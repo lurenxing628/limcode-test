@@ -44,7 +44,7 @@ const definitions = [runAgentTool, ...agentCollaborationToolModules.map((module)
 export const repo = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);
 
 /**
- * Opens the composition. `send(request, controls)` is the synthetic Provider body; every call is
+ * Opens the composition. `send(request, controls, start)` is the synthetic Provider body; every call is
  * pushed to `calls` before it runs. `settingsRoot` holds agents and provider configuration.
  */
 export async function openFullRuntime({ authority, settingsRoot, send, hostLabel = 'merge-e2e' }) {
@@ -77,11 +77,13 @@ export async function openFullRuntime({ authority, settingsRoot, send, hostLabel
     mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
     providers: { resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
       calls.push({ modelRequestId: request.modelRequestId, conversationId: request.conversationId, attemptSeq: request.attemptSeq });
+      let start;
       const adapter = new kernel.LlmCapabilityFullRequestAdapter(providerId, {
-        start(input, emit) { emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
+        start(input, emit) { start = input; emit({ type: LlmEventType.Done, payload: { requestId: input.id } }); }, abort() {}, dispose() {}
       });
       await adapter.sendFullRequest(request, { async onEvent() { return { accepted: true, terminal: true, checkpointed: true }; } });
-      await send(request, controls);
+      // `start` is the provider-facing request (its contents), for a Provider that answers by content.
+      await send(request, controls, start);
     } }; } },
     createToolDispatcher: (dependencies) => new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
       host: {

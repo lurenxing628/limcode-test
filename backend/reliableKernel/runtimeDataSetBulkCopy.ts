@@ -33,17 +33,18 @@ import { createVscodeRootAuthority } from './vscodeRootAuthority';
  *   their request in the same transaction): one unit, emitted at the Operation's position;
  * - the commit's client projection of a CollaborationMessage requires its one payload link: one
  *   unit, emitted at the message's position;
+ * - the commit's client projection of a consumed RuntimeDelivery requires its InputLink: one unit,
+ *   emitted at the delivery's position;
  * - the commit's client projection of an active Turn follows an admitted retry intent to the source
  *   Message's membership, much later in the order: no transaction holds a Turn and a TurnIntent.
- * Every table a moved row references is ordered before its anchor (checked when this module loads),
- * and Turn or termination rows only ask the worker to check requests already present, which are
- * complete units. Consecutive units fill a batch of about `batchRows` rows; a unit is never split,
+ * The complete list of such checks, with the rule covering each, is RUNTIME_DATA_SET_CROSS_ROW_CHECKS
+ * (verified against the rules when this module loads, and against the worker's source by a test). Consecutive units fill a batch of about `batchRows` rows; a unit is never split,
  * and a unit larger than a batch is a transaction of its own. Grouping by foreign-key connected
  * components was not used: a Conversation tree joined by child executions, collaboration messages
  * and forks would be one component of most of a real data set.
  *
- * Afterwards every domain's ids are compared in id order, streamed, between the source snapshot and
- * a Backup API copy of the target: every source id exists and the counts are equal.
+ * Afterwards every domain's rows are compared in id order, streamed, between the source snapshot and
+ * a Backup API copy of the target: the same ids with the same values, nothing more.
  */
 
 /**
@@ -72,6 +73,8 @@ export interface RuntimeDataSetCopyBatch {
   reads: number;
   /** Rows of the largest unit in this batch (a ModelRequest aggregate or one row). */
   largestUnitRows: number;
+  /** Domains with rows in this batch. */
+  domains: string[];
   /** Main-thread time spent reading and decoding this batch (overlaps the previous transaction). */
   buildMs: number;
   /** Wall time of the RuntimeDatabase transaction call. */
@@ -117,11 +120,7 @@ export interface RuntimeDataSetCopyReceipt {
 
 /**
  * Rows that must commit together with an earlier row (their anchor), so they are read with it and
- * emitted at its position:
- * - a ModelRequest aggregate, anchored at its Operation: the worker checks it at the end of every
- *   transaction touching it, and historical stream rows need their request in the same transaction;
- * - a CollaborationMessage and its payload link: the commit's client projection of the message
- *   requires exactly one payload.
+ * emitted at its position. Each rule exists for entries of {@link RUNTIME_DATA_SET_CROSS_ROW_CHECKS}.
  */
 interface UnitRule {
   anchor: string;
@@ -155,34 +154,156 @@ const UNIT_RULES: readonly UnitRule[] = [
     orphans: new Map([
       ['CollaborationMessagePayloadLink', 'NOT EXISTS (SELECT 1 FROM collaboration_message AS m WHERE m.id = t.message_id)']
     ])
+  },
+  {
+    anchor: 'RuntimeDelivery',
+    applies: () => true,
+    members: [{ domain: 'RuntimeDeliveryInputLink', column: 'delivery_id', key: (raw) => raw.id }],
+    orphans: new Map([
+      ['RuntimeDeliveryInputLink', 'NOT EXISTS (SELECT 1 FROM runtime_delivery AS d WHERE d.id = t.delivery_id)']
+    ])
   }
 ];
 
-/**
- * A batch ends before the first row of these domains. The commit's client projection of an active
- * Turn follows its admitted retry intent to the source Message's membership, which comes much later
- * in the order; with no TurnIntent in a Turn's transaction the projection has nothing to follow.
- */
+const UNIT_MEMBER_DOMAINS: ReadonlySet<string> = new Set(UNIT_RULES.flatMap((rule) => rule.members.map((member) => member.domain)));
+
+/** A batch ends before the first row of these domains (see the Turn entry of the checks below). */
 const BATCH_BOUNDARY_BEFORE: ReadonlySet<string> = new Set(['TurnIntent']);
 
-// A unit is emitted at its anchor's position: every table a member references (other than the
-// unit's own tables) must be ordered before the anchor, or a moved row would precede its reference.
+/** Units of a copy: anchor domain and the member domains read with it. */
+export const RUNTIME_DATA_SET_COPY_UNITS: ReadonlyArray<{ anchor: string; members: readonly string[] }> = Object.freeze(
+  UNIT_RULES.map((rule) => Object.freeze({ anchor: rule.anchor, members: Object.freeze(rule.members.map((member) => member.domain)) }))
+);
+/** Domains a batch never shares with the rows before them. */
+export const RUNTIME_DATA_SET_COPY_BATCH_BOUNDARIES: readonly string[] = Object.freeze([...BATCH_BOUNDARY_BEFORE]);
+
+export type RuntimeDataSetCrossRowHandling =
+  /** Every row it reads is in the same unit as the committed row (a UNIT_RULES entry with this anchor). */
+  | { kind: 'unit'; anchor: string }
+  /** No transaction holds the committed domain together with `domain` (BATCH_BOUNDARY_BEFORE). */
+  | { kind: 'boundary-before'; domain: string }
+  /** Every domain it reads is inserted earlier in the copy order (so already committed). */
+  | { kind: 'reads-earlier' }
+  /** A missing later row gives no record, a remove, a LEFT JOIN null or a caught error: it cannot throw for it. */
+  | { kind: 'tolerates-missing' }
+  /** Depends only on insert order within the sequence, which batches keep. */
+  | { kind: 'insert-order' }
+  /** CAS objects are transferred and made durable before the first row transaction. */
+  | { kind: 'cas-first' }
+  /** Not run by inserts (a delete trigger). */
+  | { kind: 'not-inserted' };
+
+export interface RuntimeDataSetCrossRowCheck {
+  /**
+   * commit-projection: a branch of databaseWorker readTransactionChanges (`row.domain === name`);
+   * worker-aggregate: a domain of assertTouchedRuntimeAggregates (`step.domain === name`);
+   * worker-insert: a domain executeMutation checks on insert (`schema.key === name`);
+   * sql-trigger: a RUNTIME_SCHEMA_TRIGGERS name.
+   */
+  source: 'commit-projection' | 'worker-aggregate' | 'worker-insert' | 'sql-trigger';
+  name: string;
+  /** Domains whose inserted rows run it. */
+  triggeredBy: readonly string[];
+  /** Other domains it reads. */
+  reads: readonly string[];
+  handling: RuntimeDataSetCrossRowHandling;
+}
+
+/**
+ * Every check that runs at the end of a transaction or on insert and reads other rows, i.e. what
+ * one single-transaction copy satisfied implicitly and a batched copy must satisfy explicitly.
+ * runtime-dataset-bulk-copy.test.mjs compares the names with the worker's source: a new projection
+ * or check that is not listed here fails that test. Verified against this list when the module loads.
+ */
+export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowCheck[] = Object.freeze([
+  // databaseWorker readTransactionChanges → clientProjection
+  { source: 'commit-projection', name: 'ChildExecutionActivity', triggeredBy: ['ChildExecution', 'ChildExecutionActiveTurnLink', 'ToolCall', 'ModelRequest'],
+    reads: ['ChildExecution', 'ChildExecutionActiveTurnLink', 'ChildExecutionTurnLink', 'Turn', 'ToolCall', 'ModelRequest'], handling: { kind: 'tolerates-missing' } },
+  { source: 'commit-projection', name: 'ConversationContextStatus', triggeredBy: ['ConversationContextHeadLink'], reads: ['ContextSequenceRoot'], handling: { kind: 'reads-earlier' } },
+  { source: 'commit-projection', name: 'ConversationCommandReceipt', triggeredBy: ['CommandReceipt'], reads: [], handling: { kind: 'reads-earlier' } },
+  { source: 'commit-projection', name: 'TurnIntent', triggeredBy: ['TurnIntent'], reads: ['TurnIntentRevision', 'ContentObject'], handling: { kind: 'tolerates-missing' } },
+  // An active Turn with an admitted retry intent is projected with its source Message's membership.
+  { source: 'commit-projection', name: 'Turn', triggeredBy: ['Turn'], reads: ['TurnIntent', 'TurnIntentRevision', 'ContentObject', 'MessagePartOfConversation'],
+    handling: { kind: 'boundary-before', domain: 'TurnIntent' } },
+  { source: 'commit-projection', name: 'Message', triggeredBy: ['Message', 'MessagePartOfConversation', 'MessageCurrentRevisionLink'],
+    reads: ['MessagePartOfConversation', 'MessageCurrentRevisionLink', 'MessageRevision', 'ContentObject'], handling: { kind: 'tolerates-missing' } },
+  { source: 'commit-projection', name: 'CompressionBlock', triggeredBy: ['CompressionBlock'],
+    reads: ['CompressionBlockSource', 'ContextSegmentSource', 'MessageRevision', 'MessagePartOfConversation'], handling: { kind: 'tolerates-missing' } },
+  { source: 'commit-projection', name: 'AnswerBridge', triggeredBy: ['AnswerBridge'], reads: ['AnswerSubmission', 'AnswerPayload'], handling: { kind: 'tolerates-missing' } },
+  { source: 'commit-projection', name: 'AnswerSubmission', triggeredBy: ['AnswerSubmission'], reads: ['AnswerBridge'], handling: { kind: 'reads-earlier' } },
+  { source: 'commit-projection', name: 'Process', triggeredBy: ['Process'], reads: ['ProcessOriginLink', 'ToolCall', 'ContentObject'], handling: { kind: 'tolerates-missing' } },
+  // Exactly one payload link per message.
+  { source: 'commit-projection', name: 'CollaborationMessage', triggeredBy: ['CollaborationMessage'], reads: ['CollaborationMessagePayloadLink', 'ContentObject'],
+    handling: { kind: 'unit', anchor: 'CollaborationMessage' } },
+  // A consumed current/next-turn delivery must have its InputLink (deriveCommittedParentHandling).
+  { source: 'commit-projection', name: 'RuntimeDelivery', triggeredBy: ['RuntimeDelivery', 'RuntimeDeliveryInputLink'], reads: ['RuntimeDeliveryInputLink'],
+    handling: { kind: 'unit', anchor: 'RuntimeDelivery' } },
+  // databaseWorker assertTouchedRuntimeAggregates
+  { source: 'worker-aggregate', name: 'ModelRequest', triggeredBy: ['ModelRequest'], reads: ['Operation', 'Attempt', 'ModelStreamFence'], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-aggregate', name: 'Operation', triggeredBy: ['Operation'], reads: ['ModelRequest', 'Attempt', 'ModelStreamFence'], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-aggregate', name: 'Attempt', triggeredBy: ['Attempt'], reads: ['Operation', 'ModelRequest', 'ModelStreamFence'], handling: { kind: 'unit', anchor: 'Operation' } },
+  // A terminated Turn checks the requests it has at that moment: none yet (ModelRequest comes later) or complete units.
+  { source: 'worker-aggregate', name: 'Turn', triggeredBy: ['Turn'], reads: ['ModelRequest'], handling: { kind: 'tolerates-missing' } },
+  { source: 'worker-aggregate', name: 'TurnTermination', triggeredBy: ['TurnTermination'], reads: ['ModelRequest'], handling: { kind: 'tolerates-missing' } },
+  // databaseWorker executeMutation (insert)
+  { source: 'worker-insert', name: 'ModelStreamCheckpoint', triggeredBy: ['ModelStreamCheckpoint'], reads: ['ModelRequest'], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-insert', name: 'ModelStreamFence', triggeredBy: ['ModelStreamFence'], reads: ['ModelRequest'], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-insert', name: 'ModelRequest', triggeredBy: ['ModelRequest'], reads: [], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-insert', name: 'Operation', triggeredBy: ['Operation'], reads: [], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-insert', name: 'Attempt', triggeredBy: ['Attempt'], reads: ['Operation'], handling: { kind: 'unit', anchor: 'Operation' } },
+  { source: 'worker-insert', name: 'ContentObject', triggeredBy: ['ContentObject'], reads: [], handling: { kind: 'cas-first' } },
+  // SQL triggers (schema/domainManifest RUNTIME_SCHEMA_TRIGGERS)
+  { source: 'sql-trigger', name: 'prevent_runtime_delivery_after_final_output_fence', triggeredBy: ['PendingTurnInput'], reads: ['TurnFinalOutputFence'],
+    handling: { kind: 'insert-order' } },
+  { source: 'sql-trigger', name: 'delete_interaction_request_with_turn', triggeredBy: [], reads: ['InteractionOwnerLink', 'InteractionRequest'], handling: { kind: 'not-inserted' } }
+] satisfies RuntimeDataSetCrossRowCheck[]);
+
+// Checked when this module loads: units keep the foreign-key order, and every listed check is
+// covered by the rule its handling names.
 (() => {
-  const position = new Map(RUNTIME_DATA_SET_INSERT_ORDER.map((domain, index) => [schemaForDomain(domain).table, index]));
+  const order = new Map(RUNTIME_DATA_SET_INSERT_ORDER.map((domain, index) => [domain, index]));
+  const position = (domain: string): number => {
+    const found = order.get(domain);
+    if (found === undefined) throw new Error(`Unknown Runtime domain in the copy rules: ${domain}`);
+    return found;
+  };
+  const tablePosition = new Map(RUNTIME_DATA_SET_INSERT_ORDER.map((domain, index) => [schemaForDomain(domain).table, index]));
   for (const rule of UNIT_RULES) {
-    const unitTables = new Set([rule.anchor, ...rule.members.map((member) => member.domain)].map((domain) => schemaForDomain(domain).table));
-    const anchor = position.get(schemaForDomain(rule.anchor).table)!;
+    const unitDomains = new Set([rule.anchor, ...rule.members.map((member) => member.domain)]);
+    const unitTables = new Set([...unitDomains].map((domain) => schemaForDomain(domain).table));
+    const anchor = position(rule.anchor);
     for (const { domain } of rule.members) {
-      if (!(position.get(schemaForDomain(domain).table)! > anchor)) throw new Error(`${domain} is not ordered after its unit anchor ${rule.anchor}.`);
+      if (!(position(domain) > anchor)) throw new Error(`${domain} is not ordered after its unit anchor ${rule.anchor}.`);
+      // A unit is emitted at its anchor's position: every table a member references (other than
+      // the unit's own tables) must be ordered before the anchor.
       for (const column of schemaForDomain(domain).columns) {
         const table = column.references?.table;
-        if (table !== undefined && !unitTables.has(table) && !(position.get(table)! < anchor)) {
+        if (table !== undefined && !unitTables.has(table) && !(tablePosition.get(table)! < anchor)) {
           throw new Error(`${domain}.${column.name} references ${table}, which is not ordered before ${rule.anchor}; the copy cannot keep that unit whole.`);
         }
       }
     }
   }
-  for (const domain of BATCH_BOUNDARY_BEFORE) schemaForDomain(domain);
+  for (const check of RUNTIME_DATA_SET_CROSS_ROW_CHECKS) {
+    const at = check.triggeredBy.length > 0 ? Math.min(...check.triggeredBy.map(position)) : -1;
+    const handling = check.handling;
+    if (handling.kind === 'unit') {
+      const rule = UNIT_RULES.find((entry) => entry.anchor === handling.anchor);
+      if (!rule) throw new Error(`Copy check ${check.name} names a unit without a rule: ${handling.anchor}.`);
+      const unitDomains = new Set([rule.anchor, ...rule.members.map((member) => member.domain)]);
+      for (const domain of check.reads) {
+        if (!unitDomains.has(domain) && !(position(domain) < position(rule.anchor))) {
+          throw new Error(`Copy check ${check.name} reads ${domain}, neither in unit ${rule.anchor} nor earlier.`);
+        }
+      }
+    } else if (handling.kind === 'boundary-before') {
+      if (!BATCH_BOUNDARY_BEFORE.has(handling.domain)) throw new Error(`Copy check ${check.name} needs a batch boundary before ${handling.domain}.`);
+    } else if (handling.kind === 'reads-earlier') {
+      for (const domain of check.reads) {
+        if (!(position(domain) <= at)) throw new Error(`Copy check ${check.name} reads ${domain}, which is inserted later.`);
+      }
+    }
+  }
 })();
 
 /**
@@ -365,6 +486,7 @@ async function writeBatches(
   let largestUnit = 0;
   let readsBefore = 0;
   let buildMs = 0;
+  const domains = new Set<string>();
   let inFlight: Promise<void> | undefined;
   let failure: { error: unknown } | undefined;
   const settle = async (): Promise<void> => {
@@ -376,12 +498,13 @@ async function writeBatches(
     if (steps.length === 0) return;
     const batch: RuntimeDataSetCopyBatch = {
       index: summary.count, rows, steps: steps.length, reads: counter.reads - readsBefore, largestUnitRows: largestUnit,
-      buildMs: Math.round(buildMs), transactionMs: 0
+      domains: [...domains], buildMs: Math.round(buildMs), transactionMs: 0
     };
     const transaction = steps;
     steps = [];
     rows = 0;
     largestUnit = 0;
+    domains.clear();
     buildMs = 0;
     readsBefore = counter.reads;
     await settle();
@@ -414,7 +537,10 @@ async function writeBatches(
       started = performance.now();
     }
     previousDomain = domain;
-    for (const { domain: rowDomain, raw } of unit) steps.push(runtimeDataSetCopyRow(rowDomain, raw).step);
+    for (const { domain: rowDomain, raw } of unit) {
+      steps.push(runtimeDataSetCopyRow(rowDomain, raw).step);
+      domains.add(rowDomain);
+    }
     rows += unit.length;
     largestUnit = Math.max(largestUnit, unit.length);
     buildMs += performance.now() - started;
@@ -428,8 +554,8 @@ async function writeBatches(
 }
 
 /**
- * Every domain's ids, in id order and streamed, on the source snapshot and on a Backup API copy of
- * the target (a private file of the target's control root, removed afterwards): equal sequences.
+ * Every domain's rows, streamed in the copy's insert order, on the source snapshot and on a Backup API copy of
+ * the target (a private file of the target's control root, removed afterwards): equal ids, equal values.
  */
 async function verifyCopy(source: Database.Database, database: RuntimeDatabase): Promise<Record<string, number>> {
   const copyPath = path.join(path.dirname(path.resolve(database.binding.paths.dataRootPath)), `copy-verify-${randomUUID()}.sqlite`);
@@ -437,20 +563,35 @@ async function verifyCopy(source: Database.Database, database: RuntimeDatabase):
   try {
     await database.backupTo(copyPath);
     const copy = new Database(toSqliteFilePath(copyPath), { readonly: true, fileMustExist: true });
+    copy.defaultSafeIntegers(true);
     try {
       for (const domain of RUNTIME_DATA_SET_INSERT_ORDER) {
-        const sql = `SELECT id FROM "${schemaForDomain(domain).table}" ORDER BY id`;
-        const expected = source.prepare(sql).pluck().iterate() as IterableIterator<string>;
-        const actual = copy.prepare(sql).pluck().iterate() as IterableIterator<string>;
+        // Whole rows in one pass: every source row exists with exactly its stored values (codec
+        // round trip included), and nothing else does. A domain the copy inserts in source rowid
+        // order is scanned in rowid order on both sides (sequential reads); unit members, inserted
+        // at their anchor's position, are compared in id order.
+        const columns = schemaForDomain(domain).columns.map((column) => column.name);
+        const order = UNIT_MEMBER_DOMAINS.has(domain) ? 'id' : 'rowid';
+        const sql = `SELECT ${columns.map((column) => `"${column}"`).join(', ')} FROM "${schemaForDomain(domain).table}" ORDER BY ${order}`;
+        const expected = source.prepare(sql).raw().iterate() as IterableIterator<unknown[]>;
+        const actual = copy.prepare(sql).raw().iterate() as IterableIterator<unknown[]>;
+        const idAt = columns.indexOf('id');
         let count = 0;
         try {
           for (;;) {
             const left = expected.next();
             const right = actual.next();
-            if (left.done || right.done || left.value !== right.value) {
-              if (left.done && right.done) break;
+            if (left.done && right.done) break;
+            if (left.done || right.done || left.value[idAt] !== right.value[idAt]) {
               throw new RuntimeDataSetMergeError('runtime-data-set-copy-verification-failed',
-                `复制后的核对未通过：${domain} 的记录${left.done ? '多出' : '缺少'} ${left.done ? right.value : left.value}。`);
+                `复制后的核对未通过：${domain} 的记录${left.done ? '多出' : '缺少'} ${String(left.done ? right.value![idAt] : left.value[idAt])}。`);
+            }
+            let same = true;
+            for (let index = 0; index < columns.length && same; index += 1) same = sameStoredValue(left.value[index], right.value[index]);
+            if (!same) {
+              const differs = columns.filter((_, index) => !sameStoredValue(left.value[index], right.value[index]));
+              throw new RuntimeDataSetMergeError('runtime-data-set-copy-verification-failed',
+                `复制后的核对未通过：${domain}#${String(left.value[idAt])} 的内容与来源不同（${differs.join('、')}）。`);
             }
             count += 1;
             if (count % 1_000 === 0) await new Promise((resolve) => setImmediate(resolve));
@@ -468,6 +609,11 @@ async function verifyCopy(source: Database.Database, database: RuntimeDatabase):
     await Promise.all(['', '-wal', '-shm', '-journal'].map((suffix) => fs.rm(`${copyPath}${suffix}`, { force: true }).catch(() => undefined)));
   }
   return counts;
+}
+
+/** One stored SQLite value (TEXT, safe INTEGER as bigint, BLOB as Buffer, NULL) equal to another. */
+function sameStoredValue(left: unknown, right: unknown): boolean {
+  return left === right || (Buffer.isBuffer(left) && Buffer.isBuffer(right) && left.equals(right));
 }
 
 function comparable(file: string): string {

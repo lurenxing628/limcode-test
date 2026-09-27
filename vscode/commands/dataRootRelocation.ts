@@ -112,15 +112,20 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
   let failure: unknown;
   let runtimeClosed = false;
   let cleaned = true;
-  await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在迁移数据目录' }, async (progress) => {
+  await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在迁移数据目录', cancellable: true }, async (progress, token) => {
     const onProgress = (message: string): void => progress?.report({ message });
     let staged: StagedDataRootRelocation;
+    // "Cancel" stops the online pre-copy; once every window is asked to go offline it is too late.
+    const cancel = new AbortController();
+    const cancellation = token?.onCancellationRequested(() => cancel.abort());
     try {
       onProgress('正在准备新目录');
-      staged = await stageDataRootRelocation(plan, host.product.application.database, { onProgress, relocationId });
+      staged = await stageDataRootRelocation(plan, host.product.application.database, { onProgress, relocationId, signal: cancel.signal });
     } catch (error) {
       failure = error;
       return;
+    } finally {
+      cancellation?.dispose();
     }
     onProgress('等待所有 LimCode 窗口空闲');
     try {
@@ -601,5 +606,7 @@ async function reloadWindow(): Promise<void> {
 }
 
 function describeError(error: unknown): string {
+  // A cancellation (the progress notification's "Cancel"): DOMException or Error named AbortError.
+  if ((error as { name?: unknown } | undefined)?.name === 'AbortError') return '迁移已取消。';
   return error instanceof Error ? error.message : String(error ?? '未知原因');
 }

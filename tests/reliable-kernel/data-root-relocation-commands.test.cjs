@@ -13,7 +13,7 @@ function loadCommands(dependencies) {
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
-    module, exports: module.exports, console, process,
+    module, exports: module.exports, console, process, AbortController,
     require(name) {
       if (name === 'node:crypto') return crypto;
       if (!Object.prototype.hasOwnProperty.call(dependencies, name)) throw new Error(`Unexpected source dependency: ${name}`);
@@ -31,9 +31,11 @@ function fixture({
   picked = TARGET, plan = {}, answers = [], busy = [false], exclusive = 'completed', completeError, cleanup,
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
-  nativeAnswers = [], recoverOutcome = 'recovered'
+  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false
 } = {}) {
   const calls = [];
+  const progressOptions = [];
+  const cancellation = { listeners: [], onCancellationRequested(listener) { this.listeners.push(listener); return { dispose: () => { this.listeners = this.listeners.filter((entry) => entry !== listener); } }; } };
   const prompts = [];
   const status = {
     dataRootPath: SOURCE, proxy: 'http://proxy', proxyShellAndMcp: true,
@@ -52,7 +54,10 @@ function fixture({
       async showWarningMessage(message, options, ...items) { calls.push(['warning', message, options, items]); return nativeAnswers.shift(); },
       async showInformationMessage(message, options) { calls.push(['info', message, options]); },
       async showErrorMessage(message, ...rest) { calls.push(['error', message, ...rest]); return recoveryChoice; },
-      async withProgress(_options, action) { return action({ report: (value) => calls.push(['progress', value.message]) }); }
+      async withProgress(options, action) {
+        progressOptions.push(options);
+        return action({ report: (value) => calls.push(['progress', value.message]) }, cancellation);
+      }
     },
     ProgressLocation: { Notification: 15 },
     commands: { async executeCommand(command, argument) { calls.push(['command', command, argument]); } }
@@ -101,6 +106,13 @@ function fixture({
       },
       stageDataRootRelocation: async (planned, sourceDatabase, options) => {
         calls.push(['stage', planned.targetRootPath, sourceDatabase === database, options.relocationId]);
+        assert.equal(options.signal?.aborted, false, '准备阶段带着可取消的信号');
+        if (cancelStage) {
+          // The user presses "Cancel" on the progress notification while the pre-copy runs.
+          for (const listener of [...cancellation.listeners]) listener();
+          assert.equal(options.signal.aborted, true);
+          throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+        }
         return staged;
       },
       completeDataRootRelocation: async (input, publish) => {
@@ -173,7 +185,7 @@ function fixture({
     globalState: { get: (key) => globalState.get(key), update: async (key, value) => { calls.push(['global-state', key, value]); globalState.set(key, value); } }
   };
   const request = { clientId: 'client-1' };
-  return { calls, prompts, commands, context, startup, status, request, globalState, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress') };
+  return { calls, prompts, commands, context, startup, status, request, globalState, progressOptions, cancellation, kinds: () => calls.map((call) => call[0]).filter((kind) => kind !== 'progress') };
 }
 
 const modal = (call) => call[2]?.modal === true || call.slice(2).some((item) => item?.modal === true);
@@ -208,6 +220,17 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   assert.doesNotMatch(text, /原样保留/);
   assert.match(f.globalState.get('limcode.dataRootRelocationNotice'), /1 个历史库留在旧目录/);
   assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+});
+
+test('复审 bulk #6：迁移进度可以取消；在线预复制期间取消时停止准备、清除进行中记录、不协调不重载，提示已取消', async () => {
+  const f = fixture({ answers: [{ choice: 'relocate', include: [] }], cancelStage: true });
+  await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+  assert.equal(f.progressOptions.find((options) => options.title === '正在迁移数据目录')?.cancellable, true);
+  assert.ok(!f.kinds().includes('exclusive') && !f.kinds().includes('close-runtime') && !f.kinds().includes('complete'));
+  assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
+  assert.match(JSON.stringify(f.prompts.at(-1)), /迁移已取消/);
+  assert.equal(f.cancellation.listeners.length, 0, '准备结束后不再监听取消');
+  assert.ok(!f.calls.some((call) => call[0] === 'command'));
 });
 
 test('发起窗口在等待期间开始新任务：只提示一次迁移会推迟；关闭运行时前最后一刻又有任务就放弃，撤销准备，不重载', async () => {

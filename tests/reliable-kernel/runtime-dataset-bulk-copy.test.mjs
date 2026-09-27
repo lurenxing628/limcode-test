@@ -4,7 +4,8 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import test from 'node:test';
+import test, { after } from 'node:test';
+import { openFullRuntime, createRootConversation } from './runtime-dataset-merge-full-runtime.mjs';
 
 const require = createRequire(import.meta.url);
 const compiled = process.env.LIMCODE_TEST_EXTENSION_ROOT
@@ -20,8 +21,11 @@ const { attachmentObservationLinkId } = kernelFile('attachmentObservations.js');
 const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { precopyRuntimeDataSetCas } = kernelFile('runtimeDataSetMerge.js');
 const {
-  RUNTIME_DATA_SET_COPY_BATCH_ROWS, copyRuntimeDataSetIntoEmptyRoot, ensureRuntimeDataSetCopyCurrent, isRuntimeDataSetCopyCurrent
+  RUNTIME_DATA_SET_COPY_BATCH_ROWS, RUNTIME_DATA_SET_COPY_BATCH_BOUNDARIES, RUNTIME_DATA_SET_COPY_UNITS, RUNTIME_DATA_SET_CROSS_ROW_CHECKS,
+  copyRuntimeDataSetIntoEmptyRoot, ensureRuntimeDataSetCopyCurrent, isRuntimeDataSetCopyCurrent
 } = kernelFile('runtimeDataSetBulkCopy.js');
+const { RUNTIME_DATA_SET_INSERT_ORDER } = kernelFile('runtimeDataSetMerge.js');
+const { RUNTIME_SCHEMA_TRIGGERS } = kernelFile('schema/domainManifest.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
@@ -242,6 +246,166 @@ test('E：其它历史库在线整库预复制；独占阶段按文件状态确�
   assert.deepEqual(readAll(target.dataSet), readAll(fixture.alpha));
   assert.equal(await isRuntimeDataSetCopyCurrent(fixture.paths, redone.receipt), true);
 });
+
+test('复审 bulk #5：D 只信任完整的文件身份——正文被改成同样长度、再用 utimes 还原 mtime，也会因 ctime 变化重算摘要并拒绝', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['d_same_size']);
+  const tampered = casFile(fixture.current.binding, messageText('d_same_size', 0));
+  // Whole seconds, so the restored mtime below is exactly the recorded one.
+  await fs.utimes(tampered, 1_700_000_000, 1_700_000_000);
+  const target = await createTarget(t, 'default');
+  const precopy = await precopyRuntimeDataSetCas(fixture.paths, inputOf(fixture.current),
+    { configurationRootPath: target.root, binding: target.dataSet.binding });
+  assert.equal((await fs.stat(casFile(target.dataSet.binding, messageText('d_same_size', 0)))).ino, (await fs.stat(tampered)).ino, '同盘硬链接');
+  const before = await fs.stat(tampered, { bigint: true });
+  const bytes = await fs.readFile(tampered);
+  await fs.chmod(tampered, 0o600);
+  await fs.writeFile(tampered, Buffer.from(bytes.toString('utf8').replace('消息', '改动'), 'utf8'));
+  assert.equal((await fs.stat(tampered, { bigint: true })).size, before.size, '同样长度');
+  await fs.chmod(tampered, Number(before.mode) & 0o777);
+  await fs.utimes(tampered, 1_700_000_000, 1_700_000_000);
+  const after = await fs.stat(tampered, { bigint: true });
+  assert.deepEqual([after.dev, after.ino, after.size, after.mtimeNs], [before.dev, before.ino, before.size, before.mtimeNs], '只有 ctime 不同');
+  assert.notEqual(after.ctimeNs, before.ctimeNs);
+  await assert.rejects(copy(fixture, fixture.current, target, { casVerification: precopy.verification }),
+    { code: 'runtime-data-set-merge-target-cas-damaged' });
+});
+
+test('复审 bulk #4/#5：全量核对逐行比较整行——复制期间目标少了一行或一行内容被改，都在核对时拒绝', async (t) => {
+  for (const tamper of ['missing', 'changed']) {
+    const fixture = await createFixture(t);
+    await seed(fixture.current, ['v_one', 'v_two']);
+    const target = await createTarget(t, 'default');
+    let done = false;
+    await assert.rejects(copy(fixture, fixture.current, target, {
+      batchRows: 3,
+      onFaultPoint(point) {
+        if (point !== 'after-batch' || done) return;
+        const database = new Database(target.dataSet.binding.paths.databasePath);
+        try {
+          const changes = tamper === 'missing'
+            ? database.prepare('DELETE FROM turn_termination WHERE id = ?').run('v_two_termination').changes
+            : database.prepare('UPDATE conversation SET title = ? WHERE id = ?').run('被改过的标题', 'v_one').changes;
+          done = changes === 1;
+        } finally { database.close(); }
+      }
+    }), (error) => {
+      assert.equal(error.code, 'runtime-data-set-copy-verification-failed');
+      assert.match(error.message, tamper === 'missing' ? /TurnTermination 的记录缺少 v_two_termination/ : /Conversation#v_one 的内容与来源不同（title）/);
+      return true;
+    }, tamper);
+    assert.equal(done, true);
+  }
+});
+
+test('复审 bulk #4：复制期间来源又有写入，复制结束时的来源复核拒绝本次复制', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['s_one', 's_two']);
+  const target = await createTarget(t, 'default');
+  let written = false;
+  await assert.rejects(copy(fixture, fixture.current, target, {
+    batchRows: 4,
+    onFaultPoint(point) {
+      if (point !== 'after-batch' || written) return;
+      rawConversations(fixture.current, 'late', 1);
+      written = true;
+    }
+  }), { code: 'runtime-data-set-merge-source-changed' });
+  assert.equal(written, true);
+});
+
+test('复审 bulk #1：跨行检查清单与 worker 源码一一对应，且与分批规则一一对应（新增投影或检查漏登记会失败）', async () => {
+  const worker = await fs.readFile(path.join(compiled, 'backend/reliableKernel/databaseWorker.js'), 'utf8');
+  const body = (name) => {
+    const start = worker.indexOf(`function ${name}(`);
+    assert.ok(start >= 0, name);
+    const end = worker.indexOf('\nfunction ', start + 1);
+    return worker.slice(start, end < 0 ? undefined : end);
+  };
+  const names = (text, pattern) => new Set([...text.matchAll(pattern)].map((match) => match[1]));
+  const mutation = body('executeMutation');
+  const insertBranch = mutation.slice(mutation.indexOf("mutation.kind === 'insert'"), mutation.indexOf("mutation.kind === 'update'"));
+  const expected = {
+    'commit-projection': names(body('readTransactionChanges'), /row\.domain === '(\w+)'/g),
+    'worker-aggregate': names(body('assertTouchedRuntimeAggregates'), /step\.domain === '(\w+)'/g),
+    'worker-insert': names(insertBranch, /schema\.key === '(\w+)'/g),
+    'sql-trigger': new Set(RUNTIME_SCHEMA_TRIGGERS.map((trigger) => trigger.name))
+  };
+  assert.ok(expected['commit-projection'].has('RuntimeDelivery') && expected['worker-insert'].has('ModelStreamCheckpoint'), '源码解析有效');
+  for (const [source, found] of Object.entries(expected)) {
+    const listed = new Set(RUNTIME_DATA_SET_CROSS_ROW_CHECKS.filter((check) => check.source === source).map((check) => check.name));
+    assert.deepEqual([...listed].sort(), [...found].sort(), `${source} 与源码一致`);
+  }
+  // Every rule of the copy exists for a listed check, and every check naming a rule has it.
+  const anchors = new Set(RUNTIME_DATA_SET_CROSS_ROW_CHECKS.filter((check) => check.handling.kind === 'unit').map((check) => check.handling.anchor));
+  assert.deepEqual(RUNTIME_DATA_SET_COPY_UNITS.map((unit) => unit.anchor).sort(), [...anchors].sort());
+  const boundaries = new Set(RUNTIME_DATA_SET_CROSS_ROW_CHECKS.filter((check) => check.handling.kind === 'boundary-before').map((check) => check.handling.domain));
+  assert.deepEqual([...RUNTIME_DATA_SET_COPY_BATCH_BOUNDARIES].sort(), [...boundaries].sort());
+  const delivery = RUNTIME_DATA_SET_CROSS_ROW_CHECKS.find((check) => check.name === 'RuntimeDelivery');
+  assert.deepEqual(delivery.handling, { kind: 'unit', anchor: 'RuntimeDelivery' });
+  assert.deepEqual(RUNTIME_DATA_SET_COPY_UNITS.find((unit) => unit.anchor === 'RuntimeDelivery').members, ['RuntimeDeliveryInputLink']);
+});
+
+/**
+ * One source for every batch size: first a fully composed Runtime (production conversation runner,
+ * child coordinator, collaboration tools, delivery wakes; only the model is synthetic) spawns two
+ * child Agents, one sends the other a follow-up task, and the answers are delivered back; then the
+ * hand-seeded rows (seedRich, consumed deliveries, processes, context and compression, answers,
+ * receipts, interactions, queued intents).
+ */
+let sharedRichSource;
+const sharedRichRoots = [];
+after(() => Promise.all(sharedRichRoots.map((root) => fs.rm(root, { recursive: true, force: true }))));
+function richSource() {
+  sharedRichSource ??= (async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-bulk-copy-rich-'));
+    sharedRichRoots.push(root);
+    const paths = { globalStoragePath: root };
+    const current = await initialize(root, 'default');
+    await selectVscodeRuntimeDataSet(paths, 'default');
+    await runRealAgents(current, path.join(root, '..', `${path.basename(root)}-settings`));
+    sharedRichRoots.push(path.join(root, '..', `${path.basename(root)}-settings`));
+    await seedRich(current);
+    await seedConsumedDeliveries(current, 'rich_parent', 3);
+    await seedMoreDomains(current);
+    return { root, paths, current };
+  })();
+  return sharedRichSource;
+}
+
+for (const batchRows of [1, 2, 3, 5, 7, 11, 13, RUNTIME_DATA_SET_COPY_BATCH_ROWS]) {
+  test(`复审 bulk #1：实跑的子 Agent、协作投递、答复与手工补充的全部领域，每批 ${batchRows} 行都能复制，逐表逐行与来源一致，批不跨越边界`, { timeout: 180_000 }, async (t) => {
+    const fixture = await richSource();
+    const tables = sourceTables(fixture.current);
+    for (const table of ['child_execution', 'answer_submission', 'runtime_delivery_input_link', 'collaboration_message', 'process',
+      'compression_block', 'interaction_request', 'conversation_context_head_link', 'model_stream_checkpoint', 'command_receipt']) {
+      assert.ok(tables[table] > 0, `来源含 ${table}`);
+    }
+    const reader = new Database(fixture.current.binding.paths.databasePath);
+    try {
+      assert.ok(reader.prepare("SELECT COUNT(*) FROM runtime_delivery AS d JOIN runtime_delivery_input_link AS l ON l.delivery_id = d.id WHERE d.state = 'consumed'").pluck().get() >= 4,
+        '含已消费、带输入链接的投递');
+      assert.ok(reader.prepare("SELECT COUNT(*) FROM child_execution AS c JOIN answer_bridge AS b ON b.child_execution_id = c.id JOIN answer_submission AS s ON s.answer_bridge_id = b.id WHERE c.id NOT IN ('child_exec_1', 'child_exec_2')").pluck().get() >= 1,
+        '含实跑出的子 Agent 答复');
+    } finally { reader.close(); }
+    const target = await createTarget(t, 'default');
+    const batches = [];
+    const receipt = await copy(fixture, fixture.current, target, { batchRows, onBatch: (batch) => batches.push(batch) });
+    assert.equal(receipt.rows, Object.values(tables).reduce((sum, count) => sum + count, 0));
+    assert.deepEqual(readAll(target.dataSet), readAll(fixture.current), '逐表逐行一致');
+    // Independent of where rows fall: a batch starting at a boundary domain holds nothing ordered before it.
+    const position = new Map(RUNTIME_DATA_SET_INSERT_ORDER.map((domain, index) => [domain, index]));
+    for (const batch of batches) {
+      // The boundaries the listed checks require (not the rule set under test).
+      for (const boundary of RUNTIME_DATA_SET_CROSS_ROW_CHECKS.filter((check) => check.handling.kind === 'boundary-before').map((check) => check.handling.domain)) {
+        if (!batch.domains.includes(boundary)) continue;
+        const earlier = batch.domains.filter((domain) => position.get(domain) < position.get(boundary));
+        assert.deepEqual(earlier, [], `批 ${batch.index} 含 ${boundary}，不应含更早的领域`);
+      }
+      assert.ok(batch.rows <= batchRows - 1 + batch.largestUnitRows);
+    }
+  });
+}
 
 async function createFixture(t, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-bulk-copy-source-'));
@@ -540,4 +704,119 @@ async function treeSnapshot(root) {
   }
   await visit(root);
   return files;
+}
+
+async function runRealAgents(dataSet, settingsRoot) {
+  const TASK = 'BULK_WORKER_TASK', PEER = 'BULK_PEER_TASK', FOLLOWUP = 'BULK_PEER_FOLLOWUP', ANSWER = 'BULK_WORKER_ANSWER';
+  const call = (id, name, args = {}) => ({ id, functionCall: { name, args } });
+  const answer = (text) => ({ role: 'model', parts: [{ text }] });
+  const spawn = (id, prompt) => call(id, 'run_agent', { operation: 'spawn', taskName: id, prompt, foregroundWaitMs: 0 });
+  const contents = (start) => JSON.stringify(start?.contents ?? []);
+  const detail = (start, name) => (start?.contents ?? []).flatMap((content) => content.parts ?? [])
+    .filter((part) => part.functionResponse?.name === name).at(-1)?.functionResponse.response?.detail;
+  let worker, peer, rootRound = 0, peerRound = 0;
+  const runtime = await openFullRuntime({ authority: dataSet.authority, settingsRoot, hostLabel: 'bulk-copy-seed', async send(request, controls, start) {
+    const reply = (content) => controls.onEvent({ kind: 'completed', streamSeq: '1', content });
+    if (request.conversationId === 'full_root') {
+      rootRound += 1;
+      return reply(rootRound === 1 ? { role: 'model', parts: [spawn('spawn-worker', TASK), spawn('spawn-peer', PEER)] } : answer(`Root round ${rootRound}.`));
+    }
+    if (contents(start).includes(TASK)) worker ??= request.conversationId;
+    if (contents(start).includes(PEER)) peer ??= request.conversationId;
+    if (request.conversationId === worker) return reply(answer(ANSWER));
+    peerRound += 1;
+    if (peerRound === 1) return reply({ role: 'model', parts: [call('peer-members', 'list_agents')] });
+    if (peerRound === 2) {
+      const member = detail(start, 'list_agents')?.members?.find((entry) => entry.title === 'spawn-worker');
+      if (member) return reply({ role: 'model', parts: [call('peer-followup', 'followup_agent_task', { conversationRef: member.conversationRef, text: FOLLOWUP })] });
+    }
+    return reply(answer('Peer done.'));
+  } });
+  try {
+    await runtime.startupRecovery();
+    await createRootConversation(runtime.app, runtime.agentIds.parent, 'full_root');
+    await runtime.runner.input({ conversationId: 'full_root', commandId: 'delegate', text: '请分派两个子任务' });
+    const rows = async (domain, where = {}) => (await runtime.app.database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
+    const deadline = Date.now() + 60_000;
+    for (;;) {
+      const busy = (await rows('Turn', { status: 'active' })).length + (await rows('RuntimeDeliveryWake', { state: 'pending' })).length
+        + (await rows('RuntimeDeliveryWake', { state: 'claimed' })).length;
+      const answered = (await rows('AnswerSubmission')).length >= 2 && rootRound >= 2;
+      if (busy === 0 && answered) break;
+      if (Date.now() > deadline) assert.fail(`实跑的子 Agent 没有结束：${JSON.stringify({ busy, rootRound, peerRound, errors: runtime.errors })}`);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    await runtime.runner.waitForIdle();
+    await runtime.coordinator.waitForIdle();
+  } finally { await runtime.close(); }
+}
+
+/** Consumed current-turn deliveries exactly as injectionSteps writes them (delivery + PendingTurnInput + InputLink, then consumed). */
+async function seedConsumedDeliveries(dataSet, conversationId, count) {
+  await withRuntime(dataSet, async (runtime, store) => {
+    const turnId = `${conversationId}_delivery_turn`;
+    await runtime.transaction([
+      repo('Turn').insert({ id: turnId, conversation_id: conversationId, status: 'active', created_at: NOW, updated_at: NOW, terminal_at: null })
+    ]);
+    for (let index = 0; index < count; index += 1) {
+      const payload = await store.ingest(runtime, `delivery ${conversationId} ${index}`, 'text/plain');
+      const inboxId = `${conversationId}_inbox_${index}`;
+      const deliveryId = `${conversationId}_delivery_${index}`;
+      const inputId = `${conversationId}_input_${index}`;
+      await runtime.transaction([
+        repo('RuntimeInboxItem').insert({ id: inboxId, dedupe_key: `dd-${inboxId}`, source_kind: 'process_completion', source_id: `p-${index}`, state: 'routed', created_at: NOW, updated_at: NOW }),
+        repo('RuntimeDelivery').insert({ id: deliveryId, inbox_item_id: inboxId, target_conversation_id: conversationId, target_turn_id: turnId, phase: 'current_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: NOW, updated_at: NOW }),
+        repo('PendingTurnInput').insert({ id: inputId, turn_id: turnId, position: BigInt(index + 1), input_kind: 'runtime_delivery', content_object_id: payload.id, state: 'pending', created_at: NOW, updated_at: NOW }),
+        repo('RuntimeDeliveryInputLink').insert({ id: `${conversationId}_input_link_${index}`, delivery_id: deliveryId, pending_turn_input_id: inputId, handled_at: null, created_at: NOW, updated_at: NOW }),
+        repo('RuntimeDelivery').update(deliveryId, { state: 'consumed', failure_reason: null, updated_at: NOW })
+      ]);
+    }
+  });
+}
+
+/** Domains whose commit projection reads other rows (from the bulk review): unfinished child, answers, queued intents, a process, context and compression, a receipt, an interaction. */
+async function seedMoreDomains(dataSet) {
+  const ids = await withRuntime(dataSet, async (runtime, store) => ({
+    args: (await store.ingest(runtime, '{"command":"ls -la","foregroundWaitMs":0}', 'application/vnd.limcode.tool-arguments+json')).id,
+    answer: (await store.ingest(runtime, 'child answer body', 'text/plain')).id,
+    intent: (await store.ingest(runtime, JSON.stringify({ kind: 'message', text: 'queued' }), 'application/vnd.limcode.turn-intent+json')).id,
+    segment: (await store.ingest(runtime, 'segment body', 'text/plain')).id,
+    title: (await store.ingest(runtime, 'block title', 'text/plain')).id,
+    summary: (await store.ingest(runtime, 'block summary', 'text/plain')).id,
+    prompt: (await store.ingest(runtime, 'please confirm', 'text/plain')).id
+  }));
+  const database = new Database(dataSet.binding.paths.databasePath);
+  try {
+    database.pragma('foreign_keys = ON');
+    const run = (sql, ...values) => database.prepare(sql).run(...values);
+    database.transaction(() => {
+      run('INSERT INTO child_execution VALUES (?, ?, ?, ?, ?)', 'child_exec_2', 'rich_other', 'running', NOW, NOW);
+      run('INSERT INTO child_execution_parent_link VALUES (?, ?, ?, ?, ?, ?)', 'child_parent_link_2', 'child_exec_2', 'tool_call_spawn_2', null, 'rich_parent_turn', NOW);
+      run('INSERT INTO turn VALUES (?, ?, ?, ?, ?, ?)', 'child2_turn', 'rich_other', 'active', NOW, NOW, null);
+      run('INSERT INTO tool_call (id, turn_id, call_seq, tool_name, status, arguments_object_id, created_at, updated_at) VALUES (?, ?, 1, ?, ?, ?, ?, ?)', 'child2_tool', 'child2_turn', 'bash', 'pending', ids.args, NOW, NOW);
+      run('INSERT INTO child_execution_turn_link VALUES (?, ?, ?, ?, ?)', 'child_turn_link_2', 'child_exec_2', 1, 'child2_turn', NOW);
+      run('INSERT INTO child_execution_active_turn_link VALUES (?, ?, ?, ?)', 'child_active_2', 'child_exec_2', 'child2_turn', NOW);
+      run('INSERT INTO turn_intent VALUES (?, ?, ?, ?, ?, ?)', 'child2_intent', 'rich_other', null, 'queued', NOW, NOW);
+      run('INSERT INTO turn_intent_revision VALUES (?, ?, ?, ?, ?)', 'child2_intent_rev', 'child2_intent', 1, ids.intent, NOW);
+      run('INSERT INTO child_execution_intent_link VALUES (?, ?, ?, ?, ?, ?, ?)', 'child_intent_link_2', 'child_exec_2', 1, 'child2_intent', 'queued', NOW, NOW);
+      run('INSERT INTO answer_bridge VALUES (?, ?, ?, ?, ?, ?)', 'bridge_2', 'child_exec_2', 'submission_2', 'open', NOW, NOW);
+      run('INSERT INTO answer_submission VALUES (?, ?, ?, ?, ?, ?)', 'submission_2', 'bridge_2', 1, 'child2_turn', 0, NOW);
+      run('INSERT INTO answer_payload VALUES (?, ?, ?, ?, ?, ?)', 'payload_2', 'submission_2', 'answer', ids.answer, 17, NOW);
+      run('INSERT INTO turn_intent VALUES (?, ?, ?, ?, ?, ?)', 'parent_queued_intent', 'rich_parent', null, 'queued', NOW, NOW);
+      run('INSERT INTO turn_intent_revision VALUES (?, ?, ?, ?, ?)', 'parent_queued_intent_rev', 'parent_queued_intent', 1, ids.intent, NOW);
+      run('INSERT INTO process VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', 'process_1', 'exited', 'nonce', 1234, null, null, 'fp', 'digest', 'spool', 0, 0, 0, 0, NOW, NOW, NOW);
+      run('INSERT INTO process_origin_link VALUES (?, ?, ?, ?)', 'process_origin_1', 'process_1', 'child2_tool', NOW);
+      run('INSERT INTO context_segment VALUES (?, ?, ?, ?)', 'segment_1', ids.segment, 'message', NOW);
+      run('INSERT INTO context_sequence_node VALUES (?, ?, ?, ?)', 'node_1', null, 'segment_1', NOW);
+      run('INSERT INTO context_sequence_root VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', 'root_1', 'rich_parent', 1, 'node_1', 'node_1', 1, 1, 10, NOW);
+      run('INSERT INTO conversation_context_head_link VALUES (?, ?, ?, ?)', 'head_1', 'rich_parent', 'root_1', NOW);
+      run('INSERT INTO compression_block VALUES (?, ?, ?, ?, ?, ?, ?, ?)', 'block_1', 'rich_parent', 'ready', 'authority-copy', ids.title, ids.summary, NOW, NOW);
+      run('INSERT INTO compression_block_source VALUES (?, ?, ?, ?, ?)', 'block_source_1', 'block_1', 'segment_1', 1, NOW);
+      run('INSERT INTO command_receipt VALUES (?, ?, ?, ?, ?, ?)', 'receipt_1', 'command', 'cmd-1', 'rich_parent', null, NOW);
+      run('INSERT INTO interaction_request VALUES (?, ?, ?, ?, ?, ?)', 'interaction_1', 'approval', 'pending', ids.prompt, NOW, NOW);
+      run('INSERT INTO interaction_owner_link VALUES (?, ?, ?, ?)', 'interaction_owner_1', 'interaction_1', 'rich_parent_retry_turn', NOW);
+    })();
+    assert.deepEqual(database.pragma('foreign_key_check'), []);
+    database.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { database.close(); }
 }

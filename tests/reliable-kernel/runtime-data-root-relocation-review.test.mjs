@@ -275,16 +275,72 @@ test('其它历史库在线阶段已整库复制进新根：之后没变的直�
     let staged;
     try { staged = await relocation.stageDataRootRelocation(plan, source, {}); }
     finally { await source.close(); }
-    const receipt = staged.precopiedOthers[fixture.alpha.id];
+    const receipt = staged.precopiedOthers[fixture.alpha.id]?.receipt;
     assert.ok(receipt && receipt.rows > 0, '在线阶段已复制其它库');
     assert.ok(staged.precopied.verification.size > 0, '当前库预复制带回已校验正文的元数据');
+    const copiedDatabase = path.join(receipt.target.runtimeDataRootPath, 'limcode.sqlite');
+    const copiedInode = (await fs.stat(copiedDatabase)).ino;
     if (changed) await seed(fixture.alpha, [{ id: 'conversation_alpha_after_stage', project: PROJECT }]);
     const result = await relocation.completeDataRootRelocation(staged, async () => undefined, {});
-    assert.deepEqual(result.others.migrated, [fixture.alpha.id]);
     const moved = await rootAuthority.resolveVscodeRuntimeDataSet({ globalStoragePath: target }, fixture.alpha.id);
+    const finalDatabase = path.join(moved.runtimeDataRootPath, 'limcode.sqlite');
+    if (changed) assert.notEqual((await fs.stat(finalDatabase)).ino, copiedInode, '来源变了：清空后重做');
+    else assert.equal((await fs.stat(finalDatabase)).ino, copiedInode, '来源没变：在线复制原样保留，没有重做');
+    assert.deepEqual(result.others.migrated, [fixture.alpha.id]);
     assert.deepEqual(conversationIds(moved.runtimeDataRootPath), conversationIds(fixture.alpha.binding.paths.dataRootPath));
     assert.equal(conversationIds(moved.runtimeDataRootPath).includes('conversation_alpha_after_stage'), changed);
   }
+});
+
+test('复审 bulk #2：在线复制过的其它库在独占阶段重做失败时，新目录里不留这个库的任何目录，迁移照常完成、它留在旧目录', async (t) => {
+  const bulk = kernelFile('runtimeDataSetBulkCopy.js');
+  const original = bulk.ensureRuntimeDataSetCopyCurrent;
+  bulk.ensureRuntimeDataSetCopyCurrent = (paths, receipt, reset, options) => original(paths, receipt, async () => {
+    await reset();
+    throw Object.assign(new Error('注入：重做时磁盘已满'), { code: 'ENOSPC' });
+  }, options);
+  t.after(() => { bulk.ensureRuntimeDataSetCopyCurrent = original; });
+  const fixture = await createFixture(t);
+  const target = path.join(fixture.base, 'moved');
+  const plan = await planWithRuntime(fixture, target);
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await relocation.stageDataRootRelocation(plan, source, {}); } finally { await source.close(); }
+  const copied = staged.precopiedOthers[fixture.alpha.id];
+  assert.ok(copied, '在线阶段已复制 alpha');
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_after_stage', project: PROJECT }]);
+  const result = await relocation.completeDataRootRelocation(staged, async () => undefined, {});
+  assert.deepEqual(result.others.migrated, []);
+  assert.match(result.others.leftBehind.find((entry) => entry.id === fixture.alpha.id)?.reason ?? '', /磁盘已满/);
+  const scopeRoot = path.dirname(path.dirname(copied.receipt.target.runtimeDataRootPath));
+  await assert.rejects(fs.stat(copied.createdPath), { code: 'ENOENT' }, '为它新建的目录全部删除');
+  await assert.rejects(fs.stat(scopeRoot), { code: 'ENOENT' });
+  const inspection = await rootAuthority.inspectVscodeRuntimeDataSets({ globalStoragePath: target });
+  assert.deepEqual(inspection.candidates.map((candidate) => candidate.id), ['default'], '新目录里只有当前库，不会被当成待合并来源');
+  assert.deepEqual(inspection.problems, []);
+});
+
+test('复审 bulk #3：在线复制过的其它库在 stage 与 complete 之间被并入当前库时，删掉 stage 为它新建的全部目录', async (t) => {
+  const { runtimeDataSetFingerprint, writeRuntimeDataSetMergeLedgerRecord } = kernelFile('runtimeDataSetMergeLedger.js');
+  const fixture = await createFixture(t);
+  const target = path.join(fixture.base, 'moved');
+  const plan = await planWithRuntime(fixture, target);
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await relocation.stageDataRootRelocation(plan, source, {}); } finally { await source.close(); }
+  const copied = staged.precopiedOthers[fixture.alpha.id];
+  assert.ok(copied);
+  const alpha = (await rootAuthority.inspectVscodeRuntimeDataSets(fixture.paths)).candidates.find((candidate) => candidate.id === fixture.alpha.id);
+  await writeRuntimeDataSetMergeLedgerRecord(fixture.paths, {
+    candidateId: alpha.id, state: 'merged', source: await runtimeDataSetFingerprint(alpha),
+    target: { dataSetId: fixture.current.binding.dataSetId, rootInstanceId: fixture.current.binding.rootInstanceId },
+    mergedAt: '2026-09-20T00:00:00.000Z', insertedRows: 1, reusedRows: 0, insertedConversations: 1
+  });
+  const result = await relocation.completeDataRootRelocation(staged, async () => undefined, {});
+  assert.deepEqual(result.others.covered, [fixture.alpha.id]);
+  await assert.rejects(fs.stat(copied.createdPath), { code: 'ENOENT' });
+  const inspection = await rootAuthority.inspectVscodeRuntimeDataSets({ globalStoragePath: target });
+  assert.deepEqual(inspection.problems, [], '下次迁移预检不会误报无法读取的历史库');
 });
 
 test('空间预估按盘核对：新目录约 2×数据库、临时目录 1×数据库、旧目录 1×数据库，同一块盘合计；只遍历一次', async (t) => {
