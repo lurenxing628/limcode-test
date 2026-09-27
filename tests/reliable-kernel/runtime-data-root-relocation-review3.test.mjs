@@ -72,8 +72,13 @@ for (const scenario of ['identity-after', 'undo-marked@identity-after', 'undo-ma
     assert.equal(hold.relocationId, relocationId);
     assert.ok(hold.message.includes(work), '说明迁移前的备份在哪');
     assert.ok((await fs.readdir(work)).some((name) => name.startsWith('database-')), '迁移前的数据库副本还在');
-    // Never undone automatically again, by nobody.
+    // Never undone automatically again, by nobody; also not reported as waiting for the directory to
+    // be closed while the other installation keeps it open (nothing is left to undo).
     assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
+    const inUse = await kernel.RuntimeDatabase.open(new RootAuthority(() => receiving), { hostBootId: `other-installation-${randomUUID()}` });
+    try {
+      assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
+    } finally { await inUse.close(); }
     assert.deepEqual(await settleDataRootRelocationBeforeOpen(target), { undone: false });
     await assert.rejects(abandonStagedDataRootRelocation({ plan: { targetRootPath: target }, relocationId }), { code: 'data-root-relocation-undo-held' });
     assert.ok(conversationIds(receiving).includes('conversation_written_meanwhile'));
@@ -157,6 +162,49 @@ async function undoingInto(t) {
   assert.equal((await markerOf(target)).state, 'undoing');
   return { fixture, target, existing };
 }
+
+test('撤销还原接收库做到一半（库文件已放回、WAL 还在副本里）：续撤不把这当成别人写入，接着放回 WAL，内容回到迁移之前', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'existing');
+  await createLimCodeTarget(target);
+  const selected = await selectedDataSet(target);
+  const database = path.join(selected.runtimeDataRootPath, 'limcode.sqlite');
+  // The receiving database's last transaction is only in its WAL (as after its Runtime was killed).
+  const saved = path.join(fixture.base, 'killed');
+  await fs.mkdir(saved);
+  const killed = await kernel.RuntimeDatabase.open(new RootAuthority(() => selected.runtimeDataRootPath), { hostBootId: `killed-${randomUUID()}` });
+  try {
+    await killed.transaction([repo('Conversation').insert({ id: 'conversation_only_in_wal', title: 'only in the WAL', status: 'active', created_at: NOW, updated_at: NOW })]);
+    for (const suffix of ['', '-wal']) await fs.copyFile(`${database}${suffix}`, path.join(saved, `limcode.sqlite${suffix}`));
+  } finally { await killed.close(); }
+  for (const suffix of ['-wal', '-shm']) await fs.rm(`${database}${suffix}`, { force: true });
+  for (const suffix of ['', '-wal']) await fs.copyFile(path.join(saved, `limcode.sqlite${suffix}`), `${database}${suffix}`);
+  assert.ok((await fs.stat(`${database}-wal`)).size > 0, '前提：最后的事务只在 WAL 里');
+  const plan = await planWithRuntime(fixture, target);
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await stageDataRootRelocation(plan, source); } finally { await source.close(); }
+  // The undo right after the failed switch stops once the database file is back, before its WAL.
+  const rename = fsp.rename;
+  let failWal = true;
+  fsp.rename = async function (from, to, ...rest) {
+    if (failWal && String(from).includes(relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY) && String(from).endsWith('limcode.sqlite-wal')) {
+      throw Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' });
+    }
+    return rename.call(this, from, to, ...rest);
+  };
+  t.after(() => { fsp.rename = rename; });
+  let error;
+  await completeDataRootRelocation(staged, async () => { throw new Error('指针写入失败'); }).catch((caught) => { error = caught; });
+  assert.equal(dataRootRelocationCleanupState(error), 'not-cleaned');
+  const work = path.join(target, relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, staged.relocationId);
+  const [backup] = (await fs.readdir(work)).filter((name) => name.startsWith('database-'));
+  assert.deepEqual(await fs.readdir(path.join(work, backup)), ['limcode.sqlite-wal'], '前提：库文件已放回，WAL 还在副本里');
+  failWal = false;
+  await markStagingOwnerDead(target);
+  assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId: staged.relocationId }), 'recovered');
+  assert.deepEqual(conversationIds(selected.runtimeDataRootPath).sort(), ['conversation_existing_1', 'conversation_only_in_wal']);
+});
 
 test('X3 撤销到一半（undoing）而发起进程还在：下一次迁移不去接着撤销，按并发拒绝，什么都不动', async (t) => {
   const { fixture, target } = await undoingInto(t);
