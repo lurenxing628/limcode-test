@@ -218,6 +218,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/vscode-fs-local-read.test.cjs',
   'tests/reliable-kernel/webview-feed-lifecycle.test.mjs',
   'tests/reliable-kernel/waiting-interaction-cancellation.test.mjs',
+  'tests/reliable-kernel/stop-waiting-turn.test.mjs',
   'tests/reliable-kernel/interaction-auto-approval.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',
   'tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs',

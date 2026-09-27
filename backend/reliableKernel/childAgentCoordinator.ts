@@ -189,6 +189,8 @@ export interface ReliableChildAgentRecoveryReport {
 const CHILD_WAKE_POLL_MS = 500;
 const CHILD_RECOVERY_CHANGE_SCAN_MS = 2_000;
 const CHILD_RECOVERY_SAFETY_SCAN_MS = 5_000;
+/** The owner of a question's or plan review's wait Operation (ToolInteractionControlPlane). */
+const INTERACTION_WAIT_OWNER_KIND = 'tool_execution';
 type ChildDispatchResult = ToolTerminalResult | ReliableAgentToolSettled | ReliableAgentToolPause;
 
 /**
@@ -357,7 +359,15 @@ export class ReliableChildAgentCoordinator {
     };
   }
 
-  /** Parent interruption closes local foreground waits but intentionally leaves children running. */
+  /**
+   * Parent interruption closes the Turn's local foreground child waits but intentionally leaves
+   * children running. Only a child Agent's waits are closed here: the foreground run_agent wait
+   * (`child_execution`), a child send continuation and the legacy answer bridge wait. A question or
+   * plan review the Turn waits on is an interaction whose wait Operation belongs to its
+   * ToolExecution; the interaction's own cancellation closes it (ReliableToolDispatcher.cancelWaiting,
+   * right after its cancelActive), so it is left alone here. Any other waiting shape still fails
+   * closed in cancelForegroundWaitForToolCall.
+   */
   public async cancelParentWaits(input: { turnId: string; reason: string }): Promise<void> {
     const turnId = requireId(input.turnId, 'turnId');
     const calls = await listAllDomainRows(this.dependencies.database, 'ToolCall', {
@@ -367,6 +377,7 @@ export class ReliableChildAgentCoordinator {
       const toolCallId = requireId(call.id, 'ToolCall.id');
       const waiting = await this.list('Operation', { tool_call_id: toolCallId, status: 'waiting_answer' }, 2);
       if (waiting.length === 0) continue;
+      if (waiting.length === 1 && waiting[0].owner_kind === INTERACTION_WAIT_OWNER_KIND) continue;
       await this.dependencies.children.cancelForegroundWaitForToolCall({
         toolCallId,
         reason: input.reason,

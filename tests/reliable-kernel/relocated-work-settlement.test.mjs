@@ -214,6 +214,9 @@ test('等待回答的提问：收尾关闭提问并中止 Turn，恢复后没有
     assert.equal(settled.counts.turnsStopped, 1);
     assert.equal(settled.counts.interactionsCancelled, 1);
     assert.notEqual((await rows(oldHost.app, 'InteractionRequest', { id: request.id }))[0].status, 'pending', '提问已关闭');
+    const [response] = await rows(oldHost.app, 'InteractionResponse', { request_id: request.id });
+    assert.equal((await readContentJson(oldHost.app, response.content_object_id)).response.reason,
+      relocatedWorkSettlementReason(target), '提问按迁移原因关闭');
     await oldHost.recover();
     await quiet(oldHost);
     assert.equal(inOld.calls.length, 0);

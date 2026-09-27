@@ -338,11 +338,9 @@ class RelocatedWorkSettlement {
 
   /**
    * The Turn's pending questions and approvals, closed with the transitions and in the way
-   * ReliableToolDispatcher.cancelWaiting closes them for a recorded stop, under the same lease.
-   * terminateRequested would do the same, but its cancelActive first asks the tool host to cancel
-   * the Turn's child waits, and the child scheduler's cancelParentWaits treats every waiting
-   * Operation as a child wait and rejects a question or approval ("Unsupported foreground child wait
-   * owner tool_execution"); closed first, only real child waits are left for it.
+   * ReliableToolDispatcher.cancelWaiting closes them for a recorded stop, under the same lease, so
+   * each one's response records the relocation reason. terminateRequested closes whatever is left
+   * the same way, with its generic "Turn observed interrupt_request" reason.
    */
   private async closePendingInteractions(turnId: string): Promise<void> {
     const owners = (await this.list('InteractionOwnerLink', { turn_id: turnId }))
