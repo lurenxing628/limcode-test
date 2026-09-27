@@ -68,6 +68,7 @@ import {
   archiveCurrentRuntimeRootForReset
 } from './VscodeReliableKernelCutoverCoordinator';
 import { pinnedDataRootPaths, VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
+import { relocatedWorkBeforeOpen, settleRelocatedWorkOnOpen } from './relocatedWorkOpening';
 import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
@@ -216,6 +217,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
         })
       );
+      // Work a relocation carried away from this old directory: the user decides before the Runtime opens.
+      const carried = await relocatedWorkBeforeOpen(runtimePlacement);
       const authority = createVscodeRootAuthority(runtimePlacement);
       // Root preparation and Runtime open share one short maintenance claim with the database
       // worker-ready + Host liveness registration, so a peer open or reset cannot interleave.
@@ -232,13 +235,23 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         }
         await completeVscodeRuntimeDataSetSelection(getPaths());
         return VscodeReliableKernelProductRuntime.open(context, {
-          authority, runtimePlacement,
+          authority, runtimePlacement, holdForRelocatedWork: carried !== undefined,
           onConfigurationChanged: async () => {
             await facade?.commandRouter.refreshConfiguration();
             await facade?.refreshConversationHistory();
           }
         });
       }, wait);
+      if (carried) {
+        // Settled before anything could run it (convergence and recovery are held until then).
+        try {
+          await settleRelocatedWorkOnOpen(product.application, carried, context.globalStorageUri.fsPath);
+        } catch (error) {
+          await product.close().catch(() => undefined);
+          throw error;
+        }
+      }
+      product.releaseRelocatedWorkHold();
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
       );

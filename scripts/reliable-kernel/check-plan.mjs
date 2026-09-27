@@ -241,6 +241,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-data-root-relocation-review3.test.mjs',
   'tests/reliable-kernel/relocated-work-settlement.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-blind.test.mjs',
+  'tests/reliable-kernel/relocated-work-opening.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-hold-child.mjs',
   'tests/reliable-kernel/configuration-missing-settings-directory.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-fixture.mjs',

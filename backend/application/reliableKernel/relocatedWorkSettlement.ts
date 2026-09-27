@@ -9,6 +9,7 @@ import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import {
+  RELOCATED_WORK_LISTS,
   parseRelocatedWorkInventory,
   type RelocatedConversationWork,
   type RelocatedWorkInventory
@@ -87,6 +88,18 @@ export type RelocatedWorkUnsettledKind =
   | 'needs_human'
   /** Settling this item threw; `detail` has the error. */
   | 'failed';
+
+/**
+ * The inventory lists whose items this module may only report (no existing transition closes them
+ * without starting a Turn): opening the old directory may still run them once. Prompts list the
+ * inventory's items of these lists; a kind that becomes settleable leaves this table, and the
+ * prompts shrink with it.
+ */
+export const RELOCATED_WORK_REPORTED_ONLY: Readonly<Partial<Record<(typeof RELOCATED_WORK_LISTS)[number], RelocatedWorkUnsettledKind>>> = Object.freeze({
+  pendingDeliveryIds: 'continuation_delivery',
+  undeliveredAnswerIds: 'child_answer',
+  pendingProcessCompletionIds: 'process_completion'
+});
 
 export interface RelocatedWorkUnsettled {
   conversationId: string;

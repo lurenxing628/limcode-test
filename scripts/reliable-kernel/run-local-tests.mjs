@@ -203,6 +203,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-data-root-relocation-review3.test.mjs',
   'tests/reliable-kernel/relocated-work-settlement.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-blind.test.mjs',
+  'tests/reliable-kernel/relocated-work-opening.test.mjs',
   'tests/reliable-kernel/configuration-missing-settings-directory.test.mjs',
   'tests/reliable-kernel/data-root-relocation-commands.test.cjs',
   'tests/reliable-kernel/data-root-relocation-real-coordination.test.mjs',

@@ -26,6 +26,7 @@ import {
   type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
 import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
+import { parseRelocatedWorkInventory, type RelocatedWorkInventory } from './relocatedWorkInventory';
 import {
   readRuntimeDataSetMergeLedger, runtimeDataSetLastMerge, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
   type RuntimeDataSetFingerprint
@@ -148,7 +149,7 @@ export class DataRootRelocationError extends Error {
  * relocation of another installation copied its data in but never switched to it, and its process
  * is gone (the user decides: undo it, or do not open the directory now).
  */
-export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable' | 'inaccessible' | 'relocating' | 'unpublished';
+export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable' | 'inaccessible' | 'relocating' | 'unpublished' | 'moved-work';
 
 /** Read errors that usually pass by themselves (see DataRootUnavailableReason 'unreadable'). */
 const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
@@ -292,8 +293,6 @@ export interface DataRootRelocationOptions extends Pick<RuntimeDataSetMergeOptio
    * target's record: only it confirms, finalizes or redoes that relocation there.
    */
   installation?: string;
-  /** Unfinished work carried to the new directory, listed in the moved notice (see DataRootMovedNotice.carriedWork). */
-  carriedWork?: DataRootCarriedWork['items'];
   /**
    * After `publish` failed: whether the data-root pointer provably did not switch to this
    * relocation (the caller reads it again). Only then is the relocation undone right there, both
@@ -310,18 +309,41 @@ export interface DataRootMovedNotice {
   /** `id`: the installation's own storage directory (where its data-root pointer lives); `label` for people. */
   installation: { id: string; label: string };
   /**
-   * Unfinished work the relocation carried to the new directory unchanged. In the old directory it
-   * must not simply resume (it would run twice): whoever keeps using the old directory settles it
-   * first (closed as aborted), with the user's consent; `settlement` says whether that happened.
+   * Unfinished work the relocation carried to the new directory unchanged, per data set that moved.
+   * In the old directory it must not simply resume (it would run twice): a data set's work is
+   * settled (closed as aborted) when it is opened there, only after the user chose to keep using
+   * the old directory ("回到旧目录", or "在这里继续" when opening it); `settlement` says how far that got.
    */
   carriedWork?: DataRootCarriedWork;
 }
 
 /** See DataRootMovedNotice.carriedWork. */
 export interface DataRootCarriedWork {
-  /** Each carried item: its conversation, the Turn when there is one, and a line for people. */
-  items: Array<{ conversationId: string; turnId?: string; label: string }>;
-  settlement: { state: 'pending' } | { state: 'settled'; at: string; by: string };
+  /** Each data set that moved with unfinished work; settled on its own when it is opened in the old directory. */
+  dataSets: DataRootCarriedDataSet[];
+}
+
+export interface DataRootCarriedDataSet {
+  /** Its id in the old directory ('default', 'workspace:…') and its identity when it moved. */
+  id: string;
+  dataSetId: string;
+  /** What would run again there (see relocatedWorkInventory), computed on the snapshot that moved. */
+  inventory: RelocatedWorkInventory;
+  settlement: DataRootCarriedWorkSettlement;
+}
+
+export type DataRootCarriedWorkSettlement =
+  | { state: 'pending' }
+  /** The user chose to keep using the old directory: settled at its next open before anything runs (again after a crash). */
+  | { state: 'consented'; at: string; by: string }
+  /** Settled once, by the installation `by`; never again. */
+  | { state: 'settled'; at: string; by: string; result: DataRootCarriedWorkResult };
+
+/** What the settlement closed and what it could not (see relocatedWorkSettlement). */
+export interface DataRootCarriedWorkResult {
+  counts: Record<string, number>;
+  live: Array<{ conversationId: string; id: string }>;
+  unsettled: Array<{ conversationId: string; kind: string; id: string; detail: string }>;
 }
 
 /** What the pointer switch records: the identity of the new data directory. */
@@ -1189,6 +1211,7 @@ export async function completeDataRootRelocation(
     let completed: RelocationMarker;
     let dataRootId: string;
     let outcome: Omit<DataRootRelocationResult, 'targetRootPath'>;
+    let carried: DataRootCarriedDataSet[] = [];
     try {
       const current = await resolveVscodeRuntimeDataSet(sourcePaths, plan.current.id);
       // Only the data sets that move must be offline; another one still in use stays behind.
@@ -1199,7 +1222,7 @@ export async function completeDataRootRelocation(
         throw new DataRootRelocationError('data-root-relocation-changed', '迁移期间当前历史库发生了变化，本次不迁移。');
       }
       options.onProgress?.('正在核对当前历史库');
-      const currentFingerprint = await dataSetFingerprint(current);
+      const { fingerprint: currentFingerprint, work: currentWork } = await dataSetFingerprintWithWork(current);
       options.onProgress?.('正在复制设置、全局规则和技能');
       const configuration = await transferConfiguration(source, target, journal);
       options.onProgress?.('正在迁移当前历史库');
@@ -1216,6 +1239,10 @@ export async function completeDataRootRelocation(
       await journal.append({ op: 'received', path: path.relative(target, staged.receiving.runtimeDataRootPath), fingerprint: receivingFingerprint });
       await copyDebugCaptures(current.runtimeDataRootPath, staged.receiving.runtimeDataRootPath, target, journal);
       const others = await migrateOthers(staged, current, journal, options);
+      // Only what really moved: the current data set and the others copied now (not those merged earlier or left behind).
+      carried = [{ ...identityOf(current), work: currentWork }, ...others.carried]
+        .filter((item) => item.work.conversations.length > 0)
+        .map((item) => ({ id: item.id, dataSetId: item.dataSetId, inventory: item.work, settlement: { state: 'pending' } }));
       const leftBehind = [...others.result.leftBehind, ...plan.unreadable.filter((item) => !others.result.leftBehind.some((left) => left.id === item.id))];
       if (plan.target.kind !== 'limcode') {
         await journal.recordCreation(VSCODE_RUNTIME_SELECTION_FILE);
@@ -1275,7 +1302,7 @@ export async function completeDataRootRelocation(
       await writeJsonDurably(path.join(source, DATA_ROOT_MOVED_NOTICE_FILE), {
         kind: MOVED_NOTICE_KIND, targetRootPath: target, relocationId: staged.relocationId, movedAt: new Date().toISOString(),
         installation: options.movedBy,
-        ...(options.carriedWork?.length ? { carriedWork: { items: options.carriedWork, settlement: { state: 'pending' } } } : {})
+        ...(carried.length > 0 ? { carriedWork: { dataSets: carried } } : {})
       }).catch((error: unknown) => console.warn('[LimCode] 在旧目录写“数据已迁走”标记失败。', error));
     }
     return { targetRootPath: target, ...outcome };
@@ -1534,12 +1561,13 @@ async function migrateOthers(
   current: VscodeRuntimeDataSetCandidate,
   journal: RelocationJournal,
   options: DataRootRelocationOptions
-): Promise<{ result: DataRootRelocationResult['others']; migrated: MigratedDataSet[] }> {
+): Promise<{ result: DataRootRelocationResult['others']; migrated: MigratedDataSet[]; carried: Array<ReturnType<typeof identityOf> & { work: RelocatedWorkInventory }> }> {
   const { plan } = staged;
   const target = plan.targetRootPath;
   const sourcePaths = { globalStoragePath: plan.sourceRootPath };
   const result: DataRootRelocationResult['others'] = { migrated: [], covered: [], leftBehind: [] };
   const migrated: MigratedDataSet[] = [];
+  const carried: Array<ReturnType<typeof identityOf> & { work: RelocatedWorkInventory }> = [];
   const taken = new Set(plan.target.kind === 'limcode' ? plan.target.dataSetIds : []);
   taken.add(staged.receiving.id);
   const ledger = await readRuntimeDataSetMergeLedger(sourcePaths).catch(() => new Map());
@@ -1560,7 +1588,7 @@ async function migrateOthers(
         throw new Error('确认之后这个历史库发生了变化');
       }
       if (await dataSetInUse(sourcePaths, other.id)) throw new Error(DATA_SET_IN_USE_REASON);
-      const fingerprint = await dataSetFingerprint(candidate);
+      const { fingerprint, work } = await dataSetFingerprintWithWork(candidate);
       const record = ledger.get(other.id);
       const lastMerge = record ? runtimeDataSetLastMerge(record) : undefined;
       if (lastMerge && sameRuntimeDataSetIdentity(lastMerge.target, current) && sameRuntimeDataSetFingerprint(lastMerge.source, fingerprint)) {
@@ -1588,6 +1616,7 @@ async function migrateOthers(
       await copyDebugCaptures(candidate.runtimeDataRootPath, runtimeDataRootPath, target, journal);
       await markVscodeRuntimeDataSetKept(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, other.id));
       migrated.push({ ...identityOf(candidate), fingerprint });
+      carried.push({ ...identityOf(candidate), work });
       result.migrated.push(other.id);
     } catch (error) {
       result.leftBehind.push({ id: other.id, reason: relocationReason(error) });
@@ -1599,7 +1628,7 @@ async function migrateOthers(
       }
     }
   }
-  return { result, migrated };
+  return { result, migrated, carried };
 }
 
 const DATA_SET_IN_USE_REASON = '这个历史库正被其它 LimCode 窗口使用（可能是另一个安装或旧版本），这次不迁移，留在旧目录（删除旧目录时也会保留）';
@@ -1628,7 +1657,16 @@ async function firstMissingAncestor(root: string, target: string): Promise<strin
 
 /** Content identity of a data set, read from a private copy in a worker; nothing is written anywhere. */
 async function dataSetFingerprint(candidate: VscodeRuntimeDataSetCandidate): Promise<RuntimeDataSetFingerprint> {
-  const facts = await readRuntimeDataSetFacts(candidate, { contentDigest: true });
+  return fingerprintOf(await readRuntimeDataSetFacts(candidate, { contentDigest: true }));
+}
+
+/** The fingerprint and the unfinished work a relocation carries away, both from one private snapshot (never the live file). */
+async function dataSetFingerprintWithWork(candidate: VscodeRuntimeDataSetCandidate): Promise<{ fingerprint: RuntimeDataSetFingerprint; work: RelocatedWorkInventory }> {
+  const facts = await readRuntimeDataSetFacts(candidate, { contentDigest: true, relocatedWork: true });
+  return { fingerprint: fingerprintOf(facts), work: facts.relocatedWork! };
+}
+
+function fingerprintOf(facts: Awaited<ReturnType<typeof readRuntimeDataSetFacts>>): RuntimeDataSetFingerprint {
   return {
     dataSetId: facts.binding.dataSetId,
     rootInstanceId: facts.binding.rootInstanceId,
@@ -2596,25 +2634,58 @@ export async function readDataRootMovedNotice(root: string): Promise<DataRootMov
 
 function isCarriedWork(value: unknown): value is DataRootCarriedWork {
   const work = value as Partial<DataRootCarriedWork> | null;
-  const settlement = work?.settlement as { state?: unknown; at?: unknown; by?: unknown } | undefined;
-  return !!work && Array.isArray(work.items) && work.items.every((item) => !!item && typeof item.conversationId === 'string'
-    && (item.turnId === undefined || typeof item.turnId === 'string') && typeof item.label === 'string')
-    && (settlement?.state === 'pending' || (settlement?.state === 'settled' && typeof settlement.at === 'string' && typeof settlement.by === 'string'));
+  return !!work && Array.isArray(work.dataSets) && work.dataSets.length > 0 && work.dataSets.every((item) => {
+    const settlement = item?.settlement as { state?: unknown; at?: unknown; by?: unknown; result?: unknown } | undefined;
+    const result = settlement?.result as Partial<DataRootCarriedWorkResult> | undefined;
+    try { parseRelocatedWorkInventory(item?.inventory); } catch { return false; }
+    return typeof item.id === 'string' && typeof item.dataSetId === 'string'
+      && (settlement?.state === 'pending'
+        || (settlement?.state === 'consented' && typeof settlement.at === 'string' && typeof settlement.by === 'string')
+        || (settlement?.state === 'settled' && typeof settlement.at === 'string' && typeof settlement.by === 'string'
+          && !!result && typeof result.counts === 'object' && Array.isArray(result.live) && Array.isArray(result.unsettled)));
+  });
 }
 
-/**
- * Records that the carried work of a moved notice was settled in the old directory (closed as
- * aborted, see DataRootMovedNotice.carriedWork); `by` names the installation that did it.
- */
-export async function settleDataRootMovedWork(root: string, relocationId: string, by: string): Promise<boolean> {
+/** Rewrites the moved notice of `root` for relocation `relocationId` under its admission (false: not that notice). */
+async function updateMovedWork(root: string, relocationId: string, change: (work: DataRootCarriedWork) => DataRootCarriedWork | undefined): Promise<boolean> {
   const resolved = path.resolve(root);
   return withRuntimeDataRootAdmission(resolved, async () => {
     const notice = await readDataRootMovedNotice(resolved);
-    if (!notice?.carriedWork || notice.relocationId !== relocationId || notice.carriedWork.settlement.state === 'settled') return false;
-    await writeJsonDurably(path.join(resolved, DATA_ROOT_MOVED_NOTICE_FILE), {
-      kind: MOVED_NOTICE_KIND, ...notice, carriedWork: { ...notice.carriedWork, settlement: { state: 'settled', at: new Date().toISOString(), by } }
-    });
+    if (!notice?.carriedWork || notice.relocationId !== relocationId) return false;
+    const next = change(notice.carriedWork);
+    if (!next) return false;
+    await writeJsonDurably(path.join(resolved, DATA_ROOT_MOVED_NOTICE_FILE), { kind: MOVED_NOTICE_KIND, ...notice, carriedWork: next });
     return true;
+  });
+}
+
+/**
+ * The user chose to keep using the old directory ("回到旧目录", or "在这里继续" when opening it): the
+ * pending carried work of every data set (or of `ids`) is settled when it is opened there, before
+ * anything runs. Only the notice of that relocation; a consent or settlement is never taken back.
+ */
+export async function consentToDataRootMovedWork(root: string, relocationId: string, by: string, ids?: readonly string[]): Promise<boolean> {
+  const at = new Date().toISOString();
+  return updateMovedWork(root, relocationId, (work) => {
+    let changed = false;
+    const dataSets = work.dataSets.map((item) => {
+      if (item.settlement.state !== 'pending' || (ids && !ids.includes(item.id))) return item;
+      changed = true;
+      return { ...item, settlement: { state: 'consented' as const, at, by } };
+    });
+    return changed ? { dataSets } : undefined;
+  });
+}
+
+/** Records, once, the settlement of data set `id`'s carried work (after its consent), with what it closed and left. */
+export async function recordDataRootMovedWorkSettled(
+  root: string, relocationId: string, id: string, by: string, result: DataRootCarriedWorkResult
+): Promise<boolean> {
+  return updateMovedWork(root, relocationId, (work) => {
+    const item = work.dataSets.find((entry) => entry.id === id);
+    if (item?.settlement.state !== 'consented') return undefined;
+    const settlement = { state: 'settled' as const, at: new Date().toISOString(), by, result };
+    return { dataSets: work.dataSets.map((entry) => (entry === item ? { ...entry, settlement } : entry)) };
   });
 }
 
@@ -2622,6 +2693,8 @@ export async function settleDataRootMovedWork(root: string, relocationId: string
 export async function clearDataRootMovedNotice(root: string, installationId: string): Promise<boolean> {
   const notice = await readDataRootMovedNotice(root);
   if (!notice || notice.installation.id !== installationId) return false;
+  // Carried work not settled yet keeps it: a data set opened later must still be settled first.
+  if (notice.carriedWork?.dataSets.some((item) => item.settlement.state !== 'settled')) return false;
   await fs.rm(path.join(path.resolve(root), DATA_ROOT_MOVED_NOTICE_FILE), { force: true });
   return true;
 }
@@ -3131,6 +3204,10 @@ function dataRootUnavailableMessage(root: string, reason: DataRootUnavailableRea
     return `数据目录暂时没有打开：${root} 里有一次没有生效的数据迁移（多半来自另一个 LimCode 安装）：数据已经复制进来，`
       + '但发起它的安装没有切换过去，它的进程也已经结束。可以撤销那次迁移后打开（只撤销那次迁移写入的内容；这之后有人写入过就不撤销），也可以暂不打开。';
   }
+  if (reason === 'moved-work') {
+    return `数据目录暂时没有打开：${root} 的数据已迁移到别处，迁走时还有没完成的任务；在这里打开会把它们再执行一次。`
+      + '要在这里继续，这些任务先按中止收尾（它们可能已在新目录执行过）；也可以改用新目录，或暂不打开。';
+  }
   if (reason === 'unreadable') {
     return `数据目录暂时无法读取：${root}；本窗口没有打开运行时。${detail ?? ''}`;
   }
@@ -3142,6 +3219,10 @@ function dataRootUnavailableMessage(root: string, reason: DataRootUnavailableRea
 }
 
 /** 'unreadable' for a read error that usually passes, 'inaccessible' for any other. */
+export function dataRootReadFailureReason(error: unknown): 'unreadable' | 'inaccessible' {
+  return readFailureReason(error);
+}
+
 function readFailureReason(error: unknown): 'unreadable' | 'inaccessible' {
   return TRANSIENT_READ_ERRORS.has(String((error as NodeJS.ErrnoException | undefined)?.code ?? '')) ? 'unreadable' : 'inaccessible';
 }

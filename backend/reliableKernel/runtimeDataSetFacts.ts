@@ -6,6 +6,7 @@ import type { HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import { copyRuntimeDataSetDatabase, copyRuntimeSqliteFiles, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import type { VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
+import type { RelocatedWorkInventory } from './relocatedWorkInventory';
 
 /**
  * Read-only facts of one data set from a private copy of its SQLite files, computed in a
@@ -21,6 +22,8 @@ export interface RuntimeDataSetFactsRequest {
   summary?: boolean;
   /** Every Conversation and MessageRevision id (the readable history), each sorted. */
   historyIds?: boolean;
+  /** The unfinished work a relocation carries away (see relocatedWorkInventory), from the same snapshot. */
+  relocatedWork?: boolean;
 }
 
 /** Ids of the readable history of one database; revisions reference their content, which is never deleted. */
@@ -34,6 +37,7 @@ export interface RuntimeDataSetFacts {
   contentDigest?: string;
   summary?: RuntimeDataSetSummary;
   historyIds?: RuntimeDataSetHistoryIds;
+  relocatedWork?: RelocatedWorkInventory;
 }
 
 /** @internal Worker protocol; plain data only. */
@@ -67,7 +71,8 @@ export async function readRuntimeDataSetFacts(
       ...(request.openable ? { openable: true } : {}),
       ...(request.contentDigest ? { contentDigest: true } : {}),
       ...(request.summary ? { summary: true } : {}),
-      ...(request.historyIds ? { historyIds: true } : {})
+      ...(request.historyIds ? { historyIds: true } : {}),
+      ...(request.relocatedWork ? { relocatedWork: true } : {})
     });
     return { binding, ...facts };
   } finally {

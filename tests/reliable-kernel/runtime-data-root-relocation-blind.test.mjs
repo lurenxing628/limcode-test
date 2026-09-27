@@ -26,7 +26,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const {
   abandonStagedDataRootRelocation, completeDataRootRelocation, dataRootRelocationCleanupState, DATA_ROOT_RELOCATION_MARKER_FILE,
   findDataRootRelocationCopy, finalizeDataRootRelocation, planDataRootRelocation, planOldDataRootDeletion, readDataRootMovedNotice,
-  recoverInterruptedDataRootRelocation, settleDataRootMovedWork, settleDataRootRelocationBeforeOpen, stageDataRootRelocation,
+  recoverInterruptedDataRootRelocation, consentToDataRootMovedWork, recordDataRootMovedWorkSettled, settleDataRootRelocationBeforeOpen, stageDataRootRelocation,
   undoUnpublishedDataRootRelocation
 } = relocation;
 const markerOf = async (target) => JSON.parse(await fs.readFile(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
@@ -479,23 +479,17 @@ test('跨模块 D 预检先按文件大小核对空间：不够就直接拒绝�
   } finally { await source.close(); }
 });
 
-test('跨模块 E“已迁走”标记带上迁走的未完成任务及其收尾状态；只有同一次迁移的标记能记为已收尾，且只记一次', async (t) => {
+test('跨模块 E 没有未完成的任务时“已迁走”标记不带 carriedWork，也就没有可同意或可记收尾的条目（带任务的情形见 relocated-work-opening）', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const target = path.join(fixture.base, 'new-home');
-  const options = {
-    movedBy: { id: '/installations/a', label: 'A' },
-    carriedWork: [{ conversationId: 'conversation_current_1', turnId: 'turn_1', label: '正在进行的回合' }]
-  };
+  const options = { movedBy: { id: '/installations/a', label: 'A' } };
   const staged = await stage(fixture, target, options);
   await completeDataRootRelocation(staged, async () => undefined, options);
   const notice = await readDataRootMovedNotice(fixture.root);
-  assert.deepEqual(notice.carriedWork, { items: options.carriedWork, settlement: { state: 'pending' } });
-  assert.equal(await settleDataRootMovedWork(fixture.root, randomUUID(), '/installations/b'), false, '别的迁移的标记不动');
-  assert.equal(await settleDataRootMovedWork(fixture.root, staged.relocationId, '/installations/b'), true);
-  const settled = (await readDataRootMovedNotice(fixture.root)).carriedWork;
-  assert.equal(settled.settlement.state, 'settled');
-  assert.equal(settled.settlement.by, '/installations/b');
-  assert.equal(await settleDataRootMovedWork(fixture.root, staged.relocationId, '/installations/c'), false, '只记一次');
+  assert.equal(notice.relocationId, staged.relocationId);
+  assert.equal(notice.carriedWork, undefined);
+  assert.equal(await consentToDataRootMovedWork(fixture.root, staged.relocationId, '/installations/b'), false);
+  assert.equal(await recordDataRootMovedWorkSettled(fixture.root, staged.relocationId, 'default', '/installations/b', { counts: {}, live: [], unsettled: [] }), false);
 });
 
 /** backend/capabilities/vscodeStorage/localStorageUri.ts with a fake vscode module. */

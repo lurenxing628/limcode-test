@@ -3,6 +3,7 @@ import Database from 'better-sqlite3';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { assertCurrentSchema, assertDatabaseBinding, configureReaderConnection } from './databaseSchema';
 import { readRuntimeDataSetSummary, runtimeDataSetContentDigest } from './runtimeDataSetContent';
+import { inventoryRelocatedWork } from './relocatedWorkInventory';
 import type {
   RuntimeDataSetFacts, RuntimeDataSetFactsWorkerData, RuntimeDataSetFactsWorkerResponse, RuntimeDataSetHistoryIds
 } from './runtimeDataSetFacts';
@@ -43,7 +44,8 @@ async function read(input: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeD
     return {
       ...(input.contentDigest ? { contentDigest: runtimeDataSetContentDigest(database) } : {}),
       ...(input.summary ? { summary: readRuntimeDataSetSummary(database) } : {}),
-      ...(input.historyIds ? { historyIds: readHistoryIds(database) } : {})
+      ...(input.historyIds ? { historyIds: readHistoryIds(database) } : {}),
+      ...(input.relocatedWork ? { relocatedWork: inventoryRelocatedWork(database) } : {})
     };
   } finally {
     database.close();

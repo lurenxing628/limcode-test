@@ -5,6 +5,7 @@ import {
   GlobalStatusPendingRelocationConflictError, LIMCODE_GLOBAL_STATUS_FILE, loadCommittedGlobalStatus, resolveDataRootUri, sameFsPath,
   updateGlobalStatusDataRoot, type LimCodeGlobalStatus, type PendingDataRootRelocation
 } from '../../backend/capabilities/vscodeStorage/globalStatus';
+import { RELOCATED_WORK_REPORTED_ONLY } from '../../backend/application/reliableKernel/relocatedWorkSettlement';
 import type { RuntimeRootPaths } from '../../backend/reliableKernel/contracts';
 import { ownProcessStartIdentity } from '../../backend/reliableKernel/runtimeClaimPrimitives';
 import {
@@ -15,7 +16,8 @@ import {
   planDataRootRelocation, planOldDataRootDeletion, readDataRootMovedNotice, readDataRootRelocationHold, recoverInterruptedDataRootRelocation,
   stageDataRootRelocation,
   sweepDataRootRelocationLeftovers, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
-  type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation
+  type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation,
+  consentToDataRootMovedWork,
 } from '../../backend/reliableKernel/runtimeDataRootRelocation';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
 import {
@@ -409,10 +411,15 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     await notify(ask, '旧数据目录现在无法打开', [check.message ?? previous]);
     return;
   }
+  // The work this installation's relocation carried away: confirming the return settles it there first.
+  const moved = await readDataRootMovedNotice(previous).catch(() => undefined);
+  const carried = moved?.carriedWork && moved.installation.id === installationOf(context).id
+    && moved.relocationId === status.lastMigration?.relocationId ? moved : undefined;
   const lines = [
     `旧目录：${previous}`,
     `当前目录：${current}`,
     '只切换数据目录，不复制也不合并：迁移之后在当前目录里新增或修改的对话不会带到旧目录，仍保存在当前目录；以后可以再迁移回来（会合并）。',
+    ...(carried ? describeMovedWork(carried) : []),
     '当前目录的迁移记录会失效：之后要删除旧目录，需要再迁移一次。',
     '所有 LimCode 窗口会重载一次；有任务的窗口会等任务结束，未发送的输入会保留。'
   ];
@@ -420,6 +427,10 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     ? (await ask({ title: '回到迁移前的旧数据目录？', sections: [{ lines }], actions: [CANCEL, { key: 'return', label: '回到旧目录' }] })).choice === 'return'
     : await nativeConfirm('回到迁移前的旧数据目录？', lines, '回到旧目录');
   if (!confirmed) return;
+  if (carried) {
+    await consentToDataRootMovedWork(previous, carried.relocationId, installationOf(context).id)
+      .catch((error: unknown) => console.warn('[LimCode] 没能记下对已迁走任务的处理，打开旧目录时会再询问。', error));
+  }
   const switchPointer = async (): Promise<void> => {
     if (await isAvailable(current, status)) {
       await invalidateDataRootRelocationRecord(current).catch((error: unknown) => console.warn('[LimCode] 当前目录的迁移记录没能标记为失效。', error));
@@ -597,6 +608,28 @@ export async function offerDataRootRecovery(
     await reloadWindow();
     return;
   }
+  if (reason === 'moved-work') {
+    const moved = await readDataRootMovedNotice(current).catch(() => undefined);
+    if (!moved?.carriedWork) {
+      await reloadWindow();
+      return;
+    }
+    const choice = await vscode.window.showErrorMessage(message, {
+      modal: true,
+      detail: [
+        `这个目录的数据已在 ${moved.movedAt.slice(0, 16).replace('T', ' ')} 由 ${moved.installation.label} 迁移到 ${moved.targetRootPath}。`,
+        ...describeMovedWork(moved)
+      ].join('\n')
+    }, CONTINUE_HERE, '改用新目录', '暂不打开');
+    if (choice === CONTINUE_HERE) {
+      await consentToDataRootMovedWork(current, moved.relocationId, installationOf(context).id);
+      await reloadWindow();
+    } else if (choice === '改用新目录') {
+      // Only the pointer moves: nothing runs here.
+      await switchToMovedDataRoot(context, undefined, current, moved.targetRootPath);
+    }
+    return;
+  }
   const previous = previousDataRoot(status, current);
   const canReturn = previous !== undefined && (await inspectDataRootForReturn(previous)).usable;
   // Its data was moved away (the old directory keeps the notice, also after its data was deleted).
@@ -726,6 +759,36 @@ async function settleInterruptedRelocation(context: vscode.ExtensionContext, pen
   if (ask) await tell(ask, '上次的迁移还没有撤销完', lines);
   else void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${lines.join('')}`);
   return false;
+}
+
+const CONTINUE_HERE = '在这里继续（已迁走的任务按中止收尾）';
+
+/** Kinds of carried work the settlement may only report (RELOCATED_WORK_REPORTED_ONLY), for people. */
+const REPORTED_ONLY_LABELS: Readonly<Record<string, string>> = {
+  continuation_delivery: '待投递的结果（会开启新的回合）',
+  child_answer: '还没送达的子 Agent 答复',
+  process_completion: '已结束进程的完成通知'
+};
+
+/**
+ * The unfinished work a relocation carried away that is not settled yet: how much, and item by
+ * item what the settlement can only report (it may still run once after opening), derived from the
+ * inventory and RELOCATED_WORK_REPORTED_ONLY.
+ */
+function describeMovedWork(notice: DataRootMovedNotice): string[] {
+  const conversations = (notice.carriedWork?.dataSets ?? []).filter((item) => item.settlement.state !== 'settled')
+    .flatMap((item) => item.inventory.conversations);
+  if (conversations.length === 0) return [];
+  const titles = conversations.slice(0, 5).map((conversation) => `“${conversation.title || conversation.conversationId}”`).join('、');
+  const lines = [
+    `迁走时有 ${conversations.length} 个对话还有没完成的任务（${titles}${conversations.length > 5 ? ' 等' : ''}）。它们已随数据迁到新目录，可能已在那里执行过；`
+      + '在这里继续使用时，打开前先把它们按中止收尾，不再执行。'
+  ];
+  const reported = conversations.flatMap((conversation) => Object.entries(RELOCATED_WORK_REPORTED_ONLY).flatMap(([list, kind]) =>
+    ((conversation as unknown as Record<string, unknown>)[list] as string[] | undefined ?? []).map((id) =>
+      `“${conversation.title || conversation.conversationId}”：${REPORTED_ONLY_LABELS[kind as string] ?? kind}（${id}）`)));
+  if (reported.length > 0) lines.push('以下各项收尾不了，打开后仍会执行一次：', ...reported);
+  return lines;
 }
 
 const FORGET_RELOCATION = '放弃这次迁移的记录';

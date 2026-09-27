@@ -77,6 +77,11 @@ function missingMcpPolicyGate(): never {
 }
 
 export interface ReliableKernelApplicationDependencies {
+  /**
+   * Opened with the runtime convergence held (no approved file change dispatched, no committed fact
+   * reconciled) until releaseRuntimeConvergence: work a relocation carried away is settled first.
+   */
+  holdRuntimeConvergence?: boolean;
   authorityCompiler: TurnAuthorityCompiler;
   compressionSettingsAuthority?: CompressionSettingsAuthority;
   resolveWorkEnvironment: WorkEnvironmentBoundaryResolver;
@@ -146,6 +151,8 @@ export class ReliableKernelApplication {
   private convergenceRequested = false;
   private convergenceClosed = false;
   private convergenceRetryDelayMs = 0;
+  /** While held (see ReliableKernelApplicationDependencies.holdRuntimeConvergence) a request only waits for the release. */
+  private convergenceHeld = false;
   private unsubscribeConvergence: (() => void) | undefined;
   private readonly providers: ReliableAgentProviderRegistry;
   private readonly diagnosticObserver: ReliableDiagnosticObserver | undefined;
@@ -329,6 +336,7 @@ export class ReliableKernelApplication {
         }
       }
     );
+    this.convergenceHeld = dependencies.holdRuntimeConvergence === true;
     this.unsubscribeConvergence = database.onCommit((commit) => {
       if (!commit.changes.some((change) => [
         'EffectIntent',
@@ -437,6 +445,16 @@ export class ReliableKernelApplication {
     this.scheduleRuntimeConvergence();
   }
 
+  /**
+   * Ends the hold of `holdRuntimeConvergence`: what was requested meanwhile (e.g. by the commits of
+   * settling a relocation's carried work) converges now. Repeating it does nothing.
+   */
+  public releaseRuntimeConvergence(): void {
+    if (!this.convergenceHeld) return;
+    this.convergenceHeld = false;
+    if (this.convergenceRequested) this.scheduleRuntimeConvergence();
+  }
+
   /** External SQLite commits do not arrive through this host's onCommit listener. */
   public async refreshExternalRuntimeWork(): Promise<void> {
     if (this.convergenceClosed) return;
@@ -475,6 +493,7 @@ export class ReliableKernelApplication {
   private scheduleRuntimeConvergence(): void {
     if (this.convergenceClosed) return;
     this.convergenceRequested = true;
+    if (this.convergenceHeld) return;
     if (this.convergenceTimer || this.convergenceTask) return;
     this.convergenceTimer = setTimeout(() => {
       this.convergenceTimer = undefined;

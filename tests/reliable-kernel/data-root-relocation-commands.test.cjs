@@ -116,6 +116,10 @@ function fixture({
       }
     },
     '../../backend/reliableKernel/runtimeClaimPrimitives': { ownProcessStartIdentity: () => 'start-identity' },
+    '../../backend/application/reliableKernel/relocatedWorkSettlement': {
+      // What the settlement module may only report; the prompts derive their list from it.
+      RELOCATED_WORK_REPORTED_ONLY: { pendingDeliveryIds: 'continuation_delivery', undeliveredAnswerIds: 'child_answer' }
+    },
     '../../backend/reliableKernel/runtimeDataRootRelocation': {
       DataRootRelocationError: class DataRootRelocationError extends Error {
         constructor(code, message) { super(message); this.code = code; }
@@ -175,6 +179,7 @@ function fixture({
       findDataRootRelocationCopy: async (root, relocationId) => { calls.push(['find-copy', root, relocationId]); return copyAside; },
       readDataRootRelocationHold: async (root) => { calls.push(['read-hold', root]); return hold; },
       isDataRootRelocationTargetInvisible: (error) => error?.code === 'data-root-relocation-target-invisible',
+      consentToDataRootMovedWork: async (root, relocationId, by) => { calls.push(['consent', root, relocationId, by]); return true; },
       undoUnpublishedDataRootRelocation: async (root) => { calls.push(['undo-unpublished', root]); return undoUnpublishedResult; }
     },
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': {
@@ -697,4 +702,60 @@ test('盲审 7 启动时进行中记录的目标一直看不到：提示并给�
   const keep = fixture({ pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: [undefined] });
   await keep.commands.beforeDataRootOpen(keep.context);
   assert.ok(keep.status.pendingRelocation, '不确认就保留，下次再试');
+});
+
+const carriedNotice = (overrides = {}) => ({
+  targetRootPath: '/mnt/new/limcode', relocationId: 'r-7', movedAt: '2026-09-27T08:30:00.000Z',
+  installation: { id: '/vscode/global-storage', label: 'VS Code（本机）' },
+  carriedWork: { dataSets: [{
+    id: 'default', dataSetId: 'current', settlement: { state: 'pending' },
+    inventory: { conversations: [{
+      conversationId: 'conversation-1', title: '部署脚本', otherRuntimeWork: false,
+      activeTurnIds: ['turn-1'], queuedIntentIds: [], unfinishedModelRequestIds: [], pendingInteractionIds: [], childExecutionIds: [],
+      pendingDeliveryIds: ['delivery-1'], pendingProcessCompletionIds: ['dispatch-1'], undeliveredAnswerIds: [], unreceiptedEffectIds: []
+    }] }
+  }] },
+  ...overrides
+});
+
+test('补充 E 打开带着迁走任务的旧目录（moved-work）：三选一；逐条列出收尾不了的项（按收尾模块导出的只报告类别推导）；在这里继续先记下同意再重载，改用新目录只切指针，暂不打开什么都不做', async () => {
+  const offer = async (choice, nativeAnswers = []) => {
+    const f = fixture({ host: false, recoveryChoice: choice, movedNotice: carriedNotice(), nativeAnswers });
+    await f.commands.offerDataRootRecovery(f.context, f.startup, '数据目录暂时没有打开', 'moved-work');
+    return f;
+  };
+  const here = await offer('在这里继续（已迁走的任务按中止收尾）');
+  const prompt = here.calls.find((call) => call[0] === 'error');
+  assert.deepEqual(prompt.slice(3), ['在这里继续（已迁走的任务按中止收尾）', '改用新目录', '暂不打开']);
+  assert.match(prompt[2].detail, /由 VS Code（本机） 迁移到 \/mnt\/new\/limcode/);
+  assert.match(prompt[2].detail, /1 个对话还有没完成的任务（“部署脚本”）/);
+  assert.match(prompt[2].detail, /以下各项收尾不了，打开后仍会执行一次：\n“部署脚本”：待投递的结果（会开启新的回合）（delivery-1）/);
+  assert.doesNotMatch(prompt[2].detail, /turn-1|dispatch-1/, '收尾模块能收尾的类别不列（这里的桩只把投递和子答复算作只报告）');
+  assert.deepEqual(here.calls.find((call) => call[0] === 'consent'), ['consent', SOURCE, 'r-7', '/vscode/global-storage']);
+  assert.ok(here.kinds().indexOf('consent') < here.kinds().lastIndexOf('command'));
+  assert.deepEqual(here.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+
+  const elsewhere = await offer('改用新目录', ['改用并重载']);
+  assert.ok(!elsewhere.kinds().includes('consent'), '改用新目录：这里什么都不收尾');
+  assert.equal(elsewhere.calls.find((call) => call[0] === 'status')[1].dataRootPath, '/mnt/new/limcode');
+
+  const later = await offer('暂不打开');
+  assert.ok(!later.kinds().includes('consent') && !later.kinds().includes('status') && !later.kinds().includes('command'), '暂不打开：什么都不做');
+});
+
+test('补充 E 发起安装“回到旧目录”：确认那一步就算同意，旧目录里带走的任务在打开时直接收尾；提示里写明；别的安装的标记或别的迁移不算', async () => {
+  const lastMigration = { fromPath: '/data/older', toPath: SOURCE, migratedAt: '2026-09-26T00:00:00.000Z', relocationId: 'r-7' };
+  const own = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }) });
+  await own.commands.returnToPreviousDataRoot(own.context, own.startup, own.request);
+  assert.match(JSON.stringify(own.prompts[0]), /在这里继续使用时，打开前先把它们按中止收尾/);
+  assert.deepEqual(own.calls.find((call) => call[0] === 'consent'), ['consent', '/data/older', 'r-7', '/vscode/global-storage']);
+  assert.ok(own.kinds().indexOf('consent') < own.kinds().indexOf('status'), '先记下同意，再切换指针');
+  for (const notice of [carriedNotice({ targetRootPath: SOURCE, installation: { id: '/other/installation', label: '另一个安装' } }), carriedNotice({ targetRootPath: SOURCE, relocationId: 'r-other' })]) {
+    const other = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: notice });
+    await other.commands.returnToPreviousDataRoot(other.context, other.startup, other.request);
+    assert.ok(!other.kinds().includes('consent'), '只认本安装、同一次迁移的标记');
+  }
+  const declined = fixture({ lastMigration, answers: [{ choice: 'cancel', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }) });
+  await declined.commands.returnToPreviousDataRoot(declined.context, declined.startup, declined.request);
+  assert.ok(!declined.kinds().includes('consent'), '没确认就不算同意');
 });

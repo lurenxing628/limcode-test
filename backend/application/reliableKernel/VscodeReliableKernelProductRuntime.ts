@@ -67,6 +67,11 @@ export interface VscodeReliableKernelProductRuntimeOptions {
   lifecycleObserver?: ReliableAgentLifecycleObserver;
   dispatchSpecial?: VscodeReliableToolHostOptions['dispatchSpecial'];
   onConfigurationChanged?: () => Promise<void> | void;
+  /**
+   * Work a relocation carried away from this old directory is settled right after the open: until
+   * releaseRelocatedWorkHold nothing that could run it starts (convergence, recovery, takeovers).
+   */
+  holdForRelocatedWork?: boolean;
 }
 
 export type VscodeReliableKernelRecoveryState =
@@ -105,6 +110,9 @@ export class VscodeReliableKernelProductRuntime {
     options?: ConversationNextTurnOptions
   ) => Promise<ConversationHostEligibilityDecision>;
   private eligibilityRescan: Promise<void> = Promise.resolve();
+  /** Carried-away work is settled before anything may run it (see releaseRelocatedWorkHold). */
+  private readonly relocatedWorkSettled: Promise<void>;
+  private releaseRelocatedWork: () => void = () => undefined;
   private workspaceSyncFailed = false;
   private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
   private closing = false;
@@ -133,8 +141,12 @@ export class VscodeReliableKernelProductRuntime {
     initializeConfiguration: () => Promise<void>;
     onConfigurationChanged?: () => Promise<void> | void;
     executionGate: { frozen: number };
+    holdForRelocatedWork?: boolean;
   }) {
     this.application = input.application;
+    this.relocatedWorkSettled = input.holdForRelocatedWork
+      ? new Promise<void>((resolve) => { this.releaseRelocatedWork = resolve; })
+      : Promise.resolve();
     this.executionGate = input.executionGate;
     this.configuration = input.configuration;
     this.toolHost = input.toolHost;
@@ -363,6 +375,7 @@ export class VscodeReliableKernelProductRuntime {
     };
     try {
       application = await ReliableKernelApplication.open(authority, {
+        holdRuntimeConvergence: options.holdForRelocatedWork === true,
         authorityCompiler: configuration,
         compressionSettingsAuthority: configuration,
         resolveWorkEnvironment: async (workEnvironmentId) => {
@@ -546,7 +559,8 @@ export class VscodeReliableKernelProductRuntime {
         conversationEntryEligibility,
         initializeConfiguration,
         onConfigurationChanged: options.onConfigurationChanged,
-        executionGate
+        executionGate,
+        holdForRelocatedWork: options.holdForRelocatedWork === true
       });
     } catch (error) {
       await debugCapture.close().catch(() => undefined);
@@ -588,11 +602,21 @@ export class VscodeReliableKernelProductRuntime {
     };
   }
 
+  /**
+   * The work a relocation carried away from this old directory is settled (or there is none):
+   * convergence, startup recovery and takeovers may run from now on. Repeating it does nothing.
+   */
+  public releaseRelocatedWorkHold(): void {
+    this.releaseRelocatedWork();
+    this.application.releaseRuntimeConvergence();
+  }
+
   public startRecovery(): Promise<ReliableKernelRecoveryReport> {
     if (this.recoveryTask) return this.recoveryTask;
     if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
     const controller = this.recoveryController;
     this.recoveryTask = (async () => {
+      await this.relocatedWorkSettled;
       await this.externalRuntimeWatcher.start();
       const [report] = await Promise.all([
         this.application.recover(controller.signal),
@@ -668,14 +692,14 @@ export class VscodeReliableKernelProductRuntime {
     const existing = this.conversationRecoveryTasks.get(conversationId);
     if (existing) return existing;
     const signal = this.recoveryController.signal;
-    const task = recoverServedConversation({
+    const task = this.relocatedWorkSettled.then(() => recoverServedConversation({
       application: this.application,
       childAgents: this.childAgents,
       conversations: this.conversations,
       conversationId,
       signal,
       ready: () => this.ensureCapabilitiesReady()
-    }).finally(() => {
+    })).finally(() => {
       if (this.conversationRecoveryTasks.get(conversationId) === task) {
         this.conversationRecoveryTasks.delete(conversationId);
       }
