@@ -15,11 +15,13 @@ const RECORD_KIND = 'limcode-runtime-data-set-merge';
 const REQUEST_KIND = 'limcode-runtime-data-set-merge-request';
 const COMMIT_KIND = 'limcode-runtime-data-set-merge-commit';
 const FINGERPRINT_KIND = 'limcode-runtime-data-set-fingerprint';
+const FINALIZATION_KIND = 'limcode-runtime-data-set-merge-finalization';
 const RECORDS = 'records';
 const REQUESTS = 'requests';
 const COMMITS = 'commits';
 /** Cache only: the content digest last computed for an exact file state. Never a merge fact. */
 const FINGERPRINTS = 'fingerprints';
+const FINALIZATIONS = 'finalizations';
 
 type StoragePaths = { globalStoragePath: string };
 
@@ -59,8 +61,11 @@ export type RuntimeDataSetMergeLedgerRecord = {
    */
   lastMerged?: RuntimeDataSetLastMerge;
 } & (
-  /** Written before the row transaction; `commitId` names the exact inserted id set. */
-  | { state: 'committing'; target: RuntimeDataSetIdentity; commitId: string }
+  /**
+   * Written before the row transaction; `commitId` names the exact inserted id set. `replaced` is the
+   * record it replaced, put back unchanged when the transaction is proven not to have committed.
+   */
+  | { state: 'committing'; target: RuntimeDataSetIdentity; commitId: string; replaced?: RuntimeDataSetMergeLedgerRecord }
   | {
     state: 'merged';
     target: RuntimeDataSetIdentity;
@@ -87,6 +92,23 @@ export interface RuntimeDataSetMergeLedgerRequest {
   expectedRootInstanceId: string;
   target: RuntimeDataSetIdentity;
   requestedAt: string;
+}
+
+/**
+ * Unfinished work a merge attempt closed in a source (after backing it up) while that attempt ended
+ * without a reported outcome (stopped or deferred afterwards). The next reported outcome of the
+ * source says so, then this is removed.
+ */
+export interface RuntimeDataSetMergeFinalization {
+  kind: typeof FINALIZATION_KIND;
+  candidateId: string;
+  source: RuntimeDataSetIdentity;
+  turns: number;
+  intents: number;
+  sourceBackupPath: string;
+  /** False when closing failed partway (some of the work may be closed). */
+  complete: boolean;
+  finalizedAt: string;
 }
 
 /** Exact rows a committing transaction inserts, for convergence after a crash. */
@@ -123,6 +145,17 @@ export async function runtimeDataSetFingerprint(candidate: VscodeRuntimeDataSetC
       .catch(() => undefined);
   }
   return fingerprint;
+}
+
+/**
+ * The cached fingerprint, only when the SQLite files are exactly as they were when it was computed;
+ * never reads the data set itself (cheap enough under a claim). Undefined: not known without a read.
+ */
+export async function cachedRuntimeDataSetFingerprint(candidate: VscodeRuntimeDataSetCandidate): Promise<RuntimeDataSetFingerprint | undefined> {
+  const binding = await requireCompleteRuntimeDataSet(candidate);
+  const files = await runtimeDataSetFileState(binding.paths.databasePath);
+  const cached = await readFingerprintCache({ globalStoragePath: candidate.configurationRootPath }, candidate.id).catch(() => undefined);
+  return cached?.files === files && sameFingerprintIdentity(cached.fingerprint, fingerprintIdentity(binding)) ? cached.fingerprint : undefined;
 }
 
 /**
@@ -240,6 +273,11 @@ async function readRuntimeDataSetMergeLedgerRecord(
   return isLedgerRecord(value, path.basename(file)) ? value : undefined;
 }
 
+/** Puts a record back exactly as it was, its time of judgment included (e.g. after a proven rollback). */
+export async function restoreRuntimeDataSetMergeLedgerRecord(paths: StoragePaths, record: RuntimeDataSetMergeLedgerRecord): Promise<void> {
+  await writeLedgerJson(paths, RECORDS, record.candidateId, record);
+}
+
 /** Drops a record, e.g. a committing record whose transaction is proven rolled back. */
 export async function removeRuntimeDataSetMergeLedgerRecord(paths: StoragePaths, candidateId: string): Promise<void> {
   await removeLedgerJson(paths, RECORDS, candidateId);
@@ -279,6 +317,36 @@ export async function writeRuntimeDataSetMergeRequest(
 
 export async function removeRuntimeDataSetMergeRequest(paths: StoragePaths, candidateId: string): Promise<void> {
   await removeLedgerJson(paths, REQUESTS, candidateId);
+}
+
+export async function readRuntimeDataSetMergeFinalization(
+  paths: StoragePaths,
+  candidate: { id: string; dataSetId?: string; rootInstanceId?: string }
+): Promise<RuntimeDataSetMergeFinalization | undefined> {
+  const file = await ledgerFile(paths, FINALIZATIONS, candidate.id);
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(file, 'utf8')) as unknown; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+  const entry = value as Partial<RuntimeDataSetMergeFinalization> | null;
+  if (entry?.kind !== FINALIZATION_KIND || entry.candidateId !== candidate.id || !sameRuntimeDataSetIdentity(entry.source, candidate)
+    || typeof entry.turns !== 'number' || typeof entry.intents !== 'number' || typeof entry.sourceBackupPath !== 'string'
+    || typeof entry.complete !== 'boolean' || typeof entry.finalizedAt !== 'string') return undefined;
+  return entry as RuntimeDataSetMergeFinalization;
+}
+
+export async function writeRuntimeDataSetMergeFinalization(
+  paths: StoragePaths,
+  finalization: Omit<RuntimeDataSetMergeFinalization, 'kind' | 'finalizedAt'>
+): Promise<void> {
+  await writeLedgerJson(paths, FINALIZATIONS, finalization.candidateId,
+    { kind: FINALIZATION_KIND, ...finalization, finalizedAt: new Date().toISOString() });
+}
+
+export async function removeRuntimeDataSetMergeFinalization(paths: StoragePaths, candidateId: string): Promise<void> {
+  await removeLedgerJson(paths, FINALIZATIONS, candidateId);
 }
 
 export async function writeRuntimeDataSetMergeCommit(paths: StoragePaths, rows: Array<[string, string]>): Promise<string> {

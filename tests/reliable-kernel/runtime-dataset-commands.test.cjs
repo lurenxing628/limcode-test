@@ -105,6 +105,9 @@ function fixture({
         return mergeReport;
       },
       readRuntimeDataSetMergeStates: async () => new Map(Object.entries(mergeStates)),
+      // Not the shipped values: the confirmation must say whatever the engine's bounds are.
+      RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS: { maxRows: 1234, maxBytes: 5 * 1024 * 1024 },
+      RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS: 56789,
       requestRuntimeDataSetMerge: async (_paths, input) => {
         calls.push(['merge-request', input.candidateId, input.expectedDataSetId, input.expectedRootInstanceId]);
       }
@@ -126,6 +129,7 @@ function fixture({
         return summaries[candidate.id];
       }
     },
+    '../../backend/reliableKernel/runtimeExclusiveMaintenance': { EXCLUSIVE_MAINTENANCE_DEFAULTS: { busyWaitTimeoutMs: 7 * 60_000 } },
     '../../backend/reliableKernel/runtimeStorageInspection': {
       deleteUnselectedRuntimeDataSet: async (_paths, id, expected) => calls.push(['delete', id, expected])
     },
@@ -171,6 +175,8 @@ test('deletion only offers other histories and cancellation performs no mutation
   const confirmed = fixture({ picks: [action('delete'), 0], confirmation: '永久删除' });
   await confirmed.manageRuntimeDataSets(confirmed.context, confirmed.startup);
   assert.deepEqual(confirmed.calls.filter(call => call[0] === 'delete'), [['delete', 'workspace:old', 'old']]);
+  assert.match(confirmed.calls.find(call => call[0] === 'warning')[2].detail, /还没有合并到当前库.*删除后其中的对话会永久丢失/,
+    '复审 merge3 #7：没有账本记录、从未合并的待合并来源也要警告');
 });
 
 test('read-only history is available without runtime startup and closes its snapshot on exit', async () => {
@@ -499,7 +505,7 @@ test('background merge reports new outcomes once, stays silent for known ones an
   const fresh = fixture({ mergeReport: emptyMergeReport({ blocked: [{ ...blocked, newly: true }] }) });
   await fresh.mergeHistoricalDataSetsInBackground(fresh.context, mergeHost());
   assert.match(fresh.calls.find(call => call[0] === 'warning')[1],
-    /未能合并到当前库，这些库里的内容没有被改动（已发布的旧格式会先备份并就地升级）/);
+    /未能合并到当前库，当前库的对话没有改动；各库的情况（例如已发布的旧格式先备份并就地升级、中断的任务已收尾）见原因/);
   const deferredIssue = { candidateId: 'workspace:old', code: 'runtime-hosts-active', message: '这个历史库正被其它窗口使用', newly: true };
   const deferred = fixture({ mergeReport: emptyMergeReport({ deferred: [deferredIssue] }) });
   await deferred.mergeHistoricalDataSetsInBackground(deferred.context, mergeHost());
@@ -507,6 +513,12 @@ test('background merge reports new outcomes once, stays silent for known ones an
   const failing = fixture({ mergeError: Object.assign(new Error('磁盘已满'), { code: 'ENOSPC' }) });
   await failing.mergeHistoricalDataSetsInBackground(failing.context, mergeHost());
   assert.match(failing.calls.find(call => call[0] === 'warning')[1], /暂时无法合并.*磁盘已满/);
+  const stopped = fixture({ mergeError: new Error('写入失败。') });
+  await stopped.mergeHistoricalDataSetsInBackground(stopped.context, mergeHost());
+  assert.match(stopped.calls.find(call => call[0] === 'warning')[1], /暂时无法合并：写入失败。已有数据未被修改/, '拼接处不出现“。。”');
+  const period = fixture({ mergeReport: emptyMergeReport({ deferred: [{ ...deferredIssue, message: '这个历史库正被其它窗口使用。' }] }) });
+  await period.mergeHistoricalDataSetsInBackground(period.context, mergeHost());
+  assert.match(period.calls.find(call => call[0] === 'info')[1], /暂时无法合并（这个历史库正被其它窗口使用），以后启动时会自动重试/);
   const obsolete = fixture();
   await obsolete.mergeHistoricalDataSetsInBackground(obsolete.context, mergeHost(), () => false);
   assert.equal(obsolete.calls.some(call => call[0] === 'merge-online'), false);
@@ -586,8 +598,10 @@ test('explicit merge runs online in this window without a reload; without a Runt
   assert.match(confirm[2].detail, /不需要重载窗口/);
   assert.match(confirm[2].detail, /已发布的旧格式会先备份并就地升级/);
   assert.match(confirm[2].detail, /按“中止”收尾，不会在当前库被继续执行/);
-  assert.match(confirm[2].detail, /若有其它窗口正在执行任务或正在使用，这次先不合并，之后会再试/);
-  assert.doesNotMatch(confirm[2].detail, /会先等它们的任务结束/, '合并时不等待忙窗口');
+  // 复审 merge3 #2：明确合并对超限来源会等其它窗口（与协调参数 whenBusy: 'wait' 一致），条件写具体数字。
+  assert.match(confirm[2].detail, /超过 1234 条记录或 5 MiB 的库需要其它窗口暂时让出：会在后台等其它窗口的任务结束、正在使用的窗口被切走（最多约 7 分钟，可取消），然后其它窗口会重载一次/);
+  assert.match(confirm[2].detail, /超过 56789 条记录的库当前版本不能安全合并/);
+  assert.doesNotMatch(confirm[2].detail, /这次先不合并，之后会再试|特别大/);
   assert.deepEqual(plain(f.calls.filter(call => ['merge-request', 'merge-online', 'command'].includes(call[0]))), [
     ['merge-request', 'workspace:old', 'old', 'old-instance'],
     ['merge-online', 'this-window', true, ['workspace:old']]

@@ -382,7 +382,7 @@ test('复审 merge2 #7：模型流检查点和栅栏只能随父 ModelRequest �
   } finally { target.close(); }
 });
 
-test('协作消息 message_seq 平移到当前库最大值之后并保持相对顺序；附件观察按内容身份复用', async (t) => {
+test('协作消息 message_seq 在合并事务内接在当前库最大值之后并保持相对顺序；附件观察按内容身份复用', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.current, [{ id: 'conversation_current_seq', project: SHARED_PROJECT }]);
   await seed(fixture.alpha, [{ id: 'conversation_alpha_seq', project: SHARED_PROJECT }]);
@@ -705,7 +705,7 @@ test('复审 merge2 #3/#9：超限来源在冲突之前从不请求协调；协�
   assert.deepEqual(calls, [{ cas: true, backups: 1, claims: [false, false] }, { locked: [true, true, false] }],
     '协调在锁外开始（正文已复制、备份已完成），拿锁后才执行；来源锁只在复核与事务那一步');
   assert.deepEqual(heldAt, {
-    'after-target-backup': [false, false], 'after-cas-transfer': [false, false],
+    'after-snapshot-copy': [false, false], 'after-target-backup': [false, false], 'after-cas-transfer': [false, false],
     'before-row-commit': [true, true], 'after-row-commit': [true, true]
   }, '快照、核验、备份、正文复制都不持有配置根锁；复核与事务在锁内');
 });
@@ -808,6 +808,10 @@ test('复审 startup2 #6：持久合并请求有期限，过期后删除，不�
   const report = await merge(fixture, database);
   assert.deepEqual([report.pendingSources, report.merged], [0, []]);
   await assert.rejects(fs.stat(file), { code: 'ENOENT' }, '过期请求被删除');
+  assert.deepEqual(report.blocked.map((issue) => [issue.candidateId, issue.code, issue.newly]),
+    [[fixture.alpha.id, 'runtime-data-set-merge-request-expired', true]], '复审 merge3 #4：过期不悄悄消失，提示一次');
+  assert.match(report.blocked[0].message, /请求的合并在 \d+ 天内一直没有完成，已不再自动重试/);
+  assert.deepEqual((await merge(fixture, database)).blocked, [], '只提示一次');
 });
 
 test('审查 #8：当前库备份失败时不留临时文件与空目录并推迟；成功后只保留最新几份备份', async (t) => {
@@ -899,7 +903,8 @@ test('超过在线事务上限的来源：无协调则推迟；协调成功走�
   const calls = [];
   const coordinate = (state) => async (input, run) => {
     calls.push(input);
-    if (state !== 'completed') return { state };
+    // A reason as the primitive words it, ending in its own full stop.
+    if (state !== 'completed') return { state, reason: '有 1 个窗口正在忙（有任务正在进行）。' };
     await run();
     return { state: 'completed' };
   };
@@ -918,7 +923,9 @@ test('超过在线事务上限的来源：无协调则推迟；协调成功走�
   assert.equal(calls[0].targetPaths.databasePath, fixture.current.binding.paths.databasePath);
   assert.match(calls[0].operationKey, new RegExp(`^${delta.id.replace(/[^\w]/g, '.')}@[0-9a-f]{16}$`));
   assert.equal(calls[0].requested, false);
-  assert.match(busy.deferred.find((item) => item.candidateId === delta.id).message, /需要其它窗口暂时让出才能合并/);
+  assert.match(busy.deferred.find((item) => item.candidateId === delta.id).message,
+    /需要其它窗口暂时让出才能合并：有 1 个窗口正在忙（有任务正在进行）。以后会自动重试。/);
+  assert.doesNotMatch(busy.deferred.find((item) => item.candidateId === delta.id).message, /。。/, 'coord3：原因不重复句号');
 
   // Through the real two-phase primitive: called outside every claim, it takes the engine's locks
   // once every window is ready; with no other window it runs at once, this window stays open.
@@ -1137,6 +1144,273 @@ test('迁移遇到正在接收回复的模型请求时明确失败：目标不�
   assert.deepEqual(await treeSnapshot(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths)).catch(() => undefined), ledgerBefore,
     '迁移不写合并记录');
 });
+
+test('复审 merge3 #1：规划之后当前库又写入协作消息，message_seq 在合并事务内分配，本次照常合并且顺序保持', async (t) => {
+  const fixture = await seqFixture(t);
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, {
+    async onFaultPoint(point) {
+      if (point === 'after-cas-transfer') await postCollaborationMessage(fixture.current, database, 'conversation_current_seq', 'collaboration_current_late');
+    }
+  });
+  assert.deepEqual([report.merged.length, report.deferred, report.blocked], [1, [], []]);
+  assertCollaborationOrder(fixture.current,
+    ['collaboration_current_1', 'collaboration_current_late', 'collaboration_alpha_1', 'collaboration_alpha_2']);
+});
+
+test('复审 merge3 #1：超限来源在锁外等待时其它窗口仍在写协作消息，它们让出之后的事务照常提交，不会白重载', async (t) => {
+  const fixture = await seqFixture(t);
+  const database = await openTarget(t, fixture.current);
+  const committed = [];
+  const coordinateOversized = async (input, run) => {
+    // whenBusy 'wait': a busy window keeps working, without any lock held here, until it is idle.
+    await postCollaborationMessage(fixture.current, database, 'conversation_current_seq', 'collaboration_current_while_waiting');
+    // Every other window has yielded (reloaded) now: the locks and the one transaction.
+    await input.withLocks(run).then(() => committed.push(true), (error) => { committed.push(error.message); throw error; });
+    return { state: 'completed' };
+  };
+  const report = await merge(fixture, database, {
+    limits: { maxRows: 1, maxBytes: Number.MAX_SAFE_INTEGER }, coordinateOversized,
+    candidateIds: [fixture.alpha.id], requested: true
+  });
+  assert.deepEqual(committed, [true], '其它窗口让出之后的事务没有失败');
+  assert.deepEqual([report.merged.length, report.merged[0]?.exclusive, report.deferred], [1, true, []]);
+  assertCollaborationOrder(fixture.current,
+    ['collaboration_current_1', 'collaboration_current_while_waiting', 'collaboration_alpha_1', 'collaboration_alpha_2']);
+});
+
+test('复审 merge3 #3：选源阶段只读账本和文件状态，已记录来源的内容指纹未命中缓存时在配置根 admission 之外计算', async (t) => {
+  const fixture = await conflictFixture(t);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  // Same content, other file state (opened and checkpointed elsewhere, copied back, …): not cached.
+  const later = new Date(Date.now() + 5_000);
+  await fs.utimes(fixture.alpha.binding.paths.databasePath, later, later);
+  const facts = kernelFile('runtimeDataSetFacts.js');
+  const original = facts.readRuntimeDataSetFacts;
+  const reads = [];
+  facts.readRuntimeDataSetFacts = (...args) => {
+    reads.push(isRuntimeDataRootAdmissionHeld(fixture.root));
+    return original(...args);
+  };
+  let report;
+  try { report = await merge(fixture, database); }
+  finally { facts.readRuntimeDataSetFacts = original; }
+  assert.deepEqual(reads, [false], '整库读取算指纹只在 admission 之外做一次');
+  assert.equal(report.pendingSources, 0);
+  assert.deepEqual(report.blocked.map((issue) => [issue.code, issue.newly]), [['runtime-data-set-merge-conflict', false]], '内容没变：仍按已记录的冲突处理，不重复提示');
+});
+
+test('复审 merge3 #4：事务确定回滚后原样恢复的拒绝记录保留判定时间，之后的持久请求照常重试', async (t) => {
+  const fixture = await conflictFixture(t);
+  const orphan = 'orphan body present in both data sets';
+  await ingest(fixture.current, orphan);
+  await ingest(fixture.alpha, orphan);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  const judged = await readLedgerRecord(fixture, fixture.alpha.id);
+  // The user resolves the conflict on the current side, then asks for the merge again.
+  await database.transaction([repo('Conversation').update('conversation_both', { title: 'alpha title' })]);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await requestMerge(fixture, fixture.alpha);
+  const rolledBack = await merge(fixture, database, {
+    onFaultPoint(point) {
+      if (point !== 'before-row-commit') return;
+      const writer = new Database(fixture.current.binding.paths.databasePath);
+      try { writer.prepare('DELETE FROM content_object WHERE sha256 = ?').run(sha256(orphan)); }
+      finally { writer.close(); }
+    }
+  });
+  assert.match(rolledBack.deferred[0]?.message ?? '', /写入当前库时出错/);
+  assert.deepEqual(await readLedgerRecord(fixture, fixture.alpha.id), judged, '恢复的记录与回滚前完全相同（包括判定时间）');
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'requested');
+  const retried = await merge(fixture, database);
+  assert.deepEqual([retried.merged.length, retried.blocked], [1, []], '请求晚于判定，照常重试');
+});
+
+test('复审 merge3 #4：提交前崩溃留下的 committing 记录确认没有提交时，放回它替换的记录（上次合并不丢）', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_once', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  const merged = await readLedgerRecord(fixture, fixture.alpha.id);
+  // Continued in the source afterwards (now conflicting), and an explicit re-merge crashed before its commit.
+  const source = new Database(fixture.alpha.binding.paths.databasePath);
+  try {
+    source.prepare("UPDATE conversation SET title = 'continued elsewhere' WHERE id = 'conversation_alpha_once'").run();
+    source.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { source.close(); }
+  const ledger = resolveVscodeRuntimeMergeLedgerRoot(fixture.paths);
+  await fs.mkdir(path.join(ledger, 'commits'), { recursive: true });
+  await fs.writeFile(path.join(ledger, 'commits', 'crashed.json'), JSON.stringify({
+    kind: 'limcode-runtime-data-set-merge-commit', commitId: 'crashed', rows: [['Conversation', 'conversation_never_committed']]
+  }));
+  await fs.writeFile(path.join(ledger, 'records', `${fixture.alpha.id.replace(/:/g, '-')}.json`), JSON.stringify({
+    ...merged, state: 'committing', commitId: 'crashed', source: { ...merged.source, contentDigest: 'crashed-attempt' },
+    replaced: merged, updatedAt: new Date().toISOString()
+  }));
+  const report = await merge(fixture, database);
+  assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.deepEqual([record.state, record.lastMerged?.mergedAt], ['blocked', merged.mergedAt], '上次合并仍有记录');
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.lastMerged?.intoCurrent, true);
+});
+
+test('复审 merge3 #5：规划之后来源文件被改写，锁内按文件状态复核后推迟，过期计划不写入，下次合并新内容', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_r5', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, {
+    onFaultPoint(point) { if (point === 'after-cas-transfer') rawInsertConversations(fixture.alpha, 'late', 1); }
+  });
+  assert.deepEqual([report.merged.length, report.deferred[0]?.code], [0, 'runtime-data-set-merge-source-changed']);
+  assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '没有按旧内容记为已合并');
+  const midway = readDatabase(fixture.current);
+  try { assert.equal(midway.count('conversation'), 0, '过期计划没有写入'); } finally { midway.close(); }
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  const after = readDatabase(fixture.current);
+  try { assert.equal(after.count('conversation', 'id = ?', 'raw_late_0'), 1); } finally { after.close(); }
+});
+
+test('复审 merge3 #5：复制私有快照期间来源被改写就重新复制；一直在变则推迟', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_copy', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  let copies = 0;
+  const report = await merge(fixture, database, {
+    onFaultPoint(point) { if (point === 'after-snapshot-copy' && ++copies === 1) rawInsertConversations(fixture.alpha, 'during_copy', 1); }
+  });
+  assert.equal(copies, 2, '第一份副本作废，重新复制');
+  assert.deepEqual([report.merged.length, report.deferred], [1, []]);
+  const target = readDatabase(fixture.current);
+  try { assert.equal(target.count('conversation', 'id = ?', 'raw_during_copy_0'), 1, '合并的是来源的新内容'); } finally { target.close(); }
+
+  const busy = await createFixture(t, { withBeta: false });
+  await seed(busy.alpha, [{ id: 'conversation_alpha_busy', project: SHARED_PROJECT }]);
+  const busyTarget = await openTarget(t, busy.current);
+  let writes = 0;
+  const changing = await merge(busy, busyTarget, {
+    onFaultPoint(point) { if (point === 'after-snapshot-copy') rawInsertConversations(busy.alpha, `write_${++writes}`, 1); }
+  });
+  assert.deepEqual([writes, changing.merged.length, changing.deferred[0]?.code], [3, 0, 'runtime-data-set-merge-source-changed']);
+  assert.equal(await readLedgerRecord(busy, busy.alpha.id), undefined);
+});
+
+test('复审 merge3 #5：检查通过之后、收尾之前来源被改写，锁内复核后推迟，来源不收尾也不备份', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_finalize', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_finalize', kind: 'bare' }]);
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, {
+    onFaultPoint(point) { if (point === 'before-source-finalization') rawInsertConversations(fixture.alpha, 'before_finalize', 1); }
+  });
+  assert.deepEqual([report.merged.length, report.deferred[0]?.code], [0, 'runtime-data-set-merge-source-changed']);
+  const source = readDatabase(fixture.alpha);
+  try { assert.equal(source.count('turn', "status = 'active'"), 1, '没有收尾'); } finally { source.close(); }
+  await assert.rejects(fs.stat(path.join(controlRoot(fixture.alpha), 'merge-source-backups')), { code: 'ENOENT' });
+  const again = await merge(fixture, database);
+  assert.deepEqual([again.merged.length, again.merged[0]?.finalized?.turns], [1, 1]);
+});
+
+test('复审 merge3 #8：收尾之后收到停止按推迟处理并记下收尾；下次合并成功或被拒时如实说明收尾与备份位置', async (t) => {
+  const stopAfterFinalization = async (fixture, database) => {
+    let copies = 0;
+    let stop = false;
+    return merge(fixture, database, {
+      shouldContinue: () => !stop,
+      // The second copy is the one taken after the source was finalized.
+      onFaultPoint(point) { if (point === 'after-snapshot-copy' && ++copies === 2) stop = true; }
+    });
+  };
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_stop', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_stop', kind: 'bare' }]);
+  const database = await openTarget(t, fixture.current);
+  const stopped = await stopAfterFinalization(fixture, database);
+  assert.equal(stopped.stopped, true);
+  assert.deepEqual([stopped.merged, stopped.deferred.map((issue) => issue.code)], [[], ['runtime-data-set-merge-stopped']]);
+  assert.match(stopped.deferred[0].message, /已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
+  const marker = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'finalizations', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const recorded = JSON.parse(await fs.readFile(marker, 'utf8'));
+  assert.deepEqual([recorded.turns, recorded.complete], [1, true]);
+  const source = readDatabase(fixture.alpha);
+  try { assert.equal(source.count('turn', "status = 'active'"), 0, '来源已收尾'); } finally { source.close(); }
+
+  const next = await merge(fixture, database);
+  assert.equal(next.merged.length, 1);
+  assert.deepEqual(next.merged[0].finalized, { turns: 1, intents: 0, sourceBackupPath: recorded.sourceBackupPath }, '成功提示里有之前的收尾和备份位置');
+  await assert.rejects(fs.stat(marker), { code: 'ENOENT' }, '说过之后删除');
+
+  const refused = await createFixture(t, { withBeta: false });
+  await seed(refused.alpha, [{ id: 'conversation_alpha_stop', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(refused.alpha, [{ conversationId: 'conversation_alpha_stop', kind: 'bare' }]);
+  const refusedTarget = await openTarget(t, refused.current);
+  assert.equal((await stopAfterFinalization(refused, refusedTarget)).deferred[0]?.code, 'runtime-data-set-merge-stopped');
+  // Before the next startup the same conversation appears in the current data set with other content.
+  await refusedTarget.transaction([
+    repo('Conversation').insert({ id: 'conversation_alpha_stop', title: 'other', status: 'active', created_at: NOW, updated_at: NOW })
+  ]);
+  const blocked = await merge(refused, refusedTarget);
+  assert.equal(blocked.blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  assert.match(blocked.blocked[0].message, /当前库没有改动/);
+  assert.doesNotMatch(blocked.blocked[0].message, /两边内容都没有改动/);
+  assert.match(blocked.blocked[0].message, /之前一次合并时已把这个库里的1 个中断的任务按“中止”收尾.*收尾前的备份在 /);
+});
+
+async function seqFixture(t) {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_current_seq', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_seq', project: SHARED_PROJECT }]);
+  await seedCollaborationMessages(fixture.current, 'conversation_current_seq', ['collaboration_current_1']);
+  await seedCollaborationMessages(fixture.alpha, 'conversation_alpha_seq', ['collaboration_alpha_1', 'collaboration_alpha_2']);
+  return fixture;
+}
+
+/** The same conversation with another title on each side: the merge is blocked by a conflict. */
+async function conflictFixture(t) {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_both', title: 'current title', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_only', project: SHARED_PROJECT },
+    { id: 'conversation_both', title: 'alpha title', project: SHARED_PROJECT }
+  ]);
+  return fixture;
+}
+
+/** Another window's ordinary collaboration message in the open target (allocated MAX(message_seq) + 1). */
+async function postCollaborationMessage(dataSet, runtime, conversationId, id) {
+  const store = new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding);
+  const payload = await store.ingest(runtime, `hello from ${id}`, 'text/vnd.limcode.collaboration-message');
+  const inboxItemId = `${id}_inbox`;
+  await runtime.transaction([
+    repo('CollaborationMessage').insertWithNextSequence(
+      { id, dedupe_key: `dedupe-${id}`, mode: 'message', created_at: NOW },
+      { column: 'message_seq', scope: {} }
+    ),
+    repo('CollaborationMessageSourceLink').insert({
+      id: `${id}_source`, message_id: id, conversation_id: conversationId, source_kind: 'tool',
+      source_key: `source-${id}`, turn_id: `${conversationId}_turn`, tool_call_id: null, board_post_id: null, created_at: NOW
+    }),
+    repo('RuntimeInboxItem').insert({
+      id: inboxItemId, dedupe_key: `dedupe-${id}`, source_kind: 'collaboration_message', source_id: id,
+      state: 'routed', created_at: NOW, updated_at: NOW
+    }),
+    repo('CollaborationMessageTargetLink').insert({
+      id: `${id}_target`, message_id: id, conversation_id: conversationId, inbox_item_id: inboxItemId, anchor_turn_id: null, created_at: NOW
+    }),
+    repo('CollaborationMessagePayloadLink').insert({ id: `${id}_payload`, message_id: id, content_object_id: payload.id, created_at: NOW }),
+    repo('RuntimeInboxPayloadLink').insert({ id: `${id}_inbox_payload`, inbox_item_id: inboxItemId, content_object_id: payload.id, created_at: NOW })
+  ]);
+}
+
+function assertCollaborationOrder(dataSet, ids) {
+  const target = readDatabase(dataSet);
+  try {
+    target.database.defaultSafeIntegers(true);
+    assert.deepEqual(target.database.prepare('SELECT id, message_seq FROM collaboration_message ORDER BY message_seq').raw().all(),
+      ids.map((id, index) => [id, BigInt(index + 1)]));
+  } finally { target.close(); }
+}
 
 async function createFixture(t, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-merge-'));

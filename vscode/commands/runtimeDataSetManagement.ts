@@ -10,11 +10,13 @@ import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeD
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
 import {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
+  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS,
   type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts,
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
 } from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { summarizeRuntimeDataSet, type RuntimeDataSetSummary } from '../../backend/reliableKernel/runtimeDataSetPreflight';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
+import { EXCLUSIVE_MAINTENANCE_DEFAULTS } from '../../backend/reliableKernel/runtimeExclusiveMaintenance';
 import { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } from '../../backend/reliableKernel/runtimeStorageInspection';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
@@ -236,7 +238,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     // Native VS Code command: no settings Webview exists here, so use the shell's modal confirmation.
     const confirmed = await vscode.window.showWarningMessage('永久删除这个历史库及其备份？', {
       modal: true, detail: `${dataSetLabel(candidate, mergeStates.get(candidate.id))}\n${candidate.runtimeDataRootPath}\n\n此操作不能撤销，不会删除当前历史库或共享设置。`
-        + deletionNote(mergeStates.get(candidate.id))
+        + deletionNote(candidate, mergeStates.get(candidate.id))
     }, '永久删除');
     if (confirmed !== '永久删除') return;
     if (!candidate.dataSetId) throw new Error('历史库尚未完整初始化，不能删除。');
@@ -247,8 +249,13 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   await switchHistory(context, startup, candidate, mergeStates.get(candidate.id));
 }
 
-function deletionNote(merge?: RuntimeDataSetMergeState): string {
-  if (!merge) return '';
+function deletionNote(candidate: VscodeRuntimeDataSetCandidate, merge?: RuntimeDataSetMergeState): string {
+  // No state: never merged and not recorded (e.g. only deferred so far), so pending an automatic merge.
+  if (!merge) {
+    return candidate.dataSetId
+      ? '\n\n注意：这个库还没有合并到当前库（它会在之后的启动中自动合并），删除后其中的对话会永久丢失；需要保留时请先选择“合并到当前库”。'
+      : '';
+  }
   const merged = lastMergeOf(merge);
   if (!merged) return '\n\n注意：这个库的对话还没有合并到任何库，删除后会永久丢失。';
   if (merged.targetMissing) {
@@ -271,6 +278,16 @@ function remergeNote(merged?: RuntimeDataSetMergedFacts): string {
     + '在已合并的对话里继续过时，那些对话与当前库里的那份不同，会整体不合并并说明原因，这时请保留这个库。';
 }
 
+/** What an explicit merge of a source above the online limit does (the engine's and coordination's own bounds). */
+function oversizedMergeNote(): string {
+  const { maxRows, maxBytes } = RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
+  const minutes = Math.round(EXCLUSIVE_MAINTENANCE_DEFAULTS.busyWaitTimeoutMs / 60_000);
+  return `超过 ${maxRows} 条记录或 ${Math.round(maxBytes / (1024 * 1024))} MiB 的库需要其它窗口暂时让出：`
+    + `会在后台等其它窗口的任务结束、正在使用的窗口被切走（最多约 ${minutes} 分钟，可取消），然后其它窗口会重载一次（未发送的输入会保留）；`
+    + '等不到时这次先不合并，之后启动时会再试。'
+    + `超过 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 条记录的库当前版本不能安全合并，会说明原因。`;
+}
+
 /**
  * Explicit merge of one data set, online: no window reload. The request is recorded first, so a
  * closed window or a busy source is retried by a later startup.
@@ -285,8 +302,7 @@ async function mergeNow(
   const confirmed = await vscode.window.showWarningMessage('把这个历史库合并到当前库？', {
     modal: true, detail: `来源：${candidate.runtimeDataRootPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
       + '原库保留（已发布的旧格式会先备份并就地升级）；原库里中断的任务按“中止”收尾，不会在当前库被继续执行。'
-      + '无法自动收尾的工作或数据冲突时整体不合并，并说明原因。'
-      + '特别大的库需要其它窗口暂时重载一次（未发送的输入会保留）；这时若有其它窗口正在执行任务或正在使用，这次先不合并，之后会再试。' + changed
+      + '无法自动收尾的工作或数据冲突时整体不合并，并说明原因。' + oversizedMergeNote() + changed
   }, '合并');
   if (confirmed !== '合并' || !candidate.dataSetId || !candidate.rootInstanceId) return;
   await requestRuntimeDataSetMerge(pathsFor(context), {
@@ -489,13 +505,13 @@ async function reportHistoricalMerge(
   const deferred = report.deferred.filter(announce);
   if (deferred.length) {
     void vscode.window.showInformationMessage(
-      `有 ${deferred.length} 份旧聊天记录暂时无法合并（${deferred.map(issue => issue.message).join('；')}），以后启动时会自动重试。`
+      `有 ${deferred.length} 份旧聊天记录暂时无法合并（${deferred.map(issue => withoutFullStop(issue.message)).join('；')}），以后启动时会自动重试。`
     );
   }
   const problems = [...report.blocked, ...report.failures].filter(announce);
   if (!problems.length) return;
   void vscode.window.showWarningMessage(
-    '部分旧聊天记录未能合并到当前库，这些库里的内容没有被改动（已发布的旧格式会先备份并就地升级）。', '查看原因'
+    '部分旧聊天记录未能合并到当前库，当前库的对话没有改动；各库的情况（例如已发布的旧格式先备份并就地升级、中断的任务已收尾）见原因。', '查看原因'
   ).then(async choice => {
     if (choice !== '查看原因' || !stillCurrent()) return;
     await showReadOnly(context, '旧聊天记录合并结果', problems.map(problem =>
@@ -541,6 +557,12 @@ export async function upgradeHistoricalDataSetsOnStartup(
   }
 }
 
+/** For text the caller follows with its own punctuation (no “。。”). */
+function withoutFullStop(text: string): string {
+  return text.trim().replace(/[。．.]+$/u, '');
+}
+
+/** Callers add their own full stop. */
 function describeError(error: unknown): string {
   const messages: string[] = [];
   const seen = new Set<unknown>();
@@ -552,7 +574,7 @@ function describeError(error: unknown): string {
       break;
     }
     const code = (current as { code?: unknown }).code;
-    const message = typeof code === 'string' ? `[${code}] ${current.message}` : current.message;
+    const message = withoutFullStop(typeof code === 'string' ? `[${code}] ${current.message}` : current.message);
     if (!messages.includes(message)) messages.push(message);
     current = (current as { cause?: unknown }).cause;
   }
