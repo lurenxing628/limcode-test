@@ -4,13 +4,19 @@ import * as path from 'node:path';
 import { realPath } from './realPath';
 
 /**
- * The extension host process holds SQLite connections: the Runtime database worker thread, and the
- * merge/inspection connections. SQLite's unix VFS keeps its locks as POSIX fcntl locks, which belong
- * to the process and are all dropped when any descriptor of that file in the process is closed. A
- * file tool or entry point that opens a database, its -wal or above all its -shm inside this process
- * silently releases the worker's locks: another process may then write under it (lost writes,
- * SQLITE_PROTOCOL, torn snapshots). Writing, truncating or deleting those files corrupts the database
- * outright on every platform.
+ * The extension host process holds SQLite connections: the Runtime database worker thread with its
+ * online backups, and the connections that merges, history inspection, data-directory relocation and
+ * copy verification open on other databases and on private copies. SQLite's unix VFS keeps its locks
+ * as POSIX fcntl locks, which belong to the process and are all dropped when any descriptor of that
+ * file in the process is closed. A file tool or entry point that opens a database, its -wal or above
+ * all its -shm inside this process silently releases those locks: another process may then write
+ * under it (lost writes, SQLITE_PROTOCOL, torn snapshots). Writing, truncating or deleting those
+ * files corrupts the database outright on every platform, and deleting a private copy while it is
+ * being written or read makes that backup or verification fail.
+ *
+ * Only the Runtime worker registers its database by identity (registerInProcessSqliteDatabase); every
+ * other database this process opens carries one of LimCode's own names below, so they are refused by
+ * name wherever they are.
  *
  * Every in-process file entry point (read, write/edit/delete planning and dispatch, transfer, local
  * attachments, exports) asks this guard before touching a local path. The guard itself only uses
@@ -19,10 +25,18 @@ import { realPath } from './realPath';
  */
 const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
 /**
- * Databases LimCode itself writes: `limcode.sqlite` (every data set), `limcode.epoch-N.sqlite`
- * (epoch migration backups) and `limcode.sqlite.<pid>.tmp` (merge backup staging), with sidecars.
+ * Databases LimCode itself writes: `limcode.sqlite` (every data set, and the private copies merges
+ * and inspection make in temporary directories), `limcode.epoch-N.sqlite` (epoch migration backups)
+ * and `limcode.sqlite.<pid>.tmp` (merge backup staging), with sidecars.
  */
 const LIMCODE_DATABASE_FILE_NAME = /^limcode\.(?:.*\.)?sqlite(?:[.-].*)?$/;
+/**
+ * Private copies a data set's control root holds while this process uses them, with sidecars: the
+ * Backup API copies of the open database behind a merge pre-copy (`merge-precopy-<pid>-<uuid>`), a
+ * relocation row count (`relocation-count-<pid>-<uuid>`) and a bulk-copy verification
+ * (`copy-verify-<uuid>`).
+ */
+const LIMCODE_STAGING_DATABASE_FILE_NAME = /^(?:merge-precopy|relocation-count|copy-verify)-.+\.sqlite(?:-wal|-shm|-journal)?$/;
 
 /** Databases whose connection lives in this process right now (the Runtime worker registers its own). */
 const inProcessDatabases = new Map<symbol, string>();
@@ -72,8 +86,8 @@ export async function assertNotSqliteDatabaseFile(
  * Refused, both under the path as given and under its real path (links resolved):
  * - LimCode's own database names with their `-wal`, `-shm`, `-journal`, anywhere, compared
  *   case-insensitively. Every LimCode data set (the current one, old workspace-scope sets, merge
- *   backups, cutover archives) keeps its database under these names, and no file tool needs those
- *   bytes in-process;
+ *   backups, cutover archives) and every private copy LimCode stages keeps its database under these
+ *   names, and no file tool needs those bytes in-process;
  * - any `X-wal`, `X-shm` or `X-journal` whose main database `X` is a file beside it, for SQLite
  *   databases other extensions in this host may hold;
  * - any `X` that has one of those sidecars beside it: a database in use or not cleanly closed;
@@ -106,7 +120,7 @@ async function refusalByName(candidate: string): Promise<Omit<SqliteDatabaseFile
   const name = path.basename(candidate).toLowerCase();
   const suffix = SQLITE_SIDECAR_SUFFIXES.find((entry) => name.length > entry.length && name.endsWith(entry));
   const mainPath = suffix ? candidate.slice(0, candidate.length - suffix.length) : candidate;
-  if (LIMCODE_DATABASE_FILE_NAME.test(name)) {
+  if (LIMCODE_DATABASE_FILE_NAME.test(name) || LIMCODE_STAGING_DATABASE_FILE_NAME.test(name)) {
     return { databasePath: mainPath, reason: suffix ? `LimCode 数据库的 ${suffix} 伴随文件` : 'LimCode 数据库文件' };
   }
   if (suffix) {

@@ -343,7 +343,11 @@ test('SQLite 文件判定按名称、真实路径、同目录伴随文件和进�
   for (const name of [
     'workspace-scope/limcode.sqlite', 'workspace-scope/limcode.sqlite-wal', 'workspace-scope/LIMCODE.SQLITE-SHM',
     'merge-backups/20260926/limcode.sqlite-journal', 'merge-backups/20260926/limcode.sqlite.4242.tmp',
-    'backups/limcode.epoch-3.sqlite', 'backups/limcode.epoch-3.sqlite-shm'
+    'backups/limcode.epoch-3.sqlite', 'backups/limcode.epoch-3.sqlite-shm',
+    // Private copies staged in a data set's control root while this process backs up or reads them.
+    'control/merge-precopy-4242-0f1e2d3c.sqlite', 'control/merge-precopy-4242-0f1e2d3c.sqlite-journal',
+    'control/relocation-count-4242-0f1e2d3c.sqlite', 'control/relocation-count-4242-0f1e2d3c.sqlite-wal',
+    'control/copy-verify-0f1e2d3c.sqlite', 'control/COPY-VERIFY-0F1E2D3C.SQLITE-SHM'
   ]) {
     assert.ok(await refused(path.join(root, name)), name);
   }
@@ -358,7 +362,8 @@ test('SQLite 文件判定按名称、真实路径、同目录伴随文件和进�
   await touch('plain/notes-shm');
   await touch('plain/limcode.json');
   await touch('plain/report.sqlite');
-  for (const name of ['plain/notes-shm', 'plain/limcode.json', 'plain/report.sqlite', 'plain/missing.txt']) {
+  for (const name of ['plain/notes-shm', 'plain/limcode.json', 'plain/report.sqlite', 'plain/missing.txt',
+    'plain/copy-verify.sqlite', 'plain/merge-precopy-notes.txt', 'plain/old-relocation-count-1.sqlite']) {
     assert.equal(await refused(path.join(root, name)), undefined, name);
   }
   // A link resolves to the file it names. Windows may refuse file symbolic links without privilege.
