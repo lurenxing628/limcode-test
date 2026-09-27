@@ -1673,7 +1673,7 @@ export function executeConversationHistoryProjection(
         FROM conversation
         JOIN page_conversation ON page_conversation.id = conversation.id
        ORDER BY conversation.updated_at DESC, conversation.id DESC
-    `, seedParameters);
+    `, seedParameters, { count: seedIds.length });
     const conversationIds = conversations.map((row) => String(row.id));
     const origins = queryAllByIds(database, 'conversation_origin_link', 'conversation_id', conversationIds)
       .filter((row) => row.source_conversation_id === null || conversationIds.includes(String(row.source_conversation_id)));
@@ -2223,7 +2223,7 @@ export function executeClientCollaborationHistoryPage(
            ORDER BY newest.attempt_seq DESC LIMIT 1
         )
        WHERE target.message_id IN (${messagePlaceholders.join(',')})
-      `, messageParameters);
+      `, messageParameters, { count: messagePlaceholders.length });
       include('RuntimeDelivery', deliveries);
       const turnIds = [...new Set([
         ...sources.map((row) => row.turn_id),
@@ -2412,15 +2412,20 @@ function queryPlainRows(
 }
 
 /**
- * SQL text that embeds one placeholder per id: each list length is a different text, so it is
- * prepared for this call only and never enters the bounded statement cache.
+ * SQL text that embeds one placeholder per id, so each list length is a different text. At one
+ * call site a single id (or none) and a full chunk always give the same text and reuse the
+ * connection's prepared Statement; any other length (a trailing partial chunk) is prepared for
+ * this call only and never enters the bounded statement cache.
  */
 function queryIdListRows(
   database: Pick<Database.Database, 'prepare'>,
   sql: string,
-  parameters: Record<string, string | bigint | null> = {}
+  parameters: Record<string, string | bigint | null>,
+  ids: { count: number; chunkSize?: number }
 ): Array<Record<string, unknown>> {
-  return prepareUncached(database, sql).all(parameters) as Array<Record<string, unknown>>;
+  const fixedText = ids.count <= 1 || ids.count === ids.chunkSize;
+  return (fixedText ? prepareCached(database, sql) : prepareUncached(database, sql))
+    .all(parameters) as Array<Record<string, unknown>>;
 }
 
 function mergeRowsById(rows: readonly Record<string, unknown>[]): Array<Record<string, unknown>> {
@@ -2526,7 +2531,8 @@ export function queryCollaborationMessagesForTurns(
   loadedTurnIds: readonly string[]
 ): Array<Record<string, unknown>> {
   const parameters: Record<string, string | bigint> = { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) };
-  const turnList = [...new Set(loadedTurnIds)].map((id, index) => {
+  const turnIds = [...new Set(loadedTurnIds)];
+  const turnList = turnIds.map((id, index) => {
     parameters[`turn${index}`] = id;
     return `@turn${index}`;
   }).join(',');
@@ -2550,7 +2556,7 @@ export function queryCollaborationMessagesForTurns(
            )
      ORDER BY message.message_seq DESC, message.id DESC
      LIMIT @limit
-  `, parameters);
+  `, parameters, { count: turnIds.length });
 }
 
 function queryClientRuntimeDeliveries(
@@ -2589,8 +2595,9 @@ function queryVisibleMessageRowsByIds(
 ): Array<Record<string, unknown>> {
   const unique = [...new Set(messageIds)];
   const rows: Array<Record<string, unknown>> = [];
-  for (let offset = 0; offset < unique.length; offset += 350) {
-    const chunk = unique.slice(offset, offset + 350);
+  const chunkSize = 350;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
     if (chunk.length === 0) continue;
     const parameters: Record<string, string | bigint> = { conversationId };
     const placeholders = chunk.map((id, index) => {
@@ -2627,7 +2634,7 @@ function queryVisibleMessageRowsByIds(
         FROM visible_messages
        WHERE id IN (${placeholders.join(',')})
        ORDER BY message_seq ASC, id ASC
-    `, parameters));
+    `, parameters, { count: chunk.length, chunkSize }));
   }
   return mergeRowsById(rows);
 }
@@ -2638,8 +2645,9 @@ function queryLatestToolCallEvents(
 ): Array<Record<string, unknown>> {
   const unique = [...new Set(toolCallIds)];
   const rows: Array<Record<string, unknown>> = [];
-  for (let offset = 0; offset < unique.length; offset += 350) {
-    const chunk = unique.slice(offset, offset + 350);
+  const chunkSize = 350;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
     if (chunk.length === 0) continue;
     const parameters: Record<string, string | bigint> = {
       eventLimit: BigInt(CLIENT_TOOL_EVENT_SUMMARY_LIMIT_PER_CALL)
@@ -2661,7 +2669,7 @@ function queryLatestToolCallEvents(
         )
        WHERE client_tail_ordinal <= @eventLimit
        ORDER BY tool_call_id ASC, event_seq ASC, id ASC
-    `, parameters).map(({ client_tail_ordinal: _ordinal, ...row }) => row));
+    `, parameters, { count: chunk.length, chunkSize }).map(({ client_tail_ordinal: _ordinal, ...row }) => row));
   }
   return rows;
 }
@@ -2672,8 +2680,9 @@ function queryLatestChildExecutionTurnLinks(
 ): Array<Record<string, unknown>> {
   const unique = [...new Set(childExecutionIds)];
   const rows: Array<Record<string, unknown>> = [];
-  for (let offset = 0; offset < unique.length; offset += 350) {
-    const chunk = unique.slice(offset, offset + 350);
+  const chunkSize = 350;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
     if (chunk.length === 0) continue;
     const parameters: Record<string, string | bigint> = {};
     const placeholders = chunk.map((id, index) => {
@@ -2693,7 +2702,7 @@ function queryLatestChildExecutionTurnLinks(
         )
        WHERE client_ordinal = 1
        ORDER BY child_execution_id ASC, turn_seq ASC, id ASC
-    `, parameters));
+    `, parameters, { count: chunk.length, chunkSize }));
   }
   return rows;
 }
@@ -2732,7 +2741,7 @@ function queryByIds(
      ) ASC,
      id DESC
      LIMIT @limit
-  `, parameters);
+  `, parameters, { count: unique.length });
 }
 
 /** History-page closure is already scope-bounded; do not apply the client-feed global row cap. */
@@ -2747,8 +2756,9 @@ function queryAllByIds(
   }
   const unique = [...new Set(ids)];
   const rows: Array<Record<string, unknown>> = [];
-  for (let offset = 0; offset < unique.length; offset += 400) {
-    const chunk = unique.slice(offset, offset + 400);
+  const chunkSize = 400;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
     const parameters: Record<string, string | bigint> = {};
     const placeholders = chunk.map((id, index) => {
       parameters[`id${index}`] = id;
@@ -2758,7 +2768,7 @@ function queryAllByIds(
       SELECT * FROM ${quote(table)}
        WHERE ${quote(column)} IN (${placeholders.join(',')})
        ORDER BY id ASC
-    `, parameters));
+    `, parameters, { count: chunk.length, chunkSize }));
   }
   return rows;
 }
@@ -2837,14 +2847,15 @@ function queryConversationIdChunks(
 ): Array<Record<string, unknown>> {
   const rows: Array<Record<string, unknown>> = [];
   const unique = [...new Set(conversationIds)];
-  for (let offset = 0; offset < unique.length; offset += 400) {
-    const chunk = unique.slice(offset, offset + 400);
+  const chunkSize = 400;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
     const parameters: Record<string, string | bigint> = {};
     const placeholders = chunk.map((id, index) => {
       parameters[`conversation${index}`] = id;
       return `@conversation${index}`;
     }).join(',');
-    rows.push(...queryIdListRows(database, sql(placeholders), parameters));
+    rows.push(...queryIdListRows(database, sql(placeholders), parameters, { count: chunk.length, chunkSize }));
   }
   return rows;
 }
@@ -2895,7 +2906,7 @@ function queryConversationModelRequests(
          ${visibleLinkClause}
        )
      ORDER BY owner_turn.created_at DESC, request.request_seq DESC, request.id DESC
-  `, parameters).reverse();
+  `, parameters, { count: visiblePlaceholders.length }).reverse();
 }
 
 function wireJsonBytes(value: unknown): number {

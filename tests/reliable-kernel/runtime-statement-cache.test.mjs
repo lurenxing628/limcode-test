@@ -171,6 +171,69 @@ test('LRU 上限生效，占位符个数可变的 SQL 不进缓存', () => {
   }
 });
 
+test('按 id 列表读回：单个 id 与满块复用语句，只有末尾不满的块临时 prepare', async () => {
+  // A commit reads back each AnswerSubmission it wrote by id; a large transaction must not make a
+  // native prepare per row. Rows are inserted directly (no foreign keys) to reach this read alone.
+  const statementCache = cacheModule();
+  const projection = require(path.join(compiledRoot, 'backend/reliableKernel/clientProjection.js'));
+  await withRuntime(async ({ open, binding }) => {
+    await (await open()).close();
+    const raw = new Database(binding.paths.databasePath);
+    try {
+      raw.defaultSafeIntegers(true);
+      raw.pragma('foreign_keys = OFF');
+      const insertBridge = raw.prepare("INSERT INTO answer_bridge (id, child_execution_id, current_submission_id, status, created_at, updated_at) VALUES (?, ?, NULL, 'open', ?, ?)");
+      const insertSubmission = raw.prepare('INSERT INTO answer_submission (id, answer_bridge_id, submission_seq, turn_id, interrupted, created_at) VALUES (?, ?, 1, ?, 0, ?)');
+      raw.transaction(() => {
+        for (let index = 0; index < 1300; index += 1) {
+          insertBridge.run(`bridge-${index}`, `child-${index}`, NOW, NOW);
+          insertSubmission.run(`submission-${index}`, `bridge-${index}`, `turn-${index}`, NOW);
+        }
+      })();
+      const cache = statementCache.attachRuntimeStatementCache(raw);
+      try {
+        const readOneByOne = (from, to) => {
+          for (let index = from; index < to; index += 1) {
+            const record = projection.projectAnswerSubmissionRecord(raw, `submission-${index}`);
+            assert.equal(record.id, `submission-${index}`);
+            assert.ok(record.outcome, 'the derived outcome is still projected');
+          }
+        };
+        readOneByOne(0, 10);
+        const warm = cache.inspect();
+        readOneByOne(10, 510);
+        const single = cache.inspect();
+        assert.equal(single.prepares - warm.prepares, 0, '500 more single-id read-backs prepare nothing new');
+        assert.equal(single.uncached - warm.uncached, 0);
+        assert.ok(single.hits - warm.hits >= 1000, 'each read-back reuses its submission and bridge statements');
+
+        const readTogether = (count) => {
+          const ids = Array.from({ length: count }, (_value, index) => `submission-${index}`);
+          const records = projection.projectAnswerSubmissionRecords(raw, ids);
+          assert.deepEqual(records.map((record) => record.id).sort(), [...ids].sort());
+        };
+        readTogether(900);
+        const afterFirstList = cache.inspect();
+        // 900 ids: two full chunks of 400 and one of 100, for submissions and again for bridges.
+        readTogether(900);
+        const afterSecondList = cache.inspect();
+        assert.equal(afterSecondList.prepares - afterFirstList.prepares, 2, 'only the two trailing partial chunks are prepared again');
+        assert.equal(afterSecondList.uncached - afterFirstList.uncached, 2, 'partial chunks never enter the cache');
+        assert.equal(afterSecondList.hits - afterFirstList.hits, 4, 'every full chunk reuses one statement');
+        // 1300 ids: one more full chunk per query, still no more prepares.
+        readTogether(1300);
+        const afterLongerList = cache.inspect();
+        assert.equal(afterLongerList.prepares - afterSecondList.prepares, 2);
+        assert.equal(afterLongerList.hits - afterSecondList.hits, 6);
+      } finally {
+        statementCache.detachRuntimeStatementCache(raw);
+      }
+    } finally {
+      raw.close();
+    }
+  });
+});
+
 test('连接关闭或 schema 变化后不复用旧语句，也不跨连接复用', async () => {
   const statementCache = cacheModule();
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-statement-cache-unit-'));
