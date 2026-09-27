@@ -36,7 +36,10 @@ export interface ExclusiveMaintenanceWindowState {
 
 const NOTICE_KEY = 'limcode.exclusiveMaintenance.noticeAfterReload';
 const REQUESTER_KEY = 'limcode.exclusiveMaintenance.requester';
-/** A kept notice older than this is dropped unread. */
+/**
+ * A kept notice is dropped unread when the window opened again more than this after it was kept
+ * (not a reload for that maintenance). Waiting for the maintenance to end does not count.
+ */
 const NOTICE_TTL_MS = 10 * 60_000;
 /** Set when this window's participant starts. */
 let windowState: ExclusiveMaintenanceWindowState | undefined;
@@ -124,13 +127,19 @@ export type ExclusiveMaintenanceRequestOptions = Omit<
 
 /**
  * Once after the window opened again: why the user's operation did not run before another window's
- * maintenance reloaded this one. Read and cleared.
+ * maintenance reloaded this one. Read and cleared. `openedAt` is when this window started opening
+ * again (the extension's activation): the reopened window may wait long for that maintenance to end.
  */
-export function takeNoticeKeptAcrossReload(state: ExclusiveMaintenanceWindowState): string | undefined {
+export function takeNoticeKeptAcrossReload(
+  state: ExclusiveMaintenanceWindowState,
+  openedAt: number = Date.now()
+): string | undefined {
   const kept = state.get<{ text?: unknown; at?: unknown }>(NOTICE_KEY);
   if (!kept) return undefined;
   void Promise.resolve(state.update(NOTICE_KEY, undefined)).catch(() => undefined);
-  return typeof kept.text === 'string' && typeof kept.at === 'number' && Date.now() - kept.at <= NOTICE_TTL_MS ? kept.text : undefined;
+  return typeof kept.text === 'string' && typeof kept.at === 'number' && openedAt - kept.at <= NOTICE_TTL_MS
+    ? kept.text
+    : undefined;
 }
 
 /**

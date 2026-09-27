@@ -144,7 +144,7 @@ if (behavior.participant !== false) {
   await participant.checkNow();
 }
 // Shown once after a reload (extension.ts).
-const kept = windowState ? layer.takeNoticeKeptAcrossReload(windowState) : undefined;
+const kept = windowState ? layer.takeNoticeKeptAcrossReload(windowState, startedAt) : undefined;
 if (kept) await emit('kept-notice', { text: kept });
 await emit('ready');
 if (behavior.closeAfterMs) {

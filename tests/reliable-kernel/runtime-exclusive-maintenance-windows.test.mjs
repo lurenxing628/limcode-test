@@ -275,6 +275,23 @@ test('用户的操作让先给较早的请求后，只有为那个请求让出�
   assert.equal(layer.takeNoticeKeptAcrossReload(windowState), undefined, 'read once');
 });
 
+test('盲审 #5：带过重载的原因按窗口重新打开的时间判断有效期，等维护结束的时间不算', async () => {
+  const layer = loadVscodeLayer(vscodeMock({ titles: [], notices: [] }, () => {}));
+  const stateWith = (value) => {
+    const state = new Map([['limcode.exclusiveMaintenance.noticeAfterReload', value]]);
+    return { get: (key) => state.get(key), update: async (key, next) => { if (next === undefined) state.delete(key); else state.set(key, next); } };
+  };
+  const text = '迁移数据目录没有进行：另一个窗口先发起了合并旧聊天记录';
+  // Reloaded 30 minutes ago, reopened a second later, then waited for a long migration to end.
+  const keptAt = Date.now() - 30 * 60_000;
+  assert.equal(layer.takeNoticeKeptAcrossReload(stateWith({ text, at: keptAt }), keptAt + 1_000), text);
+  // A window that opened again 11 minutes after the notice was kept: not that reload.
+  assert.equal(layer.takeNoticeKeptAcrossReload(stateWith({ text, at: keptAt }), keptAt + 11 * 60_000), undefined);
+  const state = stateWith({ text, at: keptAt });
+  assert.equal(layer.takeNoticeKeptAcrossReload(state), undefined, 'without the reopening time it counts from now');
+  assert.equal(state.get('limcode.exclusiveMaintenance.noticeAfterReload'), undefined, 'read and cleared either way');
+});
+
 test('打开外壳读取启动等待原因：变化时通知，运行时就绪后不再接受', async () => {
   const { ApplicationStartup } = require(path.join(compiled, 'vscode/ApplicationStartup.js'));
   const startup = new ApplicationStartup();

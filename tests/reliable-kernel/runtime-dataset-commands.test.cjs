@@ -322,7 +322,7 @@ function deferred() {
 }
 
 /** Run the actual activation and management modules with a controllable Runtime/upgrade boundary. */
-function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {}) {
+function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, keptNotice } = {}) {
   const events = [];
   const openOptions = [];
   const opening = deferred();
@@ -355,7 +355,10 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
     }
   });
   const extension = loadSource('vscode/extension.ts', {
-    vscode: { window: { async showErrorMessage(message) { events.push(['error', message]); } } },
+    vscode: { window: {
+      async showErrorMessage(message) { events.push(['error', message]); },
+      async showWarningMessage(message) { events.push(['warning-message', message]); }
+    } },
     './commands/registerCommands': { registerCommands(_context, barrier) { startup = barrier; } },
     './panels/MainPanel': { MainPanel: { registerSerializer() {} } },
     './views/SidebarEntryView': { registerSidebarEntryView() {} },
@@ -384,7 +387,10 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
           async unregister() { events.push('participant-unregister'); }
         };
       },
-      takeNoticeKeptAcrossReload() { return undefined; }
+      takeNoticeKeptAcrossReload(_state, openedAt) {
+        events.push(['kept-notice-read', openedAt]);
+        return keptNotice;
+      }
     },
     '../backend/application/runtimeBuildInfo': { RUNTIME_BUILD_INFO: {} }
   }, {
@@ -888,6 +894,31 @@ test('extension joins exclusive maintenance only after Runtime ready and leaves 
   f.finishUpgrade.resolve();
   await f.deactivate();
   assert.equal(f.events.filter(event => event === 'participant-dispose').length, 1);
+});
+
+test('the reason kept across a reload is judged by when this window started opening again, not after it waited (blind review #5)', async t => {
+  const f = extensionEntryFixture({ keptNotice: '迁移数据目录没有进行：另一个窗口先发起了合并旧聊天记录' });
+  t.after(async () => {
+    f.opened.resolve(f.application);
+    f.finishUpgrade.resolve();
+    await f.deactivate();
+  });
+  const beforeActivation = Date.now();
+  f.activate(f.context);
+  const activated = Date.now();
+  const ready = f.startup.wait();
+  await f.opening.promise;
+  // The reopened window waits for the maintenance that reloaded it before its Runtime opens.
+  await new Promise(done => setTimeout(done, 50));
+  f.opened.resolve(f.application);
+  await ready;
+  for (let i = 0; i < 20 && !f.events.some(event => Array.isArray(event) && event[0] === 'kept-notice-read'); i += 1) {
+    await new Promise(setImmediate);
+  }
+  const [, openedAt] = f.events.find(event => Array.isArray(event) && event[0] === 'kept-notice-read');
+  assert.ok(typeof openedAt === 'number' && openedAt >= beforeActivation && openedAt <= activated, `activation start, not now (${openedAt})`);
+  assert.deepEqual(f.events.filter(event => Array.isArray(event) && event[0] === 'warning-message'),
+    [['warning-message', 'Fixture 重载前：迁移数据目录没有进行：另一个窗口先发起了合并旧聊天记录']]);
 });
 
 test('deactivation marks this window leaving at once and removes its registration only after its Runtime closed (blind review #1)', async t => {

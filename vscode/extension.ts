@@ -108,7 +108,8 @@ async function startApplication(
           windowState: context.workspaceState
         });
         // The user's operation gave way to another window's maintenance, which then reloaded this one.
-        const kept = takeNoticeKeptAcrossReload(context.workspaceState);
+        // Valid by when this window reopened, not by how long it then waited for that maintenance.
+        const kept = takeNoticeKeptAcrossReload(context.workspaceState, activationStartedAt);
         if (kept) void vscode.window.showWarningMessage(`${EXTENSION_BRAND} 重载前：${kept}`);
       },
       (error) => console.warn(`${EXTENSION_BRAND} exclusive maintenance participation failed to start.`, error)
