@@ -252,6 +252,7 @@
     ],
     "deadLetterQueue": false,
     "targetGone": "目标Conversation/Turn不存在时，RuntimeInboxItem保留为事实，RuntimeDelivery置failed(reason=target-gone)。",
+    "conversationDeletion": "删除对话先停止范围内工作（对话加整棵子Agent树，conversationDeleteCommand）再在删除事务里收尾：投给范围内对话的pending RuntimeDelivery置failed(reason=target-gone)；只删子对话时父对话对它的等待以“子任务对话已被用户删除”取消，它投给范围外父对话、尚未接收的答复置failed(reason=source-gone)，从未路由的答复Inbox置settled；相关Wake与进程完成派发置dead_letter；不新增schema、状态或持久关系。",
     "identity": {
       "attemptSeq": "每个inbox+destination从1开始，phase/target不参与attempt身份",
       "logicalUnique": "(inbox_item_id,target_conversation_id,attempt_seq) UNIQUE；并发路由判定只能产生一个初始attempt=1",

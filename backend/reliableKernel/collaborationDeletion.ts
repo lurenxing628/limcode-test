@@ -1,4 +1,5 @@
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
+import { deadLetterDeliveryWakeSteps, failPendingDeliverySteps } from './deliverySettlementSteps';
 import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
@@ -29,26 +30,16 @@ export async function collaborationConversationDeletionSteps(
         { inbox_item_id: inboxId, target_conversation_id: conversationId }, deliveries.map(row => String(row.id))));
       for (const delivery of deliveries) {
         const deliveryId = String(delivery.id);
-        steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(deliveryId, {
-          state: delivery.state, target_conversation_id: conversationId, updated_at: delivery.updated_at
-        }));
         if (delivery.state === 'pending') {
           pendingDeliveryIds.add(deliveryId);
-          steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').update(deliveryId, {
-            state: 'failed', failure_reason: 'target-gone', updated_at: now
+          steps.push(...failPendingDeliverySteps(delivery, 'target-gone', now));
+        } else {
+          steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(deliveryId, {
+            state: delivery.state, target_conversation_id: conversationId, updated_at: delivery.updated_at
           }));
         }
         const wakes = await listAllDomainRows(database, 'RuntimeDeliveryWake', { delivery_id: deliveryId });
-        steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').assertExactIds(
-          { delivery_id: deliveryId }, wakes.map(row => String(row.id))));
-        for (const wake of wakes) if (wake.state === 'pending' || wake.state === 'claimed') {
-          steps.push(DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').assert(String(wake.id), {
-            state: wake.state, claim_generation: wake.claim_generation, updated_at: wake.updated_at
-          }), DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').update(String(wake.id), {
-            state: 'dead_letter', claim_owner_host_boot_id: null, claim_expires_at: null,
-            next_attempt_at: null, last_error: 'target-gone', updated_at: now
-          }));
-        }
+        steps.push(...deadLetterDeliveryWakeSteps(deliveryId, wakes, 'target-gone', now));
       }
     }
     const rootScopes = await listAllDomainRows(database, 'CollaborationBoardChannelScopeLink', { root_conversation_id: conversationId });

@@ -15,6 +15,7 @@ const { ReliableChildAgentCoordinator } = await load('backend/reliableKernel/chi
 const { runAgentTool } = await load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { evaluateConversationHostEligibility } = await load('backend/application/reliableKernel/conversationHostEligibility.js');
 const { projectFolderAssignmentSteps } = await load('backend/reliableKernel/conversationProject.js');
+const { stopAndDeleteConversation } = await load('backend/application/reliableKernel/conversationDeleteCommand.js');
 
 const PROVIDER_ID = 'dead-host-provider';
 const PROJECT_ONE = 'file:///workspace/project-one';
@@ -45,7 +46,7 @@ if (workerMode) {
   );
 } else {
 
-test('执行窗口被杀、工具仍在执行、项目在任何窗口都打不开：停止前删不掉，用户停止后效果为 outcome_unknown、Turn 收尾、可以删除（跨进程）', { timeout: 180_000 }, async () => {
+test('执行窗口被杀、工具仍在执行、项目在任何窗口都打不开：删除事务不收尾活动工作，用户停止后效果为 outcome_unknown、Turn 收尾，删除成功（跨进程）', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('killed');
   let p1;
   let child;
@@ -67,8 +68,8 @@ test('执行窗口被杀、工具仍在执行、项目在任何窗口都打不�
     const [intent] = await effectIntentsForToolCall(p1.app, call.id);
     assert.equal(intent.dispatch_state, 'dispatched');
 
-    // 用户先尝试删除：删不掉，也不让本窗口一直持有。
-    await assert.rejects(deleteConversation(p1, conversationId), /活动 Turn/);
+    // 删除事务本身不收尾活动工作（删除命令先停止再删，见 conversation-delete-stop），拒绝时也不让本窗口一直持有。
+    await assert.rejects(deleteTransaction(p1, conversationId), /活动 Turn/);
     assert.equal(p1.owns(conversationId), false);
 
     // 恢复扫描和延迟轮询不会自动标记：只有用户停止才会。
@@ -116,7 +117,7 @@ test('执行窗口被杀、工具仍在执行、项目在任何窗口都打不�
     assert.equal(p1.mcpCalls(), 0, '收尾不重放 MCP 调用');
     assert.equal(p1.owns(conversationId), false, '收尾后交还');
 
-    const deleted = await deleteConversation(p1, conversationId);
+    const deleted = await deleteCommand(p1, conversationId);
     assert.deepEqual(deleted?.deletedConversationIds, [conversationId]);
     assert.deepEqual(p1.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error)), []);
   } finally {
@@ -177,7 +178,7 @@ test('执行窗口仍存活时，其它窗口的停止不标记结果未知，�
   }
 });
 
-test('子 Agent 同样适用：执行窗口被杀后，用户停止子 Agent 把它的效果标为 outcome_unknown 并收尾子 Turn；删除只剩父对话待接收的子答复这一项现有规则（跨进程）', { timeout: 180_000 }, async () => {
+test('子 Agent 同样适用：执行窗口被杀后，用户停止子 Agent 把它的效果标为 outcome_unknown 并收尾子 Turn；删除整棵树时父对话没接收的子答复按 target-gone 收尾（跨进程）', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('killed-child');
   let p1;
   let child;
@@ -198,7 +199,7 @@ test('子 Agent 同样适用：执行窗口被杀后，用户停止子 Agent 把
     const [call] = await rows(p1.app, 'ToolCall', { turn_id: spawned.childTurnId, status: 'executing' });
     const [intent] = await effectIntentsForToolCall(p1.app, call.id);
     assert.equal(intent.dispatch_state, 'dispatched');
-    await assert.rejects(deleteConversation(p1, conversationId), /Subagent|活动 Turn/);
+    await assert.rejects(deleteTransaction(p1, conversationId), /Subagent|活动 Turn/);
 
     // A model's run_agent interrupt is not a user's stop: it never closes a dead window's work.
     await p1.coordinator.interruptSubtree({
@@ -229,14 +230,16 @@ test('子 Agent 同样适用：执行窗口被杀后，用户停止子 Agent 把
     assert.equal(['starting', 'active', 'interrupting'].includes(String(execution.status)), false, `子执行仍为 ${execution.status}`);
     assert.equal(p1.mcpCalls(), 0);
 
-    // The Subagent tree itself no longer blocks deletion. What remains is the existing rule that a
-    // parent first takes in its Subagent's answer (here the interrupted partial answer), which only a
-    // parent Turn in a window serving the project can do; changing that rule is left to the maintainer.
+    // 父对话还没接收子 Agent 的中断结果：删除整棵树时这条答复按 target-gone 收尾，不再挡住删除。
     const pendingAnswers = await rows(p1.app, 'RuntimeDelivery', { target_conversation_id: conversationId, state: 'pending' });
     assert.equal(pendingAnswers.length, 1, '子 Agent 的中断结果投递给父对话');
     const [inbox] = await rows(p1.app, 'RuntimeInboxItem', { id: pendingAnswers[0].inbox_item_id });
     assert.equal(inbox.source_kind, 'answer_submission');
-    await assert.rejects(deleteConversation(p1, conversationId), /待接收的后台结果/);
+    const deleted = await deleteCommand(p1, conversationId);
+    assert.deepEqual([...deleted.deletedConversationIds].sort(), [conversationId, spawned.childConversationId].sort());
+    assert.deepEqual((await rows(p1.app, 'RuntimeDelivery', { id: pendingAnswers[0].id })).map((row) => [row.state, row.failure_reason]),
+      [['failed', 'target-gone']]);
+    assert.deepEqual(await rows(p1.app, 'RuntimeDelivery', { state: 'pending' }), []);
     assert.equal(p1.owns(conversationId), false);
     assert.deepEqual(p1.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error)), []);
   } finally {
@@ -292,8 +295,9 @@ test('复审 #7：父对话等待子 Agent 时执行窗口被杀，没有合格�
     assert.equal(p1.owns(conversationId), false);
     assert.equal(p1.owns(spawned.childConversationId), false);
     assert.deepEqual(p1.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error)), []);
-    const blocked = await deleteConversation(p1, conversationId).then(() => null, (error) => String(error?.message ?? error));
-    console.log('[parent-waits] delete after stop:', blocked ?? 'deleted');
+    const deleted = await deleteCommand(p1, conversationId);
+    assert.deepEqual([...deleted.deletedConversationIds].sort(), [conversationId, spawned.childConversationId].sort(), '停止之后删除成功');
+    assert.deepEqual(await rows(p1.app, 'RuntimeDelivery', { state: 'pending' }), []);
   } finally {
     await p1?.close();
     await stopChild(child);
@@ -1015,10 +1019,20 @@ async function openHost(dataRoot, provider, options) {
   };
 }
 
-/** VscodeReliableKernelApplicationFacade.deleteConversation */
-function deleteConversation(host, conversationId) {
+/** The deletion transaction alone (the last step of the delete command): it never settles live work. */
+function deleteTransaction(host, conversationId) {
   return host.app.database.conversationOwners.run(conversationId, () =>
     host.app.conversationDeletion.delete(conversationId));
+}
+
+/** VscodeReliableKernelApplicationFacade.deleteConversation: stops the tree's work, then deletes it. */
+function deleteCommand(host, conversationId) {
+  return stopAndDeleteConversation({
+    application: host.app,
+    conversations: host.runner,
+    childAgents: host.coordinator ?? { interruptSubtree() { throw new Error('这个窗口没有子 Agent 调度。'); } },
+    pollMs: 100
+  }, { conversationId, requestId: `delete-${conversationId}` });
 }
 
 async function createConversation(app, conversationId, project) {

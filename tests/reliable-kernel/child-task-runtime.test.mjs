@@ -557,22 +557,21 @@ test('a user fork of a forkTurns child owns its inherited history and outlives t
     await assertSelfContainedAuthority(fork.conversationId);
 
     await f.coordinator.waitForIdle();
-    // The child's final reply is its answer. While it still waits for the parent's next Turn the
-    // parent cannot be deleted; once that Turn took it in, deletion proceeds.
+    // The child's final reply is its answer. Deleting the parent while that answer still waits for
+    // the parent's next Turn settles it together with the tree (target-gone); the user fork of the
+    // child is not part of the tree and survives.
     await eventually(async () => (await f.list('AnswerSubmission')).length > 0, 'the child final reply became its answer');
     const pendingAnswers = await eventually(async () => {
       const deliveries = await f.list('RuntimeDelivery', { target_conversation_id: 'parent' });
       return deliveries.length > 0 ? deliveries : undefined;
     }, 'the child answer was never routed to its parent');
     assert.deepEqual(pendingAnswers.map(delivery => [delivery.state, delivery.phase]), [['pending', 'next_turn']]);
-    await assert.rejects(f.app.database.conversationOwners.run('parent', () => f.app.conversationDeletion.delete('parent')),
-      /待接收的后台结果/, 'a parent with a child answer still pending is not deleted');
-    assert.equal((await f.list('Conversation', { id: 'parent' })).length, 1);
-    assert.equal((await f.runInput('parent-takes-child-answer', 'PARENT_TAKES_CHILD_ANSWER_5530')).terminalStatus, 'completed');
-    assert.deepEqual((await f.list('RuntimeDelivery', { target_conversation_id: 'parent' })).map(delivery => delivery.state), ['consumed']);
     const deleted = await f.app.database.conversationOwners.run('parent', () => f.app.conversationDeletion.delete('parent'));
-    assert.ok(deleted.deletedConversationIds.includes('parent'));
+    assert.deepEqual([...deleted.deletedConversationIds].sort(), ['parent', child].sort(), 'the parent is deleted with its child');
     assert.equal(deleted.deletedConversationIds.includes(fork.conversationId), false);
+    assert.deepEqual((await f.list('RuntimeDelivery', { id: pendingAnswers[0].id }))
+      .map(delivery => [delivery.state, delivery.failure_reason]), [['failed', 'target-gone']], 'the pending child answer is settled with the tree');
+    assert.deepEqual(await f.list('RuntimeDelivery', { state: 'pending' }), []);
     await assertSelfContainedAuthority(fork.conversationId);
     assert.equal((await f.runInput('continue-child-fork-after-parent-delete', 'CONTINUE_CHILD_FORK_7718', fork.conversationId))
       .terminalStatus, 'completed');

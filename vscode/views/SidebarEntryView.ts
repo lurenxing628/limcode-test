@@ -4,6 +4,7 @@ import { getUnavailableWebviewHtml, getWebviewHtml } from '../webview/getWebview
 import type { ApplicationFacade, ConversationHistoryRevealTarget } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { EXTENSION_BRAND, SIDEBAR_ENTRY_VIEW_ID } from '../../shared/extensionIdentity';
+import { isConversationDeleteIncompleteError } from '../../backend/application/reliableKernel/conversationDeleteCommand';
 import { toStructuredClonePlainData } from '../../shared/plainData';
 import type {
   ConversationHistoryPageRecord,
@@ -366,7 +367,9 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
         console.warn('[LimCode] Failed to delete sidebar conversation.', error);
         await this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
         await this.postConversationOperationResult(webview, 'delete', conversationId, false, message);
-        void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${message}`);
+        // Work that did not stop in time is not a refusal: the stop requests stay, deleting again completes.
+        if (isConversationDeleteIncompleteError(error)) void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${message}`);
+        else void vscode.window.showErrorMessage(`${EXTENSION_BRAND}: ${message}`);
       }
     })();
   }

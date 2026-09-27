@@ -196,7 +196,11 @@ const renameDialogDescription = computed(() => {
 const deleteDialogDescriptionHtml = computed(() => {
   const title = displayConversationTitle(deleteTarget.value);
   const target = title ? `「${escapeHtml(middleEllipsis(title, 48))}」` : '这个对话';
-  return `将删除${target}、其启动的所有子 Agent 对话，以及关联消息、工具记录和运行记录。此操作<strong>无法撤销</strong>。`;
+  const childAgent = deleteTarget.value
+    ? originLinkByConversationId.value.get(deleteTarget.value.id)?.originKind === 'agent'
+    : false;
+  const parentNotice = childAgent ? '父对话会收到“子任务已删除”的结果。' : '';
+  return `会先停止${target}和它的子任务里正在运行的任务（包括后台进程），然后删除${target}、其启动的所有子 Agent 对话，以及关联消息、工具记录和运行记录，<strong>不能撤销</strong>。${parentNotice}`;
 });
 const abortDialogDescriptionHtml = computed(() => {
   const title = displayConversationTitle(abortTarget.value);

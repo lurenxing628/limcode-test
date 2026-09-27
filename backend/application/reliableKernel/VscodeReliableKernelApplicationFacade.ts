@@ -39,6 +39,7 @@ import {
 import { BridgeMessageType } from '../../../shared/protocol';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
 import { STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE } from './conversationHostEligibility';
+import { CONVERSATION_DELETE_PROGRESS_TITLE, stopAndDeleteConversation } from './conversationDeleteCommand';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import type {
   BridgeClientId,
@@ -450,20 +451,40 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     }));
   }
 
+  /**
+   * Stops the work of the Conversation and its Subagent tree, then deletes it
+   * (conversationDeleteCommand). While work is being stopped a progress notification is shown; work
+   * that does not stop in time leaves the Conversation in place (ConversationDeleteIncompleteError).
+   */
   public deleteConversation(conversationId: string): Promise<string[] | null> {
     return this.write(() => this.deleteConversationNow(conversationId));
   }
 
   private async deleteConversationNow(conversationId: string): Promise<string[] | null> {
     this.requireOpen();
-    // The deletion control plane additionally pins every cascaded descendant before its
-    // transaction; this requested-id run is the facade boundary guard.
-    const deleted = await this.product.application.database.conversationOwners.run(conversationId, () =>
-      this.product.application.conversationDeletion.delete(conversationId)
-    );
-    if (!deleted) return null;
-    await this.refreshConversationHistory();
-    return deleted.deletedConversationIds;
+    let finishProgress: (() => void) | undefined;
+    const progressDone = new Promise<void>((resolve) => { finishProgress = resolve; });
+    try {
+      const deleted = await stopAndDeleteConversation({
+        application: this.product.application,
+        conversations: this.product.conversations,
+        childAgents: this.product.childAgents
+      }, {
+        conversationId,
+        requestId: randomUUID(),
+        onStopping: () => {
+          void vscode.window.withProgress({
+            location: vscode.ProgressLocation.Notification,
+            title: `${EXTENSION_BRAND}：${CONVERSATION_DELETE_PROGRESS_TITLE}`
+          }, () => progressDone);
+        }
+      });
+      if (!deleted) return null;
+      await this.refreshConversationHistory();
+      return deleted.deletedConversationIds;
+    } finally {
+      finishProgress?.();
+    }
   }
 
   public abortConversation(

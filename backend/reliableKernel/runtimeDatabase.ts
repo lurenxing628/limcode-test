@@ -450,6 +450,19 @@ export class RuntimeDatabase {
     return inspected !== 'dead';
   }
 
+  /**
+   * The process id a Host registered for this Runtime root, to name its window in a message; this
+   * Host's own when asked for itself. Undefined without a registration.
+   */
+  public async hostProcessId(hostBootIdInput: string): Promise<number | undefined> {
+    const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
+    if (hostBootId === this.hostBootId) return process.pid;
+    await this.validateBinding('host_liveness');
+    const record = await readHostLiveness(this.hostLivenessPath(hostBootId));
+    if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return undefined;
+    return record.processId;
+  }
+
   private rememberHostIdentity(key: string, result: 'alive' | 'dead', at: number): void {
     if (this.hostIdentityComparisons.size >= HOST_IDENTITY_CACHE_ENTRIES) this.hostIdentityComparisons.clear();
     this.hostIdentityComparisons.set(key, { result, at });
