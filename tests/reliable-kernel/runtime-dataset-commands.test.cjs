@@ -359,6 +359,8 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
     './commands/runtimeDataSetManagement': management,
     // No data-directory move in progress: nothing to wait for or finish.
     './commands/dataRootRelocation': { async beforeDataRootOpen() { return undefined; }, async afterDataRootOpened() {} },
+    // Opening never waits here: the presenter only has to exist.
+    './runtimeOpeningWait': loadSource('vscode/runtimeOpeningWait.ts', { vscode: {} }),
     './watchers/GlobalSettingsWatcher': { registerGlobalSettingsWatcher() {} },
     './runtimeExclusiveMaintenance': {
       startExclusiveMaintenanceParticipant(host, options) {
@@ -371,6 +373,8 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
     setImmediate,
     console: { log() {}, warn(...args) { events.push(['warning', ...args]); }, error(...args) { events.push(['error', ...args]); } }
   });
+  // Nothing kept across a reload in these activations.
+  management.context.workspaceState = { get() { return undefined; }, async update() {} };
   return {
     ...extension, application, context: management.context, calls: management.calls, events, management, lifetime, openOptions,
     opening, opened, upgradeStarted, finishUpgrade,
@@ -719,7 +723,7 @@ test('extension merges old libraries online only after Runtime ready and after t
   f.activate(f.context);
   const ready = f.startup.wait();
   await f.opening.promise;
-  assert.equal(f.openOptions[0], undefined, 'Runtime open 不再带启动前合并钩子');
+  assert.deepEqual(Object.keys(f.openOptions[0]), ['onRuntimeWait'], 'Runtime open 不再带启动前合并钩子，只带等待说明');
   f.opened.resolve(f.application);
   await ready;
   await f.upgradeStarted.promise;
