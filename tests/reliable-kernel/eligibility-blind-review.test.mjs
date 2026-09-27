@@ -206,6 +206,73 @@ test('盲审 2：交还等待中 Turn 的租约前，先等本窗口这个 Turn 
   }
 });
 
+test('盲审 2：等本窗口在途 native 调用期间文件夹又回来了：调用结束后在认领内复核，不交还租约，本窗口照常接着执行', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('quiesce-returned');
+  let host;
+  try {
+    const conversationId = 'conversation-quiesce-returned';
+    const provider = scriptedProvider([ASK_USER, text('按回答继续。')]);
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'w', askUser: true });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    const { turnId } = await host.runner.input({ commandId: 'quiesce-returned', conversationId, text: '问我' });
+    await eventually(async () => (await rows(host.app, 'InteractionRequest', { status: 'pending' })).length === 1, 30_000, '未进入等待');
+    await host.runner.waitForIdle();
+    const call = inFlightNativeCall(host.app.agentLoop, turnId);
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    await host.runner.rescan();
+    host.folders.push(PROJECT_TWO);
+    call.settle();
+    await sleep(800);
+    const [lease] = await rows(host.app, 'ExecutionLease', { turn_id: turnId });
+    assert.equal(lease?.host_boot_id, host.app.database.hostBootId, '文件夹已回来：租约留在本窗口');
+    await host.runner.rescan();
+    const [request] = await rows(host.app, 'InteractionRequest', { status: 'pending' });
+    await answerAskUser(host, conversationId, request.id, 'returned-answer');
+    host.runner.resume(conversationId, turnId);
+    await eventually(async () => (await rows(host.app, 'Turn', { id: turnId }))[0]?.status === 'terminated', 30_000, '本窗口没有接着执行');
+    assert.equal(provider.calls, 2);
+    assert.deepEqual(errorsOf(host), []);
+  } finally {
+    await host?.close();
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('盲审 1：资格一度无法确定、之后确定不合格：延迟候选复查时本窗口仍持有租约就交还；本窗口不持有租约时不为交还认领对话', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('deferred-hand-back');
+  let host;
+  try {
+    const conversationId = 'conversation-deferred-hand-back';
+    host = await openHost(dataRoot, scriptedProvider([ASK_USER]), { folders: [PROJECT_TWO], label: 'w', askUser: true });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    const { turnId } = await host.runner.input({ commandId: 'deferred-hand-back', conversationId, text: '问我' });
+    await eventually(async () => (await rows(host.app, 'InteractionRequest', { status: 'pending' })).length === 1, 30_000, '未进入等待');
+    await host.runner.waitForIdle();
+    host.failProbe = true;
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    await host.runner.rescan();
+    assert.equal((await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0]?.host_boot_id, host.app.database.hostBootId,
+      '资格未知：不交还');
+    host.failProbe = false;
+    await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0]?.owner_id === RELEASED,
+      15_000, '延迟候选复查确定不合格后没有交还');
+    // Nothing is held any more: a hand-back does not claim the Conversation for nothing.
+    const owners = host.app.database.conversationOwners;
+    const run = owners.run.bind(owners);
+    let claims = 0;
+    owners.run = (id, operation) => {
+      if (id === conversationId) claims += 1;
+      return run(id, operation);
+    };
+    assert.equal(await host.runner.releaseWaitingTurn(conversationId, turnId), 'not_held');
+    assert.equal(claims, 0, '不持有租约时不认领对话');
+    assert.deepEqual(errorsOf(host), []);
+  } finally {
+    await host?.close();
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
 test('盲审 2：驱动中文件夹离开、循环在轮次之间停下：先等本窗口这个 Turn 的在途 native 调用结束再交还租约', { timeout: 120_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('quiesce-drive');
   let host;
@@ -257,6 +324,77 @@ test('盲审 2：子 Agent 等待中文件夹离开：子调度先等本窗口�
     call.settle();
     await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: childTurnId }))[0]?.owner_id === RELEASED,
       10_000, '调用结束后子调度没有交还租约');
+  } finally {
+    await host?.close();
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('盲审 2：子 Agent 等本窗口在途 native 调用期间文件夹又回来了：不交还子 Turn 的租约；已不持有时子调度不为交还认领子对话', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('quiesce-child-returned');
+  let host;
+  try {
+    const conversationId = 'conversation-quiesce-child-returned';
+    const provider = routedProvider((request, n) => request.conversationId === conversationId
+      ? [SPAWN_CHILD, text('子任务已开始。')][n - 1]
+      : [ASK_USER][n - 1]);
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'w', askUser: true, children: true });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    await host.runner.input({ commandId: 'quiesce-child-returned', conversationId, text: '派一个子 Agent' });
+    const { execution, childTurnId } = await waitForChildQuestion(host);
+    const call = inFlightNativeCall(host.app.agentLoop, childTurnId);
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    await host.coordinator.recoverStartup();
+    host.folders.push(PROJECT_TWO);
+    call.settle();
+    await sleep(800);
+    const [lease] = await rows(host.app, 'ExecutionLease', { turn_id: childTurnId });
+    assert.equal(lease?.owner_id, host.coordinator.childLeaseOwnerId, '文件夹已回来：子 Turn 的租约留在本窗口');
+
+    // Once the lease went back, a later pass finds nothing held and claims nothing for it.
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    await host.coordinator.recoverStartup();
+    await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: childTurnId }))[0]?.owner_id === RELEASED,
+      10_000, '子调度没有交还');
+    const owners = host.app.database.conversationOwners;
+    const run = owners.run.bind(owners);
+    let claims = 0;
+    owners.run = (id, operation) => {
+      if (id === execution.child_conversation_id) claims += 1;
+      return run(id, operation);
+    };
+    await host.coordinator.handBackIneligibleChildLease(childTurnId, execution.child_conversation_id);
+    assert.equal(claims, 0, '不持有租约时不认领子对话');
+  } finally {
+    await host?.close();
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('盲审 2：不服务子对话的窗口被唤醒驱动子 Turn：先等本窗口子 Turn 的在途 native 调用结束再交还租约', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('quiesce-child-not-served');
+  let host;
+  try {
+    const conversationId = 'conversation-quiesce-child-not-served';
+    const provider = routedProvider((request, n) => request.conversationId === conversationId
+      ? [SPAWN_CHILD, text('子任务已开始。')][n - 1]
+      : [ASK_USER][n - 1]);
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'w', askUser: true, children: true });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    await host.runner.input({ commandId: 'quiesce-child-not-served', conversationId, text: '派一个子 Agent' });
+    const { execution, childTurnId } = await waitForChildQuestion(host);
+    const call = inFlightNativeCall(host.app.agentLoop, childTurnId);
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    let settled = false;
+    const drive = host.coordinator.driveChild(execution.id, childTurnId).finally(() => { settled = true; });
+    const rejected = assert.rejects(drive, /not served by this Host/);
+    await sleep(500);
+    assert.equal(settled, false, '驱动在等本窗口的调用');
+    assert.equal((await rows(host.app, 'ExecutionLease', { turn_id: childTurnId }))[0]?.owner_id, host.coordinator.childLeaseOwnerId,
+      '调用仍在执行：租约还不交还');
+    call.settle();
+    await rejected;
+    assert.equal((await rows(host.app, 'ExecutionLease', { turn_id: childTurnId }))[0]?.owner_id, RELEASED);
   } finally {
     await host?.close();
     await fsp.rm(outer, { recursive: true, force: true });
@@ -722,10 +860,14 @@ async function openHost(dataRoot, provider, options) {
     workEnvironments: async () => [],
     nextTurnWorkEnvironment: (id, next) => app.turns.previewNextTurnWorkEnvironment(id, next?.executorAgentId)
   };
-  app.database.conversationOwners.setClaimEligibilityProbe(async (conversationId) =>
-    (await evaluateConversationHostEligibility(base, conversationId)).eligible);
+  let failProbe = false;
+  app.database.conversationOwners.setClaimEligibilityProbe(async (conversationId) => {
+    if (failProbe) throw Object.assign(new Error('工作环境目录暂时读取失败'), { name: 'TransientProbeError' });
+    return (await evaluateConversationHostEligibility(base, conversationId)).eligible;
+  });
   runner.setEntryEligibility(async (conversationId, next) => {
     try {
+      if (failProbe) return 'unknown';
       return (await evaluateConversationEntryEligibility(base, conversationId, next)).eligible ? 'eligible' : 'ineligible';
     } catch {
       return 'unknown';
@@ -747,6 +889,7 @@ async function openHost(dataRoot, provider, options) {
     coordinator,
     runnerErrors,
     folders,
+    set failProbe(value) { failProbe = value; },
     mcpCalls: () => mcpCalls,
     owns: (conversationId) => app.database.conversationOwners.owns(conversationId),
     async close() {

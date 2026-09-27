@@ -880,8 +880,6 @@ export class ReliableConversationRunner {
         } else {
           (claim === 'ineligible' ? report.ineligibleTurnIds : report.eligibilityUnknownTurnIds).push(turnId);
           this.deferRecoveryCandidate(turnConversationId, turnId, claim);
-          // A lease this Host still holds for a Turn it does not serve goes back.
-          if (claim === 'ineligible') await this.releaseWaitingTurn(turnConversationId, turnId);
         }
         continue;
       }

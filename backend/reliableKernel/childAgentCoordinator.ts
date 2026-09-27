@@ -942,12 +942,11 @@ export class ReliableChildAgentCoordinator {
   /**
    * Hands a child Turn's lease back from a Host that does not serve (or no longer serves) the child
    * Conversation and does not drive the Turn, the counterpart of the Conversation runner's waiting
-   * Turn hand-back: this Host's native calls of the Turn finish first, then the lease row it holds
-   * goes back whether or not it expired (a child Turn waiting longer than its lease is still held
-   * by this live Host). The caller holds the child Conversation's ownership.
+   * Turn hand-back: the lease row this Host holds goes back whether or not it expired (a child Turn
+   * waiting longer than its lease is still held by this live Host). The caller has let this Host's
+   * native calls of the Turn settle first.
    */
   private async handBackChildLease(turnId: string): Promise<boolean> {
-    await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
     const fence = await this.dependencies.turns.heldExecutionLeaseFence({
       turnId,
       leaseOwnerId: this.childLeaseOwnerId,
@@ -2371,6 +2370,8 @@ export class ReliableChildAgentCoordinator {
       ? await owners.executionEligibility(conversationId) === 'eligible'
       : await owners.tryClaimEligible(conversationId) === 'owned';
     if (!serves) {
+      // A native call an earlier drive of this Turn started here records its result first.
+      await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
       await this.handBackChildLease(turnId);
       throw new ChildConversationNotServedError(conversationId);
     }
