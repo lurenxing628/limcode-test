@@ -12,6 +12,12 @@ export const RUNTIME_OPENING_WAIT_LIMITS = Object.freeze({
   openingWarnMs: 60_000,
   /** A maintenance that keeps its heartbeat may run long (a large migration): warn after this. */
   maintenanceWarnMs: 10 * 60_000,
+  /**
+   * A maintenance that published when it expects to be done (a large historical merge) and keeps
+   * its heartbeat is warned about only once it ran this many times as long as expected (and at
+   * least maintenanceWarnMs); a stopped heartbeat is warned about at once, as without it.
+   */
+  expectedEndStretch: 1.5,
   /** After “继续等待” the next warning comes no sooner than this. */
   repeatWarnMs: 10 * 60_000
 });
@@ -59,13 +65,28 @@ export function describeRuntimeOpeningWait(wait: RuntimeClaimWait): RuntimeOpeni
     };
   }
   const progress = activity.stage ? `，${activity.stage}` : '';
+  const expected = expectedEnd(activity);
+  // The holder said how long it takes and its heartbeat is fresh: warn only well past that.
+  const postponed = activity.expectedTotalMs !== undefined
+    && activity.runningMs < activity.expectedTotalMs * RUNTIME_OPENING_WAIT_LIMITS.expectedEndStretch;
   return {
-    status: { title: '正在等待另一个窗口', description: `另一个窗口正在${activity.description}${stage}，${kept}` },
-    message: `另一个窗口正在${activity.description}（已进行 ${formatDuration(activity.runningMs)}${progress}），${kept}`,
-    ...(wait.holderWaitedMs >= RUNTIME_OPENING_WAIT_LIMITS.maintenanceWarnMs
+    status: {
+      title: '正在等待另一个窗口',
+      description: `另一个窗口正在${activity.description}${stage}，${expected ? `${expected}，` : ''}${kept}`
+    },
+    message: `另一个窗口正在${activity.description}（已进行 ${formatDuration(activity.runningMs)}${progress}${expected ? `，${expected}` : ''}），${kept}`,
+    ...(wait.holderWaitedMs >= RUNTIME_OPENING_WAIT_LIMITS.maintenanceWarnMs && !postponed
       ? { warning: `另一个 LimCode 窗口正在${activity.description}，本窗口已等待 ${formatDuration(wait.holderWaitedMs)}。${keepWaiting}` }
       : {})
   };
+}
+
+/** “预计 14:32 前完成” until the published expected end, then that it runs longer than expected. */
+function expectedEnd(activity: NonNullable<RuntimeClaimWait['activity']>): string | undefined {
+  if (activity.expectedTotalMs === undefined || activity.expectedEndAt === undefined) return undefined;
+  if (activity.runningMs >= activity.expectedTotalMs) return '比预计的慢，仍在进行';
+  const at = new Date(activity.expectedEndAt);
+  return `预计 ${String(at.getHours()).padStart(2, '0')}:${String(at.getMinutes()).padStart(2, '0')} 前完成`;
 }
 
 export interface RuntimeOpeningWaitPresenter {

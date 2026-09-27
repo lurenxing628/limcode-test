@@ -248,6 +248,49 @@ test('打开运行时等待时说明原因：外壳只写持有方在做什么�
   assert.deepEqual(events.infos, ['LimCode 已经打开，不需要再等待；本窗口没有关闭。']);
 });
 
+test('大库会话：标记带预计结束时间时外壳写“预计 HH:MM 前完成”，心跳正常时 10 分钟告警推迟到预计时长的 1.5 倍；超过预计时间改说比预计的慢；心跳停了立即告警、不再推迟', async () => {
+  const vscode = {
+    ProgressLocation: { Notification: 15 },
+    window: { withProgress: async () => {}, showWarningMessage: () => new Promise(() => {}), showInformationMessage: async () => {} },
+    commands: { executeCommand: async () => {} }
+  };
+  const opening = loadLayerModule('vscode/runtimeOpeningWait.ts', { vscode });
+  assert.equal(opening.RUNTIME_OPENING_WAIT_LIMITS.expectedEndStretch, 1.5);
+  const describe = (wait) => ({ ...opening.describeRuntimeOpeningWait(wait) });
+  const expectedEndAt = new Date(2026, 8, 27, 14, 32, 0).toISOString();
+  // Expected to take 30 minutes; 12 minutes in, this window has waited 11 minutes.
+  const merging = {
+    operation: 'historical-merge', description: '合并较大的旧聊天记录', stage: '第 2/4 份，已完成 35%',
+    runningMs: 12 * 60_000, heartbeatAgeMs: 900, stale: false, expectedEndAt, expectedTotalMs: 30 * 60_000
+  };
+  const early = describe({ waitedMs: 11 * 60_000, holderWaitedMs: 11 * 60_000, activity: merging });
+  assert.equal(early.status.description,
+    '另一个窗口正在合并较大的旧聊天记录（第 2/4 份，已完成 35%），预计 14:32 前完成，完成后自动打开；未发送的输入已保留。');
+  assert.equal(early.message,
+    '另一个窗口正在合并较大的旧聊天记录（已进行 12 分钟，第 2/4 份，已完成 35%，预计 14:32 前完成），完成后自动打开；未发送的输入已保留。');
+  assert.equal(early.warning, undefined, 'postponed: the maintenance keeps its heartbeat and is within its expected time');
+  // Past the expected end but not yet 1.5 times as long: said so, still not warned.
+  const slow = describe({ waitedMs: 40 * 60_000, holderWaitedMs: 40 * 60_000, activity: { ...merging, runningMs: 40 * 60_000 } });
+  assert.equal(slow.status.description,
+    '另一个窗口正在合并较大的旧聊天记录（第 2/4 份，已完成 35%），比预计的慢，仍在进行，完成后自动打开；未发送的输入已保留。');
+  assert.equal(slow.warning, undefined);
+  // 1.5 times the expected time: the usual warning.
+  assert.match(describe({ waitedMs: 45 * 60_000, holderWaitedMs: 45 * 60_000, activity: { ...merging, runningMs: 45 * 60_000 } }).warning,
+    /另一个 LimCode 窗口正在合并较大的旧聊天记录，本窗口已等待 45 分钟。本窗口会继续等它结束/);
+  // Never earlier than without an expected end: a short expected time still waits the 10 minutes.
+  const quick = { ...merging, runningMs: 9 * 60_000, expectedTotalMs: 60_000 };
+  assert.equal(describe({ waitedMs: 9 * 60_000, holderWaitedMs: 9 * 60_000, activity: quick }).warning, undefined);
+  assert.match(describe({ waitedMs: 10 * 60_000, holderWaitedMs: 10 * 60_000, activity: { ...quick, runningMs: 10 * 60_000 } }).warning, /已等待 10 分钟/);
+  // The heartbeat stopped: warned at once, however long it was expected to take.
+  const stale = describe({ waitedMs: 60_000, holderWaitedMs: 60_000, activity: { ...merging, runningMs: 60_000, heartbeatAgeMs: 20_000, stale: true } });
+  assert.match(stale.warning, /已经 20 秒没有进展/);
+  // Without an expected end nothing changes (the migration's wording and its 10 minutes).
+  const { expectedEndAt: _end, expectedTotalMs: _total, ...plain } = merging;
+  assert.equal(describe({ waitedMs: 1_000, holderWaitedMs: 1_000, activity: plain }).status.description,
+    '另一个窗口正在合并较大的旧聊天记录（第 2/4 份，已完成 35%），完成后自动打开；未发送的输入已保留。');
+  assert.match(describe({ waitedMs: 11 * 60_000, holderWaitedMs: 11 * 60_000, activity: plain }).warning, /已等待 11 分钟/);
+});
+
 test('盲审 #9：拿到锁之后等待提示立即收起、外壳不再说在等待（不与随后的选择框并存）；之后再等别的锁时重新提示；收起后才点的警告按钮只作说明', async () => {
   const events = { progress: [], infos: [], commands: [] };
   const answers = [];

@@ -1486,6 +1486,65 @@ test('持有方没有发布标记时只说在等其它窗口；标记属于别�
   assert.equal(await opening, 'opened');
 });
 
+test('大库会话：维护标记带预计结束时间（操作经 reportExpectedEnd 写入），等待打开的窗口读到它与预计总时长；写坏的值只丢掉这一项，其余标记照常', async (t) => {
+  const { root, paths } = await createRoot(t);
+  const waits = [];
+  let startOpening;
+  const openingStarted = new Promise((resolve) => { startOpening = resolve; });
+  // A reloaded window opening again: outside the requester's async scope, it waits on the admission.
+  const opening = openingStarted.then(() => openUnderCurrentDataRootAdmission(async () => root, async () => 'opened', 5, {
+    onWait: (wait) => waits.push(wait)
+  }));
+  const expectedEndAt = new Date(Date.now() + 20 * 60_000).toISOString();
+  const outcome = await runExclusiveRuntimeMaintenance(paths, {
+    ...BASE, operationKey: 'large-session', message: '为合并较大的旧聊天记录', ignoreBackoff: false,
+    configurationRootPath: root, withLocks: (body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body))
+  }, async ({ reportStage, reportExpectedEnd }) => {
+    startOpening();
+    reportStage('第 1/2 份，已完成 0%');
+    reportExpectedEnd(expectedEndAt);
+    await delay(1_600);
+    reportExpectedEnd('不是时间');
+    await delay(400);
+    return 'merged';
+  });
+  assert.equal(outcome.state, 'completed');
+  assert.equal(await opening, 'opened');
+  const withEnd = waits.filter((wait) => wait.activity?.expectedEndAt);
+  assert.ok(withEnd.length > 0, JSON.stringify(waits.map((wait) => wait.activity)));
+  const first = withEnd[0].activity;
+  assert.equal(first.expectedEndAt, expectedEndAt);
+  assert.equal(first.stage, '第 1/2 份，已完成 0%');
+  assert.ok(Math.abs(first.expectedTotalMs - 20 * 60_000) < 10_000, `expected total ${first.expectedTotalMs} ms`);
+  const last = waits.at(-1).activity;
+  assert.equal(last.expectedEndAt, undefined, 'an unreadable expected end is dropped, not the marker');
+  assert.equal(last.expectedTotalMs, undefined);
+  assert.equal(last.description, '合并较大的旧聊天记录');
+
+  // Written by another holder with an expected end that is not a time: only that field goes.
+  let holding;
+  const held = new Promise((resolve) => { holding = resolve; });
+  let letGo;
+  const gate = new Promise((resolve) => { letGo = resolve; });
+  const holder = withRuntimeDataRootAdmission(root, async () => { holding(); await gate; });
+  await held;
+  const claim = runtimeDataRootAdmissionClaimPath(root);
+  const { claimToken } = JSON.parse(await fs.readFile(path.join(claim, 'owner.json'), 'utf8'));
+  await fs.writeFile(path.join(claim, 'activity.json'), JSON.stringify({
+    kind: 'limcode-runtime-maintenance-activity', claimToken, operation: 'historical-merge', description: '合并较大的旧聊天记录',
+    expectedEndAt: 12345, processId: process.pid, startedAt: new Date(Date.now() - 1_000).toISOString(), heartbeatAt: new Date().toISOString()
+  }));
+  const later = [];
+  const again = openUnderCurrentDataRootAdmission(async () => root, async () => 'opened', 5, { onWait: (wait) => later.push(wait) });
+  await delay(1_300);
+  letGo();
+  await holder;
+  assert.equal(await again, 'opened');
+  const seen = later.find((wait) => wait.activity)?.activity;
+  assert.equal(seen?.description, '合并较大的旧聊天记录');
+  assert.equal(seen.expectedEndAt, undefined);
+});
+
 test('残留清理与新请求交错：列完回应后再列一次请求，只删两次都没有请求且足够旧的回应，另一个请求方照常完成', async (t) => {
   const { binding, paths } = await createRoot(t);
   const peer = await openWindow(t, binding, 'peer');

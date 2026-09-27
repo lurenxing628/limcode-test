@@ -178,6 +178,11 @@ export interface ExclusiveMaintenanceGoCheck {
 export interface ExclusiveMaintenanceOperationContext {
   /** Replaces the stage that windows waiting to open show (the maintenance activity marker). */
   reportStage(stage: string | undefined): void;
+  /**
+   * When the operation expects to be done (ISO time; undefined clears it), in the same marker:
+   * waiting windows show it and, while its heartbeat stays fresh, warn only well after it.
+   */
+  reportExpectedEnd(at: string | undefined): void;
 }
 
 export interface RuntimeExclusiveMaintenanceInput {
@@ -743,7 +748,10 @@ class ExclusiveMaintenanceRequester<T> {
     }, EXCLUSIVE_MAINTENANCE_DEFAULTS.heartbeatMs);
     keepAlive?.unref?.();
     try {
-      const result = await this.operation({ reportStage: (stage) => activity.report(stage) });
+      const result = await this.operation({
+        reportStage: (stage) => activity.report(stage),
+        reportExpectedEnd: (at) => activity.expectEnd(at)
+      });
       await clearKeyBackoff(this.paths, this.operationName, this.operationKey);
       return result;
     } catch (error) {

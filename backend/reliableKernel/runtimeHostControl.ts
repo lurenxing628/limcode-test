@@ -55,11 +55,18 @@ export interface RuntimeMaintenanceActivity {
   description: string;
   /** User-facing stage or progress, e.g. 正在复制正文（3/10）. */
   stage?: string;
+  /**
+   * When the holder expects to be done (ISO time), e.g. the upper end of a large merge's estimate.
+   * Waiting windows show it and, while the heartbeat stays fresh, warn later (runtimeOpeningWait.ts).
+   */
+  expectedEndAt?: string;
 }
 
 export interface RuntimeMaintenanceActivityHandle {
   /** Replaces the stage shown to waiting windows (written at once, and with every heartbeat). */
   report(stage: string | undefined): void;
+  /** Sets (undefined: clears) when the holder expects to be done; written at once, and with every heartbeat. */
+  expectEnd(at: string | undefined): void;
 }
 
 /** The holder's published activity as seen by a waiter. */
@@ -68,6 +75,8 @@ export interface RuntimeClaimWaitActivity extends RuntimeMaintenanceActivity {
   heartbeatAgeMs: number;
   /** Not refreshed for activityStaleMs: the holder process is alive but makes no progress (never taken over). */
   stale: boolean;
+  /** From the holder's start to its expected end; only with a valid expectedEndAt later than the start. */
+  expectedTotalMs?: number;
 }
 
 export interface RuntimeClaimWait {
@@ -411,6 +420,7 @@ export async function withRuntimeMaintenanceActivity<T>(
   requireNonEmptyText(activity.description, 'activity.description');
   const startedAt = new Date().toISOString();
   let stage = activity.stage;
+  let expectedEndAt = validTime(activity.expectedEndAt);
   let writing: Promise<void> | undefined;
   let again = false;
   let stopped = false;
@@ -423,6 +433,7 @@ export async function withRuntimeMaintenanceActivity<T>(
         operation: activity.operation,
         description: activity.description,
         ...(stage ? { stage } : {}),
+        ...(expectedEndAt ? { expectedEndAt } : {}),
         processId: process.pid,
         startedAt,
         heartbeatAt: new Date().toISOString()
@@ -450,6 +461,12 @@ export async function withRuntimeMaintenanceActivity<T>(
       report(next) {
         if (next === stage) return;
         stage = next;
+        void flush();
+      },
+      expectEnd(at) {
+        const next = validTime(at);
+        if (next === expectedEndAt) return;
+        expectedEndAt = next;
         void flush();
       }
     });
@@ -482,6 +499,11 @@ async function writeMaintenanceActivity(claim: AcquiredRuntimeMaintenance, recor
   }
 }
 
+/** An ISO time that parses; anything else is dropped (an expected end is advisory). */
+function validTime(value: string | undefined): string | undefined {
+  return typeof value === 'string' && Number.isFinite(Date.parse(value)) ? value : undefined;
+}
+
 /** The activity published inside a claim, only when it belongs to the holder with this token. */
 async function readMaintenanceActivity(claimPath: string, holderToken: string): Promise<RuntimeClaimWaitActivity | undefined> {
   let record: Partial<RuntimeMaintenanceActivityRecord>;
@@ -495,10 +517,14 @@ async function readMaintenanceActivity(claimPath: string, holderToken: string): 
   if (!Number.isFinite(started) || !Number.isFinite(heartbeat)) return undefined;
   const now = Date.now();
   const heartbeatAgeMs = Math.max(0, now - heartbeat);
+  // Advisory: a missing or unreadable expected end leaves the rest of the marker as it is.
+  const expectedEndAt = validTime(typeof record.expectedEndAt === 'string' ? record.expectedEndAt : undefined);
+  const expectedEnd = expectedEndAt === undefined ? Number.NaN : Date.parse(expectedEndAt);
   return {
     operation: record.operation,
     description: record.description,
     ...(record.stage ? { stage: record.stage } : {}),
+    ...(expectedEndAt !== undefined && expectedEnd > started ? { expectedEndAt, expectedTotalMs: expectedEnd - started } : {}),
     runningMs: Math.max(0, now - started),
     heartbeatAgeMs,
     stale: heartbeatAgeMs > RUNTIME_CLAIM_WAIT.activityStaleMs
