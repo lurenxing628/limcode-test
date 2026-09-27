@@ -255,7 +255,8 @@ async function start(): Promise<void> {
         const result = executeTransaction(writer, request.steps, commitSeq + 1n);
         commitSeq += 1n;
         post({ type: 'commit', result });
-        respond({ type: 'response', id: request.id, ok: true, result });
+        // Only a reference: the host answers with the commit message's result (cloned once).
+        respond({ type: 'response', id: request.id, ok: true, result: null, committed: result.commitSeq });
         return;
       }
       if (request.kind === 'snapshot') {

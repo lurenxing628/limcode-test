@@ -110,6 +110,11 @@ export class RuntimeDatabase {
     startedAtMs?: number;
   }>();
   private readonly commitListeners = new Set<(result: RuntimeCommitResult) => void>();
+  /**
+   * Result of the latest `commit` message until the next response arrives: a committed
+   * transaction's response names it instead of carrying a second structured clone.
+   */
+  private lastCommit: RuntimeCommitResult | undefined;
   private readonly performanceMetricSinks = new Set<RuntimePerformanceMetricsSink>();
   private readonly performanceMetricFanout: RuntimePerformanceMetricsSink = {
     record: (event) => {
@@ -206,6 +211,10 @@ export class RuntimeDatabase {
     }));
   }
 
+  /**
+   * Resolves with the same RuntimeCommitResult object that the commit listeners received (one
+   * structured clone from the worker); the caller and the listeners must treat it as read-only.
+   */
   public async transaction(steps: RepositoryTransactionStep[]): Promise<RuntimeCommitResult> {
     const fence = currentExecutionLeaseFence();
     const fencedSteps = fence
@@ -391,6 +400,7 @@ export class RuntimeDatabase {
     return inspectRecordedProcess(record) !== 'dead';
   }
 
+  /** The listener receives the object a committed transaction() also resolves with; read-only. */
   public onCommit(listener: (result: RuntimeCommitResult) => void): () => void {
     this.commitListeners.add(listener);
     return () => this.commitListeners.delete(listener);
@@ -731,6 +741,7 @@ export class RuntimeDatabase {
 
   private onMessage(message: DatabaseWorkerResponse): void {
     if (message.type === 'commit') {
+      this.lastCommit = message.result;
       const metrics = this.performanceMetrics;
       const startedAtMs = metrics ? performance.now() : undefined;
       const listenerCount = this.commitListeners.size;
@@ -753,6 +764,9 @@ export class RuntimeDatabase {
       return;
     }
     if (message.type !== 'response') return;
+    // The worker posts a transaction's commit message and its response back to back.
+    const lastCommit = this.lastCommit;
+    this.lastCommit = undefined;
     const pending = this.pending.get(message.id);
     if (!pending) return;
     this.pending.delete(message.id);
@@ -777,8 +791,10 @@ export class RuntimeDatabase {
         ...(message.ok ? {} : sqliteFailureMetric(message.error))
       });
     }
-    if (message.ok) pending.resolve(message.result);
-    else pending.reject(new RuntimeDatabaseWorkerError(message.error));
+    if (!message.ok) pending.reject(new RuntimeDatabaseWorkerError(message.error));
+    else if (message.committed === undefined) pending.resolve(message.result);
+    else if (lastCommit?.commitSeq === message.committed) pending.resolve(lastCommit);
+    else pending.reject(new Error(`RuntimeDatabase worker answered commit ${message.committed} without its commit message.`));
   }
 
   private failPending(error: unknown): void {

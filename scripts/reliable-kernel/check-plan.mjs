@@ -143,6 +143,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-diagnostic-sqlite-locks.test.mjs',
   'tests/reliable-kernel/runtime-statement-cache.test.mjs',
   'tests/reliable-kernel/historical-copy-savepoint.test.mjs',
+  'tests/reliable-kernel/runtime-commit-result.test.mjs',
   'tests/reliable-kernel/sqlite-database-file-guard.test.mjs',
   'tests/reliable-kernel/debug-capture-controller.test.mjs',
   'tests/reliable-kernel/debug-capture-files.test.mjs',
