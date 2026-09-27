@@ -241,6 +241,9 @@ test('调试默认设置使用独立设置文件、现有修订检查与当前�
     assert.deepEqual(switched.settings, initial.settings);
     assert.equal(switched.filePath, path.join(currentRoot, 'settings', 'debug-capture.json'));
     assert.deepEqual(JSON.parse(await fs.readFile(initial.filePath, 'utf8')).settings, updated.settings);
+    // Defaults never create the directory (it may be an unmounted drive's mount point); a save does.
+    await assert.rejects(fs.stat(currentRoot), { code: 'ENOENT' });
+    await authority.saveGlobalSettings('debugCapture', { ...switched.settings, maxMiB: 16 }, switched.revision);
     const damaged = JSON.parse(await fs.readFile(switched.filePath, 'utf8'));
     damaged.settings.maxMiB = 999;
     await fs.writeFile(switched.filePath, JSON.stringify(damaged));
@@ -314,6 +317,9 @@ test('全局 UA 随当前配置根持久化，旧窗口不能覆盖且损坏记�
     assert.deepEqual(switched.settings, { userAgent: '' });
     assert.equal(switched.filePath, path.join(currentRoot, 'settings', 'network.json'));
     assert.deepEqual(JSON.parse(await fs.readFile(updated.filePath, 'utf8')).settings, updated.settings);
+    // Defaults never create the directory (it may be an unmounted drive's mount point); a save does.
+    await assert.rejects(fs.stat(currentRoot), { code: 'ENOENT' });
+    await authority.saveGlobalSettings('network', { userAgent: 'Second Client/2' }, switched.revision);
     const damaged = JSON.parse(await fs.readFile(switched.filePath, 'utf8'));
     damaged.settings.userAgent = 42;
     await fs.writeFile(switched.filePath, JSON.stringify(damaged));
