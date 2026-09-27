@@ -7,7 +7,8 @@ import {
   migratePreviousRuntimeEpochIfRequired, previousRuntimeEpochMigrationRequired, type RuntimeEpochMigrationOptions
 } from './runtimeEpochMigration';
 import {
-  assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission, withRuntimeMaintenance
+  assertRuntimeHostsOffline, runtimeHostLivenessDirectory, withRuntimeDataRootAdmission, withRuntimeMaintenance,
+  withRuntimeMaintenanceActivity
 } from './runtimeHostControl';
 import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet
@@ -139,7 +140,10 @@ export async function upgradeRuntimeDataSet(
     const candidate = await resolveVscodeRuntimeDataSet(storagePaths, request.candidateId);
     assertExpectedIdentity(candidate, request);
     const authority = createVscodeRootAuthority(candidate);
-    return withRuntimeMaintenance(authority.expectedPaths(), async () => {
+    // Windows opening meanwhile wait on the admission and say why (the backup can take a while).
+    return withRuntimeMaintenance(authority.expectedPaths(), () => withRuntimeMaintenanceActivity({
+      operation: 'data-set-upgrade', description: '备份并升级旧版本的聊天记录'
+    }, async () => {
       const current = await resolveVscodeRuntimeDataSet(storagePaths, request.candidateId);
       assertExpectedIdentity(current, request);
       try {
@@ -186,7 +190,7 @@ export async function upgradeRuntimeDataSet(
         ...(migration?.previousEpoch !== undefined ? { previousEpoch: migration.previousEpoch } : {}),
         ...(migration?.backupPath !== undefined ? { backupPath: migration.backupPath } : {})
       };
-    });
+    }));
   });
 }
 

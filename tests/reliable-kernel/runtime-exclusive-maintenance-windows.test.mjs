@@ -103,8 +103,8 @@ test('发起方自身忙碌只看任务不看焦点（requesterWorkBusy）', asy
     { kind: 'work', reason: '本窗口有任务正在进行' });
 });
 
-test('打开运行时等待时说明原因：持有方在做什么、已进行多久、阶段；只是另一个窗口在打开时照实说；等太久或没有进展时只给“继续等待 / 关闭窗口”', async () => {
-  const events = { progress: [], warnings: [], commands: [] };
+test('打开运行时等待时说明原因：外壳只写持有方在做什么和阶段（不带秒数），通知带耗时；久等按当前持有者计时；只给“继续等待 / 关闭窗口”，打开后再点按钮只作说明', async () => {
+  const events = { progress: [], warnings: [], infos: [], commands: [] };
   const answers = [];
   const vscode = {
     ProgressLocation: { Notification: 15 },
@@ -114,45 +114,58 @@ test('打开运行时等待时说明原因：持有方在做什么、已进行�
         await task({ report: (value) => events.progress.push(['report', value.message]) });
         events.progress.push(['closed']);
       },
-      showWarningMessage: async (message, ...actions) => {
+      showWarningMessage: (message, ...actions) => {
         events.warnings.push({ message, actions });
-        return answers.shift();
-      }
+        return answers.shift() ?? new Promise(() => {});
+      },
+      showInformationMessage: async (message) => { events.infos.push(message); }
     },
     commands: { executeCommand: async (id) => { events.commands.push(id); } }
   };
   const opening = loadLayerModule('vscode/runtimeOpeningWait.ts', { vscode });
   const describe = (wait) => ({ ...opening.describeRuntimeOpeningWait(wait) });
-  assert.deepEqual({ ...describe({ waitedMs: 1_500 }).status }, {
-    title: '正在等待其它窗口', description: '正在等待其它窗口完成打开（已等待 2 秒），完成后自动打开；未发送的输入已保留。'
+  const other = describe({ waitedMs: 1_500, holderWaitedMs: 1_500 });
+  assert.deepEqual({ ...other.status }, {
+    title: '正在等待其它窗口', description: '正在等待其它 LimCode 窗口释放数据目录，完成后自动打开；未发送的输入已保留。'
   });
+  assert.equal(other.message, '正在等待其它 LimCode 窗口释放数据目录（已等待 2 秒），完成后自动打开；未发送的输入已保留。');
   const migrating = { operation: 'data-root-migration', description: '迁移数据目录', runningMs: 12_400, heartbeatAgeMs: 800, stale: false };
-  assert.equal(describe({ waitedMs: 3_000, activity: migrating }).status.description,
-    '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。');
-  assert.equal(describe({ waitedMs: 3_000, activity: { ...migrating, stage: '正在复制正文（3/10）', runningMs: 300_000 } }).status.description,
-    '另一个窗口正在迁移数据目录（已进行 5 分钟，正在复制正文（3/10）），完成后自动打开；未发送的输入已保留。');
-  assert.equal(describe({ waitedMs: 3_000, activity: migrating }).warning, undefined);
-  assert.match(describe({ waitedMs: 11 * 60_000, activity: migrating }).warning, /本窗口已等待 11 分钟。本窗口会继续等它结束，不会跳过它直接打开；也可以关闭本窗口。/);
-  assert.match(describe({ waitedMs: 61_000 }).warning, /另一个窗口一直没有完成打开/);
-  const stale = describe({ waitedMs: 20_000, activity: { ...migrating, heartbeatAgeMs: 31_000, stale: true } });
-  assert.match(stale.status.description, /^另一个窗口正在迁移数据目录，已经 31 秒没有进展（可能卡在网络盘或外置盘上）/);
+  const plain = describe({ waitedMs: 3_000, holderWaitedMs: 3_000, activity: migrating });
+  assert.equal(plain.status.description, '另一个窗口正在迁移数据目录，完成后自动打开；未发送的输入已保留。');
+  assert.equal(plain.message, '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。');
+  const staged = describe({ waitedMs: 3_000, holderWaitedMs: 3_000, activity: { ...migrating, stage: '正在复制正文（3/10）', runningMs: 300_000 } });
+  assert.equal(staged.status.description, '另一个窗口正在迁移数据目录（正在复制正文（3/10）），完成后自动打开；未发送的输入已保留。');
+  assert.equal(staged.message, '另一个窗口正在迁移数据目录（已进行 5 分钟，正在复制正文（3/10）），完成后自动打开；未发送的输入已保留。');
+  assert.equal(plain.warning, undefined);
+  assert.match(describe({ waitedMs: 11 * 60_000, holderWaitedMs: 11 * 60_000, activity: migrating }).warning,
+    /本窗口已等待 11 分钟。本窗口会继续等它结束，不会跳过它直接打开；也可以关闭本窗口。/);
+  // Judged by the current holder: a window queued behind a long maintenance is not warned when the
+  // next window (which publishes nothing while it opens) takes the lock.
+  assert.equal(describe({ waitedMs: 62_000, holderWaitedMs: 900 }).warning, undefined);
+  assert.equal(describe({ waitedMs: 11 * 60_000, holderWaitedMs: 4 * 60_000, activity: migrating }).warning, undefined,
+    'a maintenance that took over from an earlier holder is timed from its own start');
+  assert.match(describe({ waitedMs: 62_000, holderWaitedMs: 61_000 }).warning, /另一个 LimCode 窗口已经占用数据目录 61 秒/);
+  const stale = describe({ waitedMs: 20_000, holderWaitedMs: 20_000, activity: { ...migrating, heartbeatAgeMs: 31_000, stale: true } });
+  assert.equal(stale.status.description, '另一个窗口正在迁移数据目录，但暂时没有进展（可能卡在网络盘或外置盘上）；完成后自动打开；未发送的输入已保留。');
+  assert.match(stale.message, /已经 31 秒没有进展/);
   assert.match(stale.warning, /不会跳过它直接打开/);
 
   const statuses = [];
   const presenter = opening.createRuntimeOpeningWaitPresenter((status) => statuses.push(status && { ...status }));
-  presenter.onWait({ waitedMs: 1_000 });
-  presenter.onWait({ waitedMs: 1_200 });
-  presenter.onWait({ waitedMs: 2_000, activity: migrating });
+  // Every second a new elapsed time: the notification follows, the shell does not.
+  for (let second = 1; second <= 5; second += 1) presenter.onWait({ waitedMs: second * 1_000, holderWaitedMs: second * 1_000, activity: { ...migrating, runningMs: second * 1_000 } });
+  presenter.onWait({ waitedMs: 6_000, holderWaitedMs: 6_000, activity: { ...migrating, runningMs: 6_000, stage: '正在核对' } });
   assert.deepEqual(statuses.map((status) => status.description), [
-    '正在等待其它窗口完成打开（已等待 1 秒），完成后自动打开；未发送的输入已保留。',
-    '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。'
-  ], 'the shell is updated only when the text changes');
+    '另一个窗口正在迁移数据目录，完成后自动打开；未发送的输入已保留。',
+    '另一个窗口正在迁移数据目录（正在核对），完成后自动打开；未发送的输入已保留。'
+  ], 'the shell is redrawn only when the stage changes');
+  assert.equal(events.progress.filter((entry) => entry[0] === 'report').length, 6, 'the notification shows every second');
   assert.equal(events.progress.filter((entry) => entry[0] === 'open').length, 1, 'one notification for the whole wait');
   // The holder stopped making progress: warned once; the user keeps waiting, then no new warning at once.
   answers.push('继续等待');
-  presenter.onWait({ waitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
+  presenter.onWait({ waitedMs: 30_000, holderWaitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
   await delay(10);
-  presenter.onWait({ waitedMs: 31_000, activity: { ...migrating, heartbeatAgeMs: 21_000, stale: true } });
+  presenter.onWait({ waitedMs: 31_000, holderWaitedMs: 31_000, activity: { ...migrating, heartbeatAgeMs: 21_000, stale: true } });
   await delay(10);
   assert.equal(events.warnings.length, 1);
   assert.deepEqual([...events.warnings[0].actions], ['继续等待', '关闭窗口']);
@@ -166,19 +179,84 @@ test('打开运行时等待时说明原因：持有方在做什么、已进行�
   const announced = [];
   const early = opening.createRuntimeOpeningWaitPresenter((status) => announced.push(status?.description));
   early.announce('正在迁移数据目录，完成后自动打开；未发送的输入已保留。');
-  early.onWait({ waitedMs: 1_000, activity: migrating });
+  early.onWait({ waitedMs: 1_000, holderWaitedMs: 1_000, activity: migrating });
   early.end();
   assert.deepEqual(announced, ['正在迁移数据目录，完成后自动打开；未发送的输入已保留。',
-    '另一个窗口正在迁移数据目录（已进行 12 秒），完成后自动打开；未发送的输入已保留。', undefined]);
-  assert.equal(events.progress.filter((entry) => entry[0] === 'open').length, 2, 'one notification per opening');
+    '另一个窗口正在迁移数据目录，完成后自动打开；未发送的输入已保留。', undefined]);
 
-  // “关闭窗口” closes this window; nothing else happens.
+  // “关闭窗口” closes this window while it waits.
   const closing = opening.createRuntimeOpeningWaitPresenter(() => {});
   answers.push('关闭窗口');
-  closing.onWait({ waitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
+  closing.onWait({ waitedMs: 30_000, holderWaitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
   await delay(10);
   assert.deepEqual(events.commands, ['workbench.action.closeWindow']);
   closing.end();
+
+  // A warning still open when the window opened: a button pressed afterwards is answered, nothing else.
+  let answer;
+  answers.push(new Promise((resolve) => { answer = resolve; }));
+  const late = opening.createRuntimeOpeningWaitPresenter(() => {});
+  late.onWait({ waitedMs: 70_000, holderWaitedMs: 61_000 });
+  late.end();
+  answer('关闭窗口');
+  await delay(10);
+  assert.deepEqual(events.commands, ['workbench.action.closeWindow'], 'not closed after it opened');
+  assert.deepEqual(events.infos, ['LimCode 已经打开，不需要再等待；本窗口没有关闭。']);
+});
+
+test('用户的操作让先给较早的请求后，只有为那个请求让出时才把原因带过重载；自动调用与别的请求都不带', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const state = new Map();
+  const windowState = { get: (key) => state.get(key), update: async (key, value) => { if (value === undefined) state.delete(key); else state.set(key, value); } };
+  let reloads = 0;
+  const layer = loadVscodeLayer(vscodeMock({ titles: [], notices: [] }, () => { reloads += 1; }));
+  const liveness = await publishHost(binding, 'window-b');
+  const participant = layer.startExclusiveMaintenanceParticipant({
+    exclusiveMaintenanceTarget: () => ({ paths, hostBootId: 'window-b' }), hasOwnedExecution: async () => false
+  }, { countdownSeconds: 0, pollMs: 60 * 60_000, processId: (nextFakeProcessId += 1), windowState });
+  t.after(async () => { await participant.dispose(); await fs.rm(liveness, { force: true }); });
+  // Another window with a running Turn: B's requests are published and wait.
+  const working = await layerWindow(t, binding, 'window-c', { work: true });
+  const earlier = { requestId: 'earlier-request', createdAt: '2020-01-01T00:00:00.000Z', whenBusy: 'wait', confirmation: 'notice' };
+  const other = (id) => ({ ...earlier, requestId: id, createdAt: '2020-01-01T00:00:01.000Z' });
+  const ask = (ignoreBackoff, whenBusy = 'wait') => layer.runWithExclusiveMaintenance(paths, {
+    ...MERGE, operation: 'historical-merge', operationKey: `source-${ignoreBackoff}`, message: '为合并较大的旧聊天记录',
+    waitingTitle: '等待', ignoreBackoff, whenBusy, requesterHostBootId: 'window-b', pollMs: 10, isCurrent: () => true,
+    withLocks: (body) => withRuntimeMaintenance(paths, body)
+  }, async () => assert.fail('must not run'));
+  const walk = async (request) => {
+    for (const phase of ['prepare', 'confirm', 'go']) {
+      await writeRequest(paths, { ...request, phase });
+      await participant.checkNow();
+    }
+  };
+  // The user's operation that did not run for another reason (window C is busy): nothing is kept.
+  assert.equal((await ask(true, 'abandon')).state, 'busy');
+  await walk(other('request-1'));
+  await delay(20);
+  assert.equal(reloads, 1);
+  assert.equal(layer.takeNoticeKeptAcrossReload(windowState), undefined);
+  await writeRequest(paths, earlier);
+  // An automatic call gives way too, but nothing is kept for it.
+  assert.equal((await ask(false)).gaveWayTo, 'earlier-request');
+  await walk(other('request-2'));
+  await delay(20);
+  assert.equal(reloads, 2);
+  assert.equal(layer.takeNoticeKeptAcrossReload(windowState), undefined);
+  // Yielding to another request than the one given way to keeps nothing either.
+  const clicked = await ask(true);
+  assert.equal(clicked.gaveWayTo, 'earlier-request');
+  await walk(other('request-3'));
+  await delay(20);
+  assert.equal(reloads, 3);
+  assert.equal(layer.takeNoticeKeptAcrossReload(windowState), undefined);
+  // Yielding to the request the user's operation gave way to keeps the reason, once.
+  await walk(earlier);
+  await delay(20);
+  assert.equal(reloads, 4);
+  assert.equal(working.reloads, 0);
+  assert.match(layer.takeNoticeKeptAcrossReload(windowState), /^合并较大的旧聊天记录没有进行：另一个窗口先发起了整理数据/);
+  assert.equal(layer.takeNoticeKeptAcrossReload(windowState), undefined, 'read once');
 });
 
 test('打开外壳读取启动等待原因：变化时通知，运行时就绪后不再接受', async () => {
@@ -381,7 +459,7 @@ test('多进程（复审 MP5）：两个请求方同时在锁外等待时不互�
   await b.waitFor('progress', 30_000);
   // D: the user clicks another operation in window D that needs the other windows offline.
   const d = await windows.start('D', {
-    request: true, keptNoticeFile: path.join(path.dirname(fixture.root), 'kept-D.json'),
+    request: true, windowStateFile: path.join(path.dirname(fixture.root), 'state-D.json'),
     requestOptions: { operation: 'historical-merge', operationKey: 'source@x', message: '为合并较大的旧聊天记录', participantConfirmation: 'notice', requesterBusy: undefined }
   });
   const dOutcome = await d.waitFor('coordination', 60_000);
@@ -452,7 +530,8 @@ test('多进程（复审 MP2）：用户点击的合并在其它窗口让出后�
   const clicks = windows.events().filter((event) => event.event === 'coordination' && event.requested);
   assert.equal(clicks.at(-1).name, 'A2');
   assert.equal(clicks.at(-1).state, 'backoff');
-  assert.match(clicks.at(-1).reason, /本窗口是在那之后打开的/);
+  assert.match(clicks.at(-1).reason, /暂不再次要求其它窗口重载。约 \d+ 分钟后（\d\d:\d\d 以后）可以再试。$/);
+  assert.ok(Date.parse(clicks.at(-1).retryAfter) > Date.now());
   for (const report of windows.reports()) assert.deepEqual(report.merged, []);
 });
 
@@ -496,9 +575,79 @@ test('多进程：迁移执行期间重载的窗口在打开外壳里看到“�
   assert.equal(coordination.state, 'completed');
   const statuses = windows.events().filter((event) => event.name === 'W' && event.boot === 2 && event.event === 'opening-status')
     .map((event) => event.description);
-  assert.ok(statuses.some((text) => /^另一个窗口正在迁移数据目录（已进行 \d+ 秒），完成后自动打开；未发送的输入已保留。$/.test(text)), JSON.stringify(statuses));
+  assert.deepEqual(statuses, ['另一个窗口正在迁移数据目录，完成后自动打开；未发送的输入已保留。'], 'the shell text does not change while nothing but the time does');
   const released = windows.events().find((event) => event.name === 'R' && event.event === 'locks-released').at;
   assert.ok(reopened.at >= released, 'opened only after the maintenance let go of the locks');
+});
+
+test('多进程（复审 N1）：启动时的自动合并让先给另一个窗口的迁移，本窗口随后为迁移重载——不把自动调用的结果带过重载', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
+  await requestRuntimeDataSetMerge(fixture.paths, {
+    candidateId: fixture.alpha.id,
+    expectedDataSetId: fixture.alpha.binding.dataSetId,
+    expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
+  });
+  const windows = createWindows(t, fixture.root, { limits: LIMITS });
+  await (await windows.start('C', { busy: true, busyForMs: 8_000, noMerge: true })).waitFor('ready');
+  const b = await windows.start('B', { request: true });
+  await b.waitFor('progress', 30_000);
+  const a = await windows.start('A', { windowStateFile: path.join(path.dirname(fixture.root), `state-A-${randomUUID()}.json`) });
+  await a.waitFor('report', 60_000);
+  const migration = await b.waitFor('coordination', 60_000);
+  await windows.waitForEvent('A', 'ready', 30_000, 2);
+  await delay(500);
+  await windows.stop();
+  const coordination = windows.events().filter((event) => event.name === 'A' && event.event === 'coordination');
+  assert.equal(coordination[0]?.requested, false, 'the automatic startup merge');
+  assert.equal(migration.state, 'completed');
+  assert.equal(windows.reloads().A, 1);
+  assert.deepEqual(windows.events().filter((event) => event.name === 'A' && event.event === 'kept-notice'), []);
+});
+
+test('多进程（复审 N2）：迁移在其它窗口让出后失败，发起窗口随即重载；用户马上再试可以越过冷却并完成，其它窗口为新的一次操作再重载一次；刚让出的窗口自己点迁移仍被冷却挡住', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  await (await windows.start('W', {
+    windowStateFile: path.join(path.dirname(fixture.root), 'state-W.json'),
+    // W reopens after yielding and its user clicks “迁移数据目录” too (a new attempt, its own token).
+    afterReload: { request: true, requestAfterMs: 100 }
+  })).waitFor('ready');
+  const r = await windows.start('R', {
+    request: true, failOperation: 'ENOSPC', reloadAfterFailure: true,
+    windowStateFile: path.join(path.dirname(fixture.root), 'state-R.json'),
+    // The user freed space and clicks “迁移数据目录” again right after the window came back.
+    afterReload: { request: true, requestAfterMs: 1_500, failOperation: false }
+  });
+  const first = await r.waitFor('coordination', 60_000);
+  const other = await windows.waitForEvent('W', 'coordination', 60_000, 2);
+  const retry = await windows.waitForEvent('R', 'coordination', 60_000, 2);
+  await delay(300);
+  await windows.stop();
+  assert.equal(first.state, 'threw');
+  assert.equal(other.state, 'backoff', JSON.stringify(other));
+  assert.match(other.reason, /^刚刚已经为这项维护让其它窗口重载过一次，暂不再次要求其它窗口重载。约 10 分钟后（\d\d:\d\d 以后）可以再试。$/);
+  assert.ok(other.at < retry.at, 'W asked before R retried');
+  assert.equal(retry.state, 'completed', JSON.stringify(retry));
+  assert.deepEqual(windows.reloads(), { W: 2, R: 1 }, 'one reload of W per user operation');
+});
+
+test('多进程（复审 N3）：长时间维护结束后排队的窗口依次打开；打开外壳只在阶段变化时重画', async (t) => {
+  const fixture = await createRoot(t);
+  const windows = createWindows(t, fixture.root, { noMerge: true });
+  for (const name of ['W1', 'W2', 'W3']) await (await windows.start(name)).waitFor('ready');
+  const r = await windows.start('R', { request: true, operationMs: 12_000 });
+  await r.waitFor('coordination', 90_000);
+  for (const name of ['W1', 'W2', 'W3']) await windows.waitForEvent(name, 'opened', 30_000, 2);
+  await windows.stop();
+  const released = windows.events().find((event) => event.name === 'R' && event.event === 'locks-released').at;
+  const rows = ['W1', 'W2', 'W3'].map((name) => ({
+    name,
+    afterReleaseMs: windows.events().find((event) => event.name === name && event.boot === 2 && event.event === 'opened').at - released,
+    shellUpdates: windows.events().filter((event) => event.name === name && event.boot === 2 && event.event === 'opening-status').length
+  }));
+  console.log('N3', JSON.stringify(rows));
+  assert.ok(rows.every((row) => row.shellUpdates >= 1 && row.shellUpdates <= 2), JSON.stringify(rows));
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -553,6 +702,18 @@ function vscodeMock(window, onReload, cancel = false) {
       }
     }
   };
+}
+
+/** A request file of another requester (this process stands in for it). */
+async function writeRequest(paths, overrides) {
+  const file = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', `${overrides.requestId}.json`);
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, JSON.stringify({
+    kind: 'limcode-runtime-exclusive-maintenance-request', round: 1, phase: 'prepare', operation: 'offline-gc', operationKey: 'gc',
+    message: '为整理数据', activity: '整理数据', confirmation: 'countdown', whenBusy: 'abandon', requesterProcessId: process.pid,
+    requesterProcessStartIdentity: ownProcessStartIdentity(), heartbeatAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(), ...overrides
+  }));
 }
 
 /** Loads a real VS Code layer module (TypeScript source) with the given dependencies. */
@@ -627,8 +788,8 @@ function createWindows(t, root, defaults) {
       state.events.push({ name, boot, event: 'exit', code, signal, at: Date.now() });
       if (!state.stopped && own.some((event) => event.event === 'reload')) {
         // A reloaded window boots again, no longer as the requester or with the user's click.
-        const { request: _request, explicit: _explicit, requestAfterMs: _after, ...rest } = behavior;
-        void start(name, rest);
+        const { request: _request, explicit: _explicit, requestAfterMs: _after, afterReload, ...rest } = behavior;
+        void start(name, { ...rest, ...(afterReload ?? {}) });
       }
     });
     return {

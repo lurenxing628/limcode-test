@@ -31,7 +31,9 @@ const {
   resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
-const { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld } = kernelFile('runtimeHostControl.js');
+const {
+  isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, runtimeDataRootAdmissionClaimPath, runtimeMaintenanceClaimPath
+} = kernelFile('runtimeHostControl.js');
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-09-26T00:00:00.000Z';
@@ -517,6 +519,29 @@ for (const point of ['after-source-backup', 'after-target-backup', 'after-cas-tr
     assert.deepEqual(await fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'commits')).catch(() => []), []);
   });
 }
+
+test('来源收尾（备份与终态转换）期间在所持的 admission 与来源 maintenance 里发布维护进行中标记，收尾后随锁消失', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.current, [{ id: 'conversation_current_marker', project: SHARED_PROJECT }]);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_marker', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_marker', kind: 'bare' }]);
+  const database = await openTarget(t, fixture.current);
+  const claims = [runtimeDataRootAdmissionClaimPath(fixture.root), runtimeMaintenanceClaimPath(fixture.alpha.binding.paths)];
+  const seen = [];
+  const report = await merge(fixture, database, {
+    async onFaultPoint(point) {
+      if (point !== 'after-source-backup') return;
+      for (const claim of claims) {
+        const owner = JSON.parse(await fs.readFile(path.join(claim, 'owner.json'), 'utf8'));
+        const activity = JSON.parse(await fs.readFile(path.join(claim, 'activity.json'), 'utf8'));
+        seen.push({ operation: activity.operation, description: activity.description, sameClaim: activity.claimToken === owner.claimToken });
+      }
+    }
+  });
+  assert.equal(report.merged.length, 1);
+  assert.deepEqual(seen, claims.map(() => ({ operation: 'historical-merge-finalize', description: '备份并收尾要合并的旧聊天记录', sameClaim: true })));
+  for (const claim of claims) await assert.rejects(fs.access(path.join(claim, 'activity.json')));
+});
 
 test('提交记录与当前库对不上（部分存在）时不猜测，拒绝并提示手动处理；提交前崩溃的来源在切换当前库后仍会合并', async (t) => {
   const fixture = await createFixture(t);

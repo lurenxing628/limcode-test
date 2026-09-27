@@ -379,6 +379,30 @@ for (const previousEpoch of [3, 4]) {
   });
 }
 
+test('explicit upgrade publishes a maintenance activity marker in the admission and target maintenance claims while it backs up and upgrades', async () => {
+  const fixture = await createPublishedRuntime(4);
+  const storagePaths = { globalStoragePath: fixture.cleanupRoot };
+  try {
+    await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
+    await fs.rm(kernel.runtimeHostLivenessDirectory(fixture.paths), { recursive: true, force: true });
+    const claims = [kernel.runtimeDataRootAdmissionClaimPath(fixture.cleanupRoot), kernel.runtimeMaintenanceClaimPath(fixture.paths)];
+    const seen = [];
+    const upgraded = await kernel.upgradeRuntimeDataSet(storagePaths, upgradeInput(fixture), {
+      onFaultPoint: async (point) => {
+        if (point !== 'after-backup') return;
+        for (const claim of claims) {
+          const owner = JSON.parse(await fs.readFile(path.join(claim, 'owner.json'), 'utf8'));
+          const activity = JSON.parse(await fs.readFile(path.join(claim, 'activity.json'), 'utf8'));
+          seen.push({ operation: activity.operation, description: activity.description, sameClaim: activity.claimToken === owner.claimToken });
+        }
+      }
+    });
+    assert.equal(upgraded.migrated, true);
+    assert.deepEqual(seen, claims.map(() => ({ operation: 'data-set-upgrade', description: '备份并升级旧版本的聊天记录', sameClaim: true })));
+    for (const claim of claims) await assert.rejects(fs.access(path.join(claim, 'activity.json')));
+  } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
+});
+
 test('explicit upgrade accepts a selected offline predecessor and validates current-epoch idempotency without selecting or starting it', async () => {
   const fixture = await createPublishedRuntime(4);
   const storagePaths = { globalStoragePath: fixture.cleanupRoot };

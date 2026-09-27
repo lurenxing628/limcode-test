@@ -33,7 +33,8 @@ import {
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
-  assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance
+  assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
+  withRuntimeMaintenanceActivity
 } from './runtimeHostControl';
 import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet,
@@ -1057,7 +1058,10 @@ async function finalizeSource(
   options: RuntimeDataSetMergeOptions,
   stopIfAsked: () => void
 ): Promise<void> {
-  await withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(binding.paths, async () => {
+  // Windows opening meanwhile wait on the admission and say why (the source backup can take a while).
+  await withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(binding.paths, () => withRuntimeMaintenanceActivity({
+    operation: 'historical-merge-finalize', description: '备份并收尾要合并的旧聊天记录'
+  }, async () => {
     await assertSourceUnchanged(paths, candidate, binding, state, false);
     stopIfAsked();
     const sourceBackupPath = await backupSource(binding);
@@ -1079,7 +1083,7 @@ async function finalizeSource(
     await finalizeUnfinishedWork(createVscodeRootAuthority(candidate), work);
     finalized.complete = true;
     await remember();
-  }));
+  })));
 }
 
 /** Under the source's claim: no Host, same identity and pointer, and exactly the files that were checked. */

@@ -11,7 +11,10 @@
 //   workAfterConfirm      — { delayMs, forMs, once }: a Turn starts shortly after this window confirmed
 //   request / requestOptions / operationMs — this window requests exclusive maintenance (a migration by default)
 //   explicit              — the background merge is the call made for the user's click (candidateIds + requested)
-//   keptNoticeFile        — this window's workspaceState: text kept across a reload (rememberAcrossReload)
+//   failOperation         — the requested operation throws (with this code) after other windows yielded
+//   reloadAfterFailure    — like dataRootRelocation.ts: the window reloads after the operation failed
+//   windowStateFile       — this window's workspaceState (survives its reloads): windowState of the layer
+import { randomUUID } from 'node:crypto';
 import fsSync from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
@@ -45,12 +48,17 @@ const emit = (event, extra = {}) => new Promise((resolve) => {
 });
 setInterval(() => {}, 60_000);
 
-// A text the previous boot kept across its reload (extension.ts shows it once).
-if (behavior.keptNoticeFile && fsSync.existsSync(behavior.keptNoticeFile)) {
-  const kept = JSON.parse(fsSync.readFileSync(behavior.keptNoticeFile, 'utf8'));
-  fsSync.rmSync(behavior.keptNoticeFile, { force: true });
-  await emit('kept-notice', { text: kept.text });
-}
+// This window's workspaceState: a file that outlives the process.
+const readWindowState = () => (fsSync.existsSync(behavior.windowStateFile) ? JSON.parse(fsSync.readFileSync(behavior.windowStateFile, 'utf8')) : {});
+const windowState = behavior.windowStateFile ? {
+  get: (key) => readWindowState()[key],
+  update: async (key, value) => {
+    const all = readWindowState();
+    if (value === undefined) delete all[key];
+    else all[key] = value;
+    fsSync.writeFileSync(behavior.windowStateFile, JSON.stringify(all));
+  }
+} : undefined;
 
 let focused = behavior.focused === true;
 let workUntil = behavior.busy === true ? (behavior.busyForMs ? startedAt + behavior.busyForMs : Infinity) : 0;
@@ -120,12 +128,13 @@ const layer = loadLayer('vscode/runtimeExclusiveMaintenance.ts', { '../backend/r
 if (behavior.participant !== false) {
   participant = layer.startExclusiveMaintenanceParticipant(host, {
     countdownSeconds: behavior.countdownSeconds ?? 0, pollMs: behavior.participantPollMs ?? 50,
-    ...(behavior.keptNoticeFile ? {
-      rememberAcrossReload: (text) => fsSync.writeFileSync(behavior.keptNoticeFile, JSON.stringify({ text }))
-    } : {})
+    ...(windowState ? { windowState } : {})
   });
   await participant.checkNow();
 }
+// Shown once after a reload (extension.ts).
+const kept = windowState ? layer.takeNoticeKeptAcrossReload(windowState) : undefined;
+if (kept) await emit('kept-notice', { text: kept });
 await emit('ready');
 if (behavior.requestAfterMs) await new Promise((resolve) => setTimeout(resolve, behavior.requestAfterMs));
 
@@ -139,9 +148,10 @@ const withTrackedLocks = (take) => async (body) => {
 };
 
 if (behavior.request) {
-  // This window asks the others to yield, outside the locks (a data-root migration the user confirmed).
+  // This window asks the others to yield, outside the locks (a data-root migration the user confirmed;
+  // like dataRootRelocation.ts, the key carries the attempt's own id).
   const outcome = await layer.runWithExclusiveMaintenance(paths, {
-    operation: 'data-root-migration', operationKey: 'target:/new-root', message: '为迁移数据目录',
+    operation: 'data-root-migration', operationKey: `target:/new-root#${randomUUID()}`, message: '为迁移数据目录',
     waitingTitle: '正在等待其它窗口空闲后迁移数据目录', configurationRootPath: root, requesterHostBootId: hostBootId,
     requesterBusy: layer.requesterWorkBusy(host), ignoreBackoff: true, whenBusy: 'wait',
     participantConfirmation: 'final-countdown', pollMs: 20, isCurrent: () => true,
@@ -150,9 +160,11 @@ if (behavior.request) {
   }, async () => {
     await emit('operation');
     if (behavior.operationMs) await new Promise((resolve) => setTimeout(resolve, behavior.operationMs));
+    if (behavior.failOperation) throw Object.assign(new Error('目标目录写入失败'), { code: behavior.failOperation });
     return 'migrated';
   }).catch((error) => ({ state: 'threw', reason: String(error?.message ?? error) }));
-  await emit('coordination', { state: outcome.state, reason: outcome.reason });
+  await emit('coordination', { state: outcome.state, reason: outcome.reason, retryAfter: outcome.retryAfter });
+  if (outcome.state === 'threw' && behavior.reloadAfterFailure) await vscodeMock.commands.executeCommand('workbench.action.reloadWindow');
 } else if (!behavior.noMerge) {
   const report = await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, {
     limits: behavior.limits,
@@ -198,7 +210,7 @@ async function requestOtherWindowsToYield(storagePaths, input, merge) {
     await emit('coordination', { state: 'threw', requested: input.requested, reason: String(error?.message ?? error) });
     throw error;
   });
-  await emit('coordination', { state: outcome.state, requested: input.requested, reason: outcome.reason });
+  await emit('coordination', { state: outcome.state, requested: input.requested, reason: outcome.reason, retryAfter: outcome.retryAfter });
   return outcome.state === 'completed' ? { state: 'completed' } : { state: outcome.state, reason: outcome.reason };
 }
 

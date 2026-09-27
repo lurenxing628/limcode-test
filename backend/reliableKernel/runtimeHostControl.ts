@@ -26,13 +26,17 @@ const RUNTIME_ADMISSION_SUFFIX = '.runtime-admission';
 const RUNTIME_MAINTENANCE_ACTIVITY_FILE = 'activity.json';
 const RUNTIME_MAINTENANCE_ACTIVITY_KIND = 'limcode-runtime-maintenance-activity';
 
-/** Waiting for a claim polls quickly at first, then backs off (a maintenance can take minutes). */
+/**
+ * Waiting for a claim polls quickly while a holder is new, then backs off (a maintenance can take
+ * minutes); every new holder (another claim token) starts the quick phase again, so windows queued
+ * behind each other follow one another closely.
+ */
 export const RUNTIME_CLAIM_WAIT = Object.freeze({
   firstPollMs: 50,
-  /** After firstPhaseMs of waiting. */
+  /** After firstPhaseMs of waiting for the same holder. */
   laterPollMs: 250,
   firstPhaseMs: 2_000,
-  /** After laterPhaseMs of waiting. */
+  /** After laterPhaseMs of waiting for the same holder. */
   slowPollMs: 1_000,
   laterPhaseMs: 10_000,
   /** onWait is called only once a wait lasted this long. */
@@ -69,6 +73,8 @@ export interface RuntimeClaimWaitActivity extends RuntimeMaintenanceActivity {
 export interface RuntimeClaimWait {
   /** How long this caller has been waiting for the claim (monotonic). */
   waitedMs: number;
+  /** How long the current holder (its claim token) has been seen holding it; long waits are judged by this. */
+  holderWaitedMs: number;
   /** Absent when the holder published nothing, e.g. another window that is opening. */
   activity?: RuntimeClaimWaitActivity;
 }
@@ -524,15 +530,20 @@ async function acquireMaintenanceClaim(
   let observedToken: string | undefined;
   let observed: RecordedProcessInspection | undefined;
   const waitStarted = performance.now();
-  // A live holder: tell the observer (after a while) what it does, then poll again, backing off.
+  let holder: { token: string; since: number } | undefined;
+  // A live holder: tell the observer (after a while) what it does, then poll again, backing off
+  // per holder (a new holder starts the quick phase again).
   const pause = async (holderToken: string): Promise<void> => {
-    const waitedMs = performance.now() - waitStarted;
+    const now = performance.now();
+    if (holder?.token !== holderToken) holder = { token: holderToken, since: now };
+    const waitedMs = now - waitStarted;
+    const holderWaitedMs = now - holder.since;
     if (wait?.onWait && waitedMs >= RUNTIME_CLAIM_WAIT.reportAfterMs) {
       const activity = await readMaintenanceActivity(claimPath, holderToken);
-      try { wait.onWait({ waitedMs, ...(activity ? { activity } : {}) }); }
+      try { wait.onWait({ waitedMs, holderWaitedMs, ...(activity ? { activity } : {}) }); }
       catch (error) { console.warn('[LimCode] Runtime claim wait observer failed.', error); }
     }
-    await delay(claimRetryDelayMs(waitedMs));
+    await delay(claimRetryDelayMs(holderWaitedMs));
   };
   for (;;) {
     if (await tryPublishClaimRecord(claimPath, RUNTIME_MAINTENANCE_RECORD_FILE, `${JSON.stringify(metadata)}\n`)) {
