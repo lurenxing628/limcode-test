@@ -125,24 +125,26 @@ async function openPeer(t, configurationRootPath) {
     rootGeneration: binding.rootGeneration, hostBootId, livenessId: `${hostBootId}-liveness`, processId: process.pid,
     processStartIdentity: ownProcessStartIdentity(), startedAt: now, heartbeatAt: now
   }));
+  // extension.ts deactivate: leaving first, the Runtime (its liveness record) closes, then the registration goes.
+  const deactivate = async () => {
+    await participant.dispose();
+    await fs.rm(liveness, { force: true });
+    await participant.unregister();
+  };
   const peer = {
     reloads: 0,
-    async close() { await participant.dispose(); await fs.rm(liveness, { force: true }); }
+    close: deactivate
   };
   const participant = startExclusiveMaintenanceParticipant(binding.paths, hostBootId, {
     busyReason: async () => undefined,
     confirm: async () => true,
     release: async () => {
       peer.reloads += 1;
-      await participant.dispose();
-      await fs.rm(liveness, { force: true });
+      await deactivate();
     }
   }, { pollMs: 20 });
   await participant.checkNow();
-  t.after(async () => {
-    await participant.dispose();
-    await fs.rm(liveness, { force: true });
-  });
+  t.after(deactivate);
   return peer;
 }
 

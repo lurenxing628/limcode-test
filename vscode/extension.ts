@@ -9,7 +9,7 @@ import type { DataRootUnavailableReason } from '../backend/reliableKernel/runtim
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
 
 let backendApp: VscodeReliableKernelApplicationFacade | undefined;
-let exclusiveMaintenanceParticipant: { dispose(): Promise<void> } | undefined;
+let exclusiveMaintenanceParticipant: { dispose(): Promise<void>; unregister(): Promise<void> } | undefined;
 let activeStartup: ApplicationStartup | undefined;
 let activeContext: vscode.ExtensionContext | undefined;
 
@@ -169,6 +169,8 @@ export async function deactivate(): Promise<void> {
   activeContext = undefined;
   const participant = exclusiveMaintenanceParticipant;
   exclusiveMaintenanceParticipant = undefined;
+  // Leaving, not gone: until the Runtime (and its Host liveness record) closed, other windows'
+  // requests wait for this window instead of taking it for an older version.
   const participation = participant ? participant.dispose().catch(() => undefined) : Promise.resolve();
   // Stop the current application's work immediately while any in-flight historical upgrade
   // finishes its durable boundary, including history commands used without a running Runtime.
@@ -177,4 +179,6 @@ export async function deactivate(): Promise<void> {
   const disposal = app ? app.dispose() : pending?.then(application => application.dispose(), () => undefined);
   const [disposed] = await Promise.allSettled([disposal, upgrades, participation]);
   if (disposed.status === 'rejected') throw disposed.reason;
+  // Closed: the registration goes last. A Runtime that failed to close stays registered as leaving.
+  await participant?.unregister().catch(() => undefined);
 }

@@ -379,7 +379,10 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook } = {
     './runtimeExclusiveMaintenance': {
       startExclusiveMaintenanceParticipant(host, options) {
         events.push(['participant-start', host === application, options.isCurrent()]);
-        return { async dispose() { events.push('participant-dispose'); } };
+        return {
+          async dispose() { events.push('participant-dispose'); },
+          async unregister() { events.push('participant-unregister'); }
+        };
       },
       takeNoticeKeptAcrossReload() { return undefined; }
     },
@@ -885,4 +888,39 @@ test('extension joins exclusive maintenance only after Runtime ready and leaves 
   f.finishUpgrade.resolve();
   await f.deactivate();
   assert.equal(f.events.filter(event => event === 'participant-dispose').length, 1);
+});
+
+test('deactivation marks this window leaving at once and removes its registration only after its Runtime closed (blind review #1)', async t => {
+  for (const closes of [true, false]) {
+    const f = extensionEntryFixture();
+    t.after(() => f.finishUpgrade.resolve());
+    f.activate(f.context);
+    const ready = f.startup.wait();
+    await f.opening.promise;
+    f.opened.resolve(f.application);
+    await ready;
+    for (let i = 0; i < 5 && !f.events.some(event => Array.isArray(event) && event[0] === 'participant-start'); i += 1) {
+      await new Promise(setImmediate);
+    }
+    const closing = deferred();
+    f.application.dispose = async () => {
+      f.events.push('dispose');
+      await closing.promise;
+      if (!closes) throw new Error('fixture close failed');
+      f.events.push('disposed');
+    };
+    f.finishUpgrade.resolve();
+    const shutdown = f.deactivate();
+    for (let i = 0; i < 5; i += 1) await new Promise(setImmediate);
+    assert.ok(f.events.includes('participant-dispose'), 'leaving is marked at once');
+    assert.equal(f.events.includes('participant-unregister'), false, 'the registration stays while the Runtime closes');
+    closing.resolve();
+    if (closes) {
+      await shutdown;
+      assert.ok(f.events.indexOf('participant-unregister') > f.events.indexOf('disposed'));
+    } else {
+      await assert.rejects(shutdown, /fixture close failed/);
+      assert.equal(f.events.includes('participant-unregister'), false, 'a Runtime that failed to close stays registered as leaving');
+    }
+  }
 });

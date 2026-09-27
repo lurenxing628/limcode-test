@@ -200,13 +200,15 @@ function requesterTokens(state: ExclusiveMaintenanceWindowState): Record<string,
 }
 
 export function describeProgress(progress: ExclusiveMaintenanceProgress): string {
-  if (progress.stage === 'waiting-busy') {
+  const closing = progress.leaving?.length ?? 0;
+  if (progress.stage === 'waiting-busy' || (progress.stage === 'prepare' && closing > 0)) {
     const parts: string[] = [];
     if (progress.requesterBusy) parts.push('本窗口的任务结束');
     const working = progress.busy.filter((item) => item.kind === 'work').length;
     const focused = progress.busy.filter((item) => item.kind === 'focus').length;
     if (working > 0) parts.push(`${working} 个其它窗口的任务结束`);
     if (focused > 0) parts.push(`${focused} 个正在使用的窗口被切走`);
+    if (closing > 0) parts.push(`${closing} 个正在关闭或重载的窗口关完`);
     return `等待${parts.join('、')}`;
   }
   if (progress.stage === 'confirm') return `其它 ${progress.hosts.length} 个窗口即将重载`;

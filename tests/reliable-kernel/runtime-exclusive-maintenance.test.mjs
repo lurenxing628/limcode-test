@@ -225,6 +225,119 @@ test('锁外等待期间其它窗口可以正常打开（拿到 admission 与 ma
   assert.deepEqual([busy.releases(), late.releases()], [1, 1]);
 });
 
+test('盲审 #1：锁外等待期间用户关掉那个忙窗口，它在运行时关完之前按“离开中”缺席处理，不当成旧版本窗口，迁移继续完成', async (t) => {
+  for (const gapMs of [300, 1_000]) {
+    const { binding, paths } = await createRoot(t);
+    const hostBootId = `busy-window-${gapMs}`;
+    // A window used for an hour, working on a task.
+    const liveness = await publishHost(binding, hostBootId);
+    const participant = startExclusiveMaintenanceParticipant(paths, hostBootId, {
+      busyReason: async () => WORK, confirm: async () => true, release: async () => assert.fail('it is closing, not yielding')
+    }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
+    t.after(() => participant.unregister());
+    await participant.checkNow();
+    const progress = [];
+    const outcome = run(paths, {
+      ...BASE, operation: 'data-root-relocation', operationKey: `target#${gapMs}`, message: '为迁移数据目录', ignoreBackoff: true,
+      whenBusy: 'wait', participantConfirmation: 'final-countdown', busyWaitTimeoutMs: 30_000, requesterHostBootId: 'requester-window',
+      onProgress: (item) => progress.push(item)
+    }, async () => 'migrated');
+    await eventually(() => progress.some((item) => item.stage === 'waiting-busy'));
+    // The user closes it (extension.ts deactivate): leaving at once; the Runtime closes (its liveness
+    // record goes last), and only then the registration goes.
+    await participant.dispose();
+    const registration = JSON.parse(await fs.readFile(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'hosts', `${hostBootId}.json`), 'utf8'));
+    assert.equal(typeof registration.leavingAt, 'string', 'the registration says leaving instead of disappearing');
+    await delay(gapMs);
+    await fs.rm(liveness, { force: true });
+    await participant.unregister();
+    const finished = await outcome;
+    assert.equal(finished.state, 'completed', `${finished.state}: ${finished.reason}`);
+    assert.equal(finished.result, 'migrated');
+    assert.ok(progress.some((item) => item.leaving?.some((host) => host.hostBootId === hostBootId)),
+      'meanwhile the requester reported that it waits for the closing window');
+  }
+});
+
+test('盲审 #1：本次调用中回答过的窗口登记消失（较早的版本关闭时先注销）也按缺席等它的运行时关完；从没回答过的未登记窗口仍是旧版本', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const liveness = await publishHost(binding, 'earlier-build');
+  const participant = startExclusiveMaintenanceParticipant(paths, 'earlier-build', {
+    busyReason: async () => WORK, confirm: async () => true, release: async () => {}
+  }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
+  t.after(() => participant.unregister());
+  await participant.checkNow();
+  const progress = [];
+  const outcome = run(paths, {
+    ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 30_000, onProgress: (item) => progress.push(item)
+  }, async () => 'merged');
+  await eventually(() => progress.some((item) => item.stage === 'waiting-busy'));
+  // An earlier build: its registration goes first, its Runtime closes afterwards.
+  await participant.unregister();
+  await delay(500);
+  await fs.rm(liveness, { force: true });
+  const finished = await outcome;
+  assert.equal(finished.state, 'completed', `${finished.state}: ${finished.reason}`);
+
+  await publishHost(binding, 'never-answered');
+  const refused = await run(paths, { ...BASE, operationKey: 'sources-b', whenBusy: 'wait', busyWaitTimeoutMs: 2_000 }, async () => assert.fail('must not run'));
+  assert.equal(refused.state, 'legacy-host');
+});
+
+test('盲审 #1：请求开始时已在关闭的窗口（从没回答过）等它关完；过了宽限仍没关完时如实放弃，不执行操作', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const closingLiveness = await publishHost(binding, 'already-closing');
+  const closing = startExclusiveMaintenanceParticipant(paths, 'already-closing', {
+    busyReason: async () => undefined, confirm: async () => true, release: async () => {}
+  }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
+  t.after(() => closing.unregister());
+  await closing.checkNow();
+  await closing.dispose();
+  setTimeout(() => { void fs.rm(closingLiveness, { force: true }).then(() => closing.unregister()); }, 400);
+  const waited = await run(paths, { ...BASE, operationKey: 'sources-closing' }, async () => 'merged');
+  assert.equal(waited.state, 'completed', `${waited.state}: ${waited.reason}`);
+
+  await publishHost(binding, 'stuck-closing');
+  const participant = startExclusiveMaintenanceParticipant(paths, 'stuck-closing', {
+    busyReason: async () => undefined, confirm: async () => true, release: async () => {}
+  }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
+  t.after(() => participant.unregister());
+  await participant.checkNow();
+  await participant.dispose();
+  const started = performance.now();
+  const outcome = await run(paths, { ...BASE, whenBusy: 'wait', leavingGraceMs: 400 }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'timed-out');
+  assert.equal(outcome.reason, '有窗口正在关闭或重载，但一直没有关完，这次没有进行；稍后再试。');
+  assert.deepEqual(outcome.hosts.map((host) => host.hostBootId), ['stuck-closing']);
+  assert.ok(performance.now() - started < 3_000);
+});
+
+test('盲审 #1：锁内确认阶段有窗口开始关闭时不再等它确认，只等它下线；没有窗口需要让出就不发布 go', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const liveness = await publishHost(binding, 'closing-in-countdown');
+  let participant;
+  let confirms = 0;
+  participant = startExclusiveMaintenanceParticipant(paths, 'closing-in-countdown', {
+    busyReason: async () => undefined,
+    // The user closes the window while its countdown runs: it never confirms.
+    confirm: async () => {
+      confirms += 1;
+      void participant.dispose().then(() => delay(300)).then(() => fs.rm(liveness, { force: true }));
+      return new Promise(() => {});
+    },
+    release: async () => assert.fail('no go for a window that closes on its own')
+  }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
+  t.after(() => participant.unregister());
+  await participant.checkNow();
+  const phases = [];
+  const outcome = await run(paths, { ...BASE, onProgress: (item) => phases.push(item.stage) }, async () => 'done');
+  assert.equal(outcome.state, 'completed', `${outcome.state}: ${outcome.reason}`);
+  assert.equal(confirms, 1);
+  assert.ok(phases.includes('release'), 'it waited for the closing window to go offline');
+  assert.deepEqual((await fs.readdir(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'ledger')).catch(() => [])).filter((name) => name.startsWith('operation-')), [],
+    'no go was published, so no cooldown either');
+});
+
 test('锁内轮次的持锁时间有上限：有窗口一直不确认时在确认超时后放弃并释放锁', async (t) => {
   const { binding, paths } = await createRoot(t);
   await openWindow(t, binding, 'silent-confirm', { confirm: () => new Promise(() => {}) });
@@ -1215,8 +1328,10 @@ async function openWindow(t, binding, hostBootId, options = {}) {
       const closing = participant;
       participant = undefined;
       if (options.releaseDelayMs) await delay(options.releaseDelayMs);
+      // extension.ts deactivate: leaving first, the Runtime (liveness) closes, then the registration goes.
       await closing.dispose();
       await fs.rm(liveness, { force: true });
+      await closing.unregister();
       markReleased();
     },
     notifyWaiting: (_request, reason) => push(['waiting', hostBootId, reason.kind])
@@ -1225,6 +1340,7 @@ async function openWindow(t, binding, hostBootId, options = {}) {
   t.after(async () => {
     await participant?.dispose();
     await fs.rm(liveness, { force: true });
+    await participant?.unregister();
   });
   return window;
 }
@@ -1253,6 +1369,14 @@ async function settle(windows) {
 
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function eventually(predicate, timeoutMs = 10_000) {
+  const started = performance.now();
+  while (!predicate()) {
+    if (performance.now() - started > timeoutMs) throw new Error('condition not reached in time');
+    await delay(10);
+  }
 }
 
 async function exitedProcessId() {

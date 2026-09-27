@@ -26,7 +26,9 @@ import {
  * release each have a limit, and a window that became busy meanwhile sends the requester back
  * outside (a bounded number of times). Any busy (unless the requester waits), declined,
  * unknown/legacy Host, timeout or cancel withdraws the request before anybody yields; once go was
- * published a busy window ends the call, so a window reloads at most once per call. Two requesters
+ * published a busy window ends the call, so a window reloads at most once per call. A window that
+ * is closing or reloading meanwhile is absent, never an older version: the requester waits (bounded)
+ * until its Runtime closed. Two requesters
  * never wait for each other: a window with a running request answers busy to the others, and the
  * later request gives way to an earlier one. Abandoned attempts and failures after go back off per
  * operation key, a deterministic failure blocks the key for automatic calls, and a coordinated round
@@ -63,6 +65,12 @@ export const EXCLUSIVE_MAINTENANCE_DEFAULTS = Object.freeze({
   confirmTimeoutMs: 20_000,
   /** A window reload closes its Runtime and Host liveness record. */
   releaseTimeoutMs: 30_000,
+  /**
+   * A window that is closing or reloading (its registration says leaving, or it answered in this
+   * call and then unregistered) is absent: the requester waits this long for its Host liveness
+   * record to go instead of taking it for an older version.
+   */
+  leavingGraceMs: 30_000,
   /** Locked rounds after waiting outside; the locks are released between them. */
   maxLockedAttempts: 3,
   /** The requester refreshes its request this often; participants ignore one not refreshed for staleRequestMs. */
@@ -144,6 +152,8 @@ export interface ExclusiveMaintenanceProgress {
   busy: readonly ExclusiveMaintenanceBusyHost[];
   /** The requester's own window is busy (see requesterBusy). */
   requesterBusy?: ExclusiveMaintenanceBusy;
+  /** Windows closing or reloading on their own, waited for until their Runtime closed. */
+  leaving?: readonly RuntimeHostActiveDescriptor[];
 }
 
 /** What beforeGo found: the requester's own window froze (thaw undoes it) and is idle, or is busy. */
@@ -212,6 +222,7 @@ export interface RuntimeExclusiveMaintenanceInput {
   busyWaitTimeoutMs?: number;
   confirmTimeoutMs?: number;
   releaseTimeoutMs?: number;
+  leavingGraceMs?: number;
   maxLockedAttempts?: number;
   backoffBaseMs?: number;
   backoffMaxMs?: number;
@@ -372,7 +383,15 @@ class ExclusiveMaintenanceRequester<T> {
   private readonly classify = createCachedProcessClassifier();
   private readonly busyDeadline: number;
   private readonly local: LocalRequest;
+  private readonly leavingGraceMs: number;
+  /** The other windows that answer (see refreshHosts). */
   private hosts: RuntimeHostActiveDescriptor[] = [];
+  /** Other windows closing or reloading: absent, only their Host liveness record has to go. */
+  private leaving: RuntimeHostActiveDescriptor[] = [];
+  /** Answering windows outside the protocol, as of the last refreshHosts. */
+  private outsiders: RuntimeHostActiveDescriptor[] = [];
+  /** When each leaving window was first seen leaving: the grace runs from then. */
+  private readonly leavingSince = new Map<string, number>();
   private request: RuntimeExclusiveMaintenanceRequest | undefined;
   private lastWrite = Number.NEGATIVE_INFINITY;
   private waiting = false;
@@ -398,6 +417,7 @@ class ExclusiveMaintenanceRequester<T> {
     this.prepareTimeoutMs = input.prepareTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.prepareTimeoutMs;
     this.whenBusy = input.whenBusy ?? 'abandon';
     this.busyDeadline = this.now() + (input.busyWaitTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.busyWaitTimeoutMs);
+    this.leavingGraceMs = input.leavingGraceMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.leavingGraceMs;
     this.local = { activity: this.activity };
   }
 
@@ -413,8 +433,8 @@ class ExclusiveMaintenanceRequester<T> {
       if (!withLocks) return await this.lockedRound() as Outcome<T>;
       const maxAttempts = Math.max(1, this.input.maxLockedAttempts ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.maxLockedAttempts);
       for (let attempt = 1; ; attempt += 1) {
-        this.hosts = await this.hostsNow();
-        if (this.hosts.length > 0 || await this.requesterBusy()) {
+        await this.refreshHosts();
+        if (this.hosts.length > 0 || this.leaving.length > 0 || await this.requesterBusy()) {
           const refused = await this.gate();
           if (refused) return refused;
           await this.publish({ phase: 'prepare', round: (this.request?.round ?? 0) + 1 });
@@ -445,8 +465,8 @@ class ExclusiveMaintenanceRequester<T> {
     return withRuntimeMaintenanceActivity({
       operation: this.operationName, description: this.activity, stage: '正在请其它窗口让出'
     }, async (activity): Promise<Outcome<T> | typeof RETRY> => {
-      this.hosts = await this.hostsNow();
-      if (this.hosts.length > 0 || await this.requesterBusy()) {
+      await this.refreshHosts();
+      if (this.hosts.length > 0 || this.leaving.length > 0 || await this.requesterBusy()) {
         const refused = await this.gate();
         if (refused) return refused;
         await this.publish({ phase: 'prepare', round: (this.request?.round ?? 0) + 1 });
@@ -461,11 +481,11 @@ class ExclusiveMaintenanceRequester<T> {
       if (frozen !== 'ready') return frozen;
       try {
         // Only a published go makes windows reload: until then a busy requester goes back outside.
-        let goPublished = false;
-        if (this.hosts.length > 0) {
-          const released = await this.release();
+        // Windows closing or reloading on their own are not told to go; they only have to be gone.
+        const goPublished = this.hosts.length > 0;
+        if (goPublished || this.leaving.length > 0) {
+          const released = await this.release(goPublished);
           if (released !== 'ready') return released;
-          goPublished = true;
         }
         // Last check: the requester's own window started nothing since beforeGo.
         const own = await this.requesterBusy();
@@ -485,16 +505,19 @@ class ExclusiveMaintenanceRequester<T> {
 
   /** Once per requester while other windows are involved: backoff, cooldown, older windows. */
   private async gate(): Promise<AbandonOutcome | undefined> {
-    if (this.gated || this.hosts.length === 0) return undefined;
+    if (this.gated || (this.hosts.length === 0 && this.leaving.length === 0)) return undefined;
     this.gated = true;
     const refusal = await readActiveBackoff(this.paths, this.operationName, this.operationKey, this.input);
     if (refusal) return { state: 'backoff', hosts: this.hosts, reason: refusal.reason, retryAfter: refusal.until };
-    const outsiders = await hostsOutsideProtocol(this.paths, this.hosts, this.prepareTimeoutMs);
-    if (outsiders.length > 0) return this.abandon('legacy-host', outsiders, outsideProtocolReason(outsiders));
+    if (this.outsiders.length > 0) return this.abandon('legacy-host', this.outsiders, outsideProtocolReason(this.outsiders));
     return undefined;
   }
 
-  /** Until everyone (and the requester itself) answered ready. Locked: a busy one is never waited for here. */
+  /**
+   * Until everyone (and the requester itself) answered ready. Locked: a busy one is never waited for
+   * here. Outside the locks a window closing or reloading is waited for (bounded) until its Runtime
+   * closed; in the locked round it is absent and only has to be gone before the operation (release).
+   */
   private async prepare(locked: boolean): Promise<Step> {
     const started = this.now();
     const firstSeen = new Map<string, number>();
@@ -507,31 +530,34 @@ class ExclusiveMaintenanceRequester<T> {
         const outcome = await this.abandon('busy', this.hosts, `另一个窗口先发起了${earlier.activity}，这次让它先完成，没有进行；之后可以再试。`);
         return { ...outcome, gaveWayTo: earlier.requestId };
       }
-      this.hosts = await this.hostsNow();
+      await this.refreshHosts();
       const own = await this.requesterBusy();
-      if (this.hosts.length === 0 && !own) return 'ready';
+      const leaving = locked ? [] : this.leaving;
+      if (this.hosts.length === 0 && leaving.length === 0 && !own) return 'ready';
       // A window that opened just before (or, outside the locks, during) the request registers and
       // answers within the prepare timeout; one still unregistered afterwards is an older version.
-      const outsiders = await hostsOutsideProtocol(this.paths, this.hosts, this.prepareTimeoutMs);
-      if (outsiders.length > 0) return this.abandon('legacy-host', outsiders, outsideProtocolReason(outsiders));
+      if (this.outsiders.length > 0) return this.abandon('legacy-host', this.outsiders, outsideProtocolReason(this.outsiders));
       const answers = await this.answers();
       const declined = this.hosts.filter((host) => answers.get(host.hostBootId)?.answer === 'declined');
       if (declined.length > 0) return this.abandon('declined', declined, '其它窗口的用户选择了保留窗口。');
       const busy = busyHosts(this.hosts, answers);
       const missing = this.hosts.filter((host) => !answers.has(host.hostBootId));
       for (const host of this.hosts) if (!firstSeen.has(host.hostBootId)) firstSeen.set(host.hostBootId, this.now());
-      if (busy.length === 0 && !own && missing.length === 0) return 'ready';
+      if (busy.length === 0 && !own && missing.length === 0 && leaving.length === 0) return 'ready';
       if (busy.length > 0 || own) {
         const step = await this.whenBusyStep(busy, own, locked);
         if (step) return step;
       }
       const overdue = missing.filter((host) => this.now() - Math.max(started, firstSeen.get(host.hostBootId)!) >= this.prepareTimeoutMs);
       if (overdue.length > 0) return this.abandon('timed-out', overdue, '其它窗口没有及时回应。');
+      const stuck = locked ? [] : this.stuckLeaving();
+      if (stuck.length > 0) return this.abandon('timed-out', stuck, LEAVING_TIMEOUT_REASON);
       this.input.onProgress?.({
         stage: busy.length > 0 || own ? 'waiting-busy' : 'prepare',
         hosts: this.hosts,
         busy,
-        ...(own ? { requesterBusy: own } : {})
+        ...(own ? { requesterBusy: own } : {}),
+        ...(leaving.length > 0 ? { leaving } : {})
       });
       await delay(this.pollMs);
     }
@@ -543,7 +569,8 @@ class ExclusiveMaintenanceRequester<T> {
     for (;;) {
       if (this.input.isCancelled?.()) return this.abandon('cancelled', this.hosts, '已取消。');
       await this.heartbeat();
-      this.hosts = await this.hostsNow();
+      // A window closing or reloading meanwhile no longer confirms; release waits until it is gone.
+      await this.refreshHosts();
       if (this.hosts.length === 0) return 'ready';
       const answers = await this.answers();
       const declined = this.hosts.filter((host) => answers.get(host.hostBootId)?.answer === 'declined');
@@ -587,28 +614,36 @@ class ExclusiveMaintenanceRequester<T> {
   }
 
   /**
-   * Every window confirmed; each now yields. A window (or the requester itself) that is busy here
-   * ends this call: no second round, so no window reloads twice for one operation. Windows that
-   * already reloaded did so in vain: their next startup waits on the admission until this requester
-   * lets go, their unsent input is kept, and the cooldown holds off automatic retries.
+   * Every window confirmed; each now yields (goPublished; without it only windows closing or
+   * reloading on their own are left, and they are waited for). A window (or the requester itself)
+   * that is busy after go ends this call: no second round, so no window reloads twice for one
+   * operation. Windows that already reloaded did so in vain: their next startup waits on the
+   * admission until this requester lets go, their unsent input is kept, and the cooldown holds off
+   * automatic retries.
    */
-  private async release(): Promise<Step> {
-    await this.publish({ phase: 'go' });
-    // From here windows reload: a later request of this operation must not make them reload again soon.
-    await recordOperationCooldown(this.paths, this.operationName, this.operationKey, this.input);
+  private async release(goPublished: boolean): Promise<Step> {
+    if (goPublished) {
+      await this.publish({ phase: 'go' });
+      // From here windows reload: a later request of this operation must not make them reload again soon.
+      await recordOperationCooldown(this.paths, this.operationName, this.operationKey, this.input);
+    }
     const deadline = this.now() + (this.input.releaseTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.releaseTimeoutMs);
     for (;;) {
       if (this.input.isCancelled?.()) return this.abandon('cancelled', this.hosts, '已取消。');
       await this.heartbeat();
-      this.hosts = await this.hostsNow();
+      await this.refreshHosts();
       const busy = this.hosts.length > 0 ? busyHosts(this.hosts, await this.answers()) : [];
       const own = await this.requesterBusy();
       if (busy.length > 0 || own) {
+        if (!goPublished) return (await this.whenBusyStep(busy, own, true))!;
         return this.abandon('busy', this.hosts.filter((host) => busy.some((item) => item.hostBootId === host.hostBootId)), goBusyReason(busy, own));
       }
-      if (this.hosts.length === 0) return 'ready';
-      if (this.now() >= deadline) return this.abandon('timed-out', this.hosts, '其它窗口没有及时让出数据目录。');
-      this.input.onProgress?.({ stage: 'release', hosts: this.hosts, busy: [] });
+      // Windows that yielded are leaving until their Runtime closed.
+      if (this.hosts.length === 0 && this.leaving.length === 0) return 'ready';
+      const stuck = this.stuckLeaving();
+      if (stuck.length > 0) return this.abandon('timed-out', stuck, LEAVING_TIMEOUT_REASON);
+      if (this.hosts.length > 0 && this.now() >= deadline) return this.abandon('timed-out', this.hosts, '其它窗口没有及时让出数据目录。');
+      this.input.onProgress?.({ stage: 'release', hosts: [...this.hosts, ...this.leaving], busy: [] });
       await delay(this.pollMs);
     }
   }
@@ -683,8 +718,23 @@ class ExclusiveMaintenanceRequester<T> {
     return others.find((request) => givesWayTo(this.local, request));
   }
 
-  private hostsNow(): Promise<RuntimeHostActiveDescriptor[]> {
-    return listActiveRuntimeHosts(this.paths, { exceptHostBootId: this.input.requesterHostBootId, classify: this.classify });
+  /**
+   * The other live Hosts, sorted out by their registration: present ones answer (outsiders among
+   * them end the call where that is checked); leaving ones (closing or reloading: registered as
+   * leaving, or answered in this call and unregistered since) are absent and only have to go offline.
+   */
+  private async refreshHosts(): Promise<void> {
+    const all = await listActiveRuntimeHosts(this.paths, { exceptHostBootId: this.input.requesterHostBootId, classify: this.classify });
+    const standings = await hostStandings(this.paths, all, this.prepareTimeoutMs, this.request?.requestId);
+    this.hosts = standings.present;
+    this.leaving = standings.leaving;
+    this.outsiders = standings.outsiders;
+    for (const host of this.leaving) if (!this.leavingSince.has(host.hostBootId)) this.leavingSince.set(host.hostBootId, this.now());
+  }
+
+  /** Leaving windows still open after the grace: they never finished closing. */
+  private stuckLeaving(): RuntimeHostActiveDescriptor[] {
+    return this.leaving.filter((host) => this.now() - this.leavingSince.get(host.hostBootId)! >= this.leavingGraceMs);
   }
 
   private answers(): Promise<Map<string, RuntimeExclusiveMaintenanceResponse>> {
@@ -790,6 +840,8 @@ function repeatedBusyReason(last: BusyObservation | undefined): string {
   return `准备期间反复有窗口变忙${detail ? `（最后一次：${detail}）` : ''}，这次没有进行，稍后再试。`;
 }
 
+const LEAVING_TIMEOUT_REASON = '有窗口正在关闭或重载，但一直没有关完，这次没有进行；稍后再试。';
+
 function goBusyReason(busy: readonly ExclusiveMaintenanceBusyHost[], own: ExclusiveMaintenanceBusy | undefined): string {
   return `其它窗口开始让出后${busyParts(busy, own)}，这次没有进行；已经重载的窗口会照常重新打开。`;
 }
@@ -815,7 +867,14 @@ export interface ExclusiveMaintenanceParticipantOptions {
 
 export interface ExclusiveMaintenanceParticipant {
   checkNow(): Promise<void>;
+  /**
+   * Stops answering and marks the registration leaving: this window is closing or reloading, and
+   * requesters wait for its Host liveness record to go instead of taking it for an older version.
+   * Call before the Runtime closes; call unregister once it closed.
+   */
   dispose(): Promise<void>;
+  /** Removes the registration (and stops answering); call once the Runtime and its liveness record closed. */
+  unregister(): Promise<void>;
 }
 
 /**
@@ -838,7 +897,8 @@ export function startExclusiveMaintenanceParticipant(
   const settledRounds = new Set<string>();
   let disposed = false;
   let checking: Promise<void> | undefined;
-  let registration: { unregister(): Promise<void> } | undefined;
+  let registration: ExclusiveMaintenanceRegistration | undefined;
+  let leaving: Promise<void> | undefined;
   const registered = registerExclusiveMaintenanceParticipant(paths, hostBootId).then(
     (result) => { registration = result; },
     (error) => { options.onError?.(error); }
@@ -947,35 +1007,54 @@ export function startExclusiveMaintenanceParticipant(
   };
   const timer = setInterval(() => { void checkNow(); }, options.pollMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.participantPollMs);
   timer.unref?.();
+  const stop = (): void => {
+    disposed = true;
+    clearInterval(timer);
+  };
   return {
     checkNow,
-    async dispose() {
-      disposed = true;
-      clearInterval(timer);
+    dispose() {
+      stop();
+      leaving ??= registered.then(() => registration?.markLeaving()).catch(() => undefined);
+      return leaving;
+    },
+    async unregister() {
+      stop();
       await registered;
+      await leaving;
       await registration?.unregister().catch(() => undefined);
     }
   };
+}
+
+export interface ExclusiveMaintenanceRegistration {
+  /** The window is closing or reloading: requesters wait for its Runtime to close (see hostStandings). */
+  markLeaving(): Promise<void>;
+  unregister(): Promise<void>;
 }
 
 /** A participating Host announces that it answers requests; call once its Runtime is open. */
 export async function registerExclusiveMaintenanceParticipant(
   paths: RuntimeRootPaths,
   hostBootId: string
-): Promise<{ unregister(): Promise<void> }> {
+): Promise<ExclusiveMaintenanceRegistration> {
   const directory = path.join(runtimeExclusiveMaintenanceDirectory(paths), PARTICIPANTS_DIRECTORY);
   const file = path.join(directory, `${safeName(hostBootId)}.json`);
   await removeGoneParticipants(directory);
   const identity = ownProcessStartIdentity();
-  await writeDurableJson(file, {
+  const record = {
     kind: PARTICIPANT_KIND,
     hostBootId,
     processId: process.pid,
     ...(identity !== undefined ? { processStartIdentity: identity } : {}),
     registeredAt: new Date().toISOString()
-  });
+  };
+  await writeDurableJson(file, record);
   let removed = false;
   return {
+    async markLeaving() {
+      if (!removed) await writeDurableJson(file, { ...record, leavingAt: new Date().toISOString() });
+    },
     async unregister() {
       if (removed) return;
       removed = true;
@@ -1067,34 +1146,68 @@ async function sweepAbandonedRequests(paths: RuntimeRootPaths, classify: Recorde
   }
 }
 
+interface HostStandings {
+  /** Hosts that answer: registered participants, and ones that opened within the registration grace. */
+  present: RuntimeHostActiveDescriptor[];
+  /** Participants closing or reloading: absent, only their Host liveness record has to go. */
+  leaving: RuntimeHostActiveDescriptor[];
+  /** Present hosts outside the protocol: not live, unregistered past the grace, or another process's registration. */
+  outsiders: RuntimeHostActiveDescriptor[];
+}
+
 /**
  * Every Host must be live and registered as a participant with the same process. One that started
- * within the grace (the prepare timeout) without a registration yet is waited for like a missing answer.
+ * within the grace (the prepare timeout) without a registration yet is waited for like a missing
+ * answer. A window closing or reloading is leaving, never an older version: its participant marks
+ * its registration leaving and removes it only after its Runtime closed; one that answered
+ * `requestId` and unregistered since (an earlier build unregisters first) is leaving as well.
  */
-async function hostsOutsideProtocol(
+async function hostStandings(
   paths: RuntimeRootPaths,
   hosts: readonly RuntimeHostActiveDescriptor[],
-  graceMs: number
-): Promise<RuntimeHostActiveDescriptor[]> {
+  graceMs: number,
+  requestId: string | undefined
+): Promise<HostStandings> {
   const directory = path.join(runtimeExclusiveMaintenanceDirectory(paths), PARTICIPANTS_DIRECTORY);
-  const outsiders: RuntimeHostActiveDescriptor[] = [];
+  const standings: HostStandings = { present: [], leaving: [], outsiders: [] };
+  const outside = (host: RuntimeHostActiveDescriptor): void => {
+    standings.present.push(host);
+    standings.outsiders.push(host);
+  };
   for (const host of hosts) {
     if (host.state !== 'live' || host.processId === null || !SAFE_ID.test(host.hostBootId)) {
-      outsiders.push(host);
+      outside(host);
       continue;
     }
     let record: Record<string, unknown>;
     try { record = JSON.parse(await fs.readFile(path.join(directory, `${host.hostBootId}.json`), 'utf8')) as Record<string, unknown>; }
     catch (error) {
-      if ((error as NodeJS.ErrnoException)?.code !== 'ENOENT' || !startedWithin(host, graceMs)) outsiders.push(host);
+      const missing = (error as NodeJS.ErrnoException)?.code === 'ENOENT';
+      if (missing && requestId !== undefined && await answeredRequest(paths, requestId, host.hostBootId)) standings.leaving.push(host);
+      else if (!missing || !startedWithin(host, graceMs)) outside(host);
+      else standings.present.push(host);
       continue;
     }
     if (record.kind !== PARTICIPANT_KIND || record.hostBootId !== host.hostBootId || record.processId !== host.processId
       || (host.processStartIdentity !== undefined && record.processStartIdentity !== host.processStartIdentity)) {
-      outsiders.push(host);
+      outside(host);
+    } else if (typeof record.leavingAt === 'string') {
+      standings.leaving.push(host);
+    } else {
+      standings.present.push(host);
     }
   }
-  return outsiders;
+  return standings;
+}
+
+/** Whether the Host answered any round or stage of the request. */
+async function answeredRequest(paths: RuntimeRootPaths, requestId: string, hostBootId: string): Promise<boolean> {
+  try {
+    const value = JSON.parse(await fs.readFile(responsePath(paths, requestId, hostBootId), 'utf8')) as Partial<RuntimeExclusiveMaintenanceResponse>;
+    return value.kind === RESPONSE_KIND && value.requestId === requestId && value.hostBootId === hostBootId;
+  } catch {
+    return false;
+  }
 }
 
 function startedWithin(host: RuntimeHostActiveDescriptor, graceMs: number): boolean {

@@ -14,6 +14,9 @@
 //   failOperation         — the requested operation throws (with this code) after other windows yielded
 //   reloadAfterFailure    — like dataRootRelocation.ts: the window reloads after the operation failed
 //   windowStateFile       — this window's workspaceState (survives its reloads): windowState of the layer
+//   closeAfterMs          — the user closes this window that long after it is ready (no next boot)
+//   reloadAfterMs         — the user reloads this window that long after it is ready
+//   closeGapMs            — closing its Runtime (the Host liveness record goes last) takes this long
 import { randomUUID } from 'node:crypto';
 import fsSync from 'node:fs';
 import path from 'node:path';
@@ -94,15 +97,22 @@ const vscodeMock = {
     executeCommand: async (id) => {
       if (id !== 'workbench.action.reloadWindow') return;
       await emit('reload');
-      // deactivate(): participant and Runtime close, then the Extension Host process is replaced.
-      await participant?.dispose().catch(() => undefined);
-      await database?.close().catch(() => undefined);
+      // deactivate(), then the Extension Host process is replaced.
+      await deactivate();
       process.exit(0);
     }
   }
 };
 let participant;
 let database;
+
+/** extension.ts deactivate(): leaving first, then the Runtime (and its liveness record) closes, then the registration goes. */
+async function deactivate() {
+  await participant?.dispose().catch(() => undefined);
+  if (behavior.closeGapMs) await new Promise((resolve) => setTimeout(resolve, behavior.closeGapMs));
+  await database?.close().catch(() => undefined);
+  await participant?.unregister().catch(() => undefined);
+}
 
 // Opening like extension.ts: a long wait on the admission is explained (runtimeOpeningWait.ts).
 const openingWait = loadLayer('vscode/runtimeOpeningWait.ts', {}).createRuntimeOpeningWaitPresenter((status) => {
@@ -136,6 +146,17 @@ if (behavior.participant !== false) {
 const kept = windowState ? layer.takeNoticeKeptAcrossReload(windowState) : undefined;
 if (kept) await emit('kept-notice', { text: kept });
 await emit('ready');
+if (behavior.closeAfterMs) {
+  setTimeout(async () => {
+    await emit('closing');
+    await deactivate();
+    await emit('closed');
+    process.exit(0);
+  }, behavior.closeAfterMs);
+}
+if (behavior.reloadAfterMs) {
+  setTimeout(() => { void vscodeMock.commands.executeCommand('workbench.action.reloadWindow'); }, behavior.reloadAfterMs);
+}
 if (behavior.requestAfterMs) await new Promise((resolve) => setTimeout(resolve, behavior.requestAfterMs));
 
 const withTrackedLocks = (take) => async (body) => {

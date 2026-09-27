@@ -371,6 +371,30 @@ test('多进程：迁移由运行中的窗口在锁外发起——等自己和�
     ['为迁移数据目录：本窗口的任务结束后会自动重载，未发送的输入会保留。']);
 });
 
+test('多进程（盲审 #1）：迁移在锁外等一个忙窗口时用户关掉或重载它——关闭期间它按“离开中”缺席处理而不是旧版本窗口，迁移继续完成', async (t) => {
+  for (const variant of ['close', 'reload']) {
+    const fixture = await createRoot(t);
+    const windows = createWindows(t, fixture.root, { noMerge: true });
+    const userAction = variant === 'close'
+      ? { closeAfterMs: 4_000, closeGapMs: 800 }
+      : { reloadAfterMs: 4_000, closeGapMs: 800, afterReload: { busy: false, reloadAfterMs: 0 } };
+    await (await windows.start('busy', { busy: true, ...userAction })).waitFor('ready');
+    // A short registration grace: by the time the user acts, the busy window counts as one used for a while.
+    const requester = await windows.start('requester', { request: true, requestOptions: { prepareTimeoutMs: 1_500 } });
+    const coordination = await requester.waitFor('coordination', 60_000);
+    await windows.stop();
+    assert.equal(coordination.state, 'completed', `${variant}: ${coordination.state} ${coordination.reason}`);
+    const events = windows.events();
+    const acted = events.find((event) => event.name === 'busy' && event.boot === 1 && event.event === (variant === 'close' ? 'closing' : 'reload'));
+    const waiting = events.find((event) => event.name === 'requester' && event.event === 'progress');
+    const operation = events.find((event) => event.name === 'requester' && event.event === 'operation');
+    assert.ok(acted && waiting && waiting.at < acted.at, 'the requester was waiting outside the locks when the user acted');
+    assert.ok(operation.at > acted.at + 800, 'the operation ran only after the window closed its Runtime');
+    if (variant === 'close') assert.deepEqual(windows.reloads(), { busy: 0, requester: 0 });
+    else assert.ok(windows.reloads().busy >= 1 && windows.reloads().requester === 0, JSON.stringify(windows.reloads()));
+  }
+});
+
 test('多进程：发起方进程崩溃后，残留请求不会让任何窗口倒计时，锁可以正常获取，残留由下一次请求清理', async (t) => {
   const fixture = await createRoot(t);
   const windows = createWindows(t, fixture.root, { noMerge: true });
