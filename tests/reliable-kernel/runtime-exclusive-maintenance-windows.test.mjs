@@ -395,6 +395,26 @@ test('多进程（盲审 #1）：迁移在锁外等一个忙窗口时用户关�
   }
 });
 
+test('多进程（盲审 #4）：两个窗口同时启动、各自自动合并同一个超限来源——较新的请求直接让先（不提示、不记退避），另一方完成合并，没有“有任务正在进行”的误报', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
+  const windows = createWindows(t, fixture.root, { limits: LIMITS });
+  await Promise.all([windows.start('A'), windows.start('B')]);
+  await Promise.all([windows.waitForEvent('A', 'report', 60_000), windows.waitForEvent('B', 'report', 60_000)]);
+  await delay(1_500);
+  await windows.stop();
+  const coordination = windows.events().filter((event) => event.event === 'coordination');
+  assert.ok(!coordination.some((event) => event.state === 'busy'), JSON.stringify(coordination));
+  assert.equal(windows.reports().flatMap((report) => report.merged).length, 1, 'merged exactly once');
+  assert.ok(!windows.reports().some((report) => report.deferredMessages.some((message) => /有任务正在进行/.test(message))),
+    JSON.stringify(windows.reports()));
+  const ledger = path.join(runtimeExclusiveMaintenanceDirectory(fixture.current.binding.paths), 'ledger');
+  const entries = await fs.readdir(ledger).catch(() => []);
+  const keys = [];
+  for (const name of entries) keys.push(JSON.parse(await fs.readFile(path.join(ledger, name), 'utf8')));
+  assert.deepEqual(keys.filter((entry) => entry.scope === 'key'), [], 'no backoff');
+});
+
 test('多进程：发起方进程崩溃后，残留请求不会让任何窗口倒计时，锁可以正常获取，残留由下一次请求清理', async (t) => {
   const fixture = await createRoot(t);
   const windows = createWindows(t, fixture.root, { noMerge: true });

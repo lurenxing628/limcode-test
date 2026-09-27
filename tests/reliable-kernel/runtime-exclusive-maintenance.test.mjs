@@ -890,6 +890,89 @@ test('跨模块盲审 #8：让先给本窗口自己更早的请求（例如仍�
   assert.equal(other.reason, '另一个窗口先发起了合并较大的旧聊天记录，这次让它先完成，没有进行；之后可以再试。');
 });
 
+test('盲审 #4：同一项工作（同一操作与操作键）的较新请求直接让先：结果为 superseded，不提示、不记退避；较早的请求照常完成，只做一次', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  await openWindow(t, binding, 'window-a');
+  const b = await openWindow(t, binding, 'window-b', { busy: WORK });
+  let runs = 0;
+  const operation = async () => { runs += 1; return 'merged'; };
+  // Window A asked first (the user's click: it waits for window B's task).
+  const first = run(paths, { ...BASE, whenBusy: 'wait', busyWaitTimeoutMs: 10_000, requesterHostBootId: 'window-a' }, operation);
+  for (let polls = 0; polls < 500 && (await readExclusiveMaintenanceRequests(paths)).length === 0; polls += 1) await delay(10);
+  // Window B's automatic merge of the same source.
+  const second = await run(paths, { ...BASE, requesterHostBootId: 'window-b' }, operation);
+  assert.equal(second.state, 'superseded');
+  assert.equal(second.reason, '另一个窗口正在进行同一项维护（合并旧聊天记录），这次由它完成。');
+  assert.ok(second.gaveWayTo);
+  b.setBusy(undefined);
+  assert.equal((await first).state, 'completed');
+  assert.equal(runs, 1);
+  const ledger = await fs.readdir(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'ledger')).catch(() => []);
+  assert.deepEqual(ledger.filter((name) => name.startsWith('key-')), [], 'no backoff for the work that was done');
+});
+
+test('盲审 #4：较早的请求遇到因同一项工作的请求而答忙的窗口时不放弃，按即将让出等它回答', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const liveness = await publishHost(binding, 'window-b');
+  const registration = await registerExclusiveMaintenanceParticipant(paths, 'window-b');
+  t.after(() => registration.unregister());
+  const outcome = run(paths, { ...BASE, prepareTimeoutMs: 5_000 }, async () => 'merged');
+  // Window B answers by hand: busy for its own request of this same work, then (it gave way) ready,
+  // then it confirms and reloads.
+  const respond = async (request, stage, answer, extra = {}) => {
+    const directory = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'responses', request.requestId);
+    await fs.mkdir(directory, { recursive: true });
+    await fs.writeFile(path.join(directory, 'window-b.json'), JSON.stringify({
+      kind: 'limcode-runtime-exclusive-maintenance-response', requestId: request.requestId, round: request.round, hostBootId: 'window-b',
+      stage, answer, respondedAt: new Date().toISOString(), ...extra
+    }));
+  };
+  let request;
+  for (let polls = 0; polls < 500 && !request; polls += 1) {
+    [request] = await readExclusiveMaintenanceRequests(paths);
+    if (!request) await delay(10);
+  }
+  await respond(request, 'prepare', 'busy', {
+    busyKind: 'work', reason: '本窗口正在等待执行合并旧聊天记录',
+    maintenance: { operation: BASE.operation, operationKey: BASE.operationKey, activity: '合并旧聊天记录' }
+  });
+  await delay(300);
+  for (let polls = 0; polls < 500; polls += 1) {
+    const [current] = await readExclusiveMaintenanceRequests(paths);
+    if (!current) break;
+    if (current.phase === 'prepare') await respond(current, 'prepare', 'ready');
+    if (current.phase === 'confirm') await respond(current, 'confirm', 'confirmed');
+    if (current.phase === 'go') await fs.rm(liveness, { force: true });
+    await delay(10);
+  }
+  const finished = await outcome;
+  assert.equal(finished.state, 'completed', `${finished.state}: ${finished.reason}`);
+});
+
+test('盲审 #4：其它窗口因为自己在进行另一项维护而答忙时，原因单独写明是在进行维护，不说成“有任务正在进行”', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  await publishHost(binding, 'maintaining-window');
+  const registration = await registerExclusiveMaintenanceParticipant(paths, 'maintaining-window');
+  t.after(() => registration.unregister());
+  const outcome = run(paths, { ...BASE, prepareTimeoutMs: 5_000 }, async () => assert.fail('must not run'));
+  let request;
+  for (let polls = 0; polls < 200 && !request; polls += 1) {
+    [request] = await readExclusiveMaintenanceRequests(paths);
+    if (!request) await delay(10);
+  }
+  // That window's own request (another work) runs: its participant answers busy, naming the work.
+  const directory = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'responses', request.requestId);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'maintaining-window.json'), JSON.stringify({
+    kind: 'limcode-runtime-exclusive-maintenance-response', requestId: request.requestId, round: request.round, hostBootId: 'maintaining-window',
+    stage: 'prepare', answer: 'busy', busyKind: 'work', reason: '本窗口正在等待执行整理数据',
+    maintenance: { operation: 'offline-gc', operationKey: 'gc', activity: '整理数据' }, respondedAt: new Date().toISOString()
+  }));
+  const finished = await outcome;
+  assert.equal(finished.state, 'busy');
+  assert.equal(finished.reason, '1 个其它窗口正在进行自己的维护（整理数据），暂不打扰。');
+});
+
 test('本窗口的请求让先于更早的请求：在对方确认前、倒计时之后与让出阶段都先不回答，本窗口请求结束后照常确认与让出', async (t) => {
   const { binding, paths } = await createRoot(t);
   let duringCountdown;

@@ -528,7 +528,9 @@ async function reportHistoricalMerge(
   if (requested && !report.stopped && !report.merged.length && !issues.length) {
     void vscode.window.showInformationMessage('这次没有合并：所选历史库已不在，或者当前历史库已经切换。可以重新打开“历史与存储管理”查看。');
   }
-  const announce = (issue: RuntimeDataSetMergeIssue) => issue.requested || fresh.has(noticeCause(issue));
+  // Another window's request merges the same source right now (superseded): nothing to tell here.
+  const announce = (issue: RuntimeDataSetMergeIssue) => issue.requested
+    || (issue.code !== 'runtime-data-set-merge-exclusive-superseded' && fresh.has(noticeCause(issue)));
   const deferred = report.deferred.filter(announce);
   if (deferred.length) {
     void vscode.window.showInformationMessage(

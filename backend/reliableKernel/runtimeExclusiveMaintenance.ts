@@ -98,6 +98,15 @@ export interface ExclusiveMaintenanceBusy {
   kind: ExclusiveMaintenanceBusyKind;
   /** Short user-facing reason in Chinese. */
   reason: string;
+  /** Busy with its own exclusive maintenance request (which work: other requesters tell same work apart). */
+  maintenance?: ExclusiveMaintenanceWork;
+}
+
+/** Which work a request is for. */
+export interface ExclusiveMaintenanceWork {
+  operation: string;
+  operationKey: string;
+  activity: string;
 }
 
 export interface RuntimeExclusiveMaintenanceRequest {
@@ -139,6 +148,8 @@ export interface RuntimeExclusiveMaintenanceResponse {
   answer: ExclusiveMaintenanceAnswer;
   busyKind?: ExclusiveMaintenanceBusyKind;
   reason?: string;
+  /** Busy because this window's own request runs, for this work. */
+  maintenance?: ExclusiveMaintenanceWork;
   respondedAt: string;
 }
 
@@ -249,8 +260,9 @@ export interface RuntimeExclusiveMaintenanceRunInput extends RuntimeExclusiveMai
   withLocks<R>(body: () => Promise<R>): Promise<R>;
 }
 
+/** superseded: another request (asked earlier) is for the same work and does it; no backoff, nothing to announce. */
 export type RuntimeExclusiveMaintenanceAbandonState =
-  'busy' | 'declined' | 'legacy-host' | 'timed-out' | 'cancelled' | 'backoff' | 'blocked';
+  'busy' | 'declined' | 'legacy-host' | 'timed-out' | 'cancelled' | 'backoff' | 'blocked' | 'superseded';
 
 export type RuntimeExclusiveMaintenanceOutcome<T> =
   /** coordinated: go was published, so other windows reloaded for this operation (a request alone is not). */
@@ -332,8 +344,7 @@ function assertLocksHeld(paths: RuntimeRootPaths, input: RuntimeExclusiveMainten
  * Requests of this process by requester window. A window's own participant answers busy to other
  * requests while one is running (a reload would drop it silently), also before it is published.
  */
-interface LocalRequest {
-  activity: string;
+interface LocalRequest extends ExclusiveMaintenanceWork {
   request?: RuntimeExclusiveMaintenanceRequest;
 }
 const LOCAL_REQUESTS = new Map<string, LocalRequest[]>();
@@ -423,7 +434,7 @@ class ExclusiveMaintenanceRequester<T> {
     this.whenBusy = input.whenBusy ?? 'abandon';
     this.busyDeadline = this.now() + (input.busyWaitTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.busyWaitTimeoutMs);
     this.leavingGraceMs = input.leavingGraceMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.leavingGraceMs;
-    this.local = { activity: this.activity };
+    this.local = { operation: this.operationName, operationKey: this.operationKey, activity: this.activity };
   }
 
   public async run(withLocks: RuntimeExclusiveMaintenanceRunInput['withLocks'] | undefined): Promise<Outcome<T>> {
@@ -532,6 +543,13 @@ class ExclusiveMaintenanceRequester<T> {
       // Two requesters never wait for each other: the later one gives way, with the reason (this
       // window's own earlier request, e.g. a large merge still waiting, is named as such).
       const earlier = await this.earlierRequest();
+      if (earlier && this.sameWork(earlier)) {
+        // The same work, asked for earlier: that request does it. Nothing to announce, no backoff.
+        return {
+          state: 'superseded', hosts: [], gaveWayTo: earlier.requestId,
+          reason: `${this.isOwnWindow(earlier) ? '本窗口' : '另一个窗口'}正在进行同一项维护（${earlier.activity}），这次由它完成。`
+        };
+      }
       if (earlier) {
         const outcome = await this.abandon('busy', this.hosts, this.isOwnWindow(earlier)
           ? `本窗口正在等待执行${earlier.activity}，这次没有进行，完成后再试。`
@@ -548,8 +566,12 @@ class ExclusiveMaintenanceRequester<T> {
       const answers = await this.answers();
       const declined = this.hosts.filter((host) => answers.get(host.hostBootId)?.answer === 'declined');
       if (declined.length > 0) return this.abandon('declined', declined, '其它窗口的用户选择了保留窗口。');
-      const busy = busyHosts(this.hosts, answers);
-      const missing = this.hosts.filter((host) => !answers.has(host.hostBootId));
+      // A window busy with its own request for this same work gives way to this earlier one at
+      // once (see superseded): it is waited for like a missing answer, never counted as busy.
+      const pendingSameWork = new Set(busyHosts(this.hosts, answers)
+        .filter((item) => item.maintenance && this.sameWork(item.maintenance)).map((item) => item.hostBootId));
+      const busy = busyHosts(this.hosts, answers).filter((item) => !pendingSameWork.has(item.hostBootId));
+      const missing = this.hosts.filter((host) => !answers.has(host.hostBootId) || pendingSameWork.has(host.hostBootId));
       for (const host of this.hosts) if (!firstSeen.has(host.hostBootId)) firstSeen.set(host.hostBootId, this.now());
       if (busy.length === 0 && !own && missing.length === 0 && leaving.length === 0) return 'ready';
       if (busy.length > 0 || own) {
@@ -719,6 +741,10 @@ class ExclusiveMaintenanceRequester<T> {
     return this.input.requesterBusy ? await this.input.requesterBusy() : undefined;
   }
 
+  private sameWork(work: Pick<ExclusiveMaintenanceWork, 'operation' | 'operationKey'>): boolean {
+    return work.operation === this.operationName && work.operationKey === this.operationKey;
+  }
+
   /** A request made by the requester's own window (its registered Host, else its process). */
   private isOwnWindow(request: RuntimeExclusiveMaintenanceRequest): boolean {
     return this.input.requesterHostBootId !== undefined
@@ -731,7 +757,8 @@ class ExclusiveMaintenanceRequester<T> {
     if (!this.request) return undefined;
     const others = (await readExclusiveMaintenanceRequests(this.paths, { classify: this.classify }))
       .filter((request) => request.requestId !== this.request!.requestId);
-    return others.find((request) => givesWayTo(this.local, request));
+    // The same work asked for earlier is always left to that request, whatever it waits for.
+    return others.find((request) => (this.sameWork(request) ? precedes(request, this.request!) : givesWayTo(this.local, request)));
   }
 
   /**
@@ -831,7 +858,10 @@ function busyHosts(
   return hosts.flatMap((host) => {
     const answer = answers.get(host.hostBootId);
     return answer?.answer === 'busy'
-      ? [{ hostBootId: host.hostBootId, kind: answer.busyKind ?? 'work', reason: answer.reason ?? '有任务正在进行' }]
+      ? [{
+        hostBootId: host.hostBootId, kind: answer.busyKind ?? 'work', reason: answer.reason ?? '有任务正在进行',
+        ...(answer.maintenance ? { maintenance: answer.maintenance } : {})
+      }]
       : [];
   });
 }
@@ -840,8 +870,13 @@ function busyHosts(
 function busyParts(busy: readonly ExclusiveMaintenanceBusyHost[], own: ExclusiveMaintenanceBusy | undefined): string {
   const parts: string[] = [];
   if (own) parts.push(`本窗口${own.kind === 'focus' ? '正在使用' : '还有任务正在进行'}`);
-  const working = busy.filter((item) => item.kind === 'work').length;
+  const maintaining = busy.filter((item) => item.maintenance);
+  const working = busy.filter((item) => item.kind === 'work' && !item.maintenance).length;
   const focused = busy.filter((item) => item.kind === 'focus').length;
+  if (maintaining.length > 0) {
+    const activities = [...new Set(maintaining.map((item) => item.maintenance!.activity))].join('、');
+    parts.push(`${maintaining.length} 个其它窗口正在进行自己的维护（${activities}）`);
+  }
   if (working > 0) parts.push(`${working} 个其它窗口有任务正在进行`);
   if (focused > 0) parts.push(`${focused} 个其它窗口正在使用`);
   return parts.join('，');
@@ -932,7 +967,7 @@ export function startExclusiveMaintenanceParticipant(
     busy?: ExclusiveMaintenanceBusy,
     reason?: string
   ): Promise<void> => {
-    await writeResponse(paths, request, hostBootId, stage, answer, busy?.kind, busy?.reason ?? reason);
+    await writeResponse(paths, request, hostBootId, stage, answer, busy?.kind, busy?.reason ?? reason, busy?.maintenance);
     answered.set(`${request.requestId}#${request.round}:${stage}`, `${answer}\0${busy?.kind ?? ''}\0${busy?.reason ?? ''}`);
   };
   const stillCurrentRequest = async (request: RuntimeExclusiveMaintenanceRequest): Promise<boolean> => {
@@ -944,7 +979,12 @@ export function startExclusiveMaintenanceParticipant(
     // This window's own request is running: answer busy, never yield (a reload would drop it).
     const busyNow = async (stage: ExclusiveMaintenancePhase): Promise<ExclusiveMaintenanceBusy | undefined> => {
       const own = ownRequest();
-      if (own) return { kind: 'work', reason: `本窗口正在等待执行${own.activity}` };
+      if (own) {
+        return {
+          kind: 'work', reason: `本窗口正在等待执行${own.activity}`,
+          maintenance: { operation: own.operation, operationKey: own.operationKey, activity: own.activity }
+        };
+      }
       const busy = await handlers.busyReason(request);
       // The user already confirmed the operation elsewhere: past prepare only work counts, not focus.
       return stage !== 'prepare' && request.confirmation !== 'countdown' && busy?.kind === 'focus' ? undefined : busy;
@@ -1254,7 +1294,10 @@ async function readAnswers(
     // Only answers to the current phase count; a busy answer at a later stage is always relevant.
     const relevant = value.stage === request.phase || (request.phase !== 'prepare' && value.answer === 'busy');
     if (!relevant) continue;
-    answers.set(host.hostBootId, value as RuntimeExclusiveMaintenanceResponse);
+    const { maintenance, ...answer } = value as RuntimeExclusiveMaintenanceResponse;
+    const work = maintenance && typeof maintenance.operation === 'string' && typeof maintenance.operationKey === 'string'
+      && typeof maintenance.activity === 'string' ? maintenance : undefined;
+    answers.set(host.hostBootId, { ...answer, ...(work ? { maintenance: work } : {}) });
   }
   return answers;
 }
@@ -1266,7 +1309,8 @@ async function writeResponse(
   stage: ExclusiveMaintenancePhase,
   answer: ExclusiveMaintenanceAnswer,
   busyKind?: ExclusiveMaintenanceBusyKind,
-  reason?: string
+  reason?: string,
+  maintenance?: ExclusiveMaintenanceWork
 ): Promise<void> {
   const response: RuntimeExclusiveMaintenanceResponse = {
     kind: RESPONSE_KIND,
@@ -1277,6 +1321,9 @@ async function writeResponse(
     answer,
     ...(busyKind !== undefined ? { busyKind } : {}),
     ...(reason !== undefined ? { reason } : {}),
+    ...(maintenance !== undefined
+      ? { maintenance: { operation: maintenance.operation, operationKey: maintenance.operationKey, activity: maintenance.activity } }
+      : {}),
     respondedAt: new Date().toISOString()
   };
   await writeDurableJson(responsePath(paths, request.requestId, hostBootId), response);

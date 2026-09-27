@@ -210,8 +210,10 @@ export function describeProgress(progress: ExclusiveMaintenanceProgress): string
   if (progress.stage === 'waiting-busy' || (progress.stage === 'prepare' && closing > 0)) {
     const parts: string[] = [];
     if (progress.requesterBusy) parts.push('本窗口的任务结束');
-    const working = progress.busy.filter((item) => item.kind === 'work').length;
+    const maintaining = progress.busy.filter((item) => item.maintenance).length;
+    const working = progress.busy.filter((item) => item.kind === 'work' && !item.maintenance).length;
     const focused = progress.busy.filter((item) => item.kind === 'focus').length;
+    if (maintaining > 0) parts.push(`${maintaining} 个其它窗口的维护结束`);
     if (working > 0) parts.push(`${working} 个其它窗口的任务结束`);
     if (focused > 0) parts.push(`${focused} 个正在使用的窗口被切走`);
     if (closing > 0) parts.push(`${closing} 个正在关闭或重载的窗口关完`);
