@@ -98,6 +98,7 @@ import {
   prepareCached,
   prepareUncached
 } from './runtimeStatementCache';
+import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 
 const CONTEXT_CAS_CACHE_MAX_ENTRIES = 4_096;
 const CONTEXT_CAS_CACHE_MAX_BYTES = 32 * 1024 * 1024;
@@ -412,6 +413,13 @@ async function start(): Promise<void> {
             respond({ type: 'response', id: request.id, ok: false, error: serializeError(error) });
           }
         );
+        return;
+      }
+      if (request.kind === 'countDomainRows') {
+        assertDatabaseBinding(reader, data.binding);
+        const count = reader.transaction(() => RUNTIME_DOMAIN_SCHEMAS.reduce((rows, schema) =>
+          rows + Number(reader.prepare(`SELECT COUNT(*) FROM "${schema.table.replace(/"/g, '""')}"`).pluck().get() as bigint | number), 0));
+        respond({ type: 'response', id: request.id, ok: true, result: String(count()) });
         return;
       }
       if (request.kind === 'externalDataVersion') {

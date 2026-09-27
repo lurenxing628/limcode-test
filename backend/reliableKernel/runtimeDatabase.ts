@@ -583,6 +583,13 @@ export class RuntimeDatabase {
       && row.generation === fence.generation;
   }
 
+  /** Rows over every Runtime domain, counted on this database's own reader connection (no copy). */
+  public async countDomainRows(): Promise<number> {
+    const rows = await this.request<string>({ kind: 'countDomainRows' });
+    if (!/^\d+$/.test(rows)) throw new TypeError('Runtime domain row count must be decimal.');
+    return Number(rows);
+  }
+
   public async inspect(): Promise<DatabaseWorkerDiagnostics> {
     return this.request<DatabaseWorkerDiagnostics>({ kind: 'inspect' });
   }
@@ -962,8 +969,8 @@ function databaseMetricRequestKind(
 ): RuntimeDatabaseMetricRequestKind {
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
-  // The conversation pending-work probe is one fixed worker read snapshot.
-  if (kind === 'conversationRuntimeWork') return 'snapshot';
+  // The conversation pending-work probe and the domain row count are one fixed worker read snapshot each.
+  if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows') return 'snapshot';
   return kind;
 }
 
