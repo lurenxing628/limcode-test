@@ -1600,7 +1600,8 @@ function executeMutation(
     }
     if (schema.key === 'ModelStreamCheckpoint' || schema.key === 'ModelStreamFence') {
       // Stream facts are copied only together with their terminal request, as one historical copy
-      // (a Conversation fork, a historical data-set merge): never appended to an existing request.
+      // (a Conversation fork, a historical data-set merge, a data-root relocation bulk copy): never
+      // appended to an existing request.
       if (!historicalCopiesOf(allocatedSequences).requests.has(String(mutation.row.model_request_id))) {
         throw new Error(`Historical ${schema.key} copy requires its ModelRequest to be copied in the same transaction.`);
       }

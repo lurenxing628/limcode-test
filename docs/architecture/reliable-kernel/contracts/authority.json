@@ -1610,7 +1610,7 @@
       ],
       "notes": [
         "delete 仅允许 ModelStreamFence 已提交后的 maintenance prune；保留最新 socket_generation 尾部 32 条+终态摘要",
-        "insert 只由固定 writer 的 modelStreamEvent 写入；唯一例外是历史数据集合并的历史复制插入，且 worker 校验父 ModelRequest 已 terminal（只搬运已结束请求保留的流事实，如 terminal_summary）",
+        "insert 只由固定 writer 的 modelStreamEvent 写入；唯一例外是历史复制插入，使用方为历史数据集合并与迁移数据目录的整库复制：worker 校验父 ModelRequest 已在同一事务里以历史复制插入（savepoint 回滚时这条记录同步撤销）且已 terminal（只搬运已结束请求保留的流事实，如 terminal_summary），从不追加到已有请求",
         "native_tool_call proof 必须同时保存 Provider 原始 arguments 与运行时冻结的 resolvedArguments；admission 校验 canonical ToolCall 参数与 resolvedArguments，相同请求重放复用冻结解释。",
         "未知短引用的 argumentResolutionError 必须持久并阻止执行；缺 resolvedArguments 的 proof 拒绝，不推导旧格式兼容。"
       ]
@@ -1628,6 +1628,9 @@
       "resetPolicy": "runtime-dataset",
       "indexes": [
         "model_request_id UNIQUE"
+      ],
+      "notes": [
+        "insert 只由固定 writer 的 modelStreamEvent 写入；唯一例外是历史复制插入，使用方为 Conversation fork 的 transcript 复制、历史数据集合并与迁移数据目录的整库复制：worker 校验父 ModelRequest 已在同一事务里以历史复制插入（历史复制的 ModelRequest 必须已 terminal；savepoint 回滚时这条记录同步撤销），从不追加到已有请求"
       ]
     },
     {

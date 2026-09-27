@@ -9,8 +9,9 @@ export type DomainRow = Record<string, unknown>;
 
 /**
  * Domains eligible for trusted historical copy inserts: Conversation-fork transcript copies, and
- * the historical data-set merge, which also carries the retained stream checkpoints of terminal
- * ModelRequests (the terminal summary is the completed request's durable output).
+ * the historical data-set merge and the data-root relocation bulk copy, which also carry the
+ * retained stream checkpoints of terminal ModelRequests (the terminal summary is the completed
+ * request's durable output).
  */
 export const HISTORICAL_COPY_DOMAINS: readonly string[] = [
   'ModelRequest',
@@ -32,9 +33,11 @@ export interface RepositoryInsertMutation {
   /** Fixed writer dataflow: copy this MessageRevision's allocated revision_seq into ContextSegmentSource.source_revision. */
   messageRevisionSequenceReferenceId?: string;
   /**
-   * Conversation-fork transcript copy: the row is a verbatim copy of an already-terminal source row,
-   * so the writer skips "must start prepared/pending" creation invariants and instead enforces the
-   * mirrored terminal invariants. Restricted to ModelRequest/Operation/Attempt/ModelStreamFence.
+   * Historical copy (Conversation fork, historical data-set merge, data-root relocation bulk copy):
+   * the row is a verbatim copy of an already-terminal source row, so the writer skips "must start
+   * prepared/pending" creation invariants and instead enforces the mirrored terminal invariants.
+   * Restricted to HISTORICAL_COPY_DOMAINS; a ModelStreamFence or ModelStreamCheckpoint copy also
+   * requires its ModelRequest to be copied historically in the same transaction.
    */
   historicalCopy?: true;
 }
@@ -257,9 +260,10 @@ export class DomainRepository {
   }
 
   /**
-   * Trusted Conversation-fork transcript copy channel. Only the domains whose creation invariants
-   * (prepared/pending start state, Fence fixed-writer restriction) are mirrored by terminal-state
-   * checks in the database worker may use it.
+   * Trusted historical copy channel (Conversation fork, historical data-set merge, data-root
+   * relocation bulk copy). Only HISTORICAL_COPY_DOMAINS, whose creation invariants (prepared/pending
+   * start state, stream facts written only by the fixed writer) are mirrored by terminal-state and
+   * same-transaction parent checks in the database worker, may use it.
    */
   public insertHistoricalCopy(row: DomainRow): RepositoryInsertMutation {
     this.requireMutation('insert');
