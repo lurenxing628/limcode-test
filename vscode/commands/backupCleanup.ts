@@ -5,6 +5,7 @@ import {
   type RuntimeBackupCleanupResult, type RuntimeBackupKind
 } from '../../backend/reliableKernel/runtimeBackupCleanup';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
+import type { RuntimeWriteGate } from '../../backend/application/reliableKernel/runtimeWriteGate';
 import type { BridgeClientId, DataRootPromptSection, ExtensionToWebviewMessage } from '../../shared/protocol';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { askInSettingsPage, type DataRootPrompt, type DataRootPromptAnswer } from '../dataRootPrompts';
@@ -16,6 +17,11 @@ export interface BackupCleanupHost {
   /** The configuration root (data directory) of this window. */
   dataRootPath(): string;
   postToWebview(clientId: BridgeClientId, message: ExtensionToWebviewMessage): boolean;
+  /**
+   * The window's entry-level write freeze (an exclusive data-directory operation is under way):
+   * deleting backups is a write, refused while frozen ("正在迁移数据目录，完成后再操作。").
+   */
+  writeGate?: Pick<RuntimeWriteGate, 'admit' | 'run'>;
 }
 
 type Ask = (prompt: DataRootPrompt) => Promise<DataRootPromptAnswer>;
@@ -56,6 +62,13 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   }
   if (!canStartRuntimeDataSetUpgrade(context)) return;
   const ask: Ask = (prompt) => askInSettingsPage(host, clientId, prompt);
+  // Deleting backups is a write: refused at once while this window is frozen for a data-directory operation.
+  try {
+    host.writeGate?.admit();
+  } catch (error) {
+    await tell(ask, '现在不能清理备份', [describeError(error), '没有删除任何内容。']);
+    return;
+  }
   const current = host.product.application.database;
   const configurationRootPath = host.dataRootPath();
   let plan: RuntimeBackupCleanupPlan;
@@ -105,7 +118,11 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   let result: RuntimeBackupCleanupResult;
   try {
     result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在删除备份…' },
-      () => runRuntimeDataSetUpgrade(context, () => deleteRuntimeBackups(plan, current, chosen.map((item) => item.key))));
+      () => runRuntimeDataSetUpgrade(context, () => {
+        const deletion = () => deleteRuntimeBackups(plan, current, chosen.map((item) => item.key));
+        // Frozen meanwhile (the user took a while to confirm): refused like any other write.
+        return host.writeGate ? host.writeGate.run(deletion) : deletion();
+      }));
   } catch (error) {
     await tell(ask, '备份没有删除', [describeError(error)]);
     return;

@@ -598,7 +598,7 @@ function validateMigration(root, migration, failures) {
   }
   const cleanup = migration?.backupCleanup;
   const expectedCleanup = {
-    entry: 'settings-page-other-data-root-button; data-set-management-and-command-palette-only-open-the-settings-page; progress-notification-while-checking',
+    entry: 'settings-page-other-data-root-button; data-set-management-and-command-palette-only-open-the-settings-page; progress-notification-while-checking; refused-like-a-write-command-while-this-window-is-frozen-for-a-data-root-operation-at-entry-and-again-before-deleting',
     deletableKinds: ['epoch-migration-backups', 'merge-backups', 'merge-source-backups'],
     listedOnly: 'reset-archives-limcode-runtime-backups; relocation-copied-aside-limcode-copied; control-root-legacy-backups; limcode-data-backups; name-location-size-and-reason-never-deleted',
     coverage: 'every-conversation-and-message-revision-id-of-the-copy-in-the-local-data-set-of-the-same-control-root; copy-read-in-facts-worker-from-private-copy-ids-cached-by-exact-file-state-in-merge-ledger-coverage; current-data-set-only-through-its-own-worker-reader-250-ids-per-read; other-local-data-sets-through-facts-worker-private-copy-under-their-maintenance; uncovered-kept-as-history-naming-the-missing-conversations',

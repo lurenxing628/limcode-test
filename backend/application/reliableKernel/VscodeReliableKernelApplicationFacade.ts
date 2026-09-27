@@ -101,8 +101,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   /** Attach-meta Conversation binding per client; a feed may never retarget beyond it. */
   private readonly webviewConversationIds = new Map<BridgeClientId, string>();
   private readonly commandRouter: VscodeReliableKernelCommandRouter;
-  /** Refuses write commands while an exclusive data-directory operation is about to close this Runtime. */
-  private readonly writeGate = new RuntimeWriteGate();
+  /**
+   * Refuses write commands while an exclusive data-directory operation is about to close this
+   * Runtime. Public for extension commands that write outside the Facade (e.g. 清理备份 deletes files).
+   */
+  public readonly writeGate = new RuntimeWriteGate();
   private readonly externalHistoryWatcher: ExternalDataVersionWatcher;
   private readonly interactionAttentionNotifier: InteractionAttentionNotifier;
   private readonly interactionLeaseEdges: InteractionLeaseEdgeTracker;

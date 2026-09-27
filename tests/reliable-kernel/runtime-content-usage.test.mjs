@@ -402,6 +402,43 @@ test('开发诊断命令打开的 JSON 带上同一份按类型统计，数据�
   assert.equal(snapshot.database.readerBusyTimeoutMs, '5000');
 });
 
+test('冻结期间（本窗口正在迁移数据目录等）开发诊断与查看存储占用都是只读，照常可用；写命令被拒绝', async (t) => {
+  const { database, store } = await openRuntime(t, 'frozen');
+  await store.ingest(database, 'frozen message', MESSAGE);
+  const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
+    compiledRoot, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
+  ));
+  const { RuntimeWriteGate } = require(path.join(compiledRoot, 'backend/application/reliableKernel/runtimeWriteGate.js'));
+  const { registerCommands } = require(path.join(compiledRoot, 'vscode/commands/registerCommands.js'));
+  const { EXTENSION_COMMAND_IDS } = require(path.join(compiledRoot, 'shared/extensionIdentity.js'));
+  const writeGate = new RuntimeWriteGate();
+  t.after(writeGate.freeze('迁移数据目录', []));
+  const facade = Object.assign(Object.create(Facade.prototype), {
+    disposed: false,
+    productClosed: false,
+    writeGate,
+    product: {
+      application: { database },
+      recoveryState: () => ({ state: 'fixture' }),
+      diagnostics: { inspect: async () => ({ events: [], spans: [] }) }
+    }
+  });
+  // The freeze is real: a write command of this window is refused.
+  await assert.rejects(facade.renameConversationTitle('conversation', '新名字'), { message: '正在迁移数据目录，完成后再操作。' });
+  registerCommands({ subscriptions: [], extensionMode: vscode.ExtensionMode.Development }, { wait: async () => facade, current: () => facade });
+  ui.documents.length = 0;
+  await ui.registered.get(EXTENSION_COMMAND_IDS.inspectReliability)({ conversationId: '' });
+  assert.equal(ui.documents.length, 1, '开发诊断照常打开');
+  assert.deepEqual(JSON.parse(ui.documents[0]).contentUsage, usage.summarizeRuntimeContentUsage(await database.contentUsage()));
+  const management = require(path.join(compiledRoot, 'vscode/commands/runtimeDataSetManagement.js'));
+  const current = currentCandidate(database.binding);
+  storageFixture.candidates = [current];
+  ui.documents.length = 0;
+  await management.showRuntimeStorage({ subscriptions: [] }, current, { current: () => facade });
+  assert.equal(ui.documents.length, 1, '查看存储占用照常打开');
+  assert.ok(ui.documents[0].includes('按类型统计的正文（只统计当前库，按数据库记录）：'));
+});
+
 test('查看存储占用：当前库在目录统计之后按分类列出正文，并附两条说明', async (t) => {
   const { root, database, store } = await openRuntime(t, 'view');
   await store.ingest(database, 'view message', MESSAGE);

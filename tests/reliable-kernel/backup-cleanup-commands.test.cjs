@@ -5,6 +5,9 @@ const vm = require('node:vm');
 const test = require('node:test');
 const ts = require('typescript');
 
+const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
+const { RuntimeWriteGate } = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
+
 /** Loads vscode/commands/backupCleanup.ts with every dependency replaced by a recording fake. */
 function loadCommand(dependencies) {
   const filename = path.resolve(__dirname, '../../vscode/commands/backupCleanup.ts');
@@ -57,7 +60,7 @@ const PLAN = {
   ]
 };
 
-function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true } = {}) {
+function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true, writeGate } = {}) {
   const calls = [];
   const prompts = [];
   const database = { binding: { dataSetId: 'current' }, snapshot: async () => ({ snapshot: [] }) };
@@ -73,7 +76,9 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
     ProgressLocation: { Notification: 15 },
     commands: { async executeCommand(command, argument) { calls.push(['command', command, argument]); } }
   };
-  const application = host ? { product: { application: { database } }, dataRootPath: () => ROOT, postToWebview: () => true } : undefined;
+  const application = host
+    ? { product: { application: { database } }, dataRootPath: () => ROOT, postToWebview: () => true, ...(writeGate ? { writeGate } : {}) }
+    : undefined;
   const startup = { wait: async () => { if (!application) throw new Error('no runtime'); return application; } };
   const dependencies = {
     vscode,
@@ -99,7 +104,8 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
         assert.equal(clientId, 'client-1');
         prompts.push(plain(prompt));
         calls.push(['prompt', prompt.title]);
-        return Promise.resolve(answers.shift() ?? { choice: 'cancel', include: [] });
+        const answer = answers.shift();
+        return Promise.resolve((typeof answer === 'function' ? answer() : answer) ?? { choice: 'cancel', include: [] });
       }
     },
     '../runtimeDataSetUpgradeLifetime': {
@@ -233,4 +239,30 @@ test('设置页的回答只接受这一个确认面板上列出的勾选项（�
   assert.equal(module.exports.answerDataRootPrompt('client-2', { flowId, choice: 'next', include: ['grouped'] }), false, '别的页面不能回答');
   assert.equal(module.exports.answerDataRootPrompt('client-1', { flowId, choice: 'next', include: ['grouped', 'flat', 'forged'] }), true);
   return answer.then((result) => assert.deepEqual(plain(result), { choice: 'next', include: ['grouped', 'flat'] }));
+});
+
+test('冻结期间（本窗口正在迁移数据目录等）清理备份按写命令拒绝：入口就说明，不检查也不删除；确认之后才冻结的，删除同样被拒绝', async () => {
+  const gate = new RuntimeWriteGate();
+  const thaw = gate.freeze('迁移数据目录', []);
+  const refused = fixture({ writeGate: gate });
+  await refused.run();
+  assert.ok(!refused.calls.some((call) => ['plan', 'delete', 'lifetime'].includes(call[0])), '什么都不检查、不删除');
+  assert.deepEqual(refused.prompts.map((prompt) => prompt.title), ['现在不能清理备份']);
+  assert.deepEqual(refused.prompts[0].sections[0].lines, ['正在迁移数据目录，完成后再操作。', '没有删除任何内容。']);
+  thaw();
+
+  let thawLate;
+  const late = fixture({
+    writeGate: gate,
+    answers: [{ choice: 'next', include: ['merge-target:old'] }, () => { thawLate = gate.freeze('迁移数据目录', []); return { choice: 'delete', include: [] }; }]
+  });
+  await late.run();
+  thawLate();
+  assert.ok(!late.calls.some((call) => call[0] === 'delete'), '删除前冻结：不删除');
+  assert.equal(late.prompts.at(-1).title, '备份没有删除');
+  assert.match(JSON.stringify(late.prompts.at(-1)), /正在迁移数据目录，完成后再操作。/);
+
+  const open = fixture({ writeGate: gate, answers: [{ choice: 'next', include: ['merge-target:old'] }, { choice: 'delete', include: [] }] });
+  await open.run();
+  assert.deepEqual(open.calls.find((call) => call[0] === 'delete')?.[3], ['merge-target:old'], '解冻后照常删除');
 });
