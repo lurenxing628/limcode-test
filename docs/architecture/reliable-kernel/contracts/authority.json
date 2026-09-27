@@ -90,7 +90,8 @@
     "executionLeaseIsSeparate": true,
     "takeover": "verified-dead-or-reused-process-only",
     "liveHostPreemption": false,
-    "release": "no-view-references-no-active-commands-no-pending-runtime-work",
+    "release": "no-view-references-no-active-commands-no-pending-work-this-host-executes",
+    "releasedExecutionLease": "claimable-by-any-host",
     "gates": [
       "open",
       "restore",

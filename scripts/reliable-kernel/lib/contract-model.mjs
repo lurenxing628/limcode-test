@@ -754,8 +754,9 @@ function validateAuthority(authority, migration, failures) {
     || ownership?.executionLeaseIsSeparate !== true
     || ownership?.liveHostPreemption !== false
     || ownership?.takeover !== 'verified-dead-or-reused-process-only'
-    || ownership?.release !== 'no-view-references-no-active-commands-no-pending-runtime-work') {
-    failures.push('同工作区允许多宿主，每个对话必须单宿主归属，且独立于 ExecutionLease');
+    || ownership?.release !== 'no-view-references-no-active-commands-no-pending-work-this-host-executes'
+    || ownership?.releasedExecutionLease !== 'claimable-by-any-host') {
+    failures.push('同工作区允许多宿主，每个对话必须单宿主归属，且独立于 ExecutionLease；归属只为本宿主能执行的待处理工作保留，已交还的执行租约任何宿主都可接管');
   }
   failures.push(...exactSetProblems('会话归属门禁', [
     'open', 'restore', 'admission', 'recovery', 'child-execution', 'delivery-wake', 'conversation-mutation'
