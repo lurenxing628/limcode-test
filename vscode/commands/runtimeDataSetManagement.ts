@@ -12,7 +12,8 @@ import {
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
 import {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
-  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, withRuntimeDataSetReadClaims,
+  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS,
+  withRuntimeDataSetReadClaims,
   type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts,
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeResult, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
 } from '../../backend/reliableKernel/runtimeDataSetMerge';
@@ -339,7 +340,8 @@ function oversizedMergeNote(): string {
   return `超过 ${maxRows} 条记录或 ${Math.round(maxBytes / (1024 * 1024))} MiB 的库需要其它窗口暂时让出：`
     + `会在后台等其它窗口的任务结束、正在使用的窗口被切走（最多约 ${minutes} 分钟，可取消），然后其它窗口会重载一次（未发送的输入会保留）；`
     + '等不到时这次先不合并，之后启动时会再试。'
-    + `超过 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 条记录的库当前版本不能安全合并，会说明原因。`;
+    + `超过 ${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 条记录的库要在所有 LimCode 窗口暂停时一次合并（先在后台准备，期间窗口照常可用）；`
+    + `超过 ${RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS} 条记录的库当前版本不能安全合并，会说明原因。`;
 }
 
 /**

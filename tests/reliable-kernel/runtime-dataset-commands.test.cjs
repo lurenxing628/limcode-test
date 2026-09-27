@@ -112,6 +112,7 @@ function fixture({
       // Not the shipped values: the confirmation must say whatever the engine's bounds are.
       RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS: { maxRows: 1234, maxBytes: 5 * 1024 * 1024 },
       RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS: 56789,
+      RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS: 98765432,
       requestRuntimeDataSetMerge: async (_paths, input) => {
         calls.push(['merge-request', input.candidateId, input.expectedDataSetId, input.expectedRootInstanceId]);
       },
@@ -804,7 +805,9 @@ test('explicit merge runs online in this window without a reload; without a Runt
   assert.match(confirm[2].detail, /以前从这个库合并进当前库、之后你在当前库删除了的对话不会再合并回来（连同它们的子 Agent 对话，在这个库里继续过的也一样）/);
   // 复审 merge3 #2：明确合并对超限来源会等其它窗口（与协调参数 whenBusy: 'wait' 一致），条件写具体数字。
   assert.match(confirm[2].detail, /超过 1234 条记录或 5 MiB 的库需要其它窗口暂时让出：会在后台等其它窗口的任务结束、正在使用的窗口被切走（最多约 7 分钟，可取消），然后其它窗口会重载一次/);
-  assert.match(confirm[2].detail, /超过 56789 条记录的库当前版本不能安全合并/);
+  // 大库会话：超过内存单事务上限的在所有窗口暂停时合并，超过流式硬上限的才不能合并。
+  assert.match(confirm[2].detail, /超过 56789 条记录的库要在所有 LimCode 窗口暂停时一次合并（先在后台准备，期间窗口照常可用）/);
+  assert.match(confirm[2].detail, /超过 98765432 条记录的库当前版本不能安全合并/);
   assert.doesNotMatch(confirm[2].detail, /这次先不合并，之后会再试|特别大/);
   assert.deepEqual(plain(f.calls.filter(call => ['merge-request', 'merge-online', 'command'].includes(call[0]))), [
     ['merge-request', 'workspace:old', 'old', 'old-instance'],

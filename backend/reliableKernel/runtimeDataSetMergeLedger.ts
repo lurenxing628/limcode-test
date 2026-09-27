@@ -16,12 +16,15 @@ const REQUEST_KIND = 'limcode-runtime-data-set-merge-request';
 const COMMIT_KIND = 'limcode-runtime-data-set-merge-commit';
 const FINGERPRINT_KIND = 'limcode-runtime-data-set-fingerprint';
 const FINALIZATION_KIND = 'limcode-runtime-data-set-merge-finalization';
+const PREPARATION_KIND = 'limcode-runtime-data-set-merge-preparation';
 const RECORDS = 'records';
 const REQUESTS = 'requests';
 const COMMITS = 'commits';
 /** Cache only: the content digest last computed for an exact file state. Never a merge fact. */
 const FINGERPRINTS = 'fingerprints';
 const FINALIZATIONS = 'finalizations';
+/** Advisory: the window preparing a large-merge session for a source (see RuntimeDataSetMergePreparation). */
+const PREPARATIONS = 'preparing';
 /** Content digest prefix of a data set whose content could not be read (see runtimeDataSetFingerprint). */
 const UNREADABLE_DIGEST = 'unreadable:';
 
@@ -131,11 +134,30 @@ export interface RuntimeDataSetMergeFinalization {
   finalizedAt: string;
 }
 
-/** Exact rows a committing transaction inserts, for convergence after a crash. */
+/**
+ * Evidence of a committing transaction's inserted rows, for convergence after a crash: every inserted
+ * Conversation and a bounded sample of the other rows (see RuntimeDataSetMergeEvidence; the
+ * transaction is atomic, so the sample answers as the whole set would). A streamed transaction's
+ * evidence is written empty with its committing record and completed right before its commit.
+ */
 export interface RuntimeDataSetMergeCommit {
   kind: typeof COMMIT_KIND;
   commitId: string;
   rows: Array<[domain: string, id: string]>;
+}
+
+/**
+ * One window preparing a large-merge session for a source, and holding it until that session ran:
+ * other windows leave the source alone while the heartbeat is fresh and the process alive, and
+ * take it over otherwise. Advisory only; the session checks everything again under its claims.
+ */
+export interface RuntimeDataSetMergePreparation {
+  kind: typeof PREPARATION_KIND;
+  candidateId: string;
+  token: string;
+  processId: number;
+  startedAt: string;
+  heartbeatAt: string;
 }
 
 /**
@@ -400,8 +422,12 @@ export async function removeRuntimeDataSetMergeFinalization(paths: StoragePaths,
   await removeLedgerJson(paths, FINALIZATIONS, candidateId);
 }
 
-export async function writeRuntimeDataSetMergeCommit(paths: StoragePaths, rows: Array<[string, string]>): Promise<string> {
-  const commitId = randomUUID();
+/** Writes (or, with `commitId`, rewrites) the evidence of a committing transaction. */
+export async function writeRuntimeDataSetMergeCommit(
+  paths: StoragePaths,
+  rows: Array<[string, string]>,
+  commitId: string = randomUUID()
+): Promise<string> {
   await writeLedgerJson(paths, COMMITS, commitId, { kind: COMMIT_KIND, commitId, rows });
   return commitId;
 }
@@ -435,6 +461,58 @@ export async function pruneRuntimeDataSetMergeCommits(paths: StoragePaths): Prom
   }
   for (const [name] of await readDirectoryJson(paths, COMMITS)) {
     if (!referenced.has(name)) await removeLedgerFile(paths, COMMITS, name);
+  }
+}
+
+export async function readRuntimeDataSetMergePreparation(
+  paths: StoragePaths,
+  candidateId: string
+): Promise<RuntimeDataSetMergePreparation | undefined> {
+  const file = await ledgerFile(paths, PREPARATIONS, candidateId);
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(file, 'utf8')) as unknown; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
+    throw error;
+  }
+  const entry = value as Partial<RuntimeDataSetMergePreparation> | null;
+  if (entry?.kind !== PREPARATION_KIND || entry.candidateId !== candidateId || typeof entry.token !== 'string'
+    || !Number.isSafeInteger(entry.processId) || typeof entry.startedAt !== 'string' || typeof entry.heartbeatAt !== 'string') return undefined;
+  return entry as RuntimeDataSetMergePreparation;
+}
+
+export async function writeRuntimeDataSetMergePreparation(
+  paths: StoragePaths,
+  preparation: Omit<RuntimeDataSetMergePreparation, 'kind'>
+): Promise<void> {
+  await writeLedgerJson(paths, PREPARATIONS, preparation.candidateId, { kind: PREPARATION_KIND, ...preparation });
+}
+
+export async function removeRuntimeDataSetMergePreparation(paths: StoragePaths, candidateId: string): Promise<void> {
+  await removeLedgerJson(paths, PREPARATIONS, candidateId);
+}
+
+/** A preparation not refreshed for this long, or whose process is gone, may be taken over or removed. */
+export const RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS = 60_000;
+
+/** Whether a preparation's holder may still be working on it (fresh heartbeat, process present). */
+export function isRuntimeDataSetMergePreparationLive(preparation: RuntimeDataSetMergePreparation, now = Date.now()): boolean {
+  if (!(now - Date.parse(preparation.heartbeatAt) < RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS)) return false;
+  try {
+    process.kill(preparation.processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+/** Removes preparations whose holder is gone (a crashed or closed window). Call inside configuration admission. */
+export async function pruneRuntimeDataSetMergePreparations(paths: StoragePaths): Promise<void> {
+  for (const [name, value] of await readDirectoryJson(paths, PREPARATIONS)) {
+    const candidateId = (value as { candidateId?: unknown } | null)?.candidateId;
+    const preparation = typeof candidateId === 'string' && fileName(candidateId) === name
+      ? await readRuntimeDataSetMergePreparation(paths, candidateId).catch(() => undefined) : undefined;
+    if (!preparation || !isRuntimeDataSetMergePreparationLive(preparation)) await removeLedgerFile(paths, PREPARATIONS, name);
   }
 }
 

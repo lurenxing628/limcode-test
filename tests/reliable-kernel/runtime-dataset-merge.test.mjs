@@ -21,7 +21,7 @@ const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { createConversationRuntimeWorkProbe } = kernelFile('conversationRuntimePendingWork.js');
 const {
   KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
-  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
+  RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
@@ -172,7 +172,7 @@ test('复审 reloc-perf #13：规划不再按来源行数构造实参列表（�
   assert.ok(report.merged[0] > rows);
 });
 
-test('复审 reloc-perf #14：超过单事务硬上限的来源不协调、不备份、不收尾，记为“太大”而非失败，上限不变就不再重试', async (t) => {
+test('复审 reloc-perf #14：超过内存单事务上限的来源不协调、不备份、不收尾，推迟为“等待大库会话”且不写账本；超过流式硬上限的才记为“太大”，上限不变就不再重试', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_huge', project: SHARED_PROJECT }]);
   await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_huge', kind: 'bare' }]);
@@ -182,32 +182,42 @@ test('复审 reloc-perf #14：超过单事务硬上限的来源不协调、不�
   const targetBefore = databaseDigest(fixture.current);
   const calls = [];
   const coordinateOversized = async (input, run) => { calls.push(input); await input.withLocks(run); return { state: 'completed' }; };
+  const untouched = async (message) => {
+    assert.deepEqual(calls, [], `${message}：不请求其它窗口让出`);
+    assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), sourceBefore, `${message}：没有收尾、没有来源备份`);
+    assert.equal(databaseDigest(fixture.current), targetBefore, `${message}：当前库不变`);
+    await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
+  };
   const first = await merge(fixture, database, { coordinateOversized });
-  assert.deepEqual([first.merged, first.deferred, first.failures], [[], [], []], '不是失败，也不是稍后重试');
-  assert.equal(first.blocked[0]?.code, 'runtime-data-set-merge-too-large-for-one-transaction');
-  assert.match(first.blocked[0].message, new RegExp(`约有 \\d+ 条记录，超过当前版本一次合并能安全处理的上限（${RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS} 条）`));
-  assert.match(first.blocked[0].message, /切换到这个库查看/);
-  assert.deepEqual(calls, [], '不请求其它窗口让出');
-  assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), sourceBefore, '没有收尾、没有来源备份');
-  assert.equal(databaseDigest(fixture.current), targetBefore);
-  await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
-  const record = await readLedgerRecord(fixture, fixture.alpha.id);
-  assert.deepEqual([record.state, record.maxRows], ['too-large', RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS]);
-  assert.ok(record.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
-  const state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
-  assert.deepEqual([state?.state, state?.rows], ['too-large', record.rows]);
-
+  assert.deepEqual([first.merged, first.blocked, first.failures], [[], [], []], '不是失败，也不是受阻');
+  assert.deepEqual(first.deferred.map((issue) => [issue.code, issue.size.rows > RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS]),
+    [[RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE, true]]);
+  assert.match(first.deferred[0].message, /要在所有窗口暂停时一次合并/);
+  await untouched('等待大库会话');
+  assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '等待大库会话不写账本');
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id), undefined, '界面按待合并显示');
   const again = await merge(fixture, database, { coordinateOversized });
-  assert.deepEqual([again.pendingSources, again.blocked[0]?.newly], [0, false], '上限不变就不再自动重试');
-  const explicit = await merge(fixture, database, { coordinateOversized, candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual([again.pendingSources, again.deferred[0]?.code], [1, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE], '每一批都照样等待');
+
+  // Above the streamed hard bound (injected at the same row count) it is too large: blocked, recorded, not retried while the bound stands.
+  const sizeLimits = { streamedRows: RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS };
+  const tooLarge = await merge(fixture, database, { coordinateOversized, sizeLimits });
+  assert.deepEqual([tooLarge.merged, tooLarge.deferred, tooLarge.failures], [[], [], []]);
+  assert.equal(tooLarge.blocked[0]?.code, 'runtime-data-set-merge-too-large-for-one-transaction');
+  assert.match(tooLarge.blocked[0].message, new RegExp(`约有 \\d+ 条记录，超过当前版本一次合并能安全处理的上限（${sizeLimits.streamedRows} 条）`));
+  assert.match(tooLarge.blocked[0].message, /切换到这个库查看/);
+  await untouched('太大');
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.deepEqual([record.state, record.maxRows], ['too-large', sizeLimits.streamedRows]);
+  assert.ok(record.rows > sizeLimits.streamedRows);
+  const known = await merge(fixture, database, { coordinateOversized, sizeLimits });
+  assert.deepEqual([known.pendingSources, known.blocked[0]?.newly], [0, false], '上限不变就不再自动重试');
+  const explicit = await merge(fixture, database, { coordinateOversized, sizeLimits, candidateIds: [fixture.alpha.id], requested: true });
   assert.deepEqual([explicit.blocked[0]?.code, explicit.blocked[0]?.requested], ['runtime-data-set-merge-too-large-for-one-transaction', true]);
-  // A version with another limit judges it again.
-  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
-  await fs.writeFile(file, JSON.stringify({ ...record, maxRows: record.maxRows - 1 }));
-  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id), undefined);
+  // Under another bound (the real one) it is judged again: waiting for the session.
   const judgedAgain = await merge(fixture, database, { coordinateOversized });
-  assert.deepEqual([judgedAgain.pendingSources, judgedAgain.blocked[0]?.newly], [1, true]);
-  assert.deepEqual(calls, []);
+  assert.deepEqual([judgedAgain.pendingSources, judgedAgain.deferred[0]?.code], [1, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]);
+  await untouched('重新判定');
 });
 
 test('未完成工作按中止收尾后合并：先备份来源，合并进来的对话在任何窗口都不会被启动恢复自动执行', async (t) => {
