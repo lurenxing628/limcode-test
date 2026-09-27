@@ -114,6 +114,16 @@ diff.open.requested
 
 按 `toolCallId` 聚合为 `diff-open` span。只记录成员数量和耗时，不记录文件路径或内容。
 
+## 按类型统计正文占用
+
+“历史与存储管理 → 查看存储占用”对当前库在目录统计之后附上按类型统计的正文（`backend/reliableKernel/runtimeContentUsage.ts`）；开发模式的 Inspect Reliability State 在 JSON 的 `contentUsage` 里给出同一份数据。
+
+- **只读元数据。** 由当前库自己的 RuntimeDatabase worker 在 reader 连接上执行一条固定查询（worker 请求 `contentUsage`，耗时计入 `database.request.summary` 的同名 requestKind）：`SELECT content_type, COUNT(*), SUM(byte_length), MAX(byte_length) FROM content_object GROUP BY content_type`。它只按顺序扫描唯一覆盖索引 `(content_type, sha256, byte_length)`，查询计划为 `SCAN content_object USING COVERING INDEX ux_content_object_01`，没有 `USE TEMP B-TREE FOR GROUP BY`，也不回表；不读 CAS 目录下的任何文件；在 reader 的 WAL 读快照上执行，不拿写锁，不阻塞写入。耗时与记录数成正比：实测 30 万条记录（库约 126 MiB，文件已在系统缓存中）约 50 毫秒；执行期间本窗口的其它数据库请求在 worker 队列里等待。
+- **只统计当前库。** 只有所选库正是本窗口已打开的 Runtime（dataSetId、rootInstanceId 和目录都一致）时才统计；当前库的 SQLite 只经它自己的 worker 读取，不另开连接。其它库、外来库和备份不做这项统计，视图写明“只对当前库提供”；本窗口还没有打开当前库时写明暂时无法统计。查询失败只在这一段报告原因，目录统计照常显示。
+- **按记录统计。** 每个分类显示记录数、合计大小和最大单个，分类下按大小列出具体类型（中文名加类型；Runtime 自有类型省略 `application/vnd.limcode.` 前缀）。同一正文（同一 sha256）以几种类型各有一条 ContentObject 时，每种类型都计入，所以各类合计可能大于 CAS 目录的实际大小；磁盘实际占用以同一视图上方的目录统计为准。不计算按 sha256 去重的合计，因为它需要临时 B 树。
+- **分类。** 源码写入的每个 `application/vnd.limcode.*` 类型都有归类，`effect-<kind>+json` 与 `effect-<kind>-receipt+json` 按 Effect 种类命名（新增 Effect 种类不起名就编译失败）。`text/plain`、`text/markdown`、`application/json` 被多处共用，单列为“通用文本”；`application/octet-stream` 归“进程原始输出”，并注明它也用于写入或删除前的原文件快照和未识别格式的附件；其余媒体类型归“附件”；未知的 vnd.limcode 类型和不合法的值原样列在“其它”。测试扫描源码中的类型字面量，新增类型没有归类时失败。
+- **删除对话目前不会释放正文空间。** 视图同样写明这一点。
+
 ## 查看
 
 离线汇总（只读诊断文件，不打开 SQLite）：
@@ -133,4 +143,4 @@ Extension Development Host 中运行：
 Limcode test: Inspect Reliability State (Development)
 ```
 
-输出中的 `diagnostics.events` 是原始脱敏事件，`diagnostics.spans` 是上述三类链路的有界聚合；`database.contextCasCache` 同时展示长上下文 CAS LRU 的 entries/bytes/hits/misses/evictions；`database.statementCache.writer/reader` 展示 SQLite worker 两个连接预编译语句 LRU 的 entries/prepares/hits/misses/evictions/busyBypasses/uncached/invalidations（只有计数，不含 SQL 文本）。
+输出中的 `diagnostics.events` 是原始脱敏事件，`diagnostics.spans` 是上述三类链路的有界聚合；`database.contextCasCache` 同时展示长上下文 CAS LRU 的 entries/bytes/hits/misses/evictions；`database.statementCache.writer/reader` 展示 SQLite worker 两个连接预编译语句 LRU 的 entries/prepares/hits/misses/evictions/busyBypasses/uncached/invalidations（只有计数，不含 SQL 文本）；`contentUsage` 是“按类型统计正文占用”一节的数据（只有类型、记录数和字节数）。

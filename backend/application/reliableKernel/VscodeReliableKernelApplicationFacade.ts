@@ -12,6 +12,7 @@ import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import { assertDataRootAvailable, ensureDataRootIdentity, settleDataRootRelocationBeforeOpen } from '../../reliableKernel/runtimeDataRootRelocation';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
+import { summarizeRuntimeContentUsage } from '../../reliableKernel/runtimeContentUsage';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import {
   createVscodeRootAuthority,
@@ -596,6 +597,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         runtimeKernelEpoch: this.product.application.database.binding.runtimeKernelEpoch
       },
       database,
+      // Metadata only: ContentObject records per type from the worker's covering-index aggregate.
+      contentUsage: summarizeRuntimeContentUsage(await this.product.application.database.contentUsage()),
       recovery: this.product.recoveryState(),
       diagnostics: await this.product.diagnostics.inspect({ scopeId: conversationId, limit: 200 }),
       ...(conversationId ? {

@@ -14,6 +14,7 @@ import type { ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
+import { executeRuntimeContentUsage } from './runtimeContentUsage';
 import {
   deriveCommittedParentHandling,
   executeClientCollaborationHistoryPage,
@@ -305,6 +306,11 @@ async function start(): Promise<void> {
       if (request.kind === 'childProcessCleanupMaterializationCandidates') {
         assertDatabaseBinding(reader, data.binding);
         respond({ type: 'response', id: request.id, ok: true, result: executeChildProcessCleanupMaterializationCandidates(reader) });
+        return;
+      }
+      if (request.kind === 'contentUsage') {
+        assertDatabaseBinding(reader, data.binding);
+        respond({ type: 'response', id: request.id, ok: true, result: executeRuntimeContentUsage(reader) });
         return;
       }
       if (request.kind === 'conversationRuntimeWork') {

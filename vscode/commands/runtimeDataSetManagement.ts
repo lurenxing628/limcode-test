@@ -18,6 +18,7 @@ import { summarizeRuntimeDataSet, type RuntimeDataSetSummary } from '../../backe
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
 import { EXCLUSIVE_MAINTENANCE_DEFAULTS } from '../../backend/reliableKernel/runtimeExclusiveMaintenance';
 import { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } from '../../backend/reliableKernel/runtimeStorageInspection';
+import { describeCurrentRuntimeContentUsage } from '../../backend/reliableKernel/runtimeContentUsage';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
 import { runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
@@ -228,7 +229,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   const candidate = await chooseDataSet(eligible, action.label, problems, mergeStates);
   if (!candidate || !canStartRuntimeDataSetUpgrade(context)) return;
   if (action.action === 'merge') { await mergeNow(context, startup, candidate, mergeStates.get(candidate.id)); return; }
-  if (action.action === 'storage') { await showRuntimeStorage(context, candidate); return; }
+  if (action.action === 'storage') { await showRuntimeStorage(context, candidate, startup); return; }
   if (action.action === 'history') {
     const readable = isPublishedOldDataSet(candidate) ? await upgradeHistoryBeforeRead(context, candidate) : candidate;
     if (readable && canStartRuntimeDataSetUpgrade(context)) await browseHistory(context, readable);
@@ -581,20 +582,28 @@ function describeError(error: unknown): string {
   return messages.join('；') || String(error);
 }
 
-export async function showRuntimeStorage(context: vscode.ExtensionContext, candidate?: VscodeRuntimeDataSetCandidate): Promise<void> {
+export async function showRuntimeStorage(
+  context: vscode.ExtensionContext,
+  candidate?: VscodeRuntimeDataSetCandidate,
+  startup?: ApplicationStartup
+): Promise<void> {
   await loadCommittedGlobalStatus(context);
   candidate ??= (await inspectVscodeRuntimeDataSets(pathsFor(context))).candidates.find(item => item.selected);
   if (!candidate) throw new Error('请先选择当前历史库。');
   const id = candidate.id;
   const report = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在统计历史库占用…' },
     () => inspectRuntimeDataSetStorage(pathsFor(context), id));
+  // Per content type only for the selected data set, read through this window's own open worker.
+  const contentUsage = await describeCurrentRuntimeContentUsage({ ...candidate, selected: report.selected },
+    (startup?.current() as Partial<HistoricalMergeHost> | undefined)?.product?.application.database, formatBytes);
   const labels = { sqlite: 'SQLite 数据库', cas: '历史正文与附件（CAS）', casTemporary: 'CAS 临时残留', processSpool: '进程输出暂存', diagnostics: '诊断日志', other: '其它运行文件', historicalBackups: '完整历史备份' };
   const lines = Object.entries(report.categories).map(([key, size]) =>
     `${labels[key as keyof typeof labels]}：${size.fileCount} 个文件，${formatBytes(size.bytes)}`);
   await showReadOnly(context, '历史库占用', [
     dataSetLabel(candidate), candidate.runtimeDataRootPath, '', ...lines,
     '', `合计：${report.total.fileCount} 个文件，${formatBytes(report.total.bytes)}`,
-    '这里统计文件逻辑大小，运行中的库可能继续变化。历史正文不是可随意清除的缓存；保留归档不会释放其磁盘占用。'
+    '这里统计文件逻辑大小，运行中的库可能继续变化。历史正文不是可随意清除的缓存；保留归档不会释放其磁盘占用。',
+    ...contentUsage
   ].join('\n'));
 }
 

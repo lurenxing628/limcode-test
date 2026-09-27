@@ -133,6 +133,7 @@ function fixture({
     '../../backend/reliableKernel/runtimeStorageInspection': {
       deleteUnselectedRuntimeDataSet: async (_paths, id, expected) => calls.push(['delete', id, expected])
     },
+    '../../backend/reliableKernel/runtimeContentUsage': { describeCurrentRuntimeContentUsage: async () => [] },
     '../../shared/extensionIdentity': { EXTENSION_COMMAND_IDS: { resetDevelopmentData: 'reset' } },
     '../runtimeDataSetUpgradeLifetime': lifetime,
     '../runtimeExclusiveMaintenance': {

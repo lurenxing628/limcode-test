@@ -41,6 +41,7 @@ import type {
   ToolFactsSnapshot
 } from './databaseWorkerProtocol';
 import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
+import type { RuntimeContentUsageRow } from './runtimeContentUsage';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -284,6 +285,15 @@ export class RuntimeDatabase {
     return this.request<ChildProcessCleanupMaterializationCandidate[]>({
       kind: 'childProcessCleanupMaterializationCandidates'
     });
+  }
+
+  /**
+   * ContentObject records per content_type (count, byte sum, largest), aggregated on the worker's
+   * reader connection from the covering (content_type, sha256, byte_length) index alone: no CAS
+   * file is read and writers are never blocked. Bytes shared by several types count once per type.
+   */
+  public async contentUsage(): Promise<RuntimeContentUsageRow[]> {
+    return this.request<RuntimeContentUsageRow[]>({ kind: 'contentUsage' });
   }
 
   /**

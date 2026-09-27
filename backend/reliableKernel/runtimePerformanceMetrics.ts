@@ -20,6 +20,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'effectReceiptReconciliationCandidates'
   | 'childConversationOriginCandidates'
   | 'childProcessCleanupMaterializationCandidates'
+  | 'contentUsage'
   | 'contextMaterialization'
   | 'contextContentMaterialization'
   | 'modelStreamEvent'

@@ -225,6 +225,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
   'tests/reliable-kernel/runtime-datasets.test.mjs',
   'tests/reliable-kernel/runtime-dataset-history-storage.test.mjs',
+  'tests/reliable-kernel/runtime-content-usage.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-state.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation.test.mjs',

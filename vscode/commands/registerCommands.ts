@@ -80,7 +80,7 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     }
     if (conversationId === '__storage__') {
       const { showRuntimeStorage } = await import('./runtimeDataSetManagement');
-      await showRuntimeStorage(context);
+      await showRuntimeStorage(context, undefined, startup);
       return;
     }
     const snapshot = await backendApp.inspectReliability(conversationId || undefined);
