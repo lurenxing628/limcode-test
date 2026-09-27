@@ -63,7 +63,9 @@ async function startApplication(
     let application: Awaited<ReturnType<typeof VscodeReliableKernelApplicationFacade.open>>;
     try {
       application = await openWithRuntimeDataSetSelection(context, () => VscodeReliableKernelApplicationFacade.open(context, {
-        onRuntimeWait: (wait) => { if (activeStartup === startup) openingWait.onWait(wait); }
+        onRuntimeWait: (wait) => { if (activeStartup === startup) openingWait.onWait(wait); },
+        // Taken: nothing stale stays on screen while the Runtime opens (or a library has to be picked).
+        onRuntimeWaitOver: () => { if (activeStartup === startup) openingWait.settle(); }
       }));
     } finally {
       openingWait.end();

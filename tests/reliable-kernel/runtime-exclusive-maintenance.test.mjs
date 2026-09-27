@@ -1404,6 +1404,31 @@ test('锁内执行操作期间持续刷新请求与“维护进行中”标记�
   await assert.rejects(fs.access(path.join(runtimeDataRootAdmissionClaimPath(root), 'activity.json')), 'gone with the claim');
 });
 
+test('盲审 #9：拿到锁后告诉等待方等待已经结束（onAcquired，在打开之前），不必等到打开完成', async (t) => {
+  const { root } = await createRoot(t);
+  const free = [];
+  assert.equal(await openUnderCurrentDataRootAdmission(async () => root, async () => { free.push('open'); return 'opened'; }, 5,
+    { onAcquired: () => free.push('acquired') }), 'opened');
+  assert.deepEqual(free, ['acquired', 'open'], 'also without a wait');
+  let holding;
+  const held = new Promise((resolve) => { holding = resolve; });
+  let letGo;
+  const gate = new Promise((resolve) => { letGo = resolve; });
+  const holder = withRuntimeDataRootAdmission(root, async () => { holding(); await gate; });
+  await held;
+  const log = [];
+  const opening = new Promise((resolve) => setImmediate(resolve)).then(() => openUnderCurrentDataRootAdmission(async () => root, async () => {
+    log.push('open');
+    return 'opened';
+  }, 5, { onWait: () => { if (log.at(-1) !== 'wait') log.push('wait'); }, onAcquired: () => log.push('acquired') }));
+  await delay(1_300);
+  assert.deepEqual(log, ['wait']);
+  letGo();
+  await holder;
+  assert.equal(await opening, 'opened');
+  assert.deepEqual(log, ['wait', 'acquired', 'open']);
+});
+
 test('持有方没有发布标记时只说在等其它窗口；标记属于别的持有方时不采用；心跳停止时报告没有进展，但从不越过锁', async (t) => {
   const { root } = await createRoot(t);
   await assert.rejects(withRuntimeMaintenanceActivity({ operation: 'x', description: '整理' }, async () => 1), /只能在持有/);

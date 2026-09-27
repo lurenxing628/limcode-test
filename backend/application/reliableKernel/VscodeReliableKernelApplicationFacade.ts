@@ -179,13 +179,19 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   /**
    * `onRuntimeWait` reports a long wait on the data-root admission or the scope maintenance claim
    * (another window migrating the data directory, merging, or opening), with the holder's published
-   * activity, so the window can say why; the wait itself never ends early.
+   * activity, so the window can say why; the wait itself never ends early. `onRuntimeWaitOver` is
+   * called whenever one of those claims was taken: what was shown about waiting for it is over.
    */
   public static async open(
     context: vscode.ExtensionContext,
-    options: { onRuntimeWait?(wait: RuntimeClaimWait): void } = {}
+    options: { onRuntimeWait?(wait: RuntimeClaimWait): void; onRuntimeWaitOver?(): void } = {}
   ): Promise<VscodeReliableKernelApplicationFacade> {
-    const wait = options.onRuntimeWait ? { onWait: options.onRuntimeWait } : undefined;
+    const wait = options.onRuntimeWait || options.onRuntimeWaitOver
+      ? {
+        ...(options.onRuntimeWait ? { onWait: options.onRuntimeWait } : {}),
+        ...(options.onRuntimeWaitOver ? { onAcquired: options.onRuntimeWaitOver } : {})
+      }
+      : undefined;
     const getPaths = (): StoragePaths => createVscodeStoragePaths(resolveDataRootUri(context));
     let facade: VscodeReliableKernelApplicationFacade | undefined;
     // The data-root admission serializes placement/cutover across every workspace scope sharing

@@ -82,6 +82,11 @@ export interface RuntimeClaimWait {
 export interface RuntimeClaimWaitOptions {
   /** Called on every poll once a wait lasted reportAfterMs; the wait itself never ends early. */
   onWait?(wait: RuntimeClaimWait): void;
+  /**
+   * Called once the claim was taken, before the operation runs (whether or not it had to wait):
+   * whatever the window showed about waiting for it is over. Further claims may follow.
+   */
+  onAcquired?(): void;
 }
 
 export interface RuntimeMaintenanceMetadata {
@@ -282,6 +287,10 @@ async function withRuntimeClaim<T>(
   // of running unprotected after the outer scope already released it.
   if (inherited?.active) return operation();
   const acquired = await acquireMaintenanceClaim(claimPath, targetPath, wait);
+  if (wait?.onAcquired) {
+    try { wait.onAcquired(); }
+    catch (error) { console.warn('[LimCode] Runtime claim wait observer failed.', error); }
+  }
   const nextScope = new Map(scope);
   nextScope.set(claimPath, acquired);
   let operationFailed = false;

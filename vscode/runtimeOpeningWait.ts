@@ -73,6 +73,12 @@ export interface RuntimeOpeningWaitPresenter {
   announce(description: string): void;
   /** Called on every poll of a long wait (RuntimeClaimWaitOptions.onWait); replaces an announcement. */
   onWait(wait: RuntimeClaimWait): void;
+  /**
+   * A claim was taken (RuntimeClaimWaitOptions.onAcquired): the wait shown so far is over. The
+   * notification closes and the shell status clears while the Runtime goes on opening (or a library
+   * has to be picked); a later wait, on another claim, is shown anew.
+   */
+  settle(): void;
   /** The Runtime opened or failed: the notification closes and the shell status clears. */
   end(): void;
 }
@@ -88,8 +94,8 @@ export function createRuntimeOpeningWaitPresenter(
   onStatus: (status: RuntimeOpeningWaitStatus | undefined) => void
 ): RuntimeOpeningWaitPresenter {
   let ended = false;
-  let finish: (() => void) | undefined;
-  let progress: vscode.Progress<{ message?: string }> | undefined;
+  /** The notification of the wait being shown; none before, between and after waits. */
+  let shown: { finish: () => void; progress?: vscode.Progress<{ message?: string }> } | undefined;
   let shownStatus: string | undefined;
   let shownMessage: string | undefined;
   let warningOpen = false;
@@ -97,22 +103,34 @@ export function createRuntimeOpeningWaitPresenter(
   const present = (status: RuntimeOpeningWaitStatus, message: string): void => {
     const changed = message !== shownMessage;
     shownMessage = message;
-    if (!finish) {
+    if (!shown) {
+      let finish: () => void = () => undefined;
       const done = new Promise<void>((resolve) => { finish = resolve; });
+      const notification: { finish: () => void; progress?: vscode.Progress<{ message?: string }> } = { finish };
+      shown = notification;
       // The notification starts with the latest text, whenever VS Code runs this.
       void vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification, title: `LimCode ${status.title}`, cancellable: false
       }, (reporter) => {
-        progress = reporter;
-        reporter.report({ message: shownMessage });
+        notification.progress = reporter;
+        if (shown === notification) reporter.report({ message: shownMessage });
         return done;
       });
     } else if (changed) {
-      progress?.report({ message });
+      shown.progress?.report({ message });
     }
     if (status.description !== shownStatus) {
       shownStatus = status.description;
       onStatus(status);
+    }
+  };
+  const close = (): void => {
+    shown?.finish();
+    shown = undefined;
+    shownMessage = undefined;
+    if (shownStatus !== undefined) {
+      shownStatus = undefined;
+      onStatus(undefined);
     }
   };
   return {
@@ -131,9 +149,11 @@ export function createRuntimeOpeningWaitPresenter(
         warningOpen = false;
         nextWarningAt = Date.now() + RUNTIME_OPENING_WAIT_LIMITS.repeatWarnMs;
         if (choice === undefined) return;
-        if (ended) {
+        if (ended || !shown) {
           // The warning outlived the wait: VS Code cannot take it back, so answer it.
-          void vscode.window.showInformationMessage('LimCode 已经打开，不需要再等待；本窗口没有关闭。');
+          void vscode.window.showInformationMessage(ended
+            ? 'LimCode 已经打开，不需要再等待；本窗口没有关闭。'
+            : 'LimCode 已经不需要再等待，正在打开；本窗口没有关闭。');
           return;
         }
         if (choice === RUNTIME_OPENING_WAIT_ACTIONS.closeWindow) {
@@ -141,11 +161,13 @@ export function createRuntimeOpeningWaitPresenter(
         }
       }, () => { warningOpen = false; });
     },
+    settle() {
+      if (!ended) close();
+    },
     end() {
       if (ended) return;
       ended = true;
-      finish?.();
-      if (shownStatus !== undefined) onStatus(undefined);
+      close();
     }
   };
 }

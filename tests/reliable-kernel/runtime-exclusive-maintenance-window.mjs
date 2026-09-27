@@ -123,7 +123,8 @@ const hostBootId = `${name}-boot-${boot}`;
 const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
 const openStarted = Date.now();
 database = await openUnderCurrentDataRootAdmission(async () => root,
-  () => kernel.RuntimeDatabase.open(authority, { hostBootId }), 5, { onWait: (wait) => openingWait.onWait(wait) });
+  () => kernel.RuntimeDatabase.open(authority, { hostBootId }), 5,
+  { onWait: (wait) => openingWait.onWait(wait), onAcquired: () => openingWait.settle() });
 openingWait.end();
 const paths = authority.expectedPaths();
 await emit('opened', { hostBootId, startedAt, openMs: Date.now() - openStarted });

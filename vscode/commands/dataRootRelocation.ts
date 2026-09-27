@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
+import * as path from 'node:path';
 import * as vscode from 'vscode';
 import {
   GlobalStatusPendingRelocationConflictError, LIMCODE_GLOBAL_STATUS_FILE, loadCommittedGlobalStatus, resolveDataRootUri, sameFsPath,
@@ -9,7 +11,7 @@ import { RELOCATED_WORK_REPORTED_ONLY } from '../../backend/application/reliable
 import type { RuntimeRootPaths } from '../../backend/reliableKernel/contracts';
 import { ownProcessStartIdentity } from '../../backend/reliableKernel/runtimeClaimPrimitives';
 import {
-  abandonStagedDataRootRelocation, assertDataRootAvailable, clearDataRootMovedNotice, completeDataRootRelocation,
+  abandonStagedDataRootRelocation, assertDataRootAvailable, clearDataRootMovedNotice, completeDataRootRelocation, DATA_ROOT_RELOCATION_MARKER_FILE,
   dataRootRelocationCleanupState, dataRootRelocationOwnerState, DataRootRelocationError, deleteOldDataRoot, ensureDataRootIdentity,
   finalizeDataRootRelocation, findDataRootRelocationCopy, formatBytes, inspectDataRootForReturn, invalidateDataRootRelocationRecord,
   isDataRootRelocationTargetInvisible, undoUnpublishedDataRootRelocation,
@@ -81,6 +83,13 @@ export async function relocateDataRoot(context: vscode.ExtensionContext, startup
   const status = await loadCommittedGlobalStatus(context);
   if (status.pendingRelocation && ownerOf(status.pendingRelocation) !== 'dead') {
     if (!isOwnPending(status.pendingRelocation) || relocationRunning) {
+      // Another window's relocation that failed and whose undo did not finish moves nothing: say so.
+      if (!relocationRunning && await relocationPhase(status.pendingRelocation) === 'unfinished') {
+        await tell(ask, '上次的迁移还没有撤销完', [
+          `${unfinishedElsewhere(status.pendingRelocation)}在那个窗口里再点一次“迁移数据目录”，或关闭、重载那个窗口后会自动处理，之后才能开始新的迁移。`
+        ]);
+        return;
+      }
       await tell(ask, '已有迁移正在进行', [relocationRunning
         ? '本窗口正在迁移数据目录，请等它完成。'
         : '另一个 LimCode 窗口正在迁移数据目录，请等它完成后再试。']);
@@ -869,16 +878,51 @@ function isUndoHeld(error: unknown): boolean {
 
 /**
  * Before the Runtime opens: a relocation recorded as in progress whose process is gone is undone
- * (its changes in the target); one still running returns the text of a progress notification for
- * a window that reloaded for it and now waits on the old directory's admission.
+ * (its changes in the target); one still moving data in a live process returns the text of a
+ * progress notification for a window that reloaded for it and now waits on the old directory's
+ * admission. One that failed in a live process and whose undo did not finish only gets a warning.
  */
 export async function beforeDataRootOpen(context: vscode.ExtensionContext): Promise<string | undefined> {
   const status = await loadCommittedGlobalStatus(context);
   const pending = status.pendingRelocation;
   if (!pending) return undefined;
-  if (ownerOf(pending) !== 'dead') return '正在迁移数据目录，完成后自动打开';
-  await settleInterruptedRelocation(context, pending);
+  const owner = ownerOf(pending);
+  if (owner === 'dead') {
+    await settleInterruptedRelocation(context, pending);
+    return undefined;
+  }
+  const phase = await relocationPhase(pending);
+  if (owner === 'alive' && phase === 'running') return '正在迁移数据目录，完成后自动打开';
+  if (phase === 'unfinished') {
+    void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${unfinishedElsewhere(pending)}关闭或重载那个窗口后会自动处理。`);
+  }
   return undefined;
+}
+
+/**
+ * A relocation recorded as in progress (by a live or unknown process): still moving data
+ * ('running'; also before its record in the target was written), or failed with its undo not
+ * finished ('unfinished': its record in the target says 'undoing' or 'held', or the copied data it
+ * renamed aside is still beside the target). 'unknown' when the target's record cannot be read.
+ */
+async function relocationPhase(pending: PendingDataRootRelocation): Promise<'running' | 'unfinished' | 'unknown'> {
+  let marker: { relocationId?: unknown; state?: unknown } | undefined;
+  try {
+    marker = JSON.parse(await fs.readFile(path.join(pending.targetRootPath, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code !== 'ENOENT' && code !== 'ENOTDIR') return 'unknown';
+  }
+  if (marker?.relocationId === pending.relocationId) {
+    return marker.state === 'undoing' || marker.state === 'held' ? 'unfinished' : 'running';
+  }
+  // No record of it: not written yet, or an undo removed it right before the copy renamed aside comes back.
+  const copy = await findDataRootRelocationCopy(pending.targetRootPath, pending.relocationId).catch(() => undefined);
+  return copy ? 'unfinished' : 'running';
+}
+
+function unfinishedElsewhere(pending: PendingDataRootRelocation): string {
+  return `另一个 LimCode 窗口上次迁移数据目录没有成功，新目录（${pending.targetRootPath}）里的改动还没有撤销完；`;
 }
 
 /**

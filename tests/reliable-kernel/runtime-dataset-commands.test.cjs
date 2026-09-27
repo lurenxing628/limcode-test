@@ -376,8 +376,17 @@ function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, kept
     './commands/runtimeDataSetManagement': management,
     // No data-directory move in progress: nothing to wait for or finish.
     './commands/dataRootRelocation': { async beforeDataRootOpen() { return undefined; }, async afterDataRootOpened() {} },
-    // Opening never waits here: the presenter only has to exist.
-    './runtimeOpeningWait': loadSource('vscode/runtimeOpeningWait.ts', { vscode: {} }),
+    // The real presenter: its notification is recorded.
+    './runtimeOpeningWait': loadSource('vscode/runtimeOpeningWait.ts', { vscode: {
+      ProgressLocation: { Notification: 15 },
+      window: {
+        async withProgress(options, task) {
+          events.push(['opening-notification', options.title]);
+          await task({ report() {} });
+          events.push(['opening-notification-closed']);
+        }
+      }
+    } }),
     './watchers/GlobalSettingsWatcher': { registerGlobalSettingsWatcher() {} },
     './runtimeExclusiveMaintenance': {
       startExclusiveMaintenanceParticipant(host, options) {
@@ -861,7 +870,7 @@ test('extension merges old libraries online only after Runtime ready and after t
   f.activate(f.context);
   const ready = f.startup.wait();
   await f.opening.promise;
-  assert.deepEqual(Object.keys(f.openOptions[0]), ['onRuntimeWait'], 'Runtime open 不再带启动前合并钩子，只带等待说明');
+  assert.deepEqual(Object.keys(f.openOptions[0]), ['onRuntimeWait', 'onRuntimeWaitOver'], 'Runtime open 不再带启动前合并钩子，只带等待说明');
   f.opened.resolve(f.application);
   await ready;
   await f.upgradeStarted.promise;
@@ -919,6 +928,31 @@ test('the reason kept across a reload is judged by when this window started open
   assert.ok(typeof openedAt === 'number' && openedAt >= beforeActivation && openedAt <= activated, `activation start, not now (${openedAt})`);
   assert.deepEqual(f.events.filter(event => Array.isArray(event) && event[0] === 'warning-message'),
     [['warning-message', 'Fixture 重载前：迁移数据目录没有进行：另一个窗口先发起了合并旧聊天记录']]);
+});
+
+test('a wait on the Runtime is settled once its lock was taken: the notification closes and the shell stops saying it waits, before the Runtime finished opening (blind review #9)', async t => {
+  const f = extensionEntryFixture();
+  t.after(async () => {
+    f.opened.resolve(f.application);
+    f.finishUpgrade.resolve();
+    await f.deactivate();
+  });
+  f.activate(f.context);
+  const ready = f.startup.wait();
+  await f.opening.promise;
+  const [{ onRuntimeWait, onRuntimeWaitOver }] = f.openOptions;
+  onRuntimeWait({ waitedMs: 1_500, holderWaitedMs: 1_500, activity: {
+    operation: 'data-root-migration', description: '迁移数据目录', stage: '正在切换到新数据目录', runningMs: 9_000, heartbeatAgeMs: 500, stale: false
+  } });
+  await new Promise(setImmediate);
+  assert.match(f.startup.waiting()?.description ?? '', /另一个窗口正在迁移数据目录/);
+  onRuntimeWaitOver();
+  for (let i = 0; i < 5; i += 1) await new Promise(setImmediate);
+  assert.equal(f.startup.waiting(), undefined, 'the shell no longer says it waits while the Runtime opens');
+  assert.deepEqual(f.events.filter(event => Array.isArray(event) && event[0].startsWith('opening-notification')),
+    [['opening-notification', 'LimCode 正在等待另一个窗口'], ['opening-notification-closed']], 'closed before the Runtime opened');
+  f.opened.resolve(f.application);
+  await ready;
 });
 
 test('deactivation marks this window leaving at once and removes its registration only after its Runtime closed (blind review #1)', async t => {

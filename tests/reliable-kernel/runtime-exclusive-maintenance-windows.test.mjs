@@ -220,6 +220,56 @@ test('打开运行时等待时说明原因：外壳只写持有方在做什么�
   assert.deepEqual(events.infos, ['LimCode 已经打开，不需要再等待；本窗口没有关闭。']);
 });
 
+test('盲审 #9：拿到锁之后等待提示立即收起、外壳不再说在等待（不与随后的选择框并存）；之后再等别的锁时重新提示；收起后才点的警告按钮只作说明', async () => {
+  const events = { progress: [], infos: [], commands: [] };
+  const answers = [];
+  const vscode = {
+    ProgressLocation: { Notification: 15 },
+    window: {
+      withProgress: async (options, task) => {
+        events.progress.push(['open', options.title]);
+        await task({ report: () => {} });
+        events.progress.push(['closed']);
+      },
+      showWarningMessage: () => answers.shift() ?? new Promise(() => {}),
+      showInformationMessage: async (message) => { events.infos.push(message); }
+    },
+    commands: { executeCommand: async (id) => { events.commands.push(id); } }
+  };
+  const opening = loadLayerModule('vscode/runtimeOpeningWait.ts', { vscode });
+  const migrating = { operation: 'data-root-migration', description: '迁移数据目录', stage: '正在切换到新数据目录', runningMs: 9_000, heartbeatAgeMs: 500, stale: false };
+  const statuses = [];
+  const presenter = opening.createRuntimeOpeningWaitPresenter((status) => statuses.push(status?.description));
+  presenter.announce('正在迁移数据目录，完成后自动打开；未发送的输入已保留。');
+  presenter.onWait({ waitedMs: 1_000, holderWaitedMs: 1_000, activity: migrating });
+  presenter.settle();
+  await delay(10);
+  assert.deepEqual(events.progress, [['open', 'LimCode 正在等待另一个窗口'], ['closed']]);
+  assert.equal(statuses.at(-1), undefined, 'the shell no longer says it waits while the Runtime opens');
+  presenter.settle();
+  // Another claim waited for afterwards (another window opening): shown anew.
+  presenter.onWait({ waitedMs: 1_200, holderWaitedMs: 1_200 });
+  await delay(10);
+  assert.deepEqual(events.progress.at(-1), ['open', 'LimCode 正在等待其它窗口']);
+  presenter.end();
+  await delay(10);
+  assert.deepEqual(events.progress.at(-1), ['closed']);
+  assert.deepEqual(statuses, ['正在迁移数据目录，完成后自动打开；未发送的输入已保留。',
+    '另一个窗口正在迁移数据目录（正在切换到新数据目录），完成后自动打开；未发送的输入已保留。', undefined,
+    '正在等待其它 LimCode 窗口释放数据目录，完成后自动打开；未发送的输入已保留。', undefined]);
+  // A warning still open when the wait was over: a button pressed then is answered, nothing closes.
+  let answer;
+  answers.push(new Promise((resolve) => { answer = resolve; }));
+  const warned = opening.createRuntimeOpeningWaitPresenter(() => {});
+  warned.onWait({ waitedMs: 30_000, holderWaitedMs: 30_000, activity: { ...migrating, heartbeatAgeMs: 20_000, stale: true } });
+  warned.settle();
+  answer('关闭窗口');
+  await delay(10);
+  assert.deepEqual(events.commands, []);
+  assert.deepEqual(events.infos, ['LimCode 已经不需要再等待，正在打开；本窗口没有关闭。']);
+  warned.end();
+});
+
 test('用户的操作让先给较早的请求后，只有为那个请求让出时才把原因带过重载；自动调用与别的请求都不带', async (t) => {
   const { binding, paths } = await createRoot(t);
   const state = new Map();

@@ -26,6 +26,8 @@ function loadSource(relative, dependencies) {
     require(name) {
       if (name === 'node:crypto') return crypto;
       if (name === 'node:os') return os;
+      if (name === 'node:fs/promises') return fs.promises;
+      if (name === 'node:path') return path;
       if (!Object.prototype.hasOwnProperty.call(dependencies, name)) throw new Error(`Unexpected source dependency: ${name}`);
       return dependencies[name];
     }
@@ -190,6 +192,7 @@ function fixture({
         abandonOptions.push(plain(options ?? {}));
         if (abandonError) throw abandonError;
       },
+      DATA_ROOT_RELOCATION_MARKER_FILE: '.limcode-data-root-relocation.json',
       dataRootRelocationOwnerState: () => ownerState,
       inspectDataRootForReturn: async (root) => { calls.push(['inspect-return', root]); return returnUsable ? { usable: true } : { usable: false, message: '没有当前库' }; },
       assertDataRootAvailable: async () => { if (!currentAvailable) throw new Error('unavailable'); },
@@ -721,6 +724,46 @@ test('启动前：迁移进程还在时显示“正在迁移数据目录”；�
   await blocked.commands.relocateDataRoot(blocked.context, blocked.startup, blocked.request);
   assert.deepEqual(blocked.kinds(), ['recover', 'prompt']);
   assert.match(JSON.stringify(blocked.prompts[0]), /上次中断的数据目录迁移还没有撤销完/);
+});
+
+test('盲审 #9：另一个窗口上次的迁移失败、撤销没做完（发起进程仍在）时不说“正在迁移”：启动时只警告，迁移命令说明要先撤销；发起进程状态无法确认时启动不宣布', async () => {
+  const target = path.join(WORK, 'unfinished-target');
+  fs.mkdirSync(target, { recursive: true });
+  const markerPath = path.join(target, '.limcode-data-root-relocation.json');
+  const relocationId = '00000000-0000-4000-8000-0000000000a9';
+  const pending = { relocationId, sourceRootPath: SOURCE, targetRootPath: target, startedAt: 'x', processId: 1 };
+  const marker = (state) => fs.writeFileSync(markerPath, JSON.stringify({ relocationId, state, targetRootPath: target }));
+  const warnings = (f) => f.calls.filter((call) => call[0] === 'warning').map((call) => call[1]);
+  // Still moving data: announced, nothing else.
+  marker('staging');
+  const moving = fixture({ pendingRelocation: pending, ownerState: 'alive' });
+  assert.equal(await moving.commands.beforeDataRootOpen(moving.context), '正在迁移数据目录，完成后自动打开');
+  assert.deepEqual(warnings(moving), []);
+  // Failed, its undo not finished: nothing to wait for; warned; never undone under its live process.
+  marker('undoing');
+  const undoing = fixture({ pendingRelocation: pending, ownerState: 'alive' });
+  assert.equal(await undoing.commands.beforeDataRootOpen(undoing.context), undefined);
+  assert.ok(!undoing.kinds().includes('recover'));
+  assert.deepEqual(warnings(undoing), [`Limcode test：另一个 LimCode 窗口上次迁移数据目录没有成功，新目录（${target}）里的改动还没有撤销完；关闭或重载那个窗口后会自动处理。`]);
+  const command = fixture({ pendingRelocation: pending, ownerState: 'alive' });
+  await command.commands.relocateDataRoot(command.context, command.startup, command.request);
+  assert.ok(!command.kinds().includes('open-dialog'));
+  assert.equal(command.prompts[0].title, '上次的迁移还没有撤销完');
+  assert.match(JSON.stringify(command.prompts[0]), /另一个 LimCode 窗口上次迁移数据目录没有成功.*在那个窗口里再点一次“迁移数据目录”/);
+  // Its record already gone but the copy it renamed aside still beside the target: not undone either.
+  fs.rmSync(markerPath);
+  const aside = fixture({ pendingRelocation: pending, ownerState: 'alive', copyAside: `${target}.limcode-copied-1` });
+  assert.equal(await aside.commands.beforeDataRootOpen(aside.context), undefined);
+  assert.equal(warnings(aside).length, 1);
+  // The process cannot be confirmed: not announced as migrating.
+  marker('staging');
+  const unknown = fixture({ pendingRelocation: pending, ownerState: 'unknown' });
+  assert.equal(await unknown.commands.beforeDataRootOpen(unknown.context), undefined);
+  assert.ok(!unknown.kinds().includes('warning') && !unknown.kinds().includes('recover'));
+  // Still moving data: the command says so as before.
+  const busy = fixture({ pendingRelocation: pending, ownerState: 'alive' });
+  await busy.commands.relocateDataRoot(busy.context, busy.startup, busy.request);
+  assert.equal(busy.prompts[0].title, '已有迁移正在进行');
 });
 
 test('另一个安装把这个目录的数据迁走了（reloc2 #7）：打开时不阻塞地警告会分叉，可以改用新目录或不再提醒；本安装自己的标记直接清掉', async () => {
