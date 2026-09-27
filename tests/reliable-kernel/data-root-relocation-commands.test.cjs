@@ -33,7 +33,7 @@ function fixture({
   picked = TARGET, plan = {}, answers = [], busy = [false], exclusive = 'completed', completeError, cleanup,
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
-  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice
+  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold
 } = {}) {
   const calls = [];
   const progressOptions = [];
@@ -163,7 +163,12 @@ function fixture({
       finalizeDataRootRelocation: async (root) => { calls.push(['finalize', root]); },
       readDataRootMovedNotice: async (root) => { calls.push(['read-moved', root]); return movedNotice; },
       clearDataRootMovedNotice: async (root, installation) => { calls.push(['clear-moved', root, installation]); return false; },
-      sweepDataRootRelocationLeftovers: async (root) => { calls.push(['sweep', root]); return { removed: [] }; }
+      sweepDataRootRelocationLeftovers: async (root) => { calls.push(['sweep', root]); return { removed: [] }; },
+      findDataRootRelocationCopy: async (root, relocationId) => { calls.push(['find-copy', root, relocationId]); return copyAside; },
+      readDataRootRelocationHold: async (root) => { calls.push(['read-hold', root]); return hold; }
+    },
+    '../../backend/reliableKernel/runtimeExclusiveMaintenance': {
+      clearExclusiveMaintenanceKey: async (_paths, operation, operationKey) => { calls.push(['clear-key', operation, operationKey]); }
     },
     '../../backend/reliableKernel/runtimeHostControl': {
       withRuntimeDataRootAdmission: async (root, run) => { calls.push(['admission', root]); return run(); }
@@ -220,8 +225,14 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
   assert.deepEqual(f.kinds(), [
     'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'locks', 'busy?', 'freeze', 'busy?', 'busy?', 'report-stage', 'close-runtime',
-    'complete', 'report-stage', 'status', 'thaw', 'global-state', 'command'
+    'complete', 'report-stage', 'status', 'thaw', 'clear-key', 'global-state', 'command'
   ]);
+  // reloc3 #6: only the preparation can be cancelled; the coordinated part has no cancel button.
+  assert.deepEqual(plain(f.progressOptions).filter(({ title }) => title.startsWith('正在迁移数据目录')).map(({ title, cancellable }) => [title, cancellable]),
+    [['正在迁移数据目录：准备中（可以取消）', true], ['正在迁移数据目录（已不能取消）', false]]);
+  const pendingId = f.calls.find((call) => call[0] === 'status')[1].pendingRelocation.relocationId;
+  assert.deepEqual(f.calls.find((call) => call[0] === 'clear-key'), ['clear-key', 'data-root-relocation', `data-root-relocation:${TARGET}#${pendingId}`],
+    'reloc3 #6：本次尝试的协调键用完即清，不在账本里累积');
   assert.deepEqual(f.calls.filter((call) => call[0] === 'report-stage').map((call) => call[1]), ['正在关闭本窗口的运行时', '正在切换到新数据目录'],
     '等着打开的窗口看得到阶段（复制与核对的阶段经 onProgress 同样报告）');
   assert.equal(f.calls.find((call) => call[0] === 'plan')[2], true, '行数经本窗口打开的数据库统计');
@@ -258,7 +269,7 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
 test('复审 bulk #6：迁移进度可以取消；在线预复制期间取消时停止准备、清除进行中记录、不协调不重载，提示已取消', async () => {
   const f = fixture({ answers: [{ choice: 'relocate', include: [] }], cancelStage: true });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
-  assert.equal(f.progressOptions.find((options) => options.title === '正在迁移数据目录')?.cancellable, true);
+  assert.deepEqual(plain(f.progressOptions).filter(({ title }) => title.startsWith('正在迁移数据目录')).map(({ title, cancellable }) => [title, cancellable]), [['正在迁移数据目录：准备中（可以取消）', true]]);
   assert.ok(!f.kinds().includes('exclusive') && !f.kinds().includes('close-runtime') && !f.kinds().includes('complete'));
   assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
   assert.match(JSON.stringify(f.prompts.at(-1)), /迁移已取消/);
@@ -418,6 +429,27 @@ test('数据目录不可用：可以重试、回到旧目录、选择其它已�
   await noPrevious.commands.offerDataRootRecovery(noPrevious.context, noPrevious.startup, '数据目录不可用');
   assert.deepEqual(noPrevious.calls.find((call) => call[0] === 'error').slice(2), ['重试', '选择其它目录…', '使用默认目录…']);
 
+  // reloc3 #4: an error that retrying will not fix (no permission, a path that became a file) or an
+  // unfinished relocation into the directory: the other ways out are offered too.
+  for (const reason of ['inaccessible', 'relocating']) {
+    const stuck = fixture({ host: false, recoveryChoice: undefined });
+    await stuck.commands.offerDataRootRecovery(stuck.context, stuck.startup, '数据目录不可用', reason);
+    assert.deepEqual(stuck.calls.find((call) => call[0] === 'error').slice(2), ['重试', '选择其它目录…', '使用默认目录…'], reason);
+  }
+
+  // reloc3 #6: the unavailable directory's data was moved (its notice stays after the old data is deleted): "改用迁移后的目录".
+  const movedAway = fixture({
+    host: false, recoveryChoice: '改用迁移后的目录', nativeAnswers: ['改用并重载'],
+    movedNotice: { targetRootPath: '/mnt/new/limcode', relocationId: 'r-9', movedAt: '2026-09-26T08:30:00.000Z', installation: { id: '/other/installation', label: 'VS Code（b）' } }
+  });
+  movedAway.status.dataRootPath = '/mnt/usb/limcode';
+  await movedAway.commands.offerDataRootRecovery(movedAway.context, movedAway.startup, '数据目录不可用', 'empty');
+  const offered = movedAway.calls.find((call) => call[0] === 'error');
+  assert.match(offered[1], /已在 2026-09-26 08:30 由 VS Code（b） 迁移到 \/mnt\/new\/limcode/);
+  assert.deepEqual(offered.slice(2), ['重试', '改用迁移后的目录', '选择其它目录…', '使用默认目录…']);
+  assert.equal(movedAway.calls.find((call) => call[0] === 'status')[1].dataRootPath, '/mnt/new/limcode');
+  assert.equal(movedAway.calls.find((call) => call[0] === 'status')[1].lastMigration.relocationId, undefined, '只切换、不作删除依据');
+
   const other = fixture({ host: false, recoveryChoice: '选择其它目录…', picked: '/mnt/other/limcode', nativeAnswers: ['切换并重载'] });
   other.status.dataRootPath = '/mnt/usb/limcode';
   await other.commands.offerDataRootRecovery(other.context, other.startup, '数据目录不可用');
@@ -483,6 +515,9 @@ test('回到旧目录：运行时正常时经独占协调（倒计时不可否�
   assert.ok(!f.kinds().includes('stage') && !f.kinds().includes('complete'));
   assert.deepEqual(f.calls.filter((call) => call[0] === 'report-stage').map((call) => call[1]), ['正在关闭本窗口的运行时', '正在切换回旧数据目录']);
   assert.ok(order.indexOf('freeze') < order.indexOf('close-runtime'), '关闭运行时之前先冻结本窗口');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'clear-moved'), ['clear-moved', '/data/older', '/vscode/global-storage'],
+    'reloc3 C11：回到旧目录时清掉本安装在那里留下的“已迁走”标记');
+  assert.equal(f.calls.find((call) => call[0] === 'clear-key')?.[1], 'data-root-return', '本次协调的键用完即清');
 
   const unreachable = fixture({ host: false, lastMigration: { ...lastMigration, toPath: '/mnt/usb/limcode' }, currentAvailable: false, nativeAnswers: ['回到旧目录'] });
   unreachable.status.dataRootPath = '/mnt/usb/limcode';
@@ -509,7 +544,7 @@ test('启动前：迁移进程还在时显示“正在迁移数据目录”；�
   const opened = fixture();
   opened.globalState.set('limcode.dataRootRelocationNotice', '数据目录已迁移');
   await opened.commands.afterDataRootOpened(opened.context, TARGET);
-  assert.deepEqual(opened.kinds(), ['finalize', 'sweep', 'global-state', 'info', 'read-moved']);
+  assert.deepEqual(opened.kinds(), ['finalize', 'sweep', 'global-state', 'info', 'read-hold', 'read-moved']);
   await opened.commands.afterDataRootOpened(opened.context, TARGET);
   assert.equal(opened.calls.filter((call) => call[0] === 'info').length, 1, '结果只显示一次');
 
