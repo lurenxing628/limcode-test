@@ -1364,18 +1364,21 @@ export class ReliableConversationRunner {
       if (this.deferredRecovery.has(turnId) || this.unheldRecoveredAt.has(conversationId)) continue;
       const leases = await listAllDomainRows(this.application.database, 'ExecutionLease', { turn_id: turnId });
       if (leases.length === 1) {
-        // An unexpired lease is not taken over here, so only an expired one needs the (cached)
-        // process-identity check of its holder. The scan looks again once it expires: a Host that
-        // exited commits nothing more that would start another scan.
+        // Only the holder of an expired lease gets the (cached) process-identity comparison. An
+        // unexpired lease gets the cheap checks only (its liveness record, whether its process still
+        // exists), which already recognize a Host that closed or exited; one whose PID another
+        // process took over is compared once the lease expires, when the scan looks again by itself
+        // (an exited Host commits nothing more that would start another scan).
         const expiresAt = Date.parse(String(leases[0].expires_at));
         if (!Number.isFinite(expiresAt)) continue;
-        if (expiresAt > Date.now()) {
-          nextExpiry = Math.min(nextExpiry ?? expiresAt, expiresAt);
+        const expired = expiresAt <= Date.now();
+        if (await this.application.database.isHostAliveCached(
+          requireId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id'),
+          { compareIdentity: expired }
+        )) {
+          if (!expired) nextExpiry = Math.min(nextExpiry ?? expiresAt, expiresAt);
           continue;
         }
-        if (await this.application.database.isHostAliveCached(
-          requireId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id')
-        )) continue;
       }
       if (await this.conversationOwners.executionEligibility(conversationId) !== 'eligible') continue;
       this.unheldRecoveredAt.set(conversationId, Date.now());

@@ -786,7 +786,14 @@ export class ReliableChildAgentCoordinator {
       // stays unresolved is closed by the stop below.
       if (preview.state === 'dead' && this.dependencies.deadHostEffects?.runAll
         && await this.dependencies.database.conversationOwners.executionEligibility(conversationId) === 'eligible') {
-        await this.dependencies.deadHostEffects.runAll(undefined, conversationId);
+        try {
+          await this.dependencies.deadHostEffects.runAll(undefined, conversationId);
+        } catch (error) {
+          // Another window holds the child Conversation now and settles the stop there; a failed
+          // check leaves the effects to the stop below, as without it.
+          if (isConversationRuntimeOwnerBusyError(error)) return false;
+          this.reportError(error, 'user-stop-child-recovery', turnId);
+        }
         preview = await this.inspectChildTurnEffects(turnId);
         if (preview.state === 'live') return true;
       }

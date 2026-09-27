@@ -502,7 +502,7 @@ test('盲审 2：租约已交还但派发窗口仍存活：合格窗口打开面
   }
 });
 
-test('盲审 3/4：已打开的合格窗口接管退出窗口留下的 Turn 时走与打开面板相同的恢复（先 Phase D），Turn 续跑完成；退出时租约未过期也会在到期后接管（跨进程）', { timeout: 180_000 }, async () => {
+test('盲审 3：已打开的合格窗口接管退出窗口留下的 Turn 时走与打开面板相同的恢复（先 Phase D），Turn 续跑完成；退出窗口的租约还没过期也立即接管（跨进程）', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('takeover');
   let w2; let child;
   try {
@@ -551,40 +551,43 @@ test('盲审 4：接管扫描只对租约已过期的 Turn 做进程身份探测
     const w1 = await waitForWorkerJson(child, files.ready, 90_000);
     w2 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_TWO], label: 'w2', askUser: true, takeover: true });
     const database = w2.app.database;
-    const probes = { cached: 0, uncached: 0 };
+    const probes = { compared: 0, cheap: 0, uncached: 0 };
     const cached = database.isHostAliveCached.bind(database);
     const uncached = database.isHostAlive.bind(database);
-    database.isHostAliveCached = async (hostBootId) => {
-      if (hostBootId === w1.hostBootId) probes.cached += 1;
-      return cached(hostBootId);
+    database.isHostAliveCached = async (hostBootId, options) => {
+      if (hostBootId === w1.hostBootId) probes[options?.compareIdentity === false ? 'cheap' : 'compared'] += 1;
+      return cached(hostBootId, options);
     };
     database.isHostAlive = async (hostBootId) => {
       if (hostBootId === w1.hostBootId) probes.uncached += 1;
       return uncached(hostBootId);
     };
-    const [lease] = await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId });
-    const expiresAt = Date.parse(lease.expires_at);
-
-    // Unexpired: never taken over here, so its holder is not probed.
-    await w2.runner.scanUnheldTurns();
-    assert.ok(Date.now() < expiresAt, '前提：扫描时租约尚未过期');
-    assert.deepEqual(probes, { cached: 0, uncached: 0 }, '未过期的租约不做进程探测');
-
-    // Expired (a waiting Turn does not renew): each scan probes, with the cached comparison.
-    await sleep(Math.max(0, expiresAt - Date.now()) + 1_000);
-    await w2.runner.scanUnheldTurns();
-    await w2.runner.scanUnheldTurns();
-    assert.ok(probes.cached >= 2, '过期租约的持有者被探测');
-    assert.equal(probes.uncached, 0, '扫描不用无缓存的探测');
-    assert.equal((await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId }))[0]?.host_boot_id, w1.hostBootId,
-      '持有者存活：不接管');
-
-    // The comparison of W1's process start identity is not repeated per probe.
     const statReads = { count: 0 };
     fs.readFileSync = function patched(file, ...rest) {
       if (String(file) === `/proc/${w1.pid}/stat`) statReads.count += 1;
       return readFileSync.call(this, file, ...rest);
     };
+    const [lease] = await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId });
+    const expiresAt = Date.parse(lease.expires_at);
+
+    // Unexpired: only the cheap checks (liveness record, process exists), no identity comparison.
+    await w2.runner.scanUnheldTurns();
+    assert.ok(Date.now() < expiresAt, '前提：扫描时租约尚未过期');
+    assert.deepEqual(probes, { compared: 0, cheap: 1, uncached: 0 }, '未过期的租约不比对进程身份');
+    if (process.platform === 'linux') assert.equal(statReads.count, 0);
+
+    // Expired (a waiting Turn does not renew): each scan compares, through the cache.
+    await sleep(Math.max(0, expiresAt - Date.now()) + 1_000);
+    probes.compared = 0;
+    await w2.runner.scanUnheldTurns();
+    await w2.runner.scanUnheldTurns();
+    assert.ok(probes.compared >= 2, '过期租约的持有者被比对进程身份');
+    assert.equal(probes.uncached, 0, '扫描不用无缓存的探测');
+    assert.equal((await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId }))[0]?.host_boot_id, w1.hostBootId,
+      '持有者存活：不接管');
+
+    // The comparison of W1's process start identity is not repeated per probe.
+    statReads.count = 0;
     for (let i = 0; i < 3; i += 1) assert.equal(await database.isHostAliveCached(w1.hostBootId), true);
     if (process.platform === 'linux') {
       assert.equal(statReads.count, 0, '缓存命中时不再比对进程启动身份');
@@ -610,6 +613,42 @@ test('盲审 4：接管扫描只对租约已过期的 Turn 做进程身份探测
       === database.hostBootId, 30_000, '持有者退出后没有接管');
   } finally {
     fs.readFileSync = readFileSync;
+    await w2?.close();
+    await stopChild(child);
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('盲审 4：窗口退出时租约还没过期、它的 PID 又被别的进程占用：廉价检查认不出，租约到期时扫描自己再看一次，比对启动身份判死并接管（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('pid-reused');
+  let w2; let child;
+  try {
+    const conversationId = 'conversation-pid-reused';
+    w2 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_TWO], label: 'w2', askUser: true, takeover: true });
+    await w2.app.recover();
+    await w2.runner.recoverStartup();
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, 'probe', { ...files.env, LIMCODE_BLIND_CONVERSATION: conversationId, LIMCODE_BLIND_LEASE_MS: '4000' });
+    const w1 = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    // W1's PID now belongs to another live process (here: this test process); its liveness record stays.
+    const database = w2.app.database;
+    const recordPath = database.hostLivenessPath(w1.hostBootId);
+    await fsp.writeFile(recordPath, JSON.stringify({ ...JSON.parse(await fsp.readFile(recordPath, 'utf8')), processId: process.pid }));
+    const [lease] = await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId });
+    const expiresAt = Date.parse(lease.expires_at);
+    // One scan, as after another window's commit; nothing triggers another one.
+    await w2.runner.scanUnheldTurns();
+    if (Date.now() < expiresAt) {
+      assert.equal((await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId }))[0]?.host_boot_id, w1.hostBootId,
+        '租约未过期：不比对进程身份，暂不接管');
+    }
+    await eventually(async () => (await rows(w2.app, 'ExecutionLease', { turn_id: w1.turnId }))[0]?.host_boot_id
+      === database.hostBootId, 30_000, '租约到期后扫描没有自己再看一次并接管');
+    assert.ok(Date.now() >= expiresAt, '在租约到期之后接管');
+    assert.deepEqual(errorsOf(w2), []);
+  } finally {
     await w2?.close();
     await stopChild(child);
     await fsp.rm(outer, { recursive: true, force: true });
@@ -824,7 +863,7 @@ async function runWorker(mode) {
   }
   if (mode === 'probe') {
     const host = await openHost(dataRoot, scriptedProvider([ASK_USER]), {
-      folders: [PROJECT_TWO], label: 'w1', askUser: true, leaseDurationMs: 6_000
+      folders: [PROJECT_TWO], label: 'w1', askUser: true, leaseDurationMs: Number(process.env.LIMCODE_BLIND_LEASE_MS ?? 6_000)
     });
     try {
       await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
@@ -935,6 +974,7 @@ async function openHost(dataRoot, provider, options) {
     async close() {
       if (closed) return;
       closed = true;
+      for (const settle of inFlightCalls.get(app.agentLoop) ?? []) settle();
       runner.dispose();
       await app.beginHandoff().catch(() => undefined);
       await runner.waitForIdle().catch(() => undefined);
@@ -1079,9 +1119,13 @@ function gatedMcp() {
  * A native call this Host still runs for the Turn (an admitted async call spanning rounds), as
  * ReliableAgentLoop.dispatchNativeCall tracks it: settled, it leaves the bookkeeping.
  */
+const inFlightCalls = new WeakMap();
+
 function inFlightNativeCall(agentLoop, turnId, toolCallId = `in-flight-${turnId}`) {
   let settle;
   const execution = new Promise((resolve) => { settle = resolve; });
+  // A test that fails early still lets the call settle before its window closes.
+  inFlightCalls.set(agentLoop, [...(inFlightCalls.get(agentLoop) ?? []), () => settle({ settled: true })]);
   agentLoop.nativeCallExecutions.set(toolCallId, execution);
   agentLoop.nativeCallTurnIds.set(toolCallId, turnId);
   void execution.then(() => {

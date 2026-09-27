@@ -406,13 +406,18 @@ export class RuntimeDatabase {
   }
 
   /**
-   * isHostAlive for frequent scans (the takeover scan runs after other windows' commits). Whether
-   * the process still exists is checked every time (a cheap signal-0 probe); the comparison of its
-   * start identity, which some platforms answer by starting a process, is cached per (hostBootId,
-   * pid): a mismatch or a vanished process stays dead, a match is compared again after
-   * HOST_IDENTITY_RECHECK_MS. Unknown answers are never cached and count as alive.
+   * isHostAlive for frequent scans (the takeover scan runs after other windows' commits). The
+   * comparison of the recorded process start identity, which some platforms answer by starting a
+   * process, is cached per (hostBootId, pid): a match is reused for HOST_IDENTITY_RECHECK_MS, a
+   * mismatch or a vanished process stays dead (a hostBootId names one boot, which never comes
+   * back). With `compareIdentity: false` no comparison is made at all: only whether the liveness
+   * record is there and a process with its PID still exists (a signal-0 probe), so a Host that
+   * exited is still recognized at once. Unknown answers are never cached and count as alive.
    */
-  public async isHostAliveCached(hostBootIdInput: string): Promise<boolean> {
+  public async isHostAliveCached(
+    hostBootIdInput: string,
+    options: { compareIdentity?: boolean } = {}
+  ): Promise<boolean> {
     const hostBootId = requireNonEmptyText(hostBootIdInput, 'hostBootId');
     if (hostBootId === this.hostBootId) return this.isHostAlive(hostBootId);
     await this.validateBinding('host_liveness');
@@ -420,25 +425,21 @@ export class RuntimeDatabase {
     if (!record || !sameLivenessRoot(record, this.binding) || record.hostBootId !== hostBootId) return false;
     const key = `${hostBootId}\0${record.processId}`;
     const cached = this.hostIdentityComparisons.get(key);
-    const now = Date.now();
     if (cached?.result === 'dead') return false;
-    if (cached && now - cached.at < HOST_IDENTITY_RECHECK_MS) {
-      try {
-        process.kill(record.processId, 0);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException)?.code === 'ESRCH') {
-          this.hostIdentityComparisons.set(key, { result: 'dead', at: now });
-          return false;
-        }
-      }
-      return true;
+    const now = Date.now();
+    if (options.compareIdentity === false || (cached && now - cached.at < HOST_IDENTITY_RECHECK_MS)) {
+      if (!recordedProcessVanished(record.processId)) return true;
+      this.rememberHostIdentity(key, 'dead', now);
+      return false;
     }
     const inspected = inspectRecordedProcess(record);
-    if (inspected !== 'unknown') {
-      if (this.hostIdentityComparisons.size >= HOST_IDENTITY_CACHE_ENTRIES) this.hostIdentityComparisons.clear();
-      this.hostIdentityComparisons.set(key, { result: inspected, at: now });
-    }
+    if (inspected !== 'unknown') this.rememberHostIdentity(key, inspected, now);
     return inspected !== 'dead';
+  }
+
+  private rememberHostIdentity(key: string, result: 'alive' | 'dead', at: number): void {
+    if (this.hostIdentityComparisons.size >= HOST_IDENTITY_CACHE_ENTRIES) this.hostIdentityComparisons.clear();
+    this.hostIdentityComparisons.set(key, { result, at });
   }
 
   /** The listener receives the object a committed transaction() also resolves with; read-only. */
@@ -996,6 +997,17 @@ function sameLivenessRoot(record: RuntimeHostLivenessRecord, binding: RootBindin
   return record.dataSetId === binding.dataSetId
     && record.rootInstanceId === binding.rootInstanceId
     && record.rootGeneration === binding.rootGeneration;
+}
+
+/** Whether no process with this PID exists any more (signal 0 reports ESRCH); anything else is not proof. */
+function recordedProcessVanished(processId: number): boolean {
+  if (!Number.isSafeInteger(processId) || processId <= 0) return false;
+  try {
+    process.kill(processId, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException)?.code === 'ESRCH';
+  }
 }
 
 function inspectRecordedProcess(record: RuntimeHostLivenessRecord): 'alive' | 'dead' | 'unknown' {

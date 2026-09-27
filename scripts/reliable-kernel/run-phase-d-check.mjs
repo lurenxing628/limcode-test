@@ -3475,8 +3475,9 @@ async function checkHangingEffectRecovery() {
     const assertions = [];
     const workspace = path.join(parent, 'workspace');
     await fs.mkdir(workspace);
-    // The dispatch fence must capture the actually live Host. Rewriting the lease only after the
-    // dispatch would represent a successor owner and must no longer keep the old effect in-flight.
+    // The dispatch fence must capture the actually live Host: while the Host that dispatched an
+    // effect lives, recovery never closes it, whoever holds the lease afterwards (a lease handed back,
+    // or one a waiting Turn let expire, does not make the effect crash residue).
     await ctx.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').update('lease-hanging', {
         host_boot_id: ctx.database.hostBootId
