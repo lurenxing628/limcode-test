@@ -392,9 +392,12 @@ async function start(): Promise<void> {
       if (request.kind === 'backupDatabase') {
         assertDatabaseBinding(reader, data.binding);
         const destination = requireBackupDestination(request.destinationPath, data.binding.paths.dataRootPath);
-        // A separate connection: the Backup API steps between event-loop turns while this worker
-        // keeps serving requests. One large step after the first copies the rest atomically, so a
-        // concurrent commit from another Host cannot restart a partially copied backup forever.
+        // A separate read-only connection. The Backup API's first step copies no page and the
+        // progress callback then asks for all of them, so the whole database is copied in one
+        // synchronous call on this worker thread: this window's database requests queue until it
+        // returns (the cost is documented in runtime-diagnostics.md). That single step holds one
+        // read transaction, so a concurrent commit from another Host cannot restart a partially
+        // copied backup.
         const source = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
         // Answered after later requests ran; `respond` reports only this request's own measurement,
         // and a backup never takes this worker's writer lock, so its response has no writeLock.
