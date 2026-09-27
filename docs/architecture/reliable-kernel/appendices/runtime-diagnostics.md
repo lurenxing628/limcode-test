@@ -117,9 +117,11 @@ diff.open.requested
 离线汇总（只读诊断文件，不打开 SQLite）：
 
 ```bash
-node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs <数据根或其 diagnostics 目录>
-node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs --json <数据根> | jq '.feedSnapshots, .writeLockWaitMs, .hosts'
+node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs <数据目录>
+node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs --json <数据目录> | jq '.feedSnapshots, .writeLockWaitMs, .hosts'
 ```
+
+诊断日志的位置：数据目录（设置页显示的数据目录；没有迁移过时是 VS Code 给扩展的全局存储目录，例如远程 SSH 下的 `~/.vscode-server/data/User/globalStorage/your-publisher.limcode-test`）下，当前默认历史库的诊断日志在 `<数据目录>/.limcode-runtime/active/diagnostics/events.jsonl`（轮转后另有 `events.1.jsonl`～`events.3.jsonl`）。脚本依次认参数本身、`<参数>/diagnostics`、`<参数>/.limcode-runtime/active/diagnostics`，所以传数据目录、运行数据根 `<数据目录>/.limcode-runtime/active` 或诊断目录本身都可以；按工作区分的旧历史库在 `<数据目录>/.limcode-workspace-runtimes/scopes/<key>/.limcode-runtime/active/diagnostics`，需直接传入。一个 events 文件都找不到时，脚本列出找过的路径并以退出码 1 结束，不会输出空报告。
 
 输出包括覆盖时长、按原因的快照次数与字节及外部提交占比、各 requestKind 的请求往返分布（含读请求）、写锁等待/持有分布（p50/p95/p99 为桶上界）、BUSY 位置、慢写锁、WAL 大小和 CAS 发布耗时，并在 `hosts` 下按 `hostBootId` 分组。默认只统计保留期（7 天）内的事件，`--all` 统计文件中的全部事件；无法解析或缺字段的行会跳过并计数。
 

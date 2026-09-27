@@ -3,18 +3,21 @@
 // 各类数据库请求（含读请求）的耗时分布、写锁等待/持锁分布、SQLITE_BUSY、WAL 大小和 CAS 发布耗时，
 // 并按 Host（hostBootId）分组。只读取诊断文件，不打开 SQLite，也不读取任何正文。
 //
-// 用法：node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs [--json] [--all] <数据根或 diagnostics 目录>
+// 用法：node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs [--json] [--all] <数据目录、运行数据根或 diagnostics 目录>
+//   依次认：参数本身、<参数>/diagnostics、<参数>/.limcode-runtime/active/diagnostics（数据目录下当前默认历史库的诊断日志）；
+//   一个 events*.jsonl 都找不到时列出找过的路径并以退出码 1 结束。
 //   默认只统计诊断环保留期（7 天）内的事件；--all 统计文件里的全部事件。
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
+const EVENT_FILES = ['events.3.jsonl', 'events.2.jsonl', 'events.1.jsonl', 'events.jsonl'];
 const BUCKETS = ['1', '2', '5', '10', '25', '50', '100', '250', '500', '1000', '2500', '5000', '10000', '30000', 'inf'];
 
 function usage(message) {
   if (message) console.error(message);
-  console.error('用法：node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs [--json] [--all] <数据根或 diagnostics 目录>');
+  console.error('用法：node scripts/reliable-kernel/summarize-runtime-diagnostics.mjs [--json] [--all] <数据目录、运行数据根或 diagnostics 目录>');
   process.exit(2);
 }
 
@@ -23,15 +26,19 @@ const json = args.includes('--json');
 const all = args.includes('--all');
 const target = args.find((arg) => !arg.startsWith('--'));
 if (!target) usage();
-const directory = fs.existsSync(path.join(target, 'events.jsonl')) || !fs.existsSync(path.join(target, 'diagnostics'))
-  ? target
-  : path.join(target, 'diagnostics');
-if (!fs.existsSync(directory)) usage(`找不到诊断目录：${directory}`);
+// 数据目录下默认历史库的运行数据根是 .limcode-runtime/active，诊断环在它的 diagnostics 里。
+const candidates = [target, path.join(target, 'diagnostics'), path.join(target, '.limcode-runtime', 'active', 'diagnostics')];
+const directory = candidates.find((candidate) => EVENT_FILES.some((name) => fs.existsSync(path.join(candidate, name))));
+if (!directory) {
+  console.error(`找不到诊断日志 events*.jsonl，找过：\n${candidates.map((candidate) => `  ${candidate}`).join('\n')}`);
+  console.error('按工作区分的旧历史库的诊断日志在 <数据目录>/.limcode-workspace-runtimes/scopes/<key>/.limcode-runtime/active/diagnostics，请直接传入该目录。');
+  process.exit(1);
+}
 
 const cutoffMs = all ? Number.NEGATIVE_INFINITY : Date.now() - RETENTION_MS;
 const events = [];
 let skippedLines = 0;
-for (const name of ['events.3.jsonl', 'events.2.jsonl', 'events.1.jsonl', 'events.jsonl']) {
+for (const name of EVENT_FILES) {
   const file = path.join(directory, name);
   if (!fs.existsSync(file)) continue;
   for (const line of fs.readFileSync(file, 'utf8').split('\n')) {

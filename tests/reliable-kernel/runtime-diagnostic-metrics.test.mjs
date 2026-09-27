@@ -650,3 +650,33 @@ test('汇总脚本跳过坏行与缺 metadata 的行，默认只统计 7 天保�
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
+
+test('汇总脚本认数据目录下当前历史库的诊断日志；一个 events 文件都找不到时列出找过的路径并以非 0 退出', async () => {
+  const dataDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-diagnostic-data-directory-'));
+  const empty = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-diagnostic-empty-'));
+  try {
+    const diagnostics = path.join(dataDirectory, '.limcode-runtime', 'active', 'diagnostics');
+    await fs.mkdir(diagnostics, { recursive: true });
+    await fs.writeFile(path.join(diagnostics, 'events.jsonl'), `${JSON.stringify({
+      schema: 'limcode-reliable-diagnostic', id: 'diagnostic-data-directory', eventKind: 'feed.snapshot.summary',
+      observedAt: new Date().toISOString(), metadata: { hostBootId: 'host-a', reasonCode: 'initial', sampleCount: 1, bytes: 10 }
+    })}\n`);
+    for (const target of [dataDirectory, path.join(dataDirectory, '.limcode-runtime', 'active'), diagnostics]) {
+      const report = JSON.parse(childProcess.execFileSync(process.execPath, [SUMMARY_SCRIPT, '--json', target], { encoding: 'utf8' }));
+      assert.equal(report.coverage.events, 1, target);
+      assert.equal(report.feedSnapshots.total.count, 1, target);
+    }
+
+    // An existing diagnostics directory without any events file is not a report either.
+    await fs.mkdir(path.join(empty, 'diagnostics'));
+    const missing = childProcess.spawnSync(process.execPath, [SUMMARY_SCRIPT, '--json', empty], { encoding: 'utf8' });
+    assert.equal(missing.status, 1);
+    assert.equal(missing.stdout, '');
+    for (const probed of [empty, path.join(empty, 'diagnostics'), path.join(empty, '.limcode-runtime', 'active', 'diagnostics')]) {
+      assert.ok(missing.stderr.includes(probed), `stderr names ${probed}`);
+    }
+  } finally {
+    await fs.rm(dataDirectory, { recursive: true, force: true });
+    await fs.rm(empty, { recursive: true, force: true });
+  }
+});
