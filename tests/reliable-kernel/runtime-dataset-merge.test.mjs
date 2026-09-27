@@ -1590,6 +1590,51 @@ test('盲审 merge #4：合并状态读不出来（私有副本放不下）时�
   assert.deepEqual([unreadable?.state, unreadable?.changedSinceMerge, unreadable?.sourceUnreadable], ['merged', false, true]);
 });
 
+test('盲审 merge #7：事务提交之后写合并记录失败、独占维护的收尾出错或报告未完成，都只记日志，结果仍是已合并', { skip: process.getuid?.() === 0 }, async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_recorded_later', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
+  const warn = console.warn;
+  console.warn = () => {};
+  let report;
+  try {
+    report = await merge(fixture, database, {
+      // The merged record cannot be written once the transaction committed.
+      async onFaultPoint(point) { if (point === 'after-row-commit') await fs.chmod(records, 0o500); }
+    });
+  } finally {
+    console.warn = warn;
+    await fs.chmod(records, 0o700);
+  }
+  assert.deepEqual([report.merged.length, report.deferred], [1, []], '提交之后的记录失败不报推迟');
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'committing');
+  const converged = await merge(fixture, database);
+  assert.deepEqual(converged.merged.map((item) => item.recoveredCommit), [true], '下次启动按实测确认');
+
+  for (const after of [
+    async () => { throw Object.assign(new Error('清除退避记录失败'), { code: 'EIO' }); },
+    async () => ({ state: 'failed', reason: '操作之后清理失败' })
+  ]) {
+    const large = await createFixture(t, { withBeta: false });
+    await seed(large.alpha, [{ id: 'conversation_alpha_exclusive', project: SHARED_PROJECT }]);
+    const target = await openTarget(t, large.current);
+    console.warn = () => {};
+    let exclusive;
+    try {
+      exclusive = await merge(large, target, {
+        limits: { maxRows: 1, maxBytes: 1 },
+        async coordinateOversized(input, commit) {
+          await input.withLocks(commit);
+          return after();
+        }
+      });
+    } finally { console.warn = warn; }
+    assert.deepEqual([exclusive.merged.map((item) => item.exclusive), exclusive.deferred], [[true], []]);
+    assert.equal((await readLedgerRecord(large, large.alpha.id))?.state, 'merged');
+  }
+});
+
 test('跨模块盲审 #7：合并前备份之前核对剩余空间：不够就推迟并写明约需多少 MB，不写备份、不收尾', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_space', project: SHARED_PROJECT }]);

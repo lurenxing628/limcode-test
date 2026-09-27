@@ -789,9 +789,11 @@ async function mergeOneSource(
       : await mergeSource(paths, target, candidateId, options, mode, state, keepGoing);
   } catch (error) {
     outcome = sourceOutcome(error, state);
-    // A deferral because the source changed is no outcome when another window merged the source
-    // into this target since this batch picked it.
-    if (error instanceof MergedMeanwhile) outcome = { kind: 'current', result: error.result };
+    // A deferral (the source changed, or anything unexpected) is no outcome when another window
+    // merged the source into this target since this batch picked it.
+    const meanwhile = error instanceof MergedMeanwhile ? error.result
+      : outcome.kind === 'deferred' ? await mergedMeanwhile(paths, target, candidateId, mode, state).catch(() => undefined) : undefined;
+    if (meanwhile) outcome = { kind: 'current', result: meanwhile };
     if ((outcome.kind === 'failed' || outcome.kind === 'blocked') && !state.recorded && !mode.migration) {
       await recordRefusal(paths, target, candidateId, outcome, state).catch(() => undefined);
     }
@@ -1223,7 +1225,9 @@ async function mergedMeanwhile(
 /**
  * The final step, under configuration admission and the source's maintenance claim: the source is
  * checked again (no Host, the exact files that were verified), the ledger is read again (another
- * window may have merged it meanwhile), then the committing record and ONE row transaction.
+ * window may have merged it meanwhile), then the committing record and ONE row transaction. Once
+ * the transaction committed, that is the outcome: writing the merged record or releasing a claim
+ * afterwards can fail only into the log (the next startup converges a committing record).
  */
 async function commitSource(
   paths: { globalStoragePath: string },
@@ -1237,80 +1241,108 @@ async function commitSource(
   mode: SourceMode,
   stopIfAsked: () => void
 ): Promise<SourceOutcome> {
-  return withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(binding.paths, async (): Promise<SourceOutcome> => {
-    await assertSourceUnchanged(paths, target, candidate, binding, state, mode);
-    const previous = mode.migration ? undefined : (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id);
-    if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
-      if (previous.state === 'committing') {
-        throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '另一个窗口合并这个库时中断，下次启动时先确认它的结果。' });
-      }
-      if (previous.state === 'merged' && sameRuntimeDataSetIdentity(previous.source, candidate)
-        && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
-        return { kind: 'current', result: await currentResult(paths, candidate, target, state) };
-      }
+  const done: { outcome?: SourceOutcome } = {};
+  try {
+    return await withRuntimeDataRootAdmission(paths.globalStoragePath, () => withRuntimeMaintenance(binding.paths, async () => {
+      done.outcome = await commitLocked(paths, target, candidate, binding, plan, cas, state, options, mode, stopIfAsked);
+      return done.outcome;
+    }));
+  } catch (error) {
+    if (!done.outcome) throw error;
+    console.warn('[LimCode] 旧聊天记录的合并已完成，但之后释放锁失败。', error);
+    return done.outcome;
+  }
+}
+
+async function commitLocked(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  candidate: VscodeRuntimeDataSetCandidate,
+  binding: HistoricalRootBinding,
+  plan: RowPlan,
+  cas: RuntimeDataSetCasTransfer | undefined,
+  state: SourceProgress,
+  options: RuntimeDataSetMergeOptions & Pick<RuntimeDataSetIntoDatabaseOptions, 'beforeCommit'>,
+  mode: SourceMode,
+  stopIfAsked: () => void
+): Promise<SourceOutcome> {
+  await assertSourceUnchanged(paths, target, candidate, binding, state, mode);
+  const previous = mode.migration ? undefined : (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id);
+  if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
+    if (previous.state === 'committing') {
+      throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '另一个窗口合并这个库时中断，下次启动时先确认它的结果。' });
     }
-    stopIfAsked();
-    const result: RuntimeDataSetMergeResult = {
-      ...unchangedResult(candidate, target),
-      insertedRows: plan.inserted.length,
-      reusedRows: plan.reused,
-      insertedConversations: plan.insertedConversations,
-      ...(cas ?? {}),
-      ...(plan.steps.length > 0 && target.backup.path ? { backupPath: target.backup.path } : {}),
-      ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {})
-    };
-    const merged = (): DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt'> => ({
-      candidateId: candidate.id, state: 'merged', source: state.fingerprint!, target: target.identity,
-      mergedAt: new Date().toISOString(), insertedRows: plan.inserted.length, reusedRows: plan.reused,
-      insertedConversations: plan.insertedConversations
+    if (previous.state === 'merged' && sameRuntimeDataSetIdentity(previous.source, candidate)
+      && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
+      return { kind: 'current', result: await currentResult(paths, candidate, target, state) };
+    }
+  }
+  stopIfAsked();
+  const result: RuntimeDataSetMergeResult = {
+    ...unchangedResult(candidate, target),
+    insertedRows: plan.inserted.length,
+    reusedRows: plan.reused,
+    insertedConversations: plan.insertedConversations,
+    ...(cas ?? {}),
+    ...(plan.steps.length > 0 && target.backup.path ? { backupPath: target.backup.path } : {}),
+    ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {})
+  };
+  const merged = (): DistributiveOmit<RuntimeDataSetMergeLedgerRecord, 'kind' | 'updatedAt'> => ({
+    candidateId: candidate.id, state: 'merged', source: state.fingerprint!, target: target.identity,
+    mergedAt: new Date().toISOString(), insertedRows: plan.inserted.length, reusedRows: plan.reused,
+    insertedConversations: plan.insertedConversations
+  });
+  if (plan.steps.length === 0) {
+    if (mode.migration) return { kind: 'merged', result };
+    await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
+    const finalized = await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state));
+    return { kind: 'current', result: { ...result, alreadyMerged: true, ...finalized } };
+  }
+  const commitId = mode.migration ? undefined : await writeRuntimeDataSetMergeCommit(paths, plan.inserted);
+  if (commitId !== undefined) {
+    await writeRuntimeDataSetMergeLedgerRecord(paths, {
+      candidateId: candidate.id, state: 'committing', source: state.fingerprint!, target: target.identity, commitId,
+      ...(previous ? { replaced: previous } : {})
     });
-    if (plan.steps.length === 0) {
-      if (mode.migration) return { kind: 'merged', result };
-      await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
-      const finalized = await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state));
-      return { kind: 'current', result: { ...result, alreadyMerged: true, ...finalized } };
-    }
-    const commitId = mode.migration ? undefined : await writeRuntimeDataSetMergeCommit(paths, plan.inserted);
-    if (commitId !== undefined) {
-      await writeRuntimeDataSetMergeLedgerRecord(paths, {
-        candidateId: candidate.id, state: 'committing', source: state.fingerprint!, target: target.identity, commitId,
-        ...(previous ? { replaced: previous } : {})
-      });
-    }
-    if (mode.migration) await options.beforeCommit?.(plan.inserted);
-    const backupUsed = target.backup.used === true;
-    target.backup.used = true;
-    await fault(options, 'before-row-commit');
-    try {
-      await target.database.transaction(plan.steps);
-    } catch (error) {
-      // One transaction: measured, it either committed completely (only its reply was lost) or
-      // not at all. A proven rollback drops the committing record at once; an unknown outcome
-      // (the target is gone) keeps it for the next startup to converge.
-      const presence = await insertedRowsPresence(plan.inserted, target.database).catch(() => undefined);
-      if (presence === 'none') {
-        target.backup.used = backupUsed;
-        if (commitId !== undefined) {
-          await restoreLedgerRecord(paths, candidate.id, previous);
-          await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
-        }
-      }
-      if (presence !== 'all') {
-        throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
+  }
+  if (mode.migration) await options.beforeCommit?.(plan.inserted);
+  const backupUsed = target.backup.used === true;
+  target.backup.used = true;
+  await fault(options, 'before-row-commit');
+  try {
+    await target.database.transaction(plan.steps);
+  } catch (error) {
+    // One transaction: measured, it either committed completely (only its reply was lost) or
+    // not at all. A proven rollback drops the committing record at once; an unknown outcome
+    // (the target is gone) keeps it for the next startup to converge.
+    const presence = await insertedRowsPresence(plan.inserted, target.database).catch(() => undefined);
+    if (presence === 'none') {
+      target.backup.used = backupUsed;
+      if (commitId !== undefined) {
+        await restoreLedgerRecord(paths, candidate.id, previous);
+        await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
       }
     }
-    await fault(options, 'after-row-commit');
-    if (commitId === undefined) return { kind: 'merged', result };
+    if (presence !== 'all') {
+      throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
+    }
+  }
+  await fault(options, 'after-row-commit');
+  if (commitId === undefined) return { kind: 'merged', result };
+  try {
     await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
     await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
-    return { kind: 'merged', result: { ...result, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state)) } };
-  }));
+  } catch (error) {
+    console.warn('[LimCode] 旧聊天记录已合并，但合并记录没有写成；下次启动时按实测确认。', error);
+  }
+  return { kind: 'merged', result: { ...result, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state)) } };
 }
 
 /**
  * Oversized source: only now, with everything prepared and checked, the other windows of the
  * target are asked to go offline (waiting without any claim); the locks the coordination takes
- * once they are offline wrap the final commit alone.
+ * once they are offline wrap the final commit alone. A commit that ran to its end is the outcome,
+ * whatever the coordination reports about its own cleanup afterwards.
  */
 async function commitExclusively(
   paths: { globalStoragePath: string },
@@ -1323,21 +1355,29 @@ async function commitExclusively(
   commit: () => Promise<SourceOutcome>
 ): Promise<SourceOutcome> {
   const done: { outcome?: SourceOutcome } = {};
-  const exclusive = await coordinate({
-    targetPaths: target.binding.paths,
-    requesterHostBootId: target.database.hostBootId,
-    candidateId,
-    operationKey: `${candidateId}@${fingerprintDigest(state.fingerprint!)}`,
-    requested: mode.requested,
-    withLocks: (body) => withRuntimeDataRootAdmission(paths.globalStoragePath,
-      () => withRuntimeMaintenance(target.binding.paths, body)),
-    isDeterministicFailure: (error) => error instanceof Outcome && error.outcome.kind !== 'deferred'
-  }, async () => { done.outcome = await commit(); });
-  if (exclusive.state !== 'completed' || !done.outcome) {
+  let exclusive: RuntimeDataSetExclusiveOutcome;
+  try {
+    exclusive = await coordinate({
+      targetPaths: target.binding.paths,
+      requesterHostBootId: target.database.hostBootId,
+      candidateId,
+      operationKey: `${candidateId}@${fingerprintDigest(state.fingerprint!)}`,
+      requested: mode.requested,
+      withLocks: (body) => withRuntimeDataRootAdmission(paths.globalStoragePath,
+        () => withRuntimeMaintenance(target.binding.paths, body)),
+      isDeterministicFailure: (error) => error instanceof Outcome && error.outcome.kind !== 'deferred'
+    }, async () => { done.outcome = await commit(); });
+  } catch (error) {
+    if (!done.outcome) throw error;
+    console.warn('[LimCode] 较大的旧聊天记录已合并，但之后结束独占维护时出错。', error);
+    exclusive = { state: 'completed' };
+  }
+  if (!done.outcome) {
     const reason = 'reason' in exclusive && exclusive.reason ? exclusive.reason : '其它窗口暂时无法让出';
     throw new Outcome({ kind: 'deferred', code: `runtime-data-set-merge-exclusive-${exclusive.state}`,
       message: `这份旧聊天记录较大（约 ${rows} 条记录），需要其它窗口暂时让出才能合并：${sentence(reason)}以后会自动重试。` });
   }
+  if (exclusive.state !== 'completed') console.warn('[LimCode] 较大的旧聊天记录已合并，但独占维护报告未完成。', exclusive);
   return done.outcome.kind === 'merged' ? { kind: 'merged', result: { ...done.outcome.result, exclusive: true } } : done.outcome;
 }
 
