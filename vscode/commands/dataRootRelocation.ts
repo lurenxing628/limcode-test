@@ -1,17 +1,19 @@
 import { randomUUID } from 'node:crypto';
+import * as os from 'node:os';
 import * as vscode from 'vscode';
 import {
-  LIMCODE_GLOBAL_STATUS_FILE, loadCommittedGlobalStatus, resolveDataRootUri, sameFsPath, updateGlobalStatusDataRoot,
-  type LimCodeGlobalStatus, type PendingDataRootRelocation
+  GlobalStatusPendingRelocationConflictError, LIMCODE_GLOBAL_STATUS_FILE, loadCommittedGlobalStatus, resolveDataRootUri, sameFsPath,
+  updateGlobalStatusDataRoot, type LimCodeGlobalStatus, type PendingDataRootRelocation
 } from '../../backend/capabilities/vscodeStorage/globalStatus';
 import type { RuntimeRootPaths } from '../../backend/reliableKernel/contracts';
 import { ownProcessStartIdentity } from '../../backend/reliableKernel/runtimeClaimPrimitives';
 import {
-  abandonStagedDataRootRelocation, assertDataRootAvailable, completeDataRootRelocation, dataRootRelocationCleanupState,
-  dataRootRelocationOwnerState, DataRootRelocationError, deleteOldDataRoot, ensureDataRootIdentity, finalizeDataRootRelocation,
-  formatBytes, inspectDataRootForReturn, invalidateDataRootRelocationRecord, planDataRootRelocation, planOldDataRootDeletion,
-  recoverInterruptedDataRootRelocation, stageDataRootRelocation, sweepDataRootRelocationLeftovers,
-  type DataRootRelocationPlan, type DataRootRelocationPublication, type DataRootRelocationResult, type StagedDataRootRelocation
+  abandonStagedDataRootRelocation, assertDataRootAvailable, clearDataRootMovedNotice, completeDataRootRelocation,
+  dataRootRelocationCleanupState, dataRootRelocationOwnerState, DataRootRelocationError, deleteOldDataRoot, ensureDataRootIdentity,
+  finalizeDataRootRelocation, formatBytes, inspectDataRootForReturn, invalidateDataRootRelocationRecord, planDataRootRelocation,
+  planOldDataRootDeletion, readDataRootMovedNotice, recoverInterruptedDataRootRelocation, stageDataRootRelocation,
+  sweepDataRootRelocationLeftovers, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
+  type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation
 } from '../../backend/reliableKernel/runtimeDataRootRelocation';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
 import type { ExclusiveMaintenanceBusy, RuntimeExclusiveMaintenanceOutcome } from '../../backend/reliableKernel/runtimeExclusiveMaintenance';
@@ -36,6 +38,8 @@ export interface DataRootRelocationHost {
 
 /** Shown once after the reload that follows a relocation. */
 const RELOCATION_NOTICE_KEY = 'limcode.dataRootRelocationNotice';
+/** Relocation ids of other installations' moved notices the user chose not to be reminded of. */
+const MOVED_NOTICE_DISMISSED_KEY = 'limcode.dataRootMovedNoticeDismissed';
 const CANCEL = { key: 'cancel', label: '取消', variant: 'secondary' as const };
 const OK = { key: 'cancel', label: '知道了', variant: 'secondary' as const };
 
@@ -63,6 +67,8 @@ export async function relocateDataRoot(context: vscode.ExtensionContext, startup
     await tell(ask, '已有迁移正在进行', ['另一个 LimCode 窗口正在迁移数据目录，请等它完成后再试。']);
     return;
   }
+  // A crashed relocation is undone first; its record is kept until that succeeded.
+  if (status.pendingRelocation && !await settleInterruptedRelocation(context, status.pendingRelocation, ask)) return;
   const sourceRootPath = host.dataRootPath();
   const picked = await vscode.window.showOpenDialog({
     canSelectFiles: false, canSelectFolders: true, canSelectMany: false,
@@ -102,12 +108,20 @@ export async function relocateDataRoot(context: vscode.ExtensionContext, startup
 async function runRelocation(context: vscode.ExtensionContext, host: DataRootRelocationHost, plan: DataRootRelocationPlan, ask: Ask): Promise<void> {
   const relocationId = randomUUID();
   const identity = ownProcessStartIdentity();
-  await updateGlobalStatusDataRoot(context, {
-    pendingRelocation: {
-      relocationId, sourceRootPath: plan.sourceRootPath, targetRootPath: plan.targetRootPath, startedAt: new Date().toISOString(),
-      processId: process.pid, ...(identity ? { processStartIdentity: identity } : {})
-    }
-  });
+  try {
+    // Only when no other relocation of this installation started meanwhile.
+    await updateGlobalStatusDataRoot(context, {
+      pendingRelocation: {
+        relocationId, sourceRootPath: plan.sourceRootPath, targetRootPath: plan.targetRootPath, startedAt: new Date().toISOString(),
+        processId: process.pid, ...(identity ? { processStartIdentity: identity } : {})
+      },
+      expectedPendingRelocationId: null
+    });
+  } catch (error) {
+    if (!(error instanceof GlobalStatusPendingRelocationConflictError)) throw error;
+    await tell(ask, '已有迁移正在进行', [error.message]);
+    return;
+  }
   let result: DataRootRelocationResult | undefined;
   let failure: unknown;
   let runtimeClosed = false;
@@ -123,6 +137,7 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
       staged = await stageDataRootRelocation(plan, host.product.application.database, { onProgress, relocationId, signal: cancel.signal });
     } catch (error) {
       failure = error;
+      cleaned = dataRootRelocationCleanupState(error) !== 'not-cleaned';
       return;
     } finally {
       cancellation?.dispose();
@@ -138,7 +153,9 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
       }, async () => {
         runtimeClosed = true;
         await host.closeRuntime();
-        return completeDataRootRelocation(staged, (publication) => publishRelocation(context, plan, publication), { onProgress });
+        return completeDataRootRelocation(staged, (publication) => publishRelocation(context, plan, relocationId, publication), {
+          onProgress, movedBy: installationOf(context)
+        });
       });
       if (outcome.state === 'completed') {
         result = outcome.result;
@@ -162,7 +179,7 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
   }
   // Undone: nothing is in progress any more. Otherwise the record stays, and the next startup
   // (a new process: this one then counts as ended) undoes the rest.
-  if (cleaned) await updateGlobalStatusDataRoot(context, { pendingRelocation: null }).catch(() => undefined);
+  if (cleaned) await updateGlobalStatusDataRoot(context, { pendingRelocation: null, expectedPendingRelocationId: relocationId }).catch(() => undefined);
   const message = describeError(failure);
   console.error('[LimCode] 数据目录迁移失败。', failure);
   const detail = cleaned
@@ -218,12 +235,19 @@ async function exclusively<T>(
   });
 }
 
-async function publishRelocation(context: vscode.ExtensionContext, plan: DataRootRelocationPlan, publication: DataRootRelocationPublication): Promise<void> {
+async function publishRelocation(
+  context: vscode.ExtensionContext,
+  plan: DataRootRelocationPlan,
+  relocationId: string,
+  publication: DataRootRelocationPublication
+): Promise<void> {
   await updateGlobalStatusDataRoot(context, {
     dataRootPath: plan.targetRootPath,
     dataRootId: publication.dataRootId,
-    lastMigration: { fromPath: plan.sourceRootPath, toPath: plan.targetRootPath, migratedAt: new Date().toISOString() },
-    pendingRelocation: null
+    // The relocation id: only this relocation's completion record justifies deleting the old directory.
+    lastMigration: { fromPath: plan.sourceRootPath, toPath: plan.targetRootPath, migratedAt: new Date().toISOString(), relocationId },
+    pendingRelocation: null,
+    expectedPendingRelocationId: relocationId
   });
 }
 
@@ -263,10 +287,7 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     if (await isAvailable(current, status)) {
       await invalidateDataRootRelocationRecord(current).catch((error: unknown) => console.warn('[LimCode] 当前目录的迁移记录没能标记为失效。', error));
     }
-    const dataRootId = await ensureDataRootIdentity(previous);
-    await updateGlobalStatusDataRoot(context, {
-      dataRootPath: previous, dataRootId, lastMigration: { fromPath: current, toPath: previous, migratedAt: new Date().toISOString() }
-    });
+    await pointTo(context, previous, current);
   };
   const reachable = await isAvailable(current, status);
   if (host && reachable) {
@@ -344,7 +365,8 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
   }
   // VS Code's own storage directory also holds this extension's data-root pointer: it stays.
   const keepEntries = sameFsPath(previous, context.globalStorageUri.fsPath) ? [LIMCODE_GLOBAL_STATUS_FILE] : [];
-  const input = { oldRootPath: previous, currentRootPath: current, keepEntries };
+  const relocationId = status.lastMigration?.relocationId;
+  const input = { oldRootPath: previous, currentRootPath: current, keepEntries, ...(relocationId ? { relocationId } : {}) };
   const plan = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在核对旧目录…' },
     () => planOldDataRootDeletion(input));
   if (plan.problems.length > 0) {
@@ -403,10 +425,21 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
 
 /**
  * Startup could not open the configured directory: retry, go back to the old one, choose another
- * LimCode directory, or start over in the default directory. No Runtime (and no settings page)
- * exists here, so these are native messages.
+ * LimCode directory, or start over in the default directory. A directory that merely could not be
+ * read right now (a network drive that hiccups) is only retried: it proves nothing about the data.
+ * No Runtime (and no settings page) exists here, so these are native messages.
  */
-export async function offerDataRootRecovery(context: vscode.ExtensionContext, startup: ApplicationStartup, message: string): Promise<void> {
+export async function offerDataRootRecovery(
+  context: vscode.ExtensionContext,
+  startup: ApplicationStartup,
+  message: string,
+  reason?: DataRootUnavailableReason
+): Promise<void> {
+  if (reason === 'unreadable') {
+    const retry = await vscode.window.showErrorMessage(`${message}\n\n这通常是暂时的（网络盘或外置盘响应慢），请稍后重试。`, '重试');
+    if (retry === '重试') await reloadWindow();
+    return;
+  }
   const status = await loadCommittedGlobalStatus(context);
   const current = resolveDataRootUri(context, status.dataRootPath).fsPath;
   const previous = previousDataRoot(status, current);
@@ -417,7 +450,7 @@ export async function offerDataRootRecovery(context: vscode.ExtensionContext, st
   if (choice === '重试') await reloadWindow();
   else if (choice === '回到旧目录') await returnToPreviousDataRoot(context, startup);
   else if (choice === '选择其它目录…') await chooseOtherDataRoot(context, current);
-  else if (choice === '使用默认目录…') await useDefaultDataRoot(context, current);
+  else if (choice === '使用默认目录…') await useDefaultDataRoot(context, startup, current);
 }
 
 async function chooseOtherDataRoot(context: vscode.ExtensionContext, current: string): Promise<void> {
@@ -435,29 +468,83 @@ async function chooseOtherDataRoot(context: vscode.ExtensionContext, current: st
   const confirmed = await nativeConfirm('切换到这个数据目录？', [
     `新数据目录：${chosen}`,
     `原来的目录：${current}`,
-    '只切换数据目录，不复制也不合并；原来的目录不会被修改，它恢复可用后可以在设置页“回到旧目录”。'
+    '只切换数据目录，不复制也不合并；原来的目录不会被修改，它恢复可用后可以在设置页“回到旧目录”。',
+    '这样切换过去的目录不能用来“删除旧目录”：没有复制，删除的依据只有迁移。'
   ], '切换并重载');
   if (!confirmed) return;
-  const dataRootId = await ensureDataRootIdentity(chosen);
-  await updateGlobalStatusDataRoot(context, {
-    dataRootPath: chosen, dataRootId, lastMigration: { fromPath: current, toPath: chosen, migratedAt: new Date().toISOString() }
-  });
+  await pointTo(context, chosen, current);
   await reloadWindow();
 }
 
-async function useDefaultDataRoot(context: vscode.ExtensionContext, current: string): Promise<void> {
+async function useDefaultDataRoot(context: vscode.ExtensionContext, startup: ApplicationStartup, current: string): Promise<void> {
   const defaultRoot = context.globalStorageUri.fsPath;
+  const status = await loadCommittedGlobalStatus(context);
+  if (status.lastMigration && sameFsPath(status.lastMigration.fromPath, defaultRoot) && sameFsPath(status.lastMigration.toPath, current)) {
+    // The data came from there: going back is "回到旧目录" (it also invalidates the move's record).
+    const choice = await vscode.window.showWarningMessage('默认目录就是迁移前的旧目录', {
+      modal: true,
+      detail: '请用“回到旧目录”切换回去：它同时让当前目录的迁移记录失效，避免以后按那份记录删除旧目录；两份历史也不会被混在一起。'
+    }, '回到旧目录');
+    if (choice === '回到旧目录') await returnToPreviousDataRoot(context, startup);
+    return;
+  }
+  const existing = (await inspectDataRootForReturn(defaultRoot)).usable;
   const confirmed = await nativeConfirm('改用默认数据目录？', [
     `默认数据目录：${defaultRoot}`,
     `原来的目录：${current}`,
-    '如果默认目录里还没有 LimCode 数据，会在那里新建一份空的历史。',
+    existing
+      ? '默认目录里已经有 LimCode 数据：那是以前留在那里的旧历史，不是原来目录里的数据。改用之后看到的是那份旧历史，原来目录里的对话不会带过去；以后把原来的目录迁移过来时，两边都改过的同一个对话会让合并整体取消。'
+      : '默认目录里还没有 LimCode 数据，会在那里新建一份空的历史。',
     '原来的目录不会被修改；它恢复可用后可以在设置页“回到旧目录”，或把它迁移过来（会合并）。'
   ], '改用默认目录并重载');
   if (!confirmed) return;
-  await updateGlobalStatusDataRoot(context, {
-    dataRootPath: '', dataRootId: null, lastMigration: { fromPath: current, toPath: defaultRoot, migratedAt: new Date().toISOString() }
-  });
+  await pointTo(context, '', current);
   await reloadWindow();
+}
+
+/**
+ * Switches the pointer without copying (回到旧目录, 选择其它目录, 使用默认目录, 改用迁移后的目录):
+ * the record carries no relocation id, so it never justifies deleting the directory left behind.
+ * This installation's own moved notice in the directory it goes to is cleared.
+ */
+async function pointTo(context: vscode.ExtensionContext, next: string, current: string): Promise<void> {
+  const nextRoot = next || context.globalStorageUri.fsPath;
+  const dataRootId = next ? await ensureDataRootIdentity(next) : null;
+  await updateGlobalStatusDataRoot(context, {
+    dataRootPath: next, dataRootId, lastMigration: { fromPath: current, toPath: nextRoot, migratedAt: new Date().toISOString() }
+  });
+  await clearDataRootMovedNotice(nextRoot, installationOf(context).id)
+    .catch((error: unknown) => console.warn('[LimCode] 清除“数据已迁走”标记失败。', error));
+}
+
+/** This installation, as named in a moved notice: its own storage directory holds its data-root pointer. */
+function installationOf(context: vscode.ExtensionContext): DataRootMovedNotice['installation'] {
+  return { id: context.globalStorageUri.fsPath, label: `${vscode.env?.appName ?? 'VS Code'}（${os.hostname()}）` };
+}
+
+/**
+ * A relocation recorded as in progress whose process is gone: its changes in the target are undone
+ * and the record cleared. False (with the reason shown) while that is not possible yet.
+ */
+async function settleInterruptedRelocation(context: vscode.ExtensionContext, pending: PendingDataRootRelocation, ask?: Ask): Promise<boolean> {
+  let problem: string | undefined;
+  try {
+    const outcome = await recoverInterruptedDataRootRelocation({ targetRootPath: pending.targetRootPath, relocationId: pending.relocationId });
+    if (outcome === 'recovered' || outcome === 'absent') {
+      await updateGlobalStatusDataRoot(context, { pendingRelocation: null, expectedPendingRelocationId: pending.relocationId });
+      return true;
+    }
+    problem = outcome === 'running' ? '那次迁移的进程可能还在运行。'
+      : outcome === 'blocked' ? `新数据目录正被其它 LimCode 窗口使用（${pending.targetRootPath}），关闭它们后才能撤销。`
+        : `新数据目录现在无法访问（${pending.targetRootPath}），接上后会自动撤销。`;
+  } catch (error) {
+    console.warn('[LimCode] 撤销中断的数据目录迁移失败，下次启动时再试。', error);
+    problem = describeError(error);
+  }
+  const lines = ['上次中断的数据目录迁移还没有撤销完，下次启动 LimCode 时会再试；在此之前不能开始新的迁移。', problem];
+  if (ask) await tell(ask, '上次的迁移还没有撤销完', lines);
+  else void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${lines.join('')}`);
+  return false;
 }
 
 /**
@@ -470,24 +557,17 @@ export async function beforeDataRootOpen(context: vscode.ExtensionContext): Prom
   const pending = status.pendingRelocation;
   if (!pending) return undefined;
   if (ownerOf(pending) !== 'dead') return '正在迁移数据目录，完成后自动打开';
-  const outcome = await recoverInterruptedDataRootRelocation({ targetRootPath: pending.targetRootPath, relocationId: pending.relocationId })
-    .catch((error: unknown) => {
-      console.warn('[LimCode] 撤销中断的数据目录迁移失败，下次启动时再试。', error);
-      return 'failed' as const;
-    });
-  if (outcome === 'recovered' || outcome === 'absent') {
-    const latest = await loadCommittedGlobalStatus(context);
-    if (latest.pendingRelocation?.relocationId === pending.relocationId) await updateGlobalStatusDataRoot(context, { pendingRelocation: null });
-  }
+  await settleInterruptedRelocation(context, pending);
   return undefined;
 }
 
 /**
  * After the Runtime opened: a relocation into this directory took effect (its journal goes),
- * abandoned private copies of crashed processes are removed, and the result of a relocation that
- * reloaded this window is shown once.
+ * abandoned private copies of crashed processes are removed, the result of a relocation that
+ * reloaded this window is shown once, and a directory whose data another installation moved away
+ * says so (without blocking).
  */
-export async function afterDataRootOpened(context: vscode.ExtensionContext, dataRootPath: string): Promise<void> {
+export async function afterDataRootOpened(context: vscode.ExtensionContext, dataRootPath: string, startup?: ApplicationStartup): Promise<void> {
   await finalizeDataRootRelocation(dataRootPath).catch((error: unknown) => console.warn('[LimCode] 迁移收尾失败。', error));
   await sweepDataRootRelocationLeftovers(dataRootPath).catch((error: unknown) => console.warn('[LimCode] 清理中断操作留下的临时副本失败。', error));
   const notice = context.globalState.get<string>(RELOCATION_NOTICE_KEY);
@@ -495,6 +575,68 @@ export async function afterDataRootOpened(context: vscode.ExtensionContext, data
     await context.globalState.update(RELOCATION_NOTICE_KEY, undefined);
     void vscode.window.showInformationMessage(notice);
   }
+  const moved = await readDataRootMovedNotice(dataRootPath).catch(() => undefined);
+  if (!moved) return;
+  if (moved.installation.id === installationOf(context).id) {
+    // This installation uses the directory again: its own notice is outdated.
+    await clearDataRootMovedNotice(dataRootPath, moved.installation.id).catch(() => undefined);
+    return;
+  }
+  const dismissed = context.globalState.get<string[]>(MOVED_NOTICE_DISMISSED_KEY) ?? [];
+  if (dismissed.includes(moved.relocationId)) return;
+  void warnMovedDataRoot(context, startup, dataRootPath, moved);
+}
+
+async function warnMovedDataRoot(context: vscode.ExtensionContext, startup: ApplicationStartup | undefined, current: string, moved: DataRootMovedNotice): Promise<void> {
+  const choice = await vscode.window.showWarningMessage(
+    `${EXTENSION_BRAND}：这个数据目录的数据已在 ${moved.movedAt.slice(0, 16).replace('T', ' ')} 由另一个 LimCode 安装（${moved.installation.label}）`
+      + `迁移到 ${moved.targetRootPath}。继续在这里使用，两边的历史会分叉（之后合并时，两边都改过的同一个对话会让合并整体取消）。`,
+    '改用新目录', '不再提醒'
+  );
+  if (choice === '不再提醒') {
+    const dismissed = context.globalState.get<string[]>(MOVED_NOTICE_DISMISSED_KEY) ?? [];
+    await context.globalState.update(MOVED_NOTICE_DISMISSED_KEY, [...dismissed.filter((id) => id !== moved.relocationId), moved.relocationId]);
+  } else if (choice === '改用新目录') {
+    await switchToMovedDataRoot(context, startup, current, moved.targetRootPath);
+  }
+}
+
+/** "改用新目录": this installation follows the data another installation moved (pointer only, like 选择其它目录). */
+async function switchToMovedDataRoot(context: vscode.ExtensionContext, startup: ApplicationStartup | undefined, current: string, next: string): Promise<void> {
+  const check = await inspectDataRootForReturn(next);
+  if (!check.usable) {
+    await vscode.window.showErrorMessage('不能改用这个目录', { modal: true, detail: `${next}\n\n${check.message ?? ''}` });
+    return;
+  }
+  const confirmed = await nativeConfirm('改用迁移后的数据目录？', [
+    `新数据目录：${next}`,
+    `现在的目录：${current}`,
+    '只切换本安装的数据目录，不复制也不合并；在现在的目录里新写的对话仍留在那里，以后可以把它迁移过去（会合并）。',
+    '本安装的所有 LimCode 窗口会重载一次；有任务的窗口会等任务结束。'
+  ], '改用并重载');
+  if (!confirmed) return;
+  const host = startup ? await pendingHost(startup) : undefined;
+  let runtimeClosed = false;
+  try {
+    if (host) {
+      const outcome = await exclusively(host, {
+        operation: 'data-root-follow', operationKey: `data-root-follow:${next}`, message: '为改用迁移后的数据目录',
+        waitingTitle: '改用新目录：正在等待 LimCode 窗口空闲', configurationRootPath: host.dataRootPath()
+      }, async () => {
+        runtimeClosed = true;
+        await host.closeRuntime();
+        await assertConfigurationRootRuntimesOffline(host.dataRootPath());
+        await pointTo(context, next, current);
+      });
+      if (outcome.state !== 'completed') throw new Error(outcome.reason);
+    } else {
+      await pointTo(context, next, current);
+    }
+  } catch (error) {
+    await vscode.window.showErrorMessage(`没有切换数据目录：${describeError(error)}`);
+    if (!runtimeClosed) return;
+  }
+  await reloadWindow();
 }
 
 async function forgetPreviousDataRoot(context: vscode.ExtensionContext): Promise<void> {
@@ -522,7 +664,7 @@ function describePlan(plan: DataRootRelocationPlan): DataRootPromptSection[] {
   const staying = plan.others.filter((other) => other.leaveBehind);
   const what = [
     `当前历史库：约 ${plan.current.rows} 行记录，数据库 ${formatBytes(plan.current.databaseBytes)}，正文 ${formatBytes(plan.current.casBytes)}`
-      + (plan.sameDevice ? '（同一磁盘上以硬链接共享，不重复占用）' : ''),
+      + (plan.hardLinks ? '（同一磁盘上以硬链接共享，不重复占用）' : ''),
     ...(moving.length ? [`其它 ${moving.length} 个历史库（成为新目录里单独保留的库；已合并进当前库且之后没改动的不再单独复制）`] : []),
     `设置约 ${formatBytes(plan.configurationBytes)}`
       + (plan.configurationEntries.some((name) => ['AGENTS.md', 'CLAUDE.md', 'skills'].includes(name)) ? '，含全局规则和技能' : ''),

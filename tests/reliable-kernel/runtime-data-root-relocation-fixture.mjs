@@ -197,8 +197,17 @@ export async function treeSnapshot(root) {
   return files;
 }
 
-/** Deletes what a confirmation would list by default (every deletable, non-optional item) plus `include`. */
-export async function deleteAsConfirmed(input, include = []) {
+/** The relocation id the data-root pointer records for a relocation into `root` (read from its completion record). */
+export async function relocationIdIn(root) {
+  return JSON.parse(await fs.readFile(path.join(root, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8')).relocationId;
+}
+
+/**
+ * Deletes what a confirmation would list by default (every deletable, non-optional item) plus
+ * `include`. Without `relocationId` it is the one of the relocation into the current directory.
+ */
+export async function deleteAsConfirmed(given, include = []) {
+  const input = given.relocationId ? given : { ...given, relocationId: await relocationIdIn(given.currentRootPath) };
   const plan = await relocation.planOldDataRootDeletion(input);
   const confirmedKeys = [
     ...plan.items.filter((item) => item.deletable && !item.optional).map((item) => item.key),

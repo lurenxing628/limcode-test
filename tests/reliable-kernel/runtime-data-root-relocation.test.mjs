@@ -211,6 +211,7 @@ test('预检：别处拷来的数据会被改名挪开并写明；当前目录�
   const fixture = await createFixture(t, { withAlpha: false });
   const copied = path.join(fixture.base, 'copied');
   await fs.cp(fixture.root, copied, { recursive: true });
+  await fs.rm(path.join(copied, 'notes.txt'));
   const copiedPlan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
   assert.equal(copiedPlan.target.kind, 'copied');
   assert.deepEqual(copiedPlan.problems, []);
@@ -286,6 +287,9 @@ test('数据目录不可用：不存在、空目录、只有同名空文件夹�
   await assert.rejects(assertDataRootAvailable(mountPoint), { reason: 'empty' }, '同名空文件夹或零散设置文件不算 LimCode 数据');
   assert.deepEqual((await fs.readdir(mountPoint)).sort(), ['.DS_Store', 'agents', 'settings']);
   await writeRecordStore(mountPoint, 'agents', 'agent', [{ id: 'a', name: 'a' }]);
+  await fs.mkdir(path.join(mountPoint, '.limcode-workspace-runtimes', 'scopes'), { recursive: true });
+  await assert.rejects(assertDataRootAvailable(mountPoint), { reason: 'empty' }, '设置记录存储或随手建出的 Runtime 目录都不算（任何一次保存或写入都可能在挂载点里建出它们）');
+  await initialize(mountPoint, 'default');
   await assertDataRootAvailable(mountPoint);
 
   const rootId = await ensureDataRootIdentity(mountPoint);
@@ -301,14 +305,18 @@ test('数据目录不可用：不存在、空目录、只有同名空文件夹�
 test('删除旧目录：没有迁移完成记录时拒绝；迁移后只删除迁移过去且没有改动的内容，保留其它文件、指定保留项和迁移之后才有的历史库', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const target = path.join(fixture.base, 'new-home');
-  const refused = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target });
+  const refused = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, relocationId: randomUUID() });
   assert.match(refused.problems.join('\n'), /找不到从这个目录迁移完成的记录/);
   const plan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target });
-  await relocate(fixture, plan, { publish: async () => undefined });
+  const { staged } = await relocate(fixture, plan, { publish: async () => undefined });
+  const switched = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target });
+  assert.match(switched.problems.join('\n'), /切换过来的/, '指针没有记下迁移 id（只切换、没复制）时从不删除');
+  const other = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, relocationId: randomUUID() });
+  assert.match(other.problems.join('\n'), /不是切换到这里的那次迁移留下的/);
   await fs.writeFile(path.join(fixture.root, '.limcode-global-status.json'), '{}');
   await fs.mkdir(path.join(fixture.root, '.limcode-global-status.json.lock'));
   const keepEntries = ['.limcode-global-status.json'];
-  const deletion = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, keepEntries });
+  const deletion = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, keepEntries, relocationId: staged.relocationId });
   assert.deepEqual(deletion.problems, []);
   const byKey = new Map(deletion.items.map((item) => [item.key, item]));
   assert.equal(byKey.get('data-set:default')?.deletable, true);

@@ -72,7 +72,7 @@ function saveOtherSettings(): void {
         迁移前的旧目录：<code>{{ settings.common.previousDataRootPath }}</code>
       </p>
       <div v-if="settings.common.relocationLeftBehind?.length" class="global-settings-path">
-        <span>以下历史库上次迁移时没有带过来，仍在旧目录（需要时可以回到旧目录处理后再迁移一次，会合并）：</span>
+        <span>以下历史库上次迁移时没有带过来，仍在旧目录：</span>
         <ul>
           <li v-for="line in settings.common.relocationLeftBehind" :key="line"><code>{{ line }}</code></li>
         </ul>

@@ -15,6 +15,12 @@ export interface StorageRootMigrationStatus {
   fromPath: string;
   toPath: string;
   migratedAt: string;
+  /**
+   * The data-directory relocation that copied the data (its completion record in toPath carries the
+   * same id). Absent for a switch without copying ("回到旧目录", "选择其它目录", "使用默认目录"):
+   * such a switch never justifies deleting fromPath.
+   */
+  relocationId?: string;
 }
 
 /** A data-directory relocation between its stage and its end; cleared when it ends (see dataRootRelocation). */
@@ -47,6 +53,23 @@ export interface GlobalStatusDataRootChange {
   dataRootId?: string | null;
   lastMigration?: StorageRootMigrationStatus | null;
   pendingRelocation?: PendingDataRootRelocation | null;
+  /**
+   * 进行中记录的比较后写入：调用方上次看到的记录 id（null 表示没有）。写入新记录时不一致则抛
+   * GlobalStatusPendingRelocationConflictError、什么都不写；清除时不一致则保留别人的记录，其余改动照常。
+   */
+  expectedPendingRelocationId?: string | null;
+  /** 只在指针仍指向这个目录时才提交（不一致时什么都不写）。 */
+  expectedDataRootPath?: string;
+}
+
+/** 另一个窗口刚刚开始或结束了一次数据目录迁移。 */
+export class GlobalStatusPendingRelocationConflictError extends Error {
+  public readonly code = 'global-status-pending-relocation-conflict';
+
+  public constructor() {
+    super('另一个 LimCode 窗口刚刚开始了数据目录迁移，请等它完成后再试。');
+    this.name = 'GlobalStatusPendingRelocationConflictError';
+  }
 }
 
 const committedStatusByContext = new WeakMap<vscode.ExtensionContext, LimCodeGlobalStatus>();
@@ -99,13 +122,23 @@ export async function updateGlobalStatusDataRoot(
   const uri = globalStatusFileUri(context);
   return withRecordStoreTransaction(uri, async () => {
     const previous = await loadStatusInsideLock(context, uri);
+    if (change.expectedDataRootPath !== undefined
+      && !sameFsPath(resolveDataRootUri(context, previous.dataRootPath).fsPath, resolveDataRootUri(context, change.expectedDataRootPath).fsPath)) {
+      return cloneStatus(previous);
+    }
+    let pendingRelocation = change.pendingRelocation;
+    if (change.expectedPendingRelocationId !== undefined
+      && (previous.pendingRelocation?.relocationId ?? null) !== change.expectedPendingRelocationId) {
+      if (pendingRelocation) throw new GlobalStatusPendingRelocationConflictError();
+      pendingRelocation = undefined;
+    }
     return commitStatus(context, uri, previous, {
       dataRootPath: change.dataRootPath ?? previous.dataRootPath,
       proxy: previous.proxy,
       proxyShellAndMcp: previous.proxyShellAndMcp === true,
       lastMigration: change.lastMigration,
       dataRootId: change.dataRootId,
-      pendingRelocation: change.pendingRelocation
+      pendingRelocation
     });
   });
 }
@@ -352,8 +385,14 @@ function normalizeLastMigration(input: unknown): StorageRootMigrationStatus | un
   const candidate = input as Partial<StorageRootMigrationStatus> | undefined;
   if (typeof candidate?.fromPath !== 'string'
     || typeof candidate.toPath !== 'string'
-    || typeof candidate.migratedAt !== 'string') return undefined;
-  return { fromPath: candidate.fromPath, toPath: candidate.toPath, migratedAt: candidate.migratedAt };
+    || typeof candidate.migratedAt !== 'string'
+    || (candidate.relocationId !== undefined && !(typeof candidate.relocationId === 'string' && /^[0-9a-f-]{36}$/.test(candidate.relocationId)))) {
+    return undefined;
+  }
+  return {
+    fromPath: candidate.fromPath, toPath: candidate.toPath, migratedAt: candidate.migratedAt,
+    ...(candidate.relocationId ? { relocationId: candidate.relocationId } : {})
+  };
 }
 
 function strictStatusReadError(result: Exclude<Awaited<ReturnType<typeof readJsonStrict<unknown>>>, { status: 'ok' | 'missing' }>): Error {

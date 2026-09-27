@@ -3,11 +3,13 @@ import * as path from 'node:path';
 import * as vscode from 'vscode';
 import type { StorageDataResetResult } from '../../capabilities/types';
 import { mapSettledWithBoundedConcurrency } from '../../capabilities/boundedConcurrency';
-import { loadCommittedGlobalStatus, normalizeStatusDataRootPath, resolveDataRootUri, sameFsPath } from '../../capabilities/vscodeStorage/globalStatus';
+import {
+  loadCommittedGlobalStatus, normalizeStatusDataRootPath, resolveDataRootUri, sameFsPath, updateGlobalStatusDataRoot
+} from '../../capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/vscodeStorage/paths';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths, type RuntimeRootPaths } from '../../reliableKernel/contracts';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
-import { assertDataRootAvailable } from '../../reliableKernel/runtimeDataRootRelocation';
+import { assertDataRootAvailable, ensureDataRootIdentity } from '../../reliableKernel/runtimeDataRootRelocation';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
@@ -190,6 +192,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (normalizeStatusDataRootPath(context, status.dataRootPath)) await assertDataRootAvailable(root, status.dataRootId);
       return root;
     }, async () => {
+      await recordDataRootIdentity(context);
       const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(
         getPaths(),
         resolveVscodeWorkspaceRuntimeScope({
@@ -1180,4 +1183,16 @@ function canonicalFolderUri(value: string): string {
   } catch {
     throw new TypeError('projectFolderUri 必须是有效的 URI。');
   }
+}
+
+/**
+ * A custom data directory set by an earlier version has no recorded identity yet. Its first normal
+ * open records one (under the configuration admission, right after the directory passed the
+ * structure check), so from then on only this very directory is accepted (assertDataRootAvailable).
+ */
+async function recordDataRootIdentity(context: vscode.ExtensionContext): Promise<void> {
+  const status = await loadCommittedGlobalStatus(context);
+  if (!normalizeStatusDataRootPath(context, status.dataRootPath) || status.dataRootId) return;
+  const dataRootId = await ensureDataRootIdentity(resolveDataRootUri(context, status.dataRootPath).fsPath);
+  await updateGlobalStatusDataRoot(context, { dataRootId, expectedDataRootPath: status.dataRootPath });
 }

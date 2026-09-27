@@ -1,3 +1,4 @@
+import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '../../../shared/debugCapture';
 import type {
@@ -17,6 +18,7 @@ import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, writeJson } from './json';
 import { createDefaultLlmSettings, normalizeLlmSettings } from './llmSettings';
 import { normalizeLlmCompressionSettings } from './llmCompressionConfigs';
+import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
 import { withRecordStoreTransaction } from './recordStore';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 
@@ -205,6 +207,12 @@ async function initializeMissingGlobalSettingsFile(
   section: GlobalSettingsSection
 ): Promise<GlobalSettingsFileResult> {
   const uri = globalSettingsFileUri(root, section);
+  // Defaults never create the settings directory: on an unmounted drive's mount point that would
+  // write LimCode files where the data directory is missing. They are returned unsaved (the revision
+  // of a missing file); the first explicit save writes the file.
+  if (!await directoryExists(root)) {
+    return { section, settings: getFileBackedSpec(section).createDefault(), filePath: uri.fsPath, revision: missingGlobalSettingsRevision(uri, section) };
+  }
   return withRecordStoreTransaction(uri, async () => {
     const current = await readJson<unknown>(uri, { throwOnError: true });
     if (current !== undefined) return materializeGlobalSettingsFile(root, section, current);
@@ -324,4 +332,10 @@ function getFileBackedSpec(section: GlobalSettingsSection): (typeof GLOBAL_SETTI
     throw new Error(`Global settings section "${section}" is not stored by the generic file-backed settings handler.`);
   }
   return GLOBAL_SETTINGS_SECTION_SPECS[section];
+}
+
+async function directoryExists(uri: vscode.Uri): Promise<boolean> {
+  if (isNodeFsStorageUri(uri)) return (await fs.stat(nodeFsStoragePath(uri)).catch(() => undefined))?.isDirectory() === true;
+  const stat = await Promise.resolve(vscode.workspace.fs.stat(uri)).catch(() => undefined);
+  return stat !== undefined && (stat.type & vscode.FileType.Directory) !== 0;
 }

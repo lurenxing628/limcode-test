@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  compiled, conversationIds, createFixture, createLimCodeTarget, Database, deleteAsConfirmed, indexIds, initialize, kernelFile, openRuntime,
+  compiled, conversationIds, createFixture, relocationIdIn, createLimCodeTarget, Database, deleteAsConfirmed, indexIds, initialize, kernelFile, openRuntime,
   planWithRuntime, PROJECT, relocate, relocation, renameConversation, RootAuthority, rootAuthority, seed, selectedDataSet, treeSnapshot,
   writeRecordStore
 } from './runtime-data-root-relocation-fixture.mjs';
@@ -30,9 +30,10 @@ test('R1 回到旧目录后在旧目录继续写入：完成记录失效，删�
   // "回到旧目录" while B is reachable: B's completion record is invalidated.
   await invalidateDataRootRelocationRecord(B);
   await seed(fixture.current, [{ id: 'conversation_written_in_A_after_return', project: PROJECT }]);
-  const refused = await planOldDataRootDeletion({ oldRootPath: A, currentRootPath: B });
+  const relocationId = await relocationIdIn(B);
+  const refused = await planOldDataRootDeletion({ oldRootPath: A, currentRootPath: B, relocationId });
   assert.match(refused.problems.join('\n'), /回到过这个旧目录/);
-  await assert.rejects(deleteOldDataRoot({ oldRootPath: A, currentRootPath: B, confirmedKeys: [] }), { code: 'data-root-old-delete-refused' });
+  await assert.rejects(deleteOldDataRoot({ oldRootPath: A, currentRootPath: B, relocationId, confirmedKeys: [] }), { code: 'data-root-old-delete-refused' });
   assert.ok(conversationIds(fixture.current.binding.paths.dataRootPath).includes('conversation_written_in_A_after_return'));
   assert.equal((await readDataRootRelocationRecord(B))?.invalidated, true);
 
@@ -96,6 +97,8 @@ test('R3 外置盘挂载点里被写出 settings/ 等零散内容：可用性检
   await assert.rejects(assertDataRootAvailable(dataRoot, randomUUID()), { reason: 'empty' });
   // Another LimCode directory at the same path (e.g. a different drive mounted there) is not the recorded one.
   await writeRecordStore(dataRoot, 'agents', 'agent', [{ id: 'a', name: 'a' }]);
+  await assert.rejects(assertDataRootAvailable(dataRoot), { reason: 'empty' }, '没有记录身份时，设置记录存储也不算 LimCode 数据（reloc2 F3）');
+  await initialize(dataRoot, 'default');
   await relocation.ensureDataRootIdentity(dataRoot);
   await assert.rejects(assertDataRootAvailable(dataRoot, randomUUID()), { reason: 'mismatch' });
 });
@@ -137,7 +140,7 @@ test('R5 全局规则（AGENTS.md / CLAUDE.md）和全局技能（skills/）随�
   assert.equal(await fs.readFile(path.join(target, 'CLAUDE.md'), 'utf8'), '# 我的全局规则 2\n');
   assert.equal(await fs.readFile(path.join(target, 'skills', 'my-skill', 'SKILL.md'), 'utf8'), '---\nname: my-skill\n---\n');
   await fs.writeFile(path.join(fixture.root, 'CLAUDE.md'), '# 迁移之后改过\n');
-  const items = itemsByKey(await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target }));
+  const items = itemsByKey(await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, relocationId: await relocationIdIn(target) }));
   assert.equal(items.get('configuration:AGENTS.md').deletable, true);
   assert.equal(items.get('configuration:skills').deletable, true);
   assert.equal(items.get('configuration:CLAUDE.md').deletable, false);
@@ -187,7 +190,7 @@ test('#11 归档、合并备份和升级备份默认保留，只有勾选才删�
   const target = path.join(fixture.base, 'moved');
   await relocate(fixture, await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target }));
   await assert.rejects(fs.stat(path.join(target, '.limcode-runtime-backups')), { code: 'ENOENT' }, '归档不随迁移复制');
-  const input = { oldRootPath: fixture.root, currentRootPath: target };
+  const input = { oldRootPath: fixture.root, currentRootPath: target, relocationId: await relocationIdIn(target) };
   const items = itemsByKey(await planOldDataRootDeletion(input));
   const mergeBackups = items.get('backup:default:merge-backups');
   const archives = items.get('backup:default:.limcode-runtime-backups');
@@ -210,7 +213,7 @@ test('#13 已合并进当前库且之后没改动的旧库不再单独复制；�
   const { result } = await relocate(fixture, await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target }));
   assert.deepEqual(result.others, { migrated: [], covered: [fixture.alpha.id], leftBehind: [] });
   assert.ok(!(await inspectVscodeRuntimeDataSets({ globalStoragePath: target })).candidates.some((candidate) => candidate.id === fixture.alpha.id));
-  const items = itemsByKey(await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target }));
+  const items = itemsByKey(await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, relocationId: await relocationIdIn(target) }));
   assert.equal(items.get(`data-set:${fixture.alpha.id}`).deletable, true);
   assert.match(items.get(`data-set:${fixture.alpha.id}`).label, /已合并进当前库/);
 
@@ -224,7 +227,8 @@ test('#13 已合并进当前库且之后没改动的旧库不再单独复制；�
   const { result: takenResult } = await relocate(other, await planDataRootRelocation({ sourceRootPath: other.root, targetRootPath: taken }));
   assert.deepEqual(takenResult.others.leftBehind.map((item) => item.id), [other.alpha.id]);
   const record = await readDataRootRelocationRecord(taken);
-  assert.deepEqual(record.leftBehind, [{ id: other.alpha.id, reason: '新数据目录里已有同名历史库' }]);
+  assert.deepEqual(record.leftBehind.map(({ id, reason }) => ({ id, reason })), [{ id: other.alpha.id, reason: '新数据目录里已有同名历史库' }]);
+  assert.match(record.leftBehind[0].hint, /已有同名的库，再迁移也不会带过来/, '设置页按原因说明能怎么处理');
 });
 
 test('#15 新目录正被其它 LimCode 窗口使用时不迁入', async (t) => {
@@ -383,6 +387,7 @@ test('目标是别处拷来的 LimCode 数据：整体改名挪到旁边永不�
   const fixture = await createFixture(t, { withAlpha: false });
   const copied = path.join(fixture.base, 'copied');
   await fs.cp(fixture.root, copied, { recursive: true });
+  await fs.rm(path.join(copied, 'notes.txt'));
   const before = await treeSnapshot(copied);
   const plan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
   assert.deepEqual([plan.target.kind, plan.target.sameDataSet], ['copied', true]);

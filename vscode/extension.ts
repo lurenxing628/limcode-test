@@ -5,6 +5,7 @@ import { registerSidebarEntryView } from './views/SidebarEntryView';
 import { ApplicationStartup } from './ApplicationStartup';
 import { stopRuntimeDataSetUpgrades } from './runtimeDataSetUpgradeLifetime';
 import type { VscodeReliableKernelApplicationFacade } from '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade';
+import type { DataRootUnavailableReason } from '../backend/reliableKernel/runtimeDataRootRelocation';
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
 
 let backendApp: VscodeReliableKernelApplicationFacade | undefined;
@@ -82,7 +83,7 @@ async function startApplication(
 
     backendApp = application;
     startup.resolve(application);
-    void dataRootCommands.afterDataRootOpened(context, application.dataRootPath())
+    void dataRootCommands.afterDataRootOpened(context, application.dataRootPath(), startup)
       .catch((error) => console.warn(`${EXTENSION_BRAND} data root follow-up failed.`, error));
 
     console.log(
@@ -151,7 +152,8 @@ async function startApplication(
     if ((error as { code?: unknown } | null)?.code === 'data-root-unavailable') {
       // Never an empty history in place of an unmounted drive: offer retry or the old directory.
       void import('./commands/dataRootRelocation')
-        .then(({ offerDataRootRecovery }) => offerDataRootRecovery(context, startup, `${EXTENSION_BRAND} ${message}`))
+        .then(({ offerDataRootRecovery }) => offerDataRootRecovery(context, startup, `${EXTENSION_BRAND} ${message}`,
+          (error as { reason?: DataRootUnavailableReason }).reason))
         .catch((offerError) => console.error(`${EXTENSION_BRAND} data root recovery prompt failed.`, offerError));
       return;
     }

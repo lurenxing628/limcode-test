@@ -1585,5 +1585,5 @@ function requireId(value: unknown, label: string): string {
 async function withRelocationRecord(record: GlobalSettingsRecord): Promise<GlobalSettingsRecord> {
   const relocation = await readDataRootRelocationRecord(record.activeDataRootPath).catch(() => undefined);
   if (!relocation?.leftBehind.length || relocation.invalidated) return record;
-  return { ...record, relocationLeftBehind: relocation.leftBehind.map((item) => `${item.id}：${item.reason}`) };
+  return { ...record, relocationLeftBehind: relocation.leftBehind.map((item) => `${item.id}：${item.reason}。${item.hint}`) };
 }

@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
+const os = require('node:os');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -16,6 +17,7 @@ function loadCommands(dependencies) {
     module, exports: module.exports, console, process, AbortController,
     require(name) {
       if (name === 'node:crypto') return crypto;
+      if (name === 'node:os') return os;
       if (!Object.prototype.hasOwnProperty.call(dependencies, name)) throw new Error(`Unexpected source dependency: ${name}`);
       return dependencies[name];
     }
@@ -31,7 +33,7 @@ function fixture({
   picked = TARGET, plan = {}, answers = [], busy = [false], exclusive = 'completed', completeError, cleanup,
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
-  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false
+  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice
 } = {}) {
   const calls = [];
   const progressOptions = [];
@@ -60,6 +62,7 @@ function fixture({
       }
     },
     ProgressLocation: { Notification: 15 },
+    env: { appName: 'Code' },
     commands: { async executeCommand(command, argument) { calls.push(['command', command, argument]); } }
   };
   const staged = { plan: planFor(TARGET), relocationId: 'staged' };
@@ -85,8 +88,13 @@ function fixture({
       loadCommittedGlobalStatus: async () => status,
       resolveDataRootUri: (_context, dataRootPath) => ({ fsPath: dataRootPath || '/vscode/global-storage' }),
       sameFsPath: (left, right) => path.resolve(left) === path.resolve(right),
+      GlobalStatusPendingRelocationConflictError: class GlobalStatusPendingRelocationConflictError extends Error {},
       updateGlobalStatusDataRoot: async (_context, change) => {
         calls.push(['status', plain(change)]);
+        if (change.expectedPendingRelocationId !== undefined && (status.pendingRelocation?.relocationId ?? null) !== change.expectedPendingRelocationId) {
+          if (change.pendingRelocation) throw new dependencies['../../backend/capabilities/vscodeStorage/globalStatus'].GlobalStatusPendingRelocationConflictError('另一个 LimCode 窗口刚刚开始了数据目录迁移');
+          change = { ...change, pendingRelocation: undefined };
+        }
         if (change.dataRootPath !== undefined) status.dataRootPath = change.dataRootPath;
         if (change.pendingRelocation === null) delete status.pendingRelocation;
         else if (change.pendingRelocation) status.pendingRelocation = change.pendingRelocation;
@@ -147,6 +155,8 @@ function fixture({
       deleteOldDataRoot: async (input) => { calls.push(['delete', plain(input)]); return deleteResult; },
       recoverInterruptedDataRootRelocation: async (input) => { calls.push(['recover', plain(input)]); return recoverOutcome; },
       finalizeDataRootRelocation: async (root) => { calls.push(['finalize', root]); },
+      readDataRootMovedNotice: async (root) => { calls.push(['read-moved', root]); return movedNotice; },
+      clearDataRootMovedNotice: async (root, installation) => { calls.push(['clear-moved', root, installation]); return false; },
       sweepDataRootRelocationLeftovers: async (root) => { calls.push(['sweep', root]); return { removed: [] }; }
     },
     '../../backend/reliableKernel/runtimeHostControl': {
@@ -212,6 +222,9 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   const published = f.calls.filter((call) => call[0] === 'status')[1][1];
   assert.deepEqual([published.dataRootPath, published.dataRootId, published.pendingRelocation, published.lastMigration.fromPath],
     [TARGET, '00000000-0000-4000-8000-000000000001', null, SOURCE]);
+  assert.equal(published.lastMigration.relocationId, pending.relocationId, '指针记下这次迁移的 id：删除旧目录只认这次迁移的完成记录');
+  assert.equal(published.expectedPendingRelocationId, pending.relocationId, '只清掉自己的进行中记录');
+  assert.equal(f.calls.find((call) => call[0] === 'status')[1].expectedPendingRelocationId, null, '进行中记录只在没有别的迁移时写入');
   assert.ok(!f.calls.some((call) => (call[0] === 'warning' || call[0] === 'error') && modal(call)), '除了选文件夹，没有原生模态框');
   const confirmation = f.prompts[0];
   assert.deepEqual(confirmation.actions.map((action) => action.key), ['cancel', 'relocate']);
@@ -386,14 +399,40 @@ test('数据目录不可用：可以重试、回到旧目录、选择其它已�
   const declined = fixture({ host: false, recoveryChoice: '使用默认目录…', nativeAnswers: [undefined] });
   await declined.commands.offerDataRootRecovery(declined.context, declined.startup, '数据目录不可用');
   assert.ok(!declined.kinds().includes('status'), '改用默认目录要二次确认');
-  const fallback = fixture({ host: false, recoveryChoice: '使用默认目录…', nativeAnswers: ['改用默认目录并重载'] });
+  const fallback = fixture({ host: false, recoveryChoice: '使用默认目录…', nativeAnswers: ['改用默认目录并重载'], returnUsable: false });
   fallback.status.dataRootPath = '/mnt/usb/limcode';
   await fallback.commands.offerDataRootRecovery(fallback.context, fallback.startup, '数据目录不可用');
   const warning = fallback.calls.find((call) => call[0] === 'warning');
   assert.match(warning[2].detail, /新建一份空的历史/);
   const fallbackStatus = fallback.calls.find((call) => call[0] === 'status')[1];
   assert.deepEqual([fallbackStatus.dataRootPath, fallbackStatus.dataRootId], ['', null]);
+  assert.equal(fallbackStatus.lastMigration.relocationId, undefined, '只切换、没复制：这条记录永远不能作删除依据');
   assert.deepEqual(fallback.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+  assert.equal(switched.lastMigration.relocationId, undefined, '选择其它目录同样不记迁移 id');
+
+  // reloc2 #6: the default directory already holds (older) data: said so before switching.
+  const older = fixture({ host: false, recoveryChoice: '使用默认目录…', nativeAnswers: [undefined] });
+  older.status.dataRootPath = '/mnt/usb/limcode';
+  await older.commands.offerDataRootRecovery(older.context, older.startup, '数据目录不可用');
+  assert.match(older.calls.find((call) => call[0] === 'warning')[2].detail, /默认目录里已经有 LimCode 数据：那是以前留在那里的旧历史/);
+  // ... and when the data came from the default directory, the way back is "回到旧目录".
+  const moved = fixture({
+    host: false, recoveryChoice: '使用默认目录…', nativeAnswers: [undefined],
+    lastMigration: { fromPath: '/vscode/global-storage', toPath: '/mnt/usb/limcode', migratedAt: '2026-09-26T00:00:00.000Z', relocationId: 'r' }
+  });
+  moved.status.dataRootPath = '/mnt/usb/limcode';
+  await moved.commands.offerDataRootRecovery(moved.context, moved.startup, '数据目录不可用');
+  const guide = moved.calls.find((call) => call[0] === 'warning');
+  assert.deepEqual([guide[1], guide[3]], ['默认目录就是迁移前的旧目录', ['回到旧目录']]);
+  assert.ok(!moved.kinds().includes('status'), '没有直接改用默认目录');
+
+  // reloc2 #13: a directory that merely could not be read right now is only retried.
+  const flaky = fixture({ host: false, lastMigration, recoveryChoice: undefined });
+  flaky.status.dataRootPath = '/mnt/usb/limcode';
+  await flaky.commands.offerDataRootRecovery(flaky.context, flaky.startup, '数据目录不可用', 'unreadable');
+  const flakyPrompt = flaky.calls.find((call) => call[0] === 'error');
+  assert.deepEqual(flakyPrompt.slice(2), ['重试']);
+  assert.match(flakyPrompt[1], /暂时的.*稍后重试/);
 });
 
 test('回到旧目录：运行时正常时经独占协调（倒计时不可否决）后让当前目录的迁移记录失效，再只切换指针；当前目录不可达时不在它上面拿锁', async () => {
@@ -434,7 +473,43 @@ test('启动前：迁移进程还在时显示“正在迁移数据目录”；�
   const opened = fixture();
   opened.globalState.set('limcode.dataRootRelocationNotice', '数据目录已迁移');
   await opened.commands.afterDataRootOpened(opened.context, TARGET);
-  assert.deepEqual(opened.kinds(), ['finalize', 'sweep', 'global-state', 'info']);
+  assert.deepEqual(opened.kinds(), ['finalize', 'sweep', 'global-state', 'info', 'read-moved']);
   await opened.commands.afterDataRootOpened(opened.context, TARGET);
   assert.equal(opened.calls.filter((call) => call[0] === 'info').length, 1, '结果只显示一次');
+
+  // reloc2 #10: a crashed relocation must be undone before a new one starts; its record stays until then.
+  const blocked = fixture({ pendingRelocation: pending, ownerState: 'dead', recoverOutcome: 'blocked', answers: [{ choice: 'cancel', include: [] }] });
+  await blocked.commands.relocateDataRoot(blocked.context, blocked.startup, blocked.request);
+  assert.deepEqual(blocked.kinds(), ['recover', 'prompt']);
+  assert.match(JSON.stringify(blocked.prompts[0]), /上次中断的数据目录迁移还没有撤销完/);
+});
+
+test('另一个安装把这个目录的数据迁走了（reloc2 #7）：打开时不阻塞地警告会分叉，可以改用新目录或不再提醒；本安装自己的标记直接清掉', async () => {
+  const notice = {
+    targetRootPath: '/data/moved-by-other', relocationId: 'r-other', movedAt: '2026-09-27T01:02:03.000Z',
+    installation: { id: '/other/vscode/global-storage', label: 'VS Code（desk）' }
+  };
+  const dismiss = fixture({ movedNotice: notice, nativeAnswers: ['不再提醒'] });
+  await dismiss.commands.afterDataRootOpened(dismiss.context, SOURCE, dismiss.startup);
+  await new Promise(setImmediate);
+  const warning = dismiss.calls.find((call) => call[0] === 'warning');
+  assert.match(warning[1], /另一个 LimCode 安装（VS Code（desk））迁移到 \/data\/moved-by-other。继续在这里使用，两边的历史会分叉/);
+  assert.equal(warning[2], '改用新目录', '不是模态：不阻塞使用');
+  assert.deepEqual(plain(dismiss.globalState.get('limcode.dataRootMovedNoticeDismissed')), ['r-other']);
+  await dismiss.commands.afterDataRootOpened(dismiss.context, SOURCE, dismiss.startup);
+  await new Promise(setImmediate);
+  assert.equal(dismiss.calls.filter((call) => call[0] === 'warning').length, 1, '不再提醒');
+
+  const follow = fixture({ movedNotice: notice, nativeAnswers: ['改用新目录', '改用并重载'] });
+  await follow.commands.afterDataRootOpened(follow.context, SOURCE, follow.startup);
+  for (let turn = 0; turn < 20 && !follow.kinds().includes('command'); turn += 1) await new Promise(setImmediate);
+  assert.equal(follow.calls.find((call) => call[0] === 'exclusive')[1].participantConfirmation, 'final-countdown');
+  const switched = follow.calls.find((call) => call[0] === 'status')[1];
+  assert.deepEqual([switched.dataRootPath, switched.lastMigration.fromPath, switched.lastMigration.relocationId], ['/data/moved-by-other', SOURCE, undefined]);
+  assert.deepEqual(follow.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+
+  const own = fixture({ movedNotice: { ...notice, installation: { id: '/vscode/global-storage', label: 'here' } } });
+  await own.commands.afterDataRootOpened(own.context, SOURCE, own.startup);
+  assert.deepEqual(own.calls.find((call) => call[0] === 'clear-moved').slice(1), [SOURCE, '/vscode/global-storage']);
+  assert.ok(!own.kinds().includes('warning'), '本安装回到这里：标记直接清掉，不提示');
 });

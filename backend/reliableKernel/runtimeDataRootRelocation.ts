@@ -68,12 +68,20 @@ export const DATA_ROOT_RELOCATION_MARKER_FILE = '.limcode-data-root-relocation.j
 export const DATA_ROOT_IDENTITY_FILE = '.limcode-data-root-identity.json';
 /** Replaced configuration versions, the journal and database backups of each relocation. */
 export const DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY = '.limcode-relocation-backups';
+/**
+ * Left in the old directory when its data moved: an installation that still uses that directory
+ * (the pointer is kept per installation) learns where the data went.
+ */
+export const DATA_ROOT_MOVED_NOTICE_FILE = '.limcode-data-root-moved.json';
 /** A folder that already holds other files receives LimCode data only in its own sub-folder. */
 export const DATA_ROOT_RELOCATION_SUBFOLDER = 'LimCode';
 /** Global rules and skills live directly in the data directory (rulesCatalog, skillCatalog). */
 export const DATA_ROOT_GLOBAL_ENTRIES: readonly string[] = ['AGENTS.md', 'CLAUDE.md', 'skills'];
 
 const MARKER_KIND = 'limcode-data-root-relocation';
+/** A data set of the old directory that stays there because the target already has one with its id. */
+const NAME_TAKEN_REASON = '新数据目录里已有同名历史库';
+const MOVED_NOTICE_KIND = 'limcode-data-root-moved';
 const IDENTITY_KIND = 'limcode-data-root-identity';
 const JOURNAL_FILE = 'journal.jsonl';
 const CONFIGURATION_BACKUP_DIRECTORY = 'configuration';
@@ -90,13 +98,24 @@ const CONFIGURATION_ENTRIES: readonly string[] = [...REGISTERED_STORAGE_ROOT_DIR
 /** LimCode's own bookkeeping at the top of a data directory; removed only with its last data set. */
 const METADATA_ENTRIES: readonly string[] = [
   VSCODE_RUNTIME_SELECTION_FILE, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, DATA_ROOT_IDENTITY_FILE,
-  DATA_ROOT_RELOCATION_MARKER_FILE, DATA_ROOT_RESET_PENDING_FILE
+  DATA_ROOT_RELOCATION_MARKER_FILE, DATA_ROOT_RESET_PENDING_FILE, DATA_ROOT_MOVED_NOTICE_FILE
 ];
 /** Files operating systems drop into any directory; they do not make a directory "used". */
 const IGNORABLE_ENTRY_NAMES: ReadonlySet<string> = new Set(['.DS_Store', 'Thumbs.db', 'desktop.ini', '.localized']);
+/** This extension's data-root pointer (in VS Code's own storage directory) and its lock: never user files. */
+const GLOBAL_STATUS_FILE = '.limcode-global-status.json';
+/** Every top-level name a LimCode data directory itself may hold (anything else is a file of the user). */
+const LIMCODE_TOP_LEVEL_NAMES: ReadonlySet<string> = new Set([
+  ...RUNTIME_ENTRY_NAMES, ...CONFIGURATION_ENTRIES, ...METADATA_ENTRIES,
+  DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, DATA_ROOT_BACKUPS_DIR, RESET_ARCHIVES_DIRECTORY
+]);
 const CLOUD_SYNC_SEGMENT = /^(onedrive.*|dropbox|icloud ?drive|iclouddrive|mobile documents|cloudstorage|google ?drive|googledrive|my drive|box|box sync|pcloud ?drive|nutstore|坚果云|百度网盘|baidunetdisk|baidusyncdisk|seafile|nextcloud|owncloud|synologydrive|mega|yandex\.disk)$/i;
 /** Free space kept beyond the estimate on every disk involved. */
 const FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024;
+/** Allocation units a copy of the CAS objects is measured at (FAT/exFAT use up to 1 MiB clusters). */
+const CLUSTER_SIZES: readonly number[] = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+/** Linux statfs types of filesystems without hard links (msdos/vfat, exFAT): CAS objects are copied. */
+const NO_HARD_LINK_FILESYSTEMS: ReadonlySet<number> = new Set([0x4d44, 0x2011bab0]);
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 /** Temporary copies named with their owner's process id (see sweepDataRootRelocationLeftovers). */
 const OWNED_TEMPORARY_DIRECTORY = /^limcode-(?:runtime-history|merge-precopy|relocation-count)-(\d+)-/;
@@ -152,6 +171,8 @@ export interface DataRootRelocationDataSet {
   casBytes: number;
   /** CAS bytes as allocated on disk (blocks), for a copy to another disk. */
   casAllocatedBytes: number;
+  /** CAS bytes a copy would allocate with each of CLUSTER_SIZES as allocation unit. */
+  casClusterBytes?: number[];
   /** Rows over every Runtime domain; undefined when the data set could not be read. */
   rows?: number;
 }
@@ -171,12 +192,16 @@ export interface DataRootRelocationPlan {
   current: DataRootRelocationDataSet & { rows: number };
   /** Other data sets of the old directory; `leaveBehind` names why one stays there. */
   others: Array<DataRootRelocationDataSet & { leaveBehind?: string }>;
+  /** Data sets of the old directory that cannot even be inspected; they stay there. */
+  unreadable: Array<{ id: string; reason: string }>;
   configurationBytes: number;
   /** Configuration entries of the old directory that are copied (registered, rules, skills). */
   configurationEntries: string[];
   /** Estimated bytes per disk (a disk used for several purposes appears once). */
   space: DataRootRelocationSpace[];
   sameDevice: boolean;
+  /** CAS objects are hard-linked (same disk and a filesystem with hard links), not copied. */
+  hardLinks: boolean;
   /**
    * The target holds an unfinished relocation (a crashed one, or one from this same directory that
    * completed without switching the pointer and is unchanged since): it is undone first.
@@ -224,6 +249,17 @@ export interface DataRootRelocationOptions extends Pick<RuntimeDataSetMergeOptio
   onProgress?(message: string): void;
   /** Cancels the online pre-copy (stage); the exclusive phase does not observe it. */
   signal?: AbortSignal;
+  /** The installation that moves the data, named in the old directory's moved notice (none: no notice). */
+  movedBy?: DataRootMovedNotice['installation'];
+}
+
+/** See DATA_ROOT_MOVED_NOTICE_FILE. */
+export interface DataRootMovedNotice {
+  targetRootPath: string;
+  relocationId: string;
+  movedAt: string;
+  /** `id`: the installation's own storage directory (where its data-root pointer lives); `label` for people. */
+  installation: { id: string; label: string };
 }
 
 /** What the pointer switch records: the identity of the new data directory. */
@@ -259,7 +295,12 @@ interface CopiedConfiguration {
 
 interface RelocationMarker {
   kind: typeof MARKER_KIND;
-  state: 'staging' | 'complete';
+  /**
+   * 'undoing' is written before an undo touches anything: from then on every later attempt (after a
+   * crash or a failed step) continues the undo unconditionally, whatever the journal or the receiving
+   * data set look like by then.
+   */
+  state: 'staging' | 'complete' | 'undoing';
   relocationId: string;
   sourceRootPath: string;
   /** The directory this record describes; a record copied along with a directory describes another one and is ignored. */
@@ -292,14 +333,23 @@ type JournalEntry =
   /** An existing file or link; its previous version is at `backup` (relative to the work directory). */
   | { op: 'replace'; path: string; backup: string }
   /** The existing receiving database; its offline copy is at `backup`. */
-  | { op: 'database'; path: string; backup: string };
+  | { op: 'database'; path: string; backup: string }
+  /** An existing directory: an undo removes every entry of it that is not in `keep`. */
+  | { op: 'children'; path: string; keep: string[] };
 
 const cleanupStates = new WeakMap<object, boolean>();
 
-/** Whether a failed completion already undid its changes in the target (undefined: not a completion failure). */
+/**
+ * Whether a failed stage or completion already undid its changes in the target (undefined: the
+ * failure happened before anything in the target was ours to undo).
+ */
 export function dataRootRelocationCleanupState(error: unknown): 'cleaned' | 'not-cleaned' | undefined {
   if (!error || typeof error !== 'object' || !cleanupStates.has(error)) return undefined;
   return cleanupStates.get(error) ? 'cleaned' : 'not-cleaned';
+}
+
+function recordCleanup(error: unknown, cleaned: boolean): void {
+  if (error && typeof error === 'object') cleanupStates.set(error, cleaned);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -322,23 +372,34 @@ export async function assertDataRootAvailable(dataRootPath: string, expectedRoot
   }
   if (!info.isDirectory()) throw new DataRootUnavailableError(root, 'not-directory');
   let structure: boolean;
+  let identity: string | undefined;
   try {
     structure = await hasLimCodeStructure(root);
+    identity = await readDataRootIdentity(root);
   } catch (error) {
     throw new DataRootUnavailableError(root, 'unreadable', error);
   }
   if (expectedRootId !== undefined) {
-    const identity = await readDataRootIdentity(root);
     if (identity === expectedRootId) return;
     throw new DataRootUnavailableError(root, identity !== undefined || structure ? 'mismatch' : 'empty');
   }
   if (!structure) throw new DataRootUnavailableError(root, 'empty');
 }
 
-/** The identity recorded in a data directory, if it has a valid one. */
+/**
+ * The identity recorded in a data directory: undefined when it has none (or a file that is not one).
+ * A read that fails for another reason (a network drive that hiccups) throws: it proves nothing
+ * either way and must never be taken for a different directory.
+ */
 export async function readDataRootIdentity(root: string): Promise<string | undefined> {
+  let text: string;
+  try { text = await fs.readFile(path.join(path.resolve(root), DATA_ROOT_IDENTITY_FILE), 'utf8'); }
+  catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
   let value: unknown;
-  try { value = JSON.parse(await fs.readFile(path.join(path.resolve(root), DATA_ROOT_IDENTITY_FILE), 'utf8')); }
+  try { value = JSON.parse(text); }
   catch { return undefined; }
   const record = value as { kind?: unknown; rootId?: unknown } | null;
   return record?.kind === IDENTITY_KIND && typeof record.rootId === 'string' && /^[0-9a-f-]{36}$/.test(record.rootId)
@@ -362,31 +423,20 @@ export async function ensureDataRootIdentity(root: string): Promise<string> {
 }
 
 /**
- * LimCode's own structure, never a bare name: the Runtime selection file, a Runtime directory, or a
- * record store (index.json with records/) in a registered directory or one level below it. An
- * empty folder that merely has a registered name (created by a write on an unmounted drive's mount
- * point) does not count.
+ * LimCode's own Runtime structure, never a bare name or settings alone: the Runtime selection file, a
+ * RootBinding pointer of a Runtime root, or the identity file. Settings (record stores, llm.json) are written by any
+ * configuration save, even onto an unmounted drive's mount point, so they prove nothing.
  */
 async function hasLimCodeStructure(root: string): Promise<boolean> {
-  if ((await lstatOrUndefined(path.join(root, VSCODE_RUNTIME_SELECTION_FILE)))?.isFile()) return true;
-  for (const name of [VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY]) {
-    if ((await lstatOrUndefined(path.join(root, name)))?.isDirectory()) return true;
-  }
-  if (await readDataRootIdentity(root)) return true;
-  for (const name of REGISTERED_STORAGE_ROOT_DIRS) {
-    const directory = path.join(root, name);
-    if (!(await lstatOrUndefined(directory))?.isDirectory()) continue;
-    if (await isRecordStoreStructure(directory)) return true;
-    for (const child of await fs.readdir(directory, { withFileTypes: true })) {
-      if (child.isDirectory() && await isRecordStoreStructure(path.join(directory, child.name))) return true;
-    }
+  const isFile = async (file: string): Promise<boolean> => (await lstatOrUndefined(file))?.isFile() === true;
+  if (await isFile(path.join(root, VSCODE_RUNTIME_SELECTION_FILE)) || await isFile(path.join(root, DATA_ROOT_IDENTITY_FILE))) return true;
+  // A RootBinding pointer is only written by initializing a Runtime root, never by a stray mkdir -p.
+  if (await isFile(path.join(root, VSCODE_RUNTIME_CONTROL_DIRECTORY, ROOT_BINDING_POINTER_FILE))) return true;
+  const scopes = path.join(root, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, 'scopes');
+  for (const key of await fs.readdir(scopes).catch(() => [] as string[])) {
+    if (await isFile(path.join(scopes, key, VSCODE_RUNTIME_CONTROL_DIRECTORY, ROOT_BINDING_POINTER_FILE))) return true;
   }
   return false;
-}
-
-async function isRecordStoreStructure(directory: string): Promise<boolean> {
-  return (await lstatOrUndefined(path.join(directory, INDEX_FILE)))?.isFile() === true
-    && (await lstatOrUndefined(path.join(directory, RECORDS_DIR)))?.isDirectory() === true;
 }
 
 /** The directory is one LimCode can open (used before offering to go back or switch to it). */
@@ -449,6 +499,7 @@ export async function planDataRootRelocation(input: {
     const leaveBehind = rows === undefined ? '无法读取这个历史库（可能需要先在旧目录里打开一次完成升级）' : undefined;
     others.push({ ...identityOf(candidate), ...size, ...(rows !== undefined ? { rows } : {}), ...(leaveBehind ? { leaveBehind } : {}) });
   }
+  const unreadable = inspection.problems.map((problem) => ({ id: problem.id, reason: `无法读取：${problem.message}` }));
   for (const problem of inspection.problems) {
     warnings.push(`旧目录里有一个无法读取的历史库不会被迁移，仍留在旧目录：${problem.message}`);
   }
@@ -469,7 +520,11 @@ export async function planDataRootRelocation(input: {
     : await classifyTarget(targetRootPath, sourceRootPath, currentCandidate.dataSetId);
   const target: DataRootRelocationTarget = classified.target;
   if (target.kind === 'invalid' && placement.length === 0) problems.push(target.message);
-  if (target.kind === 'copied') warnings.push(target.message);
+  if (target.kind === 'copied') {
+    warnings.push(target.message);
+    const offline = await targetOfflineProblem(targetRootPath);
+    if (offline) problems.push(offline);
+  }
   if (target.kind === 'occupied') {
     problems.push(`所选文件夹里已有其它文件（${target.entries.length} 项），LimCode 只能放在其中新建的子文件夹里：${target.suggestedPath}`);
   }
@@ -482,7 +537,7 @@ export async function planDataRootRelocation(input: {
     warnings.push('新数据目录里已有 LimCode 数据：当前历史会合并进去（同一条记录内容不同时整体取消，两边都不改）；设置按记录合并，同一项以当前在用的为准，被替换的旧版本放进新目录的备份文件夹。');
     const taken = new Set(target.dataSetIds);
     for (const other of others) {
-      if (!other.leaveBehind && taken.has(other.id)) other.leaveBehind = '新数据目录里已有同名历史库';
+      if (!other.leaveBehind && taken.has(other.id)) other.leaveBehind = NAME_TAKEN_REASON;
     }
     const offline = await targetOfflineProblem(targetRootPath);
     if (offline) problems.push(offline);
@@ -505,8 +560,8 @@ export async function planDataRootRelocation(input: {
     }
   }
   return {
-    sourceRootPath, targetRootPath, target, current, others, configurationBytes, configurationEntries,
-    space: spaceEstimate.space, sameDevice: spaceEstimate.sameDevice, undoesEarlierAttempt: classified.undoes, problems, warnings
+    sourceRootPath, targetRootPath, target, current, others, unreadable, configurationBytes, configurationEntries,
+    space: spaceEstimate.space, sameDevice: spaceEstimate.sameDevice, hardLinks: spaceEstimate.hardLinks, undoesEarlierAttempt: classified.undoes, problems, warnings
   };
 }
 
@@ -538,16 +593,17 @@ function identityOf(candidate: VscodeRuntimeDataSetCandidate): { id: string; dat
 }
 
 /** One walk of the data set's Runtime directory: database, CAS (logical and allocated). */
-async function measureDataSet(binding: HistoricalRootBinding): Promise<Pick<DataRootRelocationDataSet, 'databaseBytes' | 'casBytes' | 'casAllocatedBytes'>> {
+async function measureDataSet(binding: HistoricalRootBinding): Promise<Pick<DataRootRelocationDataSet, 'databaseBytes' | 'casBytes' | 'casAllocatedBytes' | 'casClusterBytes'>> {
   const database = path.resolve(binding.paths.databasePath);
   const databaseFiles = new Set([database, `${database}-wal`]);
   const cas = path.resolve(binding.paths.casRootPath);
-  const result = { databaseBytes: 0, casBytes: 0, casAllocatedBytes: 0 };
+  const result = { databaseBytes: 0, casBytes: 0, casAllocatedBytes: 0, casClusterBytes: CLUSTER_SIZES.map(() => 0) };
   await walkSizes(path.resolve(binding.paths.dataRootPath), (file, info) => {
     if (databaseFiles.has(file)) result.databaseBytes += info.size;
     else if (isPathInside(cas, file)) {
       result.casBytes += info.size;
       result.casAllocatedBytes += allocatedBytes(info);
+      CLUSTER_SIZES.forEach((cluster, index) => { result.casClusterBytes[index] += Math.ceil(info.size / cluster) * cluster; });
     }
   });
   return result;
@@ -594,7 +650,7 @@ async function estimateSpace(input: {
   others: DataRootRelocationPlan['others'];
   configurationAllocated: number;
   target: DataRootRelocationTarget;
-}): Promise<{ space: DataRootRelocationSpace[]; sameDevice: boolean }> {
+}): Promise<{ space: DataRootRelocationSpace[]; sameDevice: boolean; hardLinks: boolean }> {
   const targetProbe = await nearestExisting(input.targetRootPath);
   const sourceProbe = path.dirname(path.resolve(input.currentBinding.paths.dataRootPath));
   const temporaryProbe = os.tmpdir();
@@ -606,9 +662,16 @@ async function estimateSpace(input: {
   const sourceDevice = await deviceOf(sourceProbe);
   const temporaryDevice = await deviceOf(temporaryProbe);
   const sameDevice = targetDevice !== undefined && targetDevice === sourceDevice;
+  const targetFilesystem = targetProbe ? await fs.statfs(targetProbe).catch(() => undefined) : undefined;
+  // FAT/exFAT (USB sticks) have no hard links: the merge falls back to copying every object.
+  const hardLinks = sameDevice && !(process.platform === 'linux' && targetFilesystem && NO_HARD_LINK_FILESYSTEMS.has(Number(targetFilesystem.type)));
+  // A copy allocates whole clusters of the target's filesystem (up to 1 MiB on exFAT).
+  const clusterIndex = targetFilesystem ? CLUSTER_SIZES.findIndex((cluster) => cluster >= Number(targetFilesystem.bsize)) : -1;
+  const copiedCas = (dataSet: DataRootRelocationDataSet): number => !targetFilesystem ? dataSet.casAllocatedBytes
+    : Math.max(dataSet.casAllocatedBytes, dataSet.casClusterBytes?.[clusterIndex === -1 ? CLUSTER_SIZES.length - 1 : clusterIndex] ?? 0);
   const moving = [input.current, ...input.others.filter((other) => !other.leaveBehind)];
   let targetBytes = input.configurationAllocated;
-  for (const dataSet of moving) targetBytes += 2 * dataSet.databaseBytes + (sameDevice ? 0 : dataSet.casAllocatedBytes);
+  for (const dataSet of moving) targetBytes += 2 * dataSet.databaseBytes + (hardLinks ? 0 : copiedCas(dataSet));
   if (input.target.kind === 'limcode') {
     const receiving = await resolveVscodeRuntimeDataSet({ globalStoragePath: input.targetRootPath }, input.target.receivingId).catch(() => undefined);
     if (receiving) targetBytes += 2 * await databaseBytesOf(receiving.runtimeDataRootPath);
@@ -638,7 +701,7 @@ async function estimateSpace(input: {
       ...(freeBytes !== undefined ? { freeBytes } : {})
     });
   }
-  return { space: [...grouped.values()], sameDevice };
+  return { space: [...grouped.values()], sameDevice, hardLinks };
 }
 
 async function databaseBytesOf(runtimeDataRootPath: string): Promise<number> {
@@ -678,13 +741,20 @@ async function classifyTarget(
       undoes: true
     };
   }
-  const names = (await fs.readdir(targetRootPath)).filter((name) => !IGNORABLE_ENTRY_NAMES.has(name) && !isClaimName(name));
+  const names = (await fs.readdir(targetRootPath))
+    .filter((name) => !IGNORABLE_ENTRY_NAMES.has(name) && !isClaimName(name) && !isGlobalStatusName(name));
   if (names.length === 0) return { target: { kind: 'empty' }, undoes: false };
   if (!names.some((name) => RUNTIME_ENTRY_NAMES.includes(name))) {
     return { target: { kind: 'occupied', entries: names.sort(), suggestedPath: await suggestSubfolder(targetRootPath) }, undoes: false };
   }
   const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: targetRootPath });
   if (inspection.problems.some((problem) => problem.message.includes('RootBinding 不一致'))) {
+    // Copied data among other files of the user: renaming the folder would move those too.
+    const foreign = [];
+    for (const name of names) if (!LIMCODE_TOP_LEVEL_NAMES.has(name) && !await isTransientEntry(targetRootPath, name)) foreign.push(name);
+    if (foreign.length > 0) {
+      return { target: { kind: 'occupied', entries: names.sort(), suggestedPath: await suggestSubfolder(targetRootPath) }, undoes: false };
+    }
     const sameDataSet = currentDataSetId !== undefined && (await copiedDataSetIds(targetRootPath)).includes(currentDataSetId);
     return { target: { kind: 'copied', sameDataSet, message: copiedMessage(targetRootPath, sameDataSet) }, undoes: false };
   }
@@ -716,6 +786,8 @@ async function unfinishedRelocation(
   sourceRootPath: string
 ): Promise<'none' | 'running' | 'undo'> {
   if (marker.state === 'staging') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
+  // An undo that was interrupted is always finished, whoever interrupted it and whatever changed.
+  if (marker.state === 'undoing') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
   if (marker.invalidatedAt || !isSamePath(path.resolve(marker.sourceRootPath), sourceRootPath)) return 'none';
   if (!await pathExists(journalPath(target, marker.relocationId)) || !marker.receivingFingerprint) return 'none';
   try {
@@ -748,14 +820,6 @@ async function copiedDataSetIds(root: string): Promise<string[]> {
     } catch { /* not a readable binding */ }
   }
   return ids;
-}
-
-/** Renames the whole copied directory to a sibling; it is never deleted (an undo renames it back). */
-async function moveCopiedDataAside(target: string): Promise<string> {
-  const aside = `${target}.limcode-copied-${timestampSlug()}`;
-  await fs.rename(target, aside);
-  await syncDirectoryDurably(path.dirname(target));
-  return aside;
 }
 
 async function suggestSubfolder(targetRootPath: string): Promise<string> {
@@ -810,29 +874,46 @@ export async function stageDataRootRelocation(
       await undoRelocation(target, earlier);
     }
     const previous = plan.target.kind === 'copied' ? undefined : await readMarker(target);
-    if (previous?.state === 'staging') {
+    if (previous && previous.state !== 'complete') {
       throw new DataRootRelocationError('data-root-relocation-concurrent', '另一个 LimCode 窗口正在向这个目录迁移数据，请稍后再试。');
     }
-    const movedAside = plan.target.kind === 'copied' ? await moveCopiedDataAside(target) : undefined;
-    const createdDirectory = !await pathExists(target);
-    await fs.mkdir(target, { recursive: true });
-    const preexisting = (await fs.readdir(target)).sort();
-    const targetState: TargetState = plan.target.kind === 'limcode'
-      ? { kind: 'limcode', receivingId: plan.target.receivingId, dataSetIds: [...plan.target.dataSetIds] }
-      : plan.target.kind === 'copied' ? { kind: 'copied', sameDataSet: plan.target.sameDataSet } : { kind: 'empty' };
-    const marker: RelocationMarker = {
-      kind: MARKER_KIND, state: 'staging', relocationId, sourceRootPath: plan.sourceRootPath, targetRootPath: target, startedAt, owner: currentOwner(),
-      preexisting, createdDirectory, targetState,
-      receivingId: plan.target.kind === 'limcode' ? plan.target.receivingId : plan.current.id,
-      ...(previous ? { previous: withoutPrevious(previous) } : {}),
-      ...(movedAside ? { movedAside } : {})
-    };
-    await writeMarker(target, marker);
-    const journal = await RelocationJournal.create(target, relocationId);
+    let movedAside: string | undefined;
+    if (plan.target.kind === 'copied') {
+      // A window may still be using the copy (e.g. of another installation): never pull it away.
+      const blocked = await targetOfflineProblem(target);
+      if (blocked) throw new DataRootRelocationError('data-root-relocation-target-busy', blocked);
+      // The caller's in-progress record (relocation id) exists already, and the new name carries
+      // that id: the next startup finds the copy again even when this process dies right here.
+      movedAside = movedAsidePath(target, relocationId);
+      await fs.rename(target, movedAside);
+      await syncDirectoryDurably(path.dirname(target));
+    }
+    let marker: RelocationMarker | undefined;
     try {
+      const createdDirectory = !await pathExists(target);
+      await fs.mkdir(target, { recursive: true });
+      const preexisting = (await fs.readdir(target)).sort();
+      const targetState: TargetState = plan.target.kind === 'limcode'
+        ? { kind: 'limcode', receivingId: plan.target.receivingId, dataSetIds: [...plan.target.dataSetIds] }
+        : plan.target.kind === 'copied' ? { kind: 'copied', sameDataSet: plan.target.sameDataSet } : { kind: 'empty' };
+      marker = {
+        kind: MARKER_KIND, state: 'staging', relocationId, sourceRootPath: plan.sourceRootPath, targetRootPath: target, startedAt, owner: currentOwner(),
+        preexisting, createdDirectory, targetState,
+        receivingId: plan.target.kind === 'limcode' ? plan.target.receivingId : plan.current.id,
+        ...(previous ? { previous: withoutPrevious(previous) } : {}),
+        ...(movedAside ? { movedAside } : {})
+      };
+      await writeMarker(target, marker);
+      const journal = await RelocationJournal.create(target, relocationId);
       return { plan, receiving: await prepareReceivingRoot(plan, journal) };
     } catch (error) {
-      await undoRelocation(target, marker).catch((undoError: unknown) => console.error('[LimCode] 撤销迁移准备失败。', undoError));
+      const staging = marker;
+      const undo = staging ? () => undoRelocation(target, staging)
+        : movedAside ? () => restoreMovedAside(target, movedAside!) : async () => undefined;
+      recordCleanup(error, await undo().then(() => true, (undoError: unknown) => {
+        console.error('[LimCode] 撤销迁移准备失败。', undoError);
+        return false;
+      }));
       throw error;
     }
   });
@@ -850,9 +931,10 @@ export async function stageDataRootRelocation(
     });
     return { plan, relocationId, startedAt, receiving, precopied, precopiedOthers };
   } catch (error) {
-    await abandonStagedDataRootRelocation({ plan, relocationId }).catch((undoError: unknown) => {
+    recordCleanup(error, await abandonStagedDataRootRelocation({ plan, relocationId }).then(() => true, (undoError: unknown) => {
       console.error('[LimCode] 撤销迁移准备失败。', undoError);
-    });
+      return false;
+    }));
     throw error;
   }
 }
@@ -952,11 +1034,14 @@ export async function completeDataRootRelocation(
       options.onProgress?.('正在复制设置、全局规则和技能');
       const configuration = await transferConfiguration(source, target, journal);
       options.onProgress?.('正在迁移当前历史库');
-      if (plan.target.kind === 'limcode') await backupReceivingDatabase(target, staged.receiving, journal);
+      if (plan.target.kind === 'limcode') {
+        await backupReceivingDatabase(target, staged.receiving, journal);
+        await journalMergeBackups(target, staged.receiving.runtimeDataRootPath, journal);
+      }
       const merged = await mergeInto(sourcePaths, target, plan.current, staged.receiving.runtimeDataRootPath,
         { ...options, signal: undefined, progressLabel: '正在迁移当前历史库' }, plan.target.kind !== 'limcode', staged.precopied.verification);
-      if (plan.target.kind === 'limcode' && merged.backupPath) await journal.append({ op: 'entry', path: path.relative(target, merged.backupPath) });
       const others = await migrateOthers(staged, current, journal, options);
+      const leftBehind = [...others.result.leftBehind, ...plan.unreadable.filter((item) => !others.result.leftBehind.some((left) => left.id === item.id))];
       if (plan.target.kind !== 'limcode') {
         await journal.recordCreation(VSCODE_RUNTIME_SELECTION_FILE);
         await selectVscodeRuntimeDataSet({ globalStoragePath: target }, staged.receiving.id);
@@ -969,10 +1054,19 @@ export async function completeDataRootRelocation(
         ...staging, state: 'complete', completedAt: new Date().toISOString(),
         migrated: [{ ...identityOf(current), fingerprint: currentFingerprint }, ...others.migrated],
         configuration: configuration.copied,
-        leftBehind: others.result.leftBehind,
+        leftBehind,
         receivingFingerprint
       });
       await publish({ dataRootId });
+      // The pointer switched: from here on nothing is undone. Notices are best effort.
+      await fs.rm(path.join(target, DATA_ROOT_MOVED_NOTICE_FILE), { force: true })
+        .catch((error: unknown) => console.warn('[LimCode] 清除新目录里过时的“数据已迁走”标记失败。', error));
+      if (options.movedBy) {
+        await writeJsonDurably(path.join(source, DATA_ROOT_MOVED_NOTICE_FILE), {
+          kind: MOVED_NOTICE_KIND, targetRootPath: target, relocationId: staged.relocationId, movedAt: new Date().toISOString(),
+          installation: options.movedBy
+        }).catch((error: unknown) => console.warn('[LimCode] 在旧目录写“数据已迁走”标记失败。', error));
+      }
       return {
         targetRootPath: target,
         ...(staging.movedAside ? { copiedDataMovedTo: staging.movedAside } : {}),
@@ -981,7 +1075,7 @@ export async function completeDataRootRelocation(
           copiedFiles: configuration.copiedFiles, replacedFiles: configuration.replacedFiles,
           ...(configuration.replacedFiles > 0 ? { backupPath: journal.configurationBackupPath } : {})
         },
-        others: others.result
+        others: { ...others.result, leftBehind }
       };
     }));
   } catch (error) {
@@ -993,7 +1087,7 @@ export async function completeDataRootRelocation(
         console.error('[LimCode] 迁移失败后撤销新数据目录里的改动时出错。', undoError);
         return false;
       });
-      if (error && typeof error === 'object') cleanupStates.set(error, cleaned);
+      recordCleanup(error, cleaned);
     }
     throw error;
   }
@@ -1137,6 +1231,20 @@ async function removeCreatedDataSetRoot(target: string, runtimeDataRootPath: str
 async function initializeFreshRoot(target: string, runtimeDataRootPath: string): Promise<void> {
   const authority = createVscodeRootAuthority({ runtimeDataRootPath, configurationRootPath: target });
   await withRuntimeMaintenance(authority.expectedPaths(), () => initializeEmptyRuntimeRoot(authority));
+}
+
+/**
+ * The merge engine's own backup of the receiving data set is written into its control root during
+ * the merge: journaled before, so an undo removes it however far the merge got.
+ */
+async function journalMergeBackups(target: string, runtimeDataRootPath: string, journal: RelocationJournal): Promise<void> {
+  const directory = path.join(path.dirname(path.resolve(runtimeDataRootPath)), RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
+  const existing = await fs.readdir(directory).catch((error: unknown) => {
+    if (isMissing(error)) return undefined;
+    throw error;
+  });
+  if (existing === undefined) await journal.recordCreation(path.relative(target, directory));
+  else await journal.append({ op: 'children', path: path.relative(target, directory), keep: existing.sort() });
 }
 
 /**
@@ -1325,7 +1433,7 @@ async function transferEntry(from: string, to: string, relative: string, state: 
       return;
     }
     for (const name of (await fs.readdir(from)).sort()) {
-      if (isTransientName(name)) continue;
+      if (await isTransientEntry(from, name)) continue;
       await transferEntry(path.join(from, name), path.join(to, name), path.join(relative, name), state);
     }
     await syncDirectoryDurably(to);
@@ -1359,7 +1467,7 @@ async function transferEntry(from: string, to: string, relative: string, state: 
 async function copyTree(from: string, to: string, state: TransferState): Promise<void> {
   await fs.mkdir(to);
   for (const entry of (await fs.readdir(from, { withFileTypes: true })).sort((left, right) => left.name.localeCompare(right.name))) {
-    if (isTransientName(entry.name)) continue;
+    if (await isTransientEntry(from, entry.name)) continue;
     const source = path.join(from, entry.name);
     const destination = path.join(to, entry.name);
     if (entry.isDirectory()) await copyTree(source, destination, state);
@@ -1509,7 +1617,7 @@ async function treeDigest(root: string, hashes?: ReadonlyMap<string, string>): P
     if (info.isDirectory()) {
       hash.update(`d\0${relative}\n`);
       for (const name of (await fs.readdir(absolute)).sort()) {
-        if (isTransientName(name)) continue;
+        if (await isTransientEntry(absolute, name)) continue;
         await visit(path.join(absolute, name), relative ? `${relative}/${name}` : name);
       }
     } else if (info.isFile()) {
@@ -1594,9 +1702,11 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
       if (index >= lines.length - 2) break;
       throw new DataRootRelocationError('data-root-relocation-journal', `迁移日志损坏，无法撤销：${journalPath(target, relocationId)}`, error);
     }
-    const entry = value as Partial<JournalEntry> & { backup?: unknown } | null;
+    const entry = value as Partial<JournalEntry> & { backup?: unknown; keep?: unknown } | null;
+    const keep = entry?.keep;
     if (!entry || typeof entry.path !== 'string'
-      || (entry.op !== 'entry' && ((entry.op !== 'replace' && entry.op !== 'database') || typeof entry.backup !== 'string'))) {
+      || (entry.op !== 'entry' && !(entry.op === 'children' && Array.isArray(keep) && keep.every((name) => typeof name === 'string'))
+        && ((entry.op !== 'replace' && entry.op !== 'database') || typeof entry.backup !== 'string'))) {
       throw new DataRootRelocationError('data-root-relocation-journal', `迁移日志里有无法识别的记录：${line}`);
     }
     requireRelative(entry.path);
@@ -1611,17 +1721,29 @@ async function hasDatabaseRestore(target: string, marker: RelocationMarker): Pro
 }
 
 /**
- * Undoes a relocation in the target from its journal, newest change first: an existing receiving
- * database and replaced files are put back, created entries removed. Stops at the first failure and
- * keeps the journal for the next attempt. Callers hold the target's admission; a database restore
- * needs every Host of the target offline.
+ * Undoes a relocation in the target from its journal, newest change first. The record is marked
+ * 'undoing' (durably) before anything is touched, so an interrupted undo is always continued (see
+ * unfinishedRelocation). Every step can run again: replaced files and an existing receiving database
+ * are put back from the relocation's own backups, created entries removed; then the journal
+ * directory goes, then the record (the earlier completion record is put back, or it is removed), and
+ * last the copied data renamed aside comes back to its place. Stops at the first failure. Callers
+ * hold the target's admission; a database restore needs every Host of the target offline.
  */
-async function undoRelocation(target: string, marker: RelocationMarker): Promise<void> {
+async function undoRelocation(target: string, found: RelocationMarker): Promise<void> {
+  const marker: RelocationMarker = found.state === 'undoing' ? found : { ...found, state: 'undoing' };
+  if (found.state !== 'undoing') await writeMarker(target, marker);
   const work = workDirectory(target, marker.relocationId);
   for (const entry of (await readJournal(target, marker.relocationId)).reverse()) {
     const destination = path.join(target, entry.path);
     if (entry.op === 'entry') {
       await removeWithTemporaries(destination);
+      continue;
+    }
+    if (entry.op === 'children') {
+      // Entries created inside an existing directory (e.g. a merge backup of the receiving data set).
+      for (const name of await fs.readdir(destination).catch(() => [] as string[])) {
+        if (!entry.keep.includes(name)) await fs.rm(path.join(destination, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+      }
       continue;
     }
     const backup = path.join(work, entry.backup);
@@ -1635,12 +1757,7 @@ async function undoRelocation(target: string, marker: RelocationMarker): Promise
       await syncDirectoryDurably(path.dirname(destination));
       continue;
     }
-    if (!await pathExists(backup)) continue;
-    for (const suffix of ['-shm', '-wal', '-journal']) await fs.rm(`${destination}${suffix}`, { force: true });
-    await fs.rename(path.join(backup, 'limcode.sqlite'), destination);
-    if (await pathExists(path.join(backup, 'limcode.sqlite-wal'))) await fs.rename(path.join(backup, 'limcode.sqlite-wal'), `${destination}-wal`);
-    await syncDirectoryDurably(path.dirname(destination));
-    await fs.rm(backup, { recursive: true, force: true });
+    await restoreReceivingDatabase(destination, backup);
   }
   await fs.rm(work, { recursive: true, force: true });
   const backups = path.join(target, DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY);
@@ -1648,12 +1765,65 @@ async function undoRelocation(target: string, marker: RelocationMarker): Promise
   if (marker.previous) await writeMarker(target, marker.previous);
   else await fs.rm(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), { force: true });
   await syncDirectoryDurably(target).catch(() => undefined);
-  if (marker.createdDirectory) await fs.rmdir(target).catch(() => undefined);
-  // The copied data that was renamed aside goes back to its place (only into an empty spot).
-  if (marker.movedAside && await pathExists(marker.movedAside) && !await pathExists(target)) {
-    await fs.rename(marker.movedAside, target);
-    await syncDirectoryDurably(path.dirname(target)).catch(() => undefined);
+  if (marker.movedAside && await pathExists(marker.movedAside)) await restoreMovedAside(target, marker.movedAside);
+  else if (marker.createdDirectory) await fs.rmdir(target).catch(() => undefined);
+}
+
+/**
+ * Puts the receiving database back from its offline copy; safe to repeat after an interruption: the
+ * copy's database file is renamed back first (the target's own sidecars removed just before), then
+ * its WAL, and only then is the copy's directory removed.
+ */
+async function restoreReceivingDatabase(destination: string, backup: string): Promise<void> {
+  if (!await pathExists(backup)) return;
+  const database = path.join(backup, 'limcode.sqlite');
+  const wal = path.join(backup, 'limcode.sqlite-wal');
+  if (await pathExists(database)) {
+    for (const suffix of ['-shm', '-wal', '-journal']) await fs.rm(`${destination}${suffix}`, { force: true });
+    await fs.rename(database, destination);
+  } else if (!await pathExists(destination)) {
+    throw new DataRootRelocationError('data-root-relocation-undo', `迁移前的数据库副本和目标数据库都不见了，无法撤销：${destination}`);
   }
+  if (await pathExists(wal)) await fs.rename(wal, `${destination}-wal`);
+  await syncDirectoryDurably(path.dirname(destination));
+  await fs.rm(backup, { recursive: true, force: true });
+}
+
+/**
+ * Copied LimCode data renamed aside goes back to its place. The target this relocation created may
+ * still hold dead maintenance claims (never deleted by the claim protocol): that directory moves to
+ * a new sibling first. Anything else there means someone put files there meanwhile: the copy stays
+ * where it is and the error says where.
+ */
+async function restoreMovedAside(target: string, aside: string): Promise<void> {
+  const names = await fs.readdir(target).catch((error: unknown) => {
+    if (isMissing(error)) return undefined;
+    throw error;
+  });
+  if (names) {
+    if (names.some((name) => !isClaimName(name) && !IGNORABLE_ENTRY_NAMES.has(name))) {
+      throw new DataRootRelocationError('data-root-relocation-copy-aside',
+        `从别处拷来的 LimCode 数据仍保留在 ${aside}，没能改回原来的名字 ${target}：那里现在有其它内容。请自行检查后改回。`);
+    }
+    if (names.length > 0) await fs.rename(target, `${target}.limcode-undone-${timestampSlug()}`);
+    else await fs.rmdir(target);
+  }
+  await fs.rename(aside, target);
+  await syncDirectoryDurably(path.dirname(target)).catch(() => undefined);
+}
+
+/** Where copied data in `target` is renamed aside by this relocation (found again from the relocation id alone). */
+function movedAsidePath(target: string, relocationId: string): string {
+  return `${target}.limcode-copied-${timestampSlug()}-${relocationId.slice(0, 8)}`;
+}
+
+/** The copied data this relocation renamed aside, when it is still there. */
+async function findMovedAside(target: string, relocationId: string): Promise<string | undefined> {
+  const base = path.basename(target);
+  const suffix = `-${relocationId.slice(0, 8)}`;
+  const names = await fs.readdir(path.dirname(target)).catch(() => [] as string[]);
+  const name = names.find((entry) => entry.startsWith(`${base}.limcode-copied-`) && entry.endsWith(suffix));
+  return name ? path.join(path.dirname(target), name) : undefined;
 }
 
 /** A created file together with this process family's temporaries beside it (`<name>.<pid>.<uuid>.tmp`). */
@@ -1688,7 +1858,7 @@ function isMarker(value: unknown): value is RelocationMarker {
   const marker = value as Partial<RelocationMarker> | null;
   const strings = (items: unknown): boolean => Array.isArray(items) && items.every((item) => typeof item === 'string');
   const targetState = marker?.targetState as Partial<TargetState & { receivingId: unknown; dataSetIds: unknown }> | undefined;
-  return !!marker && marker.kind === MARKER_KIND && (marker.state === 'staging' || marker.state === 'complete')
+  return !!marker && marker.kind === MARKER_KIND && (marker.state === 'staging' || marker.state === 'complete' || marker.state === 'undoing')
     && typeof marker.relocationId === 'string' && /^[0-9a-f-]{36}$/.test(marker.relocationId)
     && typeof marker.sourceRootPath === 'string' && typeof marker.targetRootPath === 'string'
     && typeof marker.startedAt === 'string' && typeof marker.receivingId === 'string'
@@ -1727,12 +1897,12 @@ function ownerState(owner: RelocationOwner): 'alive' | 'dead' | 'unknown' {
   return classifyRecordedProcess(owner.processId, owner.processStartIdentity);
 }
 
-/** Migration evidence of a directory, e.g. for the settings view. */
+/** Migration evidence of a directory, e.g. for the settings view (`hint`: what the user can do about it). */
 export async function readDataRootRelocationRecord(root: string): Promise<{
   sourceRootPath: string;
   completedAt?: string;
   invalidated: boolean;
-  leftBehind: Array<{ id: string; reason: string }>;
+  leftBehind: Array<{ id: string; reason: string; hint: string }>;
 } | undefined> {
   const marker = await readMarker(path.resolve(root));
   if (marker?.state !== 'complete') return undefined;
@@ -1740,8 +1910,16 @@ export async function readDataRootRelocationRecord(root: string): Promise<{
     sourceRootPath: marker.sourceRootPath,
     ...(marker.completedAt ? { completedAt: marker.completedAt } : {}),
     invalidated: marker.invalidatedAt !== undefined,
-    leftBehind: [...(marker.leftBehind ?? [])]
+    leftBehind: (marker.leftBehind ?? []).map((item) => ({ ...item, hint: leftBehindHint(item.reason) }))
   };
+}
+
+function leftBehindHint(reason: string): string {
+  if (reason.startsWith(NAME_TAKEN_REASON)) {
+    return '当前目录里已有同名的库，再迁移也不会带过来；需要时可以回到旧目录查看或导出其中的对话。';
+  }
+  if (reason.startsWith('无法读取')) return '可以回到旧目录打开一次（完成升级或修复）后再迁移一次，会合并。';
+  return '可以回到旧目录处理后再迁移一次，会合并。';
 }
 
 /**
@@ -1791,20 +1969,54 @@ export async function recoverInterruptedDataRootRelocation(input: {
   relocationId: string;
 }): Promise<'recovered' | 'absent' | 'unreachable' | 'running' | 'blocked'> {
   const target = path.resolve(input.targetRootPath);
-  // Never takes a claim beside a directory that is not there (an unmounted drive's mount point).
+  // Never takes a claim beside a directory whose parent is not there (an unmounted drive).
+  if (!(await lstatOrUndefined(path.dirname(target)).catch(() => undefined))?.isDirectory()) return 'unreachable';
   if (!(await lstatOrUndefined(target).catch(() => undefined))?.isDirectory()) {
-    // Nothing was left there when its parent is reachable; otherwise try again another time.
-    return (await lstatOrUndefined(path.dirname(target)).catch(() => undefined))?.isDirectory() ? 'absent' : 'unreachable';
+    // Killed right after renaming copied data aside: it comes back; otherwise nothing was left there.
+    const aside = await findMovedAside(target, input.relocationId);
+    if (!aside) return 'absent';
+    await withRuntimeDataRootAdmission(target, () => restoreMovedAside(target, aside));
+    return 'recovered';
   }
   return withRuntimeDataRootAdmission(target, async () => {
     const marker = await readMarker(target);
-    if (!marker || marker.relocationId !== input.relocationId) return 'absent';
+    if (!marker || marker.relocationId !== input.relocationId) {
+      // An undo removes the record just before the copied data renamed aside comes back.
+      const aside = await findMovedAside(target, input.relocationId);
+      if (!aside) return 'absent';
+      await restoreMovedAside(target, aside);
+      return 'recovered';
+    }
     if (ownerState(marker.owner) !== 'dead') return 'running';
     if (marker.state === 'complete' && await unfinishedRelocation(target, marker, path.resolve(marker.sourceRootPath)) !== 'undo') return 'absent';
     if (await hasDatabaseRestore(target, marker) && await targetOfflineProblem(target)) return 'blocked';
     await undoRelocation(target, marker);
     return 'recovered';
   });
+}
+
+/** The moved notice of a directory (see DATA_ROOT_MOVED_NOTICE_FILE), if it has a valid one. */
+export async function readDataRootMovedNotice(root: string): Promise<DataRootMovedNotice | undefined> {
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(path.join(path.resolve(root), DATA_ROOT_MOVED_NOTICE_FILE), 'utf8')); }
+  catch { return undefined; }
+  const notice = value as (Partial<DataRootMovedNotice> & { kind?: unknown }) | null;
+  if (notice?.kind !== MOVED_NOTICE_KIND || typeof notice.targetRootPath !== 'string' || typeof notice.relocationId !== 'string'
+    || typeof notice.movedAt !== 'string' || typeof notice.installation?.id !== 'string' || typeof notice.installation.label !== 'string') {
+    return undefined;
+  }
+  return {
+    targetRootPath: notice.targetRootPath, relocationId: notice.relocationId, movedAt: notice.movedAt,
+    installation: { id: notice.installation.id, label: notice.installation.label }
+  };
+}
+
+/** This installation uses the directory again (e.g. "回到旧目录"): its own moved notice there goes. */
+export async function clearDataRootMovedNotice(root: string, installationId: string): Promise<boolean> {
+  const notice = await readDataRootMovedNotice(root);
+  if (!notice || notice.installation.id !== installationId) return false;
+  await fs.rm(path.join(path.resolve(root), DATA_ROOT_MOVED_NOTICE_FILE), { force: true });
+  return true;
 }
 
 /** State of a recorded relocation's process (for the pointer's in-progress record). */
@@ -1883,6 +2095,11 @@ export interface OldDataRootDeletionPlan {
 export async function planOldDataRootDeletion(input: {
   oldRootPath: string;
   currentRootPath: string;
+  /**
+   * The relocation the data-root pointer names as the switch from the old directory (its
+   * lastMigration.relocationId); a switch without copying has none and never justifies a deletion.
+   */
+  relocationId?: string;
   /** VS Code's own storage directory keeps the pointer file and is never removed itself. */
   keepEntries?: readonly string[];
 }): Promise<OldDataRootDeletionPlan> {
@@ -1891,12 +2108,16 @@ export async function planOldDataRootDeletion(input: {
   const problems: string[] = [];
   if (isSamePath(oldRoot, currentRoot)) problems.push('旧目录就是当前数据目录。');
   const marker = await readMarker(currentRoot);
-  if (marker?.state !== 'complete' || !isSamePath(path.resolve(marker.sourceRootPath), oldRoot)) {
+  if (!input.relocationId) {
+    problems.push('当前目录是切换过来的（回到旧目录、选择其它目录或使用默认目录），没有复制旧目录的数据，不能据此删除旧目录。');
+  } else if (marker?.state !== 'complete' || !isSamePath(path.resolve(marker.sourceRootPath), oldRoot)) {
     problems.push('找不到从这个目录迁移完成的记录，为避免误删，不能在这里删除它。');
+  } else if (marker.relocationId !== input.relocationId) {
+    problems.push('当前目录里的迁移记录不是切换到这里的那次迁移留下的，为避免误删，不能在这里删除旧目录。');
   } else if (marker.invalidatedAt) {
     problems.push('迁移之后回到过这个旧目录，它可能有新的数据；迁移记录不再作为删除依据。需要时请再迁移一次（会合并），之后才能删除。');
   }
-  if (problems.length > 0 || !marker) return { oldRootPath: oldRoot, problems, items: [], kept: [] };
+  if (problems.length > 0 || marker?.state !== 'complete') return { oldRootPath: oldRoot, problems, items: [], kept: [] };
   const items: OldDataRootDeletionItem[] = [];
   const covered = new Set<string>();
   const cover = (absolute: string): void => { covered.add(path.relative(oldRoot, absolute).split(path.sep)[0]); };
@@ -2011,6 +2232,7 @@ export async function planOldDataRootDeletion(input: {
 export async function deleteOldDataRoot(input: {
   oldRootPath: string;
   currentRootPath: string;
+  relocationId?: string;
   keepEntries?: readonly string[];
   include?: readonly string[];
   /** Keys of the items the confirmation listed for deletion. */
@@ -2067,15 +2289,27 @@ function configurationLabel(entry: string): string {
 // ---------------------------------------------------------------------------------------------
 // Files
 
+function isGlobalStatusName(name: string): boolean {
+  return name === GLOBAL_STATUS_FILE || name.startsWith(`${GLOBAL_STATUS_FILE}.`);
+}
+
 function isClaimName(name: string): boolean {
   return name.endsWith('.runtime-maintenance') || name.includes('.runtime-maintenance.generation-')
     || name.endsWith('.runtime-admission') || name.includes('.runtime-admission.generation-');
 }
 
 /**
- * LimCode's own record-store locks and atomic-write temporaries, by their exact shapes; a user file
+ * LimCode's own locks and atomic-write temporaries: the exact names, or a lock directory
+ * (`<file>.lock`, its candidates and quarantined generations, each holding owner.json). A user file
  * that merely ends in .lock or .tmp (e.g. in a checkpoint worktree) is configuration like any other.
  */
+async function isTransientEntry(directory: string, name: string): Promise<boolean> {
+  if (isTransientName(name)) return true;
+  if (!/\.lock(?:\.(?:candidate|generation)-.+)?$/.test(name)) return false;
+  const info = await lstatOrUndefined(path.join(directory, name));
+  return !!info?.isDirectory() && (await lstatOrUndefined(path.join(directory, name, 'owner.json')))?.isFile() === true;
+}
+
 function isTransientName(name: string): boolean {
   return name === `${INDEX_FILE}.lock` || name.startsWith(`${INDEX_FILE}.lock.generation-`)
     || /\.\d+\.\d+\.\d+\.tmp$/.test(name)
