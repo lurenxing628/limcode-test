@@ -483,6 +483,73 @@ test('没有现成终态转换的续跑投递只报告不收尾：父 Turn 已�
   }
 });
 
+test('父 Turn 已完成的后台子 Agent（在等提问）：按子对话面板的停止收尾，子 Agent 转为空闲、不发布答复，恢复后父对话不续跑', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const conversationId = 'conversation-detached';
+  let parentCalls = 0;
+  const origin = await openHost(oldDataRoot, scriptedProvider(async (request) => {
+    // The child has output before it asks: a subtree interruption would publish it as an answer.
+    if (request.conversationId !== conversationId) {
+      const ask = askCall('child-ask', '后台子 Agent 要继续吗？');
+      return { ...ask, parts: [{ text: '后台子任务已经完成一半。' }, ...ask.parts] };
+    }
+    parentCalls += 1;
+    return parentCalls === 1
+      ? spawnCall('spawn-detached', 'detached', '后台子任务', 0)
+      : { role: 'model', parts: [{ text: '父 Turn 已完成' }] };
+  }), { label: 'origin' });
+  let parentTurnId;
+  try {
+    await createConversation(origin.app, conversationId);
+    parentTurnId = (await origin.runner.input({ commandId: 'input-detached', conversationId, text: '派一个后台子 Agent' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: parentTurnId }))[0]?.terminal_status === 'completed'
+      && (await rows(origin.app, 'InteractionRequest', { status: 'pending' })).length === 1, 60_000, '父 Turn 未完成或子 Agent 未提问');
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  const parentEntry = inventory.conversations.find((entry) => entry.conversationId === conversationId);
+  assert.equal(parentEntry.childExecutionIds.length, 1, '父对话列出仍在运行的后台子 Agent');
+  const childEntry = inventory.conversations.find((entry) => entry.conversationId !== conversationId);
+  assert.equal(childEntry.activeTurnIds.length, 1);
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    const [child] = await rows(oldHost.app, 'ChildExecution');
+    const [childTurnId] = childEntry.activeTurnIds;
+    const messagesBefore = await Promise.all([conversationId, child.child_conversation_id].map((id) => messageIds(oldHost.app, id)));
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual(settled.unsettled, [], '后台子 Agent 不再只报告');
+    assert.deepEqual(settled.live, []);
+    assert.equal(settled.counts.backgroundChildrenStopped, 1);
+    assert.equal(settled.counts.childTurnsStopped, 1);
+    assert.equal(settled.counts.childExecutionsInterrupted, 0, '不按子树中断，不发布中断答复');
+    assert.equal(settled.counts.interactionsCancelled, 1);
+    assert.equal((await rows(oldHost.app, 'TurnTermination', { turn_id: childTurnId }))[0].terminal_status, 'interrupted');
+    const [stop] = await rows(oldHost.app, 'PendingTurnInput', { turn_id: childTurnId, input_kind: 'interrupt_request' });
+    assert.equal((await readContentJson(oldHost.app, stop.content_object_id)).reason, relocatedWorkSettlementReason(target));
+    const again = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual(again.unsettled, []);
+    assert.deepEqual(Object.values(again.counts).filter((count) => count !== 0), [], '再次收尾不改变任何东西');
+
+    await oldHost.recover();
+    await quiet(oldHost);
+    assert.equal(inOld.calls.length, 0, '旧目录不再调用模型，父对话不续跑');
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: conversationId })).map((turn) => turn.id), [parentTurnId], '父对话没有新的 Turn');
+    assert.equal((await rows(oldHost.app, 'ChildExecution', { id: child.id }))[0].status, 'idle', '子 Agent 转为空闲');
+    assert.deepEqual(await rows(oldHost.app, 'AnswerSubmission'), [], '子 Agent 没有发布答复');
+    assert.deepEqual(await rows(oldHost.app, 'RuntimeDelivery', { target_conversation_id: conversationId }), [], '没有投给父对话的结果');
+    await assertMessagesKept(oldHost.app, conversationId, messagesBefore[0]);
+    await assertMessagesKept(oldHost.app, child.child_conversation_id, messagesBefore[1]);
+    assert.deepEqual(errors(oldHost), []);
+  } finally {
+    await oldHost.close();
+  }
+});
+
 }
 
 // ---- fixture ----
