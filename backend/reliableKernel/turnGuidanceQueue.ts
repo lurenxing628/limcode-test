@@ -197,6 +197,66 @@ export class TurnGuidanceQueueOperations {
     }
   }
 
+  /**
+   * Cancels a queued TurnIntent that is not an ordinary guidance message (a continuation, a runtime
+   * continuation, a retry), as a data-root relocation settles the work it carried away. A child continuation
+   * stays with its lineage: only the subtree interruption cancels it. Same fence and receipt as
+   * cancelQueuedGuidance; the intent never starts a Turn afterwards.
+   */
+  public async cancelQueuedIntent(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
+    const source = normalizeInitiatingSource(command.source, 'guidance');
+    const conversationId = requireId(command.conversationId, 'conversationId');
+    const intentId = requireId(command.intentId, 'intentId');
+    const expectedRevisionSeq = requireDecimalIntegerString(command.expectedRevisionSeq, 'expectedRevisionSeq');
+    const commandScope = JSON.stringify(['cancel-intent', conversationId, intentId, expectedRevisionSeq]);
+    const receiptId = commandEntityId(source, 'guidance', 'command_receipt', commandScope);
+    const duplicate = await this.deps.findReceipt(source);
+    if (duplicate) return guidanceDuplicateResult(duplicate, receiptId, conversationId, intentId);
+    const intent = await this.deps.requireExisting('TurnIntent', intentId);
+    if (intent.conversation_id !== conversationId || intent.state !== TURN_INTENT_STATE_QUEUED || intent.turn_id !== null) {
+      throw new GuidanceControlConflictError(conversationId, intentId);
+    }
+    if ((await this.deps.listRows('ChildExecutionIntentLink', { turn_intent_id: intentId }, 1)).length > 0) {
+      throw new Error(`TurnIntent ${intentId} continues a child Agent: its lineage interruption cancels it.`);
+    }
+    const revisions = await listAllDomainRows(this.deps.database, 'TurnIntentRevision', { intent_id: intentId });
+    const currentRevisionSeq = revisions.reduce((maximum, revision) => {
+      const seq = requireBigInt(revision.revision_seq, 'TurnIntentRevision.revision_seq');
+      return seq > maximum ? seq : maximum;
+    }, 0n).toString();
+    if (currentRevisionSeq !== expectedRevisionSeq) throw new GuidanceControlConflictError(conversationId, intentId);
+    const now = this.timestamp();
+    try {
+      const commit = await this.deps.commitWithReceipt({
+        source,
+        receiptId,
+        conversationId,
+        turnId: null,
+        steps: [
+          DOMAIN_REPOSITORIES.domain('TurnIntent').assert(intentId, {
+            conversation_id: conversationId,
+            state: TURN_INTENT_STATE_QUEUED,
+            turn_id: null
+          }),
+          DOMAIN_REPOSITORIES.domain('TurnIntentRevision').assertExactIds(
+            { intent_id: intentId },
+            revisions.map((revision) => requireId(revision.id, 'TurnIntentRevision.id'))
+          ),
+          DOMAIN_REPOSITORIES.domain('TurnIntent').update(intentId, {
+            state: TURN_INTENT_STATE_CANCELLED,
+            updated_at: now
+          }),
+          DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
+        ]
+      });
+      if (commit.deduplicated) return guidanceDuplicateResult(commit.receipt, receiptId, conversationId, intentId);
+      return { receiptId, deduplicated: false, commitSeq: commit.commitSeq, conversationId, intentId };
+    } catch (error) {
+      if (isTransactionAssertionError(error)) throw new GuidanceControlConflictError(conversationId, intentId);
+      throw error;
+    }
+  }
+
   public async reviseGuidanceHold(command: TurnGuidanceHoldCommand): Promise<TurnCommandResult> {
     const source = normalizeInitiatingSource(command.source, 'guidance');
     const conversationId = requireId(command.conversationId, 'conversationId');

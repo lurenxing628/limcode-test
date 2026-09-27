@@ -267,6 +267,7 @@ test('运行中的子 Agent（带子树）：父 Turn 停止后级联停止子�
     const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
     assert.deepEqual(settled.unsettled, []);
     assert.deepEqual(settled.live, []);
+    assert.equal(settled.rounds, 1, '停下的子树等子调度器收敛，这不算新出现的工作');
     assert.equal(settled.counts.turnsStopped, 1);
     assert.equal(settled.counts.childTurnsStopped, 2, '子与孙的 Turn 都停止');
     assert.equal(settled.counts.childExecutionsInterrupted, 2);
@@ -436,53 +437,6 @@ test('已派发未回执的 MCP 调用：派发它的窗口被杀，收尾按迁
   }
 });
 
-test('没有现成终态转换的续跑投递只报告不收尾：父 Turn 已完成后才到的子 Agent 答复原样留下并写明原因', { timeout: 240_000 }, async (t) => {
-  const fixture = await reloc.createFixture(t, { withAlpha: false });
-  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
-  const conversationId = 'conversation-late-answer';
-  let releaseChild;
-  const childGate = new Promise((resolve) => { releaseChild = resolve; });
-  let parentCalls = 0;
-  const origin = await openHost(oldDataRoot, scriptedProvider(async (request) => {
-    if (request.conversationId !== conversationId) {
-      await childGate;
-      return { role: 'model', parts: [{ text: '子任务完成' }] };
-    }
-    parentCalls += 1;
-    return parentCalls === 1
-      ? spawnCall('spawn-late', 'late', '后台子任务', 0)
-      : { role: 'model', parts: [{ text: '父 Turn 先结束' }] };
-  }), { label: 'origin' });
-  let parentTurnId;
-  try {
-    await createConversation(origin.app, conversationId);
-    parentTurnId = (await origin.runner.input({ commandId: 'input-late', conversationId, text: '派后台子 Agent' })).turnId;
-    await eventually(async () => (await rows(origin.app, 'Turn', { id: parentTurnId }))[0]?.status === 'terminated', 60_000, '父 Turn 未结束');
-    releaseChild();
-    await eventually(async () => (await rows(origin.app, 'RuntimeDelivery', { target_conversation_id: conversationId, state: 'pending' })).length === 1,
-      60_000, '子 Agent 的答复没有投递给父对话');
-  } finally {
-    await origin.close();
-  }
-  const { target } = await relocateOldHome(fixture);
-  const inventory = inventoryOf(oldDataRoot);
-  const [deliveryId] = inventory.conversations.find((entry) => entry.conversationId === conversationId).pendingDeliveryIds;
-
-  const oldHost = await openHost(oldDataRoot, countingProvider('old-home'), { label: 'old-home' });
-  try {
-    const [before] = await rows(oldHost.app, 'RuntimeDelivery', { id: deliveryId });
-    assert.deepEqual([before.phase, before.target_turn_id, before.state], ['next_turn', null, 'pending'], '答复等着开启新的 Turn');
-    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
-    assert.deepEqual(settled.unsettled.map((item) => [item.conversationId, item.kind, item.id]),
-      [[conversationId, 'continuation_delivery', deliveryId]]);
-    assert.match(settled.unsettled[0].detail, /没有现成的终态转换/);
-    const [after] = await rows(oldHost.app, 'RuntimeDelivery', { id: deliveryId });
-    assert.deepEqual(after, before, '没有现成终态转换的投递不被改写');
-  } finally {
-    await oldHost.close();
-  }
-});
-
 test('父 Turn 已完成的后台子 Agent（在等提问）：按子对话面板的停止收尾，子 Agent 转为空闲、不发布答复，恢复后父对话不续跑', { timeout: 240_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
@@ -524,6 +478,7 @@ test('父 Turn 已完成的后台子 Agent（在等提问）：按子对话面�
     const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
     assert.deepEqual(settled.unsettled, [], '后台子 Agent 不再只报告');
     assert.deepEqual(settled.live, []);
+    assert.equal(settled.rounds, 1);
     assert.equal(settled.counts.backgroundChildrenStopped, 1);
     assert.equal(settled.counts.childTurnsStopped, 1);
     assert.equal(settled.counts.childExecutionsInterrupted, 0, '不按子树中断，不发布中断答复');
@@ -550,12 +505,522 @@ test('父 Turn 已完成的后台子 Agent（在等提问）：按子对话面�
   }
 });
 
+test('父 Turn 已完成后才到的子 Agent 答复（会开启新的 Turn）：收尾按“数据目录已迁移”放弃投递、唤醒进死信，子任务投影写明原因；恢复后父对话不续跑；再次收尾不改变任何东西', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const conversationId = 'conversation-late-answer';
+  let releaseChild;
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  let parentCalls = 0;
+  const origin = await openHost(oldDataRoot, scriptedProvider(async (request) => {
+    if (request.conversationId !== conversationId) {
+      await childGate;
+      return { role: 'model', parts: [{ text: '子任务完成' }] };
+    }
+    parentCalls += 1;
+    return parentCalls === 1
+      ? spawnCall('spawn-late', 'late', '后台子任务', 0)
+      : { role: 'model', parts: [{ text: '父 Turn 先结束' }] };
+  }), { label: 'origin' });
+  let parentTurnId;
+  try {
+    await createConversation(origin.app, conversationId);
+    parentTurnId = (await origin.runner.input({ commandId: 'input-late', conversationId, text: '派后台子 Agent' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'Turn', { id: parentTurnId }))[0]?.status === 'terminated', 60_000, '父 Turn 未结束');
+    releaseChild();
+    await eventually(async () => (await rows(origin.app, 'RuntimeDelivery', { target_conversation_id: conversationId, state: 'pending' })).length === 1,
+      60_000, '子 Agent 的答复没有投递给父对话');
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  const [deliveryId] = inventory.conversations.find((entry) => entry.conversationId === conversationId).pendingDeliveryIds;
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    const [before] = await rows(oldHost.app, 'RuntimeDelivery', { id: deliveryId });
+    assert.deepEqual([before.phase, before.target_turn_id, before.state], ['next_turn', null, 'pending'], '答复等着开启新的 Turn');
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual([settled.unsettled, settled.live, settled.rounds], [[], [], 1]);
+    assert.equal(settled.counts.deliveriesAbandoned, 1);
+    assert.deepEqual((await rows(oldHost.app, 'RuntimeDelivery', { id: deliveryId })).map((row) => [row.state, row.failure_reason]),
+      [['failed', 'data-root-relocated']]);
+    await assertWakesDeadLettered(oldHost.app, deliveryId);
+    const [task] = (await oldHost.app.runtime.children.readConversationTaskProjection(conversationId)).tasks;
+    assert.deepEqual(task.result.deliveries.map((item) => [item.state, item.failureReason, item.failureReasonText]),
+      [['failed', 'data-root-relocated', '数据目录已迁移，未送达']], '子任务投影写明数据目录已迁移、未送达');
+    await assertSettledAgain(oldHost, inventory, target);
+    await recoverIdle(oldHost, inOld);
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: conversationId })).map((turn) => turn.id), [parentTurnId], '父对话没有续跑');
+    assert.equal((await rows(oldHost.app, 'RuntimeDelivery', { id: deliveryId }))[0].state, 'failed', '恢复不重试放弃的投递');
+  } finally {
+    await oldHost.close();
+  }
+});
+
+test('排队的非普通消息（运行时续跑、续写）：收尾取消排在运行中 Turn 后面的两条续跑并停止该 Turn，续跑所属的追问按“数据目录已迁移”放弃，请求方的回复下一轮一并放弃；恢复后不准入、不开新 Turn', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const [conversationId, requester] = ['conversation-queued-intents', 'conversation-queued-requester'];
+  let calls = 0;
+  const origin = await openHost(oldDataRoot, scriptedProvider(async () => {
+    calls += 1;
+    return calls === 1 ? { role: 'model', parts: [{ text: '第一个回合结束' }] } : askCall('ask-second', '第二个回合先问一句');
+  }), { label: 'origin' });
+  let firstTurnId;
+  let secondTurnId;
+  const deliveryId = 'followup-queued-delivery';
+  const queuedIntentIds = [];
+  try {
+    await createConversation(origin.app, conversationId);
+    await createConversation(origin.app, requester);
+    firstTurnId = (await origin.runner.input({ commandId: 'input-first', conversationId, text: '第一个回合' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: firstTurnId }))[0]?.terminal_status === 'completed',
+      60_000, '第一个回合未完成');
+    secondTurnId = (await origin.runner.input({ commandId: 'input-second', conversationId, text: '再问一句' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'InteractionRequest', { status: 'pending' })).length === 1, 60_000, '第二个回合未进入等待');
+    // A peer's followup starts its own Turn (no other Turn takes it in). Its wake raced the second
+    // Turn's admission, so its runtime continuation queues behind that Turn; so does the user's
+    // "continue" of the first Turn.
+    await pendingFollowup(origin.app, 'followup-queued', requester, conversationId);
+    queuedIntentIds.push((await origin.runner.runtimeContinuation({
+      commandId: `runtime-delivery:${deliveryId}`, deliveryId, conversationId, sourceTurnId: null
+    })).intentId);
+    queuedIntentIds.push((await origin.runner.continuation({
+      commandId: 'continue-first', conversationId, sourceTurnId: firstTurnId, text: '接着第一个回合做'
+    })).intentId);
+    for (const intentId of queuedIntentIds) assert.equal((await rows(origin.app, 'TurnIntent', { id: intentId }))[0].state, 'queued');
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  const entry = inventory.conversations.find((item) => item.conversationId === conversationId);
+  assert.deepEqual(entry.queuedIntentIds, [...queuedIntentIds].sort());
+  assert.deepEqual([entry.activeTurnIds, entry.pendingDeliveryIds], [[secondTurnId], [deliveryId]]);
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual([settled.unsettled, settled.live, settled.rounds], [[], [], 2]);
+    assert.equal(settled.counts.queuedIntentsCancelled, 2, '运行时续跑和续写都取消');
+    assert.equal(settled.counts.queuedMessagesCancelled, 0);
+    assert.equal(settled.counts.turnsStopped, 1);
+    assert.equal(settled.counts.interactionsCancelled, 1);
+    assert.equal(settled.counts.deliveriesAbandoned, 2, '追问与给请求方的回复');
+    for (const intentId of queuedIntentIds) assert.equal((await rows(oldHost.app, 'TurnIntent', { id: intentId }))[0].state, 'cancelled');
+    assert.deepEqual((await rows(oldHost.app, 'RuntimeDelivery', { id: deliveryId })).map((row) => [row.state, row.failure_reason]),
+      [['failed', 'data-root-relocated']]);
+    await assertWakesDeadLettered(oldHost.app, deliveryId, 1);
+    await assertSettledAgain(oldHost, inventory, target);
+    await recoverIdle(oldHost, inOld);
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: conversationId })).map((turn) => turn.id).sort(), [firstTurnId, secondTurnId].sort());
+    assert.deepEqual(await rows(oldHost.app, 'Turn', { conversation_id: requester }), []);
+  } finally {
+    await oldHost.close();
+  }
+});
+
+test('还没送达的子 Agent 答复（答复已提交、窗口在投递之前关闭）：收尾在同一事务里给它一条已失败的投递、没有唤醒；恢复后不再投递、父对话不续跑', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const conversationId = 'conversation-unrouted';
+  let releaseChild;
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  let parentCalls = 0;
+  const origin = await openHost(oldDataRoot, scriptedProvider(async (request) => {
+    if (request.conversationId !== conversationId) {
+      await childGate;
+      return { role: 'model', parts: [{ text: '子任务完成：结果 7' }] };
+    }
+    parentCalls += 1;
+    return parentCalls === 1
+      ? spawnCall('spawn-unrouted', 'unrouted', '后台子任务', 0)
+      : { role: 'model', parts: [{ text: '父 Turn 先结束' }] };
+  }), { label: 'origin' });
+  // The answer's submission and its delivery are separate commits: the window stops in between.
+  origin.coordinator.deliverBackgroundAnswer = async () => { throw new Error('窗口在答复送达父对话之前关闭'); };
+  let parentTurnId;
+  let submissionId;
+  try {
+    await createConversation(origin.app, conversationId);
+    parentTurnId = (await origin.runner.input({ commandId: 'input-unrouted', conversationId, text: '派后台子 Agent' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: parentTurnId }))[0]?.terminal_status === 'completed',
+      60_000, '父 Turn 未完成');
+    releaseChild();
+    await eventually(async () => (await rows(origin.app, 'AnswerSubmission')).length === 1, 60_000, '子 Agent 没有提交答复');
+    [{ id: submissionId }] = await rows(origin.app, 'AnswerSubmission');
+    await origin.coordinator.waitForIdle();
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  const entry = inventory.conversations.find((item) => item.conversationId === conversationId);
+  assert.deepEqual([entry.undeliveredAnswerIds, entry.pendingDeliveryIds], [[submissionId], []], '答复已提交、还没投递');
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    assert.deepEqual(await rows(oldHost.app, 'RuntimeDelivery'), []);
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual([settled.unsettled, settled.live, settled.rounds], [[], [], 1]);
+    assert.equal(settled.counts.answersAbandoned, 1);
+    const deliveries = await rows(oldHost.app, 'RuntimeDelivery');
+    assert.deepEqual(deliveries.map((row) => [row.target_conversation_id, row.target_turn_id, row.state, row.failure_reason, String(row.attempt_seq)]),
+      [[conversationId, null, 'failed', 'data-root-relocated', '1']]);
+    const [delivery] = deliveries;
+    assert.deepEqual(await rows(oldHost.app, 'RuntimeDeliveryWake', { delivery_id: delivery.id }), [], '已失败的投递没有唤醒');
+    assert.equal((await rows(oldHost.app, 'RuntimeInboxItem', { id: delivery.inbox_item_id }))[0].state, 'routed');
+    const [task] = (await oldHost.app.runtime.children.readConversationTaskProjection(conversationId)).tasks;
+    assert.deepEqual(task.result.deliveries.map((item) => [item.id, item.failureReasonText]), [[delivery.id, '数据目录已迁移，未送达']]);
+    await assertSettledAgain(oldHost, inventory, target);
+    await recoverIdle(oldHost, inOld);
+    assert.deepEqual((await rows(oldHost.app, 'RuntimeDelivery')).map((row) => row.id), [delivery.id], '恢复不再投递这条答复');
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: conversationId })).map((turn) => turn.id), [parentTurnId], '父对话没有续跑');
+  } finally {
+    await oldHost.close();
+  }
+});
+
+test('已结束、完成通知还没派发的后台进程：收尾把完成派发置为死信，不生成投递；恢复后对话不续跑', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const conversationId = 'conversation-process-exit';
+  const origin = await openHost(oldDataRoot, scriptedProvider(() => ({ role: 'model', parts: [{ text: '构建已在后台运行' }] })), { label: 'origin' });
+  let turnId;
+  let dispatchId;
+  try {
+    await createConversation(origin.app, conversationId);
+    turnId = (await origin.runner.input({ commandId: 'input-process-exit', conversationId, text: '在后台跑构建' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: turnId }))[0]?.terminal_status === 'completed', 30_000, 'Turn 未完成');
+    await origin.runner.waitForIdle();
+    // The build it started exited after the window closed: its completion notice is not dispatched yet.
+    dispatchId = await pendingProcessDispatch(origin.app, 'process-exited', conversationId, turnId);
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  assert.deepEqual(inventory.conversations.map((entry) => [entry.conversationId, entry.pendingProcessCompletionIds]), [[conversationId, [dispatchId]]]);
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual([settled.unsettled, settled.live, settled.rounds], [[], [], 1]);
+    assert.equal(settled.counts.processCompletionsAbandoned, 1);
+    assert.deepEqual((await rows(oldHost.app, 'ProcessCompletionDispatch', { id: dispatchId }))
+      .map((row) => [row.state, row.last_error, row.claim_owner_host_boot_id, row.claim_expires_at]), [['dead_letter', 'data-root-relocated', null, null]]);
+    await assertSettledAgain(oldHost, inventory, target);
+    await recoverIdle(oldHost, inOld);
+    assert.deepEqual(await rows(oldHost.app, 'RuntimeDelivery', { target_conversation_id: conversationId }), [], '没有生成完成投递');
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: conversationId })).map((turn) => turn.id), [turnId]);
+  } finally {
+    await oldHost.close();
+  }
+});
+
+test('父 Turn 已完成的后台子 Agent（在等提问、还排着一条 send）：先按子对话面板的停止收尾它的 Turn，再按子树中断取消排队的续跑，不发布答复；恢复后谁都不再执行', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const conversationId = 'conversation-detached-queued';
+  let parentCalls = 0;
+  const origin = await openHost(oldDataRoot, scriptedProvider(async (request) => {
+    // The child has output before it asks: an interruption with a termination request would publish it.
+    if (request.conversationId !== conversationId) {
+      const ask = askCall('child-ask', '后台子 Agent 要继续吗？');
+      return { ...ask, parts: [{ text: '后台子任务已经完成一半。' }, ...ask.parts] };
+    }
+    parentCalls += 1;
+    if (parentCalls === 1) return spawnCall('spawn-detached-queued', 'detached', '后台子任务', 0);
+    // run_agent send to the child's short reference: it queues after the child's current Turn.
+    if (parentCalls === 2) {
+      return { role: 'model', parts: [{ id: 'send-detached', functionCall: { name: 'run_agent',
+        args: { operation: 'send', childRef: 'A1', prompt: '做完之后再检查一遍' } } }] };
+    }
+    return { role: 'model', parts: [{ text: '父 Turn 已完成' }] };
+  }), { label: 'origin' });
+  let parentTurnId;
+  try {
+    await createConversation(origin.app, conversationId);
+    parentTurnId = (await origin.runner.input({ commandId: 'input-detached-queued', conversationId, text: '派一个后台子 Agent，再追加一条任务' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: parentTurnId }))[0]?.terminal_status === 'completed'
+      && (await rows(origin.app, 'InteractionRequest', { status: 'pending' })).length === 1
+      && (await rows(origin.app, 'ChildExecutionIntentLink', { state: 'pending' })).length === 1, 60_000, '父 Turn 未完成、子 Agent 未提问或 send 没有排队');
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  const childEntry = inventory.conversations.find((entry) => entry.conversationId !== conversationId);
+  assert.equal(childEntry.activeTurnIds.length, 1);
+  assert.equal(childEntry.queuedIntentIds.length, 1, 'send 排在子 Agent 当前 Turn 后面');
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    const [child] = await rows(oldHost.app, 'ChildExecution');
+    const [childTurnId] = childEntry.activeTurnIds;
+    const [sendIntentId] = childEntry.queuedIntentIds;
+    await assert.rejects(oldHost.app.turns.cancelQueuedIntent({ source: { kind: 'command', key: 'cancel-child-continuation' },
+      conversationId: child.child_conversation_id, intentId: sendIntentId, expectedRevisionSeq: '1' }), /lineage interruption cancels it/,
+    '子 Agent 的续跑只随子树中断取消');
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual([settled.unsettled, settled.live, settled.rounds], [[], [], 1]);
+    assert.equal(settled.counts.backgroundChildrenStopped, 1);
+    assert.equal(settled.counts.childTurnsStopped, 1);
+    assert.equal(settled.counts.interactionsCancelled, 1);
+    assert.equal(settled.counts.childExecutionsInterrupted, 1, '排队的续跑随子树中断取消');
+    assert.equal(settled.counts.childContinuationsCancelled, 1);
+    assert.equal((await rows(oldHost.app, 'TurnTermination', { turn_id: childTurnId }))[0].terminal_status, 'interrupted');
+    assert.deepEqual(await rows(oldHost.app, 'PendingTurnInput', { turn_id: childTurnId, input_kind: 'termination_request' }), [],
+      '子 Turn 先停下，子树中断不写终止请求');
+    assert.equal((await rows(oldHost.app, 'TurnIntent', { id: sendIntentId }))[0].state, 'cancelled');
+    await assertSettledAgain(oldHost, inventory, target);
+    await recoverIdle(oldHost, inOld);
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: conversationId })).map((turn) => turn.id), [parentTurnId], '父对话没有新的 Turn');
+    assert.deepEqual((await rows(oldHost.app, 'Turn', { conversation_id: child.child_conversation_id })).map((turn) => turn.id), [childTurnId], '排队的 send 没有开启子 Agent 的新 Turn');
+    assert.deepEqual(await rows(oldHost.app, 'AnswerSubmission'), [], '子 Agent 没有发布答复');
+    assert.deepEqual(await rows(oldHost.app, 'RuntimeDelivery', { target_conversation_id: conversationId }), [], '没有投给父对话的结果');
+  } finally {
+    await oldHost.close();
+  }
+});
+
+test('协作副作用循环收尾：放弃发给对方的追问后，请求方收到“没人会回答”的回复，这条回复又会开启回合，下一轮一并放弃；恢复后两边都不执行', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const oldDataRoot = fixture.current.binding.paths.dataRootPath;
+  const [requester, peer] = ['conversation-requester', 'conversation-peer'];
+  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin' });
+  let requesterTurnId;
+  try {
+    await createConversation(origin.app, requester);
+    await createConversation(origin.app, peer);
+    // The requester's Turn sent the followup and ended; the reply to it may open a new Turn there.
+    requesterTurnId = (await origin.runner.input({ commandId: 'input-requester', conversationId: requester, text: '请对方复核部署脚本' })).turnId;
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: requesterTurnId }))[0]?.terminal_status === 'completed',
+      30_000, '请求方的回合未完成');
+    await origin.runner.waitForIdle();
+    await pendingFollowup(origin.app, 'followup-carried', requester, peer, { sourceTurnId: requesterTurnId });
+    // A plain message without a wake just waits for the peer's next Turn: it opens none.
+    await pendingFollowup(origin.app, 'message-waiting', requester, peer, { mode: 'message' });
+  } finally {
+    await origin.close();
+  }
+  const { target } = await relocateOldHome(fixture);
+  const inventory = inventoryOf(oldDataRoot);
+  assert.deepEqual(inventory.conversations.map((entry) => [entry.conversationId, entry.pendingDeliveryIds]), [[peer, ['followup-carried-delivery']]]);
+
+  const inOld = countingProvider('old-home');
+  const oldHost = await openHost(oldDataRoot, inOld, { label: 'old-home', wake: true });
+  try {
+    const settled = await settleRelocatedWork({ application: oldHost.app, inventory, targetRootPath: target });
+    assert.deepEqual([settled.unsettled, settled.live], [[], []]);
+    assert.equal(settled.rounds, 2, '第一轮放弃追问，第二轮放弃给请求方的回复');
+    assert.equal(settled.counts.deliveriesAbandoned, 2);
+    assert.equal((await rows(oldHost.app, 'CollaborationRequest', { id: 'followup-carried-request' }))[0].state, 'failed');
+    const [replyLink] = await rows(oldHost.app, 'CollaborationMessageReplyLink', { request_message_id: 'followup-carried' });
+    const replyText = (await oldHost.app.runtime.collaboration.readMessage({ conversationId: requester, messageId: replyLink.message_id })).text;
+    assert.match(replyText, /data directory was relocated/);
+    const replyDeliveries = await rows(oldHost.app, 'RuntimeDelivery', { target_conversation_id: requester });
+    assert.deepEqual(replyDeliveries.map((row) => [row.state, row.failure_reason]), [['failed', 'data-root-relocated']]);
+    for (const deliveryId of ['followup-carried-delivery', replyDeliveries[0].id]) await assertWakesDeadLettered(oldHost.app, deliveryId, 1);
+    assert.equal((await rows(oldHost.app, 'RuntimeDelivery', { id: 'message-waiting-delivery' }))[0].state, 'pending', '不开回合的普通消息留着等下一个回合');
+    await assertSettledAgain(oldHost, inventory, target);
+    await recoverIdle(oldHost, inOld);
+    assert.deepEqual((await rows(oldHost.app, 'Turn')).map((turn) => turn.id), [requesterTurnId], '两边都没有开启新的回合');
+  } finally {
+    await oldHost.close();
+  }
+});
+
+test('放弃转换（控制面）：存活宿主的认领没过期就返回 live、什么都不改，认领过期或认领它的窗口已死就照常放弃：一个事务放弃投递、唤醒进死信并取消它排队的运行时续跑；完成派发、未路由的结果与排队的续写同理；重复调用幂等', { timeout: 120_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const conversationId = 'conversation-abandon';
+  const reason = 'data-root-relocated';
+  const host = await openHost(fixture.current.binding.paths.dataRootPath, scriptedProvider(() => ({ role: 'model', parts: [{ text: '完成' }] })), { label: 'control' });
+  try {
+    const { app } = host;
+    await createConversation(app, conversationId);
+    const firstTurnId = (await host.runner.input({ commandId: 'input-control', conversationId, text: '第一个回合' })).turnId;
+    await eventually(async () => (await rows(app, 'TurnTermination', { turn_id: firstTurnId }))[0]?.terminal_status === 'completed', 30_000, '第一个回合未完成');
+    await host.runner.waitForIdle();
+    // A Turn holding the Conversation's execution lease: continuations queue behind it.
+    const hostBootId = app.database.hostBootId;
+    const lease = { leaseOwnerId: `control:${hostBootId}`, hostBootId, leaseExpiresAt: new Date(Date.now() + 120_000).toISOString() };
+    const running = await app.database.conversationOwners.run(conversationId, () => app.turns.input({
+      source: { kind: 'command', key: 'input-running' }, conversationId, ...lease, content: '第二个回合', contentType: 'text/plain; charset=utf-8'
+    }));
+    assert.equal(running.admitted, true);
+    // A claim a live Host holds (this very process stands in for it), expiring shortly: live until
+    // then, nobody's afterwards. A claim whose Host is gone is stale right away.
+    const liveHost = app.database.hostBootId;
+    const shortClaim = () => new Date(Date.now() + 1_500).toISOString();
+    const longClaim = () => new Date(Date.now() + 600_000).toISOString();
+    const untilExpired = (expiresAt) => sleep(Math.max(0, Date.parse(expiresAt) - Date.now()) + 50);
+
+    // abandonPending: a peer's followup whose runtime continuation queued behind the running Turn.
+    await createConversation(app, 'conversation-abandon-requester');
+    await pendingFollowup(app, 'followup-control', 'conversation-abandon-requester', conversationId);
+    const delivery = { id: 'followup-control-delivery' };
+    const continuation = await app.database.conversationOwners.run(conversationId, () => app.turns.runtimeContinuation({
+      source: { kind: 'internal', key: `runtime-delivery:${delivery.id}` }, conversationId, ...lease, sourceTurnId: null, deliveryId: delivery.id
+    }));
+    assert.equal((await rows(app, 'TurnIntent', { id: continuation.intentId }))[0].state, 'queued', '续跑排在运行中的 Turn 后面');
+    const wakeId = 'followup-control-wake';
+    const wakeClaimExpiresAt = shortClaim();
+    await app.database.transaction([repo('RuntimeDeliveryWake').update(wakeId, { state: 'claimed', claim_owner_host_boot_id: liveHost,
+      claim_generation: 1n, claim_expires_at: wakeClaimExpiresAt, attempt_count: 1n, next_attempt_at: null, updated_at: new Date().toISOString() })]);
+    const deliveries = app.runtime.deliveries;
+    assert.deepEqual(await deliveries.abandonPending({ deliveryId: delivery.id, reason }), { outcome: 'live' });
+    assert.equal((await rows(app, 'RuntimeDelivery', { id: delivery.id }))[0].state, 'pending', '存活宿主认领着唤醒：不动');
+    assert.equal((await rows(app, 'RuntimeDeliveryWake', { id: wakeId }))[0].state, 'claimed');
+    assert.equal((await rows(app, 'TurnIntent', { id: continuation.intentId }))[0].state, 'queued');
+    await untilExpired(wakeClaimExpiresAt);
+    assert.deepEqual(await deliveries.abandonPending({ deliveryId: delivery.id, reason }), { outcome: 'abandoned', intentsCancelled: 1 });
+    assert.deepEqual((await rows(app, 'RuntimeDelivery', { id: delivery.id })).map((row) => [row.state, row.failure_reason]), [['failed', reason]]);
+    await assertWakesDeadLettered(app, delivery.id, 1);
+    assert.equal((await rows(app, 'TurnIntent', { id: continuation.intentId }))[0].state, 'cancelled', '同一事务取消它排队的运行时续跑');
+    assert.deepEqual(await deliveries.abandonPending({ deliveryId: delivery.id, reason }), { outcome: 'not_pending', state: 'failed' });
+    // A wake claimed by a window that crashed: its claim has not expired, but nobody holds it.
+    await pendingFollowup(app, 'followup-crashed-claim', 'conversation-abandon-requester', conversationId);
+    await app.database.transaction([repo('RuntimeDeliveryWake').update('followup-crashed-claim-wake', { state: 'claimed',
+      claim_owner_host_boot_id: 'crashed-host', claim_generation: 1n, claim_expires_at: longClaim(), attempt_count: 1n, next_attempt_at: null,
+      updated_at: new Date().toISOString() })]);
+    assert.deepEqual(await deliveries.abandonPending({ deliveryId: 'followup-crashed-claim-delivery', reason }), { outcome: 'abandoned', intentsCancelled: 0 },
+      '认领它的窗口已经不在：认领作废，照常放弃');
+    await assertWakesDeadLettered(app, 'followup-crashed-claim-delivery', 1);
+
+    // createAbandoned
+    const inboxItemId = await finishedProcessResult(app, 'process-unrouted', conversationId, firstTurnId);
+    const created = await deliveries.createAbandoned({ inboxItemId, targetConversationId: conversationId, reason });
+    assert.equal(created.created, true);
+    assert.deepEqual((await rows(app, 'RuntimeDelivery', { id: created.deliveryId })).map((row) =>
+      [row.inbox_item_id, row.target_turn_id, row.phase, row.state, row.failure_reason, String(row.attempt_seq)]),
+    [[inboxItemId, null, 'next_turn', 'failed', reason, '1']]);
+    assert.deepEqual(await rows(app, 'RuntimeDeliveryWake', { delivery_id: created.deliveryId }), [], '没有唤醒');
+    assert.equal((await rows(app, 'RuntimeInboxItem', { id: inboxItemId }))[0].state, 'routed', '同一事务里路由掉，恢复不会再路由它');
+    assert.deepEqual(await deliveries.createAbandoned({ inboxItemId, targetConversationId: conversationId, reason }), { deliveryId: created.deliveryId, created: false });
+    const routedElsewhere = await finishedProcessResult(app, 'process-routed', conversationId, firstTurnId);
+    await app.database.transaction([repo('RuntimeInboxItem').update(routedElsewhere, { state: 'routed', updated_at: new Date().toISOString() })]);
+    await assert.rejects(deliveries.createAbandoned({ inboxItemId: routedElsewhere, targetConversationId: conversationId, reason }), /was routed without a delivery/);
+
+    // abandonDispatch
+    const dispatchId = await pendingProcessDispatch(app, 'process-dispatch', conversationId, firstTurnId);
+    const dispatchClaimExpiresAt = shortClaim();
+    await app.database.transaction([repo('ProcessCompletionDispatch').update(dispatchId, { state: 'claimed', claim_owner_host_boot_id: liveHost,
+      claim_generation: 1n, claim_expires_at: dispatchClaimExpiresAt, attempt_count: 1n, updated_at: new Date().toISOString() })]);
+    assert.equal(await app.processDeliveries.abandonDispatch({ dispatchId, reason }), 'live');
+    assert.equal((await rows(app, 'ProcessCompletionDispatch', { id: dispatchId }))[0].state, 'claimed', '存活宿主认领着：不动');
+    await untilExpired(dispatchClaimExpiresAt);
+    assert.equal(await app.processDeliveries.abandonDispatch({ dispatchId, reason }), 'abandoned');
+    assert.deepEqual((await rows(app, 'ProcessCompletionDispatch', { id: dispatchId })).map((row) =>
+      [row.state, row.last_error, row.claim_owner_host_boot_id, row.claim_expires_at]), [['dead_letter', reason, null, null]]);
+    assert.equal(await app.processDeliveries.abandonDispatch({ dispatchId, reason }), 'not_pending');
+    const crashedDispatchId = await pendingProcessDispatch(app, 'process-crashed-claim', conversationId, firstTurnId);
+    await app.database.transaction([repo('ProcessCompletionDispatch').update(crashedDispatchId, { state: 'claimed', claim_owner_host_boot_id: 'crashed-host',
+      claim_generation: 1n, claim_expires_at: longClaim(), attempt_count: 1n, updated_at: new Date().toISOString() })]);
+    assert.equal(await app.processDeliveries.abandonDispatch({ dispatchId: crashedDispatchId, reason }), 'abandoned', '认领它的窗口已经不在');
+
+    // cancelQueuedIntent
+    const continued = await host.runner.continuation({ commandId: 'continue-control', conversationId, sourceTurnId: firstTurnId, text: '接着做' });
+    assert.equal((await rows(app, 'TurnIntent', { id: continued.intentId }))[0].state, 'queued');
+    const command = { source: { kind: 'command', key: 'cancel-continuation' }, conversationId, intentId: continued.intentId, expectedRevisionSeq: '1' };
+    await assert.rejects(app.turns.cancelGuidance({ ...command, source: { kind: 'command', key: 'cancel-as-message' } }), /not an ordinary queued guidance message/);
+    await assert.rejects(app.turns.cancelQueuedIntent({ ...command, source: { kind: 'command', key: 'cancel-stale' }, expectedRevisionSeq: '2' }),
+      (error) => error.code === 'GUIDANCE_CONTROL_CONFLICT');
+    assert.equal((await rows(app, 'TurnIntent', { id: continued.intentId }))[0].state, 'queued', '版本对不上：不动');
+    assert.equal((await app.turns.cancelQueuedIntent(command)).deduplicated, false);
+    assert.equal((await rows(app, 'TurnIntent', { id: continued.intentId }))[0].state, 'cancelled');
+    assert.equal((await app.turns.cancelQueuedIntent(command)).deduplicated, true, '同一命令重复调用幂等');
+  } finally {
+    await host.close();
+  }
+});
+
+
+test('父 Turn 在一个存活的窗口里运行：它还没送达的子 Agent 答复留给那个窗口（live），不在这里放弃；再次收尾结果相同', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const dataRoot = fixture.current.binding.paths.dataRootPath;
+  const conversationId = 'conversation-live-parent';
+  const ready = path.join(fixture.base, 'live-parent-ready.json');
+  const worker = spawnWorker('live-parent', { LIMCODE_RELOCATED_WORK_DATA_ROOT: dataRoot,
+    LIMCODE_RELOCATED_WORK_CONVERSATION: conversationId, LIMCODE_RELOCATED_WORK_READY: ready });
+  let host;
+  try {
+    const { turnId, submissionId } = await waitForWorkerJson(worker, ready, 90_000);
+    // Still alive (its process identity checks out), but it runs nothing while the settlement runs.
+    await sleep(300);
+    worker.kill('SIGSTOP');
+    const provider = countingProvider('settling');
+    host = await openHost(dataRoot, provider, { label: 'settling' });
+    const inventory = parseRelocatedWorkInventory(await host.app.database.relocatedWorkInventory());
+    const entry = inventory.conversations.find((item) => item.conversationId === conversationId);
+    assert.deepEqual([entry.activeTurnIds, entry.undeliveredAnswerIds], [[turnId], [submissionId]]);
+    const targetRootPath = path.join(fixture.base, 'new-home');
+    const settled = await settleRelocatedWork({ application: host.app, inventory, targetRootPath });
+    assert.deepEqual(settled.unsettled, []);
+    assert.deepEqual(settled.live, [{ conversationId, id: turnId }, { conversationId, id: submissionId }], '父 Turn 和它的答复都留给存活的窗口');
+    assert.equal(settled.counts.answersAbandoned, 0);
+    assert.deepEqual(await rows(host.app, 'RuntimeDelivery'), [], '没有替存活窗口的父 Turn 放弃答复');
+    assert.equal((await rows(host.app, 'Turn', { id: turnId }))[0].status, 'active');
+    const again = await settleRelocatedWork({ application: host.app, inventory, targetRootPath });
+    assert.deepEqual([again.live, again.unsettled], [settled.live, []]);
+    assert.deepEqual(await rows(host.app, 'RuntimeDelivery'), []);
+    assert.equal(provider.calls.length, 0);
+  } finally {
+    worker.kill('SIGKILL');
+    await waitForExit(worker);
+    await host?.close();
+  }
+});
+
+test('循环收尾有上限：每一轮之后都冒出新的可执行工作时，收尾 5 轮就停，之后冒出的只报告（rounds_exhausted），不再收尾', { timeout: 120_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const [requester, peer] = ['conversation-endless-requester', 'conversation-endless-peer'];
+  const host = await openHost(fixture.current.binding.paths.dataRootPath, countingProvider('endless'), { label: 'endless' });
+  try {
+    const { app } = host;
+    await createConversation(app, requester);
+    await createConversation(app, peer);
+    await pendingFollowup(app, 'followup-0', requester, peer);
+    // Every convergence between rounds also brings one more followup: work that keeps appearing.
+    let appeared = 0;
+    const collaboration = app.runtime.collaboration;
+    const application = Object.create(app, { runtime: { value: { ...app.runtime, collaboration: {
+      async reconcile() {
+        await collaboration.reconcile();
+        appeared += 1;
+        await pendingFollowup(app, `followup-${appeared}`, requester, peer);
+      }
+    } } } });
+    const inventory = parseRelocatedWorkInventory(await app.database.relocatedWorkInventory());
+    const settled = await settleRelocatedWork({ application, inventory, targetRootPath: path.join(fixture.base, 'new-home') });
+    assert.equal(settled.rounds, 5);
+    assert.equal(appeared, 5, '每轮之后都重新盘点');
+    assert.deepEqual(settled.live, []);
+    const [lastReply] = await rows(app, 'RuntimeDelivery', { target_conversation_id: requester, state: 'pending' });
+    assert.deepEqual(settled.unsettled.map((item) => [item.conversationId, item.kind, item.id]),
+      [[peer, 'rounds_exhausted', 'followup-5-delivery'], [requester, 'rounds_exhausted', lastReply.id]], '第 5 轮之后冒出的只报告');
+    assert.match(settled.unsettled[0].detail, /收尾 5 轮后仍出现新的可执行项/);
+    assert.equal((await rows(app, 'RuntimeDelivery', { id: 'followup-5-delivery' }))[0].state, 'pending', '只报告的项不收尾');
+    assert.equal(settled.counts.deliveriesAbandoned, 9, '5 条追问与前 4 条回复');
+  } finally {
+    await host.close();
+  }
+});
+
 }
 
 // ---- fixture ----
 
 /** The window that dispatches an MCP call that never answers, then waits to be killed. */
 async function runWorker(mode) {
+  if (mode === 'live-parent') return runLiveParentWorker();
   if (mode !== 'mcp-origin') throw new Error(`Unknown worker ${mode}.`);
   const dataRoot = requiredEnv('LIMCODE_RELOCATED_WORK_DATA_ROOT');
   const conversationId = requiredEnv('LIMCODE_RELOCATED_WORK_CONVERSATION');
@@ -570,6 +1035,33 @@ async function runWorker(mode) {
   30_000, 'MCP 调用未派发');
   const ready = requiredEnv('LIMCODE_RELOCATED_WORK_READY');
   await fs.writeFile(`${ready}.tmp`, JSON.stringify({ turnId }), 'utf8');
+  await fs.rename(`${ready}.tmp`, ready);
+  await new Promise(() => {});
+}
+
+/**
+ * A window that keeps running a parent Turn (it waits for the user) while the background child it
+ * started already submitted its answer; the answer's delivery, a separate commit, never happens here.
+ */
+async function runLiveParentWorker() {
+  const dataRoot = requiredEnv('LIMCODE_RELOCATED_WORK_DATA_ROOT');
+  const conversationId = requiredEnv('LIMCODE_RELOCATED_WORK_CONVERSATION');
+  let parentCalls = 0;
+  const host = await openHost(dataRoot, scriptedProvider(async (request) => {
+    if (request.conversationId !== conversationId) return { role: 'model', parts: [{ text: '子任务完成' }] };
+    parentCalls += 1;
+    return parentCalls === 1 ? spawnCall('spawn-live', 'live', '后台子任务', 0) : askCall('ask-live', '父 Turn 还在等用户回答');
+  }), { label: 'live' });
+  host.coordinator.deliverBackgroundAnswer = async () => { throw new Error('答复送达之前窗口被暂停'); };
+  await createConversation(host.app, conversationId);
+  const { turnId } = await host.runner.input({ commandId: 'input-live', conversationId, text: '派后台子 Agent，然后问一句' });
+  await eventually(async () => (await rows(host.app, 'AnswerSubmission')).length === 1
+    && (await rows(host.app, 'InteractionRequest', { status: 'pending' })).length === 1, 60_000, '答复没有提交或父 Turn 没有进入等待');
+  const [submission] = await rows(host.app, 'AnswerSubmission');
+  await host.runner.waitForIdle();
+  await host.coordinator.waitForIdle();
+  const ready = requiredEnv('LIMCODE_RELOCATED_WORK_READY');
+  await fs.writeFile(`${ready}.tmp`, JSON.stringify({ turnId, submissionId: submission.id }), 'utf8');
   await fs.rename(`${ready}.tmp`, ready);
   await new Promise(() => {});
 }
@@ -822,12 +1314,53 @@ async function createConversation(app, conversationId) {
 
 /** A finished background Process started by `sourceTurnId`, with its automatic delivery (eligibility-delivery-ownership). */
 async function pendingProcessDelivery(app, id, conversationId, sourceTurnId) {
+  await finishedProcessResult(app, id, conversationId, sourceTurnId);
+  return app.runtime.deliveries.createAutomatic({ inboxItemId: id, targetConversationId: conversationId, sourceTurnId });
+}
+
+/** A finished background Process's result in the Inbox (the Inbox item `id`), not routed yet. */
+async function finishedProcessResult(app, id, conversationId, sourceTurnId) {
   const at = new Date().toISOString();
   const payload = await app.contentStore.prepare(app.database, JSON.stringify({ kind: 'process_completion',
     processId: id, processReceiptId: `receipt-${id}`, sourceTurnId, conversationId }),
   'application/vnd.limcode.process-completion+json');
   await app.database.transaction([
     ...preparedContentObjectSteps([payload], 'fixture_process_result'),
+    ...finishedProcessSteps(id, conversationId, sourceTurnId, at),
+    repo('RuntimeInboxItem').insert({ id, dedupe_key: `fixture:${id}`, source_kind: 'process_receipt',
+      source_id: `receipt-${id}`, state: 'available', created_at: at, updated_at: at }),
+    repo('RuntimeInboxPayloadLink').insert({ id: `payload-${id}`, inbox_item_id: id,
+      content_object_id: payload.metadata.id, created_at: at })
+  ]);
+  return id;
+}
+
+/**
+ * A background Process started by `sourceTurnId` that exited while no window ran: its detached
+ * process_exit Operation has its receipt and the completion dispatch is still pending (the scan
+ * would turn it into a delivery that continues the Conversation). Returns the dispatch id.
+ */
+async function pendingProcessDispatch(app, id, conversationId, sourceTurnId) {
+  const at = new Date().toISOString();
+  const exitRequest = await app.contentStore.prepare(app.database, `{"kind":"process_exit","processId":"${id}"}\n`, 'application/json');
+  await app.database.transaction([
+    ...preparedContentObjectSteps([exitRequest], 'fixture_process_exit'),
+    ...finishedProcessSteps(id, conversationId, sourceTurnId, at),
+    repo('Operation').insert({ id: `operation-${id}`, owner_kind: 'process', owner_id: id, operation_seq: 1n,
+      tool_call_id: null, status: 'succeeded', created_at: at, updated_at: at }),
+    repo('Attempt').insert({ id: `attempt-${id}`, operation_id: `operation-${id}`, attempt_seq: 1n, status: 'succeeded',
+      created_at: at, updated_at: at, completed_at: at }),
+    repo('EffectIntent').insert({ id: `intent-${id}`, attempt_id: `attempt-${id}`, effect_kind: 'process_exit',
+      dispatch_state: 'receipt_written', request_object_id: exitRequest.metadata.id, created_at: at, updated_at: at }),
+    repo('ProcessCompletionDispatch').insert({ id: `dispatch-${id}`, process_receipt_id: `receipt-${id}`, state: 'pending',
+      claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n,
+      next_attempt_at: null, last_error: null, completed_at: null, created_at: at, updated_at: at })
+  ]);
+  return `dispatch-${id}`;
+}
+
+function finishedProcessSteps(id, conversationId, sourceTurnId, at) {
+  return [
     repo('Process').insert({ id, status: 'exited', wrapper_nonce: `nonce-${id}`, wrapper_pid: 0n, child_pid: null,
       process_group_id: null, start_fingerprint: `fingerprint-${id}`, command_digest: `digest-${id}`,
       spool_locator: `spool/${id}`, retained_bytes: 0n, retained_chunks: 0n, dropped_bytes: 0n, truncated: 0n,
@@ -835,13 +1368,83 @@ async function pendingProcessDelivery(app, id, conversationId, sourceTurnId) {
     repo('ProcessCompletionSourceLink').insert({ id: `source-${id}`, process_id: id, conversation_id: conversationId,
       source_turn_id: sourceTurnId, source_tool_call_id: `${id}-tool`, created_at: at }),
     repo('ProcessReceipt').insert({ id: `receipt-${id}`, process_id: id, outcome: 'succeeded', exit_code: 0n,
-      exit_signal: null, wrapper_nonce: `nonce-${id}`, start_fingerprint: `fingerprint-${id}`, received_at: at }),
-    repo('RuntimeInboxItem').insert({ id, dedupe_key: `fixture:${id}`, source_kind: 'process_receipt',
-      source_id: `receipt-${id}`, state: 'available', created_at: at, updated_at: at }),
-    repo('RuntimeInboxPayloadLink').insert({ id: `payload-${id}`, inbox_item_id: id,
-      content_object_id: payload.metadata.id, created_at: at })
+      exit_signal: null, wrapper_nonce: `nonce-${id}`, start_fingerprint: `fingerprint-${id}`, received_at: at })
+  ];
+}
+
+/**
+ * A cross-conversation followup from `requester` waiting to open a Turn of `peer` (its wake is
+ * pending), with its automatic request (collaboration-lifecycle's fixture); with `mode: 'message'`
+ * a plain message without request or wake, waiting for the peer's next Turn. The requester's Turn
+ * that sent it (`sourceTurnId`) funds the request's budget: only then may the reply that tells the
+ * requester the outcome open a Turn there. Ids derive from `id`.
+ */
+async function pendingFollowup(app, id, requester, peer, { mode = 'followup', sourceTurnId = null } = {}) {
+  const now = new Date().toISOString();
+  const followup = mode === 'followup';
+  const payload = await app.contentStore.ingest(app.database, `请 ${peer} 复核部署脚本`, 'text/vnd.limcode.collaboration-message');
+  await app.database.transaction([
+    repo('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode, created_at: now }, { column: 'message_seq', scope: {} }),
+    repo('CollaborationMessageSourceLink').insert({ id: `${id}-source`, message_id: id, conversation_id: requester, source_kind: 'tool',
+      source_key: id, turn_id: sourceTurnId, tool_call_id: null, created_at: now }),
+    repo('RuntimeInboxItem').insert({ id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id,
+      state: 'routed', created_at: now, updated_at: now }),
+    repo('CollaborationMessageTargetLink').insert({ id: `${id}-target`, message_id: id, conversation_id: peer, inbox_item_id: `${id}-inbox`,
+      anchor_turn_id: null, created_at: now }),
+    repo('CollaborationMessagePayloadLink').insert({ id: `${id}-payload`, message_id: id, content_object_id: payload.id, created_at: now }),
+    repo('RuntimeInboxPayloadLink').insert({ id: `${id}-inbox-payload`, inbox_item_id: `${id}-inbox`, content_object_id: payload.id, created_at: now }),
+    repo('RuntimeDelivery').insert({ id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: peer, target_turn_id: null,
+      phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: now, updated_at: now }),
+    ...(followup ? [
+      repo('CollaborationBudget').insert({ id: `${id}-budget`, origin_kind: 'turn', origin_key: `${id}-origin`,
+        authority_turn_id: sourceTurnId ?? `${id}-historical-turn`, created_at: now }),
+      repo('CollaborationRequest').insert({ id: `${id}-request`, message_id: id, budget_id: `${id}-budget`, automatic: 1n, state: 'pending',
+        created_at: now, updated_at: now }),
+      repo('RuntimeDeliveryWake').insert({ id: `${id}-wake`, delivery_id: `${id}-delivery`, state: 'pending', claim_owner_host_boot_id: null,
+        claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: now, last_error: null,
+        acknowledged_at: null, created_at: now, updated_at: now })
+    ] : [])
   ]);
-  return app.runtime.deliveries.createAutomatic({ inboxItemId: id, targetConversationId: conversationId, sourceTurnId });
+}
+
+/** The delivery's wakes, each dead-lettered with the relocation reason and without a claim (`count` of them when given). */
+async function assertWakesDeadLettered(app, deliveryId, count) {
+  const wakes = await rows(app, 'RuntimeDeliveryWake', { delivery_id: deliveryId });
+  if (count !== undefined) assert.equal(wakes.length, count);
+  assert.deepEqual(wakes.map((wake) => [wake.state, wake.last_error, wake.claim_owner_host_boot_id, wake.claim_expires_at]),
+    wakes.map(() => ['dead_letter', 'data-root-relocated', null, null]), `投递 ${deliveryId} 的唤醒都进了死信`);
+}
+
+/** The same inventory settled again: everything is closed already, one round, nothing changes. */
+async function assertSettledAgain(host, inventory, targetRootPath) {
+  const before = await settledFacts(host.app);
+  const again = await settleRelocatedWork({ application: host.app, inventory, targetRootPath });
+  assert.deepEqual([again.unsettled, again.live, again.rounds], [[], [], 1]);
+  assert.deepEqual(Object.entries(again.counts).filter(([, count]) => count !== 0), [], '再次收尾不改变任何东西');
+  assert.deepEqual(await settledFacts(host.app), before);
+}
+
+const SETTLED_DOMAINS = [
+  'Turn', 'TurnTermination', 'TurnIntent', 'PendingTurnInput', 'InteractionRequest', 'ChildExecution', 'ChildExecutionIntentLink',
+  'AnswerSubmission', 'RuntimeInboxItem', 'RuntimeDelivery', 'RuntimeDeliveryWake', 'ProcessCompletionDispatch',
+  'CollaborationRequest', 'CollaborationMessage'
+];
+
+async function settledFacts(app) {
+  return Object.fromEntries(await Promise.all(SETTLED_DOMAINS.map(async (domain) => [domain, await rows(app, domain)])));
+}
+
+/** The full startup recovery after the settlement: no model call, no new Turn, nothing left to run. */
+async function recoverIdle(host, provider) {
+  const turnsBefore = (await rows(host.app, 'Turn')).map((turn) => turn.id);
+  await host.recover();
+  await eventually(async () => (await rows(host.app, 'ChildExecution'))
+    .every((child) => !['starting', 'active', 'interrupting'].includes(String(child.status))), 30_000, '子执行没有收敛');
+  await quiet(host);
+  assert.equal(provider.calls.length, 0, '旧目录不调用模型');
+  assert.deepEqual((await rows(host.app, 'Turn')).map((turn) => turn.id), turnsBefore, '恢复没有开启新的 Turn');
+  assert.deepEqual((await host.app.database.relocatedWorkInventory()).conversations, [], '恢复之后没有待执行的工作');
+  assert.deepEqual(errors(host), []);
 }
 
 async function rows(app, domain, where = {}) {

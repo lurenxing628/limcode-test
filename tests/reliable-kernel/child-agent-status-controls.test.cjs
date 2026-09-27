@@ -183,6 +183,32 @@ test('Agent status projects durable run, Answer and Delivery identities with run
   assert.equal(projection.children[0].deliveryBadge, 'awaiting_parent');
 });
 
+test('a child answer given up by a data-root relocation reads as not delivered, in Chinese; other reason codes are shown as they are', () => {
+  const statusOf = (failureReason) => projectReliableAgentStatus({
+    conversationId: 'parent-conversation',
+    agentNames: new Map(),
+    records: {
+      Turn: { parent: { id: 'parent-turn', conversation_id: 'parent-conversation', status: 'terminated' } },
+      ChildExecution: { child: { id: 'child-execution', child_conversation_id: 'child-conversation', status: 'idle' } },
+      ChildExecutionParentLink: { child: { id: 'child-parent-link', child_execution_id: 'child-execution', parent_turn_id: 'parent-turn', source_tool_call_id: 'run-agent-tool' } },
+      AnswerBridge: {
+        child: {
+          id: 'answer-bridge', child_execution_id: 'child-execution', status: 'open', current_submission_id: 'answer-submission',
+          current_submission_seq: '1', current_turn_id: 'child-turn', current_submission_interrupted: 0
+        }
+      },
+      AnswerSubmission: { child: { id: 'answer-submission', answer_bridge_id: 'answer-bridge', submission_seq: '1', turn_id: 'child-turn' } },
+      RuntimeInboxItem: { child: { id: 'answer-inbox', source_kind: 'answer_submission', source_id: 'answer-submission' } },
+      RuntimeDelivery: {
+        child: { id: 'answer-delivery', inbox_item_id: 'answer-inbox', attempt_seq: '1', phase: 'next_turn', state: 'failed', failure_reason: failureReason }
+      }
+    }
+  }).children[0];
+  assert.equal(statusOf('data-root-relocated').deliveryId, 'answer-delivery');
+  assert.equal(statusOf('data-root-relocated').deliveryFailureReason, '数据目录已迁移，未送达');
+  assert.equal(statusOf('target-gone').deliveryFailureReason, 'target-gone');
+});
+
 test('run_agent navigation identity comes only from durable ChildExecution relations', () => {
   const projected = projectReliableConversation({
     conversationId: 'parent-conversation',

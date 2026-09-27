@@ -32,6 +32,11 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import {
+  abandonedDeliveryInsertSteps,
+  deadLetterDeliveryWakeSteps,
+  failPendingDeliverySteps
+} from './deliverySettlementSteps';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   projectRuntimeDeliveryForModel,
@@ -1385,6 +1390,12 @@ export class AnswerControlPlane {
   }
 }
 
+/** What abandonPending did: `live` when a live Host holds the delivery's wake under an unexpired claim. */
+export type RuntimeDeliveryAbandonResult =
+  | { outcome: 'abandoned'; intentsCancelled: number }
+  | { outcome: 'live' }
+  | { outcome: 'not_pending'; state: string | null };
+
 /** RuntimeInbox destination/attempt state machine and parentHandling repository projection. */
 export class RuntimeDeliveryControlPlane {
   private readonly now: () => string;
@@ -1557,6 +1568,97 @@ export class RuntimeDeliveryControlPlane {
     ]);
     const row = await this.requireExisting('RuntimeDelivery', newId);
     return { ...(await this.summaryFromRow(row)), retryOfDeliveryId: failedDeliveryId, commitSeq: commit.commitSeq };
+  }
+
+  /**
+   * Gives up one pending delivery that must not reach its target in this data set (a data-root
+   * relocation carried it away): the delivery fails with `reason`, its pending wakes are
+   * dead-lettered and a runtime continuation still queued to open a Turn for it is cancelled, all in
+   * one transaction (deliverySettlementSteps). A wake a live Host holds under an unexpired claim is
+   * that Host's: nothing changes and the result is `live` (a claim whose Host is gone is stale and
+   * given up with the rest). Idempotent; never retried, never opens a Turn.
+   */
+  public async abandonPending(input: { deliveryId: string; reason: string }): Promise<RuntimeDeliveryAbandonResult> {
+    const deliveryId = requirePhaseFId(input.deliveryId, 'deliveryId');
+    const reason = requirePhaseFText(input.reason, 'reason');
+    for (let attempt = 0; ; attempt += 1) {
+      const delivery = await this.maybeGet('RuntimeDelivery', deliveryId);
+      if (!delivery || delivery.state !== 'pending') {
+        return { outcome: 'not_pending', state: delivery ? String(delivery.state) : null };
+      }
+      const now = this.timestamp();
+      const wakes = await listAllDomainRows(this.database, 'RuntimeDeliveryWake', { delivery_id: deliveryId });
+      for (const wake of wakes) {
+        if (await this.heldByLiveHost(wake, now)) return { outcome: 'live' };
+      }
+      const continuationSteps = await this.supersededContinuationSteps(deliveryId, now);
+      try {
+        await this.database.transaction([
+          ...failPendingDeliverySteps(delivery, reason, now),
+          ...deadLetterDeliveryWakeSteps(deliveryId, wakes, reason, now),
+          ...continuationSteps
+        ]);
+        return { outcome: 'abandoned', intentsCancelled: continuationSteps.length > 0 ? 1 : 0 };
+      } catch (error) {
+        // A concurrent change (a claim, an absorption) wins; read again and decide on the new facts.
+        if (!isTransactionAssertionFailure(error) || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  /** A claim that has not expired, held by a Host that is still alive (a crashed Host's claim is stale). */
+  private async heldByLiveHost(claim: DomainRow, now: string): Promise<boolean> {
+    return claim.state === 'claimed'
+      && Date.parse(String(claim.claim_expires_at)) > Date.parse(now)
+      && await this.database.isHostAlive(requirePhaseFText(claim.claim_owner_host_boot_id, 'claim_owner_host_boot_id'));
+  }
+
+  /**
+   * Routes a result nobody routed yet (a child answer whose delivery was never created) to an
+   * already failed delivery with `reason`, in one transaction and without a wake: the target never
+   * receives it in this data set, and recovery finds this delivery instead of creating one.
+   * Idempotent: a result that already has a delivery for the target is left as it is.
+   */
+  public async createAbandoned(input: {
+    inboxItemId: string;
+    targetConversationId: string;
+    reason: string;
+  }): Promise<{ deliveryId: string; created: boolean }> {
+    const reason = requirePhaseFText(input.reason, 'reason');
+    const command = normalizeDeliveryCommand({
+      inboxItemId: input.inboxItemId,
+      targetConversationId: input.targetConversationId,
+      targetTurnId: null,
+      phase: 'next_turn'
+    });
+    const deliveryId = deliveryIdFor(command, 1n);
+    const existing = await listAllDomainRows(this.database, 'RuntimeDelivery', {
+      inbox_item_id: command.inboxItemId,
+      target_conversation_id: command.targetConversationId
+    });
+    if (existing.length > 0) return { deliveryId: String(existing[0].id), created: false };
+    const inbox = await this.requireExisting('RuntimeInboxItem', command.inboxItemId);
+    if (inbox.state !== 'available') {
+      throw new Error(`RuntimeInboxItem ${command.inboxItemId} was routed without a delivery to ${command.targetConversationId}.`);
+    }
+    const now = this.timestamp();
+    try {
+      await this.database.transaction(abandonedDeliveryInsertSteps(
+        inbox,
+        { id: deliveryId, targetConversationId: command.targetConversationId, phase: command.phase },
+        reason,
+        now
+      ));
+      return { deliveryId, created: true };
+    } catch (error) {
+      if (!isExpectedDeliveryIdentityConflict(error) && !isTransactionAssertionFailure(error)) throw error;
+      const raced = await listAllDomainRows(this.database, 'RuntimeDelivery', {
+        inbox_item_id: command.inboxItemId,
+        target_conversation_id: command.targetConversationId
+      });
+      if (raced.length === 0) throw error;
+      return { deliveryId: String(raced[0].id), created: false };
+    }
   }
 
   /**

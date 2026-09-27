@@ -196,7 +196,7 @@ export function projectReliableAgentStatus(input: {
       ...(stringValue(delivery?.parent_handling_state)
         ? { parentHandlingState: stringValue(delivery?.parent_handling_state) }
         : {}),
-      ...(stringValue(delivery?.failure_reason) ? { deliveryFailureReason: stringValue(delivery?.failure_reason) } : {}),
+      ...(stringValue(delivery?.failure_reason) ? { deliveryFailureReason: deliveryFailureText(stringValue(delivery?.failure_reason)!) } : {}),
       ...(stringValue(child.created_at) ? { createdAt: stringValue(child.created_at) } : {}),
       ...(stringValue(child.updated_at) ? { updatedAt: stringValue(child.updated_at) } : {}),
       ...(deliveryBadge ? { deliveryBadge } : {})
@@ -310,4 +310,13 @@ function booleanFlag(value: unknown): boolean | undefined {
 
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+/** Settlement reason codes the backend writes into a failed delivery, as the user reads them. */
+const DELIVERY_FAILURE_TEXT: Readonly<Record<string, string>> = {
+  'data-root-relocated': '数据目录已迁移，未送达'
+};
+
+export function deliveryFailureText(reason: string): string {
+  return DELIVERY_FAILURE_TEXT[reason] ?? reason;
 }

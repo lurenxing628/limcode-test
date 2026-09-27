@@ -15,6 +15,7 @@ import type {
 import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
 export type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
 import type { RuntimeContentUsageRow } from './runtimeContentUsage';
+import type { RelocatedWorkInventory } from './relocatedWorkInventory';
 
 export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
 export const MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT = 1;
@@ -269,6 +270,7 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'childProcessCleanupMaterializationCandidates' }
   /** ContentObject records per content_type, aggregated on the reader from the covering index only. */
   | { kind: 'contentUsage' }
+  | { kind: 'relocatedWorkInventory' }
   | { kind: 'conversationRuntimeWork'; conversationId: string }
   | { kind: 'contextMaterialization'; rootId: string }
   | { kind: 'contextContentMaterialization'; rootId: string }
@@ -345,7 +347,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

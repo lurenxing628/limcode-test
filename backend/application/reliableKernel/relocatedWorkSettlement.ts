@@ -5,7 +5,7 @@ import {
   runWithoutExecutionLeaseFence,
   type ExecutionLeaseFence
 } from '../../reliableKernel/executionLeaseFence';
-import { stablePhaseFId } from '../../reliableKernel/phaseFIdentity';
+import { DATA_ROOT_RELOCATED_REASON } from '../../reliableKernel/deliverySettlementSteps';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import {
@@ -21,13 +21,16 @@ import type { ReliableKernelApplication } from '../../reliableKernel/runtimeAppl
  * new one (see relocatedWorkInventory), so that a Host recovering the old directory never runs it a
  * second time: no model call, no tool, no continuation.
  *
- * Only the existing, public control-plane transitions of a user's explicit stop are used, in the
- * order the tested stop paths use them (ReliableConversationRunner.interrupt with its control-only
- * settlement, ReliableChildAgentCoordinator.interruptSubtree with `userStop`):
+ * Only public control-plane transitions are used: those of a user's explicit stop, in the order the
+ * tested stop paths use them (ReliableConversationRunner.interrupt with its control-only settlement,
+ * ReliableChildAgentCoordinator.interruptSubtree with `userStop`), and the abandon transitions that
+ * give a result up with the reason code `data-root-relocated` (deliverySettlementSteps: the rows'
+ * existing terminal states failed / dead_letter, never retried, never opening a Turn):
  *
  * | Work                                              | Transition                                                   |
  * |---------------------------------------------------|--------------------------------------------------------------|
  * | queued user message                               | TurnControlPlane.cancelGuidance                              |
+ * | queued retry or runtime continuation              | TurnControlPlane.cancelQueuedIntent                          |
  * | active Turn (top level)                           | requestExternalInterrupt, control lease, AgentLoop.terminateRequested → interrupted |
  * | its unstarted ModelRequest, undispatched effect   | closed by terminateRequested                                 |
  * | its pending question or approval                  | cancelled as ReliableToolDispatcher.cancelWaiting does, then terminateRequested |
@@ -35,14 +38,16 @@ import type { ReliableKernelApplication } from '../../reliableKernel/runtimeAppl
  * | effect dispatched by a window proven dead         | PhaseDRecoveryScanner.abandonDeadHostEffects → outcome_unknown |
  * | subagent spawn dispatched by a window proven dead | ChildExecutionControlPlane.recoverSpawnIntent (recorded as spawned) |
  * | running or pending child Agent, with its subtree  | ChildExecutionControlPlane.interruptSubtree, then its Turns as above |
- * | background child Agent of a completed parent Turn | its active Turn stopped as from its own panel (stop request, as above); it goes idle, no answer |
+ * | background child Agent of a completed parent Turn | its active Turn stopped as from its own panel (stop request, as above); it goes idle, no answer; a queued continuation is then cancelled with interruptSubtree |
  * | orphan Turn (no lease, no input)                  | TurnControlPlane.finalizeRecovery → cancelled               |
+ * | pending result or message that would open a Turn  | RuntimeDeliveryControlPlane.abandonPending → failed, wakes dead_letter, its runtime continuation cancelled |
+ * | child answer not routed yet                       | RuntimeDeliveryControlPlane.createAbandoned → an already failed delivery, no wake |
+ * | finished background process not delivered yet    | ProcessCompletionDeliveryControlPlane.abandonDispatch → dead_letter |
  *
- * Work no existing transition closes without starting a Turn is left untouched and returned in
- * `unsettled` (a result waiting for a new Turn, a child answer not delivered yet, a background
- * child with a queued continuation whose partial answer continues a parent that already completed).
- * Work a live Host executes gets the durable stop request and is returned in `live`; that Host
- * closes it.
+ * Settling can create new work (a requester told that nobody will answer), so it runs in rounds over
+ * the whole data set (see run). Work a live Host executes gets the durable stop request, or is left
+ * to that Host, and is returned in `live`; what a stop path does not close here is returned in
+ * `unsettled` (`needs_human`, `failed`, and `rounds_exhausted` past the round limit).
  *
  * Call it on the old directory's opened Runtime before its startup recovery (application.recover,
  * the child scheduler and the Runner) runs, and only on the user's explicit choice: closing work
@@ -75,38 +80,35 @@ export interface RelocatedWorkSettlementCounts {
   effectsClosedAsUnknown: number;
   /** Results already addressed to a stopped Turn, kept in its history instead of continuing it. */
   deliveriesTakenIn: number;
+  /** Queued continuations that are not ordinary user messages (a retry, a runtime continuation), cancelled. */
+  queuedIntentsCancelled: number;
+  /** Pending results (a child answer, a process completion, a collaboration message) failed as not delivered here. */
+  deliveriesAbandoned: number;
+  /** Child answers nobody routed yet, given an already failed delivery. */
+  answersAbandoned: number;
+  /** Finished background processes whose completion notice is dead-lettered instead of delivered. */
+  processCompletionsAbandoned: number;
 }
 
 export type RelocatedWorkUnsettledKind =
-  /** A pending result or message that would open a new Turn; no terminal transition exists for it. */
-  | 'continuation_delivery'
-  /** A finished background process of a Turn that had completed; its delivery would open a Turn. */
-  | 'process_completion'
-  /** A child answer not delivered yet; delivering it continues its parent Conversation. */
-  | 'child_answer'
-  /**
-   * A background child of a completed parent Turn that has a queued continuation: only the subtree
-   * interruption cancels that, and its interrupted answer continues the parent once.
-   */
-  | 'background_child'
-  /** A queued continuation that is not an ordinary user message (cancelGuidance does not apply). */
-  | 'queued_continuation'
   /** A Turn the stop path does not close here (child spawn or cancel in flight, inconsistent facts). */
   | 'needs_human'
   /** Settling this item threw; `detail` has the error. */
-  | 'failed';
+  | 'failed'
+  /**
+   * Still new executable work after MAX_SETTLEMENT_ROUNDS rounds (each round's settlement created
+   * more, for example requesters told that nobody will answer): reported, not settled further.
+   */
+  | 'rounds_exhausted';
 
 /**
  * The inventory lists whose items this module may only report (no existing transition closes them
  * without starting a Turn): opening the old directory may still run them once. Prompts list the
  * inventory's items of these lists; a kind that becomes settleable leaves this table, and the
- * prompts shrink with it.
+ * prompts shrink with it. Every list is settleable now: what may still need a person (`live`,
+ * `needs_human`, `rounds_exhausted`) is only known once the settlement ran, from its result.
  */
-export const RELOCATED_WORK_REPORTED_ONLY: Readonly<Partial<Record<(typeof RELOCATED_WORK_LISTS)[number], RelocatedWorkUnsettledKind>>> = Object.freeze({
-  pendingDeliveryIds: 'continuation_delivery',
-  undeliveredAnswerIds: 'child_answer',
-  pendingProcessCompletionIds: 'process_completion'
-});
+export const RELOCATED_WORK_REPORTED_ONLY: Readonly<Partial<Record<(typeof RELOCATED_WORK_LISTS)[number], RelocatedWorkUnsettledKind>>> = Object.freeze({});
 
 export interface RelocatedWorkUnsettled {
   conversationId: string;
@@ -121,12 +123,15 @@ export interface RelocatedWorkSettlementResult {
   /** Work a live Host executes: its durable stop request is written and that Host closes it. */
   live: Array<{ conversationId: string; id: string }>;
   unsettled: RelocatedWorkUnsettled[];
+  /** Settlement rounds run: settling can create new work (see run), taken again up to the limit. */
+  rounds: number;
 }
 
 const SOURCE_PREFIX = 'data-root-relocated';
+/** Rounds of settle, converge collaboration, take the inventory again; more new work is only reported. */
+const MAX_SETTLEMENT_ROUNDS = 5;
 const CONTROL_LEASE_MS = 30_000;
 const CHILD_RUNNING_STATUSES = ['starting', 'active', 'interrupting'] as const;
-const STOPPED_TERMINAL_STATUSES = new Set(['interrupted', 'cancelled']);
 
 type TurnOutcome = 'stopped' | 'terminal' | 'live' | 'unsupported' | 'needs_human' | 'failed';
 type IncludedChild = { parentChildExecutionId: string | null; parentTurn: DomainRow | null };
@@ -164,7 +169,11 @@ class RelocatedWorkSettlement {
     modelRequestsClosed: 0,
     effectsCancelled: 0,
     effectsClosedAsUnknown: 0,
-    deliveriesTakenIn: 0
+    deliveriesTakenIn: 0,
+    queuedIntentsCancelled: 0,
+    deliveriesAbandoned: 0,
+    answersAbandoned: 0,
+    processCompletionsAbandoned: 0
   };
   private readonly live: RelocatedWorkSettlementResult['live'] = [];
   private readonly unsettled: RelocatedWorkUnsettled[] = [];
@@ -180,9 +189,63 @@ class RelocatedWorkSettlement {
     this.leaseOwnerId = `${SOURCE_PREFIX}:${this.hostBootId}`;
   }
 
+  /**
+   * Settles in rounds. Settling can create new work: a collaboration request whose deliveries all
+   * failed tells its requester that nobody will answer (CollaborationControlPlane.reconcile), and a
+   * Turn that ended completes the requests it took in; such a reply may open a Turn there. So after
+   * each round the collaboration facts converge, the whole data set is taken again
+   * (RuntimeDatabase.relocatedWorkInventory) and the Conversations with work not seen before are
+   * settled the same way, until no new work appears. After MAX_SETTLEMENT_ROUNDS rounds, what is
+   * still new is reported (`rounds_exhausted`) instead of settled.
+   */
   public async run(): Promise<RelocatedWorkSettlementResult> {
+    const seen = new Set<string>();
+    let round = 1;
+    await this.settleRound(this.inventory.conversations, seen);
+    for (;;) {
+      let next: RelocatedWorkInventory;
+      try {
+        await this.application.runtime.collaboration.reconcile();
+        next = parseRelocatedWorkInventory(await this.application.database.relocatedWorkInventory());
+      } catch (error) {
+        this.unsettled.push({ conversationId: '', kind: 'failed', id: `round-${round + 1}`, detail: errorMessage(error) });
+        break;
+      }
+      const fresh = next.conversations.filter((conversation) => workKeys(conversation).some((key) => !seen.has(key)));
+      if (fresh.length === 0) break;
+      if (round >= MAX_SETTLEMENT_ROUNDS) {
+        for (const conversation of fresh) {
+          for (const key of workKeys(conversation).filter((item) => !seen.has(item))) {
+            const [list, id] = key.split('|');
+            this.unsettled.push({
+              conversationId: conversation.conversationId, kind: 'rounds_exhausted', id,
+              detail: `收尾 ${MAX_SETTLEMENT_ROUNDS} 轮后仍出现新的可执行项（${list}），只报告，不再收尾。`
+            });
+          }
+        }
+        break;
+      }
+      round += 1;
+      await this.settleRound(fresh, seen);
+    }
+    // A Conversation settled again in a later round reports what is still open once.
+    return {
+      reason: this.reason,
+      counts: { ...this.counts },
+      live: uniqueBy(this.live, (item) => `${item.conversationId}|${item.id}`),
+      unsettled: uniqueBy(this.unsettled, (item) => `${item.conversationId}|${item.kind}|${item.id}`),
+      rounds: round
+    };
+  }
+
+  /** One round over the given Conversations' work, in the order the stop paths need. */
+  private async settleRound(inventory: readonly RelocatedConversationWork[], seen: Set<string>): Promise<void> {
     const conversations: RelocatedConversationWork[] = [];
-    for (const conversation of this.inventory.conversations) {
+    for (const conversation of inventory) {
+      for (const key of workKeys(conversation)) seen.add(key);
+      // Once settled, a Conversation the pending-work probe still sees as busy (a stopped lineage
+      // converges in the child scheduler's recovery) is not new work.
+      seen.add(`otherRuntimeWork|${conversation.conversationId}`);
       if (await this.get('Conversation', conversation.conversationId)) conversations.push(conversation);
     }
     // A queued message goes first, so no Turn ending below admits it.
@@ -190,19 +253,13 @@ class RelocatedWorkSettlement {
     // Parents stop before their children: an interrupted child's partial answer then only
     // notifies a stopped parent instead of continuing it.
     for (const conversation of conversations) await this.stopTopLevelTurns(conversation.conversationId);
-    await this.interruptChildren(new Set(conversations.map((conversation) => conversation.conversationId)));
     const listed = new Set(conversations.map((conversation) => conversation.conversationId));
+    await this.interruptChildren(listed);
     for (const conversation of conversations) {
-      await this.reportPendingDeliveries(conversation.conversationId);
-      await this.reportUndeliveredAnswers(conversation);
+      await this.abandonPendingDeliveries(conversation.conversationId);
+      await this.abandonUndeliveredAnswers(conversation);
     }
-    await this.reportProcessCompletions(listed);
-    return {
-      reason: this.reason,
-      counts: { ...this.counts },
-      live: [...this.live],
-      unsettled: [...this.unsettled]
-    };
+    await this.abandonProcessCompletions(listed);
   }
 
   private async cancelQueuedMessages(conversationId: string): Promise<void> {
@@ -229,14 +286,27 @@ class RelocatedWorkSettlement {
         if (isConversationRuntimeOwnerBusyError(error)) {
           this.live.push({ conversationId, id: intentId });
         } else if (/not an ordinary queued guidance message/.test(errorMessage(error))) {
-          this.unsettled.push({
-            conversationId, kind: 'queued_continuation', id: intentId,
-            detail: '排队的续跑不是普通消息，没有现成的取消转换；打开后会被执行。'
-          });
+          await this.cancelQueuedIntent(conversationId, intentId, revisionSeq.toString());
         } else {
           this.unsettled.push({ conversationId, kind: 'failed', id: intentId, detail: errorMessage(error) });
         }
       }
+    }
+  }
+
+  /** A queued continuation that is not an ordinary message (a retry, a runtime continuation). */
+  private async cancelQueuedIntent(conversationId: string, intentId: string, expectedRevisionSeq: string): Promise<void> {
+    try {
+      const result = await this.application.turns.cancelQueuedIntent({
+        source: { kind: 'command', key: `${SOURCE_PREFIX}:intent:${intentId}` },
+        conversationId,
+        intentId,
+        expectedRevisionSeq
+      });
+      if (!result.deduplicated) this.counts.queuedIntentsCancelled += 1;
+    } catch (error) {
+      if (isConversationRuntimeOwnerBusyError(error)) this.live.push({ conversationId, id: intentId });
+      else this.unsettled.push({ conversationId, kind: 'failed', id: intentId, detail: errorMessage(error) });
     }
   }
 
@@ -493,34 +563,43 @@ class RelocatedWorkSettlement {
       if (roots.length === 0) return;
       for (const [rootId, root] of roots) {
         done.add(rootId);
-        if (await this.stopDetachedChild(rootId, root)) detached.add(rootId);
-        else await this.interruptSubtreeOf(rootId, root);
+        const handled = await this.stopDetachedChild(rootId, root);
+        if (handled === 'stopped') detached.add(rootId);
+        else if (handled === 'no') await this.interruptSubtreeOf(rootId, root);
       }
     }
   }
 
   /**
-   * A background child whose parent Turn completed, stopped like from its own panel. False when that
-   * stop does not end its work: it has a queued continuation (only the subtree interruption cancels
-   * it) or no Turn yet.
+   * A background child whose parent Turn completed, stopped like from its own panel: its active
+   * Turns get an ordinary stop request and are settled like top-level ones, so it publishes no
+   * interrupted answer and the completed parent is never continued (`stopped`; its own children are
+   * handled next). A queued continuation (a run_agent send) is then cancelled with the lineage
+   * (ChildExecutionControlPlane.interruptSubtree): with none of its Turns active any more, the
+   * interruption writes no termination request, so again nothing reaches the parent (`subtree`).
+   * `no` when it is not such a child: it is interrupted with its subtree as usual.
    */
-  private async stopDetachedChild(childExecutionId: string, entry: IncludedChild): Promise<boolean> {
-    if (!await this.completedSuccessfully(entry.parentTurn)) return false;
-    if ((await this.list('ChildExecutionIntentLink', { child_execution_id: childExecutionId, state: 'pending' })).length > 0) {
-      return false;
-    }
+  private async stopDetachedChild(childExecutionId: string, entry: IncludedChild): Promise<'stopped' | 'subtree' | 'no'> {
+    if (!await this.completedSuccessfully(entry.parentTurn)) return 'no';
+    const queued = (await this.list('ChildExecutionIntentLink', { child_execution_id: childExecutionId, state: 'pending' })).length > 0;
     const links = await this.list('ChildExecutionActiveTurnLink', { child_execution_id: childExecutionId });
-    if (links.length === 0) return false;
+    if (links.length === 0 && !queued) return 'no';
     let stopped = 0;
+    let live = false;
     for (const link of links) {
       const turn = await this.get('Turn', String(link.turn_id));
       // A Turn already ended (a second settlement) leaves the child to go idle in its scheduler.
       if (!turn || turn.status !== 'active') continue;
-      if (await this.stopTurn(String(turn.conversation_id), String(turn.id), true) === 'stopped') stopped += 1;
+      const outcome = await this.stopTurn(String(turn.conversation_id), String(turn.id), true);
+      if (outcome === 'stopped') stopped += 1;
+      else if (outcome !== 'terminal') live = true;
     }
     this.counts.childTurnsStopped += stopped;
-    if (stopped > 0) this.counts.backgroundChildrenStopped += 1;
-    return true;
+    if (stopped > 0 || (queued && !live)) this.counts.backgroundChildrenStopped += 1;
+    // A Turn a live Host still runs keeps its lineage there: that Host executes the stop request.
+    if (!queued || live) return 'stopped';
+    await this.interruptSubtreeOf(childExecutionId, entry);
+    return 'subtree';
   }
 
   private async interruptSubtreeOf(rootId: string, root: IncludedChild): Promise<void> {
@@ -538,16 +617,7 @@ class RelocatedWorkSettlement {
       for (const turnId of interrupted.activeTurnIds) {
         const turn = await this.get('Turn', turnId);
         if (!turn || turn.status !== 'active') continue;
-        const outcome = await this.stopTurn(String(turn.conversation_id), turnId, false);
-        if (outcome !== 'stopped') continue;
-        this.counts.childTurnsStopped += 1;
-        const [membership] = await this.list('ChildExecutionTurnLink', { turn_id: turnId });
-        if (String(membership?.child_execution_id) === rootId && await this.completedSuccessfully(root.parentTurn)) {
-          this.unsettled.push({
-            conversationId: parentConversationId ?? String(turn.conversation_id), kind: 'background_child', id: rootId,
-            detail: '后台子 Agent 还有排队的续跑消息，只能按子树中断；派出它的父 Turn 已完成，子 Agent 的中断结果按现有规则会让父对话续跑一次。'
-          });
-        }
+        if (await this.stopTurn(String(turn.conversation_id), turnId, false) === 'stopped') this.counts.childTurnsStopped += 1;
       }
     } catch (error) {
       this.unsettled.push({
@@ -574,35 +644,32 @@ class RelocatedWorkSettlement {
   }
 
   /**
-   * A pending delivery addressed to a Turn that has ended moves on through its own routing (the same
-   * advance its wake performs). What then waits for a new Turn of the Conversation would start one:
-   * no terminal transition exists for it, so it is only reported.
+   * Every pending delivery to the Conversation that would reach it on its own is given up
+   * (RuntimeDeliveryControlPlane.abandonPending): it fails as not delivered here, its wakes are
+   * dead-lettered and a runtime continuation queued for it is cancelled, so it never opens a Turn.
+   * A delivery addressed to a Turn still active belongs to the live Host running that Turn, and one
+   * whose wake a live Host claimed is that Host's (`live`). A plain message without a wake is left
+   * for whichever Turn comes next: it opens none by itself.
    */
-  private async reportPendingDeliveries(conversationId: string): Promise<void> {
+  private async abandonPendingDeliveries(conversationId: string): Promise<void> {
     for (const pending of await this.list('RuntimeDelivery', { target_conversation_id: conversationId, state: 'pending' })) {
       const deliveryId = String(pending.id);
-      let delivery: DomainRow | null = pending;
-      if (delivery.phase === 'current_turn' && delivery.target_turn_id !== null) {
-        const target = await this.get('Turn', String(delivery.target_turn_id));
-        // A Turn still active here is held by a live Host, which takes the delivery in.
-        if (target?.status === 'active') continue;
-        try {
-          await this.application.database.conversationOwners.run(conversationId, () =>
-            this.application.runtime.deliveries.advance(deliveryId));
-        } catch (error) {
-          if (isConversationRuntimeOwnerBusyError(error)) continue;
-          this.unsettled.push({ conversationId, kind: 'failed', id: deliveryId, detail: errorMessage(error) });
-          continue;
-        }
-        delivery = await this.get('RuntimeDelivery', deliveryId);
-        if (!delivery || delivery.state !== 'pending') continue;
+      if (pending.target_turn_id !== null) {
+        if ((await this.get('Turn', String(pending.target_turn_id)))?.status === 'active') continue;
+      } else if (!await this.opensTurn(pending)) {
+        continue;
       }
-      if (delivery.phase !== 'next_turn' || delivery.target_turn_id !== null) continue;
-      if (!await this.opensTurn(delivery)) continue;
-      this.unsettled.push({
-        conversationId, kind: 'continuation_delivery', id: deliveryId,
-        detail: '待投递的后台结果或消息会开启新的 Turn 续跑，没有现成的终态转换可以收尾。'
-      });
+      try {
+        const result = await this.application.runtime.deliveries.abandonPending({ deliveryId, reason: DATA_ROOT_RELOCATED_REASON });
+        if (result.outcome === 'abandoned') {
+          this.counts.deliveriesAbandoned += 1;
+          this.counts.queuedIntentsCancelled += result.intentsCancelled;
+        } else if (result.outcome === 'live') {
+          this.live.push({ conversationId, id: deliveryId });
+        }
+      } catch (error) {
+        this.unsettled.push({ conversationId, kind: 'failed', id: deliveryId, detail: errorMessage(error) });
+      }
     }
   }
 
@@ -621,37 +688,54 @@ class RelocatedWorkSettlement {
     ) === 'opens_turn';
   }
 
-  /** A child answer still to be delivered continues its parent when the delivery routing says so. */
-  private async reportUndeliveredAnswers(conversation: RelocatedConversationWork): Promise<void> {
+  /**
+   * A child answer to the Conversation that nobody routed yet gets an already failed delivery
+   * (RuntimeDeliveryControlPlane.createAbandoned) instead of the one recovery would create and that
+   * would continue the parent. Recovery's own classification decides what the answer needs: one that
+   * settled a wait, or already has a delivery (settled above), needs nothing; one whose source Turn a
+   * live Host still owns, or whose parent Turn is still active, is that Host's.
+   */
+  private async abandonUndeliveredAnswers(conversation: RelocatedConversationWork): Promise<void> {
+    const answers = this.application.runtime.answers;
     for (const submissionId of conversation.undeliveredAnswerIds) {
-      const submission = await this.get('AnswerSubmission', submissionId);
-      if (!submission) continue;
-      const routed = await this.list('RuntimeInboxItem', { source_kind: 'answer_submission', source_id: submissionId });
-      if (routed.some((item) => item.state !== 'available')) continue;
-      const bridge = await this.get('AnswerBridge', String(submission.answer_bridge_id));
-      if (!bridge) continue;
-      const childExecutionId = String(bridge.child_execution_id);
-      const [parentLink] = await this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId });
-      const parentTurn = parentLink ? await this.get('Turn', String(parentLink.parent_turn_id)) : null;
-      if (!parentTurn || parentTurn.status === 'active') continue;
-      const [termination] = await this.list('TurnTermination', { turn_id: String(parentTurn.id) });
-      const status = String(termination?.terminal_status);
-      const failedSubmissionId = stablePhaseFId('answer_submission', 'child-drive-failed', childExecutionId, String(submission.turn_id));
-      const continues = status === 'completed' || (
-        STOPPED_TERMINAL_STATUSES.has(status)
-        && submission.interrupted === 0n
-        && bridge.current_submission_id === submissionId
-        && submissionId !== failedSubmissionId
-      );
-      if (!continues) continue;
-      this.unsettled.push({
-        conversationId: conversation.conversationId, kind: 'child_answer', id: submissionId,
-        detail: '子 Agent 的答复尚未送达，送达后会让父对话续跑，没有现成的终态转换可以收尾。'
-      });
+      const conversationId = conversation.conversationId;
+      try {
+        if (!await this.get('AnswerSubmission', submissionId)) continue;
+        const inbox = await answers.ensureInboxForSubmission(submissionId);
+        if (inbox.deferredLiveOwner) {
+          this.live.push({ conversationId, id: submissionId });
+          continue;
+        }
+        const disposition = await answers.classifyDeliveryRecovery(submissionId);
+        if (disposition.kind === 'deferred_live_owner') {
+          this.live.push({ conversationId, id: submissionId });
+          continue;
+        }
+        if (disposition.kind !== 'delivery_required') continue;
+        // A parent Turn still active after the stops above is a live Host's (reported there): it takes the answer in.
+        if ((await this.get('Turn', disposition.automaticSourceTurnId))?.status === 'active') {
+          this.live.push({ conversationId, id: submissionId });
+          continue;
+        }
+        const abandoned = await this.application.runtime.deliveries.createAbandoned({
+          inboxItemId: disposition.inboxItemId,
+          targetConversationId: disposition.command.targetConversationId,
+          reason: DATA_ROOT_RELOCATED_REASON
+        });
+        if (abandoned.created) this.counts.answersAbandoned += 1;
+      } catch (error) {
+        this.unsettled.push({ conversationId, kind: 'failed', id: submissionId, detail: errorMessage(error) });
+      }
     }
   }
 
-  private async reportProcessCompletions(listed: ReadonlySet<string>): Promise<void> {
+  /**
+   * The completion notice of a finished background Process started from a listed Conversation is
+   * dead-lettered (ProcessCompletionDeliveryControlPlane.abandonDispatch) instead of becoming a
+   * delivery that continues its Conversation. A source Turn still active belongs to a live Host,
+   * which takes the result in; a dispatch a live Host claimed is that Host's (`live`).
+   */
+  private async abandonProcessCompletions(listed: ReadonlySet<string>): Promise<void> {
     const dispatches = [
       ...await this.list('ProcessCompletionDispatch', { state: 'pending' }),
       ...await this.list('ProcessCompletionDispatch', { state: 'claimed' })
@@ -661,12 +745,18 @@ class RelocatedWorkSettlement {
       if (!receipt) continue;
       const [source] = await this.list('ProcessCompletionSourceLink', { process_id: String(receipt.process_id) });
       if (!source || !listed.has(String(source.conversation_id))) continue;
-      // A stopped source Turn only notifies; a live Host's active Turn takes the result in.
-      if (!await this.completedSuccessfully(await this.get('Turn', String(source.source_turn_id)))) continue;
-      this.unsettled.push({
-        conversationId: String(source.conversation_id), kind: 'process_completion', id: String(dispatch.id),
-        detail: '后台进程在已完成的 Turn 之后结束，它的完成通知送达后会开启新的 Turn 续跑，没有现成的终态转换可以收尾。'
-      });
+      if ((await this.get('Turn', String(source.source_turn_id)))?.status === 'active') continue;
+      const conversationId = String(source.conversation_id);
+      try {
+        const outcome = await this.application.processDeliveries.abandonDispatch({
+          dispatchId: String(dispatch.id),
+          reason: DATA_ROOT_RELOCATED_REASON
+        });
+        if (outcome === 'abandoned') this.counts.processCompletionsAbandoned += 1;
+        else if (outcome === 'live') this.live.push({ conversationId, id: String(dispatch.id) });
+      } catch (error) {
+        this.unsettled.push({ conversationId, kind: 'failed', id: String(dispatch.id), detail: errorMessage(error) });
+      }
     }
   }
 
@@ -744,6 +834,22 @@ class RelocatedWorkSettlement {
     if (!row) throw new Error(`${domain} ${id} does not exist.`);
     return row;
   }
+}
+
+/** Each item of a Conversation's listed work, as `list|id` (and `otherRuntimeWork|conversation`). */
+function workKeys(conversation: RelocatedConversationWork): string[] {
+  const keys = RELOCATED_WORK_LISTS.flatMap((list) => conversation[list].map((id) => `${list}|${id}`));
+  return conversation.otherRuntimeWork ? [...keys, `otherRuntimeWork|${conversation.conversationId}`] : keys;
+}
+
+function uniqueBy<T>(items: readonly T[], key: (item: T) => string): T[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    const itemKey = key(item);
+    if (seen.has(itemKey)) return false;
+    seen.add(itemKey);
+    return true;
+  });
 }
 
 function errorMessage(error: unknown): string {

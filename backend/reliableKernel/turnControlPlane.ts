@@ -776,6 +776,12 @@ export class TurnControlPlane {
     return this.guidanceQueue.cancelQueuedGuidance(command);
   }
 
+  /** A queued TurnIntent that is not an ordinary message (a continuation, a runtime continuation, a retry), see TurnGuidanceQueue.cancelQueuedIntent. */
+  public cancelQueuedIntent(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
+    return this.runOwnedConversationMutation(command.conversationId, () =>
+      this.guidanceQueue.cancelQueuedIntent(command));
+  }
+
   public setGuidanceHold(command: TurnGuidanceHoldCommand): Promise<TurnCommandResult> {
     return this.runOwnedConversationMutation(command.conversationId, () =>
       this.guidanceQueue.reviseGuidanceHold(command));

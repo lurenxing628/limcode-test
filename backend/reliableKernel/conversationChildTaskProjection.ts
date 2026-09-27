@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import type { SnapshotBarrier } from './contracts';
 import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
+import { settlementReasonText } from './deliverySettlementSteps';
 import { childExecutionAcceptsContinuation, requireChildExecutionStatus, type ChildExecutionStatus } from './childExecutionState';
 import {
   parseInputTurnIntentEnvelope,
@@ -58,6 +59,8 @@ export interface ConversationChildTaskDelivery {
   targetTurnId?: string;
   wakeState?: string;
   failureReason?: string;
+  /** What the user reads for a settlement reason code (for example a data-root relocation). */
+  failureReasonText?: string;
   /** Delivery consumption and model-input handling are different committed facts. */
   handledAt?: string;
 }
@@ -72,6 +75,7 @@ export interface ConversationChildTaskAnswerHandling {
   handledAt?: string;
   wakeState?: string;
   failureReason?: string;
+  failureReasonText?: string;
 }
 
 export interface ConversationChildTaskRecord {
@@ -406,6 +410,7 @@ export async function buildConversationChildTaskProjection(
       const input = facts.deliveryInputLinks.find(link => link.delivery_id === row.id);
       const wake = facts.deliveryWakes.find(value => value.delivery_id === row.id);
       const failureReason = optionalText(row.failure_reason) ?? optionalText(wake?.last_error);
+      const failureReasonText = settlementReasonText(failureReason);
       return {
         id: requireText(row.id, 'RuntimeDelivery.id'), state: requireText(row.state, 'RuntimeDelivery.state'),
         phase: requireText(row.phase, 'RuntimeDelivery.phase'),
@@ -414,6 +419,7 @@ export async function buildConversationChildTaskProjection(
         ...(optionalText(row.target_turn_id) ? { targetTurnId: String(row.target_turn_id) } : {}),
         ...(optionalText(wake?.state) ? { wakeState: String(wake?.state) } : {}),
         ...(failureReason ? { failureReason } : {}),
+        ...(failureReasonText ? { failureReasonText } : {}),
         ...(optionalText(input?.handled_at) ? { handledAt: String(input?.handled_at) } : {})
       };
     }).sort((a, b) => compareText(a.id, b.id));
@@ -555,6 +561,7 @@ async function answerHandling(
     answerId: delivery.sourceId, via: 'runtime_delivery', deliveryId: delivery.id,
     ...(delivery.wakeState ? { wakeState: delivery.wakeState } : {}),
     ...(delivery.failureReason ? { failureReason: delivery.failureReason } : {}),
+    ...(delivery.failureReasonText ? { failureReasonText: delivery.failureReasonText } : {}),
     ...(delivery.handledAt ? { handledAt: delivery.handledAt } : {})
   }));
   const candidates = new Set(facts.answerToolCalls.map(row => String(row.id)));

@@ -24,6 +24,8 @@ const { evaluateConversationHostEligibility } = await load('backend/application/
 const { projectFolderAssignmentSteps } = await load('backend/reliableKernel/conversationProject.js');
 const { writeTool } = await load('backend/world/modules/tools/definitions/write/index.js');
 const { relocatedWorkBeforeOpen, settleRelocatedWorkOnOpen } = await load('backend/application/reliableKernel/relocatedWorkOpening.js');
+const { RELOCATED_WORK_REPORTED_ONLY } = await load('backend/application/reliableKernel/relocatedWorkSettlement.js');
+const { preparedContentObjectSteps } = await load('backend/reliableKernel/contentObjectTransaction.js');
 const reloc = await import(pathToFileURL(path.join(root, 'tests/reliable-kernel/runtime-data-root-relocation-fixture.mjs')).href);
 const { relocation, rootAuthority } = reloc;
 
@@ -191,6 +193,33 @@ test('窄竞态：打开之后、收尾之前，已批准还没派发的文件�
   assert.equal(provider.calls.length, 0);
 });
 
+test('打开前的提示只列收尾不了的项：待投递的结果和进程完成通知现在都能收尾，提示列表比上一轮短（这里 2 项变 0 项）；清单照样记下，同意后打开时一并收尾，旧目录 Provider 0 次', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const { conversationId, turnId } = await admitUnstartedTurn(fixture);
+  const { deliveryId, dispatchId } = await finishedBackgroundProcesses(fixture, conversationId, turnId);
+  const { relocationId } = await relocateOldHome(fixture);
+  const [entry] = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets;
+  const [work] = entry.inventory.conversations;
+  assert.deepEqual([work.activeTurnIds, work.pendingDeliveryIds, work.pendingProcessCompletionIds], [[turnId], [deliveryId], [dispatchId]], '清单照样记下');
+  const previously = reportedOnlyItems(entry.inventory, PREVIOUSLY_REPORTED_ONLY);
+  const now = reportedOnlyItems(entry.inventory, RELOCATED_WORK_REPORTED_ONLY);
+  assert.equal(previously.length, 2, '上一轮：待投递的结果和进程完成通知逐条列为收尾不了、打开后仍会执行一次');
+  assert.ok(now.length < previously.length, '提示列表变短');
+  assert.deepEqual(now, [], '能收尾的类别不再列出');
+  assert.deepEqual(RELOCATED_WORK_REPORTED_ONLY, {});
+  assert.ok(Object.isFrozen(RELOCATED_WORK_REPORTED_ONLY), '形状不变：仍是冻结的 { 清单列表名: 类别 }');
+
+  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
+  const provider = countingProvider();
+  await openSettleAndRecover(fixture, provider, INSTALLATION_B);
+  assert.equal(provider.calls.length, 0, '旧目录不调用模型');
+  const settled = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
+  assert.deepEqual([settled.state, settled.result.live, settled.result.unsettled], ['settled', [], []], '没有需要人处理的项');
+  assert.deepEqual([settled.result.counts.turnsStopped, settled.result.counts.deliveriesTakenIn, settled.result.counts.processCompletionsAbandoned], [1, 1, 1]);
+  assert.deepEqual((await rowsOf(fixture, 'ProcessCompletionDispatch', { id: dispatchId })).map((row) => [row.state, row.last_error]), [['dead_letter', 'data-root-relocated']]);
+  assert.deepEqual((await rowsOf(fixture, 'RuntimeDelivery', { id: deliveryId })).map((row) => row.state), ['consumed']);
+});
+
 test('真实的 Facade.open：旧目录带着没同意的迁走任务时，在运行时打开之前就拒绝（reason moved-work，由恢复提示给出三选一）', { timeout: 120_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   await admitUnstartedTurn(fixture);
@@ -270,6 +299,64 @@ async function admitUnstartedTurn(fixture) {
     }));
     assert.equal(admitted.admitted, true);
     return { conversationId, turnId: admitted.turnId };
+  } finally { await origin.close(); }
+}
+
+/** The kinds the moved-work prompt listed item by item before this round made them settleable. */
+const PREVIOUSLY_REPORTED_ONLY = Object.freeze({
+  pendingDeliveryIds: 'continuation_delivery',
+  undeliveredAnswerIds: 'child_answer',
+  pendingProcessCompletionIds: 'process_completion'
+});
+
+/** The items the moved-work prompt lists as "收尾不了" for `table` (vscode/commands/dataRootRelocation.ts describeMovedWork). */
+function reportedOnlyItems(inventory, table) {
+  return inventory.conversations.flatMap((conversation) => Object.entries(table).flatMap(([list, kind]) =>
+    (conversation[list] ?? []).map((id) => `“${conversation.title || conversation.conversationId}”：${kind}（${id}）`)));
+}
+
+/**
+ * Two background Processes the unstarted Turn `turnId` started, finished while its window was
+ * gone: one completion already delivered to that Turn (pending), one not dispatched yet.
+ */
+async function finishedBackgroundProcesses(fixture, conversationId, turnId) {
+  const origin = await openHost(dataRootOf(fixture), countingProvider(), { folders: [PROJECT.uri], label: 'origin', runner: false });
+  try {
+    const { app } = origin;
+    const at = new Date().toISOString();
+    const processSteps = (id) => [
+      repo('Process').insert({ id, status: 'exited', wrapper_nonce: `nonce-${id}`, wrapper_pid: 0n, child_pid: null,
+        process_group_id: null, start_fingerprint: `fingerprint-${id}`, command_digest: `digest-${id}`, spool_locator: `spool/${id}`,
+        retained_bytes: 0n, retained_chunks: 0n, dropped_bytes: 0n, truncated: 0n, started_at: at, updated_at: at, completed_at: at }),
+      repo('ProcessCompletionSourceLink').insert({ id: `source-${id}`, process_id: id, conversation_id: conversationId,
+        source_turn_id: turnId, source_tool_call_id: `${id}-tool`, created_at: at }),
+      repo('ProcessReceipt').insert({ id: `receipt-${id}`, process_id: id, outcome: 'succeeded', exit_code: 0n, exit_signal: null,
+        wrapper_nonce: `nonce-${id}`, start_fingerprint: `fingerprint-${id}`, received_at: at })
+    ];
+    const payload = await app.contentStore.prepare(app.database, JSON.stringify({ kind: 'process_completion', processId: 'process-delivered',
+      processReceiptId: 'receipt-process-delivered', sourceTurnId: turnId, conversationId }), 'application/vnd.limcode.process-completion+json');
+    const exitRequest = await app.contentStore.prepare(app.database, '{"kind":"process_exit","processId":"process-undispatched"}\n', 'application/json');
+    await app.database.transaction([
+      ...preparedContentObjectSteps([payload, exitRequest], 'fixture_process'),
+      ...processSteps('process-delivered'),
+      repo('RuntimeInboxItem').insert({ id: 'process-delivered', dedupe_key: 'fixture:process-delivered', source_kind: 'process_receipt',
+        source_id: 'receipt-process-delivered', state: 'available', created_at: at, updated_at: at }),
+      repo('RuntimeInboxPayloadLink').insert({ id: 'payload-process-delivered', inbox_item_id: 'process-delivered',
+        content_object_id: payload.metadata.id, created_at: at }),
+      ...processSteps('process-undispatched'),
+      repo('Operation').insert({ id: 'operation-process-undispatched', owner_kind: 'process', owner_id: 'process-undispatched',
+        operation_seq: 1n, tool_call_id: null, status: 'succeeded', created_at: at, updated_at: at }),
+      repo('Attempt').insert({ id: 'attempt-process-undispatched', operation_id: 'operation-process-undispatched', attempt_seq: 1n,
+        status: 'succeeded', created_at: at, updated_at: at, completed_at: at }),
+      repo('EffectIntent').insert({ id: 'intent-process-undispatched', attempt_id: 'attempt-process-undispatched', effect_kind: 'process_exit',
+        dispatch_state: 'receipt_written', request_object_id: exitRequest.metadata.id, created_at: at, updated_at: at }),
+      repo('ProcessCompletionDispatch').insert({ id: 'dispatch-process-undispatched', process_receipt_id: 'receipt-process-undispatched',
+        state: 'pending', claim_owner_host_boot_id: null, claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n,
+        next_attempt_at: null, last_error: null, completed_at: null, created_at: at, updated_at: at })
+    ]);
+    const delivered = await app.runtime.deliveries.createAutomatic({ inboxItemId: 'process-delivered', targetConversationId: conversationId, sourceTurnId: turnId });
+    assert.deepEqual([delivered.delivery.phase, delivered.delivery.target_turn_id], ['current_turn', turnId]);
+    return { deliveryId: delivered.delivery.id, dispatchId: 'dispatch-process-undispatched' };
   } finally { await origin.close(); }
 }
 

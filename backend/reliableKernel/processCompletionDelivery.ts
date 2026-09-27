@@ -14,6 +14,7 @@ import {
   stablePhaseFId
 } from './phaseFIdentity';
 import { ProcessControlPlane, type ProcessOutputReadResult } from './processEffects';
+import { deadLetterProcessCompletionDispatchSteps } from './deliverySettlementSteps';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -204,6 +205,35 @@ export class ProcessCompletionDeliveryControlPlane {
       });
     this.scanPromise = tracked;
     return tracked;
+  }
+
+  /**
+   * Gives up the completion notice of a finished background Process that must not reach its
+   * Conversation in this data set (a data-root relocation carried it away): the dispatch is
+   * dead-lettered with `reason` (deliverySettlementSteps), so no delivery is ever created for it and
+   * the scan never picks it up again. A dispatch a live Host holds under an unexpired claim is that
+   * Host's: nothing changes and the result is `live` (a claim whose Host is gone is stale and is
+   * given up). Idempotent; never retried, never opens a Turn.
+   */
+  public async abandonDispatch(input: { dispatchId: string; reason: string }): Promise<'abandoned' | 'live' | 'not_pending'> {
+    const dispatchId = requirePhaseFId(input.dispatchId, 'dispatchId');
+    const reason = requirePhaseFText(input.reason, 'reason');
+    for (let attempt = 0; ; attempt += 1) {
+      const dispatch = await this.maybeGet('ProcessCompletionDispatch', dispatchId);
+      if (!dispatch || (dispatch.state !== 'pending' && dispatch.state !== 'claimed')) return 'not_pending';
+      const now = this.timestamp();
+      if (
+        dispatch.state === 'claimed'
+        && Date.parse(String(dispatch.claim_expires_at)) > Date.parse(now)
+        && await this.database.isHostAlive(requirePhaseFText(dispatch.claim_owner_host_boot_id, 'claim_owner_host_boot_id'))
+      ) return 'live';
+      try {
+        await this.database.transaction(deadLetterProcessCompletionDispatchSteps(dispatch, reason, now));
+        return 'abandoned';
+      } catch (error) {
+        if (!isTransactionAssertionFailure(error) || attempt >= 2) throw error;
+      }
+    }
   }
 
   public async dispose(): Promise<void> {

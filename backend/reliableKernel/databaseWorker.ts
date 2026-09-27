@@ -15,6 +15,7 @@ import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
 import { executeRuntimeContentUsage } from './runtimeContentUsage';
+import { inventoryRelocatedWork } from './relocatedWorkInventory';
 import {
   deriveCommittedParentHandling,
   executeClientCollaborationHistoryPage,
@@ -313,6 +314,11 @@ async function start(): Promise<void> {
       if (request.kind === 'contentUsage') {
         assertDatabaseBinding(reader, data.binding);
         respond({ type: 'response', id: request.id, ok: true, result: executeRuntimeContentUsage(reader) });
+        return;
+      }
+      if (request.kind === 'relocatedWorkInventory') {
+        assertDatabaseBinding(reader, data.binding);
+        respond({ type: 'response', id: request.id, ok: true, result: inventoryRelocatedWork(reader) });
         return;
       }
       if (request.kind === 'conversationRuntimeWork') {

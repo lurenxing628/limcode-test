@@ -87,3 +87,42 @@ export function deadLetterProcessCompletionDispatchSteps(
     })
   ];
 }
+
+/**
+ * A result that was never routed gets its delivery already failed with `reason`, in the same
+ * transaction that routes its Inbox item: no Host ever creates a wake for a failed delivery, and
+ * recovery finds this delivery instead of routing the result again.
+ */
+export function abandonedDeliveryInsertSteps(
+  inbox: DomainRow,
+  delivery: { id: string; targetConversationId: string; phase: string },
+  reason: string,
+  now: string
+): RepositoryTransactionStep[] {
+  const inboxId = String(inbox.id);
+  return [
+    DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').assert(inboxId, { state: 'available', source_id: inbox.source_id }),
+    DOMAIN_REPOSITORIES.domain('RuntimeDelivery').insert({
+      id: delivery.id,
+      inbox_item_id: inboxId,
+      target_conversation_id: delivery.targetConversationId,
+      target_turn_id: null,
+      phase: delivery.phase,
+      attempt_seq: 1n,
+      retry_of_delivery_id: null,
+      state: 'failed',
+      failure_reason: reason,
+      created_at: now,
+      updated_at: now
+    }),
+    DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').update(inboxId, { state: 'routed', updated_at: now })
+  ];
+}
+
+/** The reason code a data-root relocation settles the carried results of the old directory with. */
+export const DATA_ROOT_RELOCATED_REASON = 'data-root-relocated';
+
+/** What the user reads for a settlement reason code shown next to an undelivered result. */
+export function settlementReasonText(reason: string | undefined): string | undefined {
+  return reason === DATA_ROOT_RELOCATED_REASON ? '数据目录已迁移，未送达' : undefined;
+}

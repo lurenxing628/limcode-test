@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
+import type { RelocatedWorkInventory } from './relocatedWorkInventory';
 import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import {
   ROOT_BINDING_POINTER_FILE,
@@ -368,6 +369,15 @@ export class RuntimeDatabase {
     const version = await this.request<string>({ kind: 'externalDataVersion' });
     if (!/^\d+$/.test(version)) throw new TypeError('SQLite external data version must be decimal.');
     return version;
+  }
+
+  /**
+   * The carried-work inventory of this whole data set (relocatedWorkInventory), read on the worker's
+   * read connection: a data-root relocation settlement takes it again after each round, since
+   * settling can create new work (a requester told that nobody will answer).
+   */
+  public async relocatedWorkInventory(): Promise<RelocatedWorkInventory> {
+    return this.request<RelocatedWorkInventory>({ kind: 'relocatedWorkInventory' });
   }
 
   /**
@@ -995,8 +1005,9 @@ function databaseMetricRequestKind(
 ): RuntimeDatabaseMetricRequestKind {
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
-  // The conversation pending-work probe and the domain row count are one fixed worker read snapshot each.
-  if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows') return 'snapshot';
+  // The conversation pending-work probe, the domain row count and the carried-work inventory are one
+  // fixed worker read snapshot each.
+  if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows' || kind === 'relocatedWorkInventory') return 'snapshot';
   return kind;
 }
 

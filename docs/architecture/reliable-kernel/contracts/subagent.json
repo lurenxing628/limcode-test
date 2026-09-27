@@ -253,6 +253,7 @@
     "deadLetterQueue": false,
     "targetGone": "目标Conversation/Turn不存在时，RuntimeInboxItem保留为事实，RuntimeDelivery置failed(reason=target-gone)。",
     "conversationDeletion": "删除对话先停止范围内工作（对话加整棵子Agent树，conversationDeleteCommand）再在删除事务里收尾。停止不需要对话归属：排队消息按修订号CAS取消且全部落地后才停Turn，父Turn停止请求先于子树中断持久化，后台进程直接写停止请求文件；原因写“用户删除对话”（被删子对话的父等待写“用户删除子任务对话”）；命令期间本窗口不在范围内开续跑Turn（内存标记）。收尾：投给范围内对话的pending RuntimeDelivery置failed(reason=target-gone)；只删子对话时父对话对它的等待以“用户删除子任务对话”取消；它投给范围外父对话的答复：父Turn有未结束的模型请求时删除等它接收，父Turn在跑但不在请求中时换成删除通知运行时输入（consumed，内容application/vnd.limcode.child-answer-source-deleted+json，不含答复），父对话空闲时置failed(reason=source-gone)；从未路由的答复Inbox置settled；相关Wake与进程完成派发置dead_letter；不新增schema、状态或持久关系。",
+    "dataRootRelocation": "数据目录迁移后，旧目录在任何执行之前收尾迁走的工作（settleRelocatedWork），迁走的结果按原因码data-root-relocated放弃，复用删除的deliverySettlementSteps：会开启回合的pending RuntimeDelivery置failed(reason=data-root-relocated)，它的Wake置dead_letter，经RuntimeDeliveryIntentLink为它排队的runtime_continuation在同一事务里取消（abandonPending）；从未路由的子Agent答复在同一事务里路由到一条attempt=1、已failed、没有Wake的Delivery（createAbandoned）；进程完成派发置dead_letter（abandonDispatch）；存活Host认领且未过期的Wake或派发、仍活动的目标Turn属于存活宿主，原样留下记为live，认领者已死的认领作废、照常放弃；父Turn已完成的后台子Agent先按子对话面板的停止停下活动Turn，排着续跑时再interruptSubtree取消，不写termination_request、不发布答复；客户端投递投影与子任务投影把该原因码显示为“数据目录已迁移，未送达”；不新增schema、状态或持久关系。",
     "identity": {
       "attemptSeq": "每个inbox+destination从1开始，phase/target不参与attempt身份",
       "logicalUnique": "(inbox_item_id,target_conversation_id,attempt_seq) UNIQUE；并发路由判定只能产生一个初始attempt=1",
@@ -424,7 +425,7 @@
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
     "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
     "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
-    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply; a-reply-committed-before-the-deletion-only-settles-its-request(completed-when-a-Turn-wrote-it-failed-for-a-failure-reply)-and-is-never-sent-twice",
+    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; deliveries-a-data-root-relocation-carried-away-fail-in-the-old-directory(data-root-relocated)-and-the-reply-that-tells-the-requester-would-open-a-Turn-so-the-next-settlement-round-gives-it-up-too; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply; a-reply-committed-before-the-deletion-only-settles-its-request(completed-when-a-Turn-wrote-it-failed-for-a-failure-reply)-and-is-never-sent-twice",
     "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
     "forkTurns": [
       "none",
