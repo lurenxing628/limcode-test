@@ -980,6 +980,10 @@ test('锁内轮次用完时放弃原因按最后一次的实际原因：发起�
   assert.equal(lockedRounds, 3);
   assert.equal(outcome.reason, '准备期间反复有窗口变忙（最后一次：本窗口还有任务正在进行），这次没有进行，稍后再试。');
   assert.doesNotMatch(outcome.reason, /其它窗口/);
+  // The next automatic call meets the key's backoff: the same reason, saying when instead of “later”.
+  const later = await request(paths, BASE, async () => assert.fail('must not run'));
+  assert.equal(later.state, 'backoff');
+  assert.match(later.reason, /^准备期间反复有窗口变忙（最后一次：本窗口还有任务正在进行），这次没有进行。约 5 分钟后（\d\d:\d\d 以后）可以再试。$/);
 });
 
 test('beforeGo 在全部确认之后、发布 go 之前调用：本窗口不空闲就在任何窗口重载前退回锁外或放弃；冻结在轮次结束时解除', async (t) => {

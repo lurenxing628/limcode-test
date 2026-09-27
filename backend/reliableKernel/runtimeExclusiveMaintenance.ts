@@ -1206,7 +1206,7 @@ async function readActiveBackoff(
     if (!Number.isFinite(until) || until <= Date.now() || until > Date.now() + maxMs + 60_000) continue;
     if (!latest || until > latest.at) latest = { until: entry.until, reason: entry.reason, at: until };
   }
-  return latest ? { until: latest.until, reason: `${latest.reason}${retryText(latest.at)}` } : undefined;
+  return latest ? { until: latest.until, reason: withRetryTime(latest.reason, latest.at) } : undefined;
 }
 
 async function recordKeyBackoff(
@@ -1249,6 +1249,11 @@ async function recordOperationCooldown(
     ...(input.requesterToken !== undefined ? { requesterToken: input.requesterToken } : {}),
     reason: '刚刚已经为这项维护让其它窗口重载过一次，暂不再次要求其它窗口重载。', recordedAt: new Date().toISOString()
   }).catch((error) => console.warn('[LimCode] 无法记录独占维护的冷却期。', error));
+}
+
+/** A recorded reason that ends with “try again later” says when instead. */
+function withRetryTime(reason: string, untilMs: number): string {
+  return `${reason.replace(/[，；]?(?:之后可以再试|稍后再试)。$/, '。')}${retryText(untilMs)}`;
 }
 
 /** When a refused call may be made again, in the user's words: about how long, and the local time. */
