@@ -570,6 +570,19 @@ test('background merge reports new outcomes once, stays silent for known ones an
   assert.equal(obsolete.calls.some(call => call[0] === 'merge-online'), false);
 });
 
+test('an automatic merge that gave way to another window merging the same source says nothing; a requested one still says why (blind review #4)', async () => {
+  const superseded = {
+    candidateId: 'workspace:old', code: 'runtime-data-set-merge-exclusive-superseded',
+    message: '另一个窗口正在进行同一项维护（合并较大的旧聊天记录），这次由它完成。', newly: true
+  };
+  const quiet = fixture({ mergeReport: emptyMergeReport({ deferred: [superseded] }) });
+  await quiet.mergeHistoricalDataSetsInBackground(quiet.context, mergeHost());
+  assert.equal(quiet.calls.some(call => ['warning', 'info'].includes(call[0])), false);
+  const requested = fixture({ mergeReport: emptyMergeReport({ deferred: [{ ...superseded, requested: true }] }) });
+  await requested.mergeHistoricalDataSetsInBackground(requested.context, mergeHost());
+  assert.match(requested.calls.find(call => call[0] === 'info')[1], /暂时无法合并（另一个窗口正在进行同一项维护（合并较大的旧聊天记录），这次由它完成）/);
+});
+
 test('only an oversized source the engine prepared asks other windows to yield, keyed by that source state', async () => {
   const withLocks = body => body();
   const isDeterministicFailure = () => false;

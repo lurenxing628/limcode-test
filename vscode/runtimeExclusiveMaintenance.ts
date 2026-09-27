@@ -285,8 +285,10 @@ async function countdown(
       for (let tick = 0; tick < COUNTDOWN_TICKS_PER_SECOND; tick += 1) {
         await new Promise((resolve) => setTimeout(resolve, 1000 / COUNTDOWN_TICKS_PER_SECOND));
         // Withdrawn meanwhile (another window declined or stayed busy, a timeout): no reload follows.
-        if (!await context.isCurrent().catch(() => true)) {
-          withdrawn = true;
+        // Moved on (a new round asks again): this countdown is in vain, closed without a word.
+        const state = await context.requestState().catch(() => 'current' as const);
+        if (state !== 'current') {
+          withdrawn = state === 'withdrawn';
           return false;
         }
       }

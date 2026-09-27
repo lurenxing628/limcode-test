@@ -111,6 +111,34 @@ test('盲审 #6：倒计时期间请求被撤回（另一个窗口的用户选�
   assert.equal(counting.reloads, 0);
 });
 
+test('盲审 #6：倒计时期间请求进入新一轮（发起方回锁外后重新协调）时倒计时悄悄关闭，不说“不重载”；请求随后撤回也不补这句', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const notices = [];
+  const titles = [];
+  let reloads = 0;
+  const layer = loadVscodeLayer(vscodeMock({ titles, notices }, () => { reloads += 1; }));
+  const liveness = await publishHost(binding, 'window-rounds');
+  const participant = layer.startExclusiveMaintenanceParticipant({
+    exclusiveMaintenanceTarget: () => ({ paths, hostBootId: 'window-rounds' }), hasOwnedExecution: async () => false
+  }, { countdownSeconds: 5, pollMs: 60 * 60_000, processId: (nextFakeProcessId += 1) });
+  t.after(async () => { await participant.dispose(); await fs.rm(liveness, { force: true }); });
+  const request = { requestId: 'round-request', createdAt: new Date().toISOString(), whenBusy: 'wait' };
+  await writeRequest(paths, { ...request, phase: 'prepare' });
+  await participant.checkNow();
+  await writeRequest(paths, { ...request, phase: 'confirm' });
+  const started = Date.now();
+  const counting = participant.checkNow();
+  await delay(600);
+  await writeRequest(paths, { ...request, round: 2, phase: 'prepare' });
+  await counting;
+  assert.ok(Date.now() - started < 3_000, `closed early (${Date.now() - started} ms)`);
+  assert.equal(titles.filter((title) => /即将重载/.test(title)).length, 1);
+  await fs.rm(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', 'round-request.json'), { force: true });
+  await participant.checkNow();
+  assert.deepEqual(notices.filter((notice) => /不重载/.test(notice)), []);
+  assert.equal(reloads, 0);
+});
+
 test('发起方自身忙碌只看任务不看焦点（requesterWorkBusy）', async () => {
   const layer = loadVscodeLayer(vscodeMock({ titles: [], notices: [], focused: true }, () => {}));
   assert.equal(await layer.requesterWorkBusy({ hasOwnedExecution: async () => false })(), undefined);

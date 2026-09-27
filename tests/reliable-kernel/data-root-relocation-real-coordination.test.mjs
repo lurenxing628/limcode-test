@@ -542,6 +542,19 @@ test('reloc3 F1/问题 1 真实的 Facade.open：新目录里有发起进程还�
   assert.equal(recorded, await relocation.readDataRootIdentity(target));
 });
 
+test('盲审 #9：真实的 Facade.open 拿到锁时就告诉扩展等待已经结束（onRuntimeWaitOver），不等打开的其余部分', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  await globalStatus.saveGlobalStatus(vscodeContext, fixture.root, '');
+  const over = [];
+  // The rest of opening needs a real VS Code; the admission (and the scope's maintenance claim) come first.
+  await Facade.open(vscodeContext, { onRuntimeWait() {}, onRuntimeWaitOver: () => over.push('over') })
+    .then(async (facade) => { await facade.dispose(); }, () => undefined);
+  assert.ok(over.length >= 1, 'told once the admission was taken');
+});
+
 test('reloc3 G1 globalStatus 的进行中记录按比较后写入：已有别的进行中迁移时拒绝写入；清除只清自己的', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const storage = path.join(fixture.base, 'vscode-global-storage');

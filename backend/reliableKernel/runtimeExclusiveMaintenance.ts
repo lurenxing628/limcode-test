@@ -930,8 +930,9 @@ export interface ExclusiveMaintenanceParticipantHandlers {
   busyReason(request: RuntimeExclusiveMaintenanceRequest): Promise<ExclusiveMaintenanceBusy | undefined>;
   /**
    * Countdown or notice before confirming; false only when the user cancelled a cancellable
-   * countdown. `context.isCurrent` tells whether the request still waits for this answer (a request
-   * withdrawn meanwhile, e.g. another window declined, closes the countdown: this window will not reload).
+   * countdown. `context.requestState` tells whether the request still waits for this answer: a
+   * countdown for a request withdrawn meanwhile (another window declined, a timeout) closes and says
+   * this window will not reload; one that moved on (a new round asks again) closes silently.
    */
   confirm(request: RuntimeExclusiveMaintenanceRequest, context: ExclusiveMaintenanceConfirmContext): Promise<boolean>;
   /** Yields the root: reload the window (its next startup waits on the admission). */
@@ -941,9 +942,15 @@ export interface ExclusiveMaintenanceParticipantHandlers {
 }
 
 export interface ExclusiveMaintenanceConfirmContext {
-  /** False once the request was withdrawn or moved on (a new round): the countdown is in vain. */
-  isCurrent(): Promise<boolean>;
+  /**
+   * 'current' while the request waits for this answer; 'withdrawn' once it was withdrawn or is gone
+   * (this window will not reload for it); 'moved-on' when it went on without this answer (a new
+   * round asks again) or this window no longer takes part.
+   */
+  requestState(): Promise<ExclusiveMaintenanceRequestState>;
 }
+
+export type ExclusiveMaintenanceRequestState = 'current' | 'withdrawn' | 'moved-on';
 
 export interface ExclusiveMaintenanceParticipantOptions {
   pollMs?: number;
@@ -1007,10 +1014,14 @@ export function startExclusiveMaintenanceParticipant(
     await writeResponse(paths, request, hostBootId, stage, answer, busy?.kind, busy?.reason ?? reason, busy?.maintenance);
     answered.set(`${request.requestId}#${request.round}:${stage}`, `${answer}\0${busy?.kind ?? ''}\0${busy?.reason ?? ''}`);
   };
-  const stillCurrentRequest = async (request: RuntimeExclusiveMaintenanceRequest): Promise<boolean> => {
+  const requestState = async (request: RuntimeExclusiveMaintenanceRequest): Promise<ExclusiveMaintenanceRequestState> => {
+    if (!current()) return 'moved-on';
     const still = (await readExclusiveMaintenanceRequests(paths, { classify })).find((item) => item.requestId === request.requestId);
-    return current() && still?.round === request.round && still.phase === request.phase;
+    if (!still) return 'withdrawn';
+    return still.round === request.round && still.phase === request.phase ? 'current' : 'moved-on';
   };
+  const stillCurrentRequest = async (request: RuntimeExclusiveMaintenanceRequest): Promise<boolean> =>
+    await requestState(request) === 'current';
   const handle = async (request: RuntimeExclusiveMaintenanceRequest, ownRequest: () => LocalRequest | undefined): Promise<void> => {
     const round = `${request.requestId}#${request.round}`;
     // This window's own request is running: answer busy, never yield (a reload would drop it).
@@ -1052,7 +1063,7 @@ export function startExclusiveMaintenanceParticipant(
         await respond(request, 'confirm', 'busy', busy);
         return;
       }
-      const confirmed = await handlers.confirm(request, { isCurrent: () => stillCurrentRequest(request) });
+      const confirmed = await handlers.confirm(request, { requestState: () => requestState(request) });
       // Withdrawn (another window declined, a timeout) or restarted while the countdown ran.
       if (!await stillCurrentRequest(request)) return;
       if (!confirmed && request.confirmation === 'countdown') {
