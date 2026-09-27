@@ -69,7 +69,12 @@ function fixture({
   const database = { hostBootId: 'host-1' };
   const application = host ? {
     product: { application: { database } },
-    async hasOwnedExecution() { const value = busy.length > 1 ? busy.shift() : busy[0]; calls.push(['busy?', value]); return value; },
+    async hasOwnedExecution() {
+      const value = busy.length > 1 ? busy.shift() : busy[0];
+      calls.push(['busy?', value instanceof Error ? 'error' : value]);
+      if (value instanceof Error) throw value;
+      return value;
+    },
     exclusiveMaintenanceTarget() { return { paths: { dataRootPath: `${SOURCE}/.limcode-runtime/active` }, hostBootId: 'host-1' }; },
     dataRootPath() { return SOURCE; },
     async withDataRootLocks(body) { calls.push(['locks']); return body(); },
@@ -213,7 +218,7 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   const f = fixture({ answers: [{ choice: 'relocate', include: [] }] });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
   assert.deepEqual(f.kinds(), [
-    'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'locks', 'freeze', 'busy?', 'busy?', 'report-stage', 'close-runtime',
+    'open-dialog', 'plan', 'busy?', 'prompt', 'status', 'stage', 'exclusive', 'locks', 'busy?', 'freeze', 'busy?', 'busy?', 'report-stage', 'close-runtime',
     'complete', 'report-stage', 'status', 'thaw', 'global-state', 'command'
   ]);
   assert.deepEqual(f.calls.filter((call) => call[0] === 'report-stage').map((call) => call[1]), ['正在关闭本窗口的运行时', '正在切换到新数据目录'],
@@ -259,7 +264,7 @@ test('复审 bulk #6：迁移进度可以取消；在线预复制期间取消时
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
 });
 
-test('发起窗口在等待期间开始新任务：只提示一次迁移会推迟；确认之后（beforeGo 冻结本窗口时）仍有任务就退回，撤销准备，不重载', async () => {
+test('发起窗口在等待期间开始新任务：只提示一次迁移会推迟；确认之后（beforeGo）仍有任务就退回，撤销准备，不重载；忙时不冻结', async () => {
   const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: [false, true, true, true] });
   await f.commands.relocateDataRoot(f.context, f.startup, f.request);
   const exclusive = f.calls.find((call) => call[0] === 'exclusive')[1];
@@ -270,8 +275,20 @@ test('发起窗口在等待期间开始新任务：只提示一次迁移会推�
   assert.deepEqual(f.calls.find((call) => call[0] === 'abandon'), ['abandon', true]);
   assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
   assert.match(JSON.stringify(f.prompts.at(-1)), /本窗口在确认之后开始了新的任务/);
-  assert.deepEqual(f.kinds().filter((kind) => kind === 'freeze' || kind === 'thaw'), ['freeze', 'thaw'], '冻结后发现忙：马上解冻');
+  assert.deepEqual(f.kinds().filter((kind) => kind === 'freeze' || kind === 'thaw'), [], '冻结之前就发现忙：不冻结');
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
+});
+
+test('beforeGo 冻结之后的复查：发现检查与冻结之间开始的任务，或复查本身出错（按忙处理），都把解冻交给原语，窗口不会一直冻结', async () => {
+  for (const [late, reason] of [[true, /本窗口在确认之后开始了新的任务/], [new Error('探测失败'), /无法确认本窗口是否空闲/]]) {
+    const f = fixture({ answers: [{ choice: 'relocate', include: [] }], busy: [false, false, late] });
+    await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+    assert.deepEqual(f.kinds().filter((kind) => ['busy?', 'freeze', 'thaw'].includes(kind)), ['busy?', 'busy?', 'freeze', 'busy?', 'thaw']);
+    assert.ok(!f.kinds().includes('close-runtime'));
+    assert.deepEqual(f.calls.find((call) => call[0] === 'abandon'), ['abandon', true]);
+    assert.match(JSON.stringify(f.prompts.at(-1)), reason);
+    assert.ok(!f.calls.some((call) => call[0] === 'command'));
+  }
 });
 
 test('其它窗口没有让出：撤销准备、清除进行中记录，本窗口继续使用原目录且不重载，原因显示在设置页', async () => {

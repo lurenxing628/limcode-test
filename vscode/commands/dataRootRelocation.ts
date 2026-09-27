@@ -231,9 +231,17 @@ async function exclusively<T>(
     requesterHostBootId: hostBootId,
     requesterBusy,
     beforeGo: async () => {
-      const thaw = host.freezeNewWork();
+      // What may throw runs before the freeze and only what cannot after it: the thaw always
+      // reaches the primitive (a lost one would leave this window frozen).
       const busy = await ownWork();
-      return busy ? { busy: { ...busy, reason: '本窗口在确认之后开始了新的任务' }, thaw } : { thaw };
+      if (busy) return { busy: { ...busy, reason: '本窗口在确认之后开始了新的任务' } };
+      const thaw = host.freezeNewWork();
+      // Work taken up between the check and the freeze; a check that fails counts as busy.
+      const late = await ownWork().then(
+        (found) => found && { ...found, reason: '本窗口在确认之后开始了新的任务' },
+        (): ExclusiveMaintenanceBusy => ({ kind: 'work', reason: '无法确认本窗口是否空闲' })
+      );
+      return late ? { busy: late, thaw } : { thaw };
     },
     participantConfirmation: 'final-countdown',
     whenBusy: 'wait',
