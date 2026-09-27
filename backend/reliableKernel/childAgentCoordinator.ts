@@ -957,13 +957,14 @@ export class ReliableChildAgentCoordinator {
 
   /**
    * A child Turn this Host holds the lease of while it does not serve the child Conversation (its
-   * folder left the window) and does not drive it: the lease goes back under the child
+   * folder left the window) and does not drive it (the recovery pass skips Turns it drives): the
+   * lease goes back under the child
    * Conversation's short control claim. When another window holds that Conversation right now the
    * recovery polling retries. While this Host still runs native calls of the Turn the hand-back
    * completes in the background, so a recovery pass never waits for them.
    */
   private async handBackIneligibleChildLease(turnId: string, conversationId: string): Promise<void> {
-    if (this.activeTurns.has(turnId) || this.leaseHandBacks.has(turnId)) return;
+    if (this.leaseHandBacks.has(turnId)) return;
     if (!await this.dependencies.turns.heldExecutionLeaseFence({
       turnId,
       leaseOwnerId: this.childLeaseOwnerId,
@@ -978,8 +979,8 @@ export class ReliableChildAgentCoordinator {
       if (this.disposing || this.handoff) return;
       try {
         await owners.run(conversationId, async () => {
-          // Re-checked under the claim: the folder may have come back meanwhile, and a drive owns its lease.
-          if (this.activeTurns.has(turnId) || await owners.executionEligibility(conversationId) !== 'ineligible') return;
+          // Re-checked under the claim: the folder may have come back meanwhile.
+          if (await owners.executionEligibility(conversationId) !== 'ineligible') return;
           await this.handBackChildLease(turnId);
         });
       } catch (error) {

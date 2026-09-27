@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
@@ -192,7 +193,7 @@ test('盲审 2：交还等待中 Turn 的租约前，先等本窗口这个 Turn 
     await host.runner.waitForIdle();
     const call = inFlightNativeCall(host.app.agentLoop, turnId);
     host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
-    await host.runner.rescan();
+    await withinMs(host.runner.rescan(), 5_000, '重扫被在途调用阻塞');
     await sleep(500);
     assert.equal((await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0]?.host_boot_id, host.app.database.hostBootId,
       '本窗口仍在执行这个 Turn 的调用：租约还不交还');
@@ -257,6 +258,7 @@ test('盲审 1：资格一度无法确定、之后确定不合格：延迟候选
     await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0]?.owner_id === RELEASED,
       15_000, '延迟候选复查确定不合格后没有交还');
     // Nothing is held any more: a hand-back does not claim the Conversation for nothing.
+    await eventually(async () => !host.runner.leaseHandBacks.has(turnId), 5_000, '交还没有结束');
     const owners = host.app.database.conversationOwners;
     const run = owners.run.bind(owners);
     let claims = 0;
@@ -267,6 +269,34 @@ test('盲审 1：资格一度无法确定、之后确定不合格：延迟候选
     assert.equal(await host.runner.releaseWaitingTurn(conversationId, turnId), 'not_held');
     assert.equal(claims, 0, '不持有租约时不认领对话');
     assert.deepEqual(errorsOf(host), []);
+  } finally {
+    await host?.close();
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('盲审 1：待交还标记重试时 Turn 正由本窗口驱动：不替驱动交还，租约由驱动在轮次之间自己交还', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('pending-driven');
+  let host;
+  try {
+    const conversationId = 'conversation-pending-driven';
+    const mcp = gatedMcp();
+    const provider = scriptedProvider([MCP_CALL, text('不应到达')]);
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'w', mcp: mcp.answer });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    const { turnId } = await host.runner.input({ commandId: 'pending-driven', conversationId, text: '调用外部工具' });
+    await mcp.started;
+    // The folder leaves while a tool of the Turn runs; a hand-back left pending earlier is retried.
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    host.runner.pendingLeaseHandBacks.set(turnId, conversationId);
+    host.runner.ensureExternalWakePolling();
+    await sleep(1_500);
+    assert.equal((await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0]?.host_boot_id, host.app.database.hostBootId,
+      '工具仍在执行：不替驱动交还租约');
+    mcp.release();
+    await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: turnId }))[0]?.owner_id === RELEASED,
+      30_000, '驱动没有在轮次之间交还');
+    assert.equal(provider.calls, 1);
   } finally {
     await host?.close();
     await fsp.rm(outer, { recursive: true, force: true });
@@ -317,7 +347,7 @@ test('盲审 2：子 Agent 等待中文件夹离开：子调度先等本窗口�
     const { childTurnId } = await waitForChildQuestion(host);
     const call = inFlightNativeCall(host.app.agentLoop, childTurnId);
     host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
-    await host.coordinator.recoverStartup();
+    await withinMs(host.coordinator.recoverStartup(), 5_000, '子调度恢复扫描被在途调用阻塞');
     await sleep(500);
     assert.equal((await rows(host.app, 'ExecutionLease', { turn_id: childTurnId }))[0]?.host_boot_id, host.app.database.hostBootId,
       '本窗口仍在执行子 Turn 的调用：租约还不交还');
@@ -356,6 +386,7 @@ test('盲审 2：子 Agent 等本窗口在途 native 调用期间文件夹又回
     await host.coordinator.recoverStartup();
     await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: childTurnId }))[0]?.owner_id === RELEASED,
       10_000, '子调度没有交还');
+    await eventually(async () => !host.coordinator.leaseHandBacks.has(childTurnId), 5_000, '子调度的交还没有结束');
     const owners = host.app.database.conversationOwners;
     const run = owners.run.bind(owners);
     let claims = 0;
@@ -560,6 +591,15 @@ test('盲审 4：接管扫描只对租约已过期的 Turn 做进程身份探测
       assert.equal(await database.isHostAlive(w1.hostBootId), true);
       assert.equal(statReads.count, 1, '无缓存的探测每次都比对');
     }
+
+    // A recorded process whose start identity does not match (its PID was reused) is dead, and stays
+    // dead although a process with that PID exists.
+    const own = JSON.parse(await fsp.readFile(database.hostLivenessPath(database.hostBootId), 'utf8'));
+    const reusedHostBootId = crypto.randomUUID();
+    await fsp.writeFile(database.hostLivenessPath(reusedHostBootId),
+      JSON.stringify({ ...own, hostBootId: reusedHostBootId, processStartIdentity: `${own.processStartIdentity ?? 'identity'}-reused` }));
+    assert.equal(await database.isHostAliveCached(reusedHostBootId), false, 'PID 被复用：启动身份不符即判死');
+    assert.equal(await database.isHostAliveCached(reusedHostBootId), false, '判死的结果不因该 PID 上仍有进程而翻回存活');
 
     // The holder exits: the cheap existence check finds it gone at once, and the Turn is taken over.
     child.kill('SIGKILL');
@@ -1256,6 +1296,16 @@ async function eventuallyValue(read, timeoutMs, message) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Fails when the operation does not finish in time (it waited for something it must not wait for). */
+async function withinMs(promise, ms, message) {
+  let timer;
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); })]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function requiredEnv(name) {

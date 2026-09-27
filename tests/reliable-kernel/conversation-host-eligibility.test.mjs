@@ -31,7 +31,7 @@ const vscodeStub = {
   Uri: StubUri,
   EventEmitter: StubEventEmitter,
   ViewColumn: { One: 1 },
-  workspace: { workspaceFolders: [] },
+  workspace: { workspaceFolders: [], onDidChangeWorkspaceFolders: () => ({ dispose() {} }) },
   window: {
     async showInformationMessage(message) { informationMessages.push(message); },
     async showWarningMessage() {},
@@ -520,6 +520,33 @@ test('盲审 8：冻结的工作环境在当前窗口不可用时，面板恢复
   const message = conversationRecoveryWaitingMessage(withoutLabel);
   assert.equal(message, `${EXTENSION_BRAND}：该对话冻结的工作环境在当前窗口不可用，未完成的任务会在打开该工作环境的窗口中继续执行。`);
   assert.equal(message.includes('work-env-remote'), false);
+});
+
+test('盲审 3：产品运行时把接管无存活宿主持有的 Turn 接到与打开面板相同的按对话恢复（一次持有内：准备 → Phase D → 子调度 → 对话 Runner）', async () => {
+  const { VscodeReliableKernelProductRuntime } = require(compiled('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js'));
+  const order = [];
+  let takeover;
+  const runtime = new VscodeReliableKernelProductRuntime({
+    application: {
+      database: { conversationOwners: { async run(id, operation) { order.push(`claim:${id}`); return operation(); } } },
+      async recoverConversation(id) { order.push(`phase-d:${id}`); }
+    },
+    childAgents: { async recoverStartup(_signal, id) { order.push(`children:${id}`); } },
+    conversations: {
+      setConversationTakeover(hook) { takeover = hook; },
+      async recoverStartup(_signal, id) { order.push(`runner:${id}`); }
+    },
+    executionGate: { frozen: 0 },
+    initializeConfiguration: async () => undefined,
+    conversationEligibility: async () => ({ eligible: true }),
+    conversationEntryEligibility: async () => ({ eligible: true })
+  });
+  runtime.ensureCapabilitiesReady = async () => { order.push('ready'); };
+  assert.equal(typeof takeover, 'function', '产品运行时安装了接管钩子');
+  await takeover('conversation-unheld');
+  assert.deepEqual(order, [
+    'claim:conversation-unheld', 'ready', 'phase-d:conversation-unheld', 'children:conversation-unheld', 'runner:conversation-unheld'
+  ]);
 });
 
 test('文件修改审批：不合格窗口只记录决定，不派发修改、不续跑并提示；合格窗口照常派发并续跑', async () => {
