@@ -260,7 +260,7 @@ async function withBeta(fixture) {
   return beta;
 }
 
-test('B3 在线复制过的其它库在独占阶段丢弃重做时，只删它自己的目录：与它共用上级目录、已迁移的另一个库完整保留', async (t) => {
+test('在线复制过的其它库在独占阶段丢弃重做时，只清空它自己的目录：与它共用上级目录的另一个库完整迁移', async (t) => {
   const fixture = await createFixture(t);
   const beta = await withBeta(fixture);
   const target = path.join(fixture.base, 'moved');
@@ -281,6 +281,43 @@ test('B3 在线复制过的其它库在独占阶段丢弃重做时，只删它�
     const moved = await rootAuthority.resolveVscodeRuntimeDataSet({ globalStoragePath: target }, dataSet.id);
     assert.deepEqual(conversationIds(moved.runtimeDataRootPath), conversationIds(dataSet.binding.paths.dataRootPath));
   }
+});
+
+test('B3 其它库在独占阶段迁移失败：只删为它新建的目录，它新建的上级目录里先迁好的另一个库完整保留（删错了，之后“删除旧目录”会删掉唯一的一份）', async (t) => {
+  const fixture = await createFixture(t);
+  const beta = await withBeta(fixture);
+  const byId = new Map([[fixture.alpha.id, fixture.alpha], [beta.id, beta]]);
+  const target = path.join(fixture.base, 'moved');
+  const plan = await planWithRuntime(fixture, target);
+  const [first, second] = plan.others.map((other) => other.id);
+  assert.deepEqual([first, second].sort(), [...byId.keys()].sort());
+  // The first one's pre-copy fails (its directories go), so the second one creates the shared parent.
+  const copy = bulk.copyRuntimeDataSetIntoEmptyRoot;
+  bulk.copyRuntimeDataSetIntoEmptyRoot = async function (paths, input, ...rest) {
+    if (input.candidateId === first) throw Object.assign(new Error('注入：预复制时磁盘已满'), { code: 'ENOSPC' });
+    return copy.call(this, paths, input, ...rest);
+  };
+  t.after(() => { bulk.copyRuntimeDataSetIntoEmptyRoot = copy; });
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await stageDataRootRelocation(plan, source); } finally { await source.close(); }
+  bulk.copyRuntimeDataSetIntoEmptyRoot = copy;
+  const shared = path.join(target, '.limcode-workspace-runtimes');
+  assert.equal(staged.precopiedOthers[first], undefined);
+  assert.equal(staged.precopiedOthers[second].createdPath, shared, '前提：第二个库新建了共用的上级目录');
+  // In the exclusive phase the first one is migrated into the shared parent, then the second one fails.
+  const ensure = bulk.ensureRuntimeDataSetCopyCurrent;
+  bulk.ensureRuntimeDataSetCopyCurrent = async function (paths, receipt, ...rest) {
+    if (receipt === staged.precopiedOthers[second].receipt) throw new Error('注入：核对预复制时读取失败');
+    return ensure.call(this, paths, receipt, ...rest);
+  };
+  t.after(() => { bulk.ensureRuntimeDataSetCopyCurrent = ensure; });
+  const result = await completeDataRootRelocation(staged, async () => undefined);
+  assert.deepEqual(result.others.migrated, [first]);
+  assert.ok(result.others.leftBehind.some((entry) => entry.id === second && /核对预复制时读取失败/.test(entry.reason)));
+  const moved = await rootAuthority.resolveVscodeRuntimeDataSet({ globalStoragePath: target }, first);
+  assert.deepEqual(conversationIds(moved.runtimeDataRootPath), conversationIds(byId.get(first).binding.paths.dataRootPath), '先迁好的库还在');
+  await assert.rejects(rootAuthority.resolveVscodeRuntimeDataSet({ globalStoragePath: target }, second), () => true, '失败的库不留目录');
 });
 
 test('B1 其它库在线复制失败：为它新建的目录马上删掉，独占阶段再迁移它', async (t) => {
