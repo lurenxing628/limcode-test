@@ -120,6 +120,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/user-stop-dead-host.test.mjs',
   'tests/reliable-kernel/conversation-host-eligibility-review.test.mjs',
   'tests/reliable-kernel/plan-and-entry-eligibility.test.mjs',
+  'tests/reliable-kernel/eligibility-placement-handback.test.mjs',
   'tests/reliable-kernel/conversation-settings-isolation.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/global-settings-live-save.test.mjs',

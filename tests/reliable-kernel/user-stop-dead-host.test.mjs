@@ -206,7 +206,11 @@ test('子 Agent 同样适用：执行窗口被杀后，用户停止子 Agent 把
       childExecutionId: spawned.childExecutionId,
       reason: 'run_agent interrupt_subtree requested'
     });
+    // The child scheduler's automatic recovery now sees a recorded stop and a dead executing window:
+    // it settles control-only work but never closes dispatched work as outcome_unknown on its own.
+    await p1.coordinator.recoverStartup();
     await sleep(1_000);
+    await p1.coordinator.recoverStartup();
     assert.deepEqual(await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }), []);
     assert.equal((await rows(p1.app, 'Turn', { id: spawned.childTurnId }))[0]?.status, 'active');
 
@@ -293,6 +297,206 @@ test('复审 #7：父对话等待子 Agent 时执行窗口被杀，没有合格�
   } finally {
     await p1?.close();
     await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('死宿主判定：派发或持租约的宿主存活即为 live；本窗口派发的效果按存活；缺派发宿主记录不按已死；用户停止在栅栏内复核，复核不再是已死就交还租约、不标记；已到回执按回执对账（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('judgement');
+  let p1;
+  let child;
+  try {
+    const conversationId = 'conversation-judgement';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId });
+    const { turnId, hostBootId } = await waitForWorkerJson(child, files.ready, 90_000);
+    p1 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_ONE], label: 'p1' });
+    const phaseD = p1.app.phaseDRecovery;
+    const self = p1.app.database.hostBootId;
+    const [call] = await rows(p1.app, 'ToolCall', { turn_id: turnId });
+    const [intent] = await effectIntentsForToolCall(p1.app, call.id);
+
+    // The executing window is alive: its dispatched work is never judged dead.
+    assert.deepEqual(await phaseD.deadHostEffectsForTurn(turnId, self), { state: 'live', hostBootIds: [hostBootId] });
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    assert.deepEqual(await phaseD.deadHostEffectsForTurn(turnId, self),
+      { state: 'dead', hostBootIds: [hostBootId], effectIntentIds: [intent.id] });
+    // Asked as the dispatching Host itself, the work runs here: never dead.
+    assert.deepEqual(await phaseD.deadHostEffectsForTurn(turnId, hostBootId), { state: 'live', hostBootIds: [hostBootId] });
+    // Without a recorded dispatch Host nothing proves the work stopped.
+    const effects = phaseD.effects;
+    const readFence = effects.readEffectDispatchFence;
+    effects.readEffectDispatchFence = async () => undefined;
+    try {
+      assert.deepEqual(await phaseD.deadHostEffectsForTurn(turnId, self), { state: 'live', hostBootIds: [] });
+    } finally {
+      effects.readEffectDispatchFence = readFence;
+    }
+
+    // The user's stop re-reads the work under the lease it claimed. When that re-read no longer finds
+    // every Host dead, nothing is marked and the lease goes straight back.
+    const inspect = phaseD.deadHostEffectsForTurn.bind(phaseD);
+    let inspections = 0;
+    phaseD.deadHostEffectsForTurn = async (...args) => {
+      inspections += 1;
+      return inspections === 1 ? inspect(...args) : { state: 'live', hostBootIds: ['host-came-back'] };
+    };
+    let lease = (await rows(p1.app, 'ExecutionLease', { turn_id: turnId }))[0];
+    const recheck = await p1.runner.interrupt({ commandId: 'stop-recheck', conversationId, turnId,
+      expectedLeaseGeneration: String(lease.generation), reason: '用户停止' });
+    phaseD.deadHostEffectsForTurn = inspect;
+    assert.equal(recheck.executingWindowAlive, true);
+    assert.ok(inspections >= 2, '认领租约后在栅栏内复核');
+    assert.equal((await rows(p1.app, 'Turn', { id: turnId }))[0]?.status, 'active', '复核不是已死：不收尾');
+    assert.deepEqual(await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }), [], '复核不是已死：不标记');
+    lease = (await rows(p1.app, 'ExecutionLease', { turn_id: turnId }))[0];
+    assert.equal(lease.owner_id, kernel.RELEASED_EXECUTION_LEASE_HOLDER, '未收尾的认领在同一次持有内交还');
+    assert.equal(p1.owns(conversationId), false);
+
+    // The call's answer arrived just before the window died (a Receipt with the Operation still open).
+    // The stop applies that recorded result instead of closing the call some other way.
+    const recorded = await p1.app.runtime.effects.recordEffectReceipt({
+      source: { kind: 'callback', key: `mcp-call:${intent.attempt_id}:receipt` },
+      attemptId: intent.attempt_id,
+      effectKind: 'mcp_tool_call',
+      outcome: 'succeeded',
+      detail: { outcome: 'succeeded', result: { content: [{ type: 'text', text: '外部工具完成' }] } }
+    });
+    assert.ok(recorded.effectReceiptId);
+    assert.equal((await rows(p1.app, 'Operation', { tool_call_id: call.id }))[0]?.status, 'executing', '回执已到、Operation 仍未结束');
+    const stopped = await p1.runner.interrupt({ commandId: 'stop-arrived', conversationId, turnId,
+      expectedLeaseGeneration: String(lease.generation), reason: '用户停止' });
+    assert.equal(stopped.executingWindowAlive, undefined);
+    assert.equal((await rows(p1.app, 'Turn', { id: turnId }))[0]?.status, 'terminated');
+    assert.equal((await rows(p1.app, 'Operation', { tool_call_id: call.id }))[0]?.status, 'succeeded', '按已到回执对账');
+    assert.equal((await rows(p1.app, 'ToolOutcome', { tool_call_id: call.id }))[0]?.status, 'succeeded');
+    const receipts = await rows(p1.app, 'CommandReceipt', {});
+    assert.equal(receipts.some((row) => String(row.source_key).startsWith('user-stop-dead-host:')), false);
+    assert.equal(p1.mcpCalls(), 0);
+    assert.deepEqual(p1.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error)), []);
+  } finally {
+    await p1?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('复审 #7：服务该对话的窗口里用户停止，死宿主留下的效果先走启动恢复同样的核对路径，核对不了的才由停止标为结果未知（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('serving-stop');
+  let p2;
+  let child;
+  try {
+    const conversationId = 'conversation-serving-stop';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId });
+    const { turnId } = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    // A window serving the project that has not recovered the Turn yet (it was already open).
+    p2 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_TWO.uri], label: 'p2' });
+    const [call] = await rows(p2.app, 'ToolCall', { turn_id: turnId });
+    const [intent] = await effectIntentsForToolCall(p2.app, call.id);
+    const lease = (await rows(p2.app, 'ExecutionLease', { turn_id: turnId }))[0];
+    await p2.runner.interrupt({ commandId: 'serving-stop', conversationId, turnId,
+      expectedLeaseGeneration: String(lease.generation), reason: '用户停止' });
+    await eventually(async () => (await rows(p2.app, 'Turn', { id: turnId }))[0]?.status === 'terminated', 30_000, 'Turn 未收尾');
+    assert.equal((await rows(p2.app, 'TurnTermination', { turn_id: turnId }))[0]?.terminal_status, 'interrupted');
+    const [receipt] = await rows(p2.app, 'EffectReceipt', { attempt_id: intent.attempt_id });
+    const detail = await readContentJson(p2.app, receipt.response_object_id);
+    assert.notEqual(detail.reason, DEAD_HOST_STOP_REASON, '先走恢复路径，不直接按用户停止标记');
+    assert.match(detail.reason, /MCP service cannot prove/);
+    const receipts = await rows(p2.app, 'CommandReceipt', {});
+    assert.equal(receipts.some((row) => String(row.source_key).startsWith('user-stop-dead-host:')), false);
+    assert.equal(p2.mcpCalls(), 0, '恢复不重放外部调用');
+  } finally {
+    await p2?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('子驱动只在服务子对话的窗口执行：不合格窗口即使持有子 Turn 的租约也不驱动，立即交还（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('drive-child-gate');
+  let p1;
+  let child;
+  try {
+    const conversationId = 'conversation-drive-child-gate';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId }, 'origin-parent-waits');
+    const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    const provider = scriptedProvider([]);
+    p1 = await openHost(dataRoot, provider, { folders: [PROJECT_ONE], label: 'p1', children: true });
+    const claimed = await p1.app.turns.claimRecoveryExecution({
+      turnId: spawned.childTurnId,
+      leaseOwnerId: p1.coordinator.childLeaseOwnerId,
+      hostBootId: p1.app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 30_000).toISOString()
+    });
+    assert.ok(claimed, '本窗口取得了子 Turn 的租约（例如在这里派生后文件夹被移除）');
+    await assert.rejects(p1.coordinator.driveChild(spawned.childExecutionId, spawned.childTurnId), /not served by this Host/);
+    const [lease] = await rows(p1.app, 'ExecutionLease', { turn_id: spawned.childTurnId });
+    assert.equal(lease.owner_id, kernel.RELEASED_EXECUTION_LEASE_HOLDER, '交还租约');
+    assert.equal(provider.calls, 0, '不调用模型');
+    assert.equal(p1.owns(spawned.childConversationId), false);
+  } finally {
+    await p1?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
+test('子 Agent 运行中本窗口移除其项目文件夹：子驱动停在轮次之间并交还租约，模型不再被调用', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('child-round');
+  let host;
+  try {
+    const conversationId = 'conversation-child-round';
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    let childStarted;
+    const started = new Promise((resolve) => { childStarted = resolve; });
+    let parentCalls = 0;
+    let childCalls = 0;
+    const parentReplies = [
+      { role: 'model', parts: [{ id: 'provider-spawn', functionCall: {
+        name: 'run_agent', args: { operation: 'spawn', taskName: 'round', prompt: '做两轮', foregroundWaitMs: 0 } } }] },
+      { role: 'model', parts: [{ text: '子任务已开始。' }] }
+    ];
+    const provider = {
+      providerId: PROVIDER_ID,
+      async sendFullRequest(request, controls) {
+        if (request.conversationId === conversationId) {
+          const content = parentReplies[parentCalls++];
+          if (!content) throw new Error('Unexpected parent Provider call.');
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content });
+          return;
+        }
+        childCalls += 1;
+        if (childCalls === 1) {
+          childStarted();
+          await gate;
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ id: 'c1', functionCall: { name: 'not_a_real_tool', args: {} } }] } });
+          return;
+        }
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: '第二轮' }] } });
+      }
+    };
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_ONE, PROJECT_TWO.uri], label: 'multi-root', children: true });
+    await createConversation(host.app, conversationId, PROJECT_TWO);
+    await host.runner.input({ commandId: 'child-round', conversationId, text: '派一个子 Agent' });
+    await started;
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO.uri), 1);
+    const [execution] = await rows(host.app, 'ChildExecution', {});
+    const [link] = await rows(host.app, 'ChildExecutionActiveTurnLink', { child_execution_id: execution.id });
+    release();
+    await eventually(async () => (await rows(host.app, 'ExecutionLease', { turn_id: link.turn_id }))[0]?.owner_id
+      === kernel.RELEASED_EXECUTION_LEASE_HOLDER, 15_000, '子驱动没有在轮次之间交还租约');
+    assert.equal(childCalls, 1, '文件夹移除后子 Agent 不再调用模型');
+    assert.equal((await rows(host.app, 'Turn', { id: link.turn_id }))[0]?.status, 'active', '子 Turn 停在轮次之间');
+  } finally {
+    await host?.close();
     await fs.rm(outer, { recursive: true, force: true });
   }
 });
@@ -426,6 +630,7 @@ async function openHost(dataRoot, provider, options) {
     runner,
     coordinator,
     runnerErrors,
+    folders,
     mcpCalls: () => mcpCalls,
     owns: (conversationId) => app.database.conversationOwners.owns(conversationId),
     async close() {
