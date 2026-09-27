@@ -9,7 +9,7 @@ import {
 import { createVscodeStoragePaths, type StoragePaths } from '../../capabilities/vscodeStorage/paths';
 import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths, type RuntimeRootPaths } from '../../reliableKernel/contracts';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
-import { assertDataRootAvailable, ensureDataRootIdentity } from '../../reliableKernel/runtimeDataRootRelocation';
+import { assertDataRootAvailable, ensureDataRootIdentity, settleDataRootRelocationBeforeOpen } from '../../reliableKernel/runtimeDataRootRelocation';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import { projectFolderAssignmentSteps } from '../../reliableKernel/conversationProject';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
@@ -192,6 +192,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (normalizeStatusDataRootPath(context, status.dataRootPath)) await assertDataRootAvailable(root, status.dataRootId);
       return root;
     }, async () => {
+      // A relocation into this directory that never finished is undone first (never over content
+      // written since) or, while its process may still run, the open is refused.
+      const settled = await settleDataRootRelocationBeforeOpen(getPaths().globalStoragePath);
+      if (settled.held) console.warn(`[LimCode] ${settled.held}`);
+      if (settled.undone) {
+        // What the undo left may no longer be LimCode data (e.g. a directory the relocation created).
+        const status = await loadCommittedGlobalStatus(context);
+        if (normalizeStatusDataRootPath(context, status.dataRootPath)) await assertDataRootAvailable(getPaths().globalStoragePath, status.dataRootId);
+      }
       await recordDataRootIdentity(context);
       const runtimePlacement = await resolveVscodeWorkspaceRuntimePlacement(
         getPaths(),

@@ -325,7 +325,7 @@ test('#12 目标在 FAT/exFAT 上（没有硬链接、簇很大）：正文按�
   if (linked.hardLinks) assert.ok(need(exfat) - need(linked) >= 2 * 131072, '两个对话的正文对象各占至少一个 128 KiB 簇');
 });
 
-test('#13 LimCode 自己的锁目录（<文件>.lock，内有 owner.json）不当设置复制；身份文件暂时读不到时判为“无法读取”而不是“不是原来那份”', async (t) => {
+test('#13 LimCode 自己的锁目录（<文件>.lock，内有 owner.json）不当设置复制；身份文件暂时读不到（EIO）时判为“暂时无法读取”、没有权限时判为“无法访问”，都不是“不是原来那份”', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   await fs.mkdir(path.join(fixture.root, 'settings', 'llm.json.lock'), { recursive: true });
   await fs.writeFile(path.join(fixture.root, 'settings', 'llm.json.lock', 'owner.json'), '{"pid":1}\n');
@@ -335,13 +335,24 @@ test('#13 LimCode 自己的锁目录（<文件>.lock，内有 owner.json）不�
   const record = JSON.parse(await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
   assert.ok(record.configuration.some((item) => item.entry === 'settings'));
 
-  if (process.getuid?.() === 0) return; // root reads anything
   const rootId = await relocation.ensureDataRootIdentity(target);
   const identity = path.join(target, relocation.DATA_ROOT_IDENTITY_FILE);
-  await fs.chmod(identity, 0o000);
-  t.after(() => fs.chmod(identity, 0o600).catch(() => undefined));
-  await assert.rejects(assertDataRootAvailable(target, rootId), { reason: 'unreadable' });
-  await fs.chmod(identity, 0o600);
+  // A read error that usually passes (a network drive that hiccups): only retrying makes sense (reloc3 #4).
+  const readFile = fsp.readFile;
+  fsp.readFile = async function (file, ...rest) {
+    if (path.resolve(String(file)) === identity) throw Object.assign(new Error('EIO: i/o error, read'), { code: 'EIO' });
+    return readFile.call(this, file, ...rest);
+  };
+  try {
+    await assert.rejects(assertDataRootAvailable(target, rootId), { reason: 'unreadable' });
+  } finally { fsp.readFile = readFile; }
   await assertDataRootAvailable(target, rootId);
   assert.equal((await inspectDataRootForReturn(target)).usable, true);
+  if (process.getuid?.() === 0) return; // root reads anything
+  // No permission: retrying does not help, so it is not "unreadable" (the prompt offers other ways out).
+  await fs.chmod(identity, 0o000);
+  t.after(() => fs.chmod(identity, 0o600).catch(() => undefined));
+  await assert.rejects(assertDataRootAvailable(target, rootId), { reason: 'inaccessible' });
+  await fs.chmod(identity, 0o600);
+  await assertDataRootAvailable(target, rootId);
 });

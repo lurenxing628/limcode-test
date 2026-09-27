@@ -133,7 +133,18 @@ export class DataRootRelocationError extends Error {
   }
 }
 
-export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable';
+/**
+ * 'unreadable': a read failed with an error that usually passes (a network drive that hiccups), so
+ * only retrying makes sense; 'inaccessible': any other read error (no permission, a path that became
+ * a file), which retrying will not fix; 'relocating': a relocation into it has not finished and its
+ * process is alive or cannot be judged.
+ */
+export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable' | 'inaccessible' | 'relocating';
+
+/** Read errors that usually pass by themselves (see DataRootUnavailableReason 'unreadable'). */
+const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
+  'EIO', 'ETIMEDOUT', 'EAGAIN', 'EBUSY', 'EINTR', 'ECONNRESET', 'ECONNABORTED', 'ENETDOWN', 'ENETUNREACH', 'EHOSTDOWN', 'EHOSTUNREACH'
+]);
 
 /** A configured data directory that is missing, empty or another one (an unmounted drive, a lost share). */
 export class DataRootUnavailableError extends Error {
@@ -297,10 +308,11 @@ interface RelocationMarker {
   kind: typeof MARKER_KIND;
   /**
    * 'undoing' is written before an undo touches anything: from then on every later attempt (after a
-   * crash or a failed step) continues the undo unconditionally, whatever the journal or the receiving
-   * data set look like by then.
+   * crash or a failed step) continues the undo, whatever the journal says. 'held': an undo found the
+   * receiving data set changed since the relocation (someone else wrote there) and stopped without
+   * touching anything; it is never undone automatically again (see `held`).
    */
-  state: 'staging' | 'complete' | 'undoing';
+  state: 'staging' | 'complete' | 'undoing' | 'held';
   relocationId: string;
   sourceRootPath: string;
   /** The directory this record describes; a record copied along with a directory describes another one and is ignored. */
@@ -325,6 +337,8 @@ interface RelocationMarker {
   receivingFingerprint?: RuntimeDataSetFingerprint;
   /** The user went back to the old directory afterwards: this record no longer proves anything about it. */
   invalidatedAt?: string;
+  /** Why the undo was held (state 'held'); the relocation's backups stay in its work directory. */
+  held?: { at: string; reason: string };
 }
 
 type JournalEntry =
@@ -332,8 +346,14 @@ type JournalEntry =
   | { op: 'entry'; path: string }
   /** An existing file or link; its previous version is at `backup` (relative to the work directory). */
   | { op: 'replace'; path: string; backup: string }
-  /** The existing receiving database; its offline copy is at `backup`. */
-  | { op: 'database'; path: string; backup: string }
+  /** The existing receiving database; its offline copy is at `backup`, taken while its content was `before`. */
+  | { op: 'database'; path: string; backup: string; before: RuntimeDataSetFingerprint }
+  /**
+   * The receiving data set right after the relocation wrote it (nothing to undo by itself): an undo
+   * goes ahead only while the data set is still exactly this, or still `before`, so it never
+   * overwrites or removes what anyone wrote there since.
+   */
+  | { op: 'received'; path: string; fingerprint: RuntimeDataSetFingerprint }
   /** An existing directory: an undo removes every entry of it that is not in `keep`. */
   | { op: 'children'; path: string; keep: string[] };
 
@@ -368,7 +388,7 @@ export async function assertDataRootAvailable(dataRootPath: string, expectedRoot
   try {
     info = await fs.stat(root);
   } catch (error) {
-    throw new DataRootUnavailableError(root, isMissing(error) ? 'missing' : 'unreadable', error);
+    throw new DataRootUnavailableError(root, isMissing(error) ? 'missing' : readFailureReason(error), error);
   }
   if (!info.isDirectory()) throw new DataRootUnavailableError(root, 'not-directory');
   let structure: boolean;
@@ -377,7 +397,7 @@ export async function assertDataRootAvailable(dataRootPath: string, expectedRoot
     structure = await hasLimCodeStructure(root);
     identity = await readDataRootIdentity(root);
   } catch (error) {
-    throw new DataRootUnavailableError(root, 'unreadable', error);
+    throw new DataRootUnavailableError(root, readFailureReason(error), error);
   }
   if (expectedRootId !== undefined) {
     if (identity === expectedRootId) return;
@@ -443,6 +463,7 @@ async function hasLimCodeStructure(root: string): Promise<boolean> {
 export async function inspectDataRootForReturn(dataRootPath: string): Promise<{ usable: boolean; message?: string }> {
   try {
     await assertDataRootAvailable(dataRootPath);
+    if (await unfinishedRelocationOwner(dataRootPath) === 'running') return { usable: false, message: dataRootUnavailableMessage(path.resolve(dataRootPath), 'relocating') };
     const inspection = await inspectVscodeRuntimeDataSets({ globalStoragePath: dataRootPath });
     if (inspection.problems.some((problem) => problem.message.includes('RootBinding 不一致'))) {
       return { usable: false, message: '这个目录里的 LimCode 数据是从别的位置拷贝过来的，不能直接打开。' };
@@ -785,6 +806,8 @@ async function unfinishedRelocation(
   marker: RelocationMarker,
   sourceRootPath: string
 ): Promise<'none' | 'running' | 'undo'> {
+  // Someone else wrote into the target since: never undone automatically (see undoRelocation).
+  if (marker.state === 'held') return 'none';
   if (marker.state === 'staging') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
   // An undo that was interrupted is always finished, whoever interrupted it and whatever changed.
   if (marker.state === 'undoing') return ownerState(marker.owner) === 'dead' ? 'undo' : 'running';
@@ -874,7 +897,7 @@ export async function stageDataRootRelocation(
       await undoRelocation(target, earlier);
     }
     const previous = plan.target.kind === 'copied' ? undefined : await readMarker(target);
-    if (previous && previous.state !== 'complete') {
+    if (previous && previous.state !== 'complete' && previous.state !== 'held') {
       throw new DataRootRelocationError('data-root-relocation-concurrent', '另一个 LimCode 窗口正在向这个目录迁移数据，请稍后再试。');
     }
     let movedAside: string | undefined;
@@ -886,10 +909,10 @@ export async function stageDataRootRelocation(
       // that id: the next startup finds the copy again even when this process dies right here.
       movedAside = movedAsidePath(target, relocationId);
       await fs.rename(target, movedAside);
-      await syncDirectoryDurably(path.dirname(target));
     }
     let marker: RelocationMarker | undefined;
     try {
+      if (movedAside) await syncDirectoryDurably(path.dirname(target));
       const createdDirectory = !await pathExists(target);
       await fs.mkdir(target, { recursive: true });
       const preexisting = (await fs.readdir(target)).sort();
@@ -980,11 +1003,17 @@ async function createDataSetRoot(target: string, id: string, journal: Relocation
 }
 
 /** Undoes what an abandoned stage created (e.g. the windows could not be closed); only while it is still ours. */
-export async function abandonStagedDataRootRelocation(staged: Pick<StagedDataRootRelocation, 'plan' | 'relocationId'>): Promise<void> {
-  const target = staged.plan.targetRootPath;
+export async function abandonStagedDataRootRelocation(staged: { plan: { targetRootPath: string }; relocationId: string }): Promise<void> {
+  const target = path.resolve(staged.plan.targetRootPath);
   await withRuntimeDataRootAdmission(target, async () => {
     const marker = await readMarker(target);
-    if (!marker || marker.relocationId !== staged.relocationId) return;
+    if (!marker || marker.relocationId !== staged.relocationId) {
+      // An undo removes the record right before the copied data comes back to its place: when that
+      // last step failed, the copy is still beside it and is put back here (or the failure says where it is).
+      const aside = await findMovedAside(target, staged.relocationId);
+      if (aside) await restoreMovedAside(target, aside);
+      return;
+    }
     if (marker.targetState.kind === 'limcode' && await hasDatabaseRestore(target, marker)) {
       const blocked = await targetOfflineProblem(target);
       if (blocked) throw new DataRootRelocationError('data-root-relocation-target-busy', blocked);
@@ -1035,11 +1064,16 @@ export async function completeDataRootRelocation(
       const configuration = await transferConfiguration(source, target, journal);
       options.onProgress?.('正在迁移当前历史库');
       if (plan.target.kind === 'limcode') {
+        options.onProgress?.('正在为新目录的当前历史库做撤销副本');
         await backupReceivingDatabase(target, staged.receiving, journal);
         await journalMergeBackups(target, staged.receiving.runtimeDataRootPath, journal);
       }
       const merged = await mergeInto(sourcePaths, target, plan.current, staged.receiving.runtimeDataRootPath,
         { ...options, signal: undefined, progressLabel: '正在迁移当前历史库' }, plan.target.kind !== 'limcode', staged.precopied.verification);
+      // What the relocation left in the receiving data set: an undo later goes ahead only while it is unchanged.
+      options.onProgress?.('正在核对新目录');
+      const receivingFingerprint = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, staged.receiving.id));
+      await journal.append({ op: 'received', path: path.relative(target, staged.receiving.runtimeDataRootPath), fingerprint: receivingFingerprint });
       const others = await migrateOthers(staged, current, journal, options);
       const leftBehind = [...others.result.leftBehind, ...plan.unreadable.filter((item) => !others.result.leftBehind.some((left) => left.id === item.id))];
       if (plan.target.kind !== 'limcode') {
@@ -1048,8 +1082,6 @@ export async function completeDataRootRelocation(
       }
       await journal.recordCreation(DATA_ROOT_IDENTITY_FILE);
       const dataRootId = await ensureDataRootIdentity(target);
-      options.onProgress?.('正在核对新目录');
-      const receivingFingerprint = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, staged.receiving.id));
       await writeMarker(target, {
         ...staging, state: 'complete', completedAt: new Date().toISOString(),
         migrated: [{ ...identityOf(current), fingerprint: currentFingerprint }, ...others.migrated],
@@ -1083,7 +1115,10 @@ export async function completeDataRootRelocation(
     // (which again undoes only a record that is still ours).
     if (owned.marker) {
       const staging = owned.marker;
-      const cleaned = await withRuntimeDataRootAdmission(target, () => undoRelocation(target, staging)).then(() => true, (undoError: unknown) => {
+      options.onProgress?.('正在撤销本次迁移在新目录里的改动');
+      // Nobody else wrote into the target meanwhile: it was offline under its admission until the
+      // failure, and a window that opens it now waits (or is refused) while this record is ours.
+      const cleaned = await withRuntimeDataRootAdmission(target, () => undoRelocation(target, staging, { verified: true })).then(() => true, (undoError: unknown) => {
         console.error('[LimCode] 迁移失败后撤销新数据目录里的改动时出错。', undoError);
         return false;
       });
@@ -1257,6 +1292,7 @@ async function backupReceivingDatabase(target: string, receiving: StagedDataRoot
   if (journalFile && journalFile.size > 0) {
     throw new DataRootRelocationError('data-root-relocation-target-recovery', '新数据目录里的当前历史库有未完成的恢复，请先在那里打开一次 LimCode。');
   }
+  const before = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, receiving.id));
   const name = `${DATABASE_BACKUP_PREFIX}${createHash('sha256').update(receiving.id).digest('hex').slice(0, 16)}`;
   const destination = path.join(journal.workDirectory, name);
   const temporary = `${destination}.${process.pid}.${randomUUID()}.tmp`;
@@ -1273,7 +1309,7 @@ async function backupReceivingDatabase(target: string, receiving: StagedDataRoot
   } finally {
     await fs.rm(temporary, { recursive: true, force: true });
   }
-  await journal.append({ op: 'database', path: path.relative(target, databasePath), backup: name });
+  await journal.append({ op: 'database', path: path.relative(target, databasePath), backup: name, before });
 }
 
 /**
@@ -1702,18 +1738,64 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
       if (index >= lines.length - 2) break;
       throw new DataRootRelocationError('data-root-relocation-journal', `迁移日志损坏，无法撤销：${journalPath(target, relocationId)}`, error);
     }
-    const entry = value as Partial<JournalEntry> & { backup?: unknown; keep?: unknown } | null;
+    const entry = value as Partial<JournalEntry> & { backup?: unknown; keep?: unknown; before?: unknown; fingerprint?: unknown } | null;
     const keep = entry?.keep;
-    if (!entry || typeof entry.path !== 'string'
-      || (entry.op !== 'entry' && !(entry.op === 'children' && Array.isArray(keep) && keep.every((name) => typeof name === 'string'))
-        && ((entry.op !== 'replace' && entry.op !== 'database') || typeof entry.backup !== 'string'))) {
+    const fingerprint = (item: unknown): boolean => typeof (item as Partial<RuntimeDataSetFingerprint> | undefined)?.contentDigest === 'string';
+    const valid = !!entry && typeof entry.path === 'string' && (entry.op === 'entry'
+      || (entry.op === 'children' && Array.isArray(keep) && keep.every((name) => typeof name === 'string'))
+      || (entry.op === 'replace' && typeof entry.backup === 'string')
+      || (entry.op === 'database' && typeof entry.backup === 'string' && fingerprint(entry.before))
+      || (entry.op === 'received' && fingerprint(entry.fingerprint)));
+    if (!valid) {
       throw new DataRootRelocationError('data-root-relocation-journal', `迁移日志里有无法识别的记录：${line}`);
     }
-    requireRelative(entry.path);
-    if (typeof entry.backup === 'string') requireRelative(entry.backup);
+    requireRelative(entry!.path!);
+    if (typeof entry!.backup === 'string') requireRelative(entry!.backup);
     entries.push(entry as JournalEntry);
   }
   return entries;
+}
+
+/**
+ * Why the receiving data set may no longer be undone, if so: it is neither what the relocation left
+ * there (its 'received' journal entry) nor what it was before (an existing one's 'database' entry;
+ * also what a restore that already happened put back). Someone else wrote there since. An existing
+ * data set that cannot be read counts as changed; a fresh root of this relocation that cannot be
+ * read any more (half removed by an interrupted undo) does not.
+ */
+async function receivingChangedSince(target: string, marker: RelocationMarker): Promise<string | undefined> {
+  const entries = await readJournal(target, marker.relocationId);
+  const database = entries.find((entry): entry is Extract<JournalEntry, { op: 'database' }> => entry.op === 'database');
+  const received = entries.find((entry): entry is Extract<JournalEntry, { op: 'received' }> => entry.op === 'received');
+  if (!database && !received) return undefined;
+  if (database) {
+    // This undo's own restore is halfway (the database file is back, its WAL not yet): it continues.
+    const backup = path.join(workDirectory(target, marker.relocationId), database.backup);
+    if (await pathExists(backup) && !await pathExists(path.join(backup, 'limcode.sqlite'))) return undefined;
+  }
+  let current: RuntimeDataSetFingerprint;
+  try {
+    current = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, marker.receivingId));
+  } catch (error) {
+    if (!database) return undefined;
+    return `新数据目录里的当前历史库现在无法读取（${errorMessage(error)}），无法确认迁移之后没有别人写入。`;
+  }
+  if (database && sameRuntimeDataSetFingerprint(database.before, current)) return undefined;
+  if (received && sameRuntimeDataSetFingerprint(received.fingerprint, current)) return undefined;
+  return '新数据目录里的当前历史库在这次迁移之后有了新的内容（可能是另一个 LimCode 安装或窗口正在使用这个目录）。';
+}
+
+function heldError(target: string, marker: RelocationMarker): DataRootRelocationError {
+  return new DataRootRelocationError('data-root-relocation-undo-held', describeHeld(target, marker));
+}
+
+function describeHeld(target: string, marker: RelocationMarker): string {
+  return `${marker.held?.reason ?? ''}为了不覆盖这些内容，那次迁移在新目录 ${target} 里做的改动没有撤销，之后也不会自动撤销；`
+    + `迁移前的数据库副本和被替换的设置保存在 ${workDirectory(target, marker.relocationId)}，需要时可以据此手动恢复。旧目录没有改动。`;
+}
+
+function isHeldError(error: unknown): boolean {
+  return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-undo-held';
 }
 
 async function hasDatabaseRestore(target: string, marker: RelocationMarker): Promise<boolean> {
@@ -1721,20 +1803,35 @@ async function hasDatabaseRestore(target: string, marker: RelocationMarker): Pro
 }
 
 /**
- * Undoes a relocation in the target from its journal, newest change first. The record is marked
- * 'undoing' (durably) before anything is touched, so an interrupted undo is always continued (see
- * unfinishedRelocation). Every step can run again: replaced files and an existing receiving database
- * are put back from the relocation's own backups, created entries removed; then the journal
- * directory goes, then the record (the earlier completion record is put back, or it is removed), and
- * last the copied data renamed aside comes back to its place. Stops at the first failure. Callers
- * hold the target's admission; a database restore needs every Host of the target offline.
+ * Undoes a relocation in the target from its journal, newest change first. First the receiving data
+ * set must still be exactly what the relocation left there (or what it was before): otherwise
+ * someone wrote there since (another installation whose current directory it is), nothing is
+ * touched and the record becomes 'held' (see receivingChangedSince). `verified`: the caller knows
+ * nobody could have written (an undo right after its own failure, the target never left offline).
+ * The record is marked 'undoing' (durably) before anything is touched, so an interrupted undo is
+ * always continued (see unfinishedRelocation). Every step can run again: replaced files and an
+ * existing receiving database are put back from the relocation's own backups, created entries
+ * removed; then the journal directory goes, then the record (the earlier completion record is put
+ * back, or it is removed), and last the copied data renamed aside comes back to its place. Stops at
+ * the first failure. Callers hold the target's admission; a database restore needs every Host of
+ * the target offline.
  */
-async function undoRelocation(target: string, found: RelocationMarker): Promise<void> {
+async function undoRelocation(target: string, found: RelocationMarker, options: { verified?: boolean } = {}): Promise<void> {
+  if (found.state === 'held') throw heldError(target, found);
+  if (!options.verified) {
+    const changed = await receivingChangedSince(target, found);
+    if (changed) {
+      const held: RelocationMarker = { ...found, state: 'held', held: { at: new Date().toISOString(), reason: changed } };
+      await writeMarker(target, held);
+      throw heldError(target, held);
+    }
+  }
   const marker: RelocationMarker = found.state === 'undoing' ? found : { ...found, state: 'undoing' };
   if (found.state !== 'undoing') await writeMarker(target, marker);
   const work = workDirectory(target, marker.relocationId);
   for (const entry of (await readJournal(target, marker.relocationId)).reverse()) {
     const destination = path.join(target, entry.path);
+    if (entry.op === 'received') continue;
     if (entry.op === 'entry') {
       await removeWithTemporaries(destination);
       continue;
@@ -1808,7 +1905,12 @@ async function restoreMovedAside(target: string, aside: string): Promise<void> {
     if (names.length > 0) await fs.rename(target, `${target}.limcode-undone-${timestampSlug()}`);
     else await fs.rmdir(target);
   }
-  await fs.rename(aside, target);
+  try {
+    await fs.rename(aside, target);
+  } catch (error) {
+    throw new DataRootRelocationError('data-root-relocation-copy-aside',
+      `从别处拷来的 LimCode 数据仍保留在 ${aside}，没能改回原来的名字 ${target}（${errorMessage(error)}）。之后会再试；也可以自行改回。`, error);
+  }
   await syncDirectoryDurably(path.dirname(target)).catch(() => undefined);
 }
 
@@ -1858,7 +1960,9 @@ function isMarker(value: unknown): value is RelocationMarker {
   const marker = value as Partial<RelocationMarker> | null;
   const strings = (items: unknown): boolean => Array.isArray(items) && items.every((item) => typeof item === 'string');
   const targetState = marker?.targetState as Partial<TargetState & { receivingId: unknown; dataSetIds: unknown }> | undefined;
-  return !!marker && marker.kind === MARKER_KIND && (marker.state === 'staging' || marker.state === 'complete' || marker.state === 'undoing')
+  return !!marker && marker.kind === MARKER_KIND
+    && (marker.state === 'staging' || marker.state === 'complete' || marker.state === 'undoing' || marker.state === 'held')
+    && (marker.held === undefined || (typeof marker.held.at === 'string' && typeof marker.held.reason === 'string'))
     && typeof marker.relocationId === 'string' && /^[0-9a-f-]{36}$/.test(marker.relocationId)
     && typeof marker.sourceRootPath === 'string' && typeof marker.targetRootPath === 'string'
     && typeof marker.startedAt === 'string' && typeof marker.receivingId === 'string'
@@ -1967,7 +2071,7 @@ async function finalizeRelocation(root: string, marker: RelocationMarker): Promi
 export async function recoverInterruptedDataRootRelocation(input: {
   targetRootPath: string;
   relocationId: string;
-}): Promise<'recovered' | 'absent' | 'unreachable' | 'running' | 'blocked'> {
+}): Promise<'recovered' | 'absent' | 'unreachable' | 'running' | 'blocked' | 'held'> {
   const target = path.resolve(input.targetRootPath);
   // Never takes a claim beside a directory whose parent is not there (an unmounted drive).
   if (!(await lstatOrUndefined(path.dirname(target)).catch(() => undefined))?.isDirectory()) return 'unreachable';
@@ -1987,12 +2091,65 @@ export async function recoverInterruptedDataRootRelocation(input: {
       await restoreMovedAside(target, aside);
       return 'recovered';
     }
+    if (marker.state === 'held') return 'held';
     if (ownerState(marker.owner) !== 'dead') return 'running';
     if (marker.state === 'complete' && await unfinishedRelocation(target, marker, path.resolve(marker.sourceRootPath)) !== 'undo') return 'absent';
     if (await hasDatabaseRestore(target, marker) && await targetOfflineProblem(target)) return 'blocked';
-    await undoRelocation(target, marker);
+    try {
+      await undoRelocation(target, marker);
+    } catch (error) {
+      if (isHeldError(error)) return 'held';
+      throw error;
+    }
     return 'recovered';
   });
+}
+
+/**
+ * Before a window opens `root` (call under its configuration admission): a relocation into it that
+ * never finished is not built upon. Its process proven gone: the undo is completed first (`undone`;
+ * the directory may then no longer hold LimCode data, so the caller checks it again), unless someone
+ * wrote into it since, in which case nothing is touched, the record is left 'held' and `held` says
+ * why and where the backups are (the directory opens as it is). Its process alive or unknown: the
+ * open is refused ('relocating'), as it is while a needed database restore finds the directory in use.
+ */
+export async function settleDataRootRelocationBeforeOpen(root: string): Promise<{ undone: boolean; held?: string }> {
+  const target = path.resolve(root);
+  return withRuntimeDataRootAdmission(target, async () => {
+    const marker = await readMarker(target);
+    if (!marker || (marker.state !== 'staging' && marker.state !== 'undoing')) return { undone: false };
+    if (ownerState(marker.owner) !== 'dead') throw new DataRootUnavailableError(target, 'relocating');
+    if (await hasDatabaseRestore(target, marker) && await targetOfflineProblem(target)) throw new DataRootUnavailableError(target, 'relocating');
+    try {
+      await undoRelocation(target, marker);
+    } catch (error) {
+      if (isHeldError(error)) return { undone: false, held: errorMessage(error) };
+      throw error;
+    }
+    return { undone: true };
+  });
+}
+
+/** 'running': an unfinished relocation into `root` whose process is alive or cannot be judged (opening it is refused). */
+async function unfinishedRelocationOwner(root: string): Promise<'none' | 'running' | 'dead'> {
+  const marker = await readMarker(path.resolve(root));
+  if (!marker || (marker.state !== 'staging' && marker.state !== 'undoing')) return 'none';
+  return ownerState(marker.owner) === 'dead' ? 'dead' : 'running';
+}
+
+/**
+ * A relocation into `root` whose undo was held (someone wrote there since): why, and where its
+ * backups are. For a notice when the directory is opened.
+ */
+export async function readDataRootRelocationHold(root: string): Promise<{ relocationId: string; message: string } | undefined> {
+  const target = path.resolve(root);
+  const marker = await readMarker(target);
+  return marker?.state === 'held' ? { relocationId: marker.relocationId, message: describeHeld(target, marker) } : undefined;
+}
+
+/** The copied data a relocation renamed aside from `targetRootPath`, while it is still there (not put back). */
+export async function findDataRootRelocationCopy(targetRootPath: string, relocationId: string): Promise<string | undefined> {
+  return findMovedAside(path.resolve(targetRootPath), relocationId);
 }
 
 /** The moved notice of a directory (see DATA_ROOT_MOVED_NOTICE_FILE), if it has a valid one. */
@@ -2198,6 +2355,12 @@ export async function planOldDataRootDeletion(input: {
   }
   const metadata: string[] = [];
   for (const name of METADATA_ENTRIES) {
+    // The moved notice stays (a few hundred bytes): another installation still pointing here learns
+    // where the data went, also after everything else is deleted.
+    if (name === DATA_ROOT_MOVED_NOTICE_FILE) {
+      covered.add(name);
+      continue;
+    }
     if (await pathExists(path.join(oldRoot, name))) metadata.push(path.join(oldRoot, name));
   }
   if (metadata.length > 0) {
@@ -2430,11 +2593,23 @@ async function removeSqliteFiles(file: string): Promise<void> {
 }
 
 function dataRootUnavailableMessage(root: string, reason: DataRootUnavailableReason): string {
+  if (reason === 'relocating') {
+    return `数据目录暂时不能打开：${root} 里有一次还没完成的数据迁移（可能来自另一个 LimCode 安装），发起它的进程还在运行或无法确认已经结束。`
+      + '它完成或撤销之后才能打开这个目录；本窗口没有打开运行时。';
+  }
+  if (reason === 'unreadable') {
+    return `数据目录暂时无法读取：${root}；本窗口没有打开运行时。`;
+  }
   const detail = reason === 'missing' ? '目录不存在'
     : reason === 'not-directory' ? '这个位置不是文件夹'
       : reason === 'empty' ? '目录里没有 LimCode 数据'
-        : reason === 'mismatch' ? '目录里不是原来那份 LimCode 数据' : '目录无法读取';
+        : reason === 'mismatch' ? '目录里不是原来那份 LimCode 数据' : '目录无法访问（例如没有权限）';
   return `数据目录不可用（${detail}）：${root}。可能是外置盘没有接上或网络盘断开；为避免在这里新建一份空的历史，本窗口没有打开运行时。`;
+}
+
+/** 'unreadable' for a read error that usually passes, 'inaccessible' for any other. */
+function readFailureReason(error: unknown): 'unreadable' | 'inaccessible' {
+  return TRANSIENT_READ_ERRORS.has(String((error as NodeJS.ErrnoException | undefined)?.code ?? '')) ? 'unreadable' : 'inaccessible';
 }
 
 export function formatBytes(bytes: number): string {
