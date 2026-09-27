@@ -928,12 +928,21 @@ function goBusyReason(busy: readonly ExclusiveMaintenanceBusyHost[], own: Exclus
 export interface ExclusiveMaintenanceParticipantHandlers {
   /** Why this Host cannot yield now (running work, the user in this window…), or undefined when idle. */
   busyReason(request: RuntimeExclusiveMaintenanceRequest): Promise<ExclusiveMaintenanceBusy | undefined>;
-  /** Countdown or notice before confirming; false only when the user cancelled a cancellable countdown. */
-  confirm(request: RuntimeExclusiveMaintenanceRequest): Promise<boolean>;
+  /**
+   * Countdown or notice before confirming; false only when the user cancelled a cancellable
+   * countdown. `context.isCurrent` tells whether the request still waits for this answer (a request
+   * withdrawn meanwhile, e.g. another window declined, closes the countdown: this window will not reload).
+   */
+  confirm(request: RuntimeExclusiveMaintenanceRequest, context: ExclusiveMaintenanceConfirmContext): Promise<boolean>;
   /** Yields the root: reload the window (its next startup waits on the admission). */
   release(request: RuntimeExclusiveMaintenanceRequest): Promise<void>;
   /** Wait-mode requests: told once, in advance, that this Host keeps the requester waiting and why. */
   notifyWaiting?(request: RuntimeExclusiveMaintenanceRequest, busy: ExclusiveMaintenanceBusy): void;
+}
+
+export interface ExclusiveMaintenanceConfirmContext {
+  /** False once the request was withdrawn or moved on (a new round): the countdown is in vain. */
+  isCurrent(): Promise<boolean>;
 }
 
 export interface ExclusiveMaintenanceParticipantOptions {
@@ -1043,7 +1052,7 @@ export function startExclusiveMaintenanceParticipant(
         await respond(request, 'confirm', 'busy', busy);
         return;
       }
-      const confirmed = await handlers.confirm(request);
+      const confirmed = await handlers.confirm(request, { isCurrent: () => stillCurrentRequest(request) });
       // Withdrawn (another window declined, a timeout) or restarted while the countdown ran.
       if (!await stillCurrentRequest(request)) return;
       if (!confirmed && request.confirmation === 'countdown') {
@@ -1067,6 +1076,8 @@ export function startExclusiveMaintenanceParticipant(
         await respond(request, 'go', 'busy', busy);
         return;
       }
+      // The call may have ended meanwhile (another window was busy at go): never reload in vain.
+      if (!await stillCurrentRequest(request)) return;
       await handlers.release(request);
     }
   };

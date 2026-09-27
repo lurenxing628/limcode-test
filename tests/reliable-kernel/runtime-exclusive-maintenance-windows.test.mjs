@@ -95,6 +95,22 @@ test('倒计时但不可否决：用户已确认的操作里，其它窗口的�
   }
 });
 
+test('盲审 #6：倒计时期间请求被撤回（另一个窗口的用户选择保留）：倒计时立即关闭并说明本次不重载', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const counting = await layerWindow(t, binding, 'counting-window', { countdownSeconds: 5 });
+  await layerWindow(t, binding, 'keeping-window', { cancel: true });
+  const started = Date.now();
+  const outcome = await withRuntimeMaintenance(paths, () => requestExclusiveRuntimeMaintenance(paths, {
+    ...MERGE, pollMs: 10
+  }, async () => assert.fail('must not run')));
+  assert.equal(outcome.state, 'declined');
+  for (let polls = 0; polls < 150 && !counting.notices.some((notice) => /本窗口不重载/.test(notice)); polls += 1) await delay(20);
+  assert.ok(Date.now() - started < 3_000, `the countdown closed early (${Date.now() - started} ms)`);
+  assert.deepEqual(counting.notices.filter((notice) => /本窗口不重载/.test(notice)), ['其它窗口的合并旧聊天记录这次没有进行，本窗口不重载。']);
+  assert.deepEqual(counting.countdowns(), ['为合并旧聊天记录，本窗口即将重载']);
+  assert.equal(counting.reloads, 0);
+});
+
 test('发起方自身忙碌只看任务不看焦点（requesterWorkBusy）', async () => {
   const layer = loadVscodeLayer(vscodeMock({ titles: [], notices: [], focused: true }, () => {}));
   assert.equal(await layer.requesterWorkBusy({ hasOwnedExecution: async () => false })(), undefined);
@@ -715,7 +731,7 @@ async function layerWindow(t, binding, hostBootId, options = {}) {
   participant = loadVscodeLayer(mock).startExclusiveMaintenanceParticipant({
     exclusiveMaintenanceTarget: () => ({ paths: binding.paths, hostBootId }),
     hasOwnedExecution: async () => window.work
-  }, { countdownSeconds: 0, pollMs: 15, processId: (nextFakeProcessId += 1) });
+  }, { countdownSeconds: options.countdownSeconds ?? 0, pollMs: 15, processId: (nextFakeProcessId += 1) });
   await participant.checkNow();
   t.after(async () => {
     await participant?.dispose();

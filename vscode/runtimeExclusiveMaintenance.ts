@@ -4,7 +4,7 @@ import {
   requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
   startExclusiveMaintenanceParticipant as startProtocolParticipant,
   type ExclusiveMaintenanceBusy, type ExclusiveMaintenanceOperation, type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress,
-  type RuntimeExclusiveMaintenanceInput, type RuntimeExclusiveMaintenanceOutcome,
+  type ExclusiveMaintenanceConfirmContext, type RuntimeExclusiveMaintenanceInput, type RuntimeExclusiveMaintenanceOutcome,
   type RuntimeExclusiveMaintenanceRunInput, type RuntimeExclusiveMaintenanceRequest
 } from '../backend/reliableKernel/runtimeExclusiveMaintenance';
 
@@ -65,9 +65,9 @@ export function startExclusiveMaintenanceParticipant(
       if (vscode.window.state?.focused) return { kind: 'focus', reason: '窗口正在使用' };
       return undefined;
     },
-    confirm: (request) => request.confirmation === 'notice'
+    confirm: (request, context) => request.confirmation === 'notice'
       ? announce(request.message)
-      : countdown(request, seconds),
+      : countdown(request, seconds, context),
     release: async (request) => {
       const kept = gaveWay;
       if (kept && kept.requestId === request.requestId && windowState) {
@@ -229,10 +229,18 @@ async function announce(message: string): Promise<boolean> {
   return true;
 }
 
-async function countdown(request: RuntimeExclusiveMaintenanceRequest, seconds: number): Promise<boolean> {
+/** Ticks per second of the countdown: each checks the request is still waiting for this answer. */
+const COUNTDOWN_TICKS_PER_SECOND = 4;
+
+async function countdown(
+  request: RuntimeExclusiveMaintenanceRequest,
+  seconds: number,
+  context: ExclusiveMaintenanceConfirmContext
+): Promise<boolean> {
   // final-countdown: the user already confirmed the operation elsewhere; this window cannot veto it.
   const cancellable = request.confirmation === 'countdown';
-  return vscode.window.withProgress({
+  let withdrawn = false;
+  const confirmed = await vscode.window.withProgress({
     location: vscode.ProgressLocation.Notification, title: `${request.message}，本窗口即将重载`, cancellable
   }, async (progress, token) => {
     const cancelledNow = () => cancellable && token?.isCancellationRequested === true;
@@ -244,8 +252,17 @@ async function countdown(request: RuntimeExclusiveMaintenanceRequest, seconds: n
           : `${left} 秒后重载（已在其它窗口确认），未发送的输入会保留`,
         increment: 100 / seconds
       });
-      await new Promise((resolve) => setTimeout(resolve, 1000));
+      for (let tick = 0; tick < COUNTDOWN_TICKS_PER_SECOND; tick += 1) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 / COUNTDOWN_TICKS_PER_SECOND));
+        // Withdrawn meanwhile (another window declined or stayed busy, a timeout): no reload follows.
+        if (!await context.isCurrent().catch(() => true)) {
+          withdrawn = true;
+          return false;
+        }
+      }
     }
     return !cancelledNow();
   });
+  if (withdrawn) void vscode.window.showInformationMessage(`其它窗口的${request.activity}这次没有进行，本窗口不重载。`);
+  return confirmed;
 }

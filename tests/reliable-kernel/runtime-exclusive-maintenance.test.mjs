@@ -451,6 +451,22 @@ test('go 阶段回答忙的窗口本轮不再重载（即使随后变空闲）�
   assert.equal(again.state, 'backoff');
 });
 
+test('盲审 #6：窗口在 go 阶段查自己是否空闲时，这次调用因别的窗口忙而结束：重载前再核对请求，不白白重载', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const busyAtGo = await openWindow(t, binding, 'busy-at-go', { busy: (request) => (request.phase === 'go' ? WORK : undefined) });
+  const slow = await openWindow(t, binding, 'slow-check', {
+    busy: async (request) => {
+      if (request.phase === 'go') await delay(500);
+      return undefined;
+    }
+  });
+  const outcome = await run(paths, { ...BASE }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'busy');
+  await delay(800);
+  await settle([busyAtGo, slow]);
+  assert.deepEqual([busyAtGo.releases(), slow.releases()], [0, 0]);
+});
+
 test('go 阶段遇忙的调用在慢窗口看到 go 之前就结束时，慢窗口不重载', async (t) => {
   const { binding, paths } = await createRoot(t);
   // This window checks for requests only when the test says so (a window busy with other things).
