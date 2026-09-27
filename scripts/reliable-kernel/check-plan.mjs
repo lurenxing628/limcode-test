@@ -121,6 +121,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/conversation-host-eligibility-review.test.mjs',
   'tests/reliable-kernel/plan-and-entry-eligibility.test.mjs',
   'tests/reliable-kernel/eligibility-placement-handback.test.mjs',
+  'tests/reliable-kernel/eligibility-delivery-ownership.test.mjs',
+  'tests/reliable-kernel/dead-host-effects-spawn.test.mjs',
   'tests/reliable-kernel/conversation-settings-isolation.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/global-settings-live-save.test.mjs',

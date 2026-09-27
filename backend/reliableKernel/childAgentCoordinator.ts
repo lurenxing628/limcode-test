@@ -1866,8 +1866,10 @@ export class ReliableChildAgentCoordinator {
     });
     await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
     // The spawning Host is the natural first driver of the brand-new child Conversation. Every
-    // child fact is already durable, so if the claim fails closed another Host's recovery drives
-    // the child and the durable wait below still settles this ToolCall.
+    // child fact is already durable, so if the claim fails closed the durable wait below still
+    // settles this ToolCall. This Host holds the child Turn's lease, so no other Host can take the
+    // child over while it lives: its own recovery passes retry the claim (another window holding
+    // the child Conversation briefly, for a stop or a recovery scan, hands it back).
     let drivesChild = true;
     try {
       await this.dependencies.database.conversationOwners.claim(spawned.childConversationId);
@@ -1878,6 +1880,7 @@ export class ReliableChildAgentCoordinator {
         error
       );
       drivesChild = false;
+      this.triggerRecoveryPass();
     }
     if (drivesChild) this.launch(spawned.childExecutionId, spawned.childTurnId);
     if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);

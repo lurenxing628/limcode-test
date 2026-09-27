@@ -74,10 +74,14 @@ interface PlacedWork {
  * environment included, when it was created. Each must be placeable here: a frozen work environment
  * other than the project's own (one the user chose, for example after the project folder moved)
  * only needs to be available here; the project's own work environment, or none, also needs the
- * project folder open here. An idle Conversation is served where its project folder is open, or,
- * when that folder is not open here, where its next Turn could start (the work environment chosen
- * for it is available here). A Conversation without a project link and without frozen work
- * environments has no durable placement fact, so every Host remains eligible for it.
+ * project folder open here. An idle Conversation waiting for runtime deliveries (a finished
+ * background process, a child Agent's answer, a peer's message) is served where one of the
+ * continuations they start can run: a continuation that inherits its source Turn's authority is
+ * placed by the work environment that Turn froze, and one that compiles current settings by where
+ * its next Turn could start. Any other idle Conversation is served where its project folder is
+ * open, or, when that folder is not open here, where its next Turn could start (the preview finds
+ * a work environment available here). A Conversation without a project link and without frozen
+ * work environments has no durable placement fact, so every Host remains eligible for it.
  */
 export async function evaluateConversationHostEligibility(
   dependencies: ConversationHostEligibilityDependencies,
@@ -86,10 +90,96 @@ export async function evaluateConversationHostEligibility(
   const project = await projectFolderForConversation(dependencies.database, conversationId);
   const work = await frozenConversationWork(dependencies, conversationId);
   if (work.length > 0) return placementEligibility(dependencies, project, work);
-  if (!project || dependencies.workspaceFolderUris().includes(project.uri)) return { eligible: true };
+  const continuations = await pendingContinuationSources(dependencies, conversationId);
+  if (continuations.length === 0) return idleEligibility(dependencies, conversationId, project);
+  let first: ConversationHostEligibilityDecision | undefined;
+  let nextTurn: Promise<ConversationHostEligibilityDecision> | undefined;
+  for (const sourceTurnId of continuations) {
+    const decision = sourceTurnId === null
+      ? await (nextTurn ??= idleEligibility(dependencies, conversationId, project))
+      : await placementEligibility(dependencies, project, [
+          { turnId: sourceTurnId, workEnvironmentId: await frozenDefaultWorkEnvironment(dependencies, sourceTurnId) }
+        ]);
+    if (decision.eligible) return decision;
+    first ??= decision;
+  }
+  return first!;
+}
+
+/** Where an idle Conversation's next Turn could start: its project folder is open, or the preview finds a work environment. */
+async function idleEligibility(
+  dependencies: ConversationHostEligibilityDependencies,
+  conversationId: string,
+  project: { uri: string; name: string } | undefined
+): Promise<ConversationHostEligibilityDecision> {
+  const open = projectOpenEligibility(dependencies, project);
+  if (open.eligible) return open;
   const next = await dependencies.nextTurnWorkEnvironment?.(conversationId);
-  if (next?.workEnvironmentId !== undefined && !next.error) return { eligible: true };
+  return next && !next.error ? { eligible: true } : open;
+}
+
+function projectOpenEligibility(
+  dependencies: ConversationHostEligibilityDependencies,
+  project: { uri: string; name: string } | undefined
+): ConversationHostEligibilityDecision {
+  if (!project || dependencies.workspaceFolderUris().includes(project.uri)) return { eligible: true };
   return { eligible: false, reason: 'project_not_open', projectUri: project.uri, projectName: project.name };
+}
+
+/**
+ * The continuations an idle Conversation's pending runtime deliveries will start (each delivery
+ * whose wake is not written yet or still waits to be handled): the source Turn whose authority a
+ * continuation inherits — the Turn
+ * that started the background process, or the parent Turn that started the answering child Agent —
+ * or null for a peer message, whose continuation compiles the destination's current settings.
+ */
+async function pendingContinuationSources(
+  dependencies: ConversationHostEligibilityDependencies,
+  conversationId: string
+): Promise<Array<string | null>> {
+  const deliveries = await listAllDomainRows(dependencies.database, 'RuntimeDelivery', {
+    target_conversation_id: conversationId, state: 'pending', phase: 'next_turn', target_turn_id: null
+  });
+  const sources: Array<string | null> = [];
+  for (const delivery of deliveries) {
+    const deliveryId = requireId(delivery.id, 'RuntimeDelivery.id');
+    const wakes = await listAllDomainRows(dependencies.database, 'RuntimeDeliveryWake', { delivery_id: deliveryId });
+    if (wakes.length > 0 && !wakes.some((wake) => wake.state === 'pending' || wake.state === 'claimed')) continue;
+    sources.push(await continuationSourceTurn(dependencies, deliveryId, requireId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')));
+  }
+  return sources;
+}
+
+async function continuationSourceTurn(
+  dependencies: ConversationHostEligibilityDependencies,
+  deliveryId: string,
+  inboxItemId: string
+): Promise<string | null> {
+  const cacheKey = `delivery-source:${deliveryId}`;
+  const cache = dependencies.frozenWorkEnvironmentCache;
+  const cached = cache?.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const [item] = await listAllDomainRows(dependencies.database, 'RuntimeInboxItem', { id: inboxItemId });
+  const sourceId = requireId(item?.source_id, 'RuntimeInboxItem.source_id');
+  let sourceTurnId: string | null = null;
+  if (item.source_kind === 'process_receipt') {
+    const [receipt] = await listAllDomainRows(dependencies.database, 'ProcessReceipt', { id: sourceId });
+    const [link] = await listAllDomainRows(dependencies.database, 'ProcessCompletionSourceLink', {
+      process_id: requireId(receipt?.process_id, 'ProcessReceipt.process_id')
+    });
+    sourceTurnId = requireId(link?.source_turn_id, 'ProcessCompletionSourceLink.source_turn_id');
+  } else if (item.source_kind === 'answer_submission') {
+    const [submission] = await listAllDomainRows(dependencies.database, 'AnswerSubmission', { id: sourceId });
+    const [bridge] = await listAllDomainRows(dependencies.database, 'AnswerBridge', {
+      id: requireId(submission?.answer_bridge_id, 'AnswerSubmission.answer_bridge_id')
+    });
+    const [parent] = await listAllDomainRows(dependencies.database, 'ChildExecutionParentLink', {
+      child_execution_id: requireId(bridge?.child_execution_id, 'AnswerBridge.child_execution_id')
+    });
+    sourceTurnId = requireId(parent?.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
+  }
+  rememberFrozen(cache, cacheKey, sourceTurnId);
+  return sourceTurnId;
 }
 
 export interface ConversationEntryEligibilityDependencies extends ConversationHostEligibilityDependencies {
@@ -126,7 +216,7 @@ export async function evaluateConversationEntryEligibility(
   const next = await dependencies.nextTurnWorkEnvironment(conversationId, {
     ...(options.executorAgentId ? { executorAgentId: options.executorAgentId } : {})
   });
-  if (!next) return evaluateConversationHostEligibility(dependencies, conversationId);
+  if (!next) return projectOpenEligibility(dependencies, project);
   if (next.error) return { eligible: false, reason: 'next_work_environment_unavailable', message: next.error };
   return { eligible: true };
 }

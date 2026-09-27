@@ -41,7 +41,13 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
           request.conversationId,
           request.sourceKind === 'collaboration_message' ? null : request.sourceTurnId
         );
-    if (eligibility !== 'eligible') return { acknowledged: false };
+    if (eligibility !== 'eligible') {
+      // This Host cannot execute the work it holds the Conversation for: it hands the Conversation
+      // back rather than keep it for the pending delivery, so the Host that can run it takes over
+      // (and new input there is not blocked). An unknown answer proves nothing and keeps it.
+      if (eligibility === 'ineligible') await application.database.conversationOwners.handBack(request.conversationId);
+      return { acknowledged: false };
+    }
     await dependencies.ready?.();
     if (request.action === 'resume_current_turn') {
       if (!request.targetTurnId) return { acknowledged: false };

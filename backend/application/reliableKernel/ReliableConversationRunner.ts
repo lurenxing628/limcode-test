@@ -1010,11 +1010,14 @@ export class ReliableConversationRunner {
   }
 
   /**
-   * A user's stop of a Turn whose run_agent spawn was dispatched but never receipted (its window
-   * exited in between). The spawn transaction already created the child, so the spawn is recorded as
-   * succeeded through the child scheduler's own recovery transition, under the child Conversation's
-   * short control claim; the stop then closes the parent's wait and the cascade stops the child.
-   * Nothing is driven here.
+   * A user's stop of a Turn whose run_agent spawn was dispatched but never receipted because the
+   * window that dispatched it exited in between (deadHostEffectsForTurn lists spawns only once that
+   * Host is proven dead; while it lives, it records the spawn and drives the child itself). The spawn
+   * transaction already created the child, so the spawn is recorded as succeeded through the child
+   * scheduler's own recovery transition, under the child Conversation's short control claim; the
+   * stop then closes the parent's wait and a cascade stops the child. Nothing is driven here: a
+   * child that should now run is handed back at once, so a window's child scheduler that serves it
+   * takes it over (an ordinary stop lets the child continue in the background).
    */
   private async recordSpawnedChildren(turnId: string): Promise<void> {
     try {
@@ -1025,10 +1028,10 @@ export class ReliableConversationRunner {
       if (effects.state !== 'unsupported' || !effects.spawnEffectIntentIds) return;
       for (const effectIntentId of effects.spawnEffectIntentIds) {
         const childConversationId = await this.spawnedChildConversation(effectIntentId);
-        await this.conversationOwners.run(
-          childConversationId,
-          () => this.application.runtime.children.recoverSpawnIntent(effectIntentId)
-        );
+        await this.conversationOwners.run(childConversationId, async () => {
+          const recovered = await this.application.runtime.children.recoverSpawnIntent(effectIntentId);
+          if (recovered.shouldDrive) await this.conversationOwners.handBack(childConversationId);
+        });
       }
     } catch (error) {
       if (!isConversationRuntimeOwnerBusyError(error)) {

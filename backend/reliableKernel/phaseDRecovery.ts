@@ -43,8 +43,11 @@ interface PhaseDScanContext {
  * - `live`: a Host that dispatched work still lacking a Receipt, or holds the Turn's lease, is
  *   alive or unverifiable;
  * - `unsupported`: a child spawn or cancel is in flight; the child scheduler owns it. When only spawns
- *   are in flight, `spawnEffectIntentIds` lists them: the spawn transaction already created each
- *   child, so a user's stop may record them as spawned (ChildExecutionControlPlane.recoverSpawnIntent);
+ *   are in flight and the Host that dispatched them is proven dead, `spawnEffectIntentIds` lists
+ *   them: the spawn transaction already created each child, so a user's stop may record them as
+ *   spawned (ChildExecutionControlPlane.recoverSpawnIntent). While that Host is alive or unverifiable
+ *   (it holds the new child Turn's lease, or another Host's lease on this Turn) the state is `live`:
+ *   it is still recording the spawn and will drive the child;
  * - `dead`: every such Host is proven dead (process gone or PID reused); `effectIntentIds` are the
  *   dispatched or receipted effects that still need a terminal Operation.
  */
@@ -580,7 +583,11 @@ export class PhaseDRecoveryScanner {
       }
     }
     if (cancelInFlight) return { state: 'unsupported' };
-    if (spawns.length > 0) return { state: 'unsupported', spawnEffectIntentIds: spawns };
+    if (spawns.length > 0) {
+      const live = await this.liveSpawnDispatchHosts(turnId, spawns, selfHostBootId);
+      if (live.length > 0) return { state: 'live', hostBootIds: live };
+      return { state: 'unsupported', spawnEffectIntentIds: spawns };
+    }
     if (dispatched.length === 0) return { state: 'none', receiptEffectIntentIds: receipted };
     const leases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leases.length > 1) throw new Error(`Turn ${turnId} has multiple ExecutionLeases.`);
@@ -699,6 +706,45 @@ export class PhaseDRecoveryScanner {
       default:
         throw new Error(`Effect kind ${String(intent.effect_kind)} cannot be closed for a stopped Turn.`);
     }
+  }
+
+  /**
+   * A subagent_spawn records no dispatch fence. The spawn transaction gives the new child Turn's
+   * lease to the Host that dispatched it, which keeps it until it records the spawn and drives the
+   * child; another Host holding this Turn's lease is still executing the Turn itself. Returns those
+   * Hosts that are alive or cannot be proven dead (this Host counts as alive for a child lease).
+   */
+  private async liveSpawnDispatchHosts(
+    turnId: string,
+    spawnEffectIntentIds: readonly string[],
+    selfHostBootId: string
+  ): Promise<string[]> {
+    const hosts = new Set<string>();
+    const turnLeases = await this.list('ExecutionLease', { turn_id: turnId }, 2);
+    if (turnLeases.length > 1) throw new Error(`Turn ${turnId} has multiple ExecutionLeases.`);
+    const turnLeaseHost = turnLeases[0]?.host_boot_id;
+    if (typeof turnLeaseHost === 'string' && turnLeaseHost !== selfHostBootId) hosts.add(turnLeaseHost);
+    for (const effectIntentId of spawnEffectIntentIds) {
+      const childConversationId = await this.spawnedChildConversation(effectIntentId);
+      if (!childConversationId) continue;
+      for (const lease of await this.list('ExecutionLease', { conversation_id: childConversationId }, 16)) {
+        hosts.add(requireText(lease.host_boot_id, 'ExecutionLease.host_boot_id'));
+      }
+    }
+    const live: string[] = [];
+    for (const hostBootId of hosts) {
+      if (hostBootId === selfHostBootId || await this.database.isHostAlive(hostBootId)) live.push(hostBootId);
+    }
+    return live.sort();
+  }
+
+  private async spawnedChildConversation(effectIntentId: string): Promise<string | undefined> {
+    const [intent] = await this.list('EffectIntent', { id: effectIntentId }, 1);
+    const [attempt] = intent ? await this.list('Attempt', { id: requireText(intent.attempt_id, 'EffectIntent.attempt_id') }, 1) : [];
+    const [operation] = attempt ? await this.list('Operation', { id: requireText(attempt.operation_id, 'Attempt.operation_id') }, 1) : [];
+    if (operation?.owner_kind !== 'child_execution') return undefined;
+    const [child] = await this.list('ChildExecution', { id: requireText(operation.owner_id, 'Operation.owner_id') }, 1);
+    return typeof child?.child_conversation_id === 'string' ? child.child_conversation_id : undefined;
   }
 
   private async list(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {

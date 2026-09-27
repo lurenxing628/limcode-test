@@ -161,6 +161,12 @@ interface OwnedConversation {
    * overlapping command finishes last hands it back; an execution claim clears it.
    */
   commandClaim: boolean;
+  /**
+   * This Host found it cannot execute the work it claimed the Conversation for (handBack()): the
+   * claim goes back once no activity pins it, whatever pending work says; an execution claim that
+   * finds this Host eligible again clears it.
+   */
+  handBack?: boolean;
 }
 
 /**
@@ -250,7 +256,10 @@ export class ConversationRuntimeOwnerManager {
     if (after === 'eligible') {
       await this.enqueue(id, async () => {
         const state = this.owned.get(id);
-        if (state) state.commandClaim = false;
+        if (state) {
+          state.commandClaim = false;
+          state.handBack = false;
+        }
       });
       return 'owned';
     }
@@ -302,6 +311,22 @@ export class ConversationRuntimeOwnerManager {
         if (!this.closed) throw error;
       });
     }
+  }
+
+  /**
+   * Hands the Conversation back because this Host cannot execute the work it holds it for (a
+   * runtime delivery whose continuation cannot start here). Unlike an idle release, pending work
+   * does not keep the claim, even when this Host is eligible for the Conversation's other work: it
+   * goes back as soon as no activity pins it, so the Host that can execute the work takes it over.
+   */
+  public async handBack(conversationId: string): Promise<void> {
+    const id = requireNonEmptyText(conversationId, 'conversationId');
+    await this.enqueue(id, async () => {
+      const state = this.owned.get(id);
+      if (!state) return;
+      state.handBack = true;
+      await this.releaseIfIdleLocked(id);
+    });
   }
 
   public async releaseIfIdle(conversationId: string): Promise<boolean> {
@@ -377,7 +402,7 @@ export class ConversationRuntimeOwnerManager {
     if (!state || state.pins > 0) return false;
     let pending = true;
     try {
-      pending = await this.pendingWorkProbe(conversationId);
+      pending = state.handBack !== true && await this.pendingWorkProbe(conversationId);
     } catch {
       // A probe failure can never be interpreted as proof that no work is pending.
       pending = true;

@@ -141,8 +141,11 @@ export class RuntimeDatabase {
   ) {
     if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
     this.conversationOwners = new ConversationRuntimeOwnerManager(binding, hostBootId);
-    this.conversationOwners.setPendingWorkProbe((conversationId) =>
-      this.hasConversationRuntimeWork(conversationId));
+    // Work whose execution lease another live Host holds runs there: it never keeps this Host's
+    // claim, which would only stop that Host from taking the Conversation to drive it.
+    this.conversationOwners.setPendingWorkProbe(async (conversationId) =>
+      await this.hasConversationRuntimeWork(conversationId)
+      && !await this.conversationExecutedByLivePeer(conversationId));
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
     worker.on('error', (error) => {
       this.closed = true;
@@ -351,6 +354,24 @@ export class RuntimeDatabase {
       kind: 'conversationRuntimeWork',
       conversationId: requireNonEmptyText(conversationId, 'conversationId')
     });
+  }
+
+  /**
+   * Whether another Runtime Host that is alive (or cannot be proven dead) holds an ExecutionLease in
+   * the Conversation. A lease handed back or left by a dead Host does not count.
+   */
+  public async conversationExecutedByLivePeer(conversationId: string): Promise<boolean> {
+    const leases = await this.snapshotAll(DOMAIN_REPOSITORIES.domain('ExecutionLease').list({
+      where: { conversation_id: requireNonEmptyText(conversationId, 'conversationId') },
+      orderBy: { column: 'id', direction: 'asc' },
+      limit: 1_000
+    }));
+    for (const lease of leases.snapshot) {
+      const hostBootId = lease.host_boot_id;
+      if (typeof hostBootId !== 'string' || hostBootId.length === 0 || hostBootId === this.hostBootId) continue;
+      if (await this.isHostAlive(hostBootId)) return true;
+    }
+    return false;
   }
 
   /**

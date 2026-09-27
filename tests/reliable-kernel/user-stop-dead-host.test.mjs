@@ -548,6 +548,104 @@ test('用户停止：子 Agent 派生已派发、执行窗口在写回执前退�
   }
 });
 
+
+// 派发宿主仍存活时（它已派发派生、正在写派生回执），另一窗口的普通停止（不级联子 Agent）不替它记派生，
+// 交给执行窗口并提示；自动恢复即使先记下，也不占住子对话。执行窗口随后照常写回执（按 attempt 去重）、驱动子 Agent、收尾父 Turn。
+for (const variant of [
+  { name: 'S1：停止窗口不服务该项目', folders: [PROJECT_ONE] },
+  { name: 'S2：停止窗口也打开了该项目，启动时跑过子调度自动恢复', folders: [PROJECT_TWO.uri], coordinatorRecovery: true },
+  { name: 'S3：停止窗口也打开了该项目，只跑了对话启动恢复', folders: [PROJECT_TWO.uri] },
+  { name: 'S4：停止窗口也打开了该项目，停止前不做任何启动恢复', folders: [PROJECT_TWO.uri], skipRecovery: true }
+]) {
+  test(`${variant.name}：派发宿主存活、正在写派生回执时停止父 Turn，不抢先记派生，子 Agent 由执行窗口驱动（跨进程）`, { timeout: 180_000 }, async () => {
+    const { outer, dataRoot } = await createIsolatedRoot('spawn-live');
+    let p1; let child;
+    try {
+      const conversationId = 'conversation-spawn-live';
+      const files = workerFiles(outer);
+      const release = path.join(outer, 'origin-release');
+      const resultFile = path.join(outer, 'origin-result.json');
+      child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId,
+        LIMCODE_SPAWN_RELEASE: release, LIMCODE_SPAWN_RESULT: resultFile }, 'origin-spawn-paused');
+      const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+      const provider = scriptedProvider([]);
+      p1 = await openHost(dataRoot, provider, { folders: variant.folders, label: 'p1', children: true });
+      if (!variant.skipRecovery) {
+        await p1.app.recover();
+        await p1.runner.recoverStartup();
+      }
+      if (variant.coordinatorRecovery) await p1.coordinator.recoverStartup();
+      // The child scheduler's automatic recovery records the spawn through its own idempotent
+      // transition; it must not keep the child Conversation whose Turn the live window leases.
+      assert.equal(p1.owns(spawned.childConversationId), false, '恢复不占住子对话');
+      const recordedByRecovery = (await rows(p1.app, 'EffectIntent', { id: spawned.spawnIntentId }))[0].dispatch_state === 'receipt_written';
+      const [lease] = await rows(p1.app, 'ExecutionLease', { turn_id: spawned.parentTurnId });
+      const stopped = await p1.runner.interrupt({ commandId: 'stop-parent', conversationId, turnId: spawned.parentTurnId,
+        expectedLeaseGeneration: String(lease.generation), reason: '用户请求中断当前 Turn。' });
+      const [intent] = await rows(p1.app, 'EffectIntent', { id: spawned.spawnIntentId });
+      if (!recordedByRecovery) {
+        assert.equal(stopped.executingWindowAlive, true, '交给执行窗口并提示');
+        assert.equal(intent.dispatch_state, 'dispatched', '派发宿主存活：停止不记派生');
+        assert.deepEqual(await rows(p1.app, 'EffectReceipt', { attempt_id: intent.attempt_id }), []);
+      }
+      assert.equal(p1.owns(spawned.childConversationId), false, '停止窗口不占住子对话');
+      assert.equal(p1.owns(conversationId), false);
+
+      await fs.writeFile(release, 'go\n', 'utf8');
+      const result = await waitForWorkerJson(child, resultFile, 90_000);
+      assert.equal(result.receiptError, null, `执行窗口写派生回执出错：${result.receiptError}`);
+      assert.ok(result.childCalls >= 1, '子 Agent 被执行窗口驱动');
+      assert.equal(result.parentTermination, 'interrupted');
+      assert.deepEqual(result.runnerErrors, []);
+      const [final] = await rows(p1.app, 'EffectIntent', { id: spawned.spawnIntentId });
+      assert.equal((await rows(p1.app, 'EffectReceipt', { attempt_id: final.attempt_id })).length, 1, '只有一条派生回执');
+      assert.deepEqual((await rows(p1.app, 'Turn', { conversation_id: spawned.childConversationId })).map((r) => r.status), ['terminated']);
+      const [execution] = await rows(p1.app, 'ChildExecution', { id: spawned.childExecutionId });
+      assert.equal(['starting', 'active', 'interrupting'].includes(String(execution.status)), false, `子执行仍为 ${execution.status}`);
+      assert.equal(provider.calls, 0, '停止窗口不调用模型');
+    } finally {
+      await p1?.close();
+      if (child) await fs.writeFile(workerFiles(outer).finish, 'finish\n', 'utf8').catch(() => undefined);
+      if (child) await waitForExit(child, 60_000).catch(() => undefined);
+      await stopChild(child);
+      await fs.rm(outer, { recursive: true, force: true });
+    }
+  });
+}
+
+test('复审 X10：子调度的控制类认领已提交但随后出错时交还子 Turn 的租约（跨进程）', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('x10-child-claim');
+  let p1; let child;
+  try {
+    const conversationId = 'conversation-x10';
+    const files = workerFiles(outer);
+    child = spawnWorker(dataRoot, { ...files.env, LIMCODE_DEAD_HOST_CONVERSATION: conversationId }, 'origin-child');
+    const spawned = await waitForWorkerJson(child, files.ready, 90_000);
+    child.kill('SIGKILL');
+    await waitForExit(child, 30_000);
+    p1 = await openHost(dataRoot, scriptedProvider([]), { folders: [PROJECT_ONE], label: 'p1', children: true });
+    const claim = p1.app.turns.claimRecoveryExecution.bind(p1.app.turns);
+    let injected = 0;
+    p1.app.turns.claimRecoveryExecution = async (input) => {
+      const claimed = await claim(input);
+      if (input.turnId !== spawned.childTurnId) return claimed;
+      injected += 1;
+      throw new Error('认领已提交后读取失败（注入）');
+    };
+    await p1.coordinator.interruptSubtree({ sourceKey: 'user-stop-child', childExecutionId: spawned.childExecutionId,
+      reason: '用户停止子 Agent' }, { userStop: true }).catch(() => undefined);
+    assert.ok(injected >= 1, '子 Turn 的控制类认领被调用');
+    const [lease] = await rows(p1.app, 'ExecutionLease', { turn_id: spawned.childTurnId });
+    assert.ok(lease, '子 Turn 仍有租约');
+    assert.notEqual(lease.host_boot_id, p1.app.database.hostBootId, '出错后本窗口不继续持有子 Turn 的租约');
+    assert.equal((await rows(p1.app, 'Turn', { id: spawned.childTurnId }))[0]?.status, 'active');
+  } finally {
+    await p1?.close();
+    await stopChild(child);
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 }
 
 /** The executing window: starts a Turn whose MCP call never answers, then waits to be killed. */
@@ -562,6 +660,10 @@ async function runWorker(mode) {
   }
   if (mode === 'origin-spawn-dispatched') {
     await runSpawnDispatchedOrigin();
+    return;
+  }
+  if (mode === 'origin-spawn-paused') {
+    await runSpawnPausedOrigin();
     return;
   }
   if (mode !== 'origin') throw new Error(`Unknown worker ${mode}.`);
@@ -661,6 +763,77 @@ async function runSpawnDispatchedOrigin() {
       spawnIntentId: intent.id,
       childExecutionId: execution.id,
       childConversationId: execution.child_conversation_id
+    });
+    await waitForFile(requiredEnv('LIMCODE_DEAD_HOST_FINISH'), 300_000);
+  } finally {
+    await host.close();
+  }
+}
+
+/**
+ * The executing window stays alive after dispatching a run_agent spawn, with its spawn receipt write
+ * held until the test releases it; then it continues normally (records the receipt, drives the child).
+ */
+async function runSpawnPausedOrigin() {
+  const dataRoot = requiredEnv('LIMCODE_DEAD_HOST_DATA_ROOT');
+  const conversationId = requiredEnv('LIMCODE_DEAD_HOST_CONVERSATION');
+  let parentCalls = 0;
+  let childCalls = 0;
+  const provider = {
+    providerId: PROVIDER_ID,
+    async sendFullRequest(request, controls) {
+      let content;
+      if (request.conversationId === conversationId) {
+        parentCalls += 1;
+        content = parentCalls === 1
+          ? { role: 'model', parts: [{ id: 'provider-spawn', functionCall: { name: 'run_agent',
+            args: { operation: 'spawn', taskName: 'spawned', prompt: '子任务', foregroundWaitMs: 0 } } }] }
+          : { role: 'model', parts: [{ text: '父继续' }] };
+      } else {
+        childCalls += 1;
+        content = { role: 'model', parts: [{ text: '子任务完成' }] };
+      }
+      await controls.onEvent({ kind: 'completed', streamSeq: '1', content });
+    }
+  };
+  const host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO.uri], label: 'origin', children: true });
+  const effects = host.app.runtime.effects;
+  const record = effects.recordEffectReceipt.bind(effects);
+  let receiptError = null;
+  effects.recordEffectReceipt = async (input) => {
+    if (input.effectKind !== 'subagent_spawn') return record(input);
+    await waitForFile(requiredEnv('LIMCODE_SPAWN_RELEASE'), 300_000);
+    try {
+      return await record(input);
+    } catch (error) {
+      receiptError = String(error?.stack ?? error);
+      throw error;
+    }
+  };
+  try {
+    await createConversation(host.app, conversationId, PROJECT_TWO);
+    const started = await host.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '派一个子 Agent' });
+    await eventually(async () => (await rows(host.app, 'EffectIntent', { effect_kind: 'subagent_spawn', dispatch_state: 'dispatched' })).length === 1,
+      60_000, '派生未派发');
+    const [intent] = await rows(host.app, 'EffectIntent', { effect_kind: 'subagent_spawn' });
+    const [execution] = await rows(host.app, 'ChildExecution', {});
+    await writeJson(requiredEnv('LIMCODE_DEAD_HOST_READY'), {
+      parentTurnId: started.turnId,
+      spawnIntentId: intent.id,
+      childExecutionId: execution.id,
+      childConversationId: execution.child_conversation_id
+    });
+    await waitForFile(requiredEnv('LIMCODE_SPAWN_RELEASE'), 300_000);
+    await eventually(async () => (await rows(host.app, 'Turn', { id: started.turnId }))[0]?.status === 'terminated', 30_000, '父 Turn 未收尾');
+    await eventually(async () => childCalls >= 1
+      && (await rows(host.app, 'Turn', { conversation_id: execution.child_conversation_id })).every((turn) => turn.status === 'terminated'),
+    30_000, '子 Agent 未被驱动完成').catch(() => undefined);
+    await host.runner.waitForIdle();
+    await writeJson(requiredEnv('LIMCODE_SPAWN_RESULT'), {
+      receiptError,
+      parentTermination: (await rows(host.app, 'TurnTermination', { turn_id: started.turnId }))[0]?.terminal_status ?? null,
+      childCalls,
+      runnerErrors: host.runnerErrors.map((entry) => String(entry.error?.message ?? entry.error))
     });
     await waitForFile(requiredEnv('LIMCODE_DEAD_HOST_FINISH'), 300_000);
   } finally {
