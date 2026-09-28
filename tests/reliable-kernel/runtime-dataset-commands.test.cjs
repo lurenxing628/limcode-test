@@ -834,7 +834,7 @@ test('explicit merge runs online in this window without a reload; without a Runt
   assert.match(confirm[2].detail, /已发布的旧格式会先备份并就地升级/);
   assert.match(confirm[2].detail, /原库里中断的任务按“中止”收尾、排队未发送的消息会被取消，都不会在当前库被继续执行/);
   // 盲审 merge #1：再次合并不插回用户在当前库删掉的对话，确认框如实写明。
-  assert.match(confirm[2].detail, /以前从这个库合并进当前库、之后你在当前库删除了的对话不会再合并回来（连同它们的子 Agent 对话，在这个库里继续过的也一样）/);
+  assert.match(confirm[2].detail, /你在当前库删除过的对话（包括以前从这个库合并进来之后删掉的）不会再合并回来（连同它们的子 Agent 对话，在这个库里继续过的也一样）/);
   // 复审 merge3 #2：明确合并对超限来源会等其它窗口（与协调参数 whenBusy: 'wait' 一致），条件写具体数字。
   assert.match(confirm[2].detail, /超过 1234 条记录或 5 MiB 的库需要其它窗口暂时让出：会在后台等其它窗口的任务结束、正在使用的窗口被切走（最多约 7 分钟，可取消），然后其它窗口会重载一次/);
   // 大库会话：超过内存单事务上限的在所有窗口暂停时合并，超过流式硬上限的才不能合并。
@@ -922,7 +922,7 @@ test('switching away explains the kept rule and warns before continuing merged c
   assert.match(detail, /现在的当前库会记为“你保留的库”，以后只在你选择“合并到当前库”时才合并/);
   assert.match(detail, /还没合并过、也不是你保留的旧库，会在下次打开时自动合并进新的当前库/);
   assert.match(detail, /在已合并的对话里继续聊天，这个库以后就不能再合并回当前库.*只新建对话.*新对话以后仍可合并回来/);
-  assert.match(detail, /从这个库合并进当前库、之后在当前库删除了的对话，以后再合并时不会被插回（在这个库里继续过也一样）/);
+  assert.match(detail, /在当前库删除过的对话（包括从这个库合并进当前库之后删掉的），以后再合并时不会被插回（在这个库里继续过也一样）/);
   assert.equal(f.calls.some(call => ['select', 'command'].includes(call[0])), false, '未确认不切换');
 
   // Changed since the merge (or unreadable now): the rule for deleted conversations still holds.
@@ -931,7 +931,7 @@ test('switching away explains the kept rule and warns before continuing merged c
     await later.manageRuntimeDataSets(later.context, later.startup);
     const text = later.calls.find(call => call[0] === 'warning' && call[1] === '切换当前历史库并重载窗口？')[2].detail;
     assert.doesNotMatch(text, /这个库的对话已合并到当前库/);
-    assert.match(text, /之后在当前库删除了的对话，以后再合并时不会被插回/);
+    assert.match(text, /在当前库删除过的对话（包括从这个库合并进当前库之后删掉的），以后再合并时不会被插回/);
   }
 });
 
@@ -959,11 +959,11 @@ test('盲审 merge #1：通知与日志报出以前合并进来、之后在当�
   const f = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({ skippedConversations: 3 })] }) });
   await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost(), () => true);
   assert.deepEqual(f.calls.filter(call => call[0] === 'info').map(call => call[1]), [
-    '已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话），可直接在侧栏继续。有 3 个对话以前合并进来、之后你在当前库删除了，这次没有再合并回来。'
+    '已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话），可直接在侧栏继续。有 3 个对话你在当前库删除过，这次没有合并回来。'
     + '原库和合并前备份都已保留。'
   ]);
   assert.deepEqual(f.logs.filter(([level]) => level === 'info').map(([, line]) => line), [
-    '[LimCode] 已合并旧聊天记录 workspace:old：新增 12 行；合并前备份：/fixture/backup；3 个之前合并进来、之后在当前库删除的对话没有再合并'
+    '[LimCode] 已合并旧聊天记录 workspace:old：新增 12 行；合并前备份：/fixture/backup；3 个在当前库删除过的对话没有再合并'
   ]);
 });
 
@@ -1014,6 +1014,8 @@ test('盲审 merge #4：明确合并时已合并、没有新内容也有回应�
     return f.calls.filter(call => ['info', 'warning', 'error'].includes(call[0]) && call[1] !== '把这个历史库合并到当前库？').map(call => call[1]);
   };
   assert.deepEqual(await explicit(emptyMergeReport({ merged: [already] })), ['所选历史库已合并到当前历史库，没有新内容。']);
+  assert.deepEqual(await explicit(emptyMergeReport({ merged: [{ ...already, mergedByAnotherWindow: true }] })), ['所选历史库已由另一个窗口合并到当前历史库。'],
+    '盲审2 #7：另一个窗口刚合并了它，不说“没有新内容”');
   assert.deepEqual(await explicit(emptyMergeReport()), ['这次没有合并：所选历史库已不在，或者当前历史库已经切换。可以重新打开“历史与存储管理”查看。']);
   assert.deepEqual(await explicit(emptyMergeReport({ stopped: true })), [], '停止（窗口关闭或切库）时不回应');
 

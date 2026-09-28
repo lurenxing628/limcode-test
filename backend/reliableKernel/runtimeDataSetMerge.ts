@@ -318,6 +318,8 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   skippedConversations?: number;
   /** Nothing new was written: the source is merged into this data set already (已合并，没有新内容). */
   alreadyMerged?: true;
+  /** With alreadyMerged: another window merged it into this data set after this batch picked it (已由另一个窗口合并). */
+  mergedByAnotherWindow?: true;
   /** A foreign history root's readable name (only a foreign source has one; its id is not readable). */
   label?: string;
 }
@@ -1903,8 +1905,31 @@ async function assertSourceUnchanged(
     || await runtimeDataSetFileState(binding.paths.databasePath) !== state.files) {
     const meanwhile = await mergedMeanwhile(paths, target, candidate.id, mode, state);
     if (meanwhile) throw new MergedMeanwhile(meanwhile);
-    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '来源历史库在核验之后又有变化，稍后重试。' });
+    throw new Outcome({
+      kind: 'deferred', code: 'runtime-data-set-merge-source-changed',
+      message: await closedByAnotherWindow(paths, candidate, state)
+        ? '另一个窗口也在合并这个库，已先把库里中断的任务收尾（库因此有了变化），这次先不合并；稍后会再试。'
+        : '来源历史库在核验之后又有变化，稍后重试。'
+    });
   }
+}
+
+/**
+ * Whether another window closed work in the source since this attempt judged it (the source changed
+ * by that): the source's record of closed work is not the one this attempt knows (its own, or the one
+ * it found when it began).
+ */
+async function closedByAnotherWindow(
+  paths: { globalStoragePath: string },
+  candidate: VscodeRuntimeDataSetCandidate,
+  state: SourceProgress
+): Promise<boolean> {
+  const now = await readRuntimeDataSetMergeFinalization(paths, candidate).catch(() => undefined);
+  if (!now) return false;
+  const known = state.finalized;
+  const same = (left: readonly string[], right: readonly string[]): boolean => isDeepStrictEqual([...left].sort(), [...right].sort());
+  return !known || !same(now.turnIds, known.turnIds) || !same(now.intentIds, known.intentIds)
+    || now.turns !== known.turns || now.intents !== known.intents || now.complete !== known.complete;
 }
 
 /**
@@ -1926,7 +1951,8 @@ async function mergedMeanwhile(
   const candidate: SourceRef = state.foreign
     ? { id: candidateId, dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId, label: state.foreign.label }
     : await resolveVscodeRuntimeDataSet(paths, candidateId);
-  return sameRuntimeDataSetIdentity(record.source, candidate) ? currentResult(paths, candidate, target, state) : undefined;
+  return sameRuntimeDataSetIdentity(record.source, candidate)
+    ? { ...await currentResult(paths, candidate, target, state), mergedByAnotherWindow: true } : undefined;
 }
 
 /**
@@ -1986,7 +2012,8 @@ async function commitLocked(
     }
     if (previous.state === 'merged' && sameRuntimeDataSetIdentity(previous.source, candidate)
       && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
-      return { kind: 'current', result: await currentResult(paths, candidate, target, state) };
+      // Not merged when this attempt began (settledSource): another window merged it meanwhile.
+      return { kind: 'current', result: { ...await currentResult(paths, candidate, target, state), ...(mode.migration ? {} : { mergedByAnotherWindow: true as const }) } };
     }
   }
   stopIfAsked();

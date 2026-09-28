@@ -25,6 +25,7 @@ const {
   RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
   mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
 } = kernelFile('runtimeDataSetMerge.js');
+const ledgerModule = kernelFile('runtimeDataSetMergeLedger.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { runExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
@@ -1973,6 +1974,45 @@ test('盲审2 merge #4：在当前库删掉（本来就跳过）的对话在来�
     assert.equal(target.count('interaction_request'), 0);
     assertNothingResumes(target);
   } finally { target.close(); }
+});
+
+test('盲审2 merge #7：另一个窗口先合并了同一来源时结果标明“另一个窗口”；来源因另一个窗口收尾而变化时推迟理由如实', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_meanwhile', project: SHARED_PROJECT }]);
+  await seed(fixture.beta, [{ id: 'conversation_beta_closed', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  let nested = false;
+  const report = await merge(fixture, database, {
+    candidateIds: [fixture.alpha.id], requested: true,
+    async onFaultPoint(point) {
+      if (point !== 'after-cas-transfer' || nested) return;
+      nested = true;
+      // Another window merges the same source first.
+      assert.equal((await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true })).merged.length, 1);
+    }
+  });
+  assert.deepEqual(report.merged.map((item) => [item.candidateId, item.alreadyMerged, item.mergedByAnotherWindow]), [[fixture.alpha.id, true, true]]);
+
+  const changed = await merge(fixture, database, {
+    candidateIds: [fixture.beta.id], requested: true,
+    async onFaultPoint(point) {
+      if (point !== 'after-cas-transfer') return;
+      // Another window closed work in beta meanwhile (its record of that, and the source changed).
+      await ledgerModule.writeRuntimeDataSetMergeFinalization(fixture.paths, {
+        candidateId: fixture.beta.id, source: { dataSetId: fixture.beta.binding.dataSetId, rootInstanceId: fixture.beta.binding.rootInstanceId },
+        turnIds: ['conversation_beta_closed_turn'], intentIds: [], turns: 1, intents: 0, sourceBackupPath: '/elsewhere/backup', complete: true
+      });
+      rawInsertConversations(fixture.beta, 'closed', 1);
+    }
+  });
+  assert.deepEqual(changed.deferred.map((item) => [item.code, item.message]), [['runtime-data-set-merge-source-changed',
+    '另一个窗口也在合并这个库，已先把库里中断的任务收尾（库因此有了变化），这次先不合并；稍后会再试。']]);
+  await ledgerModule.removeRuntimeDataSetMergeFinalization(fixture.paths, fixture.beta.id);
+  const plain = await merge(fixture, database, {
+    candidateIds: [fixture.beta.id], requested: true,
+    onFaultPoint(point) { if (point === 'after-cas-transfer') rawInsertConversations(fixture.beta, 'changed', 1); }
+  });
+  assert.deepEqual(plain.deferred.map((item) => item.message), ['来源历史库在核验之后又有变化，稍后重试。']);
 });
 
 async function mergedInto(fixture) {

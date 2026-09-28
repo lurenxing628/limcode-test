@@ -203,7 +203,7 @@ test('结果：按在线合并的批结果报告（点了取消的那一份总�
   ];
   const failedDefault = { ...failed, candidateId: 'default' };
   assert.deepEqual(session.largeMergeDetails(sources, [merged, cancelled, failedDefault]), [
-    'limcode、notes（/a，约 30 万条记录）：新增 12 个对话，另有 2 个以前合并进来、之后在当前库删除的对话没有再合并。',
+    'limcode、notes（/a，约 30 万条记录）：新增 12 个对话，另有 2 个在当前库删除过的对话没有再合并。',
     '旧工作区历史（/b，约 8000 条记录）：没有合并，合并时取消了，这一份已撤回。',
     '默认历史库（/c，约 10 万条记录）：没有合并，来源格式不对。',
     'workspace:d（/d，约 10 万条记录）：这次没有合并，以后启动时会再合并。'

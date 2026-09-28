@@ -432,7 +432,7 @@ export function largeMergeDetails(
     if (outcome.state === 'merged') {
       const { insertedConversations, skippedConversations } = outcome.result;
       return `${name}：新增 ${insertedConversations} 个对话`
-        + (skippedConversations ? `，另有 ${skippedConversations} 个以前合并进来、之后在当前库删除的对话没有再合并` : '') + '。';
+        + (skippedConversations ? `，另有 ${skippedConversations} 个在当前库删除过的对话没有再合并` : '') + '。';
     }
     return `${name}：没有合并，${outcome.message.replace(/[。．.]+$/u, '')}。`;
   });
