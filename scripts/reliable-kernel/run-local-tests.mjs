@@ -94,6 +94,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/reliable-message-activity-row.test.mjs',
   'tests/reliable-kernel/function-call-preview-handoff.test.mjs',
   'tests/reliable-kernel/guidance-queue.test.mjs',
+  'tests/reliable-kernel/reliable-queue-ordering.test.mjs',
   'tests/reliable-kernel/compression-progress-ui.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/session-thinking-control.test.mjs',
@@ -110,6 +111,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/skill-tool-result-projection.test.mjs',
   'tests/reliable-kernel/skill-reattachment-compression.test.mjs',
   'tests/reliable-kernel/request-compression-settings.test.mjs',
+  'tests/reliable-kernel/context-token-estimator.test.mjs',
   'tests/reliable-kernel/model-capabilities.test.mjs',
   'tests/reliable-kernel/compression-provider-contracts.test.mjs',
   'tests/reliable-kernel/compression-reduction-gate.test.mjs',
@@ -130,6 +132,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/tool-boundary-regressions.test.mjs',
   'tests/reliable-kernel/path-shape-boundaries.test.mjs',
   'tests/reliable-kernel/model-system-prompt-prefix.test.mjs',
+  'tests/reliable-kernel/runtime-context-rendering.test.mjs',
   'tests/reliable-kernel/native-astra-integration.test.mjs',
   'tests/reliable-kernel/native-compression-guard.test.mjs',
   'tests/reliable-kernel/native-tool-admission.test.mjs',
@@ -175,6 +178,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/provider-vendor-check.test.mjs',
   'tests/reliable-kernel/unified-provider-regressions.test.mjs',
   'tests/reliable-kernel/provider-websocket-policy.test.mjs',
+  'tests/reliable-kernel/proxy-environment.test.mjs',
   'tests/reliable-kernel/reliable-control-lifecycle.test.mjs',
   'tests/reliable-kernel/reliable-outbox-ui-contract.test.mjs',
   'tests/reliable-kernel/segmented-summary-chunking.test.mjs',
@@ -190,6 +194,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/stop-waiting-turn.test.mjs',
   'tests/reliable-kernel/interaction-auto-approval.test.mjs',
   'tests/reliable-kernel/platform-runtime-compatibility.test.mjs',
+  'tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs',
   'tests/reliable-kernel/runtime-claim-windows-rename.test.cjs',
   'tests/reliable-kernel/workspace-runtime-isolation.test.mjs',
   'tests/reliable-kernel/runtime-datasets.test.mjs',
@@ -274,7 +279,12 @@ if (files.length === 0) {
   process.exit(1);
 }
 if (process.argv.includes('--list')) {
-  for (const file of files) console.log(file);
+  // process.exit() drops what a pipe has not taken yet (a reader that is slow to drain it), which cut
+  // the list short for check-plan.mjs: exit once all of it is written.
+  await new Promise((resolve) => {
+    process.stdout.once('error', resolve); // A reader that stopped early (| head) wants no more.
+    process.stdout.write(`${files.join('\n')}\n`, resolve);
+  });
   process.exit(0);
 }
 console.log(
@@ -282,9 +292,18 @@ console.log(
     ? `按稳定顺序运行${files.length}个已纳入版本库的CI关键测试文件。`
     : `按稳定顺序运行${files.length}个当前可靠内核本机测试文件。`
 );
-// Guard against a hung run, not a budget for the suite: the serial suite alone now takes about
-// 13-14 minutes on a developer machine, so a 10-minute cap failed every complete run.
-const TEST_TIMEOUT_MS = 30 * 60 * 1000;
+// Guard against a hung run, not a budget for the suite: it only stops a run that no longer makes
+// progress. The serial CI list now takes more than 30 minutes on a developer machine (a 10- and then
+// a 30-minute cap each ended complete runs that were still passing), so leave generous headroom; a
+// slow test is a matter for that test's own timeout.
+const TEST_TIMEOUT_MS = 90 * 60 * 1000;
+// A webview build named without its owner (by an older runner) cannot be checked; one older than this
+// is abandoned (removeAbandonedWebviewBuilds). Its own constant, so raising the hang guard does not
+// move it; it only has to stay above any possible run.
+const UNOWNED_BUILD_ABANDONED_AFTER_MS = 24 * 60 * 60 * 1000;
+if (UNOWNED_BUILD_ABANDONED_AFTER_MS <= 2 * TEST_TIMEOUT_MS) {
+  throw new Error('UNOWNED_BUILD_ABANDONED_AFTER_MS必须远大于TEST_TIMEOUT_MS：否则仍在运行的旧式构建会被当作遗弃删除。');
+}
 // Several gate tests intentionally read/write shared evidence files. Node's default per-file
 // parallelism makes those durable fixtures race each other, so the advertised stable order must be
 // real rather than merely sorting the argv list.
@@ -387,8 +406,7 @@ function removeAbandonedWebviewBuilds(cacheDirectory) {
     const owner = /^\d+(?=-)/.exec(entry.name.slice(WEBVIEW_BUILD_PREFIX.length))?.[0];
     const abandoned = owner
       ? !processIsAlive(Number(owner))
-      // A build named without its owner cannot be checked; one older than any possible run is abandoned.
-      : Date.now() - fs.statSync(path.join(cacheDirectory, entry.name)).mtimeMs > 2 * TEST_TIMEOUT_MS;
+      : Date.now() - fs.statSync(path.join(cacheDirectory, entry.name)).mtimeMs > UNOWNED_BUILD_ABANDONED_AFTER_MS;
     if (abandoned) fs.rmSync(path.join(cacheDirectory, entry.name), { recursive: true, force: true });
   }
 }

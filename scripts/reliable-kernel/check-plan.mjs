@@ -325,6 +325,51 @@ const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([
   'scripts/reliable-kernel/tool-scheduler-phase2-after.json'
 ]);
 
+// Tracked test files that `run-local-tests.mjs --ci` does not run, each with the package script that
+// does (checked to name it). Every other tracked test must be in its CI_TEST_FILES.
+const TRACKED_TESTS_OUTSIDE_CI = new Map([
+  // Drive a real browser against the built webview; the CI list runs in Node only.
+  ['tests/webview-session-thinking.browser.mjs', 'test:browser'],
+  ['tests/webview-agent-status-panel.browser.mjs', 'test:browser']
+]);
+
+function isRunnableTestPath(file) {
+  return /\.test\.(?:cjs|mjs|js|ts)$/.test(file) || /\.browser\.mjs$/.test(file);
+}
+
+/** A tracked test that no run covers is dead weight that looks like coverage; see TRACKED_TESTS_OUTSIDE_CI. */
+function checkCiTestCoverage(tracked) {
+  let ciFiles;
+  try {
+    ciFiles = childProcess.execFileSync(process.execPath, ['scripts/reliable-kernel/run-local-tests.mjs', '--ci', '--list'], {
+      cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe']
+    }).split(/\r?\n/).filter(Boolean);
+  } catch (error) {
+    failures.push(`无法读取CI测试清单（run-local-tests.mjs --ci --list）：${String(error?.stderr || error?.message || error).trim()}`);
+    return;
+  }
+  const inCi = new Set(ciFiles);
+  const duplicates = ciFiles.filter((file, index) => ciFiles.indexOf(file) !== index);
+  if (duplicates.length) failures.push(`CI测试清单有重复项：${[...new Set(duplicates)].join(', ')}`);
+  const uncovered = tracked.filter(isRunnableTestPath).filter((file) => !inCi.has(file) && !TRACKED_TESTS_OUTSIDE_CI.has(file));
+  if (uncovered.length) {
+    failures.push('受版本管理的测试既不在CI清单（run-local-tests.mjs的CI_TEST_FILES）里，'
+      + `也不在check-plan.mjs的TRACKED_TESTS_OUTSIDE_CI排除名单里：${uncovered.join(', ')}`);
+  }
+  const trackedFiles = new Set(tracked);
+  const scripts = JSON.parse(read('package.json')).scripts ?? {};
+  for (const [file, script] of TRACKED_TESTS_OUTSIDE_CI) {
+    if (inCi.has(file)) failures.push(`${file}已在CI清单里，应从TRACKED_TESTS_OUTSIDE_CI移除`);
+    else if (!trackedFiles.has(file)) failures.push(`TRACKED_TESTS_OUTSIDE_CI里的${file}不在版本库里，应移除`);
+    else if (!scripts[script]?.includes(file)) failures.push(`TRACKED_TESTS_OUTSIDE_CI说${file}由npm run ${script}运行，但这个脚本没有运行它`);
+  }
+  if (requireTracked) {
+    // The runner fails on a listed file that is missing, which a checkout without it is.
+    const untracked = ciFiles.filter((file) => !trackedFiles.has(file));
+    if (untracked.length) failures.push(`CI清单里的测试未被版本库跟踪：${untracked.join(', ')}`);
+  }
+}
+
 function checkTrackedInputs() {
   let tracked = [];
   try {
@@ -338,6 +383,7 @@ function checkTrackedInputs() {
     failures.push(`仅允许明确审查过的关键测试与基准脚本进入版本库：${unexpectedTrackedTests.join(', ')}`);
   }
   if (!read('.gitignore').split(/\r?\n/).includes('/tests/')) failures.push('.gitignore必须忽略根目录/tests/');
+  if (tracked.length) checkCiTestCoverage(tracked);
 
   if (!requireTracked) {
     notes.push('当前只检查工作区内容；准备合入时再运行 npm run check:plan:tracked');

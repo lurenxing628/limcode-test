@@ -86,7 +86,9 @@ test('本机测试入口启动时清理无主的 webview 构建目录，保留�
   for (const name of [abandoned, live, staleUnowned, recentUnowned]) {
     await fs.mkdir(path.join(cache, name, 'chunks'), { recursive: true });
   }
-  const old = new Date(Date.now() - 3 * 60 * 60 * 1000);
+  // Past the runner's age for unowned builds (UNOWNED_BUILD_ABANDONED_AFTER_MS, one day; independent of
+  // its hang guard TEST_TIMEOUT_MS), so it is abandoned by age alone.
+  const old = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
   await fs.utimes(path.join(cache, staleUnowned), old, old);
   await fs.writeFile(path.join(cache, 'unrelated.json'), '{}');
 
