@@ -810,6 +810,11 @@ function isForeignLocation(value: unknown): value is ForeignRuntimeRootLocation 
     && (location.baseDataRootPath === undefined || typeof location.baseDataRootPath === 'string');
 }
 
+/** The file of the request for `candidateId` (a data-root relocation carries it, see readRuntimeDataSetMergeRequests). */
+export function runtimeDataSetMergeRequestFile(paths: StoragePaths, candidateId: string): Promise<string> {
+  return ledgerFile(paths, REQUESTS, candidateId);
+}
+
 export async function removeRuntimeDataSetMergeRequest(paths: StoragePaths, candidateId: string): Promise<void> {
   await removeLedgerJson(paths, REQUESTS, candidateId);
 }
@@ -825,9 +830,29 @@ export async function readRuntimeDataSetMergeFinalization(
     if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return undefined;
     throw error;
   }
+  const entry = finalizationOf(value, candidate.id);
+  return entry && sameRuntimeDataSetIdentity(entry.source, candidate) ? entry : undefined;
+}
+
+/** Every finalization note of this configuration root, whatever identity it names (a data-root relocation carries them). */
+export async function readRuntimeDataSetMergeFinalizations(paths: StoragePaths): Promise<RuntimeDataSetMergeFinalization[]> {
+  return (await readDirectoryJson(paths, FINALIZATIONS)).flatMap(([name, value]) => {
+    const candidateId = (value as { candidateId?: unknown } | null)?.candidateId;
+    const entry = typeof candidateId === 'string' && fileName(candidateId) === name ? finalizationOf(value, candidateId) : undefined;
+    return entry ? [entry] : [];
+  });
+}
+
+/** The file of the finalization note for `candidateId`. */
+export function runtimeDataSetMergeFinalizationFile(paths: StoragePaths, candidateId: string): Promise<string> {
+  return ledgerFile(paths, FINALIZATIONS, candidateId);
+}
+
+function finalizationOf(value: unknown, candidateId: string): RuntimeDataSetMergeFinalization | undefined {
   const entry = value as Partial<RuntimeDataSetMergeFinalization> | null;
   const ids = (list: unknown): list is string[] => Array.isArray(list) && list.every((id) => typeof id === 'string');
-  if (entry?.kind !== FINALIZATION_KIND || entry.candidateId !== candidate.id || !sameRuntimeDataSetIdentity(entry.source, candidate)
+  if (entry?.kind !== FINALIZATION_KIND || entry.candidateId !== candidateId || !entry.source
+    || typeof entry.source.dataSetId !== 'string' || typeof entry.source.rootInstanceId !== 'string'
     || !ids(entry.turnIds) || !ids(entry.intentIds)
     || typeof entry.turns !== 'number' || typeof entry.intents !== 'number' || typeof entry.sourceBackupPath !== 'string'
     || typeof entry.complete !== 'boolean' || typeof entry.finalizedAt !== 'string') return undefined;

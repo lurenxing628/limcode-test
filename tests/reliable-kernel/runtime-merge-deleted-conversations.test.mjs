@@ -914,6 +914,108 @@ test('迁移合并也按删除记录：新目录的当前库里删掉的对话�
   assert.equal(item?.reason, '迁移时有 1 个对话你在新目录的当前库里删除过，没有并过去，只在这里还有，所以保留');
 });
 
+const ledgerModule = kernelFile('runtimeDataSetMergeLedger.js');
+/** Merge requests and finalization notes under `root`, file by file. */
+async function requestsAndNotes(root) {
+  const result = {};
+  for (const section of ['requests', 'finalizations']) {
+    const directory = path.join(ledgerRoot(root), section);
+    if (!await exists(directory)) continue;
+    for (const [file, digest] of Object.entries(await moving.treeSnapshot(directory))) result[`${section}/${file}`] = digest;
+  }
+  return result;
+}
+
+test('盲审 F4：迁移带走迁走的库的合并请求（按新身份改写，期限不变）与收尾说明，新目录启动时照请求合并并报告收尾；带过去的请求核对不一致时撤销；旧目录的原样留着', async (t) => {
+  const fixture = await moving.createFixture(t);
+  const alpha = (await moving.rootAuthority.inspectVscodeRuntimeDataSets(fixture.paths)).candidates.find((item) => item.id === fixture.alpha.id);
+  await moving.rootAuthority.markVscodeRuntimeDataSetKept(alpha);
+  await ledgerModule.writeRuntimeDataSetMergeRequest(fixture.paths, {
+    candidateId: alpha.id, expectedDataSetId: alpha.dataSetId, expectedRootInstanceId: alpha.rootInstanceId, target: identityOf(fixture.current.binding)
+  });
+  await ledgerModule.writeRuntimeDataSetMergeFinalization(fixture.paths, {
+    candidateId: alpha.id, source: identityOf(alpha), turnIds: ['turn_closed'], intentIds: [], turns: 1, intents: 0,
+    sourceBackupPath: path.join(fixture.root, 'merge-source-backup'), complete: true
+  });
+  const oldBookkeeping = await requestsAndNotes(fixture.root);
+  const { requestedAt } = (await ledgerModule.readRuntimeDataSetMergeRequests(fixture.paths)).get(alpha.id);
+  const target = path.join(fixture.base, 'new-home');
+  const plan = await moving.planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+
+  // The carried request damaged right after it was written: the check finds it, the relocation is undone.
+  const requestFile = path.join(ledgerRoot(target), 'requests', `${alpha.id.replace(/:/g, '-')}.json`);
+  const rename = fs.rename;
+  let damaged = false;
+  fs.rename = async function (from, to, ...rest) {
+    const done = await rename.call(this, from, to, ...rest);
+    if (!damaged && to === requestFile) {
+      damaged = true;
+      await fs.writeFile(to, '{');
+    }
+    return done;
+  };
+  try {
+    await assert.rejects(moving.relocate(fixture, plan),
+      (error) => error.code === 'data-root-relocation-merge-records' && /带到新数据目录的合并请求与旧目录核对不一致，整体取消迁移/.test(error.message));
+  } finally { fs.rename = rename; }
+  assert.equal(damaged, true);
+  assert.deepEqual(await requestsAndNotes(target), {}, '撤销去掉带过去的请求和说明');
+
+  const { result } = await moving.relocate(fixture, plan);
+  assert.deepEqual(result.others.migrated, [alpha.id]);
+  const current = await moving.selectedDataSet(target);
+  const alphaCopy = (await moving.rootAuthority.inspectVscodeRuntimeDataSets({ globalStoragePath: target })).candidates.find((item) => item.id === alpha.id);
+  assert.deepEqual((await ledgerModule.readRuntimeDataSetMergeRequests({ globalStoragePath: target })).get(alpha.id), {
+    kind: 'limcode-runtime-data-set-merge-request', candidateId: alpha.id,
+    expectedDataSetId: alphaCopy.dataSetId, expectedRootInstanceId: alphaCopy.rootInstanceId,
+    target: { dataSetId: current.dataSetId, rootInstanceId: current.rootInstanceId }, requestedAt
+  }, '请求按迁走的库和新当前库的身份改写，期限不变');
+  const note = await ledgerModule.readRuntimeDataSetMergeFinalization({ globalStoragePath: target }, alphaCopy);
+  assert.deepEqual([note?.source, note?.turns, note?.sourceBackupPath], [identityOf(alphaCopy), 1, path.join(fixture.root, 'merge-source-backup')]);
+  assert.deepEqual(await requestsAndNotes(fixture.root), oldBookkeeping, '旧目录的请求和说明原样留着');
+
+  const startup = await mergeIntoCurrent(target, current);
+  // The note is found under the new identity (its turn is not in this fixture's source, so the merge counts 0 closed).
+  assert.deepEqual(startup.merged.map((item) => [item.candidateId, item.finalized?.sourceBackupPath]), [[alpha.id, path.join(fixture.root, 'merge-source-backup')]],
+    '新目录启动时照请求合并，并报告迁移前的收尾（带过去的收尾说明按新身份找到）');
+  assert.ok(moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'));
+});
+
+test('盲审 F4：外来历史库的合并请求改写成新目录找到它的位置（旧目录的归档成为上一个目录的归档，id 随之而变），新目录启动时照请求合并', async (t) => {
+  const fixture = await moving.createFixture(t);
+  const archivePath = await archive(fixture, fixture.alpha);
+  const source = await found(fixture.root, archivePath);
+  await request(fixture.root, source);
+  const target = path.join(fixture.base, 'new-home');
+  const plan = await moving.planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+  await moving.relocate(fixture, plan);
+  const there = await found(target, archivePath, null, [fixture.root]);
+  assert.notEqual(there.id, source.id, '前提：从新目录看，旧目录的归档是另一个 id');
+  const carried = await ledgerModule.readRuntimeDataSetMergeRequests({ globalStoragePath: target });
+  assert.deepEqual([...carried.keys()], [there.id]);
+  assert.deepEqual(carried.get(there.id).foreign, { location: there.location, label: source.label });
+  const current = await moving.selectedDataSet(target);
+  assert.deepEqual(carried.get(there.id).target, { dataSetId: current.dataSetId, rootInstanceId: current.rootInstanceId });
+  const startup = await mergeIntoCurrent(target, current);
+  assert.deepEqual(brief(startup).merged.map(([id]) => id), [there.id]);
+  assert.ok(moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'));
+});
+
+test('盲审 F4：合并进当前库、提交后中断还没收尾（旧目录还能收尾）时迁移预检拒绝并写明；在旧目录收尾之后照常迁移', async (t) => {
+  const fixture = await moving.createFixture(t);
+  await batch(fixture, { ...explicit(fixture.alpha.id), onFaultPoint: crashAfterCommit });
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'committing');
+  const target = path.join(fixture.base, 'new-home');
+  const refused = await moving.planWithRuntime(fixture, target);
+  assert.match(refused.problems.join('\n'), new RegExp(`当前目录里有一次合并还没有收尾（来源 ${fixture.alpha.id}：.*迁移之后它就无法再收尾，这次不迁移；中断的合并会在打开窗口时自动收尾，之后再迁移。`));
+  assert.deepEqual(brief(await batch(fixture)).merged, [[fixture.alpha.id, 1, 0]], '旧目录启动时收尾');
+  const plan = await moving.planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+  await moving.relocate(fixture, plan);
+});
+
 test('审查低-4：外来正文一个对象同样大小、内容被改，合并记为失败，不发布这个对象、不提交任何行', async (t) => {
   const fixture = await home(t);
   const elsewhere = await createConfigurationRoot({ tmp: fixture.base });

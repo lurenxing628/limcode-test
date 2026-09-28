@@ -201,6 +201,59 @@ test('#11 归档、合并备份和升级备份默认保留，只有勾选才删�
   await assert.rejects(fs.stat(fixture.current.binding.paths.dataRootPath), { code: 'ENOENT' }, '迁移过且没改动的历史库删除');
 });
 
+test('盲审 F5：删除旧目录时勾选的归档逐份在当前目录的外来声明下删：正在被合并（声明被占）或只读查看（有登记）的那份保留并写明，其余照删；都空出来之后才删掉', async (t) => {
+  const foreign = kernelFile('runtimeForeignHistory.js');
+  const { registerForeignRuntimeHistoryView } = kernelFile('runtimeForeignHistoryViews.js');
+  const fixture = await createFixture(t, { withAlpha: false });
+  const archives = path.join(fixture.root, '.limcode-runtime-backups');
+  const [FIRST, SECOND] = ['20260901-000000-000-aaaaaaaa', '20260902-000000-000-bbbbbbbb'];
+  for (const name of [FIRST, SECOND]) {
+    await fs.mkdir(path.join(archives, name), { recursive: true });
+    await fs.writeFile(path.join(archives, name, 'limcode.sqlite'), name);
+  }
+  const target = path.join(fixture.base, 'moved');
+  await relocate(fixture, await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target }));
+  const input = { oldRootPath: fixture.root, currentRootPath: target, relocationId: await relocationIdIn(target) };
+  const discovered = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPaths: [fixture.root] });
+  const rootOf = (name) => discovered.find((entry) => entry.location.containerPath === path.join(archives, name));
+  const [first, second] = [rootOf(FIRST), rootOf(SECOND)];
+  assert.ok(first && second, '前提：当前目录把旧目录的两份归档都认作外来历史库');
+  const pointer = (entry) => path.join(entry.location.containerPath, 'root-binding.json');
+  const key = 'backup:default:.limcode-runtime-backups';
+
+  // A merge of the first holds its claim (another async scope, as another window would).
+  let release;
+  let entered;
+  const holding = new Promise((resolve) => { entered = resolve; });
+  const held = foreign.tryWithForeignRuntimeRootClaim(target, first.id, pointer(first), async () => {
+    entered();
+    await new Promise((resolve) => { release = resolve; });
+  });
+  await holding;
+  let deleted;
+  try {
+    deleted = (await deleteAsConfirmed(input, [key])).result;
+  } finally { release(); await held; }
+  assert.deepEqual(deleted.busy.map((entry) => entry.path), [path.join(archives, FIRST)]);
+  assert.match(deleted.busy[0].reason, /正在被合并或查看/);
+  assert.ok(!deleted.removed.includes(key), '这一项没有删完，不算已删');
+  assert.equal(await fs.readFile(path.join(archives, FIRST, 'limcode.sqlite'), 'utf8'), FIRST, '被占用的那份保留');
+  await assert.rejects(fs.stat(path.join(archives, SECOND)), { code: 'ENOENT' }, '没被占用的那份照删');
+  assert.equal(deleted.remainingArchives, 1);
+
+  // A read-only view of it is registered: kept as well.
+  const view = await registerForeignRuntimeHistoryView(target, first.id);
+  try {
+    const again = (await deleteAsConfirmed(input, [key])).result;
+    assert.deepEqual(again.busy.map((entry) => entry.path), [path.join(archives, FIRST)]);
+  } finally { await view.release(); }
+  assert.equal(await fs.readFile(path.join(archives, FIRST, 'limcode.sqlite'), 'utf8'), FIRST);
+
+  const last = (await deleteAsConfirmed(input, [key])).result;
+  assert.deepEqual([last.busy, last.removed.includes(key), last.remainingArchives], [[], true, 0]);
+  await assert.rejects(fs.stat(archives), { code: 'ENOENT' });
+});
+
 test('#13 已合并进当前库且之后没改动的旧库不再单独复制；迁不了的库记在新目录的完成记录里（设置页显示）', async (t) => {
   const fixture = await createFixture(t);
   const alpha = (await inspectVscodeRuntimeDataSets(fixture.paths)).candidates.find((candidate) => candidate.id === fixture.alpha.id);

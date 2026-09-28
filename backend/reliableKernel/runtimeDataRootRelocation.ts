@@ -29,10 +29,14 @@ import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
 import { summarizeRuntimeDataSet } from './runtimeDataSetPreflight';
 import { parseRelocatedWorkInventory, type RelocatedWorkInventory } from './relocatedWorkInventory';
 import {
-  readRuntimeDataSetMergeLedger, runtimeDataSetConversationsMergedFrom, runtimeDataSetLastMerge, runtimeDataSetMergeClosures,
-  runtimeDataSetMergeLedgerRecordFile, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, withRuntimeDataSetMergeClosures,
-  type RuntimeDataSetFingerprint
+  isForeignRuntimeHistoryId, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeFinalizations, readRuntimeDataSetMergeLedger,
+  readRuntimeDataSetMergeRequests, runtimeDataSetConversationsMergedFrom, runtimeDataSetLastMerge, runtimeDataSetMergeClosures,
+  runtimeDataSetMergeFinalizationFile, runtimeDataSetMergeLedgerRecordFile, runtimeDataSetMergeRequestFile, sameRuntimeDataSetFingerprint,
+  sameRuntimeDataSetIdentity, withRuntimeDataSetMergeClosures,
+  type RuntimeDataSetFingerprint, type RuntimeDataSetMergeFinalization, type RuntimeDataSetMergeLedgerRequest
 } from './runtimeDataSetMergeLedger';
+import { liveForeignRuntimeHistoryViews } from './runtimeForeignHistoryViews';
+import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
 import {
   readRuntimeDeletedConversations, readRuntimeIdentityAliases, recordRuntimeDeletedConversations, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY,
   RUNTIME_IDENTITY_ALIASES_DIRECTORY, runtimeMergeIdentityName, type RuntimeIdentityContinuation, type RuntimeMergeIdentity
@@ -2191,6 +2195,15 @@ interface MergeRecordsCarry {
   deletionIdentities: RuntimeMergeIdentity[];
   keptClosures: Array<{ candidateId: string; closures: ReturnType<typeof runtimeDataSetMergeClosures> }>;
   continuations: Array<{ to: RuntimeMergeIdentity; continues: RuntimeMergeIdentity[] }>;
+  /** Exactly as the target must read them afterwards (a newer request the target had for the same source stays). */
+  requests: RuntimeDataSetMergeLedgerRequest[];
+  finalizations: RuntimeDataSetMergeFinalization[];
+}
+
+/** runtimeForeignHistory imports this module: loaded when first needed. */
+let foreignHistoryModule: Promise<typeof import('./runtimeForeignHistory')> | undefined;
+function foreignHistory(): Promise<typeof import('./runtimeForeignHistory')> {
+  return foreignHistoryModule ??= import('./runtimeForeignHistory');
 }
 
 /**
@@ -2201,7 +2214,12 @@ interface MergeRecordsCarry {
  * identity changes a continuation of its new identity: what the target kept for it, the old identity,
  * and what that one continued (chains expanded here, see readRuntimeMergeTargetIdentities). Without
  * it a copy of the old identity is no old copy any more and what the user deleted before the
- * relocation could be merged back. `movedAside`: the target's content is renamed aside first (a
+ * relocation could be merged back. Recorded merge requests (their deadline kept) and finalization
+ * notes follow the data sets they name, rewritten for the identities that change (a foreign root's
+ * request for where the target finds it, see foreignLocationFrom); those of a data set that stays
+ * behind stay with it there. A merge that is not finished into a data set that moves (committed or
+ * committing, its record not written yet) would never be finished once moved: refused, it finishes
+ * at the next open of a window there. `movedAside`: the target's content is renamed aside first (a
  * copied target), so none of it counts. Throws DataRootRelocationError when something cannot be read.
  */
 async function planMergeRecordsCarry(
@@ -2242,6 +2260,12 @@ async function planMergeRecordsCarry(
   const sourceRecords = await readMergeRecords(() => readRuntimeDataSetMergeLedger(sourcePaths), '旧目录里的合并记录');
   const targetRecords = options.movedAside ? new Map() : await readMergeRecords(() => readRuntimeDataSetMergeLedger(targetPaths), '新数据目录里的合并记录');
   for (const [candidateId, record] of sourceRecords) {
+    if (record.state === 'committing' && continued.some((entry) => sameRuntimeDataSetIdentity(entry.from, record.target))
+      && await finishesThere(sourcePaths, candidateId, record.source)) {
+      throw new DataRootRelocationError('data-root-relocation-merge-unfinished',
+        `当前目录里有一次合并还没有收尾（来源 ${candidateId}：可能正在进行，或上次在提交时中断，合并记录还没写成）。`
+        + '迁移之后它就无法再收尾，这次不迁移；中断的合并会在打开窗口时自动收尾，之后再迁移。');
+    }
     const from = await runtimeDataSetMergeLedgerRecordFile(sourcePaths, candidateId);
     const to = await runtimeDataSetMergeLedgerRecordFile(targetPaths, candidateId);
     const there = await existing(to);
@@ -2274,7 +2298,77 @@ async function planMergeRecordsCarry(
     if (entries.length === kept.length) continue;
     writes.push({ kind: 'write', to: file, text: `${JSON.stringify({ version: 1, continues: entries }, null, 2)}\n`, replaces: await existing(file) !== undefined });
   }
-  return { writes, deletionIdentities, keptClosures, continuations };
+
+  // Merge requests and finalization notes follow their data sets (only once their new identity is known).
+  const movedTo = (identity: { dataSetId: string; rootInstanceId: string }): RuntimeMergeIdentity | undefined | null => {
+    const entry = continued.find((item) => sameRuntimeDataSetIdentity(item.from, identity));
+    return entry ? entry.to ?? null : undefined;
+  };
+  const ledgerJson = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
+  const requests: RuntimeDataSetMergeLedgerRequest[] = [];
+  const targetRequests = options.movedAside ? new Map() : await readMergeRecords(() => readRuntimeDataSetMergeRequests(targetPaths), '新数据目录里的合并请求');
+  for (const request of (await readMergeRecords(() => readRuntimeDataSetMergeRequests(sourcePaths), '旧目录里的合并请求')).values()) {
+    const expected = { dataSetId: request.expectedDataSetId, rootInstanceId: request.expectedRootInstanceId };
+    // A data set's request stays behind with it; a foreign root is found from the target too.
+    const moved = request.foreign ? expected : movedTo(expected);
+    const receiving = movedTo(request.target);
+    if (!moved || receiving === null) continue;
+    let carried: RuntimeDataSetMergeLedgerRequest = {
+      ...request, expectedDataSetId: moved.dataSetId, expectedRootInstanceId: moved.rootInstanceId, ...(receiving ? { target: receiving } : {})
+    };
+    if (request.foreign) {
+      const location = foreignLocationFrom(request.foreign.location, path.resolve(source), path.resolve(target));
+      carried = { ...carried, candidateId: (await foreignHistory()).foreignRuntimeHistoryId(location, expected), foreign: { ...request.foreign, location } };
+    }
+    const to = await runtimeDataSetMergeRequestFile(targetPaths, carried.candidateId);
+    const there = await existing(to);
+    const kept = targetRequests.get(carried.candidateId);
+    if (kept && Date.parse(kept.requestedAt) >= Date.parse(carried.requestedAt)) {
+      requests.push(kept);
+      continue;
+    }
+    if (there && !there.isFile()) throw mergeRecordsError(`新数据目录的合并请求里有同名的非普通文件（${to}）`);
+    requests.push(carried);
+    writes.push({ kind: 'write', to, text: ledgerJson(carried), replaces: there !== undefined });
+  }
+  const finalizations: RuntimeDataSetMergeFinalization[] = [];
+  for (const note of await readMergeRecords(() => readRuntimeDataSetMergeFinalizations(sourcePaths), '旧目录里的合并收尾说明')) {
+    const source = movedTo(note.source);
+    if (!source) continue;
+    const carried: RuntimeDataSetMergeFinalization = { ...note, source };
+    const to = await runtimeDataSetMergeFinalizationFile(targetPaths, note.candidateId);
+    const there = await existing(to);
+    if (there && !there.isFile()) throw mergeRecordsError(`新数据目录的合并收尾说明里有同名的非普通文件（${to}）`);
+    finalizations.push(carried);
+    writes.push({ kind: 'write', to, text: ledgerJson(carried), replaces: there !== undefined });
+  }
+  return { writes, deletionIdentities, keptClosures, continuations, requests, finalizations };
+}
+
+/**
+ * Whether the old directory still finishes an interrupted commit of `candidateId` itself: a foreign
+ * root's always (from the ledger and the target alone), a data set's while it is that source still.
+ */
+async function finishesThere(paths: { globalStoragePath: string }, candidateId: string, source: RuntimeMergeIdentity): Promise<boolean> {
+  if (isForeignRuntimeHistoryId(candidateId)) return true;
+  const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId).catch(() => undefined);
+  return sameRuntimeDataSetIdentity(source, candidate);
+}
+
+/**
+ * Where directory `to` finds a foreign root a request of directory `from` names (runtimeForeignHistory
+ * discovery): what lay in or beside `from` (or beside an earlier directory) now lies in or beside a
+ * previous data directory, and what lies in or beside `to` itself is its own.
+ */
+function foreignLocationFrom(location: ForeignRuntimeRootLocation, from: string, to: string): ForeignRuntimeRootLocation {
+  const base = location.side === 'previous' && location.baseDataRootPath ? location.baseDataRootPath : from;
+  const own = isSamePath(base, to);
+  const { containerPath, dataRootRelativePath } = location;
+  if (location.kind === 'copied') return { kind: 'copied', side: own ? 'current' : 'previous', baseDataRootPath: base, containerPath, containerName: location.containerName, dataRootRelativePath };
+  const name = location.side === 'previous' ? location.containerName.slice(path.basename(base).length + 1) : location.containerName;
+  return own
+    ? { kind: 'archive', containerPath, containerName: name, dataRootRelativePath }
+    : { kind: 'archive', side: 'previous', baseDataRootPath: base, containerPath, containerName: `${path.basename(base)}/${name}`, dataRootRelativePath };
 }
 
 /**
@@ -2329,6 +2423,11 @@ async function verifyMergeRecordsCarry(source: string, target: string, carry: Me
   for (const { to, continues } of carry.continuations) {
     const read = await readRuntimeIdentityAliases(target, to);
     if (!continues.every((identity) => read.some((entry) => sameRuntimeDataSetIdentity(entry, identity)))) throw mismatch('身份延续记录');
+  }
+  const requests = await readRuntimeDataSetMergeRequests(targetPaths);
+  if (!carry.requests.every((request) => isDeepStrictEqual(requests.get(request.candidateId), request))) throw mismatch('合并请求');
+  for (const note of carry.finalizations) {
+    if (!isDeepStrictEqual(await readRuntimeDataSetMergeFinalization(targetPaths, { id: note.candidateId, ...note.source }), note)) throw mismatch('合并收尾说明');
   }
 }
 
@@ -3530,7 +3629,10 @@ export async function planOldDataRootDeletion(input: {
 /**
  * Deletes what the user confirmed: every deletable item that is not optional, and the optional ones
  * in `include`. The plan is computed again under the old directory's admission with every Host of
- * it offline; when it no longer matches what was confirmed, nothing is deleted.
+ * it offline; when it no longer matches what was confirmed, nothing is deleted. The current
+ * directory reads the old one's reset archives as foreign history: each archive is removed only
+ * under that history's claims, taken without waiting, while no read-only view of it is registered;
+ * one in use stays (`busy`, why; its item is not among `removed`).
  */
 export async function deleteOldDataRoot(input: {
   oldRootPath: string;
@@ -3540,7 +3642,7 @@ export async function deleteOldDataRoot(input: {
   include?: readonly string[];
   /** Keys of the items the confirmation listed for deletion. */
   confirmedKeys: readonly string[];
-}): Promise<{ removed: string[]; remainingDataSets: number; remainingArchives: number }> {
+}): Promise<{ removed: string[]; remainingDataSets: number; remainingArchives: number; busy: Array<{ path: string; reason: string }> }> {
   const oldRoot = path.resolve(input.oldRootPath);
   return withRuntimeDataRootAdmission(oldRoot, async () => {
     await assertConfigurationRootRuntimesOffline(oldRoot);
@@ -3553,17 +3655,57 @@ export async function deleteOldDataRoot(input: {
       throw new DataRootRelocationError('data-root-old-delete-changed', '确认之后旧目录发生了变化，没有删除任何内容；请重新查看后再删除。');
     }
     const order: Array<OldDataRootDeletionItem['kind']> = ['data-set', 'unmigrated', 'backup', 'configuration', 'metadata'];
+    const busy: Array<{ path: string; reason: string }> = [];
+    const partly = new Set<string>();
     for (const kind of order) {
       for (const item of selected.filter((entry) => entry.kind === kind)) {
-        for (const entry of item.paths) await fs.rm(entry, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        for (const entry of item.paths) {
+          if (kind !== 'backup' || path.basename(entry) !== RESET_ARCHIVES_DIRECTORY) {
+            await fs.rm(entry, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+            continue;
+          }
+          const inUse = await removeResetArchives(path.resolve(input.currentRootPath), oldRoot, entry);
+          if (inUse.length > 0) partly.add(item.key);
+          busy.push(...inUse.map((archive) => ({ path: archive, reason: '正在被合并或查看（当前目录里有窗口在合并、核验或只读查看它），这次没有删除，稍后再删' })));
+        }
       }
     }
     await removeEmptyDirectories(oldRoot);
     const after = await inspectVscodeRuntimeDataSets({ globalStoragePath: oldRoot }).catch(() => undefined);
     const remainingDataSets = after ? after.candidates.filter((candidate) => candidate.dataSetId).length + after.problems.length : 0;
     // Archives kept in the old directory stay foreign history of the current one only while it is remembered.
-    return { removed: keys, remainingDataSets, remainingArchives: await countResetArchives(oldRoot) };
+    return { removed: keys.filter((key) => !partly.has(key)), remainingDataSets, remainingArchives: await countResetArchives(oldRoot), busy };
   });
+}
+
+/**
+ * Removes the reset archives in `directory` of the old directory one by one, each under the claims
+ * of the foreign history roots the current directory finds in it (runtimeForeignHistory discovery,
+ * the old directory as a previous one; a merge, verification or read-only view takes them), taken
+ * without waiting, and only while no view of them is registered. Returns the archives in use (kept).
+ */
+async function removeResetArchives(currentRoot: string, oldRoot: string, directory: string): Promise<string[]> {
+  const history = await foreignHistory();
+  const roots = await history.discoverForeignRuntimeHistory({ configurationRootPath: currentRoot, previousDataRootPaths: [oldRoot] });
+  const inUse: string[] = [];
+  for (const name of (await fs.readdir(directory).catch(() => [] as string[])).sort()) {
+    const archive = path.join(directory, name);
+    const inside = roots.filter((root) => isSamePath(root.location.containerPath, archive) || isPathBelow(archive, root.location.containerPath));
+    const claimed = async (index: number): Promise<boolean> => {
+      if (index === inside.length) {
+        for (const root of inside) if (await liveForeignRuntimeHistoryViews(currentRoot, root.id) > 0) return false;
+        await fs.rm(archive, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+        return true;
+      }
+      const { location } = inside[index];
+      const pointer = path.join(path.dirname(path.join(location.containerPath, ...location.dataRootRelativePath.split('/'))), ROOT_BINDING_POINTER_FILE);
+      const result = await history.tryWithForeignRuntimeRootClaim(currentRoot, inside[index].id, pointer, () => claimed(index + 1));
+      return result.acquired && result.value;
+    };
+    if (!await claimed(0)) inUse.push(archive);
+  }
+  await fs.rmdir(directory).catch(() => undefined);
+  return inUse;
 }
 
 /**

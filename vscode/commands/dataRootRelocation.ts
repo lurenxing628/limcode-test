@@ -628,7 +628,7 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
   });
   if (answer.choice !== 'delete') return;
   const include = optional.filter((item) => answer.include.includes(item.key)).map((item) => item.key);
-  let removed: { removed: string[]; remainingDataSets: number; remainingArchives?: number };
+  let removed: { removed: string[]; remainingDataSets: number; remainingArchives?: number; busy?: Array<{ path: string; reason: string }> };
   try {
     removed = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在删除旧数据目录中的 LimCode 数据…' },
       () => deleteOldDataRoot({ ...input, include, confirmedKeys: [...required.map((item) => item.key), ...include] }));
@@ -640,6 +640,7 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
   if (removed.remainingDataSets === 0 && !removed.remainingArchives) await forgetPreviousDataRoot(context);
   await tell(ask, '已删除', [
     `已删除 ${removed.removed.length} 项。`,
+    ...(removed.busy ?? []).map((entry) => `保留归档 ${entry.path}：${entry.reason}。`),
     ...(removed.remainingDataSets > 0 ? [`旧目录里还保留 ${removed.remainingDataSets} 个历史库，设置页仍会显示这个旧目录。`] : []),
     ...(removed.remainingArchives
       ? [`旧目录里还保留 ${removed.remainingArchives} 份“归档并重置”留下的归档，列在“历史与存储管理 → 外来历史库”里${removed.remainingDataSets > 0 ? '' : '，设置页仍会显示这个旧目录'}。`] : [])
