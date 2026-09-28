@@ -5,6 +5,7 @@ import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { isCrossConversationFollowup } from './collaborationScope';
 import { collaborationMessageWakePolicy } from './collaborationWake';
 import { ConversationOwnershipGate } from './conversationOwnershipGate';
+import { isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import {
   requireIsoTimestamp,
@@ -211,13 +212,30 @@ export class ProcessCompletionDeliveryControlPlane {
    * Gives up the completion notice of a finished background Process that must not reach its
    * Conversation in this data set (a data-root relocation carried it away): the dispatch is
    * dead-lettered with `reason` (deliverySettlementSteps), so no delivery is ever created for it and
-   * the scan never picks it up again. A dispatch a live Host holds under an unexpired claim is that
-   * Host's: nothing changes and the result is `live` (a claim whose Host is gone is stale and is
-   * given up). Idempotent; never retried, never opens a Turn.
+   * the scan never picks it up again. It is taken as a control command, like a user's stop: the
+   * Conversation of a dispatch another live Host holds is that Host's, whose own scan delivers it
+   * (the scan leaves such foreign rows untouched as well), and so is a dispatch a live Host holds
+   * under an unexpired claim; nothing changes and the result is `live` (a claim whose Host is gone
+   * is stale and is given up). Idempotent; never retried, never opens a Turn.
    */
   public async abandonDispatch(input: { dispatchId: string; reason: string }): Promise<'abandoned' | 'live' | 'not_pending'> {
     const dispatchId = requirePhaseFId(input.dispatchId, 'dispatchId');
     const reason = requirePhaseFText(input.reason, 'reason');
+    const dispatch = await this.maybeGet('ProcessCompletionDispatch', dispatchId);
+    if (!dispatch || (dispatch.state !== 'pending' && dispatch.state !== 'claimed')) return 'not_pending';
+    const conversationId = await this.dispatchConversationId(dispatch);
+    if (conversationId === null) return this.abandonOwnedDispatch(dispatchId, reason);
+    try {
+      return await this.database.conversationOwners.run(conversationId, () => this.abandonOwnedDispatch(dispatchId, reason));
+    } catch (error) {
+      // Another live (or unknown) Host holds the Conversation: its scan converges the dispatch.
+      if (isConversationRuntimeOwnerBusyError(error)) return 'live';
+      throw error;
+    }
+  }
+
+  /** abandonDispatch under the Conversation's ownership (see there). */
+  private async abandonOwnedDispatch(dispatchId: string, reason: string): Promise<'abandoned' | 'live' | 'not_pending'> {
     for (let attempt = 0; ; attempt += 1) {
       const dispatch = await this.maybeGet('ProcessCompletionDispatch', dispatchId);
       if (!dispatch || (dispatch.state !== 'pending' && dispatch.state !== 'claimed')) return 'not_pending';

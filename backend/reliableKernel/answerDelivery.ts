@@ -14,6 +14,7 @@ import {
   type PreparedForegroundSettlement
 } from './childExecution';
 import { requireChildExecutionStatus } from './childExecutionState';
+import { isConversationRuntimeOwnerBusyError } from './ConversationRuntimeOwnerManager';
 import { isCrossConversationFollowup } from './collaborationScope';
 import { displayConversationTitle } from '../../shared/conversationTitle';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
@@ -1574,13 +1575,31 @@ export class RuntimeDeliveryControlPlane {
    * Gives up one pending delivery that must not reach its target in this data set (a data-root
    * relocation carried it away): the delivery fails with `reason`, its pending wakes are
    * dead-lettered and a runtime continuation still queued to open a Turn for it is cancelled, all in
-   * one transaction (deliverySettlementSteps). A wake a live Host holds under an unexpired claim is
-   * that Host's: nothing changes and the result is `live` (a claim whose Host is gone is stale and
-   * given up with the rest). Idempotent; never retried, never opens a Turn.
+   * one transaction (deliverySettlementSteps). It is taken as a control command, like a user's stop:
+   * a target Conversation another live Host holds is that Host's, whose own scans deliver or settle
+   * the delivery, and so is a wake a live Host holds under an unexpired claim; nothing changes and
+   * the result is `live` (a claim whose Host is gone is stale and given up with the rest).
+   * Idempotent; never retried, never opens a Turn.
    */
   public async abandonPending(input: { deliveryId: string; reason: string }): Promise<RuntimeDeliveryAbandonResult> {
     const deliveryId = requirePhaseFId(input.deliveryId, 'deliveryId');
     const reason = requirePhaseFText(input.reason, 'reason');
+    const delivery = await this.maybeGet('RuntimeDelivery', deliveryId);
+    if (!delivery || delivery.state !== 'pending') {
+      return { outcome: 'not_pending', state: delivery ? String(delivery.state) : null };
+    }
+    const targetConversationId = requirePhaseFId(delivery.target_conversation_id, 'RuntimeDelivery.target_conversation_id');
+    try {
+      return await this.database.conversationOwners.run(targetConversationId, () => this.abandonOwnedPending(deliveryId, reason));
+    } catch (error) {
+      // Another live (or unknown) Host holds the target Conversation: its rows stay untouched.
+      if (isConversationRuntimeOwnerBusyError(error)) return { outcome: 'live' };
+      throw error;
+    }
+  }
+
+  /** abandonPending under the target Conversation's ownership (see there). */
+  private async abandonOwnedPending(deliveryId: string, reason: string): Promise<RuntimeDeliveryAbandonResult> {
     for (let attempt = 0; ; attempt += 1) {
       const delivery = await this.maybeGet('RuntimeDelivery', deliveryId);
       if (!delivery || delivery.state !== 'pending') {

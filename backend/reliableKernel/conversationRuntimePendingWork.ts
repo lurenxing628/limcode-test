@@ -1,12 +1,20 @@
 import type Database from 'better-sqlite3';
+import { prepareCached } from './runtimeStatementCache';
 
 /**
  * A single reader snapshot decides whether an owner may be released. The result is bounded, not the
  * history being searched: an old background process or an answer-to-delivery gap still retains its
  * conversation. Terminal history and completed foreground processes do not retain an owner.
+ *
+ * `cached` prepares it through the connection's statement cache (runtimeStatementCache), for a
+ * caller that creates the probe per request (the carried-work inventory); the database worker's own
+ * probe is prepared once for the worker's lifetime and stays out of the cache.
  */
-export function createConversationRuntimeWorkProbe(database: Database.Database): (conversationId: string) => boolean {
-  const statement = database.prepare(`
+export function createConversationRuntimeWorkProbe(
+  database: Database.Database,
+  options: { cached?: boolean } = {}
+): (conversationId: string) => boolean {
+  const sql = `
     WITH conversation_turns AS (
       SELECT id FROM turn WHERE conversation_id = @conversationId
     ), relevant_children AS (
@@ -107,7 +115,10 @@ export function createConversationRuntimeWorkProbe(database: Database.Database):
            AND (cleanup.id IS NULL OR cleanup.state IN ('pending', 'stop_requested'))
       ) THEN 1
       ELSE 0 END AS busy
-  `).safeIntegers(true);
+  `;
+  const statement = options.cached
+    ? prepareCached(database, sql, { safeIntegers: true })
+    : database.prepare(sql).safeIntegers(true);
   return (conversationId) => {
     const row = statement.get({ conversationId }) as { busy: bigint };
     return row.busy === 1n;

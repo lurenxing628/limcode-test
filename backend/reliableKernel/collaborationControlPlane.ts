@@ -230,6 +230,12 @@ export class CollaborationControlPlane {
       const request = await this.existing('CollaborationRequest', source.requestId);
       if (request.message_id !== replyToMessageId) throw new Error('Completion reply request mismatch.');
       if (failureReply) {
+        // Another reconcile of the data set (another window, this Host's runtime convergence) may have
+        // sent this very reply and settled the task since the replay above: its reply is the answer.
+        if (request.state !== 'pending') {
+          const raced = await replay();
+          if (raced) return raced;
+        }
         const [requestTurn, ...extra] = await this.rows('CollaborationRequestTurnLink', { request_id: source.requestId });
         if (request.state !== 'pending' || extra.length || (requestTurn && await this.maybe('Turn', String(requestTurn.turn_id)))) throw new Error('Only a pending task that no Turn will answer gets a failure reply.');
         sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationRequest').assert(source.requestId, { state: 'pending', message_id: replyToMessageId }),

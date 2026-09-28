@@ -368,7 +368,8 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'relocatedWorkInventory') {
         assertDatabaseBinding(reader, data.binding);
-        respond({ type: 'response', id: request.id, ok: true, result: inventoryRelocatedWork(reader) });
+        // One read snapshot for all of its queries, like countDomainRows.
+        respond({ type: 'response', id: request.id, ok: true, result: reader.transaction(() => inventoryRelocatedWork(reader))() });
         return;
       }
       if (request.kind === 'conversationRuntimeWork') {

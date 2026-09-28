@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
+import { prepareCached } from './runtimeStatementCache';
 
 /**
  * Unfinished work a data-root relocation carries unchanged into the new directory while the old
@@ -120,7 +121,9 @@ const WORK_QUERIES: ReadonlyArray<readonly [WorkList, string]> = Object.freeze([
 /**
  * Every Conversation of the data set with work a Host would resume or execute on its own, listed
  * with that work. The kernel's pending-work probe is the final authority, so a Conversation it sees
- * as busy is listed even when none of the named lists applies (`otherRuntimeWork`).
+ * as busy is listed even when none of the named lists applies (`otherRuntimeWork`). Fixed SQL
+ * through the connection's statement cache (a connection without one prepares fresh); run it in one
+ * read transaction for a single snapshot.
  */
 export function inventoryRelocatedWork(source: Database.Database): RelocatedWorkInventory {
   const byConversation = new Map<string, Map<WorkList, Set<string>>>();
@@ -133,13 +136,13 @@ export function inventoryRelocatedWork(source: Database.Database): RelocatedWork
     return entry;
   };
   for (const [list, sql] of WORK_QUERIES) {
-    for (const row of source.prepare(sql).raw().iterate() as IterableIterator<[unknown, unknown]>) {
+    for (const row of prepareCached(source, sql, { rows: 'raw' }).iterate() as IterableIterator<[unknown, unknown]>) {
       lists(String(row[1])).get(list)!.add(String(row[0]));
     }
   }
-  const busy = createConversationRuntimeWorkProbe(source);
+  const busy = createConversationRuntimeWorkProbe(source, { cached: true });
   const conversations: RelocatedConversationWork[] = [];
-  const titles = source.prepare('SELECT id, title FROM conversation ORDER BY id').raw()
+  const titles = prepareCached(source, 'SELECT id, title FROM conversation ORDER BY id', { rows: 'raw' })
     .iterate() as IterableIterator<[string, string]>;
   for (const [conversationId, title] of titles) {
     const named = byConversation.get(conversationId);
