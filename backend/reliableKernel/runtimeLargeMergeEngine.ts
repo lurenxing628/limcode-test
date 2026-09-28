@@ -6,7 +6,7 @@ import {
 } from './runtimeDataSetMerge';
 import { peekRuntimeDataSetSummary } from './runtimeDataSetPreflight';
 import {
-  estimateLargeMergeSources, prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession, RUNTIME_DATA_SET_MERGE_CANCELLED,
+  estimateLargeMergeSources, LargeMergePreparationError, prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession, RUNTIME_DATA_SET_MERGE_CANCELLED,
   type LargeMergeEstimateProgress, type LargeMergePreparation as StreamedMergePreparation, type LargeMergePrepareProgress,
   type LargeMergeSourceResult
 } from './runtimeDataSetStreamedMerge';
@@ -28,6 +28,12 @@ import { inspectVscodeRuntimeDataSets, type VscodeRuntimeDataSetCandidate } from
  * source online (the engine keeps a claim on each prepared source until the preparation runs or is
  * released); the run merges every prepared source in its own streamed maintenance transaction.
  */
+
+/**
+ * What prepare() throws when the preparation failed as a whole: its reason as the user is told it,
+ * and how many sources' unfinished work it had closed already (their data changed).
+ */
+export { LargeMergePreparationError };
 
 /** How long a part of the session (preparing, or the exclusive phase) of one source or all of them is expected to take. */
 export interface LargeMergeDuration {

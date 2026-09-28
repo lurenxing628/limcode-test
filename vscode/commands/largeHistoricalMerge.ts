@@ -7,7 +7,7 @@ import {
   EXCLUSIVE_MAINTENANCE_DEFAULTS, type ExclusiveMaintenanceBusy, type RuntimeExclusiveMaintenanceOutcome
 } from '../../backend/reliableKernel/runtimeExclusiveMaintenance';
 import {
-  largeMergeEngine, type LargeMergeEngine, type LargeMergeEstimate, type LargeMergePreparation, type LargeMergeRunProgress,
+  largeMergeEngine, LargeMergePreparationError, type LargeMergeEngine, type LargeMergeEstimate, type LargeMergePreparation, type LargeMergeRunProgress,
   type LargeMergeSettledReport, type LargeMergeSourceOutcome
 } from '../../backend/reliableKernel/runtimeLargeMergeEngine';
 import {
@@ -173,7 +173,7 @@ export async function offerLargeHistoricalMerge(
       }, (progress, token) => prepare(context, host, engine, sources, false, stillCurrent, (message) => progress?.report({ message }), token));
     } catch (error) {
       console.error(`[LimCode] ${ACTIVITY}的准备没有完成。`, error);
-      const message = `${ACTIVITY}暂时无法准备：${describeError(error)}。已有数据未被修改，下次启动时会再试。`;
+      const message = `${ACTIVITY}暂时无法准备：${describeError(error)}。${preparationDataNote(error)}，下次启动时会再试。`;
       if (await fresh(options, 'runtime-data-set-merge-large-session-prepare', message) && stillCurrent()) void vscode.window.showWarningMessage(message);
       return;
     }
@@ -273,7 +273,7 @@ export async function startLargeHistoricalMerge(
         (message) => progress?.report({ message }), token));
     } catch (error) {
       console.error(`[LimCode] ${ACTIVITY}的准备没有完成。`, error);
-      await vscode.window.showErrorMessage(`${ACTIVITY}没有开始：准备时出错（${describeError(error)}）。已有数据未被修改。`);
+      await vscode.window.showErrorMessage(`${ACTIVITY}没有开始：准备时出错（${describeError(error)}）。${preparationDataNote(error)}。`);
       return;
     }
     if (!preparation || !stillCurrent()) return;
@@ -294,6 +294,17 @@ export async function startLargeHistoricalMerge(
     releaseHold?.();
     sessionRunning = false;
   }
+}
+
+/**
+ * What a failed preparation left of the data: unchanged, unless it had closed some source's
+ * unfinished work already (LargeMergePreparationError.finalizedSources).
+ */
+function preparationDataNote(error: unknown): string {
+  const finalized = error instanceof LargeMergePreparationError ? error.finalizedSources : 0;
+  return finalized > 0
+    ? `准备时已有 ${finalized} 份旧聊天记录里中断的任务按“中止”收尾、排队未发送的消息被取消（都不会在当前库继续执行），其余数据未被修改`
+    : '已有数据未被修改';
 }
 
 function currentCheck(context: vscode.ExtensionContext, options: LargeHistoricalMergeOptions): () => boolean {

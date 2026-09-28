@@ -1090,8 +1090,21 @@ const PREPARATIONS = new WeakMap<LargeMergePreparation, PreparationInternals>();
 type PreparedOutcome = { kind: 'prepared'; source: PreparedLargeMergeSource } | { kind: 'small' };
 
 /**
+ * A preparation that failed as a whole (none of it runs; everything it held is let go of): the reason
+ * as the user is told it (a full disk in Chinese, never the system's own text), and how many sources'
+ * unfinished work it had closed already (their data did change: “未被修改” would not be true).
+ */
+export class LargeMergePreparationError extends Error {
+  public constructor(public readonly cause: unknown, public readonly finalizedSources: number) {
+    super(isDiskFull(cause) ? '磁盘空间不足' : engine.errorMessage(cause));
+    this.name = 'LargeMergePreparationError';
+  }
+}
+
+/**
  * Online preparation of a large-merge session (no claim held for long; every window keeps working).
- * Never throws for a single source: its outcome goes into `report` (and the ledger) as a batch's would.
+ * Never throws for a single source: its outcome goes into `report` (and the ledger) as a batch's would;
+ * whatever else fails throws a LargeMergePreparationError.
  */
 export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): Promise<LargeMergePreparation> {
   const paths = { globalStoragePath: path.resolve(input.paths.globalStoragePath) };
@@ -1116,6 +1129,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
   };
   const prepared: PreparedLargeMergeSource[] = [];
   const small: string[] = [];
+  let finalizedSources = 0;
   internals.earlierBackup = sources.length > 0 ? await engine.newestTargetBackup(target).catch(() => undefined) : undefined;
   try {
     for (const [index, picked] of sources.entries()) {
@@ -1125,8 +1139,29 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         candidateId, code: outcome.code, message: outcome.message, newly: true, requested: picked.requested,
         ...(picked.label ? { label: picked.label } : {})
       });
-      if (!await internals.claims.claim(candidateId)) {
-        report.deferred.push(issue({ code: 'runtime-data-set-merge-preparing-elsewhere', message: '另一个窗口正在准备合并这份较大的旧聊天记录，由那个窗口完成。' }));
+      /** A full disk stops the preparation (as in the session): the sources after this one are not started. */
+      const notStartedAfter = (): void => {
+        for (const later of sources.slice(index + 1)) {
+          report.deferred.push({
+            candidateId: later.id, code: DISK_FULL, message: '前一份准备时磁盘空间不足，这一份没有开始；腾出空间后会再合并。',
+            newly: true, requested: later.requested, ...(later.label ? { label: later.label } : {})
+          });
+        }
+      };
+      // Writing its preparation record can fail too (no room, I/O): this source's outcome, told as the batch tells it.
+      const claimed = await internals.claims.claim(candidateId).catch(async (error: unknown) =>
+        engine.sourceOutcome(await diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并', undefined, options), {}));
+      if (claimed !== true) {
+        if (claimed === false) {
+          report.deferred.push(issue({ code: 'runtime-data-set-merge-preparing-elsewhere', message: '另一个窗口正在准备合并这份较大的旧聊天记录，由那个窗口完成。' }));
+          continue;
+        }
+        if (claimed.kind === 'stopped') break;
+        report.deferred.push(issue(claimed));
+        if (claimed.code === DISK_FULL) {
+          notStartedAfter();
+          break;
+        }
         continue;
       }
       const progress = (stage: LargeMergePrepareStage, rows?: number): void => input.onProgress?.({
@@ -1144,6 +1179,8 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         (state) => prepareSource(paths, target, candidateId, mode, state, input, progress, internals)
           .catch(async (error: unknown) => { throw await diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并', undefined, options); }),
         sourceInternals.state);
+      // Its unfinished work was closed by this preparation (whatever came of it): its data changed.
+      if (sourceInternals.state.finalized && !sourceInternals.state.finalized.earlier) finalizedSources += 1;
       if (outcome.kind === 'prepared') {
         prepared.push(picked.label ? { ...outcome.source, label: picked.label } : outcome.source);
         internals.sources.set(candidateId, sourceInternals);
@@ -1166,13 +1203,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       if (outcome.kind === 'deferred') {
         report.deferred.push(refused);
         if (outcome.code === DISK_FULL) {
-          // The disk is full: the sources after it are not started either (as in the session).
-          for (const later of sources.slice(index + 1)) {
-            report.deferred.push({
-              candidateId: later.id, code: DISK_FULL, message: '前一份准备时磁盘空间不足，这一份没有开始；腾出空间后会再合并。',
-              newly: true, requested: later.requested, ...(later.label ? { label: later.label } : {})
-            });
-          }
+          notStartedAfter();
           break;
         }
       } else {
@@ -1185,7 +1216,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     await releaseHolds(internals);
     await internals.claims.releaseAll();
     await removeUnusedBackup(target.backup.path, target.controlRoot, internals);
-    throw error;
+    throw new LargeMergePreparationError(error, finalizedSources);
   }
   if (sources.length > 0) {
     await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
