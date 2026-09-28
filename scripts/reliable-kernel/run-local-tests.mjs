@@ -15,7 +15,8 @@ const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/compressionTokenChange.test.ts',
   'webview/tests/chatDraftPrefill.test.ts',
   'webview/tests/composerDraftPersistence.test.ts',
-  'webview/tests/steeringReceipts.test.ts'
+  'webview/tests/steeringReceipts.test.ts',
+  'webview/tests/terminationNotice.test.ts'
 ]);
 const CI_TEST_FILES = Object.freeze([
   'tests/bottomStickyScrollerScheduler.test.cjs',

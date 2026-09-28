@@ -17,6 +17,7 @@ import {
   IconX
 } from '@tabler/icons-vue';
 import { isVisibleTextPart, type LlmUsageMetadataRecord, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
+import { terminationNotice as terminationNoticeText } from './terminationNotice';
 import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
@@ -307,23 +308,7 @@ const hasTerminatedAuditContent = computed(() => terminatedPartial.value && prop
 const showMessageContent = computed(() =>
   !terminatedPartial.value || props.terminationNoticeSuppressed || terminatedContentExpanded.value
 );
-const terminationNotice = computed(() => {
-  const detail = props.termination?.detail?.trim().replace(/[。.!！?？]+$/, '');
-  if (props.termination?.reasonCode === 'empty_model_result') {
-    return props.runHadCompletedTools
-      ? '工具调用已完成，但 LLM 没有返回可显示的最终说明。本轮已明确失败，工具结果仍会保留。'
-      : 'LLM 调用已结束，但没有返回可显示的正文。本轮已明确失败，不会以空回复静默完成。';
-  }
-  if (props.runHadCompletedTools) {
-    return detail
-      ? `本轮在工具调用后未正常完成：${detail}。工具结果已保留。`
-      : '本轮在工具调用后被终止，未生成最终说明；工具结果已保留，未完成回复不会计入后续 LLM 上下文。';
-  }
-  if (detail) return `本次回复未正常完成：${detail}`;
-  return props.termination?.kind === 'failed'
-    ? '本次回复未正常完成。未完成的回复正文不会进入后续 LLM 上下文；已完成的工具结果和中断位置仍会保留。'
-    : '本次回复已终止。未完成的回复正文不会进入后续 LLM 上下文；已完成的工具结果和中断位置仍会保留。';
-});
+const terminationNotice = computed(() => terminationNoticeText(props.termination, props.runHadCompletedTools));
 const terminationTooltipRows = computed(() => props.termination ? [
   { label: '原因', value: props.termination.detail?.trim() || props.termination.reasonCode },
   ...(props.termination.detail?.trim() ? [{ label: '分类', value: props.termination.reasonCode }] : []),
