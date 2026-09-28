@@ -573,6 +573,41 @@ test('reloc3 G1 globalStatus 的进行中记录按比较后写入：已有别的
   assert.ok(!(await globalStatus.loadCommittedGlobalStatus(vscodeContext)).pendingRelocation);
 });
 
+test('最后一轮 #5 globalStatus 记下历次离开的数据目录（最近的在前，最多 10 个）：切走时记下，切回时当前目录不算，外来发现确认空了的与删掉的旧目录去掉；格式不对报损坏', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const storage = path.join(fixture.base, 'vscode-global-storage');
+  await fs.mkdir(storage);
+  const vscodeContext = context(storage);
+  const [a, b, c] = ['a-home', 'b-home', 'c-home'].map((name) => path.join(fixture.base, name));
+  await globalStatus.saveGlobalStatus(vscodeContext, a, '');
+  const move = (from, to) => globalStatus.updateGlobalStatusDataRoot(vscodeContext, {
+    dataRootPath: to, lastMigration: { fromPath: from, toPath: to, migratedAt: NOW_ISO, relocationId: randomUUID() }
+  });
+  const roots = async () => (await globalStatus.loadCommittedGlobalStatus(vscodeContext)).previousDataRoots;
+  await move(a, b);
+  await move(b, c);
+  assert.deepEqual(await roots(), [b, a], 'A→B→C：A 和 B 都记着（不只最近一次的来源）');
+  await move(c, a);
+  assert.deepEqual(await roots(), [c, b], '回到 A：当前目录不算旧目录');
+  await globalStatus.updateGlobalStatusDataRoot(vscodeContext, { forgetPreviousDataRoots: [b] });
+  assert.deepEqual(await roots(), [c]);
+  await globalStatus.updateGlobalStatusDataRoot(vscodeContext, { lastMigration: null });
+  assert.equal(await roots(), undefined, '旧目录已删除（lastMigration 清除）：它也不再记');
+  let current = a;
+  for (let index = 0; index < 12; index += 1) {
+    const next = path.join(fixture.base, `d${index}`);
+    await move(current, next);
+    current = next;
+  }
+  const many = await roots();
+  assert.equal(many.length, 10, '最多 10 个');
+  assert.deepEqual([many[0], many[9]], [path.join(fixture.base, 'd10'), path.join(fixture.base, 'd1')]);
+  const statusFile = path.join(storage, globalStatus.LIMCODE_GLOBAL_STATUS_FILE);
+  const saved = JSON.parse(await fs.readFile(statusFile, 'utf8'));
+  await fs.writeFile(statusFile, JSON.stringify({ ...saved, previousDataRoots: ['relative/limcode'] }));
+  await assert.rejects(globalStatus.loadCommittedGlobalStatus(context(storage)), /全局状态旧数据目录列表损坏/);
+});
+
 test('reloc3 F4 冻结的窗口只认领自己已持有的对话，解冻后照常按资格认领', async () => {
   const productModule = load('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js');
   const product = Object.assign(Object.create(productModule.VscodeReliableKernelProductRuntime.prototype), { executionGate: { frozen: 0 } });

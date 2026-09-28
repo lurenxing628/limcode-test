@@ -51,7 +51,16 @@ export interface LimCodeGlobalStatus {
   dataRootId?: string;
   /** 正在进行的数据目录迁移；进程崩溃后由下次启动清理。 */
   pendingRelocation?: PendingDataRootRelocation;
+  /**
+   * 本安装用过、已经离开的数据目录，最近离开的在前，最多 PREVIOUS_DATA_ROOTS_LIMIT 个：外来历史库在这些
+   * 目录里找“归档并重置”留下的归档，并在它们旁边找拷来的目录。每次切换数据目录（迁移、回到旧目录、选择
+   * 其它目录、使用默认目录）都把离开的目录记在最前；里面已经没有这些东西的，由外来发现去掉。
+   */
+  previousDataRoots?: string[];
 }
+
+/** previousDataRoots 最多记几个目录。 */
+export const PREVIOUS_DATA_ROOTS_LIMIT = 10;
 
 /** 切换数据目录时的改动；省略的字段保持原值，null 表示清除。路径改变而没有给出新身份时身份被清除。 */
 export interface GlobalStatusDataRootChange {
@@ -66,6 +75,8 @@ export interface GlobalStatusDataRootChange {
   expectedPendingRelocationId?: string | null;
   /** 只在指针仍指向这个目录时才提交（不一致时什么都不写）。 */
   expectedDataRootPath?: string;
+  /** 从 previousDataRoots 里去掉这些目录（外来发现确认里面已经没有归档和拷来的目录）。 */
+  forgetPreviousDataRoots?: readonly string[];
 }
 
 /** 另一个窗口刚刚开始或结束了一次数据目录迁移。 */
@@ -144,7 +155,8 @@ export async function updateGlobalStatusDataRoot(
       proxyShellAndMcp: previous.proxyShellAndMcp === true,
       lastMigration: change.lastMigration,
       dataRootId: change.dataRootId,
-      pendingRelocation
+      pendingRelocation,
+      ...(change.forgetPreviousDataRoots ? { forgetPreviousDataRoots: change.forgetPreviousDataRoots } : {})
     });
   });
 }
@@ -257,9 +269,11 @@ async function commitStatus(
     lastMigration?: StorageRootMigrationStatus | null;
     dataRootId?: string | null;
     pendingRelocation?: PendingDataRootRelocation | null;
+    forgetPreviousDataRoots?: readonly string[];
   }
 ): Promise<LimCodeGlobalStatus> {
   const dataRootPath = normalizeStatusDataRootPath(context, next.dataRootPath);
+  const previousDataRoots = nextPreviousDataRoots(context, previous, dataRootPath, next);
   // The identity belongs to the directory: kept only while the path stays the same.
   const dataRootId = next.dataRootId === null ? undefined
     : next.dataRootId ?? (sameFsPath(dataRootPath, previous.dataRootPath) ? previous.dataRootId : undefined);
@@ -273,7 +287,8 @@ async function commitStatus(
     ...(next.lastMigration ? { lastMigration: requireMigration(next.lastMigration) }
       : next.lastMigration === undefined && previous.lastMigration ? { lastMigration: { ...previous.lastMigration } } : {}),
     ...(dataRootPath && dataRootId ? { dataRootId: requireDataRootId(dataRootId) } : {}),
-    ...(pendingRelocation ? { pendingRelocation: requirePendingRelocation(pendingRelocation) } : {})
+    ...(pendingRelocation ? { pendingRelocation: requirePendingRelocation(pendingRelocation) } : {}),
+    ...(previousDataRoots.length > 0 ? { previousDataRoots } : {})
   };
   await writeJson(uri, status);
   remember(context, status);
@@ -285,6 +300,30 @@ async function commitStatus(
   return cloneStatus(status);
 }
 
+/**
+ * The directory the pointer leaves (a new lastMigration) goes first; the one it now names, the
+ * forgotten ones and, when lastMigration is cleared (its old directory was deleted), that one leave.
+ */
+function nextPreviousDataRoots(
+  context: vscode.ExtensionContext,
+  previous: LimCodeGlobalStatus,
+  dataRootPath: string,
+  next: { lastMigration?: StorageRootMigrationStatus | null; forgetPreviousDataRoots?: readonly string[] }
+): string[] {
+  const active = resolveDataRootUri(context, dataRootPath).fsPath;
+  const leaving = next.lastMigration ? [path.resolve(next.lastMigration.fromPath)] : [];
+  const forgotten = [
+    ...(next.forgetPreviousDataRoots ?? []),
+    ...(next.lastMigration === null && previous.lastMigration ? [previous.lastMigration.fromPath] : [])
+  ];
+  const roots: string[] = [];
+  for (const root of [...leaving, ...(previous.previousDataRoots ?? [])]) {
+    if (sameFsPath(root, active) || forgotten.some((entry) => sameFsPath(entry, root)) || roots.some((entry) => sameFsPath(entry, root))) continue;
+    roots.push(root);
+  }
+  return roots.slice(0, PREVIOUS_DATA_ROOTS_LIMIT);
+}
+
 function statusFromGlobalState(context: vscode.ExtensionContext): LimCodeGlobalStatus {
   const stored = context.globalState.get<Partial<LimCodeGlobalStatus>>(LIMCODE_GLOBAL_STATUS_KEY);
   const dataRootPath = normalizeDataRootPath(stored?.dataRootPath, { fallbackToDefault: true });
@@ -292,6 +331,7 @@ function statusFromGlobalState(context: vscode.ExtensionContext): LimCodeGlobalS
   const customRoot = sameFsPath(dataRootPath, context.globalStorageUri.fsPath) ? '' : dataRootPath;
   const dataRootId = normalizeDataRootId(stored?.dataRootId);
   const pendingRelocation = normalizePendingRelocation(stored?.pendingRelocation);
+  const previousDataRoots = normalizePreviousDataRoots(stored?.previousDataRoots);
   return {
     schemaVersion: STORAGE_VERSION,
     dataRootPath: customRoot,
@@ -302,7 +342,8 @@ function statusFromGlobalState(context: vscode.ExtensionContext): LimCodeGlobalS
       : new Date(0).toISOString(),
     ...(lastMigration ? { lastMigration } : {}),
     ...(customRoot && dataRootId ? { dataRootId } : {}),
-    ...(pendingRelocation ? { pendingRelocation } : {})
+    ...(pendingRelocation ? { pendingRelocation } : {}),
+    ...(previousDataRoots?.length ? { previousDataRoots } : {})
   };
 }
 
@@ -326,6 +367,8 @@ function parseGlobalStatus(uri: vscode.Uri, value: unknown): LimCodeGlobalStatus
   if (record.dataRootId !== undefined && !dataRootId) throw new Error(`全局状态数据目录身份损坏：${uri.fsPath}`);
   const pendingRelocation = record.pendingRelocation === undefined ? undefined : normalizePendingRelocation(record.pendingRelocation);
   if (record.pendingRelocation !== undefined && !pendingRelocation) throw new Error(`全局状态迁移进行记录损坏：${uri.fsPath}`);
+  const previousDataRoots = record.previousDataRoots === undefined ? undefined : normalizePreviousDataRoots(record.previousDataRoots);
+  if (record.previousDataRoots !== undefined && !previousDataRoots) throw new Error(`全局状态旧数据目录列表损坏：${uri.fsPath}`);
   return {
     schemaVersion: STORAGE_VERSION,
     dataRootPath: normalizeDataRootPath(record.dataRootPath),
@@ -334,7 +377,8 @@ function parseGlobalStatus(uri: vscode.Uri, value: unknown): LimCodeGlobalStatus
     updatedAt: record.updatedAt,
     ...(lastMigration ? { lastMigration } : {}),
     ...(dataRootId ? { dataRootId } : {}),
-    ...(pendingRelocation ? { pendingRelocation } : {})
+    ...(pendingRelocation ? { pendingRelocation } : {}),
+    ...(previousDataRoots?.length ? { previousDataRoots } : {})
   };
 }
 
@@ -348,8 +392,15 @@ function cloneStatus(status: LimCodeGlobalStatus): LimCodeGlobalStatus {
   return {
     ...status,
     ...(status.lastMigration ? { lastMigration: { ...status.lastMigration } } : {}),
-    ...(status.pendingRelocation ? { pendingRelocation: { ...status.pendingRelocation } } : {})
+    ...(status.pendingRelocation ? { pendingRelocation: { ...status.pendingRelocation } } : {}),
+    ...(status.previousDataRoots ? { previousDataRoots: [...status.previousDataRoots] } : {})
   };
+}
+
+function normalizePreviousDataRoots(input: unknown): string[] | undefined {
+  if (!Array.isArray(input) || input.length > PREVIOUS_DATA_ROOTS_LIMIT
+    || !input.every((entry) => typeof entry === 'string' && entry.length > 0 && path.isAbsolute(entry))) return undefined;
+  return input.map((entry: string) => path.resolve(entry));
 }
 
 function requireDataRootId(value: string): string {

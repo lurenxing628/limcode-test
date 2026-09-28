@@ -713,7 +713,7 @@ test('上一个数据目录里的归档：位置必须严格按发现规则（�
   await initialize(fixture.alpha.scopeRoot, fixture.alpha.id);
   const home = path.join(fixture.base, 'new-home');
   await fs.mkdir(home);
-  const found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: home, previousDataRootPath: fixture.root });
+  const found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: home, previousDataRootPaths: [fixture.root] });
   const entry = found.find((item) => item.location.containerPath === archived.backupPath);
   assert.equal(entry?.location.side, 'previous');
   await foreign.locateForeignRuntimeRoot(home, entry.location);

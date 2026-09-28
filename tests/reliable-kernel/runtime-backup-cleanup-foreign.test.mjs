@@ -498,7 +498,7 @@ test('外来库保留的升级前备份按同样的规则：升级完成满 7 �
   assert.deepEqual(result.deleted.map((entry) => entry.path), [twin], JSON.stringify(result));
 });
 
-test('上一个数据目录里的归档与旁边的拷来目录：给出上一个数据目录时一起核对，内容都在当前库里时可删；旧目录里的其它内容不动', async (t) => {
+test('以前的数据目录里的归档与旁边的拷来目录：给出离开过的数据目录时一起核对（连续迁移后不止上一个），内容都在当前库里时可删；旧目录里的其它内容不动', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one']);
   const previous = path.join(fixture.base, 'OldLimCode');
@@ -509,13 +509,15 @@ test('上一个数据目录里的归档与旁边的拷来目录：给出上一�
   await fs.cp(controlRoot(fixture.current), path.join(copiedBeside, '.limcode-runtime'), { recursive: true });
   const database = await openCurrent(t, fixture);
   const without = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(without.items.some((entry) => entry.path === archived), false, '没有给出上一个数据目录时不看它');
-  const plan = await planRuntimeBackupCleanup(fixture.root, database, { previousDataRootPath: previous });
-  assert.equal(plan.previousDataRootPath, previous);
+  assert.equal(without.items.some((entry) => entry.path === archived), false, '没有给出离开过的数据目录时不看它');
+  // A→B→C: the older directory comes after the one left last (which is gone here).
+  const later = path.join(fixture.base, 'LaterLimCode');
+  const plan = await planRuntimeBackupCleanup(fixture.root, database, { previousDataRootPaths: [later, previous] });
+  assert.deepEqual(plan.previousDataRootPaths, [later, previous]);
   const item = itemAt(plan, archived);
   const besideItem = itemAt(plan, path.join(copiedBeside, '.limcode-runtime'));
-  assert.deepEqual([item.origin, item.deletable], ['上一个数据目录里的归档', true], item.reason);
-  assert.deepEqual([besideItem.origin, besideItem.deletable], ['上一个数据目录旁的拷来目录里的库', true], besideItem.reason);
+  assert.deepEqual([item.origin, item.deletable], ['以前的数据目录里的归档', true], item.reason);
+  assert.deepEqual([besideItem.origin, besideItem.deletable], ['以前的数据目录旁的拷来目录里的库', true], besideItem.reason);
   const before = await treeState(previous, [archived]);
   const result = await deleteRuntimeBackups(plan, database, [item.key, besideItem.key]);
   assert.deepEqual(result.deleted.map((entry) => entry.path).sort(), [archived, path.join(copiedBeside, '.limcode-runtime')].sort());

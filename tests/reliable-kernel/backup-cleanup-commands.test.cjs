@@ -103,7 +103,7 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
     vscode,
     '../../backend/reliableKernel/runtimeBackupCleanup': {
       async planRuntimeBackupCleanup(root, current, options) {
-        calls.push(['plan', root, current === database, options.previousDataRootPath ?? null]);
+        calls.push(['plan', root, current === database, options.previousDataRootPaths ? [...options.previousDataRootPaths] : null]);
         options.onProgress('正在核对 merge-old…');
         onPlan?.();
         if (planError) throw planError;
@@ -338,7 +338,7 @@ test('检查结果：上次中断、改回原名的项写在面板上；技术�
   assert.ok(warnings.some((line) => line.includes('EACCES')), warnings.join('\n'));
 });
 
-test('外来历史库单独一组：可删的写明来源、位置和内容已完整在哪个库，不可删的写明原因；上一个数据目录交给检查；删除后拷来目录里没有库时写明其余内容保留', async () => {
+test('外来历史库单独一组：可删的写明来源、位置和内容已完整在哪个库，不可删的写明原因；离开过的数据目录交给检查；删除后拷来目录里没有库时写明其余内容保留', async () => {
   const COPIED = '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678';
   const f = fixture({
     status: { dataRootPath: ROOT, lastMigration: { fromPath: '/old/limcode' } },
@@ -356,7 +356,7 @@ test('外来历史库单独一组：可删的写明来源、位置和内容已�
     }
   });
   await f.run();
-  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, '/old/limcode'], '上一个数据目录的归档和旁边的拷来目录一起核对');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, ['/old/limcode']], '最近一次迁移离开的目录的归档和旁边的拷来目录一起核对');
   assert.deepEqual(f.calls.find((call) => call[0] === 'status'), ['status', true]);
   const [first, second, done] = f.prompts;
   assert.match(first.description, /外来历史库要先通过核验/);
@@ -377,7 +377,19 @@ test('外来历史库单独一组：可删的写明来源、位置和内容已�
   ]);
 });
 
-test('读不出上一个数据目录的位置时只核对当前数据目录，照常检查，原因只写进日志', async () => {
+test('最后一轮 #5 连续迁移之后：离开过的数据目录（globalStatus 的列表，加上最近一次迁移离开的目录）都交给检查，和外来历史库的发现一致', async () => {
+  const f = fixture({
+    status: { dataRootPath: ROOT, lastMigration: { fromPath: '/b/limcode' }, previousDataRoots: ['/b/limcode', '/a/limcode'] },
+    answers: [{ choice: 'cancel', include: [] }]
+  });
+  await f.run();
+  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, ['/b/limcode', '/a/limcode']], 'A→B→C 之后 A 也核对');
+  const older = fixture({ status: { dataRootPath: ROOT, lastMigration: { fromPath: '/b/limcode' }, previousDataRoots: ['/a/limcode'] }, answers: [{ choice: 'cancel', include: [] }] });
+  await older.run();
+  assert.deepEqual(older.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, ['/a/limcode', '/b/limcode']]);
+});
+
+test('读不出以前的数据目录的位置时只核对当前数据目录，照常检查，原因只写进日志', async () => {
   const warnings = [];
   const f = fixture({ warnings, statusError: new Error('globalStatus.json 无法解析'), answers: [{ choice: 'cancel', include: [] }] });
   await f.run();

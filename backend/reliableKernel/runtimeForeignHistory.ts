@@ -33,11 +33,12 @@ import {
  * Foreign history: complete Runtime roots this configuration root does not enumerate as data sets,
  * registered in place and read only. Found by listing directories and reading small JSON files:
  * - reset archives `<scope>/.limcode-runtime-backups/<time>[-epoch-<N>-to-<M>]-<id8>` of every scope
- *   of the current data directory and of the previous one (globalStatus lastMigration.fromPath),
- *   also of scopes that keep nothing else (the data root is `<archive>/active`);
+ *   of the current data directory and of the data directories this installation left (globalStatus
+ *   previousDataRoots and lastMigration.fromPath, see ForeignRuntimeHistoryInput), also of scopes
+ *   that keep nothing else (the data root is `<archive>/active`);
  * - copied data directories `<data directory name>.limcode-copied-<time>-<id8>` beside the current
- *   and beside the previous data directory, and inside each its default root, its workspace scopes
- *   and their archives.
+ *   one and beside those left, and inside each its default root, its workspace scopes and their
+ *   archives.
  *
  * Location comes only from these rules (getPaths plus fixed and strictly matched names); identity
  * only from the root's own records, which must agree exactly. Verification is as strict as for a
@@ -105,8 +106,11 @@ export interface ForeignRuntimeHistoryReport {
 export interface ForeignRuntimeHistoryInput {
   /** getPaths().globalStoragePath: the current configuration (data) root. */
   configurationRootPath: string;
-  /** globalStatus lastMigration.fromPath, when a relocation left an old data directory. */
-  previousDataRootPath?: string;
+  /**
+   * The data directories this installation left, most recent first: globalStatus previousDataRoots,
+   * and lastMigration.fromPath (all an installation that relocated before that list existed has).
+   */
+  previousDataRootPaths?: readonly string[];
 }
 
 export class ForeignRuntimeHistoryRejection extends Error {
@@ -207,19 +211,18 @@ export async function heldDatabaseFiles(configurationRootPath: string, options: 
 /** Only list directories and read small JSON files: safe at any time, done once in the background at startup. */
 export async function discoverForeignRuntimeHistory(input: ForeignRuntimeHistoryInput): Promise<DiscoveredForeignRuntimeRoot[]> {
   const configurationRoot = path.resolve(input.configurationRootPath);
-  return discoverWith(configurationRoot, input.previousDataRootPath, await heldDatabaseFiles(configurationRoot));
+  return discoverWith(configurationRoot, input.previousDataRootPaths, await heldDatabaseFiles(configurationRoot));
 }
 
 async function discoverWith(
   configurationRoot: string,
-  previousDataRootPath: string | undefined,
+  previousDataRootPaths: readonly string[] | undefined,
   held: HeldDatabaseFiles
 ): Promise<DiscoveredForeignRuntimeRoot[]> {
-  const previous = previousDataRoot(configurationRoot, previousDataRootPath);
-  const bases = [configurationRoot, ...(previous ? [previous] : [])];
+  const bases = [configurationRoot, ...previousDataRoots(configurationRoot, previousDataRootPaths)];
   const found: DiscoveredForeignRuntimeRoot[] = [];
   for (const base of bases) {
-    // The previous data directory's archives stay there after a relocation (only its data sets move).
+    // A previous data directory's archives stay there after a relocation (only its data sets move).
     const common = base === configurationRoot ? { kind: 'archive' as const } : { kind: 'archive' as const, side: 'previous' as const, baseDataRootPath: base };
     const prefix = base === configurationRoot ? '' : `${path.basename(base)}/`;
     for (const directory of await listVscodeRuntimeArchiveDirectories(base).catch(() => [])) {
@@ -257,8 +260,8 @@ async function discoverWith(
 /**
  * Control roots of foreign history renamed aside in place (a cleanup of foreign history interrupted
  * between its rename and its removal), each with the location discovery gives that root once it is
- * back under its name: in the archives directories of the current and the previous data directory
- * (an archive), and in every copied directory beside either, in its default root, its workspace
+ * back under its name: in the archives directories of the current and the previous data directories
+ * (an archive), and in every copied directory beside any of them, in its default root, its workspace
  * scopes and their archives directories (`.limcode-runtime` or an archive). `renamed` matches such an
  * entry's name and captures the original name in group 1; only names discovery takes count. Lists
  * directories only, never through a link.
@@ -268,8 +271,7 @@ export async function listRenamedForeignRuntimeRoots(
   renamed: RegExp
 ): Promise<Array<{ path: string; originalPath: string; location: ForeignRuntimeRootLocation }>> {
   const configurationRoot = path.resolve(input.configurationRootPath);
-  const previous = previousDataRoot(configurationRoot, input.previousDataRootPath);
-  const bases = [configurationRoot, ...(previous ? [previous] : [])];
+  const bases = [configurationRoot, ...previousDataRoots(configurationRoot, input.previousDataRootPaths)];
   const found: Array<{ path: string; originalPath: string; location: ForeignRuntimeRootLocation }> = [];
   const originalOf = (entry: string): string | undefined => renamed.exec(entry)?.[1];
   for (const base of bases) {
@@ -335,10 +337,50 @@ export async function listRenamedForeignRuntimeRoots(
   return found;
 }
 
-function previousDataRoot(configurationRoot: string, previous: string | undefined): string | undefined {
-  if (!previous || !path.isAbsolute(previous)) return undefined;
-  const resolved = path.resolve(previous);
-  return isSamePath(resolved, configurationRoot) ? undefined : resolved;
+/** The previous data directories to look in: absolute, not the current one, each once, in order. */
+function previousDataRoots(configurationRoot: string, previous: readonly string[] | undefined): string[] {
+  const roots: string[] = [];
+  for (const entry of previous ?? []) {
+    if (!entry || !path.isAbsolute(entry)) continue;
+    const resolved = path.resolve(entry);
+    if (isSamePath(resolved, configurationRoot) || roots.some((root) => isSamePath(root, resolved))) continue;
+    roots.push(resolved);
+  }
+  return roots;
+}
+
+/**
+ * The previous data directories that provably hold nothing foreign history would list: no reset
+ * archive in any scope and no copied directory beside them (a directory that is gone counts as
+ * empty only when its parent can be listed). Anything that cannot be read keeps its directory: an
+ * unmounted drive must not make its archives disappear from the list for good.
+ */
+export async function previousDataRootsWithoutForeignHistory(input: ForeignRuntimeHistoryInput): Promise<string[]> {
+  const configurationRoot = path.resolve(input.configurationRootPath);
+  const empty: string[] = [];
+  for (const base of previousDataRoots(configurationRoot, input.previousDataRootPaths)) {
+    try {
+      const siblings = await fs.readdir(path.dirname(base));
+      if (siblings.some((name) => copiedNamePattern(base).test(name))) continue;
+      const info = await fs.lstat(base).catch((error: unknown) => {
+        if (isMissing(error)) return undefined;
+        throw error;
+      });
+      if (info) {
+        if (!info.isDirectory()) continue;
+        await fs.readdir(base);
+        const scopes = path.join(base, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
+        // Scopes that cannot be listed may hide archives.
+        await fs.readdir(scopes).catch((error: unknown) => { if (!isMissing(error)) throw error; });
+        const archives = await listVscodeRuntimeArchiveDirectories(base);
+        if (archives.some((directory) => directory.unreadable || directory.names.length > 0)) continue;
+      }
+      empty.push(base);
+    } catch {
+      // Not readable now: kept.
+    }
+  }
+  return empty;
 }
 
 /** Every root inside one copied data directory (or the directory itself when none is recognizable). */
@@ -669,7 +711,7 @@ export async function inspectForeignRuntimeHistory(
 ): Promise<ForeignRuntimeHistoryReport> {
   const configurationRoot = path.resolve(input.configurationRootPath);
   const held = await heldDatabaseFiles(configurationRoot);
-  const found = await discoverWith(configurationRoot, input.previousDataRootPath, held);
+  const found = await discoverWith(configurationRoot, input.previousDataRootPaths, held);
   const { candidates } = await inspectVscodeRuntimeDataSets({ globalStoragePath: configurationRoot });
   const entries: ForeignRuntimeHistoryEntry[] = [];
   for (const entry of found) {

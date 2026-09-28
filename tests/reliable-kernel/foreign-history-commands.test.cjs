@@ -51,7 +51,9 @@ const COPIED = entry({
 
 function fixture({ entries = [entry(), entry({ id: 'foreign:archive:1111111111111111', duplicateOf: 'foreign:archive:0123456789abcdef' }), COPIED,
   entry({ id: 'foreign:copied:2222222222222222', status: 'unavailable', code: 'foreign-history-copy-failed', reason: '暂时无法核验：复制数据库到私有临时目录失败（ENOSPC）。', summary: undefined })],
-picks = [], warnings = [], infos = [], discovered = [] } = {}) {
+picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
+  lastMigration: { fromPath: '/old/limcode', toPath: ROOT, migratedAt: '2026-09-01' }, previousDataRoots: ['/old/limcode', '/older/limcode']
+} } = {}) {
   const calls = [];
   const state = new Map();
   const context = { globalState: { get: (key) => state.get(key), update: async (key, value) => { state.set(key, value); } } };
@@ -75,8 +77,9 @@ picks = [], warnings = [], infos = [], discovered = [] } = {}) {
   const command = loadCommand({
     vscode,
     '../../backend/capabilities/vscodeStorage/globalStatus': {
-      loadCommittedGlobalStatus: async () => ({ lastMigration: { fromPath: '/old/limcode', toPath: ROOT, migratedAt: '2026-09-01' } }),
-      resolveDataRootUri: () => ({ fsPath: ROOT })
+      loadCommittedGlobalStatus: async () => plain(status),
+      resolveDataRootUri: () => ({ fsPath: ROOT }),
+      updateGlobalStatusDataRoot: async (_context, change) => { calls.push(['status', plain(change)]); }
     },
     '../../backend/capabilities/vscodeStorage/paths': { createVscodeStoragePaths: (uri) => ({ globalStoragePath: uri.fsPath }) },
     '../../backend/reliableKernel/runtimeDataSetHistory': {
@@ -85,10 +88,11 @@ picks = [], warnings = [], infos = [], discovered = [] } = {}) {
     '../../backend/reliableKernel/runtimeForeignHistory': {
       discoverForeignRuntimeHistory: async (input) => { calls.push(['discover', plain(input)]); return discovered.shift() ?? []; },
       inspectForeignRuntimeHistory: async (input) => {
-        calls.push(['inspect', input.configurationRootPath, input.previousDataRootPath]);
+        calls.push(['inspect', input.configurationRootPath, plain(input.previousDataRootPaths)]);
         input.onProgress?.(1, entries.length);
         return { configurationRootPath: ROOT, checkedAt: '2026-09-27T00:00:00.000Z', entries };
       },
+      previousDataRootsWithoutForeignHistory: async (input) => { calls.push(['empty?', plain(input.previousDataRootPaths)]); return empties.shift() ?? []; },
       locateForeignRuntimeRoot: async (configurationRootPath, location) => { calls.push(['locate', configurationRootPath, plain(location)]); return located; },
       inspectForeignRuntimeStorage: async (paths, root) => {
         calls.push(['storage', plain(paths), root.id]);
@@ -110,7 +114,7 @@ picks = [], warnings = [], infos = [], discovered = [] } = {}) {
 test('外来历史库列表：核验通过的注明来源、原位置和“以后的版本支持合并”，完全相同的拷贝折叠；未通过和暂时无法核验的列出位置、大小与原因', async () => {
   const f = fixture({ picks: [undefined] });
   await f.command.manageForeignRuntimeHistory(f.context);
-  assert.deepEqual(f.calls.find((call) => call[0] === 'inspect'), ['inspect', ROOT, '/old/limcode']);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'inspect'), ['inspect', ROOT, ['/old/limcode', '/older/limcode']], '历次离开的数据目录都找');
   const [, items, placeHolder] = f.calls.find((call) => call[0] === 'pick');
   assert.match(placeHolder, /只读；以后的版本支持合并/);
   assert.equal(items.length, 3, '完全相同的拷贝只显示一份');
@@ -160,7 +164,7 @@ test('选中核验通过的外来库：只读查看经 located 根打开历史�
   assert.match(text, /合计：3 个文件，4096 B/);
 });
 
-test('上一个数据目录里的归档注明来源', async () => {
+test('以前的数据目录里的归档注明来源（连续迁移后不止上一个目录）', async () => {
   const previous = entry({
     location: {
       kind: 'archive', side: 'previous', baseDataRootPath: '/old/limcode',
@@ -171,7 +175,7 @@ test('上一个数据目录里的归档注明来源', async () => {
   const f = fixture({ entries: [previous], picks: [undefined] });
   await f.command.manageForeignRuntimeHistory(f.context);
   const [, items] = f.calls.find((call) => call[0] === 'pick');
-  assert.equal(items[0].label, '归档（上一个数据目录里） · 20260901-010203-004-abcdef12');
+  assert.equal(items[0].label, '归档（以前的数据目录里） · 20260901-010203-004-abcdef12');
 });
 
 test('启动发现：新条目只提示一次，之后再出现的新条目另行提示；“查看”打开外来历史库列表', async () => {
@@ -188,10 +192,34 @@ test('启动发现：新条目只提示一次，之后再出现的新条目另�
   assert.match(infos[0][1], /可以在“历史与存储管理 → 外来历史库”里核验，核验通过的可以只读查看；以后的版本支持合并/, '按发现计数，只承诺核验通过的可以查看');
   assert.match(infos[1][1], /^发现 1 个外来历史库/);
   assert.deepEqual(f.calls.find((call) => call[0] === 'discover'), ['discover', {
-    paths: { globalStoragePath: ROOT }, configurationRootPath: ROOT, previousDataRootPath: '/old/limcode'
+    paths: { globalStoragePath: ROOT }, configurationRootPath: ROOT, previousDataRootPaths: ['/old/limcode', '/older/limcode']
   }]);
+  assert.ok(!f.calls.some((call) => call[0] === 'status'), '都还有归档或拷来的目录：列表不变');
   assert.equal(f.calls.filter((call) => call[0] === 'inspect').length, 1, '点“查看”才核验');
   const stale = fixture({ discovered: [[one]] });
   await stale.command.announceForeignRuntimeHistoryOnStartup(stale.context, () => false);
   assert.equal(stale.calls.some((call) => call[0] === 'info'), false, '窗口已换了运行时就不提示');
+});
+
+test('最后一轮 #5 启动发现之后，里面已经没有归档也没有拷来目录的旧数据目录从列表里去掉（由后端保守判定），其它照旧', async () => {
+  const f = fixture({ discovered: [[]], empties: [['/older/limcode']] });
+  await f.command.announceForeignRuntimeHistoryOnStartup(f.context);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'empty?'), ['empty?', ['/old/limcode', '/older/limcode']]);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'status'), ['status', { forgetPreviousDataRoots: ['/older/limcode'] }]);
+  assert.ok(!f.calls.some((call) => call[0] === 'info'), '什么都没发现：不提示');
+});
+
+test('最后一轮 #5 本版本之前迁移过的安装（globalStatus 只有 lastMigration.fromPath，还没有旧目录列表）：上一个目录照旧查看；它空了也不写 globalStatus（不在列表里，没有可去掉的）', async () => {
+  const f = fixture({ discovered: [[]], empties: [['/old/limcode']], status: { lastMigration: { fromPath: '/old/limcode', toPath: ROOT, migratedAt: '2026-09-01' } } });
+  await f.command.announceForeignRuntimeHistoryOnStartup(f.context);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'discover'), ['discover', {
+    paths: { globalStoragePath: ROOT }, configurationRootPath: ROOT, previousDataRootPaths: ['/old/limcode']
+  }]);
+  assert.ok(!f.calls.some((call) => call[0] === 'status'), '不在列表里：不写');
+  const listed = fixture({ discovered: [[]], empties: [['/old/limcode']], status: {
+    lastMigration: { fromPath: '/old/limcode', toPath: ROOT, migratedAt: '2026-09-01' }, previousDataRoots: ['/older/limcode']
+  } });
+  await listed.command.announceForeignRuntimeHistoryOnStartup(listed.context);
+  assert.deepEqual(listed.calls.find((call) => call[0] === 'discover')[1].previousDataRootPaths, ['/older/limcode', '/old/limcode'], '列表加上最近一次迁移离开的目录');
+  assert.ok(!listed.calls.some((call) => call[0] === 'status'));
 });

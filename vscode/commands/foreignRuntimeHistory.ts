@@ -1,9 +1,10 @@
 import * as vscode from 'vscode';
-import { loadCommittedGlobalStatus, resolveDataRootUri } from '../../backend/capabilities/vscodeStorage/globalStatus';
+import { loadCommittedGlobalStatus, resolveDataRootUri, updateGlobalStatusDataRoot, type LimCodeGlobalStatus } from '../../backend/capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths } from '../../backend/capabilities/vscodeStorage/paths';
 import { openRuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeDataSetHistory';
 import {
   discoverForeignRuntimeHistory, inspectForeignRuntimeHistory, inspectForeignRuntimeStorage, locateForeignRuntimeRoot,
+  previousDataRootsWithoutForeignHistory,
   type ForeignRuntimeHistoryEntry, type ForeignRuntimeHistoryInput
 } from '../../backend/reliableKernel/runtimeForeignHistory';
 import { browseRuntimeHistory, formatBytes, showReadOnly } from './runtimeDataSetManagement';
@@ -17,13 +18,28 @@ const ANNOUNCED_KEY = 'limcode.foreignRuntimeHistoryAnnounced';
 const ANNOUNCED_LIMIT = 500;
 const MERGE_LATER = '只读；以后的版本支持合并';
 
-async function foreignInput(context: vscode.ExtensionContext): Promise<ForeignRuntimeHistoryInput & { paths: { globalStoragePath: string } }> {
-  const status = await loadCommittedGlobalStatus(context);
+async function foreignInput(
+  context: vscode.ExtensionContext,
+  known?: LimCodeGlobalStatus
+): Promise<ForeignRuntimeHistoryInput & { paths: { globalStoragePath: string } }> {
+  const status = known ?? await loadCommittedGlobalStatus(context);
   const paths = createVscodeStoragePaths(resolveDataRootUri(context));
+  const previous = leftDataRoots(status);
   return {
     paths, configurationRootPath: paths.globalStoragePath,
-    ...(status?.lastMigration?.fromPath ? { previousDataRootPath: status.lastMigration.fromPath } : {})
+    ...(previous.length > 0 ? { previousDataRootPaths: previous } : {})
   };
+}
+
+/**
+ * The data directories this installation left, to look in: the list in globalStatus
+ * (previousDataRoots), and the last relocation's source (lastMigration.fromPath), which is all an
+ * installation that relocated before the list existed has. Discovery takes each directory once.
+ */
+function leftDataRoots(status: LimCodeGlobalStatus | undefined): string[] {
+  const listed = [...(status?.previousDataRoots ?? [])];
+  const from = status?.lastMigration?.fromPath;
+  return from && !listed.includes(from) ? [...listed, from] : listed;
 }
 
 /** Once after startup, in the background: only lists directories and reads small JSON files; new entries are announced once. */
@@ -31,8 +47,15 @@ export async function announceForeignRuntimeHistoryOnStartup(
   context: vscode.ExtensionContext,
   isCurrent: () => boolean = () => true
 ): Promise<void> {
-  const input = await foreignInput(context);
+  const status = await loadCommittedGlobalStatus(context);
+  const input = await foreignInput(context, status);
   const found = await discoverForeignRuntimeHistory(input);
+  // Data directories on the list that hold no archive and no copied directory any more are no longer
+  // looked in (the last relocation's source is looked in anyway: not on the list, nothing to take off).
+  const listed = status?.previousDataRoots ?? [];
+  const empty = (await previousDataRootsWithoutForeignHistory(input).catch(() => [] as string[])).filter((root) => listed.includes(root));
+  if (empty.length > 0) await updateGlobalStatusDataRoot(context, { forgetPreviousDataRoots: empty }).catch((error: unknown) =>
+    console.warn('[LimCode] 更新旧数据目录列表失败。', error));
   if (!isCurrent() || found.length === 0) return;
   const fresh = await rememberAnnounced(context, input.configurationRootPath, found.map((entry) => entry.id));
   if (fresh === 0) return;
@@ -127,8 +150,8 @@ async function reveal(entry: ForeignRuntimeHistoryEntry): Promise<void> {
 }
 
 function entryLabel(entry: ForeignRuntimeHistoryEntry): string {
-  const source = entry.location.kind === 'archive' ? entry.location.side === 'previous' ? '归档（上一个数据目录里）' : '归档'
-    : entry.archiveName ? '拷来目录里的归档' : entry.location.side === 'previous' ? '从别处拷来（上一个数据目录旁）' : '从别处拷来';
+  const source = entry.location.kind === 'archive' ? entry.location.side === 'previous' ? '归档（以前的数据目录里）' : '归档'
+    : entry.archiveName ? '拷来目录里的归档' : entry.location.side === 'previous' ? '从别处拷来（以前的数据目录旁）' : '从别处拷来';
   const scope = entry.scope && entry.scope !== 'default' ? ' · 工作区库' : '';
   const state = entry.status === 'failed' ? '未通过核验 · ' : entry.status === 'unavailable' ? '暂时无法核验 · ' : '';
   const copyOf = entry.sameAsLocal ? entry.sameAsLocal.selected ? '（当前库的旧拷贝）' : `（历史库 ${entry.sameAsLocal.candidateId} 的旧拷贝）` : '';

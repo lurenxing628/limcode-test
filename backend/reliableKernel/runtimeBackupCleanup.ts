@@ -142,8 +142,8 @@ export interface RuntimeBackupCleanupPlan {
   problems: string[];
   /** The technical causes behind the problems (for the log). */
   details: string[];
-  /** The previous data directory looked in for foreign history (globalStatus lastMigration.fromPath). */
-  previousDataRootPath?: string;
+  /** The data directories this installation left, looked in for foreign history (see ForeignRuntimeHistoryInput). */
+  previousDataRootPaths?: readonly string[];
 }
 
 export interface RuntimeBackupCleanupResult {
@@ -164,8 +164,8 @@ export interface RuntimeBackupCleanupOptions {
   onProgress?(message: string): void;
   /** The clock of the age rules (tests). */
   now?(): number;
-  /** globalStatus lastMigration.fromPath: its archives and the directories copied aside beside it are foreign history too. */
-  previousDataRootPath?: string;
+  /** The data directories this installation left (see ForeignRuntimeHistoryInput): their archives and the directories copied aside beside them are foreign history too. */
+  previousDataRootPaths?: readonly string[];
 }
 
 export interface RuntimeBackupDeletionOptions extends RuntimeBackupCleanupOptions {
@@ -346,7 +346,7 @@ export async function planRuntimeBackupCleanup(
   options: RuntimeBackupCleanupOptions = {}
 ): Promise<RuntimeBackupCleanupPlan> {
   const configurationRootPath = path.resolve(configurationRootPathInput);
-  const previousDataRootPath = options.previousDataRootPath;
+  const previousDataRootPaths = options.previousDataRootPaths?.length ? [...options.previousDataRootPaths] : undefined;
   const now = options.now ?? Date.now;
   const report = options.onProgress ?? (() => undefined);
   const problems: string[] = [];
@@ -358,7 +358,7 @@ export async function planRuntimeBackupCleanup(
   report('正在列出历史库…');
   let { roots, databaseFiles } = await listControlRoots(configurationRootPath, current, problem);
   report('正在收尾上次没有删完的备份…');
-  const leftovers = await settleInterruptedDeletions(configurationRootPath, roots, problem, { previousDataRootPath, databaseFiles });
+  const leftovers = await settleInterruptedDeletions(configurationRootPath, roots, problem, { previousDataRootPaths, databaseFiles });
   if (leftovers.restored.length > 0) ({ roots, databaseFiles } = await listControlRoots(configurationRootPath, current, () => undefined));
   const ledger = await readLedgerFacts(configurationRootPath);
   const items: RuntimeBackupCleanupItem[] = [];
@@ -368,7 +368,7 @@ export async function planRuntimeBackupCleanup(
   report('正在列出外来历史库…');
   let found: DiscoveredForeignRuntimeRoot[] = [];
   try {
-    found = await discoverForeignRuntimeHistory({ configurationRootPath, ...(previousDataRootPath ? { previousDataRootPath } : {}) });
+    found = await discoverForeignRuntimeHistory({ configurationRootPath, ...(previousDataRootPaths ? { previousDataRootPaths } : {}) });
   } catch (error) {
     problem('外来历史库（归档、拷来目录里的库）没有全部列出，没有列出的都保留。', error);
   }
@@ -407,7 +407,7 @@ export async function planRuntimeBackupCleanup(
   const plan: RuntimeBackupCleanupPlan = {
     configurationRootPath, checkedAt: new Date(now()).toISOString(), items,
     finishedDeletions: leftovers.finished, restoredDeletions: leftovers.restored, problems, details,
-    ...(previousDataRootPath ? { previousDataRootPath } : {})
+    ...(previousDataRootPaths ? { previousDataRootPaths } : {})
   };
   PROOFS.set(plan, proofs);
   FOREIGN_PROOFS.set(plan, foreignProofs);
@@ -552,7 +552,7 @@ export async function deleteRuntimeBackups(
     if (emptied.size > 0) {
       // A copied directory is never deleted as a whole: once no data set is left, the rest is the user's.
       const remaining = await discoverForeignRuntimeHistory({
-        configurationRootPath, ...(plan.previousDataRootPath ? { previousDataRootPath: plan.previousDataRootPath } : {})
+        configurationRootPath, ...(plan.previousDataRootPaths?.length ? { previousDataRootPaths: plan.previousDataRootPaths } : {})
       }).catch(() => undefined);
       for (const [key, directory] of emptied) {
         if (remaining && !remaining.some((entry) => comparable(entry.location.containerPath) === key && hasDataRoot(entry.location))) {
@@ -1404,7 +1404,7 @@ async function settleInterruptedDeletions(
   configurationRootPath: string,
   roots: readonly ControlRoot[],
   problem: (text: string, error?: unknown) => void,
-  context: { previousDataRootPath?: string; databaseFiles: DatabaseFiles }
+  context: { previousDataRootPaths?: readonly string[]; databaseFiles: DatabaseFiles }
 ): Promise<{ finished: string[]; restored: string[] }> {
   const finished: string[] = [];
   const restored: string[] = [];
@@ -1425,7 +1425,7 @@ async function settleInterruptedDeletions(
   let foreign: Awaited<ReturnType<typeof listRenamedForeignRuntimeRoots>> = [];
   try {
     foreign = await listRenamedForeignRuntimeRoots({
-      configurationRootPath, ...(context.previousDataRootPath ? { previousDataRootPath: context.previousDataRootPath } : {})
+      configurationRootPath, ...(context.previousDataRootPaths?.length ? { previousDataRootPaths: context.previousDataRootPaths } : {})
     }, DELETING_NAME);
   } catch (error) {
     problem('外来历史库里上次没有删完的目录没有全部找到，下次检查时再试。', error);
@@ -2030,9 +2030,9 @@ function foreignName(found: DiscoveredForeignRuntimeRoot): string {
 function foreignOrigin(found: DiscoveredForeignRuntimeRoot): string {
   const workspace = found.scope.startsWith('workspace:') ? '（工作区库）' : '';
   if (found.location.kind === 'archive') {
-    return found.location.side === 'previous' ? `上一个数据目录里的归档${workspace}` : `“归档并重置”的归档${workspace}`;
+    return found.location.side === 'previous' ? `以前的数据目录里的归档${workspace}` : `“归档并重置”的归档${workspace}`;
   }
-  const beside = found.location.side === 'previous' ? '上一个数据目录旁的' : '';
+  const beside = found.location.side === 'previous' ? '以前的数据目录旁的' : '';
   return `${beside}拷来目录里的${found.archiveName ? '归档' : '库'}${workspace}`;
 }
 

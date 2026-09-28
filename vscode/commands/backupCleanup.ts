@@ -77,14 +77,14 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   }
   const current = host.product.application.database;
   const configurationRootPath = host.dataRootPath();
-  const previousDataRootPath = await previousDataRoot(context);
+  const previousDataRootPaths = await previousDataRoots(context);
   let plan: RuntimeBackupCleanupPlan;
   try {
     plan = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在检查备份…' },
       (progress) => runRuntimeDataSetUpgrade(context, () => {
         const check = () => planRuntimeBackupCleanup(configurationRootPath, current, {
           onProgress: (message) => progress.report({ message }),
-          ...(previousDataRootPath ? { previousDataRootPath } : {})
+          ...(previousDataRootPaths.length > 0 ? { previousDataRootPaths } : {})
         });
         // The check writes too (it settles leftovers of an interrupted cleanup, copies other data
         // sets under their maintenance and writes the id cache): a write command for the freeze.
@@ -214,13 +214,21 @@ function locationText(item: RuntimeBackupCleanupItem): string {
   return `所属：${owner}　位置：${item.path}`;
 }
 
-/** globalStatus lastMigration.fromPath: its archives and the directories copied aside beside it are foreign history too. */
-async function previousDataRoot(context: vscode.ExtensionContext): Promise<string | undefined> {
+/**
+ * The data directories this installation left, as foreign history discovery looks in them
+ * (globalStatus previousDataRoots, and lastMigration.fromPath, which is all an installation that
+ * relocated before that list existed has): their archives and the directories copied aside beside
+ * them are foreign history too.
+ */
+async function previousDataRoots(context: vscode.ExtensionContext): Promise<string[]> {
   try {
-    return (await loadCommittedGlobalStatus(context))?.lastMigration?.fromPath || undefined;
+    const status = await loadCommittedGlobalStatus(context);
+    const listed = [...(status?.previousDataRoots ?? [])];
+    const from = status?.lastMigration?.fromPath;
+    return from && !listed.includes(from) ? [...listed, from] : listed;
   } catch (error) {
-    console.warn('[LimCode] 清理备份：无法读取上一个数据目录的位置，这次只看当前数据目录。', error);
-    return undefined;
+    console.warn('[LimCode] 清理备份：无法读取以前的数据目录的位置，这次只看当前数据目录。', error);
+    return [];
   }
 }
 

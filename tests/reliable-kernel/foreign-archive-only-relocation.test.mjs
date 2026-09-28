@@ -58,14 +58,14 @@ async function readMessages(paths, root, conversationId) {
 
 /** The new directory's view of the old one's archive: found beside nothing, in the previous directory itself. */
 async function verifiedFromNewDirectory(target, previous, backupPath) {
-  const found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPath: previous });
+  const found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPaths: [previous] });
   const discovered = found.find((entry) => entry.location.containerPath === backupPath);
   assert.ok(discovered, `新目录的外来历史库发现了旧目录里的归档：${JSON.stringify(found.map((entry) => entry.location.containerPath))}`);
   assert.equal(discovered.location.kind, 'archive');
   assert.equal(discovered.location.side, 'previous');
   assert.equal(discovered.location.baseDataRootPath, previous);
   assert.equal(discovered.location.containerName, `${path.basename(previous)}/${path.relative(previous, backupPath).split(path.sep).join('/')}`);
-  const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPath: previous });
+  const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPaths: [previous] });
   const entry = report.entries.find((item) => item.location.containerPath === backupPath);
   assert.equal(entry?.status, 'verified', entry?.reason);
   assert.equal(entry.id, discovered.id);
@@ -132,7 +132,7 @@ test('foreign-archive-only-relocation：迁走的工作区库带着归档，删�
     target: { dataSetId: archived.dataSetId, rootInstanceId: archived.rootInstanceId },
     source: { dataSetId: 'other', rootInstanceId: 'other', rootGeneration: 1, pointerRevision: 1, contentDigest: 'x' }
   });
-  const blocked = (await foreign.inspectForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPath: fixture.root }))
+  const blocked = (await foreign.inspectForeignRuntimeHistory({ configurationRootPath: target, previousDataRootPaths: [fixture.root] }))
     .entries.find((entry) => entry.location.containerPath === backupPath);
   assert.equal(blocked?.status, 'failed');
   assert.equal(blocked.code, 'foreign-history-unfinished-merge');
@@ -157,4 +157,36 @@ test('foreign-archive-only-relocation：旧目录里读不了的归档目录（�
   assert.match(item.reason, /无法读取，保留/);
   assert.equal(result.remainingArchives, 1, '读不了的归档目录也算保留的归档');
   assert.ok(await exists(path.join(scope, '.limcode-runtime-backups')));
+});
+
+test('最后一轮 #5 连续迁移（A→B→C）之后，A 和 B 里的归档都列在 C 的外来历史库里；里面已经没有归档和拷来目录的旧目录判为可去掉，读不了的、盘没接上的、旁边还有拷来目录的都保留', async (t) => {
+  const fixture = await createFixture(t);
+  const { backupPath } = await archiveAndReset(fixture, fixture.current);
+  const [a, b, c] = [fixture.root, path.join(fixture.base, 'b-home'), path.join(fixture.base, 'c-home')];
+  await fs.mkdir(c, { recursive: true });
+  // B was a data directory in between and keeps an archive of its own.
+  const bArchive = path.join(b, '.limcode-runtime-backups', path.basename(backupPath));
+  await fs.mkdir(path.dirname(bArchive), { recursive: true });
+  await fs.cp(backupPath, bArchive, { recursive: true });
+  const found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: c, previousDataRootPaths: [b, a] });
+  assert.deepEqual(found.filter((entry) => entry.location.side === 'previous').map((entry) => [entry.location.baseDataRootPath, entry.location.containerPath]),
+    [[b, bArchive], [a, backupPath]], '两个旧目录里的归档都列出');
+  const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: c, previousDataRootPaths: [b, a] });
+  assert.equal(report.entries.find((entry) => entry.location.containerPath === backupPath)?.status, 'verified');
+
+  const empty = path.join(fixture.base, 'empty-home');
+  await fs.mkdir(path.join(empty, '.limcode-runtime-backups'), { recursive: true });
+  const gone = path.join(fixture.base, 'gone-home');
+  const unmounted = path.join(fixture.base, 'no-such-drive', 'limcode');
+  const beside = path.join(fixture.base, 'beside-home');
+  await fs.mkdir(`${beside}.limcode-copied-2026-09-02T01-02-03-004Z-12345678`);
+  const locked = path.join(fixture.base, 'locked-home');
+  await fs.mkdir(locked);
+  const privileged = process.getuid?.() === 0;
+  if (!privileged) await fs.chmod(locked, 0o000);
+  t.after(() => fs.chmod(locked, 0o700).catch(() => undefined));
+  const removable = await foreign.previousDataRootsWithoutForeignHistory({
+    configurationRootPath: c, previousDataRootPaths: [b, a, empty, gone, unmounted, beside, locked, c]
+  });
+  assert.deepEqual(removable, privileged ? [empty, gone, locked] : [empty, gone], '只有确实空了的旧目录；当前目录本身不在列表里');
 });

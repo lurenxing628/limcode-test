@@ -140,7 +140,7 @@ test('迁移挪开的拷来目录：核验、只读查看与存储统计只经 l
   const probe = probeFilesystem();
   let report; let read; let storage; let root;
   try {
-    report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: copied, previousDataRootPath: fixture.root });
+    report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: copied, previousDataRootPaths: [fixture.root] });
     const entry = report.entries.find((item) => item.location.containerName === aside);
     assert.equal(entry?.status, 'verified', entry?.reason);
     root = await foreign.locateForeignRuntimeRoot(copied, entry.location);
@@ -246,7 +246,7 @@ test('启动发现只列目录、读小 JSON：找到上一个数据目录旁的
   await fs.mkdir(path.join(directory, 'previous.limcode-copied-not-a-relocation'), { recursive: true });
   const probe = probeFilesystem();
   let found;
-  try { found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: home, previousDataRootPath: previous }); }
+  try { found = await foreign.discoverForeignRuntimeHistory({ configurationRootPath: home, previousDataRootPaths: [previous] }); }
   finally { probe.stop(); }
   assert.deepEqual(found.map((entry) => [entry.location.side, entry.location.dataRootRelativePath]), [
     ['previous', '.limcode-runtime/active'],
