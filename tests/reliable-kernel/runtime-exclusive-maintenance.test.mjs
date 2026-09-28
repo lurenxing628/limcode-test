@@ -235,7 +235,7 @@ test('盲审 #1：锁外等待期间用户关掉那个忙窗口，它在运行�
     const participant = startExclusiveMaintenanceParticipant(paths, hostBootId, {
       busyReason: async () => WORK, confirm: async () => true, release: async () => assert.fail('it is closing, not yielding')
     }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
-    t.after(() => participant.unregister());
+    closeBeforeRootRemoval(t, paths, () => participant.unregister());
     await participant.checkNow();
     const progress = [];
     const outcome = run(paths, {
@@ -266,7 +266,7 @@ test('盲审 #1：本次调用中回答过的窗口登记消失（较早的版�
   const participant = startExclusiveMaintenanceParticipant(paths, 'earlier-build', {
     busyReason: async () => WORK, confirm: async () => true, release: async () => {}
   }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
-  t.after(() => participant.unregister());
+  closeBeforeRootRemoval(t, paths, () => participant.unregister());
   await participant.checkNow();
   const progress = [];
   const outcome = run(paths, {
@@ -291,7 +291,7 @@ test('盲审 #1：请求开始时已在关闭的窗口（从没回答过）等�
   const closing = startExclusiveMaintenanceParticipant(paths, 'already-closing', {
     busyReason: async () => undefined, confirm: async () => true, release: async () => {}
   }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
-  t.after(() => closing.unregister());
+  closeBeforeRootRemoval(t, paths, () => closing.unregister());
   await closing.checkNow();
   await closing.dispose();
   setTimeout(() => { void fs.rm(closingLiveness, { force: true }).then(() => closing.unregister()); }, 400);
@@ -302,7 +302,7 @@ test('盲审 #1：请求开始时已在关闭的窗口（从没回答过）等�
   const participant = startExclusiveMaintenanceParticipant(paths, 'stuck-closing', {
     busyReason: async () => undefined, confirm: async () => true, release: async () => {}
   }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
-  t.after(() => participant.unregister());
+  closeBeforeRootRemoval(t, paths, () => participant.unregister());
   await participant.checkNow();
   await participant.dispose();
   const started = performance.now();
@@ -328,7 +328,7 @@ test('盲审 #1：锁内确认阶段有窗口开始关闭时不再等它确认�
     },
     release: async () => assert.fail('no go for a window that closes on its own')
   }, { pollMs: 20, processId: (nextFakeProcessId += 1) });
-  t.after(() => participant.unregister());
+  closeBeforeRootRemoval(t, paths, () => participant.unregister());
   await participant.checkNow();
   const phases = [];
   const outcome = await run(paths, { ...BASE, onProgress: (item) => phases.push(item.stage) }, async () => 'done');
@@ -1212,7 +1212,8 @@ test('没有发布 go 就不算已协调：其它窗口在 go 前全部关闭、
   const participant = startExclusiveMaintenanceParticipant(binding.paths, 'closing-peer', {
     busyReason: async () => undefined, confirm: async () => true, release: async () => {}
   }, { pollMs: 10, processId: (nextFakeProcessId += 1) });
-  t.after(() => participant.dispose());
+  // Leaving writes its registration once more: before the root goes, not into a removed one.
+  closeBeforeRootRemoval(t, paths, () => participant.dispose());
   await participant.checkNow();
   let heldCalls = 0;
   let lockedRounds = 0;
@@ -1608,6 +1609,8 @@ async function openWindow(t, binding, hostBootId, options = {}) {
   if (options.registerAfterMs) await delay(options.registerAfterMs);
   let participant;
   let markReleased;
+  // A reload still under way (a slow one outlives its test): its leaving write lands before the root goes.
+  let releasing;
   const window = {
     log: own,
     released: new Promise((resolve) => { markReleased = resolve; }),
@@ -1627,21 +1630,30 @@ async function openWindow(t, binding, hostBootId, options = {}) {
       push(['release', hostBootId, request.round]);
       const closing = participant;
       participant = undefined;
-      if (options.releaseDelayMs) await delay(options.releaseDelayMs);
-      // extension.ts deactivate: leaving first, the Runtime (liveness) closes, then the registration goes.
-      await closing.dispose();
-      await fs.rm(liveness, { force: true });
-      await closing.unregister();
+      releasing = (async () => {
+        if (options.releaseDelayMs) await delay(options.releaseDelayMs);
+        // extension.ts deactivate: leaving first, the Runtime (liveness) closes, then the registration goes.
+        await closing.dispose();
+        await fs.rm(liveness, { force: true });
+        await closing.unregister();
+      })();
+      await releasing;
       markReleased();
     },
     notifyWaiting: (_request, reason) => push(['waiting', hostBootId, reason.kind])
   }, { pollMs: options.pollMs ?? 10, processId: options.processId ?? (nextFakeProcessId += 1) });
   await participant.checkNow();
-  t.after(async () => {
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await releasing?.catch(() => undefined);
     await participant?.dispose();
     await fs.rm(liveness, { force: true });
     await participant?.unregister();
-  });
+  };
+  // Closed before its root is removed (createRoot): a participant still polling writes answers there.
+  closeBeforeRootRemoval(t, binding.paths, close);
   return window;
 }
 
@@ -1685,13 +1697,35 @@ async function exitedProcessId() {
   return child.pid;
 }
 
+/** The windows opened on each root (openWindow), by its data root path: stopped before the root is removed. */
+const windowsOfRoot = new Map();
+
+/**
+ * A participant's close (dispose, unregister): run before its root is removed (createRoot's hook), and
+ * also on its own; once only. A participant still polling, or marking itself leaving, writes into the
+ * root and must not do so while or after it is removed (ENOTEMPTY, an empty tree left behind).
+ */
+function closeBeforeRootRemoval(t, paths, close) {
+  let closed;
+  const once = () => (closed ??= Promise.resolve().then(close));
+  windowsOfRoot.get(paths.dataRootPath)?.push(once);
+  t.after(once);
+}
+
 async function createRoot(t) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-exclusive-maintenance-'));
-  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  const windows = [];
+  // Hooks run in the order they were added, and this one comes before the windows' own: it stops
+  // their polling first, so none writes into the root while it is removed (ENOTEMPTY).
+  t.after(async () => {
+    for (const close of windows.splice(0)) await close();
+    await fs.rm(parent, { recursive: true, force: true });
+  });
   const root = path.join(parent, 'global');
   await fs.mkdir(root);
   const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
   const binding = await kernel.initializeEmptyRuntimeRoot(authority);
+  windowsOfRoot.set(binding.paths.dataRootPath, windows);
   return { root, binding, paths: binding.paths };
 }
 
