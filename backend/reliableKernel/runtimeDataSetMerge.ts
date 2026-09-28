@@ -3704,7 +3704,18 @@ async function settleTargetBackup(
 async function pruneTargetBackups(target: TargetContext, keep: readonly string[]): Promise<void> {
   const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
   const names = await targetBackupsByAge(backups);
-  for (const name of names.slice(0, Math.max(0, names.length - RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION))) {
+  // A large-merge preparation's backup its window still holds (it may be waiting for the other windows):
+  // its session needs it, so it is neither pruned nor counted as one of the kept ones.
+  const held = new Set<string>();
+  const registered = await readRuntimeLargeMergeTargetBackups({ globalStoragePath: target.configurationRootPath })
+    .catch(() => [] as Array<{ backup?: RuntimeLargeMergeTargetBackup }>);
+  for (const { backup } of registered) {
+    if (backup && path.resolve(path.dirname(backup.backupPath)) === path.resolve(backups) && isRuntimeLargeMergeTargetBackupLive(backup)) {
+      held.add(backup.name);
+    }
+  }
+  const pruned = names.filter((name) => !held.has(name));
+  for (const name of pruned.slice(0, Math.max(0, pruned.length - RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION))) {
     if (!keep.includes(name)) await fs.rm(path.join(backups, name), { recursive: true, force: true });
   }
   await syncDirectoryDurably(backups);
