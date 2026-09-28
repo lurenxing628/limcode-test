@@ -741,12 +741,17 @@ class PreparationClaims {
 
   /**
    * The backup was settled (kept, or removed): its registration goes, after any write still on its
-   * way. A backup that could not be removed (`settled` false) keeps it, no longer refreshed: the
-   * pruning of preparations removes both once this window is gone.
+   * way. A backup that could not be removed (`settled` false; no transaction used it) keeps it, no
+   * longer refreshed and marked unused again (a session that merged nothing leaves no pre-merge
+   * backup): the pruning of preparations removes both once this window is gone.
    */
   public async releaseBackup(settled = true): Promise<void> {
     const backup = this.backup;
     if (!backup) return;
+    if (!settled && backup.used) {
+      this.backup = { ...backup, used: false };
+      await this.persistBackup().catch(() => undefined);
+    }
     this.backup = undefined;
     if (this.held.size === 0) this.stopHeartbeat();
     await this.backupWrites;
@@ -1743,7 +1748,8 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
       const settled = await engine.settleTargetBackup(target, { ...(internals.earlierBackup ? { keep: internals.earlierBackup } : {}) })
         .then(() => true, () => false);
       backupSettled = true;
-      // A used backup stays as the pre-merge backup; an unused one that could not be removed stays registered.
+      // A used backup stays as the pre-merge backup; an unused one that could not be removed stays
+      // registered, as unused again (marked used before the first source), for the pruning to remove.
       await internals.claims.releaseBackup(used || settled);
       measured.sessionMs += performance.now() - closingAt;
     }

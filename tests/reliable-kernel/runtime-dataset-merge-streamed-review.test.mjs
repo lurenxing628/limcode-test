@@ -207,7 +207,7 @@ test('会话开始前准备的备份已经不在（被清理了）：整批推�
   assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
 });
 
-test('没用上的备份这次删不掉（EBUSY）：登记保留，不再刷新心跳；窗口不在之后下一次清理把备份和登记一起删掉', { timeout: 300_000 }, async (t) => {
+test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什么也没合并时）：登记保留（会话开始前记为用过的改回没用过），不再刷新心跳；窗口不在之后下一次清理把备份和登记一起删掉', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
@@ -235,8 +235,37 @@ test('没用上的备份这次删不掉（EBUSY）：登记保留，不再刷新
   await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits }));
   assert.deepEqual(await targetBackups(fixture), [path.basename(backup)], '本窗口还在：不删');
   await rewriteRegistration(fixture, registration.name, { processId: await deadProcessId() });
-  await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits }));
+  const batch = (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
+  await withWindow(fixture, batch);
   assert.deepEqual(await targetBackups(fixture), []);
+  assert.deepEqual(await registrations(fixture), []);
+
+  // A session that merged nothing (cancelled before its first source; marked used before it) and could not remove the backup.
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+  }));
+  backup = preparation.backupPath;
+  const cancelled = new AbortController();
+  cancelled.abort();
+  fsPromises.rm = async (target, ...rest) => {
+    if (path.resolve(String(target)) === path.resolve(backup)) {
+      throw Object.assign(new Error(`EBUSY: resource busy or locked, rm '${target}'`), { code: 'EBUSY', syscall: 'rm' });
+    }
+    return rm(target, ...rest);
+  };
+  let session;
+  try {
+    session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+      () => runLargeMergeSession({ paths: fixture.paths, prepared: preparation, signal: cancelled.signal })));
+  } finally {
+    fsPromises.rm = rm;
+  }
+  assert.deepEqual(session.results.map((result) => [result.state, result.reason]), [['not-run', 'cancelled']]);
+  const [unused] = await registrations(fixture);
+  assert.deepEqual([unused?.name, unused?.used], [path.basename(backup), false], '会话什么也没合并：登记保留，改回没用过');
+  await rewriteRegistration(fixture, unused.name, { processId: await deadProcessId() });
+  await withWindow(fixture, batch);
+  assert.deepEqual(await targetBackups(fixture), [], '窗口不在之后连同备份删掉');
   assert.deepEqual(await registrations(fixture), []);
 });
 
