@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
 import type { RuntimeRootPaths } from '../backend/reliableKernel/contracts';
 import {
-  requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
-  startExclusiveMaintenanceParticipant as startProtocolParticipant,
+  readExclusiveMaintenanceRefusal, requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
+  startExclusiveMaintenanceParticipant as startProtocolParticipant, type ExclusiveMaintenanceRefusal,
   type ExclusiveMaintenanceBusy, type ExclusiveMaintenanceOperation, type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress,
   type ExclusiveMaintenanceConfirmContext, type RuntimeExclusiveMaintenanceInput, type RuntimeExclusiveMaintenanceOutcome,
   type RuntimeExclusiveMaintenanceRunInput, type RuntimeExclusiveMaintenanceRequest
@@ -211,6 +211,24 @@ export async function runWithExclusiveMaintenance<T>(
     gaveWay = { text: `${activity}没有进行：${outcome.reason}`, requestId: outcome.gaveWayTo };
   }
   return outcome;
+}
+
+/**
+ * Read-only, before asking the user anything (a countdown, a confirmation): whether this operation
+ * called now as runWithExclusiveMaintenance calls it would be refused before any window is asked —
+ * the cooldown, the key's backoff or a blocked key — with the reason, which says when it can be
+ * tried again. An explicit call's requester token kept in windowState is read, never created.
+ * Records nothing; the call itself checks again.
+ */
+export async function exclusiveMaintenanceRefusal(
+  paths: RuntimeRootPaths,
+  input: Pick<RuntimeExclusiveMaintenanceInput, 'operation' | 'operationKey' | 'ignoreBackoff' | 'requesterHostBootId'>
+    & { windowState?: ExclusiveMaintenanceWindowState }
+): Promise<ExclusiveMaintenanceRefusal | undefined> {
+  const { windowState: givenState, ...query } = input;
+  const state = givenState ?? windowState;
+  const requesterToken = query.ignoreBackoff && state ? requesterTokens(state)[query.operation] : undefined;
+  return readExclusiveMaintenanceRefusal(paths, { ...query, ...(requesterToken !== undefined ? { requesterToken } : {}) });
 }
 
 /**

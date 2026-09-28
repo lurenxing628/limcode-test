@@ -364,6 +364,40 @@ export async function clearExclusiveMaintenanceKey(paths: RuntimeRootPaths, oper
   await removeWithRetry(path.join(ledgerDirectory(paths), keyLedgerName(requireText(operation, 'operation'), requireText(operationKey, 'operationKey'))));
 }
 
+/** Why a call made now would be refused before any window is asked (readExclusiveMaintenanceRefusal). */
+export interface ExclusiveMaintenanceRefusal {
+  state: 'backoff' | 'blocked';
+  /** The reason the call would give, with when it can be tried again. */
+  reason: string;
+  /** When the backoff or cooldown runs out (ISO); absent for a blocked key. */
+  retryAfter?: string;
+}
+
+/**
+ * Read-only; it records and decides nothing: whether a call of this operation made now would be
+ * refused before it asks any window — a key blocked for automatic calls, or, while other windows
+ * are open, the operation's cooldown or the key's backoff (automatic calls) — with the reason the
+ * call would give, so a caller can say so before asking the user anything (a countdown). Without
+ * an operationKey only the cooldown is looked at. The call itself checks all of it again.
+ */
+export async function readExclusiveMaintenanceRefusal(
+  paths: RuntimeRootPaths,
+  input: Pick<RuntimeExclusiveMaintenanceInput,
+    'operation' | 'operationKey' | 'ignoreBackoff' | 'requesterToken' | 'requesterHostBootId' | 'backoffMaxMs' | 'cooldownAfterCoordinatedMs'>
+): Promise<ExclusiveMaintenanceRefusal | undefined> {
+  const operation = requireText(input.operation, 'operation');
+  const operationKey = input.operationKey === undefined ? undefined : requireText(input.operationKey, 'operationKey');
+  if (operationKey !== undefined && !input.ignoreBackoff) {
+    const blocked = await readKeyBlock(paths, operation, operationKey);
+    if (blocked) return { state: 'blocked', reason: blocked };
+  }
+  // As the call's gate: backoff and cooldown hold only while other windows would be asked.
+  const others = await listActiveRuntimeHosts(paths, input.requesterHostBootId !== undefined ? { exceptHostBootId: input.requesterHostBootId } : {});
+  if (others.length === 0) return undefined;
+  const refusal = await readActiveBackoff(paths, operation, operationKey, input);
+  return refusal ? { state: 'backoff', reason: refusal.reason, retryAfter: refusal.until } : undefined;
+}
+
 function assertLocksHeld(paths: RuntimeRootPaths, input: RuntimeExclusiveMaintenanceInput): void {
   if (!isRuntimeMaintenanceHeld(paths)) {
     throw new Error('独占维护必须在目标数据集的 maintenance 锁内发起。');
@@ -1410,8 +1444,9 @@ async function readKeyBlock(paths: RuntimeRootPaths, operation: string, operatio
 async function readActiveBackoff(
   paths: RuntimeRootPaths,
   operation: string,
-  operationKey: string,
-  input: RuntimeExclusiveMaintenanceInput
+  /** Undefined: only the operation's cooldown (readExclusiveMaintenanceRefusal before the key is known). */
+  operationKey: string | undefined,
+  input: Pick<RuntimeExclusiveMaintenanceInput, 'ignoreBackoff' | 'requesterToken' | 'backoffMaxMs' | 'cooldownAfterCoordinatedMs'>
 ): Promise<{ until: string; reason: string } | undefined> {
   const maxMs = Math.max(
     input.backoffMaxMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.backoffMaxMs,
@@ -1428,7 +1463,7 @@ async function readActiveBackoff(
     if (!input.ignoreBackoff || !sameRequester) entries.push(cooldown);
   }
   // An explicit user request skips the key's backoff.
-  if (!input.ignoreBackoff) {
+  if (!input.ignoreBackoff && operationKey !== undefined) {
     const key = await readLedger(paths, keyLedgerName(operation, operationKey));
     if (key) entries.push(key);
   }

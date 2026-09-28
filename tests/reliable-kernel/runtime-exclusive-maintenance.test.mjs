@@ -29,8 +29,8 @@ const {
   runtimeDataRootAdmissionClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance, withRuntimeMaintenanceActivity
 } = kernelFile('runtimeHostControl.js');
 const {
-  clearExclusiveMaintenanceKey, createProtocolProcessClassifier, readExclusiveMaintenanceRequests, registerExclusiveMaintenanceParticipant,
-  requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory,
+  clearExclusiveMaintenanceKey, createProtocolProcessClassifier, readExclusiveMaintenanceRefusal, readExclusiveMaintenanceRequests,
+  registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory,
   startExclusiveMaintenanceParticipant
 } = kernelFile('runtimeExclusiveMaintenance.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
@@ -555,6 +555,47 @@ test('确定性失败只拦自动调用：用户明确重试照常执行，成�
   assert.equal((await request(paths, deterministic, async () => assert.fail('must not run'))).state, 'blocked');
   await clearExclusiveMaintenanceKey(paths, deterministic.operation, deterministic.operationKey);
   assert.equal((await request(paths, deterministic, async () => 'cleared')).state, 'completed');
+});
+
+test('大库会话：只读查询“现在发起会不会在询问任何窗口之前被挡住”与调用本身一致——冷却（按操作，写明何时可以再试；发起方凭标识越过）、按键退避与确定性失败（只拦自动调用）；没有其它窗口时不挡；不给键只看冷却；查询什么都不写', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const ledger = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'ledger');
+  const ledgerFiles = async () => {
+    const names = await fs.readdir(ledger).catch(() => []);
+    return Promise.all(names.sort().map(async (name) => [name, await fs.readFile(path.join(ledger, name), 'utf8')]));
+  };
+  const input = { ...BASE, operationKey: 'large-merge:a' };
+  const query = (overrides = {}) => readExclusiveMaintenanceRefusal(paths, { operation: input.operation, operationKey: input.operationKey, ignoreBackoff: false, ...overrides });
+  assert.equal(await query(), undefined, 'nothing recorded');
+  // A coordinated go (another window yielded), then the operation failed: key backoff and the operation's cooldown.
+  await openWindow(t, binding, 'peer-1');
+  await assert.rejects(request(paths, { ...input, ignoreBackoff: true, requesterToken: 'asked-here' }, async () => { throw new Error('合并时出错'); }), /合并时出错/);
+  // No other window open now: the call's gate would not look at backoff or cooldown either.
+  assert.equal(await query(), undefined, 'alone: not refused');
+  await openWindow(t, binding, 'peer-2');
+  const before = await ledgerFiles();
+  const automatic = await query();
+  assert.equal(automatic.state, 'backoff');
+  assert.match(automatic.reason, /约 \d+ 分钟后（\d\d:\d\d 以后）可以再试。$/);
+  assert.ok(Date.parse(automatic.retryAfter) > Date.now());
+  // The call itself says the same.
+  const called = await request(paths, input, async () => assert.fail('must not run'));
+  assert.deepEqual([called.state, called.reason], [automatic.state, automatic.reason]);
+  // Without the key (before the work is known): the cooldown alone.
+  assert.equal((await query({ operationKey: undefined })).state, 'backoff');
+  // An explicit call: past the key's backoff, not past the cooldown, unless it carries the token of the call that published go.
+  assert.equal((await query({ ignoreBackoff: true })).state, 'backoff');
+  assert.equal(await query({ ignoreBackoff: true, requesterToken: 'asked-here' }), undefined);
+  assert.equal(await query({ ignoreBackoff: true, requesterToken: 'asked-here', operationKey: undefined }), undefined);
+  assert.deepEqual(await ledgerFiles(), before, 'the query writes nothing');
+  // A key blocked by a deterministic failure: automatic calls only, whether or not other windows are open.
+  const blockedRoot = await createRoot(t);
+  const deterministic = { ...BASE, operationKey: 'large-merge:b', isDeterministicFailure: () => true };
+  await assert.rejects(request(blockedRoot.paths, deterministic, async () => { throw new Error('来源格式不对'); }));
+  const blocked = await readExclusiveMaintenanceRefusal(blockedRoot.paths, { operation: BASE.operation, operationKey: 'large-merge:b', ignoreBackoff: false });
+  assert.equal(blocked.state, 'blocked');
+  assert.equal(blocked.reason, (await request(blockedRoot.paths, deterministic, async () => assert.fail('must not run'))).reason);
+  assert.equal(await readExclusiveMaintenanceRefusal(blockedRoot.paths, { operation: BASE.operation, operationKey: 'large-merge:b', ignoreBackoff: true }), undefined);
 });
 
 test('发起方自己窗口的忙也要等：锁外等待它空闲；abandon 模式直接放弃', async (t) => {
