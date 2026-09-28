@@ -38,6 +38,8 @@ const PREPARATIONS = 'preparing';
 const TARGET_BACKUPS = 'preparing-backups';
 /** Content digest prefix of a data set whose content could not be read (see runtimeDataSetFingerprint). */
 const UNREADABLE_DIGEST = 'unreadable:';
+const PROMPTS = 'prompts';
+const PROMPT_KIND = 'limcode-runtime-data-set-merge-prompt';
 /** The id of a foreign history root (runtimeForeignHistory.foreignRuntimeHistoryId). */
 const FOREIGN_ID = /^foreign:(archive|copied):[0-9a-f]{16}$/;
 
@@ -731,6 +733,32 @@ export async function restoreRuntimeDataSetMergeLedgerRecord(paths: StoragePaths
 /** Drops a record, e.g. a committing record whose transaction is proven rolled back. */
 export async function removeRuntimeDataSetMergeLedgerRecord(paths: StoragePaths, candidateId: string): Promise<void> {
   await removeLedgerJson(paths, RECORDS, candidateId);
+}
+
+/** Which window of which VS Code session asks the user something once (prompts/<name>.json); advisory only. */
+export interface RuntimeDataSetMergePrompt {
+  kind: typeof PROMPT_KIND;
+  sessionId: string;
+  processId: number;
+  processStartIdentity?: string;
+  claimedAt: string;
+}
+
+export async function readRuntimeDataSetMergePrompt(paths: StoragePaths, name: string): Promise<RuntimeDataSetMergePrompt | undefined> {
+  let value: Partial<RuntimeDataSetMergePrompt>;
+  try { value = JSON.parse(await fs.readFile(await ledgerFile(paths, PROMPTS, name), 'utf8')) as Partial<RuntimeDataSetMergePrompt>; }
+  catch { return undefined; }
+  if (value?.kind !== PROMPT_KIND || typeof value.sessionId !== 'string' || !Number.isSafeInteger(value.processId)
+    || (value.processStartIdentity !== undefined && typeof value.processStartIdentity !== 'string')) return undefined;
+  return value as RuntimeDataSetMergePrompt;
+}
+
+export async function writeRuntimeDataSetMergePrompt(
+  paths: StoragePaths,
+  name: string,
+  prompt: Omit<RuntimeDataSetMergePrompt, 'kind' | 'claimedAt'>
+): Promise<void> {
+  await writeLedgerJson(paths, PROMPTS, name, { kind: PROMPT_KIND, ...prompt, claimedAt: new Date().toISOString() });
 }
 
 /** A recorded, still applicable failure of this exact source state (for startup data-set choice). */

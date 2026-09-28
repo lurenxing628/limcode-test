@@ -41,7 +41,7 @@ function fixture({
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
   mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
-  emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState
+  emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState, undecidedClaim = true
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current', source: 'legacy' };
   const old = { id: 'workspace:old', ...(emptyOld ? {} : { dataSetId: 'old', rootInstanceId: 'old-instance' }), runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
@@ -109,6 +109,9 @@ function fixture({
         return mergeReport;
       },
       readRuntimeDataSetMergeStates: async () => new Map(Object.entries(mergeStates)),
+      // The prompt record about data sets switched away from in an earlier version, and the answer “保持分开”.
+      claimRuntimeDataSetUndecidedPrompt: async (_paths, input) => { calls.push(['undecided-claim', input.sessionId]); return undecidedClaim; },
+      keepRuntimeDataSetsApart: async (_paths, ids) => { calls.push(['keep-apart', [...ids]]); },
       RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE: 'runtime-data-set-merge-awaiting-exclusive',
       // Not the shipped values: the confirmation must say whatever the engine's bounds are.
       RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS: { maxRows: 1234, maxBytes: 5 * 1024 * 1024 },
@@ -1330,4 +1333,73 @@ test('盲审2 merge #8：同一进程的合并批次排队执行：启动批次�
   await startup;
   await manual;
   assert.deepEqual(order, ['start startup', 'end startup', 'start workspace:old', 'end workspace:old']);
+});
+
+test('盲审2 merge #2：启动批次里等用户决定的库（以前的版本里切走的）由一个窗口问一次：保持分开记为保留；全部合并先确认，再记录请求按明确请求合并；关掉不选什么都不做', async () => {
+  const undecided = emptyMergeReport({ undecided: [{ candidateId: 'workspace:old', databaseBytes: 2048 }] });
+  const summaries = { 'workspace:old': { projectNames: ['旧项目'], conversationCount: 2 } };
+  const question = '以前的版本里你切换过当前历史库。要把下面这些历史库合并进当前库吗？原库保留，可随时查看。旧项目（2 KiB）';
+
+  const apart = fixture({ mergeReport: undecided, summaries, informationChoice: '保持分开' });
+  await apart.mergeHistoricalDataSetsInBackground(apart.context, mergeHost());
+  await settle(() => apart.calls.some(call => call[0] === 'keep-apart'));
+  assert.deepEqual(plain(apart.calls.filter(call => ['undecided-claim', 'keep-apart', 'info', 'merge-request'].includes(call[0]))), [
+    ['undecided-claim', ''], ['info', question], ['keep-apart', ['workspace:old']],
+    ['info', '已保持分开，这些库不会自动合并；需要时可在“历史与存储管理”里选择“合并到当前库”。']
+  ]);
+  assert.equal(apart.calls.filter(call => call[0] === 'merge-online').length, 1, '没有再合并');
+
+  const all = fixture({ mergeReport: undecided, summaries, informationChoice: '全部合并', confirmation: '合并' });
+  await all.mergeHistoricalDataSetsInBackground(all.context, mergeHost());
+  await settle(() => all.calls.filter(call => call[0] === 'merge-online').length === 2);
+  const confirm = all.calls.find(call => call[0] === 'warning');
+  assert.equal(confirm[1], '把这些历史库合并到当前库？');
+  assert.match(confirm[2].detail, /^来源：\/fixture\/old\n\n在后台合并/);
+  assert.match(confirm[2].detail, /原库里中断的任务按“中止”收尾/);
+  assert.deepEqual(plain(all.calls.filter(call => ['merge-request', 'merge-online', 'keep-apart'].includes(call[0]))), [
+    ['merge-online', 'this-window', true, null], ['merge-request', 'workspace:old', 'old', 'old-instance'],
+    ['merge-online', 'this-window', true, ['workspace:old']]
+  ], '确认之后记录请求，再按明确请求合并（大小分流照常）');
+
+  const declined = fixture({ mergeReport: undecided, summaries, informationChoice: '全部合并', confirmation: undefined });
+  await declined.mergeHistoricalDataSetsInBackground(declined.context, mergeHost());
+  await settle(() => declined.calls.some(call => call[0] === 'warning'));
+  assert.equal(declined.calls.some(call => ['merge-request', 'keep-apart'].includes(call[0])), false, '确认框取消：什么都不做');
+
+  const closed = fixture({ mergeReport: undecided, summaries });
+  await closed.mergeHistoricalDataSetsInBackground(closed.context, mergeHost());
+  await settle(() => closed.calls.some(call => call[0] === 'info'));
+  await settle(() => false);
+  assert.equal(closed.calls.some(call => ['merge-request', 'keep-apart', 'warning'].includes(call[0])), false, '关掉不选：下次启动再问');
+
+  const other = fixture({ mergeReport: undecided, summaries, undecidedClaim: false, informationChoice: '保持分开' });
+  await other.mergeHistoricalDataSetsInBackground(other.context, mergeHost());
+  await settle(() => false);
+  assert.equal(other.calls.some(call => ['info', 'keep-apart'].includes(call[0])), false, '另一个窗口在问（或这次会话问过）');
+
+  const explicit = fixture({ mergeReport: undecided, summaries, informationChoice: '保持分开' });
+  await explicit.mergeHistoricalDataSetsInBackground(explicit.context, mergeHost(), () => true, ['workspace:old']);
+  await settle(() => false);
+  assert.equal(explicit.calls.some(call => call[0] === 'undecided-claim'), false, '用户点的那次合并不问');
+
+  // Answered while this window is frozen for a data-directory operation: nothing recorded, asked again later.
+  const refused = '正在迁移数据目录，完成后再操作。';
+  for (const [choice, what] of [['保持分开', '记下“保持分开”'], ['全部合并', '合并到当前库']]) {
+    const frozen = fixture({ mergeReport: undecided, summaries, informationChoice: choice, confirmation: '合并' });
+    const host = { ...mergeHost(), writeGate: { admit() { throw new Error(refused); } } };
+    await frozen.mergeHistoricalDataSetsInBackground(frozen.context, host);
+    await settle(() => frozen.calls.some(call => call[0] === 'warning'));
+    assert.deepEqual(frozen.calls.filter(call => ['keep-apart', 'merge-request'].includes(call[0])), [], choice);
+    assert.equal(frozen.calls.filter(call => call[0] === 'merge-online').length, 1, `${choice}：只有启动批次`);
+    assert.ok(frozen.calls.some(call => call[0] === 'warning' && call[1] === `现在不能${what}：${refused}没有做任何改动。`),
+      `${choice}: ${JSON.stringify(frozen.calls.filter(call => call[0] === 'warning'))}`);
+  }
+  // Frozen while the confirmation of “全部合并” was open.
+  let checks = 0;
+  const late = fixture({ mergeReport: undecided, summaries, informationChoice: '全部合并', confirmation: '合并' });
+  const lateHost = { ...mergeHost(), writeGate: { admit() { if ((checks += 1) > 1) throw new Error(refused); } } };
+  await late.mergeHistoricalDataSetsInBackground(late.context, lateHost);
+  await settle(() => checks > 1 && late.calls.some(call => call[0] === 'warning' && String(call[1]).startsWith('现在不能')));
+  assert.deepEqual(late.calls.filter(call => call[0] === 'merge-request'), []);
+  assert.equal(checks, 2);
 });

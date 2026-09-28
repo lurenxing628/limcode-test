@@ -58,6 +58,7 @@ export const VSCODE_LEGACY_WORKSPACE_RUNTIME_OWNER_DIRECTORY = 'runtime-owner';
 const WORKSPACE_RUNTIME_ID_DOMAIN = 'limcode-vscode-workspace-runtime\0';
 const RUNTIME_SELECTION_KIND = 'limcode-runtime-selection';
 const RUNTIME_DATA_SET_KEPT_KIND = 'limcode-runtime-data-set-kept';
+const UPGRADE_SELECTION_KIND = 'limcode-runtime-upgrade-selection';
 
 export type VscodeWorkspaceRuntimeScopeKind =
   | 'workspace-file'
@@ -339,6 +340,8 @@ export async function selectVscodeRuntimeDataSet(
     const candidate = await inspectCandidate(root, id, previous, previous?.id === id && !previous.initialized);
     if (previous?.id === id) return candidate;
     await assertConfigurationRootRuntimesOffline(root);
+    // Before this version's first switch moves it: what the selection said when this version came.
+    if (previous) await vscodeRuntimeSwitchedBeforeUpgrade({ globalStoragePath: root }, true).catch(() => undefined);
     // Switching away is an explicit decision to keep that data set apart: it is never merged
     // automatically afterwards. Data sets from before this version carry no such record. The
     // record is written before the selection moves; a readable data set that cannot be marked is
@@ -362,6 +365,39 @@ export async function selectVscodeRuntimeDataSet(
     await publishSelection(root, id, true, previous);
     return Object.freeze({ ...candidate, selected: true });
   });
+}
+
+/**
+ * Whether the user switched data sets before this version: 0.0.24–0.0.30 had “切换当前历史库” but
+ * wrote no kept marker (isVscodeRuntimeDataSetKept), so a data set switched away from then looks like
+ * one an older version left. Judged on the selection revision this version found before it first
+ * switched, sealed a fresh selection or picked merge sources (0 without a selection), recorded then in
+ * the merge ledger (`upgrade/selection.json`, when `record`; an estimate only reads) and read from then
+ * on, so a switch in this version (which marks the data set kept) changes nothing. Unreadable: as
+ * switched. Call under the configuration admission.
+ */
+export async function vscodeRuntimeSwitchedBeforeUpgrade(
+  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
+  record: boolean
+): Promise<boolean> {
+  const root = path.resolve(paths.globalStoragePath);
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: root }), 'upgrade', 'selection.json');
+  await assertSafeRootPath(root, file);
+  let value: unknown;
+  try { value = await readOptionalJson(file); }
+  catch { return true; }
+  if (value !== undefined) {
+    const found = value as { kind?: unknown; selectionRevision?: unknown } | null;
+    return found?.kind !== UPGRADE_SELECTION_KIND || !Number.isSafeInteger(found.selectionRevision) || Number(found.selectionRevision) > 1;
+  }
+  const selectionRevision = (await readRuntimeDataSetSelection(root))?.selectionRevision ?? 0;
+  if (record) {
+    // Not recorded (e.g. no room): recorded later, on a revision that is then at most higher (never merged more).
+    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+      .then(() => writeJsonFileDurably(file, { kind: UPGRADE_SELECTION_KIND, selectionRevision, recordedAt: new Date().toISOString() }))
+      .catch(() => undefined);
+  }
+  return selectionRevision > 1;
 }
 
 /** Configuration-root merge ledger; see {@link VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY}. */
@@ -428,18 +464,19 @@ async function markRuntimeDataSetKept(
 ): Promise<void> {
   const file = keptMarkerPath(candidate);
   await assertSafeRootPath(candidate.configurationRootPath, file);
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   const identity = candidate.dataSetId && candidate.rootInstanceId
     ? { dataSetId: candidate.dataSetId, rootInstanceId: candidate.rootInstanceId }
     : { anyIncarnation: true };
+  await writeJsonFileDurably(file, { kind: RUNTIME_DATA_SET_KEPT_KIND, ...identity, keptAt: new Date().toISOString() });
+}
+
+/** Written whole or not at all (a temporary file, synced, renamed, its directory synced). */
+async function writeJsonFileDurably(file: string, value: unknown): Promise<void> {
+  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
     const handle = await fs.open(temporary, 'wx', 0o600);
     try {
-      await handle.writeFile(`${JSON.stringify({
-        kind: RUNTIME_DATA_SET_KEPT_KIND,
-        ...identity,
-        keptAt: new Date().toISOString()
-      }, null, 2)}\n`, 'utf8');
+      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
       await handle.sync();
     } finally {
       await handle.close();
@@ -465,7 +502,10 @@ export async function completeVscodeRuntimeDataSetSelection(
     if (!selection) throw new VscodeRuntimeDataSetError('当前运行数据集选择不存在。');
     const candidate = await inspectCandidate(root, selection.id, selection, false);
     if (candidate.requiresRecovery) throw new VscodeRuntimeDataSetError('运行数据集必须先完成现有cutover恢复。');
-    if (!selection.initialized) await publishSelection(root, selection.id, true, selection);
+    if (selection.initialized) return;
+    // Sealing a fresh root is no switch: the revision this version found is recorded before it moves.
+    await vscodeRuntimeSwitchedBeforeUpgrade({ globalStoragePath: root }, true).catch(() => undefined);
+    await publishSelection(root, selection.id, true, selection);
   });
 }
 

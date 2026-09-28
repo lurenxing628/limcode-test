@@ -29,8 +29,12 @@ export {
  * | queued ordinary TurnIntent (user message waiting)  | TurnControlPlane.cancelGuidance                  |
  * | everything below                                   | refused, with the reason and what the user can do |
  */
-/** Reason of a Turn closed before merging a data set an earlier version left behind. */
-export const MERGE_FINALIZATION_REASON = '旧版本升级时中断，合并前收尾。';
+/**
+ * Reason of a Turn closed before merging a data set last used in an earlier version (one opened and
+ * switched away from in this version is kept, see KEPT_MERGE_FINALIZATION_REASON): it was interrupted
+ * there, which says nothing about how (an upgrade, a switch, a closed window).
+ */
+export const MERGE_FINALIZATION_REASON = '在旧版本里中断，合并前收尾。';
 /** Reason of a Turn closed before merging a data set the user switched away from in this version. */
 export const KEPT_MERGE_FINALIZATION_REASON = '合并前收尾。';
 

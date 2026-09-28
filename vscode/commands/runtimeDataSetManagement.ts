@@ -11,10 +11,11 @@ import {
 } from '../../backend/reliableKernel/runtimeDataSetHistory';
 import { upgradeDiscoveredRuntimeDataSets, upgradeRuntimeDataSet } from '../../backend/reliableKernel/runtimeDataSetUpgrade';
 import {
+  claimRuntimeDataSetUndecidedPrompt, keepRuntimeDataSetsApart,
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE,
   RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS,
   withRuntimeDataSetReadClaims,
-  type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts,
+  type RuntimeDataSetExclusiveOutcome, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergedFacts, type RuntimeDataSetUndecidedSource,
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeResult, type RuntimeDataSetMergeState, type RuntimeDataSetOversizedMerge
 } from '../../backend/reliableKernel/runtimeDataSetMerge';
 import { summarizeRuntimeDataSet, type RuntimeDataSetSummary } from '../../backend/reliableKernel/runtimeDataSetPreflight';
@@ -115,6 +116,7 @@ function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
   }
   if (merge.state === 'blocked' || merge.state === 'failed') return merge.lastMerged ? ' · 之前合并过，再次合并未成功' : ' · 未能合并';
   if (merge.state === 'requested') return ' · 等待合并';
+  if (merge.state === 'undecided') return ' · 以前的版本里切换走的库（等你决定是否合并）';
   if (merge.state === 'too-large') return ` · 约 ${formatLargeMergeRowsWithUnit(merge.rows)}记录，超过当前版本能安全合并的规模`;
   return ' · 你保留的库（不自动合并）';
 }
@@ -527,6 +529,11 @@ export async function mergeHistoricalDataSetsInBackground(
   // Which sources wait for the large merge session now (the management menu and list show them).
   largeMergeEngine().noteBatch(paths, report);
   await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent, candidateIds !== undefined);
+  if (!candidateIds && report.undecided?.length && stillCurrent()) {
+    // Not awaited: the question stays until answered or closed; the startup goes on.
+    void offerUndecidedMerge(context, host, report.undecided, stillCurrent)
+      .catch(error => console.error('[LimCode] 询问是否合并以前切换走的历史库时出错。', error));
+  }
   const session = largeMergeSessionSources(report);
   if (session.length > 0 && isLargeHistoricalMergeHost(host) && stillCurrent()) {
     const options = largeMergeOptions(context, paths.globalStoragePath, stillCurrent);
@@ -540,8 +547,8 @@ export async function mergeHistoricalDataSetsInBackground(
 
 /**
  * Merge batches of this process run one after another (the startup batch, 合并到当前库, a foreign
- * root's merge): two at once would judge, close and copy the same sources side by side, and one could
- * copy a data set the other has open (its SQLite locks released).
+ * root's merge, the answer to the question below): two at once would judge, close and copy the same
+ * sources side by side, and one could copy a data set the other has open (its SQLite locks released).
  */
 let mergeBatches: Promise<unknown> = Promise.resolve();
 
@@ -549,6 +556,56 @@ function oneMergeBatchAtATime<T>(run: () => Promise<T>): Promise<T> {
   const next = mergeBatches.then(run, run);
   mergeBatches = next.catch(() => undefined);
   return next;
+}
+
+/**
+ * Data sets the user may have switched away from in an earlier version (it recorded no such choice):
+ * never merged or closed automatically, asked about once, in one window per VS Code session (the prompt
+ * record, as for the large merge session). “全部合并” merges them as the user's explicit request (the
+ * usual confirmation and size routing); “保持分开” keeps them, merged later only when chosen in
+ * 历史与存储管理; closed without an answer, asked again at the next startup.
+ */
+async function offerUndecidedMerge(
+  context: vscode.ExtensionContext,
+  host: HistoricalMergeHost,
+  sources: readonly RuntimeDataSetUndecidedSource[],
+  stillCurrent: () => boolean
+): Promise<void> {
+  const paths = pathsFor(context);
+  if (!await claimRuntimeDataSetUndecidedPrompt(paths, { sessionId: vscode.env?.sessionId ?? '' })) return;
+  const candidates = (await inspectVscodeRuntimeDataSets(paths)).candidates.filter(candidate => !candidate.selected
+    && candidate.dataSetId && candidate.rootInstanceId && sources.some(source => source.candidateId === candidate.id));
+  if (!candidates.length || !stillCurrent()) return;
+  const names: string[] = [];
+  for (const candidate of candidates) {
+    // Read from a private copy under the library's claims, as the management list reads it.
+    const summary = await withRuntimeDataSetReadClaims(paths, candidate, () => summarizeRuntimeDataSet(candidate)).catch(() => undefined);
+    const bytes = sources.find(source => source.candidateId === candidate.id)?.databaseBytes;
+    names.push(`${dataSetLabel(candidate, undefined, summary, true)}${bytes === undefined ? '' : `（${formatBytes(String(bytes))}）`}`);
+  }
+  if (!stillCurrent()) return;
+  const answer = await vscode.window.showInformationMessage(
+    `以前的版本里你切换过当前历史库。要把下面这些历史库合并进当前库吗？原库保留，可随时查看。${names.join('；')}`, '全部合并', '保持分开');
+  if (!answer || !stillCurrent()) return;
+  // Both answers write: refused (nothing recorded, asked again at the next startup) while this window is
+  // frozen for a data-directory operation, like 合并到当前库.
+  if (answer === '保持分开') {
+    if (await refusedWhileWriteFrozen(host, '记下“保持分开”')) return;
+    await keepRuntimeDataSetsApart(paths, candidates.map(candidate => candidate.id));
+    void vscode.window.showInformationMessage('已保持分开，这些库不会自动合并；需要时可在“历史与存储管理”里选择“合并到当前库”。');
+    return;
+  }
+  if (await refusedWhileWriteFrozen(host, '合并到当前库')) return;
+  const confirmed = await vscode.window.showWarningMessage('把这些历史库合并到当前库？', { modal: true, detail: mergeConfirmationDetail(candidates) }, '合并');
+  if (confirmed !== '合并' || !stillCurrent()) return;
+  // Also when this window froze while the confirmation was open.
+  if (await refusedWhileWriteFrozen(host, '合并到当前库')) return;
+  for (const candidate of candidates) {
+    await requestRuntimeDataSetMerge(paths, {
+      candidateId: candidate.id, expectedDataSetId: candidate.dataSetId!, expectedRootInstanceId: candidate.rootInstanceId!
+    });
+  }
+  await mergeHistoricalDataSetsInBackground(context, host, stillCurrent, candidates.map(candidate => candidate.id));
 }
 
 /**
@@ -794,7 +851,12 @@ function withoutFullStop(text: string): string {
  * other write command, before anything is asked or changed.
  */
 async function refusedWhileFrozen(startup: ApplicationStartup, what: string): Promise<boolean> {
-  const gate = (startup.current() as { writeGate?: { admit(): void } } | undefined)?.writeGate;
+  return refusedWhileWriteFrozen(startup.current(), what);
+}
+
+/** refusedWhileFrozen, for the application at hand (the host a background merge runs for). */
+async function refusedWhileWriteFrozen(application: unknown, what: string): Promise<boolean> {
+  const gate = (application as { writeGate?: { admit(): void } } | undefined)?.writeGate;
   try {
     gate?.admit();
     return false;

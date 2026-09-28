@@ -15,6 +15,7 @@ import {
 } from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
+import { classifyRecordedProcess, ownProcessStartIdentity, type RecordedProcessClassifier } from './runtimeClaimPrimitives';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
   describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, inspectUnfinishedWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
@@ -23,14 +24,14 @@ import {
 import {
   cachedRuntimeDataSetFingerprint, isForeignRuntimeHistoryId, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits,
   readCachedRuntimeDataSetAudit, readCachedRuntimeRootAudit, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization,
-  readRuntimeDataSetMergeLedger, readRuntimeDataSetMergeRecordDamage, rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
+  readRuntimeDataSetMergeLedger, readRuntimeDataSetMergePrompt, readRuntimeDataSetMergeRecordDamage, rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
   readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit, pruneRuntimeDataSetMergePreparations,
   isRuntimeLargeMergeTargetBackupLive, readRuntimeLargeMergeTargetBackups, removeRuntimeLargeMergeTargetBackupFile,
   removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
   restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetConversationsMergedFrom, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
   runtimeDataSetMergeRecordName,
   sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
-  writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
+  writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergePrompt, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetAuditCacheEntry, type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity,
   type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest, type RuntimeDataSetMergeRecordDamage,
   type RuntimeLargeMergeTargetBackup
@@ -57,7 +58,7 @@ import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 import { toSqliteFilePath } from './sqliteFilePath';
 import {
   createVscodeRootAuthority, inspectVscodeRuntimeDataSets, isVscodeRuntimeDataSetKept, legacyWorkspaceRuntimeOwnerState,
-  resolveVscodeRuntimeDataSet, type VscodeRuntimeDataSetCandidate
+  markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataSet, vscodeRuntimeSwitchedBeforeUpgrade, type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
 /**
@@ -351,8 +352,19 @@ export interface RuntimeDataSetMergeBatchResult {
   blocked: RuntimeDataSetMergeIssue[];
   /** The source itself cannot be merged in its current state (format, drift, integrity). */
   failures: RuntimeDataSetMergeIssue[];
+  /**
+   * Data sets the user may have switched away from before this version (vscodeRuntimeSwitchedBeforeUpgrade)
+   * with neither a kept marker nor a record: not merged, nor closed, automatically; the user decides.
+   */
+  undecided?: RuntimeDataSetUndecidedSource[];
   pendingSources: number;
   stopped: boolean;
+}
+
+/** A data set the user decides about (RuntimeDataSetMergeBatchResult.undecided): its SQLite files' size. */
+export interface RuntimeDataSetUndecidedSource {
+  candidateId: string;
+  databaseBytes?: number;
 }
 
 /** The last merge of a data set, judged against the data sets and source files as they are now. */
@@ -372,6 +384,8 @@ export type RuntimeDataSetMergeState =
   | { state: 'blocked' | 'failed'; code: string; message: string; lastMerged?: RuntimeDataSetMergedFacts }
   | { state: 'requested'; requestedAt: string; lastMerged?: RuntimeDataSetMergedFacts }
   | { state: 'kept'; lastMerged?: RuntimeDataSetMergedFacts }
+  /** Switched away from before this version, never merged: merged only when the user decides so (see `undecided`). */
+  | { state: 'undecided'; lastMerged?: never }
   /** Too many rows for one merge transaction in this version (see RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS). */
   | { state: 'too-large'; rows: number; maxRows: number; message: string; lastMerged?: RuntimeDataSetMergedFacts };
 
@@ -673,6 +687,7 @@ async function pickSources(
   const streamedRows = options.sizeLimits?.streamedRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS;
   // Before anything is judged: a source merged into this target after this is another window's.
   const pickedAt = new Date().toISOString();
+  let switchedBefore = false;
   const picked = await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
     const inspection = await inspectVscodeRuntimeDataSets(storagePaths);
     const selected = inspection.candidates.filter((candidate) => candidate.selected);
@@ -681,6 +696,7 @@ async function pickSources(
     const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
     const damage = await readRuntimeDataSetMergeRecordDamage(storagePaths);
     const requests = await readRuntimeDataSetMergeRequests(storagePaths);
+    switchedBefore = await vscodeRuntimeSwitchedBeforeUpgrade(storagePaths, options.readOnly !== true);
     const explicit = options.requested === true && options.candidateIds !== undefined;
     const picked: PickedSource[] = [];
     for (const candidate of inspection.candidates) {
@@ -702,7 +718,8 @@ async function pickSources(
           && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId,
         // Whatever it is kept as or requested for, an interrupted commit (into any data set) converges first.
         converge: interruptedCommit(record, target),
-        elsewhere: record?.state === 'committing' && !interruptedCommit(record, target)
+        elsewhere: record?.state === 'committing' && !interruptedCommit(record, target),
+        undecided: switchedBefore && !record && !damaged
       };
       if (options.candidateIds && !options.candidateIds.includes(candidate.id)) {
         // Its request stays with an interrupted commit: the commit may have happened (see below).
@@ -784,6 +801,8 @@ async function pickSources(
       }
       if (!keepGoing()) break;
       if (!await convergeInterruptedCommit(storagePaths, target, source, report)) continue;
+      // A local data set whose commit proved to be none is judged as any other, on its record put back.
+      if (source.candidate) source.undecided = switchedBefore && !source.record;
     }
     if (source.elsewhere && !options.readOnly) {
       if (!keepGoing()) break;
@@ -798,6 +817,7 @@ async function pickSources(
       // Judged as any other now, on its record as that commit left it (merged there, or put back).
       const record = (await readRuntimeDataSetMergeLedger(storagePaths)).get(source.id);
       source.record = record && sameRuntimeDataSetIdentity(record.source, source.candidate!) ? record : undefined;
+      source.undecided = switchedBefore && !source.record;
       source.unjudged = true;
     }
     if (source.unjudged) {
@@ -841,6 +861,8 @@ interface PickedSource {
   converge?: boolean;
   /** A local data set's interrupted commit into another data set: converged first (convergeElsewhere). */
   elsewhere?: boolean;
+  /** See RuntimeDataSetMergeBatchResult.undecided. */
+  undecided?: boolean;
 }
 
 /**
@@ -940,6 +962,16 @@ async function selectSource(
   // still converges.
   if (!pending && ((record && record.state !== 'committing' && runtimeDataSetLastMerge(record))
     || source.foreign !== undefined || await isVscodeRuntimeDataSetKept(source.candidate!))) {
+    await expire();
+    return 'skip';
+  }
+  // Maybe switched away from before this version, which wrote no kept marker: the user decides (the
+  // batch lists it, one window asks); nothing of it is merged or closed automatically meanwhile.
+  if (!pending && source.undecided) {
+    const files = await requireCompleteRuntimeDataSet(source.candidate!)
+      .then((binding) => runtimeDataSetFileState(binding.paths.databasePath)).catch(() => undefined);
+    const databaseBytes = files === undefined ? undefined : runtimeDataSetFileStateBytes(files);
+    (report.undecided ??= []).push({ candidateId: source.id, ...(databaseBytes !== undefined ? { databaseBytes } : {}) });
     await expire();
     return 'skip';
   }
@@ -1092,6 +1124,52 @@ export async function precopyRuntimeDataSetCas(
   }
 }
 
+/**
+ * Whether this window asks the user about the undecided data sets (RuntimeDataSetMergeBatchResult.undecided)
+ * now, as the large merge session's prompt record decides it: not when this VS Code session already
+ * asked, nor while another window whose process is alive holds the record; otherwise this window takes
+ * it. Advisory only, never a merge fact: an answer is a request or a kept marker, no answer asks again
+ * at the next startup.
+ */
+export async function claimRuntimeDataSetUndecidedPrompt(
+  paths: { globalStoragePath: string },
+  input: { sessionId: string; classify?: RecordedProcessClassifier }
+): Promise<boolean> {
+  const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
+  const identity = ownProcessStartIdentity();
+  return withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
+    const record = await readRuntimeDataSetMergePrompt(storagePaths, UNDECIDED_PROMPT);
+    if (record) {
+      if (record.sessionId === input.sessionId) return false;
+      const own = record.processId === process.pid && (record.processStartIdentity ?? '') === (identity ?? '');
+      if (!own && (input.classify ?? classifyRecordedProcess)(record.processId, record.processStartIdentity) !== 'dead') return false;
+    }
+    await writeRuntimeDataSetMergePrompt(storagePaths, UNDECIDED_PROMPT, {
+      sessionId: input.sessionId, processId: process.pid, ...(identity !== undefined ? { processStartIdentity: identity } : {})
+    });
+    return true;
+  });
+}
+
+const UNDECIDED_PROMPT = 'switched-before-upgrade';
+
+/**
+ * The user's answer “保持分开” about undecided data sets: each is kept (merged only on request), as a
+ * data set switched away from in this version is. One no longer there, or merged meanwhile, is left alone.
+ */
+export async function keepRuntimeDataSetsApart(paths: { globalStoragePath: string }, candidateIds: readonly string[]): Promise<void> {
+  const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
+  await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
+    const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
+    for (const candidate of (await inspectVscodeRuntimeDataSets(storagePaths)).candidates) {
+      if (!candidateIds.includes(candidate.id) || candidate.selected || !candidate.dataSetId || !candidate.rootInstanceId) continue;
+      const record = ledger.get(candidate.id);
+      if (record && sameRuntimeDataSetIdentity(record.source, candidate)) continue;
+      await markVscodeRuntimeDataSetKept(candidate);
+    }
+  });
+}
+
 /** Records an explicit merge request of a complete non-selected data set into the current one. */
 export async function requestRuntimeDataSetMerge(
   paths: { globalStoragePath: string },
@@ -1150,6 +1228,7 @@ export async function readRuntimeDataSetMergeStates(
   const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
   const damage = await readRuntimeDataSetMergeRecordDamage(storagePaths);
   const requests = await readRuntimeDataSetMergeRequests(storagePaths);
+  const switchedBefore = await vscodeRuntimeSwitchedBeforeUpgrade(storagePaths, false);
   for (const candidate of inspection.candidates) {
     if (candidate.selected || !candidate.dataSetId) continue;
     const damaged = damage.get(runtimeDataSetMergeRecordName(candidate.id));
@@ -1185,6 +1264,8 @@ export async function readRuntimeDataSetMergeStates(
       result.set(candidate.id, { state: 'merged', ...lastMerged });
     } else if (await isVscodeRuntimeDataSetKept(candidate).catch(() => true)) {
       result.set(candidate.id, { state: 'kept' });
+    } else if (switchedBefore && !record) {
+      result.set(candidate.id, { state: 'undecided' });
     }
   }
   return result;
@@ -1990,7 +2071,7 @@ async function finalizeSource(
   }, async () => {
     await assertSourceUnchanged(paths, target, candidate, binding, state, mode);
     stopIfAsked();
-    // Work in a data set the user switched away from in this version was not interrupted by an upgrade.
+    // Work in a data set the user switched away from in this version was interrupted there, not in an earlier version.
     const reason = await isVscodeRuntimeDataSetKept(candidate) ? KEPT_MERGE_FINALIZATION_REASON : MERGE_FINALIZATION_REASON;
     const sourceBackupPath = await backupSource(binding, options);
     await fault(options, 'after-source-backup');
