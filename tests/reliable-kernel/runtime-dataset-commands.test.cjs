@@ -1244,3 +1244,59 @@ test('deactivation marks this window leaving at once and removes its registratio
     }
   }
 });
+
+test('最后一轮盲审 #6：本窗口因数据目录操作冻结时，“合并到当前库”“查看前就地升级旧历史库”“删除其他历史库”在入口拒绝并说明原因，什么都不改；确认框开着时才冻结的同样拒绝', async () => {
+  const refused = '正在迁移数据目录，完成后再操作。';
+  const frozen = { writeGate: { admit() { throw new Error(refused); } } };
+  const writes = calls => calls.filter(call => ['delete', 'upgrade', 'merge-request', 'merge-online', 'history'].includes(call[0]));
+  for (const [kind, what, extra] of [
+    ['merge', '合并到当前库', {}], ['delete', '删除其他历史库', {}], ['history', '升级这个旧历史库后查看', { oldEpoch: 4 }]
+  ]) {
+    const f = fixture({ application: frozen, picks: [action(kind), 0, 0, 0], confirmation: kind === 'delete' ? '永久删除' : '合并', ...extra });
+    await f.manageRuntimeDataSets(f.context, f.startup);
+    assert.deepEqual(writes(f.calls), [], kind);
+    assert.ok(f.calls.some(call => call[0] === 'warning' && call[1] === `现在不能${what}：${refused}没有做任何改动。`), `${kind}: ${JSON.stringify(f.calls.filter(call => call[0] === 'warning'))}`);
+  }
+  // Viewing a library that needs no upgrade is a read: not refused.
+  const reading = fixture({ application: frozen, picks: [action('history'), 0, 0, 0, undefined] });
+  await reading.manageRuntimeDataSets(reading.context, reading.startup);
+  assert.ok(reading.calls.some(call => call[0] === 'history'));
+  // Frozen while the confirmation was open.
+  for (const [kind, confirmation] of [['delete', '永久删除'], ['merge', '合并']]) {
+    let checks = 0;
+    const late = { writeGate: { admit() { if ((checks += 1) > 1) throw new Error(refused); } } };
+    const f = fixture({ application: late, picks: [action(kind), 0], confirmation });
+    await f.manageRuntimeDataSets(f.context, f.startup);
+    assert.deepEqual(writes(f.calls), [], kind);
+    assert.equal(checks, 2, kind);
+  }
+});
+
+test('最后一轮盲审 #2：从设置页发起的迁移数据目录从开始到结束（确认、可能要几分钟的准备、协调、撤销）都登记为本窗口正在进行的维护；命令面板只打开设置页时不登记', async () => {
+  const handlers = new Map();
+  const events = [];
+  const ids = new Proxy({}, { get: (_target, name) => String(name) });
+  const host = { exclusiveMaintenanceTarget: () => ({ paths: {}, hostBootId: 'window-a' }) };
+  const commands = loadSource('vscode/commands/registerCommands.ts', {
+    vscode: {
+      commands: { registerCommand: (id, handler) => { handlers.set(id, handler); return { dispose() {} }; } },
+      window: { async showErrorMessage(message) { events.push(['error', message]); } }
+    },
+    '../panels/MainPanel': { MainPanel: {} },
+    '../../shared/extensionIdentity': { EXTENSION_BRAND: 'Limcode test', EXTENSION_COMMAND_IDS: ids },
+    './dataRootRelocation': { async relocateDataRoot(_context, _startup, request) { events.push(['relocate', request?.clientId ?? null]); } },
+    '../runtimeExclusiveMaintenance': {
+      holdOwnExclusiveMaintenanceWork(holdHost, work) {
+        assert.equal(holdHost, host);
+        events.push(['hold', work.operation, work.activity]);
+        return () => events.push(['release']);
+      }
+    }
+  }, { Promise });
+  commands.registerCommands({ subscriptions: [] }, { current: () => host });
+  await handlers.get('relocateDataRoot')({ clientId: 'settings-client' });
+  assert.deepEqual(events, [['hold', 'data-root-relocation', '迁移数据目录'], ['relocate', 'settings-client'], ['release']]);
+  events.length = 0;
+  await handlers.get('relocateDataRoot')();
+  assert.deepEqual(events, [['relocate', null]], 'only opens the settings page: nothing held');
+});

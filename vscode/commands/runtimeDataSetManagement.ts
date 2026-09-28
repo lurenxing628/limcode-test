@@ -257,6 +257,8 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     await startLargeHistoricalMerge(context, host, largeMergeOptions(context, host.dataRootPath(), () => canStartRuntimeDataSetUpgrade(context)));
     return;
   }
+  if (action.action === 'merge' && await refusedWhileFrozen(startup, '合并到当前库')) return;
+  if (action.action === 'delete' && await refusedWhileFrozen(startup, '删除其他历史库')) return;
   const { candidates, problems } = await inspectVscodeRuntimeDataSets(pathsFor(context));
   if (!canStartRuntimeDataSetUpgrade(context)) return;
   const mergeStates = await readRuntimeDataSetMergeStates(pathsFor(context)).catch(() => new Map<string, RuntimeDataSetMergeState>());
@@ -279,6 +281,8 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   if (action.action === 'merge') { await mergeNow(context, startup, candidate, mergeStates.get(candidate.id)); return; }
   if (action.action === 'storage') { await showRuntimeStorage(context, candidate, startup); return; }
   if (action.action === 'history') {
+    // Viewing is a read; upgrading a published old format in place first is a write.
+    if (isPublishedOldDataSet(candidate) && await refusedWhileFrozen(startup, '升级这个旧历史库后查看')) return;
     const readable = isPublishedOldDataSet(candidate) ? await upgradeHistoryBeforeRead(context, candidate) : candidate;
     if (readable && canStartRuntimeDataSetUpgrade(context)) await browseHistory(context, readable);
     return;
@@ -291,6 +295,8 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
         + deletionNote(candidate, mergeStates.get(candidate.id))
     }, '永久删除');
     if (confirmed !== '永久删除') return;
+    // Also when this window froze while the confirmation was open.
+    if (await refusedWhileFrozen(startup, '删除其他历史库')) return;
     if (!candidate.dataSetId) throw new Error('历史库尚未完整初始化，不能删除。');
     await deleteUnselectedRuntimeDataSet(pathsFor(context), candidate.id, candidate.dataSetId);
     await vscode.window.showInformationMessage('所选历史库已删除。');
@@ -368,6 +374,8 @@ async function mergeNow(
       + '无法自动收尾的工作或数据冲突时整体不合并，并说明原因。' + oversizedMergeNote() + changed
   }, '合并');
   if (confirmed !== '合并' || !candidate.dataSetId || !candidate.rootInstanceId) return;
+  // Also when this window froze while the confirmation was open.
+  if (await refusedWhileFrozen(startup, '合并到当前库')) return;
   await requestRuntimeDataSetMerge(pathsFor(context), {
     candidateId: candidate.id, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
   });
@@ -756,6 +764,22 @@ function withoutFullStop(text: string): string {
 }
 
 /** Callers add their own full stop. */
+/**
+ * These entries write (the current library, or another one in place): refused at once while this
+ * window is frozen for a data-directory operation (“正在迁移数据目录，完成后再操作。”), like any
+ * other write command, before anything is asked or changed.
+ */
+async function refusedWhileFrozen(startup: ApplicationStartup, what: string): Promise<boolean> {
+  const gate = (startup.current() as { writeGate?: { admit(): void } } | undefined)?.writeGate;
+  try {
+    gate?.admit();
+    return false;
+  } catch (error) {
+    await vscode.window.showWarningMessage(`现在不能${what}：${describeError(error)}。没有做任何改动。`);
+    return true;
+  }
+}
+
 function describeError(error: unknown): string {
   const messages: string[] = [];
   const seen = new Set<unknown>();

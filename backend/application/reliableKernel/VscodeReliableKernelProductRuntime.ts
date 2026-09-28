@@ -119,8 +119,8 @@ export class VscodeReliableKernelProductRuntime {
   private readonly initializeConfiguration: () => Promise<void>;
   private readonly workspaceFoldersSubscription: vscode.Disposable;
   private workspaceFoldersChangeTask: Promise<void> = Promise.resolve();
-  /** While frozen (see freezeNewExecution) this window claims no Conversation it does not own yet. */
-  private readonly executionGate: { frozen: number };
+  /** While frozen (see freezeNewExecution) this window claims no Conversation but the ones it owned when it froze. */
+  private readonly executionGate: ExecutionFreezeGate;
 
   private constructor(input: {
     application: ReliableKernelApplication;
@@ -140,7 +140,7 @@ export class VscodeReliableKernelProductRuntime {
     ) => Promise<ConversationHostEligibilityDecision>;
     initializeConfiguration: () => Promise<void>;
     onConfigurationChanged?: () => Promise<void> | void;
-    executionGate: { frozen: number };
+    executionGate: ExecutionFreezeGate;
     holdForRelocatedWork?: boolean;
   }) {
     this.application = input.application;
@@ -414,7 +414,7 @@ export class VscodeReliableKernelProductRuntime {
         runtimeBuildInfo: getRuntimeBuildInfo
       });
       const runtimeDatabase = application.database;
-      const executionGate = { frozen: 0 };
+      const executionGate: ExecutionFreezeGate = { frozen: 0 };
       const runtimeContent = application.contentStore;
       const runtimeTurns = application.turns;
       const frozenWorkEnvironmentCache = new Map<string, string | null>();
@@ -588,17 +588,23 @@ export class VscodeReliableKernelProductRuntime {
    */
   /**
    * Stops this window from taking up new work, for an exclusive maintenance that is about to close
-   * its Runtime: a Conversation it does not own yet is not claimed for execution here (new input
-   * stays pending and runs after the reload); Conversations it owns are not interrupted. Returns the
-   * undo (idempotent).
+   * its Runtime: only the Conversations it owned when it froze (`ownedConversationIds`; without
+   * them, the ones it owns at each claim) are claimed for execution here — a view opened meanwhile
+   * that takes a Conversation over settles only its control plane and resumes nothing (new input
+   * stays pending and runs after the reload); Conversations it owned are not interrupted. Nested
+   * freezes keep the first one's Conversations. Returns the undo (idempotent).
    */
-  public freezeNewExecution(): () => void {
+  public freezeNewExecution(ownedConversationIds?: Iterable<string>): () => void {
+    if (this.executionGate.frozen === 0) {
+      this.executionGate.owned = ownedConversationIds === undefined ? undefined : new Set(ownedConversationIds);
+    }
     this.executionGate.frozen += 1;
     let thawed = false;
     return () => {
       if (thawed) return;
       thawed = true;
       this.executionGate.frozen -= 1;
+      if (this.executionGate.frozen === 0) this.executionGate.owned = undefined;
     };
   }
 
@@ -832,14 +838,24 @@ export function pinnedDataRootPaths(context: vscode.ExtensionContext, configurat
   };
 }
 
+/** A window's execution freeze (see VscodeReliableKernelProductRuntime.freezeNewExecution). */
+export interface ExecutionFreezeGate {
+  frozen: number;
+  /** While frozen: the Conversations this window owned when it froze. */
+  owned?: ReadonlySet<string>;
+}
+
 /**
  * The claim probe of a window: while frozen (see VscodeReliableKernelProductRuntime.freezeNewExecution)
- * it claims only the Conversations it owns already; otherwise its host eligibility decides.
+ * it claims only the Conversations it owned when it froze — not one a view took over meanwhile,
+ * which owns it by then (without that set: the ones it owns); otherwise its host eligibility decides.
  */
 export function freezableClaimProbe(
-  executionGate: { frozen: number },
+  executionGate: ExecutionFreezeGate,
   owners: { owns(conversationId: string): boolean },
   eligible: (conversationId: string) => Promise<boolean>
 ): (conversationId: string) => Promise<boolean> {
-  return async (conversationId) => (executionGate.frozen === 0 || owners.owns(conversationId)) && await eligible(conversationId);
+  return async (conversationId) => (
+    executionGate.frozen === 0 || (executionGate.owned ? executionGate.owned.has(conversationId) : owners.owns(conversationId))
+  ) && await eligible(conversationId);
 }

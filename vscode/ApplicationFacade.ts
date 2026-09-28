@@ -56,6 +56,8 @@ export interface ConversationHistoryRevealTarget {
 /** VS Code shell 只依赖此门面，不拥有或推断 Runtime 领域关系。 */
 export interface ApplicationFacade {
   readonly onDidChangeConversationHistory: vscode.Event<void>;
+  /** The write gate: admit() throws while this window is frozen for a data-directory operation. */
+  readonly writeGate?: { admit(): void };
   readonly onDidRevealConversationHistoryTop: vscode.Event<ConversationHistoryRevealTarget>;
 
   createConversation(options?: { projectFolderUri?: string }): Promise<string>;

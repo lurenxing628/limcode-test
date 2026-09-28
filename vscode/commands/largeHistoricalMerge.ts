@@ -21,7 +21,7 @@ import type { BridgeClientId, ExtensionToWebviewMessage } from '../../shared/pro
 import { MainPanel } from '../panels/MainPanel';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
 import {
-  exclusiveMaintenanceRefusal, requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenanceWindowState
+  exclusiveMaintenanceRefusal, holdOwnExclusiveMaintenanceWork, requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenanceWindowState
 } from '../runtimeExclusiveMaintenance';
 
 /**
@@ -121,6 +121,7 @@ export async function offerLargeHistoricalMerge(
   sessionRunning = true;
   const engine = options.engine ?? largeMergeEngine();
   let preparation: LargeMergePreparation | undefined;
+  let releaseHold: (() => void) | undefined;
   try {
     const paths = { globalStoragePath: host.dataRootPath() };
     const { hostBootId } = host.exclusiveMaintenanceTarget();
@@ -162,7 +163,9 @@ export async function offerLargeHistoricalMerge(
       return;
     }
     if (answer !== 'go' || !stillCurrent() || host.writeGate?.frozen) return;
-    // Agreed: only now is anything prepared (unfinished work closed, target backed up, content published, claims kept).
+    // Agreed: from here until the session ended no other window's maintenance reloads this one.
+    releaseHold = holdOwnExclusiveMaintenanceWork(host, { operation: OPERATION, activity: ACTIVITY });
+    // Only now is anything prepared (unfinished work closed, target backed up, content published, claims kept).
     const sources = estimated.sources.map((source) => source.candidateId);
     try {
       preparation = await vscode.window.withProgress({
@@ -188,6 +191,7 @@ export async function offerLargeHistoricalMerge(
   } finally {
     // Whatever did not run lets go of what the engine kept for it (nothing after a run).
     if (preparation) await release(engine, preparation);
+    releaseHold?.();
     sessionRunning = false;
   }
 }
@@ -218,6 +222,7 @@ export async function startLargeHistoricalMerge(
   const paths = { globalStoragePath: host.dataRootPath() };
   sessionRunning = true;
   let preparation: LargeMergePreparation | undefined;
+  let releaseHold: (() => void) | undefined;
   try {
     // Held off by the cooldown after another window's coordination: said now, before anything is estimated, asked or prepared.
     const { paths: targetPaths, hostBootId } = host.exclusiveMaintenanceTarget();
@@ -258,6 +263,8 @@ export async function startLargeHistoricalMerge(
       return;
     }
     if (!await confirm(estimated)) return;
+    // Confirmed: from here until the session ended no other window's maintenance reloads this one.
+    releaseHold = holdOwnExclusiveMaintenanceWork(host, { operation: OPERATION, activity: ACTIVITY });
     const sources = estimated.sources.map((source) => source.candidateId);
     try {
       preparation = await vscode.window.withProgress({
@@ -284,6 +291,7 @@ export async function startLargeHistoricalMerge(
     await vscode.window.showErrorMessage(`${ACTIVITY}失败：${describeError(error)}。`);
   } finally {
     if (preparation) await release(engine, preparation);
+    releaseHold?.();
     sessionRunning = false;
   }
 }

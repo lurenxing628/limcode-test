@@ -800,6 +800,13 @@ test('启动前：迁移进程还在时显示“正在迁移数据目录”；�
   assert.equal(await crashed.commands.beforeDataRootOpen(crashed.context), undefined);
   assert.deepEqual(crashed.calls.find((call) => call[0] === 'recover')[1], { targetRootPath: TARGET, relocationId: 'r-1' });
   assert.equal(crashed.calls.find((call) => call[0] === 'status')[1].pendingRelocation, null);
+  // 最后一轮盲审 #2：撤销成功后提示一次（进行迁移的窗口被关闭或重载了），不再静默。
+  const undone = crashed.calls.filter((call) => call[0] === 'info');
+  assert.equal(undone.length, 1);
+  assert.match(undone[0][1], /上次的数据目录迁移没有完成就中断了.*数据目录没有切换.*它在新目录里留下的内容已撤销/);
+  const nothingLeft = fixture({ pendingRelocation: pending, ownerState: 'dead', recoverOutcome: 'absent' });
+  await nothingLeft.commands.beforeDataRootOpen(nothingLeft.context);
+  assert.match(nothingLeft.calls.find((call) => call[0] === 'info')?.[1] ?? '', /没有生效.*新目录里没有留下它的内容/);
 
   const unreachable = fixture({ pendingRelocation: pending, ownerState: 'dead', recoverOutcome: 'unreachable' });
   await unreachable.commands.beforeDataRootOpen(unreachable.context);

@@ -161,6 +161,29 @@ test('冻结期间只看冻结前已有的工作：之前开始的 Turn 与仍�
   assert.equal(window.facade.writeGate.frozen, false);
 });
 
+test('最后一轮盲审 #5：冻结期间打开对话面板接管一个冻结前不属于本窗口的对话时只做控制类收尾，不认领执行（不续跑、不准入）；冻结前拥有的对话照常；解冻后照常', { timeout: 60_000 }, async (t) => {
+  const window = await openWindow(t);
+  await createConversation(window.app, 'conversation-a');
+  await createConversation(window.app, 'conversation-b');
+  const owners = window.app.database.conversationOwners;
+  await owners.claim('conversation-a');
+  const thaw = window.facade.freezeNewWork('迁移数据目录');
+  // A view opened meanwhile: recoverServedConversation holds the Conversation (conversationOwners.run),
+  // then its runner recovery asks to execute it (tryOwnConversation → tryClaimEligible).
+  let viaView;
+  let busyWhileViewing;
+  await owners.run('conversation-b', async () => {
+    viaView = await owners.tryClaimEligible('conversation-b');
+    busyWhileViewing = await window.facade.hasOwnedExecution();
+  });
+  assert.equal(viaView, 'ineligible', 'owned by the view by then, but not before the freeze: nothing resumes here');
+  assert.equal(busyWhileViewing, false);
+  assert.equal(await owners.tryClaimEligible('conversation-b'), 'ineligible', 'nor in the background');
+  assert.equal(await owners.tryClaimEligible('conversation-a'), 'owned', 'owned before the freeze: goes on');
+  thaw();
+  assert.equal(await owners.tryClaimEligible('conversation-b'), 'owned', 'thawed: as before');
+});
+
 /** One window: the Runtime, its Runner and command router, and the Facade's write gate, wired like the product. */
 async function openWindow(t) {
   const outer = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-write-freeze-'));
@@ -191,7 +214,7 @@ async function openWindow(t) {
     toolHost: { setStateChangeListener() {} },
     async ensureCapabilitiesReady() {},
     conversationHostEligibility: (conversationId) => viewConversationHostEligibility(eligibility, conversationId),
-    freezeNewExecution: () => ProductRuntime.prototype.freezeNewExecution.call({ executionGate })
+    freezeNewExecution: (owned) => ProductRuntime.prototype.freezeNewExecution.call({ executionGate }, owned)
   };
   const facade = Object.assign(Object.create(Facade.prototype), {
     product, writeGate: new RuntimeWriteGate(), historyEntries: [], refreshConversationHistory: async () => {}

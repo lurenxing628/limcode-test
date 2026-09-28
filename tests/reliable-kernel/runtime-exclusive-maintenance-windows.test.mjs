@@ -1269,3 +1269,88 @@ async function publishHost(binding, hostBootId, startedAt = STARTED) {
 function delay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+/** A window of the layer for 最后一轮盲审 #4: `busy()` decides its work; confirmations counted by the drafts it is asked to save. */
+async function promisingWindow(t, binding, hostBootId, busy, pollMs = 15) {
+  const window = { titles: [], notices: [], reloads: 0, confirms: 0 };
+  const liveness = await publishHost(binding, hostBootId);
+  let reloading;
+  // The reload closes the window: it stops answering and its liveness record goes.
+  const participant = loadVscodeLayer(vscodeMock(window, () => {
+    window.reloads += 1;
+    reloading = (async () => {
+      await participant.dispose();
+      await fs.rm(liveness, { force: true });
+    })();
+    return reloading;
+  })).startExclusiveMaintenanceParticipant({
+    exclusiveMaintenanceTarget: () => ({ paths: binding.paths, hostBootId }), hasOwnedExecution: async () => busy()
+  }, { countdownSeconds: 0, pollMs, processId: (nextFakeProcessId += 1), saveDrafts: () => { window.confirms += 1; return 0; } });
+  await participant.checkNow();
+  closeBeforeRootRemoval(t, binding.paths.dataRootPath, async () => {
+    await reloading?.catch(() => undefined);
+    await closeParticipant(participant, liveness);
+  });
+  return window;
+}
+
+/** The phase of the live request (tests: one request at a time). */
+function livePhase(paths) {
+  const directory = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests');
+  try {
+    for (const name of fsSync.readdirSync(directory)) {
+      const request = JSON.parse(fsSync.readFileSync(path.join(directory, name), 'utf8'));
+      if (request.phase !== 'withdrawn') return request.phase;
+    }
+  } catch { /* none yet */ }
+  return undefined;
+}
+
+test('最后一轮盲审 #4：只提示模式（用户已在别处确认）与倒计时一致——同一请求的后续轮次不再提示“将重载”；请求没有进行就撤回时补一句“本窗口不重载”；“任务结束后会自动重载”同样更正一次', { timeout: 60_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // B is idle and answers quickly; C (slower) is busy whenever it is asked to confirm, so each round goes back outside.
+  const b = await promisingWindow(t, binding, 'notice-b', () => false);
+  const c = await promisingWindow(t, binding, 'notice-c', () => livePhase(paths) === 'confirm', 200);
+  const outcome = await exclusive.runExclusiveRuntimeMaintenance(paths, {
+    ...MERGE, operationKey: 'source@notice', message: '为合并较大的旧聊天记录', ignoreBackoff: true, whenBusy: 'wait',
+    participantConfirmation: 'notice', pollMs: 10, busyWaitTimeoutMs: 20_000, maxLockedAttempts: 3,
+    withLocks: (body) => withRuntimeMaintenance(paths, body)
+  }, async () => assert.fail('must not run'));
+  assert.equal(outcome.state, 'busy', outcome.reason);
+  for (let polls = 0; polls < 100 && !b.notices.some((notice) => /不重载/.test(notice)); polls += 1) await delay(20);
+  assert.ok(b.confirms >= 2, `B was asked in several rounds (${b.confirms})`);
+  assert.deepEqual(b.notices, [
+    '为合并较大的旧聊天记录，本窗口将重载；未发送的输入会保留。',
+    '其它窗口的合并较大的旧聊天记录这次没有进行，本窗口不重载。'
+  ]);
+  assert.deepEqual([b.reloads, c.reloads], [0, 0]);
+
+  // Told to reload once its task ends; the request then gave up waiting: corrected once as well.
+  const other = await createRoot(t);
+  const d = await promisingWindow(t, other.binding, 'waiting-d', () => true);
+  const waited = await exclusive.runExclusiveRuntimeMaintenance(other.paths, {
+    ...MERGE, operationKey: 'source@waiting', message: '为合并较大的旧聊天记录', ignoreBackoff: true, whenBusy: 'wait',
+    participantConfirmation: 'notice', pollMs: 10, busyWaitTimeoutMs: 600,
+    withLocks: (body) => withRuntimeMaintenance(other.paths, body)
+  }, async () => assert.fail('must not run'));
+  assert.equal(waited.state, 'busy');
+  for (let polls = 0; polls < 100 && !d.notices.some((notice) => /不重载/.test(notice)); polls += 1) await delay(20);
+  assert.deepEqual(d.notices, [
+    '为合并较大的旧聊天记录：本窗口的任务结束后会自动重载，未发送的输入会保留。',
+    '其它窗口的合并较大的旧聊天记录这次没有进行，本窗口不重载。'
+  ]);
+  assert.equal(d.reloads, 0);
+});
+
+test('最后一轮盲审 #4：只提示之后照常为这个请求重载的窗口不补“不重载”；倒计时撤回时已说过的不再重复', { timeout: 60_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const b = await promisingWindow(t, binding, 'kept-b', () => false);
+  const outcome = await exclusive.runExclusiveRuntimeMaintenance(paths, {
+    ...MERGE, operationKey: 'source@kept', message: '为合并较大的旧聊天记录', ignoreBackoff: true, whenBusy: 'wait',
+    participantConfirmation: 'notice', pollMs: 10, withLocks: (body) => withRuntimeMaintenance(paths, body)
+  }, async () => 'merged');
+  assert.equal(outcome.state, 'completed');
+  await delay(1_200);
+  assert.deepEqual(b.notices, ['为合并较大的旧聊天记录，本窗口将重载；未发送的输入会保留。']);
+  assert.equal(b.reloads, 1);
+});

@@ -59,6 +59,14 @@ export class RuntimeWriteGate {
   }
 
   /**
+   * Whether a write command admitted here is still running (frozen or not): it is this window's
+   * work, which a reload would interrupt (see the Facade's hasOwnedExecution).
+   */
+  public get writesInFlight(): boolean {
+    return this.running > 0;
+  }
+
+  /**
    * Freezes writes for `activity` (“迁移数据目录”). `ownedConversationIds` is what this window owns
    * right now; it and whether a write command is still running form the baseline. Returns the thaw
    * (idempotent).

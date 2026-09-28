@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import type { RuntimeRootPaths } from '../backend/reliableKernel/contracts';
 import {
-  readExclusiveMaintenanceRefusal, requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
+  holdExclusiveMaintenanceWork, readExclusiveMaintenanceRefusal, requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance,
   startExclusiveMaintenanceParticipant as startProtocolParticipant, type ExclusiveMaintenanceRefusal,
   type ExclusiveMaintenanceBusy, type ExclusiveMaintenanceOperation, type ExclusiveMaintenanceParticipant, type ExclusiveMaintenanceProgress,
   type ExclusiveMaintenanceConfirmContext, type RuntimeExclusiveMaintenanceInput, type RuntimeExclusiveMaintenanceOutcome,
@@ -10,7 +10,10 @@ import {
 
 export interface ExclusiveMaintenanceParticipantHost {
   exclusiveMaintenanceTarget(): { paths: RuntimeRootPaths; hostBootId: string };
-  /** True while this window has work that a reload would interrupt (see the Facade). */
+  /**
+   * True while this window has work that a reload would interrupt (see the Facade), a write command
+   * still running included (the write gate's, frozen or not: e.g. 清理备份 deleting).
+   */
   hasOwnedExecution(): Promise<boolean>;
 }
 
@@ -78,7 +81,10 @@ export function startExclusiveMaintenanceParticipant(
       return 0;
     }
   };
-  return startProtocolParticipant(paths, hostBootId, {
+  // A promise to reload is followed only while this participant answers (see promiseReload).
+  let stopped = false;
+  const answering = (): boolean => !stopped && options.isCurrent?.() !== false;
+  const participant = startProtocolParticipant(paths, hostBootId, {
     busyReason: async () => {
       if (await host.hasOwnedExecution()) return { kind: 'work', reason: '有任务正在进行' };
       if (vscode.window.state?.focused) return { kind: 'focus', reason: '窗口正在使用' };
@@ -86,11 +92,15 @@ export function startExclusiveMaintenanceParticipant(
     },
     confirm: (request, context) => {
       saveDrafts();
-      return request.confirmation === 'notice'
-        ? announce(request.message)
-        : countdown(request, seconds, context);
+      if (request.confirmation !== 'notice') return countdown(request, seconds, context);
+      // The user confirmed elsewhere: told once per request (a later round does not repeat it), and
+      // corrected once when the request ends without this window reloading, as a countdown is.
+      promiseReload(request, context, 'notice', `${request.message}，本窗口将重载；未发送的输入会保留。`, answering);
+      return Promise.resolve(true);
     },
     release: async (request) => {
+      // Reloading for it now: the promise is kept, no correction follows.
+      reloadPromises.get(request.requestId)?.settle();
       const kept = gaveWay;
       if (kept && kept.requestId === request.requestId && windowState) {
         try { await windowState.update(NOTICE_KEY, { text: kept.text, at: Date.now() }); }
@@ -100,16 +110,39 @@ export function startExclusiveMaintenanceParticipant(
       if (saveDrafts() > 0) await new Promise((resolve) => setTimeout(resolve, DRAFT_SAVE_SETTLE_MS));
       await vscode.commands.executeCommand('workbench.action.reloadWindow');
     },
-    notifyWaiting: (request, busy) => {
-      void vscode.window.showInformationMessage(busy.kind === 'focus'
+    notifyWaiting: (request, busy, context) => {
+      promiseReload(request, context, 'waiting', busy.kind === 'focus'
         ? `${request.message}：你正在使用本窗口，切换到其它窗口后本窗口会自动重载，未发送的输入会保留。`
-        : `${request.message}：本窗口的任务结束后会自动重载，未发送的输入会保留。`);
+        : `${request.message}：本窗口的任务结束后会自动重载，未发送的输入会保留。`, answering);
     }
   }, {
     ...(options.pollMs !== undefined ? { pollMs: options.pollMs } : {}),
     ...(options.isCurrent ? { isCurrent: options.isCurrent } : {}),
     ...(options.processId !== undefined ? { processId: options.processId } : {}),
     onError: (error) => console.warn('[LimCode] 多窗口维护协作检查失败。', error)
+  });
+  return {
+    checkNow: () => participant.checkNow(),
+    dispose: () => { stopped = true; return participant.dispose(); },
+    unregister: () => { stopped = true; return participant.unregister(); }
+  };
+}
+
+/**
+ * Holds this window's own operation from the moment the user agreed to it (its preparation may take
+ * minutes, before it asks the other windows): until the returned release, this window answers busy
+ * to other windows' maintenance and never yields to it (see holdExclusiveMaintenanceWork). A window
+ * whose Runtime is not open holds nothing.
+ */
+export function holdOwnExclusiveMaintenanceWork(
+  host: Pick<ExclusiveMaintenanceParticipantHost, 'exclusiveMaintenanceTarget'>,
+  work: { operation: string; operationKey?: string; activity: string }
+): () => void {
+  let hostBootId: string;
+  try { hostBootId = host.exclusiveMaintenanceTarget().hostBootId; }
+  catch { return () => undefined; }
+  return holdExclusiveMaintenanceWork(hostBootId, {
+    operation: work.operation, operationKey: work.operationKey ?? `${work.operation}:preparing`, activity: work.activity
   });
 }
 
@@ -216,8 +249,9 @@ export async function runWithExclusiveMaintenance<T>(
 /**
  * Read-only, before asking the user anything (a countdown, a confirmation): whether this operation
  * called now as runWithExclusiveMaintenance calls it would be refused before any window is asked —
- * the cooldown, the key's backoff or a blocked key — with the reason, which says when it can be
- * tried again. An explicit call's requester token kept in windowState is read, never created.
+ * the cooldown, the key's backoff, a blocked key (the reason says when it can be tried again) or a
+ * window outside the protocol, e.g. an older version ('legacy-host': close or reload it). An explicit
+ * call's requester token kept in windowState is read, never created.
  * Records nothing; the call itself checks again.
  */
 export async function exclusiveMaintenanceRefusal(
@@ -259,10 +293,12 @@ export function describeProgress(progress: ExclusiveMaintenanceProgress): string
     const parts: string[] = [];
     if (progress.requesterBusy) parts.push('本窗口的任务结束');
     const maintaining = progress.busy.filter((item) => item.maintenance).length;
-    const working = progress.busy.filter((item) => item.kind === 'work' && !item.maintenance).length;
+    const working = progress.busy.filter((item) => item.kind === 'work' && !item.maintenance && !item.opening).length;
+    const opening = progress.busy.filter((item) => item.opening).length;
     const focused = progress.busy.filter((item) => item.kind === 'focus').length;
     if (maintaining > 0) parts.push(`${maintaining} 个其它窗口的维护结束`);
     if (working > 0) parts.push(`${working} 个其它窗口的任务结束`);
+    if (opening > 0) parts.push(`${opening} 个正在打开的窗口打开完`);
     if (focused > 0) parts.push(`${focused} 个正在使用的窗口被切走`);
     if (closing > 0) parts.push(`${closing} 个正在关闭或重载的窗口关完`);
     return `等待${parts.join('、')}`;
@@ -272,9 +308,59 @@ export function describeProgress(progress: ExclusiveMaintenanceProgress): string
   return `询问其它 ${progress.hosts.length} 个窗口`;
 }
 
-async function announce(message: string): Promise<boolean> {
-  void vscode.window.showInformationMessage(`${message}，本窗口将重载；未发送的输入会保留。`);
-  return true;
+/** How often a promise to reload checks that its request is still live. */
+const RELOAD_PROMISE_CHECK_MS = 500;
+
+interface ReloadPromise {
+  told: Set<string>;
+  /** Kept (this window reloads for it) or already corrected (a withdrawn countdown said so). */
+  settle(): void;
+}
+
+/**
+ * Requests this window told it would reload for, without a countdown (a notice, or “本窗口的任务结束后
+ * 会自动重载”): each text once per request, whatever round asks again. When the request is withdrawn
+ * without this window reloading for it (the call ended: another window stayed busy, a timeout…) it
+ * says so once — “其它窗口的……这次没有进行，本窗口不重载。” — as a countdown that is withdrawn does.
+ */
+const reloadPromises = new Map<string, ReloadPromise>();
+
+function promiseReload(
+  request: RuntimeExclusiveMaintenanceRequest,
+  context: ExclusiveMaintenanceConfirmContext,
+  kind: 'notice' | 'waiting',
+  text: string,
+  isCurrent?: () => boolean
+): void {
+  let promise = reloadPromises.get(request.requestId);
+  if (!promise) {
+    let kept = false;
+    promise = { told: new Set(), settle: () => { kept = true; } };
+    reloadPromises.set(request.requestId, promise);
+    const expiresAt = Date.parse(request.expiresAt);
+    void (async () => {
+      try {
+        for (;;) {
+          // Never keeps the extension host (or a test) alive by itself.
+          await new Promise((resolve) => { setTimeout(resolve, RELOAD_PROMISE_CHECK_MS).unref?.(); });
+          if (kept || isCurrent?.() === false) return;
+          const state = await context.requestState().catch(() => 'current' as const);
+          if (kept) return;
+          if (state === 'withdrawn') {
+            void vscode.window.showInformationMessage(`其它窗口的${request.activity}这次没有进行，本窗口不重载。`);
+            return;
+          }
+          // Only a live request is followed; an expired one is ignored by every window.
+          if (!(Date.now() < expiresAt)) return;
+        }
+      } finally {
+        reloadPromises.delete(request.requestId);
+      }
+    })();
+  }
+  if (promise.told.has(kind)) return;
+  promise.told.add(kind);
+  void vscode.window.showInformationMessage(text);
 }
 
 /** Ticks per second of the countdown: each checks the request is still waiting for this answer. */
@@ -313,6 +399,10 @@ async function countdown(
     }
     return !cancelledNow();
   });
-  if (withdrawn) void vscode.window.showInformationMessage(`其它窗口的${request.activity}这次没有进行，本窗口不重载。`);
+  if (withdrawn) {
+    // Said here once: a promise made earlier for this request (see promiseReload) is not repeated.
+    reloadPromises.get(request.requestId)?.settle();
+    void vscode.window.showInformationMessage(`其它窗口的${request.activity}这次没有进行，本窗口不重载。`);
+  }
   return confirmed;
 }

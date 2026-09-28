@@ -29,7 +29,7 @@ const {
   runtimeDataRootAdmissionClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance, withRuntimeMaintenanceActivity
 } = kernelFile('runtimeHostControl.js');
 const {
-  clearExclusiveMaintenanceKey, createProtocolProcessClassifier, readExclusiveMaintenanceRefusal, readExclusiveMaintenanceRequests,
+  clearExclusiveMaintenanceKey, createProtocolProcessClassifier, holdExclusiveMaintenanceWork, readExclusiveMaintenanceRefusal, readExclusiveMaintenanceRequests,
   registerExclusiveMaintenanceParticipant, requestExclusiveRuntimeMaintenance, runExclusiveRuntimeMaintenance, runtimeExclusiveMaintenanceDirectory,
   startExclusiveMaintenanceParticipant
 } = kernelFile('runtimeExclusiveMaintenance.js');
@@ -1035,7 +1035,7 @@ test('盲审 #4：窗口因自己的维护请求答忙时，回应里写明那�
   await b.check();
   const answer = await readAnswer(paths, 'later-request', 'window-b');
   assert.deepEqual([answer.stage, answer.answer, answer.reason], ['prepare', 'busy', '本窗口正在等待执行迁移数据目录']);
-  assert.deepEqual(answer.maintenance, { operation: 'data-root-migration', operationKey: 'to:/other', activity: '迁移数据目录' });
+  assert.deepEqual(answer.maintenance, { operation: 'data-root-migration', operationKey: 'to:/other', activity: '迁移数据目录', whenBusy: 'wait' });
   proceed(undefined);
   assert.equal((await own).state, 'completed');
 });
@@ -1240,7 +1240,7 @@ test('beforeGo 自身抛错按本窗口忙处理：不发布 go、没有窗口�
     withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
   }, async () => assert.fail('must not run'));
   assert.equal(outcome.state, 'busy');
-  assert.equal(outcome.reason, '准备期间反复有窗口变忙（最后一次：本窗口还有任务正在进行），这次没有进行，稍后再试。');
+  assert.equal(outcome.reason, '准备期间本窗口一再变忙（最后一次：无法确认本窗口是否空闲：database is closed），这次没有进行，稍后再试。');
   assert.deepEqual([calls, lockedRounds, frozen], [3, 3, 0], 'never frozen: the check threw before the freeze');
   await settle([peer]);
   assert.equal(peer.releases(), 0);
@@ -1349,12 +1349,12 @@ test('锁内轮次用完时放弃原因按最后一次的实际原因：发起�
   }, async () => assert.fail('must not run'));
   assert.equal(outcome.state, 'busy');
   assert.equal(lockedRounds, 3);
-  assert.equal(outcome.reason, '准备期间反复有窗口变忙（最后一次：本窗口还有任务正在进行），这次没有进行，稍后再试。');
+  assert.equal(outcome.reason, '准备期间本窗口一再变忙（最后一次：本窗口有任务正在进行），这次没有进行，稍后再试。');
   assert.doesNotMatch(outcome.reason, /其它窗口/);
   // The next automatic call meets the key's backoff: the same reason, saying when instead of “later”.
   const later = await request(paths, BASE, async () => assert.fail('must not run'));
   assert.equal(later.state, 'backoff');
-  assert.match(later.reason, /^准备期间反复有窗口变忙（最后一次：本窗口还有任务正在进行），这次没有进行。约 5 分钟后（\d\d:\d\d 以后）可以再试。$/);
+  assert.match(later.reason, /^准备期间本窗口一再变忙（最后一次：本窗口有任务正在进行），这次没有进行。约 5 分钟后（\d\d:\d\d 以后）可以再试。$/);
 });
 
 test('beforeGo 在全部确认之后、发布 go 之前调用：本窗口不空闲就在任何窗口重载前退回锁外或放弃；冻结在轮次结束时解除', async (t) => {
@@ -1778,3 +1778,207 @@ async function publishHost(binding, hostBootId, startedAt = STARTED) {
     processStartIdentity: ownProcessStartIdentity(), startedAt, heartbeatAt: NOW }));
   return target;
 }
+
+/** A window's real busy check (the Facade's hasOwnedExecution) over one open database, with its own write gate. */
+async function facadeWindow(t, hostBootId) {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-owned-writes-'));
+  const root = await kernel.resetCandidateRuntimeRoot(directory);
+  const database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId });
+  t.after(async () => {
+    await database.close();
+    await fs.rm(directory, { recursive: true, force: true });
+  });
+  const facade = { requireOpen() {}, product: { application: { database } }, writeGate: new RuntimeWriteGate() };
+  const hasOwnedExecution = () => Facade.prototype.hasOwnedExecution.call(facade);
+  let finish;
+  return {
+    facade,
+    hasOwnedExecution,
+    ownWork: async () => (await hasOwnedExecution()) ? { kind: 'work', reason: '本窗口有任务正在进行' } : undefined,
+    /** A write command (e.g. 清理备份 deleting) admitted through the gate, running until finishWrite(). */
+    startWrite() {
+      const running = facade.writeGate.run(() => new Promise((resolve) => { finish = resolve; }));
+      return running;
+    },
+    finishWrite: () => finish?.(),
+    /** As dataRootRelocation.ts coordinateExclusively's beforeGo: check, freeze, check again. */
+    beforeGo: (counter) => async () => {
+      if (await hasOwnedExecution()) return { busy: { kind: 'work', reason: '本窗口在确认之后开始了新的任务' } };
+      counter.freezes += 1;
+      const owned = database.conversationOwners.ownedActivity().map(({ conversationId }) => conversationId);
+      const thaw = facade.writeGate.freeze('迁移数据目录', owned);
+      return (await hasOwnedExecution()) ? { busy: { kind: 'work', reason: '本窗口在确认之后开始了新的任务' }, thaw } : { thaw };
+    }
+  };
+}
+
+test('最后一轮盲审 #1：本窗口有冻结前就在进行的写命令时，发起方在锁外等它结束（不冻结、不进锁），之后照常完成', { timeout: 60_000 }, async (t) => {
+  const { paths } = await createRoot(t);
+  const window = await facadeWindow(t, 'requester-with-write');
+  const write = window.startWrite();
+  assert.equal(await window.hasOwnedExecution(), true, 'a write command in progress is work, frozen or not');
+  const counter = { freezes: 0 };
+  let lockedRounds = 0;
+  const stages = [];
+  setTimeout(() => window.finishWrite(), 1_200);
+  const started = performance.now();
+  const outcome = await run(paths, {
+    operation: 'data-root-migration', operationKey: 'attempt-1', message: '为迁移数据目录', ignoreBackoff: true,
+    requesterHostBootId: 'requester-with-write', requesterBusy: window.ownWork, beforeGo: window.beforeGo(counter),
+    whenBusy: 'wait', participantConfirmation: 'final-countdown',
+    onProgress: (progress) => stages.push(`${progress.stage}:${progress.requesterBusy?.reason ?? ''}`),
+    withLocks: (body) => { lockedRounds += 1; return withRuntimeMaintenance(paths, body); }
+  }, async () => 'migrated');
+  await write;
+  assert.deepEqual(outcome, { state: 'completed', result: 'migrated', coordinated: false });
+  assert.ok(performance.now() - started >= 1_000, 'it waited for the write');
+  assert.deepEqual([lockedRounds, counter.freezes], [1, 1], 'one locked round, frozen once, after the write ended');
+  assert.ok(stages.includes('waiting-busy:本窗口有任务正在进行'), stages.join(', '));
+  assert.equal(window.facade.writeGate.frozen, false);
+});
+
+test('最后一轮盲审 #1（跨模块 F2）：其它窗口有正在进行的写命令（例如清理备份在删除）时答忙；自动调用放弃并如实说明，用户的调用等它结束再让它重载', { timeout: 60_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const peer = await facadeWindow(t, 'peer-with-write');
+  const b = await openWindow(t, binding, 'window-b', { busy: async () => (await peer.hasOwnedExecution()) ? WORK : undefined });
+  const write = peer.startWrite();
+  const automatic = await run(paths, BASE, async () => assert.fail('must not run'));
+  assert.equal(automatic.state, 'busy');
+  assert.equal(automatic.reason, '1 个其它窗口有任务正在进行，暂不打扰。');
+  assert.equal(b.releases(), 0);
+  setTimeout(() => peer.finishWrite(), 500);
+  const explicit = await run(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff: true, whenBusy: 'wait' }, async () => 'merged');
+  await write;
+  assert.deepEqual(explicit, { state: 'completed', result: 'merged', coordinated: true });
+  assert.equal(b.releases(), 1, 'it reloaded only after its write ended');
+});
+
+test('最后一轮盲审 #2：本窗口的操作从用户同意起就登记（准备可能要几分钟，还没有请求文件）：期间对其它请求答忙、从不让出；结束后照常让出', { timeout: 30_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const b = await openWindow(t, binding, 'window-b');
+  const release = holdExclusiveMaintenanceWork('window-b', { operation: 'data-root-relocation', operationKey: 'data-root-relocation:preparing', activity: '迁移数据目录' });
+  const automatic = await run(paths, BASE, async () => assert.fail('must not run'));
+  assert.equal(automatic.state, 'busy');
+  assert.equal(automatic.reason, '1 个其它窗口正在进行自己的维护（迁移数据目录），暂不打扰。');
+  assert.equal(b.releases(), 0, 'never reloaded in the middle of its preparation');
+  setTimeout(() => { release(); release(); }, 300);
+  const explicit = await run(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff: true, whenBusy: 'wait' }, async () => 'merged');
+  assert.deepEqual(explicit, { state: 'completed', result: 'merged', coordinated: true });
+  assert.equal(b.releases(), 1);
+});
+
+test('最后一轮盲审 #3：只读查询也判断未参与协作的窗口（旧版本、状态不明）：与调用一样在询问任何窗口之前就说明，调用方因此不会白做准备；刚启动还在登记宽限内的窗口不算', async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const input = { ...BASE, operationKey: 'large-merge:legacy', ignoreBackoff: true };
+  const query = () => readExclusiveMaintenanceRefusal(paths, { operation: input.operation, operationKey: input.operationKey, ignoreBackoff: true });
+  await openWindow(t, binding, 'current-window');
+  assert.equal(await query(), undefined);
+  // A window just opened that has not registered yet: within the grace, as the call waits for it.
+  const opening = await publishHost(binding, 'just-opened', new Date().toISOString());
+  assert.equal(await query(), undefined, 'within the registration grace');
+  await fs.rm(opening, { force: true });
+  // A live window of an older version: never registers.
+  await publishHost(binding, 'older-version');
+  const refused = await query();
+  assert.deepEqual(refused, { state: 'legacy-host', reason: '还有未参与协作的窗口（可能是旧版本）在使用这个数据目录，重载或关闭它后再试。' });
+  const ledger = await fs.readdir(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'ledger')).catch(() => []);
+  assert.deepEqual(ledger, [], 'the query writes nothing');
+  // The call says the same, before asking any window.
+  const called = await run(paths, input, async () => assert.fail('must not run'));
+  assert.deepEqual([called.state, called.reason], [refused.state, refused.reason]);
+});
+
+function participantFile(paths, hostBootId) {
+  return path.join(runtimeExclusiveMaintenanceDirectory(paths), 'hosts', `${hostBootId}.json`);
+}
+
+test('最后一轮盲审 #7：启动身份只在登记与 Host liveness 两边都有时才比较——登记时探测失败（没有身份）的本版本窗口照常参与，不当成旧版本', { timeout: 30_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const b = await openWindow(t, binding, 'window-without-identity');
+  const file = participantFile(paths, 'window-without-identity');
+  const { processStartIdentity: _dropped, ...record } = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify(record));
+  assert.equal(await readExclusiveMaintenanceRefusal(paths, { operation: BASE.operation, ignoreBackoff: false }), undefined);
+  const outcome = await run(paths, BASE, async () => 'merged');
+  assert.deepEqual(outcome, { state: 'completed', result: 'merged', coordinated: true });
+  assert.equal(b.releases(), 1);
+  // Both sides have one and they differ: another process's registration.
+  const other = await createRoot(t);
+  await openWindow(t, other.binding, 'window-other-identity');
+  const otherFile = participantFile(other.paths, 'window-other-identity');
+  await fs.writeFile(otherFile, JSON.stringify({ ...JSON.parse(await fs.readFile(otherFile, 'utf8')), processStartIdentity: 'another-start' }));
+  assert.equal((await run(other.paths, BASE, async () => assert.fail('must not run'))).state, 'legacy-host');
+});
+
+test('最后一轮盲审 #7：窗口的运行时一打开就登记为“正在打开”，参与方开始回答之前按忙（正在打开）对待而不是旧版本；一直停在打开中超过 2 分钟才算未参与协作', { timeout: 30_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  // The Runtime opened long ago by its liveness (a slow open: settling carried work…), registered as opening.
+  await publishHost(binding, 'slow-window');
+  await registerExclusiveMaintenanceParticipant(paths, 'slow-window', { opening: true });
+  assert.equal(await readExclusiveMaintenanceRefusal(paths, { operation: BASE.operation, ignoreBackoff: false }), undefined, 'not an older version');
+  const automatic = await run(paths, BASE, async () => assert.fail('must not run'));
+  assert.deepEqual([automatic.state, automatic.reason], ['busy', '1 个其它窗口正在打开，暂不打扰。']);
+  // The user's call waits for it; its participant starts answering, it yields, the call completes.
+  const stages = [];
+  setTimeout(() => { void openWindow(t, binding, 'slow-window'); }, 300);
+  const explicit = await run(paths, { ...BASE, operationKey: 'sources-b', ignoreBackoff: true, whenBusy: 'wait',
+    onProgress: (progress) => stages.push(progress.busy.filter((item) => item.opening).length) }, async () => 'merged');
+  assert.deepEqual(explicit, { state: 'completed', result: 'merged', coordinated: true });
+  assert.ok(stages.some((count) => count === 1), 'waited for the window still opening');
+  // Stuck opening: outside the protocol after 2 minutes.
+  const stuck = await createRoot(t);
+  await publishHost(stuck.binding, 'stuck-window');
+  await registerExclusiveMaintenanceParticipant(stuck.paths, 'stuck-window', { opening: true });
+  const stuckFile = participantFile(stuck.paths, 'stuck-window');
+  await fs.writeFile(stuckFile, JSON.stringify({ ...JSON.parse(await fs.readFile(stuckFile, 'utf8')), openingAt: new Date(Date.now() - 3 * 60_000).toISOString() }));
+  assert.equal((await run(stuck.paths, BASE, async () => assert.fail('must not run'))).state, 'legacy-host');
+  await fs.rm(stuckFile, { force: true });
+});
+
+test('最后一轮盲审 #8：同一项工作的较新请求只在较早的一方会等待或已过 prepare 时才让先——较早的是遇忙即放弃、仍在 prepare 的自动调用时，用户的调用不让先，照常完成', { timeout: 30_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  const a = await openWindow(t, binding, 'window-a');
+  // Window A's automatic call of the same work, published first and still in prepare.
+  await writeRequest(paths, {
+    requestId: 'earlier-automatic', createdAt: '2020-01-01T00:00:00.000Z', operation: BASE.operation, operationKey: BASE.operationKey,
+    whenBusy: 'abandon', phase: 'prepare', requesterHostBootId: 'window-a'
+  });
+  const explicit = await run(paths, { ...BASE, ignoreBackoff: true, whenBusy: 'wait', busyWaitTimeoutMs: 5_000 }, async () => 'merged');
+  assert.deepEqual(explicit, { state: 'completed', result: 'merged', coordinated: true }, 'not superseded by a call that gives up by itself');
+  assert.equal(a.releases(), 1);
+  // Past prepare (it holds the locks, windows confirmed it), or waiting itself: the later one gives way as before.
+  for (const earlier of [{ whenBusy: 'abandon', phase: 'confirm' }, { whenBusy: 'wait', phase: 'prepare' }]) {
+    const other = await createRoot(t);
+    await openWindow(t, other.binding, 'window-a');
+    await writeRequest(other.paths, {
+      requestId: 'earlier', createdAt: '2020-01-01T00:00:00.000Z', operation: BASE.operation, operationKey: BASE.operationKey,
+      requesterHostBootId: 'window-a', ...earlier
+    });
+    const later = await run(other.paths, { ...BASE, ignoreBackoff: true, whenBusy: 'wait', busyWaitTimeoutMs: 5_000 }, async () => assert.fail('must not run'));
+    assert.equal(later.state, 'superseded', JSON.stringify(earlier));
+  }
+});
+
+test('最后一轮盲审 #8：较早的遇忙即放弃的请求看到为同一项工作答忙、但不会让先（它在等待）的窗口时按忙放弃，不再按即将让出等它', { timeout: 30_000 }, async (t) => {
+  const { binding, paths } = await createRoot(t);
+  await publishHost(binding, 'window-b');
+  const registration = await registerExclusiveMaintenanceParticipant(paths, 'window-b');
+  t.after(() => registration.unregister());
+  const started = performance.now();
+  const outcome = run(paths, { ...BASE, prepareTimeoutMs: 5_000 }, async () => assert.fail('must not run'));
+  let request;
+  for (let polls = 0; polls < 500 && !request; polls += 1) {
+    [request] = await readExclusiveMaintenanceRequests(paths);
+    if (!request) await delay(10);
+  }
+  const directory = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'responses', request.requestId);
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, 'window-b.json'), JSON.stringify({
+    kind: 'limcode-runtime-exclusive-maintenance-response', requestId: request.requestId, round: request.round, hostBootId: 'window-b',
+    stage: 'prepare', answer: 'busy', busyKind: 'work', reason: '本窗口正在等待执行合并旧聊天记录', respondedAt: new Date().toISOString(),
+    maintenance: { operation: BASE.operation, operationKey: BASE.operationKey, activity: '合并旧聊天记录', whenBusy: 'wait' }
+  }));
+  const finished = await outcome;
+  assert.deepEqual([finished.state, finished.reason], ['busy', '1 个其它窗口正在进行自己的维护（合并旧聊天记录），暂不打扰。']);
+  assert.ok(performance.now() - started < 4_000, 'not waited for until the prepare timeout');
+});

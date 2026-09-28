@@ -66,6 +66,7 @@ import type {
 } from '../../../vscode/ApplicationFacade';
 import { VscodeReliableKernelCommandRouter, watchConversationRefresh } from './VscodeReliableKernelCommandRouter';
 import { isRuntimeWritesFrozenError, RuntimeWriteGate } from './runtimeWriteGate';
+import { registerExclusiveMaintenanceParticipant } from '../../reliableKernel/runtimeExclusiveMaintenance';
 import {
   VscodeReliableKernelCutoverCoordinator,
   archiveCurrentRuntimeRootForReset
@@ -252,13 +253,19 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
             );
           }
           await completeVscodeRuntimeDataSetSelection(getPaths());
-          return VscodeReliableKernelProductRuntime.open(context, {
+          const opened = await VscodeReliableKernelProductRuntime.open(context, {
             authority, runtimePlacement, holdForRelocatedWork,
             onConfigurationChanged: async () => {
               await facade?.commandRouter.refreshConfiguration();
               await facade?.refreshConversationHistory();
             }
           });
+          // From its Host liveness on, other windows' maintenance sees this window as opening (busy)
+          // until its participant starts answering (extension.ts), never as an older version.
+          await registerExclusiveMaintenanceParticipant(
+            createRuntimeRootPaths(runtimePlacement.runtimeDataRootPath), opened.application.database.hostBootId, { opening: true }
+          ).catch((error: unknown) => console.warn('[LimCode] 无法登记本窗口正在打开。', error));
+          return opened;
         }, wait));
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
@@ -755,19 +762,21 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   /**
-   * True while a reload of this window would interrupt work: an ExecutionLease of this Host, a
-   * command or run in progress (an activity pin), or any durable pending work of a conversation it
-   * owns — queued input, undelivered deliveries and wakes, a pending answer delivery, background
+   * True while a reload of this window would interrupt work: a write command still running (the
+   * write gate's, e.g. 清理备份 checking or deleting), an ExecutionLease of this Host, a command or
+   * run in progress (an activity pin), or any durable pending work of a conversation it owns —
+   * queued input, undelivered deliveries and wakes, a pending answer delivery, background
    * processes. The owner manager keeps a conversation exactly while that probe reports work.
    * Frozen (freezeNewWork): only work that existed before the freeze counts — a write command
-   * still running from before, and the conversations owned then (what a view does meanwhile is not
-   * work). Leases always count: while frozen none can start, so one is work from before.
+   * still running from before (and, since its effects cannot be told apart, the whole freeze once
+   * one was), and the conversations owned then (what a view does meanwhile is not work). Leases
+   * always count: while frozen none can start, so one is work from before.
    */
   public async hasOwnedExecution(): Promise<boolean> {
     this.requireOpen();
     const database = this.product.application.database;
     const frozen = this.writeGate.frozenBaseline();
-    if (frozen?.writesRunning) return true;
+    if (this.writeGate.writesInFlight || frozen?.writesRunning) return true;
     if ((await listAllDomainRows(database, 'ExecutionLease', { host_boot_id: database.hostBootId })).length > 0) return true;
     for (const { conversationId, pinned } of database.conversationOwners.ownedActivity()) {
       if (frozen && !frozen.conversationIds.has(conversationId)) continue;
@@ -805,7 +814,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     this.requireOpen();
     const owned = this.product.application.database.conversationOwners.ownedActivity().map(({ conversationId }) => conversationId);
     const thawWrites = this.writeGate.freeze(activity, owned);
-    const thawExecution = this.product.freezeNewExecution();
+    const thawExecution = this.product.freezeNewExecution(owned);
     return () => {
       thawExecution();
       thawWrites();

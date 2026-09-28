@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { MainPanel, type MainPanelOptions } from '../panels/MainPanel';
 import type { ApplicationFacade } from '../ApplicationFacade';
 import type { ApplicationStartup } from '../ApplicationStartup';
+import type { ExclusiveMaintenanceParticipantHost } from '../runtimeExclusiveMaintenance';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 
 export function registerCommands(context: vscode.ExtensionContext, startup: ApplicationStartup): void {
@@ -96,7 +97,14 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     // `request` carries the settings page that asked ({ clientId }); its confirmations appear there.
     [EXTENSION_COMMAND_IDS.relocateDataRoot, '迁移数据目录失败', async (request?: unknown) => {
       const { relocateDataRoot } = await import('./dataRootRelocation');
-      await relocateDataRoot(context, startup, request);
+      // Started from the settings page: from there until it ended (confirmation, a preparation of
+      // possibly minutes, coordination, undo) no other window's maintenance reloads this window.
+      const release = await holdRelocation(startup, request);
+      try {
+        await relocateDataRoot(context, startup, request);
+      } finally {
+        release();
+      }
     }],
     [EXTENSION_COMMAND_IDS.returnToPreviousDataRoot, '回到旧数据目录失败', async (request?: unknown) => {
       const { returnToPreviousDataRoot } = await import('./dataRootRelocation');
@@ -123,6 +131,16 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
     openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand, runtimeDataSetsCommand,
     ...dataRootCommandDisposables
   );
+}
+
+/** See the relocateDataRoot command: only a relocation started from a settings page (`{ clientId }`) runs here. */
+async function holdRelocation(startup: ApplicationStartup, request: unknown): Promise<() => void> {
+  const host = startup.current() as Partial<ExclusiveMaintenanceParticipantHost> | undefined;
+  if (typeof (request as { clientId?: unknown } | undefined)?.clientId !== 'string' || typeof host?.exclusiveMaintenanceTarget !== 'function') {
+    return () => undefined;
+  }
+  const { holdOwnExclusiveMaintenanceWork } = await import('../runtimeExclusiveMaintenance');
+  return holdOwnExclusiveMaintenanceWork(host as ExclusiveMaintenanceParticipantHost, { operation: 'data-root-relocation', activity: '迁移数据目录' });
 }
 
 async function readyApplication(startup: ApplicationStartup): Promise<ApplicationFacade | undefined> {

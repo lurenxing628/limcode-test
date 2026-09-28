@@ -516,7 +516,9 @@ test('手动开始：先只读估计（可取消的通知），再确认（写�
   assert.equal(options.modal, true);
   assert.match(options.detail, /^先在后台准备约 1–5 分钟（窗口照常可用，可以取消），再等本窗口和其它 LimCode 窗口的任务结束（最多约 10 分钟），然后所有 LimCode 窗口重载一次，暂停约 1–4 分钟：其它窗口重载并显示进度/);
   assert.ok(!/分钟）？/.test(title));
-  assert.deepEqual(window.order.slice(0, 3), ['estimate', 'confirm', 'prepare']);
+  assert.deepEqual(window.order.slice(0, 4), ['estimate', 'confirm', 'hold:historical-merge', 'prepare'],
+    '最后一轮盲审 #2：确认之后、准备之前就登记本窗口的会话（其它窗口的维护不会在准备中途让它重载）');
+  assert.equal(window.order.at(-1), 'unhold', '会话结束才解除');
   // Nothing settled while both sources go on to the session: nothing to tell yet (not the batch's “这次没有合并” for a click).
   assert.deepEqual(window.reports, []);
   // Asked before the confirmation whether the cooldown would refuse it (the explicit call's view: no key backoff).
@@ -562,7 +564,8 @@ test('首次启动自动开始：只读估计、倒计时，倒计时结束（�
   // A kept token of an explicit call never helps an automatic one.
   const window = loadWindow(fixture, { busyForMs: 300, requesterToken: 'kept-token' });
   await window.offer();
-  assert.deepEqual(window.order.slice(0, 3), ['estimate', 'countdown', 'prepare'], 'prepared only after the countdown ran out');
+  assert.deepEqual(window.order.slice(0, 4), ['estimate', 'countdown', 'hold:historical-merge', 'prepare'], 'prepared only after the countdown ran out');
+  assert.equal(window.order.at(-1), 'unhold');
   assert.deepEqual(window.engine.calls.slice(0, 2), [['estimate', ['workspace:big-1', 'workspace:big-2'], false], ['prepare', ['workspace:big-1', 'workspace:big-2']]]);
   const preparing = window.ui.progress.find((entry) => entry.title?.startsWith('正在准备'));
   assert.deepEqual([preparing.title, preparing.location, preparing.cancellable], ['正在准备合并较大的旧聊天记录（窗口照常可用）', 15, true]);
@@ -910,6 +913,12 @@ function loadWindow(fixture, behavior = {}) {
   });
   const recordingLayer = {
     ...layer,
+    // 最后一轮盲审 #2: this window holds its session from the user's agreement until it ended.
+    holdOwnExclusiveMaintenanceWork: (holdHost, work) => {
+      order.push(`hold:${work.operation}`);
+      const release = layer.holdOwnExclusiveMaintenanceWork(holdHost, work);
+      return () => { order.push('unhold'); release(); };
+    },
     runWithExclusiveMaintenance: (paths, options, operation) => {
       coordinations.push(options);
       return layer.runWithExclusiveMaintenance(paths, { ...options, pollMs: 10 }, (context) => operation({

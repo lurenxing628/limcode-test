@@ -28,8 +28,11 @@ class Uri {
   toString() { return `file://${this.fsPath}`; }
 }
 let registeredSerializer;
+// MainPanel reads vscode.commands through a copy of this module made when it loads: present from the start.
+const executedCommands = [];
 const vscode = {
   Uri, EventEmitter, ViewColumn: { One: 1 }, workspace: { workspaceFolders: [] },
+  commands: { executeCommand: async (command) => { executedCommands.push(command); } },
   window: {
     registerWebviewPanelSerializer(_viewType, serializer) {
       registeredSerializer = serializer;
@@ -161,4 +164,62 @@ test('盲审 #10：重载前请每个面板立即保存未发送的输入，经 
     panel.dispose();
   }
   assert.equal(MainPanel.saveComposerDrafts(post), 0, 'a closed panel is not asked');
+});
+
+test('最后一轮盲审 #6：本窗口冻结时，设置页的数据目录按钮（迁移、回到旧目录、删除旧目录、清理备份）在面板入口就拒绝并说明原因；回答提示照常', { timeout: 15000 }, async () => {
+  let receive;
+  const disposed = new EventEmitter();
+  const panel = {
+    title: 'Limcode Test', visible: true, viewColumn: 1,
+    onDidDispose: disposed.event,
+    onDidChangeViewState: new EventEmitter().event,
+    reveal() {},
+    dispose() { disposed.fire(); disposed.dispose(); },
+    webview: {
+      options: {}, cspSource: 'vscode-webview:', html: '',
+      asWebviewUri: (uri) => uri,
+      onDidReceiveMessage(listener, receiver, disposables) {
+        receive = receiver ? listener.bind(receiver) : listener;
+        const disposable = { dispose() { receive = undefined; } };
+        disposables?.push(disposable);
+        return disposable;
+      }
+    }
+  };
+  let frozen = true;
+  const facade = {
+    waitUntilHydrated: async () => {},
+    conversationExists: async () => true,
+    getConversationDisplayTitle: () => '对话',
+    recoverConversation: async () => {},
+    attachWebview: () => 'settings-client',
+    setWebviewVisible() {},
+    detachWebview() {},
+    handleWebviewMessage() {},
+    writeGate: { admit() { if (frozen) throw new Error('正在迁移数据目录，完成后再操作。'); } }
+  };
+  const executed = executedCommands;
+  executed.length = 0;
+  const warnings = [];
+  vscode.window.showWarningMessage = async (message) => { warnings.push(message); };
+  try {
+    MainPanel.registerSerializer({ subscriptions: [], extensionUri: Uri.file(process.cwd()) }, {
+      wait: async () => facade, waiting: () => undefined, onDidChangeWaiting: () => ({ dispose() {} })
+    });
+    await registeredSerializer.deserializeWebviewPanel(panel, { conversationId: 'conversation' });
+    for (const action of ['relocate', 'returnToPrevious', 'deletePrevious', 'cleanupBackups']) {
+      receive({ type: 'dataRoot.action', id: `frozen-${action}`, payload: { action } });
+    }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual(executed, [], 'no data-directory command started');
+    assert.equal(warnings.length, 4);
+    assert.ok(warnings.every((message) => message.endsWith('正在迁移数据目录，完成后再操作。')), JSON.stringify(warnings));
+    frozen = false;
+    receive({ type: 'dataRoot.action', id: 'thawed', payload: { action: 'relocate' } });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(executed.length, 1, 'thawed: as before');
+  } finally {
+    panel.dispose();
+    delete vscode.window.showWarningMessage;
+  }
 });

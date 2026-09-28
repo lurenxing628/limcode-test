@@ -812,12 +812,21 @@ function installationOf(context: vscode.ExtensionContext): DataRootMovedNotice['
 async function settleInterruptedRelocation(context: vscode.ExtensionContext, pending: PendingDataRootRelocation, ask?: Ask): Promise<boolean> {
   let problem: string | undefined;
   let unreachable = false;
+  // Told once below: a relocation interrupted while it still moved data (not one whose failure and
+  // unfinished undo were already told, which is only finished here).
+  const interrupted = !ask && await relocationPhase(pending).catch(() => 'unknown' as const) === 'running';
   try {
     const outcome = await recoverInterruptedDataRootRelocation({
       targetRootPath: pending.targetRootPath, relocationId: pending.relocationId, ...(pending.targetAnchor ? { anchor: pending.targetAnchor } : {})
     });
     if (outcome === 'recovered' || outcome === 'absent') {
       await updateGlobalStatusDataRoot(context, { pendingRelocation: null, expectedPendingRelocationId: pending.relocationId });
+      // At startup (its process is gone: the window closed or reloaded meanwhile): told once, since
+      // the record is gone now. The user's own retry (ask) goes on without it.
+      if (interrupted) {
+        void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：上次的数据目录迁移没有完成就中断了（进行迁移的窗口被关闭或重载），没有生效：`
+          + `数据目录没有切换，原来的目录照常使用；${outcome === 'recovered' ? '它在新目录里留下的内容已撤销' : '新目录里没有留下它的内容'}。需要时可以重新迁移。`);
+      }
       return true;
     }
     if (outcome === 'held' || outcome === 'orphaned') {

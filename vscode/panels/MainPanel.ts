@@ -456,6 +456,14 @@ export class MainPanel {
       answerDataRootPrompt(this.clientId, payload);
       return;
     }
+    // Each of these writes the data directory: refused at once while this window is frozen for a
+    // data-directory operation, with the reason (“正在迁移数据目录，完成后再操作。”).
+    try {
+      this.backendApp.writeGate?.admit();
+    } catch (error) {
+      void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
     const command = action === 'relocate' ? EXTENSION_COMMAND_IDS.relocateDataRoot
       : action === 'returnToPrevious' ? EXTENSION_COMMAND_IDS.returnToPreviousDataRoot
         : action === 'deletePrevious' ? EXTENSION_COMMAND_IDS.deletePreviousDataRoot
