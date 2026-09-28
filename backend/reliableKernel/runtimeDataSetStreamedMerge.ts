@@ -2045,8 +2045,7 @@ function measuredNeed(prepared: PreparedLargeMergeSource, targetIndexBytes: numb
  */
 function diskFull(error: unknown, directory: string, doing: string, undone: string): unknown {
   if (error instanceof engine.Outcome || !isDiskFull(error)) return error;
-  const file = (error as { path?: unknown }).path;
-  const where = typeof file === 'string' && path.isAbsolute(file) ? path.dirname(file) : directory;
+  const where = engine.writtenDirectory(error, directory);
   return new engine.Outcome({ kind: 'deferred', code: DISK_FULL, message: `磁盘空间不足：${doing}在 ${where} 写不下了，${undone}；腾出空间后会再合并` });
 }
 

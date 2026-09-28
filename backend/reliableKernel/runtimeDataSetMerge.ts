@@ -2292,6 +2292,12 @@ async function transferSourceCas(
     });
   return transfer.catch((error: unknown) => {
     if (error instanceof Outcome) throw error;
+    if (isDiskFullError(error)) {
+      throw new Outcome({
+        kind: 'deferred', code: 'runtime-data-set-merge-disk-full',
+        message: `磁盘空间不足：复制正文文件时在 ${writtenDirectory(error, target.controlRoot)} 写不下了；腾出空间后会再合并`
+      });
+    }
     throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `复制正文文件时出错，稍后重试：${errorMessage(error)}` });
   });
 }
@@ -3485,6 +3491,16 @@ function isDiskFullError(error: unknown): boolean {
   return false;
 }
 
+/**
+ * The directory a failed write went to, for saying where the disk is full: a link, copy or rename
+ * names what it read as `path` and what it wrote as `dest`; `fallback` when neither is a full path.
+ */
+function writtenDirectory(error: unknown, fallback: string): string {
+  const { path: read, dest } = (error !== null && typeof error === 'object' ? error : {}) as { path?: unknown; dest?: unknown };
+  const file = typeof dest === 'string' ? dest : read;
+  return typeof file === 'string' && path.isAbsolute(file) ? path.dirname(file) : fallback;
+}
+
 const TRANSIENT_ERRNO_CODES = new Set([
   'EACCES', 'EAGAIN', 'EBUSY', 'EDQUOT', 'EINTR', 'EIO', 'EMFILE', 'ENFILE', 'ENOMEM', 'ENOSPC', 'EPERM', 'EROFS', 'ETIMEDOUT'
 ]);
@@ -3651,7 +3667,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, insertedRowsPresence, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
-  closeSnapshot, pruneMergePreparations, isDiskFullError
+  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory
 });
 export type {
   PickedSource as HistoricalMergePickedSource, Refusal as HistoricalMergeRefusal, RowPlan as HistoricalMergeRowPlan, SourceRef as HistoricalMergeSourceRef,

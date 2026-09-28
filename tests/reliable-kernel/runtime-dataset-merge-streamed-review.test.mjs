@@ -522,7 +522,7 @@ test('空间不够、开不了大库会话时，中等来源照常单独协调�
   }
 });
 
-test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间不足（中文、没有系统原文），后面的来源也不开始准备，不留备份和登记', { timeout: 300_000 }, async (t) => {
+test('准备时写不下目标备份或正文对象（ENOSPC）：这份推迟为磁盘空间不足（中文、写明写不下的目录、没有系统原文），后面的来源也不开始准备，不留备份和登记', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
@@ -549,6 +549,46 @@ test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间�
   assert.deepEqual(await registrations(fixture), []);
   assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
 
+  // The same once the backup is there and the target's content store is full: said with the directory
+  // written to (a link names the source object as its path, the target as its dest).
+  const linkedTo = [];
+  const noRoomToLink = async (from, to) => {
+    linkedTo.push(to);
+    throw Object.assign(new Error(`ENOSPC: no space left on device, link '${from}' -> '${to}'`), { code: 'ENOSPC', errno: -28, syscall: 'link', path: from, dest: to });
+  };
+  const linking = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: { ...LIMITS, linkFile: noRoomToLink }
+  }));
+  assert.deepEqual(linking.sources, []);
+  assert.deepEqual(linking.report.deferred.map((issue) => issue.code), [DISK_FULL, DISK_FULL], JSON.stringify(linking.report));
+  assert.equal(linkedTo.length, 1, '第一个正文对象就写不下，后面的来源不开始');
+  assert.equal(linking.report.deferred[0].message, `磁盘空间不足：复制正文文件时在 ${path.dirname(linkedTo[0])} 写不下了；腾出空间后会再合并`);
+  assert.deepEqual(await targetBackups(fixture), [], '这次的备份也删掉');
+  assert.deepEqual(await registrations(fixture), []);
+  assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
+
+  // And when the temporary directory has no room for the private copy of the source (its copy names the copy as dest).
+  const copyFile = fsPromises.copyFile;
+  fsPromises.copyFile = async (from, to, ...rest) => {
+    if (path.basename(path.dirname(String(to))).startsWith(`limcode-runtime-history-${process.pid}-`)) {
+      throw Object.assign(new Error(`ENOSPC: no space left on device, copyfile '${from}' -> '${to}'`), { code: 'ENOSPC', errno: -28, syscall: 'copyfile', path: String(from), dest: String(to) });
+    }
+    return copyFile(from, to, ...rest);
+  };
+  let copying;
+  try {
+    copying = await withWindow(fixture, (window) => prepareLargeMergeSources({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+    }));
+  } finally {
+    fsPromises.copyFile = copyFile;
+  }
+  assert.deepEqual(copying.report.deferred.map((issue) => issue.code), [DISK_FULL, DISK_FULL], JSON.stringify(copying.report));
+  const [, temporary] = /^磁盘空间不足：准备合并这份旧聊天记录时在 (.+) 写不下了，这次没有合并；腾出空间后会再合并$/u.exec(copying.report.deferred[0].message) ?? [];
+  assert.equal(path.dirname(temporary ?? ''), os.tmpdir(), copying.report.deferred[0].message);
+  assert.match(path.basename(temporary), new RegExp(`^limcode-runtime-history-${process.pid}-`));
+  assert.deepEqual(await targetBackups(fixture), []);
+  assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
 });
 
 // ---------------------------------------------------------------------------------------------
