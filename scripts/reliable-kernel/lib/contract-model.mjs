@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 
+/** Source text with LF line endings, so a Windows checkout (core.autocrlf) matches the same multi-line snippets. */
+function readText(file) {
+  return fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+}
+
 export const CONTRACT_FILES = [
   'authority.json',
   'client-feed.json',
@@ -310,7 +315,7 @@ export function loadContractDocuments(root) {
   const directory = path.join(root, 'docs/architecture/reliable-kernel/contracts');
   return Object.fromEntries(CONTRACT_FILES.map((file) => [
     file,
-    JSON.parse(fs.readFileSync(path.join(directory, file), 'utf8'))
+    JSON.parse(readText(path.join(directory, file)))
   ]));
 }
 
@@ -440,12 +445,12 @@ function validateValidatorProtocol(root, registry, failures) {
       failures.push(`${group.id}校验器文件不存在：${validatorPath ?? '未登记'}`);
       continue;
     }
-    const source = fs.readFileSync(absolute, 'utf8');
+    const source = readText(absolute);
     if (!source.includes('new Map(') || !source.includes('.get(check.id)')) failures.push(`${group.id}校验器必须使用Map<checkId,handler>`);
     if (source.includes('matches(check)') || source.includes('.find(([matches])')) failures.push(`${group.id}校验器不得按description谓词匹配handler`);
     if (group.id !== 'plan' && !source.includes('PENDING:')) failures.push(`${group.id}校验器必须诚实输出PENDING`);
   }
-  const packageSource = fs.readFileSync(path.join(root, 'scripts/reliable-kernel/validators/package.mjs'), 'utf8');
+  const packageSource = readText(path.join(root, 'scripts/reliable-kernel/validators/package.mjs'));
   for (const marker of [
     "unzipEntry(absolute, 'extension/package.json'",
     'readVsixMainEntry(absolute)',
@@ -456,7 +461,7 @@ function validateValidatorProtocol(root, registry, failures) {
     if (!packageSource.includes(marker)) failures.push(`package provenance handler缺少制品真实性步骤：${marker}`);
   }
   if (packageSource.includes("fs.readFileSync(path.join(root, 'package.json')")) failures.push('package validator不得用工作区package.json代替VSIX内manifest');
-  const generatorSource = fs.readFileSync(path.join(root, 'scripts/reliable-kernel/write-build-provenance.mjs'), 'utf8');
+  const generatorSource = readText(path.join(root, 'scripts/reliable-kernel/write-build-provenance.mjs'));
   if (!generatorSource.includes('manifest.main') || !generatorSource.includes("crypto.createHash('sha256')")) failures.push('build provenance generator必须读取package.json.main并计算SHA-256');
   for (const marker of ["'status'", "'--porcelain'", "'--untracked-files=all'", 'worktreeClean']) {
     if (!generatorSource.includes(marker)) failures.push(`build provenance generator缺少构建时工作区洁净检查：${marker}`);
@@ -539,13 +544,13 @@ function validateMigration(root, migration, failures) {
   if (!plainObject(merge) || JSON.stringify(merge) !== JSON.stringify(expectedMerge)) {
     failures.push('旧历史库只能在当前库打开后在线合并：来源离线，重活不持锁，全部检查通过才先备份再按现有终态收尾，每来源一个经 Repository 与 codec 的写事务，超过在线上限才在锁外协调独占兜底、超过内存单事务上限等大库会话的流式维护事务、超过流式硬上限记为太大，冲突整份拒绝，合并进来的对话不会被自动继续');
   }
-  const repositoriesSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/repositories.ts'), 'utf8');
+  const repositoriesSource = readText(path.join(root, 'backend/reliableKernel/repositories.ts'));
   const historicalCopyDomains = /HISTORICAL_COPY_DOMAINS: readonly string\[\] = \[([^\]]*)\]/.exec(repositoriesSource)?.[1]
     ?.split(',').map((item) => item.trim().replace(/^'|'$/g, '')).filter(Boolean) ?? [];
   if (JSON.stringify(historicalCopyDomains) !== JSON.stringify(expectedMerge.historicalCopyDomains)) {
     failures.push('历史复制插入领域必须与 migration.json#historicalMerge.historicalCopyDomains 完全一致');
   }
-  const mergeSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeDataSetMerge.ts'), 'utf8');
+  const mergeSource = readText(path.join(root, 'backend/reliableKernel/runtimeDataSetMerge.ts'));
   const mergeConstant = (pattern) => pattern.exec(mergeSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
   const [onlineRows, onlineMiB] = mergeConstant(/RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object\.freeze\(\{ maxRows: ([\d_]+), maxBytes: ([\d_]+) \* 1024 \* 1024 \}\)/);
   const [transactionRows] = mergeConstant(/RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS = ([\d_]+);/);
@@ -553,8 +558,8 @@ function validateMigration(root, migration, failures) {
   const [chunkRows] = mergeConstant(/const READ_CHUNK = ([\d_]+);/);
   const [evidenceRows] = mergeConstant(/RUNTIME_DATA_SET_MERGE_COMMIT_EVIDENCE_ROWS = ([\d_]+);/);
   const [evidencePerEnd] = mergeConstant(/const EVIDENCE_PER_END = ([\d_]+);/);
-  const streamedSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeDataSetStreamedMerge.ts'), 'utf8');
-  const ledgerSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeDataSetMergeLedger.ts'), 'utf8');
+  const streamedSource = readText(path.join(root, 'backend/reliableKernel/runtimeDataSetStreamedMerge.ts'));
+  const ledgerSource = readText(path.join(root, 'backend/reliableKernel/runtimeDataSetMergeLedger.ts'));
   const [heartbeatMs] = /const PREPARATION_HEARTBEAT_MS = ([\d_]+);/.exec(streamedSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
   const [staleMs] = /RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS = ([\d_]+);/.exec(ledgerSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
   const streamedChunk = /RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS: number = engine\.READ_CHUNK;/.test(streamedSource);
@@ -582,10 +587,10 @@ function validateMigration(root, migration, failures) {
     .exec(streamedSource)?.slice(1).map(Number) ?? [];
   const [measuredLow, measuredHigh] = /RUNTIME_DATA_SET_LARGE_MERGE_MEASURED_RATE_BOUNDS = Object\.freeze\(\{ low: ([\d.]+), high: ([\d.]+) \}\)/
     .exec(streamedSource)?.slice(1).map(Number) ?? [];
-  const casCacheSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeCasVerificationCache.ts'), 'utf8');
+  const casCacheSource = readText(path.join(root, 'backend/reliableKernel/runtimeCasVerificationCache.ts'));
   const casCacheFile = /const CACHE_FILE = '([^']+)';/.exec(casCacheSource)?.[1] ?? '';
   const [casCacheDays] = /const MAX_AGE_MS = ([\d_]+) \* 24 \* 60 \* 60 \* 1000;/.exec(casCacheSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
-  const guardSource = fs.readFileSync(path.join(root, 'backend/capabilities/filesystem/sqliteDatabaseFileGuard.ts'), 'utf8');
+  const guardSource = readText(path.join(root, 'backend/capabilities/filesystem/sqliteDatabaseFileGuard.ts'));
   const limcodeDatabaseName = /const LIMCODE_DATABASE_FILE_NAME = \/(.+)\/;/.exec(guardSource)?.[1];
   const ownDatabaseName = limcodeDatabaseName !== undefined && ['', '-wal', '-shm'].every((suffix) => new RegExp(limcodeDatabaseName).test(`${casCacheFile}${suffix}`));
   if (!expectedMerge.exclusivity.includes(`-within-${measuredLow}x-to-${measuredHigh}x-range-${unmeasuredLow}x-to-${unmeasuredHigh}x;`)
@@ -593,7 +598,7 @@ function validateMigration(root, migration, failures) {
     || !ownDatabaseName) {
     failures.push('migration.json#historicalMerge 的只读估计范围、实测速率的换算上下限与正文核验缓存的保留天数必须与代码常量一致；正文核验缓存必须用 LimCode 自己的数据库名（进程内文件工具不会打开它）');
   }
-  const spaceSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeDataSetLargeMergeSpace.ts'), 'utf8');
+  const spaceSource = readText(path.join(root, 'backend/reliableKernel/runtimeDataSetLargeMergeSpace.ts'));
   const [walPeak] = /export const LARGE_MERGE_WAL_PEAK_FACTOR = ([\d.]+);/.exec(spaceSource)?.slice(1).map(Number) ?? [];
   const [indexShare] = /export const LARGE_MERGE_TARGET_INDEX_SHARE = ([\d.]+);/.exec(spaceSource)?.slice(1).map(Number) ?? [];
   const [skipChunks] = /const SKIP_SEGMENT_CHUNKS = ([\d_]+);/.exec(streamedSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
@@ -610,7 +615,7 @@ function validateMigration(root, migration, failures) {
     || !expectedMerge.casPolicy.includes(`-keeps-at-most-${memoryEntries}-identities-in-memory-`)) {
     failures.push('migration.json#historicalMerge 的大库会话空间模型（WAL 倍数、索引页比例、数据库临时文件比例、余量）、剩余时间改按速率之前的写入时长、跳过闭包每段的读取块数、目标备份登记的过期时限与正文核验缓存的内存上限必须与代码常量一致');
   }
-  const largeSessionSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeLargeMergeSession.ts'), 'utf8');
+  const largeSessionSource = readText(path.join(root, 'backend/reliableKernel/runtimeLargeMergeSession.ts'));
   const largeSessionConstant = (name) => Number(new RegExp(`${name}: ([\\d_.]+)[,\\n]`).exec(largeSessionSource)?.[1]?.replaceAll('_', ''));
   const [largeMarginMiB] = /freeSpaceMarginBytes: ([\d_]+) \* 1024 \* 1024,/.exec(largeSessionSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
   const largeResultMinutes = Number(/resultTtlMs: ([\d_]+) \* 60_000/.exec(largeSessionSource)?.[1]);
@@ -642,7 +647,7 @@ function validateMigration(root, migration, failures) {
     cleanup: 'crashed-requester-requests-and-responses-swept-by-next-request; answers-removed-only-without-request-in-listings-before-and-after-and-unwritten-15s; cleanup-failure-logged-never-replaces-outcome; eperm-retried',
     exclusivityProof: 'host-liveness-records-only; request-advisory'
   };
-  const openingWaitSource = fs.readFileSync(path.join(root, 'vscode/runtimeOpeningWait.ts'), 'utf8');
+  const openingWaitSource = readText(path.join(root, 'vscode/runtimeOpeningWait.ts'));
   const [maintenanceWarnMinutes] = /maintenanceWarnMs: ([\d_]+) \* 60_000,/.exec(openingWaitSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
   const [expectedEndStretch] = /expectedEndStretch: ([\d.]+),/.exec(openingWaitSource)?.slice(1).map(Number) ?? [];
   if (!expectedExclusive.reloadedHostBehavior.includes(`-postponed-until-running-${expectedEndStretch}x-the-expected-duration-never-before-${maintenanceWarnMinutes}m-`)) {
@@ -685,7 +690,7 @@ function validateMigration(root, migration, failures) {
   if (!plainObject(cleanup) || JSON.stringify(cleanup) !== JSON.stringify(expectedCleanup)) {
     failures.push('备份清理只删能证明完整存在于本地库的副本：升级前、合并前与合并来源的收尾前备份的全部对话、消息修订与其它历史记录 id 和它引用的正文都在同一控制根的本地库里、显示的消息也相同才可删（显示不同的单列、默认不勾选；当前库只经它自己的读取线程查询，与本地库是同一个文件的硬链接不读），保护满 1 小时的最新一份及更新的、不满 1 小时、有临时文件、进行中的日志与未报告的收尾引用，升级备份按最晚的时间满 7 天、旧版 3→4 备份一律保留；外来历史库只处理核验通过的，与非当前本地库身份与内容摘要相同、或它与它保留的备份的全部 id 都在某一个本地库里才可删，按控制根删（拷来目录整体不删），外来声明不等待地取、声明内重新核验，外来目录里只动被删那一份；拷来目录整体与旧格式备份只列出；两步确认，锁内同口径复核后先改名、再核一次覆盖，通过才写已核对标记再删，不跟随符号链接');
   }
-  const cleanupSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeBackupCleanup.ts'), 'utf8');
+  const cleanupSource = readText(path.join(root, 'backend/reliableKernel/runtimeBackupCleanup.ts'));
   const graceDays = Number(/RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS = ([\d_]+) \* 24 \* 60 \* 60 \* 1000;/.exec(cleanupSource)?.[1]?.replaceAll('_', ''));
   const minAge = /RUNTIME_BACKUP_CLEANUP_MERGE_BACKUP_MIN_AGE_MS = (?:([\d_]+) \* )?60 \* 60 \* 1000;/.exec(cleanupSource);
   const minAgeHours = minAge ? Number(minAge[1]?.replaceAll('_', '') ?? 1) : Number.NaN;
@@ -695,7 +700,7 @@ function validateMigration(root, migration, failures) {
     || !expectedCleanup.coverage.includes(`-reader-${readBatch}-ids-per-read;`)) {
     failures.push('migration.json#backupCleanup 的升级宽限天数、合并前备份最短保留时间与每次读取 id 数必须与 runtimeBackupCleanup.ts 的常量一致');
   }
-  const directoryConstant = (file, name) => new RegExp(`export const ${name} = '([^']+)';`).exec(fs.readFileSync(path.join(root, 'backend/reliableKernel', file), 'utf8'))?.[1];
+  const directoryConstant = (file, name) => new RegExp(`export const ${name} = '([^']+)';`).exec(readText(path.join(root, 'backend/reliableKernel', file)))?.[1];
   const deletableDirectories = [
     directoryConstant('runtimeEpochMigration.ts', 'RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY'),
     directoryConstant('runtimeDataSetMerge.ts', 'RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY'),
@@ -707,8 +712,8 @@ function validateMigration(root, migration, failures) {
     || JSON.stringify(deletableKinds) !== JSON.stringify(['epoch-migration', 'merge-target', 'merge-source', 'foreign-history'])) {
     failures.push('备份清理可删的只有 migration.json#backupCleanup.deletableKinds 列出的三种目录（升级前备份、合并前备份、合并来源的收尾前备份）与核验通过的外来历史库');
   }
-  const foreignSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeForeignHistory.ts'), 'utf8');
-  const claimSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeHostControl.ts'), 'utf8');
+  const foreignSource = readText(path.join(root, 'backend/reliableKernel/runtimeForeignHistory.ts'));
+  const claimSource = readText(path.join(root, 'backend/reliableKernel/runtimeHostControl.ts'));
   // Foreign history is deleted only under its own foreign claim taken without waiting, never under a
   // maintenance claim of its located paths (that one lives beside the foreign directory).
   if (!cleanupSource.includes('tryWithForeignRuntimeRootClaim(') || !cleanupSource.includes('copyForeignRuntimeSqliteFiles(')
@@ -719,7 +724,7 @@ function validateMigration(root, migration, failures) {
   // An open read-only view is registered in the current configuration root for its whole life and
   // keeps the root; the history rows beyond messages are the undeletable domains; the admission is
   // released once a foreign root's mark is durable (its removal runs under the foreign claim alone).
-  const readSource = (file) => fs.readFileSync(path.join(root, 'backend/reliableKernel', file), 'utf8');
+  const readSource = (file) => readText(path.join(root, 'backend/reliableKernel', file));
   const viewsSource = readSource('runtimeForeignHistoryViews.ts');
   if (!cleanupSource.includes('liveForeignRuntimeHistoryViews(') || !readSource('runtimeDataSetHistory.ts').includes('registerForeignRuntimeHistoryView(')
     || !viewsSource.includes("const VIEWS_DIRECTORY = 'foreign-views';") || !viewsSource.includes('resolveVscodeRuntimeMergeLedgerRoot(')
@@ -751,9 +756,9 @@ function validateMigration(root, migration, failures) {
   const constantsPath = path.join(root, 'backend/capabilities/vscodeStorage/constants.ts');
   const pathsPath = path.join(root, 'backend/capabilities/vscodeStorage/paths.ts');
   const protocolPath = path.join(root, 'shared/protocol.ts');
-  const constantsSource = fs.readFileSync(constantsPath, 'utf8');
-  const pathsSource = fs.readFileSync(pathsPath, 'utf8');
-  const protocolSource = fs.readFileSync(protocolPath, 'utf8');
+  const constantsSource = readText(constantsPath);
+  const pathsSource = readText(pathsPath);
+  const protocolSource = readText(protocolPath);
   const registeredDirConstants = parseIdentifierConstArray(constantsSource, 'REGISTERED_STORAGE_ROOT_DIRS');
   const registeredFileConstants = parseIdentifierConstArray(constantsSource, 'REGISTERED_STORAGE_ROOT_FILES');
   const constantValues = new Map([...constantsSource.matchAll(/export const ([A-Z][A-Z0-9_]+) = '([^']+)'/g)].map((match) => [match[1], match[2]]));
@@ -859,7 +864,7 @@ function validateMigration(root, migration, failures) {
  * never linked, recorded under the current configuration root; never finalized or migrated.
  */
 function validateForeignHistory(root, authority, failures) {
-  const read = (file) => fs.readFileSync(path.join(root, 'backend/reliableKernel', file), 'utf8');
+  const read = (file) => readText(path.join(root, 'backend/reliableKernel', file));
   const foreignSource = read('runtimeForeignHistory.ts');
   const foreignMergeSource = read('runtimeForeignHistoryMerge.ts');
   const forbidden = /\bRuntimeDatabase\b|new RootAuthority|withRuntimeMaintenance\(root\.recorded|recorded\.paths\.(databasePath|casRootPath|rootPointerPath|runtimeEpochPath)/;
@@ -908,7 +913,7 @@ function validateForeignHistory(root, authority, failures) {
  * for the target and the identities it continues, and nothing unreadable is read as none.
  */
 function validateDeletedConversations(root, failures) {
-  const read = (file) => fs.readFileSync(path.join(root, file), 'utf8');
+  const read = (file) => readText(path.join(root, file));
   const kernel = (file) => read(`backend/reliableKernel/${file}`);
   const records = kernel('runtimeMergeTombstones.ts');
   const deletion = kernel('conversationDeletion.ts');
@@ -1655,7 +1660,7 @@ function validateConversationHistoryPagination(root, history, failures) {
     || history?.maxPageRows !== 200) {
     failures.push('侧栏会话历史必须按页码定位：有界OFFSET窗口外用键集边界，各页为当前排序精确划分，游标只绑定页码与数据集身份');
   }
-  const projection = fs.readFileSync(path.join(root, 'backend/reliableKernel/clientProjection.ts'), 'utf8');
+  const projection = readText(path.join(root, 'backend/reliableKernel/clientProjection.ts'));
   const windowRows = /export const CONVERSATION_HISTORY_EXACT_OFFSET_ROWS = ([\d_]+);/.exec(projection)?.[1];
   if (windowRows === undefined || Number(windowRows.replaceAll('_', '')) !== history?.maxOffsetRows) {
     failures.push('侧栏会话历史的OFFSET窗口必须与clientProjection.ts的CONVERSATION_HISTORY_EXACT_OFFSET_ROWS一致');
@@ -1730,7 +1735,7 @@ function validateTransitionLedger(root, ledger, failures) {
       if (ledger.status !== 'active') failures.push(`${entry.key}定位文件不存在：${relativePath}`);
       continue;
     }
-    const source = fs.readFileSync(absolutePath, 'utf8');
+    const source = readText(absolutePath);
     if (!source.includes(symbol)) {
       if (ledger.status !== 'active') failures.push(`${entry.key}定位符号不存在：${symbol}`);
       continue;
@@ -1776,7 +1781,7 @@ function validateCrossContract(documents, failures) {
 }
 
 function validateHumanPlanMarkers(root, failures) {
-  const read = (relative) => fs.readFileSync(path.join(root, relative), 'utf8');
+  const read = (relative) => readText(path.join(root, relative));
   const readme = read('docs/architecture/reliable-kernel/README.md');
   if (!readme.includes(CONTRACT_REVISION)) failures.push(`可靠内核README必须标记合同修订${CONTRACT_REVISION}`);
   // The contracts README headline names the base revision and every file revised after it, each

@@ -15,7 +15,8 @@ const notes = [];
 const requireTracked = process.argv.includes('--require-tracked');
 
 function read(relativePath) {
-  return fs.readFileSync(path.join(root, relativePath), 'utf8');
+  // LF line endings: a Windows checkout (core.autocrlf) must match the same multi-line snippets.
+  return fs.readFileSync(path.join(root, relativePath), 'utf8').replace(/\r\n/g, '\n');
 }
 
 function git(args) {
