@@ -23,15 +23,16 @@ import {
 import {
   cachedRuntimeDataSetFingerprint, isForeignRuntimeHistoryId, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits,
   readCachedRuntimeDataSetAudit, readCachedRuntimeRootAudit, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization,
-  readRuntimeDataSetMergeLedger, rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
+  readRuntimeDataSetMergeLedger, readRuntimeDataSetMergeRecordDamage, rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
   readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit, pruneRuntimeDataSetMergePreparations,
   isRuntimeLargeMergeTargetBackupLive, readRuntimeLargeMergeTargetBackups, removeRuntimeLargeMergeTargetBackupFile,
   removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
   restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetConversationsMergedFrom, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
+  runtimeDataSetMergeRecordName,
   sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetAuditCacheEntry, type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity,
-  type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest,
+  type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest, type RuntimeDataSetMergeRecordDamage,
   type RuntimeLargeMergeTargetBackup
 } from './runtimeDataSetMergeLedger';
 import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
@@ -678,6 +679,7 @@ async function pickSources(
     if (selected.length !== 1 || !sameRuntimeDataSetIdentity(target.identity, selected[0])) return [];
     report.targetCandidateId = selected[0].id;
     const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
+    const damage = await readRuntimeDataSetMergeRecordDamage(storagePaths);
     const requests = await readRuntimeDataSetMergeRequests(storagePaths);
     const explicit = options.requested === true && options.candidateIds !== undefined;
     const picked: PickedSource[] = [];
@@ -692,6 +694,7 @@ async function pickSources(
       }
       const recorded = ledger.get(candidate.id);
       const record = recorded && sameRuntimeDataSetIdentity(recorded.source, candidate) ? recorded : undefined;
+      const damaged = damage.get(runtimeDataSetMergeRecordName(candidate.id));
       const source: PickedSource = {
         id: candidate.id, candidate, requested: explicit, record, request, expired,
         // A recorded request only keeps its source pending (see RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS).
@@ -700,6 +703,10 @@ async function pickSources(
       };
       if (options.candidateIds && !options.candidateIds.includes(candidate.id)) {
         if (expired && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
+        continue;
+      }
+      if (damaged && (damaged === 'newer' || !(source.requested || source.pending))) {
+        reportDamagedRecord(source, damaged, report);
         continue;
       }
       // Only a fingerprint cached for the exact current files is used here: computing one reads the
@@ -922,6 +929,27 @@ async function reportExpiredRequest(
 }
 
 /**
+ * A record file this version cannot use is never taken for "no record" (automatic merges would repeat
+ * a merge, forget its conversations or replace a newer version's record): a damaged one pauses the
+ * source's automatic merges until the user asks for one (that records it anew), a newer version's
+ * defers every merge of it.
+ */
+function reportDamagedRecord(source: PickedSource, damage: RuntimeDataSetMergeRecordDamage, report: RuntimeDataSetMergeBatchResult): void {
+  const issue = { candidateId: source.id, newly: true, requested: source.requested, ...(source.label ? { label: source.label } : {}) };
+  if (damage === 'newer') report.deferred.push({ ...issue, ...RECORD_NEWER });
+  else report.blocked.push({ ...issue, ...RECORD_DAMAGED });
+}
+
+const RECORD_DAMAGED = {
+  code: 'runtime-data-set-merge-record-damaged',
+  message: '合并账本里这个库的记录读不出（文件已损坏），已暂停自动合并这个库；需要时请在“历史与存储管理”里选择“合并到当前库”，会重新记录。'
+} as const;
+const RECORD_NEWER = {
+  code: 'runtime-data-set-merge-record-newer',
+  message: '合并账本里这个库的记录来自更新版本的 LimCode，这个版本不认识也不会改动它，这个库先不合并；请用更新的版本合并。'
+} as const;
+
+/**
  * Merges one complete data set of this configuration root into an explicitly given open Runtime
  * (e.g. a fresh root under another data directory, for data-root migration). Throws for any
  * outcome other than merged. The caller holds the target's configuration admission when that
@@ -1071,9 +1099,11 @@ export async function readRuntimeDataSetMergeStates(
   const current = selected?.dataSetId && selected.rootInstanceId
     ? { dataSetId: selected.dataSetId, rootInstanceId: selected.rootInstanceId } : undefined;
   const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
+  const damage = await readRuntimeDataSetMergeRecordDamage(storagePaths);
   const requests = await readRuntimeDataSetMergeRequests(storagePaths);
   for (const candidate of inspection.candidates) {
     if (candidate.selected || !candidate.dataSetId) continue;
+    const damaged = damage.get(runtimeDataSetMergeRecordName(candidate.id));
     const recorded = ledger.get(candidate.id);
     const record = recorded && sameRuntimeDataSetIdentity(recorded.source, candidate) ? recorded : undefined;
     const fingerprint = record ? await cachedRuntimeDataSetFingerprint(candidate).catch(() => undefined)
@@ -1095,6 +1125,8 @@ export async function readRuntimeDataSetMergeStates(
       && Date.now() - Date.parse(request.requestedAt) < RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS
       && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId) {
       result.set(candidate.id, { state: 'requested', requestedAt: request.requestedAt, ...carried });
+    } else if (damaged) {
+      result.set(candidate.id, { state: 'blocked', ...(damaged === 'newer' ? RECORD_NEWER : RECORD_DAMAGED) });
     } else if (unchanged && (record?.state === 'failed'
       || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
       result.set(candidate.id, { state: record.state, code: record.code, message: record.message, ...carried });

@@ -2040,6 +2040,41 @@ test('盲审2 merge #8：批次里没缓存的来源指纹在该库的 maintenan
   assert.deepEqual(report.merged.map((item) => [item.candidateId, item.alreadyMerged]), [[fixture.alpha.id, true]]);
 });
 
+test('盲审2 merge #6：读不出的账本记录不当成“没有记录”：自动合并暂停并报告，明确合并重新记录；更新版本写的记录推迟，从不改写', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_damaged', project: SHARED_PROJECT }]);
+  await seed(fixture.beta, [{ id: 'conversation_beta_newer', project: SHARED_PROJECT }]);
+  const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
+  await fs.mkdir(records, { recursive: true });
+  const alphaFile = path.join(records, `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const betaFile = path.join(records, `${fixture.beta.id.replace(/:/g, '-')}.json`);
+  await fs.writeFile(alphaFile, '{"kind":"limcode-runtime-data-set-merge","candidateId":');
+  const newer = JSON.stringify({
+    kind: 'limcode-runtime-data-set-merge', candidateId: fixture.beta.id, state: 'archived-by-a-newer-version',
+    source: { dataSetId: fixture.beta.binding.dataSetId, rootInstanceId: fixture.beta.binding.rootInstanceId }, updatedAt: NOW
+  });
+  await fs.writeFile(betaFile, newer);
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database);
+  assert.deepEqual(report.merged, []);
+  assert.deepEqual(report.blocked.map((item) => [item.candidateId, item.code]), [[fixture.alpha.id, 'runtime-data-set-merge-record-damaged']]);
+  assert.deepEqual(report.deferred.map((item) => [item.candidateId, item.code]), [[fixture.beta.id, 'runtime-data-set-merge-record-newer']]);
+  const states = await readRuntimeDataSetMergeStates(fixture.paths);
+  assert.deepEqual([states.get(fixture.alpha.id)?.code, states.get(fixture.beta.id)?.code],
+    ['runtime-data-set-merge-record-damaged', 'runtime-data-set-merge-record-newer']);
+  const alpha = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.deepEqual(alpha.merged.map((item) => item.candidateId), [fixture.alpha.id], '用户明确请求：合并并重新记录');
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'merged');
+  const beta = await merge(fixture, database, { candidateIds: [fixture.beta.id], requested: true });
+  assert.deepEqual([beta.merged, beta.deferred.map((item) => item.code)], [[], ['runtime-data-set-merge-record-newer']]);
+  assert.equal(await fs.readFile(betaFile, 'utf8'), newer, '更新版本的记录一字不改');
+  await assert.rejects(ledgerModule.writeRuntimeDataSetMergeLedgerRecord(fixture.paths, {
+    candidateId: fixture.beta.id, state: 'failed', source: { dataSetId: fixture.beta.binding.dataSetId, rootInstanceId: fixture.beta.binding.rootInstanceId },
+    code: 'x', message: 'x'
+  }), { code: 'runtime-data-set-merge-record-newer' }, '写记录本身也不改写它');
+  assert.equal(await fs.readFile(betaFile, 'utf8'), newer);
+});
+
 async function mergedInto(fixture) {
   const record = await readLedgerRecord(fixture, fixture.alpha.id);
   return (record?.mergedInto ?? []).map((entry) => [entry.target.dataSetId, [...entry.conversationIds].sort()]);

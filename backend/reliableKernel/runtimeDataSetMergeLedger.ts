@@ -513,11 +513,50 @@ export async function readRuntimeDataSetMergeLedger(paths: StoragePaths): Promis
   return result;
 }
 
+const RECORD_STATES: ReadonlySet<string> = new Set(['committing', 'merged', 'blocked', 'failed', 'too-large']);
+
 function isLedgerRecord(value: unknown, name: string): value is RuntimeDataSetMergeLedgerRecord {
   const record = value as Partial<RuntimeDataSetMergeLedgerRecord> | null;
   return record?.kind === RECORD_KIND && typeof record.candidateId === 'string' && fileName(record.candidateId) === name
-    && !!record.source && typeof record.source.dataSetId === 'string'
-    && ['committing', 'merged', 'blocked', 'failed', 'too-large'].includes(String(record.state));
+    && !!record.source && typeof record.source.dataSetId === 'string' && RECORD_STATES.has(String(record.state));
+}
+
+/**
+ * A record file this version cannot use: `newer`, a record in a state it does not know (written by a
+ * newer LimCode sharing the data directory), never overwritten; `damaged`, anything else that is no
+ * record (torn, foreign, malformed). Neither is "no record": the source is not merged automatically.
+ */
+export type RuntimeDataSetMergeRecordDamage = 'newer' | 'damaged';
+
+/** Record files that are no usable record, by the name a candidate id gives (runtimeDataSetMergeRecordName). */
+export async function readRuntimeDataSetMergeRecordDamage(paths: StoragePaths): Promise<Map<string, RuntimeDataSetMergeRecordDamage>> {
+  const result = new Map<string, RuntimeDataSetMergeRecordDamage>();
+  for (const [name, value] of await readDirectoryJson(paths, RECORDS, true)) {
+    const damage = recordDamage(value, name);
+    if (damage) result.set(name, damage);
+  }
+  return result;
+}
+
+/** The record file name of a candidate id (runtimeDataSetMergeRecordDamage is keyed by it). */
+export function runtimeDataSetMergeRecordName(candidateId: string): string {
+  return fileName(candidateId);
+}
+
+function recordDamage(value: unknown, name: string): RuntimeDataSetMergeRecordDamage | undefined {
+  if (value !== UNPARSABLE && isLedgerRecord(value, name)) return undefined;
+  const record = value as Partial<RuntimeDataSetMergeLedgerRecord> | null;
+  return value !== UNPARSABLE && record?.kind === RECORD_KIND && !RECORD_STATES.has(String(record.state)) ? 'newer' : 'damaged';
+}
+
+/** A record in a state this version does not know is a newer version's: never overwritten here. */
+export class RuntimeDataSetMergeRecordNewerError extends Error {
+  public readonly code = 'runtime-data-set-merge-record-newer';
+
+  public constructor(candidateId: string) {
+    super(`合并账本里 ${candidateId} 的记录来自更新版本的 LimCode，这个版本不改动它。`);
+    this.name = 'RuntimeDataSetMergeRecordNewerError';
+  }
 }
 
 /**
@@ -533,7 +572,7 @@ export async function writeRuntimeDataSetMergeLedgerRecord(
     & { insertedConversationIds?: readonly string[] }
 ): Promise<void> {
   const { insertedConversationIds, ...record } = input;
-  const previous = await readRuntimeDataSetMergeLedgerRecord(paths, record.candidateId);
+  const previous = await readRuntimeDataSetMergeLedgerRecord(paths, record.candidateId, true);
   const same = previous !== undefined && sameRuntimeDataSetIdentity(previous.source, record.source);
   const lastMerged = same && record.state !== 'merged' ? runtimeDataSetLastMerge(previous) : undefined;
   const { mergedInto, formerMergedInto } = carriedConversations(previous, record.source);
@@ -660,19 +699,22 @@ export function runtimeDataSetLastMerge(record: RuntimeDataSetMergeLedgerRecord)
     : record.lastMerged;
 }
 
+/** `forWrite`: a newer version's record is refused (RuntimeDataSetMergeRecordNewerError), never replaced. */
 async function readRuntimeDataSetMergeLedgerRecord(
   paths: StoragePaths,
-  candidateId: string
+  candidateId: string,
+  forWrite = false
 ): Promise<RuntimeDataSetMergeLedgerRecord | undefined> {
   const file = await ledgerFile(paths, RECORDS, candidateId);
   let value: unknown;
   try { value = JSON.parse(await fs.readFile(file, 'utf8')) as unknown; }
   catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    // An unreadable previous record carries nothing forward; a torn file is not a record.
+    // A damaged previous record carries nothing forward (only an explicit request replaces one).
     if (error instanceof SyntaxError) return undefined;
     throw error;
   }
+  if (forWrite && recordDamage(value, path.basename(file)) === 'newer') throw new RuntimeDataSetMergeRecordNewerError(candidateId);
   return isLedgerRecord(value, path.basename(file)) ? value : undefined;
 }
 
@@ -974,7 +1016,10 @@ async function ledgerFile(paths: StoragePaths, section: string, id: string): Pro
   return file;
 }
 
-async function readDirectoryJson(paths: StoragePaths, section: string): Promise<Array<[string, unknown]>> {
+/** What readDirectoryJson gives for a file that is no JSON at all, when asked to (`unparsable`). */
+const UNPARSABLE = Symbol('unparsable');
+
+async function readDirectoryJson(paths: StoragePaths, section: string, unparsable = false): Promise<Array<[string, unknown]>> {
   const directory = path.join(resolveVscodeRuntimeMergeLedgerRoot(paths), section);
   await assertNoSymbolicPrefix(path.resolve(paths.globalStoragePath), directory);
   let names: string[];
@@ -987,7 +1032,7 @@ async function readDirectoryJson(paths: StoragePaths, section: string): Promise<
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     try { result.push([name, JSON.parse(await fs.readFile(path.join(directory, name), 'utf8')) as unknown]); }
-    catch { /* A torn or foreign file is not a record. */ }
+    catch { if (unparsable) result.push([name, UNPARSABLE]); /* Else a torn or foreign file is not a record. */ }
   }
   return result;
 }
