@@ -17,7 +17,7 @@ import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
-  describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
+  describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, inspectUnfinishedWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
   type CarriedWorkRefusals, type UnfinishedWorkInspection
 } from './runtimeDataSetMergeWork';
 import {
@@ -1360,7 +1360,7 @@ async function mergeSource(
     let work: UnfinishedWorkInspection | undefined;
     if (!mode.finalizeWork) assertCarriable(taken.audit.carriedWork!);
     else {
-      work = taken.audit.unfinishedWork!;
+      work = await keptUnfinishedWork(taken.snapshot.database, taken.audit.unfinishedWork!, () => skippedSourceRows(taken.snapshot.database, target, merged));
       if (work.refused.length > 0) throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
     }
     const limits = options.limits ?? RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
@@ -1381,7 +1381,7 @@ async function mergeSource(
       await finalizeSource(paths, target, candidate, binding, work, state, options, mode, stopIfAsked);
       await taken.snapshot.close();
       taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options, paths);
-      const remaining = taken.audit.unfinishedWork!;
+      const remaining = await keptUnfinishedWork(taken.snapshot.database, taken.audit.unfinishedWork!, () => skippedSourceRows(taken.snapshot.database, target, merged));
       if (remaining.refused.length > 0 || hasFinalizableWork(remaining)) {
         throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(remaining.refused) || '收尾后仍有未结束的任务', state, true));
       }
@@ -2361,6 +2361,33 @@ async function planSource(
   const deleted = merged.length > 0 ? await deletedSinceMerge(source, target.database, merged) : undefined;
   state.skippedConversations = deleted?.count ?? 0;
   return planRows(source, target.database, deleted && skippedRows(source, deleted.conversations));
+}
+
+/**
+ * The unfinished work a merge takes along (as audited, `work`): whatever belongs to the rows it leaves
+ * out (a conversation deleted here since, with everything of it, see skippedRows; `skipped` by domain)
+ * neither refuses the source nor is closed there. The same skip set the plan uses, read on the snapshot.
+ */
+async function keptUnfinishedWork(
+  source: Database.Database,
+  work: UnfinishedWorkInspection,
+  skipped: () => Promise<ReadonlyMap<string, ReadonlySet<string>> | undefined>
+): Promise<UnfinishedWorkInspection> {
+  if (work.refused.length === 0 && !hasFinalizableWork(work)) return work;
+  const rows = await skipped();
+  if (!rows || rows.size === 0) return work;
+  const tables = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.key, schema.table]));
+  return inspectUnfinishedWork(source, new Map([...rows].map(([domain, ids]) => [tables.get(domain)!, ids])));
+}
+
+/** The rows of the source a merge leaves out (skippedRows of the conversations deleted here since). */
+async function skippedSourceRows(
+  source: Database.Database,
+  target: TargetContext,
+  merged: readonly string[]
+): Promise<Map<string, Set<string>> | undefined> {
+  const deleted = merged.length > 0 ? await deletedSinceMerge(source, target.database, merged) : undefined;
+  return deleted && skippedRows(source, deleted.conversations);
 }
 
 /**
@@ -3703,7 +3730,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   MERGE_DOMAIN_ORDER, IDENTITY_MERGE_DIFFERENCES, SKIPPED_WITH, SKIPPED_WITH_MEMBERS, MAX_REPORTED_CONFLICTS, READ_CHUNK,
   BACKUP_FREE_SPACE_MARGIN_BYTES, Outcome, StopRequested, MergedMeanwhile,
   targetContext, pickSources, runSourceAttempt, settledSource, resolveSource, recordedConversations, takeVerifiedSnapshot,
-  countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, transferSourceCas, finalizeSource,
+  countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, keptUnfinishedWork, transferSourceCas, finalizeSource,
   cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,

@@ -167,9 +167,23 @@ const REFUSAL_PROBES: readonly Probe[] = Object.freeze([
  * probe is applied to every Conversation as the final authority, including the Conversations whose
  * work would be finalized (judged as they will be once finalized, see busyAfterFinalization):
  * anything it still sees after the named probes counts as refused, before anything is finalized,
- * so the merge never admits work the receiving Runtime would pick up.
+ * so the merge never admits work the receiving Runtime would pick up. `skipped` (row ids by table):
+ * the rows the merge leaves out (a conversation deleted in the target since, with everything that
+ * belongs to it), neither refusing the source nor closed.
  */
-export function inspectUnfinishedWork(source: Database.Database): UnfinishedWorkInspection {
+export function inspectUnfinishedWork(
+  source: Database.Database,
+  skipped?: ReadonlyMap<string, ReadonlySet<string>>
+): UnfinishedWorkInspection {
+  const restore = skipped && skipped.size > 0 ? shadowSkipped(source, skipped) : undefined;
+  try {
+    return inspect(source);
+  } finally {
+    restore?.();
+  }
+}
+
+function inspect(source: Database.Database): UnfinishedWorkInspection {
   const refused: UnfinishedWorkRefusal[] = [];
   for (const [label, sql] of REFUSAL_PROBES) {
     const count = Number(source.prepare(sql).pluck().get() as bigint | number);
@@ -232,7 +246,7 @@ function busyAfterFinalization(
   try {
     const busy = createConversationRuntimeWorkProbe(source);
     let remaining = 0;
-    for (const id of source.prepare('SELECT id FROM main.conversation ORDER BY id').pluck().iterate() as IterableIterator<string>) {
+    for (const id of source.prepare('SELECT id FROM conversation ORDER BY id').pluck().iterate() as IterableIterator<string>) {
       if (busy(id)) remaining += 1;
     }
     return remaining;
@@ -243,6 +257,45 @@ function busyAfterFinalization(
 
 const FINALIZED_TURNS = 'temp.merge_finalized_turn';
 const FINALIZED_INTENTS = 'temp.merge_finalized_intent';
+/** A table without the rows the merge leaves out (shadowSkipped); its own name then shows this view. */
+const KEPT_PREFIX = 'merge_kept_';
+
+/**
+ * Every table with skipped rows shows without them to the probes (unqualified names reach TEMP views
+ * first): `temp.merge_kept_<table>` holds the rest, and a view under the table's own name shows it.
+ */
+function shadowSkipped(source: Database.Database, skipped: ReadonlyMap<string, ReadonlySet<string>>): () => void {
+  const queryOnly = Number(source.pragma('query_only', { simple: true }) as bigint | number) !== 0;
+  source.pragma('query_only = OFF');
+  const drops: string[] = [];
+  const restore = (): void => {
+    for (const drop of drops.reverse()) source.exec(drop);
+    if (queryOnly) source.pragma('query_only = ON');
+  };
+  try {
+    for (const [table, ids] of skipped) {
+      if (ids.size === 0) continue;
+      const list = `merge_skipped_${table}`;
+      source.exec(`CREATE TEMP TABLE "${list}" (id TEXT PRIMARY KEY) WITHOUT ROWID`);
+      drops.push(`DROP TABLE temp."${list}"`);
+      const insert = source.prepare(`INSERT INTO temp."${list}" (id) VALUES (?)`);
+      for (const id of ids) insert.run(id);
+      source.exec(`CREATE TEMP VIEW "${KEPT_PREFIX}${table}" AS SELECT * FROM main."${table}" WHERE id NOT IN (SELECT id FROM temp."${list}")`);
+      drops.push(`DROP VIEW temp."${KEPT_PREFIX}${table}"`);
+      source.exec(`CREATE TEMP VIEW "${table}" AS SELECT * FROM temp."${KEPT_PREFIX}${table}"`);
+      drops.push(`DROP VIEW IF EXISTS temp."${table}"`);
+    }
+  } catch (error) {
+    restore();
+    throw error;
+  }
+  return restore;
+}
+
+/** Whether a table shows without skipped rows now (shadowSkipped). */
+function hasSkippedShadow(source: Database.Database, table: string): boolean {
+  return source.prepare("SELECT 1 FROM temp.sqlite_master WHERE type = 'view' AND name = ?").get(`${KEPT_PREFIX}${table}`) !== undefined;
+}
 
 function shadowFinalization(
   source: Database.Database,
@@ -265,19 +318,26 @@ function shadowFinalization(
     }
     const columns = (table: string): string[] => (source.prepare(`PRAGMA main.table_info(${table})`).all() as Array<{ name: string }>)
       .map((column) => column.name);
-    const view = (name: string, select: string): void => {
-      source.exec(`CREATE TEMP VIEW ${name} AS ${select}`);
+    // Over a table shown without skipped rows, its rows without them (its shadow comes back afterwards).
+    const base = (table: string): string => {
+      if (!hasSkippedShadow(source, table)) return `main.${table}`;
+      source.exec(`DROP VIEW temp."${table}"`);
+      drops.push(`CREATE TEMP VIEW "${table}" AS SELECT * FROM temp."${KEPT_PREFIX}${table}"`);
+      return `temp."${KEPT_PREFIX}${table}"`;
+    };
+    const view = (name: string, select: (from: string) => string): void => {
+      source.exec(`CREATE TEMP VIEW ${name} AS ${select(base(name))}`);
       drops.push(`DROP VIEW temp.${name}`);
     };
-    view('turn', `SELECT ${columns('turn').map((column) => column === 'status'
+    view('turn', (from) => `SELECT ${columns('turn').map((column) => column === 'status'
       ? `CASE WHEN id IN (SELECT id FROM ${FINALIZED_TURNS}) THEN 'terminated' ELSE status END AS status`
-      : `"${column}"`).join(', ')} FROM main.turn`);
-    view('execution_lease', `SELECT * FROM main.execution_lease WHERE turn_id NOT IN (SELECT id FROM ${FINALIZED_TURNS})`);
-    view('pending_turn_input', `SELECT * FROM main.pending_turn_input
+      : `"${column}"`).join(', ')} FROM ${from}`);
+    view('execution_lease', (from) => `SELECT * FROM ${from} WHERE turn_id NOT IN (SELECT id FROM ${FINALIZED_TURNS})`);
+    view('pending_turn_input', (from) => `SELECT * FROM ${from}
       WHERE NOT (state = 'pending' AND turn_id IN (SELECT id FROM ${FINALIZED_TURNS}))`);
-    view('tool_call', `SELECT * FROM main.tool_call
+    view('tool_call', (from) => `SELECT * FROM ${from}
       WHERE NOT (status = 'pending' AND turn_id IN (SELECT id FROM ${FINALIZED_TURNS}))`);
-    view('turn_intent', `SELECT * FROM main.turn_intent WHERE id NOT IN (SELECT id FROM ${FINALIZED_INTENTS})`);
+    view('turn_intent', (from) => `SELECT * FROM ${from} WHERE id NOT IN (SELECT id FROM ${FINALIZED_INTENTS})`);
   } catch (error) {
     restore();
     throw error;

@@ -33,7 +33,7 @@ import {
   removeRuntimeLargeMergeTargetBackup, writeRuntimeLargeMergeTargetBackup,
   type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeLargeMergeTargetBackup
 } from './runtimeDataSetMergeLedger';
-import { describeUnfinishedWork, hasFinalizableWork } from './runtimeDataSetMergeWork';
+import { describeUnfinishedWork, hasFinalizableWork, type UnfinishedWorkInspection } from './runtimeDataSetMergeWork';
 import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { assertModelRequestAggregate } from './runtimeModelRequestAggregate';
 import { attachRuntimeStatementCache, detachRuntimeStatementCache } from './runtimeStatementCache';
@@ -308,6 +308,17 @@ async function prepareSkippedRows(
   });
   await closeOver(source, skipRuleStatements(), chunkRows * SKIP_SEGMENT_CHUNKS);
   return true;
+}
+
+/** The skipped rows prepareSkippedRows left in the snapshot, by domain. */
+function skippedRowsOf(source: Database.Database): Map<string, Set<string>> {
+  const skipped = new Map<string, Set<string>>();
+  for (const [domain, id] of source.prepare(`SELECT domain, id FROM temp.${SKIP_TABLE}`).raw().iterate() as IterableIterator<[string, string]>) {
+    let ids = skipped.get(domain);
+    if (!ids) skipped.set(domain, ids = new Set());
+    ids.add(id);
+  }
+  return skipped;
 }
 
 /**
@@ -1162,7 +1173,10 @@ async function prepareSource(
     if (!aboveThreshold(taken.audit.size!, threshold, options)) return { kind: 'small' };
     // What is verified here is kept on disk: the session (or a later preparation) only lstats it.
     verified = await openRuntimeCasVerificationCache(paths.globalStoragePath);
-    const work = taken.audit.unfinishedWork!;
+    // What belongs to conversations deleted here since is left out: it neither refuses the source nor is closed.
+    const keptWork = (): Promise<UnfinishedWorkInspection> => engine.keptUnfinishedWork(taken.snapshot.database, taken.audit.unfinishedWork!,
+      async () => await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows) ? skippedRowsOf(taken.snapshot.database) : undefined);
+    const work = await keptWork();
     if (work.refused.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
     stopIfAsked();
     const scanSource = async (): Promise<RuntimeDataSetMergeScan> => {
@@ -1191,7 +1205,7 @@ async function prepareSource(
       await engine.finalizeSource(paths, target, candidate, binding, work, state, options, mode, stopIfAsked);
       await taken.snapshot.close();
       taken = await snapshot();
-      const remaining = taken.audit.unfinishedWork!;
+      const remaining = await keptWork();
       if (remaining.refused.length > 0 || hasFinalizableWork(remaining)) {
         throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(remaining.refused) || '收尾后仍有未结束的任务', state, true));
       }
