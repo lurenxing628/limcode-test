@@ -20,7 +20,9 @@ export const useDataRootPromptStore = defineStore('data-root-prompt', {
         // A newer prompt of the same page supersedes an unanswered one (its command already moved on).
         if (this.prompt) this.send(this.prompt.flowId, 'cancel', []);
         this.prompt = message.payload;
-        this.include = [];
+        // Options the command ticks by default start ticked; every other one starts unticked.
+        this.include = [...(message.payload.options ?? []), ...message.payload.sections.flatMap((section) => section.options ?? [])]
+          .filter((option) => option.checked === true).map((option) => option.key);
       });
     },
     toggle(key: string, ticked: boolean): void {

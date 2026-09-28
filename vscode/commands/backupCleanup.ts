@@ -32,6 +32,16 @@ const OK = { key: 'cancel', label: '知道了', variant: 'secondary' as const };
 const SETTINGS_LOCATION = '其他 → 数据目录';
 const DELETABLE_KINDS: ReadonlySet<RuntimeBackupKind> = new Set(['epoch-migration', 'merge-target', 'merge-source']);
 
+/**
+ * Deletable copies with messages that are deleted or replaced (edited, retried) where the rest of
+ * them is: grouped apart after the kinds that can be proven, never ticked by default, deleted only
+ * when ticked knowingly.
+ */
+const REPLACED_GROUP = {
+  title: '含你后来删除或替换的内容',
+  purpose: '内容都还在当前库或某个历史库里，但其中一些消息在那里已被你删除、编辑或重试替换，只在这份副本里还能看到；默认不勾选，勾选后才删除，删除后这些消息就再也看不到了'
+};
+
 /** Group order of the first panel: the kinds that can be proven first, then the listed ones. */
 const KINDS: ReadonlyArray<{ kind: RuntimeBackupKind; title: string; purpose: string }> = [
   { kind: 'epoch-migration', title: '升级前备份', purpose: '旧版本的历史库自动升级到当前格式之前，整份数据库的备份' },
@@ -49,10 +59,11 @@ const KINDS: ReadonlyArray<{ kind: RuntimeBackupKind; title: string; purpose: st
 
 /**
  * 清理备份 (settings page, 其他 → 数据目录): checks every backup with a progress notification,
- * lists them grouped by kind in the settings page's ConfirmPanel (nothing ticked), asks a second,
- * danger confirmation for the ticked ones, then deletes them (runtimeBackupCleanup, which checks each
- * again under the claims). Without a settings page (command palette, 历史与存储管理) it only opens the
- * settings page at that entry.
+ * lists them grouped by kind in the settings page's ConfirmPanel (the ones whose content is complete
+ * elsewhere ticked; the ones with content deleted or replaced there grouped apart, unticked), asks a
+ * second, danger confirmation for the ticked ones, then deletes them (runtimeBackupCleanup, which
+ * checks each again under the claims). Without a settings page (command palette, 历史与存储管理) it
+ * only opens the settings page at that entry.
  */
 export async function cleanupBackups(context: vscode.ExtensionContext, startup: ApplicationStartup, request?: unknown): Promise<void> {
   const clientId = requestClientId(request);
@@ -98,7 +109,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   const deletable = plan.items.filter((item) => item.deletable);
   const first = await ask({
     title: deletable.length > 0 ? '清理备份：勾选要删除的备份' : '清理备份：没有可以删除的备份',
-    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、每个消息版本（包括编辑前的版本）都还在同一位置的历史库里；外来历史库要先通过核验，再与某个本地库身份相同且内容完全相同，或全部对话和消息版本都在某个本地库里。含有别处没有的对话的一律保留。',
+    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、消息版本和工具调用、输出、回答等记录都还在当前库或同一数据目录的某个历史库里，正文文件也在，副本里显示的每条消息在那里也显示同一个版本；外来历史库还要先通过核验。含有别处没有的对话或记录的一律保留；其中有消息在那里已被你删除、编辑或重试替换的，单独列出，默认不勾选。',
     sections: firstPanelSections(plan),
     actions: deletable.length > 0 ? [CANCEL, { key: 'next', label: '下一步', variant: 'default' }] : [OK]
   });
@@ -110,6 +121,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   }
   const bytes = sum(chosen.map((item) => item.bytes));
   const reclaimable = sum(chosen.map((item) => item.reclaimableBytes));
+  const replaced = chosen.filter((item) => (item.replacedMessages ?? 0) > 0);
   const second = await ask({
     title: '永久删除所选备份？',
     sections: [
@@ -119,6 +131,9 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
       },
       {
         lines: [
+          ...(replaced.length > 0
+            ? [`其中 ${replaced.length} 项含你后来删除或替换的内容（共 ${replaced.reduce((total, item) => total + (item.replacedMessages ?? 0), 0)} 条消息），删除后这些消息就再也看不到了。`]
+            : []),
           `核对时间：${formatTime(plan.checkedAt)}。删除前会在锁内再核对一遍，内容、所在历史库或进行中的操作有变化的项不会删除。`,
           '与其它文件共用（硬链接）的部分不计入预计释放。',
           '删除后不能恢复，此操作不能撤销。'
@@ -155,11 +170,15 @@ function logDetails(details: readonly string[], items: ReadonlyArray<{ name: str
 
 function firstPanelSections(plan: RuntimeBackupCleanupPlan): DataRootPromptSection[] {
   const deletable = plan.items.filter((item) => item.deletable);
+  const replaced = deletable.filter(isReplaced);
   const sections: DataRootPromptSection[] = [{
     lines: [
       `核对时间：${formatTime(plan.checkedAt)}`,
       deletable.length > 0
-        ? `可以删除 ${deletable.length} 项，合计 ${formatBytes(sum(deletable.map((item) => item.bytes)))}（预计释放 ${formatBytes(sum(deletable.map((item) => item.reclaimableBytes)))}）；默认都不勾选。`
+        ? `可以删除 ${deletable.length} 项，合计 ${formatBytes(sum(deletable.map((item) => item.bytes)))}（预计释放 ${formatBytes(sum(deletable.map((item) => item.reclaimableBytes)))}）；`
+          + (replaced.length > 0
+            ? `内容完整的 ${deletable.length - replaced.length} 项默认勾选，含你后来删除或替换的内容的 ${replaced.length} 项默认不勾选。`
+            : '默认都勾选，可以取消。')
         : '没有能证明已完整存在于本地库的备份，全部保留。',
       ...(plan.finishedDeletions.length > 0 ? [`已删完上次没有删完的 ${plan.finishedDeletions.length} 项。`] : []),
       ...(plan.restoredDeletions.length > 0
@@ -167,21 +186,37 @@ function firstPanelSections(plan: RuntimeBackupCleanupPlan): DataRootPromptSecti
       ...plan.problems
     ]
   }];
+  const option = (item: RuntimeBackupCleanupItem, checked: boolean) => ({
+    key: item.key,
+    label: `${item.name}（${formatBytes(item.bytes)}，预计释放 ${formatBytes(item.reclaimableBytes)}）`,
+    detail: `${createdText(item)}　${locationText(item)}　${item.reason}`,
+    ...(checked ? { checked: true } : {})
+  });
   for (const group of KINDS) {
-    const items = plan.items.filter((item) => item.kind === group.kind);
-    if (items.length === 0) continue;
-    sections.push({
-      title: `${group.title}（${items.length} 项）`,
-      lines: [`用途：${group.purpose}`, ...items.filter((item) => !item.deletable).map(keptLine)],
-      options: items.filter((item) => item.deletable).map((item) => ({
-        key: item.key,
-        label: `${item.name}（${formatBytes(item.bytes)}，预计释放 ${formatBytes(item.reclaimableBytes)}）`,
-        detail: `${createdText(item)}　${locationText(item)}　${item.reason}`
-      }))
-    });
+    const items = plan.items.filter((item) => item.kind === group.kind && !isReplaced(item));
+    if (items.length > 0) {
+      sections.push({
+        title: `${group.title}（${items.length} 项）`,
+        lines: [`用途：${group.purpose}`, ...items.filter((item) => !item.deletable).map(keptLine)],
+        options: items.filter((item) => item.deletable).map((item) => option(item, true))
+      });
+    }
+    // Right after the kinds that can be proven (foreign history is the last of them).
+    if (group.kind === 'foreign-history' && replaced.length > 0) {
+      sections.push({
+        title: `${REPLACED_GROUP.title}（${replaced.length} 项）`,
+        lines: [`用途：${REPLACED_GROUP.purpose}`],
+        options: replaced.map((item) => option(item, false))
+      });
+    }
   }
   if (plan.items.length === 0) sections.push({ lines: ['没有找到任何备份。'] });
   return sections;
+}
+
+/** Deletable, but messages visible in it are deleted or replaced where the rest of it is. */
+function isReplaced(item: RuntimeBackupCleanupItem): boolean {
+  return item.deletable && (item.replacedMessages ?? 0) > 0;
 }
 
 function keptLine(item: RuntimeBackupCleanupItem): string {
@@ -206,11 +241,15 @@ function createdText(item: RuntimeBackupCleanupItem): string {
   return item.createdAt ? `创建于 ${formatTime(item.createdAt)}` : '创建时间未知';
 }
 
-/** Whose copy it is only for the kinds that belong to a data set; foreign history says where it comes from; the listed-only ones just say where they are. */
+/**
+ * Whose copy it is only for the kinds that belong to a data set, named as the history management
+ * names it (当前库, its project names, 旧工作区历史 or 默认历史库; a data set that could not be read has
+ * no name to show); foreign history says where it comes from; the listed-only ones just say where they are.
+ */
 function locationText(item: RuntimeBackupCleanupItem): string {
   if (item.kind === 'foreign-history') return `来源：${item.origin ?? '外来历史库'}　位置：${item.path}`;
-  if (!DELETABLE_KINDS.has(item.kind)) return `位置：${item.path}`;
-  const owner = item.inCurrentDataSet ? '当前库' : item.dataSetCandidateId ? `历史库 ${item.dataSetCandidateId}` : '未知的历史库';
+  const owner = item.dataSetName ?? (item.inCurrentDataSet ? '当前库' : undefined);
+  if (!DELETABLE_KINDS.has(item.kind) || !owner) return `位置：${item.path}`;
   return `所属：${owner}　位置：${item.path}`;
 }
 

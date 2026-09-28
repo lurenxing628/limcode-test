@@ -550,7 +550,7 @@ test('与清理备份并发（真实的清理流程，同一个外来声明）�
     const started = Date.now();
     const kept = await deleteRuntimeBackups(plan, database, [covered.key]);
     assert.ok(Date.now() - started < 5_000, '清理不等待合并');
-    assert.deepEqual([kept.deleted, kept.kept.map((entry) => entry.reason)], [[], ['正在被只读查看、核验或合并（另一个窗口或操作正在用它），这一项没有删除']]);
+    assert.deepEqual([kept.deleted, kept.kept.map((entry) => entry.reason)], [[], ['正在被另一个窗口或操作使用（只读查看、核验、合并或清理备份），这一项没有删除']]);
     assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), unit(second)).deletable, false, '合并期间检查也不给删');
     assert.ok(await exists(unit(second)), '正在合并的来源没有被删');
   } finally { resume(); }

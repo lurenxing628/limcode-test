@@ -7,6 +7,7 @@ import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import { copyRuntimeDataSetDatabase, copyRuntimeSqliteFiles, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import type { VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
 import type { RelocatedWorkInventory } from './relocatedWorkInventory';
+import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 
 /**
  * Read-only facts of one data set from a private copy of its SQLite files, computed in a
@@ -20,16 +21,62 @@ export interface RuntimeDataSetFactsRequest {
   openable?: boolean;
   contentDigest?: boolean;
   summary?: boolean;
-  /** Every Conversation and MessageRevision id (the readable history), read from the tables, in no particular order. */
+  /** The readable history (RuntimeDataSetHistoryIds), read from the tables themselves, in no particular order. */
   historyIds?: boolean;
   /** The unfinished work a relocation carries away (see relocatedWorkInventory), from the same snapshot. */
   relocatedWork?: boolean;
 }
 
-/** Ids of the readable history of one database; revisions reference their content, which is never deleted. */
+/**
+ * The rest of the history a person can see besides Conversations and MessageRevisions (清理备份,
+ * L5): rows no Repository deletes, removed only with their Conversation (or never), so a merge
+ * carries every one of them over with its id. Control-plane, context and delivery rows, and every
+ * domain with a delete mutation, are not history in this sense. A table an older epoch did not have
+ * (the collaboration domains before epoch 5) is read as empty.
+ */
+export const RUNTIME_HISTORY_RECORD_DOMAINS: ReadonlyArray<{ key: string; table: string }> = Object.freeze([
+  { key: 'Turn', table: 'turn' },
+  { key: 'TurnTermination', table: 'turn_termination' },
+  { key: 'ToolCall', table: 'tool_call' },
+  { key: 'ToolOutcome', table: 'tool_outcome' },
+  { key: 'ToolModelResult', table: 'tool_model_result' },
+  { key: 'ToolResultArtifact', table: 'tool_result_artifact' },
+  { key: 'FileChangeSet', table: 'file_change_set' },
+  { key: 'FileChangeSetMember', table: 'file_change_set_member' },
+  { key: 'FileChangeDecision', table: 'file_change_decision' },
+  { key: 'InteractionRequest', table: 'interaction_request' },
+  { key: 'InteractionResponse', table: 'interaction_response' },
+  { key: 'Process', table: 'process' },
+  { key: 'ProcessOutputChunk', table: 'process_output_chunk' },
+  { key: 'Attachment', table: 'attachment' },
+  { key: 'AttachmentLink', table: 'attachment_link' },
+  { key: 'CompressionBlock', table: 'compression_block' },
+  { key: 'ChildExecution', table: 'child_execution' },
+  { key: 'CollaborationMessage', table: 'collaboration_message' }
+].map((entry) => Object.freeze(entry)));
+
+// Checked when this module loads: each is a domain with that table, and no Repository deletes its rows.
+for (const entry of RUNTIME_HISTORY_RECORD_DOMAINS) {
+  const schema = RUNTIME_DOMAIN_SCHEMAS.find((candidate) => candidate.key === entry.key);
+  if (!schema || schema.table !== entry.table || (schema.mutations as readonly string[]).includes('delete')) {
+    throw new Error(`History record domain ${entry.key} is not an undeletable domain of table ${entry.table}.`);
+  }
+}
+
+/**
+ * The readable history of one database, read from the tables themselves: every Conversation and
+ * MessageRevision id, the ids of the other history rows (RUNTIME_HISTORY_RECORD_DOMAINS, by domain
+ * key), what is visible (every message not deleted, with its current revision) and every body
+ * (ContentObject id, CAS storage key, byte length as decimal text).
+ */
 export interface RuntimeDataSetHistoryIds {
   conversations: string[];
   messageRevisions: string[];
+  records: Record<string, string[]>;
+  /** [message id, its current-revision link id, the current revision id]. */
+  visibleMessages: Array<[string, string, string]>;
+  /** [content object id, storage key, byte length]. */
+  contents: Array<[string, string, string]>;
 }
 
 export interface RuntimeDataSetFacts {

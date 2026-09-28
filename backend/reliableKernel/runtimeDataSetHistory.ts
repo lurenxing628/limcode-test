@@ -10,6 +10,7 @@ import {
   copyLocatedRuntimeDatabase, heldDatabaseFiles, readLocatedRuntimeFile, relocateRuntimeRoot, withLocatedRuntimeRootFence,
   type HeldDatabaseFiles
 } from './runtimeForeignHistory';
+import { registerForeignRuntimeHistoryView, type ForeignRuntimeHistoryViewRegistration } from './runtimeForeignHistoryViews';
 import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { sameLocatedRuntimeRoot, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
@@ -54,7 +55,9 @@ const MAX_MESSAGE_CONTENT_BYTES = 64n * 1024n * 1024n;
  * it) with its Hosts offline, then open only that temporary copy, fenced by the recorded binding.
  * The copy counts only when the files kept their state while it was taken, and no file copied or
  * read is a file of a database this process may hold (copyLocatedRuntimeDatabase). CAS stays
- * on-demand, read from the located root as regular files only. A recorded path is never read.
+ * on-demand, read from the located root as regular files only. A recorded path is never read. A
+ * foreign root stays registered as viewed (runtimeForeignHistoryViews, written under its claim in the
+ * current configuration root) until the reader is closed, so 清理备份 keeps it meanwhile.
  */
 export async function openRuntimeDataSetHistory(
   paths: { globalStoragePath: string },
@@ -80,15 +83,17 @@ export async function openRuntimeDataSetHistory(
       else if (!sameLocatedRuntimeRoot(await relocateRuntimeRoot(paths, current, held), current)) {
         throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
       }
+      const view = current.origin.kind === 'foreign' ? await registerForeignRuntimeHistoryView(paths.globalStoragePath, current.id) : undefined;
       let snapshot: RuntimeDataSetDatabaseSnapshot | undefined;
       try {
         snapshot = await createLocatedRuntimeDatabaseSnapshot(current, { copy: (located) => copyLocatedRuntimeDatabase(located, held) });
         const { database } = snapshot;
         assertCurrentSchema(database, binding);
         assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS, { label: 'Historical Runtime' });
-        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, held);
+        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, held, view);
       } catch (error) {
         await snapshot?.close();
+        await view?.release().catch(() => undefined);
         if (error instanceof Error) {
           error.message = `无法读取历史库：${error.message} 未执行任何迁移或重置。`;
         }
@@ -118,7 +123,8 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     private readonly binding: RootBinding,
     private readonly database: Database.Database,
     private readonly snapshot: RuntimeDataSetDatabaseSnapshot,
-    private held: HeldDatabaseFiles
+    private held: HeldDatabaseFiles,
+    private readonly view?: ForeignRuntimeHistoryViewRegistration
   ) {}
 
   public async listConversations(input: { limit?: number; after?: RuntimeHistoryConversationCursor } = {}) {
@@ -185,7 +191,11 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     if (this.closed) return;
     this.closed = true;
     this.textCache.clear();
-    await this.snapshot.close();
+    try {
+      await this.snapshot.close();
+    } finally {
+      await this.view?.release();
+    }
   }
 
   private async validateSource(): Promise<void> {

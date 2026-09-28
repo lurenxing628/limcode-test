@@ -32,8 +32,8 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 function item(overrides) {
   return {
     key: 'merge-target:.limcode-runtime/merge-backups/a', kind: 'merge-target', name: 'a', path: `${CONTROL}/merge-backups/a`,
-    dataSetCandidateId: 'default', inCurrentDataSet: true, bytes: '2048', reclaimableBytes: '1024', fileCount: 2,
-    createdAt: '2026-09-20T01:02:00.000Z', deletable: true, reason: '可以删除：其中 2 个对话、4 个消息版本都完整存在于当前库', ...overrides
+    dataSetCandidateId: 'default', dataSetName: '当前库', inCurrentDataSet: true, bytes: '2048', reclaimableBytes: '1024', fileCount: 2,
+    createdAt: '2026-09-20T01:02:00.000Z', deletable: true, reason: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）', ...overrides
   };
 }
 
@@ -53,27 +53,27 @@ const PLAN = {
     }),
     item({
       key: 'merge-source:src', kind: 'merge-source', name: 'source', path: '/data/limcode/.limcode-workspace-runtimes/scopes/x/.limcode-runtime/merge-source-backups/source',
-      dataSetCandidateId: 'workspace:folder-x', inCurrentDataSet: false, bytes: '1048576', reclaimableBytes: '1048576',
-      reason: '可以删除：其中 1 个对话、2 个消息版本都完整存在于这个历史库（workspace:folder-x）'
+      dataSetCandidateId: 'workspace:folder-x', dataSetName: '历史库“项目甲”', inCurrentDataSet: false, bytes: '1048576', reclaimableBytes: '1048576',
+      reason: '可以删除：内容已完整在历史库“项目甲”里（其中 1 个对话、2 个消息版本都在，显示的消息相同，正文文件也都在）'
     }),
     item({
       key: 'reset-archive:arch', kind: 'reset-archive', name: 'notes', path: `${ROOT}/.limcode-runtime-backups/notes`,
-      inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '归档目录里不是“归档并重置”留下的归档（名字不认识）；只列出，不删除'
+      dataSetName: undefined, inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '归档目录里不是“归档并重置”留下的归档（名字不认识）；只列出，不删除'
     }),
     item({
       key: 'foreign-history:foreign:archive:0123456789abcdef', kind: 'foreign-history', name: '20260901-010203-004-abcdef12',
       path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`, origin: '“归档并重置”的归档', dataSetCandidateId: undefined,
-      inCurrentDataSet: false, bytes: '4096', reclaimableBytes: '4096', reason: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在）'
+      dataSetName: undefined, inCurrentDataSet: false, bytes: '4096', reclaimableBytes: '4096', reason: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）'
     }),
     item({
       key: 'foreign-history:foreign:copied:fedcba9876543210', kind: 'foreign-history', name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
       path: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678/.limcode-runtime', origin: '拷来目录里的库', dataSetCandidateId: undefined,
-      inCurrentDataSet: false, bytes: '8192', reclaimableBytes: '8192', deletable: false, reason: '未通过核验：结构或完整性核验未通过，原样保留'
+      dataSetName: undefined, inCurrentDataSet: false, bytes: '8192', reclaimableBytes: '8192', deletable: false, reason: '未通过核验：结构或完整性核验未通过，原样保留'
     }),
     item({
       key: 'copied-data-root:limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', kind: 'copied-data-root',
       name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', path: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
-      dataSetCandidateId: undefined, inCurrentDataSet: false, bytes: '300', reclaimableBytes: '300', deletable: false,
+      dataSetCandidateId: undefined, dataSetName: undefined, inCurrentDataSet: false, bytes: '300', reclaimableBytes: '300', deletable: false,
       reason: '迁移数据目录时挪到旁边的拷来目录。其中的库在“外来历史库”一组里逐个核对，只删能证明内容已完整在本地库里的库；目录本身和其余内容（设置、规则、技能）不删除'
     })
   ]
@@ -154,6 +154,9 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   const [first, second, done] = f.prompts;
   assert.equal(first.title, '清理备份：勾选要删除的备份');
   assert.match(first.description, /只删除能证明完整存在于本地库的副本/);
+  assert.match(first.description, /工具调用、输出、回答等记录都还在当前库或同一数据目录的某个历史库里，正文文件也在，副本里显示的每条消息在那里也显示同一个版本/);
+  assert.match(first.description, /已被你删除、编辑或重试替换的，单独列出，默认不勾选/);
+  assert.doesNotMatch(first.description, /包括编辑前的版本/, '不再说编辑前的版本都还在：被替换的消息单独列出');
   assert.deepEqual(first.actions.map((action) => action.key), ['cancel', 'next']);
   assert.equal(first.danger, undefined);
   assert.equal(first.options, undefined, '勾选框按种类放在各自的分组里');
@@ -163,9 +166,12 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   ]);
   const merge = first.sections.find((section) => section.title === '合并前备份（2 项）');
   assert.match(merge.lines[0], /^用途：/);
-  assert.deepEqual(merge.options.map((option) => option.key), ['merge-target:old']);
+  assert.deepEqual(merge.options.map((option) => [option.key, option.checked]), [['merge-target:old', true]], '内容完整的项默认勾选');
   assert.match(merge.options[0].label, /^merge-old（2 KiB，预计释放 1 KiB）$/);
-  assert.match(merge.options[0].detail, /创建于 2026-09-\d\d \d\d:\d\d.*所属：当前库　位置：\/data\/limcode\/\.limcode-runtime\/merge-backups\/merge-old.*可以删除：其中 2 个对话/);
+  assert.match(merge.options[0].detail, /创建于 2026-09-\d\d \d\d:\d\d.*所属：当前库　位置：\/data\/limcode\/\.limcode-runtime\/merge-backups\/merge-old.*可以删除：内容已完整在当前库里/);
+  const source = first.sections.find((section) => section.title === '合并来源的收尾前备份（1 项）');
+  assert.match(source.options[0].detail, /所属：历史库“项目甲”　位置：/, '所属用“历史与存储管理”里的名字，不写 id');
+  assert.doesNotMatch(JSON.stringify(first), /workspace:folder-x/);
   assert.ok(merge.lines.some((line) => line.startsWith('merge-newest（2 KiB）') && line.endsWith('不删除：这是这个库最新的一份满 1 小时的完整合并前备份，保留')));
   const upgrade = first.sections.find((section) => section.title === '升级前备份（1 项）');
   assert.deepEqual(upgrade.options, [], '不可删的项没有勾选框');
@@ -174,7 +180,7 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   assert.ok(archive.lines.some((line) => line.includes('位置：/data/limcode/.limcode-runtime-backups/') && line.includes('（100 B）')));
   assert.ok(archive.lines.every((line) => !line.includes('当前库') && !line.includes('所属：')), '只列出的归档不是当前库的一部分，位置只写路径');
   assert.ok(first.sections[0].lines.includes('已删完上次没有删完的 1 项。'));
-  assert.ok(first.sections[0].lines.some((line) => line.startsWith('可以删除 3 项，合计 1 MiB') && line.includes('默认都不勾选')));
+  assert.ok(first.sections[0].lines.some((line) => line.startsWith('可以删除 3 项，合计 1 MiB') && line.endsWith('默认都勾选，可以取消。')));
 
   assert.equal(second.title, '永久删除所选备份？');
   assert.equal(second.danger, true);
@@ -188,6 +194,47 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   assert.equal(done.title, '备份已删除');
   assert.match(done.sections[0].lines[0], /^已删除 2 项/);
   assert.equal(f.calls.filter((call) => call[0] === 'lifetime').length, 2, '检查与删除都登记为本窗口的数据操作');
+});
+
+test('含你后来删除或替换的内容单独一组（审查 H1）：默认不勾选、写明条数，内容完整的默认勾选；第二步写明其中几项、共几条消息删除后再也看不到；明确勾选之后才删', async () => {
+  const replacedItem = item({
+    key: 'merge-target:replaced', name: 'merge-replaced', path: `${CONTROL}/merge-backups/merge-replaced`, replacedMessages: 2,
+    reason: '其中 2 条消息在当前库里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了'
+  });
+  const replacedForeign = item({
+    key: 'foreign-history:foreign:archive:1111111111111111', kind: 'foreign-history', name: '20260902-010203-004-abcdef13',
+    path: `${ROOT}/.limcode-runtime-backups/20260902-010203-004-abcdef13`, origin: '“归档并重置”的归档', dataSetCandidateId: undefined,
+    dataSetName: undefined, inCurrentDataSet: false, replacedMessages: 1,
+    reason: '其中 1 条消息在历史库“项目甲”里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了'
+  });
+  const plan = { ...PLAN, items: [...PLAN.items, replacedItem, replacedForeign] };
+  const chosen = ['merge-target:old', 'merge-target:replaced', 'foreign-history:foreign:archive:1111111111111111'];
+  const f = fixture({ plan, answers: [{ choice: 'next', include: chosen }, { choice: 'delete', include: [] }] });
+  await f.run();
+  const [first, second] = f.prompts;
+  assert.deepEqual(first.sections.slice(1).map((section) => section.title), [
+    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '外来历史库（2 项）', '含你后来删除或替换的内容（2 项）',
+    '归档目录里的其它内容（只列出）（1 项）', '拷来目录（只列出）（1 项）'
+  ], '紧跟在可以证明的几种之后');
+  const group = first.sections.find((section) => section.title === '含你后来删除或替换的内容（2 项）');
+  assert.match(group.lines[0], /^用途：内容都还在当前库或某个历史库里，但其中一些消息在那里已被你删除、编辑或重试替换，只在这份副本里还能看到；默认不勾选/);
+  assert.deepEqual(group.options.map((option) => [option.key, option.checked]), [
+    ['merge-target:replaced', undefined], ['foreign-history:foreign:archive:1111111111111111', undefined]
+  ], '默认不勾选');
+  assert.match(group.options[0].detail, /所属：当前库　位置：.*其中 2 条消息在当前库里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了$/);
+  assert.match(group.options[1].detail, /来源：“归档并重置”的归档　位置：.*其中 1 条消息在历史库“项目甲”里已被你删除/);
+  const merge = first.sections.find((section) => section.title === '合并前备份（2 项）');
+  assert.deepEqual(merge.options.map((option) => [option.key, option.checked]), [['merge-target:old', true]], '替换组的项不在它的种类里重复出现');
+  assert.ok(first.sections[0].lines.some((line) => line.startsWith('可以删除 5 项')
+    && line.endsWith('内容完整的 3 项默认勾选，含你后来删除或替换的内容的 2 项默认不勾选。')), first.sections[0].lines.join('\n'));
+  assert.equal(second.sections[1].lines[0], '其中 2 项含你后来删除或替换的内容（共 3 条消息），删除后这些消息就再也看不到了。');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'delete')[3], chosen);
+
+  // Only the complete ones ticked (as the panel opens): nothing of the replaced group is deleted, and no warning line.
+  const ticked = fixture({ plan, answers: [{ choice: 'next', include: ['merge-target:old'] }, { choice: 'delete', include: [] }] });
+  await ticked.run();
+  assert.deepEqual(ticked.calls.find((call) => call[0] === 'delete')[3], ['merge-target:old']);
+  assert.doesNotMatch(ticked.prompts[1].sections[1].lines.join('\n'), /含你后来删除或替换的内容/);
 });
 
 test('第一步取消、第二步取消、没有勾选任何一项：都不删除；勾选以外的键不会传给删除', async () => {
@@ -359,7 +406,7 @@ test('外来历史库单独一组：可删的写明来源、位置和内容已�
   assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, ['/old/limcode']], '最近一次迁移离开的目录的归档和旁边的拷来目录一起核对');
   assert.deepEqual(f.calls.find((call) => call[0] === 'status'), ['status', true]);
   const [first, second, done] = f.prompts;
-  assert.match(first.description, /外来历史库要先通过核验/);
+  assert.match(first.description, /外来历史库还要先通过核验/);
   const foreign = first.sections.find((section) => section.title === '外来历史库（2 项）');
   assert.match(foreign.lines[0], /^用途：“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过/);
   assert.deepEqual(foreign.options.map((option) => option.key), ['foreign-history:foreign:archive:0123456789abcdef']);

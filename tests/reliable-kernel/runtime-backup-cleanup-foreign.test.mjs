@@ -1,7 +1,8 @@
-// 清理备份里的外来历史库（runtimeBackupCleanup + runtimeForeignHistory）：“归档并重置”的归档、上一个数据
-// 目录里的归档和拷来目录里的库。只处理核验通过的；与某个非当前本地库身份相同且内容摘要相同，或全部对话与消息
-// 版本（连同它保留的备份）都在某个本地库里才可删；删除在 admission 与不等待的外来声明内重新核验再改名、再核、
-// 写标记、删除，外来目录里只动被删的那一份。Runs against the compiled extension.
+// 清理备份里的外来历史库（runtimeBackupCleanup + runtimeForeignHistory）：“归档并重置”的归档、以前的数据
+// 目录里的归档和拷来目录里的库。只处理核验通过的；与某个非当前本地库身份相同且内容摘要相同，或对话、消息版本、
+// 其它历史记录和正文（连同它保留的备份）都在某个本地库里、显示的消息也相同才可删；删除在 admission 与不等待的
+// 外来声明内重新核验再改名、再核、写标记，之后只在声明内删除，外来目录里只动被删的那一份。Runs against the
+// compiled extension.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
@@ -39,7 +40,7 @@ const NOW = '2026-09-26T00:00:00.000Z';
 const DAY = 24 * 60 * 60_000;
 const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
-const BUSY = '正在被只读查看、核验或合并（另一个窗口或操作正在用它）';
+const BUSY = '正在被另一个窗口或操作使用（只读查看、核验、合并或清理备份）';
 const REST = '其余内容（设置、规则、技能）保留，可自行处理';
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 
@@ -64,7 +65,7 @@ test('覆盖证明：“归档并重置”留下的真实归档，它的对话�
   const plan = await planRuntimeBackupCleanup(fixture.root, reader);
   const item = itemAt(plan, archived);
   assert.equal(item.deletable, true, item.reason);
-  assert.equal(item.reason, '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在）');
+  assert.equal(item.reason, '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）');
   assert.ok(reader.calls > 0 && reader.maxBatch <= 250, '当前库只经它自己的读取线程查询');
   const parent = path.dirname(archived);
   const others = (await fs.readdir(parent)).filter((name) => name !== path.basename(archived));
@@ -87,10 +88,10 @@ test('身份相同证明：与某个历史库身份相同、内容摘要相同�
   const plan = await planRuntimeBackupCleanup(fixture.root, database);
   const identical = itemAt(plan, twin);
   assert.equal(identical.deletable, true, identical.reason);
-  assert.equal(identical.reason, `可以删除：内容已完整在历史库（${fixture.alpha.id}）里（与它身份相同、内容完全相同）`);
+  assert.equal(identical.reason, '可以删除：内容已完整在历史库“shared”里（与它身份相同、内容完全相同，正文文件也都在）');
   assert.equal(identical.origin, '“归档并重置”的归档（工作区库）');
   const ofCurrent = itemAt(plan, currentCopy);
-  assert.equal(ofCurrent.reason, '可以删除：内容已完整在当前库里（其中 1 个对话、2 个消息版本都在）', '当前库没有安全的摘要途径，只按覆盖核对');
+  assert.equal(ofCurrent.reason, '可以删除：内容已完整在当前库里（其中 1 个对话、2 个消息版本都在，显示的消息相同，正文文件也都在）', '当前库没有安全的摘要途径，只按覆盖核对');
   const alphaBefore = await fileStates(controlRoot(fixture.alpha));
   const result = await deleteRuntimeBackups(plan, database, [identical.key]);
   assert.deepEqual(result.deleted.map((entry) => entry.path), [twin], JSON.stringify(result));
@@ -100,12 +101,12 @@ test('身份相同证明：与某个历史库身份相同、内容摘要相同�
   // Alpha has one more conversation: no longer the same content, still every id of the copy.
   await seed(fixture.alpha, ['conversation_alpha_three']);
   const grown = itemAt(await planRuntimeBackupCleanup(fixture.root, database), twinToKeep);
-  assert.equal(grown.reason, `可以删除：内容已完整在历史库（${fixture.alpha.id}）里（其中 2 个对话、4 个消息版本都在）`);
+  assert.equal(grown.reason, '可以删除：内容已完整在历史库“shared”里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）');
   // Alpha lost one of the copy's conversations: neither proof holds.
   await deleteConversation(fixture.alpha, 'conversation_alpha_two');
   const shrunk = itemAt(await planRuntimeBackupCleanup(fixture.root, database), twinToKeep);
   assert.deepEqual([shrunk.deletable, shrunk.reason],
-    [false, `含 1 个历史库（${fixture.alpha.id}）没有的对话（可能是你删掉的），也没有别的本地库完整包含它，按历史保留`]);
+    [false, '含 1 个历史库“shared”没有的对话（可能是你删掉的），也没有别的本地库完整包含它，按历史保留']);
 });
 
 test('没有通过核验的外来库只列出、写明原因；列出之后才出现涉及它的正在提交的合并、或路径上换成了符号链接，锁内重新核验不通过，不删', async (t) => {
@@ -294,7 +295,11 @@ test('删除中崩溃（子进程 SIGKILL）：改名之后、再核之前崩溃
   const leftover = (await fs.readdir(copied)).find((name) => name.startsWith('.limcode-runtime.deleting-'));
   assert.ok(leftover, (await fs.readdir(copied)).join(','));
   const mark = JSON.parse(await fs.readFile(path.join(copied, leftover, '.limcode-backup-cleanup-verified'), 'utf8'));
-  assert.deepEqual(mark, { foreignId: copiedId, kind: 'limcode-backup-cleanup-verified', name: leftover });
+  // Bound to this configuration root: its path and its cleanup identity (created with the first mark).
+  const identity = JSON.parse(await fs.readFile(path.join(fixture.root, '.limcode-runtime-merges', 'backup-cleanup-identity.json'), 'utf8'));
+  assert.deepEqual(mark, {
+    foreignId: copiedId, kind: 'limcode-backup-cleanup-verified', name: leftover, configurationRoot: fixture.root, cleanupIdentity: identity.token
+  });
   // Removed halfway: its pointer is already gone, the mark still names the claim.
   await fs.rm(path.join(copied, leftover, 'root-binding.json'));
 
@@ -445,13 +450,13 @@ test('外来库保留的备份逐份核对：都在当前库里时连同它一�
     withBackup, uncoveredBackup, legacy, captures, spool, unknown, journal, unfinished, unknownData, linked, writing, strange, empty, edited
   }).map(([name, directory]) => [name, itemAt(plan, directory).reason]));
   assert.deepEqual(reasons, {
-    withBackup: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，包括它保留的 1 份备份）',
+    withBackup: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在，包括它保留的 1 份备份）',
     uncoveredBackup: '含 1 个当前库没有的对话（可能是你删掉的），也没有别的本地库完整包含它，按历史保留',
     legacy: '里面有旧格式备份 backups/（升级到 SQLite 内核之前的数据，从未导入），整份保留，可自行处理',
     captures: '里面有调试取证（diagnostics/debug-captures），整份保留，可自行处理',
     spool: '里面的进程输出暂存（process-spool）还有内容，整份保留，可自行处理',
     unknown: '里面有不认识的内容（notes.txt），整份保留，可自行处理',
-    journal: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在）',
+    journal: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）',
     unfinished: '有 1 项未结束的任务（旧窗口中断时留下），覆盖核对不包括它们，按历史保留',
     unknownData: '数据目录里有不认识的内容（notes.txt），整份保留，可自行处理',
     linked: '目录里有符号链接，不跟随也不删除，整份保留',
@@ -492,7 +497,7 @@ test('外来库保留的升级前备份按同样的规则：升级完成满 7 �
   assert.deepEqual([skewed.deletable, skewed.reason], [false, `它保留的升级前备份 ${backupName}：升级完成的时间晚于现在，时间不可信，整份保留`]);
   const later = await planRuntimeBackupCleanup(fixture.root, database, { now: () => Date.now() + 8 * DAY });
   assert.equal(itemAt(later, twin).reason,
-    `可以删除：内容已完整在历史库（${fixture.alpha.id}）里（与它身份相同、内容完全相同；它保留的 1 份备份也都在那里）`);
+    '可以删除：内容已完整在历史库“shared”里（与它身份相同、内容完全相同，正文文件也都在；它保留的 1 份备份也都在那里）');
   assert.equal(itemAt(later, retired).reason, `它保留的升级前备份 ${backupName}：旧版本 3→4 升级留下的备份，整份保留`);
   const result = await deleteRuntimeBackups(later, database, [itemAt(later, twin).key], { now: () => Date.now() + 8 * DAY });
   assert.deepEqual(result.deleted.map((entry) => entry.path), [twin], JSON.stringify(result));
@@ -549,7 +554,7 @@ test('锁内复核：列出之后外来库有变化、证明它的历史库有�
       if (point === 'after-rename') rawEditFile(alphaDatabase, (edit) => edit.prepare("UPDATE conversation SET title = 'renamed' WHERE id = ?").run('conversation_alpha'));
     }
   });
-  assert.deepEqual(lateChange.kept.map((entry) => entry.reason), [`证明它的历史库（${fixture.alpha.id}）在检查之后有改动，请重新检查，已改回原名，保留`]);
+  assert.deepEqual(lateChange.kept.map((entry) => entry.reason), ['证明它的历史库“shared”在检查之后有改动，请重新检查，已改回原名，保留']);
   assert.ok((await fs.lstat(twinChangedLate)).isDirectory());
 
   await fs.writeFile(path.join(touched, 'active', 'diagnostics.tmp'), 'written after the check');
@@ -558,7 +563,7 @@ test('锁内复核：列出之后外来库有变化、证明它的历史库有�
   assert.deepEqual(changed.deleted, []);
   assert.deepEqual(changed.kept.map((entry) => entry.reason), [
     '列出之后它有变化，请重新检查；这一项没有删除',
-    `证明它的历史库（${fixture.alpha.id}）在检查之后有改动，请重新检查；这一项没有删除`
+    '证明它的历史库“shared”在检查之后有改动，请重新检查；这一项没有删除'
   ]);
 
   // Alpha was archived and reset meanwhile: the proving data set is another one now.

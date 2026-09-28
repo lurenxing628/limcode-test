@@ -3241,6 +3241,8 @@ export interface DataRootPromptOption {
   label: string;
   /** Shown under the label. */
   detail?: string;
+  /** Ticked when the prompt opens (the user can untick it); unticked otherwise. */
+  checked?: boolean;
 }
 
 export interface DataRootPromptSection {
@@ -3257,7 +3259,7 @@ export interface DataRootPromptPayload {
   description?: string;
   /** Listed in full (never truncated). */
   sections: DataRootPromptSection[];
-  /** Check boxes, unticked by default (e.g. backups that are kept unless ticked). */
+  /** Check boxes, unticked unless `checked` (e.g. backups that are kept unless ticked). */
   options?: DataRootPromptOption[];
   actions: DataRootPromptAction[];
   danger?: boolean;

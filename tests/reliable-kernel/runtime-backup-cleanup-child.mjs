@@ -1,5 +1,7 @@
-// Child process of runtime-backup-cleanup(-foreign).test.mjs: a window that crashes while deleting a
-// backup, or another process holding a claim (hold-claim <claim path> <target>) until told to release it.
+// Child process of runtime-backup-cleanup(-foreign, -review).test.mjs: a window that crashes while
+// deleting a backup, another process holding a claim (hold-claim <claim path> <target>) until told to
+// release it, or one that looks whether the configuration admission and a foreign root's claim are free
+// (probe <configuration root> <foreign id> <root pointer>; prints {"admission","claim"}: "free" or "held").
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -26,14 +28,30 @@ if (mode === 'hold-claim') {
   });
   process.exit(0);
 }
+if (mode === 'probe') {
+  const { RuntimeClaimHeldError, RuntimeMaintenanceBusyError, withRuntimeDataRootAdmission } = kernelFile('runtimeHostControl.js');
+  const { tryWithForeignRuntimeRootClaim } = kernelFile('runtimeForeignHistory.js');
+  const [id, pointer] = [key, crashPoint];
+  let admission = 'free';
+  try {
+    await withRuntimeDataRootAdmission(root, async () => undefined, { refuseWhenHeld: true });
+  } catch (error) {
+    if (!(error instanceof RuntimeClaimHeldError || error instanceof RuntimeMaintenanceBusyError)) throw error;
+    admission = 'held';
+  }
+  const claim = (await tryWithForeignRuntimeRootClaim(root, id, pointer, async () => undefined)).acquired ? 'free' : 'held';
+  process.stdout.write(`${JSON.stringify({ admission, claim })}\n`);
+  process.exit(0);
+}
 if (mode !== 'delete-then-crash') throw new Error(`unknown mode ${mode}`);
-if (!['after-rename', 'after-verify'].includes(crashPoint)) throw new Error(`unknown crash point ${crashPoint}`);
+if (!['after-rename', 'after-verify', 'before-removal'].includes(crashPoint)) throw new Error(`unknown crash point ${crashPoint}`);
 const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
 const database = await kernel.RuntimeDatabase.open(authority, { hostBootId: `crash-${randomUUID()}` });
 const plan = await planRuntimeBackupCleanup(root, database);
 await deleteRuntimeBackups(plan, database, [key], {
-  // Killed with both claims held: after-rename before the coverage was checked again (no verified
-  // mark yet), after-verify once the mark is durable and before the recursive removal.
+  // Killed with every claim held: after-rename before the coverage was checked again (no verified
+  // mark yet), after-verify once the mark is durable; before-removal (a foreign root) with its foreign
+  // claim alone, the admission already released, before the recursive removal.
   onFaultPoint(point) { if (point === crashPoint) process.kill(process.pid, 'SIGKILL'); }
 });
 // Not killed: the crash point was never reached.
