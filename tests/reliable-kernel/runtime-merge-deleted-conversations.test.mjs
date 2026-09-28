@@ -590,7 +590,7 @@ test('审查 UI-1：合并时跳过了删掉的对话，列表状态带上跳过
   } finally { await database.close(); }
 });
 
-test('审查 B2：迁移进含旧拷贝的目录后，按身份延续记录，迁移前当前库的旧拷贝仍是旧拷贝：列表标出、合并拒绝，删掉的对话不回来', async (t) => {
+test('审查 B2：迁移进含旧拷贝的目录后，迁移写下的身份延续让迁移前当前库的旧拷贝仍是旧拷贝：列表标出、合并拒绝，删掉的对话不回来', async (t) => {
   const fixture = await moving.createFixture(t, { withAlpha: false });
   const copied = path.join(fixture.base, 'copied');
   await fs.cp(fixture.root, copied, { recursive: true });
@@ -598,12 +598,12 @@ test('审查 B2：迁移进含旧拷贝的目录后，按身份延续记录，�
   await deleteUnrecorded(fixture.current.authority, 'conversation_current_1');
   const plan = await moving.relocation.planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
   assert.deepEqual([plan.target.kind, plan.target.sameDataSet], ['copied', true]);
-  const { result } = await moving.relocate(fixture, plan);
+  const { result, staged } = await moving.relocate(fixture, plan);
   const aside = result.copiedDataMovedTo;
   const current = await moving.selectedDataSet(copied);
   assert.notEqual(current.dataSetId, fixture.current.binding.dataSetId, '迁移后当前库是新身份');
-  // What the relocation writes (its part): the new current data set continues the one it came from.
-  await writeAliases(copied, current, [fixture.current.binding]);
+  assert.deepEqual((await records.readRuntimeIdentityAliases(copied, current)).map((entry) => [entry.dataSetId, entry.rootInstanceId, entry.relocationId]),
+    [[fixture.current.binding.dataSetId, fixture.current.binding.rootInstanceId, staged.relocationId]], '迁移写下：新的当前库延续迁移前的那一个');
 
   const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: copied, previousDataRootPaths: [fixture.root] });
   const entry = report.entries.find((item) => item.location.containerPath === aside && item.scope === 'default' && !item.archiveName);
@@ -635,12 +635,8 @@ test('审查 B2b：迁移前合并过、之后删掉的对话，迁移带走账�
   const { result } = await moving.relocate(fixture, plan);
   const current = await moving.selectedDataSet(copied);
   assert.ok(!moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'));
-  // What the relocation carries and writes (its part): the ledger and the deletion records, and the continuation.
-  for (const section of ['records', 'deleted-conversations']) {
-    await fs.cp(path.join(ledgerRoot(fixture.root), section), path.join(ledgerRoot(copied), section), { recursive: true, force: false })
-      .catch((error) => { if (error.code !== 'ENOENT') throw error; });
-  }
-  await writeAliases(copied, current, [fixture.current.binding]);
+  assert.deepEqual(await readLedgerRecord({ paths: { globalStoragePath: copied } }, fixture.alpha.id), await readLedgerRecord(fixture, fixture.alpha.id),
+    '迁移带走了账本：alpha 并进迁移前当前库的闭包');
 
   const source = await found(copied, result.copiedDataMovedTo, fixture.alpha.id, [fixture.root]);
   assert.equal(source.root.recorded.dataSetId, fixture.alpha.binding.dataSetId, '拷贝里的是迁移前合并过的 alpha');
@@ -654,6 +650,147 @@ test('审查 B2b：迁移前合并过、之后删掉的对话，迁移带走账�
   assert.deepEqual([merged.blocked, merged.deferred, merged.failures], [[], [], []]);
   assert.deepEqual(merged.merged.map((item) => [item.candidateId, item.skippedConversations]), [[source.id, 1]]);
   assert.ok(!moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'), '迁移前删掉的对话没有回来');
+});
+
+// --- Data-root relocation carries what merges must never bring back (the relocation's part) ---------------
+
+/** One batch in a window of `current` (a selected data set of the configuration root `root`). */
+async function mergeIntoCurrent(root, current, options = {}) {
+  const authority = createVscodeRootAuthority({ runtimeDataRootPath: current.runtimeDataRootPath, configurationRootPath: root });
+  const database = await kernel.RuntimeDatabase.open(authority, { hostBootId: `window-${randomUUID()}` });
+  try {
+    return await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, options);
+  } finally { await database.close(); }
+}
+
+/** Deletion records, merge ledger records and continuations under `root`, file by file. */
+async function bookkeeping(root) {
+  const result = {};
+  for (const section of ['deleted-conversations', 'records', 'aliases']) {
+    const directory = path.join(ledgerRoot(root), section);
+    if (!await exists(directory)) continue;
+    for (const [file, digest] of Object.entries(await moving.treeSnapshot(directory))) result[`${section}/${file}`] = digest;
+  }
+  return result;
+}
+
+const recordFileOf = (root, candidateId) => path.join(ledgerRoot(root), 'records', `${candidateId.replace(/:/g, '-')}.json`);
+
+test('迁移带走删除记录：账本里没有闭包时（记录丢了，或被更早的版本合并），迁移前经删除命令删掉的对话，迁移后合并旧拷贝里的那个库也不回来', async (t) => {
+  const fixture = await moving.createFixture(t);
+  assert.deepEqual(brief(await batch(fixture)).merged, [[fixture.alpha.id, 1, 0]]);
+  assert.deepEqual((await deleteWithCommand(fixture.current.authority, fixture.root, 'conversation_alpha_1')).deletedConversationIds, ['conversation_alpha_1']);
+  await fs.rm(recordFileOf(fixture.root, fixture.alpha.id));
+  const copied = path.join(fixture.base, 'copied');
+  await fs.cp(fixture.root, copied, { recursive: true });
+  await fs.rm(path.join(copied, 'notes.txt'));
+  const plan = await moving.relocation.planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
+  assert.deepEqual([plan.target.kind, plan.problems], ['copied', []]);
+  const { result } = await moving.relocate(fixture, plan);
+  const current = await moving.selectedDataSet(copied);
+  assert.deepEqual([...await records.readRuntimeDeletedConversations(copied, [identityOf(fixture.current.binding)])], ['conversation_alpha_1'],
+    '删除记录带到了新目录（按迁移前当前库的身份）');
+  assert.deepEqual((await records.readRuntimeMergeTargetIdentities(copied, current)).map((identity) => identity.dataSetId),
+    [current.dataSetId, fixture.current.binding.dataSetId]);
+  assert.deepEqual(result.others.migrated, [fixture.alpha.id]);
+  const alphaCopy = (await moving.rootAuthority.inspectVscodeRuntimeDataSets({ globalStoragePath: copied })).candidates.find((item) => item.id === fixture.alpha.id);
+  assert.notEqual(alphaCopy.dataSetId, fixture.alpha.binding.dataSetId);
+  assert.deepEqual((await records.readRuntimeIdentityAliases(copied, alphaCopy)).map((entry) => entry.dataSetId), [fixture.alpha.binding.dataSetId],
+    '迁走的其它库换了身份，同样写下延续');
+
+  const source = await found(copied, result.copiedDataMovedTo, fixture.alpha.id, [fixture.root]);
+  await request(copied, source);
+  const merged = await mergeIntoCurrent(copied, current, explicit(source.id));
+  assert.deepEqual(brief(merged).merged, [[source.id, 0, 1]], '只靠带过来的删除记录跳过');
+  assert.ok(!moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'), '迁移前删掉的对话没有回来');
+});
+
+test('迁移进已有 LimCode 数据的目录：目标自己的合并记录、删除记录和身份延续都保留，与带过去的取并集（同一候选 id 的记录按来源身份保留两边的闭包，延续展开旧目录当前库自己的延续）；没切换、或带过去的记录核对不一致时撤销，目标的这些记录原样恢复', async (t) => {
+  const fixture = await moving.createFixture(t);
+  const earlier = { dataSetId: randomUUID(), rootInstanceId: randomUUID() };
+  await writeAliases(fixture.root, fixture.current.binding, [earlier]);
+  await records.recordRuntimeDeletedConversations(fixture.root, earlier, ['conversation_earlier_1']);
+  assert.deepEqual(brief(await batch(fixture)).merged, [[fixture.alpha.id, 1, 0]]);
+  await deleteWithCommand(fixture.current.authority, fixture.root, 'conversation_alpha_1');
+
+  // The target's own library under alpha's candidate id, merged into its current data set there, deleted from it since.
+  const target = path.join(fixture.base, 'existing');
+  const existing = await moving.createLimCodeTarget(target);
+  const scope = moving.rootAuthority.resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: ['file:///workspace/alpha'] });
+  const scopeRoot = moving.rootAuthority.resolveVscodeWorkspaceRuntimeScopeRoot({ globalStoragePath: target }, scope);
+  await fs.mkdir(scopeRoot, { recursive: true });
+  const theirs = await moving.initialize(scopeRoot, fixture.alpha.id);
+  await moving.seed(theirs, [{ id: 'conversation_theirs_1', project: moving.PROJECT }]);
+  const targetHome = { root: target, paths: { globalStoragePath: target }, current: existing };
+  assert.deepEqual(brief(await batch(targetHome)).merged, [[fixture.alpha.id, 1, 0]]);
+  await deleteWithCommand(existing.authority, target, 'conversation_theirs_1');
+  const theirsEarlier = { dataSetId: randomUUID(), rootInstanceId: randomUUID() };
+  await writeAliases(target, existing.binding, [theirsEarlier]);
+  const keptRecord = await readLedgerRecord(targetHome, fixture.alpha.id);
+  assert.deepEqual(keptRecord.mergedInto, [{ target: identityOf(existing.binding), conversationIds: ['conversation_theirs_1'] }]);
+  const before = await bookkeeping(target);
+
+  const plan = await moving.relocation.planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target });
+  assert.deepEqual([plan.target.kind, plan.problems], ['limcode', []]);
+  // Not switched (the pointer write provably did not happen): undone.
+  await assert.rejects(moving.relocate(fixture, plan, { publish: async () => { throw new Error('指针没有写成'); } }), /指针没有写成/);
+  assert.deepEqual(await bookkeeping(target), before, '没切换就撤销：目标的记录原样恢复，带过去的都去掉');
+  // The joined record damaged right after it was written: the check finds it, the relocation is undone.
+  const recordFile = recordFileOf(target, fixture.alpha.id);
+  const rename = fs.rename;
+  let damaged = false;
+  fs.rename = async function (from, to, ...rest) {
+    const done = await rename.call(this, from, to, ...rest);
+    if (!damaged && to === recordFile && !String(from).includes('.limcode-relocation-backups')) {
+      damaged = true;
+      await fs.writeFile(to, '{');
+    }
+    return done;
+  };
+  try {
+    await assert.rejects(moving.relocate(fixture, plan),
+      (error) => error.code === 'data-root-relocation-merge-records' && /带到新数据目录的合并记录与旧目录核对不一致，整体取消迁移/.test(error.message));
+  } finally { fs.rename = rename; }
+  assert.equal(damaged, true);
+  assert.deepEqual(await bookkeeping(target), before, '核对不一致也撤销：目标的记录原样恢复');
+
+  const { staged } = await moving.relocate(fixture, plan);
+  const { formerMergedInto, ...record } = await readLedgerRecord(targetHome, fixture.alpha.id);
+  assert.deepEqual(record, keptRecord, '目标自己的记录（状态、来源、闭包）不变');
+  assert.deepEqual(formerMergedInto, [{
+    source: identityOf(fixture.alpha.binding), target: identityOf(fixture.current.binding), conversationIds: ['conversation_alpha_1']
+  }], '旧目录那条的闭包按它的来源身份保留');
+  const deletions = async (identity) => [...await records.readRuntimeDeletedConversations(target, [identity])];
+  assert.deepEqual(await deletions(existing.binding), ['conversation_theirs_1']);
+  assert.deepEqual(await deletions(fixture.current.binding), ['conversation_alpha_1']);
+  assert.deepEqual(await deletions(earlier), ['conversation_earlier_1']);
+  assert.deepEqual((await records.readRuntimeIdentityAliases(target, existing.binding)).map((entry) => [entry.dataSetId, entry.relocationId === staged.relocationId]),
+    [[theirsEarlier.dataSetId, false], [fixture.current.binding.dataSetId, true], [earlier.dataSetId, false]],
+    '目标原有的延续在前，再是旧目录的当前库和它延续的更早身份');
+});
+
+test('迁移预检：旧目录的删除记录或身份延续读不出、已有 LimCode 目标里有同名但内容不同的删除记录时，拒绝并写明原因', async (t) => {
+  const fixture = await moving.createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'existing');
+  await moving.createLimCodeTarget(target);
+  const problems = async () => (await moving.relocation.planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target })).problems.join('\n');
+  await deleteWithCommand(fixture.current.authority, fixture.root, 'conversation_current_1');
+  assert.equal(await problems(), '');
+  const name = `${fixture.current.binding.dataSetId}.${fixture.current.binding.rootInstanceId}`;
+  const [file] = await fs.readdir(path.join(ledgerRoot(fixture.root), 'deleted-conversations', name));
+  const theirs = path.join(ledgerRoot(target), 'deleted-conversations', name);
+  await fs.mkdir(theirs, { recursive: true });
+  await fs.writeFile(path.join(theirs, file), JSON.stringify({ version: 1, conversationIds: ['conversation_other'], deletedAt: NOW }));
+  assert.match(await problems(), /^新数据目录里已有同名但内容不同的删除记录（.+），无法合在一起。迁移要把删除记录、合并记录和身份延续带到新目录.*这次不迁移。$/m);
+  await fs.rm(theirs, { recursive: true });
+  const own = path.join(ledgerRoot(fixture.root), 'deleted-conversations', name, file);
+  const text = await fs.readFile(own, 'utf8');
+  await fs.writeFile(own, '{');
+  assert.match(await problems(), /^旧目录里的删除记录读不出（删除记录 .+ 不是完整的 JSON）。.*这次不迁移。$/m);
+  await fs.writeFile(own, text);
+  await fs.mkdir(path.join(ledgerRoot(fixture.root), 'aliases'), { recursive: true });
+  await fs.writeFile(path.join(ledgerRoot(fixture.root), 'aliases', `${name}.json`), JSON.stringify({ version: 2, continues: [] }));
+  assert.match(await problems(), /^旧目录里历史库的身份延续记录读不出（身份延续记录 .+ 的格式不认识）。.*这次不迁移。$/m);
 });
 
 test('迁移合并也按删除记录：新目录的当前库里删掉的对话不被迁过去，旧目录里的这个库因此保留、不列为可删', async (t) => {

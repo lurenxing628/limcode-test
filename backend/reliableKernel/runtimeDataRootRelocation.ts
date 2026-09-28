@@ -29,9 +29,14 @@ import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
 import { summarizeRuntimeDataSet } from './runtimeDataSetPreflight';
 import { parseRelocatedWorkInventory, type RelocatedWorkInventory } from './relocatedWorkInventory';
 import {
-  readRuntimeDataSetMergeLedger, runtimeDataSetLastMerge, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
+  readRuntimeDataSetMergeLedger, runtimeDataSetConversationsMergedFrom, runtimeDataSetLastMerge, runtimeDataSetMergeClosures,
+  runtimeDataSetMergeLedgerRecordFile, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, withRuntimeDataSetMergeClosures,
   type RuntimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
+import {
+  readRuntimeDeletedConversations, readRuntimeIdentityAliases, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY, RUNTIME_IDENTITY_ALIASES_DIRECTORY,
+  runtimeMergeIdentityName, type RuntimeIdentityContinuation, type RuntimeMergeIdentity
+} from './runtimeMergeTombstones';
 import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigration';
 import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, listActiveRuntimeHosts, withRuntimeDataRootAdmission, withRuntimeMaintenance
@@ -42,8 +47,8 @@ import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './run
 import {
   assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
   markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
-  selectVscodeRuntimeDataSet, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, VSCODE_RUNTIME_SELECTION_FILE,
-  VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
+  resolveVscodeRuntimeMergeLedgerRoot, selectVscodeRuntimeDataSet, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY,
+  VSCODE_RUNTIME_SELECTION_FILE, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
 } from './vscodeRootAuthority';
 
 /**
@@ -750,6 +755,18 @@ export async function planDataRootRelocation(input: {
     if (offline) problems.push(offline);
   }
   if (classified.undoes) warnings.push('新数据目录里有上次没有完成的迁移，开始前会先把它撤销。');
+  if (target.kind === 'empty' || target.kind === 'limcode' || target.kind === 'copied') {
+    // Carried along in the exclusive phase (planMergeRecordsCarry): what cannot be read refuses now.
+    try {
+      const receiving = target.kind === 'limcode' ? await resolveVscodeRuntimeDataSet({ globalStoragePath: targetRootPath }, target.receivingId) : undefined;
+      await planMergeRecordsCarry(sourceRootPath, targetRootPath, [
+        { from: mergeIdentity(current), ...(receiving ? { to: mergeIdentity(receiving) } : {}) },
+        ...others.filter((other) => !other.leaveBehind).map((other) => ({ from: mergeIdentity(other) }))
+      ], { relocationId: 'plan', at: new Date().toISOString(), movedAside: target.kind === 'copied' });
+    } catch (error) {
+      problems.push(errorMessage(error));
+    }
+  }
   for (const other of others) {
     if (other.leaveBehind) warnings.push(`旧目录里的历史库 ${other.id} 不会迁移，仍留在旧目录：${other.leaveBehind}。`);
   }
@@ -1390,6 +1407,18 @@ export async function completeDataRootRelocation(
       await journal.append({ op: 'received', path: path.relative(target, staged.receiving.runtimeDataRootPath), fingerprint: receivingFingerprint });
       await copyDebugCaptures(current.runtimeDataRootPath, staged.receiving.runtimeDataRootPath, target, journal);
       const others = await migrateOthers(staged, current, journal, options);
+      // After the merges (they read the receiving data set's own deletion records): what merges into the
+      // data sets here must never bring back, and whose continuation each changed identity is.
+      options.onProgress?.('正在带上删除记录、合并记录和身份延续');
+      const moved = await Promise.all(others.result.migrated.map(async (id): Promise<ContinuedIdentity> => {
+        const other = plan.others.find((item) => item.id === id)!;
+        const copy = await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, id);
+        return { from: mergeIdentity(other), to: mergeIdentity(copy) };
+      }));
+      const carry = await planMergeRecordsCarry(source, target, [{ from: mergeIdentity(current), to: mergeIdentity(receivingFingerprint) }, ...moved],
+        { relocationId: staged.relocationId, at: new Date().toISOString() });
+      await applyMergeRecordsCarry(target, carry, journal);
+      await verifyMergeRecordsCarry(source, target, carry);
       // Only what really moved: the current data set and the others copied now (not those merged earlier or left behind).
       carried = [{ ...identityOf(current), work: currentWork }, ...others.carried]
         .filter((item) => item.work.conversations.length > 0)
@@ -2132,6 +2161,200 @@ async function treeDigest(root: string, hashes?: ReadonlyMap<string, string>): P
 }
 
 // ---------------------------------------------------------------------------------------------
+// What merges must never bring back (runtimeMergeTombstones, the merge ledger's closures)
+
+/** Where a merge record the relocation rewrote keeps its previous version, in the relocation's work directory. */
+const MERGE_RECORDS_BACKUP_DIRECTORY = 'merge-records';
+/** `<dataSetId>.<rootInstanceId>`: a directory of one identity's deletion records (runtimeMergeTombstones). */
+const IDENTITY_DIRECTORY_NAME = /^([A-Za-z0-9][A-Za-z0-9_-]{0,127})\.([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/;
+
+/**
+ * A data set whose identity the relocation changes: the one it left in the new directory (`to`; not
+ * known yet while planning a fresh root) continues the one it came from.
+ */
+interface ContinuedIdentity { from: RuntimeMergeIdentity; to?: RuntimeMergeIdentity }
+
+/** One file the carry writes in the target; `replaces`: one is there already (backed up first). */
+type MergeRecordsWrite =
+  | { kind: 'copy'; from: string; to: string; digest: string; replaces: boolean }
+  | { kind: 'write'; to: string; text: string; replaces: boolean };
+
+interface MergeRecordsCarry {
+  writes: MergeRecordsWrite[];
+  /** What the target must hold afterwards (verifyMergeRecordsCarry); `keptClosures`: those of a target's record it joined. */
+  deletionIdentities: RuntimeMergeIdentity[];
+  keptClosures: Array<{ candidateId: string; closures: ReturnType<typeof runtimeDataSetMergeClosures> }>;
+  continuations: Array<{ to: RuntimeMergeIdentity; continues: RuntimeMergeIdentity[] }>;
+}
+
+/**
+ * What the relocation writes into the target of the old directory's merge bookkeeping, read only
+ * (nothing is written): every deletion record (a new name is copied, the same name must hold the same
+ * content), every merge ledger record (copied; one the target has under the same candidate id stays,
+ * with the old one's closures joined to it per source identity), and for every data set whose
+ * identity changes a continuation of its new identity: what the target kept for it, the old identity,
+ * and what that one continued (chains expanded here, see readRuntimeMergeTargetIdentities). Without
+ * it a copy of the old identity is no old copy any more and what the user deleted before the
+ * relocation could be merged back. `movedAside`: the target's content is renamed aside first (a
+ * copied target), so none of it counts. Throws DataRootRelocationError when something cannot be read.
+ */
+async function planMergeRecordsCarry(
+  source: string,
+  target: string,
+  continued: readonly ContinuedIdentity[],
+  options: { relocationId: string; at: string; movedAside?: boolean }
+): Promise<MergeRecordsCarry> {
+  const sourcePaths = { globalStoragePath: source };
+  const targetPaths = { globalStoragePath: target };
+  const sourceLedger = resolveVscodeRuntimeMergeLedgerRoot(sourcePaths);
+  const targetLedger = resolveVscodeRuntimeMergeLedgerRoot(targetPaths);
+  const existing = async (file: string): Promise<Stats | undefined> => options.movedAside ? undefined : lstatOrUndefined(file);
+  const writes: MergeRecordsWrite[] = [];
+  const keptClosures: MergeRecordsCarry['keptClosures'] = [];
+
+  // Deletion records: files of unique names, never merged.
+  const deletionIdentities = await readMergeRecords(() => deletionRecordIdentities(source), '旧目录里的删除记录');
+  await readMergeRecords(() => readRuntimeDeletedConversations(source, deletionIdentities), '旧目录里的删除记录');
+  for (const identity of deletionIdentities) {
+    const name = runtimeMergeIdentityName(identity);
+    const directory = path.join(sourceLedger, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY, name);
+    for (const file of (await fs.readdir(directory)).sort()) {
+      if (!file.endsWith('.json')) continue;
+      const from = path.join(directory, file);
+      const to = path.join(targetLedger, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY, name, file);
+      const digest = await sha256File(from);
+      const there = await existing(to);
+      if (there) {
+        if (there.isFile() && await sha256File(to) === digest) continue;
+        throw mergeRecordsError(`新数据目录里已有同名但内容不同的删除记录（${to}），无法合在一起`);
+      }
+      writes.push({ kind: 'copy', from, to, digest, replaces: false });
+    }
+  }
+
+  // Merge ledger records: closures are kept per source identity, whoever's record it is.
+  const sourceRecords = await readMergeRecords(() => readRuntimeDataSetMergeLedger(sourcePaths), '旧目录里的合并记录');
+  const targetRecords = options.movedAside ? new Map() : await readMergeRecords(() => readRuntimeDataSetMergeLedger(targetPaths), '新数据目录里的合并记录');
+  for (const [candidateId, record] of sourceRecords) {
+    const from = await runtimeDataSetMergeLedgerRecordFile(sourcePaths, candidateId);
+    const to = await runtimeDataSetMergeLedgerRecordFile(targetPaths, candidateId);
+    const there = await existing(to);
+    if (there && !there.isFile()) throw mergeRecordsError(`新数据目录的合并记录里有同名的非普通文件（${to}）`);
+    const kept = targetRecords.get(candidateId);
+    if (!kept) {
+      // Nothing there, or a file that is no record (a merge reads it as none): the old directory's record as it is.
+      writes.push({ kind: 'copy', from, to, digest: await sha256File(from), replaces: there !== undefined });
+      continue;
+    }
+    const joined = withRuntimeDataSetMergeClosures(kept, record);
+    keptClosures.push({ candidateId, closures: runtimeDataSetMergeClosures(kept) });
+    if (!isDeepStrictEqual(joined, kept)) writes.push({ kind: 'write', to, text: `${JSON.stringify(joined, null, 2)}\n`, replaces: true });
+  }
+
+  // Continuations of the identities that change.
+  const continuations: MergeRecordsCarry['continuations'] = [];
+  for (const { from, to } of continued) {
+    const earlier = await readMergeRecords(() => readRuntimeIdentityAliases(source, from), '旧目录里历史库的身份延续记录');
+    if (!to || sameRuntimeDataSetIdentity(from, to)) continue;
+    const file = path.join(targetLedger, RUNTIME_IDENTITY_ALIASES_DIRECTORY, `${runtimeMergeIdentityName(to)}.json`);
+    const kept = options.movedAside ? [] : await readMergeRecords(() => readRuntimeIdentityAliases(target, to), '新数据目录里当前历史库的身份延续记录');
+    const entries: RuntimeIdentityContinuation[] = [];
+    const add = (entry: RuntimeIdentityContinuation): void => {
+      if (sameRuntimeDataSetIdentity(to, entry) || entries.some((known) => sameRuntimeDataSetIdentity(known, entry))) return;
+      entries.push({ dataSetId: entry.dataSetId, rootInstanceId: entry.rootInstanceId, relocationId: entry.relocationId, at: entry.at });
+    };
+    for (const entry of [...kept, { ...from, relocationId: options.relocationId, at: options.at }, ...earlier]) add(entry);
+    continuations.push({ to, continues: entries.map(({ dataSetId, rootInstanceId }) => ({ dataSetId, rootInstanceId })) });
+    if (entries.length === kept.length) continue;
+    writes.push({ kind: 'write', to: file, text: `${JSON.stringify({ version: 1, continues: entries }, null, 2)}\n`, replaces: await existing(file) !== undefined });
+  }
+  return { writes, deletionIdentities, keptClosures, continuations };
+}
+
+/**
+ * Writes what planMergeRecordsCarry found, each change journaled first: a new file under the topmost
+ * path it creates (an undo removes it), a rewritten one after its previous version was copied into
+ * the relocation's work directory (an undo puts it back). Then every directory on the way is synced.
+ */
+async function applyMergeRecordsCarry(target: string, carry: MergeRecordsCarry, journal: RelocationJournal): Promise<void> {
+  const directories = new Set<string>();
+  for (const write of carry.writes) {
+    const relative = path.relative(target, write.to);
+    if (write.replaces) {
+      const backup = path.join(MERGE_RECORDS_BACKUP_DIRECTORY, relative);
+      await journal.append({ op: 'replace', path: relative, backup });
+      await copyIntoBackup(write.to, path.join(journal.workDirectory, backup));
+    } else {
+      await journal.recordCreation(relative);
+      await fs.mkdir(path.dirname(write.to), { recursive: true, mode: 0o700 });
+    }
+    if (write.kind === 'copy') await copyVerified(write.from, write.to, write.digest);
+    else await writeTextDurably(write.to, write.text);
+    for (let directory = path.dirname(write.to); isPathBelow(target, directory); directory = path.dirname(directory)) directories.add(directory);
+  }
+  for (const directory of [...directories].sort((left, right) => right.length - left.length)) await syncDirectoryDurably(directory);
+  if (directories.size > 0) await syncDirectoryDurably(target);
+}
+
+/**
+ * The target as a merge reads it now holds everything carried: every deletion the old directory
+ * recorded, every closure of its ledger (per source identity and target), every continuation.
+ */
+async function verifyMergeRecordsCarry(source: string, target: string, carry: MergeRecordsCarry): Promise<void> {
+  const mismatch = (what: string): DataRootRelocationError => new DataRootRelocationError('data-root-relocation-merge-records',
+    `带到新数据目录的${what}与旧目录核对不一致，整体取消迁移。`);
+  const targetPaths = { globalStoragePath: target };
+  for (const identity of carry.deletionIdentities) {
+    const carried = await readRuntimeDeletedConversations(target, [identity]);
+    for (const id of await readRuntimeDeletedConversations(source, [identity])) if (!carried.has(id)) throw mismatch('删除记录');
+  }
+  const targetRecords = await readRuntimeDataSetMergeLedger(targetPaths);
+  const expected = [
+    ...[...await readRuntimeDataSetMergeLedger({ globalStoragePath: source })].map(([candidateId, record]) => ({ candidateId, closures: runtimeDataSetMergeClosures(record) })),
+    ...carry.keptClosures
+  ];
+  for (const { candidateId, closures } of expected) {
+    const kept = targetRecords.get(candidateId);
+    for (const closure of closures) {
+      const merged = new Set(kept ? runtimeDataSetConversationsMergedFrom(kept, closure.source, [closure.target]) : []);
+      if (!closure.conversationIds.every((id) => merged.has(id))) throw mismatch('合并记录');
+    }
+  }
+  for (const { to, continues } of carry.continuations) {
+    const read = await readRuntimeIdentityAliases(target, to);
+    if (!continues.every((identity) => read.some((entry) => sameRuntimeDataSetIdentity(entry, identity)))) throw mismatch('身份延续记录');
+  }
+}
+
+/** A data set's identity as merge records name it (a data set of the current epoch always has one). */
+function mergeIdentity(dataSet: { dataSetId?: string; rootInstanceId?: string }): RuntimeMergeIdentity {
+  if (!dataSet.dataSetId || !dataSet.rootInstanceId) throw mergeRecordsError('有一个历史库没有完整的身份');
+  return { dataSetId: dataSet.dataSetId, rootInstanceId: dataSet.rootInstanceId };
+}
+
+/** The identities that have a directory of deletion records under `root` (other entries are no records). */
+async function deletionRecordIdentities(root: string): Promise<RuntimeMergeIdentity[]> {
+  const directory = path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: root }), RUNTIME_DELETED_CONVERSATIONS_DIRECTORY);
+  let names: string[];
+  try { names = (await fs.readdir(directory)).sort(); }
+  catch (error) { if (isMissing(error)) return []; throw error; }
+  return names.flatMap((name) => {
+    const match = IDENTITY_DIRECTORY_NAME.exec(name);
+    return match ? [{ dataSetId: match[1], rootInstanceId: match[2] }] : [];
+  });
+}
+
+async function readMergeRecords<T>(read: () => Promise<T>, what: string): Promise<T> {
+  try { return await read(); }
+  catch (error) { throw mergeRecordsError(`${what}读不出（${errorMessage(error)}）`, error); }
+}
+
+function mergeRecordsError(reason: string, cause?: unknown): DataRootRelocationError {
+  return new DataRootRelocationError('data-root-relocation-merge-records',
+    `${reason}。迁移要把删除记录、合并记录和身份延续带到新目录（以后合并旧拷贝时按它们跳过你删掉的对话），做不到就不能保证删掉的对话不会回来，这次不迁移。`, cause);
+}
+
+// ---------------------------------------------------------------------------------------------
 // Journal and undo
 
 class RelocationJournal {
@@ -2680,7 +2903,10 @@ export async function finalizeDataRootRelocation(
 async function finalizeRelocation(root: string, marker: RelocationMarker): Promise<void> {
   const work = workDirectory(root, marker.relocationId);
   for (const name of await fs.readdir(work).catch(() => [] as string[])) {
-    if (name === JOURNAL_FILE || name.startsWith(DATABASE_BACKUP_PREFIX)) await fs.rm(path.join(work, name), { recursive: true, force: true });
+    // The merge records it rewrote only gained closures and continuations: their earlier versions go too.
+    if (name === JOURNAL_FILE || name.startsWith(DATABASE_BACKUP_PREFIX) || name === MERGE_RECORDS_BACKUP_DIRECTORY) {
+      await fs.rm(path.join(work, name), { recursive: true, force: true });
+    }
   }
   await fs.rmdir(work).catch(() => undefined);
   await fs.rmdir(path.join(root, DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)).catch(() => undefined);

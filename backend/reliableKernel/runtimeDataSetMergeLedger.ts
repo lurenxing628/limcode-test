@@ -543,12 +543,31 @@ export async function writeRuntimeDataSetMergeLedgerRecord(
 }
 
 /**
+ * `kept` with every closure `carried` keeps as well, per source identity: those of `kept`'s source
+ * incarnation join its own, the others are kept as an earlier incarnation's; nothing of either is
+ * dropped and nothing else of `carried` counts (e.g. a data-root relocation into an existing LimCode
+ * directory, whose ledger has a record under the same candidate id as the old directory's).
+ */
+export function withRuntimeDataSetMergeClosures(
+  kept: RuntimeDataSetMergeLedgerRecord,
+  carried: RuntimeDataSetMergeLedgerRecord
+): RuntimeDataSetMergeLedgerRecord {
+  const { mergedInto, formerMergedInto } = carriedConversations(kept, kept.source, carried);
+  const { mergedInto: _mergedInto, formerMergedInto: _formerMergedInto, ...rest } = kept;
+  return {
+    ...rest, ...(mergedInto.length > 0 ? { mergedInto } : {}), ...(formerMergedInto.length > 0 ? { formerMergedInto } : {})
+  } as RuntimeDataSetMergeLedgerRecord;
+}
+
+/**
  * The conversations a previous record carried, as the record of `source` carries them: its own per
  * target, or kept per source identity when they belong to another incarnation (none are dropped).
+ * `also`: another record whose closures are carried the same way.
  */
 function carriedConversations(
   previous: RuntimeDataSetMergeLedgerRecord | undefined,
-  source: RuntimeDataSetIdentity
+  source: RuntimeDataSetIdentity,
+  also?: RuntimeDataSetMergeLedgerRecord
 ): { mergedInto: RuntimeDataSetMergedConversations[]; formerMergedInto: RuntimeDataSetFormerMergedConversations[] } {
   const mergedInto: RuntimeDataSetMergedConversations[] = [];
   const formerMergedInto: RuntimeDataSetFormerMergedConversations[] = [];
@@ -561,11 +580,22 @@ function carriedConversations(
     if (!entry) list.push(entry = own ? { target: identityOf(target), conversationIds: [] } : { source: identityOf(from), target: identityOf(target), conversationIds: [] } as RuntimeDataSetFormerMergedConversations);
     entry.conversationIds = [...new Set([...entry.conversationIds, ...ids])];
   };
-  if (previous) {
-    for (const entry of mergedEntries(previous.mergedInto)) add(previous.source, entry.target, entry.conversationIds);
-    for (const entry of mergedEntries(previous.formerMergedInto)) if (entry.source) add(entry.source, entry.target, entry.conversationIds);
+  for (const record of [previous, also]) {
+    if (!record) continue;
+    for (const entry of mergedEntries(record.mergedInto)) add(record.source, entry.target, entry.conversationIds);
+    for (const entry of mergedEntries(record.formerMergedInto)) if (entry.source) add(entry.source, entry.target, entry.conversationIds);
   }
   return { mergedInto, formerMergedInto };
+}
+
+/** Every closure a record keeps, with the source incarnation it belongs to (well-formed entries only). */
+export function runtimeDataSetMergeClosures(
+  record: RuntimeDataSetMergeLedgerRecord
+): Array<{ source: RuntimeDataSetIdentity; target: RuntimeDataSetIdentity; conversationIds: string[] }> {
+  return [
+    ...mergedEntries(record.mergedInto).map((entry) => ({ source: identityOf(record.source), target: entry.target, conversationIds: entry.conversationIds })),
+    ...mergedEntries(record.formerMergedInto).flatMap((entry) => entry.source ? [{ source: entry.source, target: entry.target, conversationIds: entry.conversationIds }] : [])
+  ];
 }
 
 /** Well-formed entries only: a malformed one names nothing. */
@@ -637,6 +667,11 @@ async function readRuntimeDataSetMergeLedgerRecord(
     throw error;
   }
   return isLedgerRecord(value, path.basename(file)) ? value : undefined;
+}
+
+/** The file of one source's record (never through a symbolic link), e.g. to copy the record as it is. */
+export function runtimeDataSetMergeLedgerRecordFile(paths: StoragePaths, candidateId: string): Promise<string> {
+  return ledgerFile(paths, RECORDS, candidateId);
 }
 
 /** Puts a record back exactly as it was, its time of judgment included (e.g. after a proven rollback). */

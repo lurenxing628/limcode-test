@@ -19,6 +19,7 @@
 //                               the first committed batch (fresh root)
 //   undo-marked                 (phase recover) after the record was marked 'undoing', before any undo step
 //   undo-restored               (phase recover) after the first replaced configuration file was put back
+//   undo-merge-restored         (phase recover) after the first rewritten merge record (ledger, continuation) was put back
 //   undo-db-restored            (phase recover) after the receiving database file was renamed back
 //   undo-work-removed           (phase recover) after the journal directory was removed, before the record
 //   undo-record-removed         (phase recover) after the record was removed (copied data not back yet)
@@ -81,6 +82,9 @@ function installHooks() {
     if (point === 'undo-restored' && phase === 'recover' && String(from).includes(`${path.sep}configuration${path.sep}`)) {
       kill('undo: first replaced file put back');
     }
+    if (point === 'undo-merge-restored' && phase === 'recover' && String(from).includes(`${path.sep}merge-records${path.sep}`)) {
+      kill('undo: first rewritten merge record put back');
+    }
     if (point === 'undo-leftover-moved' && phase === 'recover' && typeof to === 'string' && to.includes('.limcode-undone-')) {
       kill('undo: target with dead claims moved aside');
     }
@@ -126,8 +130,34 @@ function installHooks() {
   }
 }
 
+const tombstones = require(path.join(compiled, 'backend/reliableKernel/runtimeMergeTombstones.js'));
+const { resolveVscodeRuntimeMergeLedgerRoot } = require(path.join(compiled, 'backend/reliableKernel/vscodeRootAuthority.js'));
+const identityOf = (binding) => ({ dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId });
+
+/**
+ * What merges must never bring back, as the relocation carries it: a deletion record, a merge record
+ * (with its closure) under alpha's candidate id and a continuation of the current data set; an
+ * existing target keeps its own under the same names (the record is joined, the continuation extended).
+ */
+async function writeMergeBookkeeping(root, current, candidateId, conversationId) {
+  const ledger = resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: root });
+  await tombstones.recordRuntimeDeletedConversations(root, identityOf(current.binding), [conversationId]);
+  const at = '2026-09-27T00:00:00.000Z';
+  const source = { dataSetId: randomUUID(), rootInstanceId: randomUUID(), rootGeneration: 1, pointerRevision: 1, contentDigest: 'c'.repeat(64) };
+  await fsp.mkdir(path.join(ledger, 'records'), { recursive: true });
+  await fsp.writeFile(path.join(ledger, 'records', `${candidateId.replace(/:/g, '-')}.json`), `${JSON.stringify({
+    kind: 'limcode-runtime-data-set-merge', candidateId, source, updatedAt: at, state: 'failed', code: 'x', message: 'x',
+    mergedInto: [{ target: identityOf(current.binding), conversationIds: [conversationId] }]
+  }, null, 2)}\n`);
+  await fsp.mkdir(path.join(ledger, 'aliases'), { recursive: true });
+  await fsp.writeFile(path.join(ledger, 'aliases', `${current.binding.dataSetId}.${current.binding.rootInstanceId}.json`), `${JSON.stringify({
+    version: 1, continues: [{ dataSetId: randomUUID(), rootInstanceId: randomUUID(), relocationId: randomUUID(), at }]
+  }, null, 2)}\n`);
+}
+
 async function prepare() {
   const fixture = await populateFixture(base);
+  await writeMergeBookkeeping(fixture.root, fixture.current, fixture.alpha.id, 'conversation_deleted_source');
   await fsp.writeFile(path.join(fixture.root, 'AGENTS.md'), '# source rules\n');
   await fsp.writeFile(path.join(fixture.root, 'CLAUDE.md'), '# source claude\n');
   await fsp.mkdir(path.join(fixture.root, 'skills', 'shared'), { recursive: true });
@@ -136,9 +166,10 @@ async function prepare() {
     { id: 'provider-shared', name: 'source', apiKey: 'sk-source' }, { id: 'provider-source-only', name: 'source only' }
   ]);
   if (kind === 'limcode') {
-    await createLimCodeTarget(target, {
+    const existing = await createLimCodeTarget(target, {
       agents: [{ id: 'agent-shared', name: 'target version' }, { id: 'agent-target-only', name: 'only in target' }]
     });
+    await writeMergeBookkeeping(target, existing, fixture.alpha.id, 'conversation_deleted_target');
     await fsp.writeFile(path.join(target, 'AGENTS.md'), '# target rules\n');
     await fsp.mkdir(path.join(target, 'CLAUDE.md'));
     await fsp.writeFile(path.join(target, 'CLAUDE.md', 'note.txt'), 'a directory where the source has a file\n');
