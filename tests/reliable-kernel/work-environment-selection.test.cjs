@@ -180,7 +180,7 @@ test('ProductRuntime subscribes once, captures complete add/remove/reorder snaps
       return queue = queue.then(async () => { observed.push(plain(folders)); });
     } },
     toolHost: { async dispose() {} }, childAgents: { async dispose() {} }, fileDiffs: { dispose() {} },
-    conversations: { dispose() {}, async waitForIdle() {} }, diagnostics: { async close() {} }, debugCapture: { async close() {} },
+    conversations: { dispose() {}, async waitForIdle() {}, setConversationTakeover() {} }, diagnostics: { async close() {} }, debugCapture: { async close() {} },
     initializeConfiguration: async () => undefined,
     onConfigurationChanged: () => { broadcasts.push(observed.length); }
   });
