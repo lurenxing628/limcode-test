@@ -255,16 +255,30 @@ async function runLargeSession() {
     rows: source.rows, databaseBytes: 1024 * 1024,
     duration: { expectedMs: source.mergeMs, minMs: Math.round(source.mergeMs * 0.8), maxMs: Math.round(source.mergeMs * 1.6) }
   }));
+  // The engine's own figures: the sources, the largest one's WAL peak, 64 MiB; one private copy in the temporary directory.
+  const space = { targetDirectory: paths.dataRootPath, targetBytes: 70 * 1024 * 1024, temporaryDirectory: root, temporaryBytes: 1024 * 1024 };
   const engine = {
     waiting: async () => sources.map(({ candidateId, rows }) => ({ candidateId, rows, bytes: rows * 100 })),
     noteBatch: () => {},
+    // Read-only, before the prompt or the confirmation: both durations (preparing here as long as the merge).
+    estimate: async ({ candidateIds }) => {
+      await emit('engine-estimate', { candidateIds });
+      const estimated = sources.filter((source) => candidateIds.includes(source.candidateId))
+        .map((source) => ({ ...source, preparing: source.duration, cached: true }));
+      const sum = (durations) => durations.reduce((total, item) => ({
+        expectedMs: total.expectedMs + item.expectedMs, minMs: total.minMs + item.minMs, maxMs: total.maxMs + item.maxMs
+      }), { expectedMs: 0, minMs: 0, maxMs: 0 });
+      return {
+        sources: estimated, report: { merged: [], deferred: [], blocked: [], failures: [] }, space,
+        preparing: sum(estimated.map((source) => source.preparing)), duration: sum(estimated.map((source) => source.duration)), stopped: false
+      };
+    },
     prepare: async ({ candidateIds }) => {
       await emit('engine-prepare', { candidateIds });
       return {
         sources: sources.filter((source) => candidateIds.includes(source.candidateId)),
         report: { merged: [], deferred: [], blocked: [], failures: [] },
-        // The engine's own figures: the sources, the largest one's WAL peak, 64 MiB; one private copy in the temporary directory.
-        space: { targetDirectory: paths.dataRootPath, targetBytes: 70 * 1024 * 1024, temporaryDirectory: root, temporaryBytes: 1024 * 1024 },
+        space,
         engineState: 'fake'
       };
     },

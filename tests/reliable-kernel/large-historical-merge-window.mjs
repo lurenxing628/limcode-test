@@ -14,11 +14,13 @@
 //   windowStateFile / globalStateFile — this window's workspaceState / the extension's globalState (files)
 //   countdownSeconds           — the startup prompt's countdown (1 by default)
 //   cancelCountdown            — the user presses “取消” as soon as the startup prompt appears
+//   closeWhenPostponed         — once the prompt says it moved to the next startup, this window closes
+//                                (after the startup recovery settled): the next boot is the next startup
 //   manual: 'menu'             — once the startup batch is done, the user opens 历史与存储管理, picks
-//                                “合并较大的旧聊天记录（…）” and confirms (the manual flow: confirm, then prepare)
+//                                “合并较大的旧聊天记录（…）” and confirms (the manual flow: estimate, confirm, then prepare)
 //   lookAtMenu                 — the user only opens 历史与存储管理 and looks at the items
-//   cancelPreparationAt        — the user presses “取消” on the manual preparation's notification once
-//                                a report matches this pattern
+//   cancelPreparationAt        — the user presses “取消” on the preparation's notification once a report
+//                                matches this pattern
 //   killAt { index, merging }  — this process is SIGKILLed at the `merging`-th progress report of the
 //                                merge stage of the session's source `index` (the transaction is open)
 //   cancelAt { index, merging } — there the user presses “取消” on the session's progress notification
@@ -132,6 +134,7 @@ const vscodeMock = {
     },
     showInformationMessage: async (message, ...items) => {
       emit('notice', { message, items: items.filter((item) => typeof item === 'string') });
+      if (behavior.closeWhenPostponed && message.startsWith('已改到下次启动时再合并较大的旧聊天记录')) void closeAfterPostponing();
       return undefined;
     },
     showWarningMessage: async (message, ...rest) => {
@@ -229,18 +232,35 @@ const realEngine = engineModule.largeMergeEngine();
 const mergingReports = new Map();
 let lastStage;
 let userCancelled = false;
+const settledCodes = (report) => ({
+  merged: report.merged.map((item) => item.candidateId),
+  deferred: report.deferred.map((item) => item.code),
+  blocked: report.blocked.map((item) => item.code),
+  failures: report.failures.map((item) => item.code)
+});
 const watchedEngine = Object.freeze({
   ...realEngine,
+  async estimate(input) {
+    emit('estimating', { candidateIds: [...input.candidateIds], requested: input.requested });
+    const estimated = await realEngine.estimate(input);
+    emit('estimated', {
+      sources: estimated.sources.map((source) => ({
+        candidateId: source.candidateId, label: source.label, rows: source.rows, fingerprint: source.fingerprint, cached: source.cached,
+        preparing: source.preparing, duration: source.duration
+      })),
+      preparing: estimated.preparing, duration: estimated.duration, space: estimated.space, stopped: estimated.stopped,
+      settled: settledCodes(estimated.report)
+    });
+    return estimated;
+  },
   async prepare(input) {
+    emit('preparing', { candidateIds: [...input.candidateIds], requested: input.requested });
     const preparation = await realEngine.prepare(input);
     emit('prepared', {
-      sources: preparation.sources.map((source) => ({ candidateId: source.candidateId, label: source.label, rows: source.rows, duration: source.duration })),
-      settled: {
-        merged: preparation.report.merged.map((item) => item.candidateId),
-        deferred: preparation.report.deferred.map((item) => item.code),
-        blocked: preparation.report.blocked.map((item) => item.code),
-        failures: preparation.report.failures.map((item) => item.code)
-      }
+      sources: preparation.sources.map((source) => ({
+        candidateId: source.candidateId, label: source.label, rows: source.rows, fingerprint: source.fingerprint, duration: source.duration
+      })),
+      settled: settledCodes(preparation.report)
     });
     return preparation;
   },
@@ -345,6 +365,15 @@ if (behavior.settle) {
     emit('closed');
     process.exit(0);
   }
+}
+
+/** The user postponed the startup prompt: the window closes once its startup recovery settled (as a user closing it later). */
+async function closeAfterPostponing() {
+  await recovery;
+  await runtime.runner.waitForIdle();
+  await deactivate();
+  emit('closed');
+  process.exit(0);
 }
 
 /** Loads a real VS Code layer module with this window's vscode mock. */

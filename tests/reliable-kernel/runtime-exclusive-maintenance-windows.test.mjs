@@ -889,6 +889,8 @@ test('多进程（大库会话）：首次启动倒计时后发起窗口冻结�
     assert.equal(countdown?.cancellable, false, name);
   }
   assert.deepEqual(windows.reloads(), { W1: 1, W2: 1, R: 1 });
+  // Estimated read-only before the prompt, prepared only after it ran out.
+  assert.ok(first('R', 'engine-estimate').at <= first('R', 'engine-prepare').at);
   // R froze itself before go, closed its Runtime, and only then the engine ran: both claims held, every Host offline.
   const frozen = first('R', 'frozen');
   assert.equal(frozen.activity, '合并较大的旧聊天记录');
@@ -927,8 +929,10 @@ test('多进程（大库会话，手动开始）：确认后其它窗口只收�
   await windows.waitForEvent('W', 'opened', 30_000, 2);
   await windows.stop();
   const events = windows.events();
-  // Confirmed first, with the size the batch measured (the duration comes with the preparation).
+  // Estimated read-only, then confirmed with its size and both durations, then prepared.
   assert.ok(events.some((item) => item.name === 'R' && item.event === 'warning' && /^合并较大的旧聊天记录（1 份，约 8 万条记录）？$/.test(item.message)), 'confirmed first');
+  const at = (event) => events.find((item) => item.name === 'R' && item.event === event)?.at;
+  assert.ok(at('engine-estimate') <= at('engine-prepare'), 'estimated before prepared');
   assert.ok(events.some((item) => item.name === 'W' && item.event === 'notice' && item.message === '为合并较大的旧聊天记录，本窗口将重载；未发送的输入会保留。'));
   assert.equal(events.some((item) => item.name === 'W' && item.event === 'progress' && item.countdown), false, 'no countdown in other windows');
   assert.deepEqual(windows.reloads(), { W: 1, R: 1 });

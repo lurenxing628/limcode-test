@@ -418,7 +418,7 @@ test('大库会话：中等来源随大库会话一起等由引擎在批里判�
   }
 });
 
-test('大库会话：“历史与存储管理”只在有来源等待时列出“合并较大的旧聊天记录（N 份，约 X 条记录，准备后给出预计时长）”，合并列表里把它们标为“较大，等待合并（约 X 条记录，准备后给出预计时长）”——准备之前不编时长；入口开始手动合并，运行时没打开时说明', async () => {
+test('大库会话：“历史与存储管理”只在有来源等待时列出“合并较大的旧聊天记录（N 份，约 X 条记录，开始前给出预计时长）”，合并列表里把它们标为“较大，等待合并（约 X 条记录，开始前给出预计时长）”——估计之前不编时长；入口开始手动合并，运行时没打开时说明', async () => {
   const waiting = [
     { candidateId: 'workspace:old', rows: 700_000, bytes: 180 * 1024 * 1024 },
     { candidateId: 'workspace:other', rows: 50_000, bytes: 12 * 1024 * 1024 }
@@ -431,10 +431,10 @@ test('大库会话：“历史与存储管理”只在有来源等待时列出�
   await listed.manageRuntimeDataSets(listed.context, listed.startup);
   const [menu, sources] = listed.calls.filter(call => call[0] === 'pick').map(call => call[1]);
   const entry = menu.find(item => item.action === 'largeMerge');
-  assert.equal(entry.label, '合并较大的旧聊天记录（2 份，约 75 万条记录，准备后给出预计时长）');
+  assert.equal(entry.label, '合并较大的旧聊天记录（2 份，约 75 万条记录，开始前给出预计时长）');
   assert.equal(menu.indexOf(entry), menu.findIndex(item => item.action === 'merge') + 1);
-  assert.equal(sources[0].label, '其他历史库 · 旧工作区历史 · 较大，等待合并（约 70 万条记录，准备后给出预计时长）');
-  assert.ok(!JSON.stringify(menu).includes('分钟）'), 'no duration before preparing');
+  assert.equal(sources[0].label, '其他历史库 · 旧工作区历史 · 较大，等待合并（约 70 万条记录，开始前给出预计时长）');
+  assert.ok(!JSON.stringify(menu).includes('分钟）'), 'no duration before the estimate');
   const offline = fixture({ largeWaiting: waiting, picks: [action('largeMerge')] });
   await offline.manageRuntimeDataSets(offline.context, offline.startup);
   assert.deepEqual(offline.calls.filter(call => call[0] === 'error').map(call => call[1]), ['运行时没有打开，不能合并较大的旧聊天记录。']);

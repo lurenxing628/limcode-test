@@ -27,6 +27,7 @@ const { summarizeRuntimeDataSet } = kernelFile('runtimeDataSetPreflight.js');
 const exclusive = kernelFile('runtimeExclusiveMaintenance.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const engineModule = kernelFile('runtimeLargeMergeEngine.js');
+const { estimateLargeMergeSources } = kernelFile('runtimeDataSetStreamedMerge.js');
 const session = kernelFile('runtimeLargeMergeSession.js');
 const { RuntimeWriteGate } = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
 const extensionIdentity = require(path.join(compiled, 'shared/extensionIdentity.js'));
@@ -149,12 +150,12 @@ test('进度节流：本窗口的进度通知每 0.5 秒最多一次、总以最
   assert.ok(distinct.size <= 21 + 4, `${distinct.size} stages`);
 });
 
-test('文案：进度“正在合并较大的旧聊天记录 2/4（已处理 12 万 / 38 万条，约还需 3 分钟）”（引擎报的是已比较的来源行数，不只是写入的）、等待中只写规模不编时长、倒计时、剩余时间与区间', () => {
+test('文案：进度“正在合并较大的旧聊天记录 2/4（已处理 12 万 / 38 万条，约还需 3 分钟）”（引擎报的是已比较的来源行数，不只是写入的）、等待中只写规模不编时长、倒计时写明后台准备与所有窗口暂停两段时长、剩余时间与区间', () => {
   const progress = { index: 1, total: 4, candidateId: 'x', rowsDone: 120_000, rowsTotal: 380_000 };
   assert.equal(session.largeMergeProgressMessage(progress, 2.5 * MINUTE), '正在合并较大的旧聊天记录 2/4（已处理 12 万 / 38 万条，约还需 3 分钟）');
   assert.equal(session.largeMergeProgressMessage({ ...progress, rowsDone: 3_000, rowsTotal: 8_000 }, 20_000),
     '正在合并较大的旧聊天记录 2/4（已处理 3000 / 8000 条，约还需不到 1 分钟）');
-  assert.equal(session.largeMergeWaitingText(750_000), '约 75 万条记录，准备后给出预计时长');
+  assert.equal(session.largeMergeWaitingText(750_000), '约 75 万条记录，开始前给出预计时长');
   assert.equal(session.formatLargeMergeRows(15_500), '1.6 万');
   assert.equal(session.formatLargeMergeRows(1_234_567), '123 万');
   // Early on the preparation's estimate, later the rate so far.
@@ -163,8 +164,18 @@ test('文案：进度“正在合并较大的旧聊天记录 2/4（已处理 12 
   const duration = { expectedMs: 3.75 * MINUTE, minMs: 3 * MINUTE, maxMs: 6 * MINUTE };
   assert.equal(session.formatLargeMergeRange(duration), '3–6 分钟');
   assert.equal(session.formatLargeMergeRange({ expectedMs: 30_000, minMs: 24_000, maxMs: 48_000 }), '约 1 分钟');
-  assert.equal(session.largeMergeCountdownText({ seconds: 60, sources: 4, rows: 750_000, duration }),
-    '将在 60 秒后合并 4 份较大的旧聊天记录（约 75 万条，预计 3–6 分钟；期间所有 LimCode 窗口暂停并显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。');
+  // “约 …” for the two parts the prompt and the confirmation name; never “约 约”, and “不到 1 分钟” when even the longest is shorter.
+  assert.equal(session.formatLargeMergeAbout(duration), '约 3–6 分钟');
+  assert.equal(session.formatLargeMergeAbout({ minMs: 120_000, maxMs: 120_000 }), '约 2 分钟');
+  assert.equal(session.formatLargeMergeAbout({ minMs: 24_000, maxMs: 48_000 }), '不到 1 分钟');
+  // The estimate's two parts: the background preparation after the countdown (windows usable), then the pause of every window.
+  const preparing = { expectedMs: 40_000, minMs: 16_000, maxMs: 100_000 };
+  assert.equal(session.largeMergeCountdownText({ seconds: 60, sources: 4, rows: 750_000, preparing, duration }),
+    '将在 60 秒后合并 4 份较大的旧聊天记录（约 75 万条）。倒计时结束后先在后台准备约 1–2 分钟（期间照常可用），准备好后所有 LimCode 窗口重载一次，'
+    + '暂停约 3–6 分钟（显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。');
+  assert.equal(session.largeMergeCountdownText({ seconds: 1, sources: 1, rows: 8_000, preparing: { expectedMs: 5_000, minMs: 2_000, maxMs: 12_500 }, duration }),
+    '将在 1 秒后合并 1 份较大的旧聊天记录（约 8000 条）。倒计时结束后先在后台准备不到 1 分钟（期间照常可用），准备好后所有 LimCode 窗口重载一次，'
+    + '暂停约 3–6 分钟（显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。');
   assert.deepEqual(session.sumLargeMergeDurations([duration, duration]), { expectedMs: 7.5 * MINUTE, minMs: 6 * MINUTE, maxMs: 12 * MINUTE });
 });
 
@@ -261,7 +272,7 @@ test('适配层：等待列表来自本窗口最近一次批结果里等大库�
   assert.equal(map({ candidateId: id, state: 'blocked', issue: { candidateId: id, code: 'c', message: 'm', label } }, '别的名称').label, label, 'the issue says it first');
 });
 
-test('适配层接真实引擎：threshold 为 online，中等来源一起准备、更小的写明留给在线合并；进度按阶段写成文字；来源带标签（候选列表读过的项目名，否则写库的种类）、指纹、行数、预计区间，空间照搬引擎的数字；release 交还声明；run 的进度是整个会话的已处理行数与引擎的剩余时间，结果映射为已合并', async (t) => {
+test('适配层接真实引擎：先只读估计（不在配置准入内；什么都不准备、不备份、不写账本，复制核验一次后按缓存估计；指纹与准备同义、准备与暂停两段时长、空间含目标备份），threshold 为 online，中等来源一起准备、更小的写明留给在线合并；进度按阶段写成文字；来源带标签（候选列表读过的项目名，否则写库的种类）、指纹、行数、预计区间，空间照搬引擎的数字；release 交还声明；run 的进度是整个会话的已处理行数与引擎的剩余时间，结果映射为已合并', async (t) => {
   const fixture = await mergeFixture.createConfigurationRoot({ beta: true });
   t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
   const small = await mergeFixture.initializeScope(fixture.paths, 'small');
@@ -274,6 +285,76 @@ test('适配层接真实引擎：threshold 为 online，中等来源一起准备
   assert.deepEqual((await summarizeRuntimeDataSet(alphaCandidate)).projectNames, ['alpha-project']);
   const engine = engineModule.largeMergeEngine();
   const ids = [fixture.alpha.id, fixture.beta.id, small.id];
+  const openDatabase = () => kernel.RuntimeDatabase.open(fixture.current.authority, { hostBootId: `adapter-${Date.now()}` });
+  const estimateOnce = async () => {
+    const database = await openDatabase();
+    const messages = [];
+    try {
+      const estimated = await engine.estimate({
+        paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: ids, requested: false,
+        onProgress: (message) => messages.push(message)
+      });
+      return { estimated, messages };
+    } finally { await database.close(); }
+  };
+  // Never inside the configuration admission (a foreign root's claim comes before it).
+  const inside = await openDatabase();
+  try {
+    await assert.rejects(withRuntimeDataRootAdmission(fixture.root, () => engine.estimate({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: inside }, candidateIds: ids, requested: false
+    })), /outside the configuration admission/);
+  } finally { await inside.close(); }
+  const sourceTrees = async () => Promise.all([fixture.alpha, fixture.beta, small].map((dataSet) => mergeFixture.treeSnapshot(path.dirname(dataSet.binding.paths.dataRootPath))));
+  const targetControl = path.dirname(fixture.current.binding.paths.dataRootPath);
+  const treesBefore = await sourceTrees();
+  const targetBefore = await fs.readdir(targetControl);
+  const estimate = await estimateOnce();
+  const { estimated } = estimate;
+  assert.deepEqual(estimated.sources.map((source) => source.candidateId).sort(), [fixture.alpha.id, fixture.beta.id].sort());
+  for (const source of estimated.sources) {
+    assert.equal(source.label, source.candidateId === fixture.alpha.id ? 'alpha-project' : '旧工作区历史');
+    assert.match(source.fingerprint, /^[0-9a-f]{16,}$/);
+    assert.ok(source.rows > 4_000 && source.databaseBytes > 0, JSON.stringify(source));
+    assert.equal(source.cached, false, 'never audited before: copied and audited once');
+    for (const part of [source.preparing, source.duration]) assert.ok(part.minMs <= part.expectedMs && part.expectedMs <= part.maxMs, JSON.stringify(part));
+  }
+  // The engine's totals: the preparation with its one target backup, the pause of every window.
+  assert.ok(estimated.preparing.expectedMs >= estimated.sources.reduce((sum, source) => sum + source.preparing.expectedMs, 0));
+  assert.equal(estimated.duration.expectedMs, estimated.sources.reduce((sum, source) => sum + source.duration.expectedMs, 0));
+  assert.ok(estimated.preparing.minMs <= estimated.preparing.expectedMs && estimated.preparing.expectedMs <= estimated.preparing.maxMs);
+  assert.ok(estimated.duration.minMs <= estimated.duration.expectedMs && estimated.duration.expectedMs <= estimated.duration.maxMs);
+  assert.equal(estimated.stopped, false);
+  assert.deepEqual(estimated.report.deferred.map((issue) => [issue.candidateId, issue.code]), [[small.id, 'runtime-data-set-merge-large-session-small']]);
+  assert.ok(estimate.messages.length > 0 && estimate.messages.every((message) => /^第 [123]\/3 份：正在(复制一份只读副本|核验只读副本)$/.test(message)), estimate.messages.join('\n'));
+  // Read-only: nothing finalized, backed up or recorded, no preparation claim; only the audit cache written.
+  assert.deepEqual(await sourceTrees(), treesBefore, '来源一字节不变');
+  assert.deepEqual(await fs.readdir(targetControl), targetBefore, '当前库没有备份');
+  for (const section of ['preparing', 'records', 'commits']) assert.deepEqual(await mergeFixture.ledgerEntries(fixture, section), [], section);
+  assert.ok((await mergeFixture.ledgerEntries(fixture, 'audits')).length >= 2, 'audits cached');
+  // Asked again: from the cache (nothing copied, no progress to show), the same fingerprints. And the engine's own
+  // figures for the same files and target, passed on as they are: the preparation's times as `preparing`, the exclusive phase's as `duration`.
+  const both = await openDatabase();
+  const again = { messages: [] };
+  let raw;
+  try {
+    again.estimated = await engine.estimate({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: both }, candidateIds: ids, requested: false,
+      onProgress: (message) => again.messages.push(message)
+    });
+    raw = await estimateLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: both }, candidateIds: ids, threshold: 'online' });
+  } finally { await both.close(); }
+  assert.deepEqual(again.messages, []);
+  assert.ok(again.estimated.sources.every((source) => source.cached));
+  assert.deepEqual(again.estimated.sources.map((source) => source.fingerprint), estimated.sources.map((source) => source.fingerprint));
+  const range = (ms, [minMs, maxMs]) => ({ expectedMs: ms, minMs, maxMs });
+  assert.deepEqual([again.estimated.preparing, again.estimated.duration],
+    [range(raw.prepareEstimateMs, raw.prepareEstimateRangeMs), range(raw.sessionEstimateMs, raw.sessionEstimateRangeMs)]);
+  assert.deepEqual(again.estimated.sources.map((source) => [source.candidateId, source.rows, source.databaseBytes, source.preparing, source.duration]),
+    raw.sources.map((source) => [source.candidateId, source.rows, source.databaseBytes,
+      range(source.prepareEstimateMs, source.prepareEstimateRangeMs), range(source.sessionEstimateMs, source.sessionEstimateRangeMs)]));
+  assert.deepEqual(again.estimated.space, {
+    targetDirectory: raw.space.targetDirectory, targetBytes: raw.space.targetBytes, temporaryDirectory: raw.space.temporaryDirectory, temporaryBytes: raw.space.temporaryBytes
+  });
   const prepareOnce = async () => {
     const database = await kernel.RuntimeDatabase.open(fixture.current.authority, { hostBootId: `adapter-${Date.now()}` });
     const messages = [];
@@ -289,6 +370,10 @@ test('适配层接真实引擎：threshold 为 online，中等来源一起准备
   const { preparation } = first;
   // Above the online bound: prepared (with the in-memory threshold they would all be left to the online batch).
   assert.deepEqual(preparation.sources.map((source) => source.candidateId).sort(), [fixture.alpha.id, fixture.beta.id].sort());
+  // The estimate's fingerprints are the preparation's (no unfinished work was closed): the key asked before the countdown is the session's.
+  assert.equal(session.largeMergeOperationKey(fixture.current.binding, estimated.sources), session.largeMergeOperationKey(fixture.current.binding, preparation.sources));
+  // The estimate's space also has the online target backup the preparation took since.
+  assert.ok(estimated.space.targetBytes > preparation.space.targetBytes, JSON.stringify([estimated.space, preparation.space]));
   for (const source of preparation.sources) {
     assert.equal(source.label, source.candidateId === fixture.alpha.id ? 'alpha-project' : '旧工作区历史');
     assert.match(source.fingerprint, /^[0-9a-f]{16,}$/);
@@ -332,28 +417,32 @@ test('适配层接真实引擎：threshold 为 online，中等来源一起准备
 // The VS Code layer: real coordination (layer and primitive) and claims, fake engine.
 // ---------------------------------------------------------------------------------------------
 
-test('倒计时里点“取消”：只推迟到下次启动——不协调、不写账本、没有“永不”；同一会话里不再提示', async (t) => {
+test('倒计时里点“取消”：只推迟到下次启动——倒计时之前只做了只读估计，什么都没准备（不收尾、不备份、不占声明，也没有要交还的）、不协调、不写账本、没有“永不”；倒计时写明后台准备与所有窗口暂停两段时长；同一会话里不再提示', async (t) => {
   const fixture = await createRoot(t);
   const window = loadWindow(fixture, { cancelCountdownAfterReports: 1 });
   await window.offer();
-  // The preparation that will not run is released (what the engine kept for it: claims, an unused backup).
-  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  // Only the read-only estimate (in the status bar), for exactly the sources the batch left to the session.
+  assert.deepEqual(window.engine.calls, [['estimate', ['workspace:big-1', 'workspace:big-2'], false]]);
+  const estimating = window.ui.progress.find((entry) => entry.title === '正在估计合并较大的旧聊天记录需要多久');
+  assert.deepEqual([estimating?.location, estimating?.cancellable, estimating?.messages], [10, false, ['第 1/2 份：正在复制一份只读副本']]);
   assert.deepEqual(window.coordinations, [], 'never asked other windows');
   const countdown = window.ui.progress.find((entry) => entry.cancellable && entry.messages[0]?.startsWith('将在 '));
   assert.ok(countdown, JSON.stringify(window.ui.progress));
   assert.equal(countdown.title, undefined);
-  assert.match(countdown.messages[0], /^将在 2 秒后合并 2 份较大的旧聊天记录（约 40 万条，预计 1–4 分钟；期间所有 LimCode 窗口暂停并显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。$/);
+  // The estimate's totals: preparing two sources and the one target backup (1–5 minutes), then the pause (1–4 minutes).
+  assert.equal(countdown.messages[0], '将在 2 秒后合并 2 份较大的旧聊天记录（约 40 万条）。倒计时结束后先在后台准备约 1–5 分钟（期间照常可用），'
+    + '准备好后所有 LimCode 窗口重载一次，暂停约 1–4 分钟（显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。');
   assert.deepEqual(window.ui.infos, ['已改到下次启动时再合并较大的旧聊天记录；也可以在“历史与存储管理”里手动开始。']);
   assert.ok(!window.ui.infos.concat(window.ui.warnings.map((item) => item[0])).some((text) => /永不|不再提示/.test(text)));
   // Nothing recorded: only the prompt record exists beside the ledger.
   assert.deepEqual(await fs.readdir(path.join(fixture.root, '.limcode-runtime-merges')), ['prompts']);
   assert.deepEqual(window.host.events, [], 'this window was never frozen or closed');
-  // The same VS Code session: no second prompt (and no second preparation).
+  // The same VS Code session: no second prompt (and no second estimate).
   await window.offer();
-  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['estimate']);
 });
 
-test('空间不够时不提示开始，只说明还差多少（同一原因只提示一次）；手动开始同样不开始并说明', async (t) => {
+test('空间不够时不提示开始，只说明还差多少（同一原因只提示一次；按估计给出的数字，其中含准备要做的目标备份，什么都不准备）；手动开始同样在确认之前就不开始并说明', async (t) => {
   const fixture = await createRoot(t);
   const causes = new Set();
   const window = loadWindow(fixture, {
@@ -362,6 +451,7 @@ test('空间不够时不提示开始，只说明还差多少（同一原因只�
   });
   await window.offer();
   assert.equal(window.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0, 'no countdown');
+  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['estimate'], 'nothing prepared');
   assert.deepEqual(window.coordinations, []);
   assert.equal(window.ui.warnings.length, 1);
   assert.match(window.ui.warnings[0][0], /^有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录（.+）剩余空间不足：需要约 .+，现在可用 10 MB，还差约 .+。腾出空间后，下次启动时会再提示；也可以在“历史与存储管理”里手动开始。$/);
@@ -372,9 +462,18 @@ test('空间不够时不提示开始，只说明还差多少（同一原因只�
   const manual = loadWindow(fixture, { freeBytes: 10 * 1024 * 1024, confirm: '开始合并' });
   await manual.start();
   assert.deepEqual(manual.coordinations, []);
+  assert.deepEqual(manual.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.equal(manual.ui.warnings.filter(([, options]) => options?.modal).length, 0, 'not asked to confirm');
   assert.equal(manual.ui.errors.length, 1);
   assert.equal(manual.ui.errors[0][0], '合并较大的旧聊天记录没有开始');
   assert.match(manual.ui.errors[0][1].detail, /还差约 .+。腾出空间后可以再试；已有数据未被修改。$/);
+  // The estimate's figure decides (the preparation's backup and copied content in it), not what the session alone would need.
+  const estimateSpace = { targetDirectory: fixture.paths.dataRootPath, targetBytes: 3 * 1024 ** 3, temporaryDirectory: path.dirname(fixture.root), temporaryBytes: 1024 * 1024 };
+  const backupShort = loadWindow(fixture, { freeBytes: 1024 ** 3, estimateSpace, sessionId: 'session-3' });
+  await backupShort.offer();
+  assert.deepEqual(backupShort.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.equal(backupShort.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0, 'no countdown');
+  assert.match(backupShort.ui.warnings.at(-1)?.[0] ?? '', /^有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录（.+）剩余空间不足：需要约 3\.0 GB，现在可用 1\.0 GB，还差约 2\.0 GB。/);
 });
 
 test('独占开始前用 statfs 再核一次空间：协调期间空间被占掉时不关闭本窗口运行时、不合并、不重载，只说明还差多少（自动开始按原因只提示一次）', async (t) => {
@@ -384,7 +483,7 @@ test('独占开始前用 statfs 再核一次空间：协调期间空间被占掉
   const manual = loadWindow(fixture, { confirm: '开始合并', freeBytes });
   await manual.start();
   assert.equal(manual.coordinations.length, 1, 'enough room before the coordination');
-  assert.deepEqual(manual.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  assert.deepEqual(manual.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'release']);
   assert.deepEqual(manual.host.events.map((event) => event[0]), ['freeze', 'thaw'], 'this window\'s Runtime never closed');
   assert.deepEqual(manual.ui.commands, [], 'not reloaded');
   assert.match(manual.ui.warnings.at(-1)[0], /^较大的旧聊天记录这次没有合并：有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录（.+）剩余空间不足：需要约 .+，现在可用 10 MB，还差约 .+。已有数据未被修改，可以稍后在“历史与存储管理”里再试。$/);
@@ -400,24 +499,30 @@ test('独占开始前用 statfs 再核一次空间：协调期间空间被占掉
   assert.match(automatic.ui.infos.at(-1), /^较大的旧聊天记录这次没有合并：有 2 份.+还差约 .+。下次启动时会再提示；也可以在“历史与存储管理”里手动开始。$/);
 });
 
-test('手动开始：先确认（写明份数、约多少条记录，预计时长准备后给出，会等任务结束、期间暂停与取消的含义），再准备；以明确调用协调（不越过冷却以外的退避、其它窗口只提示、锁外等忙窗口、协调中不可取消），冻结并关闭本窗口运行时后才合并，然后重载；结果留到重载之后', async (t) => {
+test('手动开始：先只读估计（可取消的通知），再确认（写明份数、约多少条记录、后台准备与所有窗口暂停两段时长、会等任务结束、期间暂停与取消的含义），确认之后才准备；以明确调用协调（不越过冷却以外的退避、其它窗口只提示、锁外等忙窗口、协调中不可取消），冻结并关闭本窗口运行时后才合并，然后重载；结果留到重载之后', async (t) => {
   const fixture = await createRoot(t);
   // This window's earlier explicit operation of the same kind left its requester token (it may retry after its reload).
   const window = loadWindow(fixture, { confirm: '开始合并', requesterToken: 'kept-token' });
   const started = Date.now();
   await window.start();
-  // Confirmed first, from the cached estimate, before anything was prepared.
+  // Estimated read-only first (the user's click: requested), in a notification that can be cancelled.
+  assert.deepEqual(window.engine.calls[0], ['estimate', ['workspace:big-1', 'workspace:big-2'], true]);
+  const estimating = window.ui.progress.find((entry) => entry.title?.startsWith('正在估计'));
+  assert.deepEqual([estimating.title, estimating.location, estimating.cancellable],
+    ['正在估计合并较大的旧聊天记录需要多久（只读，窗口照常可用）', 15, true]);
+  // Confirmed with the estimate before anything was prepared.
   const [title, options] = window.ui.warnings[0];
-  // The size the batch measured; how long it takes is known only once prepared.
   assert.equal(title, '合并较大的旧聊天记录（2 份，约 40 万条记录）？');
   assert.equal(options.modal, true);
-  assert.match(options.detail, /^约 40 万条记录；预计要多久，准备好之后在进度里给出。\n\n先在后台准备（窗口照常可用，可以取消），再等本窗口和其它 LimCode 窗口的任务结束（最多约 10 分钟），然后所有 LimCode 窗口暂停/);
+  assert.match(options.detail, /^先在后台准备约 1–5 分钟（窗口照常可用，可以取消），再等本窗口和其它 LimCode 窗口的任务结束（最多约 10 分钟），然后所有 LimCode 窗口重载一次，暂停约 1–4 分钟：其它窗口重载并显示进度/);
   assert.ok(!/分钟）？/.test(title));
+  assert.deepEqual(window.order.slice(0, 3), ['estimate', 'confirm', 'prepare']);
+  // Nothing settled while both sources go on to the session: nothing to tell yet (not the batch's “这次没有合并” for a click).
+  assert.deepEqual(window.reports, []);
   // Asked before the confirmation whether the cooldown would refuse it (the explicit call's view: no key backoff).
   assert.deepEqual(window.refusalQueries.map((query) => [query.operation, query.operationKey, query.ignoreBackoff, query.requesterHostBootId, query.requesterToken]),
     [['historical-merge', undefined, true, 'requester', 'kept-token']]);
   assert.match(options.detail, /合并时可以点“取消”：只撤回正在合并的那一份，已经合并完的保留，其余的以后启动时再合并。/);
-  assert.ok(window.order.indexOf('confirm') < window.order.indexOf('prepare'), window.order.join());
   // The coordination: the user's explicit call.
   assert.equal(window.coordinations.length, 1);
   const coordination = window.coordinations[0];
@@ -434,7 +539,8 @@ test('手动开始：先确认（写明份数、约多少条记录，预计时�
   assert.equal(coordination.waitingTitle, '正在等待 LimCode 窗口空闲后合并较大的旧聊天记录（预计 1–4 分钟）');
   // Frozen before go, Runtime closed before the merge, reloaded after.
   assert.deepEqual(window.host.events.map((event) => event[0]), ['freeze', 'close', 'run', 'thaw']);
-  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['prepare', 'run', 'release'], 'released after the run (nothing left then)');
+  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'run', 'release'], 'released after the run (nothing left then)');
+  assert.deepEqual(window.engine.calls[1], ['prepare', ['workspace:big-1', 'workspace:big-2']]);
   assert.deepEqual(window.host.events[0], ['freeze', '合并较大的旧聊天记录']);
   assert.ok(window.order.indexOf('close') < window.order.indexOf('run'));
   assert.deepEqual(window.ui.commands, ['workbench.action.reloadWindow']);
@@ -451,18 +557,25 @@ test('手动开始：先确认（写明份数、约多少条记录，预计时�
   assert.equal(kept.details[0], '旧工作区历史（/fixture/workspace:big-1，约 30 万条记录）：新增 10 个对话。');
 });
 
-test('首次启动自动开始：倒计时结束后按自动调用协调（不越过退避、其它窗口是不能否决的倒计时、锁外最多等 10 分钟）；等本窗口任务时提示一次', async (t) => {
+test('首次启动自动开始：只读估计、倒计时，倒计时结束（没有推迟）才准备（可取消的通知，只准备估计剩下的来源）；然后按自动调用协调（不越过退避、其它窗口是不能否决的倒计时、锁外最多等 10 分钟）；等本窗口任务时提示一次', async (t) => {
   const fixture = await createRoot(t);
   // A kept token of an explicit call never helps an automatic one.
   const window = loadWindow(fixture, { busyForMs: 300, requesterToken: 'kept-token' });
   await window.offer();
+  assert.deepEqual(window.order.slice(0, 3), ['estimate', 'countdown', 'prepare'], 'prepared only after the countdown ran out');
+  assert.deepEqual(window.engine.calls.slice(0, 2), [['estimate', ['workspace:big-1', 'workspace:big-2'], false], ['prepare', ['workspace:big-1', 'workspace:big-2']]]);
+  const preparing = window.ui.progress.find((entry) => entry.title?.startsWith('正在准备'));
+  assert.deepEqual([preparing.title, preparing.location, preparing.cancellable], ['正在准备合并较大的旧聊天记录（窗口照常可用）', 15, true]);
   assert.equal(window.coordinations.length, 1);
   const coordination = window.coordinations[0];
   assert.deepEqual([coordination.ignoreBackoff, coordination.participantConfirmation, coordination.whenBusy, coordination.cancellable],
     [false, 'final-countdown', 'wait', false]);
-  // Asked twice whether it would be refused before asking anyone: the cooldown before preparing, the key's backoff before counting down.
+  // Asked twice whether it would be refused before asking anyone: the cooldown before estimating, then before the
+  // countdown with the key the estimate's fingerprints make (the one the coordination uses).
+  const key = session.largeMergeOperationKey(fixture.binding, window.sources);
+  assert.equal(coordination.operationKey, key);
   assert.deepEqual(window.refusalQueries.map((query) => [query.operationKey, query.ignoreBackoff, query.requesterToken]),
-    [[undefined, false, undefined], [coordination.operationKey, false, undefined]]);
+    [[undefined, false, undefined], [key, false, undefined]]);
   assert.equal(window.ui.infos.filter((text) => /本窗口有任务正在进行，合并较大的旧聊天记录会等它结束后再进行（最多等 10 分钟）/.test(text)).length, 1);
   assert.deepEqual(window.ui.commands, ['workbench.action.reloadWindow']);
   assert.equal(plain(session.takeLargeMergeResult(window.state, Date.now())).requested, false);
@@ -479,7 +592,7 @@ test('冻结期间新命令被拒：本窗口因迁移数据目录冻结时手�
   // Frozen while the user was confirming: prepared, but refused before anything was coordinated.
   const later = loadWindow(fixture, { confirm: () => { later.host.writeGate.freeze('迁移数据目录', []); return '开始合并'; } });
   await later.start();
-  assert.deepEqual(later.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  assert.deepEqual(later.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'release']);
   assert.deepEqual(later.coordinations, []);
   assert.equal(later.ui.warnings.at(-1)[0], '正在迁移数据目录，完成后再操作。没有开始合并较大的旧聊天记录。');
   // The session's own freeze: other writes are refused with its reason while it runs (asserted
@@ -533,7 +646,7 @@ test('进度节流（会话里）：进度通知每 0.5 秒最多更新一次，
   assert.ok(stages.every((stage) => /已完成 \d*[05]%$/.test(stage)));
 });
 
-test('一个窗口同一时间只有一个会话：启动提示倒计时期间手动开始只说明正在进行，不会再确认、准备或协调一次', async (t) => {
+test('一个窗口同一时间只有一个会话：启动提示倒计时期间手动开始只说明正在进行，不会再估计、确认、准备或协调一次', async (t) => {
   const fixture = await createRoot(t);
   const window = loadWindow(fixture, { cancelCountdownAfterReports: 2, confirm: '开始合并' });
   const offering = window.offer();
@@ -542,19 +655,25 @@ test('一个窗口同一时间只有一个会话：启动提示倒计时期间�
   await offering;
   assert.ok(window.ui.infos.includes('本窗口已经在准备或进行合并较大的旧聊天记录，请等它结束。'), JSON.stringify(window.ui.infos));
   assert.equal(window.ui.warnings.filter(([, options]) => options?.modal).length, 0, 'no confirmation');
-  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  // One estimate (the prompt's); never a second one while this window may hold a preparation of the same sources.
+  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['estimate']);
   assert.deepEqual(window.coordinations, []);
 });
 
-test('准备时已经有结果的来源（已合并、没有新内容、被拒、推迟）按在线合并的批结果说明，用户点的那次每一条都会说明；没有合并的准备会被释放；引擎给出的剩余时间优先', async (t) => {
+test('估计或准备时已经有结果的来源（已合并、没有新内容、被拒、推迟）按在线合并的批结果说明（估计的在倒计时或确认之前），用户点的那次每一条都会说明；只准备估计剩下的来源；没有合并的准备会被释放；什么都没剩也没结果时用户点的那次照样有回音；引擎给出的剩余时间优先', async (t) => {
   const fixture = await createRoot(t);
-  const settled = {
+  const sources = [
+    source('workspace:big-1', 300_000, 60_000), source('workspace:big-2', 100_000, 60_000),
+    source('workspace:done', 70_000, 60_000), source('workspace:later', 70_000, 60_000), source('workspace:conflict', 70_000, 60_000)
+  ];
+  const estimateSettled = {
     merged: [mergeResult('workspace:done', 0, { alreadyMerged: true })],
-    deferred: [{ candidateId: 'workspace:later', code: 'runtime-data-set-merge-source-busy', message: '来源正在使用。', newly: true }],
+    deferred: [{ candidateId: 'workspace:later', code: 'runtime-data-set-merge-preparing-elsewhere', message: '另一个窗口正在准备合并这份较大的旧聊天记录，由那个窗口完成。', newly: true }],
     blocked: [{ candidateId: 'workspace:conflict', code: 'runtime-data-set-merge-conflict', message: '数据冲突。', newly: false }],
     failures: []
   };
-  const automatic = loadWindow(fixture, { settled, cancelCountdownAfterReports: 1 });
+  // Settled by the estimate: told before the prompt; the prompt counts only the rest.
+  const automatic = loadWindow(fixture, { sources, estimateSettled, cancelCountdownAfterReports: 1 });
   await automatic.offer();
   assert.equal(automatic.reports.length, 1);
   const [batch, requested] = automatic.reports[0];
@@ -563,42 +682,71 @@ test('准备时已经有结果的来源（已合并、没有新内容、被拒�
   assert.deepEqual(batch.deferred.map((item) => [item.candidateId, item.requested, item.newly]), [['workspace:later', undefined, true]]);
   assert.deepEqual(batch.blocked.map((item) => [item.candidateId, item.requested, item.newly]), [['workspace:conflict', undefined, false]]);
   assert.deepEqual([batch.pendingSources, batch.stopped], [0, false]);
-  assert.deepEqual(automatic.engine.calls.map((call) => call[0]), ['prepare', 'release'], 'not run: released');
-  const manual = loadWindow(fixture, { settled, confirm: '开始合并', engineRemainingMs: 7 * 60_000 + 1, progressEvents: 150, progressEveryMs: 4 });
+  assert.ok(automatic.order.indexOf('estimate') < automatic.order.indexOf('countdown'));
+  assert.match(automatic.ui.progress.find((entry) => entry.messages[0]?.startsWith('将在 ')).messages[0], /^将在 2 秒后合并 2 份较大的旧聊天记录（约 40 万条）。/);
+  assert.deepEqual(automatic.engine.calls.map((call) => call[0]), ['estimate'], 'postponed: nothing prepared');
+  // The countdown ran out: only the sources the estimate left are prepared; what the preparation settled is told then.
+  const prepareSettled = { merged: [mergeResult('workspace:big-2', 0, { alreadyMerged: true })], deferred: [], blocked: [], failures: [] };
+  const going = loadWindow(fixture, { sources, estimateSettled, settled: prepareSettled, sessionId: 'session-2' });
+  await going.offer();
+  assert.deepEqual(going.engine.calls.find((call) => call[0] === 'prepare'), ['prepare', ['workspace:big-1', 'workspace:big-2']]);
+  assert.deepEqual(going.reports.map(([report]) => report.merged.map((item) => item.candidateId)), [['workspace:done'], ['workspace:big-2']]);
+  assert.equal(going.coordinations[0].operationKey, session.largeMergeOperationKey(fixture.binding, [sources[0]]), 'the session is the rest');
+  const manual = loadWindow(fixture, {
+    sources, estimateSettled, settled: prepareSettled, confirm: '开始合并', engineRemainingMs: 7 * 60_000 + 1, progressEvents: 150, progressEveryMs: 4
+  });
   await manual.start();
-  assert.equal(manual.reports.length, 1);
+  assert.equal(manual.reports.length, 2);
   const [clicked, clickedRequested] = manual.reports[0];
   assert.equal(clickedRequested, true);
   assert.deepEqual([...clicked.deferred, ...clicked.blocked].map((item) => item.requested), [true, true]);
-  assert.deepEqual(manual.engine.calls.map((call) => call[0]), ['prepare', 'run', 'release']);
+  assert.ok(manual.order.indexOf('estimate') < manual.order.indexOf('confirm'));
+  assert.equal(manual.ui.warnings.find(([, options]) => options?.modal)[0], '合并较大的旧聊天记录（2 份，约 40 万条记录）？');
+  assert.deepEqual(manual.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'run', 'release']);
   const notification = manual.ui.progress.find((entry) => entry.messages.some((message) => /^正在合并较大的旧聊天记录 /.test(message)));
   // The first message comes before any progress (the preparation's estimate); every later one is the engine's.
   assert.ok(notification.messages.length >= 2, JSON.stringify(notification.messages));
   for (const message of notification.messages.slice(1)) assert.match(message, /约还需 8 分钟）$/);
+  // Nothing left for the session and nothing settled (the sources went meanwhile): the click still hears back.
+  const gone = loadWindow(fixture, { confirm: '开始合并', estimateSettled: { merged: [], deferred: [], blocked: [], failures: [] }, estimateNone: true });
+  await gone.start();
+  assert.deepEqual(gone.reports.map(([report, requestedHere]) => [report.merged.length + report.deferred.length + report.blocked.length + report.failures.length, requestedHere]), [[0, true]]);
+  assert.deepEqual(gone.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.equal(gone.ui.warnings.filter(([, options]) => options?.modal).length, 0);
 });
 
-test('协调在询问任何窗口之前就会被挡住时（冷却、这项工作的退避）：自动开始冷却中不准备，准备后发现退避也不倒计时，如实说明何时可以再试（按原因只提示一次）；手动开始在确认之前就说明', async (t) => {
+test('协调在询问任何窗口之前就会被挡住时（冷却、这项工作的退避或 blocked）：自动开始冷却中连估计都不做，按估计的指纹得出操作键后发现退避或 blocked 就不倒计时、什么都不准备，如实说明何时可以再试（按原因只提示一次）；手动开始在估计和确认之前就说明', async (t) => {
   const fixture = await createRoot(t);
   const reason = '刚刚已经为这项维护让其它窗口重载过一次，暂不再次要求其它窗口重载。约 10 分钟后（14:32 以后）可以再试。';
   const causes = new Set();
   const freshCause = async (code) => { const fresh = !causes.has(code); causes.add(code); return fresh; };
-  // The cooldown: known before the work is (no key) — nothing is prepared or counted down.
+  // The cooldown: known before the work is (no key) — nothing is estimated, prepared or counted down.
   const cooling = loadWindow(fixture, { freshCause, refusal: () => ({ state: 'backoff', reason, retryAfter: new Date(Date.now() + 10 * MINUTE).toISOString() }) });
   await cooling.offer();
-  assert.deepEqual(cooling.engine.calls, [], 'not prepared');
+  assert.deepEqual(cooling.engine.calls, [], 'not estimated');
   assert.deepEqual(cooling.coordinations, []);
   assert.equal(cooling.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0, 'no countdown');
   assert.deepEqual(cooling.ui.infos, [`较大的旧聊天记录这次没有合并：${reason}下次启动时会再提示；也可以在“历史与存储管理”里手动开始。`]);
   assert.deepEqual([...causes], ['runtime-data-set-merge-large-session-backoff']);
-  // This work's backoff: known once prepared (its key) — released, no countdown, and the same cause is not told again.
+  // This work's backoff: known once estimated (the key its fingerprints make) — no countdown, nothing prepared, and the same cause is not told again.
   const backingOff = loadWindow(fixture, {
     freshCause, sessionId: 'session-2', refusal: (input) => (input.operationKey ? { state: 'backoff', reason, retryAfter: new Date().toISOString() } : undefined)
   });
   await backingOff.offer();
-  assert.deepEqual(backingOff.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  assert.deepEqual(backingOff.engine.calls.map((call) => call[0]), ['estimate'], 'nothing prepared, nothing to release');
+  assert.equal(backingOff.refusalQueries.at(-1).operationKey, session.largeMergeOperationKey(fixture.binding, backingOff.sources));
   assert.equal(backingOff.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0, 'no countdown that would end in “没有合并”');
   assert.deepEqual(backingOff.coordinations, []);
   assert.deepEqual(backingOff.ui.infos, [], 'told once per cause');
+  // The key blocked for automatic calls: the same.
+  const blocked = loadWindow(fixture, {
+    freshCause, sessionId: 'session-3', refusal: (input) => (input.operationKey ? { state: 'blocked', reason: '这项合并上次失败了，已停止自动重试。' } : undefined)
+  });
+  await blocked.offer();
+  assert.deepEqual(blocked.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.equal(blocked.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0);
+  assert.deepEqual(blocked.ui.infos, ['较大的旧聊天记录这次没有合并：这项合并上次失败了，已停止自动重试。下次启动时会再提示；也可以在“历史与存储管理”里手动开始。']);
+  assert.deepEqual([...causes], ['runtime-data-set-merge-large-session-backoff', 'runtime-data-set-merge-large-session-blocked']);
   // The user's explicit start: said before anything is confirmed or prepared.
   const manual = loadWindow(fixture, { confirm: '开始合并', refusal: () => ({ state: 'backoff', reason, retryAfter: new Date().toISOString() }) });
   await manual.start();
@@ -607,14 +755,45 @@ test('协调在询问任何窗口之前就会被挡住时（冷却、这项工�
   assert.deepEqual(manual.coordinations, []);
 });
 
-test('准备时点“取消”（或窗口关闭）：已经准备的部分交还引擎，不说明准备结果、不协调', async (t) => {
+test('准备时点“取消”（或窗口关闭）：已经准备的部分交还引擎，不说明准备结果、不协调；自动开始的准备被取消同样只改到下次启动', async (t) => {
   const fixture = await createRoot(t);
   const window = loadWindow(fixture, { confirm: '开始合并', cancelPrepare: true });
   await window.start();
-  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['prepare', 'release']);
+  assert.deepEqual(window.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'release']);
   assert.deepEqual(window.reports, []);
   assert.deepEqual(window.coordinations, []);
   assert.deepEqual(window.ui.commands, []);
+  // After the countdown ran out: “取消” on the preparation's notification moves it to the next startup too.
+  const automatic = loadWindow(fixture, { cancelPrepare: true });
+  await automatic.offer();
+  assert.deepEqual(automatic.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'release']);
+  assert.deepEqual(automatic.coordinations, []);
+  assert.deepEqual(automatic.ui.infos, ['已改到下次启动时再合并较大的旧聊天记录；也可以在“历史与存储管理”里手动开始。']);
+  assert.deepEqual(automatic.host.events, []);
+});
+
+test('估计时点“取消”（或窗口关闭）、估计出错：什么都没准备、不确认、不协调；手动开始说明没有开始，自动开始按原因只提示一次', async (t) => {
+  const fixture = await createRoot(t);
+  const cancelled = loadWindow(fixture, { confirm: '开始合并', cancelEstimate: true });
+  await cancelled.start();
+  assert.deepEqual(cancelled.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.deepEqual([cancelled.reports, cancelled.coordinations, cancelled.ui.errors], [[], [], []]);
+  assert.equal(cancelled.ui.warnings.filter(([, options]) => options?.modal).length, 0, 'not asked to confirm');
+  const failing = loadWindow(fixture, { confirm: '开始合并', estimateError: '读不到来源' });
+  await failing.start();
+  assert.deepEqual(failing.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.deepEqual(failing.ui.errors.map(([message]) => message), ['合并较大的旧聊天记录没有开始：估计时出错（读不到来源）。已有数据未被修改。']);
+  const causes = new Set();
+  const freshCause = async (code) => { const fresh = !causes.has(code); causes.add(code); return fresh; };
+  const automatic = loadWindow(fixture, { estimateError: '读不到来源', freshCause });
+  await automatic.offer();
+  assert.deepEqual(automatic.engine.calls.map((call) => call[0]), ['estimate']);
+  assert.equal(automatic.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0);
+  assert.deepEqual(automatic.ui.warnings.map(([message]) => message), ['合并较大的旧聊天记录暂时无法估计：读不到来源。已有数据未被修改，下次启动时会再试。']);
+  const again = loadWindow(fixture, { estimateError: '读不到来源', freshCause, sessionId: 'session-2' });
+  await again.offer();
+  assert.deepEqual(again.ui.warnings, [], 'told once per cause');
+  assert.deepEqual([...causes], ['runtime-data-set-merge-large-session-estimate']);
 });
 
 test('会话开始时引擎自己的空间检查不够（或第一份就磁盘满）：什么都没合并，本窗口照常重载，重载后说一次“没有进行”和引擎给出的原因，不按每份各报一次', async (t) => {
@@ -641,10 +820,25 @@ function mergeResult(candidateId, insertedConversations, extra = {}) {
   };
 }
 
-function source(candidateId, rows, mergeMs) {
+/** A source as the fake engine prepares it (its exclusive phase measured again), and as it estimates it (`preparing` added). */
+function source(candidateId, rows, mergeMs, prepareMs = 30_000) {
   return {
     candidateId, label: '旧工作区历史', runtimeDataRootPath: `/fixture/${candidateId}`, fingerprint: `fp-${candidateId}`, rows, databaseBytes: 1024 * 1024,
-    duration: { expectedMs: mergeMs, minMs: Math.round(mergeMs * 0.8), maxMs: Math.round(mergeMs * 1.6) }
+    duration: { expectedMs: mergeMs, minMs: Math.round(mergeMs * 0.8), maxMs: Math.round(mergeMs * 1.6) },
+    preparing: { expectedMs: prepareMs, minMs: Math.round(prepareMs * 0.4), maxMs: Math.round(prepareMs * 2.5) }
+  };
+}
+
+/** The fake engine's online target backup, counted once in the estimate's total preparation (never in a source's). */
+const TARGET_BACKUP = { expectedMs: 60_000, minMs: 24_000, maxMs: 150_000 };
+
+/** The engine's figures (the session never computes its own): the sources, the largest one's WAL peak and 64 MiB; `extra` for the estimate's backup and copied content. */
+function spaceFor(fixture, sources, extra = 0) {
+  const largest = Math.max(0, ...sources.map((item) => item.databaseBytes));
+  return {
+    targetDirectory: fixture.paths.dataRootPath,
+    targetBytes: sources.reduce((sum, item) => sum + item.databaseBytes, 0) + largest * 1.5 + 64 * 1024 * 1024 + extra,
+    temporaryDirectory: path.dirname(fixture.root), temporaryBytes: largest
   };
 }
 
@@ -685,6 +879,7 @@ function loadWindow(fixture, behavior = {}) {
         return task({
           report: (value) => {
             if (!value?.message) return;
+            if (value.message.startsWith('将在 ') && !entry.messages.length) order.push('countdown');
             entry.messages.push(value.message);
             entry.reports.push({ at: Date.now(), message: value.message });
             if (behavior.cancelCountdownAfterReports && value.message.startsWith('将在 ') && entry.messages.length >= behavior.cancelCountdownAfterReports) entry.cancel();
@@ -754,26 +949,47 @@ function loadWindow(fixture, behavior = {}) {
     },
     closeRuntime: async () => { host.events.push(['close']); order.push('close'); }
   };
+  const settledIds = (report) => [...(report?.merged ?? []), ...(report?.deferred ?? []), ...(report?.blocked ?? []), ...(report?.failures ?? [])]
+    .map((item) => item.candidateId);
   const engine = {
     calls: [],
     waiting: async () => sources.map(({ candidateId, rows }) => ({ candidateId, rows, bytes: rows * 100 })),
     noteBatch: () => {},
+    // Read-only: what the session would take (a source the estimate settled is left out), both durations, the space.
+    estimate: async (input) => {
+      order.push('estimate');
+      engine.calls.push(['estimate', [...input.candidateIds], input.requested]);
+      input.onProgress?.('第 1/2 份：正在复制一份只读副本');
+      // The user pressed “取消” on the estimate's notification meanwhile (or the window closed).
+      if (behavior.cancelEstimate) ui.progress.find((entry) => entry.title?.startsWith('正在估计'))?.cancel();
+      if (behavior.estimateError) throw new Error(behavior.estimateError);
+      const settled = settledIds(behavior.estimateSettled);
+      const estimated = (behavior.estimateNone ? [] : sources)
+        .filter((item) => input.candidateIds.includes(item.candidateId) && !settled.includes(item.candidateId))
+        .map(({ duration, preparing, ...item }) => ({ ...item, preparing, duration, cached: true }));
+      const sum = (durations) => session.sumLargeMergeDurations(durations);
+      return {
+        sources: estimated,
+        report: behavior.estimateSettled ?? { merged: [], deferred: [], blocked: [], failures: [] },
+        // The online target backup and the content copied into the target are in the estimate's figure.
+        space: behavior.estimateSpace ?? spaceFor(fixture, estimated, estimated.length > 0 ? 2 * 1024 * 1024 : 0),
+        preparing: estimated.length > 0 ? sum([...estimated.map((item) => item.preparing), TARGET_BACKUP]) : sum([]),
+        duration: sum(estimated.map((item) => item.duration)),
+        stopped: false
+      };
+    },
     prepare: async (input) => {
       order.push('prepare');
       engine.calls.push(['prepare', [...input.candidateIds]]);
       // The user pressed “取消” on the preparation's notification meanwhile.
       if (behavior.cancelPrepare) ui.progress.find((entry) => entry.title?.startsWith('正在准备'))?.cancel();
-      const prepared = sources.filter((item) => input.candidateIds.includes(item.candidateId));
-      const largest = Math.max(0, ...prepared.map((item) => item.databaseBytes));
+      const settled = settledIds(behavior.settled);
+      const prepared = sources.filter((item) => input.candidateIds.includes(item.candidateId) && !settled.includes(item.candidateId))
+        .map(({ preparing: _preparing, ...item }) => item);
       return {
         sources: prepared,
         report: behavior.settled ?? { merged: [], deferred: [], blocked: [], failures: [] },
-        // Figures as the engine gives them (the session never computes its own): here the sources, a WAL peak and 64 MiB.
-        space: {
-          targetDirectory: fixture.paths.dataRootPath,
-          targetBytes: prepared.reduce((sum, item) => sum + item.databaseBytes, 0) + largest * 1.5 + 64 * 1024 * 1024,
-          temporaryDirectory: path.dirname(fixture.root), temporaryBytes: largest
-        },
+        space: spaceFor(fixture, prepared),
         engineState: 'fake'
       };
     },

@@ -24,7 +24,7 @@ const foreign = kernelFile('runtimeForeignHistory.js');
 const foreignMerge = kernelFile('runtimeForeignHistoryMerge.js');
 const { HISTORICAL_MERGE_ENGINE: engine, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
 const { prepareLargeMergeSources, runLargeMergeSession } = kernelFile('runtimeDataSetStreamedMerge.js');
-const { keepLargeMergeResult, largeMergeBatchResult, largeMergeDetails, takeLargeMergeResult } = kernelFile('runtimeLargeMergeSession.js');
+const { keepLargeMergeResult, largeMergeBatchResult, largeMergeDetails, largeMergeOperationKey, takeLargeMergeResult } = kernelFile('runtimeLargeMergeSession.js');
 const { largeMergeEngine } = kernelFile('runtimeLargeMergeEngine.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
@@ -300,7 +300,7 @@ test('小、中、大三种规模的外来库各合并一次：小的在线，�
   assert.deepEqual(query(fixture.current.binding.paths.databasePath, "SELECT COUNT(*) FROM turn WHERE status = 'active'"), [0]);
 });
 
-test('大库会话的真实接线（largeMergeEngine 适配层）合并外来大库：准备结果与详情用可读名称，会话合并成功、正文只复制，外来目录不变、声明释放', { timeout: 300_000 }, async (t) => {
+test('大库会话的真实接线（largeMergeEngine 适配层）合并外来大库：先只读估计（只经它的声明读、估计完就释放，不写账本、不碰外来目录，正文按全部复制计空间，用可读名称），同意之后再准备（指纹与估计相同，操作键一致）；准备结果与详情用可读名称，会话合并成功、正文只复制，外来目录不变、声明释放', { timeout: 300_000 }, async (t) => {
   const fixture = await home(t);
   // Above the online bound: the adapter takes it into the session (its threshold is the online bound).
   const big = await copiedDirectory(fixture, (source) => generateSyntheticSource(source.current, { rows: 4_200, prefix: 'wired' }));
@@ -308,13 +308,31 @@ test('大库会话的真实接线（largeMergeEngine 适配层）合并外来大
   const before = await treeState(big.container);
   await request(fixture, source);
   const adapter = largeMergeEngine();
+  const claims = () => fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'foreign-claims')).catch(() => []);
   const database = await openWindow(fixture);
+  let estimated;
   let preparation;
   try {
-    preparation = await adapter.prepare({
+    // Read-only first, as the session asks before the prompt or the confirmation.
+    estimated = await adapter.estimate({
       paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: [source.id], requested: true
     });
+    assert.deepEqual(estimated.sources.map((item) => [item.candidateId, item.label]), [[source.id, source.label]], '估计也用可读名称');
+    assert.ok(estimated.preparing.expectedMs > 0 && estimated.duration.expectedMs > 0);
+    assert.deepEqual(await claims(), [], '估计完就释放声明');
+    assert.deepEqual(await treeState(big.container), before, '估计不碰外来目录');
+    assert.equal(await readLedgerRecord(fixture, source.id), undefined, '估计不写账本');
+    assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
+    // Agreed: prepared now (under its claim until the session or the release).
+    preparation = await adapter.prepare({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: estimated.sources.map((item) => item.candidateId), requested: true
+    });
   } finally { await database.close(); }
+  // A foreign root is never finalized: the same fingerprint, the same coordination key before the countdown and in the session.
+  assert.deepEqual(preparation.sources.map((item) => item.fingerprint), estimated.sources.map((item) => item.fingerprint));
+  assert.equal(largeMergeOperationKey(fixture.current.binding, estimated.sources), largeMergeOperationKey(fixture.current.binding, preparation.sources));
+  // Its content objects are counted as copied into the target (never linked): the estimate's figure has them, the online backup too.
+  assert.ok(estimated.space.targetBytes > preparation.space.targetBytes, JSON.stringify([estimated.space, preparation.space]));
   assert.deepEqual(preparation.sources.map((item) => [item.candidateId, item.label]), [[source.id, source.label]], '外来来源的名称透传到会话');
   assert.ok(largeMergeDetails(preparation.sources, [])[0].startsWith(`${source.label}（`));
   const outcomes = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,

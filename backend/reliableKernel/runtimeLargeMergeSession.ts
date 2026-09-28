@@ -6,7 +6,8 @@ import { classifyRecordedProcess, ownProcessStartIdentity, type RecordedProcessC
 import type { RuntimeDataSetMergeBatchResult, RuntimeDataSetMergeIssue } from './runtimeDataSetMerge';
 import { withRuntimeDataRootAdmission } from './runtimeHostControl';
 import type {
-  LargeMergeDuration, LargeMergePreparedSource, LargeMergeRunProgress, LargeMergeSourceOutcome, LargeMergeSpaceFacts
+  LargeMergeDuration, LargeMergeEstimatedSource, LargeMergePreparedSource, LargeMergeRunProgress, LargeMergeSourceOutcome,
+  LargeMergeSpaceFacts
 } from './runtimeLargeMergeEngine';
 import { resolveVscodeRuntimeMergeLedgerRoot } from './vscodeRootAuthority';
 
@@ -38,11 +39,13 @@ export const LARGE_MERGE_SESSION = Object.freeze({
 /**
  * The work of one session: the target's identity and each source's content fingerprint. The same
  * sources asked for by two windows are the same work (the later request gives way at once); a
- * changed source is new work, never held back by the backoff of the earlier state.
+ * changed source is new work, never held back by the backoff of the earlier state. The estimate
+ * gives the fingerprint the preparation gives the same files: the key asked before the countdown is
+ * the one the coordination uses unless the preparation changed a source (closed its unfinished work).
  */
 export function largeMergeOperationKey(
   target: { dataSetId: string; rootInstanceId: string },
-  sources: ReadonlyArray<Pick<LargeMergePreparedSource, 'candidateId' | 'fingerprint'>>
+  sources: ReadonlyArray<Pick<LargeMergePreparedSource | LargeMergeEstimatedSource, 'candidateId' | 'fingerprint'>>
 ): string {
   const parts = sources.map((source) => `${source.candidateId}@${source.fingerprint}`).sort();
   const digest = createHash('sha256').update(parts.join('\0')).digest('hex').slice(0, 32);
@@ -77,12 +80,13 @@ export interface LargeMergeSpacePlan {
 }
 
 /**
- * Space per disk for the session, checked before the prompt, before the coordination and again
- * (fs.statfs) right before the exclusive phase closes this window's Runtime, with the figures the
- * engine's own check at the session's start uses (LargeMergeSpaceFacts): the target's disk needs
- * targetBytes (its margin included), the temporary directory one private copy of the largest source
- * (temporaryBytes) plus LARGE_MERGE_SESSION.freeSpaceMarginBytes when it is another disk. A disk used
- * for both is checked once for their sum.
+ * Space per disk for the session, checked before the prompt or the confirmation with the estimate's
+ * figures (the preparation's target backup and copied content included), before the coordination
+ * and again (fs.statfs) right before the exclusive phase closes this window's Runtime with the
+ * figures the engine's own check at the session's start uses (the preparation's): the target's disk
+ * needs targetBytes (its margin included), the temporary directory one private copy of the largest
+ * source (temporaryBytes) plus LARGE_MERGE_SESSION.freeSpaceMarginBytes when it is another disk. A
+ * disk used for both is checked once for their sum.
  */
 export async function planLargeMergeSpace(
   facts: LargeMergeSpaceFacts,
@@ -175,9 +179,9 @@ export function largeMergePromptPath(paths: { globalStoragePath: string }): stri
 /**
  * Whether this window offers the session now. Under the configuration admission: not when this
  * VS Code session (vscode.env.sessionId) already offered it, nor while another window whose process
- * is alive holds the record (it prepares, prompts or was told “取消” and keeps that until the next
- * startup); otherwise this window takes the record. Several windows starting together therefore
- * prepare and prompt once.
+ * is alive holds the record (it estimates, prompts, prepares or was told “取消” and keeps that until
+ * the next startup); otherwise this window takes the record. Several windows starting together
+ * therefore estimate and prompt once.
  */
 export async function claimLargeMergePrompt(
   paths: { globalStoragePath: string },
@@ -324,9 +328,9 @@ export function largeMergeProgressMessage(progress: LargeMergeRunProgress, remai
     + `（已处理 ${formatLargeMergeRows(progress.rowsDone)} / ${formatLargeMergeRowsWithUnit(progress.rowsTotal)}，约还需${remainingMs < 60_000 ? '' : ' '}${formatLargeMergeRemaining(remainingMs)}）`;
 }
 
-/** A source (or several) waiting for the session, before it was prepared: its size, never a made-up duration. */
+/** A source (or several) waiting for the session, before it was estimated: its size, never a made-up duration. */
 export function largeMergeWaitingText(rows: number): string {
-  return `约 ${formatLargeMergeRowsWithUnit(rows)}记录，准备后给出预计时长`;
+  return `约 ${formatLargeMergeRowsWithUnit(rows)}记录，开始前给出预计时长`;
 }
 
 /** “12 万”, “8000”. */
@@ -353,10 +357,17 @@ export function sumLargeMergeDurations(durations: readonly LargeMergeDuration[])
 }
 
 /** “3–6 分钟”, or “约 3 分钟” when both ends round alike. */
-export function formatLargeMergeRange(duration: LargeMergeDuration): string {
+export function formatLargeMergeRange(duration: Pick<LargeMergeDuration, 'minMs' | 'maxMs'>): string {
   const low = Math.max(1, Math.floor(duration.minMs / 60_000));
   const high = Math.max(low, Math.ceil(duration.maxMs / 60_000));
   return low === high ? `约 ${low} 分钟` : `${low}–${high} 分钟`;
+}
+
+/** “约 3–6 分钟”, “约 3 分钟” when both ends round alike, “不到 1 分钟” when even the longest is shorter. */
+export function formatLargeMergeAbout(duration: Pick<LargeMergeDuration, 'minMs' | 'maxMs'>): string {
+  if (duration.maxMs < 60_000) return '不到 1 分钟';
+  const range = formatLargeMergeRange(duration);
+  return range.startsWith('约 ') ? range : `约 ${range}`;
 }
 
 /** The whole minutes of an estimate, at least 1 (“约 N 分钟”). */
@@ -364,13 +375,16 @@ export function largeMergeMinutes(ms: number): number {
   return Math.max(1, Math.round(ms / 60_000));
 }
 
-/** The startup prompt, with the seconds left. */
+/**
+ * The startup prompt, with the seconds left: the size, how long the background preparation after
+ * the countdown takes (every window stays usable), and how long every window then pauses.
+ */
 export function largeMergeCountdownText(input: {
-  seconds: number; sources: number; rows: number; duration: LargeMergeDuration;
+  seconds: number; sources: number; rows: number; preparing: LargeMergeDuration; duration: LargeMergeDuration;
 }): string {
-  const range = formatLargeMergeRange(input.duration);
-  return `将在 ${input.seconds} 秒后合并 ${input.sources} 份较大的旧聊天记录（约 ${formatLargeMergeRowsWithUnit(input.rows)}，`
-    + `预计 ${range}；期间所有 LimCode 窗口暂停并显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。`;
+  return `将在 ${input.seconds} 秒后合并 ${input.sources} 份较大的旧聊天记录（约 ${formatLargeMergeRowsWithUnit(input.rows)}）。`
+    + `倒计时结束后先在后台准备${formatLargeMergeAbout(input.preparing)}（期间照常可用），准备好后所有 LimCode 窗口重载一次，`
+    + `暂停${formatLargeMergeAbout(input.duration)}（显示进度，完成后自动恢复，未发送的输入会保留）。点“取消”改到下次启动。`;
 }
 
 // ---------------------------------------------------------------------------------------------
