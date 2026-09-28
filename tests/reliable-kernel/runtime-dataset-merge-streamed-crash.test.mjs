@@ -35,6 +35,7 @@ test('崩溃注入：会话在 committing 写入后、第 1 块、中间块、�
   const firstRun = await runChild(fixture, { candidateIds: [first] });
   assert.equal(firstRun.code, 0, firstRun.stderr);
   const firstOnly = readAll(fixture.current);
+  const firstInserted = JSON.parse(firstRun.stdout).results[0].insertedRows;
   await initial.restore();
   const middle = Math.floor(order[0].rows / LIMITS.chunkRows / 2);
   assert.ok(middle > 1, '来源跨越很多块');
@@ -73,6 +74,10 @@ test('崩溃注入：会话在 committing 写入后、第 1 块、中间块、�
       } else {
         assert.equal(firstRecord?.state, 'merged', `${name}：按实测记为已合并`);
         assert.equal(firstRecord.mergedInto?.[0]?.conversationIds.length, 4, `${name}：插入的对话记入账本`);
+        // Review #11: the rows it inserted, not the rows of its commit evidence.
+        assert.equal(firstRecord.insertedRows, firstInserted, `${name}：记下的新增行数是这份实际插入的`);
+        const recovered = converged.merged.find((item) => item.candidateId === first);
+        if (recovered) assert.deepEqual([recovered.recoveredCommit, recovered.insertedRows], [true, firstInserted], `${name}：收敛结果报出实际新增行数`);
       }
       assert.equal(await readLedgerRecord(fixture, second), undefined, `${name}：第二份没有记录`);
       assert.deepEqual(await ledgerEntries(fixture, 'commits'), [], `${name}：没有残留的提交凭据`);

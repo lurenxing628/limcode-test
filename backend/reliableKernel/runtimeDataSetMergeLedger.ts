@@ -181,13 +181,16 @@ export interface RuntimeDataSetMergeFinalization {
 /**
  * Evidence of a committing transaction's inserted rows, for convergence after a crash: every inserted
  * Conversation and a bounded sample of the other rows (see RuntimeDataSetMergeEvidence; the
- * transaction is atomic, so the sample answers as the whole set would). A streamed transaction's
- * evidence is written empty with its committing record and completed right before its commit.
+ * transaction is atomic, so the sample answers as the whole set would), and how many rows it inserts
+ * and reuses (what a converged merge reports). A streamed transaction's evidence is written empty
+ * with its committing record and completed right before its commit.
  */
 export interface RuntimeDataSetMergeCommit {
   kind: typeof COMMIT_KIND;
   commitId: string;
   rows: Array<[domain: string, id: string]>;
+  insertedRows: number;
+  reusedRows: number;
 }
 
 /**
@@ -773,9 +776,11 @@ export async function removeRuntimeDataSetMergeFinalization(paths: StoragePaths,
 export async function writeRuntimeDataSetMergeCommit(
   paths: StoragePaths,
   rows: Array<[string, string]>,
+  counts: { insertedRows: number; reusedRows: number },
   commitId: string = randomUUID()
 ): Promise<string> {
-  await writeLedgerJson(paths, COMMITS, commitId, { kind: COMMIT_KIND, commitId, rows });
+  await writeLedgerJson(paths, COMMITS, commitId,
+    { kind: COMMIT_KIND, commitId, rows, insertedRows: counts.insertedRows, reusedRows: counts.reusedRows });
   return commitId;
 }
 
@@ -788,8 +793,13 @@ export async function readRuntimeDataSetMergeCommit(paths: StoragePaths, commitI
     throw error;
   }
   const commit = value as Partial<RuntimeDataSetMergeCommit>;
-  if (commit?.kind !== COMMIT_KIND || commit.commitId !== commitId || !Array.isArray(commit.rows)) return undefined;
+  if (commit?.kind !== COMMIT_KIND || commit.commitId !== commitId || !Array.isArray(commit.rows)
+    || !isCount(commit.insertedRows) || !isCount(commit.reusedRows)) return undefined;
   return commit as RuntimeDataSetMergeCommit;
+}
+
+function isCount(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 0;
 }
 
 export async function removeRuntimeDataSetMergeCommit(paths: StoragePaths, commitId: string): Promise<void> {

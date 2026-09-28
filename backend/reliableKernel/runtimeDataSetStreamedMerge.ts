@@ -572,7 +572,8 @@ async function streamMergeTransaction(
     evidence: RuntimeDataSetMergeEvidence;
     state: HistoricalMergeSourceProgress;
     onChunk(chunk: number, rows: number): Promise<void>;
-    beforeCommit(): Promise<void>;
+    /** With what the transaction inserts and reuses, right before its commit. */
+    beforeCommit(merged: StreamedMerge): Promise<void>;
   }
 ): Promise<StreamedMerge> {
   const scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'> = {
@@ -612,7 +613,7 @@ async function streamMergeTransaction(
       return { committed: false, ...merged };
     }
     input.signal?.throwIfAborted();
-    await input.beforeCommit();
+    await input.beforeCommit({ committed: true, ...merged });
     open = false;
     await database.maintenanceCommit().catch(refused);
     return { committed: true, ...merged };
@@ -1858,15 +1859,16 @@ async function mergeLocked(
     });
     // The evidence is completed right before the commit: until then it names nothing, so a crash
     // before the commit converges to "none of it is there" and puts the replaced record back.
-    const commitId = await writeRuntimeDataSetMergeCommit(paths, []);
+    const commitId = await writeRuntimeDataSetMergeCommit(paths, [], { insertedRows: 0, reusedRows: 0 });
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId, state: 'committing', source: state.fingerprint!, target: target.identity, commitId, ...(previous ? { replaced: previous } : {}), ...skipped
     });
     const backupUsed = target.backup.used === true;
     target.backup.used = true;
     await options.onFaultPoint?.('after-committing', { candidateId });
-    // What this transaction wrote so far, for the space it turns out to need (the WAL grows with it).
-    const written = { rows: 0 };
+    // What this transaction wrote so far, for the space it turns out to need (the WAL grows with it),
+    // and what it counted once it got to its commit (for a commit whose reply was lost).
+    const written: { rows: number; counted?: StreamedMerge } = { rows: 0 };
     const walBytes = (): Promise<number> => stat(`${target.binding.paths.databasePath}-wal`).then((info) => info.size, () => 0);
     let streamed: StreamedMerge;
     try {
@@ -1887,10 +1889,11 @@ async function mergeLocked(
             });
           }
         },
-        beforeCommit: async () => {
+        beforeCommit: async (counted) => {
           await options.onFaultPoint?.('after-last-chunk', { candidateId });
           progress('committing', prepared.rows);
-          await writeRuntimeDataSetMergeCommit(paths, evidence.rows(), commitId);
+          written.counted = counted;
+          await writeRuntimeDataSetMergeCommit(paths, evidence.rows(), { insertedRows: counted.inserted, reusedRows: counted.reused }, commitId);
           await options.onFaultPoint?.('before-commit', { candidateId });
         }
       });
@@ -1908,10 +1911,8 @@ async function mergeLocked(
         await target.database.maintenanceCheckpoint().catch(() => undefined);
         throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal));
       }
-      streamed = {
-        committed: true, rows: prepared.rows, inserted: prepared.insertRows, reused: prepared.reusedRows,
-        insertedConversations: evidence.conversationIds.length
-      };
+      // Every inserted row is there: the transaction committed, so it got to its commit and counted.
+      streamed = written.counted!;
     }
     if (!streamed.committed) {
       // Every row is here already: recorded as merged without a transaction, as an empty plan is.

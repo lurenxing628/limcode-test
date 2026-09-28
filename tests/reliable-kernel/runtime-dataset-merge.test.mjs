@@ -1286,7 +1286,7 @@ test('复审 merge3 #4：提交前崩溃留下的 committing 记录确认没有�
   const ledger = resolveVscodeRuntimeMergeLedgerRoot(fixture.paths);
   await fs.mkdir(path.join(ledger, 'commits'), { recursive: true });
   await fs.writeFile(path.join(ledger, 'commits', 'crashed.json'), JSON.stringify({
-    kind: 'limcode-runtime-data-set-merge-commit', commitId: 'crashed', rows: [['Conversation', 'conversation_never_committed']]
+    kind: 'limcode-runtime-data-set-merge-commit', commitId: 'crashed', rows: [['Conversation', 'conversation_never_committed']], insertedRows: 1, reusedRows: 0
   }));
   await fs.writeFile(path.join(ledger, 'records', `${fixture.alpha.id.replace(/:/g, '-')}.json`), JSON.stringify({
     ...merged, state: 'committing', commitId: 'crashed', source: { ...merged.source, contentDigest: 'crashed-attempt' },
@@ -1518,17 +1518,20 @@ test('盲审 merge #1：提交后崩溃、之后在当前库删了这批里的�
   } finally { target.close(); }
 });
 
-test('盲审 merge #1：提交后崩溃、没有删对话：下次启动实测全部在，按提交记录报出新增的对话并记入账本', async (t) => {
+test('盲审 merge #1：提交后崩溃、没有删对话：下次启动实测全部在，按提交记录报出新增的对话、新增的行数（审查 #11：不是证据行数）并记入账本', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [
     { id: 'conversation_alpha_after_commit_a', project: SHARED_PROJECT },
     { id: 'conversation_alpha_after_commit_b', project: SHARED_PROJECT }
   ]);
+  const before = totalRows(fixture.current);
   const killed = await runChild(['kill', fixture.root, 'after-row-commit']);
   assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  const inserted = totalRows(fixture.current) - before;
   const database = await openTarget(t, fixture.current);
   const converged = await merge(fixture, database);
-  assert.deepEqual(converged.merged.map((item) => [item.recoveredCommit, item.insertedConversations, item.insertedRows > 0]), [[true, 2, true]]);
+  assert.deepEqual(converged.merged.map((item) => [item.recoveredCommit, item.insertedConversations, item.insertedRows]), [[true, 2, inserted]]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).insertedRows, inserted);
   assert.deepEqual(await mergedInto(fixture),
     [[fixture.current.binding.dataSetId, ['conversation_alpha_after_commit_a', 'conversation_alpha_after_commit_b']]]);
 });
@@ -2322,6 +2325,14 @@ function readDatabase(dataSet) {
     },
     close() { database.close(); }
   };
+}
+
+/** Rows of every Runtime domain table of a data set. */
+function totalRows(dataSet) {
+  const target = readDatabase(dataSet);
+  try {
+    return kernel.RUNTIME_DOMAIN_SCHEMAS.reduce((sum, schema) => sum + target.count(schema.table), 0);
+  } finally { target.close(); }
 }
 
 function databaseDigest(dataSet) {

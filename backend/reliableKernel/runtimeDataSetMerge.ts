@@ -1513,7 +1513,8 @@ async function settledSource(
       id: candidateId, dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId, ...(label ? { label } : {})
     };
     if (!sameRuntimeDataSetIdentity(record.source, candidate)) return undefined;
-    const rows = (await readRuntimeDataSetMergeCommit(paths, record.commitId))?.rows ?? [];
+    const commit = await readRuntimeDataSetMergeCommit(paths, record.commitId);
+    const rows = commit?.rows ?? [];
     const presence = rows.length > 0 ? await insertedRowsPresence(rows, target.database) : 'none';
     if (presence === 'none') {
       // Nothing of it was committed: the record it replaced is back, and the source is merged again.
@@ -1534,16 +1535,18 @@ async function settledSource(
       state.recorded = true;
       throw new Outcome(outcome);
     }
-    // Recorded for the source state that was committed; later changes show as changed since merge.
+    // Recorded for the source state that was committed, with the counts its commit evidence gives
+    // (rows are there, so the evidence is); later changes show as changed since merge.
+    const { insertedRows, reusedRows } = commit!;
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId, state: 'merged', source: record.source, target: target.identity,
-      mergedAt: new Date().toISOString(), insertedRows: rows.length, reusedRows: 0,
+      mergedAt: new Date().toISOString(), insertedRows, reusedRows,
       insertedConversations: insertedConversationIds.length, insertedConversationIds,
       ...(record.skippedConversations ? { skippedConversations: record.skippedConversations } : {})
     });
     await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
     return { kind: 'merged', result: {
-      ...unchangedResult(candidate, target), insertedRows: rows.length, insertedConversations: insertedConversationIds.length,
+      ...unchangedResult(candidate, target), insertedRows, reusedRows, insertedConversations: insertedConversationIds.length,
       recoveredCommit: true, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state))
     } };
   });
@@ -2013,7 +2016,8 @@ async function commitLocked(
     const finalized = await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state));
     return { kind: 'current', result: { ...result, alreadyMerged: true, ...finalized } };
   }
-  const commitId = mode.migration ? undefined : await writeRuntimeDataSetMergeCommit(paths, mergeCommitEvidence(plan.inserted));
+  const commitId = mode.migration ? undefined
+    : await writeRuntimeDataSetMergeCommit(paths, mergeCommitEvidence(plan.inserted), { insertedRows: plan.inserted.length, reusedRows: plan.reused });
   if (commitId !== undefined) {
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId: candidate.id, state: 'committing', source: state.fingerprint!, target: target.identity, commitId,
