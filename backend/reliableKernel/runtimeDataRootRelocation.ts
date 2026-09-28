@@ -995,7 +995,7 @@ function copiedMessage(targetRootPath: string, sameDataSet: boolean): string {
   const aside = `${path.basename(targetRootPath)}.limcode-copied-<时间>`;
   return sameDataSet
     ? `新数据目录里是当前历史的一份旧拷贝（从别处复制过来的）。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；当前历史照常迁入。`
-    : `新数据目录里是从别处拷贝过来的另一份 LimCode 数据。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；之后它列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看（以后的版本支持合并），也可以把它放回原来的位置后在那里打开。`;
+    : `新数据目录里是从别处拷贝过来的另一份 LimCode 数据。迁移时它会整体改名为“${aside}”保留在旁边，不合并、不删除；之后它列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看，也可以合并进当前库，或者把它放回原来的位置后在那里打开。`;
 }
 
 /** Data-set ids named by the RootBindings of a copied data directory (read as plain JSON). */

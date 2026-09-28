@@ -217,7 +217,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   const waitingRows = waiting.reduce((sum, item) => sum + item.rows, 0);
   const action = await vscode.window.showQuickPick([
     { label: '其他历史库', description: '查看旧聊天；旧格式会先自动备份升级', action: 'history' },
-    { label: '外来历史库', description: '归档与从别处拷来的目录里的旧聊天；只读查看，以后的版本支持合并', action: 'foreign' },
+    { label: '外来历史库', description: '归档与从别处拷来的目录里的旧聊天；只读查看，也可以选择合并进当前库', action: 'foreign' },
     { label: '查看存储占用', description: '按需统计正文、数据库、临时文件与备份', action: 'storage' },
     { label: '合并到当前库', description: '把其他历史库的对话并入当前库；在后台进行，原库保留', action: 'merge' },
     ...(waiting.length > 0 ? [{
@@ -240,7 +240,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     return;
   }
   if (action.action === 'foreign') {
-    await manageForeignRuntimeHistory(context);
+    await manageForeignRuntimeHistory(context, startup);
     return;
   }
   if (action.action === 'cleanupBackups') {
@@ -287,7 +287,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     // Native VS Code command: no settings Webview exists here, so use the shell's modal confirmation.
     const confirmed = await vscode.window.showWarningMessage('永久删除这个历史库及其备份？', {
       modal: true, detail: `${dataSetLabel(candidate, mergeStates.get(candidate.id))}\n${candidate.runtimeDataRootPath}\n\n此操作不能撤销，不会删除当前历史库或共享设置。`
-        + '它的归档（归档并重置留下的 .limcode-runtime-backups）会保留，之后作为外来历史库出现在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看。'
+        + '它的归档（归档并重置留下的 .limcode-runtime-backups）会保留，之后作为外来历史库出现在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看或合并进当前库。'
         + deletionNote(candidate, mergeStates.get(candidate.id))
     }, '永久删除');
     if (confirmed !== '永久删除') return;
@@ -338,7 +338,7 @@ function remergeNote(merged?: RuntimeDataSetMergedFacts): string {
  * up to the in-memory transaction bound other windows yield for its one transaction; above it, up
  * to the streamed bound, it goes to the large merge session (大库会话); only above that it is too large.
  */
-function oversizedMergeNote(): string {
+export function oversizedMergeNote(): string {
   const { maxRows, maxBytes } = RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
   const minutes = Math.round(EXCLUSIVE_MAINTENANCE_DEFAULTS.busyWaitTimeoutMs / 60_000);
   const streamed = formatLargeMergeRowsWithUnit(RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS);
@@ -628,7 +628,7 @@ async function reportHistoricalMerge(
   if (merged.length) {
     const conversations = merged.reduce((sum, item) => sum + item.insertedConversations, 0);
     const text = `已把 ${merged.length} 份${details ? '较大的' : ''}旧聊天记录合并到当前历史库（新增 ${conversations} 个对话），可直接在侧栏继续。`
-      + mergedNotes(merged) + '原库和合并前备份都已保留。';
+      + mergedNotes(merged) + '原库和合并前备份都已保留。' + foreignMergedNote(merged);
     if (!details?.length) void vscode.window.showInformationMessage(text);
     else {
       // The large merge session: how many conversations each source added (or why not), on request.
@@ -641,7 +641,7 @@ async function reportHistoricalMerge(
   const current = report.merged.filter(item => item.alreadyMerged);
   if (current.length) {
     void vscode.window.showInformationMessage(
-      `${requested ? '所选历史库' : `${current.length} 份旧聊天记录`}已合并到当前历史库，没有新内容。${mergedNotes(current)}`
+      `${requested ? '所选历史库' : `${current.length} 份旧聊天记录`}已合并到当前历史库，没有新内容。${mergedNotes(current)}${foreignMergedNote(current)}`
     );
   }
   // The user's click always hears back, also when the engine found nothing to do for it.
@@ -665,19 +665,30 @@ async function reportHistoricalMerge(
   ).then(async choice => {
     if (choice !== '查看原因' || !stillCurrent()) return;
     await showReadOnly(context, '旧聊天记录合并结果', problems.map(problem =>
-      `${problem.candidateId ?? '历史库列表'}\n[${problem.code}] ${problem.message}`
+      `${problem.label ?? problem.candidateId ?? '历史库列表'}\n[${problem.code}] ${problem.message}`
     ).join('\n\n'));
   }).then(undefined, error => console.warn('[LimCode] 无法显示旧聊天记录合并详情。', error));
 }
 
 /** One log line per merged source, with everything its notice summarizes. */
 function mergedLog(merged: RuntimeDataSetMergeResult): string {
+  const name = merged.label ? `${merged.label}（${merged.candidateId}）` : merged.candidateId;
   return (merged.alreadyMerged
-    ? `旧聊天记录 ${merged.candidateId} 已合并到当前历史库，没有新内容`
-    : `已合并旧聊天记录 ${merged.candidateId}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`)
+    ? `旧聊天记录 ${name} 已合并到当前历史库，没有新内容`
+    : `已合并旧聊天记录 ${name}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`)
     + (merged.finalized ? `；收尾 ${merged.finalized.turns} 个中断任务，另有 ${merged.finalized.intents} 条排队未发送的消息已取消，`
       + `收尾前来源备份：${merged.finalized.sourceBackupPath}` : '')
     + (merged.skippedConversations ? `；${merged.skippedConversations} 个之前合并进来、之后在当前库删除的对话没有再合并` : '');
+}
+
+/**
+ * Foreign history roots (archives, copied directories) are only read by a merge: once their content is
+ * in the current data set, backup cleanup can prove it by coverage and delete them.
+ */
+function foreignMergedNote(results: readonly RuntimeDataSetMergeResult[]): string {
+  const foreign = results.filter(result => result.label);
+  if (!foreign.length) return '';
+  return `${foreign.map(result => result.label).join('、')}原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。`;
 }
 
 /** What merged sources also did: work closed before merging, and conversations deliberately left out. */

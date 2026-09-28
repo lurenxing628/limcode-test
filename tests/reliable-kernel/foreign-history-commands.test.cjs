@@ -12,7 +12,8 @@ function loadCommand(dependencies) {
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
-    module, exports: module.exports, console, process,
+    // One Error for both sides: a fake's rejection is an `Error` to the command, as in the extension host.
+    module, exports: module.exports, console, process, Error,
     require(name) {
       if (!Object.prototype.hasOwnProperty.call(dependencies, name)) throw new Error(`Unexpected source dependency: ${name}`);
       return dependencies[name];
@@ -53,7 +54,7 @@ function fixture({ entries = [entry(), entry({ id: 'foreign:archive:111111111111
   entry({ id: 'foreign:copied:2222222222222222', status: 'unavailable', code: 'foreign-history-copy-failed', reason: '暂时无法核验：复制数据库到私有临时目录失败（ENOSPC）。', summary: undefined })],
 picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
   lastMigration: { fromPath: '/old/limcode', toPath: ROOT, migratedAt: '2026-09-01' }, previousDataRoots: ['/old/limcode', '/older/limcode']
-} } = {}) {
+}, mergeStates = [], requestError, host } = {}) {
   const calls = [];
   const state = new Map();
   const context = { globalState: { get: (key) => state.get(key), update: async (key, value) => { state.set(key, value); } } };
@@ -102,28 +103,49 @@ picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
           total: size('4096', 3) };
       }
     },
+    '../../backend/reliableKernel/runtimeForeignHistoryMerge': {
+      readForeignRuntimeHistoryMergeStates: async (paths, listed) => {
+        calls.push(['merge-states', plain(paths), listed.map((item) => item.id)]);
+        return new Map(mergeStates);
+      },
+      requestForeignRuntimeHistoryMerge: async (paths, request) => {
+        calls.push(['request', plain(paths), plain(request)]);
+        if (requestError) throw requestError;
+      }
+    },
     './runtimeDataSetManagement': {
       browseRuntimeHistory: async (_context, label, open, source) => { calls.push(['browse', label, source]); calls.push(['opened', plain(await open())]); },
       formatBytes: (value) => `${value} B`,
-      showReadOnly: async (_context, title, text) => { calls.push(['read-only', title, text]); }
+      showReadOnly: async (_context, title, text) => { calls.push(['read-only', title, text]); },
+      mergeHistoricalDataSetsInBackground: async (_context, current, shouldContinue, ids) => {
+        calls.push(['background-merge', current.name, shouldContinue(), plain(ids)]);
+      },
+      oversizedMergeNote: () => '（较大的库另行说明。）'
     }
   });
-  return { command, calls, context, state };
+  const startup = host === undefined ? undefined : { current: () => host };
+  return { command, calls, context, state, startup };
 }
 
-test('外来历史库列表：核验通过的注明来源、原位置和“以后的版本支持合并”，完全相同的拷贝折叠；未通过和暂时无法核验的列出位置、大小与原因', async () => {
+const CLEANUP = /这份归档或拷来的库原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。/;
+
+test('外来历史库列表：核验通过的注明来源、原位置和“可以合并进当前库”，完全相同的拷贝折叠；未通过和暂时无法核验的列出位置、大小与原因', async () => {
   const f = fixture({ picks: [undefined] });
   await f.command.manageForeignRuntimeHistory(f.context);
   assert.deepEqual(f.calls.find((call) => call[0] === 'inspect'), ['inspect', ROOT, ['/old/limcode', '/older/limcode']], '历次离开的数据目录都找');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'merge-states'), ['merge-states', { globalStoragePath: ROOT },
+    ['foreign:archive:0123456789abcdef', 'foreign:archive:1111111111111111', 'foreign:copied:fedcba9876543210', 'foreign:copied:2222222222222222']],
+  '合并状态只从当前配置根的账本读');
   const [, items, placeHolder] = f.calls.find((call) => call[0] === 'pick');
-  assert.match(placeHolder, /只读；以后的版本支持合并/);
+  assert.equal(placeHolder, '外来历史库 · 原样保留；核验通过的可以只读查看，也可以合并进当前库');
   assert.equal(items.length, 3, '完全相同的拷贝只显示一份');
   const [archive, copied, unavailable] = items;
   assert.equal(archive.label, '归档 · 20260901-010203-004-abcdef12');
   assert.match(archive.description, /2 个对话 · 最后活动 2026-09-01 01:02 · alpha · 4096 B（3 个文件）/);
   assert.match(archive.detail, /位置：\/data\/limcode\/\.limcode-runtime-backups\/20260901-010203-004-abcdef12\/active/);
   assert.match(archive.detail, /原位置：\/data\/limcode\/\.limcode-runtime\/active/);
-  assert.match(archive.detail, /只读；以后的版本支持合并/);
+  assert.match(archive.detail, /只读；可以合并进当前库/);
+  assert.doesNotMatch(archive.detail, /以后的版本/);
   assert.match(archive.detail, /另有 1 份完全相同的拷贝/);
   assert.equal(copied.label, '未通过核验 · 从别处拷来 · limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678');
   assert.equal(copied.description, '8192 B（5 个文件）');
@@ -145,12 +167,15 @@ test('选中未通过的外来库：说明原因与位置，只提供“打开�
   assert.equal(f.calls.some((call) => ['browse', 'storage', 'locate'].includes(call[0])), false);
 });
 
-test('选中核验通过的外来库：只读查看经 located 根打开历史，存储占用写明原位置只作记录', async () => {
+test('选中核验通过的外来库：可以只读查看、合并进当前库；只读查看经 located 根打开历史，存储占用写明原位置只作记录', async () => {
   const f = fixture({ picks: [0, (items) => items.find((item) => item.action === 'read'), 0, (items) => items.find((item) => item.action === 'storage'), undefined] });
   await f.command.manageForeignRuntimeHistory(f.context);
   const actions = f.calls.filter((call) => call[0] === 'pick')[1];
-  assert.deepEqual(actions[1].map((item) => item.label), ['只读查看', '查看存储占用', '打开所在文件夹']);
-  assert.match(actions[2], /只读；以后的版本支持合并/);
+  assert.deepEqual(actions[1].map((item) => [item.label, item.action]),
+    [['只读查看', 'read'], ['合并进当前库', 'merge'], ['查看存储占用', 'storage'], ['打开所在文件夹', 'reveal']]);
+  assert.equal(actions[1][1].description, '在后台合并，原目录不改动');
+  assert.equal(actions[2], '归档 · 20260901-010203-004-abcdef12');
+  assert.equal(f.calls.some((call) => call[0] === 'request'), false, '只读查看不写合并请求');
   assert.deepEqual(f.calls.find((call) => call[0] === 'browse'), ['browse', '归档 · 20260901-010203-004-abcdef12', '外来历史库']);
   assert.deepEqual(f.calls.filter((call) => call[0] === 'locate').map((call) => call.slice(1)), [
     [ROOT, entry().location], [ROOT, entry().location]
@@ -189,7 +214,8 @@ test('启动发现：新条目只提示一次，之后再出现的新条目另�
   const infos = f.calls.filter((call) => call[0] === 'info');
   assert.equal(infos.length, 2);
   assert.match(infos[0][1], /^发现 2 个外来历史库/);
-  assert.match(infos[0][1], /可以在“历史与存储管理 → 外来历史库”里核验，核验通过的可以只读查看；以后的版本支持合并/, '按发现计数，只承诺核验通过的可以查看');
+  assert.match(infos[0][1], /可以在“历史与存储管理 → 外来历史库”里核验，核验通过的可以只读查看，也可以选择合并进当前库（不会自动合并）。原数据保持原样。/,
+    '按发现计数，只承诺核验通过的可以查看和由用户选择合并');
   assert.match(infos[1][1], /^发现 1 个外来历史库/);
   assert.deepEqual(f.calls.find((call) => call[0] === 'discover'), ['discover', {
     paths: { globalStoragePath: ROOT }, configurationRootPath: ROOT, previousDataRootPaths: ['/old/limcode', '/older/limcode']
@@ -222,4 +248,127 @@ test('最后一轮 #5 本版本之前迁移过的安装（globalStatus 只有 la
   await listed.command.announceForeignRuntimeHistoryOnStartup(listed.context);
   assert.deepEqual(listed.calls.find((call) => call[0] === 'discover')[1].previousDataRootPaths, ['/older/limcode', '/old/limcode'], '列表加上最近一次迁移离开的目录');
   assert.ok(!listed.calls.some((call) => call[0] === 'status'));
+});
+
+test('合并进当前库：确认框写明只读、复制正文、中断任务与冲突不合并和清理备份提示；确认后按所见身份写请求，再只在后台合并这一个', async () => {
+  const f = fixture({ picks: [0, (items) => items.find((item) => item.action === 'merge')], warnings: ['合并'], host: { name: 'window-host', product: {} } });
+  await f.command.manageForeignRuntimeHistory(f.context, f.startup);
+  const [, message, options, button] = f.calls.find((call) => call[0] === 'warning');
+  assert.equal(message, '把这个外来历史库合并进当前库？');
+  assert.equal(button, '合并');
+  assert.equal(options.modal, true);
+  assert.match(options.detail, /来源：\/data\/limcode\/\.limcode-runtime-backups\/20260901-010203-004-abcdef12\/active/);
+  assert.match(options.detail, /外来历史库只读：合并不在它的目录里写任何东西，它原样保留；它的正文文件会复制进当前库（不共用文件）/);
+  assert.match(options.detail, /还有中断的任务或排队未发送的消息，这次不合并并说明原因（当前版本不在外来目录里收尾），仍可只读查看/);
+  assert.match(options.detail, /与当前库有数据冲突时整体不合并/);
+  assert.match(options.detail, /（较大的库另行说明。）/);
+  assert.match(options.detail, CLEANUP);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'request'), ['request', { globalStoragePath: ROOT }, {
+    id: 'foreign:archive:0123456789abcdef', location: entry().location, label: '外来历史库（归档 · 20260901-010203-004-abcdef12）',
+    expectedDataSetId: 'data-set-a', expectedRootInstanceId: 'instance-a'
+  }], '请求带上列表里所见的身份，合并时再核对');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'background-merge'), ['background-merge', 'window-host', true, ['foreign:archive:0123456789abcdef']]);
+  assert.ok(f.calls.findIndex((call) => call[0] === 'request') < f.calls.findIndex((call) => call[0] === 'background-merge'), '先记录请求再合并');
+  assert.equal(f.calls.filter((call) => call[0] === 'pick').length, 2, '开始合并后列表关闭');
+});
+
+test('合并进当前库：取消什么也不写；没有打开的当前库时只记录请求；请求被拒时说明原因且不合并', async () => {
+  const cancelled = fixture({ picks: [0, (items) => items.find((item) => item.action === 'merge'), undefined], warnings: [undefined], host: { name: 'h', product: {} } });
+  await cancelled.command.manageForeignRuntimeHistory(cancelled.context, cancelled.startup);
+  assert.equal(cancelled.calls.some((call) => ['request', 'background-merge'].includes(call[0])), false);
+  assert.equal(cancelled.calls.filter((call) => call[0] === 'pick').length, 3, '取消后回到列表');
+
+  const noHost = fixture({ picks: [0, (items) => items.find((item) => item.action === 'merge')], warnings: ['合并'], host: {} });
+  await noHost.command.manageForeignRuntimeHistory(noHost.context, noHost.startup);
+  assert.equal(noHost.calls.filter((call) => call[0] === 'request').length, 1);
+  assert.equal(noHost.calls.some((call) => call[0] === 'background-merge'), false);
+  assert.deepEqual(noHost.calls.find((call) => call[0] === 'info'), ['info', '已记录合并请求，当前历史库打开后会自动合并。']);
+
+  const refused = fixture({
+    picks: [0, (items) => items.find((item) => item.action === 'merge'), undefined], warnings: ['合并'], host: { name: 'h', product: {} },
+    requestError: new Error('所选外来历史库已变化，请重新打开外来历史库。')
+  });
+  await refused.command.manageForeignRuntimeHistory(refused.context, refused.startup);
+  assert.deepEqual(refused.calls.find((call) => call[0] === 'error'), ['error', '没有合并：所选外来历史库已变化，请重新打开外来历史库。']);
+  assert.equal(refused.calls.some((call) => call[0] === 'background-merge'), false);
+});
+
+test('旧拷贝：标出是谁的旧拷贝，合并入口写明不能合并；点开说明原因并提示在“清理备份”里按覆盖处理，不写请求', async () => {
+  const oldCurrent = entry({ sameAsLocal: { candidateId: 'default', selected: true } });
+  const oldWorkspace = entry({ id: 'foreign:archive:3333333333333333', name: '20260902-010203-004-abcdef12', sameAsLocal: { candidateId: 'workspace:folder-x', selected: false } });
+  const f = fixture({
+    entries: [oldCurrent, oldWorkspace], host: { name: 'h', product: {} },
+    picks: [0, (items) => items.find((item) => item.action === 'old-copy'), 1, (items) => items.find((item) => item.label === '合并进当前库'), undefined]
+  });
+  await f.command.manageForeignRuntimeHistory(f.context, f.startup);
+  const [, items] = f.calls.find((call) => call[0] === 'pick');
+  assert.equal(items[0].label, '归档 · 20260901-010203-004-abcdef12（当前库的旧拷贝）');
+  assert.match(items[0].detail, /只读；它是当前历史库的旧拷贝，不合并/);
+  assert.equal(items[1].label, '归档 · 20260902-010203-004-abcdef12（历史库 workspace:folder-x 的旧拷贝）');
+  const actions = f.calls.filter((call) => call[0] === 'pick');
+  assert.deepEqual(actions[1][1][1], { label: '合并进当前库', description: '不能合并：它是当前历史库的旧拷贝', action: 'old-copy' });
+  assert.deepEqual(actions[3][1][1], { label: '合并进当前库', description: '不能合并：它是历史库 workspace:folder-x的旧拷贝', action: 'old-copy' });
+  const infos = f.calls.filter((call) => call[0] === 'info');
+  assert.equal(infos.length, 2);
+  assert.match(infos[0][1], /^这个外来历史库是当前历史库的旧拷贝（同一个库的另一份），不合并/);
+  assert.match(infos[0][1], /可以在“清理备份”里按覆盖核对后删除/);
+  assert.equal(f.calls.some((call) => ['warning', 'request', 'background-merge'].includes(call[0])), false);
+});
+
+test('合并状态：已合并（时间）并提示在“清理备份”里按覆盖核对删除；之后有变化的可以再合并；请求中、被拒写明原因；上次合并过的被拒仍显示已合并（时间）', async () => {
+  const ids = ['foreign:archive:a000000000000000', 'foreign:archive:b000000000000000', 'foreign:archive:c000000000000000', 'foreign:archive:d000000000000000'];
+  const f = fixture({
+    entries: ids.map((id, index) => entry({ id, name: `2026090${index + 1}-010203-004-abcdef12` })),
+    mergeStates: [
+      [ids[0], { state: 'merged', mergedAt: '2026-09-27T08:09:10.000Z', intoCurrent: true, changedSinceMerge: false }],
+      [ids[1], { state: 'merged', mergedAt: '2026-09-26T01:02:03.000Z', intoCurrent: true, changedSinceMerge: true }],
+      [ids[2], { state: 'requested', requestedAt: '2026-09-27T09:10:11.000Z' }],
+      [ids[3], { state: 'blocked', code: 'runtime-data-set-merge-conflict', message: '同一个库的另一份拷贝先合并进来之后，这一份又有了不同的改动。\n第二行细节',
+        lastMerged: { mergedAt: '2026-09-25T01:02:03.000Z', intoCurrent: true, changedSinceMerge: true } }]
+    ],
+    picks: [0, (items) => items.find((item) => item.action === 'merge'), undefined], warnings: [undefined]
+  });
+  await f.command.manageForeignRuntimeHistory(f.context);
+  const [, items] = f.calls.find((call) => call[0] === 'pick');
+  assert.match(items[0].description, /^已合并（2026-09-27 08:09） · 2 个对话/);
+  assert.match(items[0].detail, /只读；已合并进当前库/);
+  assert.match(items[0].detail, CLEANUP);
+  assert.match(items[1].description, /^已合并（2026-09-26 01:02），之后有变化 · /);
+  assert.match(items[1].detail, /只读；可以合并进当前库/);
+  assert.match(items[2].description, /^已请求合并（2026-09-27 09:10），还没有完成 · /);
+  assert.match(items[3].description, /^已合并（2026-09-25 01:02）；暂不能合并 · /);
+  assert.match(items[3].detail, / · 只读；没有合并：同一个库的另一份拷贝先合并进来之后，这一份又有了不同的改动。$/);
+  assert.doesNotMatch(items[3].detail, /第二行细节/);
+  const [, actions, placeHolder] = f.calls.filter((call) => call[0] === 'pick')[1];
+  assert.equal(placeHolder, '归档 · 20260901-010203-004-abcdef12 · 已合并（2026-09-27 08:09）');
+  assert.equal(actions[1].description, '已合并（2026-09-27 08:09）；在后台合并，原目录不改动');
+  assert.match(f.calls.find((call) => call[0] === 'warning')[2].detail, /它上次合并之后没有变化，这次会提示没有新内容/);
+  assert.equal(f.calls.filter((call) => call[0] === 'merge-states').length, 2, '每次回到列表都重新读合并状态');
+});
+
+test('有未结束任务的外来库：列表写明原因、不说可以合并；合并入口写明暂不能合并，点开说明原因，不写请求，仍可只读查看', async () => {
+  const busy = entry({ unfinishedWork: { finalizable: 2, refused: 1 } });
+  const f = fixture({
+    entries: [busy], host: { name: 'h', product: {} },
+    picks: [0, (items) => items.find((item) => item.label === '合并进当前库'), 0, (items) => items.find((item) => item.action === 'read'), undefined]
+  });
+  await f.command.manageForeignRuntimeHistory(f.context, f.startup);
+  const [, items] = f.calls.find((call) => call[0] === 'pick');
+  assert.match(items[0].detail, /有 3 项未结束的任务（旧窗口中断时留下），合并前需要收尾，当前版本不在外来目录里收尾，所以暂不合并；可以只读查看/);
+  assert.doesNotMatch(items[0].detail, /可以合并进当前库/);
+  const actions = f.calls.filter((call) => call[0] === 'pick')[1][1];
+  assert.deepEqual(actions[1], { label: '合并进当前库', description: '暂不能合并：有 3 项未结束的任务', action: 'unfinished' });
+  const [, info] = f.calls.find((call) => call[0] === 'info');
+  assert.match(info, /有 3 项未结束的任务（旧窗口中断时留下），合并前要先收尾；外来历史库只读，当前版本不在它的目录里收尾，所以暂不合并/);
+  assert.equal(f.calls.some((call) => ['warning', 'request', 'background-merge'].includes(call[0])), false);
+  assert.ok(f.calls.some((call) => call[0] === 'browse'), '仍可只读查看');
+});
+
+test('合并结果与大库会话里的名称：来源和名称可读，工作区库注明', () => {
+  const f = fixture();
+  assert.equal(f.command.foreignSourceLabel(entry()), '外来历史库（归档 · 20260901-010203-004-abcdef12）');
+  assert.equal(f.command.foreignSourceLabel({ ...COPIED, scope: 'workspace:folder-x' }),
+    '外来历史库（从别处拷来 · limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678 · 工作区库）');
+  assert.equal(f.command.foreignSourceLabel({ ...COPIED, archiveName: '20260903-010203-004-abcdef12' }),
+    '外来历史库（拷来目录里的归档 · 20260903-010203-004-abcdef12）');
 });

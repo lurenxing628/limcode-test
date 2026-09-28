@@ -143,7 +143,7 @@ async function startApplication(
         .then(() => mergeHistoricalDataSetsInBackground(context, application, isCurrent))
         .catch(error => console.error(`${EXTENSION_BRAND} historical data merge failed.`, error))
         // Archives and copied data directories: listed once, announced once, read only on request.
-        .then(() => announceForeignRuntimeHistoryOnStartup(context, isCurrent))
+        .then(() => announceForeignRuntimeHistoryOnStartup(context, isCurrent, startup))
         .catch(error => console.error(`${EXTENSION_BRAND} foreign history discovery failed.`, error));
       const recoveryStartedAt = Date.now();
       void application.startRuntimeRecovery().then(

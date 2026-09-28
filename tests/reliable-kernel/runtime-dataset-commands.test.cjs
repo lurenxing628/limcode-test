@@ -948,6 +948,36 @@ test('盲审 merge #1：通知与日志报出以前合并进来、之后在当�
   ]);
 });
 
+test('外来历史库合并：通知与日志用可读名称，并提示这份归档或拷来的库可以在“清理备份”里按覆盖核对删除；没有新内容时同样提示；原因列表也用名称', async () => {
+  const id = 'foreign:archive:0123456789abcdef';
+  const label = '外来历史库（归档 · 20260901-010203-004-abcdef12）';
+  const tip = `${label}原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。`;
+  const merged = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({ candidateId: id, label, copiedCasObjects: 3 })] }) });
+  await merged.mergeHistoricalDataSetsInBackground(merged.context, mergeHost(), () => true, [id]);
+  assert.deepEqual(merged.calls.filter(call => call[0] === 'info').map(call => call[1]), [
+    `已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话），可直接在侧栏继续。原库和合并前备份都已保留。${tip}`
+  ]);
+  assert.deepEqual(merged.logs.filter(([level]) => level === 'info').map(([, line]) => line), [
+    `[LimCode] 已合并旧聊天记录 ${label}（${id}）：新增 12 行；合并前备份：/fixture/backup`
+  ]);
+  const again = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({
+    candidateId: id, label, alreadyMerged: true, insertedRows: 0, insertedConversations: 0, backupPath: undefined
+  })] }) });
+  await again.mergeHistoricalDataSetsInBackground(again.context, mergeHost(), () => true, [id]);
+  assert.deepEqual(again.calls.filter(call => call[0] === 'info').map(call => call[1]), [`所选历史库已合并到当前历史库，没有新内容。${tip}`]);
+  const local = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld()] }) });
+  await local.mergeHistoricalDataSetsInBackground(local.context, mergeHost(), () => true);
+  assert.doesNotMatch(local.calls.find(call => call[0] === 'info')[1], /清理备份/, '本地历史库的合并不提清理备份');
+
+  const refused = fixture({ confirmation: '查看原因', mergeReport: emptyMergeReport({ blocked: [{
+    candidateId: id, label, code: 'runtime-data-set-merge-foreign-old-copy', message: '这个外来历史库是当前历史库的旧拷贝。', newly: true, requested: true
+  }] }) });
+  await refused.mergeHistoricalDataSetsInBackground(refused.context, mergeHost(), () => true, [id]);
+  for (let turn = 0; turn < 50 && !refused.calls.some(call => call[0] === 'document'); turn += 1) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(refused.calls.find(call => call[0] === 'document'), ['document',
+    `${label}\n[runtime-data-set-merge-foreign-old-copy] 这个外来历史库是当前历史库的旧拷贝。`]);
+});
+
 test('盲审 merge #4：明确合并时已合并、没有新内容也有回应，引擎什么都没做时同样回应；自动合并没有可说的就静默', async () => {
   const already = {
     candidateId: 'workspace:old', sourceDataSetId: 'old', targetDataSetId: 'current', insertedRows: 0, reusedRows: 0,
