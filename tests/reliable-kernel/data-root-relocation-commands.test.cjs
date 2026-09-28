@@ -49,7 +49,7 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 
 function fixture({
   picked = TARGET, plan = {}, answers = [], busy = [false], completeError, cleanup,
-  closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
+  closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true, carryBackError,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
   nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold,
   afterLocksError, statusUnreadable = false, undoUnpublishedResult = {},
@@ -228,6 +228,11 @@ function fixture({
       findDataRootRelocationCopy: async (root, relocationId) => { calls.push(['find-copy', root, relocationId]); return copyAside; },
       readDataRootRelocationHold: async (root) => { calls.push(['read-hold', root]); return hold; },
       isDataRootRelocationTargetInvisible: (error) => error?.code === 'data-root-relocation-target-invisible',
+      carryDeletionRecordsBack: async (input) => {
+        calls.push(['carry-back', { ...input }]);
+        if (carryBackError) throw carryBackError;
+        return 1;
+      },
       consentToDataRootMovedWork: async (root, relocationId, by) => {
         calls.push(['consent', root, relocationId, by]);
         if (consentError) throw consentError;
@@ -1066,6 +1071,28 @@ test('补充 E 发起安装“回到旧目录”：确认那一步就算同意�
   const declined = fixture({ lastMigration, answers: [{ choice: 'cancel', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }) });
   await declined.commands.returnToPreviousDataRoot(declined.context, declined.startup, declined.request);
   assert.ok(!declined.kinds().includes('consent'), '没确认就不算同意');
+});
+
+test('回到旧目录：所有窗口让出之后、切换指针之前，把在当前目录里记下的删除一并记到旧目录（确认框写明）；记不下就不切换并说明原因', async () => {
+  const lastMigration = { fromPath: '/data/older', toPath: SOURCE, migratedAt: '2026-09-26T00:00:00.000Z', relocationId: 'r-7' };
+  const f = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }) });
+  await f.commands.returnToPreviousDataRoot(f.context, f.startup, f.request);
+  assert.match(JSON.stringify(f.prompts[0]), /在当前目录里删掉的、迁移时带过来的对话会记到旧目录的删除记录里：以后在旧目录里合并时不会把它们加回来；旧目录里原本就有的对话不会被删除/);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'carry-back'), ['carry-back', { currentRootPath: SOURCE, previousRootPath: '/data/older', relocationId: 'r-7' }]);
+  const order = f.kinds();
+  assert.ok(order.indexOf('close-runtime') < order.indexOf('carry-back') && order.indexOf('carry-back') < order.indexOf('status'), '所有窗口让出之后、切换指针之前');
+
+  const failing = fixture({
+    lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }), carryBackError: new Error('删除记录读不出')
+  });
+  await failing.commands.returnToPreviousDataRoot(failing.context, failing.startup, failing.request);
+  assert.ok(!failing.calls.some((call) => call[0] === 'status' && call[1].dataRootPath === '/data/older'), '没有切换');
+  assert.match(JSON.stringify(failing.calls.filter((call) => call[0] === 'error')), /没能把在当前目录里记下的删除一并记到旧目录（(Error: )?删除记录读不出），所以没有切换/);
+
+  const withoutId = fixture({ lastMigration: { ...lastMigration, relocationId: undefined }, answers: [{ choice: 'return', include: [] }] });
+  await withoutId.commands.returnToPreviousDataRoot(withoutId.context, withoutId.startup, withoutId.request);
+  assert.ok(!withoutId.kinds().includes('carry-back'), '没有迁移 id（更早版本的迁移）：没有可带回的');
+  assert.doesNotMatch(JSON.stringify(withoutId.prompts[0]), /删除记录/);
 });
 
 test('最后一轮 决定二 “回到旧目录”找不到这次迁移的标记（或读不出、读不懂、只有本安装别的迁移的标记）时如实报错、不切换；记同意失败时也报错、不切换', async () => {

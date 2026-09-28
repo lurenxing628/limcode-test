@@ -34,8 +34,8 @@ import {
   type RuntimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
 import {
-  readRuntimeDeletedConversations, readRuntimeIdentityAliases, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY, RUNTIME_IDENTITY_ALIASES_DIRECTORY,
-  runtimeMergeIdentityName, type RuntimeIdentityContinuation, type RuntimeMergeIdentity
+  readRuntimeDeletedConversations, readRuntimeIdentityAliases, recordRuntimeDeletedConversations, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY,
+  RUNTIME_IDENTITY_ALIASES_DIRECTORY, runtimeMergeIdentityName, type RuntimeIdentityContinuation, type RuntimeMergeIdentity
 } from './runtimeMergeTombstones';
 import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigration';
 import {
@@ -2324,6 +2324,38 @@ async function verifyMergeRecordsCarry(source: string, target: string, carry: Me
     const read = await readRuntimeIdentityAliases(target, to);
     if (!continues.every((identity) => read.some((entry) => sameRuntimeDataSetIdentity(entry, identity)))) throw mismatch('身份延续记录');
   }
+}
+
+/**
+ * Before "回到旧目录" switches back from the directory relocation `relocationId` moved into: what the
+ * user deleted here from a data set that continues one of the old directory through that relocation
+ * is recorded there too, for the one it came from, so a merge there leaves those conversations out
+ * as well (a copy of them elsewhere, e.g. a library merged here and then deleted from). Nothing of
+ * the old directory's data changes: a conversation still there stays. Returns how many were recorded;
+ * throws when the records here cannot be read or one cannot be written there (nothing more is written).
+ */
+export async function carryDeletionRecordsBack(input: { currentRootPath: string; previousRootPath: string; relocationId: string }): Promise<number> {
+  const current = path.resolve(input.currentRootPath);
+  const previous = path.resolve(input.previousRootPath);
+  const directory = path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: current }), RUNTIME_IDENTITY_ALIASES_DIRECTORY);
+  let names: string[];
+  try { names = (await fs.readdir(directory)).sort(); }
+  catch (error) { if (isMissing(error)) return 0; throw error; }
+  let recorded = 0;
+  for (const name of names) {
+    const match = name.endsWith('.json') ? IDENTITY_DIRECTORY_NAME.exec(name.slice(0, -'.json'.length)) : null;
+    if (!match) continue;
+    const identity = { dataSetId: match[1], rootInstanceId: match[2] };
+    for (const earlier of (await readRuntimeIdentityAliases(current, identity)).filter((entry) => entry.relocationId === input.relocationId)) {
+      // Only to leave out what is recorded there already: one more record of the same ids changes nothing.
+      const known = await readRuntimeDeletedConversations(previous, [earlier]).catch(() => new Set<string>());
+      const missing = [...await readRuntimeDeletedConversations(current, [identity])].filter((id) => !known.has(id)).sort();
+      if (missing.length === 0) continue;
+      await recordRuntimeDeletedConversations(previous, earlier, missing);
+      recorded += missing.length;
+    }
+  }
+  return recorded;
 }
 
 /** A data set's identity as merge records name it (a data set of the current epoch always has one). */

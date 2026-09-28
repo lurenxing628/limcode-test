@@ -793,6 +793,30 @@ test('迁移预检：旧目录的删除记录或身份延续读不出、已有 L
   assert.match(await problems(), /^旧目录里历史库的身份延续记录读不出（身份延续记录 .+ 的格式不认识）。.*这次不迁移。$/m);
 });
 
+test('回到旧目录：在新目录里删掉的、迁移带过来的库里的对话记到旧目录，旧目录里再合并含有它们的库时不加回来；旧目录里原有的对话不删，再带一次不重复记', async (t) => {
+  const fixture = await moving.createFixture(t);
+  const target = path.join(fixture.base, 'moved');
+  const plan = await moving.relocation.planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: target });
+  const { staged, result } = await moving.relocate(fixture, plan);
+  assert.deepEqual(result.others.migrated, [fixture.alpha.id]);
+  const current = await moving.selectedDataSet(target);
+  // In the new directory: the library carried along is merged into the current one there, then that
+  // conversation is deleted, and one from before the relocation as well.
+  assert.deepEqual(brief(await mergeIntoCurrent(target, current, explicit(fixture.alpha.id))).merged, [[fixture.alpha.id, 1, 0]]);
+  const authority = createVscodeRootAuthority({ runtimeDataRootPath: current.runtimeDataRootPath, configurationRootPath: target });
+  await deleteWithCommand(authority, target, 'conversation_alpha_1');
+  await deleteWithCommand(authority, target, 'conversation_current_1');
+  const back = () => moving.relocation.carryDeletionRecordsBack({ currentRootPath: target, previousRootPath: fixture.root, relocationId: staged.relocationId });
+  assert.equal(await back(), 2);
+  assert.deepEqual([...await records.readRuntimeDeletedConversations(fixture.root, [identityOf(fixture.current.binding)])].sort(),
+    ['conversation_alpha_1', 'conversation_current_1']);
+  assert.equal(await back(), 0, '再带一次不重复记');
+
+  assert.deepEqual(conversations(fixture), ['conversation_current_1', 'conversation_current_2'], '旧目录里原有的对话不删');
+  assert.deepEqual(brief(await batch(fixture, explicit(fixture.alpha.id))).merged, [[fixture.alpha.id, 0, 1]], '旧目录里合并 alpha：跳过在新目录里删掉的');
+  assert.deepEqual(conversations(fixture), ['conversation_current_1', 'conversation_current_2']);
+});
+
 test('迁移合并也按删除记录：新目录的当前库里删掉的对话不被迁过去，旧目录里的这个库因此保留、不列为可删', async (t) => {
   const fixture = await moving.createFixture(t, { withAlpha: false });
   const target = path.join(fixture.base, 'existing');

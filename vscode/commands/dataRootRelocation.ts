@@ -18,7 +18,7 @@ import {
   stageDataRootRelocation, inspectDataRootMovedNotice, DATA_ROOT_MOVED_NOTICE_FILE,
   sweepDataRootRelocationLeftovers, type DataRootCarriedWorkLeftItem, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
   type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation,
-  consentToDataRootMovedWork, describeEarlierMovedWork,
+  carryDeletionRecordsBack, consentToDataRootMovedWork, describeEarlierMovedWork,
 } from '../../backend/reliableKernel/runtimeDataRootRelocation';
 import { settleEarlierMovedWorkOffline } from '../../backend/application/reliableKernel/relocatedWorkOpening';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
@@ -475,6 +475,9 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     `当前目录：${current}`,
     '只切换数据目录，不复制也不合并：迁移之后在当前目录里新增或修改的对话不会带到旧目录，仍保存在当前目录；以后可以再迁移回来（会合并）。',
     ...(carried ? describeMovedWork(carried) : []),
+    ...(relocationId && await isAvailable(current, status)
+      ? ['在当前目录里删掉的、迁移时带过来的对话会记到旧目录的删除记录里：以后在旧目录里合并时不会把它们加回来；旧目录里原本就有的对话不会被删除。']
+      : []),
     '当前目录的迁移记录会失效：之后要删除旧目录，需要再迁移一次。',
     '所有 LimCode 窗口会重载一次；有任务的窗口会等任务结束，未发送的输入会保留。'
   ];
@@ -492,6 +495,12 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
   }
   const switchPointer = async (): Promise<void> => {
     if (await isAvailable(current, status)) {
+      // Deletions made here stay deletions there (for merges there; see carryDeletionRecordsBack).
+      if (relocationId) {
+        await carryDeletionRecordsBack({ currentRootPath: current, previousRootPath: previous, relocationId }).catch((error: unknown) => {
+          throw new Error(`没能把在当前目录里记下的删除一并记到旧目录（${describeError(error)}），所以没有切换`);
+        });
+      }
       await invalidateDataRootRelocationRecord(current).catch((error: unknown) => console.warn('[LimCode] 当前目录的迁移记录没能标记为失效。', error));
     }
     await pointTo(context, previous, current);
