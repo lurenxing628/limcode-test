@@ -20,7 +20,9 @@ export interface RuntimeCasVerificationCache extends RuntimeCasVerifier {
   close(): void;
   /**
    * How many verified identities this cache did not keep, since it was opened by anyone: its file
-   * could not be used and the ones kept in memory instead reached their bound (MEMORY_ENTRIES). Such
+   * could not be used and the ones kept in memory instead reached their bound (MEMORY_ENTRIES), or a
+   * write of pending entries failed (another window held the file longer than BUSY_MS, no room).
+   * What is still pending is written first, so the count is final for everything set so far. Such
    * objects are hashed again wherever they are checked next.
    */
   unrecorded(): number;
@@ -33,7 +35,8 @@ export interface RuntimeCasVerificationCache extends RuntimeCasVerifier {
  * differs in anything (any rewrite, copy or restore changes it) hashes the file in full, and a cache
  * that cannot be opened, read or written only costs hashing again. A damaged file is replaced; a
  * file that cannot be used at all keeps at most {@link MEMORY_ENTRIES} entries in memory, the rest
- * is counted (unrecorded) so that a caller relying on them can say so. Writes are batched; entries
+ * is counted (unrecorded) so that a caller relying on them can say so, as are the entries of a batched
+ * write that failed. Writes are batched; entries
  * not refreshed for {@link MAX_AGE_MS} are dropped.
  *
  * POSIX lock rule (see sqliteDatabaseFileGuard): the file carries one of LimCode's own database names,
@@ -81,7 +84,7 @@ interface SharedCache {
   /** Written or removed (null) since the last flush; the record (bounded) while the file cannot be used. */
   pending: Map<string, string | null>;
   opened: Promise<void>;
-  /** Identities not kept: the file could not be used and MEMORY_ENTRIES were kept already. */
+  /** Identities not kept: the file could not be used and MEMORY_ENTRIES were kept already, or their write failed. */
   unrecorded: number;
 }
 
@@ -115,6 +118,7 @@ function cacheHandle(file: string, shared: SharedCache): RuntimeCasVerificationC
       if (shared.pending.size >= FLUSH_AT) flush(shared);
     },
     unrecorded() {
+      flush(shared);
       return shared.unrecorded;
     },
     close() {
@@ -149,7 +153,8 @@ function flush(shared: SharedCache): void {
       }
     })();
   } catch {
-    // Busy (another window writes) or no room: these entries are verified again next time.
+    // Busy (another window writes) or no room: these entries are verified again next time, and counted.
+    for (const identity of shared.pending.values()) if (identity !== null) shared.unrecorded += 1;
   }
   shared.pending.clear();
 }
