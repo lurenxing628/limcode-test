@@ -16,7 +16,8 @@ const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/chatDraftPrefill.test.ts',
   'webview/tests/composerDraftPersistence.test.ts',
   'webview/tests/steeringReceipts.test.ts',
-  'webview/tests/terminationNotice.test.ts'
+  'webview/tests/terminationNotice.test.ts',
+  'webview/tests/reliableQueueOrdering.test.ts'
 ]);
 const CI_TEST_FILES = Object.freeze([
   'tests/bottomStickyScrollerScheduler.test.cjs',
@@ -95,7 +96,6 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/reliable-message-activity-row.test.mjs',
   'tests/reliable-kernel/function-call-preview-handoff.test.mjs',
   'tests/reliable-kernel/guidance-queue.test.mjs',
-  'tests/reliable-kernel/reliable-queue-ordering.test.mjs',
   'tests/reliable-kernel/compression-progress-ui.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/session-thinking-control.test.mjs',

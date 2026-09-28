@@ -3,7 +3,7 @@ import test from 'node:test';
 import {
   compareReliableQueueOrder,
   reliableQueueEffectivePosition
-} from '../../webview/src/domain/reliableQueueOrdering.ts';
+} from '../src/domain/reliableQueueOrdering.ts';
 
 function orderedIds(values) {
   return [...values].sort(compareReliableQueueOrder).map((value) => value.id);
