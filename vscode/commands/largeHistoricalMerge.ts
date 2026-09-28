@@ -7,20 +7,21 @@ import {
   EXCLUSIVE_MAINTENANCE_DEFAULTS, type ExclusiveMaintenanceBusy, type RuntimeExclusiveMaintenanceOutcome
 } from '../../backend/reliableKernel/runtimeExclusiveMaintenance';
 import {
-  largeMergeEngine, type LargeMergeDuration, type LargeMergeEngine, type LargeMergePreparation, type LargeMergeRunProgress,
-  type LargeMergeSourceOutcome
+  largeMergeEngine, type LargeMergeEngine, type LargeMergePreparation, type LargeMergeRunProgress, type LargeMergeSourceOutcome
 } from '../../backend/reliableKernel/runtimeLargeMergeEngine';
 import {
   claimLargeMergePrompt, createLargeMergeThrottle, describeLargeMergeSpaceShortage, estimateLargeMergeRemainingMs, formatLargeMergeRange,
   formatLargeMergeRowsWithUnit, keepLargeMergeResult, LARGE_MERGE_SESSION, largeMergeBatchResult, largeMergeCountdownText, largeMergeDetails,
-  largeMergeMinutes, largeMergeOperationKey, largeMergeProgressMessage, largeMergeStage, planLargeMergeSpace, sumLargeMergeDurations,
+  largeMergeOperationKey, largeMergeProgressMessage, largeMergeStage, planLargeMergeSpace, sumLargeMergeDurations,
   type LargeMergeDiskProber, type LargeMergeSpacePlan
 } from '../../backend/reliableKernel/runtimeLargeMergeSession';
 import { EXTENSION_BRAND } from '../../shared/extensionIdentity';
 import type { BridgeClientId, ExtensionToWebviewMessage } from '../../shared/protocol';
 import { MainPanel } from '../panels/MainPanel';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
-import { requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenanceWindowState } from '../runtimeExclusiveMaintenance';
+import {
+  exclusiveMaintenanceRefusal, requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenanceWindowState
+} from '../runtimeExclusiveMaintenance';
 
 /**
  * 大库会话: the sources above the online merge limit that the online batch left to it (those above
@@ -29,8 +30,10 @@ import { requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenan
  *
  * Automatic, after the startup batch: one window of the configuration root (prompt record by
  * vscode.env.sessionId) prepares the sources in the background while it stays usable, checks the
- * disk space, then counts down 60 seconds in a cancellable notification (“取消” only moves it to the
- * next startup, nothing is recorded). Manual, from 历史与存储管理: a modal confirmation first. Then
+ * disk space and whether the coordination would be refused before asking anyone (cooldown,
+ * backoff: then it says when it can be tried again instead), then counts down 60 seconds in a
+ * cancellable notification (“取消” only moves it to the next startup, nothing is recorded).
+ * Manual, from 历史与存储管理: the cooldown checked and a modal confirmation first. Then
  * both ask every window to yield (runWithExclusiveMaintenance, historical-merge, keyed by the target
  * and the sources' fingerprints; waiting for busy windows outside the locks as a migration does),
  * and in the exclusive phase this window closes its Runtime, merges source after source (a cancel
@@ -38,6 +41,9 @@ import { requesterWorkBusy, runWithExclusiveMaintenance, type ExclusiveMaintenan
  */
 
 const ACTIVITY = '合并较大的旧聊天记录';
+const OPERATION = 'historical-merge';
+/** The engine's code of a session stopped by too little disk space (at its start, or part way). */
+const DISK_FULL = 'runtime-data-set-merge-disk-full';
 /** After asking the Webviews to save unsent input, closing the Runtime waits this long for the writes to land. */
 const DRAFT_SAVE_SETTLE_MS = 250;
 /** Startup-notice cause of the session as a whole (disk space, a coordination that did not happen). */
@@ -114,6 +120,8 @@ export async function offerLargeHistoricalMerge(
     const { hostBootId } = host.exclusiveMaintenanceTarget();
     // Only one window of this configuration root prepares and prompts, once per VS Code session.
     if (!await claimLargeMergePrompt(paths, { sessionId: options.sessionId ?? vscode.env.sessionId, hostBootId })) return;
+    // Held off by the cooldown after another coordination: not even prepared now.
+    if (await refusedBeforeAsking(host, options, stillCurrent)) return;
     try {
       preparation = await vscode.window.withProgress({ location: vscode.ProgressLocation.Window, title: `正在准备${ACTIVITY}` },
         (progress) => prepare(context, host, engine, candidateIds, false, stillCurrent, (message) => progress?.report({ message })));
@@ -127,7 +135,7 @@ export async function offerLargeHistoricalMerge(
     await options.report(settledReport(preparation, false), false);
     if (preparation.sources.length === 0) return;
     // Not enough room: no prompt, only how much is missing.
-    const space = await planLargeMergeSpace(preparation.space, preparation.sources, options.probeDisk);
+    const space = await planLargeMergeSpace(preparation.space, options.probeDisk);
     if (!space.ok) {
       const message = shortageText(preparation, space);
       if (await fresh(options, 'runtime-data-set-merge-large-session-disk-full', message) && stillCurrent()) {
@@ -135,6 +143,10 @@ export async function offerLargeHistoricalMerge(
       }
       return;
     }
+    // The coordination would be refused before asking anyone (cooldown, this work's backoff): no
+    // countdown that ends in “没有合并”; when it can be tried again is said instead.
+    const operationKey = largeMergeOperationKey(host.product.application.database.binding, preparation.sources);
+    if (await refusedBeforeAsking(host, options, stillCurrent, operationKey)) return;
     const answer = await countdown(preparation, options.countdownSeconds ?? LARGE_MERGE_SESSION.countdownSeconds, stillCurrent);
     if (answer === 'cancelled') {
       // Only moved to the next startup: nothing is recorded, and there is no “never”.
@@ -178,17 +190,26 @@ export async function startLargeHistoricalMerge(
   sessionRunning = true;
   let preparation: LargeMergePreparation | undefined;
   try {
+    // Held off by the cooldown after another window's coordination: said now, before anything is asked or prepared.
+    const { paths: targetPaths, hostBootId } = host.exclusiveMaintenanceTarget();
+    const windowState = options.windowState ?? (context as Partial<vscode.ExtensionContext>).workspaceState;
+    const refusal = await exclusiveMaintenanceRefusal(targetPaths, {
+      operation: OPERATION, ignoreBackoff: true, requesterHostBootId: hostBootId, ...(windowState ? { windowState } : {})
+    }).catch(() => undefined);
+    if (refusal) {
+      await vscode.window.showWarningMessage(`现在不能${ACTIVITY}：${withoutFullStop(refusal.reason)}。已有数据未被修改。`);
+      return;
+    }
     const waiting = await engine.waiting(paths).catch(() => []);
     const candidateIds = options.candidateIds ?? waiting.map((source) => source.candidateId);
     if (candidateIds.length === 0) {
       await vscode.window.showInformationMessage(`现在没有等待合并的较大的旧聊天记录。`);
       return;
     }
+    // Sizes the batch measured; how long it takes is known only once prepared (never made up here).
     const known = waiting.filter((source) => candidateIds.includes(source.candidateId));
-    const estimate = known.length === candidateIds.length
-      ? { rows: known.reduce((sum, source) => sum + source.rows, 0), duration: sumLargeMergeDurations(known.map((source) => source.duration)) }
-      : undefined;
-    if (!await confirm(candidateIds.length, estimate)) return;
+    const rows = known.length === candidateIds.length ? known.reduce((sum, source) => sum + source.rows, 0) : undefined;
+    if (!await confirm(candidateIds.length, rows)) return;
     try {
       preparation = await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification, title: `正在准备${ACTIVITY}（窗口照常可用）`, cancellable: true
@@ -202,7 +223,7 @@ export async function startLargeHistoricalMerge(
     if (!preparation || !stillCurrent()) return;
     await options.report(settledReport(preparation, true), true);
     if (preparation.sources.length === 0) return;
-    const space = await planLargeMergeSpace(preparation.space, preparation.sources, options.probeDisk);
+    const space = await planLargeMergeSpace(preparation.space, options.probeDisk);
     if (!space.ok) {
       await vscode.window.showErrorMessage(`${ACTIVITY}没有开始`, {
         modal: true, detail: `${shortageText(preparation, space)}腾出空间后可以再试；已有数据未被修改。`
@@ -249,11 +270,17 @@ async function prepare(
   const cancellation = token?.onCancellationRequested?.(() => abort.abort());
   const watch = setInterval(() => { if (!stillCurrent()) abort.abort(); }, LARGE_MERGE_SESSION.progressIntervalMs);
   try {
-    return await runRuntimeDataSetUpgrade(context, () => engine.prepare({
+    const prepared = await runRuntimeDataSetUpgrade(context, () => engine.prepare({
       paths: { globalStoragePath: host.dataRootPath() },
       target: { configurationRootPath: host.dataRootPath(), database: host.product.application.database },
       candidateIds, requested, signal: abort.signal, onProgress
     }));
+    // Stopped part way (“取消”, or the window closing): what was prepared so far is let go of.
+    if (abort.signal.aborted) {
+      await release(engine, prepared);
+      return undefined;
+    }
+    return prepared;
   } catch (error) {
     if (abort.signal.aborted) return undefined;
     throw error;
@@ -269,6 +296,26 @@ function settledReport(preparation: LargeMergePreparation, requested: boolean): 
     issues.map((issue) => (requested ? { ...issue, requested: true } : { ...issue }));
   const { merged, deferred, blocked, failures } = preparation.report;
   return { merged: [...merged], deferred: mark(deferred), blocked: mark(blocked), failures: mark(failures), pendingSources: 0, stopped: false };
+}
+
+/**
+ * The automatic session: would its coordination be refused before any window is asked (the cooldown
+ * after another coordination; with the key known, this work's backoff or a key blocked for automatic
+ * calls)? Then it is told once per cause, with when it can be tried again, and nothing goes on.
+ */
+async function refusedBeforeAsking(
+  host: LargeHistoricalMergeHost,
+  options: LargeHistoricalMergeOptions,
+  stillCurrent: () => boolean,
+  operationKey?: string
+): Promise<boolean> {
+  const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
+  const refusal = await exclusiveMaintenanceRefusal(paths, {
+    operation: OPERATION, ...(operationKey !== undefined ? { operationKey } : {}), ignoreBackoff: false, requesterHostBootId: hostBootId
+  }).catch(() => undefined);
+  if (!refusal) return false;
+  await tellNotRun(options, false, stillCurrent, refusal.state, refusal.reason);
+  return true;
 }
 
 async function release(engine: LargeMergeEngine, preparation: LargeMergePreparation): Promise<void> {
@@ -306,15 +353,15 @@ async function countdown(
   });
 }
 
-async function confirm(sources: number, estimate: { rows: number; duration: LargeMergeDuration } | undefined): Promise<boolean> {
+/** Before anything is prepared: the size the batch measured, and that the duration comes with the preparation. */
+async function confirm(sources: number, rows: number | undefined): Promise<boolean> {
   const busyMinutes = Math.round(EXCLUSIVE_MAINTENANCE_DEFAULTS.busyWaitTimeoutMs / 60_000);
-  const size = estimate
-    ? `约 ${formatLargeMergeRowsWithUnit(estimate.rows)}记录，合并预计 ${formatLargeMergeRange(estimate.duration)}。\n\n`
-    : '';
+  const size = rows !== undefined ? `约 ${formatLargeMergeRowsWithUnit(rows)}记录；` : '';
   const choice = await vscode.window.showWarningMessage(
-    `${ACTIVITY}（${sources} 份${estimate ? `，约 ${largeMergeMinutes(estimate.duration.expectedMs)} 分钟` : ''}）？`, {
+    `${ACTIVITY}（${sources} 份${rows !== undefined ? `，约 ${formatLargeMergeRowsWithUnit(rows)}记录` : ''}）？`, {
       modal: true,
-      detail: `${size}先在后台准备（窗口照常可用，可以取消），再等本窗口和其它 LimCode 窗口的任务结束（最多约 ${busyMinutes} 分钟），`
+      detail: `${size}预计要多久，准备好之后在进度里给出。\n\n`
+        + `先在后台准备（窗口照常可用，可以取消），再等本窗口和其它 LimCode 窗口的任务结束（最多约 ${busyMinutes} 分钟），`
         + '然后所有 LimCode 窗口暂停：其它窗口重载并显示进度，本窗口显示合并进度、完成后重载，全部自动恢复，未发送的输入会保留。'
         + '合并时可以点“取消”：只撤回正在合并的那一份，已经合并完的保留，其余的以后启动时再合并。'
         + '\n\n原库保留；原库里中断的任务按“中止”收尾、排队未发送的消息会被取消，都不会在当前库被继续执行；'
@@ -349,11 +396,12 @@ async function runSession(
   // Read while the Runtime is open (the exclusive phase closes it).
   const binding = host.product.application.database.binding;
   const windowState = options.windowState ?? (context as Partial<vscode.ExtensionContext>).workspaceState;
-  const space = await planLargeMergeSpace(preparation.space, preparation.sources, options.probeDisk);
+  const space = await planLargeMergeSpace(preparation.space, options.probeDisk);
   if (!space.ok) {
     await tellNotRun(options, requested, stillCurrent, 'disk-full', shortageText(preparation, space));
     return;
   }
+  const duration = sumLargeMergeDurations(preparation.sources.map((source) => source.duration));
   const ownWork = requesterWorkBusy(host);
   let announced = false;
   const busyMinutes = Math.round((options.coordination?.busyWaitTimeoutMs ?? EXCLUSIVE_MAINTENANCE_DEFAULTS.busyWaitTimeoutMs) / 60_000);
@@ -369,10 +417,11 @@ async function runSession(
   let outcome: RuntimeExclusiveMaintenanceOutcome<LargeMergeSourceOutcome[]>;
   try {
     outcome = await runWithExclusiveMaintenance(targetPaths, {
-      operation: 'historical-merge',
+      operation: OPERATION,
       operationKey: largeMergeOperationKey(binding, preparation.sources),
       message: `为${ACTIVITY}`,
-      waitingTitle: `正在等待 LimCode 窗口空闲后${ACTIVITY}`,
+      // Prepared by now: how long the merge itself is expected to take.
+      waitingTitle: `正在等待 LimCode 窗口空闲后${ACTIVITY}（预计 ${formatLargeMergeRange(duration)}）`,
       configurationRootPath,
       requesterHostBootId: hostBootId,
       requesterBusy,
@@ -420,6 +469,14 @@ async function runSession(
   }
   if (outcome.state === 'completed') {
     for (const item of outcome.result) console.info(`[LimCode] ${ACTIVITY}：${item.candidateId} ${item.state}`);
+    // Too little disk space before anything was merged (the engine's own check, or the first
+    // source rolled back): said as such once this window opened again, not as one failure per source.
+    const short = outcome.result.every((item) => item.state === 'deferred' && item.code === DISK_FULL) ? outcome.result[0] : undefined;
+    if (short && short.state === 'deferred') {
+      await keep(windowState, { configurationRootPath, requested, details: [], notStarted: withoutFullStop(short.message) });
+      await reloadWindow();
+      return;
+    }
     await keep(windowState, {
       configurationRootPath, requested,
       report: largeMergeBatchResult(outcome.result, requested),
@@ -462,7 +519,7 @@ async function exclusivePhase(
 ): Promise<LargeMergeSourceOutcome[]> {
   const { options, session } = input;
   // The disk may have filled up while windows were asked: checked once more, before anything is closed.
-  const space = await planLargeMergeSpace(preparation.space, preparation.sources, options.probeDisk);
+  const space = await planLargeMergeSpace(preparation.space, options.probeDisk);
   if (!space.ok) {
     session.spaceShort = true;
     throw new Error(shortageText(preparation, space));
@@ -481,7 +538,7 @@ async function exclusivePhase(
   // Windows waiting to open say by when it should be done, and warn only well past that.
   input.reportExpectedEnd(new Date(startedAt + duration.maxMs).toISOString());
   const first: LargeMergeRunProgress = {
-    index: 0, total: preparation.sources.length, candidateId: preparation.sources[0]?.candidateId ?? '', rowsWritten: 0, rowsTotal
+    index: 0, total: preparation.sources.length, candidateId: preparation.sources[0]?.candidateId ?? '', rowsDone: 0, rowsTotal
   };
   let stage = largeMergeStage(first);
   input.reportStage(stage);
@@ -504,8 +561,9 @@ async function exclusivePhase(
             stage = next;
             input.reportStage(next);
           }
+          // The engine's own estimate from this session's rate, when it gives one.
           notify.push(largeMergeProgressMessage(current, current.remainingMs ?? estimateLargeMergeRemainingMs({
-            elapsedMs: Date.now() - startedAt, rowsWritten: current.rowsWritten, rowsTotal: current.rowsTotal, expectedMs: duration.expectedMs
+            elapsedMs: Date.now() - startedAt, rowsDone: current.rowsDone, rowsTotal: current.rowsTotal, expectedMs: duration.expectedMs
           })));
         }
       }));

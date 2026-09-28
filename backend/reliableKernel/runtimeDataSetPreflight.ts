@@ -67,6 +67,16 @@ export async function summarizeRuntimeDataSet(candidate: VscodeRuntimeDataSetCan
 
 const summaries = new Map<string, { key: string; summary: RuntimeDataSetSummary }>();
 
+/**
+ * What summarizeRuntimeDataSet last read for this data set in this process (a picker opened it),
+ * never read here: for a label only, so a later change of its files does not drop it.
+ */
+export function peekRuntimeDataSetSummary(candidate: VscodeRuntimeDataSetCandidate): RuntimeDataSetSummary | undefined {
+  const known = summaries.get(candidate.runtimeDataRootPath);
+  if (!known || !candidate.dataSetId) return undefined;
+  return known.key.startsWith(`${candidate.dataSetId}\0${candidate.rootInstanceId ?? ''}\0`) ? known.summary : undefined;
+}
+
 async function pathExists(file: string): Promise<boolean> {
   try {
     await fs.lstat(file);

@@ -927,7 +927,8 @@ test('多进程（大库会话，手动开始）：确认后其它窗口只收�
   await windows.waitForEvent('W', 'opened', 30_000, 2);
   await windows.stop();
   const events = windows.events();
-  assert.ok(events.some((item) => item.name === 'R' && item.event === 'warning' && /^合并较大的旧聊天记录（1 份，约 1 分钟）？$/.test(item.message)), 'confirmed first');
+  // Confirmed first, with the size the batch measured (the duration comes with the preparation).
+  assert.ok(events.some((item) => item.name === 'R' && item.event === 'warning' && /^合并较大的旧聊天记录（1 份，约 8 万条记录）？$/.test(item.message)), 'confirmed first');
   assert.ok(events.some((item) => item.name === 'W' && item.event === 'notice' && item.message === '为合并较大的旧聊天记录，本窗口将重载；未发送的输入会保留。'));
   assert.equal(events.some((item) => item.name === 'W' && item.event === 'progress' && item.countdown), false, 'no countdown in other windows');
   assert.deepEqual(windows.reloads(), { W: 1, R: 1 });

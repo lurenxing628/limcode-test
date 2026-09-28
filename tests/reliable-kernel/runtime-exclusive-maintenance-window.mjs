@@ -256,13 +256,15 @@ async function runLargeSession() {
     duration: { expectedMs: source.mergeMs, minMs: Math.round(source.mergeMs * 0.8), maxMs: Math.round(source.mergeMs * 1.6) }
   }));
   const engine = {
-    waiting: async () => sources.map(({ candidateId, rows, duration }) => ({ candidateId, rows, duration })),
+    waiting: async () => sources.map(({ candidateId, rows }) => ({ candidateId, rows, bytes: rows * 100 })),
+    noteBatch: () => {},
     prepare: async ({ candidateIds }) => {
       await emit('engine-prepare', { candidateIds });
       return {
         sources: sources.filter((source) => candidateIds.includes(source.candidateId)),
         report: { merged: [], deferred: [], blocked: [], failures: [] },
-        space: { targetDirectory: paths.dataRootPath, temporaryDirectory: root, targetDatabaseBytes: 1024, targetBackupPending: false },
+        // The engine's own figures: the sources, the largest one's WAL peak, 64 MiB; one private copy in the temporary directory.
+        space: { targetDirectory: paths.dataRootPath, targetBytes: 70 * 1024 * 1024, temporaryDirectory: root, temporaryBytes: 1024 * 1024 },
         engineState: 'fake'
       };
     },
@@ -279,7 +281,10 @@ async function runLargeSession() {
         for (let step = 1; step <= steps; step += 1) {
           if (signal.aborted) break;
           await new Promise((resolve) => setTimeout(resolve, 20));
-          onProgress({ index, total: preparation.sources.length, candidateId: source.candidateId, rowsWritten: rowsWritten + Math.round((source.rows * step) / steps), rowsTotal });
+          onProgress({
+            index, total: preparation.sources.length, candidateId: source.candidateId, stage: 'merging',
+            rowsDone: rowsWritten + Math.round((source.rows * step) / steps), rowsTotal
+          });
         }
         rowsWritten += source.rows;
         outcomes.push({ candidateId: source.candidateId, state: 'merged', result: {

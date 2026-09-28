@@ -3,7 +3,6 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { classifyRecordedProcess, ownProcessStartIdentity, type RecordedProcessClassifier } from './runtimeClaimPrimitives';
-import { CLUSTER_SIZES, NO_HARD_LINK_FILESYSTEMS } from './runtimeDataRootRelocation';
 import type { RuntimeDataSetMergeBatchResult, RuntimeDataSetMergeIssue } from './runtimeDataSetMerge';
 import { withRuntimeDataRootAdmission } from './runtimeHostControl';
 import type {
@@ -13,7 +12,7 @@ import { resolveVscodeRuntimeMergeLedgerRoot } from './vscodeRootAuthority';
 
 /**
  * The large merge session (vscode/commands/largeHistoricalMerge.ts) apart from VS Code: its bounds,
- * the coordination key, the disk space it still needs, the one-window prompt record, the progress
+ * the coordination key, the disk space it needs, the one-window prompt record, the progress
  * throttle and wording, and the result a window keeps across its reload.
  */
 export const LARGE_MERGE_SESSION = Object.freeze({
@@ -23,18 +22,14 @@ export const LARGE_MERGE_SESSION = Object.freeze({
   progressIntervalMs: 500,
   /** Windows waiting to open repaint only when the source changes or the progress grew by this much. */
   stageStepPercent: 5,
-  /** WAL of one source's transaction, relative to that source's database (it is checkpointed after each source). */
-  walFactor: 1.5,
-  /** Free space kept beyond the estimate on every disk involved (as the relocation and the merge backups do). */
+  /**
+   * Free space kept beyond the private copy on a temporary directory of its own disk (the engine's
+   * figure for the target's disk has the same margin in it).
+   */
   freeSpaceMarginBytes: 64 * 1024 * 1024,
   /** A result kept across the requesting window's reload is shown when the window opened again within this. */
   resultTtlMs: 10 * 60_000
 });
-
-/** The deferral of an above-online-limit source into a pending large merge session (the batch's coordination hook). */
-export const LARGE_MERGE_SESSION_DEFERRAL_STATE = 'large-session';
-/** The online batch's code for that deferral (runtime-data-set-merge-exclusive-<state>). */
-export const LARGE_MERGE_SESSION_DEFERRAL_CODE = `runtime-data-set-merge-exclusive-${LARGE_MERGE_SESSION_DEFERRAL_STATE}`;
 
 // ---------------------------------------------------------------------------------------------
 // Coordination key
@@ -62,10 +57,6 @@ export function largeMergeOperationKey(
 export interface LargeMergeDiskProbe {
   device?: number;
   freeBytes?: number;
-  /** Allocation unit (statfs bsize). */
-  blockSize?: number;
-  /** statfs filesystem type (Linux magic number). */
-  type?: number;
 }
 
 export type LargeMergeDiskProber = (directory: string) => Promise<LargeMergeDiskProbe>;
@@ -86,59 +77,44 @@ export interface LargeMergeSpacePlan {
 }
 
 /**
- * Space per disk for the rest of the session, checked before the prompt and again (fs.statfs) right
- * before the exclusive phase; a disk used for several purposes is checked once for their sum:
- * - target: every source database (the target grows by at most that), the largest one once more
- *   times walFactor (one source's WAL before its checkpoint), the target database when its online
- *   backup is still to be taken, and CAS objects still to be copied — only across disks or onto a
- *   filesystem without hard links (FAT/exFAT), measured at its cluster size (CLUSTER_SIZES);
- * - temporary directory: one private copy of the largest source;
- * each with LARGE_MERGE_SESSION.freeSpaceMarginBytes to spare.
+ * Space per disk for the session, checked before the prompt, before the coordination and again
+ * (fs.statfs) right before the exclusive phase closes this window's Runtime, with the figures the
+ * engine's own check at the session's start uses (LargeMergeSpaceFacts): the target's disk needs
+ * targetBytes (its margin included), the temporary directory one private copy of the largest source
+ * (temporaryBytes) plus LARGE_MERGE_SESSION.freeSpaceMarginBytes when it is another disk. A disk used
+ * for both is checked once for their sum.
  */
 export async function planLargeMergeSpace(
   facts: LargeMergeSpaceFacts,
-  sources: ReadonlyArray<Pick<LargeMergePreparedSource, 'databaseBytes'>>,
   probe: LargeMergeDiskProber = probeLargeMergeDisk
 ): Promise<LargeMergeSpacePlan> {
-  const margin = LARGE_MERGE_SESSION.freeSpaceMarginBytes;
-  const sizes = sources.map((source) => Math.max(0, source.databaseBytes));
-  const largest = Math.max(0, ...sizes);
   const target = await probe(facts.targetDirectory);
   const temporary = await probe(facts.temporaryDirectory);
-  let targetBytes = sizes.reduce((sum, size) => sum + size, 0) + Math.ceil(largest * LARGE_MERGE_SESSION.walFactor)
-    + (facts.targetBackupPending ? Math.max(0, facts.targetDatabaseBytes) : 0);
-  if (facts.pendingCas && facts.pendingCas.bytes > 0) {
-    const casDisk = await probe(facts.pendingCas.sourceDirectory);
-    const linked = target.device !== undefined && target.device === casDisk.device
-      && !(process.platform === 'linux' && target.type !== undefined && NO_HARD_LINK_FILESYSTEMS.has(target.type));
-    if (!linked) {
-      const index = target.blockSize === undefined ? 0 : CLUSTER_SIZES.findIndex((cluster) => cluster >= target.blockSize!);
-      const cluster = index === -1 ? CLUSTER_SIZES.length - 1 : index;
-      targetBytes += Math.max(facts.pendingCas.bytes, facts.pendingCas.clusterBytes[cluster] ?? 0);
-    }
-  }
   const needs = [
-    { probe: target, label: '当前历史库所在的盘', path: facts.targetDirectory, bytes: targetBytes },
-    { probe: temporary, label: '临时目录', path: facts.temporaryDirectory, bytes: largest }
+    { probe: target, label: '当前历史库所在的盘', path: facts.targetDirectory, bytes: Math.max(0, facts.targetBytes), margin: false },
+    { probe: temporary, label: '临时目录', path: facts.temporaryDirectory, bytes: Math.max(0, facts.temporaryBytes), margin: true }
   ];
-  const grouped = new Map<string, LargeMergeDiskNeed>();
+  const grouped = new Map<string, LargeMergeDiskNeed & { withMargin: boolean }>();
   for (const need of needs) {
     const key = need.probe.device === undefined ? `path:${need.path}` : `device:${need.probe.device}`;
     const existing = grouped.get(key);
     if (existing) {
       existing.requiredBytes += need.bytes;
       existing.label = `${existing.label}、${need.label}`;
+      // The target's figure already keeps a margin on this disk.
+      existing.withMargin = existing.withMargin && need.margin;
       continue;
     }
     grouped.set(key, {
-      label: need.label, path: need.path, requiredBytes: need.bytes + margin,
+      label: need.label, path: need.path, requiredBytes: need.bytes, withMargin: need.margin,
       ...(need.probe.freeBytes !== undefined ? { freeBytes: need.probe.freeBytes } : {}),
       missingBytes: 0
     });
   }
-  const disks = [...grouped.values()].map((disk) => ({
-    ...disk, missingBytes: disk.freeBytes === undefined ? 0 : Math.max(0, disk.requiredBytes - disk.freeBytes)
-  }));
+  const disks = [...grouped.values()].map(({ withMargin, ...disk }) => {
+    const requiredBytes = disk.requiredBytes + (withMargin ? LARGE_MERGE_SESSION.freeSpaceMarginBytes : 0);
+    return { ...disk, requiredBytes, missingBytes: disk.freeBytes === undefined ? 0 : Math.max(0, requiredBytes - disk.freeBytes) };
+  });
   return { ok: disks.every((disk) => disk.missingBytes === 0), disks };
 }
 
@@ -156,10 +132,7 @@ export async function probeLargeMergeDisk(directory: string): Promise<LargeMerge
     const info = await fs.stat(current).catch(() => undefined);
     if (info) {
       const stats = await fs.statfs(current).catch(() => undefined);
-      return {
-        device: info.dev,
-        ...(stats ? { freeBytes: Number(stats.bavail) * Number(stats.bsize), blockSize: Number(stats.bsize), type: Number(stats.type) } : {})
-      };
+      return { device: info.dev, ...(stats ? { freeBytes: Number(stats.bavail) * Number(stats.bsize) } : {}) };
     }
     const parent = path.dirname(current);
     if (parent === current) return {};
@@ -324,28 +297,36 @@ export function createLargeMergeThrottle<T>(
  * changes or the progress grew by a step.
  */
 export function largeMergeStage(progress: LargeMergeRunProgress, stepPercent: number = LARGE_MERGE_SESSION.stageStepPercent): string {
-  const share = progress.rowsTotal > 0 ? Math.min(1, Math.max(0, progress.rowsWritten / progress.rowsTotal)) : 0;
+  const share = progress.rowsTotal > 0 ? Math.min(1, Math.max(0, progress.rowsDone / progress.rowsTotal)) : 0;
   const percent = Math.floor((share * 100) / stepPercent) * stepPercent;
   return `第 ${progress.index + 1}/${progress.total} 份，已完成 ${percent}%`;
 }
 
 /**
- * How long the rest takes: the preparation's estimate while few rows were written (under 5% or in
- * the first 10 seconds), then by the rate so far.
+ * How long the rest takes when the engine did not say: the preparation's estimate while few rows
+ * were handled (under 5% or in the first 10 seconds), then by the rate so far.
  */
 export function estimateLargeMergeRemainingMs(input: {
-  elapsedMs: number; rowsWritten: number; rowsTotal: number; expectedMs: number;
+  elapsedMs: number; rowsDone: number; rowsTotal: number; expectedMs: number;
 }): number {
-  const { elapsedMs, rowsWritten, rowsTotal, expectedMs } = input;
-  const left = Math.max(0, rowsTotal - rowsWritten);
-  if (rowsWritten <= 0 || rowsWritten < rowsTotal * 0.05 || elapsedMs < 10_000) return Math.max(0, expectedMs - elapsedMs);
-  return (elapsedMs * left) / rowsWritten;
+  const { elapsedMs, rowsDone, rowsTotal, expectedMs } = input;
+  const left = Math.max(0, rowsTotal - rowsDone);
+  if (rowsDone <= 0 || rowsDone < rowsTotal * 0.05 || elapsedMs < 10_000) return Math.max(0, expectedMs - elapsedMs);
+  return (elapsedMs * left) / rowsDone;
 }
 
-/** “正在合并较大的旧聊天记录 2/4（已写入 12 万 / 38 万条，约还需 3 分钟）”. */
+/**
+ * “正在合并较大的旧聊天记录 2/4（已处理 12 万 / 38 万条，约还需 3 分钟）”: rows the engine compared
+ * and wrote or found present already, not only the ones written.
+ */
 export function largeMergeProgressMessage(progress: LargeMergeRunProgress, remainingMs: number): string {
   return `正在合并较大的旧聊天记录 ${progress.index + 1}/${progress.total}`
-    + `（已写入 ${formatLargeMergeRows(progress.rowsWritten)} / ${formatLargeMergeRowsWithUnit(progress.rowsTotal)}，约还需${remainingMs < 60_000 ? '' : ' '}${formatLargeMergeRemaining(remainingMs)}）`;
+    + `（已处理 ${formatLargeMergeRows(progress.rowsDone)} / ${formatLargeMergeRowsWithUnit(progress.rowsTotal)}，约还需${remainingMs < 60_000 ? '' : ' '}${formatLargeMergeRemaining(remainingMs)}）`;
+}
+
+/** A source (or several) waiting for the session, before it was prepared: its size, never a made-up duration. */
+export function largeMergeWaitingText(rows: number): string {
+  return `约 ${formatLargeMergeRowsWithUnit(rows)}记录，准备后给出预计时长`;
 }
 
 /** “12 万”, “8000”. */
@@ -418,15 +399,18 @@ export function largeMergeBatchResult(outcomes: readonly LargeMergeSourceOutcome
   return report;
 }
 
-/** One line per prepared source for “查看详情”: how many conversations it added, or why not. */
+/**
+ * One line per prepared source for “查看详情”: how many conversations it added, or why not. Named as
+ * the candidate list names it (label), with where it is and its size; the id only when unnamed.
+ */
 export function largeMergeDetails(
-  sources: ReadonlyArray<Pick<LargeMergePreparedSource, 'candidateId' | 'runtimeDataRootPath' | 'rows'>>,
+  sources: ReadonlyArray<Pick<LargeMergePreparedSource, 'candidateId' | 'label' | 'runtimeDataRootPath' | 'rows'>>,
   outcomes: readonly LargeMergeSourceOutcome[]
 ): string[] {
   return sources.map((source) => {
     const outcome = outcomes.find((item) => item.candidateId === source.candidateId);
     const where = source.runtimeDataRootPath ? `${source.runtimeDataRootPath}，` : '';
-    const name = `${source.candidateId}（${where}约 ${formatLargeMergeRowsWithUnit(source.rows)}记录）`;
+    const name = `${source.label ?? source.candidateId}（${where}约 ${formatLargeMergeRowsWithUnit(source.rows)}记录）`;
     if (!outcome) return `${name}：这次没有合并，以后启动时会再合并。`;
     if (outcome.state === 'merged' && outcome.result.alreadyMerged) return `${name}：已合并到当前历史库，没有新内容。`;
     if (outcome.state === 'merged') {
@@ -455,6 +439,8 @@ export interface LargeMergeKeptResult {
   details: string[];
   /** The session ended with an unexpected error after this window's Runtime closed. */
   error?: string;
+  /** Nothing was merged because the engine's check at the session's start found too little disk space. */
+  notStarted?: string;
 }
 
 export async function keepLargeMergeResult(state: LargeMergeResultState, result: LargeMergeKeptResult, now: number = Date.now()): Promise<void> {
@@ -475,6 +461,7 @@ export function takeLargeMergeResult(state: LargeMergeResultState, openedAt: num
   return {
     configurationRootPath: kept.configurationRootPath, requested: kept.requested, details: kept.details.filter((line) => typeof line === 'string'),
     ...(kept.report ? { report: kept.report } : {}),
-    ...(typeof kept.error === 'string' ? { error: kept.error } : {})
+    ...(typeof kept.error === 'string' ? { error: kept.error } : {}),
+    ...(typeof kept.notStarted === 'string' ? { notStarted: kept.notStarted } : {})
   };
 }
