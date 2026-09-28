@@ -767,7 +767,7 @@ function mergedLog(merged: RuntimeDataSetMergeResult): string {
     : `已合并旧聊天记录 ${name}：新增 ${merged.insertedRows} 行；合并前备份：${merged.backupPath ?? '（确认上次已提交的合并）'}`)
     + (merged.finalized ? `；收尾 ${merged.finalized.turns} 个中断任务，另有 ${merged.finalized.intents} 条排队未发送的消息已取消，`
       + `收尾前来源备份：${merged.finalized.sourceBackupPath}` : '')
-    + (merged.skippedConversations ? `；${merged.skippedConversations} 个在当前库删除过的对话没有再合并` : '');
+    + (merged.skippedConversations ? `；${merged.skippedConversations} 个你删除过的对话没有再合并` : '');
 }
 
 /**
@@ -788,7 +788,7 @@ function foreignMergedNote(results: readonly RuntimeDataSetMergeResult[]): strin
  * deleted in the current data set: backup cleanup keeps it (it holds conversations found nowhere else).
  */
 export function keptForSkippedTip(skipped: number): string {
-  return `合并时跳过了 ${skipped} 个你在当前库删掉的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`;
+  return `合并时跳过了 ${skipped} 个你删除过的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`;
 }
 
 /** What merged sources also did: work closed before merging, and conversations deliberately left out. */
@@ -799,7 +799,7 @@ function mergedNotes(results: readonly RuntimeDataSetMergeResult[]): string {
   const skipped = total(result => result.skippedConversations ?? 0);
   return (turns ? `其中 ${turns} 个中断的任务已按“中止”收尾，不会被继续执行。` : '')
     + (intents ? `另有 ${intents} 条排队未发送的消息已取消。` : '')
-    + (skipped ? `有 ${skipped} 个对话你在当前库删除过，这次没有合并回来。` : '');
+    + (skipped ? `有 ${skipped} 个对话你删除过，这次没有合并回来。` : '');
 }
 
 /** Runs after current Runtime startup. Historical upgrades never register or recover old tasks. */

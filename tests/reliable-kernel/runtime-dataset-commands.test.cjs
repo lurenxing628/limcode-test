@@ -962,11 +962,11 @@ test('盲审 merge #1：通知与日志报出以前合并进来、之后在当�
   const f = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({ skippedConversations: 3 })] }) });
   await f.mergeHistoricalDataSetsInBackground(f.context, mergeHost(), () => true);
   assert.deepEqual(f.calls.filter(call => call[0] === 'info').map(call => call[1]), [
-    '已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话），可直接在侧栏继续。有 3 个对话你在当前库删除过，这次没有合并回来。'
+    '已把 1 份旧聊天记录合并到当前历史库（新增 1 个对话），可直接在侧栏继续。有 3 个对话你删除过，这次没有合并回来。'
     + '原库和合并前备份都已保留。'
   ]);
   assert.deepEqual(f.logs.filter(([level]) => level === 'info').map(([, line]) => line), [
-    '[LimCode] 已合并旧聊天记录 workspace:old：新增 12 行；合并前备份：/fixture/backup；3 个在当前库删除过的对话没有再合并'
+    '[LimCode] 已合并旧聊天记录 workspace:old：新增 12 行；合并前备份：/fixture/backup；3 个你删除过的对话没有再合并'
   ]);
 });
 
@@ -994,7 +994,7 @@ test('外来历史库合并：通知与日志用可读名称，并提示这份�
   const skipped = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({ candidateId: id, label, skippedConversations: 2 })] }) });
   await skipped.mergeHistoricalDataSetsInBackground(skipped.context, mergeHost(), () => true, [id]);
   const notice = skipped.calls.find(call => call[0] === 'info')[1];
-  assert.ok(notice.endsWith(`${label}合并时跳过了 2 个你在当前库删掉的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`), notice);
+  assert.ok(notice.endsWith(`${label}合并时跳过了 2 个你删除过的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`), notice);
   assert.ok(!notice.includes('可以在“清理备份”里按覆盖核对后删除'), '不再说可以按覆盖删除');
 
   const refused = fixture({ confirmation: '查看原因', mergeReport: emptyMergeReport({ blocked: [{
