@@ -896,7 +896,8 @@ async function prepareSource(
     if (input.signal?.aborted) throw new engine.StopRequested();
   };
   stopIfAsked();
-  const earlier = await readRuntimeDataSetMergeFinalization(paths, await engine.sourceCandidate(paths, candidateId, state));
+  // Nothing is ever closed in a foreign root: it has no such record (as in the online merge).
+  const earlier = state.foreign ? undefined : await readRuntimeDataSetMergeFinalization(paths, await engine.sourceCandidate(paths, candidateId, state));
   if (earlier) {
     state.finalized = {
       turnIds: earlier.turnIds, intentIds: earlier.intentIds, turns: earlier.turns, intents: earlier.intents,
@@ -1632,16 +1633,17 @@ async function mergeLocked(
       exclusive: true
     };
     const evidence = new RuntimeDataSetMergeEvidence();
+    const skipped = state.skippedConversations ? { skippedConversations: state.skippedConversations } : {};
     const record = (inserted: StreamedMerge) => ({
       candidateId, state: 'merged' as const, source: state.fingerprint!, target: target.identity,
       mergedAt: new Date().toISOString(), insertedRows: inserted.inserted, reusedRows: inserted.reused,
-      insertedConversations: inserted.insertedConversations, insertedConversationIds: evidence.conversationIds
+      insertedConversations: inserted.insertedConversations, insertedConversationIds: evidence.conversationIds, ...skipped
     });
     // The evidence is completed right before the commit: until then it names nothing, so a crash
     // before the commit converges to "none of it is there" and puts the replaced record back.
     const commitId = await writeRuntimeDataSetMergeCommit(paths, []);
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
-      candidateId, state: 'committing', source: state.fingerprint!, target: target.identity, commitId, ...(previous ? { replaced: previous } : {})
+      candidateId, state: 'committing', source: state.fingerprint!, target: target.identity, commitId, ...(previous ? { replaced: previous } : {}), ...skipped
     });
     const backupUsed = target.backup.used === true;
     target.backup.used = true;

@@ -435,6 +435,11 @@ interface MigratedDataSet {
   fingerprint: RuntimeDataSetFingerprint;
   /** Carried by this data set of the target (merged into the current one earlier). */
   mergedInto?: string;
+  /**
+   * Conversations the merge into the receiving data set left out because the user had deleted them
+   * there (runtimeMergeTombstones): they exist only here, so this data set is never offered for deletion.
+   */
+  skippedConversations?: number;
 }
 
 interface CopiedConfiguration {
@@ -1398,7 +1403,10 @@ export async function completeDataRootRelocation(
       dataRootId = await ensureDataRootIdentity(target);
       completed = {
         ...staging, state: 'complete', completedAt: new Date().toISOString(),
-        migrated: [{ ...identityOf(current), fingerprint: currentFingerprint }, ...others.migrated],
+        migrated: [{
+          ...identityOf(current), fingerprint: currentFingerprint,
+          ...(merged.skippedConversations ? { skippedConversations: merged.skippedConversations } : {})
+        }, ...others.migrated],
         configuration: configuration.copied,
         leftBehind,
         receivingFingerprint
@@ -3127,7 +3135,9 @@ export async function planOldDataRootDeletion(input: {
     for (const entry of paths) bytes += (await measureTree(entry)).bytes;
     let reason: string | undefined;
     if (!migrated) reason = '没有迁移到当前目录';
-    else {
+    else if (migrated.skippedConversations) {
+      reason = `迁移时有 ${migrated.skippedConversations} 个对话你在新目录的当前库里删除过，没有并过去，只在这里还有，所以保留`;
+    } else {
       const now = await dataSetFingerprint(candidate).catch(() => undefined);
       if (!now) reason = '无法读取，无法确认迁移之后没有改动';
       else if (!sameRuntimeDataSetFingerprint(migrated.fingerprint, now)) reason = '迁移之后这个历史库有新的改动';

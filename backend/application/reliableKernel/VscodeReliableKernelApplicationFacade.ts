@@ -40,6 +40,7 @@ import { BridgeMessageType } from '../../../shared/protocol';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
 import { STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE } from './conversationHostEligibility';
 import { stopAndDeleteConversation } from './conversationDeleteCommand';
+import { recordRuntimeDeletedConversations } from '../../reliableKernel/runtimeMergeTombstones';
 import { toStructuredClonePlainData } from '../../../shared/plainData';
 import type {
   BridgeClientId,
@@ -459,10 +460,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     let report: ((message: string) => void) | undefined;
     let latestMessage = '';
     try {
+      const application = this.product.application;
       const deleted = await stopAndDeleteConversation({
-        application: this.product.application,
+        application,
         conversations: this.product.conversations,
-        childAgents: this.product.childAgents
+        childAgents: this.product.childAgents,
+        // Beside the merge ledger of this data directory: no later merge of an older copy brings them back.
+        recordDeleted: (conversationIds) => recordRuntimeDeletedConversations(
+          this.runtimePlacement.configurationRootPath, application.database.binding, conversationIds
+        )
       }, {
         conversationId,
         requestId: randomUUID(),
@@ -485,6 +491,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         }
       });
       if (!deleted) return null;
+      if (deleted.deletionRecordError) {
+        void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：对话已删除，但没能记下删除记录，以后合并旧拷贝时这些对话可能会回来。`
+          + `（${deleted.deletionRecordError}）`);
+      }
       await this.refreshConversationHistory();
       return deleted.deletedConversationIds;
     } finally {

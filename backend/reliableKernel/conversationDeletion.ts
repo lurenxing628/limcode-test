@@ -179,7 +179,15 @@ export class ConversationDeletionControlPlane {
     return this.stopping.has(conversationId);
   }
 
-  public async delete(conversationIdInput: string): Promise<ConversationDeleteResult | null> {
+  /**
+   * `beforeCommit` runs with exactly the conversations the transaction deletes, after every owner is
+   * pinned and right before it commits (the deletion command records them there, see
+   * runtimeMergeTombstones); when it throws, nothing is deleted.
+   */
+  public async delete(
+    conversationIdInput: string,
+    options: { beforeCommit?(conversationIds: readonly string[]): Promise<void> } = {}
+  ): Promise<ConversationDeleteResult | null> {
     const conversationId = requireId(conversationIdInput, 'conversationId');
     const snapshot = await this.readSnapshot(conversationId);
     if (!snapshot) return null;
@@ -278,6 +286,7 @@ export class ConversationDeletionControlPlane {
       if (index < ownershipOrder.length) {
         return this.database.conversationOwners.run(ownershipOrder[index], () => deleteOwned(index + 1));
       }
+      await options.beforeCommit?.(deletionOrder);
       await this.database.transaction(steps);
       return { deletedConversationIds: deletionOrder };
     };

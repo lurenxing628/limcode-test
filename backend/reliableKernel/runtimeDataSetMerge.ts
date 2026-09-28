@@ -21,24 +21,28 @@ import {
   type CarriedWorkRefusals, type UnfinishedWorkInspection
 } from './runtimeDataSetMergeWork';
 import {
-  cachedRuntimeDataSetFingerprint, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits, readCachedRuntimeDataSetAudit,
-  readCachedRuntimeRootAudit, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger,
-  rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
+  cachedRuntimeDataSetFingerprint, isForeignRuntimeHistoryId, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits,
+  readCachedRuntimeDataSetAudit, readCachedRuntimeRootAudit, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization,
+  readRuntimeDataSetMergeLedger, rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
   readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit, pruneRuntimeDataSetMergePreparations,
   removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
-  restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetFingerprint, runtimeDataSetLastMerge, runtimeDataSetMergedConversations,
+  restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetConversationsMergedFrom, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
   sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetAuditCacheEntry, type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity,
   type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest
 } from './runtimeDataSetMergeLedger';
 import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
+import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
   withRuntimeMaintenanceActivity
 } from './runtimeHostControl';
 import type { LocatedRuntimeRoot } from './runtimeLocatedRoot';
+import {
+  readRuntimeDeletedConversations, readRuntimeMergeTargetIdentities, RuntimeMergeRecordUnreadableError
+} from './runtimeMergeTombstones';
 import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet,
   type RuntimeDataSetDatabaseSnapshot
@@ -686,10 +690,16 @@ async function pickSources(
       const source: PickedSource = {
         id: recorded.candidateId, label: recorded.foreign.label, foreign: recorded.foreign, identity,
         requested: explicit, record, request, expired,
-        pending: request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity)
+        pending: request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity),
+        converge: interruptedCommit(found, target)
       };
       if (options.candidateIds && !options.candidateIds.includes(source.id)) {
-        if (expired && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
+        // Its request stays with an interrupted commit: the commit may have happened (see below).
+        if (expired && !source.converge && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
+        continue;
+      }
+      if (source.converge) {
+        picked.push(source);
         continue;
       }
       const selection = await selectSource(storagePaths, target, source, record ? 'uncached' : undefined, report, streamedRows, options.readOnly);
@@ -697,10 +707,26 @@ async function pickSources(
       source.unjudged = selection === 'later';
       picked.push(source);
     }
+    // An interrupted commit of a foreign root into this target converges from the ledger and the target
+    // alone: also after its request ran out or was removed, and wherever the root is now.
+    for (const record of ledger.values()) {
+      if (!interruptedCommit(record, target) || !isForeignRuntimeHistoryId(record.candidateId) || requests.has(record.candidateId)) continue;
+      if (options.candidateIds && !options.candidateIds.includes(record.candidateId)) continue;
+      picked.push({
+        id: record.candidateId, identity: { dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId },
+        requested: explicit, record, pending: false, converge: true
+      });
+    }
     return picked;
   });
   const sources: PickedSource[] = [];
   for (const source of picked) {
+    if (source.converge) {
+      // An estimate writes nothing: the commit converges in the next batch or preparation.
+      if (options.readOnly) continue;
+      if (!keepGoing()) break;
+      if (!await convergeForeignCommit(storagePaths, target, source, report)) continue;
+    }
     if (source.unjudged) {
       if (!keepGoing()) break;
       // A foreign root is read under its own claim, taken here (outside the admission) for this read only.
@@ -734,6 +760,59 @@ interface PickedSource {
   expired?: RuntimeDataSetMergeLedgerRequest;
   /** Judging its record needs a fingerprint that was not cached: judged again outside the admission. */
   unjudged?: boolean;
+  /**
+   * A foreign root with an interrupted commit into this target: converged first, outside the admission
+   * and without its hold (convergeForeignCommit); merged afterwards only on a request that still holds.
+   */
+  converge?: boolean;
+}
+
+/** A committing record of the source into this target: a crash between its transaction and its record. */
+function interruptedCommit(record: RuntimeDataSetMergeLedgerRecord | undefined, target: TargetContext): boolean {
+  return record?.state === 'committing' && sameRuntimeDataSetIdentity(record.target, target.identity);
+}
+
+/**
+ * Converges an interrupted commit of a foreign root (settledSource, no hold, no request needed) and
+ * reports its outcome as a merge would. True: nothing of it was committed and a request that still
+ * holds (or this very request) wants it merged, so it is merged as any requested foreign root.
+ */
+async function convergeForeignCommit(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  source: PickedSource,
+  report: RuntimeDataSetMergeBatchResult
+): Promise<boolean> {
+  const outcome = await runSourceAttempt<{ kind: 'unsettled' }>(paths, target, source.id, { finalizeWork: false, requested: source.requested },
+    async (state) => await settledSource(paths, target, source.id, state, source.label) ?? { kind: 'unsettled' });
+  source.converge = false;
+  if (outcome.kind === 'stopped') return false;
+  if (outcome.kind === 'unsettled') {
+    if (source.foreign && (source.pending || source.requested)) return true;
+    // Merged meanwhile (another window converged it): nothing to report; else nothing of it was committed.
+    const record = (await readRuntimeDataSetMergeLedger(paths)).get(source.id);
+    if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target.identity)) {
+      if (source.expired) await removeRuntimeDataSetMergeRequest(paths, source.id).catch(() => undefined);
+      return false;
+    }
+    await reportExpiredRequest(paths, source, report);
+    return false;
+  }
+  if (outcome.kind === 'merged' || outcome.kind === 'current') {
+    report.merged.push(outcome.result);
+    await removeRuntimeDataSetMergeRequest(paths, source.id).catch(() => undefined);
+    return false;
+  }
+  const issue: RuntimeDataSetMergeIssue = {
+    candidateId: source.id, code: outcome.code, message: outcome.message, newly: true, requested: source.requested,
+    ...(source.label ? { label: source.label } : {})
+  };
+  if (outcome.kind === 'deferred') report.deferred.push(issue);
+  else {
+    (outcome.kind === 'blocked' ? report.blocked : report.failures).push(issue);
+    await removeRuntimeDataSetMergeRequest(paths, source.id).catch(() => undefined);
+  }
+  return false;
 }
 
 /**
@@ -1209,7 +1288,10 @@ async function mergeSource(
   };
   stopIfAsked();
   if (!mode.migration) {
-    const earlier = await readRuntimeDataSetMergeFinalization(paths, await sourceCandidate(paths, candidateId, state));
+    // Nothing is ever closed in a foreign root, so it has no such record: it is not located for one
+    // (an interrupted commit of it converges without it, see settledSource).
+    const earlier = state.foreign ? undefined
+      : await readRuntimeDataSetMergeFinalization(paths, await sourceCandidate(paths, candidateId, state));
     if (earlier) {
       state.finalized = {
         turnIds: earlier.turnIds, intentIds: earlier.intentIds, turns: earlier.turns, intents: earlier.intents,
@@ -1220,8 +1302,9 @@ async function mergeSource(
     if (settled) return settled;
   }
   const { candidate, binding } = await resolveSource(paths, target, candidateId, mode, state);
-  // Conversations earlier merges of this source inserted here: the ones deleted here since are left out.
-  const merged = mode.migration ? [] : await recordedConversations(paths, target, candidate);
+  // Conversations earlier merges of this source inserted here, and every one the user deleted here
+  // (a migration's target too): the ones absent here now are left out.
+  const merged = await recordedConversations(paths, target, candidate);
   const unfinishedWork = mode.finalizeWork ? 'finalize' as const : 'carry' as const;
   if (!mode.migration) {
     // Audited before in exactly this file state: a source that waits (large-merge session, or last in
@@ -1351,16 +1434,21 @@ function auditFacts(files: string, audit: RuntimeSnapshotAudit): RuntimeDataSetA
 /**
  * Before any work on a source: an unchanged source already merged into this target (e.g. by
  * another window since this batch picked it) is left alone, and an interrupted commit into this
- * target is converged by measuring its exact inserted rows.
+ * target is converged by measuring its exact inserted rows. A foreign root (by its id) converges
+ * without its hold: from the ledger and the target alone, also when the root is gone.
  */
 async function settledSource(
   paths: { globalStoragePath: string },
   target: TargetContext,
   candidateId: string,
-  state: SourceProgress
+  state: SourceProgress,
+  label: string | undefined = state.foreign?.label
 ): Promise<SourceOutcome | undefined> {
+  const foreign = isForeignRuntimeHistoryId(candidateId);
   const recorded = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
   if (recorded?.state === 'merged' && sameRuntimeDataSetIdentity(recorded.target, target.identity)) {
+    // Whether a foreign root is unchanged is read under its hold only (a merge of it takes one).
+    if (foreign && !state.foreign) return undefined;
     const candidate = await sourceCandidate(paths, candidateId, state);
     const fingerprint = await sourceFingerprint(candidate).catch(() => undefined);
     return sameRuntimeDataSetIdentity(recorded.source, candidate) && sameRuntimeDataSetFingerprint(recorded.source, fingerprint)
@@ -1370,11 +1458,11 @@ async function settledSource(
   return withRuntimeDataRootAdmission(paths.globalStoragePath, async (): Promise<SourceOutcome | undefined> => {
     // A foreign id names the root's identity: its commit converges from the ledger and the target
     // alone, also when the root is gone meanwhile.
-    const local = state.foreign ? undefined : await resolveVscodeRuntimeDataSet(paths, candidateId);
+    const local = foreign ? undefined : await resolveVscodeRuntimeDataSet(paths, candidateId);
     const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
     if (record?.state !== 'committing' || !sameRuntimeDataSetIdentity(record.target, target.identity)) return undefined;
     const candidate: SourceRef = local ?? {
-      id: candidateId, dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId, label: state.foreign!.label
+      id: candidateId, dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId, ...(label ? { label } : {})
     };
     if (!sameRuntimeDataSetIdentity(record.source, candidate)) return undefined;
     const rows = (await readRuntimeDataSetMergeCommit(paths, record.commitId))?.rows ?? [];
@@ -1402,7 +1490,8 @@ async function settledSource(
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId, state: 'merged', source: record.source, target: target.identity,
       mergedAt: new Date().toISOString(), insertedRows: rows.length, reusedRows: 0,
-      insertedConversations: insertedConversationIds.length, insertedConversationIds
+      insertedConversations: insertedConversationIds.length, insertedConversationIds,
+      ...(record.skippedConversations ? { skippedConversations: record.skippedConversations } : {})
     });
     await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
     return { kind: 'merged', result: {
@@ -1415,18 +1504,32 @@ async function settledSource(
 /** Identity, idle state, recovery, epoch (a published 3/4 source is upgraded in place first). */
 async function resolveSource(
   paths: { globalStoragePath: string },
-  target: Pick<TargetContext, 'identity'>,
+  /** A migration's source check names the target identity only (it continues nothing it could refuse). */
+  target: Pick<TargetContext, 'identity'> & Partial<Pick<TargetContext, 'configurationRootPath'>>,
   candidateId: string,
   mode: SourceMode,
   state: SourceProgress
 ): Promise<{ candidate: HistoricalMergeCandidate; binding: HistoricalRootBinding }> {
-  if (state.foreign) return resolveForeignSource(paths, target, candidateId, state.foreign);
+  const withRoot = (): Pick<TargetContext, 'identity' | 'configurationRootPath'> => {
+    if (target.configurationRootPath === undefined) throw new TypeError('A merge into a data set names its configuration root.');
+    return { identity: target.identity, configurationRootPath: target.configurationRootPath };
+  };
+  if (state.foreign) return resolveForeignSource(paths, withRoot(), candidateId, state.foreign);
   let candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
   if ((candidate.selected && !mode.migration) || !candidate.dataSetId || !candidate.rootInstanceId) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '来源已成为当前库或已被清空，本次不合并。' });
   }
   if (sameRuntimeDataSetIdentity(target.identity, candidate)) {
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-same-identity', message: '来源与当前历史库是同一个数据集，不能合并。' });
+  }
+  // An identity the current data set continues (a data-root relocation carried its content into it) is
+  // an old copy of it. A migration merging it into its continuation again is exactly what it continues.
+  if (!mode.migration && (await continuedIdentities(withRoot())).some((identity) => sameRuntimeDataSetIdentity(identity, candidate))) {
+    throw new Outcome({
+      kind: 'blocked', code: 'runtime-data-set-merge-continued-identity',
+      message: '这个历史库是当前历史库迁移数据目录之前的那一份（当前库延续了它），不合并：同一个库的两份不能都并进当前库，两边的内容都没有改动。'
+        + '需要时可以在“历史与存储管理”里切换过去查看。'
+    });
   }
   // Without a claim this is an early answer only; the commit checks it again under the claims.
   await assertSourceIdle(candidate);
@@ -1461,12 +1564,13 @@ async function resolveSource(
 
 /**
  * A foreign root located strictly again under its hold (pointer, epoch manifest, current epoch, every
- * Host proven gone, nothing unfinished), never one with the identity of a local data set: that is an
- * old copy of it, which backup cleanup judges by coverage instead.
+ * Host proven gone, nothing unfinished), never one with the identity of a local data set or of one the
+ * current data set continues: that is an old copy of it, which backup cleanup judges by coverage
+ * instead. While a local data set cannot be read that cannot be ruled out, so the merge waits.
  */
 async function resolveForeignSource(
   paths: { globalStoragePath: string },
-  target: Pick<TargetContext, 'identity'>,
+  target: Pick<TargetContext, 'identity' | 'configurationRootPath'>,
   candidateId: string,
   hold: ForeignHistoricalMergeHold
 ): Promise<{ candidate: ForeignHistoricalMergeCandidate; binding: HistoricalRootBinding }> {
@@ -1474,16 +1578,50 @@ async function resolveForeignSource(
   if (candidate.id !== candidateId) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '外来历史库的身份已变化，本次不合并。' });
   }
-  const local = sameRuntimeDataSetIdentity(target.identity, candidate) ? '当前历史库'
-    : (await inspectVscodeRuntimeDataSets(paths)).candidates.find((dataSet) => sameRuntimeDataSetIdentity(candidate, dataSet))?.id;
+  const inspection = await inspectVscodeRuntimeDataSets(paths);
+  const continued = await continuedIdentities(target);
+  const same = (identity: { dataSetId?: string; rootInstanceId?: string }): boolean => sameRuntimeDataSetIdentity(candidate, identity);
+  const twin = inspection.candidates.find(same);
+  const local = same(target.identity) || continued.some(same) ? '当前历史库' : twin && `历史库“${runtimeDataSetReadableName(twin)}”`;
   if (local !== undefined) {
     throw new Outcome({
       kind: 'blocked', code: 'runtime-data-set-merge-foreign-old-copy',
-      message: `这个外来历史库是${local === '当前历史库' ? local : `历史库 ${local}`}的旧拷贝（同一个库的另一份），不合并：同一个库的两份不能都并进当前库，`
+      message: `这个外来历史库是${local}${!same(target.identity) && continued.some(same) ? '（迁移数据目录之前的那一份）' : ''}的旧拷贝（同一个库的另一份），不合并：同一个库的两份不能都并进当前库，`
         + '两边的内容都没有改动。它的对话如果都已在那个库里，可以在“清理备份”里按覆盖核对后删除；需要时也可以在“外来历史库”里只读查看它。'
     });
   }
+  if (inspection.problems.length > 0) {
+    throw new Outcome({
+      kind: 'deferred', code: 'runtime-data-set-merge-local-unreadable',
+      message: `本地有 ${inspection.problems.length} 个历史库暂时读不出，无法确认这个外来历史库不是它的旧拷贝，这次不合并，两边的内容都没有改动；那个库能读出之后会再合并。`
+    });
+  }
   return { candidate, binding: foreignBinding(candidate) };
+}
+
+/**
+ * The identities the target continues (runtimeMergeTombstones), read under its configuration root.
+ * Unreadable: nothing may be merged into it until they can be read (records of what not to bring back).
+ */
+async function continuedIdentities(target: Pick<TargetContext, 'identity' | 'configurationRootPath'>): Promise<RuntimeDataSetIdentity[]> {
+  return (await mergeTargetIdentities(target)).slice(1);
+}
+
+async function mergeTargetIdentities(target: Pick<TargetContext, 'identity' | 'configurationRootPath'>): Promise<RuntimeDataSetIdentity[]> {
+  return mergeRecordsReadable(() => readRuntimeMergeTargetIdentities(target.configurationRootPath, target.identity));
+}
+
+/** A deleted-conversation record or an identity continuation that cannot be read defers the merge. */
+async function mergeRecordsReadable<T>(read: () => Promise<T>): Promise<T> {
+  try {
+    return await read();
+  } catch (error) {
+    if (!(error instanceof RuntimeMergeRecordUnreadableError)) throw error;
+    throw new Outcome({
+      kind: 'deferred', code: error.code,
+      message: `当前库的删除记录读不出（${error.message}），为免把你删掉的对话合并回来，这次不合并，两边的内容都没有改动；以后会自动重试。`
+    });
+  }
 }
 
 /**
@@ -1776,10 +1914,11 @@ async function commitLocked(
     ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
     ...(state.skippedConversations ? { skippedConversations: state.skippedConversations } : {})
   };
+  const skipped = state.skippedConversations ? { skippedConversations: state.skippedConversations } : {};
   const merged = (): Parameters<typeof writeRuntimeDataSetMergeLedgerRecord>[1] => ({
     candidateId: candidate.id, state: 'merged', source: state.fingerprint!, target: target.identity,
     mergedAt: new Date().toISOString(), insertedRows: plan.inserted.length, reusedRows: plan.reused,
-    insertedConversations: plan.insertedConversations, insertedConversationIds
+    insertedConversations: plan.insertedConversations, insertedConversationIds, ...skipped
   });
   if (plan.steps.length === 0) {
     if (mode.migration) return { kind: 'merged', result };
@@ -1791,7 +1930,7 @@ async function commitLocked(
   if (commitId !== undefined) {
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId: candidate.id, state: 'committing', source: state.fingerprint!, target: target.identity, commitId,
-      ...(previous ? { replaced: previous } : {})
+      ...(previous ? { replaced: previous } : {}), ...skipped
     });
   }
   if (mode.migration) await options.beforeCommit?.(plan.inserted);
@@ -2066,24 +2205,26 @@ async function transferSourceCas(
   });
 }
 
-/** Conversations earlier merges of this source inserted into this target (its ledger record). */
+/**
+ * Conversations a merge of this source leaves out when they are absent from the target now (see
+ * deletedSinceMerge), read under the target's configuration root: every conversation merges of the
+ * same source incarnation inserted into the target or into an identity it continues (any record of
+ * that incarnation: a local data set's, a foreign copy's, what a record of a later incarnation under
+ * the same candidate id kept), and every conversation the user deleted there (runtimeMergeTombstones).
+ * Records that cannot be read defer the merge.
+ */
 async function recordedConversations(
-  paths: { globalStoragePath: string },
-  target: TargetContext,
+  _paths: { globalStoragePath: string },
+  target: Pick<TargetContext, 'identity' | 'configurationRootPath'>,
   candidate: HistoricalMergeCandidate
 ): Promise<string[]> {
-  const ledger = await readRuntimeDataSetMergeLedger(paths);
-  if (!isForeignCandidate(candidate)) {
-    const record = ledger.get(candidate.id);
-    return record && sameRuntimeDataSetIdentity(record.source, candidate) ? runtimeDataSetMergedConversations(record, target.identity) : [];
-  }
-  // A foreign root is one copy of a data set incarnation: what any merge of that incarnation inserted
-  // here (its own, another copy's, the data set it was copied from) and the user deleted since stays out.
+  const targets = await mergeTargetIdentities(target);
+  const source = { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
   const merged = new Set<string>();
-  for (const record of ledger.values()) {
-    if (!sameRuntimeDataSetIdentity(record.source, candidate)) continue;
-    for (const id of runtimeDataSetMergedConversations(record, target.identity)) merged.add(id);
+  for (const record of (await readRuntimeDataSetMergeLedger({ globalStoragePath: target.configurationRootPath })).values()) {
+    for (const id of runtimeDataSetConversationsMergedFrom(record, source, targets)) merged.add(id);
   }
+  for (const id of await mergeRecordsReadable(() => readRuntimeDeletedConversations(target.configurationRootPath, targets))) merged.add(id);
   return [...merged];
 }
 

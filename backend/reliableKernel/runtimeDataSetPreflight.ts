@@ -77,6 +77,15 @@ export function peekRuntimeDataSetSummary(candidate: VscodeRuntimeDataSetCandida
   return known.key.startsWith(`${candidate.dataSetId}\0${candidate.rootInstanceId ?? ''}\0`) ? known.summary : undefined;
 }
 
+/**
+ * A readable name of a local data set for a message: the project names a picker read for it (never
+ * read here), else the kind of history; never its internal id.
+ */
+export function runtimeDataSetReadableName(candidate: VscodeRuntimeDataSetCandidate): string {
+  const names = peekRuntimeDataSetSummary(candidate)?.projectNames ?? [];
+  return names.length > 0 ? names.slice(0, 3).join('、') : candidate.source === 'workspace' ? '旧工作区历史' : '默认历史库';
+}
+
 async function pathExists(file: string): Promise<boolean> {
   try {
     await fs.lstat(file);

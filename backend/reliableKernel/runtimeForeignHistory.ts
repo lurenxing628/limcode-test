@@ -9,6 +9,7 @@ import { CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
 import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
+import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
 import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocation';
 import { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
 import {
@@ -18,6 +19,7 @@ import {
 import {
   locateLocalRuntimeDataSet, sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot
 } from './runtimeLocatedRoot';
+import { readRuntimeIdentityAliases } from './runtimeMergeTombstones';
 import { auditRuntimeSnapshot, RuntimeSnapshotAuditError } from './runtimeSnapshotAudit';
 import {
   assertNoSymbolicPath, copyRuntimeSqliteFiles, inspectLocatedRuntimeStorage, type RuntimeDataSetStorageInspection
@@ -92,8 +94,11 @@ export interface ForeignRuntimeHistoryEntry extends DiscoveredForeignRuntimeRoot
   contentDigest?: string;
   /** Interrupted work a later merge would first have to finish; reading is unaffected. */
   unfinishedWork?: { finalizable: number; refused: number };
-  /** Same data set incarnation as a local data set: an old copy of it. */
-  sameAsLocal?: { candidateId: string; selected: boolean };
+  /**
+   * Same data set incarnation as a local data set, or as one the current data set continues
+   * (`continued`, see runtimeMergeTombstones): an old copy of it. `name`: its readable name.
+   */
+  sameAsLocal?: { candidateId: string; selected: boolean; name?: string; continued?: true };
   /** An exactly identical copy (same identity and content digest) of this other foreign entry. */
   duplicateOf?: string;
 }
@@ -732,12 +737,17 @@ export async function inspectForeignRuntimeHistory(
   const held = await heldDatabaseFiles(configurationRoot);
   const found = await discoverWith(configurationRoot, input.previousDataRootPaths, held);
   const { candidates } = await inspectVscodeRuntimeDataSets({ globalStoragePath: configurationRoot });
+  const selected = candidates.find((candidate) => candidate.selected);
+  // Unreadable continuations only leave the relation unshown: a merge reads them again and waits.
+  const continued = selected?.dataSetId && selected.rootInstanceId
+    ? await readRuntimeIdentityAliases(configurationRoot, { dataSetId: selected.dataSetId, rootInstanceId: selected.rootInstanceId }).catch(() => [])
+    : [];
   const entries: ForeignRuntimeHistoryEntry[] = [];
   for (const entry of found) {
     entries.push((await inspectOne(configurationRoot, entry, held)).entry);
     input.onProgress?.(entries.length, found.length);
   }
-  relate(entries, candidates);
+  relate(entries, candidates, continued);
   return { configurationRootPath: configurationRoot, checkedAt: new Date().toISOString(), entries };
 }
 
@@ -870,13 +880,21 @@ function isTransientAuditCode(code: string | undefined): boolean {
   return code !== undefined && (TRANSIENT_SQLITE_CODE.test(code) || TRANSIENT_CODES.has(code));
 }
 
-/** Old copy of a local data set; identical foreign copies shown once. */
-function relate(entries: ForeignRuntimeHistoryEntry[], candidates: readonly VscodeRuntimeDataSetCandidate[]): void {
+/** Old copy of a local data set (or of one the current data set continues); identical foreign copies shown once. */
+function relate(
+  entries: ForeignRuntimeHistoryEntry[],
+  candidates: readonly VscodeRuntimeDataSetCandidate[],
+  continued: readonly { dataSetId: string; rootInstanceId: string }[]
+): void {
   const primary = new Map<string, ForeignRuntimeHistoryEntry>();
+  const selected = candidates.find((candidate) => candidate.selected);
   for (const entry of entries) {
     if (entry.status !== 'verified') continue;
-    const local = candidates.find((candidate) => candidate.dataSetId === entry.dataSetId && candidate.rootInstanceId === entry.rootInstanceId);
-    if (local) entry.sameAsLocal = { candidateId: local.id, selected: local.selected };
+    const same = (identity: { dataSetId?: string; rootInstanceId?: string }): boolean =>
+      identity.dataSetId === entry.dataSetId && identity.rootInstanceId === entry.rootInstanceId;
+    const local = candidates.find(same);
+    if (local) entry.sameAsLocal = { candidateId: local.id, selected: local.selected, name: local.selected ? '当前历史库' : runtimeDataSetReadableName(local) };
+    else if (selected && continued.some(same)) entry.sameAsLocal = { candidateId: selected.id, selected: true, name: '当前历史库', continued: true };
     const key = `${entry.dataSetId}\0${entry.rootInstanceId}\0${entry.contentDigest}`;
     const first = primary.get(key);
     if (first) entry.duplicateOf = first.id;

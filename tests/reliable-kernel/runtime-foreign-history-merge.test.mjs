@@ -423,7 +423,9 @@ test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两�
   const blocked = new Map(refused.blocked.map((issue) => [issue.candidateId, issue]));
   assert.deepEqual([...blocked.values()].map((issue) => issue.code), ['runtime-data-set-merge-foreign-old-copy', 'runtime-data-set-merge-foreign-old-copy']);
   assert.match(blocked.get(oldCurrent.id).message, /这个外来历史库是当前历史库的旧拷贝/);
-  assert.match(blocked.get(oldAlpha.id).message, new RegExp(`这个外来历史库是历史库 ${fixture.alpha.id}的旧拷贝`));
+  // By a readable name (the project names a picker read, else the kind of history), never its internal id.
+  assert.match(blocked.get(oldAlpha.id).message, /这个外来历史库是历史库“旧工作区历史”的旧拷贝/);
+  assert.ok(!blocked.get(oldAlpha.id).message.includes(fixture.alpha.id), '原因里不写内部 id');
   assert.match(blocked.get(oldAlpha.id).message, /可以在“清理备份”里按覆盖核对后删除/);
   assert.equal(blocked.get(oldAlpha.id).label, oldAlpha.label);
   assert.deepEqual(conversations(fixture), ['current_1']);

@@ -115,7 +115,7 @@ export async function foreignHistoricalMergeFingerprint(
 
 export type ForeignRuntimeHistoryMergeState =
   /** The last merge of this root (its identity) into a data set, and whether the root changed since (by its verified content digest). */
-  | { state: 'merged'; mergedAt: string; intoCurrent: boolean; changedSinceMerge: boolean }
+  | { state: 'merged'; mergedAt: string; intoCurrent: boolean; changedSinceMerge: boolean; skippedConversations?: number }
   | { state: 'requested'; requestedAt: string; lastMerged?: ForeignRuntimeHistoryLastMerge }
   | { state: 'blocked' | 'failed'; code: string; message: string; lastMerged?: ForeignRuntimeHistoryLastMerge }
   | { state: 'too-large'; rows: number; maxRows: number; message: string; lastMerged?: ForeignRuntimeHistoryLastMerge };
@@ -124,6 +124,8 @@ export interface ForeignRuntimeHistoryLastMerge {
   mergedAt: string;
   intoCurrent: boolean;
   changedSinceMerge: boolean;
+  /** That merge left out conversations the user had deleted there: backup cleanup keeps this root. */
+  skippedConversations?: number;
 }
 
 /**
@@ -148,7 +150,8 @@ export async function readForeignRuntimeHistoryMergeStates(
     const unchanged = record !== undefined && record.source.contentDigest === entry.contentDigest;
     const merge = record ? runtimeDataSetLastMerge(record) : undefined;
     const lastMerged: ForeignRuntimeHistoryLastMerge | undefined = merge && {
-      mergedAt: merge.mergedAt, intoCurrent: sameRuntimeDataSetIdentity(merge.target, current), changedSinceMerge: merge.source.contentDigest !== entry.contentDigest
+      mergedAt: merge.mergedAt, intoCurrent: sameRuntimeDataSetIdentity(merge.target, current), changedSinceMerge: merge.source.contentDigest !== entry.contentDigest,
+      ...(merge.skippedConversations ? { skippedConversations: merge.skippedConversations } : {})
     };
     const carried = lastMerged ? { lastMerged } : {};
     const request = requests.get(entry.id);

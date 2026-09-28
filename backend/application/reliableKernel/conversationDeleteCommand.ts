@@ -67,8 +67,22 @@ export interface ConversationDeleteCommandDependencies {
       options: { userStop?: boolean }
     ): Promise<unknown>;
   };
+  /**
+   * Records durably that the user deleted exactly these conversations from the current data set
+   * (runtimeMergeTombstones), right before the deletion commits, so no later merge of an older copy
+   * brings them back. A failure never stops the deletion: the result says so (`deletionRecordError`).
+   */
+  recordDeleted?(conversationIds: readonly string[]): Promise<void>;
   timeoutMs?: number;
   pollMs?: number;
+}
+
+export interface ConversationDeleteCommandResult extends ConversationDeleteResult {
+  /**
+   * Deleted, but not every deleted conversation could be recorded as deleted (why): a later merge
+   * of an older copy may bring those back. Only with `recordDeleted`.
+   */
+  deletionRecordError?: string;
 }
 
 export interface ConversationDeleteRemainingWork {
@@ -102,7 +116,7 @@ export function isConversationDeleteIncompleteError(error: unknown): error is Co
 export async function stopAndDeleteConversation(
   dependencies: ConversationDeleteCommandDependencies,
   input: { conversationId: string; requestId: string; onProgress?: (progress: ConversationDeleteProgress) => void }
-): Promise<ConversationDeleteResult | null> {
+): Promise<ConversationDeleteCommandResult | null> {
   return new ConversationDeleteCommand(dependencies, input.conversationId, input.requestId, input.onProgress).run();
 }
 
@@ -114,6 +128,9 @@ class ConversationDeleteCommand {
   private readonly attempts = new Map<string, number>();
   private busy: ConversationRuntimeOwnerBusyError | undefined;
   private lastProgress: string | undefined;
+  /** Conversations recorded as deleted (recordDeleted) by an earlier round, and the last failure to. */
+  private readonly recordedDeleted = new Set<string>();
+  private recordError: string | undefined;
 
   public constructor(
     private readonly dependencies: ConversationDeleteCommandDependencies,
@@ -122,7 +139,7 @@ class ConversationDeleteCommand {
     private readonly onProgress?: (progress: ConversationDeleteProgress) => void
   ) {}
 
-  public async run(): Promise<ConversationDeleteResult | null> {
+  public async run(): Promise<ConversationDeleteCommandResult | null> {
     const releases: Array<() => void> = [];
     try {
       return await this.stopAndDelete(releases);
@@ -131,7 +148,7 @@ class ConversationDeleteCommand {
     }
   }
 
-  private async stopAndDelete(releases: Array<() => void>): Promise<ConversationDeleteResult | null> {
+  private async stopAndDelete(releases: Array<() => void>): Promise<ConversationDeleteCommandResult | null> {
     const { application } = this.dependencies;
     const deadline = Date.now() + (this.dependencies.timeoutMs ?? CONVERSATION_DELETE_STOP_TIMEOUT_MS);
     const marked = new Set<string>();
@@ -147,8 +164,9 @@ class ConversationDeleteCommand {
       if (inventory.work.length === 0) {
         try {
           // The facade boundary guard: the requested id is pinned; the control plane pins the rest.
-          return await application.database.conversationOwners.run(this.conversationId, () =>
-            application.conversationDeletion.delete(this.conversationId));
+          const deleted = await application.database.conversationOwners.run(this.conversationId, () =>
+            application.conversationDeletion.delete(this.conversationId, { beforeCommit: (ids) => this.recordDeleted(ids) }));
+          return deleted && this.withDeletionRecord(deleted);
         } catch (error) {
           if (isConversationRuntimeOwnerBusyError(error)) {
             // Nothing runs, but another window holds the Conversation (it releases an idle one).
@@ -178,6 +196,24 @@ class ConversationDeleteCommand {
       if (Date.now() >= deadline) throw await this.incomplete(inventory);
       await sleep(this.dependencies.pollMs ?? DEFAULT_POLL_MS);
     }
+  }
+
+  /** Right before the transaction commits: never throws (a failure is reported with the result). */
+  private async recordDeleted(conversationIds: readonly string[]): Promise<void> {
+    const record = this.dependencies.recordDeleted;
+    const missing = conversationIds.filter((id) => !this.recordedDeleted.has(id));
+    if (!record || missing.length === 0) return;
+    try {
+      await record(missing);
+      for (const id of missing) this.recordedDeleted.add(id);
+    } catch (error) {
+      this.recordError = error instanceof Error ? error.message : String(error);
+    }
+  }
+
+  private withDeletionRecord(deleted: ConversationDeleteResult): ConversationDeleteCommandResult {
+    if (!this.dependencies.recordDeleted || deleted.deletedConversationIds.every((id) => this.recordedDeleted.has(id))) return deleted;
+    return { ...deleted, deletionRecordError: this.recordError ?? '原因未知' };
   }
 
   private progress(progress: ConversationDeleteProgress): void {

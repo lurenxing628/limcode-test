@@ -415,7 +415,7 @@ test('身份关系：当前库的拷贝记为旧拷贝；两份完全相同的�
   const byPath = (copied) => report.entries.find((entry) => entry.location.containerPath === copied);
   for (const copied of [first, second, third]) {
     assert.equal(byPath(copied).status, 'verified', byPath(copied).reason);
-    assert.deepEqual(byPath(copied).sameAsLocal, { candidateId: 'default', selected: true });
+    assert.deepEqual(byPath(copied).sameAsLocal, { candidateId: 'default', selected: true, name: '当前历史库' });
   }
   assert.equal(byPath(first).duplicateOf, undefined);
   assert.equal(byPath(second).duplicateOf, byPath(first).id);
