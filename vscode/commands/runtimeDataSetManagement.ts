@@ -496,7 +496,7 @@ export async function mergeHistoricalDataSetsInBackground(
   let progress: vscode.Progress<{ message?: string }> | undefined;
   let report: RuntimeDataSetMergeBatchResult;
   try {
-    report = await runRuntimeDataSetUpgrade(context, () => mergeHistoricalDataSetsOnline(paths, {
+    report = await runRuntimeDataSetUpgrade(context, () => oneMergeBatchAtATime(() => mergeHistoricalDataSetsOnline(paths, {
       configurationRootPath: paths.globalStoragePath,
       database: host.product.application.database
     }, {
@@ -512,7 +512,7 @@ export async function mergeHistoricalDataSetsInBackground(
       // An automatic source above the online limit goes along with a large merge session of the same
       // batch (the engine then leaves it awaiting); only without one is it coordinated on its own.
       coordinateOversized: (input, merge) => requestOtherWindowsToYield(paths, input, merge, stillCurrent)
-    }));
+    })));
   } catch (error) {
     console.error('[LimCode] 旧聊天记录合并检查失败。', error);
     const fresh = await freshStartupNotices(context, paths.globalStoragePath, 'merge',
@@ -536,6 +536,19 @@ export async function mergeHistoricalDataSetsInBackground(
       .catch(error => console.error('[LimCode] 合并较大的旧聊天记录失败。', error));
   }
   return report;
+}
+
+/**
+ * Merge batches of this process run one after another (the startup batch, 合并到当前库, a foreign
+ * root's merge): two at once would judge, close and copy the same sources side by side, and one could
+ * copy a data set the other has open (its SQLite locks released).
+ */
+let mergeBatches: Promise<unknown> = Promise.resolve();
+
+function oneMergeBatchAtATime<T>(run: () => Promise<T>): Promise<T> {
+  const next = mergeBatches.then(run, run);
+  mergeBatches = next.catch(() => undefined);
+  return next;
 }
 
 /**

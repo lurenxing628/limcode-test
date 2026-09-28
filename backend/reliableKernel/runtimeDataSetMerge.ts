@@ -769,7 +769,7 @@ async function pickSources(
       // A foreign root is read under its own claim, taken here (outside the admission) for this read only.
       const fingerprint = source.foreign
         ? await (await foreignHistoryMerge()).foreignHistoricalMergeFingerprint(storagePaths, source.id, source.foreign).catch(() => undefined)
-        : await runtimeDataSetFingerprint(source.candidate!).catch(() => undefined);
+        : await localFingerprint(source.candidate!).catch(() => undefined);
       if (await selectSource(storagePaths, target, source, fingerprint, report, streamedRows, options.readOnly) === 'skip') continue;
     }
     sources.push(source);
@@ -2375,7 +2375,17 @@ async function sourceCandidate(
 }
 
 function sourceFingerprint(candidate: HistoricalMergeCandidate): Promise<RuntimeDataSetFingerprint> {
-  return isForeignCandidate(candidate) ? candidate.hold.fingerprint(candidate) : runtimeDataSetFingerprint(candidate);
+  return isForeignCandidate(candidate) ? candidate.hold.fingerprint(candidate) : localFingerprint(candidate);
+}
+
+/**
+ * A local data set's fingerprint, read (when not cached for its exact files) under its maintenance
+ * claim: every opener of it in this process (finalization, upgrade, history, another batch) holds that
+ * claim, and a copy of files this process has open in SQLite would release its POSIX locks on them.
+ */
+async function localFingerprint(candidate: VscodeRuntimeDataSetCandidate): Promise<RuntimeDataSetFingerprint> {
+  return await cachedRuntimeDataSetFingerprint(candidate)
+    ?? withRuntimeMaintenance((await requireCompleteRuntimeDataSet(candidate)).paths, () => runtimeDataSetFingerprint(candidate));
 }
 
 /** The row plan of a source copy, leaving out what belongs to conversations deleted here since they were merged. */

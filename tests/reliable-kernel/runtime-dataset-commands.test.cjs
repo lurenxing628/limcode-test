@@ -1302,3 +1302,32 @@ test('最后一轮盲审 #2：从设置页发起的迁移数据目录从开始�
   await handlers.get('relocateDataRoot')();
   assert.deepEqual(events, [['relocate', null]], 'only opens the settings page: nothing held');
 });
+
+/** Lets the module's detached work (a question not awaited) run until `done` holds. */
+async function settle(done) {
+  for (let turn = 0; turn < 200 && !done(); turn += 1) await new Promise(resolve => setImmediate(resolve));
+}
+
+test('盲审2 merge #8：同一进程的合并批次排队执行：启动批次还没结束时点“合并到当前库”，后一个批次等前一个结束才开始', async () => {
+  const order = [];
+  let finishStartup;
+  const f = fixture({
+    picks: [action('merge'), 0], confirmation: '合并', application: mergeHost(),
+    async mergeHook(options) {
+      const which = options.candidateIds ? [...options.candidateIds].join(',') : 'startup';
+      order.push(`start ${which}`);
+      if (which === 'startup') await new Promise(resolve => { finishStartup = resolve; });
+      order.push(`end ${which}`);
+    }
+  });
+  const startup = f.mergeHistoricalDataSetsInBackground(f.context, mergeHost());
+  await settle(() => finishStartup !== undefined);
+  const manual = f.manageRuntimeDataSets(f.context, f.startup);
+  await settle(() => f.calls.some(call => call[0] === 'merge-request'));
+  await settle(() => false);
+  assert.deepEqual(order, ['start startup'], '手动合并的批次在启动批次结束之前没有开始');
+  finishStartup();
+  await startup;
+  await manual;
+  assert.deepEqual(order, ['start startup', 'end startup', 'start workspace:old', 'end workspace:old']);
+});

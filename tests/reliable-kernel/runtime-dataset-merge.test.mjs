@@ -2015,6 +2015,31 @@ test('盲审2 merge #7：另一个窗口先合并了同一来源时结果标明�
   assert.deepEqual(plain.deferred.map((item) => item.message), ['来源历史库在核验之后又有变化，稍后重试。']);
 });
 
+test('盲审2 merge #8：批次里没缓存的来源指纹在该库的 maintenance 里复制读取（同一进程打开它的都持有它）', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false });
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_fingerprint', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  assert.equal((await merge(fixture, database)).merged.length, 1);
+  // Opened without writing: its fingerprint is no longer cached for its files.
+  await fs.utimes(fixture.alpha.binding.paths.databasePath, new Date(), new Date());
+  let release;
+  let held;
+  const acquired = new Promise((resolve) => { held = resolve; });
+  const holding = withRuntimeMaintenance(fixture.alpha.binding.paths, async () => {
+    held();
+    await new Promise((resolve) => { release = resolve; });
+  });
+  await acquired;
+  let settled = false;
+  const batch = merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true }).then((report) => { settled = true; return report; });
+  await new Promise((resolve) => setTimeout(resolve, 600));
+  assert.equal(settled, false, '要复制这个库算指纹时等它的 maintenance');
+  release();
+  await holding;
+  const report = await batch;
+  assert.deepEqual(report.merged.map((item) => [item.candidateId, item.alreadyMerged]), [[fixture.alpha.id, true]]);
+});
+
 async function mergedInto(fixture) {
   const record = await readLedgerRecord(fixture, fixture.alpha.id);
   return (record?.mergedInto ?? []).map((entry) => [entry.target.dataSetId, [...entry.conversationIds].sort()]);
