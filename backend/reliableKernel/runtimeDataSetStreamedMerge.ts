@@ -148,6 +148,11 @@ const INVARIANT = 'runtime-data-set-merge-invariant';
  * default here is 16 MiB each): its rows are read once, in order, so the cache does not grow with it.
  */
 const SOURCE_PAGE_CACHE_KIB = 2048;
+/**
+ * Rows of one table a skip rule reads between two yields, in read chunks: the rules do little per row
+ * (an index probe), the scan's chunks much more (decode, compare), so a segment is many chunks.
+ */
+const SKIP_SEGMENT_CHUNKS = 64;
 
 export type LargeMergeFaultPoint =
   | RuntimeDataSetMergeFaultPoint
@@ -281,13 +286,15 @@ function locatedBinding(root: LocatedRuntimeRoot): HistoricalRootBinding {
  * Leaves out what belongs to the conversations an earlier merge of this source inserted here and the
  * user deleted since: the same closure as the online merge's skippedRows (foreign keys, SKIPPED_WITH,
  * SKIPPED_WITH_MEMBERS, to a fixed point, content identities never), computed in a TEMP table of the
- * private snapshot connection instead of in memory. True when rows are left out (see skipWhere).
+ * private snapshot connection instead of in memory, a segment of `chunkRows` × SKIP_SEGMENT_CHUNKS rows
+ * at a time (closeOver). True when rows are left out (see skipWhere).
  */
 async function prepareSkippedRows(
   source: Database.Database,
   target: RuntimeDatabase,
   merged: readonly string[],
-  state: HistoricalMergeSourceProgress
+  state: HistoricalMergeSourceProgress,
+  chunkRows: number
 ): Promise<boolean> {
   const deleted = merged.length > 0 ? await engine.deletedSinceMerge(source, target, merged) : undefined;
   state.skippedConversations = deleted?.count ?? 0;
@@ -297,14 +304,53 @@ async function prepareSkippedRows(
     source.exec(`CREATE TEMP TABLE ${SKIP_TABLE} (domain TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (domain, id)) WITHOUT ROWID`);
     const seed = source.prepare(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id) VALUES ('Conversation', ?)`);
     for (const id of deleted.conversations) seed.run(id);
-    const rules = skipRuleStatements().map((sql) => source.prepare(sql));
-    for (;;) {
-      let added = 0;
-      for (const rule of rules) added += rule.run().changes;
-      if (added === 0) break;
-    }
   });
+  await closeOver(source, skipRuleStatements(), chunkRows * SKIP_SEGMENT_CHUNKS);
   return true;
+}
+
+/**
+ * Runs the skip rules to their fixed point without holding this thread (review #7: the closure of a
+ * large source took seconds of the window's thread): a rule that reads one table (`FROM "<table>" AS t
+ * WHERE …`) reads it in rowid segments of `segmentRows`, a rule over several (an `all` rule's
+ * memberships) runs whole, and the thread yields after every segment and rule. INSERT OR IGNORE only
+ * adds, so the segments of a rule add exactly what the whole statement adds, and the fixed point is
+ * the same.
+ */
+async function closeOver(source: Database.Database, rules: readonly string[], segmentRows: number): Promise<void> {
+  const runs = rules.map((sql) => segmentedRule(source, sql, segmentRows));
+  for (;;) {
+    let added = 0;
+    for (const run of runs) added += await run();
+    if (added === 0) return;
+  }
+}
+
+function segmentedRule(source: Database.Database, sql: string, segmentRows: number): () => Promise<number> {
+  const scanned = /\bFROM ("(?:[^"]|"")+") AS t\s+WHERE\b/.exec(sql);
+  if (!scanned || /\bGROUP BY\b/.test(sql)) {
+    const whole = source.prepare(sql);
+    return async () => {
+      const added = withTemporaryWrites(source, () => whole.run().changes);
+      await yieldThread();
+      return added;
+    };
+  }
+  // NOT INDEXED: the rowid range is the scan (an index on the rule's column would be read whole per segment).
+  const segment = source.prepare(`${sql.replace(scanned[0], `FROM ${scanned[1]} AS t NOT INDEXED WHERE`)} AND t.rowid > ? AND t.rowid <= ?`);
+  const last = Number(source.prepare(`SELECT COALESCE(MAX(rowid), 0) FROM ${scanned[1]}`).pluck().get());
+  return async () => {
+    let added = 0;
+    for (let after = 0; after < last; after += segmentRows) {
+      added += withTemporaryWrites(source, () => segment.run(after, after + segmentRows).changes);
+      await yieldThread();
+    }
+    return added;
+  };
+}
+
+function yieldThread(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }
 
 /** The skippedRows rules as INSERT … SELECT statements over the TEMP table (one fixed-point pass each). */
@@ -1112,7 +1158,7 @@ async function prepareSource(
     stopIfAsked();
     const scanSource = async (): Promise<RuntimeDataSetMergeScan> => {
       boundSourcePageCache(taken.snapshot.database);
-      const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state);
+      const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows);
       progress('scan', 0);
       const scan = await scanMergeRows(taken.snapshot.database, target.database, {
         skipping, chunkRows, ...(input.signal ? { signal: input.signal } : {}), onRows: (rows) => progress('scan', rows)
@@ -1839,7 +1885,8 @@ async function mergeLocked(
     }
     const merged = await engine.recordedConversations(paths, target, candidate);
     boundSourcePageCache(copy.database);
-    const skipping = await prepareSkippedRows(copy.database, target.database, merged, state);
+    const chunkRows = options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS;
+    const skipping = await prepareSkippedRows(copy.database, target.database, merged, state, chunkRows);
     // Published online with their verified identities: unchanged objects are only lstat'ed here.
     const cas = await engine.transferSourceCas(candidate, locatedBinding(root), target, copy.database, options, verified, false);
     await engine.fault(options, 'after-cas-transfer');
@@ -1874,7 +1921,7 @@ async function mergeLocked(
     try {
       progress('merging', 0);
       streamed = await streamMergeTransaction(copy.database, target.database, {
-        skipping, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS, ...(signal ? { signal } : {}), evidence, state,
+        skipping, chunkRows, ...(signal ? { signal } : {}), evidence, state,
         onChunk: async (chunk, rows) => {
           written.rows = rows;
           progress('merging', rows);

@@ -25,6 +25,7 @@ const { openRuntimeCasVerificationCache } = kernelFile('runtimeCasVerificationCa
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
 const { RuntimeDatabaseWorkerError } = kernelFile('runtimeDatabase.js');
+const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
 const MiB = 1024 * 1024;
@@ -641,6 +642,77 @@ test('会话里发现冲突就停：回滚后不再读这份来源的其余部�
   assert.ok(chunks >= 15, `来源约 ${chunks} 块`);
   // Measured: the chunks up to the conversations and the rolled-back rows' presence (4 of about 19 reading on).
   assert.ok(reads <= 6, `发现冲突之后不再读（会话读了 ${reads} 次当前库，整份约 ${chunks} 块）`);
+});
+
+// ---------------------------------------------------------------------------------------------
+// The left-out closure off the window's thread (review #7).
+// ---------------------------------------------------------------------------------------------
+
+test('跳过闭包不长时间占着窗口线程：只读一张表的规则按 rowid 分段（每段 64 块），每段、每条规则之后都让出线程；结果与一次跑完相同，删掉的对话（行在后面的段里）不会被插回', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => removeConfigurationRoot(fixture.root));
+  const { generateSyntheticSource } = await import('./fixtures/runtime-merge-fixture.mjs');
+  await generateSyntheticSource(fixture.alpha, { rows: 6_000, prefix: 'synthetic' });
+  const first = await prepareAndRun(fixture, LIMITS);
+  assert.deepEqual(first.session.results.map((result) => result.state), ['merged']);
+  // Deleted here since: its message memberships sit past the first segment of their table (448 rows with 7-row chunks).
+  const deleted = 'synthetic_0000060';
+  const rowsOf = () => Object.fromEntries(Object.entries(readAll(fixture.current))
+    .map(([table, rows]) => [table, rows.filter((row) => row.includes(deleted)).length]).filter(([, count]) => count > 0));
+  await withWindow(fixture, (window) => new ConversationDeletionControlPlane(window).delete(deleted));
+  const left = rowsOf();
+  assert.equal(left.conversation ?? 0, 0);
+  assert.equal(left.message_part_of_conversation ?? 0, 0, '删对话时这些行删掉了');
+  await seedConversations(fixture.alpha, [{ id: 'alpha_after_merge' }]);
+
+  const SqliteDatabase = require(require.resolve('better-sqlite3', { paths: [path.join(compiled, 'backend/reliableKernel')] }));
+  const prepare = SqliteDatabase.prototype.prepare;
+  t.after(() => { SqliteDatabase.prototype.prepare = prepare; });
+  let ticks = 0;
+  let ticking = true;
+  const tick = () => { ticks += 1; if (ticking) setImmediate(tick); };
+  setImmediate(tick);
+  const runs = [];
+  SqliteDatabase.prototype.prepare = function recordClosure(sql, ...rest) {
+    const statement = prepare.call(this, sql, ...rest);
+    if (typeof sql === 'string' && sql.includes('INTO temp.limcode_merge_skip') && !sql.includes('VALUES')) {
+      const run = statement.run;
+      statement.run = function recordedRun(...args) {
+        runs.push({ sql, segment: args.length === 2 ? args : undefined, tick: ticks });
+        return run.apply(this, args);
+      };
+    }
+    return statement;
+  };
+  let preparation;
+  try {
+    preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window },
+      candidateIds: [fixture.alpha.id], requested: true, options: LIMITS
+    }));
+  } finally {
+    SqliteDatabase.prototype.prepare = prepare;
+    ticking = false;
+  }
+  assert.equal(preparation.sources.length, 1);
+  assert.equal(preparation.sources[0].skippedConversations, 1);
+  assert.ok(runs.length > 20, `闭包跑了 ${runs.length} 次语句（空表的规则不跑）`);
+  const segmented = runs.filter((entry) => entry.segment);
+  assert.ok(segmented.every((entry) => /AS t NOT INDEXED WHERE[\s\S]* AND t\.rowid > \? AND t\.rowid <= \?$/.test(entry.sql)), '分段语句按 rowid 范围读');
+  assert.ok(segmented.some((entry) => entry.segment[0] >= LIMITS.chunkRows * 64), '大的表分成了几段');
+  assert.ok(runs.some((entry) => /GROUP BY owner/.test(entry.sql) && !entry.segment), '跨几张表的规则整条跑');
+  for (let index = 1; index < runs.length; index += 1) {
+    assert.ok(runs[index].tick > runs[index - 1].tick, `第 ${index} 条之前让出过线程`);
+  }
+
+  const session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+    () => runLargeMergeSession({ paths: fixture.paths, prepared: preparation })));
+  assert.deepEqual(session.results.map((result) => [result.state, result.result?.insertedConversations]), [['merged', 1]]);
+  assert.deepEqual(rowsOf(), left, '删掉的对话一行也没有插回（它在后面段里的行也跳过了）');
+  const target = new Database(fixture.current.binding.paths.databasePath, { readonly: true });
+  try {
+    assert.equal(target.prepare('SELECT COUNT(*) FROM conversation WHERE id = ?').pluck().get('alpha_after_merge'), 1);
+  } finally { target.close(); }
 });
 
 // ---------------------------------------------------------------------------------------------
