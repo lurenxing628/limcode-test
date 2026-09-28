@@ -241,6 +241,94 @@ test('删除对话：删除命令在删除提交之前把整棵子树的对话 i
   assert.deepEqual(conversations(fixture), []);
 });
 
+/**
+ * The window's facade (VscodeReliableKernelApplicationFacade) with VS Code mocked, over the real Runtime
+ * database of `fixture`'s current data set; `warnings` collects what it shows.
+ */
+async function openFacade(t, fixture) {
+  const Module = require('node:module');
+  const originalLoad = Module._load;
+  const disposable = () => ({ dispose() {} });
+  class EventEmitter {
+    listeners = new Set();
+    event = (listener) => { this.listeners.add(listener); return { dispose: () => this.listeners.delete(listener) }; };
+    fire(value) { for (const listener of [...this.listeners]) listener(value); }
+    dispose() { this.listeners.clear(); }
+  }
+  const warnings = [];
+  const vscode = {
+    EventEmitter,
+    Uri: { parse: (text) => ({ toString: () => text }), joinPath: () => ({}) },
+    ProgressLocation: { Notification: 15 },
+    window: {
+      registerWebviewViewProvider: disposable,
+      onDidChangeActiveTextEditor: disposable,
+      showWarningMessage: async (message) => { warnings.push(message); },
+      showInformationMessage: async () => undefined,
+      showErrorMessage: async () => undefined,
+      withProgress: async (_options, task) => task({ report() {} })
+    },
+    workspace: { onDidChangeWorkspaceFolders: disposable, workspaceFolders: [] },
+    commands: { executeCommand: async () => undefined }
+  };
+  Module._load = function load(request, parent, isMain) {
+    if (request === 'vscode') return vscode;
+    if (request.endsWith('/panels/MainPanel')) {
+      return { MainPanel: {
+        onDidChangeConversationPanelState: disposable, getOpenConversationPanelStates: () => [], createOrShow() {},
+        refreshConversationTitle() {}, closePanelsByConversationId() {}
+      } };
+    }
+    if (request.endsWith('/webview/getWebviewHtml')) return { getWebviewHtml: () => '', getUnavailableWebviewHtml: () => '' };
+    return originalLoad.call(this, request, parent, isMain);
+  };
+  let Facade;
+  try {
+    ({ VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
+      compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
+    )));
+  } finally { Module._load = originalLoad; }
+  const database = await openWindow(fixture);
+  const nothingRuns = async () => { throw new Error('nothing runs in this conversation'); };
+  const product = {
+    debugCapture: { setListener() {} },
+    toolHost: { setStateChangeListener() {} },
+    ensureCapabilitiesReady: async () => undefined,
+    application: {
+      database,
+      contentStore: new kernel.ContentAddressedStore(fixture.current.authority, fixture.current.binding),
+      conversationDeletion: new ConversationDeletionControlPlane(database),
+      modelProvider: { subscribeSteering: () => () => undefined },
+      webviewFeed: { postToConversation() {}, reconnect() {} }
+    },
+    configuration: { agents: async () => [] },
+    conversations: { interrupt: nothingRuns },
+    childAgents: { interruptSubtree: nothingRuns },
+    close: async () => undefined
+  };
+  const facade = new Facade({}, product, () => ({}), { configurationRootPath: fixture.root });
+  t.after(async () => { await facade.dispose(); await database.close(); });
+  return { facade, warnings };
+}
+
+test('删除对话经窗口：删除记录写在当前配置根、按打开的当前库身份；记不下时照常删除，并提示以后合并旧拷贝时这些对话可能会回来', async (t) => {
+  const fixture = await home(t);
+  await seedConversations(fixture.current, [{ id: 'window_1' }, { id: 'window_2' }]);
+  const { facade, warnings } = await openFacade(t, fixture);
+  assert.deepEqual(await facade.deleteConversation('window_1'), ['window_1']);
+  assert.deepEqual([...await records.readRuntimeDeletedConversations(fixture.root, [identityOf(fixture.current.binding)])], ['window_1'],
+    '窗口删除时记下，记在当前配置根、按当前库身份');
+  assert.deepEqual(warnings, [], '记下了就不提示');
+
+  const directory = path.join(ledgerRoot(fixture.root), 'deleted-conversations');
+  await fs.rm(directory, { recursive: true });
+  await fs.writeFile(directory, 'not a directory');
+  assert.deepEqual(await facade.deleteConversation('window_2'), ['window_2'], '记不下时照常删除');
+  assert.deepEqual(conversations(fixture), []);
+  assert.equal(warnings.length, 1);
+  assert.match(warnings[0], /^Limcode test：对话已删除，但没能记下删除记录，以后合并旧拷贝时这些对话可能会回来。（.*不是目录.*）$/);
+});
+
 test('删除命令记下的对话，任何合并都不会带回：账本没有闭包时本地库、外来归档、大库会话（含准备时的试算）都跳过它', async (t) => {
   const fixture = await home(t);
   await seedConversations(fixture.current, [{ id: 'own_1' }]);
