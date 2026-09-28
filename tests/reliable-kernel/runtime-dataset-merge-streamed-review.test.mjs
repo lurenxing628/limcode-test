@@ -21,6 +21,7 @@ const {
   estimateLargeMergeSources, prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession
 } = kernelFile('runtimeDataSetStreamedMerge.js');
 const { largeMergeTargetBytes } = kernelFile('runtimeDataSetLargeMergeSpace.js');
+const { openRuntimeCasVerificationCache } = kernelFile('runtimeCasVerificationCache.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -393,8 +394,98 @@ test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间�
 });
 
 // ---------------------------------------------------------------------------------------------
+// Memory (review #3): the CAS verification cache when its file cannot be used.
+// ---------------------------------------------------------------------------------------------
+
+test('正文核验缓存文件损坏（不是数据库）：打开时删掉重建，之后照常记在盘上', { timeout: 120_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'limcode.cas-verified.sqlite');
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  await fs.writeFile(file, 'this is not a database, only garbage left behind '.repeat(200));
+  const cache = await openRuntimeCasVerificationCache(fixture.root);
+  cache.set('/cas/sha256/aa/object', '1:2:3:4:5');
+  cache.close();
+  const again = await openRuntimeCasVerificationCache(fixture.root);
+  try {
+    assert.equal(again.get('/cas/sha256/aa/object'), '1:2:3:4:5', '重建之后记在盘上');
+    assert.equal(again.unrecorded(), 0);
+  } finally {
+    again.close();
+  }
+});
+
+test('正文核验缓存用不了时（它的位置被一个目录占着）：内存里最多留 1 万条，多的不留并计数；准备因此如实推迟这份来源，不进会话，也不留备份和声明', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'limcode.cas-verified.sqlite');
+  await fs.mkdir(file, { recursive: true });
+  const cache = await openRuntimeCasVerificationCache(fixture.root);
+  try {
+    for (let index = 0; index < 10_050; index += 1) cache.set(`/cas/${index}`, `identity-${index}`);
+    assert.equal(cache.unrecorded(), 50, '超过 1 万条的不留');
+    assert.equal(cache.get('/cas/9999'), 'identity-9999');
+    assert.equal(cache.get('/cas/10000'), undefined);
+    cache.delete('/cas/0');
+    assert.equal(cache.get('/cas/0'), undefined);
+  } finally {
+    cache.close();
+  }
+
+  // A source with more objects than that: its preparation says so instead of leaving them to the session.
+  await contentHeavySource(fixture.alpha, 920);
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: { sizeLimits: { transactionRows: 1_000 } }
+  }));
+  assert.deepEqual(preparation.sources, []);
+  assert.deepEqual(preparation.report.deferred.map((issue) => issue.code), ['runtime-data-set-merge-verification-unrecorded']);
+  assert.match(preparation.report.deferred[0].message, /正文的核验结果没能全部记下/);
+  assert.deepEqual(await targetBackups(fixture), []);
+  assert.deepEqual(await registrations(fixture), []);
+  assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
+  assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '不入账，以后再合并');
+});
+
+// ---------------------------------------------------------------------------------------------
 // Helpers.
 // ---------------------------------------------------------------------------------------------
+
+/** Per conversation ten distinct message bodies and a distinct request recipe (eleven content objects). */
+async function contentHeavySource(dataSet, count) {
+  const { MESSAGE_TYPE, modelRequestAggregate, NOW, repo, withRuntime } = await import('./fixtures/runtime-merge-fixture.mjs');
+  await withRuntime(dataSet, async (runtime, store) => {
+    let steps = [];
+    for (let c = 0; c < count; c += 1) {
+      const id = `heavy_${String(c).padStart(6, '0')}`;
+      const turnId = `${id}_turn`;
+      const objects = await store.prepareBatch(runtime, [
+        ...Array.from({ length: 10 }, (_, m) => ({ content: JSON.stringify({ role: 'user', parts: [{ text: `${id} ${m}` }] }), contentType: MESSAGE_TYPE })),
+        { content: JSON.stringify({ recipe: id }), contentType: 'application/json' }
+      ]);
+      for (const object of objects) if (object.insert) steps.push(object.insert);
+      const ids = objects.map((object) => object.metadata.id);
+      steps.push(
+        repo('Conversation').insert({ id, title: id, status: 'active', created_at: NOW, updated_at: NOW }),
+        repo('Turn').insert({ id: turnId, conversation_id: id, status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+        repo('TurnTermination').insert({ id: `${id}_termination`, turn_id: turnId, terminal_status: 'completed', reason: 'fixture', created_at: NOW })
+      );
+      for (let m = 0; m < 10; m += 1) {
+        const messageId = `${id}_m${m}`;
+        steps.push(
+          repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
+          repo('MessageRevision').insert({ id: `${messageId}_r`, message_id: messageId, revision_seq: 1n, role: 'user', content_object_id: ids[m], created_at: NOW }),
+          repo('MessageCurrentRevisionLink').insert({ id: `${messageId}_c`, message_id: messageId, revision_id: `${messageId}_r`, updated_at: NOW }),
+          repo('MessagePartOfConversation').insert({ id: `${messageId}_p`, conversation_id: id, message_id: messageId, message_seq: BigInt(m + 1), created_at: NOW })
+        );
+      }
+      for (let r = 0; r < 4; r += 1) steps.push(...modelRequestAggregate(turnId, `${id}_q${r}`, BigInt(r + 1), { recipe: ids[10], body: ids[r], checkpoints: 1, completed: true }));
+      if (steps.length >= 2_000 || c === count - 1) {
+        await runtime.transaction(steps);
+        steps = [];
+      }
+    }
+  });
+}
 
 /** Index pages of a database file (dbstat), read from a private copy so the file itself gets no sidecars. */
 async function indexBytesOf(file) {

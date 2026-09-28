@@ -7,7 +7,7 @@ import type { ResourceLimits } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
-import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
+import { openRuntimeCasVerificationCache, type RuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   HISTORICAL_MERGE_ENGINE as engine, planMergeChunk, RuntimeDataSetMergeEvidence, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
@@ -1023,7 +1023,7 @@ async function prepareSource(
     return engine.takeVerifiedSnapshot(candidate, binding, 'finalize', state, mode, snapshotOptions, paths);
   };
   let taken = await snapshot();
-  let verified: (RuntimeCasVerifier & { close(): void }) | undefined;
+  let verified: RuntimeCasVerificationCache | undefined;
   try {
     if (state.finalized?.earlier) engine.countFinalized(taken.snapshot.database, state.finalized);
     engine.assertMergeableSize(taken.audit.size!, options, state, true);
@@ -1078,7 +1078,15 @@ async function prepareSource(
     });
     await engine.fault(options, 'after-target-backup');
     progress('cas');
+    const unrecorded = verified.unrecorded();
     const cas = await engine.transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, false);
+    if (verified.unrecorded() > unrecorded) {
+      // The session would hash those objects again while every window waits: not this time.
+      throw new engine.Outcome({
+        kind: 'deferred', code: 'runtime-data-set-merge-verification-unrecorded',
+        message: '正文的核验结果没能全部记下（.limcode-runtime-merges 里的核验记录无法写入），为免所有窗口暂停时重新核验这些正文，这份较大的旧聊天记录这次不合并；以后启动时会再合并。'
+      });
+    }
     await engine.fault(options, 'after-cas-transfer');
     const size = taken.audit.size!;
     const databaseBytes = await sqliteFilesBytes(binding.paths.databasePath);

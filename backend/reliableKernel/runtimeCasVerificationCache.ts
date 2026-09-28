@@ -18,6 +18,12 @@ export interface RuntimeCasVerifier {
 export interface RuntimeCasVerificationCache extends RuntimeCasVerifier {
   /** Writes what is still pending and lets go of the shared connection (idempotent). */
   close(): void;
+  /**
+   * How many verified identities this cache did not keep, since it was opened by anyone: its file
+   * could not be used and the ones kept in memory instead reached their bound (MEMORY_ENTRIES). Such
+   * objects are hashed again wherever they are checked next.
+   */
+  unrecorded(): number;
 }
 
 /**
@@ -25,8 +31,10 @@ export interface RuntimeCasVerificationCache extends RuntimeCasVerifier {
  * that did not run, a later preparation and the session hash each unchanged object only once
  * (`.limcode-runtime-merges/limcode.cas-verified.sqlite`). Not authoritative: an identity that
  * differs in anything (any rewrite, copy or restore changes it) hashes the file in full, and a cache
- * that cannot be opened, read or written only costs hashing again (this call then keeps its entries
- * in memory). Writes are batched; entries not refreshed for {@link MAX_AGE_MS} are dropped.
+ * that cannot be opened, read or written only costs hashing again. A damaged file is replaced; a
+ * file that cannot be used at all keeps at most {@link MEMORY_ENTRIES} entries in memory, the rest
+ * is counted (unrecorded) so that a caller relying on them can say so. Writes are batched; entries
+ * not refreshed for {@link MAX_AGE_MS} are dropped.
  *
  * POSIX lock rule (see sqliteDatabaseFileGuard): the file carries one of LimCode's own database names,
  * so no in-process file tool opens it, and this process keeps at most one connection to it, shared by
@@ -38,7 +46,7 @@ export async function openRuntimeCasVerificationCache(configurationRootPath: str
   const file = path.join(directory, CACHE_FILE);
   let shared = OPEN.get(file);
   if (!shared) {
-    const created: SharedCache = { refs: 0, pending: new Map(), opened: Promise.resolve() };
+    const created: SharedCache = { refs: 0, pending: new Map(), opened: Promise.resolve(), unrecorded: 0 };
     created.opened = openDatabase(root, directory, file).then((database) => {
       created.database = database;
       created.statements = {
@@ -63,14 +71,18 @@ const FLUSH_AT = 256;
 const BUSY_MS = 50;
 /** Entries of objects no merge confirmed for this long (e.g. of deleted data sets) are dropped. */
 const MAX_AGE_MS = 90 * 24 * 60 * 60 * 1000;
+/** Entries kept in memory at most while the file cannot be used (about 4 MB); more are not kept. */
+const MEMORY_ENTRIES = 10_000;
 
 interface SharedCache {
   database?: Database.Database;
   statements?: { read: Database.Statement; write: Database.Statement; remove: Database.Statement };
   refs: number;
-  /** Written or removed (null) since the last flush; the whole record while the file cannot be used. */
+  /** Written or removed (null) since the last flush; the record (bounded) while the file cannot be used. */
   pending: Map<string, string | null>;
   opened: Promise<void>;
+  /** Identities not kept: the file could not be used and MEMORY_ENTRIES were kept already. */
+  unrecorded: number;
 }
 
 const OPEN = new Map<string, SharedCache>();
@@ -90,12 +102,20 @@ function cacheHandle(file: string, shared: SharedCache): RuntimeCasVerificationC
       }
     },
     set(target, identity) {
+      if (!keep(shared, target)) return;
       shared.pending.set(target, identity);
       if (shared.pending.size >= FLUSH_AT) flush(shared);
     },
     delete(target) {
+      if (!shared.statements) {
+        shared.pending.delete(target);
+        return;
+      }
       shared.pending.set(target, null);
       if (shared.pending.size >= FLUSH_AT) flush(shared);
+    },
+    unrecorded() {
+      return shared.unrecorded;
     },
     close() {
       if (closed) return;
@@ -107,6 +127,13 @@ function cacheHandle(file: string, shared: SharedCache): RuntimeCasVerificationC
       try { shared.database?.close(); } catch { /* A cache only. */ }
     }
   };
+}
+
+/** Without the file the pending entries are the whole record: bounded, what does not fit is counted. */
+function keep(shared: SharedCache, target: string): boolean {
+  if (shared.statements || shared.pending.has(target) || shared.pending.size < MEMORY_ENTRIES) return true;
+  shared.unrecorded += 1;
+  return false;
 }
 
 function flush(shared: SharedCache): void {
@@ -130,6 +157,17 @@ function flush(shared: SharedCache): void {
 async function openDatabase(root: string, directory: string, file: string): Promise<Database.Database> {
   await assertNoSymbolicPrefix(root, directory);
   await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  try {
+    return await openFile(file);
+  } catch (error) {
+    // A damaged or foreign file is only a cache: replaced once (another process may still use the old one).
+    if (!isDamaged(error)) throw error;
+    for (const suffix of ['', '-wal', '-shm']) await fs.rm(`${file}${suffix}`, { force: true });
+    return openFile(file);
+  }
+}
+
+async function openFile(file: string): Promise<Database.Database> {
   const database = new Database(toSqliteFilePath(file));
   try {
     database.pragma(`busy_timeout = ${BUSY_MS}`);
@@ -138,13 +176,25 @@ async function openDatabase(root: string, directory: string, file: string): Prom
     database.exec(`CREATE TABLE IF NOT EXISTS verified_file (
       path TEXT PRIMARY KEY, identity TEXT NOT NULL, verified_at INTEGER NOT NULL
     ) WITHOUT ROWID`);
-    database.prepare('DELETE FROM verified_file WHERE verified_at < ?').run(Date.now() - MAX_AGE_MS);
+    // Pruning waits for no other window: busy now, done at a later opening.
+    try { database.prepare('DELETE FROM verified_file WHERE verified_at < ?').run(Date.now() - MAX_AGE_MS); }
+    catch (error) { if (!isBusy(error)) throw error; }
     await fs.chmod(file, 0o600).catch(() => undefined);
     return database;
   } catch (error) {
     database.close();
     throw error;
   }
+}
+
+function isDamaged(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && (code.startsWith('SQLITE_CORRUPT') || code.startsWith('SQLITE_NOTADB'));
+}
+
+function isBusy(error: unknown): boolean {
+  const code = (error as { code?: unknown } | undefined)?.code;
+  return typeof code === 'string' && (code.startsWith('SQLITE_BUSY') || code.startsWith('SQLITE_LOCKED'));
 }
 
 async function assertNoSymbolicPrefix(root: string, target: string): Promise<void> {

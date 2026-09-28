@@ -2842,7 +2842,8 @@ async function transferCas(
   `);
   const objects = options.sourceObjects;
   if (objects && !options.verifyOnly) await assertRoomForObjects(page, targetCas, options.freeSpace ?? freeSpace);
-  const lengths = new Map<string, bigint>();
+  // Per storage key its length, in a TEMP table of the source's connection (on disk): nothing per object on this thread.
+  const lengths = new HandledStorageKeys(source);
   const touchedDirectories = new Set<string>();
   const temporaryRoot = path.join(targetCas, 'tmp');
   let temporaryUsed = false;
@@ -2854,12 +2855,12 @@ async function transferCas(
       after = rows[rows.length - 1].position;
       for (const row of rows) {
         options.signal?.throwIfAborted();
-        const known = lengths.get(row.storage_key);
+        const known = lengths.length(row.storage_key);
         if (storageKeyForDigest(row.sha256) !== row.storage_key || (known !== undefined && known !== row.byte_length)) {
           throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源的正文登记不一致：${row.storage_key}。` });
         }
         if (known !== undefined) continue;
-        lengths.set(row.storage_key, row.byte_length);
+        lengths.add(row.storage_key, row.byte_length);
         const sourceFile = casPath(sourceCas, row.storage_key);
         const targetFile = casPath(targetCas, row.storage_key);
         // One synchronous lstat (metadata only, microseconds): an object this copy or an earlier
@@ -2942,10 +2943,67 @@ async function transferCas(
     // entries durable before any row that references them is committed.
     for (const directory of touchedDirectories) await syncDirectoryDurably(directory);
   } finally {
+    lengths.drop();
     // The temporary files are gone (each copy removes its own); their directory is synced once.
     if (temporaryUsed) await syncDirectoryDurably(temporaryRoot).catch(() => undefined);
   }
   return result;
+}
+
+/**
+ * The storage keys a CAS pass over a source handled, with the length its rows name, in a TEMP table
+ * of the source's snapshot connection (a file with its own bounded page cache): a source with
+ * millions of content objects keeps nothing per object in this thread's heap. The main database of
+ * such a connection is opened read-only; only its TEMP database is written.
+ */
+class HandledStorageKeys {
+  private static next = 0;
+  private readonly table = `limcode_merge_cas_keys_${HandledStorageKeys.next++}`;
+  private readonly read: Database.Statement;
+  private readonly write: Database.Statement;
+
+  public constructor(private readonly source: Database.Database) {
+    withTemporaryWrites(source, () => source.exec(
+      `CREATE TEMP TABLE ${this.table} (storage_key TEXT PRIMARY KEY, byte_length INTEGER NOT NULL) WITHOUT ROWID`
+    ));
+    this.read = source.prepare(`SELECT byte_length FROM temp.${this.table} WHERE storage_key = ?`).pluck();
+    this.write = source.prepare(`INSERT INTO temp.${this.table} (storage_key, byte_length) VALUES (?, ?)`);
+  }
+
+  /** The length this key was first seen with, if it was. */
+  public length(key: string): bigint | number | undefined {
+    return this.read.get(key) as bigint | number | undefined;
+  }
+
+  public add(key: string, length: bigint | number): void {
+    withTemporaryWrites(this.source, () => this.write.run(key, length));
+  }
+
+  public has(key: string): boolean {
+    return this.length(key) !== undefined;
+  }
+
+  public drop(): void {
+    try {
+      withTemporaryWrites(this.source, () => this.source.exec(`DROP TABLE IF EXISTS temp.${this.table}`));
+    } catch {
+      // Gone with the connection at the latest.
+    }
+  }
+}
+
+/**
+ * A snapshot connection opened with query_only can still write its own TEMP tables: its main
+ * database is opened read-only either way.
+ */
+function withTemporaryWrites<T>(database: Database.Database, run: () => T): T {
+  const queryOnly = Number(database.pragma('query_only', { simple: true })) !== 0;
+  if (queryOnly) database.pragma('query_only = OFF');
+  try {
+    return run();
+  } finally {
+    if (queryOnly) database.pragma('query_only = ON');
+  }
 }
 
 /**
@@ -2996,21 +3054,25 @@ async function assertRoomForObjects(
   targetCas: string,
   available: (directory: string) => Promise<number | undefined>
 ): Promise<void> {
-  const seen = new Set<string>();
+  const seen = new HandledStorageKeys(page.database);
   let missing = 0n;
-  for (let after = 0n; ;) {
-    const rows = page.all(after) as Array<{ position: bigint; storage_key: string; byte_length: bigint }>;
-    if (rows.length === 0) break;
-    after = rows[rows.length - 1].position;
-    for (const row of rows) {
-      if (seen.has(row.storage_key)) continue;
-      seen.add(row.storage_key);
-      let file: string;
-      try { file = casPath(targetCas, row.storage_key); }
-      catch { continue; } // An invalid key fails the transfer itself.
-      if (lstatSync(file, { throwIfNoEntry: false }) === undefined) missing += row.byte_length;
+  try {
+    for (let after = 0n; ;) {
+      const rows = page.all(after) as Array<{ position: bigint; storage_key: string; byte_length: bigint }>;
+      if (rows.length === 0) break;
+      after = rows[rows.length - 1].position;
+      for (const row of rows) {
+        if (seen.has(row.storage_key)) continue;
+        seen.add(row.storage_key, row.byte_length);
+        let file: string;
+        try { file = casPath(targetCas, row.storage_key); }
+        catch { continue; } // An invalid key fails the transfer itself.
+        if (lstatSync(file, { throwIfNoEntry: false }) === undefined) missing += BigInt(row.byte_length);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
     }
-    await new Promise((resolve) => setImmediate(resolve));
+  } finally {
+    seen.drop();
   }
   if (missing === 0n) return;
   const needed = Number(missing) + BACKUP_FREE_SPACE_MARGIN_BYTES;
