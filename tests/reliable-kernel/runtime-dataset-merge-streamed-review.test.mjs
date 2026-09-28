@@ -5,6 +5,7 @@ import { execFile, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs/promises';
+import fsSync from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -16,11 +17,12 @@ import {
 
 const require = createRequire(import.meta.url);
 const fsPromises = require('node:fs/promises');
-const { mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
+const { HISTORICAL_MERGE_ENGINE, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
 const {
   estimateLargeMergeSources, prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession
 } = kernelFile('runtimeDataSetStreamedMerge.js');
-const { largeMergeTargetBytes } = kernelFile('runtimeDataSetLargeMergeSpace.js');
+const { estimatedTargetIndexBytes, largeMergeTargetBytes } = kernelFile('runtimeDataSetLargeMergeSpace.js');
+const { isRuntimeLargeMergeTargetBackupLive } = kernelFile('runtimeDataSetMergeLedger.js');
 const { openRuntimeCasVerificationCache } = kernelFile('runtimeCasVerificationCache.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
@@ -65,8 +67,13 @@ test('准备好的窗口在会话之前消失（关窗、重载、崩溃）：�
   const [leakedAgain] = await targetBackups(fixture);
   assert.ok(leakedAgain);
   await withWindow(fixture, async (window) => {
-    const again = await prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
+    let beforeItsOwn;
+    const again = await prepareLargeMergeSources({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS,
+      onProgress: (progress) => { if (progress.stage === 'backup') beforeItsOwn ??= backupNamesNow(fixture); }
+    });
     assert.equal(again.sources.length, 1, '死掉窗口的准备记录可以接手');
+    assert.deepEqual(beforeItsOwn, [], '准备开始时先清理过期准备，再做自己的备份');
     assert.deepEqual(await targetBackups(fixture), [path.basename(again.backupPath)], '只剩这次准备自己的备份');
     assert.deepEqual((await registrations(fixture)).map((entry) => entry.name), [path.basename(again.backupPath)]);
     await releaseLargeMergePreparation(again);
@@ -207,18 +214,19 @@ test('会话开始前准备的备份已经不在（被清理了）：整批推�
   assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
 });
 
-test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什么也没合并时）：登记保留（会话开始前记为用过的改回没用过），不再刷新心跳；窗口不在之后下一次清理把备份和登记一起删掉', { timeout: 300_000 }, async (t) => {
+test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什么也没合并时）：登记保留（会话开始前记为用过的改回没用过），不再刷新心跳；窗口不在（进程不在或 24 小时没心跳）之后下一次清理把备份和登记一起删掉；登记指向别处的目录时只撤登记', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const rm = fsPromises.rm;
   let backup;
-  fsPromises.rm = async (target, ...rest) => {
+  const busy = async (target, ...rest) => {
     if (backup && path.resolve(String(target)) === path.resolve(backup)) {
       throw Object.assign(new Error(`EBUSY: resource busy or locked, rm '${target}'`), { code: 'EBUSY', syscall: 'rm' });
     }
     return rm(target, ...rest);
   };
+  fsPromises.rm = busy;
   try {
     await withWindow(fixture, async (window) => {
       const preparation = await prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
@@ -236,9 +244,22 @@ test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什
   assert.deepEqual(await targetBackups(fixture), [path.basename(backup)], '本窗口还在：不删');
   await rewriteRegistration(fixture, registration.name, { processId: await deadProcessId() });
   const batch = (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
+  // Still busy when the pruning gets to it: kept, registration and all, for the next pruning.
+  fsPromises.rm = busy;
+  try {
+    await withWindow(fixture, batch);
+  } finally {
+    fsPromises.rm = rm;
+  }
+  assert.deepEqual(await targetBackups(fixture), [path.basename(backup)], '清理时也删不掉');
+  assert.deepEqual((await registrations(fixture)).map((entry) => entry.name), [path.basename(backup)], '登记留到下一次清理');
   await withWindow(fixture, batch);
   assert.deepEqual(await targetBackups(fixture), []);
   assert.deepEqual(await registrations(fixture), []);
+  // A process that is there holds it for a day after its last heartbeat at most.
+  const hoursAgo = (hours) => new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+  assert.equal(isRuntimeLargeMergeTargetBackupLive({ ...registration, processId: process.pid, heartbeatAt: hoursAgo(23) }), true);
+  assert.equal(isRuntimeLargeMergeTargetBackupLive({ ...registration, processId: process.pid, heartbeatAt: hoursAgo(25) }), false, '24 小时没心跳即过期');
 
   // A session that merged nothing (cancelled before its first source; marked used before it) and could not remove the backup.
   const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
@@ -247,12 +268,7 @@ test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什
   backup = preparation.backupPath;
   const cancelled = new AbortController();
   cancelled.abort();
-  fsPromises.rm = async (target, ...rest) => {
-    if (path.resolve(String(target)) === path.resolve(backup)) {
-      throw Object.assign(new Error(`EBUSY: resource busy or locked, rm '${target}'`), { code: 'EBUSY', syscall: 'rm' });
-    }
-    return rm(target, ...rest);
-  };
+  fsPromises.rm = busy;
   let session;
   try {
     session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
@@ -267,6 +283,52 @@ test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什
   await withWindow(fixture, batch);
   assert.deepEqual(await targetBackups(fixture), [], '窗口不在之后连同备份删掉');
   assert.deepEqual(await registrations(fixture), []);
+
+  // A registration naming anything but a backup directory of this engine removes nothing but itself.
+  const elsewhere = path.join(fixture.root, 'not-merge-backups', registration.name);
+  await fs.mkdir(elsewhere, { recursive: true });
+  await writeRegistration(fixture, { ...registration, backupPath: elsewhere, processId: await deadProcessId() });
+  await withWindow(fixture, batch);
+  assert.equal(await fs.stat(elsewhere).then((info) => info.isDirectory(), () => false), true, '别处的目录不删');
+  assert.deepEqual(await registrations(fixture), [], '登记撤掉');
+});
+
+test('会话开始前记不下备份的使用（写登记遇到 ENOSPC 或 EIO）：整批推迟、说明原因，不写任何东西，没用上的备份和登记都撤掉', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => removeConfigurationRoot(fixture.root));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  const rows = countRows(fixture.current);
+  const open = fsPromises.open;
+  t.after(() => { fsPromises.open = open; });
+  for (const [errno, code, message] of [
+    ['ENOSPC', DISK_FULL, /^磁盘空间不足：合并较大的旧聊天记录前要在 .+ 记下合并前备份的使用，这次没有合并$/u],
+    ['EIO', 'runtime-data-set-merge-backup-unrecorded', /^无法记下合并前备份的使用，这次没有合并；以后启动时会再合并。$/u]
+  ]) {
+    const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+    }));
+    assert.equal(preparation.sources.length, 1);
+    fsPromises.open = async (file, ...rest) => {
+      if (String(file).includes(`${path.sep}preparing-backups${path.sep}`)) {
+        throw Object.assign(new Error(`${errno}: cannot write, open '${file}'`), { code: errno, syscall: 'open', path: String(file) });
+      }
+      return open(file, ...rest);
+    };
+    let session;
+    try {
+      session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+        () => runLargeMergeSession({ paths: fixture.paths, prepared: preparation })));
+    } finally {
+      fsPromises.open = open;
+    }
+    assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['deferred', code]], errno);
+    assert.match(session.results[0].issue.message, message);
+    assert.equal(countRows(fixture.current), rows, '当前库没有写入');
+    assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '不入账');
+    assert.deepEqual(await targetBackups(fixture), [], '没用上的备份删掉');
+    assert.deepEqual(await registrations(fixture), []);
+    assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
+  }
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -274,6 +336,11 @@ test('没用上的备份这次删不掉（EBUSY；准备交还时，或会话什
 // ---------------------------------------------------------------------------------------------
 
 test('会话写提交证据时遇到 ENOSPC：与 SQLITE_FULL 一样按磁盘空间不足处理——中文说明和需要量、没有系统原文，这份撤回，后面的来源不再开始', { timeout: 300_000 }, async (t) => {
+  // A full disk or quota anywhere in the cause chain; nothing else.
+  for (const code of ['ENOSPC', 'EDQUOT', 'SQLITE_FULL']) {
+    assert.equal(HISTORICAL_MERGE_ENGINE.isDiskFullError(new Error('wrapped', { cause: Object.assign(new Error(code), { code }) })), true, code);
+  }
+  assert.equal(HISTORICAL_MERGE_ENGINE.isDiskFullError(Object.assign(new Error('EIO'), { code: 'EIO' })), false);
   const fixture = await createConfigurationRoot({ beta: true });
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
@@ -320,10 +387,18 @@ test('会话中途磁盘快满：每块写完查剩余空间，不到 64 MB 余�
     probed.push(directory);
     return nearlyFull ? 8 * MiB : 1024 * 1024 * MiB;
   };
+  // The WAL the transaction wrote so far, as the session reads it once the disk is nearly full: large
+  // enough that the need projected from it over all the source's rows is above the size model.
+  const wal = path.resolve(`${fixture.current.binding.paths.databasePath}-wal`);
+  const walAtCheck = 40 * MiB;
+  const stat = fsPromises.stat;
+  fsPromises.stat = async (file, ...rest) => (nearlyFull && path.resolve(String(file)) === wal ? { size: walAtCheck } : stat(file, ...rest));
+  t.after(() => { fsPromises.stat = stat; });
   const { preparation, session } = await prepareAndRun(fixture, {
     ...LIMITS, freeSpace,
     onFaultPoint: (point, detail) => { if (point === 'after-chunk' && detail.chunk === 1) nearlyFull = true; }
   });
+  fsPromises.stat = stat;
   assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code ?? result.reason]), [['deferred', DISK_FULL], ['not-run', 'disk-full']]);
   const { message } = session.results[0].issue;
   const match = /^磁盘空间快满了（(.+) 只剩约 8 MB）：按已写入的部分推算，合并这份旧聊天记录需要约 (\d+) MB，已提前撤回这份的写入$/u.exec(message);
@@ -332,6 +407,9 @@ test('会话中途磁盘快满：每块写完查剩余空间，不到 64 MB 余�
   const [source] = preparation.sources;
   const modelled = largeMergeTargetBytes([source], preparation.space.targetIndexBytes, 64 * MiB);
   assert.ok(Number(match[2]) >= Math.ceil(modelled / MiB), `${match[2]} MB，模型 ${modelled}`);
+  // Two chunks of at most 7 rows were written: the WAL projected over all rows, at least.
+  const projected = source.databaseBytes + (walAtCheck / (2 * LIMITS.chunkRows)) * source.rows + 64 * MiB;
+  assert.ok(projected > modelled && Number(match[2]) >= Math.floor(projected / MiB), `${match[2]} MB，按预写日志推算至少 ${Math.floor(projected / MiB)} MB`);
   assert.ok(probed.filter((directory) => directory === preparation.space.targetDirectory).length >= 3, '每块写完都查了剩余空间');
   assert.deepEqual(readAll(fixture.current), before, '提前撤回，当前库不变');
   assert.equal(await readLedgerRecord(fixture, source.candidateId), undefined);
@@ -426,6 +504,22 @@ test('空间不够、开不了大库会话时，中等来源照常单独协调�
   assert.deepEqual(roomy.deferred.map((issue) => [issue.candidateId, issue.code]).sort(),
     [[fixture.alpha.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE], [fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]].sort());
   assert.equal(coordinated.length, 1, '空间够时中等来源随会话等待，不单独协调');
+
+  // Room for the session's target side, not for the private copy of its source on the same disk (the temporary directory).
+  const [rootDevice, temporaryDevice] = await Promise.all([fixture.root, os.tmpdir()].map(async (directory) => (await fs.stat(directory)).dev));
+  if (rootDevice === temporaryDevice) {
+    await initial.restore();
+    const betaBytes = cramped.deferred[0].size?.bytes;
+    assert.ok(betaBytes > 0, JSON.stringify(cramped.deferred[0]));
+    const targetSideOnly = async () => {
+      const files = await targetFiles();
+      return files + largeMergeTargetBytes([{ databaseBytes: betaBytes }], estimatedTargetIndexBytes(files), 64 * MiB) + MiB;
+    };
+    const copyTooMuch = await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths,
+      { configurationRootPath: fixture.root, database: window }, { ...limits, coordinateOversized, freeSpace: targetSideOnly }));
+    assert.deepEqual(copyTooMuch.merged.map((item) => item.candidateId), [fixture.alpha.id], '放不下来源的私有副本：中等来源照常合并');
+    assert.equal(coordinated.length, 2);
+  }
 });
 
 test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间不足（中文、没有系统原文），后面的来源也不开始准备，不留备份和登记', { timeout: 300_000 }, async (t) => {
@@ -454,6 +548,7 @@ test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间�
   assert.deepEqual(await targetBackups(fixture), []);
   assert.deepEqual(await registrations(fixture), []);
   assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
+
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -857,6 +952,17 @@ async function deadProcessId() {
 
 function backupsDirectory(fixture) {
   return path.join(path.dirname(fixture.current.binding.paths.dataRootPath), 'merge-backups');
+}
+
+/** The same, synchronously (from a progress callback). */
+function backupNamesNow(fixture) {
+  try { return fsSync.readdirSync(backupsDirectory(fixture)).sort(); } catch { return []; }
+}
+
+async function writeRegistration(fixture, registration) {
+  const directory = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'preparing-backups');
+  await fs.mkdir(directory, { recursive: true });
+  await fs.writeFile(path.join(directory, `${registration.name}.json`), JSON.stringify(registration));
 }
 
 async function targetBackups(fixture) {
