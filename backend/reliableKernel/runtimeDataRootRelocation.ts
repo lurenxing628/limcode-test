@@ -26,6 +26,7 @@ import {
   type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
 import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
+import { summarizeRuntimeDataSet } from './runtimeDataSetPreflight';
 import { parseRelocatedWorkInventory, type RelocatedWorkInventory } from './relocatedWorkInventory';
 import {
   readRuntimeDataSetMergeLedger, runtimeDataSetLastMerge, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
@@ -42,7 +43,7 @@ import {
   assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
   markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
   selectVscodeRuntimeDataSet, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, VSCODE_RUNTIME_SELECTION_FILE,
-  VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate
+  VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
 } from './vscodeRootAuthority';
 
 /**
@@ -245,6 +246,32 @@ export interface DataRootRelocationPlan {
   problems: string[];
   /** Shown before confirmation; the relocation may still proceed. */
   warnings: string[];
+  /**
+   * Work an earlier relocation carried away from this directory that is not settled here yet (see
+   * inspectEarlierMovedWork): moved on once more it would run in both new directories. The
+   * relocation goes ahead only once it is settled (DataRootRelocationOptions.settleEarlierMovedWork).
+   */
+  earlierMovedWork?: DataRootEarlierMovedWork;
+}
+
+/** See DataRootRelocationPlan.earlierMovedWork. */
+export interface DataRootEarlierMovedWork {
+  /** The earlier relocation whose moved notice this directory keeps, and where it moved the data. */
+  relocationId: string;
+  targetRootPath: string;
+  dataSets: DataRootEarlierMovedDataSet[];
+}
+
+export interface DataRootEarlierMovedDataSet {
+  id: string;
+  dataSetId: string;
+  state: 'pending' | 'consented';
+  /** It cannot be inspected now: it may hold that work, and it cannot be settled either. */
+  unreadable?: true;
+  /** For people: its project folder names, else which kind of library it is. */
+  label: string;
+  /** The Conversations with that work, as the earlier relocation's inventory named them. */
+  conversations: Array<{ conversationId: string; title: string }>;
 }
 
 export interface StagedDataRootRelocation {
@@ -310,6 +337,13 @@ export interface DataRootRelocationOptions extends Pick<RuntimeDataSetMergeOptio
    * admissions still held; otherwise it stays as it is for the caller (see completeDataRootRelocation).
    */
   pointerUnchanged?(): Promise<boolean>;
+  /**
+   * Settles, before anything moves, the work an earlier relocation carried away from data set `id`
+   * of the old directory and that is not settled there yet (DataRootRelocationPlan.earlierMovedWork;
+   * the user chose so when confirming, which is the consent); throws when not all of it could be.
+   * Without it such work refuses the relocation.
+   */
+  settleEarlierMovedWork?(dataSet: { id: string; dataSetId: string }): Promise<void>;
 }
 
 /** See DATA_ROOT_MOVED_NOTICE_FILE. */
@@ -659,6 +693,14 @@ export async function planDataRootRelocation(input: {
     others.push({ ...identityOf(candidate), ...size, ...(leaveBehind ? { leaveBehind } : {}) });
   }
   const unreadable = inspection.problems.map((problem) => ({ id: problem.id, reason: `无法读取：${problem.message}` }));
+  // Moved on once more, work an earlier relocation carried away and not settled here would run twice.
+  let earlierMovedWork: DataRootEarlierMovedWork | undefined;
+  try {
+    earlierMovedWork = await inspectEarlierMovedWork(sourceRootPath, inspection);
+  } catch (error) {
+    problems.push(`无法确认上一次迁移迁走的任务在这里都已收尾（${errorMessage(error)}），为免它们再被迁走、执行两次，这次不迁移。`);
+  }
+  if (earlierMovedWork?.dataSets.some((item) => item.unreadable)) problems.push(...describeEarlierMovedWork(earlierMovedWork));
   for (const problem of inspection.problems) {
     warnings.push(`旧目录里有一个无法读取的历史库不会被迁移，仍留在旧目录：${problem.message}`);
   }
@@ -738,8 +780,62 @@ export async function planDataRootRelocation(input: {
   }
   return {
     sourceRootPath, targetRootPath, target, current, others, unreadable, configurationBytes, configurationEntries,
-    space: spaceEstimate.space, sameDevice: spaceEstimate.sameDevice, hardLinks: spaceEstimate.hardLinks, undoesEarlierAttempt: classified.undoes, problems, warnings
+    space: spaceEstimate.space, sameDevice: spaceEstimate.sameDevice, hardLinks: spaceEstimate.hardLinks, undoesEarlierAttempt: classified.undoes, problems, warnings,
+    ...(earlierMovedWork ? { earlierMovedWork } : {})
   };
+}
+
+/**
+ * The work an earlier relocation carried away from this directory (its moved notice) that is not
+ * settled here yet, per data set still here as it was: one reset or replaced since holds none of it,
+ * one deleted since is gone with it, and one that cannot be inspected now counts (`unreadable`). A
+ * relocation from here would carry that work once more (it would run in both new directories) and
+ * its new notice would replace the one that keeps it from running here. A notice that cannot be
+ * read or understood throws: nothing about that work is known then.
+ */
+export async function inspectEarlierMovedWork(root: string, known?: VscodeRuntimeDataSetInspection): Promise<DataRootEarlierMovedWork | undefined> {
+  const read = await inspectDataRootMovedNotice(root);
+  if ('invalid' in read) throw new DataRootRelocationError('data-root-moved-notice-invalid', `当前数据目录里的“数据已迁走”标记读不懂：${read.invalid}`);
+  if (!('notice' in read) || !read.notice.carriedWork) return undefined;
+  const inspection = known ?? await inspectVscodeRuntimeDataSets({ globalStoragePath: root });
+  const dataSets: DataRootEarlierMovedDataSet[] = [];
+  for (const item of read.notice.carriedWork.dataSets) {
+    if (item.settlement.state === 'settled') continue;
+    const candidate = inspection.candidates.find((entry) => entry.id === item.id);
+    const unreadable = !candidate && inspection.problems.some((problem) => problem.id === item.id
+      || (problem.id === 'workspace-scopes' && item.id.startsWith('workspace:')) || (problem.id === 'default' && item.id === 'default'));
+    if (!unreadable && candidate?.dataSetId !== item.dataSetId) continue;
+    const summary = candidate ? await summarizeRuntimeDataSet(candidate).catch(() => undefined) : undefined;
+    dataSets.push({
+      id: item.id, dataSetId: item.dataSetId, state: item.settlement.state,
+      ...(unreadable ? { unreadable: true as const } : {}),
+      label: summary?.projectNames.length ? summary.projectNames.join('、') : item.id === 'default' ? '默认历史库' : '旧工作区历史',
+      conversations: item.inventory.conversations.map((conversation) => ({ conversationId: conversation.conversationId, title: conversation.title }))
+    });
+  }
+  return dataSets.length > 0 ? { relocationId: read.notice.relocationId, targetRootPath: read.notice.targetRootPath, dataSets } : undefined;
+}
+
+/** For people: which libraries still hold such work, why that stops a relocation, and what to do. */
+export function describeEarlierMovedWork(work: DataRootEarlierMovedWork): string[] {
+  const conversations = (item: DataRootEarlierMovedDataSet): string => {
+    const titles = item.conversations.slice(0, 3).map((conversation) => `“${conversation.title || conversation.conversationId}”`).join('、');
+    return `${item.conversations.length} 个对话（${titles}${item.conversations.length > 3 ? ' 等' : ''}）`;
+  };
+  return [
+    `这些历史库里还有上一次迁移到 ${work.targetRootPath} 时迁走、但这里还没收尾的任务；再迁移一次它们会跟着迁走，在两个新目录里各执行一次：`,
+    ...work.dataSets.map((item) => `历史库“${item.label}”${item.unreadable ? '（现在读不出来，无法收尾）' : ''}：${conversations(item)}`),
+    work.dataSets.some((item) => item.unreadable)
+      ? '读不出来的历史库要等它能读了才能收尾；在这之前不能迁移。'
+      : '可以在迁移确认框里选“先把这些任务按中止收尾，再迁移”；也可以先在这里打开它们（“历史与存储管理”里切换为当前历史库，打开时会先收尾），再迁移。'
+  ];
+}
+
+/** Such work the confirmation did not name: another relocation's notice, or a data set it did not list. */
+function unconfirmedEarlierMovedWork(earlier: DataRootEarlierMovedWork | undefined, confirmed: DataRootEarlierMovedWork | undefined): boolean {
+  if (!earlier) return false;
+  const named = new Set((confirmed?.dataSets ?? []).map((item) => `${item.id}\0${item.dataSetId}`));
+  return earlier.relocationId !== confirmed?.relocationId || earlier.dataSets.some((item) => !named.has(`${item.id}\0${item.dataSetId}`));
 }
 
 async function placementProblems(rawTarget: string, sourceRootPath: string, targetRootPath: string): Promise<string[]> {
@@ -1153,7 +1249,8 @@ async function revalidatePlan(planned: DataRootRelocationPlan, installation?: st
   }
   if (target.kind === 'invalid') problems.push(target.message);
   if (problems.length > 0) throw new DataRootRelocationError('data-root-relocation-precondition', problems.join('\n'));
-  if (current.id !== planned.current.id || current.dataSetId !== planned.current.dataSetId
+  const unplanned = unconfirmedEarlierMovedWork(await inspectEarlierMovedWork(planned.sourceRootPath, inspection), planned.earlierMovedWork);
+  if (current.id !== planned.current.id || current.dataSetId !== planned.current.dataSetId || unplanned
     || current.rootInstanceId !== planned.current.rootInstanceId || !isDeepStrictEqual(target, planned.target)) {
     throw new DataRootRelocationError('data-root-relocation-changed', '确认之后当前历史库或新数据目录发生了变化，请重新开始迁移。');
   }
@@ -1261,6 +1358,7 @@ export async function completeDataRootRelocation(
     let outcome: Omit<DataRootRelocationResult, 'targetRootPath'>;
     let carried: DataRootCarriedDataSet[] = [];
     try {
+      await settleEarlierMovedWork(plan, options);
       const current = await resolveVscodeRuntimeDataSet(sourcePaths, plan.current.id);
       // Only the data sets that move must be offline; another one still in use stays behind.
       await assertRuntimeHostsOffline(createRuntimeRootPaths(current.runtimeDataRootPath));
@@ -1363,6 +1461,39 @@ export async function completeDataRootRelocation(
       .catch((error: unknown) => console.warn('[LimCode] 清除新目录里过时的“数据已迁走”标记失败。', error));
     return { targetRootPath: target, ...outcome };
   }));
+}
+
+/**
+ * First in the exclusive phase, under the old directory's admission and before the target changes
+ * any further: work an earlier relocation carried away from here and not settled here must not move
+ * on. It is settled through the caller (the user chose so when confirming, which is the consent for
+ * data sets not consented yet), each data set as at its open; anything left fails the relocation
+ * (undone like any failure before the switch), and so does such work without that choice.
+ */
+async function settleEarlierMovedWork(plan: DataRootRelocationPlan, options: DataRootRelocationOptions): Promise<void> {
+  const source = plan.sourceRootPath;
+  const earlier = await inspectEarlierMovedWork(source);
+  if (!earlier) return;
+  const refuse = (work: DataRootEarlierMovedWork, cause?: unknown): DataRootRelocationError => new DataRootRelocationError(
+    'data-root-relocation-earlier-moved-work', describeEarlierMovedWork(work).join('\n'), cause);
+  if (!options.settleEarlierMovedWork || earlier.dataSets.some((item) => item.unreadable)) throw refuse(earlier);
+  // Choosing to settle consents to what the confirmation named, not to what turned up since.
+  if (unconfirmedEarlierMovedWork(earlier, plan.earlierMovedWork)) {
+    throw new DataRootRelocationError('data-root-relocation-changed', '确认之后当前目录里又有了确认框没有列出的、上一次迁移迁走还没收尾的任务，本次不迁移；请重新开始迁移。');
+  }
+  options.onProgress?.('正在把上一次迁走、这里还没收尾的任务按中止收尾');
+  const pending = earlier.dataSets.filter((item) => item.state === 'pending').map((item) => item.id);
+  if (pending.length > 0) await consentToDataRootMovedWork(source, earlier.relocationId, options.installation ?? 'data-root-relocation', pending);
+  for (const item of earlier.dataSets) {
+    try {
+      await options.settleEarlierMovedWork({ id: item.id, dataSetId: item.dataSetId });
+    } catch (error) {
+      throw new DataRootRelocationError('data-root-relocation-earlier-moved-work',
+        `上一次迁移到 ${earlier.targetRootPath} 时迁走、这里还没收尾的任务没能全部收尾（历史库“${item.label}”：${errorMessage(error)}），这次不迁移；可以稍后重试。`, error);
+    }
+  }
+  const left = await inspectEarlierMovedWork(source);
+  if (left) throw refuse(left);
 }
 
 /**

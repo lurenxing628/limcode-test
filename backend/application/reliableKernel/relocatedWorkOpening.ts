@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
+import { ReliableKernelApplication, type ReliableKernelApplicationDependencies } from '../../reliableKernel/runtimeApplication';
 import {
   DataRootRelocationError,
   DataRootUnavailableError,
@@ -14,11 +14,15 @@ import {
 } from '../../reliableKernel/runtimeDataRootRelocation';
 import { DOMAIN_REPOSITORIES } from '../../reliableKernel/repositories';
 import {
+  createVscodeRootAuthority,
   resolveVscodeRuntimeDataSet,
   resolveVscodeRuntimeDataSetScopeRoot,
   type VscodeWorkspaceRuntimePlacement
 } from '../../reliableKernel/vscodeRootAuthority';
 import { settleRelocatedWork, type RelocatedWorkSettlementResult } from './relocatedWorkSettlement';
+
+/** Where a data set of a directory is (the placement of a Runtime that opens it). */
+type DataSetPlacement = Pick<VscodeWorkspaceRuntimePlacement, 'configurationRootPath' | 'runtimeScopeRootPath'>;
 
 /**
  * Opening a data set of an old directory whose data a relocation moved away with unfinished work
@@ -42,7 +46,7 @@ export interface RelocatedWorkOpening {
  * too ('moved-notice-invalid': it might name this data set), and so does one whose relocation is
  * still under way ('relocating': it may yet be undone, see dataRootMovedNoticeUnderWay).
  */
-export async function relocatedWorkBeforeOpen(placement: VscodeWorkspaceRuntimePlacement): Promise<RelocatedWorkOpening | undefined> {
+export async function relocatedWorkBeforeOpen(placement: DataSetPlacement): Promise<RelocatedWorkOpening | undefined> {
   const root = placement.configurationRootPath;
   let read: Awaited<ReturnType<typeof inspectDataRootMovedNotice>>;
   try {
@@ -80,7 +84,7 @@ export interface RelocatedWorkHoldingRuntime {
 }
 
 export async function openSettlingRelocatedWork<T extends RelocatedWorkHoldingRuntime>(
-  placement: VscodeWorkspaceRuntimePlacement,
+  placement: DataSetPlacement,
   by: string,
   open: (holdForRelocatedWork: boolean) => Promise<T>
 ): Promise<T> {
@@ -138,6 +142,48 @@ export async function settleRelocatedWorkOnOpen(application: ReliableKernelAppli
     .catch((error: unknown) => console.warn('[LimCode] 记下没有收尾的迁走任务失败。', error));
   throw new DataRootUnavailableError(opening.root, 'moved-work-unsettled', new RelocatedWorkLeftError(items));
 }
+
+/**
+ * Settles the work an earlier relocation carried away from data set `id` of this old directory
+ * without opening it for use, before a new relocation moves it on (see
+ * DataRootRelocationOptions.settleEarlierMovedWork, its consent recorded first): its Runtime opens
+ * with its convergence held and with nothing that could run work (no model, tool or MCP call, no
+ * Turn compiled), is settled exactly as at an open (settleRelocatedWorkOnOpen) and closes again; it
+ * is never recovered and its convergence never released. Throws what that throws when not all of it
+ * could be settled (what was left is recorded, the consent stays: a retry settles the rest).
+ */
+export async function settleEarlierMovedWorkOffline(configurationRootPath: string, id: string, by: string): Promise<void> {
+  const opening = await relocatedWorkBeforeOpen({
+    configurationRootPath, runtimeScopeRootPath: resolveVscodeRuntimeDataSetScopeRoot(configurationRootPath, id)
+  });
+  if (!opening) return;
+  const { runtimeDataRootPath } = await resolveVscodeRuntimeDataSet({ globalStoragePath: configurationRootPath }, id);
+  const application = await ReliableKernelApplication.open(
+    createVscodeRootAuthority({ configurationRootPath, runtimeDataRootPath }), SETTLING_ONLY
+  );
+  try {
+    await settleRelocatedWorkOnOpen(application, opening, by);
+  } finally {
+    await application.close();
+  }
+}
+
+/** Everything that could run work refuses: the Runtime above only takes the stop transitions. */
+const SETTLING_ONLY: ReliableKernelApplicationDependencies = (() => {
+  const refuse = (what: string) => (): never => {
+    throw new Error(`迁移前收尾迁走的任务时不执行任何工作（${what}）。`);
+  };
+  return {
+    holdRuntimeConvergence: true,
+    authorityCompiler: { compile: async () => refuse('开始回合')() },
+    resolveWorkEnvironment: () => undefined,
+    mcpConnections: { toolAnnotations: async () => refuse('MCP')(), callTool: async () => refuse('MCP')() },
+    mcpPolicyGate: { authorize: async () => refuse('MCP')() },
+    attachmentSettings: { loadGlobalSettings: async () => refuse('附件')() },
+    providers: { resolve: refuse('模型') },
+    toolDispatcher: { definitions: () => [], dispatch: async () => refuse('工具')() }
+  };
+})();
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

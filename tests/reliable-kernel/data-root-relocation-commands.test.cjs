@@ -154,6 +154,11 @@ function fixture({
         constructor(code, message) { super(message); this.code = code; }
       },
       formatBytes: (bytes) => `${bytes} B`,
+      describeEarlierMovedWork: (work) => [
+        `这些历史库里还有上一次迁移到 ${work.targetRootPath} 时迁走、但这里还没收尾的任务：`,
+        ...work.dataSets.map((item) => `历史库“${item.label}”`),
+        '（出路）'
+      ],
       planDataRootRelocation: async ({ targetRootPath, sourceDatabase }) => {
         calls.push(['plan', targetRootPath, sourceDatabase === database]);
         return planFor(targetRootPath);
@@ -169,9 +174,13 @@ function fixture({
         }
         return staged;
       },
-      completeDataRootRelocation: async (input, publish) => {
+      completeDataRootRelocation: async (input, publish, options) => {
         assert.equal(input, staged);
         calls.push(['complete']);
+        // Work an earlier relocation carried away: settled through the option the command gives.
+        if (options.settleEarlierMovedWork) {
+          for (const dataSet of (plan.earlierMovedWork ?? { dataSets: [] }).dataSets) await options.settleEarlierMovedWork({ id: dataSet.id, dataSetId: dataSet.dataSetId });
+        }
         if (completeError) {
           if (cleanup) cleanupStates.set(completeError, cleanup);
           throw completeError;
@@ -242,6 +251,9 @@ function fixture({
     '../../shared/extensionIdentity': {
       EXTENSION_BRAND: 'Limcode test',
       EXTENSION_COMMAND_IDS: { openPanel: 'limcode-test.openPanel' }
+    },
+    '../../backend/application/reliableKernel/relocatedWorkOpening': {
+      settleEarlierMovedWorkOffline: async (root, id, by) => { calls.push(['settle-earlier', root, id, typeof by]); }
     },
     '../dataRootPrompts': {
       askInSettingsPage: async (hostArgument, clientId, prompt) => {
@@ -435,6 +447,40 @@ test('其它窗口没有让出（go 之后又开始了任务）：撤销准备�
   assert.equal(f.calls.filter((call) => call[0] === 'status').at(-1)[1].pendingRelocation, null);
   assert.match(JSON.stringify(f.prompts.at(-1)), /其它窗口开始让出后1 个其它窗口有任务正在进行/);
   assert.ok(!f.calls.some((call) => call[0] === 'command'));
+});
+
+test('遗留风险 1 确认框：当前目录里还有上一次迁走、没收尾的任务时逐库列出原因，唯一的出路是“先把这些任务按中止收尾，再迁移”（取消或旧的“迁移并重载”都不迁移）；选了才把离线收尾交给迁移', async () => {
+  const earlierMovedWork = {
+    relocationId: 'r-earlier', targetRootPath: '/data/b-home',
+    dataSets: [{ id: 'workspace:a', dataSetId: 'alpha', state: 'consented', label: '迁走项目', conversations: [{ conversationId: 'c-1', title: '部署脚本' }] }]
+  };
+  const declined = fixture({ plan: { earlierMovedWork }, answers: [{ choice: 'relocate', include: [] }] });
+  await declined.commands.relocateDataRoot(declined.context, declined.startup, declined.request);
+  const confirmation = declined.prompts.at(-1);
+  assert.deepEqual(confirmation.actions.map((action) => [action.key, action.label]), [['cancel', '取消'], ['settle-and-relocate', '先把这些任务按中止收尾，再迁移']]);
+  const section = confirmation.sections.find((entry) => entry.title === '上一次迁走、这里还没收尾的任务：');
+  assert.deepEqual(section.lines.slice(0, 2), ['这些历史库里还有上一次迁移到 /data/b-home 时迁走、但这里还没收尾的任务：', '历史库“迁走项目”']);
+  assert.match(section.lines.at(-1), /所有窗口让出之后、复制任何内容之前，这些历史库在这里按中止收尾（不执行任何工作）/);
+  assert.ok(!declined.kinds().includes('stage'), '没选收尾：不迁移');
+
+  const chosen = fixture({ plan: { earlierMovedWork }, answers: [{ choice: 'settle-and-relocate', include: [] }] });
+  await chosen.commands.relocateDataRoot(chosen.context, chosen.startup, chosen.request);
+  assert.deepEqual(chosen.calls.find((call) => call[0] === 'settle-earlier'), ['settle-earlier', SOURCE, 'workspace:a', 'string'], '离线收尾交给迁移的独占阶段');
+  assert.ok(chosen.kinds().indexOf('complete') < chosen.kinds().indexOf('settle-earlier'));
+
+  const plainRelocation = fixture({ answers: [{ choice: 'relocate', include: [] }] });
+  await plainRelocation.commands.relocateDataRoot(plainRelocation.context, plainRelocation.startup, plainRelocation.request);
+  assert.ok(!plainRelocation.kinds().includes('settle-earlier'), '没有这样的任务时不给这个选项');
+});
+
+test('遗留风险 1 失败提示：离线收尾没能全部收尾而不迁移时，提示逐条写明剩下的是什么、在哪个对话、为什么', async () => {
+  const items = [{ conversationId: 'c-1', title: '部署脚本', list: 'activeTurnIds', id: 'turn-1', why: 'live', detail: '' }];
+  const left = Object.assign(new Error('还剩 1 项'), { items });
+  const failure = Object.assign(new Error('上一次迁移迁走、这里还没收尾的任务没能全部收尾'), { cause: Object.assign(new Error('没有全部收尾'), { cause: left }) });
+  const f = fixture({ answers: [{ choice: 'relocate', include: [] }], completeError: failure, cleanup: 'cleaned' });
+  await f.commands.relocateDataRoot(f.context, f.startup, f.request);
+  const error = f.calls.find((call) => call[0] === 'error');
+  assert.match(error[2].detail, /(Error: )?上一次迁移迁走、这里还没收尾的任务没能全部收尾\n还没收尾的项：\n· 对话“部署脚本”里的进行中的回合（turn-1）：另一个 LimCode 窗口正在执行或占着它/);
 });
 
 test('运行时关闭后迁移失败：迁移自身已撤销时不再重复；没能撤销时再撤销一次，仍失败就保留进行中记录留给下次启动；关闭运行时本身失败也会撤销', async () => {

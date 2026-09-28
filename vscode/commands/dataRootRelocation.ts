@@ -18,8 +18,9 @@ import {
   stageDataRootRelocation, inspectDataRootMovedNotice, DATA_ROOT_MOVED_NOTICE_FILE,
   sweepDataRootRelocationLeftovers, type DataRootCarriedWorkLeftItem, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
   type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation,
-  consentToDataRootMovedWork,
+  consentToDataRootMovedWork, describeEarlierMovedWork,
 } from '../../backend/reliableKernel/runtimeDataRootRelocation';
+import { settleEarlierMovedWorkOffline } from '../../backend/application/reliableKernel/relocatedWorkOpening';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
 import {
   clearExclusiveMaintenanceKey, type ExclusiveMaintenanceBusy, type RuntimeExclusiveMaintenanceOutcome
@@ -127,12 +128,21 @@ export async function relocateDataRoot(context: vscode.ExtensionContext, startup
     await tell(ask, '本窗口有任务正在进行', ['请等任务结束（或停止任务）后再迁移数据目录。']);
     return;
   }
+  // Work an earlier relocation carried away from here and not settled here would move again and run
+  // twice: the relocation goes ahead only when the user has it settled first (that choice is the consent).
+  const earlier = plan.earlierMovedWork;
   const confirmed = await ask({
     title: '迁移数据目录并重载所有 LimCode 窗口？',
-    sections: describePlan(plan),
-    actions: [CANCEL, { key: 'relocate', label: '迁移并重载' }]
+    sections: [
+      ...(earlier ? [{ title: '上一次迁走、这里还没收尾的任务：', lines: [
+        ...describeEarlierMovedWork(earlier).slice(0, -1),
+        '选“先把这些任务按中止收尾，再迁移”：所有窗口让出之后、复制任何内容之前，这些历史库在这里按中止收尾（不执行任何工作），它们在上一次的新目录里不受影响；收尾不了（例如另一个窗口正占着）就不迁移，并逐条说明。'
+      ] }] : []),
+      ...describePlan(plan)
+    ],
+    actions: [CANCEL, earlier ? { key: 'settle-and-relocate', label: '先把这些任务按中止收尾，再迁移' } : { key: 'relocate', label: '迁移并重载' }]
   });
-  if (confirmed.choice !== 'relocate') return;
+  if (confirmed.choice !== (earlier ? 'settle-and-relocate' : 'relocate')) return;
   await runRelocation(context, host, plan, ask);
 }
 
@@ -213,6 +223,10 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
               return publishRelocation(context, plan, relocationId, publication);
             }, {
               onProgress: report, movedBy: installation, installation: installation.id,
+              // Chosen when confirming (see relocateDataRoot); settled offline as at an open of each data set.
+              ...(plan.earlierMovedWork ? {
+                settleEarlierMovedWork: (dataSet: { id: string }) => settleEarlierMovedWorkOffline(plan.sourceRootPath, dataSet.id, installation.id)
+              } : {}),
               // A failed switch is undone right there only when the pointer is read again and did not switch.
               pointerUnchanged: async () => await pointerSwitchedTo(context, plan.targetRootPath, relocationId) === false
             });
@@ -276,7 +290,9 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
   // Undone: nothing is in progress any more. Otherwise the record stays, and the next startup
   // (a new process: this one then counts as ended) undoes the rest.
   if (cleaned) await updateGlobalStatusDataRoot(context, { pendingRelocation: null, expectedPendingRelocationId: relocationId }).catch(() => undefined);
-  const message = describeError(failure);
+  // What settling the earlier relocation's work left, item by item (see settleEarlierMovedWork).
+  const left = leftOf(failure);
+  const message = [describeError(failure), ...(left?.length ? describeCarriedWorkLeft(left).slice(0, -1) : [])].join('\n');
   console.error('[LimCode] 数据目录迁移失败。', failure);
   if (pointerUnknown) {
     await vscode.window.showErrorMessage('无法确认数据目录迁移的结果', {
@@ -856,10 +872,13 @@ function describeMovedWork(notice: DataRootMovedNotice): string[] {
   ];
 }
 
-/** What the refused open could not settle (its error), else what the notice last recorded. */
+/** What a refused settlement left, from its error's causes (see RelocatedWorkLeftError). */
 function leftOf(error: unknown): readonly DataRootCarriedWorkLeftItem[] | undefined {
-  const items = ((error as { cause?: unknown } | undefined)?.cause as { items?: unknown } | undefined)?.items;
-  return Array.isArray(items) ? items as DataRootCarriedWorkLeftItem[] : undefined;
+  for (let cause = error, depth = 0; cause && depth < 4; cause = (cause as { cause?: unknown }).cause, depth += 1) {
+    const items = (cause as { items?: unknown }).items;
+    if (Array.isArray(items)) return items as DataRootCarriedWorkLeftItem[];
+  }
+  return undefined;
 }
 
 function latestLeft(notice: DataRootMovedNotice | undefined): readonly DataRootCarriedWorkLeftItem[] {
