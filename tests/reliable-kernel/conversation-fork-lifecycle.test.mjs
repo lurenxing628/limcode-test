@@ -133,6 +133,8 @@ async function withForkRuntime(run, {
     // ownership pins, configuration stores, context writer and agent loop remain real.
     facade = Object.create(Facade.prototype);
     facade.product = { application: app, configuration };
+    // Deleting a conversation records it beside the merge ledger of this configuration root.
+    facade.runtimePlacement = { configurationRootPath: path.join(directory, 'configuration') };
     facade.writeGate = new RuntimeWriteGate();
     facade.historyEntries = [];
     facade.refreshConversationHistory = async () => {};
