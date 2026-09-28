@@ -180,10 +180,11 @@ export interface RuntimeDataSetMergeFinalization {
 
 /**
  * Evidence of a committing transaction's inserted rows, for convergence after a crash: every inserted
- * Conversation and a bounded sample of the other rows (see RuntimeDataSetMergeEvidence; the
- * transaction is atomic, so the sample answers as the whole set would), and how many rows it inserts
- * and reuses (what a converged merge reports). A streamed transaction's evidence is written empty
- * with its committing record and completed right before its commit.
+ * Conversation (recorded as merged into the target) and a bounded sample of the other rows (see
+ * RuntimeDataSetMergeEvidence), and how many rows it inserts and reuses (what a converged merge
+ * reports). Whether it committed is read off its marker row in the target, keyed by `commitId`. A
+ * streamed transaction's evidence is written empty with its committing record and completed right
+ * before its commit.
  */
 export interface RuntimeDataSetMergeCommit {
   kind: typeof COMMIT_KIND;

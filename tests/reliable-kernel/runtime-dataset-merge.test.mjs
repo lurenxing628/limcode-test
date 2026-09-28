@@ -28,6 +28,7 @@ const {
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { runExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
+const tombstones = kernelFile('runtimeMergeTombstones.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeMergeLedgerRoot, resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
@@ -556,7 +557,7 @@ test('来源收尾（备份与终态转换）期间在所持的 admission 与来
   for (const claim of claims) await assert.rejects(fs.access(path.join(claim, 'activity.json')));
 });
 
-test('提交记录与当前库对不上（部分存在）时不猜测，拒绝并提示手动处理；提交前崩溃的来源在切换当前库后仍会合并', async (t) => {
+test('盲审2 merge #1：收敛只看本次提交专属的标记行：提交后崩溃时证据里多出一个从没插入的对话，照样按已合并收敛，那个对话不记入账本；提交前崩溃的来源在切换当前库后仍会合并', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, [{ id: 'conversation_alpha_partial', project: SHARED_PROJECT }]);
   await seed(fixture.beta, [{ id: 'conversation_beta_before_commit', project: SHARED_PROJECT }]);
@@ -571,8 +572,10 @@ test('提交记录与当前库对不上（部分存在）时不猜测，拒绝�
 
   let database = await openTarget(t, fixture.current);
   const report = await merge(fixture, database, { candidateIds: [fixture.alpha.id] });
-  assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-conflict');
-  assert.match(report.blocked[0].message, /上次合并在提交时中断/);
+  assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
+  assert.deepEqual(report.merged.map((item) => [item.candidateId, item.recoveredCommit]), [[fixture.alpha.id, true]], '标记在：整份已提交');
+  assert.deepEqual(await mergedInto(fixture), [[fixture.current.binding.dataSetId, ['conversation_alpha_partial']]],
+    '盲审2 #1：证据里当前库没有的对话不记入账本（以后不会被当成删掉的而跳过）');
   await database.close();
 
   // R6: beta crashed before its commit, so it never reached any data set; switching must not hide it.
@@ -584,6 +587,45 @@ test('提交记录与当前库对不上（部分存在）时不猜测，拒绝�
   const target = readDatabase(gamma);
   try { assert.equal(target.count('conversation', 'id = ?', 'conversation_beta_before_commit'), 1); }
   finally { target.close(); }
+});
+
+test('盲审2 merge #1：两份来源行重叠（alpha 以前并入过 beta），beta 规划后 alpha 抢先提交：beta 的事务整体回滚，按标记判为未提交并放回原记录，再合并时插入 beta 独有的对话', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, [{ id: 'conversation_shared_x', project: SHARED_PROJECT }]);
+  await seed(fixture.beta, [{ id: 'conversation_beta_only_y', project: SHARED_PROJECT }]);
+  // An earlier session: beta was current and alpha was merged into it (alpha's rows are in beta too).
+  await selectVscodeRuntimeDataSet(fixture.paths, fixture.beta.id);
+  const intoBeta = await kernel.RuntimeDatabase.open(fixture.beta.authority, { hostBootId: `window-${randomUUID()}` });
+  try {
+    assert.equal((await merge(fixture, intoBeta, { candidateIds: [fixture.alpha.id], requested: true })).merged.length, 1);
+  } finally { await intoBeta.close(); }
+  await selectVscodeRuntimeDataSet(fixture.paths, 'default');
+  const database = await openTarget(t, fixture.current);
+  const first = await merge(fixture, database, {
+    candidateIds: [fixture.beta.id], requested: true,
+    async onFaultPoint(point) {
+      if (point !== 'after-cas-transfer') return;
+      // Meanwhile (another window) alpha is merged: its conversation x, planned by beta too, is committed first.
+      const other = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+      assert.deepEqual(other.merged.map((item) => item.insertedConversations), [1]);
+    }
+  });
+  assert.deepEqual([first.merged, first.blocked], [[], []]);
+  assert.deepEqual(first.deferred.map((item) => item.code), ['SQLITE_CONSTRAINT_PRIMARYKEY']);
+  assert.equal(await readLedgerRecord(fixture, fixture.beta.id), undefined, '标记不在：没有提交，原来没有记录');
+  assert.deepEqual(await fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'commits')), []);
+  const second = await merge(fixture, database, { candidateIds: [fixture.beta.id], requested: true });
+  assert.deepEqual([second.blocked, second.deferred], [[], []]);
+  assert.deepEqual(second.merged.map((item) => [item.insertedConversations, item.skippedConversations ?? 0, item.recoveredCommit]), [[1, 0, false]]);
+  const record = await readLedgerRecord(fixture, fixture.beta.id);
+  assert.deepEqual(record.mergedInto.map((entry) => [...entry.conversationIds].sort()), [['conversation_beta_only_y']]);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.equal(target.count('conversation', 'id = ?', 'conversation_shared_x'), 1);
+    assert.equal(target.count('conversation', 'id = ?', 'conversation_beta_only_y'), 1);
+    assert.equal(target.count('command_receipt', "source_kind = 'internal' AND source_key LIKE 'historical-merge-commit:%'"), 3,
+      '每次提交一行标记：alpha、beta 进当前库各一行，alpha 进 beta 的那行随 beta 合并进来；回滚的那次没有');
+  } finally { target.close(); }
 });
 
 test('审查 #6：提交前当前库少了一行复用行时事务整体回滚并推迟，下次按实测补齐', async (t) => {
@@ -1495,7 +1537,7 @@ test('盲审 merge #1：跳过的对话按闭包整体不插：之后在来源�
   } finally { target.close(); }
 });
 
-test('盲审 merge #1：提交后崩溃、之后在当前库删了这批里的对话：实测部分存在而受阻，这批插入的对话照样记入账本，之后明确合并时不再插回', async (t) => {
+test('盲审 merge #1：提交后崩溃、之后在当前库删了这批里的对话：按标记收敛为已合并，账本只记还在的对话，删掉的由删除记录挡住，之后明确合并时不再插回', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [
     { id: 'conversation_alpha_crash_keep', project: SHARED_PROJECT },
@@ -1504,10 +1546,14 @@ test('盲审 merge #1：提交后崩溃、之后在当前库删了这批里的�
   const killed = await runChild(['kill', fixture.root, 'after-row-commit']);
   assert.equal(killed.signal, 'SIGKILL', killed.stderr);
   const database = await openTarget(t, fixture.current);
+  // Deleted as the deletion command does: its deletion record first.
+  await tombstones.recordRuntimeDeletedConversations(fixture.root, database.binding, ['conversation_alpha_crash_gone']);
   await new ConversationDeletionControlPlane(database).delete('conversation_alpha_crash_gone');
   const converged = await merge(fixture, database);
-  assert.equal(converged.blocked[0]?.code, 'runtime-data-set-merge-conflict', '消息行删不掉：部分存在，证明事务已提交');
-  assert.deepEqual(await mergedInto(fixture), [[fixture.current.binding.dataSetId, ['conversation_alpha_crash_gone', 'conversation_alpha_crash_keep']]]);
+  assert.deepEqual([converged.blocked, converged.deferred], [[], []]);
+  assert.deepEqual(converged.merged.map((item) => [item.recoveredCommit, item.insertedConversations]), [[true, 2]], '标记在：整份已提交');
+  assert.deepEqual(await mergedInto(fixture), [[fixture.current.binding.dataSetId, ['conversation_alpha_crash_keep']]],
+    '盲审2 #1：只记当前库里实际存在的对话；删掉的那个由删除记录挡住');
   await seed(fixture.alpha, [{ id: 'conversation_alpha_crash_new', project: SHARED_PROJECT }]);
   await requestMerge(fixture, fixture.alpha);
   const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
@@ -1528,7 +1574,8 @@ test('盲审 merge #1：提交后崩溃、没有删对话：下次启动实测�
   const before = totalRows(fixture.current);
   const killed = await runChild(['kill', fixture.root, 'after-row-commit']);
   assert.equal(killed.signal, 'SIGKILL', killed.stderr);
-  const inserted = totalRows(fixture.current) - before;
+  // The commit's own marker row (盲审2 #1) is not one of the merged rows.
+  const inserted = totalRows(fixture.current) - before - 1;
   const database = await openTarget(t, fixture.current);
   const converged = await merge(fixture, database);
   assert.deepEqual(converged.merged.map((item) => [item.recoveredCommit, item.insertedConversations, item.insertedRows]), [[true, 2, inserted]]);

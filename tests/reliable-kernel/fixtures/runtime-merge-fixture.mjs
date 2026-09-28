@@ -282,26 +282,35 @@ export function rawWrite(dataSet, write) {
   } finally { database.close(); }
 }
 
-/** Every row of every Runtime domain table, ordered by id (integers as decimal strings, BLOBs as hex). */
+/**
+ * Every row of every Runtime domain table, ordered by id (integers as decimal strings, BLOBs as hex). A
+ * historical merge's commit markers (one per commit, keyed by its random commit id) count, not show.
+ */
 export function readAll(dataSet) {
   const reader = new Database(dataSet.binding.paths.databasePath, { readonly: true });
   try {
     reader.defaultSafeIntegers(true);
     const all = {};
     for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
-      const rows = reader.prepare(`SELECT * FROM "${schema.table}" ORDER BY id`).all()
+      const found = reader.prepare(`SELECT * FROM "${schema.table}" ORDER BY id`).all();
+      const markers = found.filter((row) => schema.table === 'command_receipt' && row.source_kind === 'internal'
+        && String(row.source_key).startsWith('historical-merge-commit:'));
+      const rows = found.filter((row) => !markers.includes(row))
         .map((row) => JSON.stringify(row, (_key, value) => typeof value === 'bigint' ? `${value}n`
           : value?.type === 'Buffer' && Array.isArray(value.data) ? Buffer.from(value.data).toString('hex') : value));
+      if (markers.length > 0) rows.push(`historical merge commit markers: ${markers.length}`);
       if (rows.length > 0) all[schema.table] = rows;
     }
     return all;
   } finally { reader.close(); }
 }
 
+/** Rows of every Runtime domain table, a historical merge's commit markers left out (no merged rows). */
 export function countRows(dataSet) {
   const reader = new Database(dataSet.binding.paths.databasePath, { readonly: true });
   try {
-    return RUNTIME_DOMAIN_SCHEMAS.reduce((sum, schema) => sum + Number(reader.prepare(`SELECT COUNT(*) FROM "${schema.table}"`).pluck().get()), 0);
+    return RUNTIME_DOMAIN_SCHEMAS.reduce((sum, schema) => sum + Number(reader.prepare(`SELECT COUNT(*) FROM "${schema.table}"${schema.table === 'command_receipt'
+      ? " WHERE NOT (source_kind = 'internal' AND source_key LIKE 'historical-merge-commit:%')" : ''}`).pluck().get()), 0);
   } finally { reader.close(); }
 }
 

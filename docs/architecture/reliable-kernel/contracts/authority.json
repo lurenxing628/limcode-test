@@ -691,7 +691,7 @@
         "conversation_id,created_at"
       ],
       "notes": [
-        "source_kind ∈ {command,callback,internal,recovery}；source_key 为各来源自有键，替代原单一 command_id UNIQUE；Process-owned detached Operation 的 conversation_id/turn_id 为 NULL。"
+        "source_kind ∈ {command,callback,internal,recovery}；source_key 为各来源自有键，替代原单一 command_id UNIQUE；Process-owned detached Operation 的 conversation_id/turn_id 为 NULL；历史合并每次提交在同一事务写一行标记：internal，source_key 为 historical-merge-commit:<commitId>，conversation_id/turn_id 为 NULL。"
       ]
     },
     {

@@ -1513,40 +1513,37 @@ async function settledSource(
       id: candidateId, dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId, ...(label ? { label } : {})
     };
     if (!sameRuntimeDataSetIdentity(record.source, candidate)) return undefined;
-    const commit = await readRuntimeDataSetMergeCommit(paths, record.commitId);
-    const rows = commit?.rows ?? [];
-    const presence = rows.length > 0 ? await insertedRowsPresence(rows, target.database) : 'none';
-    if (presence === 'none') {
+    if (!await mergeCommitCommitted(record.commitId, target.database)) {
       // Nothing of it was committed: the record it replaced is back, and the source is merged again.
       await restoreLedgerRecord(paths, candidateId, record.replaced);
       await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
       return undefined;
     }
+    // Committed, all of it. Its evidence (written before its committing record, removed only with it)
+    // gives the counts and the conversations it inserted; missing or damaged, merged all the same, what
+    // it inserted unknown (a failed read is retried later).
+    const commit = await readRuntimeDataSetMergeCommit(paths, record.commitId).catch((error: unknown) => {
+      if (error instanceof SyntaxError) return undefined;
+      throw error;
+    });
+    if (!commit) console.warn('[LimCode] 上次合并已提交到当前库，但它的提交证据读不出；按已合并记下，插入了哪些对话未知。', candidateId);
     state.fingerprint = record.source;
-    // Some of it is here, so the one transaction committed: every conversation it inserted is on record
-    // as merged here (one the user deleted since is left out of later merges into this data set).
-    const insertedConversationIds = rows.filter(([domain]) => domain === 'Conversation').map(([, id]) => id);
-    if (presence === 'partial') {
-      const outcome: Refusal = { kind: 'blocked', code: 'runtime-data-set-merge-conflict', message: '上次合并在提交时中断，之后当前库里这批对话已有增删，无法确认合并状态；请在历史与存储管理中手动合并。' };
-      await writeRuntimeDataSetMergeLedgerRecord(paths, {
-        candidateId, state: 'blocked', source: record.source, target: target.identity, code: outcome.code, message: outcome.message,
-        insertedConversationIds
-      });
-      state.recorded = true;
-      throw new Outcome(outcome);
-    }
-    // Recorded for the source state that was committed, with the counts its commit evidence gives
-    // (rows are there, so the evidence is); later changes show as changed since merge.
-    const { insertedRows, reusedRows } = commit!;
+    const committed = (commit?.rows ?? []).filter(([domain]) => domain === 'Conversation').map(([, id]) => id);
+    // On record as merged here: of the conversations it inserted those that are here now (one the user
+    // deleted since is left out of later merges into this data set by its deletion record).
+    const insertedConversationIds = await presentConversations(committed, target.database);
+    // Recorded for the source state that was committed, with the counts its commit evidence gives;
+    // later changes show as changed since merge.
+    const { insertedRows, reusedRows } = commit ?? { insertedRows: 0, reusedRows: 0 };
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId, state: 'merged', source: record.source, target: target.identity,
       mergedAt: new Date().toISOString(), insertedRows, reusedRows,
-      insertedConversations: insertedConversationIds.length, insertedConversationIds,
+      insertedConversations: committed.length, insertedConversationIds,
       ...(record.skippedConversations ? { skippedConversations: record.skippedConversations } : {})
     });
     await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
     return { kind: 'merged', result: {
-      ...unchangedResult(candidate, target), insertedRows, reusedRows, insertedConversations: insertedConversationIds.length,
+      ...unchangedResult(candidate, target), insertedRows, reusedRows, insertedConversations: committed.length,
       recoveredCommit: true, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state))
     } };
   });
@@ -2031,20 +2028,23 @@ async function commitLocked(
   try {
     // Synced at its commit (synchronous = FULL for this transaction alone): the merged record written
     // next, and the commit evidence removed with it, never outlive a merge a power loss takes back.
-    await target.database.transaction(plan.steps, { durable: true });
+    await target.database.transaction(commitId === undefined ? plan.steps : [...plan.steps, mergeCommitMarkerStep(commitId)], { durable: true });
   } catch (error) {
-    // One transaction: measured, it either committed completely (only its reply was lost) or
-    // not at all. A proven rollback drops the committing record at once; an unknown outcome
-    // (the target is gone) keeps it for the next startup to converge.
-    const presence = await insertedRowsPresence(plan.inserted, target.database).catch(() => undefined);
-    if (presence === 'none') {
+    // One transaction, all of it or none: its marker tells which (a failure the worker reports was
+    // rolled back, so the marker is not there; a lost reply is read as it is). A proven rollback
+    // drops the committing record at once; an unknown outcome (the target is gone) keeps it for the
+    // next startup to converge.
+    const committed = commitId === undefined
+      ? await insertedRowsPresence(plan.inserted, target.database).then((presence) => presence === 'all' ? true : presence === 'none' ? false : undefined, () => undefined)
+      : await mergeCommitCommitted(commitId, target.database).catch(() => undefined);
+    if (committed === false) {
       target.backup.used = backupUsed;
       if (commitId !== undefined) {
         await restoreLedgerRecord(paths, candidate.id, previous);
         await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
       }
     }
-    if (presence !== 'all') {
+    if (committed !== true) {
       throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
     }
   }
@@ -2730,12 +2730,12 @@ export const RUNTIME_DATA_SET_MERGE_COMMIT_EVIDENCE_ROWS = 2_000;
 const EVIDENCE_PER_END = 50;
 
 /**
- * Evidence of one merge commit, which is one atomic transaction (any row it inserted proves it
- * committed): every inserted Conversation (recorded per target after a crash, see mergedInto) and
- * of every other domain that is no content identity (those may appear in the target on their own)
- * the first and last EVIDENCE_PER_END inserted rows, fewer per domain when that keeps the whole
- * within RUNTIME_DATA_SET_MERGE_COMMIT_EVIDENCE_ROWS (never fewer than the first and the last).
- * Collected row by row in insert order, so a streamed merge holds only this much.
+ * Evidence of one merge commit: every inserted Conversation (recorded per target after a crash, see
+ * mergedInto) and, for diagnosis only, of every other domain that is no content identity the first
+ * and last EVIDENCE_PER_END inserted rows, fewer per domain when that keeps the whole within
+ * RUNTIME_DATA_SET_MERGE_COMMIT_EVIDENCE_ROWS (never fewer than the first and the last). Whether the
+ * commit happened is its marker's alone (mergeCommitMarkerStep): such rows may also come from another
+ * source. Collected row by row in insert order, so a streamed merge holds only this much.
  */
 export class RuntimeDataSetMergeEvidence {
   private readonly conversations: string[] = [];
@@ -2786,10 +2786,51 @@ function mergeCommitEvidence(inserted: ReadonlyArray<readonly [domain: string, i
 }
 
 /**
- * Presence of a merge's inserted rows in the target, counting only rows that exist nowhere else:
- * a content-derived identity (content, project, attachment, observation) may appear in the target
- * independently at any time (another window opens the same folder or stores the same bytes), so it
- * is no evidence of this commit.
+ * The one row of a merge commit that nothing else ever writes: an internal CommandReceipt keyed by the
+ * commit id (no conversation, no turn), inserted by that very transaction. Any other row it inserts may
+ * be in the target without it: another source holding the same rows (one merged into the other before)
+ * may have committed them meanwhile, and that is what fails this transaction. So whether it committed,
+ * all of it or none of it, is read off this row alone (mergeCommitCommitted).
+ */
+function mergeCommitMarkerStep(commitId: string): RepositoryTransactionStep {
+  return DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+    id: mergeCommitMarkerId(commitId), source_kind: 'internal', source_key: `${MERGE_COMMIT_MARKER_KEY}${commitId}`,
+    conversation_id: null, turn_id: null, created_at: new Date().toISOString()
+  });
+}
+
+const MERGE_COMMIT_MARKER_KEY = 'historical-merge-commit:';
+
+function mergeCommitMarkerId(commitId: string): string {
+  return `historical_merge_commit_${commitId}`;
+}
+
+/**
+ * Whether the merge commit `commitId` committed in the target: its marker (mergeCommitMarkerStep) is
+ * there. A transaction the worker reports failed was rolled back by SQLite, so its marker is not; one
+ * whose reply was lost, or that failed only after its commit, is read here as it is. A failed read
+ * throws (the outcome stays unknown).
+ */
+async function mergeCommitCommitted(commitId: string, database: RuntimeDatabase): Promise<boolean> {
+  const [marker] = (await database.snapshot([DOMAIN_REPOSITORIES.domain('CommandReceipt').get(mergeCommitMarkerId(commitId))])).snapshot as Array<DomainRow | null>;
+  return marker !== null && marker !== undefined && marker.source_key === `${MERGE_COMMIT_MARKER_KEY}${commitId}`;
+}
+
+/** Which of these conversations are in the target now. */
+async function presentConversations(ids: readonly string[], database: RuntimeDatabase): Promise<string[]> {
+  const present: string[] = [];
+  for (let start = 0; start < ids.length; start += READ_CHUNK) {
+    const chunk = ids.slice(start, start + READ_CHUNK);
+    const found = (await database.snapshot(chunk.map((id) => DOMAIN_REPOSITORIES.domain('Conversation').get(id)))).snapshot;
+    chunk.forEach((id, index) => { if (found[index] !== null && found[index] !== undefined) present.push(id); });
+  }
+  return present;
+}
+
+/**
+ * Presence of a data-root migration's inserted rows in its fresh target, which nothing else writes
+ * (a migration writes no ledger and no commit marker), counting only rows that exist nowhere else: a
+ * content-derived identity (content, project, attachment, observation) is no evidence of this commit.
  */
 async function insertedRowsPresence(
   inserted: ReadonlyArray<readonly [domain: string, id: string]>,
@@ -3665,7 +3706,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, transferSourceCas, finalizeSource,
   cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
-  unchangedResult, currentResult, insertedRowsPresence, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,
+  unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
   closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory
 });

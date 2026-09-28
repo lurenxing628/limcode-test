@@ -72,10 +72,11 @@ import { createVscodeRootAuthority, inspectVscodeRuntimeDataSets, resolveVscodeR
  *    MERGE_DOMAIN_ORDER and rowid order with exactly the row rules of an online merge (planMergeChunk:
  *    content identities in savepoints, renumbered columns allocated in the transaction, historical
  *    copies, the rows of conversations deleted here since an earlier merge left out) and each chunk's
- *    presence assertions; its bounded commit evidence is completed right before the durable commit,
- *    the WAL is checkpointed (TRUNCATE), and only then is the source recorded as merged. A cancellation
- *    or a full disk rolls back the current source only; the sources merged before it stay. How long
- *    the merged sources took against the size model is kept for later estimates.
+ *    presence assertions; its commit marker is appended after the last chunk and its bounded commit
+ *    evidence completed right before the durable commit, the WAL is checkpointed (TRUNCATE), and only
+ *    then is the source recorded as merged. A cancellation or a full disk rolls back the current source
+ *    only; the sources merged before it stay. How long the merged sources took against the size model
+ *    is kept for later estimates.
  */
 
 /** Source rows compared and appended per chunk (streamed merge and online scan). */
@@ -616,6 +617,8 @@ async function streamMergeTransaction(
   database: RuntimeDatabase,
   input: ChunkedRowsOptions & {
     evidence: RuntimeDataSetMergeEvidence;
+    /** Its commit's marker (the historical merge's mergeCommitMarkerStep), appended after the last chunk. */
+    marker: RepositoryTransactionStep;
     state: HistoricalMergeSourceProgress;
     onChunk(chunk: number, rows: number): Promise<void>;
     /** With what the transaction inserts and reuses, right before its commit. */
@@ -659,6 +662,7 @@ async function streamMergeTransaction(
       return { committed: false, ...merged };
     }
     input.signal?.throwIfAborted();
+    await database.maintenanceAppend([input.marker]).catch(refused);
     await input.beforeCommit({ committed: true, ...merged });
     open = false;
     await database.maintenanceCommit().catch(refused);
@@ -1910,8 +1914,8 @@ async function mergeLocked(
       mergedAt: new Date().toISOString(), insertedRows: inserted.inserted, reusedRows: inserted.reused,
       insertedConversations: inserted.insertedConversations, insertedConversationIds: evidence.conversationIds, ...skipped
     });
-    // The evidence is completed right before the commit: until then it names nothing, so a crash
-    // before the commit converges to "none of it is there" and puts the replaced record back.
+    // The evidence is completed right before the commit (until then it names nothing); whether the
+    // commit happened is read off its marker alone, so a crash before it puts the replaced record back.
     const commitId = await writeRuntimeDataSetMergeCommit(paths, [], { insertedRows: 0, reusedRows: 0 });
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
       candidateId, state: 'committing', source: state.fingerprint!, target: target.identity, commitId, ...(previous ? { replaced: previous } : {}), ...skipped
@@ -1927,7 +1931,7 @@ async function mergeLocked(
     try {
       progress('merging', 0);
       streamed = await streamMergeTransaction(copy.database, target.database, {
-        skipping, chunkRows, ...(signal ? { signal } : {}), evidence, state,
+        skipping, chunkRows, ...(signal ? { signal } : {}), evidence, marker: engine.mergeCommitMarkerStep(commitId), state,
         onChunk: async (chunk, rows) => {
           written.rows = rows;
           progress('merging', rows);
@@ -1951,20 +1955,20 @@ async function mergeLocked(
         }
       });
     } catch (error) {
-      // One transaction: measured, it either committed completely (only its reply was lost) or not at all.
-      const presence = await engine.insertedRowsPresence(evidence.rows(), target.database).catch(() => undefined);
-      if (presence === 'none') {
+      // One transaction, all of it or none: its marker tells which (only its reply was lost, or it was rolled back).
+      const committed = await engine.mergeCommitCommitted(commitId, target.database).catch(() => undefined);
+      if (committed === false) {
         target.backup.used = backupUsed;
         await restoreReplaced(paths, candidateId, previous);
         await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
       }
-      if (presence !== 'all') {
+      if (committed !== true) {
         const wal = await walBytes();
         // The rolled-back transaction's WAL is given back to the disk.
         await target.database.maintenanceCheckpoint().catch(() => undefined);
         throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal));
       }
-      // Every inserted row is there: the transaction committed, so it got to its commit and counted.
+      // Its marker is there: the transaction committed, so it got to its commit and counted.
       streamed = written.counted!;
     }
     if (!streamed.committed) {
