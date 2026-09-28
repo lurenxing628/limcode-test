@@ -397,35 +397,42 @@ test('符号链接不跟随：链接本身、目录里的链接、链接的备�
   assert.deepEqual(await treeSnapshot(outside), before, '链接指向的内容没有被读改');
 });
 
-test('只列出的备份：归档、拷来的目录、旧格式 backups/ 与 .limcode-data-backups 写明名称、位置、大小和原因，不能删除', async (t) => {
+test('只列出的备份：归档目录里不认识的条目、没有库的拷来目录、旧格式 backups/ 与 .limcode-data-backups 写明名称、位置、大小和原因，不能删除；认不出的归档是未通过核验的外来历史库', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one']);
   const database = await openCurrent(t, fixture);
   const archive = path.join(fixture.root, '.limcode-runtime-backups', '20260901-010203-004-abcdef12');
+  const unknown = path.join(fixture.root, '.limcode-runtime-backups', 'notes');
   const copied = `${fixture.root}.limcode-copied-2026-09-02T01-02-03-004Z-12345678`;
   t.after(() => fs.rm(copied, { recursive: true, force: true }));
   const legacy = path.join(controlRoot(fixture.alpha), 'backups');
   const dataBackups = path.join(fixture.root, '.limcode-data-backups');
-  for (const [directory, bytes] of [[archive, 11], [copied, 22], [legacy, 33], [dataBackups, 44]]) {
+  for (const [directory, bytes] of [[archive, 11], [unknown, 5], [copied, 22], [legacy, 33], [dataBackups, 44]]) {
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(directory, 'data.bin'), Buffer.alloc(bytes, 1));
   }
   const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const listed = [archive, copied, legacy, dataBackups].map((directory) => itemAt(plan, directory));
+  for (const directory of [archive, unknown, copied, legacy, dataBackups]) {
+    assert.equal(plan.items.filter((item) => item.path === directory).length, 1, `${directory} 只列出一次`);
+  }
+  const listed = [archive, unknown, copied, legacy, dataBackups].map((directory) => itemAt(plan, directory));
   assert.deepEqual(listed.map((item) => [item.kind, item.deletable, item.bytes, item.name]), [
-    ['reset-archive', false, '11', path.basename(archive)],
+    ['foreign-history', false, '11', path.basename(archive)],
+    ['reset-archive', false, '5', 'notes'],
     ['copied-data-root', false, '22', path.basename(copied)],
     ['legacy-cutover', false, '33', 'backups'],
     ['data-backups', false, '44', '.limcode-data-backups']
   ]);
-  assert.deepEqual(listed.map((item) => item.inCurrentDataSet), [false, false, false, false], '只列出的都不是当前库的一部分（归档就在当前库的目录下也一样）');
-  assert.match(listed[0].reason, /含当时的对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除/);
-  assert.match(listed[1].reason, /含对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除/);
+  assert.deepEqual(listed.map((item) => item.inCurrentDataSet), [false, false, false, false, false], '只列出的都不是当前库的一部分（归档就在当前库的目录下也一样）');
+  assert.match(listed[0].reason, /^未通过核验：历史库不完整.*，原样保留$/);
+  assert.equal(listed[0].origin, '“归档并重置”的归档');
+  assert.equal(listed[1].reason, '归档目录里不是“归档并重置”留下的归档（名字不认识）；只列出，不删除');
+  assert.equal(listed[2].reason, '拷来目录里已经没有库；其余内容（设置、规则、技能）保留，可自行处理');
   assert.equal(listed[0].createdAt, '2026-09-01T01:02:03.004Z');
-  assert.equal(listed[1].createdAt, '2026-09-02T01:02:03.004Z');
+  assert.equal(listed[2].createdAt, '2026-09-02T01:02:03.004Z');
   const result = await deleteRuntimeBackups(plan, database, listed.map((item) => item.key));
-  assert.deepEqual(result.kept.map((item) => item.reason), Array(4).fill('不在可以删除的清单里'));
-  for (const directory of [archive, copied, legacy, dataBackups]) assert.ok((await fs.lstat(directory)).isDirectory());
+  assert.deepEqual(result.kept.map((item) => item.reason), Array(5).fill('不在可以删除的清单里'));
+  for (const directory of [archive, unknown, copied, legacy, dataBackups]) assert.ok((await fs.lstat(directory)).isDirectory());
 });
 
 test('预计释放不计入还有其它硬链接的文件', async (t) => {

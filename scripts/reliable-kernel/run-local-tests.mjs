@@ -195,6 +195,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-dataset-merge.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-state.test.mjs',
   'tests/reliable-kernel/runtime-backup-cleanup.test.mjs',
+  'tests/reliable-kernel/runtime-backup-cleanup-foreign.test.mjs',
   'tests/reliable-kernel/backup-cleanup-commands.test.cjs',
   'tests/reliable-kernel/runtime-foreign-history.test.mjs',
   'tests/reliable-kernel/foreign-history-commands.test.cjs',

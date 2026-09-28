@@ -69,7 +69,7 @@
     "unselectedHistory": "offline-snapshot-read-only-on-demand",
     "historicalEpochUpgrade": "automatic-backup-then-exact-target-offline-upgrade",
     "historyDiscovery": "per-candidate-errors-no-implicit-fallback",
-    "foreignHistory": "verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written",
+    "foreignHistory": "verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself",
     "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [
       "paths",

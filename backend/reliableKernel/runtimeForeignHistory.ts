@@ -12,7 +12,8 @@ import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocation';
 import { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
 import {
-  judgeRuntimeHostLivenessRecords, runtimeHostLivenessDirectory, withRuntimeClaimAtPath, withRuntimeMaintenance
+  judgeRuntimeHostLivenessRecords, RuntimeClaimHeldError, runtimeHostLivenessDirectory, RuntimeMaintenanceBusyError,
+  withRuntimeClaimAtPath, withRuntimeMaintenance, type RuntimeMaintenanceMetadata
 } from './runtimeHostControl';
 import {
   locateLocalRuntimeDataSet, sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot
@@ -253,6 +254,87 @@ async function discoverWith(
   return found;
 }
 
+/**
+ * Control roots of foreign history renamed aside in place (a cleanup of foreign history interrupted
+ * between its rename and its removal), each with the location discovery gives that root once it is
+ * back under its name: in the archives directories of the current and the previous data directory
+ * (an archive), and in every copied directory beside either, in its default root, its workspace
+ * scopes and their archives directories (`.limcode-runtime` or an archive). `renamed` matches such an
+ * entry's name and captures the original name in group 1; only names discovery takes count. Lists
+ * directories only, never through a link.
+ */
+export async function listRenamedForeignRuntimeRoots(
+  input: ForeignRuntimeHistoryInput,
+  renamed: RegExp
+): Promise<Array<{ path: string; originalPath: string; location: ForeignRuntimeRootLocation }>> {
+  const configurationRoot = path.resolve(input.configurationRootPath);
+  const previous = previousDataRoot(configurationRoot, input.previousDataRootPath);
+  const bases = [configurationRoot, ...(previous ? [previous] : [])];
+  const found: Array<{ path: string; originalPath: string; location: ForeignRuntimeRootLocation }> = [];
+  const originalOf = (entry: string): string | undefined => renamed.exec(entry)?.[1];
+  for (const base of bases) {
+    const common = base === configurationRoot ? { kind: 'archive' as const } : { kind: 'archive' as const, side: 'previous' as const, baseDataRootPath: base };
+    const prefix = base === configurationRoot ? '' : `${path.basename(base)}/`;
+    for (const directory of await listVscodeRuntimeArchiveDirectories(base).catch(() => [])) {
+      if (directory.unreadable) continue;
+      const name = `${prefix}${path.relative(base, directory.path).split(path.sep).join('/')}`;
+      for (const entry of (await fs.readdir(directory.path).catch(() => [] as string[])).sort()) {
+        const original = originalOf(entry);
+        if (!original || !ARCHIVE_NAME.test(original)) continue;
+        const containerPath = path.join(directory.path, original);
+        found.push({
+          path: path.join(directory.path, entry), originalPath: containerPath,
+          location: Object.freeze({ ...common, containerPath, containerName: `${name}/${original}`, dataRootRelativePath: VSCODE_RUNTIME_ACTIVE_DIRECTORY })
+        });
+      }
+    }
+  }
+  for (const base of bases) {
+    const side = base === configurationRoot ? 'current' as const : 'previous' as const;
+    const pattern = copiedNamePattern(base);
+    let names: string[];
+    try { names = await fs.readdir(path.dirname(base)); }
+    catch { continue; }
+    for (const containerName of names.filter((entry) => pattern.test(entry)).sort()) {
+      const containerPath = path.join(path.dirname(base), containerName);
+      if (!(await fs.lstat(containerPath).catch(() => undefined))?.isDirectory()) continue;
+      const container = { kind: 'copied' as const, side, baseDataRootPath: base, containerPath, containerName };
+      const namesIn = async (directory: string): Promise<string[]> => {
+        if (directory === containerPath) return fs.readdir(containerPath).catch(() => [] as string[]);
+        const listed = await listContainerDirectory(containerPath, directory).catch(() => 'invalid' as const);
+        return listed === 'invalid' ? [] : listed;
+      };
+      let scopes: Array<{ label: string; relative: string[] }>;
+      try { scopes = await containerScopes(containerPath); }
+      catch { continue; }
+      for (const scope of scopes) {
+        const scopeDirectory = path.join(containerPath, ...scope.relative);
+        for (const entry of (await namesIn(scopeDirectory)).sort()) {
+          if (originalOf(entry) !== VSCODE_RUNTIME_CONTROL_DIRECTORY) continue;
+          found.push({
+            path: path.join(scopeDirectory, entry), originalPath: path.join(scopeDirectory, VSCODE_RUNTIME_CONTROL_DIRECTORY),
+            location: Object.freeze({
+              ...container, dataRootRelativePath: [...scope.relative, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_ACTIVE_DIRECTORY].join('/')
+            })
+          });
+        }
+        const archives = path.join(scopeDirectory, VSCODE_RUNTIME_ARCHIVES_DIRECTORY);
+        for (const entry of (await namesIn(archives)).sort()) {
+          const original = originalOf(entry);
+          if (!original || !ARCHIVE_NAME.test(original)) continue;
+          found.push({
+            path: path.join(archives, entry), originalPath: path.join(archives, original),
+            location: Object.freeze({
+              ...container, dataRootRelativePath: [...scope.relative, VSCODE_RUNTIME_ARCHIVES_DIRECTORY, original, VSCODE_RUNTIME_ACTIVE_DIRECTORY].join('/')
+            })
+          });
+        }
+      }
+    }
+  }
+  return found;
+}
+
 function previousDataRoot(configurationRoot: string, previous: string | undefined): string | undefined {
   if (!previous || !path.isAbsolute(previous)) return undefined;
   const resolved = path.resolve(previous);
@@ -327,6 +409,17 @@ async function readPointerIdentity(
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The identity a discovered root's pointer names (read as a small regular file, not verified): what
+ * discovery took for its id. Undefined when there is no readable pointer.
+ */
+export async function readForeignRuntimePointerIdentity(
+  location: ForeignRuntimeRootLocation,
+  held: HeldDatabaseFiles
+): Promise<{ dataSetId: string; rootInstanceId: string } | undefined> {
+  return readPointerIdentity(location, held);
 }
 
 /**
@@ -461,33 +554,75 @@ export async function withLocatedRuntimeRootFence<T>(
 }
 
 /**
- * The private copy of a located root's database and WAL, taken under its fence: it counts only when
- * both kept their exact state while it was taken (at most 3 attempts; a WAL removed between the two
- * copies changes the state), and none of its database files may be a file of a database this process
- * holds (checked again right before each copy). Shared by verification and by the read-only view.
- * Throws ForeignRuntimeHistoryRejection; a copy that fails is "not verifiable now".
+ * The foreign root's claim ({@link withLocatedRuntimeRootFence}) by id, without waiting: a live
+ * holder (a read-only view opening it, its verification, a merge; in another window or in another
+ * async scope of this one) or one whose state is unknown means `acquired: false`, and the operation
+ * does not run. Joins a claim this scope already holds.
+ */
+export async function tryWithForeignRuntimeRootClaim<T>(
+  configurationRootPath: string,
+  id: string,
+  rootPointerPath: string,
+  operation: () => Promise<T>
+): Promise<{ acquired: true; value: T } | { acquired: false; holder: RuntimeMaintenanceMetadata }> {
+  const claimPath = await foreignRuntimeHistoryFile(configurationRootPath, CLAIMS_DIRECTORY, id, '');
+  let started = false;
+  try {
+    const value = await withRuntimeClaimAtPath(claimPath, rootPointerPath, () => {
+      started = true;
+      return operation();
+    }, { refuseWhenHeld: true });
+    return { acquired: true, value };
+  } catch (error) {
+    if (!started && (error instanceof RuntimeClaimHeldError || error instanceof RuntimeMaintenanceBusyError)) {
+      return { acquired: false, holder: error.owner };
+    }
+    throw error;
+  }
+}
+
+/**
+ * The private copy of a located root's database and WAL, taken under its fence (see
+ * {@link copyForeignRuntimeSqliteFiles}). Shared by verification and by the read-only view.
  */
 export async function copyLocatedRuntimeDatabase(
   root: LocatedRuntimeRoot,
   held: HeldDatabaseFiles
-): Promise<{ databasePath: string; remove(): Promise<void> }> {
+): Promise<{ databasePath: string; files: string; remove(): Promise<void> }> {
+  return copyForeignRuntimeSqliteFiles(root.containerRoot, root.located.databasePath, held);
+}
+
+/**
+ * The private copy of one SQLite database below a foreign container (a root's own, or a backup its
+ * control root keeps), reached without links from `containerRoot`: it counts only when the database
+ * and its WAL kept their exact state while it was taken (at most 3 attempts; a WAL removed between
+ * the two copies changes the state), and none of its files (main, -wal, -shm, -journal) may be a
+ * file of a database this process holds (checked again right before each copy). `files` is that
+ * state (runtimeDataSetFileState). Throws ForeignRuntimeHistoryRejection; a copy that fails is "not
+ * verifiable now".
+ */
+export async function copyForeignRuntimeSqliteFiles(
+  containerRoot: string,
+  databasePath: string,
+  held: HeldDatabaseFiles
+): Promise<{ databasePath: string; files: string; remove(): Promise<void> }> {
   for (let attempt = 1; attempt <= COPY_ATTEMPTS; attempt += 1) {
-    await assertNotHeldDatabase(root.located.databasePath, held);
+    await assertNotHeldDatabase(databasePath, held);
     let before: string;
     let copy: { databasePath: string; remove(): Promise<void> };
     try {
-      before = await runtimeDataSetFileState(root.located.databasePath);
-      copy = await copyRuntimeSqliteFiles(root.containerRoot, root.located.databasePath);
+      before = await runtimeDataSetFileState(databasePath);
+      copy = await copyRuntimeSqliteFiles(containerRoot, databasePath);
     } catch (error) {
-      if (isMissing(error) && !await present(root.containerRoot).catch(() => true)) throw gone();
+      if (isMissing(error) && !await present(containerRoot).catch(() => true)) throw gone();
       throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-copy-failed',
         `复制数据库到私有临时目录失败（${error instanceof Error ? error.message : String(error)}），稍后再试。`);
     }
     let kept = false;
     try {
-      if (await runtimeDataSetFileState(root.located.databasePath).catch(() => undefined) !== before) continue;
+      if (await runtimeDataSetFileState(databasePath).catch(() => undefined) !== before) continue;
       kept = true;
-      return copy;
+      return { databasePath: copy.databasePath, files: before, remove: () => copy.remove() };
     } finally {
       if (!kept) await copy.remove();
     }
@@ -538,7 +673,7 @@ export async function inspectForeignRuntimeHistory(
   const { candidates } = await inspectVscodeRuntimeDataSets({ globalStoragePath: configurationRoot });
   const entries: ForeignRuntimeHistoryEntry[] = [];
   for (const entry of found) {
-    entries.push(await inspectOne(configurationRoot, entry, held));
+    entries.push((await inspectOne(configurationRoot, entry, held)).entry);
     input.onProgress?.(entries.length, found.length);
   }
   relate(entries, candidates);
@@ -558,11 +693,25 @@ export async function inspectForeignRuntimeStorage(
   return report;
 }
 
+/**
+ * One discovered root verified exactly as {@link inspectForeignRuntimeHistory} verifies it (not
+ * related to the local data sets), with its located root when it was located at all: for a caller
+ * that acts on a verified root under its claim (the audit joins a claim this scope holds).
+ */
+export async function inspectForeignRuntimeRoot(
+  configurationRootPath: string,
+  found: DiscoveredForeignRuntimeRoot,
+  heldFiles?: HeldDatabaseFiles
+): Promise<{ entry: ForeignRuntimeHistoryEntry; root?: LocatedRuntimeRoot }> {
+  const configurationRoot = path.resolve(configurationRootPath);
+  return inspectOne(configurationRoot, found, heldFiles ?? await heldDatabaseFiles(configurationRoot));
+}
+
 async function inspectOne(
   configurationRoot: string,
   found: DiscoveredForeignRuntimeRoot,
   held: HeldDatabaseFiles
-): Promise<ForeignRuntimeHistoryEntry> {
+): Promise<{ entry: ForeignRuntimeHistoryEntry; root?: LocatedRuntimeRoot }> {
   const locatedPath = hasDataRoot(found.location) ? locatedPaths(found.location).dataRootPath : found.location.containerPath;
   const base: ForeignRuntimeHistoryEntry = { ...found, status: 'unavailable', locatedPath };
   // A failed root does not change by itself: its size is walked once per exact state and kept.
@@ -574,7 +723,7 @@ async function inspectOne(
   try {
     root = await locateForeignRuntimeRoot(configurationRoot, found.location, held);
   } catch (error) {
-    return { ...base, ...await sized(rejected(error), found.id) };
+    return { entry: { ...base, ...await sized(rejected(error), found.id) } };
   }
   const identity = {
     id: root.id, recordedDataRootPath: root.recorded.paths.dataRootPath, dataSetId: root.recorded.dataSetId,
@@ -582,10 +731,12 @@ async function inspectOne(
   };
   try {
     const result = await auditForeignRuntimeRoot(configurationRoot, root, held);
-    if (result.outcome === 'failed') return { ...base, ...identity, status: 'failed', code: result.code, reason: result.reason, size: result.size };
-    return { ...base, ...identity, status: 'verified', ...result.audit, size: result.size };
+    if (result.outcome === 'failed') {
+      return { entry: { ...base, ...identity, status: 'failed', code: result.code, reason: result.reason, size: result.size }, root };
+    }
+    return { entry: { ...base, ...identity, status: 'verified', ...result.audit, size: result.size }, root };
   } catch (error) {
-    return { ...base, ...identity, ...await sized(rejected(error), root.id) };
+    return { entry: { ...base, ...identity, ...await sized(rejected(error), root.id) }, root };
   }
 }
 

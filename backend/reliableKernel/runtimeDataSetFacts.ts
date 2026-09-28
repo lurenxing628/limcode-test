@@ -109,6 +109,25 @@ export async function readRuntimeBackupFacts(
   }
 }
 
+/**
+ * The same read-only facts of a private copy the caller made and removes (for instance a foreign
+ * history root's, copied after its dev:ino checks), whose root_binding row must equal `binding`.
+ * Only the copy is opened, and only by the worker.
+ */
+export async function readRuntimeCopyFacts(
+  copyDatabasePath: string,
+  binding: HistoricalRootBinding,
+  request: Pick<RuntimeDataSetFactsRequest, 'contentDigest' | 'summary' | 'historyIds'>
+): Promise<Omit<RuntimeDataSetFacts, 'binding'>> {
+  return runWorker({
+    databasePath: path.resolve(copyDatabasePath),
+    binding: JSON.parse(JSON.stringify(binding)) as HistoricalRootBinding,
+    ...(request.contentDigest ? { contentDigest: true } : {}),
+    ...(request.summary ? { summary: true } : {}),
+    ...(request.historyIds ? { historyIds: true } : {})
+  });
+}
+
 /** Exact state of a database and its WAL file: any rewrite, copy or restore changes it. */
 export async function runtimeDataSetFileState(databasePath: string): Promise<string> {
   const describe = (stat: BigIntStats): string => `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;

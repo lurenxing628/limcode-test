@@ -1,4 +1,5 @@
-// Child process of runtime-backup-cleanup.test.mjs: a window that crashes while deleting a backup.
+// Child process of runtime-backup-cleanup(-foreign).test.mjs: a window that crashes while deleting a
+// backup, or another process holding a claim (hold-claim <claim path> <target>) until told to release it.
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -12,6 +13,19 @@ const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBa
 const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
 
 const [mode, root, key, crashPoint = 'after-rename'] = process.argv.slice(2);
+if (mode === 'hold-claim') {
+  const { withRuntimeClaimAtPath } = kernelFile('runtimeHostControl.js');
+  await withRuntimeClaimAtPath(root, key, async () => {
+    process.stdout.write('held\n');
+    // Given up after 15 s at the latest: a caller that waited for it instead of giving up proceeds then.
+    await new Promise((resolve) => {
+      process.stdin.once('data', resolve);
+      process.stdin.once('end', resolve);
+      setTimeout(resolve, 15_000).unref();
+    });
+  });
+  process.exit(0);
+}
 if (mode !== 'delete-then-crash') throw new Error(`unknown mode ${mode}`);
 if (!['after-rename', 'after-verify'].includes(crashPoint)) throw new Error(`unknown crash point ${crashPoint}`);
 const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));

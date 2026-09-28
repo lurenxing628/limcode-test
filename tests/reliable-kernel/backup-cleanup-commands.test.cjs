@@ -25,6 +25,7 @@ function loadCommand(dependencies, sandboxConsole = console) {
 }
 
 const ROOT = '/data/limcode';
+const extensionContext = { globalStorageUri: { fsPath: '/data/limcode' } };
 const CONTROL = `${ROOT}/.limcode-runtime`;
 const plain = (value) => JSON.parse(JSON.stringify(value));
 
@@ -56,13 +57,29 @@ const PLAN = {
       reason: '可以删除：其中 1 个对话、2 个消息版本都完整存在于这个历史库（workspace:folder-x）'
     }),
     item({
-      key: 'reset-archive:arch', kind: 'reset-archive', name: '20260901-010203-004-abcdef12', path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`,
-      inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '“归档并重置”时整份保留的历史库，含当时的对话；可在“历史与存储管理 → 外来历史库”里查看（核验通过的可以只读打开），以后的版本支持合并；本版本只列出，不删除'
+      key: 'reset-archive:arch', kind: 'reset-archive', name: 'notes', path: `${ROOT}/.limcode-runtime-backups/notes`,
+      inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '归档目录里不是“归档并重置”留下的归档（名字不认识）；只列出，不删除'
+    }),
+    item({
+      key: 'foreign-history:foreign:archive:0123456789abcdef', kind: 'foreign-history', name: '20260901-010203-004-abcdef12',
+      path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`, origin: '“归档并重置”的归档', dataSetCandidateId: undefined,
+      inCurrentDataSet: false, bytes: '4096', reclaimableBytes: '4096', reason: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在）'
+    }),
+    item({
+      key: 'foreign-history:foreign:copied:fedcba9876543210', kind: 'foreign-history', name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
+      path: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678/.limcode-runtime', origin: '拷来目录里的库', dataSetCandidateId: undefined,
+      inCurrentDataSet: false, bytes: '8192', reclaimableBytes: '8192', deletable: false, reason: '未通过核验：结构或完整性核验未通过，原样保留'
+    }),
+    item({
+      key: 'copied-data-root:limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', kind: 'copied-data-root',
+      name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', path: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
+      dataSetCandidateId: undefined, inCurrentDataSet: false, bytes: '300', reclaimableBytes: '300', deletable: false,
+      reason: '迁移数据目录时挪到旁边的拷来目录。其中的库在“外来历史库”一组里逐个核对，只删能证明内容已完整在本地库里的库；目录本身和其余内容（设置、规则、技能）不删除'
     })
   ]
 };
 
-function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true, writeGate, onPlan, warnings } = {}) {
+function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true, writeGate, onPlan, warnings, status, statusError } = {}) {
   const calls = [];
   const prompts = [];
   const database = { binding: { dataSetId: 'current' }, snapshot: async () => ({ snapshot: [] }) };
@@ -86,7 +103,7 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
     vscode,
     '../../backend/reliableKernel/runtimeBackupCleanup': {
       async planRuntimeBackupCleanup(root, current, options) {
-        calls.push(['plan', root, current === database]);
+        calls.push(['plan', root, current === database, options.previousDataRootPath ?? null]);
         options.onProgress('正在核对 merge-old…');
         onPlan?.();
         if (planError) throw planError;
@@ -96,8 +113,15 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
         calls.push(['delete', planned === plan, current === database, [...keys]]);
         return deleteResult ?? {
           deleted: keys.map((key) => { const entry = plan.items.find((candidate) => candidate.key === key); return { key, name: entry.name, path: entry.path, bytes: entry.bytes, reclaimableBytes: entry.reclaimableBytes }; }),
-          kept: [], unfinished: []
+          kept: [], unfinished: [], copiedDirectoriesWithoutDataSets: []
         };
+      }
+    },
+    '../../backend/capabilities/vscodeStorage/globalStatus': {
+      async loadCommittedGlobalStatus(context) {
+        calls.push(['status', context === extensionContext]);
+        if (statusError) throw statusError;
+        return status ?? { dataRootPath: ROOT };
       }
     },
     '../../shared/extensionIdentity': { EXTENSION_COMMAND_IDS: { openPanel: 'limcode-test.openPanel', cleanupBackups: 'limcode-test.cleanupBackups' } },
@@ -117,7 +141,7 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
     }
   };
   const command = loadCommand(dependencies, warnings ? { ...console, warn: (...args) => warnings.push(args.map(String).join(' ')) } : console);
-  return { calls, prompts, run: (request = { clientId: 'client-1' }) => command.cleanupBackups({}, startup, request) };
+  return { calls, prompts, run: (request = { clientId: 'client-1' }) => command.cleanupBackups(extensionContext, startup, request) };
 }
 
 test('两步确认：检查有进度通知；第一个面板按种类分组列出、只有可删的项有勾选框；第二个 danger 面板列出将删除的项、合计大小、核对时间和不能撤销', async () => {
@@ -125,7 +149,7 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   await f.run();
   assert.deepEqual(f.calls.filter((call) => call[0] === 'progress').map((call) => call[1]), ['正在检查备份…', '正在删除备份…']);
   assert.ok(f.calls.some((call) => call[0] === 'progress-report' && call[1] === '正在核对 merge-old…'), '检查过程报告进度');
-  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true], '经本窗口打开的当前库读取');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, null], '经本窗口打开的当前库读取；没有迁移过就只看当前数据目录');
 
   const [first, second, done] = f.prompts;
   assert.equal(first.title, '清理备份：勾选要删除的备份');
@@ -134,7 +158,8 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   assert.equal(first.danger, undefined);
   assert.equal(first.options, undefined, '勾选框按种类放在各自的分组里');
   assert.deepEqual(first.sections.slice(1).map((section) => section.title), [
-    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '“归档并重置”的归档（只列出）（1 项）'
+    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '外来历史库（2 项）',
+    '归档目录里的其它内容（只列出）（1 项）', '拷来目录（只列出）（1 项）'
   ]);
   const merge = first.sections.find((section) => section.title === '合并前备份（2 项）');
   assert.match(merge.lines[0], /^用途：/);
@@ -145,11 +170,11 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
   const upgrade = first.sections.find((section) => section.title === '升级前备份（1 项）');
   assert.deepEqual(upgrade.options, [], '不可删的项没有勾选框');
   assert.ok(upgrade.lines.some((line) => line.includes('不删除：含 3 个当前库没有的对话（可能是你删掉的），按历史保留')));
-  const archive = first.sections.find((section) => section.title?.startsWith('“归档并重置”'));
+  const archive = first.sections.find((section) => section.title?.startsWith('归档目录里的其它内容'));
   assert.ok(archive.lines.some((line) => line.includes('位置：/data/limcode/.limcode-runtime-backups/') && line.includes('（100 B）')));
   assert.ok(archive.lines.every((line) => !line.includes('当前库') && !line.includes('所属：')), '只列出的归档不是当前库的一部分，位置只写路径');
   assert.ok(first.sections[0].lines.includes('已删完上次没有删完的 1 项。'));
-  assert.ok(first.sections[0].lines.some((line) => line.startsWith('可以删除 2 项，合计 1 MiB') && line.includes('默认都不勾选')));
+  assert.ok(first.sections[0].lines.some((line) => line.startsWith('可以删除 3 项，合计 1 MiB') && line.includes('默认都不勾选')));
 
   assert.equal(second.title, '永久删除所选备份？');
   assert.equal(second.danger, true);
@@ -311,4 +336,53 @@ test('检查结果：上次中断、改回原名的项写在面板上；技术�
   assert.doesNotMatch(JSON.stringify(first), /SQLITE_CORRUPT|EACCES/);
   assert.ok(warnings.some((line) => line.includes('merge-bad') && line.includes('SQLITE_CORRUPT')), warnings.join('\n'));
   assert.ok(warnings.some((line) => line.includes('EACCES')), warnings.join('\n'));
+});
+
+test('外来历史库单独一组：可删的写明来源、位置和内容已完整在哪个库，不可删的写明原因；上一个数据目录交给检查；删除后拷来目录里没有库时写明其余内容保留', async () => {
+  const COPIED = '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678';
+  const f = fixture({
+    status: { dataRootPath: ROOT, lastMigration: { fromPath: '/old/limcode' } },
+    answers: [
+      { choice: 'next', include: ['foreign-history:foreign:archive:0123456789abcdef', 'foreign-history:foreign:copied:fedcba9876543210', 'copied-data-root:limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678'] },
+      { choice: 'delete', include: [] }
+    ],
+    deleteResult: {
+      deleted: [{
+        key: 'foreign-history:foreign:archive:0123456789abcdef', name: '20260901-010203-004-abcdef12',
+        path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`, bytes: '4096', reclaimableBytes: '4096'
+      }],
+      kept: [], unfinished: [],
+      copiedDirectoriesWithoutDataSets: [{ name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', path: COPIED }]
+    }
+  });
+  await f.run();
+  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, '/old/limcode'], '上一个数据目录的归档和旁边的拷来目录一起核对');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'status'), ['status', true]);
+  const [first, second, done] = f.prompts;
+  assert.match(first.description, /外来历史库要先通过核验/);
+  const foreign = first.sections.find((section) => section.title === '外来历史库（2 项）');
+  assert.match(foreign.lines[0], /^用途：“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过/);
+  assert.deepEqual(foreign.options.map((option) => option.key), ['foreign-history:foreign:archive:0123456789abcdef']);
+  assert.match(foreign.options[0].detail,
+    /来源：“归档并重置”的归档　位置：\/data\/limcode\/\.limcode-runtime-backups\/20260901-010203-004-abcdef12　可以删除：内容已完整在当前库里/);
+  assert.ok(foreign.lines.some((line) => line.includes('来源：拷来目录里的库　位置：/data/limcode.limcode-copied-') && line.includes('不删除：未通过核验：')), foreign.lines.join('\n'));
+  const copied = first.sections.find((section) => section.title === '拷来目录（只列出）（1 项）');
+  assert.deepEqual(copied.options, [], '拷来目录整体永远不能勾选');
+  assert.ok(copied.lines.some((line) => line.includes(`位置：${COPIED}`) && line.includes('目录本身和其余内容（设置、规则、技能）不删除')));
+  assert.deepEqual(f.calls.find((call) => call[0] === 'delete')[3], ['foreign-history:foreign:archive:0123456789abcdef'], '未通过核验的库与拷来目录即使被勾选也不传给删除');
+  assert.deepEqual(second.sections[0].lines, [`20260901-010203-004-abcdef12（4 KiB）　${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`]);
+  assert.deepEqual(done.sections[0].lines, [
+    '已删除 1 项，合计 4 KiB（预计释放 4 KiB）。',
+    `拷来目录 limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678 里已经没有库；其余内容（设置、规则、技能）保留，可自行处理。位置：${COPIED}`
+  ]);
+});
+
+test('读不出上一个数据目录的位置时只核对当前数据目录，照常检查，原因只写进日志', async () => {
+  const warnings = [];
+  const f = fixture({ warnings, statusError: new Error('globalStatus.json 无法解析'), answers: [{ choice: 'cancel', include: [] }] });
+  await f.run();
+  assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, null]);
+  assert.equal(f.prompts[0].title, '清理备份：勾选要删除的备份');
+  assert.ok(warnings.some((line) => line.includes('globalStatus.json 无法解析')), warnings.join('\n'));
+  assert.doesNotMatch(JSON.stringify(f.prompts), /globalStatus/);
 });

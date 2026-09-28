@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { loadCommittedGlobalStatus } from '../../backend/capabilities/vscodeStorage/globalStatus';
 import {
   deleteRuntimeBackups, planRuntimeBackupCleanup,
   type RuntimeBackupCleanupCurrent, type RuntimeBackupCleanupItem, type RuntimeBackupCleanupPlan,
@@ -31,13 +32,17 @@ const OK = { key: 'cancel', label: '知道了', variant: 'secondary' as const };
 const SETTINGS_LOCATION = '其他 → 数据目录';
 const DELETABLE_KINDS: ReadonlySet<RuntimeBackupKind> = new Set(['epoch-migration', 'merge-target', 'merge-source']);
 
-/** Group order of the first panel: the three kinds that can be proven first, then the listed ones. */
+/** Group order of the first panel: the kinds that can be proven first, then the listed ones. */
 const KINDS: ReadonlyArray<{ kind: RuntimeBackupKind; title: string; purpose: string }> = [
   { kind: 'epoch-migration', title: '升级前备份', purpose: '旧版本的历史库自动升级到当前格式之前，整份数据库的备份' },
   { kind: 'merge-target', title: '合并前备份', purpose: '把其它历史库合并进来之前，接收合并的库的整份备份' },
   { kind: 'merge-source', title: '合并来源的收尾前备份', purpose: '合并前收尾来源库里没有结束的任务之前，来源库的整份备份' },
-  { kind: 'reset-archive', title: '“归档并重置”的归档（只列出）', purpose: '“归档并重置”时整份保留的历史库' },
-  { kind: 'copied-data-root', title: '迁移时从别处拷来的目录（只列出）', purpose: '迁移数据目录时在新目录里发现、挪到旁边保留的 LimCode 数据' },
+  {
+    kind: 'foreign-history', title: '外来历史库',
+    purpose: '“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过、且能证明内容已完整在当前库或某个历史库里的才可以删除（归档整份删除，拷来目录只删其中的库）'
+  },
+  { kind: 'reset-archive', title: '归档目录里的其它内容（只列出）', purpose: '“归档并重置”的归档目录里不是归档的内容' },
+  { kind: 'copied-data-root', title: '拷来目录（只列出）', purpose: '迁移数据目录时挪到旁边的拷来目录本身，其中库以外的设置、规则、技能永远不会被整体删除' },
   { kind: 'legacy-cutover', title: '旧格式备份 backups/（只列出）', purpose: '升级到 SQLite 内核之前的旧格式数据' },
   { kind: 'data-backups', title: '旧版本数据备份 .limcode-data-backups（只列出）', purpose: '旧版本开发数据的重置备份' }
 ];
@@ -72,12 +77,14 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   }
   const current = host.product.application.database;
   const configurationRootPath = host.dataRootPath();
+  const previousDataRootPath = await previousDataRoot(context);
   let plan: RuntimeBackupCleanupPlan;
   try {
     plan = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在检查备份…' },
       (progress) => runRuntimeDataSetUpgrade(context, () => {
         const check = () => planRuntimeBackupCleanup(configurationRootPath, current, {
-          onProgress: (message) => progress.report({ message })
+          onProgress: (message) => progress.report({ message }),
+          ...(previousDataRootPath ? { previousDataRootPath } : {})
         });
         // The check writes too (it settles leftovers of an interrupted cleanup, copies other data
         // sets under their maintenance and writes the id cache): a write command for the freeze.
@@ -91,7 +98,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   const deletable = plan.items.filter((item) => item.deletable);
   const first = await ask({
     title: deletable.length > 0 ? '清理备份：勾选要删除的备份' : '清理备份：没有可以删除的备份',
-    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、每个消息版本（包括编辑前的版本）都还在同一位置的历史库里。含有别处没有的对话的备份一律保留。',
+    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、每个消息版本（包括编辑前的版本）都还在同一位置的历史库里；外来历史库要先通过核验，再与某个本地库身份相同且内容完全相同，或全部对话和消息版本都在某个本地库里。含有别处没有的对话的一律保留。',
     sections: firstPanelSections(plan),
     actions: deletable.length > 0 ? [CANCEL, { key: 'next', label: '下一步', variant: 'default' }] : [OK]
   });
@@ -189,6 +196,9 @@ function resultLines(result: RuntimeBackupCleanupResult): string[] {
   }
   for (const item of result.unfinished) lines.push(`${item.name}：${item.reason}`);
   for (const item of result.kept) lines.push(`${item.name} 保留：${item.reason}`);
+  for (const directory of result.copiedDirectoriesWithoutDataSets ?? []) {
+    lines.push(`拷来目录 ${directory.name} 里已经没有库；其余内容（设置、规则、技能）保留，可自行处理。位置：${directory.path}`);
+  }
   return lines.length > 0 ? lines : ['没有删除任何备份。'];
 }
 
@@ -196,11 +206,22 @@ function createdText(item: RuntimeBackupCleanupItem): string {
   return item.createdAt ? `创建于 ${formatTime(item.createdAt)}` : '创建时间未知';
 }
 
-/** Whose copy it is only for the kinds that belong to a data set; the listed-only ones just say where they are. */
+/** Whose copy it is only for the kinds that belong to a data set; foreign history says where it comes from; the listed-only ones just say where they are. */
 function locationText(item: RuntimeBackupCleanupItem): string {
+  if (item.kind === 'foreign-history') return `来源：${item.origin ?? '外来历史库'}　位置：${item.path}`;
   if (!DELETABLE_KINDS.has(item.kind)) return `位置：${item.path}`;
   const owner = item.inCurrentDataSet ? '当前库' : item.dataSetCandidateId ? `历史库 ${item.dataSetCandidateId}` : '未知的历史库';
   return `所属：${owner}　位置：${item.path}`;
+}
+
+/** globalStatus lastMigration.fromPath: its archives and the directories copied aside beside it are foreign history too. */
+async function previousDataRoot(context: vscode.ExtensionContext): Promise<string | undefined> {
+  try {
+    return (await loadCommittedGlobalStatus(context))?.lastMigration?.fromPath || undefined;
+  } catch (error) {
+    console.warn('[LimCode] 清理备份：无法读取上一个数据目录的位置，这次只看当前数据目录。', error);
+    return undefined;
+  }
 }
 
 async function tell(ask: Ask, title: string, lines: string[]): Promise<void> {

@@ -633,7 +633,8 @@ function validateMigration(root, migration, failures) {
   const expectedCleanup = {
     entry: 'settings-page-other-data-root-button; data-set-management-and-command-palette-only-open-the-settings-page; progress-notification-while-checking; check-and-deletion-are-write-commands-counted-in-the-freeze-baseline; refused-like-a-write-command-while-this-window-is-frozen-for-a-data-root-operation-at-entry-and-again-before-deleting',
     deletableKinds: ['epoch-migration-backups', 'merge-backups', 'merge-source-backups'],
-    listedOnly: 'reset-archives-limcode-runtime-backups; relocation-copied-aside-limcode-copied; control-root-legacy-backups; limcode-data-backups; name-location-size-and-reason-never-deleted',
+    listedOnly: 'copied-directory-as-a-whole-with-its-settings-rules-and-skills; archives-directory-entries-that-are-no-archive; foreign-history-that-failed-or-cannot-be-verified-now; control-root-legacy-backups; limcode-data-backups; name-location-size-and-reason-never-deleted',
+    foreignHistory: 'archives-of-every-scope-of-the-current-and-the-previous-data-directory-and-data-sets-of-copied-directories-beside-either-as-discovered-and-verified-by-runtime-foreign-history; only-verified-ones; deletion-unit-the-located-control-root-a-whole-archive-or-one-data-set-of-a-copied-directory-never-the-copied-directory-told-when-no-data-set-is-left; proven-by-same-identity-and-content-digest-as-a-local-data-set-other-than-the-open-one-or-by-every-conversation-and-message-revision-id-of-it-and-of-its-kept-backups-in-one-local-data-set-of-the-configuration-root; open-data-set-has-no-safe-digest-proven-only-by-coverage-through-its-reader; kept-backups-by-their-own-rules; legacy-backups-debug-captures-process-output-unknown-entries-links-or-special-files-keep-it-whole; unfinished-work-keeps-it-when-proven-by-coverage; databases-only-through-the-foreign-copy-dev-ino-checked-state-unchanged-and-records-as-small-regular-files; its-foreign-claim-taken-without-waiting-in-check-deletion-and-settling-held-by-a-read-only-view-verification-or-merge-means-kept; local-digest-and-ids-under-their-own-maintenance-never-inside-the-foreign-claim; deletion-under-admission-and-foreign-claim-relocates-and-verifies-again-compares-the-whole-control-root-tree-and-the-proving-data-set-then-rename-check-mark-with-its-id-remove; only-writes-in-a-foreign-directory-rename-mark-and-removal-of-the-deleted-root-itself; leftovers-found-where-discovery-finds-roots-settled-under-admission-and-the-same-claim',
     coverage: 'every-conversation-and-message-revision-id-of-the-copy-in-the-local-data-set-of-the-same-control-root; copy-read-in-facts-worker-from-private-copy-ids-read-from-the-tables-not-indexed-cached-by-exact-file-state-in-merge-ledger-coverage; current-data-set-only-through-its-own-worker-reader-250-ids-per-read; other-local-data-sets-through-facts-worker-private-copy-under-their-maintenance; copy-or-data-set-sharing-an-inode-with-a-local-database-wal-or-shm-by-dev-ino-never-copied-kept-as-history; uncovered-kept-as-history-naming-the-missing-conversations-and-message-versions; reasons-in-words-technical-cause-only-in-the-log',
     conditions: 'upgrade-backup-completion-record-to-epoch-5-next-binding-same-data-set-local-generation-not-lower-and-7-days-after-completion-from-the-latest-of-record-time-directory-name-and-record-file-mtime-ctime-later-than-now-kept; published-3-to-4-upgrade-backups-kept; merge-and-source-backup-root-binding-same-data-set-local-generation-not-lower',
     protections: 'in-progress-control-root-journal-or-committing-merge; newest-complete-merge-backup-at-least-1h-old-per-control-root-and-every-newer-one; merge-backup-younger-than-1h; merge-backup-age-from-the-later-of-name-time-and-directory-mtime; directory-with-tmp-file; source-backup-referenced-by-unreported-finalization',
@@ -643,7 +644,7 @@ function validateMigration(root, migration, failures) {
     reclaim: 'files-with-other-hard-links-not-counted'
   };
   if (!plainObject(cleanup) || JSON.stringify(cleanup) !== JSON.stringify(expectedCleanup)) {
-    failures.push('备份清理只删能证明完整存在于本地库的副本：只处理升级前、合并前与合并来源的收尾前备份，副本的全部对话与消息修订 id 都在同一控制根的本地库才可删（当前库只经它自己的读取线程查询，与本地库是同一个文件的硬链接不读），保护满 1 小时的最新一份及更新的、不满 1 小时、有临时文件、进行中的日志与未报告的收尾引用，升级备份按最晚的时间满 7 天、旧版 3→4 备份一律保留；归档、拷来的目录与旧格式备份只列出；两步确认，锁内同口径复核后先改名、再核一次覆盖，通过才写已核对标记再删，不跟随符号链接');
+    failures.push('备份清理只删能证明完整存在于本地库的副本：升级前、合并前与合并来源的收尾前备份的全部对话与消息修订 id 都在同一控制根的本地库才可删（当前库只经它自己的读取线程查询，与本地库是同一个文件的硬链接不读），保护满 1 小时的最新一份及更新的、不满 1 小时、有临时文件、进行中的日志与未报告的收尾引用，升级备份按最晚的时间满 7 天、旧版 3→4 备份一律保留；外来历史库只处理核验通过的，与非当前本地库身份与内容摘要相同、或它与它保留的备份的全部 id 都在某一个本地库里才可删，按控制根删（拷来目录整体不删），外来声明不等待地取、声明内重新核验，外来目录里只动被删那一份；拷来目录整体与旧格式备份只列出；两步确认，锁内同口径复核后先改名、再核一次覆盖，通过才写已核对标记再删，不跟随符号链接');
   }
   const cleanupSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeBackupCleanup.ts'), 'utf8');
   const graceDays = Number(/RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS = ([\d_]+) \* 24 \* 60 \* 60 \* 1000;/.exec(cleanupSource)?.[1]?.replaceAll('_', ''));
@@ -664,8 +665,17 @@ function validateMigration(root, migration, failures) {
   const deletableKinds = /RUNTIME_BACKUP_DELETABLE_KINDS: readonly RuntimeBackupKind\[\] = Object\.freeze\(\[([^\]]*)\]\)/.exec(cleanupSource)?.[1]
     ?.split(',').map((item) => item.trim().replace(/^'|'$/g, '')).filter(Boolean) ?? [];
   if (JSON.stringify(deletableDirectories) !== JSON.stringify(expectedCleanup.deletableKinds)
-    || JSON.stringify(deletableKinds) !== JSON.stringify(['epoch-migration', 'merge-target', 'merge-source'])) {
-    failures.push('备份清理可删的只有 migration.json#backupCleanup.deletableKinds 列出的三种目录（升级前备份、合并前备份、合并来源的收尾前备份）');
+    || JSON.stringify(deletableKinds) !== JSON.stringify(['epoch-migration', 'merge-target', 'merge-source', 'foreign-history'])) {
+    failures.push('备份清理可删的只有 migration.json#backupCleanup.deletableKinds 列出的三种目录（升级前备份、合并前备份、合并来源的收尾前备份）与核验通过的外来历史库');
+  }
+  const foreignSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeForeignHistory.ts'), 'utf8');
+  const claimSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeHostControl.ts'), 'utf8');
+  // Foreign history is deleted only under its own foreign claim taken without waiting, never under a
+  // maintenance claim of its located paths (that one lives beside the foreign directory).
+  if (!cleanupSource.includes('tryWithForeignRuntimeRootClaim(') || !cleanupSource.includes('copyForeignRuntimeSqliteFiles(')
+    || /withRuntimeMaintenance\((?:proof\.)?root\.located|withRuntimeMaintenance\(read\.root/.test(cleanupSource)
+    || !/refuseWhenHeld: true/.test(foreignSource) || !/if \(wait\?\.refuseWhenHeld\) throw new RuntimeClaimHeldError/.test(claimSource)) {
+    failures.push('清理备份删除外来历史库必须取它在当前配置根下的外来声明且不等待（被只读查看、核验或合并持有时保留），数据库只经外来库模块的复制函数读，不取外来目录旁的维护声明');
   }
   if (migration?.candidateRoot?.isolated !== true || migration?.candidateRoot?.mayReadLegacyRuntime !== false) {
     failures.push('候选验证必须使用隔离数据根且不能读取旧运行时');
@@ -788,10 +798,10 @@ function validateMigration(root, migration, failures) {
  */
 function validateForeignHistory(root, authority, failures) {
   const foreignSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeForeignHistory.ts'), 'utf8');
-  if (authority?.rootPolicy?.foreignHistory !== 'verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written'
+  if (authority?.rootPolicy?.foreignHistory !== 'verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself'
     || !foreignSource.includes("const CACHE_DIRECTORY = 'foreign';") || !foreignSource.includes("const CLAIMS_DIRECTORY = 'foreign-claims';")
     || /\bRuntimeDatabase\b|new RootAuthority|withRuntimeMaintenance\(root\.recorded|recorded\.paths\.(databasePath|casRootPath|rootPointerPath|runtimeEpochPath)/.test(foreignSource)) {
-    failures.push('外来历史库只能原位只读登记：读取只经 located 路径，recorded 只作身份栅栏与显示，从不建立 RootAuthority 或打开 RuntimeDatabase，结果缓存与声明只在当前配置根 .limcode-runtime-merges/foreign 与 foreign-claims，外来目录从不写入');
+    failures.push('外来历史库只能原位只读登记：读取只经 located 路径，recorded 只作身份栅栏与显示，从不建立 RootAuthority 或打开 RuntimeDatabase，结果缓存与声明只在当前配置根 .limcode-runtime-merges/foreign 与 foreign-claims，外来目录除清理备份删除经证明的那一份本身之外从不写入');
   }
 }
 

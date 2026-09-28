@@ -96,6 +96,12 @@ export interface RuntimeClaimWaitOptions {
    * whatever the window showed about waiting for it is over. Further claims may follow.
    */
   onAcquired?(): void;
+  /**
+   * Do not wait at all: a live holder (another process, or another async scope of this one) makes
+   * the acquisition throw RuntimeClaimHeldError at once, before the operation runs. A holder whose
+   * state cannot be verified still throws RuntimeMaintenanceBusyError; a dead one is still isolated.
+   */
+  refuseWhenHeld?: boolean;
 }
 
 export interface RuntimeMaintenanceMetadata {
@@ -119,6 +125,19 @@ export class RuntimeMaintenanceBusyError extends Error {
       'failing closed instead of taking over an unknown Runtime Host.'
     );
     this.name = 'RuntimeMaintenanceBusyError';
+  }
+}
+
+/** A claim asked for with `refuseWhenHeld` is held by a live holder: nothing was waited for or run. */
+export class RuntimeClaimHeldError extends Error {
+  public readonly code = 'runtime-claim-held';
+
+  public constructor(
+    public readonly claimPath: string,
+    public readonly owner: RuntimeMaintenanceMetadata
+  ) {
+    super(`Runtime claim ${claimPath} is held by process ${owner.processId}; not waiting for it.`);
+    this.name = 'RuntimeClaimHeldError';
   }
 }
 
@@ -588,6 +607,7 @@ async function acquireMaintenanceClaim(
     if (!record) continue;
     if (record.processId === process.pid && record.processStartIdentity === ownIdentity) {
       // Another async scope in this same process holds the claim; wait for its release.
+      if (wait?.refuseWhenHeld) throw new RuntimeClaimHeldError(claimPath, record);
       await pause(record.claimToken);
       continue;
     }
@@ -622,6 +642,7 @@ async function acquireMaintenanceClaim(
         );
       }
     }
+    if (wait?.refuseWhenHeld) throw new RuntimeClaimHeldError(claimPath, record);
     await pause(record.claimToken);
   }
 }
