@@ -54,7 +54,7 @@ function fixture({
   nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold,
   afterLocksError, statusUnreadable = false, undoUnpublishedResult = {},
   /** What inspectDataRootMovedNotice finds (an Error: the read fails); by default `movedNotice` or none. */
-  movedRead, consentError
+  movedRead, consentError, abandonNoticeError
 } = {}) {
   const calls = [];
   const abandonOptions = [];
@@ -238,7 +238,12 @@ function fixture({
         if (consentError) throw consentError;
         return true;
       },
-      undoUnpublishedDataRootRelocation: async (root) => { calls.push(['undo-unpublished', root]); return undoUnpublishedResult; }
+      undoUnpublishedDataRootRelocation: async (root) => { calls.push(['undo-unpublished', root]); return undoUnpublishedResult; },
+      abandonDataRootMovedNotice: async (root, relocationId) => {
+        calls.push(['abandon-moved', root, relocationId]);
+        if (abandonNoticeError) throw abandonNoticeError;
+        return true;
+      }
     },
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': {
       ...primitive,
@@ -700,6 +705,12 @@ test('数据目录不可用：可以重试、回到旧目录、选择其它已�
   const kept = fixture({ host: false, recoveryChoice: '撤销那次未完成的迁移并打开', undoUnpublishedResult: { held: '之后有人写过。' } });
   await kept.commands.offerDataRootRecovery(kept.context, kept.startup, '数据目录暂时没有打开', 'unpublished');
   assert.match(kept.calls.find((call) => call[0] === 'warning')[2].detail, /之后有人写过。[\s\S]*照常打开/);
+  // Relocation group R6: its pointer switch had begun (it may have switched): no undo offered, only why.
+  const switching = fixture({ host: false, recoveryChoice: '撤销那次未完成的迁移并打开' });
+  const cause = Object.assign(new Error('发起它的安装可能已经切换过来并在用这些数据，所以这里不提供撤销。'), { code: 'data-root-relocation-switching' });
+  await switching.commands.offerDataRootRecovery(switching.context, switching.startup, '数据目录暂时没有打开：……所以这里不提供撤销。', 'unpublished', Object.assign(new Error('x'), { cause }));
+  assert.deepEqual(switching.calls.filter((call) => call[0] === 'error').map((call) => plain(call.slice(1))), [['数据目录暂时没有打开：……所以这里不提供撤销。', { modal: true }]]);
+  assert.ok(!switching.kinds().includes('undo-unpublished') && !switching.kinds().includes('command'), '切换中：不撤销、不重载');
 
   // reloc3 #6: the unavailable directory's data was moved (its notice stays after the old data is deleted): "改用迁移后的目录".
   const movedAway = fixture({
@@ -934,10 +945,57 @@ test('盲审 7 启动时进行中记录的目标一直看不到：提示并给�
   const warning = forget.calls.find((call) => call[0] === 'warning');
   assert.match(warning[1], /现在看不到/);
   assert.equal(warning[2], '放弃这次迁移的记录…', '原生提示里只多一个选项');
-  assert.equal(forget.status.pendingRelocation, undefined, '确认后清除进行中记录');
+  await until(() => forget.status.pendingRelocation === undefined, '确认后清除进行中记录');
   const keep = fixture({ pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: [undefined] });
   await keep.commands.beforeDataRootOpen(keep.context);
+  await settle();
   assert.ok(keep.status.pendingRelocation, '不确认就保留，下次再试');
+});
+
+/** Lets the choices handled after beforeDataRootOpen returned run (the fakes resolve at once). */
+async function settle() {
+  for (let turn = 0; turn < 50; turn += 1) await new Promise((resolve) => setImmediate(resolve));
+}
+
+async function until(check, message) {
+  for (let turn = 0; turn < 200 && !check(); turn += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.ok(check(), message);
+}
+
+test('迁移组 R2/R3 启动时“放弃这次迁移的记录”的提示不挡住打开（通知一直不答也照常返回）；答了之后先按迁移 id 去掉旧目录里这次迁移的标记再清记录；去不掉就保留记录并说明', async () => {
+  const pending = {
+    relocationId: 'lost', sourceRootPath: SOURCE, targetRootPath: '/mnt/lost/limcode', startedAt: '2026-09-27T00:00:00.000Z', processId: 1
+  };
+  const never = fixture({ pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: [new Promise(() => {})] });
+  const opened = await Promise.race([
+    never.commands.beforeDataRootOpen(never.context).then(() => 'returned'),
+    new Promise((resolve) => setTimeout(() => resolve('blocked'), 2_000))
+  ]);
+  assert.equal(opened, 'returned', '非模态通知不挡住打开');
+  assert.ok(never.kinds().includes('warning'));
+  assert.ok(never.status.pendingRelocation, '没答：记录保留');
+  assert.ok(!never.kinds().includes('abandon-moved'));
+
+  let answer;
+  const later = fixture({ pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: [new Promise((resolve) => { answer = resolve; }), '放弃这次迁移的记录'] });
+  await later.commands.beforeDataRootOpen(later.context);
+  assert.ok(later.status.pendingRelocation, '打开时还没答');
+  answer('放弃这次迁移的记录…');
+  await until(() => later.status.pendingRelocation === undefined, '答了之后清除记录');
+  const kinds = later.kinds();
+  assert.deepEqual(later.calls.find((call) => call[0] === 'abandon-moved'), ['abandon-moved', SOURCE, 'lost'], '按迁移 id 去掉旧目录里的标记');
+  assert.ok(kinds.indexOf('abandon-moved') < kinds.lastIndexOf('status'), '先去掉标记再清记录');
+  assert.match(later.calls.filter((call) => call[0] === 'warning').at(-1)[2].detail, /“数据已迁走”标记随之去掉（原来的标记放回），旧目录的数据没有改动/);
+
+  const failing = fixture({
+    pendingRelocation: pending, recoverOutcome: 'unreachable', nativeAnswers: ['放弃这次迁移的记录…', '放弃这次迁移的记录'],
+    abandonNoticeError: new Error('EIO: i/o error, write')
+  });
+  await failing.commands.beforeDataRootOpen(failing.context);
+  await until(() => failing.kinds().includes('error'), '去不掉标记时说明');
+  await settle();
+  assert.ok(failing.status.pendingRelocation, '去不掉标记：记录保留');
+  assert.match(failing.calls.find((call) => call[0] === 'error')[2].detail, /没能去掉旧目录里这次迁移写下的“数据已迁走”标记（(?:Error: )?EIO: i\/o error, write），记录保留/);
 });
 
 const carriedNotice = (overrides = {}) => ({
@@ -978,6 +1036,16 @@ test('补充 E 打开带着迁走任务的旧目录（moved-work）：三选一�
 
   const later = await offer('暂不打开');
   assert.ok(!later.kinds().includes('consent') && !later.kinds().includes('status') && !later.kinds().includes('command'), '暂不打开：什么都不做');
+});
+
+test('迁移组 R7 “在这里继续”记不下同意时如实报错（模态、说明可以重载后再选），不重载也不打开', async () => {
+  const f = fixture({ host: false, recoveryChoice: '在这里继续（已迁走的任务按中止收尾）', movedNotice: carriedNotice(), consentError: new Error('EIO: i/o error, write') });
+  await f.commands.offerDataRootRecovery(f.context, f.startup, '数据目录暂时没有打开', 'moved-work');
+  assert.ok(f.kinds().includes('consent'));
+  const shown = f.calls.filter((call) => call[0] === 'error').at(-1);
+  assert.match(shown[1], /没能在这个目录里记下“迁走的任务按中止收尾”（(?:Error: )?EIO: i\/o error, write），这次没有打开；可以重载窗口后再选一次。/);
+  assert.equal(shown[2]?.modal, true);
+  assert.ok(!f.kinds().includes('command'), '不重载');
 });
 
 test('最后一轮 #4 这个目录里那次没成功的迁移正在撤销（relocation-undoing）：只给“重试”，说明撤销完成之后就能打开', async () => {

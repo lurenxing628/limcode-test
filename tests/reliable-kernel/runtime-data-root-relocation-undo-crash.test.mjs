@@ -27,9 +27,9 @@ function child(base, scenario, kind, phase) {
 
 // Left by a killed process like its claims: the liveness record of the merge's session on the
 // receiving data set (killed inside the merge transaction, e.g. at its 'merging' journal entry);
-// a dead process's record never counts as online.
-const noise = (file) => /\.runtime-(maintenance|admission)/.test(file) || file.endsWith('-shm') || /[\\/]cas[\\/]sha256[\\/]/.test(file)
-  || /[\\/]host-liveness[\\/]/.test(file);
+// a dead process's record never counts as online. The receiving CAS is compared too: what the
+// relocation added there goes with the undo.
+const noise = (file) => /\.runtime-(maintenance|admission)/.test(file) || file.endsWith('-shm') || /[\\/]host-liveness[\\/]/.test(file);
 function diffSnapshots(before, after) {
   const keys = new Set([...Object.keys(before), ...Object.keys(after)].filter((key) => !noise(key)));
   const diff = [];
@@ -56,14 +56,14 @@ const scenarios = [];
 const push = (kind, ...names) => { for (const name of names) scenarios.push([name, kind]); };
 push('empty', 'during-merge', 'pending-written', 'journal-create', 'staging-marker-after', 'selection-after', 'identity-after', 'complete-marker-after', 'publish-after', 'undo-work-removed',
   'undo-marked', 'undo-record-removed', 'notice-after', 'undo-marked@notice-after', 'undo-work-removed@notice-after');
-// Every journal append of a whole relocation (count: empty 14, limcode 20, copied 14), the carried merge records included.
+// Every journal append of a whole relocation (count: empty 14, limcode 21, copied 14; the existing target's first one lists its CAS), the carried merge records included.
 for (let n = 1; n <= 14; n += 1) push('empty', `journal-before:${n}`, `journal-after:${n}`);
 push('limcode', 'journal-create', 'staging-marker-after', 'dbbackup-before-rename', 'identity-after', 'complete-marker-after', 'notice-after', 'publish-after',
   'undo-marked@notice-after',
-  'undo-db-restored', 'undo-work-removed', 'undo-db-restored@journal-before:13',
-  'undo-marked', 'undo-restored', 'undo-record-removed', 'undo-restored@journal-before:12', 'undo-restored@journal-before:5',
-  'undo-merge-restored', 'undo-merge-restored@journal-after:18');
-for (let n = 1; n <= 20; n += 1) push('limcode', `journal-before:${n}`, `journal-after:${n}`);
+  'undo-db-restored', 'undo-work-removed', 'undo-db-restored@journal-before:14',
+  'undo-marked', 'undo-restored', 'undo-record-removed', 'undo-restored@journal-before:13', 'undo-restored@journal-before:6',
+  'undo-merge-restored', 'undo-merge-restored@journal-after:19');
+for (let n = 1; n <= 21; n += 1) push('limcode', `journal-before:${n}`, `journal-after:${n}`);
 push('copied', 'during-merge', 'aside-after', 'staging-marker-after', 'journal-after:1', 'journal-after:12', 'journal-after:13', 'journal-after:14', 'complete-marker-after',
   'publish-after', 'undo-work-removed', 'undo-marked', 'undo-record-removed', 'undo-leftover-moved@during-merge', 'undo-record-removed@during-merge');
 for (let n = 2; n <= 14; n += 1) push('copied', `journal-before:${n}`);

@@ -235,6 +235,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         })
       );
       const authority = createVscodeRootAuthority(runtimePlacement);
+      // This installation's own relocation away from here that never switched its pointer moved nothing for it.
+      const pending = opened.pendingRelocation;
+      const unswitched = pending && sameFsPath(pending.sourceRootPath, root) ? { unswitchedRelocationId: pending.relocationId } : {};
       // Work a relocation carried away from this old directory: the user decides before the Runtime
       // opens, and it is all settled before anything could run it (convergence and recovery are
       // held until then); otherwise the Runtime closes again and the open fails.
@@ -266,7 +269,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
             createRuntimeRootPaths(runtimePlacement.runtimeDataRootPath), opened.application.database.hostBootId, { opening: true }
           ).catch((error: unknown) => console.warn('[LimCode] 无法登记本窗口正在打开。', error));
           return opened;
-        }, wait));
+        }, wait), unswitched);
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
       );

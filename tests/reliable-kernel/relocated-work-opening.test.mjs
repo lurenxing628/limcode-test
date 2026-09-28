@@ -706,6 +706,174 @@ test('遗留风险 1：旧目录里上一次迁走的工作区库从没打开、
   assert.equal((await runsIn(fixture.alpha.id, b.target, 1)).calls, 1);
 });
 
+test('迁移组 R1：A→B（工作区库带着没收尾的任务迁走）后再从 B 迁回 A（合并进已有目录）：A 的“已迁走”标记保留（规划写明），A 里那个库打开时照旧先问，不会在 A 里再执行一次', { timeout: 300_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t);
+  await admitUnstartedTurn(fixture, { dataRoot: fixture.alpha.binding.paths.dataRootPath, conversationId: 'conversation-alpha-carried' });
+  const b = await relocateOldHomeTo(fixture, 'b-home');
+  const noticeFile = path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE);
+  const before = await fs.readFile(noticeFile, 'utf8');
+  assert.deepEqual((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets.map((item) => [item.id, item.settlement.state]), [[fixture.alpha.id, 'pending']]);
+  const bDataRoot = rootAuthority.resolveVscodeRuntimeDataRoot({ globalStoragePath: b.target });
+  const source = await reloc.openRuntime({ authority: new kernel.RootAuthority(() => bDataRoot) });
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  let staged;
+  try {
+    const plan = await relocation.planDataRootRelocation({ sourceRootPath: b.target, targetRootPath: fixture.root, sourceDatabase: source, installation: INSTALLATION_A });
+    assert.deepEqual(plan.problems, []);
+    assert.equal(plan.target.kind, 'limcode');
+    assert.ok(plan.warnings.some((warning) => warning.includes(`“${fixture.alpha.id}”`) && /迁入之后那份“已迁走”标记保留，打开这些库时仍会先问你是否按中止收尾/.test(warning)),
+      `规划写明标记保留：${JSON.stringify(plan.warnings)}`);
+    staged = await relocation.stageDataRootRelocation(plan, source, options);
+  } finally { await source.close(); }
+  await relocation.completeDataRootRelocation(staged, async () => undefined, { ...options, pointerUnchanged: async () => true });
+  assert.equal(await fs.readFile(noticeFile, 'utf8'), before, 'A 的“已迁走”标记原样保留');
+  const gate = await relocatedWorkBeforeOpen({
+    configurationRootPath: fixture.root, runtimeScopeRootPath: rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(fixture.root, fixture.alpha.id)
+  }).then(() => 'open', (error) => error.reason);
+  assert.equal(gate, 'moved-work', 'A 里那个库打开时照旧先问（不会直接恢复、再执行一次）');
+});
+
+test('迁移组 R2：切换指针之前失败、指针读不出、新目录又看不到时，本安装进行中记录所指的迁移写下的标记不把旧目录当作已迁走（别的安装照旧）；放弃记录时按迁移 id 去掉它、放回它替换的标记，别的迁移 id 不动', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await admitUnstartedTurn(fixture);
+  const noticeFile = path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE);
+  // An earlier relocation's notice (its work all settled here, as settleEarlierMovedWork leaves it).
+  const earlier = `${JSON.stringify({
+    kind: 'limcode-data-root-moved', targetRootPath: path.join(fixture.base, 'elsewhere'), relocationId: randomUUID(), movedAt: '2026-09-20T08:00:00.000Z',
+    installation: { id: '/installations/c', label: 'VS Code（C）' }
+  }, null, 2)}\n`;
+  await fs.writeFile(noticeFile, earlier);
+  const drive = path.join(fixture.base, 'usb');
+  const target = path.join(drive, 'new-home');
+  await fs.mkdir(drive);
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  const failure = await relocation.completeDataRootRelocation(staged, async () => { throw new Error('写指针失败'); },
+    { ...options, pointerUnchanged: async () => { throw new Error('读不出指针'); } }).then(() => undefined, (error) => error);
+  assert.match(String(failure?.message), /写指针失败/);
+  assert.equal(relocation.dataRootRelocationCleanupState(failure), 'not-cleaned', '指针读不出：什么都不撤销');
+  assert.equal((await relocation.readDataRootMovedNotice(fixture.root))?.relocationId, staged.relocationId);
+  await reloc.markStagingOwnerDead(target);
+  await fs.rename(drive, `${drive}.unplugged`);
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root)).then(() => 'open', (error) => error.reason), 'moved-work', '别的安装：照旧按已迁走先问');
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root), { unswitchedRelocationId: staged.relocationId }), undefined,
+    '本安装的指针从没切换过去：不当作已迁走');
+  assert.equal(await relocation.abandonDataRootMovedNotice(fixture.root, randomUUID()), false, '别的迁移 id：不动');
+  assert.equal((await relocation.readDataRootMovedNotice(fixture.root))?.relocationId, staged.relocationId);
+  assert.equal(await relocation.abandonDataRootMovedNotice(fixture.root, staged.relocationId), true);
+  assert.equal(await fs.readFile(noticeFile, 'utf8'), earlier, '放回它替换的标记');
+  await fs.rename(`${drive}.unplugged`, drive);
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root)), undefined, '盘接回来之后旧目录照常打开（工作只有这一份）');
+  assert.equal(await relocation.abandonDataRootMovedNotice(fixture.root, staged.relocationId), false, '再放弃一次：已经不是它的标记');
+});
+
+test('迁移组 R4：迁入已有 LimCode 目录失败撤销后，接收库的 CAS 与迁移前一致（本次复制进去的对象删掉，原有的不动）', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t);
+  const target = path.join(fixture.base, 'existing-home');
+  const existing = await reloc.createLimCodeTarget(target);
+  const casRoot = existing.binding.paths.casRootPath;
+  const list = async (directory) => {
+    const out = [];
+    const walk = async (at) => {
+      for (const entry of await fs.readdir(at, { withFileTypes: true }).catch(() => [])) {
+        const file = path.join(at, entry.name);
+        if (entry.isDirectory()) await walk(file); else out.push(path.relative(directory, file));
+      }
+    };
+    await walk(directory);
+    return out.sort();
+  };
+  const before = await list(casRoot);
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  let during;
+  const failure = await relocation.completeDataRootRelocation(staged, async () => {
+    during = await list(casRoot);
+    throw new Error('写指针失败');
+  }, { ...options, pointerUnchanged: async () => true }).then(() => undefined, (error) => error);
+  assert.equal(relocation.dataRootRelocationCleanupState(failure), 'cleaned');
+  assert.ok(during.length > before.length, `前提：迁移往接收库的 CAS 里加了对象（${before.length} → ${during.length}）`);
+  assert.deepEqual(await list(casRoot), before, '撤销后接收库的 CAS 与迁移前一致');
+});
+
+test('迁移组 R5：合并进已有目录时因目标删过而跳过的对话没有迁过去，不记进“已迁走”的任务（旧目录继续使用时不会被中止收尾）', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const carried = await admitUnstartedTurn(fixture, { conversationId: 'conversation-deleted-in-target' });
+  const target = path.join(fixture.base, 'existing-home');
+  const existing = await reloc.createLimCodeTarget(target);
+  const { recordRuntimeDeletedConversations } = await load('backend/reliableKernel/runtimeMergeTombstones.js');
+  await recordRuntimeDeletedConversations(target, { dataSetId: existing.binding.dataSetId, rootInstanceId: existing.binding.rootInstanceId }, [carried.conversationId]);
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  const result = await relocation.completeDataRootRelocation(staged, async () => undefined, { ...options, pointerUnchanged: async () => true });
+  assert.deepEqual(result.merged.skippedConversationIds, [carried.conversationId], '合并跳过了它');
+  assert.equal(reloc.conversationIds(existing.binding.paths.dataRootPath).includes(carried.conversationId), false);
+  const notice = await relocation.readDataRootMovedNotice(fixture.root);
+  assert.equal(notice.relocationId, staged.relocationId);
+  assert.equal(notice.carriedWork, undefined, '没有迁过去的对话不记成“已迁走”');
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root)), undefined, '旧目录照常打开，那条任务留在这里');
+});
+
+test('迁移组 R6：切换指针之前在目标记录里持久写下“切换中”；之后中断（指针读不出）时其它安装不提供撤销、如实说明；没写到“切换中”就中断的，按“可能没有切换”可以撤销', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'new-home');
+  const markerFile = path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE);
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  let during;
+  const failure = await relocation.completeDataRootRelocation(staged, async () => {
+    during = JSON.parse(await fs.readFile(markerFile, 'utf8'));
+    throw new Error('写指针失败');
+  }, { ...options, pointerUnchanged: async () => { throw new Error('读不出指针'); } }).then(() => undefined, (error) => error);
+  assert.equal(relocation.dataRootRelocationCleanupState(failure), 'not-cleaned');
+  assert.equal(during.state, 'complete');
+  assert.match(String(during.switchingAt), /^\d{4}-\d\d-\d\dT/, '切换指针之前已记下切换中');
+  await reloc.markStagingOwnerDead(target);
+  const refused = await relocation.settleDataRootRelocationBeforeOpen(target, { installation: INSTALLATION_B }).then(() => undefined, (error) => error);
+  assert.equal(refused?.reason, 'unpublished');
+  assert.equal(refused.cause?.code, 'data-root-relocation-switching');
+  assert.match(refused.message, /发起它的安装可能已经切换过来并在用这些数据，所以这里不提供撤销/);
+  assert.doesNotMatch(refused.message, /可以撤销那次迁移后打开/);
+  await assert.rejects(relocation.undoUnpublishedDataRootRelocation(target), { code: 'data-root-relocation-switching' });
+  assert.equal(JSON.parse(await fs.readFile(markerFile, 'utf8')).state, 'complete', '没有撤销');
+
+  // Interrupted before "switching" was written: it never switched, another installation may undo it.
+  const marker = JSON.parse(await fs.readFile(markerFile, 'utf8'));
+  delete marker.switchingAt;
+  await fs.writeFile(markerFile, `${JSON.stringify(marker, null, 2)}\n`);
+  const offered = await relocation.settleDataRootRelocationBeforeOpen(target, { installation: INSTALLATION_B }).then(() => undefined, (error) => error);
+  assert.equal(offered?.reason, 'unpublished');
+  assert.equal(offered.cause, undefined);
+  assert.match(offered.message, /没有记下发起它的安装已经切换过去（它可能没有切换）/);
+  assert.deepEqual(await relocation.undoUnpublishedDataRootRelocation(target), {});
+  await assert.rejects(fs.stat(markerFile), { code: 'ENOENT' });
+});
+
+test('迁移组 R8：“已迁走”标记所指的目标记录读不出（不是不存在，例如 EIO）时旧目录按读不出拒绝打开，不当作迁移已不在进行', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await admitUnstartedTurn(fixture);
+  const { target } = await relocateOldHome(fixture);
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root)).then(() => 'open', (error) => error.reason), 'moved-work');
+  const markerFile = path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE);
+  const fsp = require('node:fs/promises');
+  const realReadFile = fsp.readFile;
+  const failed = [];
+  fsp.readFile = async (file, ...rest) => {
+    if (path.resolve(String(file)) === markerFile) {
+      failed.push(file);
+      throw Object.assign(new Error(`EIO: i/o error, open '${file}'`), { code: 'EIO' });
+    }
+    return realReadFile(file, ...rest);
+  };
+  let refused;
+  try {
+    refused = await relocatedWorkBeforeOpen(placementOf(fixture.root)).then(() => undefined, (error) => error);
+  } finally { fsp.readFile = realReadFile; }
+  assert.ok(failed.length > 0, '注入的失败确实落在目标记录上');
+  assert.equal(refused?.reason, 'unreadable', String(refused?.stack));
+  assert.equal(refused.cause?.code, 'EIO');
+});
+
 // ---------------------------------------------------------------------------------------------
 
 function dataRootOf(fixture) {

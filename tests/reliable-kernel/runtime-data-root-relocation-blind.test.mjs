@@ -51,6 +51,14 @@ async function unconfirmedCompletion(staged, options = {}) {
   return failure;
 }
 
+/** A completion interrupted after its record was written and before its pointer switch began (relocation group R6). */
+async function beforeSwitching(target) {
+  const marker = await markerOf(target);
+  assert.ok(marker.switchingAt, '前提：切换指针之前已记下切换中');
+  delete marker.switchingAt;
+  await fs.writeFile(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), `${JSON.stringify(marker, null, 2)}\n`);
+}
+
 function child(script, args) {
   const run = spawn(process.execPath, [path.join(here, script), ...args], { stdio: 'inherit' });
   return new Promise((resolve) => run.on('exit', (code, signal) => resolve({ code, signal })));
@@ -438,6 +446,11 @@ test('盲审 11 / 跨模块 A：完成记录写明发起安装；只有它（且
   }
   await assert.rejects(settleDataRootRelocationBeforeOpen(target, { installation: b }), (error) => error.reason === 'relocating');
   await markStagingOwnerDead(target);
+  // Its pointer switch had begun (the write failed and could not be proven not to have happened): it may have switched.
+  await assert.rejects(settleDataRootRelocationBeforeOpen(target, { installation: b }), (error) => error.reason === 'unpublished'
+    && error.cause?.code === 'data-root-relocation-switching' && !/撤销那次迁移后打开/.test(error.message));
+  // Interrupted before that: it never switched, the user decides.
+  await beforeSwitching(target);
   await assert.rejects(settleDataRootRelocationBeforeOpen(target, { installation: b }), (error) => error.reason === 'unpublished'
     && /撤销那次迁移后打开/.test(error.message));
   const source = await openRuntime(fixture.current);
@@ -467,6 +480,11 @@ test('跨模块 A（finalize-by-other）切换指针前被杀：另一个安装�
   assert.deepEqual(conversationIds((await selectedDataSet(first.target)).runtimeDataRootPath), ['conversation_existing_1']);
 
   const second = await killedInto(t, 'before-publish', 'runtime-data-root-relocation-crash-child.mjs');
+  // Killed as its pointer switch began: for another installation it may have switched, so it is not undone from there.
+  await assert.rejects(undoUnpublishedDataRootRelocation(second.target), { code: 'data-root-relocation-switching' });
+  assert.equal((await markerOf(second.target)).state, 'complete', '没有撤销');
+  // Killed before that (its record written, its switch not begun): the user may undo it.
+  await beforeSwitching(second.target);
   assert.deepEqual(await undoUnpublishedDataRootRelocation(second.target), {}, '用户选择撤销那次未完成的迁移并打开');
   assert.deepEqual(await settleDataRootRelocationBeforeOpen(second.target, { installation: path.join(second.base, 'other-installation') }), { undone: false });
   assert.deepEqual(conversationIds((await selectedDataSet(second.target)).runtimeDataRootPath), ['conversation_existing_1']);
@@ -474,6 +492,7 @@ test('跨模块 A（finalize-by-other）切换指针前被杀：另一个安装�
   const third = await killedInto(t, 'before-publish', 'runtime-data-root-relocation-crash-child.mjs');
   await fs.rm(workOf(third.target, third.relocationId), { recursive: true, force: true });
   assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: third.target, relocationId: third.relocationId }), 'orphaned', '完成但日志不在：不当作没有');
+  await beforeSwitching(third.target);
   await assert.rejects(undoUnpublishedDataRootRelocation(third.target), (error) => error.code === 'data-root-relocation-orphaned' && /无法自动撤销/.test(error.message));
 });
 

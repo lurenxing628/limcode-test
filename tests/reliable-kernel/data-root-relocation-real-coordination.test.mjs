@@ -678,7 +678,7 @@ test('盲审 7（exp8）进行中记录指向一个再也接不上的位置（�
   await commands.relocateDataRoot(vscodeContext, first.startup, { clientId: 'client-1' });
   const offered = ui.calls.find(([kind, title]) => kind === 'prompt' && title === '上次的迁移还没有撤销完');
   assert.match(offered?.[2] ?? '', /现在看不到/);
-  assert.match(offered[2], /放弃之后不会再尝试撤销：旧目录没有改动/);
+  assert.match(offered[2], /放弃之后不会再尝试撤销：数据目录没有切换过去，这次迁移在旧目录里写下的“数据已迁走”标记随之去掉（原来的标记放回），旧目录的数据没有改动/);
   assert.ok(ui.calls.some(([kind]) => kind === 'open-dialog'), '放弃记录之后照常选择新文件夹');
   const status = await globalStatus.loadCommittedGlobalStatus(vscodeContext);
   assert.equal(status.dataRootPath, ui.picked, '迁移照常完成');

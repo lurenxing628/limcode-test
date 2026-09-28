@@ -321,6 +321,11 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
    * deleted conversation, its Subagent conversations included in it.
    */
   skippedConversations?: number;
+  /**
+   * A data-root relocation's merge (migration mode) only: every conversation it left out, Subagent
+   * conversations included (what moved with the relocation is only what it merged).
+   */
+  skippedConversationIds?: string[];
   /** Nothing new was written: the source is merged into this data set already (已合并，没有新内容). */
   alreadyMerged?: true;
   /** With alreadyMerged: another window merged it into this data set after this batch picked it (已由另一个窗口合并). */
@@ -1429,6 +1434,8 @@ interface SourceProgress {
   };
   /** Conversations the plan leaves out (see skippedRows), counted per deleted conversation. */
   skippedConversations?: number;
+  /** Their ids, Subagent conversations included (reported by a relocation's merge only). */
+  skippedConversationIds?: string[];
   /** The outcome was already written to the ledger where it was found. */
   recorded?: boolean;
   /**
@@ -2310,7 +2317,8 @@ async function commitLocked(
     ...(cas ?? {}),
     ...(plan.steps.length > 0 && target.backup.path ? { backupPath: target.backup.path } : {}),
     ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
-    ...(state.skippedConversations ? { skippedConversations: state.skippedConversations } : {})
+    ...(state.skippedConversations ? { skippedConversations: state.skippedConversations } : {}),
+    ...(mode.migration && state.skippedConversationIds?.length ? { skippedConversationIds: state.skippedConversationIds } : {})
   };
   const skipped = state.skippedConversations ? { skippedConversations: state.skippedConversations } : {};
   const merged = (): Parameters<typeof writeRuntimeDataSetMergeLedgerRecord>[1] => ({
@@ -2734,6 +2742,7 @@ async function planSource(
 ): Promise<RowPlan> {
   const deleted = merged.length > 0 ? await deletedSinceMerge(source, target.database, merged) : undefined;
   state.skippedConversations = deleted?.count ?? 0;
+  state.skippedConversationIds = deleted ? [...deleted.conversations].sort() : [];
   return planRows(source, target.database, deleted && skippedRows(source, deleted.conversations));
 }
 

@@ -44,9 +44,16 @@ export interface RelocatedWorkOpening {
  * settleRelocatedWorkOnOpen (again after a crash, or after an open that could not settle all of it).
  * A notice that cannot be read refuses the open (the read's reason), one that cannot be understood
  * too ('moved-notice-invalid': it might name this data set), and so does one whose relocation is
- * still under way ('relocating': it may yet be undone, see dataRootMovedNoticeUnderWay).
+ * still under way ('relocating': it may yet be undone, see dataRootMovedNoticeUnderWay) or whose
+ * target's record of it cannot be read now (the read's reason). `unswitchedRelocationId`: the
+ * relocation this installation's in-progress record names (its pointer never switched to it, the
+ * pointer still names this directory): its notice moved nothing away for this installation, and
+ * the notice it replaced had nothing left unsettled here (settleEarlierMovedWork runs first).
  */
-export async function relocatedWorkBeforeOpen(placement: DataSetPlacement): Promise<RelocatedWorkOpening | undefined> {
+export async function relocatedWorkBeforeOpen(
+  placement: DataSetPlacement,
+  options: { unswitchedRelocationId?: string } = {}
+): Promise<RelocatedWorkOpening | undefined> {
   const root = placement.configurationRootPath;
   let read: Awaited<ReturnType<typeof inspectDataRootMovedNotice>>;
   try {
@@ -60,13 +67,17 @@ export async function relocatedWorkBeforeOpen(placement: DataSetPlacement): Prom
   }
   if (!('notice' in read)) return undefined;
   const { notice } = read;
+  if (notice.relocationId === options.unswitchedRelocationId) return undefined;
   const dataSet = notice.carriedWork?.dataSets.find((item) => item.settlement.state !== 'settled'
     && samePath(resolveVscodeRuntimeDataSetScopeRoot(root, item.id), placement.runtimeScopeRootPath));
   if (!dataSet) return undefined;
   // Another data set under that id now (reset or replaced since): none of that work is in it.
   const candidate = await resolveVscodeRuntimeDataSet({ globalStoragePath: root }, dataSet.id).catch(() => undefined);
   if (candidate && candidate.dataSetId !== dataSet.dataSetId) return undefined;
-  if (await dataRootMovedNoticeUnderWay(notice)) throw new DataRootUnavailableError(root, 'relocating');
+  const underWay = await dataRootMovedNoticeUnderWay(notice).catch((error: unknown) => {
+    throw new DataRootUnavailableError(root, dataRootReadFailureReason(error), error);
+  });
+  if (underWay) throw new DataRootUnavailableError(root, 'relocating');
   if (dataSet.settlement.state === 'pending') throw new DataRootUnavailableError(root, 'moved-work');
   return { root, notice, dataSet };
 }
@@ -86,9 +97,10 @@ export interface RelocatedWorkHoldingRuntime {
 export async function openSettlingRelocatedWork<T extends RelocatedWorkHoldingRuntime>(
   placement: DataSetPlacement,
   by: string,
-  open: (holdForRelocatedWork: boolean) => Promise<T>
+  open: (holdForRelocatedWork: boolean) => Promise<T>,
+  options: { unswitchedRelocationId?: string } = {}
 ): Promise<T> {
-  const carried = await relocatedWorkBeforeOpen(placement);
+  const carried = await relocatedWorkBeforeOpen(placement, options);
   const product = await open(carried !== undefined);
   if (carried) {
     try {

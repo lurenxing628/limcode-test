@@ -18,7 +18,7 @@ import {
   stageDataRootRelocation, inspectDataRootMovedNotice, DATA_ROOT_MOVED_NOTICE_FILE,
   sweepDataRootRelocationLeftovers, type DataRootCarriedWorkLeftItem, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
   type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation,
-  carryDeletionRecordsBack, consentToDataRootMovedWork, describeEarlierMovedWork,
+  abandonDataRootMovedNotice, carryDeletionRecordsBack, consentToDataRootMovedWork, describeEarlierMovedWork,
 } from '../../backend/reliableKernel/runtimeDataRootRelocation';
 import { settleEarlierMovedWorkOffline } from '../../backend/application/reliableKernel/relocatedWorkOpening';
 import type { RuntimeDatabase } from '../../backend/reliableKernel/runtimeDatabase';
@@ -275,7 +275,7 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
     console.error('[LimCode] 数据目录迁移已完成，收尾时出错。', failure);
     await context.globalState.update(RELOCATION_NOTICE_KEY, result ? describeResult(result) : `数据目录已迁移到 ${plan.targetRootPath}。`);
     await vscode.window.showErrorMessage('数据目录迁移已完成', {
-      modal: true, detail: `迁移已完成，收尾时出错：${describeError(failure)}\n\n数据目录已切换到 ${plan.targetRootPath}，旧目录没有改动。窗口将重载以打开新目录。`
+      modal: true, detail: `迁移已完成，收尾时出错：${describeError(failure)}\n\n数据目录已切换到 ${plan.targetRootPath}，旧目录里的数据没有改动（只多了一个“数据已迁走”标记）。窗口将重载以打开新目录。`
     });
     await reloadWindow();
     return;
@@ -303,7 +303,7 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
   }
   const detail = (cleaned
     ? cleanupProblem ?? '数据目录没有切换，旧目录没有改动；新目录里本次做的改动已撤销。'
-    : `数据目录没有切换，旧目录没有改动；新目录里本次做的改动没能全部撤销，下次启动 LimCode 时会再撤销一次。${cleanupProblem ?? ''}`);
+    : `数据目录没有切换，旧目录里的数据没有改动；新目录里本次做的改动没能全部撤销，下次启动 LimCode 时会再撤销一次。${cleanupProblem ?? ''}`);
   if (runtimeClosed) {
     // This window's Runtime (and its settings page) is closed: only a native message is left.
     await vscode.window.showErrorMessage('数据目录迁移失败，仍然使用原目录', { modal: true, detail: `${message}\n\n${detail}窗口将重载以重新打开原目录。` });
@@ -671,6 +671,12 @@ export async function offerDataRootRecovery(
   const status = await loadCommittedGlobalStatus(context);
   const current = resolveDataRootUri(context, status.dataRootPath).fsPath;
   if (reason === 'unpublished') {
+    // Its pointer switch had begun (it may have switched): not undone from here.
+    if ((error as { cause?: { code?: unknown } } | undefined)?.cause?.code === 'data-root-relocation-switching') {
+      // The message says why (DataRootUnavailableError carries the cause's explanation).
+      await vscode.window.showErrorMessage(message, { modal: true });
+      return;
+    }
     const choice = await vscode.window.showErrorMessage(message, UNDO_UNPUBLISHED, '暂不打开');
     if (choice !== UNDO_UNPUBLISHED) return;
     try {
@@ -707,7 +713,12 @@ export async function offerDataRootRecovery(
       ].join('\n')
     }, CONTINUE_HERE, '改用新目录', '暂不打开');
     if (choice === CONTINUE_HERE) {
-      await consentToDataRootMovedWork(current, moved.relocationId, installationOf(context).id);
+      try {
+        await consentToDataRootMovedWork(current, moved.relocationId, installationOf(context).id);
+      } catch (error) {
+        await vscode.window.showErrorMessage(`${EXTENSION_BRAND}：没能在这个目录里记下“迁走的任务按中止收尾”（${describeError(error)}），这次没有打开；可以重载窗口后再选一次。`, { modal: true });
+        return;
+      }
       await reloadWindow();
     } else if (choice === '改用新目录') {
       // Only the pointer moves: nothing runs here.
@@ -836,7 +847,7 @@ async function settleInterruptedRelocation(context: vscode.ExtensionContext, pen
       const hold = outcome === 'held' ? await readDataRootRelocationHold(pending.targetRootPath).catch(() => undefined) : undefined;
       const lines = outcome === 'held'
         ? ['上次中断的数据目录迁移没有撤销。', hold?.message ?? '']
-        : [`上次中断的数据目录迁移没有生效（数据目录没有切换，旧目录没有改动），但新目录 ${pending.targetRootPath} 里已经有那次迁移复制过去的数据；`
+        : [`上次中断的数据目录迁移没有生效（数据目录没有切换，旧目录里的数据没有改动），但新目录 ${pending.targetRootPath} 里已经有那次迁移复制过去的数据；`
           + '撤销所需的记录已经不在了（可能已被另一个 LimCode 安装收尾），无法自动撤销，需要时请自行处理那里的数据。'];
       if (ask) await tell(ask, '上次的迁移没有撤销', lines);
       else void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${lines.join('')}`);
@@ -927,26 +938,42 @@ export function describeCarriedWorkLeft(items: readonly DataRootCarriedWorkLeftI
 }
 
 const FORGET_RELOCATION = '放弃这次迁移的记录';
-const FORGET_RELOCATION_NOTE = '放弃之后不会再尝试撤销：旧目录没有改动；新目录那边（如果以后又能访问）可能留有这次迁移的半截数据，需要时请自行删除。';
+const FORGET_RELOCATION_NOTE = '放弃之后不会再尝试撤销：数据目录没有切换过去，这次迁移在旧目录里写下的“数据已迁走”标记随之去掉（原来的标记放回），旧目录的数据没有改动；'
+  + '新目录那边（如果以后又能访问）可能留有这次迁移的半截数据，需要时请自行删除。';
 
 /**
  * A relocation whose target stays unreachable (a broken drive, a changed drive letter) would block
- * every later relocation: the user may give its record up after confirming what that means.
+ * every later relocation: the user may give its record up after confirming what that means. Its
+ * moved notice in the old directory goes first (the pointer never switched to it; see
+ * abandonDataRootMovedNotice), then the record. Without a settings page (at startup) the notification
+ * does not hold the open up: the choice is handled whenever it is made, and `false` returns at once.
  */
 async function offerForgetRelocation(context: vscode.ExtensionContext, pending: PendingDataRootRelocation, lines: Array<string | undefined>, ask?: Ask): Promise<boolean> {
   const text = lines.filter((line): line is string => !!line);
-  let forget: boolean;
-  if (ask) {
-    const answer = await ask({
-      title: '上次的迁移还没有撤销完', sections: [{ lines: [...text, FORGET_RELOCATION_NOTE] }],
-      actions: [OK, { key: 'forget', label: FORGET_RELOCATION, variant: 'danger' }]
-    });
-    forget = answer.choice === 'forget';
-  } else {
-    forget = await vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${text.join('')}`, `${FORGET_RELOCATION}…`) === `${FORGET_RELOCATION}…`
-      && await nativeConfirm(`${FORGET_RELOCATION}？`, [`新数据目录：${pending.targetRootPath}`, FORGET_RELOCATION_NOTE], FORGET_RELOCATION);
+  if (!ask) {
+    void (async () => {
+      const forget = await vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${text.join('')}`, `${FORGET_RELOCATION}…`) === `${FORGET_RELOCATION}…`
+        && await nativeConfirm(`${FORGET_RELOCATION}？`, [`新数据目录：${pending.targetRootPath}`, FORGET_RELOCATION_NOTE], FORGET_RELOCATION);
+      if (forget) await forgetRelocation(context, pending);
+    })().catch((error: unknown) => console.warn('[LimCode] 放弃迁移记录失败。', error));
+    return false;
   }
-  if (!forget) return false;
+  const answer = await ask({
+    title: '上次的迁移还没有撤销完', sections: [{ lines: [...text, FORGET_RELOCATION_NOTE] }],
+    actions: [OK, { key: 'forget', label: FORGET_RELOCATION, variant: 'danger' }]
+  });
+  return answer.choice === 'forget' && forgetRelocation(context, pending, ask);
+}
+
+async function forgetRelocation(context: vscode.ExtensionContext, pending: PendingDataRootRelocation, ask?: Ask): Promise<boolean> {
+  try {
+    await abandonDataRootMovedNotice(pending.sourceRootPath, pending.relocationId);
+  } catch (error) {
+    await notify(ask, '没有放弃这次迁移的记录', [
+      `没能去掉旧目录里这次迁移写下的“数据已迁走”标记（${describeError(error)}），记录保留；可以稍后再试。`
+    ]);
+    return false;
+  }
   await updateGlobalStatusDataRoot(context, { pendingRelocation: null, expectedPendingRelocationId: pending.relocationId });
   return true;
 }
