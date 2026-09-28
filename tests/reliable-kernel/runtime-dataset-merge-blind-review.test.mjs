@@ -459,7 +459,12 @@ test('F7：准备记录的心跳在配置准入内核对后才写回——读到
   }));
   assert.equal(preparation.sources.length, 1);
   armed = true;
+  // The heartbeat timer does not hold the event loop open (the extension host's never empties): hold it
+  // until the beat is reached, or Node ends the test with the promise still pending.
+  const keepAlive = setInterval(() => {}, 1_000);
+  t.after(() => clearInterval(keepAlive));
   assert.equal((await heartbeat).candidateId, fixture.alpha.id);
+  clearInterval(keepAlive);
   // The heartbeat read the record and found it still this window's; the release comes now.
   const releasing = releaseLargeMergePreparation(preparation);
   await delay(300);
