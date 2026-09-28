@@ -4,8 +4,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite,
-  readAll, readLedgerRecord, saveState, seedConversations, seedRichSource, treeSnapshot
+  countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite, readAll, readLedgerRecord,
+  removeConfigurationRoot, saveState, seedConversations, seedRichSource, treeSnapshot
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const {
@@ -25,7 +25,7 @@ const SMALL_LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
 
 async function fixtureFor(t, options) {
   const fixture = await createConfigurationRoot(options);
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   return fixture;
 }
 

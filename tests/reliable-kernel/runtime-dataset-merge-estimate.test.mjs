@@ -8,7 +8,8 @@ import { performance } from 'node:perf_hooks';
 import test from 'node:test';
 import {
   countRows, createConfigurationRoot, Database, generateSyntheticSource, kernel, kernelFile, ledgerEntries, MESSAGE_TYPE,
-  modelRequestAggregate, NOW, rawWrite, readAll, readLedgerRecord, repo, seedConversations, seedRichSource, treeSnapshot, withRuntime
+  modelRequestAggregate, NOW, rawWrite, readAll, readLedgerRecord, removeConfigurationRoot, repo, seedConversations, seedRichSource,
+  treeSnapshot, withRuntime
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const require = createRequire(import.meta.url);
@@ -33,7 +34,7 @@ const LEDGER_SECTIONS = ['records', 'requests', 'preparing', 'finalizations', 'c
 
 async function fixtureFor(t, options) {
   const fixture = await createConfigurationRoot(options);
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   return fixture;
 }
 

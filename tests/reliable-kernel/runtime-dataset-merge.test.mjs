@@ -7,6 +7,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
+import { removeConfigurationRoot } from './fixtures/runtime-merge-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const compiled = process.env.LIMCODE_TEST_EXTENSION_ROOT
@@ -1118,7 +1119,7 @@ test('迁移复用：CAS 在线预复制（按 RootAuthority 校验来源身份�
   ]);
   await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_running', kind: 'leased-model-request' }]);
   const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-merge-other-'));
-  t.after(() => fs.rm(otherRoot, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(otherRoot));
   const fresh = await initialize(otherRoot, 'default');
   const input = {
     candidateId: fixture.alpha.id,
@@ -1164,7 +1165,7 @@ test('迁移遇到正在接收回复的模型请求时明确失败：目标不�
       .run('conversation_alpha_streaming_unfinished_turn_request');
   } finally { streaming.close(); }
   const otherRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-merge-streaming-'));
-  t.after(() => fs.rm(otherRoot, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(otherRoot));
   const fresh = await initialize(otherRoot, 'default');
   const database = await openTarget(t, fresh);
   const sourceBefore = await treeSnapshot(fixture.alpha.scopeRoot);
@@ -1939,7 +1940,7 @@ function assertCollaborationOrder(dataSet, ids) {
 
 async function createFixture(t, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-merge-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(root));
   const paths = { globalStoragePath: root };
   const current = await initialize(root, 'default');
   const alpha = await initializeScope(paths, 'alpha');

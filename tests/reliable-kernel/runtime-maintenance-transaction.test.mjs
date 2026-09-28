@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import test from 'node:test';
-import { createConfigurationRoot, kernel, kernelFile, modelRequestAggregate, NOW, repo, seedConversations, withRuntime } from './fixtures/runtime-merge-fixture.mjs';
+import {
+  createConfigurationRoot, kernel, kernelFile, modelRequestAggregate, NOW, removeConfigurationRoot, repo, seedConversations, withRuntime
+} from './fixtures/runtime-merge-fixture.mjs';
 
 // The worker's maintenance transaction (RuntimeDatabase.open(authority, { maintenance: true })): one
 // write transaction over several requests of a private offline instance, as a large-merge session
@@ -11,7 +13,7 @@ const { withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 
 async function fixtureFor(t, options) {
   const fixture = await createConfigurationRoot(options);
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   return fixture;
 }
 
@@ -100,6 +102,42 @@ test('维护事务：只在持有维护声明的维护实例上可用，打开�
       // Other writes work again once it ended.
       await database.transaction([conversation('conversation_after')]);
       assert.equal(await present('Conversation', 'conversation_after'), true);
+    } finally { await database.close(); }
+  });
+});
+
+test('维护事务（审查 #10）：打开期间 modelStreamEvent、modelStreamActivity、cancelCurrentModelRequest 也被 worker 拒绝、事务照常提交；提交时的聚合断言逐页查完（600 个请求里按 id 排在第 3 页的那个缺 Operation 也抓到，整笔回滚）', async (t) => {
+  const fixture = await fixtureFor(t);
+  await seedConversations(fixture.current, [{ id: 'conversation_seed' }]);
+  const recipe = await withRuntime(fixture.current, (runtime, store) => store.ingest(runtime, '{}', 'application/json'));
+  await withRuntimeMaintenance(fixture.current.binding.paths, async () => {
+    const database = await kernel.RuntimeDatabase.open(fixture.current.authority, { hostBootId: `historical-merge-${randomUUID()}`, maintenance: true });
+    try {
+      const present = async (domain, id) => (await database.snapshot([repo(domain).get(id)])).snapshot[0] !== null;
+      await database.maintenanceBegin();
+      for (const kind of ['modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest']) {
+        await assert.rejects(database.sendRequest({ kind }),
+          new RegExp(`maintenance transaction is open on this Runtime database; ${kind} is refused until it ends`), `${kind} 被拒`);
+      }
+      await database.maintenanceAppend([repo('Conversation').insert({ id: 'conversation_meanwhile', title: 'x', status: 'active', created_at: NOW, updated_at: NOW })]);
+      await database.maintenanceCommit();
+      assert.equal(await present('Conversation', 'conversation_meanwhile'), true, '被拒的请求不影响事务');
+
+      // Asserted 256 ids a page at the commit: the broken request sorts into the third page.
+      const ids = Array.from({ length: 600 }, (_, index) => `request_${String(index).padStart(4, '0')}`);
+      const broken = ids[599];
+      await database.maintenanceBegin();
+      for (let start = 0; start < ids.length; start += 50) {
+        const steps = [];
+        for (const [offset, id] of ids.slice(start, start + 50).entries()) {
+          const [operation, attempt, request, ...stream] = modelRequestAggregate('conversation_seed_turn', id, BigInt(start + offset + 1),
+            { recipe: recipe.id, body: recipe.id, checkpoints: 1 });
+          steps.push(...(id === broken ? [request] : [operation, attempt, request, ...stream]));
+        }
+        await database.maintenanceAppend(steps);
+      }
+      await assert.rejects(database.maintenanceCommit(), new RegExp(`ModelRequest ${broken} must own exactly one Operation`));
+      assert.equal(await present('ModelRequest', ids[0]), false, '整笔回滚');
     } finally { await database.close(); }
   });
 });

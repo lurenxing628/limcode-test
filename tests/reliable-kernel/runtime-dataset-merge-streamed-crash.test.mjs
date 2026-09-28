@@ -7,7 +7,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  compiled, createConfigurationRoot, kernel, kernelFile, ledgerEntries, readAll, readLedgerRecord, saveState, seedRichSource, sha256, treeSnapshot
+  compiled, createConfigurationRoot, kernel, kernelFile, ledgerEntries, readAll, readLedgerRecord, removeConfigurationRoot, saveState,
+  seedConversations, seedRichSource, sha256, treeSnapshot
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const { mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
@@ -17,7 +18,7 @@ const LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
 
 test('崩溃注入：会话在 committing 写入后、第 1 块、中间块、最后一块之后、提交前、提交后、merged 写入前、第二份来源开始前被杀，下次启动都能收敛：当前库要么是合并前，要么是这份合并后的参考结果，来源文件不变，没有残留', { timeout: 600_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 4);
   await seedRichSource(fixture.beta, 'beta', 4);
   const initial = await saveState(fixture, fixture.current);
@@ -89,6 +90,65 @@ test('崩溃注入：会话在 committing 写入后、第 1 块、中间块、�
         assert.equal(again.code, 0, again.stderr);
         assert.deepEqual(readAll(fixture.current), both, '之后的会话合并完两份');
       }
+    } finally {
+      await fs.rm(temporary, { recursive: true, force: true });
+      await initial.restore();
+    }
+  }
+});
+
+test('崩溃注入（再次合并，审查 #10）：来源合并过一次、之后又有新对话，明确请求再次合并时在 committing 写入后、中间块、提交前、提交后、merged 写入前被杀：下次启动要么放回上一次合并的记录、当前库等于上一次合并后，要么按实测记为这次已合并（实际新增行数、两次插入的对话），来源文件不变，没有残留', { timeout: 600_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => removeConfigurationRoot(fixture.root));
+  await seedRichSource(fixture.alpha, 'alpha', 4);
+  const merged = await runChild(fixture, {});
+  assert.equal(merged.code, 0, merged.stderr);
+  assert.deepEqual(JSON.parse(merged.stdout).results.map((result) => result.state), ['merged']);
+  const earlier = await readLedgerRecord(fixture, fixture.alpha.id);
+  // Continued in the source afterwards; the user asks for it again.
+  await seedConversations(fixture.alpha, Array.from({ length: 12 }, (_, index) => ({ id: `alpha_later_${index}` })));
+  const initial = await saveState(fixture, fixture.current);
+  t.after(() => initial.remove());
+  const sources = await sourceFiles(fixture.alpha);
+  const once = readAll(fixture.current);
+  const request = { candidateIds: [fixture.alpha.id], requested: true };
+  const reference = await runChild(fixture, request);
+  assert.equal(reference.code, 0, reference.stderr);
+  const [result] = JSON.parse(reference.stdout).results;
+  assert.equal(result.state, 'merged');
+  const twice = readAll(fixture.current);
+  await initial.restore();
+  const middle = Math.floor(JSON.parse(reference.stdout).prepared[0].rows / LIMITS.chunkRows / 2);
+
+  const cases = [
+    ['committing 写入后', { point: 'after-committing' }, once],
+    ['中间块之后', { point: 'after-chunk', chunk: middle }, once],
+    ['提交前（证据已写全）', { point: 'before-commit' }, once],
+    ['提交后、收回预写日志前', { point: 'after-commit' }, twice],
+    ['merged 写入前', { point: 'before-merged-record' }, twice]
+  ];
+  for (const [name, fault, expected] of cases) {
+    const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-large-merge-child-tmp-'));
+    try {
+      const killed = await runChild(fixture, { ...request, fault }, temporary);
+      assert.equal(killed.signal, 'SIGKILL', `${name}：子进程在故障点被杀\n${killed.stderr}`);
+      await withTemporaryDirectory(temporary, () => sweepDataRootRelocationLeftovers(fixture.root));
+      const converged = await mergeOnline(fixture, { sizeLimits: LIMITS.sizeLimits });
+      assert.deepEqual([converged.failures, converged.blocked], [[], []], name);
+      assert.deepEqual(readAll(fixture.current), expected, `${name}：当前库${expected === once ? '等于上一次合并后' : '等于这次合并后的参考结果'}`);
+      const record = await readLedgerRecord(fixture, fixture.alpha.id);
+      assert.equal(record?.state, 'merged', name);
+      if (expected === once) {
+        assert.deepEqual([record.mergedAt, record.source.contentDigest], [earlier.mergedAt, earlier.source.contentDigest], `${name}：放回上一次合并的记录`);
+        assert.deepEqual(converged.merged, [], `${name}：没有请求，不自动再合并`);
+      } else {
+        assert.notEqual(record.source.contentDigest, earlier.source.contentDigest, `${name}：记为这次的来源状态`);
+        assert.equal(record.insertedRows, result.insertedRows, `${name}：实际新增行数`);
+        assert.equal(record.mergedInto?.[0]?.conversationIds.length, 16, `${name}：两次插入的对话都记入账本`);
+      }
+      assert.deepEqual(await ledgerEntries(fixture, 'commits'), [], `${name}：没有残留的提交凭据`);
+      assert.deepEqual(await ledgerEntries(fixture, 'preparing'), [], `${name}：已死进程的准备记录被清理`);
+      assert.deepEqual(await sourceFiles(fixture.alpha), sources, `${name}：来源文件不变`);
     } finally {
       await fs.rm(temporary, { recursive: true, force: true });
       await initial.restore();

@@ -1,7 +1,7 @@
 // Large-merge session after its review (second part): target backups that outlive their window,
 // cleanup failures that must not undo an outcome, disk space, invariants, conflicts, the closure.
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import fs from 'node:fs/promises';
@@ -10,8 +10,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  compiled, countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite, readAll, readLedgerRecord, saveState,
-  seedConversations, seedRichSource
+  compiled, countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite, readAll, readLedgerRecord,
+  removeConfigurationRoot, saveState, seedConversations, seedRichSource
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const require = createRequire(import.meta.url);
@@ -37,7 +37,7 @@ const INVARIANT = 'runtime-data-set-merge-invariant';
 
 test('准备好的窗口在会话之前消失（关窗、重载、崩溃）：它做的目标备份登记在盘上，下一次批次或准备清理过期准备时连同备份删掉，不会一次次累积', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
 
   const first = await runChild(t, fixture, { fault: { point: 'after-cas-transfer' } });
@@ -76,7 +76,7 @@ test('准备好的窗口在会话之前消失（关窗、重载、崩溃）：�
 
 test('准备抛错时（写第二份来源的准备记录遇到 ENOSPC）：本次做的目标备份和它的登记都删掉，声明也都交还', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await seedRichSource(fixture.beta, 'beta', 3);
   const open = fsPromises.open;
@@ -104,7 +104,7 @@ test('准备抛错时（写第二份来源的准备记录遇到 ENOSPC）：本�
 
 test('会话开始之后窗口消失：备份在第一份来源之前记为用过，清理过期准备时只撤登记，这份合并前备份照常保留', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const killed = await runChild(t, fixture, { fault: { point: 'after-commit' } });
   assert.equal(killed.signal, 'SIGKILL', killed.stderr);
@@ -123,7 +123,7 @@ test('会话开始之后窗口消失：备份在第一份来源之前记为用�
 
 test('会话结束时关闭私有实例出错：已合并的结果照常返回，用上的备份保留，登记撤掉', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const close = kernel.RuntimeDatabase.prototype.close;
   let armed = false;
@@ -152,7 +152,7 @@ test('会话结束时关闭私有实例出错：已合并的结果照常返回�
 
 test('删除私有副本失败（Windows 上被扫描程序占着：EBUSY）不覆盖已有的结果：在线合并、准备和会话都照常给出结果，副本留在临时目录', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   // alpha (77 rows) is merged online, beta (125 rows) waits for the session.
   await seedRichSource(fixture.alpha, 'alpha', 2);
   await seedRichSource(fixture.beta, 'beta', 4);
@@ -189,7 +189,7 @@ test('删除私有副本失败（Windows 上被扫描程序占着：EBUSY）不�
 
 test('会话开始前准备的备份已经不在（被清理了）：整批推迟、说明原因，不写任何东西，登记撤掉', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const rows = countRows(fixture.current);
   const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
@@ -208,7 +208,7 @@ test('会话开始前准备的备份已经不在（被清理了）：整批推�
 
 test('没用上的备份这次删不掉（EBUSY）：登记保留，不再刷新心跳；窗口不在之后下一次清理把备份和登记一起删掉', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const rm = fsPromises.rm;
   let backup;
@@ -245,7 +245,7 @@ test('没用上的备份这次删不掉（EBUSY）：登记保留，不再刷新
 
 test('会话写提交证据时遇到 ENOSPC：与 SQLITE_FULL 一样按磁盘空间不足处理——中文说明和需要量、没有系统原文，这份撤回，后面的来源不再开始', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await seedRichSource(fixture.beta, 'beta', 3);
   const before = readAll(fixture.current);
@@ -280,7 +280,7 @@ test('会话写提交证据时遇到 ENOSPC：与 SQLITE_FULL 一样按磁盘空
 
 test('会话中途磁盘快满：每块写完查剩余空间，不到 64 MB 余量就提前回滚，按已写入的部分推算需要量；后面的来源不开始', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await seedRichSource(fixture.beta, 'beta', 3);
   const before = readAll(fixture.current);
@@ -308,9 +308,40 @@ test('会话中途磁盘快满：每块写完查剩余空间，不到 64 MB 余�
   assert.deepEqual(await ledgerEntries(fixture, 'commits'), []);
 });
 
+test('真的写满的磁盘（审查 #10：不是故障点模拟）：配置根在一个小 tmpfs 上，会话的事务在 SQLite 里遇到磁盘满——按磁盘空间不足推迟，中文说明不带系统原文，后面的来源不开始，当前库不变、没有记录和提交凭据，预写日志还给磁盘；腾出空间后再合并两份都成', { timeout: 300_000 }, async (t) => {
+  if (spawnSync('unshare', ['-Urm', 'true']).status !== 0) {
+    t.skip('这台机器不允许无特权的用户与挂载命名空间（unshare -Urm），挂不了小 tmpfs');
+    return;
+  }
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-large-merge-small-tmpfs-'));
+  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-large-merge-small-tmpfs-copies-'));
+  t.after(async () => {
+    await fs.rm(directory, { recursive: true, force: true });
+    await fs.rm(temporary, { recursive: true, force: true });
+  });
+  const child = path.join(HERE, 'runtime-dataset-merge-disk-full-child.mjs');
+  // The tmpfs exists only in the child's mount namespace and goes away with it.
+  const result = await new Promise((resolve) => {
+    execFile('unshare', ['-Urm', 'sh', '-c', 'mount -t tmpfs -o size=48m tmpfs "$1" && exec "$2" "$3" "$1"', 'sh', directory, process.execPath, child], {
+      env: { ...process.env, LIMCODE_TEST_EXTENSION_ROOT: compiled, TMPDIR: temporary }, maxBuffer: 16 * 1024 * 1024
+    }, (error, stdout, stderr) => resolve({ code: error ? error.code ?? null : 0, stdout, stderr }));
+  });
+  assert.equal(result.code, 0, result.stderr);
+  const seen = JSON.parse(result.stdout);
+  assert.equal(seen.prepared, 2);
+  assert.deepEqual(seen.results.map((item) => [item.state, item.code ?? item.reason]), [['deferred', DISK_FULL], ['not-run', 'disk-full']], JSON.stringify(seen.results));
+  const [, where] = /^磁盘空间不足，需要约 \d+ MB：合并这份旧聊天记录要在 (\S+) 暂存数据，已撤回这份的写入/.exec(seen.results[0].message) ?? [];
+  assert.ok(where?.startsWith(directory), seen.results[0].message);
+  assert.doesNotMatch(seen.results[0].message.replace(where, ''), /SQLITE|disk|full|ENOSPC|space left/i, '没有系统原文');
+  assert.equal(seen.unchanged, true, '当前库不变');
+  assert.equal(seen.walAfter, 0, '撤回的事务的预写日志还给了磁盘');
+  assert.deepEqual([seen.records, seen.commits], [[null, null], []]);
+  assert.deepEqual(seen.again, ['merged', 'merged'], '腾出空间后两份都合并');
+});
+
 test('空间计入目标会被改写的索引页：准备在它的目标备份上实测（dbstat），估计按目标文件大小的 0.65 估；需要量按同一个模型', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.current, 'target', 6);
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await withWindow(fixture, async (window) => {
@@ -333,7 +364,7 @@ test('空间计入目标会被改写的索引页：准备在它的目标备份�
 
 test('空间不够、开不了大库会话时，中等来源照常单独协调合并，不被连带挡住；空间够时照旧随会话一起等待', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedConversations(fixture.alpha, [{ id: 'alpha_medium' }]);
   await seedRichSource(fixture.beta, 'beta', 3);
   const [alphaRows, betaRows] = [countRows(fixture.alpha), countRows(fixture.beta)];
@@ -369,7 +400,7 @@ test('空间不够、开不了大库会话时，中等来源照常单独协调�
 
 test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间不足（中文、没有系统原文），后面的来源也不开始准备，不留备份和登记', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await seedRichSource(fixture.beta, 'beta', 3);
   const open = fsPromises.open;
@@ -401,7 +432,7 @@ test('准备时写不下目标备份（ENOSPC）：这份推迟为磁盘空间�
 
 test('正文核验缓存文件损坏（不是数据库）：打开时删掉重建，之后照常记在盘上', { timeout: 120_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'limcode.cas-verified.sqlite');
   await fs.mkdir(path.dirname(file), { recursive: true });
   await fs.writeFile(file, 'this is not a database, only garbage left behind '.repeat(200));
@@ -419,7 +450,7 @@ test('正文核验缓存文件损坏（不是数据库）：打开时删掉重�
 
 test('正文核验缓存用不了时（它的位置被一个目录占着）：内存里最多留 1 万条，多的不留并计数；准备因此如实推迟这份来源，不进会话，也不留备份和声明', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'limcode.cas-verified.sqlite');
   await fs.mkdir(file, { recursive: true });
   const cache = await openRuntimeCasVerificationCache(fixture.root);
@@ -454,7 +485,7 @@ test('正文核验缓存用不了时（它的位置被一个目录占着）：�
 
 test('不变量在试算里就查出（来源里一个已结束请求缺 Operation）：准备按受阻入账，不备份、不进会话，当前库不变；下次启动直接报告为受阻，不再等待大库会话', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const request = 'alpha_conversation_2_request_completed';
   rawWrite(fixture.alpha, (source) => {
@@ -488,7 +519,7 @@ test('不变量在试算里就查出（来源里一个已结束请求缺 Operati
 
 test('不变量在会话里才查出（来源里一个对话的项目链接换了 id：试算只比 id，写入时撞上“每个对话一条”的唯一约束）：整份回滚，按受阻入账，下次启动不再准备', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }));
   assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'merged');
@@ -515,7 +546,7 @@ test('不变量在会话里才查出（来源里一个对话的项目链接换�
 
 test('不变量在提交时才查出（来源给当前库里已有的请求多加了一次尝试，试算只查它要新插入的请求）：提交时的聚合断言拒绝，整份回滚，按受阻入账', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }));
   const request = 'alpha_conversation_0_request_completed';
@@ -534,7 +565,7 @@ test('不变量在提交时才查出（来源给当前库里已有的请求多�
 
 test('写入出错但不是数据本身的问题（本线程的错误、忙、断言当前库状态失败）：照旧推迟、不入账，以后再合并', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const append = kernel.RuntimeDatabase.prototype.maintenanceAppend;
   t.after(() => { kernel.RuntimeDatabase.prototype.maintenanceAppend = append; });
@@ -557,7 +588,7 @@ test('写入出错但不是数据本身的问题（本线程的错误、忙、�
 
 test('试算里读来源副本本身出错（SQLite 的 I/O 错误）不算数据不被接受：这份推迟，不入账', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const SqliteDatabase = require(require.resolve('better-sqlite3', { paths: [path.join(compiled, 'backend/reliableKernel')] }));
   const prepare = SqliteDatabase.prototype.prepare;
@@ -582,7 +613,7 @@ test('试算里读来源副本本身出错（SQLite 的 I/O 错误）不算数�
 
 test('会话里发现冲突就停：回滚后不再读这份来源的其余部分，拒绝里写明“至少”几处', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 4);
   const snapshot = kernel.RuntimeDatabase.prototype.snapshot;
   let streaming = false;

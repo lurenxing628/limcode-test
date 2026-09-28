@@ -40,6 +40,19 @@ export async function createConfigurationRoot(options = {}) {
   return { root, paths, current, alpha, beta };
 }
 
+/**
+ * Removes a configuration root and what its claims leave beside it: `<root>.runtime-admission` and
+ * the tombstones of claims whose process was killed (`<root>.runtime-admission.generation-dead-*`,
+ * kept there by design so stale contenders collide), which would otherwise pile up in the temp directory.
+ */
+export async function removeConfigurationRoot(root) {
+  await fs.rm(root, { recursive: true, force: true });
+  const prefix = `${path.basename(root)}.runtime-`;
+  for (const name of await fs.readdir(path.dirname(root)).catch(() => [])) {
+    if (name.startsWith(prefix)) await fs.rm(path.join(path.dirname(root), name), { recursive: true, force: true });
+  }
+}
+
 export async function initializeScope(paths, name) {
   const scope = resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: [`file:///workspace/${name}`] });
   const scopeRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, scope);

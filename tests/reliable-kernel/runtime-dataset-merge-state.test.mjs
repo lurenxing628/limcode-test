@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
+import { removeConfigurationRoot } from './fixtures/runtime-merge-fixture.mjs';
 
 // Merge state as the management UI sees it: merge targets that no longer exist, the last merge
 // surviving a later failed attempt, and the user's "kept" decision.
@@ -269,7 +270,7 @@ function pick(state) {
 
 async function createFixture(t, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-dataset-merge-state-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(root));
   const paths = { globalStoragePath: root };
   const current = await initialize(root, 'default');
   const alpha = await initializeScope(paths, 'alpha');

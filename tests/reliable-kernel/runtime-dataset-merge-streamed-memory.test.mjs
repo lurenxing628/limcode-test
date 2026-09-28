@@ -5,7 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  compiled, countRows, createConfigurationRoot, generateSyntheticSource, MESSAGE_TYPE, modelRequestAggregate, NOW, repo, withRuntime
+  compiled, countRows, createConfigurationRoot, generateSyntheticSource, MESSAGE_TYPE, modelRequestAggregate, NOW, removeConfigurationRoot,
+  repo, withRuntime
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -28,7 +29,7 @@ test(`内存上界：${SIZES.join(' 行与 ')} 行的来源各走一次大库会
   const peaks = [];
   for (const rows of SIZES) {
     const fixture = await createConfigurationRoot();
-    t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+    t.after(() => removeConfigurationRoot(fixture.root));
     const written = await generateSyntheticSource(fixture.alpha, { rows });
     const sourceRows = countRows(fixture.alpha);
     assert.ok(sourceRows >= written && written >= rows, `来源 ${sourceRows} 行`);
@@ -41,7 +42,7 @@ test(`内存上界：${SIZES.join(' 行与 ')} 行的来源各走一次大库会
     assert.deepEqual(report.results.map((result) => result.state), ['merged'], JSON.stringify(report));
     assert.equal(countRows(fixture.current), sourceRows, '逐行写入当前库');
     peaks.push(report.vmHwmKb / 1024);
-    await fs.rm(fixture.root, { recursive: true, force: true });
+    await removeConfigurationRoot(fixture.root);
   }
   const [smaller, larger] = peaks;
   t.diagnostic(`VmHWM：${SIZES[0]} 行 ${smaller.toFixed(1)} MB，${SIZES[1]} 行 ${larger.toFixed(1)} MB`);
@@ -57,7 +58,7 @@ test('内存：约 2 万个正文对象、13 万行的来源走一次准备与�
   timeout: 600_000
 }, async (t) => {
   const fixture = await createConfigurationRoot();
-  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  t.after(() => removeConfigurationRoot(fixture.root));
   await contentHeavySource(fixture.alpha, HEAVY_CONVERSATIONS);
   const child = await runMemoryChild(fixture.root, { sizeLimits: { transactionRows: 1_000 }, workerResourceLimits: WORKER_LIMITS });
   assert.equal(child.code, 0, child.stderr);
