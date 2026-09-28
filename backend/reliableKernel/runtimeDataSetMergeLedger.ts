@@ -20,6 +20,7 @@ const FINALIZATION_KIND = 'limcode-runtime-data-set-merge-finalization';
 const PREPARATION_KIND = 'limcode-runtime-data-set-merge-preparation';
 const AUDIT_KIND = 'limcode-runtime-data-set-audit';
 const SESSION_RATE_KIND = 'limcode-runtime-large-merge-session-rate';
+const TARGET_BACKUP_KIND = 'limcode-runtime-large-merge-target-backup';
 const RECORDS = 'records';
 const REQUESTS = 'requests';
 const COMMITS = 'commits';
@@ -33,6 +34,8 @@ const SESSION_RATE_ID = 'large-merge-session';
 const FINALIZATIONS = 'finalizations';
 /** Advisory: the window preparing a large-merge session for a source (see RuntimeDataSetMergePreparation). */
 const PREPARATIONS = 'preparing';
+/** The online target backup of a large-merge preparation, until settled (see RuntimeLargeMergeTargetBackup). */
+const TARGET_BACKUPS = 'preparing-backups';
 /** Content digest prefix of a data set whose content could not be read (see runtimeDataSetFingerprint). */
 const UNREADABLE_DIGEST = 'unreadable:';
 /** The id of a foreign history root (runtimeForeignHistory.foreignRuntimeHistoryId). */
@@ -857,6 +860,73 @@ export async function pruneRuntimeDataSetMergePreparations(paths: StoragePaths):
     const preparation = typeof candidateId === 'string' && fileName(candidateId) === name
       ? await readRuntimeDataSetMergePreparation(paths, candidateId).catch(() => undefined) : undefined;
     if (!preparation || !isRuntimeDataSetMergePreparationLive(preparation)) await removeLedgerFile(paths, PREPARATIONS, name);
+  }
+}
+
+/**
+ * The online backup of the target that a large-merge preparation takes (merge-backups/<name> of the
+ * target's control root), registered before its first byte is written and refreshed with the
+ * preparation's heartbeat until a session settled it or the preparation was released. A window that
+ * goes away (closed, reloaded, crashed) at any point in between leaves only this registration: the
+ * next pruning of preparations removes the backup with it, unless a session started on it (`used`,
+ * written before the session's first source), which keeps it as any merge's pre-merge backup.
+ */
+export interface RuntimeLargeMergeTargetBackup {
+  kind: typeof TARGET_BACKUP_KIND;
+  /** The backup directory's name (the engine's backup name, see BACKUP_NAME). */
+  name: string;
+  /** The backup directory, …/merge-backups/<name>. */
+  backupPath: string;
+  processId: number;
+  startedAt: string;
+  heartbeatAt: string;
+  /** A session started on it: kept as a pre-merge backup whatever happens to its window. */
+  used: boolean;
+}
+
+/**
+ * A registration whose process is present counts as held this long after its last heartbeat (a
+ * suspended machine or a busy window is no reason to delete a backup a session may still use); a
+ * process that is gone releases it at once.
+ */
+export const RUNTIME_LARGE_MERGE_TARGET_BACKUP_STALE_MS = 24 * 60 * 60 * 1000;
+
+export async function writeRuntimeLargeMergeTargetBackup(
+  paths: StoragePaths,
+  backup: Omit<RuntimeLargeMergeTargetBackup, 'kind'>
+): Promise<void> {
+  await writeLedgerJson(paths, TARGET_BACKUPS, backup.name, { kind: TARGET_BACKUP_KIND, ...backup });
+}
+
+export async function removeRuntimeLargeMergeTargetBackup(paths: StoragePaths, name: string): Promise<void> {
+  await removeLedgerJson(paths, TARGET_BACKUPS, name);
+}
+
+/** Every registration file; `backup` is absent for a torn or unknown one (removed when pruned). */
+export async function readRuntimeLargeMergeTargetBackups(
+  paths: StoragePaths
+): Promise<Array<{ file: string; backup?: RuntimeLargeMergeTargetBackup }>> {
+  return (await readDirectoryJson(paths, TARGET_BACKUPS)).map(([file, value]) => {
+    const entry = value as Partial<RuntimeLargeMergeTargetBackup> | null;
+    const valid = entry?.kind === TARGET_BACKUP_KIND && typeof entry.name === 'string' && fileName(entry.name) === file
+      && typeof entry.backupPath === 'string' && path.isAbsolute(entry.backupPath) && Number.isSafeInteger(entry.processId)
+      && typeof entry.startedAt === 'string' && typeof entry.heartbeatAt === 'string' && typeof entry.used === 'boolean';
+    return valid ? { file, backup: entry as RuntimeLargeMergeTargetBackup } : { file };
+  });
+}
+
+export async function removeRuntimeLargeMergeTargetBackupFile(paths: StoragePaths, file: string): Promise<void> {
+  await removeLedgerFile(paths, TARGET_BACKUPS, file);
+}
+
+/** Whether the window that registered a target backup may still use it (process present, heard from within a day). */
+export function isRuntimeLargeMergeTargetBackupLive(backup: RuntimeLargeMergeTargetBackup, now = Date.now()): boolean {
+  if (!(now - Date.parse(backup.heartbeatAt) < RUNTIME_LARGE_MERGE_TARGET_BACKUP_STALE_MS)) return false;
+  try {
+    process.kill(backup.processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
   }
 }
 

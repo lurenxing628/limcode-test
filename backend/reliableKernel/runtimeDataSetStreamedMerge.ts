@@ -18,16 +18,20 @@ import {
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeOptions, type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
+import {
+  estimatedTargetIndexBytes, LARGE_MERGE_WAL_PEAK_FACTOR, largeMergeTargetBytes, measuredIndexBytes
+} from './runtimeDataSetLargeMergeSpace';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
 import { holdForeignHistoricalMergeSource } from './runtimeForeignHistoryMerge';
 import { locateLocalRuntimeDataSet, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import {
   readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeCommit,
   removeRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeRequest, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
-  isRuntimeDataSetMergePreparationLive, pruneRuntimeDataSetMergePreparations, RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS,
+  isRuntimeDataSetMergePreparationLive, RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS,
   writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergePreparation,
   pruneRuntimeDataSetMergeCommits, readRuntimeLargeMergeSessionRate, rememberRuntimeLargeMergeSessionRate,
-  type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity
+  removeRuntimeLargeMergeTargetBackup, writeRuntimeLargeMergeTargetBackup,
+  type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeLargeMergeTargetBackup
 } from './runtimeDataSetMergeLedger';
 import { describeUnfinishedWork, hasFinalizableWork } from './runtimeDataSetMergeWork';
 import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
@@ -78,8 +82,6 @@ const PREPARATION_HEARTBEAT_MS = 10_000;
 export { RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS };
 /** The preparation's estimate of the exclusive time (from its measured scan) is shown as this range of it. */
 export const RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE = Object.freeze({ low: 0.7, high: 1.6 });
-/** WAL of one streamed source until its TRUNCATE checkpoint, relative to the source database. */
-const WAL_PEAK_FACTOR = 1.5;
 /**
  * A streamed merge also inserts (worker invariants, presence assertions, the commit): the session's
  * time without its copy relative to the online scan of the same rows. Measured 3.9 to 5.4 times
@@ -551,6 +553,9 @@ async function streamMergeTransaction(
 class PreparationClaims {
   private readonly held = new Map<string, { token: string; startedAt: string }>();
   private timer: NodeJS.Timeout | undefined;
+  /** The preparation's target backup while registered (RuntimeLargeMergeTargetBackup); its writes go one after another. */
+  private backup: Omit<RuntimeLargeMergeTargetBackup, 'kind' | 'heartbeatAt'> | undefined;
+  private backupWrites: Promise<void> = Promise.resolve();
 
   public constructor(private readonly paths: { globalStoragePath: string }) {}
 
@@ -574,7 +579,7 @@ class PreparationClaims {
     const claim = this.held.get(candidateId);
     if (!claim) return;
     this.held.delete(candidateId);
-    if (this.held.size === 0) this.stopHeartbeat();
+    if (this.held.size === 0 && !this.backup) this.stopHeartbeat();
     await withRuntimeDataRootAdmission(this.paths.globalStoragePath, async () => {
       const current = await readRuntimeDataSetMergePreparation(this.paths, candidateId).catch(() => undefined);
       if (current?.token === claim.token) await removeRuntimeDataSetMergePreparation(this.paths, candidateId);
@@ -583,6 +588,55 @@ class PreparationClaims {
 
   public async releaseAll(): Promise<void> {
     for (const candidateId of [...this.held.keys()]) await this.release(candidateId);
+  }
+
+  /**
+   * Registers the preparation's target backup (`root`, not written yet) on disk, refreshed with the
+   * claims' heartbeat: a window that goes away before the session settled it leaves it to the next
+   * pruning of preparations (see RuntimeLargeMergeTargetBackup). Throws when the registration cannot
+   * be written: the backup is then not taken. A registration left by a backup that failed (its
+   * directory already removed) is replaced.
+   */
+  public async registerBackup(root: string): Promise<void> {
+    if (this.backup && this.backup.backupPath !== root) await this.releaseBackup();
+    this.backup = { name: path.basename(root), backupPath: root, processId: process.pid, startedAt: new Date().toISOString(), used: false };
+    try {
+      await this.persistBackup();
+    } catch (error) {
+      this.backup = undefined;
+      throw error;
+    }
+    this.startHeartbeat();
+  }
+
+  /** Before a session's first source: the backup is kept as a pre-merge backup whatever happens to this window. */
+  public async backupInUse(): Promise<void> {
+    if (!this.backup || this.backup.used) return;
+    this.backup = { ...this.backup, used: true };
+    await this.persistBackup();
+  }
+
+  /**
+   * The backup was settled (kept, or removed): its registration goes, after any write still on its
+   * way. A backup that could not be removed (`settled` false) keeps it, no longer refreshed: the
+   * pruning of preparations removes both once this window is gone.
+   */
+  public async releaseBackup(settled = true): Promise<void> {
+    const backup = this.backup;
+    if (!backup) return;
+    this.backup = undefined;
+    if (this.held.size === 0) this.stopHeartbeat();
+    await this.backupWrites;
+    if (settled) await removeRuntimeLargeMergeTargetBackup(this.paths, backup.name).catch(() => undefined);
+  }
+
+  /** Writes the registration as it is when its turn comes (a heartbeat never writes back an older `used`). */
+  private persistBackup(): Promise<void> {
+    const write = this.backupWrites.then(async () => {
+      if (this.backup) await writeRuntimeLargeMergeTargetBackup(this.paths, { ...this.backup, heartbeatAt: new Date().toISOString() });
+    });
+    this.backupWrites = write.catch(() => undefined);
+    return write;
   }
 
   private startHeartbeat(): void {
@@ -603,6 +657,7 @@ class PreparationClaims {
       if (current?.token !== claim.token) continue;
       await writeRuntimeDataSetMergePreparation(this.paths, { ...current, heartbeatAt: new Date().toISOString() }).catch(() => undefined);
     }
+    if (this.backup) await this.persistBackup().catch(() => undefined);
   }
 }
 
@@ -651,8 +706,16 @@ export interface PrepareLargeMergeInput {
 export interface LargeMergeSpace {
   /** Where the target's WAL and data grow (the target's control root). */
   targetDirectory: string;
-  /** Needed there during the session: the sources' databases (growth), the largest one's WAL peak and a margin. */
+  /**
+   * Needed there during the session: the sources' databases (growth), the largest WAL of one source
+   * (its new pages and the target's index pages it rewrites) and a margin (largeMergeTargetBytes).
+   */
   targetBytes: number;
+  /**
+   * Part of targetBytes: the target's index pages the inserts rewrite, measured on the preparation's
+   * backup of the target (dbstat), estimated from the target's size where there is none.
+   */
+  targetIndexBytes: number;
   /** Where the private source copies go (os.tmpdir()). */
   temporaryDirectory: string;
   /** The largest source database with its WAL. */
@@ -715,6 +778,8 @@ interface PreparationInternals {
   pickedAt: string;
   requested: boolean;
   earlierBackup?: string;
+  /** The target's index pages, measured on this preparation's backup of it. */
+  targetIndexBytes?: number;
   options: LargeMergeEngineOptions;
   sources: Map<string, PreparedInternals>;
   released: boolean;
@@ -747,6 +812,10 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
   const { sources, pickedAt } = await engine.pickSources(paths, target, {
     ...(input.candidateIds ? { candidateIds: input.candidateIds } : {}), requested, ...(options.sizeLimits ? { sizeLimits: options.sizeLimits } : {})
   }, report, keepGoing);
+  if (sources.length > 0) {
+    // Windows gone since leave preparations and unused target backups: removed before this one takes its own.
+    await withRuntimeDataRootAdmission(paths.globalStoragePath, () => engine.pruneMergePreparations(paths)).catch(() => undefined);
+  }
   const internals: PreparationInternals = {
     claims: new PreparationClaims(paths), pickedAt, requested, options, sources: new Map(), released: false
   };
@@ -777,7 +846,9 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         continue;
       }
       const outcome = await engine.runSourceAttempt<PreparedOutcome>(paths, target, candidateId, mode,
-        (state) => prepareSource(paths, target, candidateId, mode, state, input, progress), sourceInternals.state);
+        (state) => prepareSource(paths, target, candidateId, mode, state, input, progress, internals)
+          .catch((error: unknown) => { throw diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并'); }),
+        sourceInternals.state);
       if (outcome.kind === 'prepared') {
         prepared.push(picked.label ? { ...outcome.source, label: picked.label } : outcome.source);
         internals.sources.set(candidateId, sourceInternals);
@@ -797,21 +868,34 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         continue;
       }
       const refused = issue(outcome);
-      if (outcome.kind === 'deferred') report.deferred.push(refused);
-      else {
+      if (outcome.kind === 'deferred') {
+        report.deferred.push(refused);
+        if (outcome.code === DISK_FULL) {
+          // The disk is full: the sources after it are not started either (as in the session).
+          for (const later of sources.slice(index + 1)) {
+            report.deferred.push({
+              candidateId: later.id, code: DISK_FULL, message: '前一份准备时磁盘空间不足，这一份没有开始；腾出空间后会再合并。',
+              newly: true, requested: later.requested, ...(later.label ? { label: later.label } : {})
+            });
+          }
+          break;
+        }
+      } else {
         (outcome.kind === 'blocked' ? report.blocked : report.failures).push(refused);
         await removeRuntimeDataSetMergeRequest(paths, candidateId).catch(() => undefined);
       }
     }
   } catch (error) {
+    // Nothing of it runs: the claims, and the target backup it took for no transaction.
     await releaseHolds(internals);
     await internals.claims.releaseAll();
+    await removeUnusedBackup(target.backup.path, target.controlRoot, internals);
     throw error;
   }
   if (sources.length > 0) {
     await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
       await pruneRuntimeDataSetMergeCommits(paths);
-      await pruneRuntimeDataSetMergePreparations(paths);
+      await engine.pruneMergePreparations(paths);
     }).catch(() => undefined);
   }
   if (!keepGoing() || report.stopped) {
@@ -829,7 +913,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     report: batch,
     small,
     ...(target.backup.path ? { backupPath: target.backup.path } : {}),
-    space: sessionSpace(target, prepared),
+    space: sessionSpace(target, prepared, internals.targetIndexBytes ?? 0),
     estimateMs,
     estimateRangeMs: estimateRange(estimateMs)
   };
@@ -845,7 +929,7 @@ export async function releaseLargeMergePreparation(preparation: LargeMergePrepar
   internals.released = true;
   await releaseHolds(internals);
   await internals.claims.releaseAll();
-  await removeUnusedBackup(preparation, internals);
+  await removeUnusedBackup(preparation.backupPath, preparation.space.targetDirectory, internals);
 }
 
 /**
@@ -871,14 +955,21 @@ async function releaseHolds(internals: PreparationInternals): Promise<void> {
   for (const source of internals.sources.values()) await source.state.foreign?.release();
 }
 
-/** The preparation's online target backup, which no transaction used: removed (as settleTargetBackup does). */
-async function removeUnusedBackup(preparation: LargeMergePreparation, internals: PreparationInternals): Promise<void> {
-  if (!preparation.backupPath) return;
-  // Unused, settleTargetBackup only removes it (and syncs its directory); it reads nothing else.
-  const target = { controlRoot: preparation.space.targetDirectory, backup: { path: preparation.backupPath } };
-  await engine.settleTargetBackup(target as unknown as HistoricalMergeTargetContext, {
-    ...(internals.earlierBackup ? { keep: internals.earlierBackup } : {})
-  }).catch(() => undefined);
+/**
+ * The preparation's online target backup, which no transaction used: removed (as settleTargetBackup
+ * does), and its registration with it; one that cannot be removed now stays registered for the
+ * pruning of preparations.
+ */
+async function removeUnusedBackup(backupPath: string | undefined, controlRoot: string, internals: PreparationInternals): Promise<void> {
+  let removed = true;
+  if (backupPath) {
+    // Unused, settleTargetBackup only removes it (and syncs its directory); it reads nothing else.
+    const target = { controlRoot, backup: { path: backupPath } };
+    removed = await engine.settleTargetBackup(target as unknown as HistoricalMergeTargetContext, {
+      ...(internals.earlierBackup ? { keep: internals.earlierBackup } : {})
+    }).then(() => true, () => false);
+  }
+  await internals.claims.releaseBackup(removed);
 }
 
 /** One source: the online merge's steps up to its commit, with a streamed scan instead of a plan. */
@@ -889,7 +980,8 @@ async function prepareSource(
   mode: HistoricalMergeSourceMode,
   state: HistoricalMergeSourceProgress,
   input: PrepareLargeMergeInput,
-  progress: (stage: LargeMergePrepareStage, rows?: number) => void
+  progress: (stage: LargeMergePrepareStage, rows?: number) => void,
+  internals: PreparationInternals
 ): Promise<HistoricalMergeSourceOutcome | PreparedOutcome> {
   const options = input.options ?? {};
   const stopIfAsked = (): void => {
@@ -979,7 +1071,11 @@ async function prepareSource(
       return await engine.commitSource(paths, target, candidate, binding, plan, undefined, state, options, mode, stopIfAsked);
     }
     progress('backup');
-    await engine.ensureTargetBackup(target, options);
+    await engine.ensureTargetBackup(target, options, {
+      register: (root) => internals.claims.registerBackup(root),
+      // The target's index pages, which the session's inserts rewrite in its WAL: read on the finished copy.
+      inspect: (copy) => { internals.targetIndexBytes = measuredIndexBytes(copy); }
+    });
     await engine.fault(options, 'after-target-backup');
     progress('cas');
     const cas = await engine.transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, false);
@@ -1003,7 +1099,7 @@ async function prepareSource(
     };
   } finally {
     verified?.close();
-    await taken.snapshot.close();
+    await engine.closeSnapshot(taken.snapshot);
   }
 }
 
@@ -1012,12 +1108,16 @@ function aboveThreshold(size: { rows: number; bytes: number }, threshold: 'in-me
   return size.rows > (options.sizeLimits?.transactionRows ?? RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
 }
 
-function sessionSpace(target: HistoricalMergeTargetContext, sources: ReadonlyArray<{ databaseBytes: number }>): LargeMergeSpace {
+function sessionSpace(
+  target: HistoricalMergeTargetContext,
+  sources: ReadonlyArray<{ databaseBytes: number }>,
+  targetIndexBytes: number
+): LargeMergeSpace {
   const largest = sources.reduce((max, source) => Math.max(max, source.databaseBytes), 0);
   return {
     targetDirectory: target.controlRoot,
-    targetBytes: sources.length === 0 ? 0
-      : Math.ceil(sources.reduce((sum, source) => sum + source.databaseBytes, 0) + largest * WAL_PEAK_FACTOR + engine.BACKUP_FREE_SPACE_MARGIN_BYTES),
+    targetBytes: largeMergeTargetBytes(sources, targetIndexBytes, engine.BACKUP_FREE_SPACE_MARGIN_BYTES),
+    targetIndexBytes: sources.length === 0 ? 0 : targetIndexBytes,
     temporaryDirectory: os.tmpdir(),
     temporaryBytes: largest
   };
@@ -1240,11 +1340,13 @@ export async function estimateLargeMergeSources(input: EstimateLargeMergeInput):
   }
   const { pendingSources: _pending, ...batch } = report;
   const targetBackupBytes = estimated.length > 0 ? await sqliteFilesBytes(target.binding.paths.databasePath) : 0;
+  // Not measured before the preparation's backup of the target: its index pages at the share of its size.
+  const targetIndexBytes = estimatedTargetIndexBytes(targetBackupBytes);
   // The one online backup of the target the preparation takes (a copy's worth of reading and writing).
   const prepareEstimateMs = estimated.length === 0 ? 0
     : estimated.reduce((sum, source) => sum + source.prepareEstimateMs, 0) + Math.round(targetBackupBytes / PREPARE_COPY_BYTES_PER_MS);
   const sessionEstimateMs = estimated.reduce((sum, source) => sum + source.sessionEstimateMs, 0);
-  const space = sessionSpace(target, estimated);
+  const space = sessionSpace(target, estimated, targetIndexBytes);
   return {
     sources: estimated,
     report: batch,
@@ -1299,7 +1401,7 @@ async function estimateSource(
         await options.onFaultPoint?.(point);
       }
     }, paths);
-    await taken.snapshot.close();
+    await engine.closeSnapshot(taken.snapshot);
     facts = engine.auditFacts(state.files!, taken.audit);
     if (!facts) throw new Error('The audit of this source measured nothing.');
   }
@@ -1414,15 +1516,34 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
   const notRun = (from: number, reason: 'cancelled' | 'disk-full'): void => {
     for (const source of preparation.sources.slice(from)) results.results.push({ candidateId: source.candidateId, state: 'not-run', reason });
   };
+  /** Nothing of the session starts: every source deferred with this reason. */
+  const deferAll = (code: string, message: string): LargeMergeSessionResult => {
+    for (const source of preparation.sources) {
+      results.results.push({
+        candidateId: source.candidateId, state: 'deferred',
+        issue: { candidateId: source.candidateId, code, message, newly: true, ...(source.label ? { label: source.label } : {}) }
+      });
+    }
+    return results;
+  };
   let backupSettled = false;
   try {
     const free = await (options.freeSpace ?? engine.freeSpace)(preparation.space.targetDirectory).catch(() => undefined);
     if (free !== undefined && free < preparation.space.targetBytes) {
-      const message = `磁盘空间不足，需要约 ${Math.ceil(preparation.space.targetBytes / (1024 * 1024))} MB：合并较大的旧聊天记录要在 ${preparation.space.targetDirectory} 暂存数据`;
-      for (const source of preparation.sources) {
-        results.results.push({ candidateId: source.candidateId, state: 'deferred', issue: { candidateId: source.candidateId, code: DISK_FULL, message, newly: true } });
+      return deferAll(DISK_FULL, `磁盘空间不足，需要约 ${Math.ceil(preparation.space.targetBytes / (1024 * 1024))} MB：合并较大的旧聊天记录要在 ${preparation.space.targetDirectory} 暂存数据`);
+    }
+    if (preparation.backupPath) {
+      // The pre-merge backup the preparation took: still there, and from now on kept whatever happens to this window.
+      if (!await stat(preparation.backupPath).then((info) => info.isDirectory(), () => false)) {
+        return deferAll('runtime-data-set-merge-backup-missing', '准备时做的当前历史库备份已经不在了，这次不合并；以后启动时会重新准备。');
       }
-      return results;
+      try {
+        await internals.claims.backupInUse();
+      } catch (error) {
+        return isDiskFull(error)
+          ? deferAll(DISK_FULL, `磁盘空间不足：合并较大的旧聊天记录前要在 ${paths.globalStoragePath} 记下合并前备份的使用，这次没有合并`)
+          : deferAll('runtime-data-set-merge-backup-unrecorded', '无法记下合并前备份的使用，这次没有合并；以后启动时会再合并。');
+      }
     }
     // This session against the size model, for later estimates: its merged sources with opening and closing the private instance.
     const measured = { sources: 0, rows: 0, sessionMs: 0, modelMs: 0 };
@@ -1452,7 +1573,9 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         const startedAt = performance.now();
         const outcome = await engine.runSourceAttempt(paths, target, prepared.candidateId, mode,
           (state) => mergePreparedSource(paths, target, resolver, prepared, verified!, state, mode, options, input.signal,
-            clock.source(index, prepared)), { ...sourceInternals.state });
+            clock.source(index, prepared), preparation.space.targetIndexBytes)
+            .catch((error: unknown) => { throw diskFull(error, target.controlRoot, '合并这份旧聊天记录时', '已撤回这份的写入'); }),
+          { ...sourceInternals.state });
         clock.sourceDone(prepared);
         const result = sourceResult(prepared.candidateId, outcome, internals.requested, prepared.label);
         results.results.push(result);
@@ -1480,9 +1603,16 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
     } finally {
       verified?.close();
       const closingAt = performance.now();
-      await database.close();
+      // Closing the private instance cannot undo what committed: a failure is logged, the results stand.
+      await database.close().catch((error: unknown) => {
+        console.warn('[LimCode] 合并较大的旧聊天记录之后关闭私有实例出错；已合并的部分不受影响。', error);
+      });
+      const used = target.backup.used === true;
+      const settled = await engine.settleTargetBackup(target, { ...(internals.earlierBackup ? { keep: internals.earlierBackup } : {}) })
+        .then(() => true, () => false);
       backupSettled = true;
-      await engine.settleTargetBackup(target, { ...(internals.earlierBackup ? { keep: internals.earlierBackup } : {}) }).catch(() => undefined);
+      // A used backup stays as the pre-merge backup; an unused one that could not be removed stays registered.
+      await internals.claims.releaseBackup(used || settled);
       measured.sessionMs += performance.now() - closingAt;
     }
     // Only a session long enough that its fixed parts do not dominate; replaces the last one.
@@ -1495,8 +1625,8 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
     internals.released = true;
     await releaseHolds(internals);
     await internals.claims.releaseAll();
-    // Nothing ran (no room on the disk, or the private instance did not open): no transaction used it.
-    if (!backupSettled) await removeUnusedBackup(preparation, internals);
+    // Nothing ran (no room on the disk, the backup gone, or the private instance did not open): no transaction used it.
+    if (!backupSettled) await removeUnusedBackup(preparation.backupPath, preparation.space.targetDirectory, internals);
     await pruneRuntimeDataSetMergeCommits(paths).catch(() => undefined);
   }
   return results;
@@ -1566,7 +1696,8 @@ async function mergePreparedSource(
   mode: HistoricalMergeSourceMode,
   options: LargeMergeEngineOptions,
   signal: AbortSignal | undefined,
-  progress: (stage: LargeMergeSessionStage, rows: number) => void
+  progress: (stage: LargeMergeSessionStage, rows: number) => void,
+  targetIndexBytes: number
 ): Promise<HistoricalMergeSourceOutcome> {
   const { candidateId } = prepared;
   const changed = (error: unknown): never => {
@@ -1577,7 +1708,7 @@ async function mergePreparedSource(
   const done: { outcome?: HistoricalMergeSourceOutcome } = {};
   try {
     return await resolver.fence(root, async () => {
-      done.outcome = await mergeLocked(paths, target, resolver, root, prepared, verified, state, mode, options, signal, progress);
+      done.outcome = await mergeLocked(paths, target, resolver, root, prepared, verified, state, mode, options, signal, progress, targetIndexBytes);
       return done.outcome;
     });
   } catch (error) {
@@ -1598,7 +1729,8 @@ async function mergeLocked(
   mode: HistoricalMergeSourceMode,
   options: LargeMergeEngineOptions,
   signal: AbortSignal | undefined,
-  progress: (stage: LargeMergeSessionStage, rows: number) => void
+  progress: (stage: LargeMergeSessionStage, rows: number) => void,
+  targetIndexBytes: number
 ): Promise<HistoricalMergeSourceOutcome> {
   const { candidateId } = prepared;
   await resolver.assertUnchanged(root, { paths, target, state, mode });
@@ -1648,14 +1780,27 @@ async function mergeLocked(
     const backupUsed = target.backup.used === true;
     target.backup.used = true;
     await options.onFaultPoint?.('after-committing', { candidateId });
+    // What this transaction wrote so far, for the space it turns out to need (the WAL grows with it).
+    const written = { rows: 0 };
+    const walBytes = (): Promise<number> => stat(`${target.binding.paths.databasePath}-wal`).then((info) => info.size, () => 0);
     let streamed: StreamedMerge;
     try {
       progress('merging', 0);
       streamed = await streamMergeTransaction(copy.database, target.database, {
         skipping, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS, ...(signal ? { signal } : {}), evidence, state,
         onChunk: async (chunk, rows) => {
+          written.rows = rows;
           progress('merging', rows);
           await options.onFaultPoint?.('after-chunk', { candidateId, chunk });
+          // Nearly full: rolled back now, before the disk is full for every other program too.
+          const free = await (options.freeSpace ?? engine.freeSpace)(target.controlRoot).catch(() => undefined);
+          if (free !== undefined && free < engine.BACKUP_FREE_SPACE_MARGIN_BYTES) {
+            const need = measuredNeed(prepared, targetIndexBytes, rows, await walBytes());
+            throw new engine.Outcome({
+              kind: 'deferred', code: DISK_FULL,
+              message: `磁盘空间快满了（${target.controlRoot} 只剩约 ${megabytes(free)} MB）：按已写入的部分推算，合并这份旧聊天记录需要约 ${megabytes(need)} MB，已提前撤回这份的写入`
+            });
+          }
         },
         beforeCommit: async () => {
           await options.onFaultPoint?.('after-last-chunk', { candidateId });
@@ -1673,9 +1818,10 @@ async function mergeLocked(
         await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
       }
       if (presence !== 'all') {
+        const wal = await walBytes();
         // The rolled-back transaction's WAL is given back to the disk.
         await target.database.maintenanceCheckpoint().catch(() => undefined);
-        throw streamFailure(error, prepared, target);
+        throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal));
       }
       streamed = {
         committed: true, rows: prepared.rows, inserted: prepared.insertRows, reused: prepared.reusedRows,
@@ -1712,7 +1858,7 @@ async function mergeLocked(
       ...await engine.takeFinalized(paths, candidate, state).catch(() => engine.finalizedResult(state))
     } };
   } finally {
-    await copy.close();
+    await engine.closeSnapshot(copy);
   }
 }
 
@@ -1724,29 +1870,54 @@ async function restoreReplaced(
   await engine.restoreLedgerRecord(paths, candidateId, previous);
 }
 
-/** A failed streamed transaction (rolled back): a refusal as it is, a cancellation, a full disk, anything else deferred. */
-function streamFailure(error: unknown, prepared: PreparedLargeMergeSource, target: HistoricalMergeTargetContext): unknown {
+/**
+ * A failed streamed transaction (rolled back): a refusal as it is, a cancellation, a full disk (with
+ * the space `need`ed as measured, never the system's own text), anything else deferred.
+ */
+function streamFailure(error: unknown, prepared: PreparedLargeMergeSource, target: HistoricalMergeTargetContext, need: number): unknown {
   if (error instanceof engine.Outcome) return error;
   if (isAbort(error)) {
     return new engine.Outcome({ kind: 'deferred', code: RUNTIME_DATA_SET_MERGE_CANCELLED, message: '合并已取消，这份旧聊天记录没有合并（之前合并完的库保留）；以后可以再合并。' });
   }
-  if (hasErrorCode(error, 'SQLITE_FULL')) {
-    const bytes = prepared.databaseBytes * (1 + WAL_PEAK_FACTOR) + engine.BACKUP_FREE_SPACE_MARGIN_BYTES;
+  if (isDiskFull(error)) {
     return new engine.Outcome({
       kind: 'deferred', code: DISK_FULL,
-      message: `磁盘空间不足，需要约 ${Math.ceil(bytes / (1024 * 1024))} MB：合并这份旧聊天记录要在 ${target.controlRoot} 暂存数据，已撤回这份的写入`
+      message: `磁盘空间不足，需要约 ${megabytes(need)} MB：合并这份旧聊天记录要在 ${target.controlRoot} 暂存数据，已撤回这份的写入`
     });
   }
   return new engine.Outcome({ kind: 'deferred', code: engine.errorCode(error), message: `写入当前库时出错，稍后重试：${engine.errorMessage(error)}` });
 }
 
-function hasErrorCode(error: unknown, code: string): boolean {
-  const seen = new Set<unknown>();
-  for (let current = error; current && typeof current === 'object' && !seen.has(current); current = (current as { cause?: unknown }).cause) {
-    seen.add(current);
-    if ((current as { code?: unknown }).code === code) return true;
-  }
-  return false;
+/**
+ * Space one source needs on the target's disk: the size model (largeMergeTargetBytes), or more when
+ * the WAL its transaction wrote for its first `rows` rows says so (projected over all of them).
+ */
+function measuredNeed(prepared: PreparedLargeMergeSource, targetIndexBytes: number, rows: number, walBytes: number): number {
+  const modelled = largeMergeTargetBytes([prepared], targetIndexBytes, engine.BACKUP_FREE_SPACE_MARGIN_BYTES);
+  if (rows <= 0 || walBytes <= 0) return modelled;
+  const projectedWal = (walBytes / rows) * Math.max(rows, prepared.rows);
+  return Math.ceil(Math.max(modelled, prepared.databaseBytes + projectedWal + engine.BACKUP_FREE_SPACE_MARGIN_BYTES));
+}
+
+/**
+ * A full disk anywhere in a source's steps (ledger records, copies, the transaction) as the outcome a
+ * session and a preparation stop at: said in Chinese with where, never with the system's own text.
+ * Anything else, and an outcome already decided, as it is.
+ */
+function diskFull(error: unknown, directory: string, doing: string, undone: string): unknown {
+  if (error instanceof engine.Outcome || !isDiskFull(error)) return error;
+  const file = (error as { path?: unknown }).path;
+  const where = typeof file === 'string' && path.isAbsolute(file) ? path.dirname(file) : directory;
+  return new engine.Outcome({ kind: 'deferred', code: DISK_FULL, message: `磁盘空间不足：${doing}在 ${where} 写不下了，${undone}；腾出空间后会再合并` });
+}
+
+function megabytes(bytes: number): number {
+  return Math.max(1, Math.ceil(bytes / (1024 * 1024)));
+}
+
+/** A full disk or quota anywhere in the cause chain (the system's own text is never shown for it). */
+function isDiskFull(error: unknown): boolean {
+  return engine.isDiskFullError(error);
 }
 
 function isAbort(error: unknown): boolean {

@@ -855,17 +855,23 @@ test('审查 #8：当前库备份失败时不留临时文件与空目录并推�
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_backup', project: SHARED_PROJECT }]);
   const database = await openTarget(t, fixture.current);
-  const failing = {
+  const failing = (code) => ({
     binding: database.binding,
     hostBootId: database.hostBootId,
     snapshot: (reads) => database.snapshot(reads),
     transaction: (steps) => database.transaction(steps),
     async backupTo(destination) {
       await fs.writeFile(destination, 'partial copy');
-      throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+      throw Object.assign(new Error(code === 'ENOSPC' ? 'ENOSPC: no space left on device, write' : 'EIO: i/o error, write'), { code });
     }
-  };
-  const report = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: failing });
+  });
+  // A full disk is said as such, in Chinese and without the system's text (审查修复 #2); anything else is a failed backup.
+  const full = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: failing('ENOSPC') });
+  assert.equal(full.deferred[0]?.code, 'runtime-data-set-merge-disk-full');
+  assert.match(full.deferred[0].message, /^磁盘空间不足：合并前要在 .+ 备份当前历史库，写不下了/u);
+  assert.doesNotMatch(full.deferred[0].message, /ENOSPC|no space/u);
+  await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
+  const report = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: failing('EIO') });
   assert.equal(report.deferred[0]?.code, 'runtime-data-set-merge-backup-failed');
   await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
 

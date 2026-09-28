@@ -253,8 +253,11 @@ test('估计只读：不收尾、不备份、不传正文、不写账本、不�
     const targetFiles = (await fs.stat(target)).size + await fs.stat(`${target}-wal`).then((info) => info.size, () => 0);
     assert.equal(result.space.targetBackupBytes, targetFiles);
     assert.equal(result.space.casCopyBytes, 0);
-    // The session's own need (every source, the largest one's WAL peak, a margin), plus the backup still to come.
-    assert.equal(result.space.targetBytes, Math.ceil(source.databaseBytes * 2.5 + 64 * 1024 * 1024) + targetFiles, JSON.stringify(result.space));
+    // The session's own need (every source, the largest one's WAL peak with the target's index pages it
+    // rewrites, not measured before the preparation's backup: 0.65 of the target's files; a margin), plus the backup still to come.
+    assert.equal(result.space.targetIndexBytes, Math.ceil(targetFiles * 0.65), JSON.stringify(result.space));
+    assert.equal(result.space.targetBytes, Math.ceil(source.databaseBytes * 2.5 + result.space.targetIndexBytes + 64 * 1024 * 1024) + targetFiles,
+      JSON.stringify(result.space));
     assert.equal(result.space.temporaryBytes, source.databaseBytes);
   }
   assert.deepEqual(first.sources.map(({ cached: _c, ...rest }) => rest), second.sources.map(({ cached: _c, ...rest }) => rest));
@@ -750,8 +753,9 @@ test('外来大库的估计：只经它的声明读（声明记在当前配置�
   const audit = JSON.parse(await fs.readFile(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'audits', `${entry.id.replace(/:/g, '-')}.json`), 'utf8'));
   assert.ok(audit.casBytes > 0 && audit.casObjects === first.sources[0].casObjects, JSON.stringify(audit));
   assert.equal(first.space.casCopyBytes, audit.casBytes, '外来库的正文全部复制');
+  assert.equal(first.space.targetIndexBytes, Math.ceil(first.space.targetBackupBytes * 0.65));
   assert.equal(first.space.targetBytes,
-    Math.ceil(first.sources[0].databaseBytes * 2.5 + 64 * 1024 * 1024) + first.space.targetBackupBytes + audit.casBytes);
+    Math.ceil(first.sources[0].databaseBytes * 2.5 + first.space.targetIndexBytes + 64 * 1024 * 1024) + first.space.targetBackupBytes + audit.casBytes);
 
   assert.deepEqual(probe.seen.filter((call) => inside(elsewhere.root, call.path)), [], '它记录的原位置从不被访问');
   assert.deepEqual(probe.seen.filter((call) => call.writes && inside(container, call.path)), [], '外来目录里不新建、不改写、不删除任何东西');

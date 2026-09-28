@@ -25,14 +25,17 @@ import {
   readCachedRuntimeDataSetAudit, readCachedRuntimeRootAudit, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization,
   readRuntimeDataSetMergeLedger, rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
   readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit, pruneRuntimeDataSetMergePreparations,
+  isRuntimeLargeMergeTargetBackupLive, readRuntimeLargeMergeTargetBackups, removeRuntimeLargeMergeTargetBackupFile,
   removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
   restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetConversationsMergedFrom, runtimeDataSetFingerprint, runtimeDataSetLastMerge,
   sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
   type RuntimeDataSetAuditCacheEntry, type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity,
-  type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest
+  type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest,
+  type RuntimeLargeMergeTargetBackup
 } from './runtimeDataSetMergeLedger';
 import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
+import { estimatedTargetIndexBytes, largeMergeTargetBytes } from './runtimeDataSetLargeMergeSpace';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
@@ -593,7 +596,10 @@ export async function mergeHistoricalDataSetsOnline(
     if (outcome.kind === 'deferred' && outcome.code === POSTPONED_IN_BATCH) postponed.push({ source, index, outcome });
     else await settle(source, outcome);
   }
-  const largeSession = report.deferred.some((issue) => issue.code === RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE);
+  // Only a session that can start takes them along: without the room it needs they are merged as ever.
+  const awaiting = report.deferred.filter((issue) => issue.code === RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE);
+  const largeSession = awaiting.length > 0 && postponed.length > 0 && !stopped
+    && await largeMergeSessionFits(target, awaiting.map((issue) => issue.size?.bytes ?? 0), options).catch(() => true);
   for (const { source, index, outcome } of stopped ? [] : postponed) {
     if (largeSession) {
       await settle(source, { ...outcome, code: RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE });
@@ -607,14 +613,42 @@ export async function mergeHistoricalDataSetsOnline(
     await settle(source, again);
   }
   await settleTargetBackup(target, { keep: earlierBackup }).catch(() => undefined);
-  if (sources.length > 0) {
-    await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
-      await pruneRuntimeDataSetMergeCommits(storagePaths);
-      // A large-merge preparation of a window that is gone holds nothing any more.
-      await pruneRuntimeDataSetMergePreparations(storagePaths);
-    }).catch(() => undefined);
-  }
+  await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
+    if (sources.length > 0) await pruneRuntimeDataSetMergeCommits(storagePaths);
+    // A large-merge preparation of a window that is gone holds nothing any more, nor the target backup it took.
+    await pruneMergePreparations(storagePaths);
+  }).catch(() => undefined);
   return report;
+}
+
+/**
+ * Whether the large-merge session the waiting sources (their audited bytes) need has room now, by the
+ * estimate's figures (largeMergeTargetBytes plus the preparation's backup of the target on the
+ * target's disk, a private copy of the largest source in the temporary directory, each with the
+ * margin). A disk whose free space cannot be read counts as having room.
+ */
+async function largeMergeSessionFits(
+  target: TargetContext,
+  sourceBytes: readonly number[],
+  options: Pick<RuntimeDataSetMergeOptions, 'freeSpace'>
+): Promise<boolean> {
+  let targetDatabaseBytes = 0;
+  for (const file of [target.binding.paths.databasePath, `${target.binding.paths.databasePath}-wal`]) {
+    targetDatabaseBytes += await fs.stat(file).then((info) => info.size, () => 0);
+  }
+  const sources = sourceBytes.map((databaseBytes) => ({ databaseBytes }));
+  const needs = new Map<string, number>([[target.controlRoot, targetDatabaseBytes
+    + largeMergeTargetBytes(sources, estimatedTargetIndexBytes(targetDatabaseBytes), BACKUP_FREE_SPACE_MARGIN_BYTES)]]);
+  const temporary = os.tmpdir();
+  const largest = Math.max(0, ...sourceBytes) + BACKUP_FREE_SPACE_MARGIN_BYTES;
+  const [targetDevice, temporaryDevice] = await Promise.all([target.controlRoot, temporary].map((directory) => fs.stat(directory).then((info) => info.dev, () => undefined)));
+  if (targetDevice !== undefined && targetDevice === temporaryDevice) needs.set(target.controlRoot, needs.get(target.controlRoot)! + largest);
+  else needs.set(temporary, largest);
+  for (const [directory, bytes] of needs) {
+    const free = await (options.freeSpace ?? freeSpace)(directory).catch(() => undefined);
+    if (free !== undefined && free < bytes) return false;
+  }
+  return true;
 }
 
 /**
@@ -1371,7 +1405,20 @@ async function mergeSource(
     return await commitExclusively(paths, target, candidateId, size.rows, state, mode, options.coordinateOversized!, commit);
   } finally {
     verifiedCache?.close();
-    await taken.snapshot.close();
+    await closeSnapshot(taken.snapshot);
+  }
+}
+
+/**
+ * Closes a private snapshot. Removing its copy can fail where another program holds the file for a
+ * moment (a scanner on Windows: EBUSY, EPERM): that never undoes the outcome the source already has
+ * (a merge that committed stays merged); the copy is left in the temporary directory with a warning.
+ */
+async function closeSnapshot(snapshot: RuntimeDataSetDatabaseSnapshot): Promise<void> {
+  try {
+    await snapshot.close();
+  } catch (error) {
+    console.warn('[LimCode] 旧聊天记录的临时副本没有删掉，留在临时目录里。', error);
   }
 }
 
@@ -3064,14 +3111,25 @@ async function rememberLinked(sourceFile: string, targetFile: string, verified: 
   if (sameContentIdentity(before, after)) verified.set(targetFile, after);
 }
 
-/** Online Backup API copy of the target, once per batch; failures leave no partial files behind. */
-async function ensureTargetBackup(target: TargetContext, options: RuntimeDataSetMergeOptions): Promise<string> {
+/**
+ * Online Backup API copy of the target before its first merge transaction, once per batch (or
+ * large-merge preparation); failures leave no partial files behind. A large-merge preparation
+ * registers its directory before anything of it is written (`register`, see
+ * RuntimeLargeMergeTargetBackup; when it throws, nothing is) and reads the finished copy while it is
+ * checked (`inspect`, e.g. its index pages).
+ */
+async function ensureTargetBackup(
+  target: TargetContext,
+  options: RuntimeDataSetMergeOptions,
+  hooks: { register?(root: string): Promise<void>; inspect?(copy: Database.Database): void } = {}
+): Promise<string> {
   if (target.backup.path) return target.backup.path;
   await assertRoomForBackup(target.binding.paths.databasePath, target.controlRoot, '当前历史库', options);
   const backups = path.join(target.controlRoot, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
   const root = path.join(backups, backupDirectoryName());
   const destination = path.join(root, 'limcode.sqlite');
   const temporary = `${destination}.${process.pid}.tmp`;
+  await hooks.register?.(root);
   try {
     await fs.mkdir(root, { recursive: true, mode: 0o700 });
     await writeDurableJson(path.join(root, 'root-binding.json'), target.binding);
@@ -3081,6 +3139,7 @@ async function ensureTargetBackup(target: TargetContext, options: RuntimeDataSet
     try {
       copy.defaultSafeIntegers(true);
       assertCurrentSchema(copy, target.binding);
+      hooks.inspect?.(copy);
     } finally {
       copy.close();
     }
@@ -3092,7 +3151,9 @@ async function ensureTargetBackup(target: TargetContext, options: RuntimeDataSet
     await removeSqliteFiles(temporary);
     await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
     await fs.rmdir(backups).catch(() => undefined);
-    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-backup-failed', message: `合并前备份当前历史库失败，稍后重试：${errorMessage(error)}` });
+    throw isDiskFullError(error)
+      ? new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-disk-full', message: `磁盘空间不足：合并前要在 ${target.controlRoot} 备份当前历史库，写不下了；腾出空间后会再合并` })
+      : new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-backup-failed', message: `合并前备份当前历史库失败，稍后重试：${errorMessage(error)}` });
   }
   target.backup.path = root;
   return root;
@@ -3129,6 +3190,35 @@ async function pruneTargetBackups(target: TargetContext, keep: readonly string[]
     if (!keep.includes(name)) await fs.rm(path.join(backups, name), { recursive: true, force: true });
   }
   await syncDirectoryDurably(backups);
+}
+
+/**
+ * Removes the preparations whose window is gone, and the target backups such windows registered
+ * (RuntimeLargeMergeTargetBackup): one no session started on is removed with its registration, one a
+ * session started on stays as a pre-merge backup (only its registration goes). A backup that cannot
+ * be removed now keeps its registration for the next pruning. Call inside configuration admission.
+ */
+async function pruneMergePreparations(paths: { globalStoragePath: string }): Promise<void> {
+  await pruneRuntimeDataSetMergePreparations(paths);
+  for (const { file, backup } of await readRuntimeLargeMergeTargetBackups(paths)) {
+    if (backup && isRuntimeLargeMergeTargetBackupLive(backup)) continue;
+    if (backup && !backup.used && !await removeRegisteredTargetBackup(backup).then(() => true, () => false)) continue;
+    await removeRuntimeLargeMergeTargetBackupFile(paths, file);
+  }
+}
+
+/** A registered backup directory, only where this engine names its backups (…/merge-backups/<BACKUP_NAME>, a real directory). */
+async function removeRegisteredTargetBackup(backup: RuntimeLargeMergeTargetBackup): Promise<void> {
+  const directory = path.resolve(backup.backupPath);
+  if (path.basename(directory) !== backup.name || !BACKUP_NAME.test(backup.name)
+    || path.basename(path.dirname(directory)) !== RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY) return;
+  const info = await fs.lstat(directory).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  });
+  if (!info?.isDirectory()) return;
+  await fs.rm(directory, { recursive: true, force: true });
+  await syncDirectoryDurably(path.dirname(directory)).catch(() => undefined);
 }
 
 async function newestTargetBackup(target: TargetContext): Promise<string | undefined> {
@@ -3171,7 +3261,9 @@ async function backupSource(binding: HistoricalRootBinding, options: RuntimeData
     await removeSqliteFiles(temporary);
     await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
     await fs.rmdir(backups).catch(() => undefined);
-    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-backup-failed', message: `收尾前备份来源失败，稍后重试：${errorMessage(error)}` });
+    throw isDiskFullError(error)
+      ? new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-disk-full', message: `磁盘空间不足：收尾前要在 ${backups} 备份这份旧聊天记录，写不下了；腾出空间后会再合并` })
+      : new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-backup-failed', message: `收尾前备份来源失败，稍后重试：${errorMessage(error)}` });
   }
   return root;
 }
@@ -3309,6 +3401,17 @@ function isTransientError(error: unknown): boolean {
     const code = (current as { code?: unknown }).code;
     if (typeof code !== 'string') continue;
     if (TRANSIENT_ERRNO_CODES.has(code) || /^SQLITE_(?:BUSY|LOCKED|IOERR|FULL|NOMEM|CANTOPEN|INTERRUPT|PROTOCOL|READONLY)/.test(code)) return true;
+  }
+  return false;
+}
+
+/** A full disk or quota anywhere in the cause chain: reported as such, in Chinese, never with the system's own text. */
+function isDiskFullError(error: unknown): boolean {
+  const seen = new Set<unknown>();
+  for (let current = error; current && typeof current === 'object' && !seen.has(current); current = (current as { cause?: unknown }).cause) {
+    seen.add(current);
+    const code = (current as { code?: unknown }).code;
+    if (code === 'ENOSPC' || code === 'EDQUOT' || (typeof code === 'string' && code.startsWith('SQLITE_FULL'))) return true;
   }
   return false;
 }
@@ -3478,7 +3581,8 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, insertedRowsPresence, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,
-  isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome
+  isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
+  closeSnapshot, pruneMergePreparations, isDiskFullError
 });
 export type {
   PickedSource as HistoricalMergePickedSource, Refusal as HistoricalMergeRefusal, RowPlan as HistoricalMergeRowPlan, SourceRef as HistoricalMergeSourceRef,
