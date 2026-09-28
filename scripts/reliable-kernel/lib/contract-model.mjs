@@ -499,7 +499,7 @@ function validateMigration(root, migration, failures) {
   }
   const merge = migration?.historicalMerge;
   const expectedMerge = {
-    sources: ['pre-switch-history-data-sets-automatic-once', 'user-kept-or-already-merged-explicit-request-only'],
+    sources: ['pre-switch-history-data-sets-automatic-once', 'user-kept-or-already-merged-explicit-request-only', 'foreign-history-root-verified-in-place-user-request-only'],
     target: 'selected-current-epoch-data-set-open-in-requesting-host',
     initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-exact-schema-and-physical-fingerprint-published-3-4-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
     trigger: 'background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; selection-under-admission-reads-only-ledger-requests-and-file-states-uncached-fingerprints-judged-outside; hosts-prepare-without-claims-and-commit-one-at-a-time-under-admission-and-source-maintenance; later-host-rechecks-source-files-then-rereads-ledger-and-skips-source-already-merged-unreported; before-deferring-a-changed-source-or-an-unexpected-error-ledger-reread-source-merged-into-same-target-after-batch-picked-it-skipped-silently-explicit-request-told-already-merged',
@@ -511,6 +511,7 @@ function validateMigration(root, migration, failures) {
     sizeLimit: 'online-transaction-at-most-4000-source-rows-and-12MiB-measured-worst-about-1.3s-below-busy-timeout; in-memory-transaction-limit-60000-source-rows-above-it-deferred-awaiting-exclusive-large-session-unrecorded-before-any-plan-coordination-backup-or-finalization; in-between-exclusive-maintenance-coordinated-outside-locks-after-checks-cas-and-target-backup-locks-wrap-only-source-recheck-and-transaction-keyed-by-source-content-fingerprint-else-deferred; automatic-batch-judges-sources-above-the-online-limit-last-deferred-awaiting-exclusive-too-when-one-awaits-the-large-session-else-coordinated-each-explicit-request-coordinated-alone; streamed-transaction-hard-limit-20000000-source-rows-above-it-recorded-too-large-before-any-plan-coordination-backup-or-finalization',
     exclusivity: 'snapshot-audit-plan-cas-and-target-backup-without-claims; snapshot-counts-only-if-source-file-state-unchanged-across-copy-else-retaken-at-most-3-times; finalization-and-commit-under-configuration-admission-and-source-maintenance-rechecking-hosts-offline-identity-pointer-and-exact-file-state; exclusive-fallback-takes-admission-and-target-maintenance-around-that-commit; source-offline-by-host-liveness-and-legacy-runtime-owner-claim; large-session-prepared-online-by-the-engine-in-one-window-then-exclusive-phase-under-admission-and-target-maintenance-where-the-requester-closes-its-runtime-and-the-engine-merges-source-after-source-then-the-requester-reloads-after-the-locks-are-released-a-preparation-that-does-not-run-or-was-stopped-part-way-released-back-to-the-engine; large-session-space-checked-before-the-prompt-before-the-coordination-and-with-statfs-right-before-the-exclusive-phase-by-the-engines-own-figures-target-disk-target-bytes-margin-included-temporary-disk-temporary-bytes-plus-64MiB-only-on-a-disk-of-its-own-one-check-per-disk; large-session-preparation-one-window-per-source-preparing-record-heartbeat-10s-taken-over-after-60s-or-once-its-process-is-gone; large-session-exclusive-phase-only-under-admission-and-target-maintenance-with-hosts-offline-each-source-under-its-maintenance-rechecked-unchanged-and-copied-again',
     sourcePolicy: 'exact-published-3-4-backup-and-in-place-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot',
+    foreignSourcePolicy: 'only-on-the-users-explicit-request-recorded-in-the-current-configuration-root-ledger-with-location-name-and-seen-identity-never-automatic-kept-semantics; its-claim-foreign-claims-id-under-the-current-configuration-root-held-from-preparation-to-commit-taken-before-admission-the-claim-of-verification-reading-and-backup-cleanup; located-paths-only-recorded-only-an-identity-fence; strictly-located-again-and-rechecked-under-its-claim-before-commit-pointer-root-binding-epoch-manifest-hosts-gone-and-exact-file-state-since-verification-else-deferred-nothing-committing; never-written-no-claim-ledger-source-backup-finalization-upgrade-wal-or-shm-inside-it-snapshot-and-audit-on-private-copies; records-requests-and-fingerprints-under-the-current-configuration-root-keyed-by-foreign-id-with-source-identity-its-committing-record-never-makes-it-unverifiable; cas-objects-copied-never-linked-read-through-no-follow-descriptors-digest-verified-after-free-space-for-missing-objects-plus-64MiB-else-deferred-disk-full; any-unfinished-work-blocked-with-counts-and-reason-never-finalized-read-only-view-kept; same-identity-as-a-local-data-set-blocked-as-its-old-copy-left-to-backup-cleanup-by-coverage; two-foreign-copies-of-one-identity-first-merges-later-nothing-new-or-conflict-left-out-conversations-by-the-union-of-that-identitys-records; same-size-routing-online-exclusive-or-large-session-by-a-readable-name',
     busySourcePolicy: 'defer-source',
     unfinishedWorkPolicy: 'refusal-probes-conflicts-size-and-cas-checked-on-unfinalized-snapshot-first; kernel-pending-work-probe-judges-every-conversation-as-after-finalization-before-any-finalization; then-source-backup-and-existing-terminal-transitions-cancelled-or-interrupted-with-reason-by-source-legacy-interrupted-by-upgrade-user-kept-closed-before-merge; closed-counts-read-back-from-source-after-closing-never-planned-counts; states-without-transition-refuse-source-with-reason-and-way-out',
     backupPolicy: 'sqlite-backup-api-of-open-target-once-per-batch-before-first-change-only-when-rows-to-insert; named-utc-millisecond-time-then-process-sequence; unused-by-any-transaction-removed-at-batch-end; used-then-newest-3-by-creation-kept-per-control-root-plus-this-batch-and-newest-before-it; failed-backup-leaves-no-files; target-and-source-backups-first-check-free-space-for-database-plus-wal-plus-64MiB-on-their-disk-else-deferred-disk-full-with-needed-MB-before-writing-notified-once-per-cause; large-session-target-backed-up-online-once-while-preparing-removed-when-released-unused-no-backup-in-the-exclusive-phase',
@@ -569,6 +570,11 @@ function validateMigration(root, migration, failures) {
     || !expectedMerge.backupPolicy.includes(`; used-then-newest-${backupRetention}-by-creation-`)
     || !expectedMerge.backupPolicy.includes(`-database-plus-wal-plus-${backupMarginMiB}MiB-`)) {
     failures.push('migration.json#historicalMerge 的在线上限、内存单事务上限、流式硬上限、流式每块行数、提交证据上限与首末条数、准备记录心跳与接手时限、合并请求期限、备份保留份数与备份前剩余空间余量必须与代码常量一致');
+  }
+  if (!expectedMerge.foreignSourcePolicy.includes(`-free-space-for-missing-objects-plus-${backupMarginMiB}MiB-`)
+    || !/if \(objects && !options\.verifyOnly\) await assertRoomForObjects\(/.test(mergeSource)
+    || !mergeSource.includes('const needed = Number(missing) + BACKUP_FREE_SPACE_MARGIN_BYTES;')) {
+    failures.push('migration.json#historicalMerge.foreignSourcePolicy 的外来正文复制前空间余量必须与代码常量一致，且复制前先按缺失对象总量加余量查空间');
   }
   const largeSessionSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeLargeMergeSession.ts'), 'utf8');
   const largeSessionConstant = (name) => Number(new RegExp(`${name}: ([\\d_.]+)[,\\n]`).exec(largeSessionSource)?.[1]?.replaceAll('_', ''));
@@ -794,13 +800,50 @@ function validateMigration(root, migration, failures) {
  * Foreign history (archives and copied data directories) is registered in place and read only:
  * located paths for every read, the recorded binding only as an identity fence, never a
  * RootAuthority or RuntimeDatabase, and its cache and claims only under the current configuration root.
+ * It is merged into the current data set only on the user's request, under its claim, copied and
+ * never linked, recorded under the current configuration root; never finalized or migrated.
  */
 function validateForeignHistory(root, authority, failures) {
-  const foreignSource = fs.readFileSync(path.join(root, 'backend/reliableKernel/runtimeForeignHistory.ts'), 'utf8');
-  if (authority?.rootPolicy?.foreignHistory !== 'verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself'
+  const read = (file) => fs.readFileSync(path.join(root, 'backend/reliableKernel', file), 'utf8');
+  const foreignSource = read('runtimeForeignHistory.ts');
+  const foreignMergeSource = read('runtimeForeignHistoryMerge.ts');
+  const forbidden = /\bRuntimeDatabase\b|new RootAuthority|withRuntimeMaintenance\(root\.recorded|recorded\.paths\.(databasePath|casRootPath|rootPointerPath|runtimeEpochPath)/;
+  if (authority?.rootPolicy?.foreignHistory !== 'verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself; merged-into-current-only-on-user-request-under-its-claim-copied-never-linked-ledger-under-current-configuration-root'
     || !foreignSource.includes("const CACHE_DIRECTORY = 'foreign';") || !foreignSource.includes("const CLAIMS_DIRECTORY = 'foreign-claims';")
-    || /\bRuntimeDatabase\b|new RootAuthority|withRuntimeMaintenance\(root\.recorded|recorded\.paths\.(databasePath|casRootPath|rootPointerPath|runtimeEpochPath)/.test(foreignSource)) {
+    || forbidden.test(foreignSource)) {
     failures.push('外来历史库只能原位只读登记：读取只经 located 路径，recorded 只作身份栅栏与显示，从不建立 RootAuthority 或打开 RuntimeDatabase，结果缓存与声明只在当前配置根 .limcode-runtime-merges/foreign 与 foreign-claims，外来目录除清理备份删除经证明的那一份本身之外从不写入');
+  }
+  const mergeSource = read('runtimeDataSetMerge.ts');
+  const streamedSource = read('runtimeDataSetStreamedMerge.ts');
+  const ledgerSource = read('runtimeDataSetMergeLedger.ts');
+  const foreignId = 'const FOREIGN_ID = /^foreign:(archive|copied):[0-9a-f]{16}$/;';
+  const missing = [
+    // Its claim is held from preparation to commit, taken before (never inside) configuration admission.
+    [foreignSource, 'if (isRuntimeDataRootAdmissionHeld(configurationRoot)) {'],
+    [foreignMergeSource, 'const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, id, pointerOf(location));'],
+    // Snapshots are private copies; its CAS is read through no-follow descriptors.
+    [foreignMergeSource, 'copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles())'],
+    [foreignMergeSource, 'return await openLocatedRuntimeFile(file, await (held ??= this.heldFiles()));'],
+    // Never finalized, never a migration source, fenced by its held claim, its objects copied (never linked).
+    [mergeSource, "if (isForeignCandidate(candidate)) throw new TypeError('A foreign history root is never finalized.');"],
+    [mergeSource, "if (isForeignCandidate(candidate)) throw new TypeError('A data-root migration has no foreign sources.');"],
+    [mergeSource, '? candidate.hold.fence(body) : withRuntimeMaintenance(binding.paths, body);'],
+    [mergeSource, 'verified, verifyOnly, sourceObjects: candidate.hold.objects(candidate), freeSpace: options.freeSpace ?? freeSpace'],
+    [mergeSource, "kind: 'blocked', code: 'runtime-data-set-merge-foreign-old-copy',"],
+    [mergeSource, "kind: 'blocked', code: 'runtime-data-set-merge-foreign-unfinished-work',"],
+    // The large-merge session reads a foreign source only through the hold its preparation took.
+    [streamedSource, 'const resolver = historicalMergeSources(paths, (candidateId) => internals.sources.get(candidateId)?.state.foreign);'],
+    // Only a request names a foreign source (with its location), and only a foreign id carries one.
+    [ledgerSource, foreignId], [foreignSource, foreignId],
+    [ledgerSource, 'if (FOREIGN_ID.test(request.candidateId) !== (foreign !== undefined)) continue;'],
+    // Its own committing merge (only read from it) never makes a foreign root unverifiable.
+    [foreignSource, 'const merged = typeof record.candidateId === \'string\' && FOREIGN_ID.test(record.candidateId) ? [record.target] : [record.source, record.target];']
+  ].filter(([source, text]) => !source.includes(text));
+  if (missing.length > 0 || forbidden.test(foreignMergeSource)
+    || /withRuntimeMaintenance\(|withLocatedRuntimeRootFence\(|auditForeignRuntimeRoot\(/.test(foreignMergeSource)) {
+    failures.push('外来历史库只在用户请求时合并进当前库：从准备到提交持有它在当前配置根的声明（在准入之外取得），快照与审计只在私有拷贝上，正文经不跟随链接的描述符复制、从不硬链接，'
+      + '从不收尾、升级、做来源备份或作为迁移来源，有未结束任务或与本地库同身份时拒绝并写明原因，账本与指纹只在当前配置根；'
+      + `缺少：${missing.map(([, text]) => text.slice(0, 60)).join(' | ') || '（无）'}`);
   }
 }
 
