@@ -609,6 +609,8 @@ async function crashSource(env, dataSet) {
   let stderr = '';
   child.stderr.on('data', (chunk) => { stderr += chunk; });
   const exited = new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+  // Also when it never became ready: gone before its source is removed.
+  env.cleanup.push(() => killed(child, exited));
   const deadline = Date.now() + 90_000;
   while (!(await fs.stat(readyFile).then(() => true, () => false))) {
     if (Date.now() > deadline || child.exitCode !== null) assert.fail(`crash child never became ready: ${stderr}`);
@@ -623,10 +625,19 @@ async function crashSource(env, dataSet) {
 /** A1's session child: the pending sources prepared and merged once, without interruption. */
 function runReferenceSession(env, input) {
   return new Promise((resolve, reject) => {
-    execFile(process.execPath, [path.join(HERE, 'runtime-dataset-merge-streamed-child.mjs'), env.fixture.root, JSON.stringify(input)], {
+    const child = execFile(process.execPath, [path.join(HERE, 'runtime-dataset-merge-streamed-child.mjs'), env.fixture.root, JSON.stringify(input)], {
       env: { ...process.env, LIMCODE_TEST_EXTENSION_ROOT: compiled, TMPDIR: env.tmp }, maxBuffer: 16 * 1024 * 1024
     }, (error, stdout, stderr) => (error ? reject(new Error(`${error.message}\n${stderr}`)) : resolve(JSON.parse(stdout))));
+    // A test that ends while it still merges (a timeout): gone before its root is removed.
+    const exited = new Promise((done) => child.once('exit', done));
+    env.cleanup.push(() => killed(child, exited));
   });
+}
+
+/** A child process of this test gone for good (killed when it still runs). */
+async function killed(child, exited) {
+  if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  await exited;
 }
 
 /**

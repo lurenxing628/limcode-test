@@ -121,7 +121,7 @@ test('盲审 #6：倒计时期间请求进入新一轮（发起方回锁外后�
   const participant = layer.startExclusiveMaintenanceParticipant({
     exclusiveMaintenanceTarget: () => ({ paths, hostBootId: 'window-rounds' }), hasOwnedExecution: async () => false
   }, { countdownSeconds: 5, pollMs: 60 * 60_000, processId: (nextFakeProcessId += 1) });
-  t.after(async () => { await participant.dispose(); await fs.rm(liveness, { force: true }); });
+  closeBeforeRootRemoval(t, paths.dataRootPath, () => closeParticipant(participant, liveness));
   const request = { requestId: 'round-request', createdAt: new Date().toISOString(), whenBusy: 'wait' };
   await writeRequest(paths, { ...request, phase: 'prepare' });
   await participant.checkNow();
@@ -351,7 +351,7 @@ test('用户的操作让先给较早的请求后，只有为那个请求让出�
   const participant = layer.startExclusiveMaintenanceParticipant({
     exclusiveMaintenanceTarget: () => ({ paths, hostBootId: 'window-b' }), hasOwnedExecution: async () => false
   }, { countdownSeconds: 0, pollMs: 60 * 60_000, processId: (nextFakeProcessId += 1), windowState });
-  t.after(async () => { await participant.dispose(); await fs.rm(liveness, { force: true }); });
+  closeBeforeRootRemoval(t, paths.dataRootPath, () => closeParticipant(participant, liveness));
   // Another window with a running Turn: B's requests are published and wait.
   const working = await layerWindow(t, binding, 'window-c', { work: true });
   const earlier = { requestId: 'earlier-request', createdAt: '2020-01-01T00:00:00.000Z', whenBusy: 'wait', confirmation: 'notice' };
@@ -424,7 +424,7 @@ test('盲审 #10：确认重载前让面板立即保存未发送的输入：确�
     countdownSeconds: 0, pollMs: 60 * 60_000, processId: (nextFakeProcessId += 1),
     saveDrafts: () => { log.push(['save', Date.now()]); return 1; }
   });
-  t.after(async () => { await participant.dispose(); await fs.rm(liveness, { force: true }); });
+  closeBeforeRootRemoval(t, paths.dataRootPath, () => closeParticipant(participant, liveness));
   const request = { requestId: 'draft-request', createdAt: new Date().toISOString(), whenBusy: 'wait', confirmation: 'notice' };
   for (const phase of ['prepare', 'confirm', 'go']) {
     await writeRequest(paths, { ...request, phase });
@@ -951,22 +951,45 @@ async function layerWindow(t, binding, hostBootId, options = {}) {
   };
   const liveness = await publishHost(binding, hostBootId);
   let participant;
-  const mock = vscodeMock(window, async () => {
-    window.reloads += 1;
-    await participant?.dispose();
-    participant = undefined;
-    await fs.rm(liveness, { force: true });
+  let closed = false;
+  // A reload still under way when the test ends (it runs after the reload command returned).
+  let reloading;
+  const mock = vscodeMock(window, () => {
+    if (closed) return undefined;
+    reloading = (async () => {
+      window.reloads += 1;
+      await participant?.dispose();
+      participant = undefined;
+      await fs.rm(liveness, { force: true });
+    })();
+    return reloading;
   }, options.cancel === true);
-  participant = loadVscodeLayer(mock).startExclusiveMaintenanceParticipant({
+  const started = loadVscodeLayer(mock).startExclusiveMaintenanceParticipant({
     exclusiveMaintenanceTarget: () => ({ paths: binding.paths, hostBootId }),
     hasOwnedExecution: async () => window.work
   }, { countdownSeconds: options.countdownSeconds ?? 0, pollMs: 15, processId: (nextFakeProcessId += 1) });
+  participant = started;
   await participant.checkNow();
-  t.after(async () => {
-    await participant?.dispose();
-    await fs.rm(liveness, { force: true });
+  // Pass or fail: closed before its root is removed, as extension.ts deactivates (a reload that
+  // already closed it leaves only its registration to remove).
+  closeBeforeRootRemoval(t, binding.paths.dataRootPath, async () => {
+    closed = true;
+    await reloading?.catch(() => undefined);
+    await closeParticipant(started, liveness);
   });
   return window;
+}
+
+/**
+ * A participant of this process closed as extension.ts deactivates it: leaving first (it stops
+ * answering), an answer or countdown under way ends, the Runtime's liveness record goes, then the
+ * registration.
+ */
+async function closeParticipant(participant, liveness) {
+  await participant.dispose();
+  await participant.checkNow();
+  await fs.rm(liveness, { force: true });
+  await participant.unregister();
 }
 
 function vscodeMock(window, onReload, cancel = false) {
@@ -1040,14 +1063,20 @@ function loadVscodeLayer(vscodeModule) {
   return module.exports;
 }
 
-/** Window processes; a window that reloaded boots again, like VS Code replacing its Extension Host. */
+/**
+ * Window processes; a window that reloaded boots again, like VS Code replacing its Extension Host.
+ * Their temporary files (private copies of a merge) go beside the root, inside its temporary
+ * directory: a window killed part way leaves nothing in the system's.
+ */
 function createWindows(t, root, defaults) {
   const state = { stopped: false, children: new Map(), events: [], boots: {}, behaviors: {} };
+  const tmp = `${root}-tmp`;
+  fsSync.mkdirSync(tmp, { recursive: true });
   async function start(name, behavior = {}) {
     state.behaviors[name] = behavior;
     state.boots[name] = (state.boots[name] ?? 0) + 1;
     const boot = state.boots[name];
-    const env = { ...process.env };
+    const env = { ...process.env, TMPDIR: tmp };
     delete env.NODE_TEST_CONTEXT;
     env.LIMCODE_EXCLUSIVE_MAINTENANCE_WINDOW = JSON.stringify({ root, name, boot, behavior: { ...defaults, ...behavior } });
     const child = spawn(process.execPath, [WINDOW], { cwd: process.cwd(), env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -1104,12 +1133,13 @@ function createWindows(t, root, defaults) {
     child.once('exit', resolve);
     child.kill('SIGKILL');
   });
+  // Every window running now exits (also one started after an earlier stop); none restarts.
   async function stop() {
-    if (state.stopped) return;
     state.stopped = true;
     await Promise.all([...state.children.values()].map(exitOf));
   }
-  t.after(stop);
+  // Pass or fail: every window exited (none restarts) before the root is removed.
+  closeBeforeRootRemoval(t, root, stop);
   return {
     start,
     stop,
@@ -1137,9 +1167,43 @@ function createWindows(t, root, defaults) {
   };
 }
 
+/** What runs on a temporary directory's root (windows of this process, window processes), by that directory. */
+const closersOfDirectory = new Map();
+
+/**
+ * Removes `directory` once the test ended, pass or fail: first everything registered on it
+ * (closeBeforeRootRemoval), then the directory. A participant still polling, marking itself
+ * leaving or answering writes into its root: while or after it is removed that leaves a tree behind
+ * (or the removal fails with ENOTEMPTY). Added before any window of the test, so this hook runs
+ * before their own (hooks run in the order they were added).
+ */
+function removeAfterItsWindows(t, directory) {
+  const closers = [];
+  closersOfDirectory.set(directory, closers);
+  t.after(async () => {
+    try {
+      for (const close of closers.splice(0)) await close().catch(() => undefined);
+    } finally {
+      closersOfDirectory.delete(directory);
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });
+}
+
+/** `close` runs before the temporary directory holding `location` is removed, and at the end of the test anyway; once only. */
+function closeBeforeRootRemoval(t, location, close) {
+  let closed;
+  const once = () => (closed ??= Promise.resolve().then(close));
+  for (const [directory, closers] of closersOfDirectory) {
+    const relative = path.relative(directory, location);
+    if (relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative)) closers.push(once);
+  }
+  t.after(once);
+}
+
 async function createRoot(t) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-exclusive-windows-'));
-  t.after(() => fs.rm(parent, { recursive: true, force: true }));
+  removeAfterItsWindows(t, parent);
   const root = path.join(parent, 'global');
   await fs.mkdir(root);
   const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
@@ -1148,8 +1212,12 @@ async function createRoot(t) {
 }
 
 async function createFixture(t) {
-  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-exclusive-merge-'));
-  t.after(() => fs.rm(root, { recursive: true, force: true }));
+  // Inside a temporary directory: what lives beside the root (its configuration admission, a window's
+  // state file) goes with it.
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-exclusive-merge-'));
+  removeAfterItsWindows(t, parent);
+  const root = path.join(parent, 'global');
+  await fs.mkdir(root);
   const paths = { globalStoragePath: root };
   const current = await initialize(root);
   const scope = resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: ['file:///workspace/alpha'] });
