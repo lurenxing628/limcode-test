@@ -2010,6 +2010,156 @@ test('LLM capability adapter 不因稍后重试文案放宽永久错误或显式
   }
 });
 
+async function providerFailureOf(message, rawError) {
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
+    emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
+  }));
+  try {
+    await adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
+  } catch (error) {
+    return error;
+  }
+  return assert.fail(`Provider 失败没有抛出：${JSON.stringify({ message, rawError })}`);
+}
+
+function quotaExhaustedReason(original) {
+  return `Provider 额度已用完，自动重试不会成功（原文：${original}）。`
+    + '提高额度或换一个渠道/模型后，直接发送“继续”即可接着做，已完成的工具结果还在上下文里。';
+}
+
+const ASK_SAGE_MONTHLY_LIMIT = 'Sorry, if we executed this query (up to 4096 tokens), you would be above your monthly token limit (202422 out of 200000), please contact us to get it increased or become an Ask Sage member now';
+const OPENAI_INSUFFICIENT_QUOTA = 'You exceeded your current quota, please check your plan and billing details. For more information on this error, read the docs: https://platform.openai.com/docs/guides/error-codes/api-errors.';
+const GEMINI_EXCEEDED_QUOTA = 'You exceeded your current quota, please check your plan and billing details. For more information on this error, head to: https://ai.google.dev/gemini-api/docs/rate-limits.';
+
+function geminiQuotaBody(quotaId) {
+  return {
+    error: {
+      code: 429,
+      message: GEMINI_EXCEEDED_QUOTA,
+      status: 'RESOURCE_EXHAUSTED',
+      details: [
+        {
+          '@type': 'type.googleapis.com/google.rpc.QuotaFailure',
+          violations: [{ quotaMetric: 'generativelanguage.googleapis.com/generate_content_free_tier_requests', quotaId }]
+        },
+        { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '37s' }
+      ]
+    }
+  };
+}
+
+test('LLM capability adapter 把 Provider 额度用完认成永久错误：429 也不重试，终止原因用中文说明', async () => {
+  for (const [message, rawError] of [
+    // Ask Sage 原句：400、200 带 error body、429 三种都不重试。
+    [ASK_SAGE_MONTHLY_LIMIT, {
+      kind: 'http_error', status: 400,
+      bodyText: JSON.stringify({ message: ASK_SAGE_MONTHLY_LIMIT }), rawBody: { message: ASK_SAGE_MONTHLY_LIMIT }
+    }],
+    [ASK_SAGE_MONTHLY_LIMIT, { kind: 'response_error', status: 200, rawBody: { error: { message: ASK_SAGE_MONTHLY_LIMIT } } }],
+    [ASK_SAGE_MONTHLY_LIMIT, { kind: 'http_error', status: 429, rawBody: { error: { message: ASK_SAGE_MONTHLY_LIMIT } } }],
+    // 429 且 insufficient_quota 只在响应体 rawBody.error.code 里。
+    [OPENAI_INSUFFICIENT_QUOTA, {
+      kind: 'http_error', status: 429,
+      rawBody: { error: { message: OPENAI_INSUFFICIENT_QUOTA, type: 'insufficient_quota', param: null, code: 'insufficient_quota' } }
+    }],
+    ['Request failed', { kind: 'http_error', status: 429, rawBody: { error: { message: 'Request failed', code: 'insufficient_quota' } } }],
+    // 响应体没解析成 rawBody 时，从 bodyText 解析出同样的字段。
+    ['LLM 请求失败：http_error HTTP 429', {
+      kind: 'http_error', status: 429,
+      bodyText: JSON.stringify({ error: { message: 'Request failed', type: 'insufficient_quota' } })
+    }],
+    ['Your account org-fixture is suspended, please check your plan and billing details', {
+      status: 429, rawBody: { error: { message: 'suspended', type: 'exceeded_current_quota_error' } }
+    }],
+    ['Quota exceeded for this API key.', { status: 429 }],
+    [GEMINI_EXCEEDED_QUOTA, { kind: 'http_error', status: 429, rawBody: geminiQuotaBody('GenerateRequestsPerDayPerProjectPerModel-FreeTier') }],
+    ['Rate limit reached for gpt-4o in organization org-fixture on requests per day (RPD): Limit 200, Used 200, Requested 1.', { status: 429 }],
+    ['Your credit balance is too low to access the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.', {
+      status: 400, rawBody: { type: 'error', error: { type: 'invalid_request_error', message: 'Your credit balance is too low' } }
+    }],
+    ['Your credit balance ($0.12) is too low to run this request.', { status: 429 }],
+    ['You have reached your specified API usage limits. You will regain access on 2026-10-01 at 00:00 UTC.', { status: 400 }],
+    ['Insufficient Balance', { status: 402 }],
+    ['用户额度已用完，请联系管理员充值', { status: 429 }],
+    ['该令牌余额不足', { status: 429 }],
+    ['当前分组配额已用尽', { status: 503 }],
+    ['该API的调用次数已达今日上限', { status: 429 }]
+  ]) {
+    const label = JSON.stringify({ message, rawError });
+    const error = await providerFailureOf(message, rawError);
+    assert.equal(error instanceof kernel.ProviderTransientError, false, label);
+    assert.equal(error.message, quotaExhaustedReason(message), label);
+  }
+
+  // 原文过长时截短，操作说明仍在持久化失败消息的 768 字符之内。
+  const longOriginal = `Quota exceeded for this API key. ${'upstream detail '.repeat(80)}`;
+  const long = await providerFailureOf(longOriginal, { status: 429 });
+  assert.equal(long instanceof kernel.ProviderTransientError, false);
+  assert.ok(long.message.length < 768, String(long.message.length));
+  assert.ok(long.message.includes('…）。提高额度或换一个渠道/模型后'), long.message);
+  assert.ok(long.message.endsWith('已完成的工具结果还在上下文里。'), long.message);
+});
+
+test('LLM capability adapter 按分钟或按秒的限流和普通 5xx 仍按瞬时错误重试，不当成额度用完', async () => {
+  const openAITpm = 'Rate limit reached for gpt-4 in organization org-fixture on tokens per min (TPM): Limit 10000, Used 9000, Requested 2000. Please try again in 6ms. Visit https://platform.openai.com/account/rate-limits to learn more.';
+  const openAIRpm = 'Rate limit reached for gpt-4o in organization org-fixture on requests per min (RPM): Limit 3, Used 3, Requested 1. Please try again in 20s.';
+  const anthropicTpm = 'This request would exceed the rate limit for your organization (org-fixture) of 50,000 input tokens per minute. For details, refer to: https://docs.claude.com/en/api/rate-limits.';
+  for (const [message, rawError, reason] of [
+    [openAITpm, {
+      kind: 'http_error', status: 429,
+      rawBody: { error: { message: openAITpm, type: 'tokens', param: null, code: 'rate_limit_exceeded' } }
+    }, 'rate_limited'],
+    [openAIRpm, {
+      kind: 'http_error', status: 429,
+      bodyText: JSON.stringify({ error: { message: openAIRpm, type: 'requests', code: 'rate_limit_exceeded' } })
+    }, 'rate_limited'],
+    [anthropicTpm, {
+      kind: 'http_error', status: 429, rawBody: { type: 'error', error: { type: 'rate_limit_error', message: anthropicTpm } }
+    }, 'rate_limited'],
+    // Gemini 按分钟的免费额度同样写“exceeded your current quota”，只有 quotaId 标明按分钟。
+    [GEMINI_EXCEEDED_QUOTA, {
+      kind: 'http_error', status: 429, rawBody: geminiQuotaBody('GenerateRequestsPerMinutePerProjectPerModel-FreeTier')
+    }, 'rate_limited'],
+    ['Allocated quota exceeded, please increase your quota limit.', { status: 429 }, 'rate_limited'],
+    ['每分钟请求额度已用完，请稍后再试', { status: 429 }, 'rate_limited'],
+    ['temporary failure', { status: 503 }, 'temporary_service_error'],
+    ['Internal server error', {
+      kind: 'http_error', status: 500, rawBody: { error: { message: 'Internal server error', type: 'server_error' } }
+    }, 'temporary_service_error'],
+    ['Streaming error: 502: Bad Gateway', undefined, 'temporary_service_error']
+  ]) {
+    const label = JSON.stringify({ message, rawError });
+    const error = await providerFailureOf(message, rawError);
+    assert.ok(error instanceof kernel.ProviderTransientError, `${label} -> ${error?.message}`);
+    assert.equal(error.reason, reason, label);
+  }
+});
+
+test('LLM capability adapter 其它永久错误保留原文，响应体字段只参与额度判断', async () => {
+  for (const [message, rawError] of [
+    ['Incorrect API key provided: sk-fixture.', { status: 401, code: 'invalid_api_key' }],
+    ["This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.", {
+      kind: 'http_error', status: 400,
+      rawBody: { error: { type: 'invalid_request_error', code: 'context_length_exceeded' } }
+    }],
+    ['Input exceeds the token limit of the model.', { status: 400 }],
+    // Anthropic 响应体总带 invalid_request_error；它不能把提到 thinking 的 400 变成能力错误。
+    ['messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `text`.', {
+      kind: 'http_error', status: 400,
+      rawBody: {
+        type: 'error',
+        error: { type: 'invalid_request_error', message: 'messages.1.content.0.type: Expected `thinking` or `redacted_thinking`, but found `text`.' }
+      }
+    }]
+  ]) {
+    const label = JSON.stringify({ message, rawError });
+    const error = await providerFailureOf(message, rawError);
+    assert.equal(error instanceof kernel.ProviderTransientError, false, label);
+    assert.equal(error instanceof kernel.ProviderCapabilityError, false, label);
+    assert.equal(error.message, message, label);
+  }
+});
+
 test('上游 incomplete chunked read 在无输出和部分输出后都进入连接中断重试', async () => {
   const message = 'Streaming error: peer closed connection without sending complete message body (incomplete chunked read)';
   for (const partialOutput of [false, true]) {

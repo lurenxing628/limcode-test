@@ -2716,7 +2716,12 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
       endpointKind
     );
   }
-  if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded|insufficient_quota|billing_hard_limit_reached)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))|(?:credit|balance|billing).*(?:exhaust|limit|insufficient)/.test(signature)) {
+  // The body's own error code/type joins only this check: Anthropic bodies always carry
+  // invalid_request_error, which must not steer the capability or transport rules around it.
+  if (isProviderQuotaExhausted(`${signature} ${collectProviderErrorBodySignature(raw).toLowerCase()}`)) {
+    return new Error(providerQuotaExhaustedMessage(message));
+  }
+  if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))/.test(signature)) {
     return new Error(message);
   }
   // This timeout comes from the Responses WS session state machine, not from an arbitrary error
@@ -2753,6 +2758,112 @@ function classifyProviderFailure(message: string, raw: Record<string, unknown> |
     return new ProviderTransientError('connection_interrupted', message);
   }
   return new Error(message);
+}
+
+/** Codes that always mean the account's quota or billing cap, whatever the HTTP status (even 429). */
+const PROVIDER_QUOTA_EXHAUSTED_CODE = /\b(?:insufficient_quota|billing_hard_limit_reached|exceeded_current_quota(?:_error)?)\b/;
+
+/** One clause of an English error: a sentence-ending ". " or ";" ends it, the dot in "$0.12" does not. */
+const CLAUSE_CHAR = String.raw`(?:(?!\.\s)[^;\n])`;
+
+/**
+ * Wording for a cap that the bounded automatic retry cannot outlast. Every phrase names a quota,
+ * billing, credit, balance or plan, or a period of a day or longer; a bare "token limit" (context
+ * length) or "rate limit" never matches. Short-window throttles that share this wording are vetoed
+ * by PROVIDER_SHORT_WINDOW_LIMIT.
+ */
+const PROVIDER_QUOTA_EXHAUSTED_WORDING: readonly RegExp[] = [
+  // OpenAI/Gemini "You exceeded your current quota", "Quota exceeded", one-api "quota is not enough".
+  new RegExp(String.raw`\b(?:exceed(?:ed|s|ing)?|exhausted|reached|used up|out of|insufficient|over)\b${CLAUSE_CHAR}{0,40}\bquota\b`),
+  new RegExp(String.raw`\bquota\b${CLAUSE_CHAR}{0,40}\b(?:exceed(?:ed|s)?|exhausted|reached|used up|depleted|insufficient|not enough)\b`),
+  // Ask Sage: "you would be above your monthly token limit (202422 out of 200000)".
+  new RegExp(String.raw`\babove your\b${CLAUSE_CHAR}{0,40}\b(?:limits?|quotas?|allowances?|caps?)\b`),
+  // A cap named by a period of a day or longer: "monthly spending limit", "requests per day (RPD)".
+  new RegExp(String.raw`\b(?:monthly|daily|weekly|yearly|annual)\b${CLAUSE_CHAR}{0,30}\b(?:limits?|quotas?|allowances?|caps?|budgets?)\b`),
+  /\bper[- ](?:day|week|month|year)\b/,
+  new RegExp(String.raw`\b(?:reached|exceeded|hit|used up)\b${CLAUSE_CHAR}{0,30}\b(?:plan|subscription|spend(?:ing)?|usage)\b${CLAUSE_CHAR}{0,15}\b(?:limits?|caps?|allowances?)\b`),
+  // Prepaid credit and balance: "credit balance ($0.12) is too low", "Insufficient Balance", "can only afford".
+  new RegExp(String.raw`\b(?:credits?|balance|billing|funds)\b${CLAUSE_CHAR}{0,40}\b(?:exhaust(?:ed)?|limits?|insufficient|too low|depleted|run out|ran out|used up|exceeded)\b`),
+  new RegExp(String.raw`\b(?:insufficient|not enough|out of|no remaining|requires more)\b${CLAUSE_CHAR}{0,20}\b(?:credits?|balance|funds)\b|\bcan only afford\b`),
+  // 中文网关：额度已用完、余额不足、配额已用尽、超出配额、已达今日上限、欠费。
+  /(?:额度|余额|配额)[^。；\n]{0,12}(?:用完|用尽|耗尽|不足|不够|超出|超限|达到上限|已达上限)/,
+  /(?:超出|超过|用完|用尽|耗尽)[^。；\n]{0,8}(?:额度|配额)/,
+  /(?:今日|今天|当日|每日|本周|每周|本月|当月|每月)[^。；\n]{0,8}(?:上限|限额|额度|配额)/,
+  /欠费/
+];
+
+/**
+ * Per-second/per-minute throttles clear within the retry budget even when a provider words them as a
+ * quota: Gemini's per-minute free tier says "You exceeded your current quota" and names the window
+ * only in its QuotaFailure quotaId; 阿里云百炼 reports TPM/TPS throttling as "Allocated quota exceeded".
+ */
+const PROVIDER_SHORT_WINDOW_LIMIT = /\bper[- ]?(?:second|sec|minute|min)s?\b|per(?:second|minute)|\b(?:rpm|tpm|rps|tps|qps)\b|\ballocated quota\b|每(?:秒|分钟)|频率|频繁|限流|并发/;
+
+function isProviderQuotaExhausted(signature: string): boolean {
+  if (PROVIDER_QUOTA_EXHAUSTED_CODE.test(signature)) return true;
+  return PROVIDER_QUOTA_EXHAUSTED_WORDING.some((pattern) => pattern.test(signature))
+    && !PROVIDER_SHORT_WINDOW_LIMIT.test(signature);
+}
+
+/** Keeps the actionable second sentence inside the 768-character persisted failure message. */
+const PROVIDER_QUOTA_ORIGINAL_MAX_LENGTH = 400;
+
+function providerQuotaExhaustedMessage(original: string): string {
+  const text = original.trim();
+  const quoted = text.length > PROVIDER_QUOTA_ORIGINAL_MAX_LENGTH
+    ? `${text.slice(0, PROVIDER_QUOTA_ORIGINAL_MAX_LENGTH)}…`
+    : text;
+  return `Provider 额度已用完，自动重试不会成功（原文：${quoted}）。`
+    + '提高额度或换一个渠道/模型后，直接发送“继续”即可接着做，已完成的工具结果还在上下文里。';
+}
+
+const PROVIDER_ERROR_BODY_CARRIERS = ['rawBody', 'bodyText', 'rawResponse', 'rawChunk'] as const;
+const PROVIDER_ERROR_BODY_FIELDS = ['code', 'type', 'status', 'message', 'detail', 'reason', 'quotaId'] as const;
+
+/**
+ * An HTTP error keeps the provider's error code/type in its response body, which collectErrorSignature
+ * does not walk: OpenAI's 429 insufficient_quota lives at rawBody.error.code under a generic message.
+ * Read only the error's own code/type/status/message fields (and Gemini's QuotaFailure quotaId), from
+ * the parsed body or from bodyText that parses as JSON, never the whole body.
+ */
+function collectProviderErrorBodySignature(raw: Record<string, unknown> | undefined): string {
+  if (!raw) return '';
+  const fields = new Set<string>();
+  for (const key of PROVIDER_ERROR_BODY_CARRIERS) {
+    collectProviderErrorBodyFields(parseProviderErrorBody(raw[key]), fields, 0);
+  }
+  return [...fields].join(' ');
+}
+
+function parseProviderErrorBody(value: unknown): unknown {
+  if (typeof value !== 'string') return value;
+  const text = value.trim();
+  if (text.length > 65_536 || !/^[[{]/.test(text)) return undefined;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+}
+
+function collectProviderErrorBodyFields(value: unknown, fields: Set<string>, depth: number): void {
+  if (depth > 6) return;
+  if (Array.isArray(value)) {
+    for (const entry of value.slice(0, 8)) collectProviderErrorBodyFields(entry, fields, depth + 1);
+    return;
+  }
+  const record = asRecord(value);
+  if (!record) return;
+  for (const key of PROVIDER_ERROR_BODY_FIELDS) {
+    const field = record[key];
+    if (typeof field === 'string' && field.trim()) fields.add(field.trim().slice(0, 1_000));
+  }
+  if (typeof record.error === 'string' && record.error.trim()) fields.add(record.error.trim().slice(0, 1_000));
+  // `error` is the usual envelope, `response` the Responses API failure, `details`/`violations` Gemini's
+  // google.rpc QuotaFailure.
+  for (const key of ['error', 'response', 'details', 'violations']) {
+    collectProviderErrorBodyFields(record[key], fields, depth + 1);
+  }
 }
 
 function isStructuredOpenAIResponsesWebSocketTimeout(
