@@ -24,7 +24,7 @@ const foreign = kernelFile('runtimeForeignHistory.js');
 const foreignMerge = kernelFile('runtimeForeignHistoryMerge.js');
 const { HISTORICAL_MERGE_ENGINE: engine, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
 const { prepareLargeMergeSources, runLargeMergeSession } = kernelFile('runtimeDataSetStreamedMerge.js');
-const { largeMergeDetails } = kernelFile('runtimeLargeMergeSession.js');
+const { keepLargeMergeResult, largeMergeBatchResult, largeMergeDetails, takeLargeMergeResult } = kernelFile('runtimeLargeMergeSession.js');
 const { largeMergeEngine } = kernelFile('runtimeLargeMergeEngine.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
@@ -325,6 +325,54 @@ test('大库会话的真实接线（largeMergeEngine 适配层）合并外来大
   assert.equal((await readLedgerRecord(fixture, source.id)).state, 'merged');
   assert.deepEqual(await treeState(big.container), before, '外来目录一字节不变');
   assert.deepEqual(await fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'foreign-claims')).catch(() => []), [], '声明已释放');
+});
+
+test('大库会话的真实接线：外来大库在会话里才受阻（准备之后当前库另写了它的一条记录）：会话结果、批结果与重载后保留的结果都带可读名称，原因列表不写 id；当前库只有另写的那一条', { timeout: 300_000 }, async (t) => {
+  const fixture = await home(t);
+  const big = await copiedDirectory(fixture, (source) => generateSyntheticSource(source.current, { rows: 4_200, prefix: 'clash' }));
+  const source = await found(fixture, big.container);
+  await request(fixture, source);
+  const adapter = largeMergeEngine();
+  const database = await openWindow(fixture);
+  let preparation;
+  try {
+    preparation = await adapter.prepare({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: [source.id], requested: true
+    });
+    // After the preparation compared it: this window writes a different version of one of its conversations.
+    await database.transaction([repo('Conversation').insert({ id: 'clash_0000000', title: '在当前库另写的', status: 'active', created_at: NOW, updated_at: NOW })]);
+  } finally { await database.close(); }
+  assert.deepEqual(preparation.sources.map((item) => item.candidateId), [source.id]);
+  const outcomes = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+    () => adapter.run({ paths: fixture.paths, target: { configurationRootPath: fixture.root, binding: fixture.current.binding }, preparation })));
+  assert.deepEqual(outcomes.map((item) => [item.candidateId, item.state, item.code, item.label]),
+    [[source.id, 'blocked', 'runtime-data-set-merge-conflict', source.label]], '会话结果带外来来源的可读名称');
+  // As the session tells it after the reload (runtimeDataSetManagement's reasons list names an issue by its label).
+  const report = largeMergeBatchResult(outcomes, true);
+  assert.deepEqual(report.blocked.map((issue) => [issue.candidateId, issue.label, issue.requested]), [[source.id, source.label, true]]);
+  const values = new Map();
+  const state = { get: (key) => values.get(key), update: async (key, value) => { values.set(key, value); } };
+  await keepLargeMergeResult(state, { configurationRootPath: fixture.root, requested: true, report, details: largeMergeDetails(preparation.sources, outcomes) });
+  const kept = takeLargeMergeResult(state, Date.now());
+  assert.deepEqual(kept.report.blocked.map((issue) => `${issue.label ?? issue.candidateId}\n[${issue.code}]`), [`${source.label}\n[runtime-data-set-merge-conflict]`]);
+  assert.ok(kept.details[0].startsWith(`${source.label}（`));
+  assert.deepEqual(query(fixture.current.binding.paths.databasePath, "SELECT title FROM conversation WHERE id LIKE 'clash_%'"), ['在当前库另写的'], '整份回滚');
+
+  // A source that never started (the session was cancelled before it) has no issue: named by its preparation.
+  const other = await found(fixture, (await copiedDirectory(fixture, (copy) => generateSyntheticSource(copy.current, { rows: 4_200, prefix: 'later' }))).container);
+  await request(fixture, other);
+  const window = await openWindow(fixture);
+  let second;
+  try {
+    second = await adapter.prepare({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, candidateIds: [other.id], requested: true });
+  } finally { await window.close(); }
+  const cancelled = new AbortController();
+  cancelled.abort();
+  const notRun = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+    () => adapter.run({ paths: fixture.paths, target: { configurationRootPath: fixture.root, binding: fixture.current.binding }, preparation: second, signal: cancelled.signal })));
+  assert.deepEqual(notRun.map((item) => [item.candidateId, item.state, item.code, item.label]),
+    [[other.id, 'deferred', 'runtime-data-set-merge-cancelled', other.label]]);
+  assert.deepEqual(largeMergeBatchResult(notRun, true).deferred.map((issue) => issue.label), [other.label]);
 });
 
 test('以前的数据目录里的归档（迁移后留在旧目录，globalStatus 记下的历次旧目录）同样可以合并：严格定位 side=previous 的位置，旧目录一字节不变', async (t) => {

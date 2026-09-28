@@ -479,6 +479,25 @@ test('大库会话：重载后按在线合并的同一套通知与去重说明�
   ]);
 });
 
+test('大库会话：外来历史库在会话里受阻时，重载后的原因列表用会话保留的可读名称，不写 id', async () => {
+  const values = new Map();
+  const workspaceState = { get: key => values.get(key), update: async (key, value) => { if (value === undefined) values.delete(key); else values.set(key, value); } };
+  const id = 'foreign:copy:0123456789abcdef';
+  const label = '外来历史库（拷来的数据目录 · backup-2026）';
+  // As the session keeps it (largeMergeBatchResult passes the engine's name along).
+  await largeMergeSession.keepLargeMergeResult(workspaceState, {
+    configurationRootPath: '/fixture', requested: true, details: [`${label}（/fixture/copy，约 7 万条记录）：没有合并，冲突。`],
+    report: largeMergeSession.largeMergeBatchResult([
+      { candidateId: id, state: 'blocked', code: 'runtime-data-set-merge-conflict', message: '准备之后当前库又改了同一条记录。', label }
+    ], true)
+  });
+  const f = fixture({ workspaceState, confirmation: '查看原因' });
+  await f.reportLargeHistoricalMergeKeptAcrossReload(f.context, () => true, Date.now());
+  for (let turn = 0; turn < 50 && !f.calls.some(call => call[0] === 'document'); turn += 1) await new Promise(resolve => setImmediate(resolve));
+  assert.deepEqual(f.calls.find(call => call[0] === 'document'), ['document',
+    `${label}\n[runtime-data-set-merge-conflict] 准备之后当前库又改了同一条记录。`]);
+});
+
 function extensionEntryFixture({ onDemand = false, upgradeError, mergeHook, keptNotice } = {}) {
   const events = [];
   const openOptions = [];

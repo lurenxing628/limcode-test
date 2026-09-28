@@ -176,6 +176,13 @@ test('结果：按在线合并的批结果报告（点了取消的那一份总�
   assert.deepEqual(report.merged.map((item) => [item.candidateId, item.exclusive]), [['workspace:a', true]]);
   assert.deepEqual(report.deferred, [{ candidateId: 'workspace:b', code: cancelled.code, message: cancelled.message, newly: true, requested: true }]);
   assert.deepEqual(report.failures.map((item) => [item.candidateId, item.requested]), [['workspace:c', undefined]]);
+  // A foreign history root: the reasons list after the session shows its readable name (a local source has none, its id is shown).
+  const label = '外来历史库（拷来的数据目录 · backup-2026）';
+  const foreignOutcomes = [{ ...failed, candidateId: 'foreign:copy:1', label }, { ...cancelled, candidateId: 'foreign:copy:2', label }];
+  const foreignReport = session.largeMergeBatchResult(foreignOutcomes, false);
+  assert.deepEqual([...foreignReport.failures, ...foreignReport.deferred].map((item) => [item.candidateId, item.label]),
+    [['foreign:copy:1', label], ['foreign:copy:2', label]]);
+  assert.ok(!('label' in report.failures[0]) && !('label' in report.deferred[0]), 'no name made up for a local source');
   // Named as the candidate list names them (project names it read, else the kind of history); the id only when unnamed.
   const sources = [
     { candidateId: 'workspace:a', label: 'limcode、notes', runtimeDataRootPath: '/a', rows: 300_000 },
@@ -237,6 +244,21 @@ test('适配层：等待列表来自本窗口最近一次批结果里等大库�
     assert.deepEqual(map({ candidateId: 'workspace:c', state, issue: { candidateId: 'workspace:c', code: `code-${state}`, message: `为什么 ${state}` } }),
       { candidateId: 'workspace:c', state, code: `code-${state}`, message: `为什么 ${state}` });
   }
+  // A foreign history root keeps its readable name (its issue's, else the one the preparation gave it
+  // when it never started): the reasons after the session name it by that, not by its id.
+  const label = '外来历史库（归档 · 20260901-010203-004-abcdef12）';
+  const id = 'foreign:archive:0123456789abcdef';
+  for (const state of ['deferred', 'blocked', 'failed']) {
+    assert.deepEqual(map({ candidateId: id, state, issue: { candidateId: id, code: `code-${state}`, message: `为什么 ${state}`, label } }),
+      { candidateId: id, state, code: `code-${state}`, message: `为什么 ${state}`, label });
+  }
+  assert.deepEqual(map({ candidateId: id, state: 'deferred', issue: { candidateId: id, code: 'runtime-data-set-merge-cancelled', message: '合并已取消', label } }),
+    { candidateId: id, state: 'cancelled', code: 'runtime-data-set-merge-cancelled', message: '合并时取消了，这一份已撤回，以后启动时会再合并。', label });
+  assert.deepEqual(map({ candidateId: id, state: 'not-run', reason: 'cancelled' }, label),
+    { candidateId: id, state: 'deferred', code: 'runtime-data-set-merge-cancelled', message: '合并中途取消了，这一份还没有开始，以后启动时会再合并。', label });
+  assert.deepEqual(map({ candidateId: id, state: 'not-run', reason: 'disk-full' }, label),
+    { candidateId: id, state: 'deferred', code: 'runtime-data-set-merge-disk-full', message: '前一份合并时磁盘空间不足，这一份没有开始；腾出空间后会再合并。', label });
+  assert.equal(map({ candidateId: id, state: 'blocked', issue: { candidateId: id, code: 'c', message: 'm', label } }, '别的名称').label, label, 'the issue says it first');
 });
 
 test('适配层接真实引擎：threshold 为 online，中等来源一起准备、更小的写明留给在线合并；进度按阶段写成文字；来源带标签（候选列表读过的项目名，否则写库的种类）、指纹、行数、预计区间，空间照搬引擎的数字；release 交还声明；run 的进度是整个会话的已处理行数与引擎的剩余时间，结果映射为已合并', async (t) => {

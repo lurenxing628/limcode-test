@@ -392,7 +392,9 @@ export function largeMergeBatchResult(outcomes: readonly LargeMergeSourceOutcome
     }
     const issue: RuntimeDataSetMergeIssue = {
       candidateId: outcome.candidateId, code: outcome.code, message: outcome.message, newly: true,
-      ...(requested || outcome.state === 'cancelled' ? { requested: true } : {})
+      ...(requested || outcome.state === 'cancelled' ? { requested: true } : {}),
+      // A foreign history root is named by its readable name in the reasons, not by its id.
+      ...(outcome.label ? { label: outcome.label } : {})
     };
     (outcome.state === 'blocked' ? report.blocked : outcome.state === 'failed' ? report.failures : report.deferred).push(issue);
   }

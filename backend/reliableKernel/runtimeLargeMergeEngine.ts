@@ -99,13 +99,26 @@ export interface LargeMergeRunProgress {
   remainingMs?: number;
 }
 
+/**
+ * Why a source was not merged. `label` is a foreign history root's readable name (the engine's, as its
+ * issues carry it): the reasons told after the session name it by that, a local source by its id as
+ * the online batch does.
+ */
+interface LargeMergeSourceNotMerged<State extends 'cancelled' | 'deferred' | 'blocked' | 'failed'> {
+  candidateId: string;
+  state: State;
+  code: string;
+  message: string;
+  label?: string;
+}
+
 export type LargeMergeSourceOutcome =
   | { candidateId: string; state: 'merged'; result: RuntimeDataSetMergeResult }
   /** Rolled back because the session was cancelled while this source ran; a later startup tries it again. */
-  | { candidateId: string; state: 'cancelled'; code: string; message: string }
+  | LargeMergeSourceNotMerged<'cancelled'>
   /** Not started (cancelled or out of disk space before it) or stopped by something other than the source. */
-  | { candidateId: string; state: 'deferred'; code: string; message: string }
-  | { candidateId: string; state: 'blocked' | 'failed'; code: string; message: string };
+  | LargeMergeSourceNotMerged<'deferred'>
+  | LargeMergeSourceNotMerged<'blocked' | 'failed'>;
 
 export interface LargeMergeEngine {
   /** Sources the last online batch of this process left to the session, with their audited size. */
@@ -226,16 +239,23 @@ const STREAMED_MERGE_ENGINE: LargeMergeEngine = Object.freeze<LargeMergeEngine>(
         rowsDone: progress.sessionRows, rowsTotal: progress.sessionTotalRows, remainingMs: progress.remainingMs
       })
     });
-    return session.results.map(largeMergeSourceOutcome);
+    // A foreign history root's name as the engine prepared it: also for a source that never started (no issue).
+    const foreignLabels = new Map((input.preparation.engineState as StreamedMergePreparation).sources
+      .flatMap((source) => (source.label ? [[source.candidateId, source.label] as const] : [])));
+    return session.results.map((result) => largeMergeSourceOutcome(result, foreignLabels.get(result.candidateId)));
   }
 });
 
 /**
  * One source's result of the engine's session as the session reports it: nothing new counts as
  * merged (alreadyMerged); the source a cancel rolled back is 'cancelled'; a source that never
- * started (after a cancel, or after the disk filled up) is deferred with why. Exported for tests.
+ * started (after a cancel, or after the disk filled up) is deferred with why. A foreign history
+ * root keeps its readable name: the one its issue carries, else `foreignLabel` (the engine's name
+ * from the preparation, for a source that never started). Exported for tests.
  */
-export function largeMergeSourceOutcome(result: LargeMergeSourceResult): LargeMergeSourceOutcome {
+export function largeMergeSourceOutcome(result: LargeMergeSourceResult, foreignLabel?: string): LargeMergeSourceOutcome {
+  const label = ('issue' in result ? result.issue.label : undefined) ?? foreignLabel;
+  const named = label ? { label } : {};
   switch (result.state) {
     case 'merged':
       return { candidateId: result.candidateId, state: 'merged', result: result.result };
@@ -246,22 +266,22 @@ export function largeMergeSourceOutcome(result: LargeMergeSourceResult): LargeMe
       return result.reason === 'cancelled'
         ? {
           candidateId: result.candidateId, state: 'deferred', code: RUNTIME_DATA_SET_MERGE_CANCELLED,
-          message: '合并中途取消了，这一份还没有开始，以后启动时会再合并。'
+          message: '合并中途取消了，这一份还没有开始，以后启动时会再合并。', ...named
         }
         : {
           candidateId: result.candidateId, state: 'deferred', code: 'runtime-data-set-merge-disk-full',
-          message: '前一份合并时磁盘空间不足，这一份没有开始；腾出空间后会再合并。'
+          message: '前一份合并时磁盘空间不足，这一份没有开始；腾出空间后会再合并。', ...named
         };
     case 'deferred':
       if (result.issue.code === RUNTIME_DATA_SET_MERGE_CANCELLED) {
         return {
           candidateId: result.candidateId, state: 'cancelled', code: result.issue.code,
-          message: '合并时取消了，这一份已撤回，以后启动时会再合并。'
+          message: '合并时取消了，这一份已撤回，以后启动时会再合并。', ...named
         };
       }
-      return { candidateId: result.candidateId, state: 'deferred', code: result.issue.code, message: result.issue.message };
+      return { candidateId: result.candidateId, state: 'deferred', code: result.issue.code, message: result.issue.message, ...named };
     default:
-      return { candidateId: result.candidateId, state: result.state, code: result.issue.code, message: result.issue.message };
+      return { candidateId: result.candidateId, state: result.state, code: result.issue.code, message: result.issue.message, ...named };
   }
 }
 
