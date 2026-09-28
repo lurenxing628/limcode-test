@@ -836,8 +836,7 @@ const WORK_ITEM_LABELS: Readonly<Record<string, string>> = {
   pendingProcessCompletionIds: '后台进程的完成通知',
   undeliveredAnswerIds: '子 Agent 的答复',
   unreceiptedEffectIds: '工具操作',
-  otherRuntimeWork: '其它没完成的工作',
-  round: '一轮收尾'
+  otherRuntimeWork: '其它没完成的工作'
 };
 
 /**
@@ -876,7 +875,8 @@ function latestLeft(notice: DataRootMovedNotice | undefined): readonly DataRootC
 export function describeCarriedWorkLeft(items: readonly DataRootCarriedWorkLeftItem[]): string[] {
   const where = (item: DataRootCarriedWorkLeftItem): string => item.conversationId
     ? `对话“${item.title || item.conversationId}”里的${WORK_ITEM_LABELS[item.list] ?? item.list}（${item.id}）`
-    : `${WORK_ITEM_LABELS[item.list] ?? item.list}（${item.id}）`;
+    : item.list === 'round' ? (/^round-\d+$/.test(item.id) ? `第 ${item.id.slice('round-'.length)} 轮收尾` : '收尾过程')
+      : `${WORK_ITEM_LABELS[item.list] ?? item.list}（${item.id}）`;
   const why = (item: DataRootCarriedWorkLeftItem): string => item.why === 'live'
     ? '另一个 LimCode 窗口正在执行或占着它，这里收尾不了。关闭或重载那个窗口（或等它结束）之后重试。'
     : item.why === 'failed' ? `收尾时出错（${item.detail}）。可以重试；一直出错时可以改用新目录。`

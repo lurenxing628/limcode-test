@@ -18,7 +18,7 @@ import {
   resolveVscodeRuntimeDataSetScopeRoot,
   type VscodeWorkspaceRuntimePlacement
 } from '../../reliableKernel/vscodeRootAuthority';
-import { settleRelocatedWork } from './relocatedWorkSettlement';
+import { settleRelocatedWork, type RelocatedWorkSettlementResult } from './relocatedWorkSettlement';
 
 /**
  * Opening a data set of an old directory whose data a relocation moved away with unfinished work
@@ -109,14 +109,22 @@ export async function openSettlingRelocatedWork<T extends RelocatedWorkHoldingRu
  */
 export async function settleRelocatedWorkOnOpen(application: ReliableKernelApplication, opening: RelocatedWorkOpening, by: string): Promise<void> {
   if (application.database.binding.dataSetId !== opening.dataSet.dataSetId) return;
-  const result = await settleRelocatedWork({
-    application, inventory: opening.dataSet.inventory, targetRootPath: opening.notice.targetRootPath
-  });
-  const left = [
+  let result: RelocatedWorkSettlementResult | undefined;
+  let stopped: unknown;
+  try {
+    result = await settleRelocatedWork({
+      application, inventory: opening.dataSet.inventory, targetRootPath: opening.notice.targetRootPath
+    });
+  } catch (error) {
+    // Not an item that failed (those are in the result): the settlement itself stopped. Nothing ran;
+    // it is left like any other item, so the refusal names it and a retry settles the rest.
+    stopped = error;
+  }
+  const left = result ? [
     ...result.live.map((item) => ({ ...item, why: 'live' as const, detail: '' })),
     ...result.unsettled.map((item) => ({ ...item, why: item.kind, detail: item.detail }))
-  ];
-  if (left.length === 0) {
+  ] : [{ conversationId: '', list: 'round', id: 'settlement', why: 'failed' as const, detail: `收尾中途出错：${errorMessage(stopped)}` }];
+  if (result && left.length === 0) {
     await recordDataRootMovedWorkSettled(opening.root, opening.notice.relocationId, opening.dataSet.id, by, { counts: { ...result.counts } });
     return;
   }
@@ -129,6 +137,10 @@ export async function settleRelocatedWorkOnOpen(application: ReliableKernelAppli
   await recordDataRootMovedWorkLeft(opening.root, opening.notice.relocationId, opening.dataSet.id, by, items)
     .catch((error: unknown) => console.warn('[LimCode] 记下没有收尾的迁走任务失败。', error));
   throw new DataRootUnavailableError(opening.root, 'moved-work-unsettled', new RelocatedWorkLeftError(items));
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** The cause of a 'moved-work-unsettled' refusal: what that open could not settle, for the prompt. */

@@ -936,7 +936,8 @@ test('最后一轮 #1 这次打开留下了没收尾的项（moved-work-unsettle
     { conversationId: 'conversation-1', title: '部署脚本', list: 'undeliveredAnswerIds', id: 'answer-1', why: 'live', detail: '' },
     { conversationId: 'conversation-2', title: '周报', list: 'activeTurnIds', id: 'turn-2', why: 'needs_human', detail: 'Turn 的终态事实不一致，需要人工处理；已记录停止请求。' },
     { conversationId: 'conversation-3', title: '', list: 'pendingDeliveryIds', id: 'delivery-9', why: 'rounds_exhausted', detail: '收尾 5 轮后仍出现新的可执行项（pendingDeliveryIds），这次不再收尾。' },
-    { conversationId: '', title: '', list: 'round', id: 'round-2', why: 'failed', detail: '第 2 轮之前协作收敛或重新盘点失败（试了 3 次）：revision conflict' }
+    { conversationId: '', title: '', list: 'round', id: 'round-2', why: 'failed', detail: '第 2 轮之前协作收敛或重新盘点失败（试了 3 次）：revision conflict' },
+    { conversationId: '', title: '', list: 'round', id: 'settlement', why: 'failed', detail: '收尾中途出错：数据库 worker 已退出' }
   ];
   const f = fixture({ host: false, recoveryChoice: undefined, movedNotice: carriedNotice() });
   const error = Object.assign(new Error('数据目录这次没有打开'), { reason: 'moved-work-unsettled', cause: { items } });
@@ -952,7 +953,8 @@ test('最后一轮 #1 这次打开留下了没收尾的项（moved-work-unsettle
     '· 对话“部署脚本”里的子 Agent 的答复（answer-1）：另一个 LimCode 窗口正在执行或占着它，这里收尾不了。关闭或重载那个窗口（或等它结束）之后重试。',
     '· 对话“周报”里的进行中的回合（turn-2）：停止流程收不掉它（Turn 的终态事实不一致，需要人工处理；已记录停止请求。）。可以稍后重试（它可能自己结束），或改用新目录，在那里处理这个对话。',
     '· 对话“conversation-3”里的待投递的结果或消息（delivery-9）：收尾几轮之后仍不断出现新的工作（收尾 5 轮后仍出现新的可执行项（pendingDeliveryIds），这次不再收尾。）。重试时会接着收尾；一直这样时可以改用新目录。',
-    '· 一轮收尾（round-2）：收尾时出错（第 2 轮之前协作收敛或重新盘点失败（试了 3 次）：revision conflict）。可以重试；一直出错时可以改用新目录。',
+    '· 第 2 轮收尾：收尾时出错（第 2 轮之前协作收敛或重新盘点失败（试了 3 次）：revision conflict）。可以重试；一直出错时可以改用新目录。',
+    '· 收尾过程：收尾时出错（收尾中途出错：数据库 worker 已退出）。可以重试；一直出错时可以改用新目录。',
     '在全部收尾之前，这个目录不会在这里打开，里面的任何工作都不会执行；重试时会先把迁走的任务整库再收尾一次。'
   ]);
   assert.ok(!f.kinds().includes('command') && !f.kinds().includes('status') && !f.kinds().includes('consent'), '关掉提示：什么都不做');

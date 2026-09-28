@@ -507,6 +507,29 @@ test('产品运行时的门：打开时扣住（holdForRelocatedWork）就不开
   ]);
 });
 
+test('风险 2：收尾本身意外出错（不是某一项失败）时不再是通用的“运行时无法启动”：照样不放行，记下一条“收尾过程出错”的剩余项，拒绝打开（moved-work-unsettled）并说明可以重试；重试时收尾完', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const { turnId } = await admitUnstartedTurn(fixture);
+  const { relocationId } = await relocateOldHome(fixture);
+  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
+  const provider = countingProvider();
+  const first = await openOldHome(fixture, provider, { wrap: (app) => Object.create(app, {
+    runtime: { get() { throw new Error('数据库 worker 已退出'); } }
+  }) });
+  assert.equal(first.refused?.reason, 'moved-work-unsettled', `不放行：${first.refused?.stack}`);
+  assert.match(first.refused.message, /迁走的任务还没有全部收尾（还剩 1 项：收尾时出错 1 项）.*可以重试/);
+  assert.deepEqual(first.refused.cause.items.map((item) => [item.conversationId, item.list, item.id, item.why]), [['', 'round', 'settlement', 'failed']]);
+  assert.match(first.refused.cause.items[0].detail, /收尾中途出错：数据库 worker 已退出/);
+  assert.deepEqual([first.hold, first.released, first.closed], [true, false, true], '扣住打开、没有放行、运行时关掉');
+  const entry = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0];
+  assert.equal(entry.settlement.state, 'consented');
+  assert.deepEqual(entry.settlement.left.items, first.refused.cause.items);
+  const next = await openSettleAndRecover(fixture, provider, INSTALLATION_B);
+  assert.equal(provider.calls.length, 0);
+  assert.deepEqual(next.host.executions, { tools: [], processes: [] });
+  assert.equal((await turnRow(fixture, turnId)).status, 'terminated');
+});
+
 // ---------------------------------------------------------------------------------------------
 
 function dataRootOf(fixture) {
