@@ -1934,7 +1934,7 @@ test('盲审 merge #9：合并事务以 synchronous=FULL 提交，落盘之后�
     }
   });
   assert.equal(merged.merged.length, 1);
-  assert.deepEqual(atCommit, [1n, 1, 'committing']);
+  assert.deepEqual(atCommit, [1n, 1, 'committing'], '第二次 durable 提交（第一次失败）同样在 FULL 下提交：提交后读回 FULL 才计数');
   assert.deepEqual(await state(), [1n, 1]);
   assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'merged');
 });

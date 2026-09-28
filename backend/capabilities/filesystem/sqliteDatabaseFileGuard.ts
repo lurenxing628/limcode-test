@@ -32,9 +32,10 @@ const SQLITE_SIDECAR_SUFFIXES = ['-wal', '-shm', '-journal'] as const;
 const LIMCODE_DATABASE_FILE_NAME = /^limcode\.(?:.*\.)?sqlite(?:[.-].*)?$/;
 /**
  * Private copies a data set's control root holds while this process uses them, with sidecars: the
- * Backup API copies of the open database behind a merge pre-copy (`merge-precopy-<pid>-<uuid>`), a
- * relocation row count (`relocation-count-<pid>-<uuid>`) and a bulk-copy verification
- * (`copy-verify-<uuid>`).
+ * Backup API copies of the open database behind a merge pre-copy (`merge-precopy-<pid>-<uuid>`) and a
+ * bulk-copy verification (`copy-verify-<uuid>`). `relocation-count-<pid>-<uuid>` is matched only for
+ * what earlier builds left behind (sweepDataRootRelocationLeftovers removes it): the relocation row
+ * count copies nothing now, it counts on the worker's reader connection.
  */
 const LIMCODE_STAGING_DATABASE_FILE_NAME = /^(?:merge-precopy|relocation-count|copy-verify)-.+\.sqlite(?:-wal|-shm|-journal)?$/;
 

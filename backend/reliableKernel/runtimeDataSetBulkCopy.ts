@@ -313,9 +313,11 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
  * is under another configuration root than the source; no Host runs on the target, which is taken
  * under its maintenance claim, has the current epoch and holds no row at all; the source is offline
  * and passes every migration check (see openRuntimeDataSetMigrationSource); after the copy the
- * source is still exactly the copied state. Any failure leaves a partially written target: the
- * caller discards the whole target root (nothing referenced it yet). Throws RuntimeDataSetMergeError
- * for refusals, AbortError for a cancellation.
+ * source is still exactly the copied state. The copy is on disk before the receipt is returned (the
+ * batches commit with synchronous = NORMAL; a caller records it done, see
+ * RuntimeDatabase.durabilityCheckpoint). Any failure leaves a partially written target: the caller
+ * discards the whole target root (nothing referenced it yet). Throws RuntimeDataSetMergeError for
+ * refusals, AbortError for a cancellation.
  */
 export async function copyRuntimeDataSetIntoEmptyRoot(
   paths: { globalStoragePath: string },
@@ -357,6 +359,8 @@ export async function copyRuntimeDataSetIntoEmptyRoot(
       await options.onFaultPoint?.('after-cas-transfer');
       const batches = await writeBatches(source.database, database, batchRows, options);
       const rowsByDomain = await verifyCopy(source.database, database);
+      // Closing the last connection checkpoints too, but reports nothing and skips it while another is open.
+      await database.durabilityCheckpoint();
       const copied = Object.values(rowsByDomain).reduce((sum, count) => sum + count, 0);
       const receipt: RuntimeDataSetCopyReceipt = {
         candidateId: source.candidate.id,

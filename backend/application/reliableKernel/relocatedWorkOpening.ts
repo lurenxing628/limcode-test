@@ -106,10 +106,13 @@ export async function openSettlingRelocatedWork<T extends RelocatedWorkHoldingRu
  * Right after the Runtime opened with its convergence held and before its recovery (see
  * VscodeReliableKernelProductRuntime.releaseRelocatedWorkHold): settles the carried work with the
  * user's stop transitions (`by`: this installation). Only when nothing is left is it recorded as
- * settled (once, never again). Anything left, whatever the reason (work a live window runs or holds,
- * an item that failed, one that needs a person, new work still coming after the last round), keeps
- * it consented, is recorded as what this open left (for the prompt) and fails the open
- * ('moved-work-unsettled'): none of it may run here, and the next open settles the whole data set again.
+ * settled (once, never again), and only once the settlement is on disk (the durability barrier
+ * RuntimeDatabase.durabilityCheckpoint: the stop transitions commit with synchronous = NORMAL, a crash
+ * could lose them after the record said settled). Anything left, whatever the reason (work a live
+ * window runs or holds, an item that failed, one that needs a person, new work still coming after the
+ * last round, a settlement that stopped or could not be made durable), keeps it consented, is recorded
+ * as what this open left (for the prompt) and fails the open ('moved-work-unsettled'): none of it may
+ * run here, and the next open settles the whole data set again.
  */
 export async function settleRelocatedWorkOnOpen(application: ReliableKernelApplication, opening: RelocatedWorkOpening, by: string): Promise<void> {
   if (application.database.binding.dataSetId !== opening.dataSet.dataSetId) return;
@@ -124,10 +127,17 @@ export async function settleRelocatedWorkOnOpen(application: ReliableKernelAppli
     // it is left like any other item, so the refusal names it and a retry settles the rest.
     stopped = error;
   }
-  const left = result ? [
+  let left = result ? [
     ...result.live.map((item) => ({ ...item, why: 'live' as const, detail: '' })),
     ...result.unsettled.map((item) => ({ ...item, why: item.kind, detail: item.detail }))
-  ] : [{ conversationId: '', list: 'round', id: 'settlement', why: 'failed' as const, detail: `收尾中途出错：${errorMessage(stopped)}` }];
+  ] : [settlementFailed(`收尾中途出错：${errorMessage(stopped)}`)];
+  if (result && left.length === 0) {
+    try {
+      await application.database.durabilityCheckpoint();
+    } catch (error) {
+      left = [settlementFailed(`收尾没能写回磁盘：${errorMessage(error)}`)];
+    }
+  }
   if (result && left.length === 0) {
     await recordDataRootMovedWorkSettled(opening.root, opening.notice.relocationId, opening.dataSet.id, by, { counts: { ...result.counts } });
     return;
@@ -184,6 +194,11 @@ const SETTLING_ONLY: ReliableKernelApplicationDependencies = (() => {
     toolDispatcher: { definitions: () => [], dispatch: async () => refuse('工具')() }
   };
 })();
+
+/** The settlement itself did not finish (not an item that failed): left like one, a retry settles the rest. */
+function settlementFailed(detail: string) {
+  return { conversationId: '', list: 'round', id: 'settlement', why: 'failed' as const, detail };
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);

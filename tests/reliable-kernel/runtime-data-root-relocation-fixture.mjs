@@ -1,6 +1,6 @@
 // Shared fixture of the data-root relocation tests (runtime-data-root-relocation*.test.mjs and the
 // crash child). Everything runs against the compiled extension (LIMCODE_TEST_EXTENSION_ROOT or dist).
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -223,4 +223,30 @@ export async function markStagingOwnerDead(target) {
   const marker = JSON.parse(await fs.readFile(file, 'utf8'));
   marker.owner = { processId: spawnSync(process.execPath, ['-e', '']).pid };
   await fs.writeFile(file, `${JSON.stringify(marker, null, 2)}\n`);
+}
+
+/**
+ * Stops (SIGSTOP) a child that runs a Runtime of `databasePath` at a moment it holds no SQLite write
+ * lock: stopped inside a write transaction it would keep every other window's write waiting until
+ * that one's busy timeout ("database is locked"), which no live window does for long. The lock is
+ * probed from another process without waiting (the POSIX lock rule); while it is held the child runs
+ * on a little and is stopped again.
+ */
+export async function stopOutsideWrites(child, databasePath) {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    child.kill('SIGSTOP');
+    if (await writeLockFree(databasePath)) return;
+    child.kill('SIGCONT');
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  throw new Error(`${databasePath} 的写锁一直被占着，没能在写事务之外停住子进程。`);
+}
+
+function writeLockFree(databasePath) {
+  const probe = [
+    'const D = require("better-sqlite3"); const d = new D(process.argv[1]); d.pragma("busy_timeout = 0"); let free = true;',
+    'try { d.exec("BEGIN IMMEDIATE"); d.exec("ROLLBACK"); } catch (error) { if (!String(error.code).startsWith("SQLITE_BUSY")) throw error; free = false; }',
+    'd.close(); process.stdout.write(String(free));'
+  ].join(' ');
+  return new Promise((resolve, reject) => execFile(process.execPath, ['-e', probe, databasePath], (error, stdout) => error ? reject(error) : resolve(stdout === 'true')));
 }

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
@@ -314,6 +315,20 @@ test('复审 bulk #4：复制期间来源又有写入，复制结束时的来源
   assert.equal(written, true);
 });
 
+test('盲审 worker #1：收据之前复制已落盘（落盘屏障）：目标库有另一个进程停在复制之前的读快照、写不回磁盘时复制失败，不给收据', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['conversation_durable_copy']);
+  const target = await createTarget(t, 'default');
+  let reader;
+  t.after(() => reader?.release());
+  await assert.rejects(copy(fixture, fixture.current, target, {
+    async onFaultPoint(point) {
+      if (point === 'after-cas-transfer') reader = await holdReadSnapshot(target.dataSet.binding.paths.databasePath);
+    }
+  }), /没能全部写回磁盘/);
+  assert.ok(reader, '前提：复制期间确有这样的读者');
+});
+
 test('复审 bulk #1：跨行检查清单与 worker 源码一一对应，且与分批规则一一对应（新增投影或检查漏登记会失败）', async () => {
   const worker = await fs.readFile(path.join(compiled, 'backend/reliableKernel/databaseWorker.js'), 'utf8');
   const body = (name) => {
@@ -405,6 +420,20 @@ for (const batchRows of [1, 2, 3, 5, 7, 11, 13, RUNTIME_DATA_SET_COPY_BATCH_ROWS
       assert.ok(batch.rows <= batchRows - 1 + batch.largestUnitRows);
     }
   });
+}
+
+/** Another process with a read transaction open on `databasePath` (the state it read stays in use) until released. */
+async function holdReadSnapshot(databasePath) {
+  const child = spawn(process.execPath, ['-e', [
+    'const D = require("better-sqlite3"); const d = new D(process.argv[1]); d.pragma("busy_timeout = 5000");',
+    'd.exec("BEGIN"); d.prepare("SELECT COUNT(*) FROM conversation").get(); process.stdout.write("ready\\n");',
+    'process.stdin.on("end", () => { d.exec("COMMIT"); d.close(); process.exit(0); }); process.stdin.resume();'
+  ].join(' '), databasePath], { stdio: ['pipe', 'pipe', 'inherit'] });
+  await new Promise((resolve, reject) => {
+    child.stdout.on('data', (chunk) => { if (String(chunk).includes('ready')) resolve(); });
+    child.once('exit', (code) => reject(new Error(`读者没有就绪就退出了（${code}）`)));
+  });
+  return { release: () => new Promise((resolve) => { child.once('exit', resolve); child.stdin.end(); }) };
 }
 
 async function createFixture(t, options = {}) {

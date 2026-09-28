@@ -245,7 +245,8 @@ test('存活窗口占着的项（live：它在执行的 Turn 与排在后面的�
   const holder = spawnWorker('live-holder', { dataRoot: dataRootOf(fixture), ready });
   t.after(() => { if (holder.exitCode === null && holder.signalCode === null) holder.kill('SIGKILL'); });
   await waitForFile(holder, ready, 90_000);
-  holder.kill('SIGSTOP');
+  // Stopped outside a write transaction (a window that stalls inside one holds every writer up).
+  await reloc.stopOutsideWrites(holder, fixture.current.binding.paths.databasePath);
 
   // This open: what the live window holds cannot be settled here, so nothing is released.
   const provider = countingProvider();
@@ -527,6 +528,46 @@ test('风险 2：收尾本身意外出错（不是某一项失败）时不再是
   const next = await openSettleAndRecover(fixture, provider, INSTALLATION_B);
   assert.equal(provider.calls.length, 0);
   assert.deepEqual(next.host.executions, { tools: [], processes: [] });
+  assert.equal((await turnRow(fixture, turnId)).status, 'terminated');
+});
+
+test('盲审 worker #1：“已收尾”只在收尾落盘之后记：记之前先过落盘屏障（那时标记还是同意、收尾已提交）；屏障失败时不记已收尾、保持同意，按“收尾过程出错”留下一项、这次不打开；下次打开照常收尾，过了屏障才记', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const { turnId } = await admitUnstartedTurn(fixture);
+  const { relocationId } = await relocateOldHome(fixture);
+  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
+  const settlement = async () => (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
+  const barriers = [];
+  // The window's own barrier, observed: what the notice and the Turn were when it was reached.
+  const observeBarrier = (failure) => async (host) => {
+    const { database } = host.app;
+    const barrier = database.durabilityCheckpoint.bind(database);
+    database.durabilityCheckpoint = async () => {
+      const [turn] = (await database.snapshot([repo('Turn').get(turnId)])).snapshot;
+      barriers.push([(await settlement()).state, turn.status]);
+      if (failure) throw failure;
+      return barrier();
+    };
+  };
+  const provider = countingProvider();
+  const first = await openOldHome(fixture, provider, { opened: observeBarrier(new Error('另一个窗口还在读旧的状态')) });
+  assert.equal(first.refused?.reason, 'moved-work-unsettled', `不放行：${first.refused?.stack}`);
+  assert.deepEqual(first.refused.cause.items.map((item) => [item.conversationId, item.list, item.id, item.why]), [['', 'round', 'settlement', 'failed']]);
+  assert.match(first.refused.cause.items[0].detail, /收尾没能写回磁盘：另一个窗口还在读旧的状态/);
+  assert.deepEqual([first.hold, first.released, first.closed], [true, false, true], '扣住打开、没有放行、运行时关掉');
+  assert.deepEqual(barriers, [['consented', 'terminated']], '屏障在记录之前：收尾已提交，标记还是同意');
+  const kept = await settlement();
+  assert.equal(kept.state, 'consented', '屏障失败：不记已收尾');
+  assert.deepEqual(kept.left.items, first.refused.cause.items);
+
+  const next = await openOldHome(fixture, provider, { opened: observeBarrier() });
+  try {
+    assert.equal(next.refused, undefined, `重开照常收尾并放行：${next.refused?.stack}`);
+    assert.deepEqual([next.hold, next.released], [true, true]);
+  } finally { await next.host?.close(); }
+  assert.deepEqual(barriers, [['consented', 'terminated'], ['consented', 'terminated']], '真的屏障通过之后才记');
+  assert.equal((await settlement()).state, 'settled');
+  assert.equal(provider.calls.length, 0);
   assert.equal((await turnRow(fixture, turnId)).status, 'terminated');
 });
 

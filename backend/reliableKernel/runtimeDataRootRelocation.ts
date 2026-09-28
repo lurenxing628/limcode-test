@@ -139,7 +139,10 @@ const CLUSTER_SIZES: readonly number[] = [4096, 8192, 16384, 32768, 65536, 13107
 /** Linux statfs types of filesystems without hard links (msdos/vfat, exFAT): CAS objects are copied. */
 const NO_HARD_LINK_FILESYSTEMS: ReadonlySet<number> = new Set([0x4d44, 0x2011bab0]);
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
-/** Temporary copies named with their owner's process id (see sweepDataRootRelocationLeftovers). */
+/**
+ * Temporary copies named with their owner's process id (see sweepDataRootRelocationLeftovers).
+ * `relocation-count` copies are only what earlier builds left: the row count copies nothing now.
+ */
 const OWNED_TEMPORARY_DIRECTORY = /^limcode-(?:runtime-history|merge-precopy|relocation-count)-(\d+)-/;
 const OWNED_STAGING_FILE = /^(?:merge-precopy|relocation-count)-(\d+)-[0-9a-f-]{36}\.sqlite(?:-wal|-shm|-journal)?$/;
 /** Names of earlier builds without an owner: removed only once clearly abandoned. */
@@ -661,8 +664,8 @@ export async function inspectDataRootForReturn(dataRootPath: string): Promise<{ 
 
 /**
  * Read-only relocation plan. `sourceDatabase` is this window's open Runtime of the current data set
- * (its rows are counted through a Backup API copy); without it the data set must be closed in this
- * process. Checked again (without measuring) when staging.
+ * (its rows are counted on its worker's reader connection in one read transaction, nothing copied);
+ * without it the data set must be closed in this process. Checked again (without measuring) when staging.
  */
 export async function planDataRootRelocation(input: {
   sourceRootPath: string;
@@ -1609,6 +1612,7 @@ async function mergeInto(
     try {
       // The rows the one transaction inserts are journaled before it commits (see JournalEntry 'merging').
       const relative = path.relative(target, runtimeDataRootPath);
+      // Its one transaction commits durably (synchronous = FULL) before the relocation records it complete.
       return await mergeRuntimeDataSetIntoDatabase(sourcePaths, input, { configurationRootPath: target, database }, {
         migration: true, ...(options.linkFile ? { linkFile: options.linkFile } : {}),
         beforeCommit: (inserted) => journal.append({ op: 'merging', path: relative, inserted: inserted.map(([domain, id]) => [domain, id]) })

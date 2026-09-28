@@ -278,7 +278,7 @@ export interface RuntimeMaintenanceRollbackResult {
   rolledBack: boolean;
 }
 
-/** Answer of `maintenanceCheckpoint`: SQLite's wal_checkpoint(TRUNCATE) row. */
+/** Answer of `maintenanceCheckpoint` and `durabilityCheckpoint`: SQLite's wal_checkpoint(TRUNCATE / PASSIVE) row. */
 export interface RuntimeWalCheckpointResult {
   busy: number;
   log: number;
@@ -327,6 +327,11 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'maintenanceCommit' }
   | { kind: 'maintenanceRollback' }
   | { kind: 'maintenanceCheckpoint' }
+  /**
+   * wal_checkpoint(PASSIVE) on the writer outside any transaction (refused while a maintenance
+   * transaction is open): the durability barrier of RuntimeDatabase.durabilityCheckpoint.
+   */
+  | { kind: 'durabilityCheckpoint' }
   | { kind: 'inspect' }
   | { kind: 'close' };
 
@@ -366,7 +371,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
   readerForeignKeys: bigint;
   readerBusyTimeoutMs: bigint;
   currentCommitSeq: string;
-  /** Transactions this worker committed with synchronous = FULL on request (`durable`). */
+  /** Transactions this worker committed with synchronous = FULL on request (`durable`), read back in effect after the commit. */
   durableCommitCount: number;
   /** Bounded verified Context CAS cache counters; metadata only, never content bytes. */
   contextCasCache: {

@@ -270,6 +270,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-dataset-merge-crash-child.mjs',
   'tests/reliable-kernel/fixtures/runtime-merge-fixture.mjs',
   'tests/reliable-kernel/runtime-maintenance-transaction.test.mjs',
+  'tests/reliable-kernel/runtime-database-durability-snapshots.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-streamed.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-estimate.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-streamed-review.test.mjs',

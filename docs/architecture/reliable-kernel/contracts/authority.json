@@ -32,7 +32,7 @@
       "busy_timeout_ms": 5000,
       "foreign_keys": "on-per-connection"
     },
-    "durableCommits": "merge-engine-row-transaction-only-historical-merge-exclusive-fallback-and-relocation-merge-mode-synchronous-full-for-that-commit-then-normal; large-merge-maintenance-transaction-begun-with-synchronous-full-normal-again-after-commit-or-rollback",
+    "durableCommits": "merge-engine-row-transaction-only-historical-merge-exclusive-fallback-and-relocation-merge-mode-synchronous-full-for-that-commit-then-normal; large-merge-maintenance-transaction-begun-with-synchronous-full-normal-again-after-commit-or-rollback; synchronous-set-and-checked-through-database-pragma-never-the-statement-cache; a-record-outside-the-database-saying-something-in-it-is-done-written-only-after-that-is-on-disk-a-durable-commit-with-writes-or-the-durability-checkpoint-wal-checkpoint-passive-outside-any-transaction-never-holding-other-windows-writes-busy-0-and-every-frame-written-back-bounded-retries-else-an-error; an-assertion-only-durable-transaction-writes-no-wal-frame-and-a-checkpoint-on-close-reports-nothing-neither-is-a-barrier",
     "maintenanceTransactions": "offline-private-instance-only-opened-under-root-maintenance-with-hosts-offline-no-commit-listeners; one-write-transaction-across-requests-other-writes-refused-while-open; appended-steps-under-ordinary-insert-invariants-failed-append-rolls-back-all; touched-model-request-aggregates-and-historical-copies-kept-in-a-temp-table-aggregates-asserted-at-commit; commit-reads-no-changes-back-snapshot-required-allocated-sequences-counted-only; wal-checkpoint-truncate-a-separate-request-outside-the-transaction",
     "connectionModel": {
       "writer": "single-dedicated-worker-per-host",

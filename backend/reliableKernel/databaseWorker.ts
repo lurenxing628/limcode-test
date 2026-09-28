@@ -305,7 +305,12 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'maintenanceCheckpoint') {
         if (maintenance) throw new Error('A WAL checkpoint cannot run while the maintenance transaction is open.');
-        respond({ type: 'response', id: request.id, ok: true, result: truncateWal(writer) });
+        respond({ type: 'response', id: request.id, ok: true, result: checkpointWal(writer, 'TRUNCATE') });
+        return;
+      }
+      if (request.kind === 'durabilityCheckpoint') {
+        assertDatabaseBinding(writer, data.binding);
+        respond({ type: 'response', id: request.id, ok: true, result: checkpointWal(writer, 'PASSIVE') });
         return;
       }
       if (request.kind === 'transaction') {
@@ -775,7 +780,10 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
     .map(({ sequence: _sequence, ...change }) => change);
 }
 
-/** Transactions this worker committed through committedDurably (diagnostics). */
+/**
+ * Transactions this worker committed with synchronous = FULL in effect, read back right after their
+ * commit (diagnostics: a test sees a durable commit that was not FULL, the second one as the first).
+ */
 let durableCommitCount = 0;
 
 /**
@@ -784,17 +792,28 @@ let durableCommitCount = 0;
  * the transaction failed. Only this connection's pragma changes; no database file is opened here.
  */
 function committedDurably<T>(database: Database.Database, commit: () => T): T {
-  prepareCached(database, 'PRAGMA synchronous = FULL').run();
   try {
-    if (BigInt(prepareCached(database, 'PRAGMA synchronous', { rows: 'pluck' }).get() as number | bigint) !== 2n) {
-      throw new Error('SQLite synchronous = FULL is not in effect for a durable transaction.');
-    }
+    requireSynchronousFull(database, 'a durable transaction');
     const result = commit();
-    durableCommitCount += 1;
+    if (synchronousLevel(database) === 2n) durableCommitCount += 1;
     return result;
   } finally {
-    prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+    database.pragma('synchronous = NORMAL');
   }
+}
+
+/**
+ * synchronous = FULL on this connection, read back. Never through the statement cache: SQLite applies
+ * a setting PRAGMA when it compiles it and compiles the read form's answer in as a constant, so a
+ * reused statement is correct only while SQLite happens to recompile it on every run.
+ */
+function requireSynchronousFull(database: Database.Database, purpose: string): void {
+  database.pragma('synchronous = FULL');
+  if (synchronousLevel(database) !== 2n) throw new Error(`SQLite synchronous = FULL is not in effect for ${purpose}.`);
+}
+
+function synchronousLevel(database: Database.Database): bigint {
+  return BigInt(database.pragma('synchronous', { simple: true }) as number | bigint);
 }
 
 function executeTransaction(
@@ -820,9 +839,9 @@ function executeTransaction(
   return { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences };
 }
 
-/** Requests refused while a maintenance transaction is open: every other writer entry point. */
+/** Requests refused while a maintenance transaction is open: every other writer entry point, the durability checkpoint too. */
 const MAINTENANCE_EXCLUSIVE_WRITES: ReadonlySet<string> = new Set([
-  'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin'
+  'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin', 'durabilityCheckpoint'
 ]);
 
 /** Ids per page of a maintenance commit's aggregate check. */
@@ -874,15 +893,12 @@ function requireMaintenanceTransaction(open: MaintenanceTransaction | undefined)
  * transaction), so the commit is synced to disk when it returns. NORMAL again once it ends.
  */
 function beginMaintenanceTransaction(database: Database.Database): MaintenanceTransaction {
-  prepareCached(database, 'PRAGMA synchronous = FULL').run();
   try {
-    if (BigInt(prepareCached(database, 'PRAGMA synchronous', { rows: 'pluck' }).get() as number | bigint) !== 2n) {
-      throw new Error('SQLite synchronous = FULL is not in effect for a maintenance transaction.');
-    }
+    requireSynchronousFull(database, 'a maintenance transaction');
     beginMeasuredWrite(database);
   } catch (error) {
     if (database.inTransaction) database.exec('ROLLBACK');
-    prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+    database.pragma('synchronous = NORMAL');
     throw error;
   }
   try {
@@ -932,8 +948,8 @@ function commitMaintenanceTransaction(
     rollbackMaintenanceTransaction(database);
     throw error;
   }
-  prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
-  durableCommitCount += 1;
+  if (synchronousLevel(database) === 2n) durableCommitCount += 1;
+  database.pragma('synchronous = NORMAL');
   return { commitSeq: nextCommitSeq.toString(), snapshotRequired: true, allocatedSequences: open.allocatedSequences };
 }
 
@@ -941,13 +957,18 @@ function rollbackMaintenanceTransaction(database: Database.Database): void {
   try {
     if (database.inTransaction) database.exec('ROLLBACK');
   } finally {
-    prepareCached(database, 'PRAGMA synchronous = NORMAL').run();
+    database.pragma('synchronous = NORMAL');
   }
 }
 
-/** wal_checkpoint(TRUNCATE) on the writer: the WAL is written back and truncated when no reader holds it. */
-function truncateWal(database: Database.Database): RuntimeWalCheckpointResult {
-  const row = prepareCached(database, 'PRAGMA wal_checkpoint(TRUNCATE)').get() as { busy: number | bigint; log: number | bigint; checkpointed: number | bigint };
+/**
+ * wal_checkpoint on the writer, outside any transaction: the WAL is synced, the frames no reader
+ * still needs written back, and the database file synced once all are (`busy` 0, `checkpointed`
+ * equal to `log`). PASSIVE neither waits nor takes the writer lock; TRUNCATE waits for readers and
+ * writers (busy timeout) and also empties the WAL.
+ */
+function checkpointWal(database: Database.Database, mode: 'PASSIVE' | 'TRUNCATE'): RuntimeWalCheckpointResult {
+  const row = prepareCached(database, `PRAGMA wal_checkpoint(${mode})`).get() as { busy: number | bigint; log: number | bigint; checkpointed: number | bigint };
   return { busy: Number(row.busy), log: Number(row.log), checkpointed: Number(row.checkpointed) };
 }
 

@@ -112,6 +112,10 @@ interface RuntimeHostLivenessRecord {
   heartbeatAt: string;
 }
 
+/** See RuntimeDatabase.durabilityCheckpoint: attempts, and the pause between them (about 1 s in all). */
+const DURABILITY_CHECKPOINT_ATTEMPTS = 20;
+const DURABILITY_CHECKPOINT_RETRY_MS = 50;
+
 export class RuntimeDatabase {
   private readonly pending = new Map<number, {
     resolve(value: unknown): void;
@@ -301,6 +305,28 @@ export class RuntimeDatabase {
   public async maintenanceCheckpoint(): Promise<RuntimeWalCheckpointResult> {
     this.assertMaintenanceInstance();
     return this.request<RuntimeWalCheckpointResult>({ kind: 'maintenanceCheckpoint' });
+  }
+
+  /**
+   * Durability barrier for a record kept outside this database that says something in it is done:
+   * write that record only after this returned. Commits are synced only at a checkpoint
+   * (synchronous = NORMAL), so this runs wal_checkpoint(PASSIVE) outside any transaction: the WAL
+   * synced, then written back, and the database file synced once every frame is. Done only when every
+   * frame was written back (`busy` 0, `checkpointed` equal to `log`): every commit made before the call
+   * is on disk. PASSIVE never takes the writer lock nor waits, so another window's writes are not held
+   * up (FULL would hold them while it waits for readers, up to their own busy timeout); a reader that
+   * still needs an older state leaves frames behind, and after DURABILITY_CHECKPOINT_ATTEMPTS attempts
+   * this throws, it is never taken as done. A durable transaction with only assertions writes no WAL
+   * frame and is no such barrier. Refused while a maintenance transaction is open.
+   */
+  public async durabilityCheckpoint(): Promise<void> {
+    let result: RuntimeWalCheckpointResult | undefined;
+    for (let attempt = 0; attempt < DURABILITY_CHECKPOINT_ATTEMPTS; attempt += 1) {
+      if (attempt > 0) await new Promise((resolve) => setTimeout(resolve, DURABILITY_CHECKPOINT_RETRY_MS));
+      result = await this.request<RuntimeWalCheckpointResult>({ kind: 'durabilityCheckpoint' });
+      if (result.busy === 0 && result.checkpointed === result.log) return;
+    }
+    throw new Error(`历史库的改动没能全部写回磁盘（预写日志 ${result!.log} 帧，写回 ${result!.checkpointed} 帧；另一个窗口还在读旧的状态），稍后再试。`);
   }
 
   private assertMaintenanceInstance(): void {
@@ -1080,8 +1106,9 @@ function databaseMetricRequestKind(
   // The conversation pending-work probe, the domain row count and the carried-work inventory are one
   // fixed worker read snapshot each.
   if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows' || kind === 'relocatedWorkInventory') return 'snapshot';
-  // A maintenance transaction's requests are parts of one write transaction.
-  if (kind.startsWith('maintenance')) return 'transaction';
+  // A maintenance transaction's requests are parts of one write transaction; the durability
+  // checkpoint is the last step of the transactions before it.
+  if (kind.startsWith('maintenance') || kind === 'durabilityCheckpoint') return 'transaction';
   return kind as RuntimeDatabaseMetricRequestKind;
 }
 

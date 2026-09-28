@@ -67,6 +67,7 @@ test('维护事务：只在持有维护声明的维护实例上可用，打开�
       // are allocated across chunks as in one transaction, and only counted in the result.
       const [operation2, attempt2, request2, ...stream2] = aggregate('request_across_chunks');
       await database.maintenanceBegin();
+      assert.equal((await database.inspect()).synchronous, 2n, '第二次开始（上一笔提交失败回滚）同样是 FULL');
       await database.maintenanceAppend([conversation('conversation_across'), turn('conversation_across'), message('message_across_1')]);
       await database.maintenanceAppend([request2, message('message_across_2')]);
       await database.maintenanceAppend([operation2, attempt2]);
@@ -78,7 +79,7 @@ test('维护事务：只在持有维护声明的维护实例上可用，打开�
       const sequences = (await database.snapshot(['message_across_1', 'message_across_2'].map((id) => repo('CollaborationMessage').get(id)))).snapshot;
       assert.deepEqual(sequences.map((row) => row.message_seq), [1n, 2n], '跨块分配的序号连续');
       const inspected = await database.inspect();
-      assert.deepEqual([inspected.synchronous, inspected.durableCommitCount], [1n, 1], '提交落盘后回到 NORMAL');
+      assert.deepEqual([inspected.synchronous, inspected.durableCommitCount], [1n, 1], '提交落盘后回到 NORMAL（提交后读回 FULL 才计数）');
       const checkpoint = await database.maintenanceCheckpoint();
       assert.equal(checkpoint.busy, 0);
       assert.equal((await fs.stat(`${fixture.current.binding.paths.databasePath}-wal`)).size, 0, 'TRUNCATE 收回预写日志');
@@ -86,6 +87,7 @@ test('维护事务：只在持有维护声明的维护实例上可用，打开�
 
       // A copied stream fact needs its request copied by the same transaction: a committed one is not.
       await database.maintenanceBegin();
+      assert.equal((await database.inspect()).synchronous, 2n, '提交之后再开始仍是 FULL');
       await assert.rejects(database.maintenanceAppend([repo('ModelStreamCheckpoint').insertHistoricalCopy({
         id: 'request_across_chunks_checkpoint_9', model_request_id: 'request_across_chunks', attempt_seq: 1n, socket_generation: 0n,
         stream_seq: 9n, checkpoint_kind: 'output_delta', content_object_id: recipe.id, created_at: NOW
@@ -94,6 +96,7 @@ test('维护事务：只在持有维护声明的维护实例上可用，打开�
 
       // A failed chunk ends the whole transaction.
       await database.maintenanceBegin();
+      assert.equal((await database.inspect()).synchronous, 2n, '每次开始都是 FULL');
       await database.maintenanceAppend([conversation('conversation_rolled_back')]);
       await assert.rejects(database.maintenanceAppend([conversation('conversation_rolled_back')]), /UNIQUE/);
       await assert.rejects(database.maintenanceCommit(), /No maintenance transaction is open/);
@@ -127,6 +130,7 @@ test('维护事务（审查 #10）：打开期间 modelStreamEvent、modelStream
       const ids = Array.from({ length: 600 }, (_, index) => `request_${String(index).padStart(4, '0')}`);
       const broken = ids[599];
       await database.maintenanceBegin();
+      assert.equal((await database.inspect()).synchronous, 2n, '同一实例第二次开始仍是 FULL');
       for (let start = 0; start < ids.length; start += 50) {
         const steps = [];
         for (const [offset, id] of ids.slice(start, start + 50).entries()) {

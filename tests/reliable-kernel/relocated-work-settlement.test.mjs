@@ -966,7 +966,7 @@ test('父 Turn 在一个存活的窗口里运行：它还没送达的子 Agent �
     const { turnId, submissionId } = await waitForWorkerJson(worker, ready, 90_000);
     // Still alive (its process identity checks out), but it runs nothing while the settlement runs.
     await sleep(300);
-    worker.kill('SIGSTOP');
+    await reloc.stopOutsideWrites(worker, fixture.current.binding.paths.databasePath);
     const provider = countingProvider('settling');
     host = await openHost(dataRoot, provider, { label: 'settling' });
     const inventory = parseRelocatedWorkInventory(await host.app.database.relocatedWorkInventory());
@@ -1144,7 +1144,7 @@ test('不放行（live：绕过闸门的存活窗口在旧目录里跑着父 Tur
   t.after(async () => { worker.kill('SIGKILL'); await waitForExit(worker); });
   const { turnId, submissionId } = await waitForWorkerJson(worker, ready, 90_000);
   await sleep(300);
-  worker.kill('SIGSTOP');
+  await reloc.stopOutsideWrites(worker, fixture.current.binding.paths.databasePath);
   const provider = countingProvider('old-home');
   const first = await openOldHome(fixture, provider);
   await assertRefused(fixture, first, [
