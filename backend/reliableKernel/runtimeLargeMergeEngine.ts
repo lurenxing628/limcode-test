@@ -113,16 +113,19 @@ export type LargeMergeSettledReport = Pick<RuntimeDataSetMergeBatchResult, 'merg
 
 /**
  * Free space as the engine computes it: on the target's disk (the sources' databases, the largest
- * one's WAL peak and a margin; for an estimate also the online target backup and the content objects
- * copied into the target, which the preparation takes before the session), and in the temporary
- * directory (one private copy of the largest source at a time). A preparation's figures are the
- * ones the engine checks at the start of its session.
+ * one's WAL peak, the target's index pages and a margin; for an estimate also the online target
+ * backup and the content objects copied into the target, which the preparation takes before the
+ * session), in the temporary directory (one private copy of the largest source at a time) and in
+ * SQLite's temporary directory (its temporary files). A preparation's figures are the ones the
+ * engine checks at the start of its session.
  */
 export interface LargeMergeSpaceFacts {
   targetDirectory: string;
   targetBytes: number;
   temporaryDirectory: string;
   temporaryBytes: number;
+  sqliteTemporaryDirectory: string;
+  sqliteTemporaryBytes: number;
 }
 
 export interface LargeMergePreparation {
@@ -262,6 +265,15 @@ const STREAMED_MERGE_ENGINE: LargeMergeEngine = Object.freeze<LargeMergeEngine>(
       ...(input.signal ? { signal: input.signal } : {}),
       onProgress: (progress) => input.onProgress?.(describeEstimate(progress))
     });
+    // Settled without a session (merged, refused, or no longer above the online bound): no longer
+    // waiting, so the menu and the list stop offering it (a refused one shows its recorded reason).
+    if (!estimated.report.stopped) {
+      forgetWaiting(input.paths, [
+        ...estimated.report.merged.map((result) => result.candidateId),
+        ...[...estimated.report.blocked, ...estimated.report.failures].flatMap((issue) => (issue.candidateId !== undefined ? [issue.candidateId] : [])),
+        ...estimated.small
+      ]);
+    }
     const labels = await sourceLabels(input.paths, estimated.sources.map((source) => source.candidateId));
     return {
       sources: estimated.sources.map((source) => ({
@@ -336,6 +348,14 @@ const STREAMED_MERGE_ENGINE: LargeMergeEngine = Object.freeze<LargeMergeEngine>(
   }
 });
 
+function forgetWaiting(paths: { globalStoragePath: string }, candidateIds: readonly string[]): void {
+  const key = path.resolve(paths.globalStoragePath);
+  const known = waitingSources.get(key);
+  if (!known) return;
+  for (const candidateId of candidateIds) known.delete(candidateId);
+  if (known.size === 0) waitingSources.delete(key);
+}
+
 /**
  * One source's result of the engine's session as the session reports it: nothing new counts as
  * merged (alreadyMerged); the source a cancel rolled back is 'cancelled'; a source that never
@@ -400,7 +420,8 @@ function settledReport(
 function spaceFacts(space: LargeMergeSpaceFacts): LargeMergeSpaceFacts {
   return {
     targetDirectory: space.targetDirectory, targetBytes: space.targetBytes,
-    temporaryDirectory: space.temporaryDirectory, temporaryBytes: space.temporaryBytes
+    temporaryDirectory: space.temporaryDirectory, temporaryBytes: space.temporaryBytes,
+    sqliteTemporaryDirectory: space.sqliteTemporaryDirectory, sqliteTemporaryBytes: space.sqliteTemporaryBytes
   };
 }
 

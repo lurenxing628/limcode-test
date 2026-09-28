@@ -9,6 +9,7 @@ import type {
   LargeMergeDuration, LargeMergeEstimatedSource, LargeMergePreparedSource, LargeMergeRunProgress, LargeMergeSourceOutcome,
   LargeMergeSpaceFacts
 } from './runtimeLargeMergeEngine';
+import { largeMergeDiskNeeds, type LargeMergeDiskNeed, type LargeMergeDiskProbe } from './runtimeDataSetLargeMergeSpace';
 import { resolveVscodeRuntimeMergeLedgerRoot } from './vscodeRootAuthority';
 
 /**
@@ -56,23 +57,9 @@ export function largeMergeOperationKey(
 // Disk space
 // ---------------------------------------------------------------------------------------------
 
-/** What one directory's disk is and has free; unknown parts are left out. */
-export interface LargeMergeDiskProbe {
-  device?: number;
-  freeBytes?: number;
-}
+export type { LargeMergeDiskNeed, LargeMergeDiskProbe } from './runtimeDataSetLargeMergeSpace';
 
 export type LargeMergeDiskProber = (directory: string) => Promise<LargeMergeDiskProbe>;
-
-export interface LargeMergeDiskNeed {
-  /** User-facing, e.g. 当前历史库所在的盘. */
-  label: string;
-  path: string;
-  requiredBytes: number;
-  /** Absent when the free space cannot be read there (the write itself then fails cleanly). */
-  freeBytes?: number;
-  missingBytes: number;
-}
 
 export interface LargeMergeSpacePlan {
   ok: boolean;
@@ -83,42 +70,22 @@ export interface LargeMergeSpacePlan {
  * Space per disk for the session, checked before the prompt or the confirmation with the estimate's
  * figures (the preparation's target backup and copied content included), before the coordination
  * and again (fs.statfs) right before the exclusive phase closes this window's Runtime with the
- * figures the engine's own check at the session's start uses (the preparation's): the target's disk
- * needs targetBytes (its margin included), the temporary directory one private copy of the largest
- * source (temporaryBytes) plus LARGE_MERGE_SESSION.freeSpaceMarginBytes when it is another disk. A
- * disk used for both is checked once for their sum.
+ * figures the engine's own check at the session's start uses (the preparation's). The grouping is
+ * the engine's (largeMergeDiskNeeds, also what a batch checks before sources wait for a session):
+ * the target's disk needs targetBytes (its margin included), the temporary directory one private
+ * copy of the largest source and SQLite's temporary directory its temporary files, plus
+ * LARGE_MERGE_SESSION.freeSpaceMarginBytes once on a disk the target's is not. A disk used for
+ * several is checked once for their sum.
  */
 export async function planLargeMergeSpace(
   facts: LargeMergeSpaceFacts,
   probe: LargeMergeDiskProber = probeLargeMergeDisk
 ): Promise<LargeMergeSpacePlan> {
-  const target = await probe(facts.targetDirectory);
-  const temporary = await probe(facts.temporaryDirectory);
-  const needs = [
-    { probe: target, label: '当前历史库所在的盘', path: facts.targetDirectory, bytes: Math.max(0, facts.targetBytes), margin: false },
-    { probe: temporary, label: '临时目录', path: facts.temporaryDirectory, bytes: Math.max(0, facts.temporaryBytes), margin: true }
-  ];
-  const grouped = new Map<string, LargeMergeDiskNeed & { withMargin: boolean }>();
-  for (const need of needs) {
-    const key = need.probe.device === undefined ? `path:${need.path}` : `device:${need.probe.device}`;
-    const existing = grouped.get(key);
-    if (existing) {
-      existing.requiredBytes += need.bytes;
-      existing.label = `${existing.label}、${need.label}`;
-      // The target's figure already keeps a margin on this disk.
-      existing.withMargin = existing.withMargin && need.margin;
-      continue;
-    }
-    grouped.set(key, {
-      label: need.label, path: need.path, requiredBytes: need.bytes, withMargin: need.margin,
-      ...(need.probe.freeBytes !== undefined ? { freeBytes: need.probe.freeBytes } : {}),
-      missingBytes: 0
-    });
-  }
-  const disks = [...grouped.values()].map(({ withMargin, ...disk }) => {
-    const requiredBytes = disk.requiredBytes + (withMargin ? LARGE_MERGE_SESSION.freeSpaceMarginBytes : 0);
-    return { ...disk, requiredBytes, missingBytes: disk.freeBytes === undefined ? 0 : Math.max(0, requiredBytes - disk.freeBytes) };
-  });
+  const disks = largeMergeDiskNeeds(facts, {
+    target: await probe(facts.targetDirectory),
+    temporary: await probe(facts.temporaryDirectory),
+    sqliteTemporary: await probe(facts.sqliteTemporaryDirectory)
+  }, LARGE_MERGE_SESSION.freeSpaceMarginBytes);
   return { ok: disks.every((disk) => disk.missingBytes === 0), disks };
 }
 

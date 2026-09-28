@@ -37,7 +37,10 @@ import {
   type RuntimeLargeMergeTargetBackup
 } from './runtimeDataSetMergeLedger';
 import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
-import { estimatedTargetIndexBytes, largeMergeTargetBytes } from './runtimeDataSetLargeMergeSpace';
+import {
+  largeMergeDiskDevice, largeMergeDiskNeeds, largeMergeSessionSpace, sqliteTemporaryDirectory, type LargeMergeDiskNeed,
+  type LargeMergeSessionSpaceFacts
+} from './runtimeDataSetLargeMergeSpace';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
@@ -495,6 +498,8 @@ type Refusal = {
   tooLarge?: { rows: number; maxRows: number };
   /** Deferred until a large-merge session: the audited source size. */
   awaiting?: { rows: number; bytes: number };
+  /** Deferred until a large-merge session: what the session needs for it (see largeMergeSessionFits). */
+  space?: { databaseBytes: number; casCopyBytes: number };
 };
 
 type SourceOutcome =
@@ -575,6 +580,8 @@ export async function mergeHistoricalDataSetsOnline(
     }
     await options.onSourceStart?.(source.candidate ?? { id: source.id, ...(source.label ? { label: source.label } : {}) }, index, sources.length);
   };
+  // What a session needs for each source waiting for it (their figures, see largeMergeSessionFits).
+  const awaitingSpace: Array<Refusal['space']> = [];
   const settle = async (source: PickedSource, outcome: Exclude<SourceOutcome, { kind: 'stopped' }>): Promise<void> => {
     if (outcome.kind === 'merged' || outcome.kind === 'current') {
       const { result } = outcome;
@@ -586,6 +593,7 @@ export async function mergeHistoricalDataSetsOnline(
       candidateId: source.id, code: outcome.code, message: outcome.message, newly: true, requested: source.requested,
       ...(outcome.awaiting ? { size: outcome.awaiting } : {}), ...(source.label ? { label: source.label } : {})
     };
+    if (outcome.code === RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE) awaitingSpace.push(outcome.space);
     if (outcome.kind === 'deferred') report.deferred.push(issue);
     else {
       (outcome.kind === 'blocked' ? report.blocked : report.failures).push(issue);
@@ -614,9 +622,10 @@ export async function mergeHistoricalDataSetsOnline(
     else await settle(source, outcome);
   }
   // Only a session that can start takes them along: without the room it needs they are merged as ever.
+  // Its room as the estimate would judge it: every source it would take (these too), their files.
   const awaiting = report.deferred.filter((issue) => issue.code === RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE);
   const largeSession = awaiting.length > 0 && postponed.length > 0 && !stopped
-    && await largeMergeSessionFits(target, awaiting.map((issue) => issue.size?.bytes ?? 0), options).catch(() => true);
+    && await largeMergeSessionFits(target, [...awaitingSpace, ...postponed.map(({ outcome }) => outcome.space)], options).catch(() => true);
   for (const { source, index, outcome } of stopped ? [] : postponed) {
     if (largeSession) {
       await settle(source, { ...outcome, code: RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE });
@@ -639,33 +648,49 @@ export async function mergeHistoricalDataSetsOnline(
 }
 
 /**
- * Whether the large-merge session the waiting sources (their audited bytes) need has room now, by the
- * estimate's figures (largeMergeTargetBytes plus the preparation's backup of the target on the
- * target's disk, a private copy of the largest source in the temporary directory, each with the
- * margin). A disk whose free space cannot be read counts as having room.
+ * Whether the large-merge session of these sources (the ones waiting for it and the ones that would
+ * go along) has room now, by the figures its estimate would give (largeMergeSessionSpace, with the
+ * target's files and each source's files and copied content) and checked disk by disk as the window
+ * checks them before offering it (largeMergeDiskNeeds). A disk whose free space cannot be read, or a
+ * source whose figures are not known, counts as having room.
  */
 async function largeMergeSessionFits(
   target: TargetContext,
-  sourceBytes: readonly number[],
+  sources: ReadonlyArray<{ databaseBytes: number; casCopyBytes: number } | undefined>,
   options: Pick<RuntimeDataSetMergeOptions, 'freeSpace'>
 ): Promise<boolean> {
-  let targetDatabaseBytes = 0;
+  let targetFilesBytes = 0;
   for (const file of [target.binding.paths.databasePath, `${target.binding.paths.databasePath}-wal`]) {
-    targetDatabaseBytes += await fs.stat(file).then((info) => info.size, () => 0);
+    targetFilesBytes += await fs.stat(file).then((info) => info.size, () => 0);
   }
-  const sources = sourceBytes.map((databaseBytes) => ({ databaseBytes }));
-  const needs = new Map<string, number>([[target.controlRoot, targetDatabaseBytes
-    + largeMergeTargetBytes(sources, estimatedTargetIndexBytes(targetDatabaseBytes), BACKUP_FREE_SPACE_MARGIN_BYTES)]]);
-  const temporary = os.tmpdir();
-  const largest = Math.max(0, ...sourceBytes) + BACKUP_FREE_SPACE_MARGIN_BYTES;
-  const [targetDevice, temporaryDevice] = await Promise.all([target.controlRoot, temporary].map((directory) => fs.stat(directory).then((info) => info.dev, () => undefined)));
-  if (targetDevice !== undefined && targetDevice === temporaryDevice) needs.set(target.controlRoot, needs.get(target.controlRoot)! + largest);
-  else needs.set(temporary, largest);
-  for (const [directory, bytes] of needs) {
-    const free = await (options.freeSpace ?? freeSpace)(directory).catch(() => undefined);
-    if (free !== undefined && free < bytes) return false;
-  }
-  return true;
+  const space = largeMergeSessionSpace({
+    targetDirectory: target.controlRoot, targetFilesBytes,
+    sources: sources.map((source) => source ?? { databaseBytes: 0, casCopyBytes: 0 }),
+    marginBytes: BACKUP_FREE_SPACE_MARGIN_BYTES, temporaryDirectory: os.tmpdir(), sqliteTemporaryDirectory: await sqliteTemporaryDirectory()
+  });
+  return await largeMergeShortDisk(space, options) === undefined;
+}
+
+/**
+ * The first disk of a session's space without room for its part now (largeMergeDiskNeeds with this
+ * engine's margin, free space as `options.freeSpace` or statfs gives it); undefined when every disk
+ * has room or its free space cannot be read.
+ */
+async function largeMergeShortDisk(
+  space: LargeMergeSessionSpaceFacts,
+  options: Pick<RuntimeDataSetMergeOptions, 'freeSpace'>
+): Promise<LargeMergeDiskNeed | undefined> {
+  const probe = async (directory: string): Promise<{ device?: number; freeBytes?: number }> => {
+    const device = await largeMergeDiskDevice(directory);
+    const freeBytes = await (options.freeSpace ?? freeSpace)(directory).catch(() => undefined);
+    return { ...(device !== undefined ? { device } : {}), ...(freeBytes !== undefined ? { freeBytes } : {}) };
+  };
+  const needs = largeMergeDiskNeeds(space, {
+    target: await probe(space.targetDirectory),
+    temporary: await probe(space.temporaryDirectory),
+    sqliteTemporary: await probe(space.sqliteTemporaryDirectory)
+  }, BACKUP_FREE_SPACE_MARGIN_BYTES);
+  return needs.find((need) => need.missingBytes > 0);
 }
 
 /**
@@ -1511,8 +1536,14 @@ async function mergeSource(
     // this batch) is judged by its cached size, without being copied and audited again.
     const cached = await cachedAudit(paths, candidate, state);
     if (cached) {
-      assertMergeableSize(cached, options, state);
-      assertNotPostponed(cached, options, mode, state);
+      assertMergeableSize(cached, options, state, true);
+      // Work no merge can close refuses the source whatever its size, before it waits for anything
+      // (where nothing of it is left out: then the audit's work is what any merge of it meets).
+      if (mode.finalizeWork && cached.refusedWork.length > 0 && await leavesNothingOut(target, merged)) assertWorkFinalizable(cached.refusedWork, state);
+      await withSessionSpace(candidate, binding, target, cached, () => {
+        assertMergeableSize(cached, options, state);
+        assertNotPostponed(cached, options, mode, state);
+      });
     }
   }
   let taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options, paths);
@@ -1520,13 +1551,24 @@ async function mergeSource(
   try {
     // An earlier attempt may have ended before it counted what it closed: counted in this copy.
     if (state.finalized?.earlier) countFinalized(taken.snapshot.database, state.finalized);
-    if (!mode.migration) assertMergeableSize(taken.audit.size!, options, state);
-    assertNotPostponed(taken.audit.size!, options, mode, state);
+    if (!mode.migration) assertMergeableSize(taken.audit.size!, options, state, true);
     let work: UnfinishedWorkInspection | undefined;
     if (!mode.finalizeWork) assertCarriable(taken.audit.carriedWork!);
-    else {
+    else if (taken.audit.unfinishedWork!.refused.length > 0 && await leavesNothingOut(target, merged)) {
+      // Refused whatever its size: a source that would wait (for a large-merge session, or for the end
+      // of this batch) is recorded as refused now, as a smaller one is, not left waiting for a session
+      // that would only refuse it again. Only where nothing of it is left out (else the preparation
+      // judges the work that remains, see keptUnfinishedWork).
+      assertWorkFinalizable(taken.audit.unfinishedWork!.refused, state);
+    }
+    const audited = taken.audit.size!;
+    await withSessionSpace(candidate, binding, target, state.files !== undefined ? auditFacts(state.files, taken.audit) : undefined, () => {
+      if (!mode.migration) assertMergeableSize(audited, options, state);
+      assertNotPostponed(audited, options, mode, state);
+    });
+    if (mode.finalizeWork) {
       work = await keptUnfinishedWork(taken.snapshot.database, taken.audit.unfinishedWork!, () => skippedSourceRows(taken.snapshot.database, target, merged));
-      if (work.refused.length > 0) throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
+      assertWorkFinalizable(work.refused, state);
     }
     const limits = options.limits ?? RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
     stopIfAsked();
@@ -2417,6 +2459,53 @@ async function takeFinalized(
     const finalized = state.finalized ?? recorded;
     return { finalized: { turns: finalized.turns, intents: finalized.intents, sourceBackupPath: finalized.sourceBackupPath } };
   });
+}
+
+/**
+ * Runs the checks that may defer the source to a large-merge session; such a deferral carries what
+ * the session needs for it (its SQLite files, and its content the preparation copies into the target
+ * where it cannot link it: a foreign root's always, a local one's across disks).
+ */
+async function withSessionSpace(
+  candidate: HistoricalMergeCandidate,
+  binding: HistoricalRootBinding,
+  target: TargetContext,
+  facts: { databaseBytes: number; casBytes: number } | undefined,
+  check: () => void
+): Promise<void> {
+  try {
+    check();
+  } catch (error) {
+    if (!(error instanceof Outcome) || !error.outcome.awaiting || !facts) throw error;
+    let linked = false;
+    if (!isForeignCandidate(candidate)) {
+      const [source, into] = await Promise.all([binding.paths.casRootPath, target.binding.paths.casRootPath]
+        .map((directory) => fs.stat(directory).then((info) => info.dev, () => undefined)));
+      linked = source !== undefined && source === into;
+    }
+    error.outcome.space = { databaseBytes: facts.databaseBytes, casCopyBytes: linked ? 0 : facts.casBytes };
+    throw error;
+  }
+}
+
+/**
+ * Whether a merge of this source leaves nothing out: none of the conversations earlier merges of it
+ * inserted here was deleted here since (read from the target alone). Then its audit's unfinished work
+ * is exactly what a merge meets, without computing the left-out rows (keptUnfinishedWork).
+ */
+async function leavesNothingOut(target: TargetContext, merged: readonly string[]): Promise<boolean> {
+  const ids = [...new Set(merged)];
+  for (let start = 0; start < ids.length; start += READ_CHUNK) {
+    const chunk = ids.slice(start, start + READ_CHUNK);
+    const found = (await target.database.snapshot(chunk.map((id) => DOMAIN_REPOSITORIES.domain('Conversation').get(id)))).snapshot;
+    if (found.some((row) => row === null)) return false;
+  }
+  return true;
+}
+
+/** Work no merge can close (an audit's refused unfinished work): the source is refused (blocked). */
+function assertWorkFinalizable(refused: ReadonlyArray<{ label: string; count: number }>, state: SourceProgress): void {
+  if (refused.length > 0) throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(refused), state));
 }
 
 function unfinishedWorkOutcome(found: string, state: SourceProgress, afterFinalization = false): Refusal {
@@ -4021,7 +4110,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, assertNoCommitElsewhere, mergeRequestDone, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
-  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory, skippedRows
+  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory, largeMergeShortDisk, skippedRows
 });
 export type {
   PickedSource as HistoricalMergePickedSource, Refusal as HistoricalMergeRefusal, RowPlan as HistoricalMergeRowPlan, SourceRef as HistoricalMergeSourceRef,

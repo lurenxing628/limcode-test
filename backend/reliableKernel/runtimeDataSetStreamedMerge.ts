@@ -19,7 +19,8 @@ import {
 } from './runtimeDataSetMerge';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
-  estimatedTargetIndexBytes, LARGE_MERGE_WAL_PEAK_FACTOR, largeMergeTargetBytes
+  estimatedTargetIndexBytes, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
+  LARGE_MERGE_WAL_PEAK_FACTOR, sqliteTemporaryDirectory
 } from './runtimeDataSetLargeMergeSpace';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
 import { holdForeignHistoricalMergeSource } from './runtimeForeignHistoryMerge';
@@ -1010,6 +1011,10 @@ export interface LargeMergeSpace {
   temporaryDirectory: string;
   /** The largest source database with its WAL. */
   temporaryBytes: number;
+  /** Where this process's SQLite puts its temporary files (sqliteTemporaryDirectory()). */
+  sqliteTemporaryDirectory: string;
+  /** SQLite's temporary files: largeMergeSqliteTemporaryBytes of the largest source. */
+  sqliteTemporaryBytes: number;
 }
 
 export interface PreparedLargeMergeSource {
@@ -1137,7 +1142,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       }
       const outcome = await engine.runSourceAttempt<PreparedOutcome>(paths, target, candidateId, mode,
         (state) => prepareSource(paths, target, candidateId, mode, state, input, progress, internals)
-          .catch((error: unknown) => { throw diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并'); }),
+          .catch(async (error: unknown) => { throw await diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并', undefined, options); }),
         sourceInternals.state);
       if (outcome.kind === 'prepared') {
         prepared.push(picked.label ? { ...outcome.source, label: picked.label } : outcome.source);
@@ -1203,7 +1208,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     report: batch,
     small,
     ...(target.backup.path ? { backupPath: target.backup.path } : {}),
-    space: sessionSpace(target, prepared, internals.targetIndexBytes ?? 0),
+    space: await sessionSpace(target, prepared, internals.targetIndexBytes ?? 0),
     estimateMs,
     estimateRangeMs: estimateRange(estimateMs)
   };
@@ -1412,18 +1417,21 @@ function aboveThreshold(size: { rows: number; bytes: number }, threshold: 'in-me
   return size.rows > (options.sizeLimits?.transactionRows ?? RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS);
 }
 
-function sessionSpace(
+/** A preparation's space: the target backed up and its index pages measured, the content published already. */
+async function sessionSpace(
   target: HistoricalMergeTargetContext,
   sources: ReadonlyArray<{ databaseBytes: number }>,
   targetIndexBytes: number
-): LargeMergeSpace {
+): Promise<LargeMergeSpace> {
   const largest = sources.reduce((max, source) => Math.max(max, source.databaseBytes), 0);
   return {
     targetDirectory: target.controlRoot,
     targetBytes: largeMergeTargetBytes(sources, targetIndexBytes, engine.BACKUP_FREE_SPACE_MARGIN_BYTES),
     targetIndexBytes: sources.length === 0 ? 0 : targetIndexBytes,
     temporaryDirectory: os.tmpdir(),
-    temporaryBytes: largest
+    temporaryBytes: largest,
+    sqliteTemporaryDirectory: await sqliteTemporaryDirectory(),
+    sqliteTemporaryBytes: sources.length === 0 ? 0 : largeMergeSqliteTemporaryBytes(largest)
   };
 }
 
@@ -1600,7 +1608,7 @@ export async function estimateLargeMergeSources(input: EstimateLargeMergeInput):
   }, report, keepGoing);
   const estimated: LargeMergeEstimatedSource[] = [];
   const small: string[] = [];
-  let casCopyBytes = 0;
+  const spaceSources: Array<{ databaseBytes: number; casCopyBytes: number }> = [];
   const rate = sources.length > 0 ? await measuredSessionRate(paths) : undefined;
   for (const [index, picked] of sources.entries()) {
     if (!keepGoing()) break;
@@ -1634,30 +1642,34 @@ export async function estimateLargeMergeSources(input: EstimateLargeMergeInput):
       continue;
     }
     estimated.push(outcome.source);
-    casCopyBytes += outcome.casCopyBytes;
+    spaceSources.push({ databaseBytes: outcome.source.databaseBytes, casCopyBytes: outcome.casCopyBytes });
   }
   if (!keepGoing() || report.stopped) {
     // Stopped: nothing of it is offered.
     estimated.length = 0;
     small.length = 0;
-    casCopyBytes = 0;
+    spaceSources.length = 0;
   }
   const { pendingSources: _pending, ...batch } = report;
   const targetBackupBytes = estimated.length > 0 ? await sqliteFilesBytes(target.binding.paths.databasePath) : 0;
-  // Not measured before the preparation's backup of the target: its index pages at the share of its size.
-  const targetIndexBytes = estimatedTargetIndexBytes(targetBackupBytes);
+  const casCopyBytes = spaceSources.reduce((sum, source) => sum + source.casCopyBytes, 0);
   // The one online backup of the target the preparation takes (a copy's worth of reading and writing).
   const prepareEstimateMs = estimated.length === 0 ? 0
     : estimated.reduce((sum, source) => sum + source.prepareEstimateMs, 0) + Math.round(targetBackupBytes / PREPARE_COPY_BYTES_PER_MS);
   const sessionEstimateMs = estimated.reduce((sum, source) => sum + source.sessionEstimateMs, 0);
-  const space = sessionSpace(target, estimated, targetIndexBytes);
+  // The figures a batch checks before sources wait for a session (largeMergeSessionSpace): the target's
+  // index pages at their share of its files (the preparation measures them on its backup).
+  const space = largeMergeSessionSpace({
+    targetDirectory: target.controlRoot, targetFilesBytes: targetBackupBytes, sources: spaceSources,
+    marginBytes: engine.BACKUP_FREE_SPACE_MARGIN_BYTES, temporaryDirectory: os.tmpdir(), sqliteTemporaryDirectory: await sqliteTemporaryDirectory()
+  });
   return {
     sources: estimated,
     report: batch,
     small,
     space: {
       ...space,
-      targetBytes: estimated.length === 0 ? 0 : space.targetBytes + targetBackupBytes + casCopyBytes,
+      targetIndexBytes: estimated.length === 0 ? 0 : estimatedTargetIndexBytes(targetBackupBytes),
       targetBackupBytes, casCopyBytes
     },
     prepareEstimateMs,
@@ -1832,9 +1844,10 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
   };
   let backupSettled = false;
   try {
-    const free = await (options.freeSpace ?? engine.freeSpace)(preparation.space.targetDirectory).catch(() => undefined);
-    if (free !== undefined && free < preparation.space.targetBytes) {
-      return deferAll(DISK_FULL, `磁盘空间不足，需要约 ${Math.ceil(preparation.space.targetBytes / (1024 * 1024))} MB：合并较大的旧聊天记录要在 ${preparation.space.targetDirectory} 暂存数据`);
+    // Every disk the session writes to (the target's, the private copies', SQLite's temporary files'), as the window checked them.
+    const short = await engine.largeMergeShortDisk(preparation.space, options);
+    if (short) {
+      return deferAll(DISK_FULL, `磁盘空间不足，需要约 ${megabytes(short.requiredBytes)} MB：合并较大的旧聊天记录要在 ${short.path} 暂存数据`);
     }
     if (preparation.backupPath) {
       // The pre-merge backup the preparation took: still there, and from now on kept whatever happens to this window.
@@ -1878,7 +1891,7 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         const outcome = await engine.runSourceAttempt(paths, target, prepared.candidateId, mode,
           (state) => mergePreparedSource(paths, target, resolver, prepared, verified!, state, mode, options, input.signal,
             clock.source(index, prepared), preparation.space.targetIndexBytes)
-            .catch((error: unknown) => { throw diskFull(error, target.controlRoot, '合并这份旧聊天记录时', '已撤回这份的写入'); }),
+            .catch(async (error: unknown) => { throw await diskFull(error, target.controlRoot, '合并这份旧聊天记录时', '已撤回这份的写入', prepared, options); }),
           { ...sourceInternals.state });
         clock.sourceDone(prepared);
         const result = sourceResult(prepared.candidateId, outcome, internals.requested, prepared.label);
@@ -2127,9 +2140,11 @@ async function mergeLocked(
       }
       if (committed !== true) {
         const wal = await walBytes();
+        // Before anything is given back: a temporary directory full while the target's disk is not.
+        const temporary = isDiskFull(error) ? await fullTemporaryDirectory(target.controlRoot, prepared, options) : undefined;
         // The rolled-back transaction's WAL is given back to the disk.
         await target.database.maintenanceCheckpoint().catch(() => undefined);
-        throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal));
+        throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal), temporary);
       }
       // Its marker is there: the transaction committed, so it got to its commit and counted.
       streamed = written.counted!;
@@ -2178,9 +2193,16 @@ async function restoreReplaced(
 
 /**
  * A failed streamed transaction (rolled back): a refusal as it is, a cancellation, a full disk (with
- * the space `need`ed as measured, never the system's own text), anything else deferred.
+ * the space `need`ed as measured on the target's disk, or where a full temporary directory was and
+ * what it needs; never the system's own text), anything else deferred.
  */
-function streamFailure(error: unknown, prepared: PreparedLargeMergeSource, target: HistoricalMergeTargetContext, need: number): unknown {
+function streamFailure(
+  error: unknown,
+  prepared: PreparedLargeMergeSource,
+  target: HistoricalMergeTargetContext,
+  need: number,
+  temporary?: FullTemporaryDirectory
+): unknown {
   if (error instanceof engine.Outcome) return error;
   if (isAbort(error)) {
     return new engine.Outcome({ kind: 'deferred', code: RUNTIME_DATA_SET_MERGE_CANCELLED, message: '合并已取消，这份旧聊天记录没有合并（之前合并完的库保留）；以后可以再合并。' });
@@ -2188,7 +2210,9 @@ function streamFailure(error: unknown, prepared: PreparedLargeMergeSource, targe
   if (isDiskFull(error)) {
     return new engine.Outcome({
       kind: 'deferred', code: DISK_FULL,
-      message: `磁盘空间不足，需要约 ${megabytes(need)} MB：合并这份旧聊天记录要在 ${target.controlRoot} 暂存数据，已撤回这份的写入`
+      message: temporary
+        ? `磁盘空间不足，需要约 ${megabytes(temporary.needBytes)} MB：合并这份旧聊天记录要在${temporary.label}（${temporary.path}）暂存数据，已撤回这份的写入`
+        : `磁盘空间不足，需要约 ${megabytes(need)} MB：合并这份旧聊天记录要在 ${target.controlRoot} 暂存数据，已撤回这份的写入`
     });
   }
   return new engine.Outcome({ kind: 'deferred', code: engine.errorCode(error), message: `写入当前库时出错，稍后重试：${engine.errorMessage(error)}` });
@@ -2205,14 +2229,58 @@ function measuredNeed(prepared: PreparedLargeMergeSource, targetIndexBytes: numb
   return Math.ceil(Math.max(modelled, prepared.databaseBytes + projectedWal + engine.BACKUP_FREE_SPACE_MARGIN_BYTES));
 }
 
+interface FullTemporaryDirectory {
+  label: string;
+  path: string;
+  /** What a source needs there: its private copy (the temporary directory), SQLite's temporary files, a margin. */
+  needBytes: number;
+}
+
+/**
+ * Where a full disk that named no file (SQLite's own) most likely was when the target's disk still
+ * has room: SQLite's temporary directory or the private copies' (os.tmpdir()), whichever has less than
+ * the margin left. Undefined when the target's disk is nearly full too, or none of them is.
+ */
+async function fullTemporaryDirectory(
+  targetDirectory: string,
+  source: { databaseBytes: number },
+  options: Pick<LargeMergeEngineOptions, 'freeSpace'>
+): Promise<FullTemporaryDirectory | undefined> {
+  const margin = engine.BACKUP_FREE_SPACE_MARGIN_BYTES;
+  const free = (directory: string): Promise<number | undefined> => (options.freeSpace ?? engine.freeSpace)(directory).catch(() => undefined);
+  const targetFree = await free(targetDirectory);
+  if (targetFree === undefined || targetFree < margin) return undefined;
+  const sqlite = await sqliteTemporaryDirectory();
+  const copies = os.tmpdir();
+  const oneDisk = await largeMergeDiskDevice(sqlite).then(async (device) => device !== undefined && device === await largeMergeDiskDevice(copies));
+  const needs = {
+    sqlite: largeMergeSqliteTemporaryBytes(source.databaseBytes) + (oneDisk ? source.databaseBytes : 0),
+    copies: source.databaseBytes + (oneDisk ? largeMergeSqliteTemporaryBytes(source.databaseBytes) : 0)
+  };
+  for (const [directory, label, bytes] of [[sqlite, '数据库临时文件目录', needs.sqlite], [copies, '临时目录', needs.copies]] as const) {
+    const left = await free(directory);
+    if (left !== undefined && left < margin) return { label, path: directory, needBytes: bytes + margin };
+  }
+  return undefined;
+}
+
 /**
  * A full disk anywhere in a source's steps (ledger records, copies, the transaction) as the outcome a
- * session and a preparation stop at: said in Chinese with where, never with the system's own text.
+ * session and a preparation stop at: said in Chinese with where (the file's directory when the error
+ * names one, else a full temporary directory, else `directory`), never with the system's own text.
  * Anything else, and an outcome already decided, as it is.
  */
-function diskFull(error: unknown, directory: string, doing: string, undone: string): unknown {
+async function diskFull(
+  error: unknown,
+  directory: string,
+  doing: string,
+  undone: string,
+  source?: { databaseBytes: number },
+  options: Pick<LargeMergeEngineOptions, 'freeSpace'> = {}
+): Promise<unknown> {
   if (error instanceof engine.Outcome || !isDiskFull(error)) return error;
-  const where = engine.writtenDirectory(error, directory);
+  const named = engine.writtenDirectory(error, '');
+  const where = named !== '' ? named : (await fullTemporaryDirectory(directory, source ?? { databaseBytes: 0 }, options))?.path ?? directory;
   return new engine.Outcome({ kind: 'deferred', code: DISK_FULL, message: `磁盘空间不足：${doing}在 ${where} 写不下了，${undone}；腾出空间后会再合并` });
 }
 
