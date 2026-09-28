@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import { classifyRecordedProcess } from './runtimeClaimPrimitives';
 import { readRuntimeDataSetFacts, runtimeDataSetFileState } from './runtimeDataSetFacts';
 import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
 import { requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
@@ -206,6 +207,8 @@ export interface RuntimeDataSetMergePreparation {
   candidateId: string;
   token: string;
   processId: number;
+  /** The process's start identity where it can be read (ownProcessStartIdentity): a reused pid is not this process. */
+  processStartIdentity?: string;
   startedAt: string;
   heartbeatAt: string;
 }
@@ -905,7 +908,8 @@ export async function readRuntimeDataSetMergePreparation(
   }
   const entry = value as Partial<RuntimeDataSetMergePreparation> | null;
   if (entry?.kind !== PREPARATION_KIND || entry.candidateId !== candidateId || typeof entry.token !== 'string'
-    || !Number.isSafeInteger(entry.processId) || typeof entry.startedAt !== 'string' || typeof entry.heartbeatAt !== 'string') return undefined;
+    || !Number.isSafeInteger(entry.processId) || !optionalText(entry.processStartIdentity)
+    || typeof entry.startedAt !== 'string' || typeof entry.heartbeatAt !== 'string') return undefined;
   return entry as RuntimeDataSetMergePreparation;
 }
 
@@ -923,15 +927,14 @@ export async function removeRuntimeDataSetMergePreparation(paths: StoragePaths, 
 /** A preparation not refreshed for this long, or whose process is gone, may be taken over or removed. */
 export const RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS = 60_000;
 
-/** Whether a preparation's holder may still be working on it (fresh heartbeat, process present). */
+/**
+ * Whether a preparation's holder may still be working on it: a fresh heartbeat, and its process not
+ * proven gone (classifyRecordedProcess: no such pid, or a pid now used by another process as its
+ * start identity shows). A process whose state cannot be verified counts as there.
+ */
 export function isRuntimeDataSetMergePreparationLive(preparation: RuntimeDataSetMergePreparation, now = Date.now()): boolean {
   if (!(now - Date.parse(preparation.heartbeatAt) < RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS)) return false;
-  try {
-    process.kill(preparation.processId, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
+  return classifyRecordedProcess(preparation.processId, preparation.processStartIdentity) !== 'dead';
 }
 
 /** Removes preparations whose holder is gone (a crashed or closed window). Call inside configuration admission. */
@@ -959,6 +962,8 @@ export interface RuntimeLargeMergeTargetBackup {
   /** The backup directory, …/merge-backups/<name>. */
   backupPath: string;
   processId: number;
+  /** As a preparation's (RuntimeDataSetMergePreparation.processStartIdentity). */
+  processStartIdentity?: string;
   startedAt: string;
   heartbeatAt: string;
   /** A session started on it: kept as a pre-merge backup whatever happens to its window. */
@@ -991,6 +996,7 @@ export async function readRuntimeLargeMergeTargetBackups(
     const entry = value as Partial<RuntimeLargeMergeTargetBackup> | null;
     const valid = entry?.kind === TARGET_BACKUP_KIND && typeof entry.name === 'string' && fileName(entry.name) === file
       && typeof entry.backupPath === 'string' && path.isAbsolute(entry.backupPath) && Number.isSafeInteger(entry.processId)
+      && optionalText(entry.processStartIdentity)
       && typeof entry.startedAt === 'string' && typeof entry.heartbeatAt === 'string' && typeof entry.used === 'boolean';
     return valid ? { file, backup: entry as RuntimeLargeMergeTargetBackup } : { file };
   });
@@ -1000,15 +1006,18 @@ export async function removeRuntimeLargeMergeTargetBackupFile(paths: StoragePath
   await removeLedgerFile(paths, TARGET_BACKUPS, file);
 }
 
-/** Whether the window that registered a target backup may still use it (process present, heard from within a day). */
+/**
+ * Whether the window that registered a target backup may still use it: heard from within a day, and
+ * its process not proven gone (as isRuntimeDataSetMergePreparationLive).
+ */
 export function isRuntimeLargeMergeTargetBackupLive(backup: RuntimeLargeMergeTargetBackup, now = Date.now()): boolean {
   if (!(now - Date.parse(backup.heartbeatAt) < RUNTIME_LARGE_MERGE_TARGET_BACKUP_STALE_MS)) return false;
-  try {
-    process.kill(backup.processId, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
-  }
+  return classifyRecordedProcess(backup.processId, backup.processStartIdentity) !== 'dead';
+}
+
+/** Absent, or a non-empty text. */
+function optionalText(value: unknown): boolean {
+  return value === undefined || (typeof value === 'string' && value.length > 0);
 }
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;

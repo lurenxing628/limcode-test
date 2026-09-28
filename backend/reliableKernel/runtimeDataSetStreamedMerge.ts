@@ -24,6 +24,7 @@ import {
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
 import { holdForeignHistoricalMergeSource } from './runtimeForeignHistoryMerge';
 import { locateLocalRuntimeDataSet, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
+import { ownProcessStartIdentity } from './runtimeClaimPrimitives';
 import {
   readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeCommit,
   removeRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeRequest, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
@@ -170,7 +171,9 @@ export type LargeMergeFaultPoint =
   /** Session: committed durably, the WAL not yet checkpointed. */
   | 'after-commit'
   /** Session: checkpointed (TRUNCATE), the merged record not yet written. */
-  | 'before-merged-record';
+  | 'before-merged-record'
+  /** Preparation: a heartbeat found a preparation record still this window's, not yet written (detail.candidateId). */
+  | 'preparation-heartbeat';
 
 export interface LargeMergeFaultDetail {
   candidateId?: string;
@@ -185,6 +188,8 @@ export interface LargeMergeEngineOptions extends Omit<RuntimeDataSetMergeOptions
   onFaultPoint?(point: LargeMergeFaultPoint, detail?: LargeMergeFaultDetail): void | Promise<void>;
   /** Heap limits of the private maintenance worker. */
   workerResourceLimits?: ResourceLimits;
+  /** Tests: the preparation's heartbeat interval (PREPARATION_HEARTBEAT_MS). */
+  heartbeatMs?: number;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -694,8 +699,15 @@ class PreparationClaims {
   /** The preparation's target backup while registered (RuntimeLargeMergeTargetBackup); its writes go one after another. */
   private backup: Omit<RuntimeLargeMergeTargetBackup, 'kind' | 'heartbeatAt'> | undefined;
   private backupWrites: Promise<void> = Promise.resolve();
+  private refreshing = false;
+  /** This process's start identity where it can be read: a record naming a reused pid is not this window's. */
+  private readonly identity = ownProcessStartIdentity();
 
-  public constructor(private readonly paths: { globalStoragePath: string }) {}
+  public constructor(
+    private readonly paths: { globalStoragePath: string },
+    private readonly heartbeatMs: number = PREPARATION_HEARTBEAT_MS,
+    private readonly fault?: LargeMergeEngineOptions['onFaultPoint']
+  ) {}
 
   /** False while another live window prepares or holds the source. */
   public async claim(candidateId: string): Promise<boolean> {
@@ -705,7 +717,8 @@ class PreparationClaims {
       if (current && current.token !== mine?.token && isRuntimeDataSetMergePreparationLive(current)) return false;
       const claim = mine ?? { token: randomUUID(), startedAt: new Date().toISOString() };
       await writeRuntimeDataSetMergePreparation(this.paths, {
-        candidateId, token: claim.token, processId: process.pid, startedAt: claim.startedAt, heartbeatAt: new Date().toISOString()
+        candidateId, token: claim.token, processId: process.pid, ...this.processIdentity(),
+        startedAt: claim.startedAt, heartbeatAt: new Date().toISOString()
       });
       this.held.set(candidateId, claim);
       this.startHeartbeat();
@@ -737,7 +750,9 @@ class PreparationClaims {
    */
   public async registerBackup(root: string): Promise<void> {
     if (this.backup && this.backup.backupPath !== root) await this.releaseBackup();
-    this.backup = { name: path.basename(root), backupPath: root, processId: process.pid, startedAt: new Date().toISOString(), used: false };
+    this.backup = {
+      name: path.basename(root), backupPath: root, processId: process.pid, ...this.processIdentity(), startedAt: new Date().toISOString(), used: false
+    };
     try {
       await this.persistBackup();
     } catch (error) {
@@ -784,7 +799,7 @@ class PreparationClaims {
 
   private startHeartbeat(): void {
     if (this.timer) return;
-    this.timer = setInterval(() => { void this.refresh(); }, PREPARATION_HEARTBEAT_MS);
+    this.timer = setInterval(() => { void this.refresh(); }, this.heartbeatMs);
     this.timer.unref?.();
   }
 
@@ -793,14 +808,36 @@ class PreparationClaims {
     this.timer = undefined;
   }
 
-  /** Refreshed without the admission (it can be held for minutes): only while the record is still ours. */
+  /**
+   * Only while the record is still ours, checked and written under the configuration admission (a
+   * release or another window's claim, both under it, cannot come in between: a record released or
+   * taken over is never written back). The beat waits for the admission (another window, or this
+   * window's own session, may hold it for minutes) and refreshes as soon as the holder lets go
+   * (another window judges the record stale only under the same admission); meanwhile no other beat
+   * starts.
+   */
   private async refresh(): Promise<void> {
-    for (const [candidateId, claim] of this.held) {
-      const current = await readRuntimeDataSetMergePreparation(this.paths, candidateId).catch(() => undefined);
-      if (current?.token !== claim.token) continue;
-      await writeRuntimeDataSetMergePreparation(this.paths, { ...current, heartbeatAt: new Date().toISOString() }).catch(() => undefined);
+    if (this.refreshing) return;
+    this.refreshing = true;
+    try {
+      if (this.held.size > 0) {
+        await withRuntimeDataRootAdmission(this.paths.globalStoragePath, async () => {
+          for (const [candidateId, claim] of this.held) {
+            const current = await readRuntimeDataSetMergePreparation(this.paths, candidateId).catch(() => undefined);
+            if (current?.token !== claim.token) continue;
+            await this.fault?.('preparation-heartbeat', { candidateId });
+            await writeRuntimeDataSetMergePreparation(this.paths, { ...current, heartbeatAt: new Date().toISOString() }).catch(() => undefined);
+          }
+        }).catch(() => undefined);
+      }
+      if (this.backup) await this.persistBackup().catch(() => undefined);
+    } finally {
+      this.refreshing = false;
     }
-    if (this.backup) await this.persistBackup().catch(() => undefined);
+  }
+
+  private processIdentity(): { processStartIdentity?: string } {
+    return this.identity !== undefined ? { processStartIdentity: this.identity } : {};
   }
 }
 
@@ -960,7 +997,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     await withRuntimeDataRootAdmission(paths.globalStoragePath, () => engine.pruneMergePreparations(paths)).catch(() => undefined);
   }
   const internals: PreparationInternals = {
-    claims: new PreparationClaims(paths), pickedAt, requested, options, sources: new Map(), released: false
+    claims: new PreparationClaims(paths, options.heartbeatMs, options.onFaultPoint), pickedAt, requested, options, sources: new Map(), released: false
   };
   const prepared: PreparedLargeMergeSource[] = [];
   const small: string[] = [];
