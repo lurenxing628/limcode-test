@@ -1756,7 +1756,11 @@ async function estimateSource(
   if (fingerprint === undefined) throw new Error('The audit of this source gave no fingerprint.');
   engine.assertMergeableSize(facts, options, state, true);
   if (!aboveThreshold(facts, input.threshold ?? 'in-memory', options)) return { kind: 'small' };
-  if (facts.refusedWork.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(facts.refusedWork), state));
+  // Refused as a batch refuses it: only where nothing of it is left out (else the preparation judges
+  // the work that remains once the rows of conversations deleted here are left out).
+  if (facts.refusedWork.length > 0 && await engine.leavesNothingOut(target, await engine.recordedConversations(paths, target, candidate))) {
+    throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(facts.refusedWork), state));
+  }
   // Linked when both content stores are on one disk (a copy only across disks or where links fail);
   // a foreign root's objects are always copied.
   const foreign = engine.isForeignCandidate(candidate);

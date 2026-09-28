@@ -4121,7 +4121,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, assertNoCommitElsewhere, mergeRequestDone, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
-  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory, largeMergeShortDisk, skippedRows
+  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory, largeMergeShortDisk, skippedRows, leavesNothingOut
 });
 export type {
   PickedSource as HistoricalMergePickedSource, Refusal as HistoricalMergeRefusal, RowPlan as HistoricalMergeRowPlan, SourceRef as HistoricalMergeSourceRef,
