@@ -41,7 +41,8 @@ import {
 } from './runtimeHostControl';
 import type { LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import {
-  readRuntimeDeletedConversations, readRuntimeMergeTargetIdentities, RuntimeMergeRecordUnreadableError
+  findRuntimeIdentityOwner, readRuntimeDeletedConversations, readRuntimeIdentityAliases, readRuntimeMergeTargetIdentities,
+  RuntimeMergeRecordUnreadableError
 } from './runtimeMergeTombstones';
 import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet,
@@ -1522,14 +1523,22 @@ async function resolveSource(
   if (sameRuntimeDataSetIdentity(target.identity, candidate)) {
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-same-identity', message: '来源与当前历史库是同一个数据集，不能合并。' });
   }
-  // An identity the current data set continues (a data-root relocation carried its content into it) is
-  // an old copy of it. A migration merging it into its continuation again is exactly what it continues.
-  if (!mode.migration && (await continuedIdentities(withRoot())).some((identity) => sameRuntimeDataSetIdentity(identity, candidate))) {
-    throw new Outcome({
-      kind: 'blocked', code: 'runtime-data-set-merge-continued-identity',
-      message: '这个历史库是当前历史库迁移数据目录之前的那一份（当前库延续了它），不合并：同一个库的两份不能都并进当前库，两边的内容都没有改动。'
-        + '需要时可以在“历史与存储管理”里切换过去查看。'
-    });
+  // An identity a local data set continues (a data-root relocation carried its content into it under a
+  // new identity) is an old copy of that data set: of the current one, or of another local one. A
+  // migration merging it into its continuation again is exactly what it continues.
+  if (!mode.migration) {
+    const owner = await localOwnerOf(withRoot(), (await inspectVscodeRuntimeDataSets(paths)).candidates.filter((local) => local.id !== candidate.id),
+      { dataSetId: candidate.dataSetId, rootInstanceId: candidate.rootInstanceId }, false);
+    if (owner) {
+      throw new Outcome({
+        kind: 'blocked', code: 'runtime-data-set-merge-continued-identity',
+        message: owner.current
+          ? '这个历史库是当前历史库迁移数据目录之前的那一份（当前库延续了它），不合并：同一个库的两份不能都并进当前库，两边的内容都没有改动。'
+            + '需要时可以在“历史与存储管理”里切换过去查看。'
+          : `这个历史库是${owner.name}迁移数据目录之前的那一份（那个库延续了它），不合并：同一个库的两份不能都并进当前库，两边的内容都没有改动。`
+            + '需要时可以在“历史与存储管理”里切换过去查看。'
+      });
+    }
   }
   // Without a claim this is an early answer only; the commit checks it again under the claims.
   await assertSourceIdle(candidate);
@@ -1564,9 +1573,10 @@ async function resolveSource(
 
 /**
  * A foreign root located strictly again under its hold (pointer, epoch manifest, current epoch, every
- * Host proven gone, nothing unfinished), never one with the identity of a local data set or of one the
- * current data set continues: that is an old copy of it, which backup cleanup judges by coverage
- * instead. While a local data set cannot be read that cannot be ruled out, so the merge waits.
+ * Host proven gone, nothing unfinished), never one with the identity of a local data set or of one a local
+ * data set (the current one or another) continues: that is an old copy of it, which backup cleanup judges
+ * by coverage instead. While a local data set or its continuations cannot be read that cannot be ruled
+ * out, so the merge waits.
  */
 async function resolveForeignSource(
   paths: { globalStoragePath: string },
@@ -1579,14 +1589,11 @@ async function resolveForeignSource(
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '外来历史库的身份已变化，本次不合并。' });
   }
   const inspection = await inspectVscodeRuntimeDataSets(paths);
-  const continued = await continuedIdentities(target);
-  const same = (identity: { dataSetId?: string; rootInstanceId?: string }): boolean => sameRuntimeDataSetIdentity(candidate, identity);
-  const twin = inspection.candidates.find(same);
-  const local = same(target.identity) || continued.some(same) ? '当前历史库' : twin && `历史库“${runtimeDataSetReadableName(twin)}”`;
-  if (local !== undefined) {
+  const owner = await localOwnerOf(target, inspection.candidates, { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! }, true);
+  if (owner) {
     throw new Outcome({
       kind: 'blocked', code: 'runtime-data-set-merge-foreign-old-copy',
-      message: `这个外来历史库是${local}${!same(target.identity) && continued.some(same) ? '（迁移数据目录之前的那一份）' : ''}的旧拷贝（同一个库的另一份），不合并：同一个库的两份不能都并进当前库，`
+      message: `这个外来历史库是${owner.name}${owner.continued ? '（迁移数据目录之前的那一份）' : ''}的旧拷贝（同一个库的另一份），不合并：同一个库的两份不能都并进当前库，`
         + '两边的内容都没有改动。它的对话如果都已在那个库里，可以在“清理备份”里按覆盖核对后删除；需要时也可以在“外来历史库”里只读查看它。'
     });
   }
@@ -1600,26 +1607,56 @@ async function resolveForeignSource(
 }
 
 /**
- * The identities the target continues (runtimeMergeTombstones), read under its configuration root.
- * Unreadable: nothing may be merged into it until they can be read (records of what not to bring back).
+ * Whose old copy a source identity is (findRuntimeIdentityOwner): the target's own identity or one it
+ * continues first, then another local data set's (`locals`, the target among them or not); `exact`
+ * false: continuations only. Continuations that cannot be read defer the merge, naming whose they are.
  */
-async function continuedIdentities(target: Pick<TargetContext, 'identity' | 'configurationRootPath'>): Promise<RuntimeDataSetIdentity[]> {
-  return (await mergeTargetIdentities(target)).slice(1);
+async function localOwnerOf(
+  target: Pick<TargetContext, 'identity' | 'configurationRootPath'>,
+  locals: readonly VscodeRuntimeDataSetCandidate[],
+  identity: RuntimeDataSetIdentity,
+  exact: boolean
+): Promise<{ current: boolean; continued: boolean; name: string } | undefined> {
+  const current: { dataSetId?: string; rootInstanceId?: string; local?: VscodeRuntimeDataSetCandidate } = {
+    dataSetId: target.identity.dataSetId, rootInstanceId: target.identity.rootInstanceId
+  };
+  const others = locals.filter((local) => !sameRuntimeDataSetIdentity(target.identity, local)).map((local) => ({
+    dataSetId: local.dataSetId, rootInstanceId: local.rootInstanceId, local
+  }));
+  const found = await findRuntimeIdentityOwner(target.configurationRootPath, [current, ...others], identity, {
+    exact,
+    unreadable: (owner, error) => {
+      throw new Outcome({
+        kind: 'deferred', code: error.code,
+        message: `${owner.local ? `本地历史库“${runtimeDataSetReadableName(owner.local)}”` : '当前库'}的身份延续记录读不出（${error.message}），`
+          + '无法确认这个来源不是它的旧拷贝，这次不合并，两边的内容都没有改动；以后会自动重试。'
+      });
+    }
+  });
+  if (!found) return undefined;
+  const { owner, continued } = found;
+  return owner.local
+    ? { current: false, continued, name: `历史库“${runtimeDataSetReadableName(owner.local)}”` }
+    : { current: true, continued, name: '当前历史库' };
 }
 
+/**
+ * The target and the identities it continues (runtimeMergeTombstones), read under its configuration root.
+ * Unreadable: nothing may be merged into it until they can be read (records of what not to bring back).
+ */
 async function mergeTargetIdentities(target: Pick<TargetContext, 'identity' | 'configurationRootPath'>): Promise<RuntimeDataSetIdentity[]> {
   return mergeRecordsReadable(() => readRuntimeMergeTargetIdentities(target.configurationRootPath, target.identity));
 }
 
 /** A deleted-conversation record or an identity continuation that cannot be read defers the merge. */
-async function mergeRecordsReadable<T>(read: () => Promise<T>): Promise<T> {
+async function mergeRecordsReadable<T>(read: () => Promise<T>, what = '当前库的删除记录'): Promise<T> {
   try {
     return await read();
   } catch (error) {
     if (!(error instanceof RuntimeMergeRecordUnreadableError)) throw error;
     throw new Outcome({
       kind: 'deferred', code: error.code,
-      message: `当前库的删除记录读不出（${error.message}），为免把你删掉的对话合并回来，这次不合并，两边的内容都没有改动；以后会自动重试。`
+      message: `${what}读不出（${error.message}），为免把你删掉的对话合并回来，这次不合并，两边的内容都没有改动；以后会自动重试。`
     });
   }
 }
@@ -2211,21 +2248,34 @@ async function transferSourceCas(
  * same source incarnation inserted into the target or into an identity it continues (any record of
  * that incarnation: a local data set's, a foreign copy's, what a record of a later incarnation under
  * the same candidate id kept), and every conversation the user deleted there (runtimeMergeTombstones).
- * Records that cannot be read defer the merge.
+ * A local source is its own identity and every one it continues (read under its configuration root,
+ * `paths`): what merges of those inserted counts too. Records that cannot be read defer the merge.
  */
 async function recordedConversations(
-  _paths: { globalStoragePath: string },
+  paths: { globalStoragePath: string },
   target: Pick<TargetContext, 'identity' | 'configurationRootPath'>,
   candidate: HistoricalMergeCandidate
 ): Promise<string[]> {
   const targets = await mergeTargetIdentities(target);
-  const source = { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
+  const sources = await sourceIdentities(paths, candidate);
   const merged = new Set<string>();
   for (const record of (await readRuntimeDataSetMergeLedger({ globalStoragePath: target.configurationRootPath })).values()) {
-    for (const id of runtimeDataSetConversationsMergedFrom(record, source, targets)) merged.add(id);
+    for (const source of sources) for (const id of runtimeDataSetConversationsMergedFrom(record, source, targets)) merged.add(id);
   }
   for (const id of await mergeRecordsReadable(() => readRuntimeDeletedConversations(target.configurationRootPath, targets))) merged.add(id);
   return [...merged];
+}
+
+/**
+ * A source's identity and, for a local data set, every identity it continues (a data-root relocation
+ * carried it here under a new identity). A foreign root's continuations live in its own configuration
+ * root, never read here: it is only its own identity.
+ */
+async function sourceIdentities(paths: { globalStoragePath: string }, candidate: HistoricalMergeCandidate): Promise<RuntimeDataSetIdentity[]> {
+  const own = { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
+  if (isForeignCandidate(candidate)) return [own];
+  const continues = await mergeRecordsReadable(() => readRuntimeIdentityAliases(paths.globalStoragePath, own), '这个历史库的身份延续记录');
+  return [own, ...continues.map(({ dataSetId, rootInstanceId }) => ({ dataSetId, rootInstanceId }))];
 }
 
 /** The source as it is now: a local data set resolved again, or a foreign root located again under its hold. */

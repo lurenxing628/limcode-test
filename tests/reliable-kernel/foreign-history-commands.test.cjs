@@ -366,11 +366,15 @@ test('合并状态：已合并（时间）并提示在“清理备份”里按�
   assert.equal(f.calls.filter((call) => call[0] === 'merge-states').length, 2, '每次回到列表都重新读合并状态');
 });
 
-test('当前库延续的旧身份的拷贝标为当前库的旧拷贝；合并时跳过了删掉的对话的，列表不再说可以在清理备份里删除', async () => {
+test('本地库（当前库或其它本地库）延续的旧身份的拷贝标为那个库的旧拷贝；合并时跳过了删掉的对话的，列表不再说可以在清理备份里删除', async () => {
   const continued = entry({ sameAsLocal: { candidateId: 'default', selected: true, name: '当前历史库', continued: true } });
   const skipped = entry({ id: 'foreign:archive:4444444444444444', name: '20260904-010203-004-abcdef12' });
+  const other = entry({
+    id: 'foreign:archive:5555555555555555', name: '20260905-010203-004-abcdef12',
+    sameAsLocal: { candidateId: 'workspace:folder-0123456789abcdef', selected: false, name: 'alpha', continued: true }
+  });
   const f = fixture({
-    entries: [continued, skipped],
+    entries: [continued, skipped, other],
     mergeStates: [['foreign:archive:4444444444444444', { state: 'merged', mergedAt: '2026-09-27T08:09:10.000Z', intoCurrent: true, changedSinceMerge: false, skippedConversations: 2 }]],
     picks: [undefined]
   });
@@ -380,6 +384,8 @@ test('当前库延续的旧身份的拷贝标为当前库的旧拷贝；合并�
   assert.match(items[0].detail, /只读；它是当前历史库（迁移数据目录之前的那一份）的旧拷贝，不合并/);
   assert.match(items[1].detail, /只读；已合并进当前库 · （跳过了 2 个删掉的对话，清理备份会保留这份。）/);
   assert.doesNotMatch(items[1].detail, CLEANUP, '清理备份会保留它，不再提示可以按覆盖删除');
+  assert.equal(items[2].label, '归档 · 20260905-010203-004-abcdef12（历史库“alpha”（迁移数据目录之前的那一份）的旧拷贝）');
+  assert.match(items[2].detail, /只读；它是历史库“alpha”（迁移数据目录之前的那一份）的旧拷贝，不合并/);
 });
 
 test('有未结束任务的外来库：列表写明原因、不说可以合并；合并入口写明暂不能合并，点开说明原因，不写请求，仍可只读查看', async () => {

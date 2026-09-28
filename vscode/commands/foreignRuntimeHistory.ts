@@ -230,13 +230,13 @@ async function mergeIntoCurrent(
 }
 
 /**
- * Whose old copy a verified entry is (same data set incarnation as a local data set, or one the current
- * data set continues), by a readable name, if it is one.
+ * Whose old copy a verified entry is (same data set incarnation as a local data set, or one a local data
+ * set continues), by a readable name, if it is one.
  */
 function oldCopyOf(entry: ForeignRuntimeHistoryEntry): string | undefined {
   const local = entry.sameAsLocal;
   if (!local) return undefined;
-  return local.selected ? `当前历史库${local.continued ? '（迁移数据目录之前的那一份）' : ''}` : `历史库“${local.name ?? '另一个本地库'}”`;
+  return `${local.selected ? '当前历史库' : `历史库“${local.name ?? '另一个本地库'}”`}${local.continued ? '（迁移数据目录之前的那一份）' : ''}`;
 }
 
 /** Interrupted work a merge would first have to finish (never finished in a foreign directory). */

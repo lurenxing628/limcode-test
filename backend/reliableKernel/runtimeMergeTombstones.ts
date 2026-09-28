@@ -175,6 +175,41 @@ export async function readRuntimeMergeTargetIdentities(
   return result;
 }
 
+/**
+ * The local data set an identity belongs to: every local data set (the current one and the others of
+ * this configuration root) owns its own identity and each identity it continues (a data-root relocation
+ * gives the data sets it carries new identities and records the old ones here), so a copy of any of them
+ * is an old copy of that data set. The first of `locals` with exactly this identity wins (unless `exact`
+ * is false), else the first that continues it: order `locals` by precedence. Continuations that cannot be
+ * read throw (RuntimeMergeRecordUnreadableError) unless `unreadable` handles them (returning: none).
+ */
+export async function findRuntimeIdentityOwner<T extends { dataSetId?: string; rootInstanceId?: string }>(
+  configurationRootPath: string,
+  locals: readonly T[],
+  identity: RuntimeMergeIdentity,
+  options: { exact?: boolean; unreadable?(local: T, error: RuntimeMergeRecordUnreadableError): void } = {}
+): Promise<{ owner: T; continued: boolean } | undefined> {
+  const same = (other: { dataSetId?: string; rootInstanceId?: string }): boolean =>
+    other.dataSetId === identity.dataSetId && other.rootInstanceId === identity.rootInstanceId;
+  if (options.exact !== false) {
+    const owner = locals.find(same);
+    if (owner) return { owner, continued: false };
+  }
+  for (const local of locals) {
+    if (!local.dataSetId || !local.rootInstanceId) continue;
+    let continues: RuntimeIdentityContinuation[];
+    try {
+      continues = await readRuntimeIdentityAliases(configurationRootPath, { dataSetId: local.dataSetId, rootInstanceId: local.rootInstanceId });
+    } catch (error) {
+      if (!(error instanceof RuntimeMergeRecordUnreadableError) || !options.unreadable) throw error;
+      options.unreadable(local, error);
+      continue;
+    }
+    if (continues.some(same)) return { owner: local, continued: true };
+  }
+  return undefined;
+}
+
 /** `<dataSetId>.<rootInstanceId>`: the name of an identity's records. */
 export function runtimeMergeIdentityName(identity: RuntimeMergeIdentity): string {
   return identityName(identity);
