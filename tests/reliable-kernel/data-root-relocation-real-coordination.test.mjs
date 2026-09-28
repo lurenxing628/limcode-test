@@ -337,9 +337,15 @@ test('迁移在合并时失败、撤销又没做完（放回设置时 EPERM）�
   assert.equal(status.dataRootPath, fixture.root, '指针没有切换');
   assert.equal(status.pendingRelocation?.targetRootPath, target, '进行中记录留给下次启动');
   const markerFile = path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE);
-  // A staging record is undone without an 'undoing' mark first (the undo only deletes and renames back).
-  assert.equal(JSON.parse(await fs.readFile(markerFile, 'utf8')).state, 'staging');
+  // The undo of a staging record marks it 'undoing' first: the relocation failed and is being undone.
+  assert.equal(JSON.parse(await fs.readFile(markerFile, 'utf8')).state, 'undoing');
   assert.notDeepEqual(await treeSnapshot(path.join(target, 'settings')), settingsBefore, '前提：设置确实没放回');
+  // Another window starting now (the relocating process still lives): not "正在迁移数据目录", but what is true.
+  ui.calls.length = 0;
+  assert.equal(await commands.beforeDataRootOpen(context(storage)), undefined, `不等“迁移完成”，照常打开原来的目录：${trace()}`);
+  const warning = ui.calls.find(([kind]) => kind === 'warning');
+  assert.match(warning?.[1] ?? '', /迁移数据目录没有成功，它在新目录（.*）里的改动正在撤销或还没有撤销完；这里照常打开原来的数据目录/, trace());
+  assert.doesNotMatch(JSON.stringify(ui.calls), /正在迁移数据目录/);
 
   // The next startup is a new process: the one that ran the relocation has ended.
   const statusFile = path.join(storage, globalStatus.LIMCODE_GLOBAL_STATUS_FILE);

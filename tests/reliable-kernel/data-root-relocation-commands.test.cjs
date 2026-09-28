@@ -769,17 +769,18 @@ test('盲审 #9：另一个窗口上次的迁移失败、撤销没做完（发�
   const moving = fixture({ pendingRelocation: pending, ownerState: 'alive' });
   assert.equal(await moving.commands.beforeDataRootOpen(moving.context), '正在迁移数据目录，完成后自动打开');
   assert.deepEqual(warnings(moving), []);
-  // Failed, its undo not finished: nothing to wait for; warned; never undone under its live process.
+  // Failed, being undone or its undo not finished (an undo marks a staging record 'undoing' too): nothing to wait for; warned; never undone under its live process.
   marker('undoing');
   const undoing = fixture({ pendingRelocation: pending, ownerState: 'alive' });
   assert.equal(await undoing.commands.beforeDataRootOpen(undoing.context), undefined);
   assert.ok(!undoing.kinds().includes('recover'));
-  assert.deepEqual(warnings(undoing), [`Limcode test：另一个 LimCode 窗口上次迁移数据目录没有成功，新目录（${target}）里的改动还没有撤销完；关闭或重载那个窗口后会自动处理。`]);
+  assert.deepEqual(warnings(undoing), [`Limcode test：另一个 LimCode 窗口迁移数据目录没有成功，它在新目录（${target}）里的改动正在撤销或还没有撤销完；`
+    + '这里照常打开原来的数据目录；如果那个窗口的撤销停下了，关闭或重载那个窗口后会自动处理。']);
   const command = fixture({ pendingRelocation: pending, ownerState: 'alive' });
   await command.commands.relocateDataRoot(command.context, command.startup, command.request);
   assert.ok(!command.kinds().includes('open-dialog'));
-  assert.equal(command.prompts[0].title, '上次的迁移还没有撤销完');
-  assert.match(JSON.stringify(command.prompts[0]), /另一个 LimCode 窗口上次迁移数据目录没有成功.*在那个窗口里再点一次“迁移数据目录”/);
+  assert.equal(command.prompts[0].title, '上次的迁移没有成功，还没有撤销完');
+  assert.match(JSON.stringify(command.prompts[0]), /另一个 LimCode 窗口迁移数据目录没有成功.*正在撤销或还没有撤销完；等它撤销完之后才能开始新的迁移；如果撤销停下了，在那个窗口里再点一次“迁移数据目录”/);
   // Its record already gone but the copy it renamed aside still beside the target: not undone either.
   fs.rmSync(markerPath);
   const aside = fixture({ pendingRelocation: pending, ownerState: 'alive', copyAside: `${target}.limcode-copied-1` });
@@ -906,6 +907,14 @@ test('补充 E 打开带着迁走任务的旧目录（moved-work）：三选一�
 
   const later = await offer('暂不打开');
   assert.ok(!later.kinds().includes('consent') && !later.kinds().includes('status') && !later.kinds().includes('command'), '暂不打开：什么都不做');
+});
+
+test('最后一轮 #4 这个目录里那次没成功的迁移正在撤销（relocation-undoing）：只给“重试”，说明撤销完成之后就能打开', async () => {
+  const message = '数据目录暂时不能打开：里面有一次没有成功的数据迁移，发起它的 LimCode 窗口正在撤销它在这里的改动';
+  const f = fixture({ host: false, recoveryChoice: '重试' });
+  await f.commands.offerDataRootRecovery(f.context, f.startup, message, 'relocation-undoing');
+  assert.deepEqual(f.calls.find((call) => call[0] === 'error').slice(1), [`${message}\n\n撤销完成之后就能打开，请稍后重试。`, '重试']);
+  assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
 });
 
 test('补充 E 发起安装“回到旧目录”：确认那一步就算同意，旧目录里带走的任务在打开时直接收尾；提示里写明；别的安装的标记或别的迁移不算', async () => {

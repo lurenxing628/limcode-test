@@ -85,8 +85,8 @@ export async function relocateDataRoot(context: vscode.ExtensionContext, startup
     if (!isOwnPending(status.pendingRelocation) || relocationRunning) {
       // Another window's relocation that failed and whose undo did not finish moves nothing: say so.
       if (!relocationRunning && await relocationPhase(status.pendingRelocation) === 'unfinished') {
-        await tell(ask, '上次的迁移还没有撤销完', [
-          `${unfinishedElsewhere(status.pendingRelocation)}在那个窗口里再点一次“迁移数据目录”，或关闭、重载那个窗口后会自动处理，之后才能开始新的迁移。`
+        await tell(ask, '上次的迁移没有成功，还没有撤销完', [
+          `${unfinishedElsewhere(status.pendingRelocation)}等它撤销完之后才能开始新的迁移；如果撤销停下了，在那个窗口里再点一次“迁移数据目录”，或关闭、重载那个窗口后会自动处理。`
         ]);
         return;
       }
@@ -606,9 +606,10 @@ export async function offerDataRootRecovery(
   message: string,
   reason?: DataRootUnavailableReason
 ): Promise<void> {
-  if (reason === 'unreadable' || reason === 'relocating') {
-    // Temporary: the drive answers slowly, or a relocation into this directory is running.
-    const note = reason === 'relocating' ? '迁移完成或撤销之后就能打开，请稍后重试。' : '这通常是暂时的（网络盘或外置盘响应慢），请稍后重试。';
+  if (reason === 'unreadable' || reason === 'relocating' || reason === 'relocation-undoing') {
+    // Temporary: the drive answers slowly, or a relocation into this directory is running or being undone.
+    const note = reason === 'relocating' ? '迁移完成或撤销之后就能打开，请稍后重试。'
+      : reason === 'relocation-undoing' ? '撤销完成之后就能打开，请稍后重试。' : '这通常是暂时的（网络盘或外置盘响应慢），请稍后重试。';
     const retry = await vscode.window.showErrorMessage(`${message}\n\n${note}`, '重试');
     if (retry === '重试') await reloadWindow();
     return;
@@ -898,16 +899,17 @@ export async function beforeDataRootOpen(context: vscode.ExtensionContext): Prom
   const phase = await relocationPhase(pending);
   if (owner === 'alive' && phase === 'running') return '正在迁移数据目录，完成后自动打开';
   if (phase === 'unfinished') {
-    void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${unfinishedElsewhere(pending)}关闭或重载那个窗口后会自动处理。`);
+    void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${unfinishedElsewhere(pending)}这里照常打开原来的数据目录；如果那个窗口的撤销停下了，关闭或重载那个窗口后会自动处理。`);
   }
   return undefined;
 }
 
 /**
  * A relocation recorded as in progress (by a live or unknown process): still moving data
- * ('running'; also before its record in the target was written), or failed with its undo not
- * finished ('unfinished': its record in the target says 'undoing' or 'held', or the copied data it
- * renamed aside is still beside the target). 'unknown' when the target's record cannot be read.
+ * ('running'; also before its record in the target was written), or failed and being undone or
+ * with its undo not finished ('unfinished': its record in the target says 'undoing' (written when an
+ * undo starts) or 'held', or the copied data it renamed aside is still beside the target).
+ * 'unknown' when the target's record cannot be read.
  */
 async function relocationPhase(pending: PendingDataRootRelocation): Promise<'running' | 'unfinished' | 'unknown'> {
   let marker: { relocationId?: unknown; state?: unknown } | undefined;
@@ -926,7 +928,7 @@ async function relocationPhase(pending: PendingDataRootRelocation): Promise<'run
 }
 
 function unfinishedElsewhere(pending: PendingDataRootRelocation): string {
-  return `另一个 LimCode 窗口上次迁移数据目录没有成功，新目录（${pending.targetRootPath}）里的改动还没有撤销完；`;
+  return `另一个 LimCode 窗口迁移数据目录没有成功，它在新目录（${pending.targetRootPath}）里的改动正在撤销或还没有撤销完；`;
 }
 
 /**

@@ -218,10 +218,11 @@ test('X3 撤销到一半（undoing）而发起进程还在：下一次迁移不�
   const plan = await planWithRuntime(fixture, target);
   assert.equal(plan.undoesEarlierAttempt, false);
   assert.equal(plan.target.kind, 'invalid');
-  assert.match(plan.target.message, /正在向这个目录迁移数据/);
+  // Not "migrating into it": that relocation failed and its live process undoes it (or its undo stopped).
+  assert.match(plan.target.message, /迁移没有成功，正在撤销它在这里的改动（或撤销停下了、还没做完）/);
   const source = await openRuntime(fixture.current);
   try {
-    await assert.rejects(stageDataRootRelocation(plan, source), (error) => error?.code === 'data-root-relocation-precondition' && /正在向这个目录迁移数据/.test(error.message));
+    await assert.rejects(stageDataRootRelocation(plan, source), (error) => error?.code === 'data-root-relocation-precondition' && /迁移没有成功，正在撤销/.test(error.message));
   } finally { await source.close(); }
   assert.equal((await markerOf(target)).state, 'undoing');
   assert.equal(await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8'), settings);

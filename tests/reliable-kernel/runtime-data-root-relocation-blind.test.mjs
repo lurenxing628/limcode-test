@@ -25,7 +25,7 @@ const fsp = require('node:fs/promises');
 const here = path.dirname(fileURLToPath(import.meta.url));
 const {
   abandonStagedDataRootRelocation, completeDataRootRelocation, dataRootRelocationCleanupState, DATA_ROOT_RELOCATION_MARKER_FILE,
-  findDataRootRelocationCopy, finalizeDataRootRelocation, planDataRootRelocation, planOldDataRootDeletion, readDataRootMovedNotice,
+  findDataRootRelocationCopy, finalizeDataRootRelocation, inspectDataRootForReturn, planDataRootRelocation, planOldDataRootDeletion, readDataRootMovedNotice,
   recoverInterruptedDataRootRelocation, consentToDataRootMovedWork, recordDataRootMovedWorkSettled, settleDataRootRelocationBeforeOpen, stageDataRootRelocation,
   undoUnpublishedDataRootRelocation
 } = relocation;
@@ -239,6 +239,60 @@ test('盲审 3（exp5）新目录所在的盘写满：完成记录写不进去�
   await abandonStagedDataRootRelocation(staged, { pointerUnchanged: true });
   full.on = false;
   assert.equal(await exists(target), false);
+});
+
+test('最后一轮 #4 撤销没生效的迁移时先记下“撤销中”：打开或迁到这个目录的人看到的是“正在撤销”，不是“正在迁移”；写不进去（磁盘满）也照样撤销，腾出空间后补记', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'undoing');
+  const staged = await stage(fixture, target);
+  assert.equal((await markerOf(target)).state, 'staging');
+  // The disk is full until the undo's first step frees space (its first removal inside the target;
+  // the admission's files beside it do not count); the undo pauses at its second step.
+  const full = { on: true, steps: 0, refused: 0 };
+  let resume;
+  const paused = new Promise((resolve) => { resume = resolve; });
+  let reached;
+  const atPause = new Promise((resolve) => { reached = resolve; });
+  const open = fsp.open;
+  const rm = fsp.rm;
+  fsp.open = async function (file, flags, ...rest) {
+    if (full.on && typeof file === 'string' && path.basename(file).startsWith(`${DATA_ROOT_RELOCATION_MARKER_FILE}.`) && /w/.test(String(flags))) {
+      full.refused += 1;
+      throw Object.assign(new Error(`ENOSPC: no space left on device, open '${file}'`), { code: 'ENOSPC' });
+    }
+    return open.call(this, file, flags, ...rest);
+  };
+  fsp.rm = async function (file, ...rest) {
+    if (typeof file === 'string' && file.startsWith(`${target}${path.sep}`) && !path.basename(file).startsWith(`${DATA_ROOT_RELOCATION_MARKER_FILE}.`)) {
+      full.steps += 1;
+      if (full.steps === 1) full.on = false;
+      if (full.steps === 2) { reached(); await paused; }
+    }
+    return rm.call(this, file, ...rest);
+  };
+  t.after(() => { fsp.open = open; fsp.rm = rm; });
+  const undo = abandonStagedDataRootRelocation(staged, { pointerUnchanged: true });
+  await atPause;
+  assert.equal(full.refused > 0, true, '撤销开始时确实写不进“撤销中”');
+  assert.equal((await markerOf(target)).state, 'undoing', '磁盘满时先撤销，腾出空间后补记“撤销中”');
+  const planned = await planWithRuntime(fixture, target);
+  assert.match(planned.problems.join(''), /迁移没有成功，正在撤销它在这里的改动/);
+  // Its LimCode data is already gone at this step: whatever else it says, never "a relocation is running".
+  assert.doesNotMatch(JSON.stringify(await inspectDataRootForReturn(target)), /正在迁移|正在向这个目录迁移数据/);
+  resume();
+  await undo;
+  assert.equal(await exists(target), false, '撤销照常做完');
+
+  // Being undone while its process lives (here: this one): an opener is told so, not "a relocation is running".
+  const again = await stage(fixture, target);
+  await fs.writeFile(path.join(target, DATA_ROOT_RELOCATION_MARKER_FILE), JSON.stringify({ ...(await markerOf(target)), state: 'undoing' }));
+  const inspected = await inspectDataRootForReturn(target);
+  assert.equal(inspected.usable, false);
+  assert.match(inspected.message, /有一次没有成功的数据迁移，发起它的 LimCode 窗口正在撤销它在这里的改动/);
+  await assert.rejects(settleDataRootRelocationBeforeOpen(target), (error) => error.reason === 'relocation-undoing'
+    && /有一次没有成功的数据迁移，发起它的 LimCode 窗口正在撤销它在这里的改动/.test(error.message));
+  await abandonStagedDataRootRelocation(again, { pointerUnchanged: true });
+  assert.equal(await exists(target), false, '接着撤销完');
 });
 
 test('盲审 3 撤销的最后一步（写回迁移前的记录）遇到磁盘满：说明新建的内容已删掉、只差写回记录，腾出空间后再放弃即可完成', async (t) => {
