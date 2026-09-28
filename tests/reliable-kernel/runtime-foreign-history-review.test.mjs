@@ -399,7 +399,7 @@ test('当前库的旧拷贝要求 dataSetId 与 rootInstanceId 都相同：同�
   finally { database.close(); }
   const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home });
   assert.equal(entryAt(report, same)?.status, 'verified', entryAt(report, same)?.reason);
-  assert.deepEqual(entryAt(report, same).sameAsLocal, { candidateId: 'default', selected: true });
+  assert.deepEqual(entryAt(report, same).sameAsLocal, { candidateId: 'default', selected: true, name: '当前历史库' });
   const changed = entryAt(report, other);
   assert.equal(changed?.status, 'verified', changed?.reason);
   assert.equal(changed.dataSetId, context.current.binding.dataSetId);
