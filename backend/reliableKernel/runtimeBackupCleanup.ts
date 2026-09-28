@@ -2,6 +2,8 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { promisify } from 'node:util';
+import { gunzip, gzip } from 'node:zlib';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { DATA_ROOT_BACKUPS_DIR } from '../capabilities/vscodeStorage/constants';
 import {
@@ -16,12 +18,15 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 import { comparable } from './runtimeDataSetBulkCopy';
 import {
   readRuntimeBackupFacts, readRuntimeCopyFacts, readRuntimeDataSetFacts, RUNTIME_HISTORY_RECORD_DOMAINS, runtimeDataSetFileState,
-  type RuntimeDataSetHistoryIds
+  type RuntimeDataSetContentBodies, type RuntimeDataSetHistoryIds
 } from './runtimeDataSetFacts';
 import {
   BACKUP_NAME as MERGE_BACKUP_NAME, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY
 } from './runtimeDataSetMerge';
-import { isReadableRuntimeDataSetFingerprint, readRuntimeDataSetMergeLedger, runtimeDataSetFingerprint } from './runtimeDataSetMergeLedger';
+import {
+  isReadableRuntimeDataSetFingerprint, isRuntimeLargeMergeTargetBackupLive, readRuntimeDataSetMergeLedger,
+  readRuntimeLargeMergeTargetBackups, runtimeDataSetFingerprint
+} from './runtimeDataSetMergeLedger';
 import {
   MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
   RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE
@@ -66,11 +71,14 @@ import {
  * the old-format backups/ of a control root and .limcode-data-backups are only listed. Planning reads
  * the copies without claims (settling leftovers and copying another data set take theirs; the window
  * runs it as a write command, like the deletion); deletion re-verifies under configuration admission
- * and the control root's maintenance (publishing 清理备份 to waiting windows), renames the copy to
- * `<name>.deleting-<id>`, checks the coverage once more (deleting a Conversation or a message takes no
- * claim) and only then marks it verified (for this configuration root) and removes it. A leftover of
- * a crash is removed by the next cleanup only when this configuration root verified it; otherwise it
- * gets its name back and is checked again. Symbolic links are never followed.
+ * and the control root's maintenance (publishing 清理备份 to waiting windows), compares the directory
+ * once more as the last step before renaming it to `<name>.deleting-<id>`, checks the coverage and the
+ * directory once more (deleting a Conversation or a message takes no claim) and only then marks it
+ * verified (for this configuration root) and removes it. A leftover of a crash is removed by the next
+ * cleanup when this installation verified it (from this configuration root, or from a data directory
+ * it left: never given its name back half removed); otherwise it gets its name back and is checked
+ * again. Symbolic links are never followed. A pre-merge backup a large-merge preparation registered
+ * (preparing-backups/) stays while registered and unused, and never anchors the newest one kept.
  *
  * POSIX lock rule: the current data set is read only through its own worker reader (`snapshot`);
  * its files are never opened or closed by this process, and neither is any copy or other data set
@@ -214,7 +222,9 @@ const VERIFIED_MARKER_FILE = '.limcode-backup-cleanup-verified';
 const VERIFIED_MARKER_KIND = 'limcode-backup-cleanup-verified';
 const EPOCH_BACKUP_NAME = /^[0-9TZ-]+-[a-f0-9]{8}$/;
 const COVERAGE_DIRECTORY = 'coverage';
-const COVERAGE_KIND = 'limcode-runtime-backup-coverage-history-2';
+const COVERAGE_KIND = 'limcode-runtime-backup-coverage-history-3';
+const gzipAsync = promisify(gzip);
+const gunzipAsync = promisify(gunzip);
 const FINALIZATIONS_DIRECTORY = 'finalizations';
 const CURRENT_LABEL = '当前库';
 /** Whose database files a hard link is, when it is not the open data set's (never named by its id, which no one sees). */
@@ -320,6 +330,13 @@ interface LocalFacts {
   projectNames: readonly string[];
 }
 
+/**
+ * What a deletion checks again in the open data set (see recheckInCurrent): the copy's Conversations
+ * and what it shows. Nothing else of its ids is kept once it is listed (other rows are deleted only
+ * with their Conversation, bodies never; another data set is checked by its file state).
+ */
+type RecheckIds = Pick<RuntimeDataSetHistoryIds, 'conversations' | 'visibleMessages'>;
+
 interface LocalDataSet {
   candidate: VscodeRuntimeDataSetCandidate;
   binding: HistoricalRootBinding;
@@ -375,6 +392,13 @@ interface LedgerFacts {
   recordsUnreadable: boolean;
   finalizationBackups: ReadonlySet<string>;
   finalizationsUnreadable: boolean;
+  /**
+   * Target backups of a large-merge preparation (preparing-backups/, RuntimeLargeMergeTargetBackup)
+   * that a preparation or its session may still use (the registration is live) or that no session
+   * used yet (the merge removes those itself): by directory and by name. Neither deleted nor an anchor.
+   */
+  preparingBackups: { paths: ReadonlySet<string>; names: ReadonlySet<string>; live: ReadonlySet<string> };
+  preparingUnreadable: boolean;
 }
 
 /** Everything a deletion re-verifies; kept in this process only, never shown or serialized. */
@@ -383,11 +407,14 @@ interface BackupProof {
   kind: DeletableKind;
   controlRootPath: string;
   candidateId: string;
-  tree: string;
+  /** The directory as listed: compared in full when verified again, and shallowly right before and after the rename. */
+  tree: TreeFacts;
   binding: HistoricalRootBinding;
   current: boolean;
-  backupIds: RuntimeDataSetHistoryIds;
-  local?: LocalFacts;
+  /** Proven by the open data set: what is read again there. */
+  recheck?: RecheckIds;
+  /** Proven by another data set: its files as they were read. */
+  localFiles?: string;
   /** Visible messages of the copy already deleted or replaced there when it was listed (ticked knowingly). */
   replaced: ReadonlySet<string>;
 }
@@ -414,12 +441,28 @@ interface ForeignProof {
   contentDigest?: string;
   /** The local data set it is proven against (with its name), and its files as they were read (not the open one's). */
   by: { candidateId: string; binding: HistoricalRootBinding; current: boolean; name: string; files?: string };
-  /** Every id that must stay covered: its own (coverage) and those of the backups it keeps. */
-  ids: RuntimeDataSetHistoryIds;
+  /** Proven by the open data set: what is read again there (its own and those of the backups it keeps). */
+  recheck?: RecheckIds;
   /** Visible messages already deleted or replaced in that data set when it was listed (ticked knowingly). */
   replaced: ReadonlySet<string>;
   /** A data set of a copied directory: that directory (told when no data set is left in it). */
   copiedDirectory?: string;
+}
+
+/** A refusal of the whole check or deletion, already in words for the user (anything else is described by the caller, see its log). */
+export class RuntimeBackupCleanupError extends Error {
+  public constructor(message: string) {
+    super(message);
+    this.name = 'RuntimeBackupCleanupError';
+  }
+}
+
+/** Local time to the minute, as every time of 清理备份 and the foreign history list is shown. */
+export function formatLocalTime(value: string | number): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value);
+  const pad = (part: number) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
 }
 
 const PROOFS = new WeakMap<RuntimeBackupCleanupPlan, ReadonlyMap<string, BackupProof>>();
@@ -447,7 +490,13 @@ export async function planRuntimeBackupCleanup(
   report('正在列出历史库…');
   let { roots, databaseFiles } = await listControlRoots(configurationRootPath, current, problem);
   report('正在收尾上次没有删完的备份…');
-  const leftovers = await settleInterruptedDeletions(configurationRootPath, roots, problem, { previousDataRootPaths, databaseFiles });
+  let leftovers: { finished: string[]; restored: string[] } = { finished: [], restored: [] };
+  try {
+    leftovers = await settleInterruptedDeletions(configurationRootPath, roots, problem, { previousDataRootPaths, databaseFiles });
+  } catch (error) {
+    // Only what is left of an earlier cleanup: the next check tries again; this one goes on.
+    problem('上次没有删完的备份这次没有收尾，下次检查时再试。', error);
+  }
   if (leftovers.restored.length > 0) ({ roots, databaseFiles } = await listControlRoots(configurationRootPath, current, () => undefined));
   const ledger = await readLedgerFacts(configurationRootPath);
   const items: RuntimeBackupCleanupItem[] = [];
@@ -518,11 +567,12 @@ export async function planRuntimeBackupCleanup(
  * configuration admission and its control root's maintenance (published as 清理备份 to waiting
  * windows): the copy is exactly as listed and is not a hard link of a local database, the local
  * data set has the same identity and generation, no operation is in progress, the newest pre-merge
- * backup stays, and its history is still covered (nothing visible replaced beyond what was ticked).
- * After the rename the coverage is checked once more; a copy that is no longer covered gets its name
- * back. Anything else keeps the copy. A foreign root is verified and marked under the admission and
- * its own foreign claim, taken without waiting (see markForeignRoot), and removed after the admission
- * is released, under the claim alone.
+ * backup stays, and its history is still covered (nothing visible replaced beyond what was ticked);
+ * right before the rename its directory is compared once more (the same directory, not a link put in
+ * its place, with the same entries). After the rename the coverage and the directory are checked once
+ * more; a copy that fails either gets its name back. Anything else keeps the copy. A foreign root is
+ * verified and marked under the admission and its own foreign claim, taken without waiting (see
+ * markForeignRoot), and removed after the admission is released, under the claim alone.
  */
 export async function deleteRuntimeBackups(
   plan: RuntimeBackupCleanupPlan,
@@ -532,7 +582,7 @@ export async function deleteRuntimeBackups(
 ): Promise<RuntimeBackupCleanupResult> {
   const proofs = PROOFS.get(plan);
   const foreignProofs = FOREIGN_PROOFS.get(plan);
-  if (!proofs || !foreignProofs) throw new Error('这份备份清单不是本窗口刚才核对的结果，请重新检查。');
+  if (!proofs || !foreignProofs) throw new RuntimeBackupCleanupError('这份备份清单不是本窗口刚才核对的结果，请重新检查。');
   const configurationRootPath = plan.configurationRootPath;
   const now = options.now ?? Date.now;
   const result: RuntimeBackupCleanupResult = { deleted: [], kept: [], unfinished: [], copiedDirectoriesWithoutDataSets: [] };
@@ -592,11 +642,15 @@ export async function deleteRuntimeBackups(
               keep('没有删除', errorMessage(error));
               continue;
             }
+            // The last step before the rename (its coverage was read again meanwhile): the same directory
+            // (not a link put in its place), with the same entries in the same state.
+            if (!await sameShallowTree(entry.path, proof.tree)) { keep('列出之后这份备份有变化，请重新检查；这一项没有删除'); continue; }
             const outcome = await removeBackupDirectory(entry.path, {
               configurationRootPath,
               afterRename: () => options.onFaultPoint?.('after-rename', proof.item.key),
               afterVerify: () => options.onFaultPoint?.('after-verify', proof.item.key),
-              stillCovered: () => stillCovered(root, proof, current)
+              stillCovered: async (deleting) => await stillCovered(root, proof, current)
+                ?? (await sameShallowTree(deleting, proof.tree) ? undefined : '改名前后这份备份有变化，请重新检查')
             });
             if (outcome.state === 'deleted') {
               result.deleted.push({
@@ -712,10 +766,15 @@ async function listControlRoots(
   };
   add(configurationRootPath);
   const scopes = path.join(configurationRootPath, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
-  for (const name of await readDirectoryNames(scopes)) {
-    const scope = path.join(scopes, name);
-    const info = await lstatOrUndefined(scope);
-    if (info?.isDirectory()) add(scope);
+  try {
+    for (const name of await readDirectoryNames(scopes)) {
+      const scope = path.join(scopes, name);
+      const info = await lstatOrUndefined(scope);
+      if (info?.isDirectory()) add(scope);
+    }
+  } catch (error) {
+    // Every backup there stays: none of them is listed, so none can be deleted.
+    problem('工作区历史库所在的目录无法读取，其中的备份没有列出，都按历史保留。', error);
   }
   let inspection: Awaited<ReturnType<typeof inspectVscodeRuntimeDataSets>> | undefined;
   try {
@@ -776,8 +835,15 @@ async function listControlRoots(
   }
   for (const root of roots.values()) {
     if (!root.local && !root.unavailable) root.unavailable = '所在位置没有可以核对的历史库';
-    for (const [file, operation] of IN_PROGRESS_FILES) {
-      if (await lstatOrUndefined(path.join(root.controlRootPath, file)) && !root.inProgress.includes(operation)) root.inProgress.push(operation);
+    try {
+      for (const [file, operation] of IN_PROGRESS_FILES) {
+        if (await lstatOrUndefined(path.join(root.controlRootPath, file)) && !root.inProgress.includes(operation)) root.inProgress.push(operation);
+      }
+    } catch (error) {
+      // Whether an operation is in progress there cannot be told: nothing of it is proven.
+      root.local = undefined;
+      root.unavailable = '所在位置无法读取，无法确认没有进行中的操作，按历史保留';
+      root.unavailableDetail = errorMessage(error);
     }
   }
   return { roots: [...roots.values()], databaseFiles };
@@ -840,7 +906,39 @@ async function readLedgerFacts(configurationRootPath: string): Promise<LedgerFac
   } catch {
     finalizationsUnreadable = true;
   }
-  return { committing, recordsUnreadable, finalizationBackups, finalizationsUnreadable };
+  const preparing = { paths: new Set<string>(), names: new Set<string>(), live: new Set<string>() };
+  let preparingUnreadable = false;
+  try {
+    for (const { file, backup } of await readRuntimeLargeMergeTargetBackups(paths)) {
+      if (!backup) {
+        // Not a registration this version can read: whichever backup it names stays.
+        preparing.names.add(file.replace(/\.json$/, ''));
+        continue;
+      }
+      const live = isRuntimeLargeMergeTargetBackupLive(backup);
+      // A used one whose window is gone is any merge's pre-merge backup now (only its registration is left).
+      if (!live && backup.used) continue;
+      preparing.paths.add(comparable(path.resolve(backup.backupPath)));
+      preparing.names.add(backup.name);
+      if (live) preparing.live.add(backup.name);
+    }
+  } catch {
+    preparingUnreadable = true;
+  }
+  return { committing, recordsUnreadable, finalizationBackups, finalizationsUnreadable, preparingBackups: preparing, preparingUnreadable };
+}
+
+/**
+ * Why a pre-merge backup a large-merge preparation registered stays (see LedgerFacts.preparingBackups),
+ * undefined for any other.
+ */
+function preparingBackupReason(ledger: LedgerFacts, directory: string): string | undefined {
+  if (ledger.preparingUnreadable) return '大库合并准备的备份登记无法读取，不能确认它没有被使用，保留';
+  const name = path.basename(directory);
+  if (!ledger.preparingBackups.paths.has(comparable(directory)) && !ledger.preparingBackups.names.has(name)) return undefined;
+  return ledger.preparingBackups.live.has(name)
+    ? '大库合并的准备正在使用它（准备登记仍然有效），保留'
+    : '大库合并准备时做的，还没有被合并用上（由合并自己清理），保留';
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -924,7 +1022,7 @@ async function evaluateBackup(input: EvaluationInput): Promise<Evaluation> {
   const keep = (reason: string, detail?: string): Evaluation => ({ item: { ...item, reason, ...(detail ? { detail } : {}) } });
   if (entry.foreign) return keep(entry.foreign);
   if (!tree) return keep('无法读取这个目录，按历史保留');
-  if (input.known && tree.digest !== input.known.tree) return keep('列出之后这份备份有变化，请重新检查');
+  if (input.known && tree.digest !== input.known.tree.digest) return keep('列出之后这份备份有变化，请重新检查');
   if (tree.symbolicLink) return keep('目录里有符号链接，不跟随也不删除');
   if (tree.unsupported) return keep('目录里有无法识别的文件类型，不处理');
   const operations = inProgressOperations(root, input.ledger);
@@ -945,8 +1043,7 @@ async function evaluateBackup(input: EvaluationInput): Promise<Evaluation> {
     const completedAt = Math.max(completion.completedAt, createdAt ?? 0, completion.recordedAt);
     if (completedAt > now) return keep('升级完成的时间晚于现在，时间不可信，按历史保留');
     if (now - completedAt < RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS) {
-      const after = new Date(completedAt + RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS).toISOString();
-      return keep(`升级完成不满 7 天，${after} 之后才可以删除`);
+      return keep(`升级完成不满 7 天，${formatLocalTime(completedAt + RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS)} 之后才可以删除`);
     }
     const content = await backupContentProblem(entry.path, kind, completion.fromEpoch);
     if (content) return keep(`${content}，保留`);
@@ -957,10 +1054,12 @@ async function evaluateBackup(input: EvaluationInput): Promise<Evaluation> {
     const content = await backupContentProblem(entry.path, kind);
     if (content) return keep(content === BACKUP_UNFINISHED ? '备份还没有写完（目录里有临时文件），保留' : `${content}，保留`);
     if (kind === 'merge-target') {
+      const preparing = preparingBackupReason(input.ledger, entry.path);
+      if (preparing) return keep(preparing);
       if (now - backupTime(createdAt, tree.modifiedAt, now) < RUNTIME_BACKUP_CLEANUP_MERGE_BACKUP_MIN_AGE_MS) {
         return keep('创建不满 1 小时，可能正被合并使用，保留');
       }
-      const protection = await newestMergeBackupProtection(root, entry.name, now);
+      const protection = await newestMergeBackupProtection(root, entry.name, now, input.ledger);
       if (protection) return keep(protection);
     } else {
       if (input.ledger.finalizationsUnreadable) return keep('合并收尾记录无法读取，不能确认它没有被引用，保留');
@@ -985,8 +1084,8 @@ async function evaluateBackup(input: EvaluationInput): Promise<Evaluation> {
     // visible, another one by its exact files; see recheckInCurrent).
     try {
       const refusal = local.current
-        ? await recheckInCurrent(input.current, input.known.backupIds, input.known.replaced, '这份备份里有', false)
-        : (await localFacts(local, input.cache, input.databaseFiles, input.known.local), undefined);
+        ? await recheckInCurrent(input.current, input.known.recheck, input.known.replaced, '这份备份里有', false)
+        : await localUnchanged(local, input.databaseFiles, input.known.localFiles);
       if (refusal) return keep(refusal);
     } catch (error) {
       return keep(error instanceof CleanupRefusal ? error.message : unreadableReason(error, local.current ? CURRENT_LABEL : '所在历史库'), errorMessage(error));
@@ -1022,9 +1121,9 @@ async function evaluateBackup(input: EvaluationInput): Promise<Evaluation> {
   return {
     item: proven,
     proof: {
-      item: proven, kind, controlRootPath: root.controlRootPath, candidateId: local.candidate.id, tree: tree.digest,
-      binding: local.binding, current: local.current, backupIds, replaced: new Set(coverage.replaced),
-      ...(!local.current && local.facts ? { local: local.facts } : {})
+      item: proven, kind, controlRootPath: root.controlRootPath, candidateId: local.candidate.id, tree,
+      binding: local.binding, current: local.current, replaced: new Set(coverage.replaced),
+      ...(local.current ? { recheck: recheckIds(backupIds) } : local.facts ? { localFiles: local.facts.files } : {})
     }
   };
 }
@@ -1065,9 +1164,10 @@ function backupTime(createdAt: number | undefined, modifiedAt: number, now: numb
 /**
  * The newest complete pre-merge backup at least an hour old anchors the protection: it and every
  * newer one stay. A younger one may still be removed by the merge batch that wrote it (when no
- * transaction used it), so it never takes the anchor's place.
+ * transaction used it), so it never takes the anchor's place; nor does a large-merge preparation's
+ * that is still registered (see preparingBackupReason): its merge may remove it however old it is.
  */
-async function newestMergeBackupProtection(root: ControlRoot, name: string, now: number): Promise<string | undefined> {
+async function newestMergeBackupProtection(root: ControlRoot, name: string, now: number, ledger: LedgerFacts): Promise<string | undefined> {
   const directory = path.join(root.controlRootPath, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY);
   const names = (await readDirectoryNames(directory)).flatMap((entry) => {
     const match = MERGE_BACKUP_NAME.exec(entry);
@@ -1081,7 +1181,8 @@ async function newestMergeBackupProtection(root: ControlRoot, name: string, now:
     const database = await lstatOrUndefined(path.join(backup, 'limcode.sqlite'));
     const temporary = (await readDirectoryNames(backup)).some((entry) => entry.endsWith('.tmp'));
     const made = backupTime(backupCreatedAt('merge-target', names[index]), info ? info.mtimeMs : now, now);
-    if (info?.isDirectory() && database?.isFile() && !temporary && now - made >= RUNTIME_BACKUP_CLEANUP_MERGE_BACKUP_MIN_AGE_MS) {
+    if (info?.isDirectory() && database?.isFile() && !temporary && now - made >= RUNTIME_BACKUP_CLEANUP_MERGE_BACKUP_MIN_AGE_MS
+      && !preparingBackupReason(ledger, backup)) {
       anchor = index;
       break;
     }
@@ -1198,8 +1299,11 @@ function unreadableReason(error: unknown, subject: string): string {
 // ---------------------------------------------------------------------------------------------
 // Coverage: the copy's history is in one local data set, and shows the same there
 
-/** lstat results of CAS files in this check: a body is looked up once per data set. */
-type BodyCheck = Map<string, bigint | undefined>;
+/**
+ * lstat results of CAS files in this check, per CAS root by storage key (the size of a regular file,
+ * undefined for anything else): a body is looked up once per data set.
+ */
+type BodyCheck = Map<string, Map<string, number | undefined>>;
 
 /**
  * How much of a copy's history (`ids`) one local data set holds. Conversations first (they are
@@ -1245,7 +1349,7 @@ async function coverageIn(
     if (missing > 0) coverage.missingRecords.push([domain.key, missing]);
   }
   if (coverage.missingRecords.length > 0) return coverage;
-  for (const [id] of ids.contents) {
+  for (const id of ids.contents) {
     const body = facts.contents.get(id);
     if (!body || !await bodyPresent(casRoot, body[0], body[1], bodies)) coverage.missingContents += 1;
   }
@@ -1300,13 +1404,13 @@ async function countMissingInCurrent(current: RuntimeBackupCleanupCurrent, domai
 /** Bodies of the copy the open data set lacks: its content object (read through its reader) and a regular file of that size at its storage key. */
 async function missingBodiesInCurrent(
   current: RuntimeBackupCleanupCurrent,
-  contents: ReadonlyArray<readonly [string, string, string]>,
+  contents: readonly string[],
   bodies: BodyCheck
 ): Promise<number> {
   let missing = 0;
   for (let offset = 0; offset < contents.length; offset += RUNTIME_BACKUP_CLEANUP_READ_BATCH) {
     const batch = contents.slice(offset, offset + RUNTIME_BACKUP_CLEANUP_READ_BATCH);
-    const rows = await readCurrent(current, batch.map(([id]) => ({ kind: 'get', domain: 'ContentObject', id })));
+    const rows = await readCurrent(current, batch.map((id) => ({ kind: 'get', domain: 'ContentObject', id })));
     for (const row of rows) {
       const storageKey = row?.storage_key;
       const byteLength = row?.byte_length;
@@ -1349,12 +1453,14 @@ async function readCurrent(current: RuntimeBackupCleanupCurrent, reads: Reposito
 /** A body is present as a regular file of exactly its size at its storage key below `casRoot` (lstat: never followed, never opened). */
 async function bodyPresent(casRoot: string, storageKey: string, byteLength: string, bodies: BodyCheck): Promise<boolean> {
   if (!/^sha256\/[0-9a-f]{2}\/[0-9a-f]{64}$/.test(storageKey) || !/^(0|[1-9][0-9]*)$/.test(byteLength)) return false;
-  const file = path.join(casRoot, ...storageKey.split('/'));
-  if (!bodies.has(file)) {
-    const info = await fs.lstat(file, { bigint: true }).catch(() => undefined);
-    bodies.set(file, info?.isFile() ? info.size : undefined);
+  let sizes = bodies.get(casRoot);
+  if (!sizes) bodies.set(casRoot, sizes = new Map());
+  if (!sizes.has(storageKey)) {
+    const info = await fs.lstat(path.join(casRoot, ...storageKey.split('/')), { bigint: true }).catch(() => undefined);
+    sizes.set(storageKey, info?.isFile() ? Number(info.size) : undefined);
   }
-  return bodies.get(file) === BigInt(byteLength);
+  const size = sizes.get(storageKey);
+  return size !== undefined && BigInt(size) === BigInt(byteLength);
 }
 
 /**
@@ -1366,11 +1472,12 @@ async function bodyPresent(casRoot: string, storageKey: string, byteLength: stri
  */
 async function recheckInCurrent(
   current: RuntimeBackupCleanupCurrent,
-  ids: RuntimeDataSetHistoryIds,
+  ids: RecheckIds | undefined,
   planned: ReadonlySet<string>,
   subject: string,
   afterRename: boolean
 ): Promise<string | undefined> {
+  if (!ids) return '检查时没有记下要再次核对的内容，请重新检查';
   const conversations = await countMissingInCurrent(current, 'Conversation', ids.conversations);
   if (conversations > 0) {
     return afterRename ? `当前库刚刚少了 ${conversations} 个${subject}的对话` : `含 ${conversations} 个当前库没有的对话（可能是你删掉的），按历史保留`;
@@ -1391,9 +1498,26 @@ async function recheckInCurrent(
 async function stillCovered(root: ControlRoot, proof: BackupProof, current: RuntimeBackupCleanupCurrent): Promise<string | undefined> {
   const local = root.local;
   if (!local || !sameBinding(local.binding, proof.binding)) return '所在历史库在检查之后发生了变化';
-  if (local.current) return recheckInCurrent(current, proof.backupIds, proof.replaced, '这份备份里有', true);
-  return await runtimeDataSetFileState(local.binding.paths.databasePath) === proof.local?.files
+  if (local.current) return recheckInCurrent(current, proof.recheck, proof.replaced, '这份备份里有', true);
+  return await runtimeDataSetFileState(local.binding.paths.databasePath) === proof.localFiles
     ? undefined : '所在历史库在检查之后有改动';
+}
+
+/** The ids a deletion reads again in the open data set (the rest of them is not kept, see RecheckIds). */
+function recheckIds(ids: RecheckIds): RecheckIds {
+  return { conversations: ids.conversations, visibleMessages: ids.visibleMessages };
+}
+
+/**
+ * Another data set is still exactly the files its facts were read from (`files`); never the open one.
+ * Undefined when unchanged, else why not.
+ */
+async function localUnchanged(local: LocalDataSet, databaseFiles: DatabaseFiles, files: string | undefined): Promise<string | undefined> {
+  if (local.current || await hardLinkedDatabase(local.binding.paths.databasePath, databaseFiles) === CURRENT_LABEL) {
+    return '当前库只经它自己的读取线程查询，不复制它的文件，按历史保留';
+  }
+  return files !== undefined && await runtimeDataSetFileState(local.binding.paths.databasePath) === files
+    ? undefined : '所在历史库在检查之后有改动，请重新检查';
 }
 
 /**
@@ -1405,39 +1529,35 @@ async function stillCovered(root: ControlRoot, proof: BackupProof, current: Runt
 async function localFacts(
   local: LocalDataSet,
   cache: CoverageCache,
-  databaseFiles: DatabaseFiles,
-  known?: LocalFacts
+  databaseFiles: DatabaseFiles
 ): Promise<LocalFacts> {
   if (local.current || await hardLinkedDatabase(local.binding.paths.databasePath, databaseFiles) === CURRENT_LABEL) {
     // A second fence: listControlRoots already keeps such a data set out.
     throw new CleanupRefusal('当前库只经它自己的读取线程查询，不复制它的文件，按历史保留');
   }
   const files = await runtimeDataSetFileState(local.binding.paths.databasePath);
-  if (known) {
-    if (known.files !== files) throw new CleanupRefusal('所在历史库在检查之后有改动，请重新检查');
-    return known;
-  }
   if (local.facts?.files === files) return local.facts;
   const subject = dataSetSubject(local.candidate.id);
   const cached = await cache.read(subject, files, local.binding);
-  const read = cached ?? await withRuntimeMaintenance(local.binding.paths, () => withRuntimeMaintenanceActivity({
-    ...ACTIVITY, stage: `正在核对${local.facts ? localName(local) : '一个历史库'}`
-  }, async () => {
-    const facts = await readRuntimeDataSetFacts(local.candidate, { historyIds: true, summary: true });
-    if (!facts.historyIds || !facts.summary || !sameBinding(facts.binding, local.binding)
-      || await runtimeDataSetFileState(local.binding.paths.databasePath) !== files) {
-      throw new CleanupRefusal('暂时无法核对：所在历史库在读取期间有变化，稍后再试');
-    }
-    return { ids: facts.historyIds, projectNames: facts.summary.projectNames };
-  }));
-  if (!cached) await cache.write(subject, files, local.binding, read.ids, read.projectNames);
+  const read = cached?.bodies ? { ids: cached.ids, bodies: cached.bodies, projectNames: cached.projectNames }
+    : await withRuntimeMaintenance(local.binding.paths, () => withRuntimeMaintenanceActivity({
+      ...ACTIVITY, stage: `正在核对${local.facts ? localName(local) : '一个历史库'}`
+    }, async () => {
+      const facts = await readRuntimeDataSetFacts(local.candidate, { historyIds: true, contentBodies: true, summary: true });
+      if (!facts.historyIds || !facts.contentBodies || !facts.summary || !sameBinding(facts.binding, local.binding)
+        || await runtimeDataSetFileState(local.binding.paths.databasePath) !== files) {
+        throw new CleanupRefusal('暂时无法核对：所在历史库在读取期间有变化，稍后再试');
+      }
+      return { ids: facts.historyIds, bodies: facts.contentBodies, projectNames: facts.summary.projectNames };
+    }));
+  if (!cached?.bodies) await cache.write(subject, files, local.binding, read.ids, { bodies: read.bodies, projectNames: read.projectNames ?? [] });
   local.facts = {
     files,
     conversations: new Set(read.ids.conversations),
     messageRevisions: new Set(read.ids.messageRevisions),
     records: new Map(Object.entries(read.ids.records).map(([domain, ids]) => [domain, new Set(ids)])),
     visible: new Map(read.ids.visibleMessages.map(([message, , revision]) => [message, revision])),
-    contents: new Map(read.ids.contents.map(([id, key, length]) => [id, [key, length] as const])),
+    contents: new Map(read.bodies.map(([id, key, length]) => [id, [key, length] as const])),
     projectNames: read.projectNames ?? []
   };
   return local.facts;
@@ -1460,8 +1580,10 @@ function localName(local: LocalDataSet): string {
 
 /**
  * Non-authoritative history (see RuntimeDataSetHistoryIds) by exact file state in
- * `.limcode-runtime-merges/coverage/`, with a data set's project names; a changed file (any rewrite,
- * copy or restore changes its state) is simply read again.
+ * `.limcode-runtime-merges/coverage/`, gzip-compressed JSON: a copy's ids (its bodies only by id, they
+ * are checked in the proving data set), and for a local data set also where each of its bodies is
+ * stored and its project names. A changed file (any rewrite, copy or restore changes its state) is
+ * simply read again.
  */
 class CoverageCache {
   private readonly directory: string;
@@ -1486,11 +1608,13 @@ class CoverageCache {
     subject: string,
     files: string,
     binding: HistoricalRootBinding
-  ): Promise<{ ids: RuntimeDataSetHistoryIds; projectNames?: string[] } | undefined> {
+  ): Promise<{ ids: RuntimeDataSetHistoryIds; bodies?: RuntimeDataSetContentBodies; projectNames?: string[] } | undefined> {
     this.used.add(this.fileName(subject));
     try {
       await assertNoSymbolicPrefix(this.configurationRootPath, this.directory);
-      const value = JSON.parse(await fs.readFile(path.join(this.directory, this.fileName(subject)), 'utf8')) as Record<string, unknown> | null;
+      const file = path.join(this.directory, this.fileName(subject));
+      if (!(await fs.lstat(file)).isFile()) return undefined;
+      const value = JSON.parse((await gunzipAsync(await fs.readFile(file))).toString('utf8')) as Record<string, unknown> | null;
       if (value?.kind !== COVERAGE_KIND || value.subject !== subject || value.files !== files
         || value.identity !== identityWithGeneration(binding)) return undefined;
       const ids = value.ids as Partial<RuntimeDataSetHistoryIds> | undefined;
@@ -1498,9 +1622,14 @@ class CoverageCache {
       if (!ids || !isTextArray(ids.conversations) || !isTextArray(ids.messageRevisions)
         || !records || typeof records !== 'object' || Array.isArray(records)
         || !RUNTIME_HISTORY_RECORD_DOMAINS.every((domain) => isTextArray(records[domain.key]))
-        || !isTextTuples(ids.visibleMessages, 3) || !isTextTuples(ids.contents, 3)
+        || !isTextTuples(ids.visibleMessages, 3) || !isTextArray(ids.contents)
+        || (value.bodies !== undefined && !isTextTuples(value.bodies, 3))
         || (value.projectNames !== undefined && !isTextArray(value.projectNames))) return undefined;
-      return { ids: ids as RuntimeDataSetHistoryIds, ...(value.projectNames !== undefined ? { projectNames: value.projectNames } : {}) };
+      return {
+        ids: ids as RuntimeDataSetHistoryIds,
+        ...(value.bodies !== undefined ? { bodies: value.bodies as RuntimeDataSetContentBodies } : {}),
+        ...(value.projectNames !== undefined ? { projectNames: value.projectNames } : {})
+      };
     } catch {
       return undefined;
     }
@@ -1511,19 +1640,20 @@ class CoverageCache {
     files: string,
     binding: HistoricalRootBinding,
     ids: RuntimeDataSetHistoryIds,
-    projectNames?: readonly string[]
+    local?: { bodies: RuntimeDataSetContentBodies; projectNames: readonly string[] }
   ): Promise<void> {
     const file = path.join(this.directory, this.fileName(subject));
     const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
     try {
       await assertNoSymbolicPrefix(this.configurationRootPath, this.directory);
       await fs.mkdir(this.directory, { recursive: true, mode: 0o700 });
+      const compressed = await gzipAsync(Buffer.from(`${JSON.stringify({
+        kind: COVERAGE_KIND, subject, files, identity: identityWithGeneration(binding), ids,
+        ...(local ? { bodies: local.bodies, projectNames: local.projectNames } : {})
+      })}\n`, 'utf8'));
       const handle = await fs.open(temporary, 'wx', 0o600);
       try {
-        await handle.writeFile(`${JSON.stringify({
-          kind: COVERAGE_KIND, subject, files, identity: identityWithGeneration(binding), ids,
-          ...(projectNames ? { projectNames } : {})
-        })}\n`, 'utf8');
+        await handle.writeFile(compressed);
         await handle.sync();
       } finally {
         await handle.close();
@@ -1541,12 +1671,12 @@ class CoverageCache {
     await fs.rm(path.join(this.directory, this.fileName(subject)), { force: true }).catch(() => undefined);
   }
 
-  /** After a complete listing: entries of copies and data sets that were not looked at are gone. */
+  /** After a complete listing: entries of copies and data sets that were not looked at are gone (and any other file of an earlier format). */
   public async prune(): Promise<void> {
     try {
       await assertNoSymbolicPrefix(this.configurationRootPath, this.directory);
       for (const name of await readDirectoryNames(this.directory)) {
-        if (name.endsWith('.json') && !this.used.has(name)) await fs.rm(path.join(this.directory, name), { force: true });
+        if (/\.json(?:\.gz)?$/.test(name) && !this.used.has(name)) await fs.rm(path.join(this.directory, name), { force: true });
       }
     } catch {
       // Only a cache.
@@ -1554,7 +1684,7 @@ class CoverageCache {
   }
 
   private fileName(subject: string): string {
-    return `${createHash('sha256').update(subject).digest('hex').slice(0, 32)}.json`;
+    return `${createHash('sha256').update(subject).digest('hex').slice(0, 32)}.json.gz`;
   }
 }
 
@@ -1750,8 +1880,12 @@ async function writeVerifiedMark(directory: string, configurationRootPath: strin
   await syncDirectoryDurably(directory);
 }
 
-/** The mark goes last: a removal that fails halfway stays a verified leftover, finished by the next cleanup. */
+/**
+ * The mark goes last: a removal that fails halfway stays a verified leftover, finished by the next
+ * cleanup. Only a real directory is removed: a link put in its place is never followed.
+ */
 async function removeVerifiedDirectory(directory: string): Promise<void> {
+  if (!(await fs.lstat(directory)).isDirectory()) throw new Error(`Not a directory (a link or a file was put in its place): ${directory}`);
   for (const name of await fs.readdir(directory)) {
     if (name === VERIFIED_MARKER_FILE) continue;
     await fs.rm(path.join(directory, name), { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
@@ -1761,29 +1895,45 @@ async function removeVerifiedDirectory(directory: string): Promise<void> {
 }
 
 /**
- * The mark of this very directory (it names it), with what it records: `ours` only when this
- * configuration root with its cleanup identity wrote it. Any other mark proves nothing here.
+ * The mark of this very directory (it names it), with what it records: `ours` when this installation
+ * wrote it, from this configuration root (its path and cleanup identity) or from a data directory it
+ * left (`previousDataRootPaths`, globalStatus): a mark naming that directory counts when its cleanup
+ * identity is still the one there, or when that directory's bookkeeping is gone with its last data set
+ * (deleting the old directory removes it). Any other mark proves nothing here (a copied directory,
+ * another installation or machine at the same path). Throws when the mark or an identity cannot be
+ * read now: undecided, the leftover is neither removed nor given its name back this time.
  */
 async function readVerifiedMark(
   directory: string,
   configurationRootPath: string,
-  read: TextReader = readLocalText
+  read: TextReader = readLocalText,
+  previousDataRootPaths: readonly string[] = []
 ): Promise<{ foreignId?: string; ours: boolean } | undefined> {
   const file = path.join(directory, VERIFIED_MARKER_FILE);
-  if (!(await lstatOrUndefined(file))?.isFile()) return undefined;
+  const info = await lstatOrUndefined(file);
+  if (!info?.isFile() || info.size > MAX_VERIFIED_MARK_BYTES) return undefined;
+  let value: { kind?: unknown; name?: unknown; foreignId?: unknown; configurationRoot?: unknown; cleanupIdentity?: unknown } | null;
+  const text = await read(file);
   try {
-    const value = JSON.parse(await read(file)) as {
-      kind?: unknown; name?: unknown; foreignId?: unknown; configurationRoot?: unknown; cleanupIdentity?: unknown;
-    } | null;
-    if (value?.kind !== VERIFIED_MARKER_KIND || value.name !== path.basename(directory)) return undefined;
-    const identity = await cleanupIdentity(configurationRootPath, false);
-    const ours = identity !== undefined && value.cleanupIdentity === identity
-      && typeof value.configurationRoot === 'string' && comparable(value.configurationRoot) === comparable(path.resolve(configurationRootPath));
-    return { ...(typeof value.foreignId === 'string' ? { foreignId: value.foreignId } : {}), ours };
+    value = JSON.parse(text) as typeof value;
   } catch {
     return undefined;
   }
+  if (value?.kind !== VERIFIED_MARKER_KIND || value.name !== path.basename(directory)) return undefined;
+  const foreignId = typeof value.foreignId === 'string' ? { foreignId: value.foreignId } : {};
+  if (typeof value.configurationRoot !== 'string' || typeof value.cleanupIdentity !== 'string') return { ...foreignId, ours: false };
+  const written = comparable(path.resolve(value.configurationRoot));
+  if (written === comparable(path.resolve(configurationRootPath))) {
+    return { ...foreignId, ours: await cleanupIdentity(configurationRootPath, false) === value.cleanupIdentity };
+  }
+  const previous = previousDataRootPaths.find((root) => comparable(path.resolve(root)) === written);
+  if (!previous) return { ...foreignId, ours: false };
+  const there = await readCleanupIdentity(path.resolve(previous));
+  return { ...foreignId, ours: there === undefined || there === value.cleanupIdentity };
 }
+
+/** A verified mark is a few hundred bytes: anything larger is no mark of this cleanup. */
+const MAX_VERIFIED_MARK_BYTES = 64 * 1024;
 
 /**
  * This configuration root's identity for verified marks: a random token in its merge ledger root,
@@ -1793,16 +1943,9 @@ async function readVerifiedMark(
 async function cleanupIdentity(configurationRootPath: string, create: boolean): Promise<string | undefined> {
   const directory = resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: configurationRootPath });
   const file = path.join(directory, CLEANUP_IDENTITY_FILE);
-  await assertNoSymbolicPrefix(configurationRootPath, file);
   const read = async (): Promise<string | undefined> => {
-    try {
-      const value = JSON.parse(await fs.readFile(file, 'utf8')) as { kind?: unknown; token?: unknown } | null;
-      return value?.kind === CLEANUP_IDENTITY_KIND && typeof value.token === 'string' && /^[0-9a-f-]{36}$/.test(value.token)
-        ? value.token : undefined;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-      throw error;
-    }
+    const token = await readCleanupIdentity(configurationRootPath);
+    return token === null ? undefined : token;
   };
   const existing = await read();
   if (existing || !create) return existing;
@@ -1824,6 +1967,31 @@ async function cleanupIdentity(configurationRootPath: string, create: boolean): 
     const written = await read();
     if (!written) throw new Error('清理备份的身份记录无法读取');
     return written;
+  }
+}
+
+/**
+ * The cleanup identity recorded in a configuration root: its token, undefined when there is no record
+ * (never written, or removed with the directory's bookkeeping), null when the file there is no
+ * identity record (it matches no mark). Throws when it cannot be read now (or a link is in its path).
+ */
+async function readCleanupIdentity(configurationRootPath: string): Promise<string | null | undefined> {
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: configurationRootPath }), CLEANUP_IDENTITY_FILE);
+  await assertNoSymbolicPrefix(configurationRootPath, file);
+  let text: string;
+  try {
+    if (!(await fs.lstat(file)).isFile()) return null;
+    text = await fs.readFile(file, 'utf8');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') return undefined;
+    throw error;
+  }
+  try {
+    const value = JSON.parse(text) as { kind?: unknown; token?: unknown } | null;
+    return value?.kind === CLEANUP_IDENTITY_KIND && typeof value.token === 'string' && /^[0-9a-f-]{36}$/.test(value.token) ? value.token : null;
+  } catch {
+    return null;
   }
 }
 
@@ -1874,17 +2042,22 @@ async function settleInterruptedDeletions(
 ): Promise<{ finished: string[]; restored: string[] }> {
   const finished: string[] = [];
   const restored: string[] = [];
+  const previous = context.previousDataRootPaths ?? [];
   const pending: Array<{ root: ControlRoot; leftovers: Array<{ path: string; original: string }> }> = [];
   for (const root of roots) {
     const leftovers: Array<{ path: string; original: string }> = [];
-    for (const kind of LOCAL_BACKUP_KINDS) {
-      const directory = path.join(root.controlRootPath, DELETABLE_DIRECTORIES[kind]);
-      for (const name of await readDirectoryNames(directory)) {
-        const base = DELETING_NAME.exec(name)?.[1];
-        if (base && (kind === 'epoch-migration' ? EPOCH_BACKUP_NAME.test(base) : MERGE_BACKUP_NAME.test(base))) {
-          leftovers.push({ path: path.join(directory, name), original: path.join(directory, base) });
+    try {
+      for (const kind of LOCAL_BACKUP_KINDS) {
+        const directory = path.join(root.controlRootPath, DELETABLE_DIRECTORIES[kind]);
+        for (const name of await readDirectoryNames(directory)) {
+          const base = DELETING_NAME.exec(name)?.[1];
+          if (base && (kind === 'epoch-migration' ? EPOCH_BACKUP_NAME.test(base) : MERGE_BACKUP_NAME.test(base))) {
+            leftovers.push({ path: path.join(directory, name), original: path.join(directory, base) });
+          }
         }
       }
+    } catch (error) {
+      problem(`${root.controlRootPath} 里上次没有删完的备份没有全部找到，下次检查时再试。`, error);
     }
     if (leftovers.length > 0) pending.push({ root, leftovers });
   }
@@ -1906,7 +2079,7 @@ async function settleInterruptedDeletions(
       for (const { root, leftovers } of pending) {
         await withRuntimeMaintenance(root.paths, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage }, async () => {
           for (const leftover of leftovers) {
-            const decision = await decideLeftover(leftover, configurationRootPath, configurationRootPath, readLocalText, problem);
+            const decision = await decideLeftover(leftover, configurationRootPath, configurationRootPath, readLocalText, problem, previous);
             record(decision === 'verified' ? await finishLeftover(leftover, problem) : decision, leftover);
           }
         }));
@@ -1926,12 +2099,12 @@ async function settleInterruptedDeletions(
         if (await lstatOrUndefined(leftover.path)) problem(`上次没有删完的 ${name} 不是普通目录，没有处理。`);
         continue;
       }
-      const mark = await readVerifiedMark(leftover.path, configurationRootPath, read);
+      const mark = await readVerifiedMark(leftover.path, configurationRootPath, read, previous);
       const id = (mark?.ours ? mark.foreignId : undefined)
         ?? foreignRuntimeHistoryId(leftover.location, await leftoverIdentity(leftover.path, read));
       const settled = await withForeignClaimReleasingAdmission<'finished' | 'restored' | undefined>(configurationRootPath, id,
         path.join(leftover.originalPath, ROOT_BINDING_POINTER_FILE), { ...ACTIVITY, stage: '正在收尾上次没有删完的外来历史库' }, async () => {
-          const decision = await decideLeftover(entry, path.dirname(leftover.path), configurationRootPath, read, problem);
+          const decision = await decideLeftover(entry, path.dirname(leftover.path), configurationRootPath, read, problem, previous);
           return decision === 'verified' ? { value: undefined, after: () => finishLeftover(entry, problem) } : { value: decision };
         });
       if (!settled.acquired) {
@@ -1947,16 +2120,18 @@ async function settleInterruptedDeletions(
 }
 
 /**
- * One leftover (reached without links from `root`): 'verified' when this configuration root marked it
- * (then finishLeftover removes it); otherwise it gets its name back ('restored') unless that name is
- * taken again (undefined, reported).
+ * One leftover (reached without links from `root`): 'verified' when this installation marked it (see
+ * readVerifiedMark; then finishLeftover removes it, it never gets its name back half removed);
+ * otherwise it gets its name back ('restored') unless that name is taken again, or its mark cannot be
+ * read now (undefined, reported: next time).
  */
 async function decideLeftover(
   leftover: { path: string; original: string },
   root: string,
   configurationRootPath: string,
   read: TextReader,
-  problem: (text: string, error?: unknown) => void
+  problem: (text: string, error?: unknown) => void,
+  previousDataRootPaths: readonly string[]
 ): Promise<'verified' | 'restored' | undefined> {
   const name = path.basename(leftover.path);
   try {
@@ -1966,7 +2141,7 @@ async function decideLeftover(
       problem(`上次没有删完的 ${name} 不是普通目录，没有处理。`);
       return undefined;
     }
-    if ((await readVerifiedMark(leftover.path, configurationRootPath, read))?.ours) return 'verified';
+    if ((await readVerifiedMark(leftover.path, configurationRootPath, read, previousDataRootPaths))?.ours) return 'verified';
     if (await lstatOrUndefined(leftover.original)) {
       problem(`上次没有删完的 ${name} 没有核对完，原来的名字已被占用，没有改回，也没有删除。`);
       return undefined;
@@ -2214,7 +2389,7 @@ async function evaluateForeign(
         candidateId: best.local.candidate.id, binding: best.local.binding, current: best.local.current, name: where,
         ...(!best.local.current && best.local.facts ? { files: best.local.facts.files } : {})
       },
-      ids, replaced: new Set(best.coverage.replaced),
+      ...(best.local.current ? { recheck: recheckIds(ids) } : {}), replaced: new Set(best.coverage.replaced),
       ...(found.location.kind === 'copied' ? { copiedDirectory: found.location.containerPath } : {})
     }
   };
@@ -2421,7 +2596,7 @@ async function foreignBackupCopy(
     const completedAt = Math.max(completion.completedAt, backupCreatedAt(kind, base) ?? 0, completion.recordedAt);
     if (completedAt > now) return refuse('：升级完成的时间晚于现在，时间不可信');
     if (now - completedAt < RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS) {
-      return refuse(`：升级完成不满 7 天，${new Date(completedAt + RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS).toISOString()} 之后才可以删除`);
+      return refuse(`：升级完成不满 7 天，${formatLocalTime(completedAt + RUNTIME_BACKUP_CLEANUP_UPGRADE_GRACE_MS)} 之后才可以删除`);
     }
     const problem = await backupContentProblem(directory, kind, completion.fromEpoch);
     if (problem) return content(problem);
@@ -2558,7 +2733,7 @@ async function foreignStillCovered(
   current: RuntimeBackupCleanupCurrent,
   afterRename: boolean
 ): Promise<string | undefined> {
-  if (local.current) return recheckInCurrent(current, proof.ids, proof.replaced, '它有', afterRename);
+  if (local.current) return recheckInCurrent(current, proof.recheck, proof.replaced, '它有', afterRename);
   return await runtimeDataSetFileState(local.binding.paths.databasePath) === proof.by.files
     ? undefined : `证明它的${proof.by.name}在检查之后有改动，请重新检查`;
 }
@@ -2687,7 +2862,7 @@ function unionIds(...parts: Array<RuntimeDataSetHistoryIds | undefined>): Runtim
   const messageRevisions = new Set<string>();
   const records = new Map<string, Set<string>>(RUNTIME_HISTORY_RECORD_DOMAINS.map((domain) => [domain.key, new Set<string>()]));
   const visible = new Map<string, [string, string, string]>();
-  const contents = new Map<string, [string, string, string]>();
+  const contents = new Set<string>();
   for (const part of parts) {
     if (!part) continue;
     for (const id of part.conversations) conversations.add(id);
@@ -2698,12 +2873,12 @@ function unionIds(...parts: Array<RuntimeDataSetHistoryIds | undefined>): Runtim
       records.set(domain, target);
     }
     for (const entry of part.visibleMessages) visible.set(`${entry[0]}\0${entry[2]}`, [entry[0], entry[1], entry[2]]);
-    for (const entry of part.contents) contents.set(entry[0], [entry[0], entry[1], entry[2]]);
+    for (const id of part.contents) contents.add(id);
   }
   return {
     conversations: [...conversations], messageRevisions: [...messageRevisions],
     records: Object.fromEntries([...records].map(([domain, ids]) => [domain, [...ids]])),
-    visibleMessages: [...visible.values()], contents: [...contents.values()]
+    visibleMessages: [...visible.values()], contents: [...contents]
   };
 }
 

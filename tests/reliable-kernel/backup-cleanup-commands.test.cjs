@@ -6,7 +6,10 @@ const test = require('node:test');
 const ts = require('typescript');
 
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
-const { RuntimeWriteGate } = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
+const writeGateModule = require(path.join(compiled, 'backend/application/reliableKernel/runtimeWriteGate.js'));
+const { RuntimeWriteGate } = writeGateModule;
+const hostControl = require(path.join(compiled, 'backend/reliableKernel/runtimeHostControl.js'));
+const { formatLocalTime, RuntimeBackupCleanupError } = require(path.join(compiled, 'backend/reliableKernel/runtimeBackupCleanup.js'));
 
 /** Loads vscode/commands/backupCleanup.ts with every dependency replaced by a recording fake. */
 function loadCommand(dependencies, sandboxConsole = console) {
@@ -79,7 +82,7 @@ const PLAN = {
   ]
 };
 
-function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = true, writeGate, onPlan, warnings, status, statusError } = {}) {
+function fixture({ answers = [], plan = PLAN, planError, deleteResult, deleteError, host = true, writeGate, onPlan, warnings, status, statusError } = {}) {
   const calls = [];
   const prompts = [];
   const database = { binding: { dataSetId: 'current' }, snapshot: async () => ({ snapshot: [] }) };
@@ -101,7 +104,11 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
   const startup = { wait: async () => { if (!application) throw new Error('no runtime'); return application; } };
   const dependencies = {
     vscode,
+    '../../backend/application/reliableKernel/runtimeWriteGate': writeGateModule,
+    '../../backend/reliableKernel/runtimeHostControl': hostControl,
     '../../backend/reliableKernel/runtimeBackupCleanup': {
+      formatLocalTime,
+      RuntimeBackupCleanupError,
       async planRuntimeBackupCleanup(root, current, options) {
         calls.push(['plan', root, current === database, options.previousDataRootPaths ? [...options.previousDataRootPaths] : null]);
         options.onProgress('正在核对 merge-old…');
@@ -111,6 +118,7 @@ function fixture({ answers = [], plan = PLAN, planError, deleteResult, host = tr
       },
       async deleteRuntimeBackups(planned, current, keys) {
         calls.push(['delete', planned === plan, current === database, [...keys]]);
+        if (deleteError) throw deleteError;
         return deleteResult ?? {
           deleted: keys.map((key) => { const entry = plan.items.find((candidate) => candidate.key === key); return { key, name: entry.name, path: entry.path, bytes: entry.bytes, reclaimableBytes: entry.reclaimableBytes }; }),
           kept: [], unfinished: [], copiedDirectoriesWithoutDataSets: []
@@ -263,10 +271,48 @@ test('没有可删的项：只有“知道了”，不出现第二个确认；�
   assert.deepEqual(none.prompts[0].actions.map((action) => action.label), ['知道了']);
   assert.equal(none.calls.some((call) => call[0] === 'delete'), false);
 
-  const failed = fixture({ planError: new Error('磁盘已满') });
+  const failed = fixture({ planError: Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }) });
   await failed.run();
-  assert.deepEqual([failed.prompts[0].title, failed.prompts[0].sections[0].lines], ['备份检查没有完成', ['磁盘已满', '没有删除任何内容。']]);
+  assert.deepEqual([failed.prompts[0].title, failed.prompts[0].sections[0].lines],
+    ['备份检查没有完成', ['检查时磁盘空间不足（详细原因已写入日志），腾出空间后再试。', '没有删除任何内容。']]);
   assert.equal(failed.calls.some((call) => call[0] === 'delete'), false);
+});
+
+test('盲审 #5 整个检查或删除没有完成时：面板上只写中文原因，技术原因只写进日志；本来就写给用户的拒绝原样显示', async () => {
+  const shown = async (error, answers = []) => {
+    const warnings = [];
+    const f = fixture({ warnings, planError: error, answers });
+    await f.run();
+    return { lines: f.prompts[0].sections[0].lines, warnings, prompts: f.prompts };
+  };
+  const denied = await shown(Object.assign(new Error("EACCES: permission denied, scandir '/data/limcode/.limcode-workspace-runtimes/scopes'"), { code: 'EACCES' }));
+  assert.deepEqual(denied.lines, ['检查时没有权限读取或修改数据目录里的某个位置（详细原因已写入日志）。', '没有删除任何内容。']);
+  assert.doesNotMatch(JSON.stringify(denied.prompts), /EACCES|scandir|permission denied/);
+  assert.ok(denied.warnings.some((line) => line.includes('EACCES: permission denied')), denied.warnings.join('\n'));
+  const unknown = await shown(new TypeError("Cannot read properties of undefined (reading 'binding')"));
+  assert.deepEqual(unknown.lines, ['检查时遇到意外的错误（详细原因已写入日志），稍后再试。', '没有删除任何内容。']);
+  assert.ok(unknown.warnings.some((line) => line.includes("reading 'binding'")), unknown.warnings.join('\n'));
+  const busy = await shown(new hostControl.RuntimeMaintenanceBusyError('/data/limcode/.limcode-runtime.runtime-admission', {
+    claimToken: 't', processId: 1234, startedAt: '2026-09-27T00:00:00.000Z', rootPointerPath: '/data/limcode/.limcode-runtime/root-binding.json'
+  }, 'identity unknown'));
+  assert.deepEqual(busy.lines, ['另一个窗口正在维护数据目录，而且无法确认它的状态，这次没有继续，稍后再试。', '没有删除任何内容。']);
+  const stopped = await shown(Object.assign(new Error('Extension shutdown has stopped admitting Runtime data-set upgrades.'), { code: 'runtime-dataset-upgrades-stopped' }));
+  assert.deepEqual(stopped.lines, ['窗口正在关闭，没有继续。', '没有删除任何内容。']);
+  // Written for the user already: shown as it is, nothing logged as unexpected.
+  const refused = await shown(new RuntimeBackupCleanupError('这份备份清单不是本窗口刚才核对的结果，请重新检查。'));
+  assert.deepEqual([refused.lines, refused.warnings], [['这份备份清单不是本窗口刚才核对的结果，请重新检查。', '没有删除任何内容。'], []]);
+
+  // The deletion as a whole failed: the same, for 删除.
+  const warnings = [];
+  const failing = fixture({
+    warnings,
+    answers: [{ choice: 'next', include: ['merge-target:old'] }, { choice: 'delete', include: [] }],
+    deleteError: Object.assign(new Error('EPERM: operation not permitted, rename'), { code: 'EPERM' })
+  });
+  await failing.run();
+  assert.equal(failing.prompts.at(-1).title, '备份没有删除');
+  assert.deepEqual(failing.prompts.at(-1).sections[0].lines, ['删除时没有权限读取或修改数据目录里的某个位置（详细原因已写入日志）。']);
+  assert.ok(warnings.some((line) => line.includes('EPERM: operation not permitted')), warnings.join('\n'));
 });
 
 test('删除时锁内复核没有通过的项：结果面板逐项写明保留原因', async () => {

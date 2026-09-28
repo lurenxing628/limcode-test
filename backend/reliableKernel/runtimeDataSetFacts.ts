@@ -23,6 +23,11 @@ export interface RuntimeDataSetFactsRequest {
   summary?: boolean;
   /** The readable history (RuntimeDataSetHistoryIds), read from the tables themselves, in no particular order. */
   historyIds?: boolean;
+  /**
+   * Every body with where it is (RuntimeDataSetContentBodies): only a data set that proves copies
+   * needs it; a copy's bodies are checked in the proving data set by that data set's own rows.
+   */
+  contentBodies?: boolean;
   /** The unfinished work a relocation carries away (see relocatedWorkInventory), from the same snapshot. */
   relocatedWork?: boolean;
 }
@@ -67,7 +72,7 @@ for (const entry of RUNTIME_HISTORY_RECORD_DOMAINS) {
  * The readable history of one database, read from the tables themselves: every Conversation and
  * MessageRevision id, the ids of the other history rows (RUNTIME_HISTORY_RECORD_DOMAINS, by domain
  * key), what is visible (every message not deleted, with its current revision) and every body
- * (ContentObject id, CAS storage key, byte length as decimal text).
+ * (ContentObject id; where each one is stored comes separately, see RuntimeDataSetContentBodies).
  */
 export interface RuntimeDataSetHistoryIds {
   conversations: string[];
@@ -75,15 +80,19 @@ export interface RuntimeDataSetHistoryIds {
   records: Record<string, string[]>;
   /** [message id, its current-revision link id, the current revision id]. */
   visibleMessages: Array<[string, string, string]>;
-  /** [content object id, storage key, byte length]. */
-  contents: Array<[string, string, string]>;
+  /** Content object ids. */
+  contents: string[];
 }
+
+/** [content object id, CAS storage key, byte length as decimal text] of every body of a database. */
+export type RuntimeDataSetContentBodies = Array<[string, string, string]>;
 
 export interface RuntimeDataSetFacts {
   binding: HistoricalRootBinding;
   contentDigest?: string;
   summary?: RuntimeDataSetSummary;
   historyIds?: RuntimeDataSetHistoryIds;
+  contentBodies?: RuntimeDataSetContentBodies;
   relocatedWork?: RelocatedWorkInventory;
 }
 
@@ -119,6 +128,7 @@ export async function readRuntimeDataSetFacts(
       ...(request.contentDigest ? { contentDigest: true } : {}),
       ...(request.summary ? { summary: true } : {}),
       ...(request.historyIds ? { historyIds: true } : {}),
+      ...(request.contentBodies ? { contentBodies: true } : {}),
       ...(request.relocatedWork ? { relocatedWork: true } : {})
     });
     return { binding, ...facts };

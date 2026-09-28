@@ -1,12 +1,13 @@
 import * as vscode from 'vscode';
 import { loadCommittedGlobalStatus } from '../../backend/capabilities/vscodeStorage/globalStatus';
 import {
-  deleteRuntimeBackups, planRuntimeBackupCleanup,
+  deleteRuntimeBackups, formatLocalTime, planRuntimeBackupCleanup, RuntimeBackupCleanupError,
   type RuntimeBackupCleanupCurrent, type RuntimeBackupCleanupItem, type RuntimeBackupCleanupPlan,
   type RuntimeBackupCleanupResult, type RuntimeBackupKind
 } from '../../backend/reliableKernel/runtimeBackupCleanup';
+import { isRuntimeMaintenanceBusyError } from '../../backend/reliableKernel/runtimeHostControl';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
-import type { RuntimeWriteGate } from '../../backend/application/reliableKernel/runtimeWriteGate';
+import { isRuntimeWritesFrozenError, type RuntimeWriteGate } from '../../backend/application/reliableKernel/runtimeWriteGate';
 import type { BridgeClientId, DataRootPromptSection, ExtensionToWebviewMessage } from '../../shared/protocol';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { askInSettingsPage, type DataRootPrompt, type DataRootPromptAnswer } from '../dataRootPrompts';
@@ -83,7 +84,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   try {
     host.writeGate?.admit();
   } catch (error) {
-    await tell(ask, '现在不能清理备份', [describeError(error), '没有删除任何内容。']);
+    await tell(ask, '现在不能清理备份', [describeError(error, '检查'), '没有删除任何内容。']);
     return;
   }
   const current = host.product.application.database;
@@ -102,7 +103,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
         return host.writeGate ? host.writeGate.run(check) : check();
       }));
   } catch (error) {
-    await tell(ask, '备份检查没有完成', [describeError(error), '没有删除任何内容。']);
+    await tell(ask, '备份检查没有完成', [describeError(error, '检查'), '没有删除任何内容。']);
     return;
   }
   logDetails(plan.details, plan.items);
@@ -153,7 +154,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
         return host.writeGate ? host.writeGate.run(deletion) : deletion();
       }));
   } catch (error) {
-    await tell(ask, '备份没有删除', [describeError(error)]);
+    await tell(ask, '备份没有删除', [describeError(error, '删除')]);
     return;
   }
   logDetails([], [...result.kept, ...result.unfinished]);
@@ -302,15 +303,22 @@ function formatBytes(value: string): string {
   return `${bytes} B`;
 }
 
-/** Local time to the minute (the list of foreign history shows its times the same way). */
+/** Local time to the minute (the list of foreign history and the reasons of the check show their times the same way). */
 export function formatTime(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return value;
-  const pad = (part: number) => String(part).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  return formatLocalTime(value);
 }
 
-function describeError(error: unknown): string {
-  const message = (error as { message?: unknown } | null | undefined)?.message;
-  return typeof message === 'string' && message ? message : String(error);
+/**
+ * Why the check or the deletion as a whole did not go on, in words: the refusals already written
+ * for the user as they are, anything else as its kind of cause; its own text only goes to the log.
+ */
+function describeError(error: unknown, step: '检查' | '删除'): string {
+  if (isRuntimeWritesFrozenError(error) || error instanceof RuntimeBackupCleanupError) return error.message;
+  console.warn(`[LimCode] 清理备份：${step}没有完成。`, error);
+  const code = (error as { code?: unknown } | null | undefined)?.code;
+  if (code === 'runtime-dataset-upgrades-stopped') return '窗口正在关闭，没有继续。';
+  if (isRuntimeMaintenanceBusyError(error)) return '另一个窗口正在维护数据目录，而且无法确认它的状态，这次没有继续，稍后再试。';
+  if (code === 'EACCES' || code === 'EPERM') return `${step}时没有权限读取或修改数据目录里的某个位置（详细原因已写入日志）。`;
+  if (code === 'ENOSPC' || code === 'EDQUOT') return `${step}时磁盘空间不足（详细原因已写入日志），腾出空间后再试。`;
+  return `${step}时遇到意外的错误（详细原因已写入日志），稍后再试。`;
 }

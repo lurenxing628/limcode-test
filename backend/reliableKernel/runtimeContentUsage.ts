@@ -270,7 +270,8 @@ export function formatRuntimeContentUsage(
 /**
  * The storage view's section: only for the selected data set, and only through this window's own
  * open RuntimeDatabase of exactly that root (another Host's database is never opened here).
- * A failed read is reported in place, so the directory statistics above are still shown.
+ * A failed read is reported in place in words (its cause only in the log), so the directory
+ * statistics above are still shown.
  */
 export async function describeCurrentRuntimeContentUsage(
   dataSet: { selected: boolean; dataSetId?: string; rootInstanceId?: string; runtimeDataRootPath: string },
@@ -284,8 +285,9 @@ export async function describeCurrentRuntimeContentUsage(
   try {
     return ['', ...formatRuntimeContentUsage(summarizeRuntimeContentUsage(await database.contentUsage()), formatBytes)];
   } catch (error) {
-    const message = (error instanceof Error ? error.message : String(error)).trim().replace(/[。．.]+$/u, '');
-    return ['', `按类型统计正文失败：${message}。`];
+    // Its own text only goes to the log.
+    console.warn('[LimCode] 按类型统计正文失败。', error);
+    return ['', '按类型统计正文失败（详细原因已写入日志），稍后再打开一次试试。'];
   }
 }
 

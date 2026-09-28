@@ -59,3 +59,48 @@ test('确认面板的勾选框：命令默认勾选（checked）的项一打开�
     if (previousPinia) pinia.setActivePinia(previousPinia);
   }
 });
+
+// 盲审 #2: the hint beside 清理备份… in the settings page (其他 → 数据目录) says what the cleanup does
+// (AGENTS.md, 备份清理): verified foreign history is deletable too, the coverage it proves, which copies
+// are ticked by default and which are listed apart; copied directories themselves are never deleted.
+test('设置页“清理备份…”旁的说明与实际行为一致：核验通过的外来历史库也可以删除，写明覆盖口径、默认勾选与单列的一组', async () => {
+  const { createSSRApp } = await import('vue');
+  const { renderToString } = await import('@vue/server-renderer');
+  const pinia = await import('pinia');
+  const previousPinia = pinia.getActivePinia();
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout, innerWidth: 1280, innerHeight: 800,
+    acquireVsCodeApi() { return { postMessage() {}, getState() { return {}; }, setState() {} }; }
+  };
+  let server;
+  try {
+    server = await createWebviewSsrServer();
+    const { default: tab } = await server.ssrLoadModule('/src/components/settings/global/OtherSettingsTab.vue');
+    const isolated = pinia.createPinia();
+    pinia.setActivePinia(isolated);
+    // The tab's hover tooltips measure the viewport while they are set up (only now: Vite itself
+    // must not see a document while it loads).
+    globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
+    const html = await renderToString(createSSRApp(tab).use(isolated));
+    const hint = html.match(/<span class="global-settings-field-hint">(迁移时先检查新目录[^<]*)<\/span>/)?.[1];
+    assert.ok(hint, '找到数据目录一栏的说明');
+    const cleanup = hint.slice(hint.indexOf('清理备份'));
+    for (const phrase of [
+      '清理备份只删除能证明内容已完整在本地库里的副本',
+      '升级前、合并前与合并来源的收尾前备份，以及核验通过的外来历史库（“归档并重置”的归档、以前的数据目录里的归档和拷来目录里的库）',
+      '每个对话、消息版本和工具调用、输出、回答等记录都要还在当前库或同一数据目录的某个历史库里，正文文件也在，副本里显示的每条消息在那里也显示同一个版本',
+      '含有别处没有的对话或记录的一律保留',
+      '内容完整的默认勾选；有消息在那里已被你删除、编辑或重试替换的单独列出，默认不勾选',
+      '拷来目录本身和其中的设置、规则、技能不会被删除'
+    ]) assert.ok(cleanup.includes(phrase), `说明里没有“${phrase}”：${cleanup}`);
+    assert.doesNotMatch(cleanup, /只列出/, '归档和拷来目录里的库不再只列出');
+  } finally {
+    await server?.close();
+    globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document;
+    else globalThis.document = previousDocument;
+    if (previousPinia) pinia.setActivePinia(previousPinia);
+  }
+});

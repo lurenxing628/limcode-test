@@ -696,8 +696,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         runtimeKernelEpoch: this.product.application.database.binding.runtimeKernelEpoch
       },
       database,
-      // Metadata only: ContentObject records per type from the worker's covering-index aggregate.
-      contentUsage: summarizeRuntimeContentUsage(await this.product.application.database.contentUsage()),
+      // Metadata only: ContentObject records per type from the worker's covering-index aggregate. A
+      // failed aggregate is reported in its place; the rest of the diagnostics is still shown.
+      contentUsage: await this.product.application.database.contentUsage().then(summarizeRuntimeContentUsage).catch((error: unknown) => ({
+        unavailable: '按类型统计正文失败', detail: error instanceof Error ? error.message : String(error)
+      })),
       recovery: this.product.recoveryState(),
       diagnostics: await this.product.diagnostics.inspect({ scopeId: conversationId, limit: 200 }),
       ...(conversationId ? {

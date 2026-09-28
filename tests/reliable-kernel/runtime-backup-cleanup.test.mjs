@@ -197,7 +197,7 @@ test('升级前备份：升级完成满 7 天才可删；控制根里有进行�
   const fresh = await planRuntimeBackupCleanup(fixture.root, database);
   const freshItem = itemAt(fresh, backup);
   assert.equal(freshItem.kind, 'epoch-migration');
-  assert.match(freshItem.reason, /^升级完成不满 7 天，.+ 之后才可以删除$/);
+  assert.match(freshItem.reason, /^升级完成不满 7 天，\d{4}-\d\d-\d\d \d\d:\d\d 之后才可以删除$/);
   const eightDays = { now: () => Date.now() + 8 * DAY };
   const later = await planRuntimeBackupCleanup(fixture.root, database, eightDays);
   assert.equal(itemAt(later, backup).deletable, true, itemAt(later, backup).reason);

@@ -402,6 +402,35 @@ test('开发诊断命令打开的 JSON 带上同一份按类型统计，数据�
   assert.equal(snapshot.database.readerBusyTimeoutMs, '5000');
 });
 
+test('盲审 #5 开发诊断：按类型统计正文失败时只在 contentUsage 处写明，整份诊断照常打开', async (t) => {
+  const { database } = await openRuntime(t, 'inspect-failing');
+  const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
+    compiledRoot, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
+  ));
+  const { registerCommands } = require(path.join(compiledRoot, 'vscode/commands/registerCommands.js'));
+  const { EXTENSION_COMMAND_IDS } = require(path.join(compiledRoot, 'shared/extensionIdentity.js'));
+  // The same open database, except that its per-type aggregate fails.
+  database.contentUsage = async () => { throw new Error('Runtime reader worker exited (code 1).'); };
+  t.after(() => { delete database.contentUsage; });
+  const facade = Object.assign(Object.create(Facade.prototype), {
+    disposed: false,
+    productClosed: false,
+    product: {
+      application: { database },
+      recoveryState: () => ({ state: 'fixture' }),
+      diagnostics: { inspect: async () => ({ events: [], spans: [] }) }
+    }
+  });
+  registerCommands({ subscriptions: [], extensionMode: vscode.ExtensionMode.Development }, { wait: async () => facade, current: () => facade });
+  ui.documents.length = 0;
+  await ui.registered.get(EXTENSION_COMMAND_IDS.inspectReliability)({ conversationId: '' });
+  assert.equal(ui.documents.length, 1, '诊断照常打开');
+  const snapshot = JSON.parse(ui.documents[0]);
+  assert.deepEqual(snapshot.contentUsage, { unavailable: '按类型统计正文失败', detail: 'Runtime reader worker exited (code 1).' });
+  assert.equal(snapshot.database.foreignKeys, '1', '其余诊断都在');
+  assert.deepEqual(snapshot.recovery, { state: 'fixture' });
+});
+
 test('冻结期间（本窗口正在迁移数据目录等）开发诊断与查看存储占用都是只读，照常可用；写命令被拒绝', async (t) => {
   const { database, store } = await openRuntime(t, 'frozen');
   await store.ingest(database, 'frozen message', MESSAGE);
@@ -499,11 +528,21 @@ test('查看存储占用：当前库在目录统计之后按分类列出正文�
   assert.ok((await show(current, startupWith(openRuntimeOf(moved)))).includes(unavailable));
   assert.equal(usageCalls, 1);
 
-  // A failed read is reported in place; the directory statistics are still shown.
-  const failing = { binding: database.binding, contentUsage: async () => { throw new Error('worker 已关闭.'); } };
-  const failedView = await show(current, startupWith(openRuntimeOf(failing)));
+  // A failed read is reported in place in words, its own text only in the log (盲审 #5); the directory statistics are still shown.
+  const failing = { binding: database.binding, contentUsage: async () => { throw new Error('Runtime reader worker exited (code 1).'); } };
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (...args) => { warnings.push(args.map(String).join(' ')); };
+  let failedView;
+  try {
+    failedView = await show(current, startupWith(openRuntimeOf(failing)));
+  } finally {
+    console.warn = warn;
+  }
   assert.ok(failedView.includes('SQLite 数据库：3 个文件，8 KiB'));
-  assert.ok(failedView.endsWith('\n\n按类型统计正文失败：worker 已关闭。'));
+  assert.ok(failedView.endsWith('\n\n按类型统计正文失败（详细原因已写入日志），稍后再打开一次试试。'));
+  assert.doesNotMatch(failedView, /worker exited/);
+  assert.ok(warnings.some((line) => line.includes('Runtime reader worker exited (code 1).')), warnings.join('\n'));
 });
 
 test('开发命令的“磁盘占用”入口把窗口启动句柄交给存储视图', async () => {

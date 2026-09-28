@@ -490,7 +490,8 @@ test('外来库保留的升级前备份按同样的规则：升级完成满 7 �
   const backupName = path.basename(upgraded.backupPath);
 
   const fresh = itemAt(await planRuntimeBackupCleanup(fixture.root, database), twin);
-  assert.deepEqual([fresh.deletable, fresh.reason.replace(/\d{4}-\d\d-\d\dT[\d:.]+Z/, 'T')], [false,
+  // Local time to the minute, as the panel shows every time (盲审 #6), never UTC.
+  assert.deepEqual([fresh.deletable, fresh.reason.replace(/\d{4}-\d\d-\d\d \d\d:\d\d/, 'T')], [false,
     `它保留的升级前备份 ${backupName}：升级完成不满 7 天，T 之后才可以删除，整份保留`]);
   // A clock that went back: the completion lies ahead of now, so no time of it is trusted.
   const skewed = itemAt(await planRuntimeBackupCleanup(fixture.root, database, { now: () => Date.now() - DAY }), twin);

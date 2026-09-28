@@ -5,8 +5,8 @@ import { assertCurrentSchema, assertDatabaseBinding, configureReaderConnection }
 import { readRuntimeDataSetSummary, runtimeDataSetContentDigest } from './runtimeDataSetContent';
 import { inventoryRelocatedWork } from './relocatedWorkInventory';
 import {
-  RUNTIME_HISTORY_RECORD_DOMAINS, type RuntimeDataSetFacts, type RuntimeDataSetFactsWorkerData, type RuntimeDataSetFactsWorkerResponse,
-  type RuntimeDataSetHistoryIds
+  RUNTIME_HISTORY_RECORD_DOMAINS, type RuntimeDataSetContentBodies, type RuntimeDataSetFacts, type RuntimeDataSetFactsWorkerData,
+  type RuntimeDataSetFactsWorkerResponse, type RuntimeDataSetHistoryIds
 } from './runtimeDataSetFacts';
 import { assertPublishedPreviousRuntimeEpochSnapshot } from './runtimeEpochMigration';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
@@ -46,6 +46,7 @@ async function read(input: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeD
       ...(input.contentDigest ? { contentDigest: runtimeDataSetContentDigest(database) } : {}),
       ...(input.summary ? { summary: readRuntimeDataSetSummary(database) } : {}),
       ...(input.historyIds ? { historyIds: readHistoryIds(database) } : {}),
+      ...(input.contentBodies ? { contentBodies: readContentBodies(database) } : {}),
       ...(input.relocatedWork ? { relocatedWork: inventoryRelocatedWork(database) } : {})
     };
   } finally {
@@ -60,21 +61,8 @@ async function read(input: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeD
  * must not look as if it held less history, or fewer visible messages, than it does.
  */
 function readHistoryIds(database: Database.Database): RuntimeDataSetHistoryIds {
-  const present = new Set(database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").pluck().all() as string[]);
-  const rows = (table: string, columns: readonly string[]): string[][] => {
-    if (!present.has(table)) {
-      if (table === 'conversation' || table.startsWith('message')) throw new Error(`Historical table ${table} is missing.`);
-      return [];
-    }
-    const values = database.prepare(`SELECT ${columns.map((column) => `"${column}"`).join(', ')} FROM "${table}" NOT INDEXED`).raw().all() as unknown[][];
-    return values.map((row) => row.map((value, index) => {
-      if (typeof value === 'string' && value.length > 0) return value;
-      // A byte length is an integer column: kept as decimal text.
-      if (typeof value === 'bigint' || (typeof value === 'number' && Number.isSafeInteger(value))) return String(value);
-      throw new Error(`Historical ${table}.${columns[index]} is not non-empty text.`);
-    }));
-  };
-  const ids = (table: string): string[] => rows(table, ['id']).map(([id]) => id);
+  const rows = historyRows(database);
+  const ids = (table: string): string[] => rows(table, ['id'], true) as string[];
   const records: Record<string, string[]> = {};
   for (const domain of RUNTIME_HISTORY_RECORD_DOMAINS) records[domain.key] = ids(domain.table);
   // Visible: not deleted, with a current revision (what every reader of the history shows).
@@ -89,8 +77,40 @@ function readHistoryIds(database: Database.Database): RuntimeDataSetHistoryIds {
     messageRevisions: ids('message_revision'),
     records,
     visibleMessages,
-    contents: rows('content_object', ['id', 'storage_key', 'byte_length']).map(([id, key, length]) => [id, key, length])
+    contents: ids('content_object')
   };
+}
+
+/** Every body with its CAS storage key and byte length, from the table itself (see readHistoryIds). */
+function readContentBodies(database: Database.Database): RuntimeDataSetContentBodies {
+  return historyRows(database)('content_object', ['id', 'storage_key', 'byte_length']).map(([id, key, length]) => [id, key, length]);
+}
+
+/**
+ * Rows of a history table as non-empty text, read NOT INDEXED; a table an older epoch did not have
+ * is empty, except the ones every epoch has (conversations and messages).
+ */
+function historyRows(database: Database.Database): {
+  (table: string, columns: readonly string[]): string[][];
+  (table: string, columns: readonly [string], single: true): string[];
+} {
+  const present = new Set(database.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'").pluck().all() as string[]);
+  const text = (table: string, column: string, value: unknown): string => {
+    if (typeof value === 'string' && value.length > 0) return value;
+    // A byte length is an integer column: kept as decimal text.
+    if (typeof value === 'bigint' || (typeof value === 'number' && Number.isSafeInteger(value))) return String(value);
+    throw new Error(`Historical ${table}.${column} is not non-empty text.`);
+  };
+  return ((table: string, columns: readonly string[], single?: true): string[][] | string[] => {
+    if (!present.has(table)) {
+      if (table === 'conversation' || table.startsWith('message')) throw new Error(`Historical table ${table} is missing.`);
+      return [];
+    }
+    const statement = database.prepare(`SELECT ${columns.map((column) => `"${column}"`).join(', ')} FROM "${table}" NOT INDEXED`);
+    // One column (ids): plain values, without an array per row.
+    if (single) return (statement.pluck().all() as unknown[]).map((value) => text(table, columns[0], value));
+    return (statement.raw().all() as unknown[][]).map((row) => row.map((value, index) => text(table, columns[index], value)));
+  }) as ReturnType<typeof historyRows>;
 }
 
 /** Rows as they are (a nullable column stays null), from the table itself. */
