@@ -47,7 +47,9 @@ import type { ReliableKernelApplication } from '../../reliableKernel/runtimeAppl
  * Settling can create new work (a requester told that nobody will answer), so it runs in rounds over
  * the whole data set (see run). Work a live Host executes gets the durable stop request, or is left
  * to that Host, and is returned in `live`; what a stop path does not close here is returned in
- * `unsettled` (`needs_human`, `failed`, and `rounds_exhausted` past the round limit).
+ * `unsettled` (`needs_human`, `failed`, and `rounds_exhausted` past the round limit). Nothing
+ * returned there is settled: while anything is, the caller lets nothing run (the old directory does
+ * not open, see relocatedWorkOpening) and the next open settles the whole data set again.
  *
  * Call it on the old directory's opened Runtime before its startup recovery (application.recover,
  * the child scheduler and the Runner) runs, and only on the user's explicit choice: closing work
@@ -97,39 +99,43 @@ export type RelocatedWorkUnsettledKind =
   | 'failed'
   /**
    * Still new executable work after MAX_SETTLEMENT_ROUNDS rounds (each round's settlement created
-   * more, for example requesters told that nobody will answer): reported, not settled further.
+   * more, for example requesters told that nobody will answer): not settled further this time.
    */
   | 'rounds_exhausted';
 
 /**
- * The inventory lists whose items this module may only report (no existing transition closes them
- * without starting a Turn): opening the old directory may still run them once. Prompts list the
- * inventory's items of these lists; a kind that becomes settleable leaves this table, and the
- * prompts shrink with it. Every list is settleable now: what may still need a person (`live`,
- * `needs_human`, `rounds_exhausted`) is only known once the settlement ran, from its result.
+ * What an item is: the inventory list its id belongs to (`pendingProcessCompletionIds` holds dispatch
+ * ids), `otherRuntimeWork` (the pending-work probe; id: the Conversation) or `round` (a whole round).
  */
-export const RELOCATED_WORK_REPORTED_ONLY: Readonly<Partial<Record<(typeof RELOCATED_WORK_LISTS)[number], RelocatedWorkUnsettledKind>>> = Object.freeze({});
+export type RelocatedWorkItemList = (typeof RELOCATED_WORK_LISTS)[number] | 'otherRuntimeWork' | 'round';
 
-export interface RelocatedWorkUnsettled {
+export interface RelocatedWorkItem {
   conversationId: string;
-  kind: RelocatedWorkUnsettledKind;
   id: string;
+  list: RelocatedWorkItemList;
+}
+
+export interface RelocatedWorkUnsettled extends RelocatedWorkItem {
+  kind: RelocatedWorkUnsettledKind;
   detail: string;
 }
 
 export interface RelocatedWorkSettlementResult {
   reason: string;
   counts: RelocatedWorkSettlementCounts;
-  /** Work a live Host executes: its durable stop request is written and that Host closes it. */
-  live: Array<{ conversationId: string; id: string }>;
+  /** Work a live Host executes or holds: a Turn has its durable stop request, the rest is left to that Host. */
+  live: RelocatedWorkItem[];
   unsettled: RelocatedWorkUnsettled[];
   /** Settlement rounds run: settling can create new work (see run), taken again up to the limit. */
   rounds: number;
 }
 
 const SOURCE_PREFIX = 'data-root-relocated';
-/** Rounds of settle, converge collaboration, take the inventory again; more new work is only reported. */
+/** Rounds of settle, converge collaboration, take the inventory again; more new work is left (`rounds_exhausted`). */
 const MAX_SETTLEMENT_ROUNDS = 5;
+/** Converging and taking the inventory between rounds is tried this often (another Host may converge the same facts). */
+const ROUND_ATTEMPTS = 3;
+const ROUND_RETRY_DELAY_MS = 100;
 const CONTROL_LEASE_MS = 30_000;
 const CHILD_RUNNING_STATUSES = ['starting', 'active', 'interrupting'] as const;
 
@@ -196,21 +202,18 @@ class RelocatedWorkSettlement {
    * each round the collaboration facts converge, the whole data set is taken again
    * (RuntimeDatabase.relocatedWorkInventory) and the Conversations with work not seen before are
    * settled the same way, until no new work appears. After MAX_SETTLEMENT_ROUNDS rounds, what is
-   * still new is reported (`rounds_exhausted`) instead of settled.
+   * still new is left (`rounds_exhausted`: the caller must not let it run). Converging and taking the
+   * inventory is tried ROUND_ATTEMPTS times (another live Host of the old directory may converge the
+   * same facts at once); when it keeps failing, the round is `failed`: what it would have found is
+   * not settled, so the caller must not let anything run.
    */
   public async run(): Promise<RelocatedWorkSettlementResult> {
     const seen = new Set<string>();
     let round = 1;
     await this.settleRound(this.inventory.conversations, seen);
     for (;;) {
-      let next: RelocatedWorkInventory;
-      try {
-        await this.application.runtime.collaboration.reconcile();
-        next = parseRelocatedWorkInventory(await this.application.database.relocatedWorkInventory());
-      } catch (error) {
-        this.unsettled.push({ conversationId: '', kind: 'failed', id: `round-${round + 1}`, detail: errorMessage(error) });
-        break;
-      }
+      const next = await this.nextInventory(round + 1);
+      if (!next) break;
       const fresh = next.conversations.filter((conversation) => workKeys(conversation).some((key) => !seen.has(key)));
       if (fresh.length === 0) break;
       if (round >= MAX_SETTLEMENT_ROUNDS) {
@@ -218,8 +221,8 @@ class RelocatedWorkSettlement {
           for (const key of workKeys(conversation).filter((item) => !seen.has(item))) {
             const [list, id] = key.split('|');
             this.unsettled.push({
-              conversationId: conversation.conversationId, kind: 'rounds_exhausted', id,
-              detail: `收尾 ${MAX_SETTLEMENT_ROUNDS} 轮后仍出现新的可执行项（${list}），只报告，不再收尾。`
+              conversationId: conversation.conversationId, list: list as RelocatedWorkItemList, kind: 'rounds_exhausted', id,
+              detail: `收尾 ${MAX_SETTLEMENT_ROUNDS} 轮后仍出现新的可执行项（${list}），这次不再收尾。`
             });
           }
         }
@@ -228,13 +231,36 @@ class RelocatedWorkSettlement {
       round += 1;
       await this.settleRound(fresh, seen);
     }
+    return this.result(round);
+  }
+
+  /** Collaboration converged and the whole data set taken again, tried a few times; undefined (a `failed` round) when it keeps failing. */
+  private async nextInventory(round: number): Promise<RelocatedWorkInventory | undefined> {
+    let failure: unknown;
+    for (let attempt = 1; attempt <= ROUND_ATTEMPTS; attempt += 1) {
+      try {
+        await this.application.runtime.collaboration.reconcile();
+        return parseRelocatedWorkInventory(await this.application.database.relocatedWorkInventory());
+      } catch (error) {
+        failure = error;
+        if (attempt < ROUND_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, ROUND_RETRY_DELAY_MS * attempt));
+      }
+    }
+    this.unsettled.push({
+      conversationId: '', list: 'round', kind: 'failed', id: `round-${round}`,
+      detail: `第 ${round} 轮之前协作收敛或重新盘点失败（试了 ${ROUND_ATTEMPTS} 次）：${errorMessage(failure)}`
+    });
+    return undefined;
+  }
+
+  private result(rounds: number): RelocatedWorkSettlementResult {
     // A Conversation settled again in a later round reports what is still open once.
     return {
       reason: this.reason,
       counts: { ...this.counts },
       live: uniqueBy(this.live, (item) => `${item.conversationId}|${item.id}`),
       unsettled: uniqueBy(this.unsettled, (item) => `${item.conversationId}|${item.kind}|${item.id}`),
-      rounds: round
+      rounds
     };
   }
 
@@ -284,11 +310,11 @@ class RelocatedWorkSettlement {
         if (!result.deduplicated) this.counts.queuedMessagesCancelled += 1;
       } catch (error) {
         if (isConversationRuntimeOwnerBusyError(error)) {
-          this.live.push({ conversationId, id: intentId });
+          this.live.push({ conversationId, id: intentId, list: 'queuedIntentIds' });
         } else if (/not an ordinary queued guidance message/.test(errorMessage(error))) {
           await this.cancelQueuedIntent(conversationId, intentId, revisionSeq.toString());
         } else {
-          this.unsettled.push({ conversationId, kind: 'failed', id: intentId, detail: errorMessage(error) });
+          this.unsettled.push({ conversationId, list: 'queuedIntentIds', kind: 'failed', id: intentId, detail: errorMessage(error) });
         }
       }
     }
@@ -305,8 +331,8 @@ class RelocatedWorkSettlement {
       });
       if (!result.deduplicated) this.counts.queuedIntentsCancelled += 1;
     } catch (error) {
-      if (isConversationRuntimeOwnerBusyError(error)) this.live.push({ conversationId, id: intentId });
-      else this.unsettled.push({ conversationId, kind: 'failed', id: intentId, detail: errorMessage(error) });
+      if (isConversationRuntimeOwnerBusyError(error)) this.live.push({ conversationId, id: intentId, list: 'queuedIntentIds' });
+      else this.unsettled.push({ conversationId, list: 'queuedIntentIds', kind: 'failed', id: intentId, detail: errorMessage(error) });
     }
   }
 
@@ -341,24 +367,24 @@ class RelocatedWorkSettlement {
         () => this.settleOwnedTurn(turnId)
       );
       if (outcome === 'stopped') await this.countClosedWork(before);
-      else if (outcome === 'live') this.live.push({ conversationId, id: turnId });
+      else if (outcome === 'live') this.live.push({ conversationId, id: turnId, list: 'activeTurnIds' });
       else if (outcome === 'unsupported' || outcome === 'needs_human') {
         this.unsettled.push({
-          conversationId, kind: 'needs_human', id: turnId,
+          conversationId, list: 'activeTurnIds', kind: 'needs_human', id: turnId,
           detail: outcome === 'unsupported'
             ? '子 Agent 的派生或取消仍在进行，停止路径不在这里收尾；已记录停止请求。'
             : 'Turn 的终态事实不一致，需要人工处理；已记录停止请求。'
         });
       } else if (outcome === 'failed') {
-        this.unsettled.push({ conversationId, kind: 'failed', id: turnId, detail: '停止请求没有被收尾路径接受。' });
+        this.unsettled.push({ conversationId, list: 'activeTurnIds', kind: 'failed', id: turnId, detail: '停止请求没有被收尾路径接受。' });
       }
       return outcome;
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) {
-        this.live.push({ conversationId, id: turnId });
+        this.live.push({ conversationId, id: turnId, list: 'activeTurnIds' });
         return 'live';
       }
-      this.unsettled.push({ conversationId, kind: 'failed', id: turnId, detail: errorMessage(error) });
+      this.unsettled.push({ conversationId, list: 'activeTurnIds', kind: 'failed', id: turnId, detail: errorMessage(error) });
       return 'failed';
     }
   }
@@ -621,7 +647,7 @@ class RelocatedWorkSettlement {
       }
     } catch (error) {
       this.unsettled.push({
-        conversationId: parentConversationId ?? rootId, kind: 'failed', id: rootId, detail: errorMessage(error)
+        conversationId: parentConversationId ?? rootId, list: 'childExecutionIds', kind: 'failed', id: rootId, detail: errorMessage(error)
       });
     }
   }
@@ -665,10 +691,10 @@ class RelocatedWorkSettlement {
           this.counts.deliveriesAbandoned += 1;
           this.counts.queuedIntentsCancelled += result.intentsCancelled;
         } else if (result.outcome === 'live') {
-          this.live.push({ conversationId, id: deliveryId });
+          this.live.push({ conversationId, id: deliveryId, list: 'pendingDeliveryIds' });
         }
       } catch (error) {
-        this.unsettled.push({ conversationId, kind: 'failed', id: deliveryId, detail: errorMessage(error) });
+        this.unsettled.push({ conversationId, list: 'pendingDeliveryIds', kind: 'failed', id: deliveryId, detail: errorMessage(error) });
       }
     }
   }
@@ -703,18 +729,18 @@ class RelocatedWorkSettlement {
         if (!await this.get('AnswerSubmission', submissionId)) continue;
         const inbox = await answers.ensureInboxForSubmission(submissionId);
         if (inbox.deferredLiveOwner) {
-          this.live.push({ conversationId, id: submissionId });
+          this.live.push({ conversationId, id: submissionId, list: 'undeliveredAnswerIds' });
           continue;
         }
         const disposition = await answers.classifyDeliveryRecovery(submissionId);
         if (disposition.kind === 'deferred_live_owner') {
-          this.live.push({ conversationId, id: submissionId });
+          this.live.push({ conversationId, id: submissionId, list: 'undeliveredAnswerIds' });
           continue;
         }
         if (disposition.kind !== 'delivery_required') continue;
         // A parent Turn still active after the stops above is a live Host's (reported there): it takes the answer in.
         if ((await this.get('Turn', disposition.automaticSourceTurnId))?.status === 'active') {
-          this.live.push({ conversationId, id: submissionId });
+          this.live.push({ conversationId, id: submissionId, list: 'undeliveredAnswerIds' });
           continue;
         }
         const abandoned = await this.application.runtime.deliveries.createAbandoned({
@@ -724,7 +750,7 @@ class RelocatedWorkSettlement {
         });
         if (abandoned.created) this.counts.answersAbandoned += 1;
       } catch (error) {
-        this.unsettled.push({ conversationId, kind: 'failed', id: submissionId, detail: errorMessage(error) });
+        this.unsettled.push({ conversationId, list: 'undeliveredAnswerIds', kind: 'failed', id: submissionId, detail: errorMessage(error) });
       }
     }
   }
@@ -753,9 +779,9 @@ class RelocatedWorkSettlement {
           reason: DATA_ROOT_RELOCATED_REASON
         });
         if (outcome === 'abandoned') this.counts.processCompletionsAbandoned += 1;
-        else if (outcome === 'live') this.live.push({ conversationId, id: String(dispatch.id) });
+        else if (outcome === 'live') this.live.push({ conversationId, id: String(dispatch.id), list: 'pendingProcessCompletionIds' });
       } catch (error) {
-        this.unsettled.push({ conversationId, kind: 'failed', id: String(dispatch.id), detail: errorMessage(error) });
+        this.unsettled.push({ conversationId, list: 'pendingProcessCompletionIds', kind: 'failed', id: String(dispatch.id), detail: errorMessage(error) });
       }
     }
   }

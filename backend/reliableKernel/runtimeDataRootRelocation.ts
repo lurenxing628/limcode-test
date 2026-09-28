@@ -76,7 +76,11 @@ export const DATA_ROOT_IDENTITY_FILE = '.limcode-data-root-identity.json';
 export const DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY = '.limcode-relocation-backups';
 /**
  * Left in the old directory when its data moved: an installation that still uses that directory
- * (the pointer is kept per installation) learns where the data went.
+ * (the pointer is kept per installation) learns where the data went, and the work that moved is not
+ * resumed there (see DataRootMovedNotice.carriedWork). The old directory's only guard, so it is
+ * written durably before the pointer switches (a relocation that cannot write it is undone) and
+ * removed by that relocation's undo, which puts back the one that was there before (an earlier
+ * relocation away from that directory); one that cannot be understood keeps the directory closed.
  */
 export const DATA_ROOT_MOVED_NOTICE_FILE = '.limcode-data-root-moved.json';
 /** A folder that already holds other files receives LimCode data only in its own sub-folder. */
@@ -88,6 +92,8 @@ const MARKER_KIND = 'limcode-data-root-relocation';
 /** A data set of the old directory that stays there because the target already has one with its id. */
 const NAME_TAKEN_REASON = '新数据目录里已有同名历史库';
 const MOVED_NOTICE_KIND = 'limcode-data-root-moved';
+/** In a relocation's work directory: the moved notice its source had before it wrote its own (put back by its undo). */
+const EARLIER_MOVED_NOTICE_FILE = 'moved-notice-before.json';
 const IDENTITY_KIND = 'limcode-data-root-identity';
 const JOURNAL_FILE = 'journal.jsonl';
 const CONFIGURATION_BACKUP_DIRECTORY = 'configuration';
@@ -148,10 +154,13 @@ export class DataRootRelocationError extends Error {
  * process is alive or cannot be judged (or its undo cannot run right now); 'relocation-undoing':
  * one failed and its live process is undoing it (or its undo stopped); 'unpublished': a
  * relocation of another installation copied its data in but never switched to it, and its process
- * is gone (the user decides: undo it, or do not open the directory now).
+ * is gone (the user decides: undo it, or do not open the directory now); 'moved-work': a relocation
+ * carried unfinished work away and the user did not decide yet; 'moved-work-unsettled': that work
+ * could not all be settled at this open (it stays consented; the next open settles it again);
+ * 'moved-notice-invalid': its moved notice is there but cannot be understood (never taken for none).
  */
 export type DataRootUnavailableReason = 'missing' | 'not-directory' | 'empty' | 'mismatch' | 'unreadable' | 'inaccessible' | 'relocating'
-  | 'relocation-undoing' | 'unpublished' | 'moved-work';
+  | 'relocation-undoing' | 'unpublished' | 'moved-work' | 'moved-work-unsettled' | 'moved-notice-invalid';
 
 /** Read errors that usually pass by themselves (see DataRootUnavailableReason 'unreadable'). */
 const TRANSIENT_READ_ERRORS: ReadonlySet<string> = new Set([
@@ -336,16 +345,37 @@ export interface DataRootCarriedDataSet {
 
 export type DataRootCarriedWorkSettlement =
   | { state: 'pending' }
-  /** The user chose to keep using the old directory: settled at its next open before anything runs (again after a crash). */
-  | { state: 'consented'; at: string; by: string }
-  /** Settled once, by the installation `by`; never again. */
+  /**
+   * The user chose to keep using the old directory: settled at its next open before anything runs.
+   * It stays consented until an open settles all of it: after a crash, and after an open that could
+   * not settle everything (`left`: what that open left and why; the open failed and nothing ran).
+   */
+  | { state: 'consented'; at: string; by: string; left?: DataRootCarriedWorkLeft }
+  /** Settled, all of it (by the installation `by`); never again. */
   | { state: 'settled'; at: string; by: string; result: DataRootCarriedWorkResult };
 
-/** What the settlement closed and what it could not (see relocatedWorkSettlement). */
+/** What the settlement closed, per kind (see relocatedWorkSettlement's counts). */
 export interface DataRootCarriedWorkResult {
   counts: Record<string, number>;
-  live: Array<{ conversationId: string; id: string }>;
-  unsettled: Array<{ conversationId: string; kind: string; id: string; detail: string }>;
+}
+
+/** What an open could not settle; while anything is left the old directory does not open. */
+export interface DataRootCarriedWorkLeft {
+  at: string;
+  by: string;
+  items: DataRootCarriedWorkLeftItem[];
+}
+
+export interface DataRootCarriedWorkLeftItem {
+  conversationId: string;
+  /** The Conversation's title when it was recorded. */
+  title: string;
+  /** What it is (RelocatedWorkItemList of relocatedWorkSettlement). */
+  list: string;
+  id: string;
+  /** 'live': a live window runs or holds it; the others as relocatedWorkSettlement reports them. */
+  why: 'live' | 'failed' | 'needs_human' | 'rounds_exhausted';
+  detail: string;
 }
 
 /** What the pointer switch records: the identity of the new data directory. */
@@ -1198,7 +1228,8 @@ export async function abandonStagedDataRootRelocation(
 /**
  * Exclusive phase. Call while holding the old directory's configuration admission after every
  * Host of its current data set went offline (this window's own Runtime included). `publish`
- * switches the data-root pointer; it runs last, after the completion record. A failure before it
+ * switches the data-root pointer; it runs last, after the completion record and the old directory's
+ * moved notice (`options.movedBy`; not written: a failure like any other). A failure before it
  * undoes the relocation in the target from its journal right there (both admissions still held,
  * and only while no Host has the target open); `dataRootRelocationCleanupState(error)` tells
  * whether that undo succeeded. A failure of `publish` itself is undone only when
@@ -1223,6 +1254,8 @@ export async function completeDataRootRelocation(
       throw new DataRootRelocationError('data-root-relocation-lost', '新数据目录里的迁移准备记录不见了（可能已被另一个窗口清理），本次不迁移。');
     }
     const journal = RelocationJournal.open(target, staged.relocationId);
+    /** The record as the target has it now (what an undo starts from). */
+    let written: RelocationMarker = staging;
     let completed: RelocationMarker;
     let dataRootId: string;
     let outcome: Omit<DataRootRelocationResult, 'targetRootPath'>;
@@ -1273,6 +1306,21 @@ export async function completeDataRootRelocation(
         receivingFingerprint
       };
       await writeMarker(target, completed);
+      written = completed;
+      if (options.movedBy) {
+        // Before the pointer switches: once it did, the old directory has it (see DataRootMovedNotice).
+        // Not written: the relocation fails and is undone like any other failure before the switch.
+        // A notice already there (an earlier relocation away from it) is kept for that undo to put back.
+        options.onProgress?.('正在旧目录里记下数据已迁走');
+        const noticePath = path.join(source, DATA_ROOT_MOVED_NOTICE_FILE);
+        const earlier = await readTextIfPresent(noticePath);
+        if (earlier !== undefined) await writeTextDurably(path.join(workDirectory(target, staged.relocationId), EARLIER_MOVED_NOTICE_FILE), earlier);
+        await writeJsonDurably(noticePath, {
+          kind: MOVED_NOTICE_KIND, targetRootPath: target, relocationId: staged.relocationId, movedAt: new Date().toISOString(),
+          installation: options.movedBy,
+          ...(carried.length > 0 ? { carriedWork: { dataSets: carried } } : {})
+        });
+      }
       outcome = {
         ...(staging.movedAside ? { copiedDataMovedTo: staging.movedAside } : {}),
         merged,
@@ -1287,7 +1335,7 @@ export async function completeDataRootRelocation(
       // window from opening the target before: nobody else wrote there. A Host that has the target
       // open anyway (an old version) keeps its database untouched.
       options.onProgress?.('正在撤销本次迁移在新目录里的改动');
-      recordCleanup(error, await undoAfterFailure(target, staging).then(() => true, (undoError: unknown) => {
+      recordCleanup(error, await undoAfterFailure(target, written).then(() => true, (undoError: unknown) => {
         console.error('[LimCode] 迁移失败后撤销新数据目录里的改动时出错。', undoError);
         return false;
       }));
@@ -1308,18 +1356,11 @@ export async function completeDataRootRelocation(
       }
       throw error;
     }
-    // The pointer switched: from here on nothing is undone. The confirmation and the notices are best effort.
+    // The pointer switched: from here on nothing is undone. The confirmation and the cleanup are best effort.
     await writeMarker(target, { ...completed, state: 'published', publishedAt: new Date().toISOString() })
       .catch((error: unknown) => console.warn('[LimCode] 在新目录记下迁移已生效失败，下次打开新目录时补记。', error));
     await fs.rm(path.join(target, DATA_ROOT_MOVED_NOTICE_FILE), { force: true })
       .catch((error: unknown) => console.warn('[LimCode] 清除新目录里过时的“数据已迁走”标记失败。', error));
-    if (options.movedBy) {
-      await writeJsonDurably(path.join(source, DATA_ROOT_MOVED_NOTICE_FILE), {
-        kind: MOVED_NOTICE_KIND, targetRootPath: target, relocationId: staged.relocationId, movedAt: new Date().toISOString(),
-        installation: options.movedBy,
-        ...(carried.length > 0 ? { carriedWork: { dataSets: carried } } : {})
-      }).catch((error: unknown) => console.warn('[LimCode] 在旧目录写“数据已迁走”标记失败。', error));
-    }
     return { targetRootPath: target, ...outcome };
   }));
 }
@@ -2151,7 +2192,8 @@ async function hasDatabaseRestore(target: string, marker: RelocationMarker): Pro
  * only so that others see a failed relocation being undone instead of one still running (it is
  * undone anyway, so a mark it cannot write stops nothing). A disk too full for the mark does not
  * stop the undo either (every step frees space or needs none): the mark is tried again after each
- * step until it is written. Every step can run again: replaced files and an existing
+ * step until it is written. Then the moved notice it wrote in the old directory goes (see
+ * removeMovedNotice). Every step can run again: replaced files and an existing
  * receiving database are put back from the relocation's own backups, created entries removed; then
  * the journal directory goes, then the record (the earlier completion record is put back, or it is
  * removed), and last the copied data renamed aside comes back to its place. Stops at the first
@@ -2191,6 +2233,7 @@ async function undoRelocation(target: string, found: RelocationMarker, options: 
       }
     };
     await markUndoing();
+    await removeMovedNotice(target, found);
     const work = workDirectory(target, marker.relocationId);
     for (const entry of [...entries].reverse()) {
       await markUndoing();
@@ -2233,6 +2276,32 @@ async function undoRelocation(target: string, found: RelocationMarker, options: 
   }
   if (found.movedAside && await pathExists(found.movedAside)) await restoreMovedAside(target, found.movedAside);
   else if (found.createdDirectory) await fs.rmdir(target).catch(() => undefined);
+}
+
+/**
+ * The moved notice a relocation wrote in its source directory goes with its undo (it is written
+ * before the pointer switch, see completeDataRootRelocation): the work it names never moved. The one
+ * that was there before it (kept in its work directory) comes back, else the file goes. Only that
+ * relocation's notice; one that cannot be read stays (it may be another's) and one that cannot be
+ * removed stops the undo, for the next attempt. Not under the source's admission (the undo holds the
+ * target's; the other order is the completion's): a consent there meanwhile is refused while the
+ * relocation's process lives (see dataRootMovedNoticeUnderWay).
+ */
+async function removeMovedNotice(target: string, found: RelocationMarker): Promise<void> {
+  const source = path.resolve(found.sourceRootPath);
+  const noticePath = path.join(source, DATA_ROOT_MOVED_NOTICE_FILE);
+  try {
+    const read = await inspectDataRootMovedNotice(source);
+    if (!('notice' in read) || read.notice.relocationId !== found.relocationId) return;
+    const earlier = await readTextIfPresent(path.join(workDirectory(target, found.relocationId), EARLIER_MOVED_NOTICE_FILE));
+    if (earlier === undefined) await fs.rm(noticePath, { force: true });
+    else await writeTextDurably(noticePath, earlier);
+  } catch (error) {
+    throw new DataRootRelocationError('data-root-relocation-undo',
+      `撤销没有做完：没能去掉旧目录里这次迁移写下的“数据已迁走”标记（${noticePath}：${errorMessage(error)}）。`
+      + '它留着，旧目录会把没有迁走的任务当成已迁走，所以撤销停在这里，下次再试。', error);
+  }
+  await syncDirectoryDurably(source).catch(() => undefined);
 }
 
 /** What the user can delete by hand when the target's disk is too full even for the undo. */
@@ -2634,42 +2703,88 @@ export async function findDataRootRelocationCopy(targetRootPath: string, relocat
   return findMovedAside(path.resolve(targetRootPath), relocationId);
 }
 
-/** The moved notice of a directory (see DATA_ROOT_MOVED_NOTICE_FILE), if it has a valid one. */
+/** The moved notice of a directory (see DATA_ROOT_MOVED_NOTICE_FILE), if it has a valid one (for what is only shown). */
 export async function readDataRootMovedNotice(root: string): Promise<DataRootMovedNotice | undefined> {
+  const read = await inspectDataRootMovedNotice(root);
+  return 'notice' in read ? read.notice : undefined;
+}
+
+/**
+ * The moved notice as the gate of an old directory reads it: none, a valid one, or one that is there
+ * but cannot be understood (`invalid`: broken JSON, another shape, a state this version does not know,
+ * such as one a newer version wrote; with the new directory when that part is readable). A read that
+ * fails otherwise proves nothing and throws.
+ */
+export async function inspectDataRootMovedNotice(root: string): Promise<
+  { none: true } | { notice: DataRootMovedNotice } | { invalid: string; targetRootPath?: string }
+> {
   let text: string;
   try { text = await fs.readFile(path.join(path.resolve(root), DATA_ROOT_MOVED_NOTICE_FILE), 'utf8'); }
   catch (error) {
-    // Only a missing notice is none; a read that fails otherwise proves nothing and throws.
-    if (isMissing(error)) return undefined;
+    if (isMissing(error)) return { none: true };
     throw error;
   }
   let value: unknown;
-  try { value = JSON.parse(text); } catch { return undefined; }
+  try { value = JSON.parse(text); } catch (error) { return { invalid: `不是完整的 JSON：${errorMessage(error)}` }; }
   const notice = value as (Partial<DataRootMovedNotice> & { kind?: unknown }) | null;
+  const target = typeof notice?.targetRootPath === 'string' && path.isAbsolute(notice.targetRootPath) ? { targetRootPath: notice.targetRootPath } : {};
   if (notice?.kind !== MOVED_NOTICE_KIND || typeof notice.targetRootPath !== 'string' || typeof notice.relocationId !== 'string'
-    || typeof notice.movedAt !== 'string' || typeof notice.installation?.id !== 'string' || typeof notice.installation.label !== 'string'
-    || (notice.carriedWork !== undefined && !isCarriedWork(notice.carriedWork))) {
-    return undefined;
+    || typeof notice.movedAt !== 'string' || typeof notice.installation?.id !== 'string' || typeof notice.installation.label !== 'string') {
+    return { invalid: '内容不是本版本认得的“数据已迁走”标记', ...target };
+  }
+  if (notice.carriedWork !== undefined && !isCarriedWork(notice.carriedWork)) {
+    return { invalid: '迁走的任务清单或它的收尾状态不是本版本认得的内容（可能是更新的版本写的）', ...target };
   }
   return {
-    targetRootPath: notice.targetRootPath, relocationId: notice.relocationId, movedAt: notice.movedAt,
-    installation: { id: notice.installation.id, label: notice.installation.label },
-    ...(notice.carriedWork ? { carriedWork: notice.carriedWork } : {})
+    notice: {
+      targetRootPath: notice.targetRootPath, relocationId: notice.relocationId, movedAt: notice.movedAt,
+      installation: { id: notice.installation.id, label: notice.installation.label },
+      ...(notice.carriedWork ? { carriedWork: notice.carriedWork } : {})
+    }
   };
+}
+
+/**
+ * Whether the relocation a moved notice names is still under way: the target's record of it is
+ * staging, complete or being undone and its process is not proven gone. The notice is written before
+ * the pointer switches, so until that process ends the relocation may still fail and be undone
+ * (removing the notice): nothing is consented to or settled on it meanwhile. Once that process is
+ * gone the notice holds as written (a relocation it names may have switched), until an undo removes it.
+ */
+export async function dataRootMovedNoticeUnderWay(notice: DataRootMovedNotice): Promise<boolean> {
+  const marker = await readMarker(path.resolve(notice.targetRootPath)).catch(() => undefined);
+  return !!marker && marker.relocationId === notice.relocationId
+    && (marker.state === 'staging' || marker.state === 'complete' || marker.state === 'undoing')
+    && ownerState(marker.owner) !== 'dead';
 }
 
 function isCarriedWork(value: unknown): value is DataRootCarriedWork {
   const work = value as Partial<DataRootCarriedWork> | null;
   return !!work && Array.isArray(work.dataSets) && work.dataSets.length > 0 && work.dataSets.every((item) => {
-    const settlement = item?.settlement as { state?: unknown; at?: unknown; by?: unknown; result?: unknown } | undefined;
-    const result = settlement?.result as Partial<DataRootCarriedWorkResult> | undefined;
+    const settlement = item?.settlement as { state?: unknown; at?: unknown; by?: unknown; result?: unknown; left?: unknown } | undefined;
     try { parseRelocatedWorkInventory(item?.inventory); } catch { return false; }
+    const stamped = typeof settlement?.at === 'string' && typeof settlement.by === 'string';
     return typeof item.id === 'string' && typeof item.dataSetId === 'string'
       && (settlement?.state === 'pending'
-        || (settlement?.state === 'consented' && typeof settlement.at === 'string' && typeof settlement.by === 'string')
-        || (settlement?.state === 'settled' && typeof settlement.at === 'string' && typeof settlement.by === 'string'
-          && !!result && typeof result.counts === 'object' && Array.isArray(result.live) && Array.isArray(result.unsettled)));
+        || (settlement?.state === 'consented' && stamped && (settlement.left === undefined || isCarriedWorkLeft(settlement.left)))
+        || (settlement?.state === 'settled' && stamped && isCarriedWorkResult(settlement.result)));
   });
+}
+
+function isCarriedWorkResult(value: unknown): value is DataRootCarriedWorkResult {
+  const counts = (value as Partial<DataRootCarriedWorkResult> | null)?.counts;
+  return !!counts && typeof counts === 'object' && !Array.isArray(counts)
+    && Object.values(counts).every((count) => Number.isSafeInteger(count) && count >= 0);
+}
+
+const LEFT_WHY: ReadonlySet<string> = new Set(['live', 'failed', 'needs_human', 'rounds_exhausted']);
+
+function isCarriedWorkLeft(value: unknown): value is DataRootCarriedWorkLeft {
+  const left = value as Partial<DataRootCarriedWorkLeft> | null;
+  return !!left && typeof left.at === 'string' && typeof left.by === 'string' && Array.isArray(left.items) && left.items.length > 0
+    && left.items.every((item: Partial<DataRootCarriedWorkLeftItem> | null) => !!item && typeof item.conversationId === 'string'
+      && typeof item.title === 'string' && typeof item.list === 'string' && typeof item.id === 'string'
+      && typeof item.why === 'string' && LEFT_WHY.has(item.why) && typeof item.detail === 'string');
 }
 
 /** Rewrites the moved notice of `root` for relocation `relocationId` under its admission (false: not that notice). */
@@ -2703,14 +2818,32 @@ export async function consentToDataRootMovedWork(root: string, relocationId: str
   });
 }
 
-/** Records, once, the settlement of data set `id`'s carried work (after its consent), with what it closed and left. */
+/** Records, once, that data set `id`'s carried work is all settled (after its consent), with what was closed. */
 export async function recordDataRootMovedWorkSettled(
   root: string, relocationId: string, id: string, by: string, result: DataRootCarriedWorkResult
 ): Promise<boolean> {
+  if (!isCarriedWorkResult(result)) throw new TypeError('recordDataRootMovedWorkSettled requires the counts of what was closed.');
   return updateMovedWork(root, relocationId, (work) => {
     const item = work.dataSets.find((entry) => entry.id === id);
     if (item?.settlement.state !== 'consented') return undefined;
-    const settlement = { state: 'settled' as const, at: new Date().toISOString(), by, result };
+    const settlement = { state: 'settled' as const, at: new Date().toISOString(), by, result: { counts: { ...result.counts } } };
+    return { dataSets: work.dataSets.map((entry) => (entry === item ? { ...entry, settlement } : entry)) };
+  });
+}
+
+/**
+ * Records what an open of data set `id` could not settle (it stays consented; that open failed and
+ * nothing ran), for the prompt; the next open settles all of it again.
+ */
+export async function recordDataRootMovedWorkLeft(
+  root: string, relocationId: string, id: string, by: string, items: readonly DataRootCarriedWorkLeftItem[]
+): Promise<boolean> {
+  const left: DataRootCarriedWorkLeft = { at: new Date().toISOString(), by, items: items.map((item) => ({ ...item })) };
+  if (!isCarriedWorkLeft(left)) throw new TypeError('recordDataRootMovedWorkLeft requires what was left and why.');
+  return updateMovedWork(root, relocationId, (work) => {
+    const item = work.dataSets.find((entry) => entry.id === id);
+    if (item?.settlement.state !== 'consented') return undefined;
+    const settlement = { ...item.settlement, left };
     return { dataSets: work.dataSets.map((entry) => (entry === item ? { ...entry, settlement } : entry)) };
   });
 }
@@ -3221,11 +3354,24 @@ async function copyDurably(from: string, to: string): Promise<void> {
 }
 
 async function writeJsonDurably(file: string, value: unknown): Promise<void> {
+  await writeTextDurably(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+/** A file's text, or undefined when it does not exist (any other read error throws). */
+async function readTextIfPresent(file: string): Promise<string | undefined> {
+  try { return await fs.readFile(file, 'utf8'); }
+  catch (error) {
+    if (isMissing(error)) return undefined;
+    throw error;
+  }
+}
+
+async function writeTextDurably(file: string, text: string): Promise<void> {
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
   try {
     const handle = await fs.open(temporary, 'wx', 0o600);
     try {
-      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
+      await handle.writeFile(text, 'utf8');
       await handle.sync();
     } finally {
       await handle.close();
@@ -3257,6 +3403,14 @@ function dataRootUnavailableMessage(root: string, reason: DataRootUnavailableRea
   if (reason === 'moved-work') {
     return `数据目录暂时没有打开：${root} 的数据已迁移到别处，迁走时还有没完成的任务；在这里打开会把它们再执行一次。`
       + '要在这里继续，这些任务先按中止收尾（它们可能已在新目录执行过）；也可以改用新目录，或暂不打开。';
+  }
+  if (reason === 'moved-work-unsettled') {
+    return `数据目录这次没有打开：${root} 里迁走的任务还没有全部收尾${detail ? `（${detail}）` : ''}。`
+      + '全部收尾之前这里不执行任何工作，以免它们在这里再执行一次；可以重试，重试时会先接着收尾，也可以改用新目录。';
+  }
+  if (reason === 'moved-notice-invalid') {
+    return `数据目录这次没有打开：${root} 里的“数据已迁走”标记（${DATA_ROOT_MOVED_NOTICE_FILE}）读不懂${detail ? `（${detail}）` : ''}，`
+      + '无法确认迁走的任务在这里是否已经收尾，为免它们再执行一次，本窗口没有打开运行时。可以改用新目录，或确认后自行处理这个标记。';
   }
   if (reason === 'unreadable') {
     return `数据目录暂时无法读取：${root}；本窗口没有打开运行时。${detail ?? ''}`;

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import childProcess from 'node:child_process';
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 // A data-root relocation carries unfinished work unchanged into the new directory and never
@@ -10,7 +10,11 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // installation), that work is closed there as a user's stop, so it never runs a second time.
 // Every scenario builds its state in the old directory, relocates for real
 // (stageDataRootRelocation + completeDataRootRelocation), then opens the old directory, settles the
-// inventory taken from it and runs the full startup recovery with the production wake handler.
+// inventory taken from it and runs the full startup recovery with the production wake handler. The
+// old directory's Runtime is opened with its convergence held (as when it opens with carried work)
+// until its recovery releases it; windows that stand for ordinary running ones are `running`. The
+// last group opens it the way Facade.open does (openSettlingRelocatedWork): whatever the settlement
+// leaves keeps it closed, nothing is released and nothing runs, and the retry settles all of it.
 const root = process.cwd();
 const load = (relative) => import(pathToFileURL(path.join(root, 'dist/extension', relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
@@ -24,12 +28,17 @@ const { askUserTool } = await load('backend/world/modules/tools/definitions/askU
 const { runAgentTool } = await load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { inventoryRelocatedWork, parseRelocatedWorkInventory, countRelocatedWork } = await load('backend/reliableKernel/relocatedWorkInventory.js');
 const { settleRelocatedWork, relocatedWorkSettlementReason } = await load('backend/application/reliableKernel/relocatedWorkSettlement.js');
+const { openSettlingRelocatedWork } = await load('backend/application/reliableKernel/relocatedWorkOpening.js');
 const reloc = await import(pathToFileURL(path.join(root, 'tests/reliable-kernel/runtime-data-root-relocation-fixture.mjs')).href);
 
 const PROVIDER_ID = 'relocated-work-provider';
 const PROJECT = { uri: 'file:///workspace/relocated-work', name: '迁走项目' };
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 const TEST_FILE = fileURLToPath(import.meta.url);
+const INSTALLATION_A = '/installations/a';
+const INSTALLATION_B = '/installations/b';
+/** Windows still open (see openHost): a test that fails before its own close leaves none behind (afterEach). */
+const stillOpen = new Set();
 
 /** An MCP tool whose server never answers: its effect stays dispatched while the window lives. */
 const hangingMcpTool = {
@@ -55,13 +64,15 @@ if (workerMode) {
   );
 } else {
 
+afterEach(async () => { for (const host of [...stillOpen]) await host.close(); });
+
 test('回到旧目录：收尾后启动恢复不再执行已迁走的 Turn（旧目录 0 次、新目录 1 次）；清单可写进 JSON；再次收尾不改变任何东西', { timeout: 240_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
   const conversationId = 'conversation-carried';
 
   // Old directory: a project window admitted a user message's Turn and closed before it called the model.
-  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin' });
+  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin', running: true });
   let turnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -89,7 +100,7 @@ test('回到旧目录：收尾后启动恢复不再执行已迁走的 Turn（旧
 
   // New directory: the project window recovers the carried Turn and runs it once.
   const inNew = countingProvider('new-home');
-  const newHost = await openHost(newDataRoot, inNew, { label: 'new-home', wake: true });
+  const newHost = await openHost(newDataRoot, inNew, { label: 'new-home', wake: true, running: true });
   try {
     await newHost.recover();
     await eventually(async () => (await rows(newHost.app, 'Turn', { id: turnId }))[0]?.status === 'terminated', 60_000, '新目录没有执行完');
@@ -139,7 +150,7 @@ test('排队消息：收尾取消排队的用户消息并停止当前 Turn，恢
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
   const conversationId = 'conversation-queued';
-  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin' });
+  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin', running: true });
   let turnId;
   let intentId;
   try {
@@ -188,7 +199,7 @@ test('等待回答的提问：收尾关闭提问并中止 Turn，恢复后没有
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
   const conversationId = 'conversation-ask';
-  const origin = await openHost(oldDataRoot, scriptedProvider(() => askCall('ask-1', '要继续吗？')), { label: 'origin' });
+  const origin = await openHost(oldDataRoot, scriptedProvider(() => askCall('ask-1', '要继续吗？')), { label: 'origin', running: true });
   let turnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -243,7 +254,7 @@ test('运行中的子 Agent（带子树）：父 Turn 停止后级联停止子�
     if (role === 'parent') return spawnCall('spawn-child', 'child', '子任务', 600_000);
     if (role === 'child') return spawnCall('spawn-grandchild', 'grandchild', '孙任务', 600_000);
     return askCall('ask-grandchild', '孙 Agent 要继续吗？');
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   let parentTurnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -305,7 +316,7 @@ test('待投递的子 Agent 答复（投给仍在等待的父 Turn）：收尾�
     return parentCalls === 1
       ? spawnCall('spawn-background', 'background', '后台子任务', 0)
       : askCall('ask-parent', '等子任务的时候先问一句');
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   let parentTurnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -350,7 +361,7 @@ test('待投递的进程完成（投给仍在等待的 Turn）：收尾时由该
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
   const conversationId = 'conversation-process';
-  const origin = await openHost(oldDataRoot, scriptedProvider(() => askCall('ask-process', '进程在跑，先问一句')), { label: 'origin' });
+  const origin = await openHost(oldDataRoot, scriptedProvider(() => askCall('ask-process', '进程在跑，先问一句')), { label: 'origin', running: true });
   let turnId;
   let deliveryId;
   try {
@@ -452,7 +463,7 @@ test('父 Turn 已完成的后台子 Agent（在等提问）：按子对话面�
     return parentCalls === 1
       ? spawnCall('spawn-detached', 'detached', '后台子任务', 0)
       : { role: 'model', parts: [{ text: '父 Turn 已完成' }] };
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   let parentTurnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -521,7 +532,7 @@ test('父 Turn 已完成后才到的子 Agent 答复（会开启新的 Turn）�
     return parentCalls === 1
       ? spawnCall('spawn-late', 'late', '后台子任务', 0)
       : { role: 'model', parts: [{ text: '父 Turn 先结束' }] };
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   let parentTurnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -568,7 +579,7 @@ test('排队的非普通消息（运行时续跑、续写）：收尾取消排�
   const origin = await openHost(oldDataRoot, scriptedProvider(async () => {
     calls += 1;
     return calls === 1 ? { role: 'model', parts: [{ text: '第一个回合结束' }] } : askCall('ask-second', '第二个回合先问一句');
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   let firstTurnId;
   let secondTurnId;
   const deliveryId = 'followup-queued-delivery';
@@ -640,7 +651,7 @@ test('还没送达的子 Agent 答复（答复已提交、窗口在投递之前�
     return parentCalls === 1
       ? spawnCall('spawn-unrouted', 'unrouted', '后台子任务', 0)
       : { role: 'model', parts: [{ text: '父 Turn 先结束' }] };
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   // The answer's submission and its delivery are separate commits: the window stops in between.
   origin.coordinator.deliverBackgroundAnswer = async () => { throw new Error('窗口在答复送达父对话之前关闭'); };
   let parentTurnId;
@@ -690,7 +701,7 @@ test('已结束、完成通知还没派发的后台进程：收尾把完成派�
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
   const conversationId = 'conversation-process-exit';
-  const origin = await openHost(oldDataRoot, scriptedProvider(() => ({ role: 'model', parts: [{ text: '构建已在后台运行' }] })), { label: 'origin' });
+  const origin = await openHost(oldDataRoot, scriptedProvider(() => ({ role: 'model', parts: [{ text: '构建已在后台运行' }] })), { label: 'origin', running: true });
   let turnId;
   let dispatchId;
   try {
@@ -743,7 +754,7 @@ test('父 Turn 已完成的后台子 Agent（在等提问、还排着一条 send
         args: { operation: 'send', childRef: 'A1', prompt: '做完之后再检查一遍' } } }] };
     }
     return { role: 'model', parts: [{ text: '父 Turn 已完成' }] };
-  }), { label: 'origin' });
+  }), { label: 'origin', running: true });
   let parentTurnId;
   try {
     await createConversation(origin.app, conversationId);
@@ -795,7 +806,7 @@ test('协作副作用循环收尾：放弃发给对方的追问后，请求方�
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const oldDataRoot = fixture.current.binding.paths.dataRootPath;
   const [requester, peer] = ['conversation-requester', 'conversation-peer'];
-  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin' });
+  const origin = await openHost(oldDataRoot, countingProvider('origin'), { label: 'origin', running: true });
   let requesterTurnId;
   try {
     await createConversation(origin.app, requester);
@@ -842,7 +853,7 @@ test('放弃转换（控制面）：存活宿主的认领没过期就返回 live
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const conversationId = 'conversation-abandon';
   const reason = 'data-root-relocated';
-  const host = await openHost(fixture.current.binding.paths.dataRootPath, scriptedProvider(() => ({ role: 'model', parts: [{ text: '完成' }] })), { label: 'control' });
+  const host = await openHost(fixture.current.binding.paths.dataRootPath, scriptedProvider(() => ({ role: 'model', parts: [{ text: '完成' }] })), { label: 'control', running: true });
   try {
     const { app } = host;
     await createConversation(app, conversationId);
@@ -964,7 +975,9 @@ test('父 Turn 在一个存活的窗口里运行：它还没送达的子 Agent �
     const targetRootPath = path.join(fixture.base, 'new-home');
     const settled = await settleRelocatedWork({ application: host.app, inventory, targetRootPath });
     assert.deepEqual(settled.unsettled, []);
-    assert.deepEqual(settled.live, [{ conversationId, id: turnId }, { conversationId, id: submissionId }], '父 Turn 和它的答复都留给存活的窗口');
+    assert.deepEqual(settled.live, [
+      { conversationId, id: turnId, list: 'activeTurnIds' }, { conversationId, id: submissionId, list: 'undeliveredAnswerIds' }
+    ], '父 Turn 和它的答复都留给存活的窗口');
     assert.equal(settled.counts.answersAbandoned, 0);
     assert.deepEqual(await rows(host.app, 'RuntimeDelivery'), [], '没有替存活窗口的父 Turn 放弃答复');
     assert.equal((await rows(host.app, 'Turn', { id: turnId }))[0].status, 'active');
@@ -979,9 +992,49 @@ test('父 Turn 在一个存活的窗口里运行：它还没送达的子 Agent �
   }
 });
 
-test('循环收尾有上限：每一轮之后都冒出新的可执行工作时，收尾 5 轮就停，之后冒出的只报告（rounds_exhausted），不再收尾', { timeout: 120_000 }, async (t) => {
+test('轮间的协作收敛一时出错（另一个窗口同时收敛同样的事实）：这一轮重试，照常收尾，不记 failed；一直出错时只记一条 failed（round），收尾本身不抛错', { timeout: 120_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const [requester, peer] = ['conversation-flaky-requester', 'conversation-flaky-peer'];
+  const host = await openHost(fixture.current.binding.paths.dataRootPath, countingProvider('flaky'), { label: 'flaky' });
+  try {
+    const { app } = host;
+    await createConversation(app, requester);
+    await createConversation(app, peer);
+    await pendingFollowup(app, 'followup-flaky', requester, peer);
+    const collaboration = app.runtime.collaboration;
+    let calls = 0;
+    let failing = 2;
+    const application = Object.create(app, { runtime: { value: { ...app.runtime, collaboration: {
+      async reconcile() {
+        calls += 1;
+        if (failing > 0) {
+          failing -= 1;
+          throw new Error('revision conflict: another Host reconciled this request first');
+        }
+        await collaboration.reconcile();
+      }
+    } } } });
+    const inventory = parseRelocatedWorkInventory(await app.database.relocatedWorkInventory());
+    const targetRootPath = path.join(fixture.base, 'new-home');
+    const settled = await settleRelocatedWork({ application, inventory, targetRootPath });
+    assert.deepEqual(settled.unsettled, [], '重试之后照常收尾');
+    assert.equal(settled.rounds, 2, '放弃追问后给请求方的回复在第二轮放弃');
+    assert.ok(calls >= 4, `前两次出错的收敛又试过：${calls}`);
+
+    failing = Infinity;
+    const failed = await settleRelocatedWork({ application, inventory, targetRootPath });
+    assert.deepEqual(failed.unsettled.map((item) => [item.conversationId, item.list, item.kind, item.id]), [['', 'round', 'failed', 'round-2']]);
+    assert.match(failed.unsettled[0].detail, /试了 3 次/);
+  } finally {
+    await host.close();
+  }
+});
+
+test('循环收尾有上限：每一轮之后都冒出新的可执行工作时，收尾 5 轮就停，之后冒出的留作 rounds_exhausted（这次不再收尾；开库时不放行，见最后一组）', { timeout: 120_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const [requester, peer] = ['conversation-endless-requester', 'conversation-endless-peer'];
+  // As on opening the old directory: this Runtime's own convergence is held, so it does not reconcile
+  // the same collaboration facts at the same time (that made a round fail once in a whole-file run).
   const host = await openHost(fixture.current.binding.paths.dataRootPath, countingProvider('endless'), { label: 'endless' });
   try {
     const { app } = host;
@@ -1000,18 +1053,111 @@ test('循环收尾有上限：每一轮之后都冒出新的可执行工作时�
     } } } });
     const inventory = parseRelocatedWorkInventory(await app.database.relocatedWorkInventory());
     const settled = await settleRelocatedWork({ application, inventory, targetRootPath: path.join(fixture.base, 'new-home') });
-    assert.equal(settled.rounds, 5);
-    assert.equal(appeared, 5, '每轮之后都重新盘点');
+    const shown = JSON.stringify(settled.unsettled);
+    assert.equal(settled.rounds, 5, shown);
+    assert.equal(appeared, 5, `每轮之后都重新盘点：${shown}`);
     assert.deepEqual(settled.live, []);
     const [lastReply] = await rows(app, 'RuntimeDelivery', { target_conversation_id: requester, state: 'pending' });
-    assert.deepEqual(settled.unsettled.map((item) => [item.conversationId, item.kind, item.id]),
-      [[peer, 'rounds_exhausted', 'followup-5-delivery'], [requester, 'rounds_exhausted', lastReply.id]], '第 5 轮之后冒出的只报告');
+    assert.deepEqual(settled.unsettled.map((item) => [item.conversationId, item.kind, item.id, item.list]), [
+      [peer, 'rounds_exhausted', 'followup-5-delivery', 'pendingDeliveryIds'], [requester, 'rounds_exhausted', lastReply.id, 'pendingDeliveryIds']
+    ], '第 5 轮之后冒出的留下（rounds_exhausted）');
     assert.match(settled.unsettled[0].detail, /收尾 5 轮后仍出现新的可执行项/);
-    assert.equal((await rows(app, 'RuntimeDelivery', { id: 'followup-5-delivery' }))[0].state, 'pending', '只报告的项不收尾');
+    assert.equal((await rows(app, 'RuntimeDelivery', { id: 'followup-5-delivery' }))[0].state, 'pending', '留下的项这次不收尾');
     assert.equal(settled.counts.deliveriesAbandoned, 9, '5 条追问与前 4 条回复');
   } finally {
     await host.close();
   }
+});
+
+// ---- Opening the old directory as Facade.open does (openSettlingRelocatedWork): whatever the
+// settlement leaves (failed, rounds_exhausted, needs_human, live) keeps it closed, the Runtime is
+// closed again without being released, nothing runs; the retry settles all of it, then opens.
+
+test('不放行（failed）：某一轮协作收敛一直出错（重试 3 次），这次打开失败、运行时关掉、不恢复（照旧放行时请求方收到“没人会回答”的回复会开回合，见审查 RV2）；重试时整库收尾完才放行，旧目录 Provider、工具、进程都是 0 次', { timeout: 300_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await fundedFollowup(fixture, 'conversation-requester', 'conversation-peer', 'followup-carried');
+  await consentAfterRelocation(fixture);
+  const provider = countingProvider('old-home');
+  const first = await openOldHome(fixture, provider, { wrap: (app) => withCollaboration(app, {
+    async reconcile() { throw new Error('revision conflict: another Host reconciled this request first'); }
+  }) });
+  await assertRefused(fixture, first, [['', 'round', 'round-2', 'failed']]);
+  assert.match(first.refused.cause.items[0].detail, /试了 3 次.*revision conflict/);
+  assertNothingRan(provider, first);
+  await assertRetrySettles(fixture, provider);
+});
+
+test('不放行（rounds_exhausted）：每一轮之后都冒出新的可执行工作，收尾 5 轮后还有剩下的，这次打开失败、运行时关掉、不恢复（照旧放行时剩下的追问会开回合，见审查 RV3）；重试时整库收尾完才放行，旧目录 Provider、工具、进程都是 0 次', { timeout: 300_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const [requester, peer] = ['conversation-endless-requester', 'conversation-endless-peer'];
+  const requesterTurnId = await fundedFollowup(fixture, requester, peer, 'followup-0');
+  await consentAfterRelocation(fixture);
+  const provider = countingProvider('old-home');
+  let appeared = 0;
+  const first = await openOldHome(fixture, provider, { wrap: (app) => {
+    const collaboration = app.runtime.collaboration;
+    return withCollaboration(app, {
+      // Every convergence between rounds also brings one more followup: work that keeps appearing.
+      async reconcile() {
+        await collaboration.reconcile();
+        appeared += 1;
+        await pendingFollowup(app, `followup-${appeared}`, requester, peer, { sourceTurnId: requesterTurnId });
+      }
+    });
+  } });
+  assert.equal(appeared, 5);
+  const left = first.refused?.cause?.items ?? [];
+  assert.ok(left.length > 0 && left.every((item) => item.why === 'rounds_exhausted' && item.list === 'pendingDeliveryIds'), JSON.stringify(left));
+  assert.ok(left.some((item) => item.conversationId === peer && item.id === 'followup-5-delivery'), JSON.stringify(left));
+  await assertRefused(fixture, first, left.map((item) => [item.conversationId, item.list, item.id, 'rounds_exhausted']));
+  assertNothingRan(provider, first);
+  await assertRetrySettles(fixture, provider);
+});
+
+test('不放行（needs_human）：停止路径收不掉的 Turn（这里它的恢复判断是 needs_human），这次打开失败、运行时关掉、不恢复；重试时它照常停下、整库收尾完才放行，旧目录 Provider、工具、进程都是 0 次', { timeout: 300_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const conversationId = 'conversation-needs-human';
+  const turnId = await unstartedTurn(fixture, conversationId);
+  await consentAfterRelocation(fixture);
+  const provider = countingProvider('old-home');
+  const first = await openOldHome(fixture, provider, { wrap: (app) => withTurns(app, {
+    async recoveryFacts(id) { return { ...(await app.turns.recoveryFacts(id)), judgment: 'needs_human' }; }
+  }) });
+  await assertRefused(fixture, first, [[conversationId, 'activeTurnIds', turnId, 'needs_human']]);
+  assert.match(first.refused.cause.items[0].detail, /终态事实不一致/);
+  assertNothingRan(provider, first);
+  await assertRetrySettles(fixture, provider);
+  const host = await openHost(fixture.current.binding.paths.dataRootPath, countingProvider('reader'), { label: 'reader' });
+  try { assert.equal((await rows(host.app, 'Turn', { id: turnId }))[0].status, 'terminated'); } finally { await host.close(); }
+});
+
+test('不放行（live：绕过闸门的存活窗口在旧目录里跑着父 Turn，它的子 Agent 答复还没送达）：这次打开失败、运行时关掉、不恢复，答复不在这里放弃；那个窗口没做完就退出后，重试时父 Turn 停下、答复按“数据目录已迁移”放弃，整库收尾完才放行，旧目录 Provider、工具、进程都是 0 次', { timeout: 300_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const dataRoot = fixture.current.binding.paths.dataRootPath;
+  await unstartedTurn(fixture, 'conversation-carried');
+  await consentAfterRelocation(fixture);
+  // A window of the old directory without this gate (e.g. an older version) keeps running a parent Turn there.
+  const conversationId = 'conversation-live-parent';
+  const ready = path.join(fixture.base, 'live-parent-ready.json');
+  const worker = spawnWorker('live-parent', { LIMCODE_RELOCATED_WORK_DATA_ROOT: dataRoot,
+    LIMCODE_RELOCATED_WORK_CONVERSATION: conversationId, LIMCODE_RELOCATED_WORK_READY: ready });
+  t.after(async () => { worker.kill('SIGKILL'); await waitForExit(worker); });
+  const { turnId, submissionId } = await waitForWorkerJson(worker, ready, 90_000);
+  await sleep(300);
+  worker.kill('SIGSTOP');
+  const provider = countingProvider('old-home');
+  const first = await openOldHome(fixture, provider);
+  await assertRefused(fixture, first, [
+    [conversationId, 'activeTurnIds', turnId, 'live'], [conversationId, 'undeliveredAnswerIds', submissionId, 'live']
+  ]);
+  assertNothingRan(provider, first);
+  const reader = await openHost(dataRoot, countingProvider('reader'), { label: 'reader' });
+  try { assert.deepEqual(await rows(reader.app, 'RuntimeDelivery'), [], '答复留给存活的窗口，没有在这里放弃'); } finally { await reader.close(); }
+
+  worker.kill('SIGKILL');
+  await waitForExit(worker);
+  const counts = await assertRetrySettles(fixture, provider);
+  assert.equal(counts.answersAbandoned, 1);
 });
 
 }
@@ -1027,7 +1173,7 @@ async function runWorker(mode) {
   let hangCalls = 0;
   const host = await openHost(dataRoot, scriptedProvider(() => ({
     role: 'model', parts: [{ id: 'call-hang', functionCall: { name: 'fixture_hang', args: {} } }]
-  })), { label: 'origin', onMcpCall: () => { hangCalls += 1; } });
+  })), { label: 'origin', running: true, onMcpCall: () => { hangCalls += 1; } });
   await createConversation(host.app, conversationId);
   const { turnId } = await host.runner.input({ commandId: 'input-mcp', conversationId, text: '调用外部工具' });
   await eventually(async () => hangCalls > 0
@@ -1051,7 +1197,7 @@ async function runLiveParentWorker() {
     if (request.conversationId !== conversationId) return { role: 'model', parts: [{ text: '子任务完成' }] };
     parentCalls += 1;
     return parentCalls === 1 ? spawnCall('spawn-live', 'live', '后台子任务', 0) : askCall('ask-live', '父 Turn 还在等用户回答');
-  }), { label: 'live' });
+  }), { label: 'live', running: true });
   host.coordinator.deliverBackgroundAnswer = async () => { throw new Error('答复送达之前窗口被暂停'); };
   await createConversation(host.app, conversationId);
   const { turnId } = await host.runner.input({ commandId: 'input-live', conversationId, text: '派后台子 Agent，然后问一句' });
@@ -1104,6 +1250,124 @@ function requiredEnv(name) {
   return value;
 }
 
+/** Relocated by installation A with its moved notice, and B's "在这里继续" consent for the old directory. */
+async function consentAfterRelocation(fixture) {
+  const target = path.join(fixture.base, 'new-home');
+  const plan = await reloc.planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const source = await reloc.openRuntime(fixture.current);
+  let staged;
+  try { staged = await reloc.relocation.stageDataRootRelocation(plan, source, options); } finally { await source.close(); }
+  await reloc.relocation.completeDataRootRelocation(staged, async () => undefined, options);
+  assert.equal(await reloc.relocation.consentToDataRootMovedWork(fixture.root, staged.relocationId, INSTALLATION_B), true);
+}
+
+/**
+ * Facade.open with the real openSettlingRelocatedWork (see relocated-work-opening): opened with its
+ * convergence held when there is carried work, settled (`wrap`: a fault while settling), released
+ * only when all of it is settled (`released`: the product runtime's startRecovery waits for it), else
+ * closed again and refused.
+ */
+async function openOldHome(fixture, provider, { wrap = (app) => app } = {}) {
+  const state = { hold: undefined, released: false, closed: false, host: undefined, refused: undefined };
+  const placement = {
+    configurationRootPath: fixture.root,
+    runtimeScopeRootPath: reloc.rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(fixture.root, 'default')
+  };
+  try {
+    await openSettlingRelocatedWork(placement, INSTALLATION_B, async (hold) => {
+      state.hold = hold;
+      state.host = await openHost(fixture.current.binding.paths.dataRootPath, provider, { label: 'old-home', wake: true, holdRuntimeConvergence: hold });
+      return {
+        application: wrap(state.host.app),
+        releaseRelocatedWorkHold: () => { state.released = true; },
+        close: async () => { state.closed = true; await state.host.close(); }
+      };
+    });
+  } catch (error) {
+    state.refused = error;
+    if (state.host && !state.closed) await state.host.close();
+  }
+  return state;
+}
+
+/** Refused with what was left (`[conversation, list, id, why]`), closed without release; the notice stays consented and records it. */
+async function assertRefused(fixture, opened, left) {
+  assert.equal(opened.refused?.reason, 'moved-work-unsettled', `不放行：${opened.refused?.stack}`);
+  assert.deepEqual(opened.refused.cause.items.map((item) => [item.conversationId, item.list, item.id, item.why]), left);
+  assert.deepEqual([opened.hold, opened.released, opened.closed], [true, false, true], '扣住打开、没有放行、运行时关掉');
+  const settlement = (await reloc.relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
+  assert.equal(settlement.state, 'consented', '不记已收尾');
+  assert.deepEqual(settlement.left.items, opened.refused.cause.items, '记下这次留下了什么、为什么');
+}
+
+function assertNothingRan(provider, opened) {
+  assert.equal(provider.calls.length, 0, '旧目录不调用模型');
+  assert.deepEqual(opened.host.executions, { tools: [], processes: [] }, '旧目录不调用工具、不启动进程');
+}
+
+/** The retry: all of it settled and recorded once, released, and the full startup recovery runs nothing. Returns the counts. */
+async function assertRetrySettles(fixture, provider) {
+  const opened = await openOldHome(fixture, provider);
+  assert.equal(opened.refused, undefined, `重试：${opened.refused?.stack}`);
+  assert.deepEqual([opened.hold, opened.released], [true, true], '收尾完才放行');
+  try {
+    await recoverIdle(opened.host, provider);
+    assert.deepEqual(opened.host.executions, { tools: [], processes: [] }, '旧目录不调用工具、不启动进程');
+  } finally { await opened.host.close(); }
+  const settlement = (await reloc.relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
+  assert.equal(settlement.state, 'settled');
+  assert.equal('left' in settlement, false);
+  return settlement.result.counts;
+}
+
+function withCollaboration(app, collaboration) {
+  return Object.create(app, { runtime: { value: { ...app.runtime, collaboration } } });
+}
+
+/** The application with some Turn control-plane calls replaced (the rest go to the real one). */
+function withTurns(app, overrides) {
+  const turns = new Proxy(app.turns, {
+    get(target, key) {
+      if (Object.hasOwn(overrides, key)) return overrides[key];
+      const value = Reflect.get(target, key, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    }
+  });
+  return Object.create(app, { turns: { value: turns } });
+}
+
+/** A requester's completed Turn funds a followup to `peer` that waits to open a Turn there. Returns that Turn. */
+async function fundedFollowup(fixture, requester, peer, id) {
+  const origin = await openHost(fixture.current.binding.paths.dataRootPath, countingProvider('origin'), { label: 'origin', running: true });
+  try {
+    await createConversation(origin.app, requester);
+    await createConversation(origin.app, peer);
+    const { turnId } = await origin.runner.input({ commandId: `input-${id}`, conversationId: requester, text: '请对方复核部署脚本' });
+    await eventually(async () => (await rows(origin.app, 'TurnTermination', { turn_id: turnId }))[0]?.terminal_status === 'completed', 30_000, '请求方的回合未完成');
+    await origin.runner.waitForIdle();
+    await pendingFollowup(origin.app, id, requester, peer, { sourceTurnId: turnId });
+    return turnId;
+  } finally { await origin.close(); }
+}
+
+/** A project window admitted a user message's Turn and closed before it called the model. Returns the Turn. */
+async function unstartedTurn(fixture, conversationId) {
+  const origin = await openHost(fixture.current.binding.paths.dataRootPath, countingProvider('origin'), { label: 'origin', running: true });
+  try {
+    await createConversation(origin.app, conversationId);
+    const hostBootId = origin.app.database.hostBootId;
+    const admitted = await origin.app.database.conversationOwners.run(conversationId, () => origin.app.turns.input({
+      source: { kind: 'command', key: `input-${conversationId}` }, conversationId,
+      leaseOwnerId: `origin:${hostBootId}`, hostBootId, leaseExpiresAt: new Date(Date.now() + 30_000).toISOString(),
+      content: '运行一次部署脚本', contentType: 'text/plain; charset=utf-8'
+    }));
+    assert.equal(admitted.admitted, true);
+    return admitted.turnId;
+  } finally { await origin.close(); }
+}
+
 async function relocateOldHome(fixture) {
   const target = path.join(fixture.base, 'new-home');
   const plan = await reloc.planWithRuntime(fixture, target);
@@ -1126,13 +1390,27 @@ function inventoryOf(dataRoot) {
   return withOffline(dataRoot, (database) => inventoryRelocatedWork(database));
 }
 
+/**
+ * A window of the directory. Its convergence is held from the open, as when the old directory opens
+ * with carried work to settle (openSettlingRelocatedWork), until recover() releases it first, as the
+ * product runtime's startRecovery does; `running`: an ordinary window whose convergence runs from the
+ * start. `executions` records what runs here besides the model: tool calls and process starts.
+ */
 async function openHost(dataRoot, provider, options) {
   const folders = options.folders ?? [PROJECT.uri];
+  const executions = { tools: [], processes: [] };
   let coordinator;
   const app = await kernel.ReliableKernelApplication.open(
     new kernel.RootAuthority(() => dataRoot),
-    fixtureDependencies(provider, options.onMcpCall ?? (() => undefined), () => coordinator)
+    {
+      ...fixtureDependencies(provider, options.onMcpCall ?? (() => undefined), () => coordinator, executions),
+      holdRuntimeConvergence: options.holdRuntimeConvergence ?? options.running !== true
+    }
   );
+  for (const name of ['prepareStart', 'dispatchStart', 'launchDispatched']) {
+    const original = app.processes[name].bind(app.processes);
+    app.processes[name] = (...input) => { executions.processes.push(name); return original(...input); };
+  }
   coordinator = new ReliableChildAgentCoordinator({
     database: app.database,
     ...app.runtime,
@@ -1166,13 +1444,15 @@ async function openHost(dataRoot, provider, options) {
     }));
   }
   let closed = false;
-  return {
+  const host = {
     app,
     runner,
     coordinator,
     runnerErrors,
+    executions,
     /** VscodeReliableKernelProductRuntime.startRecovery, in its order. */
     async recover() {
+      app.releaseRuntimeConvergence();
       await app.recover();
       await coordinator.recoverStartup();
       await runner.recoverStartup();
@@ -1181,6 +1461,7 @@ async function openHost(dataRoot, provider, options) {
     async close() {
       if (closed) return;
       closed = true;
+      stillOpen.delete(host);
       runner.dispose();
       await app.beginHandoff().catch(() => undefined);
       await runner.waitForIdle().catch(() => undefined);
@@ -1188,9 +1469,11 @@ async function openHost(dataRoot, provider, options) {
       await app.close();
     }
   };
+  stillOpen.add(host);
+  return host;
 }
 
-function fixtureDependencies(provider, onMcpCall, coordinator) {
+function fixtureDependencies(provider, onMcpCall, coordinator, executions) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -1252,8 +1535,8 @@ function fixtureDependencies(provider, onMcpCall, coordinator) {
       }
     },
     processCompletionDelivery: { scanIntervalMs: 50 },
-    createToolDispatcher: ({ database, contentStore, runtime, files, fileMutations, processes, mcp, interactions }) =>
-      new kernel.ReliableToolDispatcher({
+    createToolDispatcher: ({ database, contentStore, runtime, files, fileMutations, processes, mcp, interactions }) => {
+      const dispatcher = new kernel.ReliableToolDispatcher({
         database,
         contentStore,
         effects: runtime.effects,
@@ -1271,7 +1554,14 @@ function fixtureDependencies(provider, onMcpCall, coordinator) {
           async quiesce(reason) { await coordinator().quiesce(reason); },
           async dispose() {}
         }
-      })
+      });
+      // Every tool call of this window goes through dispatch or dispatchBatch.
+      for (const name of ['dispatch', 'dispatchBatch']) {
+        const original = dispatcher[name].bind(dispatcher);
+        dispatcher[name] = (...input) => { executions.tools.push(name); return original(...input); };
+      }
+      return dispatcher;
+    }
   };
 }
 

@@ -55,9 +55,10 @@ async function assertOldHomeIntact(root) {
 const scenarios = [];
 const push = (kind, ...names) => { for (const name of names) scenarios.push([name, kind]); };
 push('empty', 'during-merge', 'pending-written', 'journal-create', 'staging-marker-after', 'selection-after', 'identity-after', 'complete-marker-after', 'publish-after', 'undo-work-removed',
-  'undo-marked', 'undo-record-removed');
+  'undo-marked', 'undo-record-removed', 'notice-after', 'undo-marked@notice-after', 'undo-work-removed@notice-after');
 for (let n = 1; n <= 10; n += 1) push('empty', `journal-before:${n}`, `journal-after:${n}`);
-push('limcode', 'journal-create', 'staging-marker-after', 'dbbackup-before-rename', 'identity-after', 'complete-marker-after', 'publish-after',
+push('limcode', 'journal-create', 'staging-marker-after', 'dbbackup-before-rename', 'identity-after', 'complete-marker-after', 'notice-after', 'publish-after',
+  'undo-marked@notice-after',
   'undo-db-restored', 'undo-work-removed', 'undo-db-restored@journal-before:13',
   'undo-marked', 'undo-restored', 'undo-record-removed', 'undo-restored@journal-before:12', 'undo-restored@journal-before:5');
 for (let n = 1; n <= 16; n += 1) push('limcode', `journal-before:${n}`, `journal-after:${n}`);
@@ -80,7 +81,9 @@ for (const [scenario, kind] of scenarios) {
     const beforeTarget = JSON.parse(await fs.readFile(path.join(base, 'before-target.json'), 'utf8'));
     const pointer = JSON.parse(await fs.readFile(path.join(base, 'pointer.json'), 'utf8'));
 
+    const notice = () => relocation.readDataRootMovedNotice(root);
     if (scenario === 'publish-after') {
+      assert.equal((await notice())?.relocationId, relocationId, '切换生效：旧目录留着“已迁走”标记');
       assert.equal(pointer.dataRootPath, target);
       const moved = await selectedDataSet(target);
       assert.deepEqual(conversationIds(moved.runtimeDataRootPath).filter((id) => id.startsWith('conversation_current')), ['conversation_current_1', 'conversation_current_2']);
@@ -92,9 +95,13 @@ for (const [scenario, kind] of scenarios) {
     assert.equal(pointer.dataRootPath, root, '指针仍是旧目录');
     assert.equal(pointer.pendingRelocation?.relocationId, relocationId, '进行中记录还在');
 
+    // Written right before the switch (never after it): there once the kill came after it.
+    const noticeWritten = (undoCrash ? firstPoint : scenario) === 'notice-after';
+    assert.equal((await notice())?.relocationId, noticeWritten ? relocationId : undefined, '“已迁走”标记只在切换之前的最后一步写');
     if (undoCrash) {
       const second = await child(base, undoPoint, kind, 'recover');
       assert.equal(second.signal, 'SIGKILL', `撤销过程中被杀：${await log()}`);
+      if (undoPoint === 'undo-marked') assert.equal((await notice())?.relocationId, noticeWritten ? relocationId : undefined, '记下撤销中之后才删标记');
     }
     // Next startup (beforeDataRootOpen): the owner is gone.
     let outcome;
@@ -106,6 +113,7 @@ for (const [scenario, kind] of scenarios) {
     t.diagnostic(`recover -> ${outcome}`);
     assert.ok(outcome === 'recovered' || outcome === 'absent', outcome);
     await assertOldHomeIntact(root);
+    assert.equal(await notice(), undefined, '撤销（包括续撤）删掉这次迁移写下的“已迁走”标记');
 
     const asides = (await fs.readdir(base)).filter((entry) => entry.includes('.limcode-copied-'));
     if (beforeTarget === null) {

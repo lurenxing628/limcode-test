@@ -3,14 +3,19 @@
 // of the old directory settles it (closed as aborted) only after the user chose to keep using the
 // old directory, right after its Runtime opened with its convergence held and before anything runs:
 // the same order as VscodeReliableKernelApplicationFacade.open and the product runtime (the Runtime
-// here is the kernel application with the production Runner, eligibility probe and recovery order).
-// A crash in the middle of settling is continued at the next open; the settlement is recorded once.
+// here is the kernel application with the production Runner, eligibility probe and recovery order;
+// its convergence is held from the open until the recovery releases it, as in production).
+// A crash in the middle of settling is continued at the next open; the settlement is recorded once,
+// and only once all of it is settled: anything left fails the open and nothing runs. The moved
+// notice is written before the pointer switches and removed by an undo; one that cannot be
+// understood refuses the open.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import path from 'node:path';
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const require = createRequire(import.meta.url);
@@ -23,8 +28,7 @@ const { ReliableConversationRunner } = await load('backend/application/reliableK
 const { evaluateConversationHostEligibility } = await load('backend/application/reliableKernel/conversationHostEligibility.js');
 const { projectFolderAssignmentSteps } = await load('backend/reliableKernel/conversationProject.js');
 const { writeTool } = await load('backend/world/modules/tools/definitions/write/index.js');
-const { relocatedWorkBeforeOpen, settleRelocatedWorkOnOpen } = await load('backend/application/reliableKernel/relocatedWorkOpening.js');
-const { RELOCATED_WORK_REPORTED_ONLY } = await load('backend/application/reliableKernel/relocatedWorkSettlement.js');
+const { openSettlingRelocatedWork, relocatedWorkBeforeOpen, settleRelocatedWorkOnOpen } = await load('backend/application/reliableKernel/relocatedWorkOpening.js');
 const { preparedContentObjectSteps } = await load('backend/reliableKernel/contentObjectTransaction.js');
 const reloc = await import(pathToFileURL(path.join(root, 'tests/reliable-kernel/runtime-data-root-relocation-fixture.mjs')).href);
 const { relocation, rootAuthority } = reloc;
@@ -36,6 +40,8 @@ const INSTALLATION_A = '/installations/a';
 const INSTALLATION_B = '/installations/b';
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 const TEST_FILE = fileURLToPath(import.meta.url);
+/** Windows still open (see openHost): a test that fails before its own close leaves none behind (afterEach). */
+const stillOpen = new Set();
 
 if (process.env.LIMCODE_RELOCATED_OPENING_WORKER === 'settle-killed') {
   // The next open of the old directory, killed in the middle of settling.
@@ -47,6 +53,20 @@ if (process.env.LIMCODE_RELOCATED_OPENING_WORKER === 'settle-killed') {
   await settleRelocatedWorkOnOpen(host.app, opening, INSTALLATION_B);
   process.exit(3);
 }
+
+if (process.env.LIMCODE_RELOCATED_OPENING_WORKER === 'live-holder') {
+  // A live window of the old directory that runs the carried Turn (its model call never answers),
+  // so it holds the Conversation while another window settles; killed later without finishing.
+  const { dataRoot, ready } = JSON.parse(process.env.LIMCODE_RELOCATED_OPENING_INPUT);
+  const host = await openHost(dataRoot, hangingProvider(), { folders: [PROJECT.uri], label: 'live-holder', running: true });
+  await host.recover();
+  await eventually(async () => (await rows(host.app, 'ModelRequest')).length > 0, 60_000, '存活窗口没有接手迁走的 Turn');
+  await fs.writeFile(`${ready}.tmp`, 'ready');
+  await fs.rename(`${ready}.tmp`, ready);
+  await new Promise(() => {});
+}
+
+afterEach(async () => { for (const host of [...stillOpen]) await host.close(); });
 
 test('RVX（其它安装打开旧目录）：迁移完成时清单写进“已迁走”标记；没有同意时拒绝打开（运行时不打开）；选“在这里继续”之后先收尾再恢复，旧目录 Provider 0 次，收尾结果只记一次', { timeout: 240_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
@@ -85,9 +105,9 @@ test('RVX（其它安装打开旧目录）：迁移完成时清单写进“已�
   const settled = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
   assert.equal(settled.state, 'settled');
   assert.equal(settled.by, INSTALLATION_B);
+  assert.deepEqual(Object.keys(settled.result), ['counts'], '全部收尾才记已收尾：只记关掉了什么');
   assert.equal(settled.result.counts.turnsStopped, 1);
-  assert.deepEqual([settled.result.live, settled.result.unsettled], [[], []]);
-  assert.equal(await relocation.recordDataRootMovedWorkSettled(fixture.root, relocationId, 'default', INSTALLATION_A, { counts: {}, live: [], unsettled: [] }), false, '只记一次');
+  assert.equal(await relocation.recordDataRootMovedWorkSettled(fixture.root, relocationId, 'default', INSTALLATION_A, { counts: {} }), false, '只记一次');
   assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_A), false, '已收尾的不再同意');
   assert.ok(target);
 });
@@ -143,14 +163,14 @@ test('窄竞态：打开之后、收尾之前，已批准还没派发的文件�
   const dataRoot = dataRootOf(fixture);
   // A window asked for a file change and closed; a window that does not serve the project approved it.
   const origin = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ id: 'write-call', functionCall: { name: 'write', args: { path: 'x.txt', content: 'x' } } }] }]),
-    { folders: [PROJECT.uri], label: 'origin', write: true });
+    { folders: [PROJECT.uri], label: 'origin', write: true, running: true });
   try {
     await createConversation(origin.app, conversationId);
     await origin.runner.input({ commandId: 'approved-write', conversationId, text: '改文件' });
     await eventually(async () => (await rows(origin.app, 'FileChangeSet', { status: 'pending' })).length === 1, 30_000, '没有进入审批');
     await origin.runner.waitForIdle();
   } finally { await origin.close(); }
-  const approver = await openHost(dataRoot, countingProvider(), { folders: [ELSEWHERE], label: 'approver', write: true });
+  const approver = await openHost(dataRoot, countingProvider(), { folders: [ELSEWHERE], label: 'approver', write: true, running: true });
   try {
     const [changeSet] = await rows(approver.app, 'FileChangeSet', { status: 'pending' });
     await approver.app.database.conversationOwners.run(conversationId, () => approver.app.files.decide({
@@ -163,37 +183,38 @@ test('窄竞态：打开之后、收尾之前，已批准还没派发的文件�
   assert.equal(entry.inventory.conversations[0].unreceiptedEffectIds.length, 1, '清单里有这项已批准的文件修改');
   assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
 
-  const opening = await relocatedWorkBeforeOpen(placementOf(fixture.root));
+  // The real open of Facade.open (openSettlingRelocatedWork): the Runtime opens with its convergence held.
   const provider = countingProvider();
-  const host = await openHost(dataRoot, provider, { folders: [PROJECT.uri], label: 'old-home', write: true, holdRuntimeConvergence: true });
   const dispatched = [];
-  const dispatch = host.app.fileMutations.dispatchRecordAndReconcile.bind(host.app.fileMutations);
-  host.app.fileMutations.dispatchRecordAndReconcile = async (id) => { dispatched.push(id); return dispatch(id); };
-  // While the settlement holds the Conversation (this window owns it and serves its project), a
-  // convergence is asked for, as the settlement's own commits do (e.g. closing a pending approval
-  // first): given time to run before the Turn and its effects are closed.
-  const terminate = host.app.agentLoop.terminateRequested.bind(host.app.agentLoop);
-  host.app.agentLoop.terminateRequested = async (...input) => {
-    await host.app.refreshExternalRuntimeWork();
-    await sleep(800);
-    return terminate(...input);
-  };
-  try {
+  const opened = await openOldHome(fixture, provider, { write: true, opened: async (host) => {
+    // Recorded and refused: a dispatch here would be the carried change running a second time.
+    host.app.fileMutations.dispatchRecordAndReconcile = async (id) => { dispatched.push(id); throw new Error(`不应派发 ${id}`); };
+    // While the settlement holds the Conversation (this window owns it and serves its project), a
+    // convergence is asked for, as the settlement's own commits do (e.g. closing a pending approval
+    // first): given time to run before the Turn and its effects are closed.
+    const terminate = host.app.agentLoop.terminateRequested.bind(host.app.agentLoop);
+    host.app.agentLoop.terminateRequested = async (...input) => {
+      await host.app.refreshExternalRuntimeWork();
+      await sleep(800);
+      return terminate(...input);
+    };
     await host.app.refreshExternalRuntimeWork();
     await sleep(500);
     assert.deepEqual(dispatched, [], '打开之后、收尾之前不派发');
-    await settleRelocatedWorkOnOpen(host.app, opening, INSTALLATION_B);
+  } });
+  assert.equal(opened.refused, undefined, `打开：${opened.refused?.stack}`);
+  assert.equal(opened.hold, true, '有迁走的任务要收尾：打开时扣住收敛');
+  try {
     assert.deepEqual(dispatched, [], '收尾期间也不派发');
-    host.app.releaseRuntimeConvergence();
-    await host.recover();
+    await opened.host.recover();
     await quiet();
-  } finally { await host.close(); }
+  } finally { await opened.host.close(); }
   assert.deepEqual(dispatched, [], '收尾之后没有可派发的');
   assert.deepEqual((await rowsOf(fixture, 'EffectIntent', { effect_kind: 'file_mutation' })).map((row) => row.dispatch_state), ['cancelled_before_dispatch']);
   assert.equal(provider.calls.length, 0);
 });
 
-test('打开前的提示只列收尾不了的项：待投递的结果和进程完成通知现在都能收尾，提示列表比上一轮短（这里 2 项变 0 项）；清单照样记下，同意后打开时一并收尾，旧目录 Provider 0 次', { timeout: 240_000 }, async (t) => {
+test('待投递的结果和进程完成通知都能收尾：迁移时照样记进清单；同意后打开时一并收尾，旧目录 Provider、工具、进程都是 0 次', { timeout: 240_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const { conversationId, turnId } = await admitUnstartedTurn(fixture);
   const { deliveryId, dispatchId } = await finishedBackgroundProcesses(fixture, conversationId, turnId);
@@ -201,29 +222,96 @@ test('打开前的提示只列收尾不了的项：待投递的结果和进程�
   const [entry] = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets;
   const [work] = entry.inventory.conversations;
   assert.deepEqual([work.activeTurnIds, work.pendingDeliveryIds, work.pendingProcessCompletionIds], [[turnId], [deliveryId], [dispatchId]], '清单照样记下');
-  const previously = reportedOnlyItems(entry.inventory, PREVIOUSLY_REPORTED_ONLY);
-  const now = reportedOnlyItems(entry.inventory, RELOCATED_WORK_REPORTED_ONLY);
-  assert.equal(previously.length, 2, '上一轮：待投递的结果和进程完成通知逐条列为收尾不了、打开后仍会执行一次');
-  assert.ok(now.length < previously.length, '提示列表变短');
-  assert.deepEqual(now, [], '能收尾的类别不再列出');
-  assert.deepEqual(RELOCATED_WORK_REPORTED_ONLY, {});
-  assert.ok(Object.isFrozen(RELOCATED_WORK_REPORTED_ONLY), '形状不变：仍是冻结的 { 清单列表名: 类别 }');
 
   assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
   const provider = countingProvider();
-  await openSettleAndRecover(fixture, provider, INSTALLATION_B);
+  const opened = await openSettleAndRecover(fixture, provider, INSTALLATION_B);
   assert.equal(provider.calls.length, 0, '旧目录不调用模型');
+  assert.deepEqual(opened.host.executions, { tools: [], processes: [] }, '旧目录不调用工具、不启动进程');
   const settled = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
-  assert.deepEqual([settled.state, settled.result.live, settled.result.unsettled], ['settled', [], []], '没有需要人处理的项');
+  assert.equal(settled.state, 'settled', '都收尾了');
   assert.deepEqual([settled.result.counts.turnsStopped, settled.result.counts.deliveriesTakenIn, settled.result.counts.processCompletionsAbandoned], [1, 1, 1]);
   assert.deepEqual((await rowsOf(fixture, 'ProcessCompletionDispatch', { id: dispatchId })).map((row) => [row.state, row.last_error]), [['dead_letter', 'data-root-relocated']]);
   assert.deepEqual((await rowsOf(fixture, 'RuntimeDelivery', { id: deliveryId })).map((row) => row.state), ['consumed']);
 });
 
-test('真实的 Facade.open：旧目录带着没同意的迁走任务时，在运行时打开之前就拒绝（reason moved-work，由恢复提示给出三选一）', { timeout: 120_000 }, async (t) => {
+test('存活窗口占着的项（live：它在执行的 Turn 与排在后面的消息）：不放行，这次打开失败，运行时关掉、不恢复，逐条记下留下了什么；那个窗口没做完就退出后，重试时整库收尾完才放行，旧目录 Provider、工具、进程都是 0 次', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const { conversationId, turnId } = await admitUnstartedTurn(fixture);
+  const queuedId = await queueMessage(fixture, conversationId);
+  const { relocationId } = await relocateOldHome(fixture);
+  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
+  const ready = path.join(fixture.base, 'live-holder-ready');
+  const holder = spawnWorker('live-holder', { dataRoot: dataRootOf(fixture), ready });
+  t.after(() => { if (holder.exitCode === null && holder.signalCode === null) holder.kill('SIGKILL'); });
+  await waitForFile(holder, ready, 90_000);
+  holder.kill('SIGSTOP');
+
+  // This open: what the live window holds cannot be settled here, so nothing is released.
+  const provider = countingProvider();
+  const first = await openOldHome(fixture, provider);
+  assert.equal(first.refused?.reason, 'moved-work-unsettled', `不放行：${first.refused?.stack}`);
+  assert.match(first.refused.message, /还剩 2 项：另一个窗口正在执行或占着 2 项/);
+  const left = [
+    { conversationId, title: conversationId, list: 'queuedIntentIds', id: queuedId, why: 'live', detail: '' },
+    { conversationId, title: conversationId, list: 'activeTurnIds', id: turnId, why: 'live', detail: '' }
+  ];
+  assert.deepEqual(first.refused.cause.items, left, '拒绝时带着这次留下的项（提示逐条列出）');
+  assert.deepEqual([first.hold, first.released, first.closed], [true, false, true], '扣住打开、没有放行、运行时关掉');
+  const kept = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
+  assert.equal(kept.state, 'consented', '不算已收尾');
+  assert.deepEqual([kept.left.by, kept.left.items], [INSTALLATION_B, left], '记下这次留下了什么、为什么');
+  assert.equal(provider.calls.length, 0);
+  assert.deepEqual(first.host.executions, { tools: [], processes: [] });
+  assert.equal((await turnRow(fixture, turnId)).status, 'active', '前提：存活窗口还占着它');
+
+  // That window ends without finishing: the retry settles the whole data set again, then opens.
+  holder.kill('SIGKILL');
+  await new Promise((resolve) => holder.once('exit', resolve));
+  const next = await openSettleAndRecover(fixture, provider, INSTALLATION_B);
+  assert.equal(provider.calls.length, 0, '迁走的项没有执行');
+  assert.deepEqual(next.host.executions, { tools: [], processes: [] });
+  assert.equal((await turnRow(fixture, turnId)).status, 'terminated');
+  assert.equal((await rowsOf(fixture, 'TurnIntent', { id: queuedId }))[0].state, 'cancelled');
+  const settled = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement;
+  assert.equal(settled.state, 'settled');
+  assert.equal('left' in settled, false);
+  assert.equal(settled.result.counts.turnsStopped, 1);
+  assert.equal(settled.result.counts.queuedMessagesCancelled, 1);
+});
+
+test('某一轮收尾时协作收敛一直出错（重试 3 次仍失败）：不放行（不恢复、不执行），标记保持同意、不记已收尾并记下留下的项，这次打开失败并说明可以重试；重开后接着收尾完，旧目录 Provider、工具、进程都是 0 次', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  const { turnId } = await admitUnstartedTurn(fixture);
+  const { relocationId } = await relocateOldHome(fixture);
+  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
+  const provider = countingProvider();
+  const first = await openOldHome(fixture, provider, { wrap: (app) => Object.create(app, { runtime: { value: { ...app.runtime, collaboration: {
+    async reconcile() { throw new Error('collaboration facts changed concurrently'); }
+  } } } }) });
+  assert.equal(first.refused?.reason, 'moved-work-unsettled', `不放行：${first.refused?.stack}`);
+  assert.match(first.refused.message, /迁走的任务还没有全部收尾（还剩 1 项：收尾时出错 1 项）/);
+  assert.match(first.refused.message, /可以重试/);
+  assert.deepEqual(first.refused.cause.items.map((item) => [item.conversationId, item.list, item.id, item.why]), [['', 'round', 'round-2', 'failed']]);
+  assert.match(first.refused.cause.items[0].detail, /collaboration facts changed concurrently/);
+  assert.deepEqual([first.hold, first.released, first.closed], [true, false, true], '扣住打开、没有放行、运行时关掉');
+  const entry = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0];
+  assert.equal(entry.settlement.state, 'consented', '不记已收尾');
+  assert.deepEqual(entry.settlement.left.items, first.refused.cause.items, '记下这次留下的项');
+  assert.equal(provider.calls.length, 0);
+  assert.deepEqual(first.host.executions, { tools: [], processes: [] });
+
+  const next = await openSettleAndRecover(fixture, provider, INSTALLATION_B);
+  assert.equal(provider.calls.length, 0, '重开后收尾完，照常恢复也不执行');
+  assert.deepEqual(next.host.executions, { tools: [], processes: [] });
+  assert.equal((await turnRow(fixture, turnId)).status, 'terminated');
+  assert.equal((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement.state, 'settled');
+});
+
+test('真实的 Facade.open：旧目录带着没同意的迁走任务时，在运行时打开之前就拒绝（reason moved-work，由恢复提示给出三选一）；同意之后打开运行时时带着扣住（holdForRelocatedWork）', { timeout: 120_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   await admitUnstartedTurn(fixture);
-  await relocateOldHome(fixture);
+  const { relocationId } = await relocateOldHome(fixture);
   const { Facade, globalStatus, context } = loadFacade();
   const storage = path.join(fixture.base, 'vscode-global-storage');
   await fs.mkdir(storage);
@@ -234,6 +322,150 @@ test('真实的 Facade.open：旧目录带着没同意的迁走任务时，在�
   assert.equal((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement.state, 'pending');
   const hosts = await fs.readdir(path.join(dataRootOf(fixture), 'host-liveness')).catch(() => []);
   assert.deepEqual(hosts.filter((name) => name.endsWith('.json')), [], '运行时没有打开（没有登记 Host）');
+
+  // "在这里继续": the product Runtime is asked to open with its hold (a stand-in open; what the hold
+  // does is shown by the product runtime's gate below and by openSettlingRelocatedWork above).
+  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, relocationId, INSTALLATION_B), true);
+  const { VscodeReliableKernelProductRuntime } = require(path.join(compiled, 'backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js'));
+  const realOpen = VscodeReliableKernelProductRuntime.open;
+  const asked = [];
+  VscodeReliableKernelProductRuntime.open = async (_context, options) => {
+    asked.push(options.holdForRelocatedWork);
+    throw new Error('stand-in: the product Runtime is not opened here');
+  };
+  t.after(() => { VscodeReliableKernelProductRuntime.open = realOpen; });
+  const stopped = await Facade.open(vscodeContext).then(async (facade) => { await facade.dispose(); return undefined; }, (error) => error);
+  assert.match(String(stopped?.message), /stand-in/, String(stopped?.stack));
+  assert.deepEqual(asked, [true], '有同意过的迁走任务：运行时打开时扣住收敛与恢复');
+  assert.equal((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement.state, 'consented', '没打开就没有收尾');
+});
+
+test('标记先写（决定二）：切换指针之前旧目录里就有这次迁移的标记；迁移还在进行（发起进程还在）时旧目录按 relocating 拒绝，不拿它问用户、也不收尾；切换失败撤销时标记随撤销删掉，旧目录照常打开', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await admitUnstartedTurn(fixture);
+  const target = path.join(fixture.base, 'new-home');
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  let during;
+  const failure = await relocation.completeDataRootRelocation(staged, async () => {
+    const notice = await relocation.readDataRootMovedNotice(fixture.root);
+    during = {
+      relocationId: notice?.relocationId,
+      dataSets: notice?.carriedWork?.dataSets.length,
+      opening: await relocatedWorkBeforeOpen(placementOf(fixture.root)).then(() => 'opens', (error) => error.reason)
+    };
+    throw new Error('切换指针失败');
+  }, { ...options, pointerUnchanged: async () => true }).then(() => undefined, (error) => error);
+  assert.match(String(failure?.message), /切换指针失败/);
+  assert.deepEqual(during, { relocationId: staged.relocationId, dataSets: 1, opening: 'relocating' }, '切换之前标记已写好；进行中的迁移不拿来问用户');
+  assert.equal(relocation.dataRootRelocationCleanupState(failure), 'cleaned');
+  assert.equal(await relocation.readDataRootMovedNotice(fixture.root), undefined, '撤销时标记随之删掉');
+  await assert.rejects(fs.stat(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE)), { code: 'ENOENT' });
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root)), undefined, '迁移没有生效：旧目录照常打开（工作只有这一份）');
+});
+
+test('标记先写（决定二）：写“已迁走”标记失败（注入 EIO）时迁移按切换前失败撤销：不切换指针、新目录撤销干净、旧目录没有标记，旧目录照常打开（工作只有这一份）', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await admitUnstartedTurn(fixture);
+  const target = path.join(fixture.base, 'new-home');
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  const fsp = require('node:fs/promises');
+  const realOpen = fsp.open;
+  const failed = [];
+  fsp.open = async (file, ...rest) => {
+    const name = String(file);
+    if (name.startsWith(`${path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE)}.`) && name.endsWith('.tmp')) {
+      failed.push(name);
+      throw Object.assign(new Error(`EIO: i/o error, open '${name}'`), { code: 'EIO' });
+    }
+    return realOpen(file, ...rest);
+  };
+  let published = 0;
+  let failure;
+  try {
+    failure = await relocation.completeDataRootRelocation(staged, async () => { published += 1; }, options).then(() => undefined, (error) => error);
+  } finally { fsp.open = realOpen; }
+  assert.equal(failed.length, 1, '注入的失败确实落在写标记上');
+  assert.equal(failure?.code, 'EIO', String(failure?.stack));
+  assert.equal(published, 0, '没有切换指针');
+  assert.equal(relocation.dataRootRelocationCleanupState(failure), 'cleaned', '按切换前失败撤销');
+  await assert.rejects(fs.stat(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE)), { code: 'ENOENT' });
+  assert.equal(await relocation.readDataRootMovedNotice(fixture.root), undefined);
+  assert.equal(await relocatedWorkBeforeOpen(placementOf(fixture.root)), undefined, '迁移没有生效：旧目录照常打开');
+});
+
+test('撤销只动这次迁移自己的标记（决定二）：旧目录里原有的别的迁移的标记（还有没收尾的库）在这次迁移失败撤销后原样放回；撤销时那里已是别的迁移的标记，就不碰它', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await admitUnstartedTurn(fixture);
+  const noticeFile = path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE);
+  const noticeOf = (relocationId) => `${JSON.stringify({
+    kind: 'limcode-data-root-moved', targetRootPath: path.join(fixture.base, 'elsewhere'), relocationId, movedAt: '2026-09-20T08:00:00.000Z',
+    installation: { id: '/installations/c', label: 'VS Code（C）' },
+    carriedWork: { dataSets: [{ id: 'workspace:other', dataSetId: 'other', inventory: { conversations: [] }, settlement: { state: 'pending' } }] }
+  }, null, 2)}\n`;
+  // An earlier relocation away from this directory left its notice, with a data set not settled yet.
+  const earlier = noticeOf(randomUUID());
+  await fs.writeFile(noticeFile, earlier);
+  const target = path.join(fixture.base, 'new-home');
+  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
+  const staged = await stageOldHome(fixture, target, options);
+  let during;
+  const failure = await relocation.completeDataRootRelocation(staged, async () => {
+    during = (await relocation.readDataRootMovedNotice(fixture.root))?.relocationId;
+    throw new Error('切换指针失败');
+  }, { ...options, pointerUnchanged: async () => true }).then(() => undefined, (error) => error);
+  assert.equal(during, staged.relocationId, '切换之前换成了这次迁移的标记');
+  assert.equal(relocation.dataRootRelocationCleanupState(failure), 'cleaned');
+  assert.equal(await fs.readFile(noticeFile, 'utf8'), earlier, '撤销后原有的标记原样放回');
+
+  // Not undone at once (the pointer may have switched); by the time it is, another relocation's notice is there.
+  const again = await stageOldHome(fixture, target, options);
+  const kept = await relocation.completeDataRootRelocation(again, async () => { throw new Error('切换指针失败'); },
+    { ...options, pointerUnchanged: async () => false }).then(() => undefined, (error) => error);
+  assert.equal(relocation.dataRootRelocationCleanupState(kept), 'not-cleaned');
+  assert.equal((await relocation.readDataRootMovedNotice(fixture.root))?.relocationId, again.relocationId);
+  const later = noticeOf(randomUUID());
+  await fs.writeFile(noticeFile, later);
+  await relocation.abandonStagedDataRootRelocation(again, { pointerUnchanged: true });
+  assert.equal(await fs.readFile(noticeFile, 'utf8'), later, '撤销不碰别的迁移的标记');
+  await assert.rejects(fs.stat(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE)), { code: 'ENOENT' });
+});
+
+test('标记读不懂（决定三）：截断的 JSON、不认识的收尾状态（settling）、不合格的库、坏的 left、别的 kind，一律按 moved-notice-invalid 拒绝打开，不当作没有标记；读得出新目录时一并给出', { timeout: 240_000 }, async (t) => {
+  const fixture = await reloc.createFixture(t, { withAlpha: false });
+  await admitUnstartedTurn(fixture);
+  const { target } = await relocateOldHome(fixture);
+  const noticeFile = path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE);
+  const written = await fs.readFile(noticeFile, 'utf8');
+  const notice = JSON.parse(written);
+  const withSettlement = (settlement) => JSON.stringify({ ...notice, carriedWork: { dataSets: notice.carriedWork.dataSets.map((item) => ({ ...item, settlement })) } });
+  const variants = {
+    truncated: written.slice(0, Math.floor(written.length / 2)),
+    unknownState: withSettlement({ state: 'settling', at: 'x', by: 'y' }),
+    badDataSet: JSON.stringify({ ...notice, carriedWork: { dataSets: [{ ...notice.carriedWork.dataSets[0], inventory: { conversations: 'x' } }] } }),
+    badLeft: withSettlement({ state: 'consented', at: 'x', by: 'y', left: { at: 'x', by: 'y', items: [
+      { conversationId: 'c', title: '', list: 'activeTurnIds', id: 't', why: 'maybe', detail: '' }
+    ] } }),
+    otherKind: JSON.stringify({ ...notice, kind: 'limcode-data-root-moved-v2' })
+  };
+  const outcomes = {};
+  const targets = {};
+  for (const [name, text] of Object.entries(variants)) {
+    await fs.writeFile(noticeFile, text);
+    outcomes[name] = await relocatedWorkBeforeOpen(placementOf(fixture.root)).then((value) => (value === undefined ? 'opens-unheld' : 'held'), (error) => error.reason);
+    const read = await relocation.inspectDataRootMovedNotice(fixture.root);
+    targets[name] = read.targetRootPath ?? null;
+    assert.equal(await relocation.readDataRootMovedNotice(fixture.root), undefined, '只作展示的读取把它当作没有');
+  }
+  assert.deepEqual(outcomes, Object.fromEntries(Object.keys(variants).map((name) => [name, 'moved-notice-invalid'])), '读不懂的标记证明不了没有迁走的任务');
+  assert.deepEqual(targets, { truncated: null, unknownState: target, badDataSet: target, badLeft: target, otherKind: target });
+  await fs.writeFile(noticeFile, variants.unknownState);
+  const refused = await relocatedWorkBeforeOpen(placementOf(fixture.root)).then(() => undefined, (error) => error);
+  assert.match(refused.message, /“数据已迁走”标记（\.limcode-data-root-moved\.json）读不懂（迁走的任务清单或它的收尾状态不是本版本认得的内容/);
+  assert.match(refused.message, /本窗口没有打开运行时。可以改用新目录/);
+  await fs.writeFile(noticeFile, written);
+  await assert.rejects(relocatedWorkBeforeOpen(placementOf(fixture.root)), (error) => error.reason === 'moved-work', '标记恢复原样：照常询问');
 });
 
 test('产品运行时的门：打开时扣住（holdForRelocatedWork）就不开始启动恢复、也不接管对话，收尾后 releaseRelocatedWorkHold 才放行并放开收敛', async () => {
@@ -288,7 +520,7 @@ function placementOf(configurationRootPath) {
 /** A project window of the old directory admitted a user message's Turn and closed before it called the model. */
 async function admitUnstartedTurn(fixture) {
   const conversationId = 'conversation-carried';
-  const origin = await openHost(dataRootOf(fixture), countingProvider(), { folders: [PROJECT.uri], label: 'origin', runner: false });
+  const origin = await openHost(dataRootOf(fixture), countingProvider(), { folders: [PROJECT.uri], label: 'origin', runner: false, running: true });
   try {
     await createConversation(origin.app, conversationId);
     const hostBootId = origin.app.database.hostBootId;
@@ -302,17 +534,24 @@ async function admitUnstartedTurn(fixture) {
   } finally { await origin.close(); }
 }
 
-/** The kinds the moved-work prompt listed item by item before this round made them settleable. */
-const PREVIOUSLY_REPORTED_ONLY = Object.freeze({
-  pendingDeliveryIds: 'continuation_delivery',
-  undeliveredAnswerIds: 'child_answer',
-  pendingProcessCompletionIds: 'process_completion'
-});
+/** A user message queued behind the Conversation's active Turn (admitted by nobody yet). */
+async function queueMessage(fixture, conversationId, key = 'input-queued') {
+  const origin = await openHost(dataRootOf(fixture), countingProvider(), { folders: [PROJECT.uri], label: 'queue', runner: false, running: true });
+  try {
+    const queued = await admitTurn(origin.app, conversationId, key);
+    assert.equal(queued.admitted, false, '前提：排在进行中的 Turn 后面');
+    return queued.intentId;
+  } finally { await origin.close(); }
+}
 
-/** The items the moved-work prompt lists as "收尾不了" for `table` (vscode/commands/dataRootRelocation.ts describeMovedWork). */
-function reportedOnlyItems(inventory, table) {
-  return inventory.conversations.flatMap((conversation) => Object.entries(table).flatMap(([list, kind]) =>
-    (conversation[list] ?? []).map((id) => `“${conversation.title || conversation.conversationId}”：${kind}（${id}）`)));
+/** A user message given to the Conversation the way the Runner does, without running anything. */
+async function admitTurn(app, conversationId, key) {
+  const hostBootId = app.database.hostBootId;
+  return app.database.conversationOwners.run(conversationId, () => app.turns.input({
+    source: { kind: 'command', key }, conversationId,
+    leaseOwnerId: `test:${hostBootId}`, hostBootId, leaseExpiresAt: new Date(Date.now() + 30_000).toISOString(),
+    content: `消息 ${key}`, contentType: 'text/plain; charset=utf-8'
+  }));
 }
 
 /**
@@ -320,7 +559,7 @@ function reportedOnlyItems(inventory, table) {
  * gone: one completion already delivered to that Turn (pending), one not dispatched yet.
  */
 async function finishedBackgroundProcesses(fixture, conversationId, turnId) {
-  const origin = await openHost(dataRootOf(fixture), countingProvider(), { folders: [PROJECT.uri], label: 'origin', runner: false });
+  const origin = await openHost(dataRootOf(fixture), countingProvider(), { folders: [PROJECT.uri], label: 'origin', runner: false, running: true });
   try {
     const { app } = origin;
     const at = new Date().toISOString();
@@ -363,27 +602,57 @@ async function finishedBackgroundProcesses(fixture, conversationId, turnId) {
 /** A real relocation of the old home by installation A (it names itself in the moved notice). */
 async function relocateOldHome(fixture) {
   const target = path.join(fixture.base, 'new-home');
-  const plan = await reloc.planWithRuntime(fixture, target);
-  assert.deepEqual(plan.problems, []);
   const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
-  const source = await reloc.openRuntime(fixture.current);
-  let staged;
-  try { staged = await relocation.stageDataRootRelocation(plan, source, options); } finally { await source.close(); }
+  const staged = await stageOldHome(fixture, target, options);
   await relocation.completeDataRootRelocation(staged, async () => undefined, options);
   return { target, relocationId: staged.relocationId };
 }
 
-/** Facade.open's order: consent checked before the open, Runtime opened with convergence held, settled, released, then the startup recovery. */
-async function openSettleAndRecover(fixture, provider, by) {
-  const opening = await relocatedWorkBeforeOpen(placementOf(fixture.root));
-  assert.ok(opening, '同意之后照常打开');
-  const host = await openHost(dataRootOf(fixture), provider, { folders: [PROJECT.uri], label: 'old-home', holdRuntimeConvergence: true });
+/** The online stage of a relocation of the old home (with this "window's" Runtime open). */
+async function stageOldHome(fixture, target, options) {
+  const plan = await reloc.planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+  const source = await reloc.openRuntime(fixture.current);
+  try { return await relocation.stageDataRootRelocation(plan, source, options); } finally { await source.close(); }
+}
+
+/**
+ * Facade.open's order with the real openSettlingRelocatedWork: consent checked before the open, the
+ * Runtime opened with its convergence held when there is carried work, settled, and only then the
+ * hold released; the product runtime's startRecovery waits for that release (`released`; the caller
+ * recovers). `wrap` stands in for a fault while settling; `opened` runs right after the open. A
+ * refused open closed the Runtime again (`refused`, `closed`).
+ */
+async function openOldHome(fixture, provider, { by = INSTALLATION_B, wrap = (app) => app, opened, write = false } = {}) {
+  const state = { hold: undefined, released: false, closed: false, host: undefined, refused: undefined };
   try {
-    await settleRelocatedWorkOnOpen(host.app, opening, by);
-    host.app.releaseRuntimeConvergence();
-    await host.recover();
+    await openSettlingRelocatedWork(placementOf(fixture.root), by, async (hold) => {
+      state.hold = hold;
+      state.host = await openHost(dataRootOf(fixture), provider, { folders: [PROJECT.uri], label: 'old-home', write, holdRuntimeConvergence: hold });
+      await opened?.(state.host);
+      return {
+        application: wrap(state.host.app),
+        releaseRelocatedWorkHold: () => { state.released = true; },
+        close: async () => { state.closed = true; await state.host.close(); }
+      };
+    });
+  } catch (error) {
+    state.refused = error;
+    if (state.host && !state.closed) await state.host.close();
+  }
+  return state;
+}
+
+/** openOldHome that must go ahead with carried work to settle, then the startup recovery. */
+async function openSettleAndRecover(fixture, provider, by) {
+  const opened = await openOldHome(fixture, provider, { by });
+  assert.equal(opened.refused, undefined, `同意之后照常打开：${opened.refused?.stack}`);
+  assert.deepEqual([opened.hold, opened.released], [true, true], '有迁走的任务：扣住打开，收尾完才放行');
+  try {
+    await opened.host.recover();
     await quiet();
-  } finally { await host.close(); }
+  } finally { await opened.host.close(); }
+  return opened;
 }
 
 async function turnRow(fixture, turnId) {
@@ -396,12 +665,20 @@ async function rowsOf(fixture, domain, where) {
   try { return await rows(host.app, domain, where); } finally { await host.close(); }
 }
 
+/**
+ * A window of the old directory. Its convergence is held from the open, as when it opens with carried
+ * work to settle (openSettlingRelocatedWork), until recover() releases it first, as the product
+ * runtime's startRecovery does; `running`: an ordinary window whose convergence runs from the start.
+ * `executions` records what runs here besides the model: tool calls and process starts.
+ */
 async function openHost(dataRoot, provider, options) {
   const folders = [...options.folders];
+  const executions = { tools: [], processes: [] };
   const app = await kernel.ReliableKernelApplication.open(
     new kernel.RootAuthority(() => dataRoot),
-    { ...fixtureDependencies(provider, options.write === true), ...(options.holdRuntimeConvergence ? { holdRuntimeConvergence: true } : {}) }
+    { ...fixtureDependencies(provider, options.write === true, executions), holdRuntimeConvergence: options.holdRuntimeConvergence ?? options.running !== true }
   );
+  countProcessStarts(app, executions);
   const runner = options.runner === false ? undefined : new ReliableConversationRunner(app, `${options.label}:${app.database.hostBootId}`, () => undefined);
   app.database.conversationOwners.setClaimEligibilityProbe(async (conversationId) => (await evaluateConversationHostEligibility({
     database: app.database,
@@ -410,11 +687,13 @@ async function openHost(dataRoot, provider, options) {
     workEnvironments: async () => []
   }, conversationId)).eligible);
   let closed = false;
-  return {
+  const host = {
     app,
     runner,
+    executions,
     /** VscodeReliableKernelProductRuntime.startRecovery, in its order (no child Agents here). */
     async recover() {
+      app.releaseRuntimeConvergence();
       await app.recover();
       await runner?.recoverStartup();
       await app.refreshExternalRuntimeWork();
@@ -422,15 +701,26 @@ async function openHost(dataRoot, provider, options) {
     async close() {
       if (closed) return;
       closed = true;
+      stillOpen.delete(host);
       runner?.dispose();
       await app.beginHandoff().catch(() => undefined);
       await runner?.waitForIdle().catch(() => undefined);
       await app.close();
     }
   };
+  stillOpen.add(host);
+  return host;
 }
 
-function fixtureDependencies(provider, write) {
+/** Process starts of this window (ProcessControlPlane: prepare, dispatch, launch), recorded in `executions`. */
+function countProcessStarts(app, executions) {
+  for (const name of ['prepareStart', 'dispatchStart', 'launchDispatched']) {
+    const original = app.processes[name].bind(app.processes);
+    app.processes[name] = (...input) => { executions.processes.push(name); return original(...input); };
+  }
+}
+
+function fixtureDependencies(provider, write, executions = { tools: [], processes: [] }) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -470,8 +760,8 @@ function fixtureDependencies(provider, write) {
         return provider;
       }
     },
-    createToolDispatcher: ({ database, contentStore, runtime, files, fileMutations, processes, mcp, interactions }) =>
-      new kernel.ReliableToolDispatcher({
+    createToolDispatcher: ({ database, contentStore, runtime, files, fileMutations, processes, mcp, interactions }) => {
+      const dispatcher = new kernel.ReliableToolDispatcher({
         database, contentStore, effects: runtime.effects, files, fileMutations, processes, mcp, interactions,
         host: {
           definitions() { return write ? [writeTool] : []; },
@@ -482,13 +772,26 @@ function fixtureDependencies(provider, write) {
           async cancelTurnWaits() {},
           async dispose() {}
         }
-      })
+      });
+      // Every tool call of this window goes through dispatch or dispatchBatch.
+      for (const name of ['dispatch', 'dispatchBatch']) {
+        const original = dispatcher[name].bind(dispatcher);
+        dispatcher[name] = (...input) => { executions.tools.push(name); return original(...input); };
+      }
+      return dispatcher;
+    }
   };
 }
 
 /** Every model call is recorded; the reply is a plain final answer. */
 function countingProvider() {
   return scriptedProvider(null);
+}
+
+/** A model call that never answers: the Turn stays in flight in that window. */
+function hangingProvider() {
+  const calls = [];
+  return { providerId: PROVIDER_ID, calls, async sendFullRequest(request) { calls.push(request.conversationId); await new Promise(() => {}); } };
 }
 
 function scriptedProvider(replies) {
@@ -546,6 +849,30 @@ function runWorker(mode, input) {
   child.stdout.on('data', (chunk) => { output += chunk; });
   child.stderr.on('data', (chunk) => { output += chunk; });
   return new Promise((resolve) => child.on('exit', (code, signal) => resolve({ code, signal, output })));
+}
+
+/** A worker that keeps running (see runWorker for one that is waited for). */
+function spawnWorker(mode, input) {
+  const child = spawn(process.execPath, [TEST_FILE], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, LIMCODE_RELOCATED_OPENING_WORKER: mode, LIMCODE_RELOCATED_OPENING_INPUT: JSON.stringify(input) }
+  });
+  child.output = '';
+  child.stdout.on('data', (chunk) => { child.output += chunk; });
+  child.stderr.on('data', (chunk) => { child.output += chunk; });
+  return child;
+}
+
+async function waitForFile(child, file, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await fs.stat(file).then(() => true, () => false)) return;
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`worker exited early
+${child.output}`);
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${file}
+${child.output}`);
+    await sleep(20);
+  }
 }
 
 /** The compiled Facade with a VS Code mock (a window without folders: the default data set). */

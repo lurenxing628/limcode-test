@@ -286,7 +286,7 @@ test('M14 删除旧目录时旧目录又被窗口打开：拒绝，什么都不�
   assert.deepEqual(conversationIds(fixture.current.binding.paths.dataRootPath), ['conversation_current_1', 'conversation_current_2']);
 });
 
-test('#7 迁移完成时在旧目录留下“已迁到新目录”标记；目标里过时的标记（从它迁走过）在切换后去掉；只清得掉本安装自己的标记', async (t) => {
+test('#7 迁移完成时在旧目录留下“已迁到新目录”标记（切换指针之前就写好，见 relocated-work-opening 决定二）；目标里过时的标记（从它迁走过）在切换后去掉；只清得掉本安装自己的标记', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const target = path.join(fixture.base, 'existing');
   await createLimCodeTarget(target);
@@ -301,7 +301,7 @@ test('#7 迁移完成时在旧目录留下“已迁到新目录”标记；目�
   try { staged = await stageDataRootRelocation(plan, source); } finally { await source.close(); }
   let noticeAtPublish;
   await completeDataRootRelocation(staged, async () => { noticeAtPublish = await readDataRootMovedNotice(fixture.root); }, { movedBy: installation });
-  assert.equal(noticeAtPublish, undefined, '指针切换之前旧目录里还没有标记');
+  assert.equal(noticeAtPublish?.relocationId, staged.relocationId, '指针切换之前旧目录里已经有这次迁移的标记');
   const notice = await readDataRootMovedNotice(fixture.root);
   assert.deepEqual([notice.targetRootPath, notice.relocationId, notice.installation], [target, staged.relocationId, installation]);
   assert.equal(await readDataRootMovedNotice(target), undefined, '新目录里过时的标记已去掉');

@@ -28,8 +28,8 @@ export const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 export const crossDevice = async () => { throw Object.assign(new Error('cross-device link'), { code: 'EXDEV' }); };
 
 /** Stage online with this "window's" Runtime open, close it, then complete (exclusive). */
-export async function relocate(fixture, plan, { publish, linkFile, relocationId } = {}) {
-  const options = { ...(linkFile ? { linkFile } : {}), ...(relocationId ? { relocationId } : {}) };
+export async function relocate(fixture, plan, { publish, linkFile, relocationId, movedBy } = {}) {
+  const options = { ...(linkFile ? { linkFile } : {}), ...(relocationId ? { relocationId } : {}), ...(movedBy ? { movedBy } : {}) };
   const source = await openRuntime(fixture.current);
   let staged;
   try {

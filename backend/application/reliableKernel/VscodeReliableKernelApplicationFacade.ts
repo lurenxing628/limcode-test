@@ -70,7 +70,7 @@ import {
   archiveCurrentRuntimeRootForReset
 } from './VscodeReliableKernelCutoverCoordinator';
 import { pinnedDataRootPaths, VscodeReliableKernelProductRuntime } from './VscodeReliableKernelProductRuntime';
-import { relocatedWorkBeforeOpen, settleRelocatedWorkOnOpen } from './relocatedWorkOpening';
+import { openSettlingRelocatedWork } from './relocatedWorkOpening';
 import { ReliableConversationLifecycle } from './conversationLifecycle';
 import { ExternalDataVersionWatcher } from './ExternalDataVersionWatcher';
 import {
@@ -232,41 +232,33 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           workspaceFolderUris: (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.toString())
         })
       );
-      // Work a relocation carried away from this old directory: the user decides before the Runtime opens.
-      const carried = await relocatedWorkBeforeOpen(runtimePlacement);
       const authority = createVscodeRootAuthority(runtimePlacement);
-      // Root preparation and Runtime open share one short maintenance claim with the database
-      // worker-ready + Host liveness registration, so a peer open or reset cannot interleave.
-      const product = await withRuntimeMaintenance(authority.expectedPaths(), async () => {
-        const rootPreparation = await new VscodeReliableKernelCutoverCoordinator(
-          authority,
-          runtimePlacement.runtimeScopeRootPath
-        ).ensureCurrentRoot();
-        if (rootPreparation.epochMigrationBackupPath) {
-          console.info(
-            `[LimCode] 已将第 ${rootPreparation.epochMigratedFrom} 代运行数据无损升级到第 ${RUNTIME_KERNEL_EPOCH} 代；`
-            + `升级前 SQLite 备份：${rootPreparation.epochMigrationBackupPath}。`
-          );
-        }
-        await completeVscodeRuntimeDataSetSelection(getPaths());
-        return VscodeReliableKernelProductRuntime.open(context, {
-          authority, runtimePlacement, holdForRelocatedWork: carried !== undefined,
-          onConfigurationChanged: async () => {
-            await facade?.commandRouter.refreshConfiguration();
-            await facade?.refreshConversationHistory();
+      // Work a relocation carried away from this old directory: the user decides before the Runtime
+      // opens, and it is all settled before anything could run it (convergence and recovery are
+      // held until then); otherwise the Runtime closes again and the open fails.
+      const product = await openSettlingRelocatedWork(runtimePlacement, context.globalStorageUri.fsPath, (holdForRelocatedWork) =>
+        // Root preparation and Runtime open share one short maintenance claim with the database
+        // worker-ready + Host liveness registration, so a peer open or reset cannot interleave.
+        withRuntimeMaintenance(authority.expectedPaths(), async () => {
+          const rootPreparation = await new VscodeReliableKernelCutoverCoordinator(
+            authority,
+            runtimePlacement.runtimeScopeRootPath
+          ).ensureCurrentRoot();
+          if (rootPreparation.epochMigrationBackupPath) {
+            console.info(
+              `[LimCode] 已将第 ${rootPreparation.epochMigratedFrom} 代运行数据无损升级到第 ${RUNTIME_KERNEL_EPOCH} 代；`
+              + `升级前 SQLite 备份：${rootPreparation.epochMigrationBackupPath}。`
+            );
           }
-        });
-      }, wait);
-      if (carried) {
-        // Settled before anything could run it (convergence and recovery are held until then).
-        try {
-          await settleRelocatedWorkOnOpen(product.application, carried, context.globalStorageUri.fsPath);
-        } catch (error) {
-          await product.close().catch(() => undefined);
-          throw error;
-        }
-      }
-      product.releaseRelocatedWorkHold();
+          await completeVscodeRuntimeDataSetSelection(getPaths());
+          return VscodeReliableKernelProductRuntime.open(context, {
+            authority, runtimePlacement, holdForRelocatedWork,
+            onConfigurationChanged: async () => {
+              await facade?.commandRouter.refreshConfiguration();
+              await facade?.refreshConversationHistory();
+            }
+          });
+        }, wait));
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
       );

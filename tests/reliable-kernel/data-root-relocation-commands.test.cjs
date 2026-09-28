@@ -52,7 +52,9 @@ function fixture({
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
   nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold,
-  afterLocksError, statusUnreadable = false, undoUnpublishedResult = {}
+  afterLocksError, statusUnreadable = false, undoUnpublishedResult = {},
+  /** What inspectDataRootMovedNotice finds (an Error: the read fails); by default `movedNotice` or none. */
+  movedRead, consentError
 } = {}) {
   const calls = [];
   const abandonOptions = [];
@@ -147,10 +149,6 @@ function fixture({
       }
     },
     '../../backend/reliableKernel/runtimeClaimPrimitives': { ownProcessStartIdentity: () => 'start-identity' },
-    '../../backend/application/reliableKernel/relocatedWorkSettlement': {
-      // What the settlement module may only report; the prompts derive their list from it.
-      RELOCATED_WORK_REPORTED_ONLY: { pendingDeliveryIds: 'continuation_delivery', undeliveredAnswerIds: 'child_answer' }
-    },
     '../../backend/reliableKernel/runtimeDataRootRelocation': {
       DataRootRelocationError: class DataRootRelocationError extends Error {
         constructor(code, message) { super(message); this.code = code; }
@@ -205,13 +203,27 @@ function fixture({
       deleteOldDataRoot: async (input) => { calls.push(['delete', plain(input)]); return deleteResult; },
       recoverInterruptedDataRootRelocation: async (input) => { calls.push(['recover', plain(input)]); return recoverOutcome; },
       finalizeDataRootRelocation: async (root) => { calls.push(['finalize', root]); },
-      readDataRootMovedNotice: async (root) => { calls.push(['read-moved', root]); return movedNotice; },
+      readDataRootMovedNotice: async (root) => {
+        calls.push(['read-moved', root]);
+        if (movedRead instanceof Error) throw movedRead;
+        return movedRead && !movedRead.notice ? undefined : movedNotice;
+      },
+      inspectDataRootMovedNotice: async (root) => {
+        calls.push(['inspect-moved', root]);
+        if (movedRead instanceof Error) throw movedRead;
+        return movedRead ?? (movedNotice ? { notice: movedNotice } : { none: true });
+      },
+      DATA_ROOT_MOVED_NOTICE_FILE: '.limcode-data-root-moved.json',
       clearDataRootMovedNotice: async (root, installation) => { calls.push(['clear-moved', root, installation]); return false; },
       sweepDataRootRelocationLeftovers: async (root) => { calls.push(['sweep', root]); return { removed: [] }; },
       findDataRootRelocationCopy: async (root, relocationId) => { calls.push(['find-copy', root, relocationId]); return copyAside; },
       readDataRootRelocationHold: async (root) => { calls.push(['read-hold', root]); return hold; },
       isDataRootRelocationTargetInvisible: (error) => error?.code === 'data-root-relocation-target-invisible',
-      consentToDataRootMovedWork: async (root, relocationId, by) => { calls.push(['consent', root, relocationId, by]); return true; },
+      consentToDataRootMovedWork: async (root, relocationId, by) => {
+        calls.push(['consent', root, relocationId, by]);
+        if (consentError) throw consentError;
+        return true;
+      },
       undoUnpublishedDataRootRelocation: async (root) => { calls.push(['undo-unpublished', root]); return undoUnpublishedResult; }
     },
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': {
@@ -884,7 +896,7 @@ const carriedNotice = (overrides = {}) => ({
   ...overrides
 });
 
-test('补充 E 打开带着迁走任务的旧目录（moved-work）：三选一；逐条列出收尾不了的项（按收尾模块导出的只报告类别推导）；在这里继续先记下同意再重载，改用新目录只切指针，暂不打开什么都不做', async () => {
+test('补充 E 打开带着迁走任务的旧目录（moved-work）：三选一；如实说明全部收尾之前不执行、收尾不了就不打开（不再说“不再执行”或“打开后仍会执行一次”）；在这里继续先记下同意再重载，改用新目录只切指针，暂不打开什么都不做', async () => {
   const offer = async (choice, nativeAnswers = []) => {
     const f = fixture({ host: false, recoveryChoice: choice, movedNotice: carriedNotice(), nativeAnswers });
     await f.commands.offerDataRootRecovery(f.context, f.startup, '数据目录暂时没有打开', 'moved-work');
@@ -895,8 +907,9 @@ test('补充 E 打开带着迁走任务的旧目录（moved-work）：三选一�
   assert.deepEqual(prompt.slice(3), ['在这里继续（已迁走的任务按中止收尾）', '改用新目录', '暂不打开']);
   assert.match(prompt[2].detail, /由 VS Code（本机） 迁移到 \/mnt\/new\/limcode/);
   assert.match(prompt[2].detail, /1 个对话还有没完成的任务（“部署脚本”）/);
-  assert.match(prompt[2].detail, /以下各项收尾不了，打开后仍会执行一次：\n“部署脚本”：待投递的结果（会开启新的回合）（delivery-1）/);
-  assert.doesNotMatch(prompt[2].detail, /turn-1|dispatch-1/, '收尾模块能收尾的类别不列（这里的桩只把投递和子答复算作只报告）');
+  assert.match(prompt[2].detail, /在这里继续使用时，打开时先把它们全部按中止收尾，收尾完之前这里不执行任何工作；有收尾不了的（例如另一个窗口正占着它，或需要人工处理），这次就不打开，并逐条说明是哪一项、为什么、该怎么做。/);
+  assert.doesNotMatch(prompt[2].detail, /不再执行|打开后仍会执行一次|收尾不了，打开后/, '不再有“只报告再放行”的说法');
+  assert.doesNotMatch(prompt[2].detail, /会开启新的回合|还没送达的子 Agent 答复|已结束进程的完成通知/, '上一轮的旧类别文案已删掉');
   assert.deepEqual(here.calls.find((call) => call[0] === 'consent'), ['consent', SOURCE, 'r-7', '/vscode/global-storage']);
   assert.ok(here.kinds().indexOf('consent') < here.kinds().lastIndexOf('command'));
   assert.deepEqual(here.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
@@ -917,19 +930,120 @@ test('最后一轮 #4 这个目录里那次没成功的迁移正在撤销（relo
   assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
 });
 
-test('补充 E 发起安装“回到旧目录”：确认那一步就算同意，旧目录里带走的任务在打开时直接收尾；提示里写明；别的安装的标记或别的迁移不算', async () => {
+test('最后一轮 #1 这次打开留下了没收尾的项（moved-work-unsettled）：模态提示逐条写明是什么、在哪个对话、为什么没收尾、该怎么做，并说明全部收尾前这里不执行任何工作', async () => {
+  const items = [
+    { conversationId: 'conversation-1', title: '部署脚本', list: 'activeTurnIds', id: 'turn-1', why: 'live', detail: '' },
+    { conversationId: 'conversation-1', title: '部署脚本', list: 'undeliveredAnswerIds', id: 'answer-1', why: 'live', detail: '' },
+    { conversationId: 'conversation-2', title: '周报', list: 'activeTurnIds', id: 'turn-2', why: 'needs_human', detail: 'Turn 的终态事实不一致，需要人工处理；已记录停止请求。' },
+    { conversationId: 'conversation-3', title: '', list: 'pendingDeliveryIds', id: 'delivery-9', why: 'rounds_exhausted', detail: '收尾 5 轮后仍出现新的可执行项（pendingDeliveryIds），这次不再收尾。' },
+    { conversationId: '', title: '', list: 'round', id: 'round-2', why: 'failed', detail: '第 2 轮之前协作收敛或重新盘点失败（试了 3 次）：revision conflict' }
+  ];
+  const f = fixture({ host: false, recoveryChoice: undefined, movedNotice: carriedNotice() });
+  const error = Object.assign(new Error('数据目录这次没有打开'), { reason: 'moved-work-unsettled', cause: { items } });
+  await f.commands.offerDataRootRecovery(f.context, f.startup, '数据目录这次没有打开：迁走的任务还没有全部收尾（还剩 5 项）', 'moved-work-unsettled', error);
+  const prompt = f.calls.find((call) => call[0] === 'error');
+  assert.equal(prompt[1], '数据目录这次没有打开：迁走的任务还没有全部收尾（还剩 5 项）');
+  assert.equal(prompt[2].modal, true, '模态：逐条列出');
+  assert.deepEqual(prompt.slice(3), ['重试', '改用新目录']);
+  const lines = prompt[2].detail.split('\n');
+  assert.deepEqual(lines, [
+    '还没收尾的项：',
+    '· 对话“部署脚本”里的进行中的回合（turn-1）：另一个 LimCode 窗口正在执行或占着它，这里收尾不了。关闭或重载那个窗口（或等它结束）之后重试。',
+    '· 对话“部署脚本”里的子 Agent 的答复（answer-1）：另一个 LimCode 窗口正在执行或占着它，这里收尾不了。关闭或重载那个窗口（或等它结束）之后重试。',
+    '· 对话“周报”里的进行中的回合（turn-2）：停止流程收不掉它（Turn 的终态事实不一致，需要人工处理；已记录停止请求。）。可以稍后重试（它可能自己结束），或改用新目录，在那里处理这个对话。',
+    '· 对话“conversation-3”里的待投递的结果或消息（delivery-9）：收尾几轮之后仍不断出现新的工作（收尾 5 轮后仍出现新的可执行项（pendingDeliveryIds），这次不再收尾。）。重试时会接着收尾；一直这样时可以改用新目录。',
+    '· 一轮收尾（round-2）：收尾时出错（第 2 轮之前协作收敛或重新盘点失败（试了 3 次）：revision conflict）。可以重试；一直出错时可以改用新目录。',
+    '在全部收尾之前，这个目录不会在这里打开，里面的任何工作都不会执行；重试时会先把迁走的任务整库再收尾一次。'
+  ]);
+  assert.ok(!f.kinds().includes('command') && !f.kinds().includes('status') && !f.kinds().includes('consent'), '关掉提示：什么都不做');
+});
+
+test('最后一轮 #6 moved-work-unsettled 的出路：重试（重载）、改用新目录（只切指针）；错误里没带条目时列出标记里最近一次记下的；打开之后不再有剩余项提示（有剩余项就不会打开）', async () => {
+  const leftAt = (at, id) => ({ at, by: '/vscode/global-storage', items: [{ conversationId: 'conversation-1', title: '部署脚本', list: 'activeTurnIds', id, why: 'live', detail: '' }] });
+  const notice = carriedNotice({ carriedWork: { dataSets: [
+    { ...carriedNotice().carriedWork.dataSets[0], settlement: { state: 'consented', at: '2026-09-27T09:00:00.000Z', by: '/vscode/global-storage', left: leftAt('2026-09-27T10:00:00.000Z', 'turn-old') } },
+    { ...carriedNotice().carriedWork.dataSets[0], id: 'workspace:abc', settlement: { state: 'consented', at: '2026-09-27T09:00:00.000Z', by: '/vscode/global-storage', left: leftAt('2026-09-27T11:00:00.000Z', 'turn-new') } }
+  ] } });
+  const offer = async (choice, nativeAnswers = []) => {
+    const f = fixture({ host: false, recoveryChoice: choice, movedNotice: notice, nativeAnswers });
+    await f.commands.offerDataRootRecovery(f.context, f.startup, '数据目录这次没有打开', 'moved-work-unsettled');
+    return f;
+  };
+  const retry = await offer('重试');
+  const prompt = retry.calls.find((call) => call[0] === 'error');
+  assert.match(prompt[2].detail, /turn-new/);
+  assert.doesNotMatch(prompt[2].detail, /turn-old/, '只列最近一次打开留下的');
+  assert.deepEqual(retry.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+  assert.ok(!retry.kinds().includes('consent'), '已经同意过：不再询问');
+  const elsewhere = await offer('改用新目录', ['改用并重载']);
+  assert.equal(elsewhere.calls.find((call) => call[0] === 'status')[1].dataRootPath, '/mnt/new/limcode');
+  const nothing = await offer(undefined);
+  assert.ok(!nothing.kinds().includes('command') && !nothing.kinds().includes('status'));
+
+  const opened = fixture({ movedNotice: carriedNotice({ carriedWork: { dataSets: [{ ...carriedNotice().carriedWork.dataSets[0], settlement: {
+    state: 'settled', at: '2026-09-27T12:00:00.000Z', by: '/vscode/global-storage', result: { counts: { turnsStopped: 1 } }
+  } }] } }) });
+  await opened.commands.afterDataRootOpened(opened.context, SOURCE, opened.startup);
+  assert.deepEqual(opened.calls.filter((call) => call[0] === 'warning'), [], '打开之后没有剩余项提示');
+});
+
+test('最后一轮 决定三 “已迁走”标记读不懂（moved-notice-invalid）：按不能访问一类给出路（重试、改用标记里写的新目录、回到旧目录、选择其它目录、使用默认目录）；读不出新目录时不给“改用迁移后的目录”', async () => {
+  const message = '数据目录这次没有打开：“数据已迁走”标记读不懂';
+  const readable = fixture({ host: false, recoveryChoice: '改用迁移后的目录', nativeAnswers: ['改用并重载'],
+    movedRead: { invalid: '迁走的任务清单或它的收尾状态不是本版本认得的内容', targetRootPath: '/mnt/new/limcode' } });
+  await readable.commands.offerDataRootRecovery(readable.context, readable.startup, message, 'moved-notice-invalid');
+  const prompt = readable.calls.find((call) => call[0] === 'error');
+  assert.equal(prompt[1], `${message}\n\n标记里写的新目录：/mnt/new/limcode。`);
+  assert.deepEqual(prompt.slice(2), ['重试', '改用迁移后的目录', '选择其它目录…', '使用默认目录…']);
+  assert.equal(readable.calls.find((call) => call[0] === 'status')[1].dataRootPath, '/mnt/new/limcode', '只切指针');
+  assert.ok(!readable.kinds().includes('consent'));
+  const broken = fixture({ host: false, recoveryChoice: '重试', movedRead: { invalid: '不是完整的 JSON' } });
+  await broken.commands.offerDataRootRecovery(broken.context, broken.startup, message, 'moved-notice-invalid');
+  assert.deepEqual(broken.calls.find((call) => call[0] === 'error').slice(1), [message, '重试', '选择其它目录…', '使用默认目录…']);
+  assert.deepEqual(broken.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
+});
+
+test('补充 E 发起安装“回到旧目录”：确认那一步就算同意，旧目录里带走的任务在打开时直接收尾；提示里写明；别的安装后来的标记不算（由它管着旧目录的打开）', async () => {
   const lastMigration = { fromPath: '/data/older', toPath: SOURCE, migratedAt: '2026-09-26T00:00:00.000Z', relocationId: 'r-7' };
   const own = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }) });
   await own.commands.returnToPreviousDataRoot(own.context, own.startup, own.request);
-  assert.match(JSON.stringify(own.prompts[0]), /在这里继续使用时，打开前先把它们按中止收尾/);
+  assert.match(JSON.stringify(own.prompts[0]), /在这里继续使用时，打开时先把它们全部按中止收尾，收尾完之前这里不执行任何工作/);
   assert.deepEqual(own.calls.find((call) => call[0] === 'consent'), ['consent', '/data/older', 'r-7', '/vscode/global-storage']);
   assert.ok(own.kinds().indexOf('consent') < own.kinds().indexOf('status'), '先记下同意，再切换指针');
-  for (const notice of [carriedNotice({ targetRootPath: SOURCE, installation: { id: '/other/installation', label: '另一个安装' } }), carriedNotice({ targetRootPath: SOURCE, relocationId: 'r-other' })]) {
-    const other = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: notice });
-    await other.commands.returnToPreviousDataRoot(other.context, other.startup, other.request);
-    assert.ok(!other.kinds().includes('consent'), '只认本安装、同一次迁移的标记');
-  }
+  const other = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }],
+    movedNotice: carriedNotice({ targetRootPath: SOURCE, relocationId: 'r-later', installation: { id: '/other/installation', label: '另一个安装' } }) });
+  await other.commands.returnToPreviousDataRoot(other.context, other.startup, other.request);
+  assert.ok(!other.kinds().includes('consent'), '别的安装的标记不替它同意');
+  assert.equal(other.calls.find((call) => call[0] === 'status')?.[1].dataRootPath, '/data/older', '照常切换：旧目录的打开由那份标记管着');
   const declined = fixture({ lastMigration, answers: [{ choice: 'cancel', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }) });
   await declined.commands.returnToPreviousDataRoot(declined.context, declined.startup, declined.request);
   assert.ok(!declined.kinds().includes('consent'), '没确认就不算同意');
+});
+
+test('最后一轮 决定二 “回到旧目录”找不到这次迁移的标记（或读不出、读不懂、只有本安装别的迁移的标记）时如实报错、不切换；记同意失败时也报错、不切换', async () => {
+  const lastMigration = { fromPath: '/data/older', toPath: SOURCE, migratedAt: '2026-09-26T00:00:00.000Z', relocationId: 'r-7' };
+  const cases = [
+    ['missing', { movedRead: { none: true } }, /旧目录里找不到这次迁移留下的“数据已迁走”标记（\/data\/older\/\.limcode-data-root-moved\.json）/],
+    ['unreadable', { movedRead: Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' }) }, /读不出旧目录里的“数据已迁走”标记（\/data\/older\/\.limcode-data-root-moved\.json：(Error: )?EACCES: permission denied）/],
+    ['invalid', { movedRead: { invalid: '不是完整的 JSON', targetRootPath: SOURCE } }, /旧目录里的“数据已迁走”标记读不懂（\/data\/older\/\.limcode-data-root-moved\.json：不是完整的 JSON）/],
+    ['own-other', { movedNotice: carriedNotice({ targetRootPath: SOURCE, relocationId: 'r-older' }) }, /旧目录里找不到这次迁移留下的“数据已迁走”标记/]
+  ];
+  for (const [name, options, expected] of cases) {
+    const f = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], ...options });
+    await f.commands.returnToPreviousDataRoot(f.context, f.startup, f.request);
+    assert.equal(f.prompts[0]?.title, '现在不能回到旧目录', name);
+    assert.match(JSON.stringify(f.prompts[0]), expected, name);
+    assert.match(JSON.stringify(f.prompts[0]), /无法确认迁走的任务在旧目录里不会再执行一次|无法确认迁走的任务在那里不会再执行一次/, name);
+    assert.ok(!f.kinds().includes('consent') && !f.kinds().includes('status'), `${name}：不同意、不切换`);
+  }
+  const failing = fixture({ lastMigration, answers: [{ choice: 'return', include: [] }], movedNotice: carriedNotice({ targetRootPath: SOURCE }),
+    consentError: Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' }) });
+  await failing.commands.returnToPreviousDataRoot(failing.context, failing.startup, failing.request);
+  assert.deepEqual(failing.prompts.map((prompt) => prompt.title), ['回到迁移前的旧数据目录？', '没有回到旧目录']);
+  assert.match(JSON.stringify(failing.prompts[1]), /没能在旧目录里记下“迁走的任务按中止收尾”（(Error: )?EIO: i\/o error, write），所以没有切换/);
+  assert.ok(!failing.kinds().includes('status'), '同意没记下：不切换');
+  const without = fixture({ lastMigration: { ...lastMigration, relocationId: undefined }, answers: [{ choice: 'return', include: [] }] });
+  await without.commands.returnToPreviousDataRoot(without.context, without.startup, without.request);
+  assert.ok(!without.kinds().includes('inspect-moved'), '只切过指针的记录（没有迁移 id）：没有要找的标记');
+  assert.equal(without.calls.find((call) => call[0] === 'status')?.[1].dataRootPath, '/data/older');
 });

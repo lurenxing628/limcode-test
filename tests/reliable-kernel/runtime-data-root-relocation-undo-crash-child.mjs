@@ -12,7 +12,8 @@
 //   dbbackup-before-rename      offline copy of the receiving database complete, before its rename
 //   selection-after             after the selection file is written (fresh root)
 //   identity-after              after the identity file is written
-//   complete-marker-after       after the completion record is written (== before publish)
+//   complete-marker-after       after the completion record is written (before the moved notice)
+//   notice-after                after the old directory's moved notice is written (== before publish)
 //   publish-after               after the pointer switch
 //   during-merge                killed inside the move: before the merge's row commit (existing target), after
 //                               the first committed batch (fresh root)
@@ -88,6 +89,7 @@ function installHooks() {
       if (point === 'staging-marker-after' && markerWrites === 1) kill('staging record written');
       if (point === 'complete-marker-after' && phase === 'relocate' && markerWrites === 2) kill('completion record written');
     }
+    if (point === 'notice-after' && toName === '.limcode-data-root-moved.json' && phase === 'relocate') kill('moved notice written');
     if (point === 'selection-after' && toName === '.limcode-runtime-selection.json' && phase === 'relocate') kill('selection written');
     if (point === 'identity-after' && toName === '.limcode-data-root-identity.json') kill('identity written');
     if (point === 'undo-db-restored' && phase === 'recover' && toName === 'limcode.sqlite' && String(from).includes('.limcode-relocation-backups')) {
@@ -180,6 +182,8 @@ async function main() {
   installHooks();
   await relocate(fixture, plan, {
     relocationId,
+    // Its moved notice is written into the old directory right before the switch; an undo removes it.
+    movedBy: { id: path.join(base, 'installation'), label: 'crash child' },
     publish: async ({ dataRootId }) => {
       await writeFileAtomicDurable(pointer, JSON.stringify({ dataRootPath: target, dataRootId }));
       if (point === 'publish-after') kill('pointer switch');

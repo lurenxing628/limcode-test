@@ -543,7 +543,7 @@ test('跨模块 E 没有未完成的任务时“已迁走”标记不带 carried
   assert.equal(notice.relocationId, staged.relocationId);
   assert.equal(notice.carriedWork, undefined);
   assert.equal(await consentToDataRootMovedWork(fixture.root, staged.relocationId, '/installations/b'), false);
-  assert.equal(await recordDataRootMovedWorkSettled(fixture.root, staged.relocationId, 'default', '/installations/b', { counts: {}, live: [], unsettled: [] }), false);
+  assert.equal(await recordDataRootMovedWorkSettled(fixture.root, staged.relocationId, 'default', '/installations/b', { counts: {} }), false);
 });
 
 /** backend/capabilities/vscodeStorage/localStorageUri.ts with a fake vscode module. */

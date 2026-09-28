@@ -165,7 +165,7 @@ async function startApplication(
       // Never an empty history in place of an unmounted drive: offer retry or the old directory.
       void import('./commands/dataRootRelocation')
         .then(({ offerDataRootRecovery }) => offerDataRootRecovery(context, startup, `${EXTENSION_BRAND} ${message}`,
-          (error as { reason?: DataRootUnavailableReason }).reason))
+          (error as { reason?: DataRootUnavailableReason }).reason, error))
         .catch((offerError) => console.error(`${EXTENSION_BRAND} data root recovery prompt failed.`, offerError));
       return;
     }

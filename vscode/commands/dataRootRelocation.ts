@@ -7,7 +7,6 @@ import {
   GlobalStatusPendingRelocationConflictError, LIMCODE_GLOBAL_STATUS_FILE, loadCommittedGlobalStatus, resolveDataRootUri, sameFsPath,
   updateGlobalStatusDataRoot, type LimCodeGlobalStatus, type PendingDataRootRelocation
 } from '../../backend/capabilities/vscodeStorage/globalStatus';
-import { RELOCATED_WORK_REPORTED_ONLY } from '../../backend/application/reliableKernel/relocatedWorkSettlement';
 import type { RuntimeRootPaths } from '../../backend/reliableKernel/contracts';
 import { ownProcessStartIdentity } from '../../backend/reliableKernel/runtimeClaimPrimitives';
 import {
@@ -16,8 +15,8 @@ import {
   finalizeDataRootRelocation, findDataRootRelocationCopy, formatBytes, inspectDataRootForReturn, invalidateDataRootRelocationRecord,
   isDataRootRelocationTargetInvisible, undoUnpublishedDataRootRelocation,
   planDataRootRelocation, planOldDataRootDeletion, readDataRootMovedNotice, readDataRootRelocationHold, recoverInterruptedDataRootRelocation,
-  stageDataRootRelocation,
-  sweepDataRootRelocationLeftovers, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
+  stageDataRootRelocation, inspectDataRootMovedNotice, DATA_ROOT_MOVED_NOTICE_FILE,
+  sweepDataRootRelocationLeftovers, type DataRootCarriedWorkLeftItem, type DataRootMovedNotice, type DataRootRelocationPlan, type DataRootRelocationPublication,
   type DataRootRelocationResult, type DataRootUnavailableReason, type StagedDataRootRelocation,
   consentToDataRootMovedWork,
 } from '../../backend/reliableKernel/runtimeDataRootRelocation';
@@ -428,9 +427,33 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     return;
   }
   // The work this installation's relocation carried away: confirming the return settles it there first.
-  const moved = await readDataRootMovedNotice(previous).catch(() => undefined);
-  const carried = moved?.carriedWork && moved.installation.id === installationOf(context).id
-    && moved.relocationId === status.lastMigration?.relocationId ? moved : undefined;
+  // That relocation wrote its moved notice there before switching: not finding it, or not
+  // understanding it, is never taken for "nothing moved" (its work would run there a second time).
+  const relocationId = status.lastMigration?.relocationId;
+  let moved: DataRootMovedNotice | undefined;
+  if (relocationId) {
+    const noticePath = path.join(previous, DATA_ROOT_MOVED_NOTICE_FILE);
+    let read: Awaited<ReturnType<typeof inspectDataRootMovedNotice>>;
+    try {
+      read = await inspectDataRootMovedNotice(previous);
+    } catch (error) {
+      await notify(ask, '现在不能回到旧目录', [`读不出旧目录里的“数据已迁走”标记（${noticePath}：${describeError(error)}），无法确认迁走的任务在那里不会再执行一次。请稍后再试。`]);
+      return;
+    }
+    const own = 'notice' in read && read.notice.installation.id === installationOf(context).id;
+    if ('invalid' in read || !('notice' in read) || (own && read.notice.relocationId !== relocationId)) {
+      await notify(ask, '现在不能回到旧目录', [
+        'invalid' in read
+          ? `旧目录里的“数据已迁走”标记读不懂（${noticePath}：${read.invalid}），`
+          : `旧目录里找不到这次迁移留下的“数据已迁走”标记（${noticePath}），`,
+        '无法确认迁走的任务在旧目录里不会再执行一次，所以没有切换，仍使用当前目录。'
+      ]);
+      return;
+    }
+    // Another installation's notice (it moved that directory on since): it governs opening it there.
+    moved = read.notice;
+  }
+  const carried = moved?.carriedWork && moved.installation.id === installationOf(context).id && moved.relocationId === relocationId ? moved : undefined;
   const lines = [
     `旧目录：${previous}`,
     `当前目录：${current}`,
@@ -444,8 +467,12 @@ export async function returnToPreviousDataRoot(context: vscode.ExtensionContext,
     : await nativeConfirm('回到迁移前的旧数据目录？', lines, '回到旧目录');
   if (!confirmed) return;
   if (carried) {
-    await consentToDataRootMovedWork(previous, carried.relocationId, installationOf(context).id)
-      .catch((error: unknown) => console.warn('[LimCode] 没能记下对已迁走任务的处理，打开旧目录时会再询问。', error));
+    try {
+      await consentToDataRootMovedWork(previous, carried.relocationId, installationOf(context).id);
+    } catch (error) {
+      await notify(ask, '没有回到旧目录', [`没能在旧目录里记下“迁走的任务按中止收尾”（${describeError(error)}），所以没有切换；可以稍后再试。`]);
+      return;
+    }
   }
   const switchPointer = async (): Promise<void> => {
     if (await isAvailable(current, status)) {
@@ -604,7 +631,8 @@ export async function offerDataRootRecovery(
   context: vscode.ExtensionContext,
   startup: ApplicationStartup,
   message: string,
-  reason?: DataRootUnavailableReason
+  reason?: DataRootUnavailableReason,
+  error?: unknown
 ): Promise<void> {
   if (reason === 'unreadable' || reason === 'relocating' || reason === 'relocation-undoing') {
     // Temporary: the drive answers slowly, or a relocation into this directory is running or being undone.
@@ -627,6 +655,16 @@ export async function offerDataRootRecovery(
       return;
     }
     await reloadWindow();
+    return;
+  }
+  if (reason === 'moved-work-unsettled') {
+    // Not all of it could be settled at this open: it stays consented and nothing ran; the next open settles again.
+    const moved = await readDataRootMovedNotice(current).catch(() => undefined);
+    const choice = await vscode.window.showErrorMessage(message, {
+      modal: true, detail: describeCarriedWorkLeft(leftOf(error) ?? latestLeft(moved)).join('\n')
+    }, '重试', ...(moved ? ['改用新目录'] : []));
+    if (choice === '重试') await reloadWindow();
+    else if (choice === '改用新目录' && moved) await switchToMovedDataRoot(context, undefined, current, moved.targetRootPath);
     return;
   }
   if (reason === 'moved-work') {
@@ -653,17 +691,20 @@ export async function offerDataRootRecovery(
   }
   const previous = previousDataRoot(status, current);
   const canReturn = previous !== undefined && (await inspectDataRootForReturn(previous)).usable;
-  // Its data was moved away (the old directory keeps the notice, also after its data was deleted).
-  const moved = await readDataRootMovedNotice(current).catch(() => undefined);
-  const follow = moved && (await inspectDataRootForReturn(moved.targetRootPath)).usable ? moved : undefined;
-  const text = follow
-    ? `${message}\n\n这个目录的数据已在 ${follow.movedAt.slice(0, 16).replace('T', ' ')} 由 ${follow.installation.label} 迁移到 ${follow.targetRootPath}。`
-    : message;
+  // Its data was moved away (the old directory keeps the notice, also after its data was deleted);
+  // a notice that cannot be understood ('moved-notice-invalid') still names where, when it can be read that far.
+  const read = await inspectDataRootMovedNotice(current).catch(() => undefined);
+  const moved = read && 'notice' in read ? read.notice : undefined;
+  const movedTo = moved?.targetRootPath ?? (read && 'invalid' in read ? read.targetRootPath : undefined);
+  const follow = movedTo && (await inspectDataRootForReturn(movedTo)).usable ? movedTo : undefined;
+  const text = follow && moved
+    ? `${message}\n\n这个目录的数据已在 ${moved.movedAt.slice(0, 16).replace('T', ' ')} 由 ${moved.installation.label} 迁移到 ${moved.targetRootPath}。`
+    : follow ? `${message}\n\n标记里写的新目录：${follow}。` : message;
   const choice = await vscode.window.showErrorMessage(text, ...[
     '重试', ...(follow ? ['改用迁移后的目录'] : []), ...(canReturn ? ['回到旧目录'] : []), '选择其它目录…', '使用默认目录…'
   ]);
   if (choice === '重试') await reloadWindow();
-  else if (choice === '改用迁移后的目录' && follow) await switchToMovedDataRoot(context, undefined, current, follow.targetRootPath);
+  else if (choice === '改用迁移后的目录' && follow) await switchToMovedDataRoot(context, undefined, current, follow);
   else if (choice === '回到旧目录') await returnToPreviousDataRoot(context, startup);
   else if (choice === '选择其它目录…') await chooseOtherDataRoot(context, current);
   else if (choice === '使用默认目录…') await useDefaultDataRoot(context, startup, current);
@@ -784,32 +825,67 @@ async function settleInterruptedRelocation(context: vscode.ExtensionContext, pen
 
 const CONTINUE_HERE = '在这里继续（已迁走的任务按中止收尾）';
 
-/** Kinds of carried work the settlement may only report (RELOCATED_WORK_REPORTED_ONLY), for people. */
-const REPORTED_ONLY_LABELS: Readonly<Record<string, string>> = {
-  continuation_delivery: '待投递的结果（会开启新的回合）',
-  child_answer: '还没送达的子 Agent 答复',
-  process_completion: '已结束进程的完成通知'
+/** What an item of carried work is (its inventory list, see relocatedWorkSettlement's RelocatedWorkItemList), for people. */
+const WORK_ITEM_LABELS: Readonly<Record<string, string>> = {
+  activeTurnIds: '进行中的回合',
+  queuedIntentIds: '排队的消息或续跑',
+  unfinishedModelRequestIds: '没完成的模型请求',
+  pendingInteractionIds: '等待回答的提问或审批',
+  childExecutionIds: '子 Agent',
+  pendingDeliveryIds: '待投递的结果或消息',
+  pendingProcessCompletionIds: '后台进程的完成通知',
+  undeliveredAnswerIds: '子 Agent 的答复',
+  unreceiptedEffectIds: '工具操作',
+  otherRuntimeWork: '其它没完成的工作',
+  round: '一轮收尾'
 };
 
 /**
- * The unfinished work a relocation carried away that is not settled yet: how much, and item by
- * item what the settlement can only report (it may still run once after opening), derived from the
- * inventory and RELOCATED_WORK_REPORTED_ONLY.
+ * The unfinished work a relocation carried away that is not settled yet: how much, and what
+ * continuing here means (all of it is settled before anything runs; while any of it cannot be, the
+ * directory does not open here).
  */
 function describeMovedWork(notice: DataRootMovedNotice): string[] {
   const conversations = (notice.carriedWork?.dataSets ?? []).filter((item) => item.settlement.state !== 'settled')
     .flatMap((item) => item.inventory.conversations);
   if (conversations.length === 0) return [];
   const titles = conversations.slice(0, 5).map((conversation) => `“${conversation.title || conversation.conversationId}”`).join('、');
-  const lines = [
-    `迁走时有 ${conversations.length} 个对话还有没完成的任务（${titles}${conversations.length > 5 ? ' 等' : ''}）。它们已随数据迁到新目录，可能已在那里执行过；`
-      + '在这里继续使用时，打开前先把它们按中止收尾，不再执行。'
+  return [
+    `迁走时有 ${conversations.length} 个对话还有没完成的任务（${titles}${conversations.length > 5 ? ' 等' : ''}）。它们已随数据迁到新目录，可能已在那里执行过。`
+      + '在这里继续使用时，打开时先把它们全部按中止收尾，收尾完之前这里不执行任何工作；'
+      + '有收尾不了的（例如另一个窗口正占着它，或需要人工处理），这次就不打开，并逐条说明是哪一项、为什么、该怎么做。'
   ];
-  const reported = conversations.flatMap((conversation) => Object.entries(RELOCATED_WORK_REPORTED_ONLY).flatMap(([list, kind]) =>
-    ((conversation as unknown as Record<string, unknown>)[list] as string[] | undefined ?? []).map((id) =>
-      `“${conversation.title || conversation.conversationId}”：${REPORTED_ONLY_LABELS[kind as string] ?? kind}（${id}）`)));
-  if (reported.length > 0) lines.push('以下各项收尾不了，打开后仍会执行一次：', ...reported);
-  return lines;
+}
+
+/** What the refused open could not settle (its error), else what the notice last recorded. */
+function leftOf(error: unknown): readonly DataRootCarriedWorkLeftItem[] | undefined {
+  const items = ((error as { cause?: unknown } | undefined)?.cause as { items?: unknown } | undefined)?.items;
+  return Array.isArray(items) ? items as DataRootCarriedWorkLeftItem[] : undefined;
+}
+
+function latestLeft(notice: DataRootMovedNotice | undefined): readonly DataRootCarriedWorkLeftItem[] {
+  const recorded = (notice?.carriedWork?.dataSets ?? []).flatMap((item) =>
+    item.settlement.state === 'consented' && item.settlement.left ? [item.settlement.left] : []);
+  return recorded.sort((a, b) => b.at.localeCompare(a.at))[0]?.items ?? [];
+}
+
+/**
+ * What an open of the old directory could not settle, item by item: what it is, in which
+ * Conversation, why, and what to do. Nothing of it ran; the next open settles the whole data set again.
+ */
+export function describeCarriedWorkLeft(items: readonly DataRootCarriedWorkLeftItem[]): string[] {
+  const where = (item: DataRootCarriedWorkLeftItem): string => item.conversationId
+    ? `对话“${item.title || item.conversationId}”里的${WORK_ITEM_LABELS[item.list] ?? item.list}（${item.id}）`
+    : `${WORK_ITEM_LABELS[item.list] ?? item.list}（${item.id}）`;
+  const why = (item: DataRootCarriedWorkLeftItem): string => item.why === 'live'
+    ? '另一个 LimCode 窗口正在执行或占着它，这里收尾不了。关闭或重载那个窗口（或等它结束）之后重试。'
+    : item.why === 'failed' ? `收尾时出错（${item.detail}）。可以重试；一直出错时可以改用新目录。`
+      : item.why === 'needs_human' ? `停止流程收不掉它（${item.detail}）。可以稍后重试（它可能自己结束），或改用新目录，在那里处理这个对话。`
+        : `收尾几轮之后仍不断出现新的工作（${item.detail}）。重试时会接着收尾；一直这样时可以改用新目录。`;
+  return [
+    ...(items.length > 0 ? ['还没收尾的项：', ...items.map((item) => `· ${where(item)}：${why(item)}`)] : []),
+    '在全部收尾之前，这个目录不会在这里打开，里面的任何工作都不会执行；重试时会先把迁走的任务整库再收尾一次。'
+  ];
 }
 
 const FORGET_RELOCATION = '放弃这次迁移的记录';
