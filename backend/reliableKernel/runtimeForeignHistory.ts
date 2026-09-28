@@ -757,6 +757,14 @@ export async function readLocatedRuntimeFile(file: string, held: HeldDatabaseFil
 }
 
 /**
+ * Whether the descriptor opened the file `lstat` found. On Windows Node's path stat leaves the volume
+ * serial (dev) unset while the descriptor's stat reports it, so there only the file id is compared.
+ */
+export function sameOpenedFile(found: BigIntStats, opened: BigIntStats, platform: NodeJS.Platform = process.platform): boolean {
+  return opened.ino === found.ino && (platform === 'win32' || opened.dev === found.dev);
+}
+
+/**
  * The descriptor of a regular file of a located root, opened exactly as readLocatedRuntimeFile opens
  * it (lstat first, O_NOFOLLOW and O_NONBLOCK, the descriptor checked to be that same regular file,
  * never a file of a database this process holds). The caller reads it and closes it. `maxBytes` bounds
@@ -781,7 +789,7 @@ export async function openLocatedRuntimeFile(file: string, held: HeldDatabaseFil
       kept = true;
       throw openDatabase(file);
     }
-    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino || (maxBytes !== undefined && opened.size > BigInt(maxBytes))) {
+    if (!opened.isFile() || !sameOpenedFile(info, opened) || (maxBytes !== undefined && opened.size > BigInt(maxBytes))) {
       throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-changed', `${path.basename(file)} 在读取时被替换了，稍后再试。`);
     }
     kept = true;

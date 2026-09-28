@@ -409,3 +409,13 @@ test('盲审 #8：外来库有等待中的合并请求时清理备份不判可�
   try { assert.equal(itemOf(await planRuntimeBackupCleanup(fixture.root, database))?.deletable, true, '请求结束之后可删'); }
   finally { await database.close(); }
 });
+
+test('Windows 上按路径的 stat 不带卷序列号（dev）时，打开的描述符仍认作 lstat 找到的那个文件；文件 id 不同照样判为被替换', () => {
+  // Node on Windows: lstat leaves dev unset (0) while the descriptor's stat reports the volume serial.
+  const found = { dev: 0n, ino: 281474976710701n };
+  const opened = { dev: 2717616129n, ino: 281474976710701n };
+  assert.equal(foreign.sameOpenedFile(found, opened, 'win32'), true);
+  assert.equal(foreign.sameOpenedFile(found, { ...opened, ino: 281474976710702n }, 'win32'), false);
+  assert.equal(foreign.sameOpenedFile(found, opened, 'linux'), false, '其它平台 dev 不同就是另一个文件');
+  assert.equal(foreign.sameOpenedFile({ dev: 7n, ino: 9n }, { dev: 7n, ino: 9n }, 'darwin'), true);
+});
