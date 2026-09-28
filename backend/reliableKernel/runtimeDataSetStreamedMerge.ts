@@ -19,7 +19,7 @@ import {
 } from './runtimeDataSetMerge';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
-  estimatedTargetIndexBytes, LARGE_MERGE_WAL_PEAK_FACTOR, largeMergeTargetBytes, measuredIndexBytes
+  estimatedTargetIndexBytes, LARGE_MERGE_WAL_PEAK_FACTOR, largeMergeTargetBytes
 } from './runtimeDataSetLargeMergeSpace';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
 import { holdForeignHistoricalMergeSource } from './runtimeForeignHistoryMerge';
@@ -37,6 +37,7 @@ import {
 import { describeUnfinishedWork, hasFinalizableWork, type UnfinishedWorkInspection } from './runtimeDataSetMergeWork';
 import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { assertModelRequestAggregate } from './runtimeModelRequestAggregate';
+import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import { attachRuntimeStatementCache, detachRuntimeStatementCache } from './runtimeStatementCache';
 import {
   createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet, type RuntimeDataSetDatabaseSnapshot
@@ -143,6 +144,8 @@ export const RUNTIME_DATA_SET_LARGE_MERGE_MEASURED_RATE_BOUNDS = Object.freeze({
 /** A session whose merged sources the model gives less than this is not measured: its fixed parts would dominate. */
 const RATE_MIN_MODEL_MS = 1000;
 const SKIP_TABLE = 'limcode_merge_skip';
+/** An `all` skip rule's owners during one pass (allSkipRule). */
+const SKIP_CANDIDATES = 'limcode_merge_skip_candidate';
 /** A source's rows the Runtime refuses (invariantRefusal). */
 const INVARIANT = 'runtime-data-set-merge-invariant';
 /**
@@ -306,12 +309,8 @@ async function prepareSkippedRows(
   state.skippedConversations = deleted?.count ?? 0;
   withTemporaryWrites(source, () => source.exec(`DROP TABLE IF EXISTS temp.${SKIP_TABLE}`));
   if (!deleted) return false;
-  withTemporaryWrites(source, () => {
-    source.exec(`CREATE TEMP TABLE ${SKIP_TABLE} (domain TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (domain, id)) WITHOUT ROWID`);
-    const seed = source.prepare(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id) VALUES ('Conversation', ?)`);
-    for (const id of deleted.conversations) seed.run(id);
-  });
-  await closeOver(source, skipRuleStatements(), chunkRows * SKIP_SEGMENT_CHUNKS);
+  seedSkipTable(source, deleted.conversations);
+  await closeOver(source, chunkRows * SKIP_SEGMENT_CHUNKS);
   return true;
 }
 
@@ -326,33 +325,63 @@ function skippedRowsOf(source: Database.Database): Map<string, Set<string>> {
   return skipped;
 }
 
+function seedSkipTable(source: Database.Database, conversations: Iterable<string>): void {
+  withTemporaryWrites(source, () => {
+    source.exec(`CREATE TEMP TABLE ${SKIP_TABLE} (domain TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (domain, id)) WITHOUT ROWID`);
+    const seed = source.prepare(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id) VALUES ('Conversation', ?)`);
+    for (const id of conversations) seed.run(id);
+  });
+}
+
+/** Where the closure gives the thread back: after a segment of a one-table rule, or a step of an `all` rule. */
+type SkipClosureYield = (step: 'rule' | 'all') => Promise<void>;
+
 /**
- * Runs the skip rules to their fixed point without holding this thread (review #7: the closure of a
- * large source took seconds of the window's thread): a rule that reads one table (`FROM "<table>" AS t
- * WHERE …`) reads it in rowid segments of `segmentRows`, a rule over several (an `all` rule's
- * memberships) runs whole, and the thread yields after every segment and rule. INSERT OR IGNORE only
- * adds, so the segments of a rule add exactly what the whole statement adds, and the fixed point is
- * the same.
+ * @internal Tests: the closure as a preparation computes it (segments of `segmentRows`, `pause` at
+ * every yield) from the left-out `conversations` of a source connection, as domain → ids.
  */
-async function closeOver(source: Database.Database, rules: readonly string[], segmentRows: number): Promise<void> {
-  const runs = rules.map((sql) => segmentedRule(source, sql, segmentRows));
-  for (;;) {
-    let added = 0;
-    for (const run of runs) added += await run();
-    if (added === 0) return;
+export async function largeMergeSkippedRows(
+  source: Database.Database,
+  conversations: Iterable<string>,
+  segmentRows: number,
+  pause?: SkipClosureYield
+): Promise<Map<string, Set<string>>> {
+  withTemporaryWrites(source, () => source.exec(`DROP TABLE IF EXISTS temp.${SKIP_TABLE}`));
+  seedSkipTable(source, conversations);
+  try {
+    await closeOver(source, segmentRows, pause);
+    return skippedRowsOf(source);
+  } finally {
+    withTemporaryWrites(source, () => source.exec(`DROP TABLE IF EXISTS temp.${SKIP_TABLE}; DROP TABLE IF EXISTS temp.${SKIP_CANDIDATES}`));
   }
 }
 
-function segmentedRule(source: Database.Database, sql: string, segmentRows: number): () => Promise<number> {
-  const scanned = /\bFROM ("(?:[^"]|"")+") AS t\s+WHERE\b/.exec(sql);
-  if (!scanned || /\bGROUP BY\b/.test(sql)) {
-    const whole = source.prepare(sql);
-    return async () => {
-      const added = withTemporaryWrites(source, () => whole.run().changes);
-      await yieldThread();
-      return added;
-    };
+/**
+ * Runs the skip rules to their fixed point without holding this thread (review #7 and blind review
+ * #4: the closure of a large source took seconds of the window's thread). A rule that reads one table
+ * (`FROM "<table>" AS t WHERE …`) reads it in rowid segments of `segmentRows`; an `all` rule works
+ * from its candidates (allSkipRule), a bounded step at a time; the thread yields after every segment
+ * and step. Every rule only adds, and an `all` rule adds in a pass exactly what its GROUP BY form adds
+ * (see allSkipRule), so the fixed point is the online merge's (skippedRows).
+ */
+async function closeOver(source: Database.Database, segmentRows: number, pause: SkipClosureYield = () => yieldThread()): Promise<void> {
+  const runs = skipRules().map((rule) => typeof rule === 'string'
+    ? segmentedRule(source, rule, segmentRows, pause)
+    : allSkipRule(source, rule, segmentRows, pause));
+  try {
+    for (;;) {
+      let added = 0;
+      for (const run of runs) added += await run();
+      if (added === 0) return;
+    }
+  } finally {
+    withTemporaryWrites(source, () => source.exec(`DROP TABLE IF EXISTS temp.${SKIP_CANDIDATES}`));
   }
+}
+
+function segmentedRule(source: Database.Database, sql: string, segmentRows: number, pause: SkipClosureYield): () => Promise<number> {
+  const scanned = /\bFROM ("(?:[^"]|"")+") AS t\s+WHERE\b/.exec(sql);
+  if (!scanned) throw new Error('A skip rule reads one table (FROM "<table>" AS t WHERE …).');
   // NOT INDEXED: the rowid range is the scan (an index on the rule's column would be read whole per segment).
   const segment = source.prepare(`${sql.replace(scanned[0], `FROM ${scanned[1]} AS t NOT INDEXED WHERE`)} AND t.rowid > ? AND t.rowid <= ?`);
   const last = Number(source.prepare(`SELECT COALESCE(MAX(rowid), 0) FROM ${scanned[1]}`).pluck().get());
@@ -360,24 +389,109 @@ function segmentedRule(source: Database.Database, sql: string, segmentRows: numb
     let added = 0;
     for (let after = 0; after < last; after += segmentRows) {
       added += withTemporaryWrites(source, () => segment.run(after, after + segmentRows).changes);
-      await yieldThread();
+      await pause('rule');
     }
     return added;
   };
+}
+
+/**
+ * One pass of an `all` rule (an owner goes once every membership naming it is a left-out row) in
+ * bounded steps, instead of one GROUP BY over every membership table (seconds on a large source):
+ *   1. candidates: the owners (not left out yet) of the left-out member rows, a page of `segmentRows`
+ *      left-out ids at a time (each looked up by its primary key);
+ *   2. every candidate with a membership that is not left out is dropped: by an index on the member
+ *      column, `segmentRows` candidates at a time, else by the member table in rowid segments;
+ *   3. the remaining candidates are left out, `segmentRows` at a time.
+ * The left-out rows are read as they were before step 3, as the GROUP BY statement reads them before
+ * its inserts: the same owners are added.
+ */
+function allSkipRule(source: Database.Database, rule: AllSkipRule, segmentRows: number, pause: SkipClosureYield): () => Promise<number> {
+  const skipped = (domain: string, id: string): string =>
+    `EXISTS (SELECT 1 FROM temp.${SKIP_TABLE} AS s WHERE s.domain = ${literal(domain)} AND s.id = ${id})`;
+  const run = (statement: Database.Statement, ...parameters: unknown[]): number => withTemporaryWrites(source, () => statement.run(...parameters).changes);
+  withTemporaryWrites(source, () => source.exec(`CREATE TEMP TABLE IF NOT EXISTS ${SKIP_CANDIDATES} (owner TEXT NOT NULL UNIQUE)`));
+  const candidates = source.prepare(`SELECT COALESCE(MAX(rowid), 0) FROM temp.${SKIP_CANDIDATES}`).pluck();
+  const clear = source.prepare(`DELETE FROM temp.${SKIP_CANDIDATES}`);
+  const members = rule.members.map(({ domain, column, table }) => {
+    const member = quoteIdentifier(table);
+    const owner = `t.${quoteIdentifier(column)}`;
+    const page = `SELECT id FROM temp.${SKIP_TABLE} WHERE domain = ${literal(domain)} AND id > ? ORDER BY id LIMIT ?`;
+    const indexed = leadsIndex(source, table, column);
+    return {
+      pageEnd: source.prepare(`SELECT MAX(id) FROM (${page})`).pluck(),
+      collect: source.prepare(`INSERT OR IGNORE INTO temp.${SKIP_CANDIDATES} (owner)
+        SELECT ${owner} FROM (${page}) AS page JOIN ${member} AS t ON t.id = page.id
+         WHERE ${owner} IS NOT NULL AND NOT ${skipped(rule.domain, owner)}`),
+      indexed,
+      last: indexed ? 0 : Number(source.prepare(`SELECT COALESCE(MAX(rowid), 0) FROM ${member}`).pluck().get()),
+      keep: indexed
+        ? source.prepare(`DELETE FROM temp.${SKIP_CANDIDATES} AS c WHERE c.rowid > ? AND c.rowid <= ?
+            AND EXISTS (SELECT 1 FROM ${member} AS t WHERE ${owner} = c.owner AND NOT ${skipped(domain, 't.id')})`)
+        : source.prepare(`DELETE FROM temp.${SKIP_CANDIDATES} WHERE owner IN (
+            SELECT ${owner} FROM ${member} AS t NOT INDEXED WHERE ${owner} IS NOT NULL AND NOT ${skipped(domain, 't.id')}
+               AND t.rowid > ? AND t.rowid <= ?)`)
+    };
+  });
+  const insert = source.prepare(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id)
+    SELECT ${literal(rule.domain)}, owner FROM temp.${SKIP_CANDIDATES} WHERE rowid > ? AND rowid <= ?`);
+  return async () => {
+    run(clear);
+    for (const member of members) {
+      for (let after: string | null = ''; after !== null;) {
+        run(member.collect, after, segmentRows);
+        after = member.pageEnd.get(after, segmentRows) as string | null;
+        await pause('all');
+      }
+    }
+    let last = Number(candidates.get());
+    for (const member of members) {
+      if (last === 0) break;
+      const end = member.indexed ? last : member.last;
+      for (let after = 0; after < end; after += segmentRows) {
+        run(member.keep, after, after + segmentRows);
+        await pause('all');
+      }
+      last = Number(candidates.get());
+    }
+    let added = 0;
+    for (let after = 0; after < last; after += segmentRows) {
+      added += run(insert, after, after + segmentRows);
+      await pause('all');
+    }
+    run(clear);
+    return added;
+  };
+}
+
+/** Whether `column` leads an index of `table` that holds every row (a partial one does not). */
+function leadsIndex(source: Database.Database, table: string, column: string): boolean {
+  const indexes = source.pragma(`main.index_list(${quoteIdentifier(table)})`) as Array<{ name: string; partial: number | bigint }>;
+  return indexes.some((index) => Number(index.partial) === 0
+    && (source.pragma(`main.index_info(${quoteIdentifier(index.name)})`) as Array<{ seqno: number | bigint; name: string | null }>)
+      .some((entry) => Number(entry.seqno) === 0 && entry.name === column));
 }
 
 function yieldThread(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
-/** The skippedRows rules as INSERT … SELECT statements over the TEMP table (one fixed-point pass each). */
-function skipRuleStatements(): string[] {
+interface AllSkipRule {
+  domain: string;
+  members: Array<{ domain: string; column: string; table: string }>;
+}
+
+/**
+ * The skippedRows rules over the TEMP table (one fixed-point pass each): INSERT … SELECT statements
+ * that read one table, and the `all` rules (allSkipRule).
+ */
+function skipRules(): Array<string | AllSkipRule> {
   const identity = engine.IDENTITY_MERGE_DIFFERENCES;
   const domainOf = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.table, schema.key]));
   const tableOf = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => [schema.key, schema.table]));
   const skipped = (domain: string, id: string): string =>
     `EXISTS (SELECT 1 FROM temp.${SKIP_TABLE} AS s WHERE s.domain = ${literal(domain)} AND s.id = ${id})`;
-  const statements: string[] = [];
+  const rules: Array<string | AllSkipRule> = [];
   for (const schema of RUNTIME_DOMAIN_SCHEMAS) {
     if (identity.has(schema.key)) continue;
     const references = [
@@ -388,7 +502,7 @@ function skipRuleStatements(): string[] {
       ...engine.SKIPPED_WITH.filter((rule) => rule.domain === schema.key)
     ];
     for (const { column, owner, kind } of references) {
-      statements.push(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id)
+      rules.push(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id)
         SELECT ${literal(schema.key)}, t.id FROM ${quoteIdentifier(schema.table)} AS t
          WHERE t.${quoteIdentifier(column)} IS NOT NULL${kind ? ` AND t.${quoteIdentifier(kind[0])} = ${literal(kind[1])}` : ''}
            AND ${skipped(owner, `t.${quoteIdentifier(column)}`)}`);
@@ -398,19 +512,15 @@ function skipRuleStatements(): string[] {
     const members = rule.members.map(([domain, column]) => ({ domain, column, table: tableOf.get(domain)! }));
     if (rule.mode === 'any') {
       for (const { domain, column, table } of members) {
-        statements.push(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id)
+        rules.push(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id)
           SELECT ${literal(rule.domain)}, t.${quoteIdentifier(column)} FROM ${quoteIdentifier(table)} AS t
            WHERE t.${quoteIdentifier(column)} IS NOT NULL AND ${skipped(domain, 't.id')}`);
       }
       continue;
     }
-    // 'all': an owner goes once every membership naming it is a left-out row.
-    const memberships = members.map(({ domain, column, table }) => `SELECT t.${quoteIdentifier(column)} AS owner, ${skipped(domain, 't.id')} AS gone
-      FROM ${quoteIdentifier(table)} AS t WHERE t.${quoteIdentifier(column)} IS NOT NULL`).join(' UNION ALL ');
-    statements.push(`INSERT OR IGNORE INTO temp.${SKIP_TABLE} (domain, id)
-      SELECT ${literal(rule.domain)}, owner FROM (${memberships}) GROUP BY owner HAVING SUM(gone) = COUNT(*)`);
+    rules.push({ domain: rule.domain, members });
   }
-  return statements;
+  return rules;
 }
 
 function boundSourcePageCache(source: Database.Database): void {
@@ -1258,7 +1368,9 @@ async function prepareSource(
     await engine.ensureTargetBackup(target, options, {
       register: (root) => internals.claims.registerBackup(root),
       // The target's index pages, which the session's inserts rewrite in its WAL: read on the finished copy.
-      inspect: (copy) => { internals.targetIndexBytes = measuredIndexBytes(copy); }
+      inspect: async (copy) => {
+        internals.targetIndexBytes = (await auditRuntimeSnapshot(copy, { binding: target.binding, integrity: false, indexBytes: true })).indexBytes;
+      }
     });
     await engine.fault(options, 'after-target-backup');
     progress('cas');

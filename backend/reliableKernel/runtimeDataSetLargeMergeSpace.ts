@@ -44,7 +44,8 @@ export function estimatedTargetIndexBytes(targetDatabaseBytes: number): number {
 
 /**
  * Index pages of a database (dbstat), on a connection of a file no RuntimeDatabase of this process
- * has open (the preparation's private backup of the target).
+ * has open: the preparation's private backup of the target, read in auditRuntimeSnapshot's worker
+ * (a multi-GB target's index pages are read in full; never on the extension host's main thread).
  */
 export function measuredIndexBytes(database: Database.Database): number {
   return Number(database.prepare(`

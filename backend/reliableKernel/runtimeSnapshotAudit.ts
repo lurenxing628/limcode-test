@@ -29,6 +29,8 @@ export interface RuntimeSnapshotAuditRequest {
   integrity?: boolean;
   /** Project names, conversation count and last activity (readRuntimeDataSetSummary). */
   summary?: boolean;
+  /** Bytes of the copy's index pages (dbstat): a large-merge preparation's measure of its target backup. */
+  indexBytes?: boolean;
 }
 
 export interface RuntimeSnapshotAudit {
@@ -39,6 +41,7 @@ export interface RuntimeSnapshotAudit {
   content?: { objects: number; bytes: number };
   contentDigest?: string;
   summary?: RuntimeDataSetSummary;
+  indexBytes?: number;
 }
 
 /** @internal Worker protocol; plain data only. */
@@ -50,6 +53,7 @@ export interface RuntimeSnapshotAuditWorkerData {
   contentDigest?: boolean;
   skipIntegrity?: true;
   summary?: true;
+  indexBytes?: true;
 }
 
 /** @internal */
@@ -73,7 +77,8 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     ...(request.measure ? { measureTables: RUNTIME_DOMAIN_SCHEMAS.map((schema) => schema.table) } : {}),
     ...(request.contentDigest ? { contentDigest: true } : {}),
     ...(request.integrity === false ? { skipIntegrity: true as const } : {}),
-    ...(request.summary ? { summary: true as const } : {})
+    ...(request.summary ? { summary: true as const } : {}),
+    ...(request.indexBytes ? { indexBytes: true as const } : {})
   };
   return new Promise((resolve, reject) => {
     let settled = false;

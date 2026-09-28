@@ -3543,13 +3543,13 @@ async function rememberLinked(sourceFile: string, targetFile: string, verified: 
  * Online Backup API copy of the target before its first merge transaction, once per batch (or
  * large-merge preparation); failures leave no partial files behind. A large-merge preparation
  * registers its directory before anything of it is written (`register`, see
- * RuntimeLargeMergeTargetBackup; when it throws, nothing is) and reads the finished copy while it is
- * checked (`inspect`, e.g. its index pages).
+ * RuntimeLargeMergeTargetBackup; when it throws, nothing is) and reads the finished copy (`inspect`,
+ * e.g. its index pages in a worker) once this thread has closed it, before it is published.
  */
 async function ensureTargetBackup(
   target: TargetContext,
   options: RuntimeDataSetMergeOptions,
-  hooks: { register?(root: string): Promise<void>; inspect?(copy: Database.Database): void } = {}
+  hooks: { register?(root: string): Promise<void>; inspect?(copyPath: string): Promise<void> } = {}
 ): Promise<string> {
   if (target.backup.path) return target.backup.path;
   await assertRoomForBackup(target.binding.paths.databasePath, target.controlRoot, '当前历史库', options);
@@ -3567,10 +3567,11 @@ async function ensureTargetBackup(
     try {
       copy.defaultSafeIntegers(true);
       assertCurrentSchema(copy, target.binding);
-      hooks.inspect?.(copy);
     } finally {
       copy.close();
     }
+    // Only after this thread's connection is closed (POSIX locks: see auditRuntimeSnapshot).
+    await hooks.inspect?.(temporary);
     await removeSqliteSidecars(temporary);
     await fs.rename(temporary, destination);
     await syncDirectoryDurably(root);
@@ -4020,7 +4021,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, assertNoCommitElsewhere, mergeRequestDone, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
-  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory
+  closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory, skippedRows
 });
 export type {
   PickedSource as HistoricalMergePickedSource, Refusal as HistoricalMergeRefusal, RowPlan as HistoricalMergeRowPlan, SourceRef as HistoricalMergeSourceRef,
