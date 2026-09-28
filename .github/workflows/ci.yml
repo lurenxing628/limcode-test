@@ -50,8 +50,9 @@ jobs:
   linux-reliability-tests:
     name: Linux reliability tests
     runs-on: ubuntu-latest
-    # Serial critical tests have their own 30-minute guard; allow setup, compile and browser time.
-    timeout-minutes: 45
+    # The serial CI list takes about an hour on a hosted runner and has its own 90-minute guard
+    # (run-local-tests.mjs); allow setup, compile and browser time on top.
+    timeout-minutes: 100
     steps:
       - name: Checkout
         uses: actions/checkout@v6
