@@ -88,8 +88,8 @@ WAL：每 60 秒对 `-wal` 做一次 `stat()` 取大小，每 5 分钟写一条 
 
 大库会话（`vscode/commands/largeHistoricalMerge.ts`，见 `01-invariants-and-authority.md` 的历史合并一段）不写新的诊断事件，排查只看这几处：
 
-- **日志**：会话的准备、协调或独占阶段出错时写 `[LimCode] 合并较大的旧聊天记录……` 的 error；独占阶段结束时每份来源一行 `[LimCode] 合并较大的旧聊天记录：<来源 id> <merged|cancelled|deferred|blocked|failed>`；重载后提示结果时，合并了的来源与在线合并一样各写一行 `已合并旧聊天记录 …`。
-- **提示记录**：配置根 `.limcode-runtime-merges/prompts/large-merge-session.json` 写着哪个 VS Code 会话（`sessionId`）、哪个进程（`processId`/`processStartIdentity`）、哪个窗口（`hostBootId`）在准备并提示。它只是提示，不是合并记录；记录的会话与当前相同或记录进程仍存活时，其它窗口启动时不再提示，点“取消”后也不会改动它。
+- **日志**：会话的估计、准备、协调或独占阶段出错时写 `[LimCode] 合并较大的旧聊天记录……` 的 error；独占阶段结束时每份来源一行 `[LimCode] 合并较大的旧聊天记录：<来源 id> <merged|cancelled|deferred|blocked|failed>`；重载后提示结果时，合并了的来源与在线合并一样各写一行 `已合并旧聊天记录 …`。
+- **提示记录**：配置根 `.limcode-runtime-merges/prompts/large-merge-session.json` 写着哪个 VS Code 会话（`sessionId`）、哪个进程（`processId`/`processStartIdentity`）、哪个窗口（`hostBootId`）在估计并提示（倒计时结束后由它准备）。它只是提示，不是合并记录；记录的会话与当前相同或记录进程仍存活时，其它窗口启动时不再提示，点“取消”后也不会改动它。
 - **维护进行中标记**：独占阶段里持锁方在 admission 与目标 maintenance 的锁目录下的 `activity.json` 带 `stage`（“第 2/4 份，已完成 35%”，按 5% 一档）和 `expectedEndAt`（开始合并时按预计区间上限算出）。等待打开的窗口把 `expectedEndAt` 显示为“预计 HH:MM 前完成”，心跳正常时直到已进行预计时长的 1.5 倍（且不少于 10 分钟）才给久等告警；心跳超过 15 秒没刷新照常立即告警。
 - **重载后结果**：发起窗口在重载前把结果写进自己的 workspaceState（`limcode.largeHistoricalMerge.result`），重新打开时读取并清除；打开时间与写入时间相差超过 10 分钟就不再提示，这时以“历史与存储管理”里各库的状态为准。
 
