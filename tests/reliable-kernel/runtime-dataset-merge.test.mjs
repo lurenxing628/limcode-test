@@ -1321,7 +1321,8 @@ test('复审 merge3 #4：提交前崩溃留下的 committing 记录确认没有�
   const database = await openTarget(t, fixture.current);
   assert.equal((await merge(fixture, database)).merged.length, 1);
   const merged = await readLedgerRecord(fixture, fixture.alpha.id);
-  // Continued in the source afterwards (now conflicting), and an explicit re-merge crashed before its commit.
+  // Continued in the source afterwards (now conflicting), and an explicit re-merge crashed before its commit (its request stays).
+  await requestMerge(fixture, fixture.alpha);
   const source = new Database(fixture.alpha.binding.paths.databasePath);
   try {
     source.prepare("UPDATE conversation SET title = 'continued elsewhere' WHERE id = 'conversation_alpha_once'").run();
@@ -1336,8 +1337,10 @@ test('复审 merge3 #4：提交前崩溃留下的 committing 记录确认没有�
     ...merged, state: 'committing', commitId: 'crashed', source: { ...merged.source, contentDigest: 'crashed-attempt' },
     replaced: merged, updatedAt: new Date().toISOString()
   }));
+  // Converged first (盲审2 #3: this data set's own), then the recorded request goes on as usual.
   const report = await merge(fixture, database);
   assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-conflict');
+  await assert.rejects(fs.access(path.join(ledger, 'commits', 'crashed.json')));
   const record = await readLedgerRecord(fixture, fixture.alpha.id);
   assert.deepEqual([record.state, record.lastMerged?.mergedAt], ['blocked', merged.mergedAt], '上次合并仍有记录');
   assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.lastMerged?.intoCurrent, true);
@@ -2073,6 +2076,188 @@ test('盲审2 merge #6：读不出的账本记录不当成“没有记录”：�
     code: 'x', message: 'x'
   }), { code: 'runtime-data-set-merge-record-newer' }, '写记录本身也不改写它');
   assert.equal(await fs.readFile(betaFile, 'utf8'), newer);
+});
+
+function requestFile(fixture, candidateId) {
+  return path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'requests', `${candidateId.replace(/:/g, '-')}.json`);
+}
+
+const exists = (file) => fs.stat(file).then(() => true, () => false);
+
+test('盲审2 merge #3：用户保留的库明确合并、提交后“已合并”记录没写成：请求不删，下一次自动批次先按标记收敛为已合并', { skip: process.getuid?.() === 0 }, async (t) => {
+  const fixture = await createFixture(t, { withBeta: false, selected: 'alpha' });
+  await selectVscodeRuntimeDataSet(fixture.paths, 'default');
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  assert.deepEqual((await merge(fixture, database)).merged, [], '保留的库不自动合并');
+  await requestMerge(fixture, fixture.alpha);
+  const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
+  const warn = console.warn;
+  console.warn = () => {};
+  let report;
+  try {
+    report = await merge(fixture, database, {
+      candidateIds: [fixture.alpha.id], requested: true,
+      async onFaultPoint(point) { if (point === 'after-row-commit') await fs.chmod(records, 0o500); }
+    });
+  } finally {
+    console.warn = warn;
+    await fs.chmod(records, 0o700);
+  }
+  assert.deepEqual(report.merged.map((item) => [item.candidateId, item.insertedConversations]), [[fixture.alpha.id, 1]]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'committing');
+  assert.equal(await exists(requestFile(fixture, fixture.alpha.id)), true, '“已合并”没记下，请求留着');
+  const converged = await merge(fixture, database);
+  assert.deepEqual(converged.merged.map((item) => [item.candidateId, item.recoveredCommit, item.insertedConversations]), [[fixture.alpha.id, true, 1]]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'merged');
+  assert.equal(await exists(requestFile(fixture, fixture.alpha.id)), false);
+  const state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
+  assert.deepEqual([state?.state, state?.intoCurrent], ['merged', true]);
+  assert.deepEqual((await merge(fixture, database)).merged, []);
+  const target = readDatabase(fixture.current);
+  try { assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_kept'), 1); } finally { target.close(); }
+});
+
+test('盲审2 merge #3：用户保留的库明确合并提交后崩溃、请求在下次启动前已过期：先按标记收敛为已合并，不报“请求过期”', async (t) => {
+  const fixture = await createFixture(t, { withBeta: false, selected: 'alpha' });
+  await selectVscodeRuntimeDataSet(fixture.paths, 'default');
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept2', project: SHARED_PROJECT }]);
+  const database = await openTarget(t, fixture.current);
+  await requestMerge(fixture, fixture.alpha);
+  const crashed = await merge(fixture, database, {
+    candidateIds: [fixture.alpha.id], requested: true,
+    onFaultPoint(point) { if (point === 'after-row-commit') throw Object.assign(new Error('simulated crash after the commit'), { code: 'EIO' }); }
+  });
+  assert.deepEqual(crashed.deferred.map((item) => item.code), ['EIO']);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'committing');
+  const file = requestFile(fixture, fixture.alpha.id);
+  const request = JSON.parse(await fs.readFile(file, 'utf8'));
+  await fs.writeFile(file, JSON.stringify({ ...request, requestedAt: new Date(Date.now() - 8 * 24 * 3600 * 1000).toISOString() }));
+  const auto = await merge(fixture, database);
+  assert.deepEqual([auto.blocked, auto.deferred], [[], []], '不报请求过期');
+  assert.deepEqual(auto.merged.map((item) => [item.candidateId, item.recoveredCommit]), [[fixture.alpha.id, true]]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'merged');
+  assert.equal(await exists(file), false);
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'merged');
+});
+
+test('盲审2 merge #5：来源停在合并到另一个库时中断的 committing：按那个库里的标记收敛（在：记为已合并到那个库，自动批次不再合并；不在或那个库已删：放回原记录照常合并）；那个库正在使用时推迟、不覆盖', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, [
+    { id: 'conversation_alpha_elsewhere', project: SHARED_PROJECT }, { id: 'conversation_alpha_elsewhere_gone', project: SHARED_PROJECT }
+  ]);
+  // Alpha's merge into the then current data set was killed after its commit; one of its conversations was
+  // deleted there before the next merge batch; the user switched to beta.
+  const killed = await runChild(['kill', fixture.root, 'after-row-commit', fixture.alpha.id]);
+  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
+  const there = await openTarget(t, fixture.current);
+  await new ConversationDeletionControlPlane(there).delete('conversation_alpha_elsewhere_gone');
+  await there.close();
+  const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
+  const file = path.join(records, `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const committing = await fs.readFile(file, 'utf8');
+  assert.equal(JSON.parse(committing).state, 'committing');
+  await selectVscodeRuntimeDataSet(fixture.paths, fixture.beta.id);
+  const database = await openTarget(t, fixture.beta);
+  // That data set is in use (an old window still has it): the commit stays unknown, nothing is written over it.
+  const host = await publishHost(fixture.current.binding, 'old-window');
+  for (const options of [{}, { candidateIds: [fixture.alpha.id], requested: true }]) {
+    const report = await merge(fixture, database, options);
+    assert.deepEqual(report.deferred.filter((item) => item.candidateId === fixture.alpha.id).map((item) => [item.code, item.message]),
+      [['runtime-data-set-merge-commit-elsewhere', '这个库上次合并到另一个历史库时中断了，那个库现在读不出或正在使用，确认不了那次合并的结果；这次先不合并，以后会再试。']]);
+    assert.equal(await fs.readFile(file, 'utf8'), committing, '那条记录原样留着');
+  }
+  await fs.rm(host);
+  const report = await merge(fixture, database);
+  assert.ok(!report.merged.some((item) => item.candidateId === fixture.alpha.id), '按标记已合并到那个库：合并过一次，自动批次不再合并');
+  assert.ok(![...report.deferred, ...report.blocked, ...report.failures].some((item) => item.candidateId === fixture.alpha.id));
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.deepEqual([record.state, record.target.dataSetId, record.insertedConversations], ['merged', fixture.current.binding.dataSetId, 2]);
+  assert.deepEqual(await mergedInto(fixture), [[fixture.current.binding.dataSetId, ['conversation_alpha_elsewhere']]],
+    '只记那个库里还在的对话（同盲审2 #1）');
+  await assert.rejects(fs.access(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'commits', `${JSON.parse(committing).commitId}.json`)));
+  const reader = readDatabase(fixture.beta);
+  try { assert.equal(reader.count('conversation', 'id = ?', 'conversation_alpha_elsewhere'), 0); } finally { reader.close(); }
+
+  // Crashed before its commit (no marker there), or that data set deleted since: nothing of it counts.
+  // While some data set cannot be read, that one may still be it: deferred.
+  for (const kind of ['no-marker', 'unreadable', 'deleted']) {
+    const other = await createFixture(t);
+    await seed(other.alpha, [{ id: 'conversation_alpha_never_there', project: SHARED_PROJECT }]);
+    const recordFile = path.join(resolveVscodeRuntimeMergeLedgerRoot(other.paths), 'records', `${other.alpha.id.replace(/:/g, '-')}.json`);
+    const crafted = JSON.stringify({
+      kind: 'limcode-runtime-data-set-merge', candidateId: other.alpha.id, state: 'committing',
+      source: { dataSetId: other.alpha.binding.dataSetId, rootInstanceId: other.alpha.binding.rootInstanceId, rootGeneration: 1, pointerRevision: 1, contentDigest: 'crashed' },
+      target: { dataSetId: other.beta.binding.dataSetId, rootInstanceId: other.beta.binding.rootInstanceId }, commitId: 'into-beta', updatedAt: NOW
+    });
+    await fs.mkdir(path.dirname(recordFile), { recursive: true });
+    await fs.writeFile(recordFile, crafted);
+    if (kind === 'deleted') await deleteUnselectedRuntimeDataSet(other.paths, other.beta.id, other.beta.binding.dataSetId);
+    const into = await openTarget(t, other.current);
+    if (kind === 'unreadable') {
+      const pointer = other.beta.binding.paths.rootPointerPath;
+      const saved = await fs.readFile(pointer);
+      await fs.writeFile(pointer, '{');
+      const waiting = await merge(other, into);
+      assert.deepEqual(waiting.deferred.filter((item) => item.candidateId === other.alpha.id).map((item) => item.code), ['runtime-data-set-merge-commit-elsewhere']);
+      assert.equal(await fs.readFile(recordFile, 'utf8'), crafted);
+      await fs.writeFile(pointer, saved);
+    }
+    const merged = await merge(other, into);
+    assert.ok(merged.merged.some((item) => item.candidateId === other.alpha.id), `${kind}：那次提交什么都不算，照常合并`);
+    assert.equal((await readLedgerRecord(other, other.alpha.id))?.state, 'merged');
+  }
+});
+
+test('盲审2 merge #5：提交前锁内重读账本时才出现指向另一个库的 committing 记录：推迟，不覆盖', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_late_elsewhere', project: SHARED_PROJECT }]);
+  const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
+  const file = path.join(records, `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const committing = JSON.stringify({
+    kind: 'limcode-runtime-data-set-merge', candidateId: fixture.alpha.id, state: 'committing',
+    source: { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId, rootGeneration: 1, pointerRevision: 1, contentDigest: 'crashed' },
+    target: { dataSetId: fixture.beta.binding.dataSetId, rootInstanceId: fixture.beta.binding.rootInstanceId }, commitId: 'into-beta', updatedAt: NOW
+  });
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, {
+    candidateIds: [fixture.alpha.id], requested: true,
+    async onFaultPoint(point) {
+      if (point !== 'after-cas-transfer') return;
+      await fs.mkdir(records, { recursive: true });
+      await fs.writeFile(file, committing);
+    }
+  });
+  assert.deepEqual([report.merged, report.deferred.map((item) => item.code)], [[], ['runtime-data-set-merge-commit-elsewhere']]);
+  assert.equal(await fs.readFile(file, 'utf8'), committing);
+  const target = readDatabase(fixture.current);
+  try { assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_late_elsewhere'), 0); } finally { target.close(); }
+});
+
+test('盲审2 merge #5：记录拒绝时不写在任何 committing 记录上（例如这次尝试期间另一个库的中断提交留下的）', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.alpha, [{ id: 'conversation_alpha_refused', project: SHARED_PROJECT }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_refused', kind: 'bare' }]);
+  const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
+  const file = path.join(records, `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const committing = JSON.stringify({
+    kind: 'limcode-runtime-data-set-merge', candidateId: fixture.alpha.id, state: 'committing',
+    source: { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId, rootGeneration: 1, pointerRevision: 1, contentDigest: 'crashed' },
+    target: { dataSetId: fixture.beta.binding.dataSetId, rootInstanceId: fixture.beta.binding.rootInstanceId }, commitId: 'into-beta', updatedAt: NOW
+  });
+  const database = await openTarget(t, fixture.current);
+  const report = await merge(fixture, database, {
+    candidateIds: [fixture.alpha.id], requested: true,
+    async onFaultPoint(point) {
+      if (point !== 'after-source-backup') return;
+      // Before its work is closed: work nothing closes appears (the closed source is refused), and a committing record.
+      rawSource(fixture.alpha, (source) => insertUnreceiptedProcess(source, 'conversation_alpha_refused'));
+      await fs.mkdir(records, { recursive: true });
+      await fs.writeFile(file, committing);
+    }
+  });
+  assert.deepEqual(report.blocked.map((item) => item.code), ['runtime-data-set-merge-unfinished-work']);
+  assert.equal(await fs.readFile(file, 'utf8'), committing, '拒绝照样报告，但不写在那条 committing 记录上');
 });
 
 async function mergedInto(fixture) {

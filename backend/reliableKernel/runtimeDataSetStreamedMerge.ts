@@ -1007,7 +1007,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       if (outcome.kind === 'merged' || outcome.kind === 'current') {
         const { result } = outcome;
         if (outcome.kind === 'merged' || picked.requested || result.finalized || result.skippedConversations) report.merged.push(result);
-        await removeRuntimeDataSetMergeRequest(paths, candidateId).catch(() => undefined);
+        await engine.mergeRequestDone(paths, candidateId, target).catch(() => undefined);
         continue;
       }
       const refused = issue(outcome);
@@ -1740,9 +1740,8 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
           measured.sessionMs += performance.now() - startedAt;
           measured.modelMs += sessionModelMs(prepared);
         }
-        if (result.state === 'merged' || result.state === 'current' || result.state === 'blocked' || result.state === 'failed') {
-          await removeRuntimeDataSetMergeRequest(paths, prepared.candidateId).catch(() => undefined);
-        }
+        if (result.state === 'merged' || result.state === 'current') await engine.mergeRequestDone(paths, prepared.candidateId, target).catch(() => undefined);
+        if (result.state === 'blocked' || result.state === 'failed') await removeRuntimeDataSetMergeRequest(paths, prepared.candidateId).catch(() => undefined);
         await sourceInternals.state.foreign?.release();
         await internals.claims.release(prepared.candidateId);
         if (result.state === 'deferred' && result.issue.code === RUNTIME_DATA_SET_MERGE_CANCELLED) {
@@ -1892,6 +1891,7 @@ async function mergeLocked(
   await resolver.assertUnchanged(root, { paths, target, state, mode });
   const candidate = await resolver.candidate(root);
   const previous = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
+  engine.assertNoCommitElsewhere(previous, target);
   if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
     if (previous.state === 'committing') {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '另一个窗口合并这个库时中断，下次启动时先确认它的结果。' });

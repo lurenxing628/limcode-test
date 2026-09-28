@@ -565,7 +565,7 @@ export async function mergeHistoricalDataSetsOnline(
     if (outcome.kind === 'merged' || outcome.kind === 'current') {
       const { result } = outcome;
       if (outcome.kind === 'merged' || source.requested || result.finalized || result.skippedConversations) report.merged.push(result);
-      await removeRuntimeDataSetMergeRequest(storagePaths, source.id).catch(() => undefined);
+      await mergeRequestDone(storagePaths, source.id, target).catch(() => undefined);
       return;
     }
     const issue = {
@@ -699,14 +699,24 @@ async function pickSources(
         id: candidate.id, candidate, requested: explicit, record, request, expired,
         // A recorded request only keeps its source pending (see RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS).
         pending: request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity)
-          && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId
+          && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId,
+        // Whatever it is kept as or requested for, an interrupted commit (into any data set) converges first.
+        converge: interruptedCommit(record, target),
+        elsewhere: record?.state === 'committing' && !interruptedCommit(record, target)
       };
       if (options.candidateIds && !options.candidateIds.includes(candidate.id)) {
-        if (expired && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
+        // Its request stays with an interrupted commit: the commit may have happened (see below).
+        if (expired && !source.converge && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
         continue;
       }
       if (damaged && (damaged === 'newer' || !(source.requested || source.pending))) {
         reportDamagedRecord(source, damaged, report);
+        continue;
+      }
+      // An estimate converges nothing: one into this target says so (estimateSource), one into another
+      // data set is judged on its record as it stands.
+      if (source.converge || (source.elsewhere && !options.readOnly)) {
+        picked.push(source);
         continue;
       }
       // Only a fingerprint cached for the exact current files is used here: computing one reads the
@@ -766,17 +776,36 @@ async function pickSources(
   const sources: PickedSource[] = [];
   for (const source of picked) {
     if (source.converge) {
-      // An estimate writes nothing: the commit converges in the next batch or preparation.
-      if (options.readOnly) continue;
+      // An estimate writes nothing: the commit converges in the next batch or preparation (a local
+      // data set's estimate reports that it waits for it).
+      if (options.readOnly) {
+        if (source.candidate) sources.push(source);
+        continue;
+      }
       if (!keepGoing()) break;
-      if (!await convergeForeignCommit(storagePaths, target, source, report)) continue;
+      if (!await convergeInterruptedCommit(storagePaths, target, source, report)) continue;
+    }
+    if (source.elsewhere && !options.readOnly) {
+      if (!keepGoing()) break;
+      try {
+        await convergeElsewhere(storagePaths, target, source.id);
+      } catch (error) {
+        const refused = sourceOutcome(error, {});
+        if (refused.kind === 'stopped') break;
+        report.deferred.push({ candidateId: source.id, code: refused.code, message: refused.message, newly: true, requested: source.requested });
+        continue;
+      }
+      // Judged as any other now, on its record as that commit left it (merged there, or put back).
+      const record = (await readRuntimeDataSetMergeLedger(storagePaths)).get(source.id);
+      source.record = record && sameRuntimeDataSetIdentity(record.source, source.candidate!) ? record : undefined;
+      source.unjudged = true;
     }
     if (source.unjudged) {
       if (!keepGoing()) break;
       // A foreign root is read under its own claim, taken here (outside the admission) for this read only.
       const fingerprint = source.foreign
         ? await (await foreignHistoryMerge()).foreignHistoricalMergeFingerprint(storagePaths, source.id, source.foreign).catch(() => undefined)
-        : await localFingerprint(source.candidate!).catch(() => undefined);
+        : source.record ? await localFingerprint(source.candidate!).catch(() => undefined) : undefined;
       if (await selectSource(storagePaths, target, source, fingerprint, report, streamedRows, options.readOnly) === 'skip') continue;
     }
     sources.push(source);
@@ -805,10 +834,22 @@ interface PickedSource {
   /** Judging its record needs a fingerprint that was not cached: judged again outside the admission. */
   unjudged?: boolean;
   /**
-   * A foreign root with an interrupted commit into this target: converged first, outside the admission
-   * and without its hold (convergeForeignCommit); merged afterwards only on a request that still holds.
+   * An interrupted commit into this target: converged first, outside the admission and without any
+   * hold (convergeInterruptedCommit), whether the source is kept, requested or not; a foreign root is
+   * merged afterwards only on a request that still holds, a local data set as its record put back says.
    */
   converge?: boolean;
+  /** A local data set's interrupted commit into another data set: converged first (convergeElsewhere). */
+  elsewhere?: boolean;
+}
+
+/**
+ * A merged source's request is done, unless its merged record did not get written (only logged, the
+ * record stays committing): it stays with the source until the next batch converges that commit.
+ */
+async function mergeRequestDone(paths: { globalStoragePath: string }, candidateId: string, target: TargetContext): Promise<void> {
+  if (interruptedCommit((await readRuntimeDataSetMergeLedger(paths)).get(candidateId), target)) return;
+  await removeRuntimeDataSetMergeRequest(paths, candidateId);
 }
 
 /** A committing record of the source into this target: a crash between its transaction and its record. */
@@ -817,11 +858,12 @@ function interruptedCommit(record: RuntimeDataSetMergeLedgerRecord | undefined, 
 }
 
 /**
- * Converges an interrupted commit of a foreign root (settledSource, no hold, no request needed) and
- * reports its outcome as a merge would. True: nothing of it was committed and a request that still
- * holds (or this very request) wants it merged, so it is merged as any requested foreign root.
+ * Converges an interrupted commit into this target (settledSource, no hold, no request needed) and
+ * reports its outcome as a merge would. True: nothing of it was committed and the source is to be
+ * judged again: a local data set on its record put back (source.record, source.unjudged), a foreign
+ * root only as merged on a request that still holds (or this very request).
  */
-async function convergeForeignCommit(
+async function convergeInterruptedCommit(
   paths: { globalStoragePath: string },
   target: TargetContext,
   source: PickedSource,
@@ -833,8 +875,15 @@ async function convergeForeignCommit(
   if (outcome.kind === 'stopped') return false;
   if (outcome.kind === 'unsettled') {
     if (source.foreign && (source.pending || source.requested)) return true;
-    // Merged meanwhile (another window converged it): nothing to report; else nothing of it was committed.
     const record = (await readRuntimeDataSetMergeLedger(paths)).get(source.id);
+    // A local data set is judged as any other on the record as it is now: the one put back (a merged
+    // one, too), or another window's outcome.
+    if (source.candidate) {
+      source.record = record && sameRuntimeDataSetIdentity(record.source, source.candidate) ? record : undefined;
+      source.unjudged = true;
+      return true;
+    }
+    // Merged meanwhile (another window converged it): nothing to report; else nothing of it was committed.
     if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target.identity)) {
       if (source.expired) await removeRuntimeDataSetMergeRequest(paths, source.id).catch(() => undefined);
       return false;
@@ -1334,7 +1383,8 @@ async function recordRefusal(
   const source = state.fingerprint ?? await sourceFingerprint(candidate);
   await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
     const current = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
-    if ((current?.state === 'merged' || current?.state === 'committing') && sameRuntimeDataSetFingerprint(current.source, source)) return;
+    // An interrupted commit (into any data set) is converged, never recorded over.
+    if (current?.state === 'committing' || (current?.state === 'merged' && sameRuntimeDataSetFingerprint(current.source, source))) return;
     await writeRuntimeDataSetMergeLedgerRecord(paths, outcome.tooLarge
       ? { candidateId, state: 'too-large', source, code: outcome.code, message: outcome.message, ...outcome.tooLarge }
       : outcome.kind === 'failed'
@@ -1536,7 +1586,9 @@ async function settledSource(
     return sameRuntimeDataSetIdentity(recorded.source, candidate) && sameRuntimeDataSetFingerprint(recorded.source, fingerprint)
       ? { kind: 'current', result: await currentResult(paths, candidate, target, state) } : undefined;
   }
-  if (recorded?.state !== 'committing' || !sameRuntimeDataSetIdentity(recorded.target, target.identity)) return undefined;
+  // Converged when the batch picked it (convergeElsewhere); found only now (another window's), it waits.
+  if (recorded?.state === 'committing' && !sameRuntimeDataSetIdentity(recorded.target, target.identity)) throw new Outcome(COMMIT_ELSEWHERE);
+  if (recorded?.state !== 'committing') return undefined;
   return withRuntimeDataRootAdmission(paths.globalStoragePath, async (): Promise<SourceOutcome | undefined> => {
     // A foreign id names the root's identity: its commit converges from the ledger and the target
     // alone, also when the root is gone meanwhile.
@@ -1581,6 +1633,82 @@ async function settledSource(
       recoveredCommit: true, ...await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state))
     } };
   });
+}
+
+/**
+ * An interrupted commit of a local source into another data set of this configuration root, converged
+ * by that data set's own evidence: its commit marker, read on a private copy of it (it is offline, the
+ * selected data set is this target) under its maintenance claim. Committed: the source is on record as
+ * merged there (the conversations of the commit that are there now), and judged as any merged source;
+ * not committed, or that data set is gone: the record the commit replaced is back. Nothing is guessed
+ * or written over it while that data set cannot be read or is in use (COMMIT_ELSEWHERE).
+ */
+async function convergeElsewhere(
+  paths: { globalStoragePath: string },
+  target: TargetContext,
+  candidateId: string
+): Promise<void> {
+  await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
+    const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
+    if (record?.state !== 'committing' || sameRuntimeDataSetIdentity(record.target, target.identity)) return;
+    const inspection = await inspectVscodeRuntimeDataSets(paths);
+    const there = inspection.candidates.find((dataSet) => !dataSet.selected && sameRuntimeDataSetIdentity(record.target, dataSet));
+    if (!there) {
+      // Gone (deleted, reset): nothing of it counts any more. One that cannot be read may still be it.
+      if (inspection.problems.length > 0 || inspection.candidates.some((dataSet) => dataSet.selected && sameRuntimeDataSetIdentity(record.target, dataSet))) {
+        throw new Outcome(COMMIT_ELSEWHERE);
+      }
+      await restoreLedgerRecord(paths, candidateId, record.replaced);
+      await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
+      return;
+    }
+    const committed = await (async () => {
+      await assertSourceIdle(there);
+      const binding = await requireCompleteRuntimeDataSet(there);
+      return withRuntimeMaintenance(binding.paths, async () => {
+        const copy = await createRuntimeDataSetDatabaseSnapshot(there, binding);
+        try {
+          const key = copy.database.prepare('SELECT source_key FROM command_receipt WHERE id = ?').pluck().get(mergeCommitMarkerId(record.commitId));
+          if (key !== `${MERGE_COMMIT_MARKER_KEY}${record.commitId}`) return undefined;
+          const commit = await readRuntimeDataSetMergeCommit(paths, record.commitId).catch((error: unknown) => {
+            if (error instanceof SyntaxError) return undefined;
+            throw error;
+          });
+          const conversations = (commit?.rows ?? []).filter(([domain]) => domain === 'Conversation').map(([, id]) => id);
+          const present = copy.database.prepare('SELECT 1 FROM conversation WHERE id = ?').pluck();
+          return { commit, conversations, present: conversations.filter((id) => present.get(id) !== undefined) };
+        } finally {
+          await closeSnapshot(copy);
+        }
+      });
+    })().catch((error: unknown) => {
+      // In use (a Host, an old window), unreadable, no room for the copy: that commit stays unknown.
+      console.warn('[LimCode] 这个库上次合并到的另一个历史库读不出或正在使用，确认不了那次合并的结果，先不合并。', error instanceof Error ? error.message : error);
+      throw new Outcome(COMMIT_ELSEWHERE);
+    });
+    if (!committed) {
+      await restoreLedgerRecord(paths, candidateId, record.replaced);
+      await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
+      return;
+    }
+    await writeRuntimeDataSetMergeLedgerRecord(paths, {
+      candidateId, state: 'merged', source: record.source, target: record.target, mergedAt: new Date().toISOString(),
+      insertedRows: committed.commit?.insertedRows ?? 0, reusedRows: committed.commit?.reusedRows ?? 0,
+      insertedConversations: committed.conversations.length, insertedConversationIds: committed.present,
+      ...(record.skippedConversations ? { skippedConversations: record.skippedConversations } : {})
+    });
+    await removeRuntimeDataSetMergeCommit(paths, record.commitId).catch(() => undefined);
+  });
+}
+
+const COMMIT_ELSEWHERE: Refusal = {
+  kind: 'deferred', code: 'runtime-data-set-merge-commit-elsewhere',
+  message: '这个库上次合并到另一个历史库时中断了，那个库现在读不出或正在使用，确认不了那次合并的结果；这次先不合并，以后会再试。'
+};
+
+/** Before a committing record is written over `previous`: another data set's interrupted commit is never replaced. */
+function assertNoCommitElsewhere(previous: RuntimeDataSetMergeLedgerRecord | undefined, target: TargetContext): void {
+  if (previous?.state === 'committing' && !sameRuntimeDataSetIdentity(previous.target, target.identity)) throw new Outcome(COMMIT_ELSEWHERE);
 }
 
 /** Identity, idle state, recovery, epoch (a published 3/4 source is upgraded in place first). */
@@ -2038,6 +2166,7 @@ async function commitLocked(
 ): Promise<SourceOutcome> {
   await assertSourceUnchanged(paths, target, candidate, binding, state, mode);
   const previous = mode.migration ? undefined : (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id);
+  assertNoCommitElsewhere(previous, target);
   if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
     if (previous.state === 'committing') {
       throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '另一个窗口合并这个库时中断，下次启动时先确认它的结果。' });
@@ -3802,7 +3931,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, keptUnfinishedWork, transferSourceCas, finalizeSource,
   cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
-  unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,
+  unchangedResult, currentResult, mergeCommitMarkerStep, mergeCommitCommitted, restoreLedgerRecord, assertNoCommitElsewhere, mergeRequestDone, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome,
   closeSnapshot, pruneMergePreparations, isDiskFullError, writtenDirectory
 });
