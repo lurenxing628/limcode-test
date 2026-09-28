@@ -82,7 +82,7 @@ test('准备好的窗口在会话之前消失（关窗、重载、崩溃）：�
   assert.deepEqual(await registrations(fixture), [], '释放时登记也撤掉');
 });
 
-test('准备抛错时（写第二份来源的准备记录遇到 ENOSPC）：本次做的目标备份和它的登记都删掉，声明也都交还', { timeout: 300_000 }, async (t) => {
+test('写第二份来源的准备记录遇到 ENOSPC（盲审 #5）：第二份按磁盘空间不足推迟（中文、写明目录、没有系统原文），第一份照常准备好；释放时目标备份、登记和声明都交还', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
@@ -91,21 +91,29 @@ test('准备抛错时（写第二份来源的准备记录遇到 ENOSPC）：本�
   let claims = 0;
   fsPromises.open = async (file, ...rest) => {
     if (String(file).includes(`${path.sep}preparing${path.sep}`) && String(file).endsWith('.tmp') && ++claims === 2) {
-      throw Object.assign(new Error(`ENOSPC: no space left on device, open '${file}'`), { code: 'ENOSPC', syscall: 'open' });
+      throw Object.assign(new Error(`ENOSPC: no space left on device, open '${file}'`), { code: 'ENOSPC', syscall: 'open', path: String(file) });
     }
     return open(file, ...rest);
   };
+  let preparation;
   try {
-    await withWindow(fixture, async (window) => {
-      await assert.rejects(prepareLargeMergeSources({
-        paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
-      }), { code: 'ENOSPC' });
-    });
+    preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+    }));
   } finally {
     fsPromises.open = open;
   }
   assert.equal(claims >= 2, true, '第二份来源的准备记录写失败了');
-  assert.deepEqual(await targetBackups(fixture), [], '第一份来源时做的备份删掉了');
+  assert.equal(preparation.sources.length, 1, '第一份照常准备好');
+  const [first] = preparation.sources;
+  assert.deepEqual(preparation.report.deferred.map((issue) => issue.code), [DISK_FULL]);
+  const { message } = preparation.report.deferred[0];
+  assert.equal(message, `磁盘空间不足：准备合并这份旧聊天记录时在 ${path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'preparing')} 写不下了，这次没有合并；腾出空间后会再合并`);
+  assert.notEqual(preparation.report.deferred[0].candidateId, first.candidateId);
+  assert.deepEqual(await targetBackups(fixture), [path.basename(preparation.backupPath)]);
+  assert.deepEqual((await ledgerEntries(fixture, 'preparing')).length, 1, '只有第一份的准备记录');
+  await releaseLargeMergePreparation(preparation);
+  assert.deepEqual(await targetBackups(fixture), [], '没用上的备份删掉了');
   assert.deepEqual(await registrations(fixture), []);
   assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
 });
@@ -876,7 +884,7 @@ test('提交的回复丢了（事务其实已提交）：按事务自己数的�
 // The left-out closure off the window's thread (review #7).
 // ---------------------------------------------------------------------------------------------
 
-test('跳过闭包不长时间占着窗口线程：只读一张表的规则按 rowid 分段（每段 64 块），每段、每条规则之后都让出线程；结果与一次跑完相同，删掉的对话（行在后面的段里）不会被插回', { timeout: 300_000 }, async (t) => {
+test('跳过闭包不长时间占着窗口线程：只读一张表的规则按 rowid 分段（每段 64 块），跨几张表的“全部成员”规则按候选分步（盲审 #4），每段、每步之后都让出线程；结果与一次跑完相同，删掉的对话（行在后面的段里）不会被插回', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
   const { generateSyntheticSource } = await import('./fixtures/runtime-merge-fixture.mjs');
@@ -903,10 +911,13 @@ test('跳过闭包不长时间占着窗口线程：只读一张表的规则按 r
   const runs = [];
   SqliteDatabase.prototype.prepare = function recordClosure(sql, ...rest) {
     const statement = prepare.call(this, sql, ...rest);
-    if (typeof sql === 'string' && sql.includes('INTO temp.limcode_merge_skip') && !sql.includes('VALUES')) {
+    const closure = typeof sql === 'string' && !sql.includes('VALUES')
+      && (sql.includes('INTO temp.limcode_merge_skip') || sql.includes('DELETE FROM temp.limcode_merge_skip_candidate'));
+    if (closure) {
       const run = statement.run;
       statement.run = function recordedRun(...args) {
-        runs.push({ sql, segment: args.length === 2 ? args : undefined, tick: ticks });
+        // Clearing the candidates (no parameters) belongs to the step after it.
+        if (args.length > 0) runs.push({ sql, segment: args.length === 2 ? args : undefined, tick: ticks });
         return run.apply(this, args);
       };
     }
@@ -925,10 +936,14 @@ test('跳过闭包不长时间占着窗口线程：只读一张表的规则按 r
   assert.equal(preparation.sources.length, 1);
   assert.equal(preparation.sources[0].skippedConversations, 1);
   assert.ok(runs.length > 20, `闭包跑了 ${runs.length} 次语句（空表的规则不跑）`);
-  const segmented = runs.filter((entry) => entry.segment);
-  assert.ok(segmented.every((entry) => /AS t NOT INDEXED WHERE[\s\S]* AND t\.rowid > \? AND t\.rowid <= \?$/.test(entry.sql)), '分段语句按 rowid 范围读');
-  assert.ok(segmented.some((entry) => entry.segment[0] >= LIMITS.chunkRows * 64), '大的表分成了几段');
-  assert.ok(runs.some((entry) => /GROUP BY owner/.test(entry.sql) && !entry.segment), '跨几张表的规则整条跑');
+  assert.ok(runs.every((entry) => entry.segment), '每条都是一段或一步');
+  const scans = runs.filter((entry) => /AS t NOT INDEXED WHERE[\s\S]* AND t\.rowid > \? AND t\.rowid <= \?\)?$/.test(entry.sql));
+  const candidates = runs.filter((entry) => /ORDER BY id LIMIT \?\) AS page JOIN/.test(entry.sql)
+    || /temp\.limcode_merge_skip_candidate (AS c )?WHERE (c\.)?rowid > \? AND (c\.)?rowid <= \?/.test(entry.sql));
+  assert.equal(scans.length + candidates.length, runs.length, runs.filter((entry) => !scans.includes(entry) && !candidates.includes(entry)).map((entry) => entry.sql).join('\n'));
+  assert.ok(scans.some((entry) => entry.segment[0] >= LIMITS.chunkRows * 64), '大的表分成了几段');
+  assert.ok(candidates.some((entry) => /'Message', owner FROM temp\.limcode_merge_skip_candidate/.test(entry.sql)), '跨几张表的规则也分步跑');
+  assert.ok(runs.every((entry) => !/GROUP BY/.test(entry.sql)), '没有整条跑的 GROUP BY');
   for (let index = 1; index < runs.length; index += 1) {
     assert.ok(runs[index].tick > runs[index - 1].tick, `第 ${index} 条之前让出过线程`);
   }

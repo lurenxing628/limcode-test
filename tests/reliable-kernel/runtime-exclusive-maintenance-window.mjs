@@ -255,8 +255,12 @@ async function runLargeSession() {
     rows: source.rows, databaseBytes: 1024 * 1024,
     duration: { expectedMs: source.mergeMs, minMs: Math.round(source.mergeMs * 0.8), maxMs: Math.round(source.mergeMs * 1.6) }
   }));
-  // The engine's own figures: the sources, the largest one's WAL peak, 64 MiB; one private copy in the temporary directory.
-  const space = { targetDirectory: paths.dataRootPath, targetBytes: 70 * 1024 * 1024, temporaryDirectory: root, temporaryBytes: 1024 * 1024 };
+  // The engine's own figures: the sources, the largest one's WAL peak, 64 MiB; one private copy in the temporary directory;
+  // SQLite's temporary files (a quarter of the largest source) in its temporary directory.
+  const space = {
+    targetDirectory: paths.dataRootPath, targetBytes: 70 * 1024 * 1024, temporaryDirectory: root, temporaryBytes: 1024 * 1024,
+    sqliteTemporaryDirectory: root, sqliteTemporaryBytes: 256 * 1024
+  };
   const engine = {
     waiting: async () => sources.map(({ candidateId, rows }) => ({ candidateId, rows, bytes: rows * 100 })),
     noteBatch: () => {},

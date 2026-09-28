@@ -52,31 +52,43 @@ test('操作键：目标身份加各来源指纹的摘要，与来源顺序无�
   assert.notEqual(session.largeMergeOperationKey({ ...target, rootInstanceId: 'other' }, [a, b]), key);
 });
 
-test('空间：按引擎在会话开始时自己检查的数字核对——当前库所在的盘要引擎给出的字节数（其中已含 64 MiB 余量），临时目录要最大来源的一份再加 64 MiB；同一块盘合并核对、余量只算一次；不够时写明还差多少', async () => {
+test('空间：按引擎在会话开始时自己检查的数字核对——当前库所在的盘要引擎给出的字节数（其中已含 64 MiB 余量），临时目录要最大来源的一份、数据库临时文件目录要引擎给出的临时文件量，各再加 64 MiB；同一块盘合并核对、余量只算一次；不够时写明还差多少', async () => {
   const MiB = 1024 * 1024;
   const margin = session.LARGE_MERGE_SESSION.freeSpaceMarginBytes;
   assert.equal(margin, 64 * MiB);
-  // The engine's figures: sources 900 MiB + the largest (700 MiB) × 1.5 for its WAL + 64 MiB.
-  const facts = { targetDirectory: '/target', targetBytes: (900 + 1050 + 64) * MiB, temporaryDirectory: '/tmp-dir', temporaryBytes: 700 * MiB };
-  const disks = { '/target': { device: 1, freeBytes: 10_000 * MiB }, '/tmp-dir': { device: 2, freeBytes: 800 * MiB } };
+  // The engine's figures: sources 900 MiB + the largest (700 MiB) × 1.5 for its WAL + 64 MiB; SQLite's temporary files a quarter of the largest.
+  const facts = {
+    targetDirectory: '/target', targetBytes: (900 + 1050 + 64) * MiB, temporaryDirectory: '/tmp-dir', temporaryBytes: 700 * MiB,
+    sqliteTemporaryDirectory: '/var-tmp', sqliteTemporaryBytes: 175 * MiB
+  };
+  const disks = {
+    '/target': { device: 1, freeBytes: 10_000 * MiB }, '/tmp-dir': { device: 2, freeBytes: 800 * MiB }, '/var-tmp': { device: 3, freeBytes: 300 * MiB }
+  };
   const probe = async (directory) => disks[directory];
   const plan = await session.planLargeMergeSpace(facts, probe);
   assert.equal(plan.disks.find((disk) => disk.path === '/target').requiredBytes, facts.targetBytes, 'exactly what the engine checks');
   assert.equal(plan.disks.find((disk) => disk.path === '/tmp-dir').requiredBytes, 700 * MiB + margin);
+  assert.equal(plan.disks.find((disk) => disk.path === '/var-tmp').requiredBytes, 175 * MiB + margin);
   assert.equal(plan.ok, true);
-  // The temporary directory on the target's disk: checked once, for the sum; the margin is in the engine's figure already.
+  // SQLite's temporary directory on its own small disk: that one is short, and said by its name.
+  disks['/var-tmp'] = { device: 3, freeBytes: 200 * MiB };
+  const sqliteShort = await session.planLargeMergeSpace(facts, probe);
+  assert.equal(sqliteShort.ok, false);
+  assert.equal(session.describeLargeMergeSpaceShortage(sqliteShort), '数据库临时文件目录（/var-tmp）剩余空间不足：需要约 239 MB，现在可用 200 MB，还差约 39 MB');
+  // Both temporary directories on the target's disk: checked once, for the sum; the margin is in the engine's figure already.
   disks['/tmp-dir'] = { device: 1, freeBytes: 10_000 * MiB };
+  disks['/var-tmp'] = { device: 1, freeBytes: 10_000 * MiB };
   const shared = await session.planLargeMergeSpace(facts, probe);
   assert.equal(shared.disks.length, 1);
-  assert.equal(shared.disks[0].label, '当前历史库所在的盘、临时目录');
-  assert.equal(shared.disks[0].requiredBytes, (900 + 1050 + 64 + 700) * MiB);
+  assert.equal(shared.disks[0].label, '当前历史库所在的盘、临时目录、数据库临时文件目录');
+  assert.equal(shared.disks[0].requiredBytes, (900 + 1050 + 64 + 700 + 175) * MiB);
   // Short: not ok, and how much is missing.
   disks['/target'] = { device: 1, freeBytes: 2 * 1024 * MiB };
   const short = await session.planLargeMergeSpace(facts, probe);
   assert.equal(short.ok, false);
-  assert.equal(short.disks[0].missingBytes, (900 + 1050 + 64 + 700) * MiB - 2 * 1024 * MiB);
+  assert.equal(short.disks[0].missingBytes, (900 + 1050 + 64 + 700 + 175) * MiB - 2 * 1024 * MiB);
   assert.equal(session.describeLargeMergeSpaceShortage(short),
-    '当前历史库所在的盘、临时目录（/target）剩余空间不足：需要约 2.7 GB，现在可用 2.0 GB，还差约 666 MB');
+    '当前历史库所在的盘、临时目录、数据库临时文件目录（/target）剩余空间不足：需要约 2.8 GB，现在可用 2.0 GB，还差约 841 MB');
   // Free space that cannot be read: not refused here (the engine's own check and the write decide).
   disks['/target'] = { device: 1 };
   assert.equal((await session.planLargeMergeSpace(facts, probe)).ok, true);
@@ -353,7 +365,8 @@ test('适配层接真实引擎：先只读估计（不在配置准入内；什�
     raw.sources.map((source) => [source.candidateId, source.rows, source.databaseBytes,
       range(source.prepareEstimateMs, source.prepareEstimateRangeMs), range(source.sessionEstimateMs, source.sessionEstimateRangeMs)]));
   assert.deepEqual(again.estimated.space, {
-    targetDirectory: raw.space.targetDirectory, targetBytes: raw.space.targetBytes, temporaryDirectory: raw.space.temporaryDirectory, temporaryBytes: raw.space.temporaryBytes
+    targetDirectory: raw.space.targetDirectory, targetBytes: raw.space.targetBytes, temporaryDirectory: raw.space.temporaryDirectory, temporaryBytes: raw.space.temporaryBytes,
+    sqliteTemporaryDirectory: raw.space.sqliteTemporaryDirectory, sqliteTemporaryBytes: raw.space.sqliteTemporaryBytes
   });
   const prepareOnce = async () => {
     const database = await kernel.RuntimeDatabase.open(fixture.current.authority, { hostBootId: `adapter-${Date.now()}` });
@@ -385,6 +398,7 @@ test('适配层接真实引擎：先只读估计（不在配置准入内；什�
   assert.deepEqual(preparation.report.deferred.map((issue) => [issue.candidateId, issue.code, issue.message]),
     [[small.id, 'runtime-data-set-merge-large-session-small', '这份旧聊天记录不需要所有窗口暂停，下次启动时会在后台直接合并。']]);
   assert.ok(preparation.space.targetBytes > 0 && preparation.space.temporaryBytes > 0 && preparation.space.targetDirectory && preparation.space.temporaryDirectory);
+  assert.ok(preparation.space.sqliteTemporaryBytes > 0 && preparation.space.sqliteTemporaryDirectory, JSON.stringify(preparation.space));
   assert.ok(first.messages.some((message) => /^第 [123]\/3 份：正在复制一份只读副本$/.test(message)), first.messages.join('\n'));
   assert.ok(first.messages.some((message) => /^第 [123]\/3 份：正在备份当前历史库$/.test(message)), first.messages.join('\n'));
   assert.ok(first.messages.every((message) => /^第 [123]\/3 份：正在(复制一份只读副本|逐条比较|收尾中断的任务|复制正文|备份当前历史库)/.test(message)), first.messages.join('\n'));
@@ -454,7 +468,7 @@ test('空间不够时不提示开始，只说明还差多少（同一原因只�
   assert.deepEqual(window.engine.calls.map((call) => call[0]), ['estimate'], 'nothing prepared');
   assert.deepEqual(window.coordinations, []);
   assert.equal(window.ui.warnings.length, 1);
-  assert.match(window.ui.warnings[0][0], /^有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录（.+）剩余空间不足：需要约 .+，现在可用 10 MB，还差约 .+。腾出空间后，下次启动时会再提示；也可以在“历史与存储管理”里手动开始。$/);
+  assert.match(window.ui.warnings[0][0], /^有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录、数据库临时文件目录（.+）剩余空间不足：需要约 .+，现在可用 10 MB，还差约 .+。腾出空间后，下次启动时会再提示；也可以在“历史与存储管理”里手动开始。$/);
   assert.deepEqual([...causes], ['runtime-data-set-merge-large-session-disk-full']);
   const again = loadWindow(fixture, { freeBytes: 10 * 1024 * 1024, sessionId: 'session-2', freshCause: async (code) => !causes.has(code) });
   await again.offer();
@@ -468,12 +482,15 @@ test('空间不够时不提示开始，只说明还差多少（同一原因只�
   assert.equal(manual.ui.errors[0][0], '合并较大的旧聊天记录没有开始');
   assert.match(manual.ui.errors[0][1].detail, /还差约 .+。腾出空间后可以再试；已有数据未被修改。$/);
   // The estimate's figure decides (the preparation's backup and copied content in it), not what the session alone would need.
-  const estimateSpace = { targetDirectory: fixture.paths.dataRootPath, targetBytes: 3 * 1024 ** 3, temporaryDirectory: path.dirname(fixture.root), temporaryBytes: 1024 * 1024 };
+  const estimateSpace = {
+    targetDirectory: fixture.paths.dataRootPath, targetBytes: 3 * 1024 ** 3, temporaryDirectory: path.dirname(fixture.root), temporaryBytes: 1024 * 1024,
+    sqliteTemporaryDirectory: path.dirname(fixture.root), sqliteTemporaryBytes: 256 * 1024
+  };
   const backupShort = loadWindow(fixture, { freeBytes: 1024 ** 3, estimateSpace, sessionId: 'session-3' });
   await backupShort.offer();
   assert.deepEqual(backupShort.engine.calls.map((call) => call[0]), ['estimate']);
   assert.equal(backupShort.ui.progress.filter((entry) => entry.messages[0]?.startsWith('将在 ')).length, 0, 'no countdown');
-  assert.match(backupShort.ui.warnings.at(-1)?.[0] ?? '', /^有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录（.+）剩余空间不足：需要约 3\.0 GB，现在可用 1\.0 GB，还差约 2\.0 GB。/);
+  assert.match(backupShort.ui.warnings.at(-1)?.[0] ?? '', /^有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录、数据库临时文件目录（.+）剩余空间不足：需要约 3\.0 GB，现在可用 1\.0 GB，还差约 2\.0 GB。/);
 });
 
 test('独占开始前用 statfs 再核一次空间：协调期间空间被占掉时不关闭本窗口运行时、不合并、不重载，只说明还差多少（自动开始按原因只提示一次）', async (t) => {
@@ -486,7 +503,7 @@ test('独占开始前用 statfs 再核一次空间：协调期间空间被占掉
   assert.deepEqual(manual.engine.calls.map((call) => call[0]), ['estimate', 'prepare', 'release']);
   assert.deepEqual(manual.host.events.map((event) => event[0]), ['freeze', 'thaw'], 'this window\'s Runtime never closed');
   assert.deepEqual(manual.ui.commands, [], 'not reloaded');
-  assert.match(manual.ui.warnings.at(-1)[0], /^较大的旧聊天记录这次没有合并：有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录（.+）剩余空间不足：需要约 .+，现在可用 10 MB，还差约 .+。已有数据未被修改，可以稍后在“历史与存储管理”里再试。$/);
+  assert.match(manual.ui.warnings.at(-1)[0], /^较大的旧聊天记录这次没有合并：有 2 份较大的旧聊天记录等待合并，但当前历史库所在的盘、临时目录、数据库临时文件目录（.+）剩余空间不足：需要约 .+，现在可用 10 MB，还差约 .+。已有数据未被修改，可以稍后在“历史与存储管理”里再试。$/);
   assert.equal(session.takeLargeMergeResult(manual.state, Date.now()), undefined, 'nothing kept for a reload');
   const causes = new Set();
   const automatic = loadWindow(fixture, {
@@ -799,6 +816,27 @@ test('估计时点“取消”（或窗口关闭）、估计出错：什么都�
   assert.deepEqual([...causes], ['runtime-data-set-merge-large-session-estimate']);
 });
 
+test('盲审 #5：准备整体出错时如实说明数据——没有收尾任何来源才说“已有数据未被修改”，已收尾的写明几份；磁盘满只说磁盘空间不足，不带系统原文', async (t) => {
+  const fixture = await createRoot(t);
+  const { LargeMergePreparationError } = engineModule;
+  const full = new LargeMergePreparationError(Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }), 0);
+  assert.equal(full.message, '磁盘空间不足');
+  assert.equal(full.cause.code, 'ENOSPC');
+  const untouched = loadWindow(fixture, { confirm: '开始合并', prepareError: full });
+  await untouched.start();
+  assert.deepEqual(untouched.ui.errors.map(([message]) => message), ['合并较大的旧聊天记录没有开始：准备时出错（磁盘空间不足）。已有数据未被修改。']);
+  const finalized = loadWindow(fixture, { confirm: '开始合并', prepareError: new LargeMergePreparationError(new Error('读不到来源'), 1), sessionId: 'session-2' });
+  await finalized.start();
+  assert.deepEqual(finalized.ui.errors.map(([message]) => message), [
+    '合并较大的旧聊天记录没有开始：准备时出错（读不到来源）。准备时已有 1 份旧聊天记录里中断的任务按“中止”收尾、排队未发送的消息被取消（都不会在当前库继续执行），其余数据未被修改。'
+  ]);
+  const automatic = loadWindow(fixture, { prepareError: new LargeMergePreparationError(new Error('读不到来源'), 2), sessionId: 'session-3' });
+  await automatic.offer();
+  assert.deepEqual(automatic.ui.warnings.map(([message]) => message).filter((message) => message.includes('无法准备')), [
+    '合并较大的旧聊天记录暂时无法准备：读不到来源。准备时已有 2 份旧聊天记录里中断的任务按“中止”收尾、排队未发送的消息被取消（都不会在当前库继续执行），其余数据未被修改，下次启动时会再试。'
+  ]);
+});
+
 test('会话开始时引擎自己的空间检查不够（或第一份就磁盘满）：什么都没合并，本窗口照常重载，重载后说一次“没有进行”和引擎给出的原因，不按每份各报一次', async (t) => {
   const fixture = await createRoot(t);
   const message = '磁盘空间不足，需要约 120 MB：合并较大的旧聊天记录要在 /fixture 暂存数据';
@@ -835,13 +873,14 @@ function source(candidateId, rows, mergeMs, prepareMs = 30_000) {
 /** The fake engine's online target backup, counted once in the estimate's total preparation (never in a source's). */
 const TARGET_BACKUP = { expectedMs: 60_000, minMs: 24_000, maxMs: 150_000 };
 
-/** The engine's figures (the session never computes its own): the sources, the largest one's WAL peak and 64 MiB; `extra` for the estimate's backup and copied content. */
+/** The engine's figures (the session never computes its own): the sources, the largest one's WAL peak and 64 MiB, its SQLite temporary files; `extra` for the estimate's backup and copied content. */
 function spaceFor(fixture, sources, extra = 0) {
   const largest = Math.max(0, ...sources.map((item) => item.databaseBytes));
   return {
     targetDirectory: fixture.paths.dataRootPath,
     targetBytes: sources.reduce((sum, item) => sum + item.databaseBytes, 0) + largest * 1.5 + 64 * 1024 * 1024 + extra,
-    temporaryDirectory: path.dirname(fixture.root), temporaryBytes: largest
+    temporaryDirectory: path.dirname(fixture.root), temporaryBytes: largest,
+    sqliteTemporaryDirectory: path.dirname(fixture.root), sqliteTemporaryBytes: Math.ceil(largest * 0.25)
   };
 }
 
@@ -992,6 +1031,7 @@ function loadWindow(fixture, behavior = {}) {
       engine.calls.push(['prepare', [...input.candidateIds]]);
       // The user pressed “取消” on the preparation's notification meanwhile.
       if (behavior.cancelPrepare) ui.progress.find((entry) => entry.title?.startsWith('正在准备'))?.cancel();
+      if (behavior.prepareError) throw behavior.prepareError;
       const settled = settledIds(behavior.settled);
       const prepared = sources.filter((item) => input.candidateIds.includes(item.candidateId) && !settled.includes(item.candidateId))
         .map(({ preparing: _preparing, ...item }) => item);
