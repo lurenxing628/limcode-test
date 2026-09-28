@@ -8,7 +8,7 @@ import Database from 'better-sqlite3';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
-import { RuntimeDatabase } from './runtimeDatabase';
+import { RuntimeDatabase, RuntimeDatabaseWorkerError } from './runtimeDatabase';
 import {
   HISTORICAL_MERGE_ENGINE as engine, planMergeChunk, RuntimeDataSetMergeEvidence, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
   type ForeignHistoricalMergeCandidate, type ForeignHistoricalMergeHold, type HistoricalMergeCandidate,
@@ -35,6 +35,8 @@ import {
 } from './runtimeDataSetMergeLedger';
 import { describeUnfinishedWork, hasFinalizableWork } from './runtimeDataSetMergeWork';
 import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
+import { assertModelRequestAggregate } from './runtimeModelRequestAggregate';
+import { attachRuntimeStatementCache, detachRuntimeStatementCache } from './runtimeStatementCache';
 import {
   createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet, type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
@@ -139,6 +141,8 @@ export const RUNTIME_DATA_SET_LARGE_MERGE_MEASURED_RATE_BOUNDS = Object.freeze({
 /** A session whose merged sources the model gives less than this is not measured: its fixed parts would dominate. */
 const RATE_MIN_MODEL_MS = 1000;
 const SKIP_TABLE = 'limcode_merge_skip';
+/** A source's rows the Runtime refuses (invariantRefusal). */
+const INVARIANT = 'runtime-data-set-merge-invariant';
 /**
  * Page cache of a source snapshot's connection, in KiB, for its main and TEMP databases (SQLite's
  * default here is 16 MiB each): its rows are read once, in order, so the cache does not grow with it.
@@ -382,6 +386,12 @@ export interface RuntimeDataSetMergeScan {
   reusedRows: number;
   insertConversations: number;
   conflicts: { count: number; samples: string[] };
+  /**
+   * What the Runtime worker would refuse at the commit, found by its own aggregate assertion
+   * (runtimeModelRequestAggregate) on the source's copy for a request the merge inserts: the refusal's
+   * text. The scan stops there (its counts cover the rows up to that chunk).
+   */
+  refusedAggregate?: string;
   elapsedMs: number;
 }
 
@@ -445,7 +455,10 @@ function countingSink(scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'>, savepoin
 /**
  * Online dry run of a merge: every source row decoded and compared with the target row of its id, as
  * the merge will (planMergeChunk), keeping only counts, at most MAX_REPORTED_CONFLICTS conflict
- * samples and the time taken. Memory does not grow with the rows.
+ * samples and the time taken. Memory does not grow with the rows. Every request the merge inserts has
+ * its aggregate asserted as the worker asserts it at the commit, on the source's copy: an inserted
+ * request's aggregate is all the source's (its rows are the source's rows, inserted or equal), so the
+ * commit would refuse exactly what fails here (see refusedAggregate).
  */
 export async function scanMergeRows(
   source: Database.Database,
@@ -456,18 +469,84 @@ export async function scanMergeRows(
   const scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'> = {
     rows: 0, insertRows: 0, reusedRows: 0, insertConversations: 0, conflicts: { count: 0, samples: [] }
   };
-  const sink = countingSink(scan, { next: 0 });
-  await forEachSourceChunk(source, target, {
-    skipping: options.skipping === true, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS,
-    ...(options.signal ? { signal: options.signal } : {})
-  }, async (schema, chunk, existing) => {
-    planMergeChunk(schema, chunk, existing, sink);
-    sink.steps.length = 0;
-    sink.presence.length = 0;
-    scan.rows += chunk.length;
-    options.onRows?.(scan.rows);
-  });
+  const requests: string[] = [];
+  const counting = countingSink(scan, { next: 0 });
+  const sink: RuntimeDataSetMergeChunkSink = {
+    ...counting,
+    inserted: (domain, id) => {
+      counting.inserted(domain, id);
+      if (domain === 'ModelRequest') requests.push(id);
+    }
+  };
+  // The assertion's statements, prepared once for the whole scan rather than per request.
+  attachRuntimeStatementCache(source);
+  try {
+    await forEachSourceChunk(source, target, {
+      skipping: options.skipping === true, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS,
+      ...(options.signal ? { signal: options.signal } : {})
+    }, async (schema, chunk, existing) => {
+      planMergeChunk(schema, chunk, existing, sink);
+      sink.steps.length = 0;
+      sink.presence.length = 0;
+      scan.rows += chunk.length;
+      for (const id of requests.splice(0)) {
+        const refused = refusedAggregate(source, id);
+        if (refused !== undefined) throw new RefusedAggregate(refused);
+      }
+      options.onRows?.(scan.rows);
+    });
+  } catch (error) {
+    if (!(error instanceof RefusedAggregate)) throw error;
+    return { ...scan, refusedAggregate: error.message, elapsedMs: performance.now() - started };
+  } finally {
+    detachRuntimeStatementCache(source);
+  }
   return { ...scan, elapsedMs: performance.now() - started };
+}
+
+class RefusedAggregate extends Error {}
+
+/**
+ * The worker's assertion of one request's aggregate on this connection: its refusal, or undefined
+ * when the aggregate holds. SQLite's own errors (they carry a code) are not a refusal and are thrown.
+ */
+function refusedAggregate(database: Database.Database, modelRequestId: string): string | undefined {
+  try {
+    assertModelRequestAggregate(database, modelRequestId);
+    return undefined;
+  } catch (error) {
+    if ((error as { code?: unknown } | undefined)?.code !== undefined) throw error;
+    return engine.errorMessage(error);
+  }
+}
+
+/**
+ * Rows of the source the Runtime does not accept: an aggregate or a historical copy's state its worker
+ * asserts, or a UNIQUE constraint of the schema beyond the id (a scan compares ids only). The same
+ * again for this source and target: blocked and recorded, so no later startup prepares a session for
+ * it; a change of the source, or a request, has it checked again.
+ */
+function invariantRefusal(detail: string, state: HistoricalMergeSourceProgress): InstanceType<typeof engine.Outcome> {
+  return new engine.Outcome({
+    kind: 'blocked', code: INVARIANT,
+    message: `这份旧聊天记录里有当前库不接受的数据（数据不完整或状态不一致），整体未合并，${state.finalized ? '当前库没有改动' : '两边内容都没有改动'}。`
+      + '来源不变时再合并结果也一样，所以不再自动重试；这个库有了变化，或'
+      + (state.foreign ? '在“历史与存储管理 → 外来历史库”里再次选择“合并进当前库”' : '在“历史与存储管理”里再次选择“合并到当前库”')
+      + `时会重新检查。\n${detail}`
+  });
+}
+
+/**
+ * An append or the commit the worker refused for the rows themselves (see invariantRefusal): an error
+ * its assertions threw (they carry no code) or a constraint of the schema; its transaction is rolled
+ * back already. Anything else stays as it is: an error with another code (I/O, a full disk, a busy
+ * database, a presence assertion), or one of this thread (a lost worker, a closed instance).
+ */
+function workerRefusal(error: unknown, state: HistoricalMergeSourceProgress): unknown {
+  if (!(error instanceof RuntimeDatabaseWorkerError)) return error;
+  const code = (error as { code?: unknown }).code;
+  if (code !== undefined && !String(code).startsWith('SQLITE_CONSTRAINT')) return error;
+  return invariantRefusal(error.message, state);
 }
 
 interface StreamedMerge {
@@ -481,9 +560,10 @@ interface StreamedMerge {
 
 /**
  * The one maintenance transaction of a source: chunk by chunk, compared with the target's committed
- * state and appended with that chunk's presence assertions. A conflict stops the writing at once (the
- * transaction is rolled back; the rest is still compared, for the count and samples) and refuses the
- * source; any failure or cancellation rolls it back. `beforeCommit` runs after the last chunk.
+ * state and appended with that chunk's presence assertions. A conflict refuses the source at the chunk
+ * it is found in: rolled back, the rest of the source not read (every window waits meanwhile), the
+ * refusal counting "at least" that chunk's conflicts. Rows the worker refuses are refused too
+ * (workerRefusal); any failure or cancellation rolls it back. `beforeCommit` runs after the last chunk.
  */
 async function streamMergeTransaction(
   source: Database.Database,
@@ -508,6 +588,9 @@ async function streamMergeTransaction(
   };
   let open = true;
   let chunk = 0;
+  const refused = (error: unknown): never => {
+    throw workerRefusal(error, input.state);
+  };
   await database.maintenanceBegin();
   try {
     await forEachSourceChunk(source, database, input, async (schema, rows, existing) => {
@@ -516,19 +599,12 @@ async function streamMergeTransaction(
       const steps: RepositoryTransactionStep[] = [...sink.steps, ...sink.presence];
       sink.steps.length = 0;
       sink.presence.length = 0;
-      if (scan.conflicts.count > 0) {
-        if (open) {
-          open = false;
-          await database.maintenanceRollback();
-        }
-        return;
-      }
+      if (scan.conflicts.count > 0) throw new engine.Outcome(engine.conflictRefusal(scan.conflicts, input.state, true));
       input.signal?.throwIfAborted();
-      await database.maintenanceAppend(steps);
+      await database.maintenanceAppend(steps).catch(refused);
       await input.onChunk(chunk, scan.rows);
       chunk += 1;
     });
-    if (scan.conflicts.count > 0) throw new engine.Outcome(engine.conflictRefusal(scan.conflicts, input.state));
     const merged = { rows: scan.rows, inserted: scan.insertRows, reused: scan.reusedRows, insertedConversations: scan.insertConversations };
     if (scan.insertRows === 0) {
       open = false;
@@ -538,7 +614,7 @@ async function streamMergeTransaction(
     input.signal?.throwIfAborted();
     await input.beforeCommit();
     open = false;
-    await database.maintenanceCommit();
+    await database.maintenanceCommit().catch(refused);
     return { committed: true, ...merged };
   } catch (error) {
     if (open) await database.maintenanceRollback().catch(() => undefined);
@@ -1043,6 +1119,7 @@ async function prepareSource(
         if (isAbort(error)) throw new engine.StopRequested();
         throw error;
       });
+      if (scan.refusedAggregate !== undefined) throw invariantRefusal(scan.refusedAggregate, state);
       if (scan.conflicts.count > 0) throw new engine.Outcome(engine.conflictRefusal(scan.conflicts, state));
       return scan;
     };

@@ -10,7 +10,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import test from 'node:test';
 import {
-  compiled, countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, readAll, readLedgerRecord, saveState,
+  compiled, countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite, readAll, readLedgerRecord, saveState,
   seedConversations, seedRichSource
 } from './fixtures/runtime-merge-fixture.mjs';
 
@@ -24,10 +24,12 @@ const { largeMergeTargetBytes } = kernelFile('runtimeDataSetLargeMergeSpace.js')
 const { openRuntimeCasVerificationCache } = kernelFile('runtimeCasVerificationCache.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
+const { RuntimeDatabaseWorkerError } = kernelFile('runtimeDatabase.js');
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
 const MiB = 1024 * 1024;
 const DISK_FULL = 'runtime-data-set-merge-disk-full';
+const INVARIANT = 'runtime-data-set-merge-invariant';
 
 // ---------------------------------------------------------------------------------------------
 // Target backups (review #1) and failures while cleaning up (#13, #14).
@@ -444,6 +446,170 @@ test('正文核验缓存用不了时（它的位置被一个目录占着）：�
   assert.deepEqual(await registrations(fixture), []);
   assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
   assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '不入账，以后再合并');
+});
+
+// ---------------------------------------------------------------------------------------------
+// Rows the Runtime refuses (review #5) and conflicts found in the session (#9).
+// ---------------------------------------------------------------------------------------------
+
+test('不变量在试算里就查出（来源里一个已结束请求缺 Operation）：准备按受阻入账，不备份、不进会话，当前库不变；下次启动直接报告为受阻，不再等待大库会话', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  const request = 'alpha_conversation_2_request_completed';
+  rawWrite(fixture.alpha, (source) => {
+    source.prepare('DELETE FROM attempt WHERE id = ?').run(`${request}_attempt`);
+    source.prepare('DELETE FROM operation WHERE id = ?').run(`${request}_operation`);
+  });
+  const before = readAll(fixture.current);
+  const preparation = await withWindow(fixture, async (window) => {
+    const batch = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
+    assert.deepEqual(batch.deferred.map((issue) => issue.code), [RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]);
+    return prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
+  });
+  assert.deepEqual(preparation.sources, [], '不进会话');
+  assert.deepEqual(preparation.report.blocked.map((issue) => issue.code), [INVARIANT]);
+  assert.match(preparation.report.blocked[0].message,
+    /当前库不接受的数据[\s\S]*两边内容都没有改动[\s\S]*不再自动重试[\s\S]*ModelRequest alpha_conversation_2_request_completed must own exactly one Operation/);
+  assert.equal(preparation.backupPath, undefined);
+  assert.deepEqual(await targetBackups(fixture), []);
+  assert.deepEqual(readAll(fixture.current), before, '当前库不变');
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.deepEqual([record.state, record.code], ['blocked', INVARIANT]);
+
+  await withWindow(fixture, async (window) => {
+    const batch = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
+    assert.deepEqual(batch.deferred, [], '不再等待大库会话');
+    assert.deepEqual(batch.blocked.map((issue) => [issue.code, issue.newly]), [[INVARIANT, false]], '照记下的结果报告');
+    const again = await prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
+    assert.deepEqual(again.sources, [], '不再准备');
+  });
+});
+
+test('不变量在会话里才查出（来源里一个对话的项目链接换了 id：试算只比 id，写入时撞上“每个对话一条”的唯一约束）：整份回滚，按受阻入账，下次启动不再准备', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }));
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'merged');
+  rawWrite(fixture.alpha, (source) => {
+    source.prepare("UPDATE conversation_project_link SET id = 'alpha_relinked' WHERE conversation_id = 'alpha_conversation_1'").run();
+  });
+  const before = readAll(fixture.current);
+  const { preparation, session } = await prepareAndRun(fixture, LIMITS, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.equal(preparation.sources.length, 1, '试算没有发现');
+  assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['blocked', INVARIANT]]);
+  assert.match(session.results[0].issue.message, /当前库不接受的数据[\s\S]*UNIQUE constraint failed: conversation_project_link\.conversation_id/);
+  assert.deepEqual(readAll(fixture.current), before, '整份回滚');
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.deepEqual([record.state, record.code], ['blocked', INVARIANT]);
+  assert.deepEqual(await ledgerEntries(fixture, 'commits'), []);
+
+  await withWindow(fixture, async (window) => {
+    const batch = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
+    assert.deepEqual(batch.deferred, [], '不再等待大库会话');
+    const again = await prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
+    assert.deepEqual(again.sources, [], '不再准备');
+  });
+});
+
+test('不变量在提交时才查出（来源给当前库里已有的请求多加了一次尝试，试算只查它要新插入的请求）：提交时的聚合断言拒绝，整份回滚，按受阻入账', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }));
+  const request = 'alpha_conversation_0_request_completed';
+  rawWrite(fixture.alpha, (source) => {
+    source.prepare(`INSERT INTO attempt (id, operation_id, attempt_seq, status, created_at, updated_at, completed_at)
+      VALUES (?, ?, 2, 'completed', ?, ?, ?)`).run(`${request}_attempt_2`, `${request}_operation`, NOW, NOW, NOW);
+  });
+  const before = readAll(fixture.current);
+  const { preparation, session } = await prepareAndRun(fixture, LIMITS, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.equal(preparation.sources.length, 1);
+  assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['blocked', INVARIANT]]);
+  assert.match(session.results[0].issue.message, new RegExp(`ModelRequest ${request} current Attempt must be the contiguous tail`));
+  assert.deepEqual(readAll(fixture.current), before, '整份回滚');
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'blocked');
+});
+
+test('写入出错但不是数据本身的问题（本线程的错误、忙、断言当前库状态失败）：照旧推迟、不入账，以后再合并', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  const append = kernel.RuntimeDatabase.prototype.maintenanceAppend;
+  t.after(() => { kernel.RuntimeDatabase.prototype.maintenanceAppend = append; });
+  const failures = [
+    ['runtime-data-set-merge-failed', () => new Error('RuntimeDatabase is closed.')],
+    ['SQLITE_BUSY', () => new RuntimeDatabaseWorkerError({ name: 'SqliteError', message: 'database is locked', code: 'SQLITE_BUSY' })],
+    ['RUNTIME_TRANSACTION_ASSERTION_FAILED', () => new RuntimeDatabaseWorkerError({ name: 'Error', message: 'Conversation row changed', code: 'RUNTIME_TRANSACTION_ASSERTION_FAILED' })]
+  ];
+  for (const [code, failure] of failures) {
+    let calls = 0;
+    kernel.RuntimeDatabase.prototype.maintenanceAppend = async function appendThenFail(...args) {
+      if (++calls === 2) throw failure();
+      return append.apply(this, args);
+    };
+    const { session } = await prepareAndRun(fixture, LIMITS);
+    assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['deferred', code]]);
+    assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, `${code}：不入账`);
+  }
+});
+
+test('试算里读来源副本本身出错（SQLite 的 I/O 错误）不算数据不被接受：这份推迟，不入账', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  const SqliteDatabase = require(require.resolve('better-sqlite3', { paths: [path.join(compiled, 'backend/reliableKernel')] }));
+  const prepare = SqliteDatabase.prototype.prepare;
+  t.after(() => { SqliteDatabase.prototype.prepare = prepare; });
+  let failed = 0;
+  SqliteDatabase.prototype.prepare = function prepareOrFail(sql, ...rest) {
+    if (this.readonly && sql === 'SELECT * FROM model_request WHERE id = ?') {
+      failed += 1;
+      throw Object.assign(new Error('disk I/O error'), { code: 'SQLITE_IOERR' });
+    }
+    return prepare.call(this, sql, ...rest);
+  };
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+  }));
+  assert.ok(failed > 0, '试算读到了请求');
+  assert.deepEqual(preparation.sources, []);
+  assert.deepEqual(preparation.report.blocked, []);
+  assert.deepEqual(preparation.report.deferred.map((issue) => issue.code), ['SQLITE_IOERR']);
+  assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined);
+});
+
+test('会话里发现冲突就停：回滚后不再读这份来源的其余部分，拒绝里写明“至少”几处', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => fs.rm(fixture.root, { recursive: true, force: true }));
+  await seedRichSource(fixture.alpha, 'alpha', 4);
+  const snapshot = kernel.RuntimeDatabase.prototype.snapshot;
+  let streaming = false;
+  let reads = 0;
+  kernel.RuntimeDatabase.prototype.snapshot = function countedSnapshot(...args) {
+    if (streaming) reads += 1;
+    return snapshot.apply(this, args);
+  };
+  t.after(() => { kernel.RuntimeDatabase.prototype.snapshot = snapshot; });
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+  }));
+  // Another window, before its reload, created the first conversation here with other content.
+  await seedConversations(fixture.current, [{ id: 'alpha_conversation_0', title: 'changed here meanwhile' }]);
+  const before = readAll(fixture.current);
+  const session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+    () => runLargeMergeSession({
+      paths: fixture.paths, prepared: preparation,
+      options: { onFaultPoint: (point) => { if (point === 'after-committing') streaming = true; } }
+    })));
+  assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['blocked', 'runtime-data-set-merge-conflict']]);
+  assert.match(session.results[0].issue.message, /至少有 1 处同一条记录但内容不同[\s\S]*Conversation#alpha_conversation_0 字段不同：title/);
+  assert.deepEqual(readAll(fixture.current), before, '整份回滚');
+  const chunks = Math.ceil(preparation.sources[0].rows / LIMITS.chunkRows);
+  assert.ok(chunks >= 15, `来源约 ${chunks} 块`);
+  // Measured: the chunks up to the conversations and the rolled-back rows' presence (4 of about 19 reading on).
+  assert.ok(reads <= 6, `发现冲突之后不再读（会话读了 ${reads} 次当前库，整份约 ${chunks} 块）`);
 });
 
 // ---------------------------------------------------------------------------------------------

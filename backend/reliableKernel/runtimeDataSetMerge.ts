@@ -1791,12 +1791,15 @@ function checkPlan(
   return { rows: size.rows, oversized };
 }
 
-/** Same ids with other content in source and target: the whole source is refused, nothing written. */
-function conflictRefusal(conflicts: { count: number; samples: readonly string[] }, state: SourceProgress): Refusal {
+/**
+ * Same ids with other content in source and target: the whole source is refused, nothing written.
+ * `partial`: counted until the merge stopped at them (a large-merge session reads no further).
+ */
+function conflictRefusal(conflicts: { count: number; samples: readonly string[] }, state: SourceProgress, partial = false): Refusal {
   return {
     kind: 'blocked',
     code: 'runtime-data-set-merge-conflict',
-    message: `这份旧聊天记录与当前历史库有 ${conflicts.count} 处同一条记录但内容不同（例如合并之后又在其中一边改动了同一对话），整体未合并，`
+    message: `这份旧聊天记录与当前历史库${partial ? '至少' : ''}有 ${conflicts.count} 处同一条记录但内容不同（例如合并之后又在其中一边改动了同一对话），整体未合并，`
       + `${state.finalized ? '当前库没有改动' : '两边内容都没有改动'}。`
       + (state.foreign
         ? '同一个库的另一份拷贝先合并进来之后，这一份又有了不同的改动时也是这样。可以在“外来历史库”里只读查看它，再决定保留哪一份。'
