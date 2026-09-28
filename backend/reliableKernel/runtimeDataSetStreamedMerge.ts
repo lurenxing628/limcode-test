@@ -10,13 +10,15 @@ import type { HistoricalRootBinding } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   HISTORICAL_MERGE_ENGINE as engine, planMergeChunk, RuntimeDataSetMergeEvidence, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
-  type HistoricalMergeRowPlan, type HistoricalMergeSourceMode, type HistoricalMergeSourceOutcome, type HistoricalMergeSourceProgress,
+  type ForeignHistoricalMergeCandidate, type ForeignHistoricalMergeHold, type HistoricalMergeCandidate,
+  type HistoricalMergePickedSource, type HistoricalMergeRowPlan, type HistoricalMergeSourceMode, type HistoricalMergeSourceOutcome, type HistoricalMergeSourceProgress,
   type HistoricalMergeTargetContext, type RuntimeDataSetCasTransfer, type RuntimeDataSetCasVerification,
   type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeChunkSink, type RuntimeDataSetMergeFaultPoint,
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeOptions, type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
+import { holdForeignHistoricalMergeSource } from './runtimeForeignHistoryMerge';
 import { locateLocalRuntimeDataSet, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import {
   readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeCommit,
@@ -28,7 +30,9 @@ import {
 } from './runtimeDataSetMergeLedger';
 import { describeUnfinishedWork, hasFinalizableWork } from './runtimeDataSetMergeWork';
 import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
-import { createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
+import {
+  createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet, type RuntimeDataSetDatabaseSnapshot
+} from './runtimeStorageInspection';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 import { createVscodeRootAuthority, inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet } from './vscodeRootAuthority';
 
@@ -118,19 +122,25 @@ export interface LargeMergeEngineOptions extends Omit<RuntimeDataSetMergeOptions
 /**
  * How a session finds and fences one source, as a LocatedRuntimeRoot: its `located` paths serve every
  * copy, file state, claim and CAS read, its `recorded` binding only as the identity fence. The session
- * holds the root's fence (withLocatedRuntimeRootFence: a local data set's maintenance claim) around
- * its check, copy and transaction. Local data sets of this configuration root resolve here; a foreign
- * history library registered in place can come in through the same seam.
+ * holds the root's fence around its check, copy and transaction: a local data set's maintenance claim,
+ * or a foreign history root's claim, which its preparation took and holds until the session released
+ * it (runtimeForeignHistoryMerge); nothing is ever claimed inside a foreign directory.
  */
 export interface HistoricalMergeSourceResolver {
   /** The source located again from where it was found; throws when it is gone or no complete data set. */
   locate(candidateId: string): Promise<LocatedRuntimeRoot>;
+  /** Runs `operation` under the root's fence (never takes a foreign root's claim anew: its hold has it). */
+  fence<T>(root: LocatedRuntimeRoot, operation: () => Promise<T>): Promise<T>;
+  /** The source as the engine steps take it (a local candidate, or the foreign root its hold verified). */
+  candidate(root: LocatedRuntimeRoot): Promise<HistoricalMergeCandidate>;
   /**
    * Inside the configuration admission and the root's fence: no Host uses the source and it is exactly
-   * the audited state (recorded identity, root generation, pointer revision, file state at `located`).
-   * Throws the merge refusal otherwise.
+   * the audited state (recorded identity, root generation, pointer revision, epoch manifest, file state
+   * at `located`). Throws the merge refusal otherwise.
    */
   assertUnchanged(root: LocatedRuntimeRoot, check: SourceCheck): Promise<void>;
+  /** A private copy of the source's database, fenced by its recorded binding. */
+  snapshot(root: LocatedRuntimeRoot): Promise<RuntimeDataSetDatabaseSnapshot>;
 }
 
 interface SourceCheck {
@@ -145,9 +155,49 @@ export function localHistoricalMergeSources(paths: { globalStoragePath: string }
   const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
   return {
     locate: (candidateId) => locateLocalRuntimeDataSet(storagePaths, candidateId),
+    fence: (root, operation) => withLocatedRuntimeRootFence(storagePaths, root, operation),
+    candidate: (root) => resolveVscodeRuntimeDataSet(storagePaths, root.id),
     async assertUnchanged(root, check) {
       const candidate = await resolveVscodeRuntimeDataSet(storagePaths, root.id);
       await engine.assertSourceUnchanged(check.paths, check.target, candidate, locatedBinding(root), check.state, check.mode);
+    },
+    snapshot: (root) => createLocatedRuntimeDatabaseSnapshot(root)
+  };
+}
+
+/**
+ * Local data sets, and the foreign history roots whose claims a preparation holds (`held`). A foreign
+ * root is only ever read through its hold, and checked against the root its preparation verified:
+ * still the same place, records and exact file state.
+ */
+export function historicalMergeSources(
+  paths: { globalStoragePath: string },
+  held: (candidateId: string) => ForeignHistoricalMergeHold | undefined
+): HistoricalMergeSourceResolver {
+  const local = localHistoricalMergeSources(paths);
+  const verified = (root: LocatedRuntimeRoot): { hold: ForeignHistoricalMergeHold; candidate: ForeignHistoricalMergeCandidate } => {
+    const hold = held(root.id);
+    if (!hold?.verified) {
+      throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '这个外来历史库的准备已不在，本次不合并。' });
+    }
+    return { hold, candidate: hold.verified };
+  };
+  return {
+    async locate(candidateId) {
+      const hold = held(candidateId);
+      return hold ? (await hold.locate()).root : local.locate(candidateId);
+    },
+    fence: (root, operation) => root.origin.kind === 'foreign' ? verified(root).hold.fence(operation) : local.fence(root, operation),
+    candidate: async (root) => root.origin.kind === 'foreign' ? verified(root).candidate : local.candidate(root),
+    async assertUnchanged(root, check) {
+      if (root.origin.kind !== 'foreign') return local.assertUnchanged(root, check);
+      const { candidate } = verified(root);
+      await engine.assertSourceUnchanged(check.paths, check.target, candidate, engine.foreignBinding(candidate), check.state, check.mode);
+    },
+    snapshot: (root) => {
+      if (root.origin.kind !== 'foreign') return local.snapshot(root);
+      const { hold, candidate } = verified(root);
+      return hold.snapshot(candidate);
     }
   };
 }
@@ -551,8 +601,10 @@ export interface LargeMergeSpace {
 
 export interface PreparedLargeMergeSource {
   candidateId: string;
+  /** A foreign history root's readable name (its id is not). */
+  label?: string;
   sourceDataSetId: string;
-  /** Where the source is (its Runtime data root), for details the user can open. */
+  /** Where the source is (its Runtime data root, located), for details the user can open. */
   runtimeDataRootPath: string;
   /** Content digest of the source state this preparation judged (every table, every row): a coordination key part. */
   fingerprint: string;
@@ -609,6 +661,7 @@ interface PreparationInternals {
 }
 
 interface PreparedInternals {
+  /** A foreign history root's claim is in it (`foreign`), held from this preparation until the session released it. */
   state: HistoricalMergeSourceProgress;
   casVerification: RuntimeDataSetCasVerification;
 }
@@ -644,9 +697,10 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
   try {
     for (const [index, picked] of sources.entries()) {
       if (!keepGoing()) break;
-      const candidateId = picked.candidate.id;
+      const candidateId = picked.id;
       const issue = (outcome: { code: string; message: string; awaiting?: { rows: number; bytes: number } }): RuntimeDataSetMergeIssue => ({
-        candidateId, code: outcome.code, message: outcome.message, newly: true, requested: picked.requested
+        candidateId, code: outcome.code, message: outcome.message, newly: true, requested: picked.requested,
+        ...(picked.label ? { label: picked.label } : {})
       });
       if (!await internals.claims.claim(candidateId)) {
         report.deferred.push(issue({ code: 'runtime-data-set-merge-preparing-elsewhere', message: '另一个窗口正在准备合并这份较大的旧聊天记录，由那个窗口完成。' }));
@@ -657,13 +711,20 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       });
       const mode: HistoricalMergeSourceMode = { finalizeWork: true, requested: picked.requested, pickedAt };
       const sourceInternals: PreparedInternals = { state: {}, casVerification: new Map() };
+      const held = await holdForeignSource(paths, picked, sourceInternals.state);
+      if (held !== true) {
+        await internals.claims.release(candidateId);
+        if (held.kind !== 'stopped') report.deferred.push(issue(held));
+        continue;
+      }
       const outcome = await engine.runSourceAttempt<PreparedOutcome>(paths, target, candidateId, mode,
         (state) => prepareSource(paths, target, candidateId, mode, state, sourceInternals, input, progress), sourceInternals.state);
       if (outcome.kind === 'prepared') {
-        prepared.push(outcome.source);
+        prepared.push(picked.label ? { ...outcome.source, label: picked.label } : outcome.source);
         internals.sources.set(candidateId, sourceInternals);
         continue;
       }
+      await sourceInternals.state.foreign?.release();
       await internals.claims.release(candidateId);
       if (outcome.kind === 'small') {
         small.push(candidateId);
@@ -684,6 +745,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       }
     }
   } catch (error) {
+    await releaseHolds(internals);
     await internals.claims.releaseAll();
     throw error;
   }
@@ -717,8 +779,32 @@ export async function releaseLargeMergePreparation(preparation: LargeMergePrepar
   const internals = PREPARATIONS.get(preparation);
   if (!internals || internals.released) return;
   internals.released = true;
+  await releaseHolds(internals);
   await internals.claims.releaseAll();
   await removeUnusedBackup(preparation, internals);
+}
+
+/**
+ * A foreign history root's claim, taken before any of its admission-taking steps and kept in its
+ * state until the session released it; true when there is none to take or it is held now.
+ */
+async function holdForeignSource(
+  paths: { globalStoragePath: string },
+  picked: HistoricalMergePickedSource,
+  state: HistoricalMergeSourceProgress
+): Promise<true | ReturnType<typeof engine.sourceOutcome>> {
+  if (!picked.foreign) return true;
+  try {
+    state.foreign = await holdForeignHistoricalMergeSource(paths, picked.id, picked.foreign);
+    return true;
+  } catch (error) {
+    return engine.sourceOutcome(error, {});
+  }
+}
+
+/** Lets go of every foreign root's claim a preparation still holds. */
+async function releaseHolds(internals: PreparationInternals): Promise<void> {
+  for (const source of internals.sources.values()) await source.state.foreign?.release();
 }
 
 /** The preparation's online target backup, which no transaction used: removed (as settleTargetBackup does). */
@@ -747,7 +833,7 @@ async function prepareSource(
     if (input.signal?.aborted) throw new engine.StopRequested();
   };
   stopIfAsked();
-  const earlier = await readRuntimeDataSetMergeFinalization(paths, await resolveVscodeRuntimeDataSet(paths, candidateId));
+  const earlier = await readRuntimeDataSetMergeFinalization(paths, await engine.sourceCandidate(paths, candidateId, state));
   if (earlier) {
     state.finalized = {
       turnIds: earlier.turnIds, intentIds: earlier.intentIds, turns: earlier.turns, intents: earlier.intents,
@@ -971,7 +1057,7 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
     );
     const target = engine.targetContext({ configurationRootPath: preparation.configurationRootPath, database });
     if (preparation.backupPath) target.backup = { path: preparation.backupPath };
-    const resolver = localHistoricalMergeSources(paths);
+    const resolver = historicalMergeSources(paths, (candidateId) => internals.sources.get(candidateId)?.state.foreign);
     const clock = new SessionClock(preparation, input.onProgress);
     try {
       for (const [index, prepared] of preparation.sources.entries()) {
@@ -987,11 +1073,12 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
           (state) => mergePreparedSource(paths, target, resolver, prepared, sourceInternals.casVerification, state, mode, options, input.signal,
             clock.source(index, prepared)), { ...sourceInternals.state });
         clock.sourceDone(prepared);
-        const result = sourceResult(prepared.candidateId, outcome, internals.requested);
+        const result = sourceResult(prepared.candidateId, outcome, internals.requested, prepared.label);
         results.results.push(result);
         if (result.state === 'merged' || result.state === 'current' || result.state === 'blocked' || result.state === 'failed') {
           await removeRuntimeDataSetMergeRequest(paths, prepared.candidateId).catch(() => undefined);
         }
+        await sourceInternals.state.foreign?.release();
         await internals.claims.release(prepared.candidateId);
         if (result.state === 'deferred' && result.issue.code === RUNTIME_DATA_SET_MERGE_CANCELLED) {
           results.cancelled = true;
@@ -1010,6 +1097,7 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
     }
   } finally {
     internals.released = true;
+    await releaseHolds(internals);
     await internals.claims.releaseAll();
     // Nothing ran (no room on the disk, or the private instance did not open): no transaction used it.
     if (!backupSettled) await removeUnusedBackup(preparation, internals);
@@ -1018,13 +1106,14 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
   return results;
 }
 
-function sourceResult(candidateId: string, outcome: HistoricalMergeSourceOutcome, requested: boolean): LargeMergeSourceResult {
+function sourceResult(candidateId: string, outcome: HistoricalMergeSourceOutcome, requested: boolean, label?: string): LargeMergeSourceResult {
   if (outcome.kind === 'merged') return { candidateId, state: 'merged', result: outcome.result };
   if (outcome.kind === 'current') return { candidateId, state: 'current', result: outcome.result };
+  const named = label ? { label } : {};
   if (outcome.kind === 'stopped') {
-    return { candidateId, state: 'deferred', issue: { candidateId, code: RUNTIME_DATA_SET_MERGE_CANCELLED, message: '合并已停止。', newly: true, requested } };
+    return { candidateId, state: 'deferred', issue: { candidateId, code: RUNTIME_DATA_SET_MERGE_CANCELLED, message: '合并已停止。', newly: true, requested, ...named } };
   }
-  return { candidateId, state: outcome.kind, issue: { candidateId, code: outcome.code, message: outcome.message, newly: true, requested } };
+  return { candidateId, state: outcome.kind, issue: { candidateId, code: outcome.code, message: outcome.message, newly: true, requested, ...named } };
 }
 
 /** Progress of a session: throttled, with the remaining time from the rate measured so far. */
@@ -1091,7 +1180,7 @@ async function mergePreparedSource(
   const root = await resolver.locate(candidateId).catch(changed);
   const done: { outcome?: HistoricalMergeSourceOutcome } = {};
   try {
-    return await withLocatedRuntimeRootFence(paths, root, async () => {
+    return await resolver.fence(root, async () => {
       done.outcome = await mergeLocked(paths, target, resolver, root, prepared, verified, state, mode, options, signal, progress);
       return done.outcome;
     });
@@ -1117,7 +1206,7 @@ async function mergeLocked(
 ): Promise<HistoricalMergeSourceOutcome> {
   const { candidateId } = prepared;
   await resolver.assertUnchanged(root, { paths, target, state, mode });
-  const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
+  const candidate = await resolver.candidate(root);
   const previous = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
   if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
     if (previous.state === 'committing') {
@@ -1128,7 +1217,7 @@ async function mergeLocked(
     }
   }
   progress('copying', 0);
-  const copy = await createLocatedRuntimeDatabaseSnapshot(root);
+  const copy = await resolver.snapshot(root);
   try {
     // Under the source's fence with no Host on it the files cannot change: the audit's conclusions hold.
     if (await runtimeDataSetFileState(root.located.databasePath) !== state.files) {

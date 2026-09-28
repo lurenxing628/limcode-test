@@ -47,7 +47,7 @@ export interface LargeMergeWaitingSource {
 
 export interface LargeMergePreparedSource {
   candidateId: string;
-  /** For the user: the project names the candidate list read, else the kind of history (no id). */
+  /** For the user: the project names the candidate list read, else the kind of history, or a foreign history root's name (no id). */
   label?: string;
   /** Where the source is, for the details the user can open. */
   runtimeDataRootPath?: string;
@@ -185,7 +185,8 @@ const STREAMED_MERGE_ENGINE: LargeMergeEngine = Object.freeze<LargeMergeEngine>(
     return {
       sources: prepared.sources.map((source) => ({
         candidateId: source.candidateId,
-        ...(labels.has(source.candidateId) ? { label: labels.get(source.candidateId)! } : {}),
+        // A foreign history root is no local candidate: the engine names it (PreparedLargeMergeSource.label).
+        ...(labels.has(source.candidateId) ? { label: labels.get(source.candidateId)! } : source.label ? { label: source.label } : {}),
         runtimeDataRootPath: source.runtimeDataRootPath,
         fingerprint: source.fingerprint,
         rows: source.rows,

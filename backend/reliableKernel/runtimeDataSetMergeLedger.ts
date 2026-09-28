@@ -3,6 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { readRuntimeDataSetFacts, runtimeDataSetFileState } from './runtimeDataSetFacts';
+import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
 import { requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import { resolveVscodeRuntimeMergeLedgerRoot, type VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
 
@@ -27,6 +28,8 @@ const FINALIZATIONS = 'finalizations';
 const PREPARATIONS = 'preparing';
 /** Content digest prefix of a data set whose content could not be read (see runtimeDataSetFingerprint). */
 const UNREADABLE_DIGEST = 'unreadable:';
+/** The id of a foreign history root (runtimeForeignHistory.foreignRuntimeHistoryId). */
+const FOREIGN_ID = /^foreign:(archive|copied):[0-9a-f]{16}$/;
 
 type StoragePaths = { globalStoragePath: string };
 
@@ -111,6 +114,17 @@ export interface RuntimeDataSetMergeLedgerRequest {
   expectedRootInstanceId: string;
   target: RuntimeDataSetIdentity;
   requestedAt: string;
+  /**
+   * A foreign history root (candidateId is its foreign id): where it was found and its readable name.
+   * Only a request makes such a root a merge source; it is never enumerated like a data set.
+   */
+  foreign?: RuntimeDataSetMergeForeignSource;
+}
+
+/** Where a requested foreign history root was found (runtimeForeignHistory discovery), and its name. */
+export interface RuntimeDataSetMergeForeignSource {
+  location: ForeignRuntimeRootLocation;
+  label: string;
 }
 
 /**
@@ -216,6 +230,30 @@ export async function rememberRuntimeDataSetFingerprint(
 ): Promise<void> {
   await writeLedgerJson({ globalStoragePath: candidate.configurationRootPath }, FINGERPRINTS, candidate.id,
     { kind: FINGERPRINT_KIND, candidateId: candidate.id, files, fingerprint });
+}
+
+/**
+ * The fingerprint cached under this configuration root for a root read in place (a foreign history
+ * root, by its id): only for exactly these database files and this identity. Never reads the root.
+ */
+export async function cachedRuntimeRootFingerprint(
+  paths: StoragePaths,
+  id: string,
+  files: string,
+  identity: Omit<RuntimeDataSetFingerprint, 'contentDigest'>
+): Promise<RuntimeDataSetFingerprint | undefined> {
+  const cached = await readFingerprintCache(paths, id).catch(() => undefined);
+  return cached?.files === files && sameFingerprintIdentity(cached.fingerprint, fingerprintIdentity(identity)) ? cached.fingerprint : undefined;
+}
+
+/** Caches, under this configuration root, a fingerprint computed on a private copy of exactly `files` of a root read in place. */
+export async function rememberRuntimeRootFingerprint(
+  paths: StoragePaths,
+  id: string,
+  files: string,
+  fingerprint: RuntimeDataSetFingerprint
+): Promise<void> {
+  await writeLedgerJson(paths, FINGERPRINTS, id, { kind: FINGERPRINT_KIND, candidateId: id, files, fingerprint });
 }
 
 export function sameRuntimeDataSetFingerprint(left: RuntimeDataSetFingerprint, right: RuntimeDataSetFingerprint | undefined): boolean {
@@ -374,6 +412,11 @@ export async function readRuntimeDataSetMergeRequests(paths: StoragePaths): Prom
     if (request?.kind !== REQUEST_KIND || typeof request.candidateId !== 'string' || fileName(request.candidateId) !== name
       || typeof request.expectedDataSetId !== 'string' || typeof request.expectedRootInstanceId !== 'string'
       || !request.target) continue;
+    // A foreign root is found only where its request says: without a complete location it is no request,
+    // and only a foreign id names one (runtimeForeignHistory ids never collide with a data set's).
+    const foreign = request.foreign as Partial<RuntimeDataSetMergeForeignSource> | undefined;
+    if (FOREIGN_ID.test(request.candidateId) !== (foreign !== undefined)) continue;
+    if (foreign !== undefined && (typeof foreign?.label !== 'string' || !isForeignLocation(foreign.location))) continue;
     result.set(request.candidateId, request as RuntimeDataSetMergeLedgerRequest);
   }
   return result;
@@ -384,6 +427,15 @@ export async function writeRuntimeDataSetMergeRequest(
   request: Omit<RuntimeDataSetMergeLedgerRequest, 'kind' | 'requestedAt'>
 ): Promise<void> {
   await writeLedgerJson(paths, REQUESTS, request.candidateId, { kind: REQUEST_KIND, ...request, requestedAt: new Date().toISOString() });
+}
+
+function isForeignLocation(value: unknown): value is ForeignRuntimeRootLocation {
+  const location = value as Partial<ForeignRuntimeRootLocation> | null | undefined;
+  return !!location && (location.kind === 'archive' || location.kind === 'copied')
+    && typeof location.containerPath === 'string' && typeof location.containerName === 'string'
+    && typeof location.dataRootRelativePath === 'string'
+    && (location.side === undefined || location.side === 'current' || location.side === 'previous')
+    && (location.baseDataRootPath === undefined || typeof location.baseDataRootPath === 'string');
 }
 
 export async function removeRuntimeDataSetMergeRequest(paths: StoragePaths, candidateId: string): Promise<void> {

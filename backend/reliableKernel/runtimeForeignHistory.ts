@@ -12,8 +12,8 @@ import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocation';
 import { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
 import {
-  judgeRuntimeHostLivenessRecords, RuntimeClaimHeldError, runtimeHostLivenessDirectory, RuntimeMaintenanceBusyError,
-  withRuntimeClaimAtPath, withRuntimeMaintenance, type RuntimeMaintenanceMetadata
+  isRuntimeDataRootAdmissionHeld, judgeRuntimeHostLivenessRecords, RuntimeClaimHeldError, runtimeHostLivenessDirectory,
+  RuntimeMaintenanceBusyError, withRuntimeClaimAtPath, withRuntimeMaintenance, type RuntimeMaintenanceMetadata
 } from './runtimeHostControl';
 import {
   locateLocalRuntimeDataSet, sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot
@@ -53,10 +53,11 @@ import {
  * and never a file that is the same inode as a file of a database this process may hold SQLite
  * (POSIX fcntl) locks on: closing any descriptor of such a file drops those locks.
  *
- * A foreign root is like a data set the user kept: never merged automatically (merging is for a
- * later version), never selectable, never finalized or upgraded. Roots that fail are listed with
- * name, location, size and reason and kept as they are; a full disk, a failed copy or a root that
- * keeps changing is "not verifiable now".
+ * A foreign root is like a data set the user kept: merged into the current data set only when the
+ * user asks for it (runtimeForeignHistoryMerge, which holds this root's claim from preparation to
+ * commit and writes its ledger under the current configuration root), never selectable, never
+ * finalized or upgraded. Roots that fail are listed with name, location, size and reason and kept as
+ * they are; a full disk, a failed copy or a root that keeps changing is "not verifiable now".
  */
 
 export type ForeignRuntimeHistoryStatus = 'verified' | 'failed' | 'unavailable';
@@ -176,6 +177,11 @@ export function foreignRuntimeHistoryId(
     fold(location.containerName), fold(location.dataRootRelativePath), identity?.dataSetId ?? '', identity?.rootInstanceId ?? ''
   ].join('\0')).digest('hex');
   return `foreign:${location.kind}:${digest.slice(0, 16)}`;
+}
+
+/** Whether `id` names a foreign history root (see foreignRuntimeHistoryId), never a local data set. */
+export function isForeignRuntimeHistoryId(id: string): boolean {
+  return FOREIGN_ID.test(id);
 }
 
 /**
@@ -678,30 +684,43 @@ export async function copyForeignRuntimeSqliteFiles(
  * and O_NONBLOCK, and read only while the descriptor is that same regular file within the limit.
  */
 export async function readLocatedRuntimeFile(file: string, held: HeldDatabaseFiles, maxBytes: number): Promise<Buffer> {
+  const handle = await openLocatedRuntimeFile(file, held, maxBytes);
+  try { return await handle.readFile(); }
+  finally { await handle.close(); }
+}
+
+/**
+ * The descriptor of a regular file of a located root, opened exactly as readLocatedRuntimeFile opens
+ * it (lstat first, O_NOFOLLOW and O_NONBLOCK, the descriptor checked to be that same regular file,
+ * never a file of a database this process holds). The caller reads it and closes it. `maxBytes` bounds
+ * a record; a content object passes none.
+ */
+export async function openLocatedRuntimeFile(file: string, held: HeldDatabaseFiles, maxBytes?: number): Promise<fs.FileHandle> {
   const info = await fs.lstat(file, { bigint: true });
   if (!info.isFile()) {
     throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-special-file',
       `${path.basename(file)} 不是普通文件（符号链接、管道或设备），不跟随链接、也不打开它。`);
   }
   if (held.has(`${info.dev}:${info.ino}`)) throw openDatabase(file);
-  if (info.size > BigInt(maxBytes)) {
+  if (maxBytes !== undefined && info.size > BigInt(maxBytes)) {
     throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-file-too-large', `${path.basename(file)} 超过 ${maxBytes} 字节，不是 LimCode 写下的记录。`);
   }
   const handle = await fs.open(file, OPEN_READ_ONLY);
-  let retained = false;
+  let kept = false;
   try {
     const opened = await handle.stat({ bigint: true });
     if (held.has(`${opened.dev}:${opened.ino}`)) {
       RETAINED_HANDLES.push(handle);
-      retained = true;
+      kept = true;
       throw openDatabase(file);
     }
-    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino || opened.size > BigInt(maxBytes)) {
+    if (!opened.isFile() || opened.dev !== info.dev || opened.ino !== info.ino || (maxBytes !== undefined && opened.size > BigInt(maxBytes))) {
       throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-changed', `${path.basename(file)} 在读取时被替换了，稍后再试。`);
     }
-    return await handle.readFile();
+    kept = true;
+    return handle;
   } finally {
-    if (!retained) await handle.close();
+    if (!kept) await handle.close();
   }
 }
 
@@ -1036,7 +1055,7 @@ async function assertNoUnfinishedRelocationOrMerge(
   }
   for (const name of names) {
     let record: {
-      kind?: unknown; state?: unknown;
+      kind?: unknown; state?: unknown; candidateId?: unknown;
       source?: { dataSetId?: unknown; rootInstanceId?: unknown }; target?: { dataSetId?: unknown; rootInstanceId?: unknown };
     } | null;
     try { record = JSON.parse(await readForeignFile(path.join(directory, name), held)) as typeof record; }
@@ -1047,7 +1066,10 @@ async function assertNoUnfinishedRelocationOrMerge(
       throw await readProblem(error, ledgerRoot, 'foreign-history-merge-ledger', '合并记录无法读取。');
     }
     if (record?.kind !== MERGE_LEDGER_RECORD_KIND || record.state !== 'committing') continue;
-    if ([record.source, record.target].some((identity) =>
+    // A merge out of a foreign root (keyed by its foreign id) only ever read that root: its unsettled
+    // outcome concerns the data set it merged into, never the content of a root with its identity.
+    const merged = typeof record.candidateId === 'string' && FOREIGN_ID.test(record.candidateId) ? [record.target] : [record.source, record.target];
+    if (merged.some((identity) =>
       identity?.dataSetId === recorded.dataSetId && identity.rootInstanceId === recorded.rootInstanceId)) {
       throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-unfinished-merge',
         '它参与的一次合并还没有确认是否写入完成；只能由原来的 LimCode 收尾，原样保留。');
@@ -1214,6 +1236,51 @@ async function cachedTreeSize(
   return size;
 }
 
+/** One foreign root's claim (the one withLocatedRuntimeRootFence takes), held until released. */
+export interface ForeignRuntimeRootClaimHold {
+  /** True from acquisition until release. */
+  readonly held: boolean;
+  release(): Promise<void>;
+}
+
+/**
+ * Takes a foreign root's claim and keeps it across calls and async scopes until released: a merge
+ * holds it from its (large-merge) preparation to its commit, so verification, viewing and backup
+ * cleanup of the same root wait for it or refuse meanwhile. Waits as the fence does (a live holder is
+ * awaited, a dead one's claim isolated). Never taken inside this configuration root's admission (its
+ * holder takes the admission after it); code running under a hold never takes the same root's fence
+ * again, which from another async scope would wait for the hold itself.
+ */
+export async function holdForeignRuntimeRootClaim(
+  paths: { globalStoragePath: string },
+  id: string,
+  targetPath: string
+): Promise<ForeignRuntimeRootClaimHold> {
+  const configurationRoot = path.resolve(paths.globalStoragePath);
+  if (isRuntimeDataRootAdmissionHeld(configurationRoot)) {
+    throw new Error('A foreign history root is claimed before the configuration admission, never inside it.');
+  }
+  const claimPath = await foreignRuntimeHistoryFile(configurationRoot, CLAIMS_DIRECTORY, id, '');
+  let acquired!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => { acquired = resolve; });
+  const released = new Promise<void>((resolve) => { release = resolve; });
+  const state = { held: false };
+  const holder = withRuntimeClaimAtPath(claimPath, targetPath, async () => {
+    state.held = true;
+    acquired();
+    await released;
+  }).finally(() => { state.held = false; });
+  await Promise.race([started, holder]);
+  return {
+    get held() { return state.held; },
+    async release() {
+      release();
+      await holder.catch((error: unknown) => console.warn('[LimCode] 释放外来历史库的声明失败。', error));
+    }
+  };
+}
+
 /** `.limcode-runtime-merges/<section>/<id with ':' → '-'><suffix>` under the current configuration root only. */
 async function foreignRuntimeHistoryFile(configurationRootPath: string, section: string, id: string, suffix: string): Promise<string> {
   if (!FOREIGN_ID.test(id)) throw new TypeError(`Not a foreign history id: ${id}`);
@@ -1224,7 +1291,7 @@ async function foreignRuntimeHistoryFile(configurationRootPath: string, section:
 }
 
 /** Exact state of what the audit read: database and WAL, pointer and manifest, and the records themselves. */
-async function foreignFileState(root: LocatedRuntimeRoot): Promise<string> {
+export async function foreignFileState(root: LocatedRuntimeRoot): Promise<string> {
   const describe = async (file: string): Promise<string> => {
     const stat: BigIntStats = await fs.stat(file, { bigint: true });
     return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
