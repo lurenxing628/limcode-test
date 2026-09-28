@@ -447,6 +447,38 @@ test('真的写满的磁盘（审查 #10：不是故障点模拟）：配置根�
   assert.deepEqual(seen.again, ['merged', 'merged'], '腾出空间后两份都合并');
 });
 
+test('会话里一份来源撤回之后（它的事务已把页溢出写进预写日志），下一份开始之前预写日志已还给磁盘；下一份照常合并', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot({ beta: true });
+  t.after(() => removeConfigurationRoot(fixture.root));
+  const { generateSyntheticSource } = await import('./fixtures/runtime-merge-fixture.mjs');
+  // Large enough that the transaction's pages spill out of the maintenance writer's 4 MiB page cache into the WAL.
+  await generateSyntheticSource(fixture.alpha, { rows: 50_000, prefix: 'synthetic' });
+  await seedRichSource(fixture.beta, 'beta', 3);
+  const wal = `${fixture.current.binding.paths.databasePath}-wal`;
+  const walBytes = () => fs.stat(wal).then((info) => info.size, () => 0);
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: { sizeLimits: LIMITS.sizeLimits }
+  }));
+  assert.deepEqual(preparation.sources.map((source) => source.candidateId), [fixture.alpha.id, fixture.beta.id]);
+  const seen = {};
+  const session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+    () => runLargeMergeSession({
+      paths: fixture.paths, prepared: preparation,
+      options: {
+        onFaultPoint: async (point, detail = {}) => {
+          if (point === 'after-last-chunk' && detail.candidateId === fixture.alpha.id) {
+            seen.atFailure = await walBytes();
+            throw new Error('the first source fails after its last chunk');
+          }
+          if (point === 'before-source' && detail.index === 1) seen.beforeNext = await walBytes();
+        }
+      }
+    })));
+  assert.deepEqual(session.results.map((result) => result.state), ['deferred', 'merged']);
+  assert.ok(seen.atFailure > 4 * MiB, `撤回前预写日志 ${seen.atFailure} 字节（页溢出写进了预写日志）`);
+  assert.equal(seen.beforeNext, 0, '下一份开始前已还给磁盘');
+});
+
 test('空间计入目标会被改写的索引页：准备在它的目标备份上实测（dbstat），估计按目标文件大小的 0.65 估；需要量按同一个模型', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
