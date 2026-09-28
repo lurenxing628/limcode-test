@@ -645,6 +645,38 @@ test('会话里发现冲突就停：回滚后不再读这份来源的其余部�
 });
 
 // ---------------------------------------------------------------------------------------------
+// What a merge reports as inserted (review #11).
+// ---------------------------------------------------------------------------------------------
+
+test('提交的回复丢了（事务其实已提交）：按事务自己数的新增与复用行数报出结果并记账，不用准备时试算的数（准备之后当前库又有了同样的一份对话）', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => removeConfigurationRoot(fixture.root));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS
+  }));
+  // Another window, before its reload, created one of the source's conversations here exactly as the source has it.
+  await seedConversations(fixture.current, [{ id: 'alpha_conversation_0' }]);
+  const before = countRows(fixture.current);
+  const commit = kernel.RuntimeDatabase.prototype.maintenanceCommit;
+  let lost = 0;
+  kernel.RuntimeDatabase.prototype.maintenanceCommit = async function commitThenLoseReply(...args) {
+    await commit.apply(this, args);
+    lost += 1;
+    throw new Error('the reply of the commit was lost');
+  };
+  t.after(() => { kernel.RuntimeDatabase.prototype.maintenanceCommit = commit; });
+  const session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
+    () => runLargeMergeSession({ paths: fixture.paths, prepared: preparation })));
+  kernel.RuntimeDatabase.prototype.maintenanceCommit = commit;
+  assert.equal(lost, 1);
+  const inserted = countRows(fixture.current) - before;
+  assert.ok(inserted < preparation.sources[0].insertRows, `会话插入的（${inserted}）比试算时少（${preparation.sources[0].insertRows}）`);
+  assert.deepEqual(session.results.map((result) => [result.state, result.result?.insertedRows]), [['merged', inserted]]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).insertedRows, inserted);
+});
+
+// ---------------------------------------------------------------------------------------------
 // The left-out closure off the window's thread (review #7).
 // ---------------------------------------------------------------------------------------------
 
