@@ -679,7 +679,7 @@ async function exclusivePhase(
             stage = next;
             input.reportStage(next);
           }
-          // The engine's own estimate from this session's rate, when it gives one.
+          // The engine's own estimate (the streamed engine's rate counts only the time its rows stream), when it gives one.
           notify.push(largeMergeProgressMessage(current, current.remainingMs ?? estimateLargeMergeRemainingMs({
             elapsedMs: Date.now() - startedAt, rowsDone: current.rowsDone, rowsTotal: current.rowsTotal, expectedMs: duration.expectedMs
           })));

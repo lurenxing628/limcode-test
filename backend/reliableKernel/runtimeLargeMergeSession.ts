@@ -274,8 +274,10 @@ export function largeMergeStage(progress: LargeMergeRunProgress, stepPercent: nu
 }
 
 /**
- * How long the rest takes when the engine did not say: the preparation's estimate while few rows
- * were handled (under 5% or in the first 10 seconds), then by the rate so far.
+ * How long the rest takes when an engine did not say: the preparation's estimate while few rows
+ * were handled (under 5% or in the first 10 seconds), then by the rate so far. The streamed engine
+ * always says (LargeMergeSessionClock: the preparation's estimates until its rows streamed for a
+ * second, then the rate of streaming alone, so its fixed parts do not inflate the rest).
  */
 export function estimateLargeMergeRemainingMs(input: {
   elapsedMs: number; rowsDone: number; rowsTotal: number; expectedMs: number;

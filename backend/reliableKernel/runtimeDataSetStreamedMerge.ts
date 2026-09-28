@@ -1805,7 +1805,10 @@ export interface LargeMergeSessionProgress {
   sessionTotalRows: number;
   /** Since the session started. */
   elapsedMs: number;
-  /** From the measured rate of this session (the preparation's estimate before any row). */
+  /**
+   * The rest of the session: its rows at the rate measured while rows streamed, plus the fixed part
+   * per source still to start (the preparation's estimates before a second of streaming; LargeMergeSessionClock).
+   */
   remainingMs: number;
 }
 
@@ -1904,7 +1907,7 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
     const target = engine.targetContext({ configurationRootPath: preparation.configurationRootPath, database });
     if (preparation.backupPath) target.backup = { path: preparation.backupPath };
     const resolver = historicalMergeSources(paths, (candidateId) => internals.sources.get(candidateId)?.state.foreign);
-    const clock = new SessionClock(preparation, input.onProgress);
+    const clock = new LargeMergeSessionClock(preparation, input.onProgress);
     let verified: (RuntimeCasVerifier & { close(): void }) | undefined;
     try {
       // The CAS objects the preparation verified and published: unchanged ones are only lstat'ed.
@@ -1990,40 +1993,103 @@ function sourceResult(candidateId: string, outcome: HistoricalMergeSourceOutcome
   return { candidateId, state: outcome.kind, issue: { candidateId, code: outcome.code, message: outcome.message, newly: true, requested, ...named } };
 }
 
-/** Progress of a session: throttled, with the remaining time from the rate measured so far. */
-class SessionClock {
-  private readonly startedAt = performance.now();
+/**
+ * Streaming measured for at least this long (all sources of the session together) before its rate
+ * says how long the rest takes; until then the preparation's estimates do.
+ */
+const SESSION_RATE_MIN_STREAM_MS = 1000;
+
+/**
+ * Progress of a session: throttled, with the time the rest takes. Each source first does work whose
+ * time does not grow with its rows (the private copy again, an lstat per content object, the
+ * left-out closure, the committing record), then streams its rows. The rate is measured only while
+ * rows stream (rows streamed per ms of streaming), never over the fixed parts: the rest takes its
+ * rows at that rate plus, per source still to start, the fixed part the sources so far took. Before
+ * there is such a rate (the first second of streaming), the preparation's estimates of the source
+ * that runs (less the time it ran) and of the later ones. Exported for tests only.
+ */
+export class LargeMergeSessionClock {
+  private readonly startedAt: number;
   private readonly totalRows: number;
-  private doneRows = 0;
   private lastReport = 0;
   private lastStage: string | undefined;
+  /** Rows of finished sources; rows they streamed and for how long; their other (fixed) time. */
+  private doneRows = 0;
+  private streamedRows = 0;
+  private streamedMs = 0;
+  private fixedMs = 0;
+  private fixedSources = 0;
+  private current: {
+    index: number; prepared: PreparedLargeMergeSource; startedAt: number; streamStartedAt?: number; streamEndedAt?: number; rows: number;
+  } | undefined;
 
-  public constructor(private readonly preparation: LargeMergePreparation, private readonly report?: (progress: LargeMergeSessionProgress) => void) {
+  public constructor(
+    private readonly preparation: Pick<LargeMergePreparation, 'sources'>,
+    private readonly report?: (progress: LargeMergeSessionProgress) => void,
+    /** Tests: the clock (ms). */
+    private readonly now: () => number = () => performance.now()
+  ) {
+    this.startedAt = now();
     this.totalRows = preparation.sources.reduce((sum, source) => sum + source.rows, 0);
   }
 
   public source(index: number, prepared: PreparedLargeMergeSource): (stage: LargeMergeSessionStage, rows: number) => void {
     return (stage, rows) => {
+      const now = this.now();
+      if (this.current?.index !== index) this.current = { index, prepared, startedAt: now, rows: 0 };
+      const current = this.current;
+      if (stage === 'merging') {
+        current.streamStartedAt ??= now;
+        current.rows = Math.min(rows, prepared.rows);
+      } else if (current.streamStartedAt !== undefined) {
+        current.streamEndedAt ??= now;
+        current.rows = prepared.rows;
+      }
       if (!this.report) return;
-      const now = performance.now();
       const key = `${index}:${stage}`;
       if (key === this.lastStage && now - this.lastReport < 200) return;
       this.lastStage = key;
       this.lastReport = now;
-      const elapsedMs = now - this.startedAt;
       const sessionRows = this.doneRows + Math.min(rows, prepared.rows);
-      const remainingMs = sessionRows > 0
-        ? Math.max(0, Math.round(elapsedMs / sessionRows * (this.totalRows - sessionRows)))
-        : this.preparation.estimateMs;
       this.report({
         stage, candidateId: prepared.candidateId, index, total: this.preparation.sources.length, rows, sourceRows: prepared.rows,
-        sessionRows, sessionTotalRows: this.totalRows, elapsedMs: Math.round(elapsedMs), remainingMs
+        sessionRows, sessionTotalRows: this.totalRows, elapsedMs: Math.round(now - this.startedAt), remainingMs: Math.round(this.remainingMs(now))
       });
     };
   }
 
   public sourceDone(prepared: PreparedLargeMergeSource): void {
+    const now = this.now();
+    const current = this.current;
+    if (current?.streamStartedAt !== undefined) {
+      const streamMs = (current.streamEndedAt ?? now) - current.streamStartedAt;
+      this.streamedRows += current.rows;
+      this.streamedMs += streamMs;
+      this.fixedMs += Math.max(0, now - current.startedAt - streamMs);
+      this.fixedSources += 1;
+    }
     this.doneRows += prepared.rows;
+    this.current = undefined;
+  }
+
+  private remainingMs(now: number): number {
+    const current = this.current;
+    const later = this.preparation.sources.slice((current?.index ?? -1) + 1);
+    const streaming = current?.streamStartedAt !== undefined;
+    const streamedRows = this.streamedRows + (streaming ? current!.rows : 0);
+    const streamedMs = this.streamedMs + (streaming ? (current!.streamEndedAt ?? now) - current!.streamStartedAt! : 0);
+    if (streamedMs < SESSION_RATE_MIN_STREAM_MS || streamedRows <= 0) {
+      const own = current ? Math.max(0, current.prepared.estimateMs - (now - current.startedAt)) : 0;
+      return own + later.reduce((sum, source) => sum + source.estimateMs, 0);
+    }
+    const rate = streamedRows / streamedMs;
+    // The fixed part of a source: as the finished ones took it, else as the one that runs took it before streaming.
+    const fixedEach = this.fixedSources > 0 ? this.fixedMs / this.fixedSources
+      : streaming ? current!.streamStartedAt! - current!.startedAt : 0;
+    const own = current
+      ? (current.prepared.rows - current.rows) / rate + (streaming ? 0 : Math.max(0, fixedEach - (now - current.startedAt)))
+      : 0;
+    return own + later.reduce((sum, source) => sum + source.rows / rate + fixedEach, 0);
   }
 }
 
