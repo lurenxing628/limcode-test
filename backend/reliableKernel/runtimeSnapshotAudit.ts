@@ -21,7 +21,7 @@ export interface RuntimeSnapshotAuditRequest {
   binding: RootBinding;
   /** 'finalize' classifies work a historical merge closes first; 'carry' what a migration refuses. */
   unfinishedWork?: 'finalize' | 'carry';
-  /** Row count over every Runtime domain and file size in bytes. */
+  /** Row count over every Runtime domain and file size in bytes, and the content objects' count and bytes. */
   measure?: boolean;
   /** runtimeDataSetContentDigest of the copy (the content part of a merge fingerprint). */
   contentDigest?: boolean;
@@ -35,6 +35,8 @@ export interface RuntimeSnapshotAudit {
   unfinishedWork?: UnfinishedWorkInspection;
   carriedWork?: CarriedWorkRefusals;
   size?: { rows: number; bytes: number };
+  /** With `measure`: content_object rows and the sum of their byte_length (a storage key shared by rows counts per row). */
+  content?: { objects: number; bytes: number };
   contentDigest?: string;
   summary?: RuntimeDataSetSummary;
 }

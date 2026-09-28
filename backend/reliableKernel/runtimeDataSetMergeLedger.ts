@@ -18,11 +18,18 @@ const COMMIT_KIND = 'limcode-runtime-data-set-merge-commit';
 const FINGERPRINT_KIND = 'limcode-runtime-data-set-fingerprint';
 const FINALIZATION_KIND = 'limcode-runtime-data-set-merge-finalization';
 const PREPARATION_KIND = 'limcode-runtime-data-set-merge-preparation';
+const AUDIT_KIND = 'limcode-runtime-data-set-audit';
+const SESSION_RATE_KIND = 'limcode-runtime-large-merge-session-rate';
 const RECORDS = 'records';
 const REQUESTS = 'requests';
 const COMMITS = 'commits';
 /** Cache only: the content digest last computed for an exact file state. Never a merge fact. */
 const FINGERPRINTS = 'fingerprints';
+/** Cache only: what the audit of an exact file state found (see RuntimeDataSetAuditFacts). Never a merge fact. */
+const AUDITS = 'audits';
+/** Cache only: how fast the last large-merge session of this configuration root was (estimates only). Never a merge fact. */
+const RATES = 'rates';
+const SESSION_RATE_ID = 'large-merge-session';
 const FINALIZATIONS = 'finalizations';
 /** Advisory: the window preparing a large-merge session for a source (see RuntimeDataSetMergePreparation). */
 const PREPARATIONS = 'preparing';
@@ -254,6 +261,170 @@ export async function rememberRuntimeRootFingerprint(
   fingerprint: RuntimeDataSetFingerprint
 ): Promise<void> {
   await writeLedgerJson(paths, FINGERPRINTS, id, { kind: FINGERPRINT_KIND, candidateId: id, files, fingerprint });
+}
+
+/**
+ * What the worker audit of a private copy found for one exact source file state (runtimeSnapshotAudit):
+ * how large it is and which unfinished work a merge would refuse or close first. Cached so that a
+ * source that waits for a large-merge session is not copied and audited again at every startup while
+ * its files stay exactly as they were: the online batch's size judgment and the large-merge estimate
+ * use it. Not authoritative: a preparation copies and audits the source itself, and the session
+ * checks the source unchanged against its fingerprint under its claims.
+ */
+export interface RuntimeDataSetAuditFacts {
+  /** Rows of every Runtime table and the database's page bytes (the audit's size). */
+  rows: number;
+  bytes: number;
+  /** The SQLite database plus its WAL in this state. */
+  databaseBytes: number;
+  /** content_object rows and the sum of their byte_length. */
+  casObjects: number;
+  casBytes: number;
+  /** Unfinished work the merge refuses (with counts), and how much it would close first. */
+  refusedWork: Array<{ label: string; count: number }>;
+  finalizableTurns: number;
+  finalizableIntents: number;
+}
+
+export interface RuntimeDataSetAuditCacheEntry extends RuntimeDataSetAuditFacts {
+  /** The exact file state audited (runtimeDataSetFileState), and its fingerprint. */
+  files: string;
+  fingerprint: RuntimeDataSetFingerprint;
+  auditedAt: string;
+}
+
+/**
+ * The cached audit of a source, only when its SQLite files are exactly as they were when it was
+ * audited and its identity (data set, root instance, generation, pointer revision) is the same;
+ * never reads the data set itself. Undefined: not known without copying and auditing it.
+ */
+export async function readCachedRuntimeDataSetAudit(candidate: VscodeRuntimeDataSetCandidate): Promise<RuntimeDataSetAuditCacheEntry | undefined> {
+  const binding = await requireCompleteRuntimeDataSet(candidate);
+  const files = await runtimeDataSetFileState(binding.paths.databasePath);
+  return readAuditCache({ globalStoragePath: candidate.configurationRootPath }, candidate.id, files, binding);
+}
+
+/**
+ * The same for a root read in place (a foreign history root, by its id), cached under this
+ * configuration root: only for exactly these database files and this identity. Never reads the root.
+ */
+export async function readCachedRuntimeRootAudit(
+  paths: StoragePaths,
+  id: string,
+  files: string,
+  identity: Omit<RuntimeDataSetFingerprint, 'contentDigest'>
+): Promise<RuntimeDataSetAuditCacheEntry | undefined> {
+  return readAuditCache(paths, id, files, identity);
+}
+
+/**
+ * Caches what the audit of a private copy of exactly these files found (`files` from
+ * runtimeDataSetFileState before the copy, unchanged after it; `fingerprint` computed on that copy).
+ */
+export async function rememberRuntimeDataSetAudit(
+  candidate: VscodeRuntimeDataSetCandidate,
+  files: string,
+  fingerprint: RuntimeDataSetFingerprint,
+  facts: RuntimeDataSetAuditFacts
+): Promise<void> {
+  await writeAuditCache({ globalStoragePath: candidate.configurationRootPath }, candidate.id, files, fingerprint, facts);
+}
+
+/** Caches, under this configuration root, the audit of a private copy of exactly `files` of a root read in place. */
+export async function rememberRuntimeRootAudit(
+  paths: StoragePaths,
+  id: string,
+  files: string,
+  fingerprint: RuntimeDataSetFingerprint,
+  facts: RuntimeDataSetAuditFacts
+): Promise<void> {
+  await writeAuditCache(paths, id, files, fingerprint, facts);
+}
+
+async function readAuditCache(
+  paths: StoragePaths,
+  id: string,
+  files: string,
+  identity: FingerprintIdentity
+): Promise<RuntimeDataSetAuditCacheEntry | undefined> {
+  const file = await ledgerFile(paths, AUDITS, id);
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(file, 'utf8')) as unknown; }
+  catch { return undefined; }
+  const entry = value as Partial<RuntimeDataSetAuditCacheEntry> & { kind?: unknown; candidateId?: unknown } | null;
+  const fingerprint = entry?.fingerprint;
+  const count = (item: unknown): item is number => Number.isSafeInteger(item) && (item as number) >= 0;
+  if (entry?.kind !== AUDIT_KIND || entry.candidateId !== id || entry.files !== files || !fingerprint
+    || typeof fingerprint.contentDigest !== 'string' || !isReadableRuntimeDataSetFingerprint(fingerprint)
+    || !sameFingerprintIdentity(fingerprint as RuntimeDataSetFingerprint, fingerprintIdentity(identity))
+    || !count(entry.rows) || !count(entry.bytes) || !count(entry.databaseBytes) || !count(entry.casObjects) || !count(entry.casBytes)
+    || !count(entry.finalizableTurns) || !count(entry.finalizableIntents) || typeof entry.auditedAt !== 'string'
+    || !Array.isArray(entry.refusedWork)
+    || !entry.refusedWork.every((item: { label?: unknown; count?: unknown } | null) => typeof item?.label === 'string' && count(item.count))) {
+    return undefined;
+  }
+  return {
+    files, fingerprint: fingerprint as RuntimeDataSetFingerprint, auditedAt: entry.auditedAt,
+    rows: entry.rows, bytes: entry.bytes, databaseBytes: entry.databaseBytes, casObjects: entry.casObjects, casBytes: entry.casBytes,
+    refusedWork: entry.refusedWork.map((item) => ({ label: item.label, count: item.count })),
+    finalizableTurns: entry.finalizableTurns, finalizableIntents: entry.finalizableIntents
+  };
+}
+
+async function writeAuditCache(
+  paths: StoragePaths,
+  id: string,
+  files: string,
+  fingerprint: RuntimeDataSetFingerprint,
+  facts: RuntimeDataSetAuditFacts
+): Promise<void> {
+  if (!isReadableRuntimeDataSetFingerprint(fingerprint)) return;
+  await writeLedgerJson(paths, AUDITS, id, {
+    kind: AUDIT_KIND, candidateId: id, files, fingerprint,
+    rows: facts.rows, bytes: facts.bytes, databaseBytes: facts.databaseBytes, casObjects: facts.casObjects, casBytes: facts.casBytes,
+    refusedWork: facts.refusedWork.map((item) => ({ label: item.label, count: item.count })),
+    finalizableTurns: facts.finalizableTurns, finalizableIntents: facts.finalizableIntents, auditedAt: new Date().toISOString()
+  });
+}
+
+/**
+ * What the last large-merge session of this configuration root measured for the sources it merged:
+ * how long they took in the exclusive phase (with opening and closing the private instance) and how
+ * long the size model of the estimate (estimateLargeMergeSources, before any measurement) said. It
+ * only scales later estimates on this machine; never a merge fact.
+ */
+export interface RuntimeLargeMergeSessionRate {
+  measuredAt: string;
+  sources: number;
+  rows: number;
+  sessionMs: number;
+  modelMs: number;
+}
+
+/** The last measured session rate, or undefined (none, unreadable, or not one). */
+export async function readRuntimeLargeMergeSessionRate(paths: StoragePaths): Promise<RuntimeLargeMergeSessionRate | undefined> {
+  let value: unknown;
+  try { value = JSON.parse(await fs.readFile(await ledgerFile(paths, RATES, SESSION_RATE_ID), 'utf8')) as unknown; }
+  catch { return undefined; }
+  const entry = value as Partial<RuntimeLargeMergeSessionRate> & { kind?: unknown } | null;
+  const positive = (item: unknown): item is number => typeof item === 'number' && Number.isFinite(item) && item > 0;
+  const count = (item: unknown): item is number => Number.isSafeInteger(item) && (item as number) > 0;
+  if (entry?.kind !== SESSION_RATE_KIND || typeof entry.measuredAt !== 'string' || !count(entry.sources) || !count(entry.rows)
+    || !positive(entry.sessionMs) || !positive(entry.modelMs)) {
+    return undefined;
+  }
+  return { measuredAt: entry.measuredAt, sources: entry.sources, rows: entry.rows, sessionMs: entry.sessionMs, modelMs: entry.modelMs };
+}
+
+/** Replaces the measured session rate with this session's. */
+export async function rememberRuntimeLargeMergeSessionRate(
+  paths: StoragePaths,
+  rate: Omit<RuntimeLargeMergeSessionRate, 'measuredAt'>
+): Promise<void> {
+  await writeLedgerJson(paths, RATES, SESSION_RATE_ID, {
+    kind: SESSION_RATE_KIND, measuredAt: new Date().toISOString(),
+    sources: rate.sources, rows: rate.rows, sessionMs: rate.sessionMs, modelMs: rate.modelMs
+  });
 }
 
 export function sameRuntimeDataSetFingerprint(left: RuntimeDataSetFingerprint, right: RuntimeDataSetFingerprint | undefined): boolean {

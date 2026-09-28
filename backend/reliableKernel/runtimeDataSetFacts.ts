@@ -138,6 +138,12 @@ export async function runtimeDataSetFileState(databasePath: string): Promise<str
   return `db=${database};wal=${wal}`;
 }
 
+/** Bytes of the database and its WAL in a state of {@link runtimeDataSetFileState}; undefined for any other text. */
+export function runtimeDataSetFileStateBytes(files: string): number | undefined {
+  const match = /^db=\d+:\d+:(\d+):\d+:\d+;wal=(?:absent|\d+:\d+:(\d+):\d+:\d+)$/.exec(files);
+  return match ? Number(match[1]) + Number(match[2] ?? 0) : undefined;
+}
+
 function runWorker(data: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeDataSetFacts, 'binding'>> {
   return new Promise((resolve, reject) => {
     let settled = false;

@@ -48,6 +48,9 @@ function audit(input: RuntimeSnapshotAuditWorkerData): RuntimeSnapshotAudit {
       const pageSize = Number(database.pragma('page_size', { simple: true }) as bigint | number);
       const pageCount = Number(database.pragma('page_count', { simple: true }) as bigint | number);
       result.size = { rows, bytes: pageSize * pageCount };
+      const content = database.prepare('SELECT COUNT(*) AS objects, COALESCE(SUM(byte_length), 0) AS bytes FROM content_object')
+        .get() as { objects: bigint | number; bytes: bigint | number };
+      result.content = { objects: Number(content.objects), bytes: Number(content.bytes) };
     }
     return result;
   } finally {

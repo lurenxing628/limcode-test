@@ -14,23 +14,25 @@ import {
   DOMAIN_REPOSITORIES, HISTORICAL_COPY_DOMAINS, savepoint, type DomainRow, type RepositoryTransactionStep
 } from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
+import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
   describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
   type CarriedWorkRefusals, type UnfinishedWorkInspection
 } from './runtimeDataSetMergeWork';
 import {
-  cachedRuntimeDataSetFingerprint, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits,
-  readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger,
+  cachedRuntimeDataSetFingerprint, isReadableRuntimeDataSetFingerprint, pruneRuntimeDataSetMergeCommits, readCachedRuntimeDataSetAudit,
+  readCachedRuntimeRootAudit, readRuntimeDataSetMergeCommit, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger,
+  rememberRuntimeDataSetAudit, rememberRuntimeRootAudit,
   readRuntimeDataSetMergeRequests, rememberRuntimeDataSetFingerprint, removeRuntimeDataSetMergeCommit, pruneRuntimeDataSetMergePreparations,
   removeRuntimeDataSetMergeFinalization, removeRuntimeDataSetMergeLedgerRecord, removeRuntimeDataSetMergeRequest,
   restoreRuntimeDataSetMergeLedgerRecord, runtimeDataSetFingerprint, runtimeDataSetLastMerge, runtimeDataSetMergedConversations,
   sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeFinalization,
   writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergeRequest,
-  type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord,
-  type RuntimeDataSetMergeLedgerRequest
+  type RuntimeDataSetAuditCacheEntry, type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity,
+  type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeLedgerRecord, type RuntimeDataSetMergeLedgerRequest
 } from './runtimeDataSetMergeLedger';
-import { runtimeDataSetFileState } from './runtimeDataSetFacts';
+import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
@@ -619,7 +621,10 @@ export async function mergeHistoricalDataSetsOnline(
 async function pickSources(
   storagePaths: { globalStoragePath: string },
   target: TargetContext,
-  options: Pick<RuntimeDataSetMergeBatchOptions, 'candidateIds' | 'requested' | 'sizeLimits'>,
+  options: Pick<RuntimeDataSetMergeBatchOptions, 'candidateIds' | 'requested' | 'sizeLimits'> & {
+    /** An estimate: nothing is written (no request is removed or reported as expired). */
+    readOnly?: boolean;
+  },
   report: RuntimeDataSetMergeBatchResult,
   keepGoing: () => boolean
 ): Promise<{ sources: PickedSource[]; pickedAt: string }> {
@@ -653,13 +658,13 @@ async function pickSources(
           && request.expectedDataSetId === candidate.dataSetId && request.expectedRootInstanceId === candidate.rootInstanceId
       };
       if (options.candidateIds && !options.candidateIds.includes(candidate.id)) {
-        if (expired) await reportExpiredRequest(storagePaths, source, report);
+        if (expired && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
         continue;
       }
       // Only a fingerprint cached for the exact current files is used here: computing one reads the
       // whole data set, which is done per source below, outside the admission.
       const fingerprint = record ? await cachedRuntimeDataSetFingerprint(candidate).catch(() => undefined) ?? 'uncached' : undefined;
-      const selection = await selectSource(storagePaths, target, source, fingerprint, report, streamedRows);
+      const selection = await selectSource(storagePaths, target, source, fingerprint, report, streamedRows, options.readOnly);
       if (selection === 'skip') continue;
       source.unjudged = selection === 'later';
       picked.push(source);
@@ -684,10 +689,10 @@ async function pickSources(
         pending: request !== undefined && sameRuntimeDataSetIdentity(request.target, target.identity)
       };
       if (options.candidateIds && !options.candidateIds.includes(source.id)) {
-        if (expired) await reportExpiredRequest(storagePaths, source, report);
+        if (expired && !options.readOnly) await reportExpiredRequest(storagePaths, source, report);
         continue;
       }
-      const selection = await selectSource(storagePaths, target, source, record ? 'uncached' : undefined, report, streamedRows);
+      const selection = await selectSource(storagePaths, target, source, record ? 'uncached' : undefined, report, streamedRows, options.readOnly);
       if (selection === 'skip') continue;
       source.unjudged = selection === 'later';
       picked.push(source);
@@ -702,7 +707,7 @@ async function pickSources(
       const fingerprint = source.foreign
         ? await (await foreignHistoryMerge()).foreignHistoricalMergeFingerprint(storagePaths, source.id, source.foreign).catch(() => undefined)
         : await runtimeDataSetFingerprint(source.candidate!).catch(() => undefined);
-      if (await selectSource(storagePaths, target, source, fingerprint, report, streamedRows) === 'skip') continue;
+      if (await selectSource(storagePaths, target, source, fingerprint, report, streamedRows, options.readOnly) === 'skip') continue;
     }
     sources.push(source);
   }
@@ -743,14 +748,16 @@ async function selectSource(
   source: PickedSource,
   fingerprint: RuntimeDataSetFingerprint | 'uncached' | undefined,
   report: RuntimeDataSetMergeBatchResult,
-  streamedRows: number
+  streamedRows: number,
+  readOnly = false
 ): Promise<'work' | 'skip' | 'later'> {
   const { record, request, pending } = source;
   const reference: SourceRef = source.candidate ?? { id: source.id, ...source.identity, ...(source.label ? { label: source.label } : {}) };
+  const expire = readOnly ? async () => undefined : () => reportExpiredRequest(paths, source, report);
   const later = record !== undefined && fingerprint === 'uncached';
   const unchanged = record !== undefined && fingerprint !== 'uncached' && sameRuntimeDataSetFingerprint(record.source, fingerprint);
   if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target.identity) && unchanged) {
-    if (request || source.expired) await removeRuntimeDataSetMergeRequest(paths, source.id);
+    if ((request || source.expired) && !readOnly) await removeRuntimeDataSetMergeRequest(paths, source.id);
     // An explicit request always hears back, also when there is nothing new.
     if (source.requested) report.merged.push({ ...unchangedResult(reference, target), alreadyMerged: true });
     return 'skip';
@@ -761,7 +768,7 @@ async function selectSource(
   // still converges.
   if (!pending && ((record && record.state !== 'committing' && runtimeDataSetLastMerge(record))
     || source.foreign !== undefined || await isVscodeRuntimeDataSetKept(source.candidate!))) {
-    await reportExpiredRequest(paths, source, report);
+    await expire();
     return 'skip';
   }
   if (later) return 'later';
@@ -776,7 +783,7 @@ async function selectSource(
     (record.state === 'failed' ? report.failures : report.blocked).push({
       candidateId: source.id, code: record.code, message: record.message, newly: false, ...(source.label ? { label: source.label } : {})
     });
-    await reportExpiredRequest(paths, source, report);
+    await expire();
     return 'skip';
   }
   return 'work';
@@ -881,7 +888,7 @@ export async function precopyRuntimeDataSetCas(
     const snapshot = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
     try {
       snapshot.defaultSafeIntegers(true);
-      const verification: CasVerification = new Map();
+      const verification: RuntimeDataSetCasVerification = new Map();
       const transfer = await transferCas(candidate.configurationRootPath, binding, target.configurationRootPath, target.binding, snapshot, {
         ...(options.linkFile ? { linkFile: options.linkFile } : {}), ...(options.signal ? { signal: options.signal } : {}), verified: verification
       });
@@ -1097,6 +1104,8 @@ interface SourceMode {
    * coordination) is postponed right after its audit, before any plan, backup or finalization.
    */
   postponeOversized?: boolean;
+  /** An estimate: nothing is written; a published 3/4 source is not upgraded (deferred instead). */
+  readOnly?: boolean;
 }
 
 interface SourceProgress {
@@ -1214,19 +1223,22 @@ async function mergeSource(
   // Conversations earlier merges of this source inserted here: the ones deleted here since are left out.
   const merged = mode.migration ? [] : await recordedConversations(paths, target, candidate);
   const unfinishedWork = mode.finalizeWork ? 'finalize' as const : 'carry' as const;
-  let taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options);
+  if (!mode.migration) {
+    // Audited before in exactly this file state: a source that waits (large-merge session, or last in
+    // this batch) is judged by its cached size, without being copied and audited again.
+    const cached = await cachedAudit(paths, candidate, state);
+    if (cached) {
+      assertMergeableSize(cached, options, state);
+      assertNotPostponed(cached, options, mode, state);
+    }
+  }
+  let taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options, paths);
+  let verifiedCache: { close(): void } | undefined;
   try {
     // An earlier attempt may have ended before it counted what it closed: counted in this copy.
     if (state.finalized?.earlier) countFinalized(taken.snapshot.database, state.finalized);
     if (!mode.migration) assertMergeableSize(taken.audit.size!, options, state);
-    if (mode.postponeOversized && exceedsOnlineLimits(taken.audit.size!, options)) {
-      const { rows, bytes } = taken.audit.size!;
-      throw new Outcome({
-        kind: 'deferred', code: POSTPONED_IN_BATCH, awaiting: { rows, bytes },
-        message: `这份旧聊天记录较大（约 ${rows} 条记录），和更大的旧聊天记录一起在所有窗口暂停时合并，正在等待合并`
-          + `${state.finalized ? '。' : '；这个库的对话内容没有改动。'}`
-      });
-    }
+    assertNotPostponed(taken.audit.size!, options, mode, state);
     let work: UnfinishedWorkInspection | undefined;
     if (!mode.finalizeWork) assertCarriable(taken.audit.carriedWork!);
     else {
@@ -1237,7 +1249,10 @@ async function mergeSource(
     stopIfAsked();
     let plan = await planSource(taken.snapshot.database, target, merged, state);
     let size = checkPlan(plan, taken.audit.size!, limits, options, state);
-    const verified: CasVerification = options.casVerification ?? new Map();
+    // A historical merge keeps what it verified on disk (a later attempt hashes nothing unchanged again).
+    let verified: RuntimeCasVerifier | undefined = options.casVerification;
+    if (!verified && !mode.migration) verified = verifiedCache = await openRuntimeCasVerificationCache(paths.globalStoragePath);
+    verified ??= new Map<string, string>();
     if (work && hasFinalizableWork(work)) {
       // Everything that can refuse the source was checked on the unfinalized snapshot (unfinished
       // work, conflicts, size); the CAS objects are verified too. Only then is the source backed up
@@ -1247,7 +1262,7 @@ async function mergeSource(
       await fault(options, 'before-source-finalization');
       await finalizeSource(paths, target, candidate, binding, work, state, options, mode, stopIfAsked);
       await taken.snapshot.close();
-      taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options);
+      taken = await takeVerifiedSnapshot(candidate, binding, unfinishedWork, state, mode, options, paths);
       const remaining = taken.audit.unfinishedWork!;
       if (remaining.refused.length > 0 || hasFinalizableWork(remaining)) {
         throw new Outcome(unfinishedWorkOutcome(describeUnfinishedWork(remaining.refused) || '收尾后仍有未结束的任务', state, true));
@@ -1271,8 +1286,66 @@ async function mergeSource(
     if (!size.oversized) return await commit();
     return await commitExclusively(paths, target, candidateId, size.rows, state, mode, options.coordinateOversized!, commit);
   } finally {
+    verifiedCache?.close();
     await taken.snapshot.close();
   }
+}
+
+/** An automatic batch's first pass leaves a source above the online bounds to its end (see SourceMode). */
+function assertNotPostponed(
+  size: { rows: number; bytes: number },
+  options: Pick<RuntimeDataSetMergeOptions, 'limits'>,
+  mode: SourceMode,
+  state: SourceProgress
+): void {
+  if (!mode.postponeOversized || !exceedsOnlineLimits(size, options)) return;
+  const { rows, bytes } = size;
+  throw new Outcome({
+    kind: 'deferred', code: POSTPONED_IN_BATCH, awaiting: { rows, bytes },
+    message: `这份旧聊天记录较大（约 ${rows} 条记录），和更大的旧聊天记录一起在所有窗口暂停时合并，正在等待合并`
+      + `${state.finalized ? '。' : '；这个库的对话内容没有改动。'}`
+  });
+}
+
+/**
+ * The cached audit of the source's exact current files (readCachedRuntimeDataSetAudit; a foreign
+ * root's under this configuration root, read under its hold): the judged state is then that one, as a
+ * new audit would make it (a refusal is recorded for it).
+ */
+async function cachedAudit(
+  paths: { globalStoragePath: string },
+  candidate: HistoricalMergeCandidate,
+  state: SourceProgress
+): Promise<RuntimeDataSetAuditCacheEntry | undefined> {
+  const cached = await (isForeignCandidate(candidate)
+    ? foreignCachedAudit(paths, candidate)
+    : readCachedRuntimeDataSetAudit(candidate)).catch(() => undefined);
+  if (cached) {
+    state.files = cached.files;
+    state.fingerprint = cached.fingerprint;
+  }
+  return cached;
+}
+
+async function foreignCachedAudit(
+  paths: { globalStoragePath: string },
+  candidate: ForeignHistoricalMergeCandidate
+): Promise<RuntimeDataSetAuditCacheEntry | undefined> {
+  const { recorded, located } = candidate.root;
+  return readCachedRuntimeRootAudit(paths, candidate.id, await runtimeDataSetFileState(located.databasePath), {
+    dataSetId: recorded.dataSetId, rootInstanceId: recorded.rootInstanceId, rootGeneration: recorded.rootGeneration, pointerRevision: recorded.pointerRevision
+  });
+}
+
+/** What an audit of a historical merge's copy of exactly `files` found, as cached (RuntimeDataSetAuditFacts). */
+function auditFacts(files: string, audit: RuntimeSnapshotAudit): RuntimeDataSetAuditFacts | undefined {
+  const databaseBytes = runtimeDataSetFileStateBytes(files);
+  if (!audit.size || !audit.content || !audit.unfinishedWork || databaseBytes === undefined) return undefined;
+  return {
+    rows: audit.size.rows, bytes: audit.size.bytes, databaseBytes, casObjects: audit.content.objects, casBytes: audit.content.bytes,
+    refusedWork: audit.unfinishedWork.refused.map((item) => ({ label: item.label, count: item.count })),
+    finalizableTurns: audit.unfinishedWork.turns.length, finalizableIntents: audit.unfinishedWork.intents.length
+  };
 }
 
 /**
@@ -1361,6 +1434,9 @@ async function resolveSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
   }
   const epoch = candidate.runtimeKernelEpoch;
+  if ((epoch === 3 || epoch === 4) && mode.readOnly) {
+    throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-upgrade-pending', message: '这份旧聊天记录还是已发布的旧格式，启动时会先在后台升级，之后才能估计。' });
+  }
   if (epoch === 3 || epoch === 4) {
     const upgrade = await upgradeRuntimeDataSet(paths, {
       candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
@@ -1891,7 +1967,9 @@ async function takeVerifiedSnapshot(
   unfinishedWork: 'finalize' | 'carry',
   state: SourceProgress,
   mode: SourceMode,
-  options: RuntimeDataSetMergeOptions = {}
+  options: RuntimeDataSetMergeOptions = {},
+  /** Where a foreign root's audit is cached (this configuration root); a local data set's is its own. */
+  cacheRoot?: { globalStoragePath: string }
 ): Promise<VerifiedSnapshot> {
   // A foreign root is read at its located paths (`binding`); its recorded binding alone is the fence.
   // Its unfinished work is always probed: nothing of it may be carried or finalized.
@@ -1933,10 +2011,15 @@ async function takeVerifiedSnapshot(
           rootGeneration: binding.rootGeneration, pointerRevision: binding.pointerRevision,
           contentDigest: audit!.contentDigest
         };
-        // A foreign root's fingerprint is cached under this configuration root, never beside the root.
-        await (isForeignCandidate(candidate)
-          ? candidate.hold.rememberFingerprint(candidate, files, state.fingerprint)
-          : rememberRuntimeDataSetFingerprint(candidate, files, state.fingerprint)).catch(() => undefined);
+        // A foreign root's fingerprint and audit are cached under this configuration root, never beside the root.
+        const facts = auditFacts(files, audit!);
+        if (isForeignCandidate(candidate)) {
+          await candidate.hold.rememberFingerprint(candidate, files, state.fingerprint).catch(() => undefined);
+          if (facts && cacheRoot) await rememberRuntimeRootAudit(cacheRoot, candidate.id, files, state.fingerprint, facts).catch(() => undefined);
+        } else {
+          await rememberRuntimeDataSetFingerprint(candidate, files, state.fingerprint).catch(() => undefined);
+          if (facts) await rememberRuntimeDataSetAudit(candidate, files, state.fingerprint, facts).catch(() => undefined);
+        }
       }
       return { snapshot, audit: audit! };
     } catch (error) {
@@ -1953,7 +2036,8 @@ async function takeVerifiedSnapshot(
  * An unchanged file is trusted without hashing it again; any difference hashes it in full.
  */
 export type RuntimeDataSetCasVerification = Map<string, string>;
-type CasVerification = RuntimeDataSetCasVerification;
+/** A Map, or the persistent cache of historical merges (see RuntimeCasVerifier). */
+type CasVerification = RuntimeCasVerifier;
 /** Suffix of a private temporary copy under the target CAS `tmp/` directory. */
 export const RUNTIME_DATA_SET_CAS_COPY_SUFFIX = '.merge.tmp';
 const CAS_COPY_SUFFIX = RUNTIME_DATA_SET_CAS_COPY_SUFFIX;
@@ -2507,7 +2591,7 @@ async function transferCas(
   } = {}
 ): Promise<RuntimeDataSetCasTransfer> {
   const result = { linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0 };
-  const verified = options.verified ?? new Map<string, string>();
+  const verified: CasVerification = options.verified ?? new Map<string, string>();
   const sourceCas = path.resolve(sourceBinding.paths.casRootPath);
   const targetCas = path.resolve(targetBinding.paths.casRootPath);
   await assertNoSymbolicPath(sourceConfigurationRootPath, sourceCas);
@@ -3200,6 +3284,7 @@ export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   BACKUP_FREE_SPACE_MARGIN_BYTES, Outcome, StopRequested, MergedMeanwhile,
   targetContext, pickSources, runSourceAttempt, settledSource, resolveSource, recordedConversations, takeVerifiedSnapshot,
   countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, transferSourceCas, finalizeSource,
+  cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,
   unchangedResult, currentResult, insertedRowsPresence, restoreLedgerRecord, mergeReadSql, sourceRow, errorCode, errorMessage,
   isTransientError, fault, freeSpace, isForeignCandidate, foreignBinding, sourceCandidate, sourceOutcome
