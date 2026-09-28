@@ -1702,13 +1702,18 @@ async function openWindow(t, binding, hostBootId, options = {}) {
 async function writeRequest(paths, overrides) {
   const file = path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', `${overrides.requestId}.json`);
   await fs.mkdir(path.dirname(file), { recursive: true });
-  await fs.writeFile(file, JSON.stringify({
+  // Replaced atomically, as the product publishes: a request starting in this process sweeps requests it
+  // cannot read as abandoned, and must never catch this one half-written and remove it.
+  const temporary = `${file}.${process.pid}.${nextTemporaryRequest += 1}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify({
     kind: 'limcode-runtime-exclusive-maintenance-request', round: 1, phase: 'prepare', operation: 'offline-gc', operationKey: 'gc',
     message: '为整理数据', activity: '整理数据', confirmation: 'countdown', whenBusy: 'abandon', requesterProcessId: process.pid,
     requesterProcessStartIdentity: ownProcessStartIdentity(), heartbeatAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 60_000).toISOString(), ...overrides
   }));
+  await fs.rename(temporary, file);
 }
+let nextTemporaryRequest = 0;
 
 async function readAnswer(paths, requestId, hostBootId) {
   return JSON.parse(await fs.readFile(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'responses', requestId, `${hostBootId}.json`), 'utf8'));
