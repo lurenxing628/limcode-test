@@ -688,7 +688,18 @@ function mergedLog(merged: RuntimeDataSetMergeResult): string {
 function foreignMergedNote(results: readonly RuntimeDataSetMergeResult[]): string {
   const foreign = results.filter(result => result.label);
   if (!foreign.length) return '';
-  return `${foreign.map(result => result.label).join('、')}原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。`;
+  const kept = foreign.filter(result => result.skippedConversations);
+  const covered = foreign.filter(result => !result.skippedConversations);
+  return (covered.length ? `${covered.map(result => result.label).join('、')}原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。` : '')
+    + kept.map(result => `${result.label}${keptForSkippedTip(result.skippedConversations!)}`).join('');
+}
+
+/**
+ * Instead of the cleanup tip for a foreign copy whose merge left out conversations the user had
+ * deleted in the current data set: backup cleanup keeps it (it holds conversations found nowhere else).
+ */
+export function keptForSkippedTip(skipped: number): string {
+  return `合并时跳过了 ${skipped} 个你在当前库删掉的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`;
 }
 
 /** What merged sources also did: work closed before merging, and conversations deliberately left out. */

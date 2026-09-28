@@ -11,8 +11,10 @@ import {
   readForeignRuntimeHistoryMergeStates, requestForeignRuntimeHistoryMerge, type ForeignRuntimeHistoryMergeState
 } from '../../backend/reliableKernel/runtimeForeignHistoryMerge';
 import type { ApplicationStartup } from '../ApplicationStartup';
+import { formatTime } from './backupCleanup';
 import {
-  browseRuntimeHistory, formatBytes, mergeHistoricalDataSetsInBackground, oversizedMergeNote, showReadOnly, type HistoricalMergeHost
+  browseRuntimeHistory, formatBytes, keptForSkippedTip, mergeHistoricalDataSetsInBackground, oversizedMergeNote, showReadOnly,
+  type HistoricalMergeHost
 } from './runtimeDataSetManagement';
 
 /**
@@ -204,7 +206,7 @@ async function mergeIntoCurrent(
     detail: `来源：${entry.locatedPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
       + '外来历史库只读：合并不在它的目录里写任何东西，它原样保留；它的正文文件会复制进当前库（不共用文件），需要相应的磁盘空间。'
       + '它里面如果还有中断的任务或排队未发送的消息，这次不合并并说明原因（当前版本不在外来目录里收尾），仍可只读查看。'
-      + '以前合并进当前库、之后你在当前库删除了的对话不会再合并回来（同一个库的其它拷贝合并进来的也一样）。'
+      + '你在本版本里删掉的对话不会回来；更早版本里删掉、而这份库里还有的对话会被加回来，合并后可以再删。'
       + '与当前库有数据冲突时整体不合并，并说明原因。' + oversizedMergeNote() + again
       + `\n\n合并完成后，${CLEANUP_TIP}`
   }, '合并');
@@ -227,10 +229,14 @@ async function mergeIntoCurrent(
   return 'merged';
 }
 
-/** Whose old copy a verified entry is (same data set incarnation as a local data set), if it is one. */
+/**
+ * Whose old copy a verified entry is (same data set incarnation as a local data set, or one the current
+ * data set continues), by a readable name, if it is one.
+ */
 function oldCopyOf(entry: ForeignRuntimeHistoryEntry): string | undefined {
-  if (!entry.sameAsLocal) return undefined;
-  return entry.sameAsLocal.selected ? '当前历史库' : `历史库 ${entry.sameAsLocal.candidateId}`;
+  const local = entry.sameAsLocal;
+  if (!local) return undefined;
+  return local.selected ? `当前历史库${local.continued ? '（迁移数据目录之前的那一份）' : ''}` : `历史库“${local.name ?? '另一个本地库'}”`;
 }
 
 /** Interrupted work a merge would first have to finish (never finished in a foreign directory). */
@@ -241,7 +247,7 @@ function unfinishedCount(entry: ForeignRuntimeHistoryEntry): number {
 /** "已合并（时间）" of its last merge, then what is pending or refused now. */
 function mergeStateText(merge: ForeignRuntimeHistoryMergeState | undefined): string {
   if (!merge) return '';
-  const time = (iso: string): string => iso.replace('T', ' ').slice(0, 16);
+  const time = (iso: string): string => formatTime(iso);
   const last = merge.state === 'merged' ? merge : merge.lastMerged;
   const merged = !last ? '' : last.intoCurrent
     ? `已合并（${time(last.mergedAt)}）${merge.state === 'merged' && last.changedSinceMerge ? '，之后有变化' : ''}`
@@ -258,8 +264,8 @@ async function reveal(entry: ForeignRuntimeHistoryEntry): Promise<void> {
 
 function entryLabel(entry: ForeignRuntimeHistoryEntry): string {
   const state = entry.status === 'failed' ? '未通过核验 · ' : entry.status === 'unavailable' ? '暂时无法核验 · ' : '';
-  const copyOf = entry.sameAsLocal ? entry.sameAsLocal.selected ? '（当前库的旧拷贝）' : `（历史库 ${entry.sameAsLocal.candidateId} 的旧拷贝）` : '';
-  return `${state}${entryName(entry)}${copyOf}`;
+  const copyOf = oldCopyOf(entry);
+  return `${state}${entryName(entry)}${copyOf ? `（${copyOf}的旧拷贝）` : ''}`;
 }
 
 /** Where it came from and its name: what a merge notice and the large-merge session call it. */
@@ -279,7 +285,9 @@ export function foreignSourceLabel(entry: ForeignRuntimeHistoryEntry): string {
 function mergeDetail(entry: ForeignRuntimeHistoryEntry, merge?: ForeignRuntimeHistoryMergeState): string[] {
   const copyOf = oldCopyOf(entry);
   if (copyOf) return [`只读；它是${copyOf}的旧拷贝，不合并`];
-  if (merge?.state === 'merged' && merge.intoCurrent && !merge.changedSinceMerge) return ['只读；已合并进当前库', CLEANUP_TIP];
+  if (merge?.state === 'merged' && merge.intoCurrent && !merge.changedSinceMerge) {
+    return ['只读；已合并进当前库', merge.skippedConversations ? keptForSkippedTip(merge.skippedConversations) : CLEANUP_TIP];
+  }
   // The line on its unfinished work says why it is not merged now.
   if (unfinishedCount(entry) > 0) return ['只读'];
   if (merge?.state === 'blocked' || merge?.state === 'failed' || merge?.state === 'too-large') {
@@ -295,7 +303,7 @@ function entryFacts(entry: ForeignRuntimeHistoryEntry, merge?: ForeignRuntimeHis
   return [
     mergeStateText(merge),
     summary ? `${summary.conversationCount} 个对话` : '',
-    summary?.lastActivityAt ? `最后活动 ${summary.lastActivityAt.replace('T', ' ').slice(0, 16)}` : '',
+    summary?.lastActivityAt ? `最后活动 ${formatTime(summary.lastActivityAt)}` : '',
     summary?.projectNames.length ? summary.projectNames.slice(0, 3).join('、') : '',
     size
   ].filter(Boolean).join(' · ');

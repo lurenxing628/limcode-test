@@ -302,7 +302,8 @@ function formatBytes(value: string): string {
   return `${bytes} B`;
 }
 
-function formatTime(value: string): string {
+/** Local time to the minute (the list of foreign history shows its times the same way). */
+export function formatTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   const pad = (part: number) => String(part).padStart(2, '0');

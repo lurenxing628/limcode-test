@@ -987,6 +987,12 @@ test('外来历史库合并：通知与日志用可读名称，并提示这份�
   const local = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld()] }) });
   await local.mergeHistoricalDataSetsInBackground(local.context, mergeHost(), () => true);
   assert.doesNotMatch(local.calls.find(call => call[0] === 'info')[1], /清理备份/, '本地历史库的合并不提清理备份');
+  // Conversations the user had deleted were left out: backup cleanup keeps this copy, so the tip says so instead.
+  const skipped = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({ candidateId: id, label, skippedConversations: 2 })] }) });
+  await skipped.mergeHistoricalDataSetsInBackground(skipped.context, mergeHost(), () => true, [id]);
+  const notice = skipped.calls.find(call => call[0] === 'info')[1];
+  assert.ok(notice.endsWith(`${label}合并时跳过了 2 个你在当前库删掉的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`), notice);
+  assert.ok(!notice.includes('可以在“清理备份”里按覆盖核对后删除'), '不再说可以按覆盖删除');
 
   const refused = fixture({ confirmation: '查看原因', mergeReport: emptyMergeReport({ blocked: [{
     candidateId: id, label, code: 'runtime-data-set-merge-foreign-old-copy', message: '这个外来历史库是当前历史库的旧拷贝。', newly: true, requested: true

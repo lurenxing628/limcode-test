@@ -1,3 +1,5 @@
+// Times are shown in local time (backupCleanup.formatTime): a zone other than UTC tells it apart from the ISO string.
+process.env.TZ = 'Asia/Shanghai';
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -24,6 +26,12 @@ function loadCommand(dependencies) {
 
 const ROOT = '/data/limcode';
 const plain = (value) => JSON.parse(JSON.stringify(value));
+/** Local time to the minute, as backupCleanup.formatTime shows it (the stub below is this). */
+function local(value) {
+  const date = new Date(value);
+  const pad = (part) => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
 
 function entry(overrides) {
   return {
@@ -120,8 +128,10 @@ picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
       mergeHistoricalDataSetsInBackground: async (_context, current, shouldContinue, ids) => {
         calls.push(['background-merge', current.name, shouldContinue(), plain(ids)]);
       },
-      oversizedMergeNote: () => '（较大的库另行说明。）'
-    }
+      oversizedMergeNote: () => '（较大的库另行说明。）',
+      keptForSkippedTip: (skipped) => `（跳过了 ${skipped} 个删掉的对话，清理备份会保留这份。）`
+    },
+    './backupCleanup': { formatTime: (value) => local(value) }
   });
   const startup = host === undefined ? undefined : { current: () => host };
   return { command, calls, context, state, startup };
@@ -141,7 +151,7 @@ test('外来历史库列表：核验通过的注明来源、原位置和“可�
   assert.equal(items.length, 3, '完全相同的拷贝只显示一份');
   const [archive, copied, unavailable] = items;
   assert.equal(archive.label, '归档 · 20260901-010203-004-abcdef12');
-  assert.match(archive.description, /2 个对话 · 最后活动 2026-09-01 01:02 · alpha · 4096 B（3 个文件）/);
+  assert.ok(archive.description.includes(`2 个对话 · 最后活动 ${local('2026-09-01T01:02:03.000Z')} · alpha · 4096 B（3 个文件）`), '时间按本地时间');
   assert.match(archive.detail, /位置：\/data\/limcode\/\.limcode-runtime-backups\/20260901-010203-004-abcdef12\/active/);
   assert.match(archive.detail, /原位置：\/data\/limcode\/\.limcode-runtime\/active/);
   assert.match(archive.detail, /只读；可以合并进当前库/);
@@ -261,6 +271,8 @@ test('合并进当前库：确认框写明只读、复制正文、中断任务�
   assert.match(options.detail, /外来历史库只读：合并不在它的目录里写任何东西，它原样保留；它的正文文件会复制进当前库（不共用文件）/);
   assert.match(options.detail, /还有中断的任务或排队未发送的消息，这次不合并并说明原因（当前版本不在外来目录里收尾），仍可只读查看/);
   assert.match(options.detail, /与当前库有数据冲突时整体不合并/);
+  assert.match(options.detail, /你在本版本里删掉的对话不会回来；更早版本里删掉、而这份库里还有的对话会被加回来，合并后可以再删。/);
+  assert.doesNotMatch(options.detail, /同一个库的其它拷贝合并进来的也一样/);
   assert.match(options.detail, /（较大的库另行说明。）/);
   assert.match(options.detail, CLEANUP);
   assert.deepEqual(f.calls.find((call) => call[0] === 'request'), ['request', { globalStoragePath: ROOT }, {
@@ -294,20 +306,27 @@ test('合并进当前库：取消什么也不写；没有打开的当前库时�
 });
 
 test('旧拷贝：标出是谁的旧拷贝，合并入口写明不能合并；点开说明原因并提示在“清理备份”里按覆盖处理，不写请求', async () => {
-  const oldCurrent = entry({ sameAsLocal: { candidateId: 'default', selected: true } });
-  const oldWorkspace = entry({ id: 'foreign:archive:3333333333333333', name: '20260902-010203-004-abcdef12', sameAsLocal: { candidateId: 'workspace:folder-x', selected: false } });
+  const oldCurrent = entry({ sameAsLocal: { candidateId: 'default', selected: true, name: '当前历史库' } });
+  const oldWorkspace = entry({
+    id: 'foreign:archive:3333333333333333', name: '20260902-010203-004-abcdef12',
+    sameAsLocal: { candidateId: 'workspace:folder-0123456789abcdef', selected: false, name: 'alpha、beta' }
+  });
   const f = fixture({
     entries: [oldCurrent, oldWorkspace], host: { name: 'h', product: {} },
     picks: [0, (items) => items.find((item) => item.action === 'old-copy'), 1, (items) => items.find((item) => item.label === '合并进当前库'), undefined]
   });
   await f.command.manageForeignRuntimeHistory(f.context, f.startup);
   const [, items] = f.calls.find((call) => call[0] === 'pick');
-  assert.equal(items[0].label, '归档 · 20260901-010203-004-abcdef12（当前库的旧拷贝）');
+  assert.equal(items[0].label, '归档 · 20260901-010203-004-abcdef12（当前历史库的旧拷贝）');
   assert.match(items[0].detail, /只读；它是当前历史库的旧拷贝，不合并/);
-  assert.equal(items[1].label, '归档 · 20260902-010203-004-abcdef12（历史库 workspace:folder-x 的旧拷贝）');
+  assert.equal(items[1].label, '归档 · 20260902-010203-004-abcdef12（历史库“alpha、beta”的旧拷贝）', '用可读的库名，不写内部 id');
   const actions = f.calls.filter((call) => call[0] === 'pick');
   assert.deepEqual(actions[1][1][1], { label: '合并进当前库', description: '不能合并：它是当前历史库的旧拷贝', action: 'old-copy' });
-  assert.deepEqual(actions[3][1][1], { label: '合并进当前库', description: '不能合并：它是历史库 workspace:folder-x的旧拷贝', action: 'old-copy' });
+  assert.deepEqual(actions[3][1][1], { label: '合并进当前库', description: '不能合并：它是历史库“alpha、beta”的旧拷贝', action: 'old-copy' });
+  const shown = f.calls.flatMap((call) => call[0] === 'pick'
+    ? [call[2], ...call[1].flatMap((item) => [item.label, item.description, item.detail])]
+    : call[0] === 'info' ? [call[1]] : []);
+  assert.ok(shown.every((text) => !String(text ?? '').includes('folder-0123456789abcdef')), '任何提示里都没有内部 id');
   const infos = f.calls.filter((call) => call[0] === 'info');
   assert.equal(infos.length, 2);
   assert.match(infos[0][1], /^这个外来历史库是当前历史库的旧拷贝（同一个库的另一份），不合并/);
@@ -330,20 +349,37 @@ test('合并状态：已合并（时间）并提示在“清理备份”里按�
   });
   await f.command.manageForeignRuntimeHistory(f.context);
   const [, items] = f.calls.find((call) => call[0] === 'pick');
-  assert.match(items[0].description, /^已合并（2026-09-27 08:09） · 2 个对话/);
+  assert.equal(local('2026-09-27T08:09:10.000Z'), '2026-09-27 16:09', '本测试在东八区运行');
+  assert.ok(items[0].description.startsWith('已合并（2026-09-27 16:09） · 2 个对话'), '时间按本地时间');
   assert.match(items[0].detail, /只读；已合并进当前库/);
   assert.match(items[0].detail, CLEANUP);
-  assert.match(items[1].description, /^已合并（2026-09-26 01:02），之后有变化 · /);
+  assert.ok(items[1].description.startsWith(`已合并（${local('2026-09-26T01:02:03.000Z')}），之后有变化 · `));
   assert.match(items[1].detail, /只读；可以合并进当前库/);
-  assert.match(items[2].description, /^已请求合并（2026-09-27 09:10），还没有完成 · /);
-  assert.match(items[3].description, /^已合并（2026-09-25 01:02）；暂不能合并 · /);
+  assert.ok(items[2].description.startsWith(`已请求合并（${local('2026-09-27T09:10:11.000Z')}），还没有完成 · `));
+  assert.ok(items[3].description.startsWith(`已合并（${local('2026-09-25T01:02:03.000Z')}）；暂不能合并 · `));
   assert.match(items[3].detail, / · 只读；没有合并：同一个库的另一份拷贝先合并进来之后，这一份又有了不同的改动。$/);
   assert.doesNotMatch(items[3].detail, /第二行细节/);
   const [, actions, placeHolder] = f.calls.filter((call) => call[0] === 'pick')[1];
-  assert.equal(placeHolder, '归档 · 20260901-010203-004-abcdef12 · 已合并（2026-09-27 08:09）');
-  assert.equal(actions[1].description, '已合并（2026-09-27 08:09）；在后台合并，原目录不改动');
+  assert.equal(placeHolder, `归档 · 20260901-010203-004-abcdef12 · 已合并（${local('2026-09-27T08:09:10.000Z')}）`);
+  assert.equal(actions[1].description, `已合并（${local('2026-09-27T08:09:10.000Z')}）；在后台合并，原目录不改动`);
   assert.match(f.calls.find((call) => call[0] === 'warning')[2].detail, /它上次合并之后没有变化，这次会提示没有新内容/);
   assert.equal(f.calls.filter((call) => call[0] === 'merge-states').length, 2, '每次回到列表都重新读合并状态');
+});
+
+test('当前库延续的旧身份的拷贝标为当前库的旧拷贝；合并时跳过了删掉的对话的，列表不再说可以在清理备份里删除', async () => {
+  const continued = entry({ sameAsLocal: { candidateId: 'default', selected: true, name: '当前历史库', continued: true } });
+  const skipped = entry({ id: 'foreign:archive:4444444444444444', name: '20260904-010203-004-abcdef12' });
+  const f = fixture({
+    entries: [continued, skipped],
+    mergeStates: [['foreign:archive:4444444444444444', { state: 'merged', mergedAt: '2026-09-27T08:09:10.000Z', intoCurrent: true, changedSinceMerge: false, skippedConversations: 2 }]],
+    picks: [undefined]
+  });
+  await f.command.manageForeignRuntimeHistory(f.context);
+  const [, items] = f.calls.find((call) => call[0] === 'pick');
+  assert.equal(items[0].label, '归档 · 20260901-010203-004-abcdef12（当前历史库（迁移数据目录之前的那一份）的旧拷贝）');
+  assert.match(items[0].detail, /只读；它是当前历史库（迁移数据目录之前的那一份）的旧拷贝，不合并/);
+  assert.match(items[1].detail, /只读；已合并进当前库 · （跳过了 2 个删掉的对话，清理备份会保留这份。）/);
+  assert.doesNotMatch(items[1].detail, CLEANUP, '清理备份会保留它，不再提示可以按覆盖删除');
 });
 
 test('有未结束任务的外来库：列表写明原因、不说可以合并；合并入口写明暂不能合并，点开说明原因，不写请求，仍可只读查看', async () => {
