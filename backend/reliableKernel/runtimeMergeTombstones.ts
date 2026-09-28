@@ -59,20 +59,27 @@ export class RuntimeMergeRecordUnreadableError extends Error {
   }
 }
 
+/** One deletion record written: `withdraw` removes it again (durably) when its deletion did not happen. */
+export interface RuntimeDeletedConversationsReceipt {
+  file: string;
+  withdraw(): Promise<void>;
+}
+
 /**
  * Records, durably, that the user deleted these conversations from the data set of `identity`:
  * a new file (temporary file, fsync, rename, directory fsync) under the configuration root. Call it
- * before the deletion commits; a deletion that does not commit leaves a record that names
- * conversations still there, which no merge leaves out (only absent ones are).
+ * before the deletion commits, and withdraw it when the deletion did not happen: a merge leaves out
+ * what it names wherever the target no longer has it, also from the data set itself, where a deletion
+ * that never committed left it.
  */
 export async function recordRuntimeDeletedConversations(
   configurationRootPath: string,
   identity: RuntimeMergeIdentity,
   conversationIds: readonly string[],
   now: Date = new Date()
-): Promise<void> {
+): Promise<RuntimeDeletedConversationsReceipt | undefined> {
   const ids = [...new Set(conversationIds)];
-  if (ids.length === 0) return;
+  if (ids.length === 0) return undefined;
   if (!ids.every(isConversationId)) throw new TypeError('A deleted-conversation record names only conversation ids.');
   const root = path.resolve(configurationRootPath);
   const directory = deletionDirectory(root, identity);
@@ -94,6 +101,22 @@ export async function recordRuntimeDeletedConversations(
     await fs.rm(temporary, { force: true });
   }
   await syncDirectoryDurably(directory);
+  const file = path.join(directory, name);
+  return {
+    file,
+    withdraw: async () => {
+      await assertNoSymbolicPrefix(root, directory);
+      let info;
+      try { info = await fs.lstat(file); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+        throw error;
+      }
+      if (!info.isFile()) throw new Error(`删除记录 ${name} 不是普通文件，没有撤回`);
+      await fs.rm(file);
+      await syncDirectoryDurably(directory);
+    }
+  };
 }
 
 /**

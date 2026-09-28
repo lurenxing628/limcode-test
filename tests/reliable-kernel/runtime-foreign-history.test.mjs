@@ -148,8 +148,9 @@ test('迁移挪开的拷来目录：核验、只读查看与存储统计只经 l
     storage = await foreign.inspectForeignRuntimeStorage(paths, root);
   } finally { probe.stop(); }
   assert.deepEqual(probe.seen.filter((call) => inside(elsewhere, call.path)), [], '原件所在位置从不被访问');
-  assert.ok(probe.seen.some((call) => call.name === 'copyFile' && call.index === 0 && call.path === root.located.databasePath), '快照复制自 located 数据库');
-  assert.ok(probe.seen.filter((call) => call.name === 'copyFile' && call.index === 1).every((call) => !inside(asidePath, call.path)), '从不向拷来目录写入');
+  assert.ok(probe.seen.some((call) => call.name === 'open' && call.index === 0 && call.path === root.located.databasePath && typeof call.flags === 'number'),
+    '快照从 located 数据库的描述符读出（按描述符打开）');
+  assert.ok(probe.seen.filter((call) => call.name === 'open' && writes(call)).every((call) => !inside(asidePath, call.path)), '私有副本从不写进拷来目录');
   assert.deepEqual(probe.seen.filter((call) => writes(call) && (inside(asidePath, call.path) || (inside(path.dirname(asidePath), call.path) && !inside(copied, call.path)))), [],
     '拷来目录里和它旁边都不新建、不改写、不删除任何东西（声明与缓存只在当前配置根）');
 
@@ -353,23 +354,34 @@ test('每种拒绝原因各一例：未通过的列出位置、大小与原因�
     }],
     ['foreign-history-copy-failed', 'unavailable', async (home, t) => {
       const copied = await copiedBeside(home, elsewhere, 1);
-      const copyFile = fsp.copyFile;
-      fsp.copyFile = async function (from, ...rest) {
-        if (inside(copied, path.resolve(String(from)))) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
-        return copyFile.call(this, from, ...rest);
+      // The private copy of this root's database cannot be written (the temporary directory is full).
+      const open = fsp.open;
+      let reading;
+      fsp.open = async function (file, flags, ...rest) {
+        if (typeof flags === 'number') reading = path.resolve(String(file));
+        else if (flags === 'wx' && reading && inside(copied, reading)) throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+        return open.call(this, file, flags, ...rest);
       };
-      t.after(() => { fsp.copyFile = copyFile; });
+      t.after(() => { fsp.open = open; });
     }],
     ['foreign-history-changing', 'unavailable', async (home, t) => {
       const copied = await copiedBeside(home, elsewhere, 1);
-      const copyFile = fsp.copyFile;
+      // Every copy of the database is followed by a change of its time stamp (once its descriptor is closed).
+      const open = fsp.open;
       let tick = 0;
-      fsp.copyFile = async function (from, ...rest) {
-        const result = await copyFile.call(this, from, ...rest);
-        if (path.resolve(String(from)) === database(copied)) { tick += 1; await fs.utimes(from, new Date(), new Date(Date.now() + tick * 1000)); }
-        return result;
+      fsp.open = async function (file, ...rest) {
+        const handle = await open.call(this, file, ...rest);
+        if (path.resolve(String(file)) === database(copied)) {
+          const close = handle.close;
+          handle.close = async function () {
+            const result = await close.call(this);
+            tick += 1; await fs.utimes(file, new Date(), new Date(Date.now() + tick * 1000));
+            return result;
+          };
+        }
+        return handle;
       };
-      t.after(() => { fsp.copyFile = copyFile; });
+      t.after(() => { fsp.open = open; });
     }]
   ];
   for (const [code, status, arrange] of cases) {
@@ -422,9 +434,13 @@ test('身份关系：当前库的拷贝记为旧拷贝；两份完全相同的�
   assert.equal(byPath(third).duplicateOf, undefined);
   assert.notEqual(byPath(third).contentDigest, byPath(first).contentDigest);
 
+  // A database copied into a private snapshot is opened read-only by descriptor (numeric flags).
   const copies = [];
-  const copyFile = fsp.copyFile;
-  fsp.copyFile = async function (from, ...rest) { copies.push(path.resolve(String(from))); return copyFile.call(this, from, ...rest); };
+  const open = fsp.open;
+  fsp.open = async function (file, flags, ...rest) {
+    if (typeof flags === 'number' && path.basename(String(file)) === 'limcode.sqlite') copies.push(path.resolve(String(file)));
+    return open.call(this, file, flags, ...rest);
+  };
   try {
     await foreign.inspectForeignRuntimeHistory({ configurationRootPath: home });
     assert.deepEqual(copies, [], '文件状态没变就用缓存');
@@ -432,7 +448,7 @@ test('身份关系：当前库的拷贝记为旧拷贝；两份完全相同的�
     const again = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: home });
     assert.deepEqual(copies, [path.join(first, '.limcode-runtime', 'active', 'limcode.sqlite')], '只有变了的重新核验');
     assert.equal(again.entries.find((entry) => entry.location.containerPath === first).status, 'verified');
-  } finally { fsp.copyFile = copyFile; }
+  } finally { fsp.open = open; }
 });
 
 test('只读查看期间外来库的记录变了（指针代数被改）：读取器拒绝继续读，不返回可能过时的内容；源目录未被写入', async (t) => {

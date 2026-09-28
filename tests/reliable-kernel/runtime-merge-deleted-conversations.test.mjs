@@ -744,7 +744,19 @@ test('迁移后其它本地库的旧身份：拷来目录里迁走的其它库�
   assert.deepEqual(brief(refused), { merged: [], blocked: [[source.id, 'runtime-data-set-merge-foreign-old-copy']], deferred: [], failures: [] },
     '迁移前这样的合并就被拒绝，迁移之后也一样');
   assert.equal(refused.blocked[0].message.match(/^这个外来历史库是历史库“([^”]+)”（迁移数据目录之前的那一份）的旧拷贝（同一个库的另一份），不合并/)?.[1], name);
+  assert.match(refused.blocked[0].message, /它的对话如果都已在那个库里，可以在“清理备份”里按覆盖核对后删除/);
   assert.deepEqual(moving.conversationIds(current.runtimeDataRootPath), before, '什么都没合并进来');
+  // The tip holds: backup cleanup checks coverage in every local data set, the one that continues it
+  // included (not by identity), and finds all of this copy in it.
+  const window = await kernel.RuntimeDatabase.open(createVscodeRootAuthority({ runtimeDataRootPath: current.runtimeDataRootPath, configurationRootPath: copied }),
+    { hostBootId: `window-${randomUUID()}` });
+  try {
+    const item = (await planRuntimeBackupCleanup(copied, window)).items.find((candidate) => candidate.key === `foreign-history:${source.id}`);
+    assert.equal(item?.deletable, true, JSON.stringify(item));
+    // Proved by alpha (by its project names; the list names it from a summary not read in this test): the
+    // current data set no longer holds alpha_1.
+    assert.match(item.reason, /^可以删除：内容已完整在历史库“[^”]+”里（其中 2 个对话、/);
+  } finally { await window.close(); }
 
   // The alpha carried here merges; merges of its old identity (carried with the ledger) still leave alpha_1 out.
   const merged = await mergeIntoCurrent(copied, current, explicit(fixture.alpha.id));

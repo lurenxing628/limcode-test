@@ -212,7 +212,8 @@ test('拷来目录里的外来库在线合并进当前库：只经 located 读�
   assert.deepEqual(probe.seen.filter((call) => inside(elsewhere.root, call.path)), [], '原件所在的 recorded 位置从不被访问');
   assert.deepEqual(probe.seen.filter((call) => writes(call) && inside(container, call.path)), [], '外来目录里不新建、不改写、不删除任何东西');
   assert.deepEqual(probe.seen.filter((call) => call.name.startsWith('link') && inside(container, call.path)), [], '从不硬链接外来目录里的文件');
-  assert.ok(probe.seen.some((call) => call.name === 'copyFile' && call.index === 0 && call.path === source.databasePath), '快照复制自 located 数据库');
+  assert.ok(probe.seen.some((call) => call.name === 'open' && call.index === 0 && call.path === source.databasePath && typeof call.flags === 'number'),
+    '快照从 located 数据库的描述符读出（按描述符打开）');
   assert.deepEqual(await treeState(container), before, '外来目录逐字节、逐 inode 不变（链接数与 ctime 也不变）');
   assert.deepEqual(await treeState(elsewhere.root), original);
   const object = query(fixture.current.binding.paths.databasePath, 'SELECT storage_key FROM content_object ORDER BY id')

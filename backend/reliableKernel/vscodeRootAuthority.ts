@@ -25,16 +25,18 @@ export const VSCODE_RUNTIME_SELECTION_FILE = '.limcode-runtime-selection.json';
  */
 export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
 /**
- * Reset archives of a scope (`<scope>/.limcode-runtime-backups/<time>-<id8>`, each a complete former
+ * Reset archives of a scope (`<scope>/.limcode-runtime-backups/<name>`, see VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN, each a complete former
  * control root). Never a data set of this configuration root: a scope that keeps only these is not
  * enumerated, and each archive is listed as foreign history (runtimeForeignHistory).
  */
 export const VSCODE_RUNTIME_ARCHIVES_DIRECTORY = '.limcode-runtime-backups';
 /**
- * Names of reset archives: `<yyyyMMdd-HHmmss-SSS>-<id8>` (archiveCurrentRuntimeRootForReset), and
- * `<yyyyMMdd-HHmmss-SSS>-epoch-<N>-to-<M>-<id8>` of the automatic epoch resets of released 0.0.15–0.0.21.
+ * Names of reset archives (one group, safe to embed): `<yyyyMMdd-HHmmss-SSS>-<id8>`
+ * (archiveCurrentRuntimeRootForReset), `<yyyyMMdd-HHmmss-SSS>-epoch-<N>-to-<M>-<id8>` of the automatic
+ * epoch resets of released 0.0.15–0.0.21, and the 17 digits `<yyyyMMddHHmmssSSS>` of the manual
+ * “归档并重置” of released 0.0.10–0.0.20 (resetDevelopmentData, a published older format).
  */
-export const VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN = String.raw`\d{8}-\d{6}-\d{3}-(?:epoch-\d+-to-\d+-)?[0-9a-f]{8}`;
+export const VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN = String.raw`(?:\d{8}-\d{6}-\d{3}-(?:epoch-\d+-to-\d+-)?[0-9a-f]{8}|\d{17})`;
 const RUNTIME_ARCHIVE_NAME = new RegExp(`^${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`);
 const WORKSPACE_SCOPE_KEY = /^(workspace-file|folder|folder-set|empty)-[a-f0-9]{64}$/;
 

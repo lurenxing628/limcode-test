@@ -79,8 +79,10 @@ export interface ConversationDeleteCommandDependencies {
    * Records durably that the user deleted exactly these conversations from the current data set
    * (runtimeMergeTombstones), right before the deletion commits, so no later merge of an older copy
    * brings them back. A failure never stops the deletion: the result says so (`deletionRecordError`).
+   * What it returns withdraws the record: the command calls it when it fails and the conversation is
+   * still there (its deletion never committed), so no merge leaves out a conversation not deleted.
    */
-  recordDeleted?(conversationIds: readonly string[]): Promise<void>;
+  recordDeleted?(conversationIds: readonly string[]): Promise<{ withdraw(): Promise<void> } | void>;
   timeoutMs?: number;
   pollMs?: number;
 }
@@ -139,6 +141,8 @@ class ConversationDeleteCommand {
   /** Conversations recorded as deleted (recordDeleted) by an earlier round, and the last failure to. */
   private readonly recordedDeleted = new Set<string>();
   private recordError: string | undefined;
+  /** The records written, withdrawn when the command fails with its conversation still there. */
+  private readonly receipts: Array<{ withdraw(): Promise<void> }> = [];
 
   public constructor(
     private readonly dependencies: ConversationDeleteCommandDependencies,
@@ -151,9 +155,24 @@ class ConversationDeleteCommand {
     const releases: Array<() => void> = [];
     try {
       return await this.stopAndDelete(releases);
+    } catch (error) {
+      await this.withdrawUncommitted();
+      throw error;
     } finally {
       for (const release of releases) release();
     }
+  }
+
+  /**
+   * The command failed: a transaction deletes the whole tree or nothing, so while its conversation is
+   * still there no deletion committed and every record written for it is withdrawn. Anything unclear
+   * (the conversation gone, or not readable now) keeps them.
+   */
+  private async withdrawUncommitted(): Promise<void> {
+    if (this.receipts.length === 0) return;
+    const still = await this.dependencies.application.conversationDeletion.inspect(this.conversationId).catch(() => null);
+    if (!still) return;
+    for (const receipt of this.receipts.splice(0)) await receipt.withdraw().catch(() => undefined);
   }
 
   private async stopAndDelete(releases: Array<() => void>): Promise<ConversationDeleteCommandResult | null> {
@@ -211,7 +230,8 @@ class ConversationDeleteCommand {
     const missing = conversationIds.filter((id) => !this.recordedDeleted.has(id));
     if (!record || missing.length === 0) return;
     try {
-      await record(missing);
+      const receipt = await record(missing);
+      if (receipt) this.receipts.push(receipt);
       for (const id of missing) this.recordedDeleted.add(id);
     } catch (error) {
       this.recordError = error instanceof Error ? error.message : String(error);

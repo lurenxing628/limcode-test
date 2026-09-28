@@ -25,7 +25,7 @@ import {
 } from './runtimeDataSetMerge';
 import {
   isReadableRuntimeDataSetFingerprint, isRuntimeLargeMergeTargetBackupLive, readRuntimeDataSetMergeLedger,
-  readRuntimeLargeMergeTargetBackups, runtimeDataSetFingerprint
+  readRuntimeDataSetMergeRequests, readRuntimeLargeMergeTargetBackups, runtimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
 import {
   MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
@@ -2277,15 +2277,22 @@ function copiedContainer(
 }
 
 /**
- * A merge from this foreign root whose transaction may have committed without its record (a crash):
- * it converges from the ledger alone, but only a rolled-back one merges again, from this root.
+ * A merge from this foreign root still to happen keeps it: one whose transaction may have committed
+ * without its record (a crash; it converges from the ledger alone, but only a rolled-back one merges
+ * again, from this root), and one the user asked for that has not run yet (deleting the root would
+ * leave the request to fail later with nothing to merge; it is kept until merged or given up).
  */
-async function foreignMergeCommitting(configurationRootPath: string, foreignId: string): Promise<string | undefined> {
+async function foreignMergePending(configurationRootPath: string, foreignId: string): Promise<string | undefined> {
   try {
-    const record = (await readRuntimeDataSetMergeLedger({ globalStoragePath: configurationRootPath })).get(foreignId);
-    return record?.state === 'committing' ? '有进行中的操作（正在提交的合并），完成之后再清理' : undefined;
+    const paths = { globalStoragePath: configurationRootPath };
+    const record = (await readRuntimeDataSetMergeLedger(paths)).get(foreignId);
+    if (record?.state === 'committing') return '有进行中的操作（正在提交的合并），完成之后再清理';
+    if ((await readRuntimeDataSetMergeRequests(paths)).has(foreignId)) {
+      return '你已请求把它合并进当前库，合并还没完成；合并完成或请求过期之后再清理';
+    }
+    return undefined;
   } catch {
-    return '合并记录无法读取，不能确认它没有正在提交的合并，这次不能删除';
+    return '合并记录无法读取，不能确认它没有正在提交的合并或等待中的合并请求，这次不能删除';
   }
 }
 
@@ -2306,7 +2313,7 @@ async function evaluateForeign(
   held: HeldDatabaseFiles
 ): Promise<{ item: RuntimeBackupCleanupItem; proof?: ForeignProof }> {
   const listed = (reason: string, detail?: string, tree?: TreeFacts) => ({ item: foreignItem(found, unit, tree, reason, detail) });
-  const committing = await foreignMergeCommitting(input.configurationRootPath, found.id);
+  const committing = await foreignMergePending(input.configurationRootPath, found.id);
   if (committing) return listed(committing, undefined, await linkFreeTree(found.location.containerPath, unit));
   const locals = input.roots.flatMap((root) => root.local ? [root.local] : []);
   const hint = await readForeignRuntimePointerIdentity(found.location, held).catch(() => undefined);
@@ -2685,7 +2692,7 @@ async function markForeignRoot(
   if (await liveForeignRuntimeHistoryViews(configurationRootPath, proof.root.id) > 0) {
     return { state: 'kept', reason: `${FOREIGN_BUSY}，这一项没有删除` };
   }
-  const committing = await foreignMergeCommitting(configurationRootPath, proof.found.id);
+  const committing = await foreignMergePending(configurationRootPath, proof.found.id);
   if (committing) return kept(committing);
   const { roots, databaseFiles } = await listControlRoots(configurationRootPath, current, () => undefined);
   const held = await heldFiles(configurationRootPath, databaseFiles);

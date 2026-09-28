@@ -245,6 +245,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-foreign-history-review.test.mjs',
   'tests/reliable-kernel/runtime-foreign-history-merge.test.mjs',
   'tests/reliable-kernel/runtime-merge-deleted-conversations.test.mjs',
+  'tests/reliable-kernel/runtime-foreign-history-blind.test.mjs',
   'tests/reliable-kernel/foreign-archive-only-relocation.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-review.test.mjs',

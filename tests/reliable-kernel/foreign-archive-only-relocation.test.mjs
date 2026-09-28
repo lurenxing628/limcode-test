@@ -159,7 +159,7 @@ test('foreign-archive-only-relocation：旧目录里读不了的归档目录（�
   assert.ok(await exists(path.join(scope, '.limcode-runtime-backups')));
 });
 
-test('最后一轮 #5 连续迁移（A→B→C）之后，A 和 B 里的归档都列在 C 的外来历史库里；里面已经没有归档和拷来目录的旧目录判为可去掉，读不了的、盘没接上的、旁边还有拷来目录的都保留', async (t) => {
+test('最后一轮 #5 连续迁移（A→B→C）之后，A 和 B 里的归档都列在 C 的外来历史库里；在而且里面已经没有归档和拷来目录的旧目录判为可去掉，读不了的、不在的（盘没接上，或挂载点还在而盘没接上）、旁边还有拷来目录的都保留', async (t) => {
   const fixture = await createFixture(t);
   const { backupPath } = await archiveAndReset(fixture, fixture.current);
   const [a, b, c] = [fixture.root, path.join(fixture.base, 'b-home'), path.join(fixture.base, 'c-home')];
@@ -188,5 +188,7 @@ test('最后一轮 #5 连续迁移（A→B→C）之后，A 和 B 里的归档�
   const removable = await foreign.previousDataRootsWithoutForeignHistory({
     configurationRootPath: c, previousDataRootPaths: [b, a, empty, gone, unmounted, beside, locked, c]
   });
-  assert.deepEqual(removable, privileged ? [empty, gone, locked] : [empty, gone], '只有确实空了的旧目录；当前目录本身不在列表里');
+  // A directory that is not there (its parent listable: a mount point whose disk is not attached looks the
+  // same) is kept, like one whose parent is gone too.
+  assert.deepEqual(removable, privileged ? [empty, locked] : [empty], '只有在而且确实空了的旧目录；不在的保留；当前目录本身不在列表里');
 });

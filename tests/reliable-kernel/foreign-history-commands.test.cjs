@@ -62,7 +62,9 @@ function fixture({ entries = [entry(), entry({ id: 'foreign:archive:111111111111
   entry({ id: 'foreign:copied:2222222222222222', status: 'unavailable', code: 'foreign-history-copy-failed', reason: '暂时无法核验：复制数据库到私有临时目录失败（ENOSPC）。', summary: undefined })],
 picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
   lastMigration: { fromPath: '/old/limcode', toPath: ROOT, migratedAt: '2026-09-01' }, previousDataRoots: ['/old/limcode', '/older/limcode']
-}, mergeStates = [], requestError, host } = {}) {
+}, mergeStates = [], requestError, host, located = {
+  id: 'foreign:archive:0123456789abcdef', recorded: { dataSetId: 'data-set-a', rootInstanceId: 'instance-a' }
+} } = {}) {
   const calls = [];
   const state = new Map();
   const context = { globalState: { get: (key) => state.get(key), update: async (key, value) => { state.set(key, value); } } };
@@ -82,7 +84,6 @@ picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
       async showErrorMessage(message) { calls.push(['error', message]); }
     }
   };
-  const located = { id: 'located-root' };
   const command = loadCommand({
     vscode,
     '../../backend/capabilities/vscodeStorage/globalStatus': {
@@ -128,8 +129,7 @@ picks = [], warnings = [], infos = [], discovered = [], empties = [], status = {
       mergeHistoricalDataSetsInBackground: async (_context, current, shouldContinue, ids) => {
         calls.push(['background-merge', current.name, shouldContinue(), plain(ids)]);
       },
-      oversizedMergeNote: () => '（较大的库另行说明。）',
-      keptForSkippedTip: (skipped) => `（跳过了 ${skipped} 个删掉的对话，清理备份会保留这份。）`
+      oversizedMergeNote: () => '（较大的库另行说明。）'
     },
     './backupCleanup': { formatTime: (value) => local(value) }
   });
@@ -190,8 +190,8 @@ test('选中核验通过的外来库：可以只读查看、合并进当前库�
   assert.deepEqual(f.calls.filter((call) => call[0] === 'locate').map((call) => call.slice(1)), [
     [ROOT, entry().location], [ROOT, entry().location]
   ]);
-  assert.deepEqual(f.calls.find((call) => call[0] === 'open-history'), ['open-history', { globalStoragePath: ROOT }, 'located-root']);
-  assert.deepEqual(f.calls.find((call) => call[0] === 'storage'), ['storage', { globalStoragePath: ROOT }, 'located-root']);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'open-history'), ['open-history', { globalStoragePath: ROOT }, 'foreign:archive:0123456789abcdef']);
+  assert.deepEqual(f.calls.find((call) => call[0] === 'storage'), ['storage', { globalStoragePath: ROOT }, 'foreign:archive:0123456789abcdef']);
   const [, title, text] = f.calls.find((call) => call[0] === 'read-only');
   assert.equal(title, '外来历史库占用');
   assert.match(text, /原位置（只作记录，不会访问）：\/data\/limcode\/\.limcode-runtime\/active/);
@@ -382,10 +382,25 @@ test('本地库（当前库或其它本地库）延续的旧身份的拷贝标�
   const [, items] = f.calls.find((call) => call[0] === 'pick');
   assert.equal(items[0].label, '归档 · 20260901-010203-004-abcdef12（当前历史库（迁移数据目录之前的那一份）的旧拷贝）');
   assert.match(items[0].detail, /只读；它是当前历史库（迁移数据目录之前的那一份）的旧拷贝，不合并/);
-  assert.match(items[1].detail, /只读；已合并进当前库 · （跳过了 2 个删掉的对话，清理备份会保留这份。）/);
+  assert.match(items[1].detail, /只读；已合并进当前库 · 合并时跳过了 2 个你删掉过的对话（在当前库，或在这份原来所属的库里删掉的），它们只在这份里还有，所以“清理备份”会保留这份/);
   assert.doesNotMatch(items[1].detail, CLEANUP, '清理备份会保留它，不再提示可以按覆盖删除');
   assert.equal(items[2].label, '归档 · 20260905-010203-004-abcdef12（历史库“alpha”（迁移数据目录之前的那一份）的旧拷贝）');
   assert.match(items[2].detail, /只读；它是历史库“alpha”（迁移数据目录之前的那一份）的旧拷贝，不合并/);
+});
+
+test('盲审 #6：只读查看与存储统计重新定位后，那个位置上已经换成了另一个库（id 或身份不同）：提示重新打开列表，不打开、不统计', async () => {
+  for (const located of [
+    { id: 'foreign:archive:9999999999999999', recorded: { dataSetId: 'data-set-a', rootInstanceId: 'instance-a' } },
+    { id: 'foreign:archive:0123456789abcdef', recorded: { dataSetId: 'data-set-b', rootInstanceId: 'instance-b' } }
+  ]) {
+    for (const action of ['read', 'storage']) {
+      const f = fixture({ located, picks: [0, (items) => items.find((item) => item.action === action), undefined] });
+      await f.command.manageForeignRuntimeHistory(f.context);
+      const warning = f.calls.find((call) => call[0] === 'warning');
+      assert.match(warning?.[1] ?? '', /这个位置上的外来历史库已经不是列表里的那一份了（列出之后被换过），没有打开。请重新打开“外来历史库”列表再看。/, action);
+      assert.equal(f.calls.some((call) => ['open-history', 'browse', 'storage', 'read-only'].includes(call[0])), false, action);
+    }
+  }
 });
 
 test('有未结束任务的外来库：列表写明原因、不说可以合并；合并入口写明暂不能合并，点开说明原因，不写请求，仍可只读查看', async () => {

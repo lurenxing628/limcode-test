@@ -69,7 +69,7 @@
     "unselectedHistory": "offline-snapshot-read-only-on-demand",
     "historicalEpochUpgrade": "automatic-backup-then-exact-target-offline-upgrade",
     "historyDiscovery": "per-candidate-errors-no-implicit-fallback",
-    "foreignHistory": "verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself; merged-into-current-only-on-user-request-under-its-claim-copied-never-linked-ledger-under-current-configuration-root",
+    "foreignHistory": "verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself; merged-into-current-only-on-user-request-under-its-claim-copied-never-linked-ledger-under-current-configuration-root; reset-archives-named-time-id8-or-time-epoch-n-to-m-id8-or-the-17-digits-of-the-manual-reset-of-released-0.0.10-0.0.20-a-published-older-format-listed-not-verified-with-location-size-and-reason",
     "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [
       "paths",

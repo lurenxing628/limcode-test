@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type BigIntStats } from 'node:fs';
 import * as fs from 'node:fs/promises';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { isSamePath } from '../capabilities/filesystem/pathContainment';
 import { inProcessSqliteDatabasePaths } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
@@ -22,7 +23,7 @@ import {
 import { findRuntimeIdentityOwner } from './runtimeMergeTombstones';
 import { auditRuntimeSnapshot, RuntimeSnapshotAuditError } from './runtimeSnapshotAudit';
 import {
-  assertNoSymbolicPath, copyRuntimeSqliteFiles, inspectLocatedRuntimeStorage, type RuntimeDataSetStorageInspection
+  assertNoSymbolicPath, inspectLocatedRuntimeStorage, type RuntimeDataSetStorageInspection
 } from './runtimeStorageInspection';
 import {
   inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories, resolveVscodeRuntimeMergeLedgerRoot,
@@ -34,7 +35,8 @@ import {
 /**
  * Foreign history: complete Runtime roots this configuration root does not enumerate as data sets,
  * registered in place and read only. Found by listing directories and reading small JSON files:
- * - reset archives `<scope>/.limcode-runtime-backups/<time>[-epoch-<N>-to-<M>]-<id8>` of every scope
+ * - reset archives `<scope>/.limcode-runtime-backups/<time>[-epoch-<N>-to-<M>]-<id8>` (or the 17 digits
+ *   of released 0.0.10–0.0.20, a published older format listed as not verified) of every scope
  *   of the current data directory and of the data directories this installation left (globalStatus
  *   previousDataRoots and lastMigration.fromPath, see ForeignRuntimeHistoryInput), also of scopes
  *   that keep nothing else (the data root is `<archive>/active`);
@@ -134,6 +136,8 @@ export class ForeignRuntimeHistoryRejection extends Error {
 export type HeldDatabaseFiles = ReadonlySet<string>;
 
 const ARCHIVE_NAME = new RegExp(`^${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`);
+/** A root renamed aside by backup cleanup before its removal (`<name>.deleting-<16 hex>`, runtimeBackupCleanup). */
+const DELETING_LEFTOVER = /^(.+)\.deleting-[0-9a-f]{16}$/;
 const COPIED_SUFFIX = String.raw`\.limcode-copied-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[0-9a-f]{8}`;
 const WORKSPACE_SCOPE_KEY = /^(workspace-file|folder|folder-set|empty)-[a-f0-9]{64}$/;
 const SCOPE_PREFIX = String.raw`(?:\.limcode-workspace-runtimes/scopes/(?:workspace-file|folder|folder-set|empty)-[a-f0-9]{64}/)?`;
@@ -361,10 +365,12 @@ function previousDataRoots(configurationRoot: string, previous: readonly string[
 }
 
 /**
- * The previous data directories that provably hold nothing foreign history would list: no reset
- * archive in any scope and no copied directory beside them (a directory that is gone counts as
- * empty only when its parent can be listed). Anything that cannot be read keeps its directory: an
- * unmounted drive must not make its archives disappear from the list for good.
+ * The previous data directories that provably hold nothing foreign history would list: the directory
+ * is there and readable, no reset archive in any scope (any name VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN
+ * knows) and no `.deleting-` leftover of an interrupted backup cleanup there (it is settled only while
+ * its directory is remembered, see listRenamedForeignRuntimeRoots), and no copied directory beside it.
+ * A directory that is gone is kept (it may sit on a drive not mounted now, its mount point still
+ * listable); so is anything that cannot be read: its archives must not disappear from the list for good.
  */
 export async function previousDataRootsWithoutForeignHistory(input: ForeignRuntimeHistoryInput): Promise<string[]> {
   const configurationRoot = path.resolve(input.configurationRootPath);
@@ -373,22 +379,22 @@ export async function previousDataRootsWithoutForeignHistory(input: ForeignRunti
     try {
       const siblings = await fs.readdir(path.dirname(base));
       if (siblings.some((name) => copiedNamePattern(base).test(name))) continue;
-      const info = await fs.lstat(base).catch((error: unknown) => {
-        if (isMissing(error)) return undefined;
-        throw error;
-      });
-      if (info) {
-        if (!info.isDirectory()) continue;
-        await fs.readdir(base);
-        const scopes = path.join(base, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
-        // Scopes that cannot be listed may hide archives.
-        await fs.readdir(scopes).catch((error: unknown) => { if (!isMissing(error)) throw error; });
-        const archives = await listVscodeRuntimeArchiveDirectories(base);
-        if (archives.some((directory) => directory.unreadable || directory.names.length > 0)) continue;
+      const info = await fs.lstat(base);
+      if (!info.isDirectory()) continue;
+      await fs.readdir(base);
+      const scopes = path.join(base, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
+      // Scopes that cannot be listed may hide archives.
+      await fs.readdir(scopes).catch((error: unknown) => { if (!isMissing(error)) throw error; });
+      const archives = await listVscodeRuntimeArchiveDirectories(base);
+      if (archives.some((directory) => directory.unreadable || directory.names.length > 0)) continue;
+      let leftover = false;
+      for (const directory of archives) {
+        leftover ||= (await fs.readdir(directory.path)).some((name) => ARCHIVE_NAME.test(DELETING_LEFTOVER.exec(name)?.[1] ?? ''));
       }
+      if (leftover) continue;
       empty.push(base);
     } catch {
-      // Not readable now: kept.
+      // Gone, or not readable now: kept.
     }
   }
   return empty;
@@ -665,8 +671,10 @@ export async function copyForeignRuntimeSqliteFiles(
     let copy: { databasePath: string; remove(): Promise<void> };
     try {
       before = await runtimeDataSetFileState(databasePath);
-      copy = await copyRuntimeSqliteFiles(containerRoot, databasePath);
+      copy = await copyForeignSqliteByDescriptor(containerRoot, databasePath, held);
     } catch (error) {
+      // A file that turned out to be a link, a FIFO or a device, or one of a database this process holds.
+      if (error instanceof ForeignRuntimeHistoryRejection) throw error;
       if (isMissing(error) && !await present(containerRoot).catch(() => true)) throw gone();
       throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-copy-failed',
         `复制数据库到私有临时目录失败（${error instanceof Error ? error.message : String(error)}），稍后再试。`);
@@ -681,6 +689,60 @@ export async function copyForeignRuntimeSqliteFiles(
     }
   }
   throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-changing', '数据库文件在复制期间一直在变化，稍后再试。');
+}
+
+/**
+ * The database and its WAL (never -shm; a non-empty -journal refuses) copied into a fresh private
+ * temporary directory from descriptors opened as openLocatedRuntimeFile opens them: nothing is opened
+ * through a link or as a FIFO, and a file that turns out to be one of a database this process holds is
+ * kept open, never closed (its POSIX locks stay). Named with this process id, like every private copy.
+ */
+async function copyForeignSqliteByDescriptor(
+  containerRoot: string,
+  databasePath: string,
+  held: HeldDatabaseFiles
+): Promise<{ databasePath: string; remove(): Promise<void> }> {
+  await assertNoSymbolicPath(containerRoot, databasePath);
+  const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-runtime-history-${process.pid}-`));
+  const remove = () => fs.rm(temporaryRoot, { recursive: true, force: true });
+  try {
+    const copied = path.join(temporaryRoot, 'limcode.sqlite');
+    await copyFromDescriptor(await openLocatedRuntimeFile(databasePath, held), copied);
+    const journal = await lstatIfPresent(`${databasePath}-journal`);
+    if (journal && (!journal.isFile() || journal.size > 0)) {
+      throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-rollback-journal', 'SQLite 有未完成的回滚日志（-journal），原样保留。');
+    }
+    const wal = `${databasePath}-wal`;
+    if (await lstatIfPresent(wal)) {
+      await assertNoSymbolicPath(containerRoot, wal);
+      await copyFromDescriptor(await openLocatedRuntimeFile(wal, held), `${copied}-wal`);
+    }
+    return { databasePath: copied, remove };
+  } catch (error) {
+    await remove();
+    throw error;
+  }
+}
+
+/** Copies what an open descriptor reads into a new private file (made durable), then closes the descriptor. */
+async function copyFromDescriptor(source: fs.FileHandle, target: string): Promise<void> {
+  try {
+    const out = await fs.open(target, 'wx', 0o600);
+    try {
+      const buffer = Buffer.allocUnsafe(1024 * 1024);
+      for (let position = 0; ;) {
+        const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
+        if (bytesRead === 0) break;
+        await out.write(buffer, 0, bytesRead);
+        position += bytesRead;
+      }
+      await out.sync();
+    } finally {
+      await out.close();
+    }
+  } finally {
+    await source.close();
+  }
 }
 
 /**
@@ -739,7 +801,9 @@ export async function inspectForeignRuntimeHistory(
   const { candidates } = await inspectVscodeRuntimeDataSets({ globalStoragePath: configurationRoot });
   const entries: ForeignRuntimeHistoryEntry[] = [];
   for (const entry of found) {
-    entries.push((await inspectOne(configurationRoot, entry, held)).entry);
+    // A root whose claim is held (a merge from preparation to commit, a read-only view opening it) is
+    // not waited for: its cached result when there is one, else "being used, verified later".
+    entries.push((await inspectOne(configurationRoot, entry, held, false)).entry);
     input.onProgress?.(entries.length, found.length);
   }
   await relate(configurationRoot, entries, candidates);
@@ -776,7 +840,8 @@ export async function inspectForeignRuntimeRoot(
 async function inspectOne(
   configurationRoot: string,
   found: DiscoveredForeignRuntimeRoot,
-  held: HeldDatabaseFiles
+  held: HeldDatabaseFiles,
+  waitForClaim = true
 ): Promise<{ entry: ForeignRuntimeHistoryEntry; root?: LocatedRuntimeRoot }> {
   const locatedPath = hasDataRoot(found.location) ? locatedPaths(found.location).dataRootPath : found.location.containerPath;
   const base: ForeignRuntimeHistoryEntry = { ...found, status: 'unavailable', locatedPath };
@@ -796,7 +861,7 @@ async function inspectOne(
     rootInstanceId: root.recorded.rootInstanceId, runtimeKernelEpoch: root.recorded.runtimeKernelEpoch
   };
   try {
-    const result = await auditForeignRuntimeRoot(configurationRoot, root, held);
+    const result = await auditForeignRuntimeRoot(configurationRoot, root, held, waitForClaim);
     if (result.outcome === 'failed') {
       return { entry: { ...base, ...identity, status: 'failed', code: result.code, reason: result.reason, size: result.size }, root };
     }
@@ -817,30 +882,49 @@ type AuditResult =
   | { outcome: 'verified'; audit: ForeignAudit; size?: { bytes: string; fileCount: number } }
   | { outcome: 'failed'; code: string; reason: string; size?: { bytes: string; fileCount: number } };
 
-/** Under the foreign claim: the private-snapshot audit (worker), kept per exact file state. */
+/**
+ * The private-snapshot audit (worker), kept per exact file state: a result cached for the root's exact
+ * files is returned without its claim; anything else is read under the claim, waited for or, without
+ * `waitForClaim`, refused while another holds it ("being used, verified later").
+ */
 async function auditForeignRuntimeRoot(
   configurationRoot: string,
   root: LocatedRuntimeRoot,
-  held: HeldDatabaseFiles
+  held: HeldDatabaseFiles,
+  waitForClaim: boolean
 ): Promise<AuditResult> {
-  return withLocatedRuntimeRootFence({ globalStoragePath: configurationRoot }, root, async () => {
+  const early = await foreignFileState(root).then((files) => readAuditCache(configurationRoot, root.id, files), () => undefined);
+  if (early) return early;
+  if (!waitForClaim) {
     if (root.origin.kind !== 'foreign') throw new TypeError('Not a foreign root.');
-    const current = await locateForeignRuntimeRoot(configurationRoot, root.origin.location, held);
-    if (!sameLocatedRuntimeRoot(current, root)) {
-      throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-changed', '核验期间它发生了变化，稍后再试。');
+    const claimed = await tryWithForeignRuntimeRootClaim(configurationRoot, root.id, root.located.rootPointerPath,
+      () => auditUnderClaim(configurationRoot, root, held));
+    if (!claimed.acquired) {
+      throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-busy', '它正在被合并或查看（占用它的是另一个窗口或操作），稍后再核验。');
     }
-    const files = await foreignFileState(current);
-    const cached = await readAuditCache(configurationRoot, current.id, files);
-    if (cached) return cached;
-    const copy = await copyLocatedRuntimeDatabase(current, held);
-    let result: AuditResult;
-    try { result = await auditCopy(copy.databasePath, current); }
-    finally { await copy.remove(); }
-    const size = await measureTree(path.dirname(current.located.rootPointerPath));
-    const complete: AuditResult = size ? { ...result, size } : result;
-    await writeAuditCache(configurationRoot, current.id, files, complete).catch(() => undefined);
-    return complete;
-  });
+    return claimed.value;
+  }
+  return withLocatedRuntimeRootFence({ globalStoragePath: configurationRoot }, root, () => auditUnderClaim(configurationRoot, root, held));
+}
+
+/** Under the foreign claim: located again, then the cached result or the audit of a private copy. */
+async function auditUnderClaim(configurationRoot: string, root: LocatedRuntimeRoot, held: HeldDatabaseFiles): Promise<AuditResult> {
+  if (root.origin.kind !== 'foreign') throw new TypeError('Not a foreign root.');
+  const current = await locateForeignRuntimeRoot(configurationRoot, root.origin.location, held);
+  if (!sameLocatedRuntimeRoot(current, root)) {
+    throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-changed', '核验期间它发生了变化，稍后再试。');
+  }
+  const files = await foreignFileState(current);
+  const cached = await readAuditCache(configurationRoot, current.id, files);
+  if (cached) return cached;
+  const copy = await copyLocatedRuntimeDatabase(current, held);
+  let result: AuditResult;
+  try { result = await auditCopy(copy.databasePath, current); }
+  finally { await copy.remove(); }
+  const size = await measureTree(path.dirname(current.located.rootPointerPath));
+  const complete: AuditResult = size ? { ...result, size } : result;
+  await writeAuditCache(configurationRoot, current.id, files, complete).catch(() => undefined);
+  return complete;
 }
 
 async function auditCopy(databasePath: string, root: LocatedRuntimeRoot): Promise<AuditResult> {

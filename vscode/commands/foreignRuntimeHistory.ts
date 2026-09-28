@@ -13,7 +13,7 @@ import {
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { formatTime } from './backupCleanup';
 import {
-  browseRuntimeHistory, formatBytes, keptForSkippedTip, mergeHistoricalDataSetsInBackground, oversizedMergeNote, showReadOnly,
+  browseRuntimeHistory, formatBytes, mergeHistoricalDataSetsInBackground, oversizedMergeNote, showReadOnly,
   type HistoricalMergeHost
 } from './runtimeDataSetManagement';
 
@@ -26,6 +26,14 @@ import {
 const ANNOUNCED_KEY = 'limcode.foreignRuntimeHistoryAnnounced';
 const ANNOUNCED_LIMIT = 500;
 const CLEANUP_TIP = '这份归档或拷来的库原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。';
+
+/**
+ * A foreign merge skips what was deleted in the current data set and also what was deleted in the data
+ * set this copy was taken from (its own deletion records), so the tip does not say “in the current one” only.
+ */
+function skippedTip(skipped: number): string {
+  return `合并时跳过了 ${skipped} 个你删掉过的对话（在当前库，或在这份原来所属的库里删掉的），它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`;
+}
 
 async function foreignInput(
   context: vscode.ExtensionContext,
@@ -165,13 +173,19 @@ async function actOn(
     return;
   }
   if (action.action === 'merge') return mergeIntoCurrent(context, paths, entry, merge, startup);
-  const locate = () => locateForeignRuntimeRoot(paths.globalStoragePath, entry.location);
+  // Located again from where it was found: another root now there is not the one listed.
+  const root = await locateForeignRuntimeRoot(paths.globalStoragePath, entry.location);
+  if (root.id !== entry.id || (entry.dataSetId !== undefined
+    && (root.recorded.dataSetId !== entry.dataSetId || root.recorded.rootInstanceId !== entry.rootInstanceId))) {
+    await vscode.window.showWarningMessage('这个位置上的外来历史库已经不是列表里的那一份了（列出之后被换过），没有打开。请重新打开“外来历史库”列表再看。');
+    return;
+  }
   if (action.action === 'read') {
-    await browseRuntimeHistory(context, entryLabel(entry), async () => openRuntimeDataSetHistory(paths, await locate()), '外来历史库');
+    await browseRuntimeHistory(context, entryLabel(entry), async () => openRuntimeDataSetHistory(paths, root), '外来历史库');
     return;
   }
   const report = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在统计外来历史库占用…' },
-    async () => inspectForeignRuntimeStorage(paths, await locate()));
+    async () => inspectForeignRuntimeStorage(paths, root));
   const labels: Record<string, string> = {
     sqlite: 'SQLite 数据库', cas: '历史正文与附件（CAS）', casTemporary: 'CAS 临时残留', processSpool: '进程输出暂存',
     diagnostics: '诊断日志', other: '其它运行文件', historicalBackups: '它自己的升级与合并备份'
@@ -286,7 +300,7 @@ function mergeDetail(entry: ForeignRuntimeHistoryEntry, merge?: ForeignRuntimeHi
   const copyOf = oldCopyOf(entry);
   if (copyOf) return [`只读；它是${copyOf}的旧拷贝，不合并`];
   if (merge?.state === 'merged' && merge.intoCurrent && !merge.changedSinceMerge) {
-    return ['只读；已合并进当前库', merge.skippedConversations ? keptForSkippedTip(merge.skippedConversations) : CLEANUP_TIP];
+    return ['只读；已合并进当前库', merge.skippedConversations ? skippedTip(merge.skippedConversations) : CLEANUP_TIP];
   }
   // The line on its unfinished work says why it is not merged now.
   if (unfinishedCount(entry) > 0) return ['只读'];

@@ -47,7 +47,8 @@ import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './run
 import {
   assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
   markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
-  resolveVscodeRuntimeMergeLedgerRoot, selectVscodeRuntimeDataSet, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY,
+  resolveVscodeRuntimeMergeLedgerRoot, selectVscodeRuntimeDataSet, VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN, VSCODE_RUNTIME_CONTROL_DIRECTORY,
+  VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY,
   VSCODE_RUNTIME_SELECTION_FILE, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
 } from './vscodeRootAuthority';
 
@@ -106,6 +107,7 @@ const CONFIGURATION_BACKUP_DIRECTORY = 'configuration';
 const DATABASE_BACKUP_PREFIX = 'database-';
 /** Archives of "归档并重置" (VscodeReliableKernelCutoverCoordinator), one per scope root. */
 const RESET_ARCHIVES_DIRECTORY = '.limcode-runtime-backups';
+const RESET_ARCHIVE_NAME = new RegExp(`^${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`);
 const CONTROL_ROOT_BACKUP_DIRECTORIES: readonly string[] = [
   RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY
 ];
@@ -3560,10 +3562,20 @@ export async function deleteOldDataRoot(input: {
   });
 }
 
-/** Reset archives in every scope of a data directory, found by listing directories (an unreadable archives directory counts once). */
+/**
+ * Reset archives in every scope of a data directory, found by listing directories (an unreadable
+ * archives directory counts once), and the `.deleting-` leftovers of an interrupted backup cleanup
+ * there: those are settled only while the directory is remembered.
+ */
 async function countResetArchives(root: string): Promise<number> {
   const directories = await listVscodeRuntimeArchiveDirectories(root).catch(() => []);
-  return directories.reduce((sum, directory) => sum + (directory.unreadable ? 1 : directory.names.length), 0);
+  let count = 0;
+  for (const directory of directories) {
+    if (directory.unreadable) { count += 1; continue; }
+    const names = await fs.readdir(directory.path).catch(() => undefined);
+    count += names ? names.filter((name) => RESET_ARCHIVE_NAME.test(name.replace(/\.deleting-[0-9a-f]{16}$/, ''))).length : 1;
+  }
+  return count;
 }
 
 /** What moved with a data set (its database, CAS, debug captures the new directory has) or is only bookkeeping. */

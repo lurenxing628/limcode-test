@@ -71,17 +71,30 @@ async function exists(file) {
   try { await fs.lstat(file); return true; } catch (error) { if (error.code === 'ENOENT') return false; throw error; }
 }
 
-/** Records the sources of every node:fs copyFile until stopped. */
+/**
+ * Records the source of every database (or WAL) copied into a private snapshot until stopped: such a
+ * file is opened read-only by descriptor (numeric flags) and copied from it; `onCopied` runs once that
+ * descriptor is closed, that is, once the copy is complete.
+ */
 function spyCopies(onCopied) {
-  const copyFile = fsp.copyFile;
+  const open = fsp.open;
   const sources = [];
-  fsp.copyFile = async function (from, ...rest) {
-    sources.push(path.resolve(String(from)));
-    const result = await copyFile.call(this, from, ...rest);
-    await onCopied?.(path.resolve(String(from)));
-    return result;
+  fsp.open = async function (file, flags, ...rest) {
+    const source = path.resolve(String(file));
+    const copying = typeof flags === 'number' && /(^|\/)limcode\.sqlite(-wal)?$/.test(source);
+    if (copying) sources.push(source);
+    const handle = await open.call(this, file, flags, ...rest);
+    if (copying && onCopied) {
+      const close = handle.close;
+      handle.close = async function () {
+        const result = await close.call(this);
+        await onCopied(source);
+        return result;
+      };
+    }
+    return handle;
   };
-  return { sources, stop() { fsp.copyFile = copyFile; } };
+  return { sources, stop() { fsp.open = open; } };
 }
 
 /** Records every path node:fs/promises opens until stopped. */
@@ -239,14 +252,15 @@ test('复制失败一律暂时无法核验：临时目录不存在（ENOENT）�
   assert.equal(entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home }), copied)?.status, 'verified');
 
   const vanishing = await context.copy(2);
-  const copyFile = fsp.copyFile;
-  fsp.copyFile = async function (from, ...rest) {
-    if (path.resolve(String(from)) === databaseOf(vanishing)) await fs.rm(vanishing, { recursive: true, force: true });
-    return copyFile.call(this, from, ...rest);
+  // Moved away right as its database is opened to be copied.
+  const open = fsp.open;
+  fsp.open = async function (file, flags, ...rest) {
+    if (typeof flags === 'number' && path.resolve(String(file)) === databaseOf(vanishing)) await fs.rm(vanishing, { recursive: true, force: true });
+    return open.call(this, file, flags, ...rest);
   };
   let gone;
   try { gone = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home }), vanishing); }
-  finally { fsp.copyFile = copyFile; }
+  finally { fsp.open = open; }
   assert.equal(gone?.status, 'unavailable', JSON.stringify(gone));
   assert.equal(gone.code, 'foreign-history-gone');
   assert.match(gone.reason, /已经被移走或删除/);
@@ -358,7 +372,7 @@ test('归档的合并记录在它所属的数据目录（当前配置根）里�
   assert.equal(entry.code, 'foreign-history-unfinished-merge');
 });
 
-test('外来库的互斥声明在当前配置根下：另一处持有同一外来库的声明时核验等它释放，释放后照常核验，声明用完即删', { timeout: 60000 }, async (t) => {
+test('外来库的互斥声明在当前配置根下：另一处持有同一外来库的声明时，列表不等它（暂时无法核验、不入缓存），单独核验这一个库等它释放；释放后照常核验，声明用完即删', { timeout: 60000 }, async (t) => {
   const context = await setup(t, 'claim');
   const copied = await context.copy(1);
   const discovered = (await foreign.discoverForeignRuntimeHistory({ configurationRootPath: context.home })).find((entry) => entry.location.containerPath === copied);
@@ -370,16 +384,22 @@ test('外来库的互斥声明在当前配置根下：另一处持有同一外�
   const holder = withRuntimeClaimAtPath(path.join(claims, discovered.id.replace(/:/g, '-')), pointerOf(copied), async () => { acquired(); await released; });
   await holding;
   let settled = false;
-  let inspection;
+  let single;
   try {
-    inspection = foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home }).finally(() => { settled = true; });
-    await Promise.race([inspection.catch(() => undefined), delay(2500)]);
-    assert.equal(settled, false, '声明被持有时核验在等待');
+    const listed = await Promise.race([foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home }), delay(15000).then(() => 'timeout')]);
+    assert.notEqual(listed, 'timeout', '列表不等被占的声明');
+    const busy = entryAt(listed, copied);
+    assert.deepEqual([busy?.status, busy?.code], ['unavailable', 'foreign-history-busy'], JSON.stringify(busy));
+    assert.equal(await exists(path.join(context.home, '.limcode-runtime-merges', 'foreign', `${busy.id.replace(/:/g, '-')}.json`)), false, '不入缓存');
+    single = foreign.inspectForeignRuntimeRoot(context.home, discovered).finally(() => { settled = true; });
+    await Promise.race([single.catch(() => undefined), delay(2500)]);
+    assert.equal(settled, false, '单独核验这一个库时等声明释放');
   } finally {
     release();
     await holder;
   }
-  const entry = entryAt(await inspection, copied);
+  assert.equal((await single).entry.status, 'verified', '释放后单独核验照常');
+  const entry = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home }), copied);
   assert.equal(entry?.status, 'verified', entry?.reason);
   assert.deepEqual(await fs.readdir(claims), [], '声明用完即释放');
 });
@@ -660,15 +680,25 @@ test('host-liveness 不是目录（普通文件）时无法证明进程已结束
 test('核验线程遇到暂时性的 SQLite 结果码（SQLITE_CANTOPEN：私有副本在打开前不见了）只是暂时无法核验，不入缓存', async (t) => {
   const context = await setup(t, 'cantopen');
   const copied = await context.copy(1);
-  const copyFile = fsp.copyFile;
-  fsp.copyFile = async function (from, to, ...rest) {
-    const result = await copyFile.call(this, from, to, ...rest);
-    if (path.resolve(String(from)) === databaseOf(copied)) await fs.rm(String(to), { force: true });
-    return result;
+  // The private copy of the database is removed right after it was written (its source descriptor closed).
+  const open = fsp.open;
+  let target;
+  fsp.open = async function (file, flags, ...rest) {
+    const handle = await open.call(this, file, flags, ...rest);
+    if (flags === 'wx') target = path.resolve(String(file));
+    if (typeof flags === 'number' && path.resolve(String(file)) === databaseOf(copied)) {
+      const close = handle.close;
+      handle.close = async function () {
+        const result = await close.call(this);
+        if (target) await fs.rm(target, { force: true });
+        return result;
+      };
+    }
+    return handle;
   };
   let entry;
   try { entry = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: context.home }), copied); }
-  finally { fsp.copyFile = copyFile; }
+  finally { fsp.open = open; }
   assert.equal(entry?.status, 'unavailable', JSON.stringify(entry));
   assert.equal(entry.code, 'foreign-history-audit-unavailable');
   assert.equal(await exists(path.join(context.home, '.limcode-runtime-merges', 'foreign', `${entry.id.replace(/:/g, '-')}.json`)), false, '不入缓存');

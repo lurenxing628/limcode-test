@@ -2577,8 +2577,9 @@ async function transferSourceCas(
  * same source incarnation inserted into the target or into an identity it continues (any record of
  * that incarnation: a local data set's, a foreign copy's, what a record of a later incarnation under
  * the same candidate id kept), and every conversation the user deleted there (runtimeMergeTombstones).
- * A local source is its own identity and every one it continues (read under its configuration root,
- * `paths`): what merges of those inserted counts too. Records that cannot be read defer the merge.
+ * The source is its own identity and every one it continues (sourceIdentities): what merges of those
+ * inserted counts too, and so does every conversation the user deleted from them (an earlier copy of
+ * the source still holds those). Records that cannot be read defer the merge.
  */
 async function recordedConversations(
   paths: { globalStoragePath: string },
@@ -2586,25 +2587,30 @@ async function recordedConversations(
   candidate: HistoricalMergeCandidate
 ): Promise<string[]> {
   const targets = await mergeTargetIdentities(target);
-  const sources = await sourceIdentities(paths, candidate);
+  const { root, identities: sources } = await sourceIdentities(paths, target, candidate);
   const merged = new Set<string>();
   for (const record of (await readRuntimeDataSetMergeLedger({ globalStoragePath: target.configurationRootPath })).values()) {
     for (const source of sources) for (const id of runtimeDataSetConversationsMergedFrom(record, source, targets)) merged.add(id);
   }
   for (const id of await mergeRecordsReadable(() => readRuntimeDeletedConversations(target.configurationRootPath, targets))) merged.add(id);
+  for (const id of await mergeRecordsReadable(() => readRuntimeDeletedConversations(root, sources), '这个历史库的删除记录')) merged.add(id);
   return [...merged];
 }
 
 /**
- * A source's identity and, for a local data set, every identity it continues (a data-root relocation
- * carried it here under a new identity). A foreign root's continuations live in its own configuration
- * root, never read here: it is only its own identity.
+ * A source's identity and every identity it continues, with the configuration root whose records name
+ * them: a local data set's own (`paths`, the target's but in a data-root migration), for a foreign root
+ * the current one (whatever this configuration root recorded of a data set with its identity).
  */
-async function sourceIdentities(paths: { globalStoragePath: string }, candidate: HistoricalMergeCandidate): Promise<RuntimeDataSetIdentity[]> {
+async function sourceIdentities(
+  paths: { globalStoragePath: string },
+  target: Pick<TargetContext, 'configurationRootPath'>,
+  candidate: HistoricalMergeCandidate
+): Promise<{ root: string; identities: RuntimeDataSetIdentity[] }> {
   const own = { dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
-  if (isForeignCandidate(candidate)) return [own];
-  const continues = await mergeRecordsReadable(() => readRuntimeIdentityAliases(paths.globalStoragePath, own), '这个历史库的身份延续记录');
-  return [own, ...continues.map(({ dataSetId, rootInstanceId }) => ({ dataSetId, rootInstanceId }))];
+  const root = isForeignCandidate(candidate) ? target.configurationRootPath : paths.globalStoragePath;
+  const continues = await mergeRecordsReadable(() => readRuntimeIdentityAliases(root, own), '这个历史库的身份延续记录');
+  return { root, identities: [own, ...continues.map(({ dataSetId, rootInstanceId }) => ({ dataSetId, rootInstanceId }))] };
 }
 
 /** The source as it is now: a local data set resolved again, or a foreign root located again under its hold. */

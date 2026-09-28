@@ -130,7 +130,11 @@ export interface ForeignRuntimeHistoryLastMerge {
 
 /**
  * Merge state of verified foreign roots relative to the selected data set, from this configuration
- * root's ledger and each entry's verified content digest (nothing of a root is read here).
+ * root's ledger and each entry's verified content digest (nothing of a root is read here). A record is
+ * kept under the id the root had when it was merged; a data-root relocation renames the containers of
+ * the directory it leaves (an archive of the current directory becomes one of a previous directory),
+ * which changes the id. Without a record of its own id, a record of another foreign id with the same
+ * identity and exactly this content digest is the same root: its state is shown.
  */
 export async function readForeignRuntimeHistoryMergeStates(
   paths: { globalStoragePath: string },
@@ -145,7 +149,9 @@ export async function readForeignRuntimeHistoryMergeStates(
   const requests = await readRuntimeDataSetMergeRequests(storagePaths);
   for (const entry of entries) {
     if (entry.status !== 'verified' || !entry.dataSetId || !entry.rootInstanceId) continue;
-    const found = ledger.get(entry.id);
+    const found = ledger.get(entry.id) ?? (entry.contentDigest === undefined ? undefined : [...ledger.values()].find((other) =>
+      isForeignRuntimeHistoryId(other.candidateId) && !entries.some((listed) => listed.id === other.candidateId)
+      && sameRuntimeDataSetIdentity(other.source, entry) && other.source.contentDigest === entry.contentDigest));
     const record = found && sameRuntimeDataSetIdentity(found.source, entry) ? found : undefined;
     const unchanged = record !== undefined && record.source.contentDigest === entry.contentDigest;
     const merge = record ? runtimeDataSetLastMerge(record) : undefined;
