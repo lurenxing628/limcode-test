@@ -997,8 +997,10 @@ export class ReliableChildAgentCoordinator {
       if (this.disposing || this.handoff) return;
       try {
         await owners.run(conversationId, async () => {
-          // Re-checked under the claim: the folder may have come back meanwhile.
-          if (await owners.executionEligibility(conversationId) !== 'ineligible') return;
+          // Re-checked under the claim: the folder may have come back meanwhile (and left again),
+          // and a drive this coordinator started since owns its lease and hands it back itself.
+          if (this.activeTurns.has(turnId)
+            || await owners.executionEligibility(conversationId) !== 'ineligible') return;
           await this.handBackChildLease(turnId);
         });
       } catch (error) {

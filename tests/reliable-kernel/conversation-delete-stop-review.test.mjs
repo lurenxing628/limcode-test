@@ -31,6 +31,9 @@ const {
   isConversationDeleteIncompleteError
 } = await load('backend/application/reliableKernel/conversationDeleteCommand.js');
 const { CHILD_CONVERSATION_DELETED_NOTICE } = await load('backend/reliableKernel/deliverySettlementSteps.js');
+const { ConversationRuntimeOwnerBusyError } = await load('backend/reliableKernel/ConversationRuntimeOwnerManager.js');
+const { ConversationDeletionBlockedError } = await load('backend/reliableKernel/conversationDeletion.js');
+const capabilitiesModule = await load('shared/modelCapabilities.js');
 const { createWebviewSsrServer } = await import(pathToFileURL(path.join(root, 'tests/reliable-kernel/webview-ssr-server.mjs')).href);
 const clientFeedModule = await import(pathToFileURL(path.join(root, 'dist/extension/shared/reliableKernelClientFeed.js')).href);
 
@@ -200,14 +203,16 @@ test('高-3 竞态：父 Turn 正在请求边界接收子 Agent 的答复时子�
   await fs.rm(outer, { recursive: true, force: true });
 });
 
-test('高-3：只删子对话，父 Turn 正在发模型请求、子 Agent 的答复已投给它 → 删除等它的请求结束（进度写明在等父对话），之后完成', { timeout: 180_000 }, async () => {
+test('低-3：只删子对话，父 Turn 正在发模型请求、子 Agent 的答复已投给它 → 删除不等它、立即完成；请求结束后父 Turn 收到的是删除通知、不是答复，照常完成', { timeout: 180_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('r1b');
   let parentRound = 0;
   let release;
   const gate = new Promise((resolve) => { release = resolve; });
   let parentWaiting = false;
+  const parentRequests = [];
   const provider = scriptedProvider(async (request) => {
     if (request.conversationId === 'parent') {
+      parentRequests.push(request);
       parentRound += 1;
       if (parentRound === 1) return spawnCall('spawn-bg', 'child', '子任务', 0);
       if (parentRound === 2) {
@@ -229,21 +234,244 @@ test('高-3：只删子对话，父 Turn 正在发模型请求、子 Agent 的�
     const [execution] = await rows(p1.app, 'ChildExecution', {});
     const childConversationId = String(execution.child_conversation_id);
     const progress = [];
-    const deleting = deleteCommand(p1, childConversationId, { timeoutMs: 60_000, onProgress: (entry) => progress.push(entry) });
-    await eventually(async () => progress.some((entry) => entry.kind === 'waiting_parent'), 10_000, '没有提示在等父对话');
-    assert.match(progress.find((entry) => entry.kind === 'waiting_parent').message, /父对话「parent」正在等模型回复/);
-    assert.equal((await rows(p1.app, 'Conversation', { id: childConversationId })).length, 1, '父 Turn 的请求结束前不删');
+    const deleted = await deleteCommand(p1, childConversationId, { timeoutMs: 10_000, onProgress: (entry) => progress.push(entry.kind) });
+    assert.deepEqual(deleted.deletedConversationIds, [childConversationId], '不等父 Turn 的请求结束');
+    assert.deepEqual([...new Set(progress)].filter((kind) => kind !== 'stopping'), [], '没有在等父对话的进度');
+    assert.equal(parentRound, 2, '删除时父 Turn 的第二次请求还没结束');
     release();
-    const deleted = await deleting;
-    assert.deepEqual(deleted.deletedConversationIds, [childConversationId]);
     await eventually(async () => (await rows(p1.app, 'Turn', { id: turnId }))[0]?.status === 'terminated', 30_000, '父 Turn 未结束');
     assert.equal((await rows(p1.app, 'TurnTermination', { turn_id: turnId }))[0]?.terminal_status, 'completed');
+    const context = JSON.stringify(parentRequests.at(-1).context);
+    assert.ok(context.includes(CHILD_CONVERSATION_DELETED_NOTICE), '父 Turn 的下一次请求带着删除通知');
+    assert.equal(context.includes('CHILD_ANSWER_R1B'), false, '父 Turn 收不到已删子任务的答复');
     await quiet(p1, 1_000);
     await assertNoPendingResults(p1.app);
     assert.deepEqual(errors(p1), []);
   } finally {
     release();
     await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1：只删子对话，父 Turn 在等提问、子 Agent 的答复已被它接收但还没吸收（恢复扫描已注入）→ 删除立即完成，这条待吸收的输入换成删除通知；回答后父 Turn 看到通知、看不到答复，照常完成', { timeout: 180_000 }, async () => {
+  const setup = await parentAsksWhileChildAnswers('consumed');
+  const { p1, outer, dataRoot } = setup;
+  try {
+    const before = await consumeAnswerIntoParent(setup);
+    const deleted = await deleteCommand(p1, setup.childConversationId, { timeoutMs: 30_000 });
+    assert.deepEqual(deleted.deletedConversationIds, [setup.childConversationId]);
+    const [after] = await rows(p1.app, 'PendingTurnInput', { id: before.id });
+    assert.equal(after.state, 'pending', '输入还等父 Turn 吸收');
+    assert.notEqual(after.content_object_id, before.content_object_id, '待吸收的输入换成了删除通知');
+    await finishParentAfterDeletion(setup);
+    const context = JSON.stringify(setup.requests.at(-1).context);
+    assert.ok(context.includes(CHILD_CONVERSATION_DELETED_NOTICE), '父 Turn 的下一次请求带着删除通知');
+    assert.equal(context.includes('CHILD_ANSWER_R1'), false, '看不到已删子任务的答复');
+    await assertNoPendingResults(p1.app);
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1 竞态：父 Turn 正在吸收子 Agent 的答复时子对话被删除（输入换成通知、答复记录随子对话删除）→ 父 Turn 按输入现在的内容再投影一次，收到删除通知，照常完成', { timeout: 180_000 }, async () => {
+  const setup = await parentAsksWhileChildAnswers('consumed-race');
+  const { p1, outer, dataRoot } = setup;
+  const deliveries = p1.app.runtime.deliveries;
+  const project = deliveries.projectInputForModel;
+  try {
+    const before = await consumeAnswerIntoParent(setup);
+    let deleted;
+    deliveries.projectInputForModel = async function (command) {
+      if (!deleted && command.pendingTurnInputId === before.id) {
+        deleted = await deleteCommand(p1, setup.childConversationId, { timeoutMs: 30_000 });
+      }
+      return project.call(this, command);
+    };
+    await finishParentAfterDeletion(setup);
+    assert.deepEqual(deleted?.deletedConversationIds, [setup.childConversationId], '删除发生在父 Turn 读取输入之后、投影之前');
+    const context = JSON.stringify(setup.requests.at(-1).context);
+    assert.ok(context.includes(CHILD_CONVERSATION_DELETED_NOTICE), '父 Turn 收到删除通知');
+    assert.equal(context.includes('CHILD_ANSWER_R1'), false);
+    await assertNoPendingResults(p1.app);
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    deliveries.projectInputForModel = project;
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1 兜底：删除没有替换父 Turn 待吸收的答复输入（例如旧版本窗口删的）→ 投影发现答复已随子对话删除，跳过这条输入，父 Turn 不卡住、照常完成', { timeout: 180_000 }, async () => {
+  const setup = await parentAsksWhileChildAnswers('consumed-fallback');
+  const { p1, outer, dataRoot } = setup;
+  const deletion = p1.app.conversationDeletion;
+  const noticeSteps = deletion.parentNoticeSteps;
+  try {
+    const before = await consumeAnswerIntoParent(setup);
+    deletion.parentNoticeSteps = async () => [];
+    const deleted = await deleteCommand(p1, setup.childConversationId, { timeoutMs: 30_000 });
+    deletion.parentNoticeSteps = noticeSteps;
+    assert.deepEqual(deleted.deletedConversationIds, [setup.childConversationId]);
+    const [after] = await rows(p1.app, 'PendingTurnInput', { id: before.id });
+    assert.equal(after.content_object_id, before.content_object_id, '输入没被替换');
+    assert.equal((await rows(p1.app, 'AnswerSubmission', { id: setup.answerSubmissionId })).length, 0, '答复记录随子对话删除');
+    await finishParentAfterDeletion(setup);
+    assert.equal((await rows(p1.app, 'PendingTurnInput', { id: before.id }))[0].state, 'consumed', '输入已处理');
+    assert.equal(JSON.stringify(setup.requests.at(-1).context).includes('CHILD_ANSWER_R1'), false);
+    await assertNoPendingResults(p1.app);
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    deletion.parentNoticeSteps = noticeSteps;
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1 边界：父 Turn 已过最终输出栅栏（不再接收新输入）时只删子对话 → 不注入通知，它还没接收的答复置 source-gone，删除立即完成', { timeout: 180_000 }, async () => {
+  // 不开唤醒、等子 Agent 停稳：删除时没有别的路径会把这条答复改投下一个 Turn。
+  const setup = await parentAsksWhileChildAnswers('fenced', { wake: false });
+  const { p1, outer, dataRoot } = setup;
+  try {
+    await eventually(async () => (await rows(p1.app, 'ChildExecution', {})).every((row) => !['starting', 'active', 'interrupting'].includes(row.status))
+      && (await rows(p1.app, 'ChildExecutionActiveTurnLink', {})).length === 0, 30_000, '子 Agent 没有停稳');
+    const [request] = (await rows(p1.app, 'ModelRequest', { turn_id: setup.parentTurnId })).filter((row) => row.status === 'terminal');
+    await p1.app.database.transaction([repo('TurnFinalOutputFence').insert({
+      id: 'fence-for-deletion-test', turn_id: setup.parentTurnId, model_request_id: request.id, created_at: new Date().toISOString()
+    })]);
+    assert.equal((await rows(p1.app, 'RuntimeDelivery', { id: setup.answer.id }))[0].phase, 'current_turn', '删除前答复仍投给父 Turn');
+    const deleted = await deleteCommand(p1, setup.childConversationId, { timeoutMs: 5_000 });
+    assert.deepEqual(deleted.deletedConversationIds, [setup.childConversationId]);
+    const [delivery] = await rows(p1.app, 'RuntimeDelivery', { id: setup.answer.id });
+    assert.deepEqual([delivery.state, delivery.phase, delivery.failure_reason], ['failed', 'current_turn', 'source-gone']);
+    assert.deepEqual(await rows(p1.app, 'PendingTurnInput', { turn_id: setup.parentTurnId, input_kind: 'runtime_delivery' }), [], '没有注入');
+    await assertNoPendingResults(p1.app);
+  } finally {
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1：没有内容存储的删除控制面删子对话，父 Turn 已接收还没吸收的答复输入在删除事务里标记已处理（不显示），父 Turn 照常完成', { timeout: 180_000 }, async () => {
+  const setup = await parentAsksWhileChildAnswers('consumed-no-store');
+  const { p1, outer, dataRoot } = setup;
+  try {
+    const before = await consumeAnswerIntoParent(setup);
+    const deletion = new kernel.ConversationDeletionControlPlane(p1.app.database);
+    const deleted = await p1.app.database.conversationOwners.run(setup.childConversationId, () => deletion.delete(setup.childConversationId));
+    assert.deepEqual(deleted.deletedConversationIds, [setup.childConversationId]);
+    const [after] = await rows(p1.app, 'PendingTurnInput', { id: before.id });
+    assert.deepEqual([after.state, after.content_object_id], ['consumed', before.content_object_id], '输入标记已处理、内容不变');
+    const [link] = await rows(p1.app, 'RuntimeDeliveryInputLink', { pending_turn_input_id: before.id });
+    assert.notEqual(link.handled_at, null);
+    await finishParentAfterDeletion(setup);
+    assert.equal(JSON.stringify(setup.requests.at(-1).context).includes('CHILD_ANSWER_R1'), false);
+    await assertNoPendingResults(p1.app);
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1：只删运行中的后台子对话（父 Turn 已完成，开启唤醒）→ 子 Agent 像在自己面板上停止那样停下、不发布中断答复；父对话不开新 Turn、不再调用模型、没有卡住的 Turn', { timeout: 240_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('bg-idle-parent');
+  const provider = scriptedProvider((request) => {
+    if (!request.conversationId.startsWith('parent-')) return 'hang';
+    const rounds = provider.calls.filter((call) => call.conversationId === request.conversationId).length;
+    return rounds === 1 ? spawnCall('spawn-bg', 'child', '子任务', 0) : { role: 'model', parts: [{ text: `PARENT_ROUND_${rounds}` }] };
+  });
+  const p1 = await openHost(dataRoot, provider, { label: 'p1', wake: true });
+  try {
+    for (let index = 1; index <= 3; index += 1) {
+      const parent = `parent-${index}`;
+      await createConversation(p1.app, parent);
+      const parentTurn = await p1.runner.input({ commandId: `input-${parent}`, conversationId: parent, text: '派一个后台子 Agent' });
+      await eventually(async () => (await rows(p1.app, 'TurnTermination', { turn_id: parentTurn.turnId }))[0]?.terminal_status === 'completed', 60_000, '父 Turn 未完成');
+      const execution = await eventually(async () => (await rows(p1.app, 'ChildExecution', {})).find((row) => row.status === 'active'
+        && provider.calls.some((call) => call.conversationId === row.child_conversation_id)), 60_000, '子 Agent 未开始');
+      const callsBefore = provider.calls.filter((call) => call.conversationId === parent).length;
+      const deleted = await deleteCommand(p1, String(execution.child_conversation_id), { timeoutMs: 30_000 });
+      assert.deepEqual(deleted.deletedConversationIds, [String(execution.child_conversation_id)]);
+      await quiet(p1, 1_500);
+      assert.deepEqual((await rows(p1.app, 'Turn', { conversation_id: parent })).map((turn) => turn.id), [parentTurn.turnId], `${parent} 不开新 Turn`);
+      assert.equal(provider.calls.filter((call) => call.conversationId === parent).length, callsBefore, `${parent} 不再调用模型`);
+      assert.deepEqual(await rows(p1.app, 'RuntimeDelivery', { target_conversation_id: parent }), [], '子 Agent 没有发布中断答复');
+    }
+    await assertNoPendingResults(p1.app);
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审严重-1：只删子对话，它的答复排在父对话的手动压缩 Turn 后面（next_turn、续跑已排队）→ 删除把答复置 source-gone，同一事务取消为它排队的续跑；压缩 Turn 结束后父对话不开续跑、不再调用模型', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('queued-parent-continuation');
+  let releaseChild;
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  let summarizing = false;
+  const provider = scriptedProvider(async (request) => {
+    if (request.conversationId !== 'parent') {
+      await childGate;
+      return { role: 'model', parts: [{ text: 'CHILD_ANSWER_QUEUED' }] };
+    }
+    const rounds = provider.calls.filter((call) => call.conversationId === 'parent').length;
+    if (rounds === 1) return spawnCall('spawn-bg', 'child', '子任务', 0);
+    if (rounds === 2) return { role: 'model', parts: [{ text: '第一个回合结束，内容足够被压缩。' }] };
+    summarizing = true;
+    return 'hang';
+  });
+  const p1 = await openHost(dataRoot, provider, { label: 'p1', wake: true, compression: true });
+  let compressing;
+  try {
+    await createConversation(p1.app, 'parent');
+    const first = await p1.runner.input({ commandId: 'input-parent', conversationId: 'parent', text: '派后台子 Agent' });
+    await eventually(async () => (await rows(p1.app, 'TurnTermination', { turn_id: first.turnId }))[0]?.terminal_status === 'completed', 60_000, '父 Turn 未完成');
+    const [head] = await rows(p1.app, 'ConversationContextHeadLink', { conversation_id: 'parent' });
+    compressing = p1.runner.manualCompression({ commandId: 'compress-parent', conversationId: 'parent', compressSegmentCount: 1,
+      target: { kind: 'current_head', expectedRootId: head.root_id } }).then((value) => ({ value }), (error) => ({ error }));
+    await Promise.race([
+      eventually(async () => summarizing, 30_000, '手动压缩没有开始调用模型'),
+      compressing.then((outcome) => { throw new Error(`手动压缩提前结束：${outcome.error?.stack ?? JSON.stringify(outcome.value)}`); })
+    ]);
+    releaseChild();
+    const continuation = await eventually(async () => {
+      const [link] = await rows(p1.app, 'RuntimeDeliveryIntentLink', {});
+      const intent = link && (await rows(p1.app, 'TurnIntent', { id: link.turn_intent_id }))[0];
+      return intent?.state === 'queued' ? { link, intent } : undefined;
+    }, 60_000, '子 Agent 的答复没有排队等父对话的续跑');
+    const [execution] = await rows(p1.app, 'ChildExecution', {});
+    const turnsBefore = (await rows(p1.app, 'Turn', { conversation_id: 'parent' })).length;
+    const deleted = await deleteCommand(p1, String(execution.child_conversation_id), { timeoutMs: 30_000 });
+    assert.deepEqual(deleted.deletedConversationIds, [String(execution.child_conversation_id)]);
+    const [delivery] = await rows(p1.app, 'RuntimeDelivery', { id: continuation.link.delivery_id });
+    assert.deepEqual([delivery.state, delivery.failure_reason], ['failed', 'source-gone']);
+    assert.equal((await rows(p1.app, 'TurnIntent', { id: continuation.intent.id }))[0].state, 'cancelled', '为它排队的续跑同一事务取消');
+    const parentCalls = provider.calls.filter((call) => call.conversationId === 'parent').length;
+    const [maintenance] = await rows(p1.app, 'Turn', { conversation_id: 'parent', status: 'active' });
+    await p1.runner.interrupt({ commandId: 'stop-compress', conversationId: 'parent', turnId: maintenance.id, reason: '用户停止压缩' });
+    await compressing;
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: maintenance.id }))[0]?.status === 'terminated', 30_000, '压缩 Turn 未结束');
+    await quiet(p1, 1_500);
+    assert.equal((await rows(p1.app, 'Turn', { conversation_id: 'parent' })).length, turnsBefore, '父对话不开续跑');
+    assert.equal(provider.calls.filter((call) => call.conversationId === 'parent').length, parentCalls, '不再调用模型');
+    await assertNoPendingResults(p1.app);
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    releaseChild();
+    // 先关窗口（中止还在等模型的压缩），再等压缩命令结束。
+    await p1.close();
+    await compressing;
   }
   assertForeignKeysClean(dataRoot);
   await fs.rm(outer, { recursive: true, force: true });
@@ -599,53 +827,158 @@ test('删除期间的标记只挡续跑：标记释放后，被挡住的进程�
   await fs.rm(outer, { recursive: true, force: true });
 });
 
-test('中-2：只删子对话、父 Turn 的模型请求一直没结束 → 超时不删，说明在等父对话接收答复、不说发出了停止；标记随之释放', { timeout: 180_000 }, async () => {
-  const { outer, dataRoot } = await createIsolatedRoot('parent-timeout');
-  let parentRound = 0;
-  let release;
-  const gate = new Promise((resolve) => { release = resolve; });
-  let parentWaiting = false;
-  const provider = scriptedProvider(async (request) => {
-    if (request.conversationId === 'parent') {
-      parentRound += 1;
-      if (parentRound === 1) return spawnCall('spawn-bg', 'child', '子任务', 0);
-      if (parentRound === 2) {
-        parentWaiting = true;
-        await gate;
-      }
-      return { role: 'model', parts: [{ text: `PARENT_ROUND_${parentRound}` }] };
-    }
-    const deadline = Date.now() + 30_000;
-    while (!parentWaiting && Date.now() < deadline) await sleep(20);
-    return { role: 'model', parts: [{ text: 'CHILD_ANSWER_TIMEOUT' }] };
+test('盲审高-2：删除范围里排着运行时续跑（排在手动压缩 Turn 后面）→ 删除不需要对话归属就取消它、再停下压缩 Turn，删除完成，不再调用模型', { timeout: 180_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('queued-runtime');
+  let summarizing = false;
+  const provider = scriptedProvider(() => {
+    const rounds = provider.calls.length;
+    if (rounds === 1) return { role: 'model', parts: [{ text: '第一个回合结束，内容足够被压缩。' }] };
+    summarizing = true;
+    return 'hang';
   });
-  const p1 = await openHost(dataRoot, provider, { label: 'p1', wake: true });
+  const p1 = await openHost(dataRoot, provider, { label: 'p1', compression: true });
+  let compressing;
   try {
-    await createConversation(p1.app, 'parent');
-    const { turnId } = await p1.runner.input({ commandId: 'input-parent', conversationId: 'parent', text: '派后台子 Agent' });
-    await eventually(async () => (await rows(p1.app, 'RuntimeDelivery', { target_conversation_id: 'parent', state: 'pending' }))
-      .some((row) => row.target_turn_id === turnId), 60_000, '子 Agent 的答复没有投给正在发请求的父 Turn');
-    const [execution] = await rows(p1.app, 'ChildExecution', {});
-    const childConversationId = String(execution.child_conversation_id);
-    const error = await deleteCommand(p1, childConversationId, { timeoutMs: 1_000 }).then(() => null, (reason) => reason);
-    assert.ok(isConversationDeleteIncompleteError(error), `预期没能完成：${error?.stack ?? error}`);
-    assert.equal(error.message, '删除没有完成：父对话「parent」的模型回复还没结束，它要先接收子任务的答复。等它结束后再删除一次。');
-    assert.deepEqual(error.remaining.map((item) => [item.kind, item.stopRequested]), [['parent_intake', false]]);
-    assert.equal(p1.app.conversationDeletion.isStopping(childConversationId), false, '没完成也释放标记');
-    assert.equal((await rows(p1.app, 'Conversation', { id: childConversationId })).length, 1, '没完成时不删');
-    release();
-    await eventually(async () => (await rows(p1.app, 'Turn', { id: turnId }))[0]?.status === 'terminated', 30_000, '父 Turn 未结束');
-    const deleted = await deleteCommand(p1, childConversationId, { timeoutMs: 30_000 });
-    assert.deepEqual(deleted.deletedConversationIds, [childConversationId]);
+    await createConversation(p1.app, 'target');
+    await createConversation(p1.app, 'requester');
+    const first = await p1.runner.input({ commandId: 'input-first', conversationId: 'target', text: '第一个回合' });
+    await eventually(async () => (await rows(p1.app, 'TurnTermination', { turn_id: first.turnId }))[0]?.terminal_status === 'completed', 30_000, '第一个回合未完成');
+    const [head] = await rows(p1.app, 'ConversationContextHeadLink', { conversation_id: 'target' });
+    compressing = p1.runner.manualCompression({ commandId: 'compress-target', conversationId: 'target', compressSegmentCount: 1,
+      target: { kind: 'current_head', expectedRootId: head.root_id } }).then((value) => ({ value }), (error) => ({ error }));
+    await Promise.race([
+      eventually(async () => summarizing, 30_000, '手动压缩没有开始调用模型'),
+      compressing.then((outcome) => { throw new Error(`手动压缩提前结束：${outcome.error?.stack ?? JSON.stringify(outcome.value)}`); })
+    ]);
+    await pendingFollowup(p1.app, 'fu', 'requester', 'target');
+    const queued = await p1.runner.runtimeContinuation({ commandId: 'runtime-delivery:fu-delivery', deliveryId: 'fu-delivery', conversationId: 'target', sourceTurnId: null });
+    assert.equal((await rows(p1.app, 'TurnIntent', { id: queued.intentId }))[0].state, 'queued', '运行时续跑排在压缩 Turn 后面');
+    const calls = provider.calls.length;
+    const deleted = await deleteCommand(p1, 'target', { timeoutMs: 30_000 });
+    assert.deepEqual(deleted.deletedConversationIds, ['target']);
+    await compressing;
     await quiet(p1, 1_000);
-    await assertNoPendingResults(p1.app);
+    assert.equal(provider.calls.length, calls, '删除期间与之后不再调用模型');
+    // 追问的发起方收到“对方对话已删除”的失败回复，这是它唯一的待处理投递。
+    assert.deepEqual((await rows(p1.app, 'RuntimeDelivery', { state: 'pending' })).map((row) => row.target_conversation_id), ['requester']);
     assert.deepEqual(errors(p1), []);
   } finally {
-    release();
+    await p1.close();
+    await compressing;
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审高-2：删除范围里排着用户的“继续”（continuation），Turn 在等提问 → 删除取消它、停下 Turn，删除完成', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('queued-continuation');
+  const provider = scriptedProvider(() => provider.calls.length === 1
+    ? { role: 'model', parts: [{ text: '第一个回合结束' }] }
+    : askCall('ask-second', '第二个回合先问一句'));
+  const p1 = await openHost(dataRoot, provider, { label: 'p1' });
+  try {
+    await createConversation(p1.app, 'target');
+    const first = await p1.runner.input({ commandId: 'input-first', conversationId: 'target', text: '第一个回合' });
+    await eventually(async () => (await rows(p1.app, 'TurnTermination', { turn_id: first.turnId }))[0]?.terminal_status === 'completed', 30_000, '第一个回合未完成');
+    await p1.runner.input({ commandId: 'input-second', conversationId: 'target', text: '再问一句' });
+    await eventually(async () => (await rows(p1.app, 'InteractionRequest', { status: 'pending' })).length === 1, 30_000, '第二个回合未进入等待');
+    const queued = await p1.runner.continuation({ commandId: 'continue-first', conversationId: 'target', sourceTurnId: first.turnId, text: '接着第一个回合做' });
+    assert.equal((await rows(p1.app, 'TurnIntent', { id: queued.intentId }))[0].state, 'queued');
+    const calls = provider.calls.length;
+    const deleted = await deleteCommand(p1, 'target', { timeoutMs: 30_000 });
+    assert.deepEqual(deleted.deletedConversationIds, ['target']);
+    await quiet(p1, 1_000);
+    assert.equal(provider.calls.length, calls, '不再调用模型');
+    assert.deepEqual(errors(p1), []);
+  } finally {
     await p1.close();
   }
   assertForeignKeysClean(dataRoot);
   await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审高-2：删除期间本窗口不准入删除范围里排队的意图（取消没能落地、Turn 自己结束时也不准入）；删除没完成、标记释放后照常准入', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('admission-gate');
+  const provider = scriptedProvider(() => {
+    const rounds = provider.calls.length;
+    if (rounds === 1) return askCall('ask-first', '先问一句');
+    return { role: 'model', parts: [{ text: `ROUND_${rounds}` }] };
+  });
+  const p1 = await openHost(dataRoot, provider, { label: 'p1' });
+  const turns = p1.app.turns;
+  const cancel = turns.cancelGuidanceForDeletion;
+  try {
+    await createConversation(p1.app, 'target');
+    const first = await p1.runner.input({ commandId: 'input-first', conversationId: 'target', text: '第一条' });
+    await eventually(async () => (await rows(p1.app, 'InteractionRequest', { status: 'pending' })).length === 1, 30_000, '第一个回合未进入等待');
+    const queued = await p1.runner.input({ commandId: 'input-second', conversationId: 'target', text: '第二条' });
+    assert.equal((await rows(p1.app, 'TurnIntent', { id: queued.intentId }))[0].state, 'queued');
+    turns.cancelGuidanceForDeletion = async () => { throw new Error('模拟：取消没能落地'); };
+    const deleting = deleteCommand(p1, 'target', { timeoutMs: 4_000 }).then(() => null, (error) => error);
+    await eventually(async () => p1.app.conversationDeletion.isStopping('target'), 10_000, '删除没有开始');
+    const [request] = await rows(p1.app, 'InteractionRequest', { status: 'pending' });
+    await answerAskUser(p1, 'target', request.id, 'answer-first');
+    p1.runner.resume('target', first.turnId);
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: first.turnId }))[0]?.status === 'terminated', 30_000, '第一个回合没有自己结束');
+    await sleep(1_000);
+    assert.equal((await rows(p1.app, 'TurnIntent', { id: queued.intentId }))[0].state, 'queued', '删除期间不准入');
+    assert.equal((await rows(p1.app, 'Turn', { conversation_id: 'target' })).length, 1);
+    const error = await deleting;
+    assert.ok(isConversationDeleteIncompleteError(error), `预期没能完成：${error?.stack ?? error}`);
+    turns.cancelGuidanceForDeletion = cancel;
+    const second = await eventually(async () => (await rows(p1.app, 'TurnIntent', { id: queued.intentId }))[0].turn_id, 10_000, '标记释放后没有准入排队的消息');
+    await eventually(async () => (await rows(p1.app, 'Turn', { id: second }))[0]?.status === 'terminated', 30_000, '第二个回合未结束');
+    assert.deepEqual(errors(p1), []);
+  } finally {
+    turns.cancelGuidanceForDeletion = cancel;
+    await p1.close();
+  }
+  assertForeignKeysClean(dataRoot);
+  await fs.rm(outer, { recursive: true, force: true });
+});
+
+test('盲审低-4：超时说明按最后一轮停止之后的盘点写；只在最后一次删除尝试被另一个窗口占用时才说占用', { timeout: 30_000 }, async () => {
+  const inventoryOf = (work) => ({ conversationId: 'c', conversationIds: ['c'], conversationTitles: { c: '对话' }, rootChildExecutionId: null,
+    rootChildDetached: false, childExecutions: [], work });
+  const fake = (inspect, remove, overrides = {}) => ({
+    application: {
+      conversationDeletion: { inspect, delete: remove, markStopping: () => () => undefined },
+      database: { hostBootId: 'host', conversationOwners: { run: (_id, fn) => fn() } },
+      turns: overrides.turns ?? {},
+      processes: overrides.processes ?? {}
+    },
+    conversations: { interrupt: async () => undefined },
+    childAgents: { interruptSubtree: async () => undefined, interruptFromConversation: async () => undefined },
+    timeoutMs: 300,
+    pollMs: 20
+  });
+  let attempts = 0;
+  const busyThenBlocked = await stopAndDeleteConversation(fake(async () => inventoryOf([]), async () => {
+    attempts += 1;
+    if (attempts === 1) throw new ConversationRuntimeOwnerBusyError('c', { processId: 4242, hostBootId: 'other-host' });
+    throw new ConversationDeletionBlockedError('对话树仍有活动 Turn，需要先停止。');
+  }), { conversationId: 'c', requestId: 'busy' }).then(() => null, (error) => error);
+  assert.ok(isConversationDeleteIncompleteError(busyThenBlocked));
+  assert.ok(attempts > 1);
+  assert.equal(busyThenBlocked.message.includes('4242'), false, `后来的尝试没被占用，不再说占用：${busyThenBlocked.message}`);
+
+  // 每次停止都让盘点变成另一项工作：超时说明写停止之后还剩的那一项。
+  let serial = 0;
+  let current = { kind: 'process', conversationId: 'c', id: 'process-0' };
+  const flip = () => {
+    serial += 1;
+    current = current.kind === 'process'
+      ? { kind: 'turn', conversationId: 'c', id: `turn-${serial}` }
+      : { kind: 'process', conversationId: 'c', id: `process-${serial}` };
+  };
+  const latest = await stopAndDeleteConversation(fake(async () => inventoryOf([current]), async () => {
+    throw new Error('还有工作时不删');
+  }, {
+    turns: { requestExternalInterrupt: async () => { flip(); return {}; } },
+    processes: { stopOwnedProcess: async () => { flip(); return {}; }, reconcileProcessExit: async () => undefined }
+  }), { conversationId: 'c', requestId: 'latest' }).then(() => null, (error) => error);
+  assert.ok(isConversationDeleteIncompleteError(latest), `${latest?.stack ?? latest}`);
+  assert.deepEqual(latest.remaining.map((item) => [item.kind, item.id]), [[current.kind, current.id]], latest.message);
 });
 
 test('高-2：排队消息没能取消的那一轮不停 Turn；超时说明逐项写明“还没能发出停止请求”，不说已发出', { timeout: 120_000 }, async () => {
@@ -765,8 +1098,8 @@ test('低-1/低-2/低-3：确认框说清父对话会怎样，没删完用警告
   const presentation = await server.ssrLoadModule('/src/sidebar/deletePresentation.ts');
   const child = presentation.deleteConfirmDescriptionHtml('「子任务」', true);
   assert.ok(child.includes('会先停止「子任务」和它的子任务里正在运行的任务（包括后台进程）'));
-  assert.ok(child.includes('如果父对话正在等这个子任务，它会得知这个子任务对话已被用户删除'), '只在父对话正在等时才说它会得知');
-  assert.ok(child.includes('父对话还没接收的这个子任务的答复会被丢弃，不会再送达'), '空闲父对话的未接收答复写明丢弃');
+  assert.ok(child.includes('如果父对话正在运行（包括正在等这个子任务），它会得知这个子任务对话已被用户删除'), '正在运行的父对话得知删除');
+  assert.ok(child.includes('父对话还没接收的这个子任务的答复会被丢弃，不会再送达，空闲的父对话也不会因此再运行'), '没接收的答复一律不送达，空闲父对话不续跑');
   const top = presentation.deleteConfirmDescriptionHtml('「主对话」', false);
   assert.equal(top.includes('父对话'), false);
   assert.ok(top.includes('<strong>不能撤销</strong>'));
@@ -784,6 +1117,9 @@ test('低-1/低-2/低-3：确认框说清父对话会怎样，没删完用警告
   }
   const view = await fs.readFile(path.join(root, 'vscode/views/SidebarEntryView.ts'), 'utf8');
   assert.ok(view.includes("incomplete ? { severity: 'warning' } : {}"), '没删完的结果以警告发给侧栏');
+  // 盲审低-6：两个窗口同时删同一个对话，后完成的一方发现它已不存在，也按删除成功显示。
+  assert.ok(view.includes('await backendApp.deleteConversation(conversationId) ?? [conversationId]'), '对话已不存在按已删除处理');
+  assert.equal(view.includes('该对话不存在。'), false, '不再以错误显示“该对话不存在”');
   const css = await fs.readFile(path.join(root, 'webview/src/sidebar/sidebar.css'), 'utf8');
   assert.match(css, /\.operation-notice\.is-warning\s*\{/, '警告样式存在');
 });
@@ -798,6 +1134,56 @@ async function answerAskUser(host, conversationId, requestId, key) {
     response: { answer: { selectedOptionIndexes: [0], customText: '' } },
     cancelled: false
   }));
+}
+
+/** 恢复扫描对同源答复不等请求边界，直接注入等提问的父 Turn：投递 consumed，运行时输入待吸收。 */
+async function consumeAnswerIntoParent(setup) {
+  const { p1 } = setup;
+  await p1.app.database.conversationOwners.run('parent', () => p1.app.runtime.deliveries.advance(setup.answer.id));
+  assert.equal((await rows(p1.app, 'RuntimeDelivery', { id: setup.answer.id }))[0].state, 'consumed');
+  const inputs = await rows(p1.app, 'PendingTurnInput', { turn_id: setup.parentTurnId, input_kind: 'runtime_delivery', state: 'pending' });
+  assert.equal(inputs.length, 1, '父 Turn 有一条待吸收的答复输入');
+  const [inbox] = await rows(p1.app, 'RuntimeInboxItem', { id: setup.answer.inbox_item_id });
+  setup.answerSubmissionId = String(inbox.source_id);
+  return inputs[0];
+}
+
+/** 回答父 Turn 的提问，等它继续到完成。 */
+async function finishParentAfterDeletion(setup) {
+  const { p1 } = setup;
+  const [request] = await rows(p1.app, 'InteractionRequest', { status: 'pending' });
+  await answerAskUser(p1, 'parent', request.id, 'answer-parent');
+  p1.runner.resume('parent', setup.parentTurnId);
+  await eventually(async () => (await rows(p1.app, 'Turn', { id: setup.parentTurnId }))[0]?.status === 'terminated', 30_000, '父 Turn 没有继续到结束');
+  const [termination] = await rows(p1.app, 'TurnTermination', { turn_id: setup.parentTurnId });
+  assert.equal(termination.terminal_status, 'completed', `父 Turn 继续并完成：${termination.reason}`);
+  await p1.runner.waitForIdle();
+}
+
+/** 一条投给 peer 的跨对话追问：next_turn 投递待处理，带唤醒（它会为 peer 开续跑）。 */
+async function pendingFollowup(app, id, requester, peer) {
+  const now = new Date().toISOString();
+  const payload = await app.contentStore.ingest(app.database, `请 ${peer} 复核部署脚本`, 'text/vnd.limcode.collaboration-message');
+  await app.database.transaction([
+    repo('CollaborationMessage').insertWithNextSequence({ id, dedupe_key: id, mode: 'followup', created_at: now }, { column: 'message_seq', scope: {} }),
+    repo('CollaborationMessageSourceLink').insert({ id: `${id}-source`, message_id: id, conversation_id: requester, source_kind: 'tool',
+      source_key: id, turn_id: null, tool_call_id: null, created_at: now }),
+    repo('RuntimeInboxItem').insert({ id: `${id}-inbox`, dedupe_key: id, source_kind: 'collaboration_message', source_id: id,
+      state: 'routed', created_at: now, updated_at: now }),
+    repo('CollaborationMessageTargetLink').insert({ id: `${id}-target`, message_id: id, conversation_id: peer, inbox_item_id: `${id}-inbox`,
+      anchor_turn_id: null, created_at: now }),
+    repo('CollaborationMessagePayloadLink').insert({ id: `${id}-payload`, message_id: id, content_object_id: payload.id, created_at: now }),
+    repo('RuntimeInboxPayloadLink').insert({ id: `${id}-inbox-payload`, inbox_item_id: `${id}-inbox`, content_object_id: payload.id, created_at: now }),
+    repo('RuntimeDelivery').insert({ id: `${id}-delivery`, inbox_item_id: `${id}-inbox`, target_conversation_id: peer, target_turn_id: null,
+      phase: 'next_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: now, updated_at: now }),
+    repo('CollaborationBudget').insert({ id: `${id}-budget`, origin_kind: 'turn', origin_key: `${id}-origin`,
+      authority_turn_id: `${id}-historical-turn`, created_at: now }),
+    repo('CollaborationRequest').insert({ id: `${id}-request`, message_id: id, budget_id: `${id}-budget`, automatic: 1n, state: 'pending',
+      created_at: now, updated_at: now }),
+    repo('RuntimeDeliveryWake').insert({ id: `${id}-wake`, delivery_id: `${id}-delivery`, state: 'pending', claim_owner_host_boot_id: null,
+      claim_generation: 0n, claim_expires_at: null, attempt_count: 0n, failure_count: 0n, next_attempt_at: now, last_error: null,
+      acknowledged_at: null, created_at: now, updated_at: now })
+  ]);
 }
 
 async function runWorker(mode) {
@@ -904,7 +1290,7 @@ async function openHost(dataRoot, provider, options) {
   let coordinator;
   const app = await kernel.ReliableKernelApplication.open(
     new kernel.RootAuthority(() => dataRoot),
-    fixtureDependencies(provider, options.onMcpCall ?? (() => undefined), () => coordinator, options.cwd ?? os.tmpdir())
+    fixtureDependencies(provider, options.onMcpCall ?? (() => undefined), () => coordinator, options.cwd ?? os.tmpdir(), options.compression === true)
   );
   coordinator = new ReliableChildAgentCoordinator({
     database: app.database,
@@ -959,7 +1345,25 @@ async function openHost(dataRoot, provider, options) {
   };
 }
 
-function fixtureDependencies(provider, onMcpCall, coordinator, cwd) {
+/** 文字摘要压缩（手动触发用；阈值远高于测试里的上下文，不会自动压缩）。 */
+function summaryCompressionAuthority() {
+  const model = { provider: 'openai-compatible', baseUrl: 'https://delete-stop.invalid/v1', modelId: 'delete-stop-model', providerConfigId: PROVIDER_ID };
+  const capabilities = capabilitiesModule.resolveModelCapabilities({ ...model, transport: 'http' });
+  return {
+    enabled: true,
+    methodKind: 'llm_summary',
+    executionPlan: capabilitiesModule.resolveCompressionExecutionPlan({ kind: 'llm_summary', fallbacks: [] }, capabilities),
+    thresholdTokens: 100_000,
+    config: { id: 'delete-stop-compression', name: '摘要', kind: 'llm_summary', trigger: { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens: 100_000 } },
+    provider: {
+      providerConfigId: PROVIDER_ID, provider: model.provider, modelId: model.modelId, capabilities,
+      summaryReasoning: capabilitiesModule.resolveSummaryReasoning({ mode: 'provider_default', capabilities }),
+      contextWindowTokens: 128_000, maxOutputTokens: 16_000
+    }
+  };
+}
+
+function fixtureDependencies(provider, onMcpCall, coordinator, cwd, compression = false) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -994,7 +1398,8 @@ function fixtureDependencies(provider, onMcpCall, coordinator, cwd) {
               planReviewPolicy: { mode: 'off' },
               systemPrompt: { id: 'delete-stop-prompt', text: '' },
               runtimeContext: { id: null, name: '', template: '' },
-              workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+              workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null },
+              ...(compression ? { compression: summaryCompressionAuthority() } : {})
             })
           }
         };

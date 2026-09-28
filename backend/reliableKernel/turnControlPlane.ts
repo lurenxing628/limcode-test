@@ -767,13 +767,21 @@ export class TurnControlPlane {
   }
 
   /**
-   * Deleting a Conversation cancels its queued messages from any window, before any of its Turns is
-   * stopped (conversationDeleteCommand), so no ending Turn admits them. Like requestExternalInterrupt
-   * it takes no ownership: the TurnIntent revision fence rejects a stale cancellation, and admission
-   * only takes an intent that is still queued.
+   * Deleting a Conversation cancels what is queued in it from any window, before any of its Turns is
+   * stopped (conversationDeleteCommand), so no ending Turn admits it: an ordinary message, and a
+   * continuation, runtime continuation or retry the same way as TurnGuidanceQueue.cancelQueuedIntent
+   * (a child continuation stays with its lineage). Like requestExternalInterrupt it takes no
+   * ownership: the TurnIntent revision fence rejects a stale cancellation, and admission only takes
+   * an intent that is still queued.
    */
-  public cancelGuidanceForDeletion(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
-    return this.guidanceQueue.cancelQueuedGuidance(command);
+  public async cancelGuidanceForDeletion(command: TurnGuidanceCancelCommand): Promise<TurnCommandResult> {
+    const ordinary = await this.guidanceQueue.maybeCurrentGuidanceIntent(
+      requireId(command.conversationId, 'conversationId'),
+      requireId(command.intentId, 'intentId')
+    );
+    return ordinary
+      ? this.guidanceQueue.cancelQueuedGuidance(command)
+      : this.guidanceQueue.cancelQueuedIntent(command);
   }
 
   /** A queued TurnIntent that is not an ordinary message (a continuation, a runtime continuation, a retry), see TurnGuidanceQueue.cancelQueuedIntent. */

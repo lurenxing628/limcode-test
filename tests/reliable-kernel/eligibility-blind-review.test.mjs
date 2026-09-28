@@ -402,6 +402,64 @@ test('盲审 2：子 Agent 等本窗口在途 native 调用期间文件夹又回
   }
 });
 
+test('跨模块盲审 F8：子调度交还租约等本窗口在途 native 调用期间，文件夹回来、本窗口又驱动起这个子 Turn、文件夹再离开：调用结束后在认领内复核到本窗口正在驱动，不交还子 Turn 的租约', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('handback-driving-child');
+  let host;
+  let releaseChild;
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  try {
+    const conversationId = 'conversation-handback-driving-child';
+    const calls = [];
+    const provider = {
+      providerId: PROVIDER_ID,
+      async sendFullRequest(request, controls) {
+        calls.push(request.conversationId);
+        const n = calls.filter((id) => id === request.conversationId).length;
+        let content;
+        if (request.conversationId === conversationId) content = [SPAWN_CHILD, text('子任务已开始。')][n - 1];
+        else if (n === 1) content = ASK_USER;
+        else if (n === 2) {
+          // The child Turn's next round: this window drives it until the test ends.
+          await Promise.race([childGate, new Promise((_resolve, reject) => {
+            controls.signal?.addEventListener('abort', () => reject(controls.signal.reason ?? new Error('aborted')), { once: true });
+          })]);
+          content = text('子任务完成。');
+        }
+        if (!content) throw new Error(`Unexpected Provider call for ${request.conversationId}.`);
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content });
+      }
+    };
+    host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'w', askUser: true, children: true });
+    await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
+    await host.runner.input({ commandId: 'handback-driving-child', conversationId, text: '派一个子 Agent' });
+    const { execution, childTurnId } = await waitForChildQuestion(host);
+    const childConversationId = String(execution.child_conversation_id);
+    const call = inFlightNativeCall(host.app.agentLoop, childTurnId);
+    // The folder leaves: the recovery pass starts the hand-back, which waits for this window's call.
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    await host.coordinator.recoverStartup();
+    assert.equal(host.coordinator.leaseHandBacks.has(childTurnId), true, '交还在等本窗口的在途调用');
+    // The folder comes back, the question is answered and this window drives the child Turn again.
+    host.folders.push(PROJECT_TWO);
+    const [request] = await rows(host.app, 'InteractionRequest', { status: 'pending' });
+    await answerAskUser(host, childConversationId, request.id, 'answer-child-question');
+    await host.coordinator.recoverStartup();
+    await eventually(async () => host.coordinator.activeTurns.has(childTurnId)
+      && calls.filter((id) => id === childConversationId).length === 2, 30_000, '本窗口没有重新驱动子 Turn');
+    // The folder leaves again while the drive runs; then the call the hand-back waited for ends.
+    host.folders.splice(host.folders.indexOf(PROJECT_TWO), 1);
+    call.settle();
+    await eventually(async () => !host.coordinator.leaseHandBacks.has(childTurnId), 10_000, '交还没有结束');
+    const [lease] = await rows(host.app, 'ExecutionLease', { turn_id: childTurnId });
+    assert.equal(lease?.owner_id, host.coordinator.childLeaseOwnerId, '本窗口正在驱动子 Turn：交还不替驱动交出租约');
+    assert.equal(host.coordinator.activeTurns.has(childTurnId), true, '驱动仍在进行');
+  } finally {
+    releaseChild();
+    await host?.close();
+    await fsp.rm(outer, { recursive: true, force: true });
+  }
+});
+
 test('盲审 2：不服务子对话的窗口被唤醒驱动子 Turn：先等本窗口子 Turn 的在途 native 调用结束再交还租约', { timeout: 120_000 }, async () => {
   const { outer, dataRoot } = await createIsolatedRoot('quiesce-child-not-served');
   let host;

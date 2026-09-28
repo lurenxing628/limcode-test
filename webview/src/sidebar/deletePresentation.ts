@@ -6,13 +6,14 @@ import type { ConversationOriginLinkRecord } from '@shared/protocol';
  */
 
 /**
- * Confirm text. `target` is the already escaped label. A child Agent's parent only receives the
- * deletion result when it is waiting for this child right now; an answer it has not taken in yet is
- * dropped.
+ * Confirm text. `target` is the already escaped label. A child Agent's running parent learns that
+ * the child was deleted (its wait for the child ends with that, an answer it has not taken in is
+ * replaced by that notice); an answer it has not taken in is never delivered, and an idle parent
+ * is not continued because of the deletion.
  */
 export function deleteConfirmDescriptionHtml(target: string, childAgent: boolean): string {
   const parentNotice = childAgent
-    ? '如果父对话正在等这个子任务，它会得知这个子任务对话已被用户删除；父对话还没接收的这个子任务的答复会被丢弃，不会再送达。'
+    ? '如果父对话正在运行（包括正在等这个子任务），它会得知这个子任务对话已被用户删除；父对话还没接收的这个子任务的答复会被丢弃，不会再送达，空闲的父对话也不会因此再运行。'
     : '';
   return `会先停止${target}和它的子任务里正在运行的任务（包括后台进程），然后删除${target}、其启动的所有子 Agent 对话，以及关联消息、工具记录和运行记录，<strong>不能撤销</strong>。${parentNotice}`;
 }

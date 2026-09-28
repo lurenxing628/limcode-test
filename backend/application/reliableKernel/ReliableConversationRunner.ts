@@ -63,6 +63,8 @@ const UNHELD_TURN_EXPIRY_MARGIN_MS = 250;
 /** Queued admission stood down as busy or unknown retries on its own, with backoff. */
 const ADMISSION_RETRY_BASE_DELAY_MS = 1_000;
 const ADMISSION_RETRY_MAX_DELAY_MS = 30_000;
+/** How often admission looks again at a Conversation this window's deletion is stopping. */
+const DELETION_ADMISSION_RECHECK_MS = 500;
 const LOCAL_TURN_WAKE_DOMAINS = new Set([
   'EffectIntent',
   'EffectReceipt',
@@ -2511,6 +2513,14 @@ export class ReliableConversationRunner {
    * its own queue; standing down is a safe no-op because the queued Intent stays durable.
    */
   private async runOwnedAdmissionSlot(slot: AdmissionSlot): Promise<void> {
+    if (this.application.conversationDeletion.isStopping(slot.conversationId)) {
+      // A deletion of this window stops the Conversation (ConversationDeletionControlPlane.markStopping):
+      // nothing queued starts a Turn meanwhile, the deletion cancels it. Checked again shortly, so a
+      // deletion that does not complete leaves the queue to be admitted as usual.
+      slot.completedGeneration = slot.requestedGeneration;
+      this.deferAdmissionWhileDeleting(slot.conversationId);
+      return;
+    }
     // Admission starts a Turn, so it is execution: the queued Intent stays durable for the Host
     // serving the Conversation.
     const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
@@ -2535,6 +2545,25 @@ export class ReliableConversationRunner {
       }
       throw error;
     }
+  }
+
+  /** Looks again shortly; by then the deletion may have removed the Conversation with its queue. */
+  private deferAdmissionWhileDeleting(conversationId: string): void {
+    const entry = this.admissionRetries.get(conversationId) ?? { failures: 0 };
+    if (entry.timer) return;
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      if (this.disposed) return;
+      void listAllDomainRows(this.application.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued', turn_id: null })
+        .then((queued) => {
+          if (this.disposed) return;
+          if (queued.length > 0) this.scheduleAdmission(conversationId);
+          else this.clearAdmissionRetry(conversationId);
+        })
+        .catch((error) => { if (!this.disposed) this.onError(error, { operation: 'admit-next', conversationId }); });
+    }, DELETION_ADMISSION_RECHECK_MS);
+    entry.timer.unref();
+    this.admissionRetries.set(conversationId, entry);
   }
 
   private async retryAdmissionLater(conversationId: string): Promise<void> {

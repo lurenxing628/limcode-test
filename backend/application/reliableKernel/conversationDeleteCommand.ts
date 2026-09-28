@@ -18,23 +18,26 @@ import type { ReliableKernelApplication } from '../../reliableKernel/runtimeAppl
  *
  * | Work in the scope (in this order, every round)     | Transition                                                  |
  * |----------------------------------------------------|-------------------------------------------------------------|
- * | queued user message                                | TurnControlPlane.cancelGuidanceForDeletion (revision fence); nothing below runs until every cancellation landed, so no ending Turn admits one |
+ * | queued TurnIntent (a message, a continuation, a runtime continuation, a retry) | TurnControlPlane.cancelGuidanceForDeletion (revision fence); nothing below runs until every cancellation landed, so no ending Turn admits one |
  * | active top-level Turn: the durable stop request    | TurnControlPlane.requestExternalInterrupt                   |
+ * | the requested background child Agent of a completed parent Turn, its active Turns | ReliableChildAgentCoordinator.interruptFromConversation (its own panel's stop: no interrupted answer, so no parent continues) |
  * | child Agent with work, outermost, with its subtree | ReliableChildAgentCoordinator.interruptSubtree, `userStop`, a new source key per attempt |
  * | active top-level Turn: executing the stop          | ReliableConversationRunner.interrupt (live owner, dead host, outcome_unknown) |
  * | running background process                         | ProcessControlPlane.stopOwnedProcess (the wrapper's stop request file) |
- * | child answer a parent Turn in a model request is taking in | none: the deletion waits for that request boundary |
+ *
+ * A child answer a running parent Turn outside the scope has not taken in is no work: the deletion
+ * transaction hands that Turn the deletion notice instead (ConversationDeletionControlPlane).
  *
  * The parents' stop requests are durable before the subtree is interrupted, so a parent whose wait
  * for a child ends terminates instead of calling the model again; the subtree is interrupted before
  * any parent Turn actually ends, so no child finishing normally continues a stopped parent.
- * While the command runs, this window opens no continuation Turn in the scope
- * (ConversationDeletionControlPlane.markStopping): a stopped background process of an idle
- * Conversation reports its end to nobody. The window that owns a Conversation runs its wakes, so a
+ * While the command runs, this window opens no continuation Turn in the scope and admits nothing
+ * queued there (ConversationDeletionControlPlane.markStopping): a stopped background process of an
+ * idle Conversation reports its end to nobody. The window that owns a Conversation runs its wakes, so a
  * live other window that owns one may still open that Turn; the deletion then stops it as well.
  * A live owner executes what it was asked; a dead owner's work is closed by the stop paths above.
  * The command waits until nothing runs, at most `timeoutMs`, re-issuing stops that did not land,
- * and reports progress (stopping, waiting for another window, waiting for a parent's request).
+ * and reports progress (stopping, waiting for another window).
  * When work does not stop in time the Conversation is not deleted and
  * ConversationDeleteIncompleteError names what still runs, where, and whether its stop request was
  * sent; the requests stay, so deleting again after it stopped completes.
@@ -52,9 +55,7 @@ export type ConversationDeleteProgress =
   /** Work of the scope is being stopped. */
   | { kind: 'stopping'; message: string }
   /** Nothing runs, but another window still holds the Conversation. */
-  | { kind: 'waiting_owner'; message: string }
-  /** A parent Turn outside the scope is in a model request and takes the child's answer in at its end. */
-  | { kind: 'waiting_parent'; message: string };
+  | { kind: 'waiting_owner'; message: string };
 
 export interface ConversationDeleteCommandDependencies {
   application: ReliableKernelApplication;
@@ -66,6 +67,13 @@ export interface ConversationDeleteCommandDependencies {
       input: { sourceKey: string; childExecutionId: string; reason: string },
       options: { userStop?: boolean }
     ): Promise<unknown>;
+    interruptFromConversation(input: {
+      commandId: string;
+      childExecutionId: string;
+      conversationId: string;
+      turnId: string;
+      reason: string;
+    }): Promise<unknown>;
   };
   /**
    * Records durably that the user deleted exactly these conversations from the current data set
@@ -90,7 +98,7 @@ export interface ConversationDeleteRemainingWork {
   conversationId: string;
   id: string;
   detail: string;
-  /** The stop request of this work was written (it is not for 'owner', 'parent_intake' and 'error'). */
+  /** The stop request of this work was written (it is not for 'owner' and 'error'). */
   stopRequested: boolean;
 }
 
@@ -162,6 +170,8 @@ class ConversationDeleteCommand {
         for (const id of unmarked) marked.add(id);
       }
       if (inventory.work.length === 0) {
+        // Only the latest attempt says whether another window holds the Conversation.
+        this.busy = undefined;
         try {
           // The facade boundary guard: the requested id is pinned; the control plane pins the rest.
           const deleted = await application.database.conversationOwners.run(this.conversationId, () =>
@@ -182,18 +192,15 @@ class ConversationDeleteCommand {
         }
       } else {
         this.busy = undefined;
-        if (inventory.work.every((item) => item.kind === 'parent_intake')) {
-          const parent = inventory.work[0].conversationId;
-          this.progress({
-            kind: 'waiting_parent',
-            message: `父对话${title(inventory, parent)}正在等模型回复，回复后它会接收子任务的答复，然后自动删除`
-          });
-        } else {
-          this.progress({ kind: 'stopping', message: CONVERSATION_DELETE_PROGRESS_TITLE });
-          await this.issueStops(inventory);
-        }
+        this.progress({ kind: 'stopping', message: CONVERSATION_DELETE_PROGRESS_TITLE });
+        await this.issueStops(inventory);
       }
-      if (Date.now() >= deadline) throw await this.incomplete(inventory);
+      if (Date.now() >= deadline) {
+        // What still runs after this round's stops, not what ran before them.
+        const latest = await application.conversationDeletion.inspect(this.conversationId);
+        if (!latest) return null;
+        throw await this.incomplete(latest);
+      }
       await sleep(this.dependencies.pollMs ?? DEFAULT_POLL_MS);
     }
   }
@@ -245,6 +252,18 @@ class ConversationDeleteCommand {
     for (const item of turns) {
       await this.issue(item, 'request', () => application.turns.requestExternalInterrupt(item.conversationId, {
         source: { kind: 'command', key: `${prefix}:turn:${item.id}` },
+        turnId: item.id,
+        reason: CONVERSATION_DELETE_STOP_REASON
+      }));
+    }
+    // The requested background child of a completed parent Turn is stopped like from its own panel:
+    // without a termination request it publishes no interrupted answer, so no parent continues.
+    const detached = panelStoppedRoot(inventory);
+    for (const item of detached ? inventory.work.filter((entry) => entry.kind === 'child_turn' && entry.childExecutionId === detached) : []) {
+      await this.issue({ ...item, kind: 'child_execution', id: detached! }, `panel-stop:${item.id}`, () => childAgents.interruptFromConversation({
+        commandId: `${prefix}:child-turn:${item.id}`,
+        childExecutionId: detached!,
+        conversationId: item.conversationId,
         turnId: item.id,
         reason: CONVERSATION_DELETE_STOP_REASON
       }));
@@ -330,7 +349,7 @@ class ConversationDeleteCommand {
       const workKey = item.childExecutionId
         ? `child_execution:${outermostCovering(inventory, item.childExecutionId)}`
         : `${item.kind}:${item.id}`;
-      const stopRequested = item.kind !== 'parent_intake' && this.requested.has(workKey);
+      const stopRequested = this.requested.has(workKey);
       let detail: string;
       if (item.kind === 'turn' || item.kind === 'child_turn') {
         const owner = item.kind === 'turn' ? `对话${title(inventory, item.conversationId)}的回合` : `子任务${title(inventory, item.conversationId)}的回合`;
@@ -342,12 +361,10 @@ class ConversationDeleteCommand {
         detail = `子任务${title(inventory, item.conversationId)}还有排队的后续任务`;
       } else if (item.kind === 'queued_message') {
         detail = `对话${title(inventory, item.conversationId)}还有排队的消息没能取消`;
-      } else if (item.kind === 'parent_intake') {
-        detail = `父对话${title(inventory, item.conversationId)}的模型回复还没结束，它要先接收子任务的答复`;
       } else {
         detail = `对话${title(inventory, item.conversationId)}的后台进程 ${item.id} 还在运行`;
       }
-      if (item.kind !== 'parent_intake') detail += stopRequested ? '（已发出停止请求）' : '（还没能发出停止请求）';
+      detail += stopRequested ? '（已发出停止请求）' : '（还没能发出停止请求）';
       anyRequested ||= stopRequested;
       remaining.push({ kind: item.kind, conversationId: item.conversationId, id: item.id, detail, stopRequested });
       lines.add(detail);
@@ -390,12 +407,30 @@ function title(inventory: ConversationDeletionInventory, conversationId: string)
 }
 
 /**
+ * The requested child Agent when it is stopped like from its own panel: a background child of a
+ * completed parent Turn with an active Turn. Its subtree is not interrupted with it (its own
+ * children with work are, as the outermost ones); with no active Turn left, a queued continuation
+ * is cancelled with its subtree, which then publishes nothing either.
+ */
+function panelStoppedRoot(inventory: ConversationDeletionInventory): string | null {
+  const root = inventory.rootChildExecutionId;
+  if (!root || !inventory.rootChildDetached) return null;
+  return inventory.work.some((item) => item.kind === 'child_turn' && item.childExecutionId === root) ? root : null;
+}
+
+/** The ChildExecutions of the scope that have work and are interrupted with their subtree. */
+function childrenWithWork(inventory: ConversationDeletionInventory): Set<string> {
+  const detached = panelStoppedRoot(inventory);
+  return new Set(inventory.work.flatMap((item) =>
+    item.childExecutionId && item.childExecutionId !== detached ? [item.childExecutionId] : []));
+}
+
+/**
  * The child Agents to interrupt: each ChildExecution of the scope that has work, unless an ancestor
  * in the scope is interrupted too (interruptSubtree covers the whole subtree).
  */
 function outermostChildrenWithWork(inventory: ConversationDeletionInventory): string[] {
-  const withWork = new Set(inventory.work.flatMap((item) =>
-    item.childExecutionId && item.kind !== 'parent_intake' ? [item.childExecutionId] : []));
+  const withWork = childrenWithWork(inventory);
   return [...withWork].sort().filter((childExecutionId) => outermostCovering(inventory, childExecutionId, withWork) === childExecutionId);
 }
 
@@ -403,7 +438,7 @@ function outermostChildrenWithWork(inventory: ConversationDeletionInventory): st
 function outermostCovering(
   inventory: ConversationDeletionInventory,
   childExecutionId: string | undefined,
-  withWork = new Set(inventory.work.flatMap((item) => item.childExecutionId ? [item.childExecutionId] : []))
+  withWork = childrenWithWork(inventory)
 ): string {
   if (!childExecutionId) return '';
   const parentOf = new Map(inventory.childExecutions.map((child) => [child.id, child.parentChildExecutionId]));

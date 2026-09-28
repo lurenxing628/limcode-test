@@ -26,6 +26,7 @@ import {
 import { mapSettledWithBoundedConcurrency } from '../capabilities/boundedConcurrency';
 import { classifyCommandCall } from '../world/modules/tools/definitions/command';
 import type { RuntimeDeliveryControlPlane } from './answerDelivery';
+import type { RuntimeDeliveryModelProjection } from './runtimeDeliveryProjection';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
@@ -3253,15 +3254,7 @@ export class ReliableAgentLoop {
     let absorbed = 0;
     for (const input of pending) {
       const inputId = requireId(input.id, 'PendingTurnInput.id');
-      const contentObjectId = requireId(input.content_object_id, 'PendingTurnInput.content_object_id');
-      const metadata = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
-      const content = await this.contentStore.read(metadata);
-      const projection = await this.runtimeDeliveries.projectInputForModel({
-        pendingTurnInputId: inputId,
-        contentObjectId,
-        content,
-        contentType: requireText(metadata.content_type, 'ContentObject.content_type')
-      });
+      const projection = await this.projectRuntimeInput(inputId, requireId(input.content_object_id, 'PendingTurnInput.content_object_id'));
       if (!projection) {
         await this.runtimeDeliveries.markInputHandled(inputId);
         absorbed += 1;
@@ -3285,6 +3278,31 @@ export class ReliableAgentLoop {
       absorbed += 1;
     }
     return absorbed;
+  }
+
+  /**
+   * The model projection of one runtime input. Deleting a child Conversation replaces an input of its
+   * answer that this Turn has not taken in by the deletion notice (ConversationDeletionControlPlane):
+   * an input whose content changed while it was projected is projected once more as it is now.
+   */
+  private async projectRuntimeInput(inputId: string, contentObjectIdInput: string): Promise<RuntimeDeliveryModelProjection | null> {
+    let contentObjectId = contentObjectIdInput;
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        const metadata = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
+        const content = await this.contentStore.read(metadata);
+        return await this.runtimeDeliveries.projectInputForModel({
+          pendingTurnInputId: inputId,
+          contentObjectId,
+          content,
+          contentType: requireText(metadata.content_type, 'ContentObject.content_type')
+        });
+      } catch (error) {
+        const latest = requireId((await this.requireExisting('PendingTurnInput', inputId)).content_object_id, 'PendingTurnInput.content_object_id');
+        if (attempt > 0 || latest === contentObjectId) throw error;
+        contentObjectId = latest;
+      }
+    }
   }
 
   private async terminateIfRequested(

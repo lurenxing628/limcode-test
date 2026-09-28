@@ -2085,17 +2085,26 @@ export class RuntimeDeliveryControlPlane {
         content: requirePhaseFText(notice.reason, 'Deleted child notice.reason')
       });
     }
-    const submission = await this.requireExisting('AnswerSubmission', submissionId);
-    const answerBridgeId = requirePhaseFId(
-      submission.answer_bridge_id,
-      'AnswerSubmission.answer_bridge_id'
-    );
-    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const submission = await this.maybeGet('AnswerSubmission', submissionId);
+    const bridge = submission
+      ? await this.maybeGet('AnswerBridge', requirePhaseFId(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id'))
+      : null;
+    const payloads = bridge ? await this.listRows('AnswerPayload', { submission_id: submissionId }, 2) : [];
+    if (!submission || !bridge || (payloads.length === 0 && !await this.maybeGet('AnswerSubmission', submissionId))) {
+      // The child Conversation was deleted after this input was read. Its deletion replaces an input
+      // not taken in yet by the deletion notice, which the caller reads again; an input it did not
+      // replace is never shown (the answer is gone), so the parent Turn is never stuck on it.
+      const latest = await this.requireExisting('PendingTurnInput', pendingTurnInputId);
+      if (latest.content_object_id !== contentObjectId) {
+        throw new Error('Runtime Delivery projection content conflicts with PendingTurnInput.');
+      }
+      return null;
+    }
+    const answerBridgeId = requirePhaseFId(bridge.id, 'AnswerBridge.id');
     const childExecutionId = requirePhaseFId(
       bridge.child_execution_id,
       'AnswerBridge.child_execution_id'
     );
-    const payloads = await this.listRows('AnswerPayload', { submission_id: submissionId }, 2);
     if (payloads.length !== 1 || payloads[0].content_object_id !== contentObjectId) {
       throw new Error('Answer Runtime Delivery model projection requires its exact AnswerPayload.');
     }

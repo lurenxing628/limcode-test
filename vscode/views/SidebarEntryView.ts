@@ -346,22 +346,14 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     void (async () => {
       try {
         const backendApp = await this.application();
-        const deletedConversationIds = await backendApp.deleteConversation(conversationId);
-        const deleted = deletedConversationIds !== null;
-        if (deletedConversationIds) {
-          for (const deletedConversationId of deletedConversationIds) {
-            MainPanel.closePanelsByConversationId(deletedConversationId);
-          }
+        // Null: the conversation no longer exists (another window deleted it meanwhile), which is
+        // what the user asked for.
+        const deletedConversationIds = await backendApp.deleteConversation(conversationId) ?? [conversationId];
+        for (const deletedConversationId of deletedConversationIds) {
+          MainPanel.closePanelsByConversationId(deletedConversationId);
         }
         await this.postSidebarStateWhenReady(webview, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
-        await this.postConversationOperationResult(
-          webview,
-          'delete',
-          conversationId,
-          deleted,
-          deleted ? undefined : '该对话不存在。',
-          deletedConversationIds ? { deletedConversationIds } : undefined
-        );
+        await this.postConversationOperationResult(webview, 'delete', conversationId, true, undefined, { deletedConversationIds });
       } catch (error) {
         const message = error instanceof Error ? error.message : '删除对话失败。';
         console.warn('[LimCode] Failed to delete sidebar conversation.', error);
