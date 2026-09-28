@@ -2527,30 +2527,56 @@ async function receivingChangedSince(target: string, marker: RelocationMarker): 
     try {
       if (await digestWithoutRows(candidate, merging.inserted) === database.before.contentDigest) return { kind: 'unchanged' };
     } catch (error) {
+      // The check itself did not run (a defect of this build, e.g. its worker missing from the
+      // package): never taken for a read that may pass, which would be retried forever.
+      if (isCheckWorkerFailure(error)) throw error;
       return { kind: 'unreadable', reason: errorMessage(error) };
     }
   }
   return { kind: 'changed', reason: '新数据目录里的当前历史库在这次迁移之后有了新的内容（可能是另一个 LimCode 安装或窗口正在使用这个目录）。' };
 }
 
-/** The content digest of a data set without the given rows, on a private copy in a worker. */
+/**
+ * The content digest of a data set without the given rows, on a private copy in a worker. A read of
+ * the copy that fails is the worker's answer (`ok: false`); a worker that could not start (its file
+ * missing, MODULE_NOT_FOUND) or ended without an answer (an uncaught error, an abnormal exit) is a
+ * defect of this build: 'data-root-relocation-check-worker-failed' (see isCheckWorkerFailure).
+ */
 async function digestWithoutRows(candidate: VscodeRuntimeDataSetCandidate, inserted: Array<[string, string]>): Promise<string> {
   const copy = await copyRuntimeDataSetDatabase(candidate, await requireCompleteRuntimeDataSet(candidate));
   try {
     return await new Promise<string>((resolve, reject) => {
       let settled = false;
-      const worker = new Worker(path.join(__dirname, 'runtimeDataRootRelocationWorker.js'), { workerData: { databasePath: copy.databasePath, inserted } });
+      let worker: Worker;
+      try {
+        worker = new Worker(path.join(__dirname, 'runtimeDataRootRelocationWorker.js'), { workerData: { databasePath: copy.databasePath, inserted } });
+      } catch (error) {
+        reject(checkWorkerFailure(error));
+        return;
+      }
       worker.once('message', (message: RelocationDigestWorkerResponse) => {
         settled = true;
         if (message.ok) resolve(message.digest);
         else reject(new Error(message.message));
       });
-      worker.once('error', (error) => { if (!settled) { settled = true; reject(error); } });
-      worker.once('exit', (code) => { if (!settled) { settled = true; reject(new Error(`核对线程异常退出（退出码 ${code}）。`)); } });
+      worker.once('error', (error) => { if (!settled) { settled = true; reject(checkWorkerFailure(error)); } });
+      worker.once('exit', (code) => {
+        if (!settled) { settled = true; reject(checkWorkerFailure(new Error(`核对线程没有给出结果就退出了（退出码 ${code}）`))); }
+      });
     });
   } finally {
     await copy.remove();
   }
+}
+
+function checkWorkerFailure(cause: unknown): DataRootRelocationError {
+  return new DataRootRelocationError('data-root-relocation-check-worker-failed',
+    `撤销前的核对没能运行（${errorMessage(cause)}）：这是这个 LimCode 版本自身的问题，不是目录读不出，重试不会好转；`
+    + '那次迁移在新目录里的改动这次没有撤销，记录保持不变。请更新或重新安装 LimCode。', cause);
+}
+
+function isCheckWorkerFailure(error: unknown): boolean {
+  return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-check-worker-failed';
 }
 
 function heldError(target: string, marker: RelocationMarker): DataRootRelocationError {

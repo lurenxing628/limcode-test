@@ -3,17 +3,18 @@
 // in-progress record undoes the target's changes, abandoned private copies are swept, and the same
 // target can receive the relocation again.
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
-  conversationIds, indexIds, kernel, planWithRuntime, relocate, relocation, RootAuthority, rootAuthority, selectedDataSet
+  compiled, conversationIds, indexIds, kernel, planWithRuntime, relocate, relocation, RootAuthority, rootAuthority, selectedDataSet
 } from './runtime-data-root-relocation-fixture.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+const checkout = path.resolve(here, '../..');
 const { recoverInterruptedDataRootRelocation, sweepDataRootRelocationLeftovers, finalizeDataRootRelocation } = relocation;
 
 async function runChild(t, scenario, kind) {
@@ -46,6 +47,7 @@ for (const [scenario, kind] of [
   ['before-publish', 'empty'],
   ['config-index', 'limcode'],
   ['during-merge', 'limcode'],
+  ['after-merge-commit', 'limcode'],
   ['before-complete-marker', 'limcode'],
   ['before-publish', 'limcode']
 ]) {
@@ -89,6 +91,77 @@ for (const [scenario, kind] of [
     if (kind === 'limcode') {
       assert.deepEqual(await indexIds(path.join(target, 'agents')), ['agent-shared', 'agent-source-only', 'agent-target-only']);
     }
+  });
+}
+
+test('安装包形态（按 prune-package-dist.mjs 裁剪后的 dist）：SIGKILL 在合并提交进已有 LimCode 目标之后、写 received 之前，下次启动照样核对“目标只多了这次插入的行”并撤销；核对线程不在包里或加载就出错时报这个版本自身的问题（不当作暂时读不出、什么都不动），装回之后照常撤销', { timeout: 180_000 }, async (t) => {
+  const run = await runChild(t, 'after-merge-commit', 'limcode');
+  assert.equal(run.signal, 'SIGKILL', run.log);
+  const { target, relocationId } = run.fixture;
+  const receiving = (await selectedDataSet(target)).runtimeDataRootPath;
+  const merged = ['conversation_current_1', 'conversation_current_2', 'conversation_existing_1'];
+  assert.deepEqual(conversationIds(receiving), merged, '合并已提交进目标');
+  const journal = await fs.readFile(path.join(target, '.limcode-relocation-backups', relocationId, 'journal.jsonl'), 'utf8').catch(() => '');
+  assert.ok(journal.includes('"op":"merging"') && !journal.includes('"op":"received"'), journal);
+
+  // The package as the VSIX carries it: the checkout's dist pruned to its Runtime closure.
+  const packaged = await prunedPackage(run.base);
+  const worker = path.join(packaged, 'backend/reliableKernel/runtimeDataRootRelocationWorker.js');
+  assert.ok(await fs.stat(worker), '核对线程随安装包分发');
+
+  // Without its worker (an earlier package) or with one that fails to load: this build's own defect,
+  // said as such; never 'unreadable' (retried forever), and nothing in the target is touched.
+  const markerFile = path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE);
+  const marker = await fs.readFile(markerFile, 'utf8');
+  await fs.rename(worker, `${worker}.aside`);
+  const missing = await recoverWithPackage(packaged, target, relocationId);
+  assert.equal(missing.code, 'data-root-relocation-check-worker-failed', JSON.stringify(missing));
+  assert.match(missing.message, /^撤销前的核对没能运行（.*Cannot find module.*）：这是这个 LimCode 版本自身的问题，不是目录读不出/s);
+  await fs.writeFile(worker, "throw new Error('broken check worker');\n");
+  const broken = await recoverWithPackage(packaged, target, relocationId);
+  assert.equal(broken.code, 'data-root-relocation-check-worker-failed', JSON.stringify(broken));
+  assert.match(broken.message, /broken check worker/);
+  assert.deepEqual(conversationIds(receiving), merged, '什么都没有撤销');
+  assert.equal(await fs.readFile(markerFile, 'utf8'), marker, '记录保持不变');
+
+  // The worker as packaged: the check runs in the package and the relocation is undone.
+  await fs.rm(worker);
+  await fs.rename(`${worker}.aside`, worker);
+  assert.deepEqual(await recoverWithPackage(packaged, target, relocationId), { outcome: 'recovered' });
+  assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_existing_1'], '目标库恢复到迁移之前');
+  assert.deepEqual(await indexIds(path.join(target, 'agents')), ['agent-shared', 'agent-target-only'], '目标的设置索引完整');
+  await assert.rejects(fs.stat(markerFile), { code: 'ENOENT' });
+  await assert.rejects(fs.stat(path.join(target, '.limcode-relocation-backups')), { code: 'ENOENT' });
+});
+
+/**
+ * The compiled extension pruned as the VSIX is (scripts/reliable-kernel/prune-package-dist.mjs), in
+ * `base`; its bare requires (better-sqlite3) resolve from the checkout's node_modules, as the VSIX
+ * carries them.
+ */
+async function prunedPackage(base) {
+  const packageRoot = path.join(base, 'package');
+  await fs.mkdir(path.join(packageRoot, 'dist'), { recursive: true });
+  await fs.cp(compiled, path.join(packageRoot, 'dist', 'extension'), { recursive: true });
+  await fs.symlink(path.join(checkout, 'node_modules'), path.join(packageRoot, 'node_modules'), 'dir');
+  execFileSync(process.execPath, [path.join(checkout, 'scripts/reliable-kernel/prune-package-dist.mjs')], { cwd: packageRoot, stdio: 'pipe' });
+  const closure = JSON.parse(await fs.readFile(path.join(packageRoot, 'dist', 'package-runtime-closure.json'), 'utf8'));
+  assert.equal(closure.kind, 'limcode-package-runtime-closure', '确实按安装包裁剪过');
+  return path.join(packageRoot, 'dist', 'extension');
+}
+
+/** The next startup's recovery, run in its own process by the packaged Runtime. */
+function recoverWithPackage(extensionRoot, target, relocationId) {
+  const script = `
+    const relocation = require(${JSON.stringify(path.join(extensionRoot, 'backend/reliableKernel/runtimeDataRootRelocation.js'))});
+    relocation.recoverInterruptedDataRootRelocation({ targetRootPath: ${JSON.stringify(target)}, relocationId: ${JSON.stringify(relocationId)} }).then(
+      (outcome) => process.stdout.write(JSON.stringify({ outcome })),
+      (error) => process.stdout.write(JSON.stringify({ code: error && error.code, message: String(error && error.message) })));`;
+  return new Promise((resolve, reject) => {
+    execFile(process.execPath, ['-e', script], { cwd: checkout, maxBuffer: 4 * 1024 * 1024 }, (error, stdout, stderr) => {
+      if (error) reject(new Error(`${error.message}\n${stderr}`));
+      else resolve(JSON.parse(stdout));
+    });
   });
 }
 

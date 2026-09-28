@@ -294,7 +294,13 @@ const legacyRuntimePaths = [
   '/shared/agentRunActivity.js'
 ];
 
+let packagedRuntimeClosureResult;
 function checkPackagedRuntimeClosure() {
+  packagedRuntimeClosureResult ??= packagedRuntimeClosureProblem();
+  return packagedRuntimeClosureResult;
+}
+
+function packagedRuntimeClosureProblem() {
   const absolute = requireArtifact();
   const manifest = readPackageRuntimeClosure(absolute);
   const listed = listVsixFiles(absolute);
@@ -303,10 +309,12 @@ function checkPackagedRuntimeClosure() {
   if (JSON.stringify(packageJs) !== JSON.stringify(manifestPaths)) {
     return `VSIX Runtime JS集合(${packageJs.length})与closure manifest(${manifestPaths.length})不一致`;
   }
+  const sources = new Map();
   for (const entry of manifest.files) {
     const bytes = unzipEntry(absolute, `extension/${entry.path}`, { encoding: null, maxBuffer: 64 * 1024 * 1024 });
     const digest = crypto.createHash('sha256').update(bytes).digest('hex');
     if (digest !== entry.sha256) return `${entry.path}摘要与package runtime closure manifest不一致`;
+    sources.set(entry.path, bytes.toString('utf8'));
   }
   const graph = computeVsixRequireClosure(absolute, manifest.seeds, new Set(listed));
   if (JSON.stringify([...graph].sort()) !== JSON.stringify(manifestPaths)) {
@@ -317,7 +325,78 @@ function checkPackagedRuntimeClosure() {
     const selector = legacyRuntimePaths.find((candidate) => normalized.includes(candidate));
     if (selector) return `最终require图仍可达${normalized}（命中${selector}）`;
   }
-  return null;
+  const entryProblems = dirnameEntryProblems(sources, new Set(manifestPaths));
+  return entryProblems.length > 0 ? entryProblems.join('；') : null;
+}
+
+/**
+ * Code started by its path next to the starting file (path.join or path.resolve of __dirname and one
+ * literal) instead of require(): worker threads and child processes. No require() graph reaches
+ * them, so the package keeps one only as a seed (prune-package-dist.mjs): a packaged file that starts
+ * one the VSIX lacks fails only when that code path runs. Registered with the boundary it is started
+ * across: 'worker' (workerData and messages are structured clones: also in
+ * INTERNAL_STRUCTURED_CLONE_PATHS) or 'process' (argv strings and stdio bytes, no structured clone).
+ */
+const DIRNAME_ENTRY_BOUNDARIES = new Map([
+  ['dist/extension/backend/reliableKernel/databaseWorker.js', 'worker'],
+  ['dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js', 'worker'],
+  ['dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js', 'worker'],
+  ['dist/extension/backend/reliableKernel/runtimeDataRootRelocationWorker.js', 'worker'],
+  ['dist/extension/backend/reliableKernel/processWrapper.js', 'process']
+]);
+
+/** __dirname uses that start no code, by file: the literal path each resolves (e.g. the extension root for its provenance file). */
+const DIRNAME_RESOURCE_USES = new Map([
+  ['dist/extension/backend/reliableKernel/debugCapture/source.js', new Set(['../../../../..'])]
+]);
+
+/**
+ * Every __dirname use of the packaged Runtime closure: a started entry must be registered
+ * (DIRNAME_ENTRY_BOUNDARIES, started the way it is registered), be in the VSIX closure, and a worker
+ * be a registered structured-clone boundary; any other use must be a registered resource path. A
+ * registration nothing uses any more is reported too.
+ */
+function dirnameEntryProblems(sources, closure) {
+  const problems = [];
+  const started = new Set();
+  const resources = new Set();
+  const literalPath = /\.(?:join|resolve)\)?\(\s*__dirname\s*,\s*(['"])([^'"\n]+)\1\s*\)/y;
+  for (const [file, source] of [...sources].sort(([left], [right]) => left.localeCompare(right))) {
+    for (const match of source.matchAll(/\b__dirname\b/g)) {
+      const callStart = source.lastIndexOf('(', match.index);
+      const memberStart = Math.max(source.lastIndexOf('.join', callStart), source.lastIndexOf('.resolve', callStart));
+      literalPath.lastIndex = memberStart;
+      const call = memberStart >= 0 && match.index - memberStart <= 16 ? literalPath.exec(source) : null;
+      if (!call) {
+        const line = source.slice(source.lastIndexOf('\n', match.index) + 1, source.indexOf('\n', match.index)).trim().slice(0, 160);
+        problems.push(`${file}有未登记的__dirname用法（只认path.join/resolve(__dirname, '单个字面量')）：${line}`);
+        continue;
+      }
+      const literal = call[2];
+      const target = path.posix.normalize(path.posix.join(path.posix.dirname(file), literal));
+      if (!/\.[cm]?js$/.test(literal)) {
+        if (DIRNAME_RESOURCE_USES.get(file)?.has(literal)) resources.add(`${file}\0${literal}`);
+        else problems.push(`${file}有未登记的__dirname资源路径：${literal}`);
+        continue;
+      }
+      const before = source.slice(Math.max(0, memberStart - 240), memberStart);
+      const kind = /new\s+[\w$.]*Worker\(\s*[\w$]*$/.test(before) ? 'worker'
+        : /\b(?:spawn|fork|execFile|spawnSync|execFileSync)\)?\([^;]*$/.test(before) ? 'process' : 'unknown';
+      started.add(target);
+      const registered = DIRNAME_ENTRY_BOUNDARIES.get(target);
+      if (!registered) problems.push(`${file}按__dirname启动了未登记的入口${target}（${kind}）：登记它的边界并加进prune-package-dist.mjs的seedPaths`);
+      else if (registered !== kind) problems.push(`${file}启动${target}的方式（${kind}）与登记的边界（${registered}）不一致`);
+      if (!closure.has(target)) problems.push(`${file}按__dirname启动的${target}不在VSIX Runtime闭包里：安装后这条代码路径必然失败，需加进prune-package-dist.mjs的seedPaths`);
+      if (registered === 'worker' && !INTERNAL_STRUCTURED_CLONE_PATHS.has(target)) problems.push(`worker入口${target}没有登记为structured-clone边界`);
+    }
+  }
+  for (const target of DIRNAME_ENTRY_BOUNDARIES.keys()) {
+    if (!started.has(target)) problems.push(`登记的__dirname入口${target}没有被VSIX里的任何文件启动（撤掉登记，或补上启动它的文件）`);
+  }
+  for (const [file, literals] of DIRNAME_RESOURCE_USES) {
+    for (const literal of literals) if (!resources.has(`${file}\0${literal}`)) problems.push(`登记的__dirname资源路径${file}：${literal}已不在VSIX里`);
+  }
+  return problems;
 }
 
 function checkVsixLegacyEntriesAbsent() {
@@ -360,6 +439,15 @@ function checkSourceSymbolsRemoved() {
     : null;
 }
 
+/** Extension-internal postMessage boundaries: worker threads and their launchers (structured clones between threads of this process). */
+const INTERNAL_STRUCTURED_CLONE_PATHS = new Set([
+  'dist/extension/backend/reliableKernel/databaseWorker.js',
+  'dist/extension/backend/reliableKernel/runtimeDatabase.js',
+  'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js',
+  'dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js',
+  'dist/extension/backend/reliableKernel/runtimeDataRootRelocationWorker.js'
+]);
+
 function checkBridgePayloadPlain() {
   const absolute = requireArtifact();
   const manifest = readPackageRuntimeClosure(absolute);
@@ -395,12 +483,7 @@ function checkBridgePayloadPlain() {
     }
   ];
   const webviewBoundaryPaths = new Set(boundarySpecs.map((entry) => entry.path));
-  const internalStructuredClonePaths = new Set([
-    'dist/extension/backend/reliableKernel/databaseWorker.js',
-    'dist/extension/backend/reliableKernel/runtimeDatabase.js',
-    'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js',
-    'dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js'
-  ]);
+  const internalStructuredClonePaths = INTERNAL_STRUCTURED_CLONE_PATHS;
   const problems = [];
 
   for (const spec of boundarySpecs) {

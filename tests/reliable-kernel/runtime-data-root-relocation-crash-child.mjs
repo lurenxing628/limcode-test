@@ -38,6 +38,17 @@ async function main() {
   let markerOpens = 0;
   const open = fsp.open;
   fsp.open = async function hookedOpen(file, ...rest) {
+    // The merge into an existing target committed (its rows journaled as 'merging' before), killed
+    // before its 'received' journal entry: the undo must prove the target is only that plus these rows.
+    if (scenario === 'after-merge-commit' && typeof file === 'string' && rest[0] === 'a') {
+      const handle = await open.call(this, file, ...rest);
+      const appendFile = handle.appendFile.bind(handle);
+      handle.appendFile = async (data, ...more) => {
+        if (String(data).includes('"op":"received"')) kill('merge committed, before the received journal entry');
+        return appendFile(data, ...more);
+      };
+      return handle;
+    }
     if (typeof file === 'string' && file.endsWith('.tmp')) {
       if (path.basename(file).startsWith('.limcode-data-root-relocation.json.')) {
         markerOpens += 1;
