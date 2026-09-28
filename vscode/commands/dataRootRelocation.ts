@@ -168,6 +168,7 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
   let cleaned = true;
   /** Why the undo after a failure could not finish (or was held), for the message. */
   let cleanupProblem: string | undefined;
+  let cleanupDefect = false;
   /** The pointer switched to the target although a later step failed: the relocation took effect. */
   let tookEffect = false;
   /** The pointer could not be read after the failure: nothing was undone. */
@@ -256,6 +257,7 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
           cleaned = await abandonStagedDataRootRelocation(prepared, { pointerUnchanged: true }).then(() => true, (error: unknown) => {
             console.warn('[LimCode] 撤销未完成的迁移失败，下次启动时再试。', error);
             cleanupProblem = describeError(error);
+            cleanupDefect = isCheckWorkerFailure(error);
             // Held (someone wrote into the target since): never undone automatically, nothing is left to retry.
             return isUndoHeld(error);
           });
@@ -301,7 +303,8 @@ async function runRelocation(context: vscode.ExtensionContext, host: DataRootRel
     await reloadWindow();
     return;
   }
-  const detail = (cleaned
+  // The undo's check could not run (a defect of this build): no retry mends it, so none is promised.
+  const detail = !cleaned && cleanupDefect ? `数据目录没有切换，旧目录里的数据没有改动；${CHECK_WORKER_FAILED_NOTE}${cleanupProblem ?? ''}` : (cleaned
     ? cleanupProblem ?? '数据目录没有切换，旧目录没有改动；新目录里本次做的改动已撤销。'
     : `数据目录没有切换，旧目录里的数据没有改动；新目录里本次做的改动没能全部撤销，下次启动 LimCode 时会再撤销一次。${cleanupProblem ?? ''}`);
   if (runtimeClosed) {
@@ -860,6 +863,12 @@ async function settleInterruptedRelocation(context: vscode.ExtensionContext, pen
           : `新数据目录现在看不到（${pending.targetRootPath}；例如所在的盘没有接上、网络盘断开或盘符变了），接上后会自动撤销。`;
   } catch (error) {
     console.warn('[LimCode] 撤销中断的数据目录迁移失败，下次启动时再试。', error);
+    if (isCheckWorkerFailure(error)) {
+      const lines = [`上次中断的数据目录迁移没有撤销；${CHECK_WORKER_FAILED_NOTE}`, describeError(error)];
+      if (ask) await tell(ask, '上次的迁移没能撤销', lines);
+      else void vscode.window.showWarningMessage(`${EXTENSION_BRAND}：${lines.join('')}`);
+      return false;
+    }
     problem = describeError(error);
   }
   const lines = ['上次中断的数据目录迁移还没有撤销完，下次启动 LimCode 时会再试；在此之前不能开始新的迁移。', problem];
@@ -1004,6 +1013,10 @@ async function settleOwnRelocation(context: vscode.ExtensionContext, pending: Pe
     if (isDataRootRelocationTargetInvisible(error)) {
       return offerForgetRelocation(context, pending, ['本窗口上次迁移时在新目录里做的改动还没有撤销。', describeError(error)], ask);
     }
+    if (isCheckWorkerFailure(error)) {
+      await tell(ask, '本窗口上次的迁移没能撤销', [`本窗口上次迁移时在新目录里做的改动刚才又试着撤销，没有成功；${CHECK_WORKER_FAILED_NOTE}`, describeError(error)]);
+      return false;
+    }
     problem = describeError(error);
   }
   await tell(ask, '本窗口上次的迁移还没有撤销完', [
@@ -1021,6 +1034,14 @@ function isOwnPending(pending: PendingDataRootRelocation): boolean {
 function isUndoHeld(error: unknown): boolean {
   return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-undo-held';
 }
+
+/** The undo's check could not run at all: a defect of this build, which no retry or restart mends. */
+function isCheckWorkerFailure(error: unknown): boolean {
+  return (error as { code?: unknown } | undefined)?.code === 'data-root-relocation-check-worker-failed';
+}
+
+const CHECK_WORKER_FAILED_NOTE = '撤销前的核对没能运行，这是这个 LimCode 扩展本身的问题，重试或重启都不会好转，请更新或重新安装 LimCode 扩展；'
+  + '这次什么都没有改动：新目录里那次迁移的改动原样留着（旧目录里已写下的“数据已迁走”标记也留着），迁移记录保持不变，装好之后启动时再撤销。在那之前不能开始新的迁移。';
 
 /**
  * Before the Runtime opens: a relocation recorded as in progress whose process is gone is undone

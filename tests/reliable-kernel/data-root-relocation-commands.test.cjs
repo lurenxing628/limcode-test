@@ -51,7 +51,7 @@ function fixture({
   picked = TARGET, plan = {}, answers = [], busy = [false], completeError, cleanup,
   closeError, abandonError, lastMigration, pendingRelocation, ownerState = 'dead', returnUsable = true, currentAvailable = true, carryBackError,
   host = true, deletion = {}, deleteResult = { removed: ['data-set:default'], remainingDataSets: 0 }, recoveryChoice,
-  nativeAnswers = [], recoverOutcome = 'recovered', cancelStage = false, movedNotice, copyAside, hold,
+  nativeAnswers = [], recoverOutcome = 'recovered', recoverError, cancelStage = false, movedNotice, copyAside, hold,
   afterLocksError, statusUnreadable = false, undoUnpublishedResult = {},
   /** What inspectDataRootMovedNotice finds (an Error: the read fails); by default `movedNotice` or none. */
   movedRead, consentError, abandonNoticeError
@@ -210,7 +210,7 @@ function fixture({
         return { oldRootPath: input.oldRootPath, problems: [], items: [], kept: [], ...deletion };
       },
       deleteOldDataRoot: async (input) => { calls.push(['delete', plain(input)]); return deleteResult; },
-      recoverInterruptedDataRootRelocation: async (input) => { calls.push(['recover', plain(input)]); return recoverOutcome; },
+      recoverInterruptedDataRootRelocation: async (input) => { calls.push(['recover', plain(input)]); if (recoverError) throw recoverError; return recoverOutcome; },
       finalizeDataRootRelocation: async (root) => { calls.push(['finalize', root]); },
       readDataRootMovedNotice: async (root) => {
         calls.push(['read-moved', root]);
@@ -516,6 +516,43 @@ test('运行时关闭后迁移失败：迁移自身已撤销时不再重复；�
   await closeFailed.commands.relocateDataRoot(closeFailed.context, closeFailed.startup, closeFailed.request);
   assert.ok(!closeFailed.kinds().includes('complete'));
   assert.ok(closeFailed.kinds().includes('abandon'), '准备阶段留下的内容由命令撤销，不会谎称已清理');
+});
+
+test('打包组 F1 撤销前的核对线程起不来（data-root-relocation-check-worker-failed）：迁移失败后的撤销、启动时的续撤、本窗口再点迁移时的续撤都如实说明是扩展本身的问题、重试不会好转、请更新或重新安装、这次什么都没改动，不说“下次启动时会再试”；记录保留', async () => {
+  const defect = () => Object.assign(new Error('撤销前的核对没能运行（Cannot find module runtimeDataRootRelocationWorker.js）：这是这个 LimCode 版本自身的问题，不是目录读不出，重试不会好转；那次迁移在新目录里的改动这次没有撤销，记录保持不变。请更新或重新安装 LimCode。'),
+    { code: 'data-root-relocation-check-worker-failed' });
+  const honest = /撤销前的核对没能运行，这是这个 LimCode 扩展本身的问题，重试或重启都不会好转，请更新或重新安装 LimCode 扩展；这次什么都没有改动/;
+  const retrying = /下次启动 LimCode 时会再(试|撤销一次)/;
+
+  const failed = fixture({ answers: [{ choice: 'relocate', include: [] }], completeError: new Error('磁盘错误'), cleanup: 'not-cleaned', abandonError: defect() });
+  await failed.commands.relocateDataRoot(failed.context, failed.startup, failed.request);
+  assert.ok(failed.kinds().includes('abandon'));
+  assert.equal(failed.calls.filter((call) => call[0] === 'status').length, 1, '进行中记录保留');
+  const detail = failed.calls.find((call) => call[0] === 'error')[2].detail;
+  assert.match(detail, honest);
+  assert.match(detail, /请更新或重新安装 LimCode。/, '带着错误本身的说明');
+  assert.doesNotMatch(detail, retrying);
+
+  const pending = { relocationId: 'r-defect', sourceRootPath: SOURCE, targetRootPath: TARGET, startedAt: '2026-09-28T00:00:00.000Z', processId: 1 };
+  const startup = fixture({ pendingRelocation: pending, recoverError: defect() });
+  await startup.commands.beforeDataRootOpen(startup.context);
+  const warning = startup.calls.find((call) => call[0] === 'warning');
+  assert.match(warning[1], /上次中断的数据目录迁移没有撤销；撤销前的核对没能运行/);
+  assert.match(warning[1], honest);
+  assert.doesNotMatch(warning[1], retrying);
+  assert.ok(startup.status.pendingRelocation, '记录保留');
+
+  const own = fixture({
+    pendingRelocation: { ...pending, processId: process.pid, processStartIdentity: 'start-identity' }, ownerState: 'alive', abandonError: defect()
+  });
+  await own.commands.relocateDataRoot(own.context, own.startup, own.request);
+  assert.ok(own.kinds().includes('abandon'), '本窗口的记录：又试了一次');
+  assert.equal(own.prompts[0].title, '本窗口上次的迁移没能撤销');
+  const lines = own.prompts[0].sections[0].lines.join('\n');
+  assert.match(lines, honest);
+  assert.doesNotMatch(lines, retrying);
+  assert.ok(!own.kinds().includes('plan'), '不开始新的迁移');
+  assert.ok(own.status.pendingRelocation, '记录保留');
 });
 
 test('reloc3 问题 2 与撤销搁置：失败后拷来的数据仍在旁边就不算撤销完，保留进行中记录并写明拷贝位置；撤销被搁置时清除记录并说明备份在哪；启动时搁置的续撤同样处理；打开搁置的目录提示一次，可以不再提醒', async () => {
