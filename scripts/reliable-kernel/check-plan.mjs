@@ -60,6 +60,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/openAIResponsesWebSocket.test.cjs',
   'tests/openAIResponsesWebSocketSession.test.cjs',
   'tests/reliable-kernel/attachment-catalog-projection.test.mjs',
+  'tests/reliable-kernel/compression-block-projection.test.mjs',
   'tests/reliable-kernel/attachment-ingest-boundary.test.mjs',
   'tests/reliable-kernel/canonical-base64.test.mjs',
   'tests/reliable-kernel/child-agent-status-controls.test.cjs',

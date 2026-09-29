@@ -132,28 +132,41 @@ export function projectConversationCommandReceiptRecord(database: Database.Datab
   return record;
 }
 
+/**
+ * The snapshot and commit-change projection must resolve the same source count and anchor.
+ * Keep the count block-local rather than grouping the entire Conversation before its LIMIT.
+ * CROSS JOIN is intentional: drive the anchor lookup from this block's sources, never from all
+ * message_revision entries in context_segment_source. The membership check must remain inside
+ * the anchor lookup because a shared segment can have aliases in many Conversations.
+ */
+const COMPRESSION_BLOCK_SUMMARY_COLUMNS = `
+  block.*,
+  (
+    SELECT COUNT(source.id)
+      FROM compression_block_source AS source
+     WHERE source.compression_block_id = block.id
+  ) AS source_count,
+  (
+    SELECT revision.message_id
+      FROM compression_block_source AS anchor_source
+      CROSS JOIN context_segment_source AS segment_source
+        ON segment_source.segment_id = anchor_source.segment_id
+       AND segment_source.source_kind = 'message_revision'
+      JOIN message_revision AS revision ON revision.id = segment_source.source_id
+      JOIN message_part_of_conversation AS anchor_membership
+        ON anchor_membership.message_id = revision.message_id
+       AND anchor_membership.conversation_id = block.conversation_id
+     WHERE anchor_source.compression_block_id = block.id
+     ORDER BY anchor_source.position DESC, anchor_source.id DESC
+     LIMIT 1
+  ) AS anchor_message_id
+`;
+
 export function projectCompressionBlockRecord(database: Database.Database, blockId: string): DomainRow {
   const record = queryPlainRows(database, `
-    SELECT block.*,
-           COUNT(source.id) AS source_count,
-           (
-             SELECT revision.message_id
-               FROM compression_block_source AS anchor_source
-               CROSS JOIN context_segment_source AS segment_source
-                 ON segment_source.segment_id = anchor_source.segment_id
-                AND segment_source.source_kind = 'message_revision'
-               JOIN message_revision AS revision ON revision.id = segment_source.source_id
-               JOIN message_part_of_conversation AS anchor_membership
-                 ON anchor_membership.message_id = revision.message_id
-                AND anchor_membership.conversation_id = block.conversation_id
-              WHERE anchor_source.compression_block_id = block.id
-              ORDER BY anchor_source.position DESC, anchor_source.id DESC
-              LIMIT 1
-           ) AS anchor_message_id
+    SELECT ${COMPRESSION_BLOCK_SUMMARY_COLUMNS}
       FROM compression_block AS block
-      LEFT JOIN compression_block_source AS source ON source.compression_block_id = block.id
      WHERE block.id = @blockId
-     GROUP BY block.id
      LIMIT 1
   `, { blockId })[0];
   if (!record) throw new Error(`CompressionBlock ${blockId} cannot resolve its bounded summary.`);
@@ -841,31 +854,18 @@ export function executeClientProjectionSnapshot(
        WHERE conversation_id = @conversationId
        ORDER BY updated_at DESC, id DESC LIMIT @limit
     `, params);
+    // Materialize the bounded block window before expanding its sources. An outer LIMIT after
+    // GROUP BY still counts (and can resolve anchors for) every historical block in the Conversation.
     const compressionBlocks = queryPlainRows(database, `
-      SELECT block.*,
-             COUNT(source.id) AS source_count,
-             (
-               SELECT revision.message_id
-                 FROM compression_block_source AS anchor_source
-                 CROSS JOIN context_segment_source AS segment_source
-                   ON segment_source.segment_id = anchor_source.segment_id
-                  AND segment_source.source_kind = 'message_revision'
-                 JOIN message_revision AS revision
-                   ON revision.id = segment_source.source_id
-                 JOIN message_part_of_conversation AS anchor_membership
-                   ON anchor_membership.message_id = revision.message_id
-                  AND anchor_membership.conversation_id = block.conversation_id
-                WHERE anchor_source.compression_block_id = block.id
-                ORDER BY anchor_source.position DESC, anchor_source.id DESC
-                LIMIT 1
-             ) AS anchor_message_id
-        FROM compression_block AS block
-        LEFT JOIN compression_block_source AS source
-          ON source.compression_block_id = block.id
-       WHERE block.conversation_id = @conversationId
-       GROUP BY block.id
+      WITH window_blocks AS MATERIALIZED (
+        SELECT * FROM compression_block
+         WHERE conversation_id = @conversationId
+         ORDER BY created_at DESC, id DESC
+         LIMIT @limit
+      )
+      SELECT ${COMPRESSION_BLOCK_SUMMARY_COLUMNS}
+        FROM window_blocks AS block
        ORDER BY block.created_at DESC, block.id DESC
-       LIMIT @limit
     `, params).reverse();
     const conversationContextStatuses = queryPlainRows(database, `
       SELECT head.id,
