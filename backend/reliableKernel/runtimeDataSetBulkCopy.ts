@@ -1,3 +1,4 @@
+import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -352,6 +353,25 @@ export async function copyRuntimeDataSetIntoEmptyRoot(
       source = await openRuntimeDataSetMigrationSource(sourcePaths, input,
         { dataSetId: database.binding.dataSetId, rootInstanceId: database.binding.rootInstanceId });
       options.signal?.throwIfAborted();
+      const aggregates = new MergeAggregatePreflight(source.database, database);
+      try {
+        for (const domain of ['ModelRequest', 'Operation', 'Attempt']) {
+          const schema = schemaForDomain(domain);
+          const page = source.database.prepare(`SELECT rowid AS position, * FROM ${schema.table} WHERE rowid > ? ORDER BY rowid LIMIT 250`);
+          for (let after = 0n; ;) {
+            options.signal?.throwIfAborted();
+            const rows = page.all(after) as Array<Record<string, unknown>>;
+            if (!rows.length) break;
+            for (const raw of rows) {
+              const { position, ...record } = raw;
+              aggregates.touch(domain, DOMAIN_REPOSITORIES.codec(domain).decode(record));
+              after = position as bigint;
+            }
+            await new Promise((resolve) => setImmediate(resolve));
+          }
+        }
+        await aggregates.validate(options.signal);
+      } finally { aggregates.close(); }
       const casVerification = options.casVerification ?? new Map<string, string>();
       const cas = await transferRuntimeDataSetMigrationCas(source, {
         configurationRootPath: targetPlacement.configurationRootPath, binding: database.binding

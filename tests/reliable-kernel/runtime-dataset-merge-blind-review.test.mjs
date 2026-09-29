@@ -72,7 +72,7 @@ test('盲审 #1：超过在线上限、又有无法收尾的工作（仍在运�
     if (startup === 1) {
       assert.deepEqual(batch.blocked.map((issue) => [issue.candidateId, issue.code, issue.newly]).sort(),
         [[fixture.alpha.id, UNFINISHED, true], [fixture.beta.id, UNFINISHED, true]].sort());
-      for (const issue of batch.blocked) assert.match(issue.message, /仍在运行或结果未知的后台进程×1/);
+      for (const issue of batch.blocked) assert.match(issue.message, /后台进程仍在运行、结束证据不一致或后续工作未收尾×1/);
     }
     assert.deepEqual(await engine.waiting(fixture.paths), [], '“历史与存储管理”不列为较大、等待合并');
   }

@@ -6,6 +6,9 @@ import { performance } from 'node:perf_hooks';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { readMergeModelAggregates } from './runtimeMergeAggregatePreflight';
+import { RuntimeDataInvariantError } from './runtimeDataInvariant';
+import { repairHistoryTransaction } from './runtimeHistoryRepairTransaction';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import {
   assertModelRequestAggregate,
@@ -269,6 +272,13 @@ async function start(): Promise<void> {
       if (request.kind.startsWith('maintenance') && data.maintenance !== true) {
         throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
       }
+      if (request.kind === 'maintenanceRepairHistory') {
+        assertDatabaseBinding(writer, data.binding);
+        const result = committedDurably(writer, () => repairHistoryTransaction(writer, request.input));
+        commitSeq += 1n;
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
       if (request.kind === 'maintenanceBegin') {
         assertDatabaseBinding(writer, data.binding);
         maintenance = beginMaintenanceTransaction(writer);
@@ -322,6 +332,12 @@ async function start(): Promise<void> {
         post({ type: 'commit', result });
         // Only a reference: the host answers with the commit message's result (cloned once).
         respond({ type: 'response', id: request.id, ok: true, result: null, committed: result.commitSeq });
+        return;
+      }
+      if (request.kind === 'mergeModelAggregates') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = reader.transaction(() => readMergeModelAggregates(reader, request.ids))();
+        respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
       if (request.kind === 'snapshot') {
@@ -841,7 +857,7 @@ function executeTransaction(
 
 /** Requests refused while a maintenance transaction is open: every other writer entry point, the durability checkpoint too. */
 const MAINTENANCE_EXCLUSIVE_WRITES: ReadonlySet<string> = new Set([
-  'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin', 'durabilityCheckpoint'
+  'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin', 'maintenanceRepairHistory', 'durabilityCheckpoint'
 ]);
 
 /** Ids per page of a maintenance commit's aggregate check. */
@@ -1599,7 +1615,7 @@ function executeMutation(
       // (a Conversation fork, a historical data-set merge, a data-root relocation bulk copy): never
       // appended to an existing request.
       if (!historicalCopiesOf(allocatedSequences).has(String(mutation.row.model_request_id))) {
-        throw new Error(`Historical ${schema.key} copy requires its ModelRequest to be copied in the same transaction.`);
+        throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), `Historical ${schema.key} copy requires its ModelRequest to be copied in the same transaction.`);
       }
     }
     if (schema.key === 'ModelStreamCheckpoint') {
@@ -1607,7 +1623,7 @@ function executeMutation(
         status?: unknown;
       } | undefined;
       if (request?.status !== 'terminal') {
-        throw new Error('Historical ModelStreamCheckpoint copy requires its ModelRequest to be terminal.');
+        throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'Historical ModelStreamCheckpoint copy requires its ModelRequest to be terminal.');
       }
     }
     const allocatedRow = mutation.allocateSequence
@@ -1617,20 +1633,20 @@ function executeMutation(
     if (schema.key === 'ModelRequest') {
       if (historicalCopy) {
         if (row.status !== 'terminal' || row.terminal_state === null) {
-          throw new Error('Fork copy ModelRequest must be terminal with a terminal_state.');
+          throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'Fork copy ModelRequest must be terminal with a terminal_state.');
         }
       } else if (row.status !== 'prepared' || row.terminal_state !== null) {
-        throw new Error('ModelRequest insert must start prepared and non-terminal.');
+        throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'ModelRequest insert must start prepared and non-terminal.');
       }
       decodeModelStreamIdentity(row.stream_stats_json);
     }
     if (schema.key === 'Operation' && row.owner_kind === 'model_request') {
       if (historicalCopy) {
         if (!['completed', 'cancelled', 'failed'].includes(String(row.status))) {
-          throw new Error('Historical ModelRequest Operation copy must be terminal.');
+          throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'Historical ModelRequest Operation copy must be terminal.');
         }
       } else if (row.status !== 'pending') {
-        throw new Error('ModelRequest Operation must start pending.');
+        throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'ModelRequest Operation must start pending.');
       }
     }
     if (schema.key === 'Attempt') {
@@ -1640,13 +1656,13 @@ function executeMutation(
       if (operation?.owner_kind === 'model_request') {
         if (historicalCopy) {
           if (!['transient_failed', 'completed', 'cancelled', 'failed'].includes(String(row.status))) {
-            throw new Error('Historical ModelRequest Attempt copy must be terminal.');
+            throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'Historical ModelRequest Attempt copy must be terminal.');
           }
         } else if (row.status !== 'pending') {
-          throw new Error('ModelRequest Attempt must start pending.');
+          throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'ModelRequest Attempt must start pending.');
         }
         if (typeof row.attempt_seq !== 'bigint' || row.attempt_seq < 1n || row.attempt_seq > 11n) {
-          throw new Error('ModelRequest permits only attempt_seq 1 through 11.');
+          throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'ModelRequest permits only attempt_seq 1 through 11.');
         }
       }
     }
@@ -1683,6 +1699,11 @@ function executeMutation(
     const encoded = repository.codec.encodeWhere(mutation.where);
     const { predicates, parameters } = whereClause(encoded);
     if (predicates.length === 0) throw new Error(`${schema.repository}.deleteWhere requires predicates.`);
+    if (schema.key === 'Conversation') {
+      const rows = prepareCached(database, `SELECT id FROM conversation WHERE ${predicates.join(' AND ')} LIMIT 2`).all(parameters) as Array<{ id: string }>;
+      if (rows.length > mutation.maxChanges) throw new Error('Conversation.deleteWhere exceeded its scope.');
+      for (const row of rows) deleteConversationModelOperations(database, row.id);
+    }
     const result = prepareCached(database, `DELETE FROM ${quote(schema.table)} WHERE ${predicates.join(' AND ')}`).run(parameters);
     if (result.changes > mutation.maxChanges) {
       throw new Error(`${schema.repository}.deleteWhere exceeded ${mutation.maxChanges} row.`);
@@ -1693,9 +1714,36 @@ function executeMutation(
     if (schema.key === 'ModelStreamCheckpoint') {
       throw new Error('ModelStreamCheckpoint rows can only be pruned by the fixed writer stream-finalization operation.');
     }
+    if (schema.key === 'Conversation') deleteConversationModelOperations(database, id);
     const result = prepareCached(database, `DELETE FROM ${quote(schema.table)} WHERE id = ?`).run(id);
     if (result.changes !== 1) throw new Error(`${schema.repository} delete expected one row: ${id}`);
   }
+}
+
+/**
+ * owner_kind/owner_id is a polymorphic soft reference, not an SQLite FK. The declared
+ * Operation cascade-with-owner is implemented here in the same writer transaction, before the
+ * Conversation -> Turn -> ModelRequest cascade erases the ownership evidence. Never a general
+ * orphan sweep: retained effects/process history and operations of other owners are untouched.
+ */
+function deleteConversationModelOperations(database: Database.Database, conversationId: string): void {
+  const requests = prepareCached(database, `
+    SELECT request.id, request.status FROM turn
+      JOIN model_request AS request ON request.turn_id = turn.id
+     WHERE turn.conversation_id = ?
+  `);
+  // Indexed scope scan, constant memory; validation performs only reads until the iterator ends.
+  for (const request of requests.iterate(conversationId) as IterableIterator<{ id: string; status: string }>) {
+    if (request.status !== 'terminal') throw new RuntimeDataInvariantError('ModelRequest', request.id,
+      `Conversation deletion requires terminal ModelRequest ${request.id}.`);
+    assertModelRequestAggregate(database, request.id);
+  }
+  prepareCached(database, `
+    DELETE FROM operation WHERE owner_kind = 'model_request' AND owner_id IN (
+      SELECT request.id FROM model_request AS request JOIN turn ON turn.id = request.turn_id
+       WHERE turn.conversation_id = ?
+    )
+  `).run(conversationId);
 }
 
 function assertPreparedContentInsert(
@@ -2953,11 +3001,13 @@ function requireParentPort(): NonNullable<typeof parentPort> {
 }
 
 function serializeError(error: unknown): SerializedWorkerError {
-  const value = error as { name?: unknown; message?: unknown; stack?: unknown; code?: unknown };
+  const value = error as { name?: unknown; message?: unknown; stack?: unknown; code?: unknown; domain?: unknown; recordId?: unknown };
   return {
     name: typeof value?.name === 'string' ? value.name : 'Error',
     message: typeof value?.message === 'string' ? value.message : String(error),
     ...(typeof value?.stack === 'string' ? { stack: value.stack } : {}),
-    ...(typeof value?.code === 'string' ? { code: value.code } : {})
+    ...(typeof value?.code === 'string' ? { code: value.code } : {}),
+    ...(typeof value?.domain === 'string' ? { domain: value.domain } : {}),
+    ...(typeof value?.recordId === 'string' ? { recordId: value.recordId } : {})
   };
 }

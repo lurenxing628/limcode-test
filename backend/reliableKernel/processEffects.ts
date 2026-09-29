@@ -63,6 +63,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { listAllDomainRows } from './repositoryPagination';
 import { RootAuthority } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { hasMatchingTerminalProcessReceipt } from './runtimeProcessHistory';
 import {
   currentExecutionLeaseFence,
   executionLeaseFenceAssertion,
@@ -736,10 +737,9 @@ export class ProcessControlPlane {
     processRow: DomainRow,
     options: { allowStopWrite: boolean; signal?: AbortSignal }
   ): Promise<ProcessStopObservation> {
-    const persistedReceipts = await this.list('ProcessReceipt', { process_id: request.processId }, 2);
-    if (persistedReceipts.length > 1) throw new Error(`Process ${request.processId} has multiple ProcessReceipts.`);
-    if (persistedReceipts.length === 1) {
-      const persisted = persistedProcessObservation(processRow, persistedReceipts[0]);
+    const evidence = await this.readPersistedProcessEvidence(request.processId);
+    if (evidence.receipt) {
+      const persisted = persistedProcessObservation(evidence.process, evidence.receipt);
       if (persisted.state === 'exited') return terminalStopObservation(persisted, true);
       if (persisted.state === 'outcome_unknown') return unknownStopObservation(persisted.reason);
       throw new Error('Persisted ProcessReceipt cannot describe a running Process.');
@@ -863,10 +863,9 @@ export class ProcessControlPlane {
     const deadline = Date.now() + timeoutMs;
     let latest: ProcessWaitObservation = { state: 'running', processId };
     for (;;) {
-      const persisted = await this.list('ProcessReceipt', { process_id: processId }, 2);
-      if (persisted.length > 1) throw new Error(`Process ${processId} has multiple ProcessReceipts.`);
-      if (persisted.length === 1) {
-        return persistedProcessObservation(await this.requireExisting('Process', processId), persisted[0]);
+      const evidence = await this.readPersistedProcessEvidence(processId);
+      if (evidence.receipt) {
+        return persistedProcessObservation(evidence.process, evidence.receipt);
       }
       latest = await this.observeProcess(processId);
       if (latest.state === 'exited') return this.reconcileProcessExit(processId);
@@ -890,7 +889,7 @@ export class ProcessControlPlane {
     const processRow = await this.requireExisting('Process', processId);
     if (!ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))) return 'retained';
     const receipts = await this.list('ProcessReceipt', { process_id: processId }, 2);
-    if (receipts.length !== 1 || !processReceiptMatchesProcess(processRow, receipts[0]!)) return 'retained';
+    if (receipts.length !== 1 || !hasMatchingTerminalProcessReceipt(processRow, receipts[0]!)) return 'retained';
     if (!await this.terminalOutputIsFullyRegistered(processRow)) return 'retained';
     return this.removeArchivedSpool(processRow);
   }
@@ -931,7 +930,7 @@ export class ProcessControlPlane {
       const outcomes = await Promise.all(batch.map(async (processRow): Promise<keyof Omit<ProcessSpoolCleanupReport, 'scanned'>> => {
         const processId = requireId(processRow.id, 'Process.id');
         const receipts = receiptsByProcess.get(processId) ?? [];
-        if (receipts.length !== 1 || !processReceiptMatchesProcess(processRow, receipts[0]!)) return 'retained';
+        if (receipts.length !== 1 || !hasMatchingTerminalProcessReceipt(processRow, receipts[0]!)) return 'retained';
         if (mismatchIds.has(processId)) {
           try {
             await this.reconcileOutput(processId);
@@ -1534,9 +1533,9 @@ export class ProcessControlPlane {
 
   private async observeProcess(processId: string): Promise<ProcessWaitObservation> {
     await this.validateBinding();
-    const processRow = await this.requireExisting('Process', processId);
-    const persisted = (await this.list('ProcessReceipt', { process_id: processId }, 2))[0];
-    if (persisted) return persistedProcessObservation(processRow, persisted);
+    const evidence = await this.readPersistedProcessEvidence(processId);
+    const processRow = evidence.process;
+    if (evidence.receipt) return persistedProcessObservation(processRow, evidence.receipt);
     const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
     try {
       const receipt = parseWrapperExitReceipt(await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
@@ -1990,6 +1989,18 @@ export class ProcessControlPlane {
     const row = snapshot.snapshot[0];
     if (Array.isArray(row)) throw new TypeError(`${domain} get returned rows.`);
     return row;
+  }
+
+  /** The Process and its immutable receipt must come from one worker read snapshot. */
+  private async readPersistedProcessEvidence(processId: string): Promise<{ process: DomainRow; receipt?: DomainRow }> {
+    const [process, receipts] = (await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Process').get(processId),
+      DOMAIN_REPOSITORIES.domain('ProcessReceipt').list({ where: { process_id: processId }, limit: 2 })
+    ])).snapshot;
+    if (!process || Array.isArray(process)) throw new Error(`Process ${processId} does not exist.`);
+    if (!Array.isArray(receipts)) throw new TypeError('ProcessReceipt list did not return rows.');
+    if (receipts.length > 1) throw new Error(`Process ${processId} has multiple ProcessReceipts.`);
+    return { process, ...(receipts[0] ? { receipt: receipts[0] } : {}) };
   }
 
   private async requireExisting(domain: string, id: string): Promise<DomainRow> {
@@ -2602,18 +2613,6 @@ function processTerminalStatus(receipt: ProcessWrapperExitReceipt): string {
   return 'exited';
 }
 
-function processReceiptMatchesProcess(processRow: DomainRow, receipt: DomainRow): boolean {
-  if (
-    receipt.process_id !== processRow.id
-    || receipt.wrapper_nonce !== processRow.wrapper_nonce
-    || receipt.start_fingerprint !== processRow.start_fingerprint
-  ) return false;
-  if (processRow.status === 'cancelled') return receipt.outcome === 'cancelled';
-  if (processRow.status === 'timed_out') return receipt.outcome === 'timed_out';
-  if (processRow.status === 'output_limit_exceeded') return receipt.outcome === 'output_limit_exceeded';
-  return processRow.status === 'exited' && (receipt.outcome === 'succeeded' || receipt.outcome === 'failed');
-}
-
 function persistedTerminationReason(outcome: ProcessReceiptTerminalOutcome): ProcessTerminationReason {
   if (outcome === 'cancelled') return 'manual';
   if (outcome === 'timed_out') return 'timed_out';
@@ -2627,6 +2626,9 @@ function persistedProcessObservation(processRow: DomainRow, receipt: DomainRow):
     receipt.wrapper_nonce !== processRow.wrapper_nonce
     || receipt.start_fingerprint !== processRow.start_fingerprint
   ) return { state: 'outcome_unknown', processId, reason: 'Persisted ProcessReceipt identity mismatch.' };
+  if (!hasMatchingTerminalProcessReceipt(processRow, receipt)) {
+    return { state: 'outcome_unknown', processId, reason: 'Persisted ProcessReceipt terminal state/time or outcome/exit tuple mismatch.' };
+  }
   if (receipt.outcome === 'outcome_unknown') {
     return { state: 'outcome_unknown', processId, reason: 'Persisted ProcessReceipt records outcome_unknown.' };
   }
@@ -2646,7 +2648,7 @@ function persistedProcessObservation(processRow: DomainRow, receipt: DomainRow):
         commandDigest: requireSha256(processRow.command_digest, 'Process.command_digest'),
         exitCode: receipt.exit_code === null ? null : requireBigInt(receipt.exit_code, 'ProcessReceipt.exit_code').toString(),
         signal: receipt.exit_signal === null ? null : requireText(receipt.exit_signal, 'ProcessReceipt.exit_signal'),
-        exitedAt: requireText(processRow.completed_at ?? receipt.received_at, 'Process.completed_at'),
+        exitedAt: requireText(processRow.completed_at, 'Process.completed_at'),
         retainedBytes: requireBigInt(processRow.retained_bytes, 'Process.retained_bytes').toString(),
         retainedChunks: requireBigInt(processRow.retained_chunks, 'Process.retained_chunks').toString(),
         droppedBytes: requireBigInt(processRow.dropped_bytes, 'Process.dropped_bytes').toString(),

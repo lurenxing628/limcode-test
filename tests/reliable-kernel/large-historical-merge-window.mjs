@@ -304,6 +304,8 @@ const largeMerge = loadLayer('vscode/commands/largeHistoricalMerge.ts', {
 // Only shorter: the prompt's countdown and the coordination's poll interval.
 const shortened = { countdownSeconds: behavior.countdownSeconds ?? 1, coordination: { pollMs: 20 } };
 const management = loadLayer('vscode/commands/runtimeDataSetManagement.ts', {
+  '../../backend/reliableKernel/runtimeHistoryRepair': kernelFile('runtimeHistoryRepair.js'),
+  '../../backend/reliableKernel/runtimeHistoryRepairInspection': kernelFile('runtimeHistoryRepairInspection.js'),
   '../../backend/capabilities/vscodeStorage/globalStatus': { loadCommittedGlobalStatus: async () => ({}), resolveDataRootUri: () => root },
   '../../backend/capabilities/vscodeStorage/paths': { createVscodeStoragePaths: () => ({ globalStoragePath: root }) },
   '../../backend/reliableKernel/vscodeRootAuthority': kernelFile('vscodeRootAuthority.js'),

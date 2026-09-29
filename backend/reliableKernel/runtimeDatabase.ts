@@ -77,6 +77,8 @@ import {
   type RuntimePerformanceMetricsSink
 } from './runtimePerformanceMetrics';
 import { readProcessStartFingerprint } from './processProtocol';
+import type { MergeModelAggregate } from './runtimeMergeAggregatePreflight';
+import type { RuntimeHistoryRepairInput, RuntimeHistoryRepairResult } from './runtimeHistoryRepairTransaction';
 
 export interface SnapshotSubscription<T> {
   barrier: SnapshotBarrier<T>;
@@ -84,11 +86,15 @@ export interface SnapshotSubscription<T> {
 }
 
 export class RuntimeDatabaseWorkerError extends Error {
+  public readonly domain?: string;
+  public readonly recordId?: string;
   public constructor(error: SerializedWorkerError) {
     super(error.message);
     this.name = error.name || 'RuntimeDatabaseWorkerError';
     if (error.stack) this.stack = error.stack;
     if (error.code) (this as Error & { code?: string }).code = error.code;
+    this.domain = error.domain;
+    this.recordId = error.recordId;
   }
 }
 
@@ -279,6 +285,12 @@ export class RuntimeDatabase {
    * once, at the commit. While it is open this database refuses every other write, and a failed append
    * rolls all of it back. The commit reads no changes back (the result says a snapshot is required).
    */
+  /** Explicit, backed-up repair of terminal owner-deletion residue; never an online or arbitrary SQL writer. */
+  public async maintenanceRepairHistory(input: RuntimeHistoryRepairInput): Promise<RuntimeHistoryRepairResult> {
+    this.assertMaintenanceInstance();
+    return this.request<RuntimeHistoryRepairResult>({ kind: 'maintenanceRepairHistory', input });
+  }
+
   public async maintenanceBegin(): Promise<void> {
     this.assertMaintenanceInstance();
     await this.request<null>({ kind: 'maintenanceBegin' });
@@ -338,6 +350,11 @@ export class RuntimeDatabase {
     reads: RepositoryRead[]
   ): Promise<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>> {
     return this.request<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>>({ kind: 'snapshot', reads });
+  }
+
+  /** Bounded target aggregates for historical merge preflight, all in one worker read snapshot. */
+  public async mergeModelAggregates(ids: readonly string[]): Promise<MergeModelAggregate[]> {
+    return this.request<MergeModelAggregate[]>({ kind: 'mergeModelAggregates', ids: [...ids] });
   }
 
   /** Reads every page of one repository list inside one SQLite read transaction. */
@@ -1105,7 +1122,7 @@ function databaseMetricRequestKind(
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
   // The conversation pending-work probe, the domain row count and the carried-work inventory are one
   // fixed worker read snapshot each.
-  if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows' || kind === 'relocatedWorkInventory') return 'snapshot';
+  if (kind === 'conversationRuntimeWork' || kind === 'countDomainRows' || kind === 'relocatedWorkInventory' || kind === 'mergeModelAggregates') return 'snapshot';
   // A maintenance transaction's requests are parts of one write transaction; the durability
   // checkpoint is the last step of the transactions before it.
   if (kind.startsWith('maintenance') || kind === 'durabilityCheckpoint') return 'transaction';

@@ -4,6 +4,7 @@ import { parseNativeResponseMetrics } from './nativeResponseMetrics';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import { requireRuntimeId } from './runtimeSqlRows';
 import { prepareCached } from './runtimeStatementCache';
+import { RuntimeDataInvariantError } from './runtimeDataInvariant';
 
 /**
  * A ModelRequest aggregate (its request, one Operation, one to eleven Attempts, the terminal fence)
@@ -318,33 +319,41 @@ function decimalRuntimeInteger(value: unknown, label: string): bigint {
 
 export function assertModelRequestAggregate(database: Database.Database, modelRequestId: string): void {
   const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
-  if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
-  const request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
-  const identity = decodeModelStreamIdentity(request.stream_stats_json);
+  if (!requestRaw) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} does not exist.`);
+  let request: ReturnType<ReturnType<typeof DOMAIN_REPOSITORIES.codec>['decode']>;
+  let identity: ReturnType<typeof decodeModelStreamIdentity>;
+  try {
+    request = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(requestRaw as Record<string, unknown>);
+    identity = decodeModelStreamIdentity(request.stream_stats_json);
+  } catch (error) {
+    // Only codec/metadata validation errors are data refusals; engine/SQLite failures stay transient.
+    if (!(error instanceof TypeError) && !(error instanceof SyntaxError)) throw error;
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, error.message);
+  }
   const operations = prepareCached(database,
     "SELECT id, status FROM operation WHERE owner_kind = 'model_request' AND owner_id = ?"
   ).all(modelRequestId) as Array<{ id: string; status: string }>;
-  if (operations.length !== 1) throw new Error(`ModelRequest ${modelRequestId} must own exactly one Operation.`);
+  if (operations.length !== 1) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} must own exactly one Operation.`);
   const operation = operations[0];
   const attempts = prepareCached(database,
     'SELECT id, attempt_seq, status, completed_at FROM attempt WHERE operation_id = ? ORDER BY attempt_seq'
   ).all(operation.id) as Array<{ id: string; attempt_seq: bigint; status: string; completed_at: string | null }>;
   if (attempts.length < 1 || attempts.length > 11) {
-    throw new Error(`ModelRequest ${modelRequestId} must have between one and eleven Attempts.`);
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} must have between one and eleven Attempts.`);
   }
   attempts.forEach((attempt, index) => {
     if (attempt.attempt_seq !== BigInt(index + 1)) {
-      throw new Error(`ModelRequest ${modelRequestId} Attempt sequence is not contiguous.`);
+      throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} Attempt sequence is not contiguous.`);
     }
   });
   const currentAttempt = attempts.find((attempt) => attempt.attempt_seq === identity.attemptSeq);
-  if (!currentAttempt) throw new Error(`ModelRequest ${modelRequestId} stream identity has no matching Attempt.`);
+  if (!currentAttempt) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} stream identity has no matching Attempt.`);
   if (identity.attemptSeq !== BigInt(attempts.length)) {
-    throw new Error(`ModelRequest ${modelRequestId} current Attempt must be the contiguous tail.`);
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} current Attempt must be the contiguous tail.`);
   }
   const priorAttempts = attempts.slice(0, -1);
   if (priorAttempts.some((attempt) => attempt.status !== 'transient_failed' || attempt.completed_at === null)) {
-    throw new Error(`ModelRequest ${modelRequestId} prior Attempts must be durably transient_failed.`);
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} prior Attempts must be durably transient_failed.`);
   }
   const fence = prepareCached(database, 'SELECT * FROM model_stream_fence WHERE model_request_id = ?').get(modelRequestId) as {
     attempt_seq?: unknown;
@@ -354,13 +363,13 @@ export function assertModelRequestAggregate(database: Database.Database, modelRe
   const status = String(request.status);
   const terminalState = request.terminal_state;
   if (status !== 'terminal' && terminalState !== null) {
-    throw new Error(`Non-terminal ModelRequest ${modelRequestId} cannot carry terminal_state.`);
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Non-terminal ModelRequest ${modelRequestId} cannot carry terminal_state.`);
   }
   if (identity.attemptSeq > 1n && (
     identity.retryMaxAttempts === undefined
     || identity.attemptSeq - 1n > BigInt(identity.retryMaxAttempts)
   )) {
-    throw new Error(`ModelRequest ${modelRequestId} current Attempt exceeds its frozen retry budget.`);
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} current Attempt exceeds its frozen retry budget.`);
   }
   if (status === 'prepared') {
     if (
@@ -369,7 +378,7 @@ export function assertModelRequestAggregate(database: Database.Database, modelRe
       || operation.status !== 'pending'
       || currentAttempt.status !== 'pending'
       || fence
-    ) throw new Error(`Prepared ModelRequest ${modelRequestId} aggregate is inconsistent.`);
+    ) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Prepared ModelRequest ${modelRequestId} aggregate is inconsistent.`);
     return;
   }
   if (status === 'streaming') {
@@ -378,7 +387,7 @@ export function assertModelRequestAggregate(database: Database.Database, modelRe
       || operation.status !== 'running'
       || currentAttempt.status !== 'running'
       || fence
-    ) throw new Error(`Streaming ModelRequest ${modelRequestId} aggregate is inconsistent.`);
+    ) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Streaming ModelRequest ${modelRequestId} aggregate is inconsistent.`);
     return;
   }
   if (status === 'retrying') {
@@ -392,11 +401,11 @@ export function assertModelRequestAggregate(database: Database.Database, modelRe
       || currentAttempt.status !== 'pending'
       || priorAttempts.length !== Number(identity.attemptSeq - 1n)
       || fence
-    ) throw new Error(`Retrying ModelRequest ${modelRequestId} aggregate is inconsistent.`);
+    ) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Retrying ModelRequest ${modelRequestId} aggregate is inconsistent.`);
     return;
   }
   if (status !== 'terminal' || typeof terminalState !== 'string' || terminalState.length === 0) {
-    throw new Error(`ModelRequest ${modelRequestId} has an unsupported aggregate status.`);
+    throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `ModelRequest ${modelRequestId} has an unsupported aggregate status.`);
   }
   if (terminalState === 'completed') {
     if (
@@ -405,12 +414,12 @@ export function assertModelRequestAggregate(database: Database.Database, modelRe
       || fence?.attempt_seq !== identity.attemptSeq
       || fence.socket_generation !== identity.socketGeneration
       || fence.outcome !== 'completed'
-    ) throw new Error(`Completed ModelRequest ${modelRequestId} aggregate is inconsistent.`);
+    ) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Completed ModelRequest ${modelRequestId} aggregate is inconsistent.`);
     return;
   }
-  if (fence) throw new Error(`Non-completed ModelRequest ${modelRequestId} cannot have a terminal fence.`);
+  if (fence) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Non-completed ModelRequest ${modelRequestId} cannot have a terminal fence.`);
   if (
     !['cancelled', 'failed'].includes(currentAttempt.status)
     || operation.status !== currentAttempt.status
-  ) throw new Error(`Terminal ModelRequest ${modelRequestId} aggregate is inconsistent.`);
+  ) throw new RuntimeDataInvariantError('ModelRequest', modelRequestId, `Terminal ModelRequest ${modelRequestId} aggregate is inconsistent.`);
 }

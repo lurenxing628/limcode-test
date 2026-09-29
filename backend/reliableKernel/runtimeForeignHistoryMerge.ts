@@ -1,3 +1,4 @@
+import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
@@ -165,7 +166,7 @@ export async function readForeignRuntimeHistoryMergeStates(
       && Date.now() - Date.parse(request.requestedAt) < RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS
       && request.expectedDataSetId === entry.dataSetId && request.expectedRootInstanceId === entry.rootInstanceId) {
       result.set(entry.id, { state: 'requested', requestedAt: request.requestedAt, ...carried });
-    } else if (unchanged && (record.state === 'failed' || (record.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
+    } else if (unchanged && reusableRuntimeMergeRefusal(record) && (record.state === 'failed' || (record.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
       result.set(entry.id, { state: record.state, code: record.code, message: record.message, ...carried });
     } else if (unchanged && record.state === 'too-large' && record.maxRows === RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS) {
       result.set(entry.id, { state: 'too-large', rows: record.rows, maxRows: record.maxRows, message: record.message, ...carried });

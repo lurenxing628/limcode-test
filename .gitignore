@@ -208,3 +208,10 @@ docs/architecture/*
 !/tests/reliable-kernel/collaboration-runtime.test.mjs
 
 !/tests/reliable-kernel/native-collaboration-boundary.test.mjs
+
+!/tests/reliable-kernel/runtime-history-integrity.test.mjs
+!/tests/reliable-kernel/process-completion-integrity.test.mjs
+!/tests/reliable-kernel/runtime-dataset-merge-responsiveness.test.mjs
+!/tests/reliable-kernel/model-handle-catalog.test.mjs
+!/tests/reliable-kernel/runtime-history-repair.test.mjs
+!/tests/reliable-kernel/runtime-history-repair-child.mjs

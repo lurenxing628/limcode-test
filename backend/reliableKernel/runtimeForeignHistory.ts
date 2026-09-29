@@ -1,3 +1,4 @@
+import { RUNTIME_MERGE_VALIDATION_REVISION } from './runtimeMergeValidation';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type BigIntStats } from 'node:fs';
 import * as fs from 'node:fs/promises';
@@ -1282,9 +1283,9 @@ function fileProblem(error: unknown, code: string, label: string): ForeignRuntim
 async function readAuditCache(configurationRoot: string, id: string, files: string): Promise<AuditResult | undefined> {
   try {
     const value = JSON.parse(await fs.readFile(await foreignRuntimeHistoryFile(configurationRoot, CACHE_DIRECTORY, id, '.json'), 'utf8')) as {
-      kind?: unknown; id?: unknown; files?: unknown; result?: AuditResult;
+      kind?: unknown; id?: unknown; files?: unknown; validationRevision?: unknown; result?: AuditResult;
     } | null;
-    if (value?.kind !== CACHE_KIND || value.id !== id || value.files !== files || !value.result) return undefined;
+    if (value?.kind !== CACHE_KIND || value.validationRevision !== RUNTIME_MERGE_VALIDATION_REVISION || value.id !== id || value.files !== files || !value.result) return undefined;
     const result = value.result;
     if (result.outcome === 'verified' && result.audit && typeof result.audit === 'object') return result;
     if (result.outcome === 'failed' && typeof result.code === 'string' && typeof result.reason === 'string') return result;
@@ -1296,7 +1297,7 @@ async function readAuditCache(configurationRoot: string, id: string, files: stri
 
 async function writeAuditCache(configurationRoot: string, id: string, files: string, result: AuditResult): Promise<void> {
   await writeCacheFile(await foreignRuntimeHistoryFile(configurationRoot, CACHE_DIRECTORY, id, '.json'),
-    { kind: CACHE_KIND, id, files, checkedAt: new Date().toISOString(), result });
+    { kind: CACHE_KIND, validationRevision: RUNTIME_MERGE_VALIDATION_REVISION, id, files, checkedAt: new Date().toISOString(), result });
 }
 
 async function writeCacheFile(file: string, value: unknown): Promise<void> {

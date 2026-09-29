@@ -361,7 +361,8 @@ test('大库会话端到端（外来大库，自动流程）：用户请求合�
   const countdown = first(r1, 'progress-report', (item) => item.message === countdownText(estimated, 1));
   assert.ok(countdown, r1.filter((item) => item.event === 'progress-report').map((item) => item.message).join('\n'));
   const preparing = first(r1, 'preparing');
-  assert.ok(estimated.at < countdown.at && countdown.at <= preparing.at, JSON.stringify([estimated.at, countdown.at, preparing.at]));
+  assert.ok(r1.indexOf(estimated) < r1.indexOf(countdown) && r1.indexOf(countdown) < r1.indexOf(preparing),
+    '同一窗口按估计、倒计时、准备的事件顺序执行，毫秒时间戳相同也不影响先后');
   assert.deepEqual(first(r1, 'prepared').sources.map((item) => [item.candidateId, item.label, item.fingerprint]),
     [[source.id, source.label, estimated.sources[0].fingerprint]], '外来来源不收尾：指纹与估计相同');
   assert.ok(first(r1, 'engine-stage', (item) => item.stage === 'committing'));

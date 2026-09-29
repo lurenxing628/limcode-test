@@ -1,10 +1,12 @@
 import { randomUUID } from 'node:crypto';
-import { stat } from 'node:fs/promises';
+import { mkdtemp, rm, stat } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { ResourceLimits } from 'node:worker_threads';
 import Database from 'better-sqlite3';
+import type { RootBinding } from './contracts';
+import { toSqliteFilePath } from './sqliteFilePath';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
@@ -37,9 +39,9 @@ import {
 } from './runtimeDataSetMergeLedger';
 import { describeUnfinishedWork, hasFinalizableWork, type UnfinishedWorkInspection } from './runtimeDataSetMergeWork';
 import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
-import { assertModelRequestAggregate } from './runtimeModelRequestAggregate';
+import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
+import { isRuntimeDataInvariant } from './runtimeDataInvariant';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
-import { attachRuntimeStatementCache, detachRuntimeStatementCache } from './runtimeStatementCache';
 import {
   createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet, type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
@@ -326,6 +328,67 @@ function skippedRowsOf(source: Database.Database): Map<string, Set<string>> {
   return skipped;
 }
 
+/**
+ * Rechecks only kept work in the audit worker. Private TEMP keys are exported in bounded pages,
+ * with no JS map and no second copy of the Runtime database. The source snapshot then
+ * closes its sole reader until the worker has closed and exited; it cannot be used during the wait.
+ * @internal Also exercised directly by the large-source responsiveness regression.
+ */
+export async function reinspectLargeMergeKeptWork(
+  snapshot: RuntimeDataSetDatabaseSnapshot,
+  binding: HistoricalRootBinding,
+  signal?: AbortSignal
+): Promise<UnfinishedWorkInspection> {
+  const source = snapshot.database;
+  if (!source.readonly || source.inTransaction) throw new Error('Kept-work recheck requires an idle read-only snapshot.');
+  signal?.throwIfAborted();
+  const directory = await mkdtemp(path.join(os.tmpdir(), `limcode-runtime-history-${process.pid}-`));
+  const skippedRowsPath = path.join(directory, 'skipped.sqlite');
+  try {
+    await exportSkippedKeys(source, skippedRowsPath, signal);
+    signal?.throwIfAborted();
+    const audit = await snapshot.withClosedReader((snapshotPath) => auditRuntimeSnapshot(snapshotPath, {
+      binding: binding as RootBinding, unfinishedWork: 'finalize', integrity: false, skippedRowsPath
+    }));
+    signal?.throwIfAborted();
+    return audit.unfinishedWork!;
+  } finally {
+    await rm(directory, { recursive: true, force: true }).catch((error: unknown) => {
+      // The audit/stop outcome is already decided. A scanner holding its disposable index must
+      // not turn that into a new merge failure; report the disposable files left in the temp directory.
+      console.warn('[LimCode] 历史重检的临时跳过索引没有删掉，留在临时目录里。', error);
+    });
+  }
+}
+
+/** A disposable transport index, never a Runtime root, backup, receipt or recovery authority. */
+async function exportSkippedKeys(source: Database.Database, skippedRowsPath: string, signal?: AbortSignal): Promise<void> {
+  const index = new Database(toSqliteFilePath(skippedRowsPath));
+  try {
+    // Backup API's final destination fsync can synchronously stall the window for the full index.
+    // This derived index may be discarded after a crash; only its fully written, closed file is used.
+    index.pragma('journal_mode = OFF');
+    index.pragma('synchronous = OFF');
+    index.pragma(`cache_size = -${SOURCE_PAGE_CACHE_KIB}`);
+    index.exec(`CREATE TABLE ${SKIP_TABLE} (domain TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY(domain,id)) WITHOUT ROWID`);
+    const page = source.prepare(`SELECT domain, id FROM temp.${SKIP_TABLE}
+      WHERE (domain, id) > (?, ?) ORDER BY domain, id LIMIT ${RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS}`);
+    const insert = index.prepare(`INSERT INTO ${SKIP_TABLE} VALUES (?, ?)`);
+    const append = index.transaction((rows: Array<{ domain: string; id: string }>) => {
+      for (const row of rows) insert.run(row.domain, row.id);
+    });
+    let domain = '', id = '';
+    for (;;) {
+      signal?.throwIfAborted();
+      const rows = page.all(domain, id) as Array<{ domain: string; id: string }>;
+      if (rows.length === 0) return;
+      append(rows);
+      ({ domain, id } = rows[rows.length - 1]!);
+      await yieldThread();
+    }
+  } finally { index.close(); }
+}
+
 function seedSkipTable(source: Database.Database, conversations: Iterable<string>): void {
   withTemporaryWrites(source, () => {
     source.exec(`CREATE TEMP TABLE ${SKIP_TABLE} (domain TEXT NOT NULL, id TEXT NOT NULL, PRIMARY KEY (domain, id)) WITHOUT ROWID`);
@@ -529,10 +592,10 @@ function boundSourcePageCache(source: Database.Database): void {
 }
 
 /** The read of one domain's source rows in merge order, without the left-out rows. */
-function sourceRowsSql(schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number], skipping: boolean): string {
-  return engine.mergeReadSql(schema, skipping
-    ? ` AS t WHERE NOT EXISTS (SELECT 1 FROM temp.${SKIP_TABLE} AS s WHERE s.domain = ${literal(schema.key)} AND s.id = t.id)`
-    : '');
+function sourceRowsSql(schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number]): string {
+  // Filtering in SQL can synchronously scan millions of skipped rows before returning the first
+  // kept row. Read every physical row in the original merge order and bound that work below.
+  return engine.mergeReadSql(schema);
 }
 
 /**
@@ -562,8 +625,8 @@ export interface RuntimeDataSetMergeScan {
   conflicts: { count: number; samples: string[] };
   /**
    * What the Runtime worker would refuse at the commit, found by its own aggregate assertion
-   * (runtimeModelRequestAggregate) on the source's copy for a request the merge inserts: the refusal's
-   * text. The scan stops there (its counts cover the rows up to that chunk).
+   * (runtimeModelRequestAggregate) on the effective kept-source/target aggregate. Both orphan
+   * operations and added attempts on existing requests are checked; counts cover the compared rows.
    */
   refusedAggregate?: string;
   elapsedMs: number;
@@ -586,10 +649,18 @@ async function forEachSourceChunk(
   visit: (schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number], chunk: DomainRow[], existing: Array<DomainRow | null>) => Promise<void>
 ): Promise<void> {
   if (!Number.isSafeInteger(options.chunkRows) || options.chunkRows < 1) throw new RangeError('chunkRows must be a positive integer.');
+  const skipped = options.skipping ? source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`) : undefined;
   for (const schema of engine.MERGE_DOMAIN_ORDER) {
+    options.signal?.throwIfAborted();
     const repository = DOMAIN_REPOSITORIES.domain(schema.key);
-    const statement = source.prepare(sourceRowsSql(schema, options.skipping));
+    const statement = source.prepare(sourceRowsSql(schema));
     let chunk: DomainRow[] = [];
+    let scannedSinceYield = 0;
+    const pause = async (): Promise<void> => {
+      await yieldThread();
+      scannedSinceYield = 0;
+      options.signal?.throwIfAborted();
+    };
     const flush = async (): Promise<void> => {
       if (chunk.length === 0) return;
       options.signal?.throwIfAborted();
@@ -598,11 +669,17 @@ async function forEachSourceChunk(
       chunk = [];
       await visit(schema, rows, existing);
       // Decoding stays on the extension thread; yield so a large source never monopolizes it.
-      await new Promise((resolve) => setImmediate(resolve));
+      await pause();
     };
     for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
-      chunk.push(engine.sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
-      if (chunk.length >= options.chunkRows) await flush();
+      scannedSinceYield += 1;
+      if (!skipped || skipped.get(schema.key, String(raw.id)) === undefined) {
+        chunk.push(engine.sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
+        if (chunk.length >= options.chunkRows) await flush();
+      }
+      // Even an entirely deleted conversation produces pauses and prompt cancellation. The write
+      // chunk remains based on kept rows; CollaborationMessage's source sequence order is unchanged.
+      if (scannedSinceYield >= RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS) await pause();
     }
     await flush();
   }
@@ -629,10 +706,9 @@ function countingSink(scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'>, savepoin
 /**
  * Online dry run of a merge: every source row decoded and compared with the target row of its id, as
  * the merge will (planMergeChunk), keeping only counts, at most MAX_REPORTED_CONFLICTS conflict
- * samples and the time taken. Memory does not grow with the rows. Every request the merge inserts has
- * its aggregate asserted as the worker asserts it at the commit, on the source's copy: an inserted
- * request's aggregate is all the source's (its rows are the source's rows, inserted or equal), so the
- * commit would refuse exactly what fails here (see refusedAggregate).
+ * samples and the time taken. Touched aggregate ids live in a disk-backed temporary table, not an
+ * unbounded JS set. The shared preflight validates both directions of model ownership against the
+ * target reader and kept source rows; the writer still revalidates at commit against later changes.
  */
 export async function scanMergeRows(
   source: Database.Database,
@@ -643,17 +719,16 @@ export async function scanMergeRows(
   const scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'> = {
     rows: 0, insertRows: 0, reusedRows: 0, insertConversations: 0, conflicts: { count: 0, samples: [] }
   };
-  const requests: string[] = [];
+  const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => !options.skipping
+    || source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`).get(domain, id) === undefined);
   const counting = countingSink(scan, { next: 0 });
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
-    inserted: (domain, id) => {
-      counting.inserted(domain, id);
-      if (domain === 'ModelRequest') requests.push(id);
+    inserted: (domain, id, row) => {
+      counting.inserted(domain, id, row);
+      aggregates.touch(domain, row);
     }
   };
-  // The assertion's statements, prepared once for the whole scan rather than per request.
-  attachRuntimeStatementCache(source);
   try {
     await forEachSourceChunk(source, target, {
       skipping: options.skipping === true, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS,
@@ -663,35 +738,16 @@ export async function scanMergeRows(
       sink.steps.length = 0;
       sink.presence.length = 0;
       scan.rows += chunk.length;
-      for (const id of requests.splice(0)) {
-        const refused = refusedAggregate(source, id);
-        if (refused !== undefined) throw new RefusedAggregate(refused);
-      }
       options.onRows?.(scan.rows);
     });
+    if (scan.conflicts.count === 0) await aggregates.validate(options.signal);
   } catch (error) {
-    if (!(error instanceof RefusedAggregate)) throw error;
-    return { ...scan, refusedAggregate: error.message, elapsedMs: performance.now() - started };
+    if (!isRuntimeDataInvariant(error)) throw error;
+    return { ...scan, refusedAggregate: engine.errorMessage(error), elapsedMs: performance.now() - started };
   } finally {
-    detachRuntimeStatementCache(source);
+    aggregates.close();
   }
   return { ...scan, elapsedMs: performance.now() - started };
-}
-
-class RefusedAggregate extends Error {}
-
-/**
- * The worker's assertion of one request's aggregate on this connection: its refusal, or undefined
- * when the aggregate holds. SQLite's own errors (they carry a code) are not a refusal and are thrown.
- */
-function refusedAggregate(database: Database.Database, modelRequestId: string): string | undefined {
-  try {
-    assertModelRequestAggregate(database, modelRequestId);
-    return undefined;
-  } catch (error) {
-    if ((error as { code?: unknown } | undefined)?.code !== undefined) throw error;
-    return engine.errorMessage(error);
-  }
 }
 
 /**
@@ -701,25 +757,18 @@ function refusedAggregate(database: Database.Database, modelRequestId: string): 
  * it; a change of the source, or a request, has it checked again.
  */
 function invariantRefusal(detail: string, state: HistoricalMergeSourceProgress): InstanceType<typeof engine.Outcome> {
-  return new engine.Outcome({
-    kind: 'blocked', code: INVARIANT,
-    message: `这份旧聊天记录里有当前库不接受的数据（数据不完整或状态不一致），整体未合并，${state.finalized ? '当前库没有改动' : '两边内容都没有改动'}。`
-      + '来源不变时再合并结果也一样，所以不再自动重试；这个库有了变化，或'
-      + (state.foreign ? '在“历史与存储管理 → 外来历史库”里再次选择“合并进当前库”' : '在“历史与存储管理”里再次选择“合并到当前库”')
-      + `时会重新检查。\n${detail}`
-  });
+  return engine.invariantRefusal(detail, state);
 }
 
 /**
  * An append or the commit the worker refused for the rows themselves (see invariantRefusal): an error
- * its assertions threw (they carry no code) or a constraint of the schema; its transaction is rolled
+ * its typed data assertions threw or a constraint of the schema; its transaction is rolled
  * back already. Anything else stays as it is: an error with another code (I/O, a full disk, a busy
  * database, a presence assertion), or one of this thread (a lost worker, a closed instance).
  */
 function workerRefusal(error: unknown, state: HistoricalMergeSourceProgress): unknown {
   if (!(error instanceof RuntimeDatabaseWorkerError)) return error;
-  const code = (error as { code?: unknown }).code;
-  if (code !== undefined && !String(code).startsWith('SQLITE_CONSTRAINT')) return error;
+  if (!isRuntimeDataInvariant(error)) return error;
   return invariantRefusal(error.message, state);
 }
 
@@ -758,8 +807,8 @@ async function streamMergeTransaction(
   const counting = countingSink(scan, { next: 0 });
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
-    inserted: (domain, id) => {
-      counting.inserted(domain, id);
+    inserted: (domain, id, row) => {
+      counting.inserted(domain, id, row);
       input.evidence.add(domain, id);
     }
   };
@@ -1357,8 +1406,16 @@ async function prepareSource(
     // What is verified here is kept on disk: the session (or a later preparation) only lstats it.
     verified = await openRuntimeCasVerificationCache(paths.globalStoragePath);
     // What belongs to conversations deleted here since is left out: it neither refuses the source nor is closed.
-    const keptWork = (): Promise<UnfinishedWorkInspection> => engine.keptUnfinishedWork(taken.snapshot.database, taken.audit.unfinishedWork!,
-      async () => await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows) ? skippedRowsOf(taken.snapshot.database) : undefined);
+    const keptWork = async (): Promise<UnfinishedWorkInspection> => {
+      const work = taken.audit.unfinishedWork!;
+      if (work.refused.length === 0 && !hasFinalizableWork(work)) return work;
+      boundSourcePageCache(taken.snapshot.database);
+      if (!await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows)) return work;
+      return reinspectLargeMergeKeptWork(taken.snapshot, binding, input.signal).catch((error: unknown) => {
+        if (isAbort(error)) throw new engine.StopRequested();
+        throw error;
+      });
+    };
     const work = await keptWork();
     if (work.refused.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
     stopIfAsked();
@@ -1397,7 +1454,7 @@ async function prepareSource(
     }
     if (scan.insertRows === 0) {
       // Nothing new (all its rows are here already): recorded as merged at once, as an online merge records it.
-      const plan: HistoricalMergeRowPlan = { steps: [], inserted: [], reused: scan.reusedRows, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
+      const plan: HistoricalMergeRowPlan = { targetVersion: await engine.mergeTargetVersion(target.database), steps: [], inserted: [], reused: scan.reusedRows, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
       return await engine.commitSource(paths, target, candidate, binding, plan, undefined, state, options, mode, stopIfAsked);
     }
     progress('backup');

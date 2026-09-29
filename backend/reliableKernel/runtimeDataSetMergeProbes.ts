@@ -1,5 +1,9 @@
 import type Database from 'better-sqlite3';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
+import { UNSETTLED_PROCESS_HISTORY_SQL } from './runtimeProcessHistory';
+import { RUNTIME_DOMAIN_SCHEMA_BY_KEY } from './schema/domainManifest';
+import { toSqliteFilePath } from './sqliteFilePath';
+import { isSamePath } from '../capabilities/filesystem/pathContainment';
 
 /**
  * Read-only classification of unfinished work in a data-set snapshot, shared by the merge (main
@@ -157,7 +161,7 @@ const REFUSAL_PROBES: readonly Probe[] = Object.freeze([
          AND NOT (COALESCE(collaboration.mode, '') = 'message' AND delivery.phase = 'next_turn' AND delivery.target_turn_id IS NULL))
         OR wake.state IN ('pending', 'claimed')`],
   ['未处理的协作请求', "SELECT COUNT(*) FROM collaboration_request WHERE state = 'pending'"],
-  ['仍在运行或结果未知的后台进程', RUNNING_PROCESS_SQL],
+  ['后台进程仍在运行、结束证据不一致或后续工作未收尾', UNSETTLED_PROCESS_HISTORY_SQL],
   ['未送达的进程结束通知', "SELECT COUNT(*) FROM process_completion_dispatch WHERE state IN ('pending', 'claimed')"],
   ['进程输出尚未完整登记', UNREGISTERED_PROCESS_OUTPUT_SQL]
 ]);
@@ -180,6 +184,43 @@ export function inspectUnfinishedWork(
     return inspect(source);
   } finally {
     restore?.();
+  }
+}
+
+/**
+ * Worker-only recheck of the kept rows. The skip keys stay in their private SQLite index and fixed
+ * TEMP views filter them directly; no per-row JS map or second insertion of all skipped ids exists.
+ * The main snapshot is physically read-only. Its sole reader is closed before this worker opens it.
+ */
+export function inspectUnfinishedWorkWithSkipIndex(source: Database.Database, skippedRowsPath: string): UnfinishedWorkInspection {
+  if (!source.readonly || source.inTransaction || isSamePath(source.name, skippedRowsPath)) {
+    throw new Error('Skipped-work audit requires separate private read-only snapshot and index files.');
+  }
+  const queryOnly = Number(source.pragma('query_only', { simple: true })) !== 0;
+  source.pragma('query_only = OFF');
+  const drops: string[] = [];
+  let attached = false;
+  try {
+    source.prepare('ATTACH DATABASE ? AS merge_skip_index').run(toSqliteFilePath(skippedRowsPath));
+    attached = true;
+    for (const schema of ['main', 'temp', 'merge_skip_index']) source.pragma(`${schema}.cache_size = -2048`);
+    const domains = source.prepare('SELECT DISTINCT domain FROM merge_skip_index.limcode_merge_skip').pluck().all() as string[];
+    for (const domain of domains) {
+      const schema = RUNTIME_DOMAIN_SCHEMA_BY_KEY.get(domain);
+      if (!schema) throw new Error(`Unknown skipped-work domain ${domain}.`);
+      const table = schema.table;
+      source.exec(`CREATE TEMP VIEW "${KEPT_PREFIX}${table}" AS SELECT * FROM main."${table}" AS kept
+        WHERE NOT EXISTS (SELECT 1 FROM merge_skip_index.limcode_merge_skip AS skipped
+          WHERE skipped.domain = '${domain}' AND skipped.id = kept.id)`);
+      drops.push(`DROP VIEW temp."${KEPT_PREFIX}${table}"`);
+      source.exec(`CREATE TEMP VIEW "${table}" AS SELECT * FROM temp."${KEPT_PREFIX}${table}"`);
+      drops.push(`DROP VIEW temp."${table}"`);
+    }
+    return inspect(source);
+  } finally {
+    for (const drop of drops.reverse()) source.exec(drop);
+    if (attached) source.exec('DETACH DATABASE merge_skip_index');
+    if (queryOnly) source.pragma('query_only = ON');
   }
 }
 

@@ -328,3 +328,20 @@ SQLite long-lived connection 只能缓存由 RootAuthority 建立的 immutable f
 - Client patch 不适用：snapshot-required/重取 snapshot；
 - Delivery target 已删除：InboxItem 保留，Delivery failed(reason=target-gone)；产生答复的子对话被用户删除而父对话保留时，父对话还没接收的答复 Delivery failed(reason=source-gone)，但答复已投给正在运行的父 Turn（未过最终输出栅栏）时，改为把删除通知作为这条投递的运行时输入注入（Delivery consumed，内容为 `application/vnd.limcode.child-answer-source-deleted+json`，模型看到的是 child_failure 与通知文字，不含答复），父 Turn 已接收但还没吸收的那条运行时输入改用同样的通知内容，为 failed(source-gone) 的答复排队的父对话续跑同一事务取消；数据目录迁移后旧目录收尾迁走的结果：Delivery failed(reason=data-root-relocated)，Wake 与进程完成派发 dead_letter（last_error=data-root-relocated），界面显示“数据目录已迁移，未送达”；
 - 不吞错、不伪造成功/失败、不改走旧文件 writer。
+
+
+### 历史残留的删除、检查与修复
+
+进程等待、停止收敛、spool 清理和完成通知共用完整的持久终态证据校验：成功必须退出码为 0，失败必须非零退出码或非空退出信号，退出码和信号只能存在一个；未知结果二者均为空。Process 的状态、非空 completed_at、nonce 和启动身份必须与回执匹配。等待和通知从同一读快照取 Process 与回执；通知正文使用已核实的 Process.completed_at，创建通知的写事务再次断言已核验字段，不用收到回执的时间替代完成时间。
+
+大库读取每扫描 250 条原始记录即让出并检查取消，包括全部被删除闭包跳过的区段；保留协作消息的来源序号顺序。按跳过闭包复查未完成工作时不把全部跳过 id 装进窗口线程的 Map：小步导出磁盘跳过索引，关闭私有快照 reader，再由审计 worker 用固定 TEMP 视图检查；worker 连接关闭且线程退出之后才重开 reader。此生命周期只属于独立、只读、没有事务或活跃 iterator 的私有快照，不得用于在线来源、目标或维护 writer。
+
+`Operation.owner_kind/owner_id` 是软引用，`deletePolicy: cascade-with-owner` 不是数据库外键。writer 的 Conversation 删除（包括按唯一键删除）在同一事务里先按该对话的 Turn/ModelRequest 精确找出模型请求所属的 Operation，要求请求已终态且聚合完整，再删除 Operation（Attempt 随真实外键级联），最后由 Conversation 级联删除 Turn/ModelRequest。不能依赖声明文字自动级联，也不能泛化为清理所有失去软引用的领域：Process、EffectReceipt 等保留历史仍按原合同保留。任何后续断言失败整笔回滚。
+
+历史合并的进程准入根据持久证据与后续工作，而非仅按状态枚举排除：`outcome_unknown` 是已经结束观测但结果未知，不是“运行中”，更不代表子进程已被证明退出。匹配的 ProcessReceipt（nonce、启动身份、结果和退出元组）、completed_at、没有待完成操作/通知以及输出完整登记时可按原状态导入；缺回执、身份不匹配、状态矛盾或待处理工作仍拒绝。合并从不把它改成 exited，不发送旧结束通知或重新启动进程。数据目录迁移保留原来的较严策略，不因历史展示可合并而允许未知进程迁走。
+
+普通合并、大库准备与整库分批复制使用共享 `MergeAggregatePreflight`，检查本次实际触及的模型聚合：新请求、模型所属 Operation、Attempt 与模型流记录双向确定请求 id，按删除跳过闭包过滤来源，与当前库自己 worker 在一致读快照中的关联行组成有效聚合。请求 id 存在独立连接的磁盘 TEMP 表、页缓存受限，每次只取 64 个目标聚合、每个只保留能证明超限的有界行数，不能向正在 iterate 的来源连接写 TEMP 表。仍在最终 writer 提交时复核。只有带 `RUNTIME_DATA_INVARIANT` 的数据断言或 SQLite 约束归为确定性受阻；域与记录 id 可跨 worker 边界传回，其它执行器、I/O 或目标状态失败继续按推迟。普通在线合并记录规划时目标 writer 的本地提交序号与 external data_version，提交拒绝后目标有过任何本地或外部提交时先按并发变化推迟、不记永久受阻，防止另一窗口抢先合并同一行产生的唯一键冲突被误判为来源损坏。`runtimeMergeValidation.ts` 的日期化规则标识只使受影响的派生拒绝与审计缓存失效（包括外来历史库的审计缓存），不改变内容指纹，不删除提交记录、删除记录、mergedInto 闭包或恢复凭据。
+
+“历史与存储管理 → 检查并修复历史残留”（`runtimeHistoryRepair.ts`）是独立的用户操作，不是合库的静默兜底。只接受本地非当前、Host 和旧版 owner 均离线、无未完成恢复且精确核验为当前 epoch 的库；拒绝共享 inode/硬链接、符号链接、不完整结构与涉及该库的 committing 合并。只读检查通过私有快照审计 worker 完成，不备份、不启动 Runtime、不改源库；现存请求聚合异常、非终态孤立操作、保留效果或结果暂停依赖、不能匹配的进程结束证据均报告而不猜测修复。明确确认后才经写入闸门和维护生命周期：按完整内容摘要复核计划，先查备份与修复 WAL 空间（数据库与 WAL 大小之和的两倍加 64 MiB），通过 SQLite Backup API 备份、核对摘要并 fsync 数据库/目录，在控制根 `history-repair-backups/<时间>-<修复UUID>/` 保存 RootBinding 与 prepared 日志；再由私有维护实例的固定 worker 操作，以 synchronous=FULL 的单事务清理父请求缺失且没有保留依赖的完整终态 Operation/Attempt，并仅凭匹配的既有未知结果回执，将误改成 exited 的 Process 恢复为 outcome_unknown。实际修改前再次核对内容摘要；事务内逐表保护投影摘要证明除精确清理的元数据与纠正的单列状态外全部原记录不变，包含消息修订、当前版本、成员关系、正文与附件元数据；CAS 文件不改动，完整性核验不通过整笔回滚。没有需要修复的记录不备份；任一不安全记录使整份拒绝。
+
+修复事务同笔写专属 CommandReceipt（`historical-repair:<UUID>:<计划摘要>`）；库内标记是是否提交的唯一证明，库外 completed 日志不作提交依据。备份后取消或崩溃未改源数据；提交后写完成记录失败仍报告已提交，下次只读检查按标记显示实际结果，同一计划重入不重复删除、也不重复备份。修复备份不纳入自动备份清理。修复不改当前选择、不重建缺失父记录、不伪造退出码、不调用模型/工具、不清合库账本；修复与之后合库分别报告，修复过来源之后不得宣称两边从未改动。修复当前库中的历史残留须先切换到另一库并让本库离线；外来只读历史不原地修复。

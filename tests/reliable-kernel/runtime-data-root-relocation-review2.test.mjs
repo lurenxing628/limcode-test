@@ -317,17 +317,26 @@ test('#12 目标在 FAT/exFAT 上（没有硬链接、簇很大）：正文按�
   await fs.mkdir(path.dirname(target), { recursive: true });
   const linked = await planWithRuntime(fixture, target);
   const statfs = fsp.statfs;
+  const stat = fsp.stat;
   fsp.statfs = async function (file, ...rest) {
     const stats = await statfs.call(this, file, ...rest);
     return path.resolve(String(file)) === path.dirname(target) ? { ...stats, type: 0x2011bab0, bsize: 131072 } : stats;
   };
-  t.after(() => { fsp.statfs = statfs; });
+  // Filesystem magic numbers are Linux-specific. Other hosts model a USB disk on another device.
+  if (process.platform !== 'linux') fsp.stat = async function (file, ...rest) {
+    const stats = await stat.call(this, file, ...rest);
+    if (path.resolve(String(file)) === path.dirname(target)) stats.dev += 1;
+    return stats;
+  };
+  t.after(() => { fsp.statfs = statfs; fsp.stat = stat; });
   const exfat = await planWithRuntime(fixture, target);
-  if (process.platform === 'linux' && linked.sameDevice) {
+  if (linked.sameDevice) {
     assert.equal(linked.hardLinks, true);
     assert.equal(exfat.hardLinks, false, 'exFAT 没有硬链接：正文要复制');
   }
-  const need = (plan) => plan.space.find((space) => space.label.includes('新数据目录')).requiredBytes;
+  // Compare all disks without their margins: moving the USB target to another device splits
+  // the original combined target/temp/source group, but must still account for copied CAS clusters.
+  const need = (plan) => plan.space.reduce((bytes, space) => bytes + space.requiredBytes - 64 * 1024 * 1024, 0);
   if (linked.hardLinks) assert.ok(need(exfat) - need(linked) >= 2 * 131072, '两个对话的正文对象各占至少一个 128 KiB 簇');
 });
 

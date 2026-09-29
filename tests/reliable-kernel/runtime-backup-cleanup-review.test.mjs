@@ -634,6 +634,10 @@ async function addRecords(dataSet, conversationId) {
         start_fingerprint: 'fingerprint', command_digest: 'digest', spool_locator: 'spool', retained_bytes: 6n, retained_chunks: 1n,
         dropped_bytes: 0n, truncated: 0n, started_at: NOW, updated_at: NOW, completed_at: NOW
       }),
+      repo('ProcessReceipt').insert({
+        id: `${conversationId}_process_receipt`, process_id: `${conversationId}_process`, outcome: 'succeeded',
+        exit_code: 0n, exit_signal: null, wrapper_nonce: 'nonce', start_fingerprint: 'fingerprint', received_at: NOW
+      }),
       repo('ProcessOutputChunk').insert({
         id: `${conversationId}_output`, process_id: `${conversationId}_process`, chunk_seq: 1n, stream_kind: 'stdout',
         content_object_id: outputId, byte_length: 6n, created_at: NOW

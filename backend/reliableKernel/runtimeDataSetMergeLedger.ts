@@ -1,3 +1,4 @@
+import { RUNTIME_MERGE_VALIDATION_REVISION, revisionedRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -97,6 +98,8 @@ export type RuntimeDataSetMergeLedgerRecord = {
   candidateId: string;
   source: RuntimeDataSetFingerprint;
   updatedAt: string;
+  /** Revision of a derived refusal only, never part of content identity or commit proof. */
+  validationRevision?: string;
   /**
    * Kept on a non-merged record that replaced a merged one of the same source incarnation (a later
    * explicit attempt that was blocked, failed or interrupted): the earlier merge still happened.
@@ -319,6 +322,7 @@ export interface RuntimeDataSetAuditFacts {
 }
 
 export interface RuntimeDataSetAuditCacheEntry extends RuntimeDataSetAuditFacts {
+  validationRevision: string;
   /** The exact file state audited (runtimeDataSetFileState), and its fingerprint. */
   files: string;
   fingerprint: RuntimeDataSetFingerprint;
@@ -386,7 +390,7 @@ async function readAuditCache(
   const entry = value as Partial<RuntimeDataSetAuditCacheEntry> & { kind?: unknown; candidateId?: unknown } | null;
   const fingerprint = entry?.fingerprint;
   const count = (item: unknown): item is number => Number.isSafeInteger(item) && (item as number) >= 0;
-  if (entry?.kind !== AUDIT_KIND || entry.candidateId !== id || entry.files !== files || !fingerprint
+  if (entry?.kind !== AUDIT_KIND || entry.validationRevision !== RUNTIME_MERGE_VALIDATION_REVISION || entry.candidateId !== id || entry.files !== files || !fingerprint
     || typeof fingerprint.contentDigest !== 'string' || !isReadableRuntimeDataSetFingerprint(fingerprint)
     || !sameFingerprintIdentity(fingerprint as RuntimeDataSetFingerprint, fingerprintIdentity(identity))
     || !count(entry.rows) || !count(entry.bytes) || !count(entry.databaseBytes) || !count(entry.casObjects) || !count(entry.casBytes)
@@ -396,6 +400,7 @@ async function readAuditCache(
     return undefined;
   }
   return {
+    validationRevision: RUNTIME_MERGE_VALIDATION_REVISION,
     files, fingerprint: fingerprint as RuntimeDataSetFingerprint, auditedAt: entry.auditedAt,
     rows: entry.rows, bytes: entry.bytes, databaseBytes: entry.databaseBytes, casObjects: entry.casObjects, casBytes: entry.casBytes,
     refusedWork: entry.refusedWork.map((item) => ({ label: item.label, count: item.count })),
@@ -412,7 +417,7 @@ async function writeAuditCache(
 ): Promise<void> {
   if (!isReadableRuntimeDataSetFingerprint(fingerprint)) return;
   await writeLedgerJson(paths, AUDITS, id, {
-    kind: AUDIT_KIND, candidateId: id, files, fingerprint,
+    kind: AUDIT_KIND, validationRevision: RUNTIME_MERGE_VALIDATION_REVISION, candidateId: id, files, fingerprint,
     rows: facts.rows, bytes: facts.bytes, databaseBytes: facts.databaseBytes, casObjects: facts.casObjects, casBytes: facts.casBytes,
     refusedWork: facts.refusedWork.map((item) => ({ label: item.label, count: item.count })),
     finalizableTurns: facts.finalizableTurns, finalizableIntents: facts.finalizableIntents, auditedAt: new Date().toISOString()
@@ -587,7 +592,9 @@ export async function writeRuntimeDataSetMergeLedgerRecord(
     entry.conversationIds = [...new Set([...entry.conversationIds, ...insertedConversationIds])];
   }
   await writeLedgerJson(paths, RECORDS, record.candidateId, {
-    kind: RECORD_KIND, ...record, ...(lastMerged ? { lastMerged } : {}), ...(mergedInto.length > 0 ? { mergedInto } : {}),
+    kind: RECORD_KIND, ...record,
+    ...(revisionedRuntimeMergeRefusal(record) ? { validationRevision: RUNTIME_MERGE_VALIDATION_REVISION } : {}),
+    ...(lastMerged ? { lastMerged } : {}), ...(mergedInto.length > 0 ? { mergedInto } : {}),
     ...(formerMergedInto.length > 0 ? { formerMergedInto } : {}),
     updatedAt: new Date().toISOString()
   });

@@ -41,7 +41,7 @@ function fixture({
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
   mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
-  emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState, undecidedClaim = true
+  repairPlan, repairHook, emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState, undecidedClaim = true
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current', source: 'legacy' };
   const old = { id: 'workspace:old', ...(emptyOld ? {} : { dataSetId: 'old', rootInstanceId: 'old-instance' }), runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
@@ -67,6 +67,18 @@ function fixture({
   };
   const dependencies = {
     vscode,
+    '../../backend/reliableKernel/runtimeHistoryRepair': {
+      inspectRuntimeHistoryRepair: async (_paths, input) => {
+        calls.push(['repair-inspect', input]);
+        return repairPlan ?? { expected: { orphanOperations: 2, orphanAttempts: 2, restoredUnknownProcesses: 1, refused: 0, samples: [] }, previous: [] };
+      },
+      repairRuntimeHistory: async (_paths, plan) => {
+        calls.push(['repair-write', plan]);
+        if (repairHook) await repairHook(plan);
+        return { result: { removedOperations: 2, removedAttempts: 2, restoredUnknownProcesses: 1 }, backupPath: '/fixture/repair-backup', warnings: [] };
+      }
+    },
+    '../../backend/reliableKernel/runtimeHistoryRepairInspection': { historyRepairCount: (facts) => facts.orphanOperations + facts.restoredUnknownProcesses },
     '../../backend/capabilities/vscodeStorage/globalStatus': { loadCommittedGlobalStatus: async () => {}, resolveDataRootUri: () => '/fixture' },
     '../../backend/capabilities/vscodeStorage/paths': { createVscodeStoragePaths: () => ({ globalStoragePath: '/fixture' }) },
     '../../backend/reliableKernel/vscodeRootAuthority': {
@@ -1402,4 +1414,28 @@ test('盲审2 merge #2：启动批次里等用户决定的库（以前的版本�
   await settle(() => checks > 1 && late.calls.some(call => call[0] === 'warning' && String(call[1]).startsWith('现在不能')));
   assert.deepEqual(late.calls.filter(call => call[0] === 'merge-request'), []);
   assert.equal(checks, 2);
+});
+
+
+test('历史残留修复入口只读检查、确认前不写库，确认后通过写入闸门并显示备份位置', async () => {
+  let writes = 0;
+  const f = fixture({ picks: [action('repair'), 0], confirmation: '备份并修复',
+    application: { writeGate: { admit() {}, async run(body) { writes += 1; return body(); } } }
+  });
+  await f.manageRuntimeDataSets(f.context, f.startup);
+  assert.equal(f.calls.filter(([kind]) => kind === 'repair-inspect').length, 1);
+  assert.equal(f.calls.filter(([kind]) => kind === 'repair-write').length, 1);
+  assert.equal(writes, 2);
+  assert.ok(f.calls.some(([kind, message]) => kind === 'info' && message.includes('/fixture/repair-backup')));
+});
+
+test('取消修复确认不备份、不写库、不合并；非终态残留只显示检查结果', async () => {
+  for (const refused of [0, 1]) {
+    const f = fixture({ picks: [action('repair'), 0],
+      repairPlan: { expected: { orphanOperations: 1, orphanAttempts: 1, restoredUnknownProcesses: 0, refused, samples: [] }, previous: [] }
+    });
+    await f.manageRuntimeDataSets(f.context, f.startup);
+    assert.equal(f.calls.filter(([kind]) => kind === 'repair-inspect').length, 1);
+    assert.equal(f.calls.filter(([kind]) => kind === 'repair-write' || kind === 'merge-online').length, 0);
+  }
 });

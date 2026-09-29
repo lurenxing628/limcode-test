@@ -1,9 +1,11 @@
+import { inspectHistoryRepair } from './runtimeHistoryRepairInspection';
+import { attachRuntimeStatementCache, detachRuntimeStatementCache } from './runtimeStatementCache';
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { assertCurrentSchema, auditDatabaseIntegrity, configureReaderConnection } from './databaseSchema';
 import { readRuntimeDataSetSummary, runtimeDataSetContentDigest } from './runtimeDataSetContent';
 import { measuredIndexBytes } from './runtimeDataSetLargeMergeSpace';
-import { inspectCarriedWork, inspectUnfinishedWork } from './runtimeDataSetMergeProbes';
+import { inspectCarriedWork, inspectUnfinishedWork, inspectUnfinishedWorkWithSkipIndex } from './runtimeDataSetMergeProbes';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import type {
   RuntimeSnapshotAudit, RuntimeSnapshotAuditWorkerData, RuntimeSnapshotAuditWorkerResponse
@@ -36,11 +38,14 @@ function audit(input: RuntimeSnapshotAuditWorkerData): RuntimeSnapshotAudit {
     assertCurrentSchema(database, input.binding);
     assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS);
     if (!input.skipIntegrity) auditDatabaseIntegrity(database);
+    attachRuntimeStatementCache(database);
     const result: RuntimeSnapshotAudit = {};
+    if (input.historyRepair) result.historyRepair = inspectHistoryRepair(database);
     if (input.contentDigest) result.contentDigest = runtimeDataSetContentDigest(database);
     if (input.summary) result.summary = readRuntimeDataSetSummary(database);
     if (input.indexBytes) result.indexBytes = measuredIndexBytes(database);
-    if (input.unfinishedWork === 'finalize') result.unfinishedWork = inspectUnfinishedWork(database);
+    if (input.unfinishedWork === 'finalize') result.unfinishedWork = input.skippedRowsPath
+      ? inspectUnfinishedWorkWithSkipIndex(database, input.skippedRowsPath) : inspectUnfinishedWork(database);
     if (input.unfinishedWork === 'carry') result.carriedWork = inspectCarriedWork(database);
     if (input.measureTables) {
       let rows = 0;
@@ -56,6 +61,7 @@ function audit(input: RuntimeSnapshotAuditWorkerData): RuntimeSnapshotAudit {
     }
     return result;
   } finally {
+    detachRuntimeStatementCache(database);
     database.close();
   }
 }

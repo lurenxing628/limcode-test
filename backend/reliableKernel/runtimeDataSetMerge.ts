@@ -1,3 +1,4 @@
+import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, createReadStream, lstatSync, type BigIntStats } from 'node:fs';
 import * as fs from 'node:fs/promises';
@@ -16,7 +17,9 @@ import {
 import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
 import { classifyRecordedProcess, ownProcessStartIdentity, type RecordedProcessClassifier } from './runtimeClaimPrimitives';
-import type { RuntimeDatabase } from './runtimeDatabase';
+import { RuntimeDatabaseWorkerError, type RuntimeDatabase } from './runtimeDatabase';
+import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
+import { isRuntimeDataInvariant } from './runtimeDataInvariant';
 import {
   describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, inspectUnfinishedWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
   type CarriedWorkRefusals, type UnfinishedWorkInspection
@@ -1009,7 +1012,7 @@ async function selectSource(
   // A refusal of this unchanged source is reported again without redoing it, unless the request
   // came after that judgment (a record put back after a rollback keeps its time of judgment). A
   // too-large record counts only for the current hard bound (older ones named the in-memory bound).
-  const known = unchanged && (record?.state === 'failed'
+  const known = unchanged && record !== undefined && reusableRuntimeMergeRefusal(record) && (record?.state === 'failed'
     || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, target.identity))
     || (record?.state === 'too-large' && record.maxRows === streamedRows))
     && !(pending && request!.requestedAt > record.updatedAt);
@@ -1285,7 +1288,7 @@ export async function readRuntimeDataSetMergeStates(
       result.set(candidate.id, { state: 'requested', requestedAt: request.requestedAt, ...carried });
     } else if (damaged) {
       result.set(candidate.id, { state: 'blocked', ...(damaged === 'newer' ? RECORD_NEWER : RECORD_DAMAGED) });
-    } else if (unchanged && (record?.state === 'failed'
+    } else if (unchanged && record !== undefined && reusableRuntimeMergeRefusal(record) && (record?.state === 'failed'
       || (record?.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
       result.set(candidate.id, { state: record.state, code: record.code, message: record.message, ...carried });
     } else if (unchanged && record?.state === 'too-large' && record.maxRows === RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS) {
@@ -1445,6 +1448,18 @@ interface SourceProgress {
   foreign?: ForeignHistoricalMergeHold;
 }
 
+/** Same deterministic-data refusal for online and streamed merges; infrastructure errors stay deferred. */
+function invariantRefusal(detail: string, state: SourceProgress): Outcome {
+  return new Outcome({
+    kind: 'blocked', code: 'runtime-data-set-merge-invariant',
+    message: `这份旧聊天记录里有当前库不接受的数据（数据不完整或状态不一致），整体未合并，${state.finalized ? '当前库没有改动' : '两边内容都没有改动'}。`
+      + '来源不变时再合并结果也一样，所以不再自动重试；这个库有了变化，或'
+      + (state.foreign ? '在“历史与存储管理 → 外来历史库”里再次选择“合并进当前库”' : '在“历史与存储管理”里再次选择“合并到当前库”')
+      + `时会重新检查。\n${detail}`
+      + (state.foreign ? '' : '\n可先在“历史与存储管理 → 检查并修复历史残留”只读检查；确认后会先备份再修复。')
+  });
+}
+
 function sourceOutcome(error: unknown, state: SourceProgress): Refusal | { kind: 'stopped' } {
   // A stop after this attempt closed work in the source is deferred, so that is reported.
   if (error instanceof StopRequested && (!state.finalized || state.finalized.earlier)) return { kind: 'stopped' };
@@ -1455,6 +1470,8 @@ function sourceOutcome(error: unknown, state: SourceProgress): Refusal | { kind:
     ? { kind: 'deferred', code: 'runtime-data-set-merge-stopped', message: '合并在收尾之后停止了（窗口关闭或数据目录已切换），以后启动时会继续合并。' }
     : error instanceof Outcome
     ? { ...error.outcome }
+    : isRuntimeDataInvariant(error)
+      ? invariantRefusal(errorMessage(error), state).outcome
     : isRuntimeHostsActiveError(error)
       ? { kind: 'deferred', code: 'runtime-hosts-active', message: '这个历史库正被其它窗口使用，关闭那个窗口后会自动合并。' }
       : { kind: 'deferred', code: errorCode(error), message: `暂时无法合并，以后会自动重试：${errorMessage(error)}` };
@@ -2364,6 +2381,10 @@ async function commitLocked(
       }
     }
     if (committed !== true) {
+      if (committed === false && error instanceof RuntimeDatabaseWorkerError && isRuntimeDataInvariant(error)
+        && await mergeTargetVersion(target.database) === plan.targetVersion) {
+        throw invariantRefusal(error.message, state);
+      }
       throw new Outcome({ kind: 'deferred', code: errorCode(error), message: `写入当前库时出错，稍后重试：${errorMessage(error)}` });
     }
   }
@@ -2526,6 +2547,7 @@ function unfinishedWorkOutcome(found: string, state: SourceProgress, afterFinali
         + (state.finalized ? '。' : '；这个库的对话内容没有改动。'))
       + '可以在“历史与存储管理”里切换到这个库，等任务结束或手动停止后，再切回当前库并选择“合并到当前库”。'
       + '切换过去时，这些任务会按那个库的正常恢复继续执行。'
+      + '若是早已结束的记录或结束证据不一致，可先选择“检查并修复历史残留”只读检查；不要仅把状态改成 exited。'
   };
 }
 
@@ -2963,7 +2985,16 @@ function skippedRows(source: Database.Database, conversations: ReadonlySet<strin
   return skipped;
 }
 
+/** The writer's external data_version plus its own commit sequence cover commits by every Host. */
+async function mergeTargetVersion(database: RuntimeDatabase): Promise<string> {
+  const external = await database.externalDataVersion();
+  const local = (await database.snapshot([])).snapshotCommitSeq;
+  return `${external}:${local}`;
+}
+
 interface RowPlan {
+  /** Both local and other-connection commits since planning; never treat a target race as source damage. */
+  targetVersion: string;
   steps: RepositoryTransactionStep[];
   inserted: Array<[string, string]>;
   reused: number;
@@ -2983,12 +3014,15 @@ async function planRows(
   target: RuntimeDatabase,
   skipped?: ReadonlyMap<string, ReadonlySet<string>>
 ): Promise<RowPlan> {
-  const plan: RowPlan = { steps: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
+  const targetVersion = await mergeTargetVersion(target);
+  const plan: RowPlan = { targetVersion, steps: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
   const presence: RepositoryTransactionStep[] = [];
+  const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => !skipped?.get(domain)?.has(id));
   const sink: RuntimeDataSetMergeChunkSink = {
     steps: plan.steps,
     presence,
-    inserted: (domain, id) => {
+    inserted: (domain, id, row) => {
+      aggregates.touch(domain, row);
       plan.inserted.push([domain, id]);
       if (domain === 'Conversation') plan.insertedConversations += 1;
     },
@@ -2999,26 +3033,29 @@ async function planRows(
     },
     savepointName: () => `merge_identity_${plan.steps.length}`
   };
-  for (const schema of MERGE_DOMAIN_ORDER) {
-    const repository = DOMAIN_REPOSITORIES.domain(schema.key);
-    const statement = source.prepare(mergeReadSql(schema));
-    let chunk: DomainRow[] = [];
-    const flush = async (): Promise<void> => {
-      if (chunk.length === 0) return;
-      const existing = (await target.snapshot(chunk.map((row) => repository.get(String(row.id))))).snapshot as Array<DomainRow | null>;
-      planMergeChunk(schema, chunk, existing, sink);
-      chunk = [];
-      // Decoding stays on the extension thread; yield so a large source never monopolizes it.
-      await new Promise((resolve) => setImmediate(resolve));
-    };
-    const leftOut = skipped?.get(schema.key);
-    for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
-      if (leftOut?.has(String(raw.id))) continue;
-      chunk.push(sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
-      if (chunk.length >= READ_CHUNK) await flush();
+  try {
+    for (const schema of MERGE_DOMAIN_ORDER) {
+      const repository = DOMAIN_REPOSITORIES.domain(schema.key);
+      const statement = source.prepare(mergeReadSql(schema));
+      let chunk: DomainRow[] = [];
+      const flush = async (): Promise<void> => {
+        if (chunk.length === 0) return;
+        const existing = (await target.snapshot(chunk.map((row) => repository.get(String(row.id))))).snapshot as Array<DomainRow | null>;
+        planMergeChunk(schema, chunk, existing, sink);
+        chunk = [];
+        // Decoding stays on the extension thread; yield so a large source never monopolizes it.
+        await new Promise((resolve) => setImmediate(resolve));
+      };
+      const leftOut = skipped?.get(schema.key);
+      for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
+        if (leftOut?.has(String(raw.id))) continue;
+        chunk.push(sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
+        if (chunk.length >= READ_CHUNK) await flush();
+      }
+      await flush();
     }
-    await flush();
-  }
+    if (plan.conflicts.count === 0) await aggregates.validate();
+  } finally { aggregates.close(); }
   // A loop, not push(...presence): an argument list of every source row overflows the call stack.
   if (plan.steps.length > 0) for (const step of presence) plan.steps.push(step);
   return plan;
@@ -3033,7 +3070,7 @@ export interface RuntimeDataSetMergeChunkSink {
   steps: RepositoryTransactionStep[];
   /** One presence assertion per compared source row, asserted after the inserts they cover. */
   presence: RepositoryTransactionStep[];
-  inserted(domain: string, id: string): void;
+  inserted(domain: string, id: string, row: DomainRow): void;
   reused(): void;
   /** A row that exists in the target with other values; `sample` describes it. */
   conflict(sample: () => string): void;
@@ -3099,7 +3136,7 @@ export function planMergeChunk(
     } else {
       sink.steps.push(insert);
     }
-    sink.inserted(schema.key, id);
+    sink.inserted(schema.key, id, row);
   }
 }
 
@@ -4107,7 +4144,7 @@ export function runtimeDataSetCopyRow(domain: string, raw: Record<string, unknow
  */
 export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 }): unknown {
   if (error instanceof RuntimeDataSetMergeError || (error instanceof Error && error.name === 'AbortError')) return error;
-  if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error)) return error;
+  if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error) && !isRuntimeDataInvariant(error)) return error;
   const outcome = sourceOutcome(error, state);
   return outcome.kind === 'stopped'
     ? new RuntimeDataSetMergeError('runtime-data-set-merge-stopped', '合并已停止。', error)
@@ -4122,7 +4159,7 @@ export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFrom
 
 /** @internal The engine pieces a large-merge session reuses unchanged; no API for anything else. */
 export const HISTORICAL_MERGE_ENGINE = Object.freeze({
-  MERGE_DOMAIN_ORDER, IDENTITY_MERGE_DIFFERENCES, SKIPPED_WITH, SKIPPED_WITH_MEMBERS, MAX_REPORTED_CONFLICTS, READ_CHUNK,
+  invariantRefusal, mergeTargetVersion, MERGE_DOMAIN_ORDER, IDENTITY_MERGE_DIFFERENCES, SKIPPED_WITH, SKIPPED_WITH_MEMBERS, MAX_REPORTED_CONFLICTS, READ_CHUNK,
   BACKUP_FREE_SPACE_MARGIN_BYTES, Outcome, StopRequested, MergedMeanwhile,
   targetContext, pickSources, runSourceAttempt, settledSource, resolveSource, recordedConversations, takeVerifiedSnapshot,
   countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, keptUnfinishedWork, transferSourceCas, finalizeSource,

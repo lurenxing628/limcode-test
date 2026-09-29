@@ -936,16 +936,20 @@ test('窗口是否空闲复用对话的待办工作判定：执行中的命令�
   assert.equal(await busy(), true, 'durable pending work of an owned conversation is busy');
 });
 
-test('两个请求方不互等：本窗口有进行中的请求时对其它请求答忙、从不让出；较新的请求让先并写明原因，较早的完成', async (t) => {
+test('两个请求方不互等：本窗口有进行中的请求时对其它请求答忙、从不让出；较新的请求让先并写明原因，较早的完成', { timeout: 30_000 }, async (t) => {
   const { binding, paths } = await createRoot(t);
   const working = await openWindow(t, binding, 'working-window', { busy: WORK });
   const b = await openWindow(t, binding, 'window-b');
   // B: the user confirmed a migration there; it waits outside the locks for the working window.
+  const progress = [];
   const migration = run(paths, {
     ...BASE, operation: 'data-root-migration', operationKey: 'to:/new-root', message: '为迁移数据目录', ignoreBackoff: true,
-    whenBusy: 'wait', busyWaitTimeoutMs: 10_000, participantConfirmation: 'final-countdown', requesterHostBootId: 'window-b'
+    whenBusy: 'wait', busyWaitTimeoutMs: 10_000, participantConfirmation: 'final-countdown', requesterHostBootId: 'window-b',
+    onProgress: (item) => progress.push(item)
   }, async () => 'migrated');
-  while ((await readExclusiveMaintenanceRequests(paths)).length === 0) await delay(10);
+  // A busy round can retract its request before a filesystem poll sees it. The wait stage is
+  // durable in this observation list and proves B is still running its own operation.
+  await eventually(() => progress.some((item) => item.stage === 'waiting-busy'));
   // Any other request meanwhile: B's own window answers busy (a reload would drop its request).
   await writeRequest(paths, { requestId: 'later-request', createdAt: new Date(Date.now() + 1_000).toISOString(), whenBusy: 'abandon' });
   await b.check();
@@ -957,7 +961,9 @@ test('两个请求方不互等：本窗口有进行中的请求时对其它请�
   await fs.rm(path.join(runtimeExclusiveMaintenanceDirectory(paths), 'requests', 'later-request.json'));
 
   // D: the user clicks another operation in a second window: the later request gives way at once.
-  const d = await openWindow(t, binding, 'window-d');
+  // This window opens while B is already preparing. Its live record must have a fresh start
+  // time, as a real Runtime does; the registration gap is opening, not a months-old legacy Host.
+  const d = await openWindow(t, binding, 'window-d', { startedAt: new Date().toISOString(), registerAfterMs: 100 });
   const clicked = await run(paths, {
     ...BASE, operation: 'historical-merge', operationKey: 'source@x', message: '为合并较大的旧聊天记录', ignoreBackoff: true,
     whenBusy: 'wait', participantConfirmation: 'notice', requesterHostBootId: 'window-d'

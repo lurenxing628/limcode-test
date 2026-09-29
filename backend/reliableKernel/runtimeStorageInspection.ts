@@ -153,7 +153,18 @@ export async function deleteUnselectedRuntimeDataSet(
 
 export interface RuntimeDataSetDatabaseSnapshot {
   database: Database.Database;
+  /** Temporarily closes this private reader; the callback may exclusively audit the copy in a worker. */
+  withClosedReader<T>(run: (snapshotPath: string) => Promise<T>): Promise<T>;
   close(): Promise<void>;
+}
+
+/** @internal SQLite reports its native Windows path; compare it at that same I/O boundary. */
+export function isRuntimeSnapshotReaderPath(
+  snapshotPath: string,
+  databaseName: string,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  return isSamePath(toSqliteFilePath(snapshotPath, platform), databaseName, platform === 'win32' ? path.win32 : path);
 }
 
 /**
@@ -202,18 +213,56 @@ async function openRuntimeDatabaseSnapshotCopy(
   try {
     const snapshotPath = copy.databasePath;
     await options.beforeOpen?.(snapshotPath);
-    database = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
-    configureReaderConnection(database);
-    database.pragma('query_only = ON');
-    // This comparison is epoch-agnostic and makes no migration or schema compatibility claim.
-    assertDatabaseBinding(database, binding as RootBinding);
+    const openReader = (): Database.Database => {
+      const reader = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
+      try {
+        configureReaderConnection(reader);
+        reader.pragma('query_only = ON');
+        // This comparison is epoch-agnostic and makes no migration or schema compatibility claim.
+        assertDatabaseBinding(reader, binding as RootBinding);
+        return reader;
+      } catch (error) { reader.close(); throw error; }
+    };
+    database = openReader();
     let closed = false;
+    let suspended = false;
     return {
-      database,
+      get database() {
+        if (closed || suspended || !database) throw new Error('The private snapshot reader is closed.');
+        return database;
+      },
+      async withClosedReader<T>(run: (snapshotPath: string) => Promise<T>): Promise<T> {
+        if (closed || suspended || !database || !database.readonly || database.inTransaction) {
+          throw new Error('Only an idle private read-only snapshot may be handed to an audit worker.');
+        }
+        // This factory's copies have their own files in a fresh process-owned temporary directory.
+        // A live/root database, a hard link or an arbitrary caller-supplied copy can never be handed off.
+        const directory = path.dirname(path.resolve(snapshotPath));
+        if (!isPathBelow(os.tmpdir(), directory)
+          || !path.basename(directory).startsWith(`limcode-runtime-history-${process.pid}-`)
+          || isSamePath(snapshotPath, binding.paths.databasePath)
+          || !isRuntimeSnapshotReaderPath(snapshotPath, database.name)) {
+          throw new Error('Audit worker handoff requires a private temporary snapshot copy.');
+        }
+        suspended = true;
+        try {
+          const [file, parent] = await Promise.all([fs.lstat(snapshotPath), fs.lstat(directory)]);
+          if (!file.isFile() || file.isSymbolicLink() || file.nlink !== 1 || !parent.isDirectory() || parent.isSymbolicLink()) {
+            throw new Error('Audit worker handoff requires a separate, link-free snapshot file.');
+          }
+          // better-sqlite3 also refuses close while an iterator is active. The worker is not started
+          // until this succeeds, so no database connection, transaction or iterator overlaps it.
+          database.close();
+          database = undefined;
+          try { return await run(snapshotPath); }
+          finally { database = openReader(); }
+        } finally { suspended = false; }
+      },
       async close() {
         if (closed) return;
+        if (suspended) throw new Error('The private snapshot audit must finish before closing its copy.');
         closed = true;
-        database!.close();
+        database?.close();
         await copy.remove();
       }
     };
@@ -335,7 +384,8 @@ function classifyStoragePath(candidate: VscodeRuntimeDataSetCandidate, filePath:
 function classifyControlRootPath(control: string, dataRootPath: string, filePath: string): RuntimeStorageCategory {
   const controlRelative = path.relative(control, filePath).split(path.sep);
   if (controlRelative[0] === 'backups' || controlRelative[0] === 'epoch-migration-backups'
-    || controlRelative[0] === 'merge-backups' || controlRelative[0] === 'merge-source-backups') return 'historicalBackups';
+    || controlRelative[0] === 'merge-backups' || controlRelative[0] === 'merge-source-backups'
+    || controlRelative[0] === 'history-repair-backups') return 'historicalBackups';
   const relative = path.relative(dataRootPath, filePath).split(path.sep);
   if (relative.length === 1 && ['limcode.sqlite', 'limcode.sqlite-wal', 'limcode.sqlite-shm', 'limcode.sqlite-journal'].includes(relative[0])) return 'sqlite';
   if (relative[0] === 'cas') return relative[1] === 'tmp' ? 'casTemporary' : 'cas';

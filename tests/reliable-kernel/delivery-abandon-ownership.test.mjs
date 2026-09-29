@@ -131,6 +131,8 @@ test('盘点在一个读快照里完成：另一个连接同时提交带活动 T
     const torn = [];
     let listed = 0;
     for (let round = 0; round < 120; round += 1) {
+      // Synchronize with actual commits, not the relative speed of the reader and racing writer.
+      await writer.committed(round + 1);
       for (const entry of (await app.database.relocatedWorkInventory()).conversations) {
         listed += 1;
         if (entry.otherRuntimeWork || entry.activeTurnIds.join() !== `${entry.conversationId}-turn`) torn.push(entry);

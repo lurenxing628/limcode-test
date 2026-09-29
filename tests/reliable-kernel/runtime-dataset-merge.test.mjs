@@ -318,9 +318,8 @@ test('复审 merge2 #5：待收尾的对话若还有内核判忙而命名探针�
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_mixed', project: SHARED_PROJECT }]);
   await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_mixed', kind: 'bare' }]);
-  // Same Conversation: an exited process without a ProcessReceipt. The kernel probe keeps the
-  // Conversation busy for it; no named refusal probe counts it (constructed state).
-  rawSource(fixture.alpha, (source) => insertUnreceiptedProcess(source, 'conversation_alpha_mixed'));
+  // A terminal ToolCall without its model result: only the final kernel probe sees the debt.
+  rawSource(fixture.alpha, (source, contentId) => insertResultlessTerminalTool(source, 'conversation_alpha_mixed', contentId));
   const before = await treeSnapshot(fixture.alpha.scopeRoot);
   const report = await merge(fixture, await openTarget(t, fixture.current));
   assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-unfinished-work');
@@ -332,7 +331,7 @@ test('复审 merge2 #5：待收尾的对话若还有内核判忙而命名探针�
 test('内核探针终审：没有可收尾工作、只有内核判忙的对话也整份拒绝（去掉终审则会被合并）', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_process', project: SHARED_PROJECT }]);
-  rawSource(fixture.alpha, (source) => insertUnreceiptedProcess(source, 'conversation_alpha_process'));
+  rawSource(fixture.alpha, (source, contentId) => insertResultlessTerminalTool(source, 'conversation_alpha_process', contentId));
   const database = await openTarget(t, fixture.current);
   const report = await merge(fixture, database);
   assert.deepEqual(report.merged, []);
@@ -903,8 +902,10 @@ test('审查 #8：当前库备份失败时不留临时文件与空目录并推�
   const failing = (code) => ({
     binding: database.binding,
     hostBootId: database.hostBootId,
+    externalDataVersion: () => database.externalDataVersion(),
+    mergeModelAggregates: (ids) => database.mergeModelAggregates(ids),
     snapshot: (reads) => database.snapshot(reads),
-    transaction: (steps) => database.transaction(steps),
+    transaction: (steps, options) => database.transaction(steps, options),
     async backupTo(destination) {
       await fs.writeFile(destination, 'partial copy');
       throw Object.assign(new Error(code === 'ENOSPC' ? 'ENOSPC: no space left on device, write' : 'EIO: i/o error, write'), { code });
@@ -2256,7 +2257,7 @@ test('盲审2 merge #5：记录拒绝时不写在任何 committing 记录上（�
     async onFaultPoint(point) {
       if (point !== 'after-source-backup') return;
       // Before its work is closed: work nothing closes appears (the closed source is refused), and a committing record.
-      rawSource(fixture.alpha, (source) => insertUnreceiptedProcess(source, 'conversation_alpha_refused'));
+      rawSource(fixture.alpha, (source, contentId) => insertResultlessTerminalTool(source, 'conversation_alpha_refused', contentId));
       await fs.mkdir(records, { recursive: true });
       await fs.writeFile(file, committing);
     }
@@ -2537,12 +2538,10 @@ function rawSource(dataSet, write) {
   } finally { source.close(); }
 }
 
-/** An exited process linked to the Conversation, without its ProcessReceipt. */
-function insertUnreceiptedProcess(source, conversationId) {
-  source.prepare(`INSERT INTO process VALUES (?, 'exited', 'nonce', 1, NULL, NULL, 'fp', 'digest', 'spool', 0, 0, 0, 0, ?, ?, ?)`)
-    .run(`${conversationId}_process`, NOW, NOW, NOW);
-  source.prepare('INSERT INTO process_completion_source_link VALUES (?, ?, ?, ?, ?, ?)')
-    .run(`${conversationId}_process_link`, `${conversationId}_process`, conversationId, `${conversationId}_turn`, 'tool_call_x', NOW);
+/** Terminal ToolCall without its ToolModelResult: only the kernel's final pending-work probe sees it. */
+function insertResultlessTerminalTool(source, conversationId, contentId) {
+  source.prepare(`INSERT INTO tool_call (id, turn_id, call_seq, tool_name, status, arguments_object_id, created_at, updated_at)
+    VALUES (?, ?, 1, 'read_file', 'terminal', ?, ?, ?)`).run(`${conversationId}_resultless_tool`, `${conversationId}_turn`, contentId, NOW, NOW);
 }
 
 /** A child execution of conversation_alpha_parent in conversation_alpha_child, as a crash can leave it. */

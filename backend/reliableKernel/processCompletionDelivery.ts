@@ -19,6 +19,8 @@ import { deadLetterProcessCompletionDispatchSteps } from './deliverySettlementSt
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { RuntimeDataInvariantError } from './runtimeDataInvariant';
+import { hasMatchingTerminalProcessReceipt } from './runtimeProcessHistory';
 
 export const PROCESS_COMPLETION_CONTENT_TYPE = 'application/vnd.limcode.process-completion+json';
 export const PROCESS_COMPLETION_MAX_PAYLOAD_BYTES = 12_000;
@@ -575,11 +577,21 @@ export class ProcessCompletionDeliveryControlPlane {
     completion: CompletionFacts;
     delivery: DeliveryFacts;
   }> {
-    const receipt = await this.requireExisting(
+    const candidateReceipt = await this.requireExisting(
       'ProcessReceipt',
       requirePhaseFId(dispatch.process_receipt_id, 'ProcessCompletionDispatch.process_receipt_id')
     );
-    const processId = requirePhaseFId(receipt.process_id, 'ProcessReceipt.process_id');
+    const processId = requirePhaseFId(candidateReceipt.process_id, 'ProcessReceipt.process_id');
+    // The Receipt is immutable, but its Process and Receipt must still be observed in one snapshot.
+    // Incomplete or contradictory evidence must never become a frozen completion notification.
+    const [process, receipt] = (await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Process').get(processId),
+      DOMAIN_REPOSITORIES.domain('ProcessReceipt').get(requirePhaseFId(candidateReceipt.id, 'ProcessReceipt.id'))
+    ])).snapshot;
+    if (!process || Array.isArray(process) || !receipt || Array.isArray(receipt)
+      || !hasMatchingTerminalProcessReceipt(process, receipt)) {
+      throw new RuntimeDataInvariantError('Process', processId, `Process ${processId} has inconsistent terminal receipt evidence.`);
+    }
     const processOperations = await listAllDomainRows(this.database, 'Operation', {
       owner_kind: 'process',
       owner_id: processId
@@ -609,6 +621,7 @@ export class ProcessCompletionDeliveryControlPlane {
     const sourceTurnId = requirePhaseFId(source.source_turn_id, 'ProcessCompletionSourceLink.source_turn_id');
     const conversationId = requirePhaseFId(source.conversation_id, 'ProcessCompletionSourceLink.conversation_id');
     const completion = await this.ensureCompletionFacts({
+      process,
       receipt,
       processId,
       toolCallId,
@@ -630,6 +643,7 @@ export class ProcessCompletionDeliveryControlPlane {
   }
 
   private async ensureCompletionFacts(input: {
+    process: DomainRow;
     receipt: DomainRow;
     processId: string;
     toolCallId: string;
@@ -651,6 +665,7 @@ export class ProcessCompletionDeliveryControlPlane {
       outputError = boundedError(error);
     }
     const bytes = encodeProcessCompletionPayload({
+      process: input.process,
       receipt: input.receipt,
       processId: input.processId,
       toolCallId: input.toolCallId,
@@ -663,9 +678,20 @@ export class ProcessCompletionDeliveryControlPlane {
     const now = this.timestamp();
     try {
       await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('Process').assert(input.processId, {
+          status: input.process.status,
+          wrapper_nonce: input.process.wrapper_nonce,
+          start_fingerprint: input.process.start_fingerprint,
+          completed_at: input.process.completed_at
+        }),
         DOMAIN_REPOSITORIES.domain('ProcessReceipt').assert(receiptId, {
           process_id: input.processId,
-          outcome: input.receipt.outcome
+          outcome: input.receipt.outcome,
+          exit_code: input.receipt.exit_code,
+          exit_signal: input.receipt.exit_signal,
+          wrapper_nonce: input.receipt.wrapper_nonce,
+          start_fingerprint: input.receipt.start_fingerprint,
+          received_at: input.receipt.received_at
         }),
         DOMAIN_REPOSITORIES.domain('ProcessCompletionSourceLink').assert(
           requirePhaseFId(input.sourceLink.id, 'ProcessCompletionSourceLink.id'),
@@ -1361,6 +1387,7 @@ function processCompletionDedupeKey(processReceiptId: string): string {
 }
 
 function processCompletionPayload(input: {
+  process: DomainRow;
   receipt: DomainRow;
   processId: string;
   toolCallId: string;
@@ -1384,7 +1411,7 @@ function processCompletionPayload(input: {
       input.receipt.exit_signal,
       'ProcessReceipt.exit_signal'
     ),
-    completedAt: requireIsoTimestamp(input.receipt.received_at, 'ProcessReceipt.received_at'),
+    completedAt: requireIsoTimestamp(input.process.completed_at, 'Process.completed_at'),
     output: input.output ? {
       stdoutTail: utf8Tail(input.output.stdout, outputBudget.stdout),
       stderrTail: utf8Tail(input.output.stderr, outputBudget.stderr),

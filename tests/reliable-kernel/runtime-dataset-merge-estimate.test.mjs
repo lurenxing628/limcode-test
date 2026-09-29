@@ -365,7 +365,7 @@ test('估计的结论：阈值与分流同准备；太大、无法收尾、另�
   const refused = await withWindow(fixture, (database) => estimate(fixture, database));
   assert.deepEqual(refused.sources, []);
   assert.deepEqual(refused.report.blocked.map((issue) => [issue.candidateId, issue.code]), [[fixture.alpha.id, 'runtime-data-set-merge-unfinished-work']]);
-  assert.match(refused.report.blocked[0].message, /仍在运行或结果未知的后台进程×1/);
+  assert.match(refused.report.blocked[0].message, /后台进程仍在运行、结束证据不一致或后续工作未收尾×1/);
 
   // A published epoch-4 data set is not upgraded by an estimate.
   await downgradeToEpoch4(fixture.beta.binding);

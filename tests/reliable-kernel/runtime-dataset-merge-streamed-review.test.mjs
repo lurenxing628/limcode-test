@@ -749,7 +749,7 @@ test('不变量在会话里才查出（来源里一个对话的项目链接换�
   });
 });
 
-test('不变量在提交时才查出（来源给当前库里已有的请求多加了一次尝试，试算只查它要新插入的请求）：提交时的聚合断言拒绝，整份回滚，按受阻入账', { timeout: 300_000 }, async (t) => {
+test('已有请求的新增尝试也在预检时验证：非法聚合不备份、不进入会话，按受阻入账', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
@@ -760,12 +760,37 @@ test('不变量在提交时才查出（来源给当前库里已有的请求多�
       VALUES (?, ?, 2, 'completed', ?, ?, ?)`).run(`${request}_attempt_2`, `${request}_operation`, NOW, NOW, NOW);
   });
   const before = readAll(fixture.current);
-  const { preparation, session } = await prepareAndRun(fixture, LIMITS, { candidateIds: [fixture.alpha.id], requested: true });
-  assert.equal(preparation.sources.length, 1);
-  assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['blocked', INVARIANT]]);
-  assert.match(session.results[0].issue.message, new RegExp(`ModelRequest ${request} current Attempt must be the contiguous tail`));
+  const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
+    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS,
+    candidateIds: [fixture.alpha.id], requested: true
+  }));
+  assert.equal(preparation.sources.length, 0);
+  assert.deepEqual(preparation.report.blocked.map((issue) => issue.code), [INVARIANT]);
+  assert.equal(preparation.backupPath, undefined);
+  assert.match(preparation.report.blocked[0].message, new RegExp(`ModelRequest ${request} current Attempt must be the contiguous tail`));
   assert.deepEqual(readAll(fixture.current), before, '整份回滚');
   assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'blocked');
+});
+
+test('预检通过后的最终 worker 聚合校验仍然有效：提交前多出的非法 Attempt 整份回滚', { timeout: 300_000 }, async (t) => {
+  const fixture = await createConfigurationRoot();
+  t.after(() => removeConfigurationRoot(fixture.root));
+  await seedRichSource(fixture.alpha, 'alpha', 3);
+  const before = readAll(fixture.current);
+  const commit = kernel.RuntimeDatabase.prototype.maintenanceCommit;
+  t.after(() => { kernel.RuntimeDatabase.prototype.maintenanceCommit = commit; });
+  kernel.RuntimeDatabase.prototype.maintenanceCommit = async function injectThenCommit() {
+    await this.maintenanceAppend([kernel.DOMAIN_REPOSITORIES.domain('Attempt').insertHistoricalCopy({
+      id: 'injected_attempt', operation_id: 'alpha_conversation_0_request_completed_operation', attempt_seq: 2n,
+      status: 'completed', created_at: NOW, updated_at: NOW, completed_at: NOW
+    })]);
+    return commit.call(this);
+  };
+  const { preparation, session } = await prepareAndRun(fixture, LIMITS);
+  assert.equal(preparation.sources.length, 1);
+  assert.deepEqual(session.results.map((result) => [result.state, result.issue?.code]), [['blocked', INVARIANT]]);
+  assert.match(session.results[0].issue.message, /current Attempt must be the contiguous tail/);
+  assert.deepEqual(readAll(fixture.current), before);
 });
 
 test('写入出错但不是数据本身的问题（本线程的错误、忙、断言当前库状态失败）：照旧推迟、不入账，以后再合并', { timeout: 300_000 }, async (t) => {

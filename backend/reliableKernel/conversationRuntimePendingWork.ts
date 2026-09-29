@@ -1,5 +1,6 @@
 import type Database from 'better-sqlite3';
 import { prepareCached } from './runtimeStatementCache';
+import { terminalProcessReceiptSql } from './runtimeProcessHistory';
 
 /**
  * A single reader snapshot decides whether an owner may be released. The result is bounded, not the
@@ -81,7 +82,7 @@ export function createConversationRuntimeWorkProbe(
           LEFT JOIN process_receipt AS receipt ON receipt.process_id = process_row.id
           LEFT JOIN process_completion_dispatch AS dispatch ON dispatch.process_receipt_id = receipt.id
          WHERE source.conversation_id = @conversationId AND (
-           process_row.status = 'running' OR receipt.id IS NULL
+           NOT COALESCE(${terminalProcessReceiptSql()}, 0)
            OR dispatch.state IN ('pending', 'claimed')
            OR (dispatch.id IS NULL AND EXISTS(
              SELECT 1 FROM operation AS exit_operation
