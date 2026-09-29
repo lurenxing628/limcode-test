@@ -119,7 +119,7 @@ export function projectCompressionBlockRecord(database: Database.Database, block
            (
              SELECT revision.message_id
                FROM compression_block_source AS anchor_source
-               JOIN context_segment_source AS segment_source
+               CROSS JOIN context_segment_source AS segment_source
                  ON segment_source.segment_id = anchor_source.segment_id
                 AND segment_source.source_kind = 'message_revision'
                JOIN message_revision AS revision ON revision.id = segment_source.source_id
@@ -672,7 +672,7 @@ export function executeClientProjectionSnapshot(
              (
                SELECT revision.message_id
                  FROM compression_block_source AS anchor_source
-                 JOIN context_segment_source AS segment_source
+                 CROSS JOIN context_segment_source AS segment_source
                    ON segment_source.segment_id = anchor_source.segment_id
                   AND segment_source.source_kind = 'message_revision'
                  JOIN message_revision AS revision
