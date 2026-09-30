@@ -413,6 +413,152 @@ test('长流积压达到阈值时直刷，terminal时立即显示完整文本', 
   assert.match(textPartSource, /\{ animateReplace: true, flushLagChars: 2_048 \}/);
 });
 
+test('long streamed Markdown keeps code-viewer state at terminal while historical bodies still defer', async (context) => {
+  const server = await createViteServer(context);
+  const vue = await import('vue');
+  const pinia = await import('pinia');
+  const previousWindow = globalThis.window;
+  const previousPinia = pinia.getActivePinia();
+  const frames = new Map();
+  let nextFrameId = 0;
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {},
+    requestAnimationFrame(callback) { const id = ++nextFrameId; frames.set(id, callback); return id; },
+    cancelAnimationFrame(id) { frames.delete(id); },
+    setTimeout, clearTimeout,
+    acquireVsCodeApi() { return { postMessage() {}, getState() { return {}; }, setState() {} }; }
+  };
+  const apps = [];
+  context.after(() => {
+    for (const app of apps.reverse()) app.unmount();
+    pinia.setActivePinia(previousPinia);
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+  });
+  const { default: TextPart } = await server.ssrLoadModule('/src/components/content/parts/TextPartView.vue');
+  const renderer = vue.createRenderer({
+    patchProp() {}, insert() {}, remove() {},
+    createElement() { return {}; }, createText() { return {}; }, createComment() { return {}; },
+    setText() {}, setElementText() {}, parentNode() { return null; }, nextSibling() { return null; },
+    querySelector() { return null; }, setScopeId() {}, cloneNode(node) { return node; },
+    insertStaticContent() { return [{}, {}]; }
+  });
+  const mountPart = (props) => {
+    const viewers = [];
+    let state;
+    // The production parser and keys drive a stateful child probe. A gap in renderedParts
+    // unmounts it, just as the production template unmounts CodeBlockViewer for its plain fallback.
+    const Viewer = vue.defineComponent({
+      props: ['code'],
+      setup(viewerProps) {
+        const viewer = { props: viewerProps, softWrap: vue.ref(true), scrollTop: vue.ref(0), unmounted: false };
+        vue.onBeforeUnmount(() => { viewer.unmounted = true; });
+        viewers.push(viewer);
+        return () => null;
+      }
+    });
+    const app = renderer.createApp(vue.defineComponent({
+      setup() {
+        state = TextPart.setup(props, { expose() {} });
+        return () => vue.h('div', state.keyedRenderedParts.value.map(({ part, key }) => part.kind === 'code'
+          ? vue.h(Viewer, { key, code: part.code })
+          : vue.h('span', { key })));
+      }
+    })).use(pinia.createPinia());
+    app.provide(vue.ssrContextKey, { modules: new Set() });
+    apps.push(app);
+    app.mount({});
+    return { state, viewers };
+  };
+  const body = '```js\n' + 'const value = 1;\n'.repeat(2000);
+  const props = vue.reactive({ text: body, streaming: true, streamingPhase: 'writing',
+    showStreamingIndicator: false, markdown: true, preserveSoftBreaks: false });
+  const live = mountPart(props);
+  assert.deepEqual(live.state.renderedParts.value.map(part => part.kind), ['code']);
+  assert.equal(live.viewers.length, 1);
+  const viewer = live.viewers[0];
+  viewer.softWrap.value = false;
+  viewer.scrollTop.value = 5006;
+  props.text += '// final bytes\n```';
+  await vue.nextTick();
+  props.streaming = false;
+  await vue.nextTick();
+  assert.deepEqual(live.state.renderedParts.value.map(part => part.kind), ['code']);
+  assert.equal(live.viewers.length, 1, 'terminal must not replace the existing code-viewer instance');
+  assert.equal(viewer.softWrap.value, false);
+  assert.equal(viewer.scrollTop.value, 5006);
+  assert.match(viewer.props.code, /final bytes/, 'terminal flush includes the final unsmoothed bytes');
+  assert.equal(frames.size, 0, 'an already rendered stream needs no historical fallback frames');
+
+  // Streaming commits the HTML prefix in separate batches, while terminal parsing merges it.
+  // Exercise Vue's child reconciliation, not just the parser's array, so a remount loses state.
+  const prefixedProps = vue.reactive({ ...props, streaming: true,
+    text: 'First paragraph\n\nSecond paragraph ' + 'x'.repeat(2_048) });
+  const prefixed = mountPart(prefixedProps);
+  prefixedProps.text += '\n\n```js\n' + 'const prefixed = 1;\n'.repeat(2_000);
+  await vue.nextTick();
+  assert.deepEqual(prefixed.state.renderedParts.value.map(part => part.kind), ['html', 'html', 'code']);
+  assert.equal(prefixed.viewers.length, 1);
+  const prefixedViewer = prefixed.viewers[0];
+  prefixedViewer.softWrap.value = false;
+  prefixedViewer.scrollTop.value = 5006;
+  prefixedProps.text += '// final bytes\n```';
+  await vue.nextTick();
+  prefixedProps.streaming = false;
+  await vue.nextTick();
+  assert.deepEqual(prefixed.state.renderedParts.value.map(part => part.kind), ['html', 'code']);
+  assert.equal(prefixed.viewers.length, 1, 'combining HTML fragments must preserve the code-viewer instance');
+  assert.equal(prefixedViewer.unmounted, false);
+  assert.equal(prefixedViewer.softWrap.value, false);
+  assert.equal(prefixedViewer.scrollTop.value, 5006);
+  assert.match(prefixedViewer.props.code, /final bytes/);
+
+  const multiProps = vue.reactive({ ...props, streaming: true,
+    text: 'P1 ' + 'a'.repeat(2_048) + '\n\nP2 ' + 'b'.repeat(2_048) });
+  const multi = mountPart(multiProps);
+  multiProps.text += '\n\nP3 ' + 'c'.repeat(2_048);
+  await vue.nextTick();
+  multiProps.text += '\n\n```js\n' + 'const first = 1;\n'.repeat(2_000)
+    + '```\n\nBetween codes\n\n```js\nsecond();\n';
+  await vue.nextTick();
+  assert.deepEqual(multi.state.renderedParts.value.map(part => part.kind),
+    ['html', 'html', 'html', 'code', 'html', 'code']);
+  assert.equal(multi.viewers.length, 2);
+  const [firstViewer, secondViewer] = multi.viewers;
+  firstViewer.softWrap.value = false;
+  firstViewer.scrollTop.value = 5006;
+  secondViewer.scrollTop.value = 8008;
+  multiProps.text += '```';
+  await vue.nextTick();
+  multiProps.streaming = false;
+  await vue.nextTick();
+  assert.deepEqual(multi.state.renderedParts.value.map(part => part.kind), ['html', 'code', 'html', 'code']);
+  assert.equal(multi.viewers.length, 2, 'terminal parsing must not create or exchange either code viewer');
+  assert.equal(firstViewer.unmounted, false);
+  assert.equal(secondViewer.unmounted, false);
+  assert.match(firstViewer.props.code, /const first = 1;/, 'the first instance must still own the first code');
+  assert.doesNotMatch(firstViewer.props.code, /second\(\);/);
+  assert.match(secondViewer.props.code, /second\(\);/, 'the second instance must still own the second code');
+  assert.equal(firstViewer.softWrap.value, false);
+  assert.equal(firstViewer.scrollTop.value, 5006);
+  assert.equal(secondViewer.scrollTop.value, 8008);
+  assert.equal(frames.size, 0);
+
+  const history = mountPart(vue.reactive({ ...props, text: body + '```', streaming: false }));
+  assert.deepEqual(history.state.renderedParts.value, []);
+  assert.equal(history.viewers.length, 0);
+  const runFrame = async () => {
+    const batch = [...frames.values()]; frames.clear();
+    for (const callback of batch) callback(performance.now());
+    await vue.nextTick();
+  };
+  await runFrame();
+  assert.deepEqual(history.state.renderedParts.value, [], 'pure history still paints plain text for its first frame');
+  await runFrame();
+  assert.deepEqual(history.state.renderedParts.value.map(part => part.kind), ['code']);
+  assert.equal(history.viewers.length, 1, 'pure history renders its code viewer after the deferred parse');
+});
+
 test('failure without assistant output keeps an exact eligible request retry and never invents a Message', async (context) => {
   const server = await createViteServer(context);
   const { projectReliableConversation, modelRequestRetryForTurn, projectReliableTurnTermination } = await server.ssrLoadModule('/src/domain/reliableConversationProjection.ts');
@@ -456,13 +602,39 @@ test('failure without assistant output keeps an exact eligible request retry and
   const events = [];
   const app = vue.createSSRApp({});
   app.provide(vue.ssrContextKey, { modules: new Set() });
-  const state = app.runWithContext(() => row.setup(props, { emit: (...event) => events.push(event), expose() {} }));
+  const scope = vue.effectScope();
+  context.after(() => scope.stop());
+  const state = app.runWithContext(() => scope.run(() => row.setup(props, { emit: (...event) => events.push(event), expose() {} })));
   state.confirmingRequestId.value = 'request';
+  const refreshed = projectReliableConversation({ conversationId: 'conversation', records, details: {
+    'message-content:revision': ready(JSON.stringify({ role: 'user', parts: [{ text: 'hydrated user input' }] }))
+  } });
+  assert.notStrictEqual(refreshed.terminationByMessageId.user, props.termination);
+  props.termination = refreshed.terminationByMessageId.user;
+  await vue.nextTick();
+  assert.equal(state.confirmingRequestId.value, 'request', 'detail hydration must preserve confirmation for the same durable failure');
+  props.termination = { ...props.termination, detail: 'refreshed failure presentation' };
+  await vue.nextTick();
+  assert.equal(state.confirmingRequestId.value, 'request', 'presentation-only refresh must not cancel the selected retry');
   state.confirmRetry(); state.confirmRetry();
   assert.deepEqual(events, [['retry', 'request']], 'double confirmation can submit only the captured exact request once');
   state.confirmingRequestId.value = 'request'; props.retryModelRequestId = 'newer';
   state.confirmRetry();
   assert.equal(events.length, 1, 'a stale confirmation cannot silently switch targets');
+  await vue.nextTick();
+  const closesConfirmation = async (change, message) => {
+    state.confirmingRequestId.value = 'newer';
+    change();
+    await vue.nextTick();
+    assert.equal(state.confirmingRequestId.value, undefined, message);
+  };
+  await closesConfirmation(() => { props.retryModelRequestId = 'latest'; }, 'a different request closes the old confirmation');
+  props.retryModelRequestId = 'newer'; await vue.nextTick();
+  await closesConfirmation(() => { props.termination = { ...props.termination, id: 'different-termination' }; }, 'a different durable failure closes confirmation');
+  await closesConfirmation(() => { props.termination = { ...props.termination, kind: 'interrupted' }; }, 'a changed termination status closes confirmation');
+  await closesConfirmation(() => { props.retryBlockedReason = 'context changed'; }, 'lost retry eligibility closes confirmation');
+  props.retryBlockedReason = undefined; await vue.nextTick();
+  await closesConfirmation(() => { props.retryPending = true; }, 'a pending retry closes confirmation');
   state.confirmingRequestId.value = 'newer'; props.retryPending = true; state.confirmRetry();
   assert.equal(events.length, 1, 'pending retry remains locked');
   assert.match(source('webview/src/components/conversation/ReliableMessageList.vue'), /if \(conversationActionPending\.value\) return;/);

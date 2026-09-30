@@ -37,11 +37,21 @@ const { displayedText, replacing: replaceAnimating } = useSmoothStreamingText(
   { animateReplace: true, flushLagChars: 2_048 }
 );
 const renderedParts = shallowRef<MarkdownRenderedPart[]>([]);
+const keyedRenderedParts = computed(() => {
+  let codeOrdinal = 0;
+  return renderedParts.value.map((part, index) => ({
+    part,
+    // Streaming may split HTML into several prefix fragments that final parsing combines.
+    // A code viewer belongs to its code-block ordinal, independent of those HTML fragments.
+    key: part.kind === 'code' ? `code-${codeOrdinal++}` : `html-${index}`
+  }));
+});
 const streamingMarkdownRenderer = createStreamingMarkdownPartsRenderer();
 const DEFERRED_FINAL_MARKDOWN_CHARACTERS = 16 * 1024;
 let deferredMarkdownFirstFrame: number | undefined;
 let deferredMarkdownSecondFrame: number | undefined;
 let markdownRenderGeneration = 0;
+let hasRenderedStreamingMarkdown = false;
 // Streaming Markdown follows displayedText synchronously; only a large, already-final historical
 // body yields one paint so its readable plain-text fallback appears before rich parsing.
 const markdownReady = computed(() => props.markdown);
@@ -58,13 +68,17 @@ function renderCurrentMarkdown(): void {
   if (!markdownReady.value) {
     streamingMarkdownRenderer.reset();
     renderedParts.value = [];
+    hasRenderedStreamingMarkdown = false;
     return;
   }
 
   // A historical body arrives atomically. Paint its plain text first so a long final Markdown parse
   // cannot keep the tail row blank for another frame; rich formatting replaces it after that paint.
   const effectivelyStreaming = props.streaming || displayedText.value !== props.text;
-  if (!effectivelyStreaming && displayedText.value.length >= DEFERRED_FINAL_MARKDOWN_CHARACTERS) {
+  // A part that already rendered during a stream owns live code viewers. Keep those children
+  // mounted when the stream finishes, including any final bytes flushed by the smoothing layer.
+  if (!effectivelyStreaming && !hasRenderedStreamingMarkdown
+    && displayedText.value.length >= DEFERRED_FINAL_MARKDOWN_CHARACTERS) {
     streamingMarkdownRenderer.reset();
     renderedParts.value = [];
     deferredMarkdownFirstFrame = window.requestAnimationFrame(() => {
@@ -88,10 +102,12 @@ function renderMarkdownNow(effectivelyStreaming: boolean): void {
       streaming: effectivelyStreaming,
       preserveSoftBreaks: props.preserveSoftBreaks
     });
+    if (props.streaming && renderedParts.value.length > 0) hasRenderedStreamingMarkdown = true;
   } catch (error) {
     streamingMarkdownRenderer.reset();
     console.warn('[LimCode] Failed to render markdown.', error);
     renderedParts.value = [];
+    hasRenderedStreamingMarkdown = false;
   }
 }
 
@@ -108,12 +124,6 @@ function cancelDeferredMarkdownRender(): number {
   return markdownRenderGeneration;
 }
 
-function markdownPartKey(part: MarkdownRenderedPart, index: number): string {
-  // Content growth is a prop update, not a new logical Markdown block. Keeping this key stable
-  // preserves code-block selection, copy feedback and scroll state while deltas append.
-  return `${part.kind}-${index}`;
-}
-
 function handleMarkdownClick(event: MouseEvent): void {
   const element = event.target instanceof Element ? event.target : undefined;
   const link = element?.closest(`a[${LOCAL_FILE_LINK_DATA_ATTRIBUTE}]`);
@@ -128,7 +138,7 @@ function handleMarkdownClick(event: MouseEvent): void {
 <template>
   <div v-if="markdownReady" class="rc-markdown-shell" :class="{ streaming, replacing: replaceAnimating }">
     <template v-if="renderedParts.length">
-      <template v-for="(part, index) in renderedParts" :key="markdownPartKey(part, index)">
+      <template v-for="{ part, key } in keyedRenderedParts" :key="key">
         <div v-if="part.kind === 'html'" class="rc-markdown" v-html="part.html" @click="handleMarkdownClick"></div>
         <CodeBlockViewer v-else class="rc-code-block" :code="part.code" :language="part.language" :info="part.info" />
       </template>

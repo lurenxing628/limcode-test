@@ -142,3 +142,178 @@ test('offscreen nowrap width accounts for wide Unicode and tabs', async () => {
     assert.ok(codeLineAnchorOffset(heights, { index: 0, fraction: 1 }) < 19, 'within-line offset never moves into the next line');
   } finally { await server.close(); }
 });
+
+test('code-block content updates retain the reading line and pixel offset through real watchers and measurements', async () => {
+  const server = await createWebviewSsrServer();
+  const vue = require('vue');
+  const scope = vue.effectScope();
+  try {
+    const { default: CodeBlock } = await server.ssrLoadModule('/src/components/content/CodeBlockViewer.vue');
+    const { codeLineAnchor } = await server.ssrLoadModule('/src/domain/codeLineWindow.ts');
+    const props = vue.reactive({ code: 'a'.repeat(10000), language: 'js', info: '' });
+    let state;
+    // Call actual setup outside Vue's SSR setup phase, which deliberately skips normal watchers.
+    // Mounted-only observers stay inactive; production measureRows reads synthetic row geometry.
+    const app = createSSRApp({});
+    app.provide(vue.ssrContextKey, { modules: new Set() });
+    const warnings = [];
+    const warn = console.warn;
+    try {
+      console.warn = (...args) => warnings.push(args.join(' '));
+      state = app.runWithContext(() => scope.run(() => CodeBlock.setup(props, { expose() {} })));
+    } finally { console.warn = warn; }
+    assert.equal(warnings.length, 2);
+    assert.ok(warnings.some(warning => /onMounted.*no active component instance/.test(warning)));
+    assert.ok(warnings.some(warning => /onBeforeUnmount.*no active component instance/.test(warning)));
+    const rows = new Map();
+    const actualHeight = index => Math.max(19, state.lines.value[index]?.length ?? 0);
+    const scrollHeight = () => {
+      const range = state.windowRange.value;
+      let height = range.before + range.after + 18;
+      for (let index = range.start; index < range.end; index++) height += actualHeight(index);
+      return height;
+    };
+    let domTop = 0;
+    const scroller = {
+      clientWidth: 400,
+      get clientHeight() { return Math.min(520, scrollHeight()); },
+      get scrollHeight() { return scrollHeight(); },
+      get scrollTop() { return domTop; },
+      set scrollTop(value) { domTop = Math.max(0, Math.min(value, scrollHeight() - this.clientHeight)); },
+      querySelectorAll() {
+        const range = state.windowRange.value;
+        const visible = [];
+        for (let index = range.start; index < range.end; index++) {
+          if (!rows.has(index)) rows.set(index, {
+            dataset: { lineIndex: String(index) },
+            getBoundingClientRect: () => ({ height: actualHeight(index), width: 400 })
+          });
+          visible.push(rows.get(index));
+        }
+        return visible;
+      }
+    };
+    state.scroller.value = scroller;
+    const measure = async () => {
+      await vue.nextTick();
+      state.measureRows();
+      await vue.nextTick();
+    };
+    await measure();
+    scroller.scrollTop = 5006;
+    state.onScroll();
+    for (const suffix of ['b'.repeat(1000), 'c'.repeat(10000)]) {
+      props.code += suffix;
+      await vue.nextTick();
+      state.onScroll(); // The browser's event for our own synchronized/clamped write is inert.
+      await measure();
+      assert.equal(scroller.scrollTop, 5006, 'appending to the visible wrapped line must keep its already-read prefix');
+      assert.equal(state.scrollTop.value, 5000);
+    }
+
+    props.code = `${'p'.repeat(2000)}\n${'a'.repeat(10000)}\ntail`;
+    await measure();
+    scroller.scrollTop = 2506;
+    state.onScroll();
+    props.code = `${'p'.repeat(100)}\n${'a'.repeat(10000)}\ntail`;
+    await measure();
+    assert.equal(scroller.scrollTop, 606, 'shrinking a preceding line retains logical line 2 and its 500px reading offset');
+    props.code = `${'p'.repeat(10000)}\n${'a'.repeat(10000)}\ntail`;
+    await measure();
+    assert.equal(scroller.scrollTop, 10506, 'growing a preceding line shifts only the preserved line prefix');
+
+    props.code = `${'p'.repeat(10000)}\nshort\ntail`;
+    await measure();
+    assert.equal(scroller.scrollTop, scrollHeight() - scroller.clientHeight, 'a shortened reading line clamps to the actual scroll range');
+    props.code = 'short';
+    await measure();
+    assert.equal(scroller.scrollTop, 0, 'replacement with short content cannot keep a stale position beyond the new end');
+    assert.equal(state.windowRange.value.end, 1);
+    const settledRevision = state.heightRevision.value;
+    await measure();
+    assert.equal(state.heightRevision.value, settledRevision, 'unchanged measurements settle after consuming the content anchor');
+
+    props.code = Array.from({ length: 200 }, (_, index) => `line-${index}`).join('\n');
+    await measure();
+    scroller.scrollTop = 1006;
+    state.onScroll();
+    props.code += '\nnew-output';
+    await vue.nextTick();
+    scroller.scrollTop = 1306;
+    state.onScroll();
+    await measure();
+    assert.equal(scroller.scrollTop, 1306, 'a user scroll after the content watcher supersedes its pending reading anchor');
+
+    props.code += '\nundelivered-output';
+    await vue.nextTick();
+    await vue.nextTick();
+    scroller.scrollTop = 1456;
+    await measure();
+    assert.equal(scroller.scrollTop, 1456, 'measurement first adopts a new DOM position even when its scroll event is still pending');
+    assert.equal(state.scrollTop.value, 1450);
+
+    props.code += '\nnext-output';
+    await vue.nextTick();
+    state.measureRows();
+    scroller.scrollTop = 1606;
+    state.onScroll();
+    await vue.nextTick();
+    assert.equal(scroller.scrollTop, 1606, 'a queued measurement restore cannot overwrite a newer delivered user scroll');
+
+    props.code += '\nmore-output';
+    await vue.nextTick();
+    state.measureRows();
+    scroller.scrollTop = 1906; // Scroll event delivery can lag behind the compositor's DOM position.
+    await vue.nextTick();
+    assert.equal(scroller.scrollTop, 1906, 'a queued measurement restore checks the DOM even before the scroll event arrives');
+    assert.equal(state.scrollTop.value, 1900);
+
+    props.code += '\nlast-output';
+    await Promise.resolve(); // Watcher ran; its nextTick restore has not run yet.
+    assert.equal(state.heights.value.count, 205);
+    scroller.scrollTop = 2206;
+    await vue.nextTick();
+    assert.equal(scroller.scrollTop, 2206, 'the content watcher nextTick restore also respects an undelivered new user scroll');
+    await measure();
+    const userSettledRevision = state.heightRevision.value;
+    await measure();
+    assert.equal(state.heightRevision.value, userSettledRevision, 'superseded anchors do not leave continuing measurement work');
+
+    props.code += '\nresized-output';
+    await vue.nextTick();
+    await vue.nextTick();
+    scroller.scrollTop = 2336;
+    state.syncScroll(false); // A viewport observer only synchronizes layout, not a user scroll.
+    await measure();
+    assert.equal(scroller.scrollTop, 2336, 'layout synchronization cannot hide an undelivered user scroll from measurement');
+
+    scroller.scrollTop = 2406;
+    const wrapAnchor = codeLineAnchor(state.heights.value, scroller.scrollTop - 6);
+    state.toggleWrap();
+    await measure();
+    assert.deepEqual(codeLineAnchor(state.heights.value, scroller.scrollTop - 6), wrapAnchor,
+      'wrap reset captures the newest DOM reading line even before its scroll event arrives');
+    const wrapSettledRevision = state.heightRevision.value;
+    await measure();
+    assert.equal(state.heightRevision.value, wrapSettledRevision, 'wrap reset also consumes its preserved anchor once');
+  } finally {
+    scope.stop();
+    await server.close();
+  }
+});
+
+test('content reading anchors clamp removed lines and keep pixel offsets when a line grows', async () => {
+  const server = await createWebviewSsrServer();
+  try {
+    const { CodeLineHeights, codeLineReadingAnchor, codeLineReadingAnchorOffset } = await server.ssrLoadModule('/src/domain/codeLineWindow.ts');
+    const old = new CodeLineHeights(100, 19);
+    old.set(50, 10000);
+    const anchor = codeLineReadingAnchor(old, old.offset(50) + 5000);
+    old.set(50, 20000);
+    assert.equal(codeLineReadingAnchorOffset(old, anchor), old.offset(50) + 5000);
+    const shortened = new CodeLineHeights(2, 19);
+    const position = codeLineReadingAnchorOffset(shortened, anchor);
+    assert.ok(position >= shortened.offset(1) && position < shortened.offset(2), 'a removed reading line falls back inside the last retained line');
+    assert.equal(codeLineReadingAnchorOffset(new CodeLineHeights(0, 19), anchor), 0);
+  } finally { await server.close(); }
+});

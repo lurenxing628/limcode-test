@@ -52,6 +52,16 @@ export function codeLineAnchorOffset(heights: CodeLineHeights, anchor: { index: 
   return heights.offset(anchor.index) + Math.min(Math.max(0, heights.height(anchor.index) - 0.1), heights.height(anchor.index) * anchor.fraction);
 }
 
+/** Content growth retains the already-read prefix, rather than moving with the line's new height. */
+export function codeLineReadingAnchor(heights: CodeLineHeights, scrollTop: number) {
+  const index = heights.indexAt(Math.max(0, scrollTop));
+  return { index, offset: Math.max(0, scrollTop - heights.offset(index)) };
+}
+export function codeLineReadingAnchorOffset(heights: CodeLineHeights, anchor: { index: number; offset: number }): number {
+  const index = Math.min(Math.max(0, heights.count - 1), Math.max(0, anchor.index));
+  return heights.offset(index) + Math.min(Math.max(0, heights.height(index) - 0.1), Math.max(0, anchor.offset));
+}
+
 /** Never re-observe unchanged rows: ResizeObserver sends an initial notification on observe(). */
 export function syncCodeLineObservers<T>(
   observer: { observe(row: T): void; unobserve(row: T): void } | undefined,

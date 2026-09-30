@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
-import { CodeLineHeights, codeLineWindow, codeLineAnchor, codeLineAnchorOffset, syncCodeLineObservers, codeLineColumns } from '@webview/domain/codeLineWindow';
+import { CodeLineHeights, codeLineWindow, codeLineAnchor, codeLineAnchorOffset, codeLineReadingAnchor, codeLineReadingAnchorOffset, syncCodeLineObservers, codeLineColumns } from '@webview/domain/codeLineWindow';
 import { IconCheck, IconCopy, IconTextWrap, IconTextWrapDisabled } from '@tabler/icons-vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 
@@ -58,6 +58,10 @@ let mounted = false;
 let measuredWidth = 0;
 const observedRows = new Set<Element>();
 let resizeAnchor: ReturnType<typeof codeLineAnchor> | undefined;
+let contentAnchor: ReturnType<typeof codeLineReadingAnchor> | undefined;
+let scrollGeneration = 0;
+let restoreGeneration = 0;
+let observedScrollTop = 0;
 
 function scheduleMeasure(): void {
   if (!mounted || frame) return;
@@ -67,11 +71,15 @@ function scheduleMeasure(): void {
 function measureRows(): void {
   const element = scroller.value;
   if (!element) return;
+  if (scrollPositionChanged(element, observedScrollTop)) acceptNewScroll();
   const index = heights.value;
   const top = Math.max(0, element.scrollTop - 6);
-  const anchor = resizeAnchor ?? codeLineAnchor(index, top);
+  const anchor = resizeAnchor;
+  const readingAnchor = contentAnchor ?? codeLineReadingAnchor(index, top);
   const resizing = resizeAnchor !== undefined;
+  const contentChanged = contentAnchor !== undefined;
   resizeAnchor = undefined;
+  contentAnchor = undefined;
   let changed = false;
   const currentRows = new Set(element.querySelectorAll<HTMLElement>('.lc-code-block-line'));
   syncCodeLineObservers(rowObserver, observedRows, currentRows);
@@ -85,42 +93,81 @@ function measureRows(): void {
       changed = true;
     }
   }
-  if (changed || resizing) {
+  if (changed || resizing || contentChanged) {
     heightRevision.value++;
-    const nextTop = codeLineAnchorOffset(index, anchor) + (element.scrollTop >= 6 ? 6 : 0);
-    void nextTick(() => {
-      if (!scroller.value || heights.value !== index) return;
-      scroller.value.scrollTop = nextTop;
-      onScroll();
-    });
+    const nextTop = (anchor ? codeLineAnchorOffset(index, anchor) : codeLineReadingAnchorOffset(index, readingAnchor))
+      + (element.scrollTop >= 6 ? 6 : 0);
+    queueScrollRestore(index, nextTop);
   }
 }
 
-function onScroll(): void {
+function syncScroll(recordPosition = true): void {
   if (!scroller.value) return;
-  scrollTop.value = Math.max(0, scroller.value.scrollTop - 6);
+  const top = scroller.value.scrollTop;
+  if (recordPosition) observedScrollTop = top;
+  scrollTop.value = Math.max(0, top - 6);
   viewportHeight.value = scroller.value.clientHeight || 520;
   scheduleMeasure();
+}
+function scrollPositionChanged(element: HTMLElement, previousTop: number): boolean {
+  // Layout may clamp the previous position when content shrinks. That is not a new user scroll.
+  const maximum = Math.max(0, element.scrollHeight - element.clientHeight);
+  return Math.abs(Math.min(element.scrollTop, maximum) - Math.min(previousTop, maximum)) > 1;
+}
+function acceptNewScroll(): void {
+  scrollGeneration++;
+  resizeAnchor = undefined;
+  contentAnchor = undefined;
+  syncScroll();
+}
+function onScroll(): void {
+  if (!scroller.value) return;
+  // Our own writes synchronize their clamped DOM position before the browser scroll event arrives.
+  // A different position therefore supersedes pending anchors and deferred restores.
+  if (scrollPositionChanged(scroller.value, observedScrollTop)) acceptNewScroll();
+  else syncScroll();
+}
+function queueScrollRestore(index: CodeLineHeights, nextTop: number): void {
+  const element = scroller.value;
+  if (!element) return;
+  const generation = scrollGeneration;
+  const restore = ++restoreGeneration;
+  const previousTop = element.scrollTop;
+  void nextTick(() => {
+    if (scroller.value !== element || heights.value !== index || scrollGeneration !== generation || restoreGeneration !== restore) return;
+    // A compositor/user scroll can change the DOM before its scroll event reaches this component.
+    if (scrollPositionChanged(element, previousTop)) { acceptNewScroll(); return; }
+    element.scrollTop = nextTop;
+    syncScroll();
+  });
 }
 
 watch(lines, (current, previous) => {
   measuredContentWidth.value = 0;
+  if (scroller.value && scrollPositionChanged(scroller.value, observedScrollTop)) acceptNewScroll();
   const old = heights.value;
-  heights.value = new CodeLineHeights(current.length, 19, (index) =>
-    current[index] === previous[index] ? old.height(index) || 19 : 19);
-  // Replacement/shrinking content may leave the old scroll position beyond the new end.
-  scrollTop.value = Math.min(scrollTop.value, Math.max(0, heights.value.offset(current.length) - viewportHeight.value));
-  void nextTick(() => { onScroll(); scheduleMeasure(); });
+  const top = scroller.value ? Math.max(0, scroller.value.scrollTop - 6) : scrollTop.value;
+  if (!resizeAnchor) contentAnchor = contentAnchor ?? codeLineReadingAnchor(old, top);
+  const anchorIndex = Math.min(current.length - 1, (resizeAnchor ?? contentAnchor)!.index);
+  if (resizeAnchor) resizeAnchor = { ...resizeAnchor, index: anchorIndex };
+  // Keep the reading line's old height until its replacement is measured. A 19px estimate would
+  // temporarily clamp a long line's pixel offset and let the DOM scroll position select a new line.
+  const index = new CodeLineHeights(current.length, 19, (position) =>
+    position === anchorIndex || current[position] === previous[position] ? old.height(position) || 19 : 19);
+  heights.value = index;
+  scrollTop.value = resizeAnchor ? codeLineAnchorOffset(index, resizeAnchor) : codeLineReadingAnchorOffset(index, contentAnchor!);
+  const padding = scroller.value && scroller.value.scrollTop >= 6 ? 6 : 0;
+  queueScrollRestore(index, scrollTop.value + padding);
 });
 function resetMeasurements(): void {
-  resizeAnchor = resizeAnchor ?? codeLineAnchor(heights.value, scrollTop.value);
-  heights.value = new CodeLineHeights(lines.value.length, 19);
-  scrollTop.value = codeLineAnchorOffset(heights.value, resizeAnchor);
-  void nextTick(() => {
-    if (scroller.value) scroller.value.scrollTop = scrollTop.value + (scrollTop.value > 0 ? 6 : 0);
-    viewportHeight.value = scroller.value?.clientHeight || 520;
-    scheduleMeasure();
-  });
+  if (scroller.value && scrollPositionChanged(scroller.value, observedScrollTop)) acceptNewScroll();
+  const top = contentAnchor ? codeLineReadingAnchorOffset(heights.value, contentAnchor) : scrollTop.value;
+  resizeAnchor = resizeAnchor ?? codeLineAnchor(heights.value, top);
+  contentAnchor = undefined;
+  const index = new CodeLineHeights(lines.value.length, 19);
+  heights.value = index;
+  scrollTop.value = codeLineAnchorOffset(index, resizeAnchor);
+  queueScrollRestore(index, scrollTop.value + (scrollTop.value > 0 ? 6 : 0));
 }
 watch(softWrap, resetMeasurements);
 watch(() => [windowRange.value.start, windowRange.value.end], () => { void nextTick(scheduleMeasure); });
@@ -133,10 +180,10 @@ onMounted(() => {
       measuredWidth = width;
       if (softWrap.value) { resetMeasurements(); return; }
     }
-    onScroll();
+    syncScroll(false);
   });
   if (scroller.value) viewportObserver.observe(scroller.value);
-  onScroll();
+  syncScroll();
 });
 
 onBeforeUnmount(() => {

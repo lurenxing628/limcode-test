@@ -14,7 +14,15 @@ const props = defineProps<{
 const emit = defineEmits<{ (event: 'dismiss'): void; (event: 'retry', modelRequestId: string): void }>();
 const confirmingRequestId = ref<string>();
 const retryBlocked = computed(() => props.retryPending || !props.retryModelRequestId || Boolean(props.retryBlockedReason));
-watch(() => [props.retryModelRequestId, props.retryBlockedReason, props.retryPending, props.termination.id], () => {
+// Projection refreshes replace the termination object even when its durable identity is unchanged.
+// Close an open confirmation only when the captured target or its eligibility actually changes.
+watch([
+  () => props.retryModelRequestId,
+  () => props.retryBlockedReason,
+  () => props.retryPending,
+  () => props.termination.id,
+  () => props.termination.kind
+], () => {
   confirmingRequestId.value = undefined;
 });
 function confirmRetry(): void {
