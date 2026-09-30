@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
+import { constants } from 'node:fs';
 import { createRequire } from 'node:module';
 import { after, test } from 'node:test';
 
@@ -26,7 +28,7 @@ const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
 const { isCanonicalPathInside, isPathBelow, isPathInside, isSamePath } = dist('backend/capabilities/filesystem/pathContainment.js');
 const { realPath } = dist('backend/capabilities/filesystem/realPath.js');
 const { FileMutationDispatcher } = dist('backend/reliableKernel/fileEffects.js');
-const { captureFilePlanningRoot } = dist('backend/reliableKernel/fileTargetBoundary.js');
+const { captureFilePlanningRoot, fileDescriptorMatchesPathState, readFileWithIdentityFence } = dist('backend/reliableKernel/fileTargetBoundary.js');
 const { readFileTool } = dist('backend/world/modules/tools/definitions/readFile/index.js');
 const { normalizeDisplayPath } = dist('shared/displayPath.js');
 const { VscodeReliableToolHost } = dist('backend/application/reliableKernel/VscodeReliableToolHost.js');
@@ -90,6 +92,119 @@ test('文件写入/删除边界接受根目录本身带分隔符的工作区（�
     });
     assert.equal(actual.kind, 'known', `${targetPath}: ${actual.error ?? ''}`);
     assert.match(actual.digest, /^[0-9a-f]{64}$/);
+  }
+});
+
+function identityStat(overrides = {}) {
+  return { dev: 0x1234_5678_89ab_cdefn, ino: 0x0020_0000_0000_0001n, mode: 0o100644n,
+    size: 4n, mtimeNs: 1_700_000_000_000_000_100n, ctimeNs: 1_700_000_000_000_000_200n,
+    isFile: () => true, ...overrides };
+}
+
+test('Windows 只在路径到句柄比较时接受卷序列号的 64/32 位差异，其余身份逐字段精确匹配', () => {
+  const pathname = identityStat();
+  const descriptor = identityStat({ dev: BigInt.asUintN(32, pathname.dev) });
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    assert.equal(fileDescriptorMatchesPathState(pathname, pathname, platform), true);
+    assert.equal(fileDescriptorMatchesPathState(pathname, descriptor, platform), platform === 'win32');
+    assert.equal(fileDescriptorMatchesPathState(descriptor, pathname, platform), false, 'never normalize the reverse direction');
+  }
+  for (const field of ['dev', 'ino', 'mode', 'size', 'mtimeNs', 'ctimeNs']) {
+    assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, [field]: descriptor[field] + 1n }, 'win32'), false, field);
+  }
+  assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, dev: pathname.dev + (1n << 32n) }, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState(identityStat({ dev: 0n }), descriptor, 'win32'), false, 'zero is not an unknown-device wildcard');
+  assert.equal(fileDescriptorMatchesPathState(undefined, descriptor, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState(identityStat({ isFile: () => false }), descriptor, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, isFile: () => false }, 'win32'), false);
+});
+
+test('Windows 读取栅栏分别保留路径与句柄的完整设备身份', async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  for (const changed of ['none', 'pathname-high-bits', 'descriptor-high-bits', 'non-regular']) {
+    await t.test(changed, async (sub) => {
+      const pathname = identityStat();
+      const descriptor = identityStat({ dev: BigInt.asUintN(32, pathname.dev), isFile: () => changed !== 'non-regular' });
+      let stats = 0, reads = 0, closes = 0;
+      sub.mock.method(fs, 'open', async () => ({
+        async stat() { return ++stats === 2 && changed === 'descriptor-high-bits'
+          ? { ...descriptor, dev: descriptor.dev + (1n << 32n) } : descriptor; },
+        async readFile() { reads++; return Buffer.from('base'); },
+        async close() { closes++; }
+      }));
+      sub.mock.method(fs, 'lstat', async () => changed === 'pathname-high-bits'
+        ? { ...pathname, dev: pathname.dev + (1n << 32n) } : pathname);
+      const read = readFileWithIdentityFence('synthetic-target', pathname, async () => {});
+      if (changed === 'none') assert.equal((await read).toString(), 'base');
+      else await assert.rejects(read, /identity or type changed|changed while/);
+      assert.equal(reads, changed === 'non-regular' ? 0 : 1);
+      assert.equal(closes, 1);
+    });
+  }
+});
+
+async function replacementFixture(t) {
+  const rootPath = await temporaryDirectory(t);
+  const target = path.join(rootPath, 'replace.txt');
+  await fs.writeFile(target, 'base');
+  const digest = value => createHash('sha256').update(value).digest('hex');
+  const member = { memberId: 'replace', memberSeq: '1', operation: 'replace_file', workEnvironmentId: 'workspace',
+    planningRoot: await captureFilePlanningRoot(rootPath), targetPath: 'replace.txt',
+    baseDigest: digest('base'), targetDigest: digest('replaced') };
+  const dispatcher = {
+    resolveBoundary: id => ({ id, rootPath }),
+    readTargetBytes: async () => Buffer.from('replaced'),
+    inspectActual: input => FileMutationDispatcher.prototype.inspectActual.call(dispatcher, input)
+  };
+  return { target, apply: () => FileMutationDispatcher.prototype.applyMember.call(dispatcher, member) };
+}
+
+test('原生文件身份允许读取与替换未变化的普通文件（Windows CI 使用真实 lstat/fstat）', async (t) => {
+  const fixture = await replacementFixture(t);
+  const actual = await fixture.apply();
+  assert.equal(actual.outcome, 'succeeded', actual.error);
+  assert.equal(await fs.readFile(fixture.target, 'utf8'), 'replaced');
+});
+
+test('Windows 替换栅栏允许 64/32 位卷序列号差异，但拒绝任何单接口身份变化', async (t) => {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  t.after(() => Object.defineProperty(process, 'platform', platform));
+  for (const changed of ['none', 'pathname-high-bits', 'descriptor-high-bits']) {
+    await t.test(changed, async (sub) => {
+      const fixture = await replacementFixture(sub);
+      const pathnameDev = 0x1234_5678_89ab_cdefn;
+      const descriptorDev = BigInt.asUintN(32, pathnameDev);
+      const realLstat = fs.lstat, realOpen = fs.open;
+      let writableStats = 0;
+      sub.mock.method(fs, 'lstat', async (target, ...args) => {
+        const stat = await realLstat(target, ...args);
+        if (String(target) === fixture.target && args[0]?.bigint) {
+          stat.dev = pathnameDev + (changed === 'pathname-high-bits' && writableStats >= 2 ? 1n << 32n : 0n);
+        }
+        return stat;
+      });
+      sub.mock.method(fs, 'open', async (target, flags, ...args) => {
+        const handle = await realOpen(target, flags, ...args);
+        if (String(target) === fixture.target) {
+          const writable = typeof flags === 'number' && (flags & constants.O_RDWR) !== 0;
+          const realStat = handle.stat.bind(handle);
+          handle.stat = async (...statArgs) => {
+            const stat = await realStat(...statArgs);
+            if (writable) writableStats++;
+            stat.dev = descriptorDev + (writable && changed === 'descriptor-high-bits' && writableStats >= 2 ? 1n << 32n : 0n);
+            return stat;
+          };
+        }
+        return handle;
+      });
+      const actual = await fixture.apply();
+      assert.equal(actual.outcome, changed === 'none' ? 'succeeded' : 'conflict', actual.error);
+      assert.equal(writableStats, 2, 'exercise both writable descriptor fences');
+      assert.equal(await fs.readFile(fixture.target, 'utf8'), changed === 'none' ? 'replaced' : 'base');
+    });
   }
 });
 

@@ -19,7 +19,7 @@ import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
-import { assertFilePlanningRoot, FileMutationNotStartedError, FilePathConflictError, fileStateIdentity, normalizeFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, withFileMutationTargets, type FilePlanningRoot } from './fileTargetBoundary';
+import { assertFilePlanningRoot, FileMutationNotStartedError, FilePathConflictError, fileDescriptorMatchesPathState, fileStateIdentity, normalizeFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, withFileMutationTargets, type FilePlanningRoot } from './fileTargetBoundary';
 import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 
 export type FileChangeOperation =
@@ -1382,19 +1382,18 @@ export class FileMutationDispatcher {
           const handle = await fs.open(resolved, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
           try {
             const stat = await handle.stat({ bigint: true });
-            if (!stat.isFile() || before.kind !== 'known' || !sameFileState(before.identity, stat)) {
+            if (before.kind !== 'known' || !fileDescriptorMatchesPathState(before.state, stat)) {
               return memberObservation(member, 'conflict', null, 'Opened file target identity or type changed before replacement.');
             }
             const current = await handle.readFile({ signal });
             const afterRead = await handle.stat({ bigint: true });
-            if (before.kind !== 'known' || !sameFileState(before.identity, stat)
-              || !sameFileState(fileIdentity(stat), afterRead)
+            if (!sameFileState(stat, afterRead)
               || digestBytes(current) !== member.baseDigest) {
               return memberObservation(member, 'conflict', digestBytes(current), 'File target changed before replacement.');
             }
             await resolveBoundedTarget(this.resolveBoundary, member);
             const pathStat = await fs.lstat(resolved, { bigint: true });
-            if (!sameFileState(fileIdentity(afterRead), pathStat)) {
+            if (!sameFileState(before.state, pathStat)) {
               return memberObservation(member, 'conflict', null, 'File target identity changed before replacement.');
             }
             if (signal?.aborted) return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
@@ -1481,7 +1480,7 @@ export class FileMutationDispatcher {
 }
 
 type PathInspection =
-  | { kind: 'known'; digest: string | null; symlink: boolean; identity?: string; error?: undefined }
+  | { kind: 'known'; digest: string | null; symlink: boolean; state?: BigIntStats; error?: undefined }
   | { kind: 'conflict'; digest: null; symlink: false; error: string }
   | { kind: 'unknown'; digest: null; symlink: false; error: string };
 
@@ -1513,12 +1512,11 @@ async function refuseSqliteDatabaseTarget(
 async function inspectPath(target: string, checkBoundary: () => Promise<unknown>, signal?: AbortSignal): Promise<PathInspection> {
   try {
     const stat = await fs.lstat(target, { bigint: true });
-    const identity = fileIdentity(stat);
-    if (stat.isSymbolicLink()) return { kind: 'known', digest: 'symlink', symlink: true, identity };
-    if (stat.isDirectory()) return { kind: 'known', digest: DIRECTORY_DIGEST, symlink: false, identity };
-    if (!stat.isFile()) return { kind: 'known', digest: `other:${stat.mode}`, symlink: false, identity };
+    if (stat.isSymbolicLink()) return { kind: 'known', digest: 'symlink', symlink: true, state: stat };
+    if (stat.isDirectory()) return { kind: 'known', digest: DIRECTORY_DIGEST, symlink: false, state: stat };
+    if (!stat.isFile()) return { kind: 'known', digest: `other:${stat.mode}`, symlink: false, state: stat };
     const bytes = await readFileWithIdentityFence(target, stat, checkBoundary, signal);
-    return { kind: 'known', digest: digestBytes(bytes), symlink: false, identity };
+    return { kind: 'known', digest: digestBytes(bytes), symlink: false, state: stat };
   } catch (error) {
     if (signal?.aborted) throw signal.reason ?? error;
     if (error instanceof FilePathConflictError) return { kind: 'conflict', digest: null, symlink: false, error: error.message };
@@ -1527,16 +1525,13 @@ async function inspectPath(target: string, checkBoundary: () => Promise<unknown>
   }
 }
 
-function fileIdentity(stat: BigIntStats): string {
-  return fileStateIdentity(stat);
-}
-function sameFileState(identity: string | undefined, stat: BigIntStats): boolean {
-  return identity === fileIdentity(stat);
+function sameFileState(left: BigIntStats | undefined, right: BigIntStats | undefined): boolean {
+  return left && right ? fileStateIdentity(left) === fileStateIdentity(right) : left === right;
 }
 function digestBytes(bytes: Buffer): string { return createHash('sha256').update(bytes).digest('hex'); }
 function sameInspection(left: PathInspection, right: PathInspection): boolean {
   return left.kind === 'known' && right.kind === 'known' && left.digest === right.digest
-    && left.identity === right.identity && left.symlink === right.symlink;
+    && sameFileState(left.state, right.state) && left.symlink === right.symlink;
 }
 
 function reconcileMemberObservation(

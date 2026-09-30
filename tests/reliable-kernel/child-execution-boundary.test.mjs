@@ -372,9 +372,9 @@ test('spawned, continued and user-started child Turns all stay within the parent
       allowedTools: ['bash', 'read', 'run_agent'], toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3 } } } });
     assert.equal((await f.app.agentLoop.runInput(f.input('follow-up'))).terminalStatus, 'completed');
     await f.coordinator.waitForIdle();
-    await f.app.database.conversationOwners.claim(child.child_conversation_id);
-    await f.coordinator.inputFromConversation({ commandId: 'user-in-child', childExecutionId: child.id,
-      conversationId: child.child_conversation_id, content: 'run the tests yourself' });
+    await f.runChildCommand(child.child_conversation_id, () => f.coordinator.inputFromConversation({
+      commandId: 'user-in-child', childExecutionId: child.id,
+      conversationId: child.child_conversation_id, content: 'run the tests yourself' }));
     await f.coordinator.waitForIdle();
     const all = await turns();
     assert.equal(all.length, 3, 'spawn, parent follow-up and user input each ran one child Turn');
@@ -432,9 +432,9 @@ test('editing a message in a child conversation reruns within the bound frozen a
     // Widening the parent later must not reach the rerun either.
     await f.configuration.mutations.setToolPolicy({ scopeKind: 'agent', scopeId: f.parentAgent.id,
       allowedTools: ['bash', 'read', 'run_agent', 'write'], toolConfigs: { run_agent: { config: { maxChildAgentDepth: 3 } } } });
-    await f.app.database.conversationOwners.claim(child.child_conversation_id);
-    await f.coordinator.editAndRunFromConversation({ commandId: 'edit-in-child', childExecutionId: child.id,
-      conversationId: child.child_conversation_id, messageId: prompt.message_id, content: 'implement the fix and run the tests' });
+    await f.runChildCommand(child.child_conversation_id, () => f.coordinator.editAndRunFromConversation({
+      commandId: 'edit-in-child', childExecutionId: child.id,
+      conversationId: child.child_conversation_id, messageId: prompt.message_id, content: 'implement the fix and run the tests' }));
     await f.coordinator.waitForIdle();
     const links = (await f.list('ChildExecutionTurnLink', { child_execution_id: child.id }))
       .sort((left, right) => Number(left.turn_seq) - Number(right.turn_seq));
@@ -583,9 +583,9 @@ test('a Plan the user approves to run in a new conversation runs with the execut
     assert.deepEqual(init.thinkingOverride, { kind: 'openai-effort', value: 'high' });
 
     // Later Turns in that conversation keep the worker own settings too.
-    await f.app.database.conversationOwners.claim(child.child_conversation_id);
-    await f.coordinator.inputFromConversation({ commandId: 'user-in-delegated-child', childExecutionId: child.id,
-      conversationId: child.child_conversation_id, content: 'also run the checks' });
+    await f.runChildCommand(child.child_conversation_id, () => f.coordinator.inputFromConversation({
+      commandId: 'user-in-delegated-child', childExecutionId: child.id,
+      conversationId: child.child_conversation_id, content: 'also run the checks' }));
     await f.coordinator.waitForIdle();
     const links = (await f.list('ChildExecutionTurnLink', { child_execution_id: child.id }))
       .sort((left, right) => Number(left.turn_seq) - Number(right.turn_seq));
@@ -715,7 +715,16 @@ async function runtimeFixture(run, hooks, options = {}) {
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: parentAgent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const input = key => ({ source: { kind: 'command', key }, conversationId: 'parent', leaseOwnerId: 'boundary-owner', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: `synthetic input ${key}` });
-    f = { app, configuration, coordinator, provider, root, parentAgent, childAgent, input, requests, wires, list, frozen, compileRequests, profileInits, sent: new Set() };
+    // Match the product command router: a bare claim on an idle child is releasable between
+    // awaits. Keep an activity pin through admission, and force the commit-triggered idle sweep
+    // at this boundary so ownership correctness does not depend on the runner's timing/load.
+    const runChildCommand = (conversationId, operation) => app.database.conversationOwners.run(conversationId, async () => {
+      await app.database.conversationOwners.sweepIdle();
+      assert.equal(app.database.conversationOwners.ownedActivity().find(owner => owner.conversationId === conversationId)?.pinned, true,
+        'the child command remains pinned across idle cleanup');
+      return operation();
+    });
+    f = { app, configuration, coordinator, provider, root, parentAgent, childAgent, input, requests, wires, list, frozen, compileRequests, profileInits, runChildCommand, sent: new Set() };
     await run(f);
   } finally {
     if (coordinator) await coordinator.dispose();

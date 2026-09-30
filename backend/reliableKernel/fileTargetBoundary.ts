@@ -132,6 +132,23 @@ export function fileStateIdentity(stat: BigIntStats): string {
   return [stat.dev, stat.ino, stat.mode, stat.size, stat.mtimeNs, stat.ctimeNs].join(':');
 }
 
+/** Compare a pathname snapshot with a descriptor, without reducing same-interface fences. */
+export function fileDescriptorMatchesPathState(
+  expected: BigIntStats | undefined,
+  opened: BigIntStats,
+  platform: NodeJS.Platform = process.platform
+): boolean {
+  if (!expected?.isFile() || !opened.isFile()) return false;
+  // Older Windows libuv returns a 64-bit volume serial from GetFileInformationByName,
+  // but only its low 32 bits from NtQueryVolumeInformationFile for an open handle.
+  // https://github.com/libuv/libuv/commit/82cdfb75f
+  const sameDevice = expected.dev === opened.dev || (platform === 'win32'
+    && expected.dev > 0xffff_ffffn && opened.dev >= 0n && opened.dev <= 0xffff_ffffn
+    && BigInt.asUintN(32, expected.dev) === opened.dev);
+  return sameDevice && expected.ino === opened.ino && expected.mode === opened.mode
+    && expected.size === opened.size && expected.mtimeNs === opened.mtimeNs && expected.ctimeNs === opened.ctimeNs;
+}
+
 /**
  * A verified pathname is not a descriptor. Open without following the final link/nonblocking
  * where supported, then reject a different identity or non-regular descriptor before any read.
@@ -157,13 +174,14 @@ export async function readFileWithIdentityFence(
   try {
     const identity = fileStateIdentity(expected);
     const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile() || fileStateIdentity(opened) !== identity) {
+    if (!fileDescriptorMatchesPathState(expected, opened)) {
       throw new FilePathConflictError('Opened file target identity or type changed before reading.');
     }
+    const descriptorIdentity = fileStateIdentity(opened);
     await checkBoundary();
     signal?.throwIfAborted();
     const bytes = await handle.readFile({ signal });
-    if (fileStateIdentity(await handle.stat({ bigint: true })) !== identity) {
+    if (fileStateIdentity(await handle.stat({ bigint: true })) !== descriptorIdentity) {
       throw new FilePathConflictError('File target changed while its descriptor was read.');
     }
     await checkBoundary();
