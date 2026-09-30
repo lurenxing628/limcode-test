@@ -1340,6 +1340,14 @@ export class ModelProviderControlPlane {
         outputDeltaCheckpointed: false,
         lastActivityPersistedAt: this.epochNow() - (compression ? DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS : 0)
       };
+      const assertCallbackAuthority = (): void => {
+        if (!controller.signal.aborted) return;
+        // Cancellation belongs to the dispatch abort path; callbacks arriving afterward have
+        // lost their write authority, even before SQLite can reject their old execution fence.
+        throw handoffReason(controller.signal) ?? new ExecutionHandoffError(
+          `Provider callback for ModelRequest ${modelRequestId} belongs to an aborted dispatch.`
+        );
+      };
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
@@ -1369,6 +1377,7 @@ export class ModelProviderControlPlane {
             }
           } : {}),
           onEvent: async (event) => {
+            assertCallbackAuthority();
             const observedSeq = decimalBigInt(event.streamSeq, 'Provider event streamSeq');
             if (observedSeq > lastObservedStreamSeq) lastObservedStreamSeq = observedSeq;
             // Control acknowledgments never count as semantic progress; a proven input-wait
@@ -1399,6 +1408,9 @@ export class ModelProviderControlPlane {
               streamDurability
               ), { signal: controller.signal });
             } catch (failure) {
+              // Abort during local checkpoint backoff has the same authority semantics as a
+              // callback that arrived after abort. It must not become eventHandlerFailure.
+              assertCallbackAuthority();
               eventHandlerFailure = failure;
               throw failure;
             }

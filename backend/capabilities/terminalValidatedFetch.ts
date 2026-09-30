@@ -67,12 +67,14 @@ export function createTerminalValidatedFetch(
     let response: Response;
     try { response = await baseFetch(input, init); }
     catch (error) { observation?.end('fetch_error', error); throw error; }
+    const transportResponse = response;
     if (!response.ok && wireTrace?.toolItems.length) {
       response = annotateProviderWireError(response, wireTrace.bodySha256);
     }
     const validatedStream = response.ok && isEventStream(response.headers.get('content-type'));
     const onResponsesTerminal = provider === 'openai-responses' ? options.onResponsesTerminal : undefined;
-    if (!response.body) return response;
+    if (!response.body) return response === transportResponse
+      ? response : preserveResponseTransportMetadata(response, transportResponse);
 
     const reader = response.body.getReader();
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
@@ -122,6 +124,15 @@ export function createTerminalValidatedFetch(
           observation?.end('eof');
         } catch (error) {
           closed = true;
+          if (error instanceof LlmHttpStreamTerminationError) {
+            // A failed error-body read must not erase an already received auth status or
+            // Retry-After hint before the SDK can decode the HTTP error envelope.
+            Object.assign(error, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: Object.fromEntries(response.headers)
+            });
+          }
           observation?.end('read_error', error);
           void reader.cancel(error).catch(() => undefined);
           controller.error(error);
@@ -134,11 +145,11 @@ export function createTerminalValidatedFetch(
       }
     });
 
-    const wrapped = new Response(body, {
+    const wrapped = preserveResponseTransportMetadata(new Response(body, {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers
-    });
+    }), transportResponse);
     if (onResponsesTerminal && response.ok && !validatedStream && isJson(response.headers.get('content-type'))) {
       // Observe only after the body has passed the same transport deadline/framing checks as SSE.
       const text = await wrapped.text();
@@ -148,11 +159,32 @@ export function createTerminalValidatedFetch(
       } catch {
         // Parsing failures belong to the provider decoder, not transport retry classification.
       }
-      const complete = new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+      const complete = preserveResponseTransportMetadata(new Response(text, {
+        status: response.status, statusText: response.statusText, headers: response.headers
+      }), transportResponse);
       return observation ? observation.bind(complete) : complete;
     }
     return observation ? observation.bind(wrapped) : wrapped;
   };
+}
+
+/** Body wrappers keep the public fetch metadata, including after native stream teeing. */
+function preserveResponseTransportMetadata(response: Response, source: Response): Response {
+  Object.defineProperties(response, {
+    url: { value: source.url, enumerable: true, configurable: true },
+    redirected: { value: source.redirected, enumerable: true, configurable: true },
+    type: { value: source.type, enumerable: true, configurable: true },
+    clone: {
+      configurable: true,
+      writable: true,
+      value(this: Response): Response {
+        // Native clone owns body-used/locked checks and cancellation semantics. Only the
+        // public metadata absent from Response's constructor needs to be carried forward.
+        return preserveResponseTransportMetadata(Response.prototype.clone.call(this), this);
+      }
+    }
+  });
+  return response;
 }
 
 class SseTerminalTracker {

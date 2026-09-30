@@ -20,6 +20,7 @@ const { normalizeLlmProviderConfig } = require('../dist/extension/backend/capabi
 Module._load = originalLoad;
 
 const {
+  createLlmProviderCapability,
   createOpenAIResponsesWebSocketSessionKey,
   dryRunCompactLlmProvider,
   dryRunLlmProvider,
@@ -30,6 +31,8 @@ const { installGeminiOpenAICompatibleThoughtSignatures } = require('../dist/exte
 const {
   createTerminalValidatedFetch
 } = require('../dist/extension/backend/capabilities/terminalValidatedFetch.js');
+const { LlmCapabilityFullRequestAdapter } = require('../dist/extension/backend/reliableKernel/llmCapabilityProviderAdapter.js');
+const { ProviderTransientError } = require('../dist/extension/backend/reliableKernel/modelProviderControlPlane.js');
 const {
   geminiThinkingCapabilityForModel
 } = require('../dist/extension/shared/geminiThinking.js');
@@ -1188,30 +1191,140 @@ test('transient output parts preserve thought/text/tool/text/tool order and upda
   assert.equal(parts[1].outputItem.phase, 'commentary');
 });
 
-test('terminal validation passes through non-2xx event-stream JSON errors unchanged', async () => {
-  const body = JSON.stringify({
+test('terminal validation preserves non-2xx error bytes and public response contracts', async () => {
+  const errorBody = {
     error: {
       code: 503,
       status: 'UNAVAILABLE',
       message: 'provider unavailable'
     }
-  });
+  };
+  const body = ` ${JSON.stringify(errorBody)}\n`;
   const original = new Response(body, {
     status: 503,
-    headers: { 'content-type': 'text/event-stream' }
+    statusText: 'Backend unavailable',
+    headers: { 'content-type': 'text/event-stream', 'retry-after': '12', 'x-request-id': 'fixture-request' }
+  });
+  Object.defineProperties(original, {
+    url: { value: 'https://example.invalid/redirected' },
+    redirected: { value: true },
+    type: { value: 'basic' }
   });
   const guarded = createTerminalValidatedFetch(async () => original, 'gemini');
 
   const response = await guarded('https://example.invalid');
-  assert.equal(response, original);
+  assert.ok(response instanceof Response);
   assert.equal(response.status, 503);
-  assert.deepEqual(await response.json(), {
-    error: {
-      code: 503,
-      status: 'UNAVAILABLE',
-      message: 'provider unavailable'
-    }
-  });
+  assert.equal(response.statusText, original.statusText);
+  assert.deepEqual([...response.headers], [...original.headers]);
+  assert.equal(response.url, original.url);
+  assert.equal(response.redirected, original.redirected);
+  assert.equal(response.type, original.type);
+  assert.equal(response.bodyUsed, false);
+  const clone = response.clone();
+  const secondClone = clone.clone();
+  for (const copy of [clone, secondClone]) {
+    assert.ok(copy instanceof Response);
+    assert.equal(copy.url, original.url);
+    assert.equal(copy.redirected, original.redirected);
+    assert.equal(copy.type, original.type);
+    assert.equal(copy.status, original.status);
+    assert.equal(copy.statusText, original.statusText);
+    assert.deepEqual([...copy.headers], [...original.headers]);
+    assert.equal(copy.bodyUsed, false);
+  }
+  const [text, json, copiedText] = await Promise.all([response.text(), clone.json(), secondClone.text()]);
+  assert.equal(text, body);
+  assert.deepEqual(json, errorBody);
+  assert.equal(copiedText, body);
+  assert.equal(response.bodyUsed, true);
+  assert.equal(clone.bodyUsed, true);
+  assert.throws(() => response.clone(), TypeError);
+  await assert.rejects(response.text(), TypeError);
+});
+
+test('terminal validation preserves non-2xx status and retry headers on body stalls', async () => {
+  for (const status of [401, 403, 429, 503]) {
+    let cancelled;
+    const original = new Response(new ReadableStream({
+      pull() {},
+      cancel(reason) { cancelled = reason; }
+    }), { status, headers: { 'content-type': 'text/event-stream', 'retry-after': '12' } });
+    const guarded = createTerminalValidatedFetch(async () => original, 'gemini', { bodyIdleTimeoutMs: 15 });
+    const response = await guarded('https://example.invalid');
+    await assert.rejects(response.text(), (error) => {
+      assert.equal(error.code, 'LLM_TRANSPORT_TIMEOUT');
+      assert.equal(error.status, status);
+      assert.equal(error.headers['retry-after'], '12');
+      assert.equal(cancelled, error);
+      return true;
+    });
+  }
+});
+
+test('terminal validation checks non-2xx framing and forwards consumer cancellation', async () => {
+  const guarded = createTerminalValidatedFetch(async () => new Response('{"error":', {
+    status: 503, headers: { 'content-type': 'text/event-stream', 'content-length': '50' }
+  }), 'gemini');
+  const response = await guarded('https://example.invalid');
+  await assert.rejects(response.text(), (error) => error.code === 'LLM_STREAM_TRUNCATED' && error.status === 503);
+
+  let cancelled;
+  const source = new Response(new ReadableStream({
+    pull() {},
+    cancel(reason) { cancelled = reason; }
+  }), { status: 503 });
+  const cancellable = await createTerminalValidatedFetch(async () => source, 'gemini')('https://example.invalid');
+  const reason = new Error('consumer cancelled');
+  await cancellable.body.cancel(reason);
+  assert.equal(cancelled, reason);
+  assert.equal(cancellable.bodyUsed, true);
+});
+
+test('failed HTTP error-body reads keep auth permanent and preserve server retry timing through the SDK', async (t) => {
+  for (const stream of [false, true]) for (const status of [401, 403, 429, 503]) {
+    await t.test(`${stream ? 'stream' : 'nonstream'}-${status}`, async (context) => {
+      let calls = 0;
+      context.mock.method(globalThis, 'fetch', async () => {
+        calls += 1;
+        return new Response(new ReadableStream({ start(controller) {
+          controller.error(new TypeError('terminated', {
+            cause: Object.assign(new Error('body read interrupted'), { code: 'UND_ERR_BODY_TIMEOUT' })
+          }));
+        } }), { status, headers: {
+          'content-type': stream ? 'text/event-stream' : 'application/json', 'retry-after': '12'
+        } });
+      });
+      const settings = providerConfig({ provider: 'openai-compatible', stream });
+      const capability = createLlmProviderCapability({ settings });
+      const request = {
+        kind: 'full-model-request', modelRequestId: `error-body-${stream}-${status}`,
+        conversationId: 'error-body-conversation', attemptSeq: '1', socketGeneration: '1',
+        providerId: settings.id, modelId: settings.model,
+        authoritySnapshot: {
+          model: { providerConfigId: settings.id, provider: settings.provider, modelId: settings.model },
+          toolPolicy: { allowedTools: [], preset: 'custom', sourceConfigs: {} },
+          systemPrompt: { text: 'test' }
+        },
+        recipe: { tools: [] },
+        context: [{ segmentId: 'error-body-user', segmentKind: 'message', messageRole: 'user',
+          contentType: 'application/vnd.limcode.message+json',
+          content: JSON.stringify({ role: 'user', parts: [{ text: 'hello' }] }) }],
+        attachmentCatalogState: { catalog: [], placements: [] }
+      };
+      try {
+        await assert.rejects(new LlmCapabilityFullRequestAdapter(settings.id, capability).sendFullRequest(request, {
+          async onEvent() { assert.fail('failed error body must not produce model output'); }
+        }), (error) => {
+          assert.equal(error.status, status);
+          assert.equal(error instanceof ProviderTransientError, status === 429 || status === 503);
+          if (error instanceof ProviderTransientError) assert.equal(error.retryOptions.retryAfterMs, 12_000);
+          return true;
+        });
+        assert.equal(calls, 1, 'the capability does not multiply the control-plane retry budget');
+      } finally { capability.dispose(); }
+    });
+  }
 });
 
 test('terminal validation still rejects a truncated 2xx event stream', async () => {

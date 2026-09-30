@@ -721,13 +721,15 @@ test('陈旧代际模型回调与栅栏写入被拒绝且不产生持久化副�
         markStarted();
         await gate;
         try {
-          await controls.onEvent({
-            kind: 'completed',
-            streamSeq: '2',
-            content: { role: 'model', parts: [{ text: '陈旧回调不应提交' }] }
-          });
-        } catch (error) {
-          providerErrors.push(error);
+          // Both ordinary deltas and a late completion must retain the stale-authority
+          // contract, even though local checkpoint retry sees an already-aborted signal first.
+          for (const event of [
+            { kind: 'output_delta', streamSeq: '1', content: { text: '陈旧增量不应提交' } },
+            { kind: 'completed', streamSeq: '2', content: { role: 'model', parts: [{ text: '陈旧回调不应提交' }] } }
+          ]) {
+            try { await controls.onEvent(event); }
+            catch (error) { providerErrors.push(error); }
+          }
         } finally {
           providerReturned = true;
         }

@@ -580,3 +580,32 @@ test('an exhausted local retry budget is typed and cannot multiply in an outer r
     && error.cause === original && !isRetryableLocalExecutionError(error));
   assert.equal(attempts, LOCAL_EXECUTION_MAX_RETRIES + 1);
 });
+
+test('interrupt during provider checkpoint retry stays cancellation and discards late callback authority', { timeout: 20000 }, async () => {
+  await withHarness(async h => {
+    const startedCheckpoint = gate();
+    let checkpointAttempts = 0;
+    h.app.database.commitModelStreamEvent = async () => {
+      checkpointAttempts += 1;
+      startedCheckpoint.resolve();
+      throw localBusyError();
+    };
+    const input = await h.runner.input({ commandId: 'cancel-checkpoint-backoff', conversationId: h.conversationId, text: '等待后停止。' });
+    await startedCheckpoint.promise;
+    await h.runner.interrupt({ commandId: 'stop-checkpoint-backoff', conversationId: h.conversationId,
+      turnId: input.turnId, reason: 'Stop during local checkpoint backoff' });
+    await h.runner.waitForIdle();
+    const before = checkpointAttempts;
+    await new Promise(resolve => setTimeout(resolve, 300));
+    assert.equal(checkpointAttempts, before, 'an aborted callback must never retry its checkpoint');
+    assert.equal((await rows(h.app, 'TurnTermination', { turn_id: input.turnId }))[0].terminal_status, 'interrupted');
+    const [request] = await rows(h.app, 'ModelRequest', { turn_id: input.turnId });
+    assert.equal(request.status, 'terminal');
+    assert.equal((await rows(h.app, 'Operation', { owner_kind: 'model_request', owner_id: request.id }))[0].status, 'cancelled');
+    assert.equal((await rows(h.app, 'ModelStreamCheckpoint')).length, 0);
+    assert.equal((await rows(h.app, 'Attempt')).filter(row => row.status === 'transient_failed').length, 0,
+      'user cancellation is never treated as a transient provider retry');
+    assert.equal(h.providerCalls, 1);
+    assert.ok(h.errors.every(({ error }) => kernel.isExecutionHandoffError(error)));
+  });
+});
