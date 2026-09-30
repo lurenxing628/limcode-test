@@ -2322,7 +2322,19 @@ async function compactWithProviderNative(
   const registry = unified.createBootstrapExtensionRegistry();
   const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
   const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
-  const providerFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
+  let httpFailure: { status: number; statusText: string; headers: Record<string, string> } | undefined;
+  const validatedFetch = createTerminalValidatedFetch(proxyFetch ?? fetch, settings.provider);
+  const providerFetch: typeof fetch = async (input, init) => {
+    const response = await validatedFetch(input, init);
+    // SDK compact errors retain only the status/body message. Keep this attempt's response
+    // metadata separately so a normally completed error body cannot discard Retry-After.
+    httpFailure = response.ok ? undefined : {
+      status: response.status,
+      statusText: response.statusText,
+      headers: Object.fromEntries(response.headers)
+    };
+    return response;
+  };
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
   const requestBody = requestBodyWithOpenAIPromptCacheKey(settings, request.conversationId);
   logCompressionDebug('provider.compact.openaiResponses.settings', {
@@ -2410,6 +2422,10 @@ async function compactWithProviderNative(
     });
     // 单次 Provider 原生压缩尝试只负责当前适配器；失败由冻结的外层后备链决定是否
     // 切换为分段总结或确定性摘要，不能在 capability 内部偷偷改变执行方法。
+    if (httpFailure) {
+      const failure = failureFromCaughtError(error);
+      throw new LlmAttemptFailureError({ ...failure, rawError: { ...failure.rawError, ...httpFailure } });
+    }
     throw error;
   }
 
@@ -2490,11 +2506,16 @@ async function compactWithAnthropic(
   }
   if (!response.ok) {
     const message = providerHttpErrorMessage('Anthropic Compaction API', response.status, raw);
+    const httpMetadata = {
+      status: response.status,
+      statusText: response.statusText,
+      headers: Object.fromEntries(response.headers)
+    };
     if (response.status === 404 || response.status === 405 || response.status === 501) {
-      throw nativeCompactionCapabilityError(message, response.status, 'anthropic_messages_compact', raw);
+      throw Object.assign(nativeCompactionCapabilityError(message, response.status, 'anthropic_messages_compact', raw), httpMetadata);
     }
     throw Object.assign(new Error(message), {
-      status: response.status,
+      ...httpMetadata,
       endpointKind: 'anthropic_messages_compact',
       rawResponse: raw
     });

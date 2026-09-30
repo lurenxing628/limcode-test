@@ -51,6 +51,7 @@ import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
+  assertProviderCallbackAuthority,
   restoredProviderRequestFailure,
   NATIVE_CHAIN_REBASED_TERMINAL_STATE,
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
@@ -2464,11 +2465,13 @@ export class ReliableAgentLoop {
               }
             : {}),
           onEvent: async (event): Promise<StreamEventResult> => {
+            assertProviderCallbackAuthority(controls.signal, modelRequestId);
             // Control observations go straight to durable control handling and the steering
             // subscription; they are never fed into the text transient replay.
             if (event.kind === 'native_control') {
               const result = await controls.onEvent(event);
-              if (activeSession) await activeSession.afterNativeControl(event, result);
+              assertProviderCallbackAuthority(controls.signal, modelRequestId);
+              if (activeSession) await activeSession.afterNativeControl(event, result, controls.signal);
               if (activeSession && (result.checkpointed || result.ignoredReason === 'duplicate')) {
                 const admission = parseNativeControlCheckpoint(event.content);
                 if (admission.type === 'response.created' && admission.admittedToolResultCallIds?.length) {
@@ -2522,11 +2525,13 @@ export class ReliableAgentLoop {
                     event.streamSeq,
                     proof
                   );
+                  assertProviderCallbackAuthority(controls.signal, modelRequestId);
                   observe();
-                  await activeSession.admitStreamedCall(callItem, event.streamSeq, result);
+                  await activeSession.admitStreamedCall(callItem, event.streamSeq, result, controls.signal);
                   return result;
                 }
                 const result = await controls.onEvent(event);
+                assertProviderCallbackAuthority(controls.signal, modelRequestId);
                 observe();
                 await activeSession.admitStreamedContentItem(event, result);
                 return result;

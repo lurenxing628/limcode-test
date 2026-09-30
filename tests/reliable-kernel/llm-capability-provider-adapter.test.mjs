@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
 import path from 'node:path';
 import test from 'node:test';
 import { pathToFileURL } from 'node:url';
@@ -3121,6 +3122,86 @@ test('Provider Retry-After 秒、日期、毫秒和 Gemini RetryInfo 保留最�
   const malformed = await providerFailureOf('rate limited', { status: 429, headers: { 'retry-after': 'nonsense' } });
   assert.equal(malformed.retryOptions.retryAfterMs, undefined);
 });
+
+for (const [provider, model, endpoint] of [
+  ['openai-responses', 'compression-model', '/v1/responses/compact'],
+  ['claude', 'claude-opus-4-6', '/v1/messages']
+]) {
+  test(`${provider} 原生 Compact 的真实 HTTP 错误保留 Retry-After 与状态正文`, async () => {
+    const { createLlmProviderCapability } = await import(pathToFileURL(
+      path.join(root, 'dist/extension/backend/capabilities/llmProvider.js')
+    ).href);
+    let responseCase;
+    const paths = [];
+    const server = createServer((incoming, response) => {
+      paths.push(incoming.url);
+      incoming.resume();
+      response.writeHead(responseCase.status, {
+        'content-type': 'application/json',
+        'retry-after': responseCase.retryAfter
+      });
+      response.end(JSON.stringify({ error: { message: 'compact request must wait' } }));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    const capability = createLlmProviderCapability({
+      settings: {
+        id: 'compression-provider', name: 'local compact retry hints', provider,
+        model, models: [], modelConfigs: [], apiKey: 'offline-placeholder',
+        baseUrl: `http://127.0.0.1:${server.address().port}/v1`,
+        stream: false, retryOnError: false, retryMaxAttempts: 0,
+        toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+      }
+    });
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+    const fullRequest = compressionRequest('provider_native', [{
+      segmentId: 'http-compact-user', segmentKind: 'message', messageRole: 'user',
+      contentType: 'application/vnd.limcode.message+json',
+      content: JSON.stringify({ role: 'user', parts: [{ text: 'compact this' }] })
+    }]);
+    fullRequest.modelId = model;
+    fullRequest.authoritySnapshot.compression.provider.provider = provider;
+    fullRequest.authoritySnapshot.compression.provider.modelId = model;
+    const dateDeadline = Math.floor((Date.now() + 90_000) / 1_000) * 1_000;
+    try {
+      for (const scenario of [
+        { status: 409, retryAfter: '60', delayMs: 60_000 },
+        { status: 429, retryAfter: '37', delayMs: 37_000 },
+        { status: 409, retryAfter: new Date(dateDeadline).toUTCString(), deadline: dateDeadline },
+        { status: 409, retryAfter: '1200', excessive: true },
+        { status: 503, retryAfter: '1200', excessive: true },
+        { status: 401, retryAfter: '60', permanent: true }
+      ]) {
+        responseCase = scenario;
+        const priorCalls = paths.length;
+        const startedAt = Date.now();
+        await assert.rejects(adapter.sendFullRequest(fullRequest, {
+          onEvent: async () => assert.fail('an HTTP rejection cannot produce a completed checkpoint')
+        }), error => {
+          assert.equal(error.status, scenario.status);
+          assert.match(error.message, /compact request must wait/);
+          if (scenario.excessive) {
+            assert.equal(error instanceof kernel.ProviderTransientError, false);
+            assert.match(error.message, /至少等待 1200 秒.*超过自动等待上限/);
+          } else if (scenario.permanent) {
+            assert.equal(error instanceof kernel.ProviderTransientError, false);
+          } else {
+            assert.ok(error instanceof kernel.ProviderTransientError);
+            if (scenario.deadline) {
+              assert.ok(error.retryOptions.retryAfterMs >= scenario.deadline - Date.now());
+              assert.ok(error.retryOptions.retryAfterMs <= scenario.deadline - startedAt);
+            } else assert.equal(error.retryOptions.retryAfterMs, scenario.delayMs);
+          }
+          return true;
+        });
+        assert.equal(paths.length, priorCalls + 1, 'the capability never retries before the durable control plane');
+        assert.equal(paths.at(-1), endpoint);
+      }
+    } finally {
+      capability.dispose();
+      await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+}
 
 test('同步 start 的未知本地异常不默认重试，未被请求取消的网络 AbortError 可以重试', async () => {
   for (const [error, retryable] of [

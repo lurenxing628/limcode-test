@@ -327,6 +327,14 @@ export function isNativeChainReplayUnsafeError(error: unknown): error is NativeC
   return error instanceof NativeChainReplayUnsafeError;
 }
 
+/** Every callback path uses the dispatch signal, including native proofs outside onEvent. */
+export function assertProviderCallbackAuthority(signal: AbortSignal | undefined, modelRequestId: string): void {
+  if (!signal?.aborted) return;
+  throw handoffReason(signal) ?? new ExecutionHandoffError(
+    `Provider callback for ModelRequest ${modelRequestId} belongs to an aborted dispatch.`
+  );
+}
+
 const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
 // 思考型模型（kimi-k3 等）在大上下文 prefill / 反代网关缓冲下，首个语义事件与思考间隙可长达数分钟。
 // 误杀会丢弃本次未提交输出并消耗一次恢复预算；已有原生工具效果只能安全重建，不能重放。
@@ -1341,12 +1349,9 @@ export class ModelProviderControlPlane {
         lastActivityPersistedAt: this.epochNow() - (compression ? DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS : 0)
       };
       const assertCallbackAuthority = (): void => {
-        if (!controller.signal.aborted) return;
         // Cancellation belongs to the dispatch abort path; callbacks arriving afterward have
         // lost their write authority, even before SQLite can reject their old execution fence.
-        throw handoffReason(controller.signal) ?? new ExecutionHandoffError(
-          `Provider callback for ModelRequest ${modelRequestId} belongs to an aborted dispatch.`
-        );
+        assertProviderCallbackAuthority(controller.signal, modelRequestId);
       };
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {

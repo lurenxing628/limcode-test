@@ -260,8 +260,10 @@ export class RuntimeDatabase {
    * `durable`: this commit is synced to disk before the call returns (the writer's synchronous is
    * FULL for this transaction only, NORMAL again afterwards), for a commit that is recorded as done
    * outside this database (the historical merge ledger).
+   * `beforeSubmit` is a process-local authority check after binding validation; it is never sent
+   * to the worker and cannot revoke a transaction already submitted to the writer.
    */
-  public async transaction(steps: RepositoryTransactionStep[], options: { durable?: true } = {}): Promise<RuntimeCommitResult> {
+  public async transaction(steps: RepositoryTransactionStep[], options: { durable?: true; beforeSubmit?: () => void } = {}): Promise<RuntimeCommitResult> {
     const fence = currentExecutionLeaseFence();
     const fencedSteps = fence
       ? [
@@ -274,7 +276,8 @@ export class RuntimeDatabase {
       : steps;
     return this.requestWithExecutionFence(
       fence,
-      { kind: 'transaction', steps: fencedSteps, ...(options.durable ? { durable: true as const } : {}) }
+      { kind: 'transaction', steps: fencedSteps, ...(options.durable ? { durable: true as const } : {}) },
+      options.beforeSubmit
     );
   }
 
@@ -697,7 +700,8 @@ export class RuntimeDatabase {
    */
   private async requestWithExecutionFence<T>(
     fence: ExecutionLeaseFence | undefined,
-    request: DatabaseWorkerRequestPayload
+    request: DatabaseWorkerRequestPayload,
+    beforeSubmit?: () => void
   ): Promise<T> {
     // Cheap local fence: once this Host released the conversation owner, stale fenced callbacks
     // (e.g. a late provider stream event) must fail without any filesystem read per event.
@@ -706,7 +710,7 @@ export class RuntimeDatabase {
       throw new ConversationRuntimeOwnerReleasedError(fence.conversationId, fence.turnId);
     }
     try {
-      return await this.request<T>(request);
+      return await this.request<T>(request, beforeSubmit);
     } catch (error) {
       if (!fence || !isRuntimeTransactionAssertionError(error)) throw error;
       const stillCurrent = await this.executionFenceStillCurrent(fence).catch(() => false);
@@ -792,7 +796,7 @@ export class RuntimeDatabase {
     }
   }
 
-  private async request<T>(request: DatabaseWorkerRequestPayload): Promise<T> {
+  private async request<T>(request: DatabaseWorkerRequestPayload, beforeSubmit?: () => void): Promise<T> {
     if (this.closed) throw new Error('RuntimeDatabase is closed.');
     if (this.heartbeatFailure !== undefined) {
       const error = new Error('RuntimeDatabase Host liveness heartbeat failed; requests are fenced until restart.') as Error & {
@@ -802,6 +806,7 @@ export class RuntimeDatabase {
       throw error;
     }
     await this.validateBinding(databaseMetricRequestKind(request.kind));
+    beforeSubmit?.();
     return this.sendRequest<T>(request);
   }
 

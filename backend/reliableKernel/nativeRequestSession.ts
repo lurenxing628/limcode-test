@@ -42,6 +42,7 @@ import type {
   ProviderOutputStreamEvent,
   StreamEventResult
 } from './modelProviderControlPlane';
+import { assertProviderCallbackAuthority } from './modelProviderControlPlane';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -732,8 +733,10 @@ export class NativeRequestSession {
   public async admitStreamedCall(
     item: NativeCallItemEnvelope,
     streamSeq: string | bigint,
-    result: StreamEventResult
+    result: StreamEventResult,
+    signal?: AbortSignal
   ): Promise<void> {
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     const responseId = item.outputItem!.providerResponseId!;
     this.responseFor(responseId);
     const durableResponseCalls = [...this.calls.values()].filter(call => call.responseId === responseId).length;
@@ -778,6 +781,7 @@ export class NativeRequestSession {
       contentType: MESSAGE_CONTENT_TYPE,
       contextDisposition: 'exclude'
     });
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     const call = this.newSessionCall(item, providerOrdinal, toolCallId, streamSeq);
     this.calls.set(toolCallId, call);
     this.callByProviderId.set(call.providerCallId, call);
@@ -789,7 +793,7 @@ export class NativeRequestSession {
           `Provider declared async for native tool ${call.name} without frozen nativeAsync authorization.`
         );
       }
-      await this.admitCall(call, { streamSeq: String(streamSeq) });
+      await this.admitCall(call, { streamSeq: String(streamSeq) }, signal);
     }
   }
 
@@ -874,8 +878,10 @@ export class NativeRequestSession {
    */
   public async afterNativeControl(
     event: ProviderOutputStreamEvent,
-    result: StreamEventResult
+    result: StreamEventResult,
+    signal?: AbortSignal
   ): Promise<void> {
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     if (!result.checkpointed && result.ignoredReason !== 'duplicate') return;
     const content = asRecord(event.content) as unknown as OpenAIResponsesNativeEvent | undefined;
     if (!content || typeof content.type !== 'string'
@@ -1024,9 +1030,9 @@ export class NativeRequestSession {
           responseId: content.responseId,
           ...(content.reason !== undefined ? { reason: content.reason } : {})
         });
-        if (content.requiredInput) await this.admitRequiredInput(content.requiredInput);
+        if (content.requiredInput) await this.admitRequiredInput(content.requiredInput, signal);
         if (response.admissionBoundary) {
-          await this.admitResponseSyncCalls(response);
+          await this.admitResponseSyncCalls(response, signal);
         }
         if (response.completed) {
           for (const receipt of [...this.steerReceipts.values()]) {
@@ -1054,7 +1060,7 @@ export class NativeRequestSession {
           ...(content.responseId ? { responseId: content.responseId } : {}),
           ...(content.requiredInput ? { requiredInput: content.requiredInput } : {})
         });
-        if (content.requiredInput) await this.admitRequiredInput(content.requiredInput);
+        if (content.requiredInput) await this.admitRequiredInput(content.requiredInput, signal);
         this.pumpSignal();
         return;
       }
@@ -1066,7 +1072,7 @@ export class NativeRequestSession {
           ...(content.responseId ? { responseId: content.responseId } : {}),
           ...(content.requiredInput ? { requiredInput: content.requiredInput } : {})
         });
-        if (content.requiredInput) await this.admitRequiredInput(content.requiredInput);
+        if (content.requiredInput) await this.admitRequiredInput(content.requiredInput, signal);
         this.pumpSignal();
         return;
       }
@@ -1237,9 +1243,11 @@ export class NativeRequestSession {
 
   private async admitCall(
     call: NativeSessionCall,
-    identity: { streamSeq: string; completedResponseStreamSeq?: string; providerResponseId?: string }
+    identity: { streamSeq: string; completedResponseStreamSeq?: string; providerResponseId?: string },
+    signal?: AbortSignal
   ): Promise<void> {
     if (call.admitted || this.disposed) return;
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     const stream = this.requireStream();
     const definition = this.deps.resolveDefinition(call.name);
     const resolution = this.callResolutions.get(call.providerCallId);
@@ -1255,6 +1263,9 @@ export class NativeRequestSession {
       definition
     };
     const [policy] = await this.deps.freezePolicies([dispatchInput]);
+    // Keep the exact callback's signal across both item persistence and policy reads. A later
+    // dispatch must never lend its authority to an older callback that was waiting here.
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     if (!policy) throw new Error('Native call policy freeze returned no decision.');
     const streamIdentity: NativeToolCallStreamIdentity = {
       attemptSeq: stream.attemptSeq,
@@ -1281,6 +1292,8 @@ export class NativeRequestSession {
         policy
       }],
       streamIdentity
+    }, {
+      beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId)
     });
     await this.deps.context.appendNativeToolCall({
       conversationId: this.deps.conversationId,
@@ -1310,7 +1323,7 @@ export class NativeRequestSession {
     this.scheduleExecution(call);
   }
 
-  private async admitRequiredInput(requiredInput: readonly OpenAIResponsesRequiredInput[]): Promise<void> {
+  private async admitRequiredInput(requiredInput: readonly OpenAIResponsesRequiredInput[], signal?: AbortSignal): Promise<void> {
     for (const entry of requiredInput) {
       if (entry.type !== 'function_call_output' && entry.type !== 'custom_tool_call_output') continue;
       const callId = entry.callId;
@@ -1324,14 +1337,14 @@ export class NativeRequestSession {
           streamSeq: call.itemSeq,
           completedResponseStreamSeq: response.boundarySeq,
           providerResponseId: response.responseId
-        });
+        }, signal);
       } else {
         response.syncRequired = true;
       }
     }
   }
 
-  private async admitResponseSyncCalls(response: NativeSessionResponse): Promise<void> {
+  private async admitResponseSyncCalls(response: NativeSessionResponse, signal?: AbortSignal): Promise<void> {
     if (!response.boundarySeq) return;
     for (const call of this.calls.values()) {
       if (call.responseId !== response.responseId || call.admitted || call.asyncDeclared) continue;
@@ -1339,7 +1352,7 @@ export class NativeRequestSession {
         streamSeq: call.itemSeq,
         completedResponseStreamSeq: response.boundarySeq,
         providerResponseId: response.responseId
-      });
+      }, signal);
     }
     response.syncRequired = false;
   }

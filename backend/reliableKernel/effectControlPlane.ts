@@ -448,7 +448,7 @@ export class EffectControlPlane {
     messageId: string;
     entries: readonly ToolCallBatchEntry[];
     streamIdentity?: NativeToolCallStreamIdentity;
-  }): Promise<CreatedToolCallBatch> {
+  }, options: { beforeSubmit?: () => void } = {}): Promise<CreatedToolCallBatch> {
     const source = normalizeSource(input.source, ['callback', 'internal'], 'tool-call-batch-create');
     const batchId = requireId(input.batchId, 'batchId');
     const turnId = requireId(input.turnId, 'turnId');
@@ -478,6 +478,7 @@ export class EffectControlPlane {
     if (duplicate) {
       return this.replayToolCallBatch(duplicate, receiptId, batchId, modelRequestId, messageId, entries, streamIdentity);
     }
+    options.beforeSubmit?.();
 
     const turnContext = await this.requireActiveTurnContext(turnId);
     const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
@@ -637,13 +638,17 @@ export class EffectControlPlane {
       );
     }
 
+    // Native admission preparation can outlive its dispatch. Only a new write needs the guard;
+    // an already committed receipt remains valid and its admitted work must still be settled.
+    options.beforeSubmit?.();
     const committed = await this.commitSource({
       source,
       receiptId,
       conversationId: turnContext.conversation.id as string,
       turnId,
       receiptPreflight: { receipt: duplicate ?? null },
-      steps
+      steps,
+      beforeSubmit: options.beforeSubmit
     });
     if (committed.deduplicated) {
       return this.replayToolCallBatch(committed.receipt, receiptId, batchId, modelRequestId, messageId, entries, streamIdentity);
@@ -3194,6 +3199,7 @@ export class EffectControlPlane {
     turnId: string | null;
     steps: RepositoryTransactionStep[];
     receiptPreflight?: CommandReceiptPreflight;
+    beforeSubmit?: () => void;
   }): Promise<CommandCommit> {
     const existing = options.receiptPreflight
       ? options.receiptPreflight.receipt ?? undefined
@@ -3216,7 +3222,7 @@ export class EffectControlPlane {
       const result = await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('CommandReceipt').insert(receipt),
         ...options.steps
-      ]);
+      ], { beforeSubmit: options.beforeSubmit });
       return {
         receipt,
         deduplicated: false,
