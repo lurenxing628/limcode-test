@@ -211,7 +211,8 @@ test('Mounted template binds dropdown change and checkbox checked/change to the 
 function composerSubmission() {
   const source = parse(fs.readFileSync(composerPath, 'utf8')).descriptor.scriptSetup.content;
   const ast = ts.createSourceFile('Composer.ts', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-  const names = ['savingSessionSelections', 'savingSessionSelection', 'conversationInputDisabled'];
+  // submit captures this production draft generation before waiting for a scope save.
+  const names = ['savingSessionSelections', 'savingSessionSelection', 'conversationInputDisabled', 'submissionDraftRevision'];
   const parts = ast.statements.filter(statement => ts.isFunctionDeclaration(statement) ? statement.name?.text === 'submit'
     : ts.isVariableStatement(statement) && statement.declarationList.declarations.some(item => names.includes(item.name.getText(ast))));
   const code = parts.map(part => part.getText(ast)).join('\n') + '\nmodule.exports = { submit };';
