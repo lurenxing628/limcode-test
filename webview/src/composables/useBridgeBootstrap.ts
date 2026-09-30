@@ -1,7 +1,9 @@
-import { onBeforeUnmount, watch } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import {
   GLOBAL_SETTINGS_SECTIONS,
+  createMessageId,
   type BridgeScope,
+  type GlobalSettingsActivityPayload,
   type GlobalSettingsSection
 } from '@shared/protocol';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -41,6 +43,40 @@ export function useBridgeBootstrap(): void {
   // the previous Feed client, so remember the Hello client identity and re-declare readiness once
   // when a replacement Host attaches. The reconnect Hello keeps the same id and cannot loop.
   let announcedClientId: string | undefined;
+  const settingsActivitySessionId = createMessageId();
+  let activityRevision = 0;
+  let lastActivityState: GlobalSettingsActivityPayload['state'] | undefined;
+  const executionSections = (): readonly GlobalSettingsSection[] => session.viewKind === 'globalSettings'
+    ? CHANNEL_SETTINGS_SECTIONS : ['llm'];
+  // Coordinators/timers are non-reactive. Invalidate the cached content comparison only when
+  // their cheap aggregate state changes; unrelated store actions must not rescan every catalog.
+  const pendingActivityState = ref(globalSettings.executionPendingSaveState(executionSections()));
+  const settingsActivityState = computed(() => {
+    void pendingActivityState.value;
+    return globalSettings.executionSaveState(executionSections());
+  });
+  const publishSettingsActivity = (force = false): GlobalSettingsActivityPayload => {
+    const state = settingsActivityState.value;
+    if (force || state !== lastActivityState) {
+      lastActivityState = state;
+      activityRevision++;
+      bridge.request(BridgeMessageType.GlobalSettingsActivity, { sessionId: settingsActivitySessionId, revision: activityRevision, state });
+    }
+    return { sessionId: settingsActivitySessionId, revision: activityRevision, state };
+  };
+  // Sync is essential: a same-event edit + Send must post the dirty fence before the command.
+  disposers.push(watch(settingsActivityState,
+    () => publishSettingsActivity(), { flush: 'sync' }));
+  // Coordinators/timers live outside reactive state; publish after their final synchronous changes too.
+  disposers.push(globalSettings.$onAction(({ name, after, onError }) => {
+    if (name === 'executionSaveState' || name === 'executionPendingSaveState') return;
+    const refresh = () => {
+      pendingActivityState.value = globalSettings.executionPendingSaveState(executionSections());
+      publishSettingsActivity();
+    };
+    after(refresh);
+    onError(refresh);
+  }, true));
 
   disposers.push(
     bridge.on(BridgeMessageType.Hello, (message) => {
@@ -49,7 +85,8 @@ export function useBridgeBootstrap(): void {
       if (previousClientId && message.clientId && previousClientId !== message.clientId) {
         modelProfiles.reconnectScopes();
         globalSettings.reconcilePendingSettings();
-        bridge.ready();
+        bridge.ready(settingsActivitySessionId);
+        publishSettingsActivity(true);
       }
       session.applyHello(message.payload?.meta, message.payload?.runtime);
       interactions.replayForClient(message.clientId ?? bridge.currentClientId(), message.id);
@@ -90,13 +127,11 @@ export function useBridgeBootstrap(): void {
       }
     }),
     bridge.on(BridgeMessageType.GlobalSettingsFlush, (message) => {
-      const sections: readonly GlobalSettingsSection[] = session.viewKind === 'globalSettings'
-        ? CHANNEL_SETTINGS_SECTIONS
-        : ['llm'];
-      void globalSettings.flushForExecution(sections).then(
-        () => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, { status: 'saved' }, { correlationId: message.id }),
+      const sections = executionSections();
+      void globalSettings.flushForExecution(sections, true).then(
+        () => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, { status: 'saved', activity: publishSettingsActivity() }, { correlationId: message.id }),
         (error: unknown) => bridge.request(BridgeMessageType.GlobalSettingsFlushResult, {
-          status: 'failed', message: error instanceof Error ? error.message : String(error)
+          status: 'failed', activity: publishSettingsActivity(), message: error instanceof Error ? error.message : String(error)
         }, { correlationId: message.id })
       );
     }),
@@ -178,7 +213,8 @@ export function useBridgeBootstrap(): void {
     )
   );
 
-  bridge.ready();
+  bridge.ready(settingsActivitySessionId);
+  publishSettingsActivity(true);
   onBeforeUnmount(() => {
     for (const dispose of disposers) dispose();
   });

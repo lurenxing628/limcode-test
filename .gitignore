@@ -218,6 +218,10 @@ docs/architecture/*
 !/tests/reliable-kernel/runtime-history-repair-durability.test.mjs
 !/tests/reliable-kernel/runtime-merge-commit-guards.test.mjs
 !/tests/reliable-kernel/runtime-merge-queued-intents.test.mjs
+!/tests/reliable-kernel/settings-activity-fence.test.mjs
+!/tests/reliable-kernel/settings-activity-ordering.test.mjs
+!/tests/reliable-kernel/turn-input-status-ui.test.mjs
+!/tests/reliable-kernel/work-environment-preview-read-cost.test.mjs
 
 !/tests/reliable-kernel/client-projection-history-work-bound.test.mjs
 

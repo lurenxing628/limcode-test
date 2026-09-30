@@ -61,7 +61,7 @@ const {
 } = useChat();
 
 const requestedIntentVersions = new Map<string, string>();
-const listScroller = ref<HTMLElement | null>(null);
+const listScrollers = ref<Record<string, HTMLElement | null>>({});
 const editingIntentId = ref<string>();
 const editingText = ref('');
 const editError = ref('');
@@ -189,18 +189,32 @@ const canReorder = computed(() =>
   && committedItems.value.every((item) => Boolean(guidancePreview(item.preview)?.revisionSeq))
   && currentPendingGuidanceControls.value.length === 0
 );
-const hasQueuedItems = computed(() => queueItems.value.some((item) =>
+const waitingItems = computed(() => queueItems.value.filter((item) =>
   item.state === 'queued' || item.state === 'acknowledged'
 ));
+const submittingItems = computed(() => queueItems.value.filter((item) =>
+  item.state !== 'queued' && item.state !== 'acknowledged'
+));
+const submissionTitle = computed(() => {
+  const items = submittingItems.value;
+  if (items.some((item) => item.state === 'submitting')) return '提交中';
+  if (items.length > 0 && items.every((item) => item.state === 'accepted')) return '正在显示';
+  return '发送状态';
+});
+const submissionReason = computed(() => {
+  const items = submittingItems.value;
+  if (!items.length) return '';
+  if (items.every((item) => item.state === 'failed')) return '提交失败，草稿已保留';
+  if (items.some((item) => item.state === 'unconfirmed')) return '消息尚未确认，可手动重试';
+  if (items.every((item) => item.state === 'accepted')) return '消息已保存，正在显示';
+  return '等待系统确认';
+});
 const waitReason = computed(() => {
-  if (queueItems.value.every((item) => item.state === 'failed')) return '提交失败，草稿已保留';
-  if (queueItems.value.some((item) => item.state === 'accepted')) return '消息已保存，正在显示';
-  if (queueItems.value.some((item) => item.state === 'unconfirmed')) return '消息尚未确认，可手动重试';
-  if (!hasQueuedItems.value) return '等待系统确认';
+  if (!waitingItems.value.length) return '';
   const guidanceItems = committedItems.value.filter((item) => guidancePreview(item.preview));
   if (
     guidanceItems.length > 0
-    && guidanceItems.length === committedItems.value.length
+    && guidanceItems.length === waitingItems.value.length
     && guidanceItems.every((item) => guidancePreview(item.preview)?.hold === 'paused')
   ) {
     return '所有引导消息均已暂停';
@@ -210,6 +224,13 @@ const waitReason = computed(() => {
   ).some((request) => request.status === 'pending');
   return pendingInteraction ? '等待当前操作完成' : '等待当前回复和工具完成';
 });
+
+// A local send is not a durable queue entry. Keep both groups visible when a pending
+// submission and an actual queued TurnIntent coexist, with independent counts and explanations.
+const queueGroups = computed(() => [
+  { id: 'submissions', title: submissionTitle.value, reason: submissionReason.value, items: submittingItems.value },
+  { id: 'waiting', title: '等待队列', reason: waitReason.value, items: waitingItems.value }
+].filter((group) => group.items.length > 0));
 
 function intentPreviewProjectionVersion(intent: Record<string, unknown>, intentId: string): string {
   const revision = typeof intent.current_revision_seq === 'string'
@@ -428,7 +449,7 @@ function submissionText(text: string, content?: { parts?: readonly unknown[] }):
 function stateLabel(item: QueueItem): string {
   if (item.state === 'submitting') return '正在提交';
   if (item.state === 'unconfirmed') return '尚未确认';
-  if (item.state === 'accepted') return '已保存';
+  if (item.state === 'accepted') return '已保存，正在显示';
   if (item.state === 'acknowledged') return '已进入等待队列';
   if (item.state === 'failed') return '发送失败';
   const runtime = runtimePreview(item.preview);
@@ -555,15 +576,7 @@ function timestamp(value: unknown): number {
 </script>
 
 <template>
-  <section v-if="queueItems.length > 0" class="reliable-queue" aria-label="等待队列状态">
-    <div class="reliable-queue-header">
-      <span class="reliable-queue-title">
-        <IconBolt class="reliable-queue-guide-icon" :size="14" stroke="2" aria-hidden="true" />
-        等待队列 · {{ queueItems.length }}
-      </span>
-      <span class="reliable-queue-reason">{{ waitReason }}</span>
-    </div>
-
+  <section v-if="queueItems.length > 0" class="reliable-queue" aria-label="消息提交与等待状态">
     <div v-if="currentGuidanceControlFailure" class="reliable-queue-control-error" role="alert">
       <IconAlertCircle :size="14" stroke="2" aria-hidden="true" />
       <span>{{ currentGuidanceControlFailure.message }}</span>
@@ -572,10 +585,18 @@ function timestamp(value: unknown): number {
       </button>
     </div>
 
+    <div v-for="group in queueGroups" :key="group.id" class="reliable-queue-group" :data-state-group="group.id">
+    <div class="reliable-queue-header">
+      <span class="reliable-queue-title">
+        <IconBolt class="reliable-queue-guide-icon" :size="14" stroke="2" aria-hidden="true" />
+        {{ group.title }} · {{ group.items.length }}
+      </span>
+      <span class="reliable-queue-reason">{{ group.reason }}</span>
+    </div>
     <div class="reliable-queue-list-shell">
-      <ol ref="listScroller" class="reliable-queue-list">
+      <ol :ref="(element) => { listScrollers[group.id] = element as HTMLElement | null; }" class="reliable-queue-list">
       <li
-        v-for="(item, index) in queueItems"
+        v-for="(item, index) in group.items"
         :key="item.id"
         class="reliable-queue-item"
         :class="[
@@ -699,7 +720,8 @@ function timestamp(value: unknown): number {
         </template>
         </li>
       </ol>
-      <AdvancedScrollbar :scroller="listScroller" :refresh-key="queueItems.length" variant="minimal" />
+      <AdvancedScrollbar :scroller="listScrollers[group.id]" :refresh-key="group.items.length" variant="minimal" />
+    </div>
     </div>
   </section>
 
@@ -728,6 +750,13 @@ function timestamp(value: unknown): number {
   border-radius: 5px;
   background: color-mix(in srgb, var(--vscode-editor-background) 94%, var(--vscode-foreground) 6%);
   font-size: var(--font-size-sm);
+}
+
+.reliable-queue-group {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
 
 .reliable-queue-header,

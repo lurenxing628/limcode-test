@@ -75,6 +75,7 @@ import type { RuntimeWriteGate } from './runtimeWriteGate';
 const READ_ONLY_COMMANDS: ReadonlySet<string> = new Set<string>([
   BridgeMessageType.Ready,
   BridgeMessageType.GlobalSettingsFlushResult,
+  BridgeMessageType.GlobalSettingsActivity,
   BridgeMessageType.DebugCaptureObservation,
   BridgeMessageType.ConversationOpen,
   BridgeMessageType.ClientResync,
@@ -354,6 +355,17 @@ export class VscodeReliableKernelCommandRouter {
       payload: { state: await capture.state(), ...(analysis ? { analysis } : {}) } });
   }
 
+  private async waitForGlobalSettings(requestingClientId?: string): Promise<void> {
+    for (;;) {
+      const activityRevision = await this.settingsSaveBarrier.flush(requestingClientId);
+      const mutations = this.configurationMutationQueue;
+      await mutations;
+      // A new edit/connection or queued write while draining invalidates this execution fence.
+      if (activityRevision === this.settingsSaveBarrier.activityRevision
+        && mutations === this.configurationMutationQueue) return;
+    }
+  }
+
   private async dispatch(
     clientId: string,
     webview: vscode.Webview,
@@ -365,17 +377,19 @@ export class VscodeReliableKernelCommandRouter {
         const commandId = requireText(message.payload?.command?.commandId, 'commandId');
         const committed = await this.list('CommandReceipt', { source_kind: 'command', source_key: commandId }, 1);
         if (committed.length === 0) {
-          await this.settingsSaveBarrier.flush();
-          await this.configurationMutationQueue;
+          await this.waitForGlobalSettings(clientId);
         }
       }
     }
     switch (message.type) {
       case BridgeMessageType.Ready:
-        this.settingsSaveBarrier.attach(clientId, webview);
+        this.settingsSaveBarrier.attach(clientId, webview, message.payload?.settingsActivitySessionId);
         this.product.application.webviewFeed.reconnect(clientId);
         await this.postConfigurationSnapshot(webview, message.id);
         if (this.product.debugCapture.active()) this.post(webview, { id: randomUUID(), type: BridgeMessageType.DebugCaptureResult, channel: 'diagnostics', payload: { state: await this.product.debugCapture.state() } });
+        return;
+      case BridgeMessageType.GlobalSettingsActivity:
+        this.settingsSaveBarrier.observe(clientId, requirePayload(message.payload, '设置保存状态'));
         return;
       case BridgeMessageType.GlobalSettingsFlushResult:
         this.settingsSaveBarrier.receive(clientId, message.correlationId, requirePayload(message.payload, '设置保存确认'));
@@ -1877,8 +1891,7 @@ export class VscodeReliableKernelCommandRouter {
       });
       return;
     }
-    await this.settingsSaveBarrier.flush();
-    await this.configurationMutationQueue;
+    await this.waitForGlobalSettings();
     const activeTurns = await this.list('Turn', { conversation_id: conversationId, status: 'active' }, 2);
     if (activeTurns.length > 0) {
       this.postCompressionCommandResult(webview, correlationId, {
@@ -2016,8 +2029,7 @@ export class VscodeReliableKernelCommandRouter {
     const rootId = requireText(payload.expectedRootId, 'compression rebuild expectedRootId');
     let result: CompressionRebuildPreviewResultPayload;
     try {
-      await this.settingsSaveBarrier.flush();
-      await this.configurationMutationQueue;
+      await this.waitForGlobalSettings();
       await this.requireRow('Conversation', conversationId);
       const childExecutionId = await this.childExecutionIdForConversation(conversationId);
       const preview = await this.product.conversations.previewSourceReplayCompression({

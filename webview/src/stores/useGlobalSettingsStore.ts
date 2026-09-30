@@ -1282,6 +1282,19 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     }
   },
   actions: {
+    /** Cheap coordinator fence; unlike content comparison this never walks provider catalogs. */
+    executionPendingSaveState(sections: readonly GlobalSettingsSection[] = CHANNEL_SETTINGS_SECTIONS): 'loading' | 'saving' | 'blocked' | undefined {
+      if (sections.some(section => this.externalChangedSections[section] || this.failedSettingsSections[section])) return 'blocked';
+      if (sections.some(section => !this.loadedSections[section] || this.loadingSettingsSections[section])) return 'loading';
+      if (sections.some(section => this.pendingSettingsSections[section] || hasPendingSectionSave(section))) return 'saving';
+      return undefined;
+    },
+    /** Used by the synchronous bridge fence; no settings values leave the Webview here. */
+    executionSaveState(sections: readonly GlobalSettingsSection[] = CHANNEL_SETTINGS_SECTIONS): 'clean' | 'dirty' | 'loading' | 'saving' | 'blocked' {
+      const pending = this.executionPendingSaveState(sections);
+      if (pending) return pending;
+      return sections.some(section => isSectionDirty(this, section)) ? 'dirty' : 'clean';
+    },
     enqueueSettingsUpdate(payload: PendingGlobalSettingsUpdate): void {
       const coordinator = coordinatorFor(payload.section);
       coordinator.queued = { ...payload, settings: cloneSettingsValue(payload.settings) };
@@ -1350,7 +1363,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         });
       }
     },
-    flushForExecution(sections: readonly GlobalSettingsSection[] = CHANNEL_SETTINGS_SECTIONS): Promise<void> {
+    flushForExecution(sections: readonly GlobalSettingsSection[] = CHANNEL_SETTINGS_SECTIONS, requireLoaded = false): Promise<void> {
       if (llmProviderConfigsAutoSaveTimer !== undefined) this.saveLlmProviderConfigs();
       if (llmCompressionConfigsAutoSaveTimer !== undefined) this.saveLlmCompressionConfigs();
       return new Promise<void>((resolve, reject) => {
@@ -1372,7 +1385,7 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
             }
           }
           // 仅等待当前视图关心的 section 收敛。
-          if (sections.every((section) => !isSectionDirty(this, section) && !this.loadingSettingsSections[section])) finish();
+          if (sections.every((section) => (!requireLoaded || this.loadedSections[section]) && !isSectionDirty(this, section) && !this.loadingSettingsSections[section])) finish();
         };
         const unsubscribe = this.$subscribe(check, { detached: true, flush: 'sync' });
         const timeout = window.setTimeout(() => {

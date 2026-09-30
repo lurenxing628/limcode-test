@@ -71,6 +71,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
       return 'state';
     case BridgeMessageType.GlobalSettingsGet:
     case BridgeMessageType.GlobalSettingsUpdate:
+    case BridgeMessageType.GlobalSettingsActivity:
     case BridgeMessageType.GlobalSettingsFlushResult:
     case BridgeMessageType.ConversationSettingsGet:
     case BridgeMessageType.ConversationSettingsUpdate:

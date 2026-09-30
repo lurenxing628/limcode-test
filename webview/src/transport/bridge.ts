@@ -81,8 +81,8 @@ export class WebviewBridge {
     this.host.setState({ ...state, [key]: value });
   }
 
-  public ready(): string {
-    return this.request(BridgeMessageType.Ready, undefined, { channel: 'control' });
+  public ready(settingsActivitySessionId?: string): string {
+    return this.request(BridgeMessageType.Ready, settingsActivitySessionId ? { settingsActivitySessionId } : undefined, { channel: 'control' });
   }
 
   public on<TType extends ExtensionToWebviewMessage['type']>(

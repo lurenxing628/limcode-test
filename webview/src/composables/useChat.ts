@@ -1,3 +1,4 @@
+import { debugCaptureTrace } from '@webview/transport/debugCapture';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { computed, ref, watchEffect } from 'vue';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
@@ -222,6 +223,7 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
     || pending.conversationId !== payload.conversationId
     || pending.requestType !== payload.requestType
   ) return;
+  traceTurnInputTiming(pending, 'ack', payload);
   clearTurnInputRetry(payload.commandId);
   clearWithdrawalReceiptReplay(payload.commandId);
   if (payload.status === 'rejected') {
@@ -582,6 +584,26 @@ function clearTurnInputFailure(commandId: string): void {
   persistControls();
 }
 
+/** Content-free DevTools timing, only while the existing scoped debug capture is active. */
+function traceTurnInputTiming(
+  pending: PendingTurnInputSubmission,
+  phase: 'posted' | 'ack' | 'durable-observed',
+  result?: TurnInputResultPayload
+): void {
+  try {
+    // Submission precedes any ModelRequest; only the conversation capture scope is checked.
+    if (!debugCaptureTrace.active({ conversationId: pending.conversationId, modelRequestId: '' })) return;
+    console.debug('[LimCode][TurnInputTiming]', {
+      phase, commandId: pending.commandId, conversationId: pending.conversationId,
+      requestType: pending.requestType,
+      elapsedMs: Math.max(0, Date.now() - pending.submittedAt),
+      ...(pending.lastSentAt ? { attemptElapsedMs: Math.max(0, Date.now() - pending.lastSentAt) } : {}),
+      automaticRetryCount: pending.automaticRetryCount ?? 0,
+      ...(result ? { status: result.status, admitted: result.admitted } : {})
+    });
+  } catch { /* Diagnostics must never affect sending or its confirmation. */ }
+}
+
 function confirmTurnInputFromDurableReceipt(pending: PendingTurnInputSubmission): void {
   turnInputAcknowledgements.value = {
     ...turnInputAcknowledgements.value,
@@ -609,6 +631,7 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
       continue;
     }
     if (!observation.observed) continue;
+    traceTurnInputTiming(pending, 'durable-observed', pending.result);
     if (observation.durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
     clearTurnInputRetry(pending.commandId);
     delete next[pending.commandId];
@@ -830,6 +853,7 @@ function postTurnInputSubmission(
       ...(next.authority.model ? { model: next.authority.model } : {}),
       command: { ...next.command }
     }, { requestId: next.requestId });
+    traceTurnInputTiming(next, 'posted');
   } catch (error) {
     if (next.withdrawnAt) {
       pendingTurnInputSubmissions.value = {

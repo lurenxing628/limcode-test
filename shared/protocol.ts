@@ -1,4 +1,4 @@
-﻿import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
+import type { TurnExecutionPhase, TurnLifecycleStatus } from './turnLifecycle';
 import type { NativeSteeringReceipt, OpenAIResponsesNativeSettings } from './openAIResponsesNative';
 import type { DebugCaptureSettings, DebugCaptureCommand, DebugCaptureResult, DebugCaptureUiBatch, DebugCaptureUiAck } from './debugCapture';
 import type {
@@ -119,6 +119,7 @@ export enum BridgeMessageType {
   GlobalSettingsGet = 'settings.global.get',
   GlobalSettingsUpdate = 'settings.global.update',
   GlobalSettingsSnapshot = 'settings.global.snapshot',
+  GlobalSettingsActivity = 'settings.global.activity',
   GlobalSettingsFlush = 'settings.global.flush',
   GlobalSettingsFlushResult = 'settings.global.flush.result',
   /** Extension → Webview: write the unsent composer input into the Webview state now (the window is about to reload). */
@@ -3112,9 +3113,16 @@ export type GlobalSettingsSectionValue = GlobalSettingsRecord | NetworkSettingsR
 export interface GlobalSettingsGetPayload {
   section: GlobalSettingsSection;
 }
+/** Content-free, session-local save fence; never a substitute for settings expectedRevision CAS. */
+export interface GlobalSettingsActivityPayload {
+  sessionId: string;
+  revision: number;
+  state: 'clean' | 'dirty' | 'loading' | 'saving' | 'blocked';
+}
 export interface GlobalSettingsFlushResultPayload {
   status: 'saved' | 'failed';
   message?: string;
+  activity?: GlobalSettingsActivityPayload;
 }
 export interface GlobalSettingsSnapshotPayload {
   section: GlobalSettingsSection;
@@ -3291,7 +3299,7 @@ export interface AttachmentReloadResultPayload {
 export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.DebugCaptureCommand, DebugCaptureCommand>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservation, DebugCaptureUiBatch>
-  | BridgeEnvelope<BridgeMessageType.Ready, undefined>
+  | BridgeEnvelope<BridgeMessageType.Ready, { settingsActivitySessionId: string } | undefined>
   | BridgeEnvelope<BridgeMessageType.Ack, BridgeAckPayload>
   | BridgeEnvelope<BridgeMessageType.Ping, { text: string; sentAt: number }>
   | BridgeEnvelope<BridgeMessageType.GetWorkspaceInfo, undefined>
@@ -3354,6 +3362,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.CheckpointRestore, CheckpointRestorePayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsGet, GlobalSettingsGetPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsUpdate, GlobalSettingsUpdatePayload>
+  | BridgeEnvelope<BridgeMessageType.GlobalSettingsActivity, GlobalSettingsActivityPayload>
   | BridgeEnvelope<BridgeMessageType.GlobalSettingsFlushResult, GlobalSettingsFlushResultPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsGet, ConversationSettingsGetPayload>
   | BridgeEnvelope<BridgeMessageType.ConversationSettingsUpdate, ConversationSettingsUpdatePayload>

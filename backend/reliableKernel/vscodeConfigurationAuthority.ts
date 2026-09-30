@@ -103,7 +103,7 @@ import {
   renderReliableSystemPromptTemplate,
   type ReliablePromptRenderContext
 } from './runtimeContextRendering';
-import { loadRecordStore } from '../capabilities/vscodeStorage/recordStore';
+import { loadRecordStore, loadRecordStoreByIds } from '../capabilities/vscodeStorage/recordStore';
 import {
   createDefaultAgentBlueprints
 } from '../world/modules/agent/blueprints';
@@ -239,8 +239,20 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
   public previewWorkEnvironment(request: TurnWorkEnvironmentPreviewRequest): Promise<TurnWorkEnvironmentPreview> {
     return this.enqueueWorkspaceOperation(async () => {
       if (this.workspaceSynchronizationError) throw this.workspaceSynchronizationError;
-      const records = await this.loadRecords();
-      const workflowSelection = latestScopedSelection(records.conversationWorkflowSelections.filter((selection) =>
+      // Eligibility only observes directory selection. Do not load model, prompt, tool or
+      // compression catalogs here; compile() still reads and freezes the full fresh authority.
+      // Every preview uses current paths and source records, including peer-window changes.
+      const paths = this.getPaths();
+      const [workEnvironments, workflowSelections, environmentLinks, policyLinks] = await Promise.all([
+        this.loadWorkEnvironments(paths),
+        loadRecordStore<ConversationWorkflowSelectionRecord, 'selection'>(
+          paths.conversationWorkflowSelectionsRootUri, paths.conversationWorkflowSelectionsIndexUri, 'selection'),
+        loadRecordStore<ConversationWorkEnvironmentLinkRecord, 'link'>(
+          paths.conversationWorkEnvironmentLinksRootUri, paths.conversationWorkEnvironmentLinksIndexUri, 'link'),
+        loadRecordStore<WorkEnvironmentPolicyScopeLinkRecord, 'link'>(
+          paths.workEnvironmentPolicyScopeLinksRootUri, paths.workEnvironmentPolicyScopeLinksIndexUri, 'link')
+      ]);
+      const workflowSelection = latestScopedSelection((workflowSelections ?? []).filter((selection) =>
         selection.conversationId === request.conversationId && selection.role === 'active'
       ));
       const scopesHighToLow: ScopeReference[] = [
@@ -251,17 +263,26 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         { scopeKind: 'agent', scopeId: request.executorAgentId },
         { scopeKind: 'global' }
       ];
-      const selectedEnvironment = latestScopedSelection(records.conversationWorkEnvironmentLinks.filter((link) =>
+      const selectedEnvironment = latestScopedSelection((environmentLinks ?? []).filter((link) =>
         link.conversationId === request.conversationId && link.role === 'active'
       ));
+      const scopedPolicyLinks = (policyLinks ?? []).filter(link => link.role === 'active' && scopesHighToLow.some(scope =>
+        link.scopeKind === scope.scopeKind
+        && (scope.scopeKind === 'global' ? link.scopeId === undefined : link.scopeId === scope.scopeId)
+      ));
+      const policies = scopedPolicyLinks.length
+        ? await loadRecordStoreByIds<WorkEnvironmentPolicyRecord, 'policy'>(
+          paths.workEnvironmentPoliciesRootUri, paths.workEnvironmentPoliciesIndexUri, 'policy',
+          scopedPolicyLinks.map(link => link.workEnvironmentPolicyId))
+        : [];
       const policy = resolveScopedRecord(
-        records.workEnvironmentPolicyScopeLinks,
-        records.workEnvironmentPolicies,
+        scopedPolicyLinks,
+        policies,
         scopesHighToLow,
         (link) => link.workEnvironmentPolicyId
       );
       const selection = resolveWorkEnvironmentSelection({
-        environments: records.workEnvironments,
+        environments: workEnvironments,
         policy,
         inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
         explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
@@ -882,8 +903,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     return this.context;
   }
 
-  private async loadWorkEnvironments(): Promise<WorkEnvironmentRecord[]> {
-    const paths = this.getPaths();
+  private async loadWorkEnvironments(paths = this.getPaths()): Promise<WorkEnvironmentRecord[]> {
     const records = (await loadRecordStore<WorkEnvironmentRecord, 'workEnvironment'>(
       paths.workEnvironmentsRootUri,
       paths.workEnvironmentsIndexUri,
