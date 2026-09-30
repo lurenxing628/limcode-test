@@ -716,6 +716,14 @@ export function isPersistentAgentHandle(kind: ModelHandleKind): boolean {
     || kind === 'boardChannel' || kind === 'boardThread' || kind === 'boardPost';
 }
 
+/** Every short address a summary can retain must keep its identity across later request windows.
+ * Attachments have their own ConversationAttachmentHandleRegistry; all other refs live in recipes.
+ * Persistence reserves an address only: the target control plane still checks authorization.
+ */
+export function isPersistentContextHandle(kind: ModelHandleKind): boolean {
+  return isPersistentAgentHandle(kind) || kind === 'process' || kind === 'cursor' || kind === 'workEnvironment';
+}
+
 export function isCollaborationHandleTool(toolName: string): boolean {
   return ['list_agents', 'send_agent_message', 'followup_agent_task', 'read_agent_messages',
     'wait_agent_messages', 'agent_board'].includes(toolName) || isCrossConversationTool(toolName);

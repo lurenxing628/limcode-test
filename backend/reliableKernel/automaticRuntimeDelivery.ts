@@ -24,7 +24,7 @@ import type { ContentAddressedStore } from './contentAddressedStore';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { runtimeDeliverySourceTurn } from './childTaskTurn';
+import { childTaskRequestingParentTurn, runtimeDeliverySourceTurn } from './childTaskTurn';
 
 
 export type AutomaticRuntimeDeliveryReason =
@@ -204,7 +204,7 @@ export class AutomaticRuntimeDeliveryRouter {
    * collaboration message) or its source facts are incomplete. Such a delivery is never "routed".
    */
   public deliverySourceTurn(inboxItemId: string): Promise<string | null> {
-    return runtimeDeliverySourceTurn(this.database, inboxItemId);
+    return runtimeDeliverySourceTurn(this.database, this.contentStore, inboxItemId);
   }
 
   /**
@@ -215,6 +215,7 @@ export class AutomaticRuntimeDeliveryRouter {
     if (delivery.phase !== 'current_turn' || delivery.target_turn_id !== turnId) return false;
     const sourceTurnId = await runtimeDeliverySourceTurn(
       this.database,
+      this.contentStore,
       requireId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
     );
     return sourceTurnId !== null && sourceTurnId !== turnId;
@@ -655,7 +656,8 @@ export class AutomaticRuntimeDeliveryRouter {
     }
     const parentLink = parentLinks[0];
     const parentLinkId = requireId(parentLink.id, 'ChildExecutionParentLink.id');
-    const answerParentTurnId = requireId(parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
+    const answerParentTurnId = await childTaskRequestingParentTurn(this.database, this.contentStore,
+      childExecutionId, requireId(submission.turn_id, 'AnswerSubmission.turn_id'));
     steps.push(
       DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assertExactIds(
         { child_execution_id: childExecutionId },
@@ -663,7 +665,7 @@ export class AutomaticRuntimeDeliveryRouter {
       ),
       DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(parentLinkId, {
         child_execution_id: childExecutionId,
-        parent_turn_id: answerParentTurnId
+        parent_turn_id: parentLink.parent_turn_id
       })
     );
     const answerSourceTurnId = requireId(submission.turn_id, 'AnswerSubmission.turn_id');

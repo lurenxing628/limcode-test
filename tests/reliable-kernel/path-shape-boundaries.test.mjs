@@ -26,6 +26,7 @@ const dirLinkType = process.platform === 'win32' ? 'junction' : 'dir';
 const { isCanonicalPathInside, isPathBelow, isPathInside, isSamePath } = dist('backend/capabilities/filesystem/pathContainment.js');
 const { realPath } = dist('backend/capabilities/filesystem/realPath.js');
 const { FileMutationDispatcher } = dist('backend/reliableKernel/fileEffects.js');
+const { captureFilePlanningRoot } = dist('backend/reliableKernel/fileTargetBoundary.js');
 const { readFileTool } = dist('backend/world/modules/tools/definitions/readFile/index.js');
 const { normalizeDisplayPath } = dist('shared/displayPath.js');
 const { VscodeReliableToolHost } = dist('backend/application/reliableKernel/VscodeReliableToolHost.js');
@@ -84,6 +85,7 @@ test('文件写入/删除边界接受根目录本身带分隔符的工作区（�
   for (const targetPath of [path.relative(filesystemRoot, target), target]) {
     const actual = await FileMutationDispatcher.prototype.inspectActual.call(dispatcher, {
       workEnvironmentId: 'root-environment',
+      planningRoot: await captureFilePlanningRoot(filesystemRoot),
       targetPath
     });
     assert.equal(actual.kind, 'known', `${targetPath}: ${actual.error ?? ''}`);
@@ -131,7 +133,7 @@ test('原生 realpath 失败时文件写入/删除边界的调用点也走可移
   promises.realpath = async () => { throw Object.assign(new Error('illegal operation on a directory'), { code: 'EISDIR' }); };
   t.after(() => { promises.realpath = nativeRealpath; });
   const dispatcher = { resolveBoundary: (id) => ({ id, rootPath: directory }) };
-  const actual = await FileMutationDispatcher.prototype.inspectActual.call(dispatcher, { workEnvironmentId: 'ram-disk', targetPath: 'a.txt' });
+  const actual = await FileMutationDispatcher.prototype.inspectActual.call(dispatcher, { workEnvironmentId: 'ram-disk', planningRoot: await captureFilePlanningRoot(directory), targetPath: 'a.txt' });
   assert.equal(actual.kind, 'known', actual.error);
   assert.match(actual.digest, /^[0-9a-f]{64}$/);
 });

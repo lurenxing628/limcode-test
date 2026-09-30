@@ -3,8 +3,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { validateEditToolArguments, type ValidatedEditToolArguments } from '../../shared/editToolArguments';
 import { applyDeleteEdit, applyHunkEdit, applyInsertEdit } from '../capabilities/editStrategies';
-import { isSamePath } from '../capabilities/filesystem/pathContainment';
-import { realPath } from '../capabilities/filesystem/realPath';
+import { assertFilePlanningRoot, captureFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, resolvePlanningFileTarget, FilePathConflictError, type FilePlanningRoot } from './fileTargetBoundary';
 import { assertNotSqliteDatabaseFile } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import type { ToolDefinition } from '../world/modules/tools/registry';
 import type {
@@ -58,13 +57,14 @@ export class LocalFileToolPlanner {
     const content = requireString(args.content, 'write.content');
     const resolved = await this.resolvePath(inputPath, authority);
     signal?.throwIfAborted();
-    const current = await inspectLocalTarget(resolved.absolutePath);
+    const { current, planningRoot, targetPath } = await inspectPlannedTarget(resolved, {}, signal);
     signal?.throwIfAborted();
     if (current.kind === 'directory') throw new Error(`write target is a directory: ${inputPath}`);
     const fileMember: FileChangeProposalMemberInput = {
       operation: current.kind === 'missing' ? 'create_file' : 'replace_file',
       workEnvironmentId: resolved.workEnvironmentId,
-      targetPath: normalizedRelativeTarget(resolved),
+      planningRoot,
+      targetPath,
       ...(current.kind === 'file' ? {
         baseDigest: current.digest,
         baseContent: current.bytes,
@@ -75,7 +75,7 @@ export class LocalFileToolPlanner {
     };
     if (current.kind !== 'missing') return [fileMember];
     return [
-      ...await planMissingParentDirectories(resolved, signal),
+      ...await planMissingParentDirectories(resolved, planningRoot, targetPath, signal),
       fileMember
     ];
   }
@@ -89,7 +89,7 @@ export class LocalFileToolPlanner {
     const inputPath = args.path;
     const resolved = await this.resolvePath(inputPath, authority);
     signal?.throwIfAborted();
-    const current = await inspectLocalTarget(resolved.absolutePath);
+    const { current, planningRoot, targetPath } = await inspectPlannedTarget(resolved, {}, signal);
     signal?.throwIfAborted();
     if (current.kind !== 'file') throw new Error(`edit target must be an existing regular file: ${inputPath}`);
     const source = decodeUtf8Exact(current.bytes, inputPath);
@@ -97,7 +97,8 @@ export class LocalFileToolPlanner {
     return {
       operation: 'replace_file',
       workEnvironmentId: resolved.workEnvironmentId,
-      targetPath: normalizedRelativeTarget(resolved),
+      planningRoot,
+      targetPath,
       baseDigest: current.digest,
       baseContent: current.bytes,
       baseContentType: 'text/plain; charset=utf-8',
@@ -121,12 +122,13 @@ export class LocalFileToolPlanner {
       const inputPath = requireText(args.paths[index], `delete.paths[${index}]`);
       const resolved = await this.resolvePath(inputPath, authority);
       signal?.throwIfAborted();
-      const current = await inspectLocalTarget(resolved.absolutePath, { recursive: true });
+      const { current, planningRoot, targetPath } = await inspectPlannedTarget(resolved, { recursive: true }, signal);
       signal?.throwIfAborted();
       members.push({
         operation: current.kind === 'directory' ? 'delete_directory_tree' : 'delete_file',
         workEnvironmentId: resolved.workEnvironmentId,
-        targetPath: normalizedRelativeTarget(resolved),
+        planningRoot,
+        targetPath,
         baseDigest: current.kind === 'file'
           ? current.digest
           : current.kind === 'directory'
@@ -167,15 +169,40 @@ type LocalTarget =
   | { kind: 'file'; bytes: Buffer; digest: string }
   | { kind: 'directory' };
 
+async function inspectPlannedTarget(
+  resolved: ResolvedLocalToolPath,
+  options: { recursive?: boolean } = {},
+  signal?: AbortSignal
+): Promise<{ current: LocalTarget; planningRoot: FilePlanningRoot; targetPath: string }> {
+  const relative = normalizedRelativeTarget(resolved);
+  const planningRoot = await captureFilePlanningRoot(resolved.rootPath);
+  const target = await resolvePlanningFileTarget(planningRoot, relative);
+  const targetPath = path.relative(planningRoot.canonicalPath, target).split(path.sep).join('/');
+  const checkBoundary = async () => {
+    signal?.throwIfAborted();
+    await assertFilePlanningRoot(resolved.rootPath, planningRoot);
+    if (await resolvePlanningFileTarget(planningRoot, relative) !== target) {
+      throw new FilePathConflictError('File planning alias changed its physical target while reading.');
+    }
+    return resolveFileTarget(planningRoot, targetPath, true);
+  };
+  await checkBoundary();
+  const current = await inspectLocalTarget(target, options, checkBoundary, signal);
+  await checkBoundary();
+  return { current, planningRoot, targetPath };
+}
+
 async function inspectLocalTarget(
   absolutePath: string,
-  options: { recursive?: boolean } = {}
+  options: { recursive?: boolean },
+  checkBoundary: () => Promise<unknown>,
+  signal?: AbortSignal
 ): Promise<LocalTarget> {
   // Planning reads the current bytes in the extension host process, which also holds SQLite connections.
   await assertNotSqliteDatabaseFile(absolutePath, options);
   let stat;
   try {
-    stat = await fs.lstat(absolutePath);
+    stat = await fs.lstat(absolutePath, { bigint: true });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { kind: 'missing' };
     throw error;
@@ -183,7 +210,7 @@ async function inspectLocalTarget(
   if (stat.isSymbolicLink()) throw new Error(`Symbolic-link targets are not allowed: ${absolutePath}`);
   if (stat.isDirectory()) return { kind: 'directory' };
   if (!stat.isFile()) throw new Error(`Unsupported filesystem target type: ${absolutePath}`);
-  const bytes = await fs.readFile(absolutePath);
+  const bytes = await readFileWithIdentityFence(absolutePath, stat, checkBoundary, signal);
   return { kind: 'file', bytes, digest: createHash('sha256').update(bytes).digest('hex') };
 }
 
@@ -194,11 +221,13 @@ async function inspectLocalTarget(
  */
 async function planMissingParentDirectories(
   resolved: ResolvedLocalToolPath,
+  planningRoot: FilePlanningRoot,
+  relativeTarget: string,
   signal?: AbortSignal
 ): Promise<FileChangeProposalMemberInput[]> {
   signal?.throwIfAborted();
-  const relativeTarget = normalizedRelativeTarget(resolved);
-  const realRoot = await realPath(path.resolve(resolved.rootPath));
+  await assertFilePlanningRoot(resolved.rootPath, planningRoot);
+  const realRoot = planningRoot.canonicalPath;
   const realTarget = path.resolve(realRoot, relativeTarget.split('/').join(path.sep));
   const parent = path.dirname(realTarget);
   const relativeParent = path.relative(realRoot, parent);
@@ -218,11 +247,8 @@ async function planMissingParentDirectories(
         const stat = await fs.lstat(current);
         if (stat.isSymbolicLink()) throw new Error(`Symbolic-link write parents are not allowed: ${current}`);
         if (!stat.isDirectory()) throw new Error(`Write parent component is not a directory: ${current}`);
-        const canonical = await realPath(current);
+        await resolveFileTarget(planningRoot, path.relative(realRoot, current));
         signal?.throwIfAborted();
-        if (!isSamePath(canonical, current)) {
-          throw new Error(`Write parent does not resolve to its declared boundary path: ${current}`);
-        }
         continue;
       } catch (error) {
         if (!isNotFound(error)) throw error;
@@ -232,6 +258,7 @@ async function planMissingParentDirectories(
     members.push({
       operation: 'create_directory',
       workEnvironmentId: resolved.workEnvironmentId,
+      planningRoot,
       targetPath: path.relative(realRoot, current).split(path.sep).join('/')
     });
   }

@@ -39,6 +39,31 @@ function assertDeferred(report) {
   assert.deepEqual([report.merged, report.blocked, report.failures], [[], [], []]);
 }
 
+test('an empty historical source checkpoints and publishes its ledger without an empty transaction', async t => {
+  const f = await createConfigurationRoot();
+  f.database = await kernel.RuntimeDatabase.open(f.current.authority, { hostBootId: 'empty-source-merge' });
+  t.after(async () => { await f.database.close(); await removeConfigurationRoot(f.root); });
+  const transaction = f.database.transaction.bind(f.database);
+  f.database.transaction = async (steps, ...rest) => {
+    assert.ok(steps.length > 0, 'empty assertion sets are not transactions');
+    return transaction(steps, ...rest);
+  };
+  let checkpoints = 0;
+  const checkpoint = f.database.durabilityCheckpoint.bind(f.database);
+  f.database.durabilityCheckpoint = async () => {
+    checkpoints++;
+    assert.equal(await ledger(f), undefined, 'durability precedes the success ledger');
+    await checkpoint();
+  };
+  const result = await merge(f);
+  assert.deepEqual([result.deferred, result.blocked, result.failures], [[], [], []]);
+  assert.equal(result.merged.length, 1);
+  assert.equal(result.merged[0].insertedRows, 0);
+  assert.equal(result.merged[0].reusedRows, 0);
+  assert.equal(checkpoints, 1);
+  assert.equal((await ledger(f)).state, 'merged');
+});
+
 test('all-reused merge validates rows and checkpoints NORMAL writes before publishing its ledger', async (t) => {
   const f = await fixture(t);
   await f.database.transaction([repo('Conversation').insert(conversation('shared'))]);

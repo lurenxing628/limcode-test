@@ -1289,7 +1289,10 @@ function validateFile(file, failures) {
   if (file?.changeSet?.onePerToolCall !== true) failures.push('一个文件工具调用只能有一个FileChangeSet');
   if (file?.changeSet?.modelResult !== false) failures.push('FileChangeSet不能是模型最终结果');
   if (file?.decision?.firstResponseWins !== true) failures.push('文件审批必须只接受第一个决定');
-  if (file?.pathBoundary?.recursiveComponentSecurityWalk !== false) failures.push('自用插件不建设递归路径安全扫描');
+  if (file?.pathBoundary?.recursiveComponentSecurityWalk !== true) failures.push('规划读取与执行必须校验目标路径组成部分及规范化边界');
+  if (file?.pathBoundary?.sameAccountMaliciousProcessProtection !== false || file?.apply?.externalWriterAtomicCas !== false) {
+    failures.push('文件路径栅栏不得承诺防御同账户恶意进程或外部写入者的原子比较交换');
+  }
   if (file?.apply?.automaticRollback !== false || file?.apply?.automaticRetry !== false) failures.push('文件修改不自动回滚或重试');
   if (file?.apply?.overwriteWithoutBaseCheck !== false) failures.push('替换文件前必须核对基础摘要');
   if (file?.unresolvedClosure?.recoveryScanId !== 'recovery.file-change-unresolved') failures.push('未决FileChangeSet必须绑定稳定recovery scan ID');

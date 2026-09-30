@@ -4,6 +4,7 @@ import {
   type AttachmentCatalogState
 } from './attachmentCatalog';
 import { createHash } from 'node:crypto';
+import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNative';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
@@ -739,6 +740,50 @@ export function projectToolResultBatch(
     batchTargetTokens: batchTokens,
     mandatoryBatchOverTarget: mandatoryTokens > batchTokens
   };
+}
+
+/** The same bounded result and separate media blocks used by full-request tool responses.
+ * The caller freezes this copy before native delivery; the original ToolModelResult stays intact.
+ */
+export function projectNativeToolResultOutput(
+  toolName: string,
+  raw: unknown,
+  catalog: ModelHandleCatalog
+): NonNullable<OpenAIResponsesToolOutput['output']> {
+  const split = splitStoredToolResponseAttachments(raw);
+  const projected = projectToolResultBatch([{
+    toolName,
+    response: projectToolResultForModel(toolName, split.value, catalog)
+  }]).items[0].response;
+  const text = readModelTextToolResponse(projected)?.text ?? stableJson(projected);
+  if (split.parts.length === 0) return text;
+  return [
+    { type: 'input_text', text },
+    ...split.parts.map(({ inlineData }): Record<string, unknown> => {
+      const type = inlineData.mimeType.startsWith('image/') ? 'input_image' : 'input_file';
+      if (typeof inlineData.data === 'string') {
+        const dataUrl = `data:${inlineData.mimeType};base64,${inlineData.data}`;
+        return type === 'input_image'
+          ? { type, image_url: dataUrl }
+          : { type, file_data: dataUrl, ...(inlineData.name ? { filename: inlineData.name } : {}) };
+      }
+      return {
+        type, mimeType: inlineData.mimeType,
+        ...(inlineData.attachmentId ? { attachmentId: inlineData.attachmentId } : {}),
+        ...(inlineData.sourcePath ? { sourcePath: inlineData.sourcePath } : {}),
+        ...(inlineData.sha256 ? { sha256: inlineData.sha256 } : {}),
+        ...(inlineData.name ? { name: inlineData.name } : {})
+      };
+    })
+  ];
+}
+
+/** Only result text belongs to the shared result allowance; media keeps its separate accounting. */
+export function nativeToolOutputTextTokens(output: OpenAIResponsesToolOutput['output']): number {
+  if (output === undefined) return 0;
+  return typeof output === 'string' ? estimateTextTokens(output)
+    : safeSum(output.map(block => block.type === 'input_text' && typeof block.text === 'string'
+      ? estimateTextTokens(block.text) : 0));
 }
 
 /** Splits `total` over `demands`: small demands are met whole, the rest share what remains evenly. */

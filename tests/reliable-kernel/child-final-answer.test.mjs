@@ -55,7 +55,7 @@ const abortError = () => Object.assign(new Error('aborted by the fixture'), { na
  * wakes and the conversation runner are production code. `send` may block on the request signal,
  * so a stopped Turn really aborts its Provider request.
  */
-async function fixture(send, run) {
+async function fixture(send, run, options = {}) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-child-final-answer-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -80,6 +80,12 @@ async function fixture(send, run) {
     },
     async input(conversationId, commandId, text = commandId) { return runner.input({ conversationId, commandId, text }); },
     async terminated(turnId) { return f.until(async () => (await f.rows('TurnTermination', { turn_id: turnId }))[0], `Turn did not terminate: ${turnId}`); },
+    async admittedTurn(result) {
+      if (result.turnId) return result.turnId;
+      assert.ok(result.intentId, 'a queued input retains its exact TurnIntent');
+      return f.until(async () => (await f.rows('TurnIntent', { id: result.intentId }))[0]?.turn_id,
+        `Input was not admitted: ${result.intentId}`);
+    },
     async settled() {
       const pending = async () => ({ turns: (await f.rows('Turn', { status: 'active' })).map(turn => turn.id),
         deliveries: (await f.rows('RuntimeDelivery', { state: 'pending' })).map(row => [row.id, row.phase, row.target_turn_id]),
@@ -146,7 +152,8 @@ async function fixture(send, run) {
     await save('llm', { activeProviderConfigId: provider.id });
     const parent = await configuration.mutations.createAgent({ name: 'Synthetic root', kind: 'custom' });
     worker = await configuration.mutations.createAgent({ name: 'Synthetic worker', kind: 'custom' });
-    await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name) });
+    await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: definitions.map(tool => tool.declaration.name),
+      ...(options.maxChildAgentDepth ? { toolConfigs: { run_agent: { config: { maxChildAgentDepth: options.maxChildAgentDepth } } } } : {}) });
     const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(rootAuthority);
     app = await kernel.ReliableKernelApplication.open(rootAuthority, {
@@ -725,3 +732,262 @@ test('a child Turn completed on the native final-output path answers its parent 
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
+
+
+for (const [depth, recovered] of [[2, false], [3, false], [2, true]]) {
+  test(`reused nested children route every answer to its requesting generation at depth ${depth}${recovered ? ' after failed live handoff' : ''}`, { timeout: 90000 }, async () => {
+    const task = level => `NESTED_INITIAL_${depth}_${level}`;
+    const next = level => `NESTED_SECOND_${depth}_${level}`;
+    const FINAL = `NESTED_LEAF_FINAL_${depth}`;
+    const initialRequests = new Set(), secondRequests = new Set(), sawLeaf = new Set();
+    const dispatchTurns = new Map();
+    let second = false, leafWaiting = false, releaseLeaf = false, allowDelivery = !recovered, refused = 0;
+    await fixture(async (request, f, start) => {
+      let level = 0;
+      if (request.conversationId !== 'root') {
+        for (let candidate = 1; candidate <= depth; candidate++) {
+          if ((await f.child(task(candidate)))?.conversationId === request.conversationId) { level = candidate; break; }
+        }
+        assert.ok(level, 'every request belongs to the expected child tree');
+      }
+      if (!second) {
+        if (level < depth && !initialRequests.has(level)) {
+          initialRequests.add(level);
+          return toolsAnswer(call(`nested-spawn-${level}`, 'run_agent', {
+            operation: 'spawn', taskName: `level-${level + 1}`, prompt: task(level + 1), foregroundWaitMs: 10000
+          }));
+        }
+        return answer(`Initial level ${level} done.`);
+      }
+      if (text(start).includes(FINAL)) sawLeaf.add(level);
+      if (level < depth && !secondRequests.has(level)) {
+        secondRequests.add(level);
+        dispatchTurns.set(level, request.turnId);
+        return toolsAnswer(call(`nested-send-${level}`, 'run_agent', {
+          operation: 'send', childRef: 'A1', prompt: next(level + 1), foregroundWaitMs: 0
+        }));
+      }
+      if (level === depth) {
+        assert.ok(text(start).includes(next(level)));
+        leafWaiting = true;
+        await f.until(() => releaseLeaf, 'the test did not release the leaf');
+        return answer(FINAL);
+      }
+      if (depth === 3 && level > 0 && !sawLeaf.has(level)) {
+        // Keep every nested requester current until its own child's result reaches its boundary.
+        // The final-output fence must re-run this synthetic response with the pending answer.
+        await f.until(async () => (await f.rows('RuntimeDelivery', {
+          target_turn_id: request.turnId, phase: 'current_turn', state: 'pending'
+        })).length > 0, 'the current nested requester did not receive its child answer');
+      }
+      return answer(sawLeaf.has(level) ? `Level ${level} received ${FINAL}.` : `Second level ${level} waiting for its child.`);
+    }, async f => {
+      const first = await f.input('root', `nested-initial-${depth}-${recovered}`);
+      await f.terminated(first.turnId);
+      await f.settled();
+      const originalLineage = await f.rows('ChildExecutionParentLink');
+      const leaf = await f.child(task(depth));
+      assert.ok(leaf);
+      if (recovered) {
+        const deliveries = f.app.runtime.deliveries;
+        const create = deliveries.createAutomatic;
+        deliveries.createAutomatic = async function(input) {
+          const [inbox] = await f.rows('RuntimeInboxItem', { id: input.inboxItemId });
+          const [submission] = inbox?.source_kind === 'answer_submission' ? await f.rows('AnswerSubmission', { id: inbox.source_id }) : [];
+          if (second && submission?.answer_bridge_id === leaf.bridgeId && !allowDelivery) {
+            refused += 1;
+            throw Object.assign(new Error('fixture lost the live answer handoff'), { code: 'RUNTIME_TRANSACTION_ASSERTION_FAILED' });
+          }
+          return create.call(this, input);
+        };
+      }
+      second = true;
+      await f.input('root', `nested-second-${depth}-${recovered}`);
+      await f.until(() => leafWaiting && dispatchTurns.size === depth, 'the recursive second send never reached the leaf');
+      // Depth two covers completed requesters/runtime continuations; depth three keeps the
+      // nested requesters current and exercises the final-output fence at both inner levels.
+      if (depth === 2) for (const turnId of dispatchTurns.values()) await f.terminated(turnId);
+      releaseLeaf = true;
+      if (recovered) {
+        const submission = await f.until(async () => (await f.rows('AnswerSubmission', { answer_bridge_id: leaf.bridgeId }))
+          .find(row => row.submission_seq === 2n), 'the leaf did not publish its second answer');
+        await f.terminated(submission.turn_id);
+        await f.until(() => refused > 0, 'the live delivery was not refused');
+        const disposition = await f.app.runtime.answers.classifyDeliveryRecovery(submission.id);
+        assert.equal(disposition.kind, 'delivery_required');
+        assert.equal(disposition.automaticSourceTurnId, dispatchTurns.get(depth - 1));
+        assert.equal(disposition.command.phase, 'next_turn');
+        allowDelivery = true;
+        await f.coordinator.recoverStartup();
+      }
+      await f.until(() => sawLeaf.has(0), 'the nested answer did not propagate to the root');
+      await f.settled();
+      assert.deepEqual([...sawLeaf].filter(level => level < depth).sort(), Array.from({ length: depth }, (_, level) => level));
+      assert.deepEqual(await f.rows('ChildExecutionParentLink'), originalLineage, 'requesting generations never rewrite original parent lineage');
+      const { runtimeDeliverySourceTurn, childTaskRequestingParentTurn } = load('backend/reliableKernel/childTaskTurn.js');
+      for (let level = 1; level <= depth; level++) {
+        const child = await f.child(task(level));
+        const submissions = await f.rows('AnswerSubmission', { answer_bridge_id: child.bridgeId });
+        const last = submissions.sort((a, b) => Number(a.submission_seq - b.submission_seq)).at(-1);
+        const [inbox] = await f.rows('RuntimeInboxItem', { source_id: last.id });
+        const [delivery] = await f.rows('RuntimeDelivery', { inbox_item_id: inbox.id });
+        assert.equal(await runtimeDeliverySourceTurn(f.app.database, f.app.contentStore, inbox.id), dispatchTurns.get(level - 1));
+        assert.equal(await childTaskRequestingParentTurn(f.app.database, f.app.contentStore, child.childExecutionId, last.turn_id), dispatchTurns.get(level - 1));
+        assert.equal(delivery.state, 'consumed');
+        assert.notEqual(delivery.phase, 'notify_only');
+        const [handled] = await f.rows('RuntimeDeliveryInputLink', { delivery_id: delivery.id });
+        assert.ok(handled?.handled_at);
+      }
+    }, { maxChildAgentDepth: depth + 1 });
+  });
+}
+
+test('a delayed nested answer cannot wake a parent generation newer than its requester', { timeout: 90000 }, async () => {
+  const CHILD = 'STALE_NESTED_CHILD', GRANDCHILD = 'STALE_NESTED_GRANDCHILD', FINAL = 'STALE_NESTED_RESULT';
+  let phase = 0, rootSent = false, childSent = false, leafWaiting = false, releaseLeaf = false;
+  let requestingTurn, newestTurn;
+  await fixture(async (request, f, start) => {
+    const body = text(start);
+    assert.equal(body.includes(FINAL), false, 'a stale result was injected into a newer generation');
+    if (request.conversationId === 'root') {
+      if (!rootSent) {
+        rootSent = true;
+        return toolsAnswer(call(`stale-root-${phase}`, 'run_agent', phase === 0
+          ? { operation: 'spawn', taskName: 'child', prompt: CHILD, foregroundWaitMs: 10000 }
+          : { operation: 'send', childRef: 'A1', prompt: `CHILD_GENERATION_${phase}`, foregroundWaitMs: 0 }));
+      }
+      return answer('Root finished.');
+    }
+    if ((await f.child(GRANDCHILD))?.conversationId === request.conversationId) {
+      if (phase === 1) {
+        leafWaiting = true;
+        await f.until(() => releaseLeaf, 'the delayed leaf was never released');
+        return answer(FINAL);
+      }
+      return answer('Initial grandchild finished.');
+    }
+    if (phase < 2 && !childSent) {
+      childSent = true;
+      if (phase === 1) requestingTurn = request.turnId;
+      return toolsAnswer(call(`stale-child-${phase}`, 'run_agent', phase === 0
+        ? { operation: 'spawn', taskName: 'grandchild', prompt: GRANDCHILD, foregroundWaitMs: 10000 }
+        : { operation: 'send', childRef: 'A1', prompt: 'GRANDCHILD_SECOND_GENERATION', foregroundWaitMs: 0 }));
+    }
+    if (phase === 2) newestTurn = request.turnId;
+    return answer(`Child generation ${phase} finished.`);
+  }, async f => {
+    await f.input('root', 'stale-nested-initial');
+    await f.settled();
+    phase = 1; rootSent = false; childSent = false;
+    const second = await f.input('root', 'stale-nested-second');
+    await f.until(() => leafWaiting && requestingTurn, 'the second nested request never started');
+    await f.terminated(await f.admittedTurn(second));
+    await f.terminated(requestingTurn);
+    // The old child task is complete while its grandchild is still running; a new explicit send
+    // establishes a genuinely newer parent generation before that grandchild returns.
+    await f.until(async () => (await f.rows('Turn', { conversation_id: 'root', status: 'active' })).length === 0, 'root is still running');
+    phase = 2; rootSent = false;
+    const third = await f.input('root', 'stale-nested-third');
+    await f.until(() => newestTurn, 'the new parent generation never started');
+    await f.terminated(await f.admittedTurn(third));
+    await f.terminated(newestTurn);
+    releaseLeaf = true;
+    await f.settled();
+    const grandchild = await f.child(GRANDCHILD);
+    const last = (await f.rows('AnswerSubmission', { answer_bridge_id: grandchild.bridgeId }))
+      .sort((a, b) => Number(a.submission_seq - b.submission_seq)).at(-1);
+    const [inbox] = await f.rows('RuntimeInboxItem', { source_id: last.id });
+    const [delivery] = await f.rows('RuntimeDelivery', { inbox_item_id: inbox.id });
+    assert.equal(delivery.phase, 'notify_only');
+    assert.equal((await f.rows('RuntimeDeliveryInputLink', { delivery_id: delivery.id })).length, 0);
+    const { runtimeDeliverySourceTurn } = load('backend/reliableKernel/childTaskTurn.js');
+    assert.equal(await runtimeDeliverySourceTurn(f.app.database, f.app.contentStore, inbox.id), requestingTurn);
+    assert.notEqual(requestingTurn, newestTurn);
+  }, { maxChildAgentDepth: 3 });
+});
+
+test('a reused child normal answer may continue the exact stopped send requester', { timeout: 90000 }, async () => {
+  const TASK = 'STOPPED_SEND_TASK', NEXT = 'STOPPED_SEND_NEXT_TASK', FINAL = 'STOPPED_SEND_RESULT';
+  let second = false, rootSent = false, rootBlocked = false, childBlocked = false, releaseChild = false, sawFinal = false;
+  let requester, continuation;
+  await fixture(async (request, f, start, signal) => {
+    const body = text(start);
+    if (request.conversationId === 'root') {
+      if (body.includes(FINAL)) { sawFinal = true; continuation = request.turnId; return answer('Received the stopped send result.'); }
+      if (!rootSent) {
+        rootSent = true;
+        if (second) requester = request.turnId;
+        return toolsAnswer(call(second ? 'stopped-send' : 'stopped-spawn', 'run_agent', second
+          ? { operation: 'send', childRef: 'A1', prompt: NEXT, foregroundWaitMs: 0 }
+          : { operation: 'spawn', taskName: 'child', prompt: TASK, foregroundWaitMs: 10000 }));
+      }
+      if (second && request.turnId === requester) { rootBlocked = true; return untilAborted(signal); }
+      return answer('Initial root finished.');
+    }
+    if (body.includes(NEXT)) {
+      childBlocked = true;
+      await f.until(() => releaseChild, 'the second child task was not released');
+      return answer(FINAL);
+    }
+    return answer('Initial child finished.');
+  }, async f => {
+    await f.input('root', 'stopped-send-initial');
+    await f.settled();
+    second = true; rootSent = false;
+    const started = await f.input('root', 'stopped-send-second');
+    await f.until(() => rootBlocked && childBlocked, 'the second parent and child were not both active');
+    await f.runner.interrupt({ commandId: 'stop-send-requester', conversationId: 'root', turnId: started.turnId, reason: 'user stop' });
+    assert.equal((await f.terminated(started.turnId)).terminal_status, 'interrupted');
+    releaseChild = true;
+    await f.until(() => sawFinal, 'the normal send answer did not continue its stopped requester');
+    await f.settled();
+    assert.notEqual(continuation, started.turnId);
+    const child = await f.child(TASK);
+    const submission = (await f.rows('AnswerSubmission', { answer_bridge_id: child.bridgeId }))
+      .sort((a, b) => Number(a.submission_seq - b.submission_seq)).at(-1);
+    const [inbox] = await f.rows('RuntimeInboxItem', { source_id: submission.id });
+    const wake = f.wakes.find(item => item.inboxItemId === inbox.id);
+    assert.equal(wake.sourceTurnId, requester);
+    assert.equal(wake.action, 'start_continuation');
+    const [delivery] = await f.rows('RuntimeDelivery', { inbox_item_id: inbox.id });
+    assert.equal(delivery.target_turn_id, continuation);
+    assert.equal(delivery.state, 'consumed');
+  });
+});
+
+
+for (const sourceKind of ['process_receipt', 'answer_submission']) {
+  test(`child task provenance rejects a cyclic ${sourceKind} continuation within bounded reads`, async () => {
+    // Invalid persisted provenance must fail closed rather than recurse indefinitely. This is a
+    // read-only corruption fixture, not a claim that normal admission can create such a cycle.
+    const rows = {
+      ChildExecutionTurnLink: [{ id: 'membership', child_execution_id: 'child', turn_id: 'cycle-turn', turn_seq: 2n }],
+      TurnIntent: [{ id: 'intent', turn_id: 'cycle-turn' }],
+      RuntimeDeliveryIntentLink: [{ id: 'delivery-intent', turn_intent_id: 'intent', delivery_id: 'delivery' }],
+      RuntimeDelivery: [{ id: 'delivery', inbox_item_id: 'inbox' }],
+      RuntimeInboxItem: [{ id: 'inbox', source_kind: sourceKind, source_id: 'result' }],
+      ProcessReceipt: [{ id: 'result', process_id: 'process' }],
+      ProcessCompletionSourceLink: [{ id: 'process-source', process_id: 'process', source_turn_id: 'cycle-turn' }],
+      AnswerSubmission: [{ id: 'result', answer_bridge_id: 'bridge', turn_id: 'cycle-turn' }],
+      AnswerBridge: [{ id: 'bridge', child_execution_id: 'child' }]
+    };
+    let reads = 0;
+    const database = {
+      async snapshot(queries) {
+        reads += queries.length;
+        assert.ok(reads <= 30, 'cyclic lineage traversal exceeded its read bound');
+        return { snapshot: queries.map(query => {
+          const candidates = rows[query.domain] ?? [];
+          if (query.kind === 'get') return candidates.find(row => row.id === query.id) ?? null;
+          assert.equal(query.kind, 'list');
+          return candidates.filter(row => Object.entries(query.where ?? {}).every(([key, value]) => row[key] === value)).slice(0, query.limit);
+        }) };
+      }
+    };
+    const contentStore = { async read() { assert.fail('cyclic runtime lineage must not require preset content'); } };
+    const { childTaskRequestingParentTurn, isChildTaskTurn } = load('backend/reliableKernel/childTaskTurn.js');
+    assert.equal(await childTaskRequestingParentTurn(database, contentStore, 'child', 'cycle-turn'), null);
+    assert.equal(await isChildTaskTurn(database, contentStore, 'cycle-turn'), false);
+    assert.ok(reads <= 20);
+  });
+}

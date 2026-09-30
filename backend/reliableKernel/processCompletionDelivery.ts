@@ -1,4 +1,5 @@
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
+import { runtimeDeliverySourceTurn } from './childTaskTurn';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
@@ -1083,7 +1084,10 @@ export class ProcessCompletionDeliveryControlPlane {
       child_execution_id: childExecutionId
     }, 2);
     if (parentLinks.length !== 1) throw new Error('Answer wake requires one stable ChildExecutionParentLink.');
-    const sourceTurnId = requirePhaseFId(parentLinks[0].parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
+    const sourceTurnId = requirePhaseFId(
+      await runtimeDeliverySourceTurn(this.database, this.contentStore, requirePhaseFId(inbox.id, 'RuntimeInboxItem.id')),
+      'AnswerSubmission requesting parent Turn'
+    );
     const parentTurn = await this.requireExisting('Turn', sourceTurnId);
     const conversationId = requirePhaseFId(parentTurn.conversation_id, 'Parent Turn.conversation_id');
     if (conversationId !== targetConversationId) {

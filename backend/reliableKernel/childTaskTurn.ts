@@ -1,15 +1,17 @@
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
+import {
+  CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+  LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
+  childContinuationTurnId,
+  resolveLegacyContinuationWaitOperations
+} from './childSendLineage';
 import { requirePhaseFId } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { listAllDomainRows } from './repositoryPagination';
 import { TURN_EXECUTION_PRESET_CONTENT_TYPE } from './runtimeDeliveryContinuationIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
 
-/**
- * Read-only lineage facts about the Turns of a child task, shared by answer delivery, child
- * admission and collaboration wakes. Nothing here writes; every answer is derived from immutable
- * Turn, TurnIntent, delivery and preset facts.
- */
-
+/** Immutable dispatch lineage, shared by live delivery, recovery and task classification. */
 async function get(database: RuntimeDatabase, domain: string, id: unknown): Promise<DomainRow | null> {
   if (typeof id !== 'string' || id.length === 0) return null;
   return (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null;
@@ -20,38 +22,57 @@ async function list(database: RuntimeDatabase, domain: string, where: DomainRow,
 }
 
 /**
- * The source Turn a Process or child-answer result belongs to: the Turn that started the Process,
- * or the parent Turn that spawned the answering child. Collaboration messages have no source Turn
- * of their own, and incomplete source facts resolve to null so the caller keeps the Turn's own rules.
+ * The Turn that requested this result, never the recipient's latest Turn. For an answer this is
+ * the parent Turn that dispatched its exact child generation, not necessarily the spawn Turn.
+ * Collaboration messages and incomplete/non-task source facts have no source Turn.
  */
-export async function runtimeDeliverySourceTurn(database: RuntimeDatabase, inboxItemIdInput: string): Promise<string | null> {
-  const first = async (domain: string, where: DomainRow): Promise<DomainRow | null> => {
-    const rows = await list(database, domain, where, 2);
-    return rows.length === 1 ? rows[0] : null;
-  };
-  const inbox = await get(database, 'RuntimeInboxItem', requirePhaseFId(inboxItemIdInput, 'inboxItemId'));
+export function runtimeDeliverySourceTurn(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  inboxItemIdInput: string
+): Promise<string | null> {
+  return deliverySourceTurn(database, contentStore, requirePhaseFId(inboxItemIdInput, 'inboxItemId'), new Set());
+}
+
+async function deliverySourceTurn(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  inboxItemId: string,
+  visited: Set<string>
+): Promise<string | null> {
+  const inbox = await get(database, 'RuntimeInboxItem', inboxItemId);
   if (inbox?.source_kind === 'process_receipt') {
     const receipt = await get(database, 'ProcessReceipt', inbox.source_id);
-    const source = receipt ? await first('ProcessCompletionSourceLink', { process_id: receipt.process_id }) : null;
-    return typeof source?.source_turn_id === 'string' ? source.source_turn_id : null;
+    const sources = receipt ? await list(database, 'ProcessCompletionSourceLink', { process_id: receipt.process_id }, 2) : [];
+    return sources.length === 1 && typeof sources[0].source_turn_id === 'string' ? sources[0].source_turn_id : null;
   }
   if (inbox?.source_kind === 'answer_submission') {
     const submission = await get(database, 'AnswerSubmission', inbox.source_id);
     const bridge = submission ? await get(database, 'AnswerBridge', submission.answer_bridge_id) : null;
-    const parent = bridge ? await first('ChildExecutionParentLink', { child_execution_id: bridge.child_execution_id }) : null;
-    return typeof parent?.parent_turn_id === 'string' ? parent.parent_turn_id : null;
+    if (!submission || !bridge) return null;
+    return requestingParentTurn(database, contentStore,
+      requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id'),
+      requirePhaseFId(submission.turn_id, 'AnswerSubmission.turn_id'), visited);
   }
   return null;
 }
 
 /**
- * True when a child Turn works on the task its parent dispatched: the spawn Turn, a Turn a
- * run_agent send queued, or a continuation of such a Turn (its own background Process results,
- * the answers of its own children). Only these Turns answer the parent on the AnswerBridge. A Turn
- * the user started in the child Conversation, a peer's followup task, a Turn a peer message woke,
- * and continuations of those belong to someone else: they never publish, replace or deliver the
- * task answer.
+ * Resolves the immutable requester of one child task generation. Spawn uses its original parent
+ * link, send uses its generation-owned Operation -> ToolCall, and runtime continuations inherit
+ * the task whose result they handle. This does not relax the router's current-generation fences.
  */
+export function childTaskRequestingParentTurn(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  childExecutionId: string,
+  turnId: string
+): Promise<string | null> {
+  return requestingParentTurn(database, contentStore, requirePhaseFId(childExecutionId, 'childExecutionId'),
+    requirePhaseFId(turnId, 'turnId'), new Set());
+}
+
+/** Only parent-dispatched task Turns, including their result continuations, publish task answers. */
 export async function isChildTaskTurn(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
@@ -60,83 +81,109 @@ export async function isChildTaskTurn(
   const turnId = requirePhaseFId(turnIdInput, 'turnId');
   const memberships = await list(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 2);
   if (memberships.length !== 1) return false;
-  return isTaskTurnOf(
-    database,
-    contentStore,
-    requirePhaseFId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id'),
-    turnId,
-    new Set()
-  );
+  return await childTaskRequestingParentTurn(database, contentStore,
+    requirePhaseFId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id'), turnId) !== null;
 }
 
 /** Whether admitting this TurnIntent starts (or started) a Turn of the parent's task. */
-export function isChildTaskIntent(
+export async function isChildTaskIntent(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   childExecutionId: string,
   turnIntentId: string
 ): Promise<boolean> {
-  return isTaskIntent(database, contentStore, childExecutionId, turnIntentId, new Set());
+  return await requestingParentForIntent(database, contentStore, childExecutionId, turnIntentId, new Set()) !== null;
 }
 
-/**
- * The parent Conversation a child task Turn answers: the Conversation of the Turn that spawned its
- * child. Null for any Turn that is not a child task Turn, so its messages never wait for an answer.
- */
+/** The parent Conversation a task Turn answers; peer/user Turns never wait for a task answer. */
 export async function childTaskTurnAnswersConversation(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   turnIdInput: string
 ): Promise<string | null> {
   const turnId = requirePhaseFId(turnIdInput, 'turnId');
-  if (!await isChildTaskTurn(database, contentStore, turnId)) return null;
-  const [membership] = await list(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 1);
-  const [parentLink] = await list(database, 'ChildExecutionParentLink', { child_execution_id: membership.child_execution_id }, 2);
-  const parentTurn = parentLink ? await get(database, 'Turn', parentLink.parent_turn_id) : null;
+  const memberships = await list(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 2);
+  if (memberships.length !== 1) return null;
+  const parentTurnId = await childTaskRequestingParentTurn(database, contentStore,
+    requirePhaseFId(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id'), turnId);
+  const parentTurn = await get(database, 'Turn', parentTurnId);
   return typeof parentTurn?.conversation_id === 'string' ? parentTurn.conversation_id : null;
 }
 
-async function isTaskTurnOf(
+async function requestingParentTurn(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   childExecutionId: string,
   turnId: string,
   visited: Set<string>
-): Promise<boolean> {
-  if (visited.has(turnId)) return false;
+): Promise<string | null> {
+  if (visited.has(turnId)) return null;
   visited.add(turnId);
-  const memberships = await list(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 2);
-  if (memberships.length !== 1 || memberships[0].child_execution_id !== childExecutionId) return false;
-  const intents = await list(database, 'TurnIntent', { turn_id: turnId }, 2);
-  // The spawn Turn is created together with its ChildExecution and has no TurnIntent.
-  if (intents.length === 0) return true;
-  if (intents.length !== 1) throw new Error(`Turn ${turnId} was admitted from multiple TurnIntents.`);
-  return isTaskIntent(database, contentStore, childExecutionId, requirePhaseFId(intents[0].id, 'TurnIntent.id'), visited);
+  try {
+    const memberships = await list(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length !== 1 || memberships[0].child_execution_id !== childExecutionId) return null;
+    const intents = await list(database, 'TurnIntent', { turn_id: turnId }, 2);
+    if (intents.length === 0) {
+      // Only the spawn generation is created without a TurnIntent.
+      if (String(memberships[0].turn_seq) !== '1') return null;
+      const parents = await list(database, 'ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2);
+      return parents.length === 1 && typeof parents[0].parent_turn_id === 'string' ? parents[0].parent_turn_id : null;
+    }
+    if (intents.length !== 1) throw new Error(`Turn ${turnId} was admitted from multiple TurnIntents.`);
+    return await requestingParentForIntent(database, contentStore, childExecutionId,
+      requirePhaseFId(intents[0].id, 'TurnIntent.id'), visited);
+  } finally {
+    visited.delete(turnId);
+  }
 }
 
-async function isTaskIntent(
+async function requestingParentForIntent(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   childExecutionId: string,
   turnIntentId: string,
   visited: Set<string>
-): Promise<boolean> {
+): Promise<string | null> {
   const deliveryLinks = await list(database, 'RuntimeDeliveryIntentLink', { turn_intent_id: turnIntentId }, 2);
   if (deliveryLinks.length > 0) {
+    if (deliveryLinks.length !== 1) return null;
     const delivery = await get(database, 'RuntimeDelivery', deliveryLinks[0].delivery_id);
-    if (!delivery) return false;
-    // A continuation belongs to the Turn whose result it handles; a peer's task or message has none.
-    const sourceTurnId = await runtimeDeliverySourceTurn(
-      database,
-      requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id')
-    );
-    return sourceTurnId !== null && isTaskTurnOf(database, contentStore, childExecutionId, sourceTurnId, visited);
+    if (!delivery) return null;
+    const sourceTurnId = await deliverySourceTurn(database, contentStore,
+      requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id'), visited);
+    return sourceTurnId === null ? null : requestingParentTurn(database, contentStore, childExecutionId, sourceTurnId, visited);
   }
-  // Only run_agent send freezes the child-continuation preset for the Turn it queues.
+  // Only run_agent send freezes this preset; ordinary user/peer/retry input is not a parent task.
   const presets = await list(database, 'TurnExecutionPresetRevision', { intent_id: turnIntentId, revision_seq: '1' }, 2);
-  if (presets.length !== 1) return false;
+  if (presets.length !== 1) return null;
   const preset = await get(database, 'ContentObject', presets[0].preset_object_id);
-  if (!preset || preset.content_type !== TURN_EXECUTION_PRESET_CONTENT_TYPE) return false;
+  if (!preset || preset.content_type !== TURN_EXECUTION_PRESET_CONTENT_TYPE) return null;
   const value = JSON.parse((await contentStore.read(preset as ContentObjectMetadata)).toString('utf8')) as { kind?: unknown };
-  return value.kind === 'child-continuation';
+  if (value.kind !== 'child-continuation') return null;
+  const intentLinks = await list(database, 'ChildExecutionIntentLink', {
+    child_execution_id: childExecutionId, turn_intent_id: turnIntentId
+  }, 2);
+  if (intentLinks.length !== 1) return null;
+  const turnId = childContinuationTurnId(childExecutionId, turnIntentId);
+  let operations = await list(database, 'Operation', { owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND, owner_id: turnId }, 2);
+  if (operations.length === 0) {
+    // Preserve the existing exact shipped legacy identity check, shared with foreground recovery.
+    const bridges = await list(database, 'AnswerBridge', { child_execution_id: childExecutionId }, 2);
+    if (bridges.length !== 1) return null;
+    const legacy = await listAllDomainRows(database, 'Operation', {
+      owner_kind: LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND, owner_id: bridges[0].id
+    });
+    const allIntentLinks = await listAllDomainRows(database, 'ChildExecutionIntentLink', { child_execution_id: childExecutionId });
+    // The legacy resolver also supports a queued Intent, before it has acquired a Turn.
+    operations = await resolveLegacyContinuationWaitOperations(database, contentStore, {
+      childExecutionId, operations: legacy, intentLinks: allIntentLinks, turnIntentId
+    });
+  }
+  if (operations.length !== 1) return null;
+  const toolCall = await get(database, 'ToolCall', operations[0].tool_call_id);
+  const requester = toolCall ? await get(database, 'Turn', toolCall.turn_id) : null;
+  const parents = await list(database, 'ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2);
+  const originalParent = parents.length === 1 ? await get(database, 'Turn', parents[0].parent_turn_id) : null;
+  if (!requester || !originalParent || requester.conversation_id !== originalParent.conversation_id) return null;
+  return requirePhaseFId(requester.id, 'requesting parent Turn.id');
 }

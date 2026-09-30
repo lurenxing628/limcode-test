@@ -342,7 +342,7 @@ void management.upgradeHistoricalDataSetsOnStartup(context, isCurrent)
     if (!report) return;
     emit('batch', {
       merged: report.merged.map((item) => item.candidateId),
-      deferred: report.deferred.map((item) => ({ candidateId: item.candidateId, code: item.code, rows: item.size?.rows })),
+      deferred: report.deferred.map((item) => ({ candidateId: item.candidateId, code: item.code, message: item.message, rows: item.size?.rows })),
       blocked: report.blocked.map((item) => item.code),
       failures: report.failures.map((item) => item.code)
     });

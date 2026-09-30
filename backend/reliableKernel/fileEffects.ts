@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
+import { constants, type BigIntStats } from 'node:fs';
 import * as path from 'node:path';
 import {
   EffectControlPlane,
@@ -18,8 +19,7 @@ import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
-import { isCanonicalPathInside } from '../capabilities/filesystem/pathContainment';
-import { realPath } from '../capabilities/filesystem/realPath';
+import { assertFilePlanningRoot, FileMutationNotStartedError, FilePathConflictError, fileStateIdentity, normalizeFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, withFileMutationTargets, type FilePlanningRoot } from './fileTargetBoundary';
 import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 
 export type FileChangeOperation =
@@ -36,6 +36,7 @@ export interface FileChangeProposalMemberInput {
   operation: FileChangeOperation;
   workEnvironmentId: string;
   targetPath: string;
+  planningRoot: FilePlanningRoot;
   baseDigest?: string | null;
   /** Exact pre-mutation bytes for replace/delete. Persisted in CAS so a completed Diff can reopen. */
   baseContent?: string | Uint8Array;
@@ -123,6 +124,7 @@ interface FileEffectRequest {
   members: Array<{
     memberId: string;
     memberSeq: string;
+    planningRoot: FilePlanningRoot | null;
     operation: FileChangeOperation;
     workEnvironmentId: string;
     targetPath: string;
@@ -136,13 +138,6 @@ interface FileEffectRequest {
 const FILE_EFFECT_KIND = 'file_mutation' as const;
 const DIRECTORY_DIGEST = 'directory';
 const ACTIVE_TURN = 'active';
-
-class FilePathConflictError extends Error {
-  public constructor(message: string) {
-    super(message);
-    this.name = 'FilePathConflictError';
-  }
-}
 
 /** File proposal/approval facts. Actual filesystem work is isolated in FileMutationDispatcher. */
 export class FileChangeControlPlane {
@@ -183,6 +178,7 @@ export class FileChangeControlPlane {
     const now = this.timestamp();
     const preparedMembers: Array<{
       row: DomainRow;
+      planningRoot: FilePlanningRoot;
       baseContent?: PreparedContentObject;
       targetContent?: PreparedContentObject;
     }> = [];
@@ -208,6 +204,7 @@ export class FileChangeControlPlane {
           );
       const targetDigest = targetContent?.metadata.sha256 ?? targetDigestWithoutContent(member.operation);
       preparedMembers.push({
+        planningRoot: member.planningRoot,
         row: {
           id: memberId,
           change_set_id: changeSetId,
@@ -230,7 +227,8 @@ export class FileChangeControlPlane {
       canonicalJson({
         changeSetId,
         toolCallId,
-        members: preparedMembers.map(({ row }) => ({
+        members: preparedMembers.map(({ row, planningRoot }) => ({
+          planningRoot,
           memberId: row.id,
           memberSeq: String(row.member_seq),
           operation: row.operation,
@@ -396,20 +394,7 @@ export class FileChangeControlPlane {
 
     if (decision === 'approved') {
       const members = await this.readStoredMembers(changeSetId);
-      const request: FileEffectRequest = {
-        changeSetId,
-        members: members.map((member) => ({
-          memberId: member.id,
-          memberSeq: member.memberSeq.toString(),
-          operation: member.operation,
-          workEnvironmentId: member.workEnvironmentId,
-          targetPath: member.targetPath,
-          baseDigest: member.baseDigest,
-          baseContentObjectId: member.baseContentObjectId,
-          targetContentObjectId: member.targetContentObjectId,
-          targetDigest: member.targetDigest
-        }))
-      };
+      const request = fileEffectRequest(changeSetId, members);
       const requestContent = await this.contentStore.prepare(
         this.database,
         canonicalJson(request),
@@ -714,6 +699,26 @@ export class FileChangeControlPlane {
     });
   }
 
+  /** Bind the executable CAS payload to the complete approved proposal and its SQLite owners. */
+  public async readApprovedEffectRequest(effectIntentId: string): Promise<{ request: FileEffectRequest; matches: boolean }> {
+    const intent = await this.requireExisting('EffectIntent', effectIntentId);
+    const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
+    const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
+    if (intent.effect_kind !== FILE_EFFECT_KIND || operation.owner_kind !== 'file_change_set') {
+      throw new Error('File effect is not owned by its FileChangeSet operation.');
+    }
+    const changeSetId = requireId(operation.owner_id, 'Operation.owner_id');
+    const changeSet = await this.requireExisting('FileChangeSet', changeSetId);
+    if (changeSet.tool_call_id !== operation.tool_call_id) throw new Error('File effect belongs to another ToolCall.');
+    const decisions = await this.list('FileChangeDecision', { change_set_id: changeSetId }, 2);
+    if (decisions.length !== 1 || decisions[0].decision !== 'approved') throw new Error('File effect has no unique approved decision.');
+    const request = fileEffectRequest(changeSetId, await this.readStoredMembers(changeSetId));
+    let actual: FileEffectRequest;
+    try { actual = normalizeEffectRequest(await this.effects.readEffectRequest<FileEffectRequest>(effectIntentId)); }
+    catch { return { request, matches: false }; }
+    return { request, matches: canonicalJson(actual) === canonicalJson(request) };
+  }
+
   public async recoverDispatchedEffect(input: {
     source: PhaseDCommandSource;
     effectIntentId: string;
@@ -725,9 +730,10 @@ export class FileChangeControlPlane {
     if (intent.dispatch_state !== 'dispatched') throw new Error('Only dispatched file EffectIntent is recoverable.');
     const existingReceipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 2);
     if (existingReceipts.length > 0) return this.reconcileEffectReceipt(existingReceipts[0].id as string);
-    const request = await this.effects.readEffectRequest<FileEffectRequest>(intent.id as string);
+    const verified = await this.readApprovedEffectRequest(intent.id as string);
     const dispatcher = new FileMutationDispatcher(this.database, this.contentStore, this.effects, input.resolver);
-    const observation = await dispatcher.inspect(request);
+    const observation = verified.matches ? await dispatcher.inspect(verified.request)
+      : invalidRequestObservation(verified.request, 'outcome_unknown');
     const recorded = await this.effects.recordEffectReceipt({
       source,
       attemptId: intent.attempt_id as string,
@@ -919,32 +925,46 @@ export class FileChangeControlPlane {
     return { toolCall, execution: executions[0], turn, conversation };
   }
 
-  private async readStoredMembers(changeSetId: string): Promise<StoredMember[]> {
+  private async readStoredMembers(changeSetId: string): Promise<Array<StoredMember & { planningRoot: FilePlanningRoot | null }>> {
     const requestId = stablePhaseDId('interaction_request', `file-change:${changeSetId}`);
     const request = await this.requireExisting('InteractionRequest', requestId);
     const metadata = await this.requireContentObject(requireId(request.prompt_object_id, 'InteractionRequest.prompt_object_id'));
     const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as {
       changeSetId?: unknown;
+      toolCallId?: unknown;
       members?: unknown;
     };
-    if (body.changeSetId !== changeSetId || !Array.isArray(body.members) || body.members.length === 0) {
+    const changeSet = await this.requireExisting('FileChangeSet', changeSetId);
+    if (body.toolCallId !== changeSet.tool_call_id || body.changeSetId !== changeSetId || !Array.isArray(body.members) || body.members.length === 0) {
       throw new Error('File proposal CAS body does not match its FileChangeSet.');
     }
-    const rows = await Promise.all(body.members.map(async (entry, index) => {
+    const allRows = await listAllDomainRows(this.database, 'FileChangeSetMember', { change_set_id: changeSetId });
+    if (allRows.length !== body.members.length) throw new Error('File proposal member list is incomplete.');
+    const rowById = new Map(allRows.map(row => [row.id, row]));
+    const rows = body.members.map((entry, index) => {
       if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
         throw new TypeError('Invalid file proposal member reference.');
       }
       const reference = entry as Record<string, unknown>;
       const memberId = requireId(reference.memberId, 'proposal.memberId');
-      const row = await this.requireExisting('FileChangeSetMember', memberId);
+      const row = rowById.get(memberId);
+      if (!row) throw new Error('File proposal member does not belong to its FileChangeSet.');
       if (
         row.change_set_id !== changeSetId
         || requireBigInt(row.member_seq, 'FileChangeSetMember.member_seq') !== BigInt(index + 1)
       ) throw new Error('File proposal member reference does not match SQLite facts.');
-      return row;
-    }));
-    return Promise.all(rows.map(async (row) => {
-      const member = this.storedMemberFromRow(row);
+      const expected: Record<string, unknown> = {
+        memberSeq: String(row.member_seq), operation: row.operation, workEnvironmentId: row.work_environment_id,
+        targetPath: row.target_path, baseDigest: row.base_digest, baseContentObjectId: row.base_content_object_id,
+        targetContentObjectId: row.target_content_object_id, targetDigest: row.target_digest
+      };
+      if (Object.entries(expected).some(([key, value]) => reference[key] !== value)) {
+        throw new Error('File proposal member metadata does not match SQLite facts.');
+      }
+      return { row, planningRoot: reference.planningRoot == null ? null : normalizeFilePlanningRoot(reference.planningRoot) };
+    });
+    return Promise.all(rows.map(async ({ row, planningRoot }) => {
+      const member = { ...this.storedMemberFromRow(row), planningRoot };
       await this.assertStoredMemberContent(member);
       return member;
     }));
@@ -1149,8 +1169,10 @@ export class FileMutationDispatcher {
     }
     const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1);
     if (receipts.length > 0) throw new Error('File mutation EffectIntent already has a Receipt and cannot execute again.');
-    const request = await this.effects.readEffectRequest<FileEffectRequest>(effectIntentId);
-    return this.apply(request, signal);
+    const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
+    const verified = await control.readApprovedEffectRequest(effectIntentId);
+    return verified.matches ? this.apply(verified.request, signal)
+      : invalidRequestObservation(verified.request, 'conflict');
   }
 
   public async dispatchRecordAndReconcile(effectIntentIdInput: string, signal?: AbortSignal): Promise<{
@@ -1246,6 +1268,9 @@ export class FileMutationDispatcher {
 
   public async inspect(requestInput: FileEffectRequest): Promise<FileMutationObservation> {
     const request = normalizeEffectRequest(requestInput);
+    if (request.members.some(member => member.planningRoot === null)) {
+      return unfencedObservation(request, 'outcome_unknown');
+    }
     const members: FileMutationMemberObservation[] = [];
     for (const member of request.members) {
       const actual = await this.inspectActual(member);
@@ -1263,26 +1288,44 @@ export class FileMutationDispatcher {
     signal?: AbortSignal
   ): Promise<FileMutationObservation> {
     const request = normalizeEffectRequest(requestInput);
-    const members: FileMutationMemberObservation[] = [];
-    for (const member of request.members) {
-      if (signal?.aborted) {
-        members.push(memberObservation(
-          member,
-          'cancelled',
-          null,
-          'File mutation cancelled before this member was dispatched.'
-        ));
-        break;
-      }
-      const observation = await this.applyMember(member, signal);
-      members.push(observation);
-      if (observation.outcome !== 'succeeded') break;
+    if (request.members.some(member => member.planningRoot === null)) {
+      return unfencedObservation(request, 'conflict');
     }
-    return {
-      changeSetId: request.changeSetId,
-      outcome: aggregateFileMemberOutcomes(members),
-      members
-    };
+    try {
+    return await withFileMutationTargets(request.members.map(member => ({ root: member.planningRoot!, target: path.resolve(member.planningRoot!.canonicalPath, member.targetPath) })), async () => {
+      const members: FileMutationMemberObservation[] = [];
+      for (const member of request.members) {
+        if (signal?.aborted) {
+          members.push(memberObservation(
+            member,
+            'cancelled',
+            null,
+            'File mutation cancelled before this member was dispatched.'
+          ));
+          break;
+        }
+        const observation = await this.applyMember(member, signal);
+        members.push(observation);
+        if (observation.outcome !== 'succeeded') break;
+      }
+      return {
+        changeSetId: request.changeSetId,
+        outcome: aggregateFileMemberOutcomes(members),
+        members
+      };
+    }, signal);
+    } catch (error) {
+      if (!(error instanceof FileMutationNotStartedError)) throw error;
+      const handoff = handoffReason(signal);
+      if (handoff) throw handoff;
+      const outcome = signal?.aborted ? 'cancelled' : error.cause instanceof FilePathConflictError ? 'conflict' : 'failed';
+      return {
+        changeSetId: request.changeSetId,
+        outcome,
+        members: [memberObservation(request.members[0], outcome, null,
+          `File mutation did not start: ${errorMessage(error.cause)}`)]
+      };
+    }
   }
 
   private async applyMember(
@@ -1290,76 +1333,113 @@ export class FileMutationDispatcher {
     signal?: AbortSignal
   ): Promise<FileMutationMemberObservation> {
     let resolved: string;
+    let bytes: Buffer | undefined;
+    let before: PathInspection;
     try {
-      resolved = await resolveBoundedTarget(this.resolveBoundary, member.workEnvironmentId, member.targetPath);
+      // CAS/SQLite awaits finish before the last workspace snapshot. An editor change while
+      // target bytes are loading must be a conflict, never overwritten using an earlier digest.
+      bytes = member.operation === 'create_file' || member.operation === 'replace_file'
+        ? await this.readTargetBytes(member) : undefined;
+      resolved = await resolveBoundedTarget(this.resolveBoundary, member);
       await refuseSqliteDatabaseTarget(resolved, member.operation);
+      before = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal);
+      if (before.kind !== 'known') return memberObservation(member, before.kind === 'conflict' ? 'conflict' : 'outcome_unknown', null, before.error);
+      if (before.symlink) return memberObservation(member, 'conflict', before.digest, 'Target path is a symbolic link.');
+      const creates = member.operation === 'create_file' || member.operation === 'create_directory';
+      if (creates ? before.digest !== null : !sameDigest(before.digest, member.baseDigest)) {
+        return memberObservation(member, 'conflict', before.digest,
+          creates ? 'Create target already exists.' : 'baseDigest does not match the actual target.');
+      }
+      // Repeat root/component checks after all potentially slow inspection and SQLite guards.
+      await resolveBoundedTarget(this.resolveBoundary, member);
+      const final = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal);
+      if (!sameInspection(before, final)) {
+        return memberObservation(member, 'conflict', final.digest, 'File target identity or content changed before mutation.');
+      }
+      if (signal?.aborted) return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before member dispatch.');
     } catch (error) {
+      if (signal?.aborted) {
+        const handoff = handoffReason(signal);
+        if (handoff) throw handoff;
+        return memberObservation(member, 'cancelled', null, 'File mutation cancelled before member dispatch.');
+      }
       return error instanceof FilePathConflictError
         ? memberObservation(member, 'conflict', null, error.message)
         : memberObservation(member, 'outcome_unknown', null, errorMessage(error));
     }
-    const before = await inspectPath(resolved);
-    if (before.kind === 'unknown') return memberObservation(member, 'outcome_unknown', null, before.error);
-    if (before.symlink) return memberObservation(member, 'conflict', before.digest, 'Target path is a symbolic link.');
-    const creates = member.operation === 'create_file' || member.operation === 'create_directory';
-    if (creates ? before.digest !== null : !sameDigest(before.digest, member.baseDigest)) {
-      return memberObservation(
-        member,
-        'conflict',
-        before.digest,
-        creates ? 'Create target already exists.' : 'baseDigest does not match the actual target.'
-      );
-    }
-    if (signal?.aborted) {
-      return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before member dispatch.');
-    }
 
+    let mutationStarted = false;
     try {
       switch (member.operation) {
-        case 'create_file': {
-          const bytes = await this.readTargetBytes(member);
-          if (signal?.aborted) {
-            return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
-          }
-          await fs.writeFile(resolved, bytes, { flag: 'wx' });
+        case 'create_file':
+          mutationStarted = true;
+          await fs.writeFile(resolved, bytes!, { flag: 'wx' });
           break;
-        }
         case 'replace_file': {
-          const bytes = await this.readTargetBytes(member);
-          if (signal?.aborted) {
-            return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
-          }
-          await fs.writeFile(resolved, bytes, { flag: 'w' });
+          // Open without truncation and bind writes to the checked file identity. O_NOFOLLOW
+          // closes final-component link substitution where the OS exposes it. It is not CAS:
+          // an unrelated process can still change bytes after the final read and before write.
+          const handle = await fs.open(resolved, constants.O_RDWR | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+          try {
+            const stat = await handle.stat({ bigint: true });
+            if (!stat.isFile() || before.kind !== 'known' || !sameFileState(before.identity, stat)) {
+              return memberObservation(member, 'conflict', null, 'Opened file target identity or type changed before replacement.');
+            }
+            const current = await handle.readFile({ signal });
+            const afterRead = await handle.stat({ bigint: true });
+            if (before.kind !== 'known' || !sameFileState(before.identity, stat)
+              || !sameFileState(fileIdentity(stat), afterRead)
+              || digestBytes(current) !== member.baseDigest) {
+              return memberObservation(member, 'conflict', digestBytes(current), 'File target changed before replacement.');
+            }
+            await resolveBoundedTarget(this.resolveBoundary, member);
+            const pathStat = await fs.lstat(resolved, { bigint: true });
+            if (!sameFileState(fileIdentity(afterRead), pathStat)) {
+              return memberObservation(member, 'conflict', null, 'File target identity changed before replacement.');
+            }
+            if (signal?.aborted) return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
+            mutationStarted = true;
+            // Explicit positions: readFile advanced the handle offset to EOF.
+            let offset = 0;
+            while (offset < bytes!.length) {
+              const written = await handle.write(bytes!, offset, bytes!.length - offset, offset);
+              if (written.bytesWritten === 0) throw new Error('File replacement made no write progress.');
+              offset += written.bytesWritten;
+            }
+            await handle.truncate(bytes!.length);
+          } finally { await handle.close(); }
           break;
         }
         case 'delete_file':
+          mutationStarted = true;
           await fs.unlink(resolved);
           break;
         case 'create_directory':
+          mutationStarted = true;
           await fs.mkdir(resolved);
           break;
         case 'delete_directory_tree':
+          mutationStarted = true;
           await fs.rm(resolved, { recursive: true, force: false });
           break;
       }
     } catch (error) {
-      const afterFailure = await inspectPath(resolved);
-      if (afterFailure.kind === 'unknown') {
-        return memberObservation(member, 'outcome_unknown', null, `${errorMessage(error)}; ${afterFailure.error}`);
+      if (!mutationStarted) {
+        const handoff = handoffReason(signal);
+        if (handoff) throw handoff;
+        return memberObservation(member, signal?.aborted ? 'cancelled' : error instanceof FilePathConflictError ? 'conflict' : 'failed', before.digest, errorMessage(error));
       }
+      const afterFailure = await this.inspectActual(member);
+      if (afterFailure.kind !== 'known') return memberObservation(member, 'outcome_unknown', null, `${errorMessage(error)}; ${afterFailure.error}`);
       const reconciled = reconcileMemberObservation(member, afterFailure);
       if (reconciled.outcome === 'succeeded') return reconciled;
       if (member.operation === 'delete_directory_tree') {
-        return memberObservation(
-          member,
-          'outcome_unknown',
-          afterFailure.digest,
-          `Recursive deletion failed after dispatch; partial mutation cannot be disproved: ${errorMessage(error)}`
-        );
+        return memberObservation(member, 'outcome_unknown', afterFailure.digest,
+          `Recursive deletion failed after dispatch; partial mutation cannot be disproved: ${errorMessage(error)}`);
       }
       return { ...reconciled, error: errorMessage(error) };
     }
-    return reconcileMemberObservation(member, await inspectPath(resolved));
+    return reconcileMemberObservation(member, await this.inspectActual(member));
   }
 
   private async readTargetBytes(member: FileEffectRequest['members'][number]): Promise<Buffer> {
@@ -1375,9 +1455,9 @@ export class FileMutationDispatcher {
 
   private async inspectActual(member: FileEffectRequest['members'][number]): Promise<PathInspection> {
     try {
-      const resolved = await resolveBoundedTarget(this.resolveBoundary, member.workEnvironmentId, member.targetPath);
+      const resolved = await resolveBoundedTarget(this.resolveBoundary, member);
       await refuseSqliteDatabaseTarget(resolved, member.operation);
-      return inspectPath(resolved);
+      return inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member));
     } catch (error) {
       return error instanceof FilePathConflictError
         ? { kind: 'conflict', digest: null, symlink: false, error: error.message }
@@ -1401,41 +1481,21 @@ export class FileMutationDispatcher {
 }
 
 type PathInspection =
-  | { kind: 'known'; digest: string | null; symlink: boolean; error?: undefined }
+  | { kind: 'known'; digest: string | null; symlink: boolean; identity?: string; error?: undefined }
   | { kind: 'conflict'; digest: null; symlink: false; error: string }
   | { kind: 'unknown'; digest: null; symlink: false; error: string };
 
 async function resolveBoundedTarget(
   resolver: WorkEnvironmentBoundaryResolver,
-  workEnvironmentId: string,
-  targetPath: string
+  member: FileEffectRequest['members'][number]
 ): Promise<string> {
-  const boundary = await resolver(workEnvironmentId);
-  if (!boundary || boundary.id !== workEnvironmentId) {
-    throw new FilePathConflictError(`WorkEnvironment is not registered: ${workEnvironmentId}`);
+  if (!member.planningRoot) throw new FilePathConflictError('File proposal lacks planning root identity; replan before applying it.');
+  const boundary = await resolver(member.workEnvironmentId);
+  if (!boundary || boundary.id !== member.workEnvironmentId) {
+    throw new FilePathConflictError(`WorkEnvironment is not registered: ${member.workEnvironmentId}`);
   }
-  const configuredRoot = path.resolve(requireText(boundary.rootPath, 'WorkEnvironment.rootPath'));
-  const realRoot = await realPath(configuredRoot);
-  const target = path.isAbsolute(targetPath)
-    ? path.resolve(targetPath)
-    : path.resolve(realRoot, targetPath);
-  assertWithin(realRoot, target);
-  const parent = path.dirname(target);
-  let realParent: string;
-  try {
-    realParent = await realPath(parent);
-  } catch (error) {
-    if (isNotFound(error)) throw new FilePathConflictError('File target parent does not exist.');
-    throw error;
-  }
-  assertWithin(realRoot, realParent);
-  try {
-    const stat = await fs.lstat(target);
-    if (stat.isSymbolicLink()) throw new FilePathConflictError('Target path is a symbolic link.');
-  } catch (error) {
-    if (!isNotFound(error)) throw error;
-  }
-  return target;
+  await assertFilePlanningRoot(requireText(boundary.rootPath, 'WorkEnvironment.rootPath'), member.planningRoot);
+  return resolveFileTarget(member.planningRoot, member.targetPath);
 }
 
 /**
@@ -1450,29 +1510,33 @@ async function refuseSqliteDatabaseTarget(
   if (refusal) throw new FilePathConflictError(sqliteDatabaseFileRefusalMessage(refusal));
 }
 
-/** Both sides derive from realpath of the same root, so compare exactly (see isCanonicalPathInside). */
-function assertWithin(root: string, candidate: string): void {
-  if (!isCanonicalPathInside(root, candidate)) {
-    throw new FilePathConflictError('File target escapes the registered WorkEnvironment boundary.');
-  }
-}
-
-async function inspectPath(target: string): Promise<PathInspection> {
+async function inspectPath(target: string, checkBoundary: () => Promise<unknown>, signal?: AbortSignal): Promise<PathInspection> {
   try {
-    const stat = await fs.lstat(target);
-    if (stat.isSymbolicLink()) return { kind: 'known', digest: 'symlink', symlink: true };
-    if (stat.isDirectory()) return { kind: 'known', digest: DIRECTORY_DIGEST, symlink: false };
-    if (!stat.isFile()) return { kind: 'known', digest: `other:${stat.mode}`, symlink: false };
-    const bytes = await fs.readFile(target);
-    return {
-      kind: 'known',
-      digest: createHash('sha256').update(bytes).digest('hex'),
-      symlink: false
-    };
+    const stat = await fs.lstat(target, { bigint: true });
+    const identity = fileIdentity(stat);
+    if (stat.isSymbolicLink()) return { kind: 'known', digest: 'symlink', symlink: true, identity };
+    if (stat.isDirectory()) return { kind: 'known', digest: DIRECTORY_DIGEST, symlink: false, identity };
+    if (!stat.isFile()) return { kind: 'known', digest: `other:${stat.mode}`, symlink: false, identity };
+    const bytes = await readFileWithIdentityFence(target, stat, checkBoundary, signal);
+    return { kind: 'known', digest: digestBytes(bytes), symlink: false, identity };
   } catch (error) {
+    if (signal?.aborted) throw signal.reason ?? error;
+    if (error instanceof FilePathConflictError) return { kind: 'conflict', digest: null, symlink: false, error: error.message };
     if (isNotFound(error)) return { kind: 'known', digest: null, symlink: false };
     return { kind: 'unknown', digest: null, symlink: false, error: errorMessage(error) };
   }
+}
+
+function fileIdentity(stat: BigIntStats): string {
+  return fileStateIdentity(stat);
+}
+function sameFileState(identity: string | undefined, stat: BigIntStats): boolean {
+  return identity === fileIdentity(stat);
+}
+function digestBytes(bytes: Buffer): string { return createHash('sha256').update(bytes).digest('hex'); }
+function sameInspection(left: PathInspection, right: PathInspection): boolean {
+  return left.kind === 'known' && right.kind === 'known' && left.digest === right.digest
+    && left.identity === right.identity && left.symlink === right.symlink;
 }
 
 function reconcileMemberObservation(
@@ -1493,6 +1557,38 @@ function reconcileMemberObservation(
   }
   if (sameDigest(actual.digest, member.baseDigest)) return memberObservation(member, 'failed', actual.digest, 'Mutation was not applied.');
   return memberObservation(member, 'conflict', actual.digest, 'Actual digest matches neither baseDigest nor targetDigest.');
+}
+
+function fileEffectRequest(changeSetId: string, members: Array<StoredMember & { planningRoot: FilePlanningRoot | null }>): FileEffectRequest {
+  return {
+    changeSetId,
+    members: members.map(member => ({
+      memberId: member.id, memberSeq: member.memberSeq.toString(), operation: member.operation,
+      workEnvironmentId: member.workEnvironmentId, targetPath: member.targetPath, planningRoot: member.planningRoot,
+      baseDigest: member.baseDigest, baseContentObjectId: member.baseContentObjectId,
+      targetContentObjectId: member.targetContentObjectId, targetDigest: member.targetDigest
+    }))
+  };
+}
+
+function invalidRequestObservation(request: FileEffectRequest, outcome: 'conflict' | 'outcome_unknown'): FileMutationObservation {
+  return {
+    changeSetId: request.changeSetId, outcome,
+    members: [memberObservation(request.members[0], outcome, null,
+      'File effect request does not match the complete approved proposal. Replan instead of replaying it.')]
+  };
+}
+
+/** Missing execution evidence never authorizes inspecting today's workspace or re-running an effect. */
+function unfencedObservation(request: FileEffectRequest, outcome: 'conflict' | 'outcome_unknown'): FileMutationObservation {
+  return {
+    changeSetId: request.changeSetId,
+    outcome,
+    members: [memberObservation(request.members[0], outcome, null,
+      outcome === 'conflict'
+        ? 'File proposal lacks planning root identity; replan before applying it. No file mutation was started.'
+        : 'Dispatched file effect lacks planning root identity; its prior outcome cannot be proved. Replan instead of replaying it.')]
+  };
 }
 
 function memberObservation(
@@ -1535,6 +1631,7 @@ function fileOutcomeToToolOutcome(outcome: FileMutationOutcome): Exclude<ToolOut
 }
 
 function normalizeProposalMember(input: FileChangeProposalMemberInput): {
+  planningRoot: FilePlanningRoot;
   operation: FileChangeOperation;
   workEnvironmentId: string;
   targetPath: string;
@@ -1576,6 +1673,7 @@ function normalizeProposalMember(input: FileChangeProposalMemberInput): {
   }
   return {
     operation,
+    planningRoot: normalizeFilePlanningRoot(input.planningRoot),
     workEnvironmentId: requireId(input.workEnvironmentId, 'workEnvironmentId'),
     targetPath: requireText(input.targetPath, 'targetPath'),
     baseDigest,
@@ -1598,6 +1696,7 @@ function normalizeEffectRequest(value: FileEffectRequest): FileEffectRequest {
   }
   const members = value.members.map((member) => ({
     memberId: requireId(member.memberId, 'memberId'),
+    planningRoot: member.planningRoot == null ? null : normalizeFilePlanningRoot(member.planningRoot),
     memberSeq: requireDecimalString(member.memberSeq, 'memberSeq'),
     operation: requireOperation(member.operation),
     workEnvironmentId: requireId(member.workEnvironmentId, 'workEnvironmentId'),

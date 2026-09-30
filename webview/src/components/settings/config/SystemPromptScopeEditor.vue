@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue';
+import { computed, nextTick, ref } from 'vue';
+import { useGuardedSettingsDraft } from '@webview/composables/useGuardedSettingsDraft';
 import type { ConfigScopeKind } from '@shared/protocol';
 import { DEFAULT_INTEGRATED_SYSTEM_PROMPT } from '@shared/defaultSystemPrompt';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
@@ -17,12 +18,17 @@ const { loading: promptLoading, text: promptLoadingText } = useSettingsLoadingTe
 const scroller = ref<HTMLTextAreaElement | null>(null);
 const defaultScroller = ref<HTMLTextAreaElement | null>(null);
 const builtInGlobalPrompt = DEFAULT_INTEGRATED_SYSTEM_PROMPT;
-const draft = ref('');
-const inheritMode = ref(false);
-const currentScopeKey = ref('');
 const local = computed(() => store.localPromptFor(props.scopeKind, props.scopeId));
 const resolution = computed(() => store.promptResolutionFor(props.scopeKind, props.scopeId));
 const placeholders = computed(() => store.systemPlaceholders);
+const draftState = useGuardedSettingsDraft(
+  () => JSON.stringify([props.scopeKind, props.scopeId ?? '']),
+  () => ({ text: local.value.prompt?.text ?? (props.scopeKind === 'global' ? '' : resolution.value.inheritedText),
+    inherit: props.scopeKind !== 'global' && !local.value.prompt })
+);
+const draft = computed({ get: () => draftState.value.value.text, set: (text: string) => { draftState.value.value = { ...draftState.value.value, text }; } });
+const inheritMode = computed({ get: () => draftState.value.value.inherit, set: (inherit: boolean) => { draftState.value.value = { ...draftState.value.value, inherit }; } });
+const draftChangedRemotely = draftState.remoteChanged;
 const isInherited = computed(() => props.scopeKind !== 'global' && inheritMode.value && !local.value.prompt);
 const canRestoreScope = computed(() => props.scopeKind === 'global' ? !!local.value.link || !!local.value.prompt : !isInherited.value);
 const restoreButtonLabel = computed(() => props.scopeKind === 'global' ? '恢复默认' : '恢复继承');
@@ -45,26 +51,6 @@ const promptPlaceholder = computed(() => isInherited.value
   : '输入当前范围要追加的系统提示词…'
 );
 
-watch(() => [props.scopeKind, props.scopeId, local.value.prompt?.id, local.value.prompt?.text, resolution.value.inheritedText], () => {
-  const nextScopeKey = `${props.scopeKind}:${props.scopeId ?? ''}`;
-  const scopeChanged = currentScopeKey.value !== nextScopeKey;
-  currentScopeKey.value = nextScopeKey;
-
-  if (props.scopeKind === 'global') {
-    inheritMode.value = false;
-    draft.value = local.value.prompt?.text ?? '';
-    return;
-  }
-  if (local.value.prompt) {
-    inheritMode.value = false;
-    draft.value = local.value.prompt.text;
-    return;
-  }
-  if (scopeChanged || inheritMode.value) {
-    inheritMode.value = true;
-    draft.value = resolution.value.inheritedText;
-  }
-}, { immediate: true });
 
 function onInput(event: Event): void {
   if (isInherited.value) return;
@@ -73,17 +59,14 @@ function onInput(event: Event): void {
 
 function save(): void {
   if (!canSave.value) return;
+  draft.value = draft.value.trim();
+  draftState.markSubmitted();
   store.setPromptForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} System Prompt`);
 }
 
 function clear(): void {
   store.clearPromptScope(props.scopeKind, props.scopeId);
-  if (props.scopeKind === 'global') {
-    draft.value = '';
-    return;
-  }
-  inheritMode.value = true;
-  draft.value = resolution.value.inheritedText;
+  draftState.reset();
 }
 
 function startCustom(): void {
@@ -146,6 +129,10 @@ function insertPlaceholder(token: string): void {
       <button type="button" class="secondary" :disabled="!canRestoreScope" @click="clear">{{ restoreButtonLabel }}</button>
       <span v-if="isInherited">{{ inheritedStatusText }}</span>
       <span v-else>{{ store.status }}</span>
+      <template v-if="draftChangedRemotely">
+        <span role="status">已保存内容有更新，当前草稿已保留</span>
+        <button type="button" class="secondary" @click="draftState.reset()">读取已保存值</button>
+      </template>
     </div>
   </section>
 </template>

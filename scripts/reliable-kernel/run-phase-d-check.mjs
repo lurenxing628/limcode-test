@@ -1093,7 +1093,7 @@ async function checkFileProposalResultSeparated() {
     const mainTool = await createTool(ctx, effects, 'file-main', 'write');
     const targetPath = path.join(workspace, 'main.txt');
     await fs.writeFile(targetPath, 'base');
-    const proposal = await files.propose({
+    const proposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-main:proposal'),
       toolCallId: mainTool.toolCallId,
       members: [{
@@ -1147,7 +1147,7 @@ async function checkFileProposalResultSeparated() {
       ['create_directory', 'nested/level'],
       ['create_file', 'nested/level/source.txt']
     ]);
-    const nestedProposal = await files.propose({
+    const nestedProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-nested-parent-create:proposal'),
       toolCallId: nestedWriteTool.toolCallId,
       members: nestedMembers
@@ -1193,12 +1193,12 @@ async function checkFileProposalResultSeparated() {
         arguments: { path: 'linked-parent/escape.txt', content: 'must-not-escape' }
       },
       { snapshotId: 'authority-file-linked-parent', document: {} }
-    ), /Symbolic-link write parents are not allowed/);
+    ), /Symbolic-link (?:write parents|file path components) are not allowed/);
     assert.equal(await exists(path.join(outsideWriteRoot, 'escape.txt')), false);
     assertions.push('缺失父目录规划逐级lstat，符号链接父级在提案前拒绝且不向边界外写入');
 
     const rejectTool = await createTool(ctx, effects, 'file-reject', 'write');
-    const rejectProposal = await files.propose({
+    const rejectProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-reject:proposal'),
       toolCallId: rejectTool.toolCallId,
       members: [{
@@ -1231,7 +1231,7 @@ async function checkFileProposalResultSeparated() {
 
     const orderedBlocker = await createTool(ctx, effects, 'file-order-blocker', 'internal');
     const orderedFile = await createTool(ctx, effects, 'file-order-later', 'write');
-    const orderedProposal = await files.propose({
+    const orderedProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-order:proposal'),
       toolCallId: orderedFile.toolCallId,
       members: [{
@@ -1257,7 +1257,7 @@ async function checkFileProposalResultSeparated() {
     assertions.push('later call_seq的文件拒绝先持久化first-response，模型结果只等待前序工具结束后按序收口');
 
     const crashDecisionTool = await createTool(ctx, effects, 'file-decision-finalizer-crash', 'write');
-    const crashDecisionProposal = await files.propose({
+    const crashDecisionProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-decision-finalizer-crash:proposal'),
       toolCallId: crashDecisionTool.toolCallId,
       members: [{ operation: 'create_directory', workEnvironmentId: 'workspace', targetPath: 'decision-crash' }]
@@ -1288,7 +1288,7 @@ async function checkFileProposalResultSeparated() {
     assertions.push('文件Decision commit后、ordered finalizer前崩溃时，同source重放补齐唯一模型结果且不创建Effect');
 
     const raceTool = await createTool(ctx, effects, 'file-race', 'write');
-    const raceProposal = await files.propose({
+    const raceProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-race:proposal'),
       toolCallId: raceTool.toolCallId,
       members: [{
@@ -1319,7 +1319,7 @@ async function checkFileProposalResultSeparated() {
 
     const partialTool = await createTool(ctx, effects, 'file-partial', 'write');
     await fs.writeFile(path.join(workspace, 'conflict.txt'), 'actual');
-    const partialProposal = await files.propose({
+    const partialProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-partial:proposal'),
       toolCallId: partialTool.toolCallId,
       members: [
@@ -1343,7 +1343,7 @@ async function checkFileProposalResultSeparated() {
     assertions.push('memberSeq顺序执行，首个冲突停止后续；前序成功不回滚并形成真实partial');
 
     const existingTargetTool = await createTool(ctx, effects, 'file-existing-target', 'write');
-    const existingTargetProposal = await files.propose({
+    const existingTargetProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-existing-target:proposal'),
       toolCallId: existingTargetTool.toolCallId,
       members: [{
@@ -1363,7 +1363,7 @@ async function checkFileProposalResultSeparated() {
     assert.equal(existingTarget.terminal.status, 'conflict');
 
     const unavailableBoundaryTool = await createTool(ctx, effects, 'file-boundary-unavailable', 'write');
-    const unavailableBoundaryProposal = await files.propose({
+    const unavailableBoundaryProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-boundary-unavailable:proposal'),
       toolCallId: unavailableBoundaryTool.toolCallId,
       members: [{ operation: 'create_directory', workEnvironmentId: 'workspace', targetPath: 'unavailable' }]
@@ -1389,7 +1389,7 @@ async function checkFileProposalResultSeparated() {
     const unappliedPath = path.join(workspace, 'unapplied.txt');
     await fs.writeFile(unappliedPath, 'still-base');
     const unappliedTool = await createTool(ctx, effects, 'file-unapplied', 'write');
-    const unappliedProposal = await files.propose({
+    const unappliedProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-unapplied:proposal'),
       toolCallId: unappliedTool.toolCallId,
       members: [{
@@ -1419,7 +1419,7 @@ async function checkFileProposalResultSeparated() {
     const unknownBase = 'unreadable-base';
     await fs.writeFile(unknownPath, unknownBase);
     const unknownTool = await createTool(ctx, effects, 'file-unknown', 'write');
-    const unknownProposal = await files.propose({
+    const unknownProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-unknown:proposal'),
       toolCallId: unknownTool.toolCallId,
       members: [{
@@ -1438,14 +1438,14 @@ async function checkFileProposalResultSeparated() {
     });
     await effects.claimEffectDispatch(unknownApproved.preparedEffect.effectIntentId);
     const fsPromisesForUnknown = require('node:fs/promises');
-    const originalReadFile = fsPromisesForUnknown.readFile;
-    fsPromisesForUnknown.readFile = async (target, ...args) => {
+    const originalUnknownOpen = fsPromisesForUnknown.open;
+    fsPromisesForUnknown.open = async (target, ...args) => {
       if (path.basename(String(target)).toLowerCase() === 'unreadable-target.txt') {
         const error = new Error('injected-actual-read-unavailable');
         error.code = 'EACCES';
         throw error;
       }
-      return originalReadFile(target, ...args);
+      return originalUnknownOpen(target, ...args);
     };
     let unknown;
     try {
@@ -1455,7 +1455,7 @@ async function checkFileProposalResultSeparated() {
         resolver: boundary
       });
     } finally {
-      fsPromisesForUnknown.readFile = originalReadFile;
+      fsPromisesForUnknown.open = originalUnknownOpen;
     }
     assert.equal(unknown.status, 'outcome_unknown');
     assert.equal(await fs.readFile(unknownPath, 'utf8'), unknownBase);
@@ -1465,7 +1465,7 @@ async function checkFileProposalResultSeparated() {
     await fs.mkdir(path.join(treePath, 'removed'), { recursive: true });
     await fs.mkdir(path.join(treePath, 'retained'), { recursive: true });
     const treeTool = await createTool(ctx, effects, 'file-tree-partial', 'delete');
-    const treeProposal = await files.propose({
+    const treeProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-tree-partial:proposal'),
       toolCallId: treeTool.toolCallId,
       members: [{
@@ -1504,7 +1504,7 @@ async function checkFileProposalResultSeparated() {
     await fs.writeFile(path.join(recoveryTreePath, 'removed.txt'), 'removed');
     await fs.writeFile(path.join(recoveryTreePath, 'retained.txt'), 'retained');
     const recoveryTreeTool = await createTool(ctx, effects, 'file-tree-recovery-partial', 'delete');
-    const recoveryTreeProposal = await files.propose({
+    const recoveryTreeProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-tree-recovery-partial:proposal'),
       toolCallId: recoveryTreeTool.toolCallId,
       members: [{
@@ -1532,7 +1532,7 @@ async function checkFileProposalResultSeparated() {
     assertions.push('递归目录部分删除后宿主崩溃，重启摘要无法证明完整base时收口outcome_unknown而非failed');
 
     const escapeTool = await createTool(ctx, effects, 'file-escape', 'write');
-    const escapeProposal = await files.propose({
+    const escapeProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-escape:proposal'),
       toolCallId: escapeTool.toolCallId,
       members: [{ operation: 'create_file', workEnvironmentId: 'workspace', targetPath: '../escape.txt', targetContent: 'escape' }]
@@ -1548,7 +1548,7 @@ async function checkFileProposalResultSeparated() {
     assertions.push('目标路径越出注册WorkEnvironment时明确conflict，不扩展为沙箱或权限系统');
 
     const unknownDetailTool = await createTool(ctx, effects, 'file-missing-member-detail', 'write');
-    const unknownDetailProposal = await files.propose({
+    const unknownDetailProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-missing-member-detail:proposal'),
       toolCallId: unknownDetailTool.toolCallId,
       members: [
@@ -1579,7 +1579,7 @@ async function checkFileProposalResultSeparated() {
     assertions.push('file EffectReceipt缺少detail时按已批准成员逐条写outcome_unknown，不留下空成员审计洞');
 
     const manyTool = await createTool(ctx, effects, 'file-many-members', 'write');
-    const manyProposal = await files.propose({
+    const manyProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-many-members:proposal'),
       toolCallId: manyTool.toolCallId,
       members: Array.from({ length: 1001 }, (_, index) => ({
@@ -3494,7 +3494,7 @@ async function checkHangingEffectRecovery() {
     let processes = new kernel.ProcessControlPlane(ctx.database, ctx.store, effects, ctx.authority, ctx.binding);
 
     const fileTool = await createTool(ctx, effects, 'hanging-file', 'write');
-    const proposal = await files.propose({
+    const proposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'hanging-file:proposal'),
       toolCallId: fileTool.toolCallId,
       members: [{ operation: 'create_file', workEnvironmentId: 'workspace', targetPath: 'recovered.txt', targetContent: 'recovered' }]
@@ -3691,7 +3691,7 @@ async function checkUnresolvedFileRecovery() {
     const tool = await createTool(ctx, effects, 'unresolved-file', 'write');
     const workspace = path.join(parent, 'workspace');
     await fs.mkdir(workspace);
-    const proposal = await files.propose({
+    const proposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'unresolved:proposal'),
       toolCallId: tool.toolCallId,
       members: [{ operation: 'create_file', workEnvironmentId: 'workspace', targetPath: 'never.txt', targetContent: 'never' }]
@@ -3752,13 +3752,13 @@ async function checkUnresolvedFileRecovery() {
     const readyContext = { ...ctx, conversationId: readyTurn.conversationId, turnId: readyTurn.turnId };
     const blocker = await createTool(blockedContext, effects, 'file-scan-blocker', 'internal');
     const blockedFileTool = await createTool(blockedContext, effects, 'file-scan-blocked', 'write');
-    const blockedProposal = await files.propose({
+    const blockedProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-scan-blocked:proposal'),
       toolCallId: blockedFileTool.toolCallId,
       members: [{ operation: 'create_directory', workEnvironmentId: 'workspace', targetPath: 'blocked-scan' }]
     });
     const readyFileTool = await createTool(readyContext, effects, 'file-scan-ready', 'write');
-    const readyProposal = await files.propose({
+    const readyProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-scan-ready:proposal'),
       toolCallId: readyFileTool.toolCallId,
       members: [{ operation: 'create_directory', workEnvironmentId: 'workspace', targetPath: 'ready-scan' }]
@@ -3780,7 +3780,7 @@ async function checkUnresolvedFileRecovery() {
     const noLeaseTurn = await createAdditionalTurn(ctx, 'no-lease-finalize');
     const noLeaseContext = { ...ctx, conversationId: noLeaseTurn.conversationId, turnId: noLeaseTurn.turnId };
     const noLeaseTool = await createTool(noLeaseContext, effects, 'file-no-lease-finalize', 'write');
-    const noLeaseProposal = await files.propose({
+    const noLeaseProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'file-no-lease-finalize:proposal'),
       toolCallId: noLeaseTool.toolCallId,
       members: [{ operation: 'create_directory', workEnvironmentId: 'workspace', targetPath: 'no-lease-finalize' }]
@@ -3800,7 +3800,7 @@ async function checkUnresolvedFileRecovery() {
       unresolvedFileClosure: files
     });
     const inFlightTool = await createTool(ctx, effects, 'turn-terminal-inflight', 'write');
-    const inFlightProposal = await files.propose({
+    const inFlightProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'turn-terminal-inflight:proposal'),
       toolCallId: inFlightTool.toolCallId,
       members: [{
@@ -3853,7 +3853,7 @@ async function checkUnresolvedFileRecovery() {
       if (target) {
         injected = true;
         const injectedTool = await createTool(ctx, effects, 'turn-terminal-race', 'write');
-        injectedTerminalProposal = await files.propose({
+        injectedTerminalProposal = await proposeFileFixture(files, workspace, {
           source: source('internal', 'turn-terminal-race:proposal'),
           toolCallId: injectedTool.toolCallId,
           members: [{
@@ -3883,7 +3883,7 @@ async function checkUnresolvedFileRecovery() {
     assertions.push('终止枚举后并发提交的新提案由同一writer事务assertAll捕获，terminal回滚且不会留下terminated+pending');
 
     const terminalTool = await createTool(ctx, effects, 'turn-terminal-file', 'write');
-    const terminalProposal = await files.propose({
+    const terminalProposal = await proposeFileFixture(files, workspace, {
       source: source('internal', 'turn-terminal-file:proposal'),
       toolCallId: terminalTool.toolCallId,
       members: [{
@@ -4373,4 +4373,11 @@ function option(name) {
   if (inline) return inline.slice(name.length + 3);
   const index = process.argv.indexOf(`--${name}`);
   return index >= 0 ? process.argv[index + 1] : null;
+}
+
+// Direct control-plane fixtures carry the same durable planning evidence as LocalFileToolPlanner.
+async function proposeFileFixture(files, workspace, input) {
+  const { captureFilePlanningRoot } = require(path.join(root, 'dist/extension/backend/reliableKernel/fileTargetBoundary.js'));
+  const planningRoot = await captureFilePlanningRoot(workspace);
+  return files.propose({ ...input, members: input.members.map(member => ({ planningRoot, ...member })) });
 }

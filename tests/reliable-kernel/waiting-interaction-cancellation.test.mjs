@@ -42,6 +42,7 @@ test('全局停止把 AskUser、执行审批和文件审批统一收敛为 cance
       members: [{
         operation: 'create_file',
         workEnvironmentId: 'work-env-test',
+        planningRoot: harness.planningRoot,
         targetPath: 'cancelled.txt',
         targetContent: 'must-not-be-written'
       }]
@@ -96,6 +97,7 @@ test('审批按钮的明确拒绝仍保持 rejected，不与取消混淆', async
       members: [{
         operation: 'create_file',
         workEnvironmentId: 'work-env-test',
+        planningRoot: harness.planningRoot,
         targetPath: 'rejected.txt',
         targetContent: 'must-not-be-written'
       }]
@@ -210,8 +212,10 @@ async function createHarness(suffix) {
     })
   ]);
 
+  const rootStat = await fs.lstat(await fs.realpath(parent), { bigint: true });
   return {
     app,
+    planningRoot: { canonicalPath: await fs.realpath(parent), device: String(rootStat.dev), inode: String(rootStat.ino) },
     turnId,
     async createTool(id, toolName) {
       await app.runtime.effects.createToolCall({

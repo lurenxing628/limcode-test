@@ -211,3 +211,25 @@ test('immutable provenance reconstruction rejects absent, cyclic and non-contigu
       error => error.code === 'MODEL_CONTEXT_NATIVE_SOURCE_INVALID');
   }
 });
+
+test('process, cursor and environment identities survive compression recipes and inherited fork history', async () => {
+  const persistent = [
+    ...handles,
+    { kind: 'process', ref: 'P1', target: 'process-old' },
+    { kind: 'process', ref: 'P2', target: 'process-retained' },
+    { kind: 'cursor', ref: 'O1', target: 'rk-process-output:old-page' },
+    { kind: 'workEnvironment', ref: 'W1', target: 'work-env-old' }
+  ];
+  const fixture = recipeFixture([{ kind: 'reliable-context-compression', modelHandleCatalog: { entries: persistent } }]);
+  const remembered = await readConversationChildHandles(fixture.database, fixture.store, 'fork');
+  const { buildModelHandleCatalog, resolveModelToolArguments } = load('backend/reliableKernel/modelHandleCatalog.js');
+  const after = buildModelHandleCatalog([
+    'Summary: old build used P1/O1 in W1.', { processId: 'process-retained' },
+    { processId: 'process-new', workEnvironmentId: 'work-env-new' }
+  ], remembered);
+  assert.equal(resolveModelToolArguments('bash', { mode: 'output', processRef: 'P1', cursor: 'O1' }, after).processId, 'process-old');
+  assert.equal(resolveModelToolArguments('bash', { mode: 'output', processRef: 'P2' }, after).processId, 'process-retained');
+  assert.equal(resolveModelToolArguments('bash', { mode: 'output', processRef: 'P3' }, after).processId, 'process-new');
+  assert.equal(resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'W1' }, after).workEnvironmentId, 'work-env-old');
+  assert.equal(resolveModelToolArguments('switch_work_environment', { workEnvironmentRef: 'W2' }, after).workEnvironmentId, 'work-env-new');
+});

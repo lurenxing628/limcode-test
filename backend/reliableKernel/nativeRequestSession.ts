@@ -14,8 +14,8 @@ import {
 import { SKILLS_TOOL_NAME, type ModelOutputItemReference, type ModelResponseTiming } from '../../shared/protocol';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
-import { isCollaborationHandleTool, normalizeModelHandleCatalog, projectToolResultForModel, type ModelHandleCatalog } from './modelHandleCatalog';
-import { projectToolResultBatch, readModelTextToolResponse } from './modelFacingContextProjection';
+import { normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import { nativeToolOutputTextTokens, TOOL_RESULT_BATCH_MAX_TOKENS, SKILL_TOOL_RESULT_MAX_TOKENS } from './modelFacingContextProjection';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { nativePhysicalResponseBudgetPressure, type NativeLogicalRequestBudget } from './nativeCompressionGuard';
 import {
@@ -1521,6 +1521,19 @@ export class NativeRequestSession {
       // must never both allocate A1 from the same pre-batch catalog.
       const baseOutputs: OpenAIResponsesToolOutput[] = [];
       for (const call of ready) baseOutputs.push(await this.buildFunctionCallOutput(call));
+      // Each result is frozen independently for idempotent redelivery. Never rewrite an already
+      // frozen copy to fit a later batch: if their sum exceeds the ordinary shared allowance, close
+      // into Context at the next safe boundary, where the full-request batch projector can size it.
+      let ordinaryTokens = 0;
+      let skillTokens = 0;
+      baseOutputs.forEach((output, index) => {
+        if (ready[index].name === SKILLS_TOOL_NAME) skillTokens += nativeToolOutputTextTokens(output.output);
+        else ordinaryTokens += nativeToolOutputTextTokens(output.output);
+      });
+      if (ordinaryTokens > TOOL_RESULT_BATCH_MAX_TOKENS || skillTokens > SKILL_TOOL_RESULT_MAX_TOKENS) {
+        this.budgetClosureRequested = true;
+        continue;
+      }
       const outputs = await adapter.materializeNativeToolOutput(baseOutputs);
       const controller = this.controller;
       if (!controller || this.disposed || this.yieldingForRuntimeInput
@@ -1645,43 +1658,17 @@ export class NativeRequestSession {
       requireId(revision.content_object_id, 'MessageRevision.content_object_id')
     ) as unknown as ContentObjectMetadata;
     const raw = (await this.deps.contentStore.read(metadata)).toString('utf8');
-    if (['run_agent', 'read_agent_answer', 'submit_plan'].includes(call.name)
-      || isCollaborationHandleTool(call.name)) {
-      const frozen = await freezeNativeChildToolProjection({
-        database: this.deps.database, contentStore: this.deps.contentStore,
-        modelRequestId: this.deps.modelRequestId, toolCallId: call.toolCallId,
-        toolModelResultId: call.toolModelResultId, messageRevisionId: String(revision.id),
-        contentObjectId: metadata.id, toolName: call.name, raw,
-        catalog: this.childCatalog, now: this.deps.now()
-      });
-      this.childCatalog = frozen.catalog;
-      // Projection metadata is local authority only; the provider receives the frozen output bytes.
-      return { type: 'function_call_output', callId: call.providerCallId, output: frozen.output };
-    }
-    if (call.name === SKILLS_TOOL_NAME) {
-      // A loaded skill is read as its rendered text, the same bytes a full request replays for it.
-      const projected = projectToolResultBatch([{
-        toolName: call.name,
-        response: projectToolResultForModel(call.name, JSON.parse(raw) as unknown, this.childCatalog)
-      }]).items[0].response;
-      const text = readModelTextToolResponse(projected);
-      if (text) return { type: 'function_call_output', callId: call.providerCallId, output: text.text };
-    }
-    const parsed = asRecord(normalizePlainJson(JSON.parse(raw), 'Native ToolModelResult content'));
-    const parts = Array.isArray(parsed?.parts) ? parsed.parts : undefined;
-    let output: string | Array<Record<string, unknown>> = raw;
-    if (parts && parts.some((part) => asRecord(part)?.inlineData !== undefined || asRecord(part)?.inline_data !== undefined)) {
-      output = parts.map((part): Record<string, unknown> => {
-        const record = asRecord(part) ?? {};
-        if (typeof record.text === 'string') return { type: 'input_text', text: record.text };
-        return record as Record<string, unknown>;
-      });
-    }
-    return {
-      type: 'function_call_output',
-      callId: call.providerCallId,
-      output
-    };
+    const frozen = await freezeNativeChildToolProjection({
+      database: this.deps.database, contentStore: this.deps.contentStore,
+      modelRequestId: this.deps.modelRequestId, toolCallId: call.toolCallId,
+      toolModelResultId: call.toolModelResultId, messageRevisionId: String(revision.id),
+      contentObjectId: metadata.id, toolName: call.name, raw,
+      catalog: this.childCatalog, now: this.deps.now()
+    });
+    this.childCatalog = frozen.catalog;
+    // Every native result uses frozen bounded model bytes and a reserved handle catalog. The
+    // ToolModelResult receipt and native delivery/admission facts remain separate and unchanged.
+    return { type: 'function_call_output', callId: call.providerCallId, output: frozen.output };
   }
 
   private responseFor(responseId: string): NativeSessionResponse {

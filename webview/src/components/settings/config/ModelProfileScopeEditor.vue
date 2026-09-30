@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
+import { computed, watch } from 'vue';
+import { useGuardedSettingsDraft } from '@webview/composables/useGuardedSettingsDraft';
 import type { ConfigScopeKind } from '@shared/protocol';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
@@ -21,9 +22,24 @@ watch(() => [props.scopeKind, props.scopeId], (_value, _old, onCleanup) => onCle
 const { loading: modelLoading, text: modelLoadingText } = useSettingsLoadingText('LLM 配置', () => props.scopeKind, () => props.scopeId, {
   globalSettingsSections: ['llm', 'llmProviderConfigs'] as const
 });
-const providerConfigId = ref(INHERIT_GLOBAL_MODEL_ID);
-const model = ref('');
 const local = computed(() => store.localProfileFor(props.scopeKind, props.scopeId));
+const draftState = useGuardedSettingsDraft(
+  () => JSON.stringify([props.scopeKind, props.scopeId ?? '']),
+  () => {
+    const profile = store.confirmedFor(props.scopeKind, props.scopeId)?.profile;
+    if (!profile || profile.inheritModel) return { providerConfigId: INHERIT_GLOBAL_MODEL_ID, model: '' };
+    const configId = profile.providerConfigId
+      ?? globalSettings.llmProviderConfigs.configs.find(config => config.provider === profile.provider)?.id
+      ?? globalSettings.activeLlmProviderConfig?.id ?? globalSettings.llmProviderConfigs.configs[0]?.id ?? '';
+    const config = globalSettings.llmProviderConfigs.configs.find(item => item.id === configId);
+    return { providerConfigId: configId, model: profile.model ?? config?.model ?? '' };
+  }
+);
+const providerConfigId = computed({ get: () => draftState.value.value.providerConfigId,
+  set: (value: string) => { draftState.value.value = { ...draftState.value.value, providerConfigId: value }; } });
+const model = computed({ get: () => draftState.value.value.model,
+  set: (value: string) => { draftState.value.value = { ...draftState.value.value, model: value }; } });
+const draftChangedRemotely = draftState.remoteChanged;
 const isInheritSelected = computed(() => providerConfigId.value === INHERIT_GLOBAL_MODEL_ID);
 const inheritedModelText = computed(() => {
   const config = globalSettings.activeLlmProviderConfig;
@@ -48,7 +64,10 @@ const selectedProviderConfigId = computed({
     providerConfigId.value = value || INHERIT_GLOBAL_MODEL_ID;
     if (providerConfigId.value === INHERIT_GLOBAL_MODEL_ID) {
       model.value = '';
-      if (local.value.profile) store.clearProfileScope(props.scopeKind, props.scopeId);
+      if (local.value.profile) {
+        draftState.markSubmitted();
+        store.clearProfileScope(props.scopeKind, props.scopeId);
+      }
       return;
     }
     const config = globalSettings.llmProviderConfigs.configs.find((item) => item.id === providerConfigId.value);
@@ -56,23 +75,16 @@ const selectedProviderConfigId = computed({
   }
 });
 
-watch(() => [props.scopeKind, props.scopeId, local.value.profile?.id, globalSettings.llmProviderConfigs.configs.length, globalSettings.llm.activeProviderConfigId], () => {
-  const profile = local.value.profile;
-  if (!profile || profile.inheritModel) {
-    providerConfigId.value = INHERIT_GLOBAL_MODEL_ID;
-    model.value = '';
-    return;
-  }
-  providerConfigId.value = profile.providerConfigId ?? globalSettings.llmProviderConfigs.configs.find((config) => config.provider === profile.provider)?.id ?? globalSettings.activeLlmProviderConfig?.id ?? options.value[1]?.value ?? '';
-  model.value = profile.model ?? activeConfig.value?.model ?? '';
-}, { immediate: true });
 
 function save(): void {
   if (isInheritSelected.value) {
+    draftState.markSubmitted();
     store.clearProfileScope(props.scopeKind, props.scopeId);
     return;
   }
   const config = activeConfig.value;
+  model.value = model.value.trim();
+  draftState.markSubmitted();
   store.setProfileForScope(props.scopeKind, props.scopeId, { providerConfigId: providerConfigId.value, provider: config?.provider, model: model.value.trim(), name: `${props.scopeKind} Model Profile` });
 }
 </script>
@@ -99,6 +111,10 @@ function save(): void {
         <input v-model="model" type="text" :disabled="isInheritSelected" :placeholder="isInheritSelected ? inheritedModelText : '例如 deepseek-v4-flash'" />
       </label>
     </div>
+    <template v-if="draftChangedRemotely">
+      <span role="status">已保存内容有更新，当前草稿已保留</span>
+      <button type="button" @click="draftState.reset()">读取已保存值</button>
+    </template>
     <ModelProfileSaveStatus :scope-kind="scopeKind" :scope-id="scopeId" />
     <div class="model-profile-actions">
       <button v-if="!isInheritSelected" type="button" :disabled="!model.trim()" @click="save">保存 LLM 配置</button>

@@ -2350,8 +2350,11 @@ async function commitLocked(
         throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-target-changed', message: '当前历史库在比较之后又有变化，稍后重试。' });
       }
     };
-    if (plan.assertions) await target.database.transaction(plan.assertions);
-    else await assertScanUnchanged();
+    if (plan.assertions) {
+      // An empty source has neither writes nor reused rows. Its vacuous assertion set must
+      // not become an empty transaction (RuntimeDatabase deliberately rejects those).
+      if (plan.assertions.length > 0) await target.database.transaction(plan.assertions);
+    } else await assertScanUnchanged();
     // An assertion-only transaction writes no WAL frame, even with durable: true. Existing rows
     // may come from NORMAL commits, so prove them durable before publishing an external receipt.
     await target.database.durabilityCheckpoint();

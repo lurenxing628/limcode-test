@@ -65,6 +65,11 @@ const ADMISSION_RETRY_BASE_DELAY_MS = 1_000;
 const ADMISSION_RETRY_MAX_DELAY_MS = 30_000;
 /** How often admission looks again at a Conversation this window's deletion is stopping. */
 const DELETION_ADMISSION_RECHECK_MS = 500;
+const TERMINATION_INPUT_KINDS = new Set([
+  'interrupt_request',
+  'interrupt_current_turn',
+  'termination_request'
+]);
 const LOCAL_TURN_WAKE_DOMAINS = new Set([
   'EffectIntent',
   'EffectReceipt',
@@ -932,7 +937,11 @@ export class ReliableConversationRunner {
       signal?.throwIfAborted();
       // Queued admission drains only under this Host's Conversation ownership; a live peer owner
       // drains its own queue and a Host that does not serve it leaves it for the project's Host.
-      if (await this.tryOwnConversation(queuedConversationId, ownership) !== 'owned') continue;
+      const claim = await this.tryOwnConversation(queuedConversationId, ownership);
+      if (claim !== 'owned') {
+        await this.deferUnownedAdmission(queuedConversationId, claim);
+        continue;
+      }
       report.queuedConversationIds.push(queuedConversationId);
       this.scheduleAdmission(queuedConversationId);
     }
@@ -1867,11 +1876,7 @@ export class ReliableConversationRunner {
       turn_id: turnId,
       state: 'pending'
     });
-    return pending.find((input) => [
-      'interrupt_request',
-      'interrupt_current_turn',
-      'termination_request'
-    ].includes(String(input.input_kind)));
+    return pending.find((input) => TERMINATION_INPUT_KINDS.has(String(input.input_kind)));
   }
 
   private async readJsonContentObject(
@@ -1973,9 +1978,10 @@ export class ReliableConversationRunner {
           }
           const claim = await this.tryOwnConversation(waiting.conversationId, ownership);
           if (claim === 'busy') {
-            // A live peer Host owns this Conversation now; that Host observes and drives the
-            // waiting Turn. Keeping the local entry would auto-drive another Host's work.
-            this.waitingOwned.delete(waiting.turnId);
+            // A peer owns this Conversation now. Keep the changed fact as a deferred candidate:
+            // it still cannot execute here until ownership becomes available, but a peer release
+            // must not discard the only wake for this waiting Turn.
+            this.deferRecoveryCandidate(waiting.conversationId, waiting.turnId, 'busy');
             continue;
           }
           if (claim !== 'owned') {
@@ -1993,8 +1999,15 @@ export class ReliableConversationRunner {
       for (const deferred of [...this.deferredRecovery.values()]) {
         if (deferred.nextAttemptAt !== undefined && Date.now() < deferred.nextAttemptAt) continue;
         const facts = await this.recoveryFactsUnlessDeleted(deferred.turnId);
-        if (!facts || facts.turnStatus !== 'active' || facts.judgment === 'needs_human') {
+        if (!facts || facts.judgment === 'needs_human') {
           this.forgetRecoveryCandidate(deferred.turnId);
+          continue;
+        }
+        if (facts.turnStatus !== 'active') {
+          // A peer may finish the predecessor, then exit before admitting its durable queue.
+          // Preserve that admission wake when the active-Turn recovery candidate is retired.
+          this.forgetRecoveryCandidate(deferred.turnId);
+          this.scheduleAdmission(deferred.conversationId);
           continue;
         }
         // A live/unknown peer Conversation owner must never be displaced. The candidate stays
@@ -2012,6 +2025,7 @@ export class ReliableConversationRunner {
           const settled = await this.settleWithoutExecution(deferred.conversationId, deferred.turnId);
           if (settled === 'finalized' || settled === 'interrupted' || settled === 'inactive') {
             this.forgetRecoveryCandidate(deferred.turnId);
+            this.scheduleAdmission(deferred.conversationId);
             continue;
           }
           if (settled === 'busy') {
@@ -2114,7 +2128,10 @@ export class ReliableConversationRunner {
       ? toolCalls.find((row) => row.id === waitingToolCallId)
       : undefined;
     const ready = turns.some((row) => row.status !== 'active')
-      || pendingInputs.some((row) => row.state === 'pending')
+      // A stop is actionable inside an unresolved tool batch. Runtime deliveries are consumed
+      // only at the next request boundary, after the entire assistant/tool-result batch closes.
+      // Keep them in the fingerprint so arrival wakes once, then park on the unchanged wait.
+      || pendingInputs.some((row) => row.state === 'pending' && TERMINATION_INPUT_KINDS.has(String(row.input_kind)))
       || Boolean(waitingToolCallId && (!waitingToolCall || waitingToolCall.status === 'terminal'));
     return {
       ready,
@@ -2530,21 +2547,35 @@ export class ReliableConversationRunner {
       // owner (busy) or a failing probe (unknown) is retried after a backoff delay; a window that
       // does not serve the Conversation waits for a rescan (its folders changed).
       slot.completedGeneration = slot.requestedGeneration;
-      if (claim !== 'busy') await this.conversationOwners.releaseIfIdle(slot.conversationId);
-      if (claim !== 'ineligible') await this.retryAdmissionLater(slot.conversationId);
-      else this.clearAdmissionRetry(slot.conversationId);
+      await this.deferUnownedAdmission(slot.conversationId, claim);
       return;
     }
-    this.clearAdmissionRetry(slot.conversationId);
     try {
-      await this.conversationOwners.run(slot.conversationId, () => this.runAdmissionSlot(slot));
+      await this.conversationOwners.run(slot.conversationId, () => {
+        // Preserve the backoff until the activity pin is acquired: a successful eligibility
+        // claim alone does not end repeated claim-to-pin ownership contention.
+        this.clearAdmissionRetry(slot.conversationId);
+        return this.runAdmissionSlot(slot);
+      });
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) {
         slot.completedGeneration = slot.requestedGeneration;
+        // Ownership can change between the eligibility claim and the activity pin above. The
+        // durable queue needs the same retry as a busy result from the initial claim.
+        await this.retryAdmissionLater(slot.conversationId);
         return;
       }
       throw error;
     }
+  }
+
+  private async deferUnownedAdmission(
+    conversationId: string,
+    claim: Exclude<ConversationRuntimeEligibleClaimResult, 'owned'>
+  ): Promise<void> {
+    if (claim !== 'busy') await this.conversationOwners.releaseIfIdle(conversationId);
+    if (claim !== 'ineligible') await this.retryAdmissionLater(conversationId);
+    else this.clearAdmissionRetry(conversationId);
   }
 
   /** Looks again shortly; by then the deletion may have removed the Conversation with its queue. */

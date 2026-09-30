@@ -1,14 +1,16 @@
 import { createHash } from 'node:crypto';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { buildModelHandleCatalog, isCollaborationHandleTool, isPersistentAgentHandle, normalizeModelHandleCatalog, projectToolResultForModel, type ModelHandleCatalog, type ModelHandleEntry } from './modelHandleCatalog';
+import { buildModelHandleCatalog, isCollaborationHandleTool, isPersistentContextHandle, normalizeModelHandleCatalog, type ModelHandleCatalog, type ModelHandleEntry } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson } from './plainJson';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNative';
+import { projectNativeToolResultOutput } from './modelFacingContextProjection';
 
 /**
- * Child and collaboration references belong to the Conversation's frozen request history, not the current Context
+ * Child, collaboration, process, cursor and environment references belong to the Conversation's frozen request history, not the current Context
  * prefix. Forks copy retained ModelRequests with their immutable recipes, so the same read also
  * reserves inherited references without granting access to the source Conversation's children.
  * Missing CAS and conflicting identities are errors; neither permits renumbering from a summary.
@@ -41,7 +43,7 @@ export async function readConversationChildHandles(
         throw childHandleError(`Frozen recipe ${request.recipe_object_id} is not an object.`);
       }
       if (recipe.kind !== 'reliable-agent-turn' && recipe.kind !== 'reliable-context-compression') continue;
-      const entries = normalizeModelHandleCatalog(recipe.modelHandleCatalog).entries.filter(entry => isPersistentAgentHandle(entry.kind));
+      const entries = normalizeModelHandleCatalog(recipe.modelHandleCatalog).entries.filter(entry => isPersistentContextHandle(entry.kind));
       // Every ordinary recipe is cumulative. Compression can be newer than the last ordinary
       // request when a preview allocated a child: use its complete frozen child catalog too.
       // A compression with no child catalog contributes no identity authority.
@@ -118,7 +120,7 @@ interface NativeChildProjection {
   toolModelResultId: string;
   toolName: string;
   childHandles: ModelHandleEntry[];
-  output: string;
+  output: NonNullable<OpenAIResponsesToolOutput['output']>;
 }
 
 /** Immutable pre-send projections also survive a fork through copied ToolCallEvent/Source links. */
@@ -156,7 +158,7 @@ export async function freezeNativeChildToolProjection(input: {
   raw: string;
   catalog: ModelHandleCatalog;
   now: string;
-}): Promise<{ output: string; catalog: ModelHandleCatalog }> {
+}): Promise<{ output: NonNullable<OpenAIResponsesToolOutput['output']>; catalog: ModelHandleCatalog }> {
   const eventId = `native_child_projection_${createHash('sha256')
     .update(JSON.stringify([input.modelRequestId, input.toolCallId, input.toolModelResultId])).digest('hex')}`;
   const barrier = await input.database.snapshot([
@@ -187,13 +189,13 @@ export async function freezeNativeChildToolProjection(input: {
   }
   const raw = normalizePlainJson(JSON.parse(input.raw), 'Native child ToolModelResult');
   const discovered = buildModelHandleCatalog([isCollaborationHandleTool(input.toolName)
-    ? { kind: 'agent_collaboration', detail: raw } : raw], input.catalog.entries).entries.filter(entry => isPersistentAgentHandle(entry.kind));
+    ? { kind: 'agent_collaboration', detail: raw } : raw], input.catalog.entries).entries.filter(entry => isPersistentContextHandle(entry.kind));
   const catalog = withChildHandles(input.catalog, discovered);
-  const output = canonicalPlainJson(normalizePlainJson(projectToolResultForModel(input.toolName, raw, catalog), 'Native child model output'));
+  const output = projectNativeToolResultOutput(input.toolName, raw, catalog);
   const frozen: NativeChildProjection = {
     kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT, modelRequestId: input.modelRequestId,
     toolCallId: input.toolCallId, toolModelResultId: input.toolModelResultId, toolName: input.toolName,
-    childHandles: catalog.entries.filter(entry => isPersistentAgentHandle(entry.kind)), output
+    childHandles: catalog.entries.filter(entry => isPersistentContextHandle(entry.kind)), output
   };
   const content = await input.contentStore.prepare(input.database,
     canonicalPlainJson(normalizePlainJson(frozen, 'Native child projection')), NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE);
@@ -220,21 +222,24 @@ export async function freezeNativeChildToolProjection(input: {
 }
 
 export function withChildHandles(catalog: ModelHandleCatalog, entries: readonly ModelHandleEntry[]): ModelHandleCatalog {
-  return { entries: [...catalog.entries.filter(entry => !isPersistentAgentHandle(entry.kind)),
+  return { entries: [...catalog.entries.filter(entry => !isPersistentContextHandle(entry.kind)),
     ...mergeConversationChildHandles(catalog.entries, entries)] };
 }
 
 function parseNativeChildProjection(text: string): NativeChildProjection {
   const value = normalizePlainJson(JSON.parse(text), 'Native child projection');
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.kind !== NATIVE_CHILD_HANDLE_PROJECTION_EVENT
-    || !Array.isArray(value.childHandles) || typeof value.output !== 'string') {
+    || !Array.isArray(value.childHandles)
+    || !(typeof value.output === 'string' || (Array.isArray(value.output) && value.output.every(block =>
+      block !== null && typeof block === 'object' && !Array.isArray(block)
+      && ['input_text', 'input_image', 'input_file'].includes(String(block.type)))))) {
     throw childHandleError('Native child projection has an invalid shape.');
   }
   for (const key of ['modelRequestId', 'toolCallId', 'toolModelResultId', 'toolName']) {
     if (typeof value[key] !== 'string' || !value[key]) throw childHandleError(`Native child projection lacks ${key}.`);
   }
   const entries = normalizeModelHandleCatalog({ entries: value.childHandles }).entries;
-  if (entries.some(entry => !isPersistentAgentHandle(entry.kind))) throw childHandleError('Native child projection contains non-agent identities.');
+  if (entries.some(entry => !isPersistentContextHandle(entry.kind))) throw childHandleError('Native tool projection contains identities outside the persistent Context catalog.');
   return { ...value, childHandles: entries } as unknown as NativeChildProjection;
 }
 
@@ -243,7 +248,7 @@ export function mergeConversationChildHandles(...groups: readonly (readonly Mode
   const byRef = new Map<string, ModelHandleEntry>();
   const byTarget = new Map<string, ModelHandleEntry>();
   for (const entry of groups.flat()) {
-    if (!isPersistentAgentHandle(entry.kind)) continue;
+    if (!isPersistentContextHandle(entry.kind)) continue;
     const normalized = normalizeModelHandleCatalog({ entries: [entry] }).entries[0];
     const ref = byRef.get(normalized.ref);
     const targetIdentity = `${normalized.kind}\u0000${normalized.target}`;

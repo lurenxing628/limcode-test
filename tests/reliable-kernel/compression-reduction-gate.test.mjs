@@ -375,3 +375,43 @@ test('a ciphertext compaction without an output count has an unknown size, so a 
     assert.equal(presentations.get('provider_native').presentation.resultSizeUncounted, true);
   });
 });
+
+test('committed prefix compression keeps historical process references stable in the next ordinary recipe', async () => {
+  await withTurn('process-ref-compression', 100000, async (app, seeded) => {
+    for (const suffix of ['build', 'tests']) {
+      const processId = `process-${suffix}`;
+      const processReceiptId = `receipt-${suffix}`;
+      const delivery = kernel.projectRuntimeDeliveryForModel({
+        kind: 'process_completion', phase: 'current_turn', processId, processReceiptId,
+        deliveryId: `delivery-${suffix}`, inboxItemId: `inbox-${suffix}`,
+        targetTurnId: seeded.turnId, deliveredAt: new Date().toISOString(),
+        content: { kind: 'process_completion', processId, processReceiptId, status: 'exited', stdout: `${suffix} output`,
+          nextOutputHandle: `rk-process-output:${suffix}` }
+      });
+      await app.context.appendContent({ conversationId: seeded.conversationId, segmentKind: 'runtime_context',
+        source: { sourceKind: 'runtime_context', sourceId: `process-proof-${suffix}`, sourceRevision: '0' },
+        content: delivery.content, contentType: delivery.contentType });
+    }
+    const headRootId = await app.context.currentHeadRootId(seeded.conversationId);
+    const freeze = (head, round) => app.agentLoop.freezeOrdinaryRequestRecipe({
+      turnId: seeded.turnId, authoritySnapshotId: seeded.authoritySnapshotId,
+      headRootId: head, round, tools: [], includeOpenTaskCompletionCheck: false
+    });
+    const before = await freeze(headRootId, '1');
+    const coordinator = summaryCoordinator(app, 'Build task output is available via P1 and O1.', () => {});
+    const compressed = await coordinator.coordinate({ ...seeded, headRootId, trigger: 'manual',
+      compressSegmentCount: 2, modelHandleCatalog: before.modelHandleCatalog });
+    assert.equal(compressed.status, 'compressed');
+    const nextHead = await app.context.currentHeadRootId(seeded.conversationId);
+    const after = await freeze(nextHead, '2');
+    const args = { mode: 'output', processRef: 'P1', cursor: 'O1' };
+    assert.deepEqual(kernel.resolveModelToolArguments('bash', args, after.modelHandleCatalog),
+      kernel.resolveModelToolArguments('bash', args, before.modelHandleCatalog));
+    assert.equal(kernel.resolveModelToolArguments('bash', { mode: 'output', processRef: 'P2' },
+      after.modelHandleCatalog).processId, 'process-tests');
+    const stored = await app.context.materialize(nextHead);
+    assert.equal(stored.segments[0].segmentKind, 'compression');
+    assert.match(stored.segments[0].content.toString(), /P1 and O1/);
+    assert.equal(stored.segments.length, 2, 'the first canonical process source really left the active window');
+  });
+});

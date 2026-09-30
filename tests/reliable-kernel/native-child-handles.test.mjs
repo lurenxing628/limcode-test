@@ -305,3 +305,129 @@ test('native call proofs reject missing catalogs and missing resolutions and kee
   const frozen = { ...proof, resolvedArguments: { operation: 'spawn', prompt: 'original', frozenBy: 'an earlier build' } };
   assert.deepEqual(parseNativeToolCallCheckpoint(frozen).resolvedArguments, frozen.resolvedArguments);
 });
+
+function nativeResultProjectionFixture(results) {
+  const domains = new Map();
+  const bodies = new Map();
+  const put = (domain, row) => {
+    if (!domains.has(domain)) domains.set(domain, new Map());
+    domains.get(domain).set(row.id, row);
+  };
+  put('ModelRequest', { id: 'projection-request', turn_id: 'projection-turn' });
+  for (const [index, result] of results.entries()) {
+    const id = `projection-call-${index}`;
+    const body = `result-body-${index}`;
+    put('ToolCall', { id, turn_id: 'projection-turn', tool_name: result.name, status: 'terminal' });
+    put('ToolCallSourceLink', { id: `source-${index}`, tool_call_id: id, model_request_id: 'projection-request' });
+    put('ToolModelResult', { id: `result-${index}`, tool_call_id: id, message_revision_id: `revision-${index}` });
+    put('MessageRevision', { id: `revision-${index}`, content_object_id: body });
+    put('ContentObject', { id: body, content_type: 'application/json' });
+    bodies.set(body, JSON.stringify(result.value));
+  }
+  const select = read => [...(domains.get(read.domain)?.values() ?? [])]
+    .filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+  const database = {
+    async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get'
+      ? domains.get(read.domain)?.get(read.id) ?? null : select(read).slice(0, read.limit)) }; },
+    async snapshotAll(read) { return { snapshot: select(read) }; },
+    async transaction(steps) {
+      const apply = step => {
+        if (step.kind === 'savepoint') { step.steps.forEach(apply); return; }
+        if (step.kind === 'insert' || step.kind === 'insertWithNextSequence') {
+          assert.equal(domains.get(step.domain)?.has(step.row.id) ?? false, false, 'projection must be frozen once');
+          put(step.domain, { ...step.row });
+        }
+      };
+      steps.forEach(apply);
+      return {};
+    }
+  };
+  let counter = 0;
+  const contentStore = {
+    async read(metadata) { assert.ok(bodies.has(metadata.id)); return Buffer.from(bodies.get(metadata.id)); },
+    async readMany(metadata) { return Promise.all(metadata.map(value => this.read(value))); },
+    async prepare(_database, content, contentType) {
+      const metadata = { id: `projection-body-${counter++}`, content_type: contentType, sha256: 'fixture',
+        byte_length: BigInt(Buffer.byteLength(content)), storage_key: `projection-${counter}` };
+      bodies.set(metadata.id, content);
+      put('ContentObject', metadata);
+      return { metadata };
+    }
+  };
+  const submitted = [];
+  let ended = 0;
+  const session = new NativeRequestSession({ database, contentStore, tools: {}, capabilities,
+    modelRequestId: 'projection-request', turnId: 'projection-turn', providerId: 'projection-provider',
+    modelHandleCatalog: { entries: [] }, now: () => new Date().toISOString(),
+    budget: { planningInputCapacityTokens: 200000, compressionThresholdTokens: 180000, autoCompressionEnabled: false },
+    modelProvider: { async readNativeLatestResponseUsage() { return {
+      responseId: 'projection-response', streamSeq: '3', attemptSeq: '1', socketGeneration: '1',
+      physicalResponseCount: 1, inputTokens: 150
+    }; } },
+    resolveAdapter: async () => ({ materializeNativeToolOutput: async outputs => outputs })
+  });
+  session.bindStream({ attemptSeq: '1', socketGeneration: '1' });
+  session.responseOrder.push('projection-response');
+  session.responses.set('projection-response', { responseId: 'projection-response', admissionBoundary: true,
+    completed: true, boundarySeq: '3', syncRequired: false });
+  for (const [index, result] of results.entries()) {
+    session.calls.set(`projection-call-${index}`, { name: result.name, toolCallId: `projection-call-${index}`,
+      toolModelResultId: `result-${index}`, providerCallId: `wire-${index}`, responseId: 'projection-response',
+      providerOrdinal: index, asyncDeclared: true, admitted: true, settled: true, delivered: false });
+  }
+  session.calls.set('still-running', { name: 'slow_fixture', toolCallId: 'still-running', providerCallId: 'wire-slow',
+    responseId: 'projection-response', providerOrdinal: results.length, asyncDeclared: true,
+    admitted: true, settled: false, delivered: false });
+  session.controller = { endLogicalRequest() { ended += 1; }, async submitToolResults(outputs) { submitted.push(outputs); } };
+  return { session, database, contentStore, bodies, domains, submitted, ended: () => ended };
+}
+
+test('native async process results are bounded, actionable and durably replayed without changing receipts', async () => {
+  const raw = { status: 'succeeded', detail: { status: 'background_started', processId: 'new-native-process',
+    stdout: 'large output\n'.repeat(20000), hasMore: true, nextOutputHandle: 'rk-process-output:native-page' } };
+  const fixture = nativeResultProjectionFixture([{ name: 'bash', value: raw }]);
+  await fixture.session.pumpLoop();
+  assert.equal(fixture.submitted.length, 1, 'the unsettled async sibling keeps this on the native delivery path');
+  const output = fixture.submitted[0][0].output;
+  assert.ok(output.length < 20000, 'the whole large receipt must never reach the wire');
+  assert.doesNotMatch(output, /new-native-process|rk-process-output:native-page/);
+  assert.match(output, /P1/);
+  assert.match(output, /O1/);
+  assert.deepEqual(resolveModelToolArguments('bash', { mode: 'output', processRef: 'P1', cursor: 'O1' },
+    fixture.session.currentModelHandleCatalog()), { mode: 'output', processId: 'new-native-process', outputHandle: 'rk-process-output:native-page' });
+  assert.equal(fixture.bodies.get('result-body-0'), JSON.stringify(raw), 'receipt bytes stay immutable');
+  const restored = await readNativeRequestChildHandles(fixture.database, fixture.contentStore, 'projection-request');
+  assert.ok(restored.some(entry => entry.kind === 'process' && entry.ref === 'P1' && entry.target === 'new-native-process'));
+  fixture.session.childCatalog = { entries: restored };
+  const replay = await fixture.session.buildFunctionCallOutput(fixture.session.calls.get('projection-call-0'));
+  assert.equal(replay.output, output, 'already frozen delivery bytes must survive recovery unchanged');
+  assert.equal(fixture.domains.get('ToolCallEvent').size, 1);
+});
+
+test('oversized native result batches wait for settled work then rebase instead of sending unbounded bytes', async () => {
+  const results = Array.from({ length: 6 }, (_, index) => ({ name: 'bash', value: {
+    status: 'succeeded', detail: { status: 'background_started', processId: `batch-process-${index}`,
+      stdout: 'large output\n'.repeat(20000), hasMore: true }
+  } }));
+  const fixture = nativeResultProjectionFixture(results);
+  await fixture.session.pumpLoop();
+  assert.equal(fixture.submitted.length, 0);
+  assert.equal(fixture.session.budgetClosureRequested, true);
+  assert.equal(fixture.ended(), 0, 'the other already-admitted effect must not be cancelled');
+  fixture.session.calls.get('still-running').settled = true;
+  await fixture.session.pumpLoop();
+  assert.equal(fixture.ended(), 1);
+  assert.equal(fixture.submitted.length, 0);
+});
+
+test('native bounded projection keeps receipt media separate from JSON and preserves exact image data', () => {
+  const { projectNativeToolResultOutput } = load('backend/reliableKernel/modelFacingContextProjection.js');
+  const raw = { status: 'succeeded', detail: { path: 'image.png', parts: [{ inlineData: {
+    mimeType: 'image/png', data: 'aW1hZ2U=', name: 'image.png'
+  } }] } };
+  const output = projectNativeToolResultOutput('read', raw, { entries: [] });
+  assert.equal(output[0].type, 'input_text');
+  assert.doesNotMatch(output[0].text, /aW1hZ2U=|inlineData/);
+  assert.deepEqual(output[1], { type: 'input_image', image_url: 'data:image/png;base64,aW1hZ2U=' });
+  assert.equal(raw.detail.parts[0].inlineData.data, 'aW1hZ2U=');
+});

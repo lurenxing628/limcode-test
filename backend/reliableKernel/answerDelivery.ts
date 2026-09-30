@@ -3,6 +3,7 @@ import {
   type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
+import { runtimeDeliverySourceTurn } from './childTaskTurn';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import {
   AutomaticRuntimeDeliveryRouter,
@@ -910,6 +911,11 @@ export class AnswerControlPlane {
     };
   }
 
+  /** The exact parent dispatch Turn shared by live and recovered answer routing. */
+  public requestingParentTurn(inboxItemId: string): Promise<string | null> {
+    return runtimeDeliverySourceTurn(this.database, this.contentStore, inboxItemId);
+  }
+
   /**
    * Recovery-only classifier for the AnswerSubmission -> RuntimeDelivery crash boundary.
    *
@@ -981,8 +987,8 @@ export class AnswerControlPlane {
     }
 
     const parentTurnId = requirePhaseFId(
-      parentLinks[0].parent_turn_id,
-      'ChildExecutionParentLink.parent_turn_id'
+      await this.requestingParentTurn(inboxItemId),
+      'AnswerSubmission requesting parent Turn'
     );
     const parentTurn = await this.requireExisting('Turn', parentTurnId);
     const targetConversationId = requirePhaseFId(

@@ -248,3 +248,51 @@ test('Gemini validates functionResponse protocol without inventing an OpenAI ID 
   );
   assert.equal(fetchCalls, 1);
 });
+
+test('terminal evidence comes only from each provider protocol envelope, never tool/content fields', async () => {
+  const valid = {
+    'openai-compatible': { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] },
+    gemini: { candidates: [{ content: { parts: [] }, finishReason: 'STOP' }] },
+    claude: { type: 'message_delta', delta: { stop_reason: 'end_turn' } },
+    'openai-responses': { type: 'response.completed', response: { status: 'completed' } }
+  };
+  const falseEvidence = [
+    { finishReason: 'arbitrary' }, { finish_reason: 'arbitrary' }, { stop_reason: 'arbitrary' },
+    { type: 'message_stop' }, { type: 'response.completed' }, { response: { status: 'completed' } }
+  ];
+  const content = (provider, data) => provider === 'gemini'
+    ? { candidates: [{ content: { role: 'model', parts: [{ functionCall: { name: 'save_record', args: data } }] } }] }
+    : provider === 'openai-compatible'
+      ? { choices: [{ delta: { content: JSON.stringify(data) }, finish_reason: null }], metadata: data }
+      : provider === 'claude'
+        ? { type: 'content_block_start', content_block: { type: 'tool_use', id: 'call', name: 'save_record', input: data } }
+        : { type: 'response.output_item.added', item: { type: 'function_call', name: 'save_record', arguments: JSON.stringify(data), metadata: data } };
+  for (const provider of Object.keys(valid)) {
+    const guarded = (chunks) => createTerminalValidatedFetch(async () => new Response(
+      chunks.map(data => `data: ${JSON.stringify(data)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } }
+    ), provider)('https://fixture.invalid');
+    await (await guarded([valid[provider]])).text();
+    for (const evidence of falseEvidence) {
+      await assert.rejects((await guarded([content(provider, evidence)])).text(),
+        error => error.code === 'LLM_STREAM_TRUNCATED', `${provider}: ${JSON.stringify(evidence)}`);
+      await (await guarded([content(provider, evidence), valid[provider]])).text();
+    }
+  }
+});
+
+test('named Responses terminals still report status and usage to the empty-output guard', async () => {
+  for (const status of ['completed', 'incomplete']) {
+    const terminals = [];
+    const value = { type: `response.${status}`, response: { status,
+      incomplete_details: status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
+      usage: { output_tokens: 256, output_tokens_details: { reasoning_tokens: 256 } } } };
+    const body = `event: response.${status}\ndata: ${JSON.stringify(value)}\n\n`;
+    const guarded = createTerminalValidatedFetch(async () => new Response(body,
+      { headers: { 'content-type': 'text/event-stream' } }), 'openai-responses', {
+      onResponsesTerminal: terminal => terminals.push(terminal)
+    });
+    assert.equal(await (await guarded('https://fixture.invalid')).text(), body);
+    assert.deepEqual(terminals, [{ status, ...(status === 'incomplete' ? { reason: 'max_output_tokens' } : {}), usage: value.response.usage }]);
+  }
+});

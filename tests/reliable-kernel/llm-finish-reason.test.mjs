@@ -224,3 +224,27 @@ test('C8 Responses HTTP 非流式：只有推理且 incomplete，或推理用尽
     assert.equal(result.done, true, '没用尽上限的空回复行为不变');
   });
 });
+
+test('Responses named completed event detects reasoning-only output exhausted at max_output_tokens', async () => {
+  const terminal = responsesEvent('response.completed', { response: {
+    id: 'resp_1', object: 'response', status: 'completed', usage: exhaustedUsage,
+    output: [{ id: 'rs_1', type: 'reasoning', summary: [], encrypted_content: 'ENC' }]
+  } });
+  await withServer(() => ({ sse: reasoningOnlyStream(terminal) }), async base => {
+    const result = await run(settings('openai-responses', `${base}/v1`, 'gpt-5.5', {
+      generationConfig: { maxOutputTokens: 256 }
+    }));
+    assert.equal(result.done, false);
+    assert.equal(result.error.rawError.kind, 'empty_response');
+    assert.match(result.error.message, /max_output_tokens/);
+  });
+});
+
+test('Gemini tool argument finishReason cannot turn an unterminated stream into a completed tool batch', async () => {
+  await withServer(() => ({ sse: `data: ${JSON.stringify({ candidates: [{ content: { role: 'model',
+    parts: [{ functionCall: { name: 'list_items', args: { finishReason: 'arbitrary' } } }] } }] })}\n\n` }), async base => {
+    const result = await run(settings('gemini', `${base}/v1beta`, 'gemini-2.5-flash'));
+    assert.equal(result.done, false);
+    assert.match(result.error.message, /LLM_STREAM_TRUNCATED/);
+  });
+});

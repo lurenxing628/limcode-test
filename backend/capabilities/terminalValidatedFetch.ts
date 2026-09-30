@@ -209,10 +209,13 @@ class SseTerminalTracker {
     this.currentEvent = '';
     this.dataLines = [];
     if (!data && !event) return;
-    if (data.trim() === '[DONE]' || terminalEventName(event)) {
+    if (data.trim() === '[DONE]') {
       this.sawTerminal = true;
       return;
     }
+    // Named terminal events still carry status/usage needed by the empty-output guard.
+    // Do not skip their JSON payload merely because the event name proves stream completion.
+    if (terminalEventName(event, this.provider)) this.sawTerminal = true;
     if (!data) return;
     try {
       const value = JSON.parse(data);
@@ -256,26 +259,43 @@ function isJson(value: string | null): boolean {
   return type === 'application/json' || type.endsWith('+json');
 }
 
-function terminalEventName(event: string): boolean {
-  return event === 'response.completed' || event === 'message_stop';
+function terminalEventName(event: string, provider: LlmProviderKind): boolean {
+  return provider === 'openai-responses'
+    ? event === 'response.completed' || event === 'response.incomplete' || event === 'response.failed'
+    : provider === 'claude' && event === 'message_stop';
 }
 
-function hasTerminalJsonEvidence(value: unknown, provider: LlmProviderKind, depth = 0): boolean {
-  if (depth > 8 || value === null || value === undefined) return false;
-  if (Array.isArray(value)) return value.some((entry) => hasTerminalJsonEvidence(entry, provider, depth + 1));
-  if (typeof value !== 'object') return false;
-  const record = value as Record<string, unknown>;
-  if (record.type === 'response.completed' || record.type === 'message_stop') return true;
-  if (provider === 'openai-responses') {
-    const response = record.response;
-    if (response && typeof response === 'object'
-      && (response as Record<string, unknown>).status === 'completed') return true;
+function hasTerminalJsonEvidence(value: unknown, provider: LlmProviderKind): boolean {
+  const record = terminalRecord(value);
+  if (!record) return false;
+  // Protocol fields only. Recursing through arbitrary content lets a generated tool argument
+  // such as { finishReason: "saved" } turn a truncated Gemini stream into a successful response.
+  switch (provider) {
+    case 'openai-responses': {
+      if (typeof record.type !== 'string' || !record.type.startsWith('response.')) return false;
+      if (terminalEventName(record.type, provider)) return true;
+      const response = terminalRecord(record.response);
+      return response?.status === 'completed' || response?.status === 'incomplete';
+    }
+    case 'claude':
+      return record.type === 'message_stop'
+        || (record.type === 'message_delta' && nonEmptyReason(terminalRecord(record.delta)?.stop_reason));
+    case 'gemini':
+      return Array.isArray(record.candidates)
+        && record.candidates.some(candidate => nonEmptyReason(terminalRecord(candidate)?.finishReason));
+    case 'openai-compatible':
+      return Array.isArray(record.choices)
+        && record.choices.some(choice => nonEmptyReason(terminalRecord(choice)?.finish_reason));
   }
-  for (const key of ['finish_reason', 'finishReason', 'stop_reason']) {
-    const reason = record[key];
-    if (typeof reason === 'string' && reason.trim()) return true;
-  }
-  return Object.values(record).some((entry) => hasTerminalJsonEvidence(entry, provider, depth + 1));
+}
+
+function terminalRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : undefined;
+}
+
+function nonEmptyReason(value: unknown): boolean {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function isBodyConnectionFailure(error: unknown, depth = 0): error is Error {

@@ -24,6 +24,7 @@ const root = process.cwd();
 const compiled = process.env.LIMCODE_TEST_EXTENSION_ROOT ?? path.join(root, 'dist/extension');
 const load = (relative) => import(pathToFileURL(path.join(compiled, relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
+const { captureFilePlanningRoot } = await load('backend/reliableKernel/fileTargetBoundary.js');
 const { ReliableConversationRunner } = await load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { evaluateConversationHostEligibility } = await load('backend/application/reliableKernel/conversationHostEligibility.js');
 const { projectFolderAssignmentSteps } = await load('backend/reliableKernel/conversationProject.js');
@@ -1170,7 +1171,7 @@ function fixtureDependencies(provider, write, executions = { tools: [], processe
           definitions() { return write ? [writeTool] : []; },
           // A write proposes one file change that waits for the user's approval.
           async planFileMutation(_definition, input) {
-            return [{ operation: 'create_file', workEnvironmentId: 'work-env-test', targetPath: `${input.toolCallId}.txt`, targetContent: 'x' }];
+            return [{ operation: 'create_file', workEnvironmentId: 'work-env-test', planningRoot: await captureFilePlanningRoot(database.binding.paths.dataRootPath), targetPath: `${input.toolCallId}.txt`, targetContent: 'x' }];
           },
           async cancelTurnWaits() {},
           async dispose() {}

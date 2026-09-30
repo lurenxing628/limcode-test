@@ -107,7 +107,9 @@
     "deletePolicy": "dataset-reset-only",
     "rootIdReference": "soft",
     "fullPromptContent": false,
-    "clientDefaultIncludesSegments": false
+    "clientDefaultIncludesSegments": false,
+    "referenceIdentityRule": "冻结请求与原生结果事件保留进程、游标、工作环境及协作短引用身份；压缩、分支与重放不能把已有短引用重新分配给另一目标。附件仍由自己的稳定注册表管理，引用保留不授予目标操作权限。",
+    "nativeToolResultRule": "所有原生异步工具结果复用普通模型投影、逐结果预算和媒体分离；先冻结字节与引用再发送。组合结果超过批次预算时进入已有安全关闭/重建边界，不重新截断已冻结结果或重复已准入副作用。"
   },
   "modelRequest": {
     "extraFields": [

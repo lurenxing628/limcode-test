@@ -20,7 +20,7 @@ const { loading: conversationLoading, text: conversationLoadingText } = useSetti
 const showConversationLoading = computed(() => hasConversation.value && conversationLoading.value);
 
 function reload(): void {
-  settings.request(settings.common.conversationId);
+  settings.request(settings.common.conversationId, true);
 }
 </script>
 

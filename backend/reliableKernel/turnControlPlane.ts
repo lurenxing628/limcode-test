@@ -1088,72 +1088,85 @@ export class TurnControlPlane {
     leaseExpiresAt: string;
   }): Promise<ExecutionLeaseRenewalResult> {
     const expiresAt = requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt');
-    const now = this.timestamp();
-    if (Date.parse(expiresAt) <= Date.parse(now)) {
-      return { renewed: false, reason: 'requested_expiry_not_future' };
-    }
-    const currentRows = await this.listRows('ExecutionLease', { turn_id: input.fence.turnId }, 2);
-    if (currentRows.length !== 1) return { renewed: false, reason: 'lease_missing' };
-    const current = currentRows[0];
-    const observedExpiresAt = requireTimestamp(current.expires_at, 'ExecutionLease.expires_at');
-    const observedGeneration = requirePositiveInteger(
-      current.generation,
-      'ExecutionLease.generation'
-    ).toString();
-    if (
-      current.id !== input.fence.id
-      || current.conversation_id !== input.fence.conversationId
-      || current.turn_id !== input.fence.turnId
-      || current.owner_id !== input.fence.ownerId
-      || current.host_boot_id !== input.fence.hostBootId
-      || current.generation !== input.fence.generation
-    ) {
-      return {
-        renewed: false,
-        reason: 'fence_replaced',
-        observedExpiresAt,
-        observedGeneration
-      };
-    }
-    if (Date.parse(observedExpiresAt) <= Date.parse(now)) {
-      return {
-        renewed: false,
-        reason: 'lease_expired',
-        observedExpiresAt,
-        observedGeneration
-      };
-    }
-    try {
-      await this.database.transaction([
-        DOMAIN_REPOSITORIES.domain('Turn').assert(input.fence.turnId, { status: TURN_STATUS_ACTIVE }),
-        DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(input.fence.id, {
-          conversation_id: input.fence.conversationId,
-          turn_id: input.fence.turnId,
-          owner_id: input.fence.ownerId,
-          host_boot_id: input.fence.hostBootId,
-          generation: input.fence.generation,
-          acquired_at: current.acquired_at,
-          expires_at: observedExpiresAt
-        }),
-        DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
-          expires_at: expiresAt
-        })
+    let acquiredAt: string | undefined;
+    // Renewal and a recovery rescan can overlap under the same Conversation ownership pin. A
+    // changed expiry alone is not a handoff: re-read the complete authority before retrying.
+    const maxCasAttempts = 3;
+    for (let attempt = 0; ; attempt += 1) {
+      const now = this.timestamp();
+      if (Date.parse(expiresAt) <= Date.parse(now)) {
+        return { renewed: false, reason: 'requested_expiry_not_future' };
+      }
+      const snapshot = await this.database.snapshot([
+        DOMAIN_REPOSITORIES.domain('Turn').get(input.fence.turnId),
+        DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: input.fence.turnId }, limit: 2 })
       ]);
-      return {
-        renewed: true,
-        observedExpiresAt,
-        renewedExpiresAt: expiresAt
-      };
-    } catch (error) {
-      if (isTransactionAssertionError(error)) {
+      const turn = snapshot.snapshot[0];
+      const currentRows = rows(snapshot.snapshot[1]);
+      if (currentRows.length !== 1) return { renewed: false, reason: 'lease_missing' };
+      const current = currentRows[0];
+      const observedExpiresAt = requireTimestamp(current.expires_at, 'ExecutionLease.expires_at');
+      const observedGeneration = requirePositiveInteger(
+        current.generation,
+        'ExecutionLease.generation'
+      ).toString();
+      if (
+        !turn || Array.isArray(turn) || turn.status !== TURN_STATUS_ACTIVE
+        || current.id !== input.fence.id
+        || current.conversation_id !== input.fence.conversationId
+        || current.turn_id !== input.fence.turnId
+        || current.owner_id !== input.fence.ownerId
+        || current.host_boot_id !== input.fence.hostBootId
+        || current.generation !== input.fence.generation
+        || (attempt > 0 && current.acquired_at !== acquiredAt)
+      ) {
         return {
           renewed: false,
-          reason: 'transaction_conflict',
+          reason: 'fence_replaced',
           observedExpiresAt,
           observedGeneration
         };
       }
-      throw error;
+      if (Date.parse(observedExpiresAt) <= Date.parse(this.timestamp())) {
+        return {
+          renewed: false,
+          reason: 'lease_expired',
+          observedExpiresAt,
+          observedGeneration
+        };
+      }
+      acquiredAt = requireTimestamp(current.acquired_at, 'ExecutionLease.acquired_at');
+      if (attempt > 0 && Date.parse(observedExpiresAt) >= Date.parse(expiresAt)) {
+        // The competing writer renewed this exact live fence for at least the requested lifetime.
+        // No new generation is adopted, and terminal/missing/expired ownership never reaches here.
+        return { renewed: true, observedExpiresAt, renewedExpiresAt: observedExpiresAt };
+      }
+      if (attempt === maxCasAttempts) {
+        return { renewed: false, reason: 'transaction_conflict', observedExpiresAt, observedGeneration };
+      }
+      const renewedExpiresAt = Date.parse(observedExpiresAt) > Date.parse(expiresAt)
+        ? observedExpiresAt
+        : expiresAt;
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('Turn').assert(input.fence.turnId, { status: TURN_STATUS_ACTIVE }),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(input.fence.id, {
+            conversation_id: input.fence.conversationId,
+            turn_id: input.fence.turnId,
+            owner_id: input.fence.ownerId,
+            host_boot_id: input.fence.hostBootId,
+            generation: input.fence.generation,
+            acquired_at: acquiredAt,
+            expires_at: observedExpiresAt
+          }),
+          DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
+            expires_at: renewedExpiresAt
+          })
+        ]);
+        return { renewed: true, observedExpiresAt, renewedExpiresAt };
+      } catch (error) {
+        if (!isTransactionAssertionError(error)) throw error;
+      }
     }
   }
 
@@ -1408,8 +1421,14 @@ export class TurnControlPlane {
     const executionLeaseId = existingLease
       ? requireId(existingLease.id, 'ExecutionLease.id')
       : recoveryExecutionEntityId('execution_lease', hostBootId, turnId);
+    // A first recovery scan can overlap an ordinary Turn already executing in this runner (it
+    // has no recovery receipt yet). Match the receipt-replay renewal path: healthy ownership is
+    // retained, not replaced, so the in-flight Provider/tool writes keep their exact generation.
+    const retainGeneration = existingLease?.host_boot_id === hostBootId
+      && existingLease.owner_id === leaseOwnerId
+      && !existingLeaseExpired;
     const nextGeneration = existingLease
-      ? requirePositiveInteger(existingLease.generation, 'ExecutionLease.generation') + 1n
+      ? requirePositiveInteger(existingLease.generation, 'ExecutionLease.generation') + (retainGeneration ? 0n : 1n)
       : 1n;
     const leaseSteps: RepositoryTransactionStep[] = existingLease
       ? [
@@ -1426,8 +1445,10 @@ export class TurnControlPlane {
             owner_id: leaseOwnerId,
             host_boot_id: hostBootId,
             generation: nextGeneration,
-            acquired_at: now,
-            expires_at: leaseExpiresAt
+            acquired_at: retainGeneration ? existingLease.acquired_at : now,
+            expires_at: retainGeneration && Date.parse(String(existingLease.expires_at)) > Date.parse(leaseExpiresAt)
+              ? existingLease.expires_at
+              : leaseExpiresAt
           })
         ]
       : [

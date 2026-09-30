@@ -2636,8 +2636,10 @@ export class ReliableChildAgentCoordinator {
   }
 
   private async deliverBackgroundAnswer(answerBridgeId: string, inboxItemId: string): Promise<void> {
-    const snapshot = await this.snapshotForBridge(answerBridgeId);
-    const parentTurnId = requireId(snapshot.parentLink.parent_turn_id, 'ChildExecutionParentLink.parent_turn_id');
+    const parentTurnId = requireId(
+      await this.dependencies.answers.requestingParentTurn(inboxItemId),
+      'AnswerSubmission requesting parent Turn'
+    );
     const parentTurn = await this.get('Turn', parentTurnId);
     if (!parentTurn) throw new Error(`Parent Turn ${parentTurnId} no longer exists for answer delivery.`);
     const targetConversationId = requireId(parentTurn.conversation_id, 'Parent Turn.conversation_id');

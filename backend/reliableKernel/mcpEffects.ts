@@ -35,9 +35,15 @@ export type McpPreparationResult =
   | ({ disposition: 'prepared' } & PreparedEffectIntent)
   | { disposition: 'rejected'; settlement: ToolSettlementResult };
 
+interface McpResultWarnings {
+  attachmentError?: string;
+  resultProcessingError?: string;
+  automaticRetry?: false;
+}
+
 export type McpCallObservation =
-  | { outcome: 'succeeded'; result: unknown; parts?: InlineDataPart[] }
-  | { outcome: 'failed'; error: string; result: unknown; parts?: InlineDataPart[] }
+  | ({ outcome: 'succeeded'; result: unknown; parts?: InlineDataPart[] } & McpResultWarnings)
+  | ({ outcome: 'failed'; error: string; result: unknown; parts?: InlineDataPart[] } & McpResultWarnings)
   | { outcome: 'cancelled'; error: string }
   | { outcome: 'outcome_unknown'; error: string };
 
@@ -155,16 +161,21 @@ export class McpEffectDispatcher {
       });
     } catch (error) {
       if (!(error instanceof AttachmentAdmissionError)) throw error;
+      // The server's observed execution outcome is already known. A local attachment failure
+      // must never erase it or suggest that retrying the external action is safe.
+      if (observation.outcome !== 'succeeded' && observation.outcome !== 'failed') throw error;
+      const { parts: _parts, ...observed } = observation;
       durableObservation = {
-        outcome: 'failed',
-        error: `MCP attachment result could not be stored: ${boundedErrorMessage(error)}`,
-        result: null
+        ...observed,
+        result: withoutUnavailableAttachments(observed.result),
+        attachmentError: `MCP result attachments could not be stored: ${boundedErrorMessage(error)}`,
+        automaticRetry: false
       };
       recorded = await this.effects.recordEffectReceipt({
         source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
         attemptId: intent.attempt_id as string,
         effectKind: MCP_EFFECT_KIND,
-        outcome: 'failed',
+        outcome: durableObservation.outcome,
         detail: durableObservation
       });
     }
@@ -220,9 +231,10 @@ export class McpEffectDispatcher {
       };
     }
     if (settled.kind === 'error') return mcpInvocationFailure(settled.error, signal);
+    const result = settled.result;
     try {
-      const result = settled.result;
-      const normalized = normalizeMcpBinaryResult(result);
+      const binary = normalizeMcpBinaryResult(result);
+      const normalized = { result: normalizePlainJson(binary.result, 'MCP result'), parts: binary.parts };
       if (isObservedMcpToolFailure(result)) {
         return {
           outcome: 'failed',
@@ -237,7 +249,13 @@ export class McpEffectDispatcher {
         ...(normalized.parts.length > 0 ? { parts: normalized.parts } : {})
       };
     } catch (error) {
-      return mcpInvocationFailure(error, signal);
+      // Invocation returned a result; postprocessing uncertainty is separate from execution.
+      const warning = { result: usableMcpText(result),
+        resultProcessingError: `MCP result could not be fully represented: ${boundedErrorMessage(error)}`,
+        automaticRetry: false as const };
+      return isObservedMcpToolFailure(result)
+        ? { outcome: 'failed', error: mcpFailureMessage(result), ...warning }
+        : { outcome: 'succeeded', ...warning };
     }
   }
 
@@ -380,6 +398,32 @@ function normalizeMcpBinaryResult(result: unknown): { result: unknown; parts: In
     return entry;
   });
   return { result: { ...record, content }, parts };
+}
+
+/** Removes unusable attachment bodies while keeping all text and non-binary result fields. */
+function withoutUnavailableAttachments(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(withoutUnavailableAttachments);
+  if (!value || typeof value !== 'object') return value;
+  const record = value as Record<string, unknown>;
+  if ('inlineData' in record) {
+    const { inlineData: _inlineData, ...siblings } = record;
+    return { ...withoutUnavailableAttachments(siblings) as Record<string, unknown>, attachment: true, attachmentStatus: 'unavailable' };
+  }
+  return Object.fromEntries(Object.entries(record).map(([key, entry]) => [key,
+    key === 'attachment' && entry === true ? true : withoutUnavailableAttachments(entry)
+  ]).concat(record.attachment === true ? [['attachmentStatus', 'unavailable']] : []));
+}
+
+function usableMcpText(value: unknown): unknown {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return { content: [] };
+  const record = value as Record<string, unknown>;
+  const content = Array.isArray(record.content) ? record.content.flatMap(entry => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+    const item = entry as Record<string, unknown>;
+    return item.type === 'text' && typeof item.text === 'string' ? [{ type: 'text', text: item.text }] : [];
+  }) : typeof record.content === 'string' ? [{ type: 'text', text: record.content }] : [];
+  return { content, ...(record.isError === true ? { isError: true } : {}) };
 }
 
 function optionalMcpText(value: unknown): string | undefined {

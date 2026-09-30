@@ -136,7 +136,7 @@ export function useBridgeBootstrap(): void {
       );
     }),
     bridge.on(BridgeMessageType.ConversationSettingsSnapshot, (message) => {
-      if (message.payload) conversationSettings.applySnapshot(message.payload);
+      if (message.payload) conversationSettings.applySnapshot(message.payload, message.correlationId);
     }),
     bridge.on(BridgeMessageType.LlmProviderModelsSnapshot, (message) => {
       if (message.payload) globalSettings.applyLlmProviderModelsSnapshot(message.payload);

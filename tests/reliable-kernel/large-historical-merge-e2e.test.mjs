@@ -351,7 +351,7 @@ test('大库会话端到端（外来大库，自动流程）：用户请求合�
   assert.equal(exited.code, 0, windows.stderr('R'));
   const r1 = windows.of('R', 1);
   assert.deepEqual(r1.filter((event) => PROBLEMS.includes(event.event)), []);
-  assert.deepEqual(first(r1, 'batch').deferred.map((item) => [item.candidateId, item.code]), [[source.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]]);
+  assert.deepEqual(first(r1, 'batch').deferred.map((item) => [item.candidateId, item.code]), [[source.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]], JSON.stringify(first(r1, 'batch')));
   // Estimated first (under its claim, outside the admission), named by its readable name; prepared only after the countdown.
   const estimating = first(r1, 'estimating');
   assert.deepEqual([estimating.candidateIds, estimating.requested], [[source.id], false]);

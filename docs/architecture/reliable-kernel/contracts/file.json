@@ -35,7 +35,8 @@
     ],
     "contentStorage": "cas-before-sqlite-reference",
     "completedDiffRule": "replace_file/delete_file 的精确 base bytes 与 create_file/replace_file 的 target bytes 都在提案事务前进入 CAS；完成后通过独立 detail kind 重开 Diff，不依赖 Workspace 当前内容或瞬态预览。",
-    "modelResult": false
+    "modelResult": false,
+    "planningRootEvidence": "规划时的规范化根路径、设备与 inode 保存在审批提案 CAS 正文；执行请求保留同一证据，成员身份、顺序、完整集合及全部批准字段与 SQLite/提案交叉核对，不修改 Runtime schema。缺失证据的历史记录仍可查看和取消，但不得猜测当前根继续执行；未执行的无证据请求记冲突，已派发恢复无法证明时记 outcome_unknown。"
   },
   "decision": {
     "domain": "FileChangeDecision",
@@ -62,9 +63,9 @@
   },
   "pathBoundary": {
     "source": "registered-work-environment",
-    "rule": "执行前重新解析目标并确认仍在用户选定的工作环境内；目标本身是符号链接或路径越界时明确冲突。",
+    "rule": "读取规划正文之前验证实际路径边界。允许根链接及指向根内的父目录别名；规划将合法别名冻结为物理相对目标，读取前后重验原别名映射；目标本身为链接或父目录越界明确冲突。执行只访问批准的物理目标，核对根身份、父目录和目标状态；读取经描述符类型/身份/边界栅栏，拒绝换成 FIFO、链接或其它 inode 的目标。",
     "sameAccountMaliciousProcessProtection": false,
-    "recursiveComponentSecurityWalk": false
+    "recursiveComponentSecurityWalk": true
   },
   "apply": {
     "order": "memberSeq",
@@ -72,7 +73,9 @@
     "automaticRollback": false,
     "automaticRetry": false,
     "overwriteWithoutBaseCheck": false,
-    "rule": "只执行批准的成员；替换和删除先核对baseDigest，创建要求目标不存在。发生部分成功时如实记录每个已处理成员，不伪装成全部失败或全部成功。"
+    "rule": "只执行批准的完整成员集；先加载目标 CAS，再核对根/目标身份和 baseDigest，创建要求目标不存在；替换经不截断的描述符先核对类型/身份，之后才读写。锁等待失败或取消不能进入未加锁的恢复猜测。部分成功逐成员如实记录。便携 Node 文件 API 不保证对不遵守锁的外部写入者提供原子比较交换。",
+    "serialization": "同一进程按重叠目标排队；跨协作 Host 通过短暂注册准入及活动规范化根声明覆盖相同/嵌套根，文件 I/O 不持全局准入锁或 SQLite 事务，不相关根可并行。两类等待均可取消，跨 Host 声明获取有时间上限；仅隔离已证明死亡的 owner，释放核对声明代数。",
+    "externalWriterAtomicCas": false
   },
   "receipt": {
     "domain": "FileMutationReceipt",

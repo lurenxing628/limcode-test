@@ -298,7 +298,8 @@
   "externalEffectPromise": {
     "modelResultExactlyOnce": true,
     "externalSideEffectExactlyOnce": false,
-    "unverifiableCrashOutcome": "outcome_unknown"
+    "unverifiableCrashOutcome": "outcome_unknown",
+    "attachmentPostprocessing": "已观测到的 MCP 外部成功/显式失败与附件接纳错误分别记录；附件失败保留可用结果正文和原动作结论，标明后处理错误及不可据此自动重执行，不伪装成动作未发生。"
   },
   "notes": [
     "r5: stable recovery ID保持原target；receipt_written与有序finalizer由runAll前后纯数据库startup continuation负责，不冒充第三个stable ID",

@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, nextTick, ref, watch } from 'vue';
+import { computed, nextTick, ref } from 'vue';
+import { useGuardedSettingsDraft } from '@webview/composables/useGuardedSettingsDraft';
 import type { ConfigScopeKind } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
@@ -14,16 +15,18 @@ const props = withDefaults(defineProps<{ scopeKind: ConfigScopeKind; scopeId?: s
 const store = useRuntimeContextStore();
 const { loading: runtimeLoading, text: runtimeLoadingText } = useSettingsLoadingText('初始上下文配置', () => props.scopeKind, () => props.scopeId);
 const scroller = ref<HTMLTextAreaElement | null>(null);
-const draft = ref('');
 const local = computed(() => store.localContextFor(props.scopeKind, props.scopeId));
 const placeholders = computed(() => store.runtimePlaceholders);
 
-watch(() => [props.scopeKind, props.scopeId, local.value.runtimeContext?.id], () => {
-  draft.value = local.value.runtimeContext?.template ?? '';
-}, { immediate: true });
+const draftState = useGuardedSettingsDraft(
+  () => JSON.stringify([props.scopeKind, props.scopeId ?? '']),
+  () => ({ text: local.value.runtimeContext?.template ?? '' })
+);
+const draft = computed({ get: () => draftState.value.value.text, set: (text: string) => { draftState.value.value = { text }; } });
+const draftChangedRemotely = draftState.remoteChanged;
 
-function save(): void { store.setContextForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} Runtime Context`); }
-function clear(): void { draft.value = ''; store.clearContextScope(props.scopeKind, props.scopeId); }
+function save(): void { draft.value = draft.value.trim(); draftState.markSubmitted(); store.setContextForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} Runtime Context`); }
+function clear(): void { store.clearContextScope(props.scopeKind, props.scopeId); draftState.reset(); }
 function insertPlaceholder(token: string): void {
   const textarea = scroller.value;
   if (!textarea) {
@@ -73,6 +76,10 @@ function insertPlaceholder(token: string): void {
       <button type="button" :disabled="!draft.trim()" @click="save">保存模板</button>
       <button type="button" class="secondary" :disabled="scopeKind === 'global' || !local.runtimeContext" @click="clear">恢复继承</button>
       <span>{{ store.status }}</span>
+      <template v-if="draftChangedRemotely">
+        <span role="status">已保存内容有更新，当前草稿已保留</span>
+        <button type="button" class="secondary" @click="draftState.reset()">读取已保存值</button>
+      </template>
     </div>
   </section>
 </template>

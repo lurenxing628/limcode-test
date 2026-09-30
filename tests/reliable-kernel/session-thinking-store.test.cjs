@@ -17,6 +17,9 @@ function fixture() {
   const noopStore = new Proxy({ records: {}, viewKind: 'test' }, { get(target, key) { return key in target ? target[key] : () => undefined; } });
   const globalSettings = {
     loadedSections: {}, revisions: {},
+    executionPendingSaveState() { return undefined; },
+    executionSaveState() { return 'clean'; },
+    $onAction() { return () => undefined; },
     requestChannelSettings() {}, reconcilePendingSettings() {},
     applySnapshot({ section, revision }) { this.loadedSections[section] = true; this.revisions[section] = revision; }
   };
@@ -105,7 +108,8 @@ test('Hello更换host后重新读取，旧保存不能恢复旧scope或阻塞发
   const waiting = assert.rejects(f.store.awaitSavedForScope('conversation', 'a'), /连接已更换/);
   f.emit(protocol.BridgeMessageType.Hello, {}, undefined, 'host-b');
   await waiting;
-  const fresh = f.requests.at(-1);
+  const fresh = f.requests.findLast(request => request.type === protocol.BridgeMessageType.ModelProfileScopeRead);
+  assert.ok(fresh, 'host reconnect still requests the model scope alongside settings activity');
   assert.equal(fresh.type, protocol.BridgeMessageType.ModelProfileScopeRead);
   assert.equal(fresh.payload.sessionId, undefined);
   f.reply(fresh, snapshot('a', 'medium', 1, 'root-b'));

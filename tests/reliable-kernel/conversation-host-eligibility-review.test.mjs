@@ -47,6 +47,7 @@ const root = process.cwd();
 const compiled = (relative) => path.join(root, 'dist/extension', relative);
 const load = (relative) => import(pathToFileURL(compiled(relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
+const { captureFilePlanningRoot } = await load('backend/reliableKernel/fileTargetBoundary.js');
 const { ReliableConversationRunner } = await load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const {
   conversationHostIneligibleMessage,
@@ -896,7 +897,7 @@ function fixtureDependencies(provider, defaultWorkEnvironmentId, tools = {}) {
           definitions() { return [...(tools.askUser ? [askUserTool] : []), ...(tools.fileWrite ? [writeTool] : [])]; },
           // A write proposes one file change that waits for the user's approval.
           async planFileMutation(_definition, input) {
-            return [{ operation: 'create_file', workEnvironmentId: 'work-env-test', targetPath: `${input.toolCallId}.txt`, targetContent: 'x' }];
+            return [{ operation: 'create_file', workEnvironmentId: 'work-env-test', planningRoot: await captureFilePlanningRoot(database.binding.paths.dataRootPath), targetPath: `${input.toolCallId}.txt`, targetContent: 'x' }];
           },
           async cancelTurnWaits() {},
           async dispose() {}
