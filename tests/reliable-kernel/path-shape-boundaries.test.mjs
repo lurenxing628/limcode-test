@@ -39,6 +39,40 @@ async function temporaryDirectory(t) {
   return directory;
 }
 
+// Trace the actual guard's snapshots, not a later reopen that could hide a transient difference.
+// Only the synthetic test target is recorded; no workspace content or user path is included.
+async function traceFixtureFileIdentity(target, run) {
+  const originalLstat = fs.lstat, originalOpen = fs.open;
+  const snapshots = [];
+  const capture = (source, stat, flags) => {
+    snapshots.push({ source, flags, ...stat, devHex: stat.dev.toString(16), inoHex: stat.ino.toString(16),
+      modeOctal: stat.mode.toString(8), isFile: stat.isFile(), isDirectory: stat.isDirectory(), isSymbolicLink: stat.isSymbolicLink() });
+  };
+  fs.lstat = async (input, ...args) => {
+    const stat = await originalLstat(input, ...args);
+    if (String(input) === target && args[0]?.bigint) capture('lstat', stat);
+    return stat;
+  };
+  fs.open = async (input, flags, ...args) => {
+    const handle = await originalOpen(input, flags, ...args);
+    if (String(input) === target) {
+      const originalStat = handle.stat.bind(handle);
+      handle.stat = async (...statArgs) => {
+        const stat = await originalStat(...statArgs);
+        if (statArgs[0]?.bigint) capture('fstat', stat, flags);
+        return stat;
+      };
+    }
+    return handle;
+  };
+  try {
+    const value = await run();
+    const diagnostic = JSON.stringify({ platform: process.platform, node: process.version, uv: process.versions.uv, snapshots },
+      (_key, entry) => typeof entry === 'bigint' ? entry.toString() : entry);
+    return { value, diagnostic };
+  } finally { fs.lstat = originalLstat; fs.open = originalOpen; }
+}
+
 test('路径包含判断接受盘符根、UNC 共享根和 / 下的文件，Windows 不区分大小写', () => {
   const win = path.win32;
   assert.equal(isPathInside('G:\\', 'G:\\a.txt', win), true);
@@ -85,12 +119,12 @@ test('文件写入/删除边界接受根目录本身带分隔符的工作区（�
   const filesystemRoot = path.parse(directory).root;
   const dispatcher = { resolveBoundary: (id) => ({ id, rootPath: filesystemRoot }) };
   for (const targetPath of [path.relative(filesystemRoot, target), target]) {
-    const actual = await FileMutationDispatcher.prototype.inspectActual.call(dispatcher, {
+    const { value: actual, diagnostic } = await traceFixtureFileIdentity(target, async () => FileMutationDispatcher.prototype.inspectActual.call(dispatcher, {
       workEnvironmentId: 'root-environment',
       planningRoot: await captureFilePlanningRoot(filesystemRoot),
       targetPath
-    });
-    assert.equal(actual.kind, 'known', `${targetPath}: ${actual.error ?? ''}`);
+    }));
+    assert.equal(actual.kind, 'known', `${actual.error ?? ''}; file identity snapshots: ${diagnostic}`);
     assert.match(actual.digest, /^[0-9a-f]{64}$/);
   }
 });
@@ -163,8 +197,8 @@ async function replacementFixture(t) {
 
 test('原生文件身份允许读取与替换未变化的普通文件（Windows CI 使用真实 lstat/fstat）', async (t) => {
   const fixture = await replacementFixture(t);
-  const actual = await fixture.apply();
-  assert.equal(actual.outcome, 'succeeded', actual.error);
+  const { value: actual, diagnostic } = await traceFixtureFileIdentity(fixture.target, fixture.apply);
+  assert.equal(actual.outcome, 'succeeded', `${actual.error ?? ''}; file identity snapshots: ${diagnostic}`);
   assert.equal(await fs.readFile(fixture.target, 'utf8'), 'replaced');
 });
 
@@ -248,8 +282,10 @@ test('原生 realpath 失败时文件写入/删除边界的调用点也走可移
   promises.realpath = async () => { throw Object.assign(new Error('illegal operation on a directory'), { code: 'EISDIR' }); };
   t.after(() => { promises.realpath = nativeRealpath; });
   const dispatcher = { resolveBoundary: (id) => ({ id, rootPath: directory }) };
-  const actual = await FileMutationDispatcher.prototype.inspectActual.call(dispatcher, { workEnvironmentId: 'ram-disk', planningRoot: await captureFilePlanningRoot(directory), targetPath: 'a.txt' });
-  assert.equal(actual.kind, 'known', actual.error);
+  const planningRoot = await captureFilePlanningRoot(directory);
+  const { value: actual, diagnostic } = await traceFixtureFileIdentity(path.join(directory, 'a.txt'), () =>
+    FileMutationDispatcher.prototype.inspectActual.call(dispatcher, { workEnvironmentId: 'ram-disk', planningRoot, targetPath: 'a.txt' }));
+  assert.equal(actual.kind, 'known', `${actual.error ?? ''}; file identity snapshots: ${diagnostic}`);
   assert.match(actual.digest, /^[0-9a-f]{64}$/);
 });
 
