@@ -58,6 +58,7 @@ import {
   resolveAttachmentOnce,
   type MultimodalPreparationContext
 } from './llmRequestContentPreparation';
+import { retryLocalExecution } from '../reliableKernel/localExecutionRecovery';
 import {
   createDoneTiming,
   disposeThoughtBlock,
@@ -444,7 +445,8 @@ export async function startLlmProvider(
   });
   const streamEmit = streamEvents.emit;
   try {
-    const settings = await resolveRuntimeSettings(request, options, resolvedRuntimeSettingsByInvocationId);
+    const settings = await retryProviderInputRead(
+      () => resolveRuntimeSettings(request, options, resolvedRuntimeSettingsByInvocationId), { signal });
     emitLlmStarted(streamEmit, request.id, request.invocationId, resolveModelDisplayName(settings));
     const nativeCapabilities = openAIResponsesNativeCapabilities({
       provider: settings.provider,
@@ -611,7 +613,7 @@ export async function startLlmProvider(
   } catch (error) {
     if (isRequestAbort(signal)) return;
     const failure = failureFromCaughtError(error);
-    emitLlmError(streamEmit, request.id, failure.message, failure.rawError, {
+    emitLlmError(streamEmit, request.id, failure.message, { ...failure.rawError, failureOrigin: 'setup' }, {
       createdAt: failure.createdAt,
       streamOutputDurationMs: failure.streamOutputDurationMs
     });
@@ -656,14 +658,18 @@ async function runLlmAttempt(
       emit(event);
     };
   };
-  const preparedRequest = await prepareLlmStartRequestMultimodal(request, options, nativeCapabilities);
-  const unifiedRequest = toUnifiedRequest(
-    preparedRequest,
-    effectiveRequestGenerationConfig(request, settings),
-    settings.provider,
-    nativeCapabilities,
-    turnReminderLayoutFor(request, settings)
-  );
+  const unifiedRequest = await (async () => {
+    try {
+      const preparedRequest = await retryProviderInputRead(
+        () => prepareLlmStartRequestMultimodal(request, options, nativeCapabilities), { signal });
+      return toUnifiedRequest(preparedRequest, effectiveRequestGenerationConfig(request, settings),
+        settings.provider, nativeCapabilities, turnReminderLayoutFor(request, settings));
+    } catch (error) {
+      const failure = failureFromCaughtError(error);
+      throw new LlmAttemptFailureError({ ...failure,
+        rawError: { ...failure.rawError, failureOrigin: 'request_preparation' } });
+    }
+  })();
   const forceStreaming = isOpenAIResponsesWebSocketMode(settings);
   if (settings.stream === false && !forceStreaming) {
     const response = await provider.chat<UnifiedLLMResponse>(unifiedRequest, {
@@ -2158,7 +2164,8 @@ export async function compactLlmProvider(
       return;
     }
     const failure = failureFromCaughtError(error);
-    emitCompactError(emit, request, failure, Date.now());
+    emitCompactError(emit, request, { ...failure,
+      rawError: { ...failure.rawError, failureOrigin: 'setup' } }, Date.now());
   }
 }
 
@@ -6079,6 +6086,29 @@ function isRequestAbort(signal?: AbortSignal): boolean {
   // 某些网络层会把 ECONNRESET / socket hang up / 超时包装成 AbortError；
   // 如果不校验 signal.aborted，这类真实失败会被误判为用户取消，导致压缩块一直停在 running。
   return signal?.aborted === true;
+}
+
+/** Read-only settings/attachment preparation, before any model POST or external tool can start. */
+async function retryProviderInputRead<T>(
+  read: () => Promise<T>, options: { signal?: AbortSignal }
+): Promise<T> {
+  for (let retry = 0; ; retry += 1) {
+    options.signal?.throwIfAborted();
+    try {
+      return await retryLocalExecution(read, options);
+    } catch (error) {
+      options.signal?.throwIfAborted();
+      let value: unknown = error;
+      let transientTransport = false;
+      for (let depth = 0; depth < 6 && value && typeof value === 'object'; depth += 1) {
+        const record = value as { code?: unknown; cause?: unknown };
+        if (typeof record.code === 'string' && /^(?:ECONNRESET|ECONNABORTED|ETIMEDOUT|EAI_AGAIN|UND_ERR_SOCKET|UND_ERR_BODY_TIMEOUT|UND_ERR_CONNECT_TIMEOUT)$/.test(record.code)) transientTransport = true;
+        value = record.cause;
+      }
+      if (!transientTransport || retry >= 2) throw error;
+      await new Promise<void>(resolve => setTimeout(resolve, retry === 0 ? 100 : 250));
+    }
+  }
 }
 
 function compactRequestDebugInfo(request: LlmCompactRequest): Record<string, unknown> {

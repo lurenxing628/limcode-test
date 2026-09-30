@@ -141,6 +141,7 @@ const providerOutputTokens = computed(() => firstToken(
   envelope.value.providerOutputTokens
 ));
 const triggerLabel = computed(() => {
+  if (triggerReason.value === 'provider_context_overflow') return '模型上下文超限后压缩';
   if (triggerReason.value === 'configured_threshold') return '配置阈值触发';
   if (triggerReason.value === 'manual' || trigger.value === 'manual') return '手动触发';
   return trigger.value === 'auto' ? '自动触发' : '';

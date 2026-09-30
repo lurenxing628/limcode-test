@@ -2276,9 +2276,9 @@ function requireFileChangeOperation(value: unknown): 'create_file' | 'replace_fi
 
 function optionalCompressionTriggerReason(
   value: unknown
-): 'manual' | 'configured_threshold' | undefined {
+): 'manual' | 'configured_threshold' | 'provider_context_overflow' | undefined {
   if (value === undefined) return undefined;
-  if (value === 'manual' || value === 'configured_threshold') return value;
+  if (value === 'manual' || value === 'configured_threshold' || value === 'provider_context_overflow') return value;
   throw new TypeError(`Unsupported compression trigger reason: ${String(value)}.`);
 }
 

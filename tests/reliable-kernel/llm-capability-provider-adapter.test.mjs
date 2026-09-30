@@ -1978,17 +1978,10 @@ test('LLM capability adapter 识别 SSE 文本状态码和 SERVICE_BUSY', async 
   }
 });
 
-test('LLM capability adapter 不因稍后重试文案放宽永久错误或显式禁止重试', async () => {
+test('LLM capability adapter 不因稍后重试文案放宽永久错误', async () => {
   for (const [message, rawError] of [
-    ['未知错误，请稍后重试', undefined],
-    ['Request failed at item 503', undefined],
-    ['Streaming error: 5030: unknown failure', undefined],
-    ['服务繁忙，请稍后重试', { retryable: false }],
-    ['Streaming error: 503: SERVICE_BUSY', { transportAttemptsExhausted: true }],
     ['Streaming error: 503: SERVICE_BUSY', { code: 'invalid_api_key' }],
     ['Streaming error: 503: SERVICE_BUSY', { code: 'insufficient_quota' }],
-    ['模型服务暂时不可用，请稍后重试', { retryable: false }],
-    ['模型服务暂时不可用，请稍后重试', { transportAttemptsExhausted: true }],
     ['模型服务暂时不可用，请稍后重试', { code: 'invalid_api_key' }],
     ['模型服务暂时不可用，请稍后重试', { code: 'insufficient_quota' }],
     ...[400, 401, 403, 404, 422].map((status) => [
@@ -2135,7 +2128,7 @@ test('LLM capability adapter 按分钟或按秒的限流和普通 5xx 仍按瞬�
   }
 });
 
-test('LLM capability adapter 其它永久错误保留原文，响应体字段只参与额度判断', async () => {
+test('LLM capability adapter 永久错误保留原文并识别响应体里的上下文限制', async () => {
   for (const [message, rawError] of [
     ['Incorrect API key provided: sk-fixture.', { status: 401, code: 'invalid_api_key' }],
     ["This model's maximum context length is 128000 tokens. However, your messages resulted in 130000 tokens.", {
@@ -2423,8 +2416,7 @@ test('LLM capability adapter 只允许配置的终态前关闭在语义输出后
     rawSemanticOutput.sendFullRequest(request(), {
       onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
     }),
-    (error) => !(error instanceof kernel.ProviderTransientError)
-      && /语义输出.*不自动重放请求/.test(error.message)
+    (error) => error instanceof kernel.ProviderTransientError && error.retryAfterOutput === true
   );
 
   const afterSemanticEvents = [];
@@ -2473,7 +2465,7 @@ test('LLM capability adapter 只允许配置的终态前关闭在语义输出后
   );
 });
 
-test('signature-only reasoning 后的 EOF 在可靠 adapter 边界不可重放', async () => {
+test('signature-only reasoning 仍属未执行输出，Provider 失败可交由可靠内核替换', async () => {
   const observed = [];
   const adapter = new kernel.LlmCapabilityFullRequestAdapter(
     'provider-config',
@@ -2509,8 +2501,7 @@ test('signature-only reasoning 后的 EOF 在可靠 adapter 边界不可重放',
         return { accepted: true, checkpointed: true, terminal: false };
       }
     }),
-    (error) => !(error instanceof kernel.ProviderTransientError)
-      && /已收到 Provider (?:语义)?输出.*不自动重放请求/.test(error.message)
+    (error) => error instanceof kernel.ProviderTransientError && error.retryAfterOutput === true
   );
   assert.equal(observed.length, 1);
   assert.equal(observed[0].kind, 'output_item_done');
@@ -3062,4 +3053,151 @@ test('LLM capability adapter stores provider items of an authoritative reply wit
     { providerContext: { provider: 'openai', format: 'openai-responses', itemType: 'compaction', rawItem: { type: 'compaction', encrypted_content: 'opaque' } } },
     { text: 'answer' }
   ]);
+});
+
+test('Provider 边界未知错误默认重试，结构化网络、429、HTTP200错误体与生成格式错误都可替换部分输出', async () => {
+  const cases = [
+    ['未知错误，请稍后重试', undefined, 'temporary_service_error'],
+    ['Request failed at item 503', undefined, 'temporary_service_error'],
+    ['Streaming error: 5030: unknown failure', undefined, 'temporary_service_error'],
+    ['temporary failure', { cause: { status: 503 } }, 'temporary_service_error'],
+    ['temporary failure', { status: '503' }, 'temporary_service_error'],
+    ['terminated', { cause: { code: 'UND_ERR_SOCKET' } }, 'connection_interrupted'],
+    ['terminated', { cause: { code: 'UND_ERR_BODY_TIMEOUT' } }, 'connection_interrupted'],
+    ['too many requests', { status: 429, receivedSemanticOutput: true }, 'rate_limited'],
+    ['Internal Server Error', { status: 200, rawBody: { error: { code: 'server_error' } } }, 'temporary_service_error'],
+    ['Service Busy', { status: 503, retryable: false, transportAttemptsExhausted: true }, 'temporary_service_error'],
+    ['bad generated JSON', { kind: 'decode_error', status: 200 }, 'temporary_service_error'],
+    ['bad SSE JSON', { kind: 'stream_parse_error', status: 200 }, 'temporary_service_error'],
+    ['empty model response', { kind: 'empty_response', finishReason: 'MALFORMED_FUNCTION_CALL' }, 'temporary_service_error']
+  ];
+  for (const [message, rawError, reason] of cases) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((request, emit) => {
+      emit({ type: 'llm:delta', payload: { requestId: request.id, text: 'discardable partial' } });
+      emit({ type: 'llm:error', payload: { requestId: request.id, message, rawError } });
+    }));
+    await assert.rejects(adapter.sendFullRequest(request(), {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }), error => error instanceof kernel.ProviderTransientError && error.reason === reason
+      && error.retryAfterOutput === true, JSON.stringify({ message, rawError }));
+  }
+});
+
+test('激进重试仍拒绝认证、额度、上下文/输出上限、安全限制与本地配置错误', async () => {
+  for (const [message, raw] of [
+    ['WebSocket closed before terminal event: 1008', { status: 401, code: 'invalid_api_key' }],
+    ['WebSocket closed before terminal event: 1008', { code: 'insufficient_quota' }],
+    ['bad certificate', { code: 'CERT_HAS_EXPIRED', retryable: true }],
+    ['input too long', { status: 200, rawBody: { error: { code: 'context_length_exceeded' } } }],
+    ['truncated', { kind: 'empty_response', finishReason: 'max_output_tokens' }],
+    ['filtered', { kind: 'empty_response', finishReason: 'content_filter' }],
+    ['local settings unavailable', { failureOrigin: 'setup' }],
+    ['local attachment unavailable', { failureOrigin: 'request_preparation' }],
+    ['storage failure', { code: 'SQLITE_BUSY' }],
+    ['storage recovery exhausted', { code: 'LOCAL_EXECUTION_RECOVERY_EXHAUSTED' }],
+    ['unknown deterministic error', { retryable: false }]
+  ]) assert.equal((await providerFailureOf(message, raw)) instanceof kernel.ProviderTransientError, false,
+    JSON.stringify({ message, raw }));
+  assert.equal((await providerFailureOf('input too long', {
+    status: 200, rawBody: { error: { code: 'context_length_exceeded' } }
+  })).code, 'CONTEXT_WINDOW_EXCEEDED');
+});
+
+test('Provider Retry-After 秒、日期、毫秒和 Gemini RetryInfo 保留最小等待，过长提示不提前重试', async () => {
+  const seconds = await providerFailureOf('rate limited', { status: 429, headers: { 'Retry-After': '60' } });
+  assert.equal(seconds.retryOptions.retryAfterMs, 60_000);
+  const milliseconds = await providerFailureOf('rate limited', { status: 429, headers: { 'retry-after-ms': '1500' } });
+  assert.equal(milliseconds.retryOptions.retryAfterMs, 1_500);
+  const target = new Date(Date.now() + 90_000).toUTCString();
+  const date = await providerFailureOf('rate limited', { status: 429, headers: { 'retry-after': target } });
+  assert.ok(date.retryOptions.retryAfterMs >= 88_000 && date.retryOptions.retryAfterMs <= 90_000);
+  const gemini = await providerFailureOf('rate limited', { status: 429, rawBody: { error: { details: [
+    { '@type': 'type.googleapis.com/google.rpc.RetryInfo', retryDelay: '37s' }
+  ] } } });
+  assert.equal(gemini.retryOptions.retryAfterMs, 37_000);
+  const excessive = await providerFailureOf('rate limited', { status: 429, headers: { 'retry-after': '1200' } });
+  assert.equal(excessive instanceof kernel.ProviderTransientError, false);
+  assert.match(excessive.message, /至少等待 1200 秒.*超过自动等待上限/);
+  const malformed = await providerFailureOf('rate limited', { status: 429, headers: { 'retry-after': 'nonsense' } });
+  assert.equal(malformed.retryOptions.retryAfterMs, undefined);
+});
+
+test('同步 start 的未知本地异常不默认重试，未被请求取消的网络 AbortError 可以重试', async () => {
+  for (const [error, retryable] of [
+    [new Error('settings resolver broke'), false],
+    [Object.assign(new Error('socket hang up'), { name: 'AbortError', code: 'ECONNRESET' }), true]
+  ]) {
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability(() => { throw error; }));
+    await assert.rejects(adapter.sendFullRequest(request(), {
+      onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+    }), value => (value instanceof kernel.ProviderTransientError) === retryable);
+  }
+});
+
+test('各家生成格式错误只用两次修复预算，Provider 状态和永久限制优先于笼统标记', async () => {
+  for (const raw of [
+    { kind: 'empty_response', finishReason: 'MALFORMED_FUNCTION_CALL', retryable: false },
+    { kind: 'decode_error', status: 200, rawChunk: { type: 'content_block_stop' }, retryable: false },
+    { kind: 'decode_error', status: 200, message: 'Anthropic tool input JSON incomplete' },
+    { kind: 'stream_parse_error', status: 200 }
+  ]) {
+    const error = await providerFailureOf('bad generated output', raw);
+    assert.ok(error instanceof kernel.ProviderTransientError);
+    assert.equal(error.retryOptions.maxRetries, 2);
+    assert.equal(error.code, 'PROVIDER_MODEL_OUTPUT_INVALID');
+  }
+  for (const status of [400, 501, 505]) assert.equal((await providerFailureOf('upstream unavailable', {
+    status, rawBody: { error: { type: 'invalid_request_error', message: 'upstream unavailable' } }
+  })) instanceof kernel.ProviderTransientError, false);
+  assert.ok(await providerFailureOf('upstream unavailable', {
+    status: 503, rawBody: { error: { type: 'invalid_request_error', message: 'upstream unavailable' } }
+  }) instanceof kernel.ProviderTransientError);
+});
+
+test('Provider Attempt 元数据按重试次数加初次发送计数，并扣除 native 已消耗预算', async () => {
+  const captured = [];
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((req, emit) => {
+    captured.push(req.reliableProviderAttempt);
+    emit({ type: 'llm:done', payload: { requestId: req.id } });
+  }));
+  for (const prior of [0, 5]) {
+    const input = request();
+    input.authoritySnapshot.model.retryPolicy = { enabled: true, maxRetries: 10, retryDelayMs: 0 };
+    if (prior) input.recipe.nativeErrorRecovery = { failures: prior, modelOutputRepair: false };
+    await adapter.sendFullRequest(input, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: true }) });
+  }
+  assert.deepEqual(captured.map(value => value.maxAttempts), [11, 6]);
+});
+
+test('显式安全错误与本地 SyntaxError 不重试，Provider 工具参数解析才进入两次修复预算', async () => {
+  for (const code of ['safety', 'refusal', 'prohibited_content', 'spii']) {
+    assert.equal((await providerFailureOf('blocked', { code })) instanceof kernel.ProviderTransientError, false);
+  }
+  const local = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability(() => {
+    throw new SyntaxError('invalid local settings JSON');
+  }));
+  await assert.rejects(local.sendFullRequest(request(), {
+    onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false })
+  }), error => !(error instanceof kernel.ProviderTransientError));
+  const events = [];
+  const generated = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((req, emit) => {
+    emit({ type: 'llm:toolcall', payload: { requestId: req.id,
+      calls: [{ id: 'bad', name: 'echo', argsJson: '{"partial":' }] } });
+  }));
+  await assert.rejects(generated.sendFullRequest(request(), {
+    onEvent: async event => { events.push(event); return { accepted: true, checkpointed: true, terminal: false }; }
+  }), error => error instanceof kernel.ProviderTransientError && error.retryOptions.maxRetries === 2
+    && error.code === 'PROVIDER_MODEL_OUTPUT_INVALID');
+  assert.equal(events.length, 0, 'no malformed call crosses the provider boundary');
+});
+
+test('Provider 的 CONTENT/MODEL 服务错误不冒充本地故障，真实 wire invariant 则拒绝重试', async () => {
+  for (const code of ['CONTENT_SERVICE_UNAVAILABLE', 'MODEL_OVERLOADED']) {
+    assert.ok((await providerFailureOf('upstream problem', { status: 503, code })) instanceof kernel.ProviderTransientError);
+  }
+  for (const raw of [{ code: 'LLM_WIRE_INVARIANT_FAILED' }, { code: 'CONTENT_DIGEST_MISMATCH', category: 'internal' }]) {
+    const error = await providerFailureOf('local invariant failed', raw);
+    assert.equal(error instanceof kernel.ProviderTransientError, false);
+    assert.equal(error.category, 'internal');
+  }
 });

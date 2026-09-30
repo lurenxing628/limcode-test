@@ -1812,3 +1812,20 @@ test('Host 本地移除与同步失败隔离：其他 Host 不被禁用，后续
     assert.equal((await one.workEnvironments()).find(record => record.id === id).available, true);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+
+test('重试次数使用 8 次新默认、保留已有选择，并把旧无限值归一到运行时 10 次上限', () => {
+  assert.equal(createDefaultLlmProviderConfig().retryMaxAttempts, 8);
+  assert.equal(normalizeLlmProviderConfig({}).retryMaxAttempts, 8);
+  for (const retryMaxAttempts of [0, 1, 4, 8, 10]) {
+    assert.equal(normalizeLlmProviderConfig({ retryMaxAttempts }).retryMaxAttempts, retryMaxAttempts);
+  }
+  assert.equal(normalizeLlmProviderConfig({ retryMaxAttempts: -1 }).retryMaxAttempts, 10);
+  assert.equal(normalizeLlmProviderConfig({ retryMaxAttempts: 999 }).retryMaxAttempts, 10);
+  const withOverride = normalizeLlmProviderConfig({
+    model: 'fixture', models: [{ id: 'fixture', name: 'fixture' }], retryMaxAttempts: 8,
+    modelConfigs: [{ id: 'override', modelId: 'fixture', retryMaxAttempts: 4, retryOnError: false }]
+  });
+  assert.equal(withOverride.retryMaxAttempts, 8);
+  assert.equal(withOverride.modelConfigs[0].retryMaxAttempts, 4);
+  assert.equal(withOverride.modelConfigs[0].retryOnError, false);
+});

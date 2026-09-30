@@ -410,7 +410,7 @@ test('a transient failure while an admitted tool runs parks the Turn; re-drives 
 
 test('a Host lost during a transient retry delay still rebases a chain with durable progress', { timeout: 15000 }, async () => {
   await withNativeKernel({
-    retryPolicy: { enabled: true, maxRetries: 2, retryDelayMs: 20000 },
+    retryPolicy: { enabled: true, maxRetries: 2, retryDelayMs: 2000 },
     async script({ round, controls, emit, responseId, app }) {
       if (round === 0) {
         await emit('native_control', { type: 'response.created', responseId, capabilities });
@@ -447,6 +447,8 @@ test('a Host lost during a transient retry delay still rebases a chain with dura
     const [retrying] = await rows(state.app, 'ModelRequest', { id: request.id });
     assert.equal(retrying.status, 'retrying');
     const outcome = await drive(recovered);
+    assert.ok(Date.now() >= retrying.stream_stats_json.retryNotBeforeAt,
+      'a rebase after Host loss still honors the persisted retry delay');
     assert.equal(outcome.terminalStatus, 'completed',
       JSON.stringify(await rows(state.app, 'TurnTermination', { turn_id: turn.turnId })));
     assert.equal(requests.length, 2, 'the parked Attempt never re-sends the frozen input');
@@ -955,4 +957,103 @@ test('a frozen native call proof is trusted as recorded and never re-derived wit
     outputItem: { id: 'item-1', ordinal: 0, providerResponseId: 'r1' },
     call: { id: 'call-1', ordinal: 0, name: 'native_probe', arguments: { path: 'b.txt' } }
   }), /changed its provider arguments/, 'changed provider arguments on replay are still rejected');
+});
+
+for (const restart of [false, true]) {
+  test(`error-driven native rebases share a bounded retry budget${restart ? ' across Host restart' : ''}`, { timeout: 30000 }, async () => {
+    await withNativeKernel({
+      retryPolicy,
+      async script({ round, emit, responseId, app }) {
+        assert.ok(round < 3, 'a fresh ModelRequest must not reset the error-recovery budget');
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, `budget-call-${round}`, 0, { async: true });
+        await waitFor(async () => (await rows(app, 'ToolModelResult')).length === round + 1, 'native tool settled');
+        throw new kernel.ProviderTransientError('connection_interrupted', 'repeated fixture transport reset', true);
+      }
+    }, async state => {
+      let turn = await state.startTurn(`bounded-native-${restart}`, 'Run the probe.');
+      if (restart) {
+        const original = state.app.agentLoop.assertNativeErrorRebaseBudget.bind(state.app.agentLoop);
+        let interrupted = false;
+        state.app.agentLoop.assertNativeErrorRebaseBudget = async (...args) => {
+          await original(...args);
+          if (!interrupted) { interrupted = true; throw new kernel.ExecutionHandoffError('restart after durable error-rebase seal'); }
+        };
+        await assert.rejects(state.drive(turn), error => kernel.isExecutionHandoffError(error));
+        await state.reopen();
+        turn = await state.recover(turn.turnId);
+      }
+      const outcome = await state.driveUntilSettled(turn);
+      assert.equal(outcome.terminalStatus, 'failed');
+      assert.equal(state.requests.length, 3, 'initial request plus exactly two recovery requests');
+      assert.deepEqual(state.executions, ['budget-call-0', 'budget-call-1', 'budget-call-2']);
+      assert.deepEqual(state.duplicates, []);
+      const [termination] = await rows(state.app, 'TurnTermination', { turn_id: turn.turnId });
+      assert.match(termination.reason, /retry budget/);
+      const requests = await rows(state.app, 'ModelRequest', { turn_id: turn.turnId });
+      assert.equal(requests.filter(row => row.terminal_state === 'native_chain_rebased'
+        && row.stream_stats_json.failure?.category === 'transient').length, 3);
+    });
+  });
+}
+
+test('a native rebase carries the remaining retry budget into successor ordinary Attempts', { timeout: 30000 }, async () => {
+  await withNativeKernel({
+    retryPolicy,
+    async script({ round, request, emit, responseId, app }) {
+      assert.ok(round < 3, 'successor physical Attempts overshot the original retry budget');
+      if (round === 1) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'mixed-budget-call', 0, { async: true });
+        await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'mixed-budget tool settled');
+      }
+      if (round === 2) assert.deepEqual(request.recipe.nativeErrorRecovery, { failures: 2, modelOutputRepair: false });
+      throw new kernel.ProviderTransientError('connection_interrupted', 'mixed fixture reset', true);
+    }
+  }, async state => {
+    const turn = await state.startTurn('mixed-native-budget', 'Run the probe.');
+    const outcome = await state.driveUntilSettled(turn);
+    assert.equal(outcome.terminalStatus, 'failed');
+    assert.equal(state.requests.length, 3, 'one original plus two total recovery attempts, across identities');
+    assert.deepEqual(state.requests.map(request => request.attemptSeq), ['1', '2', '1']);
+    assert.deepEqual(state.executions, ['mixed-budget-call']);
+    assert.deepEqual(state.duplicates, []);
+  });
+});
+
+test('native error rebase honors durable Retry-After across a prompt Host handoff', { timeout: 15000 }, async () => {
+  let successorAt = 0;
+  await withNativeKernel({
+    retryPolicy,
+    async script({ round, emit, responseId, app }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitCall(emit, responseId, 'retry-after-call', 0, { async: true });
+        await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'retry-after tool settled');
+        throw new kernel.ProviderTransientError('rate_limited', 'native rate limit', true, { retryAfterMs: 1200 });
+      }
+      successorAt = Date.now();
+      await emitFinalText(emit, responseId, 'continued after the provider minimum');
+    }
+  }, async state => {
+    let turn = await state.startTurn('native-retry-after-handoff', 'Run the probe.');
+    const driving = state.drive(turn);
+    void driving.catch(() => undefined);
+    await waitFor(async () => (await rows(state.app, 'ModelRequest', { turn_id: turn.turnId }))
+      .some(row => row.terminal_state === 'native_chain_rebased'), 'native chain sealed before delay');
+    const [sealed] = await rows(state.app, 'ModelRequest', { turn_id: turn.turnId });
+    assert.ok(sealed.stream_stats_json.retryNotBeforeAt > Date.now());
+    const stopAt = Date.now();
+    await state.app.modelProvider.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('handoff during native backoff'));
+    await assert.rejects(within(driving, 'native backoff handoff', 1000), error => kernel.isExecutionHandoffError(error));
+    assert.ok(Date.now() - stopAt < 1000, 'handoff must not wait for Retry-After');
+    assert.equal(state.requests.length, 1);
+    await state.reopen();
+    turn = await state.recover(turn.turnId);
+    const outcome = await state.driveUntilSettled(turn);
+    assert.equal(outcome.terminalStatus, 'completed');
+    assert.equal(state.requests.length, 2);
+    assert.ok(successorAt >= sealed.stream_stats_json.retryNotBeforeAt, 'restart shortened the server minimum delay');
+    assert.deepEqual(state.executions, ['retry-after-call']);
+  });
 });

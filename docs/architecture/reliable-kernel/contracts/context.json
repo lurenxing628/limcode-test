@@ -214,19 +214,21 @@
   "providerRetry": {
     "automaticTransientRetry": true,
     "authority": "frozen-turn-authority+sqlite-model-request-attempt",
-    "defaultMaxRetries": 3,
+    "defaultMaxRetries": 8,
     "maxRetries": 10,
     "configuredPerFrozenAuthority": true,
     "backoffMilliseconds": [
+      500,
       1000,
       2000,
       4000,
       8000,
-      10000
+      16000,
+      30000
     ],
     "semanticDeadlinesMilliseconds": {
-      "ordinaryFirst": 80000,
-      "ordinaryIdle": 60000,
+      "ordinaryFirst": 300000,
+      "ordinaryIdle": 600000,
       "compressionCompletion": 270000
     },
     "compressionProgressContract": "compact()只以CompactDone/CompactError提交终态；真实非空白文本或思考通过metadata-only进度重置270秒无进度deadline，心跳、usage与signature-only不续命；未完成摘要不落盘，进度不阻断有界重试，总dispatch期限与取消仍有效",
@@ -236,7 +238,10 @@
     "visibilityAuthority": "只读取已提交ModelRequest/Attempt事实或commit feed；不得建立瞬时retry observer第二authority",
     "cancelable": true,
     "afterExtensionRestart": "resume-committed-retry-with-not-before-deadline",
-    "newAttemptKeepsSameModelRequest": true
+    "newAttemptKeepsSameModelRequest": true,
+    "retryAfterPolicy": "recognized-provider-hints-are-a-minimum-not-before-deadline; hints-beyond-supported-horizon-stop-with-an-explicit-reason-never-retry-early",
+    "failureClassification": "typed-provider-boundary-normalization-with-bounded-error-envelope-and-cause-evidence; retry-unknown-provider-failures-within-frozen-budget; local-setup-permanent-configuration-cancellation-and-invariant-errors-are-not-provider-transients",
+    "partialOutputRecovery": "replace-uncommitted-provider-output-only-when-replay-safe; committed-native-effects-rebase-from-context-without-resetting-logical-error-recovery-budget"
   },
   "performance": {
     "storageGrowth": "每轮新增存储≤1.5×本轮新增内容字节+128KB；量化判定式以 appendices/performance-and-packaging-gates.md 为唯一权威",

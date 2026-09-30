@@ -1948,7 +1948,7 @@ test('response.created 后首语义前 EOF 仍会创建 durable Attempt 2 并自
   });
 });
 
-test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted 与永久错误保持终态', async () => {
+test('retryable/error metadata 服从持久预算，接入层耗尽不替代可靠内核预算', async () => {
   async function runRawError(rawError) {
     const capability = {
       start(request, emit) {
@@ -2037,10 +2037,252 @@ test('0.1.35 retryable/error metadata映射为持久 retry authority，exhausted
   );
   await assert.rejects(
     runRawError({ message: 'transport exhausted', retryable: true, transportAttemptsExhausted: true }),
-    (error) => !(error instanceof kernel.ProviderTransientError)
+    (error) => error instanceof kernel.ProviderTransientError && error.retryAfterOutput === true
   );
   await assert.rejects(
     runRawError({ message: 'context length exceeded', status: 400, retryable: false }),
     (error) => !(error instanceof kernel.ProviderTransientError)
   );
+});
+
+test('真实 SDK 的可恢复失败进入 durable Attempt，修复格式不执行部分工具', async (context) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  const cases = [
+    { name: 'nonstream-body-disconnect', stream: false, kind: 'socket', expectedCalls: 2 },
+    { name: 'nonstream-body-timeout', stream: false, kind: 'body_timeout', expectedCalls: 2 },
+    { name: 'nonstream-malformed-call', stream: false, kind: 'malformed_call', expectedCalls: 2 },
+    { name: 'nonstream-output-limit', stream: false, kind: 'output_limit', expectedCalls: 1 },
+    { name: 'nonstream-server-error-body', stream: false, kind: 'server_error', expectedCalls: 2 },
+    { name: 'nonstream-unknown-error-body', stream: false, kind: 'unknown', expectedCalls: 2 },
+    { name: 'sse-429-partial', stream: true, kind: 'rate_limit', expectedCalls: 2 },
+    { name: 'sse-503-partial', stream: true, kind: 'server_error', expectedCalls: 2 },
+    { name: 'sse-malformed-call', stream: true, kind: 'malformed_call', expectedCalls: 2 },
+    { name: 'sse-parse-error', stream: true, kind: 'parse', expectedCalls: 2 }
+  ];
+  for (const scenario of cases) await context.test(scenario.name, async (t) => {
+    await withApp(`retry-regression-${scenario.name}`, async (app, conversationId, turnId) => {
+      let calls = 0;
+      const bodies = [];
+      const chunk = (delta, finish = null) => ({ id: 'c', object: 'chat.completion.chunk',
+        choices: [{ index: 0, delta, finish_reason: finish }] });
+      const sse = value => `data: ${JSON.stringify(value)}\n\n`;
+      const response = value => new Response(value, { headers: {
+        'content-type': scenario.stream ? 'text/event-stream' : 'application/json'
+      } });
+      t.mock.method(globalThis, 'fetch', async (_input, init) => {
+        calls += 1;
+        bodies.push(init.body);
+        if (calls > 1) return response(scenario.stream
+          ? sse(chunk({ role: 'assistant', content: 'recovered' }, 'stop')) + 'data: [DONE]\n\n'
+          : JSON.stringify({ id: 'c', object: 'chat.completion', choices: [{ index: 0,
+              message: { role: 'assistant', content: 'recovered' }, finish_reason: 'stop' }] }));
+        if (scenario.kind === 'socket' || scenario.kind === 'body_timeout') {
+          let reads = 0;
+          return new Response(new ReadableStream({ pull(controller) {
+            if (reads++ === 0) return controller.enqueue(new TextEncoder().encode('{"id":'));
+            controller.error(new TypeError('terminated', { cause: Object.assign(new Error('other side closed'), {
+              code: scenario.kind === 'socket' ? 'UND_ERR_SOCKET' : 'UND_ERR_BODY_TIMEOUT'
+            }) }));
+          } }), { headers: { 'content-type': 'application/json' } });
+        }
+        if (scenario.kind === 'malformed_call' || scenario.kind === 'output_limit') {
+          const call = { index: 0, id: 'incomplete-call', type: 'function',
+            function: { name: 'echo', arguments: '{"bad":' } };
+          const finish = scenario.kind === 'output_limit' ? 'length' : 'tool_calls';
+          return response(scenario.stream
+            ? sse(chunk({ role: 'assistant', tool_calls: [call] })) + sse(chunk({}, finish)) + 'data: [DONE]\n\n'
+            : JSON.stringify({ id: 'c', object: 'chat.completion', choices: [{ index: 0,
+                message: { role: 'assistant', content: null, tool_calls: [call] }, finish_reason: finish }] }));
+        }
+        if (scenario.kind === 'parse') return response('data: {oops}\n\ndata: [DONE]\n\n');
+        const error = { code: scenario.kind === 'rate_limit' ? 'rate_limit_exceeded'
+          : scenario.kind === 'unknown' ? 'unclassified_provider_failure' : 'server_error',
+          message: 'unclassified upstream problem' };
+        return response(scenario.stream
+          ? sse(chunk({ role: 'assistant', content: 'discardable partial' }))
+            + sse({ error, status_code: scenario.kind === 'rate_limit' ? 429 : 503 }) + 'data: [DONE]\n\n'
+          : JSON.stringify({ error }));
+      });
+      const capability = createLlmProviderCapability({ settings: {
+        id: 'provider-watchdog', name: 'offline retries', provider: 'openai-compatible',
+        model: 'model-watchdog', models: [], modelConfigs: [], apiKey: 'offline-placeholder',
+        baseUrl: 'https://provider.invalid/v1', stream: scenario.stream, retryOnError: false,
+        retryMaxAttempts: 0, toolCallFormat: 'function-call', createdAt: 1, updatedAt: 1
+      } });
+      try {
+        const created = await createRequest(app, conversationId, turnId, scenario.name);
+        const run = controlPlane(app).dispatch(created.modelRequestId,
+          new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability));
+        if (scenario.expectedCalls === 1) await assert.rejects(run, /finish_reason: length/);
+        else {
+          assert.equal((await run).terminalState, 'completed');
+          assert.deepEqual((await app.modelProvider.completedEvent(created.modelRequestId)).content, modelContent('recovered'));
+        }
+        assert.equal(calls, scenario.expectedCalls);
+        assert.ok(bodies.every(body => body === bodies[0]), 'same Attempt lineage retains frozen input bytes');
+        assert.equal((await list(app, 'ToolCall')).length, 0, 'partial/malformed calls never execute');
+      } finally { capability.dispose(); }
+    }, 'openai-compatible');
+  });
+});
+
+test('真实 settings resolver 的未知异常不被误认为模型故障重试', async (t) => {
+  const { createLlmProviderCapability } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/capabilities/llmProvider.js')
+  ).href);
+  await withApp('retry-local-setup-boundary', async (app, conversationId, turnId) => {
+    let resolves = 0;
+    t.mock.method(globalThis, 'fetch', async () => assert.fail('setup failure must not fetch'));
+    const capability = createLlmProviderCapability({ settings: async () => {
+      resolves += 1;
+      throw new Error('opaque settings resolver failure');
+    } });
+    try {
+      const created = await createRequest(app, conversationId, turnId, 'local-setup');
+      await assert.rejects(controlPlane(app).dispatch(created.modelRequestId,
+        new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability)), /settings resolver failure/);
+      assert.equal(resolves, 1);
+      assert.equal((await get(app, 'ModelRequest', created.modelRequestId)).terminal_state, 'provider_failed');
+    } finally { capability.dispose(); }
+  });
+});
+
+test('总期限和非用户 AbortError 都可替换部分输出，真正用户取消不重试', async (context) => {
+  for (const scenario of ['deadline', 'sdk_abort', 'user_abort']) await context.test(scenario, async () => {
+    await withApp(`retry-${scenario}`, async (app, conversationId, turnId) => {
+      let calls = 0;
+      const caller = new AbortController();
+      const created = await createRequest(app, conversationId, turnId, scenario);
+      const adapter = { providerId: 'provider-watchdog', async sendFullRequest(_request, controls) {
+        calls += 1;
+        if (calls > 1) return controls.onEvent({ kind: 'completed', streamSeq: '1', content: modelContent('recovered') });
+        await controls.onEvent({ kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: 'partial' } });
+        if (scenario === 'sdk_abort') throw Object.assign(new Error('socket hang up'), { name: 'AbortError' });
+        if (scenario === 'user_abort') caller.abort();
+        if (!controls.signal.aborted) await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
+      } };
+      const run = controlPlane(app).dispatch(created.modelRequestId, adapter, { timeoutMs: 80, signal: caller.signal });
+      if (scenario === 'user_abort') {
+        await assert.rejects(run, /cancelled/);
+        assert.equal(calls, 1);
+      } else {
+        assert.equal((await run).terminalState, 'completed');
+        assert.equal(calls, 2);
+        assert.equal(caller.signal.aborted, false);
+      }
+    });
+  });
+});
+
+test('生成修复上限跨普通失败不重置，失败部分输出只在最终 Attempt 保留', async () => {
+  await withApp('retry-repair-budget', async (app, conversationId, turnId) => {
+    let calls = 0;
+    const created = await createRequest(app, conversationId, turnId, 'repair-budget');
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {
+      calls += 1;
+      emit({ type: 'llm:delta', payload: { requestId: request.id, text: 'attempt ' + calls } });
+      emit({ type: 'llm:error', payload: { requestId: request.id, message: 'failed output',
+        rawError: calls === 1 ? { status: 503 } : { kind: 'decode_error', status: 200 } } });
+    }));
+    await assert.rejects(controlPlane(app).dispatch(created.modelRequestId, adapter), /重试上限 2 次/);
+    assert.equal(calls, 3);
+    const request = await get(app, 'ModelRequest', created.modelRequestId);
+    assert.equal(request.stream_stats_json.failure.code, 'PROVIDER_MODEL_OUTPUT_INVALID');
+    const checkpoints = await list(app, 'ModelStreamCheckpoint', { model_request_id: created.modelRequestId });
+    assert.equal(checkpoints.filter(checkpoint => checkpoint.checkpoint_kind === 'partial_summary').length, 1);
+    assert.equal((await list(app, 'ToolCall')).length, 0);
+  }, 'openai-compatible', { enabled: true, maxRetries: 8 });
+});
+
+test('Retry-After 持久 not-before 不被普通退避缩短，Host 接手仍等待且可取消', async () => {
+  await withApp('retry-server-not-before', async (app, conversationId, turnId) => {
+    let calls = 0;
+    const created = await createRequest(app, conversationId, turnId, 'server-not-before');
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {
+      calls += 1;
+      emit({ type: 'llm:error', payload: { requestId: request.id, message: 'rate limited',
+        rawError: { status: 429, headers: { 'retry-after': '60' } } } });
+    }));
+    const first = controlPlane(app);
+    const running = first.dispatch(created.modelRequestId, adapter);
+    const retrying = await waitForRequestStatus(app, created.modelRequestId, 'retrying');
+    assert.equal(retrying.stream_stats_json.retryDelayMs, 60_000);
+    const deadline = retrying.stream_stats_json.retryNotBeforeAt;
+    assert.ok(deadline >= Date.now() + 59_000);
+    await first.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('retry handoff'));
+    await assert.rejects(running, /handoff/);
+    const caller = new AbortController();
+    const second = controlPlane(app);
+    const resumed = second.dispatch(created.modelRequestId, adapter, { reconnect: true, signal: caller.signal });
+    await sleep(20);
+    assert.equal(calls, 1, 'new Host must not send before durable provider deadline');
+    assert.equal((await get(app, 'ModelRequest', created.modelRequestId)).stream_stats_json.retryNotBeforeAt, deadline);
+    caller.abort();
+    await assert.rejects(resumed, /cancelled/);
+  });
+});
+
+test('已进入格式修复后普通错误不扩大预算，成功清除修复标记且持久投影显示两次上限', async () => {
+  const { projectModelRequestSummary } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/reliableKernel/clientModelRequestSummary.js')
+  ).href);
+  for (const recover of [false, true]) await withApp(`retry-sticky-repair-${recover}`, async (app, conversationId, turnId) => {
+    let calls = 0;
+    const created = await createRequest(app, conversationId, turnId, `sticky-repair-${recover}`);
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {
+      calls += 1;
+      if (recover && calls === 3) return emit({ type: 'llm:done', payload: { requestId: request.id, content: modelContent('recovered') } });
+      emit({ type: 'llm:delta', payload: { requestId: request.id, text: 'attempt ' + calls } });
+      emit({ type: 'llm:error', payload: { requestId: request.id, message: 'upstream problem',
+        rawError: calls === 1 ? { kind: 'decode_error', status: 200 } : { status: 503 } } });
+    }));
+    const events = [];
+    const dispatch = controlPlane(app).dispatch(created.modelRequestId, adapter, { onTransientTerminal: event => events.push(event) });
+    if (recover) assert.equal((await dispatch).terminalState, 'completed');
+    else await assert.rejects(dispatch, /重试上限 2 次/);
+    assert.equal(calls, 3);
+    const request = await get(app, 'ModelRequest', created.modelRequestId);
+    assert.equal(request.stream_stats_json.retryMaxAttempts, 8, 'frozen database allowance never changes');
+    if (recover) assert.equal(request.stream_stats_json.failure, undefined);
+    else assert.equal((await list(app, 'ModelStreamCheckpoint', { model_request_id: created.modelRequestId }))
+      .filter(row => row.checkpoint_kind === 'partial_summary').length, 1);
+    assert.ok(events.filter(event => event.event.content.retrying).every(event => event.event.content.retryMaxAttempts === 2));
+  }, 'openai-compatible', { enabled: true, maxRetries: 8 });
+  const stats = { attemptSeq: '2', socketGeneration: '0', retryMaxAttempts: 8,
+    failure: { category: 'transient', code: 'PROVIDER_MODEL_OUTPUT_INVALID', message: 'bad JSON' } };
+  assert.equal(projectModelRequestSummary({ stream_stats_json: JSON.stringify(stats) }).stream_stats_json.retryMaxAttempts, 2);
+});
+
+test('native 继承一次失败后格式修复只剩一次重试，重连投影从持久事实显示准确上限', async () => {
+  const { projectModelRequestSummary } = await import(pathToFileURL(
+    path.join(compiledRoot, 'backend/reliableKernel/clientModelRequestSummary.js')
+  ).href);
+  const { readProviderRequestFailure } = await import(pathToFileURL(
+    path.join(compiledRoot, 'shared/compressionExecution.js')
+  ).href);
+  await withApp('retry-native-effective-limit', async (app, conversationId, turnId) => {
+    const head = (await list(app, 'ConversationContextHeadLink', { conversation_id: conversationId }))[0];
+    const authority = (await list(app, 'AuthoritySnapshot', { turn_id: turnId }))[0];
+    const created = await app.modelProvider.createModelRequest({ turnId, contextRootId: head.root_id,
+      authoritySnapshotId: authority.id, recipe: { kind: 'reliable-agent-turn', round: '3', tools: [],
+        nativeErrorRecovery: { failures: 1, modelOutputRepair: false } }, idempotencyKey: 'native-limit' });
+    let calls = 0;
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {
+      calls += 1;
+      emit({ type: 'llm:error', payload: { requestId: request.id, message: 'bad model JSON', rawError: { kind: 'decode_error' } } });
+    }));
+    await assert.rejects(controlPlane(app).dispatch(created.modelRequestId, adapter), /重试上限 2 次/);
+    assert.equal(calls, 2, 'one inherited failure permits only one local repair retry');
+    const row = await get(app, 'ModelRequest', created.modelRequestId);
+    assert.equal(row.stream_stats_json.retryMaxAttempts, 7, 'overall remaining allowance is immutable');
+    assert.equal(row.stream_stats_json.failure.retryMaxAttempts, 1);
+    const projected = projectModelRequestSummary({ ...row, stream_stats_json: JSON.stringify(row.stream_stats_json) });
+    assert.equal(projected.stream_stats_json.retryMaxAttempts, 1);
+    assert.equal(readProviderRequestFailure(row.stream_stats_json.failure).retryMaxAttempts, 1);
+  }, 'openai-responses', { enabled: true, maxRetries: 8 });
+  for (const retryMaxAttempts of [-1, 11, 1.5, '2']) assert.throws(() => readProviderRequestFailure({
+    category: 'transient', message: 'fixture', retryMaxAttempts
+  }), /retry limit/);
 });

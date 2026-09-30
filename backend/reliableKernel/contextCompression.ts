@@ -58,7 +58,7 @@ export interface CreateCompressionCommand {
   /** Display-only facts frozen beside structured contents; Provider materialization ignores them. */
   summaryMetadata?: {
     trigger: 'auto' | 'manual';
-    triggerReason?: 'manual' | 'configured_threshold';
+    triggerReason?: 'manual' | 'configured_threshold' | 'provider_context_overflow';
     triggerTokens?: number;
     triggerTokenSource?: ReliableContextTokenEstimateSource;
     configuredThresholdTokens?: number;
@@ -1027,8 +1027,8 @@ function normalizeCompressionSummary(
 
 function requireCompressionTriggerReason(
   value: unknown
-): 'manual' | 'configured_threshold' {
-  if (value !== 'manual' && value !== 'configured_threshold') {
+): 'manual' | 'configured_threshold' | 'provider_context_overflow' {
+  if (value !== 'manual' && value !== 'configured_threshold' && value !== 'provider_context_overflow') {
     throw new TypeError('summaryMetadata.triggerReason is invalid.');
   }
   return value;

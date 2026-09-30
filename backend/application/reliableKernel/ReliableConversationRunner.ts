@@ -46,6 +46,7 @@ import {
   type CompressionRebuildPreview
 } from '../../reliableKernel/compressionRebuildPreview';
 import { applyRequestCompressionSettings } from '../../reliableKernel/requestCompressionSettings';
+import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, localExecutionRetryDelayMs, waitForLocalExecutionRetry } from '../../reliableKernel/localExecutionRecovery';
 
 const DEFAULT_LEASE_DURATION_MS = 30_000;
 const EXTERNAL_WAKE_POLL_MS = 500;
@@ -226,6 +227,9 @@ export class ReliableConversationRunner {
     await this.recoverStartup(undefined, conversationId);
   };
   private readonly terminationRecoveryFailures = new Map<string, number>();
+  /** Host-local exception budgets; durable active Turns/queued Intents remain restart authority. */
+  private readonly localDriveRecoveryFailures = new Map<string, number>();
+  private readonly localAdmissionRecoveryFailures = new Map<string, number>();
   private readonly interruptCancellationSignaled = new Set<string>();
   private externalWakeTimer: NodeJS.Timeout | undefined;
   private externalWakePollInFlight = false;
@@ -1445,6 +1449,8 @@ export class ReliableConversationRunner {
     this.deferredRecovery.clear();
     this.pendingLeaseHandBacks.clear();
     this.terminationRecoveryFailures.clear();
+    this.localDriveRecoveryFailures.clear();
+    this.localAdmissionRecoveryFailures.clear();
     this.interruptCancellationSignaled.clear();
     this.rebuildPreviews.clear();
   }
@@ -1477,6 +1483,9 @@ export class ReliableConversationRunner {
     const task = this.runOwnedDriveSlot(slot)
       .catch(async (error) => {
         slot.error = error;
+        // An exception consumed this scheduling edge. Retrying it below must obey backoff rather
+        // than finishDriveSlot immediately recreating the failed slot in a tight loop.
+        slot.completedGeneration = slot.requestedGeneration;
         let terminationPending = false;
         try {
           terminationPending = Boolean(await this.findPendingTermination(turnId));
@@ -1485,6 +1494,14 @@ export class ReliableConversationRunner {
         }
         if (terminationPending && !this.disposed) {
           this.deferFailedTerminationRecovery(slot, error);
+        } else if (!this.disposed && isRetryableLocalExecutionError(error)) {
+          const failures = (this.localDriveRecoveryFailures.get(turnId) ?? 0) + 1;
+          this.localDriveRecoveryFailures.set(turnId, failures);
+          if (failures <= LOCAL_EXECUTION_MAX_RETRIES) {
+            this.deferredRecovery.set(turnId, { conversationId, turnId,
+              nextAttemptAt: Date.now() + localExecutionRetryDelayMs(failures) });
+            this.ensureExternalWakePolling();
+          }
         }
         this.onError(error, { operation: 'drive', conversationId, turnId });
       })
@@ -1589,6 +1606,7 @@ export class ReliableConversationRunner {
           await renewal.stop();
         }
         slot.completedGeneration = generation;
+        this.localDriveRecoveryFailures.delete(slot.turnId);
         if (this.disposed) return;
         if (result.terminalStatus === 'waiting') {
           this.terminationRecoveryFailures.delete(slot.turnId);
@@ -1788,6 +1806,29 @@ export class ReliableConversationRunner {
   private async driveManualCompression(
     slot: Pick<DriveSlot, 'conversationId' | 'turnId'>,
     frozen: FrozenManualCompressionDrive
+  ): Promise<ReliableManualCompressionDriveResult> {
+    for (let retryNumber = 0; ; retryNumber += 1) {
+      try {
+        return await this.driveManualCompressionOnce(slot, frozen, retryNumber < LOCAL_EXECUTION_MAX_RETRIES);
+      } catch (error) {
+        if (!isRetryableLocalExecutionError(error)) throw error;
+        if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
+        await waitForLocalExecutionRetry(retryNumber + 1, async () => {
+          if (this.disposed) throw new ExecutionHandoffError('Runtime stopped during local compression recovery.');
+          try { return await this.hasPendingTermination(slot.turnId); }
+          catch (stopError) {
+            if (!isRetryableLocalExecutionError(stopError)) throw stopError;
+            return false;
+          }
+        });
+      }
+    }
+  }
+
+  private async driveManualCompressionOnce(
+    slot: Pick<DriveSlot, 'conversationId' | 'turnId'>,
+    frozen: FrozenManualCompressionDrive,
+    allowLocalRetry: boolean
   ): Promise<{
     terminalStatus: 'completed' | 'interrupted';
     compression?: CoordinateCompressionResult;
@@ -1828,6 +1869,7 @@ export class ReliableConversationRunner {
       return { terminalStatus: 'completed', compression };
     } catch (error) {
       if (isExecutionHandoffError(error)) throw error;
+      if (allowLocalRetry && isRetryableLocalExecutionError(error)) throw error;
       if (await this.hasPendingTermination(slot.turnId)) {
         await this.settleManualCompressionInterrupted(slot, 'manual_context_compression_interrupted');
         return { terminalStatus: 'interrupted' };
@@ -2518,7 +2560,12 @@ export class ReliableConversationRunner {
     };
     const task = this.runOwnedAdmissionSlot(slot)
       // After dispose the database closes under an admission still in flight; its error is expected.
-      .catch((error) => { if (!this.disposed) this.onError(error, { operation: 'admit-next', conversationId }); })
+      .catch((error) => {
+        slot.completedGeneration = slot.requestedGeneration;
+        if (this.disposed) return;
+        if (isRetryableLocalExecutionError(error)) this.deferFailedAdmission(conversationId);
+        this.onError(error, { operation: 'admit-next', conversationId });
+      })
       .finally(() => this.finishAdmissionSlot(slot));
     slot.task = task;
     this.admissions.set(conversationId, slot);
@@ -2634,7 +2681,21 @@ export class ReliableConversationRunner {
       if (this.disposed) return;
       const generation = slot.requestedGeneration;
       try {
+        // A previous admission may have committed before its acknowledgment failed. Recover its
+        // exact Turn first; otherwise the queue looks empty and its only drive wake would be lost.
+        if (this.localAdmissionRecoveryFailures.has(slot.conversationId)) {
+          const active = await listAllDomainRows(this.application.database, 'Turn', {
+            conversation_id: slot.conversationId, status: 'active'
+          });
+          if (active.length > 0) {
+            slot.completedGeneration = slot.requestedGeneration;
+            this.localAdmissionRecoveryFailures.delete(slot.conversationId);
+            for (const turn of active) this.scheduleDrive(slot.conversationId, requireId(turn.id, 'Turn.id'));
+            return;
+          }
+        }
         const next = await this.application.turns.admitNextQueued(this.lease(slot.conversationId));
+        this.localAdmissionRecoveryFailures.delete(slot.conversationId);
         slot.completedGeneration = generation;
         if (this.disposed) return;
         if (next?.turnId) {
@@ -2658,6 +2719,20 @@ export class ReliableConversationRunner {
     if (!this.disposed && slot.requestedGeneration > slot.completedGeneration) {
       this.scheduleAdmission(slot.conversationId);
     }
+  }
+
+  private deferFailedAdmission(conversationId: string): void {
+    const failures = (this.localAdmissionRecoveryFailures.get(conversationId) ?? 0) + 1;
+    this.localAdmissionRecoveryFailures.set(conversationId, failures);
+    if (failures > LOCAL_EXECUTION_MAX_RETRIES) return;
+    const entry = this.admissionRetries.get(conversationId) ?? { failures: 0 };
+    if (entry.timer) return;
+    entry.timer = setTimeout(() => {
+      entry.timer = undefined;
+      if (!this.disposed) this.scheduleAdmission(conversationId);
+    }, localExecutionRetryDelayMs(failures));
+    entry.timer.unref();
+    this.admissionRetries.set(conversationId, entry);
   }
 
   private lease(conversationId: string): {

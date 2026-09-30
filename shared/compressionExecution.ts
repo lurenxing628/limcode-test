@@ -12,6 +12,8 @@ export interface ProviderRequestFailureFact {
   reason?: string;
   status?: number;
   endpointKind?: string;
+  /** Effective remaining request retry limit; the ModelRequest's overall Attempt allowance stays frozen. */
+  retryMaxAttempts?: number;
 }
 export interface CompressionAttemptFailure {
   methodKind: ExecutedCompressionMethod;
@@ -49,12 +51,17 @@ export function safeProviderFailureMessage(value: unknown): string {
 
 export function readProviderRequestFailure(value: unknown): ProviderRequestFailureFact {
   const raw = object(value, 'request failure');
-  exactKeys(raw, ['category', 'message', 'code', 'reason', 'status', 'endpointKind']);
+  exactKeys(raw, ['category', 'message', 'code', 'reason', 'status', 'endpointKind', 'retryMaxAttempts']);
   if (!CATEGORIES.includes(raw.category as ProviderRequestFailureFact['category'])) throw new TypeError('Invalid request failure category.');
+  if (raw.retryMaxAttempts !== undefined && (!Number.isSafeInteger(raw.retryMaxAttempts)
+    || Number(raw.retryMaxAttempts) < 0 || Number(raw.retryMaxAttempts) > 10)) {
+    throw new TypeError('Invalid request failure retry limit.');
+  }
   return {
     category: raw.category as ProviderRequestFailureFact['category'], message: boundedText(raw.message, 'failure message', 768),
     ...optionalText(raw, 'code'), ...optionalText(raw, 'reason'), ...optionalText(raw, 'endpointKind'),
-    ...optionalStatus(raw.status)
+    ...optionalStatus(raw.status),
+    ...(raw.retryMaxAttempts === undefined ? {} : { retryMaxAttempts: Number(raw.retryMaxAttempts) })
   };
 }
 

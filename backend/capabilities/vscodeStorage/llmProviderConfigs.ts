@@ -23,6 +23,7 @@ import {
   canonicalLlmProviderKind,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  normalizeLlmRetryMaxAttempts,
   DEFAULT_LLM_RETRY_DELAY_SECONDS,
   MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
@@ -360,10 +361,7 @@ function finiteRetryDelaySeconds(value: unknown): number | undefined {
 }
 
 function finiteRetryMaxAttempts(value: unknown): number | undefined {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return undefined;
-  const attempts = Math.floor(number);
-  return attempts < -1 ? -1 : attempts;
+  return normalizeLlmRetryMaxAttempts(value);
 }
 
 function normalizeHeaders(input: unknown): LlmProviderHeadersRecord | undefined {

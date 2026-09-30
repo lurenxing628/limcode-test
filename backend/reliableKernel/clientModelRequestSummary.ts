@@ -44,6 +44,14 @@ export function projectModelRequestSummary(record: RecordData): RecordData {
       summary.stream_stats_json = null;
     } else {
       const projected = pick(stats, STREAM_FIELDS);
+      // The durable allowance stays frozen for Attempt invariants; a generated-output repair has
+      // a stricter effective cap. Reconstruct it from the persisted marker after reconnect too.
+      if (stats.failure && typeof stats.failure === 'object' && !Array.isArray(stats.failure)
+        && typeof projected.retryMaxAttempts === 'number') {
+        const limit = typeof stats.failure.retryMaxAttempts === 'number' ? stats.failure.retryMaxAttempts
+          : stats.failure.code === 'PROVIDER_MODEL_OUTPUT_INVALID' ? 2 : undefined;
+        if (limit !== undefined) projected.retryMaxAttempts = Math.min(projected.retryMaxAttempts, limit);
+      }
       if (stats.nativeResponseMetrics !== undefined) {
         projected.nativeResponseMetrics = parseNativeResponseMetrics(stats.nativeResponseMetrics) as unknown as PlainData;
       }

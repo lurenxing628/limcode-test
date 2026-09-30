@@ -72,18 +72,7 @@ export function createTerminalValidatedFetch(
     }
     const validatedStream = response.ok && isEventStream(response.headers.get('content-type'));
     const onResponsesTerminal = provider === 'openai-responses' ? options.onResponsesTerminal : undefined;
-    if (onResponsesTerminal && response.ok && !validatedStream && response.body && isJson(response.headers.get('content-type'))) {
-      // 非流式 Responses：先读完响应体取终态，再原样交给接入库解码。
-      const text = await response.text();
-      try {
-        const terminal = responsesTerminalEvidence(JSON.parse(text));
-        if (terminal) onResponsesTerminal(terminal);
-      } catch {
-        // 解析失败由接入库报告；这里只记录明确的终态。
-      }
-      response = new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
-    }
-    if (!response.body || (!validatedStream && !observation)) return response;
+    if (!response.body) return response;
 
     const reader = response.body.getReader();
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);
@@ -99,11 +88,11 @@ export function createTerminalValidatedFetch(
       async pull(controller) {
         if (closed) return;
         try {
-          const next = await (validatedStream ? readWithIdleDeadline(reader, bodyIdleTimeoutMs) : reader.read()).catch((error: unknown) => {
+          const next = await readWithIdleDeadline(reader, bodyIdleTimeoutMs).catch((error: unknown) => {
             // Only transport reads are eligible; parser failures and explicit cancellation are not.
-            if (validatedStream && !closed && !signal?.aborted && !tracker?.sawTerminal && isBodyConnectionFailure(error)) {
+            if (!closed && !signal?.aborted && !tracker?.sawTerminal && isBodyConnectionFailure(error)) {
               throw new LlmHttpStreamTerminationError(
-                `${provider} SSE response body read interrupted: ${error.message}`,
+                `${provider} ${validatedStream ? 'SSE ' : ''}response body read interrupted: ${error.message}`,
                 'LLM_STREAM_TRUNCATED', undefined, error
               );
             }
@@ -119,7 +108,7 @@ export function createTerminalValidatedFetch(
 
           closed = true;
           tracker?.finish();
-          if (validatedStream && expectedBytes !== undefined && receivedBytes !== expectedBytes) {
+          if (expectedBytes !== undefined && receivedBytes !== expectedBytes) {
             throw new LlmHttpStreamTerminationError(
               `HTTP stream ended after ${receivedBytes} of ${expectedBytes} declared bytes.`
             );
@@ -150,6 +139,18 @@ export function createTerminalValidatedFetch(
       statusText: response.statusText,
       headers: response.headers
     });
+    if (onResponsesTerminal && response.ok && !validatedStream && isJson(response.headers.get('content-type'))) {
+      // Observe only after the body has passed the same transport deadline/framing checks as SSE.
+      const text = await wrapped.text();
+      try {
+        const terminal = responsesTerminalEvidence(JSON.parse(text));
+        if (terminal) onResponsesTerminal(terminal);
+      } catch {
+        // Parsing failures belong to the provider decoder, not transport retry classification.
+      }
+      const complete = new Response(text, { status: response.status, statusText: response.statusText, headers: response.headers });
+      return observation ? observation.bind(complete) : complete;
+    }
     return observation ? observation.bind(wrapped) : wrapped;
   };
 }
@@ -299,7 +300,7 @@ function nonEmptyReason(value: unknown): boolean {
 }
 
 function isBodyConnectionFailure(error: unknown, depth = 0): error is Error {
-  if (depth > 6 || !(error instanceof Error) || error.name === 'AbortError' || error.name === 'SyntaxError') {
+  if (depth > 6 || !(error instanceof Error) || error.name === 'SyntaxError') {
     return false;
   }
   const { code, cause } = error as Error & { code?: unknown; cause?: unknown };

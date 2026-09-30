@@ -3,6 +3,8 @@ import { computed, ref } from 'vue';
 import {
   DEFAULT_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS,
+  normalizeLlmRetryMaxAttempts,
   MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
   defaultLlmPromptCacheModeForProvider,
@@ -195,10 +197,7 @@ function alignTokenCountToK(value: number): number {
 }
 
 function normalizeRetryMaxAttempts(value: unknown): number {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
-  const attempts = Math.floor(number);
-  return attempts < -1 ? -1 : attempts;
+  return normalizeLlmRetryMaxAttempts(value) ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS;
 }
 
 function normalizeRetryDelaySeconds(value: unknown): number {
@@ -615,18 +614,19 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
           <span class="stream-checkbox-enable">启用</span>
         </LcCheckbox>
       </div>
-      <span class="stream-checkbox-text">请求报错时自动重试。重试次数不包含原始请求；设置为 -1 表示无限重试。</span>
+      <span class="stream-checkbox-text">对可恢复的模型请求错误自动重试，默认 8 次，最多 10 次（不包含原始请求）；0 关闭自动重试。鉴权、额度或请求参数等需要处理的问题会停止并说明原因；不会盲目重放结果不明的外部工具操作。设置在后续回合生效。</span>
     </div>
 
     <label class="global-settings-field retry-attempts-field">
       <span>最大重试次数</span>
       <input
         class="token-number-input"
-        :value="config.retryMaxAttempts ?? DEFAULT_LLM_RETRY_MAX_ATTEMPTS"
+        :value="normalizeRetryMaxAttempts(config.retryMaxAttempts)"
         type="number"
-        min="-1"
+        min="0"
+        :max="MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS"
         step="1"
-        placeholder="4"
+        :placeholder="String(DEFAULT_LLM_RETRY_MAX_ATTEMPTS)"
         @change="updateRetryMaxAttempts"
       />
     </label>

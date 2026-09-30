@@ -244,7 +244,16 @@ test(`separate cooperating host processes serialize ${overlap} claims and allow 
     await Promise.all(children.map(child => child.exitCode === null ? once(child, 'exit') : undefined));
     assert.ok(children.every(child => child.exitCode === 0));
   } finally {
-    for (const child of children) { if (child.connected) child.send('release'); }
+    await Promise.all(children.map(child => new Promise((resolve, reject) => {
+      if (!child.connected || child.exitCode !== null) { resolve(); return; }
+      const settled = error => {
+        // A child may disconnect between the connected check and this cleanup-only send.
+        // Keep unexpected IPC errors visible and leave the lock/ordering assertions unchanged.
+        if (error && !['EPIPE', 'ERR_IPC_CHANNEL_CLOSED'].includes(error.code)) reject(error);
+        else resolve();
+      };
+      try { child.send('release', settled); } catch (error) { settled(error); }
+    })));
     await fs.rm(temporary, { recursive: true, force: true });
   }
 });

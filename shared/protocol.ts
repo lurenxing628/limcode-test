@@ -599,13 +599,21 @@ export type LlmCompressionThresholdUnit = 'percent' | 'tokens';
 
 export const DEFAULT_LLM_CONTEXT_WINDOW_TOKENS = 200_000;
 export const DEFAULT_LLM_RETRY_ON_ERROR = true;
-export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 4;
+export const DEFAULT_LLM_RETRY_MAX_ATTEMPTS = 8;
 /** 重试间隔秒数；0 表示沿用自动指数退避。 */
 export const DEFAULT_LLM_RETRY_DELAY_SECONDS = 0;
 /** 可配置重试间隔的上限秒数。 */
 export const MAX_LLM_RETRY_DELAY_SECONDS = 600;
 /** Reliable Runtime hard ceiling for automatic Provider retries (excluding the original attempt). */
 export const MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS = 10;
+/** Canonical settings/UI count; previously saved negative/unbounded values have the runtime ceiling. */
+export function normalizeLlmRetryMaxAttempts(value: unknown): number | undefined {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return undefined;
+  return number < 0 ? MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS
+    : Math.min(Math.floor(number), MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS);
+}
+
 export const DEFAULT_LLM_PROMPT_CACHE_ENABLED = true;
 export const DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT = 90;
 export const DEFAULT_LLM_COMPRESSION_MAX_DURATION_MINUTES = 20;
@@ -799,7 +807,7 @@ export interface LlmProviderModelConfigRecord {
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
-  /** 最大重试次数，不包含原始请求；4 表示最多 1 + 4 次请求，-1 表示无限重试。 */
+  /** 最大重试次数 0–10，不包含原始请求；0 关闭自动重试。 */
   retryMaxAttempts: number;
   /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
   retryDelaySeconds: number;
@@ -834,7 +842,7 @@ export interface LlmProviderConfigRecord {
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
-  /** 最大重试次数，不包含原始请求；4 表示最多 1 + 4 次请求，-1 表示无限重试。 */
+  /** 最大重试次数 0–10，不包含原始请求；0 关闭自动重试。 */
   retryMaxAttempts: number;
   /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
   retryDelaySeconds: number;

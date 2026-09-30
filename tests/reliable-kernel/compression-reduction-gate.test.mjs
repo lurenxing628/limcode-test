@@ -15,14 +15,14 @@ const capabilitiesModule = await import(pathToFileURL(path.join(compiledRoot, 's
 const PROVIDER_ID = 'provider-reduction-gate';
 const MODEL_ID = 'model-reduction-gate';
 
-function dependencies(thresholdTokens) {
+function dependencies(thresholdTokens, options = {}) {
   const capabilities = capabilitiesModule.resolveModelCapabilities({
     provider: 'openai-compatible', baseUrl: 'https://reduction.invalid/v1', modelId: MODEL_ID,
     providerConfigId: PROVIDER_ID, transport: 'http'
   });
-  const executionPlan = capabilitiesModule.resolveCompressionExecutionPlan({ kind: 'llm_summary', fallbacks: [] }, capabilities);
+  const executionPlan = capabilitiesModule.resolveCompressionExecutionPlan({ kind: 'llm_summary', fallbacks: options.fallbacks ?? [] }, capabilities);
   const summaryReasoning = capabilitiesModule.resolveSummaryReasoning({ mode: 'provider_default', capabilities });
-  const trigger = { mode: 'token_threshold', thresholdUnit: 'tokens', thresholdTokens };
+  const trigger = { mode: options.triggerMode ?? 'token_threshold', thresholdUnit: 'tokens', thresholdTokens };
   return {
     authorityCompiler: {
       async compile(request) {
@@ -43,7 +43,7 @@ function dependencies(thresholdTokens) {
                 tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
               },
               compression: {
-                enabled: true,
+                enabled: options.disabled !== true,
                 methodKind: 'llm_summary',
                 executionPlan,
                 thresholdTokens,
@@ -79,11 +79,11 @@ function dependencies(thresholdTokens) {
   };
 }
 
-async function withTurn(name, thresholdTokens, run) {
+async function withTurn(name, thresholdTokens, run, options = {}) {
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
-  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(thresholdTokens));
+  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(thresholdTokens, options));
   try {
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -154,7 +154,7 @@ function summaryCoordinator(app, summaryText, onDispatch) {
           onDispatch();
           await controls.onEvent({
             kind: 'completed', streamSeq: '1',
-            content: { type: 'compression_result', contents: [{ role: 'model', parts: [{ text: summaryText }] }] }
+            content: { type: 'compression_result', contents: Array.isArray(summaryText) ? summaryText : [{ role: 'model', parts: [{ text: summaryText }] }] }
           });
         }
       };
@@ -414,4 +414,160 @@ test('committed prefix compression keeps historical process references stable in
     assert.match(stored.segments[0].content.toString(), /P1 and O1/);
     assert.equal(stored.segments.length, 2, 'the first canonical process source really left the active window');
   });
+});
+
+async function rejectOrdinaryContextRequest(app, seeded, code = 'CONTEXT_WINDOW_EXCEEDED') {
+  const headRootId = await app.context.currentHeadRootId(seeded.conversationId);
+  const settingsSnapshotContentObjectId = await app.modelProvider.freezeRequestSettings(seeded.turnId, seeded.authoritySnapshotId);
+  const recipe = await app.agentLoop.freezeOrdinaryRequestRecipe({ turnId: seeded.turnId,
+    authoritySnapshotId: seeded.authoritySnapshotId, headRootId, round: '1', tools: [], includeOpenTaskCompletionCheck: false });
+  const created = await app.modelProvider.createModelRequest({ turnId: seeded.turnId,
+    authoritySnapshotId: seeded.authoritySnapshotId, settingsSnapshotContentObjectId, contextRootId: headRootId,
+    recipe, idempotencyKey: 'context-overflow-source' });
+  await assert.rejects(app.modelProvider.dispatch(created.modelRequestId, { providerId: PROVIDER_ID,
+    async sendFullRequest() { throw Object.assign(new Error('The input exceeds the model context window'), { code }); }
+  }), /context window/);
+  return { failedModelRequestId: created.modelRequestId, headRootId };
+}
+
+test('real provider overflow forces below-threshold compression, proves reduction and replays the committed repair after a crash', async () => {
+  await withTurn('provider-overflow-reduction', 100_000, async (app, seeded) => {
+    await appendMessage(app, seeded, 'overflow-history', 'assistant', 'important history '.repeat(600));
+    await appendMessage(app, seeded, 'overflow-tail', 'user', 'keep this latest question');
+    const rejected = await rejectOrdinaryContextRequest(app, seeded);
+    const before = await app.compression.evaluate(rejected.headRootId, seeded.authoritySnapshotId);
+    assert.equal(before.shouldCompress, false);
+    let sends = 0;
+    const coordinator = summaryCoordinator(app, 'Short faithful history summary', () => sends++);
+    const command = { turnId: seeded.turnId, failedModelRequestId: rejected.failedModelRequestId };
+    const compressed = await coordinator.recoverProviderContextOverflow(command);
+    assert.equal(compressed.status, 'compressed', JSON.stringify(compressed));
+    assert.equal(compressed.triggerReason, 'provider_context_overflow');
+    assert.equal(compressed.providerContextOverflowRequestId, rejected.failedModelRequestId);
+    assert.notEqual(compressed.result.rootId, rejected.headRootId);
+    const metadata = await compressionMetadata(app, seeded.conversationId);
+    assert.ok(metadata.estimatedTokensAfter < metadata.contextTokensBefore);
+    assert.equal(metadata.triggerReason, 'provider_context_overflow');
+    // A new coordinator sees a moved head and must find the exact prior request/block proof.
+    const replay = await summaryCoordinator(app, 'Short faithful history summary', () => sends++)
+      .recoverProviderContextOverflow(command);
+    assert.equal(replay.result.rootId, compressed.result.rootId);
+    assert.equal(replay.modelRequestId, compressed.modelRequestId);
+    assert.equal(sends, 1);
+    const requests = await list(app, 'ModelRequest', { turn_id: seeded.turnId });
+    assert.equal(requests.length, 2, 'one rejected ordinary request and one immutable recovery compression');
+    const repaired = await app.modelProvider.replay(compressed.modelRequestId);
+    assert.equal(repaired.recipe.providerContextOverflowRequestId, rejected.failedModelRequestId);
+    const original = requests.find(row => row.id === rejected.failedModelRequestId);
+    assert.equal(original.terminal_state, 'provider_failed', 'repair never rewrites the rejected request');
+  });
+});
+
+test('provider overflow never resends a non-reducing result or bypasses manual-only compression', async () => {
+  for (const triggerMode of ['token_threshold', 'manual', 'disabled']) {
+    await withTurn(`provider-overflow-no-progress-${triggerMode}`, 100_000, async (app, seeded) => {
+      await appendMessage(app, seeded, `no-progress-source-${triggerMode}`, 'assistant', 'small source');
+      await appendMessage(app, seeded, `no-progress-tail-${triggerMode}`, 'user', 'latest question');
+      const rejected = await rejectOrdinaryContextRequest(app, seeded);
+      let sends = 0;
+      const coordinator = summaryCoordinator(app, 'not smaller '.repeat(1000), () => sends++);
+      const command = { turnId: seeded.turnId, failedModelRequestId: rejected.failedModelRequestId };
+      const first = await coordinator.recoverProviderContextOverflow(command);
+      assert.equal(first.status, 'skipped');
+      assert.equal(first.reason, triggerMode === 'disabled' ? 'disabled' : triggerMode === 'manual' ? 'manual_only' : 'non_reducing');
+      const replay = await coordinator.recoverProviderContextOverflow(command);
+      assert.equal(replay.reason, first.reason);
+      assert.equal(sends, triggerMode === 'token_threshold' ? 1 : 0);
+      assert.equal(await app.context.currentHeadRootId(seeded.conversationId), rejected.headRootId);
+      assert.equal((await list(app, 'CompressionBlock')).length, 0);
+    }, { triggerMode: triggerMode === 'disabled' ? 'token_threshold' : triggerMode, disabled: triggerMode === 'disabled' });
+  }
+});
+
+test('a real provider overflow cannot use the continue-uncompressed-if-fits estimator fallback', async () => {
+  await withTurn('provider-overflow-no-unchanged-fallback', 100_000, async (app, seeded) => {
+    await appendMessage(app, seeded, 'no-unchanged-source', 'assistant', 'history '.repeat(700));
+    await appendMessage(app, seeded, 'no-unchanged-tail', 'user', 'latest question');
+    const rejected = await rejectOrdinaryContextRequest(app, seeded);
+    let sends = 0;
+    const coordinator = new kernel.ReliableContextCompressionCoordinator(app.database, app.contentStore, app.modelProvider, {
+      resolve(providerId) { return { providerId, async sendFullRequest() {
+        sends++;
+        throw new kernel.ProviderCapabilityError('unsupported_parameter', 'Summary unavailable', 400, 'llm_summary');
+      } }; }
+    });
+    const command = { turnId: seeded.turnId, failedModelRequestId: rejected.failedModelRequestId };
+    await assert.rejects(coordinator.recoverProviderContextOverflow(command), /后备链已耗尽/);
+    await assert.rejects(coordinator.recoverProviderContextOverflow(command), /后备链已耗尽/);
+    assert.equal(sends, 1);
+    assert.equal(await app.context.currentHeadRootId(seeded.conversationId), rejected.headRootId);
+  }, { fallbacks: ['continue_uncompressed_if_fits'] });
+});
+
+test('provider overflow repair refuses unrelated failures and unrelated changed heads', async () => {
+  await withTurn('provider-overflow-invalid-proof', 100_000, async (app, seeded) => {
+    const rejected = await rejectOrdinaryContextRequest(app, seeded, 'AUTHENTICATION_ERROR');
+    const coordinator = summaryCoordinator(app, 'unused', () => assert.fail('must not dispatch'));
+    await assert.rejects(coordinator.recoverProviderContextOverflow({ turnId: seeded.turnId,
+      failedModelRequestId: rejected.failedModelRequestId }), /exact persisted context-window rejection/);
+  });
+  await withTurn('provider-overflow-changed-head', 100_000, async (app, seeded) => {
+    const rejected = await rejectOrdinaryContextRequest(app, seeded);
+    const coordinator = summaryCoordinator(app, 'unused', () => assert.fail('must not dispatch'));
+    for (const changed of [{ headRootId: 'unrelated-root' }, { authoritySnapshotId: 'unrelated-authority' },
+      { settingsSnapshotContentObjectId: 'unrelated-settings' }]) {
+      await assert.rejects(coordinator.coordinate({ turnId: seeded.turnId, authoritySnapshotId: seeded.authoritySnapshotId,
+        headRootId: rejected.headRootId, trigger: 'auto', providerContextOverflowRequestId: rejected.failedModelRequestId,
+        ...changed }), /differs from the rejected immutable request/);
+    }
+    await appendMessage(app, seeded, 'unrelated-head', 'assistant', 'unrelated append');
+    await assert.rejects(coordinator.recoverProviderContextOverflow({ turnId: seeded.turnId,
+      failedModelRequestId: rejected.failedModelRequestId }), /without a committed repair/);
+  });
+});
+
+test('provider overflow cannot claim reduction from an opaque compaction result without a measured size', async () => {
+  await withTurn('provider-overflow-unsized-result', 100_000, async (app, seeded) => {
+    await appendMessage(app, seeded, 'opaque-result-source', 'assistant', 'history '.repeat(700));
+    await appendMessage(app, seeded, 'opaque-result-tail', 'user', 'latest question');
+    const rejected = await rejectOrdinaryContextRequest(app, seeded);
+    const coordinator = summaryCoordinator(app, [{ role: 'model', parts: [{ providerContext: {
+      format: 'openai-responses', itemType: 'compaction',
+      rawItem: { type: 'compaction', id: 'cmp_unmeasured', encrypted_content: 'opaque-unknown-size' }
+    } }] }], () => {});
+    const result = await coordinator.recoverProviderContextOverflow({ turnId: seeded.turnId,
+      failedModelRequestId: rejected.failedModelRequestId });
+    assert.equal(result.status, 'skipped');
+    assert.equal(result.reason, 'non_reducing');
+    assert.equal(await app.context.currentHeadRootId(seeded.conversationId), rejected.headRootId);
+  });
+});
+
+test('restored transient connection interruption still advances the configured compression fallback', async () => {
+  await withTurn('compression-restored-transient', 1, async (app, seeded) => {
+    await appendMessage(app, seeded, 'transient-source', 'assistant', 'history '.repeat(1000));
+    await appendMessage(app, seeded, 'transient-tail', 'user', 'latest');
+    const headRootId = await app.context.currentHeadRootId(seeded.conversationId);
+    const level = await app.compression.evaluate(headRootId, seeded.authoritySnapshotId);
+    const sent = [];
+    const coordinator = new kernel.ReliableContextCompressionCoordinator(app.database, app.contentStore, app.modelProvider, {
+      resolve(providerId) { return { providerId, async sendFullRequest(request, controls) {
+        sent.push(request.recipe.compressionMethodKind);
+        if (request.recipe.compressionMethodKind === 'llm_summary') {
+          throw new kernel.ProviderTransientError('connection_interrupted', 'Connection interrupted before response', false, { maxRetries: 0 });
+        }
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { type: 'compression_result',
+          contents: [{ role: 'model', parts: [{ text: 'Fallback summary' }] }] } });
+      } }; }
+    });
+    const command = { turnId: seeded.turnId, authoritySnapshotId: seeded.authoritySnapshotId, headRootId,
+      trigger: 'auto', requestBudget: requestBudget(1, 0, level.estimatedTokens) };
+    const first = await coordinator.coordinate(command);
+    assert.equal(first.status, 'compressed');
+    assert.deepEqual(sent, ['llm_summary', 'deterministic_summary']);
+    const replay = await coordinator.coordinate(command);
+    assert.equal(replay.status, 'compressed');
+    assert.equal(replay.result.rootId, first.result.rootId);
+    assert.deepEqual(sent, ['llm_summary', 'deterministic_summary'], 'restored interrupted metadata must not block the fallback or resend');
+  }, { fallbacks: ['deterministic_summary'] });
 });

@@ -53,7 +53,12 @@
   "planReviewGate": {
     "authority": "内建工具与 MCP 工具都只读取当前 Turn 冻结的 PlanReviewPolicy；submit_plan 本身是唯一门禁旁路。",
     "approvalFact": "只有 call_seq 更早、ToolOutcome.status=succeeded 且 no_effect_result.detail.status=approved 的 submit_plan 才构成批准；change_requested 不构成批准。",
-    "coverage": ["read", "write", "command", "agent"]
+    "coverage": [
+      "read",
+      "write",
+      "command",
+      "agent"
+    ]
   },
   "resultCardinality": {
     "toolExecutionPerCall": "exactly-one",
@@ -218,19 +223,21 @@
       "provider-transient"
     ],
     "providerRetryAuthority": "frozen-turn-authority+sqlite-model-request-attempt",
-    "providerDefaultMaxRetries": 3,
+    "providerDefaultMaxRetries": 8,
     "providerMaxRetries": 10,
     "configuredPerFrozenAuthority": true,
     "backoffMilliseconds": [
+      500,
       1000,
       2000,
       4000,
       8000,
-      10000
+      16000,
+      30000
     ],
     "semanticDeadlinesMilliseconds": {
-      "ordinaryFirst": 80000,
-      "ordinaryIdle": 60000,
+      "ordinaryFirst": 300000,
+      "ordinaryIdle": 600000,
       "compressionCompletion": 270000
     },
     "compressionProgressContract": "compact()只以CompactDone/CompactError提交终态；真实非空白文本或思考通过metadata-only进度重置270秒无进度deadline，心跳、usage与signature-only不续命；未完成摘要不落盘，进度不阻断有界重试，总dispatch期限与取消仍有效",
@@ -242,7 +249,10 @@
     "fileMutationAutomaticRetry": false,
     "commandExecutionAutomaticRetry": false,
     "subagentStartAutomaticRetry": false,
-    "rule": "只有语义流停滞、连接中断、限流和明确临时服务错误按冻结配置创建有界SQLite Attempt并退避；永久Provider错误和其他操作不自动重试。"
+    "rule": "供应商请求中的网络、限流、临时服务与未识别故障按冻结预算积极重试；模型生成或协议解析失败采用单独的小额修复预算。明确永久配置错误与用户取消不重发；本地持久化恢复复用原事实和幂等身份，不把文件、命令、子任务或结果不明的外部操作当作未执行而重放。",
+    "retryAfterPolicy": "recognized-provider-hints-are-a-minimum-not-before-deadline; hints-beyond-supported-horizon-stop-with-an-explicit-reason-never-retry-early",
+    "failureClassification": "typed-provider-boundary-normalization-with-bounded-error-envelope-and-cause-evidence; retry-unknown-provider-failures-within-frozen-budget; local-setup-permanent-configuration-cancellation-and-invariant-errors-are-not-provider-transients",
+    "partialOutputRecovery": "replace-uncommitted-provider-output-only-when-replay-safe; committed-native-effects-rebase-from-context-without-resetting-logical-error-recovery-budget"
   },
   "parallelExecution": {
     "supported": true,

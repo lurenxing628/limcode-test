@@ -19,8 +19,10 @@ import {
 import {
   hasVisibleStreamingTransientForRequestAttempt,
   hasVisibleStreamingTransientForTurn,
+  createReliableRetryClock,
   reliableRetryStreamingActivityLabel
 } from '@webview/domain/reliableTransientActivity';
+import { modelRequestRetryForTurn, projectReliableTurnTermination } from '@webview/domain/reliableConversationProjection';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
 import { collaborationCardPlacementLabel, projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
 import MessageItem from './MessageItem.vue';
@@ -168,6 +170,24 @@ const visibleMessageRows = computed(() => visibleTimelineRows.value.flatMap((row
 ));
 const hasCollaborationCards = computed(() => timelineRows.value.some((row) => row.kind === 'collaboration'));
 
+// Merge historical facts per domain; a current committed row always wins over its cached copy.
+const retryRecords = computed(() => {
+  const history = feed.historyConversationId === conversationId.value ? feed.historyRecords : {};
+  const records = { ...history, ...feed.records };
+  for (const domain of ['Turn', 'ModelRequest', 'ModelContextProjection', 'ConversationContextStatus', 'TurnTermination']) {
+    records[domain] = { ...(history[domain] ?? {}), ...(feed.records[domain] ?? {}) };
+  }
+  return records;
+});
+function terminationRetry(turnId: string): ReturnType<typeof modelRequestRetryForTurn> {
+  return modelRequestRetryForTurn(retryRecords.value, conversationId.value, turnId);
+}
+function retryTerminatedRequest(termination: RunTerminationRecord, requestId: string): void {
+  if (conversationActionPending.value) return;
+  const retry = terminationRetry(termination.runId);
+  if (!retry.target || retry.target.modelRequestId !== requestId) return;
+  retryMessageFrom(conversationId.value, retry.target, currentAuthoritySelection());
+}
 const compressionNotices = computed(() => projectCompressionNotices({
   conversationId: conversationId.value, records: feed.records, messages: messages.value,
   turnIdByMessageId: projection.value.turnIdByMessageId,
@@ -181,6 +201,11 @@ const unanchoredCompressionWarnings = computed(() => compressionNotices.value.un
   !timelinePresentation.isSuppressed(conversationId.value, 'compression-warning', notice.id)));
 const unanchoredTurnFailures = computed(() => compressionNotices.value.unanchoredFailures.filter((notice) =>
   !timelinePresentation.isSuppressed(conversationId.value, 'turn-termination', notice.id)));
+const unanchoredTerminationRows = computed(() => unanchoredTurnFailures.value.flatMap((failure) => {
+  const raw = retryRecords.value.TurnTermination?.[failure.id];
+  const termination = raw ? projectReliableTurnTermination(raw, retryRecords.value) : undefined;
+  return termination ? [{ termination: { ...termination, detail: failure.detail }, title: failure.title }] : [];
+}));
 
 watch(
   () => props.followLatest,
@@ -268,6 +293,17 @@ const activeTurnRequests = computed(() => {
     .sort((left, right) => reliableInteger(right.request_seq) - reliableInteger(left.request_seq));
 });
 const latestActiveTurnRequest = computed(() => activeTurnRequests.value[0]);
+const retryNow = ref(Date.now());
+const retryClock = createReliableRetryClock((now) => { retryNow.value = now; });
+watch(() => {
+  const request = latestActiveTurnRequest.value;
+  return request?.status === 'retrying' && !hasLaterSegment.value
+    ? reliableInteger(modelRequestStreamStats(request)?.retryNotBeforeAt) : 0;
+}, (deadline) => {
+  if (deadline > 0) retryClock.start(deadline);
+  else retryClock.stop();
+}, { immediate: true });
+onBeforeUnmount(() => retryClock.stop());
 const latestRequestHasVisibleModelRow = computed(() => {
   const requestId = reliableText(latestActiveTurnRequest.value?.id);
   if (!requestId) return false;
@@ -300,7 +336,7 @@ const activeCompressionCard = computed<Record<string, unknown> | undefined>(() =
   const requestStatus = reliableText(request.status);
   const terminalState = reliableText(request.terminal_state);
   if (requestStatus === 'terminal' && terminalState !== 'completed') return undefined;
-  const retry = modelRequestRetryState(request);
+  const retry = modelRequestRetryState(request, retryNow.value);
   const status = requestStatus === 'retrying'
     ? 'retrying'
     : requestStatus === 'streaming'
@@ -393,12 +429,14 @@ const activityLabel = computed(() => {
   const latest = latestActiveTurnRequest.value;
   if (!latest) return '正在准备上下文';
   if (activeCompressionCard.value) return undefined;
-  const retry = modelRequestRetryState(latest);
+  const retry = modelRequestRetryState(latest, retryNow.value);
   // Keep the durable retry identity while the exact Attempt is waiting for output. Once its
   // transient renders model-owned content, the content itself replaces this activity row.
   if (latest.status === 'retrying') {
     const delaySeconds = Math.max(0, Math.ceil(retry.remainingDelayMs / 1_000));
-    return `${retry.reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`;
+    return delaySeconds > 0
+      ? `${retry.reasonLabel}，${delaySeconds} 秒后自动恢复（第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次）`
+      : `${retry.reasonLabel}，正在启动第 ${retry.retryAttempt}/${retry.retryMaxAttempts} 次自动恢复`;
   }
   if (latest.status === 'streaming' && retry.retryAttempt > 0) {
     const modelRequestId = reliableText(latest.id);
@@ -651,11 +689,11 @@ function timelineFloor(message: MessageRecord): number {
   return absoluteTimelineFloor(projected, Math.max(1, messages.value.findIndex((row) => row.id === message.id) + 1));
 }
 
-function modelRequestRetryState(request: Record<string, unknown>): {
+function modelRequestRetryState(request: Record<string, unknown>, now: number): {
   retryAttempt: number;
   retryMaxAttempts: number;
   remainingDelayMs: number;
-  reasonLabel: 'LLM 输出停滞' | 'LLM 连接异常' | '上下文压缩超时';
+  reasonLabel: string;
 } {
   const stats = modelRequestStreamStats(request);
   const attemptSeq = Math.max(1, reliableInteger(stats?.attemptSeq));
@@ -665,12 +703,16 @@ function modelRequestRetryState(request: Record<string, unknown>): {
   return {
     retryAttempt: Math.max(0, attemptSeq - 1),
     retryMaxAttempts: Math.max(attemptSeq - 1, reliableInteger(stats?.retryMaxAttempts)),
-    remainingDelayMs: retryNotBeforeAt > 0 ? Math.max(0, retryNotBeforeAt - Date.now()) : retryDelayMs,
+    remainingDelayMs: retryNotBeforeAt > 0 ? Math.max(0, retryNotBeforeAt - now) : retryDelayMs,
     reasonLabel: retryReason === 'compression_timeout'
       ? '上下文压缩超时'
       : retryReason === 'stream_stalled' || retryReason === 'first_semantic_timeout'
         ? 'LLM 输出停滞'
-        : 'LLM 连接异常'
+        : retryReason === 'rate_limited'
+          ? 'LLM 服务限流'
+          : retryReason === 'temporary_service_error'
+            ? 'LLM 服务暂时不可用'
+            : 'LLM 连接异常'
   };
 }
 
@@ -768,6 +810,10 @@ function messageRenderKey(message: MessageRecord): string {
           v-for="termination in terminationRowsByAnchor[row.message.id] ?? []"
           :key="termination.id"
           :termination="termination"
+          :retry-model-request-id="terminationRetry(termination.runId).target?.modelRequestId"
+          :retry-blocked-reason="terminationRetry(termination.runId).blockedReason"
+          :retry-pending="conversationActionPending"
+          @retry="retryTerminatedRequest(termination, $event)"
           @dismiss="dismissTermination(termination)"
         />
         <ReliableCompressionWarningRow
@@ -809,9 +855,13 @@ function messageRenderKey(message: MessageRecord): string {
       <ReliableCompressionWarningRow v-for="warning in unanchoredCompressionWarnings"
         :key="warning.id" :title="warning.title" :detail="warning.detail"
         @dismiss="dismissCompressionWarning(warning)" />
-      <ReliableCompressionWarningRow v-for="failure in unanchoredTurnFailures"
-        :key="failure.id" :title="failure.title" :detail="failure.detail" severity="error"
-        @dismiss="timelinePresentation.suppress(conversationId, 'turn-termination', failure.id)" />
+      <ReliableTurnTerminationRow v-for="{ termination, title } in unanchoredTerminationRows"
+        :key="termination.id" :termination="termination" :title="title"
+        :retry-model-request-id="terminationRetry(termination.runId).target?.modelRequestId"
+        :retry-blocked-reason="terminationRetry(termination.runId).blockedReason"
+        :retry-pending="conversationActionPending"
+        @retry="retryTerminatedRequest(termination, $event)"
+        @dismiss="dismissTermination(termination)" />
     </template>
     <ReliableCompressionCard
       v-if="activeCompressionCard && !hasLaterSegment"
@@ -833,7 +883,7 @@ function messageRenderKey(message: MessageRecord): string {
       <button type="button" @click="openForkReadyNotice">打开分支</button>
       <button type="button" aria-label="关闭分支提示" @click="dismissForkReadyNotice">关闭</button>
     </p>
-    <div v-if="messages.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard" class="reliable-message-empty-container">
+    <div v-if="messages.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard && unanchoredTerminationRows.length === 0 && unanchoredCompressionWarnings.length === 0" class="reliable-message-empty-container">
       <p class="reliable-message-empty">
         {{ feed.collaborationHistoryLoading ? '正在查找协作记录…'
           : feed.collaborationHistoryScanProgress ? '本页未找到协作记录，可继续查找更早记录。' : emptyHint }}

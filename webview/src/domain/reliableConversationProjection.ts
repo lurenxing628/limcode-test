@@ -4,6 +4,7 @@ import type {
   LlmUsageMetadataRecord,
   MessageContent,
   MessageRecord,
+  MessageRetryTarget,
   ModelOutputItemReference,
   ModelOutputPartMetadata,
   RunTerminationRecord,
@@ -1320,6 +1321,61 @@ function booleanInteger(value: unknown): boolean | undefined {
   return undefined;
 }
 
+/** A presentation of the same frozen-root conditions rechecked by TurnControlPlane on submission. */
+export function modelRequestRetryForTurn(
+  records: ReliableClientRecordBuckets,
+  conversationId: string,
+  turnId: string
+): { target?: Extract<MessageRetryTarget, { kind: 'model_request' }>; blockedReason?: string } {
+  const turns = values(records.Turn).filter((turn) => text(turn.conversation_id) === conversationId);
+  const turn = turns.find((candidate) => text(candidate.id) === turnId);
+  if (!turn || turn.status !== 'terminated') return { blockedReason: '本轮尚未结束，请等待状态同步' };
+  if (turns.some((candidate) => candidate.status === 'active')) {
+    return { blockedReason: '对话中还有任务正在执行，请先等待或停止它' };
+  }
+  const termination = values(records.TurnTermination).filter((item) => text(item.turn_id) === turnId);
+  if (termination.length !== 1 || termination[0].terminal_status !== 'failed') {
+    return { blockedReason: '本轮已停止；如需继续，请发送新消息' };
+  }
+  const requests = values(records.ModelRequest).filter((request) => text(request.turn_id) === turnId)
+    .sort(compareSequence('request_seq'));
+  const request = requests[requests.length - 1];
+  const requestId = text(request?.id);
+  if (!requestId) return { blockedReason: '本轮尚未创建模型请求，请重新发送消息' };
+  const terminalState = text(request?.terminal_state) ?? '';
+  if (request?.status !== 'terminal'
+    || (terminalState !== 'provider_failed' && !terminalState.startsWith('provider_transient_'))) {
+    return { blockedReason: '没有可重试的失败模型请求，请重新发送消息' };
+  }
+  const projections = values(records.ModelContextProjection).filter((projection) =>
+    projection.owner_kind === 'model_request' && projection.owner_id === requestId);
+  const heads = values(records.ConversationContextStatus).filter((head) => head.conversation_id === conversationId);
+  if (projections.length !== 1 || heads.length !== 1 || !text(projections[0].root_id) || !text(heads[0].root_id)) {
+    return { blockedReason: '正在等待模型请求与当前上下文同步' };
+  }
+  if (projections[0].root_id !== heads[0].root_id) {
+    return { blockedReason: '此请求之后的上下文已改变，请从当前上下文发送消息' };
+  }
+  return { target: { kind: 'model_request', modelRequestId: requestId } };
+}
+
+/** Preserve the exact durable terminal identity even when a retry Turn owns no user Message. */
+export function projectReliableTurnTermination(
+  raw: ReliableClientRecord,
+  records: ReliableClientRecordBuckets
+): RunTerminationRecord | undefined {
+  const terminalStatus = text(raw.terminal_status);
+  const id = text(raw.id);
+  const turnId = text(raw.turn_id);
+  if (!terminalStatus || terminalStatus === 'completed' || !id || !turnId) return undefined;
+  const reason = textPreserveWhitespace(raw.reason) ?? terminalStatus;
+  return {
+    id, runId: turnId, kind: terminationKind(terminalStatus), actor: terminationActor(terminalStatus, reason),
+    interruptedPhase: inferredInterruptedPhase(turnId, records),
+    reasonCode: terminationReasonCode(terminalStatus, reason), detail: reason, createdAt: timestamp(raw.created_at)
+  };
+}
+
 function projectTurnTerminations(
   records: ReliableClientRecordBuckets,
   messages: ParsedMessage[],
@@ -1344,17 +1400,8 @@ function projectTurnTerminations(
     const id = text(raw.id);
     const turnId = text(raw.turn_id);
     if (!id || !turnId || !conversationTurnIds.has(turnId)) continue;
-    const reason = textPreserveWhitespace(raw.reason) ?? terminalStatus;
-    const termination: RunTerminationRecord = {
-      id,
-      runId: turnId,
-      kind: terminationKind(terminalStatus),
-      actor: terminationActor(terminalStatus, reason),
-      interruptedPhase: inferredInterruptedPhase(turnId, records),
-      reasonCode: terminationReasonCode(terminalStatus, reason),
-      detail: reason,
-      createdAt: timestamp(raw.created_at)
-    };
+    const termination = projectReliableTurnTermination(raw, records);
+    if (!termination) continue;
     const orderedModelTargets = [...(modelMessagesByTurn.get(turnId) ?? [])].sort(compareParsedMessages);
     const orderedUserTargets = [...(userMessagesByTurn.get(turnId) ?? [])].sort(compareParsedMessages);
     const target = orderedModelTargets[orderedModelTargets.length - 1]

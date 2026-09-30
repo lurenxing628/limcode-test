@@ -32,11 +32,11 @@ import {
   readFileToolParameters
 } from '../world/modules/tools/definitions/readFile';
 import { classifyOpenAIResponsesPreTerminalWebSocketClose } from '../capabilities/openAIResponsesWebSocketRetryPolicy';
-import { frozenProviderRetryPolicy } from './frozenAuthority';
 import {
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   ProviderCapabilityError,
-  ProviderTransientError
+  ProviderTransientError,
+  retryPolicyForFullRequest
 } from './modelProviderControlPlane';
 import type {
   FullProviderContextItem,
@@ -911,7 +911,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
           }
         : {})
     },
-    reliableProviderAttempt: reliableProviderAttempt(request, authorityModel),
+    reliableProviderAttempt: reliableProviderAttempt(request),
     openAIResponsesContinuation: {
       volatileTailContentKinds,
       ...(nativeReasoning?.forceFullReason
@@ -1075,23 +1075,16 @@ function reinjectedCurrentTurnInput(current: MessageContent): MessageContent {
   };
 }
 
-function reliableProviderAttempt(
-  request: FullProviderRequest,
-  authorityModel: Record<string, unknown>
-): NonNullable<LlmStartRequest['reliableProviderAttempt']> {
+function reliableProviderAttempt(request: FullProviderRequest): NonNullable<LlmStartRequest['reliableProviderAttempt']> {
   const attemptBigInt = BigInt(request.attemptSeq);
   const attemptSeq = attemptBigInt > BigInt(Number.MAX_SAFE_INTEGER)
     ? Number.MAX_SAFE_INTEGER
     : Math.max(1, Number(attemptBigInt));
-  const retryPolicy = asRecord(authorityModel.retryPolicy);
-  const retryEnabled = retryPolicy?.enabled !== false;
-  const configuredRetries = typeof retryPolicy?.maxRetries === 'number'
-    && Number.isSafeInteger(retryPolicy.maxRetries)
-    && retryPolicy.maxRetries >= 0
-      ? retryPolicy.maxRetries
-      : 1;
+  const retryPolicy = retryPolicyForFullRequest(request);
+  const retryEnabled = retryPolicy.enabled;
+  const configuredRetries = request.modelOutputRepair ? Math.min(2, retryPolicy.maxRetries) : retryPolicy.maxRetries;
   const maxAttempts = retryEnabled
-    ? Math.min(10, configuredRetries + 1)
+    ? Math.min(11, configuredRetries + 1)
     : 1;
   return {
     attemptSeq,
@@ -2122,8 +2115,13 @@ function shouldFreezeFailedPartialOutput(request: FullProviderRequest, error: un
   if (!/^[1-9]\d*$/.test(request.attemptSeq)) {
     throw new TypeError('Provider request attemptSeq must be a positive decimal integer.');
   }
-  const retryPolicy = frozenProviderRetryPolicy(request.authoritySnapshot);
-  return BigInt(request.attemptSeq) >= BigInt(retryPolicy.maxRetries + 1);
+  const retryPolicy = retryPolicyForFullRequest(request);
+  const recovery = asRecord(asRecord(request.recipe)?.nativeErrorRecovery);
+  const priorFailures = typeof recovery?.failures === 'number' ? recovery.failures : 0;
+  const repairLimit = request.modelOutputRepair ? 2 : error.retryOptions.maxRetries;
+  const maxRetries = repairLimit === undefined ? retryPolicy.maxRetries
+    : Math.min(retryPolicy.maxRetries, Math.max(0, repairLimit - priorFailures));
+  return BigInt(request.attemptSeq) >= BigInt(maxRetries + 1);
 }
 
 function partialOutputSnapshot(parts: MessageContent['parts']): MessageContent | undefined {
@@ -2457,7 +2455,7 @@ function normalizeCapabilityToolCalls(value: unknown): NormalizedCapabilityToolC
     const explicitOrdinal = optionalOrdinal(record.ordinal ?? record.streamIndex);
     const name = requireText(record.name, `LLM tool call ${index}.name`);
     const normalizedArguments = argsJson
-      ? normalizePlainJson(JSON.parse(argsJson), `LLM tool call ${index}.argsJson`)
+      ? normalizePlainJson(parseProviderToolArguments(argsJson), `LLM tool call ${index}.argsJson`)
       : normalizePlainJson(record.arguments ?? {}, `LLM tool call ${index}.arguments`);
     return {
       ...(id ? { id } : {}),
@@ -2471,6 +2469,16 @@ function normalizeCapabilityToolCalls(value: unknown): NormalizedCapabilityToolC
       ...(record.async === true ? { async: true } : {})
     };
   });
+}
+
+function parseProviderToolArguments(value: string): unknown {
+  try { return JSON.parse(value) as unknown; }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw Object.assign(new ProviderTransientError('temporary_service_error',
+      'Provider 返回的工具参数不是完整 JSON，将重新生成；未执行这次工具调用。', true,
+      { maxRetries: MODEL_OUTPUT_REPAIR_MAX_RETRIES }), { code: 'PROVIDER_MODEL_OUTPUT_INVALID' });
+  }
 }
 
 function assertSameToolCall(existing: ToolCallOutput, incoming: ToolCallOutput): void {
@@ -2629,7 +2637,7 @@ function capabilityProviderError(payload: Record<string, unknown> | undefined): 
 }
 
 function capabilityThrownProviderError(error: unknown): Error {
-  if (error instanceof ProviderTransientError || (error instanceof Error && error.name === 'AbortError')) return error;
+  if (error instanceof ProviderTransientError) return error;
   const record = asRecord(error);
   const raw: Record<string, unknown> = record ? { ...record } : {};
   if (error instanceof Error) {
@@ -2665,99 +2673,167 @@ function capabilityThrownProviderError(error: unknown): Error {
   const message = error instanceof Error && error.message.trim()
     ? error.message
     : optionalText(raw.message) || 'Provider 调用失败。';
-  return classifyProviderFailure(message, raw);
+  // A synchronous start exception may be local adapter/configuration work. Only recognized
+  // provider evidence is retryable here; the default-retry policy belongs to llm:error events.
+  return classifyProviderFailure(message, raw, false);
 }
 
-function classifyProviderFailure(message: string, raw: Record<string, unknown> | undefined): Error {
-  const signature = collectErrorSignature(raw, message).toLowerCase();
+/** Maximum automatic server-directed wait. Longer hints remain explicit, never shortened. */
+const MAX_PROVIDER_RETRY_AFTER_MS = 10 * 60_000;
+const MODEL_OUTPUT_REPAIR_MAX_RETRIES = 2;
+
+function classifyProviderFailure(
+  message: string,
+  raw: Record<string, unknown> | undefined,
+  allowUnknownProviderFailure = true
+): Error {
+  const outerSignature = collectErrorSignature(raw, message).toLowerCase();
+  // Only recognized error envelopes contribute body evidence, never arbitrary output/tool arguments.
+  const signature = `${outerSignature} ${collectProviderErrorBodySignature(raw).toLowerCase()}`;
   const structuredStatus = findNumericStatus(raw);
-  const embeddedStatus = embeddedHttpStatus(signature) ?? findPayloadStatusCode(raw);
+  const embeddedStatus = embeddedHttpStatus(outerSignature) ?? findPayloadStatusCode(raw);
   const status = (structuredStatus === undefined || (structuredStatus >= 200 && structuredStatus <= 299))
-    && embeddedStatus !== undefined
-    ? embeddedStatus
-    : structuredStatus;
+    && embeddedStatus !== undefined ? embeddedStatus : structuredStatus;
   const endpointKind = findStringMetadata(raw, 'endpointKind');
-  const explicitlyRetryable = findBooleanMetadata(raw, 'retryable');
-  const transportAttemptsExhausted = findBooleanMetadata(raw, 'transportAttemptsExhausted');
-  const receivedSemanticOutput = findBooleanMetadata(raw, 'receivedSemanticOutput');
-  const openAIResponsesWebSocketTimeout = isStructuredOpenAIResponsesWebSocketTimeout(raw);
-  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|peer closed connection without sending complete message body|\bincomplete chunked read\b/.test(signature);
-  const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
-    signature,
-    findNumericMetadata(raw, 'closeCode', 1_000, 4_999)
-  );
-  // A new reliable Attempt gets a fresh socket and transient accumulator, so these explicitly
-  // recoverable pre-terminal closes may replace partial text/thought/tool output instead of
-  // appending to it. They outrank receivedSemanticOutput, stale retryable=false metadata, an
-  // exhausted capability-local transport budget, and a close reason that would otherwise look
-  // permanent; the reliable ControlPlane's frozen Attempt budget remains authoritative.
-  if (preTerminalWebSocketClose?.retryable === true) {
-    return new ProviderTransientError('connection_interrupted', message, true);
+  const code = providerErrorCode(raw);
+  const permanent = (detail = message): Error => Object.assign(new Error(detail), {
+    ...(status === undefined ? {} : { status }), ...(code ? { code } : {}),
+    ...(endpointKind ? { endpointKind } : {})
+  });
+  const transient = (reason: ConstructorParameters<typeof ProviderTransientError>[0], maxRetries?: number): Error => {
+    const retryAfterMs = providerRetryAfterMs(raw);
+    if (retryAfterMs !== undefined && retryAfterMs > MAX_PROVIDER_RETRY_AFTER_MS) {
+      return permanent(`${message}（服务要求至少等待 ${Math.ceil(retryAfterMs / 1_000)} 秒，超过自动等待上限；请在服务限流解除后继续。）`);
+    }
+    return Object.assign(new ProviderTransientError(reason, message, true, {
+      ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+      ...(maxRetries === undefined ? {} : { maxRetries })
+    }), { ...(status === undefined ? {} : { status }), ...(code ? { code } : {}) });
+  };
+
+  // llm:error also carries preparation failures. These are never authority to replay a model call.
+  if (raw?.failureOrigin === 'setup' || raw?.failureOrigin === 'request_preparation'
+    || raw?.category === 'internal'
+    || providerErrorRecords(raw).some(record =>
+      (typeof record.name === 'string' && ['RootAuthorityError', 'StaleRootBindingError', 'RuntimeDataInvariantError', 'LocalExecutionRecoveryExhaustedError'].includes(record.name))
+      || (typeof record.code === 'string'
+        && /^(?:SQLITE\w*|RUNTIME_DATA_INVARIANT|LOCAL_EXECUTION_RECOVERY_EXHAUSTED|MODEL_STREAM_IDENTITY_STALE|MODEL_STREAM_IDEMPOTENCY_CONFLICT|CONTENT_OBJECT_CORRUPT|CONTENT_DIGEST_MISMATCH|LLM_WIRE_INVARIANT_FAILED|ENOSPC|EDQUOT|EACCES|EPERM|ENOENT|EIO|EBUSY|EAGAIN|EMFILE|ENFILE)$/i.test(record.code)))) {
+    return Object.assign(permanent(), { category: 'internal' });
   }
-  if (preTerminalWebSocketClose?.retryable === false) return new Error(message);
   const nativeCompactionEndpoint = endpointKind === 'provider_native'
     || endpointKind === 'openai_responses_compact'
     || endpointKind === 'anthropic_messages_compact'
-    || signature.includes('llm compact api');
+    || outerSignature.includes('llm compact api');
   if (nativeCompactionEndpoint && (status === 404 || status === 405 || status === 501)) {
-    return new ProviderCapabilityError(
-      'native_compaction_unsupported',
-      message,
-      status,
-      endpointKind ?? 'provider_native_compaction'
-    );
+    return new ProviderCapabilityError('native_compaction_unsupported', message, status,
+      endpointKind ?? 'provider_native_compaction');
   }
   if ((status === 400 || status === 422)
-    && /unsupported|not supported|unknown parameter|invalid.*(?:reasoning|thinking|compaction)|thinking.*(?:disabled|adaptive|enabled)/.test(signature)) {
+    && /unsupported|not supported|unknown parameter|invalid.*(?:reasoning|thinking|compaction)|thinking.*(?:disabled|adaptive|enabled)/.test(outerSignature)) {
     return new ProviderCapabilityError(
-      /reasoning|thinking/.test(signature) ? 'unsupported_reasoning_mode' : 'unsupported_parameter',
-      message,
-      status,
-      endpointKind
-    );
+      /reasoning|thinking/.test(outerSignature) ? 'unsupported_reasoning_mode' : 'unsupported_parameter',
+      message, status, endpointKind);
   }
-  // The body's own error code/type joins only this check: Anthropic bodies always carry
-  // invalid_request_error, which must not steer the capability or transport rules around it.
-  if (isProviderQuotaExhausted(`${signature} ${collectProviderErrorBodySignature(raw).toLowerCase()}`)) {
-    return new Error(providerQuotaExhaustedMessage(message));
+  if (isProviderQuotaExhausted(signature)) return permanent(providerQuotaExhaustedMessage(message));
+  if (/\binvalid_encrypted_content\b|encrypted content could not be (?:verified|decrypted|parsed)/.test(signature)) return permanent();
+  if (providerErrorRecords(raw).some(record => [record.code, record.type].some(value =>
+    typeof value === 'string' && /^(?:safety|refusal|content_filter|prohibited_content|blocklist|spii|image_safety|recitation)$/i.test(value)))) {
+    return permanent();
   }
-  if (/\b(invalid_api_key|authentication_error|permission_denied|invalid_request_error|context_length_exceeded)\b|\b(?:unauthorized|forbidden)\b|context (?:length|window).*(?:exceed|too (?:large|long))/.test(signature)) {
-    return new Error(message);
+  if (/\b(?:invalid_api_key|authentication_error|permission_denied|unauthorized|forbidden|err_tls_cert_altname_invalid|cert_has_expired|depth_zero_self_signed_cert|unable_to_verify_leaf_signature)\b/.test(signature)) return permanent();
+  if (/\b(?:context_length_exceeded|model_context_window_exceeded)\b|context (?:length|window).*(?:exceed|too (?:large|long))|maximum context length|input exceeds.*token limit/.test(signature)) {
+    return Object.assign(permanent(), { code: 'CONTEXT_WINDOW_EXCEEDED' });
   }
-  // This timeout comes from the Responses WS session state machine, not from an arbitrary error
-  // string. A new reliable Attempt owns a fresh transient accumulator, so it may replace any
-  // uncommitted semantic output from the timed-out Attempt without replaying completed tools.
-  if (openAIResponsesWebSocketTimeout) {
-    return new ProviderTransientError('connection_interrupted', message, true);
+  if (/\binvalid_request_error\b/.test(signature) && !(status !== undefined && [408, 409, 425, 429].includes(status))
+    && !(status !== undefined && status >= 500)) {
+    return permanent();
   }
-  if (replaySafeTransportFailure) {
-    return new ProviderTransientError('connection_interrupted', message, true);
+  // Changing these inputs is a separate request/repair decision, not an identical-request retry.
+  const finishReason = findStringMetadata(raw, 'finishReason') ?? findStringMetadata(raw, 'incompleteReason')
+    ?? findStringMetadata(raw, 'finish_reason') ?? findStringMetadata(raw, 'stop_reason');
+  if ((finishReason && /^(?:length|max_tokens|max_output_tokens|model_context_window_exceeded|content_filter|refusal|safety|recitation|prohibited_content|blocklist|spii|image_safety)$/i.test(finishReason))
+    || /\b(?:max_output_tokens|content_filter|summary_output_limit_exhausted|compression_request_too_large|compression_source_too_large|provider_capability_mismatch|llm_media_semantics_unavailable)\b|缺少 LLM API Key|未注册的压缩方法|当前压缩方法已关闭/.test(signature)) {
+    return permanent();
   }
-  const temporaryServiceFailure = status === 408
-    || status === 425
-    || (status !== undefined && status >= 500 && status <= 599)
-    || ((status === undefined || (status >= 200 && status <= 299))
-      && /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bservice_busy\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\brate_limit_exceeded\b|\bserver_error\b|\binternal_error\b|模型服务暂时不可用|服务繁忙/.test(signature));
-  if (receivedSemanticOutput === true && !temporaryServiceFailure) {
-    return new Error(`${message}（已收到 Provider 语义输出，不自动重放请求。）`);
+  if (status !== undefined && status >= 400 && status <= 499 && ![408, 409, 425, 429].includes(status)) {
+    return permanent();
   }
-  if (status !== undefined && status >= 400 && status <= 499 && status !== 408 && status !== 425 && status !== 429) {
-    return Object.assign(new Error(message), { status, ...(endpointKind ? { endpointKind } : {}) });
+  if (status === 501 || status === 505) return permanent();
+  const preTerminalWebSocketClose = classifyOpenAIResponsesPreTerminalWebSocketClose(
+    outerSignature, findNumericMetadata(raw, 'closeCode', 1_000, 4_999));
+  if (preTerminalWebSocketClose?.retryable === false) return permanent();
+  if (preTerminalWebSocketClose?.retryable === true) return transient('connection_interrupted');
+  const replaySafeTransportFailure = /\b(llm_stream_truncated|llm_transport_timeout|und_err_socket|und_err_body_timeout|und_err_headers_timeout|und_err_connect_timeout|econnreset|econnaborted|epipe|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|peer closed connection without sending complete message body|\bincomplete chunked read\b/.test(signature);
+  if (isStructuredOpenAIResponsesWebSocketTimeout(raw) || replaySafeTransportFailure) {
+    return transient('connection_interrupted');
   }
-  if (explicitlyRetryable === false || transportAttemptsExhausted === true) return new Error(message);
-  if (status === 429) {
-    return new ProviderTransientError('rate_limited', message);
+  if (status === 429 || /\b(?:rate_limit_exceeded|rate_limit_error|too_many_requests)\b/.test(signature)) {
+    return transient('rate_limited');
   }
-  if (temporaryServiceFailure) {
-    return new ProviderTransientError('temporary_service_error', message, true);
+  if ([408, 409, 425].includes(status ?? 0) || (status !== undefined && status >= 500 && status <= 599)
+    || /\bupstream request failed\b|\bservice (?:temporarily )?unavailable\b|\bservice_busy\b|\bbad gateway\b|\bgateway timeout\b|\bserver overloaded\b|\b(?:server_error|internal_error|overloaded_error)\b|模型服务暂时不可用|服务繁忙/.test(signature)) {
+    return transient('temporary_service_error');
   }
-  if (/\b(econnreset|econnrefused|enotfound|enetunreach|ehostunreach|etimedout|eai_again|network_changed)\b|socket hang up|network error|fetch failed|connection (?:closed|reset|interrupted)|websocket closed before (?:terminal event|response\.completed|open)|timed? out/.test(signature)) {
-    return new ProviderTransientError('connection_interrupted', message);
+  if (/\b(?:decode_error|stream_parse_error|empty_response|malformed_function_call|unexpected_tool_call)\b/.test(signature)
+    || (allowUnknownProviderFailure && /\bsyntaxerror\b/.test(signature))) {
+    return Object.assign(transient('temporary_service_error', MODEL_OUTPUT_REPAIR_MAX_RETRIES), {
+      code: 'PROVIDER_MODEL_OUTPUT_INVALID'
+    });
   }
-  if (explicitlyRetryable === true) {
-    return new ProviderTransientError('connection_interrupted', message);
+  if (findBooleanMetadata(raw, 'retryable') === false) return permanent();
+  if (/websocket closed before (?:terminal event|response\.completed|open)|timed? out|\btimeout\b/.test(signature)
+    || findBooleanMetadata(raw, 'retryable') === true) return transient('connection_interrupted');
+  // The capability has explicitly reported a provider failure. Bounded durable attempts replace
+  // only this attempt's uncommitted output; native committed work still requires the rebase path.
+  return allowUnknownProviderFailure ? transient('temporary_service_error') : permanent();
+}
+
+/** Read exact error containers only; a provider body may also contain arbitrary generated content. */
+function providerErrorRecords(raw: Record<string, unknown> | undefined): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = [];
+  const seen = new Set<object>();
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 6 || records.length >= 64) return;
+    const record = asRecord(parseProviderErrorBody(value));
+    if (!record || seen.has(record)) return;
+    seen.add(record);
+    records.push(record);
+    for (const key of ['cause', 'error', 'response', ...PROVIDER_ERROR_BODY_CARRIERS]) visit(record[key], depth + 1);
+  };
+  visit(raw, 0);
+  return records;
+}
+
+function providerErrorCode(raw: Record<string, unknown> | undefined): string | undefined {
+  for (const record of providerErrorRecords(raw)) {
+    if (typeof record.code === 'string' && record.code.trim()) return record.code.trim().slice(0, 128);
   }
-  return new Error(message);
+  return undefined;
+}
+
+function providerRetryAfterMs(raw: Record<string, unknown> | undefined): number | undefined {
+  const delays: number[] = [];
+  for (const record of providerErrorRecords(raw)) {
+    const headers = asRecord(record.headers);
+    for (const [name, value] of Object.entries(headers ?? {})) {
+      const header = name.toLowerCase();
+      if (!['retry-after', 'retry-after-ms'].includes(header) || (typeof value !== 'string' && typeof value !== 'number')) continue;
+      const text = String(value).trim();
+      const milliseconds = /^\d+(?:\.\d+)?$/.test(text) ? Number(text) * (header === 'retry-after-ms' ? 1 : 1_000)
+        : header === 'retry-after' ? Date.parse(text) - Date.now() : NaN;
+      if (Number.isFinite(milliseconds) && milliseconds >= 0) delays.push(Math.ceil(milliseconds));
+    }
+    // Gemini google.rpc.RetryInfo. Only its explicit details envelope supplies a duration.
+    if (Array.isArray(record.details)) for (const value of record.details.slice(0, 16)) {
+      const detail = asRecord(value);
+      if (detail?.['@type'] !== 'type.googleapis.com/google.rpc.RetryInfo') continue;
+      if (typeof detail.retryDelay === 'string' && /^\d+(?:\.\d+)?s$/.test(detail.retryDelay)) {
+        const milliseconds = Number(detail.retryDelay.slice(0, -1)) * 1_000;
+        if (Number.isFinite(milliseconds)) delays.push(Math.ceil(milliseconds));
+      }
+    }
+  }
+  return delays.length ? Math.max(...delays) : undefined;
 }
 
 /** Codes that always mean the account's quota or billing cap, whatever the HTTP status (even 429). */
@@ -2861,7 +2937,7 @@ function collectProviderErrorBodyFields(value: unknown, fields: Set<string>, dep
   if (typeof record.error === 'string' && record.error.trim()) fields.add(record.error.trim().slice(0, 1_000));
   // `error` is the usual envelope, `response` the Responses API failure, `details`/`violations` Gemini's
   // google.rpc QuotaFailure.
-  for (const key of ['error', 'response', 'details', 'violations']) {
+  for (const key of ['error', 'response', 'details', 'violations', 'incomplete_details']) {
     collectProviderErrorBodyFields(record[key], fields, depth + 1);
   }
 }
@@ -3021,23 +3097,22 @@ function findNumericMetadata(
   return undefined;
 }
 
-function findNumericStatus(value: unknown, depth = 0): number | undefined {
-  if (depth > 5 || value === null || value === undefined) return undefined;
-  if (typeof value === 'number' && Number.isInteger(value) && value >= 100 && value <= 599) return value;
-  if (Array.isArray(value)) {
-    for (const entry of value.slice(0, 32)) {
-      const nested = findNumericStatus(entry, depth + 1);
-      if (nested !== undefined) return nested;
+function findNumericStatus(value: unknown): number | undefined {
+  const records = providerErrorRecords(asRecord(value));
+  let successfulStatus: number | undefined;
+  for (const record of records) {
+    for (const key of ['status', 'statusCode', 'httpStatus', 'status_code', 'http_status']) {
+      const candidate = record[key];
+      const status = typeof candidate === 'number' ? candidate
+        : typeof candidate === 'string' && /^\d{3}$/.test(candidate.trim()) ? Number(candidate) : NaN;
+      if (!Number.isInteger(status) || status < 100 || status > 599) continue;
+      if (status >= 400) return status;
+      successfulStatus ??= status;
     }
-    return undefined;
+    // Google RPC error.code is the numeric HTTP-equivalent code, unlike provider string codes.
+    if (typeof record.code === 'number' && Number.isInteger(record.code) && record.code >= 400 && record.code <= 599) return record.code;
   }
-  const record = asRecord(value);
-  if (!record) return undefined;
-  for (const key of ['status', 'statusCode', 'httpStatus', 'response']) {
-    const nested = findNumericStatus(record[key], depth + 1);
-    if (nested !== undefined) return nested;
-  }
-  return undefined;
+  return successfulStatus;
 }
 
 function collectErrorSignature(value: unknown, fallback: string, depth = 0, seen = new Set<object>()): string {

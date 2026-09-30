@@ -46,6 +46,7 @@ import {
   compressionOutputTokens,
   estimateCompressionResultTokens,
   hasUnsizedOpaqueCompaction,
+  hasOpaqueProviderCompaction,
   estimateMaterializedContextTokens,
   providerPromptTokens
 } from './contextTokenEstimator';
@@ -72,6 +73,7 @@ import { buildModelHandleCatalog, normalizeModelHandleCatalog, type ModelHandleC
 import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
+  ProviderTransientError,
   restoredProviderRequestFailure,
   modelRequestIdFor,
   type FullRequestProviderAdapter
@@ -87,7 +89,7 @@ import {
 } from './skillToolResultProjection';
 
 export type CompressionTrigger = 'auto' | 'manual';
-export type CompressionTriggerReason = 'manual' | 'configured_threshold';
+export type CompressionTriggerReason = 'manual' | 'configured_threshold' | 'provider_context_overflow';
 
 export interface CompressionToolDefinition {
   name: string;
@@ -104,6 +106,8 @@ export interface CoordinateCompressionCommand {
   settingsSnapshotContentObjectId?: string;
   headRootId: string;
   trigger: CompressionTrigger;
+  /** Exact rejected ordinary request; forces one smaller, immutable recovery attempt for this frontier. */
+  providerContextOverflowRequestId?: string;
   /** Exact frozen ordinary request planning budget. Required for automatic compression; optional for manual. */
   requestBudget?: FullRequestPlanningBudget;
   /** Exact active-Turn input that may need request-level reinjection after this compression. */
@@ -161,6 +165,7 @@ export type CoordinateCompressionResult =
       modelRequestId: string;
       sourceRootId: string;
       sourceSegmentCount: number;
+      providerContextOverflowRequestId?: string;
       diagnostics?: Array<'native_over_target' | 'fallback_used'>;
       attemptedMethods?: CompressionExecutionAttempt['methodKind'][];
       failures?: CompressionAttemptFailure[];
@@ -208,8 +213,18 @@ export class ReliableContextCompressionCoordinator {
     }
     const turnId = requireId(command.turnId, 'turnId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
+    if (command.providerContextOverflowRequestId) {
+      if (command.trigger !== 'auto' || command.sourceReplay || command.compressSegmentCount !== undefined) {
+        throw new TypeError('Provider context recovery requires automatic bounded prefix planning.');
+      }
+      const source = await this.readProviderContextOverflowSource(turnId, command.providerContextOverflowRequestId);
+      if (source.rootId !== command.headRootId || source.request.authority_snapshot_id !== authoritySnapshotId
+        || (source.request.settings_snapshot_object_id ?? undefined) !== command.settingsSnapshotContentObjectId) {
+        throw new Error('Provider context recovery differs from the rejected immutable request.');
+      }
+    }
     const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
-      ?? await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId);
+      ?? (command.providerContextOverflowRequestId ? undefined : await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId));
     const frozen = await readRequestTurnAuthority(
       this.database,
       this.contentStore,
@@ -230,9 +245,10 @@ export class ReliableContextCompressionCoordinator {
     const failures: CompressionAttemptFailure[] = [];
     let lastPlanningError: Extract<CoordinateCompressionResult, { status: 'error' }> | undefined;
     const groupId = `compression_group_${createHash('sha256')
-      .update(JSON.stringify([turnId, command.headRootId, settingsSnapshotContentObjectId, command.sourceReplay ?? null])).digest('hex')}`;
+      .update(JSON.stringify([turnId, command.headRootId, settingsSnapshotContentObjectId, command.sourceReplay ?? null,
+        ...(command.providerContextOverflowRequestId ? [command.providerContextOverflowRequestId] : [])])).digest('hex')}`;
     const attemptCommand: CoordinateCompressionCommand = { ...command, settingsSnapshotContentObjectId };
-    if (command.trigger === 'auto') {
+    if (command.trigger === 'auto' && !command.providerContextOverflowRequestId) {
       const evaluated = await this.compression.evaluate(command.headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
       if (!evaluated.shouldCompress) return {
         status: 'skipped', reason: 'below_threshold', estimatedTokens: evaluated.estimatedTokens,
@@ -282,11 +298,12 @@ export class ReliableContextCompressionCoordinator {
 
       if (result.status === 'skipped') {
         const hasFallback = index + 1 < policy.executionPlan.attempts.length;
-        if (hasFallback && (result.reason === 'native_pending_tools' || result.reason === 'native_steering_in_flight')) {
+        if (hasFallback && (result.reason === 'native_pending_tools' || result.reason === 'native_steering_in_flight'
+          || command.providerContextOverflowRequestId && (result.reason === 'non_reducing' || result.reason === 'finite_tail'))) {
           failures.push({
             methodKind: attempt.methodKind,
             code: result.reason,
-            message: `Provider 原生压缩暂不可执行：${result.reason}`
+            message: `当前压缩方法未能安全缩小上下文：${result.reason}`
           });
           continue;
         }
@@ -297,7 +314,8 @@ export class ReliableContextCompressionCoordinator {
       return result;
     }
 
-    if (command.trigger === 'auto' && policy.executionPlan.continueUncompressedIfFits && command.requestBudget) {
+    if (command.trigger === 'auto' && !command.providerContextOverflowRequestId
+      && policy.executionPlan.continueUncompressedIfFits && command.requestBudget) {
       const requestBudget = requireFullRequestPlanningBudget(command.requestBudget, policy.thresholdTokens);
       if (requestBudget.estimatedFullInputTokens <= requestBudget.planningInputCapacityTokens) {
         return {
@@ -325,6 +343,73 @@ export class ReliableContextCompressionCoordinator {
     throw new Error(compressionFallbackExhaustedMessage(attemptedMethods, failures));
   }
 
+  /** Repair only a proved rejected request; replay after a crash uses the same compression request/block. */
+  public async recoverProviderContextOverflow(input: { turnId: string; failedModelRequestId: string }): Promise<CoordinateCompressionResult> {
+    const turnId = requireId(input.turnId, 'turnId');
+    const failedModelRequestId = requireId(input.failedModelRequestId, 'failedModelRequestId');
+    const source = await this.readProviderContextOverflowSource(turnId, failedModelRequestId);
+    const turn = await this.requireDomain('Turn', turnId);
+    if (turn.status !== 'active') throw new Error('Provider context recovery requires the original active Turn.');
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const currentHead = await this.context.currentHeadRootId(conversationId);
+    if (currentHead !== source.rootId) {
+      // An unrelated Context append is not proof of repair. A completed matching block is required
+      // before coordinate may replay its old source instead of trying to compress a stale head.
+      let committed = false;
+      for (const request of await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId })) {
+        if (request.status !== 'terminal' || request.terminal_state !== 'completed') continue;
+        const recipe = await this.readRequestRecipe(request);
+        if (recipe.kind !== 'reliable-context-compression' || recipe.providerContextOverflowRequestId !== failedModelRequestId
+          || recipe.sourceRootId !== source.rootId) continue;
+        const block = await this.optionalDomain('CompressionBlock', compressionBlockIdFor(conversationId, source.rootId, String(request.id)));
+        if (block?.status === 'enabled') { committed = true; break; }
+      }
+      if (!committed) throw new Error('Context changed without a committed repair of the rejected request.');
+    }
+    const fullRequest = await this.modelProvider.replay(failedModelRequestId);
+    const adapter = await this.providers.resolve(fullRequest.providerId);
+    if (adapter.providerId !== fullRequest.providerId) throw new Error('Provider context recovery changed provider identity.');
+    const currentInput = source.recipe.currentTurnInput;
+    const currentInputRecord = currentInput && typeof currentInput === 'object' && !Array.isArray(currentInput) ? currentInput : undefined;
+    const result = await this.coordinate({
+      turnId,
+      authoritySnapshotId: requireId(source.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
+      ...(typeof source.request.settings_snapshot_object_id === 'string' ? { settingsSnapshotContentObjectId: source.request.settings_snapshot_object_id } : {}),
+      headRootId: source.rootId,
+      trigger: 'auto', providerContextOverflowRequestId: failedModelRequestId,
+      requestBudget: this.modelProvider.planFullRequest(fullRequest, adapter),
+      protectedCurrentInputTokens: typeof currentInputRecord?.estimatedTokens === 'number' ? currentInputRecord.estimatedTokens : 0,
+      tools: normalizeCompressionToolDefinitions(source.recipe.tools, 'Rejected request tools'),
+      modelHandleCatalog: normalizeModelHandleCatalog(source.recipe.modelHandleCatalog)
+    });
+    if (result.status === 'compressed' && await this.context.currentHeadRootId(conversationId) !== result.result.rootId) {
+      throw new Error('The proved context repair is not the current Conversation head.');
+    }
+    return result;
+  }
+
+  private async readRequestRecipe(request: DomainRow): Promise<Record<string, PlainJsonValue>> {
+    const object = await this.requireDomain('ContentObject', requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id'));
+    return requireRecord(normalizePlainJson(JSON.parse((await this.contentStore.read(asContentObjectMetadata(object))).toString('utf8')),
+      'ModelRequest recipe'), 'ModelRequest recipe');
+  }
+
+  private async readProviderContextOverflowSource(turnId: string, modelRequestId: string): Promise<{
+    request: DomainRow; recipe: Record<string, PlainJsonValue>; rootId: string;
+  }> {
+    const request = await this.requireDomain('ModelRequest', requireId(modelRequestId, 'providerContextOverflowRequestId'));
+    const stats = request.stream_stats_json as { failure?: { code?: unknown; category?: unknown } } | undefined;
+    if (request.turn_id !== turnId || request.status !== 'terminal' || request.terminal_state !== 'provider_failed'
+      || stats?.failure?.code !== 'CONTEXT_WINDOW_EXCEEDED' || stats.failure.category !== 'permanent') {
+      throw new Error('Provider context recovery requires an exact persisted context-window rejection.');
+    }
+    const recipe = await this.readRequestRecipe(request);
+    if (recipe.kind !== 'reliable-agent-turn') throw new Error('Only an ordinary request can authorize provider context recovery.');
+    const projections = await listAllDomainRows(this.database, 'ModelContextProjection', { owner_kind: 'model_request', owner_id: modelRequestId });
+    if (projections.length !== 1 || projections[0].purpose !== 'provider-request') throw new Error('Rejected request has no unique frozen Context projection.');
+    return { request, recipe, rootId: requireId(projections[0].root_id, 'ModelContextProjection.root_id') };
+  }
+
   private async coordinateAttempt(
     command: CoordinateCompressionCommand,
     attempt: CompressionExecutionAttempt,
@@ -335,7 +420,7 @@ export class ReliableContextCompressionCoordinator {
     const headRootId = requireId(command.headRootId, 'headRootId');
     const trigger = requireTrigger(command.trigger);
     const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
-      ?? await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId);
+      ?? (command.providerContextOverflowRequestId ? undefined : await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId));
     const frozen = await readRequestTurnAuthority(
       this.database, this.contentStore, authoritySnapshotId, turnId, settingsSnapshotContentObjectId
     );
@@ -357,7 +442,7 @@ export class ReliableContextCompressionCoordinator {
       ? requireFullRequestPlanningBudget(command.requestBudget, policy.thresholdTokens)
       : manualRequestPlanningBudget(frozen.document, policy.thresholdTokens);
     const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
-    if (trigger === 'auto' && !decision.shouldCompress) {
+    if (trigger === 'auto' && !command.providerContextOverflowRequestId && !decision.shouldCompress) {
       return {
         status: 'skipped',
         reason: 'below_threshold',
@@ -365,7 +450,7 @@ export class ReliableContextCompressionCoordinator {
         thresholdTokens: decision.thresholdTokens
       };
     }
-    if (trigger === 'auto' && requestBudget.fixedOverPolicy) {
+    if (trigger === 'auto' && !command.providerContextOverflowRequestId && requestBudget.fixedOverPolicy) {
       return {
         status: 'skipped',
         reason: 'fixed_over_policy',
@@ -383,7 +468,7 @@ export class ReliableContextCompressionCoordinator {
     }
     const triggerReason: CompressionTriggerReason = trigger === 'manual'
       ? 'manual'
-      : 'configured_threshold';
+      : command.providerContextOverflowRequestId ? 'provider_context_overflow' : 'configured_threshold';
     const protectedCurrentInputTokens = command.protectedCurrentInputTokens === undefined
       ? 0
       : requireNonNegativeTokenCount(command.protectedCurrentInputTokens, 'protectedCurrentInputTokens');
@@ -462,6 +547,14 @@ export class ReliableContextCompressionCoordinator {
         ? {}
         : { bodyTargetTokens: policy.config.bodyTargetTokens })
     });
+    if (command.providerContextOverflowRequestId) {
+      // Provider rejection disproved the ordinary estimate's admission decision. Aim below half
+      // of the measured history rather than retaining an entire below-threshold window again.
+      // This is an estimator-space reduction target, not a claimed Provider token oracle.
+      const currentTokens = estimateMaterializedContextTokens(semanticMaterialized.segments, fullAttachmentCatalogState, fullModelHandleCatalog);
+      rooms.calibratedBodyTargetTokens = Math.min(rooms.calibratedBodyTargetTokens,
+        rooms.calibratedAddendaTokens + calibrateEstimatorToProvider(Math.floor(currentTokens / 2), calibration));
+    }
     const effectiveSummaryMaxTokens = policy.methodKind === 'provider_native'
       ? undefined
       : calculateEffectiveSummaryMaxTokens(
@@ -588,6 +681,7 @@ export class ReliableContextCompressionCoordinator {
       attempt.methodKind, attempt.nativeKind ?? 'text',
       String(sourceSegmentCount), sourceHash,
       ...(command.sourceReplay ? [command.sourceReplay] : []),
+      ...(command.providerContextOverflowRequestId ? ['provider-context-overflow', command.providerContextOverflowRequestId] : []),
       ...(settingsSnapshotContentObjectId ? [settingsSnapshotContentObjectId] : [])
     ].join(':');
     const expectedModelRequestId = modelRequestIdFor(turnId, idempotencyKey);
@@ -612,6 +706,7 @@ export class ReliableContextCompressionCoordinator {
           requestKind: trigger === 'auto' ? 'context_compression_pre' : 'context_compression_manual',
           trigger,
           triggerReason,
+          ...(command.providerContextOverflowRequestId ? { providerContextOverflowRequestId: command.providerContextOverflowRequestId } : {}),
           triggerTokens: decision.estimatedTokens,
           triggerTokenSource: decision.source,
           configuredThresholdTokens: requestBudget.compressionThresholdTokens,
@@ -813,9 +908,10 @@ export class ReliableContextCompressionCoordinator {
     const contextSizeKnown = !hasUnsizedOpaqueCompaction(semanticMaterialized.segments);
     if (
       trigger === 'auto'
-      && policy.methodKind !== 'provider_native'
-      && contextSizeKnown
-      && projectedTokens >= currentContextTokens
+      && (command.providerContextOverflowRequestId
+        ? !contextSizeKnown || hasOpaqueProviderCompaction(summary) && providerOutputTokens === undefined
+          || projectedTokens >= currentContextTokens
+        : policy.methodKind !== 'provider_native' && contextSizeKnown && projectedTokens >= currentContextTokens)
     ) {
       // A large protected tail can cross the threshold while the currently eligible prefix is
       // already compact.  The durable ModelRequest makes this decision exact-replayable for this
@@ -884,6 +980,7 @@ export class ReliableContextCompressionCoordinator {
       modelRequestId: expectedModelRequestId,
       sourceRootId: headRootId,
       sourceSegmentCount,
+      ...(command.providerContextOverflowRequestId ? { providerContextOverflowRequestId: command.providerContextOverflowRequestId } : {}),
       ...(policy.methodKind === 'provider_native'
         && calibrateEstimatorToProvider(projectedTokens, calibration) > rooms.calibratedBodyTargetTokens
         ? { diagnostics: ['native_over_target' as const] }
@@ -1091,6 +1188,11 @@ function compressionAttemptMayFallback(error: CompressionProviderAttemptError): 
     || typeof source?.code === 'string' && /^(SQLITE|RUNTIME|MODEL_|CONTENT_)/.test(source.code)) return false;
   const terminalState = typeof source?.terminalState === 'string' ? source.terminalState.toLowerCase() : '';
   const text = `${error.message}\n${terminalState}`.toLowerCase();
+  if (/invalid_api_key|authentication_error|permission_denied|insufficient_quota|billing_hard_limit|unauthorized|forbidden/.test(text)) return false;
+  // A durably classified connection_interrupted is not a user interruption. Live and restored
+  // transient failures must admit the same configured fallback after their attempt budget ends.
+  if (error.cause instanceof ProviderTransientError
+    || source?.category === 'transient' && terminalState.startsWith('provider_transient_')) return true;
   return !(
     terminalState.includes('cancel')
     || terminalState.includes('interrupt')
@@ -1099,7 +1201,6 @@ function compressionAttemptMayFallback(error: CompressionProviderAttemptError): 
     || text.includes('canceled')
     || text.includes('interrupted')
     || text.includes('execution handoff')
-    || /invalid_api_key|authentication_error|permission_denied|insufficient_quota|billing_hard_limit|unauthorized|forbidden/.test(text)
   );
 }
 

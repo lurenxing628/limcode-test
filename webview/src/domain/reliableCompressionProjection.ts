@@ -14,7 +14,7 @@ export interface ReliableCompressionRequestPurpose {
   blockId: string;
   methodKind: string;
   sourceSegmentCount: number;
-  triggerReason?: 'manual' | 'configured_threshold';
+  triggerReason?: 'manual' | 'configured_threshold' | 'provider_context_overflow';
   triggerTokens?: number;
   triggerTokenSource?: 'provider-observed-delta' | 'compression-output' | 'semantic';
   configuredThresholdTokens?: number;
@@ -95,7 +95,7 @@ export function parseReliableCompressionRequestPurpose(
 function compressionTriggerReason(
   value: unknown
 ): ReliableCompressionRequestPurpose['triggerReason'] {
-  return value === 'manual' || value === 'configured_threshold'
+  return value === 'manual' || value === 'configured_threshold' || value === 'provider_context_overflow'
     ? value
     : undefined;
 }

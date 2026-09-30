@@ -2,6 +2,7 @@ import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 import { createHash } from 'node:crypto';
+import { retryLocalExecution } from './localExecutionRecovery';
 import { compressionExecutionMetadata, readProviderRequestFailure, safeProviderFailureMessage,
   type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact
 } from '../../shared/compressionExecution';
@@ -139,6 +140,8 @@ export interface FullProviderRequest {
   attemptSeq: string;
   socketGeneration: string;
   requestCreatedAt?: number;
+  /** Attempt-local control metadata derived from durable failure facts; never sent to the provider. */
+  modelOutputRepair?: true;
   providerId: string;
   modelId: string;
   authoritySnapshot: PlainJsonValue;
@@ -326,13 +329,13 @@ export function isNativeChainReplayUnsafeError(error: unknown): error is NativeC
 
 const DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS = 20 * 60 * 1_000;
 // 思考型模型（kimi-k3 等）在大上下文 prefill / 反代网关缓冲下，首个语义事件与思考间隙可长达数分钟。
-// 误杀代价不可恢复（已收到输出后不重放，部分输出作废且手动重新生成会撞同一堵墙）；
-// 真死连接仍由 20 分钟 dispatch 超时兼底，用户也可手动取消。因此默认值向宽容侧倾斜。
+// 误杀会丢弃本次未提交输出并消耗一次恢复预算；已有原生工具效果只能安全重建，不能重放。
+// 真死连接仍由 20 分钟 dispatch 超时兜底，用户也可手动取消。因此默认值向宽容侧倾斜。
 const DEFAULT_PROVIDER_FIRST_SEMANTIC_TIMEOUT_MS = 300_000;
 const DEFAULT_PROVIDER_SEMANTIC_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS = 5_000;
 const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 4.5 * 60 * 1_000;
-const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000] as const;
+const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
 const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
 
 export interface ProviderSemanticTimeouts {
@@ -431,7 +434,9 @@ export class ProviderTransientError extends Error {
     public readonly reason: ProviderTransientReason,
     message: string,
     /** A new Attempt may replace partial output from the failed Attempt instead of appending to it. */
-    public readonly retryAfterOutput = false
+    public readonly retryAfterOutput = false,
+    /** Provider-only hints; the durable Attempt budget and native effect fence remain authoritative. */
+    public readonly retryOptions: { retryAfterMs?: number; maxRetries?: number } = {}
   ) {
     super(message);
     this.name = 'ProviderTransientError';
@@ -1126,6 +1131,10 @@ export class ModelProviderControlPlane {
   }
 
   /** Host shutdown uses handoff, never persistent Provider cancellation. */
+  public assertNotHandingOff(): void {
+    if (this.handoff) throw this.handoff;
+  }
+
   public async quiesceAllActiveDispatches(
     reason = new ExecutionHandoffError()
   ): Promise<void> {
@@ -1273,6 +1282,7 @@ export class ModelProviderControlPlane {
       let fullRequest: FullProviderRequest;
       try {
         fullRequest = await this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
+        if (stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID') fullRequest.modelOutputRepair = true;
         this.assertRequestPreflight(request, fullRequest, adapter);
         retryPolicy ??= retryPolicyForFullRequest(fullRequest);
       } catch (error) {
@@ -1285,6 +1295,7 @@ export class ModelProviderControlPlane {
       const identity = await this.openSocketGeneration(modelRequestId, attemptSeq, stats);
       let lastObservedStreamSeq = 0n;
       let sawReplayUnsafeProviderEvent = false;
+      let eventHandlerFailure: unknown;
       const controller = new AbortController();
       const detachCallerSignal = relayAbort(options.signal, controller);
       const unregister = this.registerActiveSocket(modelRequestId, controller);
@@ -1378,14 +1389,19 @@ export class ModelProviderControlPlane {
               sawReplayUnsafeProviderEvent = true;
               progressWaiter.observeProgress();
             }
-            return this.recordDispatchStreamEvent(
+            try {
+              return await retryLocalExecution(() => this.recordDispatchStreamEvent(
               modelRequestId,
               identity.attemptSeq,
               identity.socketGeneration,
               event,
               semanticProgress,
               streamDurability
-            );
+              ), { signal: controller.signal });
+            } catch (failure) {
+              eventHandlerFailure = failure;
+              throw failure;
+            }
           }
         }))
         .then(
@@ -1422,7 +1438,8 @@ export class ModelProviderControlPlane {
         if (resolved.terminalState || resolved.superseded) return resolved;
         error = new ProviderTransientError(
           'connection_interrupted',
-          'Provider adapter resolved before committing a completed terminal checkpoint.'
+          'Provider adapter resolved before committing a completed terminal checkpoint.',
+          true
         );
       } else if (outcome.kind === 'timed_out' || outcome.kind === 'semantic_timed_out') {
         error = outcome.error;
@@ -1431,10 +1448,17 @@ export class ModelProviderControlPlane {
       } else {
         error = outcome.error;
       }
+      if (isExecutionHandoffError(error)) throw error;
+      // An SDK may call a disconnected/expired transport AbortError. Only our signal can cancel
+      // the request; a rejected provider call without that authority is a recoverable interruption.
+      if (!controller.signal.aborted && error !== eventHandlerFailure
+        && error instanceof Error && error.name === 'AbortError') {
+        error = new ProviderTransientError('connection_interrupted', error.message, true);
+      }
       if (
         outcome.kind !== 'timed_out'
         && outcome.kind !== 'semantic_timed_out'
-        && (controller.signal.aborted || isAbortError(error))
+        && controller.signal.aborted
       ) {
         const handoff = handoffReason(controller.signal)
           ?? (isExecutionHandoffError(error) ? error : undefined);
@@ -1458,6 +1482,8 @@ export class ModelProviderControlPlane {
         // Retrying would re-send the frozen input after tools were admitted or items committed:
         // the model would re-issue executed calls under new identities. Keep the request open and
         // unfailed; the caller closes its settled results into Context and rebases the Turn.
+        await this.recordNativeRebaseFailure(modelRequestId, identity, error,
+          retryPolicy?.retryDelayMs ?? 0, nativePriorFailures(fullRequest), retryPolicy?.maxRetries ?? 0);
         throw new NativeChainReplayUnsafeError(error);
       }
       if (sawReplayUnsafeProviderEvent && !error.retryAfterOutput) {
@@ -1476,9 +1502,16 @@ export class ModelProviderControlPlane {
         );
         throw replayUnsafe;
       }
-      const maxRetries = retryPolicy?.enabled ? retryPolicy.maxRetries : 0;
+      const configuredMaxRetries = retryPolicy?.enabled ? retryPolicy.maxRetries : 0;
+      const repairLimit = fullRequest.modelOutputRepair ? 2 : error.retryOptions.maxRetries;
+      const maxRetries = repairLimit === undefined ? configuredMaxRetries
+        : Math.min(configuredMaxRetries, Math.max(0, repairLimit - nativePriorFailures(fullRequest)));
       if (identity.attemptSeq >= BigInt(maxRetries + 1)) {
-        const applied = await this.failRequest(modelRequestId, identity, error);
+        const priorFailures = nativePriorFailures(fullRequest);
+        error.message = `${error.message}（${configuredMaxRetries === 0 && priorFailures === 0
+            ? '当前渠道或模型已关闭自动重试'
+            : `已自动重试 ${priorFailures + Math.max(0, Number(identity.attemptSeq) - 1)} 次，达到本次请求的重试上限 ${priorFailures + maxRetries} 次`}。）`;
+        const applied = await this.failRequest(modelRequestId, identity, error, maxRetries);
         if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
         this.emitTransientTerminal(
           options,
@@ -1494,8 +1527,11 @@ export class ModelProviderControlPlane {
         modelRequestId,
         identity,
         error.reason,
-        maxRetries,
-        retryPolicy?.retryDelayMs ?? 0
+        configuredMaxRetries,
+        retryPolicy?.retryDelayMs ?? 0,
+        error.retryOptions.retryAfterMs ?? 0,
+        error,
+        maxRetries
       );
       if (retryAttempt === null) {
         return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
@@ -2015,7 +2051,10 @@ export class ModelProviderControlPlane {
     failed: StreamIdentity,
     reason: ProviderTransientReason,
     maxRetries: number,
-    configuredDelayMs: number
+    configuredDelayMs: number,
+    providerDelayMs: number,
+    failure: ProviderTransientError,
+    effectiveMaxRetries: number
   ): Promise<{ attemptSeq: bigint; delayMs: number; retryNotBeforeAt: number } | null> {
     if (!Number.isSafeInteger(maxRetries) || maxRetries <= 0 || maxRetries > 10) {
       throw new Error('Provider retry policy must allow between 1 and 10 retries.');
@@ -2024,9 +2063,9 @@ export class ModelProviderControlPlane {
     if (retryOrdinal > maxRetries) throw new Error('Provider transient retry budget is exhausted.');
     const nextAttemptSeq = failed.attemptSeq + 1n;
     const attemptId = stableId('model_request_attempt', modelRequestId, nextAttemptSeq.toString());
-    const delayMs = configuredDelayMs > 0
+    const delayMs = Math.max(providerDelayMs, configuredDelayMs > 0
       ? configuredDelayMs
-      : retryDelayMs(retryOrdinal, this.retryDelaysMs, `${modelRequestId}:${retryOrdinal}`);
+      : retryDelayMs(retryOrdinal, this.retryDelaysMs, `${modelRequestId}:${retryOrdinal}`));
     const retryNotBeforeAt = this.epochNow() + delayMs;
     // Same heartbeat-tolerant retry: assertion failures from benign stats metadata writes are
     // retried from a fresh bundle; a genuine concurrent retry (unique/identity race) still loses.
@@ -2047,6 +2086,10 @@ export class ModelProviderControlPlane {
         retryMaxAttempts: maxRetries,
         retryDelayMs: delayMs,
         retryNotBeforeAt,
+        ...(currentStats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID'
+          ? { failure: currentStats.failure }
+          : (failure as Error & { code?: string }).code === 'PROVIDER_MODEL_OUTPUT_INVALID'
+            ? { failure: { ...providerFailureFact(failure), retryMaxAttempts: effectiveMaxRetries } } : {}),
         ...compressionExecutionMetadata(currentStats)
       };
       try {
@@ -2219,13 +2262,53 @@ export class ModelProviderControlPlane {
     }
   }
 
-  private async failRequest(modelRequestId: string, identity: StreamIdentity, error: unknown): Promise<boolean> {
+  private async failRequest(modelRequestId: string, identity: StreamIdentity, error: unknown, retryLimit?: number): Promise<boolean> {
+    const effectiveLimit = retryLimit ?? identity.stats.failure?.retryMaxAttempts;
     return this.terminalizeRequest(modelRequestId, identity, {
       attemptStatus: 'failed',
       operationStatus: 'failed',
       terminalState: providerFailureTerminalState(error),
-      failure: providerFailureFact(error)
+      failure: { ...providerFailureFact(error),
+        ...(effectiveLimit === undefined ? {} : { retryMaxAttempts: effectiveLimit }) }
     });
+  }
+
+  /** The rebase closes tools locally; this fact lets the Turn keep a budget across new requests/Hosts. */
+  private async recordNativeRebaseFailure(
+    modelRequestId: string, identity: StreamIdentity, error: ProviderTransientError,
+    configuredDelayMs: number, priorFailures: number, configuredMaxRetries: number
+  ): Promise<void> {
+    const ordinal = Number(identity.attemptSeq) + priorFailures;
+    const delayMs = Math.max(error.retryOptions.retryAfterMs ?? 0, configuredDelayMs > 0 ? configuredDelayMs
+      : retryDelayMs(ordinal, this.retryDelaysMs, `${modelRequestId}:${ordinal}`));
+    const retryNotBeforeAt = this.epochNow() + delayMs;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const bundle = await this.readRequestBundle(modelRequestId, identity.attemptSeq);
+      const stats = parseStreamStats(bundle.request.stream_stats_json);
+      if (bundle.request.status === 'terminal' || bundle.fence || !sameStats(stats, identity.stats)) return;
+      try {
+        await this.database.transaction([
+          DOMAIN_REPOSITORIES.domain('Turn').assert(requireId(bundle.turn.id, 'Turn.id'), { status: 'active' }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
+            status: bundle.request.status, stream_stats_json: bundle.request.stream_stats_json
+          }),
+          DOMAIN_REPOSITORIES.domain('ModelStreamFence').assertNone({ model_request_id: modelRequestId }),
+          DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+            stream_stats_json: { ...stats, failure: {
+              ...providerFailureFact(error),
+              ...(stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID'
+                || (error as Error & { code?: string }).code === 'PROVIDER_MODEL_OUTPUT_INVALID'
+                ? { code: 'PROVIDER_MODEL_OUTPUT_INVALID',
+                    retryMaxAttempts: Math.min(configuredMaxRetries, Math.max(0, 2 - priorFailures)) } : {})
+            }, retryDelayMs: delayMs,
+              retryNotBeforeAt }, updated_at: this.timestamp()
+          })
+        ]);
+        return;
+      } catch (failure) {
+        if (!isAssertionFailure(failure) || attempt === 2) throw failure;
+      }
+    }
   }
 
   private async terminalizeRequest(
@@ -2751,8 +2834,8 @@ function normalizeRetryDelays(value: readonly number[] | undefined): readonly nu
     throw new TypeError('retryDelaysMs must contain between 1 and 10 delays.');
   }
   return delays.map((delay, index) => {
-    if (!Number.isSafeInteger(delay) || delay < 0 || delay > 10_000) {
-      throw new TypeError(`retryDelaysMs[${index}] must be an integer in [0, 10000].`);
+    if (!Number.isSafeInteger(delay) || delay < 0 || delay > 60_000) {
+      throw new TypeError(`retryDelaysMs[${index}] must be an integer in [0, 60000].`);
     }
     return delay;
   });
@@ -2769,13 +2852,28 @@ function retryDelayMs(retryOrdinal: number, delays: readonly number[], jitterKey
   return Math.max(0, Math.round(base * factor));
 }
 
-function retryPolicyForFullRequest(request: FullProviderRequest): FrozenProviderRetryPolicy {
+export function retryPolicyForFullRequest(request: FullProviderRequest): FrozenProviderRetryPolicy {
   if (isCompressionRecipe(request.recipe)) {
     const compression = frozenCompressionPolicy(request.authoritySnapshot);
     if (!compression) throw new Error('Compression ModelRequest has no frozen compression retry policy.');
     return compression.provider.retryPolicy;
   }
-  return frozenProviderRetryPolicy(request.authoritySnapshot);
+  const policy = frozenProviderRetryPolicy(request.authoritySnapshot);
+  const priorFailures = nativePriorFailures(request);
+  const repair = isRecord(request.recipe) && isRecord(request.recipe.nativeErrorRecovery)
+    && request.recipe.nativeErrorRecovery.modelOutputRepair === true;
+  const maxRetries = Math.max(0, Math.min(policy.maxRetries, repair ? 2 : 10) - priorFailures);
+  return { ...policy, enabled: policy.enabled && maxRetries > 0, maxRetries };
+}
+
+function nativePriorFailures(request: FullProviderRequest): number {
+  if (!isRecord(request.recipe) || request.recipe.nativeErrorRecovery === undefined) return 0;
+  const recovery = request.recipe.nativeErrorRecovery;
+  if (!isRecord(recovery) || !Number.isSafeInteger(recovery.failures) || Number(recovery.failures) < 0
+    || Number(recovery.failures) > 10 || typeof recovery.modelOutputRepair !== 'boolean') {
+    throw new TypeError('Native error recovery must carry a bounded durable failure count and repair flag.');
+  }
+  return Number(recovery.failures);
 }
 
 function createRetryDelayWaiter(targetEpochMs: number, epochNow: () => number): {
@@ -2839,7 +2937,8 @@ function createProviderTimeoutWaiter(timeoutMsInput: number): {
   let timer: ReturnType<typeof setTimeout> | undefined;
   const error = new ProviderTransientError(
     'connection_interrupted',
-    `Provider dispatch timed out after ${timeoutMsInput}ms.`
+    `Provider dispatch timed out after ${timeoutMsInput}ms.`,
+    true
   );
   const promise = new Promise<{ kind: 'timed_out'; error: ProviderTransientError }>((resolve) => {
     timer = setTimeout(() => resolve({ kind: 'timed_out', error }), timeoutMsInput);
@@ -3309,6 +3408,7 @@ function terminalStreamStats(
   claudeThinkingBinding?: 'drop_block' | 'strip_thinking'
 ): DomainRow {
   const terminal: DomainRow = { ...stats, ...(timing ?? {}), ...(claudeThinkingBinding ? { claudeThinkingBinding } : {}) };
+  delete terminal.failure;
   delete terminal.lastStreamSeq;
   delete terminal.lastStreamEventAt;
   return terminal;
@@ -3453,10 +3553,6 @@ function staleStreamError(message: string): Error {
   return error;
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && error.name === 'AbortError';
-}
-
 function abortError(): Error {
   const error = new Error('Provider request was cancelled.');
   error.name = 'AbortError';
@@ -3539,7 +3635,7 @@ function providerFailureFact(error: unknown): ProviderRequestFailureFact {
   const category: ProviderRequestFailureFact['category'] = error instanceof ProviderCapabilityError ? 'capability'
     : error instanceof ProviderTransientError ? 'transient'
       : error instanceof Error && (error.name === 'AbortError' || isExecutionHandoffError(error)) ? 'cancelled'
-        : error instanceof TypeError || code && /^(SQLITE|RUNTIME|MODEL_|CONTENT_)/.test(code) ? 'internal'
+        : raw.category === 'internal' || error instanceof TypeError || code && /^(SQLITE|RUNTIME|LOCAL_EXECUTION_|MODEL_|CONTENT_)/.test(code) ? 'internal'
           : 'permanent';
   return {
     category, message,

@@ -455,3 +455,128 @@ for (const loss of ['expired', 'terminal', 'missing']) {
     });
   });
 }
+
+const localBusyError = () => Object.assign(new Error('Temporary local writer contention'), { code: 'SQLITE_BUSY' });
+
+for (const afterCommit of [false, true]) {
+  test(`local assistant commit ${afterCommit ? 'acknowledgment' : 'pre-commit'} failure resumes completed output without another model call`, { timeout: 20000 }, async () => {
+    await withHarness(async h => {
+      const original = h.app.turnOutput.appendAssistantMessage.bind(h.app.turnOutput);
+      let attempts = 0;
+      h.app.turnOutput.appendAssistantMessage = async input => {
+        attempts += 1;
+        if (attempts === 1) {
+          if (afterCommit) await original(input);
+          throw localBusyError();
+        }
+        return original(input);
+      };
+      const input = await h.runner.input({ commandId: `local-output-${afterCommit}`, conversationId: h.conversationId, text: '完成回答。' });
+      await h.runner.waitForIdle();
+      const [termination] = await rows(h.app, 'TurnTermination', { turn_id: input.turnId });
+      assert.equal(termination.terminal_status, 'completed');
+      assert.equal(h.providerCalls, 1, 'completed checkpoint is replayed locally');
+      assert.equal(attempts, 2);
+      const links = await rows(h.app, 'MessageTurnLink', { turn_id: input.turnId });
+      assert.equal(links.filter(link => link.role === 'model').length, 1, 'the exact output identity is retained');
+      assert.deepEqual(h.errors, []);
+    });
+  });
+}
+
+for (const afterCommit of [false, true]) {
+  test(`queued admission recovers a transient ${afterCommit ? 'post-commit acknowledgment' : 'pre-commit'} error without another user event`, { timeout: 20000 }, async () => {
+    await withHarness(async h => {
+      const queued = await queueAfterTerminal(h);
+      const original = h.app.turns.admitNextQueued.bind(h.app.turns);
+      let attempts = 0;
+      h.app.turns.admitNextQueued = async input => {
+        attempts += 1;
+        if (attempts === 1) {
+          if (afterCommit) await original(input);
+          throw localBusyError();
+        }
+        return original(input);
+      };
+      await h.runner.recoverStartup();
+      await eventually(async () => (await rows(h.app, 'TurnTermination')).some(row => row.terminal_status === 'completed'), 'admission did not recover');
+      await h.runner.waitForIdle();
+      const [intent] = await rows(h.app, 'TurnIntent', { id: queued.intentId });
+      assert.equal(intent.state, 'admitted');
+      assert.equal(h.providerCalls, 1);
+      assert.equal((await rows(h.app, 'Turn', { id: intent.turn_id })).length, 1);
+      assert.equal(h.runner.admissionRetries.size, 0);
+      assert.equal(h.runner.localAdmissionRecoveryFailures.size, 0);
+    });
+  });
+}
+
+test('transient execution-fence read retains a delayed recovery wake', { timeout: 20000 }, async () => {
+  await withHarness(async h => {
+    const original = h.app.turns.executionLeaseFence.bind(h.app.turns);
+    let attempts = 0;
+    h.app.turns.executionLeaseFence = async input => {
+      if (++attempts === 1) throw localBusyError();
+      return original(input);
+    };
+    const input = await h.runner.input({ commandId: 'local-fence-read', conversationId: h.conversationId, text: '完成回答。' });
+    await eventually(async () => (await rows(h.app, 'Turn', { id: input.turnId }))[0].status === 'terminated', 'drive wake was lost');
+    await h.runner.waitForIdle();
+    assert.equal((await rows(h.app, 'TurnTermination', { turn_id: input.turnId }))[0].terminal_status, 'completed');
+    assert.equal(h.providerCalls, 1);
+    assert.equal(h.runner.deferredRecovery.size, 0);
+    assert.equal(h.runner.localDriveRecoveryFailures.size, 0);
+  });
+});
+
+test('durable interruption cancels local output recovery before any second model request', { timeout: 20000 }, async () => {
+  await withHarness(async h => {
+    const failed = gate();
+    let attempts = 0;
+    h.app.turnOutput.appendAssistantMessage = async () => {
+      attempts += 1;
+      failed.resolve();
+      throw localBusyError();
+    };
+    const input = await h.runner.input({ commandId: 'local-output-stop', conversationId: h.conversationId, text: '完成回答。' });
+    await failed.promise;
+    await h.runner.interrupt({ commandId: 'stop-local-retry', conversationId: h.conversationId, turnId: input.turnId, reason: 'User stopped local recovery' });
+    await h.runner.waitForIdle();
+    assert.equal((await rows(h.app, 'TurnTermination', { turn_id: input.turnId }))[0].terminal_status, 'interrupted');
+    assert.equal(h.providerCalls, 1);
+    assert.ok(attempts < 9, 'interrupt did not wait for the recovery budget');
+  });
+});
+
+test('local recovery excludes root/schema/permission/cancellation and honors abort during backoff', async () => {
+  const { isRetryableLocalExecutionError, retryLocalExecution } = await load('backend/reliableKernel/localExecutionRecovery.js');
+  for (const code of ['SQLITE_BUSY', 'SQLITE_BUSY_SNAPSHOT', 'SQLITE_LOCKED', 'EAGAIN', 'EBUSY', 'EMFILE', 'ENFILE']) {
+    assert.equal(isRetryableLocalExecutionError(Object.assign(new Error(code), { code })), true);
+  }
+  for (const code of ['SQLITE_CORRUPT', 'SQLITE_FULL', 'EACCES', 'ENOSPC', 'RUNTIME_TRANSACTION_ASSERTION_FAILED',
+    'MODEL_STREAM_IDEMPOTENCY_CONFLICT', 'CONTENT_OBJECT_CORRUPT', 'stale-root-binding', 'EXECUTION_HANDOFF', 'LOCAL_EXECUTION_RECOVERY_EXHAUSTED']) {
+    assert.equal(isRetryableLocalExecutionError(Object.assign(new Error(code), { code })), false);
+  }
+  const controller = new AbortController();
+  let attempts = 0;
+  const cancelled = Object.assign(new Error('User cancelled'), { name: 'AbortError' });
+  await assert.rejects(retryLocalExecution(async () => {
+    attempts += 1;
+    throw localBusyError();
+  }, { signal: controller.signal, beforeRetry: async () => { controller.abort(cancelled); } }), error => error === cancelled);
+  assert.equal(attempts, 1);
+});
+
+test('an exhausted local retry budget is typed and cannot multiply in an outer retry layer', async t => {
+  const { retryLocalExecution, LOCAL_EXECUTION_MAX_RETRIES, isRetryableLocalExecutionError } = await load('backend/reliableKernel/localExecutionRecovery.js');
+  let clock = 0;
+  t.mock.method(Date, 'now', () => clock += 10000);
+  let attempts = 0;
+  const original = localBusyError();
+  await assert.rejects(retryLocalExecution(() => retryLocalExecution(async () => {
+    attempts += 1;
+    throw original;
+  })), error => error.code === 'LOCAL_EXECUTION_RECOVERY_EXHAUSTED'
+    && error.cause === original && !isRetryableLocalExecutionError(error));
+  assert.equal(attempts, LOCAL_EXECUTION_MAX_RETRIES + 1);
+});

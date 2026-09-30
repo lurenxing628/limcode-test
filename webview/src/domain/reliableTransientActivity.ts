@@ -62,3 +62,46 @@ export function reliableRetryStreamingActivityLabel(input: {
   if (input.hasVisibleOutput) return undefined;
   return `${identity}已启动，正在连接并等待 LLM 输出`;
 }
+
+
+export interface ReliableRetryClockScheduler {
+  now(): number;
+  schedule(callback: () => void, delayMs: number): unknown;
+  cancel(handle: unknown): void;
+}
+
+/** A bounded countdown observer: stops at its deadline, on replacement, and on unmount. */
+export function createReliableRetryClock(
+  update: (now: number) => void,
+  scheduler: ReliableRetryClockScheduler = {
+    now: () => Date.now(),
+    schedule: (callback, delay) => setTimeout(callback, delay),
+    cancel: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>)
+  }
+): { start(deadline: number): void; stop(): void } {
+  let timer: unknown;
+  let generation = 0;
+  const stop = (): void => {
+    generation += 1;
+    if (timer !== undefined) scheduler.cancel(timer);
+    timer = undefined;
+  };
+  return {
+    start(deadline) {
+      stop();
+      const expected = generation;
+      const tick = (): void => {
+        if (generation !== expected) return;
+        timer = undefined;
+        const now = scheduler.now();
+        update(now);
+        const remaining = deadline - now;
+        if (Number.isFinite(remaining) && remaining > 0) {
+          timer = scheduler.schedule(tick, Math.min(1_000, remaining));
+        }
+      };
+      tick();
+    },
+    stop
+  };
+}

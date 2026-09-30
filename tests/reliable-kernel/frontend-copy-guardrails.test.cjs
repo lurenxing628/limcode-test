@@ -412,3 +412,182 @@ test('长流积压达到阈值时直刷，terminal时立即显示完整文本', 
   );
   assert.match(textPartSource, /\{ animateReplace: true, flushLagChars: 2_048 \}/);
 });
+
+test('failure without assistant output keeps an exact eligible request retry and never invents a Message', async (context) => {
+  const server = await createViteServer(context);
+  const { projectReliableConversation, modelRequestRetryForTurn, projectReliableTurnTermination } = await server.ssrLoadModule('/src/domain/reliableConversationProjection.ts');
+  const records = {
+    Turn: { turn: { id: 'turn', conversation_id: 'conversation', status: 'terminated' } },
+    TurnTermination: { terminal: { id: 'terminal', turn_id: 'turn', terminal_status: 'failed', reason: '已用完 8 次自动重试：503', created_at: 10 } },
+    Message: { user: { id: 'user', conversation_id: 'conversation', revision_id: 'revision', role: 'user', message_seq: '1', created_at: 1 } },
+    MessageTurnLink: { link: { id: 'link', message_id: 'user', turn_id: 'turn', role: 'source' } },
+    ModelRequest: { request: { id: 'request', turn_id: 'turn', request_seq: '1', status: 'terminal', terminal_state: 'provider_transient_temporary_service_error' } },
+    ModelContextProjection: { projection: { id: 'projection', owner_kind: 'model_request', owner_id: 'request', root_id: 'root' } },
+    ConversationContextStatus: { head: { id: 'head', conversation_id: 'conversation', root_id: 'root' } }
+  };
+  const projected = projectReliableConversation({ conversationId: 'conversation', records, details: { 'message-content:revision': ready(JSON.stringify({ role: 'user', parts: [{ text: 'hello' }] })) } });
+  assert.deepEqual(projected.messages.map(message => message.role), ['user']);
+  assert.equal(projected.terminationByMessageId.user.detail, '已用完 8 次自动重试：503');
+  const retry = () => modelRequestRetryForTurn(records, 'conversation', 'turn');
+  assert.deepEqual(retry().target, { kind: 'model_request', modelRequestId: 'request' });
+  for (const terminal of ['completed', 'cancelled', 'native_chain_rebased']) {
+    records.ModelRequest.request.terminal_state = terminal;
+    assert.equal(retry().target, undefined, terminal);
+  }
+  records.ModelRequest.request.terminal_state = 'provider_failed';
+  records.TurnTermination.terminal.terminal_status = 'interrupted';
+  assert.equal(retry().target, undefined, 'a user stop is not a failed request');
+  records.TurnTermination.terminal.terminal_status = 'failed';
+  records.Turn.newer = { id: 'newer', conversation_id: 'conversation', status: 'active' };
+  assert.equal(retry().target, undefined, 'new work cannot be stopped by a stale failure retry');
+  delete records.Turn.newer;
+  records.ConversationContextStatus.head.root_id = 'newer-root';
+  assert.equal(retry().target, undefined, 'old requests cannot rewind newer context');
+  records.ConversationContextStatus.head.root_id = 'root';
+  records.ModelRequest.newer = { ...records.ModelRequest.request, id: 'newer', request_seq: '2' };
+  assert.equal(retry().target, undefined, 'missing latest request projection fails closed');
+  records.ModelContextProjection.newer = { ...records.ModelContextProjection.projection, id: 'projection-newer', owner_id: 'newer' };
+  assert.equal(retry().target.modelRequestId, 'newer');
+  assert.equal(projectReliableTurnTermination(records.TurnTermination.terminal, records).runId, 'turn', 'retry Turns without user Messages keep the durable identity');
+
+  const row = (await server.ssrLoadModule('/src/components/conversation/ReliableTurnTerminationRow.vue')).default;
+  const vue = await import('vue');
+  const props = vue.reactive({ termination: projected.terminationByMessageId.user, retryModelRequestId: 'request', retryPending: false });
+  const events = [];
+  const app = vue.createSSRApp({});
+  app.provide(vue.ssrContextKey, { modules: new Set() });
+  const state = app.runWithContext(() => row.setup(props, { emit: (...event) => events.push(event), expose() {} }));
+  state.confirmingRequestId.value = 'request';
+  state.confirmRetry(); state.confirmRetry();
+  assert.deepEqual(events, [['retry', 'request']], 'double confirmation can submit only the captured exact request once');
+  state.confirmingRequestId.value = 'request'; props.retryModelRequestId = 'newer';
+  state.confirmRetry();
+  assert.equal(events.length, 1, 'a stale confirmation cannot silently switch targets');
+  state.confirmingRequestId.value = 'newer'; props.retryPending = true; state.confirmRetry();
+  assert.equal(events.length, 1, 'pending retry remains locked');
+  assert.match(source('webview/src/components/conversation/ReliableMessageList.vue'), /if \(conversationActionPending\.value\) return;/);
+});
+
+test('retry countdown ticks reactively to its deadline and stops replacement or detached timers', async (context) => {
+  const server = await createViteServer(context);
+  const { createReliableRetryClock } = await server.ssrLoadModule('/src/domain/reliableTransientActivity.ts');
+  const { ref, computed } = await import('vue');
+  let now = 1000, id = 0;
+  const timers = new Map(); const observed = ref(now);
+  const clock = createReliableRetryClock(value => { observed.value = value; }, {
+    now: () => now, schedule: (callback, delay) => { timers.set(++id, { callback, delay }); return id; }, cancel: handle => timers.delete(handle)
+  });
+  const remaining = computed(() => Math.max(0, Math.ceil((4000 - observed.value) / 1000)));
+  const tick = () => { const [key, item] = timers.entries().next().value; timers.delete(key); now += item.delay; item.callback(); };
+  clock.start(4000); assert.equal(remaining.value, 3);
+  tick(); assert.equal(remaining.value, 2); tick(); assert.equal(remaining.value, 1); tick(); assert.equal(remaining.value, 0);
+  assert.equal(timers.size, 0, 'deadline ends the countdown without continuous polling');
+  clock.start(10000); const stale = [...timers.values()][0].callback;
+  clock.start(5000); assert.equal(timers.size, 1, 'replacement has one timer');
+  stale(); assert.equal(timers.size, 1, 'late replaced callback is inert');
+  clock.stop(); assert.equal(timers.size, 0);
+  stale(); assert.equal(timers.size, 0, 'unmounted or cancelled callback cannot restart itself');
+  const list = source('webview/src/components/conversation/ReliableMessageList.vue');
+  assert.match(list, /request\?\.status === 'retrying' && !hasLaterSegment\.value/);
+  assert.match(list, /else retryClock\.stop\(\)/);
+  assert.match(list, /onBeforeUnmount\(\(\) => retryClock\.stop\(\)\)/);
+  assert.match(list, /modelRequestRetryState\(latest, retryNow\.value\)/);
+});
+
+test('retry settings show the runtime ceiling and preserve explicit user retry budgets', async (context) => {
+  const server = await createViteServer(context);
+  const protocol = await server.ssrLoadModule('/@fs/' + path.join(ROOT, 'shared/protocol.ts'));
+  assert.equal(protocol.DEFAULT_LLM_RETRY_MAX_ATTEMPTS, 8);
+  assert.equal(protocol.normalizeLlmRetryMaxAttempts(undefined), undefined);
+  for (const count of [0, 1, 4, 8, 10]) assert.equal(protocol.normalizeLlmRetryMaxAttempts(count), count);
+  assert.equal(protocol.normalizeLlmRetryMaxAttempts(-1), 10);
+  assert.equal(protocol.normalizeLlmRetryMaxAttempts(999), 10);
+  const settings = source('webview/src/components/settings/global/LlmAdvancedConfigEditor.vue');
+  assert.doesNotMatch(settings, /无限重试/);
+  assert.match(settings, /min="0"/); assert.match(settings, /:max="MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS"/);
+  assert.match(settings, /不包含原始请求/);
+});
+
+test('actual message list renders safe retries for anchored and message-less failures', async (context) => {
+  const pinia = await import('pinia');
+  const { createSSRApp, nextTick } = await import('vue');
+  const { renderToString } = await import('@vue/server-renderer');
+  const previousPinia = pinia.getActivePinia();
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  globalThis.window = {
+    addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout, atob,
+    requestAnimationFrame(callback) { return setTimeout(() => callback(Date.now()), 0); },
+    cancelAnimationFrame: clearTimeout,
+    acquireVsCodeApi() { return { postMessage() {}, getState() { return {}; }, setState() {} }; }
+  };
+  context.after(() => {
+    pinia.setActivePinia(previousPinia);
+    if (previousWindow === undefined) delete globalThis.window; else globalThis.window = previousWindow;
+    if (previousDocument === undefined) delete globalThis.document; else globalThis.document = previousDocument;
+  });
+  const server = await createViteServer(context);
+  const { default: MessageList } = await server.ssrLoadModule('/src/components/conversation/ReliableMessageList.vue');
+  const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
+  globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
+  const isolated = pinia.createPinia();
+  pinia.setActivePinia(isolated);
+  const feed = useReliableKernelClientFeedStore();
+  feed.projections.activeConversationWindow = { conversationId: 'retry-render' };
+  feed.records = {
+    Turn: { turn: { id: 'turn', conversation_id: 'retry-render', status: 'terminated' } },
+    TurnTermination: { failure: { id: 'failure', turn_id: 'turn', terminal_status: 'failed',
+      reason: 'Provider retries exhausted: fixture 503', created_at: '2026-09-30T00:00:00.000Z' } },
+    ModelRequest: { request: { id: 'request', turn_id: 'turn', request_seq: '1',
+      status: 'terminal', terminal_state: 'provider_transient_temporary_service_error' } },
+    ModelContextProjection: { projection: { id: 'projection', owner_kind: 'model_request',
+      owner_id: 'request', root_id: 'root' } },
+    ConversationContextStatus: { head: { id: 'head', conversation_id: 'retry-render', root_id: 'root' } },
+    Message: {}, MessageTurnLink: {}
+  };
+  const warnings = [];
+  const render = async () => {
+    const app = createSSRApp(MessageList, {}).use(isolated);
+    app.config.warnHandler = message => warnings.push(message);
+    return renderToString(app);
+  };
+  const retryButtons = html => (html.match(/aria-label="重试本轮模型请求"/g) ?? []).length;
+  let html = await render();
+  assert.equal(retryButtons(html), 1, 'a retry Turn without a Message still has one recovery entry');
+  assert.match(html, /Provider retries exhausted: fixture 503/);
+  assert.doesNotMatch(html, /还没有消息，发一条试试/, 'failure rows replace the misleading empty-conversation hint');
+
+  feed.records.Message = { user: { id: 'user', conversation_id: 'retry-render', revision_id: 'revision',
+    role: 'user', message_seq: '1', created_at: '2026-09-29T23:59:00.000Z' } };
+  feed.records.MessageTurnLink = { link: { id: 'link', message_id: 'user', turn_id: 'turn', role: 'source' } };
+  await nextTick();
+  html = await render();
+  assert.equal(retryButtons(html), 1, 'the user-anchored path does not duplicate the failure retry');
+
+  feed.records.ConversationContextStatus.head.root_id = 'newer-root';
+  await nextTick();
+  html = await render();
+  assert.equal(retryButtons(html), 0, 'a stale root never renders an actionable retry');
+  assert.match(html, /上下文已改变/);
+  feed.records.ConversationContextStatus.head.root_id = 'root';
+  feed.records.Turn.newer = { id: 'newer', conversation_id: 'retry-render', status: 'active' };
+  await nextTick();
+  assert.equal(retryButtons(await render()), 0, 'an older failure cannot retry over a newer active Turn');
+  delete feed.records.Turn.newer;
+  feed.records.TurnTermination.failure.terminal_status = 'interrupted';
+  await nextTick();
+  assert.equal(retryButtons(await render()), 0, 'user cancellation does not become a failed-request retry');
+  assert.deepEqual(warnings, [], 'the actual component tree has no undeclared-prop or lifecycle warnings');
+});
+
+
+test('provider context overflow compression has an explicit trigger label', async (context) => {
+  const server = await createViteServer(context);
+  const { parseReliableCompressionRequestPurpose } = await server.ssrLoadModule('/src/domain/reliableCompressionProjection.ts');
+  const purpose = parseReliableCompressionRequestPurpose(JSON.stringify({
+    kind: 'context_compression', trigger: 'auto', requestKind: 'context_compression_pre',
+    blockId: 'block', methodKind: 'llm_summary', sourceSegmentCount: 4, triggerReason: 'provider_context_overflow'
+  }));
+  assert.equal(purpose.triggerReason, 'provider_context_overflow');
+  assert.match(source('webview/src/components/conversation/ReliableCompressionCard.vue'), /provider_context_overflow.*模型上下文超限后压缩/);
+});

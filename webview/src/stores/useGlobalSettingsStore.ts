@@ -12,6 +12,7 @@ import {
   normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
   DEFAULT_LLM_RETRY_MAX_ATTEMPTS,
+  normalizeLlmRetryMaxAttempts,
   DEFAULT_LLM_RETRY_DELAY_SECONDS,
   MAX_LLM_RETRY_DELAY_SECONDS,
   DEFAULT_LLM_RETRY_ON_ERROR,
@@ -424,11 +425,7 @@ function normalizeRetryDelaySeconds(value: unknown): number | undefined {
 }
 
 function normalizeRetryMaxAttempts(value: unknown): number | undefined {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return undefined;
-  const attempts = Math.floor(number);
-  if (attempts < -1) return -1;
-  return attempts;
+  return normalizeLlmRetryMaxAttempts(value);
 }
 
 function normalizeSystemPromptPrefix(value: unknown): string {

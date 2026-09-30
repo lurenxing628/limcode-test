@@ -51,6 +51,7 @@ import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
   modelRequestIdFor,
+  restoredProviderRequestFailure,
   NATIVE_CHAIN_REBASED_TERMINAL_STATE,
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
@@ -88,9 +89,10 @@ import {
   TurnControlPlane,
   type TurnInputCommand
 } from './turnControlPlane';
-import { frozenCompressionPolicy, readFrozenTurnAuthority } from './frozenAuthority';
+import { frozenCompressionPolicy, frozenProviderRetryPolicy, readFrozenTurnAuthority } from './frozenAuthority';
 import { assistantMessageIdFor, TurnOutputControlPlane } from './turnOutput';
-import { ExecutionEligibilityLostError, ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
+import { currentExecutionLeaseFence, ExecutionEligibilityLostError, ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
+import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
 import { childTaskTextForPreview } from './childSkillPreload';
 import type {
   CoordinateCompressionCommand,
@@ -115,6 +117,7 @@ export interface ReliableAgentProviderRegistry {
 
 export interface ReliableAgentCompressionCoordinator {
   coordinate(command: CoordinateCompressionCommand): Promise<CoordinateCompressionResult>;
+  recoverProviderContextOverflow?(input: { turnId: string; failedModelRequestId: string }): Promise<CoordinateCompressionResult>;
 }
 
 export interface ReliableAgentToolDispatchInput {
@@ -515,6 +518,30 @@ export class ReliableAgentLoop {
 
   public async drive(turnIdInput: string): Promise<ReliableAgentLoopResult> {
     const turnId = requireId(turnIdInput, 'turnId');
+    for (let retryNumber = 0; ; retryNumber += 1) {
+      try {
+        return await this.driveOnce(turnId, retryNumber < LOCAL_EXECUTION_MAX_RETRIES);
+      } catch (error) {
+        if (!isRetryableLocalExecutionError(error)) throw error;
+        if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
+        // Re-entry uses the last durable ModelRequest, assistant identity and Effect receipts.
+        // In particular a completed provider response is read from CAS, never requested again.
+        await waitForLocalExecutionRetry(retryNumber + 1, async () => {
+          try {
+            if (await this.terminateIfRequested(turnId, 'local-recovery-backoff')) return true;
+            await this.assertRecoveryStillOwned(turnId);
+            return false;
+          } catch (stopError) {
+            if (!isRetryableLocalExecutionError(stopError)) throw stopError;
+            return false;
+          }
+        });
+      }
+    }
+  }
+
+  private async driveOnce(turnIdInput: string, allowLocalRetry: boolean): Promise<ReliableAgentLoopResult> {
+    const turnId = requireId(turnIdInput, 'turnId');
     const modelRequestIds: string[] = [];
     const assistantMessageIds: string[] = [];
     const toolCallIds: string[] = [];
@@ -761,19 +788,32 @@ export class ReliableAgentLoop {
         }
         let dispatched: NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE;
         if (request.status === 'terminal') {
+          if (await this.recoverProviderContextOverflow(turnId, request)) {
+            requestSequence += 1n;
+            continue agentRounds;
+          }
           dispatched = request.terminal_state === NATIVE_CHAIN_REBASED_TERMINAL_STATE
             ? NATIVE_CHAIN_REBASED_TERMINAL_STATE
             : await this.readTerminalProviderOutput(modelRequestId);
         } else {
           this.observeLifecycle({ turnId, stage: 'provider_dispatch_started', round, modelRequestId });
-          dispatched = await this.dispatchAndCapture(
-            requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-            turnId,
-            modelRequestId,
-            request
-          );
+          try {
+            dispatched = await this.dispatchAndCapture(
+              requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
+              turnId,
+              modelRequestId,
+              request
+            );
+          } catch (error) {
+            if (isExecutionHandoffError(error)) throw error;
+            const failed = await this.requireExisting('ModelRequest', modelRequestId);
+            if (!await this.recoverProviderContextOverflow(turnId, failed)) throw error;
+            requestSequence += 1n;
+            continue agentRounds;
+          }
         }
         if (dispatched === NATIVE_CHAIN_REBASED_TERMINAL_STATE) {
+          await this.assertNativeErrorRebaseBudget(turnId, modelRequestId);
           // The sealed chain's items, admitted calls and closed results already live in Context;
           // the Turn continues with a new full request (where queued runtime input is absorbed).
           requestSequence += 1n;
@@ -1014,6 +1054,9 @@ export class ReliableAgentLoop {
       // Host shutdown / lease replacement is a recoverable transport handoff. Recording a failed
       // Turn here would destroy the exact durable frontier the next Host needs to resume.
       if (isExecutionHandoffError(error)) throw error;
+      // Local contention/resource pressure is not a model failure. Preserve the durable frontier
+      // for the bounded, cancellation-aware replay above; unknown/invariant errors fail closed.
+      if (allowLocalRetry && isRetryableLocalExecutionError(error)) throw error;
       let interruptionCheckError: unknown;
       try {
         if (await this.terminateIfRequested(turnId, 'drive-interrupted')) {
@@ -1162,6 +1205,9 @@ export class ReliableAgentLoop {
           boundaryKey
         }, previousTaskCard)
       : false;
+    const nativeErrorRecovery = nativeFreeze.nativeResponses
+      ? await this.readNativeErrorRecoveryBudget(input.turnId)
+      : undefined;
     return normalizePlainJson({
       kind: 'reliable-agent-turn',
       projectionRevision: '2026-08-21',
@@ -1184,6 +1230,7 @@ export class ReliableAgentLoop {
       } : {}),
       ...(nativeFreeze.turnReminderDelivery ? { turnReminderDelivery: nativeFreeze.turnReminderDelivery } : {}),
       ...(nativeFreeze.nativeResponses ? { nativeResponses: nativeFreeze.nativeResponses } : {}),
+      ...(nativeErrorRecovery && nativeErrorRecovery.failures > 0 ? { nativeErrorRecovery } : {}),
       ...(nativeFreeze.nativeReasoning ? { nativeReasoning: nativeFreeze.nativeReasoning } : {})
     }, 'Reliable Agent recipe');
   }
@@ -2590,6 +2637,72 @@ export class ReliableAgentLoop {
   }
 
   /**
+   * Error-driven native rebases cannot reset the frozen Provider retry budget by allocating a
+   * new ModelRequest. Derive it from durable failure/Attempt facts so a restart cannot reset it.
+   * Successful ordinary rounds reset this consecutive-failure budget; handoff-only rebases cost
+   * no extra retry and still preserve any failed Attempts that preceded the handoff.
+   */
+  private async assertNativeErrorRebaseBudget(turnId: string, modelRequestId: string): Promise<void> {
+    const recovery = await this.readNativeErrorRecoveryBudget(turnId);
+    if (recovery.failures === 0) return;
+    const request = await this.requireExisting('ModelRequest', modelRequestId);
+    const frozen = await readRequestTurnAuthority(this.database, this.contentStore,
+      requireId(request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'), turnId,
+      typeof request.settings_snapshot_object_id === 'string' ? request.settings_snapshot_object_id : undefined);
+    const policy = frozenProviderRetryPolicy(frozen.document);
+    const maxRetries = policy.enabled ? Math.min(policy.maxRetries, recovery.modelOutputRepair ? 2 : policy.maxRetries) : 0;
+    if (recovery.failures <= maxRetries) {
+      // A server minimum/backoff persisted before sealing survives restart. Native recovery may
+      // change request identity for safety, but must not use that to evade Retry-After.
+      const stats = asRecord(request.stream_stats_json);
+      const notBefore = typeof stats?.retryNotBeforeAt === 'number' ? stats.retryNotBeforeAt : 0;
+      while (Date.now() < notBefore) {
+        if (await this.terminateIfRequested(turnId, 'native-rebase-backoff')) return;
+        await this.assertRecoveryStillOwned(turnId);
+        await new Promise<void>(resolve => setTimeout(resolve, Math.min(250, notBefore - Date.now())));
+      }
+      return;
+    }
+    const failure = asRecord(asRecord(request.stream_stats_json)?.failure);
+    throw Object.assign(new Error(`Native request recovery exhausted its retry budget (${recovery.failures} failures). ${typeof failure?.message === 'string' ? failure.message : ''}`.trim()),
+      { code: 'PROVIDER_RECOVERY_BUDGET_EXHAUSTED' });
+  }
+
+  private async readNativeErrorRecoveryBudget(turnId: string): Promise<{ failures: number; modelOutputRepair: boolean }> {
+    const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
+      .sort((left, right) => compareInteger(right.request_seq, left.request_seq));
+    const recipes = await this.readModelRequestRecipes(requests);
+    let failures = 0;
+    let modelOutputRepair = false;
+    for (const request of requests) {
+      if (recipes.get(requireId(request.id, 'ModelRequest.id'))?.kind !== 'reliable-agent-turn') continue;
+      if (request.terminal_state === 'completed' || request.status !== 'terminal') break;
+      const stats = asRecord(request.stream_stats_json);
+      const failure = asRecord(stats?.failure);
+      const attempts = Number(reliableDecimal(stats?.attemptSeq));
+      failures += Math.max(0, attempts - 1);
+      if (failure?.category === 'transient' || failure?.code === 'CONTEXT_WINDOW_EXCEEDED') {
+        failures += 1;
+        modelOutputRepair ||= failure.code === 'PROVIDER_MODEL_OUTPUT_INVALID';
+      }
+    }
+    return { failures, modelOutputRepair };
+  }
+
+  /** Read-only backoffs still belong to the original execution generation and Host lifecycle. */
+  private async assertRecoveryStillOwned(turnId: string): Promise<void> {
+    this.modelProvider.assertNotHandingOff();
+    const fence = currentExecutionLeaseFence();
+    if (!fence) return;
+    const current = await this.turns.executionLeaseFence({
+      turnId, leaseOwnerId: fence.ownerId, hostBootId: fence.hostBootId
+    });
+    if (!current || current.id !== fence.id || current.generation !== fence.generation) {
+      throw new ExecutionHandoffError('ExecutionLease changed during recovery backoff.');
+    }
+  }
+
+  /**
    * Model/channel switch guard before a new frozen provider request: fully context-closed native
    * calls never block; unsettled or occurrence-missing calls and in-flight steering owned by a
    * different provider/model reject the switch (never a silent drop). Configuration saves stay
@@ -2913,6 +3026,11 @@ export class ReliableAgentLoop {
   }
 
   private async readTerminalProviderOutput(modelRequestId: string): Promise<NormalizedProviderOutput> {
+    const request = await this.requireExisting('ModelRequest', modelRequestId);
+    if (request.status === 'terminal' && request.terminal_state !== 'completed') {
+      const failure = asRecord(request.stream_stats_json)?.failure;
+      if (failure !== undefined) throw restoredProviderRequestFailure(failure, String(request.terminal_state));
+    }
     const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: modelRequestId }, 512);
     const terminal = checkpoints
       .filter((row) => row.checkpoint_kind === 'terminal_summary')
@@ -2924,6 +3042,30 @@ export class ReliableAgentLoop {
     const record = requireRecord(envelope, 'Model terminal checkpoint');
     if (record.kind !== 'completed') throw new Error('Model terminal checkpoint is not a completed event.');
     return normalizeProviderOutput(record.content);
+  }
+
+  /** Provider rejection repairs the Context once per failed immutable request, never its payload. */
+  private async recoverProviderContextOverflow(turnId: string, request: DomainRow): Promise<boolean> {
+    if (request.status !== 'terminal' || request.terminal_state === 'completed'
+      || asRecord(asRecord(request.stream_stats_json)?.failure)?.code !== 'CONTEXT_WINDOW_EXCEEDED'
+      || !this.compressionCoordinator.recoverProviderContextOverflow) return false;
+    const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
+      .sort((left, right) => compareInteger(right.request_seq, left.request_seq));
+    // Paid repair is bounded across restart, but a genuinely successful ordinary round resets
+    // the consecutive-failure budget. A long productive Turn may need compression again later.
+    const recipes = await this.readModelRequestRecipes(requests);
+    let failures = 0;
+    for (const candidate of requests) {
+      if (recipes.get(requireId(candidate.id, 'ModelRequest.id'))?.kind !== 'reliable-agent-turn') continue;
+      if (candidate.terminal_state === 'completed') break;
+      if (asRecord(asRecord(candidate.stream_stats_json)?.failure)?.code === 'CONTEXT_WINDOW_EXCEEDED') failures += 1;
+    }
+    if (failures > 2) return false;
+    if (await this.terminateIfRequested(turnId, 'before-context-overflow-recovery')) return false;
+    const recovered = await this.compressionCoordinator.recoverProviderContextOverflow({
+      turnId, failedModelRequestId: requireId(request.id, 'ModelRequest.id')
+    });
+    return recovered.status === 'compressed';
   }
 
   private async readRoundFacts(turnId: string): Promise<{ turn: DomainRow; authority: DomainRow; head: DomainRow }> {

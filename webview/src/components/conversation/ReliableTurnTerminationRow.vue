@@ -1,16 +1,34 @@
 <script setup lang="ts">
-import { computed } from 'vue';
-import { IconAlertTriangle, IconX } from '@tabler/icons-vue';
+import { computed, ref, watch } from 'vue';
+import { IconAlertTriangle, IconRefresh, IconX } from '@tabler/icons-vue';
 import type { RunTerminationRecord } from '@shared/protocol';
+import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 
-const props = defineProps<{ termination: RunTerminationRecord }>();
-const emit = defineEmits<{ (event: 'dismiss'): void }>();
+const props = defineProps<{
+  termination: RunTerminationRecord;
+  title?: string;
+  retryModelRequestId?: string;
+  retryBlockedReason?: string;
+  retryPending?: boolean;
+}>();
+const emit = defineEmits<{ (event: 'dismiss'): void; (event: 'retry', modelRequestId: string): void }>();
+const confirmingRequestId = ref<string>();
+const retryBlocked = computed(() => props.retryPending || !props.retryModelRequestId || Boolean(props.retryBlockedReason));
+watch(() => [props.retryModelRequestId, props.retryBlockedReason, props.retryPending, props.termination.id], () => {
+  confirmingRequestId.value = undefined;
+});
+function confirmRetry(): void {
+  const requestId = confirmingRequestId.value;
+  confirmingRequestId.value = undefined;
+  if (retryBlocked.value || !requestId || requestId !== props.retryModelRequestId) return;
+  emit('retry', requestId);
+}
 
-const title = computed(() => props.termination.kind === 'failed'
+const title = computed(() => props.title ?? (props.termination.kind === 'failed'
   ? '本轮执行失败'
   : props.termination.kind === 'cancelled'
     ? '本轮已取消'
-    : '本轮已中断');
+    : '本轮已中断'));
 const detail = computed(() => props.termination.detail?.trim() || props.termination.reasonCode);
 </script>
 
@@ -22,6 +40,12 @@ const detail = computed(() => props.termination.detail?.trim() || props.terminat
     <div class="reliable-termination-content">
       <strong>{{ title }}</strong>
       <p>{{ detail }}</p>
+      <p v-if="retryBlockedReason" class="reliable-retry-explanation">{{ retryBlockedReason }}</p>
+      <button v-if="retryModelRequestId" type="button" class="reliable-termination-retry"
+        :disabled="retryBlocked" aria-label="重试本轮模型请求"
+        @click="confirmingRequestId = retryModelRequestId">
+        <IconRefresh :size="14" aria-hidden="true" />{{ retryPending ? '正在提交重试' : '重试模型请求' }}
+      </button>
     </div>
     <button
       type="button"
@@ -32,9 +56,27 @@ const detail = computed(() => props.termination.detail?.trim() || props.terminat
       <IconX :size="15" stroke="1.9" />
     </button>
   </article>
+  <ConfirmPanel :open="Boolean(confirmingRequestId)" title="重试模型请求？"
+    description="将从这次请求的上下文重新生成回复。已经写入上下文的工具结果会保留；模型仍可能提出新的工具调用。"
+    confirm-label="重试" @cancel="confirmingRequestId = undefined" @confirm="confirmRetry" />
 </template>
 
 <style scoped>
+.reliable-termination-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+  padding: 4px 8px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+}
+.reliable-termination-retry:disabled { opacity: 0.55; cursor: default; }
+.reliable-termination-retry:not(:disabled):hover { background: color-mix(in srgb, var(--vscode-editor-background) 88%, var(--vscode-foreground) 12%); }
+.reliable-retry-explanation { margin-top: var(--space-1); }
+
 .reliable-termination-row {
   display: flex;
   align-items: flex-start;
