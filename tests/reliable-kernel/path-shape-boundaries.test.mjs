@@ -147,20 +147,41 @@ test('Windows 只在路径到句柄比较时接受卷序列号的 64/32 位差�
     assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, [field]: descriptor[field] + 1n }, 'win32'), false, field);
   }
   assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, dev: pathname.dev + (1n << 32n) }, 'win32'), false);
-  assert.equal(fileDescriptorMatchesPathState(identityStat({ dev: 0n }), descriptor, 'win32'), false, 'zero is not an unknown-device wildcard');
+  assert.equal(fileDescriptorMatchesPathState(descriptor, identityStat({ dev: 0n }), 'win32'), false, 'descriptor zero is not a wildcard');
   assert.equal(fileDescriptorMatchesPathState(undefined, descriptor, 'win32'), false);
   assert.equal(fileDescriptorMatchesPathState(identityStat({ isFile: () => false }), descriptor, 'win32'), false);
   assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, isFile: () => false }, 'win32'), false);
+});
+
+test('Windows 路径缺少卷序列号时仍核对 inode、类型、长度与纳秒时间，句柄的零设备号不能反向放行', () => {
+  // Exact guarded fields from the Windows Server 2025 / Node 22.15.1 / libuv 1.49.2 CI failure.
+  const pathname = identityStat({ dev: 0n, ino: 1125899908206697n, mode: 33206n, size: 5n,
+    mtimeNs: 1790777305120301700n, ctimeNs: 1790777305120301700n });
+  const descriptor = { ...pathname, dev: 742408122n };
+  for (const platform of ['win32', 'linux', 'darwin']) {
+    assert.equal(fileDescriptorMatchesPathState(pathname, descriptor, platform), platform === 'win32');
+    assert.equal(fileDescriptorMatchesPathState(descriptor, pathname, platform), false);
+  }
+  for (const field of ['ino', 'mode', 'size', 'mtimeNs', 'ctimeNs']) {
+    assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, [field]: descriptor[field] + 1n }, 'win32'), false, field);
+  }
+  assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, dev: -1n }, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, dev: 1n << 32n }, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState({ ...pathname, dev: 1n << 32n }, pathname, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState({ ...pathname, dev: descriptor.dev + 1n }, descriptor, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState(pathname, { ...descriptor, isFile: () => false }, 'win32'), false);
+  assert.equal(fileDescriptorMatchesPathState({ ...pathname, isFile: () => false }, descriptor, 'win32'), false);
 });
 
 test('Windows 读取栅栏分别保留路径与句柄的完整设备身份', async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform');
   Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
   t.after(() => Object.defineProperty(process, 'platform', platform));
-  for (const changed of ['none', 'pathname-high-bits', 'descriptor-high-bits', 'non-regular']) {
-    await t.test(changed, async (sub) => {
-      const pathname = identityStat();
-      const descriptor = identityStat({ dev: BigInt.asUintN(32, pathname.dev), isFile: () => changed !== 'non-regular' });
+  for (const pathnameDevice of ['missing', 'full-width']) for (const changed of ['none', 'pathname-high-bits', 'descriptor-high-bits', 'non-regular']) {
+    await t.test(`${pathnameDevice}: ${changed}`, async (sub) => {
+      const pathname = identityStat(pathnameDevice === 'missing' ? { dev: 0n } : {});
+      const descriptor = identityStat({ dev: pathnameDevice === 'missing' ? 742408122n : BigInt.asUintN(32, pathname.dev),
+        isFile: () => changed !== 'non-regular' });
       let stats = 0, reads = 0, closes = 0;
       sub.mock.method(fs, 'open', async () => ({
         async stat() { return ++stats === 2 && changed === 'descriptor-high-bits'
@@ -202,15 +223,15 @@ test('原生文件身份允许读取与替换未变化的普通文件（Windows 
   assert.equal(await fs.readFile(fixture.target, 'utf8'), 'replaced');
 });
 
-test('Windows 替换栅栏允许 64/32 位卷序列号差异，但拒绝任何单接口身份变化', async (t) => {
+test('Windows 替换栅栏允许路径卷序列号缺失或位宽不同，但拒绝任何单接口身份变化', async (t) => {
   const platform = Object.getOwnPropertyDescriptor(process, 'platform');
   Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
   t.after(() => Object.defineProperty(process, 'platform', platform));
-  for (const changed of ['none', 'pathname-high-bits', 'descriptor-high-bits']) {
-    await t.test(changed, async (sub) => {
+  for (const pathnameDevice of ['missing', 'full-width']) for (const changed of ['none', 'pathname-high-bits', 'descriptor-high-bits']) {
+    await t.test(`${pathnameDevice}: ${changed}`, async (sub) => {
       const fixture = await replacementFixture(sub);
-      const pathnameDev = 0x1234_5678_89ab_cdefn;
-      const descriptorDev = BigInt.asUintN(32, pathnameDev);
+      const pathnameDev = pathnameDevice === 'missing' ? 0n : 0x1234_5678_89ab_cdefn;
+      const descriptorDev = pathnameDevice === 'missing' ? 742408122n : BigInt.asUintN(32, pathnameDev);
       const realLstat = fs.lstat, realOpen = fs.open;
       let writableStats = 0;
       sub.mock.method(fs, 'lstat', async (target, ...args) => {

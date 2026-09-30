@@ -139,12 +139,16 @@ export function fileDescriptorMatchesPathState(
   platform: NodeJS.Platform = process.platform
 ): boolean {
   if (!expected?.isFile() || !opened.isFile()) return false;
-  // Older Windows libuv returns a 64-bit volume serial from GetFileInformationByName,
-  // but only its low 32 bits from NtQueryVolumeInformationFile for an open handle.
+  // Windows GetFileInformationByName may omit the pathname volume serial (dev=0,
+  // observed on libuv 1.49.2); fstat gets a real 32-bit serial from
+  // NtQueryVolumeInformationFile. Other versions also differ in serial width.
+  // Only this pathname-to-descriptor bridge treats zero as unavailable. Both
+  // same-interface fences must still compare the complete, original device IDs.
+  // https://github.com/nodejs/node/blob/v22.15.1/deps/uv/src/win/fs.c#L1573-L1655
   // https://github.com/libuv/libuv/commit/82cdfb75f
   const sameDevice = expected.dev === opened.dev || (platform === 'win32'
-    && expected.dev > 0xffff_ffffn && opened.dev >= 0n && opened.dev <= 0xffff_ffffn
-    && BigInt.asUintN(32, expected.dev) === opened.dev);
+    && opened.dev > 0n && opened.dev <= 0xffff_ffffn
+    && (expected.dev === 0n || (expected.dev > 0xffff_ffffn && BigInt.asUintN(32, expected.dev) === opened.dev)));
   return sameDevice && expected.ino === opened.ino && expected.mode === opened.mode
     && expected.size === opened.size && expected.mtimeNs === opened.mtimeNs && expected.ctimeNs === opened.ctimeNs;
 }

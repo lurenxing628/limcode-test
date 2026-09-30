@@ -171,20 +171,26 @@ for (const blocked of ['unknown', 'busy']) {
       const owners = h.app.database.conversationOwners;
       const tryClaim = owners.tryClaimEligible.bind(owners);
       let blockedNow = true;
-      let probes = 0;
+      let admissionClaims = 0;
       if (blocked === 'unknown') owners.setClaimEligibilityProbe(async () => {
-        probes += 1;
         if (blockedNow) throw new Error('Transient workspace read failure');
         return true;
       });
-      else owners.tryClaimEligible = async id => {
-        probes += 1;
-        return blockedNow ? 'busy' : tryClaim(id);
+      owners.tryClaimEligible = async id => {
+        assert.equal(id, h.conversationId);
+        admissionClaims += 1;
+        return blocked === 'busy' && blockedNow ? 'busy' : tryClaim(id);
       };
+      // Commit-triggered idle sweeps also ask the eligibility probe whether to keep an owner.
+      // Force those unrelated checks before recovery; they must not be mistaken for admission
+      // retries or make this bound depend on whether a background cleanup timer happened to run.
+      await owners.sweepIdle();
+      await owners.sweepIdle();
+      assert.equal(admissionClaims, 0, 'idle cleanup never attempts queued admission');
       await h.runner.recoverStartup(undefined, blocked === 'busy' ? h.conversationId : undefined);
       assert.ok(h.runner.admissionRetries.get(h.conversationId)?.timer, 'the queued-only candidate retains its retry timer');
       assert.equal(h.runner.admissionRetries.get(h.conversationId).failures, 1);
-      assert.ok(probes >= 1 && probes <= 2, 'initial claim and possible idle-release recheck stay bounded');
+      assert.equal(admissionClaims, 1, 'the initial recovery pass attempts admission exactly once before backoff');
       assert.equal(h.providerCalls, 0);
       blockedNow = false;
       // Only the existing backoff timer may wake admission; no resume, rescan, or new input.
