@@ -24,6 +24,15 @@ const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/reliableQueueOrdering.test.ts'
 ]);
 const CI_TEST_FILES = Object.freeze([
+  'tests/reliable-kernel/composer-attachment-authority.test.mjs',
+  'tests/reliable-kernel/conversation-owner-release.test.mjs',
+  'tests/reliable-kernel/diagnostic-inspection-progress.test.mjs',
+  'tests/reliable-kernel/foreign-file-volume-identity.test.mjs',
+  'tests/reliable-kernel/large-merge-device-identity.test.mjs',
+  'tests/reliable-kernel/mutable-process-detail-refresh.test.mjs',
+  'tests/reliable-kernel/native-callback-authority.test.mjs',
+  'tests/reliable-kernel/runtime-owner-close-retry.test.mjs',
+  'tests/reliable-kernel/sqlite-file-guard-admission.test.mjs',
   'tests/bottomStickyScrollerScheduler.test.cjs',
   'tests/commandRelaxedPolicy.test.cjs',
   'tests/fileWatcherScope.test.cjs',
