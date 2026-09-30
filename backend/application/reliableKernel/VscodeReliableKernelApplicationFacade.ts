@@ -119,6 +119,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private historyRefresh: Promise<void> | undefined;
   private historyRefreshPending = false;
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private interactionAttentionRefresh: Promise<void> | undefined;
+  private interactionAttentionRefreshPending = false;
   private interactionAttentionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private hydration: Promise<void> | undefined;
   private unsubscribeCommit: (() => void) | undefined;
@@ -867,6 +869,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     // Closing the product below rejects/settles ordinary database work; keep rejection observed.
     void this.hydration?.catch(() => undefined);
     void this.historyRefresh?.catch(() => undefined);
+    void this.interactionAttentionRefresh?.catch(() => undefined);
     for (const clientId of [...this.webviews.keys()]) this.detachWebview(clientId);
     this.historyEmitter.dispose();
     this.historyRevealEmitter.dispose();
@@ -900,7 +903,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       'RuntimeDeliveryInputLink',
       'PendingTurnInput'
     ].includes(change.domain))) return;
-    if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
+    // Preserve the first deadline; sustained commits must not starve the sidebar.
+    if (this.historyRefreshTimer !== undefined) return;
     this.historyRefreshTimer = setTimeout(() => {
       this.historyRefreshTimer = undefined;
       void this.refreshConversationHistory().catch((error) => {
@@ -910,9 +914,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   private scheduleInteractionAttentionRefresh(): void {
-    if (this.interactionAttentionRefreshTimer !== undefined) {
-      clearTimeout(this.interactionAttentionRefreshTimer);
-    }
+    if (this.disposed || this.interactionAttentionRefreshTimer !== undefined) return;
     this.interactionAttentionRefreshTimer = setTimeout(() => {
       this.interactionAttentionRefreshTimer = undefined;
       void this.refreshInteractionAttention().catch((error) => {
@@ -922,14 +924,26 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   /** Only the Host holding the owner Turn's ExecutionLease announces a pending ASK/Plan. */
-  private async refreshInteractionAttention(): Promise<void> {
-    const database = this.product.application.database;
-    const pending = await readPendingInteractionAttention(database, database.hostBootId);
-    if (this.disposed) return;
-    this.interactionAttentionNotifier.synchronize(pending);
+  private refreshInteractionAttention(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
+    if (this.interactionAttentionRefresh) {
+      this.interactionAttentionRefreshPending = true;
+      return this.interactionAttentionRefresh;
+    }
+    this.interactionAttentionRefresh = (async () => {
+      do {
+        this.interactionAttentionRefreshPending = false;
+        const database = this.product.application.database;
+        const pending = await readPendingInteractionAttention(database, database.hostBootId);
+        if (this.disposed) return;
+        this.interactionAttentionNotifier.synchronize(pending);
+      } while (this.interactionAttentionRefreshPending);
+    })().finally(() => { this.interactionAttentionRefresh = undefined; });
+    return this.interactionAttentionRefresh;
   }
 
   private refreshConversationHistory(): Promise<void> {
+    if (this.disposed) return Promise.resolve();
     if (this.historyRefresh) {
       // A commit may arrive while CAS-backed previews are still being read. Remember that edge so
       // the exact delivery/handled state cannot remain stuck at the older snapshot indefinitely.
@@ -948,6 +962,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   private async readConversationHistory(): Promise<void> {
     const page = await this.queryConversationHistoryPage({ kind: 'all' }, undefined, DEFAULT_HISTORY_PAGE_SIZE);
+    if (this.disposed) return;
     this.historyEntries = page.entries;
     this.originLinks = page.originLinks;
     this.historyEmitter.fire();

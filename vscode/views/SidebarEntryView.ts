@@ -88,6 +88,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   private lastCursor: string | undefined;
   private activeWebview: vscode.Webview | undefined;
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private historyRefreshDirty = false;
+  private historyRefreshInFlight = false;
   private historyRequestSeq = 0;
   private lastStateMessage: SidebarStateMessage | undefined;
   private backendApp: ApplicationFacade | undefined;
@@ -133,6 +135,8 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
 
   public dispose(): void {
     this.disposed = true;
+    this.historyRefreshDirty = false;
+    this.historyRequestSeq += 1;
     if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
     this.historyRefreshTimer = undefined;
     this.historySubscription?.dispose();
@@ -145,7 +149,12 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
     this.activeWebview = webviewView.webview;
     webviewView.onDidDispose(() => {
-      if (this.activeWebview === webviewView.webview) this.activeWebview = undefined;
+      if (this.activeWebview !== webviewView.webview) return;
+      this.activeWebview = undefined;
+      this.historyRequestSeq += 1;
+      this.historyRefreshDirty = false;
+      if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
+      this.historyRefreshTimer = undefined;
     });
 
     if (this.unavailableMessage) {
@@ -274,22 +283,33 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
   }
 
   private postSidebarStateWhenReady(webview: vscode.Webview, scopeKind: SidebarHistoryScopeKind = 'currentProject', cursor?: string, limit?: number, projectFolderUri?: string): Promise<void> {
-    this.activeWebview = webview;
+    if (this.disposed || this.activeWebview !== webview) return Promise.resolve();
     const requestSeq = ++this.historyRequestSeq;
     return this.postSidebarState(webview, scopeKind, cursor, limit, projectFolderUri, requestSeq)
       .catch((error) => {
+        if (this.disposed || this.activeWebview !== webview || requestSeq !== this.historyRequestSeq) return;
         console.warn('[LimCode] Failed to read sidebar state.', error);
         this.renderUnavailable(error instanceof Error ? error.message : String(error));
       });
   }
 
   private scheduleConversationHistoryRefresh(): void {
-    if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
+    if (this.disposed || !this.activeWebview) return;
+    this.historyRefreshDirty = true;
+    // Keep the first deadline: a continuous event stream must not postpone the visible refresh.
+    // Serialize automatic reads too, so slow reads are not perpetually superseded by newer ones.
+    if (this.historyRefreshTimer !== undefined || this.historyRefreshInFlight) return;
     this.historyRefreshTimer = setTimeout(() => {
       this.historyRefreshTimer = undefined;
       const target = this.activeWebview;
-      if (!target) return;
-      this.postSidebarStateWhenReady(target, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri);
+      if (this.disposed || !target) return;
+      this.historyRefreshDirty = false;
+      this.historyRefreshInFlight = true;
+      void this.postSidebarStateWhenReady(target, this.lastScopeKind, this.lastCursor, undefined, this.lastProjectFolderUri)
+        .finally(() => {
+          this.historyRefreshInFlight = false;
+          if (this.historyRefreshDirty) this.scheduleConversationHistoryRefresh();
+        });
     }, 180);
   }
 
@@ -440,7 +460,7 @@ class SidebarEntryViewProvider implements vscode.WebviewViewProvider, vscode.Dis
     this.lastCursor = cursor;
     const backendApp = await this.application();
     const history = await backendApp.getConversationHistoryPage({ scopeKind, projectFolderUri, cursor, limit });
-    if (requestSeq !== this.historyRequestSeq) {
+    if (this.disposed || this.activeWebview !== webview || requestSeq !== this.historyRequestSeq) {
       return;
     }
     // Later refreshes re-send the page the backend actually resolved (clamped or re-positioned).

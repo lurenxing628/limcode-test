@@ -12,6 +12,7 @@ import {
 } from './repositories';
 import { RootAuthority, sameBindingIdentity } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { VerifiedContentRanges } from './verifiedContentRanges';
 
 export interface PublishedContent {
   contentType: string;
@@ -93,6 +94,12 @@ const VERIFIED_READ_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const VERIFIED_READ_CACHE_MAX_SINGLE_BYTES = 64 * 1024 * 1024;
 
 export class ContentAddressedStore {
+  private readonly verifiedRanges = new VerifiedContentRanges();
+
+  public inspectRangeReadCache(): ReturnType<VerifiedContentRanges['inspect']> {
+    return this.verifiedRanges.inspect();
+  }
+
   /** Only fully length/digest-verified immutable bytes enter this cache. Callers receive copies. */
   private readonly verifiedReadCache = new Map<string, VerifiedContentReadCacheEntry>();
   private readonly verifiedReadFlights = new Map<string, VerifiedContentReadFlight>();
@@ -304,10 +311,13 @@ export class ContentAddressedStore {
     if (!Number.isSafeInteger(totalBytes)) throw new RangeError('CAS object is too large for chunk addressing.');
     if (offset > totalBytes) throw new RangeError('CAS chunk offset exceeds object length.');
     const length = Math.min(maxBytes, totalBytes - offset);
-    // The first range verifies the complete immutable object. Later ranges reuse those exact
-    // verified bytes, rather than reading and hashing the complete file once per 256 KiB page.
-    const verified = await this.readVerifiedObject(metadata);
-    const chunk = Buffer.from(verified.subarray(offset, offset + length));
+    // Stream-verify once per unchanged file identity, then read only the requested range. This
+    // remains bounded for oversized objects and interleaved readers that exceed the byte cache.
+    const chunk = await this.verifiedRanges.read(
+      path.resolve(this.binding.paths.casRootPath), absoluteCasPath(this.binding, expectedKey),
+      metadata.sha256, metadata.byte_length, offset, length
+    );
+    await this.authority.validate(this.binding);
     const nextOffset = offset + length;
     const hasMore = nextOffset < totalBytes;
     return {

@@ -16,7 +16,7 @@ import {
   type ReliableKernelTurnIntentPreview
 } from '../../shared/reliableKernelClientFeed';
 import type { PlainData } from '../../shared/plainData';
-import { buildFileDiffRecord } from '../capabilities/fileDiff';
+import { buildFileDiffRecordAsync, FileDiffPreviewBusyError, FileDiffPreviewTooLargeError } from '../capabilities/fileDiffAsync';
 import {
   initialGuidancePosition,
   parseInputTurnIntentEnvelopeText,
@@ -1252,6 +1252,9 @@ interface MessageContentMetadataWaiter {
   reject(error: unknown): void;
 }
 
+const FILE_DIFF_INPUT_BYTES = 32 * 1024 * 1024;
+const FILE_DIFF_DETAIL_CACHE_ENTRIES = 16;
+const FILE_DIFF_DETAIL_CACHE_BYTES = 4 * 1024 * 1024;
 const PROCESS_DETAIL_INDEX_CACHE_ENTRIES = 8;
 const MESSAGE_CONTENT_METADATA_CACHE_ENTRIES = 1_024;
 const TURN_INTENT_PREVIEW_TEXT_CHARACTERS = 512;
@@ -1260,6 +1263,11 @@ const TURN_INTENT_SOURCE_ARGUMENTS_MAX_BYTES = 64 * 1024;
 
 /** On-demand CAS detail reader with an actual wire-byte response cap. */
 export class ClientDetailReader {
+  /** Immutable member/CAS identities; every access still verifies the member exists. */
+  private readonly fileDiffDetails = new Map<string, { identity: string; bytes: Buffer }>();
+  private fileDiffDetailBytes = 0;
+  private fileDiffInputBytes = 0;
+  private readonly pendingFileDiffDetails = new Map<string, { identity: string; result: Promise<Buffer> }>();
   /** Rebuildable chunk metadata only; output bytes remain in CAS and are read one requested page at a time. */
   private readonly processOutputIndexes = new Map<string, ProcessOutputDetailIndex>();
   private readonly processOutputReconciliations = new Map<string, Promise<ProcessDetailReconciliation>>();
@@ -1798,26 +1806,81 @@ export class ClientDetailReader {
     const member = await this.requireExisting('FileChangeSetMember', recordId);
     const operation = requireFileChangeOperation(member.operation);
     const targetPath = requirePhaseFText(member.target_path, 'FileChangeSetMember.target_path');
-    const baseContent = await this.readOptionalContent(member.base_content_object_id, 'FileChangeSetMember.base_content_object_id');
-    const targetContent = await this.readOptionalContent(member.target_content_object_id, 'FileChangeSetMember.target_content_object_id');
-    const before = decodeUtf8DiffContent(baseContent, 'base');
-    const after = decodeUtf8DiffContent(targetContent, 'target');
-    const diff = operation === 'create_directory' || operation === 'delete_directory_tree'
-      ? undefined
-      : buildFileDiffRecord(targetPath, before, after, operation !== 'create_file');
-    return Buffer.from(JSON.stringify(toWirePlain({
-      memberId: recordId,
-      operation,
-      path: targetPath,
-      action: operation === 'create_file'
-        ? 'created'
-        : operation === 'delete_file' || operation === 'delete_directory_tree'
-          ? 'deleted'
-          : operation === 'create_directory'
-            ? 'created-directory'
-            : 'modified',
-      ...(diff ? { diff } : {})
-    })), 'utf8');
+    const identity = JSON.stringify([operation, targetPath, member.base_content_object_id, member.target_content_object_id]);
+    const cached = this.fileDiffDetails.get(recordId);
+    if (cached?.identity === identity) {
+      this.fileDiffDetails.delete(recordId);
+      this.fileDiffDetails.set(recordId, cached);
+      return cached.bytes;
+    }
+    const pending = this.pendingFileDiffDetails.get(recordId);
+    if (pending?.identity === identity) return pending.result;
+    // Concurrent first pages share reads and diff work; limit outstanding CAS reads
+    // as well as the downstream worker queue, which has its own byte admission.
+    if (this.pendingFileDiffDetails.size >= FILE_DIFF_DETAIL_CACHE_ENTRIES) {
+      throw new FileDiffPreviewBusyError();
+    }
+    const result = this.buildFileChangeDiff(recordId, member, operation, targetPath).then((bytes) => {
+      const prior = this.fileDiffDetails.get(recordId);
+      if (prior) {
+        this.fileDiffDetailBytes -= prior.bytes.length;
+        this.fileDiffDetails.delete(recordId);
+      }
+      if (bytes.length <= FILE_DIFF_DETAIL_CACHE_BYTES) {
+        while (this.fileDiffDetails.size >= FILE_DIFF_DETAIL_CACHE_ENTRIES
+          || this.fileDiffDetailBytes + bytes.length > FILE_DIFF_DETAIL_CACHE_BYTES) {
+          const oldest = this.fileDiffDetails.keys().next().value as string | undefined;
+          if (oldest === undefined) break;
+          this.fileDiffDetailBytes -= this.fileDiffDetails.get(oldest)!.bytes.length;
+          this.fileDiffDetails.delete(oldest);
+        }
+        this.fileDiffDetails.set(recordId, { identity, bytes });
+        this.fileDiffDetailBytes += bytes.length;
+      }
+      return bytes;
+    }).finally(() => {
+      if (this.pendingFileDiffDetails.get(recordId)?.result === result) this.pendingFileDiffDetails.delete(recordId);
+    });
+    this.pendingFileDiffDetails.set(recordId, { identity, result });
+    return result;
+  }
+
+  private async buildFileChangeDiff(
+    recordId: string, member: DomainRow, operation: ReturnType<typeof requireFileChangeOperation>, targetPath: string
+  ): Promise<Buffer> {
+    const base = await this.readOptionalContentMetadata(member.base_content_object_id, 'FileChangeSetMember.base_content_object_id');
+    const target = await this.readOptionalContentMetadata(member.target_content_object_id, 'FileChangeSetMember.target_content_object_id');
+    // Reserve before reading CAS: buffers + worst-case decoded UTF-16 strings.
+    const reserved = 3n * ((base ? requireRuntimeNonNegativeBigInt(base.byte_length, 'base.byte_length') : 0n)
+      + (target ? requireRuntimeNonNegativeBigInt(target.byte_length, 'target.byte_length') : 0n));
+    if (reserved > BigInt(FILE_DIFF_INPUT_BYTES)) throw new FileDiffPreviewTooLargeError();
+    if (reserved > BigInt(FILE_DIFF_INPUT_BYTES - this.fileDiffInputBytes)) throw new FileDiffPreviewBusyError();
+    const reservedBytes = Number(reserved);
+    this.fileDiffInputBytes += reservedBytes;
+    try {
+      const baseContent = base ? await this.contentStore.read(base) : Buffer.alloc(0);
+      const targetContent = target ? await this.contentStore.read(target) : Buffer.alloc(0);
+      const before = decodeUtf8DiffContent(baseContent, 'base');
+      const after = decodeUtf8DiffContent(targetContent, 'target');
+      const diff = operation === 'create_directory' || operation === 'delete_directory_tree'
+        ? undefined
+        : await buildFileDiffRecordAsync(targetPath, before, after, operation !== 'create_file');
+      return Buffer.from(JSON.stringify(toWirePlain({
+        memberId: recordId,
+        operation,
+        path: targetPath,
+        action: operation === 'create_file'
+          ? 'created'
+          : operation === 'delete_file' || operation === 'delete_directory_tree'
+            ? 'deleted'
+            : operation === 'create_directory'
+              ? 'created-directory'
+              : 'modified',
+        ...(diff ? { diff } : {})
+      })), 'utf8');
+    } finally {
+      this.fileDiffInputBytes -= reservedBytes;
+    }
   }
 
   private async materializeTurnIntentPreview(
@@ -2055,10 +2118,9 @@ export class ClientDetailReader {
     }
   }
 
-  private async readOptionalContent(value: unknown, label: string): Promise<Buffer> {
-    if (value === null) return Buffer.alloc(0);
-    const metadata = await this.requireExisting('ContentObject', requirePhaseFId(value, label)) as ContentObjectMetadata;
-    return this.contentStore.read(metadata);
+  private async readOptionalContentMetadata(value: unknown, label: string): Promise<ContentObjectMetadata | null> {
+    if (value === null) return null;
+    return await this.requireExisting('ContentObject', requirePhaseFId(value, label)) as ContentObjectMetadata;
   }
 
   private async resolveContentObjectId(

@@ -21,15 +21,14 @@ interface NumberedDiffOp extends RawDiffOp {
 }
 
 export function buildFileDiffRecord(filePath: string, before: string, after: string, existed: boolean): FsFileDiffRecord | undefined {
-  const text = buildUnifiedLineDiff(filePath, before, after, existed, DEFAULT_DIFF_CONTEXT_LINES);
-  if (!text) return undefined;
-  const stats = countDiffStats(text);
-  const truncated = truncateDiffText(text);
+  const result = buildUnifiedLineDiff(filePath, before, after, existed, DEFAULT_DIFF_CONTEXT_LINES);
+  if (!result) return undefined;
+  const truncated = truncateDiffText(result.text);
   return {
     format: 'unified',
     text: truncated.text,
-    added: stats.added,
-    removed: stats.removed,
+    added: result.added,
+    removed: result.removed,
     truncated: truncated.truncated
   };
 }
@@ -57,25 +56,35 @@ function replacementHunkFromOps(ops: NumberedDiffOp[]): FsHunkEditRequest | unde
 export function countDiffStats(diff: string): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
+  let inHunk = false;
   for (const line of diff.split('\n')) {
-    if (line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')) continue;
+    if (line.startsWith('@@')) { inHunk = true; continue; }
+    if (!inHunk && (line.startsWith('+++') || line.startsWith('---'))) continue;
     if (line.startsWith('+')) added += 1;
     else if (line.startsWith('-')) removed += 1;
   }
   return { added, removed };
 }
 
-function buildUnifiedLineDiff(filePath: string, before: string, after: string, existed: boolean, contextLines: number): string {
-  if (before === after) return '';
+function buildUnifiedLineDiff(
+  filePath: string, before: string, after: string, existed: boolean, contextLines: number
+): { text: string; added: number; removed: number } | undefined {
+  if (before === after) return undefined;
   const beforeLines = splitLinesForDiff(before);
   const afterLines = splitLinesForDiff(after);
   const ops = numberDiffOps(buildRawDiffOps(beforeLines, afterLines));
   const ranges = hunkRanges(ops, contextLines);
-  if (ranges.length === 0) return '';
+  if (ranges.length === 0) return undefined;
   const normalizedPath = normalizeDiffPath(filePath || 'file');
   const oldFile = existed ? `a/${normalizedPath}` : '/dev/null';
   const hunks = ranges.map((range) => formatHunk(ops.slice(range.start, range.end)));
-  return [`--- ${oldFile}`, `+++ b/${normalizedPath}`, ...hunks].join('\n');
+  let added = 0;
+  let removed = 0;
+  for (const op of ops) {
+    if (op.type === 'add') added += 1;
+    else if (op.type === 'del') removed += 1;
+  }
+  return { text: [`--- ${oldFile}`, `+++ b/${normalizedPath}`, ...hunks].join('\n'), added, removed };
 }
 
 function splitLinesForDiff(text: string): string[] {
@@ -104,7 +113,7 @@ function buildRawDiffOps(beforeLines: string[], afterLines: string[]): RawDiffOp
 
   const ops: RawDiffOp[] = [];
   for (let index = 0; index < prefix; index += 1) ops.push({ type: 'ctx', content: beforeLines[index] });
-  ops.push(...diffSegment(beforeLines.slice(prefix, oldEnd), afterLines.slice(prefix, newEnd)));
+  for (const op of diffSegment(beforeLines.slice(prefix, oldEnd), afterLines.slice(prefix, newEnd))) ops.push(op);
   for (let index = oldEnd; index < beforeLines.length; index += 1) ops.push({ type: 'ctx', content: beforeLines[index] });
   return ops;
 }
@@ -114,12 +123,16 @@ function diffSegment(oldLines: string[], newLines: string[]): RawDiffOp[] {
   if (newLines.length === 0) return oldLines.map((content) => ({ type: 'del', content }));
 
   if (oldLines.length * newLines.length > MAX_LCS_CELLS) {
+    // With no common line the exact edit script is already known. This common
+    // generated-file case needs no Myers search or trace allocation.
+    const oldValues = new Set(oldLines);
+    if (!newLines.some((line) => oldValues.has(line))) return fullReplacementDiffOps(oldLines, newLines);
     return diffSegmentByMyers(oldLines, newLines) ?? fullReplacementDiffOps(oldLines, newLines);
   }
 
   const rows = oldLines.length + 1;
   const cols = newLines.length + 1;
-  const dp = Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
+  const dp = Array.from({ length: rows }, () => new Uint32Array(cols));
 
   for (let oldIndex = oldLines.length - 1; oldIndex >= 0; oldIndex -= 1) {
     for (let newIndex = newLines.length - 1; newIndex >= 0; newIndex -= 1) {
@@ -165,9 +178,9 @@ function diffSegmentByMyers(oldLines: string[], newLines: string[]): RawDiffOp[]
   const trace: Array<Map<number, number>> = [];
 
   for (let distance = 0; distance <= maxDistance; distance += 1) {
-    trace.push(new Map(furthest));
     traceCells += furthest.size;
     if (traceCells > MAX_MYERS_TRACE_CELLS) return undefined;
+    trace.push(new Map(furthest));
 
     for (let diagonal = -distance; diagonal <= distance; diagonal += 2) {
       const useDownMove = diagonal === -distance
@@ -181,8 +194,8 @@ function diffSegmentByMyers(oldLines: string[], newLines: string[]): RawDiffOp[]
         oldIndex < oldLength
         && newIndex < newLength
         && newIndex >= 0
-        && oldLines[oldIndex] === newLines[newIndex]
       ) {
+        if (oldLines[oldIndex] !== newLines[newIndex]) break;
         oldIndex += 1;
         newIndex += 1;
       }
@@ -261,21 +274,22 @@ function numberDiffOps(rawOps: RawDiffOp[]): NumberedDiffOp[] {
   let oldLine = 1;
   let newLine = 1;
   return rawOps.map((op) => {
-    const base = { ...op, oldPos: oldLine, newPos: newLine };
+    const base: NumberedDiffOp = { type: op.type, content: op.content, oldPos: oldLine, newPos: newLine };
     if (op.type === 'ctx') {
-      const numbered: NumberedDiffOp = { ...base, oldNum: oldLine, newNum: newLine };
+      base.oldNum = oldLine;
+      base.newNum = newLine;
       oldLine += 1;
       newLine += 1;
-      return numbered;
+      return base;
     }
     if (op.type === 'del') {
-      const numbered: NumberedDiffOp = { ...base, oldNum: oldLine };
+      base.oldNum = oldLine;
       oldLine += 1;
-      return numbered;
+      return base;
     }
-    const numbered: NumberedDiffOp = { ...base, newNum: newLine };
+    base.newNum = newLine;
     newLine += 1;
-    return numbered;
+    return base;
   });
 }
 
@@ -314,10 +328,13 @@ function formatHunk(ops: NumberedDiffOp[]): string {
 
 function truncateDiffText(text: string): { text: string; truncated: boolean } {
   if (text.length <= MAX_DIFF_TEXT_CHARS) return { text, truncated: false };
-  const headLength = Math.floor(MAX_DIFF_TEXT_CHARS * 0.68);
-  const tailLength = MAX_DIFF_TEXT_CHARS - headLength;
+  let headLength = Math.floor(MAX_DIFF_TEXT_CHARS * 0.68);
+  let tailStart = text.length - (MAX_DIFF_TEXT_CHARS - headLength);
+  // Never split a Unicode surrogate pair at either truncation boundary.
+  if (/[\uD800-\uDBFF]/.test(text[headLength - 1])) headLength -= 1;
+  if (/[\uDC00-\uDFFF]/.test(text[tailStart])) tailStart += 1;
   return {
-    text: `${text.slice(0, headLength)}\n\n... diff 已截断，共 ${text.length} 字符 ...\n\n${text.slice(-tailLength)}`,
+    text: `${text.slice(0, headLength)}\n\n... diff 已截断，共 ${text.length} 字符 ...\n\n${text.slice(tailStart)}`,
     truncated: true
   };
 }

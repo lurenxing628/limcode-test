@@ -278,23 +278,16 @@ test('CAS concurrent first ingest保留唯一ContentObject并清理所有temp', 
   });
 });
 
-test('CAS pageable read reuses fully verified immutable bytes and returns isolated chunks', async () => {
+test('CAS pageable read reuses verified file identities and returns isolated chunks', async () => {
   await withCasRuntime('cas-verified-read-cache', async ({ authority, binding, database }) => {
     const store = new kernel.ContentAddressedStore(authority, binding);
     const content = Buffer.alloc((2 * 262_144) + 19, 0x61);
     const metadata = await store.ingest(database, content, 'application/test-pageable');
 
     const first = await store.readChunk(metadata, 0, 262_144);
-    assert.deepEqual(store.inspectReadCache(), {
-      entries: 1,
-      bytes: content.byteLength,
-      inflight: 0,
-      hits: 0,
-      misses: 1,
-      evictions: 0,
-      maxEntries: 128,
-      maxBytes: 32 * 1024 * 1024
-    });
+    assert.equal(store.inspectReadCache().bytes, 0);
+    assert.equal(store.inspectRangeReadCache().verifications, 1);
+    assert.equal(store.inspectRangeReadCache().activeHandles, 0);
     first.chunk.fill(0x00);
 
     const second = await store.readChunk(metadata, first.nextOffset, 262_144);
@@ -302,9 +295,9 @@ test('CAS pageable read reuses fully verified immutable bytes and returns isolat
     assert.equal(second.chunk.equals(content.subarray(262_144, 2 * 262_144)), true);
     assert.equal(replay.chunk.equals(content.subarray(0, 16)), true,
       'a caller-mutated chunk must not mutate the verified cache authority');
-    assert.equal(store.inspectReadCache().misses, 1,
+    assert.equal(store.inspectRangeReadCache().verifications, 1,
       'continuation pages must not read and hash the whole CAS object again');
-    assert.equal(store.inspectReadCache().hits, 2);
+    assert.equal(store.inspectRangeReadCache().activeHandles, 0);
   });
 });
 

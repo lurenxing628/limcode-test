@@ -126,10 +126,27 @@ interface ParsedMessageContentCacheEntry {
   content: MessageContent;
 }
 
-const PARSED_MESSAGE_CONTENT_CACHE_MAX_ENTRIES = 256;
-const PARSED_MESSAGE_CONTENT_CACHE_MAX_SOURCE_CHARACTERS = 8 * 1024 * 1024;
-const parsedMessageContentCache = new Map<string, ParsedMessageContentCacheEntry>();
-let parsedMessageContentCacheSourceCharacters = 0;
+// Detail objects are owned/evicted by the feed. Weak keys retain exactly the loaded working set,
+// rather than thrashing a byte-limited global LRU on every transient streaming frame.
+const parsedMessageContentCache = new WeakMap<ReliableKernelDetailState, ParsedMessageContentCacheEntry>();
+interface ParsedDetail {
+  source: string; value: unknown; responseParts: InlineDataPart[]; normalizedText?: string;
+}
+const parsedDetailCache = new WeakMap<ReliableKernelDetailState, ParsedDetail>();
+
+function parsedDetail(detail: ReliableKernelDetailState): ParsedDetail {
+  const cached = parsedDetailCache.get(detail);
+  if (cached?.source === detail.text) return cached;
+  const value = parseJson(detail.text);
+  const entry = { source: detail.text, value, responseParts: toolResponseParts(value) };
+  parsedDetailCache.set(detail, entry);
+  return entry;
+}
+
+function normalizedDetail(detail: ReliableKernelDetailState): string {
+  const entry = parsedDetail(detail);
+  return entry.normalizedText ??= entry.value === undefined ? detail.text : JSON.stringify(entry.value);
+}
 
 /**
  * Pure UI projection over independent Runtime objects and Link facts. It never mutates or persists a
@@ -172,7 +189,7 @@ export function projectReliableConversation(
     const detail = input.details[reliableKernelDetailKey('message-content', revisionId)];
     if (!detail || detail.status === 'loading') loadingMessageRevisionIds.push(revisionId);
     const content = detail?.status === 'ready'
-      ? parseMessageContent(revisionId, detail.text, role)
+      ? parseMessageContent(detail, role)
       : detail?.status === 'error'
         ? {
             role,
@@ -291,15 +308,16 @@ export function projectReliableConversation(
       if (!argumentsDetail || argumentsDetail.status === 'loading') missingToolArgumentIds.push(id);
       if (raw.status === 'terminal' && (!resultDetail || resultDetail.status === 'loading')) missingToolResultIds.push(id);
       const args = argumentsDetail?.status === 'ready'
-        ? normalizeJsonText(argumentsDetail.text)
+        ? normalizedDetail(argumentsDetail)
         : JSON.stringify(interactionArguments(interactionByToolCallId[id]?.prompt) ?? target.part.functionCall.args ?? {});
       const execution = executionsByCall.get(id);
       const outcome = outcomesByCall.get(id);
       if (raw.status === 'terminal') {
         toolOutcomeStatusByCallId[id] = toolOutcomeProjectionStatus(outcome);
       }
-      const parsedResult = resultDetail?.status === 'ready' ? parseJson(resultDetail.text) : undefined;
-      const responseParts = toolResponseParts(parsedResult);
+      const result = resultDetail?.status === 'ready' ? parsedDetail(resultDetail) : undefined;
+      const parsedResult = result?.value;
+      const responseParts = result?.responseParts ?? [];
       if (parsedResult !== undefined) toolResultByCallId[id] = toolResultDetail(parsedResult);
       const events = eventsByCall.get(id) ?? [];
       const status = toolStatus(raw, execution, outcome);
@@ -429,7 +447,7 @@ function projectReliableInteractions(
     const turnId = owners.get(requestId);
     const detail = details[reliableKernelDetailKey('interaction-prompt', requestId)];
     if (!detail || detail.status === 'loading') missingPromptIds.push(requestId);
-    const prompt = detail?.status === 'ready' ? parseJson(detail.text) : undefined;
+    const prompt = detail?.status === 'ready' ? parsedDetail(detail).value : undefined;
     promptIdByToolCallId[toolCallId] = requestId;
     byToolCallId[toolCallId] = {
       id: requestId,
@@ -480,7 +498,7 @@ function projectReliableFileChanges(
         if (!detail.terminalError) missingMemberIds.push(memberId);
         continue;
       }
-      const payload = record(parseJson(detail.text));
+      const payload = record(parsedDetail(detail).value);
       const diff = record(payload?.diff);
       const diffText = textPreserveWhitespace(diff?.text);
       const path = text(payload?.path);
@@ -1138,17 +1156,13 @@ function ensureProjectedFunctionCall(
 }
 
 function parseMessageContent(
-  revisionId: string,
-  source: string,
+  detail: ReliableKernelDetailState,
   role: 'user' | 'model'
 ): MessageContent {
-  const cached = parsedMessageContentCache.get(revisionId);
-  if (cached && cached.role === role && cached.source === source) {
-    parsedMessageContentCache.delete(revisionId);
-    parsedMessageContentCache.set(revisionId, cached);
-    return cached.content;
-  }
-  const parsed = parseJson(source);
+  const source = detail.text;
+  const cached = parsedMessageContentCache.get(detail);
+  if (cached && cached.role === role && cached.source === source) return cached.content;
+  const parsed = parsedDetail(detail).value;
   let content: MessageContent;
   if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
     const candidate = parsed as Record<string, unknown>;
@@ -1160,28 +1174,8 @@ function parseMessageContent(
   } else {
     content = { role, parts: source ? [{ text: source }] : [] };
   }
-  rememberParsedMessageContent(revisionId, { role, source, content });
+  parsedMessageContentCache.set(detail, { role, source, content });
   return content;
-}
-
-function rememberParsedMessageContent(revisionId: string, entry: ParsedMessageContentCacheEntry): void {
-  const existing = parsedMessageContentCache.get(revisionId);
-  if (existing) parsedMessageContentCacheSourceCharacters -= existing.source.length;
-  parsedMessageContentCache.delete(revisionId);
-  // A single pathological body remains renderable but must not pin the complete parser cache.
-  if (entry.source.length > PARSED_MESSAGE_CONTENT_CACHE_MAX_SOURCE_CHARACTERS) return;
-  parsedMessageContentCache.set(revisionId, entry);
-  parsedMessageContentCacheSourceCharacters += entry.source.length;
-  while (
-    parsedMessageContentCache.size > PARSED_MESSAGE_CONTENT_CACHE_MAX_ENTRIES
-    || parsedMessageContentCacheSourceCharacters > PARSED_MESSAGE_CONTENT_CACHE_MAX_SOURCE_CHARACTERS
-  ) {
-    const oldestRevisionId = parsedMessageContentCache.keys().next().value as string | undefined;
-    if (!oldestRevisionId) break;
-    const oldest = parsedMessageContentCache.get(oldestRevisionId);
-    parsedMessageContentCache.delete(oldestRevisionId);
-    if (oldest) parsedMessageContentCacheSourceCharacters -= oldest.source.length;
-  }
 }
 
 function toolStatus(
@@ -1226,7 +1220,7 @@ function projectToolCallEvents(
     if (!id || !toolCallId || !kind) return [];
     const detail = details[reliableKernelDetailKey('tool-event-content', id)];
     if (!detail || detail.status === 'loading') missingIds.push(id);
-    const content = detail?.status === 'ready' ? record(parseJson(detail.text)) : undefined;
+    const content = detail?.status === 'ready' ? record(parsedDetail(detail).value) : undefined;
     const delta = textPreserveWhitespace(content?.delta);
     const payload = content?.payload ?? (kind === 'progress' ? content?.progress : undefined);
     const error = text(content?.error);
@@ -1459,11 +1453,6 @@ function durationMs(execution: ReliableClientRecord | undefined): number | undef
   const started = timestamp(execution.started_at);
   const completed = timestamp(execution.completed_at);
   return started > 0 && completed >= started ? completed - started : undefined;
-}
-
-function normalizeJsonText(value: string): string {
-  const parsed = parseJson(value);
-  return parsed === undefined ? value : JSON.stringify(parsed);
 }
 
 function parseJson(value: string): unknown {

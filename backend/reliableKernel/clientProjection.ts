@@ -974,12 +974,13 @@ export function executeClientProjectionSnapshot(
 
     // Nonterminal/background/child roots may originate before the ordinary Message suffix. Pin
     // their exact visible source Message and recompute its absolute visible display rank.
+    const materializedMessageIds = new Set(messageRows.map((row) => String(row.id)));
     messageRows = mergeRowsById([
       ...messageRows,
       ...queryVisibleMessageRowsByIds(
         database,
         conversationId,
-        toolCallSourceLinks.map((row) => String(row.message_id))
+        toolCallSourceLinks.map((row) => String(row.message_id)).filter((id) => !materializedMessageIds.has(id))
       )
     ]).sort(compareMessageWindowRows);
 
@@ -1677,9 +1678,6 @@ export function executeConversationHistoryProjection(
     const conversationIds = conversations.map((row) => String(row.id));
     const origins = queryAllByIds(database, 'conversation_origin_link', 'conversation_id', conversationIds)
       .filter((row) => row.source_conversation_id === null || conversationIds.includes(String(row.source_conversation_id)));
-    const turns = queryAllByIds(database, 'turn', 'conversation_id', conversationIds);
-    const turnIds = turns.map((row) => String(row.id));
-    const leases = queryAllByIds(database, 'execution_lease', 'turn_id', turnIds);
     const agentLinks = queryAllByIds(database, 'agent_conversation_link', 'conversation_id', conversationIds);
     const conversationProjectLinks = queryAllByIds(database, 'conversation_project_link', 'conversation_id', conversationIds);
     const projectContexts = queryAllByIds(
@@ -1720,6 +1718,20 @@ export function executeConversationHistoryProjection(
     const deliveryIds = deliveries.map((row) => String(row.id));
     const deliveryWakes = queryAllByIds(database, 'runtime_delivery_wake', 'delivery_id', deliveryIds);
     const deliveryInputLinks = queryAllByIds(database, 'runtime_delivery_input_link', 'delivery_id', deliveryIds);
+    // Sidebar status needs active Turns and exact child/delivery references, never every historical
+    // Turn in each conversation. Keep referenced terminal targets so unhandled answers still fail.
+    const turns = mergeRowsById([
+      ...queryConversationIdChunks(database, conversationIds, (placeholders) => `
+        SELECT * FROM turn INDEXED BY ix_turn_02
+         WHERE conversation_id IN (${placeholders}) AND status = 'active'
+         ORDER BY id ASC
+      `),
+      ...queryAllByIds(database, 'turn', 'id', [
+        ...activeChildTurnLinks.map((row) => String(row.turn_id)),
+        ...deliveries.flatMap((row) => row.target_turn_id === null ? [] : [String(row.target_turn_id)])
+      ]).filter((row) => conversationIds.includes(String(row.conversation_id)))
+    ]).sort((left, right) => String(left.id).localeCompare(String(right.id)));
+    const leases = queryAllByIds(database, 'execution_lease', 'turn_id', turns.map((row) => String(row.id)));
     database.exec('COMMIT');
     return {
       pageIndex: page.pageIndex,
@@ -1981,8 +1993,10 @@ export function executeClientVisibleMessageHistoryPage(
 
   database.exec('BEGIN');
   try {
+    // Seek the bounded page before computing ordinals. Absolute visible ranks still require a
+    // count of the older visible prefix, but only these candidates carry content and window rows.
     const candidates = queryPlainRows(database, `
-      WITH visible_messages AS (
+      WITH page AS MATERIALIZED (
         SELECT message.id,
                membership.conversation_id,
                membership.message_seq,
@@ -1994,10 +2008,7 @@ export function executeClientVisibleMessageHistoryPage(
                revision.role,
                revision.content_object_id,
                content.content_type,
-               content.byte_length,
-               ROW_NUMBER() OVER (
-                 ORDER BY membership.message_seq ASC, message.id ASC
-               ) AS display_seq
+               content.byte_length
           FROM message_part_of_conversation AS membership
           JOIN message ON message.id = membership.message_id
           JOIN message_current_revision_link AS current_revision
@@ -2005,15 +2016,27 @@ export function executeClientVisibleMessageHistoryPage(
           JOIN message_revision AS revision ON revision.id = current_revision.revision_id
           JOIN content_object AS content ON content.id = revision.content_object_id
          WHERE membership.conversation_id = @conversationId
+           AND membership.message_seq <= @beforeMessageSeq
+           AND (membership.message_seq < @beforeMessageSeq OR message.id < @beforeId)
            AND message.deleted_at IS NULL
            AND revision.role IN ('user', 'model')
+         ORDER BY membership.message_seq DESC, membership.message_id DESC
+         LIMIT @limit
       )
-      SELECT *
-        FROM visible_messages
-       WHERE message_seq < @beforeMessageSeq
-          OR (message_seq = @beforeMessageSeq AND id < @beforeId)
-       ORDER BY message_seq DESC, id DESC
-       LIMIT @limit
+      SELECT page.*,
+             (SELECT COUNT(*)
+                FROM message_part_of_conversation AS older
+                JOIN message ON message.id = older.message_id
+                JOIN message_current_revision_link AS current_revision
+                  ON current_revision.message_id = message.id
+                JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+               WHERE older.conversation_id = @conversationId
+                 AND older.message_seq < (SELECT MIN(message_seq) FROM page)
+                 AND message.deleted_at IS NULL
+                 AND revision.role IN ('user', 'model'))
+             + ROW_NUMBER() OVER (ORDER BY page.message_seq ASC, page.id ASC) AS display_seq
+        FROM page
+       ORDER BY page.message_seq DESC, page.id DESC
     `, {
       conversationId,
       beforeMessageSeq: BigInt(beforeMessageSeq),
@@ -2627,6 +2650,10 @@ function queryVisibleMessageRowsByIds(
           JOIN message_revision AS revision ON revision.id = current_revision.revision_id
           JOIN content_object AS content ON content.id = revision.content_object_id
          WHERE membership.conversation_id = @conversationId
+           AND membership.message_seq <= (
+             SELECT MAX(message_seq) FROM message_part_of_conversation
+              WHERE conversation_id = @conversationId AND message_id IN (${placeholders.join(',')})
+           )
            AND message.deleted_at IS NULL
            AND revision.role IN ('user', 'model')
       )
@@ -2657,19 +2684,17 @@ function queryLatestToolCallEvents(
       return `@tool${index}`;
     });
     rows.push(...queryIdListRows(database, `
-      SELECT *
-        FROM (
-          SELECT event.*,
-                 ROW_NUMBER() OVER (
-                   PARTITION BY event.tool_call_id
-                   ORDER BY event.event_seq DESC, event.id DESC
-                 ) AS client_tail_ordinal
-            FROM tool_call_event AS event
-           WHERE event.tool_call_id IN (${placeholders.join(',')})
+      SELECT event.*
+        FROM tool_call AS call
+        JOIN tool_call_event AS event ON event.id IN (
+          SELECT recent.id FROM tool_call_event AS recent
+           WHERE recent.tool_call_id = call.id
+           ORDER BY recent.event_seq DESC, recent.id DESC
+           LIMIT @eventLimit
         )
-       WHERE client_tail_ordinal <= @eventLimit
-       ORDER BY tool_call_id ASC, event_seq ASC, id ASC
-    `, parameters, { count: chunk.length, chunkSize }).map(({ client_tail_ordinal: _ordinal, ...row }) => row));
+       WHERE call.id IN (${placeholders.join(',')})
+       ORDER BY event.tool_call_id ASC, event.event_seq ASC, event.id ASC
+    `, parameters, { count: chunk.length, chunkSize }));
   }
   return rows;
 }
@@ -2690,18 +2715,16 @@ function queryLatestChildExecutionTurnLinks(
       return `@child${index}`;
     });
     rows.push(...queryIdListRows(database, `
-      SELECT id, child_execution_id, turn_seq, turn_id, created_at
-        FROM (
-          SELECT link.*,
-                 ROW_NUMBER() OVER (
-                   PARTITION BY link.child_execution_id
-                   ORDER BY link.turn_seq DESC, link.id DESC
-                 ) AS client_ordinal
-            FROM child_execution_turn_link AS link
-           WHERE link.child_execution_id IN (${placeholders.join(',')})
+      SELECT link.id, link.child_execution_id, link.turn_seq, link.turn_id, link.created_at
+        FROM child_execution AS child
+        JOIN child_execution_turn_link AS link ON link.id = (
+          SELECT recent.id FROM child_execution_turn_link AS recent
+           WHERE recent.child_execution_id = child.id
+           ORDER BY recent.turn_seq DESC, recent.id DESC
+           LIMIT 1
         )
-       WHERE client_ordinal = 1
-       ORDER BY child_execution_id ASC, turn_seq ASC, id ASC
+       WHERE child.id IN (${placeholders.join(',')})
+       ORDER BY link.child_execution_id ASC, link.turn_seq ASC, link.id ASC
     `, parameters, { count: chunk.length, chunkSize }));
   }
   return rows;
@@ -2795,23 +2818,21 @@ function queryFirstUserRevisions(
   conversationIds: readonly string[]
 ): Array<Record<string, unknown>> {
   return queryConversationIdChunks(database, conversationIds, (placeholders) => `
-    SELECT conversation_id, revision_id
-      FROM (
-        SELECT membership.conversation_id,
-               revision.id AS revision_id,
-               ROW_NUMBER() OVER (
-                 PARTITION BY membership.conversation_id
-                 ORDER BY membership.message_seq ASC, membership.message_id ASC
-               ) AS ordinal
+    SELECT conversation.id AS conversation_id, revision.id AS revision_id
+      FROM conversation
+      JOIN message_revision AS revision ON revision.id = (
+        SELECT current.revision_id
           FROM message_part_of_conversation AS membership
           JOIN message ON message.id = membership.message_id
           JOIN message_current_revision_link AS current ON current.message_id = message.id
-          JOIN message_revision AS revision ON revision.id = current.revision_id
-         WHERE membership.conversation_id IN (${placeholders})
+          JOIN message_revision AS candidate ON candidate.id = current.revision_id
+         WHERE membership.conversation_id = conversation.id
            AND message.deleted_at IS NULL
-           AND revision.role = 'user'
+           AND candidate.role = 'user'
+         ORDER BY membership.message_seq ASC, membership.message_id ASC
+         LIMIT 1
       )
-     WHERE ordinal = 1
+     WHERE conversation.id IN (${placeholders})
   `);
 }
 
@@ -2820,23 +2841,21 @@ function queryLatestVisibleRevisions(
   conversationIds: readonly string[]
 ): Array<Record<string, unknown>> {
   return queryConversationIdChunks(database, conversationIds, (placeholders) => `
-    SELECT conversation_id, revision_id
-      FROM (
-        SELECT membership.conversation_id,
-               revision.id AS revision_id,
-               ROW_NUMBER() OVER (
-                 PARTITION BY membership.conversation_id
-                 ORDER BY membership.message_seq DESC, membership.message_id DESC
-               ) AS ordinal
+    SELECT conversation.id AS conversation_id, revision.id AS revision_id
+      FROM conversation
+      JOIN message_revision AS revision ON revision.id = (
+        SELECT current.revision_id
           FROM message_part_of_conversation AS membership
           JOIN message ON message.id = membership.message_id
           JOIN message_current_revision_link AS current ON current.message_id = message.id
-          JOIN message_revision AS revision ON revision.id = current.revision_id
-         WHERE membership.conversation_id IN (${placeholders})
+          JOIN message_revision AS candidate ON candidate.id = current.revision_id
+         WHERE membership.conversation_id = conversation.id
            AND message.deleted_at IS NULL
-           AND revision.role IN ('user', 'model')
+           AND candidate.role IN ('user', 'model')
+         ORDER BY membership.message_seq DESC, membership.message_id DESC
+         LIMIT 1
       )
-     WHERE ordinal = 1
+     WHERE conversation.id IN (${placeholders})
   `);
 }
 

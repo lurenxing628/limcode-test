@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, ref } from 'vue';
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
+import { CodeLineHeights, codeLineWindow, codeLineAnchor, codeLineAnchorOffset, syncCodeLineObservers, codeLineColumns } from '@webview/domain/codeLineWindow';
 import { IconCheck, IconCopy, IconTextWrap, IconTextWrapDisabled } from '@tabler/icons-vue';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 
@@ -33,7 +34,116 @@ const languageLabel = computed(() => displayLanguage(props.language, props.info)
 const lineNumberWidth = computed(() => `${Math.max(2, String(lines.value.length).length) + 2}ch`);
 const refreshKey = computed(() => `${softWrap.value ? 'wrap' : 'nowrap'}:${normalizedCode.value.length}:${lines.value.length}`);
 
+// Only mounted rows are measured. The height index keeps scrolling logarithmic and preserves
+// already measured unchanged lines as streamed text is appended.
+const heights = shallowRef(new CodeLineHeights(lines.value.length, 19));
+const heightRevision = ref(0);
+const scrollTop = ref(0);
+const viewportHeight = ref(520);
+const windowRange = computed(() => {
+  void heightRevision.value;
+  return codeLineWindow(heights.value, scrollTop.value, viewportHeight.value);
+});
+const visibleLines = computed(() => lines.value.slice(windowRange.value.start, windowRange.value.end));
+// Offscreen long lines must keep the horizontal range available in nowrap mode.
+const longestLineColumns = computed(() => lines.value.reduce((max, line) => Math.max(max, codeLineColumns(line)), 0));
+const measuredContentWidth = ref(0);
+const linesStyle = computed(() => softWrap.value ? undefined : {
+  minWidth: `max(100%, calc(${longestLineColumns.value}ch + ${lineNumberWidth.value} + 20px), ${measuredContentWidth.value}px)`
+});
+let rowObserver: ResizeObserver | undefined;
+let viewportObserver: ResizeObserver | undefined;
+let frame = 0;
+let mounted = false;
+let measuredWidth = 0;
+const observedRows = new Set<Element>();
+let resizeAnchor: ReturnType<typeof codeLineAnchor> | undefined;
+
+function scheduleMeasure(): void {
+  if (!mounted || frame) return;
+  frame = window.requestAnimationFrame(() => { frame = 0; measureRows(); });
+}
+
+function measureRows(): void {
+  const element = scroller.value;
+  if (!element) return;
+  const index = heights.value;
+  const top = Math.max(0, element.scrollTop - 6);
+  const anchor = resizeAnchor ?? codeLineAnchor(index, top);
+  const resizing = resizeAnchor !== undefined;
+  resizeAnchor = undefined;
+  let changed = false;
+  const currentRows = new Set(element.querySelectorAll<HTMLElement>('.lc-code-block-line'));
+  syncCodeLineObservers(rowObserver, observedRows, currentRows);
+  for (const row of currentRows) { // Measure only this bounded mounted window.
+    const position = Number(row.dataset.lineIndex);
+    const bounds = row.getBoundingClientRect();
+    const height = bounds.height;
+    if (!softWrap.value) measuredContentWidth.value = Math.max(measuredContentWidth.value, bounds.width);
+    if (height > 0 && Math.abs(index.height(position) - height) > 0.1) {
+      index.set(position, height);
+      changed = true;
+    }
+  }
+  if (changed || resizing) {
+    heightRevision.value++;
+    const nextTop = codeLineAnchorOffset(index, anchor) + (element.scrollTop >= 6 ? 6 : 0);
+    void nextTick(() => {
+      if (!scroller.value || heights.value !== index) return;
+      scroller.value.scrollTop = nextTop;
+      onScroll();
+    });
+  }
+}
+
+function onScroll(): void {
+  if (!scroller.value) return;
+  scrollTop.value = Math.max(0, scroller.value.scrollTop - 6);
+  viewportHeight.value = scroller.value.clientHeight || 520;
+  scheduleMeasure();
+}
+
+watch(lines, (current, previous) => {
+  measuredContentWidth.value = 0;
+  const old = heights.value;
+  heights.value = new CodeLineHeights(current.length, 19, (index) =>
+    current[index] === previous[index] ? old.height(index) || 19 : 19);
+  // Replacement/shrinking content may leave the old scroll position beyond the new end.
+  scrollTop.value = Math.min(scrollTop.value, Math.max(0, heights.value.offset(current.length) - viewportHeight.value));
+  void nextTick(() => { onScroll(); scheduleMeasure(); });
+});
+function resetMeasurements(): void {
+  resizeAnchor = resizeAnchor ?? codeLineAnchor(heights.value, scrollTop.value);
+  heights.value = new CodeLineHeights(lines.value.length, 19);
+  scrollTop.value = codeLineAnchorOffset(heights.value, resizeAnchor);
+  void nextTick(() => {
+    if (scroller.value) scroller.value.scrollTop = scrollTop.value + (scrollTop.value > 0 ? 6 : 0);
+    viewportHeight.value = scroller.value?.clientHeight || 520;
+    scheduleMeasure();
+  });
+}
+watch(softWrap, resetMeasurements);
+watch(() => [windowRange.value.start, windowRange.value.end], () => { void nextTick(scheduleMeasure); });
+onMounted(() => {
+  mounted = true;
+  rowObserver = new ResizeObserver(scheduleMeasure);
+  viewportObserver = new ResizeObserver(() => {
+    const width = scroller.value?.clientWidth ?? 0;
+    if (width !== measuredWidth) {
+      measuredWidth = width;
+      if (softWrap.value) { resetMeasurements(); return; }
+    }
+    onScroll();
+  });
+  if (scroller.value) viewportObserver.observe(scroller.value);
+  onScroll();
+});
+
 onBeforeUnmount(() => {
+  mounted = false;
+  rowObserver?.disconnect();
+  viewportObserver?.disconnect();
+  if (frame) window.cancelAnimationFrame(frame);
   if (copiedResetTimer !== undefined) window.clearTimeout(copiedResetTimer);
 });
 
@@ -139,13 +249,17 @@ function writeClipboardFallback(text: string): boolean {
       <div
         ref="scroller"
         class="lc-code-block-scroll"
+        @scroll.passive="onScroll"
         :style="{ '--lc-code-line-number-width': lineNumberWidth }"
       >
-        <div class="lc-code-block-lines" role="list" :aria-label="`${languageLabel} 代码块`">
-          <div v-for="(line, index) in lines" :key="index" class="lc-code-block-line" role="listitem">
-            <span class="lc-code-block-line-number" aria-hidden="true">{{ index + 1 }}</span>
+        <div class="lc-code-block-lines" :style="linesStyle" role="list" :aria-label="`${languageLabel} 代码块`">
+          <div aria-hidden="true" :style="{ height: `${windowRange.before}px`, flexShrink: 0 }" />
+          <div v-for="(line, index) in visibleLines" :key="windowRange.start + index" class="lc-code-block-line"
+            :data-line-index="windowRange.start + index" role="listitem" :aria-posinset="windowRange.start + index + 1" :aria-setsize="lines.length">
+            <span class="lc-code-block-line-number" aria-hidden="true">{{ windowRange.start + index + 1 }}</span>
             <span class="lc-code-block-line-text">{{ line || ' ' }}</span>
           </div>
+          <div aria-hidden="true" :style="{ height: `${windowRange.after}px`, flexShrink: 0 }" />
         </div>
       </div>
       <AdvancedScrollbar
@@ -261,6 +375,7 @@ function writeClipboardFallback(text: string): boolean {
   overflow: auto;
   padding: 6px 13px 12px 0;
   box-sizing: border-box;
+  overflow-anchor: none;
   scrollbar-width: none;
   -ms-overflow-style: none;
 }

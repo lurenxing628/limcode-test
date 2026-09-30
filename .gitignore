@@ -218,3 +218,15 @@ docs/architecture/*
 !/tests/reliable-kernel/runtime-history-repair-durability.test.mjs
 !/tests/reliable-kernel/runtime-merge-commit-guards.test.mjs
 !/tests/reliable-kernel/runtime-merge-queued-intents.test.mjs
+
+!/tests/reliable-kernel/client-projection-history-work-bound.test.mjs
+
+!/tests/reliable-kernel/feed-history-ack-cost.test.mjs
+
+!/tests/reliable-kernel/sidebar-refresh-progress.test.mjs
+
+!/tests/reliable-kernel/cas-verified-ranges.test.mjs
+!/tests/reliable-kernel/facade-refresh-progress.test.mjs
+!/tests/reliable-kernel/webview-render-cache-window.test.mjs
+!/tests/reliable-kernel/file-diff-large-input.test.mjs
+!/tests/reliable-kernel/file-diff-detail-worker.test.mjs

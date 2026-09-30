@@ -321,12 +321,6 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       const previousConversationId = activeConversationId(this.projections);
       const result = applyReliableKernelDataMessage(this.$state, message);
       const nextConversationId = activeConversationId(result.state.projections);
-      const nextVisibleMessages = visibleMessageCount(result.state.projections);
-      const previousLoadedFloorCeiling = maximumVisibleMessageFloor(
-        this.historyRecords,
-        this.records,
-        previousConversationId ?? ''
-      );
       const continuingLoadedHistory = Boolean(
         result.ack
         && previousConversationId
@@ -334,10 +328,16 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         && this.historyConversationId === previousConversationId
         && (this.historyLoadedPages > 0 || this.historyLoading)
       );
-      const historyInvalidated = continuingLoadedHistory
-        && incomingType === RELIABLE_KERNEL_SNAPSHOT_MESSAGE
-        && nextVisibleMessages < previousLoadedFloorCeiling;
-      const nextSuffixFloor = previousConversationId
+      // Only an accepted snapshot continuing loaded history can invalidate or skip its floors.
+      // Ordinary durable changes must not scan the unbounded historical prefix before ACK.
+      const checkingHistorySnapshot = continuingLoadedHistory
+        && incomingType === RELIABLE_KERNEL_SNAPSHOT_MESSAGE;
+      const previousLoadedFloorCeiling = checkingHistorySnapshot
+        ? maximumVisibleMessageFloor(this.historyRecords, this.records, previousConversationId!)
+        : 0n;
+      const historyInvalidated = checkingHistorySnapshot
+        && visibleMessageCount(result.state.projections) < previousLoadedFloorCeiling;
+      const nextSuffixFloor = checkingHistorySnapshot && !historyInvalidated && previousConversationId
         ? visibleMessageSuffixFloor(result.state.records.Message ?? {}, previousConversationId)
         : undefined;
       const snapshotSkippedLoadedFloors = continuingLoadedHistory
