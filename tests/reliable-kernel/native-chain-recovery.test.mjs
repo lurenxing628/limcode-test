@@ -154,6 +154,7 @@ async function withNativeKernel(options, verify) {
   const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(root);
   const requests = [];
+  const summaryRequests = [];
   const executions = [];
   const duplicates = [];
   const submissions = [];
@@ -201,7 +202,15 @@ async function withNativeKernel(options, verify) {
     mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { throw new Error('unexpected MCP call'); } },
     mcpPolicyGate: { async authorize() { return { toolPolicyAllowed: true, planReviewAllowed: true }; } },
     attachmentSettings: { async loadGlobalSettings() { return { section: 'attachments', settings: { maxStoredInlineFileMb: 25 }, filePath: 'unused' }; } },
-    providers: { resolve() { return adapter; } },
+    providers: { resolve(providerId) {
+      if (providerId !== 'summary-provider') return adapter;
+      return { providerId, async sendFullRequest(request, controls) {
+        summaryRequests.push(request);
+        if (options.summary) return options.summary({ request, controls, app });
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { type: 'compression_result',
+          contents: [{ role: 'model', parts: [{ text: 'Earlier useful history is preserved in this short summary.' }] }] } });
+      } };
+    } },
     toolDispatcher: {
       definitions() { return [syncDefinition, asyncDefinition]; },
       async dispatch(input) {
@@ -209,7 +218,8 @@ async function withNativeKernel(options, verify) {
         executions.push(input.providerCallId);
         const settled = await app.runtime.effects.settleWithoutEffect({
           source: { kind: 'internal', key: `native-chain-ordinary:${input.toolCallId}` },
-          toolCallId: input.toolCallId, status: 'succeeded', detail: { ok: true, callId: input.providerCallId }
+          toolCallId: input.toolCallId, status: 'succeeded', detail: { ok: true, callId: input.providerCallId,
+            ...(options.toolResultParts ? { parts: options.toolResultParts } : {}) }
         });
         return settled.terminal;
       },
@@ -231,7 +241,8 @@ async function withNativeKernel(options, verify) {
           if (gate) await gate.promise;
           const settled = await app.runtime.effects.settleWithoutEffect({
             source: { kind: 'internal', key: `native-chain-recovery:${input.toolCallId}` },
-            toolCallId: input.toolCallId, status: 'succeeded', detail: { ok: true, callId: input.providerCallId }
+            toolCallId: input.toolCallId, status: 'succeeded', detail: { ok: true, callId: input.providerCallId,
+            ...(options.toolResultParts ? { parts: options.toolResultParts } : {}) }
           });
           return settled.terminal;
         } finally {
@@ -283,7 +294,7 @@ async function withNativeKernel(options, verify) {
         created_at: now, updated_at: now
       })
     ]);
-    await verify({ get app() { return app; }, requests, executions, duplicates, submissions, ended, gates, shared,
+    await verify({ get app() { return app; }, requests, summaryRequests, executions, duplicates, submissions, ended, gates, shared,
       startTurn, drive, driveUntilSettled, reopen, recover, dependencies });
   } finally {
     for (const gate of gates.values()) gate.resolve();
@@ -1055,5 +1066,297 @@ test('native error rebase honors durable Retry-After across a prompt Host handof
     assert.equal(state.requests.length, 2);
     assert.ok(successorAt >= sealed.stream_stats_json.retryNotBeforeAt, 'restart shortened the server minimum delay');
     assert.deepEqual(state.executions, ['retry-after-call']);
+  });
+});
+
+async function seedOverflowHistory(app) {
+  const content = await app.contentStore.ingest(app.database,
+    'Important earlier work and its conclusions. '.repeat(400), 'text/plain');
+  const now = new Date().toISOString();
+  const messageId = 'overflow-history-message';
+  const revisionId = 'overflow-history-revision';
+  const plan = await app.context.prepareMessageAppendMutation({ conversationId: CONVERSATION,
+    messageRevisionId: revisionId, contentObjectId: content.id, contentByteLength: content.byte_length });
+  await app.database.transaction([
+    kernel.DOMAIN_REPOSITORIES.domain('Message').insert({ id: messageId, created_at: now, updated_at: now, deleted_at: null }),
+    kernel.DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({ id: revisionId,
+      message_id: messageId, role: 'model', content_object_id: content.id, created_at: now
+    }, { column: 'revision_seq', scope: { message_id: messageId } }),
+    kernel.DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({ id: 'overflow-history-current',
+      message_id: messageId, revision_id: revisionId, updated_at: now }),
+    kernel.DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insertWithNextSequence({ id: 'overflow-history-member',
+      conversation_id: CONVERSATION, message_id: messageId, created_at: now
+    }, { column: 'message_seq', scope: { conversation_id: CONVERSATION } }),
+    ...plan.steps
+  ]);
+}
+
+async function emitNativeText(emit, responseId, ordinal, text) {
+  const outputItem = { id: `text-${responseId}-${ordinal}`, ordinal, providerResponseId: responseId };
+  await emit('output_delta', { type: 'text_delta', text, outputItem });
+  await emit('output_item_done', { type: 'output_item_done', outputItem });
+}
+
+function nativeOverflow() {
+  return Object.assign(new Error('Provider context window exceeded after native progress'), { code: 'CONTEXT_WINDOW_EXCEEDED' });
+}
+
+async function pauseBeforeOverflowRecovery(state, turn) {
+  const coordinator = state.app.agentLoop.compressionCoordinator;
+  const original = coordinator.recoverProviderContextOverflow.bind(coordinator);
+  let command;
+  coordinator.recoverProviderContextOverflow = async input => {
+    command = input;
+    throw new kernel.ExecutionHandoffError('fixture pauses before context repair');
+  };
+  try {
+    await assert.rejects(state.drive(turn), error => kernel.isExecutionHandoffError(error));
+  } finally {
+    coordinator.recoverProviderContextOverflow = original;
+  }
+  assert.ok(command, 'the persisted provider overflow reached its recovery boundary');
+  return { coordinator, command };
+}
+
+for (const { restart, attachment } of [{ restart: false, attachment: false }, { restart: true, attachment: false },
+  { restart: true, attachment: true }]) {
+  test(`provider context overflow preserves a settled native effect and its result${attachment ? ' with a managed attachment' : ''}${restart ? ' across a committed-repair Host restart' : ''}`,
+    { timeout: 30000 }, async () => {
+      await withNativeKernel({
+        retryPolicy, compressionThreshold: 1000000,
+        ...(attachment ? { toolResultParts: [{ inlineData: { mimeType: 'image/png', name: 'native-result.png',
+          data: Buffer.from('native-tool-image-bytes').toString('base64'), storage: 'embedded', status: 'available' } }] } : {}),
+        async script({ round, request, emit, responseId, app }) {
+          if (round === 0) {
+            await emit('native_control', { type: 'response.created', responseId, capabilities });
+            await emitCall(emit, responseId, 'overflow-once', 0, { async: true });
+            await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'overflow tool settled');
+            throw nativeOverflow();
+          }
+          assert.deepEqual(nativeToolPairs(request).get('overflow-once'), { calls: 1, results: 1 },
+            'the repaired full request consumes the already executed result');
+          if (attachment) {
+            assert.equal(request.recipe.attachmentCatalogState.catalog.length, 1);
+            assert.equal(request.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment').length, 1);
+          }
+          await emitFinalText(emit, responseId, 'Completed using the saved native result.');
+        }
+      }, async state => {
+        await seedOverflowHistory(state.app);
+        let turn = await state.startTurn(`native-overflow-once-${restart}`, 'Run the native probe.');
+        let committed;
+        if (restart) {
+          const coordinator = state.app.agentLoop.compressionCoordinator;
+          const original = coordinator.recoverProviderContextOverflow.bind(coordinator);
+          coordinator.recoverProviderContextOverflow = async input => {
+            committed = await original(input);
+            assert.equal(committed.status, 'compressed');
+            throw new kernel.ExecutionHandoffError('restart after durable native overflow repair');
+          };
+          await assert.rejects(state.drive(turn), error => kernel.isExecutionHandoffError(error));
+          assert.equal(state.summaryRequests.length, 1);
+          assert.equal(state.requests.length, 1);
+          await state.reopen();
+          turn = await state.recover(turn.turnId);
+        }
+        const outcome = await state.driveUntilSettled(turn);
+        assert.equal(outcome.terminalStatus, 'completed', JSON.stringify(await rows(state.app, 'TurnTermination')));
+        assert.deepEqual(state.executions, ['overflow-once']);
+        assert.deepEqual(state.duplicates, []);
+        assert.equal(state.requests.length, 2);
+        assert.equal(state.summaryRequests.length, 1, 'repair is paid once even after restart');
+        assert.equal((await rows(state.app, 'ToolModelResult')).length, 1);
+        const [block] = await rows(state.app, 'CompressionBlock');
+        assert.ok(block);
+        if (committed) assert.equal(block.id, committed.result.compressionBlockId);
+        const first = state.requests[0];
+        const [frozen] = await rows(state.app, 'ModelContextProjection', { owner_kind: 'model_request', owner_id: first.modelRequestId });
+        const repair = state.summaryRequests[0];
+        assert.notEqual(repair.recipe.sourceRootId, frozen.root_id, 'the actual closed native frontier is the frozen repair source');
+        assert.equal(repair.recipe.providerContextOverflowRequestId, first.modelRequestId);
+        if (attachment) {
+          assert.equal(first.recipe.attachmentCatalogState.catalog.length, 0);
+          assert.equal((await rows(state.app, 'Attachment')).length, 1);
+          const attachmentHandles = state.requests[1].recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
+          assert.deepEqual(repair.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment'), attachmentHandles,
+            'the repaired preview and successor preserve the same stable attachment handle');
+        }
+        assert.deepEqual(repair.authoritySnapshot.toolPolicy, first.authoritySnapshot.toolPolicy);
+        assert.equal(state.requests[1].attemptSeq, '1');
+        assert.notEqual(state.requests[1].modelRequestId, first.modelRequestId);
+      });
+    });
+}
+
+test('provider context overflow accepts a native text item with immutable revision and source proof', { timeout: 30000 }, async () => {
+  await withNativeKernel({ retryPolicy, compressionThreshold: 1000000,
+    async script({ round, request, emit, responseId }) {
+      if (round === 0) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitNativeText(emit, responseId, 0, 'Verified native partial conclusion.');
+        throw nativeOverflow();
+      }
+      assert.match(requestText(request), /Verified native partial conclusion/);
+      await emitFinalText(emit, responseId, 'Completed from the saved partial conclusion.');
+    }
+  }, async state => {
+    await seedOverflowHistory(state.app);
+    const turn = await state.startTurn('native-overflow-text', 'Continue the analysis.');
+    const outcome = await state.driveUntilSettled(turn);
+    assert.equal(outcome.terminalStatus, 'completed', JSON.stringify(await rows(state.app, 'TurnTermination')));
+    assert.equal(state.summaryRequests.length, 1);
+    assert.equal(state.requests.length, 2);
+    assert.deepEqual(state.executions, []);
+  });
+});
+
+for (const foreign of ['runtime-delivery', 'edited-native-revision']) {
+  test(`provider context overflow rejects ${foreign} after its native append frontier`, { timeout: 30000 }, async () => {
+    await withNativeKernel({ retryPolicy, compressionThreshold: 1000000,
+      async script({ emit, responseId }) {
+        await emit('native_control', { type: 'response.created', responseId, capabilities });
+        await emitNativeText(emit, responseId, 0, 'Original native item.');
+        throw nativeOverflow();
+      }
+    }, async state => {
+      await seedOverflowHistory(state.app);
+      const turn = await state.startTurn(`native-overflow-${foreign}`, 'Continue.');
+      const { coordinator, command } = await pauseBeforeOverflowRecovery(state, turn);
+      if (foreign === 'runtime-delivery') {
+        const delivery = kernel.projectRuntimeDeliveryForModel({ kind: 'process_completion', phase: 'current_turn',
+          processId: 'foreign-process', processReceiptId: 'foreign-receipt', deliveryId: 'foreign-delivery',
+          inboxItemId: 'foreign-inbox', targetTurnId: turn.turnId, deliveredAt: new Date().toISOString(),
+          content: { kind: 'process_completion', processId: 'foreign-process', processReceiptId: 'foreign-receipt',
+            status: 'exited', stdout: 'Another operation delivered this content.' } });
+        await state.app.context.appendContent({ conversationId: CONVERSATION, segmentKind: 'runtime_context',
+          source: { sourceKind: 'runtime_context', sourceId: 'unrelated-delivery', sourceRevision: '0' },
+          content: delivery.content, contentType: delivery.contentType });
+      } else {
+        const [link] = await rows(state.app, 'ModelRequestMessageLink', { model_request_id: command.failedModelRequestId });
+        const revisions = await rows(state.app, 'MessageRevision', { message_id: link.message_id });
+        let original;
+        for (const revision of revisions) {
+          if ((await rows(state.app, 'ContextSegmentSource', { source_kind: 'message_revision', source_id: revision.id })).length) {
+            original = revision; break;
+          }
+        }
+        assert.ok(original);
+        const object = await state.app.contentStore.ingest(state.app.database, JSON.stringify({ role: 'model', parts: [{
+          text: 'User-edited native item.', outputItem: { id: 'text-response-0-0', ordinal: 0, providerResponseId: 'response-0' }
+        }] }), 'application/vnd.limcode.message+json');
+        const nextId = 'user-edited-native-revision';
+        const plan = await state.app.context.prepareMessageEditMutation({ conversationId: CONVERSATION,
+          previousMessageRevisionId: original.id, nextMessageRevisionId: nextId,
+          contentObjectId: object.id, contentByteLength: object.byte_length });
+        await state.app.database.transaction([
+          kernel.DOMAIN_REPOSITORIES.domain('MessageRevision').insertWithNextSequence({ id: nextId,
+            message_id: original.message_id, role: 'model', content_object_id: object.id, created_at: new Date().toISOString()
+          }, { column: 'revision_seq', scope: { message_id: original.message_id } }), ...plan.steps
+        ]);
+        assert.equal((await rows(state.app, 'ModelRequestMessageLink', { message_id: original.message_id }))[0].model_request_id,
+          command.failedModelRequestId, 'message-level ownership alone cannot authorize this edited revision');
+      }
+      const head = await state.app.context.currentHeadRootId(CONVERSATION);
+      await assert.rejects(coordinator.recoverProviderContextOverflow(command), /without a committed repair/);
+      assert.equal(await state.app.context.currentHeadRootId(CONVERSATION), head);
+      assert.equal(state.summaryRequests.length, 0);
+      assert.equal(state.requests.length, 1);
+    });
+  });
+}
+
+test('provider context overflow rejects every unsettled native admission, including the original frozen head', { timeout: 30000 }, async () => {
+  await withNativeKernel({ retryPolicy, compressionThreshold: 1000000, background: ['overflow-unsettled'],
+    async script({ emit, responseId, app }) {
+      await emit('native_control', { type: 'response.created', responseId, capabilities });
+      await emitCall(emit, responseId, 'overflow-unsettled', 0, { async: true });
+      await waitFor(async () => (await rows(app, 'ToolCallEvent', { event_kind: 'native_admission' })).length === 1,
+        'unsettled native admission');
+      throw nativeOverflow();
+    }
+  }, async state => {
+    await seedOverflowHistory(state.app);
+    const turn = await state.startTurn('native-overflow-unsettled', 'Start background work.');
+    // Simulate Host loss after the request rejection is durable but before native failure cleanup
+    // can cancel/settle this admission. A paused, never-started call normally closes safely.
+    const close = state.app.agentLoop.closeNativeAdmittedCall;
+    state.app.agentLoop.closeNativeAdmittedCall = async () => {
+      throw new kernel.ExecutionHandoffError('Host interrupted before native admission closure');
+    };
+    try {
+      await assert.rejects(state.drive(turn), error => kernel.isExecutionHandoffError(error));
+    } finally {
+      state.app.agentLoop.closeNativeAdmittedCall = close;
+    }
+    const coordinator = state.app.agentLoop.compressionCoordinator;
+    const command = { turnId: turn.turnId, failedModelRequestId: state.requests[0].modelRequestId };
+    const [source] = await rows(state.app, 'ToolCallSourceLink', { model_request_id: command.failedModelRequestId });
+    assert.ok(source, 'the unfinished call belongs to this exact failed request');
+    assert.equal((await rows(state.app, 'ToolCallEvent', { tool_call_id: source.tool_call_id, event_kind: 'native_admission' })).length, 1);
+    assert.equal((await rows(state.app, 'ToolModelResult')).length, 0, 'the admitted native call is really unclosed');
+    await assert.rejects(coordinator.recoverProviderContextOverflow(command), /without a committed repair/);
+    const [request] = await rows(state.app, 'ModelRequest', { id: command.failedModelRequestId });
+    const [projection] = await rows(state.app, 'ModelContextProjection', { owner_kind: 'model_request', owner_id: request.id });
+    await assert.rejects(coordinator.coordinate({ turnId: turn.turnId, headRootId: projection.root_id,
+      authoritySnapshotId: request.authority_snapshot_id, settingsSnapshotContentObjectId: request.settings_snapshot_object_id ?? undefined,
+      trigger: 'auto', providerContextOverflowRequestId: request.id }), /differs from the rejected immutable request/);
+    assert.equal((await rows(state.app, 'ToolModelResult')).length, 0);
+    assert.equal(state.summaryRequests.length, 0);
+    assert.equal(state.requests.length, 1);
+    assert.deepEqual(state.duplicates, []);
+  });
+});
+
+test('native overflow recovery rejects reordered, duplicated and re-rooted native suffixes', { timeout: 30000 }, async () => {
+  await withNativeKernel({ retryPolicy, compressionThreshold: 1000000,
+    async script({ emit, responseId, app }) {
+      await emit('native_control', { type: 'response.created', responseId, capabilities });
+      await emitNativeText(emit, responseId, 0, 'First native item.');
+      await emitNativeText(emit, responseId, 1, 'Second native item.');
+      await emitCall(emit, responseId, 'overflow-order', 2, { async: true });
+      await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'ordered native result');
+      throw nativeOverflow();
+    }
+  }, async state => {
+    await seedOverflowHistory(state.app);
+    const turn = await state.startTurn('native-overflow-order', 'Continue.');
+    const { coordinator, command } = await pauseBeforeOverflowRecovery(state, turn);
+    const source = await coordinator.readProviderContextOverflowSource(turn.turnId, command.failedModelRequestId);
+    const sourceStructure = await state.app.context.materializeStructure(source.rootId);
+    const head = await state.app.context.currentHeadRootId(CONVERSATION);
+    const structure = await state.app.context.materializeStructure(head);
+    await coordinator.assertProviderRecoverySource(source, head);
+    const prefix = structure.records.slice(0, sourceStructure.records.length);
+    const suffix = structure.records.slice(sourceStructure.records.length);
+    assert.equal(suffix.length, 4);
+    const variants = {
+      'prefix-order': [...prefix].reverse().concat(suffix),
+      'suffix-order': [...prefix, suffix[1], suffix[0], ...suffix.slice(2)],
+      'duplicate-suffix': [...prefix, ...suffix, suffix[0]],
+      'alternate-root': structure.records
+    };
+    for (const [label, permutation] of Object.entries(variants)) {
+      const now = new Date().toISOString();
+      const steps = [];
+      let parent = null;
+      for (const record of permutation) {
+        const nodeId = kernel.contextSequenceNodeId(parent, record.segment.id);
+        if (!(await rows(state.app, 'ContextSequenceNode', { id: nodeId })).length) {
+          steps.push(kernel.DOMAIN_REPOSITORIES.domain('ContextSequenceNode').insert({ id: nodeId,
+            parent_node_id: parent, segment_id: record.segment.id, created_at: now }));
+        }
+        parent = nodeId;
+      }
+      const id = `native-overflow-${label}`;
+      steps.push(kernel.DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({ id,
+        conversation_id: CONVERSATION, root_node_id: parent, tail_node_id: null, tail_segment_count: 0n,
+        segment_count: BigInt(permutation.length), estimated_tokens: structure.root.estimated_tokens, created_at: now
+      }, { column: 'root_seq', scope: { conversation_id: CONVERSATION } }));
+      await state.app.database.transaction(steps);
+      await assert.rejects(coordinator.assertProviderRecoverySource(source, id), /without a committed repair/, label);
+    }
+    assert.equal(state.summaryRequests.length, 0);
+    assert.equal(state.requests.length, 1);
+    assert.deepEqual(state.executions, ['overflow-order']);
   });
 });

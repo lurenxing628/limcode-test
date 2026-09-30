@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -14,6 +15,17 @@ const capabilitiesModule = await import(pathToFileURL(path.join(compiledRoot, 's
 
 const PROVIDER_ID = 'provider-reduction-gate';
 const MODEL_ID = 'model-reduction-gate';
+
+test('shared Context append and compression root identities preserve the published hash formulas', () => {
+  const priorId = (domain, kind, parts) => `${kind}_${createHash('sha256')
+    .update(`limcode-reliable-kernel-${domain}\0`).update(kind).update('\0').update(parts.join('\0')).digest('hex')}`;
+  for (const base of [null, 'source-root']) {
+    assert.equal(kernel.contextAppendRootId('conversation', base, 'node'),
+      priorId('context', 'context_root_append', ['conversation', base ?? '<null>', 'node']));
+  }
+  assert.equal(kernel.compressionRootIdFor('block', 'source-root'),
+    priorId('compression', 'compression_root', ['block', 'source-root']));
+});
 
 function dependencies(thresholdTokens, options = {}) {
   const capabilities = capabilitiesModule.resolveModelCapabilities({
@@ -460,6 +472,11 @@ test('real provider overflow forces below-threshold compression, proves reductio
     assert.equal(repaired.recipe.providerContextOverflowRequestId, rejected.failedModelRequestId);
     const original = requests.find(row => row.id === rejected.failedModelRequestId);
     assert.equal(original.terminal_state, 'provider_failed', 'repair never rewrites the rejected request');
+    await appendMessage(app, seeded, 'foreign-after-repair', 'user', 'unrelated later input');
+    const foreignHead = await app.context.currentHeadRootId(seeded.conversationId);
+    await assert.rejects(coordinator.recoverProviderContextOverflow(command), /without a committed repair/);
+    assert.equal(sends, 1, 'a committed block does not authorize a new repair at an unrelated head');
+    assert.equal(await app.context.currentHeadRootId(seeded.conversationId), foreignHead);
   });
 });
 

@@ -21,11 +21,13 @@ import { mergeConversationChildHandles, readConversationChildHandles } from './c
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
+  compressionRootIdFor,
   compressionSegmentIdFor,
   type CompressionCommitResult
 } from './contextCompression';
 import {
   ContextSequenceControlPlane,
+  contextAppendRootId,
   type MaterializedContext,
   type MaterializedContextSegment,
   type StructuralContextRecord
@@ -82,6 +84,7 @@ import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { nativeItemRevisionId } from './turnOutput';
 import {
   SKILL_REATTACHMENT_MAX_BODY_TARGET_SHARE,
   SKILL_REATTACHMENT_TOTAL_TOKENS,
@@ -218,10 +221,12 @@ export class ReliableContextCompressionCoordinator {
         throw new TypeError('Provider context recovery requires automatic bounded prefix planning.');
       }
       const source = await this.readProviderContextOverflowSource(turnId, command.providerContextOverflowRequestId);
-      if (source.rootId !== command.headRootId || source.request.authority_snapshot_id !== authoritySnapshotId
+      if (source.request.authority_snapshot_id !== authoritySnapshotId
         || (source.request.settings_snapshot_object_id ?? undefined) !== command.settingsSnapshotContentObjectId) {
         throw new Error('Provider context recovery differs from the rejected immutable request.');
       }
+      await this.assertProviderRecoverySource(source, command.headRootId,
+        'Provider context recovery differs from the rejected immutable request.');
     }
     const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
       ?? (command.providerContextOverflowRequestId ? undefined : await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId));
@@ -352,40 +357,183 @@ export class ReliableContextCompressionCoordinator {
     if (turn.status !== 'active') throw new Error('Provider context recovery requires the original active Turn.');
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const currentHead = await this.context.currentHeadRootId(conversationId);
-    if (currentHead !== source.rootId) {
-      // An unrelated Context append is not proof of repair. A completed matching block is required
-      // before coordinate may replay its old source instead of trying to compress a stale head.
-      let committed = false;
-      for (const request of await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId })) {
-        if (request.status !== 'terminal' || request.terminal_state !== 'completed') continue;
-        const recipe = await this.readRequestRecipe(request);
-        if (recipe.kind !== 'reliable-context-compression' || recipe.providerContextOverflowRequestId !== failedModelRequestId
-          || recipe.sourceRootId !== source.rootId) continue;
-        const block = await this.optionalDomain('CompressionBlock', compressionBlockIdFor(conversationId, source.rootId, String(request.id)));
-        if (block?.status === 'enabled') { committed = true; break; }
+    let headRootId = requireId(currentHead, 'Conversation Context head');
+    let committed = false;
+    const repairSources = new Set<string>();
+    // A repair may have frozen its source before a crash, or already committed its block. Reuse
+    // that exact source rather than treating the compressed head as fresh native progress.
+    for (const request of await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId })) {
+      const recipe = await this.readRequestRecipe(request);
+      if (recipe.kind !== 'reliable-context-compression' || recipe.providerContextOverflowRequestId !== failedModelRequestId) continue;
+      if (request.authority_snapshot_id !== source.request.authority_snapshot_id
+        || request.settings_snapshot_object_id !== source.request.settings_snapshot_object_id) {
+        throw new Error('Provider context recovery changed its frozen authority.');
       }
-      if (!committed) throw new Error('Context changed without a committed repair of the rejected request.');
+      const repairSource = requireId(recipe.sourceRootId, 'Compression recipe.sourceRootId');
+      repairSources.add(repairSource);
+      if (request.status === 'terminal' && request.terminal_state === 'completed') {
+        const block = await this.optionalDomain('CompressionBlock', compressionBlockIdFor(conversationId, repairSource, String(request.id)));
+        if (block?.status === 'enabled') {
+          if (currentHead !== compressionRootIdFor(String(block.id), repairSource)) {
+            throw new Error('Context changed without a committed repair of the rejected request.');
+          }
+          committed = true;
+        }
+      }
     }
-    const fullRequest = await this.modelProvider.replay(failedModelRequestId);
-    const adapter = await this.providers.resolve(fullRequest.providerId);
-    if (adapter.providerId !== fullRequest.providerId) throw new Error('Provider context recovery changed provider identity.');
+    if (repairSources.size > 1) throw new Error('Provider context recovery has conflicting frozen sources.');
+    if (repairSources.size === 1) {
+      headRootId = [...repairSources][0]!;
+      if (currentHead !== headRootId && !committed) throw new Error('Context changed without a committed repair of the rejected request.');
+    }
+    await this.assertProviderRecoverySource(source, headRootId);
     const currentInput = source.recipe.currentTurnInput;
     const currentInputRecord = currentInput && typeof currentInput === 'object' && !Array.isArray(currentInput) ? currentInput : undefined;
+    let previewRecipe = source.recipe;
+    if (headRootId !== source.rootId) {
+      // Native tools can introduce managed media and short references after the rejected request
+      // was frozen. Rebuild only these Context-derived projections at the proved frontier; every
+      // authority/settings/tool/addendum decision stays frozen in the original recipe.
+      const materialized = await this.context.materialize(headRootId);
+      const attachmentCatalogState = await this.attachmentCatalog.projectState(conversationId,
+        materialized.segments,
+        typeof currentInputRecord?.messageRevisionId === 'string' ? [currentInputRecord.messageRevisionId] : []);
+      const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(conversationId, attachmentCatalogState.catalog);
+      const persistentHandles = mergeConversationChildHandles(
+        await readConversationChildHandles(this.database, this.contentStore, conversationId),
+        normalizeModelHandleCatalog(source.recipe.modelHandleCatalog).entries
+      );
+      const modelHandleCatalog = buildModelHandleCatalog([
+        ...materialized.segments.map(segment => segment.content.toString('utf8')),
+        attachmentCatalogState.catalog
+      ], [...attachmentHandles.entries, ...persistentHandles]);
+      previewRecipe = requireRecord(normalizePlainJson({ ...source.recipe, attachmentCatalogState, modelHandleCatalog },
+        'Provider context recovery preview recipe'), 'Provider context recovery preview recipe');
+    }
+    const fullRequest = headRootId === source.rootId
+      ? await this.modelProvider.replay(failedModelRequestId)
+      : await this.modelProvider.previewOrdinaryRequest({
+          turnId, contextRootId: headRootId,
+          authoritySnapshotId: requireId(source.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
+          ...(typeof source.request.settings_snapshot_object_id === 'string'
+            ? { settingsSnapshotContentObjectId: source.request.settings_snapshot_object_id } : {}),
+          recipe: previewRecipe,
+          idempotencyKey: `provider-context-recovery-preview:${failedModelRequestId}:${headRootId}`
+        });
+    const adapter = await this.providers.resolve(fullRequest.providerId);
+    if (adapter.providerId !== fullRequest.providerId) throw new Error('Provider context recovery changed provider identity.');
     const result = await this.coordinate({
       turnId,
       authoritySnapshotId: requireId(source.request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
       ...(typeof source.request.settings_snapshot_object_id === 'string' ? { settingsSnapshotContentObjectId: source.request.settings_snapshot_object_id } : {}),
-      headRootId: source.rootId,
+      headRootId,
       trigger: 'auto', providerContextOverflowRequestId: failedModelRequestId,
       requestBudget: this.modelProvider.planFullRequest(fullRequest, adapter),
       protectedCurrentInputTokens: typeof currentInputRecord?.estimatedTokens === 'number' ? currentInputRecord.estimatedTokens : 0,
       tools: normalizeCompressionToolDefinitions(source.recipe.tools, 'Rejected request tools'),
-      modelHandleCatalog: normalizeModelHandleCatalog(source.recipe.modelHandleCatalog)
+      modelHandleCatalog: normalizeModelHandleCatalog(previewRecipe.modelHandleCatalog)
     });
     if (result.status === 'compressed' && await this.context.currentHeadRootId(conversationId) !== result.result.rootId) {
       throw new Error('The proved context repair is not the current Conversation head.');
     }
     return result;
+  }
+
+  /** Only this rejected native request's immutable, closed append frontier may extend its input. */
+  private async assertProviderRecoverySource(
+    source: { request: DomainRow; recipe: Record<string, PlainJsonValue>; rootId: string },
+    candidateRootId: string,
+    message = 'Context changed without a committed repair of the rejected request.'
+  ): Promise<void> {
+    const reject = (): never => { throw new Error(message); };
+    const requestId = requireId(source.request.id, 'ModelRequest.id');
+    const turnId = requireId(source.request.turn_id, 'ModelRequest.turn_id');
+    const turn = await this.requireDomain('Turn', turnId);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    if ((await readNativeSteeringInFlight(this.database, conversationId)).length > 0) reject();
+    const ownedCalls = await listAllDomainRows(this.database, 'ToolCallSourceLink', { model_request_id: requestId });
+    if (candidateRootId === source.rootId) {
+      // Even an unchanged input is unsafe if a native admission was committed but its Context
+      // closure was interrupted. Recovery must settle/append it first, never hide or replay it.
+      if (ownedCalls.length > 0) reject();
+      return;
+    }
+    const native = source.recipe.nativeResponses;
+    if (!native || typeof native !== 'object' || Array.isArray(native)) reject();
+    if (!await this.optionalDomain('ContextSequenceRoot', candidateRootId)) reject();
+    const [original, candidate] = await Promise.all([
+      this.context.materializeStructure(source.rootId), this.context.materializeStructure(candidateRootId)
+    ]);
+    if (original.root.conversation_id !== candidate.root.conversation_id
+      || candidate.records.length <= original.records.length
+      || original.records.some((record, index) => record.node.id !== candidate.records[index]?.node.id
+        || record.segment.id !== candidate.records[index]?.segment.id)) reject();
+    if (candidate.root.conversation_id !== conversationId) reject();
+    const callSources = new Set<string>();
+    const resultSources = new Set<string>();
+    let appendRootId = source.rootId;
+    let appendRoot = original.root;
+    for (const [offset, record] of candidate.records.slice(original.records.length).entries()) {
+      // Native writers append each occurrence atomically under this exact immutable root
+      // identity. A fork, truncate or reordered/rebuilt suffix cannot borrow its source rows.
+      appendRootId = contextAppendRootId(conversationId, appendRootId, requireId(record.node.id, 'ContextSequenceNode.id'));
+      const nextRoot = await this.optionalDomain('ContextSequenceRoot', appendRootId);
+      if (!nextRoot || nextRoot.conversation_id !== conversationId
+        || nextRoot.segment_count !== BigInt(original.records.length + offset + 1)
+        || BigInt(String(nextRoot.root_seq)) <= BigInt(String(appendRoot.root_seq))
+        || (nextRoot.tail_node_id ?? nextRoot.root_node_id) !== record.node.id) reject();
+      appendRoot = nextRoot!;
+      const sources = await listAllDomainRows(this.database, 'ContextSegmentSource', { segment_id: record.segment.id });
+      if (sources.length !== 1) reject();
+      const occurrence = sources[0]!;
+      if (occurrence.source_kind === 'message_revision') {
+        if (record.segment.segment_kind !== 'message') reject();
+        const revision = await this.requireDomain('MessageRevision', requireId(occurrence.source_id, 'Context source'));
+        const links = await listAllDomainRows(this.database, 'ModelRequestMessageLink', { message_id: revision.message_id });
+        if (revision.role !== 'model' || revision.content_object_id !== record.segment.content_object_id
+          || revision.revision_seq !== occurrence.source_revision || links.length !== 1 || links[0]!.model_request_id !== requestId) reject();
+        const metadata = asContentObjectMetadata(await this.requireDomain('ContentObject', String(revision.content_object_id)));
+        const value = requireRecord(normalizePlainJson(JSON.parse((await this.contentStore.read(metadata)).toString('utf8')), 'Native item'), 'Native item');
+        if (value.role !== 'model' || !Array.isArray(value.parts) || value.parts.length !== 1) throw new Error(message);
+        const part = requireRecord(value.parts[0]!, 'Native item part');
+        const item = requireRecord(part.outputItem, 'Native output item');
+        if (typeof part.text !== 'string' || part.text.length === 0
+          || part.functionCall !== undefined || part.configurationUpdate !== undefined
+          || typeof item.id !== 'string' || !item.id
+          || typeof item.providerResponseId !== 'string' || !item.providerResponseId
+          || typeof item.ordinal !== 'number' || !Number.isSafeInteger(item.ordinal)
+          || revision.id !== nativeItemRevisionId(turnId, requestId, `content:${item.providerResponseId}:${item.ordinal}`)) reject();
+        continue;
+      }
+      if (record.segment.segment_kind !== 'tool_pair'
+        || (occurrence.source_kind !== 'tool_call' && occurrence.source_kind !== 'tool_model_result')) reject();
+      const result = occurrence.source_kind === 'tool_model_result'
+        ? await this.requireDomain('ToolModelResult', requireId(occurrence.source_id, 'Context result source')) : undefined;
+      const callId = requireId(result ? result.tool_call_id : occurrence.source_id, 'Context ToolCall');
+      const call = await this.requireDomain('ToolCall', callId);
+      const links = await listAllDomainRows(this.database, 'ToolCallSourceLink', { tool_call_id: callId });
+      const admission = await this.effects.readNativeAdmission(callId);
+      const terminal = await this.effects.readTerminalResult(callId, false);
+      if (call.turn_id !== turnId || call.call_seq !== occurrence.source_revision
+        || links.length !== 1 || links[0]!.model_request_id !== requestId
+        || !admission || admission.providerCallId !== links[0]!.provider_call_id
+        || !terminal || (result && terminal.toolModelResultId !== result.id)) reject();
+      if (result) {
+        if (!callSources.has(callId) || resultSources.has(callId)) reject();
+        resultSources.add(callId);
+      } else {
+        if (callSources.has(callId)) reject();
+        callSources.add(callId);
+      }
+    }
+    // The failed chain may have admitted work just before crashing. Every owned native admission
+    // must be represented by its call AND terminal result before compression can hide the prefix.
+    for (const link of ownedCalls) {
+      const callId = requireId(link.tool_call_id, 'ToolCallSourceLink.tool_call_id');
+      if (!callSources.has(callId) || !resultSources.has(callId)) reject();
+    }
+    if (appendRootId !== candidateRootId) reject();
+    await this.context.assertNativeContextClosed(candidateRootId);
   }
 
   private async readRequestRecipe(request: DomainRow): Promise<Record<string, PlainJsonValue>> {

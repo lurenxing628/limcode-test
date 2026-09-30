@@ -218,7 +218,7 @@ export class ContextCompressionControlPlane {
     const blockId = compressionBlockIdFor(conversationId, headRootId, idempotencyKey);
     const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
-    const rootId = stableId('compression_root', blockId, headRootId);
+    const rootId = compressionRootIdFor(blockId, headRootId);
     const projectionId = stableId('compression_projection', blockId);
     const existing = await this.getOptional('CompressionBlock', blockId);
     if (existing) {
@@ -402,7 +402,7 @@ export class ContextCompressionControlPlane {
     const blockId = stableId('compression_replacement', previousBlockId, idempotencyKey);
     const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
-    const rootId = stableId('compression_root', blockId, expectedHeadRootId);
+    const rootId = compressionRootIdFor(blockId, expectedHeadRootId);
     const projectionId = stableId('compression_projection', blockId);
     const projectionPurpose = replacementProjectionPurpose(previousStatus);
     const previousBlock = await this.requireDomain('CompressionBlock', previousBlockId);
@@ -895,6 +895,11 @@ function stableId(kind: string, ...parts: string[]): string {
     .update(parts.join('\0'))
     .digest('hex');
   return `${kind}_${digest}`;
+}
+
+/** Exact result-root identity of one immutable compression over its source frontier. */
+export function compressionRootIdFor(blockId: string, sourceRootId: string): string {
+  return stableId('compression_root', requireId(blockId, 'compressionBlockId'), requireId(sourceRootId, 'sourceRootId'));
 }
 
 export function compressionSegmentIdFor(blockIdInput: string): string {

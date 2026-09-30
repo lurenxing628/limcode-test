@@ -636,7 +636,7 @@ export class ContextSequenceControlPlane {
       : 0n;
     const plans = missingFacts.map((fact, index) => {
       const nodeId = contextSequenceNodeId(parentNodeId, fact.segmentId);
-      const rootId = stableId('context_root_append', conversationId, previousRootId ?? '<null>', nodeId);
+      const rootId = contextAppendRootId(conversationId, previousRootId, nodeId);
       segmentCount += 1n;
       estimatedTokens += estimateTokens(prepared[index].metadata.byte_length);
       if (compression) tailSegmentCount += 1n;
@@ -1234,7 +1234,7 @@ export class ContextSequenceControlPlane {
       parentNodeId = inheritedNodeId;
     }
     const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
-    const rootId = stableId('context_root_append', conversationId, '<null>', nodeId);
+    const rootId = contextAppendRootId(conversationId, null, nodeId);
     const headLinkId = stableId('conversation_context_head', conversationId);
     return {
       rootId,
@@ -1292,7 +1292,7 @@ export class ContextSequenceControlPlane {
     }]);
     const parentNodeId = base.compression ? base.tailNodeId : base.rootNodeId;
     const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
-    const rootId = stableId('context_root_append', conversationId, baseRootId ?? '<null>', nodeId);
+    const rootId = contextAppendRootId(conversationId, baseRootId, nodeId);
     const now = this.timestamp();
     return {
       steps: [
@@ -1955,7 +1955,7 @@ export class ContextSequenceControlPlane {
     const segmentId = stableSegmentId(sources);
     const parentNodeId = base.compression ? base.tailNodeId : base.rootNodeId;
     const nodeId = contextSequenceNodeId(parentNodeId, segmentId);
-    const rootId = stableId('context_root_append', conversationId, baseRootId ?? '<null>', nodeId);
+    const rootId = contextAppendRootId(conversationId, baseRootId, nodeId);
     const existingOccurrence = await this.readOccurrence(sources);
     if (existingOccurrence) {
       assertExistingSegment(existingOccurrence, segmentId, segmentKind, planInput.content.metadata.id);
@@ -2591,6 +2591,12 @@ function stableSourceRowId(source: ContextSourceOccurrence): string {
   return source.sourceKind === 'message_revision'
     ? stableId('context_segment_source', source.sourceKind, source.sourceId)
     : stableId('context_segment_source', source.sourceKind, source.sourceId, source.sourceRevision.toString());
+}
+
+/** Immutable append identity shared by producers and exact-frontier recovery proofs. */
+export function contextAppendRootId(conversationId: string, baseRootId: string | null, nodeId: string): string {
+  return stableId('context_root_append', requireId(conversationId, 'conversationId'),
+    baseRootId === null ? '<null>' : requireId(baseRootId, 'baseRootId'), requireId(nodeId, 'nodeId'));
 }
 
 export function contextSequenceNodeId(parentNodeId: string | null, segmentId: string): string {
