@@ -251,13 +251,15 @@ async function fixture(run, hooks = {}) {
 function scopeRouter(f, onMessage = () => {}) {
   const { VscodeReliableKernelCommandRouter } = require('../../dist/extension/backend/application/reliableKernel/VscodeReliableKernelCommandRouter.js');
   const T = require('../../dist/extension/shared/protocol.js').BridgeMessageType;
-  const messages = [], webviews = new Map();
+  const messages = [], receivedRequests = [], webviews = new Map();
   const product = { configuration: f.configuration, application: f.app, debugCapture: { setListener() {} }, toolHost: { setStateChangeListener() {}, definitionRecords() { return []; }, mcp: { sourceRecords() { return []; } }, skillDefinitions() { return []; }, ruleFiles() { return []; } } };
   const router = new VscodeReliableKernelCommandRouter(product);
-  return { router, T, messages,
+  return { router, T, messages, receivedRequests,
     send(id, type, payload, client = 'scope-client') {
       if (!webviews.has(client)) webviews.set(client, { async postMessage(message) { messages.push(structuredClone(message)); onMessage(message); return true; } });
-      router.handle(client, webviews.get(client), { id, type, payload });
+      const message = { id, type, payload };
+      receivedRequests.push(structuredClone(message));
+      router.handle(client, webviews.get(client), message);
     },
     async receive(id, timeoutMs = 8000) {
       const deadline = Date.now() + timeoutMs;
@@ -265,6 +267,19 @@ function scopeRouter(f, onMessage = () => {}) {
       return messages.find(message => message.correlationId === id).payload;
     }
   };
+}
+
+function assertUiSaveRequest(ui, channel) {
+  const request = ui.requests.at(-1);
+  const pending = ui.store.pendingFor('conversation', 'parent');
+  assert.equal(request.id, pending.requestId, 'UI wire preserves the Store reserved request ID');
+  assert.equal(channel.receivedRequests.at(-1).id, pending.requestId, 'real Router receives that pending wire ID');
+  return request;
+}
+
+function assertUiSaveConfirmed(ui, channel, request) {
+  assert.equal(ui.store.completedSaveFor('conversation', 'parent'), request.id, 'real ACK confirms this exact UI request');
+  assert.ok(channel.messages.some(message => message.correlationId === request.id && message.type === channel.T.ModelProfileScopeSnapshot));
 }
 
 for (const inheritedScope of ['agent', 'workflow']) test(`review scope actual component save to Turn preserves ${inheritedScope} identity, not global fallback`, async () => {
@@ -290,7 +305,9 @@ for (const inheritedScope of ['agent', 'workflow']) test(`review scope actual co
       const control = ui.control(provider, effective.model);
       assert.equal(control.defaultLabel.value, '渠道默认：1024 tokens');
       control.save('2048');
+      const thinkingRequest = assertUiSaveRequest(ui, channel);
       await ui.store.awaitSavedForScope('conversation', 'parent');
+      assertUiSaveConfirmed(ui, channel, thinkingRequest);
       const saved = ui.store.confirmedFor('conversation', 'parent');
       assert.equal(saved.profile.inheritModel, true);
       assert.equal(saved.profile.providerConfigId, provider.id);
@@ -299,7 +316,9 @@ for (const inheritedScope of ['agent', 'workflow']) test(`review scope actual co
       assert.equal(f.requests.at(-1).modelId, provider.model);
       assert.equal(f.wires.at(-1).body.generationConfig.thinkingConfig.thinkingBudget, 2048);
       assert.equal(f.wires.at(-1).body.reasoning_effort, undefined);
-      control.save('default'); await ui.store.awaitSavedForScope('conversation', 'parent');
+      control.save('default'); const resetRequest = assertUiSaveRequest(ui, channel);
+      await ui.store.awaitSavedForScope('conversation', 'parent');
+      assertUiSaveConfirmed(ui, channel, resetRequest);
       assert.equal(ui.store.confirmedFor('conversation', 'parent').profile, undefined, 'reset restores inheritance, not pinned global identity');
       assert.equal((await f.app.agentLoop.runInput(f.input(`component-reset-${inheritedScope}`))).terminalStatus, 'completed');
       assert.equal(f.requests.at(-1).modelId, provider.model);
@@ -501,8 +520,9 @@ for (const target of clearAckTargets) test(`review scope clear receipt is channe
     ui = require('./session-thinking-ui-fixture.cjs').createThinkingUi(message => channel.send(message.id, message.type, message.payload));
     const receipts = [];
     const saved = async action => {
-      action(); const request = ui.requests.at(-1);
+      action(); const request = assertUiSaveRequest(ui, channel);
       await ui.store.awaitSavedForScope('conversation', 'parent');
+      assertUiSaveConfirmed(ui, channel, request);
       const receipt = await channel.receive(request.id);
       receipts.push({ request, receipt });
       assert.equal(ui.store.pendingFor('conversation', 'parent'), undefined);
@@ -577,16 +597,19 @@ test('review scope delayed real clear ack releases queued new channel only once,
     ui = require('./session-thinking-ui-fixture.cjs').createThinkingUi(message => channel.send(message.id, message.type, message.payload));
     try {
       ui.store.activateScope('conversation', 'parent'); await channel.receive(ui.requests.at(-1).id);
-      ui.control(f.provider, f.provider.model).save('high'); await ui.store.awaitSavedForScope('conversation', 'parent');
-      ui.store.clearProfileScope('conversation', 'parent'); delayedId = ui.requests.at(-1).id;
+      ui.control(f.provider, f.provider.model).save('high'); const thinkingRequest = assertUiSaveRequest(ui, channel);
+      await ui.store.awaitSavedForScope('conversation', 'parent');
+      assertUiSaveConfirmed(ui, channel, thinkingRequest);
+      ui.store.clearProfileScope('conversation', 'parent'); delayedId = assertUiSaveRequest(ui, channel).id;
       await channel.receive(delayedId); assert.ok(held);
       ui.store.setProfileForScope('conversation', 'parent', { providerConfigId: provider.id, provider: provider.provider, model: provider.model });
       assert.equal(ui.requests.at(-1).id, delayedId, 'healthy UI cannot submit newer write before clear settles');
-      ui.receive(held); const selected = ui.requests.at(-1);
+      ui.receive(held); const selected = assertUiSaveRequest(ui, channel);
       assert.equal(selected.payload.operation, 'select');
       ui.receive(held);
       assert.equal(ui.store.pendingFor('conversation', 'parent').requestId, selected.id);
       await ui.store.awaitSavedForScope('conversation', 'parent');
+      assertUiSaveConfirmed(ui, channel, selected);
       ui.receive(held);
       assert.equal(ui.store.effectiveFor('conversation', 'parent').providerConfigId, provider.id);
       assert.equal(ui.store.confirmedFor('conversation', 'parent').profile.providerConfigId, provider.id);

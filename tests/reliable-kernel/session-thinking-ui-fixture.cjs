@@ -11,7 +11,7 @@ exports.createThinkingUi = function createThinkingUi(send) {
   const requests = [], timers = [];
   const client = vue.reactive({ modelProfiles: [], modelProfileScopeLinks: [] });
   let store;
-  const bridge = { request(type, payload) { const id = `ui-${requests.length}`; const message = { id, type, payload: structuredClone(payload) }; requests.push(message); send(message); return id; } };
+  const bridge = { request(type, payload, options = {}) { const id = options.requestId?.trim() || protocol.createMessageId(); const message = { id, type, payload: structuredClone(payload) }; requests.push(message); send(message); return id; } };
   function load(file, props, names) {
     let source = fs.readFileSync(file, 'utf8');
     if (props) source = source.match(/<script setup lang="ts">([\s\S]*?)<\/script>/)[1] + `\nexport { ${names.join(',')} };`;
