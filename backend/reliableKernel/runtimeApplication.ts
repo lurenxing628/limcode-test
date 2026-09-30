@@ -145,6 +145,7 @@ export class ReliableKernelApplication {
   public readonly webviewFeed: ReliableKernelWebviewFeedBridge;
 
   private closePromise: Promise<void> | undefined;
+  private closeDependenciesCompleted = false;
   private handoffPromise: Promise<void> | undefined;
   private convergenceTimer: NodeJS.Timeout | undefined;
   private convergenceTask: Promise<void> | undefined;
@@ -464,25 +465,33 @@ export class ReliableKernelApplication {
 
   public close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
-    this.closePromise = (async () => {
-      this.convergenceClosed = true;
-      this.unsubscribeConvergence?.();
-      this.unsubscribeConvergence = undefined;
-      if (this.convergenceTimer) clearTimeout(this.convergenceTimer);
-      this.convergenceTimer = undefined;
-      await this.convergenceTask?.catch(() => undefined);
-      this.webviewFeed.close();
-      this.runtime.clientFeed.close();
-      await this.beginHandoff();
-      await this.childOwnedProcessCleanup.dispose();
-      await this.processes.dispose();
-      await this.processDeliveries.dispose();
-      await this.toolDispatcher.dispose?.();
-      await this.providers.dispose?.();
-      await this.runtimeDiagnostics?.close();
+    const task = (async () => {
+      if (!this.closeDependenciesCompleted) {
+        this.convergenceClosed = true;
+        this.unsubscribeConvergence?.();
+        this.unsubscribeConvergence = undefined;
+        if (this.convergenceTimer) clearTimeout(this.convergenceTimer);
+        this.convergenceTimer = undefined;
+        await this.convergenceTask?.catch(() => undefined);
+        this.webviewFeed.close();
+        this.runtime.clientFeed.close();
+        await this.beginHandoff();
+        await this.childOwnedProcessCleanup.dispose();
+        await this.processes.dispose();
+        await this.processDeliveries.dispose();
+        await this.toolDispatcher.dispose?.();
+        await this.providers.dispose?.();
+        await this.runtimeDiagnostics?.close();
+        this.closeDependenciesCompleted = true;
+      }
       await this.database.close();
     })();
-    return this.closePromise;
+    this.closePromise = task;
+    void task.catch(() => {
+      // Retrying a failed durable release must not reopen or dispose capabilities again.
+      if (this.closeDependenciesCompleted && this.closePromise === task) this.closePromise = undefined;
+    });
+    return task;
   }
 
   /**

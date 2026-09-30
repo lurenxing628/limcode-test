@@ -146,6 +146,7 @@ export class VscodeReliableKernelCommandRouter {
   private configurationMutationQueue: Promise<void> = Promise.resolve();
   private readonly clientIdByWebview = new WeakMap<vscode.Webview, string>();
   private readonly settingsSaveBarrier = new GlobalSettingsSaveBarrier();
+  private closing = false;
 
   public constructor(
     private readonly product: VscodeReliableKernelProductRuntime,
@@ -153,32 +154,73 @@ export class VscodeReliableKernelCommandRouter {
   ) {
     this.product.debugCapture.setListener(state => this.options.broadcast?.({ id: randomUUID(), type: BridgeMessageType.DebugCaptureResult, channel: 'diagnostics', payload: { state } }));
     this.product.toolHost.setStateChangeListener(() => {
-      if (!this.options.broadcast) return;
+      if (this.closing || !this.options.broadcast) return;
       void this.product.ensureCapabilitiesReady()
-        .then(() => this.configurationSnapshot())
-        .then((snapshot) => this.options.broadcast?.(snapshot))
+        .then(() => this.closing ? undefined : this.configurationSnapshot())
+        .then((snapshot) => { if (snapshot && !this.closing) this.options.broadcast?.(snapshot); })
         .catch((error) => console.warn('[LimCode] Failed to publish refreshed capability catalog.', error));
     });
+  }
+
+  /** Reply through the existing typed rejection paths without dispatching against a retired Runtime. */
+  public rejectClosed(clientId: string, webview: vscode.Webview, message: WebviewToExtensionMessage): void {
+    this.beginClose();
+    this.handle(clientId, webview, message, new Error('可靠 ApplicationFacade 已关闭。'));
+  }
+
+  public beginClose(): void {
+    this.closing = true;
   }
 
   public handle(
     clientId: string,
     webview: vscode.Webview,
-    message: WebviewToExtensionMessage
+    message: WebviewToExtensionMessage,
+    rejection?: Error
   ): void {
     this.clientIdByWebview.set(webview, clientId);
     if (message.type === BridgeMessageType.ModelProfileScopeSet || message.type === BridgeMessageType.ModelProfileScopeClear || message.type === BridgeMessageType.ModelProfileScopeRead) {
-      this.handleModelProfileScope(clientId, webview, message);
+      if (rejection) {
+        const input = message.payload as ModelProfileScopeReadPayload & Partial<ModelProfileScopeSetPayload>;
+        this.post(webview, {
+          id: randomUUID(), type: BridgeMessageType.ModelProfileScopeSnapshot, channel: 'state', correlationId: message.id,
+          payload: { scopeKind: input?.scopeKind, ...(input?.scopeId ? { scopeId: input.scopeId } : {}),
+            authorityId: input?.authorityId ?? '', sessionId: input?.sessionId ?? '', sequence: 0, revision: '',
+            profileState: 'unknown', outcome: 'uncertain', error: rejection.message }
+        });
+      } else this.handleModelProfileScope(clientId, webview, message);
       return;
     }
     const gate = this.options.writeGate;
     const dispatch = (): Promise<void> => this.dispatch(clientId, webview, message);
     // A write refused while frozen fails like any other command: the sender gets its rejection
     // (a Turn input stays in the composer) and the reason is shown.
-    void (gate && isWriteCommand(message) ? gate.run(dispatch) : dispatch()).catch((error) => {
+    void (rejection ? Promise.reject(rejection) : gate && isWriteCommand(message) ? gate.run(dispatch) : dispatch()).catch((error) => {
       const text = error instanceof Error ? error.message : String(error);
       console.error('[LimCode] Reliable Webview command failed.', message.type, error);
-      if (
+      if (rejection && (message.type === BridgeMessageType.AttachmentOpen || message.type === BridgeMessageType.AttachmentReload)) {
+        const request = attachmentOpenRequest(message.payload ?? {});
+        if (message.type === BridgeMessageType.AttachmentOpen) {
+          this.post(webview, { id: randomUUID(), type: BridgeMessageType.AttachmentOpenResult, channel: 'command',
+            correlationId: message.id, payload: { request, status: 'failed', error: text } });
+        } else {
+          this.post(webview, { id: randomUUID(), type: BridgeMessageType.AttachmentReloadResult, channel: 'state',
+            correlationId: message.id, payload: { request, status: 'failed', error: text } });
+        }
+      } else if (rejection && (message.type === BridgeMessageType.CheckpointShadowStatsGet || message.type === BridgeMessageType.CheckpointShadowDelete)) {
+        // Checkpoint is disabled in this Runtime; keep its existing empty-stats response so the
+        // statistics view can finish its pending request; report the closing rejection alongside it.
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CheckpointShadowStatsSnapshot, channel: 'state',
+          correlationId: message.id, payload: { stats: [] } });
+        this.postRequestError(webview, message.type, text, message.id);
+      } else if (rejection && message.type === BridgeMessageType.CheckpointRestore && message.payload) {
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CheckpointRestoreResult, channel: 'state',
+          correlationId: message.id, payload: { checkpointId: message.payload.checkpointId, conversationId: message.payload.conversationId,
+            result: { status: 'failed', message: text } } });
+      } else if (rejection && message.type === BridgeMessageType.CheckpointDiffOpen && message.payload) {
+        this.post(webview, { id: randomUUID(), type: BridgeMessageType.CheckpointDiffOpenResult, channel: 'state',
+          correlationId: message.id, payload: { ...message.payload, status: 'failed', message: text } });
+      } else if (
         (message.type === BridgeMessageType.TurnStart || message.type === BridgeMessageType.TurnEnqueue)
         && message.payload?.command?.commandId
         && message.payload.conversationId
@@ -251,7 +293,7 @@ export class VscodeReliableKernelCommandRouter {
       } else {
         this.postRequestError(webview, message.type, text, message.id);
       }
-      if (isConfigurationMutationType(message.type)) {
+      if (!this.closing && isConfigurationMutationType(message.type)) {
         void this.postConfigurationSnapshot(webview).catch((snapshotError) =>
           console.warn('[LimCode] Failed to reconcile configuration snapshot after mutation error.', snapshotError)
         );
@@ -2375,12 +2417,13 @@ export class VscodeReliableKernelCommandRouter {
   private post(webview: vscode.Webview, message: ExtensionToWebviewMessage): void {
     void webview.postMessage(toStructuredClonePlainData(message, 'reliable command result')).then(
       (delivered) => {
-        if (delivered) return;
+        if (delivered || this.closing) return;
         const clientId = this.clientIdByWebview.get(webview);
         if (clientId) this.product.application.webviewFeed.reconnect(clientId);
       },
       (error) => {
-        console.warn('[LimCode] Reliable command result delivery failed; reconnecting the bounded Feed.', error);
+        console.warn('[LimCode] Reliable command result delivery failed.', error);
+        if (this.closing) return;
         const clientId = this.clientIdByWebview.get(webview);
         if (clientId) this.product.application.webviewFeed.reconnect(clientId);
       }

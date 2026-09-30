@@ -184,10 +184,13 @@ export class ConversationRuntimeOwnerManager {
   private readonly processId = process.pid;
   private readonly processStartIdentity = ownProcessStartIdentity();
   private readonly owned = new Map<string, OwnedConversation>();
+  /** Released locally; retained only to retry exact-token durable cleanup after an I/O failure. */
+  private readonly pendingReleases = new Map<string, OwnedConversation>();
   private readonly chains = new Map<string, Promise<void>>();
   private pendingWorkProbe: ConversationRuntimePendingWorkProbe = () => Promise.resolve(true);
   private claimEligibilityProbe: ConversationRuntimeClaimEligibilityProbe = () => Promise.resolve(true);
   private closed = false;
+  private closePromise: Promise<void> | undefined;
 
   public constructor(
     binding: RootBinding,
@@ -339,7 +342,7 @@ export class ConversationRuntimeOwnerManager {
     const candidates = [...this.owned.values()]
       .filter((state) => state.pins === 0)
       .map((state) => state.conversationId);
-    for (const id of candidates) {
+    for (const id of new Set([...candidates, ...this.pendingReleases.keys()])) {
       if (this.closed) return;
       await this.enqueue(id, () => this.releaseIfIdleLocked(id)).catch(() => undefined);
     }
@@ -356,13 +359,23 @@ export class ConversationRuntimeOwnerManager {
    * in-flight pins belong to operations whose writes can no longer commit, and leaving a
    * live-process token behind would block the conversation for every other Host indefinitely.
    */
-  public async close(): Promise<void> {
-    if (this.closed) return;
+  public close(): Promise<void> {
     this.closed = true;
-    await Promise.allSettled([...this.chains.values()]);
-    const states = [...this.owned.values()];
-    this.owned.clear();
-    await Promise.allSettled(states.map((state) => this.releaseRecord(state)));
+    if (this.closePromise) return this.closePromise;
+    const task = (async () => {
+      await Promise.allSettled([...this.chains.values()]);
+      for (const state of this.owned.values()) this.pendingReleases.set(state.conversationId, state);
+      this.owned.clear();
+      const results = await Promise.allSettled([...this.pendingReleases.values()]
+        .map((state) => this.releasePendingRecord(state)));
+      const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (rejected) throw rejected.reason;
+    })();
+    this.closePromise = task;
+    void task.finally(() => {
+      if (this.closePromise === task) this.closePromise = undefined;
+    }).catch(() => undefined);
+    return task;
   }
 
   private enqueue<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
@@ -387,10 +400,13 @@ export class ConversationRuntimeOwnerManager {
   ): Promise<OwnedConversation | undefined> {
     const existing = this.owned.get(conversationId);
     if (existing) return existing;
+    const pendingRelease = this.pendingReleases.get(conversationId);
+    if (pendingRelease) await this.releasePendingRecord(pendingRelease);
     const state = await this.acquireRecord(conversationId, busy);
     if (!state) return undefined;
     if (this.closed) {
-      await this.releaseRecord(state).catch(() => undefined);
+      this.pendingReleases.set(conversationId, state);
+      await this.releasePendingRecord(state);
       throw closedManagerError();
     }
     this.owned.set(conversationId, state);
@@ -399,7 +415,13 @@ export class ConversationRuntimeOwnerManager {
 
   private async releaseIfIdleLocked(conversationId: string, claimedByCaller = false): Promise<boolean> {
     const state = this.owned.get(conversationId);
-    if (!state || state.pins > 0) return false;
+    if (!state) {
+      const pendingRelease = this.pendingReleases.get(conversationId);
+      if (!pendingRelease) return false;
+      await this.releasePendingRecord(pendingRelease);
+      return true;
+    }
+    if (state.pins > 0) return false;
     let pending = true;
     try {
       pending = state.handBack !== true && await this.pendingWorkProbe(conversationId);
@@ -417,8 +439,9 @@ export class ConversationRuntimeOwnerManager {
     }
     // Local ownership drops before the durable record so stale fenced writes fail immediately;
     // the durable release below is exact-token and never touches another owner's record.
+    this.pendingReleases.set(conversationId, state);
     this.owned.delete(conversationId);
-    await this.releaseRecord(state);
+    await this.releasePendingRecord(state);
     return true;
   }
 
@@ -551,6 +574,19 @@ export class ConversationRuntimeOwnerManager {
         `Conversation ${state.conversationId} is no longer owned by token ${state.ownerToken}.`
       )
     );
+  }
+
+  private async releasePendingRecord(state: OwnedConversation): Promise<void> {
+    try {
+      await this.releaseRecord(state);
+    } catch (error) {
+      // A different canonical token proves ours is already gone; never release its replacement.
+      if (!(error instanceof ConversationRuntimeOwnerClaimError)
+        || error.code !== 'conversation-runtime-owner-mismatch') throw error;
+    }
+    if (this.pendingReleases.get(state.conversationId) === state) {
+      this.pendingReleases.delete(state.conversationId);
+    }
   }
 }
 

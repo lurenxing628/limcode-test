@@ -226,6 +226,8 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
   private readonly pending: ReliableDiagnosticEventRecord[] = [];
   private flushTimer: ReturnType<typeof setTimeout> | undefined;
   private flushPromise: Promise<void> | undefined;
+  private enqueuedEventSequence = 0;
+  private settledEventSequence = 0;
   private closed = false;
   private droppedEvents = 0;
   private persistedEvents = 0;
@@ -308,6 +310,9 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
     this.clearFlushTimer();
     if (this.pending.length === 0) return;
     this.flushPromise = this.flushOnce().finally(() => {
+      // Pending retains the newest contiguous suffix; everything before it has been persisted or
+      // dropped, including pending events evicted while this batch was in flight.
+      this.settledEventSequence = this.enqueuedEventSequence - this.pending.length;
       this.flushPromise = undefined;
       if (!this.closed && this.pending.length > 0) this.scheduleFlush();
     });
@@ -316,7 +321,9 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
 
   public async inspect(input: { scopeId?: string; limit?: number } = {}): Promise<ReliableDiagnosticJournalInspection> {
     this.emitAggregates();
-    while (this.flushPromise || this.pending.length > 0) await this.flush();
+    const inspectThrough = this.enqueuedEventSequence;
+    // Include already received events and rollups without waiting for a live producer to go quiet.
+    while (this.settledEventSequence < inspectThrough) await this.flush();
     const limit = normalizeLimit(input.limit);
     const scopeId = input.scopeId?.trim();
     let events: ReliableDiagnosticEventRecord[] = [];
@@ -402,6 +409,7 @@ export class ReliableDiagnosticJournal implements ReliableDiagnosticRollupObserv
   }
 
   private enqueue(event: ReliableDiagnosticEventRecord): void {
+    this.enqueuedEventSequence += 1;
     if (this.pending.length >= MAX_PENDING_EVENTS) {
       this.pending.shift();
       this.droppedEvents += 1;

@@ -765,7 +765,14 @@ export class RuntimeDatabase {
    * could have registered this Host's liveness identity.
    */
   public close(): Promise<void> {
-    this.closePromise ??= this.closeRuntime();
+    if (!this.closePromise) {
+      const task = this.closeRuntime();
+      this.closePromise = task;
+      // The worker remains fenced; a later close retries exact-token owner cleanup only.
+      void task.catch(() => {
+        if (this.closePromise === task) this.closePromise = undefined;
+      });
+    }
     return this.closePromise;
   }
 
@@ -790,9 +797,12 @@ export class RuntimeDatabase {
       // The worker ignores every request that reached it after 'close', and a graceful exit fails
       // none of them. Reject them here, or an owner operation awaiting one would hold close forever.
       this.failPending(new Error('RuntimeDatabase is closed.'));
-      await this.conversationOwners.close().catch(() => undefined);
-      await this.unregisterHostLiveness().catch(() => undefined);
-      this.performanceMetricSinks.clear();
+      try {
+        await this.conversationOwners.close();
+      } finally {
+        await this.unregisterHostLiveness().catch(() => undefined);
+        this.performanceMetricSinks.clear();
+      }
     }
   }
 

@@ -670,9 +670,12 @@ test('存活宿主携带陈旧 ExecutionLease 也不可被偷，畸形所有权�
     const malformed = 'conversation-malformed-record';
     const holderManager = new ConversationRuntimeOwnerManager(binding, 'malformed-holder');
     holderManager.setPendingWorkProbe(async () => false);
+    let recordPath;
+    let originalRecordBytes;
     try {
       await holderManager.claim(malformed);
-      const recordPath = path.join(conversationRuntimeOwnerClaimPath(binding.paths, malformed), 'owner.json');
+      recordPath = path.join(conversationRuntimeOwnerClaimPath(binding.paths, malformed), 'owner.json');
+      originalRecordBytes = await fs.readFile(recordPath);
       const peer = new ConversationRuntimeOwnerManager(binding, 'malformed-peer');
       try {
         await fs.writeFile(recordPath, '这不是合法 JSON\n', 'utf8');
@@ -689,10 +692,17 @@ test('存活宿主携带陈旧 ExecutionLease 也不可被偷，畸形所有权�
           (error) => error?.code === OWNER_INVALID_CODE, '空 canonical 目录同样 fail closed');
         await assert.rejects(peer.claim(emptyClaim),
           (error) => error?.code === OWNER_INVALID_CODE);
+        const malformedBytes = await fs.readFile(recordPath);
+        await assert.rejects(holderManager.close(),
+          (error) => error?.code === OWNER_INVALID_CODE, '关闭不能把畸形记录当作已释放');
+        assert.equal(holderManager.owns(malformed), false, '清理失败也不能恢复本地执行 authority');
+        assert.deepEqual(await fs.readFile(recordPath), malformedBytes, '关闭拒绝后必须保留畸形记录原样');
       } finally {
         await peer.close();
       }
     } finally {
+      // Restore only this isolated fixture's exact original record so close can retry its token.
+      if (originalRecordBytes) await fs.writeFile(recordPath, originalRecordBytes);
       await holderManager.close();
     }
   } finally {

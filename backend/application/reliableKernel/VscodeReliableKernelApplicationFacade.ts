@@ -117,16 +117,26 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private readonly historyPreviewByRevisionId = new Map<string, string>();
   private readonly historyTitleByRevisionId = new Map<string, string>();
   private historyRefresh: Promise<void> | undefined;
-  private historyRefreshPending = false;
+  private historyRefreshPending: {
+    promise: Promise<void>;
+    resolve(): void;
+    reject(error: unknown): void;
+  } | undefined;
   private historyRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private interactionAttentionRefresh: Promise<void> | undefined;
-  private interactionAttentionRefreshPending = false;
+  private interactionAttentionRefreshPending: {
+    promise: Promise<void>;
+    resolve(): void;
+    reject(error: unknown): void;
+  } | undefined;
   private interactionAttentionRefreshTimer: ReturnType<typeof setTimeout> | undefined;
   private hydration: Promise<void> | undefined;
   private unsubscribeCommit: (() => void) | undefined;
   private unsubscribeSteering: (() => void) | undefined;
   private disposed = false;
+  private productClosing = false;
   private productClosed = false;
+  private productCloseAttempt: Promise<void> | undefined;
   private dataRootMovedWarned = false;
 
   private constructor(
@@ -673,8 +683,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         this.unsubscribeCommit = undefined;
         this.unsubscribeSteering?.();
         this.unsubscribeSteering = undefined;
-        this.productClosed = true;
-        await this.product.close();
+        await this.closeProduct();
         // The gated archive/reinitialize rechecks (without exemption) that every Host, including
         // this one, has deregistered before mutating the control root.
         const archive = await archiveCurrentRuntimeRootForReset(authority, storageRoot);
@@ -753,6 +762,15 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   public handleWebviewMessage(clientId: BridgeClientId, message: WebviewToExtensionMessage): void {
     const webview = this.webviews.get(clientId);
     if (!webview) return;
+    if ((this.disposed || this.productClosing || this.productClosed)
+      && message.type !== BridgeMessageType.Ping
+      && message.type !== BridgeMessageType.GlobalSettingsActivity
+      && message.type !== BridgeMessageType.GlobalSettingsFlushResult) {
+      // Existing save-barrier acknowledgements may finish while the Runtime closes. Ready/resync
+      // and business requests must not start new work, including configuration-only writers.
+      this.commandRouter.rejectClosed(clientId, webview, message);
+      return;
+    }
     this.commandRouter.handle(clientId, webview, message);
   }
 
@@ -853,30 +871,43 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   public async dispose(): Promise<void> {
-    if (this.disposed) return;
-    this.disposed = true;
-    if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
-    this.historyRefreshTimer = undefined;
-    if (this.interactionAttentionRefreshTimer !== undefined) clearTimeout(this.interactionAttentionRefreshTimer);
-    this.interactionAttentionRefreshTimer = undefined;
-    this.interactionAttentionNotifier.clear();
-    this.unsubscribeCommit?.();
-    this.unsubscribeCommit = undefined;
-    this.unsubscribeSteering?.();
-    this.unsubscribeSteering = undefined;
-    this.externalHistoryWatcher.cancel();
-    // Host handoff must not wait behind a projection read which the old Host no longer needs.
-    // Closing the product below rejects/settles ordinary database work; keep rejection observed.
-    void this.hydration?.catch(() => undefined);
-    void this.historyRefresh?.catch(() => undefined);
-    void this.interactionAttentionRefresh?.catch(() => undefined);
-    for (const clientId of [...this.webviews.keys()]) this.detachWebview(clientId);
-    this.historyEmitter.dispose();
-    this.historyRevealEmitter.dispose();
-    if (!this.productClosed) {
-      this.productClosed = true;
-      await this.product.close();
+    if (!this.disposed) {
+      this.disposed = true;
+      if (this.historyRefreshTimer !== undefined) clearTimeout(this.historyRefreshTimer);
+      this.historyRefreshTimer = undefined;
+      if (this.interactionAttentionRefreshTimer !== undefined) clearTimeout(this.interactionAttentionRefreshTimer);
+      this.interactionAttentionRefreshTimer = undefined;
+      this.interactionAttentionNotifier.clear();
+      this.unsubscribeCommit?.();
+      this.unsubscribeCommit = undefined;
+      this.unsubscribeSteering?.();
+      this.unsubscribeSteering = undefined;
+      this.externalHistoryWatcher.cancel();
+      // Host handoff must not wait behind a projection read which the old Host no longer needs.
+      // Closing the product below rejects/settles ordinary database work; keep rejection observed.
+      void this.hydration?.catch(() => undefined);
+      void this.historyRefresh?.catch(() => undefined);
+      void this.historyRefreshPending?.promise.catch(() => undefined);
+      void this.interactionAttentionRefresh?.catch(() => undefined);
+      void this.interactionAttentionRefreshPending?.promise.catch(() => undefined);
+      for (const clientId of [...this.webviews.keys()]) this.detachWebview(clientId);
+      this.historyEmitter.dispose();
+      this.historyRevealEmitter.dispose();
     }
+    await this.closeProduct();
+  }
+
+  private closeProduct(): Promise<void> {
+    this.productClosing = true;
+    this.commandRouter.beginClose();
+    if (this.productClosed) return Promise.resolve();
+    if (this.productCloseAttempt) return this.productCloseAttempt;
+    const attempt = this.product.close().then(() => { this.productClosed = true; });
+    this.productCloseAttempt = attempt;
+    void attempt.finally(() => {
+      if (this.productCloseAttempt === attempt) this.productCloseAttempt = undefined;
+    }).catch(() => undefined);
+    return attempt;
   }
 
   private onRuntimeCommit(commit: RuntimeCommitResult): void {
@@ -927,19 +958,34 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private refreshInteractionAttention(): Promise<void> {
     if (this.disposed) return Promise.resolve();
     if (this.interactionAttentionRefresh) {
-      this.interactionAttentionRefreshPending = true;
-      return this.interactionAttentionRefresh;
+      if (!this.interactionAttentionRefreshPending) {
+        let resolve!: () => void;
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<void>((onResolve, onReject) => {
+          resolve = onResolve;
+          reject = onReject;
+        });
+        this.interactionAttentionRefreshPending = { promise, resolve, reject };
+      }
+      return this.interactionAttentionRefreshPending.promise;
     }
-    this.interactionAttentionRefresh = (async () => {
-      do {
-        this.interactionAttentionRefreshPending = false;
-        const database = this.product.application.database;
-        const pending = await readPendingInteractionAttention(database, database.hostBootId);
-        if (this.disposed) return;
-        this.interactionAttentionNotifier.synchronize(pending);
-      } while (this.interactionAttentionRefreshPending);
-    })().finally(() => { this.interactionAttentionRefresh = undefined; });
+    this.interactionAttentionRefresh = this.readInteractionAttention().finally(() => {
+      this.interactionAttentionRefresh = undefined;
+      const pending = this.interactionAttentionRefreshPending;
+      this.interactionAttentionRefreshPending = undefined;
+      if (!pending) return;
+      if (this.disposed) pending.resolve();
+      // Hydration waits for this pass; ongoing ASK/Plan events keep refreshing independently.
+      else void this.refreshInteractionAttention().then(pending.resolve, pending.reject);
+    });
     return this.interactionAttentionRefresh;
+  }
+
+  private async readInteractionAttention(): Promise<void> {
+    const database = this.product.application.database;
+    const pending = await readPendingInteractionAttention(database, database.hostBootId);
+    if (this.disposed) return;
+    this.interactionAttentionNotifier.synchronize(pending);
   }
 
   private refreshConversationHistory(): Promise<void> {
@@ -947,16 +993,27 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     if (this.historyRefresh) {
       // A commit may arrive while CAS-backed previews are still being read. Remember that edge so
       // the exact delivery/handled state cannot remain stuck at the older snapshot indefinitely.
-      this.historyRefreshPending = true;
-      return this.historyRefresh;
+      // These callers need the next read, not every later read caused by an ongoing event stream.
+      if (!this.historyRefreshPending) {
+        let resolve!: () => void;
+        let reject!: (error: unknown) => void;
+        const promise = new Promise<void>((onResolve, onReject) => {
+          resolve = onResolve;
+          reject = onReject;
+        });
+        this.historyRefreshPending = { promise, resolve, reject };
+      }
+      return this.historyRefreshPending.promise;
     }
-    this.historyRefresh = (async () => {
-      do {
-        this.historyRefreshPending = false;
-        await this.readConversationHistory();
-      } while (this.historyRefreshPending && !this.disposed);
-    })()
-      .finally(() => { this.historyRefresh = undefined; });
+    this.historyRefresh = this.readConversationHistory().finally(() => {
+      this.historyRefresh = undefined;
+      const pending = this.historyRefreshPending;
+      this.historyRefreshPending = undefined;
+      if (!pending) return;
+      if (this.disposed) pending.resolve();
+      // Start the trailing read before releasing this pass, while allowing its caller to finish.
+      else void this.refreshConversationHistory().then(pending.resolve, pending.reject);
+    });
     return this.historyRefresh;
   }
 
@@ -1247,7 +1304,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   }
 
   private requireOpen(): void {
-    if (this.disposed || this.productClosed) throw new Error('可靠 ApplicationFacade 已关闭。');
+    if (this.disposed || this.productClosing || this.productClosed) throw new Error('可靠 ApplicationFacade 已关闭。');
   }
 }
 
