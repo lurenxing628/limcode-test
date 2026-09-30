@@ -40,6 +40,22 @@ const providerConfigId = computed({ get: () => draftState.value.value.providerCo
 const model = computed({ get: () => draftState.value.value.model,
   set: (value: string) => { draftState.value.value = { ...draftState.value.value, model: value }; } });
 const draftChangedRemotely = draftState.remoteChanged;
+let pendingDiscardReset: { requestId: string; reset: () => void } | undefined;
+function discardDraft(): void {
+  const reset = draftState.prepareReset();
+  const requestId = store.discardPending(props.scopeKind, props.scopeId);
+  if (requestId) pendingDiscardReset = { requestId, reset };
+  else { pendingDiscardReset = undefined; reset(); }
+}
+watch(() => store.completedDiscardReadFor(props.scopeKind, props.scopeId), requestId => {
+  if (!pendingDiscardReset || pendingDiscardReset.requestId !== requestId) return;
+  pendingDiscardReset.reset();
+  pendingDiscardReset = undefined;
+}, { flush: 'sync' });
+watch(() => store.completedSaveFor(props.scopeKind, props.scopeId), requestId => {
+  const submissionRequestId = store.completedSubmissionFor(props.scopeKind, props.scopeId);
+  if (requestId && submissionRequestId) draftState.confirmSubmitted(submissionRequestId);
+}, { flush: 'sync' });
 const isInheritSelected = computed(() => providerConfigId.value === INHERIT_GLOBAL_MODEL_ID);
 const inheritedModelText = computed(() => {
   const config = globalSettings.activeLlmProviderConfig;
@@ -65,8 +81,8 @@ const selectedProviderConfigId = computed({
     if (providerConfigId.value === INHERIT_GLOBAL_MODEL_ID) {
       model.value = '';
       if (local.value.profile) {
-        draftState.markSubmitted();
-        store.clearProfileScope(props.scopeKind, props.scopeId);
+        const requestId = store.clearProfileScope(props.scopeKind, props.scopeId);
+        if (requestId) draftState.markSubmitted(requestId);
       }
       return;
     }
@@ -78,14 +94,15 @@ const selectedProviderConfigId = computed({
 
 function save(): void {
   if (isInheritSelected.value) {
-    draftState.markSubmitted();
-    store.clearProfileScope(props.scopeKind, props.scopeId);
+    const requestId = store.clearProfileScope(props.scopeKind, props.scopeId);
+    if (requestId) draftState.markSubmitted(requestId);
     return;
   }
   const config = activeConfig.value;
   model.value = model.value.trim();
-  draftState.markSubmitted();
-  store.setProfileForScope(props.scopeKind, props.scopeId, { providerConfigId: providerConfigId.value, provider: config?.provider, model: model.value.trim(), name: `${props.scopeKind} Model Profile` });
+  const requestId = store.setProfileForScope(props.scopeKind, props.scopeId, { providerConfigId: providerConfigId.value, provider: config?.provider, model: model.value.trim(), name: `${props.scopeKind} Model Profile` });
+  if (requestId) draftState.markSubmitted(requestId);
+  else draftState.reset(); // The current authority already confirms this selection; no write or receipt is invented.
 }
 </script>
 
@@ -115,7 +132,7 @@ function save(): void {
       <span role="status">已保存内容有更新，当前草稿已保留</span>
       <button type="button" @click="draftState.reset()">读取已保存值</button>
     </template>
-    <ModelProfileSaveStatus :scope-kind="scopeKind" :scope-id="scopeId" />
+    <ModelProfileSaveStatus :scope-kind="scopeKind" :scope-id="scopeId" :discard-draft="discardDraft" />
     <div class="model-profile-actions">
       <button v-if="!isInheritSelected" type="button" :disabled="!model.trim()" @click="save">保存 LLM 配置</button>
       <span v-else>当前将继承全局/对话的 LLM 配置。</span>

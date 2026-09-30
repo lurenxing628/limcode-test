@@ -85,6 +85,8 @@ export function useBridgeBootstrap(): void {
       if (previousClientId && message.clientId && previousClientId !== message.clientId) {
         modelProfiles.reconnectScopes();
         globalSettings.reconcilePendingSettings();
+        systemPrompts.resetPendingSaveForReconnect();
+        runtimeContexts.resetPendingSaveForReconnect();
         bridge.ready(settingsActivitySessionId);
         publishSettingsActivity(true);
       }
@@ -107,8 +109,8 @@ export function useBridgeBootstrap(): void {
       if (!message.payload) return;
       modelProfiles.invalidateSnapshot(message.payload.state);
       clientState.applyConfigurationSnapshot(message.payload.state);
-      systemPrompts.reconcilePendingSave();
-      runtimeContexts.reconcilePendingSave();
+      systemPrompts.reconcilePendingSave(message.correlationId);
+      runtimeContexts.reconcilePendingSave(message.correlationId);
     }),
     bridge.on(BridgeMessageType.ModelProfileScopeSnapshot, (message) => {
       if (message.payload) modelProfiles.applyScopeSnapshot(message.payload, message.correlationId);
@@ -164,6 +166,12 @@ export function useBridgeBootstrap(): void {
           message: payload.message,
           conversationId: scope?.kind === 'settings' && scope.level === 'conversation' ? scope.id : undefined
         });
+      }
+      if (payload.requestType === BridgeMessageType.SystemPromptScopeSet || payload.requestType === BridgeMessageType.SystemPromptScopeClear) {
+        systemPrompts.rejectPendingSave(message.correlationId, payload.message);
+      }
+      if (payload.requestType === BridgeMessageType.RuntimeContextScopeSet || payload.requestType === BridgeMessageType.RuntimeContextScopeClear) {
+        runtimeContexts.rejectPendingSave(message.correlationId, payload.message);
       }
       if (
         payload.requestType === BridgeMessageType.GlobalSettingsGet

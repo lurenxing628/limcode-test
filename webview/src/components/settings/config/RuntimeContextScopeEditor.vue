@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { useGuardedSettingsDraft } from '@webview/composables/useGuardedSettingsDraft';
 import type { ConfigScopeKind } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
@@ -24,9 +24,21 @@ const draftState = useGuardedSettingsDraft(
 );
 const draft = computed({ get: () => draftState.value.value.text, set: (text: string) => { draftState.value.value = { text }; } });
 const draftChangedRemotely = draftState.remoteChanged;
+watch(() => store.completedSaveFor(props.scopeKind, props.scopeId), requestId => {
+  if (requestId) draftState.confirmSubmitted(requestId);
+}, { flush: 'sync' });
 
-function save(): void { draft.value = draft.value.trim(); draftState.markSubmitted(); store.setContextForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} Runtime Context`); }
-function clear(): void { store.clearContextScope(props.scopeKind, props.scopeId); draftState.reset(); }
+function save(): void {
+  draft.value = draft.value.trim();
+  const requestId = store.setContextForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} Runtime Context`);
+  if (requestId) draftState.markSubmitted(requestId);
+}
+function clear(): void {
+  const requestId = store.clearContextScope(props.scopeKind, props.scopeId);
+  if (!requestId) return;
+  draft.value = '';
+  draftState.markSubmitted(requestId);
+}
 function insertPlaceholder(token: string): void {
   const textarea = scroller.value;
   if (!textarea) {

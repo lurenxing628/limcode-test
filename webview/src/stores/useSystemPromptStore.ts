@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { type ConfigScopeKind, type PromptPlaceholderRecord, type SystemPromptRecord, type SystemPromptScopeLinkRecord } from '@shared/protocol';
+import { createMessageId, type ConfigScopeKind, type PromptPlaceholderRecord, type SystemPromptRecord, type SystemPromptScopeLinkRecord } from '@shared/protocol';
 import {
   DEFAULT_INTEGRATED_SYSTEM_PROMPT,
   DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
@@ -12,13 +12,15 @@ import { useReliableKernelClientFeedStore } from './useReliableKernelClientFeedS
 interface PendingSystemPromptSave {
   scopeKind: ConfigScopeKind;
   scopeId?: string;
-  text: string;
-  requestedAt: number;
+  operation: 'set' | 'clear';
+  requestId: string;
+  text?: string;
 }
 
 interface SystemPromptStoreState {
   status: string;
-  pendingSave?: PendingSystemPromptSave;
+  pendingSaves: Record<string, PendingSystemPromptSave>;
+  completedSaves: Record<string, string>;
 }
 
 export interface SystemPromptResolution {
@@ -30,6 +32,7 @@ export interface SystemPromptResolution {
 }
 
 function scopeIdFor(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined { return scopeKind === 'global' ? undefined : scopeId?.trim(); }
+function scopeKey(scopeKind: ConfigScopeKind, scopeId?: string): string { return JSON.stringify([scopeKind, scopeIdFor(scopeKind, scopeId) ?? '']); }
 function matches(link: SystemPromptScopeLinkRecord, scopeKind: ConfigScopeKind, scopeId?: string): boolean { return link.role === 'active' && link.scopeKind === scopeKind && scopeIdFor(scopeKind, link.scopeId) === scopeIdFor(scopeKind, scopeId); }
 function latest<T extends { createdAt: number; updatedAt: number; id: string }>(items: T[]): T | undefined { return [...items].sort((a, b) => b.updatedAt - a.updatedAt || b.createdAt - a.createdAt || b.id.localeCompare(a.id))[0]; }
 function sortPlaceholders(items: PromptPlaceholderRecord[]): PromptPlaceholderRecord[] { return [...items].sort((a, b) => (a.order ?? 0) - (b.order ?? 0) || a.label.localeCompare(b.label) || a.id.localeCompare(b.id)); }
@@ -41,7 +44,7 @@ const builtInGlobalPrompt: SystemPromptRecord = {
 };
 
 export const useSystemPromptStore = defineStore('systemPrompt', {
-  state: (): SystemPromptStoreState => ({ status: '' }),
+  state: (): SystemPromptStoreState => ({ status: '', pendingSaves: {}, completedSaves: {} }),
   getters: {
     systemPlaceholders(): PromptPlaceholderRecord[] {
       return sortPlaceholders(useClientStateStore().promptPlaceholders.filter((item) => item.target === 'systemPrompt'));
@@ -111,7 +114,8 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
         }
       }
     },
-    setPromptForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, text: string, name?: string): void {
+    completedSaveFor(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined { return this.completedSaves[scopeKey(scopeKind, scopeId)]; },
+    setPromptForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, text: string, name?: string): string | undefined {
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
       if (scopeKind !== 'global' && !normalizedScopeId) {
         this.status = '缺少系统提示词配置范围，无法保存。';
@@ -121,40 +125,56 @@ export const useSystemPromptStore = defineStore('systemPrompt', {
       const normalizedText = text.trim();
       if (!normalizedText) {
         if (scopeKind === 'global') {
-          this.clearPromptScope(scopeKind, normalizedScopeId);
-          return;
+          return this.clearPromptScope(scopeKind, normalizedScopeId);
         }
         this.status = '提示词内容为空；若要继承上级配置，请点击“恢复继承”。';
         return;
       }
 
-      const requestedAt = Date.now();
-      this.pendingSave = { scopeKind, ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}), text: normalizedText, requestedAt };
+      const requestId = createMessageId();
+      this.pendingSaves[scopeKey(scopeKind, normalizedScopeId)] = { scopeKind,
+        ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}), operation: 'set', text: normalizedText, requestId };
       bridge.request(BridgeMessageType.SystemPromptScopeSet, {
         scopeKind,
         ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}),
         text: normalizedText,
         ...(name?.trim() ? { name: name.trim() } : {})
-      });
+      }, { requestId });
       this.status = '正在保存 Prompt...';
+      return requestId;
     },
-    clearPromptScope(scopeKind: ConfigScopeKind, scopeId?: string): void {
+    clearPromptScope(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined {
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
-      const clientState = useClientStateStore();
-      clientState.systemPromptScopeLinks = clientState.systemPromptScopeLinks.filter((link) => !matches(link, scopeKind, normalizedScopeId));
-      this.pendingSave = undefined;
-      this.status = scopeKind === 'global' ? '已恢复默认 Prompt' : '已恢复继承';
-      bridge.request(BridgeMessageType.SystemPromptScopeClear, { scopeKind, ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}) });
+      if (scopeKind !== 'global' && !normalizedScopeId) { this.status = '缺少系统提示词配置范围，无法恢复继承。'; return; }
+      const requestId = createMessageId();
+      this.pendingSaves[scopeKey(scopeKind, normalizedScopeId)] = { scopeKind,
+        ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}), operation: 'clear', requestId };
+      this.status = scopeKind === 'global' ? '正在恢复默认 Prompt...' : '正在恢复继承...';
+      bridge.request(BridgeMessageType.SystemPromptScopeClear, { scopeKind,
+        ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}) }, { requestId });
+      return requestId;
     },
-    reconcilePendingSave(): void {
-      const pending = this.pendingSave;
-      if (!pending) return;
-      const local = this.localPromptFor(pending.scopeKind, pending.scopeId);
-      if (!local.prompt || !local.link) return;
-      if (local.prompt.text.trim() !== pending.text) return;
-      if (local.link.updatedAt < pending.requestedAt) return;
-      this.pendingSave = undefined;
-      this.status = 'Prompt 已同步';
+    reconcilePendingSave(correlationId?: string): void {
+      if (!correlationId) return;
+      for (const [key, pending] of Object.entries(this.pendingSaves)) {
+        if (pending.requestId !== correlationId) continue;
+        const local = this.localPromptFor(pending.scopeKind, pending.scopeId);
+        if (pending.operation === 'clear' ? !!local.link : !local.prompt || !local.link || local.prompt.text.trim() !== pending.text) return;
+        delete this.pendingSaves[key];
+        this.completedSaves[key] = correlationId;
+        this.status = pending.operation === 'clear' ? pending.scopeKind === 'global' ? '已恢复默认 Prompt' : '已恢复继承' : 'Prompt 已同步';
+        return;
+      }
+    },
+    rejectPendingSave(correlationId: string | undefined, message: string): void {
+      for (const [key, pending] of Object.entries(this.pendingSaves)) {
+        if (pending.requestId !== correlationId) continue;
+        delete this.pendingSaves[key]; this.status = message; return;
+      }
+    },
+    resetPendingSaveForReconnect(): void {
+      if (Object.keys(this.pendingSaves).length) this.status = '连接已更换，保存结果未确定；本地草稿已保留，请核对当前配置。';
+      this.pendingSaves = {}; this.completedSaves = {};
     }
   }
 });

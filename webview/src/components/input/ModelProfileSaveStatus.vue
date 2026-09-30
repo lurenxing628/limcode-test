@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import type { ConfigScopeKind } from '@shared/protocol';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
-const props = defineProps<{ scopeKind: ConfigScopeKind; scopeId?: string; sendError?: string }>();
+const props = defineProps<{ scopeKind: ConfigScopeKind; scopeId?: string; sendError?: string; discardDraft?: () => void }>();
 const store = useModelProfileStore();
 const pending = computed(() => store.pendingFor(props.scopeKind, props.scopeId));
 const detached = computed(() => store.detachedFor(props.scopeKind, props.scopeId));
@@ -11,6 +11,10 @@ const scopeError = computed(() => store.errorFor(props.scopeKind, props.scopeId)
 const reading = computed(() => store.readingFor(props.scopeKind, props.scopeId));
 const effective = computed(() => saved.value?.effectiveModel);
 function reset(): void { if (props.scopeKind === 'conversation' && props.scopeId && effective.value) store.setThinkingForScope(props.scopeId, effective.value, null); }
+function discard(): void {
+  if (props.discardDraft) props.discardDraft();
+  else store.discardPending(props.scopeKind, props.scopeId);
+}
 </script>
 
 <template>
@@ -23,7 +27,7 @@ function reset(): void { if (props.scopeKind === 'conversation' && props.scopeId
     <span v-if="pending?.error || sendError || scopeError" role="alert">{{ pending?.error || sendError || scopeError }}</span>
     <span v-if="detached" role="alert">旧 authority/root 草稿已保留，未跨代提交：{{ detached.profile.model }}</span>
     <button v-if="pending?.status === 'draft'" type="button" @click="store.retryPending(scopeKind, scopeId)">确认重试</button>
-    <button v-if="pending" type="button" :disabled="reading" @click="store.discardPending(scopeKind, scopeId)">放弃草稿并读取已保存值</button>
+    <button v-if="pending" type="button" :disabled="reading" @click="discard">放弃草稿并读取已保存值</button>
     <button type="button" :disabled="reading" @click="store.refreshScope(scopeKind, scopeId)">{{ reading ? '正在读取…' : '重新读取' }}</button>
     <button v-if="effective && scopeKind === 'conversation'" type="button" @click="reset">恢复思维默认</button>
     <button v-if="pending?.status === 'uncertain' || !saved || detached || scopeError" type="button" :disabled="reading" @click="store.refreshScope(scopeKind, scopeId, { adoptRoot: true })">显式连接当前配置根</button>

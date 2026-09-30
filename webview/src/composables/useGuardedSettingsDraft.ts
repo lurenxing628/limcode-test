@@ -15,44 +15,68 @@ export function useGuardedSettingsDraft<T extends DraftFields>(
   const draft = shallowRef<T>({ ...readSaved() });
   const saved = shallowRef<T>({ ...readSaved() });
   const externalChange = shallowRef(false);
-  let editRevision = 0;
-  let submission: { revision: number; value: T } | undefined;
+  const editRevision = shallowRef(0);
+  const acknowledgedEditRevision = shallowRef(0);
+  const submission = shallowRef<{ revision: number; value: T; requestId: string }>();
   const value = computed({
     get: () => draft.value,
     set: (incoming: T) => {
-      if (!sameFields(draft.value, incoming)) editRevision++;
+      if (!sameFields(draft.value, incoming)) editRevision.value++;
       draft.value = { ...incoming };
     }
   });
-  const dirty = computed(() => !sameFields(value.value, saved.value));
+  const dirty = computed(() => editRevision.value > acknowledgedEditRevision.value || !sameFields(value.value, saved.value));
   const remoteChanged = computed(() => dirty.value && externalChange.value);
   let scope: string | undefined;
+  let scopeRevision = 0;
 
   function reset(): void {
     const incoming = { ...readSaved() };
     saved.value = incoming;
     draft.value = { ...incoming };
     externalChange.value = false;
-    submission = undefined;
+    acknowledgedEditRevision.value = editRevision.value;
+    submission.value = undefined;
   }
 
-  function markSubmitted(): void {
-    if (dirty.value || submission) submission = { revision: editRevision, value: { ...value.value } };
+  function markSubmitted(requestId: string): void {
+    if (dirty.value || submission.value) submission.value = { revision: editRevision.value, value: { ...value.value }, requestId };
+  }
+
+  function confirmSubmitted(requestId: string): void {
+    const sent = submission.value;
+    if (!sent || sent.requestId !== requestId) return;
+    if (editRevision.value === sent.revision) draft.value = { ...saved.value };
+    acknowledgedEditRevision.value = sent.revision;
+    submission.value = undefined;
+    if (!dirty.value) externalChange.value = false;
+  }
+
+  /** Explicit reads may reset the draft only if nothing was edited or rebound while awaiting them. */
+  function prepareReset(): () => void {
+    const revision = editRevision.value;
+    const binding = scopeRevision;
+    return () => {
+      if (revision === editRevision.value && binding === scopeRevision) reset();
+    };
   }
 
   watch([readScope, readSaved], ([nextScope, incoming]) => {
     if (scope === nextScope && sameFields(saved.value, incoming)) return;
-    const preserveSubmission = !!submission && (editRevision > submission.revision || !sameFields(submission.value, incoming));
-    if (scope !== nextScope || (!dirty.value && !preserveSubmission) || sameFields(value.value, incoming)) {
+    if (scope !== nextScope) scopeRevision++;
+    const sent = submission.value;
+    const preserveSubmission = !!sent && (editRevision.value > sent.revision || !sameFields(sent.value, incoming));
+    if (scope !== nextScope || (!dirty.value && !preserveSubmission)) {
       draft.value = { ...incoming };
+      acknowledgedEditRevision.value = editRevision.value;
       externalChange.value = false;
     } else {
       externalChange.value = true;
     }
     saved.value = { ...incoming };
-    if (scope !== nextScope || (submission && sameFields(submission.value, incoming))) submission = undefined;
+    if (scope !== nextScope) submission.value = undefined;
     scope = nextScope;
   }, { immediate: true, flush: 'sync' });
 
-  return { value, dirty, remoteChanged, reset, markSubmitted };
+  return { value, dirty, remoteChanged, reset, markSubmitted, confirmSubmitted, prepareReset };
 }

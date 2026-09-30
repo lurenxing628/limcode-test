@@ -11,7 +11,7 @@ const { createEmptyClientState } = require('../../dist/extension/shared/clientSt
 function fixture() {
   pinia.setActivePinia(pinia.createPinia());
   const requests = [], timers = [], listeners = new Map();
-  const bridge = { request(type, payload) { const id = `request-${requests.length}`; requests.push({ id, type, payload: structuredClone(payload) }); return id; },
+  const bridge = { request(type, payload, options = {}) { const id = options.requestId ?? `request-${requests.length}`; requests.push({ id, type, payload: structuredClone(payload) }); return id; },
     on(type, callback) { listeners.set(type, callback); return () => listeners.delete(type); }, ready() {}, currentClientId() { return 'fixture-client'; } };
   let client, store;
   const noopStore = new Proxy({ records: {}, viewKind: 'test' }, { get(target, key) { return key in target ? target[key] : () => undefined; } });
@@ -308,7 +308,8 @@ function composerSubmit(f) {
   const module = { exports: {} }, sent = [];
   vm.runInNewContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, {
     module, ref: vue.ref, computed: vue.computed, clientState: f.client, modelProfileStore: f.store, props: { disabled: false },
-    currentSubmissionCommandId: vue.ref(), currentSteeringSubmitting: vue.ref(false), draft: vue.ref('synthetic message'), selectedAttachments: vue.ref([]),
+    currentSubmissionCommandId: vue.ref(), currentSteeringSubmitting: vue.ref(false), submissionDraftRevision: 0,
+    draft: vue.ref('synthetic message'), selectedAttachments: vue.ref([]),
     buildMessageContent: text => ({ text }), ui: { isEditing: false }, nativeSteeringAvailable: vue.ref(false),
     currentTurnAuthoritySelection: () => ({}), sendMessage: (text, content) => { sent.push({ conversationId: f.client.currentConversationId, text, content }); }
   });

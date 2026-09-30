@@ -106,6 +106,8 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     edit: createComposerSnapshot()
   });
   const composerMode = ref<ComposerMode>('chat');
+  // Starts a different chat draft; ordinary typing and temporary edit mode keep this identity.
+  const chatDraftGeneration = ref(0);
   const composerHighlightKey = ref(0);
   const composerFocusKey = ref(0);
   const editingMessage = shallowRef<EditingMessageState>();
@@ -278,6 +280,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   }
 
   function clearChatDraft(): void {
+    chatDraftGeneration.value += 1;
     composerSnapshots.value.chat.draft = '';
   }
 
@@ -304,6 +307,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
 
   /** Replaces the chat draft text (leaving any open edit) and focuses the composer. */
   function replaceChatDraft(text: string): void {
+    chatDraftGeneration.value += 1;
     if (composerMode.value === 'edit') cancelEditMode();
     composerSnapshots.value.chat.draft = text;
     composerFocusKey.value += 1;
@@ -366,6 +370,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     timelineRows,
     checkpointMarkers,
     composerMode,
+    chatDraftGeneration,
     composerHighlightKey,
     composerFocusKey,
     composerDraft,

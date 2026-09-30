@@ -1,5 +1,5 @@
 ﻿import { defineStore } from 'pinia';
-import { type ConfigScopeKind, type ChatModelOverrideRecord, type LlmProviderKind, type ModelProfileRecord, type ModelProfileScopeLinkRecord, type ModelProfileScopeSnapshotPayload, type SessionThinkingOverride } from '@shared/protocol';
+import { createMessageId, type ConfigScopeKind, type ChatModelOverrideRecord, type LlmProviderKind, type ModelProfileRecord, type ModelProfileScopeLinkRecord, type ModelProfileScopeSnapshotPayload, type SessionThinkingOverride } from '@shared/protocol';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import { useClientStateStore } from './useClientStateStore';
 
@@ -7,16 +7,21 @@ type Operation = 'select' | 'thinking' | 'reset' | 'inherit' | 'clear';
 interface SelectionInput { name?: string; providerConfigId?: string; provider?: LlmProviderKind; model: string; thinkingOverride?: SessionThinkingOverride | null; inheritThinkingToChildren?: boolean; expectedEffectiveModel?: ChatModelOverrideRecord }
 interface PendingModelProfileSelection {
   requestId: string;
+  submissionRequestId: string;
   profile: ModelProfileRecord;
   operation: Operation;
   expectedEffectiveModel?: ChatModelOverrideRecord;
   status: 'draft' | 'saving' | 'uncertain';
-  submitted?: { operation: Operation; profile: ModelProfileRecord; expectedRevision: string };
+  submitted?: { operation: Operation; profile: ModelProfileRecord; expectedRevision: string; submissionRequestId: string };
   queued?: boolean;
   error?: string;
 }
 interface Scope { scopeKind: ConfigScopeKind; scopeId?: string }
-interface ReadState { requestId: string; authorityId?: string; sessionId?: string; afterRequestId?: string; discard: boolean; adopt: boolean; renew: boolean; dirty: boolean }
+interface ReadState { requestId: string; authorityId?: string; sessionId?: string; afterRequestId?: string; submissionRequestId?: string; discard: boolean; adopt: boolean; renew: boolean; dirty: boolean }
+function readTargetsSelection(read: ReadState | undefined, pending: PendingModelProfileSelection | undefined): pending is PendingModelProfileSelection {
+  return !!read && !!pending && read.submissionRequestId === pending.submissionRequestId
+    && (read.afterRequestId ? read.afterRequestId === pending.requestId : !pending.requestId);
+}
 const waiters = new Map<string, Array<{ resolve: () => void; reject: (error: Error) => void }>>();
 function settle(key: string, error?: string): void { for (const waiter of waiters.get(key) ?? []) error ? waiter.reject(new Error(error)) : waiter.resolve(); waiters.delete(key); }
 const scopeOf = (scopeKind: ConfigScopeKind, scopeId?: string): Scope => ({ scopeKind, ...(scopeKind !== 'global' && scopeId?.trim() ? { scopeId: scopeId.trim() } : {}) });
@@ -53,6 +58,8 @@ export const useModelProfileStore = defineStore('modelProfile', {
     observations: {} as Record<string, ModelProfileScopeSnapshotPayload>,
     activeScopes: {} as Record<string, { scope: Scope; users: number }>,
     reads: {} as Record<string, ReadState>,
+    completedDiscardReads: {} as Record<string, string>,
+    completedSaves: {} as Record<string, { requestId: string; submissionRequestId: string }>,
     pendingSelections: {} as Record<string, PendingModelProfileSelection>,
     detachedDrafts: {} as Record<string, PendingModelProfileSelection> }),
   actions: {
@@ -76,7 +83,10 @@ export const useModelProfileStore = defineStore('modelProfile', {
     pendingFor(scopeKind: ConfigScopeKind, scopeId?: string): PendingModelProfileSelection | undefined { return this.pendingSelections[keyOf(scopeKind, scopeId)]; },
     detachedFor(scopeKind: ConfigScopeKind, scopeId?: string): PendingModelProfileSelection | undefined { return this.detachedDrafts[keyOf(scopeKind, scopeId)]; },
     readingFor(scopeKind: ConfigScopeKind, scopeId?: string): boolean { return !!this.reads[keyOf(scopeKind, scopeId)]; },
-    setProfileForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, input: SelectionInput): void { this.choose(scopeKind, scopeId, input, 'select'); },
+    completedDiscardReadFor(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined { return this.completedDiscardReads[keyOf(scopeKind, scopeId)]; },
+    completedSaveFor(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined { return this.completedSaves[keyOf(scopeKind, scopeId)]?.requestId; },
+    completedSubmissionFor(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined { return this.completedSaves[keyOf(scopeKind, scopeId)]?.submissionRequestId; },
+    setProfileForScope(scopeKind: ConfigScopeKind, scopeId: string | undefined, input: SelectionInput): string | undefined { return this.choose(scopeKind, scopeId, input, 'select'); },
     setThinkingForScope(conversationId: string, model: ChatModelOverrideRecord, thinkingOverride: SessionThinkingOverride | null, inheritThinkingToChildren?: boolean): void {
       this.choose('conversation', conversationId, { ...plainModel(model), thinkingOverride, inheritThinkingToChildren, expectedEffectiveModel: plainModel(model) }, thinkingOverride === null ? 'reset' : 'thinking');
     },
@@ -92,12 +102,16 @@ export const useModelProfileStore = defineStore('modelProfile', {
     childThinkingInheritanceFor(scopeKind: ConfigScopeKind, scopeId?: string): boolean {
       return this.localProfileFor(scopeKind, scopeId).profile?.inheritThinkingToChildren === true;
     },
-    choose(scopeKind: ConfigScopeKind, scopeId: string | undefined, input: SelectionInput, operation: Operation): void {
+    choose(scopeKind: ConfigScopeKind, scopeId: string | undefined, input: SelectionInput, operation: Operation): string | undefined {
       const key = keyOf(scopeKind, scopeId), prior = this.pendingSelections[key], saved = this.observations[key];
       const sameSelectedModel = saved?.effectiveModel && saved.effectiveModel.providerConfigId === input.providerConfigId
         && saved.effectiveModel.provider === input.provider && saved.effectiveModel.model === input.model;
-      if (operation === 'select' && sameSelectedModel && !prior) return;
+      const sameScopedModel = saved?.profile && !saved.profile.inheritModel
+        && saved.profile.providerConfigId === input.providerConfigId && saved.profile.provider === input.provider
+        && saved.profile.model === input.model;
+      if (operation === 'select' && sameSelectedModel && sameScopedModel && saved?.authorityId === this.authorityId && !prior) return;
       settle(key, '选择已更新，请再次发送。');
+      const submissionRequestId = createMessageId();
       const profile: ModelProfileRecord = { id: saved?.profile?.id ?? `draft:${key}`, name: input.name || saved?.profile?.name || 'LLM 配置', ...plainModel(input),
         ...(operation !== 'select' && (!saved?.profile || saved.profile.inheritModel) ? { inheritModel: true } : {}),
         ...(input.inheritThinkingToChildren !== undefined || saved?.profile?.inheritThinkingToChildren !== undefined
@@ -105,12 +119,13 @@ export const useModelProfileStore = defineStore('modelProfile', {
           : {}),
         ...(operation === 'inherit' && this.thinkingFor(scopeKind, scopeId) ? { thinkingOverride: plainThinking(this.thinkingFor(scopeKind, scopeId)!) } : {}),
         ...(operation === 'thinking' && input.thinkingOverride ? { thinkingOverride: plainThinking(input.thinkingOverride) } : {}) };
-      this.pendingSelections[key] = { requestId: prior?.requestId ?? '', profile, operation,
+      this.pendingSelections[key] = { requestId: prior?.requestId ?? '', submissionRequestId, profile, operation,
         ...(input.expectedEffectiveModel ? { expectedEffectiveModel: plainModel(input.expectedEffectiveModel) } : {}),
         status: prior?.status ?? 'draft', submitted: prior?.submitted, queued: prior?.status === 'saving', ...(prior?.error ? { error: prior.error } : {}) };
-      if (prior?.status === 'saving' || prior?.status === 'uncertain') return;
-      if (!saved) { this.refreshScope(scopeKind, scopeId); return; }
+      if (prior?.status === 'saving' || prior?.status === 'uncertain') return submissionRequestId;
+      if (!saved) { this.refreshScope(scopeKind, scopeId); return submissionRequestId; }
       this.sendDraft(scopeKind, scopeId);
+      return submissionRequestId;
     },
     sendDraft(scopeKind: ConfigScopeKind, scopeId?: string): void {
       const key = keyOf(scopeKind, scopeId), pending = this.pendingSelections[key], saved = this.observations[key];
@@ -122,8 +137,11 @@ export const useModelProfileStore = defineStore('modelProfile', {
         ...(pending.operation === 'inherit' ? { inheritThinkingToChildren: profile.inheritThinkingToChildren === true } : {}),
         ...(pending.operation === 'thinking' && profile.thinkingOverride ? { thinkingOverride: plainThinking(profile.thinkingOverride) } : {}),
         ...(pending.operation === 'reset' ? { thinkingOverride: null } : {}) };
-      const requestId = bridge.request(pending.operation === 'clear' ? BridgeMessageType.ModelProfileScopeClear : BridgeMessageType.ModelProfileScopeSet, payload);
-      pending.submitted = { operation: pending.operation, expectedRevision: saved.revision, profile: { ...profile, ...(profile.thinkingOverride ? { thinkingOverride: plainThinking(profile.thinkingOverride) } : {}), ...(profile.inheritThinkingToChildren !== undefined ? { inheritThinkingToChildren: profile.inheritThinkingToChildren } : {}) } };
+      // The first wire request is reserved when the local choice is made, including queued choices.
+      // An explicit retry gets a fresh wire id while retaining that choice's submission identity.
+      const requestId = pending.submitted?.submissionRequestId === pending.submissionRequestId ? createMessageId() : pending.submissionRequestId;
+      bridge.request(pending.operation === 'clear' ? BridgeMessageType.ModelProfileScopeClear : BridgeMessageType.ModelProfileScopeSet, payload, { requestId });
+      pending.submitted = { operation: pending.operation, expectedRevision: saved.revision, submissionRequestId: pending.submissionRequestId, profile: { ...profile, ...(profile.thinkingOverride ? { thinkingOverride: plainThinking(profile.thinkingOverride) } : {}), ...(profile.inheritThinkingToChildren !== undefined ? { inheritThinkingToChildren: profile.inheritThinkingToChildren } : {}) } };
       pending.requestId = requestId; pending.status = 'saving'; pending.queued = false; delete pending.error;
       this.status = '正在保存 LLM 配置…';
       setTimeout(() => { if (this.pendingSelections[key]?.requestId === requestId && this.pendingSelections[key]?.status === 'saving') this.rejectPending(requestId, '保存结果未确定；原操作仍可能在途。请重新读取确认，不会自动重发。'); }, 10000);
@@ -137,22 +155,29 @@ export const useModelProfileStore = defineStore('modelProfile', {
     refreshScope(scopeKind: ConfigScopeKind, scopeId?: string, options: { discard?: boolean; adoptRoot?: boolean } = {}): void {
       const key = keyOf(scopeKind, scopeId), pending = this.pendingSelections[key];
       const existing = this.reads[key];
-      if (existing && !options.adoptRoot) { existing.dirty = true; existing.discard ||= options.discard === true; return; }
-      const adopt = options.adoptRoot === true || !this.authorityId;
       const afterRequestId = !options.adoptRoot && pending?.requestId ? pending.requestId : undefined;
+      if (existing && !options.adoptRoot && !(options.discard && existing.afterRequestId !== afterRequestId)) {
+        existing.dirty = true;
+        if (options.discard) { existing.discard = true; existing.submissionRequestId = pending?.submissionRequestId; }
+        return;
+      }
+      const adopt = options.adoptRoot === true || !this.authorityId;
       const sessionId = !options.adoptRoot ? this.observations[key]?.sessionId : undefined;
       const requestId = bridge.request(BridgeMessageType.ModelProfileScopeRead, { ...scopeOf(scopeKind, scopeId),
         ...(sessionId ? { sessionId } : {}), ...(options.adoptRoot ? { renewSession: true } : {}),
         ...(!adopt && this.authorityId ? { authorityId: this.authorityId } : {}), ...(afterRequestId ? { afterRequestId } : {}) });
-      this.reads[key] = { requestId, sessionId, ...(adopt ? {} : { authorityId: this.authorityId }), afterRequestId, discard: options.discard === true, adopt, renew: options.adoptRoot === true, dirty: false };
+      this.reads[key] = { requestId, sessionId, ...(adopt ? {} : { authorityId: this.authorityId }), afterRequestId,
+        submissionRequestId: pending?.submissionRequestId, discard: options.discard === true, adopt, renew: options.adoptRoot === true, dirty: false };
       if (adopt) this.adoptionRequestId = requestId;
       setTimeout(() => {
         if (this.reads[key]?.requestId !== requestId) return;
+        const read = this.reads[key];
         delete this.reads[key];
         this.status = '读取未确认；保留草稿，请重新读取。';
         this.scopeErrors[key] = this.status;
         this.failedReads[key] = true;
-        if (this.pendingSelections[key]) this.rejectPending(this.pendingSelections[key].requestId, this.status);
+        const current = this.pendingSelections[key];
+        if (readTargetsSelection(read, current)) { current.status = 'uncertain'; current.error = this.status; settle(key, this.status); }
       }, 10000);
     },
     applyScopeSnapshot(payload: ModelProfileScopeSnapshotPayload, correlationId?: string): void {
@@ -170,16 +195,17 @@ export const useModelProfileStore = defineStore('modelProfile', {
       }
       if (!isRead && !isWrite) return;
       if (isRead) delete this.reads[key];
-      // An after-read belongs to one submitted operation, not a newer queued selection that
-      // started while the host was reading. It must not detach that newer in-flight request.
-      if (isRead && read.afterRequestId && pending?.requestId !== read.afterRequestId) return;
       if (payload.outcome === 'uncertain' || !payload.revision || !payload.authorityId || !payload.sessionId) {
         this.status = payload.error || '结果未确定，请重新读取。';
         this.scopeErrors[key] = this.status;
         if (isRead) this.failedReads[key] = true;
-        if (pending) { pending.status = 'uncertain'; pending.error = this.status; settle(key, this.status); }
+        if (pending && (!isRead || readTargetsSelection(read, pending))) { pending.status = 'uncertain'; pending.error = this.status; settle(key, this.status); }
         return;
       }
+      // An after-read belongs to one submitted operation, not a newer queued selection that
+      // started while the host was reading. It must not detach that newer in-flight request.
+      if (isRead && read.afterRequestId && pending?.requestId !== read.afterRequestId
+        && !(read.discard && !pending && this.completedSaves[key]?.requestId === read.afterRequestId)) return;
       if (isRead && read.sessionId && read.sessionId !== payload.sessionId) return;
       if (isWrite && (previousObservation?.sessionId !== payload.sessionId || payload.authorityId !== this.authorityId)) return;
       const actual = payload.profile;
@@ -220,12 +246,31 @@ export const useModelProfileStore = defineStore('modelProfile', {
       const retained = new Set(client.modelProfileScopeLinks.map(link => link.modelProfileId));
       client.modelProfiles = [...client.modelProfiles.filter(profile => (!oldIds.has(profile.id) || retained.has(profile.id)) && profile.id !== payload.profile?.id), ...(payload.profile ? [{ ...payload.profile }] : [])];
       const current = this.pendingSelections[key];
+      const isReadTarget = isRead && readTargetsSelection(read, current);
       if (isWrite && payload.outcome === 'committed' && current?.requestId === correlationId) {
-        if (current.queued) { current.status = 'draft'; current.requestId = ''; this.sendDraft(payload.scopeKind, payload.scopeId); }
+        this.completedSaves[key] = { requestId: correlationId!, submissionRequestId: current.submitted!.submissionRequestId };
+        const discardRead = this.reads[key];
+        if (current.queued && discardRead?.discard && readTargetsSelection(discardRead, current)) {
+          // Explicit discard also abandons the not-yet-sent choice; the exact after-read decides
+          // the saved value once this wire operation has ended, without submitting another write.
+          current.status = 'draft'; current.queued = false;
+        }
+        else if (current.queued) { current.status = 'draft'; current.requestId = ''; this.sendDraft(payload.scopeKind, payload.scopeId); }
         else { delete this.pendingSelections[key]; settle(key); this.status = '已保存'; }
+      } else if (isRead && read.discard && (!current || isReadTarget)) {
+        delete this.pendingSelections[key];
+        settle(key, '已放弃草稿并读取当前已保存值；未撤销已提交操作。');
+        this.status = '已读取已保存值；未撤销已提交操作';
+        this.completedDiscardReads[key] = correlationId!;
       } else if (isRead && current) {
-        if (read.discard) { delete this.pendingSelections[key]; settle(key, '已放弃草稿并读取当前已保存值；未撤销已提交操作。'); this.status = '已读取已保存值；未撤销已提交操作'; }
-        else if (read.afterRequestId) { current.status = 'draft'; current.requestId = ''; current.error = '已确认原操作结束并读取实际值；草稿保留，请确认后重试或放弃。'; settle(key, current.error); }
+        if (read.afterRequestId) {
+          current.status = 'draft'; current.requestId = '';
+          if (!isReadTarget) {
+            // The old wire operation has ended, but a later explicit Save owns this choice.
+            // Submit that newer choice using the observed revision instead of discarding/replaying it.
+            delete current.error; this.sendDraft(payload.scopeKind, payload.scopeId);
+          } else { current.error = '已确认原操作结束并读取实际值；草稿保留，请确认后重试或放弃。'; settle(key, current.error); }
+        }
         else if (current.status === 'draft' && !current.error) this.sendDraft(payload.scopeKind, payload.scopeId);
       }
       if (isRead && read.dirty && !this.pendingSelections[key]) this.refreshScope(payload.scopeKind, payload.scopeId);
@@ -246,6 +291,8 @@ export const useModelProfileStore = defineStore('modelProfile', {
       }
       this.pendingSelections = {};
       this.reads = {};
+      this.completedDiscardReads = {};
+      this.completedSaves = {};
       this.observations = {};
       this.scopeErrors = {};
       this.failedReads = {};
@@ -266,7 +313,7 @@ export const useModelProfileStore = defineStore('modelProfile', {
         this.failedReads[key] = true;
         this.status = message;
         const pending = this.pendingSelections[key];
-        if (pending) { pending.status = 'uncertain'; pending.error = message; settle(key, message); }
+        if (readTargetsSelection(read, pending)) { pending.status = 'uncertain'; pending.error = message; settle(key, message); }
       }
       this.rejectPending(correlationId, message);
     },
@@ -282,14 +329,17 @@ export const useModelProfileStore = defineStore('modelProfile', {
       if (pending.status === 'uncertain' || pending.requestId) { this.refreshScope(scopeKind, scopeId); return; }
       delete pending.error; this.sendDraft(scopeKind, scopeId);
     },
-    discardPending(scopeKind: ConfigScopeKind, scopeId?: string): void {
+    discardPending(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined {
       const key = keyOf(scopeKind, scopeId), pending = this.pendingSelections[key]; if (!pending) return;
-      if (pending.requestId) { this.refreshScope(scopeKind, scopeId, { discard: true }); return; }
+      if (pending.requestId) {
+        this.refreshScope(scopeKind, scopeId, { discard: true });
+        return this.reads[key]?.requestId;
+      }
       delete this.pendingSelections[key]; settle(key, '未提交草稿已放弃；已保存配置未改动。');
     },
-    clearProfileScope(scopeKind: ConfigScopeKind, scopeId?: string): void {
+    clearProfileScope(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined {
       if (scopeKind === 'global') return;
-      this.choose(scopeKind, scopeId, { model: '' }, 'clear');
+      return this.choose(scopeKind, scopeId, { model: '' }, 'clear');
     }
   }
 });

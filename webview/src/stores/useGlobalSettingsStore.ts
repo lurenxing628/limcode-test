@@ -1,6 +1,7 @@
 import { normalizeModelCapabilitySnapshot } from '@shared/modelCapabilities';
 import { describeOpenAICompatibleThinkingProbe, OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS } from '@shared/openAICompatibleThinkingProbe';
 import { defineStore } from 'pinia';
+import { effectScope, watch } from 'vue';
 import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '@shared/debugCapture';
 import {
   GLOBAL_SETTINGS_SECTIONS,
@@ -954,6 +955,48 @@ function plainSettingsFromState(state: GlobalSettingsState, section: GlobalSetti
   }
 }
 
+function initialSettingsValue(section: GlobalSettingsSection): GlobalSettingsSectionValue {
+  switch (section) {
+    case 'common': return emptyCommon();
+    case 'network': return emptyNetwork();
+    case 'llm': return emptyLlm();
+    case 'llmProviderConfigs': return emptyLlmProviderConfigs();
+    case 'llmCompression': return emptyLlmCompression();
+    case 'llmCompressionConfigs': return emptyLlmCompressionConfigs();
+    case 'checkpointMaintenance': return emptyCheckpointMaintenance();
+    case 'appearance': return emptyAppearance();
+    case 'attachments': return emptyAttachments();
+    case 'mcpServers': return emptyMcpServers();
+    case 'debugCapture': return normalizeDebugCaptureSettings();
+  }
+}
+
+// These editable fields can return to their initial default before the first read arrives. Values
+// alone then cannot distinguish a local clear/toggle from an untouched placeholder.
+const initialEditableFields: Array<{
+  section: GlobalSettingsSection;
+  key: string;
+  read(state: GlobalSettingsState): string | boolean;
+}> = [
+  { section: 'common', key: 'proxy', read: state => state.common.proxy },
+  { section: 'common', key: 'proxyShellAndMcp', read: state => state.common.proxyShellAndMcp },
+  { section: 'network', key: 'userAgent', read: state => state.network.userAgent }
+];
+const initiallyEditedFields = new WeakMap<object, Set<string>>();
+
+function mergeInitialSettings(state: GlobalSettingsState, section: GlobalSettingsSection,
+  remote: GlobalSettingsSectionValue): GlobalSettingsSectionValue {
+  const local = plainSettingsFromState(state, section);
+  const merged = mergeSettingsThreeWay(initialSettingsValue(section), local, remote, true).value;
+  const edited = initiallyEditedFields.get(state);
+  if (edited && isPlainJsonObject(local) && isPlainJsonObject(merged)) {
+    for (const field of initialEditableFields) {
+      if (field.section === section && edited.has(`${section}.${field.key}`)) merged[field.key] = local[field.key];
+    }
+  }
+  return merged;
+}
+
 function cloneSettingsValue<T extends GlobalSettingsSectionValue>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
@@ -1215,7 +1258,7 @@ function startModelFetchTimeout(onTimeout: () => void): void {
 }
 
 /** 全局设置（数据目录 + LLM 渠道配置）表单 store。组件只读 state + 调 action，传输细节收口在此。 */
-export const useGlobalSettingsStore = defineStore('globalSettings', {
+const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
   state: (): GlobalSettingsState => ({
     common: emptyCommon(),
     network: emptyNetwork(),
@@ -2512,8 +2555,12 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
         return;
       }
       if (!this.loadedSections[section]) {
+        // The initial UI values are the edit baseline until the first read. Merge only changes
+        // made locally since then, preserving both newly created records and existing disk rows.
+        const merged = mergeInitialSettings(this, section, payload.settings);
         this.applyCommittedMetadata(payload);
-        this.applySectionSettings(section, payload.settings);
+        this.applySectionSettings(section, merged);
+        if (coordinator.queued) coordinator.queued.settings = plainSettingsFromState(this, section);
         this.pumpSettingsUpdate(section);
         this.refreshPendingSettingSection(section);
         settleSettingsStatus(this, '设置已同步');
@@ -2697,3 +2744,29 @@ export const useGlobalSettingsStore = defineStore('globalSettings', {
     }
   }
 });
+
+export const useGlobalSettingsStore: typeof useGlobalSettingsStoreDefinition = Object.assign(
+  (...args: Parameters<typeof useGlobalSettingsStoreDefinition>) => {
+    const store = useGlobalSettingsStoreDefinition(...args);
+    if (!initiallyEditedFields.has(store)) {
+      const edited = new Set<string>();
+      initiallyEditedFields.set(store, edited);
+      const scope = effectScope(true);
+      // Observe just these scalars; a deep store subscription would scan channel catalogs on
+      // every keystroke. The detached scope belongs to the store, not its first mounted editor.
+      scope.run(() => watch(() => initialEditableFields.map(field => ({
+        loaded: store.loadedSections[field.section] === true, value: field.read(store)
+      })), (current, previous) => {
+        current.forEach((entry, index) => {
+          const field = initialEditableFields[index]!;
+          const key = `${field.section}.${field.key}`;
+          if (entry.loaded) edited.delete(key);
+          else if (entry.value !== previous[index]!.value) edited.add(key);
+        });
+      }, { flush: 'sync' }));
+      const dispose = store.$dispose.bind(store);
+      store.$dispose = () => { scope.stop(); initiallyEditedFields.delete(store); dispose(); };
+    }
+    return store;
+  }, useGlobalSettingsStoreDefinition
+);

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, ref } from 'vue';
+import { computed, nextTick, ref, watch } from 'vue';
 import { useGuardedSettingsDraft } from '@webview/composables/useGuardedSettingsDraft';
 import type { ConfigScopeKind } from '@shared/protocol';
 import { DEFAULT_INTEGRATED_SYSTEM_PROMPT } from '@shared/defaultSystemPrompt';
@@ -29,7 +29,10 @@ const draftState = useGuardedSettingsDraft(
 const draft = computed({ get: () => draftState.value.value.text, set: (text: string) => { draftState.value.value = { ...draftState.value.value, text }; } });
 const inheritMode = computed({ get: () => draftState.value.value.inherit, set: (inherit: boolean) => { draftState.value.value = { ...draftState.value.value, inherit }; } });
 const draftChangedRemotely = draftState.remoteChanged;
-const isInherited = computed(() => props.scopeKind !== 'global' && inheritMode.value && !local.value.prompt);
+watch(() => store.completedSaveFor(props.scopeKind, props.scopeId), requestId => {
+  if (requestId) draftState.confirmSubmitted(requestId);
+}, { flush: 'sync' });
+const isInherited = computed(() => props.scopeKind !== 'global' && inheritMode.value);
 const canRestoreScope = computed(() => props.scopeKind === 'global' ? !!local.value.link || !!local.value.prompt : !isInherited.value);
 const restoreButtonLabel = computed(() => props.scopeKind === 'global' ? '恢复默认' : '恢复继承');
 const canSave = computed(() => !isInherited.value && draft.value.trim().length > 0);
@@ -60,19 +63,21 @@ function onInput(event: Event): void {
 function save(): void {
   if (!canSave.value) return;
   draft.value = draft.value.trim();
-  draftState.markSubmitted();
-  store.setPromptForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} System Prompt`);
+  const requestId = store.setPromptForScope(props.scopeKind, props.scopeId, draft.value, `${props.scopeKind} System Prompt`);
+  if (requestId) draftState.markSubmitted(requestId);
 }
 
 function clear(): void {
-  store.clearPromptScope(props.scopeKind, props.scopeId);
-  draftState.reset();
+  const requestId = store.clearPromptScope(props.scopeKind, props.scopeId);
+  if (!requestId) return;
+  draftState.value.value = { text: props.scopeKind === 'global' ? '' : resolution.value.inheritedText,
+    inherit: props.scopeKind !== 'global' };
+  draftState.markSubmitted(requestId);
 }
 
 function startCustom(): void {
   if (props.scopeKind === 'global') return;
   inheritMode.value = false;
-  draft.value = local.value.prompt?.text ?? resolution.value.inheritedText;
   void nextTick(() => scroller.value?.focus());
 }
 
@@ -128,7 +133,7 @@ function insertPlaceholder(token: string): void {
       <button v-else type="button" :disabled="!canSave" @click="save">保存提示词</button>
       <button type="button" class="secondary" :disabled="!canRestoreScope" @click="clear">{{ restoreButtonLabel }}</button>
       <span v-if="isInherited">{{ inheritedStatusText }}</span>
-      <span v-else>{{ store.status }}</span>
+      <span>{{ store.status }}</span>
       <template v-if="draftChangedRemotely">
         <span role="status">已保存内容有更新，当前草稿已保留</span>
         <button type="button" class="secondary" @click="draftState.reset()">读取已保存值</button>

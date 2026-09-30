@@ -335,6 +335,26 @@ const chatAttachments = computed<InlineDataPart[]>({
     attachmentSnapshots.value = { ...attachmentSnapshots.value, chat };
   }
 });
+// Async reads belong to the selected conversation and, for edits, the particular edit session.
+// Count transitions synchronously so switching away and back cannot revive an old operation.
+let conversationRevision = 0;
+let editSessionRevision = 0;
+let submissionDraftRevision = 0;
+watch(() => clientState.currentConversationId, () => { conversationRevision += 1; }, { flush: 'sync' });
+watch([
+  () => ui.composerMode,
+  () => ui.editingMessage,
+  () => ui.editingTurnIntent
+], () => { editSessionRevision += 1; }, { flush: 'sync' });
+watch([
+  () => clientState.currentConversationId,
+  () => ui.composerMode,
+  () => ui.editingMessage,
+  () => ui.editingTurnIntent,
+  () => ui.chatDraftGeneration,
+  () => draft.value,
+  () => selectedAttachments.value
+], () => { submissionDraftRevision += 1; }, { deep: true, flush: 'sync' });
 // "Send as a new message" never silently replaces a draft or an open edit (see chatDraftPrefill).
 const chatDraftPrefill = useChatDraftPrefill(ui, chatAttachments);
 // Unsent text, attachments and an open edit survive a window reload (Webview state).
@@ -465,6 +485,8 @@ onMounted(() => {
 });
 
 onBeforeUnmount(() => {
+  conversationRevision += 1;
+  submissionDraftRevision += 1;
   draftPersistence.dispose();
   window.removeEventListener('keydown', onWindowKeydown);
   window.removeEventListener('resize', onWindowResize);
@@ -486,6 +508,7 @@ function onWindowResize(): void {
 async function submit(): Promise<void> {
   const text = draft.value.trim();
   if ((!text && selectedAttachments.value.length === 0) || conversationInputDisabled.value) return;
+  const draftRevision = submissionDraftRevision;
   const content = buildMessageContent(text, selectedAttachments.value);
   if (ui.isEditing) {
     emit('submit', text, content, currentTurnAuthoritySelection());
@@ -507,7 +530,8 @@ async function submit(): Promise<void> {
     } finally {
       delete savingSessionSelections.value[conversationId];
     }
-    if (clientState.currentConversationId !== conversationId || draft.value.trim() !== text || conversationInputDisabled.value) return;
+    if (submissionDraftRevision !== draftRevision || clientState.currentConversationId !== conversationId
+      || draft.value.trim() !== text || conversationInputDisabled.value) return;
   }
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
   if (!submission) return;
@@ -529,9 +553,17 @@ async function onAttachmentFilesChange(event: Event): Promise<void> {
 
 async function addFilesAsAttachments(files: File[]): Promise<void> {
   const targetMode = ui.composerMode;
+  const targetConversationRevision = conversationRevision;
+  const targetEditSessionRevision = editSessionRevision;
+  const targetChatDraftGeneration = ui.chatDraftGeneration;
+  const targetStillCurrent = (): boolean => conversationRevision === targetConversationRevision
+    && (targetMode === 'chat'
+      ? ui.chatDraftGeneration === targetChatDraftGeneration
+      : editSessionRevision === targetEditSessionRevision);
   const limitBytes = attachmentLimitBytes.value;
   const limitMb = globalSettings.attachments.maxStoredInlineFileMb || 20;
   for (const file of files) {
+    if (!targetStillCurrent()) return;
     let targetAttachments = attachmentSnapshots.value[targetMode];
     const mimeType = attachmentMimeTypeForFile(file);
     if (!SUPPORTED_COMPOSER_MIME_TYPES.has(mimeType)) {
@@ -547,8 +579,8 @@ async function addFilesAsAttachments(files: File[]): Promise<void> {
       continue;
     }
     const data = await readFileAsBase64(file);
-    // FileReader can finish after the user switches between chat and edit. Commit to the bucket
-    // selected when reading started, never whichever mode happens to be current after the await.
+    if (!targetStillCurrent()) return;
+    // The chat draft survives mode changes, but an edit's bucket is reused by later edit sessions.
     targetAttachments = attachmentSnapshots.value[targetMode];
     if (attachmentBytes(targetAttachments) + file.size > limitBytes) {
       globalSettings.status = `本条消息的附件总大小超过 ${limitMb}MB，未添加 ${file.name}。`;

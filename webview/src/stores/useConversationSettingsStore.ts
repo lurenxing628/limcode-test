@@ -1,4 +1,4 @@
-import { defineStore } from 'pinia';
+import { defineStore, type StoreGeneric } from 'pinia';
 import type {
   ConversationSettingsRecord,
   ConversationSettingsSnapshotPayload
@@ -10,12 +10,30 @@ interface ConversationSettingsState {
   status: string;
   savedName: string;
   draftChangedRemotely: boolean;
-  pendingReload?: { requestId: string; draftName: string };
+  pendingReload?: { requestId: string; draftRevision: number };
   pendingSave?: { requestId: string; name: string };
 }
 
 function emptyCommon(conversationId = ''): ConversationSettingsRecord {
   return { conversationId, name: '' };
+}
+
+const nameDraftTrackers = new WeakMap<object, { name: string; revision: number }>();
+
+function nameDraftRevision(store: StoreGeneric): number {
+  let tracker = nameDraftTrackers.get(store);
+  if (!tracker) {
+    tracker = { name: store.common.name, revision: 0 };
+    nameDraftTrackers.set(store, tracker);
+    const current = tracker;
+    // Observe direct v-model writes synchronously, including edits that return to the same text.
+    store.$subscribe((_mutation, state) => {
+      if (current.name === state.common.name) return;
+      current.name = state.common.name;
+      current.revision++;
+    }, { detached: true, flush: 'sync' });
+  }
+  return tracker.revision;
 }
 
 /** 对话级 common 设置；模型选择只有 ModelProfile 一个 authority。 */
@@ -28,6 +46,7 @@ export const useConversationSettingsStore = defineStore('conversationSettings', 
   }),
   actions: {
     request(conversationId: string, discardDraft = false): void {
+      nameDraftRevision(this);
       // 进入对话时先占位 conversationId，避免快照未到时保存按钮不可用。
       if (this.common.conversationId !== conversationId) {
         this.common = emptyCommon(conversationId);
@@ -42,7 +61,7 @@ export const useConversationSettingsStore = defineStore('conversationSettings', 
       }
       this.status = '正在读取对话设置...';
       const requestId = bridge.request(BridgeMessageType.ConversationSettingsGet, { conversationId, section: 'common' });
-      if (discardDraft) this.pendingReload = { requestId, draftName: this.common.name };
+      if (discardDraft) this.pendingReload = { requestId, draftRevision: nameDraftRevision(this) };
     },
     save(): void {
       if (!this.common.conversationId) return;
@@ -65,8 +84,9 @@ export const useConversationSettingsStore = defineStore('conversationSettings', 
       const requestedDiscard = !!reload && reload.requestId === correlationId;
       const pending = this.pendingSave;
       const preserveSubmission = !!pending && (pending.requestId !== correlationId || this.common.name !== pending.name);
-      const mayReplace = (this.common.name === this.savedName && !preserveSubmission) || this.common.name === settings.name
-        || (requestedDiscard && this.common.name === reload.draftName);
+      const mayReplace = this.common.name === settings.name || (requestedDiscard
+        ? nameDraftRevision(this) === reload.draftRevision
+        : this.common.name === this.savedName && !preserveSubmission);
       if (requestedDiscard) this.pendingReload = undefined;
       if (requestedDiscard || pending?.requestId === correlationId) this.pendingSave = undefined;
       this.draftChangedRemotely = !mayReplace && (this.draftChangedRemotely || settings.name !== this.savedName);
