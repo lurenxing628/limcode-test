@@ -11,6 +11,16 @@ import {
   type ShellArgs
 } from '@webview/components/content/toolDisplay/shellToolModel';
 
+type ProcessOutputKind = 'process-stdout' | 'process-stderr';
+
+interface CommandOutputError {
+  kind: ProcessOutputKind;
+  label: string;
+  message: string;
+  retryable: boolean;
+  retained: boolean;
+}
+
 interface CommandEntry {
   processId: string;
   toolCallId: string;
@@ -27,6 +37,7 @@ interface CommandEntry {
   stdout: string;
   stderr: string;
   progress: string;
+  outputErrors: CommandOutputError[];
   droppedChars?: number;
   exitCode?: number;
   killed?: boolean;
@@ -211,15 +222,15 @@ function onDocumentPointerDown(event: PointerEvent): void {
 function ensureOutputDetails(): void {
   if (!open.value || !selectedProcessId.value) return;
   for (const kind of ['process-stdout', 'process-stderr'] as const) {
-    const key = reliableKernelDetailKey(kind, selectedProcessId.value);
-    if (reliableConversation.feed.details[key]?.status === 'ready') {
-      reliableConversation.feed.refreshDetail(kind, selectedProcessId.value, { priority: 'expanded' });
-    } else if (reliableConversation.feed.details[key]?.status === 'error') {
-      reliableConversation.feed.retryDetail(kind, selectedProcessId.value, { priority: 'expanded' });
-    } else {
-      reliableConversation.feed.requestDetail(kind, selectedProcessId.value, { priority: 'expanded' });
-    }
+    // Automatic demands preserve backoff and exhaustion. Only the explicit retry below resets
+    // their budget; an in-flight initial or refresh read records one later mutable-prefix demand.
+    reliableConversation.feed.refreshDetail(kind, selectedProcessId.value, { priority: 'expanded' });
   }
+}
+
+function retryOutputDetail(kind: ProcessOutputKind): void {
+  if (!selectedProcessId.value) return;
+  reliableConversation.feed.retryDetail(kind, selectedProcessId.value, { priority: 'expanded' });
 }
 
 function ensureCommandDetail(): void {
@@ -275,7 +286,7 @@ function buildCommandEntries(): CommandEntry[] {
               : 'unavailable';
       const output = processId === selectedProcessId.value
         ? materializeOutput(processId)
-        : { stdout: '', stderr: '', loading: false };
+        : { stdout: '', stderr: '', loading: false, errors: [] };
       const receipt = receipts.get(processId);
       const exitCode = signedInteger(receipt?.exit_code);
       const running = status === 'running';
@@ -302,6 +313,7 @@ function buildCommandEntries(): CommandEntry[] {
         stdout: output.stdout,
         stderr: output.stderr,
         progress: output.loading ? '输出分片加载中…' : '',
+        outputErrors: output.errors,
         ...(nonNegativeInteger(process.dropped_bytes) !== undefined
           ? { droppedChars: nonNegativeInteger(process.dropped_bytes) }
           : {}),
@@ -317,16 +329,36 @@ function buildCommandEntries(): CommandEntry[] {
     .sort((left, right) => right.updatedAt - left.updatedAt || right.startedAt - left.startedAt || left.processId.localeCompare(right.processId));
 }
 
-function materializeOutput(processId: string): { stdout: string; stderr: string; loading: boolean } {
+function materializeOutput(processId: string): {
+  stdout: string;
+  stderr: string;
+  loading: boolean;
+  errors: CommandOutputError[];
+} {
   const stdout = reliableConversation.feed.details[reliableKernelDetailKey('process-stdout', processId)];
   const stderr = reliableConversation.feed.details[reliableKernelDetailKey('process-stderr', processId)];
   const stdoutText = stdout?.status === 'ready' || stdout?.status === 'loading' ? stdout.text : '';
   const stderrText = stderr?.status === 'ready' || stderr?.status === 'loading' ? stderr.text : '';
   const initialLoading = stdout?.status === 'loading' || stderr?.status === 'loading';
+  const errors: CommandOutputError[] = [];
+  for (const [kind, label, detail] of [
+    ['process-stdout', '标准输出', stdout],
+    ['process-stderr', '标准错误', stderr]
+  ] as const) {
+    const message = detail?.status === 'error' ? detail.error : detail?.refreshError;
+    if (message) errors.push({
+      kind,
+      label,
+      message,
+      retryable: detail?.terminalError !== true,
+      retained: detail?.status === 'ready' && detail.text.length > 0
+    });
+  }
   return {
     stdout: stdoutText,
     stderr: stderrText,
-    loading: initialLoading && !stdoutText && !stderrText
+    loading: initialLoading || stdout?.refreshing === true || stderr?.refreshing === true,
+    errors
   };
 }
 
@@ -473,6 +505,10 @@ function timestamp(value: unknown): number {
 
               <section class="command-detail-section">
                 <h3>输出日志</h3>
+                <div v-for="error in selectedEntry.outputErrors" :key="error.kind" class="command-output-error" role="status">
+                  <span>{{ error.label }}读取失败：{{ error.message }}<template v-if="error.retained"> 已保留上次读到的输出。</template></span>
+                  <button v-if="error.retryable" type="button" class="command-output-retry" @click="retryOutputDetail(error.kind)">重试读取</button>
+                </div>
                 <pre v-if="selectedEntry.stdout" class="command-log is-stdout">{{ selectedEntry.stdout }}</pre>
                 <pre v-if="selectedEntry.stderr" class="command-log is-stderr">{{ selectedEntry.stderr }}</pre>
                 <pre v-if="selectedEntry.progress" class="command-log is-progress">{{ selectedEntry.progress }}</pre>
@@ -815,6 +851,37 @@ function timestamp(value: unknown): number {
   border-bottom: 1px solid var(--vscode-panel-border, rgba(128, 128, 128, 0.22));
   color: var(--vscode-errorForeground);
   font-size: var(--font-size-xs);
+}
+
+.command-output-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 6px;
+  color: var(--vscode-errorForeground);
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+}
+
+.command-output-error > span {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.command-output-retry {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: var(--radius-sm);
+  color: var(--vscode-foreground);
+  background: transparent;
+  font-size: inherit;
+}
+
+.command-output-retry:hover,
+.command-output-retry:focus-visible {
+  background: var(--vscode-list-hoverBackground);
 }
 
 .command-detail-scroll-shell {

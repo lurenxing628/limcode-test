@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { FileDiffPreviewBusyError, FileDiffPreviewTooLargeError } from '../capabilities/fileDiffAsync';
 import { captureDebug, type DebugCaptureRecorder } from './debugCapture/observer';
 import type * as vscode from 'vscode';
 import {
@@ -709,7 +710,9 @@ export class ReliableKernelWebviewFeedBridge {
           type: RELIABLE_KERNEL_DETAIL_ERROR_MESSAGE,
           requestId: request.requestId,
           sessionId: connection.sessionId,
-          message: error instanceof Error ? error.message : '读取详情失败。'
+          message: error instanceof Error ? error.message : '读取详情失败。',
+          ...(error instanceof FileDiffPreviewBusyError || error instanceof FileDiffPreviewTooLargeError
+            ? { code: error.code, retryable: error.retryable } : {})
         });
       }
     } finally {

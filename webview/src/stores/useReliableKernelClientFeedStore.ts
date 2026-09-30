@@ -88,6 +88,8 @@ interface PendingDetailRequest {
   enqueuedAt: number;
   mode: 'initial' | 'refresh';
   retryCount: number;
+  /** A newer mutable-prefix demand arrived while this exact request was in flight. */
+  refreshRequested?: boolean;
 }
 
 export type ReliableKernelDetailPriority = 'critical' | 'expanded' | 'visible' | 'background';
@@ -1249,6 +1251,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     ): string | undefined {
       const key = detailKey(kind, recordId.trim());
       const current = this.details[key];
+      if (current?.terminalError) return key;
       if (current?.status === 'ready') {
         clearDetailRetryTimer(key);
         return this.refreshDetail(kind, recordId, {
@@ -1270,11 +1273,12 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       const sessionId = this.sessionId;
       const key = detailKey(kind, id);
       const current = this.details[key];
-      if (!id || !sessionId || current?.status !== 'ready') {
-        return this.requestDetail(kind, recordId, options);
-      }
+      if (!id || !sessionId) return undefined;
       const existing = Object.values(this.pendingDetails).find((request) => request.key === key);
       if (existing) {
+        // Its pages freeze the older prefix. One later read must observe a final Process update
+        // even if it arrives before these pages finish and the running-process poll stops.
+        existing.refreshRequested = true;
         const priority = options.priority ?? 'visible';
         if (DETAIL_PRIORITY_ORDER[priority] < DETAIL_PRIORITY_ORDER[existing.priority]) {
           existing.priority = priority;
@@ -1283,6 +1287,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         }
         return key;
       }
+      if (current?.status !== 'ready') return this.requestDetail(kind, recordId, options);
       const priority = options.priority ?? 'visible';
       if (current.refreshError && !options.bypassBackoff) {
         if (!current.terminalError && current.nextRetryAt !== undefined) {
@@ -1403,22 +1408,23 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         );
         return;
       }
-      this.finishDetailRequest(message.requestId);
+      this.finishDetailRequest(message.requestId, { completed: true });
     },
 
     observeDetailError(message: ReliableKernelDetailErrorMessage): void {
       if (message.sessionId !== this.sessionId) return;
       const pending = this.pendingDetails[message.requestId];
       if (!pending || pending.sessionId !== message.sessionId) return;
-      this.failDetailRequest(message.requestId, message.message);
+      this.failDetailRequest(message.requestId, message.message, undefined, message.retryable !== false);
     },
 
-    failDetailRequest(requestId: string, error: string, totalBytes?: number): void {
+    failDetailRequest(requestId: string, error: string, totalBytes?: number, retryable = true): void {
       const pending = this.pendingDetails[requestId];
       if (!pending) return;
       const current = this.details[pending.key];
       const retryCount = pending.retryCount + 1;
-      const retryDelay = DETAIL_AUTO_RETRY_DELAYS_MS[retryCount - 1];
+      const retryDelay = retryable ? DETAIL_AUTO_RETRY_DELAYS_MS[retryCount - 1] : undefined;
+      if (!retryable) clearDetailRetryTimer(pending.key);
       const nextRetryAt = retryDelay === undefined ? undefined : Date.now() + retryDelay;
       if (pending.mode === 'refresh' && current?.status === 'ready') {
         this.details[pending.key] = {
@@ -1427,6 +1433,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           totalBytes: current.totalBytes,
           refreshError: error,
           retryCount,
+          ...(!retryable ? { terminalError: true } : {}),
           ...(nextRetryAt !== undefined ? { nextRetryAt } : {})
         };
       } else {
@@ -1436,6 +1443,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           totalBytes: totalBytes ?? current?.totalBytes ?? 0,
           error,
           retryCount,
+          ...(!retryable ? { terminalError: true } : {}),
           ...(nextRetryAt !== undefined ? { nextRetryAt } : {})
         };
       }
@@ -1505,7 +1513,8 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       }
     },
 
-    finishDetailRequest(requestId: string): void {
+    finishDetailRequest(requestId: string, options: { completed?: boolean } = {}): void {
+      const pending = this.pendingDetails[requestId];
       const timeout = detailRequestTimeouts.get(requestId);
       if (timeout !== undefined) clearTimeout(timeout);
       detailRequestTimeouts.delete(requestId);
@@ -1515,6 +1524,11 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       this.activeDetailRequestIds = this.activeDetailRequestIds.filter((id) => id !== requestId);
       this.detailQueue = this.detailQueue.filter((id) => id !== requestId);
       this.pumpDetailQueue();
+      // Only a completed read drains a later demand. A failed read keeps the existing bounded
+      // retry/backoff path; it must not turn a polling demand into a fresh retry budget.
+      if (options.completed && pending?.refreshRequested && pending.sessionId === this.sessionId) {
+        this.refreshDetail(pending.kind, pending.recordId, { priority: pending.priority });
+      }
     },
 
     sortDetailQueue(): void {

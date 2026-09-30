@@ -2,11 +2,81 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 const require = createRequire(import.meta.url);
 const root = process.cwd();
 const { buildFileDiffRecordAsync } = require(path.join(root, 'dist/extension/backend/capabilities/fileDiffAsync.js'));
 const { buildFileDiffRecord } = require(path.join(root, 'dist/extension/backend/capabilities/fileDiff.js'));
 const { ClientDetailReader } = require(path.join(root, 'dist/extension/backend/reliableKernel/clientFeed.js'));
+const { FileDiffPreviewBusyError, FileDiffPreviewTooLargeError } = require(path.join(root, 'dist/extension/backend/capabilities/fileDiffAsync.js'));
+const { ReliableKernelWebviewFeedBridge } = require(path.join(root, 'dist/extension/backend/reliableKernel/webviewFeedBridge.js'));
+
+async function detailError(error, requestId = 'request') {
+  const posted = [];
+  const bridge = new ReliableKernelWebviewFeedBridge({}, { async read() { throw error; } });
+  bridge.post = (_client, message) => posted.push(message);
+  const client = { closed: false, ready: true, visible: true, navigationGeneration: 1,
+    meta: { conversationId: 'conversation' }, detailRequests: new Set() };
+  await bridge.readDetail(client, { sessionId: 'session' }, {
+    requestId, kind: 'file-change-diff', recordId: 'member', offset: 0, maxBytes: 65536
+  });
+  assert.equal(client.detailRequests.size, 0);
+  return posted[0];
+}
+
+test('file diff detail errors retain permanent and temporary classification across the bridge', async () => {
+  for (const error of [new FileDiffPreviewTooLargeError(), new FileDiffPreviewBusyError()]) {
+    const message = await detailError(error);
+    assert.equal(message.code, error.code);
+    assert.equal(message.retryable, error.retryable);
+    assert.equal(message.message, error.message);
+  }
+});
+
+test('permanent file diff errors stop automatic and manual retries while busy previews retry', async t => {
+  const oldWindow = globalThis.window;
+  const posted = [];
+  globalThis.window = { setTimeout, clearTimeout, atob, requestAnimationFrame() {},
+    addEventListener() {}, removeEventListener() {},
+    acquireVsCodeApi: () => ({ postMessage: message => posted.push(message), getState() {}, setState() {} }) };
+  const server = await createWebviewSsrServer();
+  t.after(async () => { await server.close(); globalThis.window = oldWindow; });
+  const pinia = await import('pinia');
+  const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const sendError = async (store, error) => {
+    const requestId = Object.keys(store.pendingDetails)[0];
+    assert.ok(requestId);
+    store.observeDetailError(await detailError(error, requestId));
+  };
+  for (const permanent of [true, false]) {
+    pinia.setActivePinia(pinia.createPinia());
+    const store = useReliableKernelClientFeedStore();
+    Object.assign(store, { sessionId: 'session', hostBootId: 'host' });
+    posted.length = 0;
+    const key = store.requestDetail('file-change-diff', 'member');
+    const error = permanent ? new FileDiffPreviewTooLargeError() : new FileDiffPreviewBusyError();
+    await sendError(store, error);
+    const requests = () => posted.filter(message => message.type === 'reliable-kernel.detail-request').length;
+    if (permanent) {
+      assert.equal(store.details[key].terminalError, true);
+      assert.equal(store.details[key].nextRetryAt, undefined);
+      t.mock.timers.tick(5000);
+      store.retryDetail('file-change-diff', 'member');
+      assert.equal(requests(), 1, 'the same permanent preview never sends another request');
+    } else {
+      assert.notEqual(store.details[key].terminalError, true);
+      t.mock.timers.tick(250);
+      assert.equal(requests(), 2, 'busy preview retries after the existing backoff');
+      await sendError(store, new FileDiffPreviewTooLargeError());
+      assert.equal(store.details[key].terminalError, true);
+      t.mock.timers.tick(5000);
+      assert.equal(requests(), 2, 'a later permanent failure cancels further retries');
+    }
+    store.$dispose();
+  }
+  t.mock.timers.reset();
+});
 
 function fixture(before = 'old\n', after = 'new\n') {
   const state = { reads: 0, deleted: false, fail: false, overrideSize: undefined, target: 'target' };

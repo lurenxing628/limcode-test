@@ -256,6 +256,9 @@ export interface ReliableKernelDetailErrorMessage {
   requestId: string;
   sessionId: string;
   message: string;
+  code?: string;
+  /** False when the same immutable detail cannot succeed on another attempt. */
+  retryable?: boolean;
 }
 
 export interface ReliableKernelHistoryPageRequestMessage {
