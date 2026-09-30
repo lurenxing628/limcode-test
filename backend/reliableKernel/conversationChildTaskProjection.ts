@@ -577,6 +577,7 @@ async function answerHandling(
     if (!answerId || !submissionIds.has(answerId) || seen.has(`${toolCallId}:${answerId}`)) continue;
     seen.add(`${toolCallId}:${answerId}`);
     const results = facts.toolModelResults.filter(result => result.tool_call_id === toolCallId);
+    if (results.length === 0) continue;
     const contextCommitted = results.some(result => facts.contextSegmentSources.some(source =>
       source.source_kind === 'tool_model_result' && source.source_id === result.id));
     evidence.push({ answerId, via: 'tool_result', toolCallId, contextCommitted });

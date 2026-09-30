@@ -243,6 +243,32 @@ test('同名不同任务不合并，current和queue变化改变单task revision�
   assert.notEqual(changed.revision, priorRevision); assert.equal(changed.resumable, false);
 });
 
+test('foreground答案仅有artifact或outcome时交付未知，模型结果与Context提交分别提供证据', async () => {
+  for (const source of ['toolResultArtifacts', 'toolOutcomes']) {
+    const f = fixture(); f.child(); f.message('initial', 'work');
+    f.content('answer-content', 'answer');
+    f.facts.answerSubmissions.push({ id: 'submission', answer_bridge_id: 'worker-bridge', turn_id: 'worker-turn',
+      submission_seq: 1n, interrupted: 0n, created_at: NOW });
+    f.facts.answerPayloads.push({ id: 'payload', submission_id: 'submission', content_object_id: 'answer-content' });
+    f.facts.answerBridges[0].current_submission_id = 'submission';
+    f.facts.answerToolCalls.push({ id: 'worker-spawn', tool_name: 'run_agent' });
+    f.content('result-artifact', JSON.stringify({ detail: { submissionId: 'submission' } }), 'application/json');
+    f.facts[source].push({ id: 'result', tool_call_id: 'worker-spawn', content_object_id: 'result-artifact' });
+    const before = (await f.project()).tasks[0].result;
+    assert.equal(before.latestAnswer.answerId, 'submission');
+    assert.deepEqual(before.deliveries, []);
+    assert.deepEqual(before.handling, [{ answerId: 'submission', via: 'unknown' }], source);
+    f.facts.toolModelResults.push({ id: 'model-result', tool_call_id: 'worker-spawn' });
+    assert.deepEqual((await f.project()).tasks[0].result.handling, [
+      { answerId: 'submission', via: 'tool_result', toolCallId: 'worker-spawn', contextCommitted: false }
+    ]);
+    f.facts.contextSegmentSources.push({ id: 'context', source_kind: 'tool_model_result', source_id: 'model-result' });
+    assert.deepEqual((await f.project()).tasks[0].result.handling, [
+      { answerId: 'submission', via: 'tool_result', toolCallId: 'worker-spawn', contextCommitted: true }
+    ]);
+  }
+});
+
 test('foreground答案已提交到Context单独可见，不能误称无RuntimeDelivery等于没送达', async () => {
   const f = fixture(); f.child(); f.message('initial', 'work');
   f.content('answer-content', 'answer');

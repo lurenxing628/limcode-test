@@ -55,6 +55,7 @@ import {
   isToolResultContents,
   projectOrdinaryModelWindow,
   projectSummaryModelWindow,
+  withSummaryDispatchRefs,
   stripNativeConfigurationUpdates,
   suppressRepeatedManagedMediaBodies,
   type ManagedMediaBodyProjectionState,
@@ -1467,7 +1468,7 @@ function compressionContext(
   for (const item of sourceContext) {
     const attachmentStateContent = renderedAttachmentState.afterSegment.get(item.segmentId);
     const pairContents = item.segmentKind === 'tool_pair'
-      ? toolPairContents(item.content, modelHandleCatalog)
+      ? toolPairContents(item.content, modelHandleCatalog, methodKind !== 'provider_native')
       : undefined;
     const toolResults = pairContents !== undefined && isToolResultContents(pairContents);
     attachmentPlacements.enter(toolResults);
@@ -1497,6 +1498,9 @@ function compressionContext(
           parts: [{ text: contextText(item.content, item.contentType) }]
         }];
       }
+    }
+    if (methodKind !== 'provider_native' && !pairContents && item.segmentKind !== 'compression') {
+      decoded = withSummaryDispatchRefs(decoded, { kind: 'context_segment', id: item.segmentId });
     }
     if (item.segmentKind === 'compression' && contents.length === 0
       && methodKind !== 'provider_native') {
@@ -1885,11 +1889,14 @@ function nativeToolOccurrence(
 
 function toolPairContents(
   content: string,
-  modelHandleCatalog: ModelHandleCatalog = { entries: [] }
+  modelHandleCatalog: ModelHandleCatalog = { entries: [] },
+  forTextSummary = false
 ): MessageContent[] {
   const pair = requireRecord(normalizePlainJson(JSON.parse(content), 'Context tool pair'), 'Context tool pair');
   const call = requireRecord(pair.toolCall, 'Context tool pair.toolCall');
-  requireText(call.id, 'Context tool pair.toolCall.id');
+  const toolCallId = requireText(call.id, 'Context tool pair.toolCall.id');
+  const withSummaryIdentity = (contents: MessageContent[]) => forTextSummary
+    ? withSummaryDispatchRefs(contents, { kind: 'tool_call', id: toolCallId }) : contents;
   const providerCallId = optionalText(call.providerCallId);
   const name = requireText(call.toolName, 'Context tool pair.toolCall.toolName');
   if (pair.toolModelResult === undefined) {
@@ -1899,7 +1906,7 @@ function toolPairContents(
     if (pair.native !== true) throw new TypeError('Context tool pair is missing toolModelResult.');
     const storedOutputItem = modelOutputItemFromPayload({ outputItem: call.outputItem });
     const storedThoughtSignature = optionalText(call.thoughtSignature);
-    return [{
+    return withSummaryIdentity([{
       role: 'model',
       parts: [{
         ...(providerCallId ? { id: providerCallId } : {}),
@@ -1911,12 +1918,12 @@ function toolPairContents(
         ...(storedThoughtSignature ? { thoughtSignature: storedThoughtSignature } : {}),
         ...(storedOutputItem ? { outputItem: storedOutputItem } : {})
       }]
-    }];
+    }]);
   }
   const result = requireRecord(pair.toolModelResult, 'Context tool pair.toolModelResult');
   const decoded = parseNestedJson(result.result, 'Context tool result');
   const response = splitToolResponseAttachments(decoded);
-  return [{
+  return withSummaryIdentity([{
     role: 'user',
     parts: [{
       ...(providerCallId ? { id: providerCallId } : {}),
@@ -1926,7 +1933,7 @@ function toolPairContents(
         ...(response.parts.length > 0 ? { parts: response.parts } : {})
       }
     }]
-  }];
+  }]);
 }
 
 function splitToolResponseAttachments(value: unknown): { value: unknown; parts: InlineDataPart[] } {

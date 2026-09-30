@@ -7,6 +7,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const { readConversationChildHandles, mergeConversationChildHandles } = load('backend/reliableKernel/conversationChildHandles.js');
+const { buildModelHandleCatalog } = load('backend/reliableKernel/modelHandleCatalog.js');
 const { LlmCapabilityFullRequestAdapter } = load('backend/reliableKernel/llmCapabilityProviderAdapter.js');
 const { projectSummaryModelWindow } = load('backend/reliableKernel/modelFacingContextProjection.js');
 const { expandTextCompressionSources } = load('backend/reliableKernel/compressionSourceReplay.js');
@@ -109,6 +110,22 @@ test('same-timestamp parent turns merge newest recipes without trusting hashed t
   assert.equal(fixture.reads.length, 2);
 });
 
+test('a backwards clock between parent turns cannot discard or reassign a reserved child reference', async () => {
+  const fixture = recipeFixture([
+    { kind: 'reliable-agent-turn', modelHandleCatalog: { entries: handles.slice(0, 1) } },
+    { kind: 'reliable-context-compression', modelHandleCatalog: { entries: handles.slice(0, 2) } }
+  ]);
+  fixture.domains.Turn = [
+    { id: 'old-turn', conversation_id: 'fork', created_at: '2026-09-22T00:01:00.000Z' },
+    { id: 'new-turn', conversation_id: 'fork', created_at: '2026-09-22T00:00:59.000Z' }
+  ];
+  fixture.domains.ModelRequest[0].turn_id = 'old-turn';
+  fixture.domains.ModelRequest[1].turn_id = 'new-turn';
+  const reserved = await readConversationChildHandles(fixture.database, fixture.store, 'fork');
+  assert.deepEqual(reserved, handles.slice(0, 2));
+  assert.deepEqual(buildModelHandleCatalog([{ answerBridgeId: 'bridge-new' }], reserved).entries, handles);
+});
+
 test('frozen history rejects missing CAS and conflicting targets or renamed child references', async () => {
   for (const entries of [[child('A1', 'different')], [child('A4', 'bridge-completed')]]) {
     assert.throws(() => mergeConversationChildHandles(handles, entries),
@@ -158,6 +175,58 @@ test('reused or absent provider call ids cannot overwrite different delegated ta
   }))).contents;
   const summary = JSON.stringify(await deterministicSummary(contents));
   for (const task of ['ONE', 'TWO', 'THREE', 'FOUR']) assert.ok(summary.includes(`DISTINCT_${task}`));
+});
+
+function repeatedDispatchContext() {
+  return [1, 2].flatMap(index => [
+    {
+      segmentId: `dispatch-message-${index}`, segmentKind: 'message', messageRole: 'model',
+      contentType: 'application/vnd.limcode.message+json',
+      content: JSON.stringify({ role: 'model', parts: [{ id: 'provider-reused-id', functionCall: {
+        name: 'run_agent', args: { operation: 'send', childRef: 'A1', prompt: 'Repeat the same delegated instruction.' }
+      } }] })
+    },
+    {
+      segmentId: `dispatch-result-${index}`, segmentKind: 'tool_pair', messageRole: 'user',
+      contentType: 'application/json',
+      content: JSON.stringify({
+        toolCall: { id: `internal-dispatch-${index}`, providerCallId: 'provider-reused-id', toolName: 'run_agent' },
+        toolModelResult: { result: JSON.stringify({ answerBridgeId: 'bridge-completed', status: 'running' }) }
+      })
+    }
+  ]);
+}
+
+test('text summaries preserve separate identical dispatches when provider call ids repeat', async () => {
+  const captured = await captureCompact(fullRequest('llm_summary', repeatedDispatchContext()));
+  const first = await deterministicSummary(captured.contents);
+  const second = await deterministicSummary([{ role: 'user', parts: [{ text: 'Retain both delegated dispatches.' }] }], first);
+  for (const contents of [first, second]) {
+    const text = JSON.stringify(contents);
+    assert.ok(text.match(/historical_tool_call/g)?.length >= 2, 'identical calls from separate dispatches remain separate facts');
+    assert.equal(text.match(/historical_tool_result/g)?.length, 2, 'identical results from separate dispatches remain separate facts');
+  }
+  const descriptors = captured.contents.flatMap(content => content.parts.map(part => JSON.parse(part.text)));
+  for (const kind of ['historical_tool_call', 'historical_tool_result']) {
+    const refs = descriptors.filter(descriptor => descriptor.kind === kind).map(descriptor => descriptor.dispatchRef);
+    assert.equal(new Set(refs).size, 2);
+    assert.ok(refs.every(ref => /^D[\da-f]{64}$/.test(ref)), 'summary identities are opaque dispatch references');
+    for (const contents of [first, second]) {
+      for (const ref of refs) assert.ok(JSON.stringify(contents).includes(ref), `dispatch ${ref} survives repeated compression`);
+    }
+  }
+  assert.doesNotMatch(JSON.stringify(captured.contents), /internal-dispatch-|dispatch-message-|dispatch-result-/);
+  const replay = await captureCompact(fullRequest('llm_summary', repeatedDispatchContext()));
+  assert.deepEqual(replay.contents, captured.contents, 'the same immutable dispatch sources produce stable summary identities');
+});
+
+test('native compression retains provider call ids without text-summary dispatch metadata', async () => {
+  const captured = await captureCompact(fullRequest('provider_native', repeatedDispatchContext()));
+  const parts = captured.contents.flatMap(content => content.parts);
+  assert.equal(parts.filter(part => part.functionCall).length, 2);
+  assert.equal(parts.filter(part => part.functionResponse).length, 2);
+  assert.ok(parts.every(part => part.id === 'provider-reused-id'));
+  assert.doesNotMatch(JSON.stringify(captured.contents), /dispatchRef|summaryDispatchRef|internal-dispatch-/);
 });
 
 function provenanceFixture({ gap = false, cycle = false, missing = false } = {}) {

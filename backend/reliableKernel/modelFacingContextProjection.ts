@@ -1452,6 +1452,27 @@ export function firstUnresolvedMedia(contents: readonly MessageContent[]): strin
   return undefined;
 }
 
+type SummaryDispatchPart = ContentPart & { summaryDispatchRef?: string };
+
+/** Only text-summary inputs carry these opaque identities; provider wire ids stay unchanged. */
+export function withSummaryDispatchRefs(
+  contents: readonly MessageContent[],
+  source: { kind: 'tool_call' | 'context_segment'; id: string }
+): MessageContent[] {
+  return contents.map((content, contentIndex) => ({
+    ...content,
+    parts: content.parts.map((part, partIndex): ContentPart => {
+      if (!('functionCall' in part) && !('functionResponse' in part)) return part;
+      const identity = ['limcode.summary-dispatch', source.kind, source.id,
+        ...(source.kind === 'context_segment' ? [contentIndex, partIndex] : [])];
+      return {
+        ...part,
+        summaryDispatchRef: `D${createHash('sha256').update(JSON.stringify(identity)).digest('hex')}`
+      } as SummaryDispatchPart;
+    })
+  }));
+}
+
 /** Summary input keeps the first unique managed media body so the compression capability can
  * produce a reusable semantic observation before replacing bytes with text. Historical tool calls
  * remain readable descriptors and nested tool-response media is lifted beside that descriptor. */
@@ -1480,10 +1501,12 @@ export function projectSummaryModelWindow(
 }
 
 function summaryParts(part: ContentPart): ContentPart[] {
+  const dispatchRef = (part as SummaryDispatchPart).summaryDispatchRef;
   if ('functionCall' in part) {
     return [{ text: stableJson({
       kind: 'historical_tool_call',
       ...(part.id ? { callId: part.id } : {}),
+      ...(dispatchRef ? { dispatchRef } : {}),
       toolName: part.functionCall.name,
       arguments: boundedValueDescriptor(part.functionCall.args, TOOL_RESULT_MAX_TOKENS)
     }) }];
@@ -1497,6 +1520,7 @@ function summaryParts(part: ContentPart): ContentPart[] {
       { text: stableJson({
         kind: 'historical_tool_result',
         ...(part.id ? { callId: part.id } : {}),
+        ...(dispatchRef ? { dispatchRef } : {}),
         toolName: part.functionResponse.name,
         result: text
           ? modelTextToolResponse(

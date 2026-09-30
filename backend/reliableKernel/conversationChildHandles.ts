@@ -21,9 +21,7 @@ export async function readConversationChildHandles(
   conversationId: string
 ): Promise<ModelHandleEntry[]> {
   if (!conversationId.trim()) throw new TypeError('conversationId must be non-empty.');
-  const turns = (await listAllDomainRows(database, 'Turn', { conversation_id: conversationId }))
-    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
-      || String(right.id).localeCompare(String(left.id)));
+  const turns = await listAllDomainRows(database, 'Turn', { conversation_id: conversationId });
   const readTurn = async (turn: (typeof turns)[number]): Promise<ModelHandleEntry[] | undefined> => {
     const requests = (await listAllDomainRows(database, 'ModelRequest', { turn_id: turn.id }))
       .sort((left, right) => {
@@ -53,16 +51,14 @@ export async function readConversationChildHandles(
     }
     return undefined;
   };
-  for (let index = 0; index < turns.length;) {
-    const timestamp = turns[index].created_at;
-    const group: typeof turns = [];
-    while (index < turns.length && turns[index].created_at === timestamp) group.push(turns[index++]);
-    // Turn ids are opaque hashes, not clocks. Concurrent/same-millisecond Turns must reconcile
-    // their cumulative maps instead of allowing lexical id order to discard a newer reservation.
-    const catalogs = (await Promise.all(group.map(readTurn))).filter((entries): entries is ModelHandleEntry[] => entries !== undefined);
-    if (catalogs.length > 0) return mergeConversationChildHandles(...catalogs);
+  let handles: ModelHandleEntry[] = [];
+  // Wall clocks can move backwards and Turn ids carry no ordering authority. Reconcile each
+  // Turn's latest cumulative map; request_seq still avoids reading its older request recipes.
+  for (const turn of turns) {
+    const entries = await readTurn(turn);
+    if (entries !== undefined) handles = mergeConversationChildHandles(handles, entries);
   }
-  return [];
+  return handles;
 }
 
 /** A fork target keeps exactly one ConversationBranchLink, even after its source is deleted. */
