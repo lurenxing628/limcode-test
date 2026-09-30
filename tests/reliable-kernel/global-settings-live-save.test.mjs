@@ -189,6 +189,11 @@ test('保存比较只忽略记录元数据，不忽略用户自定义参数中�
     store.llmProviderConfigs.configs[0].requestBody.configs[0].updatedAt = 2;
     store.saveLlmProviderConfigs();
     const write = posted.find((message) => message.type === protocol.BridgeMessageType.GlobalSettingsUpdate && message.payload.section === section);
+    assert.equal(write.payload.settings.configs[0].updatedAt, 1,
+      'saving a provider must not manufacture a timestamp different from the local record');
+    assert.equal(store.llmProviderConfigs.configs[0].updatedAt, 1);
+    assert.equal(write.payload.settings.configs[0].requestBody.configs[0].updatedAt, 2,
+      'user-defined timestamp fields remain actual settings, not record metadata');
     const external = structuredClone(initial);
     external.revision = 'external';
     external.settings.configs[0].requestBody.configs[0].updatedAt = 3;

@@ -7,6 +7,13 @@ const { hasThinkingBodyConflict } = require('../../dist/extension/shared/session
 const { dryRunLlmProvider } = require('../../dist/extension/backend/capabilities/llmProvider.js');
 const { LlmCapabilityFullRequestAdapter } = require('../../dist/extension/backend/reliableKernel/llmCapabilityProviderAdapter.js');
 const { LlmEventType } = require('../../dist/extension/backend/world/modules/llm/events.js');
+const { childThinkingOverrideForSpawn } = require('../../dist/extension/backend/reliableKernel/childThinkingInheritance.js');
+
+test('child thinking override is explicit opt-in', () => {
+  const current = { kind: 'openai-effort', value: 'high' };
+  assert.deepEqual(childThinkingOverrideForSpawn({ inheritThinking: true, thinkingOverride: current }), current);
+  assert.equal(childThinkingOverrideForSpawn({ inheritThinking: false, thinkingOverride: current }), undefined);
+});
 
 export async function ordinaryWire(provider, model, generationConfig, transport = 'http', body = {}) {
   let projected;

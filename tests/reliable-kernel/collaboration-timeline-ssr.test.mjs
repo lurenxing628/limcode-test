@@ -149,6 +149,7 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
   };
   let server;
   let app;
+  let feed;
   try {
     server = await createWebviewSsrServer();
     const { default: MessageList } = await server.ssrLoadModule('/src/components/conversation/ReliableMessageList.vue');
@@ -156,7 +157,7 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
     const isolated = pinia.createPinia();
     pinia.setActivePinia(isolated);
-    const feed = useReliableKernelClientFeedStore();
+    feed = useReliableKernelClientFeedStore();
     feed.sessionId = 'session';
     feed.projections.activeConversationWindow = { conversationId: 'self' };
     feed.records = {
@@ -241,6 +242,12 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     assert.equal(live.visibleTimelineRows[0].id, reading, 'an inserted older row keeps the reading position');
   } finally {
     app?.unmount();
+    // Mounting the synthetic messages starts real detail requests. Retire this fixture's session
+    // through the normal empty-snapshot path so its unanswered deadlines/retries do not outlive it.
+    feed?.observe({
+      type: 'reliable-kernel.snapshot', sessionId: 'fixture-disposed', hostBootId: 'fixture-disposed',
+      messageSeq: '1', snapshotCommitSeq: '0', projections: {}
+    });
     if (server) await server.close();
     pinia.setActivePinia(previousPinia);
     globalThis.window = previousWindow;

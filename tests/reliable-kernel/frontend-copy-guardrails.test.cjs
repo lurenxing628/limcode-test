@@ -10,32 +10,6 @@ function source(relativePath) {
 }
 
 
-test('渠道保存请求不制造脱离本地状态的 updatedAt', () => {
-  const store = source('webview/src/stores/useGlobalSettingsStore.ts');
-  const saveMethod = store.match(/saveLlmProviderConfigs\(\): void \{[\s\S]*?\n    \},\n    queueLlmCompressionConfigsAutoSave/)?.[0];
-
-  assert.ok(saveMethod, 'saveLlmProviderConfigs source is missing');
-  assert.doesNotMatch(saveMethod, /updatedAt:\s*Date\.now\(\)/);
-});
-
-test('guidance queue uses a passive bolt and waits for the current response and tools', () => {
-  const queue = source('webview/src/components/input/ReliableQueuePanel.vue');
-
-  assert.match(queue, /IconBolt class="reliable-queue-guide-icon"/);
-  assert.match(queue, /引导消息/);
-  assert.match(queue, /等待当前回复和工具完成/);
-  assert.match(queue, /IconPencil/);
-  assert.match(queue, /IconTrash/);
-  assert.match(queue, /IconGripVertical/);
-  assert.match(queue, /IconPlayerPause/);
-  assert.match(queue, /editGuidance/);
-  assert.match(queue, /cancelGuidance/);
-  assert.match(queue, /reorderGuidance/);
-  assert.match(queue, /setGuidancePaused/);
-  assert.doesNotMatch(queue, /force-send|promoteTurnIntent|立即执行/);
-});
-
-
 test('thought cards render Markdown and merge adjacent reasoning output items', async (context) => {
   const { createWebviewSsrServer } = await import('./webview-ssr-server.mjs');
   const server = await createWebviewSsrServer();

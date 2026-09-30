@@ -223,6 +223,11 @@ docs/architecture/*
 !/tests/reliable-kernel/settings-draft-retention.test.mjs
 !/tests/reliable-kernel/file-effect-integrity.test.mjs
 !/tests/reliable-kernel/mcp-result-integrity.test.mjs
+!/tests/reliable-kernel/ci-test-shards.test.mjs
+!/tests/reliable-kernel/runtime-data-root-relocation-undo-crash-limcode.test.mjs
+!/tests/reliable-kernel/runtime-data-root-relocation-undo-crash-copied.test.mjs
+!/tests/reliable-kernel/runtime-data-root-relocation-undo-crash-cases.mjs
+!/tests/reliable-kernel/runtime-data-root-relocation-undo-crash-scenarios.mjs
 !/tests/reliable-kernel/settings-activity-ordering.test.mjs
 !/tests/reliable-kernel/turn-input-status-ui.test.mjs
 !/tests/reliable-kernel/work-environment-preview-read-cost.test.mjs
@@ -238,3 +243,6 @@ docs/architecture/*
 !/tests/reliable-kernel/webview-render-cache-window.test.mjs
 !/tests/reliable-kernel/file-diff-large-input.test.mjs
 !/tests/reliable-kernel/file-diff-detail-worker.test.mjs
+
+# CI shard timing/coverage reports are test artifacts.
+/test-results/

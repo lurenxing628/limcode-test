@@ -14,6 +14,39 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  linux-build:
+    name: Compile and contracts (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      shard-matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.15.1
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Build extension and webview once
+        run: npm run build
+      - name: Typecheck webview
+        run: npm run typecheck:webview
+      - name: Check architecture contracts
+        run: npm run check:contracts:plan
+      - name: Plan complete deterministic CI shards
+        id: plan
+        run: node scripts/reliable-kernel/check-ci-test-shards.mjs --plan
+      - name: Share Linux build with tests and browser
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-test-build
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
   cross-platform-check:
     name: Compile and contracts (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -22,105 +55,171 @@ jobs:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest
           - windows-latest
           - macos-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22.15.1
           cache: npm
-
       - name: Install dependencies
         run: npm ci
-
       - name: Compile extension
         run: npm run compile
-
       - name: Typecheck webview
         run: npm run typecheck:webview
-
       - name: Check architecture contracts
         run: npm run check:contracts:plan
+      - name: Share platform compile with runtime regressions
+        uses: actions/upload-artifact@v4
+        with:
+          name: runtime-build-${{ matrix.os }}
+          path: dist/extension/
+          if-no-files-found: error
+          retention-days: 1
 
-  linux-reliability-tests:
-    name: Linux reliability tests
+  linux-reliability-shard:
+    name: Linux reliability shard (${{ matrix.index }}/${{ matrix.count }})
+    needs: linux-build
     runs-on: ubuntu-latest
-    # The serial CI list takes about an hour on a hosted runner and has its own 90-minute guard
-    # (run-local-tests.mjs); allow setup, compile and browser time on top.
-    timeout-minutes: 100
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.linux-build.outputs.shard-matrix) }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22.15.1
           cache: npm
-
       - name: Install dependencies
         run: npm ci
+      - name: Prepare native SQLite compatibility
+        run: npm run precompile
+      - name: Restore exact Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-test-build
+          path: dist/
+      - name: Run every assigned critical test serially
+        run: node scripts/reliable-kernel/run-local-tests.mjs --ci --shard ${{ matrix.index }}/${{ matrix.count }} --report test-results/shard-${{ matrix.index }}.json
+      - name: Preserve shard coverage and timing even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reliability-shard-${{ matrix.index }}
+          path: test-results/shard-${{ matrix.index }}.json
+          if-no-files-found: error
+          retention-days: 7
 
-      - name: Run tracked critical tests
-        run: npm run test:ci:linux
-
+  linux-browser-tests:
+    name: Built chat browser regressions
+    needs: linux-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.15.1
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Prepare native SQLite compatibility
+        run: npm run precompile
+      - name: Restore exact Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-test-build
+          path: dist/
       - name: Install browser for chat regression
         run: npx playwright install --with-deps chromium
+      - name: Check built chat interaction without rebuilding
+        run: node --test tests/webview-session-thinking.browser.mjs tests/webview-agent-status-panel.browser.mjs
 
-      - name: Check built chat interaction
-        run: npm run test:browser
+  # Preserve the original required-check name. always() makes missing/cancelled matrix jobs fail
+  # closed instead of silently skipping the check; both job results and per-file evidence are checked.
+  linux-reliability-tests:
+    name: Linux reliability tests
+    if: always()
+    needs: [linux-build, linux-reliability-shard, linux-browser-tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22.15.1
+      - name: Collect every shard report
+        uses: actions/download-artifact@v4
+        with:
+          pattern: reliability-shard-*
+          path: test-results/
+          merge-multiple: true
+      - name: Require successful jobs and exact-once complete test coverage
+        if: always()
+        env:
+          CI_REQUIRED_JOB_RESULTS: ${{ toJSON(needs) }}
+        run: node scripts/reliable-kernel/check-ci-test-shards.mjs test-results
 
   windows-runtime-tests:
     name: Windows runtime compatibility tests
+    needs: cross-platform-check
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22.15.1
           cache: npm
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Compile extension
-        run: npm run compile
-
+      - name: Prepare native SQLite compatibility
+        run: npm run precompile
+      - name: Restore exact Windows compile
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-build-windows-latest
+          path: dist/extension/
       - name: Run Windows storage and Wrapper regressions
         run: node --test --test-concurrency=1 tests/settingsRevisionConflict.test.cjs tests/storageLockRace.test.cjs tests/reliable-kernel/storage-lock-multiprocess.test.cjs tests/reliable-kernel/platform-runtime-compatibility.test.mjs tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs
-
       - name: Run Windows path-shape regressions
         run: node --test --test-concurrency=1 tests/reliable-kernel/path-shape-boundaries.test.mjs
 
   macos-runtime-tests:
     name: macOS runtime compatibility tests
+    needs: cross-platform-check
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@v6
-
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
           node-version: 22.15.1
           cache: npm
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Compile extension
-        run: npm run compile
-
+      - name: Prepare native SQLite compatibility
+        run: npm run precompile
+      - name: Restore exact macOS compile
+        uses: actions/download-artifact@v4
+        with:
+          name: runtime-build-macos-latest
+          path: dist/extension/
       - name: Run macOS Runtime and Wrapper regressions
         run: node --test --test-concurrency=1 tests/reliable-kernel/platform-runtime-compatibility.test.mjs tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs
 

@@ -3,8 +3,12 @@ import os from 'node:os';
 import path from 'node:path';
 import process from 'node:process';
 import childProcess from 'node:child_process';
+import { createCiShardPlan, parseCiShard } from './lib/ci-test-shards.mjs';
 
 const root = process.cwd();
+if (process.argv.includes('--ci') && process.env.RELOCATION_CRASH_ONLY) {
+  throw new Error('CI must execute every relocation crash scenario; RELOCATION_CRASH_ONLY is local-only.');
+}
 const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/reliableConversationProjection.test.ts',
   'webview/tests/segmentedTimeline.test.ts',
@@ -124,7 +128,6 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/compression-progress-ui.test.mjs',
   'tests/reliable-kernel/configuration-authority.test.mjs',
   'tests/reliable-kernel/session-thinking-control.test.mjs',
-  'tests/reliable-kernel/session-thinking-simple.test.mjs',
   'tests/reliable-kernel/session-thinking-runtime.test.mjs',
   'tests/reliable-kernel/session-thinking-store.test.cjs',
   'tests/reliable-kernel/session-thinking.test.mjs',
@@ -254,6 +257,8 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-data-root-relocation-review.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-crash.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-undo-crash.test.mjs',
+  'tests/reliable-kernel/runtime-data-root-relocation-undo-crash-limcode.test.mjs',
+  'tests/reliable-kernel/runtime-data-root-relocation-undo-crash-copied.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-review2.test.mjs',
   'tests/reliable-kernel/runtime-data-root-relocation-review3.test.mjs',
   'tests/reliable-kernel/relocated-work-settlement.test.mjs',
@@ -272,6 +277,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-dataset-commands.test.cjs',
   'tests/reliable-kernel/work-environment-transfer-boundary.test.cjs',
   'tests/reliable-kernel/run-local-tests-cleanup.test.mjs',
+  'tests/reliable-kernel/ci-test-shards.test.mjs',
   'tests/runAgentToolSchema.test.cjs',
   'tests/settingsRevisionConflict.test.cjs',
   'tests/storageLockRace.test.cjs',
@@ -304,6 +310,15 @@ if (process.argv.includes('--ci')) {
   files.push(...WEBVIEW_TEST_FILES);
 }
 files.sort();
+const shardArgument = option('--shard');
+const reportPath = option('--report');
+if ((shardArgument || reportPath) && !process.argv.includes('--ci')) throw new Error('CI sharding requires --ci.');
+if (reportPath && !shardArgument) throw new Error('--report requires --shard.');
+if (new Set(files).size !== files.length) throw new Error('Test list contains duplicate files.');
+const selection = shardArgument ? parseCiShard(shardArgument) : undefined;
+const plan = selection ? createCiShardPlan(files, selection.count) : undefined;
+const selectedShard = selection ? plan.shards[selection.index - 1] : undefined;
+if (selectedShard) files.splice(0, files.length, ...selectedShard.files);
 if (files.length === 0) {
   console.error('在tests/reliable-kernel/**/*.test.{cjs,mjs,js}下没有找到当前可靠内核本机测试。');
   process.exit(1);
@@ -317,6 +332,21 @@ if (process.argv.includes('--list')) {
   });
   process.exit(0);
 }
+const report = selectedShard ? {
+  kind: 'limcode-ci-test-shard',
+  commit: process.env.GITHUB_SHA ?? null,
+  index: selection.index,
+  count: selection.count,
+  suiteDigest: plan.suiteDigest,
+  planDigest: plan.planDigest,
+  assignedFiles: files,
+  startedAt: new Date().toISOString(),
+  completed: false,
+  status: null,
+  results: []
+} : undefined;
+writeReport();
+if (selection) console.log(`CI shard ${selection.index}/${selection.count}: estimated ${(selectedShard.estimatedDurationMs / 1000).toFixed(1)}s`);
 console.log(
   process.argv.includes('--ci')
     ? `按稳定顺序运行${files.length}个已纳入版本库的CI关键测试文件。`
@@ -355,31 +385,55 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => s
 const testEnvironment = { ...process.env };
 let result;
 try {
-  // Use the application's existing resolver/transpiler: Node's strip-only loader cannot resolve
-  // Vite aliases, extensionless shared imports, or the protocol's TypeScript enums.
-  const { build, loadConfigFromFile } = await import('vite');
-  const loaded = await loadConfigFromFile({ command: 'build', mode: 'test' }, path.join(root, 'vite.config.ts'));
-  if (!loaded) throw new Error('Unable to load webview build configuration');
-  await build({
-    ...loaded.config,
-    configFile: false,
-    logLevel: 'error',
-    build: {
-      ssr: true,
-      outDir: webviewTestRoot,
-      rollupOptions: {
-        input: WEBVIEW_TEST_FILES.map(file => path.join(root, file)),
-        output: { entryFileNames: '[name].mjs', chunkFileNames: 'chunks/[name]-[hash].mjs' }
+  if (files.some(file => file.endsWith('.ts'))) {
+    // Use the application's existing resolver/transpiler: Node's strip-only loader cannot resolve
+    // Vite aliases, extensionless shared imports, or the protocol's TypeScript enums.
+    const { build, loadConfigFromFile } = await import('vite');
+    const loaded = await loadConfigFromFile({ command: 'build', mode: 'test' }, path.join(root, 'vite.config.ts'));
+    if (!loaded) throw new Error('Unable to load webview build configuration');
+    await build({
+      ...loaded.config,
+      configFile: false,
+      logLevel: 'error',
+      build: {
+        ssr: true,
+        outDir: webviewTestRoot,
+        rollupOptions: {
+          input: files.filter(file => file.endsWith('.ts')).map(file => path.join(root, file)),
+          output: { entryFileNames: '[name].mjs', chunkFileNames: 'chunks/[name]-[hash].mjs' }
+        }
       }
-    }
-  });
+    });
+  }
   const runnableFiles = files.map(file => file.endsWith('.ts')
     ? path.join(webviewTestRoot, `${path.basename(file, '.ts')}.mjs`)
     : file);
   // Asynchronous so this process can still react to a stop signal while the suite runs.
-  result = await runTests(runnableFiles);
+  if (report) {
+    // A separate Node process per file keeps the same isolation as the original Node test runner.
+    // Files remain serial within this checkout: durable evidence fixtures must never overlap.
+    result = { status: 0, timedOut: false };
+    for (let index = 0; index < runnableFiles.length; index += 1) {
+      if (stoppedBy) break;
+      const started = performance.now();
+      console.log(`CI test file ${index + 1}/${files.length}: ${files[index]}`);
+      const outcome = await runTests([runnableFiles[index]]);
+      report.results.push({ file: files[index], durationMs: performance.now() - started, ...outcome });
+      if (outcome.status !== 0 || outcome.timedOut) result.status = 1;
+      result.timedOut ||= outcome.timedOut;
+      writeReport();
+    }
+    report.completed = !stoppedBy && report.results.length === files.length;
+    report.status = stoppedBy ? signalExitCode(stoppedBy) : result.status;
+  } else {
+    result = await runTests(runnableFiles);
+  }
 } finally {
   removeWebviewTestRoot();
+  if (report) {
+    report.finishedAt = new Date().toISOString();
+    writeReport();
+  }
 }
 if (stoppedBy) process.exit(signalExitCode(stoppedBy));
 if (result.timedOut) {
@@ -404,9 +458,9 @@ function runTests(runnableFiles) {
       clearTimeout(timer);
       reject(error);
     });
-    testRun.once('close', (status) => {
+    testRun.once('close', (status, signal) => {
       clearTimeout(timer);
-      resolve({ status, timedOut });
+      resolve({ status, signal, timedOut });
     });
   });
 }
@@ -448,4 +502,21 @@ function processIsAlive(pid) {
   } catch (error) {
     return error.code === 'EPERM';
   }
+}
+
+function option(name) {
+  const indices = process.argv.flatMap((argument, index) => argument === name ? [index] : []);
+  if (indices.length > 1) throw new Error(`${name} may be supplied only once.`);
+  if (!indices.length) return undefined;
+  const value = process.argv[indices[0] + 1];
+  if (!value || value.startsWith('--')) throw new Error(`${name} requires a value.`);
+  return value;
+}
+
+function writeReport() {
+  if (!reportPath) return;
+  fs.mkdirSync(path.dirname(reportPath), { recursive: true });
+  const temporary = `${reportPath}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(report, null, 2)}\n`);
+  fs.renameSync(temporary, reportPath);
 }
