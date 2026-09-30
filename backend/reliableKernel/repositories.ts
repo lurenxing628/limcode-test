@@ -73,6 +73,8 @@ export interface RepositoryDeleteWhereMutation {
 
 export interface RepositoryAssertStep {
   kind: 'assert';
+  /** Opt-in domain-codec equality (including structural JSON), used by historical merge reuse. */
+  decoded?: true;
   domain: string;
   id: string;
   where: DomainRow;
@@ -378,10 +380,10 @@ export class DomainRepository {
     return { kind: 'deleteWhere', domain: this.schema.key, where: clonePlainRecord(where), maxChanges: 1 };
   }
 
-  public assert(id: string, where: DomainRow): RepositoryAssertStep {
+  public assert(id: string, where: DomainRow, options: { decoded?: true } = {}): RepositoryAssertStep {
     requireId(id);
     this.codec.encodeWhere(where);
-    return { kind: 'assert', domain: this.schema.key, id, where: clonePlainRecord(where) };
+    return { kind: 'assert', domain: this.schema.key, id, where: clonePlainRecord(where), ...(options.decoded ? { decoded: true as const } : {}) };
   }
 
   /** Transaction-local assertion: every row matching `where` must also match `expected`. */

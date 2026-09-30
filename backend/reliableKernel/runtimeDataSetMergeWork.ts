@@ -26,7 +26,7 @@ export {
  * | + pending interrupt/termination request            | TurnControlPlane.terminal → interrupted (consumed) |
  * | its non-terminal ModelRequest                      | cancelCurrentModelRequest (turn-interrupt-requested) |
  * | its pending ToolCall with no Operation             | EffectControlPlane.settleWithoutEffect → cancelled |
- * | queued ordinary TurnIntent (user message waiting)  | TurnControlPlane.cancelGuidance                  |
+ * | queued non-child TurnIntent (input/continuation/retry/runtime continuation) | TurnControlPlane.cancelQueuedIntent |
  * | everything below                                   | refused, with the reason and what the user can do |
  */
 /**
@@ -69,7 +69,7 @@ export async function finalizeUnfinishedWork(
       prepareRuntimeContinuationSteps: (deliveryId) => runtime.collaboration.prepareWakeContinuationSteps(deliveryId)
     });
     for (const intent of inspection.intents) {
-      await turns.cancelGuidance({
+      await turns.cancelQueuedIntent({
         source: { kind: 'internal', key: `historical-merge-finalize:intent:${intent.intentId}` },
         conversationId: intent.conversationId,
         intentId: intent.intentId,

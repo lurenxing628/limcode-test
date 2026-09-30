@@ -184,17 +184,23 @@ export async function repairRuntimeHistory(paths: Paths, plan: RuntimeHistoryRep
           await fs.mkdir(backupPath, { mode: 0o700 });
           const backup = path.join(backupPath, 'limcode.sqlite');
           await runtime.backupTo(backup);
-          await syncFile(backup);
           const audit = await auditRuntimeSnapshot(backup, { binding: binding as RootBinding, contentDigest: true });
           if (audit.contentDigest !== plan.expected.contentDigest) throw new Error('备份内容与已确认的检查结果不一致，没有进行修复。');
           await durableJson(path.join(backupPath, 'root-binding.json'), binding);
           await durableJson(path.join(backupPath, 'repair.json'), journal);
-          await syncDirectoryDurably(backupParent);
-          await syncDirectoryDurably(path.dirname(backupParent));
         } else {
           const audit = await auditRuntimeSnapshot(path.join(backupPath, 'limcode.sqlite'), { binding: binding as RootBinding, contentDigest: true });
           if (audit.contentDigest !== plan.expected.contentDigest) throw new Error('原修复备份已变化，不能续修。');
         }
+        // A visible prepared journal is not proof that its publish (or either parent) was
+        // fsynced: an earlier attempt can have failed after rename. Re-establish the whole
+        // backup durability barrier on both creation and reuse before any destructive work.
+        await syncFile(path.join(backupPath, 'limcode.sqlite'));
+        await syncFile(path.join(backupPath, 'root-binding.json'));
+        await syncFile(path.join(backupPath, 'repair.json'));
+        await syncDirectoryDurably(backupPath);
+        await syncDirectoryDurably(backupParent);
+        await syncDirectoryDurably(path.dirname(backupParent));
         await options.onFaultPoint?.('after-backup');
         options.signal?.throwIfAborted();
         await options.onFaultPoint?.('before-transaction');

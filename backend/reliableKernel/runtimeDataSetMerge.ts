@@ -2344,6 +2344,20 @@ async function commitLocked(
     insertedConversations: plan.insertedConversations, insertedConversationIds, ...skipped
   });
   if (plan.steps.length === 0) {
+    // Reuse is still a comparison decision: recheck it atomically against concurrent target edits.
+    const assertScanUnchanged = async (): Promise<void> => {
+      if (await mergeTargetVersion(target.database) !== plan.targetVersion) {
+        throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-target-changed', message: '当前历史库在比较之后又有变化，稍后重试。' });
+      }
+    };
+    if (plan.assertions) await target.database.transaction(plan.assertions);
+    else await assertScanUnchanged();
+    // An assertion-only transaction writes no WAL frame, even with durable: true. Existing rows
+    // may come from NORMAL commits, so prove them durable before publishing an external receipt.
+    await target.database.durabilityCheckpoint();
+    // Streamed preparation retains no rows: an unchanged whole-target version fences its bounded
+    // scan. Check again after the barrier, which can yield while a reader pins older WAL frames.
+    if (!plan.assertions) await assertScanUnchanged();
     if (mode.migration) return { kind: 'merged', result };
     await writeRuntimeDataSetMergeLedgerRecord(paths, merged());
     const finalized = await takeFinalized(paths, candidate, state).catch(() => finalizedResult(state));
@@ -2996,6 +3010,11 @@ interface RowPlan {
   /** Both local and other-connection commits since planning; never treat a target race as source damage. */
   targetVersion: string;
   steps: RepositoryTransactionStep[];
+  /**
+   * Kept even without inserts for online plans. Streamed no-op scans omit these and fence
+   * targetVersion (captured before scanning) instead, retaining bounded memory.
+   */
+  assertions?: RepositoryTransactionStep[];
   inserted: Array<[string, string]>;
   reused: number;
   insertedConversations: number;
@@ -3006,7 +3025,7 @@ interface RowPlan {
  * Builds one transaction: every source row is decoded by its domain codec and, when new, written
  * through the domain Repository insert step (historical copies for the terminal model-stream
  * domains). Existing ids are compared on decoded values. The transaction ends by asserting that
- * every source id exists in the receiving data set, so the committed row set is measured, not assumed.
+ * every source id exists and every reused row still matches the comparison contract.
  * Rows in `skipped` (see skippedRows) are left out entirely: not compared, inserted or asserted.
  */
 async function planRows(
@@ -3015,8 +3034,8 @@ async function planRows(
   skipped?: ReadonlyMap<string, ReadonlySet<string>>
 ): Promise<RowPlan> {
   const targetVersion = await mergeTargetVersion(target);
-  const plan: RowPlan = { targetVersion, steps: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
-  const presence: RepositoryTransactionStep[] = [];
+  const plan: RowPlan = { targetVersion, steps: [], assertions: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
+  const presence = plan.assertions!;
   const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => !skipped?.get(domain)?.has(id));
   const sink: RuntimeDataSetMergeChunkSink = {
     steps: plan.steps,
@@ -3068,7 +3087,7 @@ async function planRows(
 export interface RuntimeDataSetMergeChunkSink {
   /** Insert steps in source order (a content identity as a savepoint and its assertion). */
   steps: RepositoryTransactionStep[];
-  /** One presence assertion per compared source row, asserted after the inserts they cover. */
+  /** Presence for inserts, contractual equality for reused rows, checked after the inserts. */
   presence: RepositoryTransactionStep[];
   inserted(domain: string, id: string, row: DomainRow): void;
   reused(): void;
@@ -3110,7 +3129,14 @@ export function planMergeChunk(
   for (const [index, row] of chunk.entries()) {
     const id = String(row.id);
     const current = existing[index];
-    sink.presence.push(repository.assert(id, {}));
+    // Fence exactly the fields used for reuse, not target-only presentation facts or sequences.
+    // Merely asserting the id would let an edit between planning and commit silently conflict.
+    // Keep target values: equal decoded JSON can have a different key order in the source.
+    // The codec accepts a string JSON input as serialized text, so quote decoded scalar strings.
+    sink.presence.push(repository.assert(id, current ? Object.fromEntries(schema.columns
+      .filter((column) => column.name !== 'id' && column.name !== renumbered && !allowed?.has(column.name))
+      .map((column) => [column.name, column.json && typeof current[column.name] === 'string'
+        ? JSON.stringify(current[column.name]) : current[column.name]])) : {}, current ? { decoded: true } : {}));
     if (current) {
       const differences = schema.columns.map((column) => column.name)
         .filter((column) => column !== renumbered && !isDeepStrictEqual(row[column], current[column]));

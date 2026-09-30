@@ -215,3 +215,6 @@ docs/architecture/*
 !/tests/reliable-kernel/model-handle-catalog.test.mjs
 !/tests/reliable-kernel/runtime-history-repair.test.mjs
 !/tests/reliable-kernel/runtime-history-repair-child.mjs
+!/tests/reliable-kernel/runtime-history-repair-durability.test.mjs
+!/tests/reliable-kernel/runtime-merge-commit-guards.test.mjs
+!/tests/reliable-kernel/runtime-merge-queued-intents.test.mjs

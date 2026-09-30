@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { isDeepStrictEqual } from 'node:util';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
@@ -1362,7 +1363,7 @@ function executeSteps(
 ): void {
   for (const step of steps) {
     if (step.kind === 'assert') {
-      executeAssertion(database, step.domain, step.id, step.where);
+      executeAssertion(database, step.domain, step.id, step.where, step.decoded);
       continue;
     }
     if (step.kind === 'assertAll') {
@@ -1469,7 +1470,8 @@ function executeAssertion(
   database: Database.Database,
   domain: string,
   id: string,
-  where: DomainRow
+  where: DomainRow,
+  decoded?: true
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(domain);
   const encoded = repository.codec.encodeWhere(where);
@@ -1477,15 +1479,31 @@ function executeAssertion(
   const parameters: EncodedRow & { __id: string } = { __id: requireRuntimeId(id) };
   for (const [name, value] of Object.entries(encoded)) {
     if (name === 'id') throw new Error(`${repository.name} assertion id must be supplied separately.`);
+    if (decoded && repository.schema.columns.some((column) => column.name === name && column.json)) continue;
     if (value === null) predicates.push(`${quote(name)} IS NULL`);
     else {
       predicates.push(`${quote(name)} = @${name}`);
       parameters[name] = value;
     }
   }
-  const matched = prepareCached(database,
-    `SELECT 1 AS matched FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
-  ).get(parameters);
+  let matched: unknown;
+  if (decoded) {
+    // The merge planner compares codec-decoded values: JSON text formatting and key order are
+    // not differences. Keep ordinary SQL assertions unchanged for every other caller.
+    const raw = prepareCached(database,
+      `SELECT * FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
+    ).get(parameters);
+    const current = raw ? repository.codec.decode(raw as Record<string, unknown>) : undefined;
+    matched = current && repository.schema.columns.filter((column) => column.json && Object.prototype.hasOwnProperty.call(encoded, column.name))
+      .every((column) => {
+        const value = encoded[column.name];
+        return isDeepStrictEqual(current[column.name], value === null ? null : JSON.parse(String(value)));
+      });
+  } else {
+    matched = prepareCached(database,
+      `SELECT 1 AS matched FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
+    ).get(parameters);
+  }
   if (!matched) {
     const error = new Error(`${repository.name} transaction assertion failed for ${id}.`) as Error & { code: string };
     error.code = 'RUNTIME_TRANSACTION_ASSERTION_FAILED';

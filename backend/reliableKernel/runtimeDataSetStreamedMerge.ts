@@ -1419,7 +1419,9 @@ async function prepareSource(
     const work = await keptWork();
     if (work.refused.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
     stopIfAsked();
+    let scanTargetVersion: string;
     const scanSource = async (): Promise<RuntimeDataSetMergeScan> => {
+      scanTargetVersion = await engine.mergeTargetVersion(target.database);
       boundSourcePageCache(taken.snapshot.database);
       const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows);
       progress('scan', 0);
@@ -1454,7 +1456,7 @@ async function prepareSource(
     }
     if (scan.insertRows === 0) {
       // Nothing new (all its rows are here already): recorded as merged at once, as an online merge records it.
-      const plan: HistoricalMergeRowPlan = { targetVersion: await engine.mergeTargetVersion(target.database), steps: [], inserted: [], reused: scan.reusedRows, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
+      const plan: HistoricalMergeRowPlan = { targetVersion: scanTargetVersion!, steps: [], inserted: [], reused: scan.reusedRows, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
       return await engine.commitSource(paths, target, candidate, binding, plan, undefined, state, options, mode, stopIfAsked);
     }
     progress('backup');
