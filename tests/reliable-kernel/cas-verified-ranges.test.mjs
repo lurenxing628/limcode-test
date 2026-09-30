@@ -66,11 +66,12 @@ test('CAS range metadata cache is bounded and root fences still apply', async ()
 }));
 test('CAS rejects a file replaced during verification and releases descriptors', async () => fixture(async ({ store, publish }) => {
   const item = await publish(2 * 1048576);
+  const canonical = await fs.realpath(item.file);
   const open = fs.open;
   let replaced = false;
   fs.open = async (...args) => {
     const handle = await open(...args);
-    if (args[0] === item.file) {
+    if (args[0] === canonical) {
       const read = handle.read.bind(handle);
       handle.read = async (...readArgs) => {
         const result = await read(...readArgs);
@@ -86,6 +87,7 @@ test('CAS rejects a file replaced during verification and releases descriptors',
   };
   try { await assert.rejects(store.readChunk(item, 0, 32), /replaced|changed/); }
   finally { fs.open = open; }
+  assert.equal(replaced, true, 'reach the replacement instead of rejecting the initial file identity');
   assert.equal(store.inspectRangeReadCache().activeHandles, 0);
   assert.equal(store.inspectRangeReadCache().inflight, 0);
 }));
@@ -146,11 +148,12 @@ test('CAS rejects symbolic target changes during verification', async (t) => fix
   await fs.rename(item.file, item.file + '.one');
   await fs.copyFile(item.file + '.one', item.file + '.two');
   if (!await makeSymlink(t, item.file + '.one', item.file, 'file')) return;
+  const canonical = await fs.realpath(item.file);
   const open = fs.open;
   let changed = false;
   fs.open = async (...args) => {
     const handle = await open(...args);
-    if (args[0] === item.file + '.one') {
+    if (args[0] === canonical) {
       const read = handle.read.bind(handle);
       handle.read = async (...readArgs) => {
         const result = await read(...readArgs);
@@ -166,6 +169,73 @@ test('CAS rejects symbolic target changes during verification', async (t) => fix
   };
   try { await assert.rejects(store.readChunk(item, 0, 32), /target changed/); }
   finally { fs.open = open; }
+  assert.equal(changed, true, 'reach the symbolic target change instead of rejecting the initial file identity');
   assert.equal(store.inspectRangeReadCache().entries, 0);
   assert.equal(store.inspectRangeReadCache().activeHandles, 0);
 }));
+
+test('Windows CAS paging keeps complete pathname and descriptor identities through verification and cached reads', async (t) => {
+  for (const pathnameDevice of ['missing', 'full-width']) {
+    for (const stage of ['verification', 'cached-range']) {
+      for (const change of ['none', 'pathname-high-bits', 'descriptor-high-bits', 'replacement']) {
+        await t.test(`${pathnameDevice}: ${stage}: ${change}`, async (sub) => fixture(async ({ store, publish }) => {
+          const item = await publish(4096);
+          const canonical = await fs.realpath(item.file);
+          const pathnameDev = pathnameDevice === 'missing' ? 0n : 0x1234_5678_89ab_cdefn;
+          const descriptorDev = pathnameDevice === 'missing' ? 742408122n : BigInt.asUintN(32, pathnameDev);
+          const realLstat = fs.lstat, realOpen = fs.open;
+          let armed = stage === 'verification', changed = false;
+          sub.mock.method(fs, 'lstat', async (target, ...args) => {
+            const stat = await realLstat(target, ...args);
+            if (String(target) === canonical && args[0]?.bigint) {
+              stat.dev = pathnameDev + (changed && change === 'pathname-high-bits' ? 1n << 32n : 0n);
+            }
+            return stat;
+          });
+          sub.mock.method(fs, 'open', async (target, ...args) => {
+            const handle = await realOpen(target, ...args);
+            if (String(target) === canonical) {
+              const realStat = handle.stat.bind(handle), realRead = handle.read.bind(handle);
+              handle.stat = async (...statArgs) => {
+                const stat = await realStat(...statArgs);
+                stat.dev = descriptorDev + (changed && change === 'descriptor-high-bits' ? 1n << 32n : 0n);
+                return stat;
+              };
+              handle.read = async (...readArgs) => {
+                const result = await realRead(...readArgs);
+                if (armed && !changed && change !== 'none') {
+                  changed = true;
+                  if (change === 'replacement') {
+                    await fs.rename(item.file, item.file + '.old');
+                    await fs.copyFile(item.file + '.old', item.file);
+                  }
+                }
+                return result;
+              };
+            }
+            return handle;
+          });
+          const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+          Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+          try {
+            if (stage === 'cached-range') {
+              assert.equal((await store.readChunk(item, 0, 32)).chunk.equals(Buffer.alloc(32, 97)), true);
+              assert.equal(store.inspectRangeReadCache().verifications, 1);
+              armed = true;
+            }
+            if (change === 'none') {
+              assert.equal((await store.readChunk(item, 32, 32)).chunk.equals(Buffer.alloc(32, 97)), true);
+              assert.equal((await store.readChunk(item, 64, 32)).chunk.equals(Buffer.alloc(32, 97)), true);
+              assert.equal(store.inspectRangeReadCache().verifications, 1, 'reuse only the unchanged complete identity');
+            } else {
+              await assert.rejects(store.readChunk(item, 32, 32), /replaced|changed/);
+              assert.equal(changed, true, 'exercise the fence after verification or cached range bytes were read');
+            }
+            assert.equal(store.inspectRangeReadCache().activeHandles, 0);
+            assert.equal(store.inspectRangeReadCache().inflight, 0);
+          } finally { Object.defineProperty(process, 'platform', platform); }
+        }));
+      }
+    }
+  }
+});

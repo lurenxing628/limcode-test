@@ -175,8 +175,10 @@ async function isFile(target: string): Promise<boolean> {
 async function statOrUndefined(target: string): Promise<BigIntStats | undefined> {
   try {
     return await fs.stat(target, { bigint: true });
-  } catch {
-    return undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === 'ENOENT') return undefined;
+    // Failure to inspect a registered path cannot prove that an accessible alias is unrelated.
+    throw error;
   }
 }
 

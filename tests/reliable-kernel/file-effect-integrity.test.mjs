@@ -17,7 +17,8 @@ const rows = async (database, domain, where = {}) => (await database.snapshotAll
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
 
 async function fixture(run) {
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-file-integrity-'));
+  // Fault injection must compare the same canonical spelling used by production file I/O.
+  const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-file-integrity-')));
   let database;
   try {
     const root = path.join(temporary, 'workspace');
@@ -143,7 +144,8 @@ test('root symlink stays supported for nested directory creation', async () => f
   await fs.symlink(physical, h.root, 'junction');
   const call = await h.approve('write', { path: 'one/two/note.txt', content: 'approved' });
   assert.deepEqual(call.members.map(member => member.operation), ['create_directory', 'create_directory', 'create_file']);
-  assert.ok(call.members.every(member => member.planningRoot.canonicalPath === physical));
+  const canonical = await fs.realpath(physical);
+  assert.ok(call.members.every(member => member.planningRoot.canonicalPath === canonical));
   assert.equal((await h.dispatcher.dispatchRecordAndReconcile(call.effect)).terminal.status, 'succeeded');
   assert.equal(await fs.readFile(path.join(physical, 'one/two/note.txt'), 'utf8'), 'approved');
 }));
@@ -479,7 +481,7 @@ test('replacement rejects a non-regular opened handle before attempting any cont
   await fs.writeFile(target, 'base');
   const call = await h.approve('write', { path: 'note.txt', content: 'approved' });
   const originalOpen = fs.open;
-  let targetReads = 0;
+  let targetReads = 0, substituted = false;
   fs.open = async (input, ...rest) => {
     const handle = await originalOpen(input, ...rest);
     if (String(input) === target && typeof rest[0] === 'number' && (rest[0] & constants.O_RDWR) === constants.O_RDWR) {
@@ -487,6 +489,7 @@ test('replacement rejects a non-regular opened handle before attempting any cont
       handle.stat = async (...args) => {
         const stat = await originalStat(...args);
         stat.isFile = () => false; // A replaced FIFO/device must never be read, even if open succeeds.
+        substituted = true;
         return stat;
       };
       handle.readFile = async () => { targetReads++; throw new Error('non-regular content read must not start'); };
@@ -495,6 +498,7 @@ test('replacement rejects a non-regular opened handle before attempting any cont
   };
   try {
     const result = await h.dispatcher.dispatchRecordAndReconcile(call.effect);
+    assert.equal(substituted, true, 'exercise the non-regular writable descriptor fence');
     assert.equal(result.observation.outcome, 'conflict');
     assert.equal(targetReads, 0);
     assert.equal(await fs.readFile(target, 'utf8'), 'base');
@@ -509,12 +513,13 @@ for (const stage of ['planning', 'dispatch']) {
     await fs.writeFile(outside, 'outside private fixture');
     const call = stage === 'dispatch' ? await h.approve('write', { path: 'note.txt', content: 'approved' }) : undefined;
     const originalStat = fs.lstat, originalRead = fs.readFile;
-    let targetStats = 0, pathReads = 0;
+    let targetStats = 0, pathReads = 0, substituted = false;
     fs.lstat = async (input, ...rest) => {
       const stat = await originalStat(input, ...rest);
       if (String(input) === target && rest[0]?.bigint === true && ++targetStats === 1) {
         await fs.rename(target, `${target}.previous`);
         await fs.symlink(outside, target, 'file');
+        substituted = true;
       }
       return stat;
     };
@@ -529,6 +534,7 @@ for (const stage of ['planning', 'dispatch']) {
         const result = await h.dispatcher.dispatchRecordAndReconcile(call.effect);
         assert.equal(result.observation.outcome, 'conflict');
       }
+      assert.equal(substituted, true, 'exercise the post-stat symbolic-link substitution');
       assert.equal(pathReads, 0, 'a path already proven substituted must never be read');
       assert.equal(await originalRead(outside, 'utf8'), 'outside private fixture');
     } finally { fs.lstat = originalStat; fs.readFile = originalRead; }

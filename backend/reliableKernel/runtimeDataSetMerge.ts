@@ -41,7 +41,7 @@ import {
 } from './runtimeDataSetMergeLedger';
 import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
 import {
-  largeMergeDiskDevice, largeMergeDiskNeeds, largeMergeSessionSpace, sqliteTemporaryDirectory, type LargeMergeDiskNeed,
+  knownDiskDevice, largeMergeDiskDevice, largeMergeDiskNeeds, largeMergeSessionSpace, sqliteTemporaryDirectory, type LargeMergeDiskNeed,
   type LargeMergeSessionSpaceFacts
 } from './runtimeDataSetLargeMergeSpace';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
@@ -2526,7 +2526,7 @@ async function withSessionSpace(
     let linked = false;
     if (!isForeignCandidate(candidate)) {
       const [source, into] = await Promise.all([binding.paths.casRootPath, target.binding.paths.casRootPath]
-        .map((directory) => fs.stat(directory).then((info) => info.dev, () => undefined)));
+        .map((directory) => fs.stat(directory).then((info) => knownDiskDevice(info.dev), () => undefined)));
       linked = source !== undefined && source === into;
     }
     error.outcome.space = { databaseBytes: facts.databaseBytes, casCopyBytes: linked ? 0 : facts.casBytes };

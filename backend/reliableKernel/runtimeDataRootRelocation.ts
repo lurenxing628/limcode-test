@@ -48,6 +48,7 @@ import {
 import type { RelocationDigestWorkerResponse } from './runtimeDataRootRelocationWorker';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
+import { diskSpaceNeeds, knownDiskDevice } from './runtimeDataSetLargeMergeSpace';
 import {
   assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
   markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
@@ -948,7 +949,8 @@ async function countRows(candidate: VscodeRuntimeDataSetCandidate, binding: Hist
 }
 
 /**
- * Space per disk (a disk used for several purposes is checked once for their sum):
+ * Space per disk: known shared disks are checked for their sum; unknown identities reserve the
+ * largest possible shared-disk sum while keeping each path's free-space probe:
  * - target: the new database twice (the database itself, and the Backup API copy the batched copy's
  *   final verification reads, one data set at a time; its WAL stays about one batch), CAS as allocated when copied
  *   across disks (hard links on the same disk), configuration; an existing receiving database is
@@ -970,7 +972,7 @@ async function estimateSpace(input: {
   const temporaryProbe = os.tmpdir();
   const deviceOf = async (probe: string | undefined): Promise<number | undefined> => {
     if (!probe) return undefined;
-    try { return (await fs.stat(probe)).dev; } catch { return undefined; }
+    try { return knownDiskDevice((await fs.stat(probe)).dev); } catch { return undefined; }
   };
   const targetDevice = await deviceOf(targetProbe);
   const sourceDevice = await deviceOf(sourceProbe);
@@ -996,26 +998,16 @@ async function estimateSpace(input: {
     { device: temporaryDevice, label: '临时目录', path: temporaryProbe, bytes: largestDatabase },
     { device: sourceDevice, label: '旧数据目录', path: sourceProbe, bytes: input.current.databaseBytes }
   ];
-  const grouped = new Map<string, DataRootRelocationSpace>();
-  for (const need of needs) {
-    const key = need.device === undefined ? `path:${need.path}` : `device:${need.device}`;
-    const existing = grouped.get(key);
-    if (existing) {
-      existing.requiredBytes += need.bytes;
-      existing.label = `${existing.label}、${need.label}`;
-      continue;
-    }
+  const probedNeeds = await Promise.all(needs.map(async (need) => {
     let freeBytes: number | undefined;
     try {
       const stats = await fs.statfs(need.path);
       freeBytes = Number(stats.bavail) * Number(stats.bsize);
     } catch { /* free space unknown on this filesystem: the copy itself fails cleanly */ }
-    grouped.set(key, {
-      label: need.label, path: need.path, requiredBytes: need.bytes + FREE_SPACE_MARGIN_BYTES,
-      ...(freeBytes !== undefined ? { freeBytes } : {})
-    });
-  }
-  return { space: [...grouped.values()], sameDevice, hardLinks };
+    return { ...need, ...(freeBytes !== undefined ? { freeBytes } : {}) };
+  }));
+  const space = diskSpaceNeeds(probedNeeds, FREE_SPACE_MARGIN_BYTES).map(({ missingBytes: _missingBytes, ...disk }) => disk);
+  return { space, sameDevice, hardLinks };
 }
 
 async function databaseBytesOf(runtimeDataRootPath: string): Promise<number> {

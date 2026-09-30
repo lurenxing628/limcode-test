@@ -21,7 +21,7 @@ import {
 } from './runtimeDataSetMerge';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
-  estimatedTargetIndexBytes, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
+  estimatedTargetIndexBytes, knownDiskDevice, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
   LARGE_MERGE_WAL_PEAK_FACTOR, sqliteTemporaryDirectory
 } from './runtimeDataSetLargeMergeSpace';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
@@ -1824,7 +1824,7 @@ async function estimateSource(
   // a foreign root's objects are always copied.
   const foreign = engine.isForeignCandidate(candidate);
   const devices = foreign ? [] : await Promise.all([binding.paths.casRootPath, target.binding.paths.casRootPath]
-    .map((directory) => stat(directory).then((info) => info.dev, () => undefined)));
+    .map((directory) => stat(directory).then((info) => knownDiskDevice(info.dev), () => undefined)));
   const linked = !foreign && devices[0] !== undefined && devices[0] === devices[1];
   const prepareEstimateMs = Math.round(prepareModelMs(facts, linked));
   const sessionEstimateMs = Math.round(sessionModelMs(facts) * sessionRate);

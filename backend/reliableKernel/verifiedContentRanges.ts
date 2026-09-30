@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { constants, type BigIntStats } from 'node:fs';
+import { constants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
+import { fileDescriptorMatchesPathState, fileStateIdentity } from './fileTargetBoundary';
 
 const MAX_IDENTITIES = 128;
 const MAX_ACTIVE_READS = 8;
@@ -38,14 +39,21 @@ export class VerifiedContentRanges {
     // Local CAS historically permits symbolic storage paths. Pin their canonical target instead
     // of changing that policy; every phase checks that the logical path still names this target.
     const canonical = await fs.realpath(file);
+    const pathname = await fs.lstat(canonical, { bigint: true });
+    if (!pathname.isFile() || pathname.size !== length) throw new Error('CAS object byte length mismatch.');
+    const pathnameIdentity = fileStateIdentity(pathname);
     const handle = await fs.open(canonical, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
     this.activeHandles += 1;
     try {
       const before = await handle.stat({ bigint: true });
       if (!before.isFile() || before.size !== length) throw new Error('CAS object byte length mismatch.');
-      const identity = `${canonical}\0${fileIdentity(before)}`;
+      if (!fileDescriptorMatchesPathState(pathname, before)) throw new Error('CAS object was replaced before range read.');
+      // Only the pathname-to-descriptor bridge admits Windows volume-serial differences. Cache
+      // and later same-interface fences retain both complete, original identities independently.
+      const descriptorIdentity = fileStateIdentity(before);
+      const identity = `${canonical}\0${pathnameIdentity}\0${descriptorIdentity}`;
       const key = `${file}\0${digest}\0${length}`;
-      await assertCurrentFile(file, canonical, identity);
+      await assertCurrentFile(file, canonical, pathnameIdentity);
       if (this.verified.get(key) !== identity) {
         this.verified.delete(key);
         // Sharing only an exact identity prevents a replacement from borrowing an old verification.
@@ -53,8 +61,8 @@ export class VerifiedContentRanges {
         let flight = this.flights.get(flightKey);
         if (!flight) {
           flight = this.verify(handle, length, digest).then(async () => {
-            if (`${canonical}\0${fileIdentity(await handle.stat({ bigint: true }))}` !== identity) throw new Error('CAS object changed during verification.');
-            await assertCurrentFile(file, canonical, identity);
+            if (fileStateIdentity(await handle.stat({ bigint: true })) !== descriptorIdentity) throw new Error('CAS object changed during verification.');
+            await assertCurrentFile(file, canonical, pathnameIdentity);
             this.verified.delete(key);
             this.verified.set(key, identity);
             while (this.verified.size > MAX_IDENTITIES) this.verified.delete(this.verified.keys().next().value!);
@@ -73,8 +81,8 @@ export class VerifiedContentRanges {
         if (part.bytesRead === 0) throw new Error('CAS object truncated during range read.');
         read += part.bytesRead;
       }
-      if (`${canonical}\0${fileIdentity(await handle.stat({ bigint: true }))}` !== identity) throw new Error('CAS object changed during range read.');
-      await assertCurrentFile(file, canonical, identity);
+      if (fileStateIdentity(await handle.stat({ bigint: true })) !== descriptorIdentity) throw new Error('CAS object changed during range read.');
+      await assertCurrentFile(file, canonical, pathnameIdentity);
       return bytes;
     } finally {
       try { await handle.close(); } finally { this.activeHandles -= 1; }
@@ -97,14 +105,10 @@ export class VerifiedContentRanges {
   }
 }
 
-function fileIdentity(stat: BigIntStats): string {
-  return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
-}
-
 async function assertCurrentFile(file: string, canonical: string, identity: string): Promise<void> {
   if (await fs.realpath(file) !== canonical) throw new Error('CAS object target changed during range read.');
   const current = await fs.lstat(canonical, { bigint: true });
-  if (!current.isFile() || `${canonical}\0${fileIdentity(current)}` !== identity) {
+  if (!current.isFile() || fileStateIdentity(current) !== identity) {
     throw new Error('CAS object was replaced during range read.');
   }
 }

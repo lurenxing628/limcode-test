@@ -9,7 +9,7 @@ import type {
   LargeMergeDuration, LargeMergeEstimatedSource, LargeMergePreparedSource, LargeMergeRunProgress, LargeMergeSourceOutcome,
   LargeMergeSpaceFacts
 } from './runtimeLargeMergeEngine';
-import { largeMergeDiskNeeds, type LargeMergeDiskNeed, type LargeMergeDiskProbe } from './runtimeDataSetLargeMergeSpace';
+import { knownDiskDevice, largeMergeDiskNeeds, type LargeMergeDiskNeed, type LargeMergeDiskProbe } from './runtimeDataSetLargeMergeSpace';
 import { resolveVscodeRuntimeMergeLedgerRoot } from './vscodeRootAuthority';
 
 /**
@@ -103,7 +103,8 @@ export async function probeLargeMergeDisk(directory: string): Promise<LargeMerge
     const info = await fs.stat(current).catch(() => undefined);
     if (info) {
       const stats = await fs.statfs(current).catch(() => undefined);
-      return { device: info.dev, ...(stats ? { freeBytes: Number(stats.bavail) * Number(stats.bsize) } : {}) };
+      const device = knownDiskDevice(info.dev);
+      return { ...(device !== undefined ? { device } : {}), ...(stats ? { freeBytes: Number(stats.bavail) * Number(stats.bsize) } : {}) };
     }
     const parent = path.dirname(current);
     if (parent === current) return {};

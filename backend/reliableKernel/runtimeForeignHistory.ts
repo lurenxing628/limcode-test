@@ -758,11 +758,14 @@ export async function readLocatedRuntimeFile(file: string, held: HeldDatabaseFil
 }
 
 /**
- * Whether the descriptor opened the file `lstat` found. On Windows Node's path stat leaves the volume
- * serial (dev) unset while the descriptor's stat reports it, so there only the file id is compared.
+ * Whether the descriptor opened the file `lstat` found. Windows pathname stat may omit the volume
+ * serial or report 64 bits where fstat reports 32; known mismatches must still refuse the read.
  */
 export function sameOpenedFile(found: BigIntStats, opened: BigIntStats, platform: NodeJS.Platform = process.platform): boolean {
-  return opened.ino === found.ino && (platform === 'win32' || opened.dev === found.dev);
+  const sameDevice = found.dev === opened.dev || (platform === 'win32'
+    && opened.dev > 0n && opened.dev <= 0xffff_ffffn
+    && (found.dev === 0n || (found.dev > 0xffff_ffffn && BigInt.asUintN(32, found.dev) === opened.dev)));
+  return opened.ino === found.ino && sameDevice;
 }
 
 /**

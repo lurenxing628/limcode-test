@@ -140,6 +140,11 @@ export interface LargeMergeDiskProbe {
   freeBytes?: number;
 }
 
+/** Zero is an unavailable volume identity, never proof that two directories share a disk. */
+export function knownDiskDevice(device: number | undefined): number | undefined {
+  return device === 0 ? undefined : device;
+}
+
 export interface LargeMergeDiskNeed {
   /** User-facing, e.g. 当前历史库所在的盘. */
   label: string;
@@ -150,46 +155,76 @@ export interface LargeMergeDiskNeed {
   missingBytes: number;
 }
 
+export interface DiskSpaceUse extends LargeMergeDiskProbe {
+  label: string;
+  path: string;
+  bytes: number;
+  /** This use's figure already includes the disk's safety margin. */
+  includesMargin?: boolean;
+}
+
+/**
+ * Known different devices have separate budgets. An unknown device could share any known disk,
+ * and all unknown directories could share it together. Check each capacity against the largest
+ * compatible sum; never borrow another directory's free space. A repeated path is one probe group.
+ */
+export function diskSpaceNeeds(uses: ReadonlyArray<DiskSpaceUse>, marginBytes: number): LargeMergeDiskNeed[] {
+  const knownPaths = new Map<string, number>();
+  for (const use of uses) {
+    const device = knownDiskDevice(use.device);
+    if (device !== undefined) knownPaths.set(path.resolve(use.path), device);
+  }
+  const grouped = new Map<string, LargeMergeDiskNeed & { device?: number; includesMargin: boolean }>();
+  for (const use of uses) {
+    const resolvedPath = path.resolve(use.path);
+    const device = knownDiskDevice(use.device) ?? knownPaths.get(resolvedPath);
+    const key = device === undefined ? `path:${resolvedPath}` : `device:${device}`;
+    const existing = grouped.get(key);
+    if (existing) {
+      existing.requiredBytes += Math.max(0, use.bytes);
+      if (!existing.label.split('、').includes(use.label)) existing.label = `${existing.label}、${use.label}`;
+      existing.includesMargin ||= use.includesMargin === true;
+      if (use.freeBytes !== undefined) existing.freeBytes = Math.min(existing.freeBytes ?? use.freeBytes, use.freeBytes);
+      continue;
+    }
+    grouped.set(key, {
+      label: use.label, path: use.path, requiredBytes: Math.max(0, use.bytes), device,
+      includesMargin: use.includesMargin === true,
+      ...(use.freeBytes !== undefined ? { freeBytes: use.freeBytes } : {}), missingBytes: 0
+    });
+  }
+  const disks = [...grouped.values()];
+  const unknown = disks.filter(disk => disk.device === undefined);
+  const known = disks.filter(disk => disk.device !== undefined);
+  const combinedBytes = (members: typeof disks): number => members.reduce((sum, disk) => sum + disk.requiredBytes, 0)
+    + (members.some(disk => disk.includesMargin) ? 0 : marginBytes);
+  return disks.map(({ device, includesMargin: _includesMargin, ...disk }) => {
+    const candidates = device === undefined
+      ? [unknown, ...known.map(other => [other, ...unknown])]
+      : [[disks.find(other => other.device === device)!, ...unknown]];
+    const requiredBytes = Math.max(...candidates.map(combinedBytes));
+    return { ...disk, requiredBytes, missingBytes: disk.freeBytes === undefined ? 0 : Math.max(0, requiredBytes - disk.freeBytes) };
+  });
+}
+
 /**
  * Space per disk: the target's disk needs targetBytes (its margin included); the temporary directory
  * and SQLite's temporary directory their bytes, plus `marginBytes` once on a disk the target's is not.
- * Needs on one disk (one device; a directory whose device is unknown counts as its own disk) are
- * checked once for their sum.
+ * Unknown identities reserve the largest possible shared-disk sum while checking their own capacity.
  */
 export function largeMergeDiskNeeds(
   facts: LargeMergeSessionSpaceFacts,
   probes: { target: LargeMergeDiskProbe; temporary: LargeMergeDiskProbe; sqliteTemporary: LargeMergeDiskProbe },
   marginBytes: number
 ): LargeMergeDiskNeed[] {
-  const needs = [
-    { probe: probes.target, label: '当前历史库所在的盘', path: facts.targetDirectory, bytes: Math.max(0, facts.targetBytes), margin: false },
-    { probe: probes.temporary, label: '临时目录', path: facts.temporaryDirectory, bytes: Math.max(0, facts.temporaryBytes), margin: true },
+  return diskSpaceNeeds([
+    { ...probes.target, label: '当前历史库所在的盘', path: facts.targetDirectory, bytes: facts.targetBytes, includesMargin: true },
+    { ...probes.temporary, label: '临时目录', path: facts.temporaryDirectory, bytes: facts.temporaryBytes },
     {
-      probe: probes.sqliteTemporary, label: '数据库临时文件目录', path: facts.sqliteTemporaryDirectory,
-      bytes: Math.max(0, facts.sqliteTemporaryBytes), margin: true
+      ...probes.sqliteTemporary, label: '数据库临时文件目录', path: facts.sqliteTemporaryDirectory,
+      bytes: facts.sqliteTemporaryBytes
     }
-  ];
-  const grouped = new Map<string, LargeMergeDiskNeed & { withMargin: boolean }>();
-  for (const need of needs) {
-    const key = need.probe.device === undefined ? `path:${path.resolve(need.path)}` : `device:${need.probe.device}`;
-    const existing = grouped.get(key);
-    if (existing) {
-      existing.requiredBytes += need.bytes;
-      if (!existing.label.split('、').includes(need.label)) existing.label = `${existing.label}、${need.label}`;
-      // The target's figure already keeps a margin on this disk.
-      existing.withMargin = existing.withMargin && need.margin;
-      continue;
-    }
-    grouped.set(key, {
-      label: need.label, path: need.path, requiredBytes: need.bytes, withMargin: need.margin,
-      ...(need.probe.freeBytes !== undefined ? { freeBytes: need.probe.freeBytes } : {}),
-      missingBytes: 0
-    });
-  }
-  return [...grouped.values()].map(({ withMargin, ...disk }) => {
-    const requiredBytes = disk.requiredBytes + (withMargin ? marginBytes : 0);
-    return { ...disk, requiredBytes, missingBytes: disk.freeBytes === undefined ? 0 : Math.max(0, requiredBytes - disk.freeBytes) };
-  });
+  ], marginBytes);
 }
 
 /** fs.stat of the directory, or of its nearest existing ancestor: its device. */
@@ -197,7 +232,7 @@ export async function largeMergeDiskDevice(directory: string): Promise<number | 
   let current = path.resolve(directory);
   for (;;) {
     const info = await fs.stat(current).catch(() => undefined);
-    if (info) return info.dev;
+    if (info) return knownDiskDevice(info.dev);
     const parent = path.dirname(current);
     if (parent === current) return undefined;
     current = parent;
