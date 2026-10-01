@@ -7,6 +7,8 @@ import type {
 export interface OpenAIResponsesContinuationProjectionResult {
   chunk: LLMStreamChunk;
   semanticOutput: boolean;
+  /** Canonical item bytes at output_item.done, before display-only reasoning separators. */
+  completedItem?: Content;
 }
 
 export interface OpenAIResponsesCompletedProjection {
@@ -85,7 +87,27 @@ export class OpenAIResponsesContinuationProjection {
       this.validateReasoningTerminal(raw);
       this.validateMessageTerminal(raw);
     }
-    return { chunk, semanticOutput: hasSemanticChunkOutput(chunk) };
+    const completedItem = this.completedContentItem(raw);
+    return { chunk, semanticOutput: hasSemanticChunkOutput(chunk), ...(completedItem ? { completedItem } : {}) };
+  }
+
+  private completedContentItem(raw: Record<string, unknown>): Content | undefined {
+    if (this.unsafeReason || eventType(raw) !== 'response.output_item.done' || !isRecord(raw.item)) return undefined;
+    if (raw.item.type !== 'message' && raw.item.type !== 'reasoning') return undefined;
+    const outputIndex = nonNegativeInteger(raw.output_index);
+    if (outputIndex === undefined) return undefined;
+    const entry: TerminalOutputItem = {
+      item: raw.item,
+      outputIndex,
+      ...(raw.item.type === 'reasoning' && optionalString(raw.item.encrypted_content)
+        ? { trustedSignature: optionalString(raw.item.encrypted_content) }
+        : {})
+    };
+    if (raw.item.type === 'reasoning'
+      && entry.trustedSignature !== this.reasoningForTerminalItem(entry)?.trustedSignature) return undefined;
+    // observe() has verified this item's terminal body against its own streamed prefix. Reuse
+    // the final projection's semantic bytes, not the cross-item display text in partsDelta.
+    return this.projectTerminalItems([entry])?.content;
   }
 
   public completedProjection(): OpenAIResponsesCompletedProjection | undefined {

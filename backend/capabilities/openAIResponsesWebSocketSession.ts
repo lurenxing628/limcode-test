@@ -100,6 +100,8 @@ export interface LimCodeOpenAIResponsesStreamChunk extends LLMStreamChunk {
   reasoningItemDone?: boolean;
   /** Exact ordered model content proven against the terminal Responses output. */
   completedContent?: Content;
+  /** Exact item bodies supplied before the reliable kernel freezes their immutable proofs. */
+  completedOutputItems?: Content[];
   /** Native provider control observation; present only on capability-gated native streams. */
   nativeEvent?: OpenAIResponsesNativeEvent;
 }
@@ -2263,6 +2265,10 @@ function processNativeWireEvent(
   raw: Record<string, unknown>
 ): LimCodeOpenAIResponsesStreamChunk[] {
   const type = eventType(raw);
+  // Steering acknowledgements refer to their predecessor, not necessarily the response currently
+  // producing output. Their own submission/target checks remain the authority for those events.
+  if (type !== 'response.steer.accepted' && type !== 'response.steer.pending' && type !== 'response.steer.failed'
+    && !isCurrentNativeResponseEvent(state, raw, type)) return [];
   switch (type) {
     case 'response.steer.accepted':
       handleNativeSteerAccepted(state, raw);
@@ -2284,6 +2290,31 @@ function processNativeWireEvent(
       if (!state.activeResponse) return [];
       return decodeNativeWireEvent(state, raw);
   }
+}
+
+function isCurrentNativeResponseEvent(
+  state: NativeChainState,
+  raw: Record<string, unknown>,
+  type: string
+): boolean {
+  const explicitId = normalizedString(raw.response_id);
+  const nestedId = isRecord(raw.response) ? normalizedString(raw.response.id) : undefined;
+  if (explicitId && nestedId && explicitId !== nestedId) {
+    throw new Error('OpenAI Responses WebSocket event contains conflicting response identities.');
+  }
+  const responseId = responseIdFromPayload(raw);
+  if (!responseId) return true;
+  const knownResponse = state.chainResponseIds.has(responseId)
+    || responseId === normalizedString(state.prepared.payload.previous_response_id);
+  // Duplicate created frames cannot reset a projection or admit a second pending input batch.
+  if (type === 'response.created') return !knownResponse;
+  if (responseId === state.activeResponse?.responseId) return true;
+  // A closed/superseded response may be repeated after its successor starts. Discard it before
+  // item decoding, call admission, or terminal bookkeeping can attribute its facts to the successor.
+  // An incremental request may start a new lease on the same socket; only the predecessor that
+  // this lease actually sent is also known, never an arbitrary previous_response_id from a frame.
+  if (knownResponse) return false;
+  throw new Error('OpenAI Responses WebSocket event does not belong to an admitted response.');
 }
 
 function startNativeResponse(
@@ -2539,10 +2570,15 @@ function decodeNativeWireEvent(
   };
   const projected = active.projection.observe(raw, decodedChunk);
   const projectedChunk: Omit<LLMStreamChunk, 'nativeEvent'> = projected.chunk;
+  const completedItem = projected.completedItem && outputItem.done ? {
+    ...projected.completedItem,
+    parts: projected.completedItem.parts.map(part => ({ ...part, outputItem: outputItem.done }))
+  } : undefined;
   const chunk: LimCodeOpenAIResponsesStreamChunk = {
     ...projectedChunk,
     ...(outputItem.current ? { outputItem: outputItem.current } : {}),
     ...(outputItem.done ? { outputItemDone: outputItem.done } : {}),
+    ...(completedItem ? { completedOutputItems: [completedItem] } : {}),
     ...(argumentDeltas.length > 0 ? { toolCallArgumentDeltas: argumentDeltas } : {}),
     ...(type === 'response.output_item.done' && isRecord(raw.item) && raw.item.type === 'reasoning'
       ? { reasoningItemDone: true }

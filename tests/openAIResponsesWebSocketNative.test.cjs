@@ -143,6 +143,171 @@ function streamedText(chunks) {
   return chunks.map((chunk) => chunk.textDelta ?? '').join('');
 }
 
+test('canonical item completion refuses rewritten text, conflicting identity, and unproven signatures', () => {
+  const { OpenAIResponsesContinuationProjection } = require(path.resolve(
+    process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension',
+    'backend/capabilities/openAIResponsesContinuationProjection.js'));
+  const reasoning = { type: 'reasoning', id: 'exact-item', summary: [{ type: 'summary_text', text: 'exact text' }] };
+  const message = messageItem('exact-item', 'exact text');
+  const cases = [
+    {
+      item: { ...reasoning, summary: [{ type: 'summary_text', text: 'changed text' }] },
+      delta: { type: 'response.reasoning_summary_text.delta', summary_index: 0, delta: 'exact text' },
+      decoded: { partsDelta: [{ thought: true, text: 'exact text' }] }
+    },
+    {
+      item: reasoning,
+      delta: { type: 'response.reasoning_summary_text.delta', summary_index: 0, delta: 'exact text' },
+      decoded: { partsDelta: [{ thought: true, text: 'exact text', thoughtSignatures: { 'openai-responses': 'untrusted' } }] }
+    },
+    {
+      item: { ...reasoning, encrypted_content: 'not-proven-by-decoder' },
+      delta: { type: 'response.reasoning_summary_text.delta', summary_index: 0, delta: 'exact text' },
+      decoded: { partsDelta: [{ thought: true, text: 'exact text' }] }
+    },
+    {
+      item: { ...reasoning, id: 'different-item' },
+      delta: { type: 'response.reasoning_summary_text.delta', summary_index: 0, delta: 'exact text' },
+      decoded: { partsDelta: [{ thought: true, text: 'exact text' }] }
+    },
+    {
+      item: { ...message, content: [{ type: 'output_text', text: 'changed text' }] },
+      delta: { type: 'response.output_text.delta', content_index: 0, delta: 'exact text' },
+      decoded: { textDelta: 'exact text' }
+    }
+  ];
+  for (const { item, delta, decoded } of cases) {
+    const projection = new OpenAIResponsesContinuationProjection();
+    const streamed = projection.observe({ ...delta, item_id: 'exact-item', output_index: 0 }, decoded);
+    assert.equal(streamed.completedItem, undefined, 'a delta cannot close an immutable item');
+    const closed = projection.observe({ type: 'response.output_item.done', output_index: 0, item }, {});
+    assert.equal(closed.completedItem, undefined, 'invalid closure evidence cannot freeze canonical bytes');
+    projection.observe({ type: 'response.completed', response: { output: [item] } }, {});
+    assert.equal(projection.completedProjection(), undefined, 'final aggregation must still fail closed');
+  }
+  const missingIndex = new OpenAIResponsesContinuationProjection();
+  assert.equal(missingIndex.observe({ type: 'response.output_item.done', item: reasoning }, {}).completedItem,
+    undefined, 'item-only proof requires the provider output ordinal');
+});
+
+test('native item completion carries canonical reasoning and done-only message bodies separately from display deltas', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const items = [
+    { type: 'reasoning', id: 'canonical-first', summary: [{ type: 'summary_text', text: 'first' }], encrypted_content: 'first-signature' },
+    { type: 'reasoning', id: 'canonical-second', summary: [{ type: 'summary_text', text: '\n second \t' }] },
+    messageItem('canonical-message', ' done-only message \n')
+  ];
+  const server = await createServer(socket => {
+    socket.send(JSON.stringify({ type: 'response.created', response: { id: 'canonical-response' } }));
+    for (const [output_index, item] of items.entries()) socket.send(JSON.stringify({
+      type: 'response.output_item.done', response_id: 'canonical-response', output_index, item
+    }));
+    socket.send(JSON.stringify({ type: 'response.completed', response: { id: 'canonical-response', output: items } }));
+  });
+  try {
+    const format = await formatForTest();
+    const chunks = await collect(streamOptions(server, format, 'canonical-native-items', requestBody(format, [user('canonical items')]), {
+      native: nativeOptions({}), timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+    }));
+    assert.equal(chunks.flatMap(chunk => chunk.partsDelta ?? []).filter(part => part.thought).map(part => part.text ?? '').join(''),
+      'first\n\n second \t', 'the display-only separator is still available to live readers');
+    const expected = [
+      { text: 'first', thought: true, thoughtSignatures: { 'openai-responses': 'first-signature' }, outputItem: { id: 'canonical-first', ordinal: 0 } },
+      { text: '\n second \t', thought: true, outputItem: { id: 'canonical-second', ordinal: 1 } },
+      { text: ' done-only message \n', outputItem: { id: 'canonical-message', ordinal: 2 } }
+    ];
+    assert.deepEqual(chunks.flatMap(chunk => chunk.completedOutputItems ?? []).flatMap(content => content.parts), expected);
+    assert.deepEqual(chunks.find(chunk => chunk.completedContent)?.completedContent.parts, expected);
+    const terminalIndex = chunks.findIndex(chunk => chunk.nativeEvent?.type === 'response.completed');
+    assert.ok(chunks.filter(chunk => chunk.completedOutputItems).every(chunk => chunks.indexOf(chunk) < terminalIndex),
+      'canonical content must arrive before its physical response closes');
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+test('native response identity ignores stale data and terminal frames without resetting the successor', { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const holder = { calls: [] };
+  const call = { type: 'function_call', id: 'identity-call-item', call_id: 'identity-call', name: 'identity_probe',
+    arguments: '{}', async: true };
+  const answer = messageItem('identity-current-item', 'current answer');
+  const server = await createServer((socket, request) => {
+    const send = event => socket.send(JSON.stringify(event));
+    if (!request.previous_response_id) {
+      send({ type: 'response.created', response: { id: 'identity-first' } });
+      send({ type: 'response.output_item.done', response_id: 'identity-first', output_index: 0, item: call });
+      send({ type: 'response.completed', response: { id: 'identity-first', output: [call] } });
+      return;
+    }
+    send({ type: 'response.created', response: { id: 'identity-second', previous_response_id: 'identity-first' } });
+    send({ type: 'response.output_text.delta', response_id: 'identity-second', item_id: answer.id,
+      output_index: 0, content_index: 0, delta: 'current ' });
+    send({ type: 'response.created', response: { id: 'identity-first' } });
+    send({ type: 'response.created', response: { id: 'identity-second', previous_response_id: 'identity-first' } });
+    send({ type: 'response.output_text.delta', response_id: 'identity-first', item_id: 'stale-message',
+      output_index: 0, content_index: 0, delta: 'stale text' });
+    send({ type: 'response.output_item.done', response_id: 'identity-first', output_index: 0,
+      item: { type: 'reasoning', id: 'stale-reasoning', summary: [], encrypted_content: 'stale-signature' } });
+    send({ type: 'response.output_item.done', response_id: 'identity-first', output_index: 1,
+      item: { ...call, id: 'stale-call-item', call_id: 'stale-call' } });
+    for (const type of ['response.completed', 'response.incomplete', 'response.failed']) {
+      send({ type, response: { id: 'identity-first', output: [], status: type.split('.')[1] } });
+    }
+    send({ type: 'response.output_text.delta', response_id: 'identity-second', item_id: answer.id,
+      output_index: 0, content_index: 0, delta: 'answer' });
+    send({ type: 'response.output_item.done', response_id: 'identity-second', output_index: 0, item: answer });
+    send({ type: 'response.completed', response: { id: 'identity-second', output: [answer] } });
+  });
+  try {
+    let admission;
+    const chunks = await drive(streamOptions(server, format, 'native-response-identity', requestBody(format, [user('identity')], {
+      tools: [{ type: 'function', name: 'identity_probe', async: true, parameters: { type: 'object', properties: {} } }]
+    }), { native: nativeOptions({}, holder), timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 } }), chunk => {
+      if (!admission && chunk.functionCalls?.length) admission = holder.controller.submitToolResults([
+        { type: 'function_call_output', callId: call.call_id, output: 'result' }
+      ]);
+    });
+    await admission;
+    assert.equal(streamedText(chunks), 'current answer');
+    assert.deepEqual(chunks.flatMap(chunk => chunk.functionCalls ?? []).map(part => part.functionCall.callId), ['identity-call']);
+    assert.deepEqual(nativeEvents(chunks).map(event => [event.type, event.responseId]), [
+      ['response.created', 'identity-first'], ['response.completed', 'identity-first'],
+      ['response.created', 'identity-second'], ['response.completed', 'identity-second']
+    ]);
+    assert.deepEqual(chunks.flatMap(chunk => chunk.completedOutputItems ?? []).flatMap(item => item.parts), [
+      { text: 'current answer', outputItem: { id: answer.id, ordinal: 1 } }
+    ]);
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
+for (const kind of ['unknown', 'conflicting']) test(`native response identity rejects ${kind} response IDs before item closure`, { concurrency: false }, async () => {
+  resetOpenAIResponsesWebSocketSessions();
+  const format = await formatForTest();
+  const server = await createServer(socket => {
+    socket.send(JSON.stringify({ type: 'response.created', response: { id: 'identity-active' } }));
+    socket.send(JSON.stringify({ type: 'response.output_item.done', response_id: 'identity-unknown',
+      ...(kind === 'conflicting' ? { response: { id: 'identity-active' } } : {}), output_index: 0,
+      item: messageItem('untrusted-item', 'untrusted body') }));
+  });
+  const seen = [];
+  try {
+    await assert.rejects(drive(streamOptions(server, format, `native-response-${kind}`, requestBody(format, [user('identity')]), {
+      native: nativeOptions({}), timeouts: { firstEventMs: 2000, eventIdleMs: 2000, responseMs: 8000 }
+    }), chunk => { seen.push(chunk); }), kind === 'conflicting' ? /conflicting response identities/ : /does not belong to an admitted response/);
+    assert.deepEqual(seen.flatMap(chunk => chunk.completedOutputItems ?? []), []);
+    assert.equal(streamedText(seen), '');
+  } finally {
+    resetOpenAIResponsesWebSocketSessions();
+    await server.close();
+  }
+});
+
 test('完整历史首 create 准入实际发送结果，增量首 create 不冒认未重发的历史结果', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const format = await formatForTest();

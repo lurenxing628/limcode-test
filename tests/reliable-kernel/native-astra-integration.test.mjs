@@ -74,6 +74,15 @@ async function assistantCurrentParts(app, modelRequestId) {
   return JSON.parse((await app.contentStore.read(metadata)).toString('utf8')).parts;
 }
 
+async function contextMessageParts(app, conversationId) {
+  const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
+  const window = await app.context.materialize(head.root_id);
+  return window.segments.flatMap(segment => {
+    if (!segment.contentObject.content_type.endsWith('+json')) return [];
+    return JSON.parse(segment.content.toString('utf8')).parts ?? [];
+  });
+}
+
 async function forkNativeMessage(app, conversationId, modelRequestId, key) {
   const [head] = await rows(app, 'ConversationContextHeadLink', { conversation_id: conversationId });
   const [output] = await rows(app, 'ModelRequestMessageLink', { model_request_id: modelRequestId });
@@ -344,6 +353,150 @@ async function withNativeRuntime(run, { transport = 'websocket', realAuthority =
     await fs.rm(directory, { recursive: true, force: true });
   }
 }
+
+test('native WS completes two streamed reasoning items without freezing display separators', { timeout: 30_000 }, async () => {
+  await withNativeRuntime(async h => {
+    const turn = await h.startTurn('two-reasoning-items', 'Preserve reasoning item boundaries.');
+    const frame = await h.until(() => h.frames[0], 'two reasoning item request');
+    const responseId = 'two-reasoning-response';
+    h.created(frame.socket, responseId);
+    const items = ['first', 'second'].map((text, index) => ({
+      type: 'reasoning', id: `${responseId}-${index}`,
+      summary: [{ type: 'summary_text', text }]
+    }));
+    for (const [output_index, item] of items.entries()) {
+      h.send(frame.socket, { type: 'response.reasoning_summary_text.delta', response_id: responseId,
+        item_id: item.id, output_index, summary_index: 0, delta: item.summary[0].text });
+      h.send(frame.socket, { type: 'response.output_item.done', response_id: responseId, output_index, item });
+    }
+    h.completed(frame.socket, responseId, items);
+    assert.equal((await turn.completion).terminalStatus, 'completed',
+      'the terminal aggregate must agree with each exact immutable item proof');
+    assert.deepEqual((await contextMessageParts(h.app, h.conversationId)).filter(part => part.thought)
+      .map(part => part.text), ['first', 'second']);
+    assert.equal(h.httpCalls(), 0);
+  });
+});
+
+test('native WS never imports a late predecessor item into successor Context', { timeout: 30_000 }, async () => {
+  await withNativeRuntime(async h => {
+    const turn = await h.startTurn('late-item-identity', 'Preserve native response identity.');
+    const first = await h.until(() => h.frames[0], 'initial identity request');
+    h.created(first.socket, 'identity-r1');
+    const original = h.text(first.socket, 'identity-r1', 0, 'prior response body');
+    const call = { type: 'function_call', id: 'identity-call-item', call_id: 'identity-call',
+      name: 'native_probe', arguments: '{}', async: true, status: 'completed' };
+    h.send(first.socket, { type: 'response.output_item.done', response_id: 'identity-r1', output_index: 1, item: call });
+    await h.until(() => h.executions() === 1, 'identity tool execution');
+    h.completed(first.socket, 'identity-r1', [original, call]);
+    h.releaseTool.resolve();
+    const second = await h.until(() => h.frames.find(frame => frame.body.input
+      ?.some(item => item.type === 'function_call_output')), 'identity successor request');
+    assert.equal(second.body.previous_response_id, 'identity-r1');
+    h.created(second.socket, 'identity-r2', second.body.previous_response_id);
+    h.send(second.socket, { type: 'response.output_item.done', response_id: 'identity-r1', output_index: 0, item: original });
+    h.completed(second.socket, 'identity-r2', []);
+    assert.equal((await turn.completion).terminalStatus, 'completed');
+    const parts = await contextMessageParts(h.app, h.conversationId);
+    assert.deepEqual(parts.filter(part => part.outputItem?.providerResponseId === 'identity-r2'), [],
+      'a late item must not be restamped with its successor response identity');
+    assert.equal(parts.filter(part => part.text === 'prior response body').length, 1);
+    assert.equal(h.executions(), 1);
+    assert.equal(h.httpCalls(), 0);
+  });
+});
+
+for (const streamed of [true, false]) test(`native WS freezes exact ${streamed ? 'streamed' : 'done-only'} reasoning item proofs before final aggregation`,
+  { timeout: 30_000 }, async () => {
+    await withNativeRuntime(async h => {
+      const turn = await h.startTurn(`reasoning-item-proofs-${streamed}`, 'Preserve each exact reasoning item.');
+      const frame = await h.until(() => h.frames[0], 'reasoning item request');
+      const responseId = `reasoning-item-proofs-${streamed}`;
+      h.created(frame.socket, responseId);
+      const bodies = [
+        { summaries: [' \nFIRST-ITEM \t'], signature: 'first-exact-signature' },
+        { summaries: ['\nSECOND-ITEM \n '] },
+        { summaries: ['MULTI-ONE \n', '\nMULTI-TWO  '], signature: 'multi-exact-signature' },
+        { summaries: [' \t\n  '] },
+        { summaries: [], signature: 'empty-exact-signature' }
+      ];
+      const items = bodies.map((body, index) => ({
+        type: 'reasoning', id: `${responseId}-reasoning-${index}`,
+        summary: body.summaries.map(text => ({ type: 'summary_text', text })),
+        ...(body.signature ? { encrypted_content: body.signature } : {})
+      }));
+      const messageText = ' done-only final message \n';
+      items.push({ type: 'message', id: `${responseId}-message`, role: 'assistant', phase: 'final_answer',
+        content: [{ type: 'output_text', text: messageText }] });
+      const done = (item, output_index) => h.send(frame.socket, {
+        type: 'response.output_item.done', response_id: responseId, output_index, item
+      });
+      for (const [output_index, item] of items.entries()) {
+        if (streamed && item.type === 'message') {
+          h.send(frame.socket, { type: 'response.output_text.delta', response_id: responseId,
+            item_id: item.id, output_index, content_index: 0, delta: messageText.slice(0, 6) });
+        }
+        if (streamed && item.type === 'reasoning') {
+          h.send(frame.socket, { type: 'response.output_item.added', response_id: responseId, output_index,
+            item: { type: 'reasoning', id: item.id, summary: [] } });
+          for (const [summary_index, summary] of item.summary.entries()) {
+            h.send(frame.socket, { type: 'response.reasoning_summary_text.delta', response_id: responseId,
+              item_id: item.id, output_index, summary_index, delta: summary.text });
+          }
+        }
+        done(item, output_index);
+      }
+      const expected = bodies.map(body => ({ text: body.summaries.join('\n'), thought: true,
+        ...(body.signature ? { thoughtSignature: `openai-responses:${body.signature}` } : {}) }));
+      expected.push({ text: messageText });
+      const semantic = parts => parts.filter(part => part.outputItem?.providerResponseId === responseId)
+        .map(({ outputItem, thoughtDurationMs, ...part }) => part);
+      await h.until(async () => (await contextMessageParts(h.app, h.conversationId))
+        .filter(part => part.outputItem?.providerResponseId === responseId).length === items.length,
+      'all exact reasoning item revisions before response.completed');
+      assert.deepEqual(semantic(await contextMessageParts(h.app, h.conversationId)), expected,
+        'display separators must never enter immutable Context item bytes');
+      assert.equal((await contextMessageParts(h.app, h.conversationId))
+        .find(part => part.outputItem?.id === `${responseId}-message`)?.outputItem.phase, 'final_answer');
+      const [request] = await rows(h.app, 'ModelRequest', { turn_id: turn.turnId });
+      assert.equal(request.status, 'streaming');
+      const before = await rows(h.app, 'ContextSegmentSource', { source_kind: 'message_revision' });
+      // Closing an earlier item again must not freeze its display delta or duplicate Context.
+      done(items[0], 0);
+      h.completed(frame.socket, responseId, streamed ? items : []);
+      assert.equal((await turn.completion).terminalStatus, 'completed');
+      assert.deepEqual(semantic(await assistantCurrentParts(h.app, request.id)), expected);
+      assert.deepEqual(semantic(await contextMessageParts(h.app, h.conversationId)), expected);
+      assert.deepEqual(await rows(h.app, 'ContextSegmentSource', { source_kind: 'message_revision' }), before,
+        'the final aggregate and repeated done cannot append duplicate item occurrences');
+      const [link] = await rows(h.app, 'ModelRequestMessageLink', { model_request_id: request.id });
+      const immutable = [];
+      for (const revision of await rows(h.app, 'MessageRevision', { message_id: link.message_id })) {
+        const [metadata] = await rows(h.app, 'ContentObject', { id: revision.content_object_id });
+        const parts = JSON.parse((await h.app.contentStore.read(metadata)).toString('utf8')).parts;
+        if (parts.length === 1 && before.some(source => source.source_id === revision.id)) immutable.push(...parts);
+      }
+      assert.deepEqual(semantic(immutable.sort((left, right) => left.outputItem.ordinal - right.outputItem.ordinal)), expected,
+        'each canonical part has its own exact immutable revision proof');
+
+      resetOpenAIResponsesWebSocketSessions();
+      const next = await h.startTurn(`reasoning-item-successor-${streamed}`, 'Continue from the preserved reasoning.');
+      const successor = await h.until(() => h.frames[1], 'full successor after reasoning');
+      assert.equal(successor.body.previous_response_id, undefined);
+      const wireReasoning = successor.body.input.filter(item => item.type === 'reasoning');
+      assert.deepEqual(wireReasoning.map(item => ({ text: item.summary.map(part => part.text).join('\n'),
+        thought: true, ...(item.encrypted_content ? { thoughtSignature: `openai-responses:${item.encrypted_content}` } : {}) })), expected.filter(part => part.thought),
+      'a full subsequent request must preserve each item and signature without display whitespace');
+      const wireMessage = successor.body.input.find(item => item.type === 'message' && item.role === 'assistant');
+      assert.equal(wireMessage.phase, 'final_answer');
+      assert.equal(wireMessage.content.map(part => part.text).join(''), messageText);
+      h.created(successor.socket, `${responseId}-successor`);
+      h.completed(successor.socket, `${responseId}-successor`, [h.text(successor.socket, `${responseId}-successor`, 0, 'finished')]);
+      assert.equal((await next.completion).terminalStatus, 'completed');
+      assert.equal(h.executions(), 0);
+      assert.equal(h.httpCalls(), 0, 'the entire regression must exercise the real local WebSocket provider path');
+    });
+  });
 
 for (const transport of ['http', 'websocket']) test(`review P1-2真实authority high恢复默认与auto compression组合 ${transport}`, { timeout: 60000 }, async () => {
   await withNativeRuntime(async h => {
