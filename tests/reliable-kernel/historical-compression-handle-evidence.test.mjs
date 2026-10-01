@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import path from 'node:path';
+import fs from 'node:fs/promises';
+import os from 'node:os';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 
@@ -412,3 +414,174 @@ test('immutable or native expansion fails closed when originals are absent, fore
     await assert.rejects(readHistoricalCompressionHandleCatalog(history.database, history.store, history.input()));
   }
 });
+
+function rejectedPartialNativeHistory() {
+  const history = fixture([message('old', { role: 'user', parts: [{ text: JSON.stringify({ processId: 'never-projected-process' }) }] }),
+    message('retained', { role: 'user', parts: [{ text: 'retained tail' }] })],
+  { compressionMethodKind: 'provider_native', sourceSegmentCount: 1, blockId: 'failed-native-block' });
+  history.updateRecipe({ sourceHash: history.sourceHash(1) });
+  Object.assign(history.domains.ModelRequest[0], { status: 'terminal', terminal_state: 'provider_failed', usage_json: null,
+    stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null,
+      failure: { category: 'permanent', message: 'Provider-native compression requires the complete frozen model-visible window.' } } });
+  return history;
+}
+
+test('retained published failed Anthropic partial-native attempt does not poison future handle reads', async () => {
+  const history = rejectedPartialNativeHistory();
+  const before = [...history.contents].map(([id, bytes]) => [id, bytes.toString('utf8')]);
+  assert.equal(await readHistoricalCompressionHandleCatalog(history.database, history.store, history.input()), undefined);
+  const catalog = await readConversationContextHandleCatalog(history.database, history.store, history.conversationId);
+  assert.deepEqual(catalog.retiredRefs, []);
+  assert.equal(modelHandleRef(buildModelHandleCatalog([{ processId: 'next-process' }], catalog), 'process', 'next-process'), 'P1');
+  assert.deepEqual([...history.contents].map(([id, bytes]) => [id, bytes.toString('utf8')]), before);
+});
+
+test('failed partial-native history still requires exact local failure and intact immutable evidence', async () => {
+  for (const mutate of [
+    h => { h.domains.ModelRequest[0].terminal_state = 'completed'; },
+    h => { h.domains.ModelRequest[0].status = 'prepared'; },
+    h => { h.domains.ModelRequest[0].stream_stats_json.failure.message = 'network failure'; },
+    h => { delete h.domains.ModelRequest[0].stream_stats_json.failure; },
+    h => { h.domains.ModelRequest[0].stream_stats_json.failure.category = 'transient'; },
+    h => { h.domains.ModelRequest[0].stream_stats_json.failure.status = 500; },
+    h => { h.domains.ModelRequest[0].stream_stats_json.failure.code = 'UNRELATED'; },
+    h => { h.domains.ModelRequest[0].stream_stats_json.lastStreamSeq = '1'; },
+    h => { h.domains.ModelRequest[0].stream_stats_json.firstOutputAt = 1; },
+    h => { h.domains.ModelRequest[0].usage_json = { inputTokens: 1 }; },
+    h => { delete h.recipe.blockId; h.updateRecipe({}); },
+    h => h.updateRecipe({ sourceHash: '0'.repeat(64) }),
+    h => h.contents.delete('content-old'),
+    h => { h.domains.Turn[0].conversation_id = 'foreign'; },
+    h => h.updateRecipe({ compressionMethodKind: 'openai_responses_compact' }),
+    h => h.updateRecipe({ sourceReplay: 'immutable_provenance' }),
+    h => { h.domains.ModelStreamCheckpoint = [{ id: 'output', model_request_id: h.requestId }]; },
+    h => { h.domains.ModelStreamFence = [{ id: 'fence', model_request_id: h.requestId }]; },
+    h => { h.domains.CompressionBlock.push({ id: h.recipe.blockId }); }
+  ]) {
+    const history = rejectedPartialNativeHistory(); mutate(history);
+    await assert.rejects(readHistoricalCompressionHandleCatalog(history.database, history.store, history.input()));
+  }
+});
+
+
+test('rejected partial-native failure retains fork and projectionless child provenance checks', async () => {
+  for (const copy of [h => copiedProjection(h), h => projectionlessChildCopy(h),
+    h => projectionlessChildCopy(h, { ancestors: ['older-child'], humanTarget: true })]) {
+    const history = rejectedPartialNativeHistory();
+    copy(history);
+    assert.equal(await readHistoricalCompressionHandleCatalog(history.database, history.store, history.input()), undefined);
+    const catalog = await readConversationContextHandleCatalog(history.database, history.store, history.conversationId);
+    assert.deepEqual(catalog.retiredRefs, []);
+    history.updateRecipe({ sourceHash: '0'.repeat(64) });
+    await assert.rejects(readHistoricalCompressionHandleCatalog(history.database, history.store, history.input()), /frozen hash/);
+  }
+});
+
+test('real persisted Anthropic partial-native adapter failure remains readable after restart without a provider call',
+  { timeout: 60000 }, async () => {
+    const kernel = load('backend/reliableKernel/index.js');
+    const capabilities = load('shared/modelCapabilities.js');
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'historical-native-rejection-'));
+    const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
+    await kernel.initializeEmptyRuntimeRoot(root);
+    const provider = { providerConfigId: 'historical-claude', provider: 'claude', modelId: 'claude-sonnet-4-6',
+      baseUrl: 'https://historical.invalid' };
+    const modelCapabilities = { ...capabilities.resolveModelCapabilities({ ...provider, transport: 'http' }),
+      nativeCompaction: { kind: 'anthropic_messages', availability: 'verified', reason: 'fixture' } };
+    const executionPlan = capabilities.resolveCompressionExecutionPlan({ kind: 'provider_native', fallbacks: [] }, modelCapabilities);
+    const summaryReasoning = capabilities.resolveSummaryReasoning({ mode: 'provider_default', capabilities: modelCapabilities });
+    let providerCalls = 0;
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter(provider.providerConfigId, {
+      start() { providerCalls += 1; assert.fail('ordinary provider send is forbidden'); },
+      compact() { providerCalls += 1; assert.fail('partial native provider send is forbidden'); },
+      abort() {}, dispose() {}
+    });
+    const options = {
+      authorityCompiler: { async compile(input) { return { turnId: input.turnId, executorAgentId: input.executorAgentId,
+        executionPreset: { content: JSON.stringify({ providerConfigId: provider.providerConfigId, modelId: provider.modelId }) },
+        authoritySnapshot: { content: JSON.stringify({
+          kind: 'effective-turn-authority', turnId: input.turnId, conversationId: input.conversationId,
+          executorAgentId: input.executorAgentId,
+          model: { providerConfigId: provider.providerConfigId, provider: provider.provider, modelId: provider.modelId },
+          modelProfile: { compressionThresholdTokens: 150000, contextWindowTokens: 200000,
+            tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
+          compression: { enabled: true, methodKind: 'provider_native', executionPlan, thresholdTokens: 150000,
+            config: { id: 'native-compression', name: 'Historical native compression', kind: 'provider_native',
+              trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 150000 } },
+            provider: { ...provider, capabilities: modelCapabilities, summaryReasoning,
+              contextWindowTokens: 200000, maxOutputTokens: 16000 } },
+          toolPolicy: { id: 'tools', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
+          systemPrompt: { id: 'prompt', text: '' }, runtimeContext: { id: null, name: '', template: '' },
+          workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
+        }) }
+      }; } },
+      resolveWorkEnvironment: async () => undefined,
+      mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { assert.fail('no MCP'); } },
+      mcpPolicyGate: { async authorize() { assert.fail('no MCP authorization'); } },
+      attachmentSettings: { async loadGlobalSettings() { return { section: 'attachments',
+        settings: { maxStoredInlineFileMb: 25 }, filePath: 'unused' }; } },
+      providers: { resolve() { return adapter; } },
+      toolDispatcher: { definitions() { return []; }, async dispatch() { assert.fail('no tool effects'); } }
+    };
+    let app;
+    try {
+      app = await kernel.ReliableKernelApplication.open(root, options);
+      const rows = async (domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain)
+        .list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 100 }))).snapshot;
+      const now = new Date().toISOString();
+      await app.database.transaction([
+        kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'failed-history', title: 'Historical failed native request',
+          status: 'active', created_at: now, updated_at: now }),
+        kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'historical-agent-link',
+          conversation_id: 'failed-history', agent_id: 'historical-agent', role: 'default', created_at: now, updated_at: now })
+      ]);
+      const input = key => ({ source: { kind: 'command', key }, conversationId: 'failed-history', leaseOwnerId: 'historical-owner',
+        hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: key });
+      const original = await app.turns.input(input('old history'));
+      await app.turns.terminal({ source: { kind: 'internal', key: 'end-original' }, turnId: original.turnId,
+        terminalStatus: 'completed', reason: 'fixture' });
+      const current = await app.turns.input(input('retained tail'));
+      const [authority] = await rows('AuthoritySnapshot', { turn_id: current.turnId });
+      const sourceRootId = await app.context.currentHeadRootId('failed-history');
+      const { records } = await app.context.materializeStructure(sourceRootId);
+      assert.equal(records.length, 2);
+      // The published coordinator persisted this unmarked recipe before the adapter rejected its
+      // partial Anthropic input. Exercise the real writer, CAS, preflight and failure commit; do not
+      // manufacture ModelRequest failure rows or modify an already frozen recipe.
+      const recipe = { kind: 'reliable-context-compression', requestKind: 'context_compression_manual', trigger: 'manual',
+        compressionMethodKind: 'provider_native', sourceRootId, sourceSegmentCount: 1, blockId: 'failed-native-block',
+        sourceHash: createHash('sha256').update(JSON.stringify(records.slice(0, 1).map(record => ({
+          segmentId: record.segment.id, contentObjectId: record.segment.content_object_id, segmentKind: record.segment.segment_kind
+        })))).digest('hex'), attachmentCatalogState: { catalog: [], placements: [] }, modelHandleCatalog: { entries: [] } };
+      const created = await app.modelProvider.createModelRequest({ turnId: current.turnId, contextRootId: sourceRootId,
+        authoritySnapshotId: authority.id, idempotencyKey: 'published-partial-native', recipe });
+      await assert.rejects(app.modelProvider.dispatch(created.modelRequestId, adapter), /must freeze the complete model-visible Context projection/);
+      assert.equal(providerCalls, 0);
+      const [failed] = await rows('ModelRequest', { id: created.modelRequestId });
+      assert.equal(failed.status, 'terminal');
+      assert.equal(failed.terminal_state, 'provider_failed');
+      assert.equal(failed.stream_stats_json.socketGeneration, '0', 'real kernel preparation rejects before opening a provider socket');
+      assert.deepEqual(failed.stream_stats_json.failure, { category: 'permanent',
+        message: 'Provider-native compression must freeze the complete model-visible Context projection.' });
+      assert.equal(failed.usage_json, null);
+      for (const domain of ['ModelStreamCheckpoint', 'ModelStreamFence']) {
+        assert.deepEqual(await rows(domain, { model_request_id: created.modelRequestId }), []);
+      }
+      assert.deepEqual(await rows('CompressionBlock'), []);
+      const [operation] = await rows('Operation', { owner_kind: 'model_request', owner_id: created.modelRequestId });
+      assert.equal(operation.status, 'failed');
+      assert.deepEqual((await rows('Attempt', { operation_id: operation.id })).map(row => row.status), ['failed']);
+      await app.turns.terminal({ source: { kind: 'internal', key: 'end-rejected' }, turnId: current.turnId,
+        terminalStatus: 'failed', reason: 'Historical partial-native rejection' });
+      await app.close();
+      app = await kernel.ReliableKernelApplication.open(root, options);
+      const catalog = await readConversationContextHandleCatalog(app.database, app.contentStore, 'failed-history');
+      assert.deepEqual(catalog.retiredRefs, []);
+      assert.equal(modelHandleRef(buildModelHandleCatalog([{ processId: 'new-process' }], catalog), 'process', 'new-process'), 'P1');
+      assert.deepEqual((await rows('ModelRequest', { id: created.modelRequestId }))[0], failed, 'historical facts are not rewritten');
+      assert.equal(providerCalls, 0);
+    } finally {
+      if (app) await app.close();
+      await fs.rm(directory, { recursive: true, force: true });
+    }
+  });

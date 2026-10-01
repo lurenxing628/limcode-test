@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { readProviderRequestFailure } from '../../shared/compressionExecution';
 import { normalizeAttachmentCatalogState } from './attachmentCatalog';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { COMPRESSION_SOURCE_REPLAY_LIMITS, expandTextCompressionSources } from './compressionSourceReplay';
@@ -100,7 +101,9 @@ export async function readHistoricalCompressionHandleCatalog(
   if (!Number.isSafeInteger(count) || (count as number) <= 0 || (count as number) > structure.records.length) {
     throw invalid('Historical compression source count is outside its frozen Context projection.');
   }
-  if ((nativeMethod || sourceReplay) && count !== structure.records.length) {
+  const rejectedPartialNative = nativeMethod && !sourceReplay && count !== structure.records.length
+    && await isRejectedPartialNativeRequest(database, request, recipe);
+  if ((nativeMethod || sourceReplay) && count !== structure.records.length && !rejectedPartialNative) {
     throw invalid('Historical full-window compression selected a partial Context projection.');
   }
   if (structure.records[count as number]?.segment.segment_kind === 'tool_pair') {
@@ -113,6 +116,10 @@ export async function readHistoricalCompressionHandleCatalog(
   })))).digest('hex');
   if (recipe.sourceHash !== hash) throw invalid('Historical compression source identity does not match its frozen hash.');
   const context = await readSourcePrefix(store, prefix);
+  // The published adapter rejected this exact attempt before producing a provider body. Keep its
+  // frozen catalog as evidence, but it never exposed any newly derived source addresses. Ownership,
+  // prefix boundary/hash and source CAS were still checked above; a failed status alone is no proof.
+  if (rejectedPartialNative) return undefined;
   let possibleSources: readonly (readonly FullProviderContextItem[])[];
   if (sourceReplay) {
     possibleSources = [await expandTextCompressionSources(database, store, sourceConversationId, context,
@@ -144,6 +151,42 @@ export async function readHistoricalCompressionHandleCatalog(
   if (retiredRefs.size === 0) return undefined;
   return normalizeModelHandleCatalog({ entries: [], retiredRefs: [...retiredRefs],
     identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION });
+}
+
+/** Exact published local preparation guards, before native input could reach a provider. */
+const PARTIAL_NATIVE_PREPARATION_FAILURES = new Set([
+  'Provider-native compression must freeze the complete model-visible Context projection.',
+  'Provider-native compression requires the complete frozen model-visible window.'
+]);
+
+/** A retained local preparation failure is not evidence of an unsafe native provider send. */
+async function isRejectedPartialNativeRequest(database: RuntimeDatabase, request: DomainRow,
+  recipe: Record<string, unknown>): Promise<boolean> {
+  if (recipe.compressionMethodKind !== 'provider_native' || request.status !== 'terminal'
+    || request.terminal_state !== 'provider_failed') return false;
+  const stats = request.stream_stats_json;
+  if (!stats || typeof stats !== 'object' || Array.isArray(stats)) return false;
+  const record = stats as Record<string, unknown>;
+  if (record.failure === undefined) return false;
+  const failure = readProviderRequestFailure(record.failure);
+  if (failure.category !== 'permanent' || !PARTIAL_NATIVE_PREPARATION_FAILURES.has(failure.message)
+    || failure.code !== undefined || failure.status !== undefined || failure.reason !== undefined
+    || failure.endpointKind !== undefined || request.usage_json !== null
+    || record.lastStreamSeq !== undefined || record.firstOutputAt !== undefined
+    || record.nativeLatestResponseUsage !== undefined || record.nativeResponseMetrics !== undefined) return false;
+  // The producer always named the prospective block. Missing that identity must not turn the
+  // absence check into a wildcard acceptance of arbitrary failed records.
+  const blockId = text(recipe.blockId, 'Historical rejected native compression block');
+  // The guard runs before any wire output. A successful output/fence or applied block contradicts
+  // this producer and must not be hidden by the retained failure message.
+  const evidence = await database.snapshot([
+    DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').list({ where: { model_request_id: request.id }, limit: 1 }),
+    DOMAIN_REPOSITORIES.domain('ModelStreamFence').list({ where: { model_request_id: request.id }, limit: 1 }),
+    DOMAIN_REPOSITORIES.domain('CompressionBlock').get(blockId)
+  ]);
+  return Array.isArray(evidence.snapshot[0]) && evidence.snapshot[0].length === 0
+    && Array.isArray(evidence.snapshot[1]) && evidence.snapshot[1].length === 0
+    && evidence.snapshot[2] === null;
 }
 
 /** Exact published attachment-era OpenAI collector, before collaboration and plural child ids. */
