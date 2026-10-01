@@ -22,6 +22,12 @@ function readTargetsSelection(read: ReadState | undefined, pending: PendingModel
   return !!read && !!pending && read.submissionRequestId === pending.submissionRequestId
     && (read.afterRequestId ? read.afterRequestId === pending.requestId : !pending.requestId);
 }
+function selectionDependsOnRead(read: ReadState | undefined, pending: PendingModelProfileSelection | undefined): pending is PendingModelProfileSelection {
+  // Coalescing may leave a newer unsent choice waiting on an older read. A failed
+  // baseline/reconciliation blocks that choice too, but never an independent write.
+  // Keep exact submission ownership in readTargetsSelection for successful discards.
+  return !!read && !!pending && (read.afterRequestId ? read.afterRequestId === pending.requestId : !pending.requestId);
+}
 const waiters = new Map<string, Array<{ resolve: () => void; reject: (error: Error) => void }>>();
 function settle(key: string, error?: string): void { for (const waiter of waiters.get(key) ?? []) error ? waiter.reject(new Error(error)) : waiter.resolve(); waiters.delete(key); }
 const scopeOf = (scopeKind: ConfigScopeKind, scopeId?: string): Scope => ({ scopeKind, ...(scopeKind !== 'global' && scopeId?.trim() ? { scopeId: scopeId.trim() } : {}) });
@@ -173,11 +179,7 @@ export const useModelProfileStore = defineStore('modelProfile', {
         if (this.reads[key]?.requestId !== requestId) return;
         const read = this.reads[key];
         delete this.reads[key];
-        this.status = '读取未确认；保留草稿，请重新读取。';
-        this.scopeErrors[key] = this.status;
-        this.failedReads[key] = true;
-        const current = this.pendingSelections[key];
-        if (readTargetsSelection(read, current)) { current.status = 'uncertain'; current.error = this.status; settle(key, this.status); }
+        this.failRead(key, read, '读取未确认；保留草稿，请重新读取。');
       }, 10000);
     },
     applyScopeSnapshot(payload: ModelProfileScopeSnapshotPayload, correlationId?: string): void {
@@ -196,10 +198,9 @@ export const useModelProfileStore = defineStore('modelProfile', {
       if (!isRead && !isWrite) return;
       if (isRead) delete this.reads[key];
       if (payload.outcome === 'uncertain' || !payload.revision || !payload.authorityId || !payload.sessionId) {
-        this.status = payload.error || '结果未确定，请重新读取。';
-        this.scopeErrors[key] = this.status;
-        if (isRead) this.failedReads[key] = true;
-        if (pending && (!isRead || readTargetsSelection(read, pending))) { pending.status = 'uncertain'; pending.error = this.status; settle(key, this.status); }
+        const message = payload.error || '结果未确定，请重新读取。';
+        if (isRead) this.failRead(key, read, message);
+        else { this.scopeErrors[key] = message; this.rejectPending(correlationId, message); }
         return;
       }
       // An after-read belongs to one submitted operation, not a newer queued selection that
@@ -213,15 +214,20 @@ export const useModelProfileStore = defineStore('modelProfile', {
       const actualState = !actual && !payload.link ? 'absent' : validPair ? actual.thinkingOverride ? 'overridden' : 'default' : undefined;
       if (!actualState || payload.profileState !== actualState || payload.outcome !== (isWrite ? 'committed' : 'observed')) {
         const message = '配置确认状态不完整；结果未确定，请重新读取。';
-        this.scopeErrors[key] = message;
-        if (isWrite) this.rejectPending(correlationId, message);
+        if (isRead) this.failRead(key, read, message);
+        else { this.scopeErrors[key] = message; this.rejectPending(correlationId, message); }
         return;
       }
       if (isWrite) {
         if (!matchesReceipt(payload, pending?.submitted)) { this.rejectPending(correlationId, '保存确认内容不匹配；结果未确定，请重新读取。'); return; }
       }
       if (payload.authorityId !== this.authorityId) {
-        if (!isRead || !read.adopt || this.adoptionRequestId !== correlationId) return;
+        if (!isRead || !read.adopt || this.adoptionRequestId !== correlationId) {
+          // The correlated read has ended, but it cannot establish this root. In
+          // particular, navigation may have superseded an initial adoption read.
+          if (isRead) this.failRead(key, read, '配置来源确认已更新；保留草稿，请重新读取。');
+          return;
+        }
         for (const [draftKey, draft] of Object.entries(this.pendingSelections)) {
           if (this.authorityId) { this.detachedDrafts[draftKey] = draft; settle(draftKey, 'authority/root 已改变；旧草稿保留，未跨代提交。'); delete this.pendingSelections[draftKey]; }
         }
@@ -309,13 +315,16 @@ export const useModelProfileStore = defineStore('modelProfile', {
       for (const [key, read] of Object.entries(this.reads)) {
         if (read.requestId !== correlationId) continue;
         delete this.reads[key];
-        this.scopeErrors[key] = message;
-        this.failedReads[key] = true;
-        this.status = message;
-        const pending = this.pendingSelections[key];
-        if (readTargetsSelection(read, pending)) { pending.status = 'uncertain'; pending.error = message; settle(key, message); }
+        this.failRead(key, read, message);
       }
       this.rejectPending(correlationId, message);
+    },
+    failRead(key: string, read: ReadState, message: string): void {
+      this.scopeErrors[key] = message;
+      this.failedReads[key] = true;
+      this.status = message;
+      const pending = this.pendingSelections[key];
+      if (selectionDependsOnRead(read, pending)) { pending.status = 'uncertain'; pending.error = message; settle(key, message); }
     },
     rejectPending(correlationId: string | undefined, message: string): void {
       if (!correlationId) return;

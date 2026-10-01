@@ -57,6 +57,156 @@ function snapshot(scopeId, value, sequence, authorityId = 'root-a') {
     ...(profile ? { profile, link: { id: `link-${scopeId}`, scopeKind: 'conversation', scopeId, modelProfileId: profile.id, role: 'active', createdAt: 1, updatedAt: sequence } } : {}) };
 }
 const choose = (f, scope, value) => f.store.setThinkingForScope(scope, vue.reactive(model), vue.reactive({ kind: 'openai-effort', value }));
+const readFailures = ['transport-error', 'uncertain', 'timeout', 'incomplete-snapshot'];
+function failRead(f, request, timeout, failure) {
+  if (failure === 'transport-error') f.emit(protocol.BridgeMessageType.Error, { requestType: request.type, message: 'read failed' }, request.id);
+  else if (failure === 'timeout') timeout();
+  else if (failure === 'incomplete-snapshot') f.reply(request, { ...snapshot('a', null, 2), profileState: 'unknown' });
+  else f.reply(request, { ...snapshot('a', null, 2), outcome: 'uncertain', revision: '', error: 'read uncertain' });
+}
+const nextTurn = () => new Promise(setImmediate);
+
+for (const start of ['scope-mount', 'first-choice']) for (const failure of readFailures) test(`coalesced ${start} read ${failure} settles latest unsent choice and explicit recovery never replays it`, async () => {
+  const f = fixture();
+  if (start === 'scope-mount') f.store.activateScope('conversation', 'a');
+  else f.store.setProfileForScope('conversation', 'a', model);
+  const read = f.requests.at(-1), timeout = f.timers.at(-1), requestCount = f.requests.length;
+  f.store.setProfileForScope('conversation', 'a', { ...model, model: 'first-choice' });
+  f.store.setProfileForScope('conversation', 'a', { ...model, model: 'latest-choice' });
+  assert.equal(f.requests.length, requestCount, 'both unsent choices share the existing baseline read');
+  let result = 'waiting';
+  const waiting = f.store.awaitSavedForScope('conversation', 'a').then(() => { result = 'saved'; }, () => { result = 'rejected'; });
+  failRead(f, read, timeout, failure);
+  await nextTurn();
+  assert.equal(result, 'rejected', 'the Send waiter must settle without another user action');
+  await waiting;
+  assert.equal(f.store.readingFor('conversation', 'a'), false);
+  assert.equal(f.store.pendingFor('conversation', 'a').status, 'uncertain');
+  assert.equal(f.store.pendingFor('conversation', 'a').profile.model, 'latest-choice');
+  assert.ok(f.store.errorFor('conversation', 'a'));
+  await assert.rejects(f.store.awaitSavedForScope('conversation', 'a'));
+  await f.store.awaitSavedForScope('conversation', 'b');
+  f.reply(read, snapshot('a', null, 99));
+  assert.equal(f.store.confirmedFor('conversation', 'a'), undefined, 'a terminal read cannot later authorize the draft');
+  f.store.retryPending('conversation', 'a');
+  const recovery = f.requests.at(-1);
+  assert.equal(recovery.payload.renewSession, true);
+  f.reply(recovery, snapshot('a', null, 3));
+  assert.equal(f.store.pendingFor('conversation', 'a'), undefined);
+  assert.equal(f.store.detachedFor('conversation', 'a').profile.model, 'latest-choice');
+  await f.store.awaitSavedForScope('conversation', 'a');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 0);
+});
+
+for (const failure of readFailures) test(`replacing an unsent selection rejects its old waiter before a coalesced read ${failure} settles the replacement`, async () => {
+  const f = fixture(); f.store.activateScope('conversation', 'a'); const read = f.requests.at(-1), timeout = f.timers.at(-1);
+  f.store.setProfileForScope('conversation', 'a', { ...model, model: 'first-choice' });
+  const oldWaiter = assert.rejects(f.store.awaitSavedForScope('conversation', 'a'), /选择已更新/);
+  const replacement = f.store.setProfileForScope('conversation', 'a', { ...model, model: 'replacement-choice' });
+  await oldWaiter;
+  let result = 'waiting';
+  const waiting = f.store.awaitSavedForScope('conversation', 'a').then(() => { result = 'saved'; }, () => { result = 'rejected'; });
+  failRead(f, read, timeout, failure);
+  await nextTurn(); assert.equal(result, 'rejected'); await waiting;
+  assert.equal(f.store.pendingFor('conversation', 'a').submissionRequestId, replacement);
+  assert.equal(f.store.pendingFor('conversation', 'a').profile.model, 'replacement-choice');
+  f.store.discardPending('conversation', 'a');
+  await f.store.awaitSavedForScope('conversation', 'a');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 0);
+});
+
+for (const failure of readFailures) test(`stale baseline read ${failure} does not reject a newer independently submitted write`, async () => {
+  const f = fixture(); f.read('a');
+  f.store.refreshScope('conversation', 'a'); const read = f.requests.at(-1), timeout = f.timers.at(-1);
+  assert.equal(read.payload.afterRequestId, undefined);
+  choose(f, 'a', 'high'); const write = f.requests.at(-1);
+  let result = 'waiting';
+  const waiting = f.store.awaitSavedForScope('conversation', 'a').then(() => { result = 'saved'; }, () => { result = 'rejected'; });
+  failRead(f, read, timeout, failure);
+  await nextTurn(); assert.equal(result, 'waiting');
+  assert.equal(f.store.pendingFor('conversation', 'a').requestId, write.id);
+  assert.equal(f.store.pendingFor('conversation', 'a').status, 'saving');
+  assert.equal(f.store.pendingFor('conversation', 'a').error, undefined);
+  f.reply(write, { ...snapshot('a', 'high', 3), outcome: 'committed' });
+  await waiting; assert.equal(result, 'saved');
+  assert.equal(f.store.errorFor('conversation', 'a'), '');
+});
+
+for (const failure of readFailures) test(`after-write read ${failure} rejects the newer choice still queued behind that same wire operation`, async () => {
+  const f = fixture(); f.read('a'); choose(f, 'a', 'high'); const write = f.requests.at(-1);
+  f.store.refreshScope('conversation', 'a'); const read = f.requests.at(-1), timeout = f.timers.at(-1);
+  choose(f, 'a', 'medium');
+  let result = 'waiting';
+  const waiting = f.store.awaitSavedForScope('conversation', 'a').then(() => { result = 'saved'; }, () => { result = 'rejected'; });
+  failRead(f, read, timeout, failure);
+  await nextTurn();
+  assert.equal(result, 'rejected'); await waiting;
+  assert.equal(f.store.pendingFor('conversation', 'a').requestId, write.id);
+  assert.equal(f.store.pendingFor('conversation', 'a').profile.thinkingOverride.value, 'medium');
+  assert.equal(f.store.pendingFor('conversation', 'a').status, 'uncertain');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 1);
+  f.store.discardPending('conversation', 'a'); const discard = f.requests.at(-1);
+  assert.equal(discard.payload.afterRequestId, write.id);
+  f.reply(discard, { ...snapshot('a', 'high', 3), afterRequestId: write.id });
+  await f.store.awaitSavedForScope('conversation', 'a');
+  assert.equal(f.store.pendingFor('conversation', 'a'), undefined);
+  assert.equal(f.store.confirmedFor('conversation', 'a').profile.thinkingOverride.value, 'high');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 1, 'discard performs no compensation or queued write');
+});
+
+for (const failure of readFailures) test(`stale after-write read ${failure} does not reject an independently submitted newer write`, async () => {
+  const f = fixture(); f.read('a'); choose(f, 'a', 'high'); const high = f.requests.at(-1);
+  f.store.refreshScope('conversation', 'a'); const read = f.requests.at(-1), timeout = f.timers.at(-1);
+  choose(f, 'a', 'medium');
+  f.reply(high, { ...snapshot('a', 'high', 2), outcome: 'committed' }); const medium = f.requests.at(-1);
+  assert.notEqual(medium.id, high.id);
+  let result = 'waiting';
+  const waiting = f.store.awaitSavedForScope('conversation', 'a').then(() => { result = 'saved'; }, () => { result = 'rejected'; });
+  failRead(f, read, timeout, failure);
+  await nextTurn();
+  assert.equal(result, 'waiting');
+  assert.equal(f.store.pendingFor('conversation', 'a').requestId, medium.id);
+  assert.equal(f.store.pendingFor('conversation', 'a').status, 'saving');
+  assert.equal(f.store.pendingFor('conversation', 'a').error, undefined);
+  f.reply(medium, { ...snapshot('a', 'medium', 3), outcome: 'committed' });
+  await waiting;
+  assert.equal(result, 'saved');
+  assert.equal(f.store.errorFor('conversation', 'a'), '');
+});
+
+test('successful coalesced initial read still submits only the latest choice and waits for its exact receipt', async () => {
+  const f = fixture(); f.store.activateScope('conversation', 'a'); const read = f.requests.at(-1);
+  f.store.setProfileForScope('conversation', 'a', { ...model, model: 'first-choice' });
+  const submission = f.store.setProfileForScope('conversation', 'a', model);
+  let result = 'waiting';
+  const waiting = f.store.awaitSavedForScope('conversation', 'a').then(() => { result = 'saved'; }, () => { result = 'rejected'; });
+  f.reply(read, snapshot('a', null, 1));
+  const write = f.requests.at(-1);
+  assert.equal(write.id, submission);
+  assert.equal(write.payload.model, model.model);
+  assert.equal(write.payload.expectedRevision, 'etag-a-1');
+  await nextTurn(); assert.equal(result, 'waiting');
+  f.reply(write, { ...snapshot('a', undefined, 2), outcome: 'committed' });
+  await waiting; assert.equal(result, 'saved');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 1);
+});
+
+test('discard of a failed unsent choice clears its waiter without letting the old read authorize a later draft', async () => {
+  const f = fixture(); f.store.activateScope('conversation', 'a'); const oldRead = f.requests.at(-1), timeout = f.timers.at(-1);
+  f.store.setProfileForScope('conversation', 'a', { ...model, model: 'abandoned-choice' });
+  failRead(f, oldRead, timeout, 'transport-error');
+  f.store.discardPending('conversation', 'a');
+  await f.store.awaitSavedForScope('conversation', 'a');
+  assert.equal(f.store.pendingFor('conversation', 'a'), undefined);
+  f.store.setProfileForScope('conversation', 'a', model); const newRead = f.requests.at(-1);
+  f.reply(oldRead, snapshot('a', null, 99)); timeout();
+  assert.equal(f.store.pendingFor('conversation', 'a').status, 'draft');
+  assert.equal(f.store.readingFor('conversation', 'a'), true);
+  f.reply(newRead, snapshot('a', null, 1)); const write = f.requests.at(-1);
+  f.reply(write, { ...snapshot('a', undefined, 2), outcome: 'committed' });
+  await f.store.awaitSavedForScope('conversation', 'a');
+  assert.equal(f.store.confirmedFor('conversation', 'a').profile.model, model.model);
+});
 
 test('失效编辑会话的重读失败后显式重连，解除发送等待且不重放旧写入', async () => {
   const f = fixture(); f.read('a'); choose(f, 'a', 'high');
@@ -315,6 +465,68 @@ function composerSubmit(f) {
   });
   return { ...module.exports, sent };
 }
+
+for (const navigate of [false, true]) for (const failure of readFailures) test(`production Composer releases Send after coalesced initial ${failure}${navigate ? ' across a scope switch' : ''}`, async () => {
+  const f = fixture();
+  f.client.currentConversationId = 'a';
+  const deactivateA = f.store.activateScope('conversation', 'a');
+  const read = f.requests.at(-1), timeout = f.timers.at(-1);
+  f.store.setProfileForScope('conversation', 'a', model);
+  const composer = composerSubmit(f);
+  let finished = false;
+  const submission = composer.submit().then(() => { finished = true; });
+  assert.equal(composer.savingSessionSelection.value, true);
+  if (navigate) {
+    deactivateA();
+    f.client.currentConversationId = 'b';
+    f.store.activateScope('conversation', 'b'); f.reply(f.requests.at(-1), snapshot('b', null, 1));
+    assert.equal(composer.savingSessionSelection.value, false);
+    await composer.submit();
+    assert.equal(composer.sent.length, 1);
+    assert.equal(composer.sent[0].conversationId, 'b');
+  }
+  failRead(f, read, timeout, failure);
+  await nextTurn();
+  assert.equal(finished, true, 'the original Send action must finish without manual recovery');
+  await submission;
+  f.client.currentConversationId = 'a';
+  assert.equal(composer.savingSessionSelection.value, false, 'returning to the origin cannot leave its Send guard latched');
+  assert.ok(f.store.errorFor('conversation', 'a'));
+  assert.equal(composer.sent.length, navigate ? 1 : 0, 'failed model preparation cannot send stale settings');
+  f.store.discardPending('conversation', 'a');
+  f.store.refreshScope('conversation', 'a'); f.reply(f.requests.at(-1), snapshot('a', null, 2));
+  await composer.submit();
+  assert.equal(composer.sent.at(-1).conversationId, 'a');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 0);
+});
+
+test('superseded initial authority read settles the inactive origin Send without adopting or replaying its draft', async () => {
+  const f = fixture(); f.client.currentConversationId = 'a';
+  const deactivateA = f.store.activateScope('conversation', 'a'), firstRead = f.requests.at(-1);
+  f.store.setProfileForScope('conversation', 'a', model);
+  const composer = composerSubmit(f);
+  let finished = false;
+  const submission = composer.submit().then(() => { finished = true; });
+  deactivateA(); f.client.currentConversationId = 'b';
+  f.store.activateScope('conversation', 'b'); const latestRead = f.requests.at(-1);
+  f.reply(firstRead, snapshot('a', null, 1));
+  await nextTurn();
+  assert.equal(finished, true, 'a consumed but superseded initial read cannot strand the origin Send');
+  await submission;
+  assert.equal(f.store.authorityId, '', 'only the latest root adoption may establish authority');
+  assert.equal(f.store.confirmedFor('conversation', 'a'), undefined);
+  assert.equal(f.store.pendingFor('conversation', 'a').profile.model, model.model);
+  f.reply(latestRead, snapshot('b', null, 1));
+  assert.equal(f.store.authorityId, 'root-a');
+  await composer.submit(); assert.equal(composer.sent[0].conversationId, 'b');
+  f.client.currentConversationId = 'a'; assert.equal(composer.savingSessionSelection.value, false);
+  f.store.retryPending('conversation', 'a'); const recovery = f.requests.at(-1);
+  assert.equal(recovery.payload.renewSession, true);
+  f.reply(recovery, snapshot('a', null, 2));
+  assert.equal(f.store.detachedFor('conversation', 'a').profile.model, model.model);
+  await composer.submit(); assert.equal(composer.sent[1].conversationId, 'a');
+  assert.equal(f.requests.filter(request => request.type === protocol.BridgeMessageType.ModelProfileScopeSet).length, 0);
+});
 
 test('review scope production Composer submit waits only origin conversation; navigation and failure remain visible', async () => {
   const f = fixture(); f.read('a'); f.read('b');
