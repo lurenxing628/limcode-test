@@ -4,7 +4,7 @@
 
 - 上游：`https://github.com/Lianues/unified-llm-provider`，许可证 MIT。
 - 基础发布：0.1.37，源码提交 `7857da99d5faec0865b8a402eb9c9d828f87b114`（上游 main，已含 schema 属性名误删、tools 非数组两个修复）。
-- 本地构建：0.1.37-limcode.7，内容如下。
+- 本地构建：0.1.37-limcode.8，内容如下。
 - 完整源码分支已发布在 https://github.com/lurenxing628/unified-llm-provider/tree/limcode/provider-fixes （本目录的补丁即该分支相对基础提交的差异）。
 
 limcode.2 带来的内容（保持不变）：
@@ -52,6 +52,11 @@ limcode.7 新增的修复（每项在源码注释和测试里写明了官方依�
 - 流里已经发出过错误块（上游错误事件、非 JSON 数据、解码失败、格式适配器自己的错误块）时，不再调用 `finalizeStream`，不会在错误之后补发待定的工具调用、截断错误或签名信封。依据 OpenRouter errors-and-debugging：中途错误块同时带顶层 `error` 和 `finish_reason: "error"`，“The stream is terminated after this event”。
 - Responses：删除走不到的 `response.incomplete` 原生解码分支。response 层把事件名或 type 含 incomplete 的 SSE 事件当作上游错误，在格式适配器之前就返回 `stream_error`；保留这一行为，与 LimCode WebSocket 原生会话一致（只有 WebSocket 上的 steered 边界不算失败，其余 incomplete 按失败处理）。OpenAI 对该事件的定义是 “emitted when a response finishes as incomplete”。
 - OpenAI 兼容格式：`finish_reason:"length"` 截断造成的工具参数错误（流式和非流式）带 `retryable:false`。依据 Chat Completions `finish_reason`：“`length` if the maximum number of tokens specified in the request was reached”，原样重发会在同一上限处再次截断。
+
+limcode.8 新增 HTTP 原生完成项证据：
+- `response.output_item.done` 明确输出完成正文、推理与签名及其 response/item 身份；推理项在这里闭合。
+- `response.completed` 提供逐项完成事实，只有终态携带正文的响应也能进入同一持久化路径。
+- 保留迟到完成事件自己的 response 身份；普通解码没有新增完成事实。
 
 文件与命令：
 - `unified-llm-provider.patch`：相对基础提交的完整源码与测试差异，不直接作用于依赖安装目录。

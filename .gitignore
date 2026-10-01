@@ -44,6 +44,14 @@ docs/architecture/*
 !/tests/webviewLocalResources.test.cjs
 !/tests/reliable-kernel/
 /tests/reliable-kernel/*
+!/tests/reliable-kernel/historical-context-handles.test.mjs
+!/tests/reliable-kernel/historical-process-handle-card.test.mjs
+!/tests/reliable-kernel/compression-handle-freeze.test.mjs
+!/tests/reliable-kernel/fork-attachment-handle-reservations.test.mjs
+!/tests/reliable-kernel/fork-context-handle-reservations.test.mjs
+!/tests/reliable-kernel/fork-handle-merge-closure.test.mjs
+!/tests/reliable-kernel/native-http-context-completeness.test.mjs
+!/tests/reliable-kernel/historical-compression-handle-evidence.test.mjs
 !/tests/reliable-kernel/composer-attachment-authority.test.mjs
 !/tests/reliable-kernel/conversation-owner-release.test.mjs
 !/tests/reliable-kernel/diagnostic-inspection-progress.test.mjs

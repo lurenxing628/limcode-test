@@ -2,6 +2,10 @@ import { createHash } from 'node:crypto';
 import type { AttachmentCatalogEntry } from '../../shared/protocol';
 import { normalizeAttachmentCatalog } from './attachmentCatalog';
 import type { ModelHandleEntry } from './modelHandleCatalog';
+import { ContentAddressedStore } from './contentAddressedStore';
+import { RootAuthority } from './rootAuthority';
+import { frozenAttachmentError, readFrozenConversationAttachmentReservations,
+  type FrozenConversationAttachmentReservations } from './frozenConversationAttachmentHandles';
 import { DOMAIN_REPOSITORIES, savepoint, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -13,12 +17,15 @@ export interface ConversationAttachmentHandleProjection {
 /** Stable Conversation-scoped model handles. Canonical Attachment identity never leaves Runtime. */
 export class ConversationAttachmentHandleRegistry {
   private readonly now: () => string;
+  private readonly contentStore: ContentAddressedStore;
 
   public constructor(
     private readonly database: RuntimeDatabase,
-    options: { now?: () => string } = {}
+    options: { now?: () => string; contentStore?: ContentAddressedStore } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
+    this.contentStore = options.contentStore ?? new ContentAddressedStore(
+      new RootAuthority(() => database.binding.paths.dataRootPath), database.binding);
   }
 
   public async ensure(
@@ -27,6 +34,8 @@ export class ConversationAttachmentHandleRegistry {
   ): Promise<ConversationAttachmentHandleProjection> {
     const conversationId = requireText(conversationIdInput, 'conversationId');
     const catalog = normalizeAttachmentCatalog(catalogInput, 'attachmentCatalog');
+    const frozen = await readFrozenConversationAttachmentReservations(this.database, this.contentStore, conversationId);
+    await this.restoreFrozenReservations(conversationId, frozen);
     if (catalog.length === 0) return { entries: [] };
 
     const observed = await this.database.snapshot([
@@ -117,8 +126,16 @@ export class ConversationAttachmentHandleRegistry {
   ): Promise<ConversationAttachmentHandleProjection> {
     const conversationId = requireText(conversationIdInput, 'conversationId');
     const catalog = normalizeAttachmentCatalog(catalogInput, 'attachmentCatalog');
-    if (catalog.length === 0) return { entries: [] };
+    const frozen = await readFrozenConversationAttachmentReservations(this.database, this.contentStore, conversationId);
     const links = validateLinks(await this.readConversationLinks(conversationId), conversationId);
+    assertFrozenReservationsAgree(links, frozen.entries);
+    for (const entry of frozen.entries) {
+      if (!links.has(entry.target)) links.set(entry.target, {
+        id: conversationAttachmentHandleLinkId(conversationId, entry.target), conversation_id: conversationId,
+        attachment_id: entry.target, handle_seq: BigInt(entry.ref.slice(1))
+      });
+    }
+    if (catalog.length === 0) return { entries: [] };
     let nextSequence = [...links.values()].reduce((highest, link) => {
       const sequence = requirePositiveBigInt(link.handle_seq, 'ConversationAttachmentHandleLink.handle_seq');
       return sequence > highest ? sequence : highest;
@@ -145,6 +162,54 @@ export class ConversationAttachmentHandleRegistry {
     return listAllDomainRows(this.database, 'ConversationAttachmentHandleLink', {
       conversation_id: conversationId
     });
+  }
+
+  /** Recover exact published addresses before any new allocation, including an empty visible set. */
+  private async restoreFrozenReservations(conversationId: string, frozen: FrozenConversationAttachmentReservations): Promise<void> {
+    if (frozen.entries.length === 0) return;
+    const links = validateLinks(await this.readConversationLinks(conversationId), conversationId);
+    assertFrozenReservationsAgree(links, frozen.entries);
+    const missing = frozen.entries.filter(entry => !links.has(entry.target));
+    if (missing.length === 0) return;
+    const createdAt = requireText(frozen.createdAt, 'Frozen fork creation time');
+    const repository = DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink');
+    await this.database.transaction([
+      DOMAIN_REPOSITORIES.domain('Conversation').assert(conversationId, {}),
+      ...frozen.assertions,
+      ...missing.flatMap((entry, index) => {
+        const attachment = frozen.attachments.get(entry.target)!;
+        const linkId = conversationAttachmentHandleLinkId(conversationId, entry.target);
+        const sequence = BigInt(entry.ref.slice(1));
+        return [
+          DOMAIN_REPOSITORIES.domain('Attachment').assert(entry.target, {
+            sha256: attachment.sha256, byte_length: attachment.byte_length, mime_type: attachment.mime_type,
+            name: attachment.name, content_object_id: attachment.content_object_id
+          }),
+          savepoint(`restore_attachment_handle_${index}`, [repository.insert({ id: linkId,
+            conversation_id: conversationId, attachment_id: entry.target, handle_seq: sequence, created_at: createdAt
+          })], { kind: 'rollback-and-continue-on-unique', constraints: [
+            { domain: 'ConversationAttachmentHandleLink', columns: ['id'] },
+            { domain: 'ConversationAttachmentHandleLink', columns: ['conversation_id', 'attachment_id'] }
+          ] }),
+          repository.assert(linkId, { conversation_id: conversationId, attachment_id: entry.target, handle_seq: sequence })
+        ];
+      })
+    ]);
+    // A concurrent restore is idempotent; any concurrently assigned different address remains fatal.
+    assertFrozenReservationsAgree(validateLinks(await this.readConversationLinks(conversationId), conversationId), frozen.entries);
+  }
+}
+
+function assertFrozenReservationsAgree(links: ReadonlyMap<string, DomainRow>, entries: readonly ModelHandleEntry[]): void {
+  const bySequence = new Map([...links.values()].map(link => [String(link.handle_seq), String(link.attachment_id)]));
+  for (const entry of entries) {
+    const sequence = BigInt(entry.ref.slice(1));
+    const link = links.get(entry.target);
+    const target = bySequence.get(sequence.toString());
+    if ((link && requirePositiveBigInt(link.handle_seq, 'ConversationAttachmentHandleLink.handle_seq') !== sequence)
+      || (target !== undefined && target !== entry.target)) {
+      throw frozenAttachmentError(`Frozen attachment reference ${entry.ref} conflicts with the Conversation registry.`);
+    }
   }
 }
 

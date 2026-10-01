@@ -17,7 +17,8 @@ import {
 } from './attachmentObservations';
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
-import { mergeConversationChildHandles, readConversationChildHandles } from './conversationChildHandles';
+import { readConversationContextHandleCatalog } from './conversationChildHandles';
+import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
@@ -71,13 +72,20 @@ import {
   type FullRequestPlanningBudget,
   type StoredModelFacingContextItem
 } from './modelFacingContextProjection';
-import { buildModelHandleCatalog, normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
+import {
+  buildModelHandleCatalog,
+  mergeModelHandleCatalogs,
+  normalizeModelHandleCatalog,
+  reconcileHistoricalModelHandleCatalogs,
+  type ModelHandleCatalog
+} from './modelHandleCatalog';
 import {
   ModelRequestPreflightError,
   ModelProviderControlPlane,
   ProviderTransientError,
   restoredProviderRequestFailure,
   modelRequestIdFor,
+  type FullProviderContextItem,
   type FullRequestProviderAdapter
 } from './modelProviderControlPlane';
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
@@ -399,14 +407,14 @@ export class ReliableContextCompressionCoordinator {
         materialized.segments,
         typeof currentInputRecord?.messageRevisionId === 'string' ? [currentInputRecord.messageRevisionId] : []);
       const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(conversationId, attachmentCatalogState.catalog);
-      const persistentHandles = mergeConversationChildHandles(
-        await readConversationChildHandles(this.database, this.contentStore, conversationId),
-        normalizeModelHandleCatalog(source.recipe.modelHandleCatalog).entries
-      );
+      const persistentHandles = reconcileHistoricalModelHandleCatalogs([
+        await readConversationContextHandleCatalog(this.database, this.contentStore, conversationId),
+        normalizeModelHandleCatalog(source.recipe.modelHandleCatalog)
+      ]);
       const modelHandleCatalog = buildModelHandleCatalog([
         ...materialized.segments.map(segment => segment.content.toString('utf8')),
         attachmentCatalogState.catalog
-      ], [...attachmentHandles.entries, ...persistentHandles]);
+      ], mergeModelHandleCatalogs({ entries: attachmentHandles.entries }, persistentHandles));
       previewRecipe = requireRecord(normalizePlainJson({ ...source.recipe, attachmentCatalogState, modelHandleCatalog },
         'Provider context recovery preview recipe'), 'Provider context recovery preview recipe');
     }
@@ -662,13 +670,18 @@ export class ReliableContextCompressionCoordinator {
       frozen.conversationId,
       fullAttachmentCatalogState.catalog
     );
-    const childHandles = mergeConversationChildHandles(
-      await readConversationChildHandles(this.database, this.contentStore, frozen.conversationId),
-      normalizeModelHandleCatalog(command.modelHandleCatalog).entries
+    const historicalHandles = await readConversationContextHandleCatalog(
+      this.database, this.contentStore, frozen.conversationId
     );
-    const fullModelHandleCatalog = buildModelHandleCatalog(
+    const commandHandles = normalizeModelHandleCatalog(command.modelHandleCatalog);
+    // A rejected request can predate the persistent identity contract. Its original recipe stays
+    // frozen; only this new compression request adopts the reconciled, unambiguous identity map.
+    const contextHandles = command.providerContextOverflowRequestId
+      ? reconcileHistoricalModelHandleCatalogs([historicalHandles, commandHandles])
+      : mergeModelHandleCatalogs(historicalHandles, commandHandles);
+    let fullModelHandleCatalog = buildModelHandleCatalog(
       semanticMaterialized.segments.map(segment => Buffer.from(segment.content).toString('utf8')),
-      [...fullAttachmentHandles.entries, ...childHandles]
+      mergeModelHandleCatalogs({ entries: fullAttachmentHandles.entries }, contextHandles)
     );
     if (
       policy.methodKind === 'provider_native' && attempt.nativeKind === 'openai_responses'
@@ -840,6 +853,29 @@ export class ReliableContextCompressionCoordinator {
     );
     let request = await this.optionalDomain('ModelRequest', expectedModelRequestId);
     if (!request) {
+      // ModelProvider expands the selected source again when it materializes this request. Freeze
+      // the identities of that exact source before creating the immutable Recipe, including objects
+      // hidden behind an older summary or native state. Replaying an existing request keeps its own
+      // original identity scope and never replaces its frozen Catalog with today's global state.
+      const sourceContext: FullProviderContextItem[] = semanticMaterialized.segments
+        .slice(0, sourceSegmentCount).map(segment => ({
+          segmentId: segment.segmentId,
+          segmentKind: segment.segmentKind,
+          messageRole: segment.messageRole,
+          ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
+          contentType: segment.contentObject.content_type,
+          content: segment.content.toString('utf8')
+        }));
+      const handleSource = policy.methodKind !== 'provider_native' || command.sourceReplay
+        ? await expandTextCompressionSources(this.database, this.contentStore, frozen.conversationId,
+            sourceContext, command.sourceReplay ? { sourceReplay: command.sourceReplay } : {})
+        : sourceContext;
+      const expandedCatalog = buildModelHandleCatalog(handleSource.map(item => item.content), fullModelHandleCatalog);
+      // F identities belong to ConversationAttachmentHandleRegistry. Source expansion can discover
+      // their old metadata, but it cannot allocate another actionable attachment address here.
+      const attachmentRefs = new Map(fullAttachmentHandles.entries.map(entry => [entry.target, entry.ref]));
+      fullModelHandleCatalog = { ...expandedCatalog, entries: expandedCatalog.entries.filter(entry =>
+        entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
       // An explicitly empty current tool list must not resurrect tools from an earlier model round.
       const tools = policy.methodKind !== 'provider_native' ? []
         : command.tools !== undefined ? normalizeCompressionToolDefinitions(command.tools, 'Compression command.tools')
@@ -873,9 +909,7 @@ export class ReliableContextCompressionCoordinator {
           ...(policy.methodKind === 'provider_native' ? { tools } : {}),
           ...(nativeRebase ? { nativeRebase } : {}),
           attachmentCatalogState: sourceAttachmentCatalogState,
-          ...(fullModelHandleCatalog.entries.length > 0
-            ? { modelHandleCatalog: fullModelHandleCatalog }
-            : {}),
+          modelHandleCatalog: fullModelHandleCatalog,
           ...(attachmentObservationProfileSha256
             ? {
                 attachmentObservationProfileSha256,

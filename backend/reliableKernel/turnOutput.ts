@@ -1,7 +1,9 @@
 import { createHash } from 'node:crypto';
-import { ContentAddressedStore } from './contentAddressedStore';
+import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { listAllDomainRows } from './repositoryPagination';
 import {
   estimateStoredMessageContentTokens,
   providerPromptTokens,
@@ -174,7 +176,7 @@ export class TurnOutputControlPlane {
   public async appendNativeAssistantItem(input: {
     turnId: string;
     modelRequestId: string;
-    /** Stable provider item identity (global output ordinal); replay of the same item deduplicates. */
+    /** Stable response/item key; replay of the same immutable item deduplicates. */
     itemKey: string;
     content: string | Uint8Array;
     /**
@@ -419,6 +421,7 @@ export class TurnOutputControlPlane {
     if (existingRevision) {
       return this.replay(ids, identity.id, modelRequestId);
     }
+    await this.assertNativeAggregateItemsEnteredContext(turnId, modelRequestId, ids.messageId, input.content);
     const turn = await this.requireExisting('Turn', turnId);
     if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
@@ -475,6 +478,84 @@ export class TurnOutputControlPlane {
     }
   }
 
+  /** Failed partial output updates the request's one Message; unclosed output never enters Context. */
+  public async appendNativeAssistantPartialAggregate(input: {
+    turnId: string;
+    modelRequestId: string;
+    sourceKey: string;
+    content: string | Uint8Array;
+    contentType?: string;
+  }): Promise<AssistantMessageCommit> {
+    return this.appendNativeAssistantItem({
+      ...input,
+      itemKey: `failed-partial:${requireText(input.sourceKey, 'sourceKey')}`,
+      cumulativeContent: input.content,
+      contextDisposition: 'exclude'
+    });
+  }
+
+  /** Message existence proves only some item was stored. Every final item needs its own proof. */
+  private async assertNativeAggregateItemsEnteredContext(
+    turnId: string,
+    modelRequestId: string,
+    messageId: string,
+    content: string | Uint8Array
+  ): Promise<void> {
+    const aggregate = nativeAssistantMessageParts(JSON.parse(typeof content === 'string'
+      ? content : Buffer.from(content).toString('utf8')));
+    const revisions = (await listAllDomainRows(this.database, 'MessageRevision', { message_id: messageId }))
+      .sort((left, right) => Number(BigInt(String(left.revision_seq)) - BigInt(String(right.revision_seq))));
+    const projectionIds = new Set([assistantMessageRevisionIdFor(turnId, modelRequestId)]);
+    const callCounts = new Map<string, number>();
+    const proofs = new Map<string, { revision: DomainRow; part: Record<string, PlainJsonValue> }>();
+    for (const revision of revisions) {
+      if (projectionIds.has(String(revision.id))) continue;
+      const metadata = await this.requireExisting('ContentObject', requireId(revision.content_object_id, 'MessageRevision.content_object_id'));
+      const itemParts = nativeAssistantMessageParts(JSON.parse((await this.contentStore.read(metadata as unknown as ContentObjectMetadata)).toString('utf8')));
+      if (itemParts.length !== 1) continue;
+      const part = itemParts[0]!;
+      if (!nativeRecord(part.outputItem)?.providerResponseId) continue;
+      const reference = nativeAssistantOutputReference(part);
+      const call = nativeRecord(part.functionCall);
+      const callIndex = callCounts.get(reference.providerResponseId) ?? 0;
+      const itemKey = call ? `call:${reference.providerResponseId}:${callIndex}`
+        : `content:${reference.providerResponseId}:${reference.ordinal}`;
+      if (revision.id !== nativeItemRevisionId(turnId, modelRequestId, itemKey)) continue;
+      if (call) callCounts.set(reference.providerResponseId, callIndex + 1);
+      projectionIds.add(nativeCumulativeRevisionId(turnId, modelRequestId, itemKey));
+      const key = nativeAssistantPartIdentity(part);
+      if (proofs.has(key)) throw new Error(`Native output item ${reference.id} has duplicate immutable proofs.`);
+      proofs.set(key, { revision, part });
+    }
+    const sources = await listAllDomainRows(this.database, 'ToolCallSourceLink', { model_request_id: modelRequestId });
+    const identifiedAggregate = aggregate.map(part => {
+      if (nativeRecord(part.outputItem)?.providerResponseId) return part;
+      // Some frozen aggregate projections omit item metadata. Exact agreement with one immutable
+      // proof can establish their identity; missing/ambiguous bodies never qualify.
+      const matches = [...proofs.values()].filter(proof => nativeAssistantSemanticPart(proof.part) === nativeAssistantSemanticPart(part));
+      if (matches.length !== 1) throw new Error('Native completed output without metadata has no unique immutable item proof.');
+      return { ...part, outputItem: matches[0]!.part.outputItem! };
+    });
+    for (const parts of nativeAssistantPartGroups(identifiedAggregate)) {
+      const part = normalizeNativeAssistantCompletedItem({ role: 'model', parts });
+      if (!part) continue;
+      const reference = nativeAssistantOutputReference(part);
+      const proof = proofs.get(nativeAssistantPartIdentity(part));
+      if (!proof || nativeAssistantComparablePart(proof.part) !== nativeAssistantComparablePart(part)) {
+        throw new Error(`Native completed output item ${reference.id} has no matching immutable item proof.`);
+      }
+      const source = nativeRecord(part.functionCall)
+        ? sources.find(row => row.provider_call_id === part.id)
+        : undefined;
+      const contextSources = await listAllDomainRows(this.database, 'ContextSegmentSource', source
+        ? { source_kind: 'tool_call', source_id: source.tool_call_id }
+        : { source_kind: 'message_revision', source_id: proof.revision.id });
+      if (contextSources.length === 0) {
+        throw new Error(`Native completed output item ${reference.id} has not entered Context.`);
+      }
+    }
+  }
+
   private async replay(
     ids: ReturnType<typeof outputIds>,
     expectedContentObjectId: string,
@@ -525,6 +606,83 @@ export class TurnOutputControlPlane {
 
 export function assistantMessageIdFor(turnId: string, sourceKey: string): string {
   return outputIds(requireId(turnId, 'turnId'), requireText(sourceKey, 'sourceKey')).messageId;
+}
+
+/** Stable response/item identity; response-local fallback ids are never shared by two responses. */
+export function nativeAssistantPartIdentity(part: Record<string, unknown>): string {
+  const reference = nativeAssistantOutputReference(part);
+  return JSON.stringify([reference.providerResponseId, reference.id, nativeRecord(part.functionCall) ? 'call' : 'content']);
+}
+
+/** A raw item's multiple text/summary blocks have one immutable semantic body. */
+export function normalizeNativeAssistantCompletedItem(value: unknown): Record<string, PlainJsonValue> | undefined {
+  const parts = nativeAssistantMessageParts(value);
+  if (parts.length === 0) return undefined;
+  const first = parts[0]!;
+  const identity = nativeAssistantPartIdentity(first);
+  if (parts.some(part => nativeAssistantPartIdentity(part) !== identity)) {
+    throw new Error('Native completed item contains more than one output identity.');
+  }
+  if (parts.every(part => typeof part.text === 'string')) {
+    const thought = first.thought === true;
+    if (parts.some(part => (part.thought === true) !== thought)) throw new Error('Native item mixes visible text and reasoning.');
+    const signatures = [...new Set(parts.flatMap(part => typeof part.thoughtSignature === 'string' ? [part.thoughtSignature] : []))];
+    if (signatures.length > 1) throw new Error('Native item has conflicting reasoning signatures.');
+    return normalizePlainJson({ text: parts.map(part => part.text).join(''),
+      ...(thought ? { thought: true } : {}),
+      ...(signatures[0] ? { thoughtSignature: signatures[0] } : {}),
+      outputItem: first.outputItem
+    }, 'Native completed text item') as Record<string, PlainJsonValue>;
+  }
+  if (parts.length !== 1) throw new Error('Native completed non-text item contains multiple parts.');
+  return first;
+}
+
+function nativeAssistantMessageParts(value: unknown): Array<Record<string, PlainJsonValue>> {
+  const record = nativeRecord(value);
+  if (!record || record.role !== 'model' || !Array.isArray(record.parts)) throw new TypeError('Native assistant content is not a model MessageContent.');
+  return record.parts.map(part => {
+    if (!nativeRecord(part)) throw new TypeError('Native assistant part must be an object.');
+    return normalizePlainJson(part, 'Native assistant part') as Record<string, PlainJsonValue>;
+  });
+}
+
+function nativeAssistantPartGroups(parts: Array<Record<string, PlainJsonValue>>): Array<Array<Record<string, PlainJsonValue>>> {
+  const groups = new Map<string, Array<Record<string, PlainJsonValue>>>();
+  for (const part of parts) {
+    const key = nativeAssistantPartIdentity(part);
+    const group = groups.get(key) ?? [];
+    group.push(part);
+    groups.set(key, group);
+  }
+  return [...groups.values()];
+}
+
+export function nativeAssistantComparablePart(part: Record<string, PlainJsonValue>): string {
+  // WS stream ordinals were lifted across responses while terminal ordinals remained local.
+  // Response + item id owns identity; keep frozen ordinals but do not reinterpret them as ids.
+  const reference = nativeRecord(part.outputItem)!;
+  const { ordinal: _ordinal, ...identity } = reference;
+  const { thoughtDurationMs: _thoughtDurationMs, ...semantic } = part;
+  return canonicalPlainJson({ ...semantic, outputItem: identity }, 'Native immutable item comparison');
+}
+
+function nativeAssistantSemanticPart(part: Record<string, PlainJsonValue>): string {
+  const { outputItem: _outputItem, thoughtDurationMs: _thoughtDurationMs, ...semantic } = part;
+  return canonicalPlainJson(semantic, 'Native semantic item comparison');
+}
+
+function nativeAssistantOutputReference(part: Record<string, unknown>): { id: string; ordinal: number; providerResponseId: string } {
+  const reference = nativeRecord(part.outputItem);
+  if (!reference || typeof reference.ordinal !== 'number' || !Number.isSafeInteger(reference.ordinal) || reference.ordinal < 0) {
+    throw new TypeError('Native output part requires a stable ordinal.');
+  }
+  return { id: requireId(reference.id, 'Native output item id'), ordinal: reference.ordinal,
+    providerResponseId: requireId(reference.providerResponseId, 'Native output response id') };
+}
+
+function nativeRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
 }
 
 /** Deterministic per-item revision identity of the one aggregate assistant Message of a ModelRequest. */

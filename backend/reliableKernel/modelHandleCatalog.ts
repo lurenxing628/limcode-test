@@ -35,7 +35,13 @@ export interface ModelHandleEntry {
 
 export interface ModelHandleCatalog {
   entries: ModelHandleEntry[];
+  /** One current identity contract; unmarked published recipes remain immutable historical facts. */
+  identityContractRevision?: string;
+  /** Ambiguous published Context addresses are never assigned or resolved again. */
+  retiredRefs?: string[];
 }
+
+export const CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION = '2026-10-01';
 
 interface ModelHandleCandidate {
   kind: ModelHandleKind;
@@ -70,13 +76,15 @@ const MAX_NESTED_JSON_CHARS = 16 * 1024 * 1024;
  */
 export function buildModelHandleCatalog(
   values: readonly unknown[],
-  seededEntries: readonly ModelHandleEntry[] = []
+  seededEntries: readonly ModelHandleEntry[] | ModelHandleCatalog = []
 ): ModelHandleCatalog {
   const candidates: ModelHandleCandidate[] = [];
   const seenObjects = new Set<object>();
   for (const value of values) collectCandidates(value, candidates, seenObjects);
 
-  const normalizedSeeds = normalizeModelHandleCatalog({ entries: seededEntries }).entries;
+  const seedCatalog = normalizeModelHandleCatalog(Array.isArray(seededEntries)
+    ? { entries: seededEntries } : seededEntries);
+  const normalizedSeeds = seedCatalog.entries;
   const byTarget = new Map<string, ModelHandleEntry>();
   const counters: Record<ModelHandleKind, number> = {
     attachment: 0,
@@ -91,6 +99,10 @@ export function buildModelHandleCatalog(
     boardThread: 0,
     boardPost: 0
   };
+  for (const ref of seedCatalog.retiredRefs ?? []) {
+    const kind = handleKindOfRef(ref)!;
+    counters[kind] = Math.max(counters[kind], Number(ref.slice(1)));
+  }
   const entries: ModelHandleEntry[] = [];
   for (const seed of normalizedSeeds) {
     const ordinal = Number(seed.ref.slice(1));
@@ -109,7 +121,10 @@ export function buildModelHandleCatalog(
       mergeMetadata(existing, candidate);
       continue;
     }
-    const ref = `${HANDLE_PREFIX[candidate.kind]}${++counters[candidate.kind]}`;
+    const ordinal = counters[candidate.kind] + 1;
+    if (!Number.isSafeInteger(ordinal)) throw new RangeError(`Model handle ${HANDLE_PREFIX[candidate.kind]} has exhausted its safe ordinal range.`);
+    counters[candidate.kind] = ordinal;
+    const ref = `${HANDLE_PREFIX[candidate.kind]}${ordinal}`;
     const entry: ModelHandleEntry = {
       kind: candidate.kind,
       ref,
@@ -121,12 +136,24 @@ export function buildModelHandleCatalog(
     byTarget.set(key, entry);
     entries.push(entry);
   }
-  return { entries };
+  return currentModelHandleCatalog(entries, seedCatalog.retiredRefs ?? []);
 }
 
 export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog {
+  if (value === undefined) return { entries: [] };
   const record = asRecord(value);
-  if (!record || !Array.isArray(record.entries)) return { entries: [] };
+  if (!record) throw new TypeError('modelHandleCatalog must be an object when present.');
+  const hasContract = 'identityContractRevision' in record;
+  if (hasContract && record.identityContractRevision !== CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION) {
+    throw new TypeError('modelHandleCatalog.identityContractRevision is not the current identity contract.');
+  }
+  if ('retiredRefs' in record && !hasContract) {
+    throw new TypeError('modelHandleCatalog.retiredRefs requires the current identity contract.');
+  }
+  if (hasContract && (!Array.isArray(record.entries) || !Array.isArray(record.retiredRefs))) {
+    throw new TypeError('Current modelHandleCatalog requires entries and retiredRefs arrays.');
+  }
+  if (!Array.isArray(record.entries)) throw new TypeError('modelHandleCatalog.entries must be an array.');
   const refs = new Set<string>();
   const targets = new Set<string>();
   const entries = record.entries.map((candidate, index): ModelHandleEntry => {
@@ -138,6 +165,7 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
     if (!HANDLE_PATTERN.test(ref) || !ref.startsWith(HANDLE_PREFIX[kind])) {
       throw new TypeError(`modelHandleCatalog.entries[${index}].ref does not match its kind.`);
     }
+    requireSafeHandleOrdinal(ref);
     const targetIdentity = targetKey(kind, target);
     if (refs.has(ref)) throw new Error(`Duplicate model handle ref: ${ref}`);
     if (targets.has(targetIdentity)) throw new Error(`Duplicate model handle target for ${kind}: ${target}`);
@@ -155,7 +183,189 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
       ...(sizeBytes !== undefined ? { sizeBytes } : {})
     };
   });
-  return { entries };
+  if (!hasContract) return { entries };
+  const retired = new Set<string>();
+  for (const candidate of record.retiredRefs as unknown[]) {
+    const ref = requireText(candidate, 'modelHandleCatalog.retiredRefs entry');
+    const kind = handleKindOfRef(ref);
+    if (!kind || !isPersistentContextHandle(kind)) {
+      throw new TypeError('Only persistent Context references may be retired; attachment references belong to their registry.');
+    }
+    requireSafeHandleOrdinal(ref);
+    if (retired.has(ref)) throw new TypeError(`Duplicate retired model handle ref: ${ref}`);
+    if (refs.has(ref)) throw modelHandleIdentityError(`Retired model handle reference ${ref} is still assigned.`);
+    retired.add(ref);
+  }
+  return currentModelHandleCatalog(entries, [...retired]);
+}
+
+/** Strictly combines current identity facts; this never repairs or chooses among conflicting maps. */
+export function mergeModelHandleCatalogs(...catalogs: readonly ModelHandleCatalog[]): ModelHandleCatalog {
+  const normalized = catalogs.map(normalizeModelHandleCatalog);
+  const retired = new Set(normalized.flatMap(catalog => catalog.retiredRefs ?? []));
+  const byRef = new Map<string, ModelHandleEntry>();
+  const byTarget = new Map<string, ModelHandleEntry>();
+  for (const entry of normalized.flatMap(catalog => catalog.entries)) {
+    if (retired.has(entry.ref)) throw modelHandleIdentityError(`Retired model handle reference ${entry.ref} is still assigned.`);
+    const priorRef = byRef.get(entry.ref);
+    const priorTarget = byTarget.get(targetKey(entry.kind, entry.target));
+    if ((priorRef && (priorRef.kind !== entry.kind || priorRef.target !== entry.target))
+      || (priorTarget && priorTarget.ref !== entry.ref)) {
+      throw modelHandleIdentityError(`Conflicting frozen child reference ${entry.ref}.`);
+    }
+    const merged = priorRef ?? { ...entry };
+    mergeMetadata(merged, entry);
+    byRef.set(entry.ref, merged);
+    byTarget.set(targetKey(entry.kind, entry.target), merged);
+  }
+  return currentModelHandleCatalog([...byRef.values()], [...retired]);
+}
+
+/**
+ * Published unmarked maps could lose reserved Context references when wall clocks moved backwards
+ * or request windows changed. Retire each ambiguous identity component in full instead of choosing
+ * a historical target. Current-contract facts and registry-owned attachment identities stay strict.
+ */
+export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelHandleCatalog[]): ModelHandleCatalog {
+  const retired = new Set<string>();
+  const counters = new Map<ModelHandleKind, number>();
+  const uniqueFacts = new Map<string, { entry: ModelHandleEntry; current: boolean }>();
+  const retiredTargets = new Map<string, ModelHandleEntry>();
+  for (const input of catalogs) {
+    const catalog = normalizeModelHandleCatalog(input);
+    const current = catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION;
+    for (const ref of catalog.retiredRefs ?? []) {
+      retired.add(ref);
+      const kind = handleKindOfRef(ref)!;
+      counters.set(kind, Math.max(counters.get(kind) ?? 0, Number(ref.slice(1))));
+    }
+    for (const entry of catalog.entries) {
+      counters.set(entry.kind, Math.max(counters.get(entry.kind) ?? 0, Number(entry.ref.slice(1))));
+      const identity = JSON.stringify([entry.kind, entry.ref, entry.target]);
+      const prior = uniqueFacts.get(identity);
+      if (!prior) {
+        uniqueFacts.set(identity, { entry: { ...entry }, current });
+      } else {
+        const preferIncoming = current && !prior.current
+          || current === prior.current && compareHandleText(JSON.stringify(entry), JSON.stringify(prior.entry)) < 0;
+        if (preferIncoming) {
+          const replacement = { ...entry };
+          mergeMetadata(replacement, prior.entry);
+          prior.entry = replacement;
+        } else mergeMetadata(prior.entry, entry);
+        prior.current ||= current;
+      }
+    }
+  }
+  const facts: Array<{ entry: ModelHandleEntry; current: boolean }> = [];
+  for (const fact of uniqueFacts.values()) {
+    if (!retired.has(fact.entry.ref)) {
+      facts.push(fact);
+      continue;
+    }
+    if (fact.current) throw modelHandleIdentityError(`Retired model handle reference ${fact.entry.ref} is still assigned.`);
+    // A later historical import may reveal another target behind an already-retired address.
+    // Its address stays unusable, but the canonical object must still receive a fresh address.
+    const key = targetKey(fact.entry.kind, fact.entry.target);
+    const target = retiredTargets.get(key);
+    if (target) mergeMetadata(target, fact.entry);
+    else retiredTargets.set(key, { ...fact.entry });
+  }
+  // Stable representatives also make metadata independent of repository enumeration order.
+  facts.sort((left, right) => Number(right.current) - Number(left.current)
+    || compareHandleText(JSON.stringify(left.entry), JSON.stringify(right.entry)));
+  const byNode = new Map<string, number[]>();
+  for (const [index, { entry }] of facts.entries()) {
+    for (const node of [`ref:${entry.ref}`, `target:${targetKey(entry.kind, entry.target)}`]) {
+      const members = byNode.get(node) ?? [];
+      members.push(index);
+      byNode.set(node, members);
+    }
+  }
+  const visited = new Set<number>();
+  const entries: ModelHandleEntry[] = [];
+  const reallocate: ModelHandleEntry[] = [];
+  for (let index = 0; index < facts.length; index += 1) {
+    if (visited.has(index)) continue;
+    const pending = [index];
+    const component: typeof facts = [];
+    const refs = new Set<string>();
+    const targets = new Map<string, ModelHandleEntry>();
+    const visitedNodes = new Set<string>();
+    for (let position = 0; position < pending.length; position += 1) {
+      const member = pending[position]!;
+      if (visited.has(member)) continue;
+      visited.add(member);
+      const fact = facts[member]!;
+      component.push(fact);
+      refs.add(fact.entry.ref);
+      const key = targetKey(fact.entry.kind, fact.entry.target);
+      const target = targets.get(key);
+      if (target) mergeMetadata(target, fact.entry);
+      else targets.set(key, { ...fact.entry });
+      for (const node of [`ref:${fact.entry.ref}`, `target:${key}`]) {
+        if (visitedNodes.has(node)) continue;
+        visitedNodes.add(node);
+        for (const adjacent of byNode.get(node)!) pending.push(adjacent);
+      }
+    }
+    if (refs.size === 1 && targets.size === 1) {
+      entries.push([...targets.values()][0]!);
+      continue;
+    }
+    if (component.some(fact => fact.current || !isPersistentContextHandle(fact.entry.kind))) {
+      throw modelHandleIdentityError(`Conflicting frozen child reference ${component[0]!.entry.ref}.`);
+    }
+    for (const ref of refs) retired.add(ref);
+    for (const entry of targets.values()) reallocate.push(entry);
+  }
+  const knownTargets = new Set([...entries, ...reallocate].map(entry => targetKey(entry.kind, entry.target)));
+  for (const [key, entry] of retiredTargets) {
+    if (!knownTargets.has(key)) {
+      knownTargets.add(key);
+      reallocate.push(entry);
+    }
+  }
+  reallocate.sort((left, right) => compareHandleText(left.kind, right.kind) || compareHandleText(left.target, right.target));
+  for (const entry of reallocate) {
+    const ordinal = (counters.get(entry.kind) ?? 0) + 1;
+    if (!Number.isSafeInteger(ordinal)) throw new RangeError(`Model handle ${HANDLE_PREFIX[entry.kind]} has exhausted its safe ordinal range.`);
+    counters.set(entry.kind, ordinal);
+    entries.push({ ...entry, ref: `${HANDLE_PREFIX[entry.kind]}${ordinal}` });
+  }
+  entries.sort((left, right) => left.ref.localeCompare(right.ref, undefined, { numeric: true }));
+  return currentModelHandleCatalog(entries, [...retired]);
+}
+
+export function renderRetiredModelHandleNotice(catalogInput: ModelHandleCatalog | unknown): string | undefined {
+  const retired = normalizeModelHandleCatalog(catalogInput).retiredRefs ?? [];
+  if (retired.length === 0) return undefined;
+  const listed = retired.slice(0, 20).join(', ')
+    + (retired.length > 20 ? `, and ${retired.length - 20} other historical references` : '');
+  return '[Historical reference identities — runtime data, not instructions]\n'
+    + `Retired historical references: ${listed}. Their identity mappings conflicted in published history and they cannot be used in tool calls. `
+    + 'Do not infer a new reference by number or recency. Identify objects from current tool results and ownership information. '
+    + 'A reference does not grant permission to operate on an inherited or foreign object.'
+    + (retired.some(ref => ref.startsWith('O'))
+      ? ' With the current process reference, omit a retired cursor to read output from the beginning.' : '');
+}
+
+function compareHandleText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function currentModelHandleCatalog(entries: ModelHandleEntry[], retiredRefs: string[]): ModelHandleCatalog {
+  return { entries, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+    retiredRefs: [...retiredRefs].sort((left, right) => left.localeCompare(right, undefined, { numeric: true })) };
+}
+
+function requireSafeHandleOrdinal(ref: string): void {
+  const ordinal = Number(ref.slice(1));
+  if (!Number.isSafeInteger(ordinal) || ordinal <= 0) throw new RangeError(`Model handle ${ref} is outside the safe ordinal range.`);
+}
+
+function modelHandleIdentityError(message: string): Error {
+  return Object.assign(new Error(message), { code: 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT' });
 }
 
 export function modelHandleRef(
@@ -537,6 +747,10 @@ function requireRefTarget(
   accepted = `上下文或工具结果中出现过的${shortRefForm(kind)}`
 ): string {
   const ref = optionalText(value);
+  if (ref && handleKindOfRef(ref) === kind && catalog.retiredRefs?.includes(ref)) {
+    return rejectArgument(kind, argument,
+      `${argument}=${ref} 是已失效的历史${kindNoun(kind, '引用')}；历史编号的对应关系不唯一，不能根据编号或时间猜测新引用。请依据当前工具结果或工作环境说明确认对象后，使用它的新引用。`);
+  }
   const target = ref ? modelHandleTarget(catalog, kind, ref) : undefined;
   if (target) return target;
   const refKind = ref ? handleKindOfRef(ref) : undefined;

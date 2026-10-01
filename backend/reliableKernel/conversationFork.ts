@@ -17,6 +17,10 @@ import type { ContentAddressedStore } from './contentAddressedStore';
 import { estimateContextSegmentTokens, ReliableContextTokenEstimator } from './contextTokenEstimator';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
+import { NATIVE_CHILD_HANDLE_PROJECTION_EVENT, readConversationContextHandleCatalog } from './conversationChildHandles';
+import { assertForkContextHandleReservations, FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND,
+  captureForkContextHandleFrontier, prepareForkContextHandleReservations, readForkContextHandleReservationEvidence } from './forkContextHandleReservations';
 
 export interface ConversationForkCommand {
   /** Stable user/command identity. Replays with a different shape are rejected. */
@@ -84,7 +88,7 @@ export class ConversationForkControlPlane {
 
   public constructor(
     private readonly database: RuntimeDatabase,
-    contentStore: ContentAddressedStore,
+    private readonly contentStore: ContentAddressedStore,
     options: { now?: () => string } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
@@ -240,6 +244,22 @@ export class ConversationForkControlPlane {
     });
 
     const now = this.timestamp();
+    // A published fork can itself be forked before it sends another request. Restore only proved
+    // frozen F addresses before the snapshot copies its registry, without exposing old attachments.
+    await new ConversationAttachmentHandleRegistry(this.database, { contentStore: this.contentStore, now: this.now })
+      .ensure(command.sourceConversationId, []);
+    // Capture before reading CAS. Transaction assertions reject even a new request/event that
+    // arrived during the reads, so a concurrent Host cannot add addresses outside this snapshot.
+    const handleFrontier = await captureForkContextHandleFrontier(this.database, command.sourceConversationId,
+      NATIVE_CHILD_HANDLE_PROJECTION_EVENT);
+    const sourceReservations = await readForkContextHandleReservationEvidence(this.database, this.contentStore, command.sourceConversationId);
+    const sourceHandleCatalog = await readConversationContextHandleCatalog(this.database, this.contentStore,
+      command.sourceConversationId);
+    const handleReservations = await prepareForkContextHandleReservations({ database: this.database,
+      contentStore: this.contentStore, sourceConversationId: command.sourceConversationId,
+      targetConversationId: ids.targetConversationId, catalog: sourceHandleCatalog,
+      coveredRecipeObjectIds: [...new Set([...handleFrontier.coveredRecipeObjectIds,
+        ...(sourceReservations?.coveredRecipeObjectIds ?? [])])], now });
     const targetRootShape = await resolveForkRootShape(
       this.database,
       this.tokenEstimator,
@@ -350,6 +370,7 @@ export class ConversationForkControlPlane {
           )]
         : []),
       ...transcript.assertions,
+      ...handleFrontier.assertions,
       DOMAIN_REPOSITORIES.domain('AgentConversationLink').assertExactIds(
         { conversation_id: command.sourceConversationId },
         sourceAgentLinks.map((link) => requireId(link.id, 'AgentConversationLink.id'))
@@ -429,6 +450,7 @@ export class ConversationForkControlPlane {
         scope: { conversation_id: ids.targetConversationId }
       })),
       ...transcript.inserts,
+      ...handleReservations.steps,
       ...targetRootShape.nodeSteps,
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
         id: ids.targetRootId,
@@ -557,7 +579,6 @@ export class ConversationForkControlPlane {
       || conversation.id !== ids.targetConversationId
       || root.conversation_id !== ids.targetConversationId
       || head.conversation_id !== ids.targetConversationId
-      || head.root_id !== ids.targetRootId
       || agentLink.conversation_id !== ids.targetConversationId
       || agentLink.agent_id !== command.targetAgentId
       || agentLink.role !== 'default'
@@ -572,6 +593,14 @@ export class ConversationForkControlPlane {
     ) {
       throw new Error(`Conversation fork identity ${command.reuseKey} was replayed with different facts.`);
     }
+    const currentRoot = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').get(requireId(head.root_id, 'Fork replay current head root'))
+    ]);
+    if (requireRow(currentRoot.snapshot[0], 'Fork replay current head root').conversation_id !== ids.targetConversationId) {
+      throw new Error('Fork replay current Context head belongs to another Conversation.');
+    }
+    await assertForkContextHandleReservations(this.database, this.contentStore, ids.targetConversationId,
+      command.sourceConversationId);
     return {
       ...publicIds(ids),
       sharedRootNodeId: nullableId(root.root_node_id, 'ContextSequenceRoot.root_node_id'),
@@ -585,6 +614,7 @@ export class ConversationForkControlPlane {
     return value;
   }
 }
+
 
 function normalizeForkCommand(command: ConversationForkCommand) {
   const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');

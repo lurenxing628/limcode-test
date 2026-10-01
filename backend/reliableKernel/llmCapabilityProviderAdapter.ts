@@ -63,10 +63,12 @@ import {
 } from './modelFacingContextProjection';
 import {
   buildModelHandleCatalog,
+  isPersistentContextHandle,
   modelHandleEntries,
   modelHandleRef,
   normalizeModelHandleCatalog,
   projectToolResultForModel,
+  renderRetiredModelHandleNotice,
   type ModelHandleCatalog
 } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
@@ -217,6 +219,17 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let text = '';
       let thought = '';
       let thoughtSignature: string | undefined;
+      const itemThoughtSignatures = new Map<string, string>();
+      const observedThoughtSignature = (outputItem: ModelOutputItemReference | undefined, value: unknown): string | undefined => {
+        const received = optionalText(value);
+        if (outputItem) {
+          const key = JSON.stringify([outputItem.providerResponseId ?? '', outputItem.id]);
+          if (received) itemThoughtSignatures.set(key, received);
+          return itemThoughtSignatures.get(key);
+        }
+        thoughtSignature = received || thoughtSignature;
+        return thoughtSignature;
+      };
       const outputParts: MessageContent['parts'] = [];
       const completedThoughtBlockDurations: number[] = [];
       let thoughtElapsedMs: number | undefined;
@@ -309,7 +322,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             const delta = optionalText(payload?.text);
             const outputItem = modelOutputItemFromPayload(payload);
             thought += delta;
-            thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
+            const blockSignature = observedThoughtSignature(outputItem, payload?.thoughtSignature);
             const blockStartedAt = optionalPositiveNumber(payload?.thoughtStartedAt);
             const blockElapsedMs = optionalNonNegativeNumber(payload?.thoughtElapsedMs);
             if (blockStartedAt !== undefined && blockStartedAt !== thoughtStartedAt) {
@@ -321,14 +334,14 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             }
             thoughtTimingObserved = true;
             if (delta) {
-              appendTextPart(outputParts, delta, true, thoughtSignature, outputItem);
+              appendTextPart(outputParts, delta, true, blockSignature, outputItem);
               enqueue({
                 kind: 'output_delta',
                 content: {
                   type: 'thought_delta',
                   text: delta,
                   ...(outputItem ? { outputItem: plainModelOutputItem(outputItem) } : {}),
-                  ...(thoughtSignature ? { thoughtSignature } : {}),
+                  ...(blockSignature ? { thoughtSignature: blockSignature } : {}),
                   ...(thoughtStartedAt !== undefined ? { thoughtStartedAt } : {}),
                   thoughtCompletedDurationMs: completedThoughtDurationMs,
                   ...(thoughtElapsedMs !== undefined ? { thoughtElapsedMs } : {})
@@ -348,7 +361,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               thoughtStartedAt = blockStartedAt ?? thoughtStartedAt;
               thoughtElapsedMs = blockElapsedMs ?? thoughtElapsedMs;
             }
-            thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
+            const blockSignature = observedThoughtSignature(outputItem, payload?.thoughtSignature);
             thoughtTimingObserved = true;
             if (thoughtElapsedMs !== undefined) {
               enqueue({
@@ -360,7 +373,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                   thoughtElapsedMs,
                   ...(thoughtStartedAt !== undefined ? { thoughtStartedAt } : {}),
                   thoughtCompletedDurationMs: completedThoughtDurationMs,
-                  ...(thoughtSignature ? { thoughtSignature } : {})
+                  ...(blockSignature ? { thoughtSignature: blockSignature } : {})
                 }
               });
             }
@@ -374,8 +387,10 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             completedThoughtDurationMs += blockDurationMs;
             completedThoughtBlockDurations.push(blockDurationMs);
             thoughtTimingObserved = true;
-            thoughtSignature = optionalText(payload?.thoughtSignature) || thoughtSignature;
-            completeLastThoughtPart(outputParts, blockDurationMs, thoughtSignature);
+            const blockSignature = observedThoughtSignature(outputItem, payload?.thoughtSignature);
+            const completedItem = messageContentFromDonePayload(payload?.completedItem);
+            if (outputItem && completedItem) upsertCompletedOutputItem(outputParts, completedItem, outputItem);
+            completeLastThoughtPart(outputParts, blockDurationMs, blockSignature, outputItem);
             enqueue({
               kind: 'output_item_done',
               content: {
@@ -385,11 +400,13 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
                 thoughtBlockDurationMs: blockDurationMs,
                 thoughtCompletedDurationMs: completedThoughtDurationMs,
                 thoughtDurationMs: completedThoughtDurationMs,
-                ...(thoughtSignature ? { thoughtSignature } : {})
+                ...(blockSignature ? { thoughtSignature: blockSignature } : {}),
+                ...(completedItem ? { completedItem: normalizeProviderPlainJson(completedItem, 'LLM closed thought item') } : {})
               }
             });
             thoughtStartedAt = undefined;
             thoughtElapsedMs = undefined;
+            thoughtSignature = undefined;
             return;
           }
           case LlmEventType.OutputItemDone: {
@@ -398,11 +415,15 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             if (providerContextPart) appendProviderContextPart(outputParts, providerContextPart);
             if (outputItem) {
               applyOutputItemMetadata(outputParts, outputItem);
+              const completedItem = messageContentFromDonePayload(payload?.completedItem);
+              if (completedItem) upsertCompletedOutputItem(outputParts, completedItem, outputItem);
               enqueue({
                 kind: 'output_item_done',
                 content: {
                   type: 'output_item_done',
-                  outputItem: plainModelOutputItem(outputItem)
+                  outputItem: plainModelOutputItem(outputItem),
+                  ...(payload?.completedItem !== undefined
+                    ? { completedItem: normalizeProviderPlainJson(payload.completedItem, 'LLM closed output item') } : {})
                 }
               });
             }
@@ -761,6 +782,8 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
       ? runtimeContext.template.trim()
       : '';
   if (runtimeContextText) systemParts.push(runtimeContextText);
+  const retiredHandleNotice = renderRetiredModelHandleNotice(modelHandleCatalog);
+  if (retiredHandleNotice) systemParts.push(retiredHandleNotice);
   let contents: MessageContent[] = [];
   const canonicalCompressionRanges: Array<{ start: number; end: number }> = [];
   const currentTurnInput = request.requestAddenda?.currentTurnInput;
@@ -1430,15 +1453,26 @@ function compressionContext(
   for (const entry of attachmentCatalogState.catalog) {
     requireAttachmentHandle(seededHandleCatalog, entry.attachmentId);
   }
-  const modelHandleCatalog = buildModelHandleCatalog(
+  const discoveredHandleCatalog = buildModelHandleCatalog(
     sourceContext.map((item) => item.content),
-    seededHandleCatalog.entries
+    seededHandleCatalog
   );
-  // The coordinator freezes the complete ordinary identity map. Discovering a new child here
-  // means that history/recipe provenance is missing, not permission to reuse A1 in this prefix.
+  // Published unmarked compression recipes derived window-local P/O/W while rendering. Keep that
+  // original replay behavior; a current Recipe must already freeze every persistent identity that
+  // its actual expanded source can expose. Current attachments use the frozen registry-owned refs.
+  const currentIdentityContract = seededHandleCatalog.identityContractRevision !== undefined;
+  const modelHandleCatalog = currentIdentityContract
+    ? { ...discoveredHandleCatalog, entries: discoveredHandleCatalog.entries.filter(entry =>
+        entry.kind !== 'attachment' || modelHandleRef(seededHandleCatalog, 'attachment', entry.target) === entry.ref) }
+    : discoveredHandleCatalog;
+  const retiredHandleNotice = renderRetiredModelHandleNotice(modelHandleCatalog);
+  if (retiredHandleNotice) systemParts.push(retiredHandleNotice);
+  // Discovering a new identity here means the current Recipe did not freeze its actual source.
+  // Legacy child identities remain strict as before; old P/O/W keep their request-local scope.
   for (const entry of modelHandleCatalog.entries) {
-    if (entry.kind === 'child' && modelHandleRef(seededHandleCatalog, 'child', entry.target) !== entry.ref) {
-      throw Object.assign(new Error(`Compression source child ${entry.target} has no frozen reference.`), {
+    if ((entry.kind === 'child' || currentIdentityContract && isPersistentContextHandle(entry.kind))
+      && modelHandleRef(seededHandleCatalog, entry.kind, entry.target) !== entry.ref) {
+      throw Object.assign(new Error(`Compression source ${entry.kind} ${entry.target} has no frozen reference.`), {
         code: 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT'
       });
     }
@@ -2154,6 +2188,7 @@ function appendTextPart(
   const last = parts[parts.length - 1];
   const sameOutputItem = outputItem
     ? last?.outputItem?.id === outputItem.id
+      && last?.outputItem?.providerResponseId === outputItem.providerResponseId
     : last?.outputItem === undefined;
   if (last && 'text' in last && (last.thought === true) === thought
     && sameOutputItem
@@ -2188,11 +2223,14 @@ function appendSignedTextPart(
 function completeLastThoughtPart(
   parts: MessageContent['parts'],
   durationMs: number,
-  thoughtSignature?: string
+  thoughtSignature?: string,
+  outputItem?: ModelOutputItemReference
 ): void {
   for (let index = parts.length - 1; index >= 0; index -= 1) {
     const part = parts[index];
     if (!part || !('text' in part) || part.thought !== true || part.thoughtDurationMs !== undefined) continue;
+    if (outputItem && (part.outputItem?.id !== outputItem.id
+      || part.outputItem?.providerResponseId !== outputItem.providerResponseId)) continue;
     part.thoughtDurationMs = durationMs;
     if (thoughtSignature) part.thoughtSignature = thoughtSignature;
     return;
@@ -2202,6 +2240,7 @@ function completeLastThoughtPart(
       text: '',
       thought: true,
       ...(thoughtSignature ? { thoughtSignature } : {}),
+      ...(outputItem ? { outputItem } : {}),
       thoughtDurationMs: durationMs
     });
   }
@@ -2239,8 +2278,38 @@ function applyOutputItemMetadata(
   outputItem: ModelOutputItemReference
 ): void {
   for (const part of parts) {
-    if (part.outputItem?.id === outputItem.id) part.outputItem = outputItem;
+    if (part.outputItem?.id === outputItem.id
+      && part.outputItem?.providerResponseId === outputItem.providerResponseId) part.outputItem = outputItem;
   }
+}
+
+/** Closed provider bytes replace their deltas and also populate items that arrived without deltas. */
+function upsertCompletedOutputItem(
+  parts: MessageContent['parts'],
+  completed: MessageContent,
+  outputItem: ModelOutputItemReference
+): void {
+  if (completed.role !== 'model' || completed.parts.length === 0
+    || completed.parts.some(part => part.outputItem?.id !== outputItem.id
+      || part.outputItem?.providerResponseId !== outputItem.providerResponseId)) {
+    throw new Error('Closed output content does not match its provider response/item identity.');
+  }
+  const matches = (part: MessageContent['parts'][number]) => part.outputItem?.id === outputItem.id
+    && part.outputItem?.providerResponseId === outputItem.providerResponseId;
+  const first = parts.findIndex(matches);
+  const priorThought = parts.find(part => matches(part) && 'text' in part && part.thought === true);
+  const replacement = completed.parts.map(part => ({ ...part, outputItem,
+    ...('text' in part && part.thought === true && priorThought && 'text' in priorThought
+      && priorThought.thoughtDurationMs !== undefined ? { thoughtDurationMs: priorThought.thoughtDurationMs } : {}) }));
+  const kept = parts.filter(part => !matches(part));
+  const later = first < 0 ? kept.findIndex(part => part.outputItem !== undefined
+    && part.outputItem.providerResponseId === outputItem.providerResponseId
+    && part.outputItem.ordinal > outputItem.ordinal) : -1;
+  const insertion = first >= 0 ? first : later >= 0 ? later : kept.length;
+  parts.length = 0;
+  for (const part of kept.slice(0, insertion)) parts.push(part);
+  for (const part of replacement) parts.push(part);
+  for (const part of kept.slice(insertion)) parts.push(part);
 }
 
 function modelOutputItemFromPayload(

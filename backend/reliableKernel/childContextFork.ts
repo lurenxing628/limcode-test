@@ -7,6 +7,10 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { listAllDomainRows } from './repositoryPagination';
 import { requirePhaseFId, stablePhaseFId } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
+import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
+import { NATIVE_CHILD_HANDLE_PROJECTION_EVENT, readConversationContextHandleCatalog } from './conversationChildHandles';
+import { captureForkContextHandleFrontier, prepareForkContextHandleReservations,
+  readForkContextHandleReservationEvidence } from './forkContextHandleReservations';
 
 export type ChildForkTurns = 'none' | 'all' | `${number}`;
 
@@ -42,6 +46,16 @@ export async function prepareChildContextFork(
   }
 ): Promise<ChildContextForkPlan> {
   if (input.forkTurns === 'none') return { steps: [], segments: [] };
+  await new ConversationAttachmentHandleRegistry(database, { contentStore: store, now: () => input.now })
+    .ensure(input.sourceConversationId, []);
+  const handleFrontier = await captureForkContextHandleFrontier(database, input.sourceConversationId,
+    NATIVE_CHILD_HANDLE_PROJECTION_EVENT);
+  const sourceReservations = await readForkContextHandleReservationEvidence(database, store, input.sourceConversationId);
+  const sourceCatalog = await readConversationContextHandleCatalog(database, store, input.sourceConversationId);
+  const handleReservations = await prepareForkContextHandleReservations({ database, contentStore: store,
+    sourceConversationId: input.sourceConversationId, targetConversationId: input.targetConversationId,
+    catalog: sourceCatalog, coveredRecipeObjectIds: [...new Set([...handleFrontier.coveredRecipeObjectIds,
+      ...(sourceReservations?.coveredRecipeObjectIds ?? [])])], now: input.now });
   const list = (domain: string, where: Record<string, string>) => listAllDomainRows(database, domain, where);
   const [heads, turns, memberships] = await Promise.all([
     list('ConversationContextHeadLink', { conversation_id: input.sourceConversationId }),
@@ -194,6 +208,8 @@ export async function prepareChildContextFork(
       }),
       ...snapshot.assertions,
       ...snapshot.inserts,
+      ...handleFrontier.assertions,
+      ...handleReservations.steps,
       DOMAIN_REPOSITORIES.domain('ConversationBranchLink').insert({
         id: stablePhaseFId('conversation_branch_link', 'child-context-fork', input.targetConversationId),
         target_conversation_id: input.targetConversationId,

@@ -28,6 +28,8 @@ const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStor
 const { workEnvironmentIdFromUri } = load('shared/workEnvironmentCatalog.js');
 const protocol = load('shared/protocol.js');
 const { stablePhaseFId } = load('backend/reliableKernel/phaseFIdentity.js');
+const { FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND, FORK_CONTEXT_HANDLE_RESERVATION_PURPOSE,
+  readForkContextHandleReservationEvidence } = load('backend/reliableKernel/forkContextHandleReservations.js');
 
 async function rows(app, domain, where = {}) {
   return (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({
@@ -326,6 +328,31 @@ test('fork copies completed turns only and the running source turn still stops n
 
 async function contextSegmentIds(app, rootId) {
   return (await app.context.materializeStructure(rootId)).records.map(record => record.segment.id);
+}
+
+/** Keep every transcript/history root; the registered address artifact is never model Context. */
+async function publicContextRoots(h, conversationId) {
+  const roots = await rows(h.app, 'ContextSequenceRoot', { conversation_id: conversationId });
+  const [head] = await rows(h.app, 'ConversationContextHeadLink', { conversation_id: conversationId });
+  const reservations = await rows(h.app, 'ModelContextProjection', {
+    owner_kind: FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND, owner_id: conversationId
+  });
+  assert.equal(reservations.length, 1, 'the fork owns one separately registered address artifact');
+  const [reservation] = reservations;
+  assert.equal(reservation.purpose, FORK_CONTEXT_HANDLE_RESERVATION_PURPOSE);
+  assert.ok(roots.some(root => root.id === reservation.root_id), 'the private root remains retained');
+  assert.notEqual(head.root_id, reservation.root_id, 'the address artifact is absent from the model-visible head');
+  assert.deepEqual((await rows(h.app, 'ModelContextProjection', { root_id: reservation.root_id })).map(row => row.id),
+    [reservation.id], 'no request or compression may project the private address root');
+  assert.ok(await readForkContextHandleReservationEvidence(h.app.database, h.app.contentStore, conversationId),
+    'the separately scoped artifact must still pass its complete ownership, CAS and coverage validation');
+  const privateContext = await h.app.context.materializeStructure(reservation.root_id);
+  assert.equal(privateContext.records.length, 1);
+  const [record] = privateContext.records;
+  assert.equal(record.segment.segment_kind, 'runtime_context');
+  assert.deepEqual((await rows(h.app, 'ContextSegmentSource', { segment_id: record.segment.id })).map(row => row.source_kind),
+    ['runtime_context'], 'private reservations contain no Message, Tool or Compression transcript provenance');
+  return roots.filter(root => root.id !== reservation.root_id);
 }
 
 /** Every copied Turn owns its frozen authority and every copied request its re-homed projection. */
@@ -921,7 +948,7 @@ test('an early fork has no later source roots without target message provenance'
     await h.turn('source', 'future-source-input');
     const sourceRoots = await rows(h.app, 'ContextSequenceRoot', { conversation_id: 'source' });
     const fork = await h.facade.forkConversation(command);
-    const targetRoots = await rows(h.app, 'ContextSequenceRoot', { conversation_id: fork.conversationId });
+    const targetRoots = await publicContextRoots(h, fork.conversationId);
     const [head] = await rows(h.app, 'ConversationContextHeadLink', { conversation_id: fork.conversationId });
     const boundary = await h.app.context.materialize(head.root_id);
     for (const root of targetRoots) {
@@ -1342,7 +1369,7 @@ for (const deleteFollowing of [false, true]) {
         ...original, expectedRevisionId: current.revision_id, command: { commandId: `fork-edited-${deleteFollowing}` }
       });
       const estimator = new kernel.ReliableContextTokenEstimator(h.app.database, h.app.contentStore);
-      for (const root of await rows(h.app, 'ContextSequenceRoot', { conversation_id: fork.conversationId })) {
+      for (const root of await publicContextRoots(h, fork.conversationId)) {
         await estimator.estimateRoot(root.id);
       }
       await h.turn(fork.conversationId, 'continued-after-edit-fork');
@@ -1375,7 +1402,7 @@ test('forking an unchanged assistant after an earlier user edit selects current 
     assert.equal(copiedRevision.content_object_id, editedRevision.content_object_id,
       'the target visible revision must agree with the current content sent to the provider');
     const estimator = new kernel.ReliableContextTokenEstimator(h.app.database, h.app.contentStore);
-    for (const root of await rows(h.app, 'ContextSequenceRoot', { conversation_id: fork.conversationId })) {
+    for (const root of await publicContextRoots(h, fork.conversationId)) {
       await estimator.estimateRoot(root.id);
     }
     await h.turn(fork.conversationId, 'continue-edited-question');
@@ -1398,7 +1425,7 @@ test('fork after retrying an old turn does not retain the discarded suffix', asy
     });
     const fork = await h.facade.forkConversation(await h.command('source', 'fork-after-retry'));
     const estimator = new kernel.ReliableContextTokenEstimator(h.app.database, h.app.contentStore);
-    for (const root of await rows(h.app, 'ContextSequenceRoot', { conversation_id: fork.conversationId })) {
+    for (const root of await publicContextRoots(h, fork.conversationId)) {
       await estimator.estimateRoot(root.id);
     }
     await h.turn(fork.conversationId, 'continue-after-retry');
@@ -1465,7 +1492,7 @@ test('nested compression keeps reachable pre-compression fork boundaries usable'
     await h.turn('source', 'after-nested-compression');
     const fork = await h.facade.forkConversation(await h.command('source', 'compressed-fork'));
     const estimator = new kernel.ReliableContextTokenEstimator(h.app.database, h.app.contentStore);
-    const roots = await rows(h.app, 'ContextSequenceRoot', { conversation_id: fork.conversationId });
+    const roots = await publicContextRoots(h, fork.conversationId);
     assert.ok(roots.length > 1, 'do not drop all historical roots to hide provenance errors');
     for (const root of roots) await estimator.estimateRoot(root.id);
     await h.turn(fork.conversationId, 'continue-compressed-fork');

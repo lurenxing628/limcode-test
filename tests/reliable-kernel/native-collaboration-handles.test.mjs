@@ -93,8 +93,14 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
         await event('completed', { role: 'model', parts: round === 1
           ? [{ id: 'spawn-one', functionCall: { name: listTool, args: {} } },
             { id: 'spawn-two', functionCall: { name: listTool, args: {} } }]
-          : [{ id: 'send', functionCall: { name: sendTool, args: { conversationRef: 'C1' } } },
-            { id: 'unknown', functionCall: { name: sendTool, args: { conversationRef: 'C999' } } }] });
+          : [{ id: 'send', functionCall: { name: sendTool, args: {
+              conversationRef: 'C1', text: 'follow up original peer',
+              ...(sendTool === 'send_conversation_message' ? { mode: 'followup' } : {})
+            } } },
+            { id: 'unknown', functionCall: { name: sendTool, args: {
+              conversationRef: 'C999', text: 'must not run',
+              ...(sendTool === 'send_conversation_message' ? { mode: 'followup' } : {})
+            } } }] });
       }
       controls.native.onController(undefined);
     }

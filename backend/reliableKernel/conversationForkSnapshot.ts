@@ -388,15 +388,17 @@ export async function prepareConversationForkSnapshot(
       for (const attachment of revision.attachments) attachmentIds.add(id(attachment.attachment_id, 'AttachmentLink.attachment_id'));
     }
   }
+  // Address reservations outlive the visible AttachmentLinks. A copied recipe or retained prose
+  // can still mention an attachment from discarded output: trimming this registry would let the
+  // fork assign that old F# to a different attachment. Reserving its address grants no visibility;
+  // MessageRevision AttachmentLinks and the active catalog are still copied from retained history.
   const sourceAttachmentHandles = (await database.snapshotAll(
     DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink').list({
       where: { conversation_id: input.sourceConversationId },
       orderBy: { column: 'id', direction: 'asc' },
       limit: 1000
     })
-  )).snapshot.filter((link) => attachmentIds.has(
-    id(link.attachment_id, 'ConversationAttachmentHandleLink.attachment_id')
-  ));
+  )).snapshot;
   const handledAttachmentIds = new Set(sourceAttachmentHandles.map((link) =>
     id(link.attachment_id, 'ConversationAttachmentHandleLink.attachment_id')
   ));

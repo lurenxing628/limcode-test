@@ -607,9 +607,13 @@ test('a user fork of a forkTurns child stays forkable after a compression and a 
     const child = execution.child_conversation_id;
     await eventually(async () => (await f.list('Turn', { conversation_id: child })).every(turn => turn.status === 'terminated')
       && (await f.list('Turn', { conversation_id: child })).length === 3, 'the child did not finish its assignment');
-    // The child's first Context root holds both inherited exchanges and its assignment in one step:
-    // no root of the child ever held only part of the inherited history.
+    // The child's first model-visible root holds the inherited exchanges and assignment together.
+    // Address reservation roots are isolated metadata and never become the visible head.
+    const reservationRoots = new Set((await f.list('ModelContextProjection', {
+      owner_kind: 'conversation_handle_catalog', owner_id: child
+    })).map(projection => projection.root_id));
     const [firstRoot] = (await f.list('ContextSequenceRoot', { conversation_id: child }))
+      .filter(root => !reservationRoots.has(root.id))
       .sort((left, right) => Number(left.root_seq - right.root_seq));
     assert.equal(firstRoot.segment_count, 5n, 'fixture: the child started from two inherited exchanges and its assignment');
     const lifecycle = new ReliableConversationLifecycle({ application: f.app, configuration: f.configuration });

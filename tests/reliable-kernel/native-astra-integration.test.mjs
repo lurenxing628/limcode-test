@@ -19,6 +19,31 @@ const NATIVE_SETTINGS = {
   enabled: true, asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false
 };
 
+test('native WS completed projection preserves received async facts and refuses changed declarations', () => {
+  const { OpenAIResponsesContinuationProjection } = require(path.join(compiledRoot,
+    'backend/capabilities/openAIResponsesContinuationProjection.js'));
+  const call = { type: 'function_call', id: 'projection-async-item', call_id: 'projection-async-call',
+    name: 'native_probe', arguments: '{}', async: true, status: 'completed' };
+  const decoded = { functionCalls: [{ functionCall: {
+    name: 'native_probe', args: {}, callId: call.call_id, async: true
+  } }] };
+  const done = { type: 'response.output_item.done', output_index: 0, item: call };
+  const terminal = item => ({ type: 'response.completed', response: { output: [item] } });
+  const projection = new OpenAIResponsesContinuationProjection();
+  projection.observe(done, decoded);
+  projection.observe(terminal(call), {});
+  const completed = projection.completedProjection();
+  assert.equal(completed.content.parts[0].functionCall.async, true);
+  assert.equal(completed.outputItems[0].async, true);
+  for (const changed of [{ ...call, async: false }, { ...call, async: undefined }]) {
+    const contradictory = new OpenAIResponsesContinuationProjection();
+    contradictory.observe(done, decoded);
+    contradictory.observe(terminal(changed), {});
+    assert.equal(contradictory.completedProjection(), undefined,
+      'a later declaration cannot rewrite the already received async fact');
+  }
+});
+
 function deferred() {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
@@ -39,6 +64,14 @@ async function rows(app, domain, where = {}) {
   return (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain).list({
     where, orderBy: { column: 'id', direction: 'asc' }, limit: 100
   }))).snapshot;
+}
+
+async function assistantCurrentParts(app, modelRequestId) {
+  const [output] = await rows(app, 'ModelRequestMessageLink', { model_request_id: modelRequestId });
+  const [current] = await rows(app, 'MessageCurrentRevisionLink', { message_id: output.message_id });
+  const [revision] = await rows(app, 'MessageRevision', { id: current.revision_id });
+  const [metadata] = await rows(app, 'ContentObject', { id: revision.content_object_id });
+  return JSON.parse((await app.contentStore.read(metadata)).toString('utf8')).parts;
 }
 
 async function forkNativeMessage(app, conversationId, modelRequestId, key) {
@@ -386,16 +419,16 @@ test('Astra executes a durable async call before response completion and deliver
     harness.releaseTool.resolve();
     const delivery = await until(() => frames.find(frame => frame.body.type === 'response.create'
       && frame.body.input?.some(item => item.type === 'function_call_output')), 'native result delivery');
-    assert.equal(delivery.body.previous_response_id, undefined, 'the settled batch uses a preflighted full request');
+    assert.equal(delivery.body.previous_response_id, 'native-response-1',
+      'the complete async projection permits exact-prefix cache reuse');
     const carriedCalls = delivery.body.input.filter(item => item.type === 'function_call');
-    assert.equal(carriedCalls.length, 1);
-    assert.equal(carriedCalls[0].call_id, 'original-native-call');
+    assert.equal(carriedCalls.length, 0, 'the incremental result carrier does not resend the proved call');
     const outputs = delivery.body.input.filter(item => item.type === 'function_call_output');
     assert.equal(outputs.length, 1);
     assert.equal(outputs[0].call_id, 'original-native-call');
     assert.match(JSON.stringify(outputs[0].output), /content from the real native probe file/);
     assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 0);
-    created(delivery.socket, 'native-response-2');
+    created(delivery.socket, 'native-response-2', delivery.body.previous_response_id);
     const answer = text(delivery.socket, 'native-response-2', 0, 'The probe result has arrived.');
     completed(delivery.socket, 'native-response-2', [answer]);
     const finished = await turn.completion;
@@ -403,6 +436,9 @@ test('Astra executes a durable async call before response completion and deliver
     assert.equal(harness.executions(), 1);
     assert.equal(harness.httpCalls(), 0);
     assert.equal(finished.modelRequestIds.length, 2, 'the original result continues this same Turn in a separate request');
+    const frozenCall = (await assistantCurrentParts(app, request.id)).find(part => part.id === 'original-native-call');
+    assert.equal(frozenCall.async, true, 'the closed aggregate preserves the original received async fact');
+    assert.equal(frozenCall.outputItem.providerResponseId, 'native-response-1');
     assert.equal((await rows(app, 'ToolModelResult', { tool_call_id: admitted.id })).length, 1);
     assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 1);
     assert.equal((await rows(app, 'ToolCallEvent', { tool_call_id: admitted.id, event_kind: 'native_delivery' })).length, 1,
@@ -430,6 +466,7 @@ test('Astra executes a durable async call before response completion and deliver
     const frameCount = frames.length;
     const next = await harness.startTurn('native-second-turn', 'Confirm the preserved order.', forked.targetConversationId);
     const restored = await until(() => frames.slice(frameCount).find(frame => frame.body.type === 'response.create'), 'fresh canonical history');
+    assert.equal(restored.body.previous_response_id, undefined, 'a real connection reset sends the full Context');
     const input = restored.body.input;
     const callPositions = input.flatMap((item, index) => item.type === 'function_call' ? [index] : []);
     const resultPositions = input.flatMap((item, index) => item.type === 'function_call_output' ? [index] : []);
@@ -876,12 +913,44 @@ for (const model of ['gpt-6-sol', 'gpt-6-luna']) {
         const results = delivery.body.input.filter(item => item.type === 'function_call_output');
         assert.equal(results.length, 1);
         assert.equal(results[0].call_id, `original-${model}-call`);
+        if (transport === 'websocket') {
+          assert.equal(delivery.body.previous_response_id, `${model}-response-1`,
+            'the exact async prefix is reusable on the live connection');
+          assert.equal(delivery.body.input.filter(item => item.type === 'function_call').length, 0,
+            'an incremental result carrier does not resend its proved call');
+        } else {
+          assert.equal(delivery.body.previous_response_id, undefined);
+          assert.equal(delivery.body.input.find(item => item.type === 'function_call'
+            && item.call_id === `original-${model}-call`).async, true,
+          'the stateless full Context successor preserves the received async declaration');
+        }
         const carrier = delivery.response ?? delivery.socket;
         created(carrier, `${model}-response-2`, delivery.body.previous_response_id);
         completed(carrier, `${model}-response-2`, [text(carrier, `${model}-response-2`, 0, 'Result received.')]);
         assert.equal((await turn.completion).terminalStatus, 'completed');
+        const frozenCall = (await assistantCurrentParts(app, request.id)).find(part => part.id === `original-${model}-call`);
+        assert.equal(frozenCall.async, true, 'the final CAS aggregate preserves the received async declaration');
+        assert.equal(frozenCall.outputItem.providerResponseId, `${model}-response-1`);
         assert.equal(harness.executions(), 1);
         assert.deepEqual(await app.runtime.effects.listNativePendingWork({ conversationId }), []);
+        if (transport === 'websocket') {
+          resetOpenAIResponsesWebSocketSessions();
+          const frameCount = frames.length;
+          const next = await harness.startTurn(`family-${model}-${transport}-reset`, 'Verify the preserved async call.');
+          const restored = await until(() => frames.slice(frameCount).find(frame => frame.body.type === 'response.create'),
+            `${model} full Context after connection reset`);
+          assert.equal(restored.body.previous_response_id, undefined);
+          const restoredCalls = restored.body.input.filter(item => item.type === 'function_call');
+          assert.equal(restoredCalls.length, 1);
+          assert.equal(restoredCalls[0].call_id, `original-${model}-call`);
+          assert.equal(restoredCalls[0].async, true, 'the full request preserves the original received async fact');
+          assert.equal(restored.body.input.filter(item => item.type === 'function_call_output'
+            && item.call_id === `original-${model}-call`).length, 1);
+          created(restored.socket, `${model}-response-3`);
+          completed(restored.socket, `${model}-response-3`, [text(restored.socket, `${model}-response-3`, 0, 'Preserved.')]);
+          assert.equal((await next.completion).terminalStatus, 'completed');
+          assert.equal(harness.executions(), 1, 'reconstructing the full Context never executes the original tool again');
+        }
       }, { transport });
     });
   }

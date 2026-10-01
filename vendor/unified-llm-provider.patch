@@ -1,12 +1,12 @@
 diff --git a/package.json b/package.json
-index 5b0475d..5b32322 100644
+index 5b0475d..bf07320 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "unified-llm-provider",
 -  "version": "0.1.37",
-+  "version": "0.1.37-limcode.7",
++  "version": "0.1.37-limcode.8",
    "description": "统一 LLM Provider npm 包：一套统一结构接入 Gemini / Claude / OpenAI Compatible / OpenAI Responses / DeepSeek",
    "license": "MIT",
    "type": "module",
@@ -1195,7 +1195,7 @@ index 08a6ccc..d1755b3 100644
    if (mediaBlocks.length === 0) return text;
    return [
 diff --git a/src/llm/formats/openai-responses.ts b/src/llm/formats/openai-responses.ts
-index 1be02a5..1ff5467 100644
+index 1be02a5..6f66992 100644
 --- a/src/llm/formats/openai-responses.ts
 +++ b/src/llm/formats/openai-responses.ts
 @@ -8,6 +8,7 @@
@@ -1206,7 +1206,7 @@ index 1be02a5..1ff5467 100644
    isVisibleTextPart, isInlineDataPart, isFunctionCallPart, isFunctionResponsePart, isTextPart, isProviderContextPart,
  } from '../../types.js';
  import type { LLMPromptCacheConfig, LLMPromptCacheMode } from '../../config/types.js';
-@@ -24,16 +25,91 @@ interface NormalizedOpenAIResponsesPromptCacheConfig {
+@@ -24,16 +25,112 @@ interface NormalizedOpenAIResponsesPromptCacheConfig {
    ttl: '30m';
    breakpoints: {
      messages: boolean;
@@ -1245,14 +1245,35 @@ index 1be02a5..1ff5467 100644
 +}
 +
 +/** LimCode Astra：把 SSE 事件的 output_index/item_id 归一为 chunk 级 output item 引用。 */
-+function attachLimcodeOutputItem(chunk: LLMStreamChunk, data: any): void {
++function attachLimcodeOutputItem(chunk: LLMStreamChunk, data: any, responseId?: string): void {
 +  const ordinal = typeof data?.output_index === 'number' && Number.isSafeInteger(data.output_index) && data.output_index >= 0
 +    ? data.output_index
 +    : undefined;
 +  if (ordinal === undefined) return;
 +  const id = normalizeCallId(data?.item_id) ?? normalizeCallId(data?.item?.id) ?? normalizeCallId(data?.id) ?? `output:${ordinal}`;
 +  const phase = data?.item?.phase === 'commentary' || data?.item?.phase === 'final_answer' ? data.item.phase : undefined;
-+  chunk.outputItem = { id, ordinal, ...(phase ? { phase } : {}) };
++  const owner = normalizeCallId(data?.response_id) ?? responseId;
++  chunk.outputItem = { id, ordinal, ...(phase ? { phase } : {}),
++    ...(owner ? { providerResponseId: owner } : {}) };
++}
++
++/** A completion is a full immutable fact, not permission to infer content from the last delta. */
++function completedLimcodeOutputItems(output: any[], responseId?: string, firstOrdinal = 0): Content[] {
++  const result: Content[] = [];
++  output.forEach((item, index) => {
++    if (!item || typeof item !== 'object') return;
++    const ordinal = firstOrdinal + index;
++    const reference: LimcodeOutputItemReference = {
++      id: normalizeCallId(item.id) ?? `output:${ordinal}`, ordinal,
++      ...(item.phase === 'commentary' || item.phase === 'final_answer' ? { phase: item.phase } : {}),
++      ...(responseId ? { providerResponseId: responseId } : {})
++    };
++    for (const content of decodeOpenAIResponsesItemsToContents([item], 'responses')) {
++      for (const part of content.parts ?? []) part.outputItem = { ...reference };
++      result.push(content);
++    }
++  });
++  return result;
 +}
 +
 +type AssistantMessagePhase = NonNullable<LimcodeOutputItemReference['phase']>;
@@ -1299,7 +1320,7 @@ index 1be02a5..1ff5467 100644
    // ============ 编码请求：Gemini (Internal) → OpenAI Responses ============
  
    private encodeInstructions(request: LLMRequest): string | undefined {
-@@ -60,6 +136,9 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -60,6 +157,9 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
  
        if (content.role === 'model') {
          let currentMessageItem: any = null;
@@ -1309,7 +1330,7 @@ index 1be02a5..1ff5467 100644
  
          for (const part of content.parts) {
            if (isProviderContextPart(part)) {
-@@ -86,8 +165,11 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -86,8 +186,11 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
              inputItems.push(reasoningItem);
              currentMessageItem = null;
            } else if (isVisibleTextPart(part) && part.text) {
@@ -1323,7 +1344,7 @@ index 1be02a5..1ff5467 100644
                inputItems.push(currentMessageItem);
              }
              currentMessageItem.content.push({ type: 'output_text', text: part.text });
-@@ -98,6 +180,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -98,6 +201,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
                call_id: callId,
                name: part.functionCall.name,
                arguments: JSON.stringify(part.functionCall.args),
@@ -1332,7 +1353,7 @@ index 1be02a5..1ff5467 100644
              });
              pendingToolCallIds.push(callId);
              currentMessageItem = null;
-@@ -171,6 +255,15 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -171,6 +276,15 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          name: decl.name,
          description: decl.description,
          parameters: sanitizeSchemaForOpenAI(decl.parameters),
@@ -1348,7 +1369,7 @@ index 1be02a5..1ff5467 100644
        }));
      }
  
-@@ -209,7 +302,39 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -209,7 +323,39 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
        mode: this.promptCache.mode === 'implicit' ? 'implicit' : 'explicit',
        ttl: this.promptCache.ttl,
      };
@@ -1389,7 +1410,7 @@ index 1be02a5..1ff5467 100644
        inputItems.push(createOpenAICacheMarkerMessage(' '));
      }
    }
-@@ -266,19 +391,27 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -266,19 +412,27 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
      }
  
      const parts: Part[] = [];
@@ -1419,11 +1440,11 @@ index 1be02a5..1ff5467 100644
          parts.push(createProviderContextPart(item, 'responses'));
        }
      }
-@@ -304,7 +437,27 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -304,7 +458,28 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          chunk.textDelta = data.delta;
          chunk.partsDelta = [{ text: data.delta }];
        }
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
 +      else if (!isLimcodeGpt6FamilyModel(this.model)) attachAssistantPhaseOutputItem(chunk, streamState, data);
 +    } else if (event === 'response.created') {
 +      // LimCode GPT-6 家族 HTTP/SSE：response 生命周期观察（无 WS 物理身份）。
@@ -1431,6 +1452,7 @@ index 1be02a5..1ff5467 100644
 +        const response = data.response ?? data;
 +        const responseId = response?.id;
 +        if (typeof responseId === 'string' && responseId) {
++          streamState.nativeResponseId = responseId;
 +          chunk.nativeEvent = {
 +            type: 'response.created',
 +            responseId,
@@ -1442,12 +1464,12 @@ index 1be02a5..1ff5467 100644
 +      }
      } else if (event === 'response.output_item.added') {
 +      // response.incomplete 没有分支：response 层把它当作上游错误，在这里之前就返回 stream_error。
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
 +      else if (!isLimcodeGpt6FamilyModel(this.model)) rememberAssistantMessagePhase(streamState, data);
        const item = data.item;
        if (item?.type === 'reasoning') {
          // Responses API 的 reasoning item 在 added 阶段通常只有空 summary；
-@@ -312,29 +465,37 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -312,29 +487,45 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          // encrypted_content 只在 output_item.done 阶段采信，避免保存未完成或最终全量重复签名。
          emitReasoningItemSummary(chunk, streamState, item, data);
        } else if (item?.type === 'function_call') {
@@ -1455,16 +1477,16 @@ index 1be02a5..1ff5467 100644
 +        rememberPendingFunctionCall(streamState, item, data);
        }
      } else if (isReasoningTextDeltaEvent(event)) {
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
        emitReasoningDeltaText(chunk, streamState, data, data.delta);
      } else if (isReasoningTextDoneEvent(event)) {
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
        emitReasoningFullText(chunk, streamState, data, data.text ?? data.content ?? data.summary_text);
      } else if (isReasoningSummaryPartEvent(event)) {
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
        emitReasoningFullText(chunk, streamState, data, extractReasoningSummaryPartText(data.part ?? data.summary_part ?? data.content_part ?? data));
      } else if (event === 'response.function_call_arguments.delta') {
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
        appendPendingFunctionCallArguments(
          streamState,
          data.item_id ?? data.id ?? data.call_id,
@@ -1472,7 +1494,7 @@ index 1be02a5..1ff5467 100644
 +        data,
        );
      } else if (event === 'response.function_call_arguments.done') {
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
        const itemKey = rememberPendingFunctionCall(streamState, {
          id: data.item_id ?? data.id,
          call_id: data.call_id,
@@ -1483,12 +1505,20 @@ index 1be02a5..1ff5467 100644
 +      }, data);
 +      if (itemKey) emitFunctionCallChunk(chunk, itemKey, streamState, data);
      } else if (event === 'response.output_item.done') {
-+      if (this.limcodeGpt6Native) attachLimcodeOutputItem(chunk, data);
++      if (this.limcodeGpt6Native) {
++        attachLimcodeOutputItem(chunk, data, streamState.nativeResponseId);
++        if (chunk.outputItem && data.item) {
++          chunk.outputItemDone = { ...chunk.outputItem };
++          chunk.completedOutputItems = completedLimcodeOutputItems([data.item],
++            chunk.outputItem.providerResponseId, chunk.outputItem.ordinal);
++          if (data.item.type === 'reasoning') chunk.reasoningItemDone = true;
++        }
++      }
 +      else if (!isLimcodeGpt6FamilyModel(this.model)) rememberAssistantMessagePhase(streamState, data);
        const item = data.item;
        if (item?.type === 'reasoning') {
          // 如果前面没有 reasoning_summary_text.delta，done 里的完整 summary 是最后兜底，
-@@ -342,14 +503,49 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -342,14 +533,36 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
          emitReasoningItemSummary(chunk, streamState, item, data);
          emitReasoningSignature(chunk, streamState, item, data);
        } else if (item?.type === 'function_call') {
@@ -1516,23 +1546,10 @@ index 1be02a5..1ff5467 100644
 +        const output = response?.output ?? data.output;
 +        if (Array.isArray(output)) {
 +          try {
-+            const decodedContents = decodeOpenAIResponsesItemsToContents(output, 'responses');
-+            // 与解码器同一跳过规则对齐索引：每个 object item 恰好产出一个 content，
-+            // 给 part 补上真实 output item 引用，保证 HTTP 链上的 response 边界无损。
-+            let contentIndex = 0;
-+            for (let index = 0; index < output.length && contentIndex < decodedContents.length; index += 1) {
-+              const rawItem = output[index];
-+              if (!rawItem || typeof rawItem !== 'object') continue;
-+              const content = decodedContents[contentIndex];
-+              contentIndex += 1;
-+              if (!content) continue;
-+              const itemId = normalizeCallId(rawItem.id) ?? `output:${index}`;
-+              const phase = rawItem.phase === 'commentary' || rawItem.phase === 'final_answer' ? rawItem.phase : undefined;
-+              for (const part of content.parts ?? []) {
-+                part.outputItem = { id: itemId, ordinal: index, ...(phase ? { phase } : {}) };
-+              }
-+            }
++            const decodedContents = completedLimcodeOutputItems(output,
++              normalizeCallId(responseId) ?? streamState.nativeResponseId);
 +            chunk.completedContents = decodedContents;
++            chunk.completedOutputItems = decodedContents;
 +          } catch {
 +            // 终态内容附加失败不破坏既有流式语义；deltas 仍是内容来源。
 +          }
@@ -1541,7 +1558,7 @@ index 1be02a5..1ff5467 100644
        for (const item of data.response?.output ?? data.output ?? []) {
          if (item?.type === 'reasoning') {
            // 部分网关不会发送 reasoning_* delta，只在 completed.response.output
-@@ -361,10 +557,12 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -361,10 +574,12 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
            // 会在历史里形成额外的 signature-only thought part。保持原逻辑：
            // 只在 output_item.done 阶段接收 reasoning.encrypted_content。
          } else if (item?.type === 'compaction') {
@@ -1556,7 +1573,7 @@ index 1be02a5..1ff5467 100644
      }
  
      return chunk;
-@@ -376,6 +574,8 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
+@@ -376,21 +591,71 @@ export class OpenAIResponsesFormat implements CompactFormatAdapter {
        pendingFunctionCalls: new Map<string, PendingOpenAIResponsesFunctionCall>(),
        reasoningTextByKey: new Map<string, string>(),
        emittedReasoningSignatures: new Set<string>(),
@@ -1565,7 +1582,10 @@ index 1be02a5..1ff5467 100644
      } as OpenAIResponsesStreamState;
    }
  }
-@@ -385,12 +585,59 @@ interface OpenAIResponsesStreamState extends StreamDecodeState {
+ 
+ interface OpenAIResponsesStreamState extends StreamDecodeState {
++  nativeResponseId?: string;
+   emittedFunctionCallIds: Set<string>;
    pendingFunctionCalls: Map<string, PendingOpenAIResponsesFunctionCall>;
    reasoningTextByKey: Map<string, string>;
    emittedReasoningSignatures: Set<string>;
@@ -1625,7 +1645,7 @@ index 1be02a5..1ff5467 100644
  }
  
  function isPlainObject(value: unknown): value is Record<string, unknown> {
-@@ -492,6 +739,7 @@ function normalizeOpenAIResponsesPromptCacheConfig(promptCache: LLMPromptCacheCo
+@@ -492,6 +757,7 @@ function normalizeOpenAIResponsesPromptCacheConfig(promptCache: LLMPromptCacheCo
      ttl: '30m',
      breakpoints: {
        messages: breakpoints.messages !== false,
@@ -1633,7 +1653,7 @@ index 1be02a5..1ff5467 100644
      },
    };
  }
-@@ -525,6 +773,49 @@ function markLastOpenAIResponsesCacheableBlockAtRequestEnd(inputItems: any[]): b
+@@ -525,6 +791,49 @@ function markLastOpenAIResponsesCacheableBlockAtRequestEnd(inputItems: any[]): b
    return true;
  }
  
@@ -1683,7 +1703,7 @@ index 1be02a5..1ff5467 100644
  function isOpenAIResponsesCacheableContentBlock(block: unknown): block is Record<string, unknown> {
    if (!block || typeof block !== 'object' || Array.isArray(block)) return false;
    const type = (block as Record<string, unknown>).type;
-@@ -801,6 +1092,8 @@ function createFunctionCallPart(item: any): FunctionCallPart {
+@@ -801,6 +1110,8 @@ function createFunctionCallPart(item: any): FunctionCallPart {
        name: item.name,
        args: parseFunctionCallArguments(item.arguments),
        callId: normalizeCallId(item.call_id) ?? normalizeCallId(item.id),
@@ -1692,7 +1712,7 @@ index 1be02a5..1ff5467 100644
      },
    };
  }
-@@ -819,13 +1112,16 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
+@@ -819,13 +1130,16 @@ function parseFunctionCallArguments(argumentsValue: unknown): Record<string, unk
  function rememberPendingFunctionCall(
    state: OpenAIResponsesStreamState,
    item: any,
@@ -1709,7 +1729,7 @@ index 1be02a5..1ff5467 100644
    if (typeof item.name === 'string' && item.name.trim()) pending.name = item.name;
    if (typeof item.arguments === 'string') {
      if (item.arguments || !pending.argumentsText) {
-@@ -836,6 +1132,7 @@ function rememberPendingFunctionCall(
+@@ -836,6 +1150,7 @@ function rememberPendingFunctionCall(
    }
  
    state.pendingFunctionCalls.set(itemKey, pending);
@@ -1717,7 +1737,7 @@ index 1be02a5..1ff5467 100644
    return itemKey;
  }
  
-@@ -843,13 +1140,16 @@ function appendPendingFunctionCallArguments(
+@@ -843,13 +1158,16 @@ function appendPendingFunctionCallArguments(
    state: OpenAIResponsesStreamState,
    itemId: unknown,
    delta: unknown,
@@ -1734,7 +1754,7 @@ index 1be02a5..1ff5467 100644
  }
  
  function getPendingFunctionCallKey(item: any): string | undefined {
-@@ -860,38 +1160,55 @@ function emitFunctionCallChunk(
+@@ -860,38 +1178,55 @@ function emitFunctionCallChunk(
    chunk: LLMStreamChunk,
    itemOrKey: any,
    state: OpenAIResponsesStreamState,
@@ -1796,7 +1816,7 @@ index 1be02a5..1ff5467 100644
  function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
    try {
      return createFunctionCallPart(item);
-@@ -899,3 +1216,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
+@@ -899,3 +1234,4 @@ function tryCreateFunctionCallPart(item: any): FunctionCallPart | undefined {
      return undefined;
    }
  }
@@ -2669,7 +2689,7 @@ index 8c4e118..92bd014 100644
      if (buffer) {
        const lines = buffer.split('\n');
 diff --git a/src/types/llm.ts b/src/types/llm.ts
-index 53d444d..f34cd7d 100644
+index 53d444d..ef2edc7 100644
 --- a/src/types/llm.ts
 +++ b/src/types/llm.ts
 @@ -4,7 +4,7 @@
@@ -2681,7 +2701,7 @@ index 53d444d..f34cd7d 100644
  import { FunctionDeclaration } from './tool.js';
  
  export interface LLMThinkingConfig {
-@@ -167,4 +167,34 @@ export interface LLMStreamChunk {
+@@ -167,4 +167,40 @@ export interface LLMStreamChunk {
    error?: LLMRawErrorInfo;
    /** 上游原始 SSE 块；错误 chunk 会尽量保留。 */
    rawChunk?: unknown;
@@ -2715,12 +2735,18 @@ index 53d444d..f34cd7d 100644
 +  completedContents?: Content[];
 +  /** LimCode Astra 扩展（同上）：本 chunk 归属的 output item 稳定引用（SSE output_index/item_id）。 */
 +  outputItem?: LimcodeOutputItemReference;
++  /** LimCode native HTTP: completed item facts, including terminal-only items, in provider order. */
++  completedOutputItems?: Content[];
++  /** The raw output_item.done boundary, shared with the native WebSocket projection. */
++  outputItemDone?: LimcodeOutputItemReference;
++  /** A reasoning item is closed here; later responses must start a fresh thought block. */
++  reasoningItemDone?: boolean;
  }
 diff --git a/src/types/message.ts b/src/types/message.ts
-index c318996..9c89769 100644
+index c318996..e795d47 100644
 --- a/src/types/message.ts
 +++ b/src/types/message.ts
-@@ -7,8 +7,17 @@
+@@ -7,8 +7,18 @@
  
  import type { ToolDiffPreviewResponseLike } from '../plugin/tool-preview.js';
  
@@ -2729,6 +2755,7 @@ index c318996..9c89769 100644
 +  id: string;
 +  ordinal: number;
 +  phase?: 'commentary' | 'final_answer';
++  providerResponseId?: string;
 +}
 +
  /** 文本部分 */
@@ -2738,7 +2765,7 @@ index c318996..9c89769 100644
    text?: string;
    /** Gemini thinking 文本块 */
    thought?: boolean;
-@@ -51,11 +60,15 @@ export interface ProviderContextItem {
+@@ -51,11 +61,15 @@ export interface ProviderContextItem {
  
  /** Provider 原生上下文状态 part（如 OpenAI Responses compaction item） */
  export interface ProviderContextPart {
@@ -2754,7 +2781,7 @@ index c318996..9c89769 100644
    inlineData: {
      mimeType: string;
      data: string;
-@@ -66,16 +79,22 @@ export interface InlineDataPart {
+@@ -66,16 +80,22 @@ export interface InlineDataPart {
  
  /** 函数调用部分（由模型发出） */
  export interface FunctionCallPart {
@@ -2777,7 +2804,7 @@ index c318996..9c89769 100644
    functionResponse: {
      name: string;
      response: Record<string, unknown>;
-@@ -117,10 +136,28 @@ export interface UsageMetadata {
+@@ -117,10 +137,28 @@ export interface UsageMetadata {
    cacheCreationInputTokensDetails?: CacheCreationInputTokensDetails;
  }
  
@@ -8548,6 +8575,49 @@ index 415af05..84e2f05 100644
    });
  
  });
+diff --git a/tests/limcode-native-http-items.test.ts b/tests/limcode-native-http-items.test.ts
+new file mode 100644
+index 0000000..045dc41
+--- /dev/null
++++ b/tests/limcode-native-http-items.test.ts
+@@ -0,0 +1,37 @@
++import { describe, expect, it } from 'vitest';
++import { OpenAIResponsesFormat } from '../src/index.js';
++
++describe('LimCode native HTTP completed item facts', () => {
++  it('closes plain and reasoning items and includes terminal-only items in provider order', () => {
++    const format = new OpenAIResponsesFormat('gpt-6-astra', undefined, true);
++    const state = format.createStreamState();
++    format.decodeStreamChunk({ type: 'response.created', response: { id: 'response-a' } }, state);
++    const plain = { type: 'message', id: 'message-a', role: 'assistant',
++      content: [{ type: 'output_text', text: 'closed plain', annotations: [] }] };
++    const reasoning = { type: 'reasoning', id: 'reasoning-a', summary: [{ type: 'summary_text', text: 'closed thought' }],
++      encrypted_content: 'frozen-signature' };
++    const closed = format.decodeStreamChunk({ type: 'response.output_item.done', output_index: 0, item: plain }, state);
++    expect(closed.outputItemDone).toEqual({ id: 'message-a', ordinal: 0, providerResponseId: 'response-a' });
++    expect(closed.completedOutputItems?.[0].parts[0]).toMatchObject({ text: 'closed plain', outputItem: closed.outputItemDone });
++    const thought = format.decodeStreamChunk({ type: 'response.output_item.done', output_index: 1, item: reasoning }, state);
++    expect(thought.reasoningItemDone).toBe(true);
++    expect(thought.completedOutputItems?.[0].parts.some(part => 'thought' in part && part.thought === true)).toBe(true);
++    const terminal = format.decodeStreamChunk({ type: 'response.completed', response: {
++      id: 'response-a', output: [plain, reasoning, { type: 'function_call', id: 'call-item', call_id: 'call-a', name: 'probe', arguments: '{}' }]
++    } }, state);
++    expect(terminal.completedOutputItems).toEqual(terminal.completedContents);
++    expect(terminal.completedOutputItems?.map(content => content.parts[0]?.outputItem?.ordinal)).toEqual([0, 1, 2]);
++  });
++
++  it('keeps a late done response identity and never enables closures for ordinary decoding', () => {
++    const format = new OpenAIResponsesFormat('gpt-6-astra', undefined, true);
++    const state = format.createStreamState();
++    format.decodeStreamChunk({ type: 'response.created', response: { id: 'response-b' } }, state);
++    const raw = { type: 'response.output_item.done', response_id: 'response-a', output_index: 0,
++      item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'first' }] } };
++    const native = format.decodeStreamChunk(raw, state);
++    expect(native.outputItemDone).toEqual({ id: 'output:0', ordinal: 0, providerResponseId: 'response-a' });
++    const ordinary = new OpenAIResponsesFormat('gpt-6-astra');
++    expect(ordinary.decodeStreamChunk(raw, ordinary.createStreamState())).not.toHaveProperty('completedOutputItems');
++  });
++});
 diff --git a/tests/openai-compatible-finish-reason-error.test.ts b/tests/openai-compatible-finish-reason-error.test.ts
 new file mode 100644
 index 0000000..1e91a77
@@ -9753,10 +9823,10 @@ index 0000000..defc1e5
 +});
 diff --git a/tests/openai-responses-format-fixes.test.ts b/tests/openai-responses-format-fixes.test.ts
 new file mode 100644
-index 0000000..edf48cb
+index 0000000..8b26c1d
 --- /dev/null
 +++ b/tests/openai-responses-format-fixes.test.ts
-@@ -0,0 +1,1843 @@
+@@ -0,0 +1,1853 @@
 +/**
 + * OpenAI Responses 格式修复（组 B：B4 strict、B5 显式缓存断点、B6 phase、B8 服务端 compaction）。
 + *
@@ -9813,6 +9883,16 @@ index 0000000..edf48cb
 +function decodeAll(format: OpenAIResponsesFormat, events: any[]): any[] {
 +  const state = format.createStreamState();
 +  return events.map(event => format.decodeStreamChunk(structuredClone(event), state));
++}
++
++// limcode.8 adds explicit native completion evidence. The pre-existing semantic projection must
++// remain byte-identical; its added facts are checked independently in limcode-native-http-items.
++function withoutNativeCompletionEvidence(value: any): any {
++  if (Array.isArray(value)) return value.map(withoutNativeCompletionEvidence);
++  if (!value || typeof value !== 'object') return value;
++  return Object.fromEntries(Object.entries(value)
++    .filter(([key]) => !['completedOutputItems', 'outputItemDone', 'reasoningItemDone', 'providerResponseId'].includes(key))
++    .map(([key, child]) => [key, withoutNativeCompletionEvidence(child)]));
 +}
 +
 +const TOOLS = [{ functionDeclarations: [
@@ -10973,7 +11053,7 @@ index 0000000..edf48cb
 +
 +  it('Astra 原生解码（HTTP 与 WS 构造方式）带 phase 时与修复前逐字节一致', () => {
 +    const http = decodeAll(new OpenAIResponsesFormat('gpt-6-astra', undefined, true), sseEvents('resp_a', PHASE_OUTPUT));
-+    expect(JSON.stringify(http)).toBe(JSON.stringify(BASELINE_ASTRA_STREAM_PHASE));
++    expect(JSON.stringify(withoutNativeCompletionEvidence(http))).toBe(JSON.stringify(BASELINE_ASTRA_STREAM_PHASE));
 +    const ws = decodeAll(new OpenAIResponsesFormat('gpt-6-astra'), sseEvents('resp_w', PHASE_OUTPUT));
 +    expect(JSON.stringify(ws)).toBe(JSON.stringify(BASELINE_ASTRA_WS_STREAM_PHASE));
 +    // 非流式解码只多出带 phase 的 message 文本上的 outputItem（GPT-6 家族不再排除），其余与修复前逐字节一致。
@@ -11505,7 +11585,7 @@ index 0000000..edf48cb
 +  it('HTTP/SSE 原生解码、WS 构造方式与非流式解码均与 Astra 基线逐字节一致', () => {
 +    for (const model of FAMILY) {
 +      const http = decodeAll(new OpenAIResponsesFormat(model, undefined, true), sseEvents('resp_a', PHASE_OUTPUT));
-+      expect(JSON.stringify(http), model).toBe(JSON.stringify(BASELINE_ASTRA_STREAM_PHASE));
++      expect(JSON.stringify(withoutNativeCompletionEvidence(http)), model).toBe(JSON.stringify(BASELINE_ASTRA_STREAM_PHASE));
 +      const ws = decodeAll(new OpenAIResponsesFormat(model), sseEvents('resp_w', PHASE_OUTPUT));
 +      expect(JSON.stringify(ws), model).toBe(JSON.stringify(BASELINE_ASTRA_WS_STREAM_PHASE));
 +      const decoded = new OpenAIResponsesFormat(model, undefined, true).decodeResponse(structuredClone({ id: 'resp_a', output: PHASE_OUTPUT }));

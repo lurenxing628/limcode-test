@@ -90,7 +90,7 @@ export class ReliableContextTokenEstimator {
   ) {
     this.context = new ContextSequenceControlPlane(database, contentStore);
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
-    this.attachmentHandles = new ConversationAttachmentHandleRegistry(database);
+    this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { contentStore });
   }
 
   public async estimateRoot(rootIdInput: string): Promise<ReliableContextTokenEstimate> {

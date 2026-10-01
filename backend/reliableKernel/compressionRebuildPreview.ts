@@ -24,7 +24,7 @@ import {
 } from './contextCompressionCoordinator';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
-import { mergeConversationChildHandles, readConversationChildHandles } from './conversationChildHandles';
+import { readConversationContextHandleCatalog } from './conversationChildHandles';
 import { frozenCompressionPolicy } from './frozenAuthority';
 import { compactRequestForCompressionPlanning, estimateCompactProjection } from './llmCapabilityProviderAdapter';
 import {
@@ -34,7 +34,7 @@ import {
   preflightCompressionRequest,
   UNCALIBRATED_PROVIDER_TOKENS
 } from './modelFacingContextProjection';
-import { buildModelHandleCatalog } from './modelHandleCatalog';
+import { buildModelHandleCatalog, mergeModelHandleCatalogs } from './modelHandleCatalog';
 import type { FullProviderContextItem, FullProviderRequest } from './modelProviderControlPlane';
 import { estimateMessageContentsTokens } from './modelTokenEstimator';
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
@@ -158,14 +158,18 @@ export async function previewCompressionSourceReplay(
     conversationId,
     materialized.segments.map((segment) => ({ segmentId: segment.segmentId }))
   );
-  const attachmentHandles = await new ConversationAttachmentHandleRegistry(database).peek(
+  const attachmentHandles = await new ConversationAttachmentHandleRegistry(database, { contentStore }).peek(
     conversationId,
     attachmentCatalogState.catalog
   );
-  const modelHandleCatalog = buildModelHandleCatalog(segmentTexts, [
-    ...attachmentHandles.entries,
-    ...mergeConversationChildHandles(await readConversationChildHandles(database, contentStore, conversationId))
-  ]);
+  const windowHandleCatalog = buildModelHandleCatalog(segmentTexts, mergeModelHandleCatalogs(
+    { entries: attachmentHandles.entries },
+    await readConversationContextHandleCatalog(database, contentStore, conversationId)
+  ));
+  const expandedHandleCatalog = buildModelHandleCatalog(sourceContext.map(item => item.content), windowHandleCatalog);
+  const attachmentRefs = new Map(attachmentHandles.entries.map(entry => [entry.target, entry.ref]));
+  const modelHandleCatalog = { ...expandedHandleCatalog, entries: expandedHandleCatalog.entries.filter(entry =>
+    entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
   const observationProfile = attachmentCatalogState.catalog.length > 0
     ? attachmentObservationAnalysisProfileSha256(policy.provider)
     : undefined;
@@ -205,7 +209,7 @@ export async function previewCompressionSourceReplay(
       compressionMethodKind: methodKind,
       ...(methodKind === 'provider_native' ? { tools: (tools ?? []) as unknown as PlainJsonValue } : {}),
       attachmentCatalogState: attachmentCatalogState as unknown as PlainJsonValue,
-      ...(modelHandleCatalog.entries.length > 0 ? { modelHandleCatalog: modelHandleCatalog as unknown as PlainJsonValue } : {}),
+      modelHandleCatalog: modelHandleCatalog as unknown as PlainJsonValue,
       ...(text && observationProfile ? {
         attachmentObservationProfileSha256: observationProfile,
         attachmentObservationRequirements: observationRequirements as unknown as PlainJsonValue

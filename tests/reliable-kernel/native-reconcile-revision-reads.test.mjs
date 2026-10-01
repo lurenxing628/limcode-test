@@ -178,7 +178,7 @@ function observedSession(app, { conversationId, turnId, modelRequestId }, reads)
     effects: loop.effects, tools: loop.tools, modelProvider: loop.modelProvider,
     conversationId, turnId, modelRequestId, providerId: PROVIDER_ID, modelId: MODEL_ID, capabilities,
     budget: { maxPhysicalResponses: 1000, maxOutputTokens: 1000000 },
-    initialContextRootId: 'unused-root', modelHandleCatalog: {},
+    initialContextRootId: 'unused-root', modelHandleCatalog: { entries: [] },
     resolveAdapter: unused, resolveDefinition: unused, resolveCallArguments: unused, freezePolicies: unused,
     dispatchCall: unused, closeAdmittedCall: unused,
     toolCallIdFor: (providerOrdinal, providerCallId, name) => toolCallIdFor(modelRequestId, providerOrdinal, providerCallId, name),

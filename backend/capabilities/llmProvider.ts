@@ -63,6 +63,7 @@ import {
   createDoneTiming,
   disposeThoughtBlock,
   emitThoughtDeltas,
+  emitCompletedNativeItems,
   emitUnifiedChunk,
   emitUnifiedResponse,
   errorSearchText,
@@ -797,6 +798,11 @@ async function runLlmAttempt(
         };
       }
       if (hasModelOutputChunk(chunk)) responseTiming.outputObserved(chunkAt, chunkMark);
+      // A terminal response can be the first complete proof of its output items. Persist those
+      // facts before closing the physical response, so its calls and content share that scope.
+      if (nativeEvent?.type === 'response.completed' || nativeEvent?.type === 'response.incomplete') {
+        emitCompletedNativeItems(request.id, chunk, chunkEmit, nativeChain);
+      }
       if (nativeEvent) {
         // 每个物理 response 结束时带上它自己的首字与输出用时；工具执行时间不属于任何 response。
         const responseEndTiming = nativeEvent.type === 'response.completed' || nativeEvent.type === 'response.incomplete'

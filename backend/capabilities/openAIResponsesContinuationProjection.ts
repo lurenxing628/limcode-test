@@ -30,6 +30,7 @@ interface ProjectedFunctionCall {
   callId: string;
   name: string;
   args: Record<string, unknown>;
+  async?: true;
 }
 
 interface ProjectedReasoningItem {
@@ -159,14 +160,16 @@ export class OpenAIResponsesContinuationProjection {
           functionCall: {
             name: call.name,
             args: cloneJson(call.args),
-            callId: call.callId
+            callId: call.callId,
+            ...(call.async === true ? { async: true } : {})
           }
         }, outputItem));
         outputItems.push({
           type: 'function_call',
           call_id: call.callId,
           name: call.name,
-          arguments: JSON.stringify(call.args)
+          arguments: JSON.stringify(call.args),
+          ...(call.async === true ? { async: true } : {})
         });
       }
     }
@@ -293,7 +296,8 @@ export class OpenAIResponsesContinuationProjection {
     const candidate: ProjectedFunctionCall = {
       callId,
       name: part.functionCall.name,
-      args: cloneJson(part.functionCall.args)
+      args: cloneJson(part.functionCall.args),
+      ...('async' in part.functionCall && part.functionCall.async === true ? { async: true as const } : {})
     };
     const existingIndex = this.functionCallIndexes.get(callId);
     if (existingIndex === undefined) {
@@ -679,6 +683,7 @@ function terminalComparable(value: Record<string, unknown>): Record<string, unkn
 
 function sameFunctionCall(item: Record<string, unknown>, call: ProjectedFunctionCall): boolean {
   if (optionalString(item.call_id) !== call.callId || optionalString(item.name) !== call.name) return false;
+  if ((item.async === true) !== (call.async === true)) return false;
   let args: unknown = item.arguments;
   if (typeof args === 'string') {
     try {

@@ -2,15 +2,16 @@ import { readRequestTurnAuthority } from './requestCompressionSettings';
 
 import {
   buildModelHandleCatalog,
+  mergeModelHandleCatalogs,
   modelHandleEntries,
   modelHandleRef,
   normalizeModelHandleCatalog,
   resolveModelToolArguments,
   UnknownModelHandleReferenceError,
-  type ModelHandleCatalog,
-  type ModelHandleEntry
+  type ModelHandleCatalog
 } from './modelHandleCatalog';
-import { forkInheritedChildTargets, forkSourceConversationIds, isForkConversation, readConversationChildHandles } from './conversationChildHandles';
+import { forkInheritedChildTargets, forkSourceConversationIds, isForkConversation, readConversationContextHandleState } from './conversationChildHandles';
+import { historicalProcessHandleCard } from './historicalProcessHandleCard';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import { isReadonlyCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
@@ -1156,7 +1157,7 @@ export class ReliableAgentLoop {
       ) as unknown as ContentObjectMetadata;
       handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
     }
-    const seeds = [...attachmentHandles.entries, ...runtimeStatus.childHandles];
+    const seeds = mergeModelHandleCatalogs(attachmentHandles, runtimeStatus.contextHandles);
     let modelHandleCatalog = buildModelHandleCatalog(handleSources, seeds);
     const forkIdentity = runtimeStatus.forkIdentity;
     const inheritedCollaboration = forkIdentity ? forkInheritedCollaborationTargets(modelHandleCatalog, forkIdentity) : undefined;
@@ -1164,6 +1165,11 @@ export class ReliableAgentLoop {
       // The fork's own address joins the catalog so the model can tell itself from its sources.
       modelHandleCatalog = buildModelHandleCatalog([...handleSources, { kind: 'agent_collaboration', conversationId: forkIdentity.conversationId }], seeds);
     }
+    // Raw user/tool JSON is not an attachment registry. It may mention a canonical Attachment
+    // outside the visible catalog, but cannot mint an F address or change a reserved one.
+    const attachmentRefs = new Map(attachmentHandles.entries.map(entry => [entry.target, entry.ref]));
+    modelHandleCatalog = { ...modelHandleCatalog, entries: modelHandleCatalog.entries.filter(entry =>
+      entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
     if (runtimeStatusCard) {
       // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
       runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
@@ -1183,6 +1189,11 @@ export class ReliableAgentLoop {
       }
     }
     let statusCard = runtimeStatusCard;
+    const processRepairCard = await historicalProcessHandleCard(this.database, this.contentStore, conversationId, modelHandleCatalog);
+    if (processRepairCard) {
+      statusCard ??= emptyRuntimeStatusCard('[Historical reference repair — runtime data]');
+      statusCard.card += '\n' + processRepairCard;
+    }
     if (forkIdentity && inheritedCollaboration) {
       const refs = (kind: 'conversation' | 'collaborationMessage', targets: readonly string[]) => targets
         .map(target => modelHandleRef(modelHandleCatalog, kind, target)).filter((ref): ref is string => !!ref);
@@ -1215,7 +1226,7 @@ export class ReliableAgentLoop {
       round: input.round,
       tools: input.tools,
       attachmentCatalogState,
-      ...(modelHandleCatalog.entries.length > 0 ? { modelHandleCatalog } : {}),
+      modelHandleCatalog,
       ...(currentTurnState.reference ? { currentTurnInput: currentTurnState.reference } : {}),
       ...(turnTaskCard ? {
         turnTaskCard,
@@ -1232,7 +1243,12 @@ export class ReliableAgentLoop {
       ...(nativeFreeze.turnReminderDelivery ? { turnReminderDelivery: nativeFreeze.turnReminderDelivery } : {}),
       ...(nativeFreeze.nativeResponses ? { nativeResponses: nativeFreeze.nativeResponses } : {}),
       ...(nativeErrorRecovery && nativeErrorRecovery.failures > 0 ? { nativeErrorRecovery } : {}),
-      ...(nativeFreeze.nativeReasoning ? { nativeReasoning: nativeFreeze.nativeReasoning } : {})
+      ...(nativeFreeze.nativeReasoning || (nativeFreeze.nativeResponses && runtimeStatus.requiresNativeReset)
+        ? { nativeReasoning: {
+            ...nativeFreeze.nativeReasoning,
+            ...(nativeFreeze.nativeResponses && runtimeStatus.requiresNativeReset
+              ? { resetCache: true, forceFullReason: 'context_handle_identity_repair' } : {})
+          } } : {})
     }, 'Reliable Agent recipe');
   }
 
@@ -1492,21 +1508,22 @@ export class ReliableAgentLoop {
 
   private async readRuntimeStatusCard(turnId: string): Promise<{
     statusCard?: FrozenRuntimeStatusCard;
-    /** Persistent child refs of the Conversation, read once for the recipe's handle catalog. */
-    childHandles: ModelHandleEntry[];
+    /** Complete identity state, including retired addresses, frozen into the next request. */
+    contextHandles: ModelHandleCatalog;
+    requiresNativeReset: boolean;
     /** For a fork: what copied collaboration refs mean here, read once for the recipe. */
     forkIdentity?: ForkIdentityFacts;
   }> {
     const turn = await this.requireExisting('Turn', turnId);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
-    const [projection, processLinks, childHandles, fork] = await Promise.all([
+    const [projection, processLinks, handleState, fork] = await Promise.all([
       readConversationChildTaskProjection(this.database, this.contentStore, conversationId),
       listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId }),
-      readConversationChildHandles(this.database, this.contentStore, conversationId),
+      readConversationContextHandleState(this.database, this.contentStore, conversationId),
       isForkConversation(this.database, conversationId)
     ]);
     const inheritedChildTargets = fork
-      ? forkInheritedChildTargets(childHandles, new Set(projection.tasks.map(task => task.answerBridgeId)))
+      ? forkInheritedChildTargets(handleState.catalog.entries, new Set(projection.tasks.map(task => task.answerBridgeId)))
       : [];
     const forkIdentity = fork ? await this.readForkIdentityFacts(conversationId) : undefined;
     const processSnapshot = processLinks.length === 0 ? null : await this.database.snapshot(processLinks.map(link =>
@@ -1517,7 +1534,8 @@ export class ReliableAgentLoop {
         : []);
     const direct = projection.tasks.filter(task => task.depth === 1);
     if (direct.length === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
-      return { childHandles, ...(forkIdentity ? { forkIdentity } : {}) };
+      return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
+        ...(forkIdentity ? { forkIdentity } : {}) };
     }
     const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
     const pendingHandling = (task: typeof direct[number]) => task.result.deliveries.some(delivery =>
@@ -1561,7 +1579,8 @@ export class ReliableAgentLoop {
     const activeChildCount = direct.filter(task => live(task.status)).length;
     const queuedInputCount = direct.reduce((sum, task) => sum + task.queuedInputs.filter(source => source.classification === 'task').length, 0);
     const awaitingHandlingCount = direct.filter(pendingHandling).length;
-    return { childHandles, ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
+    return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
+      ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
       kind: 'runtime_status_card', childTaskRevision: projection.revision,
       totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
       queuedInputCount, awaitingHandlingCount, activeChildCount,
@@ -3019,14 +3038,17 @@ export class ReliableAgentLoop {
     if (!output.content.parts.some((part) => 'text' in part && part.text.trim().length > 0)) {
       return undefined;
     }
-    const committed = await this.turnOutput.appendAssistantMessage({
+    const partialInput = {
       turnId,
       modelRequestId,
       sourceKey: `failed-partial:${modelRequestId}`,
       content: canonicalPlainJson(output.content, 'Failed partial Provider MessageContent'),
-      contentType: MESSAGE_CONTENT_TYPE,
-      contextDisposition: 'exclude'
-    });
+      contentType: MESSAGE_CONTENT_TYPE
+    };
+    const recipe = await this.readModelRequestRecipe(modelRequestId);
+    const committed = readFrozenNativeCapabilities(recipe)
+      ? await this.turnOutput.appendNativeAssistantPartialAggregate(partialInput)
+      : await this.turnOutput.appendAssistantMessage({ ...partialInput, contextDisposition: 'exclude' });
     return committed.messageId;
   }
 

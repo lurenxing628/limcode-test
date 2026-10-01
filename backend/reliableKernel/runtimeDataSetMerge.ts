@@ -2871,6 +2871,7 @@ const SKIPPED_WITH: ReadonlyArray<{ domain: string; column: string; owner: strin
   { domain: 'ContextSequenceRoot', column: 'conversation_id', owner: 'Conversation' },
   { domain: 'ModelContextProjection', column: 'owner_id', owner: 'ModelRequest', kind: ['owner_kind', 'model_request'] },
   { domain: 'ModelContextProjection', column: 'owner_id', owner: 'CompressionBlock', kind: ['owner_kind', 'compression_block'] },
+  { domain: 'ModelContextProjection', column: 'owner_id', owner: 'Conversation', kind: ['owner_kind', 'conversation_handle_catalog'] },
   { domain: 'ModelContextProjection', column: 'root_id', owner: 'ContextSequenceRoot' },
   { domain: 'EffectIntent', column: 'attempt_id', owner: 'Attempt' },
   { domain: 'EffectReceipt', column: 'attempt_id', owner: 'Attempt' },

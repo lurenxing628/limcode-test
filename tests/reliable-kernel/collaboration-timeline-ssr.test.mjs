@@ -2,6 +2,27 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
+function createAnimationFrameQueue() {
+  const callbacks = new Map();
+  let nextId = 0;
+  return {
+    requestAnimationFrame(callback) { const id = ++nextId; callbacks.set(id, callback); return id; },
+    cancelAnimationFrame(id) { callbacks.delete(id); },
+    get pendingCount() { return callbacks.size; },
+    async flush(nextTick) {
+      for (let frame = 0; frame < 32; frame += 1) {
+        await nextTick();
+        if (callbacks.size === 0) return;
+        for (const [id, callback] of [...callbacks]) {
+          if (!callbacks.delete(id)) continue;
+          callback(frame * 16);
+        }
+      }
+      assert.fail('The SSR fixture did not finish its scheduled animation frames');
+    }
+  };
+}
+
 // Synthetic feed only: no persisted runtime, user data or full extension build.
 test('SSR keeps collaboration visible in a 35-message Turn and pages it with the same 30-row window', async () => {
   const pinia = await import('pinia');
@@ -10,10 +31,11 @@ test('SSR keeps collaboration visible in a 35-message Turn and pages it with the
   const previousPinia = pinia.getActivePinia();
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
+  const frames = createAnimationFrameQueue();
   globalThis.window = {
     addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout, atob,
-    requestAnimationFrame(callback) { return setTimeout(() => callback(Date.now()), 0); },
-    cancelAnimationFrame(id) { clearTimeout(id); },
+    requestAnimationFrame: frames.requestAnimationFrame,
+    cancelAnimationFrame: frames.cancelAnimationFrame,
     acquireVsCodeApi() { return { postMessage() {}, getState() { return {}; }, setState() {} }; }
   };
   let server;
@@ -78,12 +100,12 @@ test('SSR keeps collaboration visible in a 35-message Turn and pages it with the
     assert.equal(scroller.scrollTop, 190);
     assert.equal(recent.setup.segmentStart, 6);
     recent.setup.showEarlierSegment();
-    await nextTick();
+    await frames.flush(nextTick);
     assert.equal(recent.setup.segmentStart, 0);
     assert.equal(recent.setup.visibleTimelineRows.some((row) => row.id === 'm1'), true);
     assert.equal(recent.setup.visibleTimelineRows.some((row) => row.id === 'collaboration:card'), false);
     recent.setup.showLaterSegment();
-    await nextTick();
+    await frames.flush(nextTick);
     assert.equal(recent.setup.visibleTimelineRows.some((row) => row.id === 'collaboration:card'), true);
 
     feed.records.Message = {};
@@ -112,10 +134,16 @@ test('SSR keeps collaboration visible in a 35-message Turn and pages it with the
     assert.match(failed.html, /投递未进入回合，位置待确认/);
     assert.equal(failed.setup.visibleTimelineRows.length, 2);
   } finally {
-    if (server) await server.close();
-    pinia.setActivePinia(previousPinia);
-    globalThis.window = previousWindow;
-    globalThis.document = previousDocument;
+    try {
+      await frames.flush(nextTick);
+      if (server) await server.close();
+      await frames.flush(nextTick);
+      assert.equal(frames.pendingCount, 0, 'paint callbacks must finish before restoring the fixture window');
+    } finally {
+      pinia.setActivePinia(previousPinia);
+      globalThis.window = previousWindow;
+      globalThis.document = previousDocument;
+    }
   }
 });
 
@@ -141,10 +169,11 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
   const previousWindow = globalThis.window;
   const previousDocument = globalThis.document;
   const posted = [];
+  const frames = createAnimationFrameQueue();
   globalThis.window = {
     addEventListener() {}, removeEventListener() {}, setTimeout, clearTimeout, atob,
-    requestAnimationFrame(callback) { return setTimeout(() => callback(Date.now()), 0); },
-    cancelAnimationFrame(id) { clearTimeout(id); },
+    requestAnimationFrame: frames.requestAnimationFrame,
+    cancelAnimationFrame: frames.cancelAnimationFrame,
     acquireVsCodeApi() { return { postMessage(message) { posted.push(structuredClone(message)); }, getState() { return {}; }, setState() {} }; }
   };
   let server;
@@ -207,7 +236,7 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     app.mixin({ created() { if (this.$.type.__name === MessageList.__name) live = this.$.setupState; } });
     app.provide(vue.ssrContextKey, { modules: new Set() });
     app.mount({});
-    await vue.nextTick();
+    await frames.flush(vue.nextTick);
     assert.equal(live.segmentStart, 20, 'the latest segment follows the newest messages');
     assert.deepEqual(live.visibleMessageRows.map((message) => message.id), Array.from({ length: 10 }, (_, index) => `m${index + 1}`));
 
@@ -222,7 +251,7 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
         nextBeforeMessageSeq: '21', nextBeforeId: 'older-21', hasMore: true, scanProgress: false, scannedRows: 20, responseBytes: 4096
       }
     });
-    await vue.nextTick();
+    await frames.flush(vue.nextTick);
     assert.equal(feed.collaborationHistoryLoadedPages, 2);
     assert.equal(live.timelineRows.length, 70);
     assert.equal(live.segmentStart, 0, 'the earlier page opens where it was requested: at the top');
@@ -232,7 +261,7 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
 
     // Another card of an older Turn inserted above the mounted rows keeps what the user is reading.
     live.showLaterSegment();
-    await vue.nextTick();
+    await frames.flush(vue.nextTick);
     const reading = live.visibleTimelineRows[0].id;
     const inserted = olderCardRecords([5]);
     feed.collaborationHistoryRecords = Object.fromEntries(Object.entries(feed.collaborationHistoryRecords)
@@ -241,16 +270,22 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     assert.equal(live.timelineRows.length, 71);
     assert.equal(live.visibleTimelineRows[0].id, reading, 'an inserted older row keeps the reading position');
   } finally {
-    app?.unmount();
-    // Mounting the synthetic messages starts real detail requests. Retire this fixture's session
-    // through the normal empty-snapshot path so its unanswered deadlines/retries do not outlive it.
-    feed?.observe({
-      type: 'reliable-kernel.snapshot', sessionId: 'fixture-disposed', hostBootId: 'fixture-disposed',
-      messageSeq: '1', snapshotCommitSeq: '0', projections: {}
-    });
-    if (server) await server.close();
-    pinia.setActivePinia(previousPinia);
-    globalThis.window = previousWindow;
-    globalThis.document = previousDocument;
+    try {
+      app?.unmount();
+      // Retire unanswered detail deadlines/retries, then finish the snapshot's double-RAF paint
+      // diagnostic while it still has this fixture's window. No timer may use a later test's globals.
+      feed?.observe({
+        type: 'reliable-kernel.snapshot', sessionId: 'fixture-disposed', hostBootId: 'fixture-disposed',
+        messageSeq: '1', snapshotCommitSeq: '0', projections: {}
+      });
+      await frames.flush(vue.nextTick);
+      if (server) await server.close();
+      await frames.flush(vue.nextTick);
+      assert.equal(frames.pendingCount, 0, 'paint callbacks must finish before restoring the fixture window');
+    } finally {
+      pinia.setActivePinia(previousPinia);
+      globalThis.window = previousWindow;
+      globalThis.document = previousDocument;
+    }
   }
 });

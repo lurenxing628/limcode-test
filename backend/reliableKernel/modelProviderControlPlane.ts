@@ -606,7 +606,7 @@ export class ModelProviderControlPlane {
     );
     this.context = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.attachmentCatalog = new AttachmentCatalogProjection(database);
-    this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { now: this.now });
+    this.attachmentHandles = new ConversationAttachmentHandleRegistry(database, { now: this.now, contentStore });
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
     this.nativeSteering = new NativeSteeringStore(database, contentStore, {
       now: this.now,

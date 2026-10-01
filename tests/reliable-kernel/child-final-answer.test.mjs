@@ -639,9 +639,13 @@ test('a child Turn completed on the native final-output path answers its parent 
       releaseB.resolve();
       await waitFor(() => delivered.includes('native-call-b'), 'the second result reached the server');
       await waitFor(async () => (await rows('ToolCallEvent', { event_kind: 'native_delivery' })).length === 2, 'both delivery facts committed');
+      const finalItem = { id: 'native-final-item', ordinal: 0, providerResponseId: current };
+      const finalContent = { role: 'model', parts: [{ text: NATIVE_FINAL, outputItem: finalItem }] };
+      await emit('output_delta', { type: 'text_delta', text: NATIVE_FINAL, outputItem: finalItem });
+      await emit('output_item_done', { type: 'output_item_done', outputItem: finalItem, completedItem: finalContent });
       await emit('native_control', { type: 'response.completed', responseId: current,
         usage: { input_tokens: 300, output_tokens: 8, input_tokens_details: { cached_tokens: 0 } } });
-      await emit('completed', { role: 'model', parts: [...parts, { text: NATIVE_FINAL }] });
+      await emit('completed', { role: 'model', parts: [...parts, ...finalContent.parts] });
       controls.native.onController(undefined);
     }
   };

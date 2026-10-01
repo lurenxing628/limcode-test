@@ -13,7 +13,7 @@ import {
 } from '../capabilities/openAIResponsesNativeControl';
 import { SKILLS_TOOL_NAME, type ModelOutputItemReference, type ModelResponseTiming } from '../../shared/protocol';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
-import { freezeNativeChildToolProjection, readNativeRequestChildHandles, withChildHandles } from './conversationChildHandles';
+import { freezeNativeChildToolProjection, readNativeRequestContextHandleCatalog, withChildHandles } from './conversationChildHandles';
 import { normalizeModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import { nativeToolOutputTextTokens, TOOL_RESULT_BATCH_MAX_TOKENS, SKILL_TOOL_RESULT_MAX_TOKENS } from './modelFacingContextProjection';
 import { ContextSequenceControlPlane } from './contextSequence';
@@ -52,6 +52,9 @@ import {
   assistantMessageRevisionIdFor,
   nativeCumulativeRevisionId,
   nativeItemRevisionId,
+  nativeAssistantPartIdentity,
+  nativeAssistantComparablePart,
+  normalizeNativeAssistantCompletedItem,
   TurnOutputControlPlane
 } from './turnOutput';
 import type {
@@ -185,6 +188,8 @@ export class NativeRequestSession {
   private readonly steerReceipts = new Map<string, NativeSteeringReceipt>();
   /** Per-submission serialization of durable receipt writes (see transitionSteer). */
   private readonly steerTails = new Map<string, Promise<void>>();
+  /** Only local freeze/append facts are serialized; network admission is never joined by dispose. */
+  private localFactTail: Promise<void> = Promise.resolve();
   private firstResponseId?: string;
   private firstResponseLost = false;
   private pumpRunning = false;
@@ -256,7 +261,7 @@ export class NativeRequestSession {
   /** Rebuilds in-memory orchestration state from durable facts after a crash/reconnect. */
   public async reconcile(): Promise<void> {
     this.childCatalog = withChildHandles(this.childCatalog,
-      await readNativeRequestChildHandles(this.deps.database, this.deps.contentStore, this.deps.modelRequestId));
+      await readNativeRequestContextHandleCatalog(this.deps.database, this.deps.contentStore, this.deps.modelRequestId));
     const previouslyObserved = await this.deps.modelProvider.readNativeLatestResponseUsage(this.deps.modelRequestId);
     // Terminal checkpoints can be compacted/pruned. If the first response is no longer
     // represented, the earliest surviving response.created cannot calibrate its initial root.
@@ -606,10 +611,18 @@ export class NativeRequestSession {
     this.responseCallCounts.set(responseId, (this.responseCallCounts.get(responseId) ?? 0) + 1);
   }
 
-  private recordItemPart(key: string, part: Record<string, unknown>): void {
-    if (this.itemPartKeys.has(key)) return;
+  private recordItemPart(key: string, part: Record<string, unknown>): boolean {
+    if (this.itemPartKeys.has(key)) {
+      const prior = this.itemPartsOrdered.find(item => item.key === key)!.part;
+      if (nativeAssistantComparablePart(normalizePlainJson(prior, 'Frozen native item') as Record<string, PlainJsonValue>)
+        !== nativeAssistantComparablePart(normalizePlainJson(part, 'Replayed native item') as Record<string, PlainJsonValue>)) {
+        throw new Error(`Native output item ${key} changed its immutable completed facts.`);
+      }
+      return false;
+    }
     this.itemPartKeys.add(key);
     this.itemPartsOrdered.push({ key, part });
+    return true;
   }
 
   /**
@@ -715,14 +728,16 @@ export class NativeRequestSession {
     const itemId = typeof outputItem?.id === 'string' ? outputItem.id : undefined;
     const text = typeof record.text === 'string' ? record.text : '';
     if (!itemId || text.length === 0) return;
-    const accumulator = this.itemAccumulators.get(itemId) ?? { text: '', thought: '' };
+    const responseId = typeof outputItem?.providerResponseId === 'string' ? outputItem.providerResponseId : '';
+    const accumulatorKey = JSON.stringify([responseId, itemId]);
+    const accumulator = this.itemAccumulators.get(accumulatorKey) ?? { text: '', thought: '' };
     if (record.type === 'thought_delta') {
       accumulator.thought += text;
       if (typeof record.thoughtSignature === 'string') accumulator.thoughtSignature = record.thoughtSignature;
     } else {
       accumulator.text += text;
     }
-    this.itemAccumulators.set(itemId, accumulator);
+    this.itemAccumulators.set(accumulatorKey, accumulator);
   }
 
   /**
@@ -836,39 +851,57 @@ export class NativeRequestSession {
     const outputItem = asRecord(record.outputItem);
     const itemId = typeof outputItem?.id === 'string' ? outputItem.id : undefined;
     if (!itemId) return;
-    const accumulator = this.itemAccumulators.get(itemId);
-    const thought = record.type === 'thought_done';
-    const text = thought ? accumulator?.thought ?? '' : accumulator?.text ?? '';
-    if (text.length === 0) return;
-    const ordinal = typeof outputItem?.ordinal === 'number' && Number.isSafeInteger(outputItem.ordinal)
-      ? outputItem.ordinal
-      : undefined;
     const responseId = typeof outputItem?.providerResponseId === 'string' && outputItem.providerResponseId.length > 0
       ? outputItem.providerResponseId
+      : undefined;
+    const accumulator = this.itemAccumulators.get(JSON.stringify([responseId ?? '', itemId]));
+    const thought = record.type === 'thought_done';
+    const text = thought ? accumulator?.thought ?? '' : accumulator?.text ?? '';
+    const ordinal = typeof outputItem?.ordinal === 'number' && Number.isSafeInteger(outputItem.ordinal)
+      ? outputItem.ordinal
       : undefined;
     // Provider ordinals are response-local: an item without its response identity cannot get a
     // collision-free durable key and is left to the final aggregate.
     if (ordinal === undefined || responseId === undefined) return;
-    const part = thought
+    const completedPart = record.completedItem === undefined
+      ? undefined : normalizeNativeAssistantCompletedItem(record.completedItem);
+    if (completedPart?.functionCall) return;
+    if (!completedPart && text.length === 0 && !(thought && accumulator?.thoughtSignature)) return;
+    const closedThoughtSignature = typeof record.thoughtSignature === 'string'
+      ? record.thoughtSignature : accumulator?.thoughtSignature;
+    const part = completedPart ?? (thought
       ? {
           text,
           thought: true,
-          ...(accumulator?.thoughtSignature ?? (typeof record.thoughtSignature === 'string' ? record.thoughtSignature : undefined)
-            ? { thoughtSignature: accumulator?.thoughtSignature ?? record.thoughtSignature as string }
+          ...(closedThoughtSignature
+            ? { thoughtSignature: closedThoughtSignature }
             : {}),
           ...(outputItem ? { outputItem } : {})
         }
-      : { text, ...(outputItem ? { outputItem } : {}) };
-    this.recordItemPart(`content:${responseId}:${ordinal}`, part);
-    await this.deps.turnOutput.appendNativeAssistantItem({
-      turnId: this.deps.turnId,
-      modelRequestId: this.deps.modelRequestId,
-      itemKey: `content:${responseId}:${ordinal}`,
-      content: canonicalPlainJson({ role: 'model', parts: [part] } as unknown as PlainJsonValue, 'Native content item revision'),
-      cumulativeContent: this.cumulativeItemContent(),
-      contentType: MESSAGE_CONTENT_TYPE,
-      contextDisposition: 'append'
-    });
+      : { text, ...(outputItem ? { outputItem } : {}) });
+    if (nativeAssistantPartIdentity(part) !== nativeAssistantPartIdentity({ outputItem })) {
+      throw new Error('Native completion content does not match its output item identity.');
+    }
+    const itemKey = `content:${responseId}:${ordinal}`;
+    // A repeated done after later items must verify the same item, not re-freeze a later cumulative
+    // projection as the old item's cumulative bytes.
+    if (!this.recordItemPart(itemKey, part)) return;
+    try {
+      await this.deps.turnOutput.appendNativeAssistantItem({
+        turnId: this.deps.turnId,
+        modelRequestId: this.deps.modelRequestId,
+        itemKey,
+        content: canonicalPlainJson({ role: 'model', parts: [part] } as unknown as PlainJsonValue, 'Native content item revision'),
+        cumulativeContent: this.cumulativeItemContent(),
+        contentType: MESSAGE_CONTENT_TYPE,
+        contextDisposition: 'append'
+      });
+    } catch (error) {
+      this.itemPartKeys.delete(itemKey);
+      const index = this.itemPartsOrdered.findIndex(item => item.key === itemKey);
+      if (index >= 0) this.itemPartsOrdered.splice(index, 1);
+      throw error;
+    }
   }
 
   /**
@@ -1423,7 +1456,11 @@ export class NativeRequestSession {
     if (call.settled) this.pumpSignal();
   }
 
-  private async appendResultOccurrence(call: NativeSessionCall): Promise<void> {
+  private appendResultOccurrence(call: NativeSessionCall): Promise<void> {
+    return this.serializeLocalFact(() => this.appendResultOccurrenceNow(call));
+  }
+
+  private async appendResultOccurrenceNow(call: NativeSessionCall): Promise<void> {
     if (call.resultOccurrence || !call.toolModelResultId) return;
     const sources = await listAllDomainRows(this.deps.database, 'ContextSegmentSource', {
       source_kind: 'tool_model_result',
@@ -1602,6 +1639,9 @@ export class NativeRequestSession {
         await this.buildFunctionCallOutput(call);
         await this.appendResultOccurrence(call);
       }
+      // Disposal owns closure on the same local fact tail. Its already committed result facts
+      // are sufficient; a retired controller must not initiate another network boundary.
+      if (this.disposed) return false;
       if (this.controller !== controller || this.disposed || this.hasPendingSteering()
         || this.inFlightDeliveries.size > 0
         || this.responseOrder[this.responseOrder.length - 1] !== latestResponseId) {
@@ -1659,7 +1699,11 @@ export class NativeRequestSession {
     return ready.sort((left, right) => left.providerOrdinal - right.providerOrdinal);
   }
 
-  private async buildFunctionCallOutput(call: NativeSessionCall): Promise<OpenAIResponsesToolOutput> {
+  private buildFunctionCallOutput(call: NativeSessionCall): Promise<OpenAIResponsesToolOutput> {
+    return this.serializeLocalFact(() => this.buildFunctionCallOutputNow(call));
+  }
+
+  private async buildFunctionCallOutputNow(call: NativeSessionCall): Promise<OpenAIResponsesToolOutput> {
     if (!call.toolModelResultId) throw new Error(`Native call ${call.toolCallId} has no settled result.`);
     const result = await this.requireDomain('ToolModelResult', call.toolModelResultId);
     const revision = await this.requireDomain(
@@ -1682,6 +1726,12 @@ export class NativeRequestSession {
     // Every native result uses frozen bounded model bytes and a reserved handle catalog. The
     // ToolModelResult receipt and native delivery/admission facts remain separate and unchanged.
     return { type: 'function_call_output', callId: call.providerCallId, output: frozen.output };
+  }
+
+  private serializeLocalFact<T>(run: () => Promise<T>): Promise<T> {
+    const next = this.localFactTail.then(run, run);
+    this.localFactTail = next.then(() => undefined, () => undefined);
+    return next;
   }
 
   private responseFor(responseId: string): NativeSessionResponse {

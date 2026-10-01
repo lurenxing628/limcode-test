@@ -194,26 +194,102 @@ export function emitUnifiedChunk(
   });
 
   if (calls.length > 0) {
+    const freshCalls = filterPreviouslyEmittedNativeCalls(calls, outputItem, nativeChain);
+    if (freshCalls.length > 0) {
     emit({
       type: LlmEventType.ToolCallPreviewDone,
-      payload: { requestId, callIds: calls.map((call) => call.id).filter((id): id is string => !!id) }
+      payload: { requestId, callIds: freshCalls.map((call) => call.id).filter((id): id is string => !!id) }
     });
     emit({ type: LlmEventType.ToolCall, payload: {
       requestId,
       ...(outputItem ? { outputItem } : {}),
-      calls
+      calls: freshCalls
     } });
+    }
   }
 
   emitProviderContextParts(requestId, providerContextParts.trailing, emit, nativeChain);
+  emitCompletedNativeItems(requestId, chunk, emit, nativeChain);
 
   const outputItemDone = stampNativeResponse(modelOutputItemDoneFromChunk(chunk), nativeChain);
-  if (outputItemDone) {
+  if (outputItemDone && !Array.isArray((chunk as NativeCompletedItemsChunk).completedOutputItems)) {
     emit({
       type: LlmEventType.OutputItemDone,
       payload: { requestId, outputItem: outputItemDone }
     });
   }
+}
+
+type NativeCompletedItemsChunk = UnifiedLLMStreamChunk & { completedOutputItems?: UnifiedContent[] };
+const projectedCompletionChunks = new WeakSet<object>();
+const emittedNativeCallFacts = new WeakMap<object, Map<string, string>>();
+
+/** Called before response.completed as well as from the ordinary chunk projection. Item proofs
+ * must precede the response admission boundary, including terminal-only calls and content. */
+export function emitCompletedNativeItems(
+  requestId: string,
+  chunk: UnifiedLLMStreamChunk,
+  emit: Emit,
+  nativeChain?: OpenAIResponsesNativeChainContext
+): void {
+  const completed = (chunk as NativeCompletedItemsChunk).completedOutputItems;
+  if (!Array.isArray(completed) || projectedCompletionChunks.has(chunk)) return;
+  projectedCompletionChunks.add(chunk);
+  for (const content of completed) {
+    const completedItem = fromUnifiedCompletedContent(content, nativeChain);
+    if (completedItem.parts.length === 0) continue;
+    const outputItem = completedItem.parts[0]?.outputItem;
+    if (!outputItem?.providerResponseId) throw new Error('Native completion is missing its response/item identity.');
+    if (completedItem.parts.some(part => part.outputItem?.id !== outputItem.id
+      || part.outputItem?.providerResponseId !== outputItem.providerResponseId)) {
+      throw new Error('Native completed item contains conflicting identities.');
+    }
+    const calls = completedItem.parts.flatMap(part => 'functionCall' in part ? [{
+      ...(part.id ? { id: part.id } : {}), name: part.functionCall.name,
+      argsJson: JSON.stringify(part.functionCall.args ?? {}),
+      ...('thoughtSignature' in part && part.thoughtSignature ? { thoughtSignature: part.thoughtSignature } : {}),
+      ...('async' in part && part.async === true ? { async: true } : {})
+    }] : []);
+    const freshCalls = filterPreviouslyEmittedNativeCalls(calls, outputItem, nativeChain);
+    if (freshCalls.length > 0) emit({ type: LlmEventType.ToolCall, payload: { requestId, outputItem, calls: freshCalls } });
+    if (calls.length === 0) emit({
+      type: LlmEventType.OutputItemDone,
+      payload: { requestId, outputItem, completedItem }
+    });
+  }
+}
+
+function filterPreviouslyEmittedNativeCalls<T extends { id?: string; name: string; argsJson: string; async?: boolean; thoughtSignature?: string }>(
+  calls: readonly T[],
+  outputItem: ModelOutputItemReference | undefined,
+  nativeChain: OpenAIResponsesNativeChainContext | undefined
+): T[] {
+  const responseId = outputItem?.providerResponseId;
+  // The attempt context is also used by ordinary providers for anonymous-call numbering.
+  // Only a proved native response/item scope participates in this closure deduplication.
+  if (!nativeChain || !responseId) return [...calls];
+  const seen = emittedNativeCallFacts.get(nativeChain) ?? new Map<string, string>();
+  emittedNativeCallFacts.set(nativeChain, seen);
+  return calls.filter(call => {
+    if (!call.id) return true;
+    const key = JSON.stringify([responseId, call.id]);
+    const fact = canonicalNativeCallFact([call.name, JSON.parse(call.argsJson), call.async === true, call.thoughtSignature ?? null]);
+    const prior = seen.get(key);
+    if (prior !== undefined) {
+      if (prior !== fact) throw new Error(`Native completed tool call ${call.id} changed its frozen facts.`);
+      return false;
+    }
+    seen.set(key, fact);
+    return true;
+  });
+}
+
+function canonicalNativeCallFact(value: unknown): string {
+  // Arguments are JSON values. Object key order is transport formatting, while array order and
+  // every actual value remain part of the immutable call fact.
+  return JSON.stringify(value, (_key, nested: unknown) => isRecord(nested)
+    ? Object.fromEntries(Object.entries(nested).sort(([left], [right]) => left.localeCompare(right)))
+    : nested);
 }
 
 /**
@@ -592,6 +668,9 @@ function stampNativeResponse(
 ): ModelOutputItemReference | undefined {
   const current = nativeChain?.current;
   if (!outputItem || !current) return outputItem;
+  // The decoder can attest a late completion to an earlier response. The latest response cannot
+  // reassign that immutable item merely because it happens to share a local fallback number.
+  if (outputItem.providerResponseId && outputItem.providerResponseId !== current.responseId) return outputItem;
   if (outputItem.providerResponseId === current.responseId
     && outputItem.previousResponseId === current.previousResponseId) return outputItem;
   return {
@@ -677,6 +756,8 @@ export interface ActiveThoughtBlock {
   progressTimer?: ReturnType<typeof setInterval>;
   thoughtSignature?: string;
   outputItem?: ModelOutputItemReference;
+  /** Complete reasoning item body at its attested close, before the timing event is emitted. */
+  completedItem?: MessageContent;
 }
 
 export function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock | undefined, chunk: UnifiedLLMStreamChunk, at: number, emit: Emit, nativeChain?: OpenAIResponsesNativeChainContext): ActiveThoughtBlock | undefined {
@@ -707,6 +788,18 @@ export function emitThoughtDeltas(requestId: string, current: ActiveThoughtBlock
         ...(signature ? { thoughtSignature: signature } : {})
       }
     });
+  }
+  if (block?.outputItem) {
+    for (const content of (chunk as NativeCompletedItemsChunk).completedOutputItems ?? []) {
+      const completedItem = fromUnifiedCompletedContent(content, nativeChain);
+      const reference = modelOutputItemFromValue(completedItem.parts[0]);
+      if (reference?.id === block.outputItem.id
+        && reference.providerResponseId === block.outputItem.providerResponseId
+        && completedItem.parts.every(part => 'text' in part && part.thought === true)) {
+        block.completedItem = completedItem;
+        break;
+      }
+    }
   }
   return block;
 }
@@ -755,6 +848,7 @@ export function finishThoughtBlock(requestId: string, block: ActiveThoughtBlock,
       thoughtStartedAt: block.startedAt,
       thoughtDurationMs: Math.max(0, finishedAt - block.startedAt),
       ...(block.outputItem ? { outputItem: block.outputItem } : {}),
+      ...(block.completedItem ? { completedItem: block.completedItem } : {}),
       ...(block.thoughtSignature ? { thoughtSignature: block.thoughtSignature } : {})
     }
   });

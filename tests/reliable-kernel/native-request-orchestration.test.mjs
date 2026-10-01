@@ -580,7 +580,8 @@ test('native durable checkpoints ignore the droppable ordinary cap and persist c
     await emit('native_control', { type: 'response.completed', responseId: 'r1', usage: { input_tokens: 55, output_tokens: 5, total_tokens: 60 } });
     await emit('completed', {
       role: 'model',
-      parts: [{ text: 'aggregated' }]
+      parts: Array.from({ length: 40 }, (_, index) => ({ text: `part-${index} `,
+        outputItem: { id: `i${index}`, ordinal: index, providerResponseId: 'r1' } }))
     }, { usage: { input_tokens: 55, output_tokens: 5, total_tokens: 60 } });
   });
 });

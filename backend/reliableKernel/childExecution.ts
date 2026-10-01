@@ -9,6 +9,7 @@ import { ContextSequenceControlPlane } from './contextSequence';
 import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { readConversationChildHandles } from './conversationChildHandles';
+import { assertForkContextHandleReservations } from './forkContextHandleReservations';
 import { prepareCollaborationCapacity, CollaborationMembershipChangedError } from './collaborationCapacity';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
@@ -3258,6 +3259,10 @@ export class ChildExecutionControlPlane {
       || origin.source_message_revision_id !== null
       || !projectInheritanceMatches
     ) throw new Error('ChildExecution spawn source was replayed with different facts.');
+    if (command.forkTurns !== 'none') {
+      await assertForkContextHandleReservations(this.database, this.contentStore, ids.childConversationId,
+        requirePhaseFId(origin.source_conversation_id, 'ConversationOriginLink.source_conversation_id'));
+    }
     const frozen = await readFrozenTurnAuthority(
       this.database,
       this.contentStore,

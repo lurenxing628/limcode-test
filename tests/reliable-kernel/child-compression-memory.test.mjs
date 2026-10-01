@@ -69,6 +69,13 @@ test('compression fails closed when canonical child has no frozen reference', as
 });
 
 function recipeFixture(recipes, { missing = false } = {}) {
+  // These minimal recipes exercise current identity retention, not a published compression
+  // selector. Complete legacy source/projection proofs are covered by the historical fixtures.
+  const { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } = load('backend/reliableKernel/modelHandleCatalog.js');
+  recipes = recipes.map(recipe => recipe.modelHandleCatalog ? { ...recipe, modelHandleCatalog: {
+    ...recipe.modelHandleCatalog, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
+    retiredRefs: []
+  } } : recipe);
   const domains = {
     Turn: [{ id: 'fork-turn', conversation_id: 'fork' }, { id: 'source-turn', conversation_id: 'source' }],
     ModelRequest: recipes.map((recipe, index) => ({ id: `copied-${index}`, turn_id: 'fork-turn', request_seq: BigInt(index), recipe_object_id: `recipe-${index}` })),
@@ -81,7 +88,9 @@ function recipeFixture(recipes, { missing = false } = {}) {
     domains,
     database: {
       async snapshotAll(read) { return { snapshot: select(read) }; },
-      async snapshot(reads) { return { snapshot: reads.map(read => missing ? null : domains[read.domain].find(row => row.id === read.id)) }; }
+      async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get'
+        ? missing ? null : (domains[read.domain] ?? []).find(row => row.id === read.id) ?? null
+        : select(read)) }; }
     },
     store: { async read(metadata) { reads.push(metadata.id); return Buffer.from(JSON.stringify(recipes[Number(metadata.id.slice(7))])); } }
   };
@@ -94,7 +103,8 @@ test('copied fork request recipes preserve the complete historical mapping witho
     { kind: 'reliable-context-compression', modelHandleCatalog: { entries: handles } }
   ]);
   assert.deepEqual(await readConversationChildHandles(fixture.database, fixture.store, 'fork'), handles);
-  assert.deepEqual(fixture.reads, ['recipe-2'], 'the latest cumulative recipe is sufficient even after many old requests');
+  assert.deepEqual([...fixture.reads].sort(), ['recipe-0', 'recipe-1', 'recipe-2'],
+    'published window-local identities require every frozen recipe, including before same-Turn compression');
   assert.deepEqual(await readConversationChildHandles(fixture.database, fixture.store, 'source'), []);
 });
 

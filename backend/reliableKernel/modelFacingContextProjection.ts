@@ -1017,10 +1017,17 @@ export function projectStoredModelFacingWindow(
 ): ModelWindowProjection {
   const state = normalizeAttachmentCatalogState(attachmentCatalogState);
   const seededHandles = normalizeModelHandleCatalog(seededModelHandleCatalog);
-  const modelHandleCatalog = buildModelHandleCatalog(
+  const discoveredCatalog = buildModelHandleCatalog(
     [...items.map((item) => item.content), state.catalog],
-    seededHandles.entries
+    seededHandles
   );
+  // Current requests already froze registry-owned attachment addresses. Raw context fields must
+  // not invent another F address for an invisible/foreign Attachment. Unmarked frozen requests
+  // retain their original projection scope for replay.
+  const modelHandleCatalog = seededHandles.identityContractRevision !== undefined
+    ? { ...discoveredCatalog, entries: discoveredCatalog.entries.filter(entry => entry.kind !== 'attachment'
+      || modelHandleRef(seededHandles, 'attachment', entry.target) === entry.ref) }
+    : discoveredCatalog;
   const segmentIds = items.map((item, index) => item.segmentId?.trim() || `stored-context-item-${index}`);
   const renderedState = renderAttachmentCatalogState(
     state,

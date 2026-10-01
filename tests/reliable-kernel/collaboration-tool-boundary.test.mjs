@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
@@ -53,18 +54,62 @@ test('empty-reference cleanup only touches handle keys of builtin tools; MCP and
 });
 
 test('compressed and fork-copied recipes reserve collaboration references without scanning source conversations', async () => {
-  const domains = {
-    Turn: [{ id: 'fork-turn', conversation_id: 'fork', created_at: 'same' }],
-    ModelRequest: [{ id: 'request', turn_id: 'fork-turn', request_seq: 1n, recipe_object_id: 'recipe' }],
-    ContentObject: [{ id: 'recipe' }]
-  };
-  const database = {
-    async snapshotAll(read) { return { snapshot: (domains[read.domain] ?? []).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value)) }; },
-    async snapshot(reads) { return { snapshot: reads.map(read => (domains[read.domain] ?? []).find(row => row.id === read.id)) }; }
-  };
-  const store = { async read() { return Buffer.from(JSON.stringify({ kind: 'reliable-context-compression', modelHandleCatalog: catalog })); } };
-  assert.deepEqual(await readConversationChildHandles(database, store, 'fork'), mergeConversationChildHandles(catalog.entries));
-  assert.deepEqual(await readConversationChildHandles(database, store, 'source'), []);
+  const byRef = entries => [...entries].sort((left, right) => left.ref.localeCompare(right.ref));
+  const segment = { id: 'fork-segment', content_object_id: 'context-content', segment_kind: 'system' };
+  const sourceHash = createHash('sha256').update(JSON.stringify([{ segmentId: segment.id,
+    contentObjectId: segment.content_object_id, segmentKind: segment.segment_kind }])).digest('hex');
+  const recipes = [
+    { kind: 'reliable-context-compression', modelHandleCatalog: catalog },
+    { kind: 'reliable-agent-turn', modelHandleCatalog: catalog },
+    { kind: 'reliable-context-compression', modelHandleCatalog: { entries: catalog.entries },
+      compressionMethodKind: 'llm_summary', trigger: 'manual', sourceRootId: 'fork-root', sourceSegmentCount: 1,
+      sourceHash, attachmentCatalogState: { catalog: [], placements: [] } }
+  ];
+  for (const recipe of recipes) {
+    const contents = new Map([['recipe', Buffer.from(JSON.stringify(recipe))],
+      ['context-content', Buffer.from(JSON.stringify(detail))]]);
+    const metadata = [...contents].map(([id, bytes]) => ({ id, content_type: 'application/json',
+      byte_length: BigInt(bytes.length), sha256: createHash('sha256').update(bytes).digest('hex'), storage_key: id }));
+    const contextRoot = { id: 'fork-root', conversation_id: 'fork', root_node_id: 'fork-node', tail_node_id: null,
+      tail_segment_count: 0n, segment_count: 1n, created_at: '2026-10-01T00:00:00.000Z' };
+    const domains = {
+      Turn: [{ id: 'fork-turn', conversation_id: 'fork', created_at: contextRoot.created_at }],
+      ModelRequest: [{ id: 'request', turn_id: 'fork-turn', request_seq: 1n, recipe_object_id: 'recipe' }],
+      ContentObject: metadata,
+      ModelContextProjection: [{ id: 'provider-projection', owner_kind: 'model_request', owner_id: 'request',
+        purpose: 'provider-request', root_id: contextRoot.id }],
+      ContextSequenceRoot: [contextRoot]
+    };
+    const reads = [];
+    const matching = read => (domains[read.domain] ?? []).filter(row =>
+      Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+    const database = {
+      async snapshotAll(read) { reads.push(read); return { snapshot: matching(read) }; },
+      async snapshot(queries) {
+        reads.push(...queries);
+        return { snapshot: queries.map(read => read.kind === 'get'
+          ? (domains[read.domain] ?? []).find(row => row.id === read.id) ?? null : matching(read)) };
+      },
+      async materializeContext(id) {
+        assert.equal(id, contextRoot.id);
+        return { snapshot: { root: contextRoot, records: [{ node: { id: 'fork-node', parent_node_id: null },
+          segment, contentObject: metadata.find(row => row.id === segment.content_object_id) }] }, snapshotCommitSeq: '1' };
+      }
+    };
+    const store = { async read(row) {
+      assert.ok(contents.has(row.id), 'only the target frozen recipe or its owned Context content is read');
+      const bytes = contents.get(row.id);
+      assert.equal(bytes.length, Number(row.byte_length));
+      assert.equal(createHash('sha256').update(bytes).digest('hex'), row.sha256);
+      return Buffer.from(bytes);
+    } };
+    assert.deepEqual(byRef(await readConversationChildHandles(database, store, 'fork')),
+      byRef(mergeConversationChildHandles(catalog.entries)));
+    assert.ok(reads.every(read => read.id !== 'source' && read.domain !== 'Conversation' && read.where?.conversation_id !== 'source'
+      && read.where?.target_conversation_id !== 'source' && read.where?.owner_id !== 'source'),
+    'copied frozen references do not cause a scan of a live source Conversation');
+    assert.deepEqual(await readConversationChildHandles(database, store, 'source'), []);
+  }
 });
 
 function fixture({ toolName = 'send_agent_message', args = { targetConversationId: 'peer', text: 'hello' }, crossConversation, allowedTools = [toolName, 'run_agent'] } = {}) {
