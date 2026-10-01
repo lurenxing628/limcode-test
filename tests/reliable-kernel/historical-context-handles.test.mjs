@@ -77,7 +77,25 @@ function historyFixture(initial = [], conversationId = 'history') {
   const selected = read => (domains[read.domain] ?? []).filter(row =>
     Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
   const fixture = {
-    domains, contents, reads, append,
+    domains, contents, reads, append, putContent,
+    enableCache() {
+      const listeners = new Set();
+      let version = 1;
+      fixture.database.onCommit = callback => { listeners.add(callback); return () => listeners.delete(callback); };
+      fixture.database.externalDataVersion = async () => {
+        if (fixture.rootError) throw fixture.rootError;
+        return String(version);
+      };
+      fixture.commit = changes => { for (const callback of listeners) callback({ commitSeq: '1', changes, allocatedSequences: [] }); };
+      fixture.externalWrite = () => { version++; };
+      fixture.publishRequest = requestId => {
+        const request = domains.ModelRequest.find(row => row.id === requestId);
+        const turn = domains.Turn.find(row => row.id === request.turn_id);
+        fixture.commit([{ domain: 'Turn', kind: 'upsert', id: turn.id, record: turn },
+          { domain: 'ModelRequest', kind: 'upsert', id: request.id, record: request }]);
+      };
+      return fixture;
+    },
     reverse() { reverseReads = !reverseReads; },
     database: {
       async snapshotAll(read) { const rows = selected(read); return { snapshot: reverseReads ? rows.reverse() : rows }; },
@@ -610,7 +628,7 @@ const { LlmCapabilityFullRequestAdapter: HistoricalIntegrationAdapter } =
   load('backend/reliableKernel/llmCapabilityProviderAdapter.js');
 const { LlmEventType: historicalIntegrationEvents } = load('backend/world/modules/llm/events.js');
 
-async function historicalRuntimeIntegration(nativeEnabled, verify) {
+async function historicalRuntimeIntegration(nativeEnabled, verify, options = {}) {
   const { default: fs } = await import('node:fs/promises');
   const { default: os } = await import('node:os');
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'historical-context-runtime-'));
@@ -622,6 +640,8 @@ async function historicalRuntimeIntegration(nativeEnabled, verify) {
     multiplexing: false, explicitCaching: true };
   const fullRequests = [];
   const wireRequests = [];
+  let pendingToolRounds = 0;
+  let toolExecutions = 0;
   const capability = {
     start(request, emit, options) {
       wireRequests.push(request);
@@ -636,7 +656,9 @@ async function historicalRuntimeIntegration(nativeEnabled, verify) {
         } });
       }
       emit({ type: historicalIntegrationEvents.Done, payload: {
-        requestId: request.id, content: { role: 'model', parts: [{ text: 'continued existing history' }] }
+        requestId: request.id, content: { role: 'model', parts: pendingToolRounds-- > 0
+          ? [{ id: `probe-call-${wireRequests.length}`, functionCall: { name: 'history_probe', args: {} } }]
+          : [{ text: 'continued existing history' }] }
       } });
     },
     abort() {}, cancelRetry() {},
@@ -662,7 +684,8 @@ async function historicalRuntimeIntegration(nativeEnabled, verify) {
       retryPolicy: { enabled: false, maxRetries: 0 } },
     modelProfile: { compressionThresholdTokens: 100000, contextWindowTokens: 128000,
       tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
-    toolPolicy: { id: 'historical-tools', allowedTools: [], preset: 'custom', toolConfigs: {}, sourceConfigs: {} },
+    toolPolicy: { id: 'historical-tools', allowedTools: options.tools ? ['history_probe'] : [], preset: 'custom',
+      toolConfigs: options.tools ? { history_probe: { autoApproveExecution: true, autoSubmitResult: true, config: {} } } : {}, sourceConfigs: {} },
     planReviewPolicy: { mode: 'never' }, systemPrompt: { id: 'historical-prompt', text: '' },
     runtimeContext: { id: null, name: '', template: '' },
     workEnvironmentPolicy: { id: null, enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null }
@@ -679,7 +702,15 @@ async function historicalRuntimeIntegration(nativeEnabled, verify) {
     attachmentSettings: { async loadGlobalSettings() { return { section: 'attachments',
       settings: { maxStoredInlineFileMb: 25 }, filePath: 'unused' }; } },
     providers: { resolve() { return adapter; } },
-    toolDispatcher: { definitions() { return []; }, async dispatch() { assert.fail('no tools should execute'); } }
+    ...(options.tools ? { createToolDispatcher: ({ database, contentStore, runtime, files, fileMutations, processes, mcp, interactions }) =>
+      new integrationKernel.ReliableToolDispatcher({ database, contentStore, effects: runtime.effects,
+        files, fileMutations, processes, mcp, interactions, host: {
+          definitions() { return [{ declaration: { name: 'history_probe', description: 'Return isolated test progress.',
+            parameters: { type: 'object', properties: {}, additionalProperties: false }, source: { kind: 'builtin' },
+            metadata: { readonly: true, defaultAutoApproveExecution: true, defaultAutoSubmitResult: true } }, execution: 'runtime' }]; },
+          async executeNoEffect() { toolExecutions++; return { ok: true, processId: `isolated-history-process-${toolExecutions}` }; }
+        } })
+    } : { toolDispatcher: { definitions() { return []; }, async dispatch() { assert.fail('no tools should execute'); } } })
   };
   let app;
   const rows = async (domain, where = {}) => (await app.database.snapshotAll(
@@ -773,7 +804,7 @@ async function historicalRuntimeIntegration(nativeEnabled, verify) {
     await app.database.transaction(steps);
     const before = await Promise.all(oldMetadata.map(async metadata => [metadata.id,
       (await app.contentStore.read(metadata)).toString('utf8')]));
-    const continueConversation = async key => {
+    const continueConversation = async (key, expectedRequests = 1) => {
       const started = await app.turns.input({ source: { kind: 'command', key }, conversationId,
         leaseOwnerId: 'historical-test-owner', hostBootId: app.database.hostBootId,
         leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: 'Continue this existing conversation.' });
@@ -782,10 +813,11 @@ async function historicalRuntimeIntegration(nativeEnabled, verify) {
         ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) };
       const result = await integrationKernel.runWithExecutionLeaseFence(fence, () => app.agentLoop.drive(started.turnId));
       assert.equal(result.terminalStatus, 'completed', JSON.stringify(await rows('TurnTermination', { turn_id: started.turnId })));
-      assert.equal(result.modelRequestIds.length, 1, 'one input reaches exactly one new model request');
+      assert.equal(result.modelRequestIds.length, expectedRequests, 'input reaches the expected distinct model requests');
       return result;
     };
-    await verify({ rows, continueConversation, fullRequests, wireRequests, async reopen() {
+    await verify({ rows, continueConversation, fullRequests, wireRequests, get app() { return app; }, conversationId, authority, directory,
+      queueTools(count) { pendingToolRounds = count; }, get toolExecutions() { return toolExecutions; }, async reopen() {
       await app.close();
       app = await integrationKernel.ReliableKernelApplication.open(authority, dependencies);
     }, async frozenRecipe(id) {
@@ -842,3 +874,173 @@ for (const nativeEnabled of [false, true]) {
       });
     });
 }
+
+
+test('production request progression reuses historical identity proofs across local commits', { timeout: 30000 }, async () => {
+  await historicalRuntimeIntegration(false, async fixture => {
+    await fixture.continueConversation('cache-warm');
+    const database = fixture.app.database;
+    const snapshotAll = database.snapshotAll.bind(database);
+    const materialize = database.materializeContext.bind(database);
+    let oldRequestScans = 0;
+    let oldSourceExpansions = 0;
+    database.snapshotAll = async read => {
+      if (read.domain === 'ModelRequest' && String(read.where?.turn_id).startsWith('historical-completed-turn-')) oldRequestScans++;
+      return snapshotAll(read);
+    };
+    database.materializeContext = async id => {
+      if (id === 'historical-original-root') oldSourceExpansions++;
+      return materialize(id);
+    };
+    for (let round = 0; round < 5; round++) {
+      const result = await fixture.continueConversation(`cache-progress-${round}`);
+      const frozen = await fixture.frozenRecipe(result.modelRequestIds[0]);
+      assert.deepEqual(frozen.modelHandleCatalog.retiredRefs, ['P1']);
+    }
+    assert.equal(fixture.wireRequests.length, 6, 'six real inputs create and complete six distinct model requests');
+    assert.equal(oldRequestScans, 0, 'new turns/requests are observed from local commits without rescanning old turns');
+    assert.equal(oldSourceExpansions, 0, 'ordinary progression does not re-expand the historical compression');
+  });
+});
+
+
+test('cached request evidence follows new native source/events, imported requests, and external writes', async () => {
+  const fixture = historyFixture([{ catalog: legacy(entry('process', 'P1', 'old-process')) }]).enableCache();
+  const read = () => readConversationContextHandleCatalog(fixture.database, fixture.store, 'history');
+  await read();
+  fixture.reads.length = 0;
+  const nativeRequest = fixture.append({ catalog: legacy(entry('process', 'P2', 'new-process')),
+    native: [legacy(entry('process', 'P3', 'native-process'))] });
+  fixture.publishRequest(nativeRequest);
+  const next = await read();
+  assert.equal(modelHandleRef(next, 'process', 'native-process'), 'P3');
+  assert.equal(fixture.reads.includes('recipe-request-0'), false, 'only the new request scope is reparsed');
+  const extraProjection = fixture.putContent('native-extra-projection', {
+    kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT, modelRequestId: nativeRequest, toolCallId: 'later-tool',
+    toolModelResultId: 'later-result', toolName: 'bash', childHandles: [entry('process', 'P4', 'later-native-process')], output: '{}'
+  }, 'application/vnd.limcode.native-child-handle-projection+json');
+  const source = { id: 'later-source', tool_call_id: 'later-tool', model_request_id: nativeRequest };
+  const event = { id: 'later-event', tool_call_id: 'later-tool', event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT,
+    content_object_id: extraProjection };
+  fixture.domains.ToolCallSourceLink.push(source); fixture.domains.ToolCallEvent.push(event);
+  fixture.commit([{ domain: 'ToolCallSourceLink', id: source.id, kind: 'upsert', record: source },
+    { domain: 'ToolCallEvent', id: event.id, kind: 'upsert', record: event }]);
+  fixture.reads.length = 0;
+  assert.equal(modelHandleRef(await read(), 'process', 'later-native-process'), 'P4');
+  assert.equal(fixture.reads.includes('recipe-request-0'), false, 'native progress invalidates its owner only');
+  fixture.append({ turn: 'imported-old-turn', catalog: legacy(entry('process', 'P1', 'imported-process')) });
+  fixture.externalWrite();
+  assert.deepEqual((await read()).retiredRefs, ['P1'], 'another SQLite connection invalidates even old-history imports');
+});
+
+test('cached evidence fails closed on deletion, changed CAS metadata and fork reservation or root fences', async () => {
+  const fixture = historyFixture([{ catalog: legacy(entry('process', 'P1', 'process')) }]).enableCache();
+  const read = () => readConversationContextHandleCatalog(fixture.database, fixture.store, 'history');
+  const first = await read(); first.entries[0].target = 'caller-corruption';
+  assert.equal(modelHandleRef(await read(), 'process', 'process'), 'P1', 'returned results cannot mutate shared proof');
+  fixture.rootError = new Error('root binding changed');
+  await assert.rejects(read(), /root binding changed/);
+  fixture.rootError = undefined;
+  const recipeId = fixture.domains.ModelRequest[0].recipe_object_id;
+  fixture.contents.set(recipeId, Buffer.from('{broken'));
+  fixture.commit([{ domain: 'ContentObject', kind: 'upsert', id: recipeId, record: fixture.domains.ContentObject[0] }]);
+  await assert.rejects(read(), SyntaxError);
+  fixture.contents.set(recipeId, Buffer.from(JSON.stringify(recipe(legacy(entry('process', 'P1', 'process'))))));
+  assert.equal(modelHandleRef(await read(), 'process', 'process'), 'P1', 'failed parsing does not poison the next read');
+  fixture.domains.ModelRequest.length = 0;
+  fixture.commit([{ domain: 'ModelRequest', kind: 'remove', id: 'request-0' }]);
+  assert.deepEqual((await read()).entries, [], 'deleted requests cannot survive in cached evidence');
+  const projection = { id: 'bad-fork', owner_kind: 'conversation_handle_catalog', owner_id: 'history',
+    root_id: 'missing-root', purpose: 'fork-handle-reservations' };
+  fixture.domains.ModelContextProjection = [projection];
+  fixture.commit([{ domain: 'ModelContextProjection', kind: 'upsert', id: projection.id, record: projection }]);
+  await assert.rejects(read(), /one projection and branch/);
+});
+
+test('cache bounds evict old conversations and decline oversized request histories without losing facts', async () => {
+  const fixture = historyFixture([]).enableCache();
+  for (let index = 0; index < 9; index++) {
+    fixture.append({ turn: `turn-${index}`, conversation: `conversation-${index}`,
+      catalog: legacy(entry('process', 'P1', `process-${index}`)) });
+    await readConversationContextHandleCatalog(fixture.database, fixture.store, `conversation-${index}`);
+  }
+  fixture.reads.length = 0;
+  await readConversationContextHandleCatalog(fixture.database, fixture.store, 'conversation-0');
+  assert.ok(fixture.reads.length > 0, 'the ninth conversation evicts the least recently used proof');
+  const large = historyFixture(Array.from({ length: 2049 }, () => ({ catalog: legacy() }))).enableCache();
+  await readConversationContextHandleCatalog(large.database, large.store, 'history');
+  large.reads.length = 0;
+  assert.deepEqual((await readConversationContextHandleCatalog(large.database, large.store, 'history')).entries, []);
+  assert.equal(large.reads.length, 2049, 'over-cap histories are still checked but not retained indefinitely');
+});
+
+
+test('384 cumulative UUID-sized handle catalogs retain shared evidence across new requests', async () => {
+  const cumulative = [];
+  const initial = [];
+  for (let index = 0; index < 384; index++) {
+    cumulative.push(entry('process', `P${index + 1}`, `process-11111111-2222-4333-8444-${String(index).padStart(12, '0')}`));
+    initial.push({ catalog: current([...cumulative]) });
+  }
+  const fixture = historyFixture(initial).enableCache();
+  const read = () => readConversationContextHandleCatalog(fixture.database, fixture.store, 'history');
+  assert.equal((await read()).entries.length, 384);
+  fixture.reads.length = 0;
+  for (let index = 384; index < 390; index++) {
+    cumulative.push(entry('process', `P${index + 1}`, `process-11111111-2222-4333-8444-${String(index).padStart(12, '0')}`));
+    const id = fixture.append({ catalog: current([...cumulative]) });
+    fixture.publishRequest(id);
+    assert.equal((await read()).entries.length, index + 1);
+  }
+  assert.equal(fixture.reads.length, 6, 'each new request parses only its own evidence, even beyond 384 cumulative catalogs');
+});
+
+
+test('production tool progression preserves old proofs while advancing request identities in one Turn', { timeout: 30000 }, async () => {
+  await historicalRuntimeIntegration(false, async fixture => {
+    await fixture.continueConversation('tool-cache-warm');
+    const database = fixture.app.database;
+    const snapshotAll = database.snapshotAll.bind(database);
+    const materialize = database.materializeContext.bind(database);
+    let oldScans = 0;
+    let expansions = 0;
+    database.snapshotAll = async read => {
+      if (read.domain === 'ModelRequest' && String(read.where?.turn_id).startsWith('historical-completed-turn-')) oldScans++;
+      return snapshotAll(read);
+    };
+    database.materializeContext = async id => { if (id === 'historical-original-root') expansions++; return materialize(id); };
+    fixture.queueTools(5);
+    await fixture.continueConversation('five-real-tools', 6);
+    assert.equal(fixture.toolExecutions, 5);
+    assert.equal((await fixture.rows('ToolModelResult')).length, 5, 'every tool result is durably settled');
+    assert.equal(oldScans, 0, 'tool commits do not cause old request scans');
+    assert.equal(expansions, 0, 'tool commits do not re-expand old compression sources');
+  }, { tools: true });
+});
+
+test('a real second SQLite connection invalidates warmed request evidence', { timeout: 30000 }, async () => {
+  await historicalRuntimeIntegration(false, async fixture => {
+    await fixture.continueConversation('external-cache-warm');
+    const updated = await fixture.app.contentStore.ingest(fixture.app.database,
+      JSON.stringify(recipe(legacy(entry('process', 'P9', 'external-process')))), 'application/json');
+    const Sqlite = require('better-sqlite3');
+    const other = new Sqlite(fixture.app.database.binding.paths.databasePath);
+    try {
+      other.prepare('UPDATE model_request SET recipe_object_id = ? WHERE id = ?')
+        .run(updated.id, 'historical-completed-request-0');
+    } finally { other.close(); }
+    const catalog = await readConversationContextHandleCatalog(fixture.app.database, fixture.app.contentStore, fixture.conversationId);
+    assert.equal(modelHandleRef(catalog, 'process', 'external-process'), 'P9');
+  });
+});
+
+test('oversized histories remain readable during unrelated local commits', async () => {
+  const fixture = historyFixture(Array.from({ length: 2049 }, () => ({ catalog: legacy() }))).enableCache();
+  const originalRead = fixture.store.read.bind(fixture.store);
+  fixture.store.read = async metadata => {
+    if (metadata.id === 'recipe-request-0') fixture.commit([{ domain: 'Message', kind: 'upsert', id: 'unrelated-message',
+      record: { id: 'unrelated-message', conversation_id: 'elsewhere' } }]);
+    return originalRead(metadata);
+  };
+  assert.deepEqual((await readConversationContextHandleCatalog(fixture.database, fixture.store, 'history')).entries, []);
+});

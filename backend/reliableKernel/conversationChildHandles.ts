@@ -2,14 +2,15 @@ import { createHash } from 'node:crypto';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isCollaborationHandleTool, isPersistentContextHandle, mergeModelHandleCatalogs, normalizeModelHandleCatalog, reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog, type ModelHandleEntry } from './modelHandleCatalog';
-import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
-import { DOMAIN_REPOSITORIES } from './repositories';
+import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNative';
 import { projectNativeToolResultOutput } from './modelFacingContextProjection';
 import { readForkContextHandleReservationEvidence } from './forkContextHandleReservations';
 import { readHistoricalCompressionHandleCatalog } from './historicalCompressionHandleCatalog';
+import { readCachedContextHandleState, type ContextHandleRequestEvidence } from './contextHandleEvidenceCache';
 
 /**
  * Frozen recipes and native projections are identity evidence, including requests before a
@@ -39,78 +40,64 @@ export async function readConversationContextHandleState(
   conversationId: string
 ): Promise<{ catalog: ModelHandleCatalog; requiresNativeReset: boolean }> {
   if (!conversationId.trim()) throw new TypeError('conversationId must be non-empty.');
-  const turns = await listAllDomainRows(database, 'Turn', { conversation_id: conversationId });
-  const cache = createFrozenHandleReadCache();
+  return readCachedContextHandleState(database, contentStore, conversationId, {
+    fork: db => readForkContextHandleReservationEvidence(db, contentStore, conversationId),
+    request: (db, request, covered) => readRequestContextHandleEvidence(db, contentStore, conversationId, request, covered),
+    reconcile: (fork, requests) => {
+      const catalogs = [...(fork ? [fork.catalog] : []), ...requests.flatMap(request => request.catalogs)];
+      const catalog = reconcileHistoricalModelHandleCatalogs(catalogs);
+      const identity = contextCatalogIdentity(catalog);
+      const requiresNativeReset = (catalog.retiredRefs?.length ?? 0) > 0
+        && !requests.some(request => request.currentOrdinaryIdentity === identity);
+      return { catalog, requiresNativeReset };
+    }
+  });
+}
+
+async function readRequestContextHandleEvidence(database: RuntimeDatabase, contentStore: ContentAddressedStore,
+  conversationId: string, request: DomainRow, covered: boolean): Promise<ContextHandleRequestEvidence> {
+  if (typeof request.recipe_object_id !== 'string' || !request.recipe_object_id) {
+    throw childHandleError(`ModelRequest ${String(request.id)} has no frozen recipe.`);
+  }
+  const snapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(request.recipe_object_id)]);
+  const row = snapshot.snapshot[0];
+  if (!row || Array.isArray(row)) throw childHandleError(`Frozen recipe ContentObject ${request.recipe_object_id} is missing.`);
+  const content = await contentStore.read(row as unknown as ContentObjectMetadata);
+  const recipe = normalizePlainJson(JSON.parse(content.toString('utf8')), 'Frozen child handle recipe');
+  if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
+    throw childHandleError(`Frozen recipe ${request.recipe_object_id} is not an object.`);
+  }
+  const frozen = recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression'
+    ? { kind: recipe.kind, recipe, catalog: persistentContextCatalog(recipe.modelHandleCatalog) } : undefined;
   const catalogs: ModelHandleCatalog[] = [];
-  const currentOrdinaryCatalogs: ModelHandleCatalog[] = [];
-  const forkReservations = await readForkContextHandleReservationEvidence(database, contentStore, conversationId);
-  if (forkReservations) catalogs.push(forkReservations.catalog);
-  const coveredRecipeIds = new Set(forkReservations?.coveredRecipeObjectIds ?? []);
-  for (const turn of turns) {
-    const requests = await listAllDomainRows(database, 'ModelRequest', { turn_id: turn.id });
-    for (const request of requests) {
-      if (typeof request.recipe_object_id !== 'string' || !request.recipe_object_id) {
-        throw childHandleError(`ModelRequest ${String(request.id)} has no frozen recipe.`);
-      }
-      if (!cache.recipes.has(request.recipe_object_id)) {
-        const snapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(request.recipe_object_id)]);
-        const row = snapshot.snapshot[0];
-        if (!row || Array.isArray(row)) throw childHandleError(`Frozen recipe ContentObject ${request.recipe_object_id} is missing.`);
-        const content = await contentStore.read(row as unknown as ContentObjectMetadata);
-        const recipe = normalizePlainJson(JSON.parse(content.toString('utf8')), 'Frozen child handle recipe');
-        if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
-          throw childHandleError(`Frozen recipe ${request.recipe_object_id} is not an object.`);
-        }
-        cache.recipes.set(request.recipe_object_id,
-          recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression'
-            ? { kind: recipe.kind, recipe, catalog: persistentContextCatalog(recipe.modelHandleCatalog) } : undefined);
-      }
-      const frozen = cache.recipes.get(request.recipe_object_id);
-      if (frozen) {
-        catalogs.push(frozen.catalog);
-        // Published compression renderers could expose addresses absent from their Recipe.
-        // Reconstruct only the frozen source's address reservations. A fork's private snapshot
-        // already covers the named source recipes, including recipes outside its copied window.
-        if (!coveredRecipeIds.has(request.recipe_object_id)) {
-          const derived = await readHistoricalCompressionHandleCatalog(database, contentStore, {
-            recipe: frozen.recipe, requestId: String(request.id), conversationId
-          });
-          if (derived) catalogs.push(derived);
-        }
-      }
-      const nativeCatalogs = await readNativeRequestContextCatalogs(database, contentStore, String(request.id), cache);
-      let requestScope = frozen?.catalog;
-      if (nativeCatalogs.length > 0) {
-        // One immutable request's native outputs share its frozen scope. Clock/window changes
-        // can explain aliases across requests, never contradictory identities inside this scope.
-        // Validate without using the returned current marker as historical authority.
-        requestScope = mergeModelHandleCatalogs(...(frozen ? [frozen.catalog] : []), ...nativeCatalogs);
-      }
-      if (frozen?.kind === 'reliable-agent-turn'
-        && frozen.catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION) {
-        // Its own frozen native results are part of the adopted identity scope. A legitimate
-        // extension already reached the provider and must not force another cache reset.
-        currentOrdinaryCatalogs.push(requestScope!);
-      }
-      // Keep the raw catalogs until all evidence is present: an intermediate reconciliation
-      // must not promote window-local legacy entries into current-contract authority.
-      catalogs.push(...nativeCatalogs);
+  if (frozen) {
+    catalogs.push(frozen.catalog);
+    // A fork's private artifact already covers the named recipes outside its copied window.
+    if (!covered) {
+      const derived = await readHistoricalCompressionHandleCatalog(database, contentStore, {
+        recipe: frozen.recipe, requestId: String(request.id), conversationId
+      });
+      if (derived) catalogs.push(derived);
     }
   }
-  const catalog = reconcileHistoricalModelHandleCatalogs(catalogs);
-  const identity = contextCatalogIdentity(catalog);
-  const requiresNativeReset = (catalog.retiredRefs?.length ?? 0) > 0
-    && !currentOrdinaryCatalogs.some(frozen => contextCatalogIdentity(frozen) === identity);
-  return { catalog, requiresNativeReset };
+  const nativeCatalogs = await readNativeRequestContextCatalogs(database, contentStore, String(request.id), createFrozenHandleReadCache());
+  // Native outputs from one immutable request share exactly its frozen scope. Legacy aliases
+  // across requests can be reconciled, but contradictory identities within one scope cannot.
+  const requestScope = nativeCatalogs.length > 0
+    ? mergeModelHandleCatalogs(...(frozen ? [frozen.catalog] : []), ...nativeCatalogs) : frozen?.catalog;
+  catalogs.push(...nativeCatalogs);
+  return { catalogs, ...(frozen?.kind === 'reliable-agent-turn'
+    && frozen.catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION
+    ? { currentOrdinaryIdentity: contextCatalogIdentity(requestScope!) } : {}) };
 }
 
 function contextCatalogIdentity(catalog: ModelHandleCatalog): string {
-  return canonicalPlainJson(normalizePlainJson({
+  return createHash('sha256').update(canonicalPlainJson(normalizePlainJson({
     identityContractRevision: catalog.identityContractRevision,
     entries: catalog.entries.map(({ kind, ref, target }) => ({ kind, ref, target }))
       .sort((left, right) => left.ref.localeCompare(right.ref) || left.target.localeCompare(right.target)),
     retiredRefs: [...(catalog.retiredRefs ?? [])].sort()
-  }, 'Context handle identity'));
+  }, 'Context handle identity'))).digest('hex');
 }
 
 /** A fork target keeps exactly one ConversationBranchLink, even after its source is deleted. */
@@ -172,13 +159,11 @@ interface NativeChildProjection {
 }
 
 interface FrozenHandleReadCache {
-  recipes: Map<string, { kind: string; recipe: { [key: string]: PlainJsonValue };
-    catalog: ModelHandleCatalog } | undefined>;
   nativeProjections: Map<string, NativeChildProjection>;
 }
 
 function createFrozenHandleReadCache(): FrozenHandleReadCache {
-  return { recipes: new Map(), nativeProjections: new Map() };
+  return { nativeProjections: new Map() };
 }
 
 function persistentContextCatalog(value: unknown): ModelHandleCatalog {
