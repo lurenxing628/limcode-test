@@ -13,7 +13,7 @@ import {
   type ReliableInterruptPhase
 } from '@shared/reliableControlLifecycle';
 import { toStructuredClonePlainData } from '@shared/plainData';
-import { RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE } from '@shared/reliableKernelClientFeed';
+import { RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE, reliableKernelRuntimeIdentity } from '@shared/reliableKernelClientFeed';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import { mergeSteeringReceipts, steeringReceiptsByConversationState } from '@webview/composables/steeringReceipts';
 import {
@@ -162,14 +162,16 @@ function retireHistoryCommandWaits(changedContextOnly = false): void {
 
 function currentHistoryCommandContext(): UnconfirmedCommandContext {
   const feed = useReliableConversation().feed;
-  return { sessionId: feed.sessionId, hostBootId: feed.hostBootId, clientId: bridge.currentClientId() };
+  return { sessionId: feed.sessionId, hostBootId: feed.hostBootId, clientId: bridge.currentClientId(),
+    runtimeIdentity: reliableKernelRuntimeIdentity(feed.projections.runtimeIdentity) };
 }
 
 function historyCommandContextMatches(context: UnconfirmedCommandContext | undefined): boolean {
   if (!context) return false;
   const current = currentHistoryCommandContext();
   return context.sessionId === current.sessionId && context.hostBootId === current.hostBootId
-    && context.clientId === current.clientId;
+    && context.clientId === current.clientId
+    && JSON.stringify(context.runtimeIdentity) === JSON.stringify(current.runtimeIdentity);
 }
 
 /** A navigation changes the Feed session but cannot change an exact already-committed result. */
@@ -177,6 +179,20 @@ function historyCommandHostMatches(context: UnconfirmedCommandContext | undefine
   if (!context) return false;
   const current = currentHistoryCommandContext();
   return context.hostBootId === current.hostBootId && context.clientId === current.clientId;
+}
+
+/** A positive receipt may retire a local wait across Hosts only in the exact same Runtime. */
+function historyReceiptScopeMatches(context: UnconfirmedCommandContext | undefined): boolean {
+  if (!context) return false;
+  const current = currentHistoryCommandContext();
+  if (!historyCommandHostMatches(context) && useReliableConversation().feed.snapshotRequired) return false;
+  if (context.runtimeIdentity || current.runtimeIdentity) {
+    return !!context.runtimeIdentity && !!current.runtimeIdentity
+      && context.runtimeIdentity.dataSetId === current.runtimeIdentity.dataSetId
+      && context.runtimeIdentity.rootInstanceId === current.runtimeIdentity.rootInstanceId
+      && context.runtimeIdentity.rootGeneration === current.runtimeIdentity.rootGeneration;
+  }
+  return historyCommandHostMatches(context);
 }
 
 export interface PendingTurnInputSubmission {
@@ -1890,6 +1906,42 @@ export function useChat() {
     return expectedRootId ? { kind: 'current_head', expectedRootId } : undefined;
   }
 
+  const unconfirmedHistoryCommands = computed(() => {
+    const conversationId = reliableConversation.conversationId.value;
+    const action = conversationActionStates.value[conversationId];
+    const commandIds = [
+      ...(action?.phase === 'unconfirmed' ? [action.actionId] : []),
+      ...Object.values(forkRequests.value).filter((request) => request.sourceConversationId === conversationId
+        && request.failure).map((request) => request.actionId)
+    ];
+    return commandIds.length ? { conversationId, commandIds, context: currentHistoryCommandContext() } : undefined;
+  });
+
+  function dismissUnconfirmedHistoryCommands(selection: NonNullable<typeof unconfirmedHistoryCommands.value>): void {
+    if (selection.conversationId !== reliableConversation.conversationId.value
+      || selection.conversationId !== clientState.currentConversationId
+      || !historyCommandContextMatches(selection.context)) return;
+    let cleared = false;
+    const action = conversationActionStates.value[selection.conversationId];
+    if (action?.phase === 'unconfirmed' && selection.commandIds.includes(action.actionId)) {
+      cleared = true;
+      clearConversationAction(selection.conversationId);
+      clearHistoryActionNotice(selection.conversationId, action.actionId);
+    }
+    for (const commandId of selection.commandIds) {
+      const request = forkRequests.value[commandId];
+      if (request?.failure && request.sourceConversationId === selection.conversationId) {
+        cleared = true;
+        clearForkRequest(commandId);
+        forkClicksThisSession.delete(commandId);
+        clearHistoryActionNotice(selection.conversationId, commandId);
+      }
+    }
+    if (cleared && !conversationActionStates.value[selection.conversationId] && !unconfirmedHistoryCommands.value) {
+      setActionNotice(selection.conversationId, '已解除本地锁定；原操作仍可能已执行。再次执行会发起新操作，请先核对历史。');
+    }
+  }
+
   function requestConversationAction(next: ConversationActionState): boolean {
     const existing = conversationActionStates.value[next.conversationId];
     if (existing) {
@@ -1920,11 +1972,12 @@ export function useChat() {
     let action = conversationActionStates.value[conversationId];
     if (!action) return;
 
-    // An exact receipt remains authoritative after same-Host navigation, just like a late direct
-    // reply. It does not identify the new Turn: retire only this immutable retry's local wait.
+    // An exact receipt in the same Runtime remains authoritative across Host reconnects.
+    // It does not identify the new Turn: retire only this immutable retry's local wait.
     // Mutation replay below still requires the original Feed session and command context.
     if (action.action === 'retry' && ['submitting', 'unconfirmed'].includes(action.phase)
-      && historyCommandHostMatches(action.requestContext)
+      && historyReceiptScopeMatches(action.requestContext)
+      && clientState.currentConversationId === conversationId
       && action.commandPayload.type === BridgeMessageType.MessageRetryFrom
       && action.commandPayload.payload.command.commandId === action.actionId
       && action.commandPayload.payload.conversationId === conversationId
@@ -2440,6 +2493,8 @@ export function useChat() {
     conversationActionPending,
     conversationActionLabel,
     conversationActionNotice,
+    unconfirmedHistoryCommands,
+    dismissUnconfirmedHistoryCommands,
     conversationForkReadyNotice,
     openForkReadyNotice,
     dismissForkReadyNotice,
@@ -2551,7 +2606,8 @@ function validHistoryCommandContext(value: UnconfirmedCommandContext): boolean {
   return !!value && typeof value === 'object'
     && (value.sessionId === null || typeof value.sessionId === 'string')
     && (value.hostBootId === null || typeof value.hostBootId === 'string')
-    && validOptionalText(value.clientId);
+    && validOptionalText(value.clientId)
+    && (value.runtimeIdentity === undefined || !!reliableKernelRuntimeIdentity(value.runtimeIdentity));
 }
 
 function validConversationActionInterrupt(value: ConversationActionInterrupt): boolean {

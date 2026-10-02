@@ -803,6 +803,7 @@ test('slow ACK compacts unsent visible commits without allocating wire sequence 
   let onCommit;
   const projection = emptyClientProjection();
   const database = {
+    binding: { dataSetId: 'backpressure-data', rootInstanceId: 'backpressure-root', rootGeneration: 1 },
     hostBootId: 'backpressure-boot',
     async externalDataVersion() { return '1'; },
     async clientProjectionSnapshotAndSubscribe(_conversationId, listener) {
@@ -903,6 +904,7 @@ test('client summary keeps a long provider_call_id byte-for-byte', async () => {
   };
   const sent = [];
   const database = {
+    binding: { dataSetId: 'provider-id-data', rootInstanceId: 'provider-id-root', rootGeneration: 1 },
     hostBootId: 'provider-id-boot',
     async externalDataVersion() { return '1'; },
     async clientProjectionSnapshotAndSubscribe() {

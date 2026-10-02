@@ -381,6 +381,7 @@ test('the snapshot byte limit drops a collaboration message with its peer delive
   let commit;
   const received = [];
   const feed = new kernel.BoundedClientFeed({
+    binding: database.binding,
     hostBootId: 'collaboration-trim',
     async externalDataVersion() { return '1'; },
     async clientProjectionSnapshotAndSubscribe(_conversationId, listener) {

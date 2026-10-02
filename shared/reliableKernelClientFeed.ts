@@ -85,6 +85,22 @@ export interface ChildConversationBoundaryProjection {
   } | null;
 }
 
+/** Stable Runtime scope proof; contains no storage paths or credentials. */
+export interface ReliableKernelRuntimeIdentity {
+  dataSetId: string;
+  rootInstanceId: string;
+  rootGeneration: number;
+}
+
+export function reliableKernelRuntimeIdentity(value: unknown): ReliableKernelRuntimeIdentity | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const record = value as Partial<ReliableKernelRuntimeIdentity>;
+  if (typeof record.dataSetId !== 'string' || !record.dataSetId
+    || typeof record.rootInstanceId !== 'string' || !record.rootInstanceId
+    || !Number.isSafeInteger(record.rootGeneration) || record.rootGeneration! < 1) return undefined;
+  return { dataSetId: record.dataSetId, rootInstanceId: record.rootInstanceId, rootGeneration: record.rootGeneration! };
+}
+
 export interface ReliableKernelSnapshotMessage {
   type: typeof RELIABLE_KERNEL_SNAPSHOT_MESSAGE;
   sessionId: string;

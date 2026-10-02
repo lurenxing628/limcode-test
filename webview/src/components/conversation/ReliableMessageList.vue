@@ -26,6 +26,7 @@ import { modelRequestRetryForTurn, projectReliableTurnTermination } from '@webvi
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
 import { collaborationCardPlacementLabel, projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
 import MessageItem from './MessageItem.vue';
+import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import ReliableCollaborationCard from './ReliableCollaborationCard.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
@@ -65,12 +66,23 @@ const {
   conversationActionPending,
   conversationActionLabel,
   conversationActionNotice,
+  unconfirmedHistoryCommands,
+  dismissUnconfirmedHistoryCommands,
   conversationForkReadyNotice,
   openForkReadyNotice,
   dismissForkReadyNotice,
   forkPendingTargetIds,
   currentAuthoritySelection
 } = useChat();
+const historyDismissSelection = shallowRef<NonNullable<typeof unconfirmedHistoryCommands.value>>();
+function confirmHistoryDismiss(): void {
+  const selection = historyDismissSelection.value;
+  historyDismissSelection.value = undefined;
+  if (selection) dismissUnconfirmedHistoryCommands(selection);
+}
+watch(() => [conversationId.value, feed.sessionId, feed.hostBootId], () => {
+  historyDismissSelection.value = undefined;
+}, { flush: 'sync' });
 const globalSettings = useGlobalSettingsStore();
 const modelProfiles = useModelProfileStore();
 const timelinePresentation = useReliableTimelinePresentationStore();
@@ -878,6 +890,12 @@ function messageRenderKey(message: MessageRecord): string {
     <p v-if="conversationActionNotice" class="reliable-action-notice" role="status">
       {{ conversationActionNotice }}
     </p>
+    <p v-if="unconfirmedHistoryCommands" class="reliable-action-notice">
+      <button type="button" @click="historyDismissSelection = unconfirmedHistoryCommands">核对后解除本地锁定</button>
+    </p>
+    <ConfirmPanel :open="!!historyDismissSelection" title="解除本地锁定？"
+      description="原操作结果尚未确认。解除只恢复界面操作，不会取消或重发原请求。再次执行可能重复，请先核对历史。"
+      confirm-label="已核对，解除锁定" @confirm="confirmHistoryDismiss" @cancel="historyDismissSelection = undefined" />
     <p v-if="conversationForkReadyNotice" class="reliable-action-notice reliable-fork-ready" role="status">
       <span>{{ conversationForkReadyNotice.replayed ? '之前的分支请求已完成，分支已创建。' : '分支已创建。' }}</span>
       <button type="button" @click="openForkReadyNotice">打开分支</button>

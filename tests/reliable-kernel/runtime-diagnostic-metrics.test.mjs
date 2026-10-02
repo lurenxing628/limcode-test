@@ -359,6 +359,7 @@ test('Feed 全量快照记录七种原因，读取期间到来的请求原因留
   let commit;
   let pendingRead;
   const database = {
+    binding: real.binding,
     hostBootId: 'feed-reasons',
     performanceMetrics: { record() {} },
     recordPerformanceMetric: (event) => recorded.push(event),
@@ -450,6 +451,7 @@ test('快照读取期间到来、需要全量快照的本 Host 提交，下一�
   let pendingRead;
   let readStarted = false;
   const database = {
+    binding: real.binding,
     hostBootId: 'feed-buffered',
     performanceMetrics: { record() {} },
     recordPerformanceMetric: (event) => recorded.push(event),

@@ -530,6 +530,8 @@ export class BoundedClientFeed {
   ): ReliableKernelSnapshotMessage {
     const messageSeq = this.allocateMessageSeq(session);
     const projections = boundProjectionRecords(toWirePlain(projectionInput) as Record<string, PlainData>);
+    const { dataSetId, rootInstanceId, rootGeneration } = this.database.binding;
+    projections.runtimeIdentity = { dataSetId, rootInstanceId, rootGeneration };
     const message: ReliableKernelSnapshotMessage = {
       type: RELIABLE_KERNEL_SNAPSHOT_MESSAGE,
       sessionId: session.sessionId,

@@ -1,3 +1,4 @@
+import { reliableKernelRuntimeIdentity, type ReliableKernelRuntimeIdentity } from '@shared/reliableKernelClientFeed';
 import type {
   ConversationCommandMetadata,
   ConversationForkPayload,
@@ -9,6 +10,7 @@ export interface UnconfirmedCommandContext {
   sessionId: string | null;
   hostBootId: string | null;
   clientId?: string;
+  runtimeIdentity?: ReliableKernelRuntimeIdentity;
 }
 
 /**
@@ -264,7 +266,8 @@ function validForkRequest(value: unknown): ForkRequestState | undefined {
   if (context !== undefined && (!context || typeof context !== 'object'
     || (context.sessionId !== null && typeof context.sessionId !== 'string')
     || (context.hostBootId !== null && typeof context.hostBootId !== 'string')
-    || (context.clientId !== undefined && typeof context.clientId !== 'string'))) return undefined;
+    || (context.clientId !== undefined && typeof context.clientId !== 'string')
+    || (context.runtimeIdentity !== undefined && !reliableKernelRuntimeIdentity(context.runtimeIdentity)))) return undefined;
   return {
     actionId: request.actionId,
     sourceConversationId: request.sourceConversationId,
