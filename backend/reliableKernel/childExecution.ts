@@ -80,6 +80,7 @@ import {
 } from './childSendLineage';
 export { CHILD_TURN_ANSWER_WAIT_OWNER_KIND, LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND, childContinuationTurnId } from './childSendLineage';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { retryLocalExecution } from './localExecutionRecovery';
 import {
   normalizeTurnModelOverride,
   normalizeCompiledTurnAuthority,
@@ -212,6 +213,8 @@ export interface ChildExecutionSendResult {
   turnIntentId: string;
   intentLinkId: string;
   pendingTurnInputId?: string;
+  /** Exact pending-input recipient; absent for an idle send or once that input was consumed. */
+  affectedTurnId?: string;
   operationId: string;
   pauseId?: string;
   mode: ChildSendMode;
@@ -1173,6 +1176,13 @@ export class ChildExecutionControlPlane {
 
   public async send(commandInput: ChildExecutionSendCommand): Promise<ChildExecutionSendResult> {
     const command = normalizeSendCommand(commandInput);
+    return this.sendAgainstCurrentChild(command, 3);
+  }
+
+  private async sendAgainstCurrentChild(
+    command: ReturnType<typeof normalizeSendCommand>,
+    retriesRemaining: number
+  ): Promise<ChildExecutionSendResult> {
     const ids = sendIds(command);
     const replay = await this.findSendReplay(command, ids);
     if (replay) return replay;
@@ -1347,13 +1357,66 @@ export class ChildExecutionControlPlane {
     ];
     try {
       const commit = await this.database.transaction(steps);
-      return sendResult(command, ids, currentTurn !== null, false, commit.commitSeq);
+      return sendResult(command, ids, currentTurn ? requirePhaseFId(currentTurn.id, 'Child Turn.id') : undefined, false, commit.commitSeq);
     } catch (error) {
-      if (!isExpectedSendIdentityConflict(error)) throw error;
-      const raced = await this.findSendReplay(command, ids, content);
-      if (!raced) throw error;
-      return raced;
+      if (isExpectedSendIdentityConflict(error)) {
+        const raced = await this.findSendReplay(command, ids, content);
+        if (raced) return raced;
+      }
+      if (retriesRemaining > 0 && (
+        await this.isChildSendNaturalCompletionRace(error, snapshot)
+        || await this.isChildSendAdmissionRace(error, snapshot)
+      )) {
+        // Nothing committed. Re-read the same source's parent authority and child boundary;
+        // neither its identity nor its requested queue/interrupt semantics may change.
+        return this.sendAgainstCurrentChild(command, retriesRemaining - 1);
+      }
+      throw error;
     }
+  }
+
+  private async isChildSendAdmissionRace(error: unknown, before: ChildExecutionSnapshot): Promise<boolean> {
+    if (!isTransactionAssertionFailure(error) || before.childExecution.status !== 'idle'
+      || before.activeTurn !== null || before.activeTurnLink !== null) return false;
+    const childId = requirePhaseFId(before.childExecution.id, 'ChildExecution.id');
+    if (!(error instanceof Error)
+      || error.message !== `ChildExecutionRepository transaction assertion failed for ${childId}.`) return false;
+    const [child, activeLinks] = (await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ChildExecution').get(childId),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionActiveTurnLink').list({ where: { child_execution_id: childId }, limit: 2 })
+    ])).snapshot;
+    if (!child || Array.isArray(child) || child.status !== 'active'
+      || !Array.isArray(activeLinks) || activeLinks.length !== 1) return false;
+    const turnId = requirePhaseFId(activeLinks[0].turn_id, 'ChildExecutionActiveTurnLink.turn_id');
+    const [turn, memberships] = (await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').list({ where: { child_execution_id: childId, turn_id: turnId }, limit: 2 })
+    ])).snapshot;
+    return !!turn && !Array.isArray(turn) && turn.status === ACTIVE_TURN
+      && turn.conversation_id === child.child_conversation_id
+      && Array.isArray(memberships) && memberships.length === 1;
+  }
+
+  private async isChildSendNaturalCompletionRace(error: unknown, before: ChildExecutionSnapshot): Promise<boolean> {
+    if (!isTransactionAssertionFailure(error) || before.activeTurn?.status !== ACTIVE_TURN) return false;
+    const childId = requirePhaseFId(before.childExecution.id, 'ChildExecution.id');
+    const turnId = requirePhaseFId(before.activeTurn.id, 'Child Turn.id');
+    const expected = [
+      `ChildExecutionRepository transaction assertion failed for ${childId}.`,
+      `TurnRepository transaction assertion failed for ${turnId}.`,
+      ...(before.activeTurnLink ? [
+        `ChildExecutionActiveTurnLinkRepository transaction assertion failed for ${String(before.activeTurnLink.id)}.`
+      ] : [])
+    ];
+    if (!(error instanceof Error) || !expected.includes(error.message)) return false;
+    const [child, turn, terminations] = (await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ChildExecution').get(childId),
+      DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').list({ where: { turn_id: turnId }, limit: 2 })
+    ])).snapshot;
+    return !!child && !Array.isArray(child) && ['active', 'idle'].includes(String(child.status))
+      && !!turn && !Array.isArray(turn) && turn.status === TERMINATED_TURN
+      && Array.isArray(terminations) && terminations.length === 1 && terminations[0].terminal_status === 'completed';
   }
 
   /**
@@ -2697,7 +2760,11 @@ export class ChildExecutionControlPlane {
       status: 'waiting_answer'
     }, 2);
     const foregroundWasWaiting = foregroundOperations.length > 0;
-    const foregroundSettled = await this.cancelForegroundWaitForToolCall({
+    // A delegated Plan settles its source interaction itself: its spawn Operation has no
+    // tool_call_id. Only an Operation that owns this source call is a child foreground wait.
+    const ownsSourceWait = waitOperations.some((operation) => operation.owner_kind === 'child_execution'
+      && operation.owner_id === childExecutionId && operation.tool_call_id === sourceToolCallId);
+    const foregroundSettled = ownsSourceWait && await this.cancelForegroundWaitForToolCall({
       toolCallId: sourceToolCallId,
       reason,
       sourceIdentity: `${sourceIdentity}:foreground`,
@@ -2729,6 +2796,97 @@ export class ChildExecutionControlPlane {
       foregroundSettled: (foregroundWasWaiting && foregroundSettled) || foregroundMaterialized,
       continuationSettlements: continuationSettledIds.size
     };
+  }
+
+  /** Ordinary child-chat Stop cancels only the parent wait for that exact, ended task Turn. */
+  public settleInterruptedForegroundWait(toolCallIdInput: string, signal?: AbortSignal): Promise<boolean> {
+    const toolCallId = requirePhaseFId(toolCallIdInput, 'toolCallId');
+    return retryLocalExecution(() => this.settleInterruptedForegroundWaitAttempt(toolCallId), { signal });
+  }
+
+  private async settleInterruptedForegroundWaitAttempt(toolCallId: string): Promise<boolean> {
+    const operations = await this.listRows('Operation', { tool_call_id: toolCallId }, 2);
+    if (operations.length !== 1 || operations[0].status !== 'waiting_answer') return false;
+    const operation = operations[0];
+    let membership: DomainRow | undefined;
+    let parentLink: DomainRow | undefined;
+    if (operation.owner_kind === 'child_execution') {
+      const parents = await this.listRows('ChildExecutionParentLink', { child_execution_id: operation.owner_id }, 2);
+      // A delegated Plan owns its source interaction externally; its spawn Operation has no call.
+      if (parents.length !== 1 || parents[0].source_tool_call_id !== toolCallId) return false;
+      parentLink = parents[0];
+      const first = await this.listRows('ChildExecutionTurnLink', { child_execution_id: operation.owner_id, turn_seq: 1n }, 2);
+      if (first.length !== 1) return false;
+      membership = first[0];
+    } else if (operation.owner_kind === CHILD_TURN_ANSWER_WAIT_OWNER_KIND) {
+      const members = await this.listRows('ChildExecutionTurnLink', { turn_id: operation.owner_id }, 2);
+      if (members.length !== 1) return false; // A later queued task has not acquired a Turn yet.
+      membership = members[0];
+    } else if (operation.owner_kind === LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND) {
+      const bridge = await this.requireExisting('AnswerBridge', requirePhaseFId(operation.owner_id, 'Operation.owner_id'));
+      const members = await listAllDomainRows(this.database, 'ChildExecutionTurnLink', { child_execution_id: bridge.child_execution_id });
+      for (const member of members) {
+        const exact = await this.readContinuationWaitOperations({ bridge, toolCallId, sourceTurnId: String(member.turn_id) });
+        if (exact.some(row => row.id === operation.id)) { membership = member; break; }
+      }
+      if (!membership) return false;
+    } else return false;
+
+    const childExecutionId = requirePhaseFId(membership.child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
+    const turnId = requirePhaseFId(membership.turn_id, 'ChildExecutionTurnLink.turn_id');
+    const child = await this.requireExisting('ChildExecution', childExecutionId);
+    const turn = await this.requireExisting('Turn', turnId);
+    if (turn.status !== TERMINATED_TURN || turn.conversation_id !== child.child_conversation_id) return false;
+    const terminations = await this.listRows('TurnTermination', { turn_id: turnId }, 2);
+    const interrupts = await this.listRows('PendingTurnInput', {
+      turn_id: turnId, input_kind: 'interrupt_request', state: 'consumed'
+    }, 2);
+    if (terminations.length !== 1 || terminations[0].terminal_status !== 'interrupted' || interrupts.length === 0) return false;
+    const toolCall = await this.requireExisting('ToolCall', toolCallId);
+    const parentTurn = await this.requireExisting('Turn', requirePhaseFId(toolCall.turn_id, 'ToolCall.turn_id'));
+    const executions = await this.listRows('ToolExecution', { tool_call_id: toolCallId }, 2);
+    if (parentTurn.status !== ACTIVE_TURN || !['executing', 'waiting_answer'].includes(String(toolCall.status))
+      || executions.length !== 1 || executions[0].status !== 'waiting_answer') return false;
+    await this.database.conversationOwners.assertOwned(requirePhaseFId(parentTurn.conversation_id, 'Parent Turn.conversation_id'));
+    const authoritySteps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, { child_conversation_id: child.child_conversation_id }),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(String(membership.id), {
+        child_execution_id: childExecutionId, turn_id: turnId, turn_seq: membership.turn_seq
+      }),
+      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: TERMINATED_TURN, conversation_id: child.child_conversation_id }),
+      DOMAIN_REPOSITORIES.domain('TurnTermination').assert(String(terminations[0].id), { turn_id: turnId, terminal_status: 'interrupted' }),
+      DOMAIN_REPOSITORIES.domain('PendingTurnInput').assert(String(interrupts[0].id), { turn_id: turnId, input_kind: 'interrupt_request', state: 'consumed' }),
+      DOMAIN_REPOSITORIES.domain('Turn').assert(String(parentTurn.id), { status: ACTIVE_TURN, conversation_id: parentTurn.conversation_id }),
+      DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { turn_id: parentTurn.id, status: toolCall.status }),
+      DOMAIN_REPOSITORIES.domain('ToolExecution').assert(String(executions[0].id), { tool_call_id: toolCallId, status: 'waiting_answer' }),
+      DOMAIN_REPOSITORIES.domain('Operation').assert(String(operation.id), {
+        tool_call_id: toolCallId, owner_kind: operation.owner_kind, owner_id: operation.owner_id, status: 'waiting_answer'
+      }),
+      ...(parentLink ? [DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(String(parentLink.id), {
+        child_execution_id: childExecutionId, source_tool_call_id: toolCallId, parent_turn_id: parentTurn.id
+      })] : [])
+    ];
+    const sourceIdentity = `child-turn-user-stop:${turnId}:${toolCallId}`;
+    const detail = { interrupted: true, childTurnInterrupted: true, childExecutionId, childTurnId: turnId,
+      reason: String(terminations[0].reason) };
+    if (!parentLink) return (await this.settleContinuationOperation({ operation, execution: executions[0],
+      detail, status: 'cancelled', sourceIdentity, authoritySteps })) !== null;
+    const settlement = await this.prepareForegroundSettlement({ childExecutionId, status: 'cancelled', detail, sourceIdentity });
+    if (!settlement) return false;
+    try {
+      await this.database.transaction([
+        ...authoritySteps,
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({ id: settlement.receiptId, source_kind: 'internal',
+          source_key: sourceIdentity, conversation_id: parentTurn.conversation_id, turn_id: parentTurn.id, created_at: this.timestamp() }),
+        ...settlement.steps
+      ]);
+      return (await this.finalizeWaitSettlement(toolCallId)) !== null;
+    } catch (error) {
+      if (!isExpectedSettlementRace(error)) throw error;
+      const settled = await this.finalizeWaitSettlement(toolCallId);
+      if (!settled) throw error;
+      return true;
+    }
   }
 
   /**
@@ -2883,6 +3041,7 @@ export class ChildExecutionControlPlane {
     detail: unknown;
     status: ToolOutcomeStatus;
     sourceIdentity: string;
+    authoritySteps?: RepositoryTransactionStep[];
   }): Promise<ChildWaitSettlement | null> {
     const operationId = requirePhaseFId(input.operation.id, 'Operation.id');
     const toolCallId = requirePhaseFId(input.operation.tool_call_id, 'Operation.tool_call_id');
@@ -2913,6 +3072,7 @@ export class ChildExecutionControlPlane {
     const sourceKey = `continuation-wait:${input.sourceIdentity}:${toolCallId}`;
     try {
       await this.database.transaction([
+        ...(input.authoritySteps ?? []),
         DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
           id: receiptId,
           source_kind: 'internal',
@@ -3564,7 +3724,7 @@ export class ChildExecutionControlPlane {
       || (command.completionPolicy === 'wait_for_answer') !== (pause !== null)
       || (pause !== null && pause.operation_id !== ids.operationId)
     ) throw new Error('ChildExecution send source was replayed with different facts.');
-    return sendResult(command, ids, pendingInput !== null, true);
+    return sendResult(command, ids, pendingInput ? requirePhaseFId(pendingInput.turn_id, 'PendingTurnInput.turn_id') : undefined, true);
   }
 
   private async findRuntimeDeliveryContinuationReplay(
@@ -4105,7 +4265,7 @@ function sendIds(command: ReturnType<typeof normalizeSendCommand>) {
 function sendResult(
   command: ReturnType<typeof normalizeSendCommand>,
   ids: ReturnType<typeof sendIds>,
-  hasPendingTurnInput: boolean,
+  affectedTurnId: string | undefined,
   deduplicated: boolean,
   commitSeq?: string
 ): ChildExecutionSendResult {
@@ -4113,7 +4273,7 @@ function sendResult(
     childExecutionId: command.childExecutionId,
     turnIntentId: ids.turnIntentId,
     intentLinkId: ids.intentLinkId,
-    ...(hasPendingTurnInput ? { pendingTurnInputId: ids.pendingTurnInputId } : {}),
+    ...(affectedTurnId ? { pendingTurnInputId: ids.pendingTurnInputId, affectedTurnId } : {}),
     operationId: ids.operationId,
     ...(command.completionPolicy === 'wait_for_answer' ? { pauseId: ids.pauseId } : {}),
     mode: command.mode,

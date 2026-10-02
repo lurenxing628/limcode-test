@@ -56,6 +56,7 @@ import {
 } from './conversationHostEligibility';
 import { isConversationRuntimeOwnerBusyError } from '../../reliableKernel/ConversationRuntimeOwnerManager';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
+import { retryLocalExecution } from '../../reliableKernel/localExecutionRecovery';
 import type { ConversationRecoveryResult } from '../../../vscode/ApplicationFacade';
 
 export interface VscodeReliableKernelProductRuntimeOptions {
@@ -154,7 +155,10 @@ export class VscodeReliableKernelProductRuntime {
     this.fileDiffs = input.fileDiffs;
     this.conversations = input.conversations;
     // A Turn no live Host holds any more is taken over with the same recovery as a view takeover.
-    this.conversations.setConversationTakeover((conversationId) => this.recoverOwnedConversation(conversationId));
+    this.conversations.setConversationTakeover((conversationId) => this.recoverOwnedConversation(conversationId), {
+      includeChildExecutions: true
+    });
+    this.childAgents.setConversationRecovery((conversationId) => this.recoverOwnedConversation(conversationId));
     this.conversationLifecycle = input.conversationLifecycle;
     this.providerRegistry = input.providerRegistry;
     this.diagnostics = input.diagnostics;
@@ -621,27 +625,38 @@ export class VscodeReliableKernelProductRuntime {
     if (this.recoveryTask) return this.recoveryTask;
     if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
     const controller = this.recoveryController;
-    this.recoveryTask = (async () => {
-      await this.relocatedWorkSettled;
-      await this.externalRuntimeWatcher.start();
-      const [report] = await Promise.all([
-        this.application.recover(controller.signal),
-        this.toolHost.initialize(),
-        this.initializeConfiguration()
-      ]);
+    const phase = <T>(operation: () => Promise<T>): Promise<T> => retryLocalExecution(async () => {
       controller.signal.throwIfAborted();
-      if (!this.closing) {
-        await this.childAgents.recoverStartup(controller.signal);
-        controller.signal.throwIfAborted();
-        await this.conversations.recoverStartup(controller.signal);
-      }
-      await this.application.refreshExternalRuntimeWork();
-      this.recoveryReport = report;
-      return report;
+      if (this.closing) throw new Error('Reliable Runtime is closing.');
+      const result = await operation();
+      controller.signal.throwIfAborted();
+      return result;
+    }, { signal: controller.signal });
+    const task = (async () => {
+      await this.relocatedWorkSettled;
+      await phase(() => this.externalRuntimeWatcher.start());
+      // Join every initialization branch even on failure; close() must not close the database
+      // beneath a sibling still preparing capabilities. Retry each idempotent phase separately.
+      const initial = await Promise.allSettled([
+        phase(() => this.application.recover(controller.signal)),
+        phase(() => this.toolHost.initialize()),
+        phase(() => this.initializeConfiguration())
+      ] as const);
+      const failed = initial.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (failed) throw failed.reason;
+      const recovered = initial[0];
+      if (recovered.status !== 'fulfilled') throw recovered.reason;
+      await phase(() => this.childAgents.recoverStartup(controller.signal));
+      await phase(() => this.conversations.recoverStartup(controller.signal));
+      await phase(() => this.application.refreshExternalRuntimeWork());
+      this.recoveryReport = recovered.value;
+      this.recoveryError = undefined;
+      return recovered.value;
     })().catch((error) => {
       if (!this.closing) this.recoveryError = error;
       throw error;
     });
+    this.recoveryTask = task;
     return this.recoveryTask;
   }
 

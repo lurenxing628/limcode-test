@@ -531,7 +531,7 @@ test('盲审 3：产品运行时把接管无存活宿主持有的 Turn 接到与
       database: { conversationOwners: { async run(id, operation) { order.push(`claim:${id}`); return operation(); } } },
       async recoverConversation(id) { order.push(`phase-d:${id}`); }
     },
-    childAgents: { async recoverStartup(_signal, id) { order.push(`children:${id}`); } },
+    childAgents: { setConversationRecovery() {}, async recoverStartup(_signal, id) { order.push(`children:${id}`); } },
     conversations: {
       setConversationTakeover(hook) { takeover = hook; },
       async recoverStartup(_signal, id) { order.push(`runner:${id}`); }

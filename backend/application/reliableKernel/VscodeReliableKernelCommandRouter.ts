@@ -2216,31 +2216,17 @@ export class VscodeReliableKernelCommandRouter {
     correlationId: string | undefined,
     payload: ToolDecisionPayload
   ): Promise<void> {
-    const links = await this.list('InteractionToolCallLink', { tool_call_id: payload.toolCallId }, 10);
-    const pending = await Promise.all(links.map((link) => this.requireRow('InteractionRequest', String(link.request_id))));
-    const request = pending.find((candidate) => candidate.status === 'pending');
-    if (request) {
-      const owner = (await this.list('InteractionOwnerLink', { request_id: request.id }, 2))[0];
-      if (!owner) throw new Error('Interaction 缺少 owner。');
-      await this.handleInteractionResolve(webview, correlationId, {
-        conversationId: payload.conversationId ?? String((await this.requireRow('Turn', String(owner.turn_id))).conversation_id),
-        interactionRequestId: String(request.id),
-        interactionRevision: 1,
-        ownerTurnId: String(owner.turn_id),
-        decision: 'cancel',
-        response: { reason: payload.reason ?? '用户取消工具。' }
-      });
-      return;
-    }
     const toolCall = await this.requireRow('ToolCall', payload.toolCallId);
     const turn = await this.requireRow('Turn', String(toolCall.turn_id));
     const turnConversationId = String(turn.conversation_id);
-    if (toolCall.tool_name === 'run_agent') {
-      const childLinks = await this.list('ChildExecutionParentLink', {
-        source_tool_call_id: payload.toolCallId
-      }, 2);
+    // A delegated Plan also owns a child through its source ToolCall. The durable parent link,
+    // not the tool's name or a Webview-supplied child id, determines which subtree Stop targets.
+    const childLinks = await this.list('ChildExecutionParentLink', {
+      source_tool_call_id: payload.toolCallId
+    }, 2);
+    if (childLinks.length > 0) {
       if (childLinks.length !== 1) {
-        throw new Error('run_agent 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。');
+        throw new Error(`${String(toolCall.tool_name)} 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。`);
       }
       const result = await this.runConversationCommand(turnConversationId, () =>
         this.product.childAgents.interruptSubtree({
@@ -2264,6 +2250,27 @@ export class VscodeReliableKernelCommandRouter {
         }
       });
       return;
+    }
+    // A committed delegation can expose its child before the winning Plan response finishes
+    // local settlement. Only a call with no child can mean cancelling its pending Interaction.
+    const links = await this.list('InteractionToolCallLink', { tool_call_id: payload.toolCallId }, 10);
+    const pending = await Promise.all(links.map((link) => this.requireRow('InteractionRequest', String(link.request_id))));
+    const request = pending.find((candidate) => candidate.status === 'pending');
+    if (request) {
+      const owner = (await this.list('InteractionOwnerLink', { request_id: request.id }, 2))[0];
+      if (!owner) throw new Error('Interaction 缺少 owner。');
+      await this.handleInteractionResolve(webview, correlationId, {
+        conversationId: payload.conversationId ?? String((await this.requireRow('Turn', String(owner.turn_id))).conversation_id),
+        interactionRequestId: String(request.id),
+        interactionRevision: 1,
+        ownerTurnId: String(owner.turn_id),
+        decision: 'cancel',
+        response: { reason: payload.reason ?? '用户取消工具。' }
+      });
+      return;
+    }
+    if (toolCall.tool_name === 'run_agent') {
+      throw new Error('run_agent 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。');
     }
     const interrupted = await this.runConversationCommand(turnConversationId, () =>
       this.product.conversations.interrupt({

@@ -58,7 +58,8 @@ function fixture(initialTasks = [task(1)]) {
         return { childExecution: { id: value.childExecutionId, child_conversation_id: value.conversationId, status: value.status },
           answerBridge: { id: value.answerBridgeId, status: 'open' }, activeTurn: { id: value.execution.activeTurnId, status: 'active' } };
       },
-      async send(input) { events.sends.push(input); return { turnIntentId: 'new-intent' }; },
+      async send(input) { events.sends.push(input); return { turnIntentId: 'new-intent', mode: input.mode,
+        affectedTurnId: tasks.find(task => task.childExecutionId === input.childExecutionId)?.execution.activeTurnId }; },
       async finalizeWaitSettlement(toolCallId) { return { toolCallId, status: 'succeeded' }; }
     },
     answers: { async readCurrent() { return { status: 'running' }; } }

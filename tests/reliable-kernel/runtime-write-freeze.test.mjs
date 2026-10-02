@@ -131,6 +131,8 @@ test('冻结期间只看冻结前已有的工作：之前开始的 Turn 与仍�
   window.provider.release();
   await eventually(async () => (await rows(window.app, 'Turn', { id: turnId }))[0]?.status === 'terminated', 60_000, 'Turn 未完成');
   await eventually(async () => !(await window.facade.hasOwnedExecution()), 30_000, 'Turn 结束后窗口仍忙');
+  // Join the terminal drive's separate admission check before isolating the view's ownership.
+  await window.runner.waitForIdle();
   // While frozen, a view that holds a Conversation for a moment is not work of this window.
   let busyWhileViewing;
   await window.app.database.conversationOwners.run('conversation-b', async () => {

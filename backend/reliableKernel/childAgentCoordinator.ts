@@ -70,6 +70,7 @@ import {
 import { requireChildExecutionStatus } from './childExecutionState';
 import { childThinkingInheritanceFromAuthority, childThinkingOverrideForSpawn } from './childThinkingInheritance';
 import { childAgentDepthForTurn } from './childAgentDepth';
+import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
 import { forkInheritedChildTargets, isForkConversation } from './conversationChildHandles';
 
 export interface ReliableChildAgentSelection {
@@ -219,7 +220,16 @@ export class ReliableChildAgentCoordinator {
   private readonly recoveryAfterDrive = new Set<string>();
   /** Level-triggered wakes that arrive while the same Turn is still inside driveChild(). */
   private readonly pendingDriveWakes = new Set<string>();
-  private readonly waitingOwned = new Map<string, { childExecutionId: string; externalDataVersion: string }>();
+  private readonly waitingOwned = new Map<string, {
+    childExecutionId: string;
+    externalDataVersion: string | undefined;
+    waitingToolCallId?: string;
+    nextWakeAt?: number;
+    childDeadlineAt?: number;
+    deadlineReadPending?: boolean;
+    deadlineRetryAt?: number;
+  }>();
+  private conversationRecovery: ((conversationId: string) => Promise<void>) | undefined;
   private recoveryPollInFlight = false;
   private recoveryPollTask: Promise<void> | undefined;
   /** Frozen parent Turns never change, so each one's child thinking choice is read once per Host. */
@@ -237,6 +247,11 @@ export class ReliableChildAgentCoordinator {
     this.unregisterFinalOutput = dependencies.agentLoop?.registerFinalOutputObserver({
       beforeTurnCompleted: (input) => this.submitTurnFinalAnswer(input)
     }) ?? (() => undefined);
+  }
+
+  /** Product-scoped recovery settles expired child waits under the Conversation's ownership. */
+  public setConversationRecovery(recover: (conversationId: string) => Promise<void>): void {
+    this.conversationRecovery = recover;
   }
 
   public async dispatch(
@@ -393,6 +408,7 @@ export class ReliableChildAgentCoordinator {
    */
   public recoverStartup(signal?: AbortSignal, conversationId?: string): Promise<ReliableChildAgentRecoveryReport> {
     signal?.throwIfAborted();
+    if (this.disposing || this.handoff) return Promise.resolve(emptyRecoveryReport());
     if (this.recoveryPass) {
       const runningScope = this.recoveryPassScope;
       if (runningScope === undefined || runningScope === conversationId) {
@@ -450,7 +466,7 @@ export class ReliableChildAgentCoordinator {
     if (this.disposing || this.handoff) return false;
     const turnId = requireId(turnIdInput, 'turnId');
     const memberships = await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 2);
-    if (memberships.length === 0) return false;
+    if (this.disposing || this.handoff || memberships.length === 0) return false;
     if (memberships.length !== 1) throw new Error(`Child Turn ${turnId} has non-unique scheduler membership.`);
     const childExecutionId = requireId(
       memberships[0].child_execution_id,
@@ -459,6 +475,7 @@ export class ReliableChildAgentCoordinator {
     // Only the child Conversation's owner may drive it. A wake for a foreign-owned child stays on
     // the durable outbox; the owning Host's own scan routes it there instead.
     const turn = await this.get('Turn', turnId);
+    if (this.disposing || this.handoff || !turn) return false;
     if (turn) {
       const owners = this.dependencies.database.conversationOwners;
       const turnConversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
@@ -474,14 +491,15 @@ export class ReliableChildAgentCoordinator {
           this.reportError(error, 'resume-ownership-claim', turnId);
         }
       }
-      if (!eligible) return false;
+      if (this.disposing || this.handoff || !eligible) return false;
     }
-    this.waitingOwned.delete(turnId);
-    if (await this.dependencies.turns.ownsExecutionLease({
+    const ownsLease = await this.dependencies.turns.ownsExecutionLease({
       turnId,
       leaseOwnerId: this.childLeaseOwnerId,
       hostBootId: this.dependencies.database.hostBootId
-    })) {
+    });
+    if (this.disposing || this.handoff) return false;
+    if (ownsLease) {
       this.launch(childExecutionId, turnId);
     } else {
       this.triggerRecoveryPass();
@@ -758,9 +776,16 @@ export class ReliableChildAgentCoordinator {
       childExecutionId: requireId(input.childExecutionId, 'childExecutionId'),
       reason: requireText(input.reason, 'reason')
     });
-    await Promise.all(cancelled.activeTurnIds.map((turnId) =>
-      this.cancelLocalChildTurn(turnId, input.reason)
-    ));
+    await Promise.all(cancelled.activeTurnIds.map(async (turnId) => {
+      try {
+        await this.cancelLocalChildTurn(turnId, input.reason);
+      } finally {
+        // A parked child has no active dispatch to abort. Its durable stop is a local commit,
+        // so externalDataVersion polling cannot wake it; route this exact Turn through its
+        // normal ownership/lease checks even when cancelling a local dispatch failed.
+        await this.resumeInterruptedChildTurn(turnId);
+      }
+    }));
     this.dependencies.ownedProcessCleanup?.notify();
     // Only a user's stop (sidebar, panel cascade, tool cancel) settles Turns no Host here runs;
     // a model's run_agent interrupt leaves them to their scheduler as before.
@@ -1676,21 +1701,83 @@ export class ReliableChildAgentCoordinator {
     if (this.disposing || this.handoff || this.recoveryPollInFlight) return;
     this.recoveryPollInFlight = true;
     try {
-      for (const turnId of this.activeTurns.keys()) await this.signalDurableChildCancellation(turnId);
+      for (const turnId of this.activeTurns.keys()) {
+        if (this.disposing || this.handoff) return;
+        await this.signalDurableChildCancellation(turnId);
+      }
       if (this.waitingOwned.size > 0) {
         const version = await this.dependencies.database.externalDataVersion();
+        if (this.disposing || this.handoff) return;
         for (const [turnId, waiting] of [...this.waitingOwned]) {
-          if (waiting.externalDataVersion === version) continue;
-          this.waitingOwned.delete(turnId);
+          if (this.disposing || this.handoff) return;
+          if (this.activeTurns.has(turnId)) continue;
+          const ordinaryWake = waiting.externalDataVersion !== version || Date.now() >= (waiting.nextWakeAt ?? Infinity);
+          const deadlineWake = this.conversationRecovery
+            && (waiting.deadlineReadPending || (waiting.childDeadlineAt !== undefined && waiting.childDeadlineAt <= Date.now()))
+            && Date.now() >= (waiting.deadlineRetryAt ?? 0);
+          if (!ordinaryWake && !deadlineWake) continue;
+          if (deadlineWake) {
+            // Keep the exact parked entry through failed reads/recovery and back off even if the
+            // owner changed without a commit. This never fabricates a tool result or replays spawn.
+            waiting.deadlineRetryAt = Date.now() + CHILD_RECOVERY_SAFETY_SCAN_MS;
+            try {
+              const turn = await this.get('Turn', turnId);
+              if (this.disposing || this.handoff) return;
+              if (this.waitingOwned.get(turnId) !== waiting || this.activeTurns.has(turnId)) continue;
+              if (!turn || turn.status !== 'active') {
+                this.waitingOwned.delete(turnId);
+                continue;
+              }
+              const deadlineAt = await this.readChildWaitDeadline(turnId);
+              if (this.disposing || this.handoff) return;
+              if (this.waitingOwned.get(turnId) !== waiting || this.activeTurns.has(turnId)) continue;
+              waiting.childDeadlineAt = deadlineAt;
+              waiting.deadlineReadPending = false;
+              if (deadlineAt !== undefined && deadlineAt <= Date.now()) {
+                const conversationId = requireId(turn.conversation_id, 'Child Turn.conversation_id');
+                if (await this.dependencies.database.conversationOwners.tryClaimEligible(conversationId) !== 'owned') continue;
+                if (this.disposing || this.handoff) return;
+                if (this.waitingOwned.get(turnId) !== waiting || this.activeTurns.has(turnId)) continue;
+                await this.conversationRecovery!(conversationId);
+                continue;
+              }
+              if (!ordinaryWake) continue;
+            } catch (error) {
+              if (!this.disposing && !this.handoff) this.reportError(error, 'child-wait-deadline', turnId);
+              continue;
+            }
+          }
+          const priorVersion = waiting.externalDataVersion;
+          const priorSafetyWake = waiting.nextWakeAt;
+          if (!deadlineWake && waiting.waitingToolCallId && priorVersion !== undefined && priorVersion !== version
+            && Date.now() < (priorSafetyWake ?? Infinity)) {
+            // A global SQLite edge may belong to another conversation. Skip only a proven,
+            // unchanged human wait; failed/unknown reads keep the normal authoritative resume.
+            const stillWaiting = await this.stillOnlyAwaitingHumanAnswer(turnId, waiting.childExecutionId, waiting.waitingToolCallId)
+              .catch(() => false);
+            if (this.disposing || this.handoff) return;
+            if (this.waitingOwned.get(turnId) !== waiting || this.activeTurns.has(turnId)) continue;
+            if (stillWaiting && waiting.externalDataVersion === priorVersion && waiting.nextWakeAt === priorSafetyWake) {
+              // Keep the version captured before the proof: a later commit must get another pass.
+              waiting.externalDataVersion = version;
+              continue;
+            }
+          }
           // A human interaction can arrive after the 30s execution lease expired. Route the
           // level-trigger through resume(), which either launches the still-owned generation or
           // asks recovery to claim a new one. Blindly launching here would reject on the expired
           // fence and permanently lose the only cross-Host wake edge.
-          await this.resume(turnId);
+          if (!await this.resume(turnId) && this.waitingOwned.get(turnId) === waiting) {
+            // Ownership can return without another database write. Retain a slow safety wake.
+            waiting.externalDataVersion = version;
+            waiting.nextWakeAt = Date.now() + CHILD_RECOVERY_SAFETY_SCAN_MS;
+          }
         }
       }
+      if (this.disposing || this.handoff) return;
       if (this.recoveryPollingNeeded) {
         const version = await this.dependencies.database.externalDataVersion();
+        if (this.disposing || this.handoff) return;
         if (
           this.recoveryObservedDataVersion === undefined
           || (version !== this.recoveryObservedDataVersion && Date.now() >= this.recoveryChangeScanAt)
@@ -1701,6 +1788,66 @@ export class ReliableChildAgentCoordinator {
       this.recoveryPollInFlight = false;
       this.ensureRecoveryPolling();
     }
+  }
+
+  /** Only exact live child-tool executions have a timed wake; human questions stay event-driven. */
+  private async readChildWaitDeadline(turnId: string): Promise<number | undefined> {
+    const calls = (await listAllDomainRows(this.dependencies.database, 'ToolCall', { turn_id: turnId }))
+      .filter((call) => call.status !== 'terminal' && ['run_agent', 'read_agent_answer'].includes(String(call.tool_name)));
+    const deadlines = (await Promise.all(calls.map((call) => listAllDomainRows(
+      this.dependencies.database, 'ToolExecution', { tool_call_id: requireId(call.id, 'ToolCall.id'), status: 'waiting_answer' }
+    )))).flat().map((execution) => typeof execution.wait_deadline_at === 'string' ? Date.parse(execution.wait_deadline_at) : NaN)
+      .filter(Number.isFinite);
+    return deadlines.length > 0 ? Math.min(...deadlines) : undefined;
+  }
+
+  /** A read-only fast path for one known Ask/Plan pause, never a substitute for resume authority. */
+  private async stillOnlyAwaitingHumanAnswer(turnId: string, childExecutionId: string, toolCallId: string): Promise<boolean> {
+    const database = this.dependencies.database;
+    const repo = (domain: string) => DOMAIN_REPOSITORIES.domain(domain);
+    const first = await database.snapshot([
+      repo('Turn').get(turnId),
+      repo('ChildExecutionActiveTurnLink').list({ where: { child_execution_id: childExecutionId }, limit: 2 }),
+      repo('ExecutionLease').list({ where: { turn_id: turnId }, limit: 2 }),
+      repo('PendingTurnInput').list({ where: { turn_id: turnId, state: 'pending' }, limit: 1 }),
+      ...['pending', 'executing', 'waiting_approval', 'waiting_answer'].map((status) =>
+        repo('ToolCall').list({ where: { turn_id: turnId, status }, limit: 2 }))
+    ]);
+    const [turn, pointers, leases, inputs, pending, executing, approving, calls] = first.snapshot;
+    if (!turn || Array.isArray(turn) || turn.status !== 'active'
+      || !Array.isArray(pointers) || pointers.length !== 1 || pointers[0].turn_id !== turnId
+      || !Array.isArray(leases) || leases.length !== 1 || leases[0].host_boot_id !== database.hostBootId
+      || leases[0].owner_id !== this.childLeaseOwnerId
+      || [inputs, pending, executing, approving].some((rows) => !Array.isArray(rows) || rows.length > 0)
+      || !Array.isArray(calls) || calls.length !== 1 || calls[0].id !== toolCallId) return false;
+    const requestKind = calls[0].tool_name === 'ask_user' ? 'ask_user'
+      : calls[0].tool_name === 'submit_plan' ? 'plan_review' : undefined;
+    if (!requestKind) return false;
+    const conversationId = requireId(turn.conversation_id, 'Child Turn.conversation_id');
+    const owners = database.conversationOwners;
+    if (!owners.owns(conversationId) || await owners.executionEligibility(conversationId) !== 'eligible') return false;
+    const second = await database.snapshot([
+      repo('ToolExecution').list({ where: { tool_call_id: toolCallId }, limit: 2 }),
+      repo('Operation').list({ where: { tool_call_id: toolCallId, status: 'waiting_answer' }, limit: 2 }),
+      repo('ToolOutcome').list({ where: { tool_call_id: toolCallId }, limit: 1 }),
+      repo('InteractionToolCallLink').list({ where: { tool_call_id: toolCallId }, limit: 2 })
+    ]);
+    const [executions, operations, outcomes, links] = second.snapshot;
+    if (second.snapshotCommitSeq !== first.snapshotCommitSeq
+      || !Array.isArray(executions) || executions.length !== 1 || executions[0].status !== 'waiting_answer'
+      || executions[0].wait_deadline_at !== null
+      || !Array.isArray(operations) || operations.length !== 1
+      || !Array.isArray(outcomes) || outcomes.length !== 0
+      || !Array.isArray(links) || links.length !== 1) return false;
+    const requestId = requireId(links[0].request_id, 'InteractionToolCallLink.request_id');
+    const last = await database.snapshot([
+      repo('InteractionRequest').get(requestId),
+      repo('InteractionResponse').list({ where: { request_id: requestId }, limit: 1 })
+    ]);
+    const [request, responses] = last.snapshot;
+    return last.snapshotCommitSeq === first.snapshotCommitSeq && owners.owns(conversationId)
+      && !!request && !Array.isArray(request) && request.request_kind === requestKind && request.status === 'pending'
+      && Array.isArray(responses) && responses.length === 0;
   }
 
   /** Database shutdown must not overtake a scan that was already admitted by the wake timer. */
@@ -1745,6 +1892,25 @@ export class ReliableChildAgentCoordinator {
       this.cancellationSignaled.delete(turnId);
       throw error;
     }
+  }
+
+  /** A durable interrupt wakes only its still-active generation; foreign owners keep their work. */
+  private async resumeInterruptedChildTurn(turnId: string): Promise<void> {
+    if (this.disposing || this.handoff) return;
+    const waiting = this.waitingOwned.get(turnId);
+    if (waiting) {
+      // Preserve this local wake before any fallible read. A transient failure must leave the
+      // existing targeted poll able to retry without requiring another external database write.
+      waiting.externalDataVersion = undefined;
+      waiting.nextWakeAt = undefined;
+      this.ensureRecoveryPolling();
+    }
+    const turn = await this.get('Turn', turnId);
+    if (turn?.status !== 'active') {
+      this.waitingOwned.delete(turnId);
+      return;
+    }
+    await this.resume(turnId);
   }
 
   private async cancelLocalChildTurn(turnId: string, reason: string): Promise<void> {
@@ -1904,25 +2070,35 @@ export class ReliableChildAgentCoordinator {
       const projection = await this.dependencies.children.readConversationTaskProjection(conversationId);
       return Promise.all(bridgeIds.map(id => this.requireScopedChildTask(projection, id, scope)));
     };
-    const initial = await read();
-    const initialRevisions = initial.map(task => task.revision).join('\n');
-    let observed = initial;
-    let changed = false;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline && !childTaskWaitSettled(observed)) {
-      await waitForChildTaskObservation(this.dependencies.database, Math.min(500, deadline - Date.now()), signal);
+    // Subscribe before the first asynchronous read; retain commits between reads and waits.
+    const observation = observeChildTaskChanges(this.dependencies.database);
+    try {
       signal?.throwIfAborted();
-      observed = await read();
-      changed = observed.map(task => task.revision).join('\n') !== initialRevisions;
-      if (changed) break;
+      let version = observation.version();
+      const initial = await read();
+      const initialRevisions = initial.map(task => task.revision).join('\n');
+      let observed = initial;
+      let changed = false;
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline && !childTaskWaitSettled(observed)) {
+        await observation.waitAfter(version, Math.min(500, deadline - Date.now()), signal);
+        signal?.throwIfAborted();
+        version = observation.version();
+        observed = await read();
+        changed = observed.map(task => task.revision).join('\n') !== initialRevisions;
+        if (changed) break;
+      }
+      signal?.throwIfAborted();
+      return this.settleOwnTool(input.toolCallId, {
+        operation: 'wait',
+        answerBridgeIds: bridgeIds,
+        changed,
+        timedOut: timeoutMs > 0 && !changed && !childTaskWaitSettled(observed),
+        tasks: observed.map(childTaskSummary)
+      }, `run-agent-wait:${input.toolCallId}`);
+    } finally {
+      observation.dispose();
     }
-    return this.settleOwnTool(input.toolCallId, {
-      operation: 'wait',
-      answerBridgeIds: bridgeIds,
-      changed,
-      timedOut: timeoutMs > 0 && !changed && !childTaskWaitSettled(observed),
-      tasks: observed.map(childTaskSummary)
-    }, `run-agent-wait:${input.toolCallId}`);
   }
 
   private async scopedSnapshotForBridge(input: ReliableAgentToolDispatchInput,
@@ -2041,7 +2217,7 @@ export class ReliableChildAgentCoordinator {
     }
     if (drivesChild) this.launch(spawned.childExecutionId, spawned.childTurnId);
     if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
-    return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, deadline!, signal);
+    return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, spawned.childTurnId, deadline!, signal);
   }
 
   private async authorizeNewChildDepth(
@@ -2080,9 +2256,6 @@ export class ReliableChildAgentCoordinator {
     const beforeSend = await this.settleUserAbort(input.toolCallId, signal, 'before-child-continuation', true);
     if (beforeSend) return beforeSend;
     const snapshot = await this.scopedSnapshotForBridge(input, answerBridgeId);
-    const activeTurnId = snapshot.activeTurn?.status === 'active'
-      ? requireId(snapshot.activeTurn.id, 'Child active Turn.id')
-      : undefined;
     const completionPolicy = foregroundWaitMs === 0 ? 'background' as const : 'wait_for_answer' as const;
     const deadline = completionPolicy === 'wait_for_answer'
       ? new Date(Date.parse(this.timestamp()) + foregroundWaitMs).toISOString()
@@ -2091,11 +2264,14 @@ export class ReliableChildAgentCoordinator {
       sourceKey: `run-agent-continuation:${input.toolCallId}`,
       sourceToolCallId: input.toolCallId,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
-      mode: activeTurnId && interrupt ? 'interrupt_current_turn' : 'queue_next_turn',
+      mode: interrupt ? 'interrupt_current_turn' : 'queue_next_turn',
       content: promptWithAnswerBridge(prompt),
       completionPolicy,
       ...(deadline ? { waitDeadlineAt: deadline } : {})
     });
+    // The send's committed recipient can differ from the earlier scoped preview.
+    const affectedTurnId = sent.affectedTurnId;
+    const interruptsCurrent = sent.mode === 'interrupt_current_turn';
     // The continuation intent is durable; waiting for/cancelling the prior child Turn is no longer
     // part of child admission and must not block another run_agent startup.
     admission?.release();
@@ -2108,7 +2284,7 @@ export class ReliableChildAgentCoordinator {
       return afterSend;
     }
 
-    if (activeTurnId && !interrupt) {
+    if (affectedTurnId && !interruptsCurrent) {
       // The current child turn owns execution until its natural boundary. Recovery admits
       // this durable continuation afterwards; do not cancel it or admit a competing turn.
       this.triggerRecoveryPass();
@@ -2116,16 +2292,22 @@ export class ReliableChildAgentCoordinator {
       return this.waitContinuationForeground(input.toolCallId, answerBridgeId,
         childContinuationTurnId(requireId(snapshot.childExecution.id, 'ChildExecution.id'), sent.turnIntentId), deadline!, signal);
     }
-    if (activeTurnId) {
-      await this.cancelLocalChildTurn(
-        activeTurnId,
-        'run_agent continuation interrupted current child Turn'
-      );
+    if (affectedTurnId) {
+      try {
+        await this.cancelLocalChildTurn(
+          affectedTurnId,
+          'run_agent continuation interrupted current child Turn'
+        );
+      } finally {
+        // Wake a parked current generation before waiting for its durable terminal boundary.
+        // Waiting until the foreground deadline would leave a same-Host interrupt unobserved.
+        await this.resumeInterruptedChildTurn(affectedTurnId);
+      }
       if (completionPolicy === 'background') {
         this.triggerRecoveryPass();
         return this.requireWaitSettlement(input.toolCallId);
       }
-      const waitState = await this.awaitTurnTask(activeTurnId, signal, deadline);
+      const waitState = await this.awaitTurnTask(affectedTurnId, signal, deadline);
       if (waitState !== 'terminated') {
         this.triggerRecoveryPass();
         if (waitState === 'aborted') {
@@ -2149,10 +2331,10 @@ export class ReliableChildAgentCoordinator {
       const latest = await this.dependencies.children.readExecutionSnapshot(
         requireId(snapshot.childExecution.id, 'ChildExecution.id')
       );
-      if (latest.activeTurn?.id === activeTurnId && latest.activeTurn.status === 'terminated') {
+      if (latest.activeTurn?.id === affectedTurnId && latest.activeTurn.status === 'terminated') {
         await this.dependencies.children.observeTurnTerminal(
           requireId(snapshot.childExecution.id, 'ChildExecution.id'),
-          activeTurnId
+          affectedTurnId
         );
       }
     }
@@ -2331,7 +2513,7 @@ export class ReliableChildAgentCoordinator {
   }
 
   private launch(childExecutionId: string, turnId: string): void {
-    if (this.disposing) throw new Error('ReliableChildAgentCoordinator is disposing.');
+    if (this.disposing || this.handoff) return;
     if (this.activeTurns.has(turnId)) {
       // Do not collapse an edge-triggered interaction/delivery wake into the currently executing
       // drive. The active drive may already have passed the corresponding durable read and be about
@@ -2340,7 +2522,6 @@ export class ReliableChildAgentCoordinator {
       return;
     }
     this.pendingDriveWakes.delete(turnId);
-    this.waitingOwned.delete(turnId);
     const task = runWithoutExecutionLeaseFence(() => this.driveChild(childExecutionId, turnId));
     let handoff = false;
     let terminalStatus: ReliableChildDriveResult['terminalStatus'] | undefined;
@@ -2381,6 +2562,29 @@ export class ReliableChildAgentCoordinator {
   }
 
   private async driveChild(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
+    // Keep this launch's active slot while retrying only prerequisite reads/ownership entry.
+    // Once execution or handback cleanup starts, even a later local error must not re-drive it.
+    let executionStarted = false;
+    const assertOpen = (): void => {
+      if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+    };
+    for (let retryNumber = 0; ; retryNumber += 1) {
+      assertOpen();
+      try {
+        return await this.driveChildAttempt(childExecutionId, turnId, () => { executionStarted = true; });
+      } catch (error) {
+        if (executionStarted || !isRetryableLocalExecutionError(error)) throw error;
+        if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
+        await waitForLocalExecutionRetry(retryNumber + 1, async () => { assertOpen(); return false; });
+      }
+    }
+  }
+
+  private async driveChildAttempt(
+    childExecutionId: string,
+    turnId: string,
+    beforeExecution: () => void
+  ): Promise<ReliableChildDriveResult> {
     const child = await this.get('ChildExecution', childExecutionId);
     if (!child) throw new Error(`ChildExecution ${childExecutionId} does not exist.`);
     const conversationId = requireId(child.child_conversation_id, 'ChildExecution.child_conversation_id');
@@ -2391,6 +2595,8 @@ export class ReliableChildAgentCoordinator {
       ? await owners.executionEligibility(conversationId) === 'eligible'
       : await owners.tryClaimEligible(conversationId) === 'owned';
     if (!serves) {
+      // Handback is terminal cleanup, not preparation that this launch may replay.
+      beforeExecution();
       // A native call an earlier drive of this Turn started here records its result first.
       await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
       await this.handBackChildLease(turnId);
@@ -2398,13 +2604,28 @@ export class ReliableChildAgentCoordinator {
     }
     // The child Conversation's owner drives it. The activity pin holds ownership for the whole
     // drive and releases-if-idle afterwards, so ownership follows real work across Hosts.
-    return owners.run(conversationId, () => this.driveChildOwned(childExecutionId, turnId));
+    return owners.run(conversationId, () => this.driveChildOwned(childExecutionId, turnId, beforeExecution));
   }
 
-  private async driveChildOwned(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
+  private async driveChildOwned(
+    childExecutionId: string,
+    turnId: string,
+    beforeExecution?: () => void
+  ): Promise<ReliableChildDriveResult> {
     const fence = await this.readChildExecutionFence(turnId);
+    // Observe before creating a renewable resource: a failed read must not leak its timer.
+    let externalVersionBeforeDrive: string | undefined;
+    try {
+      externalVersionBeforeDrive = await this.dependencies.database.externalDataVersion();
+    } catch (error) {
+      if (!isRetryableLocalExecutionError(error)) throw error;
+      // This version is only a wake optimization, not execution authority. An unknown baseline
+      // forces the next waiting poll to recheck without stranding a newly admitted child Turn.
+      this.reportError(error, 'read-child-wake-version', turnId);
+    }
+    if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+    beforeExecution?.();
     const renewal = this.startChildLeaseRenewal(fence);
-    const externalVersionBeforeDrive = await this.dependencies.database.externalDataVersion();
     let result: ReliableChildDriveResult;
     try {
       result = await runWithExecutionLeaseFence(fence, async () => {
@@ -2443,18 +2664,35 @@ export class ReliableChildAgentCoordinator {
     } finally {
       await renewal.stop();
     }
+    if (this.disposing || this.handoff) return result;
     if (result.terminalStatus === 'waiting') {
-      const externalVersionAfterDrive = await this.dependencies.database.externalDataVersion();
       // Publish the waiting slot even when an external commit raced the drive. Keeping the older
       // version makes the next targeted poll level-trigger the Turn *after* activeTurns cleanup.
       // A shared boolean recovery flag could be overwritten by a concurrent recovery pass and
       // strand the child forever at this exact boundary.
       this.waitingOwned.set(turnId, {
         childExecutionId,
-        externalDataVersion: externalVersionAfterDrive === externalVersionBeforeDrive
-          ? externalVersionAfterDrive
-          : externalVersionBeforeDrive
+        externalDataVersion: externalVersionBeforeDrive,
+        ...(result.waitingToolCallId ? { waitingToolCallId: result.waitingToolCallId } : {}),
+        ...(this.conversationRecovery ? { deadlineReadPending: true } : {})
       });
+      // Publish the waiting slot before this optional read: an unavailable deadline lookup must
+      // leave a bounded retry, not strand an otherwise successfully parked child Turn.
+      const waiting = this.waitingOwned.get(turnId)!;
+      if (this.conversationRecovery) {
+        waiting.deadlineRetryAt = Date.now() + CHILD_RECOVERY_SAFETY_SCAN_MS;
+        try {
+          const deadlineAt = await this.readChildWaitDeadline(turnId);
+          if (this.disposing || this.handoff) return result;
+          if (this.waitingOwned.get(turnId) === waiting) {
+            waiting.childDeadlineAt = deadlineAt;
+            waiting.deadlineReadPending = false;
+            waiting.deadlineRetryAt = undefined;
+          }
+        } catch (error) {
+          this.reportError(error, 'read-child-wait-deadline', turnId);
+        }
+      }
     } else {
       this.waitingOwned.delete(turnId);
       const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
@@ -2565,17 +2803,11 @@ export class ReliableChildAgentCoordinator {
     for (;;) {
       if (signal?.aborted) return 'aborted';
       if (deadlineMs !== undefined && Date.now() >= deadlineMs) return 'deadline';
-      const task = this.activeTurns.get(turnId);
-      if (task) {
-        const completed = await Promise.race([
-          task.then(() => true),
-          delay(25).then(() => false)
-        ]);
-        if (completed) return 'terminated';
-        continue;
-      }
+      // Local drive completion can mean waiting or handoff. Only the durable Turn proves that
+      // an interrupt finished and the queued continuation may be admitted.
       const turn = await this.get('Turn', turnId);
-      if (!turn || turn.status === 'terminated') return 'terminated';
+      if (!turn) throw new Error(`Child Turn ${turnId} no longer exists.`);
+      if (turn.status === 'terminated') return 'terminated';
       await delay(25);
     }
   }
@@ -2583,6 +2815,7 @@ export class ReliableChildAgentCoordinator {
   private async waitInitialForeground(
     toolCallId: string,
     childExecutionId: string,
+    sourceTurnId: string,
     deadline: string,
     signal?: AbortSignal
   ): Promise<ChildDispatchResult> {
@@ -2598,6 +2831,9 @@ export class ReliableChildAgentCoordinator {
         childExecutionId,
         Math.min(remaining, signal ? 50 : 1_000)
       );
+      if (snapshot.activeTurn?.id !== sourceTurnId || snapshot.activeTurn.status === 'terminated') {
+        await this.dependencies.children.settleInterruptedForegroundWait(toolCallId, signal);
+      }
       if (snapshot.currentSubmission) continue;
       if (!snapshot.activeTurn || snapshot.activeTurn.status === 'terminated') {
         await delay(Math.min(50, remaining));
@@ -2618,6 +2854,9 @@ export class ReliableChildAgentCoordinator {
       if (this.handoff) throw this.handoff;
       const aborted = await this.settleUserAbort(toolCallId, signal, 'child-continuation-foreground-wait', true);
       if (aborted) return aborted;
+      if ((await this.get('Turn', sourceTurnId))?.status === 'terminated') {
+        await this.dependencies.children.settleInterruptedForegroundWait(toolCallId, signal);
+      }
       const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
       if (settled) return this.childWaitResult(settled);
       const remaining = Date.parse(deadline) - Date.now();
@@ -3114,25 +3353,47 @@ function childTaskWaitSettled(tasks: ConversationChildTaskRecord[]): boolean {
   return tasks.some(task => !['starting', 'active', 'interrupting'].includes(task.status) && task.queuedInputs.length === 0);
 }
 
-function waitForChildTaskObservation(database: RuntimeDatabase, timeoutMs: number, signal?: AbortSignal): Promise<void> {
-  signal?.throwIfAborted();
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let unsubscribe = () => {};
-    const finish = (error?: unknown) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      unsubscribe();
-      signal?.removeEventListener('abort', aborted);
-      if (error) reject(error); else resolve();
-    };
-    const aborted = () => finish(signal?.reason ?? new Error('Child task wait aborted.'));
-    const timer = setTimeout(() => finish(), Math.max(1, timeoutMs));
-    unsubscribe = database.onCommit(() => finish());
-    signal?.addEventListener('abort', aborted, { once: true });
-    if (signal?.aborted) aborted();
+function observeChildTaskChanges(database: RuntimeDatabase): {
+  version(): number;
+  waitAfter(version: number, timeoutMs: number, signal?: AbortSignal): Promise<void>;
+  dispose(): void;
+} {
+  let version = 0;
+  const waiters = new Set<() => void>();
+  const unsubscribe = database.onCommit(() => {
+    version += 1;
+    for (const wake of [...waiters]) wake();
   });
+  return {
+    version: () => version,
+    waitAfter: (observedVersion, timeoutMs, signal) => {
+      signal?.throwIfAborted();
+      if (version !== observedVersion) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const finish = (aborted = false) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          waiters.delete(wake);
+          signal?.removeEventListener('abort', abort);
+          if (aborted) reject(signal?.reason ?? new Error('Child task wait aborted.'));
+          else resolve();
+        };
+        const wake = () => finish();
+        const abort = () => finish(true);
+        const timer = setTimeout(wake, Math.max(1, timeoutMs));
+        waiters.add(wake);
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+        else if (version !== observedVersion) wake();
+      });
+    },
+    dispose: () => {
+      unsubscribe();
+      for (const wake of [...waiters]) wake();
+    }
+  };
 }
 
 function abortReason(value: unknown): string {

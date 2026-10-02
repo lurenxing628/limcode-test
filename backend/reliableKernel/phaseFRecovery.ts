@@ -93,6 +93,7 @@ export class PhaseFRecoveryScanner {
       // coordinator clears ChildExecutionActiveTurnLink. Reconcile that durable half-transition
       // before the registered scans so history/runtime state cannot remain falsely active forever.
       await this.reconcileTerminalChildActiveTurns(signal, context);
+      await this.settleInterruptedTaskWaits(signal, context);
       const results = [
         await this.scanAnswerInboxInvariant(signal, false, context),
         await this.runWithGate(PHASE_F_RECOVERY_DELIVERY_PENDING, signal, context),
@@ -103,6 +104,27 @@ export class PhaseFRecoveryScanner {
       return results;
     } finally {
       await gate.releaseClaimed();
+    }
+  }
+
+  /** Local/peer commits converge only live child waits whose parent this Host already serves. */
+  public async reconcileInterruptedTaskWaits(signal?: AbortSignal): Promise<void> {
+    const gate = new ConversationOwnershipGate(this.database, 'owned');
+    await this.settleInterruptedTaskWaits(signal, { gate });
+  }
+
+  private async settleInterruptedTaskWaits(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<void> {
+    const operations = (await Promise.all(['child_execution', CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+      LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND].map(owner_kind => listAllDomainRows(this.database, 'Operation', {
+      owner_kind, status: 'waiting_answer'
+    })))).flat().filter(operation => operation.tool_call_id !== null);
+    const toolCallIds = [...new Set(operations.map(operation => String(operation.tool_call_id)))];
+    const conversations = await this.conversationByToolCallId(toolCallIds);
+    for (const toolCallId of toolCallIds) {
+      signal?.throwIfAborted();
+      const conversationId = conversations.get(toolCallId);
+      if (!conversationId || (context.conversationId !== undefined && context.conversationId !== conversationId)) continue;
+      await context.gate.run(conversationId, () => this.children.settleInterruptedForegroundWait(toolCallId, signal));
     }
   }
 

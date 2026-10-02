@@ -574,6 +574,7 @@ export class ReliableKernelApplication {
       }
       const convergence = await this.phaseDRecovery.reconcileCommittedFacts();
       failed += convergence.failed;
+      await this.runtime.recovery.reconcileInterruptedTaskWaits();
       await this.runtime.collaboration.reconcile();
     } catch (error) {
       failed += 1;

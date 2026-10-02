@@ -93,6 +93,7 @@ interface DriveSlot {
   terminal: boolean;
   waitingExternalDataVersion?: string;
   waitingWakeFingerprint?: string;
+  waitingChildDeadlineAt?: number;
   maintenanceResult?: CoordinateCompressionResult;
   /** Why this Host did not drive the slot: another live Host owns it, or this Host does not serve it. */
   stoodDown?: Exclude<ConversationRuntimeEligibleClaimResult, 'owned'>;
@@ -135,6 +136,8 @@ interface WaitingOwnedTurn {
   turnId: string;
   externalDataVersion: string;
   wakeFingerprint: string;
+  childDeadlineAt?: number;
+  childDeadlineRetryAt?: number;
 }
 
 interface DeferredRecoveryTurn {
@@ -214,6 +217,8 @@ export class ReliableConversationRunner {
   private entryEligibility: ConversationEntryEligibilityProbe | undefined;
   private readonly admissionRetries = new Map<string, { failures: number; timer?: NodeJS.Timeout }>();
   private unheldScanAt = 0;
+  private unheldScanRequested = false;
+  private readonly admissionRechecks = new Set<Promise<void>>();
   private unheldScanTimer: NodeJS.Timeout | undefined;
   private unheldScanTask: Promise<void> | undefined;
   private readonly unheldRecoveredAt = new Map<string, number>();
@@ -223,6 +228,7 @@ export class ReliableConversationRunner {
   private readonly leaseHandBacks = new Map<string, Promise<LeaseHandBackResult>>();
   /** Turn → Conversation: lease hand-backs a Conversation held by another window deferred; retried each poll. */
   private readonly pendingLeaseHandBacks = new Map<string, string>();
+  private takeoverIncludesChildExecutions = false;
   private conversationTakeover: (conversationId: string) => Promise<void> = async (conversationId) => {
     await this.recoverStartup(undefined, conversationId);
   };
@@ -865,6 +871,11 @@ export class ReliableConversationRunner {
       signal?.throwIfAborted();
       const turnId = requireId(turn.id, 'Turn.id');
       const turnConversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+      if (this.retainRecoveryForActiveSlot(turnId)) {
+        report.liveOwnedTurnIds.push(turnId);
+        admissionBlockedConversationIds.add(turnConversationId);
+        continue;
+      }
       const facts = await this.application.turns.recoveryFacts(turnId);
       if (facts.judgment === 'needs_human') {
         report.needsHumanTurnIds.push(turnId);
@@ -872,6 +883,11 @@ export class ReliableConversationRunner {
         continue;
       }
       const claim = await this.tryOwnConversation(turnConversationId, ownership);
+      if (this.retainRecoveryForActiveSlot(turnId)) {
+        report.liveOwnedTurnIds.push(turnId);
+        admissionBlockedConversationIds.add(turnConversationId);
+        continue;
+      }
       if (claim === 'busy') {
         // A live peer Host owns this Conversation. Skipping it must not poison unrelated
         // recovery; the resume candidate stays level-triggered for a later release/shutdown.
@@ -915,6 +931,13 @@ export class ReliableConversationRunner {
         report.liveOwnedTurnIds.push(turnId);
         admissionBlockedConversationIds.add(turnConversationId);
         this.deferRecoveryCandidate(turnConversationId, turnId, 'busy');
+        continue;
+      }
+      // A command can have scheduled a local drive during the claim's asynchronous reads.
+      // Its slot must finish before this recovery wake is allowed to replace it.
+      if (this.retainRecoveryForActiveSlot(turnId)) {
+        report.liveOwnedTurnIds.push(turnId);
+        admissionBlockedConversationIds.add(turnConversationId);
         continue;
       }
       this.deferredRecovery.delete(turnId);
@@ -1009,9 +1032,9 @@ export class ReliableConversationRunner {
       hostBootId: this.application.database.hostBootId
     };
     const handBack = (async (): Promise<LeaseHandBackResult> => {
-      await this.application.agentLoop.quiesceNativeCalls(turnId);
-      if (this.disposed) return 'not_held';
       try {
+        await this.application.agentLoop.quiesceNativeCalls(turnId);
+        if (this.disposed) return 'not_held';
         // Nothing to hand back: the Conversation is not claimed for it.
         if (!await this.application.turns.heldExecutionLeaseFence(lease)) return 'not_held';
         return await this.conversationOwners.run(conversationId, async () => {
@@ -1025,10 +1048,10 @@ export class ReliableConversationRunner {
       } catch (error) {
         if (isConversationRuntimeOwnerBusyError(error)) return 'busy';
         this.onError(error, { operation: 'watch-external', conversationId, turnId });
-        return 'not_held';
+        return isRetryableLocalExecutionError(error) ? 'retry' : 'not_held';
       }
     })().then((result) => {
-      if (result === 'busy' && !this.disposed) {
+      if ((result === 'busy' || result === 'retry') && !this.disposed) {
         this.pendingLeaseHandBacks.set(turnId, conversationId);
         this.ensureExternalWakePolling();
       } else {
@@ -1335,7 +1358,9 @@ export class ReliableConversationRunner {
       const tasks = [
         ...[...this.active.values()].map((slot) => slot.task),
         ...[...this.admissions.values()].map((slot) => slot.task),
-        ...(this.disposed && this.externalWakeTask ? [this.externalWakeTask] : [])
+        ...(this.disposed && this.externalWakeTask ? [this.externalWakeTask] : []),
+        ...(this.disposed && this.unheldScanTask ? [this.unheldScanTask] : []),
+        ...(this.disposed ? [...this.leaseHandBacks.values(), ...this.admissionRechecks] : [])
       ];
       if (tasks.length === 0) return;
       await Promise.allSettled(tasks);
@@ -1343,21 +1368,26 @@ export class ReliableConversationRunner {
   }
 
   /**
-   * Called when another window committed. An active Turn this window serves that no live Host holds
-   * (its window exited, or handed it back) is recovered here, each Conversation at most once per
+   * Called when another window committed. An active Turn this window serves that no live Host holds,
+   * or ordinary input left queued after its predecessor ended, is recovered here at most once per
    * UNHELD_TURN_RECOVERY_INTERVAL_MS. This is how an answer recorded in a window that does not serve
    * the Conversation reaches a serving window that was already open.
    */
   public recoverUnheldTurns(): void {
-    if (this.disposed || this.unheldScanTimer || this.unheldScanTask) return;
+    if (this.disposed) return;
+    this.unheldScanRequested = true;
+    if (this.unheldScanTimer || this.unheldScanTask) return;
     const delay = Math.max(0, this.unheldScanAt + UNHELD_TURN_SCAN_INTERVAL_MS - Date.now());
     this.unheldScanTimer = setTimeout(() => {
       this.unheldScanTimer = undefined;
       this.unheldScanAt = Date.now();
+      this.unheldScanRequested = false;
       const task = this.scanUnheldTurns().catch((error: unknown) => {
+        this.unheldScanRequested = true;
         this.onError(error, { operation: 'watch-recovery', conversationId: 'unknown' });
       }).finally(() => {
         if (this.unheldScanTask === task) this.unheldScanTask = undefined;
+        if (this.unheldScanRequested) this.recoverUnheldTurns();
       });
       this.unheldScanTask = task;
     }, delay);
@@ -1372,13 +1402,44 @@ export class ReliableConversationRunner {
       if (now - at >= UNHELD_TURN_RECOVERY_INTERVAL_MS) this.unheldRecoveredAt.delete(conversationId);
     }
     let nextExpiry: number | undefined;
-    for (const turn of await listAllDomainRows(this.application.database, 'Turn', { status: 'active' })) {
+    const activeTurns = await listAllDomainRows(this.application.database, 'Turn', { status: 'active' });
+    const activeConversationIds = new Set(activeTurns.map((turn) => requireId(turn.conversation_id, 'Turn.conversation_id')));
+    for (const turn of activeTurns) {
       if (this.disposed) return;
       const turnId = requireId(turn.id, 'Turn.id');
       const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
-      if (childTurnIds.has(turnId) || this.active.has(turnId) || this.waitingOwned.has(turnId)) continue;
-      if (this.deferredRecovery.has(turnId) || this.unheldRecoveredAt.has(conversationId)) continue;
+      const childTurn = childTurnIds.has(turnId);
+      if ((childTurn && !this.takeoverIncludesChildExecutions) || this.active.has(turnId) || this.waitingOwned.has(turnId)) continue;
+      if (this.deferredRecovery.has(turnId)) continue;
+      const recoveredAt = this.unheldRecoveredAt.get(conversationId);
+      if (!childTurn && recoveredAt !== undefined) {
+        const retryAt = recoveredAt + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+        nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+        continue;
+      }
       const leases = await listAllDomainRows(this.application.database, 'ExecutionLease', { turn_id: turnId });
+      let childEligibility: ConversationRuntimeExecutionEligibility | undefined;
+      if (childTurn) {
+        // This is discovery, not a second child executor. In particular, a local parked child
+        // keeps its exact scheduler/failure budget even when its waiting lease has expired.
+        if (leases.length === 1 && leases[0].host_boot_id === this.application.database.hostBootId) {
+          this.unheldRecoveredAt.delete(conversationId);
+          continue;
+        }
+        if (this.application.conversationDeletion.isStopping(conversationId)) {
+          const retryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+          nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+          continue;
+        }
+        childEligibility = await this.conversationOwners.executionEligibility(conversationId);
+        if (childEligibility !== 'eligible') {
+          if (childEligibility === 'unknown') {
+            const retryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+            nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+          }
+          continue;
+        }
+      }
       if (leases.length === 1) {
         // Only the holder of an expired lease gets the (cached) process-identity comparison. An
         // unexpired lease gets the cheap checks only (its liveness record, whether its process still
@@ -1392,23 +1453,183 @@ export class ReliableConversationRunner {
           requireId(leases[0].host_boot_id, 'ExecutionLease.host_boot_id'),
           { compareIdentity: expired }
         )) {
-          if (!expired) nextExpiry = Math.min(nextExpiry ?? expiresAt, expiresAt);
+          const ordinaryActionAt = !childTurn
+            && leases[0].host_boot_id !== this.application.database.hostBootId
+            && await this.conversationOwners.executionEligibility(conversationId) !== 'ineligible'
+            ? await this.nextUnheldTurnActionAt(turnId) : undefined;
+          if (childTurn || ordinaryActionAt !== undefined) {
+            // A quiesced peer can leave without another SQLite commit, even after expiry.
+            // Future child waits need one deadline wake; runnable work uses bounded liveness
+            // checks. Every rescan re-reads authority and facts before claiming a dead owner.
+            const observedAt = Date.now();
+            const retryAt = ordinaryActionAt !== undefined && ordinaryActionAt > observedAt
+              ? (expired ? ordinaryActionAt : Math.min(expiresAt, ordinaryActionAt))
+              : (expired ? observedAt + UNHELD_TURN_RECOVERY_INTERVAL_MS
+                : Math.min(expiresAt, observedAt + UNHELD_TURN_RECOVERY_INTERVAL_MS));
+            nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+          } else if (!expired) nextExpiry = Math.min(nextExpiry ?? expiresAt, expiresAt);
           continue;
         }
       }
-      if (await this.conversationOwners.executionEligibility(conversationId) !== 'eligible') continue;
+      if (childTurn && recoveredAt !== undefined) {
+        const retryAt = recoveredAt + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+        nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+        continue;
+      }
+      const eligibility = childEligibility ?? await this.conversationOwners.executionEligibility(conversationId);
+      if (eligibility !== 'eligible') {
+        if (eligibility === 'unknown') {
+          const actionAt = await this.nextUnheldTurnActionAt(turnId);
+          if (actionAt !== undefined) {
+            const retryAt = Math.max(actionAt, Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS);
+            nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+          }
+        }
+        continue;
+      }
+      if (this.disposed) return;
       this.unheldRecoveredAt.set(conversationId, Date.now());
       try {
         // The same per-Conversation recovery as a view takeover: work the exited window left
         // dispatched is checked first (Phase D), then the child scheduler, then this runner.
         await this.conversationTakeover(conversationId);
       } catch (error) {
+        const retryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+        nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
         if (!isConversationRuntimeOwnerBusyError(error)) {
           this.onError(error, { operation: 'watch-recovery', conversationId, turnId });
         }
       }
     }
+    // A peer may close after committing a terminal Turn but before admitting its durable queue.
+    // There is then no active Turn/lease for the scan above to discover. Read only unadmitted
+    // queued intents (the existing turn_id index excludes admitted history), never every chat.
+    if (this.disposed) return;
+    const queued = await listAllDomainRows(this.application.database, 'TurnIntent', { state: 'queued', turn_id: null });
+    const observedConversationIds = new Set([...activeConversationIds, ...queued.map((intent) => String(intent.conversation_id))]);
+    if (queued.length > 0 && !this.disposed) {
+      const childIntentIds = new Set((await listAllDomainRows(this.application.database, 'ChildExecutionIntentLink', {
+        state: 'pending'
+      })).map((link) => String(link.turn_intent_id)));
+      const childQueuedConversationIds = new Set(queued
+        .filter((intent) => childIntentIds.has(String(intent.id)))
+        .map((intent) => requireId(intent.conversation_id, 'TurnIntent.conversation_id')));
+      const queuedConversationIds = new Set(queued
+        .filter((intent) => this.takeoverIncludesChildExecutions || !childIntentIds.has(String(intent.id)))
+        .map((intent) => requireId(intent.conversation_id, 'TurnIntent.conversation_id')));
+      for (const conversationId of queuedConversationIds) {
+        if (this.disposed) return;
+        if (activeConversationIds.has(conversationId) || this.admissions.has(conversationId)
+          || this.admissionRetries.get(conversationId)?.timer
+          || (this.localAdmissionRecoveryFailures.get(conversationId) ?? 0) > LOCAL_EXECUTION_MAX_RETRIES) continue;
+        const recoveredAt = this.unheldRecoveredAt.get(conversationId);
+        if (recoveredAt !== undefined) {
+          const retryAt = recoveredAt + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+          nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+          continue;
+        }
+        if (childQueuedConversationIds.has(conversationId)) {
+          if (this.application.conversationDeletion.isStopping(conversationId)) {
+            const retryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+            nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+            continue;
+          }
+          const eligibility = await this.conversationOwners.executionEligibility(conversationId);
+          if (eligibility !== 'eligible') {
+            if (eligibility === 'unknown') {
+              const retryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+              nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+            }
+            continue;
+          }
+          if (this.disposed) return;
+          this.unheldRecoveredAt.set(conversationId, Date.now());
+          try {
+            // Child queues are never admitted by this runner. The product's scoped takeover
+            // performs normal recovery and delegates to the exclusive child scheduler.
+            await this.conversationTakeover(conversationId);
+          } catch (error) {
+            const retryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+            nextExpiry = Math.min(nextExpiry ?? retryAt, retryAt);
+            if (!isConversationRuntimeOwnerBusyError(error)) {
+              this.onError(error, { operation: 'watch-recovery', conversationId });
+            }
+          }
+          continue;
+        }
+        this.unheldRecoveredAt.set(conversationId, Date.now());
+        // Reuse normal admission: ownership, frozen environment, deletion, held guidance and the
+        // atomic Turn/lease gate are rechecked there. Busy/unknown owners retain bounded retries.
+        this.scheduleAdmission(conversationId);
+      }
+    }
+    for (const conversationId of this.unheldRecoveredAt.keys()) {
+      if (!observedConversationIds.has(conversationId)) this.unheldRecoveredAt.delete(conversationId);
+    }
     if (nextExpiry !== undefined) this.scheduleUnheldRescanAt(nextExpiry);
+    else if (this.unheldExpiryTimer) {
+      clearTimeout(this.unheldExpiryTimer);
+      this.unheldExpiryTimer = undefined;
+      this.unheldExpiryAt = undefined;
+    }
+  }
+
+  /** Human waits are event-driven; foreground child waits also have a durable deadline wake. */
+  private async nextUnheldTurnActionAt(turnId: string): Promise<number | undefined> {
+    const pending = await listAllDomainRows(this.application.database, 'ToolCall', { turn_id: turnId, status: 'pending' });
+    if (pending.length > 0) return Date.now();
+    const waiting = (await Promise.all(['executing', 'waiting_answer', 'waiting_approval'].map((status) =>
+      listAllDomainRows(this.application.database, 'ToolCall', { turn_id: turnId, status })
+    ))).flat();
+    if (waiting.length === 0 || await this.findPendingTermination(turnId)) return Date.now();
+    let nextDeadline: number | undefined;
+    for (const call of waiting) {
+      const childCall = ['run_agent', 'read_agent_answer'].includes(String(call.tool_name));
+      if (call.status === 'executing' && !childCall) return Date.now();
+      const toolCallId = requireId(call.id, 'ToolCall.id');
+      const [toolFacts, links] = await Promise.all([
+        this.application.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('ToolOutcome').list({ where: { tool_call_id: toolCallId }, limit: 1 }),
+          DOMAIN_REPOSITORIES.domain('FileChangeSet').list({ where: { tool_call_id: toolCallId }, limit: 1 }),
+          DOMAIN_REPOSITORIES.domain('ToolExecution').list({ where: { tool_call_id: toolCallId }, limit: 1 })
+        ]),
+        listAllDomainRows(this.application.database, 'InteractionToolCallLink', { tool_call_id: toolCallId })
+      ]);
+      const [outcomes, changes, executions] = toolFacts.snapshot;
+      if (!Array.isArray(outcomes) || !Array.isArray(changes) || !Array.isArray(executions)) {
+        throw new TypeError('Waiting tool evidence lookup did not return rows.');
+      }
+      if (outcomes.length > 0) return Date.now();
+      const deadline = executions[0]?.wait_deadline_at;
+      let hasChildDeadline = false;
+      if (childCall && executions[0]?.status === 'waiting_answer' && typeof deadline === 'string') {
+        const deadlineAt = Date.parse(deadline);
+        if (Number.isFinite(deadlineAt)) {
+          hasChildDeadline = true;
+          if (deadlineAt <= Date.now()) return Date.now();
+          nextDeadline = Math.min(nextDeadline ?? deadlineAt, deadlineAt);
+        }
+      }
+      if (call.status === 'executing' && !hasChildDeadline) return Date.now();
+      if (changes.length > 0) {
+        const decisions = await listAllDomainRows(this.application.database, 'FileChangeDecision', {
+          change_set_id: requireId(changes[0].id, 'FileChangeSet.id')
+        });
+        if (decisions.length > 0) return Date.now();
+      }
+      for (const link of links) {
+        const requestId = requireId(link.request_id, 'InteractionToolCallLink.request_id');
+        const [request, responses] = (await this.application.database.snapshot([
+          DOMAIN_REPOSITORIES.domain('InteractionRequest').get(requestId),
+          DOMAIN_REPOSITORIES.domain('InteractionResponse').list({ where: { request_id: requestId }, limit: 1 })
+        ])).snapshot;
+        // Ask/plan responses are stable per call and can precede ToolOutcome finalization.
+        // Ignore an older exec_approval response: a newer question may still be unanswered.
+        if (request && !Array.isArray(request) && ['ask_user', 'plan_review'].includes(String(request.request_kind))
+          && Array.isArray(responses) && responses.length > 0) return Date.now();
+      }
+    }
+    return nextDeadline;
   }
 
   /** Runs the takeover scan again once the earliest lease it skipped as unexpired has expired. */
@@ -1431,12 +1652,19 @@ export class ReliableConversationRunner {
    * (VscodeReliableKernelProductRuntime: the same recovery as a view takeover). By default only
    * this runner's recovery runs.
    */
-  public setConversationTakeover(takeover: (conversationId: string) => Promise<void>): void {
+  public setConversationTakeover(
+    takeover: (conversationId: string) => Promise<void>,
+    options: { includeChildExecutions?: boolean } = {}
+  ): void {
     this.conversationTakeover = takeover;
+    // Only the product's full scoped recovery can discover children. Standalone ordinary
+    // runners retain their root-only execution contract.
+    this.takeoverIncludesChildExecutions = options.includeChildExecutions === true;
   }
 
   public dispose(): void {
     this.disposed = true;
+    this.unheldScanRequested = false;
     this.unsubscribeCommit();
     if (this.externalWakeTimer) clearTimeout(this.externalWakeTimer);
     this.externalWakeTimer = undefined;
@@ -1501,6 +1729,9 @@ export class ReliableConversationRunner {
             this.deferredRecovery.set(turnId, { conversationId, turnId,
               nextAttemptAt: Date.now() + localExecutionRetryDelayMs(failures) });
             this.ensureExternalWakePolling();
+          } else {
+            this.deferredRecovery.delete(turnId);
+            this.waitingOwned.delete(turnId);
           }
         }
         this.onError(error, { operation: 'drive', conversationId, turnId });
@@ -1523,6 +1754,7 @@ export class ReliableConversationRunner {
     // record is not enough. A scheduling nudge in another project's window (an answer or stop
     // recorded there) settles control-only facts and leaves the Turn to the Host serving it.
     const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
+    if (this.disposed) return;
     if (claim !== 'owned') {
       slot.terminal = true;
       slot.stoodDown = claim;
@@ -1540,7 +1772,7 @@ export class ReliableConversationRunner {
       return;
     }
     try {
-      await this.conversationOwners.run(slot.conversationId, () => this.runDriveSlot(slot));
+      await this.conversationOwners.run(slot.conversationId, () => this.disposed ? Promise.resolve() : this.runDriveSlot(slot));
     } catch (error) {
       if (isConversationRuntimeOwnerBusyError(error)) {
         slot.terminal = true;
@@ -1606,7 +1838,6 @@ export class ReliableConversationRunner {
           await renewal.stop();
         }
         slot.completedGeneration = generation;
-        this.localDriveRecoveryFailures.delete(slot.turnId);
         if (this.disposed) return;
         if (result.terminalStatus === 'waiting') {
           this.terminationRecoveryFailures.delete(slot.turnId);
@@ -1632,6 +1863,7 @@ export class ReliableConversationRunner {
           }
           slot.waitingExternalDataVersion = observation.externalDataVersion;
           slot.waitingWakeFingerprint = observation.fingerprint;
+          slot.waitingChildDeadlineAt = observation.childDeadlineAt;
           return;
         }
         // Terminal commits release ExecutionLease. Queue admission is a separate level-triggered
@@ -1640,6 +1872,7 @@ export class ReliableConversationRunner {
         slot.terminal = true;
         slot.completedGeneration = slot.requestedGeneration;
         this.terminationRecoveryFailures.delete(slot.turnId);
+        this.localDriveRecoveryFailures.delete(slot.turnId);
         this.scheduleAdmission(slot.conversationId);
         return;
       } catch (error) {
@@ -1961,7 +2194,8 @@ export class ReliableConversationRunner {
         conversationId: slot.conversationId,
         turnId: slot.turnId,
         externalDataVersion: slot.waitingExternalDataVersion,
-        wakeFingerprint: slot.waitingWakeFingerprint
+        wakeFingerprint: slot.waitingWakeFingerprint,
+        childDeadlineAt: slot.waitingChildDeadlineAt
       });
       this.ensureExternalWakePolling();
     }
@@ -1993,6 +2227,7 @@ export class ReliableConversationRunner {
         && this.pendingLeaseHandBacks.size === 0)
     ) return;
     this.externalWakePollInFlight = true;
+    let consumedLocalWake = false;
     try {
       const ownership = new Map<string, ConversationRuntimeEligibleClaimResult>();
       await this.cancelDurablyInterruptedLocalTurns();
@@ -2007,16 +2242,27 @@ export class ReliableConversationRunner {
       }
       if (this.waitingOwned.size > 0) {
         const localWake = this.localWakeRequested;
+        consumedLocalWake = localWake;
         this.localWakeRequested = false;
         const version = await this.application.database.externalDataVersion();
+        if (this.disposed) return;
         for (const waiting of [...this.waitingOwned.values()]) {
-          if (!localWake && waiting.externalDataVersion === version) continue;
+          if (this.disposed) return;
+          const deadlineWake = this.takeoverIncludesChildExecutions
+            && waiting.childDeadlineAt !== undefined && waiting.childDeadlineAt <= Date.now()
+            && (waiting.childDeadlineRetryAt === undefined || waiting.childDeadlineRetryAt <= Date.now());
+          if (!localWake && waiting.externalDataVersion === version && !deadlineWake) continue;
           // SQLite data_version is database-global: check first that this Turn's own facts changed,
           // so another window's unrelated commits never probe this window's eligibility.
           const observation = await this.observeWaitingWake(waiting.turnId);
+          if (this.disposed) return;
+          if (this.waitingOwned.get(waiting.turnId) !== waiting) continue;
+          waiting.childDeadlineAt = observation.childDeadlineAt;
+          const deadlineDue = deadlineWake && observation.childDeadlineAt !== undefined
+            && observation.childDeadlineAt <= Date.now();
           if (observation.fingerprint === waiting.wakeFingerprint) {
             waiting.externalDataVersion = observation.externalDataVersion;
-            continue;
+            if (!deadlineDue) continue;
           }
           const claim = await this.tryOwnConversation(waiting.conversationId, ownership);
           if (claim === 'busy') {
@@ -2034,13 +2280,30 @@ export class ReliableConversationRunner {
             await this.conversationOwners.releaseIfIdle(waiting.conversationId);
             continue;
           }
+          if (this.disposed) return;
+          if (this.waitingOwned.get(waiting.turnId) !== waiting) continue;
+          if (deadlineDue) {
+            // Re-entry only observes a durable child wait. Its existing Phase F recovery owns
+            // timeout settlement; retain this exact wake if that scoped recovery cannot finish.
+            waiting.childDeadlineRetryAt = Date.now() + UNHELD_TURN_RECOVERY_INTERVAL_MS;
+            await this.conversationTakeover(waiting.conversationId);
+            continue;
+          }
           this.waitingOwned.delete(waiting.turnId);
           this.scheduleDrive(waiting.conversationId, waiting.turnId);
         }
       }
+      consumedLocalWake = false;
       for (const deferred of [...this.deferredRecovery.values()]) {
+        if (this.disposed) return;
+        // Handoff marks the old slot terminal before its ownership/native cleanup finishes.
+        // Keep this wake until that slot leaves: it cannot accept a replacement drive yet.
+        if (this.active.has(deferred.turnId)) continue;
         if (deferred.nextAttemptAt !== undefined && Date.now() < deferred.nextAttemptAt) continue;
         const facts = await this.recoveryFactsUnlessDeleted(deferred.turnId);
+        if (this.disposed) return;
+        if (this.retainRecoveryForActiveSlot(deferred.turnId)
+          || this.deferredRecovery.get(deferred.turnId) !== deferred) continue;
         if (!facts || facts.judgment === 'needs_human') {
           this.forgetRecoveryCandidate(deferred.turnId);
           continue;
@@ -2057,6 +2320,9 @@ export class ReliableConversationRunner {
         const claim = facts.judgment === 'finalize'
           ? 'control'
           : await this.tryOwnConversation(deferred.conversationId, ownership);
+        if (this.disposed) return;
+        if (this.retainRecoveryForActiveSlot(deferred.turnId)
+          || this.deferredRecovery.get(deferred.turnId) !== deferred) continue;
         if (claim === 'busy') continue;
         if (claim !== 'owned') {
           // Control-only work happens in any window: an orphan is finalized and a stop request is
@@ -2087,11 +2353,17 @@ export class ReliableConversationRunner {
           turnId: deferred.turnId,
           ...this.lease(deferred.conversationId)
         });
+        if (this.disposed) return;
+        // A command may have started a newer local slot while these recovery reads awaited.
+        // Leave its exact candidate/backoff intact until that slot's cleanup has completed.
+        if (this.retainRecoveryForActiveSlot(deferred.turnId)
+          || this.deferredRecovery.get(deferred.turnId) !== deferred) continue;
         if (!claimed) continue;
         this.deferredRecovery.delete(deferred.turnId);
         this.scheduleDrive(deferred.conversationId, deferred.turnId);
       }
     } catch (error) {
+      if (consumedLocalWake && !this.disposed) this.localWakeRequested = true;
       const waiting = this.waitingOwned.values().next().value as WaitingOwnedTurn | undefined;
       const deferred = this.deferredRecovery.values().next().value as DeferredRecoveryTurn | undefined;
       const first = waiting ?? deferred;
@@ -2129,7 +2401,7 @@ export class ReliableConversationRunner {
   private async observeWaitingWake(
     turnId: string,
     waitingToolCallId?: string
-  ): Promise<{ externalDataVersion: string; fingerprint: string; ready: boolean }> {
+  ): Promise<{ externalDataVersion: string; fingerprint: string; ready: boolean; childDeadlineAt?: number }> {
     const before = await this.application.database.externalDataVersion();
     const observation = await this.waitingWakeFingerprint(turnId, waitingToolCallId);
     const after = await this.application.database.externalDataVersion();
@@ -2145,7 +2417,7 @@ export class ReliableConversationRunner {
   private async waitingWakeFingerprint(
     turnId: string,
     waitingToolCallId?: string
-  ): Promise<{ fingerprint: string; ready: boolean }> {
+  ): Promise<{ fingerprint: string; ready: boolean; childDeadlineAt?: number }> {
     const [turns, pendingInputs, toolCalls] = await Promise.all([
       listAllDomainRows(this.application.database, 'Turn', { id: turnId }),
       listAllDomainRows(this.application.database, 'PendingTurnInput', { turn_id: turnId }),
@@ -2169,6 +2441,13 @@ export class ReliableConversationRunner {
     const waitingToolCall = waitingToolCallId
       ? toolCalls.find((row) => row.id === waitingToolCallId)
       : undefined;
+    const childCallIds = new Set(waitingToolCalls
+      .filter((row) => ['run_agent', 'read_agent_answer'].includes(String(row.tool_name)))
+      .map((row) => String(row.id)));
+    const childDeadlines = executionsByCall.flat()
+      .filter((row) => childCallIds.has(String(row.tool_call_id)) && row.status === 'waiting_answer')
+      .map((row) => typeof row.wait_deadline_at === 'string' ? Date.parse(row.wait_deadline_at) : NaN)
+      .filter(Number.isFinite);
     const ready = turns.some((row) => row.status !== 'active')
       // A stop is actionable inside an unresolved tool batch. Runtime deliveries are consumed
       // only at the next request boundary, after the entire assistant/tool-result batch closes.
@@ -2177,6 +2456,7 @@ export class ReliableConversationRunner {
       || Boolean(waitingToolCallId && (!waitingToolCall || waitingToolCall.status === 'terminal'));
     return {
       ready,
+      ...(childDeadlines.length > 0 ? { childDeadlineAt: Math.min(...childDeadlines) } : {}),
       fingerprint: JSON.stringify({
         turn: turns.map((row) => [String(row.id), String(row.status)]).sort(),
         pendingInputs: pendingInputs.map((row) => [
@@ -2186,7 +2466,7 @@ export class ReliableConversationRunner {
           String(row.id), String(row.status)
         ]),
         waitingToolExecutions: executionsByCall.flat().map((row) => [
-          String(row.id), String(row.tool_call_id), String(row.status)
+          String(row.id), String(row.tool_call_id), String(row.status), String(row.wait_deadline_at)
         ]).sort((left, right) => left.join('\u0000').localeCompare(right.join('\u0000'))),
         waitingOperations: operationsByCall.flat().map((row) => [
           String(row.id), String(row.tool_call_id), String(row.status)
@@ -2373,6 +2653,7 @@ export class ReliableConversationRunner {
   private forgetRecoveryCandidate(turnId: string): void {
     this.deferredRecovery.delete(turnId);
     this.terminationRecoveryFailures.delete(turnId);
+    this.localDriveRecoveryFailures.delete(turnId);
   }
 
   /**
@@ -2408,6 +2689,14 @@ export class ReliableConversationRunner {
   private async requireExecutionHost(conversationId: string, options: ConversationEntryOptions = {}): Promise<void> {
     const eligibility = await this.entryDecision(conversationId, options);
     if (eligibility !== 'eligible') throw new ConversationHostIneligibleError(conversationId, eligibility);
+  }
+
+  /** A local slot marked terminal may still be handing off an active durable Turn. */
+  private retainRecoveryForActiveSlot(turnId: string): boolean {
+    const slot = this.active.get(turnId);
+    if (!slot) return false;
+    if (slot.terminal && !this.deferredRecovery.has(turnId)) this.deferExecutionRecovery(slot);
+    return true;
   }
 
   private deferExecutionRecovery(slot: Pick<DriveSlot, 'conversationId' | 'turnId'>): void {
@@ -2585,9 +2874,16 @@ export class ReliableConversationRunner {
       this.deferAdmissionWhileDeleting(slot.conversationId);
       return;
     }
+    if (this.disposed) return;
     // Admission starts a Turn, so it is execution: the queued Intent stays durable for the Host
     // serving the Conversation.
     const claim = await this.conversationOwners.tryClaimEligible(slot.conversationId);
+    if (this.disposed) return;
+    if (this.application.conversationDeletion.isStopping(slot.conversationId)) {
+      slot.completedGeneration = slot.requestedGeneration;
+      this.deferAdmissionWhileDeleting(slot.conversationId);
+      return;
+    }
     if (claim !== 'owned') {
       // Standing down answers every wake so far: the queued Intent stays durable. Rescheduling at
       // once would loop without ever yielding when the claim is answered from memory. A live peer
@@ -2599,6 +2895,12 @@ export class ReliableConversationRunner {
     }
     try {
       await this.conversationOwners.run(slot.conversationId, () => {
+        if (this.disposed) return Promise.resolve();
+        if (this.application.conversationDeletion.isStopping(slot.conversationId)) {
+          slot.completedGeneration = slot.requestedGeneration;
+          this.deferAdmissionWhileDeleting(slot.conversationId);
+          return Promise.resolve();
+        }
         // Preserve the backoff until the activity pin is acquired: a successful eligibility
         // claim alone does not end repeated claim-to-pin ownership contention.
         this.clearAdmissionRetry(slot.conversationId);
@@ -2627,18 +2929,24 @@ export class ReliableConversationRunner {
 
   /** Looks again shortly; by then the deletion may have removed the Conversation with its queue. */
   private deferAdmissionWhileDeleting(conversationId: string): void {
+    if (this.disposed) return;
     const entry = this.admissionRetries.get(conversationId) ?? { failures: 0 };
     if (entry.timer) return;
     entry.timer = setTimeout(() => {
       entry.timer = undefined;
       if (this.disposed) return;
-      void listAllDomainRows(this.application.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued', turn_id: null })
+      const task = listAllDomainRows(this.application.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued', turn_id: null })
         .then((queued) => {
           if (this.disposed) return;
           if (queued.length > 0) this.scheduleAdmission(conversationId);
           else this.clearAdmissionRetry(conversationId);
         })
-        .catch((error) => { if (!this.disposed) this.onError(error, { operation: 'admit-next', conversationId }); });
+        .catch((error) => {
+          if (this.disposed) return;
+          if (isRetryableLocalExecutionError(error)) this.deferFailedAdmission(conversationId);
+          this.onError(error, { operation: 'admit-next', conversationId });
+        }).finally(() => this.admissionRechecks.delete(task));
+      this.admissionRechecks.add(task);
     }, DELETION_ADMISSION_RECHECK_MS);
     entry.timer.unref();
     this.admissionRetries.set(conversationId, entry);
@@ -2694,6 +3002,12 @@ export class ReliableConversationRunner {
             return;
           }
         }
+        if (this.disposed) return;
+        if (this.application.conversationDeletion.isStopping(slot.conversationId)) {
+          slot.completedGeneration = slot.requestedGeneration;
+          this.deferAdmissionWhileDeleting(slot.conversationId);
+          return;
+        }
         const next = await this.application.turns.admitNextQueued(this.lease(slot.conversationId));
         this.localAdmissionRecoveryFailures.delete(slot.conversationId);
         slot.completedGeneration = generation;
@@ -2722,6 +3036,7 @@ export class ReliableConversationRunner {
   }
 
   private deferFailedAdmission(conversationId: string): void {
+    if (this.disposed) return;
     const failures = (this.localAdmissionRecoveryFailures.get(conversationId) ?? 0) + 1;
     this.localAdmissionRecoveryFailures.set(conversationId, failures);
     if (failures > LOCAL_EXECUTION_MAX_RETRIES) return;
@@ -2775,7 +3090,7 @@ export class ReliableConversationRunner {
   }
 }
 
-type LeaseHandBackResult = 'released' | 'not_held' | 'busy' | 'quiescing';
+type LeaseHandBackResult = 'released' | 'not_held' | 'busy' | 'quiescing' | 'retry';
 
 function requireId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.length === 0) throw new TypeError(`${label} must be a non-empty id.`);
