@@ -184,22 +184,35 @@ export async function readClaimRecord<T>(
   parse: (value: unknown) => T | undefined,
   invalid: (cause?: unknown) => Error
 ): Promise<T | undefined> {
+  const recordPath = `${claimPath}/${recordFileName}`;
+  const readRegularRecord = async (): Promise<string> => {
+    // Neither a linked claim directory nor a special/linked owner file is claim evidence.
+    if (!(await fs.lstat(claimPath)).isDirectory()) throw invalid();
+    if (!(await fs.lstat(recordPath)).isFile()) throw invalid();
+    return fs.readFile(recordPath, 'utf8');
+  };
   let raw: string;
   try {
-    raw = await fs.readFile(`${claimPath}/${recordFileName}`, 'utf8');
+    raw = await readRegularRecord();
   } catch (error) {
-    if (isMissingError(error)) {
-      // Only a genuinely missing canonical path is a completed release/isolation race; every
-      // other lstat failure surfaces instead of being swallowed as "missing".
-      try {
-        await fs.lstat(claimPath);
-      } catch (statError) {
-        if (isMissingError(statError)) return undefined;
-        throw statError;
-      }
-      throw invalid(error);
+    if (!isMissingError(error)) throw error;
+    // A release can remove the old directory while a new owner atomically publishes its own
+    // complete directory before this lstat. Re-read once, then strictly parse that new owner;
+    // an existing canonical directory alone is neither corruption nor ownership evidence.
+    let canonical;
+    try {
+      canonical = await fs.lstat(claimPath);
+    } catch (statError) {
+      if (isMissingError(statError)) return undefined;
+      throw statError;
     }
-    throw error;
+    if (!canonical.isDirectory()) throw invalid(error);
+    try {
+      raw = await readRegularRecord();
+    } catch (rereadError) {
+      if (isMissingError(rereadError)) throw invalid(rereadError);
+      throw rereadError;
+    }
   }
   let value: unknown;
   try {
