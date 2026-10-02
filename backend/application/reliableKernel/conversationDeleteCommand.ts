@@ -132,6 +132,8 @@ export async function stopAndDeleteConversation(
 
 class ConversationDeleteCommand {
   private readonly issuedAt = new Map<string, number>();
+  /** A retry delay is not an acknowledgement; track success separately for each stop step. */
+  private readonly landedSteps = new Set<string>();
   /** Work whose stop request was written, by `${kind}:${id}`. */
   private readonly requested = new Set<string>();
   private readonly failures = new Map<string, Omit<ConversationDeleteRemainingWork, 'stopRequested'>>();
@@ -269,13 +271,18 @@ class ConversationDeleteCommand {
     const turns = inventory.work.filter((entry) => entry.kind === 'turn');
     // The durable stop requests of the parents first: a parent whose wait for a child ends below
     // terminates at its next check instead of calling the model again.
+    let parentStopsLanded = true;
     for (const item of turns) {
-      await this.issue(item, 'request', () => application.turns.requestExternalInterrupt(item.conversationId, {
+      const landed = await this.issue(item, 'request', () => application.turns.requestExternalInterrupt(item.conversationId, {
         source: { kind: 'command', key: `${prefix}:turn:${item.id}` },
         turnId: item.id,
         reason: CONVERSATION_DELETE_STOP_REASON
       }));
+      if (!landed) parentStopsLanded = false;
     }
+    // A failed/uncertain parent stop cannot release its foreground child wait yet. The next
+    // inventory drops already-terminal parents, so their descendants can still finish cleanup.
+    if (!parentStopsLanded) return;
     // The requested background child of a completed parent Turn is stopped like from its own panel:
     // without a termination request it publishes no interrupted answer, so no parent continues.
     const detached = panelStoppedRoot(inventory);
@@ -340,10 +347,11 @@ class ConversationDeleteCommand {
     const workKey = `${item.kind}:${item.id}`;
     const last = this.issuedAt.get(key);
     const now = Date.now();
-    if (!everyRound && last !== undefined && now - last < RESTOP_AFTER_MS) return true;
+    if (!everyRound && last !== undefined && now - last < RESTOP_AFTER_MS) return this.landedSteps.has(key);
     this.issuedAt.set(key, now);
     try {
       await stop();
+      this.landedSteps.add(key);
       this.failures.delete(workKey);
       this.requested.add(workKey);
       return true;
