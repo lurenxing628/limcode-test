@@ -458,6 +458,7 @@ function composerSubmit(f) {
   const module = { exports: {} }, sent = [];
   vm.runInNewContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, {
     module, ref: vue.ref, computed: vue.computed, clientState: f.client, modelProfileStore: f.store, props: { disabled: false },
+    editor: vue.ref(null),
     currentSubmissionCommandId: vue.ref(), currentSteeringSubmitting: vue.ref(false), submissionDraftRevision: 0,
     draft: vue.ref('synthetic message'), selectedAttachments: vue.ref([]),
     buildMessageContent: text => ({ text }), ui: { isEditing: false }, nativeSteeringAvailable: vue.ref(false),

@@ -4,6 +4,13 @@ import type {
   ConversationForkResultPayload
 } from '@shared/protocol';
 
+/** A timed-out command may only be explicitly replayed into the same observed Runtime context. */
+export interface UnconfirmedCommandContext {
+  sessionId: string | null;
+  hostBootId: string | null;
+  clientId?: string;
+}
+
 /**
  * One fork command the user started from a message. The exact command is kept until the Host
  * confirms its result, so a lost result is replayed instead of creating a second branch.
@@ -19,6 +26,7 @@ export interface ForkRequestState {
   sentSessionId?: string;
   /** The Host reported a non-permanent failure; only an explicit click replays the command. */
   failure?: { message: string; failedAt: number };
+  requestContext?: UnconfirmedCommandContext;
 }
 
 export type ForkRequestRecords = Record<string, ForkRequestState>;
@@ -67,7 +75,7 @@ export function markForkRequestSent(
   requestId: string,
   sessionId: string | undefined
 ): ForkRequestState {
-  const { failure: _failure, ...sent } = request;
+  const { failure: _failure, requestContext: _context, ...sent } = request;
   return { ...sent, requestId, ...(sessionId ? { sentSessionId: sessionId } : {}) };
 }
 
@@ -252,6 +260,11 @@ function validForkRequest(value: unknown): ForkRequestState | undefined {
   if (failure !== undefined && (typeof failure?.message !== 'string' || typeof failure.failedAt !== 'number')) {
     return undefined;
   }
+  const context = request.requestContext;
+  if (context !== undefined && (!context || typeof context !== 'object'
+    || (context.sessionId !== null && typeof context.sessionId !== 'string')
+    || (context.hostBootId !== null && typeof context.hostBootId !== 'string')
+    || (context.clientId !== undefined && typeof context.clientId !== 'string'))) return undefined;
   return {
     actionId: request.actionId,
     sourceConversationId: request.sourceConversationId,
@@ -264,7 +277,8 @@ function validForkRequest(value: unknown): ForkRequestState | undefined {
     },
     ...(text(request.requestId) ? { requestId: request.requestId } : {}),
     ...(text(request.sentSessionId) ? { sentSessionId: request.sentSessionId } : {}),
-    ...(failure ? { failure: { message: failure.message, failedAt: failure.failedAt } } : {})
+    ...(failure ? { failure: { message: failure.message, failedAt: failure.failedAt } } : {}),
+    ...(context ? { requestContext: { ...context } } : {})
   };
 }
 

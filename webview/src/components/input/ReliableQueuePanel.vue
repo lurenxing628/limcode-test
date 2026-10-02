@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watchEffect } from 'vue';
+import { computed, ref, watch, watchEffect } from 'vue';
 import {
   IconAlertCircle,
   IconBolt,
@@ -30,6 +30,7 @@ import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import { compareReliableQueueOrder } from '@webview/domain/reliableQueueOrdering';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
+import { useConversationUiStore, type QueueEditDraftState } from '@webview/stores/useConversationUiStore';
 
 interface QueueItem {
   id: string;
@@ -46,12 +47,15 @@ interface QueueItem {
 
 const reliableConversation = useReliableConversation();
 const clientState = useClientStateStore();
+const ui = useConversationUiStore();
 const {
   currentPendingTurnInputs,
   currentTurnInputFailure,
   retryTurnInputSubmission,
   withdrawTurnInputSubmission,
   editGuidance,
+  guidanceEditAcknowledgements,
+  dismissGuidanceEditAcknowledgement,
   cancelGuidance,
   setGuidancePaused,
   reorderGuidance,
@@ -62,9 +66,44 @@ const {
 
 const requestedIntentVersions = new Map<string, string>();
 const listScrollers = ref<Record<string, HTMLElement | null>>({});
-const editingIntentId = ref<string>();
-const editingText = ref('');
-const editError = ref('');
+const editingDraft = computed(() => ui.queueEditDraft(reliableConversation.conversationId.value));
+const editingIntentId = computed(() => editingDraft.value?.intentId);
+const editingText = computed({
+  get: () => editingDraft.value?.text ?? '',
+  set: (text: string) => {
+    const draft = editingDraft.value;
+    if (draft) ui.updateQueueEditText(draft.conversationId, draft.intentId, text);
+  }
+});
+const editError = computed({
+  get: () => editingDraft.value?.error ?? '',
+  set: (error: string) => { if (editingDraft.value) editingDraft.value.error = error; }
+});
+const editingSubmission = computed(() => {
+  const draft = editingDraft.value;
+  return draft?.submission ? { ...draft.submission, conversationId: draft.conversationId, intentId: draft.intentId } : undefined;
+});
+watch(() => reliableConversation.conversationId.value, (_current, previous) => {
+  if (previous) ui.invalidateQueueEditScope(previous);
+}, { flush: 'sync' });
+watch(() => Object.values(ui.queueEditDrafts).map((draft) => ({
+  draft, submission: draft.submission, revision: draft.revision,
+  acknowledgement: draft.submission ? guidanceEditAcknowledgements.value[draft.submission.commandId] : undefined,
+  failure: currentGuidanceControlFailure.value?.commandId === draft.submission?.commandId
+    ? currentGuidanceControlFailure.value : undefined
+})), (results) => {
+  for (const { draft, submission, acknowledgement, failure, revision } of results) {
+    if (!submission || draft.submission?.commandId !== submission.commandId) continue;
+    if (failure) draft.error = failure.message;
+    if (!acknowledgement) continue;
+    delete draft.submission;
+    dismissGuidanceEditAcknowledgement(submission.commandId);
+    draft.error = '';
+    if (draft.conversationId === acknowledgement.conversationId
+      && draft.conversationId === reliableConversation.conversationId.value
+      && revision === submission.revision) ui.discardQueueEdit(draft.conversationId, draft.intentId);
+  }
+}, { immediate: true });
 const draggingIntentId = ref<string>();
 const removalTarget = ref<QueueItem>();
 const removalDescription = computed(() => {
@@ -126,6 +165,12 @@ const committedItems = computed<QueueItem[]>(() => committedQueueRecords.value.m
 }).filter((item) => item.id).sort((left, right) =>
   compareReliableQueueOrder(queueOrderValue(left), queueOrderValue(right))
 ));
+
+const retainedEdits = computed(() => {
+  const present = new Set(committedItems.value.map((item) => item.id));
+  return Object.values(ui.queueEditDrafts).filter((draft) =>
+    draft.conversationId === reliableConversation.conversationId.value && !present.has(draft.intentId));
+});
 
 const optimisticItems = computed<QueueItem[]>(() => {
   const committedIds = new Set(committedItems.value.map((item) => item.id));
@@ -471,26 +516,42 @@ function itemBusy(item: QueueItem): boolean {
 function beginEdit(item: QueueItem): void {
   const preview = guidancePreview(item.preview);
   if (!preview || itemBusy(item)) return;
-  editingIntentId.value = item.id;
-  editingText.value = preview.editorText;
-  editError.value = '';
+  ui.startQueueEdit(reliableConversation.conversationId.value, item.id, preview.editorText, !!preview.hasAttachments);
+}
+
+function discardEdit(draft: QueueEditDraftState): void {
+  if (draft.submission) dismissGuidanceEditAcknowledgement(draft.submission.commandId);
+  ui.discardQueueEdit(draft.conversationId, draft.intentId);
 }
 
 function closeEdit(): void {
-  editingIntentId.value = undefined;
-  editingText.value = '';
-  editError.value = '';
+  if (editingDraft.value) discardEdit(editingDraft.value);
+}
+
+function updateRetainedEdit(draft: QueueEditDraftState, event: Event): void {
+  ui.updateQueueEditText(draft.conversationId, draft.intentId, (event.target as HTMLTextAreaElement).value);
+}
+
+function recoverEdit(draft: QueueEditDraftState): void {
+  if (draft.conversationId !== reliableConversation.conversationId.value
+    || draft.conversationId !== clientState.currentConversationId) return;
+  // Keep the recovered copy here until the user explicitly discards it: replacing an occupied
+  // composer requires confirmation, which the user may decline or leave by switching scope.
+  ui.prefillChatDraftText(draft.text);
 }
 
 function saveEdit(item: QueueItem): void {
   const preview = guidancePreview(item.preview);
-  if (!preview) return;
-  const text = editingText.value.trim();
+  const draft = editingDraft.value;
+  if (!preview || !draft || draft.intentId !== item.id || itemBusy(item)) return;
+  const text = draft.text.trim();
   if (!text && !preview.hasAttachments) {
-    editError.value = '没有附件的引导消息不能为空。';
+    draft.error = '没有附件的引导消息不能为空。';
     return;
   }
-  if (editGuidance(item.id, preview.revisionSeq, text)) closeEdit();
+  const revision = draft.revision;
+  const submission = editGuidance(item.id, preview.revisionSeq, text);
+  if (submission) draft.submission = { commandId: submission.commandId, revision };
 }
 
 function requestRemoveItem(item: QueueItem): void {
@@ -515,7 +576,6 @@ function confirmRemoveItem(): void {
     closeRemovePanel();
     return;
   }
-  if (editingIntentId.value === item.id) closeEdit();
   closeRemovePanel();
 }
 
@@ -576,13 +636,26 @@ function timestamp(value: unknown): number {
 </script>
 
 <template>
-  <section v-if="queueItems.length > 0" class="reliable-queue" aria-label="消息提交与等待状态">
+  <section v-if="queueItems.length > 0 || retainedEdits.length > 0 || currentGuidanceControlFailure" class="reliable-queue" aria-label="消息提交与等待状态">
     <div v-if="currentGuidanceControlFailure" class="reliable-queue-control-error" role="alert">
       <IconAlertCircle :size="14" stroke="2" aria-hidden="true" />
       <span>{{ currentGuidanceControlFailure.message }}</span>
       <button type="button" title="关闭提示" @click="dismissGuidanceControlFailure">
         <IconX :size="13" stroke="2" aria-hidden="true" />
       </button>
+    </div>
+
+    <div v-for="retained in retainedEdits" :key="retained.intentId" class="reliable-queue-retained-edit" data-testid="retained-queue-edit">
+      <div class="reliable-queue-header"><span class="reliable-queue-title">已保留的编辑</span></div>
+      <p class="reliable-queue-retained-notice">原消息已不在当前等待列表中，编辑内容已保留，请先核对聊天记录。</p>
+      <textarea :value="retained.text" class="reliable-queue-editor" rows="3" aria-label="已保留的排队消息编辑"
+        @input="updateRetainedEdit(retained, $event)" />
+      <p v-if="retained.hasAttachments" class="reliable-queue-retained-notice">这里只保留编辑文字，恢复后需要重新添加附件。</p>
+      <div class="reliable-queue-editor-actions">
+        <span v-if="retained.error" class="reliable-queue-edit-error">{{ retained.error }}</span>
+        <button type="button" :disabled="!retained.text.trim()" @click="recoverEdit(retained)">放入输入框</button>
+        <button type="button" @click="discardEdit(retained)">丢弃编辑</button>
+      </div>
     </div>
 
     <div v-for="group in queueGroups" :key="group.id" class="reliable-queue-group" :data-state-group="group.id">
@@ -613,7 +686,7 @@ function timestamp(value: unknown): number {
         @dragover.prevent
         @drop="dropOn($event, item)"
       >
-        <template v-if="editingIntentId === item.id && guidancePreview(item.preview)">
+        <template v-if="editingIntentId === item.id">
           <textarea
             v-model="editingText"
             class="reliable-queue-editor"
@@ -623,7 +696,7 @@ function timestamp(value: unknown): number {
           />
           <div class="reliable-queue-editor-actions">
             <span v-if="editError" class="reliable-queue-edit-error">{{ editError }}</span>
-            <button type="button" title="保存编辑" :disabled="itemBusy(item)" @click="saveEdit(item)">
+            <button type="button" title="保存编辑" :disabled="itemBusy(item) || !guidancePreview(item.preview)" @click="saveEdit(item)">
               <IconCheck :size="14" stroke="2" aria-hidden="true" />
             </button>
             <button type="button" title="取消编辑" @click="closeEdit">
@@ -739,6 +812,8 @@ function timestamp(value: unknown): number {
 </template>
 
 <style scoped>
+.reliable-queue-retained-edit { display: flex; flex-direction: column; gap: 4px; padding: 8px; border: 1px solid var(--vscode-panel-border); }
+.reliable-queue-retained-notice { margin: 0; color: var(--vscode-descriptionForeground); font-size: var(--font-size-xs); }
 .reliable-queue {
   width: 100%;
   min-width: 0;

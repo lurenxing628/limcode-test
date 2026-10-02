@@ -166,6 +166,8 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   pinnedDetailKeys: string[];
   retiredSessionIds: string[];
   navigationGeneration: string | null;
+  /** Causal visibility frontier of the current full snapshot, never advanced by a delta. */
+  lastSnapshotCommitSeq: string | null;
   transientModelRequests: Record<string, ReliableKernelTransientState>;
   pendingTransientRecoveries: Record<string, PendingTransientRecovery>;
   /** Memory-only immutable history prefix for the currently projected Conversation. */
@@ -205,6 +207,8 @@ const DETAIL_AUTO_RETRY_DELAYS_MS = [250, 750, 2_000] as const;
 const DETAIL_CACHE_MAX_ENTRIES = 1_024;
 const DETAIL_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 const HISTORY_PAGE_LIMIT = 200;
+const HISTORY_REQUEST_DEADLINE_MS = 20_000;
+const historyRequestTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const COLLABORATION_HISTORY_REQUEST_DEADLINE_MS = 20_000;
 const collaborationHistoryTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 const MAX_REPORTED_TRANSIENT_PAINTS = 512;
@@ -222,7 +226,7 @@ const DETAIL_PRIORITY_ORDER: Readonly<Record<ReliableKernelDetailPriority, numbe
   background: 3
 });
 
-export const useReliableKernelClientFeedStore = defineStore('reliableKernelClientFeed', {
+const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelClientFeed', {
   state: (): ReliableKernelFeedStoreState => ({
     ...createEmptyReliableKernelClientState(),
     details: {},
@@ -233,6 +237,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
     pinnedDetailKeys: [],
     retiredSessionIds: [],
     navigationGeneration: null,
+    lastSnapshotCommitSeq: null,
     transientModelRequests: {},
     pendingTransientRecoveries: {},
     historyConversationId: null,
@@ -403,6 +408,9 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       this.hostBootId = result.state.hostBootId;
       this.lastMessageSeq = result.state.lastMessageSeq;
       this.lastCommitSeq = result.state.lastCommitSeq;
+      if (result.ack && incomingType === RELIABLE_KERNEL_SNAPSHOT_MESSAGE) {
+        this.lastSnapshotCommitSeq = result.state.lastCommitSeq;
+      }
       this.projections = result.state.projections;
       this.records = result.state.records;
       this.snapshotRequired = result.state.snapshotRequired;
@@ -430,6 +438,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
             Boolean(previousSessionId && previousSessionId !== result.state.sessionId)
           );
           if (snapshotSkippedLoadedFloors && nextConversationId) {
+            clearHistoryRequestTimeout(this.historyRequestId);
             this.historyLoading = false;
             this.historyRequestId = null;
             this.historyError = null;
@@ -476,6 +485,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       if (this.historyConversationId !== (normalized || null)) {
         resetHistoryState(this.$state, normalized || null);
       } else if (sessionChanged) {
+        clearHistoryRequestTimeout(this.historyRequestId);
         this.historyLoading = false;
         this.historyRequestId = null;
         this.historyError = null;
@@ -582,6 +592,15 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       this.collaborationHistoryError = message.message.trim() || '读取协作历史失败。';
     },
 
+    cancelHistoryRequests(): void {
+      clearHistoryRequestTimeout(this.historyRequestId);
+      clearCollaborationHistoryTimeout(this.collaborationHistoryRequestId);
+      this.historyLoading = false;
+      this.historyRequestId = null;
+      this.collaborationHistoryLoading = false;
+      this.collaborationHistoryRequestId = null;
+    },
+
     requestEarlierHistory(conversationId: string): boolean {
       const normalized = conversationId.trim();
       const sessionId = this.sessionId;
@@ -603,6 +622,16 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       this.historyLoading = true;
       this.historyError = null;
       this.historyRequestId = requestId;
+      const timeout = setTimeout(() => {
+        historyRequestTimeouts.delete(requestId);
+        if (this.historyRequestId !== requestId || this.sessionId !== sessionId
+          || this.historyConversationId !== normalized) return;
+        this.historyLoading = false;
+        this.historyRequestId = null;
+        this.historyError = '更早消息请求超时，请重试。';
+      }, HISTORY_REQUEST_DEADLINE_MS);
+      (timeout as unknown as { unref?: () => void }).unref?.();
+      historyRequestTimeouts.set(requestId, timeout);
       try {
         bridge.postRaw({
           type: RELIABLE_KERNEL_HISTORY_PAGE_REQUEST_MESSAGE,
@@ -614,6 +643,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
           limit: HISTORY_PAGE_LIMIT
         });
       } catch (error) {
+        clearHistoryRequestTimeout(this.historyRequestId);
         this.historyLoading = false;
         this.historyRequestId = null;
         this.historyError = error instanceof Error ? error.message : '请求更早消息失败。';
@@ -628,6 +658,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         || message.conversationId !== this.historyConversationId
         || message.requestId !== this.historyRequestId
       ) return;
+      clearHistoryRequestTimeout(message.requestId);
       if (
         message.page.hasMore
         && (!message.page.nextBeforeMessageSeq || !message.page.nextBeforeId)
@@ -640,6 +671,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
       try {
         this.historyRecords = mergeHistoryRecordPage(this.historyRecords, message.page.records);
       } catch (error) {
+        clearHistoryRequestTimeout(this.historyRequestId);
         this.historyLoading = false;
         this.historyRequestId = null;
         this.historyError = error instanceof Error ? error.message : '更早消息页面格式无效。';
@@ -660,6 +692,7 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
         || message.conversationId !== this.historyConversationId
         || message.requestId !== this.historyRequestId
       ) return;
+      clearHistoryRequestTimeout(message.requestId);
       this.historyLoading = false;
       this.historyRequestId = null;
       this.historyError = message.message.trim() || '读取更早消息失败。';
@@ -1572,6 +1605,21 @@ export const useReliableKernelClientFeedStore = defineStore('reliableKernelClien
   }
 });
 
+const historyLifecycleStores = new WeakSet<object>();
+export const useReliableKernelClientFeedStore: typeof useReliableKernelClientFeedStoreDefinition = Object.assign(
+  (...args: Parameters<typeof useReliableKernelClientFeedStoreDefinition>) => {
+    const store = useReliableKernelClientFeedStoreDefinition(...args);
+    if (!historyLifecycleStores.has(store)) {
+      historyLifecycleStores.add(store);
+      const reset = store.$reset.bind(store);
+      store.$reset = () => { store.cancelHistoryRequests(); reset(); };
+      const dispose = store.$dispose.bind(store);
+      store.$dispose = () => { store.cancelHistoryRequests(); historyLifecycleStores.delete(store); dispose(); };
+    }
+    return store;
+  }, useReliableKernelClientFeedStoreDefinition
+);
+
 export function isReliableKernelFeedMessage(message: unknown): boolean {
   return isReliableKernelFeedDataMessage(message)
     || isReliableKernelDetailResultMessage(message)
@@ -1998,10 +2046,18 @@ function isCollaborationHistoryPage(
     : page.nextBeforeMessageSeq === oldest?.message_seq && page.nextBeforeId === oldest.id;
 }
 
+function clearHistoryRequestTimeout(requestId: string | null): void {
+  if (!requestId) return;
+  const timeout = historyRequestTimeouts.get(requestId);
+  if (timeout !== undefined) clearTimeout(timeout);
+  historyRequestTimeouts.delete(requestId);
+}
+
 function resetHistoryState(
   state: ReliableKernelFeedStoreState,
   conversationId: string | null
 ): void {
+  clearHistoryRequestTimeout(state.historyRequestId);
   state.historyConversationId = conversationId;
   state.historyRecords = {};
   state.historyNextBeforeMessageSeq = null;

@@ -412,7 +412,7 @@ const activityModelLabel = computed(() => {
 });
 const activityLabel = computed(() => {
   const action = conversationAction.value;
-  if (action?.action === 'retry' && action.phase !== 'running') {
+  if (action?.action === 'retry' && action.phase !== 'running' && action.phase !== 'unconfirmed') {
     if (action.phase === 'requesting_stop') return '正在提交停止旧回复的请求';
     if (action.phase === 'stopping') return '正在停止旧回复，完成后将创建重试回合';
     if (action.phase === 'submitting') return conversationActionLabel.value ?? '旧回复已停止，正在创建重试回合';

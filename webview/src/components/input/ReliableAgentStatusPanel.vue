@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch, watchEffect } from 'vue';
 import { IconMessage2, IconPlayerStop, IconRobot, IconX } from '@tabler/icons-vue';
-import { BridgeMessageType } from '@shared/protocol';
+import { BridgeMessageType, createMessageId } from '@shared/protocol';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
+import { RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE } from '@shared/reliableKernelClientFeed';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { bridge } from '@webview/transport';
@@ -21,6 +22,20 @@ interface TooltipRow {
   value: string;
 }
 
+interface ChildInterruptFeedback {
+  requestId: string;
+  conversationId: string;
+  sourceToolCallId: string;
+  turnId?: string;
+  contextRevision: number;
+  phase: 'submitting' | 'committed' | 'failed';
+  message: string;
+}
+
+const INTERRUPT_ACK_DEADLINE_MS = 10_000;
+const INTERRUPT_RESYNC_DEADLINE_MS = 10_000;
+const INTERRUPT_UNCONFIRMED_MESSAGE = '终止结果仍未确认，已解除本地锁定。请核对当前 Agent 状态后再决定是否重试；不会自动重复终止。';
+
 const reliableConversation = useReliableConversation();
 const agentStore = useAgentStore();
 const { interruptPhase } = useChat();
@@ -29,12 +44,9 @@ const selectedChildId = ref<string>();
 const rootRef = ref<HTMLElement | null>(null);
 const listScroller = ref<HTMLElement | null>(null);
 const detailScroller = ref<HTMLElement | null>(null);
-const interruptFeedback = ref<Record<string, {
-  requestId: string;
-  phase: 'submitting' | 'committed' | 'failed';
-  message: string;
-}>>({});
+const interruptFeedback = ref<Record<string, ChildInterruptFeedback>>({});
 const interruptProjectionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+let interruptContextRevision = 0;
 
 const projection = computed(() => projectReliableAgentStatus({
   conversationId: reliableConversation.conversationId.value,
@@ -111,7 +123,9 @@ watchEffect(() => {
   const childById = new Map(entries.value.map((child) => [child.id, child]));
   for (const childId of Object.keys(interruptFeedback.value)) {
     const child = childById.get(childId);
-    if (child && !['interrupting', 'interrupted', 'closed'].includes(child.lifecycle)) continue;
+    const feedback = interruptFeedback.value[childId];
+    if (child && !['interrupting', 'interrupted', 'closed'].includes(child.lifecycle)
+      && (!feedback.turnId || !child.turnId || feedback.turnId === child.turnId)) continue;
     clearInterruptProjectionTimer(childId);
     const next = { ...interruptFeedback.value };
     delete next[childId];
@@ -119,12 +133,20 @@ watchEffect(() => {
   }
 });
 
+watch(() => [reliableConversation.conversationId.value, reliableConversation.feed.sessionId,
+  reliableConversation.feed.hostBootId], retireInterruptWaits, { flush: 'sync' });
+const disposeInterruptHello = bridge.on(BridgeMessageType.Hello, retireInterruptWaits);
+
 const disposeInterruptResult = bridge.on(BridgeMessageType.InteractionResult, (message) => {
   if (message.payload?.requestType !== BridgeMessageType.ToolExecutionCancel) return;
   const pending = Object.entries(interruptFeedback.value)
     .find(([, feedback]) => feedback.requestId === message.correlationId);
   if (!pending) return;
   const [childId, feedback] = pending;
+  if (!currentInterruptFeedback(childId, feedback.requestId)
+    || message.payload.conversationId !== feedback.conversationId
+    || message.payload.targetId !== feedback.sourceToolCallId) return;
+  clearInterruptProjectionTimer(childId);
   switch (message.payload.status) {
     case 'committed':
     case 'already_applied':
@@ -151,6 +173,7 @@ const disposeInterruptError = bridge.on(BridgeMessageType.Error, (message) => {
     .find(([, feedback]) => feedback.requestId === message.correlationId);
   if (!pending) return;
   const [childId, feedback] = pending;
+  if (!currentInterruptFeedback(childId, feedback.requestId)) return;
   clearInterruptProjectionTimer(childId);
   setInterruptFeedback(childId, {
     ...feedback,
@@ -169,6 +192,8 @@ onBeforeUnmount(() => {
   document.removeEventListener('keydown', onDocumentKeydown);
   disposeInterruptResult();
   disposeInterruptError();
+  disposeInterruptHello();
+  interruptContextRevision += 1;
   for (const timer of interruptProjectionTimers.values()) clearTimeout(timer);
   interruptProjectionTimers.clear();
 });
@@ -282,12 +307,45 @@ function interruptChild(child: ReliableChildAgentStatus): void {
   const current = interruptFeedback.value[child.id];
   if (!child.interruptible || current?.phase === 'submitting' || current?.phase === 'committed') return;
   clearInterruptProjectionTimer(child.id);
-  const requestId = bridge.request(BridgeMessageType.ToolExecutionCancel, {
-    toolCallId: child.sourceToolCallId,
-    conversationId: reliableConversation.conversationId.value,
-    reason: '用户从 Agent 运行情况面板请求终止该 Agent 及其启动的所有子 Agent。'
+  const requestId = createMessageId();
+  const conversationId = reliableConversation.conversationId.value;
+  const sessionId = reliableConversation.feed.sessionId;
+  setInterruptFeedback(child.id, {
+    requestId, conversationId, sourceToolCallId: child.sourceToolCallId,
+    ...(child.turnId ? { turnId: child.turnId } : {}), contextRevision: interruptContextRevision,
+    phase: 'submitting', message: '正在提交终止请求'
   });
-  setInterruptFeedback(child.id, { requestId, phase: 'submitting', message: '正在提交终止请求' });
+  // Register ownership and both bounded recovery stages before posting, including a synchronous ACK.
+  interruptProjectionTimers.set(child.id, setTimeout(() => {
+    const feedback = currentInterruptFeedback(child.id, requestId);
+    if (!feedback || feedback.phase !== 'submitting') return;
+    interruptProjectionTimers.delete(child.id);
+    interruptProjectionTimers.set(child.id, setTimeout(() => {
+      const pending = currentInterruptFeedback(child.id, requestId);
+      if (pending?.phase !== 'submitting') return;
+      interruptProjectionTimers.delete(child.id);
+      setInterruptFeedback(child.id, {
+        ...pending, phase: 'failed', message: INTERRUPT_UNCONFIRMED_MESSAGE
+      });
+    }, INTERRUPT_RESYNC_DEADLINE_MS));
+    try {
+      if (sessionId && reliableConversation.feed.sessionId === sessionId) {
+        bridge.postRaw({ type: RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE, sessionId });
+      }
+    }
+    catch { /* A failed read does not prove that the stop failed; the second deadline unlocks. */ }
+  }, INTERRUPT_ACK_DEADLINE_MS));
+  try {
+    bridge.request(BridgeMessageType.ToolExecutionCancel, {
+      toolCallId: child.sourceToolCallId, conversationId,
+      reason: '用户从 Agent 运行情况面板请求终止该 Agent 及其启动的所有子 Agent。'
+    }, { requestId });
+  } catch {
+    const feedback = currentInterruptFeedback(child.id, requestId);
+    if (!feedback) return;
+    clearInterruptProjectionTimer(child.id);
+    setInterruptFeedback(child.id, { ...feedback, phase: 'failed', message: INTERRUPT_UNCONFIRMED_MESSAGE });
+  }
 }
 
 function showInterruptAction(child: ReliableChildAgentStatus): boolean {
@@ -310,17 +368,44 @@ function interruptButtonDisabled(child: ReliableChildAgentStatus): boolean {
 
 function setInterruptFeedback(
   childId: string,
-  feedback: { requestId: string; phase: 'submitting' | 'committed' | 'failed'; message: string }
+  feedback: ChildInterruptFeedback
 ): void {
   interruptFeedback.value = { ...interruptFeedback.value, [childId]: feedback };
 }
 
+function currentInterruptFeedback(childId: string, requestId: string): ChildInterruptFeedback | undefined {
+  const feedback = interruptFeedback.value[childId];
+  const child = entries.value.find((entry) => entry.id === childId);
+  if (!feedback || feedback.requestId !== requestId || feedback.contextRevision !== interruptContextRevision
+    || feedback.conversationId !== reliableConversation.conversationId.value || !child
+    || child.sourceToolCallId !== feedback.sourceToolCallId
+    || ['interrupting', 'interrupted', 'closed'].includes(child.lifecycle)
+    || (feedback.turnId && child.turnId && feedback.turnId !== child.turnId)) return undefined;
+  return feedback;
+}
+
+function retireInterruptWaits(): void {
+  interruptContextRevision += 1;
+  for (const [childId, feedback] of Object.entries(interruptFeedback.value)) {
+    clearInterruptProjectionTimer(childId);
+    if (feedback.conversationId !== reliableConversation.conversationId.value) {
+      const next = { ...interruptFeedback.value };
+      delete next[childId];
+      interruptFeedback.value = next;
+    } else if (feedback.phase !== 'failed') {
+      setInterruptFeedback(childId, { ...feedback, phase: 'failed', message: INTERRUPT_UNCONFIRMED_MESSAGE });
+    }
+  }
+}
+
 function scheduleInterruptProjectionDeadline(childId: string): void {
   clearInterruptProjectionTimer(childId);
+  const requestId = interruptFeedback.value[childId]?.requestId;
+  if (!requestId) return;
   interruptProjectionTimers.set(childId, setTimeout(() => {
-    interruptProjectionTimers.delete(childId);
-    const feedback = interruptFeedback.value[childId];
+    const feedback = currentInterruptFeedback(childId, requestId);
     if (!feedback || feedback.phase !== 'committed') return;
+    interruptProjectionTimers.delete(childId);
     setInterruptFeedback(childId, {
       ...feedback,
       phase: 'failed',

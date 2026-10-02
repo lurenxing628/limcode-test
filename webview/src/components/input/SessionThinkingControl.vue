@@ -16,6 +16,12 @@ const capability = computed(() => props.config && props.model
   ? sessionThinkingCapability(props.config.provider, props.model, settings.value?.generationConfig?.maxOutputTokens, settings.value?.generationConfig?.thinkingConfig, props.config)
   : undefined);
 const pending = computed(() => store.pendingFor('conversation', props.conversationId));
+// Resolution returned an authoritative configuration error, not an in-flight read. Match only
+// the two missing-selection diagnostics produced by resolveConfigurationSelection.
+const unconfiguredModel = computed(() => !pending.value && !props.model?.trim()
+  && /^(?:Provider [^\r\n]+ 没有可用模型。|没有可用的 LLM Provider 配置。)$/.test(
+    store.confirmedFor('conversation', props.conversationId)?.effectiveModelError ?? ''
+  ));
 const override = computed(() => store.thinkingFor('conversation', props.conversationId));
 /** 已保存的覆盖在当前模型上是否生效：与请求冻结同一套容错解析（升级改名的强度类 kind 照常生效）。 */
 const saved = computed(() => override.value && props.config && props.model
@@ -31,12 +37,15 @@ const disabled = computed(() => !ready.value || busy.value || (!capability.value
 const channelValue = computed(() => props.config && props.model
   ? sessionThinkingDisplayLabel(props.config.provider, props.model, settings.value?.generationConfig?.thinkingConfig, props.config)
   : '');
-const defaultLabel = computed(() => props.config && props.model ? `渠道默认：${channelValue.value}` : '正在读取渠道设置');
+const defaultLabel = computed(() => unconfiguredModel.value ? '请先配置模型'
+  : props.config && props.model ? `渠道默认：${channelValue.value}` : '正在读取渠道设置');
 const LEVEL_NAMES: Record<string, string> = {
   none: '关闭思考', minimal: '最低', low: '低', medium: '中', high: '高', xhigh: '极高', max: '最高'
 };
 /** 输入栏只显示实际强度；来源及适配说明留在下拉选项里。 */
 const channelButtonValue = computed(() => {
+  if (unconfiguredModel.value) return '未配置模型';
+  if (!ready.value && error.value) return '读取失败';
   const value = channelValue.value;
   const effectiveLevel = value.match(/(?:^|，实际发 )(none|minimal|low|medium|high|xhigh|max)(?:（适配器）)?$/)?.[1];
   return effectiveLevel === 'none' ? '关闭' : effectiveLevel ? LEVEL_NAMES[effectiveLevel]
@@ -109,7 +118,9 @@ const displayOptions = computed(() => inheritChildren.value
     ? option
     : { ...option, buttonLabel: `${option.buttonLabel ?? option.label} · 含子 Agent` })
   : options.value);
-const hint = computed(() => [
+const hint = computed(() => unconfiguredModel.value
+  ? '请先配置模型：在侧栏设置中打开全局设置，添加并选择模型。'
+  : [
   '这个对话使用的思考强度，下一次请求开始生效，不影响其他对话。',
   `渠道默认来自渠道或模型高级配置，当前是：${channelValue.value || '读取中'}。`,
   ...(inactiveOverride.value ? [inactiveOverride.value.reason || INACTIVE_SESSION_THINKING_NOTICE] : []),
@@ -128,8 +139,10 @@ function alignPanel(): void {
   const rect = dropdown.getBoundingClientRect();
   panelLeft.value = panelOffset(rect.left, rect.width, window.innerWidth);
 }
-const error = computed(() => localError.value || pending.value?.error || store.errorFor('conversation', props.conversationId)
-  || store.confirmedFor('conversation', props.conversationId)?.effectiveModelError || '');
+const error = computed(() => unconfiguredModel.value
+  ? '请先配置模型：在全局设置中添加并选择模型。'
+  : localError.value || pending.value?.error || store.errorFor('conversation', props.conversationId)
+    || store.confirmedFor('conversation', props.conversationId)?.effectiveModelError || '');
 watch(() => [props.conversationId, props.config?.id, props.model], () => { localError.value = ''; });
 function modelIdentity(): ChatModelOverrideRecord {
   return { providerConfigId: props.config!.id, provider: props.config!.provider, model: props.model! };
@@ -159,7 +172,7 @@ function setInheritance(enabled: boolean): void {
   store.setChildThinkingInheritance(props.conversationId!, modelIdentity(), enabled);
 }
 function retry(): void {
-  if (!props.conversationId) return;
+  if (!props.conversationId || unconfiguredModel.value) return;
   localError.value = '';
   if (pending.value) store.retryPending('conversation', props.conversationId);
   else store.refreshScope('conversation', props.conversationId, { adoptRoot: true });
@@ -188,7 +201,7 @@ function retry(): void {
     </SettingsDropdown>
     <span v-if="error" class="session-thinking-error" role="status" :title="error">
       <span class="session-thinking-error-text">{{ error }}</span>
-      <button type="button" :disabled="store.readingFor('conversation', conversationId)" @click="retry">重试</button>
+      <button v-if="!unconfiguredModel" type="button" :disabled="store.readingFor('conversation', conversationId)" @click="retry">重试</button>
     </span>
   </div>
 </template>

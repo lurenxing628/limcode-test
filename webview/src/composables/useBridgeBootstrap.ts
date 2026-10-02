@@ -141,7 +141,7 @@ export function useBridgeBootstrap(): void {
       if (message.payload) conversationSettings.applySnapshot(message.payload, message.correlationId);
     }),
     bridge.on(BridgeMessageType.LlmProviderModelsSnapshot, (message) => {
-      if (message.payload) globalSettings.applyLlmProviderModelsSnapshot(message.payload);
+      if (message.payload) globalSettings.applyLlmProviderModelsSnapshot(message.payload, message.correlationId);
     }),
     bridge.on(BridgeMessageType.Error, (message) => {
       const payload = message.payload;
@@ -224,6 +224,8 @@ export function useBridgeBootstrap(): void {
   bridge.ready(settingsActivitySessionId);
   publishSettingsActivity(true);
   onBeforeUnmount(() => {
+    reliableFeed.cancelHistoryRequests();
+    globalSettings.closeFetchedModelsDialog();
     for (const dispose of disposers) dispose();
   });
 }

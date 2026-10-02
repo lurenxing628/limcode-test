@@ -37,6 +37,8 @@ export interface ReliableConversationProjectionInput {
   details: Record<string, ReliableKernelDetailState>;
   transientModelRequests?: Record<string, ReliableKernelTransientState>;
   lastCommitSeq?: string | null;
+  /** Only a full snapshot defines which historical request roots belong to the live window. */
+  lastSnapshotCommitSeq?: string | null;
   /** 当前对话已知的转向回执；驱动聚合消息在转向边界的精确拆分，缺失时保留完整内容。 */
   steeringReceipts?: readonly NativeSteeringReceipt[];
 }
@@ -249,7 +251,8 @@ export function projectReliableConversation(
       return requestId && messageId ? [[requestId, messageId] as const] : [];
     })),
     toolCallFacts: values(input.records.ToolCall),
-    lastCommitSeq: input.lastCommitSeq ?? undefined
+    lastCommitSeq: input.lastCommitSeq ?? undefined,
+    lastSnapshotCommitSeq: input.lastSnapshotCommitSeq ?? undefined
   });
   parsedMessages.sort(compareParsedMessages);
   // A streaming reply belongs to its Turn like the saved one that replaces it, so what is placed at
@@ -531,6 +534,7 @@ function appendTransientMessages(input: {
   messageIdByModelRequestId: Map<string, string>;
   toolCallFacts: ReliableClientRecord[];
   lastCommitSeq?: string;
+  lastSnapshotCommitSeq?: string;
 }): void {
   const { messages, transientByRequest, conversationId } = input;
   const durableLatestRequestSeqByTurn = new Map<string, bigint>();
@@ -552,6 +556,14 @@ function appendTransientMessages(input: {
     // only a fallback for the brief interval before that independent record arrives.
     if (!request && !transientCausalFrontierReached(transient, input.lastCommitSeq)) continue;
     if (!request && (durableLatestRequestSeqByTurn.get(transient.turnId) ?? 0n) >= requestSeq) continue;
+    // A reconnect can replay a cached terminal preview after a history action removed its
+    // Message and the full snapshot no longer includes that request. Do not recreate an extra
+    // transcript card beyond that causal snapshot. Keep the overlay cache: a history page may
+    // restore its request, and neither a delta nor a snapshot older than the frame proves scope.
+    if (!request && ['completed', 'failed', 'cancelled'].includes(transient.status)
+      && transient.afterCommitSeq && /^\d+$/.test(transient.afterCommitSeq)
+      && input.lastSnapshotCommitSeq
+      && transientCausalFrontierReached(transient, input.lastSnapshotCommitSeq)) continue;
     // 原生异步链上，Provider/Kernel 已授权在异步调用未决时继续输出；
     // 只有非原生路径保留「前序调用未终结则不显示新输出」的抑制。
     const nativeAsyncContinuation = request !== undefined

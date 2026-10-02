@@ -2,6 +2,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
+import { toStructuredClonePlainData } from '@shared/plainData';
 import {
   BridgeMessageType,
   type AgentRecord,
@@ -82,18 +83,20 @@ const {
   compressionPending,
   currentAuthoritySelection,
   currentTurnInputAcknowledgements,
+  turnInputWithdrawalsById,
   currentTurnInputFailure,
   dismissTurnInputAcknowledgement,
+  dismissTurnInputWithdrawal,
   dismissTurnInputFailure,
   steerCurrentTurn,
   currentSteeringSubmitting,
   steeringSubmissionResultsById,
   dismissSteeringSubmissionResult,
-  inFlightTurnInputTexts
+  inFlightTurnInputCommands
 } = useChat();
 const highlighted = ref(false);
 const editorExpanded = ref(false);
-const editor = ref<{ focus: () => void } | null>(null);
+const editor = ref<{ focus: () => void; captureFocusRestore: () => (() => void) | undefined } | null>(null);
 const editorShell = ref<HTMLElement | null>(null);
 const expandedEditorHeight = ref(0);
 const collapsedEditorHeight = ref(0);
@@ -105,7 +108,9 @@ const fileInput = ref<HTMLInputElement | null>(null);
 const attachmentScroller = ref<HTMLElement | null>(null);
 const channelModelPanel = ref<{ configId: string; style: Record<string, string> } | null>(null);
 const currentSubmissionCommandId = ref<string>();
+let currentSubmissionDraft: { conversationId: string; revision: number; generation: number; restoreFocus?: () => void } | undefined;
 const currentSteerCommandId = ref<string>();
+let currentSteerDraft: { conversationId: string; revision: number } | undefined;
 
 const draft = computed({
   get: () => ui.composerDraft,
@@ -115,12 +120,17 @@ const draft = computed({
 const savingSessionSelections = ref<Record<string, boolean>>({});
 const savingSessionSelection = computed(() => !!savingSessionSelections.value[clientState.currentConversationId ?? '']);
 const conversationInputDisabled = computed(() =>
-  props.disabled || Boolean(currentSubmissionCommandId.value) || currentSteeringSubmitting.value || savingSessionSelection.value
+  props.disabled || Boolean(currentSubmissionCommandId.value
+    && currentSubmissionDraft?.conversationId === clientState.currentConversationId
+    && currentSubmissionDraft.generation === ui.chatDraftGeneration)
+    || currentSteeringSubmitting.value || savingSessionSelection.value
 );
 const effectivePlaceholder = computed(() => props.placeholder);
 const expandTitle = computed(() => (editorExpanded.value ? '恢复输入框高度' : '扩大输入框'));
 const sendTitle = computed(() => {
-  if (currentSubmissionCommandId.value) return '正在确认消息已保存';
+  if (currentSubmissionCommandId.value
+    && currentSubmissionDraft?.conversationId === clientState.currentConversationId
+    && currentSubmissionDraft.generation === ui.chatDraftGeneration) return '正在确认消息已保存';
   if (currentSteeringSubmitting.value) return '正在提交介入消息';
   if (ui.isEditing) return '提交编辑';
   if (nativeSteeringAvailable.value) return '立即介入当前回复';
@@ -357,6 +367,11 @@ watch([
 ], () => { submissionDraftRevision += 1; }, { deep: true, flush: 'sync' });
 // "Send as a new message" never silently replaces a draft or an open edit (see chatDraftPrefill).
 const chatDraftPrefill = useChatDraftPrefill(ui, chatAttachments);
+watch(() => clientState.currentConversationId, () => {
+  chatDraftPrefill.cancel();
+  const queued = ui.chatDraftPrefill;
+  if (queued) ui.takeChatDraftPrefill(queued.key);
+}, { flush: 'sync' });
 // Unsent text, attachments and an open edit survive a window reload (Webview state).
 const draftPersistence = useComposerDraftPersistence({
   ui,
@@ -367,7 +382,16 @@ const draftPersistence = useComposerDraftPersistence({
     read: () => bridge.readPersistedState(PERSISTED_COMPOSER_DRAFT_KEY),
     write: (value) => bridge.writePersistedState(PERSISTED_COMPOSER_DRAFT_KEY, value)
   },
-  pendingInputTexts: () => inFlightTurnInputTexts.value,
+  pendingInputCommands: () => inFlightTurnInputCommands.value,
+  submittedChatDraft: () => {
+    const commandId = currentSubmissionCommandId.value;
+    const submitted = currentSubmissionDraft;
+    if (!commandId || !submitted || submitted.revision !== submissionDraftRevision
+      || submitted.generation !== ui.chatDraftGeneration
+      || submitted.conversationId !== clientState.currentConversationId
+      || submitted.conversationId !== reliableConversation.conversationId.value) return undefined;
+    return { commandId, conversationId: submitted.conversationId };
+  },
   // Before another window's maintenance reloads this one: what was just typed is written at once.
   onSaveRequest: (listener) => bridge.on(BridgeMessageType.ComposerDraftSave, () => listener()),
   onAttachmentsOmitted: (count) => {
@@ -387,15 +411,37 @@ const attachmentTotalBytes = computed(() => selectedAttachments.value.reduce(
 
 watch(
   () => currentSubmissionCommandId.value
+    ? turnInputWithdrawalsById.value[currentSubmissionCommandId.value]
+    : undefined,
+  (withdrawal) => {
+    const commandId = currentSubmissionCommandId.value;
+    if (!commandId || !withdrawal || currentSubmissionDraft?.conversationId !== withdrawal.conversationId) return;
+    // Withdrawal ends only this local wait. The durable command may still settle later, and the
+    // unchanged or newer draft and attachments remain the user's to edit or explicitly send.
+    currentSubmissionCommandId.value = undefined;
+    currentSubmissionDraft = undefined;
+    dismissTurnInputWithdrawal(commandId);
+  }
+);
+
+watch(
+  () => currentSubmissionCommandId.value
     ? currentTurnInputAcknowledgements.value[currentSubmissionCommandId.value]
     : undefined,
   (acknowledgement) => {
     const commandId = currentSubmissionCommandId.value;
     if (!commandId || !acknowledgement) return;
+    const submittedDraft = currentSubmissionDraft;
+    currentSubmissionCommandId.value = undefined;
+    currentSubmissionDraft = undefined;
+    dismissTurnInputAcknowledgement(commandId);
+    if (!submittedDraft || submittedDraft.revision !== submissionDraftRevision
+      || submittedDraft.conversationId !== acknowledgement.conversationId
+      || submittedDraft.conversationId !== clientState.currentConversationId
+      || submittedDraft.conversationId !== reliableConversation.conversationId.value) return;
     attachmentSnapshots.value = { ...attachmentSnapshots.value, chat: [] };
     ui.clearChatDraft();
-    currentSubmissionCommandId.value = undefined;
-    dismissTurnInputAcknowledgement(commandId);
+    restoreOwnedDraftFocus(submittedDraft);
   }
 );
 
@@ -406,10 +452,16 @@ watch(
   (result) => {
     const commandId = currentSteerCommandId.value;
     if (!commandId || !result) return;
+    const submittedDraft = currentSteerDraft;
     currentSteerCommandId.value = undefined;
+    currentSteerDraft = undefined;
     dismissSteeringSubmissionResult(commandId);
-    // 失败时保留草稿和附件，不改为排队投递。
-    if (!result.ok) return;
+    // A late receipt confirms only the captured draft. Edits and navigation (including ABA)
+    // may already have created a new draft with identical text or attachments.
+    if (!result.ok || !submittedDraft || submittedDraft.revision !== submissionDraftRevision
+      || submittedDraft.conversationId !== result.conversationId
+      || submittedDraft.conversationId !== clientState.currentConversationId
+      || submittedDraft.conversationId !== reliableConversation.conversationId.value) return;
     attachmentSnapshots.value = { ...attachmentSnapshots.value, chat: [] };
     ui.clearChatDraft();
   }
@@ -425,9 +477,11 @@ watch(
     const failure = currentTurnInputFailure.value;
     if (!failure) return;
     if (failure.commandId === currentSubmissionCommandId.value) {
+      const submittedDraft = currentSubmissionDraft;
       currentSubmissionCommandId.value = undefined;
+      currentSubmissionDraft = undefined;
       dismissTurnInputFailure(failure.commandId);
-      void nextTick(() => editor.value?.focus());
+      if (submittedDraft?.revision === submissionDraftRevision) restoreOwnedDraftFocus(submittedDraft);
       return;
     }
     if (draft.value.trim() || attachmentSnapshots.value.chat.length > 0) return;
@@ -435,7 +489,7 @@ watch(
     attachmentSnapshots.value = {
       ...attachmentSnapshots.value,
       chat: (failure.content?.parts ?? []).flatMap((part) =>
-        'inlineData' in part ? [structuredClone(part as InlineDataPart)] : []
+        'inlineData' in part ? [toStructuredClonePlainData(part, 'failed input attachment') as unknown as InlineDataPart] : []
       )
     };
     dismissTurnInputFailure(failure.commandId);
@@ -443,6 +497,16 @@ watch(
   },
   { immediate: true }
 );
+
+function restoreOwnedDraftFocus(submitted: NonNullable<typeof currentSubmissionDraft>): void {
+  const revision = submissionDraftRevision;
+  void nextTick(() => {
+    if (revision !== submissionDraftRevision
+      || submitted.conversationId !== clientState.currentConversationId
+      || submitted.conversationId !== reliableConversation.conversationId.value) return;
+    submitted.restoreFocus?.();
+  });
+}
 
 let highlightTimer: number | undefined;
 
@@ -516,10 +580,14 @@ async function submit(): Promise<void> {
   }
   if (nativeSteeringAvailable.value) {
     const submission = steerCurrentTurn(text, content);
-    if (submission) currentSteerCommandId.value = submission.commandId;
+    if (submission) {
+      currentSteerDraft = { conversationId: reliableConversation.conversationId.value, revision: draftRevision };
+      currentSteerCommandId.value = submission.commandId;
+    }
     return;
   }
   const conversationId = clientState.currentConversationId;
+  const restoreFocus = editor.value?.captureFocusRestore();
   if (conversationId) {
     savingSessionSelections.value[conversationId] = true;
     try {
@@ -535,6 +603,7 @@ async function submit(): Promise<void> {
   }
   const submission = sendMessage(text, content, currentTurnAuthoritySelection());
   if (!submission) return;
+  currentSubmissionDraft = { conversationId: submission.conversationId, revision: draftRevision, generation: ui.chatDraftGeneration, restoreFocus };
   currentSubmissionCommandId.value = submission.commandId;
 }
 

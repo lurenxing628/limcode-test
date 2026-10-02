@@ -1151,7 +1151,15 @@ function cloneMergeValue(value: MergeNodeValue): MergeNodeValue {
   return JSON.parse(JSON.stringify(value)) as unknown;
 }
 
-let modelFetchTimeout: number | undefined;
+interface PendingModelFetch {
+  requestId: string;
+  configId: string;
+  provider: LlmProviderKind;
+  baseUrl: string;
+  timeout?: number;
+}
+const pendingModelFetches = new WeakMap<object, PendingModelFetch>();
+const pendingNativeProbes = new WeakMap<object, Map<string, Omit<PendingModelFetch, 'timeout'>>>();
 /** 后端每次请求最多 30 秒、最多 9 次，另留余量。 */
 const THINKING_PROBE_TIMEOUT_MS = 180_000;
 const thinkingProbeTimers = new Map<string, number>();
@@ -1246,15 +1254,10 @@ function isSectionDirty(state: GlobalSettingsState, section: GlobalSettingsSecti
   return contentDirty || state.pendingSettingsSections[section] === true || hasPendingSectionSave(section);
 }
 
-function clearModelFetchTimeout(): void {
-  if (modelFetchTimeout === undefined) return;
-  window.clearTimeout(modelFetchTimeout);
-  modelFetchTimeout = undefined;
-}
-
-function startModelFetchTimeout(onTimeout: () => void): void {
-  clearModelFetchTimeout();
-  modelFetchTimeout = window.setTimeout(onTimeout, 60_000);
+function clearModelFetch(state: object): void {
+  const pending = pendingModelFetches.get(state);
+  if (pending?.timeout !== undefined) window.clearTimeout(pending.timeout);
+  pendingModelFetches.delete(state);
 }
 
 /** 全局设置（数据目录 + LLM 渠道配置）表单 store。组件只读 state + 调 action，传输细节收口在此。 */
@@ -1470,6 +1473,8 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       }
     },
     reconcilePendingSettings(): void {
+      pendingNativeProbes.delete(this);
+      this.closeFetchedModelsDialog();
       for (const section of GLOBAL_SETTINGS_SECTIONS) {
         const coordinator = coordinatorFor(section);
         if (coordinator.inFlight || coordinator.queued || coordinator.paused) this.recoverSettingsSave(section);
@@ -2217,15 +2222,25 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       const config = this.activeLlmProviderConfig;
       if (!config) return;
       const requestConfig = toPlainProviderConfig(config);
+      clearModelFetch(this);
+      const requestId = createMessageId();
+      const pending: PendingModelFetch = {
+        requestId, configId: requestConfig.id, provider: requestConfig.provider, baseUrl: requestConfig.baseUrl.trim()
+      };
+      pendingModelFetches.set(this, pending);
       this.status = '正在获取 LLM 列表…';
       this.fetchedModelsDialog = { open: true, loading: true, configId: requestConfig.id, models: [] };
+      // Register both the identity and deadline before posting: a synchronous reply may finish it.
+      pending.timeout = window.setTimeout(() => {
+        if (pendingModelFetches.get(this) !== pending) return;
+        clearModelFetch(this);
+        this.status = '获取 LLM 列表超时，请检查 Base URL、API Key 或网络代理设置。';
+        this.fetchedModelsDialog = { open: true, loading: false, configId: requestConfig.id, models: [] };
+      }, 60_000);
       try {
-        bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig });
-        startModelFetchTimeout(() => {
-          this.status = '获取 LLM 列表超时，请检查 Base URL、API Key 或网络代理设置。';
-          this.fetchedModelsDialog = { open: true, loading: false, configId: requestConfig.id, models: [] };
-        });
+        bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig }, { requestId });
       } catch (error) {
+        if (pendingModelFetches.get(this) !== pending) return;
         this.status = `获取 LLM 列表请求发送失败：${error instanceof Error ? error.message : String(error)}`;
         this.closeFetchedModelsDialog();
       }
@@ -2235,7 +2250,18 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       if (!config) return;
       const requestConfig = { ...toPlainProviderConfig(config), ...(modelId ? { model: modelId } : {}) };
       this.status = '正在验证原生压缩端点（仅发送合成内容，可能消耗少量 Token）…';
-      bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig, probeNative: true });
+      const requestId = createMessageId();
+      const pending = pendingNativeProbes.get(this) ?? new Map();
+      // A newer probe of this channel replaces its earlier result, but never the model-list read.
+      for (const [id, probe] of pending) if (probe.configId === configId) pending.delete(id);
+      pending.set(requestId, { requestId, configId, provider: requestConfig.provider, baseUrl: requestConfig.baseUrl.trim() });
+      pendingNativeProbes.set(this, pending);
+      try {
+        bridge.request(BridgeMessageType.LlmProviderModelsGet, { config: requestConfig, probeNative: true }, { requestId });
+      } catch (error) {
+        pending.delete(requestId);
+        this.status = `端点验证失败：${messageFromError(error)}`;
+      }
     },
     /**
      * “测试这个模型”：让后端向这个模型发最多 9 次很短的请求，测出思考参数写法。只在用户确认后调用。
@@ -2317,6 +2343,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       this.status = `「${model.name || model.id}」测试完成：${describeOpenAICompatibleThinkingProbe(evidence)}`;
     },
     closeFetchedModelsDialog(): void {
+      clearModelFetch(this);
       this.fetchedModelsDialog = emptyFetchedModelsDialog();
     },
     addFetchedModelsToConfig(models: LlmProviderModelRecord[]): void {
@@ -2669,19 +2696,34 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       if (hasPendingSectionSave(section)) this.markPendingSettingSection(section);
       else this.clearPendingSettingSection(section);
     },
-    applyLlmProviderModelsSnapshot(payload: LlmProviderModelsSnapshotPayload): void {
+    applyLlmProviderModelsSnapshot(payload: LlmProviderModelsSnapshotPayload, correlationId?: string): void {
       // 测试结果与获取 LLM 列表互不影响：不清获取超时，也不动获取弹窗。
       if (payload.purpose === 'thinking_probe') {
         this.applyThinkingProbeResult(payload);
         return;
       }
-      clearModelFetchTimeout();
+      // A list response belongs to the open request, never to a probe or an earlier dialog.
+      if (payload.purpose === undefined) {
+        const pending = pendingModelFetches.get(this);
+        if (!pending || pending.requestId !== correlationId || pending.configId !== payload.configId
+          || pending.provider !== payload.provider || pending.baseUrl !== payload.baseUrl.trim()
+          || !this.fetchedModelsDialog.open || this.fetchedModelsDialog.configId !== pending.configId
+          || this.llm.activeProviderConfigId !== pending.configId) return;
+      } else if (payload.purpose === 'capability_probe') {
+        const requests = pendingNativeProbes.get(this);
+        const pending = correlationId ? requests?.get(correlationId) : undefined;
+        if (!pending || pending.configId !== payload.configId || pending.provider !== payload.provider
+          || pending.baseUrl !== payload.baseUrl.trim()) return;
+      } else return;
       const config = this.llmProviderConfigs.configs.find((candidate) => candidate.id === payload.configId);
       if (!config) return;
-      if (config.provider !== payload.provider || config.baseUrl !== payload.baseUrl) {
+      if (config.provider !== payload.provider || config.baseUrl.trim() !== payload.baseUrl.trim()) {
         this.status = '渠道已改变，忽略旧端点返回的模型能力。';
         return;
       }
+      // Do not retire the deadline until both the request and the live endpoint match.
+      if (payload.purpose === undefined) clearModelFetch(this);
+      else if (correlationId) pendingNativeProbes.get(this)?.delete(correlationId);
       const models = sanitizeModels(payload.models);
       if (payload.purpose === 'capability_probe') {
         const evidence = models[0]?.capabilitySnapshot;
@@ -2699,14 +2741,18 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
     },
     setError(message: string, options: GlobalSettingsErrorOptions = {}): void {
       if (options.requestType === BridgeMessageType.LlmProviderModelsGet && this.rejectThinkingProbe(options.correlationId, message)) return;
-      clearModelFetchTimeout();
       if (options.requestType === BridgeMessageType.LlmProviderModelsGet) {
+        if (options.correlationId && pendingNativeProbes.get(this)?.delete(options.correlationId)) {
+          this.status = `端点验证失败：${message}`;
+          return;
+        }
+        const pending = pendingModelFetches.get(this);
+        if (!pending || pending.requestId !== options.correlationId) return;
         this.closeFetchedModelsDialog();
         this.status = settingsErrorStatus(options.requestType, message);
         return;
       }
 
-      this.closeFetchedModelsDialog();
       if (options.section) {
         const coordinator = coordinatorFor(options.section);
         if (options.correlationId && coordinator.ignoredReplyIds.has(options.correlationId)) return;
@@ -2764,8 +2810,23 @@ export const useGlobalSettingsStore: typeof useGlobalSettingsStoreDefinition = O
           else if (entry.value !== previous[index]!.value) edited.add(key);
         });
       }, { flush: 'sync' }));
+      scope.run(() => watch(() => {
+        const config = store.activeLlmProviderConfig;
+        // Match toPlainProviderConfig: an autosave that only trims transport fields does not
+        // replace the endpoint/credentials that the in-flight request actually used.
+        return JSON.stringify([
+          config?.id, config?.provider, config?.baseUrl?.trim(), config?.apiKey?.trim(),
+          sanitizeHeaders(config?.headers)
+        ]);
+      }, () => store.closeFetchedModelsDialog(), { flush: 'sync' }));
+      const reset = store.$reset.bind(store);
+      store.$reset = () => { pendingNativeProbes.delete(store); store.closeFetchedModelsDialog(); reset(); };
       const dispose = store.$dispose.bind(store);
-      store.$dispose = () => { scope.stop(); initiallyEditedFields.delete(store); dispose(); };
+      store.$dispose = () => {
+        pendingNativeProbes.delete(store);
+        store.closeFetchedModelsDialog();
+        scope.stop(); initiallyEditedFields.delete(store); dispose();
+      };
     }
     return store;
   }, useGlobalSettingsStoreDefinition

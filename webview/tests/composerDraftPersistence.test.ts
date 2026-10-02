@@ -53,7 +53,7 @@ function composer(state: ReturnType<typeof webviewState>, options: {
   attachmentLimitBytes?: number;
   /** Already in the composer when the persistence starts (e.g. a restored failed send). */
   typed?: string;
-  pendingInputTexts?: string[];
+  pendingInputCommands?: Array<{ commandId: string; conversationId: string }>;
   onSaveRequest?(listener: () => void): () => void;
   pageEvents?: EventTarget;
 } = {}) {
@@ -74,7 +74,7 @@ function composer(state: ReturnType<typeof webviewState>, options: {
       conversationId: () => conversationId.value,
       findMessage: (id) => messages.value.find((message) => message.id === id),
       storage: state.session(),
-      pendingInputTexts: () => options.pendingInputTexts ?? [],
+      pendingInputCommands: () => options.pendingInputCommands ?? [],
       debounceMs: DEBOUNCE_MS,
       attachmentLimitBytes: options.attachmentLimitBytes,
       onAttachmentsOmitted: (count) => omitted.push(count),
@@ -197,15 +197,15 @@ test('a sent (cleared) draft is written at once: a reload right after does not b
 
 test('a draft that is a Turn input still being sent is not restored (the reload sends it again) and is dropped', async () => {
   const state = webviewState();
-  state.write({ chat: { draft: '已经提交、还没确认的问题', attachments: [] }, savedAt: 1 });
-  const after = composer(state, { conversationId: 'conversation-1', pendingInputTexts: ['已经提交、还没确认的问题'] });
+  state.write({ chat: { draft: '已经提交、还没确认的问题', attachments: [], submitted: { commandId: 'submitted-command', conversationId: 'conversation-1' } }, savedAt: 1 });
+  const after = composer(state, { conversationId: 'conversation-1', pendingInputCommands: [{ commandId: 'submitted-command', conversationId: 'conversation-1' }] });
   await settle();
   assert.equal(after.ui.chatDraft, '');
   assert.equal(state.read(), undefined, 'not restored by a later reload either');
   after.reload();
 
   state.write({ chat: { draft: '另一句草稿', attachments: [] }, savedAt: 1 });
-  const other = composer(state, { pendingInputTexts: ['已经提交、还没确认的问题'] });
+  const other = composer(state, { pendingInputCommands: [{ commandId: 'submitted-command', conversationId: 'conversation-1' }] });
   await settle();
   assert.equal(other.ui.chatDraft, '另一句草稿');
   other.reload();

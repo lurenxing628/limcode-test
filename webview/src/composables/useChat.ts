@@ -1,6 +1,6 @@
 import { debugCaptureTrace } from '@webview/transport/debugCapture';
 import { bridge, BridgeMessageType } from '@webview/transport';
-import { computed, ref, watchEffect } from 'vue';
+import { computed, getCurrentScope, onScopeDispose, ref, watchEffect } from 'vue';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
@@ -13,6 +13,7 @@ import {
   type ReliableInterruptPhase
 } from '@shared/reliableControlLifecycle';
 import { toStructuredClonePlainData } from '@shared/plainData';
+import { RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE } from '@shared/reliableKernelClientFeed';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import { mergeSteeringReceipts, steeringReceiptsByConversationState } from '@webview/composables/steeringReceipts';
 import {
@@ -27,7 +28,8 @@ import {
   restoreForkRequests,
   type ForkReadyNotice,
   type ForkRequestRecords,
-  type ForkRequestState
+  type ForkRequestState,
+  type UnconfirmedCommandContext
 } from '@webview/composables/forkRequestLifecycle';
 import {
   createMessageId,
@@ -54,6 +56,13 @@ const WITHDRAWN_TURN_INPUT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const WITHDRAWAL_RECEIPT_REPLAY_MS = 30_000;
 const INTERRUPT_WATCHDOG_MS = 8_000;
 const INTERRUPT_MAX_AUTOMATIC_RETRIES = 2;
+const GUIDANCE_CONTROL_ACK_DEADLINE_MS = 10_000;
+const GUIDANCE_CONTROL_RESYNC_DEADLINE_MS = 10_000;
+const guidanceControlTimers = new Map<string, number>();
+const GUIDANCE_CONTROL_UNCONFIRMED_MESSAGE = '等待消息操作的结果仍未确认，已解除本地锁定。请核对当前队列后再决定是否操作；不会自动重发。';
+const STEERING_ACK_DEADLINE_MS = 10_000;
+const STEERING_STATUS_DEADLINE_MS = 10_000;
+const steeringSubmissionTimers = new Map<string, number>();
 const turnInputRetryTimers = new Map<string, number>();
 const withdrawalReceiptReplayTimers = new Map<string, number>();
 const interruptWatchdogTimers = new Map<string, number>();
@@ -73,7 +82,7 @@ interface InterruptState {
 }
 
 type ConversationActionKind = 'edit' | 'retry' | 'delete' | 'compress';
-type ConversationActionPhase = 'waiting_for_idle' | 'requesting_stop' | 'stopping' | 'submitting' | 'running';
+type ConversationActionPhase = 'waiting_for_idle' | 'requesting_stop' | 'stopping' | 'submitting' | 'running' | 'unconfirmed';
 type ConversationActionPayload =
   | { type: BridgeMessageType.MessageEdit; payload: MessageEditPayload }
   | { type: BridgeMessageType.MessageRetryFrom; payload: MessageRetryFromPayload }
@@ -105,6 +114,69 @@ interface ConversationActionState {
   submittedAtCommitSeq?: string;
   blockedAtCommitSeq?: string;
   operationTurnId?: string;
+  requestContext?: UnconfirmedCommandContext;
+}
+
+const HISTORY_COMMAND_UNCONFIRMED_MESSAGE = '操作结果仍未确认，已解除本地等待。请先核对当前历史，再决定是否点击原操作重试；不会自动重发。';
+const HISTORY_COMMAND_CONTEXT_CHANGED_MESSAGE = '原操作结果仍未确认，但连接或对话已变化，未重发旧命令。请先核对原对话的历史。';
+const historyCommandWaits = new Map<string, {
+  timer: number;
+  contextMatches(): boolean;
+  expire(): void;
+}>();
+const historyActionNoticeOwners = new Map<string, string>();
+
+function clearHistoryCommandWait(commandId: string): void {
+  const wait = historyCommandWaits.get(commandId);
+  if (wait) window.clearTimeout(wait.timer);
+  historyCommandWaits.delete(commandId);
+}
+
+/** One bounded read-only refresh, then uncertainty. Never replay a history mutation on a timer. */
+function armHistoryCommandWait(commandId: string, input: {
+  current(): boolean;
+  contextMatches(): boolean;
+  refresh(): void;
+  expire(): void;
+}): void {
+  clearHistoryCommandWait(commandId);
+  const expire = (): void => {
+    clearHistoryCommandWait(commandId);
+    if (input.current()) input.expire();
+  };
+  const wait = { timer: 0, contextMatches: input.contextMatches, expire };
+  historyCommandWaits.set(commandId, wait);
+  wait.timer = window.setTimeout(() => {
+    if (!input.current()) { clearHistoryCommandWait(commandId); return; }
+    if (!input.contextMatches()) { expire(); return; }
+    wait.timer = window.setTimeout(expire, GUIDANCE_CONTROL_RESYNC_DEADLINE_MS);
+    try { input.refresh(); } catch { /* A failed read proves nothing; the second deadline releases the wait. */ }
+  }, GUIDANCE_CONTROL_ACK_DEADLINE_MS);
+}
+
+function retireHistoryCommandWaits(changedContextOnly = false): void {
+  for (const wait of [...historyCommandWaits.values()]) {
+    if (!changedContextOnly || !wait.contextMatches()) wait.expire();
+  }
+}
+
+function currentHistoryCommandContext(): UnconfirmedCommandContext {
+  const feed = useReliableConversation().feed;
+  return { sessionId: feed.sessionId, hostBootId: feed.hostBootId, clientId: bridge.currentClientId() };
+}
+
+function historyCommandContextMatches(context: UnconfirmedCommandContext | undefined): boolean {
+  if (!context) return false;
+  const current = currentHistoryCommandContext();
+  return context.sessionId === current.sessionId && context.hostBootId === current.hostBootId
+    && context.clientId === current.clientId;
+}
+
+/** A navigation changes the Feed session but cannot change an exact already-committed result. */
+function historyCommandHostMatches(context: UnconfirmedCommandContext | undefined): boolean {
+  if (!context) return false;
+  const current = currentHistoryCommandContext();
+  return context.hostBootId === current.hostBootId && context.clientId === current.clientId;
 }
 
 export interface PendingTurnInputSubmission {
@@ -155,6 +227,9 @@ export interface PendingGuidanceControl {
 }
 
 interface GuidanceControlFailure {
+  commandId: string;
+  requestId: string;
+  action: GuidanceControlResultPayload['action'];
   conversationId: string;
   message: string;
   failedAt: number;
@@ -176,12 +251,25 @@ const actionNotices = ref<Record<string, string>>({});
 const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>(restored.pendingTurnInputs);
 const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>(restored.failedTurnInputs);
 const turnInputAcknowledgements = ref<Record<string, TurnInputAcknowledgement>>({});
+/** Local withdrawal retires a Composer wait; it is not evidence of submission or cancellation. */
+const turnInputWithdrawals = ref<Record<string, { conversationId: string }>>({});
 const pendingGuidanceControls = ref<Record<string, PendingGuidanceControl>>({});
 const guidanceControlFailures = ref<Record<string, GuidanceControlFailure>>({});
+const guidanceEditAcknowledgements = ref<Record<string, { conversationId: string }>>({});
+
+function acknowledgeGuidanceEdit(control: Pick<PendingGuidanceControl, 'commandId' | 'conversationId' | 'action'>): void {
+  if (control.action !== 'edit') return;
+  guidanceEditAcknowledgements.value = {
+    ...guidanceEditAcknowledgements.value,
+    [control.commandId]: { conversationId: control.conversationId }
+  };
+}
 
 interface SteeringSubmissionState {
   commandId: string;
   conversationId: string;
+  turnId: string;
+  sessionId?: string;
   submittedAt: number;
 }
 
@@ -196,7 +284,7 @@ interface SteeringFailureNotice {
   at: number;
 }
 
-/** 转向提交只以 TurnSteerResult 回执为准；本地仅跟踪「正在提交」以便禁用重复提交。 */
+/** 本地仅跟踪提交等待；超时读取持久回执，绝不重发介入消息或推断它已生效。 */
 const steeringSubmissions = ref<Record<string, SteeringSubmissionState>>({});
 const steeringSubmissionResults = ref<Record<string, SteeringSubmissionResult>>({});
 const steeringReceiptsByConversation = steeringReceiptsByConversationState();
@@ -207,8 +295,9 @@ function isPlausibleSteeringReceipt(value: unknown): value is NativeSteeringRece
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Partial<NativeSteeringReceipt>;
   return typeof record.submissionId === 'string' && !!record.submissionId
-    && typeof record.turnId === 'string'
-    && typeof record.state === 'string'
+    && typeof record.conversationId === 'string' && !!record.conversationId
+    && typeof record.turnId === 'string' && !!record.turnId
+    && ['queued', 'sent', 'accepted', 'waiting_for_input', 'continuing', 'completed', 'failed', 'delivery_unknown'].includes(record.state ?? '')
     && typeof record.updatedAt === 'number'
     && Number.isFinite(record.updatedAt);
 }
@@ -259,19 +348,24 @@ bridge.on(BridgeMessageType.GuidanceControlResult, (message) => {
   const payload = message.payload;
   if (!payload) return;
   const pending = pendingGuidanceControls.value[payload.commandId];
-  if (
-    !pending
-    || pending.requestId !== message.correlationId
-    || pending.conversationId !== payload.conversationId
-    || pending.action !== payload.action
-  ) return;
-  const next = { ...pendingGuidanceControls.value };
-  delete next[payload.commandId];
-  pendingGuidanceControls.value = next;
+  const failure = guidanceControlFailures.value[payload.conversationId];
+  // A late exact reply may settle an uncertainty notice. It cannot clear a newer control/notice.
+  const target = pending ?? (failure?.commandId === payload.commandId ? failure : undefined);
+  if (!target || target.requestId !== message.correlationId
+    || target.conversationId !== payload.conversationId || target.action !== payload.action) return;
+  clearGuidanceControlTimer(payload.commandId);
+  if (pending) {
+    const next = { ...pendingGuidanceControls.value };
+    delete next[payload.commandId];
+    pendingGuidanceControls.value = next;
+  }
   if (payload.status === 'rejected') {
     guidanceControlFailures.value = {
       ...guidanceControlFailures.value,
       [payload.conversationId]: {
+        commandId: payload.commandId,
+        requestId: target.requestId,
+        action: target.action,
         conversationId: payload.conversationId,
         message: payload.message || '引导消息操作失败，请刷新后重试。',
         failedAt: Date.now()
@@ -279,7 +373,8 @@ bridge.on(BridgeMessageType.GuidanceControlResult, (message) => {
     };
     return;
   }
-  if (guidanceControlFailures.value[payload.conversationId]) {
+  acknowledgeGuidanceEdit(target);
+  if (failure?.commandId === payload.commandId) {
     const failures = { ...guidanceControlFailures.value };
     delete failures[payload.conversationId];
     guidanceControlFailures.value = failures;
@@ -333,10 +428,101 @@ bridge.on(BridgeMessageType.TurnInterruptResult, (message) => {
   clearActionNotice(payload.conversationId);
 });
 
+const STEERING_UNCONFIRMED_MESSAGE = '介入消息的提交结果仍未确认，请先核对历史与回执再决定是否重试；不会自动重发。';
+
+function settleSteeringSubmission(submission: SteeringSubmissionState, ok: boolean, message?: string): void {
+  const current = steeringSubmissions.value[submission.commandId];
+  if (!current || current.conversationId !== submission.conversationId || current.turnId !== submission.turnId) return;
+  const timer = steeringSubmissionTimers.get(submission.commandId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  steeringSubmissionTimers.delete(submission.commandId);
+  const next = { ...steeringSubmissions.value };
+  delete next[submission.commandId];
+  steeringSubmissions.value = next;
+  steeringSubmissionResults.value = {
+    ...steeringSubmissionResults.value,
+    [submission.commandId]: { conversationId: submission.conversationId, ok }
+  };
+  if (message) {
+    steeringFailures.value = {
+      ...steeringFailures.value,
+      [submission.conversationId]: { commandId: submission.commandId, message, at: Date.now() }
+    };
+  }
+}
+
+function settleSteeringFromReceipt(submission: SteeringSubmissionState, receipt: NativeSteeringReceipt | undefined): boolean {
+  if (!receipt || receipt.submissionId !== submission.commandId
+    || receipt.conversationId !== submission.conversationId || receipt.turnId !== submission.turnId) return false;
+  const failed = receipt.state === 'failed' || receipt.state === 'delivery_unknown';
+  settleSteeringSubmission(submission, !failed, failed
+    ? receipt.message || (receipt.state === 'failed' ? '介入消息提交失败。' : STEERING_UNCONFIRMED_MESSAGE)
+    : undefined);
+  return true;
+}
+
+function armSteeringSubmissionDeadline(submission: SteeringSubmissionState): void {
+  if (!steeringSubmissions.value[submission.commandId]) return;
+  steeringSubmissionTimers.set(submission.commandId, window.setTimeout(() => {
+    steeringSubmissionTimers.delete(submission.commandId);
+    if (!steeringSubmissions.value[submission.commandId]) return;
+    // Only read local durable status. Reusing the submit command as a status identity would let
+    // an empty status response masquerade as acknowledgement of the original submission.
+    const command = nextReliableCommandMetadata();
+    steeringSubmissionTimers.set(submission.commandId, window.setTimeout(() => {
+      settleSteeringSubmission(submission, false, STEERING_UNCONFIRMED_MESSAGE);
+    }, STEERING_STATUS_DEADLINE_MS));
+    try {
+      bridge.request(BridgeMessageType.TurnSteer, {
+        action: 'status', conversationId: submission.conversationId, command
+      }, { requestId: command.commandId });
+    } catch {
+      // A failed read proves nothing about the submit. The second deadline releases the UI.
+    }
+  }, STEERING_ACK_DEADLINE_MS));
+}
+
+/** Retiring a view/Host ends local waits without cancelling or repeating a possibly saved command. */
+export function resetPendingSteeringSubmissions(): void {
+  for (const submission of Object.values(steeringSubmissions.value)) {
+    settleSteeringSubmission(submission, false, STEERING_UNCONFIRMED_MESSAGE);
+  }
+  steeringStatusRequested.clear();
+}
+
+let chatControlClientId = bridge.currentClientId();
+let chatControlConsumerCount = 0;
+bridge.on(BridgeMessageType.Hello, (message) => {
+  if (chatControlClientId && message.clientId && chatControlClientId !== message.clientId) {
+    resetPendingSteeringSubmissions();
+    resetPendingGuidanceControls();
+    retireHistoryCommandWaits();
+  }
+  if (message.clientId) chatControlClientId = message.clientId;
+});
+
 bridge.on(BridgeMessageType.TurnSteerResult, (message) => {
   const payload = message.payload;
   if (!payload || typeof payload.conversationId !== 'string' || !payload.conversationId) return;
   const conversationId = payload.conversationId;
+  const receipts = Array.isArray(payload.receipts)
+    ? payload.receipts.filter(isPlausibleSteeringReceipt).filter((receipt) => {
+      const pending = steeringSubmissions.value[receipt.submissionId];
+      return !pending || (pending.conversationId === receipt.conversationId && pending.turnId === receipt.turnId);
+    })
+    : [];
+  mergeSteeringReceipts(conversationId, receipts);
+  // Live receipts may precede the direct ACK, or arrive in a status response whose command id
+  // names the read. Only the exact durable submission/Conversation/Turn can confirm this send.
+  for (const submission of Object.values(steeringSubmissions.value)) {
+    if (submission.conversationId !== conversationId) continue;
+    const receipt = steeringReceiptsByConversation.value[conversationId]?.[submission.commandId];
+    if (settleSteeringFromReceipt(submission, receipt)) continue;
+    if (payload.error && payload.commandId === submission.commandId
+      && (!message.correlationId || message.correlationId === submission.commandId)) {
+      settleSteeringSubmission(submission, false, payload.error);
+    }
+  }
   if (payload.error) {
     steeringFailures.value = {
       ...steeringFailures.value,
@@ -347,20 +533,6 @@ bridge.on(BridgeMessageType.TurnSteerResult, (message) => {
       }
     };
   }
-  if (payload.commandId && steeringSubmissions.value[payload.commandId]) {
-    const nextSubmissions = { ...steeringSubmissions.value };
-    delete nextSubmissions[payload.commandId];
-    steeringSubmissions.value = nextSubmissions;
-    steeringSubmissionResults.value = {
-      ...steeringSubmissionResults.value,
-      [payload.commandId]: { conversationId, ok: !payload.error }
-    };
-  }
-  const receipts = Array.isArray(payload.receipts)
-    ? payload.receipts.filter(isPlausibleSteeringReceipt)
-    : [];
-  if (receipts.length === 0) return;
-  mergeSteeringReceipts(conversationId, receipts);
 });
 
 bridge.on(BridgeMessageType.ConversationActionResult, (message) => {
@@ -372,7 +544,9 @@ bridge.on(BridgeMessageType.ConversationActionResult, (message) => {
     || action.actionId !== payload.commandId
     || action.action !== payload.action
     || action.targetId !== retryTargetId(payload.target)
+    || (action.phase === 'unconfirmed' && !historyCommandHostMatches(action.requestContext))
   ) return;
+  clearHistoryCommandWait(action.actionId);
   if (payload.status === 'busy') {
     setConversationAction({
       ...action,
@@ -442,6 +616,7 @@ bridge.on(BridgeMessageType.ConversationForkResult, (message) => {
   if (!payload) return;
   const request = forkRequests.value[payload.commandId];
   if (!forkResultResolves(request, payload)) return;
+  if (request.failure && request.requestContext && !historyCommandHostMatches(request.requestContext)) return;
   // Navigation is a separate shell command, sent only after the exact durable fork result, and
   // only as the answer to a click in this session while the user still looks at the source.
   const navigation = forkResultNavigation(request, payload, {
@@ -450,6 +625,7 @@ bridge.on(BridgeMessageType.ConversationForkResult, (message) => {
   });
   forkClicksThisSession.delete(request.actionId);
   clearForkRequest(payload.commandId);
+  clearHistoryActionNotice(request.sourceConversationId, request.actionId);
   if (navigation.kind === 'open') {
     bridge.request(BridgeMessageType.ConversationOpen, { conversationId: payload.conversationId });
     return;
@@ -760,16 +936,30 @@ function submitWithdrawnGuidanceCancel(
 function reconcileGuidanceControls(
   records: Record<string, Record<string, Record<string, unknown>>>
 ): void {
-  const durableCommandIds = new Set(Object.values(records.ConversationCommandReceipt ?? {})
-    .flatMap((receipt) => typeof receipt.command_id === 'string' ? [receipt.command_id] : []));
+  const receiptConversations = new Map(Object.values(records.ConversationCommandReceipt ?? {}).flatMap((receipt) =>
+    typeof receipt.command_id === 'string' && typeof receipt.conversation_id === 'string'
+      ? [[receipt.command_id, receipt.conversation_id] as const] : []));
+  const committed = (control: { commandId: string; conversationId: string }): boolean =>
+    receiptConversations.get(control.commandId) === control.conversationId;
   const next = { ...pendingGuidanceControls.value };
   let changed = false;
   for (const control of Object.values(next)) {
-    if (!durableCommandIds.has(control.commandId)) continue;
+    if (!committed(control)) continue;
+    clearGuidanceControlTimer(control.commandId);
+    acknowledgeGuidanceEdit(control);
     delete next[control.commandId];
     changed = true;
   }
   if (changed) pendingGuidanceControls.value = next;
+  const failures = { ...guidanceControlFailures.value };
+  let failureChanged = false;
+  for (const failure of Object.values(failures)) {
+    if (!committed(failure)) continue;
+    acknowledgeGuidanceEdit(failure);
+    delete failures[failure.conversationId];
+    failureChanged = true;
+  }
+  if (failureChanged) guidanceControlFailures.value = failures;
 }
 
 function turnInputDurableObservation(
@@ -925,6 +1115,9 @@ function setInterruptState(next: InterruptState | undefined): void {
 
 function setConversationAction(action: ConversationActionState): void {
   const previous = conversationActionStates.value[action.conversationId];
+  if (previous && (previous.actionId !== action.actionId || action.phase !== 'submitting')) {
+    clearHistoryCommandWait(previous.actionId);
+  }
   if (
     previous?.interrupt
     && (
@@ -943,6 +1136,7 @@ function setConversationAction(action: ConversationActionState): void {
 function clearConversationAction(conversationId: string): void {
   const current = conversationActionStates.value[conversationId];
   if (!current) return;
+  clearHistoryCommandWait(current.actionId);
   if (current.interrupt) clearInterruptWatchdog('action', conversationId, current.interrupt.turnId);
   const next = { ...conversationActionStates.value };
   delete next[conversationId];
@@ -955,11 +1149,15 @@ function setForkRequest(request: ForkRequestState): void {
 }
 
 function replaceForkRequests(requests: ForkRequestRecords): void {
+  for (const request of Object.values(forkRequests.value)) {
+    if (requests[request.actionId]?.requestId !== request.requestId) clearHistoryCommandWait(request.actionId);
+  }
   forkRequests.value = requests;
   persistControls();
 }
 
 function clearForkRequest(actionId: string): void {
+  clearHistoryCommandWait(actionId);
   if (!forkRequests.value[actionId]) return;
   const next = { ...forkRequests.value };
   delete next[actionId];
@@ -967,15 +1165,22 @@ function clearForkRequest(actionId: string): void {
   persistControls();
 }
 
-function setActionNotice(conversationId: string, notice: string): void {
+function setActionNotice(conversationId: string, notice: string, commandId?: string): void {
+  if (commandId) historyActionNoticeOwners.set(conversationId, commandId);
+  else historyActionNoticeOwners.delete(conversationId);
   actionNotices.value = { ...actionNotices.value, [conversationId]: notice };
 }
 
 function clearActionNotice(conversationId: string): void {
+  historyActionNoticeOwners.delete(conversationId);
   if (!actionNotices.value[conversationId]) return;
   const next = { ...actionNotices.value };
   delete next[conversationId];
   actionNotices.value = next;
+}
+
+function clearHistoryActionNotice(conversationId: string, commandId: string): void {
+  if (historyActionNoticeOwners.get(conversationId) === commandId) clearActionNotice(conversationId);
 }
 
 function interruptWatchdogKey(
@@ -1129,14 +1334,38 @@ function armActionInterruptWatchdog(action: ConversationActionState): void {
 
 function requestInterruptResync(conversationId: string): void {
   try {
-    bridge.request(BridgeMessageType.ClientResync, { conversationId });
+    requestHistorySnapshot(conversationId, useReliableConversation().feed.sessionId);
   } catch {
     // The fixed-id interrupt replay remains the recovery authority even if this best-effort resync
     // cannot be posted during a transport handoff.
   }
 }
 
+function requestHistorySnapshot(conversationId: string, sessionId: string | null): void {
+  const conversation = useReliableConversation();
+  if (!sessionId || conversation.conversationId.value !== conversationId
+    || conversation.feed.sessionId !== sessionId) return;
+  // ClientResync creates a new session and invokes other controls' reconnect replayers. This
+  // existing same-session snapshot request refreshes only committed facts, without that side effect.
+  bridge.postRaw({ type: RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE, sessionId });
+}
+
+function clearGuidanceControlTimer(commandId: string): void {
+  const timer = guidanceControlTimers.get(commandId);
+  if (timer !== undefined) window.clearTimeout(timer);
+  guidanceControlTimers.delete(commandId);
+}
+
+function resetPendingGuidanceControls(): void {
+  for (const control of Object.values(pendingGuidanceControls.value)) {
+    failGuidanceControl(control.commandId, control.conversationId, new Error(GUIDANCE_CONTROL_UNCONFIRMED_MESSAGE));
+  }
+}
+
 function beginGuidanceControl(control: PendingGuidanceControl): void {
+  const conversation = useReliableConversation();
+  const sessionId = conversation.feed.sessionId;
+  clearGuidanceControlTimer(control.commandId);
   pendingGuidanceControls.value = {
     ...pendingGuidanceControls.value,
     [control.commandId]: control
@@ -1146,15 +1375,36 @@ function beginGuidanceControl(control: PendingGuidanceControl): void {
     delete failures[control.conversationId];
     guidanceControlFailures.value = failures;
   }
+  // A lost control reply must not lock queue editing forever. Refresh committed queue/receipt
+  // facts once, then release only the local wait; neither deadline repeats the mutation.
+  guidanceControlTimers.set(control.commandId, window.setTimeout(() => {
+    guidanceControlTimers.delete(control.commandId);
+    if (!pendingGuidanceControls.value[control.commandId]) return;
+    guidanceControlTimers.set(control.commandId, window.setTimeout(() => {
+      failGuidanceControl(control.commandId, control.conversationId, new Error(GUIDANCE_CONTROL_UNCONFIRMED_MESSAGE));
+    }, GUIDANCE_CONTROL_RESYNC_DEADLINE_MS));
+    try {
+      if (conversation.conversationId.value !== control.conversationId) return;
+      requestHistorySnapshot(control.conversationId, sessionId);
+    } catch {
+      // No readable receipt is not a rejection. The second deadline states the uncertainty.
+    }
+  }, GUIDANCE_CONTROL_ACK_DEADLINE_MS));
 }
 
 function failGuidanceControl(commandId: string, conversationId: string, error: unknown): void {
+  const control = pendingGuidanceControls.value[commandId];
+  if (!control || control.conversationId !== conversationId) return;
+  clearGuidanceControlTimer(commandId);
   const pending = { ...pendingGuidanceControls.value };
   delete pending[commandId];
   pendingGuidanceControls.value = pending;
   guidanceControlFailures.value = {
     ...guidanceControlFailures.value,
     [conversationId]: {
+      commandId,
+      requestId: control.requestId,
+      action: control.action,
       conversationId,
       message: error instanceof Error ? error.message : '引导消息操作失败，请重试。',
       failedAt: Date.now()
@@ -1174,6 +1424,17 @@ function nextReliableCommandMetadata(): ConversationCommandMetadata {
 
 /** Conversation commands are admitted only through the reliable Turn/Message control planes. */
 export function useChat() {
+  if (getCurrentScope()) {
+    chatControlConsumerCount += 1;
+    onScopeDispose(() => {
+      chatControlConsumerCount -= 1;
+      if (chatControlConsumerCount === 0) {
+        resetPendingSteeringSubmissions();
+        resetPendingGuidanceControls();
+        retireHistoryCommandWaits();
+      }
+    });
+  }
   const reliableConversation = useReliableConversation();
   const clientState = useClientStateStore();
   const globalSettings = useGlobalSettingsStore();
@@ -1194,7 +1455,8 @@ export function useChat() {
     currentActionInterrupt.value?.phase ?? currentStandaloneInterrupt.value?.phase
   );
   const interruptPending = computed(() => currentInterruptPhase.value !== undefined);
-  const conversationActionPending = computed(() => Boolean(currentConversationAction.value));
+  const conversationActionPending = computed(() => Boolean(currentConversationAction.value
+    && currentConversationAction.value.phase !== 'unconfirmed'));
   const conversationActionLabel = computed(() => currentConversationAction.value?.label);
   const compressionPending = computed(() => currentConversationAction.value?.action === 'compress');
   const conversationActionNotice = computed(() => actionNotices.value[reliableConversation.conversationId.value]);
@@ -1206,10 +1468,10 @@ export function useChat() {
   const reliableRecords = computed(() =>
     reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
   );
-  /** Texts of every Turn input not yet withdrawn: a reload sends them again, so no draft repeats them. */
-  const inFlightTurnInputTexts = computed(() => Object.values(pendingTurnInputSubmissions.value)
+  /** Exact non-withdrawn input identities: persistence can recognize their unchanged submitted drafts. */
+  const inFlightTurnInputCommands = computed(() => Object.values(pendingTurnInputSubmissions.value)
     .filter((submission) => !submission.withdrawnAt)
-    .map((submission) => submission.text));
+    .map((submission) => ({ commandId: submission.commandId, conversationId: submission.conversationId })));
   const currentPendingTurnInputs = computed(() => Object.values(pendingTurnInputSubmissions.value)
     .filter((submission) =>
       submission.conversationId === reliableConversation.conversationId.value
@@ -1258,6 +1520,14 @@ export function useChat() {
   const forkPendingTargetIds = computed(() =>
     pendingForkMessageIds(forkRequests.value, reliableConversation.conversationId.value));
 
+  // A changed connection/navigation retires these waits before the existing reconnect replayers.
+  watchEffect(() => {
+    void reliableConversation.feed.sessionId;
+    void reliableConversation.feed.hostBootId;
+    void reliableConversation.conversationId.value;
+    retireHistoryCommandWaits(true);
+  }, { flush: 'sync' });
+
   watchEffect(() => {
     const sessionId = reliableConversation.feed.sessionId;
     const clientId = bridge.currentClientId();
@@ -1275,6 +1545,24 @@ export function useChat() {
     reconcileConversationAction();
     replayForkRequestsForSession(sessionId);
   });
+
+  // A navigation away and back in one event still retires the old local wait.
+  watchEffect(() => {
+    const sessionId = reliableConversation.feed.sessionId;
+    const records = reliableRecords.value;
+    for (const submission of Object.values(steeringSubmissions.value)) {
+      const receipt = steeringReceiptsByConversation.value[submission.conversationId]?.[submission.commandId];
+      if (settleSteeringFromReceipt(submission, receipt)) continue;
+      const turn = records.Turn?.[submission.turnId];
+      const terminated = turn?.conversation_id === submission.conversationId && turn.status === 'terminated'
+        || Object.values(records.TurnTermination ?? {}).some((termination) => termination.turn_id === submission.turnId);
+      if (terminated || reliableConversation.feed.removedConversationIds.includes(submission.conversationId)
+        || submission.conversationId !== reliableConversation.conversationId.value
+        || (submission.sessionId && submission.sessionId !== sessionId)) {
+        settleSteeringSubmission(submission, false, STEERING_UNCONFIRMED_MESSAGE);
+      }
+    }
+  }, { flush: 'sync' });
 
   function activeConversationId(): string {
     return reliableConversation.conversationId.value;
@@ -1386,6 +1674,11 @@ export function useChat() {
     };
     clearActionNotice(pending.conversationId);
     persistControls();
+    // Retain this one-shot handoff even if a reply removes the pending record before Vue flushes.
+    turnInputWithdrawals.value = {
+      ...turnInputWithdrawals.value,
+      [commandId]: { conversationId: pending.conversationId }
+    };
     reconcileTurnInputSubmissions(reliableRecords.value);
     return true;
   }
@@ -1512,6 +1805,14 @@ export function useChat() {
   ): boolean {
     const revisionId = expectedRevisionId.trim();
     if (!sourceConversationId || !messageId || !revisionId) return false;
+    const uncertain = Object.values(forkRequests.value).find((request) => request.failure
+      && request.sourceConversationId === sourceConversationId && request.messageId === messageId);
+    if (uncertain?.requestContext && (!historyCommandContextMatches(uncertain.requestContext)
+      || sourceConversationId !== reliableConversation.conversationId.value
+      || uncertain.payload.expectedRevisionId !== revisionId)) {
+      setActionNotice(sourceConversationId, HISTORY_COMMAND_CONTEXT_CHANGED_MESSAGE);
+      return false;
+    }
     const decision = decideForkClick(
       forkRequests.value,
       { sourceConversationId, messageId, expectedRevisionId: revisionId },
@@ -1592,6 +1893,11 @@ export function useChat() {
   function requestConversationAction(next: ConversationActionState): boolean {
     const existing = conversationActionStates.value[next.conversationId];
     if (existing) {
+      if (existing.phase === 'unconfirmed' && (!historyCommandContextMatches(existing.requestContext)
+        || next.conversationId !== reliableConversation.conversationId.value)) {
+        setActionNotice(next.conversationId, HISTORY_COMMAND_CONTEXT_CHANGED_MESSAGE);
+        return false;
+      }
       if (!sameConversationActionSemantics(existing, next)) {
         setActionNotice(
           next.conversationId,
@@ -1613,6 +1919,27 @@ export function useChat() {
     const conversationId = reliableConversation.conversationId.value;
     let action = conversationActionStates.value[conversationId];
     if (!action) return;
+
+    // An exact receipt remains authoritative after same-Host navigation, just like a late direct
+    // reply. It does not identify the new Turn: retire only this immutable retry's local wait.
+    // Mutation replay below still requires the original Feed session and command context.
+    if (action.action === 'retry' && ['submitting', 'unconfirmed'].includes(action.phase)
+      && historyCommandHostMatches(action.requestContext)
+      && action.commandPayload.type === BridgeMessageType.MessageRetryFrom
+      && action.commandPayload.payload.command.commandId === action.actionId
+      && action.commandPayload.payload.conversationId === conversationId
+      && retryTargetId(action.commandPayload.payload.target) === action.targetId
+      && Object.values(reliableConversation.feed.records.ConversationCommandReceipt ?? {}).some((receipt) =>
+        receipt.command_id === action!.actionId && receipt.conversation_id === conversationId)) {
+      clearConversationAction(conversationId);
+      clearHistoryActionNotice(conversationId, action.actionId);
+      return;
+    }
+
+    if (action.phase === 'unconfirmed') {
+      if (force && historyCommandContextMatches(action.requestContext)) submitConversationAction(action);
+      return;
+    }
 
     if (action.phase === 'running') {
       if (
@@ -1713,8 +2040,9 @@ export function useChat() {
   }
 
   function submitConversationAction(action: ConversationActionState): void {
-    const requestId = requestActionPayload(action.commandPayload);
-    setConversationAction({
+    const requestId = createMessageId();
+    const context = currentHistoryCommandContext();
+    const next: ConversationActionState = {
       ...action,
       phase: 'submitting',
       interrupt: undefined,
@@ -1722,22 +2050,46 @@ export function useChat() {
       ...(reliableConversation.feed.sessionId ? { sentSessionId: reliableConversation.feed.sessionId } : {}),
       operationTurnId: undefined,
       submittedAtCommitSeq: reliableConversation.feed.lastCommitSeq ?? undefined,
-      blockedAtCommitSeq: undefined
+      blockedAtCommitSeq: undefined,
+      requestContext: context
+    };
+    setConversationAction(next);
+    const current = (): boolean => {
+      const latest = conversationActionStates.value[action.conversationId];
+      return latest?.actionId === action.actionId && latest.requestId === requestId && latest.phase === 'submitting';
+    };
+    const expire = (): void => {
+      if (!current()) return;
+      setConversationAction({ ...next, phase: 'unconfirmed', requestId: undefined });
+      setActionNotice(action.conversationId, HISTORY_COMMAND_UNCONFIRMED_MESSAGE, action.actionId);
+    };
+    if (action.action === 'retry') armHistoryCommandWait(action.actionId, {
+      current,
+      contextMatches: () => historyCommandContextMatches(context)
+        && reliableConversation.conversationId.value === action.conversationId,
+      refresh: () => requestHistorySnapshot(action.conversationId, context.sessionId),
+      expire
     });
+    try { requestActionPayload(action.commandPayload, requestId); }
+    catch (error) {
+      if (action.action !== 'retry') throw error;
+      clearHistoryCommandWait(action.actionId);
+      expire();
+    }
   }
 
-  function requestActionPayload(command: ConversationActionPayload): string {
+  function requestActionPayload(command: ConversationActionPayload, requestId: string): string {
     switch (command.type) {
       case BridgeMessageType.MessageEdit:
-        return bridge.request(command.type, command.payload);
+        return bridge.request(command.type, command.payload, { requestId });
       case BridgeMessageType.MessageRetryFrom:
-        return bridge.request(command.type, command.payload);
+        return bridge.request(command.type, command.payload, { requestId });
       case BridgeMessageType.MessageDeleteFrom:
-        return bridge.request(command.type, command.payload);
+        return bridge.request(command.type, command.payload, { requestId });
       case BridgeMessageType.CompressionStart:
         return bridge.request(command.type, toStructuredClonePlainData(
           command.payload, 'compression command'
-        ) as unknown as CompressionStartPayload);
+        ) as unknown as CompressionStartPayload, { requestId });
     }
   }
 
@@ -1841,9 +2193,12 @@ export function useChat() {
     const submission: SteeringSubmissionState = {
       commandId: command.commandId,
       conversationId,
+      turnId,
+      sessionId: reliableConversation.feed.sessionId ?? undefined,
       submittedAt: Date.now()
     };
     steeringSubmissions.value = { ...steeringSubmissions.value, [command.commandId]: submission };
+    armSteeringSubmissionDeadline(submission);
     try {
       bridge.request(BridgeMessageType.TurnSteer, {
         action: 'submit',
@@ -1854,21 +2209,8 @@ export function useChat() {
         command
       }, { requestId: command.commandId });
     } catch (error) {
-      const nextSubmissions = { ...steeringSubmissions.value };
-      delete nextSubmissions[command.commandId];
-      steeringSubmissions.value = nextSubmissions;
-      steeringSubmissionResults.value = {
-        ...steeringSubmissionResults.value,
-        [command.commandId]: { conversationId, ok: false }
-      };
-      steeringFailures.value = {
-        ...steeringFailures.value,
-        [conversationId]: {
-          commandId: command.commandId,
-          message: error instanceof Error ? error.message : '转向请求暂时无法投递。',
-          at: Date.now()
-        }
-      };
+      settleSteeringSubmission(submission, false,
+        error instanceof Error ? error.message : '转向请求暂时无法投递。');
       return undefined;
     }
     return { commandId: command.commandId };
@@ -1906,8 +2248,32 @@ export function useChat() {
   }
 
   function sendForkRequest(request: ForkRequestState): void {
-    const requestId = bridge.request(BridgeMessageType.ConversationFork, request.payload);
-    setForkRequest(markForkRequestSent(request, requestId, reliableConversation.feed.sessionId ?? undefined));
+    const requestId = createMessageId();
+    const context = currentHistoryCommandContext();
+    const sent = { ...markForkRequestSent(request, requestId, context.sessionId ?? undefined), requestContext: context };
+    setForkRequest(sent);
+    const current = (): boolean => forkRequests.value[request.actionId]?.requestId === requestId;
+    const expire = (): void => {
+      if (!current()) return;
+      const outcome = applyForkRequestError(forkRequests.value, {
+        correlationId: requestId, message: HISTORY_COMMAND_UNCONFIRMED_MESSAGE
+      }, Date.now(), forkClicksThisSession);
+      if (!outcome) return;
+      if (historyCommandContextMatches(context) || !historyCommandHostMatches(context)) {
+        forkClicksThisSession.delete(request.actionId);
+      }
+      replaceForkRequests(outcome.requests);
+      setActionNotice(request.sourceConversationId, HISTORY_COMMAND_UNCONFIRMED_MESSAGE, request.actionId);
+    };
+    armHistoryCommandWait(request.actionId, {
+      current,
+      contextMatches: () => historyCommandContextMatches(context)
+        && reliableConversation.conversationId.value === request.sourceConversationId,
+      refresh: () => requestHistorySnapshot(request.sourceConversationId, context.sessionId),
+      expire
+    });
+    try { bridge.request(BridgeMessageType.ConversationFork, request.payload, { requestId }); }
+    catch { clearHistoryCommandWait(request.actionId); expire(); }
   }
 
   function replayForkRequestsForSession(sessionId: string): void {
@@ -1916,9 +2282,9 @@ export function useChat() {
     }
   }
 
-  function editGuidance(intentId: string, expectedRevisionSeq: string, text: string): boolean {
+  function editGuidance(intentId: string, expectedRevisionSeq: string, text: string): { commandId: string } | undefined {
     const conversationId = activeConversationId();
-    if (!conversationId || !intentId || !expectedRevisionSeq) return false;
+    if (!conversationId || !intentId || !expectedRevisionSeq) return undefined;
     const command = nextReliableCommandMetadata();
     const requestId = command.commandId;
     beginGuidanceControl({
@@ -1937,10 +2303,10 @@ export function useChat() {
         text,
         command
       }, { requestId });
-      return true;
+      return { commandId: command.commandId };
     } catch (error) {
       failGuidanceControl(command.commandId, conversationId, error);
-      return false;
+      return undefined;
     }
   }
 
@@ -2025,6 +2391,13 @@ export function useChat() {
     }
   }
 
+  function dismissGuidanceEditAcknowledgement(commandId: string): void {
+    if (!guidanceEditAcknowledgements.value[commandId]) return;
+    const next = { ...guidanceEditAcknowledgements.value };
+    delete next[commandId];
+    guidanceEditAcknowledgements.value = next;
+  }
+
   function dismissGuidanceControlFailure(): void {
     const conversationId = activeConversationId();
     if (!guidanceControlFailures.value[conversationId]) return;
@@ -2042,6 +2415,13 @@ export function useChat() {
 
   function dismissTurnInputFailure(commandId: string): void {
     clearTurnInputFailure(commandId);
+  }
+
+  function dismissTurnInputWithdrawal(commandId: string): void {
+    if (!turnInputWithdrawals.value[commandId]) return;
+    const next = { ...turnInputWithdrawals.value };
+    delete next[commandId];
+    turnInputWithdrawals.value = next;
   }
 
   return {
@@ -2064,14 +2444,18 @@ export function useChat() {
     openForkReadyNotice,
     dismissForkReadyNotice,
     currentPendingTurnInputs,
-    inFlightTurnInputTexts,
+    inFlightTurnInputCommands,
     currentTurnInputAcknowledgements,
+    turnInputWithdrawalsById: computed(() => turnInputWithdrawals.value),
     currentTurnInputFailure,
     dismissTurnInputAcknowledgement,
+    dismissTurnInputWithdrawal,
     dismissTurnInputFailure,
     retryTurnInputSubmission,
     withdrawTurnInputSubmission,
     editGuidance,
+    guidanceEditAcknowledgements: computed(() => guidanceEditAcknowledgements.value),
+    dismissGuidanceEditAcknowledgement,
     cancelGuidance,
     setGuidancePaused,
     reorderGuidance,
@@ -2148,6 +2532,7 @@ function validConversationActionRecords(
       || action.phase === 'stopping'
       || action.phase === 'submitting'
       || action.phase === 'running'
+      || action.phase === 'unconfirmed'
     )
     && typeof action.targetId === 'string'
     && typeof action.label === 'string'
@@ -2158,7 +2543,15 @@ function validConversationActionRecords(
     && validOptionalText(action.submittedAtCommitSeq)
     && validOptionalText(action.blockedAtCommitSeq)
     && validOptionalText(action.operationTurnId)
+    && (action.requestContext === undefined || validHistoryCommandContext(action.requestContext))
   ));
+}
+
+function validHistoryCommandContext(value: UnconfirmedCommandContext): boolean {
+  return !!value && typeof value === 'object'
+    && (value.sessionId === null || typeof value.sessionId === 'string')
+    && (value.hostBootId === null || typeof value.hostBootId === 'string')
+    && validOptionalText(value.clientId);
 }
 
 function validConversationActionInterrupt(value: ConversationActionInterrupt): boolean {

@@ -31,6 +31,7 @@ const focusVerificationDelays = [140] as const;
 let lastTextareaPointerDownAt = 0;
 let lastTextareaPointerDownFromBlurredWindow = false;
 let focusRecoveryTimers: number[] = [];
+let focusIntentRevision = 0;
 
 const value = computed({
   get: () => props.modelValue,
@@ -45,10 +46,19 @@ watch(
 
 onMounted(() => {
   document.addEventListener('pointerdown', onDocumentPointerDown, true);
+  document.addEventListener('pointermove', onOutsidePointerMove, true);
+  document.addEventListener('focusin', onDocumentFocusIn, true);
+  document.addEventListener('keydown', onFocusNavigation, true);
+  window.addEventListener('blur', invalidateFocusRestore);
 });
 
 onBeforeUnmount(() => {
   document.removeEventListener('pointerdown', onDocumentPointerDown, true);
+  document.removeEventListener('pointermove', onOutsidePointerMove, true);
+  document.removeEventListener('focusin', onDocumentFocusIn, true);
+  document.removeEventListener('keydown', onFocusNavigation, true);
+  window.removeEventListener('blur', invalidateFocusRestore);
+  invalidateFocusRestore();
   clearFocusRecoveryTimers();
 });
 
@@ -57,10 +67,27 @@ function onDocumentPointerDown(event: PointerEvent): void {
   if (!control) return;
   if (event.target instanceof Node && control.contains(event.target)) return;
 
+  invalidateFocusRestore();
   // 用户在焦点恢复窗口内再次点击输入框外时，说明明确想退出输入模式，必须取消补 focus。
   lastTextareaPointerDownAt = 0;
   lastTextareaPointerDownFromBlurredWindow = false;
   clearFocusRecoveryTimers();
+}
+
+function invalidateFocusRestore(): void { focusIntentRevision += 1; }
+
+function onOutsidePointerMove(event: PointerEvent): void {
+  if (event.target instanceof Node && textarea.value?.contains(event.target)) return;
+  invalidateFocusRestore();
+}
+
+function onDocumentFocusIn(event: FocusEvent): void {
+  if (event.target === textarea.value || event.target === document.body || event.target === document.documentElement) return;
+  invalidateFocusRestore();
+}
+
+function onFocusNavigation(event: KeyboardEvent): void {
+  if (event.key === 'Tab' || event.key === 'Escape' || event.ctrlKey || event.metaKey) invalidateFocusRestore();
 }
 
 function onTextareaPointerDown(): void {
@@ -241,7 +268,24 @@ function focus(): void {
   textarea.value?.focus();
 }
 
-defineExpose({ focus });
+/** A submit may temporarily disable (and blur) this input. Restore only its unchanged focus intent. */
+function captureFocusRestore(): (() => void) | undefined {
+  const control = textarea.value;
+  if (!control || props.disabled || document.activeElement !== control || !document.hasFocus()) return undefined;
+  const revision = ++focusIntentRevision;
+  let consumed = false;
+  return () => {
+    if (consumed) return;
+    consumed = true;
+    if (revision !== focusIntentRevision || textarea.value !== control || !control.isConnected
+      || props.disabled || control.disabled || !document.hasFocus()) return;
+    const active = document.activeElement;
+    if (active && active !== control && active !== document.body && active !== document.documentElement) return;
+    control.focus({ preventScroll: true });
+  };
+}
+
+defineExpose({ focus, captureFocusRestore });
 </script>
 
 <template>

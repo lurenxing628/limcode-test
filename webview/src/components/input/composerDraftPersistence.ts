@@ -10,6 +10,11 @@ const DEFAULT_DEBOUNCE_MS = 250;
 /** An edit whose message never loads again (deleted meanwhile) is given up after this. */
 const EDIT_RESTORE_TIMEOUT_MS = 30_000;
 
+export interface SubmittedComposerDraft {
+  commandId: string;
+  conversationId: string;
+}
+
 type EditSnapshot =
   | {
     kind: 'message'; conversationId: string; messageId: string;
@@ -21,7 +26,7 @@ type EditSnapshot =
 
 export interface PersistedComposerDraft {
   /** The chat draft is not tied to a conversation (the composer keeps it across switches). */
-  chat: { draft: string; attachments: InlineDataPart[] };
+  chat: { draft: string; attachments: InlineDataPart[]; submitted?: SubmittedComposerDraft };
   /** An open edit belongs to its conversation and comes back only there. */
   edit?: EditSnapshot;
   /** Unsent attachments over the limit that could not be kept. */
@@ -53,8 +58,10 @@ export interface ComposerDraftPersistenceOptions {
   conversationId(): string | undefined;
   findMessage(messageId: string): MessageRecord | undefined;
   storage: ComposerDraftStorage;
-  /** Texts of Turn inputs still being sent (they are sent again after a reload): not restored as a draft. */
-  pendingInputTexts?(): readonly string[];
+  /** Exact commands already owned by the reliable input lifecycle; never replayed here. */
+  pendingInputCommands?(): readonly SubmittedComposerDraft[];
+  /** Present only while the chat draft is the unchanged draft of this submission. */
+  submittedChatDraft?(): SubmittedComposerDraft | undefined;
   debounceMs?: number;
   attachmentLimitBytes?: number;
   onAttachmentsOmitted?(count: number): void;
@@ -94,8 +101,12 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
   let inFlight = false;
 
   if (saved) {
-    inFlight = saved.chat.draft.trim() !== ''
-      && (options.pendingInputTexts?.() ?? []).some((text) => text.trim() === saved.chat.draft.trim());
+    const submitted = saved.chat.submitted;
+    // Text equality is not ownership: a newer draft can have identical text but different files,
+    // or be an explicit replacement. Older saved drafts without this marker are kept intact.
+    inFlight = !!submitted
+      && (options.pendingInputCommands?.() ?? []).some((command) =>
+        command.commandId === submitted.commandId && command.conversationId === submitted.conversationId);
     if (!inFlight && ui.composerMode === 'chat' && !ui.chatDraft.trim() && attachments.value.chat.length === 0) {
       if (saved.chat.draft) ui.replaceChatDraft(saved.chat.draft);
       if (saved.chat.attachments.length) attachments.value = { ...attachments.value, chat: clone(saved.chat.attachments) };
@@ -149,6 +160,7 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
     ui.editingMessage?.deleteCount,
     ui.editingTurnIntent?.intentId,
     ui.editingTurnIntent?.rowVersion,
+    options.submittedChatDraft?.(),
     attachments.value
   ], schedule, { deep: true });
   // Already sent before the reload (it is sent again): drop it from the saved draft right away.
@@ -219,7 +231,11 @@ export function useComposerDraftPersistence(options: ComposerDraftPersistenceOpt
       budget -= size;
       return [part];
     });
-    const chat = { draft: ui.chatDraft, attachments: keep(attachments.value.chat) };
+    const submitted = options.submittedChatDraft?.();
+    const chat = {
+      draft: ui.chatDraft, attachments: keep(attachments.value.chat),
+      ...(submitted ? { submitted } : {})
+    };
     const conversationId = options.conversationId();
     let edit: EditSnapshot | undefined;
     if (ui.composerMode === 'edit' && conversationId && ui.editingMessage) {

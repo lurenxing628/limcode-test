@@ -52,6 +52,7 @@ export function useReliableConversation(): SharedReliableConversation {
     details: feed.details,
     transientModelRequests: feed.transientModelRequests,
     lastCommitSeq: feed.lastCommitSeq,
+    lastSnapshotCommitSeq: feed.lastSnapshotCommitSeq,
     steeringReceipts: Object.values(steeringReceiptsByConversationState().value[conversationId.value] ?? {})
   }));
 

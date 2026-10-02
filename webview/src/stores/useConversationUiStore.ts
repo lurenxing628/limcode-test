@@ -70,6 +70,19 @@ export interface ChatDraftPrefillRequest {
   attachments: InlineDataPart[];
 }
 
+/** Unsent queue editor state belongs to a Conversation, independently of the live queue row. */
+export interface QueueEditDraftState {
+  conversationId: string;
+  intentId: string;
+  text: string;
+  hasAttachments: boolean;
+  revision: number;
+  error: string;
+  submission?: { commandId: string; revision: number };
+}
+
+const queueEditDraftKey = (conversationId: string, intentId: string): string => JSON.stringify([conversationId, intentId]);
+
 interface TimelineSyncSnapshot {
   messages: MessageRecord[];
   anchorMessages: MessageRecord[];
@@ -115,6 +128,9 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   const editConfirmOpen = ref(false);
   const pendingEditText = ref('');
   const chatDraftPrefill = shallowRef<ChatDraftPrefillRequest>();
+  const queueEditDrafts = ref<Record<string, QueueEditDraftState>>({});
+  const activeQueueEditIds = ref<Record<string, string>>({});
+  let queueEditRevision = 0;
   let chatDraftPrefillKey = 0;
 
   const seenMessageIds = new Set<string>();
@@ -298,6 +314,41 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     chatDraftPrefill.value = { key: chatDraftPrefillKey, text, attachments };
   }
 
+  /** Recover plain text through the same explicit replacement confirmation as message prefill. */
+  function prefillChatDraftText(text: string): void {
+    if (!text.trim()) return;
+    chatDraftPrefill.value = { key: ++chatDraftPrefillKey, text, attachments: [] };
+  }
+
+  function startQueueEdit(conversationId: string, intentId: string, text: string, hasAttachments: boolean): void {
+    const key = queueEditDraftKey(conversationId, intentId);
+    queueEditDrafts.value[key] ??= { conversationId, intentId, text, hasAttachments, revision: ++queueEditRevision, error: '' };
+    activeQueueEditIds.value[conversationId] = intentId;
+  }
+
+  function queueEditDraft(conversationId: string, intentId?: string): QueueEditDraftState | undefined {
+    const id = intentId ?? activeQueueEditIds.value[conversationId];
+    return id ? queueEditDrafts.value[queueEditDraftKey(conversationId, id)] : undefined;
+  }
+
+  function updateQueueEditText(conversationId: string, intentId: string, text: string): void {
+    const draft = queueEditDraft(conversationId, intentId);
+    if (!draft || draft.text === text) return;
+    draft.text = text;
+    draft.revision = ++queueEditRevision;
+  }
+
+  function invalidateQueueEditScope(conversationId: string): void {
+    for (const draft of Object.values(queueEditDrafts.value)) {
+      if (draft.conversationId === conversationId) draft.revision = ++queueEditRevision;
+    }
+  }
+
+  function discardQueueEdit(conversationId: string, intentId: string): void {
+    delete queueEditDrafts.value[queueEditDraftKey(conversationId, intentId)];
+    if (activeQueueEditIds.value[conversationId] === intentId) delete activeQueueEditIds.value[conversationId];
+  }
+
   function takeChatDraftPrefill(key: number): ChatDraftPrefillRequest | undefined {
     const request = chatDraftPrefill.value;
     if (request?.key !== key) return undefined;
@@ -391,6 +442,13 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
     setComposerDraft,
     clearChatDraft,
     prefillChatDraft,
+    prefillChatDraftText,
+    queueEditDrafts,
+    queueEditDraft,
+    startQueueEdit,
+    updateQueueEditText,
+    invalidateQueueEditScope,
+    discardQueueEdit,
     takeChatDraftPrefill,
     replaceChatDraft
   };

@@ -222,6 +222,7 @@ function composerSubmission() {
   const draft = vue.ref('message');
   vm.runInNewContext(ts.transpileModule(code, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS } }).outputText, {
     module, computed: vue.computed, ref: vue.ref, clientState, props: { disabled: false }, draft,
+    editor: vue.ref(null),
     modelProfileStore: { awaitSavedForScope: (_kind, id) => id === 'a' ? waiting : Promise.resolve() },
     currentSubmissionCommandId: vue.ref(), currentSteeringSubmitting: vue.ref(false), selectedAttachments: vue.ref([]),
     buildMessageContent: text => ({ text }), ui: { isEditing: false }, nativeSteeringAvailable: vue.ref(false),
