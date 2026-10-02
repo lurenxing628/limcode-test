@@ -102,6 +102,14 @@ export interface RepositoryAssertExactIdsStep {
   collaborationBacklog?: true;
 }
 
+/** Atomic capacity guard, evaluated before a new child Turn is inserted in the same transaction. */
+export interface RepositoryAssertCollaborationCapacityStep {
+  kind: 'assertCollaborationCapacity';
+  domain: 'Turn';
+  rootConversationId: string;
+  maximum: number;
+}
+
 export interface RepositoryExpectedUniqueConstraint {
   domain: string;
   columns: string[];
@@ -131,12 +139,20 @@ export type RepositoryTransactionStep =
   | RepositoryAssertAllStep
   | RepositoryAssertNoneStep
   | RepositoryAssertExactIdsStep
+  | RepositoryAssertCollaborationCapacityStep
   | RepositorySavepoint;
 
 export interface RepositoryGetRead {
   kind: 'get';
   domain: string;
   id: string;
+}
+
+/** A scalar count of active child Turns, not a materialized historical team roster. */
+export interface RepositoryCollaborationCapacityRead {
+  kind: 'collaborationCapacity';
+  domain: 'Turn';
+  rootConversationId: string;
 }
 
 export interface RepositoryKeysetCursor { column: string; value: string | bigint; id: string; direction: 'before' | 'after' }
@@ -155,10 +171,14 @@ export interface RepositoryListRead {
    * collaboration messages other than completion replies.
    */
   collaborationBacklog?: true;
+  /** Fixed ancestry membership filter, valid only for a ChildExecution roster page. */
+  collaborationRootConversationId?: string;
+  /** Fixed active top-level peer visibility, valid only for Conversation listings. */
+  collaborationProjectScope?: { callerConversationId: string; projectContextId: string | null };
   limit: number;
 }
 
-export type RepositoryRead = RepositoryGetRead | RepositoryListRead;
+export type RepositoryRead = RepositoryGetRead | RepositoryListRead | RepositoryCollaborationCapacityRead;
 
 export class DomainRowCodec {
   private readonly columnsByName: ReadonlyMap<string, ColumnDefinition>;
@@ -421,6 +441,18 @@ export class DomainRepository {
     };
   }
 
+  public collaborationCapacity(rootConversationId: string): RepositoryCollaborationCapacityRead {
+    if (this.schema.key !== 'Turn') throw new TypeError('Collaboration capacity is only valid for Turn.');
+    requireId(rootConversationId);
+    return { kind: 'collaborationCapacity', domain: 'Turn', rootConversationId };
+  }
+
+  public assertCollaborationCapacity(rootConversationId: string, maximum: number): RepositoryAssertCollaborationCapacityStep {
+    this.collaborationCapacity(rootConversationId);
+    if (!Number.isSafeInteger(maximum) || maximum < 1) throw new RangeError('Collaboration capacity maximum must be a positive safe integer.');
+    return { kind: 'assertCollaborationCapacity', domain: 'Turn', rootConversationId, maximum };
+  }
+
   private requireCollaborationBacklogScope(value: unknown): void {
     if (value === undefined) return;
     if (value !== true || this.schema.key !== 'RuntimeDelivery') throw new TypeError('Collaboration backlog scope is only valid for RuntimeDelivery.');
@@ -466,6 +498,15 @@ export class DomainRepository {
       requireId(options.collaborationConversationId);
     }
     this.requireCollaborationBacklogScope(options.collaborationBacklog);
+    if (options.collaborationRootConversationId !== undefined) {
+      if (this.schema.key !== 'ChildExecution') throw new TypeError('Collaboration roster scope is only valid for ChildExecution.');
+      requireId(options.collaborationRootConversationId);
+    }
+    if (options.collaborationProjectScope !== undefined) {
+      if (this.schema.key !== 'Conversation' || !options.collaborationProjectScope || typeof options.collaborationProjectScope !== 'object') throw new TypeError('Project collaboration scope is only valid for Conversation.');
+      requireId(options.collaborationProjectScope.callerConversationId);
+      if (options.collaborationProjectScope.projectContextId !== null) requireId(options.collaborationProjectScope.projectContextId);
+    }
     return {
       kind: 'list',
       domain: this.schema.key,
@@ -475,6 +516,8 @@ export class DomainRepository {
       ...(options.keyset ? { keyset: { ...options.keyset } } : {}),
       ...(options.collaborationConversationId ? { collaborationConversationId: options.collaborationConversationId } : {}),
       ...(options.collaborationBacklog ? { collaborationBacklog: true as const } : {}),
+      ...(options.collaborationRootConversationId ? { collaborationRootConversationId: options.collaborationRootConversationId } : {}),
+      ...(options.collaborationProjectScope ? { collaborationProjectScope: { ...options.collaborationProjectScope } } : {}),
       limit: options.limit
     };
   }

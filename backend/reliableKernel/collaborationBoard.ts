@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { readCollaborationScope } from './collaborationScope';
+import { readCollaborationIdentity } from './collaborationScope';
 import { DOMAIN_REPOSITORIES, savepoint, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -46,7 +46,7 @@ export type CollaborationBoardArguments = {
   limitChars?: number;
   notifyConversationIds?: string[];
 };
-type BoardScope = Awaited<ReturnType<typeof readCollaborationScope>>;
+type BoardScope = Awaited<ReturnType<typeof readCollaborationIdentity>>;
 type SourceAuthority = { scope: BoardScope; steps: RepositoryTransactionStep[] };
 
 /** Persistent shared discussion. Posts are untrusted peer data, never user authorization. */
@@ -115,8 +115,11 @@ export class CollaborationBoard {
       const threadId = target.threadId ?? postId;
       const explicit = args.notifyConversationIds ?? [];
       if (!Array.isArray(explicit) || explicit.length > 256 || explicit.some(id => typeof id !== 'string')) throw new Error('notifyConversationIds must be at most 256 conversation ids.');
-      const members = new Set(authority.scope.members.map(member => member.conversationId));
-      for (const id of explicit) if (!members.has(id)) throw new Error('Board notification target is outside this task tree.');
+      const isMember = async (id: string) => {
+        if (!await this.rawGet('Conversation', id)) return false;
+        return (await readCollaborationIdentity(this.database, id)).rootConversationId === authority.scope.rootConversationId;
+      };
+      for (const id of explicit) if (!await isMember(id)) throw new Error('Board notification target is outside this task tree.');
       const content = await this.contentStore.prepare(this.database, text, 'text/plain');
       steps.push(...preparedContentObjectSteps([content], 'board_post'),
         repo('Post').insert({ id: postId, content_object_id: content.metadata.id, character_count: BigInt(characterCount), created_at: now }),
@@ -128,10 +131,10 @@ export class CollaborationBoard {
       if (subscribers.length > 256) throw new Error('Board subscriber bound exceeded.');
       const targets = new Set([...explicit, ...subscribers.map(row => String(row.conversation_id))]);
       targets.delete(source.conversationId);
-      notify = [...targets].filter(id => members.has(id)).map(targetConversationId => ({
+      for (const targetConversationId of targets) if (await isMember(targetConversationId)) notify.push({
         postId, threadId, channelId, sourceConversationId: source.conversationId, targetConversationId,
         sourceKind: source.kind, sourceTurnId: source.turnId, sourceToolCallId: source.toolCallId
-      }));
+      });
       result = { postId, threadId, channelId };
     }
     const savedResult = await this.contentStore.prepare(this.database, JSON.stringify(result), 'application/json');
@@ -161,7 +164,7 @@ export class CollaborationBoard {
   private async authorize(source: Source): Promise<SourceAuthority> {
     const conversation = await this.rawGet('Conversation', source.conversationId);
     if (!conversation || conversation.status === 'deleted') throw new Error('Board conversation is unavailable.');
-    const scope = await readCollaborationScope(this.database, source.conversationId);
+    const scope = await readCollaborationIdentity(this.database, source.conversationId);
     const steps = [...scope.authoritySteps, DOMAIN_REPOSITORIES.domain('Conversation').assert(source.conversationId, { status: conversation.status })];
     const turnId = required(source.turnId, 'turnId');
     const toolCallId = required(source.toolCallId, 'toolCallId');

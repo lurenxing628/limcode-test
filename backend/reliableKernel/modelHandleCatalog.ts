@@ -453,6 +453,12 @@ export function resolveModelToolArguments(
   const record = asRecord(args);
   if (!record) return args;
   dropEmptyReferenceArguments(record, modelReferenceKeys(toolName, record));
+  // Optional opaque paging strings, like optional references, may be filled with an empty
+  // string by strict-schema relays. Only declared cursor fields are absent in that case;
+  // nonempty malformed values and all other tools still reach their normal validation.
+  const cursorKeys = toolName === 'list_agents' || toolName === 'list_conversations' ? ['cursor']
+    : toolName === 'read_agent_messages' || toolName === 'read_conversation' ? ['cursor', 'inputCursor'] : [];
+  for (const key of cursorKeys) if (record[key] === null || typeof record[key] === 'string' && record[key].trim() === '') delete record[key];
 
   if (isCollaborationHandleTool(toolName)) {
     resolveCollaborationArguments(toolName, record, catalog);

@@ -1378,6 +1378,14 @@ function executeSteps(
       executeAssertExactIds(database, step.domain, step.where, step.expectedIds, step.collaborationBacklog === true);
       continue;
     }
+    if (step.kind === 'assertCollaborationCapacity') {
+      DOMAIN_REPOSITORIES.domain(step.domain).assertCollaborationCapacity(step.rootConversationId, step.maximum);
+      if (collaborationActiveChildCount(database, step.rootConversationId) >= BigInt(step.maximum)) {
+        throw Object.assign(new Error('TurnRepository transaction collaboration capacity assertion failed.'),
+          { code: 'RUNTIME_TRANSACTION_ASSERTION_FAILED' });
+      }
+      continue;
+    }
     if (step.kind !== 'savepoint') {
       executeMutation(database, step, allocatedSequences);
       continue;
@@ -1559,6 +1567,71 @@ const COLLABORATION_BACKLOG_PREDICATE = 'EXISTS (SELECT 1 FROM runtime_inbox_ite
   + ' JOIN collaboration_message_source_link AS source ON source.message_id = inbox.source_id'
   + ' WHERE inbox.id = runtime_delivery.inbox_item_id AND inbox.source_kind = \'collaboration_message\''
   + ' AND source.source_kind <> \'completion\')';
+
+/**
+ * Starts at active child Turns, so historical team size never determines the read size. UNION
+ * terminates malformed ancestry cycles. Every active lineage must end in exactly one root;
+ * unresolved lineage fails closed, and a known other team's malformed members stay isolated.
+ * This same scalar query is the preparation read and the writer-side admission authority.
+ */
+const COLLABORATION_ACTIVE_CHILD_COUNT_SQL = `
+  WITH RECURSIVE active_children AS (
+    SELECT running.id AS turn_id, running.conversation_id
+    FROM turn AS running JOIN child_execution AS child ON child.child_conversation_id = running.conversation_id
+    WHERE running.status = 'active'
+  ), lineage(turn_id, conversation_id) AS (
+    SELECT turn_id, conversation_id FROM active_children
+    UNION
+    SELECT lineage.turn_id, parent_turn.conversation_id FROM lineage
+    JOIN child_execution AS child ON child.child_conversation_id = lineage.conversation_id
+    JOIN child_execution_parent_link AS parent ON parent.child_execution_id = child.id
+    JOIN turn AS parent_turn ON parent_turn.id = parent.parent_turn_id
+  ), roots AS (
+    SELECT lineage.turn_id, lineage.conversation_id FROM lineage
+    WHERE NOT EXISTS (SELECT 1 FROM child_execution AS child WHERE child.child_conversation_id = lineage.conversation_id)
+  )
+  SELECT
+    (SELECT COUNT(*) FROM roots WHERE conversation_id = @root) AS active_count,
+    (EXISTS (SELECT 1 FROM conversation WHERE id = @root)
+      AND NOT EXISTS (SELECT 1 FROM child_execution WHERE child_conversation_id = @root)) AS root_valid,
+    (SELECT COUNT(*) FROM active_children AS active
+      WHERE (EXISTS (SELECT 1 FROM roots WHERE roots.turn_id = active.turn_id AND roots.conversation_id = @root)
+        OR NOT EXISTS (SELECT 1 FROM roots WHERE roots.turn_id = active.turn_id))
+      AND ((SELECT COUNT(*) FROM roots WHERE roots.turn_id = active.turn_id) <> 1
+        OR (SELECT COUNT(*) FROM active_children AS sibling WHERE sibling.conversation_id = active.conversation_id) <> 1
+        OR EXISTS (
+          SELECT 1 FROM lineage
+          JOIN child_execution AS child ON child.child_conversation_id = lineage.conversation_id
+          LEFT JOIN child_execution_parent_link AS parent ON parent.child_execution_id = child.id
+          LEFT JOIN turn AS parent_turn ON parent_turn.id = parent.parent_turn_id
+          LEFT JOIN child_execution AS parent_child ON parent_child.id = parent.parent_child_execution_id
+          WHERE lineage.turn_id = active.turn_id AND (parent.id IS NULL OR parent_turn.id IS NULL
+            OR (parent.parent_child_execution_id IS NOT NULL
+              AND parent_child.child_conversation_id IS NOT parent_turn.conversation_id))
+        ))) AS invalid_count`;
+
+function collaborationActiveChildCount(database: Database.Database, rootConversationId: string): bigint {
+  const root = requireRuntimeId(rootConversationId);
+  const row = prepareCached(database, COLLABORATION_ACTIVE_CHILD_COUNT_SQL).get({ root }) as {
+    active_count: bigint; root_valid: bigint; invalid_count: bigint;
+  };
+  if (row.root_valid !== 1n || row.invalid_count !== 0n) {
+    throw new Error('Collaboration capacity requires a valid root and complete, acyclic child Turn ancestry.');
+  }
+  return row.active_count;
+}
+
+/** A bounded roster query; each selected member is independently authorized by its ancestry. */
+const COLLABORATION_ROSTER_PREDICATE = `EXISTS (
+  WITH RECURSIVE ancestors(conversation_id) AS (
+    SELECT child_execution.child_conversation_id
+    UNION
+    SELECT parent_turn.conversation_id FROM ancestors
+    JOIN child_execution AS ancestor_child ON ancestor_child.child_conversation_id = ancestors.conversation_id
+    JOIN child_execution_parent_link AS parent ON parent.child_execution_id = ancestor_child.id
+    JOIN turn AS parent_turn ON parent_turn.id = parent.parent_turn_id
+  ) SELECT 1 FROM ancestors WHERE conversation_id = @__collaboration_root
+)`;
 
 function executeAssertExactIds(
   database: Database.Database,
@@ -1913,6 +1986,7 @@ function assertTouchedRuntimeAggregates(
       || step.kind === 'assertAll'
       || step.kind === 'assertNone'
       || step.kind === 'assertExactIds'
+      || step.kind === 'assertCollaborationCapacity'
     ) return;
     if (step.domain === 'ModelRequest') {
       const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;
@@ -2853,6 +2927,10 @@ function executeChildProcessCleanupMaterializationCandidates(
 function executeRead(database: Database.Database, read: RepositoryRead): DomainRow | DomainRow[] | null {
   const repository = DOMAIN_REPOSITORIES.domain(read.domain);
   const schema = repository.schema;
+  if (read.kind === 'collaborationCapacity') {
+    repository.collaborationCapacity(read.rootConversationId);
+    return { active_count: collaborationActiveChildCount(database, read.rootConversationId) };
+  }
   if (read.kind === 'get') {
     const row = prepareCached(database, `SELECT * FROM ${quote(schema.table)} WHERE id = ?`).get(requireRuntimeId(read.id));
     return row ? repository.codec.decode(row as Record<string, unknown>) : null;
@@ -2897,6 +2975,26 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     if (schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
     parameters.__mailbox_conversation = requireRuntimeId(read.collaborationConversationId);
     predicates.push(`(EXISTS (SELECT 1 FROM collaboration_message_source_link AS source WHERE source.message_id = collaboration_message.id AND source.conversation_id = @__mailbox_conversation) OR EXISTS (SELECT 1 FROM collaboration_message_target_link AS target WHERE target.message_id = collaboration_message.id AND target.conversation_id = @__mailbox_conversation))`);
+  }
+  if (read.collaborationRootConversationId !== undefined) {
+    if (schema.key !== 'ChildExecution') throw new TypeError('Collaboration roster scope is only valid for ChildExecution.');
+    parameters.__collaboration_root = requireRuntimeId(read.collaborationRootConversationId);
+    predicates.push(COLLABORATION_ROSTER_PREDICATE);
+  }
+  if (read.collaborationProjectScope !== undefined) {
+    // Revalidate the fixed read contract at the worker boundary as well as at construction.
+    repository.list(read);
+    const scope = read.collaborationProjectScope;
+    parameters.__collaboration_caller = requireRuntimeId(scope.callerConversationId);
+    predicates.push(`conversation.status = 'active'`, 'conversation.id <> @__collaboration_caller',
+      'NOT EXISTS (SELECT 1 FROM child_execution AS child WHERE child.child_conversation_id = conversation.id)');
+    if (scope.projectContextId === null) {
+      predicates.push('NOT EXISTS (SELECT 1 FROM conversation_project_link AS project WHERE project.conversation_id = conversation.id)');
+    } else {
+      parameters.__collaboration_project = requireRuntimeId(scope.projectContextId);
+      // Drive a bound project's candidates from its indexed membership, not all other projects.
+      predicates.push('conversation.id IN (SELECT project.conversation_id FROM conversation_project_link AS project WHERE project.project_context_id = @__collaboration_project)');
+    }
   }
   parameters.__limit = BigInt(read.limit);
   const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction}${orderColumn === 'id' ? '' : `, id ${direction}`} LIMIT @__limit`;

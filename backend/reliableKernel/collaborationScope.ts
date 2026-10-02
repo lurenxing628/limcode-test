@@ -1,5 +1,4 @@
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
-import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
 
@@ -9,10 +8,10 @@ export interface CollaborationMember {
   parentConversationId: string | null;
   status: string;
 }
-export interface CollaborationScope {
+export interface CollaborationIdentity {
   rootConversationId: string;
   rootTurnId: string | null;
-  members: CollaborationMember[];
+  member: CollaborationMember;
   authoritySteps: RepositoryTransactionStep[];
 }
 
@@ -62,68 +61,58 @@ export async function isCrossConversationSend(database: RuntimeDatabase, message
   return children.snapshot.every((rows) => Array.isArray(rows) && rows.length === 0);
 }
 
-/** Derives membership from committed lineage; never accepts caller-supplied team identities. */
-export async function readCollaborationScope(database: RuntimeDatabase, conversationId: string): Promise<CollaborationScope> {
+/**
+ * Resolves one member through immutable creation ancestry. Historical siblings never participate
+ * in authorization or select a new root Turn authority for an existing child.
+ */
+export async function readCollaborationIdentity(database: RuntimeDatabase, conversationId: string): Promise<CollaborationIdentity> {
   const read = async (domain: string, id: string): Promise<DomainRow> => {
     const value = (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0] as DomainRow | null;
     if (!value) throw new Error(`${domain} ${id} does not exist.`);
     return value;
   };
-  const roots = new Map<string, { conversationId: string; turnId: string | null; steps: RepositoryTransactionStep[] }>();
-  const ancestry = async (id: string, seen = new Set<string>()): Promise<{ conversationId: string; turnId: string | null; steps: RepositoryTransactionStep[] }> => {
-    const cached = roots.get(id);
-    if (cached) return cached;
-    if (seen.has(id)) throw new Error('Collaboration lineage is cyclic.');
-    seen.add(id);
-    const children = await listAllDomainRows(database, 'ChildExecution', { child_conversation_id: id });
+  const list = async (domain: string, where: DomainRow): Promise<DomainRow[]> =>
+    (await database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit: 2 })])).snapshot[0] as DomainRow[];
+  const conversation = await read('Conversation', conversationId);
+  const steps: RepositoryTransactionStep[] = [];
+  const seen = new Set<string>();
+  let cursor = conversationId;
+  let rootTurnId: string | null = null;
+  let member: CollaborationMember | undefined;
+  for (;;) {
+    if (seen.has(cursor)) throw new Error('Collaboration lineage is cyclic.');
+    seen.add(cursor);
+    const children = await list('ChildExecution', { child_conversation_id: cursor });
     if (children.length > 1) throw new Error('Conversation has multiple ChildExecutions.');
-    if (!children.length) {
-      await read('Conversation', id);
-      const value = { conversationId: id, turnId: null, steps: [DOMAIN_REPOSITORIES.domain('ChildExecution').assertNone({ child_conversation_id: id })] };
-      roots.set(id, value); return value;
+    if (children.length === 0) {
+      await read('Conversation', cursor);
+      steps.push(DOMAIN_REPOSITORIES.domain('ChildExecution').assertNone({ child_conversation_id: cursor }));
+      member ??= { conversationId, childExecutionId: null, parentConversationId: null, status: String(conversation.status) };
+      break;
     }
     const child = children[0];
-    const links = await listAllDomainRows(database, 'ChildExecutionParentLink', { child_execution_id: child.id });
+    const links = await list('ChildExecutionParentLink', { child_execution_id: child.id });
     if (links.length !== 1 || typeof links[0].parent_turn_id !== 'string') throw new Error('Collaboration requires complete child parent lineage.');
     const link = links[0];
-    const turn = await read('Turn', String(link.parent_turn_id));
-    const parent = await ancestry(String(turn.conversation_id), seen);
+    const parentTurn = await read('Turn', String(link.parent_turn_id));
     if (link.parent_child_execution_id !== null) {
       const parentChild = await read('ChildExecution', String(link.parent_child_execution_id));
-      if (parentChild.child_conversation_id !== turn.conversation_id) throw new Error('Collaboration parent child and Turn identities conflict.');
+      if (parentChild.child_conversation_id !== parentTurn.conversation_id) throw new Error('Collaboration parent child and Turn identities conflict.');
     }
-    const value = {
-      conversationId: parent.conversationId,
-      turnId: parent.turnId ?? String(link.parent_turn_id),
-      steps: [...parent.steps,
-        DOMAIN_REPOSITORIES.domain('ChildExecution').assert(String(child.id), { child_conversation_id: id, status: child.status }),
-        DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(String(link.id), { child_execution_id: child.id, parent_turn_id: link.parent_turn_id, parent_child_execution_id: link.parent_child_execution_id }),
-        DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { conversation_id: turn.conversation_id })]
-    };
-    roots.set(id, value); return value;
-  };
-  const root = await ancestry(conversationId);
-  const rootConversation = await read('Conversation', root.conversationId);
-  const members: CollaborationMember[] = [{ conversationId: root.conversationId, childExecutionId: null, parentConversationId: null, status: String(rootConversation.status) }];
-  // Breadth first queries are bounded by the current team, not the application's global registry.
-  for (let index = 0; index < members.length; index += 1) {
-    const member = members[index];
-    const turns = await listAllDomainRows(database, 'Turn', { conversation_id: member.conversationId });
-    for (const turn of turns) {
-      const links = await listAllDomainRows(database, 'ChildExecutionParentLink', { parent_turn_id: turn.id });
-      for (const link of links) {
-        const child = await read('ChildExecution', String(link.child_execution_id));
-        const childConversationId = String(child.child_conversation_id);
-        if (members.some((entry) => entry.conversationId === childConversationId)) throw new Error('Collaboration lineage contains duplicate membership.');
-        if (members.length >= 256) throw new Error('Collaboration team exceeds the 256-member bound.');
-        const childRoot = await ancestry(childConversationId);
-        if (childRoot.conversationId !== root.conversationId) throw new Error('Collaboration child root identity conflicts.');
-        members.push({ conversationId: childConversationId, childExecutionId: String(child.id), parentConversationId: member.conversationId, status: String(child.status) });
-      }
-    }
+    member ??= { conversationId, childExecutionId: String(child.id), parentConversationId: String(parentTurn.conversation_id), status: String(child.status) };
+    steps.push(DOMAIN_REPOSITORIES.domain('ChildExecution').assert(String(child.id), { child_conversation_id: cursor, status: child.status }),
+      DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').assert(String(link.id), { child_execution_id: child.id, parent_turn_id: link.parent_turn_id, parent_child_execution_id: link.parent_child_execution_id }),
+      DOMAIN_REPOSITORIES.domain('Turn').assert(String(parentTurn.id), { conversation_id: parentTurn.conversation_id }));
+    rootTurnId = String(parentTurn.id);
+    cursor = String(parentTurn.conversation_id);
   }
-  const rootTurns = root.turnId ? [] : await listAllDomainRows(database, 'Turn', { conversation_id: root.conversationId });
-  rootTurns.sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)) || String(b.id).localeCompare(String(a.id)));
-  const rootAnchor = rootTurns.find((turn) => turn.status === 'active') ?? rootTurns[0];
-  return { rootConversationId: root.conversationId, rootTurnId: root.turnId ?? (rootAnchor ? String(rootAnchor.id) : null), members, authoritySteps: root.steps };
+  if (rootTurnId === null) {
+    const latest = async (where: DomainRow) => (await database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').list({
+      where, orderBy: { column: 'created_at', direction: 'desc' }, limit: 1
+    })])).snapshot[0] as DomainRow[];
+    const active = await latest({ conversation_id: cursor, status: 'active' });
+    const anchor = active[0] ?? (await latest({ conversation_id: cursor }))[0];
+    rootTurnId = anchor ? String(anchor.id) : null;
+  }
+  return { rootConversationId: cursor, rootTurnId, member, authoritySteps: steps };
 }

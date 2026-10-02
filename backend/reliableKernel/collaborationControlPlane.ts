@@ -2,7 +2,7 @@ import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
-import { isCrossConversationFollowup, isCrossConversationSend, readCollaborationScope, type CollaborationScope } from './collaborationScope';
+import { isCrossConversationFollowup, isCrossConversationSend, readCollaborationIdentity, type CollaborationIdentity } from './collaborationScope';
 import { collaborationWakePolicy } from './collaborationWake';
 import { CROSS_CONVERSATION_LIMITS, readTurnCollaborationLimits, readTurnCrossConversationEnabled } from './collaborationPolicy';
 import { DEFAULT_CONVERSATION_TITLE, displayConversationTitle, displayConversationTitleFromText } from '../../shared/conversationTitle';
@@ -14,6 +14,7 @@ import { isTransactionAssertionFailure, requirePhaseFId, stablePhaseFId, sqliteU
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { estimateJsonTokens, estimateTextTokens } from './modelTokenEstimator';
 import { forkSourceConversationIds } from './conversationChildHandles';
+import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
 
 export const COLLABORATION_MESSAGE_CONTENT_TYPE = 'text/vnd.limcode.collaboration-message';
 /** Every collaboration message body is 1..COLLABORATION_MESSAGE_MAX_TEXT_BYTES UTF-8 bytes. */
@@ -88,6 +89,8 @@ export interface CollaborationSendCommand {
   newConversationSteps?: RepositoryTransactionStep[];
 }
 export interface CrossConversationListing {
+  rereadCursor: string;
+  nextCursor?: string;
   conversations: Array<{ conversationId: string; title: string; running: boolean; updatedAt: string }>;
   hasMore: boolean;
 }
@@ -106,25 +109,61 @@ export class CollaborationControlPlane {
     options: { now?: () => string } = {}
   ) { this.now = options.now ?? (() => new Date().toISOString()); this.router = new AutomaticRuntimeDeliveryRouter(database, contentStore); }
 
-  /** Team roster only. Conversations outside the derived team are never listed here. */
-  public async listMembers(conversationId: string) {
-    await this.existing('Conversation', conversationId);
-    const scope = await readCollaborationScope(this.database, conversationId);
-    const members = await Promise.all(scope.members.map(async (member) => {
+  /** Live keyset roster: paging limits presentation, never the authority of a known member. */
+  public async listMembers(conversationId: string, input: { cursor?: string; limit?: number } = {}) {
+    const scope = await readCollaborationIdentity(this.database, conversationId);
+    const cursor = readTeamCursor(input.cursor, scope.rootConversationId);
+    const limit = input.limit ?? cursor.limit;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 256) throw new RangeError('Team page limit must be 1..256.');
+    const rows = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ChildExecution').list({
+      collaborationRootConversationId: scope.rootConversationId,
+      ...(cursor.afterChildId ? { afterId: cursor.afterChildId } : {}),
+      orderBy: { column: 'id', direction: 'asc' }, limit: limit + 1
+    })])).snapshot[0] as DomainRow[];
+    const members: Array<CollaborationIdentity['member'] & { title: string; allowRead: boolean; allowSend: boolean; allowWake: boolean }> = [];
+    const describe = async (identity: CollaborationIdentity) => {
+      const member = identity.member;
       const reachable = member.conversationId !== conversationId && (!member.childExecutionId || ['active', 'idle'].includes(member.status));
-      return { ...member, title: String((await this.existing('Conversation', member.conversationId)).title), allowRead: true, allowSend: reachable, allowWake: reachable };
-    }));
-    return { rootConversationId: scope.rootConversationId, members };
+      const conversation = await this.existing('Conversation', member.conversationId);
+      return { ...member, title: displayConversationTitle({ id: member.conversationId, title: String(conversation.title), maxLength: 80 }),
+        allowRead: true, allowSend: reachable, allowWake: reachable };
+    };
+    if (cursor.includeRoot) members.push(await describe(await readCollaborationIdentity(this.database, scope.rootConversationId)));
+    let consumed = 0;
+    let tokens = estimateJsonTokens(members);
+    for (const child of rows) {
+      if (members.length >= limit) break;
+      const identity = await readCollaborationIdentity(this.database, String(child.child_conversation_id));
+      if (identity.rootConversationId !== scope.rootConversationId) throw new Error('Collaboration child root identity conflicts.');
+      const member = await describe(identity);
+      const cost = estimateJsonTokens(member);
+      if (members.length > 0 && tokens + cost > 3000) break;
+      members.push(member); tokens += cost; consumed += 1;
+    }
+    const afterChildId = consumed > 0 ? String(rows[consumed - 1].id) : cursor.afterChildId;
+    const hasMore = consumed < rows.length;
+    return { rootConversationId: scope.rootConversationId, members, hasMore,
+      rereadCursor: teamCursor(scope.rootConversationId, cursor.afterChildId, cursor.includeRoot, limit),
+      ...(hasMore ? { nextCursor: teamCursor(scope.rootConversationId, afterChildId, false, limit) } : {}) };
   }
 
   public async send(input: CollaborationSendCommand) {
-    for (let attempt = 0; ; attempt += 1) {
+    let localRetries = 0;
+    let contentionRetries = 0;
+    for (;;) {
       try { return await this.sendInternal(input); }
       catch (error) {
+        // The same source identity first observes any committed message, including a lost ACK.
+        // Only local durable work is retried; one local budget spans every routing CAS attempt.
+        if (isRetryableLocalExecutionError(error)) {
+          if (localRetries >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
+          await waitForLocalExecutionRetry(++localRetries);
+          continue;
+        }
         const raced = isTransactionAssertionFailure(error) || sqliteUniqueFailureIncludes(error, ['collaboration_budget.id', 'collaboration_budget.origin_kind, collaboration_budget.origin_key']);
         if (!raced) throw error;
         // Every attempt re-reads and re-checks: a lasting refusal surfaces as its own clear error.
-        if (attempt >= 3) throw new Error('Other collaboration activity kept changing the target or the followup budget while this was being sent. Nothing was sent; try again.');
+        if (contentionRetries++ >= 3) throw new Error('Other collaboration activity kept changing the target or the followup budget while this was being sent. Nothing was sent; try again.');
       }
     }
   }
@@ -204,11 +243,11 @@ export class CollaborationControlPlane {
       if (tool.turn_id !== source.turnId || sourceTurn?.status !== 'active' || tool.status === 'terminal') throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
       sourceSteps = [DOMAIN_REPOSITORIES.domain('Turn').assert(source.turnId, { status: 'active', conversation_id: sourceConversationId }), DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: source.turnId }), DOMAIN_REPOSITORIES.domain('ToolCall').assert(source.toolCallId, { turn_id: source.turnId, status: tool.status })];
     }
-    const sourceScope = failureReply ? null : await readCollaborationScope(this.database, sourceConversationId);
-    const targetScope = creating ? newTopLevelScope(targetConversationId) : await readCollaborationScope(this.database, targetConversationId);
-    const sourceMember = sourceScope?.members.find((entry) => entry.conversationId === sourceConversationId);
+    const sourceScope = failureReply ? null : await readCollaborationIdentity(this.database, sourceConversationId);
+    const targetScope = creating ? newTopLevelIdentity(targetConversationId) : await readCollaborationIdentity(this.database, targetConversationId);
+    const sourceMember = sourceScope?.member;
     if (source.kind === 'tool' && sourceMember?.childExecutionId && sourceMember.status !== 'active') throw new Error('A stopped child cannot initiate collaboration.');
-    const targetMember = targetScope.members.find((entry) => entry.conversationId === targetConversationId)!;
+    const targetMember = targetScope.member;
     if (targetMember.childExecutionId && !['active', 'idle'].includes(targetMember.status)) throw new Error('Collaboration cannot revive a stopped, closed or starting child task.');
     // Completion replies return a result to the durable requester wherever it lives. Every other
     // source stays inside its derived team; another team's child tasks are never addressable.
@@ -311,7 +350,7 @@ export class CollaborationControlPlane {
     input: Omit<CollaborationSendCommand, 'source'>;
     source: CollaborationSource | CompletionSource | BoardSource;
     sourceTurnId: string | null;
-    sourceScope: CollaborationScope | null;
+    sourceScope: CollaborationIdentity | null;
     targetConversationId: string;
     currentTurnId: string | null;
     activeTurnId: string | null;
@@ -334,28 +373,62 @@ export class CollaborationControlPlane {
     return wakes;
   }
 
-  public async listMessages(input: { conversationId: string; targetConversationId?: string; afterMessageId?: string; beforeMessageId?: string; limit?: number }): Promise<{ messages: CollaborationMessageSummary[]; nextCursor: string | null; olderCursor: string | null; hasMore: boolean }> {
+  public async listMessages(input: { conversationId: string; targetConversationId?: string; afterMessageId?: string; beforeMessageId?: string; limit?: number; cursor?: string }) {
     const caller = requirePhaseFId(input.conversationId, 'conversationId');
     const conversationId = input.targetConversationId ? requirePhaseFId(input.targetConversationId, 'targetConversationId') : caller;
     await this.assertReadPermission(caller, conversationId);
     await this.existing('Conversation', conversationId);
-    const limit = input.limit ?? 30;
+    const reread = readMailboxCursor(input.cursor, caller, conversationId);
+    if (reread && [input.afterMessageId, input.beforeMessageId, input.limit].some(value => value !== undefined)) {
+      throw new Error('A mailbox page cursor cannot be combined with other pagination arguments.');
+    }
+    const limit = reread?.limit ?? input.limit ?? 30;
     if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new RangeError('Message page limit must be 1..100.');
     if (input.afterMessageId && input.beforeMessageId) throw new Error('Choose one message cursor direction.');
-    const cursorId = input.afterMessageId ?? input.beforeMessageId;
-    let keyset: { column: string; value: bigint; id: string; direction: 'after' | 'before' } | undefined;
-    if (cursorId) {
-      const cursor = await this.existing('CollaborationMessage', requirePhaseFId(cursorId, 'message cursor'));
-      const visible = await this.summary(cursor);
+    const ascending = reread?.ascending ?? input.afterMessageId !== undefined;
+    const visibleMessage = async (id: string): Promise<DomainRow> => {
+      const message = await this.existing('CollaborationMessage', requirePhaseFId(id, 'message cursor'));
+      const visible = await this.summary(message);
       if (![visible.sourceConversationId, visible.targetConversationId].includes(conversationId)) throw new Error('Message cursor is not visible in this Conversation.');
-      keyset = { column: 'message_seq', value: cursor.message_seq as bigint, id: String(cursor.id), direction: input.afterMessageId ? 'after' : 'before' };
+      return message;
+    };
+    const cursorId = reread ? reread.startId : input.afterMessageId ?? input.beforeMessageId;
+    const anchor = cursorId ? await visibleMessage(cursorId) : null;
+    if (reread?.emptyNextId && !anchor) await visibleMessage(reread.emptyNextId);
+    const frontier = reread?.endId ? await visibleMessage(reread.endId) : null;
+    if (anchor && frontier && (ascending ? compareSequence(anchor.message_seq, frontier.message_seq) > 0 : compareSequence(anchor.message_seq, frontier.message_seq) < 0)) {
+      throw new Error('Invalid mailbox page range.');
     }
-    const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('CollaborationMessage').list({ collaborationConversationId: conversationId, orderBy: { column: 'message_seq', direction: input.afterMessageId ? 'asc' : 'desc' }, ...(keyset ? { keyset } : {}), limit: limit + 1 })]);
-    const rows = result.snapshot[0] as DomainRow[];
-    const hasMore = rows.length > limit;
-    const selected = rows.slice(0, limit);
-    if (!input.afterMessageId) selected.reverse();
-    return { messages: await Promise.all(selected.map((row) => this.summary(row))), nextCursor: selected.length ? String(selected[selected.length - 1].id) : input.afterMessageId ?? null, olderCursor: !input.afterMessageId && hasMore && selected.length ? String(selected[0].id) : null, hasMore };
+    const rows: DomainRow[] = [];
+    if (!reread || anchor) {
+      const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('CollaborationMessage').list({
+        collaborationConversationId: conversationId, orderBy: { column: 'message_seq', direction: ascending ? 'asc' : 'desc' },
+        ...(anchor ? { keyset: { column: 'message_seq', value: anchor.message_seq as bigint, id: String(anchor.id), direction: ascending ? 'after' as const : 'before' as const } } : {}),
+        limit: limit + 1
+      })]);
+      // A reread includes its immutable first row and stops at the original bounded read's
+      // frontier. Messages committed later cannot replace unseen entries in a squeezed page.
+      if (reread && anchor) rows.push(anchor);
+      rows.push(...(result.snapshot[0] as DomainRow[]).filter(row => !frontier
+        || (ascending ? compareSequence(row.message_seq, frontier.message_seq) <= 0 : compareSequence(row.message_seq, frontier.message_seq) >= 0)));
+    }
+    const page = reread ?? { caller, conversationId, ascending, startId: rows[0] ? String(rows[0].id) : null,
+      endId: rows.length ? String(rows[rows.length - 1].id) : null, limit, emptyNextId: input.afterMessageId ?? null };
+    const rereadCursor = mailboxCursor(page);
+    const selected: CollaborationMessageSummary[] = [];
+    const result = () => {
+      const messages = ascending ? [...selected] : [...selected].reverse();
+      const hasMore = rows.length > selected.length;
+      return { conversationId, messages, nextCursor: messages.length ? messages[messages.length - 1].messageId : page.emptyNextId,
+        olderCursor: !ascending && hasMore && messages.length ? messages[0].messageId : null, hasMore, rereadCursor,
+        note: 'Pages contain whole message summaries and may end before limit to fit the result budget. Continue with nextAfterMessageRef for newer messages or olderMessageRef for older messages. To reread this page, use read_agent_messages with the same conversationRef and cursor=rereadCursor.' };
+    };
+    for (const row of rows) {
+      if (selected.length >= limit) break;
+      selected.push(await this.summary(row));
+      if (selected.length > 1 && estimateJsonTokens(result()) > 3000) { selected.pop(); break; }
+    }
+    return result();
   }
   /**
    * One page of a collaboration message's full text, starting at a character offset. A page always
@@ -385,52 +458,139 @@ export class CollaborationControlPlane {
    * out, not relabelled, and olderMessageId always leads to them. The whole result stays under the
    * model tool-result cap.
    */
-  public async readConversation(input: { conversationId: string; targetConversationId: string; beforeMessageId?: string; limit?: number; crossConversationTurnId?: string }) {
+  public async readConversation(input: { conversationId: string; targetConversationId: string; beforeMessageId?: string; limit?: number; crossConversationTurnId?: string; cursor?: string; inputCursor?: string }) {
     const target = await this.authorizeTranscriptRead(input);
     const conversation = await this.existing('Conversation', target);
-    const limit = input.limit ?? 20;
+    if (input.cursor && input.inputCursor) throw new Error('Use one transcript page cursor.');
+    const cursor = readTranscriptCursor(input.cursor ?? input.inputCursor, target);
+    if (cursor && (input.beforeMessageId !== undefined || input.limit !== undefined)) throw new Error('A transcript page cursor cannot be combined with beforeMessageRef or limit.');
+    if (input.inputCursor && cursor?.kind !== 'inputs') throw new Error('inputCursor must continue collaboration input previews.');
+    const base = { conversationId: target, title: await this.displayTitle(conversation), status: String(conversation.status) };
+    if (cursor?.kind === 'inputs') return this.readTranscriptInputPage(base, cursor);
+    const limit = cursor?.limit ?? input.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Conversation read limit must be 1..50.');
     let keyset: { column: string; value: bigint; id: string; direction: 'before' } | undefined;
-    if (input.beforeMessageId) {
-      const cursor = await this.one('MessagePartOfConversation', { conversation_id: target, message_id: requirePhaseFId(input.beforeMessageId, 'beforeMessageId') });
-      keyset = { column: 'message_seq', value: cursor.message_seq as bigint, id: String(cursor.id), direction: 'before' };
+    let anchor: DomainRow | null = null;
+    if (cursor) {
+      if (cursor.startId !== null) {
+        anchor = await this.existing('MessagePartOfConversation', cursor.startId);
+        if (anchor.conversation_id !== target) throw new Error('Transcript cursor does not belong to this conversation.');
+        keyset = { column: 'message_seq', value: anchor.message_seq as bigint, id: String(anchor.id), direction: 'before' };
+      }
+    } else if (input.beforeMessageId) {
+      const before = await this.one('MessagePartOfConversation', { conversation_id: target, message_id: requirePhaseFId(input.beforeMessageId, 'beforeMessageId') });
+      keyset = { column: 'message_seq', value: before.message_seq as bigint, id: String(before.id), direction: 'before' };
     }
-    const result = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({ where: { conversation_id: target }, orderBy: { column: 'message_seq', direction: 'desc' }, ...(keyset ? { keyset } : {}), limit: limit + 1 })]);
-    const links = result.snapshot[0] as DomainRow[];
+    const links = cursor && !anchor ? [] : (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+      where: { conversation_id: target }, orderBy: { column: 'message_seq', direction: 'desc' }, ...(keyset ? { keyset } : {}), limit: limit + 1
+    })])).snapshot[0] as DomainRow[];
+    if (anchor) links.unshift(anchor);
     const candidates = links.slice(0, limit);
-    // Newest first. The collaboration inputs of a Turn are shown before its oldest message on the page.
+    const frontiers = new Map(cursor?.frontiers ?? []);
     const newestFirst: TranscriptEntry[] = [];
     const turnInputs = new Map<string, CollaborationInputEntry[]>();
     const oldestEntryOfTurn = new Map<string, number>();
-    let spent = 0;
+    const pendingInputs: Array<[string, string]> = [];
     let consumed = 0;
     let pageFull = false;
-    for (const link of candidates) {
-      const messageId = String(link.message_id);
-      const entry = await this.transcriptEntry(messageId);
-      if (entry) {
-        const turnIds = [...new Set((await this.rows('MessageTurnLink', { message_id: messageId })).map((row) => String(row.turn_id)))];
-        const fresh: Array<[string, CollaborationInputEntry[]]> = [];
-        for (const turnId of turnIds) if (!turnInputs.has(turnId)) fresh.push([turnId, await this.collaborationInputs(target, turnId)]);
-        const cost = estimateJsonTokens(entry) + fresh.reduce((sum, [, inputs]) => sum + estimateJsonTokens(inputs), 0);
-        if (newestFirst.length > 0 && spent + cost > TRANSCRIPT_PAGE_TOKENS) { pageFull = true; break; }
-        for (const [turnId, inputs] of fresh) turnInputs.set(turnId, inputs);
-        newestFirst.push(entry);
-        for (const turnId of turnIds) oldestEntryOfTurn.set(turnId, newestFirst.length - 1);
-        spent += cost;
+    const result = () => {
+      const messages: Array<TranscriptEntry | CollaborationInputEntry> = [];
+      for (let index = newestFirst.length - 1; index >= 0; index -= 1) {
+        for (const [turnId, oldest] of oldestEntryOfTurn) if (oldest === index) messages.push(...turnInputs.get(turnId)!);
+        messages.push(newestFirst[index]);
       }
-      consumed += 1;
-    }
-    const messages: Array<TranscriptEntry | CollaborationInputEntry> = [];
-    for (let index = newestFirst.length - 1; index >= 0; index -= 1) {
-      for (const [turnId, oldest] of oldestEntryOfTurn) if (oldest === index) messages.push(...turnInputs.get(turnId)!);
-      messages.push(newestFirst[index]);
-    }
-    const hasMore = pageFull || links.length > limit;
-    return {
-      conversationId: target, title: await this.displayTitle(conversation), status: String(conversation.status), messages,
-      olderMessageId: hasMore && consumed > 0 ? String(candidates[consumed - 1].message_id) : null, hasMore, pageFull
+      const hasMore = pageFull || links.length > consumed;
+      const olderMessageId = hasMore && consumed > 0 ? String(candidates[consumed - 1].message_id) : null;
+      return { ...base, messages, olderMessageId, hasMore, pageFull,
+        rereadCursor: transcriptCursor({ kind: 'messages', conversationId: target, startId: links[0] ? String(links[0].id) : null, limit, frontiers: [...frontiers] }),
+        ...(pendingInputs.length ? { inputCursor: transcriptCursor({ kind: 'inputs', conversationId: target, groups: pendingInputs, olderMessageId, hasMore }) } : {}) };
     };
+    for (const link of candidates) {
+      const entry = await this.transcriptEntry(String(link.message_id));
+      if (!entry) { consumed += 1; continue; }
+      const turnIds: string[] = [];
+      for (const turnId of new Set((await this.rows('MessageTurnLink', { message_id: link.message_id })).map(row => String(row.turn_id)))) {
+        if ((await this.maybe('Turn', turnId))?.conversation_id === target) turnIds.push(turnId);
+      }
+      const priorOldest = new Map(oldestEntryOfTurn);
+      const priorFrontiers = new Map(frontiers);
+      newestFirst.push(entry);
+      consumed += 1;
+      for (const turnId of turnIds) oldestEntryOfTurn.set(turnId, newestFirst.length - 1);
+      const fresh = turnIds.filter(turnId => !turnInputs.has(turnId));
+      const freshInputs = new Map<string, DomainRow[]>();
+      for (const turnId of fresh) {
+        turnInputs.set(turnId, []);
+        const inputs = await this.transcriptInputs(target, turnId, frontiers.has(turnId) ? frontiers.get(turnId)! : undefined);
+        freshInputs.set(turnId, inputs);
+        frontiers.set(turnId, inputs[0] ? String(inputs[0].id) : null);
+      }
+      if (newestFirst.length > 1 && !transcriptPageFits(result())) {
+        newestFirst.pop(); consumed -= 1; pageFull = true;
+        oldestEntryOfTurn.clear(); for (const [turnId, oldest] of priorOldest) oldestEntryOfTurn.set(turnId, oldest);
+        for (const turnId of fresh) turnInputs.delete(turnId);
+        frontiers.clear(); for (const [turnId, startId] of priorFrontiers) frontiers.set(turnId, startId);
+        break;
+      }
+      for (const turnId of fresh) {
+        const inputs = freshInputs.get(turnId)!;
+        let index = 0;
+        for (; index < inputs.length && index < TRANSCRIPT_INPUT_SCAN_LIMIT; index += 1) {
+          const preview = await this.collaborationInput(target, turnId, inputs[index]);
+          if (!preview) continue;
+          const entries = turnInputs.get(turnId)!;
+          entries.unshift(preview);
+          // Reserve the exact continuation metadata before deciding whether this preview fits.
+          pendingInputs.push([turnId, String(inputs[index].id)]);
+          const fits = transcriptPageFits(result());
+          pendingInputs.pop();
+          if (!fits) { entries.shift(); break; }
+        }
+        if (index < inputs.length) pendingInputs.push([turnId, String(inputs[index].id)]);
+      }
+      // Keep the two directions independent: remaining inputs use inputCursor; older transcript
+      // Messages use olderMessageRef, never a cursor that silently skips the unshown inputs.
+      if (pendingInputs.length) { pageFull = consumed < links.length; break; }
+    }
+    return result();
+  }
+
+  /** Inputs use their committed injection positions, including history injected by older Hosts. */
+  private async transcriptInputs(conversationId: string, turnId: string, startId?: string | null): Promise<DomainRow[]> {
+    if ((await this.existing('Turn', turnId)).conversation_id !== conversationId) throw new Error('Transcript input cursor belongs to another conversation.');
+    if (startId === null) return [];
+    const anchor = startId === undefined ? null : await this.existing('PendingTurnInput', startId);
+    if (anchor && (anchor.turn_id !== turnId || anchor.input_kind !== 'runtime_delivery')) throw new Error('Transcript input cursor does not belong to this Turn.');
+    const rows = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({
+      where: { turn_id: turnId, input_kind: 'runtime_delivery' }, orderBy: { column: 'position', direction: 'desc' },
+      ...(anchor ? { keyset: { column: 'position', value: anchor.position as bigint, id: String(anchor.id), direction: 'before' as const } } : {}),
+      limit: TRANSCRIPT_INPUT_SCAN_LIMIT + 1
+    })])).snapshot[0] as DomainRow[];
+    return anchor ? [anchor, ...rows] : rows;
+  }
+
+  private async readTranscriptInputPage(base: { conversationId: string; title: string; status: string }, cursor: TranscriptInputsCursor) {
+    const groups = cursor.groups.map(([turnId, startId]) => [turnId, startId] as [string, string]);
+    const messages: CollaborationInputEntry[] = [];
+    const result = () => ({ ...base, messages, olderMessageId: cursor.olderMessageId, hasMore: cursor.hasMore, pageFull: false,
+      inputPage: true, rereadCursor: transcriptCursor(cursor),
+      ...(groups.length ? { inputCursor: transcriptCursor({ ...cursor, groups }) } : {}) });
+    let scanned = 0;
+    while (groups.length && scanned < TRANSCRIPT_INPUT_SCAN_LIMIT) {
+      const [turnId, startId] = groups[0];
+      const rows = await this.transcriptInputs(base.conversationId, turnId, startId);
+      let index = 0;
+      for (; index < rows.length && scanned < TRANSCRIPT_INPUT_SCAN_LIMIT; index += 1, scanned += 1) {
+        const preview = await this.collaborationInput(base.conversationId, turnId, rows[index]);
+        if (preview) {
+          messages.unshift(preview);
+          if (!transcriptPageFits(result())) { messages.shift(); break; }
+        }
+      }
+      if (index < rows.length) { groups[0] = [turnId, String(rows[index].id)]; break; }
+      groups.shift();
+    }
+    return result();
   }
 
   /**
@@ -465,23 +625,21 @@ export class CollaborationControlPlane {
    * replies are no transcript Messages, yet without them a peer-driven Turn shows an answer with no
    * question. Each is a bounded preview; the full text stays private to its two Conversations.
    */
-  private async collaborationInputs(conversationId: string, turnId: string): Promise<CollaborationInputEntry[]> {
-    const deliveries = (await this.rows('RuntimeDelivery', { target_conversation_id: conversationId, state: 'consumed', target_turn_id: turnId }))
-      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.id).localeCompare(String(right.id)));
-    const entries: CollaborationInputEntry[] = [];
-    for (const delivery of deliveries) {
-      const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
-      if (inbox.source_kind !== 'collaboration_message') continue;
-      const message = await this.existing('CollaborationMessage', String(inbox.source_id));
-      const source = await this.one('CollaborationMessageSourceLink', { message_id: message.id });
-      const payload = await this.one('CollaborationMessagePayloadLink', { message_id: message.id });
-      const metadata = await this.existing('ContentObject', String(payload.content_object_id)) as ContentObjectMetadata;
-      const page = collaborationTextPage((await this.contentStore.read(metadata)).toString('utf8'), 0, COLLABORATION_INPUT_PREVIEW_TOKENS);
-      entries.push({ role: 'collaboration', mode: String(message.mode), sourceKind: String(source.source_kind),
-        sourceConversationId: String(source.conversation_id), createdAt: String(message.created_at), text: page.text,
-        ...(page.nextOffset === null ? {} : { shortened: true }) });
+  private async collaborationInput(conversationId: string, turnId: string, input: DomainRow): Promise<CollaborationInputEntry | null> {
+    const link = await this.one('RuntimeDeliveryInputLink', { pending_turn_input_id: input.id });
+    const delivery = await this.existing('RuntimeDelivery', String(link.delivery_id));
+    if (delivery.target_conversation_id !== conversationId || delivery.target_turn_id !== turnId || delivery.state !== 'consumed') {
+      throw new Error('Transcript input does not match its committed delivery.');
     }
-    return entries;
+    const inbox = await this.existing('RuntimeInboxItem', String(delivery.inbox_item_id));
+    if (inbox.source_kind !== 'collaboration_message') return null;
+    const message = await this.existing('CollaborationMessage', String(inbox.source_id));
+    const source = await this.one('CollaborationMessageSourceLink', { message_id: message.id });
+    const metadata = await this.existing('ContentObject', String(input.content_object_id)) as ContentObjectMetadata;
+    const page = collaborationTextPage((await this.contentStore.read(metadata)).toString('utf8'), 0, COLLABORATION_INPUT_PREVIEW_TOKENS);
+    return { role: 'collaboration', mode: String(message.mode), sourceKind: String(source.source_kind),
+      sourceConversationId: String(source.conversation_id), createdAt: String(message.created_at), text: page.text,
+      ...(page.nextOffset === null ? {} : { shortened: true }) };
   }
 
   /** A visible user or assistant message as one transcript entry: whole, or its first page when long. */
@@ -566,7 +724,7 @@ export class CollaborationControlPlane {
       throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
     }
     await this.assertConversationSpawnAllowed({ turnId, toolCallId });
-    await this.availableFollowupBudget(turnId, (await readCollaborationScope(this.database, conversationId)).rootTurnId);
+    await this.availableFollowupBudget(turnId, (await readCollaborationIdentity(this.database, conversationId)).rootTurnId);
   }
 
   /** The collaboration message a tool call committed, if any; it outlives both Conversations. */
@@ -597,29 +755,39 @@ export class CollaborationControlPlane {
    * Other active top-level Conversations of the caller's project, newest update first. The Runtime
    * is shared by every VS Code window, so the project, never the Runtime, bounds what is listed.
    */
-  public async listConversations(input: { turnId: string; limit?: number }): Promise<CrossConversationListing> {
+  public async listConversations(input: { turnId: string; limit?: number; cursor?: string }): Promise<CrossConversationListing> {
     const { conversationId, projectContextId } = await this.authorizeCrossConversation({ turnId: input.turnId });
-    const limit = input.limit ?? 20;
+    const cursor = readProjectConversationCursor(input.cursor, conversationId, projectContextId);
+    if (cursor && input.limit !== undefined) throw new Error('A conversation page cursor cannot be combined with limit.');
+    const limit = cursor?.limit ?? input.limit ?? 20;
     if (!Number.isInteger(limit) || limit < 1 || limit > 50) throw new RangeError('Conversation list limit must be 1..50.');
+    const scope = { callerConversationId: conversationId, projectContextId };
+    const before = cursor?.before ?? null;
+    const reads = [DOMAIN_REPOSITORIES.domain('Conversation').list({ collaborationProjectScope: scope,
+      orderBy: { column: 'updated_at', direction: 'desc' },
+      ...(before ? { keyset: { column: 'updated_at', value: before[0], id: before[1], direction: 'before' as const } } : {}), limit: limit + 1 })];
+    // A reread includes its first eligible row only while that row still has the same key. If it
+    // was deleted or updated, the embedded key still bounds the page; no existing row is needed.
+    if (before && cursor?.inclusive) reads.push(DOMAIN_REPOSITORIES.domain('Conversation').list({
+      collaborationProjectScope: scope, where: { id: before[1], updated_at: before[0] }, limit: 1 }));
+    const snapshot = (await this.database.snapshot(reads)).snapshot;
+    const rows = [...(snapshot[1] as DomainRow[] ?? []), ...snapshot[0] as DomainRow[]];
     const conversations: CrossConversationListing['conversations'] = [];
-    let keyset: { column: string; value: string; id: string; direction: 'before' } | undefined;
-    for (;;) {
-      const page = (await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Conversation').list({
-        orderBy: { column: 'updated_at', direction: 'desc' }, ...(keyset ? { keyset } : {}), limit: 100
-      })])).snapshot[0] as DomainRow[];
-      for (const row of page) {
-        const id = String(row.id);
-        if (id === conversationId || row.status !== 'active') continue;
-        if ((await this.rows('ChildExecution', { child_conversation_id: id })).length) continue;
-        if (await this.projectOf(id) !== projectContextId) continue;
-        if (conversations.length === limit) return { conversations, hasMore: true };
-        const active = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').list({ where: { conversation_id: id, status: 'active' }, limit: 1 })]);
-        conversations.push({ conversationId: id, title: await this.displayTitle(row), running: (active.snapshot[0] as DomainRow[]).length > 0, updatedAt: String(row.updated_at) });
-      }
-      if (page.length < 100) return { conversations, hasMore: false };
-      const last = page[page.length - 1];
-      keyset = { column: 'updated_at', value: String(last.updated_at), id: String(last.id), direction: 'before' };
+    const pageCursor = (key: [string, string] | null, inclusive: boolean) => projectConversationCursor({
+      conversationId, projectContextId, before: key, inclusive, limit });
+    const rereadCursor = rows[0] ? pageCursor([String(rows[0].updated_at), String(rows[0].id)], true)
+      : input.cursor ?? pageCursor(null, false);
+    let consumed = 0;
+    const result = (): CrossConversationListing => ({ conversations, hasMore: consumed < rows.length, rereadCursor,
+      ...(consumed < rows.length && consumed > 0 ? { nextCursor: pageCursor([String(rows[consumed - 1].updated_at), String(rows[consumed - 1].id)], false) } : {}) });
+    for (const row of rows) {
+      if (conversations.length >= limit) break;
+      const active = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').list({ where: { conversation_id: row.id, status: 'active' }, limit: 1 })]);
+      conversations.push({ conversationId: String(row.id), title: await this.displayTitle(row), running: (active.snapshot[0] as DomainRow[]).length > 0, updatedAt: String(row.updated_at) });
+      consumed += 1;
+      if (conversations.length > 1 && estimateJsonTokens(result()) > 3000) { conversations.pop(); consumed -= 1; break; }
     }
+    return result();
   }
 
   /** The stored title, or for a placeholder its first user message, as the conversation list shows it. */
@@ -647,14 +815,35 @@ export class CollaborationControlPlane {
     if (!Number.isInteger(timeoutMs) || timeoutMs < 0 || timeoutMs > 60_000) throw new RangeError('Message wait timeout must be 0..60000 milliseconds.');
     const deadline = Date.now() + timeoutMs;
     while (true) {
-      const result = await this.listMessages(input);
-      if (result.messages.length || input.signal?.aborted || Date.now() >= deadline) return { ...result, timedOut: !result.messages.length && !input.signal?.aborted, aborted: input.signal?.aborted ?? false };
-      await new Promise<void>((resolve) => {
-        const done = () => { clearTimeout(timer); unsubscribe(); input.signal?.removeEventListener('abort', done); resolve(); };
-        const unsubscribe = this.database.onCommit(() => done());
-        const timer = setTimeout(done, Math.min(1000, Math.max(1, deadline - Date.now())));
-        input.signal?.addEventListener('abort', done, { once: true });
-      });
+      let notified = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let unsubscribe: () => void = () => undefined;
+      let resolveWake: () => void = () => undefined;
+      const wake = new Promise<void>((resolve) => { resolveWake = resolve; });
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        unsubscribe();
+        unsubscribe = () => undefined;
+        input.signal?.removeEventListener('abort', notify);
+      };
+      const notify = () => {
+        if (notified) return;
+        notified = true;
+        cleanup();
+        resolveWake();
+      };
+      unsubscribe = this.database.onCommit(notify);
+      input.signal?.addEventListener('abort', notify, { once: true });
+      if (notified) cleanup();
+      else if (input.signal?.aborted) notify();
+      try {
+        const result = await this.listMessages(input);
+        if (result.messages.length || input.signal?.aborted || Date.now() >= deadline) return { ...result, timedOut: !result.messages.length && !input.signal?.aborted, aborted: input.signal?.aborted ?? false };
+        if (!notified) timer = setTimeout(notify, Math.min(1000, Math.max(1, deadline - Date.now())));
+        await wake;
+      } finally {
+        cleanup();
+      }
     }
   }
   /**
@@ -781,7 +970,7 @@ export class CollaborationControlPlane {
   private async assertReadPermission(caller: string, target: string): Promise<void> {
     await this.existing('Conversation', caller);
     if (caller === target) return;
-    const [callerScope, targetScope] = await Promise.all([readCollaborationScope(this.database, caller), readCollaborationScope(this.database, target)]);
+    const [callerScope, targetScope] = await Promise.all([readCollaborationIdentity(this.database, caller), readCollaborationIdentity(this.database, target)]);
     if (callerScope.rootConversationId !== targetScope.rootConversationId) throw new Error('Cross-conversation collaboration is not enabled.');
   }
   /**
@@ -908,7 +1097,7 @@ export class CollaborationControlPlane {
   } | null> {
     if (!await this.maybe('Turn', senderTurnId)) return null;
     const root = rootTurnId !== undefined ? rootTurnId
-      : (await readCollaborationScope(this.database, requirePhaseFId(senderConversationId, 'senderConversationId'))).rootTurnId;
+      : (await readCollaborationIdentity(this.database, requirePhaseFId(senderConversationId, 'senderConversationId'))).rootTurnId;
     const budget = await this.budgetForTurn(senderTurnId, root);
     const authorityTurnId = String(budget.authority_turn_id);
     if (!await this.maybe('Turn', authorityTurnId)) return null;
@@ -956,7 +1145,7 @@ export class CollaborationControlPlane {
       if (budgets.size === 1) return [...budgets.values()][0];
       if (ancestryRoot && ancestryRoot !== turnId) return visit(ancestryRoot, null, seen);
       const turn = await this.existing('Turn', turnId);
-      const scope = await readCollaborationScope(this.database, String(turn.conversation_id));
+      const scope = await readCollaborationIdentity(this.database, String(turn.conversation_id));
       if (scope.rootTurnId && scope.rootTurnId !== turnId && scope.rootConversationId !== turn.conversation_id) return visit(scope.rootTurnId, null, seen);
       const intents = await this.rows('TurnIntent', { turn_id: turnId });
       const continuationSources = new Set<string>();
@@ -1033,13 +1222,55 @@ function collaborationReplyDeliveryId(requestId: string): string {
   return stablePhaseFId('runtime_delivery', 'collaboration', stablePhaseFId('collaboration_message', collaborationDedupeKey('completion', requestId)));
 }
 /** A Conversation inserted by the same transaction: top-level, alone in its team, without Turns. */
-function newTopLevelScope(conversationId: string): CollaborationScope {
+function newTopLevelIdentity(conversationId: string): CollaborationIdentity {
   return {
     rootConversationId: conversationId, rootTurnId: null,
-    members: [{ conversationId, childExecutionId: null, parentConversationId: null, status: 'active' }],
+    member: { conversationId, childExecutionId: null, parentConversationId: null, status: 'active' },
     authoritySteps: [DOMAIN_REPOSITORIES.domain('ChildExecution').assertNone({ child_conversation_id: conversationId })]
   };
 }
+interface MailboxPageCursor {
+  caller: string; conversationId: string; ascending: boolean; startId: string | null; endId: string | null; limit: number; emptyNextId: string | null;
+}
+function mailboxCursor(cursor: MailboxPageCursor): string {
+  return Buffer.from(JSON.stringify(['mailbox', cursor.caller, cursor.conversationId, cursor.ascending, cursor.startId, cursor.endId, cursor.limit, cursor.emptyNextId])).toString('base64url');
+}
+function readMailboxCursor(value: string | undefined, caller: string, conversationId: string): MailboxPageCursor | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || value.length > 4096) throw new Error('Invalid mailbox page cursor.');
+  let raw: unknown;
+  try { raw = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); }
+  catch { throw new Error('Invalid mailbox page cursor.'); }
+  if (!Array.isArray(raw) || raw.length !== 8 || raw[0] !== 'mailbox' || raw[1] !== caller || raw[2] !== conversationId) throw new Error('Mailbox page cursor belongs to another caller or mailbox.');
+  const id = (entry: unknown) => entry === null || typeof entry === 'string' && entry.length > 0;
+  if (typeof raw[3] !== 'boolean' || !id(raw[4]) || !id(raw[5]) || (raw[4] === null) !== (raw[5] === null)
+    || !Number.isInteger(raw[6]) || raw[6] < 1 || raw[6] > 100 || !id(raw[7])) throw new Error('Invalid mailbox page cursor.');
+  const cursor: MailboxPageCursor = { caller, conversationId, ascending: raw[3], startId: raw[4], endId: raw[5], limit: raw[6], emptyNextId: raw[7] };
+  if (mailboxCursor(cursor) !== value) throw new Error('Invalid mailbox page cursor.');
+  return cursor;
+}
+
+interface ProjectConversationCursor {
+  conversationId: string; projectContextId: string | null; before: [string, string] | null; inclusive: boolean; limit: number;
+}
+function projectConversationCursor(cursor: ProjectConversationCursor): string {
+  return Buffer.from(JSON.stringify([cursor.conversationId, cursor.projectContextId, cursor.before, cursor.inclusive, cursor.limit])).toString('base64url');
+}
+function readProjectConversationCursor(value: string | undefined, conversationId: string, projectContextId: string | null): ProjectConversationCursor | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || value.length > 4096) throw new Error('Invalid conversation page cursor.');
+  let raw: unknown;
+  try { raw = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); }
+  catch { throw new Error('Invalid conversation page cursor.'); }
+  if (!Array.isArray(raw) || raw.length !== 5 || raw[0] !== conversationId || raw[1] !== projectContextId) throw new Error('Conversation page cursor belongs to another caller or project.');
+  const before = raw[2];
+  if (!(before === null || Array.isArray(before) && before.length === 2 && before.every(item => typeof item === 'string' && item.length > 0))
+    || typeof raw[3] !== 'boolean' || !Number.isInteger(raw[4]) || raw[4] < 1 || raw[4] > 50) throw new Error('Invalid conversation page cursor.');
+  const cursor: ProjectConversationCursor = { conversationId, projectContextId, before, inclusive: raw[3], limit: raw[4] };
+  if (projectConversationCursor(cursor) !== value) throw new Error('Invalid conversation page cursor.');
+  return cursor;
+}
+
 function compareSequence(left: unknown, right: unknown): number {
   const a = BigInt(String(left));
   const b = BigInt(String(right));
@@ -1073,6 +1304,40 @@ export const TRANSCRIPT_MESSAGE_PREVIEW_TOKENS = 2_000;
 const TRANSCRIPT_MESSAGE_READ_MAX_BYTES = 256_000;
 
 const COLLABORATION_INPUT_PREVIEW_TOKENS = 400;
+
+const TRANSCRIPT_INPUT_SCAN_LIMIT = 100;
+function transcriptPageFits(page: { rereadCursor: string; inputCursor?: string }): boolean {
+  return page.rereadCursor.length <= 4096 && (page.inputCursor?.length ?? 0) <= 4096
+    && estimateJsonTokens(page) <= TRANSCRIPT_PAGE_TOKENS;
+}
+type TranscriptMessagesCursor = { kind: 'messages'; conversationId: string; startId: string | null; limit: number; frontiers: Array<[string, string | null]> };
+type TranscriptInputsCursor = { kind: 'inputs'; conversationId: string; groups: Array<[string, string]>; olderMessageId: string | null; hasMore: boolean };
+type TranscriptCursor = TranscriptMessagesCursor | TranscriptInputsCursor;
+function transcriptCursor(cursor: TranscriptCursor): string {
+  const value = cursor.kind === 'messages'
+    ? [cursor.conversationId, cursor.kind, cursor.startId, cursor.limit, cursor.frontiers]
+    : [cursor.conversationId, cursor.kind, cursor.groups, cursor.olderMessageId, cursor.hasMore];
+  return Buffer.from(JSON.stringify(value)).toString('base64url');
+}
+function readTranscriptCursor(value: string | undefined, conversationId: string): TranscriptCursor | null {
+  if (value === undefined) return null;
+  if (typeof value !== 'string' || value.length > 4096) throw new Error('Invalid transcript page cursor.');
+  let raw: unknown;
+  try { raw = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); }
+  catch { throw new Error('Invalid transcript page cursor.'); }
+  const id = (item: unknown): item is string => typeof item === 'string' && item.trim().length > 0;
+  const pairs = (items: unknown, nullable: boolean): items is Array<[string, string | null]> => Array.isArray(items)
+    && items.length <= 50 && items.every(item => Array.isArray(item) && item.length === 2 && id(item[0]) && (id(item[1]) || nullable && item[1] === null));
+  if (!Array.isArray(raw) || raw.length !== 5 || raw[0] !== conversationId) throw new Error('Transcript page cursor belongs to another conversation.');
+  let cursor: TranscriptCursor;
+  if (raw[1] === 'messages' && (raw[2] === null || id(raw[2])) && Number.isInteger(raw[3]) && raw[3] >= 1 && raw[3] <= 50 && pairs(raw[4], true)) {
+    cursor = { kind: 'messages', conversationId, startId: raw[2], limit: raw[3], frontiers: raw[4] };
+  } else if (raw[1] === 'inputs' && pairs(raw[2], false) && raw[2].length && (raw[3] === null || id(raw[3])) && typeof raw[4] === 'boolean') {
+    cursor = { kind: 'inputs', conversationId, groups: raw[2] as Array<[string, string]>, olderMessageId: raw[3], hasMore: raw[4] };
+  } else throw new Error('Invalid transcript page cursor.');
+  if (transcriptCursor(cursor) !== value) throw new Error('Invalid transcript page cursor.');
+  return cursor;
+}
 
 interface TranscriptEntry {
   messageId: string; role: string; createdAt: string; text: string; truncated: boolean;
@@ -1119,4 +1384,23 @@ function visibleMessageText(contentType: string, raw: string): string {
   if (!value || typeof value !== 'object' || Array.isArray(value) || !Array.isArray((value as { parts?: unknown }).parts)) throw new Error('Conversation message JSON requires a parts array.');
   return ((value as { parts: unknown[] }).parts).filter((part): part is { text: string; thought?: boolean } => Boolean(part) && typeof part === 'object' && !Array.isArray(part) && typeof (part as { text?: unknown }).text === 'string')
     .filter((part) => part.thought !== true).map((part) => part.text).join('\n');
+}
+
+/** Root-bound live cursors survive renames, status changes and deletion of the previous member. */
+function teamCursor(root: string, afterChildId: string | null, includeRoot: boolean, limit: number): string {
+  const cursor = Buffer.from(JSON.stringify([root, afterChildId, includeRoot, limit])).toString('base64url');
+  if (cursor.length > 4096) throw new Error('Team page cursor exceeds its model projection limit.');
+  return cursor;
+}
+function readTeamCursor(value: string | undefined, root: string): { afterChildId: string | null; includeRoot: boolean; limit: number } {
+  if (value === undefined) return { afterChildId: null, includeRoot: true, limit: 20 };
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4096) throw new Error('Invalid team page cursor.');
+  let parsed: unknown;
+  try { parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')); }
+  catch { throw new Error('Invalid team page cursor.'); }
+  if (!Array.isArray(parsed) || parsed.length !== 4 || parsed[0] !== root
+    || (parsed[1] !== null && (typeof parsed[1] !== 'string' || !parsed[1])) || typeof parsed[2] !== 'boolean'
+    || !Number.isSafeInteger(parsed[3]) || parsed[3] < 1 || parsed[3] > 256
+    || teamCursor(root, parsed[1], parsed[2], parsed[3]) !== value) throw new Error('Team page cursor belongs to a different scope or is invalid.');
+  return { afterChildId: parsed[1], includeRoot: parsed[2], limit: parsed[3] };
 }

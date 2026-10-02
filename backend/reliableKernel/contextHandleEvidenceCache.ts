@@ -246,12 +246,19 @@ class Dependencies {
 
   private observe(read: RepositoryRead): void {
     if (read.kind === 'get') this.id(read.domain, read.id);
-    else this.lists.push({ domain: read.domain, where: { ...read.where } });
+    else if (read.kind === 'list' && read.collaborationProjectScope !== undefined) {
+      for (const domain of ['Conversation', 'ChildExecution', 'ConversationProjectLink']) this.materializing.add(domain);
+    } else if (read.kind === 'list' && read.collaborationRootConversationId === undefined) {
+      this.lists.push({ domain: read.domain, where: { ...read.where } });
+    } else {
+      // Rooted collaboration reads depend on ancestry as well as their result domain.
+      for (const domain of ['Conversation', 'Turn', 'ChildExecution', 'ChildExecutionParentLink']) this.materializing.add(domain);
+    }
   }
   private id(domain: string, id: unknown): void {
     let ids = this.ids.get(domain); if (!ids) this.ids.set(domain, ids = new Set()); ids.add(String(id));
   }
-  public domains(): Set<string> { return new Set([...this.ids.keys(), ...this.lists.map(read => read.domain)]); }
+  public domains(): Set<string> { return new Set([...this.ids.keys(), ...this.lists.map(read => read.domain), ...this.materializing]); }
   public size(): number {
     return JSON.stringify([...this.ids].map(([domain, ids]) => [domain, [...ids]])).length * 2
       + JSON.stringify(this.lists, (_, value) => typeof value === 'bigint' ? String(value) : value).length * 2 + (this.coverage?.length ?? 0) * 2 + JSON.stringify([...this.turns]).length * 2;
