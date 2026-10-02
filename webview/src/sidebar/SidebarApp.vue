@@ -92,6 +92,8 @@ const favoritesViewActive = ref(false);
 const projectFolders = ref<ProjectFolderCandidateRecord[]>([]);
 const activeScopeKind = ref<SidebarHistoryScopeKind>('currentProject');
 const activeProjectFolderUri = ref<string | undefined>();
+const historyScopeIntent = ref<{ scopeKind: SidebarHistoryScopeKind; projectFolderUri?: string }>();
+const scopePagePending = ref(false);
 const currentProjectScope = ref<ConversationHistoryScope>({ kind: 'all' });
 const openConversations = ref<OpenConversationPanelRecord[]>([]);
 const pageInfo = ref<ConversationHistoryPageInfo>();
@@ -106,9 +108,9 @@ const hiddenByDeletion = computed(() => withDeletedDescendants(
   originLinks.value
 ));
 const visibleEntries = computed(() => entries.value.filter((entry) =>
+  // Empty Conversations are real selectable records in the backend's count and page order.
+  // Hiding them here makes counts disagree and can leave an entire page inaccessible.
   !hiddenByDeletion.value.has(entry.id)
-  // 功能3:空会话不显示;但正在运行的会话即使暂无消息也保留,避免误藏进行中会话
-  && (entry.messageCount > 0 || entry.isRunning)
 ));
 // 收藏是纯显示层:切到收藏视图时在当前已加载条目内按收藏集过滤,最近时间排序;不影响原分区排序
 const displayEntries = computed(() => {
@@ -128,11 +130,12 @@ const visibleHistoryNodes = computed(() => flattenVisibleHistoryNodesWithIntent(
 const historyScrollbarRefreshKey = computed(() => `${visibleEntries.value.length}:${visibleHistoryNodes.value.length}`);
 const historyCountText = computed(() => {
   if (!historyReady.value) return "正在加载对话...";
+  if (scopePagePending.value) return '正在读取所选范围…';
   // 收藏视图只反映当前已加载页内被收藏的条目数;其他视图按后端分页 total 统计
   if (favoritesViewActive.value) {
     return `${displayEntries.value.length} 个收藏 · 当前页`;
   }
-  // 待删除隐藏数只统计真正因删除/移除被隐藏的条目,不把空会话过滤算进去,避免低估总数
+  // Only pending deletions are hidden locally; empty Conversations remain in this page.
   const hiddenPendingDeletes = entries.value.filter((entry) => hiddenByDeletion.value.has(entry.id)).length;
   const total = Math.max(0, (pageInfo.value?.total ?? entries.value.length) - hiddenPendingDeletes);
   const page = pageInfo.value ? `第 ${pageInfo.value.pageIndex + 1} 页` : "当前页";
@@ -258,6 +261,14 @@ onMounted(() => {
       return;
     }
     if (message.type !== SIDEBAR_MESSAGE.state) return;
+    // Panel-activation notifications can carry the Host's cached history while a new scope is
+    // loading. Keep the displayed rows, but never lend that old scope's cursor to the new one.
+    openConversations.value = Array.isArray(message.openConversations) ? message.openConversations : [];
+    const intent = historyScopeIntent.value;
+    if (intent && (message.activeScopeKind !== intent.scopeKind
+      || (intent.scopeKind === 'project' && message.activeProjectFolderUri !== intent.projectFolderUri))) return;
+    if (scopePagePending.value && message.history?.pageInfo?.pageIndex !== 0) return;
+    scopePagePending.value = false;
     historyReady.value = true;
     const nextScopeKind = favoritesViewActive.value ? activeScopeKind.value : (message.activeScopeKind ?? activeScopeKind.value);
     const nextPageIdentity = historyPageIdentity(message.history);
@@ -279,7 +290,6 @@ onMounted(() => {
     else if (nextScopeKind !== 'project') activeProjectFolderUri.value = undefined;
     currentProjectScope.value = message.currentProjectScope ?? currentProjectScope.value;
     projectFolders.value = Array.isArray(message.projectFolders) ? message.projectFolders : [];
-    openConversations.value = Array.isArray(message.openConversations) ? message.openConversations : [];
     ensureActiveScopeVisible();
     ensureActiveConversationAncestorsExpanded();
     ensureNewActiveAgentAncestorsExpanded();
@@ -316,16 +326,18 @@ function switchScope(option: ScopeOption): void {
   favoritesViewActive.value = false;
   activeScopeKind.value = option.scopeKind;
   activeProjectFolderUri.value = option.projectFolderUri;
+  historyScopeIntent.value = { scopeKind: option.scopeKind, projectFolderUri: option.projectFolderUri };
+  scopePagePending.value = true;
   requestHistoryPage(option.scopeKind, undefined, option.projectFolderUri);
 }
 
 function nextPage(): void {
-  if (!pageInfo.value?.nextCursor) return;
+  if (scopePagePending.value || !pageInfo.value?.nextCursor) return;
   requestHistoryPage(activeScopeKind.value, pageInfo.value.nextCursor, activeProjectFolderUri.value);
 }
 
 function previousPage(): void {
-  if (!pageInfo.value?.previousCursor) return;
+  if (scopePagePending.value || !pageInfo.value?.previousCursor) return;
   requestHistoryPage(activeScopeKind.value, pageInfo.value.previousCursor, activeProjectFolderUri.value);
 }
 
@@ -936,9 +948,9 @@ function historyNodeStyle(node: VisibleHistoryTreeNode): Record<string, string> 
       </div>
 
       <div v-if="historyReady" class="history-pagination" aria-label="对话历史分页">
-        <button type="button" class="secondary-button" :disabled="!pageInfo?.hasPrevious" @click="previousPage">上一页</button>
+        <button type="button" class="secondary-button" :disabled="scopePagePending || !pageInfo?.hasPrevious" @click="previousPage">上一页</button>
         <span>第 {{ (pageInfo?.pageIndex ?? 0) + 1 }} 页</span>
-        <button type="button" class="secondary-button" :disabled="!pageInfo?.hasNext" @click="nextPage">下一页</button>
+        <button type="button" class="secondary-button" :disabled="scopePagePending || !pageInfo?.hasNext" @click="nextPage">下一页</button>
       </div>
     </section>
 
