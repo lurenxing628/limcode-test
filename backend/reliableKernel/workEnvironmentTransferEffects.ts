@@ -8,6 +8,7 @@ import {
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { retryLocalExecution } from './localExecutionRecovery';
 import { handoffReason } from './executionLeaseFence';
 
 export const WORK_ENVIRONMENT_TRANSFER_EFFECT_KIND = 'file_transfer' as const;
@@ -75,13 +76,16 @@ export class WorkEnvironmentTransferEffectDispatcher {
         return { observation: null, terminal: cancelled.terminal ?? await this.terminalForIntent(effectIntentId) };
       }
     }
-    if (!await this.effects.claimEffectDispatch(effectIntentId)) {
+    if (!await retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId))) {
       return { observation: null, terminal: await this.terminalForIntent(effectIntentId) };
     }
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    const request = normalizeRequest(
-      await this.effects.readEffectRequest<WorkEnvironmentTransferEffectRequest>(effectIntentId)
-    );
+    const { intent, request } = await retryLocalExecution(async () => {
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      const request = normalizeRequest(
+        await this.effects.readEffectRequest<WorkEnvironmentTransferEffectRequest>(effectIntentId)
+      );
+      return { intent, request };
+    });
     let observation: WorkEnvironmentTransferObservation;
     if (signal?.aborted) {
       observation = {
@@ -121,16 +125,17 @@ export class WorkEnvironmentTransferEffectDispatcher {
         };
       }
     }
-    const receipt = await this.effects.recordEffectReceipt({
+    // Observation persistence is independent of foreground cancellation. Never retry execute.
+    const receipt = await retryLocalExecution(() => this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `file-transfer:${String(intent.attempt_id)}:receipt` },
       attemptId: requireId(intent.attempt_id, 'EffectIntent.attempt_id'),
       effectKind: WORK_ENVIRONMENT_TRANSFER_EFFECT_KIND,
       outcome: observation.outcome,
       detail: observation
-    });
+    }));
     return {
       observation,
-      terminal: await this.reconcileEffectReceipt(receipt.effectReceiptId, 'internal')
+      terminal: await retryLocalExecution(() => this.reconcileEffectReceipt(receipt.effectReceiptId, 'internal'))
     };
   }
 

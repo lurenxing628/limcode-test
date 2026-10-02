@@ -63,6 +63,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import { listAllDomainRows } from './repositoryPagination';
 import { RootAuthority } from './rootAuthority';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { LocalExecutionRecoveryExhaustedError, retryLocalExecution } from './localExecutionRecovery';
 import { hasMatchingTerminalProcessReceipt } from './runtimeProcessHistory';
 import {
   currentExecutionLeaseFence,
@@ -370,23 +371,27 @@ export class ProcessControlPlane {
       });
       if (cancelled) return { observation: null, terminal: cancelled.terminal ?? null };
     }
-    if (!await this.effects.claimEffectDispatch(effectIntentId)) return { observation: null, terminal: null };
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    const request = normalizeStartRequest(await this.effects.readEffectRequest<ProcessStartRequest>(effectIntentId));
+    if (!await retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId))) return { observation: null, terminal: null };
+    const { intent, request } = await retryLocalExecution(async () => {
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      const request = normalizeStartRequest(await this.effects.readEffectRequest<ProcessStartRequest>(effectIntentId));
+      return { intent, request };
+    });
     const launch: ProcessLaunchObservation = signal?.aborted
       ? { outcome: 'cancelled', error: 'Process start cancelled before wrapper launch.' }
       : await this.launchDispatched(effectIntentId, signal);
-    const observation = await this.observeStart(request, launch, foregroundWaitMs, signal);
-    const recorded = await this.effects.recordEffectReceipt({
+    // Launch is never repeated. Foreground observation and persistence retain this exact launch.
+    const observation = await retryLocalExecution(() => this.observeStart(request, launch, foregroundWaitMs, signal));
+    const recorded = await retryLocalExecution(() => this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `process-start:${String(intent.attempt_id)}:receipt` },
       attemptId: intent.attempt_id as string,
       effectKind: PROCESS_START,
       outcome: observation.outcome,
       detail: observation
-    });
+    }));
     return {
       observation,
-      terminal: await this.reconcileStartReceipt(recorded.effectReceiptId)
+      terminal: await retryLocalExecution(() => this.reconcileStartReceipt(recorded.effectReceiptId))
     };
   }
 
@@ -396,16 +401,19 @@ export class ProcessControlPlane {
     signal?: AbortSignal
   ): Promise<ProcessLaunchObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
-    await this.validateBinding();
+    await retryLocalExecution(() => this.validateBinding());
     if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before spool creation.' };
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    if (intent.effect_kind !== PROCESS_START || intent.dispatch_state !== 'dispatched') {
-      throw new Error('Process launch requires a committed dispatched process_start EffectIntent.');
-    }
-    if ((await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1)).length > 0) {
-      throw new Error('process_start EffectIntent already has a Receipt and cannot launch again.');
-    }
-    const request = normalizeStartRequest(await this.effects.readEffectRequest<ProcessStartRequest>(effectIntentId));
+    const request = await retryLocalExecution(async () => {
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      if (intent.effect_kind !== PROCESS_START || intent.dispatch_state !== 'dispatched') {
+        throw new Error('Process launch requires a committed dispatched process_start EffectIntent.');
+      }
+      if ((await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1)).length > 0) {
+        throw new Error('process_start EffectIntent already has a Receipt and cannot launch again.');
+      }
+      return normalizeStartRequest(await this.effects.readEffectRequest<ProcessStartRequest>(effectIntentId));
+    });
+    if (signal?.aborted) return { outcome: 'cancelled', error: 'Process start cancelled before spool creation.' };
     const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
     try {
       await fs.mkdir(processSpoolRoot(this.binding), { recursive: true });
@@ -602,26 +610,28 @@ export class ProcessControlPlane {
       });
       return null;
     }
-    if (!await this.effects.claimEffectDispatch(effectIntentId)) return null;
+    if (!await retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId))) return null;
     const outcome = await this.executeDispatchedStop(effectIntentId, signal);
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    const recorded = await this.effects.recordEffectReceipt({
+    const intent = await retryLocalExecution(() => this.requireExisting('EffectIntent', effectIntentId));
+    const recorded = await retryLocalExecution(() => this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `process-stop:${String(intent.attempt_id)}:receipt` },
       attemptId: intent.attempt_id as string,
       effectKind: PROCESS_STOP,
       outcome: outcome.outcome,
       detail: outcome
+    }));
+    return retryLocalExecution(async () => {
+      const persisted = await this.requireExisting('EffectReceipt', recorded.effectReceiptId);
+      const persistedOutcome = requireProcessStopOutcome(persisted.outcome);
+      return {
+        outcome: persistedOutcome,
+        terminal: await this.effects.completeOperation({
+          source: { kind: 'internal', key: `process-stop-reconcile:${recorded.effectReceiptId}` },
+          effectReceiptId: recorded.effectReceiptId,
+          outcome: persistedOutcome
+        })
+      };
     });
-    const persisted = await this.requireExisting('EffectReceipt', recorded.effectReceiptId);
-    const persistedOutcome = requireProcessStopOutcome(persisted.outcome);
-    return {
-      outcome: persistedOutcome,
-      terminal: await this.effects.completeOperation({
-        source: { kind: 'internal', key: `process-stop-reconcile:${recorded.effectReceiptId}` },
-        effectReceiptId: recorded.effectReceiptId,
-        outcome: persistedOutcome
-      })
-    };
   }
 
   /** Writes a request for the wrapper; the Extension Host never signals a bare PID/process group. */
@@ -637,13 +647,16 @@ export class ProcessControlPlane {
         reason: 'Process stop cancelled before the stop request was dispatched.'
       };
     }
-    await this.validateBinding();
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    if (intent.effect_kind !== PROCESS_STOP || intent.dispatch_state !== 'dispatched') {
-      throw new Error('Process stop requires a committed dispatched process_stop_request EffectIntent.');
-    }
-    const request = normalizeStopRequest(await this.effects.readEffectRequest<ProcessStopEffectRequest>(effectIntentId));
-    const processRow = await this.requireExisting('Process', request.processId);
+    const { request, processRow } = await retryLocalExecution(async () => {
+      await this.validateBinding();
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      if (intent.effect_kind !== PROCESS_STOP || intent.dispatch_state !== 'dispatched') {
+        throw new Error('Process stop requires a committed dispatched process_stop_request EffectIntent.');
+      }
+      const request = normalizeStopRequest(await this.effects.readEffectRequest<ProcessStopEffectRequest>(effectIntentId));
+      const processRow = await this.requireExisting('Process', request.processId);
+      return { request, processRow };
+    });
     if (!processEvidenceMatches(processRow, request)) {
       return {
         outcome: 'outcome_unknown',
@@ -737,7 +750,7 @@ export class ProcessControlPlane {
     processRow: DomainRow,
     options: { allowStopWrite: boolean; signal?: AbortSignal }
   ): Promise<ProcessStopObservation> {
-    const evidence = await this.readPersistedProcessEvidence(request.processId);
+    const evidence = await retryLocalExecution(() => this.readPersistedProcessEvidence(request.processId));
     if (evidence.receipt) {
       const persisted = persistedProcessObservation(evidence.process, evidence.receipt);
       if (persisted.state === 'exited') return terminalStopObservation(persisted, true);
@@ -745,26 +758,27 @@ export class ProcessControlPlane {
       throw new Error('Persisted ProcessReceipt cannot describe a running Process.');
     }
 
-    const before = await this.waitForTerminalProcessEvidence(request.processId, 0);
+    const before = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(request.processId, 0));
     if (before.state === 'exited') return terminalStopObservation(before, true);
 
     const spoolPath = processSpoolPath(this.binding, request.spoolLocator);
     const stopPath = path.join(spoolPath, PROCESS_WRAPPER_STOP_REQUEST_FILE);
     let matchingStopExists = false;
     try {
-      const persistedStop = parseStopRequest(await readJson(stopPath));
+      const persistedStop = parseStopRequest(await retryLocalExecution(() => readJson(stopPath)));
       assertStopRequestMatchesEffect(request, persistedStop);
       matchingStopExists = true;
     } catch (error) {
+      if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       if (!isNotFound(error)) return unknownStopObservation(errorMessage(error));
     }
 
     if (!matchingStopExists) {
       if (!options.allowStopWrite) {
-        const terminal = await this.waitForTerminalProcessEvidence(
+        const terminal = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(
           request.processId,
           PROCESS_STOP_RECEIPT_WAIT_MS
-        );
+        ));
         return terminal.state === 'exited'
           ? terminalStopObservation(terminal, true)
           : unknownStopObservation(
@@ -776,23 +790,24 @@ export class ProcessControlPlane {
 
       let identity: ProcessWrapperIdentity;
       try {
-        identity = parseWrapperIdentity(await readJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE)));
+        identity = parseWrapperIdentity(await retryLocalExecution(() => readJson(path.join(spoolPath, PROCESS_WRAPPER_IDENTITY_FILE))));
         assertIdentityMatchesStop(identity, request);
       } catch (error) {
-        const terminal = await this.waitForTerminalProcessEvidence(
+        if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
+        const terminal = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(
           request.processId,
           PROCESS_STOP_RECEIPT_WAIT_MS
-        );
+        ));
         return terminal.state === 'exited'
           ? terminalStopObservation(terminal, true)
           : unknownStopObservation(errorMessage(error));
       }
 
       if (!isWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
-        const terminal = await this.waitForTerminalProcessEvidence(
+        const terminal = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(
           request.processId,
           PROCESS_STOP_RECEIPT_WAIT_MS
-        );
+        ));
         return terminal.state === 'exited'
           ? terminalStopObservation(terminal, true)
           : unknownStopObservation('Recorded process wrapper is not reachable and no terminal receipt converged.');
@@ -802,16 +817,16 @@ export class ProcessControlPlane {
           return unknownStopObservation('Live process start fingerprint does not match.');
         }
       } catch (error) {
-        const terminal = await this.waitForTerminalProcessEvidence(
+        const terminal = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(
           request.processId,
           PROCESS_STOP_RECEIPT_WAIT_MS
-        );
+        ));
         return terminal.state === 'exited'
           ? terminalStopObservation(terminal, true)
           : unknownStopObservation(errorMessage(error));
       }
 
-      const terminalBeforeWrite = await this.waitForTerminalProcessEvidence(request.processId, 0);
+      const terminalBeforeWrite = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(request.processId, 0));
       if (terminalBeforeWrite.state === 'exited') return terminalStopObservation(terminalBeforeWrite, true);
       if (options.signal?.aborted) {
         return {
@@ -833,16 +848,16 @@ export class ProcessControlPlane {
         await writeAtomicJsonOnce(stopPath, stop);
       } catch (error) {
         if (!isAlreadyExists(error)) throw error;
-        const winner = parseStopRequest(await readJson(stopPath));
+        const winner = parseStopRequest(await retryLocalExecution(() => readJson(stopPath)));
         assertStopRequestMatchesEffect(request, winner);
       }
       matchingStopExists = true;
     }
 
-    const after = await this.waitForTerminalProcessEvidence(
+    const after = await retryLocalExecution(() => this.waitForTerminalProcessEvidence(
       request.processId,
       PROCESS_STOP_RECEIPT_WAIT_MS
-    );
+    ));
     if (after.state === 'exited') return terminalStopObservation(after, false);
     if (!matchingStopExists) {
       return unknownStopObservation(
@@ -1538,17 +1553,19 @@ export class ProcessControlPlane {
     if (evidence.receipt) return persistedProcessObservation(processRow, evidence.receipt);
     const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
     try {
-      const receipt = parseWrapperExitReceipt(await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
+      const receipt = parseWrapperExitReceipt(await retryLocalExecution(() => readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE))));
       assertExitReceiptMatchesProcess(processRow, receipt);
       this.recordTerminalReceiptMetric(processId);
       return { state: 'exited', processId, receipt };
     } catch (error) {
+      if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       if (!isNotFound(error)) return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
     }
     let identity: ProcessWrapperIdentity;
     try {
-      identity = await this.requireMatchingIdentity(processRow, spoolPath);
+      identity = await retryLocalExecution(() => this.requireMatchingIdentity(processRow, spoolPath));
     } catch (error) {
+      if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
     }
     return this.observeVerifiedIdentity(identity, spoolPath);
@@ -1601,12 +1618,13 @@ export class ProcessControlPlane {
   ): Promise<ProcessWaitObservation> {
     const processId = identity.processId;
     try {
-      const raw = await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE));
+      const raw = await retryLocalExecution(() => readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)));
       const receipt = parseWrapperExitReceipt(raw);
       assertExitReceiptMatches(identity, receipt);
       this.recordTerminalReceiptMetric(processId);
       return { state: 'exited', processId, receipt };
     } catch (error) {
+      if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       if (!isNotFound(error)) return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
     }
     if (!isWrapperProcessReachable(identity.wrapperPid, path.join(spoolPath, 'launch.json'))) {
@@ -1617,12 +1635,13 @@ export class ProcessControlPlane {
       do {
         try {
           const receipt = parseWrapperExitReceipt(
-            await readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE))
+            await retryLocalExecution(() => readJson(path.join(spoolPath, PROCESS_WRAPPER_EXIT_RECEIPT_FILE)))
           );
           assertExitReceiptMatches(identity, receipt);
           this.recordTerminalReceiptMetric(processId);
           return { state: 'exited', processId, receipt };
         } catch (error) {
+          if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
           if (!isNotFound(error)) {
             return { state: 'outcome_unknown', processId, reason: errorMessage(error) };
           }

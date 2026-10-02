@@ -11,6 +11,7 @@ import {
 import { normalizePlainJson } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { retryLocalExecution } from './localExecutionRecovery';
 import { handoffReason } from './executionLeaseFence';
 
 export type McpRiskLevel = 'read' | 'write' | 'command';
@@ -146,19 +147,21 @@ export class McpEffectDispatcher {
       });
       if (cancelled) return { observation: null, terminal: cancelled.terminal ?? null };
     }
-    if (!await this.effects.claimEffectDispatch(effectIntentId)) return { observation: null, terminal: null };
+    if (!await retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId))) return { observation: null, terminal: null };
     const observation = await this.executeDispatched(effectIntentId, signal);
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
+    // The invocation has already completed. Keep its observation in this stack while only
+    // idempotent local receipt work retries, even after cancellation or lease handoff.
+    const intent = await retryLocalExecution(() => this.requireExisting('EffectIntent', effectIntentId));
     let recorded: RecordedEffectReceipt;
     let durableObservation = observation;
     try {
-      recorded = await this.effects.recordEffectReceipt({
+      recorded = await retryLocalExecution(() => this.effects.recordEffectReceipt({
         source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
         attemptId: intent.attempt_id as string,
         effectKind: MCP_EFFECT_KIND,
         outcome: observation.outcome,
         detail: observation
-      });
+      }));
     } catch (error) {
       if (!(error instanceof AttachmentAdmissionError)) throw error;
       // The server's observed execution outcome is already known. A local attachment failure
@@ -171,31 +174,33 @@ export class McpEffectDispatcher {
         attachmentError: `MCP result attachments could not be stored: ${boundedErrorMessage(error)}`,
         automaticRetry: false
       };
-      recorded = await this.effects.recordEffectReceipt({
+      recorded = await retryLocalExecution(() => this.effects.recordEffectReceipt({
         source: { kind: 'callback', key: `mcp-call:${String(intent.attempt_id)}:receipt` },
         attemptId: intent.attempt_id as string,
         effectKind: MCP_EFFECT_KIND,
         outcome: durableObservation.outcome,
         detail: durableObservation
-      });
+      }));
     }
     return {
       observation: durableObservation,
-      terminal: await this.reconcileEffectReceipt(recorded.effectReceiptId, 'internal')
+      terminal: await retryLocalExecution(() => this.reconcileEffectReceipt(recorded.effectReceiptId, 'internal'))
     };
   }
 
   /** Executes one committed dispatch. The returned observation may be lost and later recovered as unknown. */
   public async executeDispatched(effectIntentIdInput: string, signal?: AbortSignal): Promise<McpCallObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    if (intent.effect_kind !== MCP_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
-      throw new Error('MCP call requires a committed dispatched mcp_tool_call EffectIntent.');
-    }
-    if ((await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1)).length > 0) {
-      throw new Error('mcp_tool_call already has a Receipt and cannot execute again.');
-    }
-    const request = normalizeRequest(await this.effects.readEffectRequest<McpToolCallRequest>(effectIntentId));
+    const request = await retryLocalExecution(async () => {
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      if (intent.effect_kind !== MCP_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
+        throw new Error('MCP call requires a committed dispatched mcp_tool_call EffectIntent.');
+      }
+      if ((await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1)).length > 0) {
+        throw new Error('mcp_tool_call already has a Receipt and cannot execute again.');
+      }
+      return normalizeRequest(await this.effects.readEffectRequest<McpToolCallRequest>(effectIntentId));
+    });
     if (signal?.aborted) {
       return { outcome: 'cancelled', error: 'MCP call was cancelled before the connection was invoked.' };
     }

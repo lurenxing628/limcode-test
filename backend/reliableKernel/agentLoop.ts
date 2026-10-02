@@ -2233,7 +2233,7 @@ export class ReliableAgentLoop {
       // Host handoff is not a tool failure. The durable ToolCall/Effect frontier deliberately
       // remains incomplete so the next lease generation can recover it; materializing a failed
       // ToolOutcome here would both lie to the model and race a still-running detached process.
-      if (isExecutionHandoffError(error)) throw error;
+      if (isExecutionHandoffError(error) || error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       await this.effects.finalizeReadyInOrder(input.turnId);
       const terminal = await this.effects.readTerminalResult(input.call.toolCallId, false);
       if (terminal) return terminal;
@@ -2871,7 +2871,7 @@ export class ReliableAgentLoop {
     try {
       return await this.tools.scheduleAdmittedCall(input);
     } catch (error) {
-      if (isExecutionHandoffError(error)) throw error;
+      if (isExecutionHandoffError(error) || error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       await this.effects.finalizeReadyInOrder(input.turnId);
       const terminal = await this.effects.readTerminalResult(input.toolCallId, false);
       if (terminal) return terminal;

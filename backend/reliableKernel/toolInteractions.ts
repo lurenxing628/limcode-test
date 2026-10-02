@@ -19,6 +19,7 @@ import {
 } from './effectControlPlane';
 import { canonicalPlainJson as canonicalJson, normalizePlainJson } from './plainJson';
 import { frozenInteractionAutoApproval, readFrozenTurnAuthority } from './frozenAuthority';
+import { retryLocalExecution } from './localExecutionRecovery';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -537,8 +538,9 @@ export class ToolInteractionControlPlane {
     const receiptId = sourceReceiptId(source, 'ask-user-resolve', JSON.stringify([requestId, status]));
     const duplicate = await this.findSourceReceipt(source);
     if (duplicate) {
-      await this.effects.finalizeReadyInOrder(turn.id as string);
-      return this.replayResolution(duplicate, receiptId, requestId);
+      return this.finishCommittedInteraction(turn.id as string, () =>
+        this.replayResolution(duplicate, receiptId, requestId)
+      );
     }
     const existingResponse = (await this.list('InteractionResponse', { request_id: requestId }, 2))[0];
     if (existingResponse) {
@@ -550,8 +552,9 @@ export class ToolInteractionControlPlane {
         turnId: turn.id as string,
         steps: []
       });
-      await this.effects.finalizeReadyInOrder(turn.id as string);
-      return this.lostResolutionResult(committed.receipt, requestId, committed.deduplicated);
+      return this.finishCommittedInteraction(turn.id as string, () =>
+        this.lostResolutionResult(committed.receipt, requestId, committed.deduplicated)
+      );
     }
     const facts = await this.requireActiveToolFacts(toolCallId);
     if (
@@ -623,16 +626,19 @@ export class ToolInteractionControlPlane {
       ]
     });
     if (committed.deduplicated) {
-      await this.effects.finalizeReadyInOrder(facts.turn.id as string);
-      return this.replayResolution(committed.receipt, receiptId, requestId);
+      return this.finishCommittedInteraction(facts.turn.id as string, () =>
+        this.replayResolution(committed.receipt, receiptId, requestId)
+      );
     }
     if (committed.firstResponseLost) {
-      await this.effects.finalizeReadyInOrder(facts.turn.id as string);
-      return this.lostResolutionResult(committed.receipt, requestId, false);
+      return this.finishCommittedInteraction(facts.turn.id as string, () =>
+        this.lostResolutionResult(committed.receipt, requestId, false)
+      );
     }
-    const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
-    const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
-      ?? await this.effects.readTerminalResult(toolCallId, false);
+    const terminal = await this.finishCommittedInteraction(facts.turn.id as string, (finalized) =>
+      finalized.find((entry) => entry.toolCallId === toolCallId)
+        ?? this.effects.readTerminalResult(toolCallId, false)
+    );
     return {
       receiptId,
       requestId,
@@ -641,6 +647,14 @@ export class ToolInteractionControlPlane {
       commitSeq: committed.commitSeq,
       ...(terminal ? { terminal: { ...terminal, receiptId } } : {})
     };
+  }
+
+  /** Complete only local ordered result work after the first response is already durable. */
+  private finishCommittedInteraction<T>(
+    turnId: string,
+    readResult: (finalized: ToolTerminalResult[]) => Promise<T> | T
+  ): Promise<T> {
+    return retryLocalExecution(async () => readResult(await this.effects.finalizeReadyInOrder(turnId)));
   }
 
   public async resolvePlanReview(input: {
@@ -793,10 +807,13 @@ export class ToolInteractionControlPlane {
     if (await this.ensureWinningPlanDelegation(requestId, receiptId, proposalId, subject.planRequest) === 'deferred') {
       return { receiptId, requestId, proposalId, won: true, deduplicated: false, commitSeq: committed.commitSeq };
     }
-    await this.settleWinningPlanResponse(requestId, receiptId);
-    const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
-    const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
-      ?? await this.effects.readTerminalResult(toolCallId, false);
+    // Delegation above is not part of local result recovery. The immutable first response owns
+    // this settlement, including when its transaction committed but the acknowledgement was lost.
+    await retryLocalExecution(() => this.settleWinningPlanResponse(requestId, receiptId));
+    const terminal = await this.finishCommittedInteraction(facts.turn.id as string, (finalized) =>
+      finalized.find((entry) => entry.toolCallId === toolCallId)
+        ?? this.effects.readTerminalResult(toolCallId, false)
+    );
     return {
       receiptId,
       requestId,
@@ -917,12 +934,15 @@ export class ToolInteractionControlPlane {
   ): Promise<ToolTerminalResult | undefined> {
     const cancelled = status === 'cancelled';
     const reason = cancelled ? '工具执行审批已取消。' : '用户拒绝执行工具。';
-    const settled = await this.effects.settleWithoutEffect({
-      source: { kind: 'internal', key: `execution-approval-${status}:${requestId}` },
+    const settlement = {
+      source: { kind: 'internal' as const, key: `execution-approval-${status}:${requestId}` },
       toolCallId,
       status,
       detail: { requestId, reason }
-    });
+    };
+    // The user's first decision is already committed. Finish that exact local result before
+    // acknowledging it and waking its owner; never reinterpret the decision or execute the tool.
+    const settled = await retryLocalExecution(() => this.effects.settleWithoutEffect(settlement));
     return settled.terminal;
   }
 
@@ -1236,8 +1256,8 @@ export class ToolInteractionControlPlane {
       subject.proposalId,
       subject.planRequest
     ) === 'deferred') return;
-    await this.settleWinningPlanResponse(requestId, winnerReceiptId);
-    await this.effects.finalizeReadyInOrder(parentTurnId);
+    await retryLocalExecution(() => this.settleWinningPlanResponse(requestId, winnerReceiptId));
+    await this.finishCommittedInteraction(parentTurnId, () => undefined);
   }
 
   private async replayPlanResolution(
@@ -1251,7 +1271,7 @@ export class ToolInteractionControlPlane {
     const won = await this.responseReceiptWon(requestId, receipt.id as string);
     await this.helpWinningPlanResolution(requestId);
     const toolCallId = subject.toolCallId;
-    const terminal = await this.effects.readTerminalResult(toolCallId, true);
+    const terminal = await retryLocalExecution(() => this.effects.readTerminalResult(toolCallId, true));
     return {
       receiptId: receipt.id as string,
       requestId,
@@ -1268,8 +1288,10 @@ export class ToolInteractionControlPlane {
     proposalId: string,
     deduplicated: boolean
   ): Promise<PlanReviewResolutionResult> {
-    const toolCallId = (await this.readPlanReviewSubject(requestId)).toolCallId;
-    const terminal = await this.effects.readTerminalResult(toolCallId, true);
+    const terminal = await retryLocalExecution(async () => {
+      const toolCallId = (await this.readPlanReviewSubject(requestId)).toolCallId;
+      return this.effects.readTerminalResult(toolCallId, true);
+    });
     return {
       receiptId: receipt.id as string,
       requestId,

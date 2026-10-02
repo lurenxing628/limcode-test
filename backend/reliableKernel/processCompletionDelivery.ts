@@ -122,6 +122,8 @@ export class ProcessCompletionDeliveryControlPlane {
   private readonly automaticDeliveryRouter: AutomaticRuntimeDeliveryRouter;
   private wakeHandler: ProcessCompletionWakeHandler | undefined;
   private started = false;
+  private startPromise: Promise<ProcessCompletionDeliveryScanReport> | undefined;
+  private retryNotBefore = 0;
   private closing = false;
   private scanRequested = false;
   private scanPromise: Promise<ProcessCompletionDeliveryScanReport> | undefined;
@@ -183,25 +185,41 @@ export class ProcessCompletionDeliveryControlPlane {
     this.requestScan();
   }
 
-  public async start(): Promise<ProcessCompletionDeliveryScanReport> {
-    if (this.closing) throw new Error('Process completion delivery dispatcher is closing.');
+  public start(): Promise<ProcessCompletionDeliveryScanReport> {
+    if (this.closing) return Promise.reject(new Error('Process completion delivery dispatcher is closing.'));
+    if (this.startPromise) return this.startPromise;
     if (this.started) return this.scanNow();
     this.started = true;
-    this.externalDataVersion = await this.database.externalDataVersion();
-    const report = await this.scanNow();
-    const afterScanVersion = await this.database.externalDataVersion();
-    if (afterScanVersion !== this.externalDataVersion) this.requestScan();
-    this.externalDataVersion = afterScanVersion;
-    this.loopPromise = this.runLoop();
-    return report;
+    const task = (async () => {
+      const version = await this.database.externalDataVersion();
+      if (this.closing) throw new Error('Process completion delivery dispatcher is closing.');
+      const report = await this.scanNow();
+      if (this.closing) return report;
+      this.externalDataVersion = version;
+      const afterScanVersion = await this.database.externalDataVersion();
+      if (!this.closing && afterScanVersion !== version) this.requestScan();
+      return report;
+    })().catch((error) => {
+      this.retryPollingNeeded = true;
+      this.retryNotBefore = Date.now() + this.scanIntervalMs;
+      throw error;
+    }).finally(() => {
+      if (this.startPromise === task) this.startPromise = undefined;
+      // A startup read/scan failure must not prevent the durable outbox's next retry.
+      if (!this.closing && !this.loopPromise) this.loopPromise = this.runLoop();
+    });
+    this.startPromise = task;
+    return task;
   }
 
   public scanNow(): Promise<ProcessCompletionDeliveryScanReport> {
+    if (this.closing) return Promise.reject(new Error('Process completion delivery dispatcher is closing.'));
     if (this.scanPromise) return this.scanPromise;
     this.scanRequested = false;
     const tracked = this.scanOnce()
       .catch((error) => {
         this.retryPollingNeeded = true;
+        this.retryNotBefore = Date.now() + this.scanIntervalMs;
         throw error;
       })
       .finally(() => {
@@ -258,20 +276,15 @@ export class ProcessCompletionDeliveryControlPlane {
   }
 
   public async dispose(): Promise<void> {
-    if (this.closing) {
-      await this.loopPromise;
-      await this.scanPromise;
-      return;
-    }
     this.closing = true;
     this.started = false;
     this.unsubscribeCommit();
     for (const wake of [...this.loopWakeups]) wake();
-    await this.loopPromise;
-    await this.scanPromise;
+    await Promise.allSettled([this.startPromise, this.loopPromise, this.scanPromise]);
   }
 
   private requestScan(): void {
+    if (this.closing) return;
     this.scanRequested = true;
     for (const wake of [...this.loopWakeups]) wake();
   }
@@ -280,18 +293,28 @@ export class ProcessCompletionDeliveryControlPlane {
     while (!this.closing) {
       await this.waitForScan();
       if (this.closing) return;
-      if (!this.scanRequested && !this.retryPollingNeeded) {
-        const version = await this.database.externalDataVersion();
+      if (Date.now() < this.retryNotBefore) continue;
+      try {
+        let version: string | undefined;
+        if (!this.scanRequested && !this.retryPollingNeeded) {
+          version = await this.database.externalDataVersion();
+          if (this.closing) return;
+          if (version === this.externalDataVersion) continue;
+        }
+        await this.scanNow();
         if (this.closing) return;
-        if (version === this.externalDataVersion) continue;
-        this.externalDataVersion = version;
+        if (version !== undefined) this.externalDataVersion = version;
+        this.retryNotBefore = 0;
+      } catch (error) {
+        this.retryPollingNeeded = true;
+        this.retryNotBefore = Date.now() + this.scanIntervalMs;
+        this.reportError('scan', 'level-trigger', error);
       }
-      await this.scanNow().catch((error) => this.reportError('scan', 'level-trigger', error));
     }
   }
 
   private waitForScan(): Promise<void> {
-    if (this.closing || this.scanRequested) return Promise.resolve();
+    if (this.closing || (this.scanRequested && Date.now() >= this.retryNotBefore)) return Promise.resolve();
     return new Promise((resolve) => {
       let timer: ReturnType<typeof setTimeout> | undefined;
       let settled = false;
@@ -302,7 +325,7 @@ export class ProcessCompletionDeliveryControlPlane {
         this.loopWakeups.delete(finish);
         resolve();
       };
-      timer = setTimeout(finish, this.scanIntervalMs);
+      timer = setTimeout(finish, Math.max(this.scanIntervalMs, this.retryNotBefore - Date.now()));
       timer.unref?.();
       this.loopWakeups.add(finish);
     });

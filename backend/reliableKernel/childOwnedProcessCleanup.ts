@@ -7,6 +7,7 @@ import {
 import { DOMAIN_REPOSITORIES } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
+import { isRetryableLocalExecutionError } from './localExecutionRecovery';
 
 const CLEANUP_POLL_MS = 500;
 const EXTERNAL_CHANGE_POLL_MS = 1_000;
@@ -23,6 +24,9 @@ export class ChildOwnedProcessCleanupControlPlane {
   private pass: Promise<void> | undefined;
   private rerun = false;
   private started = false;
+  private startPromise: Promise<void> | undefined;
+  private externalPollTask: Promise<void> | undefined;
+  private retryNotBefore = 0;
   private closing = false;
   private materializationDirty = true;
   private pollingNeeded = false;
@@ -45,18 +49,37 @@ export class ChildOwnedProcessCleanupControlPlane {
     });
   }
 
-  public async start(): Promise<void> {
-    if (this.closing) throw new Error('Child owned-process cleanup is closing.');
+  public start(): Promise<void> {
+    if (this.closing) return Promise.reject(new Error('Child owned-process cleanup is closing.'));
+    if (this.startPromise) return this.startPromise;
+    if (this.started) return this.reconcile();
     this.started = true;
-    this.externalDataVersion = await this.database.externalDataVersion();
-    await this.reconcile();
-    const afterRecoveryVersion = await this.database.externalDataVersion();
-    if (afterRecoveryVersion !== this.externalDataVersion) {
-      this.externalDataVersion = afterRecoveryVersion;
+    const task = (async () => {
+      const version = await this.database.externalDataVersion();
+      if (this.closing) return;
       this.materializationDirty = true;
       await this.reconcile();
-    }
-    this.scheduleExternalChangePoll();
+      if (this.closing) return;
+      this.externalDataVersion = version;
+      const afterRecoveryVersion = await this.database.externalDataVersion();
+      if (this.closing) return;
+      if (afterRecoveryVersion !== version) {
+        this.materializationDirty = true;
+        await this.reconcile();
+        if (!this.closing) this.externalDataVersion = afterRecoveryVersion;
+      }
+    })().catch((error) => {
+      this.materializationDirty = true;
+      this.pollingNeeded = true;
+      this.retryNotBefore = Date.now() + CLEANUP_POLL_MS;
+      throw error;
+    }).finally(() => {
+      if (this.startPromise === task) this.startPromise = undefined;
+      this.schedule();
+      this.scheduleExternalChangePoll();
+    });
+    this.startPromise = task;
+    return task;
   }
 
   public notify(): void {
@@ -64,8 +87,12 @@ export class ChildOwnedProcessCleanupControlPlane {
     this.materializationDirty = true;
     if (!this.started) return;
     this.rerun = true;
+    if (Date.now() < this.retryNotBefore) {
+      this.schedule();
+      return;
+    }
     this.cancelScheduledPoll();
-    void this.reconcile();
+    this.reconcileInBackground();
   }
 
   public async reconcile(): Promise<void> {
@@ -76,6 +103,7 @@ export class ChildOwnedProcessCleanupControlPlane {
     }
     this.cancelScheduledPoll();
     let pollingNeeded = false;
+    let failed = false;
     const task = (async () => {
       do {
         this.rerun = false;
@@ -91,10 +119,16 @@ export class ChildOwnedProcessCleanupControlPlane {
         if (this.closing) break;
         pollingNeeded = await this.convergeCleanupRows();
       } while (this.rerun && !this.closing);
-    })().finally(() => {
+      this.retryNotBefore = 0;
+    })().catch((error) => {
+      failed = true;
+      pollingNeeded = true;
+      this.retryNotBefore = Date.now() + CLEANUP_POLL_MS;
+      throw error;
+    }).finally(() => {
       if (this.pass === task) this.pass = undefined;
       this.pollingNeeded = pollingNeeded && !this.closing;
-      if (this.rerun && !this.closing) void this.reconcile();
+      if (this.rerun && !failed && !this.closing) this.reconcileInBackground();
       else this.schedule();
     });
     this.pass = task;
@@ -107,16 +141,24 @@ export class ChildOwnedProcessCleanupControlPlane {
     this.cancelScheduledPoll();
     if (this.externalTimer) clearTimeout(this.externalTimer);
     this.externalTimer = undefined;
-    await this.pass;
+    await Promise.allSettled([this.startPromise, this.externalPollTask, this.pass].filter(
+      (task): task is Promise<void> => task !== undefined
+    ));
   }
 
   private schedule(): void {
     if (!this.started || this.closing || !this.pollingNeeded || this.timer) return;
     this.timer = setTimeout(() => {
       this.timer = undefined;
-      void this.reconcile();
-    }, CLEANUP_POLL_MS);
+      this.reconcileInBackground();
+    }, Math.max(CLEANUP_POLL_MS, this.retryNotBefore - Date.now()));
     this.timer.unref?.();
+  }
+
+  private reconcileInBackground(): void {
+    void this.reconcile().catch((error) => {
+      if (!this.closing) console.warn('[reliable-kernel] Child process cleanup will retry.', error);
+    });
   }
 
   private cancelScheduledPoll(): void {
@@ -128,9 +170,12 @@ export class ChildOwnedProcessCleanupControlPlane {
     if (!this.started || this.closing || this.externalTimer) return;
     this.externalTimer = setTimeout(() => {
       this.externalTimer = undefined;
-      void this.pollExternalChanges()
-        .catch(() => undefined)
-        .finally(() => this.scheduleExternalChangePoll());
+      const task = this.pollExternalChanges();
+      this.externalPollTask = task;
+      void task.catch(() => undefined).finally(() => {
+        if (this.externalPollTask === task) this.externalPollTask = undefined;
+        this.scheduleExternalChangePoll();
+      });
     }, EXTERNAL_CHANGE_POLL_MS);
     this.externalTimer.unref?.();
   }
@@ -138,9 +183,9 @@ export class ChildOwnedProcessCleanupControlPlane {
   private async pollExternalChanges(): Promise<void> {
     const version = await this.database.externalDataVersion();
     if (this.closing || version === this.externalDataVersion) return;
-    this.externalDataVersion = version;
     this.materializationDirty = true;
     await this.reconcile();
+    if (!this.closing) this.externalDataVersion = version;
   }
 
   private async materializeCleanupRows(): Promise<void> {
@@ -199,6 +244,12 @@ export class ChildOwnedProcessCleanupControlPlane {
       try {
         observation = await this.processes.stopOwnedProcess(processId);
       } catch (error) {
+        // A failed observation proves nothing about the process. Keep the durable cleanup pending
+        // and continue with its siblings; only a real unknown-outcome observation needs a human.
+        if (isRetryableLocalExecutionError(error)) {
+          pollingNeeded = true;
+          continue;
+        }
         observation = {
           outcome: 'outcome_unknown' as const,
           status: 'outcome_unknown' as const,

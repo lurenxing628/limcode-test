@@ -104,6 +104,7 @@ import { listAllDomainRows } from './repositoryPagination';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import type { ToolInteractionControlPlane } from './toolInteractions';
 import { WorkEnvironmentTransferEffectDispatcher } from './workEnvironmentTransferEffects';
+import { LocalExecutionRecoveryExhaustedError } from './localExecutionRecovery';
 import {
   ExecutionHandoffError,
   handoffReason,
@@ -2412,6 +2413,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     error: unknown,
     finalize = true
   ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    // An exhausted local recovery budget must reach the runtime's failure path. Converting it
+    // to a background pause would leave a dispatched effect waiting without a future wake.
+    if (error instanceof LocalExecutionRecoveryExhaustedError) throw error;
     if (finalize) await this.dependencies.effects.finalizeReadyInOrder(input.turnId);
     const terminal = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
     if (terminal) {

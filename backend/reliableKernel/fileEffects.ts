@@ -19,6 +19,7 @@ import { canonicalPlainJson as canonicalJson } from './plainJson';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
+import { isRetryableLocalExecutionError, LocalExecutionRecoveryExhaustedError, retryLocalExecution } from './localExecutionRecovery';
 import { assertFilePlanningRoot, FileMutationNotStartedError, FilePathConflictError, fileDescriptorMatchesPathState, fileStateIdentity, normalizeFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, withFileMutationTargets, type FilePlanningRoot } from './fileTargetBoundary';
 import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 
@@ -526,9 +527,13 @@ export class FileChangeControlPlane {
       if (!winner) throw new Error('FileChangeDecision race lost without a committed winner.');
       return this.decisionResultFromExisting(committed.receipt, winner, changeSetId, false);
     }
-    const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
-    const terminal = finalized.find((entry) => entry.toolCallId === toolCallId)
-      ?? await this.effects.readTerminalResult(toolCallId, false);
+    // The decline is already durable. Only finish its ordered local result before returning
+    // to the caller's owner wake; retrying this phase must never re-plan or apply file changes.
+    const terminal = await retryLocalExecution(async () => {
+      const finalized = await this.effects.finalizeReadyInOrder(facts.turn.id as string);
+      return finalized.find((entry) => entry.toolCallId === toolCallId)
+        ?? await this.effects.readTerminalResult(toolCallId, false);
+    });
     return {
       receiptId,
       changeSetId,
@@ -715,7 +720,12 @@ export class FileChangeControlPlane {
     const request = fileEffectRequest(changeSetId, await this.readStoredMembers(changeSetId));
     let actual: FileEffectRequest;
     try { actual = normalizeEffectRequest(await this.effects.readEffectRequest<FileEffectRequest>(effectIntentId)); }
-    catch { return { request, matches: false }; }
+    catch (error) {
+      // A temporary local read failure is not evidence that the approved request changed.
+      if (isRetryableLocalExecutionError(error) || error instanceof LocalExecutionRecoveryExhaustedError
+        || isExecutionHandoffError(error)) throw error;
+      return { request, matches: false };
+    }
     return { request, matches: canonicalJson(actual) === canonicalJson(request) };
   }
 
@@ -851,8 +861,10 @@ export class FileChangeControlPlane {
     if (!decision) throw new Error('Stable file decision source has no FileChangeDecision.');
     const changeSet = await this.requireExisting('FileChangeSet', changeSetId);
     const toolCall = await this.requireExisting('ToolCall', requireId(changeSet.tool_call_id, 'FileChangeSet.tool_call_id'));
-    await this.effects.finalizeReadyInOrder(requireId(toolCall.turn_id, 'ToolCall.turn_id'));
-    return this.decisionResultFromExisting(receipt, decision, changeSetId, deduplicated);
+    return retryLocalExecution(async () => {
+      await this.effects.finalizeReadyInOrder(requireId(toolCall.turn_id, 'ToolCall.turn_id'));
+      return this.decisionResultFromExisting(receipt, decision, changeSetId, deduplicated);
+    });
   }
 
   private async decisionResultFromExisting(
@@ -885,7 +897,9 @@ export class FileChangeControlPlane {
         }
       };
     }
-    const terminal = await this.effects.readTerminalResult(toolCallId, true, receipt.id as string);
+    const terminal = await retryLocalExecution(() =>
+      this.effects.readTerminalResult(toolCallId, true, receipt.id as string)
+    );
     return {
       receiptId: receipt.id as string,
       changeSetId,
@@ -1153,7 +1167,7 @@ export class FileMutationDispatcher {
       });
       if (cancelled) return null;
     }
-    if (!await this.effects.claimEffectDispatch(effectIntentId)) return null;
+    if (!await retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId))) return null;
     return this.executeDispatched(effectIntentId, signal);
   }
 
@@ -1163,14 +1177,16 @@ export class FileMutationDispatcher {
     signal?: AbortSignal
   ): Promise<FileMutationObservation> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    if (intent.effect_kind !== FILE_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
-      throw new Error('File mutation requires a committed dispatched file_mutation EffectIntent.');
-    }
-    const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1);
-    if (receipts.length > 0) throw new Error('File mutation EffectIntent already has a Receipt and cannot execute again.');
-    const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
-    const verified = await control.readApprovedEffectRequest(effectIntentId);
+    const verified = await retryLocalExecution(async () => {
+      const intent = await this.requireExisting('EffectIntent', effectIntentId);
+      if (intent.effect_kind !== FILE_EFFECT_KIND || intent.dispatch_state !== 'dispatched') {
+        throw new Error('File mutation requires a committed dispatched file_mutation EffectIntent.');
+      }
+      const receipts = await this.list('EffectReceipt', { attempt_id: intent.attempt_id }, 1);
+      if (receipts.length > 0) throw new Error('File mutation EffectIntent already has a Receipt and cannot execute again.');
+      const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
+      return control.readApprovedEffectRequest(effectIntentId);
+    });
     return verified.matches ? this.apply(verified.request, signal)
       : invalidRequestObservation(verified.request, 'conflict');
   }
@@ -1217,7 +1233,7 @@ export class FileMutationDispatcher {
     try {
       observation = await this.dispatch(effectIntentId, signal);
     } catch (error) {
-      if (isExecutionHandoffError(error)) throw error;
+      if (isExecutionHandoffError(error) || error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       const intent = await this.requireExisting('EffectIntent', effectIntentId);
       if (intent.effect_kind !== FILE_EFFECT_KIND || intent.dispatch_state !== 'dispatched') throw error;
       const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
@@ -1254,16 +1270,18 @@ export class FileMutationDispatcher {
         terminal: await this.effects.readTerminalResult(toolCallId, false)
       };
     }
-    const intent = await this.requireExisting('EffectIntent', effectIntentId);
-    const recorded = await this.effects.recordEffectReceipt({
+    // The filesystem result is already observed. Retry only its local, idempotent receipt
+    // and settlement steps; cancellation must not discard it or re-run the mutation.
+    const intent = await retryLocalExecution(() => this.requireExisting('EffectIntent', effectIntentId));
+    const recorded = await retryLocalExecution(() => this.effects.recordEffectReceipt({
       source: { kind: 'callback', key: `file-effect:${String(intent.attempt_id)}:receipt` },
       attemptId: intent.attempt_id as string,
       effectKind: FILE_EFFECT_KIND,
       outcome: fileObservationToEffectOutcome(observation.outcome),
       detail: observation
-    });
+    }));
     const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
-    return { observation, terminal: await control.reconcileEffectReceipt(recorded.effectReceiptId) };
+    return { observation, terminal: await retryLocalExecution(() => control.reconcileEffectReceipt(recorded.effectReceiptId)) };
   }
 
   public async inspect(requestInput: FileEffectRequest): Promise<FileMutationObservation> {
@@ -1339,7 +1357,7 @@ export class FileMutationDispatcher {
       // CAS/SQLite awaits finish before the last workspace snapshot. An editor change while
       // target bytes are loading must be a conflict, never overwritten using an earlier digest.
       bytes = member.operation === 'create_file' || member.operation === 'replace_file'
-        ? await this.readTargetBytes(member) : undefined;
+        ? await retryLocalExecution(() => this.readTargetBytes(member), { signal }) : undefined;
       resolved = await resolveBoundedTarget(this.resolveBoundary, member);
       await refuseSqliteDatabaseTarget(resolved, member.operation);
       before = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal);
