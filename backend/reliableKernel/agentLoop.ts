@@ -84,6 +84,7 @@ import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './p
 import { CLAUDE_TURN_SCOPED_REMINDER_DELIVERY, claudeTurnScopedRemindersEnabled } from './turnReminderProjection';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { orderRuntimeDeliveriesForInjection } from './runtimeDeliveryOrder';
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   isTurnTerminalGuidanceConflictError,
@@ -3434,14 +3435,11 @@ export class ReliableAgentLoop {
    * from another source Turn to its terminal commit, which passes them on to the next Turn.
    */
   private async absorbRuntimeDeliveryInputs(turnId: string, routed: 'take' | 'leave' = 'take'): Promise<number> {
-    const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
+    const deliveries = await orderRuntimeDeliveriesForInjection(this.database, await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_turn_id: turnId,
       phase: 'current_turn',
       state: 'pending'
-    })).sort((left, right) =>
-      String(left.created_at).localeCompare(String(right.created_at))
-      || String(left.id).localeCompare(String(right.id))
-    );
+    }));
     for (const delivery of deliveries) {
       await this.runtimeDeliveries.advance(
         requireId(delivery.id, 'RuntimeDelivery.id'),

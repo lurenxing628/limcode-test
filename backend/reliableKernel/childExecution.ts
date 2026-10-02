@@ -70,7 +70,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
-import { isChildTaskIntent, isChildTaskTurn } from './childTaskTurn';
+import { childRuntimeTaskContinuationLineage, isChildTaskIntent, isChildTaskTurn } from './childTaskTurn';
 import {
   CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
   LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
@@ -1381,10 +1381,10 @@ export class ChildExecutionControlPlane {
     });
     const sourceLink = allTurnLinks.find((link) => link.turn_id === command.sourceTurnId);
     if (!sourceLink) throw new Error('Runtime delivery source Turn is not a member of the ChildExecution.');
-    const latestLink = [...allTurnLinks].sort((left, right) =>
-      compareBigInt(right.turn_seq, left.turn_seq)
-    )[0];
-    if (!latestLink || latestLink.id !== sourceLink.id) return null;
+    const taskLineage = await childRuntimeTaskContinuationLineage(
+      this.database, this.contentStore, command.childExecutionId, command.sourceTurnId, allTurnLinks
+    );
+    if (!taskLineage) return null;
     const sourceTurn = await this.requireExisting('Turn', command.sourceTurnId);
     const sourceTerminations = await this.listRows('TurnTermination', {
       turn_id: command.sourceTurnId
@@ -1468,6 +1468,7 @@ export class ChildExecutionControlPlane {
           target_conversation_id: snapshot.childExecution.child_conversation_id,
           target_turn_id: null
         }),
+        ...taskLineage.authoritySteps,
         ...budgetSteps,
         ...preparedContentObjectSteps([intentContent, presetContent], 'child_runtime_delivery'),
         DOMAIN_REPOSITORIES.domain('TurnIntent').insert({

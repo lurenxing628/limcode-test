@@ -26,6 +26,8 @@ export interface CollaborationTimelineCard {
   /** The newest delivery attempt, or unknown when its delivery is not in the bounded feed. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
   readBy?: 'current-turn' | 'next-turn';
+  /** A child result delivered for display only, without creating a reply Turn. */
+  notificationOnly?: boolean;
   /**
    * Only Turn membership is known; no within-Turn acceptance/send order is inferred.
    * - turn: grouped after the newest loaded message of its Turn.
@@ -39,19 +41,19 @@ export interface CollaborationTimelineCard {
   placement: 'turn' | 'turn-started' | 'earlier-turn' | 'turn-without-message' | 'turn-not-loaded' | 'unbound';
 }
 
-/** Waiting or failed cards that never entered a Turn stay below every message, but only the newest few. */
+/** The tail stays bounded: waiting, then failed, then recent display-only child results. */
 export const COLLABORATION_UNLOCATED_TAIL_LIMIT = 3;
 
 export interface CollaborationTimeline {
   /**
    * Above the first loaded message, oldest first: cards of Turns older than every loaded message
    * or outside loaded history (history pages add these), and cards that never entered a Turn but
-   * are neither among the newest waiting/failed ones. None of them may displace the newest messages.
+   * are outside the bounded attention/notification tail. None may displace the newest messages.
    */
   beforeMessages: CollaborationTimelineCard[];
   /** Grouped by a loaded message, not inserted into a Message. */
   afterMessage: Record<string, CollaborationTimelineCard[]>;
-  /** At most COLLABORATION_UNLOCATED_TAIL_LIMIT newest waiting, then failed, cards that never entered a Turn. */
+  /** At most COLLABORATION_UNLOCATED_TAIL_LIMIT waiting/failed cards and recent result notifications. */
   unlocated: CollaborationTimelineCard[];
 }
 
@@ -65,8 +67,8 @@ export interface CollaborationTimeline {
  * A card whose Turn has no loaded message is placed by that Turn only: a loaded Turn is compared
  * with the Turns of the loaded messages (never with a message or envelope timestamp); a Turn
  * outside loaded history belongs to older history and sits above the first loaded message. Of the
- * cards that never entered a Turn, only the newest few waiting or failed ones stay below every
- * message. None of these records are promoted to a Message, given a transcript floor, or silently
+ * cards that never entered a Turn, a bounded tail prioritizes waiting/failed deliveries and then
+ * recent notify-only child results. None are promoted to a Message, given a transcript floor, or silently
  * dropped.
  */
 export function projectCollaborationTimeline(input: {
@@ -128,8 +130,14 @@ export function projectCollaborationTimeline(input: {
   }
   // A child's answer delivered to this Conversation: same card, told apart by its kind. An answer
   // that settled a waiting run_agent call has no delivery and stays with that tool call.
-  for (const delivery of latestDeliveries.values()) {
-    if (text(delivery.target_conversation_id) !== input.conversationId) continue;
+  // Delivery creation order selects the newest notification cards deterministically, including
+  // after history paging/reload. It does not locate them relative to any ordinary Message.
+  const answerDeliveries = [...latestDeliveries.values()].filter((delivery) =>
+    text(delivery.target_conversation_id) === input.conversationId
+    && input.records.RuntimeInboxItem?.[text(delivery.inbox_item_id)]?.source_kind === 'answer_submission'
+  ).sort((left, right) =>
+    text(left.created_at).localeCompare(text(right.created_at)) || text(left.id).localeCompare(text(right.id)));
+  for (const delivery of answerDeliveries) {
     const inbox = input.records.RuntimeInboxItem?.[text(delivery.inbox_item_id)];
     if (!inbox || inbox.source_kind !== 'answer_submission') continue;
     const submission = input.records.AnswerSubmission?.[text(inbox.source_id)];
@@ -145,6 +153,7 @@ export function projectCollaborationTimeline(input: {
       peerRelation: 'child',
       kind,
       textPreview: '',
+      ...(delivery.phase === 'notify_only' ? { notificationOnly: true } : {}),
       status: delivery.state === 'failed' ? 'failed'
         : delivery.state === 'pending' ? 'waiting'
           : delivery.state === 'consumed' ? 'settled' : 'unknown',
@@ -152,13 +161,17 @@ export function projectCollaborationTimeline(input: {
     };
     place(card, card.status === 'failed' ? '' : text(delivery.target_turn_id));
   }
-  // Below the messages stay only the newest Turn-less cards that still need attention: waiting
-  // ones first, then failed ones. Everything else that never entered a Turn joins older history.
+  // A consumed notify-only result will never acquire Turn membership. Keep recent results in
+  // the same bounded tail after waiting/failed priority, rather than moving a fresh result above
+  // the user's original request. Older notifications stay reachable in the history group.
   const unbound = placed.filter((entry) => entry.card.placement === 'unbound').map((entry) => entry.card);
   const waiting = unbound.filter((card) => card.status === 'waiting').slice(-COLLABORATION_UNLOCATED_TAIL_LIMIT);
   const room = COLLABORATION_UNLOCATED_TAIL_LIMIT - waiting.length;
   const failed = room > 0 ? unbound.filter((card) => card.status === 'failed').slice(-room) : [];
-  const tail = new Set([...waiting, ...failed]);
+  const notificationRoom = room - failed.length;
+  const notifications = notificationRoom > 0 ? unbound
+    .filter((card) => card.notificationOnly && card.status === 'settled').slice(-notificationRoom) : [];
+  const tail = new Set([...waiting, ...failed, ...notifications]);
   for (const { card, anchorId } of placed) {
     if (anchorId) (result.afterMessage[anchorId] ??= []).push(card);
     else if (tail.has(card)) result.unlocated.push(card);
@@ -205,6 +218,7 @@ export function projectCollaborationTimeline(input: {
 
 /** Every card gets a truthful explanation of grouping instead of a fabricated exact position. */
 export function collaborationCardPlacementLabel(card: CollaborationTimelineCard): string {
+  if (card.notificationOnly && card.placement === 'unbound') return '结果通知';
   if (card.placement === 'turn') return '按回合归组，具体顺序待确认';
   if (card.placement === 'turn-started') return '所属回合没有已加载的消息，按回合开始顺序排列';
   if (card.placement === 'earlier-turn') return '所属回合早于已加载的消息，位置待确认';
@@ -223,6 +237,7 @@ export function collaborationCardStatusLabel(card: CollaborationTimelineCard): s
   if (card.status === 'failed') return '投递失败';
   if (card.status === 'unknown') return '投递状态待确认';
   if (card.status === 'settled') return '';
+  if (card.notificationOnly) return '通知待送达';
   if (card.direction === 'incoming') return card.placement === 'unbound' ? '等待下一轮处理' : '已送达，等待本轮处理';
   if (card.readBy === 'current-turn') return '已送达，对方本轮读取';
   if (card.readBy === 'next-turn') return '已送达，对方下一轮读取';

@@ -11,6 +11,7 @@ import { ConversationOwnershipGate } from './conversationOwnershipGate';
 import { isTransactionAssertionFailure, requireIsoTimestamp } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { orderRuntimeDeliveriesForInjection } from './runtimeDeliveryOrder';
 import { RuntimeDatabase } from './runtimeDatabase';
 
 export const PHASE_F_RECOVERY_ANSWER_INBOX_INVARIANT = 'recovery.answer-inbox-invariant';
@@ -334,11 +335,12 @@ export class PhaseFRecoveryScanner {
   }
 
   private async scanPendingDeliveries(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<PhaseFRecoveryResult> {
-    const pending = (await listAllDomainRows(this.database, 'RuntimeDelivery', { state: 'pending' }))
+    const pending = await orderRuntimeDeliveriesForInjection(this.database,
+      (await listAllDomainRows(this.database, 'RuntimeDelivery', { state: 'pending' }))
       .filter((delivery) =>
         context.conversationId === undefined
         || String(delivery.target_conversation_id) === context.conversationId
-      );
+      ));
     const affectedIds: string[] = [];
     let unchanged = 0;
     for (const delivery of pending) {

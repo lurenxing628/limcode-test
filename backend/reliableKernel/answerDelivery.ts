@@ -34,6 +34,7 @@ import {
   type RepositoryTransactionStep
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
+import { orderRuntimeDeliveriesForInjection } from './runtimeDeliveryOrder';
 import {
   abandonedDeliveryInsertSteps,
   deadLetterDeliveryWakeSteps,
@@ -1761,15 +1762,12 @@ export class RuntimeDeliveryControlPlane {
     const startingDeliveryId = startingDeliveryIdInput == null
       ? null
       : requirePhaseFId(startingDeliveryIdInput, 'startingDeliveryId');
-    const deliveries = (await listAllDomainRows(this.database, 'RuntimeDelivery', {
+    const deliveries = await orderRuntimeDeliveriesForInjection(this.database, await listAllDomainRows(this.database, 'RuntimeDelivery', {
       target_conversation_id: conversationId,
       target_turn_id: null,
       phase: 'next_turn',
       state: 'pending'
-    })).sort((left, right) =>
-      String(left.created_at).localeCompare(String(right.created_at))
-      || String(left.id).localeCompare(String(right.id))
-    );
+    }));
     const steps: RepositoryTransactionStep[] = [];
     for (const delivery of deliveries) {
       const inbox = await this.requireExisting('RuntimeInboxItem', String(delivery.inbox_item_id));

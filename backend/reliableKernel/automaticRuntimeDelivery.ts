@@ -24,7 +24,7 @@ import type { ContentAddressedStore } from './contentAddressedStore';
 import { isRuntimeMaintenanceTurn } from './maintenanceTurn';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { childTaskRequestingParentTurn, runtimeDeliverySourceTurn } from './childTaskTurn';
+import { childTaskRequestingParentTurn, childRuntimeTaskContinuationLineage, runtimeDeliverySourceTurn } from './childTaskTurn';
 
 
 export type AutomaticRuntimeDeliveryReason =
@@ -60,6 +60,7 @@ interface ChildGenerationAuthority {
   childExecutionId: string;
   currentAllowed: boolean;
   continuationAllowed: boolean;
+  continuationTurnId: string | null;
   steps: RepositoryTransactionStep[];
 }
 
@@ -447,7 +448,9 @@ export class AutomaticRuntimeDeliveryRouter {
     if (terminalStatus === 'interrupted' || terminalStatus === 'cancelled') {
       const sourceAuthority = await this.deliverySourceAuthority(inboxItemId, sourceTurnId);
       const stoppedSourceSteps = [...terminalSteps, ...sourceAuthority.steps];
-      if (sourceAuthority.continueAfterStoppedSource) {
+      // A normal answer may continue a stopped top-level conversation. A stopped child task
+      // stays stopped: its child-owned continuation writer accepts only completed task Turns.
+      if (sourceAuthority.continueAfterStoppedSource && !childAuthority.childExecutionId) {
         if (!childAuthority.continuationAllowed) {
           return decision({
             targetConversationId,
@@ -696,13 +699,15 @@ export class AutomaticRuntimeDeliveryRouter {
     targetConversationId: string,
     sourceChildAuthority: ChildGenerationAuthority
   ): Promise<{ turnId: string; steps: RepositoryTransactionStep[] } | undefined> {
-    if (sourceChildAuthority.childExecutionId) return undefined;
+    if (sourceChildAuthority.childExecutionId && !sourceChildAuthority.continuationTurnId) return undefined;
     const active = await this.list('Turn', { conversation_id: targetConversationId, status: 'active' }, 2);
     if (active.length > 1) throw new Error(`Conversation ${targetConversationId} has multiple active Turns.`);
     const turn = active[0];
     if (!turn) return undefined;
     const turnId = requireId(turn.id, 'Turn.id');
-    if ((await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 1)).length > 0) return undefined;
+    if (sourceChildAuthority.childExecutionId) {
+      if (turnId !== sourceChildAuthority.continuationTurnId) return undefined;
+    } else if ((await this.list('ChildExecutionTurnLink', { turn_id: turnId }, 1)).length > 0) return undefined;
     const [terminations, fences] = await Promise.all([
       this.list('TurnTermination', { turn_id: turnId }, 1),
       this.list('TurnFinalOutputFence', { turn_id: turnId }, 1)
@@ -723,7 +728,7 @@ export class AutomaticRuntimeDeliveryRouter {
     const memberships = await this.list('ChildExecutionTurnLink', { turn_id: sourceTurnId }, 2);
     if (memberships.length > 1) throw new Error(`Turn ${sourceTurnId} belongs to multiple ChildExecutions.`);
     if (memberships.length === 0) {
-      return { childExecutionId: '', currentAllowed: true, continuationAllowed: true, steps: [] };
+      return { childExecutionId: '', currentAllowed: true, continuationAllowed: true, continuationTurnId: null, steps: [] };
     }
     const membership = memberships[0];
     const childExecutionId = requireId(membership.child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
@@ -740,6 +745,9 @@ export class AutomaticRuntimeDeliveryRouter {
     const active = activeLinks[0] ?? null;
     const status = requireChildExecutionStatus(child.status);
     const isLatest = latest.turn_id === sourceTurnId;
+    const taskLineage = await childRuntimeTaskContinuationLineage(
+      this.database, this.contentStore, childExecutionId, sourceTurnId, lineage
+    );
     const blocked = isChildExecutionInterrupting(status)
       || status === 'interrupted'
       || isChildExecutionPermanentlyTerminal(status);
@@ -747,11 +755,14 @@ export class AutomaticRuntimeDeliveryRouter {
       && !blocked
       && status === 'active'
       && active?.turn_id === sourceTurnId;
-    const continuationAllowed = isLatest
+    const continuationAllowed = taskLineage !== null
       && !blocked
       && (status === 'active' || status === 'idle')
-      && (active === null || active.turn_id === sourceTurnId);
+      && (active === null || active.turn_id === taskLineage.latestTurnId);
     const steps: RepositoryTransactionStep[] = [
+      ...(taskLineage?.authoritySteps ?? [DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assertExactIds(
+        { child_execution_id: childExecutionId }, lineage.map(link => requireId(link.id, 'ChildExecutionTurnLink.id'))
+      )]),
       DOMAIN_REPOSITORIES.domain('ChildExecution').assert(childExecutionId, { status: child.status }),
       DOMAIN_REPOSITORIES.domain('ChildExecutionTurnLink').assert(requireId(membership.id, 'ChildExecutionTurnLink.id'), {
         child_execution_id: childExecutionId,
@@ -765,7 +776,7 @@ export class AutomaticRuntimeDeliveryRouter {
         child_execution_id: childExecutionId
       })])
     ];
-    return { childExecutionId, currentAllowed, continuationAllowed, steps };
+    return { childExecutionId, currentAllowed, continuationAllowed, continuationTurnId: taskLineage?.latestTurnId ?? null, steps };
   }
 
   private async maybeGet(domain: string, id: string): Promise<DomainRow | null> {
