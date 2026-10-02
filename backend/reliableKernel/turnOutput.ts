@@ -187,7 +187,8 @@ export class TurnOutputControlPlane {
     cumulativeContent: string | Uint8Array;
     contentType?: string;
     contextDisposition?: 'append' | 'exclude';
-  }): Promise<AssistantMessageCommit> {
+  }, options: { beforeSubmit?: () => void } = {}): Promise<AssistantMessageCommit> {
+    options.beforeSubmit?.();
     const turnId = requireId(input.turnId, 'turnId');
     const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
     const itemKey = requireText(input.itemKey, 'itemKey');
@@ -324,6 +325,7 @@ export class TurnOutputControlPlane {
           })
         ];
     try {
+      options.beforeSubmit?.();
       const committed = await this.database.transaction([
         DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
         DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(requireId(leaseRows[0].id, 'ExecutionLease.id'), {
@@ -334,7 +336,7 @@ export class TurnOutputControlPlane {
         ...revisionSteps,
         ...contextSteps,
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
-      ]);
+      ], options);
       const contextRootId = await this.context.currentHeadRootId(conversationId);
       if (!contextRootId) throw new Error(`Conversation ${conversationId} has no Context head after assistant output commit.`);
       return {

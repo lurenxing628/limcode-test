@@ -43,6 +43,7 @@ import type {
   StreamEventResult
 } from './modelProviderControlPlane';
 import { assertProviderCallbackAuthority } from './modelProviderControlPlane';
+import { retryLocalExecution } from './localExecutionRecovery';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -163,6 +164,8 @@ export interface NativeRequestSessionDeps {
 export class NativeRequestSession {
   private controller?: OpenAIResponsesNativeController;
   private controllerFence?: ExecutionLeaseFence;
+  private controllerSignal?: AbortSignal;
+  private reportLocalFailure?: (error: unknown) => void;
   private readonly creationFence?: ExecutionLeaseFence;
   private unregisterSteering?: () => void;
   private unsubscribeSettlements?: () => void;
@@ -221,8 +224,13 @@ export class NativeRequestSession {
       (event) => {
         const fence = this.activeFence();
         if (!fence || this.disposed) return;
+        const reportFailure = this.reportLocalFailure;
         void runWithExecutionLeaseFence(fence, () => this.onSettlement(event.toolCallId))
-          .catch((error) => this.diagnose(`native settlement handling failed: ${errorMessage(error)}`));
+          .catch((error) => {
+            if (isExecutionHandoffError(error)) return;
+            this.diagnose(`native settlement handling failed: ${errorMessage(error)}`);
+            reportFailure?.(error);
+          });
       }
     );
   }
@@ -256,6 +264,25 @@ export class NativeRequestSession {
   /** Admitted calls whose external effect has not settled yet (a restarted Host must wait for them). */
   public unsettledAdmittedCallIds(): string[] {
     return [...this.calls.values()].filter(call => call.admitted && !call.settled).map(call => call.toolCallId);
+  }
+
+  public get turnId(): string { return this.deps.turnId; }
+
+  /** Read-only closure refresh after transport retirement; do not pump, admit, or execute work. */
+  public async refreshSettledAdmittedCalls(assertAuthority: () => Promise<void>): Promise<void> {
+    for (const call of this.calls.values()) {
+      if (!call.admitted || call.settled) continue;
+      const terminal = await retryLocalExecution(async () => {
+        await assertAuthority();
+        const result = await this.deps.effects.readTerminalResult(call.toolCallId, false);
+        await assertAuthority();
+        return result;
+      });
+      if (terminal) {
+        call.settled = true;
+        call.toolModelResultId = terminal.toolModelResultId;
+      }
+    }
   }
 
   /** Rebuilds in-memory orchestration state from durable facts after a crash/reconnect. */
@@ -529,11 +556,17 @@ export class NativeRequestSession {
     }
   }
 
-  public hooks(): OpenAIResponsesNativeHooks {
+  public hooks(signal?: AbortSignal, onLocalFailure?: (error: unknown) => void): OpenAIResponsesNativeHooks {
+    let registeredController: OpenAIResponsesNativeController | undefined;
     return {
       onController: (controller) => {
         if (controller) {
+          assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
+          if (this.disposed) return;
+          registeredController = controller;
           this.controller = controller;
+          this.controllerSignal = signal;
+          this.reportLocalFailure = onLocalFailure;
           // Capture the owner token once; every later callback/pump mutation reuses exactly it.
           this.controllerFence = currentExecutionLeaseFence() ?? this.creationFence;
           if (this.deps.capabilities.steering && this.controllerFence) {
@@ -552,6 +585,9 @@ export class NativeRequestSession {
           this.pumpSignal();
           return;
         }
+        // Each dispatch owns only its registration. An old adapter's finally cannot detach
+        // the controller of a newer socket generation.
+        if (this.controller !== registeredController) return;
         this.controller = undefined;
         this.unregisterSteering?.();
         this.unregisterSteering = undefined;
@@ -795,7 +831,7 @@ export class NativeRequestSession {
       cumulativeContent: this.cumulativeItemContent(),
       contentType: MESSAGE_CONTENT_TYPE,
       contextDisposition: 'exclude'
-    });
+    }, { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) });
     assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     const call = this.newSessionCall(item, providerOrdinal, toolCallId, streamSeq);
     this.calls.set(toolCallId, call);
@@ -841,8 +877,10 @@ export class NativeRequestSession {
    */
   public async admitStreamedContentItem(
     event: ProviderOutputStreamEvent,
-    result: StreamEventResult
+    result: StreamEventResult,
+    signal?: AbortSignal
   ): Promise<void> {
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
     // A terminal/foreign-identity result means the item belongs to a superseded stream; the
     // aggregate path already owns its content. Droppable-checkpoint misses still persist revisions.
     if (result.terminal) return;
@@ -895,7 +933,7 @@ export class NativeRequestSession {
         cumulativeContent: this.cumulativeItemContent(),
         contentType: MESSAGE_CONTENT_TYPE,
         contextDisposition: 'append'
-      });
+      }, { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) });
     } catch (error) {
       this.itemPartKeys.delete(itemKey);
       const index = this.itemPartsOrdered.findIndex(item => item.key === itemKey);
@@ -950,7 +988,8 @@ export class NativeRequestSession {
             this.deps.modelRequestId,
             this.requireStream().attemptSeq,
             this.requireStream().socketGeneration,
-            content.capabilities
+            content.capabilities,
+            { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) }
           );
         }
         // previous_response_id alone only identifies a chain predecessor. The transport attributes
@@ -1043,7 +1082,8 @@ export class NativeRequestSession {
             // The capability measured this response's first output and output time; the control
             // plane validates it before folding it into the request's per-response metrics.
             ...(timing !== undefined ? { timing: timing as ModelResponseTiming } : {})
-          }
+          },
+          { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) }
         );
         // Original-root calibration: only the FIRST physical response's actual input tokens,
         // exactly once; later/cumulative usage never substitutes for this anchor.
@@ -1054,7 +1094,8 @@ export class NativeRequestSession {
               this.deps.modelRequestId,
               this.requireStream().attemptSeq,
               this.requireStream().socketGeneration,
-              inputTokens
+              inputTokens,
+              { beforeSubmit: () => assertProviderCallbackAuthority(signal, this.deps.modelRequestId) }
             );
           }
         }
@@ -1399,6 +1440,7 @@ export class NativeRequestSession {
    */
   private scheduleExecution(call: NativeSessionCall): void {
     const fence = this.activeFence();
+    const reportFailure = this.reportLocalFailure;
     const run = async () => {
       try {
         const resolution = this.callResolutions.get(call.providerCallId);
@@ -1422,13 +1464,14 @@ export class NativeRequestSession {
             arguments: call.arguments
           });
         }
+        await this.onSettlement(call.toolCallId);
       } catch (error) {
         if (!isExecutionHandoffError(error)) {
           this.diagnose(`native call ${call.toolCallId} dispatch failed: ${errorMessage(error)}`);
+          reportFailure?.(error);
         }
         return;
       }
-      await this.onSettlement(call.toolCallId);
     };
     if (fence) void runWithExecutionLeaseFence(fence, run);
     else void run();
@@ -1437,8 +1480,10 @@ export class NativeRequestSession {
   private async onSettlement(toolCallId: string): Promise<void> {
     const call = this.calls.get(toolCallId);
     if (!call || call.settled) return;
-    const terminal = await this.deps.effects.readTerminalResult(toolCallId, false);
-    if (!terminal) return;
+    const signal = this.controllerSignal;
+    const terminal = await retryLocalExecution(() => this.deps.effects.readTerminalResult(toolCallId, false), { signal });
+    assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
+    if (!terminal || this.disposed) return;
     call.settled = true;
     call.toolModelResultId = terminal.toolModelResultId;
     // No Context append here: the occurrence lands only at the proven admission created event
@@ -1488,7 +1533,9 @@ export class NativeRequestSession {
       try {
         await this.pumpLoop();
       } catch (error) {
-        this.diagnose(`native delivery pump failed: ${errorMessage(error)}`);
+        if (!isExecutionHandoffError(error)) {
+          this.diagnose(`native delivery pump failed: ${errorMessage(error)}`);
+        }
       } finally {
         this.pumpRunning = false;
         if (this.pumpDirty && !this.disposed) {
@@ -1509,7 +1556,24 @@ export class NativeRequestSession {
   private async pumpLoop(): Promise<void> {
     for (;;) {
       this.pumpDirty = false;
-      if (this.disposed || this.yieldingForRuntimeInput || !this.controller) return;
+      const controller = this.controller;
+      const signal = this.controllerSignal;
+      const reportFailure = this.reportLocalFailure;
+      if (this.disposed || this.yieldingForRuntimeInput || !controller) return;
+      assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
+      const local = async <T>(operation: () => Promise<T>): Promise<T> => {
+        try {
+          return await retryLocalExecution(async () => {
+            assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
+            const result = await operation();
+            assertProviderCallbackAuthority(signal, this.deps.modelRequestId);
+            return result;
+          }, { signal });
+        } catch (error) {
+          if (!isExecutionHandoffError(error) && !signal?.aborted) reportFailure?.(error);
+          throw error;
+        }
+      };
       if (this.unsafeResultAdmission || this.budgetClosureRequested) {
         // A result that may already have reached the Provider can NEVER be resubmitted, nor can
         // another tool result be sent into that ambiguous physical chain; a chain at its physical
@@ -1521,7 +1585,7 @@ export class NativeRequestSession {
         if (this.inFlightDeliveries.size === 0
           && [...this.calls.values()].every(call => !call.admitted || call.settled)) {
           this.yieldingForRuntimeInput = true;
-          this.controller.endLogicalRequest();
+          controller.endLogicalRequest();
           this.deps.onDiagnostic?.(this.unsafeResultAdmission
             ? 'Native logical request ended after an unverified result admission; settled results continue from Context.'
             : 'Native logical request ended at its physical budget; settled results continue from Context.');
@@ -1530,10 +1594,10 @@ export class NativeRequestSession {
       }
       const ready = this.collectDeliverable();
       if (ready.length === 0) return;
-      if (await this.yieldAtNativeBatchBoundary(ready)) return;
+      if (await local(() => this.yieldAtNativeBatchBoundary(ready))) return;
       const latestBoundary = [...this.responseOrder].reverse()
         .map(id => this.responses.get(id)).find(response => response?.admissionBoundary && response.boundarySeq);
-      const observed = await this.deps.modelProvider.readNativeLatestResponseUsage(this.deps.modelRequestId);
+      const observed = await local(() => this.deps.modelProvider.readNativeLatestResponseUsage(this.deps.modelRequestId));
       const stream = this.requireStream();
       const pressure = latestBoundary !== undefined && (
         !observed || observed.responseId !== latestBoundary.responseId
@@ -1563,14 +1627,14 @@ export class NativeRequestSession {
         this.budgetClosureRequested = true;
         continue;
       }
-      const adapter = await this.deps.resolveAdapter(this.deps.providerId);
+      const adapter = await local(() => this.deps.resolveAdapter(this.deps.providerId));
       if (!adapter.materializeNativeToolOutput) {
         throw new Error(`Provider adapter ${this.deps.providerId} lacks materializeNativeToolOutput.`);
       }
       // Freeze and reserve newly exposed child refs in delivery order. Concurrent settlements
       // must never both allocate A1 from the same pre-batch catalog.
       const baseOutputs: OpenAIResponsesToolOutput[] = [];
-      for (const call of ready) baseOutputs.push(await this.buildFunctionCallOutput(call));
+      for (const call of ready) baseOutputs.push(await local(() => this.buildFunctionCallOutput(call)));
       // Each result is frozen independently for idempotent redelivery. Never rewrite an already
       // frozen copy to fit a later batch: if their sum exceeds the ordinary shared allowance, close
       // into Context at the next safe boundary, where the full-request batch projector can size it.
@@ -1584,9 +1648,8 @@ export class NativeRequestSession {
         this.budgetClosureRequested = true;
         continue;
       }
-      const outputs = await adapter.materializeNativeToolOutput(baseOutputs);
-      const controller = this.controller;
-      if (!controller || this.disposed || this.yieldingForRuntimeInput
+      const outputs = await local(() => adapter.materializeNativeToolOutput!(baseOutputs));
+      if (this.controller !== controller || this.disposed || this.yieldingForRuntimeInput
         || this.inFlightDeliveries.size > 0) return;
       // The batch stays in-flight until the admission commit lands via the checkpointed
       // response.created carrying admittedToolResultCallIds — never marked from this promise alone.

@@ -2,7 +2,7 @@ import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 import { createHash } from 'node:crypto';
-import { retryLocalExecution } from './localExecutionRecovery';
+import { LocalExecutionRecoveryExhaustedError, markRestoredTerminalFailure, retryLocalExecution } from './localExecutionRecovery';
 import { compressionExecutionMetadata, readProviderRequestFailure, safeProviderFailureMessage,
   type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact
 } from '../../shared/compressionExecution';
@@ -83,6 +83,7 @@ import {
 } from './requestCompressionSettings';
 import {
   ExecutionHandoffError,
+  currentExecutionLeaseFence,
   handoffReason,
   isExecutionHandoffError,
   runWithExecutionLeaseFence,
@@ -263,6 +264,10 @@ export interface ProviderDispatchControls {
   native?: OpenAIResponsesNativeHooks;
   onEvent(event: ProviderOutputStreamEvent): Promise<StreamEventResult>;
   onCompressionProgress?(streamSeq: string | bigint): Promise<void>;
+  /** Captures display-only failure output synchronously; dispatch owns its bounded finalization. */
+  onFailedPartialOutput?(event: ProviderOutputStreamEvent): void;
+  /** Native background local work reports failure to this dispatch, never the Provider retry layer. */
+  onLocalFailure?(error: unknown): void;
 }
 
 export interface FullRequestProviderAdapter {
@@ -574,6 +579,8 @@ export class ModelProviderControlPlane {
   private readonly adapterDrainTimeoutMs: number;
   private readonly compressionSettingsAuthority?: CompressionSettingsAuthority;
   private readonly activeSockets = new Map<string, Set<AbortController>>();
+  private readonly cancelledPartialClosures = new WeakMap<AbortController, () => Promise<void>>();
+  private readonly requestCancellations = new Map<string, Promise<ModelRequestCancelResult>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
@@ -1289,12 +1296,33 @@ export class ModelProviderControlPlane {
       const expectedGeneration = currentIdentity.socketGeneration + 1n;
       let fullRequest: FullProviderRequest;
       try {
-        fullRequest = await this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
+        fullRequest = await retryLocalExecution(() => {
+          this.assertNotHandingOff();
+          return this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
+        }, { signal: options.signal });
         if (stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID') fullRequest.modelOutputRepair = true;
         this.assertRequestPreflight(request, fullRequest, adapter);
         retryPolicy ??= retryPolicyForFullRequest(fullRequest);
       } catch (error) {
-        const applied = await this.failRequest(modelRequestId, currentIdentity, error);
+        if (isExecutionHandoffError(error)) throw error;
+        if (options.signal?.aborted) {
+          const handoff = handoffReason(options.signal);
+          if (handoff) throw handoff;
+          const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-during-provider-preparation');
+          return this.finishCancelledDispatch(modelRequestId, currentIdentity, cancelled, options, 0n);
+        }
+        let applied: boolean;
+        try {
+          applied = await retryLocalExecution(() => this.failRequest(modelRequestId, currentIdentity, error),
+            { signal: options.signal });
+        } catch (terminalError) {
+          // Failed failure persistence cannot hand an already exhausted preparation budget to a
+          // fresh outer retry loop. Retain the original exhaustion identity and both diagnostics.
+          if (error instanceof LocalExecutionRecoveryExhaustedError && !isExecutionHandoffError(terminalError)) {
+            throw Object.assign(error, { terminalError });
+          }
+          throw terminalError;
+        }
         if (applied) {
           this.emitTransientTerminal(options, currentIdentity, 'failed', 1n, providerFailureTerminalState(error));
         }
@@ -1304,7 +1332,24 @@ export class ModelProviderControlPlane {
       let lastObservedStreamSeq = 0n;
       let sawReplayUnsafeProviderEvent = false;
       let eventHandlerFailure: unknown;
+      let failedPartialOutput: ProviderOutputStreamEvent | undefined;
       const controller = new AbortController();
+      const executionFence = currentExecutionLeaseFence();
+      let cancelledPartialClosure: Promise<void> | undefined;
+      const closeCancelledPartial = (): Promise<void> => {
+        // Public Stop and the dispatch abort branch share only this local closure, never the
+        // dispatch promise itself. Ordinary callbacks have already lost their signal authority.
+        cancelledPartialClosure ??= Promise.resolve().then(() => {
+          const handoff = handoffReason(controller.signal);
+          if (handoff) throw handoff;
+          const close = () => this.finalizeFailedPartialOutput(
+            modelRequestId, identity, failedPartialOutput, abortError()
+          );
+          return executionFence ? runWithExecutionLeaseFence(executionFence, close) : close();
+        });
+        return cancelledPartialClosure;
+      };
+      this.cancelledPartialClosures.set(controller, closeCancelledPartial);
       const detachCallerSignal = relayAbort(options.signal, controller);
       const unregister = this.registerActiveSocket(modelRequestId, controller);
       const abortWaiter = createAbortWaiter(controller.signal);
@@ -1353,9 +1398,25 @@ export class ModelProviderControlPlane {
         // lost their write authority, even before SQLite can reject their old execution fence.
         assertProviderCallbackAuthority(controller.signal, modelRequestId);
       };
+      let reportLocalFailure!: (result: { kind: 'rejected'; error: unknown }) => void;
+      const localFailureOutcome = new Promise<{ kind: 'rejected'; error: unknown }>(resolve => {
+        reportLocalFailure = resolve;
+      });
       const adapterOutcome = Promise.resolve()
         .then(() => adapter.sendFullRequest(fullRequest, {
           signal: controller.signal,
+          onLocalFailure: (error) => {
+            if (controller.signal.aborted) return;
+            eventHandlerFailure = error;
+            reportLocalFailure({ kind: 'rejected', error });
+          },
+          onFailedPartialOutput: (event) => {
+            if (event.kind !== 'output_item_done' || !isRecord(event.content)
+              || event.content.type !== PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE) {
+              throw new TypeError('Failed Provider output must be a display-only partial snapshot.');
+            }
+            failedPartialOutput ??= event;
+          },
           ...(nativeRequest
             ? {
                 native: {
@@ -1377,7 +1438,8 @@ export class ModelProviderControlPlane {
                 identity.socketGeneration,
                 observedSeq,
                 this.epochNow(),
-                streamDurability
+                streamDurability,
+                assertCallbackAuthority
               );
             }
           } : {}),
@@ -1410,7 +1472,8 @@ export class ModelProviderControlPlane {
               identity.socketGeneration,
               event,
               semanticProgress,
-              streamDurability
+              streamDurability,
+              assertCallbackAuthority
               ), { signal: controller.signal });
             } catch (failure) {
               // Abort during local checkpoint backoff has the same authority semantics as a
@@ -1432,6 +1495,7 @@ export class ModelProviderControlPlane {
       try {
         outcome = await Promise.race([
           adapterOutcome,
+          localFailureOutcome,
           abortWaiter.promise,
           timeoutWaiter.promise,
           progressWaiter.promise
@@ -1446,13 +1510,17 @@ export class ModelProviderControlPlane {
       if (outcome.kind === 'aborted') {
         const handoff = handoffReason(controller.signal);
         if (handoff) throw handoff;
-        const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-during-provider-dispatch');
+        const cancelled = await this.cancelCurrentRequest(
+          modelRequestId, 'cancelled-during-provider-dispatch', closeCancelledPartial
+        );
         return this.finishCancelledDispatch(modelRequestId, identity, cancelled, options, lastObservedStreamSeq);
       }
+      const externallyAborted = controller.signal.aborted;
       let error: unknown;
       if (outcome.kind === 'resolved') {
         const resolved = await this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
         if (resolved.terminalState || resolved.superseded) return resolved;
+        controller.abort();
         error = new ProviderTransientError(
           'connection_interrupted',
           'Provider adapter resolved before committing a completed terminal checkpoint.',
@@ -1464,26 +1532,33 @@ export class ModelProviderControlPlane {
         await settleWithin(adapterOutcome, this.adapterDrainTimeoutMs);
       } else {
         error = outcome.error;
+        // Rejection retires this callback generation too. Otherwise late SDK callbacks retain
+        // authority during failure persistence or while the next Attempt is being prepared.
+        controller.abort(error);
+        await settleWithin(adapterOutcome, this.adapterDrainTimeoutMs);
       }
       if (isExecutionHandoffError(error)) throw error;
       // An SDK may call a disconnected/expired transport AbortError. Only our signal can cancel
       // the request; a rejected provider call without that authority is a recoverable interruption.
-      if (!controller.signal.aborted && error !== eventHandlerFailure
+      if (!externallyAborted && error !== eventHandlerFailure
         && error instanceof Error && error.name === 'AbortError') {
         error = new ProviderTransientError('connection_interrupted', error.message, true);
       }
       if (
         outcome.kind !== 'timed_out'
         && outcome.kind !== 'semantic_timed_out'
-        && controller.signal.aborted
+        && externallyAborted
       ) {
         const handoff = handoffReason(controller.signal)
           ?? (isExecutionHandoffError(error) ? error : undefined);
         if (handoff) throw handoff;
-        const cancelled = await this.cancelCurrentRequest(modelRequestId, 'cancelled-during-provider-dispatch');
+        const cancelled = await this.cancelCurrentRequest(
+          modelRequestId, 'cancelled-during-provider-dispatch', closeCancelledPartial
+        );
         return this.finishCancelledDispatch(modelRequestId, identity, cancelled, options, lastObservedStreamSeq);
       }
       if (!(error instanceof ProviderTransientError)) {
+        await this.finalizeFailedPartialOutput(modelRequestId, identity, failedPartialOutput, error, options.signal);
         const applied = await this.failRequest(modelRequestId, identity, error);
         if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
         this.emitTransientTerminal(
@@ -1508,6 +1583,7 @@ export class ModelProviderControlPlane {
           new Error(`${error.message}（已收到 Provider 输出，不自动重放请求。）`),
           { cause: error }
         );
+        await this.finalizeFailedPartialOutput(modelRequestId, identity, failedPartialOutput, error, options.signal);
         const applied = await this.failRequest(modelRequestId, identity, replayUnsafe);
         if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
         this.emitTransientTerminal(
@@ -1528,6 +1604,7 @@ export class ModelProviderControlPlane {
         error.message = `${error.message}（${configuredMaxRetries === 0 && priorFailures === 0
             ? '当前渠道或模型已关闭自动重试'
             : `已自动重试 ${priorFailures + Math.max(0, Number(identity.attemptSeq) - 1)} 次，达到本次请求的重试上限 ${priorFailures + maxRetries} 次`}。）`;
+        await this.finalizeFailedPartialOutput(modelRequestId, identity, failedPartialOutput, error, options.signal);
         const applied = await this.failRequest(modelRequestId, identity, error, maxRetries);
         if (!applied) return this.finishResolvedDispatch(modelRequestId, identity, options, lastObservedStreamSeq);
         this.emitTransientTerminal(
@@ -1574,6 +1651,55 @@ export class ModelProviderControlPlane {
     }
   }
 
+  /** A retired transport cannot write ordinary events, but its captured display snapshot has a
+   * separate, bounded closure window. It never creates a completed output or Context occurrence. */
+  private async finalizeFailedPartialOutput(
+    modelRequestId: string,
+    identity: StreamIdentity,
+    event: ProviderOutputStreamEvent | undefined,
+    failure: unknown,
+    callerSignal?: AbortSignal
+  ): Promise<void> {
+    if (!event) return;
+    const controller = new AbortController();
+    const detach = relayAbort(callerSignal, controller);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timedOut = false;
+    const beforeSubmit = (): void => {
+      this.assertNotHandingOff();
+      assertProviderCallbackAuthority(controller.signal, modelRequestId);
+    };
+    try {
+      await Promise.race([
+        retryLocalExecution(() => this.recordStreamEvent(modelRequestId, identity.attemptSeq,
+          identity.socketGeneration, event, { beforeSubmit }), { signal: controller.signal }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            const error = new Error('Provider partial-output finalization exceeded its 5 second deadline.');
+            timedOut = true;
+            controller.abort(error);
+            reject(error);
+          }, 5_000);
+        })
+      ]);
+    } catch (error) {
+      this.assertNotHandingOff();
+      if (callerSignal?.aborted) throw callerSignal.reason;
+      if (isExecutionHandoffError(error) && !timedOut) throw error;
+      // Display recovery is best effort after its bounded window. Preserve the authoritative
+      // Provider failure and still terminalize that exact request, rather than letting a local
+      // display error cause a fresh dispatch of already-observed Provider output.
+      if (failure instanceof Error && Object.isExtensible(failure)) {
+        Object.defineProperty(failure, 'partialOutputFinalizationError', { value: error, configurable: true });
+      }
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      // A request that lost the race must not commit later after failure terminalization.
+      controller.abort();
+      detach();
+    }
+  }
+
   /** Persistent request-level cancellation; one writer transaction always targets the latest identity. */
   /**
    * Closes a native logical request locally after a Host change. Its durable chain progress
@@ -1617,8 +1743,10 @@ export class ModelProviderControlPlane {
     socketGeneration: bigint,
     event: ProviderOutputStreamEvent,
     semanticProgress: boolean,
-    state: StreamDurabilityState
+    state: StreamDurabilityState,
+    beforeSubmit?: () => void
   ): Promise<StreamEventResult> {
+    beforeSubmit?.();
     const observedAt = this.epochNow();
     if (event.kind === 'output_delta' && state.outputDeltaCheckpointed) {
       if (semanticProgress && await this.persistStreamActivityIfDue(
@@ -1627,14 +1755,15 @@ export class ModelProviderControlPlane {
         socketGeneration,
         event.streamSeq,
         observedAt,
-        state
+        state,
+        beforeSubmit
       )) {
         return { accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' };
       }
       return this.recordUndurableDispatchEvent('coalesced');
     }
 
-    const result = await this.recordStreamEvent(modelRequestId, attemptSeq, socketGeneration, event);
+    const result = await this.recordStreamEvent(modelRequestId, attemptSeq, socketGeneration, event, { beforeSubmit });
     if (
       event.kind === 'output_delta'
       && (result.checkpointed
@@ -1653,7 +1782,8 @@ export class ModelProviderControlPlane {
         socketGeneration,
         event.streamSeq,
         observedAt,
-        state
+        state,
+        beforeSubmit
       )
     ) {
       return { accepted: false, checkpointed: false, terminal: true, ignoredReason: 'terminal' };
@@ -1667,8 +1797,10 @@ export class ModelProviderControlPlane {
     socketGeneration: bigint,
     streamSeqInput: string | bigint,
     observedAt: number,
-    state: StreamDurabilityState
+    state: StreamDurabilityState,
+    beforeSubmit?: () => void
   ): Promise<boolean> {
+    beforeSubmit?.();
     if (observedAt - state.lastActivityPersistedAt < DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS) return false;
     const activity = await this.database.recordModelStreamActivity({
       modelRequestId,
@@ -1677,7 +1809,7 @@ export class ModelProviderControlPlane {
       streamSeq: decimalBigInt(streamSeqInput, 'Provider activity streamSeq'),
       observedAt,
       now: this.timestamp()
-    });
+    }, { beforeSubmit });
     if (activity.accepted) state.lastActivityPersistedAt = observedAt;
     return activity.terminal;
   }
@@ -1699,7 +1831,8 @@ export class ModelProviderControlPlane {
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
-    eventInput: ProviderOutputStreamEvent
+    eventInput: ProviderOutputStreamEvent,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<StreamEventResult> {
     const event = normalizeStreamEvent(eventInput);
     const completed = event.kind === 'completed';
@@ -1719,7 +1852,7 @@ export class ModelProviderControlPlane {
       ...(event.usage !== undefined ? { usage: event.usage } : {}),
       ...(event.timing !== undefined ? { timing: event.timing } : {}),
       ...(completed && event.claudeThinkingBinding ? { claudeThinkingBinding: event.claudeThinkingBinding } : {})
-    });
+    }, options);
   }
 
   /**
@@ -1732,14 +1865,15 @@ export class ModelProviderControlPlane {
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
     streamSeqInput: string | bigint,
-    proof: PlainJsonValue
+    proof: PlainJsonValue,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<StreamEventResult> {
     return this.recordStreamCheckpoint(modelRequestIdInput, attemptSeqInput, socketGenerationInput, {
       checkpointKind: 'native_tool_call',
       envelopeKind: 'native_tool_call',
       streamSeq: decimalBigInt(streamSeqInput, 'streamSeq'),
       content: normalizePlainJson(proof, 'Native tool call proof')
-    });
+    }, options);
   }
 
   /** Persists the frozen native capabilities observed on an accepted response.created for UI gating. */
@@ -1747,7 +1881,8 @@ export class ModelProviderControlPlane {
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
-    capabilities: OpenAIResponsesNativeCapabilities
+    capabilities: OpenAIResponsesNativeCapabilities,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<boolean> {
     const summary = normalizeNativeCapabilitiesSummary(capabilities);
     return this.mergeNativeStreamStats(modelRequestIdInput, attemptSeqInput, socketGenerationInput, (stats) => {
@@ -1761,7 +1896,7 @@ export class ModelProviderControlPlane {
         return { outcome: 'present' };
       }
       return { outcome: 'write', stats: { ...stats, nativeCapabilities: summary } };
-    });
+    }, options);
   }
 
   /**
@@ -1772,13 +1907,15 @@ export class ModelProviderControlPlane {
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
-    tokenCountInput: number
+    tokenCountInput: number,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<boolean> {
     const tokenCount = requireNonNegativeSafeNumber(tokenCountInput, 'nativeInitialPromptTokenCount');
     return this.mergeNativeStreamStats(modelRequestIdInput, attemptSeqInput, socketGenerationInput, (stats) =>
       stats.nativeInitialPromptTokenCount !== undefined
         ? { outcome: 'present' as const }
-        : { outcome: 'write' as const, stats: { ...stats, nativeInitialPromptTokenCount: tokenCount } }
+        : { outcome: 'write' as const, stats: { ...stats, nativeInitialPromptTokenCount: tokenCount } },
+      options
     );
   }
 
@@ -1791,7 +1928,8 @@ export class ModelProviderControlPlane {
     modelRequestId: string,
     attemptSeq: string | bigint,
     socketGeneration: string | bigint,
-    observation: NativePhysicalResponseUsageObservation
+    observation: NativePhysicalResponseUsageObservation,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<boolean> {
     // Parse and validate before touching persistent state (including on duplicate delivery).
     foldNativeResponseUsage(undefined, observation, attemptSeq, socketGeneration);
@@ -1807,7 +1945,7 @@ export class ModelProviderControlPlane {
         outcome: 'write' as const,
         stats: { ...stats, nativeLatestResponseUsage: latest, ...(metrics ? { nativeResponseMetrics: metrics } : {}) }
       };
-    });
+    }, options);
   }
 
   /** Read-only fenced request observation for the live native checkpoint; unknown remains unknown. */
@@ -1825,13 +1963,16 @@ export class ModelProviderControlPlane {
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
     socketGenerationInput: string | bigint,
-    merge: (stats: StreamStats) => { outcome: 'write'; stats: StreamStats } | { outcome: 'present' }
+    merge: (stats: StreamStats) => { outcome: 'write'; stats: StreamStats } | { outcome: 'present' },
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<boolean> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     for (let attempt = 0; attempt < 3; attempt += 1) {
+      options.beforeSubmit?.();
       const request = await this.requireDomain('ModelRequest', modelRequestId);
+      options.beforeSubmit?.();
       if (request.status === 'terminal') return false;
       const stats = parseStreamStats(request.stream_stats_json);
       if (stats.attemptSeq !== attemptSeq.toString() || stats.socketGeneration !== socketGeneration.toString()) {
@@ -1850,7 +1991,7 @@ export class ModelProviderControlPlane {
             stream_stats_json: decision.stats,
             updated_at: this.timestamp()
           })
-        ]);
+        ], options);
         return true;
       } catch (error) {
         if (!isAssertionFailure(error) || attempt === 2) throw error;
@@ -1871,8 +2012,10 @@ export class ModelProviderControlPlane {
       usage?: PlainJsonValue;
       timing?: ProviderStreamTiming;
       claudeThinkingBinding?: 'drop_block' | 'strip_thinking';
-    }
+    },
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<StreamEventResult> {
+    options.beforeSubmit?.();
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
@@ -1975,7 +2118,9 @@ export class ModelProviderControlPlane {
         ignoredReason: 'checkpoint-capacity'
       });
     }
+    options.beforeSubmit?.();
     const content = await this.contentStore.prepare(this.database, checkpointBytes, CONTENT_TYPE_CHECKPOINT);
+    options.beforeSubmit?.();
     const result = await this.database.commitModelStreamEvent({
       modelRequestId,
       checkpointId,
@@ -1989,7 +2134,7 @@ export class ModelProviderControlPlane {
       usage: completed ? (event.usage ?? null) : null,
       terminalStats: completed ? terminalStreamStats(stats, event.timing, event.claudeThinkingBinding) : null,
       now: this.timestamp()
-    });
+    }, options);
     transactionCount = result.commit ? 1 : 0;
     return finish({
       accepted: result.accepted,
@@ -2144,10 +2289,40 @@ export class ModelProviderControlPlane {
     return null;
   }
 
-  private async cancelCurrentRequest(
+  private cancelCurrentRequest(
     modelRequestId: string,
-    terminalState: string
+    terminalState: string,
+    localPartialClosure?: () => Promise<void>
   ): Promise<ModelRequestCancelResult> {
+    const existing = this.requestCancellations.get(modelRequestId);
+    if (existing) return existing;
+    // A concurrent Stop may arrive after the socket unregisters but while its display closure is
+    // still writing. It must join that local cancellation rather than seal the fence ahead of it.
+    const task = this.cancelCurrentRequestOnce(modelRequestId, terminalState, localPartialClosure);
+    this.requestCancellations.set(modelRequestId, task);
+    void task.finally(() => {
+      if (this.requestCancellations.get(modelRequestId) === task) this.requestCancellations.delete(modelRequestId);
+    }).catch(() => undefined);
+    return task;
+  }
+
+  private async cancelCurrentRequestOnce(
+    modelRequestId: string,
+    terminalState: string,
+    localPartialClosure?: () => Promise<void>
+  ): Promise<ModelRequestCancelResult> {
+    const closures = new Set<() => Promise<void>>();
+    if (terminalState !== NATIVE_CHAIN_REBASED_TERMINAL_STATE) {
+      for (const controller of this.activeSockets.get(modelRequestId) ?? []) {
+        const closure = this.cancelledPartialClosures.get(controller);
+        if (closure) closures.add(closure);
+      }
+      if (localPartialClosure) closures.add(localPartialClosure);
+    }
+    // Stop the transport immediately. The adapter captures its already observed display snapshot
+    // synchronously on abort; no ordinary stream callback can write during the bounded closure.
+    this.abortActiveSockets(modelRequestId);
+    await Promise.all([...closures].map(close => close()));
     const result = await this.database.cancelCurrentModelRequest({
       modelRequestId,
       terminalState,
@@ -3664,5 +3839,5 @@ function providerFailureFact(error: unknown): ProviderRequestFailureFact {
 
 export function restoredProviderRequestFailure(factInput: unknown, terminalState: string): Error {
   const fact = readProviderRequestFailure(factInput);
-  return Object.assign(new Error(fact.message), fact, { terminalState });
+  return markRestoredTerminalFailure(Object.assign(new Error(fact.message), fact, { terminalState }));
 }

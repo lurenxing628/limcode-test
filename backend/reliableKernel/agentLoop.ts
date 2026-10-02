@@ -92,7 +92,7 @@ import {
   type TurnInputCommand
 } from './turnControlPlane';
 import { frozenCompressionPolicy, frozenProviderRetryPolicy, readFrozenTurnAuthority } from './frozenAuthority';
-import { assistantMessageIdFor, TurnOutputControlPlane } from './turnOutput';
+import { assistantMessageIdFor, nativeAssistantPartIdentity, TurnOutputControlPlane } from './turnOutput';
 import { currentExecutionLeaseFence, ExecutionEligibilityLostError, ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
 import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
 import { childTaskTextForPreview } from './childSkillPreload';
@@ -2475,11 +2475,12 @@ export class ReliableAgentLoop {
         });
         return adapter.sendFullRequest(fullRequest, {
           signal: controls.signal,
+          ...(controls.onFailedPartialOutput ? { onFailedPartialOutput: controls.onFailedPartialOutput } : {}),
           ...(controls.native || activeSession
             ? {
                 native: {
                   ...(controls.native ?? {}),
-                  ...(activeSession ? activeSession.hooks() : {})
+                  ...(activeSession ? activeSession.hooks(controls.signal, controls.onLocalFailure) : {})
                 }
               }
             : {}),
@@ -2542,7 +2543,8 @@ export class ReliableAgentLoop {
                     fullRequest.attemptSeq,
                     fullRequest.socketGeneration,
                     event.streamSeq,
-                    proof
+                    proof,
+                    { beforeSubmit: () => assertProviderCallbackAuthority(controls.signal, modelRequestId) }
                   );
                   assertProviderCallbackAuthority(controls.signal, modelRequestId);
                   observe();
@@ -2552,7 +2554,7 @@ export class ReliableAgentLoop {
                 const result = await controls.onEvent(event);
                 assertProviderCallbackAuthority(controls.signal, modelRequestId);
                 observe();
-                await activeSession.admitStreamedContentItem(event, result);
+                await activeSession.admitStreamedContentItem(event, result, controls.signal);
                 return result;
               }
             }
@@ -2560,6 +2562,7 @@ export class ReliableAgentLoop {
             // must never outrun the durable terminal checkpoint it claims to represent.
             if (event.kind === 'completed') {
               const result = await controls.onEvent(event);
+              assertProviderCallbackAuthority(controls.signal, modelRequestId);
               observe();
               return result;
             }
@@ -2650,6 +2653,9 @@ export class ReliableAgentLoop {
     session: NativeRequestSession,
     modelRequestId: string
   ): Promise<typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE> {
+    // Aborting the physical dispatch may retire an in-flight settlement observer after the
+    // result committed. Refresh only this session's admitted frontier; never redispatch tools.
+    await session.refreshSettledAdmittedCalls(() => this.assertRecoveryStillOwned(session.turnId));
     const [running] = session.unsettledAdmittedCallIds();
     if (running) {
       await session.dispose('handoff');
@@ -2990,7 +2996,8 @@ export class ReliableAgentLoop {
 
   private async materializeFailedPartialOutput(
     turnId: string,
-    modelRequestId: string | undefined
+    modelRequestId: string | undefined,
+    interrupted = false
   ): Promise<string | undefined> {
     if (!modelRequestId) return undefined;
     const request = await this.maybeGet('ModelRequest', modelRequestId);
@@ -2998,7 +3005,9 @@ export class ReliableAgentLoop {
       !request
       || request.turn_id !== turnId
       || request.status !== 'terminal'
-      || !isProviderFailureTerminalState(optionalText(request.terminal_state))
+      || (!isProviderFailureTerminalState(optionalText(request.terminal_state))
+        && (!interrupted || request.terminal_state === 'completed'
+          || request.terminal_state === NATIVE_CHAIN_REBASED_TERMINAL_STATE))
     ) return undefined;
 
     const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: modelRequestId }, 512);
@@ -3038,15 +3047,44 @@ export class ReliableAgentLoop {
     if (!output.content.parts.some((part) => 'text' in part && part.text.trim().length > 0)) {
       return undefined;
     }
+    const recipe = await this.readModelRequestRecipe(modelRequestId);
+    const native = readFrozenNativeCapabilities(recipe);
+    let displayContent = output.content;
+    if (native) {
+      // A native request may already have immutable closed items, including executed calls.
+      // The text-only snapshot adds unclosed display evidence; it cannot erase those items or
+      // introduce a partially assembled call. Keep the committed item body for shared identities.
+      const current = await this.list('MessageCurrentRevisionLink', {
+        message_id: assistantMessageIdFor(turnId, modelRequestId)
+      }, 2);
+      if (current.length > 0) {
+        if (current.length !== 1) throw new Error('Native partial display requires one current Message revision.');
+        const revision = await this.requireExisting('MessageRevision', requireId(current[0].revision_id, 'MessageCurrentRevisionLink.revision_id'));
+        const metadata = await this.requireExisting('ContentObject', requireId(revision.content_object_id, 'MessageRevision.content_object_id'));
+        const committed = normalizeProviderOutput(normalizePlainJson(JSON.parse(
+          (await this.contentStore.read(metadata as unknown as ContentObjectMetadata)).toString('utf8')
+        ), 'Native committed display Message')).content;
+        const known = new Set(committed.parts.map(part => nativeAssistantPartIdentity({ ...part })));
+        const parts = [...committed.parts, ...output.content.parts.filter(part => !known.has(nativeAssistantPartIdentity({ ...part })))];
+        const responseOrder = new Map<string, number>();
+        for (const part of parts) {
+          const responseId = requireId(part.outputItem?.providerResponseId, 'Native display response id');
+          if (!responseOrder.has(responseId)) responseOrder.set(responseId, responseOrder.size);
+        }
+        parts.sort((left, right) => responseOrder.get(left.outputItem!.providerResponseId!)!
+          - responseOrder.get(right.outputItem!.providerResponseId!)!
+          || left.outputItem!.ordinal - right.outputItem!.ordinal);
+        displayContent = { role: 'model', parts };
+      }
+    }
     const partialInput = {
       turnId,
       modelRequestId,
       sourceKey: `failed-partial:${modelRequestId}`,
-      content: canonicalPlainJson(output.content, 'Failed partial Provider MessageContent'),
+      content: canonicalPlainJson(displayContent, 'Partial Provider display MessageContent'),
       contentType: MESSAGE_CONTENT_TYPE
     };
-    const recipe = await this.readModelRequestRecipe(modelRequestId);
-    const committed = readFrozenNativeCapabilities(recipe)
+    const committed = native
       ? await this.turnOutput.appendNativeAssistantPartialAggregate(partialInput)
       : await this.turnOutput.appendAssistantMessage({ ...partialInput, contextDisposition: 'exclude' });
     return committed.messageId;
@@ -3491,12 +3529,23 @@ export class ReliableAgentLoop {
       // every durable wait, then absorb any concurrently delivered runtime context before the
       // interrupted terminal writer ACKs termination inputs and releases the exact lease.
       await this.modelProvider.cancelTurnDispatches(turnId, `termination request observed at ${stage}`);
+      // Stop preserves observed text/thought for the transcript, while cancelled requests and
+      // their unclosed items remain excluded from model Context. The Turn still owns its lease.
+      const stoppedRequests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
+      for (const stopped of stoppedRequests) {
+        await this.materializeFailedPartialOutput(turnId, requireId(stopped.id, 'ModelRequest.id'), true);
+      }
       await this.tools.cancelWaiting?.({
         turnId,
         sourceKey: `agent-loop:${turnId}:termination-request:${request.id}`,
         reason: `Turn observed ${String(request.input_kind)} at ${stage}.`
       });
-      await this.closeInterruptedToolContext(turnId, requireId(request.id, 'PendingTurnInput.id'), pendingToolCallId);
+      await this.closeTerminalToolContext(
+        turnId,
+        `agent-loop:${turnId}:termination-request:${requireId(request.id, 'PendingTurnInput.id')}`,
+        'turn_termination_requested',
+        pendingToolCallId
+      );
       await this.absorbRuntimeDeliveryInputs(turnId, 'leave');
       try {
         await this.turns.terminal({
@@ -3517,11 +3566,12 @@ export class ReliableAgentLoop {
    * A committed assistant message may contain several function calls while only the first call has
    * reached a durable user/file wait. Before terminating the Turn, materialize and cancel every
    * call represented by that committed message, then append each terminal tool_pair in provider
-   * order. This keeps the next Provider request canonical after interruption and is safe to replay.
+   * order. This keeps the next Provider request canonical after interruption or failure and is safe to replay.
    */
-  private async closeInterruptedToolContext(
+  private async closeTerminalToolContext(
     turnId: string,
-    terminationRequestId: string,
+    sourcePrefix: string,
+    reason: 'turn_termination_requested' | 'turn_failed',
     pendingToolCallId?: string
   ): Promise<void> {
     const turn = await this.requireExisting('Turn', turnId);
@@ -3553,18 +3603,19 @@ export class ReliableAgentLoop {
         if (!terminal) {
           await this.cancelUndispatchedToolEffects(
             toolCallId,
-            `agent-loop:${turnId}:termination-request:${terminationRequestId}`
+            sourcePrefix,
+            `${reason}_before_effect_dispatch`
           );
           const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
           if (operations.length === 0) {
             const settled = await this.effects.settleWithoutEffect({
               source: {
                 kind: 'internal',
-                key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:cancel-tool:${toolCallId}`
+                key: `${sourcePrefix}:cancel-tool:${toolCallId}`
               },
               toolCallId,
               status: 'cancelled',
-              detail: { reason: 'turn_termination_requested' }
+              detail: { reason }
             });
             terminal = settled.terminal ?? null;
           } else {
@@ -3574,10 +3625,10 @@ export class ReliableAgentLoop {
               ?? await this.effects.finalizeTerminalOperationsWithFallback({
                 source: {
                   kind: 'internal',
-                  key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:close-effect:${toolCallId}`
+                  key: `${sourcePrefix}:close-effect:${toolCallId}`
                 },
                 toolCallId,
-                detail: { reason: 'turn_termination_requested_after_effect_terminal' }
+                detail: { reason: `${reason}_after_effect_terminal` }
               });
           }
           terminal ??= await this.requireTerminalToolResult(toolCallId);
@@ -3605,7 +3656,7 @@ export class ReliableAgentLoop {
     await this.closeNativeResultOccurrences({
       conversationId,
       turnId,
-      sourcePrefix: `agent-loop:${turnId}:termination-request:${terminationRequestId}:native-closure`,
+      sourcePrefix: `${sourcePrefix}:native-closure`,
       scope: 'terminating_turn'
     });
 
@@ -3613,18 +3664,19 @@ export class ReliableAgentLoop {
       && !await this.effects.readTerminalResult(pendingToolCallId, false)) {
       await this.cancelUndispatchedToolEffects(
         pendingToolCallId,
-        `agent-loop:${turnId}:termination-request:${terminationRequestId}`
+        sourcePrefix,
+        `${reason}_before_effect_dispatch`
       );
       const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: pendingToolCallId });
       if (operations.length === 0) {
         await this.effects.settleWithoutEffect({
           source: {
             kind: 'internal',
-            key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:cancel-unrepresented-tool:${pendingToolCallId}`
+            key: `${sourcePrefix}:cancel-unrepresented-tool:${pendingToolCallId}`
           },
           toolCallId: pendingToolCallId,
           status: 'cancelled',
-          detail: { reason: 'turn_termination_requested' }
+          detail: { reason }
         });
       } else {
         await this.effects.finalizeReadyInOrder(turnId);
@@ -3633,10 +3685,10 @@ export class ReliableAgentLoop {
           ?? await this.effects.finalizeTerminalOperationsWithFallback({
             source: {
               kind: 'internal',
-              key: `agent-loop:${turnId}:termination-request:${terminationRequestId}:close-effect:${pendingToolCallId}`
+              key: `${sourcePrefix}:close-effect:${pendingToolCallId}`
             },
             toolCallId: pendingToolCallId,
-            detail: { reason: 'turn_termination_requested_after_effect_terminal' }
+            detail: { reason: `${reason}_after_effect_terminal` }
           });
         if (!terminal) await this.requireTerminalToolResult(pendingToolCallId);
       }
@@ -3644,7 +3696,11 @@ export class ReliableAgentLoop {
   }
 
   /** A prepared Effect may be cancelled; a dispatched Effect must first produce/recover a Receipt. */
-  private async cancelUndispatchedToolEffects(toolCallId: string, sourcePrefix: string): Promise<void> {
+  private async cancelUndispatchedToolEffects(
+    toolCallId: string,
+    sourcePrefix: string,
+    reason = 'turn_termination_requested_before_effect_dispatch'
+  ): Promise<void> {
     const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
     for (const operation of operations) {
       if (isTerminalToolStatus(operation.status)) continue;
@@ -3659,7 +3715,7 @@ export class ReliableAgentLoop {
             key: `${sourcePrefix}:cancel-before-dispatch:${String(intents[0].id)}`
           },
           effectIntentId: requireId(intents[0].id, 'EffectIntent.id'),
-          detail: { reason: 'turn_termination_requested_before_effect_dispatch' }
+          detail: { reason }
         });
       }
     }
@@ -3709,13 +3765,14 @@ export class ReliableAgentLoop {
       const turn = await this.maybeGet('Turn', turnId);
       if (!turn || turn.status !== 'active') return;
       if (await this.terminateIfRequested(turnId, 'failure-terminal')) return;
-      // A failed Provider chain may leave settled siblings of a still-open batch outside Context.
-      await this.closeNativeResultOccurrences({
-        conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'),
+      // A failed dispatch may still own prepared, never-started effects. Close the committed
+      // tool batch using the same pending-only CAS and canonical Context rules as interruption.
+      // A dispatched effect without a terminal result still blocks closure.
+      await this.closeTerminalToolContext(
         turnId,
-        sourcePrefix: `agent-loop:${turnId}:failed:${stableDigest(reason)}:native-closure`,
-        scope: 'terminating_turn'
-      });
+        `agent-loop:${turnId}:failed:${stableDigest(reason)}`,
+        'turn_failed'
+      );
       await this.absorbRuntimeDeliveryInputs(turnId, 'leave');
       try {
         await this.turns.terminal({

@@ -257,8 +257,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           // at its tool boundary, waiting for results that can never be admitted, until the socket
           // idles out minutes later.
           if (terminal) return;
-          this.capability.abort(request.modelRequestId);
           finish(error);
+          this.capability.abort(request.modelRequestId);
         });
       };
       const finish = (error?: unknown): void => {
@@ -271,14 +271,17 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminalError !== undefined) {
           const partialOutput = partialOutputSnapshot(outputParts);
           if (partialOutput && shouldFreezeFailedPartialOutput(request, terminalError)) {
-            pushEvent({
+            const partialEvent: Omit<ProviderOutputStreamEvent, 'streamSeq'> = {
               kind: 'output_item_done',
               semanticProgress: false,
               content: normalizePlainJson({
                 type: PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
                 message: partialOutput
               }, 'LLM partial output snapshot')
-            });
+            };
+            if (controls.onFailedPartialOutput) {
+              controls.onFailedPartialOutput({ ...partialEvent, streamSeq: (++sequence).toString() });
+            } else pushEvent(partialEvent);
           }
         }
         terminal = true;
@@ -520,9 +523,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           case LlmEventType.RetryStarted:
             // Reliable ModelRequest/Attempt owns the only retry loop. If a misconfigured capability
             // still announces an internal retry, stop it and surface the transient failure now.
+            finish(capabilityRetryError(payload));
             this.capability.cancelRetry(request.modelRequestId);
             if (event.type === LlmEventType.RetryStarted) this.capability.abort(request.modelRequestId);
-            finish(capabilityRetryError(payload));
             return;
           case LlmEventType.Error:
             finish(capabilityProviderError(payload));
@@ -536,8 +539,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       };
 
       const onAbort = (): void => {
-        this.capability.abort(request.modelRequestId);
         finish(abortError(controls.signal));
+        this.capability.abort(request.modelRequestId);
       };
       const detachAbort = (): void => controls.signal?.removeEventListener('abort', onAbort);
       if (controls.signal?.aborted) {
@@ -623,9 +626,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           if (event.type === LlmEventType.RetryScheduled || event.type === LlmEventType.RetryStarted) {
+            finish(capabilityRetryError(payload));
             this.capability.cancelRetry(request.modelRequestId);
             if (event.type === LlmEventType.RetryStarted) this.capability.abort(request.modelRequestId);
-            finish(capabilityRetryError(payload));
             return;
           }
           if (event.type === LlmEventType.CompactError) {
@@ -636,8 +639,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         }
       };
       const onAbort = (): void => {
-        this.capability.abort(request.modelRequestId);
         finish(abortError(controls.signal));
+        this.capability.abort(request.modelRequestId);
       };
       const detachAbort = (): void => controls.signal?.removeEventListener('abort', onAbort);
       if (controls.signal?.aborted) {
@@ -2151,7 +2154,8 @@ function providerToolAllowed(
 }
 
 function shouldFreezeFailedPartialOutput(request: FullProviderRequest, error: unknown): boolean {
-  if (error instanceof Error && error.name === 'AbortError') return false;
+  // Abort revokes ordinary callbacks, but the dispatch still owns a bounded display-only closure.
+  // Its snapshot never authorizes a completed response, tool invocation or Context occurrence.
   if (!(error instanceof ProviderTransientError) || !error.retryAfterOutput) return true;
   if (!/^[1-9]\d*$/.test(request.attemptSeq)) {
     throw new TypeError('Provider request attemptSeq must be a positive decimal integer.');

@@ -6,6 +6,15 @@
 export const LOCAL_EXECUTION_MAX_RETRIES = 8;
 const LOCAL_RETRY_DELAYS_MS = [100, 250, 500, 1_000, 2_000, 3_000, 5_000, 5_000] as const;
 
+// A reconstructed terminal fact is immutable history, even when its diagnostic code names a
+// transient local error. Keep provenance out of serialized/provider-controlled error fields.
+const restoredTerminalFailures = new WeakSet<object>();
+
+export function markRestoredTerminalFailure<T extends Error>(error: T): T {
+  restoredTerminalFailures.add(error);
+  return error;
+}
+
 /** Prevent nested local/provider/runner retry loops from multiplying an exhausted budget. */
 export class LocalExecutionRecoveryExhaustedError extends Error {
   public readonly code = 'LOCAL_EXECUTION_RECOVERY_EXHAUSTED';
@@ -17,7 +26,7 @@ export class LocalExecutionRecoveryExhaustedError extends Error {
 }
 
 export function isRetryableLocalExecutionError(error: unknown): boolean {
-  if (!error || typeof error !== 'object') return false;
+  if (!error || typeof error !== 'object' || restoredTerminalFailures.has(error)) return false;
   const value = error as { code?: unknown; name?: unknown };
   if (value.name === 'AbortError' || value.name === 'RootAuthorityError'
     || value.name === 'StaleRootBindingError') return false;

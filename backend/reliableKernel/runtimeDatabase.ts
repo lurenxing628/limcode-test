@@ -663,23 +663,25 @@ export class RuntimeDatabase {
   }
 
   public async commitModelStreamEvent(
-    input: ModelStreamEventCommitInput
+    input: ModelStreamEventCommitInput,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<ModelStreamEventCommitResult> {
     const executionFence = currentExecutionLeaseFence();
     return this.requestWithExecutionFence(executionFence, {
       kind: 'modelStreamEvent',
       input: executionFence ? { ...input, executionFence } : input
-    });
+    }, options.beforeSubmit);
   }
 
   public async recordModelStreamActivity(
-    input: ModelStreamActivityInput
+    input: ModelStreamActivityInput,
+    options: { beforeSubmit?: () => void } = {}
   ): Promise<ModelStreamActivityResult> {
     const executionFence = currentExecutionLeaseFence();
     return this.requestWithExecutionFence(executionFence, {
       kind: 'modelStreamActivity',
       input: executionFence ? { ...input, executionFence } : input
-    });
+    }, options.beforeSubmit);
   }
 
   public async cancelCurrentModelRequest(

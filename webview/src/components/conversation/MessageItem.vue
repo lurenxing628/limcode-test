@@ -136,8 +136,8 @@ const compactDescriptionHtml = computed(() => terminatedPartial.value
 const forkDescriptionHtml = computed(
   () => `将从对话开头复制到此处，共 <strong>${Math.max(1, props.floorNumber)}</strong> 条消息。确认后会创建并自动打开新的分支对话。`
 );
-const retryDescriptionHtml = computed(() => terminatedPartial.value
-  ? `确定重试这次已终止回复吗？将删除已保留的未完成回复及后续共 ${props.deleteCount} 条消息，并从原用户输入重新请求 LLM。此操作<strong>不可撤销</strong>。`
+const retryDescriptionHtml = computed(() => props.message.retryTarget?.kind === 'model_request'
+  ? '确定重试这次已终止回复吗？将删除这次请求保留的未完成回复，并从这次请求的上下文重新请求 LLM。其他消息和已完成的工具结果会保留；模型仍可能提出新的工具调用。此操作<strong>不可撤销</strong>。'
   : `确定要重试此消息吗？这将删除此消息及后续共 ${props.deleteCount} 条消息，然后重新请求 LLM。此操作<strong>不可撤销</strong>。`
 );
 const messageText = computed(() =>

@@ -49,6 +49,12 @@ import {
   type TurnCommandCommitOptions
 } from './turnCommandWire';
 import { TurnGuidanceQueueOperations } from './turnGuidanceQueue';
+import {
+  assistantMessageIdFor,
+  assistantMessageRevisionIdFor,
+  nativeCumulativeRevisionId,
+  nativeItemRevisionId
+} from './turnOutput';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
   DOMAIN_REPOSITORIES,
@@ -2535,6 +2541,9 @@ export class TurnControlPlane {
         rootId,
         beforeModelRequestSeq: requireBigInt(request.request_seq, 'ModelRequest.request_seq')
       });
+      const partialCleanup = await this.prepareRetryPartialCleanup(
+        conversationId, sourceTurnId, request, entryByMessageId
+      );
       return {
         lineage: {
           sourceTurnId,
@@ -2546,7 +2555,8 @@ export class TurnControlPlane {
           DOMAIN_REPOSITORIES.domain('ModelRequest').assert(modelRequestId, {
             turn_id: sourceTurnId,
             request_seq: requireBigInt(request.request_seq, 'ModelRequest.request_seq'),
-            status: 'terminal'
+            status: 'terminal',
+            terminal_state: request.terminal_state
           }),
           DOMAIN_REPOSITORIES.domain('ModelContextProjection').assert(
             requireId(projection.id, 'ModelContextProjection.id'),
@@ -2555,7 +2565,8 @@ export class TurnControlPlane {
           DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(
             requireId(head.id, 'ConversationContextHeadLink.id'),
             { conversation_id: conversationId, root_id: rootId }
-          )
+          ),
+          ...partialCleanup
         ]
       };
     }
@@ -2610,6 +2621,99 @@ export class TurnControlPlane {
         ...softDeleteEntrySteps(targets, now)
       ]
     };
+  }
+
+  /** A request retry discards only its proven display-only partial, never a transcript suffix. */
+  private async prepareRetryPartialCleanup(
+    conversationId: string,
+    sourceTurnId: string,
+    request: DomainRow,
+    entries: ReadonlyMap<string, ConversationMessageEntry>
+  ): Promise<RepositoryTransactionStep[]> {
+    const modelRequestId = requireId(request.id, 'ModelRequest.id');
+    const links = await this.listRows('ModelRequestMessageLink', { model_request_id: modelRequestId }, 2);
+    if (links.length === 0) {
+      return [DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assertNone({ model_request_id: modelRequestId })];
+    }
+    if (links.length !== 1 || request.terminal_state === 'completed') {
+      throw new Error(`Retry target ${modelRequestId} does not have one display-only partial output.`);
+    }
+    const link = links[0];
+    const messageId = requireId(link.message_id, 'ModelRequestMessageLink.message_id');
+    const entry = entries.get(messageId);
+    if (!entry) throw new Error(`Retry partial ${messageId} is outside Conversation ${conversationId}.`);
+    const relation = await this.getMessageRelation(conversationId, messageId);
+    const turnLinks = await this.listRows('MessageTurnLink', { message_id: messageId }, 2);
+    if (turnLinks.length !== 1 || turnLinks[0].turn_id !== sourceTurnId || turnLinks[0].role !== 'model') {
+      throw new Error(`Retry partial ${messageId} is not the output of source Turn ${sourceTurnId}.`);
+    }
+    // These are the two existing failed-partial writers' immutable identities. A native Message
+    // with any completed item also has other revisions, including tool items excluded from direct
+    // message_revision Context sources; absence of those sources alone would not prove safety.
+    const sourceKey = `failed-partial:${modelRequestId}`;
+    const itemKey = `failed-partial:${sourceKey}`;
+    const ordinaryRevisionId = assistantMessageRevisionIdFor(sourceTurnId, sourceKey);
+    const nativeRevisionIds = [
+      nativeItemRevisionId(sourceTurnId, modelRequestId, itemKey),
+      nativeCumulativeRevisionId(sourceTurnId, modelRequestId, itemKey)
+    ];
+    const nativePartial = messageId === assistantMessageIdFor(sourceTurnId, modelRequestId);
+    const revisionIds = messageId === assistantMessageIdFor(sourceTurnId, sourceKey)
+      ? [ordinaryRevisionId]
+      : nativePartial ? nativeRevisionIds : [];
+    const revisions = await listAllDomainRows(this.database, 'MessageRevision', { message_id: messageId });
+    const currentRevisionId = requireId(relation.currentRevision.id, 'MessageRevision.id');
+    if (revisionIds.length === 0
+      || !sameIdSet(revisions.map(row => requireId(row.id, 'MessageRevision.id')), revisionIds)
+      || currentRevisionId !== revisionIds[revisionIds.length - 1]
+      || revisions.some(row => row.role !== 'model')) {
+      throw new Error(`Retry partial ${messageId} contains output other than the failed display snapshot.`);
+    }
+    const partials = await this.listRows('ModelStreamCheckpoint', {
+      model_request_id: modelRequestId, checkpoint_kind: 'partial_summary'
+    }, 1);
+    if (partials.length !== 1) throw new Error(`Retry partial ${messageId} has no failed output checkpoint.`);
+    return [
+      DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assertExactIds(
+        { model_request_id: modelRequestId }, [requireId(link.id, 'ModelRequestMessageLink.id')]
+      ),
+      DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').assert(requireId(link.id, 'ModelRequestMessageLink.id'), {
+        model_request_id: modelRequestId, message_id: messageId
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').assertExactIds(
+        { message_id: messageId }, [requireId(turnLinks[0].id, 'MessageTurnLink.id')]
+      ),
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').assert(requireId(turnLinks[0].id, 'MessageTurnLink.id'), {
+        message_id: messageId, turn_id: sourceTurnId, role: 'model'
+      }),
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assert(requireId(relation.membership.id, 'MessagePartOfConversation.id'), {
+        message_id: messageId, conversation_id: conversationId
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(requireId(relation.currentLink.id, 'MessageCurrentRevisionLink.id'), {
+        message_id: messageId, revision_id: currentRevisionId
+      }),
+      DOMAIN_REPOSITORIES.domain('MessageRevision').assertExactIds({ message_id: messageId }, revisionIds),
+      ...revisions.flatMap(revision => [
+        DOMAIN_REPOSITORIES.domain('MessageRevision').assert(requireId(revision.id, 'MessageRevision.id'), {
+          message_id: messageId, role: 'model', content_object_id: revision.content_object_id
+        }),
+        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').assertNone({
+          source_kind: 'message_revision', source_id: revision.id
+        })
+      ]),
+      DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').assert(requireId(partials[0].id, 'ModelStreamCheckpoint.id'), {
+        model_request_id: modelRequestId, checkpoint_kind: 'partial_summary', content_object_id: partials[0].content_object_id
+      }),
+      // Ordinary providers may close a reasoning block before an unfinished response; only the
+      // native writer promotes item completion into independently committed output.
+      ...(nativePartial ? ['output_item_done', 'native_tool_call', 'terminal_summary'] : ['terminal_summary']).map(checkpointKind =>
+        DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').assertNone({
+          model_request_id: modelRequestId, checkpoint_kind: checkpointKind
+        })),
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assertNone({ model_request_id: modelRequestId }),
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assertNone({ message_id: messageId }),
+      ...softDeleteEntrySteps([entry], this.timestamp())
+    ];
   }
 
   private async findInheritedPlanApproval(input: {
