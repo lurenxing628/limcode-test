@@ -66,13 +66,13 @@ export async function loadLlmProviderConfigsSettings(paths: StoragePaths): Promi
   // default channel in memory only, as a missing store; the first save writes it.
   if (!await storageDirectoryExists(paths.settingsRootUri)) {
     return providerSettingsFromSnapshot(indexUri, {
-      records: [createDefaultLlmProviderConfig({ name: DEFAULT_CONFIG_NAME })], revision: missingRecordStoreRevision(indexUri)
+      records: [createBootstrapProviderConfig(indexUri, false)], revision: missingRecordStoreRevision(indexUri)
     });
   }
   const snapshot = await loadRecordStoreSnapshot<LlmProviderConfigRecord, typeof RECORD_KEY>(root, indexUri, RECORD_KEY);
   if (snapshot && snapshot.records.length > 0) return providerSettingsFromSnapshot(indexUri, snapshot);
 
-  const config = createDefaultLlmProviderConfig({ name: DEFAULT_CONFIG_NAME });
+  const config = createBootstrapProviderConfig(indexUri, true);
   try {
     const initialized = await commitRecordStoreSnapshot(root, indexUri, [config], RECORD_KEY, (record) => record.name, {
       expectedRevision: snapshot?.revision ?? missingRecordStoreRevision(indexUri),
@@ -115,6 +115,19 @@ export async function saveLlmProviderConfigsSettings(
   return {
     ...providerSettingsFromSnapshot(indexUri, committed),
     previousSettings: providerSettingsFromRecords(committed.previousRecords)
+  };
+}
+
+/** Missing reads and first materialization must name the same channel, across processes too. */
+function createBootstrapProviderConfig(indexUri: vscode.Uri, materializing: boolean): LlmProviderConfigRecord {
+  const config = createDefaultLlmProviderConfig({ name: DEFAULT_CONFIG_NAME });
+  const identity = createStorageRevision({ kind: 'llm-provider.bootstrap', resource: indexUri.toString() });
+  return {
+    ...config,
+    id: `llm-provider-config-${identity.slice('sha256:'.length)}`,
+    // An absent store has no creation event. Keep its provisional value stable; actual
+    // initialization records the creation time without replacing the provisional identity.
+    ...(materializing ? {} : { createdAt: 1, updatedAt: 1 })
   };
 }
 
@@ -202,7 +215,7 @@ function normalizeConfigList(input: LlmProviderConfigRecord[] | undefined): LlmP
   return sortConfigs([...byId.values()]);
 }
 
-/** The store a read initializes: the one default channel (its id and timestamps differ every time). */
+/** Missing and freshly initialized default records are equivalent for first-save conflict checks. */
 function isDefaultProviderRecords(records: readonly unknown[]): boolean {
   const comparable = (record: LlmProviderConfigRecord): string => createStorageRevision({
     ...normalizeLlmProviderConfig(record), id: '', createdAt: 0, updatedAt: 0

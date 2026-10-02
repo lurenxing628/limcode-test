@@ -103,11 +103,11 @@ test('reloc3 #5 记录存储型设置：页面在 settings/ 还没有时读到�
   const compressionA = await authority.loadGlobalSettings('llmCompressionConfigs');
   const network = await authority.loadGlobalSettings('network');
   await authority.saveGlobalSettings('network', { userAgent: 'Client/1' }, network.revision);
-  // Another reader now finds settings/ and writes the defaults (a new default channel id).
+  // Another reader now finds settings/ and materializes the same stable default channel identity.
   const providersB = await authority.loadGlobalSettings('llmProviderConfigs');
   await authority.loadGlobalSettings('mcpServers');
   await authority.loadGlobalSettings('llmCompressionConfigs');
-  assert.notEqual(providersB.settings.configs[0].id, providersA.settings.configs[0].id, '前提：写出的默认渠道是另一个 id');
+  assert.equal(providersB.settings.configs[0].id, providersA.settings.configs[0].id, '默认渠道写入后保留首次读取的稳定 id');
   const edited = { ...providersA.settings.configs[0], name: '我的渠道', apiKey: 'sk-a' };
   const savedProviders = await authority.saveGlobalSettings('llmProviderConfigs', { configs: [edited] }, providersA.revision);
   assert.deepEqual(savedProviders.settings.configs.map((config) => config.name), ['我的渠道']);

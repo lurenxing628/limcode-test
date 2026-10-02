@@ -46,13 +46,13 @@ export async function loadLlmCompressionConfigsSettings(paths: StoragePaths): Pr
   // default method in memory only, as a missing store; the first save writes it.
   if (!await storageDirectoryExists(paths.settingsRootUri)) {
     return compressionSettingsFromSnapshot(indexUri, {
-      records: [normalizeLlmCompressionConfig(createDefaultLlmCompressionConfig(DEFAULT_CONFIG_NAME))], revision: missingRecordStoreRevision(indexUri)
+      records: [createBootstrapCompressionConfig(indexUri, false)], revision: missingRecordStoreRevision(indexUri)
     });
   }
   const snapshot = await loadRecordStoreSnapshot<LlmCompressionConfigRecord, typeof RECORD_KEY>(root, indexUri, RECORD_KEY);
   if (snapshot && snapshot.records.length > 0) return compressionSettingsFromSnapshot(indexUri, snapshot);
 
-  const config = normalizeLlmCompressionConfig(createDefaultLlmCompressionConfig(DEFAULT_CONFIG_NAME));
+  const config = createBootstrapCompressionConfig(indexUri, true);
   try {
     const initialized = await commitRecordStoreSnapshot(root, indexUri, [config], RECORD_KEY, (record) => record.name, {
       expectedRevision: snapshot?.revision ?? missingRecordStoreRevision(indexUri),
@@ -133,6 +133,17 @@ export function normalizeLlmCompressionSettings(input: Partial<LlmCompressionSet
   return { ...(defaultConfigId ? { defaultConfigId } : {}), providerBindings, modelBindings };
 }
 
+/** The missing-store default remains the same referenced method when its store is initialized. */
+function createBootstrapCompressionConfig(indexUri: vscode.Uri, materializing: boolean): LlmCompressionConfigRecord {
+  const config = normalizeLlmCompressionConfig(createDefaultLlmCompressionConfig(DEFAULT_CONFIG_NAME));
+  const identity = createStorageRevision({ kind: 'llm-compression.bootstrap', resource: indexUri.toString() });
+  return {
+    ...config,
+    id: `llm-compression-config-${identity.slice('sha256:'.length)}`,
+    ...(materializing ? {} : { createdAt: 1, updatedAt: 1 })
+  };
+}
+
 export function normalizeLlmCompressionConfig(input: Partial<LlmCompressionConfigRecord> | undefined): LlmCompressionConfigRecord {
   const fallback = createDefaultLlmCompressionConfig(DEFAULT_CONFIG_NAME);
   const createdAt = finiteTimestamp(input?.createdAt, fallback.createdAt);
@@ -164,7 +175,7 @@ function normalizeConfigList(input: LlmCompressionConfigRecord[] | undefined): L
   return sortConfigs([...byId.values()]);
 }
 
-/** The store a read initializes: the one default method (its id and timestamps differ every time). */
+/** Missing and freshly initialized default records are equivalent for first-save conflict checks. */
 function isDefaultCompressionRecords(records: readonly unknown[]): boolean {
   const comparable = (record: LlmCompressionConfigRecord): string => createStorageRevision({
     ...normalizeLlmCompressionConfig(record), id: '', createdAt: 0, updatedAt: 0
