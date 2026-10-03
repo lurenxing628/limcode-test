@@ -1,3 +1,4 @@
+import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -366,6 +367,16 @@ export class RuntimeDatabase {
     reads: RepositoryRead[]
   ): Promise<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>> {
     return this.request<SnapshotBarrier<Array<DomainRow | DomainRow[] | null>>>({ kind: 'snapshot', reads });
+  }
+
+  /** Complete source evidence is checked in the worker; only selected ownership is returned. */
+  public attachmentProjectionSegments(conversationId: string, segmentIds: readonly string[]): Promise<SnapshotBarrier<AttachmentProjectionSegmentSnapshot>> {
+    return this.request({ kind: 'attachmentProjectionSegments', conversationId, segmentIds: [...segmentIds] });
+  }
+
+  /** Fresh AttachmentLink facts and immutable Attachment metadata for bounded revision selectors. */
+  public attachmentProjectionLinks(revisionIds: readonly string[]): Promise<SnapshotBarrier<AttachmentProjectionLinksSnapshot>> {
+    return this.request({ kind: 'attachmentProjectionLinks', revisionIds: [...revisionIds] });
   }
 
   /** Bounded target aggregates for historical merge preflight, all in one worker read snapshot. */

@@ -1,3 +1,4 @@
+import { readAttachmentProjectionSegments, readAttachmentProjectionLinks } from './attachmentProjectionSnapshot';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
@@ -354,6 +355,14 @@ async function start(): Promise<void> {
         assertDatabaseBinding(reader, data.binding);
         const result = reader.transaction(() => readMergeModelAggregates(reader, request.ids))();
         respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'attachmentProjectionSegments' || request.kind === 'attachmentProjectionLinks') {
+        assertDatabaseBinding(reader, data.binding);
+        const snapshot = reader.transaction(() => request.kind === 'attachmentProjectionSegments'
+          ? readAttachmentProjectionSegments(reader, request.conversationId, request.segmentIds)
+          : readAttachmentProjectionLinks(reader, request.revisionIds))();
+        respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
       }
       if (request.kind === 'snapshot') {

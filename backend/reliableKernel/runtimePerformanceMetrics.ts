@@ -14,6 +14,8 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'transaction'
   | 'renewExecutionLease'
   | 'snapshot'
+  | 'attachmentProjectionSegments'
+  | 'attachmentProjectionLinks'
   | 'snapshotAll'
   | 'toolFactsSnapshot'
   | 'conversationChildTaskSnapshot'

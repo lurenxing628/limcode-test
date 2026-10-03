@@ -1,3 +1,4 @@
+import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
 import type { RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type {
   DomainRow,
@@ -320,6 +321,8 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'transaction'; steps: RepositoryTransactionStep[]; durable?: true }
   | { kind: 'renewExecutionLease'; input: ExecutionLeaseRenewalInput }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
+  | { kind: 'attachmentProjectionSegments'; conversationId: string; segmentIds: string[] }
+  | { kind: 'attachmentProjectionLinks'; revisionIds: string[] }
   | { kind: 'mergeModelAggregates'; ids: string[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
   | { kind: 'toolFactsSnapshot'; toolCallId: string }
@@ -425,7 +428,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

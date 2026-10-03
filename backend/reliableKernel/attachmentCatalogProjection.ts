@@ -1,3 +1,4 @@
+import { attachmentSourceBelongsToConversation } from './attachmentProjectionEvidence';
 import type { AttachmentCatalogEntry } from '../../shared/protocol';
 import {
   mergeAttachmentCatalog,
@@ -66,7 +67,7 @@ export class AttachmentCatalogProjection {
     additionalMessageRevisionIds: readonly string[]
   ): Promise<AttachmentCatalogState> {
     const segmentIds = segments.map((segment) => requireId(segment.segmentId, 'segmentId'));
-    await this.primeSegments(segmentIds);
+    await this.primeSegments(conversationId, segmentIds);
     await this.primeCompressionLineage(conversationId, segmentIds);
     const revisionsBySegment: string[][] = [];
     for (const segmentId of segmentIds) {
@@ -185,7 +186,7 @@ export class AttachmentCatalogProjection {
       const childSegmentIds = blockSources.map((source) =>
         requireId(source.segment_id, 'CompressionBlockSource.segment_id')
       );
-      await this.primeSegments(childSegmentIds);
+      await this.primeSegments(conversationId, childSegmentIds);
       for (const childSegmentId of childSegmentIds) {
         await this.collectSegmentRevisions(conversationId, childSegmentId, revisions, nextPath);
       }
@@ -247,7 +248,7 @@ export class AttachmentCatalogProjection {
     const expanded = new Set<string>();
     let frontier = [...new Set(rootSegmentIds)];
     while (frontier.length > 0) {
-      await this.primeSegments(frontier);
+      await this.primeSegments(conversationId, frontier);
       const compressionSegments: Array<{ segmentId: string; blockId: string }> = [];
       for (const segmentId of frontier) {
         if (expanded.has(segmentId)) continue;
@@ -315,75 +316,30 @@ export class AttachmentCatalogProjection {
     }
   }
 
-  private async primeSegments(segmentIds: readonly string[]): Promise<void> {
+  private async primeSegments(conversationId: string, segmentIds: readonly string[]): Promise<void> {
     const missing = [...new Set(segmentIds)].filter((segmentId) =>
       !this.segmentCache.has(segmentId) || !this.sourceCache.has(segmentId)
     );
-    const primedSources: DomainRow[] = [];
     for (let offset = 0; offset < missing.length; offset += 64) {
       const batch = missing.slice(offset, offset + 64);
-      const result = await this.database.snapshot([
-        ...batch.map((segmentId) => DOMAIN_REPOSITORIES.domain('ContextSegment').get(segmentId)),
-        ...batch.map((segmentId) => DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-          where: { segment_id: segmentId },
-          limit: 257
-        }))
-      ]);
-      for (const [index, segmentId] of batch.entries()) {
-        const segment = result.snapshot[index];
-        if (segment && !Array.isArray(segment)) this.segmentCache.set(segmentId, segment);
-        const sourceRows = result.snapshot[batch.length + index];
-        if (!Array.isArray(sourceRows)) {
-          throw new Error(`ContextSegmentSource snapshot for ${segmentId} is invalid.`);
-        }
-        const complete = sourceRows.length < 257
-          ? sourceRows
-          : await listAllDomainRows(this.database, 'ContextSegmentSource', { segment_id: segmentId });
-        const sorted = [...complete].sort(compareSegmentSource);
-        this.sourceCache.set(segmentId, sorted);
-        primedSources.push(...sorted);
+      const { snapshot } = await this.database.attachmentProjectionSegments(conversationId, batch);
+      for (const segment of snapshot.segments) this.segmentCache.set(requireId(segment.id, 'ContextSegment.id'), segment);
+      for (const segmentId of batch) this.sourceCache.set(segmentId, []);
+      for (const source of snapshot.sources) {
+        this.sourceCache.get(requireId(source.segment_id, 'ContextSegmentSource.segment_id'))!.push(source);
       }
+      for (const revision of snapshot.messageRevisions) {
+        this.messageRevisionCache.set(requireId(revision.id, 'MessageRevision.id'), revision);
+        this.messageMembershipCache.set(requireId(revision.message_id, 'MessageRevision.message_id'), []);
+      }
+      for (const membership of snapshot.memberships) {
+        this.messageMembershipCache.get(requireId(membership.message_id, 'MessagePartOfConversation.message_id'))!.push(membership);
+      }
+      for (const [records, cache] of [
+        [snapshot.toolResults, this.toolResultCache], [snapshot.toolCalls, this.toolCallCache],
+        [snapshot.turns, this.turnCache], [snapshot.compressionBlocks, this.compressionBlockCache]
+      ] as const) for (const row of records) cache.set(requireId(row.id, 'row.id'), row);
     }
-    await this.primeSourceOwners(primedSources);
-  }
-
-  private async primeSourceOwners(sources: readonly DomainRow[]): Promise<void> {
-    const revisionIds = sources
-      .filter((source) => source.source_kind === 'message_revision')
-      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id'));
-    await this.primeMessageRevisionOwners(revisionIds);
-
-    const resultIds = sources
-      .filter((source) => source.source_kind === 'tool_model_result')
-      .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id'));
-    await this.primeDomainRows('ToolModelResult', resultIds, this.toolResultCache, false);
-    const toolCallIds = [
-      ...sources.filter((source) => source.source_kind === 'tool_call')
-        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
-      ...resultIds.flatMap((resultId) => {
-        const result = this.toolResultCache.get(resultId);
-        return result ? [requireId(result.tool_call_id, `ToolModelResult ${resultId}.tool_call_id`)] : [];
-      })
-    ];
-    await this.primeDomainRows('ToolCall', toolCallIds, this.toolCallCache, false);
-    await this.primeDomainRows(
-      'Turn',
-      toolCallIds.flatMap((toolCallId) => {
-        const toolCall = this.toolCallCache.get(toolCallId);
-        return toolCall ? [requireId(toolCall.turn_id, `ToolCall ${toolCallId}.turn_id`)] : [];
-      }),
-      this.turnCache,
-      false
-    );
-    // Every Conversation reaching a shared summary segment owns its own block over it; blocks of
-    // other or deleted Conversations are absent here and scoped out below.
-    await this.primeDomainRows(
-      'CompressionBlock',
-      sources.filter((source) => source.source_kind === 'compression_block')
-        .map((source) => requireId(source.source_id, 'ContextSegmentSource.source_id')),
-      this.compressionBlockCache,
-      false
-    );
   }
 
   private async primeMessageRevisionOwners(revisionIds: readonly string[]): Promise<void> {
@@ -423,28 +379,19 @@ export class AttachmentCatalogProjection {
   }
 
   private sourceBelongsToConversation(source: DomainRow, conversationId: string): boolean {
-    const sourceKind = requireText(source.source_kind, 'ContextSegmentSource.source_kind');
     const sourceId = requireId(source.source_id, 'ContextSegmentSource.source_id');
-    if (sourceKind === 'message_revision') {
-      return this.messageRevisionBelongsToConversation(sourceId, conversationId);
-    }
-    if (sourceKind === 'tool_call') {
-      return this.toolCallBelongsToConversation(sourceId, conversationId);
-    }
-    if (sourceKind === 'tool_model_result') {
-      const result = this.toolResultCache.get(sourceId);
-      if (!result) return false;
-      return this.toolCallBelongsToConversation(
-        requireId(result.tool_call_id, `ToolModelResult ${sourceId}.tool_call_id`),
-        conversationId
-      );
-    }
-    if (sourceKind === 'compression_block') {
-      return this.compressionBlockCache.get(sourceId)?.conversation_id === conversationId;
-    }
-    // System/runtime Context is shared immutable lineage. Unknown kinds stay visible so the
-    // structural validator fails closed instead of silently discarding malformed authority data.
-    return true;
+    const revision = this.messageRevisionCache.get(sourceId);
+    const result = this.toolResultCache.get(sourceId);
+    const call = this.toolCallCache.get(source.source_kind === 'tool_model_result' && result
+      ? requireId(result.tool_call_id, `ToolModelResult ${sourceId}.tool_call_id`) : sourceId);
+    return attachmentSourceBelongsToConversation(source, conversationId, {
+      messageRevision: revision,
+      memberships: revision ? this.messageMembershipCache.get(requireId(revision.message_id, `MessageRevision ${sourceId}.message_id`)) : undefined,
+      toolResult: result,
+      toolCall: call,
+      turn: call ? this.turnCache.get(requireId(call.turn_id, `ToolCall ${call.id}.turn_id`)) : undefined,
+      compressionBlock: this.compressionBlockCache.get(sourceId)
+    });
   }
 
   private messageRevisionBelongsToConversation(revisionId: string, conversationId: string): boolean {
@@ -456,32 +403,17 @@ export class AttachmentCatalogProjection {
     return memberships.length === 1 && memberships[0].conversation_id === conversationId;
   }
 
-  private toolCallBelongsToConversation(toolCallId: string, conversationId: string): boolean {
-    const toolCall = this.toolCallCache.get(toolCallId);
-    if (!toolCall) return false;
-    const turnId = requireId(toolCall.turn_id, `ToolCall ${toolCallId}.turn_id`);
-    const turn = this.turnCache.get(turnId);
-    return turn?.conversation_id === conversationId;
-  }
-
   private async primeRevisionLinks(revisionIds: readonly string[]): Promise<void> {
     const missing = [...new Set(revisionIds)].filter((revisionId) => !this.revisionLinkCache.has(revisionId));
-    for (let offset = 0; offset < missing.length; offset += 64) {
-      const batch = missing.slice(offset, offset + 64);
-      const result = await this.database.snapshot(batch.map((revisionId) =>
-        DOMAIN_REPOSITORIES.domain('AttachmentLink').list({
-          where: { message_revision_id: revisionId },
-          limit: 257
-        })
-      ));
-      for (const [index, revisionId] of batch.entries()) {
-        const rows = result.snapshot[index];
-        if (!Array.isArray(rows)) throw new Error(`AttachmentLink snapshot for ${revisionId} is invalid.`);
-        const complete = rows.length < 257
-          ? rows
-          : await listAllDomainRows(this.database, 'AttachmentLink', { message_revision_id: revisionId });
-        this.revisionLinkCache.set(revisionId, [...complete].sort(compareAttachmentLink));
+    for (let offset = 0; offset < missing.length; offset += 128) {
+      const batch = missing.slice(offset, offset + 128);
+      const { snapshot } = await this.database.attachmentProjectionLinks(batch);
+      for (const revisionId of batch) this.revisionLinkCache.set(revisionId, []);
+      for (const link of snapshot.links) {
+        this.revisionLinkCache.get(requireId(link.message_revision_id, 'AttachmentLink.message_revision_id'))!.push(link);
       }
+      for (const revisionId of batch) this.revisionLinkCache.get(revisionId)!.sort(compareAttachmentLink);
+      for (const attachment of snapshot.attachments) this.attachmentCache.set(requireId(attachment.id, 'Attachment.id'), attachment);
     }
   }
 
@@ -574,16 +506,6 @@ function compareAttachmentLink(left: DomainRow, right: DomainRow): number {
 
 function compareCompressionSource(left: DomainRow, right: DomainRow): number {
   return compareIntegerThenId(left.position, right.position, left.id, right.id, 'CompressionBlockSource.position');
-}
-
-function compareSegmentSource(left: DomainRow, right: DomainRow): number {
-  const leftRevision = requireBigInt(left.source_revision, 'ContextSegmentSource.source_revision');
-  const rightRevision = requireBigInt(right.source_revision, 'ContextSegmentSource.source_revision');
-  if (leftRevision !== rightRevision) return leftRevision < rightRevision ? -1 : 1;
-  const kind = requireText(left.source_kind, 'ContextSegmentSource.source_kind')
-    .localeCompare(requireText(right.source_kind, 'ContextSegmentSource.source_kind'));
-  if (kind !== 0) return kind;
-  return requireId(left.id, 'ContextSegmentSource.id').localeCompare(requireId(right.id, 'ContextSegmentSource.id'));
 }
 
 function compareIntegerThenId(
