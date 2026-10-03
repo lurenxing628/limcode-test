@@ -163,7 +163,7 @@ test('分段摘要重建：单个回合超过压缩窗口时仍按分段调用�
     const requests = await list('ModelRequest', { turn_id: result.turnId });
     assert.equal(requests.length, 1);
     assert.equal(requests[0].terminal_state, 'completed');
-    const leafBodies = server.bodies.filter((body) => body.includes('本回合记录'));
+    const leafBodies = server.bodies.filter((body) => body.includes('本段历史记录'));
     assert.ok(leafBodies.length >= 2, `expected several leaf summary calls, saw ${leafBodies.length}`);
     assert.ok(leafBodies.length <= 32);
     const wire = leafBodies.join('\n');
@@ -178,7 +178,7 @@ test('普通手动分段压缩：当前单个回合超过压缩窗口时同样�
     const result = await rebuild('segmented-manual', null);
     assert.equal(result.compression?.status, 'compressed', JSON.stringify(result));
     assert.deepEqual(result.compression.attemptedMethods, ['segmented_summary']);
-    assert.ok(server.bodies.filter((body) => body.includes('本回合记录')).length >= 2);
+    assert.ok(server.bodies.filter((body) => body.includes('本段历史记录')).length >= 2);
   });
 });
 

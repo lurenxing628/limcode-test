@@ -209,7 +209,7 @@ test('大来源：预估的分段请求数与随后真实重建发出的分段�
     assert.equal(server.bodies.length, 0, 'the preview calls no model');
     const rebuilt = await rebuild();
     assert.equal(rebuilt.compression.status, 'compressed');
-    const leafCalls = server.bodies.filter((body) => body.includes('本回合记录')).length;
+    const leafCalls = server.bodies.filter((body) => body.includes('本段历史记录')).length;
     assert.equal(leafCalls, result.outcome.summaryRequests);
   });
 });
