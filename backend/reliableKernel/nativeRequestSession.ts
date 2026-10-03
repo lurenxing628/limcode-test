@@ -1377,7 +1377,7 @@ export class NativeRequestSession {
     call.admitted = true;
     if (resolution.error !== undefined) {
       // Same honest failure as the terminal batch: no dispatch, a real failed result to deliver.
-      const failed = await this.deps.effects.settleWithoutEffect({
+      await this.deps.effects.settleWithoutEffect({
         source: {
           kind: 'internal',
           key: `agent-loop:${call.toolCallId}:invalid-model-handle-reference`
@@ -1389,9 +1389,9 @@ export class NativeRequestSession {
           error: resolution.error
         }
       });
-      call.settled = true;
-      call.toolModelResultId = failed.terminal?.toolModelResultId;
-      this.pumpSignal();
+      // The failed Operation is durable, but an earlier call may still block its model result.
+      // Keep observing settlement until the ordinary ordered finalizer supplies that result.
+      await this.onSettlement(call.toolCallId);
       return;
     }
     this.scheduleExecution(call);

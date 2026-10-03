@@ -20,13 +20,16 @@ const definition = { name: 'run_agent', description: 'native child handle fixtur
 const rows = async (app, domain, where = {}) => (await app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain(domain)
   .list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
 
-test('native settled batches freeze child refs across ModelRequests of the same Turn and restore them after reopen', { timeout: 30000 }, async () => {
+for (const blockedReference of [false, true]) {
+test(`native settled batches freeze child refs across ModelRequests and reopen${blockedReference ? ' with an ordered invalid-reference result' : ''}`, { timeout: 30000 }, async () => {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'native-child-handles-'));
   const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(root);
   let app;
   const capturedRequests = [];
   const executed = [];
+  let releasePredecessor;
+  const predecessorReady = new Promise(resolve => { releasePredecessor = resolve; });
   const adapter = {
     providerId: 'native-provider',
     async materializeNativeToolOutput(values) { return values; },
@@ -72,6 +75,15 @@ test('native settled batches freeze child refs across ModelRequests of the same 
         await call('unknown', 1, { operation: 'send', childRef: 'A999', prompt: 'must not run' }, responseId);
       }
       await control({ type: 'response.completed', responseId });
+      if (blockedReference && round === 2) {
+        const [source] = await rows(app, 'ToolCallSourceLink', { provider_call_id: 'unknown' });
+        assert.ok(source, 'the invalid reference was durably admitted while its predecessor waits');
+        assert.equal((await rows(app, 'Operation', { tool_call_id: source.tool_call_id }))[0].status, 'failed');
+        assert.equal((await rows(app, 'ToolResultArtifact', { tool_call_id: source.tool_call_id })).length, 1);
+        assert.equal(await app.runtime.effects.readTerminalResult(source.tool_call_id, false), null,
+          'a failed artifact behind an unfinished predecessor is not yet a model result');
+        releasePredecessor();
+      }
       if (round === 3) {
         await event('completed', { role: 'model', parts: [{ text: 'done' }] });
       } else {
@@ -110,10 +122,18 @@ test('native settled batches freeze child refs across ModelRequests of the same 
     providers: { resolve() { return adapter; } },
     toolDispatcher: {
       definitions() { return [definition]; },
+      subscribeToolSettlements({ turnId }, listener) {
+        return app.runtime.effects.subscribeToolModelResults(events => {
+          for (const event of events) if (event.turnId === turnId) listener(event);
+        });
+      },
       async dispatch() { throw new Error('native test must use scheduleAdmittedCall'); },
       async scheduleAdmittedCall(input) {
         executed.push(input.arguments);
-        if (input.arguments.operation === 'send') assert.equal(input.arguments.answerBridgeId, 'answer_bridge_one');
+        if (input.arguments.operation === 'send') {
+          assert.equal(input.arguments.answerBridgeId, 'answer_bridge_one');
+          if (blockedReference) await predecessorReady;
+        }
         const bridge = input.arguments.operation === 'spawn' ? `answer_bridge_${input.arguments.taskName}` : input.arguments.answerBridgeId;
         const result = await app.runtime.effects.settleWithoutEffect({
           source: { kind: 'internal', key: `fixture:${input.toolCallId}` }, toolCallId: input.toolCallId,
@@ -216,10 +236,12 @@ test('native settled batches freeze child refs across ModelRequests of the same 
       'replay never adds a second result occurrence');
     assert.equal((await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT })).length, 4);
   } finally {
+    releasePredecessor();
     await app?.close();
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
+}
 
 test('recovery of admitted unsettled native calls dispatches frozen canonical arguments and settles frozen unknown-reference errors', { timeout: 5000 }, async () => {
   const catalog = { entries: [{ kind: 'child', ref: 'A1', target: 'answer_bridge_original' }] };
