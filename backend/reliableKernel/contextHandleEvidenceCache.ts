@@ -179,6 +179,7 @@ class EvidenceCache {
               }
             }
           }
+          shareRetiredRefLists(state);
           state.result = readers.reconcile(state.fork.value, [...state.evidence.values()].map(entry => entry.value));
         }
         const afterVersion = await this.database.externalDataVersion();
@@ -297,6 +298,25 @@ class Dependencies {
       const value = Reflect.get(target, property, target);
       return typeof value === 'function' ? value.bind(target) : value;
     } });
+  }
+}
+
+/** Share only exactly equal, already validated retirement facts within the live evidence set.
+ * The lookup is discarded before returning, so it retains neither serialized keys nor obsolete
+ * arrays. Evidence invalidation releases each shared list when its last catalog is discarded. */
+function shareRetiredRefLists(state: ConversationEvidence): void {
+  const lists = new Map<string, string[]>();
+  const share = (catalog: ModelHandleCatalog): void => {
+    const refs = catalog.retiredRefs;
+    if (!refs) return;
+    const key = JSON.stringify(refs);
+    const existing = lists.get(key);
+    if (existing) catalog.retiredRefs = existing;
+    else { Object.freeze(refs); lists.set(key, refs); }
+  };
+  if (state.fork?.value) share(state.fork.value.catalog);
+  for (const evidence of state.evidence.values()) {
+    for (const catalog of evidence.value.catalogs) share(catalog);
   }
 }
 
