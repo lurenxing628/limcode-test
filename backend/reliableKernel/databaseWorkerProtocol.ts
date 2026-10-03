@@ -33,6 +33,34 @@ export interface ExecutionLeaseFencePayload {
   generation: bigint;
 }
 
+/** A logical-clock sample plus monotonic elapsed time; never replay stale enqueue-time now. */
+export interface ExecutionLeaseRenewalClock {
+  now: string;
+  sampledAtNs: bigint;
+  /** Injected clocks use their logical epoch; production additionally observes wall-clock jumps. */
+  systemClock: boolean;
+}
+
+export interface ExecutionLeaseRenewalInput {
+  fence: ExecutionLeaseFencePayload;
+  leaseExpiresAt: string;
+  clock: ExecutionLeaseRenewalClock;
+  /** A callback's authority can differ from its renewal target and must also remain current. */
+  executionFence?: ExecutionLeaseFencePayload;
+}
+
+export type ExecutionLeaseRenewalFailureReason =
+  | 'requested_expiry_not_future'
+  | 'lease_missing'
+  | 'fence_replaced'
+  | 'lease_expired'
+  | 'transaction_conflict';
+
+export type ExecutionLeaseRenewalResult =
+  | { renewed: true; observedExpiresAt: string; renewedExpiresAt: string }
+  | { renewed: false; reason: ExecutionLeaseRenewalFailureReason;
+      observedExpiresAt?: string; observedGeneration?: string };
+
 export interface ContextModelSource {
   providerId: string;
   modelId: string;
@@ -290,6 +318,7 @@ export interface RuntimeWalCheckpointResult {
 export type DatabaseWorkerRequestPayload =
   /** `durable`: this commit is synced before the response (see RuntimeDatabase.transaction). */
   | { kind: 'transaction'; steps: RepositoryTransactionStep[]; durable?: true }
+  | { kind: 'renewExecutionLease'; input: ExecutionLeaseRenewalInput }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'mergeModelAggregates'; ids: string[] }
   | { kind: 'snapshotAll'; read: RepositoryListRead }
@@ -396,7 +425,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

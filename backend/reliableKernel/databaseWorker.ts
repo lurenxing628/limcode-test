@@ -7,6 +7,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { DatabaseWorkerRequestQueue } from './databaseWorkerRequestQueue';
+import { decideExecutionLeaseRenewal, executionLeaseRenewalNow } from './executionLeaseRenewal';
 import { readMergeModelAggregates } from './runtimeMergeAggregatePreflight';
 import { RuntimeDataInvariantError } from './runtimeDataInvariant';
 import { repairHistoryTransaction } from './runtimeHistoryRepairTransaction';
@@ -69,6 +71,8 @@ import {
   type DatabaseWorkerResponse,
   type DatabaseWorkerWriteLockTiming,
   type ExecutionLeaseFencePayload,
+  type ExecutionLeaseRenewalInput,
+  type ExecutionLeaseRenewalResult,
   type EffectReceiptReconciliationCandidate,
   type ModelStreamActivityInput,
   type ModelStreamActivityResult,
@@ -254,7 +258,7 @@ async function start(): Promise<void> {
   const conversationRuntimeWork = createConversationRuntimeWorkProbe(reader);
 
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
-  port.on('message', (request: DatabaseWorkerRequest) => {
+  const requestQueue = new DatabaseWorkerRequestQueue((request: DatabaseWorkerRequest) => {
     if (closed) return;
     const receivedAtMs = Number.isFinite(request.metricEnqueuedAtMs)
       ? performance.now()
@@ -322,6 +326,16 @@ async function start(): Promise<void> {
       if (request.kind === 'durabilityCheckpoint') {
         assertDatabaseBinding(writer, data.binding);
         respond({ type: 'response', id: request.id, ok: true, result: checkpointWal(writer, 'PASSIVE') });
+        return;
+      }
+      if (request.kind === 'renewExecutionLease') {
+        assertDatabaseBinding(writer, data.binding);
+        const result = executeExecutionLeaseRenewal(writer, request.input, commitSeq + 1n);
+        if (result.commit) {
+          commitSeq += 1n;
+          post({ type: 'commit', result: result.commit });
+        }
+        respond({ type: 'response', id: request.id, ok: true, result: result.renewal });
         return;
       }
       if (request.kind === 'transaction') {
@@ -551,6 +565,7 @@ async function start(): Promise<void> {
         rollbackMaintenanceTransaction(writer);
       }
       closed = true;
+      requestQueue.close();
       detachRuntimeStatementCache(reader);
       detachRuntimeStatementCache(writer);
       reader.close();
@@ -563,6 +578,7 @@ async function start(): Promise<void> {
       measuringRequest = undefined;
     }
   });
+  port.on('message', (request: DatabaseWorkerRequest) => requestQueue.enqueue(request));
 }
 
 /**
@@ -856,9 +872,48 @@ function executeTransaction(
   return { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences };
 }
 
+/** Exact-owner renewal and its clock decision share one SQLite linearization point. */
+function executeExecutionLeaseRenewal(
+  database: Database.Database,
+  input: ExecutionLeaseRenewalInput,
+  nextCommitSeq: bigint
+): { renewal: ExecutionLeaseRenewalResult; commit?: RuntimeCommitResult } {
+  beginMeasuredWrite(database);
+  try {
+    assertDatabaseBinding(database, data.binding);
+    // Preserve the generic transaction's inherited callback fence independently of its target.
+    assertExecutionLeaseFence(database, input.executionFence);
+    const turn = executeRead(database, DOMAIN_REPOSITORIES.domain('Turn').get(input.fence.turnId));
+    const leases = executeRead(database, DOMAIN_REPOSITORIES.domain('ExecutionLease').list({
+      where: { turn_id: input.fence.turnId }, limit: 2
+    }));
+    if (Array.isArray(turn) || !Array.isArray(leases)) throw new TypeError('Invalid renewal authority rows.');
+    const renewal = decideExecutionLeaseRenewal(
+      input, turn, leases, data.hostBootId, executionLeaseRenewalNow(input.clock)
+    );
+    if (!renewal.renewed) {
+      database.exec('ROLLBACK');
+      return { renewal };
+    }
+    database.exec('DELETE FROM temp.runtime_transaction_change');
+    const allocatedSequences: RuntimeAllocatedSequence[] = [];
+    const steps = [DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
+      expires_at: renewal.renewedExpiresAt
+    })];
+    executeSteps(database, steps, allocatedSequences);
+    assertTouchedRuntimeAggregates(database, steps);
+    const changes = readTransactionChanges(database);
+    commitMeasuredWrite(database);
+    return { renewal, commit: { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences } };
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 /** Requests refused while a maintenance transaction is open: every other writer entry point, the durability checkpoint too. */
 const MAINTENANCE_EXCLUSIVE_WRITES: ReadonlySet<string> = new Set([
-  'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin', 'maintenanceRepairHistory', 'durabilityCheckpoint'
+  'renewExecutionLease', 'transaction', 'modelStreamEvent', 'modelStreamActivity', 'cancelCurrentModelRequest', 'maintenanceBegin', 'maintenanceRepairHistory', 'durabilityCheckpoint'
 ]);
 
 /** Ids per page of a maintenance commit's aggregate check. */

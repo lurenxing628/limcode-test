@@ -26,6 +26,8 @@ import type {
   ChildConversationOriginCandidate,
   ChildProcessCleanupMaterializationCandidate,
   DatabaseWorkerData,
+  ExecutionLeaseRenewalInput,
+  ExecutionLeaseRenewalResult,
   DatabaseWorkerDiagnostics,
   DatabaseWorkerRequest,
   ModelStreamActivityInput,
@@ -279,6 +281,17 @@ export class RuntimeDatabase {
       { kind: 'transaction', steps: fencedSteps, ...(options.durable ? { durable: true as const } : {}) },
       options.beforeSubmit
     );
+  }
+
+  /** Fixed atomic renewal; priority is intrinsic to this bounded operation, never caller-selected. */
+  public async renewExecutionLease(
+    input: Omit<ExecutionLeaseRenewalInput, 'executionFence'>
+  ): Promise<ExecutionLeaseRenewalResult> {
+    const executionFence = currentExecutionLeaseFence();
+    return this.requestWithExecutionFence(executionFence, {
+      kind: 'renewExecutionLease',
+      input: { ...input, ...(executionFence ? { executionFence } : {}) }
+    });
   }
 
   /**

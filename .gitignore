@@ -263,3 +263,6 @@ docs/architecture/*
 
 # CI shard timing/coverage reports are test artifacts.
 /test-results/
+
+!tests/reliable-kernel/lease-renewal-critical-queue.test.mjs
+!tests/reliable-kernel/lease-renewal-preflight-regression.test.mjs

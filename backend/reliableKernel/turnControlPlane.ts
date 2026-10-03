@@ -1,4 +1,6 @@
 import { createHash } from 'node:crypto';
+import type { ExecutionLeaseRenewalResult } from './databaseWorkerProtocol';
+export type { ExecutionLeaseRenewalFailureReason, ExecutionLeaseRenewalResult } from './databaseWorkerProtocol';
 import type {
   CompressionCommandTarget,
   LlmProviderKind,
@@ -114,26 +116,6 @@ export type TurnCommandSourceKind = 'command' | 'callback' | 'internal' | 'recov
 export type TurnCommandOperation = 'input' | 'edit' | 'delete' | 'retry' | 'interrupt' | 'continuation' | 'runtime_continuation' | 'terminal' | 'guidance';
 export type TurnTerminalStatus = 'completed' | 'failed' | 'interrupted' | 'cancelled' | 'outcome_unknown';
 export type TurnCommandContent = string | Uint8Array;
-
-export type ExecutionLeaseRenewalFailureReason =
-  | 'requested_expiry_not_future'
-  | 'lease_missing'
-  | 'fence_replaced'
-  | 'lease_expired'
-  | 'transaction_conflict';
-
-export type ExecutionLeaseRenewalResult =
-  | {
-      renewed: true;
-      observedExpiresAt: string;
-      renewedExpiresAt: string;
-    }
-  | {
-      renewed: false;
-      reason: ExecutionLeaseRenewalFailureReason;
-      observedExpiresAt?: string;
-      observedGeneration?: string;
-    };
 
 /** A history mutation can be retried unchanged once the exact competing Turn/Intent settles. */
 export class ConversationHistoryBusyError extends Error {
@@ -601,6 +583,7 @@ interface RetryRewindPlan {
 /** Phase C command facade. SQLite transactions are the only lifecycle serialization authority. */
 export class TurnControlPlane {
   private readonly now: () => string;
+  private readonly systemClock: boolean;
   private readonly authorityCompiler: TurnAuthorityCompiler;
   private readonly attachments?: AttachmentIngestService;
   private readonly unresolvedFileClosure?: TurnUnresolvedFileClosure;
@@ -625,6 +608,7 @@ export class TurnControlPlane {
     this.prepareTerminalDeliverySteps = options.prepareTerminalDeliverySteps;
     this.prepareRuntimeContinuationSteps = options.prepareRuntimeContinuationSteps;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.systemClock = options.now === undefined;
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.guidanceQueue = new TurnGuidanceQueueOperations({
       database,
@@ -1093,87 +1077,14 @@ export class TurnControlPlane {
     fence: ExecutionLeaseFence;
     leaseExpiresAt: string;
   }): Promise<ExecutionLeaseRenewalResult> {
-    const expiresAt = requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt');
-    let acquiredAt: string | undefined;
-    // Renewal and a recovery rescan can overlap under the same Conversation ownership pin. A
-    // changed expiry alone is not a handoff: re-read the complete authority before retrying.
-    const maxCasAttempts = 3;
-    for (let attempt = 0; ; attempt += 1) {
-      const now = this.timestamp();
-      if (Date.parse(expiresAt) <= Date.parse(now)) {
-        return { renewed: false, reason: 'requested_expiry_not_future' };
-      }
-      const snapshot = await this.database.snapshot([
-        DOMAIN_REPOSITORIES.domain('Turn').get(input.fence.turnId),
-        DOMAIN_REPOSITORIES.domain('ExecutionLease').list({ where: { turn_id: input.fence.turnId }, limit: 2 })
-      ]);
-      const turn = snapshot.snapshot[0];
-      const currentRows = rows(snapshot.snapshot[1]);
-      if (currentRows.length !== 1) return { renewed: false, reason: 'lease_missing' };
-      const current = currentRows[0];
-      const observedExpiresAt = requireTimestamp(current.expires_at, 'ExecutionLease.expires_at');
-      const observedGeneration = requirePositiveInteger(
-        current.generation,
-        'ExecutionLease.generation'
-      ).toString();
-      if (
-        !turn || Array.isArray(turn) || turn.status !== TURN_STATUS_ACTIVE
-        || current.id !== input.fence.id
-        || current.conversation_id !== input.fence.conversationId
-        || current.turn_id !== input.fence.turnId
-        || current.owner_id !== input.fence.ownerId
-        || current.host_boot_id !== input.fence.hostBootId
-        || current.generation !== input.fence.generation
-        || (attempt > 0 && current.acquired_at !== acquiredAt)
-      ) {
-        return {
-          renewed: false,
-          reason: 'fence_replaced',
-          observedExpiresAt,
-          observedGeneration
-        };
-      }
-      if (Date.parse(observedExpiresAt) <= Date.parse(this.timestamp())) {
-        return {
-          renewed: false,
-          reason: 'lease_expired',
-          observedExpiresAt,
-          observedGeneration
-        };
-      }
-      acquiredAt = requireTimestamp(current.acquired_at, 'ExecutionLease.acquired_at');
-      if (attempt > 0 && Date.parse(observedExpiresAt) >= Date.parse(expiresAt)) {
-        // The competing writer renewed this exact live fence for at least the requested lifetime.
-        // No new generation is adopted, and terminal/missing/expired ownership never reaches here.
-        return { renewed: true, observedExpiresAt, renewedExpiresAt: observedExpiresAt };
-      }
-      if (attempt === maxCasAttempts) {
-        return { renewed: false, reason: 'transaction_conflict', observedExpiresAt, observedGeneration };
-      }
-      const renewedExpiresAt = Date.parse(observedExpiresAt) > Date.parse(expiresAt)
-        ? observedExpiresAt
-        : expiresAt;
-      try {
-        await this.database.transaction([
-          DOMAIN_REPOSITORIES.domain('Turn').assert(input.fence.turnId, { status: TURN_STATUS_ACTIVE }),
-          DOMAIN_REPOSITORIES.domain('ExecutionLease').assert(input.fence.id, {
-            conversation_id: input.fence.conversationId,
-            turn_id: input.fence.turnId,
-            owner_id: input.fence.ownerId,
-            host_boot_id: input.fence.hostBootId,
-            generation: input.fence.generation,
-            acquired_at: acquiredAt,
-            expires_at: observedExpiresAt
-          }),
-          DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
-            expires_at: renewedExpiresAt
-          })
-        ]);
-        return { renewed: true, observedExpiresAt, renewedExpiresAt };
-      } catch (error) {
-        if (!isTransactionAssertionError(error)) throw error;
-      }
-    }
+    const leaseExpiresAt = requireTimestamp(input.leaseExpiresAt, 'leaseExpiresAt');
+    const sampledAtNs = process.hrtime.bigint();
+    const now = requireTimestamp(this.timestamp(), 'clock result');
+    return this.database.renewExecutionLease({
+      fence: input.fence,
+      leaseExpiresAt,
+      clock: { now, sampledAtNs, systemClock: this.systemClock }
+    });
   }
 
   /**

@@ -12,6 +12,7 @@ export interface RuntimePerformanceMetricsSink {
 
 export type RuntimeDatabaseMetricRequestKind =
   | 'transaction'
+  | 'renewExecutionLease'
   | 'snapshot'
   | 'snapshotAll'
   | 'toolFactsSnapshot'
