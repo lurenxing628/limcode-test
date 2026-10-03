@@ -288,6 +288,25 @@ export interface FullRequestProviderAdapter {
   ): Promise<readonly OpenAIResponsesToolOutput[]>;
 }
 
+/** Only these scalar/policy facts survive an adapter's ownership of the request body. */
+interface ProviderAttemptContinuation {
+  retryPolicy: FrozenProviderRetryPolicy;
+  priorNativeFailures: { kind: 'ready'; value: number } | { kind: 'invalid'; error: unknown };
+  modelOutputRepair: boolean;
+  compression: boolean;
+  nativeRequest: boolean;
+  configuredTimeoutMs: number;
+}
+
+/**
+ * A completed preparation promise may itself remain reachable in an awaiting caller. Transfer the
+ * body out of this holder before starting the adapter, so that promise cannot retain the history.
+ */
+interface PreparedProviderAttempt {
+  request: FullProviderRequest | undefined;
+  continuation: ProviderAttemptContinuation;
+}
+
 export class ModelRequestPreflightError extends Error {
   public constructor(
     public readonly code: ContextPlanningFailureCode,
@@ -1309,15 +1328,11 @@ export class ModelProviderControlPlane {
         stats
       };
       const expectedGeneration = currentIdentity.socketGeneration + 1n;
-      let fullRequest: FullProviderRequest;
+      let prepared: PreparedProviderAttempt;
       try {
-        fullRequest = await retryLocalExecution(() => {
-          this.assertNotHandingOff();
-          return this.buildFullRequest(modelRequestId, attemptSeq, expectedGeneration);
-        }, { signal: options.signal });
-        if (stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID') fullRequest.modelOutputRepair = true;
-        this.assertRequestPreflight(request, fullRequest, adapter);
-        retryPolicy ??= retryPolicyForFullRequest(fullRequest);
+        prepared = await this.prepareProviderAttempt(request, modelRequestId, attemptSeq, expectedGeneration, adapter,
+          stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID', retryPolicy, options.signal);
+        retryPolicy ??= prepared.continuation.retryPolicy;
       } catch (error) {
         if (isExecutionHandoffError(error)) throw error;
         if (options.signal?.aborted) {
@@ -1368,12 +1383,7 @@ export class ModelProviderControlPlane {
       const detachCallerSignal = relayAbort(options.signal, controller);
       const unregister = this.registerActiveSocket(modelRequestId, controller);
       const abortWaiter = createAbortWaiter(controller.signal);
-      const compression = isCompressionRecipe(fullRequest.recipe);
-      const configuredTimeoutMs = compression
-        ? normalizeLlmCompressionMaxDurationMinutes(
-            frozenCompressionPolicy(fullRequest.authoritySnapshot)?.config.maxDurationMinutes
-          ) * 60_000
-        : DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS;
+      const { compression, configuredTimeoutMs, nativeRequest, priorNativeFailures, modelOutputRepair } = prepared.continuation;
       const timeoutWaiter = createProviderTimeoutWaiter(
         options.timeoutMs ?? configuredTimeoutMs
       );
@@ -1387,9 +1397,6 @@ export class ModelProviderControlPlane {
       // response.created the server intentionally waits for our tool results/steering, and the
       // client lane-admission queue may hold this request before its first response.created.
       // Both are proven local/server waits: suspend the idle watchdog, never the total deadline.
-      const nativeRequest = !compression
-        && isRecord(fullRequest.recipe)
-        && isRecord(fullRequest.recipe.nativeResponses);
       const nativeWait = { boundary: false, laneQueue: false, suspended: false };
       const updateNativeWaitSuspension = (next: Partial<{ boundary: boolean; laneQueue: boolean }>): void => {
         if (!nativeRequest) return;
@@ -1418,7 +1425,7 @@ export class ModelProviderControlPlane {
         reportLocalFailure = resolve;
       });
       const adapterOutcome = Promise.resolve()
-        .then(() => adapter.sendFullRequest(fullRequest, {
+        .then(() => startPreparedProviderAttempt(prepared, adapter, {
           signal: controller.signal,
           onLocalFailure: (error) => {
             if (controller.signal.aborted) return;
@@ -1590,7 +1597,7 @@ export class ModelProviderControlPlane {
         // the model would re-issue executed calls under new identities. Keep the request open and
         // unfailed; the caller closes its settled results into Context and rebases the Turn.
         await this.recordNativeRebaseFailure(modelRequestId, identity, error,
-          retryPolicy?.retryDelayMs ?? 0, nativePriorFailures(fullRequest), retryPolicy?.maxRetries ?? 0);
+          retryPolicy?.retryDelayMs ?? 0, requirePriorNativeFailures(priorNativeFailures), retryPolicy?.maxRetries ?? 0);
         throw new NativeChainReplayUnsafeError(error);
       }
       if (sawReplayUnsafeProviderEvent && !error.retryAfterOutput) {
@@ -1611,11 +1618,11 @@ export class ModelProviderControlPlane {
         throw replayUnsafe;
       }
       const configuredMaxRetries = retryPolicy?.enabled ? retryPolicy.maxRetries : 0;
-      const repairLimit = fullRequest.modelOutputRepair ? 2 : error.retryOptions.maxRetries;
+      const repairLimit = modelOutputRepair ? 2 : error.retryOptions.maxRetries;
       const maxRetries = repairLimit === undefined ? configuredMaxRetries
-        : Math.min(configuredMaxRetries, Math.max(0, repairLimit - nativePriorFailures(fullRequest)));
+        : Math.min(configuredMaxRetries, Math.max(0, repairLimit - requirePriorNativeFailures(priorNativeFailures)));
       if (identity.attemptSeq >= BigInt(maxRetries + 1)) {
-        const priorFailures = nativePriorFailures(fullRequest);
+        const priorFailures = requirePriorNativeFailures(priorNativeFailures);
         error.message = `${error.message}（${configuredMaxRetries === 0 && priorFailures === 0
             ? '当前渠道或模型已关闭自动重试'
             : `已自动重试 ${priorFailures + Math.max(0, Number(identity.attemptSeq) - 1)} 次，达到本次请求的重试上限 ${priorFailures + maxRetries} 次`}。）`;
@@ -1664,6 +1671,46 @@ export class ModelProviderControlPlane {
       stats = parseStreamStats(request.stream_stats_json);
       attemptSeq = retryAttempt.attemptSeq;
     }
+  }
+
+  private async prepareProviderAttempt(
+    request: DomainRow,
+    modelRequestId: string,
+    attemptSeq: bigint,
+    socketGeneration: bigint,
+    adapter: FullRequestProviderAdapter,
+    repairOutput: boolean,
+    retainedRetryPolicy: FrozenProviderRetryPolicy | undefined,
+    signal?: AbortSignal
+  ): Promise<PreparedProviderAttempt> {
+    const fullRequest = await retryLocalExecution(() => {
+      this.assertNotHandingOff();
+      return this.buildFullRequest(modelRequestId, attemptSeq, socketGeneration);
+    }, { signal });
+    if (repairOutput) fullRequest.modelOutputRepair = true;
+    this.assertRequestPreflight(request, fullRequest, adapter);
+    // The first Attempt owns the frozen retry policy, as before. A reconnect/retry must not
+    // acquire a second policy authority just because its request body is rebuilt.
+    const retryPolicy = retainedRetryPolicy ?? retryPolicyForFullRequest(fullRequest);
+    const compression = isCompressionRecipe(fullRequest.recipe);
+    let priorNativeFailures: ProviderAttemptContinuation['priorNativeFailures'];
+    try { priorNativeFailures = { kind: 'ready', value: nativePriorFailures(fullRequest) }; }
+    catch (error) { priorNativeFailures = { kind: 'invalid', error }; }
+    return {
+      request: fullRequest,
+      continuation: {
+        retryPolicy,
+        priorNativeFailures,
+        modelOutputRepair: fullRequest.modelOutputRepair === true,
+        compression,
+        nativeRequest: !compression && isRecord(fullRequest.recipe) && isRecord(fullRequest.recipe.nativeResponses),
+        configuredTimeoutMs: compression
+          ? normalizeLlmCompressionMaxDurationMinutes(
+              frozenCompressionPolicy(fullRequest.authoritySnapshot)?.config.maxDurationMinutes
+            ) * 60_000
+          : DEFAULT_PROVIDER_DISPATCH_TIMEOUT_MS
+      }
+    };
   }
 
   /** A retired transport cannot write ordinary events, but its captured display snapshot has a
@@ -3071,6 +3118,23 @@ export function retryPolicyForFullRequest(request: FullProviderRequest): FrozenP
     && request.recipe.nativeErrorRecovery.modelOutputRepair === true;
   const maxRetries = Math.max(0, Math.min(policy.maxRetries, repair ? 2 : 10) - priorFailures);
   return { ...policy, enabled: policy.enabled && maxRetries > 0, maxRetries };
+}
+
+/** Synchronous ownership transfer: the long-lived dispatch frame retains only an empty holder. */
+function startPreparedProviderAttempt(
+  prepared: PreparedProviderAttempt,
+  adapter: FullRequestProviderAdapter,
+  controls: ProviderDispatchControls
+): Promise<void> {
+  const request = prepared.request;
+  if (!request) throw new Error('Prepared Provider attempt has already been transferred.');
+  prepared.request = undefined;
+  return adapter.sendFullRequest(request, controls);
+}
+
+function requirePriorNativeFailures(fact: ProviderAttemptContinuation['priorNativeFailures']): number {
+  if (fact.kind === 'invalid') throw fact.error;
+  return fact.value;
 }
 
 function nativePriorFailures(request: FullProviderRequest): number {

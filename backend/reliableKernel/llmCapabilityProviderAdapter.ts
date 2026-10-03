@@ -104,6 +104,19 @@ interface ToolCallOutput {
   async?: boolean;
 }
 
+interface OrdinaryStreamMetadata {
+  modelRequestId: string;
+  attemptSeq: string;
+  claudeThinkingBinding: FullProviderRequest['claudeThinkingBinding'];
+  priorFailures: number;
+  modelOutputRepair: boolean;
+  retryPolicy: { kind: 'ready'; value: ReturnType<typeof retryPolicyForFullRequest> }
+    | { kind: 'invalid'; error: unknown };
+}
+
+type ProviderDebugContext = Pick<FullProviderRequest,
+  'conversationId' | 'modelRequestId' | 'attemptSeq' | 'socketGeneration'>;
+
 const CURRENT_TURN_INPUT_REINJECTION_LABEL =
   '[当前 Turn 原始用户要求/数据，不是新用户输入；以下各 part 为冻结原文。]';
 const OPENAI_RESPONSES_WEBSOCKET_TIMEOUT_PHASES = new Set([
@@ -213,6 +226,16 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     }
     const llmRequest = toLlmStartRequest(request);
     if (this.debugCapture) setDebugCaptureContext(llmRequest, debugContext);
+    return this.startOrdinaryRequest(llmRequest, ordinaryStreamMetadata(request), debugContext, controls);
+  }
+
+  /** Callback scope owns the projected provider payload, never the raw Context request. */
+  private startOrdinaryRequest(
+    llmRequest: LlmStartRequest,
+    metadata: OrdinaryStreamMetadata,
+    debugContext: ProviderDebugContext,
+    controls: ProviderDispatchControls
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let sequence = 0n;
       let text = '';
@@ -257,7 +280,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           // idles out minutes later.
           if (terminal) return;
           finish(error);
-          this.capability.abort(request.modelRequestId);
+          this.capability.abort(metadata.modelRequestId);
         });
       };
       const finish = (error?: unknown): void => {
@@ -269,7 +292,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             : error;
         if (terminalError !== undefined) {
           const partialOutput = partialOutputSnapshot(outputParts);
-          if (partialOutput && shouldFreezeFailedPartialOutput(request, terminalError)) {
+          if (partialOutput && shouldFreezeFailedPartialOutput(metadata, terminalError)) {
             const partialEvent: Omit<ProviderOutputStreamEvent, 'streamSeq'> = {
               kind: 'output_item_done',
               semanticProgress: false,
@@ -496,7 +519,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             // 这次请求实际使用的 Claude 保留思考处理（含本次新学到的）写进请求终态；没带时沿用窗口里已有的选择。
             const claudeThinkingBinding = payload?.claudeThinkingBinding === 'drop_block' || payload?.claudeThinkingBinding === 'strip_thinking'
               ? payload.claudeThinkingBinding
-              : request.claudeThinkingBinding;
+              : metadata.claudeThinkingBinding;
             enqueue({
               kind: 'completed',
               content: normalizePlainJson(completedContent, 'LLM completed MessageContent'),
@@ -523,8 +546,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             // Reliable ModelRequest/Attempt owns the only retry loop. If a misconfigured capability
             // still announces an internal retry, stop it and surface the transient failure now.
             finish(capabilityRetryError(payload));
-            this.capability.cancelRetry(request.modelRequestId);
-            if (event.type === LlmEventType.RetryStarted) this.capability.abort(request.modelRequestId);
+            this.capability.cancelRetry(metadata.modelRequestId);
+            if (event.type === LlmEventType.RetryStarted) this.capability.abort(metadata.modelRequestId);
             return;
           case LlmEventType.Error:
             finish(capabilityProviderError(payload));
@@ -539,7 +562,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
 
       const onAbort = (): void => {
         finish(abortError(controls.signal));
-        this.capability.abort(request.modelRequestId);
+        this.capability.abort(metadata.modelRequestId);
       };
       const detachAbort = (): void => controls.signal?.removeEventListener('abort', onAbort);
       if (controls.signal?.aborted) {
@@ -557,6 +580,18 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
 
   private sendCompressionRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void> {
     const compactRequest = toLlmCompactRequest(request);
+    return this.startCompressionRequest(compactRequest, request.modelRequestId, {
+      attachmentObservationProfileSha256: compactRequest.attachmentObservationProfileSha256,
+      attachmentObservationRequirements: compactRequest.attachmentObservationRequirements
+    }, controls);
+  }
+
+  private startCompressionRequest(
+    compactRequest: LlmCompactRequest,
+    modelRequestId: string,
+    observationContract: CompactAttachmentObservationContract,
+    controls: ProviderDispatchControls
+  ): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       let terminal = false;
       let sequence = 0n;
@@ -580,7 +615,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             void tail.catch((error: unknown) => {
               if (terminal) return;
               finish(error);
-              this.capability.abort(request.modelRequestId);
+              this.capability.abort(modelRequestId);
             });
             return;
           }
@@ -604,7 +639,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               : normalizeProviderPlainJson(result.usageMetadata, 'LLM compact result.usageMetadata');
             const attachmentObservationResult = normalizeCompactAttachmentObservationResult(
               result,
-              compactRequest,
+              observationContract,
               contents as unknown as MessageContent[]
             );
             sequence += 1n;
@@ -626,8 +661,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           }
           if (event.type === LlmEventType.RetryScheduled || event.type === LlmEventType.RetryStarted) {
             finish(capabilityRetryError(payload));
-            this.capability.cancelRetry(request.modelRequestId);
-            if (event.type === LlmEventType.RetryStarted) this.capability.abort(request.modelRequestId);
+            this.capability.cancelRetry(modelRequestId);
+            if (event.type === LlmEventType.RetryStarted) this.capability.abort(modelRequestId);
             return;
           }
           if (event.type === LlmEventType.CompactError) {
@@ -639,7 +674,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       };
       const onAbort = (): void => {
         finish(abortError(controls.signal));
-        this.capability.abort(request.modelRequestId);
+        this.capability.abort(modelRequestId);
       };
       const detachAbort = (): void => controls.signal?.removeEventListener('abort', onAbort);
       if (controls.signal?.aborted) {
@@ -1272,7 +1307,7 @@ function frozenAttachmentObservationContract(
 
 function normalizeCompactAttachmentObservationResult(
   result: Record<string, unknown>,
-  request: LlmCompactRequest,
+  request: CompactAttachmentObservationContract,
   contents: MessageContent[]
 ): CompactAttachmentObservationContract & { attachmentObservations?: ReturnType<typeof normalizeLlmAttachmentObservation>[] } {
   const expectedProfile = request.attachmentObservationProfileSha256;
@@ -2155,16 +2190,32 @@ function providerToolAllowed(
   return toolAllowedByPolicy(policy, { name: tool.schema.name, ...(tool.source ? { source: tool.source } : {}) });
 }
 
-function shouldFreezeFailedPartialOutput(request: FullProviderRequest, error: unknown): boolean {
+function ordinaryStreamMetadata(request: FullProviderRequest): OrdinaryStreamMetadata {
+  let retryPolicy: OrdinaryStreamMetadata['retryPolicy'];
+  try { retryPolicy = { kind: 'ready', value: retryPolicyForFullRequest(request) }; }
+  catch (error) { retryPolicy = { kind: 'invalid', error }; }
+  const recovery = asRecord(asRecord(request.recipe)?.nativeErrorRecovery);
+  return {
+    modelRequestId: request.modelRequestId,
+    attemptSeq: request.attemptSeq,
+    claudeThinkingBinding: request.claudeThinkingBinding,
+    priorFailures: typeof recovery?.failures === 'number' ? recovery.failures : 0,
+    modelOutputRepair: request.modelOutputRepair === true,
+    retryPolicy
+  };
+}
+
+function shouldFreezeFailedPartialOutput(request: OrdinaryStreamMetadata, error: unknown): boolean {
   // Abort revokes ordinary callbacks, but the dispatch still owns a bounded display-only closure.
   // Its snapshot never authorizes a completed response, tool invocation or Context occurrence.
   if (!(error instanceof ProviderTransientError) || !error.retryAfterOutput) return true;
   if (!/^[1-9]\d*$/.test(request.attemptSeq)) {
     throw new TypeError('Provider request attemptSeq must be a positive decimal integer.');
   }
-  const retryPolicy = retryPolicyForFullRequest(request);
-  const recovery = asRecord(asRecord(request.recipe)?.nativeErrorRecovery);
-  const priorFailures = typeof recovery?.failures === 'number' ? recovery.failures : 0;
+  // Preserve the original lazy failure: an invalid retry policy matters only on this branch.
+  if (request.retryPolicy.kind === 'invalid') throw request.retryPolicy.error;
+  const retryPolicy = request.retryPolicy.value;
+  const priorFailures = request.priorFailures;
   const repairLimit = request.modelOutputRepair ? 2 : error.retryOptions.maxRetries;
   const maxRetries = repairLimit === undefined ? retryPolicy.maxRetries
     : Math.min(retryPolicy.maxRetries, Math.max(0, repairLimit - priorFailures));
