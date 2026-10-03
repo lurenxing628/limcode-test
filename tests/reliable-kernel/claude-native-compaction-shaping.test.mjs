@@ -396,11 +396,12 @@ test('Claude 原生压缩：实际发出的请求体与 dry-run 相同，返回�
   });
 });
 
-// ───────────────────── other providers and methods keep their bytes ─────────────────────
+// ───────────────────── native instructions and unrelated request bytes ─────────────────────
 
 /**
  * sha256(JSON.stringify({url, headers, body})) of these dry-runs as produced before this change
- * (codex/agent-collaboration ecdc1b2b): the fix is Claude-only. The summary pin was re-taken when the
+ * (codex/agent-collaboration ecdc1b2b). OpenAI native compaction now carries its frozen instructions;
+ * removing only that field must still reproduce the original pin. The summary pin was re-taken when the
  * length instruction became “约 800 tokens，最多不超过 1000 tokens…”; with the old instruction text
  * swapped back in, the new body hashes to the ecdc1b2b value 61bbdd12…. It was re-taken again when the
  * summary instructions gained the loaded-skills rule (keep skill names and the step reached); without
@@ -431,12 +432,15 @@ function handcraftedCompactRequest(provider, model, methodKind) {
 const fingerprint = (call) => sha256({ url: call.url, headers: call.headers, body: JSON.parse(call.bodyText) });
 const dryRunCompact = (request, settings) => dryRunCompactLlmProvider(request, { settings: async () => settings, compressionSettings: async () => undefined });
 
-test('OpenAI Responses /responses/compact 与摘要类压缩的请求字节不变；Gemini 仍然没有原生压缩适配器', async () => {
+test('OpenAI Responses /responses/compact 携带系统指令，其余请求字节不变；Gemini 仍然没有原生压缩适配器', async () => {
   const openai = await dryRunCompact(handcraftedCompactRequest('openai-responses', 'gpt-5.5', 'provider_native'),
     settingsFor({ provider: 'openai-responses', model: 'gpt-5.5', baseUrl: 'https://api.openai.com/v1' }));
   assert.equal(openai.calls.length, 1);
   assert.match(openai.calls[0].url, /\/responses\/compact$/);
-  assert.equal(fingerprint(openai.calls[0]), UNCHANGED_BASELINE.openaiResponsesNative);
+  const { instructions, ...openaiBodyWithoutInstructions } = JSON.parse(openai.calls[0].bodyText);
+  assert.equal(instructions, SYSTEM);
+  assert.equal(sha256({ url: openai.calls[0].url, headers: openai.calls[0].headers,
+    body: openaiBodyWithoutInstructions }), UNCHANGED_BASELINE.openaiResponsesNative);
 
   const summary = await dryRunCompact(handcraftedCompactRequest('claude', MODEL_ID, 'llm_summary'), settingsFor());
   assert.equal(summary.calls.length, 1);

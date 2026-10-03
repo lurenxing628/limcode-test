@@ -1943,7 +1943,7 @@ async function dryRunProviderNativeCompact(
   }
   const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
   const result = await provider.compactDryRun(
-    { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) },
+    openAIResponsesCompactRequest(request, normalizedContext, runtimeSettings),
     {
       inputFormat: 'unified',
       outputFormat: 'unified',
@@ -2380,7 +2380,7 @@ async function compactWithProviderNative(
       signalAborted: signal?.aborted === true
     });
     const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
-    const compactContents = { contents: normalizedContext.flatMap((content) => toUnifiedContents(content, 'openai-responses')) };
+    const compactContents = openAIResponsesCompactRequest(request, normalizedContext, settings);
     if (usesOpenAIResponsesWebSocketNativeCompact(settings)) {
       if (typeof provider.compactDryRun !== 'function') {
         throw new Error('当前 unified-llm-provider 不支持 provider.compactDryRun。');
@@ -2743,6 +2743,37 @@ function anthropicCompactionBody(value: unknown, methodConfig: LlmCompressionCon
   ].join(' ').slice(0, 16_384);
   body.compaction = { type: 'summarize', instructions };
   return body;
+}
+
+/** Shared by native OpenAI dispatch, dry-run and frozen input-budget estimation. */
+export function openAIResponsesCompactSystemInstruction(
+  request: Pick<LlmCompactRequest, 'systemInstruction' | 'settingsSnapshot'>,
+  configuredPrefix?: string
+): MessageContent | undefined {
+  // A frozen empty prefix is authoritative too: later channel edits must not change this request.
+  const frozenPrefix = request.settingsSnapshot?.systemPromptPrefix;
+  return prependSystemInstructionPrefix(
+    request.systemInstruction,
+    typeof frozenPrefix === 'string' ? frozenPrefix : configuredPrefix
+  );
+}
+
+/** Actual HTTP, WS trigger preparation and dry-run share the same native instructions and input. */
+function openAIResponsesCompactRequest(
+  request: LlmCompactRequest,
+  contents: MessageContent[],
+  settings: LlmProviderConfigRecord
+): ReturnType<typeof toUnifiedRequest> {
+  const systemInstruction = openAIResponsesCompactSystemInstruction(request, settings.systemPromptPrefix);
+  // Convert only the instructions through the ordinary part encoder. The caller already laid out
+  // the frozen native history; do not run its contents through another reminder-layout pass.
+  const unifiedSystemInstruction = systemInstruction
+    ? toUnifiedRequest({ id: request.id, contents: [], tools: [], systemInstruction }, undefined, 'openai-responses').systemInstruction
+    : undefined;
+  return {
+    contents: contents.flatMap((content) => toUnifiedContents(content, 'openai-responses')),
+    ...(unifiedSystemInstruction ? { systemInstruction: unifiedSystemInstruction } : {})
+  };
 }
 
 /**
@@ -4383,7 +4414,7 @@ function buildSegmentDeltaCall(
     Math.min(SEGMENTED_PRIOR_CONTEXT_TOKENS, targetTokens)
   );
   const transcript = renderContentsForSummary(segment);
-  const userText = `${DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT}\n\n【前情(只读，不要重新总结)】\n${boundedPrior || '无'}\n\n【本回合记录】\n${transcript}`;
+  const userText = `${DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT}\n\n【前情(只读，不要重新总结)】\n${boundedPrior || '无'}\n\n【本段历史记录】\n${transcript}`;
   return {
     label: `Segment ${index + 1}`,
     sourceContents,

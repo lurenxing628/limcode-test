@@ -637,25 +637,27 @@ export const DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS = 16_000;
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT = 'You have written a partial transcript for the initial task above. Please write a summary of the transcript. The purpose of this summary is to provide continuity so you can continue to make progress towards solving the task in a future context, where the raw history above may not be accessible and will be replaced with this summary. Write down anything that would be helpful, including the state, next steps, learnings etc. If skills were loaded with the skills tool, name each loaded skill exactly and the step of it the work had reached; their instructions are re-attached after the summary, so do not copy them. You must wrap your summary in a <summary></summary> block.';
 export const DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT = 'Transcript:';
 export const DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT = [
-  '你正在对一段很长的对话做“分段”压缩。下面【本回合记录】是对话中的一个回合的完整记录',
-  '(一个回合 = 从一条用户消息开始，到下一条用户消息之前为止，中间包含模型的思考、工具调用、工具结果和文字回复)。',
-  '请把这个回合压缩成简洁但信息完整、可在未来上下文中替代原文使用的摘要。',
+  '你正在对一段很长的对话做“分段”压缩。接下来提供的是按原始顺序排列的历史片段。',
+  '片段可能跨越多个回合，也可能只包含某个回合、消息或工具记录的一部分；不要把片段边界当作任务或工具执行的结束。',
+  '请仅根据片段中实际提供的信息，生成简洁但信息完整、可供后续合并的摘要。',
   '',
   '必须包含：',
-  '- 本回合中用户的意图/请求',
-  '- 模型采取的主要动作(调用了哪些工具、关键参数、返回的主要结果)',
-  '- 得出的结论/决定/查明的事实',
-  '- 回合结束时的状态与遗留任务/下一步',
+  '- 片段中明确出现的用户意图/请求',
+  '- 片段中实际记录的主要动作(调用了哪些工具、关键参数、已出现的返回结果)',
+  '- 有记录支持的结论/决定/查明的事实',
+  '- 片段末尾可确认的工作状态与遗留任务/下一步',
   '',
   '规则：',
-  '- 只总结本回合。“前情”仅用于保持连贯的只读参考，不要重新总结它。',
+  '- 只总结所给片段。“前情”仅用于保持连贯的只读参考，不要重新总结它。',
+  '- 原文有角色、消息 ID、工具调用/结果 ID 或片段边界标记时，保留其对应关系；不要编造不存在的标识或关联。',
+  '- 遇到记录不完整、工具结果缺失或完成状态尚未确认时，应明确标注；不得补写缺失内容、推断执行成功或擅自把任务记为完成。',
   '- 文件路径、函数名、标识符、数字等关键细节要按原文保留，不要编造。',
   '- 用户明确要求核对、记住或稍后复用的事实，以及工具结果中的对应键值，必须逐项写入摘要。',
   '- 不得用“读取了N个文件”“工具执行成功”等数量或状态概述替代这些具体事实。',
   '- 输出连贯的纯文本段落，不要使用 Markdown 标题(#)，以免与拼接时的分段标题冲突。',
   '- 必须把最终摘要用 <summary></summary> 标签包裹，标签外不要写其它内容。'
 ].join('\n');
-export const DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT = '请总结下面这个回合。';
+export const DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT = '请总结下面的有序历史片段。';
 
 export interface LlmCompressionSettingsRecord {
   defaultConfigId?: string;

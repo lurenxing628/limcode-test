@@ -1010,7 +1010,7 @@ test('an oversized message is split losslessly, including escapes, emoji and con
   });
   assert.equal(result.kind, 'provider_requests');
   assert.ok(result.calls.length >= 3, `expected several chunks, got ${result.calls.length}`);
-  const marker = '【本回合记录】\n1. user: ';
+  const marker = '【本段历史记录】\n1. user: ';
   const chunks = result.calls.map((call) => {
     const user = JSON.parse(call.bodyText).messages.find((message) => message.role === 'user').content;
     const start = user.indexOf(marker);

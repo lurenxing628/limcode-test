@@ -1154,6 +1154,29 @@ export function projectOrdinaryModelWindow(
   };
 }
 
+/** Preserve provider-canonical items while seeding managed-media tracking for later ordinary input. */
+export function preserveCanonicalModelContents(
+  contents: readonly MessageContent[],
+  state: ManagedMediaBodyProjectionState
+): MessageContent[] {
+  // Native compact output is already the canonical next window, including raw provider items and
+  // retained messages. Observe managed media for the ordinary tail without changing this window or
+  // claiming its repeated bodies were suppressed.
+  for (const content of contents) {
+    for (const part of content.parts) {
+      if ('inlineData' in part) rememberManagedMediaBody(part, state);
+      if ('functionResponse' in part) {
+        for (const media of part.functionResponse.parts ?? []) {
+          if (isModelToolResponseMultimodalMimeType(media.inlineData.mimeType)) {
+            rememberManagedMediaBody(media, state);
+          }
+        }
+      }
+    }
+  }
+  return contents.map(cloneMessageContent);
+}
+
 /**
  * Keeps the first model-visible body for each managed Attachment and replaces later bodies with an
  * explicit short-reference observation. Function-response pairing remains intact: nested repeats are
@@ -1208,23 +1231,8 @@ function repeatedManagedMediaOmission(
   modelHandleCatalog: ModelHandleCatalog,
   state: ManagedMediaBodyProjectionState
 ): Record<string, unknown> | undefined {
-  const attachmentId = optionalText(part.inlineData.attachmentId);
-  if (!attachmentId) return undefined;
-  const metadata = stableJson({
-    mimeType: part.inlineData.mimeType,
-    name: optionalText(part.inlineData.name) ?? null,
-    sizeBytes: optionalNonNegativeInteger(part.inlineData.sizeBytes) ?? null,
-    sha256: optionalText(part.inlineData.sha256) ?? null
-  });
-  const existing = state.seenAttachmentMetadata.get(attachmentId);
-  if (!existing) {
-    state.seenAttachmentMetadata.set(attachmentId, metadata);
-    state.uniqueBodyCount += 1;
-    return undefined;
-  }
-  if (existing !== metadata) {
-    throw new Error(`Managed Attachment ${attachmentId} metadata changed across one model window.`);
-  }
+  if (!rememberManagedMediaBody(part, state)) return undefined;
+  const attachmentId = optionalText(part.inlineData.attachmentId)!;
   state.suppressedBodyCount += 1;
   const attachmentRef = modelHandleRef(modelHandleCatalog, 'attachment', attachmentId);
   return {
@@ -1239,6 +1247,28 @@ function repeatedManagedMediaOmission(
       ? `正文已在更早上下文提供；后续需要时使用 ${attachmentRef}。`
       : '正文已在更早上下文提供。'
   };
+}
+
+/** Returns true only for an already observed managed body with identical metadata. */
+function rememberManagedMediaBody(part: InlineDataPart, state: ManagedMediaBodyProjectionState): boolean {
+  const attachmentId = optionalText(part.inlineData.attachmentId);
+  if (!attachmentId) return false;
+  const metadata = stableJson({
+    mimeType: part.inlineData.mimeType,
+    name: optionalText(part.inlineData.name) ?? null,
+    sizeBytes: optionalNonNegativeInteger(part.inlineData.sizeBytes) ?? null,
+    sha256: optionalText(part.inlineData.sha256) ?? null
+  });
+  const existing = state.seenAttachmentMetadata.get(attachmentId);
+  if (!existing) {
+    state.seenAttachmentMetadata.set(attachmentId, metadata);
+    state.uniqueBodyCount += 1;
+    return false;
+  }
+  if (existing !== metadata) {
+    throw new Error(`Managed Attachment ${attachmentId} metadata changed across one model window.`);
+  }
+  return true;
 }
 
 function withRepeatedManagedMediaOmissions(

@@ -1,5 +1,5 @@
 import type { LlmCapability } from '../capabilities/types';
-import { resolveOpenAIResponsesNativeToolOutputs } from '../capabilities/llmProvider';
+import { openAIResponsesCompactSystemInstruction, resolveOpenAIResponsesNativeToolOutputs } from '../capabilities/llmProvider';
 import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNative';
 import type { LlmCompactRequest, LlmStartRequest, ToolSchema } from '../world/modules/llm/contracts';
 import { LlmEventType } from '../world/modules/llm/events';
@@ -54,10 +54,10 @@ import {
   estimateProjectedModelInput,
   isToolResultContents,
   projectOrdinaryModelWindow,
+  preserveCanonicalModelContents,
   projectSummaryModelWindow,
   withSummaryDispatchRefs,
   stripNativeConfigurationUpdates,
-  suppressRepeatedManagedMediaBodies,
   type ManagedMediaBodyProjectionState,
   type ProjectedRequestTokenBreakdown
 } from './modelFacingContextProjection';
@@ -1369,6 +1369,10 @@ function requireExecutableCompressionMethod(value: unknown): NonNullable<LlmComp
  */
 export function estimateCompactProjection(request: LlmCompactRequest): ProjectedRequestTokenBreakdown {
   const prior = request.priorSummaryContents ?? [];
+  const systemInstruction = request.methodKind === 'provider_native'
+    && request.settingsSnapshot?.provider === 'openai-responses'
+    ? openAIResponsesCompactSystemInstruction(request)
+    : request.systemInstruction;
   if (request.methodKind === 'segmented_summary') {
     return estimateProjectedModelInput({
       ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
@@ -1389,7 +1393,7 @@ export function estimateCompactProjection(request: LlmCompactRequest): Projected
     return visible ? [visible] : [];
   });
   return estimateProjectedModelInput({
-    ...(request.systemInstruction ? { systemInstruction: request.systemInstruction } : {}),
+    ...(systemInstruction ? { systemInstruction } : {}),
     ...(request.tools?.length ? { tools: request.tools } : {}),
     contextContents: [...prior, ...contents],
     providerFramingTokens: request.methodKind === 'provider_native' ? 64 : 512
@@ -1659,11 +1663,10 @@ function projectOrdinaryContentsPreservingRanges(
       throw new RangeError('Canonical compression ranges are invalid or overlapping.');
     }
     projected.push(...projectOrdinarySlice(cursor, range.start));
-    // Provider-native Compact output is the canonical next window. Only repeat-media suppression is
-    // applied here; tool results and provider-native items are not projected a second time.
-    projected.push(...suppressRepeatedManagedMediaBodies(
+    // Preserve the entire native window, including retained messages' top-level raw provider items.
+    // Its managed bodies only seed suppression of later ordinary content; canonical items stay exact.
+    projected.push(...preserveCanonicalModelContents(
       contents.slice(range.start, range.end),
-      modelHandleCatalog,
       mediaState
     ));
     cursor = range.end;
