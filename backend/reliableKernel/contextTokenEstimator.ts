@@ -6,7 +6,8 @@ import { ContentAddressedStore } from './contentAddressedStore';
 import {
   ContextSequenceControlPlane,
   type MaterializedContext,
-  type MaterializedContextSegment
+  type MaterializedContextSegment,
+  type StructuralContextRecord
 } from './contextSequence';
 import type { PlainJsonValue } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
@@ -219,12 +220,15 @@ export class ReliableContextTokenEstimator {
         // their usage describes the compaction call, not the ordinary model prompt shown to users.
         if (links.length === 0) continue;
         if (links.length !== 1 || projections.length !== 1) return null;
-        const projected = await this.context.materialize(requireId(projections[0].root_id, 'ModelContextProjection.root_id'));
+        // Historical calibration only needs ordered segment identity and count. Read fresh worker-
+        // validated structure/provenance without loading CAS payloads that are not used here; all
+        // semantic estimates below use the already materialized current root.
+        const projected = await this.context.materializeStructure(requireId(projections[0].root_id, 'ModelContextProjection.root_id'));
         // Conversation Context is linear between explicit compression/edit operations. Once the latest
         // ordinary request is not a prefix, no older ordinary request can be a safer calibration.
-        if (!isSegmentPrefix(projected.segments, current)) return null;
+        if (!isSegmentPrefix(projected.records, current)) return null;
 
-        let coveredSegmentCount = projected.segments.length;
+        let coveredSegmentCount = projected.records.length;
         let anchoredTokens = input;
         const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
         if (outputSegmentId && current[coveredSegmentCount]?.segmentId === outputSegmentId) {
@@ -500,11 +504,11 @@ function providerToolAllowed(
 }
 
 function isSegmentPrefix(
-  prefix: readonly MaterializedContextSegment[],
+  prefix: readonly StructuralContextRecord[],
   complete: readonly MaterializedContextSegment[]
 ): boolean {
-  return prefix.length <= complete.length && prefix.every((segment, index) =>
-    segment.segmentId === complete[index]?.segmentId
+  return prefix.length <= complete.length && prefix.every((record, index) =>
+    requireId(record.segment.id, 'ContextSegment.id') === complete[index]?.segmentId
   );
 }
 
