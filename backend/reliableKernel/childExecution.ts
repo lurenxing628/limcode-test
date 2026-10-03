@@ -1,3 +1,5 @@
+import type { ExecutionLeaseFence } from './executionLeaseFence';
+import { committedInitialExecutionFence, requireInitialLeaseDuration } from './initialExecutionLease';
 import type { AttachmentIngestService, PreparedMessageAttachmentAdmission } from './attachmentIngest';
 import {
   ContentAddressedStore,
@@ -158,9 +160,13 @@ export interface ChildExecutionSpawnCommand {
   title?: string;
   leaseOwnerId: string;
   leaseExpiresAt: string;
+  /** Explicit new-lease lifetime measured by the writer after preparation/queueing. */
+  leaseDurationMs?: number;
 }
 
 export interface ChildExecutionSpawnResult {
+  /** Present only for the new row in this commit, never synthesized by deduplicated replay. */
+  initialExecutionFence?: ExecutionLeaseFence;
   childExecutionId: string;
   childConversationId: string;
   childTurnId: string;
@@ -229,9 +235,12 @@ export interface ChildContinuationAdmissionCommand {
   turnIntentId: string;
   leaseOwnerId: string;
   leaseExpiresAt: string;
+  /** Explicit new-lease lifetime measured by the writer after preparation/queueing. */
+  leaseDurationMs?: number;
 }
 
 export interface ChildContinuationAdmissionResult {
+  initialExecutionFence?: ExecutionLeaseFence;
   childExecutionId: string;
   turnIntentId: string;
   turnId: string;
@@ -392,6 +401,7 @@ const TERMINAL_OPERATION_STATES = new Set([
 /** Stable ChildExecution lineage and run_agent control plane for Phase F. */
 export class ChildExecutionControlPlane {
   private readonly now: () => string;
+  private readonly systemClock: boolean;
   private readonly authorityCompiler: TurnAuthorityCompiler;
   private readonly contextSequence: ContextSequenceControlPlane;
   private readonly attachments: AttachmentIngestService | undefined;
@@ -408,6 +418,7 @@ export class ChildExecutionControlPlane {
       throw new TypeError('ChildExecutionControlPlane requires a server-side TurnAuthorityCompiler.');
     }
     this.now = options.now ?? (() => new Date().toISOString());
+    this.systemClock = options.now === undefined;
     this.authorityCompiler = options.authorityCompiler;
     this.contextSequence = new ContextSequenceControlPlane(database, contentStore, { now: this.now });
     this.attachments = options.attachments;
@@ -628,16 +639,7 @@ export class ChildExecutionControlPlane {
         updated_at: now,
         terminal_at: null
       }),
-      DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
-        id: ids.childLeaseId,
-        conversation_id: ids.childConversationId,
-        turn_id: ids.childTurnId,
-        owner_id: command.leaseOwnerId,
-        host_boot_id: this.database.hostBootId,
-        generation: 1n,
-        acquired_at: now,
-        expires_at: command.leaseExpiresAt
-      }),
+
       DOMAIN_REPOSITORIES.domain('TurnExecutorLink').insert({
         id: ids.childExecutorLinkId,
         turn_id: ids.childTurnId,
@@ -750,12 +752,23 @@ export class ChildExecutionControlPlane {
           wait_deadline_at: command.waitDeadlineAt ?? null,
           updated_at: now
         })
-      ] : [])
+      ] : []),
+      this.initialLeaseInsert({
+        id: ids.childLeaseId,
+        conversation_id: ids.childConversationId,
+        turn_id: ids.childTurnId,
+        owner_id: command.leaseOwnerId,
+        host_boot_id: this.database.hostBootId,
+        generation: 1n,
+        acquired_at: now,
+        expires_at: command.leaseExpiresAt
+      }, command.leaseDurationMs)
     ];
 
     try {
       const commit = await this.database.transaction(steps);
-      return spawnResult(ids, command.completionPolicy, modelSelection, false, commit.commitSeq);
+      return { ...spawnResult(ids, command.completionPolicy, modelSelection, false, commit.commitSeq),
+        initialExecutionFence: committedInitialExecutionFence(commit, ids.childLeaseId) };
     } catch (error) {
       if (!isExpectedSpawnIdentityConflict(error)) throw error;
       const raced = await this.findSpawnReplay(command, ids, requestContent);
@@ -1876,16 +1889,7 @@ export class ChildExecutionControlPlane {
         updated_at: now,
         terminal_at: null
       }),
-      DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
-        id: ids.leaseId,
-        conversation_id: child.child_conversation_id,
-        turn_id: ids.turnId,
-        owner_id: command.leaseOwnerId,
-        host_boot_id: this.database.hostBootId,
-        generation: 1n,
-        acquired_at: now,
-        expires_at: command.leaseExpiresAt
-      }),
+
       ...preparedContentObjectSteps([authorityContent], 'child_continuation_authority'),
       DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').insert({
         id: ids.authoritySnapshotId,
@@ -1980,7 +1984,17 @@ export class ChildExecutionControlPlane {
       }),
       DOMAIN_REPOSITORIES.domain('Conversation').update(child.child_conversation_id as string, {
         updated_at: now
-      })
+      }),
+      this.initialLeaseInsert({
+        id: ids.leaseId,
+        conversation_id: child.child_conversation_id,
+        turn_id: ids.turnId,
+        owner_id: command.leaseOwnerId,
+        host_boot_id: this.database.hostBootId,
+        generation: 1n,
+        acquired_at: now,
+        expires_at: command.leaseExpiresAt
+      }, command.leaseDurationMs)
     ];
     try {
       const commit = await this.database.transaction(steps);
@@ -1990,6 +2004,7 @@ export class ChildExecutionControlPlane {
         turnIntentId: command.turnIntentId,
         turnId: ids.turnId,
         turnSeq,
+        initialExecutionFence: committedInitialExecutionFence(commit, ids.leaseId),
         answerBridgeId: bridge.id as string,
         deduplicated: false,
         commitSeq: commit.commitSeq
@@ -4025,6 +4040,16 @@ export class ChildExecutionControlPlane {
     return requireRow(await this.maybeGet(domain, id), `${domain} ${id}`);
   }
 
+  private initialLeaseInsert(row: DomainRow, durationMs: number | undefined): RepositoryTransactionStep {
+    const repository = DOMAIN_REPOSITORIES.domain('ExecutionLease');
+    if (durationMs === undefined) return repository.insert(row);
+    const now = this.timestamp();
+    const sampledAtNs = process.hrtime.bigint();
+    return repository.insertWithExecutionLeaseDuration(row, {
+      durationMs, clock: { now, sampledAtNs, systemClock: this.systemClock }
+    });
+  }
+
   private timestamp(): string {
     return requireIsoTimestamp(this.now(), 'ChildExecution clock');
   }
@@ -4074,7 +4099,8 @@ function normalizeSpawnCommand(command: ChildExecutionSpawnCommand) {
       ? command.title.trim()
       : '子 Agent 对话',
     leaseOwnerId: requirePhaseFId(command.leaseOwnerId, 'leaseOwnerId'),
-    leaseExpiresAt: requireIsoTimestamp(command.leaseExpiresAt, 'leaseExpiresAt')
+    leaseExpiresAt: requireIsoTimestamp(command.leaseExpiresAt, 'leaseExpiresAt'),
+    ...(command.leaseDurationMs === undefined ? {} : { leaseDurationMs: requireInitialLeaseDuration(command.leaseDurationMs) })
   };
 }
 
@@ -4122,7 +4148,8 @@ function normalizeAdmissionCommand(command: ChildContinuationAdmissionCommand) {
     childExecutionId: requirePhaseFId(command.childExecutionId, 'childExecutionId'),
     turnIntentId: requirePhaseFId(command.turnIntentId, 'turnIntentId'),
     leaseOwnerId: requirePhaseFId(command.leaseOwnerId, 'leaseOwnerId'),
-    leaseExpiresAt: requireIsoTimestamp(command.leaseExpiresAt, 'leaseExpiresAt')
+    leaseExpiresAt: requireIsoTimestamp(command.leaseExpiresAt, 'leaseExpiresAt'),
+    ...(command.leaseDurationMs === undefined ? {} : { leaseDurationMs: requireInitialLeaseDuration(command.leaseDurationMs) })
   };
 }
 

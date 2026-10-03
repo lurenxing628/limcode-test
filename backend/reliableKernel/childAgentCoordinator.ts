@@ -192,6 +192,13 @@ const CHILD_RECOVERY_CHANGE_SCAN_MS = 2_000;
 const CHILD_RECOVERY_SAFETY_SCAN_MS = 5_000;
 /** The owner of a question's or plan review's wait Operation (ToolInteractionControlPlane). */
 const INTERACTION_WAIT_OWNER_KIND = 'tool_execution';
+interface ChildLeaseRenewal {
+  readonly fence: ExecutionLeaseFence;
+  readonly ready: Promise<void>;
+  assertActive(): void;
+  stop(): Promise<void>;
+}
+
 type ChildDispatchResult = ToolTerminalResult | ReliableAgentToolSettled | ReliableAgentToolPause;
 
 /**
@@ -199,6 +206,8 @@ type ChildDispatchResult = ToolTerminalResult | ReliableAgentToolSettled | Relia
  * dedicated control planes; this coordinator only orders local dispatch, waiting and re-entry.
  */
 export class ReliableChildAgentCoordinator {
+  private readonly startupOperations = new Set<Promise<unknown>>();
+  private readonly childLeaseRenewals = new Set<ChildLeaseRenewal>();
   private readonly activeTurns = new Map<string, Promise<ReliableChildDriveResult>>();
   private readonly now: () => string;
   private readonly childLeaseOwnerId: string;
@@ -317,7 +326,11 @@ export class ReliableChildAgentCoordinator {
    * Ensures the child lineage for an already-committed approved Plan. The durable Plan response is
    * the intent; this method is idempotent and never owns settlement of the source submit_plan call.
    */
-  public async ensureApprovedPlan(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
+  public ensureApprovedPlan(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
+    return this.runChildStartup(() => this.ensureApprovedPlanStartup(input));
+  }
+
+  private async ensureApprovedPlanStartup(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
     if (!await this.mayEnsureApprovedPlan(input)) {
       throw new Error('Plan delegation starts its child only in a Host that serves the parent Conversation.');
     }
@@ -336,42 +349,50 @@ export class ReliableChildAgentCoordinator {
       // settings instead of the planning Turn's (see ChildSpawnAuthorityBound).
       authorityBound: 'executor_agent',
       leaseOwnerId: this.childLeaseOwnerId,
-      leaseExpiresAt: this.leaseExpiresAt()
+      leaseExpiresAt: this.leaseExpiresAt(),
+      leaseDurationMs: this.leaseDurationMs()
     });
-    const inheritedThinkingOverride = await this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId);
-    await this.dependencies.modelProfiles.initializeConversation({
-      conversationId: spawned.childConversationId,
-      model: spawned.modelSelection,
-      ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
-    });
-    if (spawned.answerBridgeId !== preview.answerBridgeId) {
-      throw new Error('Plan delegation returned an unexpected AnswerBridge identity.');
-    }
-    const claimed = await this.dependencies.children.claimSpawnDispatch(spawned.effectIntentId);
-    if (claimed) {
-      const receipt = await this.dependencies.children.recordSpawnReceipt({
-        sourceKey: `plan-child-spawn:${spawned.attemptId}`,
-        attemptId: spawned.attemptId,
-        outcome: 'succeeded',
-        detail: { adapter: 'reliable-local-agent-loop', source: 'approved-plan' }
+    const startupLease = await this.prepareChildLease(spawned.initialExecutionFence);
+    let leaseTransferred = false;
+    try {
+      const inheritedThinkingOverride = await this.dependencies.children.frozenChildThinkingOverrideForTurn(parentTurnId);
+      await this.dependencies.modelProfiles.initializeConversation({
+        conversationId: spawned.childConversationId,
+        model: spawned.modelSelection,
+        ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
       });
-      await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
-      this.launch(spawned.childExecutionId, spawned.childTurnId);
-    } else {
-      const recovered = await this.dependencies.children.recoverSpawnIntent(spawned.effectIntentId);
-      if (recovered.shouldDrive) this.launch(recovered.childExecutionId, recovered.childTurnId);
-      if (recovered.childStatus === 'starting') {
-        throw new Error('Plan child spawn recovery did not finish its durable dispatch.');
+      if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+      if (spawned.answerBridgeId !== preview.answerBridgeId) {
+        throw new Error('Plan delegation returned an unexpected AnswerBridge identity.');
       }
+      const claimed = await this.dependencies.children.claimSpawnDispatch(spawned.effectIntentId);
+      if (claimed) {
+        const receipt = await this.dependencies.children.recordSpawnReceipt({
+          sourceKey: `plan-child-spawn:${spawned.attemptId}`,
+          attemptId: spawned.attemptId,
+          outcome: 'succeeded',
+          detail: { adapter: 'reliable-local-agent-loop', source: 'approved-plan' }
+        });
+        await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
+        leaseTransferred = startupLease !== null && this.launch(spawned.childExecutionId, spawned.childTurnId, startupLease);
+      } else {
+        const recovered = await this.dependencies.children.recoverSpawnIntent(spawned.effectIntentId);
+        if (recovered.shouldDrive) leaseTransferred = startupLease !== null && this.launch(recovered.childExecutionId, recovered.childTurnId, startupLease);
+        if (recovered.childStatus === 'starting') {
+          throw new Error('Plan child spawn recovery did not finish its durable dispatch.');
+        }
+      }
+      return {
+        childExecutionId: spawned.childExecutionId,
+        childConversationId: spawned.childConversationId,
+        childTurnId: spawned.childTurnId,
+        answerBridgeId: spawned.answerBridgeId,
+        agentId: selection.agentId,
+        agentType: selection.agentType
+      };    } finally {
+      if (startupLease && !leaseTransferred) await startupLease.stop();
+      if (startupLease === null && !this.activeTurns.has(spawned.childTurnId)) this.triggerRecoveryPass();
     }
-    return {
-      childExecutionId: spawned.childExecutionId,
-      childConversationId: spawned.childConversationId,
-      childTurnId: spawned.childTurnId,
-      answerBridgeId: spawned.answerBridgeId,
-      agentId: selection.agentId,
-      agentType: selection.agentType
-    };
   }
 
   /**
@@ -1112,7 +1133,7 @@ export class ReliableChildAgentCoordinator {
   /** Waits for currently launched child Turns and any tasks they launch before returning. */
   public async waitForIdle(): Promise<void> {
     for (;;) {
-      const active = [...this.activeTurns.values()];
+      const active = [...this.activeTurns.values(), ...this.startupOperations];
       if (active.length === 0) return;
       await Promise.allSettled(active);
     }
@@ -1148,11 +1169,13 @@ export class ReliableChildAgentCoordinator {
     this.recoveryTimer = undefined;
     this.waitingOwned.clear();
     this.pendingDriveWakes.clear();
-    await Promise.allSettled([...this.activeTurns.keys()].map((turnId) =>
+    const turns = new Set([...this.activeTurns.keys(), ...[...this.childLeaseRenewals].map(resource => resource.fence.turnId)]);
+    await Promise.allSettled([...turns].map((turnId) =>
       this.dependencies.quiesceTurnExecution
         ? this.dependencies.quiesceTurnExecution({ turnId, reason })
         : this.dependencies.modelProvider.quiesceTurnDispatches(turnId, reason)
     ));
+    await Promise.allSettled([...this.childLeaseRenewals].map(resource => resource.stop()));
   }
 
   private async runRecoveryPass(signal?: AbortSignal, conversationId?: string): Promise<ReliableChildAgentRecoveryReport> {
@@ -1466,7 +1489,8 @@ export class ReliableChildAgentCoordinator {
             childExecutionId: entry.childExecutionId,
             turnIntentId: entry.turnIntentId,
             leaseOwnerId: this.childLeaseOwnerId,
-            leaseExpiresAt: this.leaseExpiresAt()
+            leaseExpiresAt: this.leaseExpiresAt(),
+            leaseDurationMs: this.leaseDurationMs()
           });
           // Another Turn already took its delivery in: the intent was cancelled, nothing starts.
           if ('superseded' in admitted) return { kind: 'superseded' as const };
@@ -1484,7 +1508,8 @@ export class ReliableChildAgentCoordinator {
       if (!admission.ran) continue;
       if (admission.value.kind === 'admitted') {
         report.continuationsAdmitted.push(admission.value.admitted.turnId);
-        this.launch(admission.value.admitted.childExecutionId, admission.value.admitted.turnId);
+        await this.launchCommittedChild(admission.value.admitted.childExecutionId, admission.value.admitted.turnId,
+          admission.value.admitted.initialExecutionFence);
       } else if (admission.value.kind === 'deferred-turn') {
         if (!report.deferredTurnIds.includes(admission.value.turnId)) {
           report.deferredTurnIds.push(admission.value.turnId);
@@ -1548,15 +1573,19 @@ export class ReliableChildAgentCoordinator {
     child: DomainRow | null
   ): Promise<'resumed' | 'deferred' | 'terminal'> {
     if (!child || child.status === 'starting') return 'deferred';
-    await this.repairChildModelProfile(childExecutionId, turnId, child);
     if (await this.dependencies.turns.ownsExecutionLease({
       turnId,
       leaseOwnerId: this.childLeaseOwnerId,
       hostBootId: this.dependencies.database.hostBootId
     })) {
-      this.launch(childExecutionId, turnId);
-      return 'resumed';
+      const held = await this.dependencies.turns.executionLeaseFence({
+        turnId, leaseOwnerId: this.childLeaseOwnerId, hostBootId: this.dependencies.database.hostBootId
+      });
+      if (held) return await this.launchRecoveredChild(childExecutionId, turnId, child, held) ? 'resumed' : 'deferred';
     }
+    // Profile repair is a control-only crash repair even when execution belongs to a peer. Do not
+    // skip it for deferred children; once this Host owns a live lease, the branch above renews first.
+    await this.repairChildModelProfile(childExecutionId, turnId, child);
     const facts = await this.dependencies.turns.recoveryFacts(turnId);
     if (facts.judgment === 'finalize') {
       await this.dependencies.turns.finalizeRecovery({
@@ -1577,8 +1606,12 @@ export class ReliableChildAgentCoordinator {
       leaseExpiresAt: this.leaseExpiresAt()
     });
     if (!claimed) return 'deferred';
-    this.launch(childExecutionId, turnId);
-    return 'resumed';
+    const launched = await this.launchRecoveredChild(childExecutionId, turnId, child, {
+      id: claimed.executionLeaseId, conversationId: claimed.conversationId, turnId,
+      ownerId: this.childLeaseOwnerId, hostBootId: this.dependencies.database.hostBootId,
+      generation: BigInt(claimed.leaseGeneration)
+    }, false);
+    return launched ? 'resumed' : 'deferred';
   }
 
   /**
@@ -2124,7 +2157,19 @@ export class ReliableChildAgentCoordinator {
     throw new Error(`Child task ${bridgeId} is outside the caller's ${scope} parent lineage or does not exist.`);
   }
 
-  private async spawnChild(
+  private spawnChild(
+    input: ReliableAgentToolDispatchInput,
+    args: { [key: string]: PlainJsonValue },
+    prompt: string,
+    foregroundWaitMs: number,
+    authority?: ReliableToolDispatchAuthority,
+    signal?: AbortSignal,
+    admission?: ReliableSpecialToolAdmission
+  ): Promise<ChildDispatchResult> {
+    return this.runChildStartup(() => this.spawnChildStartup(input, args, prompt, foregroundWaitMs, authority, signal, admission));
+  }
+
+  private async spawnChildStartup(
     input: ReliableAgentToolDispatchInput,
     args: { [key: string]: PlainJsonValue },
     prompt: string,
@@ -2172,52 +2217,61 @@ export class ReliableChildAgentCoordinator {
       ...(deadline ? { waitDeadlineAt: deadline } : {}),
       title: requireText(args.taskName, 'run_agent.taskName').replace(/\s+/g, ' ').slice(0, 120),
       leaseOwnerId: this.childLeaseOwnerId,
-      leaseExpiresAt: this.leaseExpiresAt()
+      leaseExpiresAt: this.leaseExpiresAt(),
+      leaseDurationMs: this.leaseDurationMs()
     });
-    await this.dependencies.modelProfiles.initializeConversation({
-      conversationId: spawned.childConversationId,
-      model: spawned.modelSelection,
-      ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
-    });
-    if (spawned.answerBridgeId !== answerBridgeId) {
-      throw new Error('ChildExecution returned an unexpected AnswerBridge identity.');
-    }
-    // ChildExecution/AnswerBridge/spawn intent are now durable. Foreground answer waiting must not
-    // retain the scarce child-start slot; cancellation remains attached to the active ToolCall.
-    admission?.release();
-    const claimed = await this.dependencies.children.claimSpawnDispatch(spawned.effectIntentId);
-    if (!claimed) {
-      const replay = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
-      if (replay) return replay;
-      throw new Error(`subagent_spawn ${spawned.effectIntentId} was already claimed without a terminal Tool result.`);
-    }
-    const receipt = await this.dependencies.children.recordSpawnReceipt({
-      sourceKey: `local-child-spawn:${spawned.attemptId}`,
-      attemptId: spawned.attemptId,
-      outcome: 'succeeded',
-      detail: { adapter: 'reliable-local-agent-loop' }
-    });
-    await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
-    // The spawning Host is the natural first driver of the brand-new child Conversation. Every
-    // child fact is already durable, so if the claim fails closed the durable wait below still
-    // settles this ToolCall. This Host holds the child Turn's lease, so no other Host can take the
-    // child over while it lives: its own recovery passes retry the claim (another window holding
-    // the child Conversation briefly, for a stop or a recovery scan, hands it back).
-    let drivesChild = true;
+    const startupLease = await this.prepareChildLease(spawned.initialExecutionFence);
+    let leaseTransferred = false;
     try {
-      await this.dependencies.database.conversationOwners.claim(spawned.childConversationId);
-    } catch (error) {
-      console.warn(
-        '[reliable-kernel] Fresh child conversation ownership claim failed.',
-        spawned.childConversationId,
-        error
-      );
-      drivesChild = false;
-      this.triggerRecoveryPass();
+      await this.dependencies.modelProfiles.initializeConversation({
+        conversationId: spawned.childConversationId,
+        model: spawned.modelSelection,
+        ...(inheritedThinkingOverride ? { thinkingOverride: inheritedThinkingOverride } : {})
+      });
+      if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+      if (spawned.answerBridgeId !== answerBridgeId) {
+        throw new Error('ChildExecution returned an unexpected AnswerBridge identity.');
+      }
+      // ChildExecution/AnswerBridge/spawn intent are now durable. Foreground answer waiting must not
+      // retain the scarce child-start slot; cancellation remains attached to the active ToolCall.
+      admission?.release();
+      const claimed = await this.dependencies.children.claimSpawnDispatch(spawned.effectIntentId);
+      if (!claimed) {
+        const replay = await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
+        if (replay) return replay;
+        throw new Error(`subagent_spawn ${spawned.effectIntentId} was already claimed without a terminal Tool result.`);
+      }
+      const receipt = await this.dependencies.children.recordSpawnReceipt({
+        sourceKey: `local-child-spawn:${spawned.attemptId}`,
+        attemptId: spawned.attemptId,
+        outcome: 'succeeded',
+        detail: { adapter: 'reliable-local-agent-loop' }
+      });
+      await this.dependencies.children.reconcileSpawnReceipt(receipt.effectReceiptId);
+      // The spawning Host is the natural first driver of the brand-new child Conversation. Every
+      // child fact is already durable, so if the claim fails closed the durable wait below still
+      // settles this ToolCall. This Host holds the child Turn's lease, so no other Host can take the
+      // child over while it lives: its own recovery passes retry the claim (another window holding
+      // the child Conversation briefly, for a stop or a recovery scan, hands it back).
+      let drivesChild = true;
+      try {
+        await this.dependencies.database.conversationOwners.claim(spawned.childConversationId);
+      } catch (error) {
+        console.warn(
+          '[reliable-kernel] Fresh child conversation ownership claim failed.',
+          spawned.childConversationId,
+          error
+        );
+        drivesChild = false;
+        this.triggerRecoveryPass();
+      }
+      if (drivesChild) leaseTransferred = startupLease !== null && this.launch(spawned.childExecutionId, spawned.childTurnId, startupLease);
+      if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
+      return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, spawned.childTurnId, deadline!, signal);
+    } finally {
+      if (startupLease && !leaseTransferred) await startupLease.stop();
+      if (startupLease === null && !this.activeTurns.has(spawned.childTurnId)) this.triggerRecoveryPass();
     }
-    if (drivesChild) this.launch(spawned.childExecutionId, spawned.childTurnId);
-    if (completionPolicy === 'background') return this.requireWaitSettlement(input.toolCallId);
-    return this.waitInitialForeground(input.toolCallId, spawned.childExecutionId, spawned.childTurnId, deadline!, signal);
   }
 
   private async authorizeNewChildDepth(
@@ -2364,11 +2418,12 @@ export class ReliableChildAgentCoordinator {
           childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
           turnIntentId: sent.turnIntentId,
           leaseOwnerId: this.childLeaseOwnerId,
-          leaseExpiresAt: this.leaseExpiresAt()
+          leaseExpiresAt: this.leaseExpiresAt(),
+          leaseDurationMs: this.leaseDurationMs()
         });
         // A run_agent send has no delivery of its own, so it is never superseded.
         if ('superseded' in admitted) throw new Error(`run_agent send ${sent.turnIntentId} was cancelled as a runtime continuation.`);
-        this.launch(admitted.childExecutionId, admitted.turnId);
+        await this.launchCommittedChild(admitted.childExecutionId, admitted.turnId, admitted.initialExecutionFence);
       } catch (error) {
         if (!(error instanceof CollaborationCapacityError) && !(error instanceof CollaborationMembershipChangedError) && !isTransactionAssertionFailure(error)) throw error;
         // The continuation is already durable. Capacity contention defers admission; it must
@@ -2512,17 +2567,23 @@ export class ReliableChildAgentCoordinator {
     return this.settleOwnTool(input.toolCallId, detail, `read-agent-answer:${input.toolCallId}`);
   }
 
-  private launch(childExecutionId: string, turnId: string): void {
-    if (this.disposing || this.handoff) return;
+  private launch(childExecutionId: string, turnId: string, startupLease?: ChildLeaseRenewal): boolean {
+    if (this.disposing || this.handoff) return false;
     if (this.activeTurns.has(turnId)) {
       // Do not collapse an edge-triggered interaction/delivery wake into the currently executing
       // drive. The active drive may already have passed the corresponding durable read and be about
       // to publish `waiting`; consume this level-trigger immediately after its cleanup instead.
       this.pendingDriveWakes.add(turnId);
-      return;
+      return false;
+    }
+    try { startupLease?.assertActive(); }
+    catch (error) {
+      if (!isExecutionHandoffError(error)) throw error;
+      this.triggerRecoveryPass();
+      return false;
     }
     this.pendingDriveWakes.delete(turnId);
-    const task = runWithoutExecutionLeaseFence(() => this.driveChild(childExecutionId, turnId));
+    const task = runWithoutExecutionLeaseFence(() => this.driveChild(childExecutionId, turnId, startupLease));
     let handoff = false;
     let terminalStatus: ReliableChildDriveResult['terminalStatus'] | undefined;
     this.activeTurns.set(turnId, task);
@@ -2559,31 +2620,39 @@ export class ReliableChildAgentCoordinator {
         this.ensureRecoveryPolling();
       }
     });
+    return true;
   }
 
-  private async driveChild(childExecutionId: string, turnId: string): Promise<ReliableChildDriveResult> {
-    // Keep this launch's active slot while retrying only prerequisite reads/ownership entry.
-    // Once execution or handback cleanup starts, even a later local error must not re-drive it.
-    let executionStarted = false;
-    const assertOpen = (): void => {
-      if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
-    };
-    for (let retryNumber = 0; ; retryNumber += 1) {
-      assertOpen();
-      try {
-        return await this.driveChildAttempt(childExecutionId, turnId, () => { executionStarted = true; });
-      } catch (error) {
-        if (executionStarted || !isRetryableLocalExecutionError(error)) throw error;
-        if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
-        await waitForLocalExecutionRetry(retryNumber + 1, async () => { assertOpen(); return false; });
+  private async driveChild(childExecutionId: string, turnId: string, startupLease?: ChildLeaseRenewal): Promise<ReliableChildDriveResult> {
+    let leaseConsumed = false;
+    try {
+      // Keep this launch's active slot while retrying only prerequisite reads/ownership entry.
+      // Once execution or handback cleanup starts, even a later local error must not re-drive it.
+      let executionStarted = false;
+      const assertOpen = (): void => {
+        if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+      };
+      for (let retryNumber = 0; ; retryNumber += 1) {
+        assertOpen();
+        try {
+          return await this.driveChildAttempt(childExecutionId, turnId, () => { executionStarted = true; }, startupLease, () => { leaseConsumed = true; });
+        } catch (error) {
+          if (executionStarted || !isRetryableLocalExecutionError(error)) throw error;
+          if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
+          await waitForLocalExecutionRetry(retryNumber + 1, async () => { assertOpen(); return false; });
+        }
       }
+    } finally {
+      if (startupLease && !leaseConsumed) await startupLease.stop();
     }
   }
 
   private async driveChildAttempt(
     childExecutionId: string,
     turnId: string,
-    beforeExecution: () => void
+    beforeExecution: () => void,
+    startupLease?: ChildLeaseRenewal,
+    consumeLease?: () => void
   ): Promise<ReliableChildDriveResult> {
     const child = await this.get('ChildExecution', childExecutionId);
     if (!child) throw new Error(`ChildExecution ${childExecutionId} does not exist.`);
@@ -2597,6 +2666,7 @@ export class ReliableChildAgentCoordinator {
     if (!serves) {
       // Handback is terminal cleanup, not preparation that this launch may replay.
       beforeExecution();
+      if (startupLease) { consumeLease?.(); await startupLease.stop(); }
       // A native call an earlier drive of this Turn started here records its result first.
       await this.dependencies.agentLoop.quiesceNativeCalls(turnId);
       await this.handBackChildLease(turnId);
@@ -2604,30 +2674,37 @@ export class ReliableChildAgentCoordinator {
     }
     // The child Conversation's owner drives it. The activity pin holds ownership for the whole
     // drive and releases-if-idle afterwards, so ownership follows real work across Hosts.
-    return owners.run(conversationId, () => this.driveChildOwned(childExecutionId, turnId, beforeExecution));
+    return owners.run(conversationId, () => {
+      consumeLease?.();
+      return this.driveChildOwned(childExecutionId, turnId, beforeExecution, startupLease);
+    });
   }
 
   private async driveChildOwned(
     childExecutionId: string,
     turnId: string,
-    beforeExecution?: () => void
+    beforeExecution?: () => void,
+    startupLease?: ChildLeaseRenewal
   ): Promise<ReliableChildDriveResult> {
-    const fence = await this.readChildExecutionFence(turnId);
-    // Observe before creating a renewable resource: a failed read must not leak its timer.
+    const fence = startupLease?.fence ?? await this.readChildExecutionFence(turnId);
+    beforeExecution?.();
+    const renewal = startupLease ?? this.startChildLeaseRenewal(fence);
+    let result: ReliableChildDriveResult;
     let externalVersionBeforeDrive: string | undefined;
     try {
-      externalVersionBeforeDrive = await this.dependencies.database.externalDataVersion();
-    } catch (error) {
-      if (!isRetryableLocalExecutionError(error)) throw error;
-      // This version is only a wake optimization, not execution authority. An unknown baseline
-      // forces the next waiting poll to recheck without stranding a newly admitted child Turn.
-      this.reportError(error, 'read-child-wake-version', turnId);
-    }
-    if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
-    beforeExecution?.();
-    const renewal = this.startChildLeaseRenewal(fence);
-    let result: ReliableChildDriveResult;
-    try {
+      await renewal.ready;
+      renewal.assertActive();
+      // The exact owned lease is already renewed while optional setup/read work is awaited.
+      try {
+        externalVersionBeforeDrive = await this.dependencies.database.externalDataVersion();
+      } catch (error) {
+        if (!isRetryableLocalExecutionError(error)) throw error;
+        // This version is only a wake optimization, not execution authority. An unknown baseline
+        // forces the next waiting poll to recheck without stranding a newly admitted child Turn.
+        this.reportError(error, 'read-child-wake-version', turnId);
+      }
+      if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+      renewal.assertActive();
       result = await runWithExecutionLeaseFence(fence, async () => {
         if (this.dependencies.manualCompression) {
           const turn = await this.get('Turn', turnId);
@@ -2740,6 +2817,56 @@ export class ReliableChildAgentCoordinator {
     };
   }
 
+  private runChildStartup<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.disposing || this.handoff) return Promise.reject(this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.'));
+    const task = Promise.resolve().then(() => {
+      if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+      return operation();
+    });
+    this.startupOperations.add(task);
+    return task.finally(() => this.startupOperations.delete(task));
+  }
+
+  private async launchRecoveredChild(childExecutionId: string, turnId: string, child: DomainRow,
+    fence: ExecutionLeaseFence, repairProfile = true): Promise<boolean> {
+    const renewal = await this.prepareChildLease(fence);
+    let transferred = false;
+    try {
+      if (repairProfile) await this.repairChildModelProfile(childExecutionId, turnId, child);
+      transferred = renewal !== null && this.launch(childExecutionId, turnId, renewal);
+    } finally {
+      if (renewal && !transferred) await renewal.stop();
+      if (renewal === null && !this.activeTurns.has(turnId)) this.triggerRecoveryPass();
+    }
+    return transferred || this.activeTurns.has(turnId);
+  }
+
+  private async prepareChildLease(fence: ExecutionLeaseFence | undefined): Promise<ChildLeaseRenewal | null | undefined> {
+    if (!fence) return undefined;
+    if (this.activeTurns.has(fence.turnId)) return null;
+    if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+    const owners = this.dependencies.database.conversationOwners;
+    if (!owners.owns(fence.conversationId) && await owners.tryClaimEligible(fence.conversationId) !== 'owned') return null;
+    if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
+    // This committed child authority is independent of its parent's continuing execution. The
+    // timer carries the CHILD source fence; remaining parent setup keeps its original source scope.
+    const renewal = runWithExecutionLeaseFence(fence, () => this.startChildLeaseRenewal(fence));
+    try { await renewal.ready; renewal.assertActive(); return renewal; }
+    catch (error) {
+      await renewal.stop();
+      // This lease belongs to the child. Its handoff must not revoke the parent's still-current
+      // tool callback; committed spawn receipts remain reconcilable and recovery owns the child.
+      if (isExecutionHandoffError(error)) return null;
+      throw error;
+    }
+  }
+
+  private async launchCommittedChild(childExecutionId: string, turnId: string, fence?: ExecutionLeaseFence): Promise<void> {
+    const renewal = await this.prepareChildLease(fence);
+    if (renewal === null) { if (!this.activeTurns.has(turnId)) this.triggerRecoveryPass(); return; }
+    if (!this.launch(childExecutionId, turnId, renewal)) await renewal?.stop();
+  }
+
   private async readChildExecutionFence(turnId: string): Promise<ExecutionLeaseFence> {
     const fence = await this.dependencies.turns.executionLeaseFence({
       turnId,
@@ -2750,48 +2877,52 @@ export class ReliableChildAgentCoordinator {
     return fence;
   }
 
-  private startChildLeaseRenewal(fence: ExecutionLeaseFence): { stop(): Promise<void> } {
+  private startChildLeaseRenewal(fence: ExecutionLeaseFence): ChildLeaseRenewal {
+    if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
     let stopped = false;
-    let task = Promise.resolve();
-    const timer = setInterval(() => {
-      task = task.then(async () => {
-        if (stopped || this.handoff) return;
-        try {
-          const renewed = await this.dependencies.turns.renewExecutionLease({
-            fence,
-            leaseExpiresAt: new Date(Date.now() + this.leaseDurationMs()).toISOString()
-          });
-          if (!renewed) throw new ExecutionHandoffError(
-            `Child Turn ${fence.turnId} lost its ExecutionLease generation.`
-          );
-        } catch (error) {
-          stopped = true;
-          clearInterval(timer);
-          const handoff = new ExecutionHandoffError(`Child Turn ${fence.turnId} lost its ExecutionLease generation.`);
-          this.recoveryAfterDrive.add(fence.turnId);
-          if (!isExecutionHandoffError(error)) {
-            this.reportError(error, 'renew-child-lease', fence.turnId);
-          }
-          try {
-            if (this.dependencies.quiesceTurnExecution) {
-              await this.dependencies.quiesceTurnExecution({ turnId: fence.turnId, reason: handoff });
-            } else {
-              await this.dependencies.modelProvider.quiesceTurnDispatches(fence.turnId, handoff);
-            }
-          } catch (quiesceError) {
-            this.reportError(quiesceError, 'quiesce-child-after-lease-loss', fence.turnId);
-          }
-        }
-      });
-    }, Math.max(1_000, Math.min(10_000, Math.floor(this.leaseDurationMs() / 3))));
+    let loss: ExecutionHandoffError | undefined;
+    let stopTask: Promise<void> | undefined;
+    const renew = async (): Promise<void> => {
+      if (stopped || this.handoff) return;
+      const renewed = await this.dependencies.turns.renewExecutionLease({ fence, leaseExpiresAt: this.leaseExpiresAt() });
+      if (!renewed) throw new ExecutionHandoffError(`Child Turn ${fence.turnId} lost its ExecutionLease generation.`);
+    };
+    const failed = async (error: unknown): Promise<void> => {
+      stopped = true;
+      clearInterval(timer);
+      const handoff = new ExecutionHandoffError(`Child Turn ${fence.turnId} lost its ExecutionLease generation.`);
+      loss = handoff;
+      this.recoveryAfterDrive.add(fence.turnId);
+      if (!isExecutionHandoffError(error)) this.reportError(error, 'renew-child-lease', fence.turnId);
+      if (this.handoff || this.disposing) return;
+      try {
+        if (this.dependencies.quiesceTurnExecution) await this.dependencies.quiesceTurnExecution({ turnId: fence.turnId, reason: handoff });
+        else await this.dependencies.modelProvider.quiesceTurnDispatches(fence.turnId, handoff);
+      } catch (quiesceError) { this.reportError(quiesceError, 'quiesce-child-after-lease-loss', fence.turnId); }
+    };
+    const ready = Promise.resolve().then(renew);
+    let task = ready.catch(failed);
+    const timer = setInterval(() => { task = task.then(renew).catch(failed); },
+      Math.max(1_000, Math.min(10_000, Math.floor(this.leaseDurationMs() / 3))));
     timer.unref();
-    return {
-      stop: async () => {
+    const resource: ChildLeaseRenewal = {
+      fence, ready,
+      assertActive: () => {
+        if (loss || stopped || this.handoff || this.disposing) {
+          throw loss ?? this.handoff ?? new ExecutionHandoffError(`Child Turn ${fence.turnId} lease renewal stopped.`);
+        }
+      },
+      stop: () => {
+        if (stopTask) return stopTask;
         stopped = true;
         clearInterval(timer);
-        await task;
+        this.childLeaseRenewals.delete(resource);
+        stopTask = task;
+        return stopTask;
       }
     };
+    this.childLeaseRenewals.add(resource);
+    return resource;
   }
 
   private async awaitTurnTask(

@@ -1,3 +1,4 @@
+import type { InitialExecutionLeaseDuration } from './initialExecutionLease';
 import type { RuntimeDomainMutation } from './contracts';
 import {
   RUNTIME_DOMAIN_SCHEMAS,
@@ -40,6 +41,8 @@ export interface RepositoryInsertMutation {
    * requires its ModelRequest to be copied historically in the same transaction.
    */
   historicalCopy?: true;
+  /** Fixed writer-timed lifetime; only a newly inserted local generation-1 ExecutionLease. */
+  initialExecutionLeaseDuration?: InitialExecutionLeaseDuration;
 }
 
 export interface RepositoryUpdateMutation {
@@ -279,6 +282,16 @@ export class DomainRepository {
     this.requireMutation('insert');
     this.codec.encodeInsert(row);
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row) };
+  }
+
+  public insertWithExecutionLeaseDuration(row: DomainRow, lifetime: InitialExecutionLeaseDuration): RepositoryInsertMutation {
+    if (this.schema.key !== 'ExecutionLease' || row.generation !== 1n) {
+      throw new TypeError('Writer-timed initial lease duration is limited to ExecutionLease generation 1.');
+    }
+    if (!Number.isSafeInteger(lifetime.durationMs) || lifetime.durationMs <= 0) {
+      throw new TypeError('Initial ExecutionLease duration must be a positive safe integer.');
+    }
+    return { ...this.insert(row), initialExecutionLeaseDuration: { ...lifetime, clock: { ...lifetime.clock } } };
   }
 
   /**
@@ -712,6 +725,9 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
   if (step.kind === 'insert') return {
     ...step,
     row: clonePlainRecord(step.row),
+    ...(step.initialExecutionLeaseDuration ? { initialExecutionLeaseDuration: {
+      ...step.initialExecutionLeaseDuration, clock: { ...step.initialExecutionLeaseDuration.clock }
+    } } : {}),
     ...(step.allocateSequence ? {
       allocateSequence: {
         column: step.allocateSequence.column,

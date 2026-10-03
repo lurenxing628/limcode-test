@@ -266,3 +266,5 @@ docs/architecture/*
 
 !tests/reliable-kernel/lease-renewal-critical-queue.test.mjs
 !tests/reliable-kernel/lease-renewal-preflight-regression.test.mjs
+
+!tests/reliable-kernel/child-initial-lease.test.mjs

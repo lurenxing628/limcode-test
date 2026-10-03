@@ -7,6 +7,7 @@ import { isDeepStrictEqual } from 'node:util';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
 import { toSqliteFilePath } from './sqliteFilePath';
+import { initialExecutionLeaseRow } from './initialExecutionLease';
 import { DatabaseWorkerRequestQueue } from './databaseWorkerRequestQueue';
 import { decideExecutionLeaseRenewal, executionLeaseRenewalNow } from './executionLeaseRenewal';
 import { readMergeModelAggregates } from './runtimeMergeAggregatePreflight';
@@ -1775,7 +1776,16 @@ function executeMutation(
     const allocatedRow = mutation.allocateSequence
       ? allocateNextSequence(database, repository, mutation)
       : mutation.row;
-    const row = resolveMessageRevisionSequenceReference(allocatedRow, mutation, allocatedSequences);
+    let row = resolveMessageRevisionSequenceReference(allocatedRow, mutation, allocatedSequences);
+    if (mutation.initialExecutionLeaseDuration) {
+      if (schema.key !== 'ExecutionLease' || historicalCopy || mutation.allocateSequence
+        || mutation.messageRevisionSequenceReferenceId) {
+        throw new TypeError('Initial lease duration is restricted to ordinary ExecutionLease inserts.');
+      }
+      const turn = executeRead(database, DOMAIN_REPOSITORIES.domain('Turn').get(String(row.turn_id)));
+      if (Array.isArray(turn)) throw new TypeError('Invalid initial lease Turn.');
+      row = initialExecutionLeaseRow(row, mutation.initialExecutionLeaseDuration, data.hostBootId, turn);
+    }
     if (schema.key === 'ModelRequest') {
       if (historicalCopy) {
         if (row.status !== 'terminal' || row.terminal_state === null) {
