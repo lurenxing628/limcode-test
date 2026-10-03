@@ -41,6 +41,49 @@ export interface ModelHandleCatalog {
   retiredRefs?: string[];
 }
 
+/** Read-only catalog data accepted by projection helpers; persisted catalogs keep their plain shape. */
+export interface ReadonlyModelHandleCatalog {
+  readonly entries: readonly Readonly<ModelHandleEntry>[];
+  readonly identityContractRevision?: string;
+  readonly retiredRefs?: readonly string[];
+}
+
+declare const preparedModelHandleCatalog: unique symbol;
+export interface PreparedModelHandleCatalog extends ReadonlyModelHandleCatalog {
+  readonly [preparedModelHandleCatalog]: true;
+}
+
+interface ModelHandleLookup {
+  readonly byTarget: ReadonlyMap<string, Readonly<ModelHandleEntry>>;
+  readonly byRef: ReadonlyMap<string, Readonly<ModelHandleEntry>>;
+  readonly retiredRefs: ReadonlySet<string>;
+}
+
+// Only privately created, deeply frozen snapshots are keys. Never cache arbitrary caller objects:
+// callers may mutate a catalog between operations, and every new snapshot must validate that data.
+const preparedModelHandleLookups = new WeakMap<object, ModelHandleLookup>();
+
+/** Validate/copy once at an operation boundary, then share this immutable lookup during projection. */
+export function prepareModelHandleCatalog(value: unknown): PreparedModelHandleCatalog {
+  if (typeof value === 'object' && value !== null && preparedModelHandleLookups.has(value)) {
+    return value as PreparedModelHandleCatalog;
+  }
+  const catalog = normalizeModelHandleCatalog(value);
+  const byTarget = new Map<string, Readonly<ModelHandleEntry>>();
+  const byRef = new Map<string, Readonly<ModelHandleEntry>>();
+  for (const entry of catalog.entries) {
+    Object.freeze(entry);
+    byTarget.set(targetKey(entry.kind, entry.target), entry);
+    byRef.set(entry.ref, entry);
+  }
+  Object.freeze(catalog.entries);
+  if (catalog.retiredRefs) Object.freeze(catalog.retiredRefs);
+  // The opaque type has no wire marker; ownership is established only by the private map below.
+  const prepared = Object.freeze(catalog) as unknown as PreparedModelHandleCatalog;
+  preparedModelHandleLookups.set(prepared, { byTarget, byRef, retiredRefs: new Set(catalog.retiredRefs) });
+  return prepared;
+}
+
 export const CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION = '2026-10-01';
 
 interface ModelHandleCandidate {
@@ -76,7 +119,7 @@ const MAX_NESTED_JSON_CHARS = 16 * 1024 * 1024;
  */
 export function buildModelHandleCatalog(
   values: readonly unknown[],
-  seededEntries: readonly ModelHandleEntry[] | ModelHandleCatalog = []
+  seededEntries: readonly ModelHandleEntry[] | ReadonlyModelHandleCatalog = []
 ): ModelHandleCatalog {
   const candidates: ModelHandleCandidate[] = [];
   const seenObjects = new Set<object>();
@@ -143,6 +186,16 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
   if (value === undefined) return { entries: [] };
   const record = asRecord(value);
   if (!record) throw new TypeError('modelHandleCatalog must be an object when present.');
+  if (preparedModelHandleLookups.has(record)) {
+    const prepared = value as PreparedModelHandleCatalog;
+    return {
+      entries: prepared.entries.map(entry => ({ ...entry })),
+      ...(prepared.identityContractRevision === undefined ? {} : {
+        identityContractRevision: prepared.identityContractRevision,
+        retiredRefs: [...prepared.retiredRefs!]
+      })
+    };
+  }
   const hasContract = 'identityContractRevision' in record;
   if (hasContract && record.identityContractRevision !== CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION) {
     throw new TypeError('modelHandleCatalog.identityContractRevision is not the current identity contract.');
@@ -338,7 +391,7 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
 }
 
 export function renderRetiredModelHandleNotice(catalogInput: ModelHandleCatalog | unknown): string | undefined {
-  const retired = normalizeModelHandleCatalog(catalogInput).retiredRefs ?? [];
+  const retired = prepareModelHandleCatalog(catalogInput).retiredRefs ?? [];
   if (retired.length === 0) return undefined;
   const listed = retired.slice(0, 20).join(', ')
     + (retired.length > 20 ? `, and ${retired.length - 20} other historical references` : '');
@@ -375,8 +428,8 @@ export function modelHandleRef(
 ): string | undefined {
   const normalizedTarget = optionalText(target);
   if (!normalizedTarget) return undefined;
-  return normalizeModelHandleCatalog(catalogInput).entries.find((entry) =>
-    entry.kind === kind && entry.target === normalizedTarget)?.ref;
+  const catalog = prepareModelHandleCatalog(catalogInput);
+  return preparedModelHandleLookups.get(catalog)!.byTarget.get(targetKey(kind, normalizedTarget))?.ref;
 }
 
 export function modelHandleTarget(
@@ -386,16 +439,17 @@ export function modelHandleTarget(
 ): string | undefined {
   const normalizedRef = optionalText(ref);
   if (!normalizedRef) return undefined;
-  return normalizeModelHandleCatalog(catalogInput).entries.find((entry) =>
-    entry.kind === kind && entry.ref === normalizedRef)?.target;
+  const catalog = prepareModelHandleCatalog(catalogInput);
+  const entry = preparedModelHandleLookups.get(catalog)!.byRef.get(normalizedRef);
+  return entry?.kind === kind ? entry.target : undefined;
 }
 
 export function modelHandleEntries(
   catalogInput: ModelHandleCatalog | unknown,
   kind?: ModelHandleKind
 ): ModelHandleEntry[] {
-  const entries = normalizeModelHandleCatalog(catalogInput).entries;
-  return entries.filter((entry) => kind === undefined || entry.kind === kind);
+  const entries = prepareModelHandleCatalog(catalogInput).entries;
+  return entries.filter((entry) => kind === undefined || entry.kind === kind).map(entry => ({ ...entry }));
 }
 
 /** Removes durable result-envelope ids and replaces actionable canonical values with short refs. */
@@ -404,7 +458,7 @@ export function projectToolResultForModel(
   value: unknown,
   catalogInput: ModelHandleCatalog | unknown
 ): unknown {
-  const catalog = normalizeModelHandleCatalog(catalogInput);
+  const catalog = prepareModelHandleCatalog(catalogInput);
   const envelope = asRecord(value);
   if (envelope && typeof envelope.status === 'string' && 'detail' in envelope) {
     return {
@@ -420,7 +474,7 @@ export function projectKnownToolValue(
   value: unknown,
   catalogInput: ModelHandleCatalog | unknown
 ): unknown {
-  const catalog = normalizeModelHandleCatalog(catalogInput);
+  const catalog = prepareModelHandleCatalog(catalogInput);
   const projected = projectKnownValue(isCollaborationHandleTool(toolName)
     ? projectCollaborationValue(value, catalog) : value, catalog);
   const record = asRecord(projected);
@@ -448,7 +502,7 @@ export function resolveModelToolArguments(
   argumentsInput: unknown,
   catalogInput: ModelHandleCatalog | unknown
 ): unknown {
-  const catalog = normalizeModelHandleCatalog(catalogInput);
+  const catalog = prepareModelHandleCatalog(catalogInput);
   const args = cloneValue(argumentsInput);
   const record = asRecord(args);
   if (!record) return args;
@@ -512,7 +566,7 @@ const MODEL_INTERNAL_RESULT_KEYS = new Set([
   'receiptId'
 ]);
 
-function projectKnownValue(value: unknown, catalog: ModelHandleCatalog): unknown {
+function projectKnownValue(value: unknown, catalog: PreparedModelHandleCatalog): unknown {
   if (typeof value === 'string') return projectKnownText(value, catalog);
   if (Array.isArray(value)) return value.map((entry) => projectKnownValue(entry, catalog));
   const source = asRecord(value);
@@ -558,7 +612,7 @@ function projectKnownValue(value: unknown, catalog: ModelHandleCatalog): unknown
   return output;
 }
 
-function projectKnownText(value: string, catalog: ModelHandleCatalog): string {
+function projectKnownText(value: string, catalog: PreparedModelHandleCatalog): string {
   // A tool result can claim any code, including the kernel's invalid-model-reference code. Never
   // exempt its "error" text from projection. Instead, avoid replacing only *part* of an already
   // written short reference: target "999" must not turn a rejected P999 into an apparent PC1.
@@ -715,7 +769,7 @@ function replaceRef(
   refKey: string,
   targetKey: string,
   kind: ModelHandleKind,
-  catalog: ModelHandleCatalog
+  catalog: PreparedModelHandleCatalog
 ): void {
   if (targetKey in record) throw canonicalArgumentError(toolName, targetKey, refKey, kind);
   if (!(refKey in record)) return;
@@ -733,7 +787,7 @@ function resolveTransferEnvironment(
   record: Record<string, unknown>,
   key: 'fromEnvironment' | 'toEnvironment',
   argument: string,
-  catalog: ModelHandleCatalog
+  catalog: PreparedModelHandleCatalog
 ): void {
   if (optionalText(record[key]) === 'current') {
     record[key] = 'current';
@@ -745,7 +799,7 @@ function resolveTransferEnvironment(
 
 /** Resolves one short reference of the expected kind or explains precisely why the value is not one. */
 function requireRefTarget(
-  catalog: ModelHandleCatalog,
+  catalog: PreparedModelHandleCatalog,
   kind: ModelHandleKind,
   argument: string,
   value: unknown,
@@ -753,7 +807,7 @@ function requireRefTarget(
   accepted = `上下文或工具结果中出现过的${shortRefForm(kind)}`
 ): string {
   const ref = optionalText(value);
-  if (ref && handleKindOfRef(ref) === kind && catalog.retiredRefs?.includes(ref)) {
+  if (ref && handleKindOfRef(ref) === kind && preparedModelHandleLookups.get(catalog)!.retiredRefs.has(ref)) {
     return rejectArgument(kind, argument,
       `${argument}=${ref} 是已失效的历史${kindNoun(kind, '引用')}；历史编号的对应关系不唯一，不能根据编号或时间猜测新引用。请依据当前工具结果或工作环境说明确认对象后，使用它的新引用。`);
   }
@@ -810,7 +864,7 @@ function handleKindOfRef(value: string): ModelHandleKind | undefined {
  * shell/bash execute a new command by default; processRef and cursor only observe a background
  * process. Mode misuse is reported as such, so a valid P#/O# is never described as unknown.
  */
-function resolveCommandArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
+function resolveCommandArguments(toolName: string, record: Record<string, unknown>, catalog: PreparedModelHandleCatalog): void {
   if ('processId' in record) throw canonicalArgumentError(toolName, 'processId', 'processRef', 'process');
   if ('outputHandle' in record) throw canonicalArgumentError(toolName, 'outputHandle', 'cursor', 'cursor');
   const mode = record.mode === 'output' || record.mode === 'kill' ? record.mode : 'execute';
@@ -969,7 +1023,7 @@ const COLLABORATION_HANDLE_FIELDS: ReadonlyArray<readonly [string, string, Model
   ['postId', 'postRef', 'boardPost']
 ];
 
-function projectCollaborationValue(value: unknown, catalog: ModelHandleCatalog): unknown {
+function projectCollaborationValue(value: unknown, catalog: PreparedModelHandleCatalog): unknown {
   if (Array.isArray(value)) return value.map(item => projectCollaborationValue(item, catalog));
   const record = asRecord(value);
   if (!record) return value;
@@ -1010,7 +1064,7 @@ function collaborationArgumentFields(
       ['beforeMessageRef', 'beforeMessageId', record.view === 'conversation' ? 'conversationMessage' : 'collaborationMessage'], ['replyToMessageRef', 'replyToMessageId', 'collaborationMessage']];
 }
 
-function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: ModelHandleCatalog): void {
+function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: PreparedModelHandleCatalog): void {
   const fields = collaborationArgumentFields(toolName, record);
   // Provider contracts accept only frozen short references. Canonical IDs cannot bypass the map.
   for (const [refKey, targetKey, kind] of fields) replaceRef(toolName, record, refKey, targetKey, kind, catalog);

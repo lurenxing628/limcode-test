@@ -64,12 +64,11 @@ import {
 import {
   buildModelHandleCatalog,
   isPersistentContextHandle,
-  modelHandleEntries,
   modelHandleRef,
-  normalizeModelHandleCatalog,
+  prepareModelHandleCatalog,
   projectToolResultForModel,
   renderRetiredModelHandleNotice,
-  type ModelHandleCatalog
+  type ReadonlyModelHandleCatalog
 } from './modelHandleCatalog';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { toolAllowedByPolicy } from '../../shared/toolPolicyResolution';
@@ -758,7 +757,7 @@ function isGptModelId(modelId: string): boolean {
 
 function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
-  const modelHandleCatalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+  const modelHandleCatalog = prepareModelHandleCatalog(recipe.modelHandleCatalog);
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
   const toolPolicy = authorityToolPolicy(authority);
   const availableTools = normalizeToolDefinitions(recipe.tools)
@@ -998,7 +997,7 @@ function historyInsertion(entry: TurnReminderHistoryEntry, beforeIndex: number):
 function projectOrdinaryContentsWithDetachedInputs(
   contents: readonly MessageContent[],
   canonicalRanges: readonly { start: number; end: number }[],
-  modelHandleCatalog: ModelHandleCatalog,
+  modelHandleCatalog: ReadonlyModelHandleCatalog,
   insertions: readonly HistoryInsertion[]
 ): { contents: MessageContent[]; insertions: HistoryInsertion[] } {
   const detached = insertions.filter((insertion) => insertion.input);
@@ -1087,7 +1086,7 @@ function withTurnReminderMarkers(
   return result;
 }
 
-function requireAttachmentHandle(catalog: ModelHandleCatalog, attachmentId: string): string {
+function requireAttachmentHandle(catalog: ReadonlyModelHandleCatalog, attachmentId: string): string {
   const ref = modelHandleRef(catalog, 'attachment', attachmentId);
   if (!ref) throw new Error(`Attachment ${attachmentId} has no frozen model handle.`);
   return ref;
@@ -1223,7 +1222,7 @@ function frozenAttachmentObservationContract(
   recipe: { [key: string]: PlainJsonValue },
   methodKind: LlmCompactRequest['methodKind'],
   attachmentCatalog: readonly AttachmentCatalogEntry[],
-  modelHandleCatalog: ModelHandleCatalog
+  modelHandleCatalog: ReadonlyModelHandleCatalog
 ): CompactAttachmentObservationContract {
   const rawProfile = recipe.attachmentObservationProfileSha256;
   const rawRequirements = recipe.attachmentObservationRequirements;
@@ -1417,7 +1416,7 @@ function compressionContext(
   priorSummaryContents: MessageContent[];
   systemInstruction?: MessageContent;
   attachmentCatalogState: ReturnType<typeof normalizeAttachmentCatalogState>;
-  modelHandleCatalog: ModelHandleCatalog;
+  modelHandleCatalog: ReadonlyModelHandleCatalog;
 } {
   const contents: MessageContent[] = [];
   const systemParts: string[] = [];
@@ -1456,7 +1455,7 @@ function compressionContext(
     request.attachmentCatalogState,
     'Compression request attachmentCatalogState'
   );
-  const seededHandleCatalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+  const seededHandleCatalog = prepareModelHandleCatalog(recipe.modelHandleCatalog);
   for (const entry of attachmentCatalogState.catalog) {
     requireAttachmentHandle(seededHandleCatalog, entry.attachmentId);
   }
@@ -1468,10 +1467,10 @@ function compressionContext(
   // original replay behavior; a current Recipe must already freeze every persistent identity that
   // its actual expanded source can expose. Current attachments use the frozen registry-owned refs.
   const currentIdentityContract = seededHandleCatalog.identityContractRevision !== undefined;
-  const modelHandleCatalog = currentIdentityContract
+  const modelHandleCatalog = prepareModelHandleCatalog(currentIdentityContract
     ? { ...discoveredHandleCatalog, entries: discoveredHandleCatalog.entries.filter(entry =>
         entry.kind !== 'attachment' || modelHandleRef(seededHandleCatalog, 'attachment', entry.target) === entry.ref) }
-    : discoveredHandleCatalog;
+    : discoveredHandleCatalog);
   const retiredHandleNotice = renderRetiredModelHandleNotice(modelHandleCatalog);
   if (retiredHandleNotice) systemParts.push(retiredHandleNotice);
   // Discovering a new identity here means the current Recipe did not freeze its actual source.
@@ -1612,7 +1611,7 @@ function hasOrdinaryUserPart(content: MessageContent): boolean {
 function runtimeContextContent(
   content: string,
   contentType: string,
-  modelHandleCatalog: ModelHandleCatalog = { entries: [] }
+  modelHandleCatalog: ReadonlyModelHandleCatalog = { entries: [] }
 ): MessageContent {
   const envelope = decodeRuntimeDeliveryModelEnvelope(content, contentType);
   return {
@@ -1628,7 +1627,7 @@ function runtimeContextContent(
 function projectOrdinaryContentsPreservingRanges(
   contents: readonly MessageContent[],
   canonicalRanges: readonly { start: number; end: number }[],
-  modelHandleCatalog: ModelHandleCatalog,
+  modelHandleCatalog: ReadonlyModelHandleCatalog,
   observer?: {
     /** Positions (never inside a canonical range) at which the running media state is observed. */
     cuts: readonly number[];
@@ -1929,7 +1928,7 @@ function nativeToolOccurrence(
 
 function toolPairContents(
   content: string,
-  modelHandleCatalog: ModelHandleCatalog = { entries: [] },
+  modelHandleCatalog: ReadonlyModelHandleCatalog = { entries: [] },
   forTextSummary = false
 ): MessageContent[] {
   const pair = requireRecord(normalizePlainJson(JSON.parse(content), 'Context tool pair'), 'Context tool pair');
@@ -2079,7 +2078,7 @@ function readToolsForAttachmentCatalog(
 
 function modelFacingToolsForHandleCatalog(
   tools: ToolSchema[],
-  catalog: ModelHandleCatalog
+  catalog: ReadonlyModelHandleCatalog
 ): ToolSchema[] {
   return tools.map((tool) => {
     const parameters = cloneSchemaRecord(tool.parameters);
@@ -2119,7 +2118,7 @@ function renameSchemaProperty(parameters: Record<string, unknown>, from: string,
   }
 }
 
-function replaceSchemaHandleText(value: unknown, catalog: ModelHandleCatalog): unknown {
+function replaceSchemaHandleText(value: unknown, catalog: ReadonlyModelHandleCatalog): unknown {
   if (typeof value === 'string') return modelFacingHandleText(value, catalog);
   if (Array.isArray(value)) return value.map((entry) => replaceSchemaHandleText(entry, catalog));
   const record = asRecord(value);
@@ -2130,7 +2129,7 @@ function replaceSchemaHandleText(value: unknown, catalog: ModelHandleCatalog): u
   ]));
 }
 
-function modelFacingHandleText(value: string, catalog: ModelHandleCatalog): string {
+function modelFacingHandleText(value: string, catalog: ReadonlyModelHandleCatalog): string {
   let text = value;
   for (const [from, to] of [
     ['attachmentId', 'attachmentRef'],
@@ -2140,7 +2139,7 @@ function modelFacingHandleText(value: string, catalog: ModelHandleCatalog): stri
     ['answerBridgeId', 'childRef'],
     ['workEnvironmentId', 'workEnvironmentRef']
   ] as const) text = text.split(from).join(to);
-  for (const entry of modelHandleEntries(catalog)) text = text.split(entry.target).join(entry.ref);
+  for (const entry of catalog.entries) text = text.split(entry.target).join(entry.ref);
   return text;
 }
 

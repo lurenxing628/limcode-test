@@ -27,9 +27,9 @@ import {
 import {
   buildModelHandleCatalog,
   modelHandleRef,
-  normalizeModelHandleCatalog,
+  prepareModelHandleCatalog,
   projectToolResultForModel,
-  type ModelHandleCatalog
+  type ReadonlyModelHandleCatalog
 } from './modelHandleCatalog';
 import {
   decodeRuntimeDeliveryModelEnvelope,
@@ -748,7 +748,7 @@ export function projectToolResultBatch(
 export function projectNativeToolResultOutput(
   toolName: string,
   raw: unknown,
-  catalog: ModelHandleCatalog
+  catalog: ReadonlyModelHandleCatalog
 ): NonNullable<OpenAIResponsesToolOutput['output']> {
   const split = splitStoredToolResponseAttachments(raw);
   const projected = projectToolResultBatch([{
@@ -1013,10 +1013,10 @@ export function collectStoredNativeConfigurationUpdates(
 export function projectStoredModelFacingWindow(
   items: readonly StoredModelFacingContextItem[],
   attachmentCatalogState: AttachmentCatalogState | unknown = { catalog: [], placements: [] },
-  seededModelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
+  seededModelHandleCatalog: ReadonlyModelHandleCatalog | unknown = { entries: [] }
 ): ModelWindowProjection {
   const state = normalizeAttachmentCatalogState(attachmentCatalogState);
-  const seededHandles = normalizeModelHandleCatalog(seededModelHandleCatalog);
+  const seededHandles = prepareModelHandleCatalog(seededModelHandleCatalog);
   const discoveredCatalog = buildModelHandleCatalog(
     [...items.map((item) => item.content), state.catalog],
     seededHandles
@@ -1024,10 +1024,10 @@ export function projectStoredModelFacingWindow(
   // Current requests already froze registry-owned attachment addresses. Raw context fields must
   // not invent another F address for an invisible/foreign Attachment. Unmarked frozen requests
   // retain their original projection scope for replay.
-  const modelHandleCatalog = seededHandles.identityContractRevision !== undefined
+  const modelHandleCatalog = prepareModelHandleCatalog(seededHandles.identityContractRevision !== undefined
     ? { ...discoveredCatalog, entries: discoveredCatalog.entries.filter(entry => entry.kind !== 'attachment'
       || modelHandleRef(seededHandles, 'attachment', entry.target) === entry.ref) }
-    : discoveredCatalog;
+    : discoveredCatalog);
   const segmentIds = items.map((item, index) => item.segmentId?.trim() || `stored-context-item-${index}`);
   const renderedState = renderAttachmentCatalogState(
     state,
@@ -1104,7 +1104,7 @@ export function createAttachmentPlacementQueue(emit: (content: MessageContent) =
 /** Common ordinary/native model-visible representation: same items, same result previews. */
 export function projectOrdinaryModelWindow(
   contents: readonly MessageContent[],
-  modelHandleCatalogInput: ModelHandleCatalog | unknown = { entries: [] },
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): ModelWindowProjection {
   const projected = contents.map(cloneMessageContent);
@@ -1184,10 +1184,10 @@ export function preserveCanonicalModelContents(
  */
 export function suppressRepeatedManagedMediaBodies(
   contents: readonly MessageContent[],
-  modelHandleCatalogInput: ModelHandleCatalog | unknown = { entries: [] },
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   state: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): MessageContent[] {
-  const modelHandleCatalog = normalizeModelHandleCatalog(modelHandleCatalogInput);
+  const modelHandleCatalog = prepareModelHandleCatalog(modelHandleCatalogInput);
   return contents.map((content): MessageContent => ({
     role: content.role,
     parts: content.parts.map((part): ContentPart => {
@@ -1228,7 +1228,7 @@ export function suppressRepeatedManagedMediaBodies(
 
 function repeatedManagedMediaOmission(
   part: InlineDataPart,
-  modelHandleCatalog: ModelHandleCatalog,
+  modelHandleCatalog: ReadonlyModelHandleCatalog,
   state: ManagedMediaBodyProjectionState
 ): Record<string, unknown> | undefined {
   if (!rememberManagedMediaBody(part, state)) return undefined;
@@ -1293,7 +1293,7 @@ function withRepeatedManagedMediaOmissions(
 
 function storedContextItemContents(
   item: StoredModelFacingContextItem,
-  modelHandleCatalog: ModelHandleCatalog
+  modelHandleCatalog: ReadonlyModelHandleCatalog
 ): MessageContent[] {
   if (item.segmentKind === 'runtime_context') {
     const envelope = decodeRuntimeDeliveryModelEnvelope(item.content, item.contentType);
@@ -1515,7 +1515,7 @@ export function withSummaryDispatchRefs(
  * remain readable descriptors and nested tool-response media is lifted beside that descriptor. */
 export function projectSummaryModelWindow(
   contents: readonly MessageContent[],
-  modelHandleCatalogInput: ModelHandleCatalog | unknown = { entries: [] },
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): ModelWindowProjection {
   const ordinary = projectOrdinaryModelWindow(contents, modelHandleCatalogInput, mediaState);

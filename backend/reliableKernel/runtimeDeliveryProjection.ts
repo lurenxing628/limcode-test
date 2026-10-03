@@ -12,8 +12,9 @@ import {
 import { estimateTextTokens } from './modelTokenEstimator';
 import {
   projectKnownToolValue,
-  modelHandleEntries,
+  prepareModelHandleCatalog,
   modelHandleRef,
+  type PreparedModelHandleCatalog,
   type ModelHandleCatalog
 } from './modelHandleCatalog';
 
@@ -256,7 +257,7 @@ export function renderRuntimeDeliveryModelEnvelope(
   modelHandleCatalog: ModelHandleCatalog | unknown = { entries: [] }
 ): string {
   const envelope = requireRuntimeDeliveryModelEnvelope(envelopeInput);
-  const modelEnvelope = runtimeModelEnvelope(envelope, modelHandleCatalog);
+  const modelEnvelope = runtimeModelEnvelope(envelope, prepareModelHandleCatalog(modelHandleCatalog));
   // The header line is fixed kernel text. Every variable value, peer text included, stays escaped
   // inside the one JSON line below it, so no content can forge a header or an identity field.
   const header = runtimeDeliveryHeader(envelope);
@@ -503,7 +504,7 @@ function requireString(value: unknown, label: string): string {
 
 function runtimeModelEnvelope(
   envelope: RuntimeDeliveryModelEnvelope,
-  catalog: ModelHandleCatalog | unknown
+  catalog: PreparedModelHandleCatalog
 ): Record<string, unknown> {
   if (envelope.kind === 'collaboration_message') {
     // Sender identity is kernel data: a conversation is named by its title, a team agent by its name.
@@ -563,7 +564,7 @@ const RUNTIME_INTERNAL_ID_KEYS = new Set([
 
 function compactRuntimeValue(
   value: PlainJsonValue,
-  catalog: ModelHandleCatalog | unknown
+  catalog: PreparedModelHandleCatalog
 ): PlainJsonValue {
   if (typeof value === 'string') return compactRuntimeText(value, catalog);
   if (Array.isArray(value)) return value.map((entry) => compactRuntimeValue(entry, catalog));
@@ -591,9 +592,9 @@ function compactRuntimeValue(
   return output;
 }
 
-function compactRuntimeText(value: string, catalog: ModelHandleCatalog | unknown): string {
+function compactRuntimeText(value: string, catalog: PreparedModelHandleCatalog): string {
   let text = value;
-  for (const entry of modelHandleEntries(catalog)) text = text.split(entry.target).join(entry.ref);
+  for (const entry of catalog.entries) text = text.split(entry.target).join(entry.ref);
   return text;
 }
 
