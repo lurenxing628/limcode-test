@@ -162,16 +162,7 @@ export async function readCurrentTurnTaskCard(
     orderBy: { column: 'id', direction: 'asc' },
     limit: 1_000
   }));
-  const callReads: RepositoryRead[] = turnsBarrier.snapshot.map((turn) =>
-    DOMAIN_REPOSITORIES.domain('ToolCall').list({
-      where: { turn_id: requiredText(turn.id, 'Turn.id') },
-      orderBy: { column: 'id', direction: 'asc' },
-      limit: 1_000
-    }));
-  const callsBarrier = await database.snapshot(callReads);
-  const calls = callsBarrier.snapshot
-    .flatMap(rows)
-    .filter((call) => call.tool_name === TASK_LIST_TOOL_NAME || call.tool_name === SUBMIT_PLAN_TOOL_NAME);
+  const calls = await readTaskToolCalls(database, turnsBarrier.snapshot);
   if (calls.length === 0) return undefined;
 
   const relatedReads: RepositoryRead[] = calls.flatMap((call) => [
@@ -313,6 +304,91 @@ export async function readCurrentTurnTaskCard(
     frozenAtCommitSeq
   });
   return projection ? freezeCurrentTurnTaskCard(projection) : undefined;
+}
+
+const TASK_CALL_TURNS_PER_BATCH = 32;
+const TASK_CALL_PAGE_SIZE = 256;
+
+interface TaskCallScope {
+  turnId: string;
+  toolName: typeof TASK_LIST_TOOL_NAME | typeof SUBMIT_PLAN_TOOL_NAME;
+}
+
+interface TaskCallCursor extends TaskCallScope {
+  upperCallSeq: bigint;
+  after?: { callSeq: bigint; id: string };
+}
+
+/**
+ * Only task tools cross the worker boundary. Batch sparse historical Turns instead of issuing
+ * two RPCs per Turn; only full pages need continuation. The first read also freezes each scope's
+ * call_seq frontier. New calls use MAX(call_seq)+1 within their Turn, so later pages cannot add
+ * calls admitted after that frontier. Result settlement is read afterward, as before.
+ */
+async function readTaskToolCalls(database: RuntimeDatabase, turns: readonly DomainRow[]): Promise<DomainRow[]> {
+  const calls: DomainRow[] = [];
+  const repository = DOMAIN_REPOSITORIES.domain('ToolCall');
+  for (let offset = 0; offset < turns.length; offset += TASK_CALL_TURNS_PER_BATCH) {
+    const scopes: TaskCallScope[] = turns.slice(offset, offset + TASK_CALL_TURNS_PER_BATCH).flatMap((turn) =>
+      ([TASK_LIST_TOOL_NAME, SUBMIT_PLAN_TOOL_NAME] as const).map((toolName) => ({
+        turnId: requiredText(turn.id, 'Turn.id'), toolName
+      }))
+    );
+    const first = await database.snapshot(scopes.flatMap((scope) => [
+      repository.list({
+        where: { turn_id: scope.turnId, tool_name: scope.toolName },
+        orderBy: { column: 'call_seq', direction: 'asc' }, limit: TASK_CALL_PAGE_SIZE
+      }),
+      repository.list({
+        where: { turn_id: scope.turnId, tool_name: scope.toolName },
+        orderBy: { column: 'call_seq', direction: 'desc' }, limit: 1
+      })
+    ]));
+    let pending: TaskCallCursor[] = [];
+    scopes.forEach((scope, index) => {
+      const page = rows(first.snapshot[index * 2]);
+      const last = rows(first.snapshot[index * 2 + 1])[0];
+      if (!last) {
+        if (page.length > 0) throw new Error('Task ToolCall page has no frozen sequence frontier.');
+        return;
+      }
+      const next = collectTaskCallPage(calls, page, {
+        ...scope, upperCallSeq: positiveBigInt(last.call_seq, 'ToolCall.call_seq')
+      });
+      if (next) pending.push(next);
+    });
+    while (pending.length > 0) {
+      const batch = await database.snapshot(pending.map((scope) => repository.list({
+        where: { turn_id: scope.turnId, tool_name: scope.toolName },
+        orderBy: { column: 'call_seq', direction: 'asc' },
+        keyset: { column: 'call_seq', value: scope.after!.callSeq, id: scope.after!.id, direction: 'after' },
+        limit: TASK_CALL_PAGE_SIZE
+      })));
+      const next: TaskCallCursor[] = [];
+      pending.forEach((scope, index) => {
+        const cursor = collectTaskCallPage(calls, rows(batch.snapshot[index]), scope);
+        if (cursor) next.push(cursor);
+      });
+      pending = next;
+    }
+  }
+  return calls;
+}
+
+function collectTaskCallPage(
+  calls: DomainRow[],
+  page: readonly DomainRow[],
+  scope: TaskCallCursor
+): TaskCallCursor | undefined {
+  const last = page[page.length - 1];
+  if (!last) return undefined;
+  const lastSeq = positiveBigInt(last.call_seq, 'ToolCall.call_seq');
+  if (scope.after && lastSeq <= scope.after.callSeq) throw new Error('Task ToolCall pagination did not advance.');
+  for (const call of page) {
+    if (positiveBigInt(call.call_seq, 'ToolCall.call_seq') <= scope.upperCallSeq) calls.push(call);
+  }
+  if (page.length < TASK_CALL_PAGE_SIZE || lastSeq >= scope.upperCallSeq) return undefined;
+  return { ...scope, after: { callSeq: lastSeq, id: requiredText(last.id, 'ToolCall.id') } };
 }
 
 export function freezeCurrentTurnTaskCard(projection: CurrentTurnTaskProjection): FrozenTurnTaskCard {

@@ -330,6 +330,13 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
     role: 'no_effect_result',
     content_object_id: 'task-prefix-race-result'
   };
+  const taskCall = {
+    id: toolCallId,
+    turn_id: 'task-prefix-race-turn',
+    call_seq: 1n,
+    tool_name: 'update_task_list',
+    arguments_object_id: 'task-prefix-race-arguments'
+  };
   let snapshotCount = 0;
   const database = {
     async snapshotAll() {
@@ -341,7 +348,7 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
         }]
       };
     },
-    async snapshot() {
+    async snapshot(queries) {
       snapshotCount += 1;
       if (snapshotCount === 1) {
         return {
@@ -353,15 +360,16 @@ test('任务卡按不可变 ToolCall 前缀读取，无关 commitSeq 连续变�
         };
       }
       if (snapshotCount === 2) {
+        assert.equal(queries.length, 4);
+        assert.deepEqual(queries.map(query => query.where), [
+          { turn_id: 'task-prefix-race-turn', tool_name: 'update_task_list' },
+          { turn_id: 'task-prefix-race-turn', tool_name: 'update_task_list' },
+          { turn_id: 'task-prefix-race-turn', tool_name: 'submit_plan' },
+          { turn_id: 'task-prefix-race-turn', tool_name: 'submit_plan' }
+        ]);
         return {
           snapshotCommitSeq: '12',
-          snapshot: [[{
-            id: toolCallId,
-            turn_id: 'task-prefix-race-turn',
-            call_seq: 1n,
-            tool_name: 'update_task_list',
-            arguments_object_id: 'task-prefix-race-arguments'
-          }]]
+          snapshot: [[taskCall], [taskCall], [], []]
         };
       }
       if (snapshotCount === 3) {
