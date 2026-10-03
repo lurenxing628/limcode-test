@@ -1730,10 +1730,28 @@ export class EffectControlPlane {
       const facts = await this.requireToolFacts(toolCallId, false);
       await this.finalizeReadyInOrder(facts.turn.id as string);
       const terminal = await this.readTerminalResult(toolCallId, true, duplicate.id as string);
-      if (!terminal) {
-        throw new Error(`ToolCall ${toolCallId} model detail source receipt has no terminal result.`);
+      if (terminal) return terminal;
+      // The source receipt commits the immutable model_response artifact, not ordered delivery.
+      // A preceding call may still be unresolved when the same process receipt is reconciled again.
+      const artifacts = await this.list('ToolResultArtifact', { tool_call_id: toolCallId, role: 'model_response' }, 2);
+      const operations = await listAllDomainRows(this.database, 'Operation', { tool_call_id: toolCallId });
+      const ready = artifacts.length === 1 && operations.length > 0
+        ? await this.readReadyToolOutcome(toolCallId, operations) : null;
+      if (!ready || ready.status !== status) {
+        throw new Error(`ToolCall ${toolCallId} model detail source receipt has no matching settled artifact.`);
       }
-      return terminal;
+      try {
+        await this.assertCallIsNextForModelResult(facts.toolCall, new Set());
+      } catch (error) {
+        if (error instanceof ToolCallOrderBlockedError) return null;
+        throw error;
+      }
+      // The predecessor may have settled after the first pass. Re-run the ordinary finalizer;
+      // do not invent a terminal result or accept an unblocked but incomplete durable frontier.
+      await this.finalizeReadyInOrder(facts.turn.id as string);
+      const advanced = await this.readTerminalResult(toolCallId, true, duplicate.id as string);
+      if (!advanced) throw new Error(`ToolCall ${toolCallId} model detail source receipt has no terminal result.`);
+      return advanced;
     }
     const facts = await this.requireToolFacts(toolCallId, true);
     const existingTerminal = await this.readTerminalResult(toolCallId, true);
