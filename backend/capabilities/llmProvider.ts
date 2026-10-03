@@ -4883,12 +4883,12 @@ async function generateSummaryText(
   const priorSummaryText = request.priorSummaryContents?.length
     ? plainTextOfContents(request.priorSummaryContents)
     : '';
-  const fallback = deterministicReplacementSummary(priorSummaryText, request.contents, targetTokens);
+  const fallback = (): string => deterministicReplacementSummary(priorSummaryText, request.contents, targetTokens);
   if (methodConfig.kind === 'deterministic_summary' || methodConfig.kind === 'manual_summary') {
-    return { text: fallback };
+    return { text: fallback() };
   }
 
-  if (request.contents.length === 0) return { text: fallback };
+  if (request.contents.length === 0) return { text: fallback() };
 
   const resolved = resolvedProvider ?? await resolveSummaryProvider(request, methodConfig, options);
   if (!resolved.provider) throw new Error('Summary provider was not resolved.');
@@ -5103,15 +5103,17 @@ function isStructuredSummaryText(text: string): boolean {
  * （shortenOversizedSummary），仍超出才按条目机械删减。
  * 模型没按标题输出（例如拒答）或各节全是“无”时，才退回逐条抽取的确定性摘要。
  */
-function finalizeStructuredSummary(candidate: string, fallback: string, targetTokens: number): string {
+function finalizeStructuredSummary(candidate: string, fallback: string | (() => string), targetTokens: number): string {
   requireSummaryVisibleOutput(candidate);
   const parsed = parseStructuredSummary(candidate);
   if (parsed && structuredSummaryFactCount(parsed) > 0) {
     const text = modelSummaryText(candidate);
     return estimateTokenCount(text) <= summaryBodyBudget(targetTokens) ? text : fitStructuredSummary(parsed, targetTokens);
   }
-  const fallbackSummary = parseStructuredSummary(fallback)
-    ?? structuredSummaryFromLooseText(fallback, 'active');
+  // Successful model summaries never need the full source transcript's deterministic extraction.
+  const fallbackText = typeof fallback === 'function' ? fallback() : fallback;
+  const fallbackSummary = parseStructuredSummary(fallbackText)
+    ?? structuredSummaryFromLooseText(fallbackText, 'active');
   return fitStructuredSummary(fallbackSummary, targetTokens);
 }
 
