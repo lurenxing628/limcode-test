@@ -3984,8 +3984,12 @@ export function planCompressionSummaryCalls(
   const sourceContents = summaryDeltaContents(request);
   if (sourceContents.length === 0) return plan(0);
   if (methodConfig.kind === 'llm_summary') {
-    if (!isSummaryProviderCallWithinWindow(buildSummaryProviderCall(request, methodConfig, settings), settings)) {
-      throw new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.');
+    const call = buildSummaryProviderCall(request, methodConfig, settings);
+    if (!isSummaryProviderCallWithinWindow(call, settings)) {
+      throw Object.assign(new Error('compression_request_too_large: summary input exceeds the frozen Provider input limit.'), {
+        code: 'compression_request_too_large',
+        estimatedTokens: summaryProviderCallInputTokens(call), limitTokens: summaryProviderInputLimitTokens(call, settings)
+      });
     }
     return plan(1);
   }

@@ -107,6 +107,8 @@ import type { AttachmentIngestService } from './attachmentIngest';
 export interface CreateModelRequestCommand {
   turnId: string;
   contextRootId: string;
+  /** Optional creation fence for an automatic compression selected from this active head. */
+  expectedContextHeadRootId?: string;
   authoritySnapshotId: string;
   recipe: PlainJsonValue;
   settingsSnapshotContentObjectId?: string;
@@ -764,8 +766,21 @@ export class ModelProviderControlPlane {
       ...compressionExecutionMetadata(recipe),
       ...(!compressionRequest && generationModel?.generationConfig ? { thinkingSelection: `${frozenModelId}: ${generationModel.thinkingControlledByBody ? '由自定义请求体控制' : sessionThinkingDisplayLabel(generationModel.provider as LlmProviderKind, frozenModelId, generationModel.thinkingConfig as LlmThinkingConfigRecord)}` } : {})
     };
+    const expectedHead = command.expectedContextHeadRootId === undefined ? undefined
+      : rows((await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').list({
+          where: { conversation_id: requireId(turn.conversation_id, 'Turn.conversation_id') }, limit: 1
+        })])).snapshot[0])[0];
+    if (command.expectedContextHeadRootId !== undefined
+      && (command.expectedContextHeadRootId !== contextRootId || !expectedHead)) {
+      throw new Error('Automatic compression creation requires its exact active Context head.');
+    }
     const steps: RepositoryTransactionStep[] = [
       DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
+      ...(expectedHead ? [DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(
+        requireId(expectedHead.id, 'Context head id'), { conversation_id: requireId(turn.conversation_id, 'Turn.conversation_id'), root_id: contextRootId }
+      ), ...['interrupt_request', 'interrupt_current_turn', 'termination_request'].map(inputKind =>
+        DOMAIN_REPOSITORIES.domain('PendingTurnInput').assertNone({ turn_id: turnId, state: 'pending', input_kind: inputKind })
+      )] : []),
       ...preparedContentObjectSteps([recipeContent], 'model_request_recipe'),
       DOMAIN_REPOSITORIES.domain('ModelRequest').insertWithNextSequence({
         id: modelRequestId,

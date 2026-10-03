@@ -38,17 +38,34 @@ export async function expandTextCompressionSources(
   input: readonly FullProviderContextItem[],
   options: { sourceReplay?: 'immutable_provenance' } = {}
 ): Promise<FullProviderContextItem[]> {
+  return (await prepareTextCompressionSources(database, store, conversationId, input, options)).items;
+}
+
+/** Prepared once for exact prefix admission; offsets refer to indivisible original source items. */
+export async function prepareTextCompressionSources(
+  database: RuntimeDatabase,
+  store: ContentAddressedStore,
+  conversationId: string,
+  input: readonly FullProviderContextItem[],
+  options: { sourceReplay?: 'immutable_provenance' } = {}
+): Promise<{ items: FullProviderContextItem[]; sourceEndOffsets: number[] }> {
   const shouldExpand = (item: FullProviderContextItem) => options.sourceReplay === 'immutable_provenance'
     ? item.segmentKind === 'compression'
     : isNativeState(item);
-  if (!input.some(shouldExpand)) return [...input];
+  if (!input.some(shouldExpand)) return { items: [...input], sourceEndOffsets: input.map((_, index) => index + 1) };
+  const sourceEndOffsets: number[] = [];
   const output: FullProviderContextItem[] = [];
   const cache = new Map<string, FullProviderContextItem>();
   let visits = 0;
   let bytes = 0;
-  const stack = input.slice().reverse().map((item) => ({ item, ancestors: [] as string[] }));
+  const stack: Array<{ item: FullProviderContextItem; ancestors: string[] } | { sourceEnd: number }> = [];
+  for (let index = input.length - 1; index >= 0; index -= 1) {
+    stack.push({ sourceEnd: index }, { item: input[index]!, ancestors: [] });
+  }
   while (stack.length) {
-    const { item, ancestors } = stack.pop()!;
+    const frame = stack.pop()!;
+    if ('sourceEnd' in frame) { sourceEndOffsets[frame.sourceEnd] = output.length; continue; }
+    const { item, ancestors } = frame;
     if (++visits > MAX_REPLAY_SEGMENTS) throw limited('segments', '压缩来源超过重建数量上限。');
     bytes += Buffer.byteLength(item.content, 'utf8');
     if (bytes > MAX_REPLAY_BYTES) throw limited('bytes', '压缩来源超过重建字节上限。');
@@ -99,7 +116,7 @@ export async function expandTextCompressionSources(
     }
     for (const original of expanded.reverse()) stack.push({ item: original, ancestors: [...ancestors, item.segmentId] });
   }
-  return output;
+  return { items: output, sourceEndOffsets };
 }
 
 function isNativeState(item: FullProviderContextItem): boolean {

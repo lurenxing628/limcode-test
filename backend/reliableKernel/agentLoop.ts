@@ -97,7 +97,9 @@ import { assistantMessageIdFor, nativeAssistantPartIdentity, TurnOutputControlPl
 import { currentExecutionLeaseFence, ExecutionEligibilityLostError, ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
 import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
 import { childTaskTextForPreview } from './childSkillPreload';
+import { isStrictSingleSummaryPlan } from './contextCompressionCoordinator';
 import type {
+  AutomaticCompressionContinuation,
   CoordinateCompressionCommand,
   CoordinateCompressionResult
 } from './contextCompressionCoordinator';
@@ -120,6 +122,9 @@ export interface ReliableAgentProviderRegistry {
 
 export interface ReliableAgentCompressionCoordinator {
   coordinate(command: CoordinateCompressionCommand): Promise<CoordinateCompressionResult>;
+  readAutomaticCompressionContinuation?(input: {
+    turnId: string; ordinaryRequestId: string; authoritySnapshotId: string; headRootId: string;
+  }): Promise<AutomaticCompressionContinuation | undefined>;
   recoverProviderContextOverflow?(input: { turnId: string; failedModelRequestId: string }): Promise<CoordinateCompressionResult>;
 }
 
@@ -616,9 +621,17 @@ export class ReliableAgentLoop {
             facts = await this.readRoundFacts(turnId);
           }
           const toolDefinitions = await this.tools.definitions(turnId);
-          const settingsSnapshotContentObjectId = await this.modelProvider.freezeRequestSettings(
-            turnId, requireId(facts.authority.id, 'AuthoritySnapshot.id')
-          );
+          const recoveredCompression = await this.compressionCoordinator.readAutomaticCompressionContinuation?.({
+            turnId, ordinaryRequestId: expectedModelRequestId,
+            authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
+            headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id')
+          });
+          const settingsSnapshotContentObjectId = recoveredCompression
+            ? recoveredCompression.settingsSnapshotContentObjectId
+            : await this.modelProvider.freezeRequestSettings(turnId, requireId(facts.authority.id, 'AuthoritySnapshot.id'));
+          const recoveredRebase = recoveredCompression?.recoveryDecision
+            ? recoveredCompression.nativeRebase ?? planNativeCompressionRebase({ nativeEnabled: true, updates: [] })
+            : undefined;
           let frozenRecipe = await this.freezeOrdinaryRequestRecipe({
             settingsSnapshotContentObjectId,
             turnId,
@@ -626,7 +639,11 @@ export class ReliableAgentLoop {
             headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
             authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
             tools: toolDefinitions,
-            includeOpenTaskCompletionCheck
+            includeOpenTaskCompletionCheck,
+            ...(recoveredRebase ? { nativeRebase: {
+              cacheReset: recoveredRebase.cacheReset, forceFullReason: recoveredRebase.forceFullReason,
+              ...(recoveredRebase.freshConfigurationUpdate ? { freshConfigurationUpdate: recoveredRebase.freshConfigurationUpdate } : {})
+            } } : {})
           });
           let preview = await this.modelProvider.previewOrdinaryRequest({
             turnId,
@@ -644,26 +661,35 @@ export class ReliableAgentLoop {
           // Full-request tokenization is model-independent planning data. Compression admission is
           // level-triggered by the Provider-observed Context estimate; ordinary sending is never
           // rejected solely because this heuristic estimate is high.
-          const compression = await this.compressionCoordinator.coordinate({
-            turnId,
-            settingsSnapshotContentObjectId,
-            authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
-            headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
-            trigger: 'auto',
-            requestBudget: planningBudget,
-            protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
-            modelHandleCatalog: normalizeModelHandleCatalog(asRecord(frozenRecipe)?.modelHandleCatalog),
-            tools: toolDefinitions
-          });
-          if (compression.status === 'error') {
-            throw new ModelRequestPreflightError(
-              compression.code,
-              `${compression.code}: ${compression.message}`,
-              compression.estimatedTokens,
-              compression.limitTokens
+          let compression: CoordinateCompressionResult;
+          let compressionDecision = recoveredCompression?.recoveryDecision;
+          let capacityPasses = recoveredCompression?.committedCapacityPasses ?? 0;
+          let hadCapacityProgress = capacityPasses > 0;
+          for (;;) {
+            compression = await this.compressionCoordinator.coordinate({
+              turnId, ordinaryRequestId: expectedModelRequestId, settingsSnapshotContentObjectId,
+              authoritySnapshotId: requireId(facts.authority.id, 'AuthoritySnapshot.id'),
+              headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
+              trigger: 'auto', requestBudget: planningBudget,
+              protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
+              modelHandleCatalog: normalizeModelHandleCatalog(asRecord(frozenRecipe)?.modelHandleCatalog),
+              tools: toolDefinitions
+            });
+            if (compression.status === 'error') throw new ModelRequestPreflightError(
+              compression.code, `${compression.code}: ${compression.message}`, compression.estimatedTokens, compression.limitTokens
             );
-          }
-          if (compression.status === 'compressed') {
+            if ((compression.status === 'compressed' || compression.status === 'continued_uncompressed')
+              && compression.recoveryDecision) compressionDecision = compression.recoveryDecision;
+            if (compression.status !== 'compressed') break;
+            if (compression.capacityLimitedPrefix) {
+              const policy = frozenCompressionPolicy(preview.authoritySnapshot);
+              if (!policy || !isStrictSingleSummaryPlan(policy.executionPlan)) {
+                throw new Error('Capacity continuation requires the frozen strict single-summary policy.');
+              }
+              hadCapacityProgress = true;
+              if (++capacityPasses > 32) throw new ModelRequestPreflightError('compressed_context_too_large',
+                'Automatic compression exceeded its bounded continuation count.', capacityPasses, 32);
+            }
             facts = await this.readRoundFacts(turnId);
             // Delivery that became model-visible while Compact was running belongs after the
             // canonical output. It is absorbed only after the new head CAS has succeeded.
@@ -675,7 +701,7 @@ export class ReliableAgentLoop {
             const nativeRebasePlan = compression.nativeRebase
               ?? planNativeCompressionRebase({ nativeEnabled: true, updates: [] });
             frozenRecipe = await this.freezeOrdinaryRequestRecipe({
-            settingsSnapshotContentObjectId,
+              settingsSnapshotContentObjectId,
               turnId,
               round,
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
@@ -707,12 +733,19 @@ export class ReliableAgentLoop {
               throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
             }
             planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
+            if (await this.terminateIfRequested(turnId, `round:${round}:after-capacity-compression`)) {
+              return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+            }
+            if (!compression.capacityLimitedPrefix) break;
           }
-          if ((compression.status === 'compressed' || compression.status === 'continued_uncompressed')
-            && compression.recoveryDecision) {
+          if (hadCapacityProgress && planningBudget.estimatedFullInputTokens > planningBudget.planningInputCapacityTokens) {
+            throw new ModelRequestPreflightError('compressed_context_too_large',
+              'Automatic capacity recovery did not produce a fitting ordinary request.',
+              planningBudget.estimatedFullInputTokens, planningBudget.planningInputCapacityTokens);
+          }
+          if (compressionDecision) {
             frozenRecipe = normalizePlainJson({
-              ...(frozenRecipe as { [key: string]: PlainJsonValue }),
-              compressionDecision: compression.recoveryDecision
+              ...(frozenRecipe as { [key: string]: PlainJsonValue }), compressionDecision
             }, 'Request compression recovery decision');
           }
           if (readFrozenNativeCapabilities(requireRecord(frozenRecipe, 'Native request recipe'))) {

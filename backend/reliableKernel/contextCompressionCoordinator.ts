@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
-import { safeProviderFailureMessage, type CompressionAttemptFailure, type CompressionRecoveryDecision } from '../../shared/compressionExecution';
+import { planCompressionSummaryCalls } from '../capabilities/llmProvider';
+import { compactRequestForCompressionPlanning, estimateCompactProjection } from './llmCapabilityProviderAdapter';
+import { readCompressionPurpose, safeProviderFailureMessage, type CompressionAttemptFailure, type CompressionRecoveryDecision } from '../../shared/compressionExecution';
 export type { CompressionAttemptFailure } from '../../shared/compressionExecution';
 import type { MessageContent } from '../../shared/protocol';
-import type { CompressionExecutionAttempt } from '../../shared/modelCapabilities';
+import type { CompressionExecutionAttempt, CompressionExecutionPlan } from '../../shared/modelCapabilities';
 import {
   rebaseAttachmentCatalogState,
   selectAttachmentCatalogStateSegments,
@@ -18,7 +20,7 @@ import {
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { readConversationContextHandleCatalog } from './conversationChildHandles';
-import { expandTextCompressionSources } from './compressionSourceReplay';
+import { expandTextCompressionSources, prepareTextCompressionSources } from './compressionSourceReplay';
 import {
   ContextCompressionControlPlane,
   compressionBlockIdFor,
@@ -64,6 +66,7 @@ import {
   collectStoredNativeConfigurationUpdates,
   projectStoredModelFacingWindow,
   providerTokenCalibration,
+  preflightCompressionRequest,
   selectContinuousAtomicTail,
   UNCALIBRATED_PROVIDER_TOKENS,
   type AtomicContextGroup,
@@ -86,6 +89,7 @@ import {
   restoredProviderRequestFailure,
   modelRequestIdFor,
   type FullProviderContextItem,
+  type FullProviderRequest,
   type FullRequestProviderAdapter
 } from './modelProviderControlPlane';
 import { normalizePlainJson, type PlainJsonValue } from './plainJson';
@@ -98,6 +102,14 @@ import {
   SKILL_REATTACHMENT_TOTAL_TOKENS,
   planSkillReattachment
 } from './skillToolResultProjection';
+
+export interface AutomaticCompressionContinuation {
+  settingsSnapshotContentObjectId?: string;
+  previousModelRequestId?: string;
+  committedCapacityPasses: number;
+  recoveryDecision?: CompressionRecoveryDecision;
+  nativeRebase?: NativeCompressionRebasePlan;
+}
 
 export type CompressionTrigger = 'auto' | 'manual';
 export type CompressionTriggerReason = 'manual' | 'configured_threshold' | 'provider_context_overflow';
@@ -117,6 +129,8 @@ export interface CoordinateCompressionCommand {
   settingsSnapshotContentObjectId?: string;
   headRootId: string;
   trigger: CompressionTrigger;
+  /** Deterministic ordinary request identity whose automatic compression is being prepared. */
+  ordinaryRequestId?: string;
   /** Exact rejected ordinary request; forces one smaller, immutable recovery attempt for this frontier. */
   providerContextOverflowRequestId?: string;
   /** Exact frozen ordinary request planning budget. Required for automatic compression; optional for manual. */
@@ -176,6 +190,8 @@ export type CoordinateCompressionResult =
       modelRequestId: string;
       sourceRootId: string;
       sourceSegmentCount: number;
+      /** A bounded automatic prefix committed; re-preview this head before another cut or send. */
+      capacityLimitedPrefix?: true;
       providerContextOverflowRequestId?: string;
       diagnostics?: Array<'native_over_target' | 'fallback_used'>;
       attemptedMethods?: CompressionExecutionAttempt['methodKind'][];
@@ -588,6 +604,7 @@ export class ReliableContextCompressionCoordinator {
       throw new Error(`Compression attempt ${attempt.methodKind} is not part of the frozen execution plan.`);
     }
     const policy = { ...basePolicy, methodKind: attempt.methodKind };
+    const strictAutomaticSummary = trigger === 'auto' && isStrictSingleSummaryPlan(basePolicy.executionPlan);
     if (trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
       return { status: 'skipped', reason: 'manual_only' };
     }
@@ -718,10 +735,10 @@ export class ReliableContextCompressionCoordinator {
     }
     const effectiveSummaryMaxTokens = policy.methodKind === 'provider_native'
       ? undefined
-      : calculateEffectiveSummaryMaxTokens(
+      : Math.max(strictAutomaticSummary ? 1 : 0, calculateEffectiveSummaryMaxTokens(
           policy.config.llmSummary?.targetTokens,
           rooms.calibratedBodyTargetTokens
-        );
+        ));
     // Skills whose loads this compression removes are re-attached after its result. Re-attaching every
     // skill loaded anywhere in the window is the most any prefix can add, so the retained tail leaves
     // room for that beside the summary and the post-compression body still lands on its target.
@@ -790,7 +807,7 @@ export class ReliableContextCompressionCoordinator {
         pendingNativeSteeringInputs: nativeGuard.pendingSteeringInputs
       };
     }
-    const sourceSegmentCount = nativeGuard.status === 'protect'
+    let sourceSegmentCount = nativeGuard.status === 'protect'
       ? closeToolExchangeBoundary(materialized.records, nativeGuard.sourceSegmentCount)
       : plannedSourceSegmentCount;
     if (command.sourceReplay && sourceSegmentCount !== materialized.records.length) {
@@ -807,6 +824,98 @@ export class ReliableContextCompressionCoordinator {
         pendingNativeToolCalls: nativeGuardFacts.pendingToolCalls.length,
         pendingNativeSteeringInputs: nativeGuardFacts.pendingSteeringInputs
       };
+    }
+    const continuation = strictAutomaticSummary && command.ordinaryRequestId
+      ? await this.readAutomaticCompressionContinuation({ turnId, ordinaryRequestId: command.ordinaryRequestId,
+          authoritySnapshotId, headRootId }) : undefined;
+    if (continuation && continuation.settingsSnapshotContentObjectId !== settingsSnapshotContentObjectId) {
+      throw new Error('Automatic compression continuation changed its frozen settings.');
+    }
+    const desiredSourceSegmentCount = sourceSegmentCount;
+    let capacityLimitedPrefix = false;
+    let preparedCapacitySource: { sourceContext: FullProviderContextItem[]; expanded: FullProviderContextItem[] } | undefined;
+    if (strictAutomaticSummary
+      && command.compressSegmentCount === undefined && !command.sourceReplay
+      && !command.providerContextOverflowRequestId) {
+      // Search only immutable, closed prefixes of the already materialized window. Halving does
+      // not assume token estimates are monotone; every chosen prefix passes both real input gates.
+      const boundaries: number[] = [];
+      for (let count = 1; count <= desiredSourceSegmentCount; count += 1) {
+        if (materialized.records[count]?.segment.segment_kind !== 'tool_pair') boundaries.push(count);
+      }
+      const preparedContext: FullProviderContextItem[] = semanticMaterialized.segments
+        .slice(0, desiredSourceSegmentCount).map(segment => ({
+          segmentId: segment.segmentId, segmentKind: segment.segmentKind, messageRole: segment.messageRole,
+          ...(segment.modelSource ? { modelSource: segment.modelSource } : {}),
+          contentType: segment.contentObject.content_type, content: segment.content.toString('utf8')
+        }));
+      // Expand immutable native provenance once. Prefix offsets preserve each atomic source unit
+      // while every candidate reuses the same prepared bytes and the original replay limits.
+      const prepared = await prepareTextCompressionSources(this.database, this.contentStore,
+        frozen.conversationId, preparedContext);
+      const probe = async (count: number): Promise<Extract<CoordinateCompressionResult, { status: 'error' }> | undefined> => {
+        const selected = semanticMaterialized.segments.slice(0, count);
+        const attachmentState = selectAttachmentCatalogStateSegments(fullAttachmentCatalogState,
+          selected.map(segment => segment.segmentId));
+        const sourceContext = preparedContext.slice(0, count);
+        const expanded = prepared.items.slice(0, prepared.sourceEndOffsets[count - 1]);
+        const expandedCatalog = buildModelHandleCatalog(expanded.map(item => item.content), fullModelHandleCatalog);
+        const attachmentRefs = new Map(fullAttachmentHandles.entries.map(entry => [entry.target, entry.ref]));
+        const catalog = { ...expandedCatalog, entries: expandedCatalog.entries.filter(entry =>
+          entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
+        const observationProfile = attachmentState.catalog.length > 0
+          ? attachmentObservationAnalysisProfileSha256(policy.provider) : undefined;
+        const observationRequirements = observationProfile
+          ? await loadAttachmentObservationRequirements(this.database, this.contentStore,
+              attachmentState.catalog, fullAttachmentHandles, observationProfile) : [];
+        const recipe = normalizePlainJson({
+          kind: 'reliable-context-compression', compressionMethodKind: policy.methodKind,
+          compressionConfigId: policy.config.id, blockId: 'automatic-capacity-planning',
+          sourceRootId: headRootId, sourceSegmentCount: count, sourceHash: hashSource(materialized.records.slice(0, count)),
+          attachmentCatalogState: attachmentState, modelHandleCatalog: catalog,
+          ...(observationProfile ? { attachmentObservationProfileSha256: observationProfile,
+            attachmentObservationRequirements: observationRequirements } : {}),
+          effectiveSummaryMaxTokens: summaryTargetEstimatorTokens(effectiveSummaryMaxTokens!, calibration)
+        }, 'Automatic compression capacity preview');
+        const preview: FullProviderRequest = {
+          kind: 'full-model-request', modelRequestId: 'automatic-capacity-planning',
+          conversationId: frozen.conversationId, attemptSeq: '1', socketGeneration: '0',
+          providerId: policy.provider.providerConfigId, modelId: policy.provider.modelId,
+          authoritySnapshot: frozen.document, recipe, context: sourceContext,
+          compressionSourceContext: expanded, attachmentCatalogState: attachmentState
+        };
+        const compact = compactRequestForCompressionPlanning(preview);
+        const breakdown = estimateCompactProjection(compact);
+        const admission = preflightCompressionRequest({
+          contextWindowTokens: policy.provider.contextWindowTokens, maxOutputTokens: policy.provider.maxOutputTokens,
+          compressionThresholdTokens: policy.provider.contextWindowTokens, breakdown
+        });
+        if (admission.status !== 'ready') return compressionError(admission.code, admission.message,
+          admission.estimatedTokens, admission.limitTokens);
+        try {
+          planCompressionSummaryCalls(compact, { contextWindowTokens: policy.provider.contextWindowTokens });
+        } catch (error) {
+          const failure = error as { code?: unknown; estimatedTokens?: unknown; limitTokens?: unknown };
+          if (failure.code !== 'compression_request_too_large'
+            || typeof failure.estimatedTokens !== 'number' || typeof failure.limitTokens !== 'number') throw error;
+          return compressionError('compression_request_too_large',
+            'The exact summary writer input exceeds its frozen Provider capacity.',
+            failure.estimatedTokens, failure.limitTokens);
+        }
+        return undefined;
+      };
+      const selectedPrefix = await selectAutomaticCompressionPrefix(boundaries, probe);
+      if (selectedPrefix.status === 'error') return selectedPrefix;
+      sourceSegmentCount = selectedPrefix.sourceSegmentCount;
+      preparedCapacitySource = { sourceContext: preparedContext.slice(0, sourceSegmentCount),
+        expanded: prepared.items.slice(0, prepared.sourceEndOffsets[sourceSegmentCount - 1]) };
+      capacityLimitedPrefix = sourceSegmentCount < desiredSourceSegmentCount;
+      if (capacityLimitedPrefix && !command.ordinaryRequestId) return compressionError('compressed_context_too_large',
+        'Capacity-limited automatic compression requires a stable ordinary request identity.', desiredSourceSegmentCount, sourceSegmentCount);
+      if (capacityLimitedPrefix && (continuation?.committedCapacityPasses ?? 0) >= 32) {
+        return compressionError('compressed_context_too_large',
+          'Automatic compression reached its durable limit of 32 capacity-limited commits for this Turn.', 32, 32);
+      }
     }
     const sourceSegments = materialized.records.slice(0, sourceSegmentCount);
     const sourceAttachmentCatalogState = await this.attachmentCatalog.projectState(
@@ -836,7 +945,7 @@ export class ReliableContextCompressionCoordinator {
     // OpenAI configuration_update items are transport-only: they leave the compacted window while
     // the effective effort survives in the frozen rebase plan. Anthropic signed compaction blocks
     // do not use this OpenAI-specific rebase contract.
-    const nativeRebase = await this.planNativeRebase(turnId, semanticMaterialized, sourceSegmentCount);
+    const nativeRebase = await this.planNativeRebase(turnId, semanticMaterialized, sourceSegmentCount, continuation?.nativeRebase);
     const idempotencyKey = [
       'context-compression', trigger, headRootId, policy.config.id,
       attempt.methodKind, attempt.nativeKind ?? 'text',
@@ -857,7 +966,7 @@ export class ReliableContextCompressionCoordinator {
       // the identities of that exact source before creating the immutable Recipe, including objects
       // hidden behind an older summary or native state. Replaying an existing request keeps its own
       // original identity scope and never replaces its frozen Catalog with today's global state.
-      const sourceContext: FullProviderContextItem[] = semanticMaterialized.segments
+      const sourceContext: FullProviderContextItem[] = preparedCapacitySource?.sourceContext ?? semanticMaterialized.segments
         .slice(0, sourceSegmentCount).map(segment => ({
           segmentId: segment.segmentId,
           segmentKind: segment.segmentKind,
@@ -866,10 +975,10 @@ export class ReliableContextCompressionCoordinator {
           contentType: segment.contentObject.content_type,
           content: segment.content.toString('utf8')
         }));
-      const handleSource = policy.methodKind !== 'provider_native' || command.sourceReplay
+      const handleSource = preparedCapacitySource?.expanded ?? (policy.methodKind !== 'provider_native' || command.sourceReplay
         ? await expandTextCompressionSources(this.database, this.contentStore, frozen.conversationId,
             sourceContext, command.sourceReplay ? { sourceReplay: command.sourceReplay } : {})
-        : sourceContext;
+        : sourceContext);
       const expandedCatalog = buildModelHandleCatalog(handleSource.map(item => item.content), fullModelHandleCatalog);
       // F identities belong to ConversationAttachmentHandleRegistry. Source expansion can discover
       // their old metadata, but it cannot allocate another actionable attachment address here.
@@ -883,6 +992,7 @@ export class ReliableContextCompressionCoordinator {
       const created = await this.modelProvider.createModelRequest({
         turnId,
         contextRootId: headRootId,
+        ...(strictAutomaticSummary ? { expectedContextHeadRootId: headRootId } : {}),
         authoritySnapshotId,
         settingsSnapshotContentObjectId,
         recipe: normalizePlainJson({
@@ -898,6 +1008,13 @@ export class ReliableContextCompressionCoordinator {
           sourceRootId: headRootId,
           sourceSegmentCount,
           sourceHash,
+          ...(strictAutomaticSummary && command.ordinaryRequestId ? {
+            automaticCompressionContinuation: { ordinaryRequestId: command.ordinaryRequestId,
+              previousModelRequestId: continuation?.previousModelRequestId ?? null }
+          } : {}),
+          ...(capacityLimitedPrefix ? { automaticCapacityProgress: {
+            desiredSourceSegmentCount, selectedSourceSegmentCount: sourceSegmentCount
+          } } : {}),
           ...(command.sourceReplay ? { sourceReplay: command.sourceReplay } : {}),
           blockId: compressionBlockId,
           compressionConfigId: policy.config.id,
@@ -937,11 +1054,33 @@ export class ReliableContextCompressionCoordinator {
         policy.provider.modelId
       );
     }
+    const frozenCapacity = capacityLimitedPrefix
+      ? (await this.readRequestRecipe(request)).automaticCapacityProgress : undefined;
+    const capacityProofMatches = capacityLimitedPrefix && isRecord(frozenCapacity)
+      && frozenCapacity.desiredSourceSegmentCount === desiredSourceSegmentCount
+      && frozenCapacity.selectedSourceSegmentCount === sourceSegmentCount;
+    if (capacityLimitedPrefix && !capacityProofMatches) {
+      throw new Error('Frozen automatic compression capacity plan differs from its verified source cut.');
+    }
     if (request.status !== 'terminal') {
       const providerId = requireText(request.provider_id, 'ModelRequest.provider_id');
       const adapter = await this.providers.resolve(providerId);
       assertProviderAdapter(adapter, providerId);
       try {
+        if (strictAutomaticSummary) {
+          const current = await this.database.snapshot([
+            DOMAIN_REPOSITORIES.domain('Turn').get(turnId),
+            DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').list({ where: { conversation_id: frozen.conversationId }, limit: 1 }),
+            ...['interrupt_request', 'interrupt_current_turn', 'termination_request'].map(inputKind =>
+              DOMAIN_REPOSITORIES.domain('PendingTurnInput').list({ where: { turn_id: turnId, state: 'pending', input_kind: inputKind }, limit: 1 }))
+          ]);
+          const currentTurn = current.snapshot[0];
+          if (!currentTurn || Array.isArray(currentTurn) || currentTurn.status !== 'active'
+            || rows(current.snapshot[1])[0]?.root_id !== headRootId
+            || current.snapshot.slice(2).some(value => rows(value).length > 0)) {
+            throw new Error('Automatic compression source changed before Provider dispatch.');
+          }
+        }
         await this.modelProvider.dispatch(expectedModelRequestId, adapter, { reconnect: true });
       } catch (error) {
         if (error instanceof ModelRequestPreflightError) {
@@ -1052,7 +1191,17 @@ export class ReliableContextCompressionCoordinator {
       projectedTokens + irreducibleAddendaTokens,
       calibration
     );
-    if (projectedBodyTokens > rooms.calibratedPlanningBodyRoomTokens) {
+    const currentContextTokens = estimateMaterializedContextTokens(
+      semanticMaterialized.segments, fullAttachmentCatalogState, fullModelHandleCatalog
+    );
+    const contextSizeKnown = !hasUnsizedOpaqueCompaction(semanticMaterialized.segments);
+    const strictCapacityProgress = capacityProofMatches && contextSizeKnown
+      && !hasOpaqueProviderCompaction(summary) && projectedTokens < currentContextTokens;
+    if (capacityLimitedPrefix && !strictCapacityProgress) return compressionError(
+      'compressed_context_too_large', 'Automatic capacity-limited compression did not prove strict Context reduction.',
+      projectedTokens, currentContextTokens
+    );
+    if (projectedBodyTokens > rooms.calibratedPlanningBodyRoomTokens && !strictCapacityProgress) {
       if (nativeGuardFacts.pendingToolCalls.length > 0) {
         // The protected native tail cannot shrink until the in-flight calls settle; defer the
         // compression instead of failing the Turn on its frozen addenda.
@@ -1079,15 +1228,10 @@ export class ReliableContextCompressionCoordinator {
     // measures the Context alone, and with one it is Provider-counted, while fixed tokens here are
     // estimated. Under a small threshold the fixed overhead dominates both sides, so mixing units
     // skipped compressions that did shrink the Context.
-    const currentContextTokens = estimateMaterializedContextTokens(
-      semanticMaterialized.segments,
-      fullAttachmentCatalogState,
-      fullModelHandleCatalog
-    );
+
     // A ciphertext compaction nobody sized makes the "before" figure only a lower bound: every text
     // summary replacing it would look larger and the already paid summary would be discarded on
     // every attempt, so the comparison is skipped and no before figure is recorded.
-    const contextSizeKnown = !hasUnsizedOpaqueCompaction(semanticMaterialized.segments);
     if (
       trigger === 'auto'
       && (command.providerContextOverflowRequestId
@@ -1162,6 +1306,7 @@ export class ReliableContextCompressionCoordinator {
       modelRequestId: expectedModelRequestId,
       sourceRootId: headRootId,
       sourceSegmentCount,
+      ...(strictCapacityProgress ? { capacityLimitedPrefix: true as const } : {}),
       ...(command.providerContextOverflowRequestId ? { providerContextOverflowRequestId: command.providerContextOverflowRequestId } : {}),
       ...(policy.methodKind === 'provider_native'
         && calibrateEstimatorToProvider(projectedTokens, calibration) > rooms.calibratedBodyTargetTokens
@@ -1170,6 +1315,124 @@ export class ReliableContextCompressionCoordinator {
       ...(nativeRebase ? { nativeRebase } : {}),
       result: committed
     };
+  }
+
+  /** One indexed latest-row read, then at most 33 explicit predecessor identities; no history scan. */
+  public async readAutomaticCompressionContinuation(input: {
+    turnId: string; ordinaryRequestId: string; authoritySnapshotId: string; headRootId: string;
+  }): Promise<AutomaticCompressionContinuation | undefined> {
+    const latest = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ModelRequest').list({
+      where: { turn_id: input.turnId }, orderBy: { column: 'request_seq', direction: 'desc' }, limit: 1
+    })]);
+    let request = rows(latest.snapshot[0])[0];
+    if (!request) return undefined;
+    const turn = await this.requireDomain('Turn', input.turnId);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const result: AutomaticCompressionContinuation = { committedCapacityPasses: 0 };
+    let newerSourceRootId = input.headRootId;
+    let upperSequence: bigint | undefined;
+    const seen = new Set<string>();
+    for (let depth = 0; ; depth += 1) {
+      if (depth >= 33) throw new Error('Automatic compression continuation exceeds its bounded request chain.');
+      const recipe = await this.readRequestRecipe(request);
+      const chain = recipe.automaticCompressionContinuation;
+      if (!isRecord(chain) || chain.ordinaryRequestId !== input.ordinaryRequestId) {
+        if (depth === 0) return undefined;
+        throw new Error('Automatic compression predecessor belongs to another ordinary request.');
+      }
+      const requestId = requireId(request.id, 'ModelRequest.id');
+      const sequence = BigInt(String(request.request_seq));
+      if (seen.has(requestId) || upperSequence !== undefined && sequence >= upperSequence
+        || request.turn_id !== input.turnId || request.authority_snapshot_id !== input.authoritySnapshotId
+        || recipe.kind !== 'reliable-context-compression' || recipe.trigger !== 'auto'
+        || recipe.compressionMethodKind !== 'llm_summary') throw new Error('Invalid automatic compression continuation identity.');
+      seen.add(requestId); upperSequence = sequence;
+      const settings = typeof request.settings_snapshot_object_id === 'string' ? request.settings_snapshot_object_id : undefined;
+      if (depth === 0) {
+        result.settingsSnapshotContentObjectId = settings;
+        const frozen = await readRequestTurnAuthority(this.database, this.contentStore,
+          input.authoritySnapshotId, input.turnId, settings);
+        const plan = frozenCompressionPolicy(frozen.document)?.executionPlan;
+        if (!plan || !isStrictSingleSummaryPlan(plan)) return undefined;
+      } else if (result.settingsSnapshotContentObjectId !== settings) {
+        throw new Error('Automatic compression predecessor changed frozen settings.');
+      }
+      const sourceRootId = requireText(recipe.sourceRootId, 'Compression recipe sourceRootId');
+      const blockId = compressionBlockIdFor(conversationId, sourceRootId, requestId);
+      if (recipe.blockId !== blockId) throw new Error('Automatic compression has an invalid block identity.');
+      const block = await this.optionalDomain('CompressionBlock', blockId);
+      if (block) {
+        if (request.status !== 'terminal' || request.terminal_state !== 'completed'
+          || block.status !== 'enabled' || block.authority_snapshot_id !== input.authoritySnapshotId
+          || block.conversation_id !== conversationId) throw new Error('Automatic compression predecessor is not a committed enabled result.');
+        const projection = await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+          where: { owner_kind: 'compression_block', owner_id: blockId }, limit: 2
+        })]);
+        const sourceProjections = rows(projection.snapshot[0]);
+        if (sourceProjections.length !== 1 || sourceProjections[0].purpose !== 'compression-source'
+          || sourceProjections[0].root_id !== sourceRootId) throw new Error('Automatic compression source projection differs.');
+        const resultRootId = compressionRootIdFor(blockId, sourceRootId);
+        await this.assertAutomaticContinuationAppend(newerSourceRootId, resultRootId, conversationId);
+        newerSourceRootId = sourceRootId;
+        if (!result.previousModelRequestId) {
+          result.previousModelRequestId = requestId;
+          const purpose = readCompressionPurpose(recipe.compressionPurpose);
+          result.recoveryDecision = {
+            groupId: requireText(purpose.groupId, 'Compression purpose groupId'), outcome: 'compressed',
+            methodKind: 'llm_summary', failures: purpose.priorFailures
+          };
+          if (recipe.nativeRebase !== undefined) {
+            const rebase = requireRecord(recipe.nativeRebase, 'Compression native rebase');
+            if (rebase.kind !== 'native_full_rebase' || rebase.forceFullReason !== 'compression' || rebase.cacheReset !== true
+              || typeof rebase.droppedConfigurationUpdates !== 'number') throw new Error('Invalid frozen compression rebase.');
+            result.nativeRebase = rebase as unknown as NativeCompressionRebasePlan;
+          }
+        }
+        const progress = recipe.automaticCapacityProgress;
+        if (progress !== undefined) {
+          if (!isRecord(progress) || progress.selectedSourceSegmentCount !== recipe.sourceSegmentCount
+            || typeof progress.desiredSourceSegmentCount !== 'number' || typeof progress.selectedSourceSegmentCount !== 'number'
+            || progress.selectedSourceSegmentCount <= 0 || progress.desiredSourceSegmentCount <= progress.selectedSourceSegmentCount) {
+            throw new Error('Invalid frozen automatic capacity progress.');
+          }
+          result.committedCapacityPasses += 1;
+        }
+      } else if (depth !== 0 || sourceRootId !== input.headRootId) {
+        throw new Error('Uncommitted automatic compression does not match the current frozen head.');
+      }
+      if (chain.previousModelRequestId === null) return result;
+      request = await this.requireDomain('ModelRequest', requireText(chain.previousModelRequestId, 'Compression predecessor'));
+    }
+  }
+
+  private async assertAutomaticContinuationAppend(currentRootId: string, baseRootId: string, conversationId: string): Promise<void> {
+    if (currentRootId === baseRootId) return;
+    const current = await this.requireDomain('ContextSequenceRoot', currentRootId);
+    const base = await this.requireDomain('ContextSequenceRoot', baseRootId);
+    const added = Number(current.tail_segment_count) - Number(base.tail_segment_count);
+    if (current.conversation_id !== conversationId || base.conversation_id !== conversationId
+      || current.root_node_id !== base.root_node_id || !Number.isSafeInteger(added) || added < 0
+      || Number(current.segment_count) - Number(base.segment_count) !== added) {
+      throw new Error('Automatic compression continuation does not preserve its committed source frontier.');
+    }
+    let nodeId = current.tail_node_id; const addedNodeIds: string[] = [];
+    // At most 32 individual point reads. Larger delivery appends use one existing worker-side
+    // structural materialization, never one IPC request per appended message or any CAS bodies.
+    if (added > 32) {
+      const materialized = await this.context.materializeStructure(currentRootId);
+      if (materialized.records.length !== Number(current.segment_count)) throw new Error('Context append structure changed.');
+      for (const record of materialized.records.slice(-added).reverse()) {
+        if (record.node.id !== nodeId) throw new Error('Context append node order differs.');
+        addedNodeIds.push(requireId(record.node.id, 'ContextSequenceNode.id')); nodeId = record.node.parent_node_id;
+      }
+    } else for (let index = 0; index < added; index += 1) {
+      const node = await this.requireDomain('ContextSequenceNode', requireId(nodeId, 'Appended Context node'));
+      addedNodeIds.push(requireId(node.id, 'ContextSequenceNode.id')); nodeId = node.parent_node_id;
+    }
+    if (nodeId !== base.tail_node_id) throw new Error('Automatic compression continuation changed the retained suffix.');
+    let expectedRootId = baseRootId;
+    for (const addedNodeId of addedNodeIds.reverse()) expectedRootId = contextAppendRootId(conversationId, expectedRootId, addedNodeId);
+    if (currentRootId !== expectedRootId) throw new Error('Automatic compression continuation is not the exact append descendant.');
   }
 
   /** Backend entry for the command router; all root/authority facts are resolved server-side. */
@@ -1239,7 +1502,8 @@ export class ReliableContextCompressionCoordinator {
   private async planNativeRebase(
     turnId: string,
     semanticMaterialized: MaterializedContext,
-    sourceSegmentCount: number
+    sourceSegmentCount: number,
+    continuationRebase?: NativeCompressionRebasePlan
   ): Promise<NativeCompressionRebasePlan | undefined> {
     const updates = collectStoredNativeConfigurationUpdates(storedContextItems(
       semanticMaterialized.segments.slice(0, sourceSegmentCount)
@@ -1248,13 +1512,14 @@ export class ReliableContextCompressionCoordinator {
       semanticMaterialized.segments.slice(sourceSegmentCount)
     ));
     const frozenNativeReasoning = await this.readLatestFrozenNativeReasoning(turnId);
+    // A previous cut may have removed every update and pushed the ordinary recipe beyond the
+    // bounded lookback. Its verified same-request continuation still owns that frozen effort.
+    const effectiveEffort = continuationRebase?.effectiveReasoning?.effort ?? frozenNativeReasoning?.effectiveEffort;
     return planNativeCompressionRebase({
-      nativeEnabled: frozenNativeReasoning !== undefined || updates.length > 0 || retainedUpdates.length > 0,
+      nativeEnabled: continuationRebase !== undefined || frozenNativeReasoning !== undefined || updates.length > 0 || retainedUpdates.length > 0,
       updates,
       retainedUpdates,
-      ...(frozenNativeReasoning?.effectiveEffort === undefined
-        ? {}
-        : { frozenEffectiveEffort: frozenNativeReasoning.effectiveEffort })
+      ...(effectiveEffort === undefined ? {} : { frozenEffectiveEffort: effectiveEffort })
     });
   }
 
@@ -1747,6 +2012,36 @@ function requireNonNegativeTokenCount(value: number, label: string): number {
     throw new RangeError(`${label} must be a non-negative safe integer.`);
   }
   return value;
+}
+
+/** A second same-kind/model attempt is a fallback too. Only the frozen explicit strict policy qualifies. */
+export function isStrictSingleSummaryPlan(plan: CompressionExecutionPlan): boolean {
+  return plan.strategy === 'llm_summary' && plan.attempts.length === 1
+    && plan.attempts[0]?.methodKind === 'llm_summary' && plan.continueUncompressedIfFits === false;
+}
+
+/** Closed boundaries are supplied by the structural planner; no monotonic token assumption. */
+export async function selectAutomaticCompressionPrefix(
+  boundaries: readonly number[],
+  probe: (count: number) => Promise<Extract<CoordinateCompressionResult, { status: 'error' }> | undefined>
+): Promise<{ status: 'ready'; sourceSegmentCount: number } | Extract<CoordinateCompressionResult, { status: 'error' }>> {
+  if (boundaries.some((value, index) => !Number.isSafeInteger(value) || value <= (boundaries[index - 1] ?? 0))) {
+    throw new TypeError('Automatic compression requires strictly increasing positive closed boundaries.');
+  }
+  let index = boundaries.length - 1;
+  for (let probes = 0; ; probes += 1) {
+    if (index < 0 || probes >= 24) return compressionError('compression_request_too_large',
+      'Automatic compression exhausted its bounded legal-prefix search.', boundaries.length, 24);
+    const candidate = boundaries[index];
+    const failure = await probe(candidate);
+    if (!failure) return { status: 'ready', sourceSegmentCount: candidate };
+    if (failure.code !== 'compression_request_too_large' || index === 0) return failure;
+    index = Math.floor((index - 1) / 2);
+  }
+}
+
+function isRecord(value: unknown): value is { [key: string]: PlainJsonValue } {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {
