@@ -108,6 +108,8 @@ const HANDLE_PREFIX: Record<ModelHandleKind, string> = {
   boardPost: 'B'
 };
 
+const compareModelHandleRefs = new Intl.Collator(undefined, { numeric: true }).compare;
+
 const HANDLE_PATTERN = /^(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*$/;
 const HANDLE_TOKEN_PATTERN = /\b(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*\b/g;
 const WORK_ENVIRONMENT_PATTERN = /\bwork-env-[a-zA-Z0-9._-]+\b/g;
@@ -386,7 +388,7 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
     counters.set(entry.kind, ordinal);
     entries.push({ ...entry, ref: `${HANDLE_PREFIX[entry.kind]}${ordinal}` });
   }
-  entries.sort((left, right) => left.ref.localeCompare(right.ref, undefined, { numeric: true }));
+  entries.sort((left, right) => compareModelHandleRefs(left.ref, right.ref));
   return currentModelHandleCatalog(entries, [...retired]);
 }
 
@@ -409,7 +411,7 @@ function compareHandleText(left: string, right: string): number {
 
 function currentModelHandleCatalog(entries: ModelHandleEntry[], retiredRefs: string[]): ModelHandleCatalog {
   return { entries, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
-    retiredRefs: [...retiredRefs].sort((left, right) => left.localeCompare(right, undefined, { numeric: true })) };
+    retiredRefs: [...retiredRefs].sort(compareModelHandleRefs) };
 }
 
 function requireSafeHandleOrdinal(ref: string): void {
