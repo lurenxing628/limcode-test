@@ -1,3 +1,4 @@
+import { AttachmentProjectionScopeCache, readAttachmentScopeSnapshot } from './attachmentProjectionScopeCache';
 import { readAttachmentProjectionSegments, readAttachmentProjectionLinks } from './attachmentProjectionSnapshot';
 import { executeContextSequenceNodeBatch } from './contextSequenceNodeBatch';
 import { createHash } from 'node:crypto';
@@ -258,6 +259,7 @@ async function start(): Promise<void> {
   /** The open maintenance transaction of a maintenance instance (see DatabaseWorkerData.maintenance). */
   let maintenance: MaintenanceTransaction | undefined;
   const contextCasCache = new VerifiedContextCasCache();
+  const attachmentScopeCache = new AttachmentProjectionScopeCache();
   const conversationRuntimeWork = createConversationRuntimeWorkProbe(reader);
 
   post({ type: 'ready', workerThreadId: threadId, mode: data.mode });
@@ -280,6 +282,8 @@ async function start(): Promise<void> {
       if (request.kind.startsWith('maintenance') && data.maintenance !== true) {
         throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
       }
+      // Maintenance/raw repair never shares reusable read proofs, including rollback paths.
+      if (request.kind.startsWith('maintenance')) attachmentScopeCache.clear();
       if (request.kind === 'maintenanceRepairHistory') {
         assertDatabaseBinding(writer, data.binding);
         const result = committedDurably(writer, () => repairHistoryTransaction(writer, request.input));
@@ -296,7 +300,7 @@ async function start(): Promise<void> {
       if (request.kind === 'maintenanceAppend') {
         const open = requireMaintenanceTransaction(maintenance);
         try {
-          appendMaintenanceSteps(writer, open, request.steps);
+          appendMaintenanceSteps(writer, open, request.steps, attachmentScopeCache);
         } catch (error) {
           // One source, one transaction: a failed chunk ends all of it.
           maintenance = undefined;
@@ -333,7 +337,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'renewExecutionLease') {
         assertDatabaseBinding(writer, data.binding);
-        const result = executeExecutionLeaseRenewal(writer, request.input, commitSeq + 1n);
+        const result = executeExecutionLeaseRenewal(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
@@ -344,8 +348,8 @@ async function start(): Promise<void> {
       if (request.kind === 'transaction') {
         assertDatabaseBinding(writer, data.binding);
         const result = request.durable
-          ? committedDurably(writer, () => executeTransaction(writer, request.steps, commitSeq + 1n))
-          : executeTransaction(writer, request.steps, commitSeq + 1n);
+          ? committedDurably(writer, () => executeTransaction(writer, request.steps, commitSeq + 1n, attachmentScopeCache))
+          : executeTransaction(writer, request.steps, commitSeq + 1n, attachmentScopeCache);
         commitSeq += 1n;
         post({ type: 'commit', result });
         // Only a reference: the host answers with the commit message's result (cloned once).
@@ -359,10 +363,13 @@ async function start(): Promise<void> {
         return;
       }
       if (request.kind === 'attachmentProjectionSegments' || request.kind === 'attachmentProjectionLinks') {
-        assertDatabaseBinding(reader, data.binding);
-        const snapshot = reader.transaction(() => request.kind === 'attachmentProjectionSegments'
-          ? readAttachmentProjectionSegments(reader, request.conversationId, request.segmentIds)
-          : readAttachmentProjectionLinks(reader, request.revisionIds))();
+        const read = (cache?: AttachmentProjectionScopeCache) => request.kind === 'attachmentProjectionSegments'
+          ? readAttachmentProjectionSegments(reader, request.conversationId, request.segmentIds, cache)
+          : readAttachmentProjectionLinks(reader, request.revisionIds);
+        const snapshot = request.kind === 'attachmentProjectionSegments' && data.maintenance !== true
+          ? readAttachmentScopeSnapshot(reader, writer, attachmentScopeCache,
+            () => assertDatabaseBinding(reader, data.binding), read)
+          : reader.transaction(() => { assertDatabaseBinding(reader, data.binding); return read(); })();
         respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
       }
@@ -445,7 +452,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'modelStreamEvent') {
         assertDatabaseBinding(writer, data.binding);
-        const result = executeModelStreamEvent(writer, request.input, commitSeq + 1n);
+        const result = executeModelStreamEvent(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
@@ -455,7 +462,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'modelStreamActivity') {
         assertDatabaseBinding(writer, data.binding);
-        const result = executeModelStreamActivity(writer, request.input, commitSeq + 1n);
+        const result = executeModelStreamActivity(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
@@ -465,7 +472,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'cancelCurrentModelRequest') {
         assertDatabaseBinding(writer, data.binding);
-        const result = executeCancelCurrentModelRequest(writer, request.input, commitSeq + 1n);
+        const result = executeCancelCurrentModelRequest(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
@@ -562,6 +569,7 @@ async function start(): Promise<void> {
           currentCommitSeq: commitSeq.toString(),
           durableCommitCount,
           contextCasCache: contextCasCache.inspect(),
+          attachmentScopeCache: attachmentScopeCache.inspect(),
           statementCache: {
             writer: writerStatements.inspect(),
             reader: readerStatements.inspect()
@@ -577,6 +585,7 @@ async function start(): Promise<void> {
       }
       closed = true;
       requestQueue.close();
+      attachmentScopeCache.clear();
       detachRuntimeStatementCache(reader);
       detachRuntimeStatementCache(writer);
       reader.close();
@@ -863,7 +872,8 @@ function synchronousLevel(database: Database.Database): bigint {
 function executeTransaction(
   database: Database.Database,
   steps: RepositoryTransactionStep[],
-  nextCommitSeq: bigint
+  nextCommitSeq: bigint,
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): RuntimeCommitResult {
   if (!Array.isArray(steps) || steps.length === 0) throw new Error('Runtime transaction requires at least one Repository step.');
   const allocatedSequences: RuntimeAllocatedSequence[] = [];
@@ -872,7 +882,7 @@ function executeTransaction(
 
   try {
     database.exec('DELETE FROM temp.runtime_transaction_change');
-    executeSteps(database, steps, allocatedSequences);
+    executeSteps(database, steps, allocatedSequences, attachmentScopeCache);
     assertTouchedRuntimeAggregates(database, steps);
     changes = readTransactionChanges(database);
     commitMeasuredWrite(database);
@@ -887,7 +897,8 @@ function executeTransaction(
 function executeExecutionLeaseRenewal(
   database: Database.Database,
   input: ExecutionLeaseRenewalInput,
-  nextCommitSeq: bigint
+  nextCommitSeq: bigint,
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): { renewal: ExecutionLeaseRenewalResult; commit?: RuntimeCommitResult } {
   beginMeasuredWrite(database);
   try {
@@ -911,7 +922,7 @@ function executeExecutionLeaseRenewal(
     const steps = [DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
       expires_at: renewal.renewedExpiresAt
     })];
-    executeSteps(database, steps, allocatedSequences);
+    executeSteps(database, steps, allocatedSequences, attachmentScopeCache);
     assertTouchedRuntimeAggregates(database, steps);
     const changes = readTransactionChanges(database);
     commitMeasuredWrite(database);
@@ -1005,12 +1016,13 @@ function beginMaintenanceTransaction(database: Database.Database): MaintenanceTr
 function appendMaintenanceSteps(
   database: Database.Database,
   open: MaintenanceTransaction,
-  steps: RepositoryTransactionStep[]
+  steps: RepositoryTransactionStep[],
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): void {
   if (!Array.isArray(steps) || steps.length === 0) throw new Error('A maintenance append requires at least one Repository step.');
   const allocated: RuntimeAllocatedSequence[] = [];
   HISTORICAL_COPIES.set(allocated, open.historicalCopies);
-  executeSteps(database, steps, allocated);
+  executeSteps(database, steps, allocated, attachmentScopeCache);
   assertTouchedRuntimeAggregates(database, steps, open.touched);
   database.exec('DELETE FROM temp.runtime_transaction_change');
   open.allocatedSequences += allocated.length;
@@ -1059,7 +1071,8 @@ function checkpointWal(database: Database.Database, mode: 'PASSIVE' | 'TRUNCATE'
 function executeModelStreamEvent(
   database: Database.Database,
   input: ModelStreamEventCommitInput,
-  nextCommitSeq: bigint
+  nextCommitSeq: bigint,
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): ModelStreamEventCommitResult {
   const modelRequestId = requireRuntimeId(input.modelRequestId);
   const checkpointId = requireRuntimeId(input.checkpointId);
@@ -1161,7 +1174,7 @@ function executeModelStreamEvent(
       metadata: input.contentObject as ContentObjectMetadata,
       ...(input.contentInsert ? { insert: input.contentInsert } : {})
     }], 'model_stream_content');
-    executeSteps(database, contentSteps, []);
+    executeSteps(database, contentSteps, [], attachmentScopeCache);
     insertStreamFact(database, 'ModelStreamCheckpoint', {
       id: checkpointId,
       model_request_id: modelRequestId,
@@ -1212,7 +1225,7 @@ function executeModelStreamEvent(
           stream_stats_json: input.terminalStats,
           updated_at: input.now
         })
-      ], []);
+      ], [], attachmentScopeCache);
       executeSteps(database, [
         DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').pruneAfterTerminalFence(
           modelRequestId,
@@ -1220,7 +1233,7 @@ function executeModelStreamEvent(
           socketGeneration,
           checkpointId
         )
-      ], []);
+      ], [], attachmentScopeCache);
       assertModelRequestAggregate(database, modelRequestId);
     } else {
       if (input.terminalFenceId !== null || input.terminalStats !== null || input.usage !== null) {
@@ -1249,7 +1262,8 @@ function executeModelStreamEvent(
 function executeModelStreamActivity(
   database: Database.Database,
   input: ModelStreamActivityInput,
-  nextCommitSeq: bigint
+  nextCommitSeq: bigint,
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): ModelStreamActivityResult {
   const modelRequestId = requireRuntimeId(input.modelRequestId);
   const attemptSeq = requirePositiveInteger(input.attemptSeq, 'ModelStreamActivity.attemptSeq');
@@ -1304,7 +1318,7 @@ function executeModelStreamActivity(
         },
         updated_at: input.now
       })
-    ], []);
+    ], [], attachmentScopeCache);
     const changes = readTransactionChanges(database);
     commitMeasuredWrite(database);
     return {
@@ -1321,7 +1335,8 @@ function executeModelStreamActivity(
 function executeCancelCurrentModelRequest(
   database: Database.Database,
   input: ModelRequestCancelInput,
-  nextCommitSeq: bigint
+  nextCommitSeq: bigint,
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): ModelRequestCancelResult {
   const modelRequestId = requireRuntimeId(input.modelRequestId);
   if (typeof input.terminalState !== 'string' || input.terminalState.length === 0) {
@@ -1371,7 +1386,7 @@ function executeCancelCurrentModelRequest(
       DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
         status: 'terminal', terminal_state: input.terminalState, updated_at: input.now
       })
-    ], []);
+    ], [], attachmentScopeCache);
     assertModelRequestAggregate(database, modelRequestId);
     const changes = readTransactionChanges(database);
     commitMeasuredWrite(database);
@@ -1425,7 +1440,8 @@ function requirePositiveInteger(value: unknown, label: string): bigint {
 function executeSteps(
   database: Database.Database,
   steps: RepositoryTransactionStep[],
-  allocatedSequences: RuntimeAllocatedSequence[]
+  allocatedSequences: RuntimeAllocatedSequence[],
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): void {
   for (const step of steps) {
     if (step.kind === 'ensureContextSequenceNodes') {
@@ -1457,7 +1473,7 @@ function executeSteps(
       continue;
     }
     if (step.kind !== 'savepoint') {
-      executeMutation(database, step, allocatedSequences);
+      executeMutation(database, step, allocatedSequences, attachmentScopeCache);
       continue;
     }
     if (!/^[a-z][a-z0-9_]{0,63}$/.test(step.name)) throw new Error(`Invalid savepoint name: ${step.name}`);
@@ -1466,7 +1482,7 @@ function executeSteps(
     const historicalCount = historicalCopiesOf(allocatedSequences).mark();
     database.exec(`SAVEPOINT ${marker}`);
     try {
-      executeSteps(database, step.steps, allocatedSequences);
+      executeSteps(database, step.steps, allocatedSequences, attachmentScopeCache);
       database.exec(`RELEASE SAVEPOINT ${marker}`);
     } catch (error) {
       database.exec(`ROLLBACK TO SAVEPOINT ${marker}`);
@@ -1750,7 +1766,8 @@ function executeAssertNone(database: Database.Database, domain: string, where: D
 function executeMutation(
   database: Database.Database,
   mutation: RepositoryMutation,
-  allocatedSequences: RuntimeAllocatedSequence[]
+  allocatedSequences: RuntimeAllocatedSequence[],
+  attachmentScopeCache: AttachmentProjectionScopeCache
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(mutation.domain);
   const schema = repository.schema;
@@ -1761,6 +1778,9 @@ function executeMutation(
     throw new Error(`${schema.repository} does not allow ${mutationKind}.`);
   }
 
+  // Removing proofs before SQL is safe even when the transaction/savepoint rolls back.
+  // Inserts use their final encoded segment identity below.
+  if (mutation.kind !== 'insert') attachmentScopeCache.beforeMutation(mutation);
   if (mutation.kind === 'pruneModelStreamCheckpoints') {
     executeCheckpointPrune(database, mutation);
   } else if (mutation.kind === 'insert') {
@@ -1837,6 +1857,7 @@ function executeMutation(
       }
     }
     const encoded = repository.codec.encodeInsert(row);
+    attachmentScopeCache.beforeMutation(mutation, encoded);
     const id = requireEncodedId(encoded.id, schema.codec);
     if (mutation.allocateSequence) {
       const value = encoded[mutation.allocateSequence.column];
@@ -1933,6 +1954,8 @@ function assertPreparedContentInsert(
   }
 }
 
+// Raw fixed writes below touch only stream facts, never source-scope owners. Any new raw
+// source/owner writer must invalidate attachment scope proofs before changing those rows.
 function insertStreamFact(
   database: Database.Database,
   domain: 'ModelStreamCheckpoint' | 'ModelStreamFence',

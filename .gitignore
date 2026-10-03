@@ -270,3 +270,5 @@ docs/architecture/*
 
 !tests/reliable-kernel/child-initial-lease.test.mjs
 !tests/reliable-kernel/history-preparation-admission.test.mjs
+
+!/tests/reliable-kernel/attachment-source-scope-cache.test.mjs

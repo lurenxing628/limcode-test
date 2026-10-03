@@ -1,3 +1,4 @@
+import type { AttachmentScopeCacheCounters } from './attachmentProjectionScopeCache';
 import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
 import type { RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type {
@@ -419,6 +420,8 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
     misses: number;
     evictions: number;
   };
+  /** Worker-local complete source-scope proofs; bounded metadata only. */
+  attachmentScopeCache: AttachmentScopeCacheCounters;
   /** Bounded prepared-statement LRU of each worker connection; counters only, never SQL text. */
   statementCache: {
     writer: RuntimeStatementCacheCounters;

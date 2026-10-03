@@ -16,6 +16,15 @@ export function attachmentSourceBelongsToConversation(
   conversationId: string,
   owner: AttachmentSourceOwnerEvidence
 ): boolean {
+  const scope = attachmentSourceOwnerScope(source, owner);
+  return scope === null || scope === conversationId;
+}
+
+/** null is shared; undefined is an incomplete/deleted alias, never a reusable negative proof. */
+export function attachmentSourceOwnerScope(
+  source: DomainRow,
+  owner: AttachmentSourceOwnerEvidence
+): string | null | undefined {
   const kind = attachmentProjectionId(source.source_kind, 'ContextSegmentSource.source_kind');
   const sourceId = attachmentProjectionId(source.source_id, 'ContextSegmentSource.source_id');
   if (kind === 'message_revision') {
@@ -23,20 +32,24 @@ export function attachmentSourceBelongsToConversation(
     const messageId = attachmentProjectionId(owner.messageRevision.message_id, `MessageRevision ${sourceId}.message_id`);
     if (!owner.memberships) throw new Error(`MessagePartOfConversation cache was not primed for ${messageId}.`);
     if (owner.memberships.length > 1) throw new Error(`Message ${messageId} belongs to multiple Conversations.`);
-    return owner.memberships.length === 1 && owner.memberships[0].conversation_id === conversationId;
+    return owner.memberships.length === 1 ? ownerConversation(owner.memberships[0].conversation_id) : undefined;
   }
   if (kind === 'tool_model_result') {
-    if (!owner.toolResult) return false;
+    if (!owner.toolResult) return undefined;
     attachmentProjectionId(owner.toolResult.tool_call_id, `ToolModelResult ${sourceId}.tool_call_id`);
   }
   if (kind === 'tool_call' || kind === 'tool_model_result') {
-    if (!owner.toolCall) return false;
+    if (!owner.toolCall) return undefined;
     attachmentProjectionId(owner.toolCall.turn_id, `ToolCall ${owner.toolCall.id}.turn_id`);
-    return owner.turn?.conversation_id === conversationId;
+    return ownerConversation(owner.turn?.conversation_id);
   }
-  if (kind === 'compression_block') return owner.compressionBlock?.conversation_id === conversationId;
+  if (kind === 'compression_block') return ownerConversation(owner.compressionBlock?.conversation_id);
   // Shared system/runtime sources and unknown kinds reach the structural validator unchanged.
-  return true;
+  return null;
+}
+
+function ownerConversation(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined;
 }
 
 export function compareAttachmentSegmentSource(left: DomainRow, right: DomainRow): number {

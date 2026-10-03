@@ -43,6 +43,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/openAIResponsesWebSocketNative.test.cjs',
   'tests/processSpoolCleanup.test.cjs',
   'tests/reliable-kernel/attachment-catalog-projection.test.mjs',
+  'tests/reliable-kernel/attachment-source-scope-cache.test.mjs',
   'tests/reliable-kernel/compression-block-projection.test.mjs',
   'tests/reliable-kernel/attachment-ingest-boundary.test.mjs',
   'tests/reliable-kernel/canonical-base64.test.mjs',

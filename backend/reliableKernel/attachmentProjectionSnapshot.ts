@@ -1,10 +1,11 @@
 import type Database from 'better-sqlite3';
+import { type AttachmentProjectionScopeCache, type AttachmentScopeCandidate } from './attachmentProjectionScopeCache';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { prepareCached } from './runtimeStatementCache';
 import { quote } from './runtimeSqlRows';
 import {
   attachmentProjectionId,
-  attachmentSourceBelongsToConversation,
+  attachmentSourceOwnerScope,
   compareAttachmentSegmentSource,
   type AttachmentSourceOwnerEvidence
 } from './attachmentProjectionEvidence';
@@ -33,7 +34,7 @@ const JOINS = [
   ['call', 'ToolCall'], ['turn_owner', 'Turn'], ['block', 'CompressionBlock']
 ] as const;
 
-const SOURCE_SQL = `SELECT ${JOINS.map(([alias, domain]) => columns(alias, domain)).join(', ')}
+const SOURCE_JOIN_SQL = `SELECT ${JOINS.map(([alias, domain]) => columns(alias, domain)).join(', ')}
   FROM context_segment_source AS source
   LEFT JOIN message_revision AS revision ON source.source_kind = 'message_revision' AND revision.id = source.source_id
   LEFT JOIN message_part_of_conversation AS membership ON membership.message_id = revision.message_id
@@ -41,8 +42,9 @@ const SOURCE_SQL = `SELECT ${JOINS.map(([alias, domain]) => columns(alias, domai
   LEFT JOIN tool_call AS call ON call.id = CASE source.source_kind
     WHEN 'tool_call' THEN source.source_id WHEN 'tool_model_result' THEN result.tool_call_id ELSE NULL END
   LEFT JOIN turn AS turn_owner ON turn_owner.id = call.turn_id
-  LEFT JOIN compression_block AS block ON source.source_kind = 'compression_block' AND block.id = source.source_id
-  WHERE source.segment_id IN (SELECT value FROM json_each(@ids))`;
+  LEFT JOIN compression_block AS block ON source.source_kind = 'compression_block' AND block.id = source.source_id`;
+const SOURCE_SQL = `${SOURCE_JOIN_SQL} WHERE source.segment_id IN (SELECT value FROM json_each(@ids))`;
+const SOURCE_PK_SQL = `${SOURCE_JOIN_SQL} WHERE source.id IN (SELECT value FROM json_each(@ids))`;
 
 const LINKS_SQL = `SELECT ${columns('link', 'AttachmentLink')}, ${columns('attachment', 'Attachment')}
   FROM attachment_link AS link
@@ -50,18 +52,19 @@ const LINKS_SQL = `SELECT ${columns('link', 'AttachmentLink')}, ${columns('attac
   WHERE link.message_revision_id IN (SELECT value FROM json_each(@ids))`;
 
 /**
- * The caller holds a fenced SQLite read transaction. Selectors are bounded, foreign owner rows are
- * decoded and checked in the worker, and only this Conversation's evidence crosses the worker
- * boundary. iterate() consumes the COMPLETE source set, including aliases beyond any page limit;
- * there is no source-count validity limit, conversation-only SQL filter, or cross-call cache.
+ * The caller holds a fenced SQLite read transaction. A miss consumes and validates the COMPLETE
+ * source set, including foreign aliases beyond any page limit. A worker-owned certificate may
+ * reuse only that complete scope proof; selected rows and all attachment relationships stay fresh.
  */
 export function readAttachmentProjectionSegments(
   database: Database.Database,
   conversationIdInput: string,
-  segmentIdsInput: readonly string[]
+  segmentIdsInput: readonly string[],
+  cache?: AttachmentProjectionScopeCache
 ): AttachmentProjectionSegmentSnapshot {
   const conversationId = attachmentProjectionId(conversationIdInput, 'conversationId');
   const ids = selectors(segmentIdsInput, 64, 'segmentIds');
+  const segmentIds = JSON.parse(ids) as string[];
   const snapshot: AttachmentProjectionSegmentSnapshot = {
     segments: [], sources: [], messageRevisions: [], memberships: [], toolResults: [], toolCalls: [],
     turns: [], compressionBlocks: [], examinedSourceCount: 0
@@ -69,59 +72,107 @@ export function readAttachmentProjectionSegments(
   const segments = prepareCached(database,
     'SELECT * FROM context_segment WHERE id IN (SELECT value FROM json_each(@ids))').iterate({ ids });
   for (const row of segments) snapshot.segments.push(DOMAIN_REPOSITORIES.domain('ContextSegment').codec.decode(row as DomainRow));
-  const bySegment = new Map<string, DomainRow[]>();
+  const existingSegments = new Set(snapshot.segments.map(row => String(row.id)));
+  const bySegment = new Map<string, DomainRow[]>(segmentIds.map(id => [id, []]));
   const selected = new Set<DomainRow>();
   const membershipIds = new Map<string, string>();
   const retained = new Map<string, Map<string, DomainRow>>();
+  const candidates = new Map<string, AttachmentScopeCandidate>();
+  const fullSegments: string[] = [];
+  const hitSegments: string[] = [];
+  const expectedSources = new Map<string, string>();
   const remember = (key: keyof AttachmentProjectionSegmentSnapshot, row: DomainRow | undefined): void => {
     if (!row) return;
     let rows = retained.get(key); if (!rows) retained.set(key, rows = new Map());
     rows.set(String(row.id), row);
   };
-  for (const raw of prepareCached(database, SOURCE_SQL).iterate({ ids })) {
-    const joined = raw as DomainRow;
-    const source = decode(joined, 'source', 'ContextSegmentSource')!;
-    snapshot.examinedSourceCount++;
-    const segmentId = attachmentProjectionId(source.segment_id, 'ContextSegmentSource.segment_id');
-    let sources = bySegment.get(segmentId); if (!sources) bySegment.set(segmentId, sources = []);
-    sources.push(source);
-    const owner: AttachmentSourceOwnerEvidence = {
-      messageRevision: decode(joined, 'revision', 'MessageRevision'),
-      memberships: [],
-      toolResult: decode(joined, 'result', 'ToolModelResult'),
-      toolCall: decode(joined, 'call', 'ToolCall'),
-      turn: decode(joined, 'turn_owner', 'Turn'),
-      compressionBlock: decode(joined, 'block', 'CompressionBlock')
+  let fallback = false;
+  try {
+    for (const segmentId of segmentIds) {
+      const routed = cache?.selectedSourceIds(segmentId, conversationId);
+      if (routed !== undefined && existingSegments.has(segmentId)) {
+        hitSegments.push(segmentId);
+        for (const id of routed) expectedSources.set(id, segmentId);
+      } else {
+        fullSegments.push(segmentId);
+        const candidate = existingSegments.has(segmentId) ? cache?.candidate(segmentId) : undefined;
+        if (candidate) candidates.set(segmentId, candidate);
+      }
+    }
+    const consume = (joined: DomainRow, cached: boolean): void => {
+      const source = decode(joined, 'source', 'ContextSegmentSource')!;
+      snapshot.examinedSourceCount++;
+      const segmentId = attachmentProjectionId(source.segment_id, 'ContextSegmentSource.segment_id');
+      let sources = bySegment.get(segmentId); if (!sources) bySegment.set(segmentId, sources = []);
+      sources.push(source);
+      const owner: AttachmentSourceOwnerEvidence = {
+        messageRevision: decode(joined, 'revision', 'MessageRevision'), memberships: [],
+        toolResult: decode(joined, 'result', 'ToolModelResult'),
+        toolCall: decode(joined, 'call', 'ToolCall'), turn: decode(joined, 'turn_owner', 'Turn'),
+        compressionBlock: decode(joined, 'block', 'CompressionBlock')
+      };
+      const membership = decode(joined, 'membership', 'MessagePartOfConversation');
+      if (membership) owner.memberships!.push(membership);
+      // Preserve exact SQL identities and the existing trimmed-reference normalization contract.
+      normalizeOwnerReferences(database, source, owner);
+      for (const membership of owner.memberships ?? []) {
+        const messageId = attachmentProjectionId(membership.message_id, 'MessagePartOfConversation.message_id');
+        const prior = membershipIds.get(messageId);
+        if (prior !== undefined && prior !== membership.id) throw new Error(`Message ${messageId} belongs to multiple Conversations.`);
+        membershipIds.set(messageId, String(membership.id));
+      }
+      if (source.source_kind === 'message_revision' && !owner.messageRevision) {
+        throw new Error(`MessageRevision ${attachmentProjectionId(source.source_id, 'ContextSegmentSource.source_id')} does not exist.`);
+      }
+      const scope = attachmentSourceOwnerScope(source, owner);
+      const belongs = scope === null || scope === conversationId;
+      if (cached) {
+        if (expectedSources.get(String(source.id)) !== segmentId || !belongs) fallback = true;
+        expectedSources.delete(String(source.id));
+      } else {
+        const candidate = candidates.get(segmentId);
+        // sort() never calls a comparator for one row. Such a row may keep baseline behavior,
+        // but it must not establish a reusable proof without validating every comparator field.
+        try { compareAttachmentSegmentSource(source, source); }
+        catch { candidate?.abort(); }
+        candidate?.add(String(source.id), scope);
+      }
+      if (!belongs) return;
+      selected.add(source);
+      remember('messageRevisions', owner.messageRevision);
+      for (const row of owner.memberships ?? []) remember('memberships', row);
+      remember('toolResults', owner.toolResult); remember('toolCalls', owner.toolCall);
+      remember('turns', owner.turn); remember('compressionBlocks', owner.compressionBlock);
     };
-    const membership = decode(joined, 'membership', 'MessagePartOfConversation');
-    if (membership) owner.memberships!.push(membership);
-    // Repository ids are interpreted using the projection's existing trimmed-id contract. Normal
-    // canonical rows use only the join; unusual whitespace references take a local exact lookup.
-    normalizeOwnerReferences(database, source, owner);
-    for (const membership of owner.memberships ?? []) {
-      const messageId = attachmentProjectionId(membership.message_id, 'MessagePartOfConversation.message_id');
-      const prior = membershipIds.get(messageId);
-      if (prior !== undefined && prior !== membership.id) throw new Error(`Message ${messageId} belongs to multiple Conversations.`);
-      membershipIds.set(messageId, String(membership.id));
+    if (fullSegments.length > 0) {
+      for (const raw of prepareCached(database, SOURCE_SQL).iterate({ ids: JSON.stringify(fullSegments) })) {
+        consume(raw as DomainRow, false);
+      }
     }
-    if (source.source_kind === 'message_revision' && !owner.messageRevision) {
-      throw new Error(`MessageRevision ${attachmentProjectionId(source.source_id, 'ContextSegmentSource.source_id')} does not exist.`);
+    const sourceIds = [...expectedSources.keys()];
+    for (let offset = 0; offset < sourceIds.length; offset += 128) {
+      for (const raw of prepareCached(database, SOURCE_PK_SQL).iterate({ ids: JSON.stringify(sourceIds.slice(offset, offset + 128)) })) {
+        consume(raw as DomainRow, true);
+      }
     }
-    if (!attachmentSourceBelongsToConversation(source, conversationId, owner)) continue;
-    selected.add(source);
-    remember('messageRevisions', owner.messageRevision);
-    for (const row of owner.memberships ?? []) remember('memberships', row);
-    remember('toolResults', owner.toolResult); remember('toolCalls', owner.toolCall);
-    remember('turns', owner.turn); remember('compressionBlocks', owner.compressionBlock);
+    if (fallback || expectedSources.size > 0) {
+      // Never leak partial hit evidence into the retry. It uses the same already-established
+      // SQLite snapshot and original complete reader, preserving its errors and authority.
+      for (const candidate of candidates.values()) candidate.abort();
+      for (const segmentId of hitSegments) cache?.evict(segmentId);
+      cache?.fallback();
+      return readAttachmentProjectionSegments(database, conversationId, segmentIds);
+    }
+    for (const sources of bySegment.values()) {
+      sources.sort(compareAttachmentSegmentSource);
+      snapshot.sources.push(...sources.filter(source => selected.has(source)));
+    }
+    for (const [key, rows] of retained) (snapshot[key as keyof typeof snapshot] as DomainRow[]) = [...rows.values()];
+    for (const candidate of candidates.values()) candidate.publish();
+    return snapshot;
+  } finally {
+    for (const candidate of candidates.values()) candidate.abort();
   }
-  // Sort and validate complete source sets before dropping foreign aliases. The model-facing
-  // source order is exactly the original comparator, independent of SQLite join iteration order.
-  for (const sources of bySegment.values()) {
-    sources.sort(compareAttachmentSegmentSource);
-    snapshot.sources.push(...sources.filter(source => selected.has(source)));
-  }
-  for (const [key, rows] of retained) (snapshot[key as keyof typeof snapshot] as DomainRow[]) = [...rows.values()];
-  return snapshot;
 }
 
 /** Fresh relationship query for each independently timed projection, including an empty result. */
