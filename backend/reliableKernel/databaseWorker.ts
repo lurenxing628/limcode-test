@@ -1,4 +1,5 @@
 import { readAttachmentProjectionSegments, readAttachmentProjectionLinks } from './attachmentProjectionSnapshot';
+import { executeContextSequenceNodeBatch } from './contextSequenceNodeBatch';
 import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
@@ -1427,6 +1428,10 @@ function executeSteps(
   allocatedSequences: RuntimeAllocatedSequence[]
 ): void {
   for (const step of steps) {
+    if (step.kind === 'ensureContextSequenceNodes') {
+      executeContextSequenceNodeBatch(database, step);
+      continue;
+    }
     if (step.kind === 'assert') {
       executeAssertion(database, step.domain, step.id, step.where, step.decoded);
       continue;
@@ -2061,6 +2066,7 @@ function assertTouchedRuntimeAggregates(
       || step.kind === 'assertNone'
       || step.kind === 'assertExactIds'
       || step.kind === 'assertCollaborationCapacity'
+      || step.kind === 'ensureContextSequenceNodes'
     ) return;
     if (step.domain === 'ModelRequest') {
       const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;

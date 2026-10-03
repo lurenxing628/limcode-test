@@ -130,6 +130,15 @@ export interface RepositorySavepoint {
   onError: RepositorySavepointOnError;
 }
 
+/** Fixed immutable-node identity operation, never an arbitrary multi-row mutation. */
+export const CONTEXT_SEQUENCE_NODE_BATCH_LIMIT = 128;
+export type ContextSequenceNodeTuple = [id: string, parentNodeId: string | null, segmentId: string, createdAt: string];
+export interface RepositoryEnsureContextSequenceNodesStep {
+  kind: 'ensureContextSequenceNodes';
+  domain: 'ContextSequenceNode';
+  nodes: ContextSequenceNodeTuple[];
+}
+
 export type RepositoryMutation =
   | RepositoryInsertMutation
   | RepositoryUpdateMutation
@@ -143,6 +152,7 @@ export type RepositoryTransactionStep =
   | RepositoryAssertNoneStep
   | RepositoryAssertExactIdsStep
   | RepositoryAssertCollaborationCapacityStep
+  | RepositoryEnsureContextSequenceNodesStep
   | RepositorySavepoint;
 
 export interface RepositoryGetRead {
@@ -282,6 +292,24 @@ export class DomainRepository {
     this.requireMutation('insert');
     this.codec.encodeInsert(row);
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row) };
+  }
+
+  /** Insert absent nodes in order, or prove their exact immutable identity in the writer. */
+  public ensureContextSequenceNodes(rows: readonly DomainRow[]): RepositoryEnsureContextSequenceNodesStep {
+    if (this.schema.key !== 'ContextSequenceNode') {
+      throw new TypeError('Immutable Context node batches are only valid for ContextSequenceNode.');
+    }
+    this.requireMutation('insert');
+    if (!Array.isArray(rows) || rows.length < 1 || rows.length > CONTEXT_SEQUENCE_NODE_BATCH_LIMIT) {
+      throw new RangeError(`Context node batches require 1 through ${CONTEXT_SEQUENCE_NODE_BATCH_LIMIT} rows.`);
+    }
+    const nodes = rows.map((row): ContextSequenceNodeTuple => {
+      const encoded = this.codec.encodeInsert(row);
+      requireId(encoded.id as string);
+      return [encoded.id as string, encoded.parent_node_id as string | null,
+        encoded.segment_id as string, encoded.created_at as string];
+    });
+    return { kind: 'ensureContextSequenceNodes', domain: 'ContextSequenceNode', nodes };
   }
 
   public insertWithExecutionLeaseDuration(row: DomainRow, lifetime: InitialExecutionLeaseDuration): RepositoryInsertMutation {
@@ -708,6 +736,9 @@ function clonePlainValue(value: unknown): unknown {
 
 function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
   if (step.kind === 'savepoint') return savepoint(step.name, step.steps, step.onError);
+  if (step.kind === 'ensureContextSequenceNodes') return {
+    ...step, nodes: step.nodes.map((node): ContextSequenceNodeTuple => [...node])
+  };
   if (step.kind === 'assert') return { ...step, where: clonePlainRecord(step.where) };
   if (step.kind === 'assertAll') return {
     ...step,

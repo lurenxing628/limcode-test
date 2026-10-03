@@ -941,8 +941,7 @@ async function resolveForkRootShape(
   await context.assertNativeSegmentsClosed(conversationId, retained);
   const suffix = context.planSuffixNodes(
     requireId(last.node.id, 'ContextSequenceNode.id'),
-    lateSegmentIds,
-    'fork_late_native_result_nodes'
+    lateSegmentIds
   );
   const tailId = suffix.nodeIds.at(-1) ?? requireId(last.node.id, 'ContextSequenceNode.id');
   let estimatedTokens = await tokenEstimator.estimateRootPrefix(rootId, prefix.length);

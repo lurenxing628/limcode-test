@@ -253,6 +253,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/lease-renewal-preflight-regression.test.mjs',
   'tests/reliable-kernel/child-initial-lease.test.mjs',
   'tests/reliable-kernel/history-preparation-admission.test.mjs',
+  'tests/reliable-kernel/context-sequence-node-batch.test.mjs',
   'tests/reliable-kernel/settings-draft-retention.test.mjs',
   'tests/reliable-kernel/composer-attachment-authority.test.mjs',
   'tests/reliable-kernel/conversation-owner-release.test.mjs',

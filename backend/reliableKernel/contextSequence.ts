@@ -7,6 +7,7 @@ import {
 import { resolveConversationCompressionBlock } from './compressionBlockOwnership';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import {
+  CONTEXT_SEQUENCE_NODE_BATCH_LIMIT,
   DOMAIN_REPOSITORIES,
   savepoint,
   type DomainRow,
@@ -247,11 +248,6 @@ const CONTENT_TYPE_TOOL_PAIR = 'application/vnd.limcode.context-tool-pair+json';
 const EXPECTED_OCCURRENCE_CONSTRAINTS = [
   { domain: 'ContextSegment', columns: ['id'] },
   { domain: 'ContextSegmentSource', columns: ['source_kind', 'source_id', 'source_revision'] }
-];
-const EXPECTED_NODE_CONSTRAINTS = [
-  { domain: 'ContextSequenceNode', columns: ['id'] },
-  { domain: 'ContextSequenceNode', columns: ['parent_node_id', 'segment_id'] },
-  { domain: 'ContextSequenceNode', columns: ['segment_id'] }
 ];
 
 /** Stage E Context authority. It never reads current Message state while materializing a frozen root. */
@@ -659,7 +655,7 @@ export class ContextSequenceControlPlane {
     const steps: RepositoryTransactionStep[] = [
       ...headAssertionSteps(conversationId, head, expectedHeadRootId),
       ...preparedContentObjectSteps(prepared, 'context_tool_pair_content'),
-      ...plans.flatMap((plan, index): RepositoryTransactionStep[] => [
+      ...plans.flatMap((plan): RepositoryTransactionStep[] => [
         ...occurrenceInsertSteps({
           segmentId: plan.fact.segmentId,
           segmentKind: 'tool_pair',
@@ -672,7 +668,7 @@ export class ContextSequenceControlPlane {
           parentNodeId: plan.parentNodeId,
           segmentId: plan.fact.segmentId,
           now
-        }], `context_tool_pair_node_${index}`),
+        }]),
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: plan.rootId,
           conversation_id: conversationId,
@@ -1065,8 +1061,7 @@ export class ContextSequenceControlPlane {
   /** Content-addressed nodes that continue an immutable chain from `parentNodeId`. */
   public planSuffixNodes(
     parentNodeId: string,
-    segmentIds: readonly string[],
-    savepointName: string
+    segmentIds: readonly string[]
   ): { nodeIds: string[]; steps: RepositoryTransactionStep[] } {
     const now = this.timestamp();
     const nodes: PlannedNode[] = [];
@@ -1076,7 +1071,7 @@ export class ContextSequenceControlPlane {
       nodes.push({ id, parentNodeId: parent, segmentId: requireId(segmentId, 'segmentId'), now });
       parent = id;
     }
-    return { nodeIds: nodes.map((node) => node.id), steps: nodeInsertSteps(nodes, savepointName) };
+    return { nodeIds: nodes.map((node) => node.id), steps: nodeInsertSteps(nodes) };
   }
 
   private async scanNativePairs(
@@ -1247,7 +1242,7 @@ export class ContextSequenceControlPlane {
           contentObjectId,
           now
         }),
-        ...nodeInsertSteps([...inheritedNodes, { id: nodeId, parentNodeId, segmentId, now }], 'fresh_message_context_node'),
+        ...nodeInsertSteps([...inheritedNodes, { id: nodeId, parentNodeId, segmentId, now }]),
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
           conversation_id: conversationId,
@@ -1310,7 +1305,7 @@ export class ContextSequenceControlPlane {
           contentObjectId,
           now
         }),
-        ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }], 'message_append_nodes'),
+        ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }]),
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
           conversation_id: conversationId,
@@ -1373,7 +1368,7 @@ export class ContextSequenceControlPlane {
           contentObjectId,
           now
         }),
-        ...nodeInsertSteps(rebuilt.nodes, 'message_edit_nodes'),
+        ...nodeInsertSteps(rebuilt.nodes),
         DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
           id: rootId,
           conversation_id: conversationId,
@@ -1499,7 +1494,7 @@ export class ContextSequenceControlPlane {
       steps: [
         ...headAssertionSteps(conversationId, state.head, state.rootId),
         ...occurrenceSteps,
-        ...nodeInsertSteps(nodes, 'message_truncate_nodes'),
+        ...nodeInsertSteps(nodes),
         ...(retainedSummary ? [DOMAIN_REPOSITORIES.domain('ContextSequenceNode').assert(
           requireId(summaryNodeId, 'retained compression node id'),
           {
@@ -1652,7 +1647,7 @@ export class ContextSequenceControlPlane {
           }),
           ...headAssertionSteps(conversationId, state.head, state.rootId),
           ...ownerAssertions,
-          ...nodeInsertSteps(nodes, 'repair_orphan_tool_pair_nodes'),
+          ...nodeInsertSteps(nodes),
           ...(retainedSummary ? [DOMAIN_REPOSITORIES.domain('ContextSequenceNode').assert(
             requireId(summaryNodeId, 'retained compression node id'),
             {
@@ -1762,7 +1757,7 @@ export class ContextSequenceControlPlane {
       steps: [
         ...headAssertionSteps(input.conversationId, input.state.head, input.state.rootId),
         ...occurrenceSteps,
-        ...nodeInsertSteps(nodes, `compressed_message_${input.kind}_nodes`),
+        ...nodeInsertSteps(nodes),
         ...(retainedSummary ? [DOMAIN_REPOSITORIES.domain('ContextSequenceNode').assert(
           requireId(summaryNodeId, 'retained compression node id'),
           {
@@ -2012,7 +2007,7 @@ export class ContextSequenceControlPlane {
         sources,
         now
       }),
-      ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }], 'context_node_append'),
+      ...nodeInsertSteps([{ id: nodeId, parentNodeId, segmentId, now }]),
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
         id: rootId,
         conversation_id: conversationId,
@@ -2253,24 +2248,14 @@ function messageOccurrenceWithAllocatedRevisionSteps(input: {
   })];
 }
 
-function nodeInsertSteps(nodes: readonly PlannedNode[], savepointName: string): RepositoryTransactionStep[] {
-  return nodes.flatMap((node, index) => [
-    savepoint(`${savepointName}_${index}`, [
-      DOMAIN_REPOSITORIES.domain('ContextSequenceNode').insert({
-        id: node.id,
-        parent_node_id: node.parentNodeId,
-        segment_id: node.segmentId,
-        created_at: node.now
-      })
-    ], {
-      kind: 'rollback-and-continue-on-unique',
-      constraints: EXPECTED_NODE_CONSTRAINTS
-    }),
-    DOMAIN_REPOSITORIES.domain('ContextSequenceNode').assert(node.id, {
-      parent_node_id: node.parentNodeId,
-      segment_id: node.segmentId
-    })
-  ]);
+function nodeInsertSteps(nodes: readonly PlannedNode[]): RepositoryTransactionStep[] {
+  const steps: RepositoryTransactionStep[] = [];
+  const repository = DOMAIN_REPOSITORIES.domain('ContextSequenceNode');
+  for (let offset = 0; offset < nodes.length; offset += CONTEXT_SEQUENCE_NODE_BATCH_LIMIT) {
+    steps.push(repository.ensureContextSequenceNodes(nodes.slice(offset, offset + CONTEXT_SEQUENCE_NODE_BATCH_LIMIT)
+      .map((node) => ({ id: node.id, parent_node_id: node.parentNodeId, segment_id: node.segmentId, created_at: node.now }))));
+  }
+  return steps;
 }
 
 function buildSequenceNodes(segmentIds: readonly string[], now: string): PlannedNode[] {
