@@ -85,6 +85,9 @@ class EvidenceCache {
           if (change.domain === 'Turn' && row && state.turns.has(change.id) && row.conversation_id !== conversationId) {
             this.conversations.delete(conversationId); changed = true; break;
           }
+          if (change.domain === 'ModelRequest' && row && state.requests.has(change.id) && !state.turns.has(String(row.turn_id))) {
+            this.conversations.delete(conversationId); changed = true; break;
+          }
           if (change.domain === 'Turn' && row?.conversation_id === conversationId && !state.turns.has(change.id)) {
             state.turns.add(change.id); state.pendingTurns.add(change.id); state.bytes += change.id.length * 2 + 64; changed = true;
           }
@@ -134,12 +137,22 @@ class EvidenceCache {
       this.conversations.delete(conversationId); this.conversations.set(conversationId, state);
       state.reading = true;
       const revision = state.revision;
-      const recomputing = !state.result;
+      const invalidated = (): boolean => state.revision !== revision || this.conversations.get(conversationId) !== state;
+      const assertCurrent = (): void => {
+        if (invalidated()) throw new Error('Context handle evidence was invalidated during the read.');
+      };
+      let checkingFinalFence = false;
       try {
         if (!state.ready) {
-          for (const turn of await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId })) {
-            state.turns.add(String(turn.id));
-            for (const request of await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turn.id })) {
+          const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId });
+          assertCurrent();
+          // Register the entire returned frontier before awaiting any one Turn's requests.
+          // A later Turn can otherwise move away without the commit listener knowing it.
+          for (const turn of turns) state.turns.add(String(turn.id));
+          for (const turn of turns) {
+            const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turn.id });
+            assertCurrent();
+            for (const request of requests) {
               state.requests.set(String(request.id), requestIdentity(request));
             }
           }
@@ -147,23 +160,35 @@ class EvidenceCache {
           state.ready = true;
         }
         for (const turnId of state.pendingTurns) {
-          for (const request of await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId })) {
+          const requests = await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId });
+          assertCurrent();
+          for (const request of requests) {
             state.requests.set(String(request.id), requestIdentity(request));
           }
           state.pendingTurns.delete(turnId);
         }
-        if (!state.result) {
-          if (!state.fork) {
+        // Commits may clear or replace any shared slot while a reader is suspended. Reconcile
+        // only this attempt's coherent references, and publish its result after both fences.
+        let result = state.result;
+        const recomputing = !result;
+        if (!result) {
+          let fork = state.fork;
+          if (!fork) {
             const previousCoverage = state.evidence.size ? state.evidence.values().next().value?.dependencies.coverage : undefined;
-            state.fork = await this.capture(state, readers.fork);
-            const coverage = JSON.stringify([...(state.fork.value?.coveredRecipeObjectIds ?? [])].sort());
+            fork = await this.capture(state, readers.fork);
+            assertCurrent();
+            state.fork = fork;
+            const coverage = JSON.stringify([...(fork.value?.coveredRecipeObjectIds ?? [])].sort());
             if (previousCoverage !== undefined && previousCoverage !== coverage) { state.evidence.clear(); state.evidenceByDomain.clear(); }
           }
-          const covered = new Set(state.fork.value?.coveredRecipeObjectIds ?? []);
+          const covered = new Set(fork.value?.coveredRecipeObjectIds ?? []);
           const coverage = JSON.stringify([...covered].sort());
-          for (const [id, request] of state.requests) {
-            if (!state.evidence.has(id)) {
-              const evidence = await this.capture(state, db => readers.request(db, request, covered.has(String(request.recipe_object_id))));
+          const requestEvidence: Evidence<ContextHandleRequestEvidence>[] = [];
+          for (const [id, request] of [...state.requests]) {
+            let evidence = state.evidence.get(id);
+            if (!evidence) {
+              evidence = await this.capture(state, db => readers.request(db, request, covered.has(String(request.recipe_object_id))));
+              assertCurrent();
               evidence.dependencies.coverage = coverage;
               for (const catalog of evidence.value.catalogs) catalog.entries = catalog.entries.map(entry => {
                 const key = JSON.stringify(entry);
@@ -178,25 +203,42 @@ class EvidenceCache {
                 ids.add(id);
               }
             }
+            requestEvidence.push(evidence);
           }
-          shareRetiredRefLists(state);
-          state.result = readers.reconcile(state.fork.value, [...state.evidence.values()].map(entry => entry.value));
+          assertCurrent();
+          shareRetiredRefLists(fork.value, requestEvidence);
+          result = readers.reconcile(fork.value, requestEvidence.map(entry => entry.value));
+          assertCurrent();
         }
+        checkingFinalFence = true;
         const afterVersion = await this.database.externalDataVersion();
-        if (afterVersion !== version || state.revision !== revision || this.conversations.get(conversationId) !== state) {
+        checkingFinalFence = false;
+        if (afterVersion !== version || invalidated()) {
           this.conversations.delete(conversationId);
           if (afterVersion !== version) { this.conversations.clear(); this.externalVersion = afterVersion; }
           continue;
         }
-        const result = structuredClone(state.result);
+        const cloned = structuredClone(result);
+        state.result = result;
         if (recomputing) state.bytes = retainedSize(state);
         state.reading = false;
         this.trim();
-        return result;
+        return cloned;
       } catch (error) {
+        if (checkingFinalFence) { this.conversations.delete(conversationId); throw error; }
+        // A changing frontier can also make a reader or reconciliation fail before reaching
+        // the normal post-read check. Retry only with proof of invalidation; stable corruption
+        // and root-fence failures still propagate, and all retries share the same bound.
+        const afterVersion = await this.database.externalDataVersion().catch(fenceError => {
+          this.conversations.delete(conversationId);
+          throw fenceError;
+        });
+        const changed = invalidated();
         this.conversations.delete(conversationId);
+        if (afterVersion !== version) { this.conversations.clear(); this.externalVersion = afterVersion; }
+        if (changed || afterVersion !== version) continue;
         throw error;
-      } finally { state.reading = false; }
+      } finally { state.pending.clear(); state.reading = false; }
     }
     throw Object.assign(new Error('Context handle evidence changed while it was being read; retry from the current frontier.'),
       { code: 'MODEL_CONTEXT_HANDLE_FRONTIER_CHANGED' });
@@ -205,8 +247,9 @@ class EvidenceCache {
   private async capture<T>(state: ConversationEvidence, read: (database: RuntimeDatabase) => Promise<T>): Promise<Evidence<T>> {
     const dependencies = new Dependencies();
     state.pending.add(dependencies);
-    try { return { value: await read(dependencies.reader(this.database)), dependencies }; }
-    finally { state.pending.delete(dependencies); }
+    // Retain through the attempt's final fence, including the promise-continuation gap before
+    // the caller installs the captured proof. Otherwise a commit in that gap can be missed.
+    return { value: await read(dependencies.reader(this.database)), dependencies };
   }
 
   private trim(): void {
@@ -304,7 +347,7 @@ class Dependencies {
 /** Share only exactly equal, already validated retirement facts within the live evidence set.
  * The lookup is discarded before returning, so it retains neither serialized keys nor obsolete
  * arrays. Evidence invalidation releases each shared list when its last catalog is discarded. */
-function shareRetiredRefLists(state: ConversationEvidence): void {
+function shareRetiredRefLists(fork: ForkEvidence, requests: Evidence<ContextHandleRequestEvidence>[]): void {
   const lists = new Map<string, string[]>();
   const share = (catalog: ModelHandleCatalog): void => {
     const refs = catalog.retiredRefs;
@@ -314,8 +357,8 @@ function shareRetiredRefLists(state: ConversationEvidence): void {
     if (existing) catalog.retiredRefs = existing;
     else { Object.freeze(refs); lists.set(key, refs); }
   };
-  if (state.fork?.value) share(state.fork.value.catalog);
-  for (const evidence of state.evidence.values()) {
+  if (fork) share(fork.catalog);
+  for (const evidence of requests) {
     for (const catalog of evidence.value.catalogs) share(catalog);
   }
 }
