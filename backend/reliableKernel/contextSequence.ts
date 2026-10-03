@@ -16,7 +16,7 @@ import {
 } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
-import type { ContextModelSource } from './databaseWorkerProtocol';
+import type { ContextContentMaterializationRecord, ContextModelSource } from './databaseWorkerProtocol';
 import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
 import { currentExecutionLeaseFence } from './executionLeaseFence';
 import {
@@ -1178,19 +1178,23 @@ export class ContextSequenceControlPlane {
     this.observeMetrics({ kind: 'materialize', mode: 'content', count: 1 });
     return {
       root: barrier.snapshot.root,
-      segments: barrier.snapshot.records.map((record) => ({
-        nodeId: requireId(record.node.id, 'ContextSequenceNode.id'),
-        parentNodeId: nullableId(record.node.parent_node_id, 'ContextSequenceNode.parent_node_id'),
-        segmentId: requireId(record.segment.id, 'ContextSegment.id'),
-        segmentKind: requireSegmentKind(record.segment.segment_kind),
-        messageRole: nullableText(record.messageRole, 'Context message role'),
-        ...(record.modelSource ? { modelSource: record.modelSource } : {}),
-        ...(record.sourceRecipeObjectId ? { sourceRecipeObjectId: record.sourceRecipeObjectId } : {}),
-        ...(record.sourceClaudeThinkingBinding ? { sourceClaudeThinkingBinding: record.sourceClaudeThinkingBinding } : {}),
-        contentObject: asContentObjectMetadata(record.contentObject),
-        content: bufferView(record.content)
-      })),
+      segments: materializeContextSegments(barrier.snapshot.records),
       snapshotCommitSeq: barrier.snapshotCommitSeq
+    };
+  }
+
+  /** Both views share one validated worker snapshot; provenance is never reused across reads. */
+  public async materializeWithStructure(rootId: string): Promise<{
+    structure: MaterializedContextStructure;
+    content: MaterializedContext;
+  }> {
+    const barrier = await this.database.materializeContextContent(requireId(rootId, 'rootId'));
+    this.observeMetrics({ kind: 'materialize', mode: 'content', count: 1 });
+    const { root, records } = barrier.snapshot;
+    const { snapshotCommitSeq } = barrier;
+    return {
+      structure: { root, records, snapshotCommitSeq },
+      content: { root, segments: materializeContextSegments(records), snapshotCommitSeq }
     };
   }
 
@@ -2661,6 +2665,21 @@ function staleHeadError(conversationId: string): Error & { code: string } {
   const error = new Error(`Conversation ${conversationId} Context head changed before commit.`) as Error & { code: string };
   error.code = 'CONTEXT_HEAD_STALE';
   return error;
+}
+
+function materializeContextSegments(records: ContextContentMaterializationRecord[]): MaterializedContextSegment[] {
+  return records.map((record) => ({
+    nodeId: requireId(record.node.id, 'ContextSequenceNode.id'),
+    parentNodeId: nullableId(record.node.parent_node_id, 'ContextSequenceNode.parent_node_id'),
+    segmentId: requireId(record.segment.id, 'ContextSegment.id'),
+    segmentKind: requireSegmentKind(record.segment.segment_kind),
+    messageRole: nullableText(record.messageRole, 'Context message role'),
+    ...(record.modelSource ? { modelSource: record.modelSource } : {}),
+    ...(record.sourceRecipeObjectId ? { sourceRecipeObjectId: record.sourceRecipeObjectId } : {}),
+    ...(record.sourceClaudeThinkingBinding ? { sourceClaudeThinkingBinding: record.sourceClaudeThinkingBinding } : {}),
+    contentObject: asContentObjectMetadata(record.contentObject),
+    content: bufferView(record.content)
+  }));
 }
 
 function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {

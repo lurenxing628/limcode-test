@@ -670,10 +670,8 @@ export class ReliableContextCompressionCoordinator {
     }
     // Materialize source structure/content only after the level-trigger passes. Below-threshold checks
     // are the common path and should pay for one provider-aligned Context read, not three.
-    const [materialized, semanticMaterialized] = await Promise.all([
-      this.context.materializeStructure(headRootId),
-      this.context.materialize(headRootId)
-    ]);
+    const { structure: materialized, content: semanticMaterialized } =
+      await this.context.materializeWithStructure(headRootId);
     if (materialized.records.length === 0) return { status: 'skipped', reason: 'empty_context' };
     if (command.sourceReplay && command.compressSegmentCount !== undefined
       && command.compressSegmentCount !== materialized.records.length) {
