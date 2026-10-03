@@ -5,6 +5,7 @@ import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHa
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
   ContextSequenceControlPlane,
+  type MaterializedContext,
   type MaterializedContextSegment
 } from './contextSequence';
 import type { PlainJsonValue } from './plainJson';
@@ -96,6 +97,11 @@ export class ReliableContextTokenEstimator {
   public async estimateRoot(rootIdInput: string): Promise<ReliableContextTokenEstimate> {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
+    return this.estimateMaterializedRoot(materialized);
+  }
+
+  /** Reuse only this call's immutable Context bytes; relationship projections remain fresh. */
+  private async estimateMaterializedRoot(materialized: MaterializedContext): Promise<ReliableContextTokenEstimate> {
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const attachmentCatalogState = await this.attachmentCatalog.projectState(
       conversationId,
@@ -116,7 +122,7 @@ export class ReliableContextTokenEstimator {
     const observed = await this.findObservedPrefix(
       conversationId,
       materialized.segments,
-      attachmentCatalogState,
+      projectedTokens,
       modelHandleCatalog
     );
     if (observed) return observed;
@@ -133,10 +139,10 @@ export class ReliableContextTokenEstimator {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
     const segmentCount = requireSegmentCount(segmentCountInput, materialized.segments.length);
+    const full = await this.estimateMaterializedRoot(materialized);
     if (segmentCount === materialized.segments.length) {
-      return (await this.estimateRoot(rootId)).estimatedTokens;
+      return full.estimatedTokens;
     }
-    const full = await this.estimateRoot(rootId);
     const prefixSegments = materialized.segments.slice(0, segmentCount);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const fullAttachmentState = await this.attachmentCatalog.projectState(
@@ -171,7 +177,7 @@ export class ReliableContextTokenEstimator {
   private async findObservedPrefix(
     conversationId: string,
     current: readonly MaterializedContextSegment[],
-    currentAttachmentState: AttachmentCatalogState,
+    currentProjected: number,
     modelHandleCatalog: ModelHandleCatalog
   ): Promise<ReliableContextTokenEstimate | null> {
     const turns = (await listAllDomainRows(this.database, 'Turn', {
@@ -244,11 +250,6 @@ export class ReliableContextTokenEstimator {
         const coveredProjected = estimateMaterializedContextTokens(
           coveredSegments,
           coveredAttachmentState,
-          modelHandleCatalog
-        );
-        const currentProjected = estimateMaterializedContextTokens(
-          current,
-          currentAttachmentState,
           modelHandleCatalog
         );
         const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
