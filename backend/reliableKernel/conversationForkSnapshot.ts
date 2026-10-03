@@ -112,8 +112,10 @@ export async function prepareConversationForkSnapshot(
     /** Target roots for copied request projections; omitted when the target re-sequences Context. */
     contextRoots?: ForkContextRoots;
     now: string;
+    assertActive?: () => void;
   }
 ): Promise<ConversationForkSnapshotPlan> {
+  input.assertActive?.();
   const contextLineage = input.contextSegmentIds
     ? await readForkContextLineage(database, input.contextSegmentIds, input.sourceConversationId)
     : undefined;
@@ -127,6 +129,7 @@ export async function prepareConversationForkSnapshot(
     throw new Error('Copying CompressionBlocks requires the target Context roots.');
   }
 
+  input.assertActive?.();
   const membershipBarrier = await database.snapshotAll(
     DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
       where: { conversation_id: input.sourceConversationId },
@@ -170,6 +173,7 @@ export async function prepareConversationForkSnapshot(
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
   }
 
+  input.assertActive?.();
   const basicReads = prefixMemberships.flatMap((membership): RepositoryRead[] => {
     const messageId = id(membership.message_id, 'MessagePartOfConversation.message_id');
     return [
@@ -211,6 +215,7 @@ export async function prepareConversationForkSnapshot(
       : [];
   });
 
+  input.assertActive?.();
   const relationReads = visibleCandidates.flatMap((candidate): RepositoryRead[] => {
     const messageId = id(candidate.message.id, 'Message.id');
     const revisionId = id(candidate.revision.id, 'MessageRevision.id');
@@ -262,6 +267,7 @@ export async function prepareConversationForkSnapshot(
     ...fact.requestLinks.map((link) => id(link.model_request_id, 'ModelRequestMessageLink.model_request_id')),
     ...fact.toolSources.map((link) => id(link.model_request_id, 'ToolCallSourceLink.model_request_id'))
   ]));
+  input.assertActive?.();
   const requestRows = await getRows(database, 'ModelRequest', requestIds);
   const requestAggregates = await readRequestAggregates(database, requestRows);
   const requestIdSet = new Set(requestAggregates.map((entry) => id(entry.request.id, 'ModelRequest.id')));
@@ -334,6 +340,7 @@ export async function prepareConversationForkSnapshot(
     ...tools.map((entry) => id(entry.toolCall.turn_id, 'ToolCall.turn_id')),
     ...blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id'))
   ]);
+  input.assertActive?.();
   const turnRows = await getRows(database, 'Turn', turnIds);
   requireTerminatedTurns(turnRows);
   const copiedTurnIds = new Set(turnIds);
@@ -408,6 +415,7 @@ export async function prepareConversationForkSnapshot(
     }
   }
 
+  input.assertActive?.();
   const target = input.targetConversationId;
   const messageIdMap = new Map<string, string>();
   const revisionIdMap = new Map<string, string>();

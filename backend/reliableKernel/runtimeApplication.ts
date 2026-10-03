@@ -465,6 +465,7 @@ export class ReliableKernelApplication {
 
   public close(): Promise<void> {
     if (this.closePromise) return this.closePromise;
+    this.database.stopHistoryPreparation(new ExecutionHandoffError('Reliable Runtime is closing for Host handoff.'));
     const task = (async () => {
       if (!this.closeDependenciesCompleted) {
         this.convergenceClosed = true;
@@ -618,6 +619,7 @@ export class ReliableKernelApplication {
     reason = new ExecutionHandoffError('Reliable Runtime is closing for Host handoff.')
   ): Promise<void> {
     if (this.handoffPromise) return this.handoffPromise;
+    this.database.stopHistoryPreparation(reason);
     this.handoffPromise = Promise.allSettled([
       this.modelProvider.quiesceAllActiveDispatches(reason),
       Promise.resolve(this.toolDispatcher.quiesce?.(reason))

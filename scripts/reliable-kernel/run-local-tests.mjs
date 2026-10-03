@@ -123,6 +123,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/lease-renewal-critical-queue.test.mjs',
   'tests/reliable-kernel/lease-renewal-preflight-regression.test.mjs',
   'tests/reliable-kernel/child-initial-lease.test.mjs',
+  'tests/reliable-kernel/history-preparation-admission.test.mjs',
   'tests/reliable-kernel/settings-draft-retention.test.mjs',
   'tests/reliable-kernel/file-effect-integrity.test.mjs',
   'tests/reliable-kernel/mcp-result-integrity.test.mjs',

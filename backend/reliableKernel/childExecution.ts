@@ -82,6 +82,7 @@ import {
 } from './childSendLineage';
 export { CHILD_TURN_ANSWER_WAIT_OWNER_KIND, LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND, childContinuationTurnId } from './childSendLineage';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { HistoryPreparationPermit } from './historyPreparationAdmission';
 import { retryLocalExecution } from './localExecutionRecovery';
 import {
   normalizeTurnModelOverride,
@@ -443,16 +444,25 @@ export class ChildExecutionControlPlane {
    * transaction. The CAS request is published first and may remain as an unreferenced orphan if the
    * transaction fails.
    */
-  public async spawn(commandInput: ChildExecutionSpawnCommand): Promise<ChildExecutionSpawnResult> {
+  public async spawn(commandInput: ChildExecutionSpawnCommand,
+    options: { signal?: AbortSignal } = {}): Promise<ChildExecutionSpawnResult> {
+    const inheritsHistory = normalizeChildForkTurns(commandInput.forkTurns) !== 'none';
     for (let retry = 0; ; retry += 1) {
-      try { return await this.spawnWithCapacity(commandInput); }
+      try {
+        return await (inheritsHistory
+          ? this.database.withHistoryPreparation(permit => this.spawnWithCapacity(commandInput, { ...options, permit }), options)
+          : this.spawnWithCapacity(commandInput, options));
+      }
       catch (error) {
         if (retry >= 15 || (!isTransactionAssertionFailure(error) && !(error instanceof CollaborationMembershipChangedError))) throw error;
       }
     }
   }
 
-  private async spawnWithCapacity(commandInput: ChildExecutionSpawnCommand): Promise<ChildExecutionSpawnResult> {
+  private async spawnWithCapacity(commandInput: ChildExecutionSpawnCommand,
+    options: { signal?: AbortSignal; permit?: HistoryPreparationPermit }): Promise<ChildExecutionSpawnResult> {
+    const assertActive = () => { options.signal?.throwIfAborted(); options.permit?.assertActive(); };
+    assertActive();
     const command = normalizeSpawnCommand(commandInput);
     const ids = spawnIds(command);
     const replay = await this.findSpawnReplay(command, ids);
@@ -477,6 +487,7 @@ export class ChildExecutionControlPlane {
     const capacitySteps = await prepareCollaborationCapacity(
       this.database, this.contentStore, String(parent.conversation.id), String(parent.turn.id)
     );
+    assertActive();
 
     if (command.authorityBound === 'executor_agent' && parent.toolCall.tool_name !== 'submit_plan') {
       throw new Error('Only a Plan the user approved may start a child with its executor Agent own settings.');
@@ -524,13 +535,16 @@ export class ChildExecutionControlPlane {
       )
     ]);
     const now = this.timestamp();
+    assertActive();
     const inheritedContext = await prepareChildContextFork(this.database, this.contentStore, {
       sourceConversationId: requirePhaseFId(parent.conversation.id, 'Conversation.id'),
       targetConversationId: ids.childConversationId,
       targetAgentId: command.childAgentId,
       forkTurns: command.forkTurns,
-      now
+      now,
+      assertActive
     });
+    assertActive();
     const promptContext = this.contextSequence.prepareFreshConversationMessageMutation({
       conversationId: ids.childConversationId,
       messageRevisionId: ids.childMessageRevisionId,
@@ -766,7 +780,7 @@ export class ChildExecutionControlPlane {
     ];
 
     try {
-      const commit = await this.database.transaction(steps);
+      const commit = await this.database.transaction(steps, { beforeSubmit: assertActive });
       return { ...spawnResult(ids, command.completionPolicy, modelSelection, false, commit.commitSeq),
         initialExecutionFence: committedInitialExecutionFence(commit, ids.childLeaseId) };
     } catch (error) {

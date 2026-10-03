@@ -1,5 +1,7 @@
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { StructuralContextRecord } from '../../reliableKernel/contextSequence';
+import type { HistoryPreparationPermit } from '../../reliableKernel/historyPreparationAdmission';
+import { isExecutionHandoffError } from '../../reliableKernel/executionLeaseFence';
 import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import {
   ForkCompressionPrecedence,
@@ -62,16 +64,17 @@ export class ReliableConversationLifecycle {
   private get application(): ReliableKernelApplication { return this.composition.application; }
   private get configuration(): VscodeConfigurationAuthority { return this.composition.configuration; }
 
-  public async fork(request: ConversationForkRequest): Promise<ConversationForkOutcome> {
+  public async fork(request: ConversationForkRequest, options: { signal?: AbortSignal } = {}): Promise<ConversationForkOutcome> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const commandId = requireText(request.commandId, 'Conversation fork commandId');
     // The source Conversation DAG/configuration is read and copied under its ownership pin so a
     // peer Host cannot mutate or delete it mid-fork.
-    return this.application.database.conversationOwners.run(sourceConversationId, () =>
-      this.discardingRejectedTarget(commandId, (targetConversationId) =>
-        this.forkCommand(request, commandId, targetConversationId)
-      )
-    );
+    return this.application.database.withHistoryPreparation(permit =>
+      this.application.database.conversationOwners.run(sourceConversationId, () =>
+        this.discardingRejectedTarget(commandId, (targetConversationId) =>
+          this.forkCommand(request, commandId, targetConversationId, permit)
+        )
+      ), options);
   }
 
   /**
@@ -79,28 +82,34 @@ export class ReliableConversationLifecycle {
    * of its latest ended Turn, so a Turn still in progress (including the caller's own) is never
    * copied. The branch starts no Turn and nothing is posted to a webview.
    */
-  public async forkCompletedHistory(request: CompletedHistoryForkRequest): Promise<ConversationForkOutcome & { title: string }> {
+  public async forkCompletedHistory(request: CompletedHistoryForkRequest,
+    options: { signal?: AbortSignal } = {}): Promise<ConversationForkOutcome & { title: string }> {
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const commandId = requireText(request.commandId, 'Conversation fork commandId');
     const targetConversationId = forkTargetConversationId(commandId);
-    try {
-      return await this.application.database.conversationOwners.run(sourceConversationId, async () => {
-        // A source deleted after the tool call was admitted is refused as missing, not as a
-        // Conversation without completed history.
-        if (!await this.maybeRow('Conversation', sourceConversationId)) {
-          throw new ConversationForkRejectedError(`Fork 源 Conversation ${sourceConversationId} 不存在。`);
-        }
-        // A replayed command keeps its committed boundary even if more Turns have ended since.
-        const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId);
-        const result = await this.forkCommand({ sourceConversationId, commandId, ...boundary }, commandId, targetConversationId);
-        return { ...result, title: String((await this.requireRow('Conversation', result.conversationId)).title) };
-      });
-    } catch (error) {
-      // The model's call is its only attempt: whatever failed, settings copied under a branch that
-      // was never committed are removed, and the model gets a reason it can act on.
-      await this.discardRejectedForkTarget(targetConversationId);
-      throw forkToolError(error);
-    }
+    return this.application.database.withHistoryPreparation(async permit => {
+      try {
+        return await this.application.database.conversationOwners.run(sourceConversationId, async () => {
+          permit.assertActive();
+          // A source deleted after the tool call was admitted is refused as missing, not as a
+          // Conversation without completed history.
+          if (!await this.maybeRow('Conversation', sourceConversationId)) {
+            throw new ConversationForkRejectedError(`Fork 源 Conversation ${sourceConversationId} 不存在。`);
+          }
+          // A replayed command keeps its committed boundary even if more Turns have ended since.
+          const boundary = await this.committedForkBoundary(commandId) ?? await this.completedHistoryBoundary(sourceConversationId, permit);
+          const result = await this.forkCommand({ sourceConversationId, commandId, ...boundary }, commandId, targetConversationId, permit);
+          return { ...result, title: String((await this.requireRow('Conversation', result.conversationId)).title) };
+        });
+      } catch (error) {
+        // A handed-off executor leaves recovery its exact durable facts, not a synthetic tool failure.
+        if (isExecutionHandoffError(error)) throw error;
+        // The model's call is its only attempt: whatever failed, settings copied under a branch that
+        // was never committed are removed, and the model gets a reason it can act on.
+        await this.discardRejectedForkTarget(targetConversationId);
+        throw forkToolError(error);
+      }
+    }, options);
   }
 
   /**
@@ -235,9 +244,10 @@ export class ReliableConversationLifecycle {
   }
 
   /** The newest visible user or assistant Message that is in Context and whose Turns all ended. */
-  private async completedHistoryBoundary(conversationId: string): Promise<{ messageId: string; expectedRevisionId: string }> {
+  private async completedHistoryBoundary(conversationId: string, permit: HistoryPreparationPermit): Promise<{ messageId: string; expectedRevisionId: string }> {
     let keyset: { column: string; value: bigint; id: string; direction: 'before' } | undefined;
     for (;;) {
+      permit.assertActive();
       const page = requireRows((await this.application.database.snapshot([
         DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
           where: { conversation_id: conversationId },
@@ -304,8 +314,10 @@ export class ReliableConversationLifecycle {
   private async forkCommand(
     request: ConversationForkRequest,
     commandId: string,
-    targetConversationId: string
+    targetConversationId: string,
+    permit: HistoryPreparationPermit
   ): Promise<ConversationForkOutcome> {
+    permit.assertActive();
     const sourceConversationId = requireText(request.sourceConversationId, 'Conversation fork sourceConversationId');
     const messageId = requireText(request.messageId, 'Conversation fork messageId');
     const expectedRevisionId = requireText(request.expectedRevisionId, 'Conversation fork expectedRevisionId');
@@ -442,6 +454,7 @@ export class ReliableConversationLifecycle {
       }
     }
     if (sourceSegmentIds.size === 0) throw new Error('Fork 源 MessageRevision 尚未进入 Context DAG。');
+    permit.assertActive();
     const roots = (await this.application.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').list({
         where: { conversation_id: sourceConversationId },
@@ -462,6 +475,7 @@ export class ReliableConversationLifecycle {
     const candidates = new ForkContextCandidateProbe(this.application.database, sourceSegmentIds);
     const compressionPrecedence = new ForkCompressionPrecedence(this.application.database, sourceConversationId, boundaryMessageSeq);
     for (const root of [...roots].reverse()) {
+      permit.assertActive();
       if (!await candidates.mayContain(root)) continue;
       // A root whose compression can never precede this cut is skipped without reading it.
       const summarySegmentId = await candidates.compressionSummary(root);
@@ -515,6 +529,7 @@ export class ReliableConversationLifecycle {
       sourceRecords,
       cutIndex
     );
+    permit.assertActive();
     const sourceAttachmentCatalogState = await this.application.modelProvider.projectAttachmentCatalogState(
       sourceConversationId,
       [...sourceContextSegmentIds, ...lateNativeResultSegmentIds].map((segmentId) => ({ segmentId }))
@@ -549,6 +564,7 @@ export class ReliableConversationLifecycle {
         targetTitle,
         targetAgentId: requireText(agentLinks[0].agent_id, 'AgentConversationLink.agent_id')
       }, {
+        permit,
         // Conversation-layer settings are copied after every snapshot check and BEFORE the branch
         // commits: once the branch exists it is immediately usable and replays never touch its
         // settings again. An interrupted copy or commit is resumed by the same command, which only

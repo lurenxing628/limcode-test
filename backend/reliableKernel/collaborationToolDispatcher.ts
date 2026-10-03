@@ -36,7 +36,7 @@ export interface CollaborationToolControlPlane {
 /** Conversation creation and forking, owned by the application lifecycle service. */
 export interface CrossConversationLifecycle {
   createForCollaboration(input: { turnId: string; toolCallId: string; sourceConversationId: string; prompt: string; title?: string }): Promise<unknown>;
-  forkCompletedHistory(input: { sourceConversationId: string; commandId: string }): Promise<unknown>;
+  forkCompletedHistory(input: { sourceConversationId: string; commandId: string }, options?: { signal?: AbortSignal }): Promise<unknown>;
 }
 
 export interface CollaborationToolDispatcherDependencies {
@@ -233,7 +233,7 @@ export class CollaborationToolDispatcher {
           ...(target === undefined ? {} : { targetConversationId: target }) });
         await this.dependencies.collaboration.assertConversationSpawnAllowed({ turnId: input.turnId, toolCallId: input.toolCallId });
         const sourceConversationId = target ?? conversationId;
-        detail = { ...object(await conversations.forkCompletedHistory({ sourceConversationId, commandId: input.toolCallId }), 'Conversation fork'),
+        detail = { ...object(await conversations.forkCompletedHistory({ sourceConversationId, commandId: input.toolCallId }, { signal }), 'Conversation fork'),
           sourceConversationId, turnStarted: false,
           note: 'The fork contains only completed turns and did not start a turn. Send it a task with send_conversation_message to continue work there.' };
         break;

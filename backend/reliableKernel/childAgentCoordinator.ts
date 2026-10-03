@@ -207,6 +207,7 @@ type ChildDispatchResult = ToolTerminalResult | ReliableAgentToolSettled | Relia
  */
 export class ReliableChildAgentCoordinator {
   private readonly startupOperations = new Set<Promise<unknown>>();
+  private readonly startupAbort = new AbortController();
   private readonly childLeaseRenewals = new Set<ChildLeaseRenewal>();
   private readonly activeTurns = new Map<string, Promise<ReliableChildDriveResult>>();
   private readonly now: () => string;
@@ -327,10 +328,10 @@ export class ReliableChildAgentCoordinator {
    * the intent; this method is idempotent and never owns settlement of the source submit_plan call.
    */
   public ensureApprovedPlan(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
-    return this.runChildStartup(() => this.ensureApprovedPlanStartup(input));
+    return this.runChildStartup(signal => this.ensureApprovedPlanStartup(input, signal));
   }
 
-  private async ensureApprovedPlanStartup(input: PlanDelegationEnsureRequest): Promise<PlanDelegationResult> {
+  private async ensureApprovedPlanStartup(input: PlanDelegationEnsureRequest, signal: AbortSignal): Promise<PlanDelegationResult> {
     if (!await this.mayEnsureApprovedPlan(input)) {
       throw new Error('Plan delegation starts its child only in a Host that serves the parent Conversation.');
     }
@@ -351,7 +352,7 @@ export class ReliableChildAgentCoordinator {
       leaseOwnerId: this.childLeaseOwnerId,
       leaseExpiresAt: this.leaseExpiresAt(),
       leaseDurationMs: this.leaseDurationMs()
-    });
+    }, { signal });
     const startupLease = await this.prepareChildLease(spawned.initialExecutionFence);
     let leaseTransferred = false;
     try {
@@ -1165,6 +1166,7 @@ export class ReliableChildAgentCoordinator {
 
   public async quiesce(reason: ExecutionHandoffError): Promise<void> {
     this.handoff = reason;
+    this.startupAbort.abort(reason);
     if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
     this.recoveryTimer = undefined;
     this.waitingOwned.clear();
@@ -2166,7 +2168,8 @@ export class ReliableChildAgentCoordinator {
     signal?: AbortSignal,
     admission?: ReliableSpecialToolAdmission
   ): Promise<ChildDispatchResult> {
-    return this.runChildStartup(() => this.spawnChildStartup(input, args, prompt, foregroundWaitMs, authority, signal, admission));
+    return this.runChildStartup(startupSignal =>
+      this.spawnChildStartup(input, args, prompt, foregroundWaitMs, authority, startupSignal, admission), signal);
   }
 
   private async spawnChildStartup(
@@ -2199,27 +2202,34 @@ export class ReliableChildAgentCoordinator {
     if (skillNames.length > 0 && !skillLoader) {
       throw new Error('当前宿主没有接入技能目录，run_agent 不能预载技能；没有创建子 Agent。请去掉 skills，在 prompt 里让子 Agent 自己载入。');
     }
-    const spawned = await this.dependencies.children.spawn({
-      sourceToolCallId: input.toolCallId,
-      childAgentId: selection.agentId,
-      modelFallback: frozenParentModelSelection(authority),
-      prompt: promptWithAnswerBridge(prompt),
-      // Loaded by the control plane within the child's own first-Turn skill settings, which are
-      // already bounded by this parent Turn; a failed name rejects the spawn before any fact is written.
-      ...(skillNames.length > 0 ? { preloadSkills: {
-        names: skillNames,
-        load: async (names: readonly string[], policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined) =>
-          (await skillLoader!.loadSkillsWithinPolicy(names, policy)).map((loaded) => loaded.text)
-      } } : {}),
-      forkTurns: normalizeChildForkTurns(args.forkTurns),
-      completionPolicy,
-      sourceSettlement: 'child_handle',
-      ...(deadline ? { waitDeadlineAt: deadline } : {}),
-      title: requireText(args.taskName, 'run_agent.taskName').replace(/\s+/g, ' ').slice(0, 120),
-      leaseOwnerId: this.childLeaseOwnerId,
-      leaseExpiresAt: this.leaseExpiresAt(),
-      leaseDurationMs: this.leaseDurationMs()
-    });
+    let spawned: Awaited<ReturnType<ChildExecutionControlPlane['spawn']>>;
+    try {
+      spawned = await this.dependencies.children.spawn({
+        sourceToolCallId: input.toolCallId,
+        childAgentId: selection.agentId,
+        modelFallback: frozenParentModelSelection(authority),
+        prompt: promptWithAnswerBridge(prompt),
+        // Loaded by the control plane within the child's own first-Turn skill settings, which are
+        // already bounded by this parent Turn; a failed name rejects the spawn before any fact is written.
+        ...(skillNames.length > 0 ? { preloadSkills: {
+          names: skillNames,
+          load: async (names: readonly string[], policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined) =>
+            (await skillLoader!.loadSkillsWithinPolicy(names, policy)).map((loaded) => loaded.text)
+        } } : {}),
+        forkTurns: normalizeChildForkTurns(args.forkTurns),
+        completionPolicy,
+        sourceSettlement: 'child_handle',
+        ...(deadline ? { waitDeadlineAt: deadline } : {}),
+        title: requireText(args.taskName, 'run_agent.taskName').replace(/\s+/g, ' ').slice(0, 120),
+        leaseOwnerId: this.childLeaseOwnerId,
+        leaseExpiresAt: this.leaseExpiresAt(),
+        leaseDurationMs: this.leaseDurationMs()
+      }, { signal });
+    } catch (error) {
+      const aborted = await this.settleUserAbort(input.toolCallId, signal, 'child-spawn-preparation');
+      if (aborted) return aborted;
+      throw error;
+    }
     const startupLease = await this.prepareChildLease(spawned.initialExecutionFence);
     let leaseTransferred = false;
     try {
@@ -2817,11 +2827,12 @@ export class ReliableChildAgentCoordinator {
     };
   }
 
-  private runChildStartup<T>(operation: () => Promise<T>): Promise<T> {
+  private runChildStartup<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (this.disposing || this.handoff) return Promise.reject(this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.'));
+    const startupSignal = signal ? AbortSignal.any([signal, this.startupAbort.signal]) : this.startupAbort.signal;
     const task = Promise.resolve().then(() => {
       if (this.disposing || this.handoff) throw this.handoff ?? new ExecutionHandoffError('Child coordinator is closing.');
-      return operation();
+      return operation(startupSignal);
     });
     this.startupOperations.add(task);
     return task.finally(() => this.startupOperations.delete(task));

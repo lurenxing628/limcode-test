@@ -17,6 +17,7 @@ import type { ContentAddressedStore } from './contentAddressedStore';
 import { estimateContextSegmentTokens, ReliableContextTokenEstimator } from './contextTokenEstimator';
 import { ContextSequenceControlPlane, type StructuralContextRecord } from './contextSequence';
 import { RuntimeDatabase } from './runtimeDatabase';
+import type { HistoryPreparationOptions, HistoryPreparationPermit } from './historyPreparationAdmission';
 import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
 import { NATIVE_CHILD_HANDLE_PROJECTION_EVENT, readConversationContextHandleCatalog } from './conversationChildHandles';
 import { assertForkContextHandleReservations, FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND,
@@ -101,10 +102,17 @@ export class ConversationForkControlPlane {
    * never for a replay: the caller's own pre-commit writes (Conversation-layer settings) therefore
    * happen only for a fork that is about to commit.
    */
-  public async fork(
+  public fork(
     commandInput: ConversationForkCommand,
-    options: { beforeCommit?: () => Promise<void> } = {}
+    options: HistoryPreparationOptions & { beforeCommit?: () => Promise<void> } = {}
   ): Promise<ConversationForkResult> {
+    return this.database.withHistoryPreparation(permit => this.forkPrepared(commandInput, permit, options), options);
+  }
+
+  private async forkPrepared(commandInput: ConversationForkCommand, permit: HistoryPreparationPermit,
+    options: HistoryPreparationOptions & { beforeCommit?: () => Promise<void> }): Promise<ConversationForkResult> {
+    const assertActive = () => { permit.assertActive(); options.signal?.throwIfAborted(); };
+    assertActive();
     let command: ResolvedForkCommand = normalizeForkCommand(commandInput);
     const ids = forkIds(command);
     const replay = await this.findReplay(command, ids);
@@ -219,6 +227,7 @@ export class ConversationForkControlPlane {
       sourceMembership = rows[0];
     }
 
+    assertActive();
     const sourceAgentSnapshot = await this.database.snapshotAll(
       DOMAIN_REPOSITORIES.domain('AgentConversationLink').list({
         where: { conversation_id: command.sourceConversationId },
@@ -260,6 +269,7 @@ export class ConversationForkControlPlane {
       targetConversationId: ids.targetConversationId, catalog: sourceHandleCatalog,
       coveredRecipeObjectIds: [...new Set([...handleFrontier.coveredRecipeObjectIds,
         ...(sourceReservations?.coveredRecipeObjectIds ?? [])])], now });
+    assertActive();
     const targetRootShape = await resolveForkRootShape(
       this.database,
       this.tokenEstimator,
@@ -302,6 +312,7 @@ export class ConversationForkControlPlane {
     const creationRoots = await retainedCreationRoots(
       this.database, this.tokenEstimator, ids.targetConversationId, targetHead, historicalSourceRoots, retainedLineage
     );
+    assertActive();
     const transcript = await prepareConversationForkSnapshot(this.database, {
       sourceConversationId: command.sourceConversationId,
       targetConversationId: ids.targetConversationId,
@@ -319,7 +330,8 @@ export class ConversationForkControlPlane {
         })),
         creation: creationRoots.targets
       },
-      now
+      now,
+      assertActive
     });
     if (sourceMembership) {
       // A direct caller can select an obsolete root even when the boundary revision is current.
@@ -517,13 +529,15 @@ export class ConversationForkControlPlane {
       })
     ];
 
+    const copiedMessageCount = transcript.copiedVisibleMessageCount;
+    assertActive();
     await options.beforeCommit?.();
     try {
-      const commit = await this.database.transaction(steps);
+      const commit = await this.database.transaction(steps, { beforeSubmit: assertActive });
       return {
         ...publicIds(ids),
         sharedRootNodeId,
-        copiedMessageCount: transcript.copiedVisibleMessageCount,
+        copiedMessageCount,
         deduplicated: false,
         commitSeq: commit.commitSeq
       };

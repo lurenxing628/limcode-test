@@ -268,3 +268,4 @@ docs/architecture/*
 !tests/reliable-kernel/lease-renewal-preflight-regression.test.mjs
 
 !tests/reliable-kernel/child-initial-lease.test.mjs
+!tests/reliable-kernel/history-preparation-admission.test.mjs

@@ -82,6 +82,7 @@ import {
 import { readProcessStartFingerprint } from './processProtocol';
 import type { MergeModelAggregate } from './runtimeMergeAggregatePreflight';
 import type { RuntimeHistoryRepairInput, RuntimeHistoryRepairResult } from './runtimeHistoryRepairTransaction';
+import { HistoryPreparationAdmission, type HistoryPreparationOptions, type HistoryPreparationPermit } from './historyPreparationAdmission';
 
 export interface SnapshotSubscription<T> {
   barrier: SnapshotBarrier<T>;
@@ -126,6 +127,7 @@ const DURABILITY_CHECKPOINT_ATTEMPTS = 20;
 const DURABILITY_CHECKPOINT_RETRY_MS = 50;
 
 export class RuntimeDatabase {
+  private readonly historyPreparation: HistoryPreparationAdmission;
   private readonly pending = new Map<number, {
     resolve(value: unknown): void;
     reject(error: unknown): void;
@@ -169,8 +171,10 @@ export class RuntimeDatabase {
     private readonly registryKey: string,
     initialPerformanceMetrics?: RuntimePerformanceMetricsSink,
     /** Opened offline for maintenance: a private instance without commit listeners (see open). */
-    public readonly maintenance = false
+    public readonly maintenance = false,
+    historyPreparationConcurrency?: number
   ) {
+    this.historyPreparation = new HistoryPreparationAdmission(historyPreparationConcurrency);
     if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
     this.conversationOwners = new ConversationRuntimeOwnerManager(binding, hostBootId);
     // Work whose execution lease another live Host holds runs there: it never keeps this Host's
@@ -181,6 +185,7 @@ export class RuntimeDatabase {
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
     worker.on('error', (error) => {
       this.closed = true;
+      this.stopHistoryPreparation(error);
       this.failPending(error);
     });
     worker.on('exit', (code) => {
@@ -193,6 +198,7 @@ export class RuntimeDatabase {
       // graceful close() drains and fences the work (or the OS proves the process dead).
       const unexpected = !this.closed && !this.closePromise;
       this.closed = true;
+      this.stopHistoryPreparation(new ExecutionHandoffError('SQLite database worker exited.'));
       if (unexpected || code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
     });
   }
@@ -216,6 +222,8 @@ export class RuntimeDatabase {
       maintenance?: true;
       /** Worker heap limits (e.g. a test bounding a maintenance worker). */
       resourceLimits?: ResourceLimits;
+      /** Internal resource-admission override for deterministic tests; never an Agent/model limit. */
+      historyPreparationConcurrency?: number;
     } = {}
   ): Promise<RuntimeDatabase> {
     const hostBootId = options.hostBootId ?? randomUUID();
@@ -245,7 +253,8 @@ export class RuntimeDatabase {
           ready.workerThreadId,
           registryKey,
           options.performanceMetrics,
-          options.maintenance === true
+          options.maintenance === true,
+          options.historyPreparationConcurrency
         );
         await database.registerHostLiveness();
         return database;
@@ -256,6 +265,25 @@ export class RuntimeDatabase {
       }
     }));
   }
+
+  /** Bound heavy history reads and copy plans for this database, including its direct callers. */
+  public withHistoryPreparation<T>(operation: (permit: HistoryPreparationPermit) => Promise<T>,
+    options: HistoryPreparationOptions = {}): Promise<T> {
+    // Capture before waiting; never adopt a newer lease generation when this scope is admitted.
+    const fence = currentExecutionLeaseFence();
+    return this.historyPreparation.run(async permit => {
+      if (this.closed) throw new Error('RuntimeDatabase is closed.');
+      if (fence) {
+        if (!this.conversationOwners.owns(fence.conversationId) || !await this.executionFenceStillCurrent(fence)) {
+          throw new ExecutionHandoffError(`Turn ${fence.turnId} lost its execution authority while awaiting history preparation.`);
+        }
+      } else await this.validateBinding('snapshot');
+      permit.assertActive();
+      return operation(permit);
+    }, options);
+  }
+
+  public stopHistoryPreparation(reason: unknown): void { this.historyPreparation.close(reason); }
 
   /**
    * Resolves with the same RuntimeCommitResult object that the commit listeners received (one
@@ -791,6 +819,7 @@ export class RuntimeDatabase {
    * could have registered this Host's liveness identity.
    */
   public close(): Promise<void> {
+    this.stopHistoryPreparation(new ExecutionHandoffError('RuntimeDatabase is closing.'));
     if (!this.closePromise) {
       const task = this.closeRuntime();
       this.closePromise = task;
@@ -810,6 +839,7 @@ export class RuntimeDatabase {
       this.conversationOwnerSweepTimer = undefined;
     }
     try {
+      await this.historyPreparation.whenIdle();
       await this.heartbeatTask.catch(() => undefined);
       await this.conversationOwnerSweepTask.catch(() => undefined);
       if (!this.closed) await this.sendRequest<null>({ kind: 'close' });
@@ -1001,6 +1031,7 @@ export class RuntimeDatabase {
       return;
     }
     if (message.type === 'fatal') {
+      this.stopHistoryPreparation(new RuntimeDatabaseWorkerError(message.error));
       this.failPending(new RuntimeDatabaseWorkerError(message.error));
       return;
     }

@@ -47,9 +47,11 @@ export async function prepareChildContextFork(
     targetAgentId: string;
     forkTurns: ChildForkTurns;
     now: string;
+    assertActive?: () => void;
   }
 ): Promise<ChildContextForkPlan> {
   if (input.forkTurns === 'none') return { steps: [], segments: [] };
+  input.assertActive?.();
   await new ConversationAttachmentHandleRegistry(database, { contentStore: store, now: () => input.now })
     .ensure(input.sourceConversationId, []);
   const handleFrontier = await captureForkContextHandleFrontier(database, input.sourceConversationId,
@@ -68,6 +70,7 @@ export async function prepareChildContextFork(
   ]);
   if (heads.length !== 1) throw new Error('Child context fork source must have exactly one Context head.');
   const context = new ContextSequenceControlPlane(database, store);
+  input.assertActive?.();
   const structure = await context.materializeStructure(id(heads[0].root_id));
   const membershipByMessage = new Map(memberships.map(row => [id(row.message_id), row]));
   const candidates: Array<{ turn: DomainRow; links: DomainRow[]; sequence: bigint }> = [];
@@ -100,6 +103,7 @@ export async function prepareChildContextFork(
   async function prefetch(domain: string, rowIds: readonly string[]): Promise<void> {
     const missing = [...new Set(rowIds)].filter(rowId => !cache.has(`${domain}:${rowId}`));
     for (let offset = 0; offset < missing.length; offset += FORK_READ_BATCH_SIZE) {
+      input.assertActive?.();
       const batch = missing.slice(offset, offset + FORK_READ_BATCH_SIZE);
       const barrier = await database.snapshot(batch.map(rowId => DOMAIN_REPOSITORIES.domain(domain).get(rowId)));
       for (const [index, rowId] of batch.entries()) {
@@ -135,6 +139,7 @@ export async function prepareChildContextFork(
     const pending = [...new Map(segments.map(segment => [id(segment.id), segment])).values()]
       .filter(segment => !sourcesBySegment.has(id(segment.id)));
     for (let offset = 0; offset < pending.length; offset += FORK_READ_BATCH_SIZE) {
+      input.assertActive?.();
       const batch = pending.slice(offset, offset + FORK_READ_BATCH_SIZE);
       const sourceSets = await readForkLists(database, 'ContextSegmentSource', 'segment_id', batch.map(segment => id(segment.id)));
       for (const [segmentId, sources] of sourceSets) sourcesBySegment.set(segmentId, sources);
@@ -232,7 +237,8 @@ export async function prepareChildContextFork(
     selectedMessageIds: selectedMessages,
     boundaryMessageSeq: boundary,
     contextSegmentIds: segmentIds,
-    now: input.now
+    now: input.now,
+    assertActive: input.assertActive
   });
   const copiedSources = new Map<string, string[]>();
   for (const step of snapshot.inserts) {
@@ -251,6 +257,7 @@ export async function prepareChildContextFork(
     }
   }
   await prefetch('ContentObject', segmentRows.map(segment => id(segment.content_object_id)));
+  input.assertActive?.();
   const segments = await estimateForkSegments(store, segmentRows, async objectId =>
     await get('ContentObject', objectId) as unknown as ContentObjectMetadata);
   return {
