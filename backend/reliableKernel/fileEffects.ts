@@ -1141,9 +1141,18 @@ export class FileChangeControlPlane {
   }
 }
 
+interface FileMutationDispatchResult {
+  observation: FileMutationObservation | null;
+  terminal: ToolTerminalResult | null;
+}
+
+// A Runtime can expose more than one dispatcher object. Keep local execution/recovery ownership
+// with the database instance, not one object; the durable claim remains the cross-Host authority.
+const fileMutationDispatches = new WeakMap<RuntimeDatabase, Map<string, Promise<FileMutationDispatchResult>>>();
+
 /** Dedicated file capability dispatcher; it has no ToolOutcome policy. */
 export class FileMutationDispatcher {
-  private readonly activeDispatches = new Set<string>();
+  private readonly activeDispatches: Map<string, Promise<FileMutationDispatchResult>>;
 
   public constructor(
     private readonly database: RuntimeDatabase,
@@ -1151,12 +1160,24 @@ export class FileMutationDispatcher {
     private readonly effects: EffectControlPlane,
     private readonly resolveBoundary: WorkEnvironmentBoundaryResolver,
     private readonly onConvergenceNeeded?: () => void
-  ) {}
+  ) {
+    let active = fileMutationDispatches.get(database);
+    if (!active) {
+      active = new Map();
+      fileMutationDispatches.set(database, active);
+    }
+    this.activeDispatches = active;
+  }
 
   public async dispatch(
     effectIntentId: string,
     signal?: AbortSignal
   ): Promise<FileMutationObservation | null> {
+    if (!await this.claimDispatch(effectIntentId, signal)) return null;
+    return this.executeDispatched(effectIntentId, signal);
+  }
+
+  private async claimDispatch(effectIntentId: string, signal?: AbortSignal): Promise<boolean> {
     if (signal?.aborted) {
       const handoff = handoffReason(signal);
       if (handoff) throw handoff;
@@ -1165,10 +1186,9 @@ export class FileMutationDispatcher {
         effectIntentId,
         detail: { reason: 'File mutation cancelled before capability dispatch.' }
       });
-      if (cancelled) return null;
+      if (cancelled) return false;
     }
-    if (!await retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId))) return null;
-    return this.executeDispatched(effectIntentId, signal);
+    return retryLocalExecution(() => this.effects.claimEffectDispatch(effectIntentId));
   }
 
   /** Executes one already-dispatched intent and returns observation; caller persists the Receipt. */
@@ -1191,18 +1211,9 @@ export class FileMutationDispatcher {
       : invalidRequestObservation(verified.request, 'conflict');
   }
 
-  public async dispatchRecordAndReconcile(effectIntentIdInput: string, signal?: AbortSignal): Promise<{
-    observation: FileMutationObservation | null;
-    terminal: ToolTerminalResult | null;
-  }> {
+  public async dispatchRecordAndReconcile(effectIntentIdInput: string, signal?: AbortSignal): Promise<FileMutationDispatchResult> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
-    const ownsActiveMarker = !this.activeDispatches.has(effectIntentId);
-    if (ownsActiveMarker) this.activeDispatches.add(effectIntentId);
-    try {
-      return await this.dispatchRecordAndReconcileActive(effectIntentId, signal);
-    } finally {
-      if (ownsActiveMarker) this.activeDispatches.delete(effectIntentId);
-    }
+    return this.runActive(effectIntentId, () => this.dispatchRecordAndReconcileActive(effectIntentId, signal));
   }
 
   public isDispatchActive(effectIntentIdInput: string): boolean {
@@ -1212,26 +1223,46 @@ export class FileMutationDispatcher {
   public async recoverDispatchedAndReconcile(effectIntentIdInput: string): Promise<ToolTerminalResult | null> {
     const effectIntentId = requireId(effectIntentIdInput, 'effectIntentId');
     if (this.activeDispatches.has(effectIntentId)) return null;
-    this.activeDispatches.add(effectIntentId);
-    try {
+    const result = await this.runActive(effectIntentId, async () => {
+      // This local convergence path may recover only this Runtime's abandoned dispatch stack.
+      // Foreign/missing dispatch identities belong to the dead-Host recovery scanner instead.
+      const fence = await this.effects.readEffectDispatchFence(effectIntentId);
+      if (fence?.hostBootId !== this.database.hostBootId) return { observation: null, terminal: null };
       const control = new FileChangeControlPlane(this.database, this.contentStore, this.effects);
-      return await control.recoverDispatchedEffect({
-        source: { kind: 'recovery', key: `file-mutation:${effectIntentId}:same-host-convergence` },
-        effectIntentId,
-        resolver: this.resolveBoundary
-      });
-    } finally {
-      this.activeDispatches.delete(effectIntentId);
-    }
+      return {
+        observation: null,
+        terminal: await control.recoverDispatchedEffect({
+          source: { kind: 'recovery', key: `file-mutation:${effectIntentId}:same-host-convergence` },
+          effectIntentId,
+          resolver: this.resolveBoundary
+        })
+      };
+    });
+    return result.terminal;
+  }
+
+  private runActive(effectIntentId: string, operation: () => Promise<FileMutationDispatchResult>): Promise<FileMutationDispatchResult> {
+    const existing = this.activeDispatches.get(effectIntentId);
+    if (existing) return existing;
+    // Publish before the first asynchronous read. A follower shares the result rather than
+    // racing the claim or interpreting the winner's in-flight filesystem state as crash residue.
+    const active = Promise.resolve().then(operation).finally(() => {
+      if (this.activeDispatches.get(effectIntentId) === active) this.activeDispatches.delete(effectIntentId);
+    });
+    this.activeDispatches.set(effectIntentId, active);
+    return active;
   }
 
   private async dispatchRecordAndReconcileActive(effectIntentId: string, signal?: AbortSignal): Promise<{
     observation: FileMutationObservation | null;
     terminal: ToolTerminalResult | null;
   }> {
+    // Only the successful durable claimant may inspect an exception from its own execution.
+    // A preflight/claim loser must never manufacture a receipt for another in-flight owner.
+    const claimed = await this.claimDispatch(effectIntentId, signal);
     let observation: FileMutationObservation | null;
     try {
-      observation = await this.dispatch(effectIntentId, signal);
+      observation = claimed ? await this.executeDispatched(effectIntentId, signal) : null;
     } catch (error) {
       if (isExecutionHandoffError(error) || error instanceof LocalExecutionRecoveryExhaustedError) throw error;
       const intent = await this.requireExisting('EffectIntent', effectIntentId);

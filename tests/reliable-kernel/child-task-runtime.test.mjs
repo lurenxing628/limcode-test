@@ -665,8 +665,9 @@ test('forkTurns validates a single explicit format without number or whitespace 
   }
 });
 
+for (const claimResult of ['false', 'throw', 'already-advanced']) {
 for (const winningState of ['dispatched', 'receipt_written', 'reconciled', 'inconsistent']) {
-  test(`spawn recovery validates the exact concurrent dispatch winner: ${winningState}`, { timeout: 30000 }, async () => {
+  test(`spawn recovery validates the exact concurrent dispatch winner: ${winningState}, claim ${claimResult}`, { timeout: 30000 }, async () => {
     await fixture('llm_summary', { async send() { throw new Error('Claim recovery must not start a model request.'); } }, async f => {
       const { database } = f.app;
       const { effects, children } = f.app.runtime;
@@ -687,7 +688,21 @@ for (const winningState of ['dispatched', 'receipt_written', 'reconciled', 'inco
       const originalSnapshot = database.snapshot;
       let winningClaimCount = 0;
       let losingClaimError;
+      let losingClaimResult;
+      const advanceWinner = async () => {
+        assert.equal(await originalClaim.call(effects, spawned.effectIntentId), true);
+        winningClaimCount += 1;
+        if (winningState !== 'dispatched') {
+          const receipt = await children.recordSpawnReceipt({ sourceKey: `normal-winner-${winningState}`,
+            attemptId: spawned.attemptId, outcome: 'succeeded' });
+          if (winningState === 'reconciled') await children.reconcileSpawnReceipt(receipt.effectReceiptId);
+          if (winningState === 'inconsistent') await database.transaction([
+            kernel.DOMAIN_REPOSITORIES.domain('Operation').update(spawned.operationId, { status: 'invalid-frontier' })
+          ]);
+        }
+      };
       effects.claimEffectDispatch = async intentId => {
+        assert.notEqual(claimResult, 'already-advanced', 'recovery must not redispatch an advanced intent');
         assert.equal(intentId, spawned.effectIntentId);
         database.snapshot = async reads => {
           const snapshot = await originalSnapshot.call(database, reads);
@@ -696,30 +711,24 @@ for (const winningState of ['dispatched', 'receipt_written', 'reconciled', 'inco
             // The losing claim has read pending. Before its next Attempt read, let the real
             // dispatcher commit the next frontier, returning the original stale Intent read.
             database.snapshot = originalSnapshot;
-            assert.equal(await originalClaim.call(effects, intentId), true);
-            winningClaimCount += 1;
-            if (winningState !== 'dispatched') {
-              const receipt = await children.recordSpawnReceipt({ sourceKey: `normal-winner-${winningState}`,
-                attemptId: spawned.attemptId, outcome: 'succeeded' });
-              if (winningState === 'reconciled') await children.reconcileSpawnReceipt(receipt.effectReceiptId);
-              if (winningState === 'inconsistent') await database.transaction([
-                kernel.DOMAIN_REPOSITORIES.domain('Operation').update(spawned.operationId, { status: 'invalid-frontier' })
-              ]);
-            }
+            await advanceWinner();
           }
           return snapshot;
         };
         try {
-          return await originalClaim.call(effects, intentId);
-        } catch (error) {
-          losingClaimError = error;
-          assert.match(error.message, /parent Attempt\/Operation is no longer dispatchable/);
-          throw error;
+          losingClaimResult = await originalClaim.call(effects, intentId);
+          if (claimResult === 'throw') {
+            losingClaimError = new Error('Injected claim failure after the concurrent winner.');
+            throw losingClaimError;
+          }
+          return losingClaimResult;
         } finally { database.snapshot = originalSnapshot; }
       };
       try {
+        if (claimResult === 'already-advanced') await advanceWinner();
         if (winningState === 'inconsistent') {
-          await assert.rejects(children.recoverSpawnIntent(spawned.effectIntentId), error => error === losingClaimError);
+          await assert.rejects(children.recoverSpawnIntent(spawned.effectIntentId), error => claimResult === 'throw'
+            ? error === losingClaimError : /inconsistent dispatch facts/.test(error.message));
           assert.equal((await f.list('ChildExecution'))[0].status, 'starting', 'inconsistent evidence cannot promote the child');
           assert.equal((await f.list('ToolModelResult', { tool_call_id: sourceToolCallId })).length, 0);
         } else {
@@ -733,7 +742,8 @@ for (const winningState of ['dispatched', 'receipt_written', 'reconciled', 'inco
           assert.equal((await effects.readTerminalResult(sourceToolCallId)).status, 'succeeded');
         }
         assert.equal(winningClaimCount, 1, 'one actual dispatcher wins the persisted claim');
-        assert.ok(losingClaimError, 'the regression must exercise the real stale-claim rejection');
+        assert.equal(losingClaimResult, claimResult === 'already-advanced' ? undefined : false,
+          'a stale claimant loses ownership; an advanced entry never claims again');
         assert.equal((await f.list('ChildExecution')).length, 1);
         assert.equal((await f.list('EffectReceipt', { attempt_id: spawned.attemptId })).length, 1,
           'recovery reuses the winner receipt or creates exactly one for the claimed local effect');
@@ -744,4 +754,5 @@ for (const winningState of ['dispatched', 'receipt_written', 'reconciled', 'inco
       }
     });
   });
+}
 }

@@ -1290,6 +1290,21 @@ export class EffectControlPlane {
     const intent = await this.requireExisting('EffectIntent', effectIntentId);
     const state = requireText(intent.dispatch_state, 'EffectIntent.dispatch_state');
     if (state !== 'pending') return false;
+    try {
+      return await this.claimPendingEffectDispatch(intent);
+    } catch (error) {
+      // Foreground dispatch and recovery can race before the transaction, between the separate
+      // Intent/parent/tool reads. An advanced exact intent is a lost claim, not execution failure.
+      // If no durable winner exists, preserve the original authority, integrity or I/O error.
+      const latest = await this.requireExisting('EffectIntent', effectIntentId);
+      if (latest.attempt_id !== intent.attempt_id || latest.effect_kind !== intent.effect_kind
+        || !['dispatched', 'receipt_written', 'cancelled_before_dispatch'].includes(String(latest.dispatch_state))) throw error;
+      return false;
+    }
+  }
+
+  private async claimPendingEffectDispatch(intent: DomainRow): Promise<boolean> {
+    const effectIntentId = requireId(intent.id, 'EffectIntent.id');
     const attempt = await this.requireExisting('Attempt', requireId(intent.attempt_id, 'EffectIntent.attempt_id'));
     const operation = await this.requireExisting('Operation', requireId(attempt.operation_id, 'Attempt.operation_id'));
     if (attempt.status !== 'pending' || operation.status !== 'pending') {
@@ -1337,31 +1352,24 @@ export class EffectControlPlane {
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(toolFacts.execution.id as string, { status: 'executing' })
       );
     }
-    try {
-      await this.database.transaction([
-        ...assertions,
-        ...(dispatchEnvelope ? preparedContentSteps([dispatchEnvelope], 'effect_dispatch_request') : []),
-        DOMAIN_REPOSITORIES.domain('EffectIntent').update(effectIntentId, {
-          dispatch_state: 'dispatched',
-          ...(dispatchEnvelope ? { request_object_id: dispatchEnvelope.metadata.id } : {}),
-          updated_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('Attempt').update(attempt.id as string, {
-          status: 'dispatched',
-          updated_at: now
-        }),
-        DOMAIN_REPOSITORIES.domain('Operation').update(operation.id as string, {
-          status: 'executing',
-          updated_at: now
-        })
-      ]);
-      return true;
-    } catch (error) {
-      if (!isTransactionAssertionError(error)) throw error;
-      const latest = await this.requireExisting('EffectIntent', effectIntentId);
-      if (latest.dispatch_state === 'pending') throw error;
-      return false;
-    }
+    await this.database.transaction([
+      ...assertions,
+      ...(dispatchEnvelope ? preparedContentSteps([dispatchEnvelope], 'effect_dispatch_request') : []),
+      DOMAIN_REPOSITORIES.domain('EffectIntent').update(effectIntentId, {
+        dispatch_state: 'dispatched',
+        ...(dispatchEnvelope ? { request_object_id: dispatchEnvelope.metadata.id } : {}),
+        updated_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('Attempt').update(attempt.id as string, {
+        status: 'dispatched',
+        updated_at: now
+      }),
+      DOMAIN_REPOSITORIES.domain('Operation').update(operation.id as string, {
+        status: 'executing',
+        updated_at: now
+      })
+    ]);
+    return true;
   }
 
   /**

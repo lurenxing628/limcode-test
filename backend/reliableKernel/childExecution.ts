@@ -1039,53 +1039,24 @@ export class ChildExecutionControlPlane {
     }
 
     if (facts.intent.dispatch_state === 'pending') {
+      let claimed = false;
+      let claimError: unknown = new Error(`subagent_spawn ${effectIntentId} lost claim has inconsistent dispatch facts.`);
       try {
-        await this.effects.claimEffectDispatch(effectIntentId);
+        claimed = await this.effects.claimEffectDispatch(effectIntentId);
       } catch (error) {
-        // The normal dispatcher can commit between claimEffectDispatch's separate Intent and
-        // Attempt reads. Reconcile an exact durable winner, including an already-written receipt;
-        // an unrelated identity or inconsistent state must never excuse the original claim error.
-        const raced = await this.database.snapshot([
-          DOMAIN_REPOSITORIES.domain('EffectIntent').get(effectIntentId),
-          DOMAIN_REPOSITORIES.domain('Attempt').get(requirePhaseFId(facts.attempt.id, 'Attempt.id')),
-          DOMAIN_REPOSITORIES.domain('Operation').get(requirePhaseFId(facts.operation.id, 'Operation.id')),
-          DOMAIN_REPOSITORIES.domain('EffectReceipt').list({ where: { attempt_id: facts.attempt.id }, limit: 2 })
-        ]);
-        const intent = requireRow(raced.snapshot[0], `EffectIntent ${effectIntentId}`);
-        const attempt = requireRow(raced.snapshot[1], `Attempt ${String(facts.attempt.id)}`);
-        const operation = requireRow(raced.snapshot[2], `Operation ${String(facts.operation.id)}`);
-        const receipts = requireRows(raced.snapshot[3], 'EffectReceipt spawn claim race lookup');
-        if (intent.id !== facts.intent.id || intent.effect_kind !== 'subagent_spawn'
-          || intent.attempt_id !== facts.attempt.id || intent.request_object_id !== facts.intent.request_object_id
-          || attempt.id !== facts.attempt.id || attempt.operation_id !== facts.operation.id
-          || attempt.attempt_seq !== facts.attempt.attempt_seq
-          || operation.id !== facts.operation.id || operation.owner_kind !== 'child_execution'
-          || operation.owner_id !== facts.childExecution.id || operation.tool_call_id !== facts.operation.tool_call_id
-          || operation.operation_seq !== facts.operation.operation_seq) throw error;
-        const pending = intent.dispatch_state === 'pending'
-          && attempt.status === 'pending' && operation.status === 'pending' && receipts.length === 0;
-        const cancelled = intent.dispatch_state === 'cancelled_before_dispatch'
-          && attempt.status === 'cancelled' && operation.status === 'cancelled' && receipts.length === 0;
-        const dispatched = intent.dispatch_state === 'dispatched'
-          && attempt.status === 'dispatched' && operation.status === 'executing' && receipts.length === 0;
-        const receipt = receipts.length === 1 ? receipts[0] : undefined;
-        const receiptWritten = intent.dispatch_state === 'receipt_written' && receipt !== undefined
-          && receipt.attempt_id === attempt.id && receipt.effect_kind === 'subagent_spawn'
-          && receipt.operation_id === operation.id && receipt.tool_call_id === operation.tool_call_id
-          && ['succeeded', 'failed', 'cancelled', 'conflict', 'outcome_unknown'].includes(String(receipt.outcome))
-          && ((attempt.status === 'dispatched' && operation.status === 'executing')
-            || (attempt.status === receipt.outcome
-              && (operation.status === receipt.outcome
-                || (receipt.outcome === 'succeeded'
-                  && (operation.status === 'waiting_answer' || TERMINAL_OPERATION_STATES.has(String(operation.status)))))));
-        if (!pending && !cancelled && !dispatched && !receiptWritten) throw error;
-        if (pending) {
-          // Parent ownership can temporarily prevent dispatch without changing the spawn facts.
-          // Leave that exact pending frontier for the level-triggered recovery scheduler.
-          return spawnRecoveryResult(await this.readSpawnIntentFacts(effectIntentId), false);
-        }
+        claimError = error;
+      }
+      if (!claimed && await this.validateSpawnClaimWinner(facts, claimError) === 'pending') {
+        // Parent ownership can temporarily prevent dispatch without changing the spawn facts.
+        // Leave that exact pending frontier for the level-triggered recovery scheduler.
+        return spawnRecoveryResult(await this.readSpawnIntentFacts(effectIntentId), false);
       }
       facts = await this.readSpawnIntentFacts(effectIntentId);
+    } else {
+      // Another caller (for example an approved-plan dispatch loser) may enter recovery after
+      // the claim already advanced. That entry owes the same exact aggregate validation.
+      await this.validateSpawnClaimWinner(facts,
+        new Error(`subagent_spawn ${effectIntentId} recovery has inconsistent dispatch facts.`));
     }
 
     if (facts.intent.dispatch_state === 'dispatched') {
@@ -1114,6 +1085,46 @@ export class ChildExecutionControlPlane {
     }
 
     return spawnRecoveryResult(facts, true);
+  }
+
+  /** A lost claim proves no ownership, never that the winner is a valid child aggregate. */
+  private async validateSpawnClaimWinner(facts: SpawnIntentFacts, error: unknown): Promise<'pending' | 'advanced'> {
+    const effectIntentId = requirePhaseFId(facts.intent.id, 'EffectIntent.id');
+    const raced = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('EffectIntent').get(effectIntentId),
+      DOMAIN_REPOSITORIES.domain('Attempt').get(requirePhaseFId(facts.attempt.id, 'Attempt.id')),
+      DOMAIN_REPOSITORIES.domain('Operation').get(requirePhaseFId(facts.operation.id, 'Operation.id')),
+      DOMAIN_REPOSITORIES.domain('EffectReceipt').list({ where: { attempt_id: facts.attempt.id }, limit: 2 })
+    ]);
+    const intent = requireRow(raced.snapshot[0], `EffectIntent ${effectIntentId}`);
+    const attempt = requireRow(raced.snapshot[1], `Attempt ${String(facts.attempt.id)}`);
+    const operation = requireRow(raced.snapshot[2], `Operation ${String(facts.operation.id)}`);
+    const receipts = requireRows(raced.snapshot[3], 'EffectReceipt spawn claim race lookup');
+    if (intent.id !== facts.intent.id || intent.effect_kind !== 'subagent_spawn'
+      || intent.attempt_id !== facts.attempt.id || intent.request_object_id !== facts.intent.request_object_id
+      || attempt.id !== facts.attempt.id || attempt.operation_id !== facts.operation.id
+      || attempt.attempt_seq !== facts.attempt.attempt_seq
+      || operation.id !== facts.operation.id || operation.owner_kind !== 'child_execution'
+      || operation.owner_id !== facts.childExecution.id || operation.tool_call_id !== facts.operation.tool_call_id
+      || operation.operation_seq !== facts.operation.operation_seq) throw error;
+    const pending = intent.dispatch_state === 'pending'
+      && attempt.status === 'pending' && operation.status === 'pending' && receipts.length === 0;
+    const cancelled = intent.dispatch_state === 'cancelled_before_dispatch'
+      && attempt.status === 'cancelled' && operation.status === 'cancelled' && receipts.length === 0;
+    const dispatched = intent.dispatch_state === 'dispatched'
+      && attempt.status === 'dispatched' && operation.status === 'executing' && receipts.length === 0;
+    const receipt = receipts.length === 1 ? receipts[0] : undefined;
+    const receiptWritten = intent.dispatch_state === 'receipt_written' && receipt !== undefined
+      && receipt.attempt_id === attempt.id && receipt.effect_kind === 'subagent_spawn'
+      && receipt.operation_id === operation.id && receipt.tool_call_id === operation.tool_call_id
+      && ['succeeded', 'failed', 'cancelled', 'conflict', 'outcome_unknown'].includes(String(receipt.outcome))
+      && ((attempt.status === 'dispatched' && operation.status === 'executing')
+        || (attempt.status === receipt.outcome
+          && (operation.status === receipt.outcome
+            || (receipt.outcome === 'succeeded'
+              && (operation.status === 'waiting_answer' || TERMINAL_OPERATION_STATES.has(String(operation.status)))))));
+    if (!pending && !cancelled && !dispatched && !receiptWritten) throw error;
+    return pending ? 'pending' : 'advanced';
   }
 
   /** See isChildTaskTurn: only Turns of the parent's task answer on the AnswerBridge. */
