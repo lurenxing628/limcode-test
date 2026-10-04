@@ -37,11 +37,15 @@ test('database close reports owner cleanup failure, finishes fencing, and permit
 test('application retries failed database cleanup without disposing capabilities a second time', async () => {
   const application = Object.create(kernel.ReliableKernelApplication.prototype);
   const calls = [];
+  const historyPreparationStops = [];
   const close = name => async () => { calls.push(name); };
   const failure = Object.assign(new Error('temporary owner release failure'), { code: 'EACCES' });
   let databaseCalls = 0;
   Object.assign(application, {
-    unsubscribeConvergence: () => calls.push('unsubscribe'),
+    unsubscribeConvergence: () => {
+      assert.ok(historyPreparationStops.length > 0, 'history preparation stops before dependency cleanup');
+      calls.push('unsubscribe');
+    },
     webviewFeed: { close: () => calls.push('webview') },
     runtime: { clientFeed: { close: () => calls.push('client-feed') } },
     modelProvider: { quiesceAllActiveDispatches: close('provider-handoff') },
@@ -51,9 +55,16 @@ test('application retries failed database cleanup without disposing capabilities
     toolDispatcher: { quiesce: close('tool-handoff'), dispose: close('tools') },
     providers: { dispose: close('providers') },
     runtimeDiagnostics: { close: close('diagnostics') },
-    database: { close: async () => { if (++databaseCalls === 1) throw failure; } }
+    database: {
+      stopHistoryPreparation: reason => {
+        assert.equal(reason.name, 'ExecutionHandoffError');
+        historyPreparationStops.push(reason);
+      },
+      close: async () => { if (++databaseCalls === 1) throw failure; }
+    }
   });
   const first = application.close();
+  assert.ok(historyPreparationStops.length > 0, 'close stops history preparation before async cleanup');
   assert.equal(application.close(), first);
   await assert.rejects(first, error => error === failure);
   const finishedCapabilities = [...calls];
