@@ -2150,28 +2150,48 @@ test('真实 settings resolver 的未知异常不被误认为模型故障重试'
 });
 
 test('总期限和非用户 AbortError 都可替换部分输出，真正用户取消不重试', async (context) => {
-  for (const scenario of ['deadline', 'sdk_abort', 'user_abort']) await context.test(scenario, async () => {
+  for (const scenario of ['deadline', 'sdk_abort', 'user_abort']) await context.test(scenario, async (subtest) => {
     await withApp(`retry-${scenario}`, async (app, conversationId, turnId) => {
       let calls = 0;
       const caller = new AbortController();
       const created = await createRequest(app, conversationId, turnId, scenario);
+      // The 80ms deadline must not expire while SQLite persists the fixture's partial output,
+      // otherwise that callback loses authority before it can issue the intended user abort.
+      const schedule = globalThis.setTimeout;
+      const deadlines = [];
+      subtest.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
+        if (milliseconds !== 80) return schedule(callback, milliseconds, ...args);
+        const handle = schedule(() => {}, 2 ** 31 - 1);
+        handle.unref();
+        deadlines.push({ handle, fire: () => callback(...args) });
+        return handle;
+      });
+      subtest.after(() => deadlines.forEach(({ handle }) => clearTimeout(handle)));
       const adapter = { providerId: 'provider-watchdog', async sendFullRequest(_request, controls) {
         calls += 1;
         if (calls > 1) return controls.onEvent({ kind: 'completed', streamSeq: '1', content: modelContent('recovered') });
         await controls.onEvent({ kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: 'partial' } });
         if (scenario === 'sdk_abort') throw Object.assign(new Error('socket hang up'), { name: 'AbortError' });
         if (scenario === 'user_abort') caller.abort();
+        if (scenario === 'deadline') {
+          assert.equal(deadlines.length, 1);
+          clearTimeout(deadlines[0].handle);
+          deadlines[0].fire();
+        }
         if (!controls.signal.aborted) await new Promise(resolve => controls.signal.addEventListener('abort', resolve, { once: true }));
       } };
       const run = controlPlane(app).dispatch(created.modelRequestId, adapter, { timeoutMs: 80, signal: caller.signal });
       if (scenario === 'user_abort') {
         await assert.rejects(run, /cancelled/);
         assert.equal(calls, 1);
+        assert.equal(caller.signal.aborted, true);
+        assert.match((await get(app, 'ModelRequest', created.modelRequestId)).terminal_state, /cancelled/);
       } else {
         assert.equal((await run).terminalState, 'completed');
         assert.equal(calls, 2);
         assert.equal(caller.signal.aborted, false);
       }
+      assert.equal(deadlines.length, calls, 'each Attempt still arms its outer deadline');
     });
   });
 });
