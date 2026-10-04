@@ -3103,6 +3103,16 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     repository.collaborationCapacity(read.rootConversationId);
     return { active_count: collaborationActiveChildCount(database, read.rootConversationId) };
   }
+  if (read.kind === 'conversationMessagePrefix') {
+    // Revalidate at the worker boundary; this is a fixed domain read, not arbitrary range SQL.
+    repository.conversationMessagePrefix(read.conversationId, read.throughMessageSeq);
+    const rows = prepareCached(database, `
+      SELECT * FROM message_part_of_conversation
+       WHERE conversation_id = @conversation_id AND message_seq <= @through_message_seq
+       ORDER BY message_seq ASC
+    `).all({ conversation_id: read.conversationId, through_message_seq: read.throughMessageSeq });
+    return (rows as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
+  }
   if (read.kind === 'get') {
     const row = prepareCached(database, `SELECT * FROM ${quote(schema.table)} WHERE id = ?`).get(requireRuntimeId(read.id));
     return row ? repository.codec.decode(row as Record<string, unknown>) : null;

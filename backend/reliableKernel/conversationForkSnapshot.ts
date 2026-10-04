@@ -130,6 +130,14 @@ export async function prepareConversationForkSnapshot(
     /** Child forks select complete committed turns instead of a transcript prefix. */
     selectedMessageIds?: ReadonlySet<string>;
     contextSegmentIds?: readonly string[];
+    /** Reuse only the lineage captured by this caller for these exact input segments. */
+    preparedContextLineage?: {
+      sourceConversationId: string;
+      contextSegmentIds: readonly string[];
+      lineage: ForkContextLineage;
+    };
+    /** Complete source membership captured by the child caller in this same preparation. */
+    preparedMemberships?: { sourceConversationId: string; byMessage: ReadonlyMap<string, DomainRow> };
     targetAgentId: string;
     /** Target roots for copied request projections; omitted when the target re-sequences Context. */
     contextRoots?: ForkContextRoots;
@@ -138,9 +146,16 @@ export async function prepareConversationForkSnapshot(
   }
 ): Promise<ConversationForkSnapshotPlan> {
   input.assertActive?.();
-  const contextLineage = input.contextSegmentIds
+  if (input.preparedContextLineage && (
+    input.preparedContextLineage.sourceConversationId !== input.sourceConversationId
+    || input.preparedContextLineage.contextSegmentIds !== input.contextSegmentIds
+  )) throw new Error('Fork prepared Context lineage does not belong to this source selection.');
+  if (input.preparedMemberships && (
+    input.preparedMemberships.sourceConversationId !== input.sourceConversationId || !input.selectedMessageIds
+  )) throw new Error('Fork prepared memberships require their source Conversation and selected Messages.');
+  const contextLineage = input.preparedContextLineage?.lineage ?? (input.contextSegmentIds
     ? await readForkContextLineage(database, input.contextSegmentIds, input.sourceConversationId)
-    : undefined;
+    : undefined);
   // Summary segments are shared, but each Conversation owns its CompressionBlocks: the target
   // receives its own copy of every block reachable from the retained Context.
   const compressionBlocks = contextLineage?.compressionBlocks ?? [];
@@ -152,18 +167,8 @@ export async function prepareConversationForkSnapshot(
   }
 
   input.assertActive?.();
-  const membershipBarrier = await database.snapshotAll(
-    DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
-      where: { conversation_id: input.sourceConversationId },
-      orderBy: { column: 'id', direction: 'asc' },
-      limit: 1000
-    })
-  );
   let boundaryMessageSeq = input.boundaryMessageSeq;
   if (contextLineage && boundaryMessageSeq !== undefined) {
-    const membershipsByMessage = new Map(membershipBarrier.snapshot.map((membership) => [
-      id(membership.message_id, 'MessagePartOfConversation.message_id'), membership
-    ]));
     const revisionIds = unique(contextLineage.messageSources.map((source) => id(source.source_id, 'ContextSegmentSource.source_id')));
     const revisionsById = new Map<string, DomainRow>();
     for (let offset = 0; offset < revisionIds.length; offset += FORK_MESSAGE_READ_BATCH_SIZE) {
@@ -178,10 +183,19 @@ export async function prepareConversationForkSnapshot(
         revisionsById.set(revisionId, row(value, `MessageRevision ${revisionId}`));
       }
     }
+    // Applied native steering can lie beyond the nominal model-message boundary. Resolve its
+    // source-local membership before the cutoff query, without scanning an excluded suffix.
+    const lineageMessageIds = unique([...revisionsById.values()]
+      .filter((revision) => revision.role === 'user' || revision.role === 'model')
+      .map((revision) => id(revision.message_id, 'MessageRevision.message_id')));
+    const membershipsByMessage = input.preparedMemberships?.byMessage ?? await readSourceMemberships(
+      database, input.sourceConversationId, lineageMessageIds, input.assertActive
+    );
     for (const source of contextLineage.messageSources) {
       const revision = revisionsById.get(id(source.source_id, 'ContextSegmentSource.source_id'));
       if (!revision) continue;
-      const membership = membershipsByMessage.get(id(revision.message_id, 'MessageRevision.message_id'));
+      const messageId = id(revision.message_id, 'MessageRevision.message_id');
+      const membership = sourceMembership(membershipsByMessage, input.sourceConversationId, messageId);
       if (!membership || (revision.role !== 'user' && revision.role !== 'model')) continue;
       if (source.source_revision !== revision.revision_seq
         || contextLineage.contentObjectIds.get(id(source.segment_id, 'ContextSegmentSource.segment_id')) !== revision.content_object_id) {
@@ -191,10 +205,31 @@ export async function prepareConversationForkSnapshot(
       if (sequence > boundaryMessageSeq!) boundaryMessageSeq = sequence;
     }
   }
-  const prefixMemberships = boundaryMessageSeq === undefined ? [] : membershipBarrier.snapshot
-    .filter((row) => integer(row.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq!)
-    .filter((row) => !input.selectedMessageIds || input.selectedMessageIds.has(id(row.message_id, 'MessagePartOfConversation.message_id')))
-    .sort(compareMessageMembership);
+  let prefixMemberships: DomainRow[] = [];
+  if (boundaryMessageSeq !== undefined) {
+    input.assertActive?.();
+    if (input.selectedMessageIds) {
+      const memberships = input.preparedMemberships?.byMessage ?? await readSourceMemberships(
+        database, input.sourceConversationId, [...input.selectedMessageIds], input.assertActive
+      );
+      // Child selection is sparse: iterate selected IDs, never the whole captured membership map.
+      for (const messageId of input.selectedMessageIds) {
+        const membership = sourceMembership(memberships, input.sourceConversationId, messageId);
+        if (membership && integer(membership.message_seq, 'MessagePartOfConversation.message_seq') <= boundaryMessageSeq) {
+          prefixMemberships.push(membership);
+        }
+      }
+    } else {
+      const barrier = await database.snapshot([
+        DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').conversationMessagePrefix(
+          input.sourceConversationId, boundaryMessageSeq
+        )
+      ]);
+      prefixMemberships = rows(barrier.snapshot[0], 'MessagePartOfConversation fork prefix');
+    }
+    input.assertActive?.();
+    prefixMemberships.sort(compareMessageMembership);
+  }
   if (prefixMemberships.length === 0 && compressionBlocks.length === 0) {
     return { assertions: [], inserts: [], copiedVisibleMessageCount: 0 };
   }
@@ -616,6 +651,42 @@ interface ForkMessageCandidate {
 }
 
 interface ForkVisibleMessageCandidate extends ForkMessageCandidate { revision: DomainRow }
+
+/** Read only exact source-local identities needed by lineage or a sparse child selection. */
+async function readSourceMemberships(
+  database: RuntimeDatabase,
+  sourceConversationId: string,
+  messageIds: readonly string[],
+  assertActive?: () => void
+): Promise<Map<string, DomainRow>> {
+  const result = new Map<string, DomainRow>();
+  for (let offset = 0; offset < messageIds.length; offset += FORK_MESSAGE_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = messageIds.slice(offset, offset + FORK_MESSAGE_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.map((messageId) =>
+      DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').list({
+        where: { conversation_id: sourceConversationId, message_id: messageId }, limit: 2
+      })
+    ));
+    assertActive?.();
+    for (const [index, messageId] of batch.entries()) {
+      const memberships = rows(barrier.snapshot[index], 'MessagePartOfConversation source identity');
+      if (memberships.length > 1) throw new Error('Fork source Message has duplicate Conversation memberships.');
+      if (memberships[0]) result.set(messageId, memberships[0]);
+    }
+  }
+  return result;
+}
+
+function sourceMembership(
+  memberships: ReadonlyMap<string, DomainRow>, sourceConversationId: string, messageId: string
+): DomainRow | undefined {
+  const membership = memberships.get(messageId);
+  if (membership && (membership.conversation_id !== sourceConversationId || membership.message_id !== messageId)) {
+    throw new Error('Fork prepared membership does not belong to its source Message.');
+  }
+  return membership;
+}
 
 async function readSnapshotMessageFacts(
   database: RuntimeDatabase,

@@ -179,6 +179,14 @@ export interface RepositoryCollaborationCapacityRead {
   rootConversationId: string;
 }
 
+/** The complete selected transcript prefix, read atomically without materializing its suffix. */
+export interface RepositoryConversationMessagePrefixRead {
+  kind: 'conversationMessagePrefix';
+  domain: 'MessagePartOfConversation';
+  conversationId: string;
+  throughMessageSeq: bigint;
+}
+
 export interface RepositoryKeysetCursor { column: string; value: string | bigint; id: string; direction: 'before' | 'after' }
 
 export interface RepositoryListRead {
@@ -202,7 +210,8 @@ export interface RepositoryListRead {
   limit: number;
 }
 
-export type RepositoryRead = RepositoryGetRead | RepositoryListRead | RepositoryCollaborationCapacityRead;
+export type RepositoryRead = RepositoryGetRead | RepositoryListRead | RepositoryCollaborationCapacityRead
+  | RepositoryConversationMessagePrefixRead;
 
 export class DomainRowCodec {
   private readonly columnsByName: ReadonlyMap<string, ColumnDefinition>;
@@ -531,6 +540,14 @@ export class DomainRepository {
     if (this.schema.key !== 'Turn') throw new TypeError('Collaboration capacity is only valid for Turn.');
     requireId(rootConversationId);
     return { kind: 'collaborationCapacity', domain: 'Turn', rootConversationId };
+  }
+
+  /** Fixed indexed prefix selector; database.snapshot preserves one SQLite read transaction. */
+  public conversationMessagePrefix(conversationId: string, throughMessageSeq: bigint): RepositoryConversationMessagePrefixRead {
+    if (this.schema.key !== 'MessagePartOfConversation') throw new TypeError('Conversation message prefix is only valid for MessagePartOfConversation.');
+    requireId(conversationId);
+    if (typeof throughMessageSeq !== 'bigint') throw new TypeError('Conversation message prefix requires a bigint sequence boundary.');
+    return { kind: 'conversationMessagePrefix', domain: 'MessagePartOfConversation', conversationId, throughMessageSeq };
   }
 
   public assertCollaborationCapacity(rootConversationId: string, maximum: number): RepositoryAssertCollaborationCapacityStep {

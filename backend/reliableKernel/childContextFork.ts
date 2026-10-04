@@ -226,15 +226,19 @@ export async function prepareChildContextFork(
   const selectedMessages = new Set(retained.flatMap(segment => [...segment.messages]));
   const segmentRows = retained.map(segment => segment.row);
   const segmentIds = segmentRows.map(row => id(row.id));
-  const boundary = memberships.reduce((maximum, row) => {
-    const sequence = BigInt(String(row.message_seq));
-    return sequence > maximum ? sequence : maximum;
-  }, 0n);
+  let boundary = 0n;
+  for (const messageId of selectedMessages) {
+    const membership = membershipByMessage.get(messageId);
+    if (!membership) continue;
+    const sequence = BigInt(String(membership.message_seq));
+    if (sequence > boundary) boundary = sequence;
+  }
   const snapshot = await prepareConversationForkSnapshot(database, {
     sourceConversationId: input.sourceConversationId,
     targetConversationId: input.targetConversationId,
     targetAgentId: input.targetAgentId,
     selectedMessageIds: selectedMessages,
+    preparedMemberships: { sourceConversationId: input.sourceConversationId, byMessage: membershipByMessage },
     boundaryMessageSeq: boundary,
     contextSegmentIds: segmentIds,
     now: input.now,

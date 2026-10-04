@@ -290,7 +290,11 @@ class Dependencies {
 
   private observe(read: RepositoryRead): void {
     if (read.kind === 'get') this.id(read.domain, read.id);
-    else if (read.kind === 'list' && read.collaborationProjectScope !== undefined) {
+    else if (read.kind === 'conversationMessagePrefix') {
+      // Conservatively invalidate for any membership change in this Conversation, even beyond
+      // the selected cutoff. The prefix rows themselves are never a separate cached result.
+      this.lists.push({ domain: read.domain, where: { conversation_id: read.conversationId } });
+    } else if (read.kind === 'list' && read.collaborationProjectScope !== undefined) {
       for (const domain of ['Conversation', 'ChildExecution', 'ConversationProjectLink']) this.materializing.add(domain);
     } else if (read.kind === 'list' && read.collaborationRootConversationId === undefined) {
       this.lists.push({ domain: read.domain, where: { ...read.where } });

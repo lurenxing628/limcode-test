@@ -320,7 +320,10 @@ export class ConversationForkControlPlane {
         ? { boundaryMessageSeq: requireBigInt(sourceMembership.message_seq, 'MessagePartOfConversation.message_seq') }
         : {}),
       // Whole-root callers copy no transcript but still receive their own CompressionBlocks.
-      contextSegmentIds: targetRootShape.segmentIds ?? retainedSegmentIds,
+      contextSegmentIds: retainedSegmentIds,
+      preparedContextLineage: {
+        sourceConversationId: command.sourceConversationId, contextSegmentIds: retainedSegmentIds, lineage: retainedLineage
+      },
       targetAgentId: command.targetAgentId,
       contextRoots: {
         head: targetHead,
