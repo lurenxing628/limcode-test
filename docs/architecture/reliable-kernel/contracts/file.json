@@ -36,7 +36,8 @@
     "contentStorage": "cas-before-sqlite-reference",
     "completedDiffRule": "replace_file/delete_file 的精确 base bytes 与 create_file/replace_file 的 target bytes 都在提案事务前进入 CAS；完成后通过独立 detail kind 重开 Diff，不依赖 Workspace 当前内容或瞬态预览。",
     "modelResult": false,
-    "planningRootEvidence": "规划时的规范化根路径、设备与 inode 保存在审批提案 CAS 正文；执行请求保留同一证据，成员身份、顺序、完整集合及全部批准字段与 SQLite/提案交叉核对，不修改 Runtime schema。缺失证据的历史记录仍可查看和取消，但不得猜测当前根继续执行；未执行的无证据请求记冲突，已派发恢复无法证明时记 outcome_unknown。"
+    "planningRootEvidence": "规划时的规范化根路径、设备与 inode 保存在审批提案 CAS 正文；执行请求保留同一证据，成员身份、顺序、完整集合及全部批准字段与 SQLite/提案交叉核对，不修改 Runtime schema。缺失证据的历史记录仍可查看和取消，但不得猜测当前根继续执行；未执行的无证据请求记冲突，已派发恢复无法证明时记 outcome_unknown。",
+    "implicitWriteParents": "write 隐式补齐父目录仍逐个使用 create_directory 成员；ensureParentDirectory=true 只在审批提案和执行请求 CAS 中表达，绑定同根同工作环境内后续 create_file 后代成员，不改变 SQLite schema。未标记的显式 create_directory 仍要求目标不存在；执行请求不能增加、删除或改写该已批准意图。"
   },
   "decision": {
     "domain": "FileChangeDecision",
@@ -73,7 +74,7 @@
     "automaticRollback": false,
     "automaticRetry": false,
     "overwriteWithoutBaseCheck": false,
-    "rule": "只执行批准的完整成员集；先加载目标 CAS，再核对根/目标身份和 baseDigest，创建要求目标不存在；替换经不截断的描述符先核对类型/身份，之后才读写。锁等待失败或取消不能进入未加锁的恢复猜测。部分成功逐成员如实记录。便携 Node 文件 API 不保证对不遵守锁的外部写入者提供原子比较交换。",
+    "rule": "只执行批准的完整成员集；先加载目标 CAS，再核对根/目标身份和 baseDigest，创建文件及显式创建目录要求目标不存在；隐式父目录成员允许复用已存在的真实目录，仍完整复核根、路径与最终身份；替换经不截断的描述符先核对类型/身份，之后才读写。锁等待失败或取消不能进入未加锁的恢复猜测。部分成功逐成员如实记录。便携 Node 文件 API 不保证对不遵守锁的外部写入者提供原子比较交换。",
     "serialization": "同一进程按重叠目标排队；跨协作 Host 通过短暂注册准入及活动规范化根声明覆盖相同/嵌套根，文件 I/O 不持全局准入锁或 SQLite 事务，不相关根可并行。两类等待均可取消，跨 Host 声明获取有时间上限；仅隔离已证明死亡的 owner，释放核对声明代数。",
     "externalWriterAtomicCas": false
   },
@@ -103,7 +104,8 @@
       "deletePolicy": "cascade-with-receipt",
       "missingDetailRule": "EffectReceipt detail缺失时按已批准成员逐条写outcome_unknown/actualDigest=NULL，不允许空成员集合冒充完整审计。",
       "prefixValidation": "detail存在时memberId/memberSeq必须是批准request的唯一有序前缀；首个非成功成员后停止。",
-      "rule": "成员级核对结果逐一落 FileMutationReceiptMember；receipt 级 outcome 由成员结果汇聚。"
+      "rule": "成员级核对结果逐一落 FileMutationReceiptMember；receipt 级 outcome 由成员结果汇聚。",
+      "directoryCreationEvidence": "隐式父目录的 EffectReceipt CAS detail 另记 directoryCreation：mkdir 正常返回为 created、复用执行前已存在目录为 not_created、异常或恢复不能证明为 unknown。成功仅证明目录后置条件；SQLite 成员回执的 outcome/actualDigest、created 记录本身均不授予目录所有权或递归撤销权限。恢复不得从现存目录反推本次创建，也不回放 mkdir。"
     },
     "reconcileRules": [
       "实际摘要等于targetDigest：该成员已经成功",

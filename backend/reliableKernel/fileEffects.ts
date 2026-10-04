@@ -21,6 +21,7 @@ import { RuntimeDatabase } from './runtimeDatabase';
 import { handoffReason, isExecutionHandoffError } from './executionLeaseFence';
 import { isRetryableLocalExecutionError, LocalExecutionRecoveryExhaustedError, retryLocalExecution } from './localExecutionRecovery';
 import { assertFilePlanningRoot, FileMutationNotStartedError, FilePathConflictError, fileDescriptorMatchesPathState, fileStateIdentity, normalizeFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, withFileMutationTargets, type FilePlanningRoot } from './fileTargetBoundary';
+import { isCanonicalPathInside } from '../capabilities/filesystem/pathContainment';
 import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 
 export type FileChangeOperation =
@@ -38,6 +39,8 @@ export interface FileChangeProposalMemberInput {
   workEnvironmentId: string;
   targetPath: string;
   planningRoot: FilePlanningRoot;
+  /** Implicit write parent: require a real directory, without claiming one already present. */
+  ensureParentDirectory?: true;
   baseDigest?: string | null;
   /** Exact pre-mutation bytes for replace/delete. Persisted in CAS so a completed Diff can reopen. */
   baseContent?: string | Uint8Array;
@@ -83,6 +86,8 @@ export interface FileMutationMemberObservation {
   memberSeq: string;
   outcome: FileMemberOutcome;
   actualDigest: string | null;
+  /** Observed mkdir result in EffectReceipt CAS, not ownership or permission to remove it. */
+  directoryCreation?: 'created' | 'not_created' | 'unknown';
   error?: string;
 }
 
@@ -111,6 +116,7 @@ interface SourceCommit {
 interface StoredMember {
   id: string;
   memberSeq: bigint;
+  ensureParentDirectory?: true;
   operation: FileChangeOperation;
   workEnvironmentId: string;
   targetPath: string;
@@ -126,6 +132,7 @@ interface FileEffectRequest {
     memberId: string;
     memberSeq: string;
     planningRoot: FilePlanningRoot | null;
+    ensureParentDirectory?: true;
     operation: FileChangeOperation;
     workEnvironmentId: string;
     targetPath: string;
@@ -180,11 +187,14 @@ export class FileChangeControlPlane {
     const preparedMembers: Array<{
       row: DomainRow;
       planningRoot: FilePlanningRoot;
+      ensureParentDirectory?: true;
       baseContent?: PreparedContentObject;
       targetContent?: PreparedContentObject;
     }> = [];
-    for (let index = 0; index < input.members.length; index += 1) {
-      const member = normalizeProposalMember(input.members[index]);
+    const normalizedMembers = input.members.map(normalizeProposalMember);
+    assertParentDirectoryIntents(normalizedMembers);
+    for (let index = 0; index < normalizedMembers.length; index += 1) {
+      const member = normalizedMembers[index];
       const memberId = stablePhaseDId('file_change_set_member', `${changeSetId}:${index + 1}`);
       const baseContent = member.baseContent === undefined
         ? undefined
@@ -206,6 +216,7 @@ export class FileChangeControlPlane {
       const targetDigest = targetContent?.metadata.sha256 ?? targetDigestWithoutContent(member.operation);
       preparedMembers.push({
         planningRoot: member.planningRoot,
+        ...(member.ensureParentDirectory ? { ensureParentDirectory: true } : {}),
         row: {
           id: memberId,
           change_set_id: changeSetId,
@@ -228,8 +239,9 @@ export class FileChangeControlPlane {
       canonicalJson({
         changeSetId,
         toolCallId,
-        members: preparedMembers.map(({ row, planningRoot }) => ({
+        members: preparedMembers.map(({ row, planningRoot, ensureParentDirectory }) => ({
           planningRoot,
+          ...(ensureParentDirectory ? { ensureParentDirectory: true } : {}),
           memberId: row.id,
           memberSeq: String(row.member_seq),
           operation: row.operation,
@@ -784,6 +796,7 @@ export class FileChangeControlPlane {
         memberSeq: member.memberSeq.toString(),
         outcome: 'outcome_unknown',
         actualDigest: null,
+        ...(member.ensureParentDirectory ? { directoryCreation: 'unknown' as const } : {}),
         error: reason
       }))
     };
@@ -808,6 +821,7 @@ export class FileChangeControlPlane {
           memberSeq: member.memberSeq.toString(),
           outcome: 'outcome_unknown',
           actualDigest: null,
+          ...(member.ensureParentDirectory ? { directoryCreation: 'unknown' as const } : {}),
           error: 'EffectReceipt contains no member-level observation detail.'
         }))
       };
@@ -822,6 +836,9 @@ export class FileChangeControlPlane {
       const expected = approved[index];
       if (member.memberId !== expected.id || member.memberSeq !== expected.memberSeq.toString()) {
         throw new Error('FileMutation observation member does not match the approved member order.');
+      }
+      if (member.directoryCreation !== undefined && !expected.ensureParentDirectory) {
+        throw new Error('Directory creation evidence requires an approved parent-directory intent.');
       }
     });
     if (
@@ -975,13 +992,17 @@ export class FileChangeControlPlane {
       if (Object.entries(expected).some(([key, value]) => reference[key] !== value)) {
         throw new Error('File proposal member metadata does not match SQLite facts.');
       }
-      return { row, planningRoot: reference.planningRoot == null ? null : normalizeFilePlanningRoot(reference.planningRoot) };
+      const ensureParentDirectory = normalizeParentDirectoryIntent(reference.ensureParentDirectory, requireOperation(row.operation));
+      return { row, planningRoot: reference.planningRoot == null ? null : normalizeFilePlanningRoot(reference.planningRoot), ensureParentDirectory };
     });
-    return Promise.all(rows.map(async ({ row, planningRoot }) => {
-      const member = { ...this.storedMemberFromRow(row), planningRoot };
+    const members = await Promise.all(rows.map(async ({ row, planningRoot, ensureParentDirectory }) => {
+      const member = { ...this.storedMemberFromRow(row), planningRoot,
+        ...(ensureParentDirectory ? { ensureParentDirectory } : {}) };
       await this.assertStoredMemberContent(member);
       return member;
     }));
+    assertParentDirectoryIntents(members);
+    return members;
   }
 
   private storedMemberFromRow(row: DomainRow): StoredMember {
@@ -1395,7 +1416,8 @@ export class FileMutationDispatcher {
       if (before.kind !== 'known') return memberObservation(member, before.kind === 'conflict' ? 'conflict' : 'outcome_unknown', null, before.error);
       if (before.symlink) return memberObservation(member, 'conflict', before.digest, 'Target path is a symbolic link.');
       const creates = member.operation === 'create_file' || member.operation === 'create_directory';
-      if (creates ? before.digest !== null : !sameDigest(before.digest, member.baseDigest)) {
+      const reuseParent = member.ensureParentDirectory && before.digest === DIRECTORY_DIGEST;
+      if (creates ? before.digest !== null && !reuseParent : !sameDigest(before.digest, member.baseDigest)) {
         return memberObservation(member, 'conflict', before.digest,
           creates ? 'Create target already exists.' : 'baseDigest does not match the actual target.');
       }
@@ -1406,6 +1428,9 @@ export class FileMutationDispatcher {
         return memberObservation(member, 'conflict', final.digest, 'File target identity or content changed before mutation.');
       }
       if (signal?.aborted) return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before member dispatch.');
+      if (reuseParent) {
+        return { ...memberObservation(member, 'succeeded', before.digest), directoryCreation: 'not_created' };
+      }
     } catch (error) {
       if (signal?.aborted) {
         const handoff = handoffReason(signal);
@@ -1487,7 +1512,8 @@ export class FileMutationDispatcher {
       }
       return { ...reconciled, error: errorMessage(error) };
     }
-    return reconcileMemberObservation(member, await this.inspectActual(member));
+    const observation = reconcileMemberObservation(member, await this.inspectActual(member));
+    return member.ensureParentDirectory ? { ...observation, directoryCreation: 'created' } : observation;
   }
 
   private async readTargetBytes(member: FileEffectRequest['members'][number]): Promise<Buffer> {
@@ -1609,6 +1635,7 @@ function fileEffectRequest(changeSetId: string, members: Array<StoredMember & { 
     members: members.map(member => ({
       memberId: member.id, memberSeq: member.memberSeq.toString(), operation: member.operation,
       workEnvironmentId: member.workEnvironmentId, targetPath: member.targetPath, planningRoot: member.planningRoot,
+      ...(member.ensureParentDirectory ? { ensureParentDirectory: true } : {}),
       baseDigest: member.baseDigest, baseContentObjectId: member.baseContentObjectId,
       targetContentObjectId: member.targetContentObjectId, targetDigest: member.targetDigest
     }))
@@ -1646,6 +1673,7 @@ function memberObservation(
     memberSeq: member.memberSeq,
     outcome,
     actualDigest,
+    ...(member.ensureParentDirectory ? { directoryCreation: 'unknown' as const } : {}),
     ...(error ? { error } : {})
   };
 }
@@ -1676,6 +1704,7 @@ function fileOutcomeToToolOutcome(outcome: FileMutationOutcome): Exclude<ToolOut
 
 function normalizeProposalMember(input: FileChangeProposalMemberInput): {
   planningRoot: FilePlanningRoot;
+  ensureParentDirectory?: true;
   operation: FileChangeOperation;
   workEnvironmentId: string;
   targetPath: string;
@@ -1717,6 +1746,7 @@ function normalizeProposalMember(input: FileChangeProposalMemberInput): {
   }
   return {
     operation,
+    ...(normalizeParentDirectoryIntent(input.ensureParentDirectory, operation) ? { ensureParentDirectory: true } : {}),
     planningRoot: normalizeFilePlanningRoot(input.planningRoot),
     workEnvironmentId: requireId(input.workEnvironmentId, 'workEnvironmentId'),
     targetPath: requireText(input.targetPath, 'targetPath'),
@@ -1743,6 +1773,7 @@ function normalizeEffectRequest(value: FileEffectRequest): FileEffectRequest {
     planningRoot: member.planningRoot == null ? null : normalizeFilePlanningRoot(member.planningRoot),
     memberSeq: requireDecimalString(member.memberSeq, 'memberSeq'),
     operation: requireOperation(member.operation),
+    ...(normalizeParentDirectoryIntent(member.ensureParentDirectory, requireOperation(member.operation)) ? { ensureParentDirectory: true as const } : {}),
     workEnvironmentId: requireId(member.workEnvironmentId, 'workEnvironmentId'),
     targetPath: requireText(member.targetPath, 'targetPath'),
     baseDigest: nullableDigest(member.baseDigest, 'baseDigest'),
@@ -1755,6 +1786,7 @@ function normalizeEffectRequest(value: FileEffectRequest): FileEffectRequest {
     if (member.memberSeq !== String(index + 1)) throw new Error('FileChangeSetMember memberSeq must be contiguous from 1.');
     assertEffectRequestMemberShape(member);
   }
+  assertParentDirectoryIntents(members);
   return { changeSetId: requireId(value.changeSetId, 'changeSetId'), members };
 }
 
@@ -1792,12 +1824,51 @@ function normalizeObservation(value: unknown, changeSetId: string): FileMutation
       memberSeq: requireDecimalString(member.memberSeq, 'memberSeq'),
       outcome,
       actualDigest: nullableTargetDigest(member.actualDigest, 'actualDigest'),
+      ...(member.directoryCreation === undefined ? {} : { directoryCreation: requireDirectoryCreation(member.directoryCreation) }),
       ...(typeof member.error === 'string' && member.error ? { error: member.error } : {})
     };
   });
   const outcome = requireFileMutationOutcome(record.outcome);
   if (aggregateFileMemberOutcomes(members) !== outcome) throw new Error('FileMutation aggregate outcome does not match member observations.');
   return { changeSetId, outcome, members };
+}
+
+function normalizeParentDirectoryIntent(value: unknown, operation: FileChangeOperation): true | undefined {
+  if (value === undefined) return undefined;
+  if (value !== true || operation !== 'create_directory') {
+    throw new TypeError('ensureParentDirectory is only valid for an implicit create_directory member.');
+  }
+  return true;
+}
+
+/** An ensure is approval-bound to a later file creation, never a relaxed explicit mkdir. */
+function assertParentDirectoryIntents(members: Array<{
+  operation: FileChangeOperation;
+  workEnvironmentId: string;
+  targetPath: string;
+  planningRoot: FilePlanningRoot | null;
+  ensureParentDirectory?: true;
+}>): void {
+  for (let index = 0; index < members.length; index += 1) {
+    const member = members[index];
+    if (!member.ensureParentDirectory) continue;
+    const root = member.planningRoot?.canonicalPath ?? path.parse(path.resolve(member.targetPath)).root;
+    const parent = path.resolve(root, member.targetPath);
+    const hasFile = members.slice(index + 1).some(child => {
+      if (child.operation !== 'create_file' || child.workEnvironmentId !== member.workEnvironmentId
+        || canonicalJson(child.planningRoot) !== canonicalJson(member.planningRoot)) return false;
+      const target = path.resolve(root, child.targetPath);
+      return target !== parent && isCanonicalPathInside(parent, target);
+    });
+    if (!hasFile) throw new Error('Implicit parent directory must precede a file creation inside the same approved boundary.');
+  }
+}
+
+function requireDirectoryCreation(value: unknown): NonNullable<FileMutationMemberObservation['directoryCreation']> {
+  if (value !== 'created' && value !== 'not_created' && value !== 'unknown') {
+    throw new TypeError('Invalid directory creation evidence.');
+  }
+  return value;
 }
 
 function normalizeSource<T extends PhaseDCommandSource['kind']>(

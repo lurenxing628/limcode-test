@@ -217,7 +217,8 @@ async function inspectLocalTarget(
 /**
  * Missing write parents are explicit proposal members, not an untracked dispatcher side effect.
  * This makes approval, receipts and crash recovery cover every created directory as well as the
- * final file. Existing path components must be real directories and may not be symbolic links.
+ * final file. Their ensure-only intent permits another approved write to create a shared parent
+ * while this plan awaits approval. Existing components must be real directories, never links.
  */
 async function planMissingParentDirectories(
   resolved: ResolvedLocalToolPath,
@@ -257,6 +258,7 @@ async function planMissingParentDirectories(
     }
     members.push({
       operation: 'create_directory',
+      ensureParentDirectory: true,
       workEnvironmentId: resolved.workEnvironmentId,
       planningRoot,
       targetPath: path.relative(realRoot, current).split(path.sep).join('/')
