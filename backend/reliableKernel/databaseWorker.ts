@@ -77,6 +77,7 @@ import {
   type ContextMaterializationRecord,
   type ContextMaterializationSnapshot,
   type ContextModelSource,
+  type ContextReminderAuthoritySource,
   type DatabaseWorkerData,
   type DatabaseWorkerDiagnostics,
   type DatabaseWorkerRequest,
@@ -2815,6 +2816,7 @@ function decodeContextRecords(
   // Frozen recipe of the ModelRequest that produced a model message segment. A fork copy of the same
   // request shares the recipe object; any disagreement or an unlinked source leaves it unset.
   const recipeSources = new Map<string, string | null>();
+  const reminderAuthorities = new Map<string, ContextReminderAuthoritySource | null>();
   // Claude 保留思考处理：产生这条模型输出的请求终态里记下的对话选择；多个来源取更强的一种（只会单向推进）。
   const thinkingBindings = new Map<string, 'drop_block' | 'strip_thinking'>();
   for (let offset = 0; offset < messageSegmentIds.length; offset += 500) {
@@ -2826,6 +2828,9 @@ function decodeContextRecords(
              model_request.provider_id AS source_provider_id,
              model_request.model_id AS source_model_id,
              model_request.recipe_object_id AS source_recipe_object_id,
+             model_request.id AS source_model_request_id,
+             authority.id AS source_authority_snapshot_id,
+             authority.content_object_id AS source_authority_content_id,
              model_request.stream_stats_json AS source_stream_stats_json
         FROM context_segment_source AS source
         JOIN message_revision AS revision
@@ -2837,6 +2842,9 @@ function decodeContextRecords(
          AND revision.role = 'model'
         LEFT JOIN model_request
           ON model_request.id = model_link.model_request_id
+        LEFT JOIN authority_snapshot AS authority
+          ON authority.id = model_request.authority_snapshot_id
+         AND authority.turn_id = model_request.turn_id
        WHERE source.source_kind = 'message_revision'
          AND source.segment_id IN (${placeholders})
        ORDER BY source.segment_id, source.id
@@ -2846,6 +2854,9 @@ function decodeContextRecords(
       source_provider_id: string | null;
       source_model_id: string | null;
       source_recipe_object_id: string | null;
+      source_model_request_id: string | null;
+      source_authority_snapshot_id: string | null;
+      source_authority_content_id: string | null;
       source_stream_stats_json: string | null;
     }>;
     for (const source of sourceRows) {
@@ -2872,6 +2883,15 @@ function decodeContextRecords(
       const previousRecipe = recipeSources.get(segmentId);
       if (previousRecipe === undefined) recipeSources.set(segmentId, recipeObjectId);
       else if (previousRecipe !== recipeObjectId) recipeSources.set(segmentId, null);
+      const reminderAuthority = source.source_model_request_id && source.source_authority_snapshot_id && source.source_authority_content_id
+        ? { modelRequestId: source.source_model_request_id, authoritySnapshotId: source.source_authority_snapshot_id,
+            contentObjectId: source.source_authority_content_id } : null;
+      const previousAuthority = reminderAuthorities.get(segmentId);
+      if (previousAuthority === undefined) reminderAuthorities.set(segmentId, reminderAuthority);
+      else if (previousAuthority && (!reminderAuthority
+        || previousAuthority.modelRequestId !== reminderAuthority.modelRequestId
+        || previousAuthority.authoritySnapshotId !== reminderAuthority.authoritySnapshotId
+        || previousAuthority.contentObjectId !== reminderAuthority.contentObjectId)) reminderAuthorities.set(segmentId, null);
       const binding = sourceClaudeThinkingBinding(source.source_stream_stats_json);
       if (binding && thinkingBindings.get(segmentId) !== 'strip_thinking') thinkingBindings.set(segmentId, binding);
     }
@@ -2886,7 +2906,8 @@ function decodeContextRecords(
       roles.get(String(row.segment_id)) ?? [],
       modelSources.get(String(row.segment_id)),
       recipeSources.get(String(row.segment_id)),
-      thinkingBindings.get(String(row.segment_id))
+      thinkingBindings.get(String(row.segment_id)),
+      reminderAuthorities.get(String(row.segment_id))
     );
   }
   return records as ContextMaterializationRecord[];
@@ -2913,7 +2934,8 @@ function decodeContextRecord(
   messageRoles: readonly string[],
   modelSource?: ContextModelSource | null,
   sourceRecipeObjectId?: string | null,
-  sourceThinkingBinding?: 'drop_block' | 'strip_thinking'
+  sourceThinkingBinding?: 'drop_block' | 'strip_thinking',
+  sourceReminderAuthority?: ContextReminderAuthoritySource | null
 ): ContextMaterializationRecord {
   const segmentKind = typeof row.segment_kind === 'string' ? row.segment_kind : '';
   let messageRole: string | null = null;
@@ -2947,6 +2969,7 @@ function decodeContextRecord(
     messageRole,
     ...(modelSource ? { modelSource } : {}),
     ...(messageRole === 'model' && sourceRecipeObjectId ? { sourceRecipeObjectId } : {}),
+    ...(messageRole === 'model' && sourceRecipeObjectId && sourceReminderAuthority ? { sourceReminderAuthority } : {}),
     ...(messageRole === 'model' && sourceThinkingBinding ? { sourceClaudeThinkingBinding: sourceThinkingBinding } : {})
   };
 }

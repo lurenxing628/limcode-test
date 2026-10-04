@@ -10,7 +10,8 @@ import {
   type DomainRow,
   type RepositoryInsertMutation
 } from './repositories';
-import { RootAuthority, sameBindingIdentity } from './rootAuthority';
+import { RootAuthority, RootAuthorityError, sameBindingIdentity } from './rootAuthority';
+import { isExecutionHandoffError } from './executionLeaseFence';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { VerifiedContentRanges } from './verifiedContentRanges';
 
@@ -348,6 +349,42 @@ export class ContentAddressedStore {
       const bytes = contents.get(entry.id);
       if (!bytes) throw new Error(`CAS batch read lost ContentObject ${entry.id}.`);
       return Buffer.from(bytes);
+    });
+  }
+
+  /**
+   * Optional derived-data lookup only. Unavailable/corrupt immutable objects cannot prove a fact;
+   * required recipe reads continue to use read/readMany and retain their fail-closed behavior.
+   * Root fences are mandatory and deliberately outside the per-object failure boundary.
+   */
+  public async readOptionalMany(metadata: readonly ContentObjectMetadata[]): Promise<Array<Buffer | undefined>> {
+    await this.authority.validate(this.binding);
+    const unique = [...new Map(metadata.map(entry => [entry.id, entry])).values()];
+    const contents = new Map<string, Buffer | undefined>();
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(32, Math.max(1, unique.length)) }, async () => {
+      for (;;) {
+        const index = nextIndex++;
+        if (index >= unique.length) return;
+        const entry = unique[index];
+        let bytes: Buffer;
+        try {
+          // This method performs only immutable CAS object/cache identity and byte verification.
+          // Keep control-plane failures distinct even if a future reader propagates one here.
+          bytes = await this.readVerifiedObject(entry);
+        } catch (error) {
+          if (error instanceof RootAuthorityError || isExecutionHandoffError(error)
+            || (error && typeof error === 'object' && 'name' in error && error.name === 'AbortError')) throw error;
+          contents.set(entry.id, undefined);
+          continue;
+        }
+        contents.set(entry.id, bytes);
+      }
+    }));
+    await this.authority.validate(this.binding);
+    return metadata.map(entry => {
+      const bytes = contents.get(entry.id);
+      return bytes === undefined ? undefined : Buffer.from(bytes);
     });
   }
 

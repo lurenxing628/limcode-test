@@ -1,6 +1,6 @@
 import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
 import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
-import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
+import { canonicalLlmProviderKind, type LlmThinkingConfigRecord, type LlmProviderKind } from '../../shared/protocol';
 
 import { createHash } from 'node:crypto';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
@@ -66,6 +66,7 @@ import {
   MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT,
   MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT,
   type ContextModelSource,
+  type ContextReminderAuthoritySource,
   type ModelRequestCancelResult
 } from './databaseWorkerProtocol';
 import {
@@ -608,6 +609,7 @@ export class ModelProviderControlPlane {
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
   private readonly historicalTurnReminders = new HistoricalTurnReminderCache();
+  private readonly historicalReminderEligibility = new HistoricalReminderEligibilityCache();
   /** Durable Astra steering submissions/receipts; shared with the Agent loop's native session. */
   public readonly nativeSteering: NativeSteeringStore;
   private handoff: ExecutionHandoffError | undefined;
@@ -2772,9 +2774,11 @@ export class ModelProviderControlPlane {
   ): Promise<TurnReminderHistoryEntry[] | undefined> {
     const ordinary = isRecord(recipe) && recipe.kind === 'reliable-agent-turn' && claudeTurnScopedRemindersEnabled(authority);
     if (!ordinary && !claudeTurnScopedCompaction(authority, recipe)) return undefined;
-    const sources = segments.filter((segment) => segment.segmentKind === 'message'
+    let sources = segments.filter((segment) => segment.segmentKind === 'message'
       && segment.messageRole === 'model'
       && typeof segment.sourceRecipeObjectId === 'string');
+    if (sources.length === 0) return undefined;
+    sources = await this.filterHistoricalReminderSources(sources);
     if (sources.length === 0) return undefined;
     // 本次用到的结果放在局部表里：缓存有界，边读边淘汰不能让某一条提醒悄悄消失。
     const facts = new Map<string, HistoricalRequestFacts | null>();
@@ -2856,6 +2860,62 @@ export class ModelProviderControlPlane {
           : {})
       };
     });
+  }
+
+  /** Published producers freeze delivery from this exact authority; unknown legacy facts keep recipe replay. */
+  private async filterHistoricalReminderSources(
+    sources: MaterializedContextSegment[]
+  ): Promise<MaterializedContextSegment[]> {
+    const decisions = new Map<string, boolean>();
+    const missing = new Map<string, ContextReminderAuthoritySource>();
+    for (const source of sources) {
+      if (!source.sourceReminderAuthority) continue;
+      const key = historicalReminderAuthorityKey(source.sourceReminderAuthority);
+      if (decisions.has(key) || missing.has(key)) continue;
+      const cached = this.historicalReminderEligibility.get(key);
+      if (cached === undefined) missing.set(key, source.sourceReminderAuthority);
+      else decisions.set(key, cached);
+    }
+    // Many requests share one frozen Turn authority. Resolve distinct CAS objects in PK batches,
+    // never scan all ModelRequests or read one authority body per selected message.
+    const contentIds = [...new Set([...missing.values()].map(source => source.contentObjectId))];
+    const byContent = new Map<string, boolean>();
+    for (let offset = 0; offset < contentIds.length; offset += HISTORICAL_REMINDER_READ_BATCH) {
+      const ids = contentIds.slice(offset, offset + HISTORICAL_REMINDER_READ_BATCH);
+      const snapshot = await this.database.snapshot(ids.map(id => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
+      const metadata: ContentObjectMetadata[] = [];
+      snapshot.snapshot.forEach((row, index) => {
+        // Missing/ambiguous metadata cannot prove a negative. Preserve the existing recipe path.
+        if (!row || Array.isArray(row) || row.id !== ids[index]
+          || typeof row.byte_length !== 'bigint' || row.byte_length < 0n) return;
+        metadata.push(asContentObjectMetadata(row));
+      });
+      for (const range of historicalReminderBodyRanges(metadata)) {
+        await this.readHistoricalReminderAuthorityBatch(metadata.slice(range.start, range.end), byContent);
+        await yieldToEventLoop();
+      }
+    }
+    for (const [key, source] of missing) {
+      const skip = byContent.get(source.contentObjectId);
+      if (skip === undefined) continue;
+      decisions.set(key, skip);
+      this.historicalReminderEligibility.set(key, skip);
+    }
+    return sources.filter(source => !source.sourceReminderAuthority
+      || decisions.get(historicalReminderAuthorityKey(source.sourceReminderAuthority)) !== true);
+  }
+
+  private async readHistoricalReminderAuthorityBatch(
+    metadata: readonly ContentObjectMetadata[],
+    decisions: Map<string, boolean>
+  ): Promise<void> {
+    // Optional immutable-data failure means unknown; mandatory root/ownership/cancellation fences still throw.
+    const bodies = await this.contentStore.readOptionalMany(metadata);
+    for (const row of metadata) {
+      const body = bodies.shift();
+      if (!body) continue;
+      decisions.set(row.id, historicalReminderAuthorityCanSkip(body));
+    }
   }
 
   private async materializeHistoricalReminderBodyBatch(
@@ -3332,6 +3392,46 @@ function* historicalReminderBodyRanges(
   }
 }
 const HISTORICAL_REMINDER_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+/** Pure negative eligibility: never turn an absent/unknown legacy flag into false. */
+function historicalReminderAuthorityCanSkip(bytes: Buffer): boolean {
+  let authority: unknown;
+  try { authority = JSON.parse(bytes.toString('utf8')); } catch { return false; }
+  if (!isRecord(authority) || !isRecord(authority.model)) return false;
+  const provider = canonicalLlmProviderKind(authority.model.provider);
+  if (!provider) return false;
+  return provider !== 'claude' || authority.model.claudeTurnScopedReminders === false;
+}
+
+function historicalReminderAuthorityKey(source: ContextReminderAuthoritySource): string {
+  // The selected-source join proves producer/Turn/authority agreement on every call. Once
+  // resolved, eligibility is a pure fact of this immutable authority CAS object, not its producer.
+  return source.contentObjectId;
+}
+
+/** Bound to this control plane's DB/store lifetime; shared immutable authorities share one boolean. */
+class HistoricalReminderEligibilityCache {
+  private readonly entries = new Map<string, { skip: boolean; bytes: number }>();
+  private bytes = 0;
+  public get(key: string): boolean | undefined {
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    this.entries.delete(key); this.entries.set(key, entry);
+    return entry.skip;
+  }
+  public set(key: string, skip: boolean): void {
+    const bytes = 128 + key.length * 2;
+    if (bytes > HISTORICAL_REMINDER_CACHE_MAX_BYTES) return;
+    const prior = this.entries.get(key);
+    if (prior) { this.entries.delete(key); this.bytes -= prior.bytes; }
+    this.entries.set(key, { skip, bytes }); this.bytes += bytes;
+    while (this.bytes > HISTORICAL_REMINDER_CACHE_MAX_BYTES) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.bytes -= this.entries.get(oldest)!.bytes; this.entries.delete(oldest);
+    }
+  }
+}
 
 /**
  * Owned by one ModelProviderControlPlane: the database/store lifetime and immutable recipe CAS

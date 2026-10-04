@@ -73,6 +73,13 @@ export interface ContextModelSource {
   modelId: string;
 }
 
+/** Exact selected producer identity; absent when source links are missing or disagree. */
+export interface ContextReminderAuthoritySource {
+  modelRequestId: string;
+  authoritySnapshotId: string;
+  contentObjectId: string;
+}
+
 export interface ContextMaterializationRecord {
   node: DomainRow;
   segment: DomainRow;
@@ -82,6 +89,7 @@ export interface ContextMaterializationRecord {
   modelSource?: ContextModelSource;
   /** Frozen recipe ContentObject of the ModelRequest whose output this model message segment is. */
   sourceRecipeObjectId?: string;
+  sourceReminderAuthority?: ContextReminderAuthoritySource;
   /** Claude 保留思考处理：产生这条模型输出的 ModelRequest 实际发出时这个对话已选定的处理（stream_stats 里的持久记录）。 */
   sourceClaudeThinkingBinding?: 'drop_block' | 'strip_thinking';
 }
