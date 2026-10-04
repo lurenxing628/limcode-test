@@ -53,6 +53,7 @@ export interface ForkContextRoots {
 const PAGE_LIMIT = 1000;
 // Bound transient lookup instructions/results; the final copy remains one atomic transaction.
 const FORK_MESSAGE_READ_BATCH_SIZE = 128;
+const FORK_FACT_READ_BATCH_SIZE = 64;
 
 interface MessageFact {
   message: DomainRow;
@@ -196,7 +197,7 @@ export async function prepareConversationForkSnapshot(
   ]));
   input.assertActive?.();
   const requestRows = await getRows(database, 'ModelRequest', requestIds, input.assertActive);
-  const requestAggregates = await readRequestAggregates(database, requestRows);
+  const requestAggregates = await readRequestAggregates(database, requestRows, input.assertActive);
   const requestIdSet = new Set(requestAggregates.map((entry) => id(entry.request.id, 'ModelRequest.id')));
   const requestRowsById = new Map(requestRows.map((request) => [id(request.id, 'ModelRequest.id'), request]));
   const nativeRevisions = new Map<string, NativeMessageContextRevision[]>();
@@ -227,7 +228,7 @@ export async function prepareConversationForkSnapshot(
     unique(toolSources.map((source) => id(source.tool_call_id, 'ToolCallSourceLink.tool_call_id'))),
     input.assertActive
   );
-  const tools = await readToolFacts(database, toolSources, toolRows);
+  const tools = await readToolFacts(database, toolSources, toolRows, input.assertActive);
   if (contextLineage) {
     const included = contextLineage.segmentIds;
     for (const tool of tools) {
@@ -275,7 +276,7 @@ export async function prepareConversationForkSnapshot(
   if ((await readNativeSteeringInFlight(database, input.sourceConversationId)).some((entry) => copiedTurnIds.has(entry.turnId))) {
     throw new Error('Fork source history still has an unsettled native steering instruction; wait for it to settle.');
   }
-  const turnRelations = await readTurnRelations(database, turnRows);
+  const turnRelations = await readTurnRelations(database, turnRows, input.assertActive);
   // A Turn whose whole visible transcript is copied is copied with every ModelRequest it made,
   // including compression and failed requests that own no Message, so its original termination
   // stays valid. Output a retry, edit or delete soft-deleted keeps its Turn links but is not part of
@@ -297,7 +298,7 @@ export async function prepareConversationForkSnapshot(
       ? relation.modelRequests.filter((request) => !requestIdSet.has(id(request.id, 'ModelRequest.id')))
       : [];
   });
-  for (const aggregate of await readRequestAggregates(database, completeTurnRequests)) {
+  for (const aggregate of await readRequestAggregates(database, completeTurnRequests, input.assertActive)) {
     const requestId = id(aggregate.request.id, 'ModelRequest.id');
     requestAggregates.push(aggregate);
     requestIdSet.add(requestId);
@@ -306,14 +307,21 @@ export async function prepareConversationForkSnapshot(
   // Every fork owns its history: each copied Turn owns a copy of its frozen AuthoritySnapshot and
   // copied requests reference that copy, never a row of the source (or a deleted parent). The copy
   // is a historical record: a child's own Turns still compile their authority from its assignment.
-  const authoritySnapshots = (await Promise.all(turnRows.map((turn) =>
-    listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
-  ))).flat();
+  const authoritySnapshots: DomainRow[] = [];
+  for (let offset = 0; offset < turnRows.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    input.assertActive?.();
+    const batch = turnRows.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE);
+    const snapshots = await Promise.all(batch.map((turn) =>
+      listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
+    ));
+    input.assertActive?.();
+    for (const rows of snapshots) for (const snapshot of rows) authoritySnapshots.push(snapshot);
+  }
   const projections = input.contextRoots
     ? await readRequestProjections(database, requestAggregates, input.contextRoots, input.assertActive)
     : [];
   const blockCopies = await readCompressionBlockCopies(database, compressionBlocks, input.contextRoots, input.assertActive);
-  const fileFacts = await readFileFacts(database, tools);
+  const fileFacts = await readFileFacts(database, tools, input.assertActive);
   const interactionFacts = await readInteractionFacts(database, tools, input.assertActive);
 
   const attachmentIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
@@ -368,6 +376,7 @@ export async function prepareConversationForkSnapshot(
 
   const assertions: RepositoryTransactionStep[] = [];
   const inserts: RepositoryTransactionStep[] = [];
+  const turnInserts: RepositoryTransactionStep[] = [];
   const preservedTurnIds = new Set<string>();
   for (const handle of sourceAttachmentHandles) {
     const sourceHandleId = id(handle.id, 'ConversationAttachmentHandleLink.id');
@@ -426,7 +435,7 @@ export async function prepareConversationForkSnapshot(
       conversation_id: input.sourceConversationId,
       status: 'terminated'
     }));
-    inserts.unshift(DOMAIN_REPOSITORIES.domain('Turn').insert({
+    turnInserts.push(DOMAIN_REPOSITORIES.domain('Turn').insert({
       ...turn,
       id: targetTurnId,
       conversation_id: target,
@@ -545,7 +554,8 @@ export async function prepareConversationForkSnapshot(
 
   return {
     assertions,
-    inserts,
+    // Match repeated unshift's exact reverse Turn order without shifting the full history per Turn.
+    inserts: turnInserts.reverse().concat(inserts),
     copiedVisibleMessageCount: messageFacts.length
   };
 }
@@ -656,13 +666,13 @@ async function readVisibleMessageFacts(
         ...candidate,
         attachments: await completeRows(database, relationBarrier!.snapshot[offset], 'AttachmentLink', {
           message_revision_id: revisionId
-        }),
+        }, assertActive),
         contextSources: await completeRows(database, relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource', {
           source_kind: 'message_revision', source_id: revisionId
-        }),
-        turnLinks: await completeRows(database, relationBarrier!.snapshot[offset + 2], 'MessageTurnLink', { message_id: messageId }),
+        }, assertActive),
+        turnLinks: await completeRows(database, relationBarrier!.snapshot[offset + 2], 'MessageTurnLink', { message_id: messageId }, assertActive),
         requestLinks: rows(relationBarrier!.snapshot[offset + 3], 'ModelRequestMessageLink fork source lookup'),
-        toolSources: await completeRows(database, relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink', { message_id: messageId })
+        toolSources: await completeRows(database, relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink', { message_id: messageId }, assertActive)
       };
       if (fact.turnLinks.some((link) => link.role === NATIVE_STEER_MESSAGE_TURN_ROLE)) {
         if (!contextLineage) throw new Error('Native steering fork requires an explicit Context prefix.');
@@ -686,7 +696,16 @@ function requireTerminatedTurns(turns: readonly DomainRow[]): void {
   }
 }
 
-async function readRequestAggregates(database: RuntimeDatabase, requests: DomainRow[]): Promise<RequestAggregate[]> {
+async function readRequestAggregates(database: RuntimeDatabase, requests: DomainRow[], assertActive?: () => void): Promise<RequestAggregate[]> {
+  const result: RequestAggregate[] = [];
+  for (let offset = 0; offset < requests.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    result.push(...await readRequestAggregateBatch(database, requests.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE), assertActive));
+  }
+  return result;
+}
+
+async function readRequestAggregateBatch(database: RuntimeDatabase, requests: DomainRow[], assertActive?: () => void): Promise<RequestAggregate[]> {
   if (requests.length === 0) return [];
   for (const request of requests) {
     if (request.status !== 'terminal') {
@@ -717,7 +736,7 @@ async function readRequestAggregates(database: RuntimeDatabase, requests: Domain
   for (const [index, request] of requests.entries()) {
     const attempts = (await completeRows(database, aggregateBarrier.snapshot[index * 2], 'Attempt', {
       operation_id: id(operations[index].id, 'Operation.id')
-    })).sort((left, right) => compareInteger(left.attempt_seq, right.attempt_seq));
+    }, assertActive)).sort((left, right) => compareInteger(left.attempt_seq, right.attempt_seq));
     if (attempts.length === 0) throw new Error(`Fork source ModelRequest ${String(request.id)} has no Attempt.`);
     const fences = rows(aggregateBarrier.snapshot[index * 2 + 1], 'ModelStreamFence fork source lookup');
     if (fences.length > 1) throw new Error(`Fork source ModelRequest ${String(request.id)} has multiple fences.`);
@@ -734,16 +753,22 @@ async function readRequestProjections(
   assertActive?: () => void
 ): Promise<Array<{ projection: DomainRow; rootId: string }>> {
   if (aggregates.length === 0) return [];
-  const barrier = await database.snapshot(aggregates.map((aggregate) =>
-    DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
-      where: { owner_kind: 'model_request', owner_id: id(aggregate.request.id, 'ModelRequest.id') }, limit: 2
-    })
-  ));
-  const projections = barrier.snapshot.flatMap((value) => {
-    const found = rows(value, 'ModelContextProjection fork source lookup');
-    if (found.length > 1) throw new Error('Fork source ModelRequest has multiple Context projections.');
-    return found;
-  });
+  const projections: DomainRow[] = [];
+  for (let offset = 0; offset < aggregates.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = aggregates.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.map((aggregate) =>
+      DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+        where: { owner_kind: 'model_request', owner_id: id(aggregate.request.id, 'ModelRequest.id') }, limit: 2
+      })
+    ));
+    assertActive?.();
+    for (const value of barrier.snapshot) {
+      const found = rows(value, 'ModelContextProjection fork source lookup');
+      if (found.length > 1) throw new Error('Fork source ModelRequest has multiple Context projections.');
+      for (const projection of found) projections.push(projection);
+    }
+  }
   const sourceRoots = await getRows(database, 'ContextSequenceRoot', unique(projections.map((projection) =>
     id(projection.root_id, 'ModelContextProjection.root_id')
   )), assertActive);
@@ -770,10 +795,25 @@ export function mapForkContextRoot(sourceRoot: DomainRow, roots: ForkContextRoot
 async function readToolFacts(
   database: RuntimeDatabase,
   sources: DomainRow[],
-  toolCalls: DomainRow[]
+  toolCalls: DomainRow[],
+  assertActive?: () => void
+): Promise<ToolFact[]> {
+  const sourceByTool = new Map(sources.map((source) => [id(source.tool_call_id, 'ToolCallSourceLink.tool_call_id'), source]));
+  const result: ToolFact[] = [];
+  for (let offset = 0; offset < toolCalls.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    result.push(...await readToolFactBatch(database, sourceByTool, toolCalls.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE), assertActive));
+  }
+  return result;
+}
+
+async function readToolFactBatch(
+  database: RuntimeDatabase,
+  sourceByTool: ReadonlyMap<string, DomainRow>,
+  toolCalls: DomainRow[],
+  assertActive?: () => void
 ): Promise<ToolFact[]> {
   if (toolCalls.length === 0) return [];
-  const sourceByTool = new Map(sources.map((source) => [id(source.tool_call_id, 'ToolCallSourceLink.tool_call_id'), source]));
   const reads = toolCalls.flatMap((tool): RepositoryRead[] => {
     const toolCallId = id(tool.id, 'ToolCall.id');
     if (tool.status !== 'terminal') throw new Error(`Fork source ToolCall ${toolCallId} is not terminal.`);
@@ -800,11 +840,11 @@ async function readToolFacts(
       toolCall,
       source: sourceByTool.get(toolCallId)!,
       policy: rows(barrier.snapshot[index * 7], 'ToolCallPolicySnapshot fork source lookup')[0] ?? null,
-      events: (await completeRows(database, barrier.snapshot[index * 7 + 1], 'ToolCallEvent', { tool_call_id: toolCallId }))
+      events: (await completeRows(database, barrier.snapshot[index * 7 + 1], 'ToolCallEvent', { tool_call_id: toolCallId }, assertActive))
         .sort((left, right) => compareInteger(left.event_seq, right.event_seq)),
       execution,
       outcome,
-      artifacts: await completeRows(database, barrier.snapshot[index * 7 + 4], 'ToolResultArtifact', { tool_call_id: toolCallId }),
+      artifacts: await completeRows(database, barrier.snapshot[index * 7 + 4], 'ToolResultArtifact', { tool_call_id: toolCallId }, assertActive),
       modelResult,
       callSource: callSources[0]
     });
@@ -831,6 +871,21 @@ async function readToolFacts(
 }
 
 async function readToolResultMessages(
+  database: RuntimeDatabase,
+  tools: ToolFact[],
+  sourceConversationId: string,
+  assertActive?: () => void
+): Promise<MessageFact[]> {
+  const byMessage = new Map<string, MessageFact>();
+  for (let offset = 0; offset < tools.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    const facts = await readToolResultMessageBatch(database, tools.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE), sourceConversationId, assertActive);
+    for (const fact of facts) byMessage.set(id(fact.message.id, 'Message.id'), fact);
+  }
+  return [...byMessage.values()].sort((left, right) => compareMessageMembership(left.membership, right.membership));
+}
+
+async function readToolResultMessageBatch(
   database: RuntimeDatabase,
   tools: ToolFact[],
   sourceConversationId: string,
@@ -870,9 +925,9 @@ async function readToolResultMessages(
       revision,
       attachments: await completeRows(database, barrier.snapshot[index * 5 + 3], 'AttachmentLink', {
         message_revision_id: id(revision.id, 'MessageRevision.id')
-      }),
+      }, assertActive),
       contextSources: [],
-      turnLinks: await completeRows(database, barrier.snapshot[index * 5 + 4], 'MessageTurnLink', { message_id: messageId }),
+      turnLinks: await completeRows(database, barrier.snapshot[index * 5 + 4], 'MessageTurnLink', { message_id: messageId }, assertActive),
       requestLinks: [],
       toolSources: []
     });
@@ -880,7 +935,17 @@ async function readToolResultMessages(
   return [...byMessage.values()].sort((left, right) => compareMessageMembership(left.membership, right.membership));
 }
 
-async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]): Promise<Map<string, TurnRelations>> {
+async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[], assertActive?: () => void): Promise<Map<string, TurnRelations>> {
+  const result = new Map<string, TurnRelations>();
+  for (let offset = 0; offset < turns.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = await readTurnRelationBatch(database, turns.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE), assertActive);
+    for (const [turnId, relations] of batch) result.set(turnId, relations);
+  }
+  return result;
+}
+
+async function readTurnRelationBatch(database: RuntimeDatabase, turns: DomainRow[], assertActive?: () => void): Promise<Map<string, TurnRelations>> {
   if (turns.length === 0) return new Map();
   const barrier = await database.snapshot(turns.flatMap((turn): RepositoryRead[] => {
     const turnId = id(turn.id, 'Turn.id');
@@ -906,9 +971,9 @@ async function readTurnRelations(database: RuntimeDatabase, turns: DomainRow[]):
     relations.set(turnId, {
       termination: terminations[0] ?? null,
       executor: executors[0] ?? null,
-      messageLinks: await completeRows(database, barrier.snapshot[offset + 2], 'MessageTurnLink', { turn_id: turnId }),
-      modelRequests: await completeRows(database, barrier.snapshot[offset + 3], 'ModelRequest', { turn_id: turnId }),
-      toolCalls: await completeRows(database, barrier.snapshot[offset + 4], 'ToolCall', { turn_id: turnId }),
+      messageLinks: await completeRows(database, barrier.snapshot[offset + 2], 'MessageTurnLink', { turn_id: turnId }, assertActive),
+      modelRequests: await completeRows(database, barrier.snapshot[offset + 3], 'ModelRequest', { turn_id: turnId }, assertActive),
+      toolCalls: await completeRows(database, barrier.snapshot[offset + 4], 'ToolCall', { turn_id: turnId }, assertActive),
       finalOutputFences
     });
   }
@@ -929,13 +994,19 @@ async function readDiscardedTurnOutput(
   const uncopiedTools = relations.flatMap((relation) => relation.toolCalls)
     .map((tool) => id(tool.id, 'ToolCall.id'))
     .filter((toolCallId) => !copiedToolIds.has(toolCallId));
-  const toolSourceBarrier = uncopiedTools.length > 0 ? await database.snapshot(uncopiedTools.map((toolCallId) =>
-    DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { tool_call_id: toolCallId }, limit: 2 })
-  )) : { snapshot: [] };
-  const toolSourceMessages = new Map(uncopiedTools.flatMap((toolCallId, index) => {
-    const sources = rows(toolSourceBarrier.snapshot[index], 'ToolCallSourceLink discarded output lookup');
-    return sources.length === 1 ? [[toolCallId, id(sources[0].message_id, 'ToolCallSourceLink.message_id')] as const] : [];
-  }));
+  const toolSourceMessages = new Map<string, string>();
+  for (let offset = 0; offset < uncopiedTools.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = uncopiedTools.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.map((toolCallId) =>
+      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { tool_call_id: toolCallId }, limit: 2 })
+    ));
+    assertActive?.();
+    for (const [index, toolCallId] of batch.entries()) {
+      const sources = rows(barrier.snapshot[index], 'ToolCallSourceLink discarded output lookup');
+      if (sources.length === 1) toolSourceMessages.set(toolCallId, id(sources[0].message_id, 'ToolCallSourceLink.message_id'));
+    }
+  }
   const candidates = unique([
     ...relations.flatMap((relation) => relation.messageLinks.map((link) => id(link.message_id, 'MessageTurnLink.message_id'))),
     ...toolSourceMessages.values()
@@ -1074,7 +1145,16 @@ function addCompressionBlockCopy(
   }));
 }
 
-async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Promise<ToolFact[]> {
+async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[], assertActive?: () => void): Promise<ToolFact[]> {
+  const result: ToolFact[] = [];
+  for (let offset = 0; offset < tools.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    result.push(...await readFileFactBatch(database, tools.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE), assertActive));
+  }
+  return result;
+}
+
+async function readFileFactBatch(database: RuntimeDatabase, tools: ToolFact[], assertActive?: () => void): Promise<ToolFact[]> {
   if (tools.length === 0) return tools;
   const barrier = await database.snapshot(tools.map((tool) =>
     DOMAIN_REPOSITORIES.domain('FileChangeSet').list({
@@ -1101,7 +1181,7 @@ async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Prom
     const decisions = rows(detailBarrier.snapshot[index * 2 + 1], 'FileChangeDecision fork lookup');
     if (decisions.length > 1) throw new Error(`FileChangeSet ${String(set.id)} has duplicate decisions.`);
     details.set(setId, {
-      members: await completeRows(database, detailBarrier.snapshot[index * 2], 'FileChangeSetMember', { change_set_id: setId }),
+      members: await completeRows(database, detailBarrier.snapshot[index * 2], 'FileChangeSetMember', { change_set_id: setId }, assertActive),
       decision: decisions[0] ?? null
     });
   }
@@ -1117,28 +1197,39 @@ async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]
   links: DomainRow[];
   responses: DomainRow[];
 }> {
-  if (tools.length === 0) return { requests: [], owners: [], links: [], responses: [] };
-  const linkBarrier = await database.snapshot(tools.map((tool) =>
-    DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').list({
-      where: { tool_call_id: id(tool.toolCall.id, 'ToolCall.id') }, limit: 1000
-    })
-  ));
-  const links = (await Promise.all(linkBarrier.snapshot.map((value, index) => completeRows(
-    database, value, 'InteractionToolCallLink', { tool_call_id: id(tools[index].toolCall.id, 'ToolCall.id') }
-  )))).flat();
+  const links: DomainRow[] = [];
+  for (let offset = 0; offset < tools.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = tools.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.map((tool) =>
+      DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').list({
+        where: { tool_call_id: id(tool.toolCall.id, 'ToolCall.id') }, limit: 1000
+      })
+    ));
+    for (const [index, tool] of batch.entries()) {
+      const found = await completeRows(database, barrier.snapshot[index], 'InteractionToolCallLink', {
+        tool_call_id: id(tool.toolCall.id, 'ToolCall.id')
+      }, assertActive);
+      for (const link of found) links.push(link);
+    }
+  }
   const requestIds = unique(links.map((link) => id(link.request_id, 'InteractionToolCallLink.request_id')));
-  if (requestIds.length === 0) return { requests: [], owners: [], links, responses: [] };
   const requests = await getRows(database, 'InteractionRequest', requestIds, assertActive);
-  const detailBarrier = await database.snapshot(requestIds.flatMap((requestId): RepositoryRead[] => [
-    DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').list({ where: { request_id: requestId }, limit: 2 }),
-    DOMAIN_REPOSITORIES.domain('InteractionResponse').list({ where: { request_id: requestId }, limit: 2 })
-  ]));
-  return {
-    requests,
-    links,
-    owners: requestIds.flatMap((_, index) => rows(detailBarrier.snapshot[index * 2], 'InteractionOwnerLink fork lookup')),
-    responses: requestIds.flatMap((_, index) => rows(detailBarrier.snapshot[index * 2 + 1], 'InteractionResponse fork lookup'))
-  };
+  const owners: DomainRow[] = [], responses: DomainRow[] = [];
+  for (let offset = 0; offset < requestIds.length; offset += FORK_FACT_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = requestIds.slice(offset, offset + FORK_FACT_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.flatMap((requestId): RepositoryRead[] => [
+      DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').list({ where: { request_id: requestId }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('InteractionResponse').list({ where: { request_id: requestId }, limit: 2 })
+    ]));
+    assertActive?.();
+    for (let index = 0; index < batch.length; index += 1) {
+      for (const owner of rows(barrier.snapshot[index * 2], 'InteractionOwnerLink fork lookup')) owners.push(owner);
+      for (const response of rows(barrier.snapshot[index * 2 + 1], 'InteractionResponse fork lookup')) responses.push(response);
+    }
+  }
+  return { requests, owners, links, responses };
 }
 
 function addMessageCopy(
@@ -1412,10 +1503,16 @@ async function completeRows(
   database: RuntimeDatabase,
   firstPage: unknown,
   domain: string,
-  where: DomainRow
+  where: DomainRow,
+  assertActive?: () => void
 ): Promise<DomainRow[]> {
+  assertActive?.();
   const found = rows(firstPage, `${domain} fork source lookup`);
-  return found.length < PAGE_LIMIT ? found : listAllDomainRows(database, domain, where);
+  if (found.length < PAGE_LIMIT) return found;
+  // Preserve one complete read snapshot for an overflowing relation set; do not truncate it.
+  const complete = await listAllDomainRows(database, domain, where);
+  assertActive?.();
+  return complete;
 }
 
 async function getRows(database: RuntimeDatabase, domain: string, ids: string[], assertActive?: () => void): Promise<DomainRow[]> {
