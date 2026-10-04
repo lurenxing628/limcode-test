@@ -1630,8 +1630,12 @@ function compressionContext(
   const segmentsMediaState = createManagedMediaBodyProjectionState();
   return {
     contents: projectSummaryModelWindow(contents, modelHandleCatalog, contentsMediaState).contents,
-    segments: segments.map((segment) =>
-      projectSummaryModelWindow(segment, modelHandleCatalog, segmentsMediaState).contents),
+    // The complete projection above validates every part and managed-media occurrence. Only
+    // segmented summaries consume the second view; ordinary summaries discard it entirely.
+    segments: methodKind === 'segmented_summary'
+      ? segments.map((segment) =>
+          projectSummaryModelWindow(segment, modelHandleCatalog, segmentsMediaState).contents)
+      : [],
     priorSummaryContents,
     ...(systemInstruction ? { systemInstruction } : {}),
     attachmentCatalogState,
