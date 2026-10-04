@@ -1,3 +1,4 @@
+import { FORK_MESSAGE_COPY_BATCH_LIMIT, type ForkMessageCopyDescriptor } from './forkMessageCopy';
 import { createHash } from 'node:crypto';
 import { conversationAttachmentHandleLinkId } from './conversationAttachmentHandles';
 import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
@@ -14,6 +15,7 @@ import {
 } from './conversationForkContext';
 import {
   DOMAIN_REPOSITORIES,
+  prepareForkMessageCopySteps,
   type DomainRow,
   type RepositoryRead,
   type RepositoryTransactionStep
@@ -452,14 +454,21 @@ export async function prepareConversationForkSnapshot(
       created_at: input.now
     }));
   }
-  for (const fact of messageFacts) {
+  let messageCopies: ForkMessageCopyDescriptor[] = [];
+  const flushMessageCopies = async () => {
+    if (messageCopies.length === 0) return;
+    const batch = await prepareForkMessageCopySteps({ sourceConversationId: input.sourceConversationId,
+      targetConversationId: target, messages: messageCopies }, copyWork);
+    assertions.push(batch.assertion);
+    inserts.push(batch.copy);
+    messageCopies = [];
+  };
+  for (const facts of [messageFacts, toolResultMessages]) for (const fact of facts) {
     if (copyWork.shouldYield()) await copyWork.yield();
-    await addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap, copyWork);
+    messageCopies.push(await prepareMessageCopy(fact, input, messageIdMap, revisionIdMap, turnIdMap, copyWork));
+    if (messageCopies.length === FORK_MESSAGE_COPY_BATCH_LIMIT) await flushMessageCopies();
   }
-  for (const fact of toolResultMessages) {
-    if (copyWork.shouldYield()) await copyWork.yield();
-    await addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap, copyWork);
-  }
+  await flushMessageCopies();
   for (const [messageId, revisions] of nativeRevisions) {
     if (copyWork.shouldYield()) await copyWork.yield();
     const targetMessageId = mapped(messageIdMap, messageId, 'Message');
@@ -1352,89 +1361,51 @@ async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]
   return { requests, owners, links, responses };
 }
 
-async function addMessageCopy(
-  assertions: RepositoryTransactionStep[],
-  inserts: RepositoryTransactionStep[],
+async function prepareMessageCopy(
   fact: MessageFact,
   input: { sourceConversationId: string; targetConversationId: string; now: string },
   messageIds: Map<string, string>,
   revisionIds: Map<string, string>,
   turnIds: Map<string, string>,
   copyWork: ForkCopyWork
-): Promise<void> {
+): Promise<ForkMessageCopyDescriptor> {
   const sourceMessageId = id(fact.message.id, 'Message.id');
   const sourceRevisionId = id(fact.revision.id, 'MessageRevision.id');
   const targetMessageId = mapped(messageIds, sourceMessageId, 'Message');
   const targetRevisionId = mapped(revisionIds, sourceRevisionId, 'MessageRevision');
-  assertions.push(
-    DOMAIN_REPOSITORIES.domain('Message').assert(sourceMessageId, { deleted_at: fact.message.deleted_at }),
-    DOMAIN_REPOSITORIES.domain('MessageRevision').assert(sourceRevisionId, {
-      message_id: sourceMessageId,
-      revision_seq: fact.revision.revision_seq,
-      role: fact.revision.role,
-      content_object_id: fact.revision.content_object_id
-    }),
-    DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').assert(id(fact.current.id, 'MessageCurrentRevisionLink.id'), {
-      message_id: sourceMessageId,
-      revision_id: sourceRevisionId
-    }),
-    DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').assert(id(fact.membership.id, 'MessagePartOfConversation.id'), {
-      conversation_id: input.sourceConversationId,
-      message_id: sourceMessageId,
-      message_seq: fact.membership.message_seq
-    })
-  );
-  inserts.push(
-    DOMAIN_REPOSITORIES.domain('Message').insert({
-      ...fact.message,
-      id: targetMessageId,
-      deleted_at: null
-    }),
-    DOMAIN_REPOSITORIES.domain('MessageRevision').insert({
-      ...fact.revision,
-      id: targetRevisionId,
-      message_id: targetMessageId
-    }),
-    DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').insert({
-      ...fact.current,
-      id: copyId(input.targetConversationId, 'message_current_revision_link', id(fact.current.id, 'MessageCurrentRevisionLink.id')),
-      message_id: targetMessageId,
-      revision_id: targetRevisionId
-    }),
-    DOMAIN_REPOSITORIES.domain('MessagePartOfConversation').insert({
-      ...fact.membership,
-      id: copyId(input.targetConversationId, 'message_part_of_conversation', id(fact.membership.id, 'MessagePartOfConversation.id')),
-      conversation_id: input.targetConversationId,
-      message_id: targetMessageId
-    })
-  );
+  const sourceCurrentId = id(fact.current.id, 'MessageCurrentRevisionLink.id');
+  const sourceMembershipId = id(fact.membership.id, 'MessagePartOfConversation.id');
+  // Capture the same snapshot values as the old per-domain inserts. In particular, timestamps
+  // which were never asserted must not silently become later writer-time source values.
+  const base: ForkMessageCopyDescriptor['base'] = [
+    sourceMessageId, targetMessageId, fact.message.created_at as string, fact.message.updated_at as string,
+    fact.message.deleted_at as string | null, sourceRevisionId, targetRevisionId,
+    fact.revision.revision_seq as bigint, fact.revision.role as string, fact.revision.content_object_id as string,
+    fact.revision.created_at as string, sourceCurrentId,
+    copyId(input.targetConversationId, 'message_current_revision_link', sourceCurrentId), fact.current.updated_at as string,
+    sourceMembershipId, copyId(input.targetConversationId, 'message_part_of_conversation', sourceMembershipId),
+    fact.membership.message_seq as bigint, fact.membership.created_at as string
+  ];
+  const sources: Array<ForkMessageCopyDescriptor['sources'][number]> = [];
+  const attachments: Array<ForkMessageCopyDescriptor['attachments'][number]> = [];
+  const turns: Array<ForkMessageCopyDescriptor['turns'][number]> = [];
   for (const source of fact.contextSources) {
     if (copyWork.shouldYield()) await copyWork.yield();
-    inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
-      ...source,
-      id: copyId(input.targetConversationId, 'context_segment_source', id(source.id, 'ContextSegmentSource.id')),
-      source_id: targetRevisionId,
-      source_revision: fact.revision.revision_seq
-    }));
+    if (source.source_kind !== 'message_revision') throw new Error('Fork Message copy requires MessageRevision provenance.');
+    sources.push([copyId(input.targetConversationId, 'context_segment_source', id(source.id, 'ContextSegmentSource.id')),
+      source.segment_id as string, source.created_at as string]);
   }
   for (const attachment of fact.attachments) {
     if (copyWork.shouldYield()) await copyWork.yield();
-    inserts.push(DOMAIN_REPOSITORIES.domain('AttachmentLink').insert({
-      ...attachment,
-      id: copyId(input.targetConversationId, 'attachment_link', id(attachment.id, 'AttachmentLink.id')),
-      message_revision_id: targetRevisionId
-    }));
+    attachments.push([copyId(input.targetConversationId, 'attachment_link', id(attachment.id, 'AttachmentLink.id')),
+      attachment.attachment_id as string, attachment.position as bigint, attachment.created_at as string]);
   }
   for (const link of fact.turnLinks) {
     if (copyWork.shouldYield()) await copyWork.yield();
-    const sourceTurnId = id(link.turn_id, 'MessageTurnLink.turn_id');
-    inserts.push(DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
-      ...link,
-      id: copyId(input.targetConversationId, 'message_turn_link', id(link.id, 'MessageTurnLink.id')),
-      turn_id: mapped(turnIds, sourceTurnId, 'Turn'),
-      message_id: targetMessageId
-    }));
+    turns.push([copyId(input.targetConversationId, 'message_turn_link', id(link.id, 'MessageTurnLink.id')),
+      mapped(turnIds, id(link.turn_id, 'MessageTurnLink.turn_id'), 'Turn'), link.role as string, link.created_at as string]);
   }
+  return { base, sources, attachments, turns };
 }
 
 async function addRequestAggregate(

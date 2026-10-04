@@ -186,8 +186,9 @@ async function withPublishedAttachmentSnapshot(run) {
   const current = snapshot.prepareConversationForkSnapshot;
   snapshot.prepareConversationForkSnapshot = async (...args) => {
     const plan = await current(...args);
-    const visible = new Set(plan.inserts.filter(step => step.kind === 'insert' && step.domain === 'AttachmentLink')
-      .map(step => step.row.attachment_id));
+    const visible = new Set(plan.inserts.flatMap(step => step.kind === 'copyForkMessages'
+      ? step.batch.messages.flatMap(message => message.attachments.map(attachment => attachment[1]))
+      : step.kind === 'insert' && step.domain === 'AttachmentLink' ? [step.row.attachment_id] : []));
     return { ...plan, inserts: plan.inserts.filter(step => step.kind !== 'insert'
       || step.domain !== 'ConversationAttachmentHandleLink' || visible.has(step.row.attachment_id)) };
   };

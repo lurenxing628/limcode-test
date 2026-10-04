@@ -1,3 +1,7 @@
+import { cloneForkMessageCopyBatch, cloneForkMessageCopyBatchCooperatively,
+  forkMessageCopyAssertions, forkMessageCopyInserts,
+  type ForkMessageCopyBatch, type ForkMessageCopyWork, type RepositoryAssertForkMessageCopiesStep, type RepositoryCopyForkMessagesStep
+} from './forkMessageCopy';
 import type { AcceptedAnswerNotice } from './answerPresentation';
 import type { InitialExecutionLeaseDuration } from './initialExecutionLease';
 import type { RuntimeDomainMutation } from './contracts';
@@ -167,6 +171,8 @@ export type RepositoryTransactionStep =
   | RepositoryAssertExactIdsStep
   | RepositoryAssertCollaborationCapacityStep
   | RepositoryEnsureContextSequenceNodesStep
+  | RepositoryAssertForkMessageCopiesStep
+  | RepositoryCopyForkMessagesStep
   | RepositorySavepoint;
 
 export interface RepositoryGetRead {
@@ -699,16 +705,61 @@ export class DomainRepositorySet {
 
 export const DOMAIN_REPOSITORIES = new DomainRepositorySet();
 
+interface ForkMessageCopySteps {
+  assertion: RepositoryAssertForkMessageCopiesStep;
+  copy: RepositoryCopyForkMessagesStep;
+}
+
+/** Fixed fork-message plan; no SQL, arbitrary domains or source re-read instructions are accepted. */
+export function forkMessageCopySteps(input: ForkMessageCopyBatch): ForkMessageCopySteps {
+  const pair = forkMessageStepsForBatch(cloneForkMessageCopyBatch(input));
+  for (const step of forkMessageCopyAssertions(pair.assertion)) validateForkCopyAssertion(step);
+  for (const step of forkMessageCopyInserts(pair.copy)) validateForkCopyInsert(step);
+  return pair;
+}
+
+/** Production preparation yields for rich relations, including the immutable clone and validation. */
+export async function prepareForkMessageCopySteps(input: ForkMessageCopyBatch,
+  work: ForkMessageCopyWork): Promise<ForkMessageCopySteps> {
+  const pair = forkMessageStepsForBatch(await cloneForkMessageCopyBatchCooperatively(input, work));
+  for (const step of forkMessageCopyAssertions(pair.assertion)) {
+    if (work.shouldYield()) await work.yield();
+    validateForkCopyAssertion(step);
+  }
+  for (const step of forkMessageCopyInserts(pair.copy)) {
+    if (work.shouldYield()) await work.yield();
+    validateForkCopyInsert(step);
+  }
+  return pair;
+}
+
+function forkMessageStepsForBatch(batch: ForkMessageCopyBatch): ForkMessageCopySteps {
+  return { assertion: { kind: 'assertForkMessageCopies', domain: 'Message', batch },
+    copy: { kind: 'copyForkMessages', domain: 'Message', batch } };
+}
+
+function validateForkCopyAssertion(step: RepositoryAssertStep): void {
+  requireId(step.id);
+  DOMAIN_REPOSITORIES.domain(step.domain).codec.encodeWhere(step.where);
+}
+
+function validateForkCopyInsert(step: RepositoryInsertMutation): void {
+  const repository = DOMAIN_REPOSITORIES.domain(step.domain);
+  if (!repository.schema.mutations.includes('insert')) throw new Error(`${repository.name} does not allow insert.`);
+  repository.codec.encodeInsert(step.row);
+}
+
 export function savepoint(
   name: string,
   steps: RepositoryTransactionStep[],
   onError: RepositorySavepointOnError = 'propagate'
 ): RepositorySavepoint {
   if (!/^[a-z][a-z0-9_]{0,63}$/.test(name)) throw new TypeError(`Invalid savepoint name: ${name}`);
+  const forkBatches = new WeakMap<ForkMessageCopyBatch, ForkMessageCopyBatch>();
   return {
     kind: 'savepoint',
     name,
-    steps: steps.map(cloneStep),
+    steps: steps.map(step => cloneStep(step, forkBatches)),
     onError: cloneSavepointOnError(onError)
   };
 }
@@ -800,7 +851,16 @@ function clonePlainValue(value: unknown): unknown {
   return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, nested]) => [key, clonePlainValue(nested)]));
 }
 
-function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
+function cloneStep(step: RepositoryTransactionStep,
+  forkBatches: WeakMap<ForkMessageCopyBatch, ForkMessageCopyBatch>): RepositoryTransactionStep {
+  if (step.kind === 'assertForkMessageCopies' || step.kind === 'copyForkMessages') {
+    let batch = forkBatches.get(step.batch);
+    if (!batch) {
+      batch = cloneForkMessageCopyBatch(step.batch);
+      forkBatches.set(step.batch, batch);
+    }
+    return { ...step, batch };
+  }
   if (step.kind === 'savepoint') return savepoint(step.name, step.steps, step.onError);
   if (step.kind === 'ensureContextSequenceNodes') return {
     ...step, nodes: step.nodes.map((node): ContextSequenceNodeTuple => [...node])

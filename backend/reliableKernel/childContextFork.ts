@@ -1,3 +1,4 @@
+import { visitForkCopiedMessageSources } from './forkMessageCopy';
 import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
@@ -245,13 +246,12 @@ export async function prepareChildContextFork(
     assertActive: input.assertActive
   });
   const copiedSources = new Map<string, string[]>();
-  for (const step of snapshot.inserts) {
-    if (step.kind !== 'insert' || step.domain !== 'ContextSegmentSource') continue;
-    const segmentId = id(step.row.segment_id);
+  visitForkCopiedMessageSources(snapshot.inserts, source => {
+    const segmentId = id(source.segmentId);
     const kinds = copiedSources.get(segmentId) ?? [];
-    kinds.push(id(step.row.source_kind));
+    kinds.push(id(source.sourceKind));
     copiedSources.set(segmentId, kinds);
-  }
+  });
   for (const segment of segmentRows) {
     const kinds = copiedSources.get(id(segment.id)) ?? [];
     if (segment.segment_kind === 'message'

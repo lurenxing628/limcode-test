@@ -1,3 +1,4 @@
+import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
 import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
 import { projectTimelineLinkRecord } from './clientTimelineHistory';
 import { allocateTimelinePosition, allocateHistoricalTimelineImport, timelineImportProvenanceRow, assertTimelinePosition, timelineInputAcknowledgementSteps } from './timelinePosition';
@@ -1461,6 +1462,17 @@ function executeSteps(
   attachmentScopeCache: AttachmentProjectionScopeCache
 ): void {
   for (const step of steps) {
+    if (step.kind === 'assertForkMessageCopies') {
+      visitForkMessageCopyAssertions(step, assertion =>
+        executeAssertion(database, assertion.domain, assertion.id, assertion.where));
+      continue;
+    }
+    if (step.kind === 'copyForkMessages') {
+      // Preserve generic mutation codecs, FK/trigger semantics and scope-cache invalidation.
+      visitForkMessageCopyInserts(step, insert =>
+        executeMutation(database, insert, allocatedSequences, attachmentScopeCache));
+      continue;
+    }
     if (step.kind === 'ensureContextSequenceNodes') {
       executeContextSequenceNodeBatch(database, step);
       continue;
@@ -2177,6 +2189,10 @@ function assertTouchedRuntimeAggregates(
       || step.kind === 'assertExactIds'
       || step.kind === 'assertCollaborationCapacity'
       || step.kind === 'ensureContextSequenceNodes'
+      // The fixed copy only inserts Message/revision/membership/source/attachment/Turn-link facts.
+      // Turn and ModelRequest ownership rows remain ordinary steps, scanned below as before.
+      || step.kind === 'assertForkMessageCopies'
+      || step.kind === 'copyForkMessages'
     ) return;
     if (step.domain === 'ModelRequest') {
       const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;

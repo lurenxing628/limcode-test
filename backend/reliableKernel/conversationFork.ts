@@ -1,3 +1,4 @@
+import { visitForkCopiedMessageSources } from './forkMessageCopy';
 import { createHash } from 'node:crypto';
 import {
   DOMAIN_REPOSITORIES,
@@ -340,12 +341,11 @@ export class ConversationForkControlPlane {
       // A direct caller can select an obsolete root even when the boundary revision is current.
       // Never commit a head whose retained message segments lack the copied target provenance.
       const copiedMessageSegments = new Map<string, number>();
-      for (const step of transcript.inserts) {
-        if (step.kind !== 'insert' || step.domain !== 'ContextSegmentSource'
-          || step.row.source_kind !== 'message_revision') continue;
-        const segmentId = requireId(step.row.segment_id, 'ContextSegmentSource.segment_id');
+      visitForkCopiedMessageSources(transcript.inserts, source => {
+        if (source.sourceKind !== 'message_revision') return;
+        const segmentId = requireId(source.segmentId, 'ContextSegmentSource.segment_id');
         copiedMessageSegments.set(segmentId, (copiedMessageSegments.get(segmentId) ?? 0) + 1);
-      }
+      });
       for (const source of retainedLineage.messageSources) {
         if (copiedMessageSegments.get(requireId(source.segment_id, 'ContextSegmentSource.segment_id')) !== 1) {
           throw new Error('Fork Context prefix contains a MessageRevision outside the copied current transcript.');
