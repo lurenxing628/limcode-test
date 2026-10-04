@@ -54,6 +54,24 @@ const PAGE_LIMIT = 1000;
 // Bound transient lookup instructions/results; the final copy remains one atomic transaction.
 const FORK_MESSAGE_READ_BATCH_SIZE = 128;
 const FORK_FACT_READ_BATCH_SIZE = 64;
+const FORK_COPY_WORK_BATCH_SIZE = 128;
+
+/** Only local plan construction yields; final publication remains one caller-owned transaction. */
+class ForkCopyWork {
+  private remaining = FORK_COPY_WORK_BATCH_SIZE;
+  public constructor(private readonly assertActive?: () => void) {}
+  public shouldYield(): boolean {
+    this.remaining -= 1;
+    if (this.remaining > 0) return false;
+    this.remaining = FORK_COPY_WORK_BATCH_SIZE;
+    return true;
+  }
+  public async yield(): Promise<void> {
+    this.assertActive?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    this.assertActive?.();
+  }
+}
 
 interface MessageFact {
   message: DomainRow;
@@ -353,32 +371,37 @@ export async function prepareConversationForkSnapshot(
   }
 
   input.assertActive?.();
+  const copyWork = new ForkCopyWork(input.assertActive);
   const target = input.targetConversationId;
   const messageIdMap = new Map<string, string>();
   const revisionIdMap = new Map<string, string>();
   for (const fact of [...messageFacts, ...toolResultMessages]) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceMessageId = id(fact.message.id, 'Message.id');
     const sourceRevisionId = id(fact.revision.id, 'MessageRevision.id');
     messageIdMap.set(sourceMessageId, copyId(target, 'message', sourceMessageId));
     revisionIdMap.set(sourceRevisionId, copyId(target, 'message_revision', sourceRevisionId));
   }
   for (const revisions of nativeRevisions.values()) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     for (const revision of revisions) {
+      if (copyWork.shouldYield()) await copyWork.yield();
       const revisionId = id(revision.revision.id, 'MessageRevision.id');
       revisionIdMap.set(revisionId, copyId(target, 'message_revision', revisionId));
     }
   }
-  const turnIdMap = idMap(target, 'turn', turnIds);
-  const requestIdMap = idMap(target, 'model_request', requestIds);
-  const toolIdMap = idMap(target, 'tool_call', tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')));
-  const modelResultIdMap = idMap(target, 'tool_model_result', tools.map((fact) => id(fact.modelResult.id, 'ToolModelResult.id')));
-  const authorityIdMap = idMap(target, 'authority_snapshot', authoritySnapshots.map((snapshot) => id(snapshot.id, 'AuthoritySnapshot.id')));
+  const turnIdMap = await idMap(target, 'turn', turnIds, copyWork);
+  const requestIdMap = await idMap(target, 'model_request', requestIds, copyWork);
+  const toolIdMap = await idMap(target, 'tool_call', tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')), copyWork);
+  const modelResultIdMap = await idMap(target, 'tool_model_result', tools.map((fact) => id(fact.modelResult.id, 'ToolModelResult.id')), copyWork);
+  const authorityIdMap = await idMap(target, 'authority_snapshot', authoritySnapshots.map((snapshot) => id(snapshot.id, 'AuthoritySnapshot.id')), copyWork);
 
   const assertions: RepositoryTransactionStep[] = [];
   const inserts: RepositoryTransactionStep[] = [];
   const turnInserts: RepositoryTransactionStep[] = [];
   const preservedTurnIds = new Set<string>();
   for (const handle of sourceAttachmentHandles) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceHandleId = id(handle.id, 'ConversationAttachmentHandleLink.id');
     const attachmentId = id(handle.attachment_id, 'ConversationAttachmentHandleLink.attachment_id');
     assertions.push(DOMAIN_REPOSITORIES.domain('ConversationAttachmentHandleLink').assert(sourceHandleId, {
@@ -394,11 +417,19 @@ export async function prepareConversationForkSnapshot(
       created_at: input.now
     }));
   }
-  for (const fact of messageFacts) addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap);
-  for (const fact of toolResultMessages) addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap);
+  for (const fact of messageFacts) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    await addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap, copyWork);
+  }
+  for (const fact of toolResultMessages) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    await addMessageCopy(assertions, inserts, fact, input, messageIdMap, revisionIdMap, turnIdMap, copyWork);
+  }
   for (const [messageId, revisions] of nativeRevisions) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const targetMessageId = mapped(messageIdMap, messageId, 'Message');
     for (const { revision, sources, attachments } of revisions) {
+      if (copyWork.shouldYield()) await copyWork.yield();
       const sourceRevisionId = id(revision.id, 'MessageRevision.id');
       const targetRevisionId = mapped(revisionIdMap, sourceRevisionId, 'MessageRevision');
       assertions.push(DOMAIN_REPOSITORIES.domain('MessageRevision').assert(sourceRevisionId, {
@@ -411,6 +442,7 @@ export async function prepareConversationForkSnapshot(
         ...revision, id: targetRevisionId, message_id: targetMessageId
       }));
       for (const source of sources) {
+        if (copyWork.shouldYield()) await copyWork.yield();
         inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
           ...source,
           id: copyId(target, 'context_segment_source', id(source.id, 'ContextSegmentSource.id')),
@@ -419,6 +451,7 @@ export async function prepareConversationForkSnapshot(
         }));
       }
       for (const attachment of attachments) {
+        if (copyWork.shouldYield()) await copyWork.yield();
         inserts.push(DOMAIN_REPOSITORIES.domain('AttachmentLink').insert({
           ...attachment,
           id: copyId(target, 'attachment_link', id(attachment.id, 'AttachmentLink.id')),
@@ -429,6 +462,7 @@ export async function prepareConversationForkSnapshot(
   }
 
   for (const turn of turnRows) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceTurnId = id(turn.id, 'Turn.id');
     const targetTurnId = mapped(turnIdMap, sourceTurnId, 'Turn');
     assertions.push(DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, {
@@ -495,6 +529,7 @@ export async function prepareConversationForkSnapshot(
   }
 
   for (const snapshot of authoritySnapshots) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceSnapshotId = id(snapshot.id, 'AuthoritySnapshot.id');
     const sourceTurnId = id(snapshot.turn_id, 'AuthoritySnapshot.turn_id');
     assertions.push(DOMAIN_REPOSITORIES.domain('AuthoritySnapshot').assert(sourceSnapshotId, {
@@ -508,9 +543,11 @@ export async function prepareConversationForkSnapshot(
     }));
   }
   for (const aggregate of requestAggregates) {
-    addRequestAggregate(assertions, inserts, aggregate, target, turnIdMap, requestIdMap, authorityIdMap);
+    if (copyWork.shouldYield()) await copyWork.yield();
+    await addRequestAggregate(assertions, inserts, aggregate, target, turnIdMap, requestIdMap, authorityIdMap, copyWork);
   }
   for (const { projection, rootId } of projections) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceRequestId = id(projection.owner_id, 'ModelContextProjection.owner_id');
     inserts.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({
       ...projection,
@@ -520,10 +557,13 @@ export async function prepareConversationForkSnapshot(
     }));
   }
   for (const copy of blockCopies) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     addCompressionBlockCopy(assertions, inserts, copy, input.sourceConversationId, target, authorityIdMap);
   }
   for (const fact of messageFacts) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     for (const link of fact.requestLinks) {
+      if (copyWork.shouldYield()) await copyWork.yield();
       const sourceRequestId = id(link.model_request_id, 'ModelRequestMessageLink.model_request_id');
       if (!requestIdSet.has(sourceRequestId)) continue;
       inserts.push(DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').insert({
@@ -535,7 +575,9 @@ export async function prepareConversationForkSnapshot(
     }
   }
   for (const sourceTurnId of preservedTurnIds) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     for (const fence of turnRelations.get(sourceTurnId)?.finalOutputFences ?? []) {
+      if (copyWork.shouldYield()) await copyWork.yield();
       const sourceRequestId = id(fence.model_request_id, 'TurnFinalOutputFence.model_request_id');
       inserts.push(DOMAIN_REPOSITORIES.domain('TurnFinalOutputFence').insert({
         ...fence,
@@ -547,17 +589,24 @@ export async function prepareConversationForkSnapshot(
   }
 
   for (const tool of tools) {
-    addToolCopy(assertions, inserts, tool, target, turnIdMap, requestIdMap, messageIdMap, revisionIdMap, toolIdMap, modelResultIdMap);
+    if (copyWork.shouldYield()) await copyWork.yield();
+    await addToolCopy(assertions, inserts, tool, target, turnIdMap, requestIdMap, messageIdMap, revisionIdMap, toolIdMap, modelResultIdMap, copyWork);
   }
-  addFileCopies(inserts, fileFacts, target, toolIdMap);
-  addInteractionCopies(inserts, interactionFacts, target, turnIdMap, toolIdMap);
+  await addFileCopies(inserts, fileFacts, target, toolIdMap, copyWork);
+  await addInteractionCopies(inserts, interactionFacts, target, turnIdMap, toolIdMap, copyWork);
 
-  return {
-    assertions,
-    // Match repeated unshift's exact reverse Turn order without shifting the full history per Turn.
-    inserts: turnInserts.reverse().concat(inserts),
-    copiedVisibleMessageCount: messageFacts.length
-  };
+  // Keep the exact reverse Turn prefix without a synchronous whole-plan merge.
+  const orderedInserts: RepositoryTransactionStep[] = [];
+  for (let index = turnInserts.length - 1; index >= 0; index -= 1) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    orderedInserts.push(turnInserts[index]);
+  }
+  for (const insert of inserts) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    orderedInserts.push(insert);
+  }
+  input.assertActive?.();
+  return { assertions, inserts: orderedInserts, copiedVisibleMessageCount: messageFacts.length };
 }
 
 interface ForkMessageCandidate {
@@ -1232,15 +1281,16 @@ async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]
   return { requests, owners, links, responses };
 }
 
-function addMessageCopy(
+async function addMessageCopy(
   assertions: RepositoryTransactionStep[],
   inserts: RepositoryTransactionStep[],
   fact: MessageFact,
   input: { sourceConversationId: string; targetConversationId: string; now: string },
   messageIds: Map<string, string>,
   revisionIds: Map<string, string>,
-  turnIds: Map<string, string>
-): void {
+  turnIds: Map<string, string>,
+  copyWork: ForkCopyWork
+): Promise<void> {
   const sourceMessageId = id(fact.message.id, 'Message.id');
   const sourceRevisionId = id(fact.revision.id, 'MessageRevision.id');
   const targetMessageId = mapped(messageIds, sourceMessageId, 'Message');
@@ -1288,6 +1338,7 @@ function addMessageCopy(
     })
   );
   for (const source of fact.contextSources) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
       ...source,
       id: copyId(input.targetConversationId, 'context_segment_source', id(source.id, 'ContextSegmentSource.id')),
@@ -1296,6 +1347,7 @@ function addMessageCopy(
     }));
   }
   for (const attachment of fact.attachments) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     inserts.push(DOMAIN_REPOSITORIES.domain('AttachmentLink').insert({
       ...attachment,
       id: copyId(input.targetConversationId, 'attachment_link', id(attachment.id, 'AttachmentLink.id')),
@@ -1303,6 +1355,7 @@ function addMessageCopy(
     }));
   }
   for (const link of fact.turnLinks) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceTurnId = id(link.turn_id, 'MessageTurnLink.turn_id');
     inserts.push(DOMAIN_REPOSITORIES.domain('MessageTurnLink').insert({
       ...link,
@@ -1313,15 +1366,16 @@ function addMessageCopy(
   }
 }
 
-function addRequestAggregate(
+async function addRequestAggregate(
   assertions: RepositoryTransactionStep[],
   inserts: RepositoryTransactionStep[],
   aggregate: RequestAggregate,
   target: string,
   turnIds: Map<string, string>,
   requestIds: Map<string, string>,
-  authorityIds: Map<string, string>
-): void {
+  authorityIds: Map<string, string>,
+  copyWork: ForkCopyWork
+): Promise<void> {
   const sourceRequestId = id(aggregate.request.id, 'ModelRequest.id');
   const targetRequestId = mapped(requestIds, sourceRequestId, 'ModelRequest');
   assertions.push(DOMAIN_REPOSITORIES.domain('ModelRequest').assert(sourceRequestId, {
@@ -1347,6 +1401,7 @@ function addRequestAggregate(
     owner_id: targetRequestId
   }));
   for (const attempt of aggregate.attempts) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     inserts.push(DOMAIN_REPOSITORIES.domain('Attempt').insertHistoricalCopy({
       ...attempt,
       id: copyId(target, 'attempt', id(attempt.id, 'Attempt.id')),
@@ -1362,7 +1417,7 @@ function addRequestAggregate(
   }
 }
 
-function addToolCopy(
+async function addToolCopy(
   assertions: RepositoryTransactionStep[],
   inserts: RepositoryTransactionStep[],
   fact: ToolFact,
@@ -1372,8 +1427,9 @@ function addToolCopy(
   messageIds: Map<string, string>,
   revisionIds: Map<string, string>,
   toolIds: Map<string, string>,
-  modelResultIds: Map<string, string>
-): void {
+  modelResultIds: Map<string, string>,
+  copyWork: ForkCopyWork
+): Promise<void> {
   const sourceToolId = id(fact.toolCall.id, 'ToolCall.id');
   const targetToolId = mapped(toolIds, sourceToolId, 'ToolCall');
   const targetRequestId = mapped(requestIds, id(fact.source.model_request_id, 'ToolCallSourceLink.model_request_id'), 'ModelRequest');
@@ -1399,11 +1455,14 @@ function addToolCopy(
     id: copyId(target, 'tool_call_policy_snapshot', id(fact.policy.id, 'ToolCallPolicySnapshot.id')),
     tool_call_id: targetToolId
   }));
-  for (const event of fact.events) inserts.push(DOMAIN_REPOSITORIES.domain('ToolCallEvent').insert({
-    ...event,
-    id: copyId(target, 'tool_call_event', id(event.id, 'ToolCallEvent.id')),
-    tool_call_id: targetToolId
-  }));
+  for (const event of fact.events) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    inserts.push(DOMAIN_REPOSITORIES.domain('ToolCallEvent').insert({
+      ...event,
+      id: copyId(target, 'tool_call_event', id(event.id, 'ToolCallEvent.id')),
+      tool_call_id: targetToolId
+    }));
+  }
   inserts.push(
     DOMAIN_REPOSITORIES.domain('ToolExecution').insert({
       ...fact.execution,
@@ -1416,11 +1475,14 @@ function addToolCopy(
       tool_call_id: targetToolId
     })
   );
-  for (const artifact of fact.artifacts) inserts.push(DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
-    ...artifact,
-    id: copyId(target, 'tool_result_artifact', id(artifact.id, 'ToolResultArtifact.id')),
-    tool_call_id: targetToolId
-  }));
+  for (const artifact of fact.artifacts) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    inserts.push(DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+      ...artifact,
+      id: copyId(target, 'tool_result_artifact', id(artifact.id, 'ToolResultArtifact.id')),
+      tool_call_id: targetToolId
+    }));
+  }
   const sourceModelResultId = id(fact.modelResult.id, 'ToolModelResult.id');
   const targetModelResultId = mapped(modelResultIds, sourceModelResultId, 'ToolModelResult');
   inserts.push(DOMAIN_REPOSITORIES.domain('ToolModelResult').insert({
@@ -1434,6 +1496,7 @@ function addToolCopy(
     )
   }));
   for (const source of fact.pairSources) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     const sourceKind = String(source.source_kind);
     inserts.push(DOMAIN_REPOSITORIES.domain('ContextSegmentSource').insert({
       ...source,
@@ -1444,8 +1507,9 @@ function addToolCopy(
   }
 }
 
-function addFileCopies(inserts: RepositoryTransactionStep[], tools: ToolFact[], target: string, toolIds: Map<string, string>): void {
+async function addFileCopies(inserts: RepositoryTransactionStep[], tools: ToolFact[], target: string, toolIds: Map<string, string>, copyWork: ForkCopyWork): Promise<void> {
   for (const tool of tools) {
+    if (copyWork.shouldYield()) await copyWork.yield();
     if (!tool.fileChangeSet) continue;
     const sourceSetId = id(tool.fileChangeSet.id, 'FileChangeSet.id');
     const targetSetId = copyId(target, 'file_change_set', sourceSetId);
@@ -1454,11 +1518,14 @@ function addFileCopies(inserts: RepositoryTransactionStep[], tools: ToolFact[], 
       id: targetSetId,
       tool_call_id: mapped(toolIds, id(tool.toolCall.id, 'ToolCall.id'), 'ToolCall')
     }));
-    for (const member of tool.fileMembers) inserts.push(DOMAIN_REPOSITORIES.domain('FileChangeSetMember').insert({
-      ...member,
-      id: copyId(target, 'file_change_set_member', id(member.id, 'FileChangeSetMember.id')),
-      change_set_id: targetSetId
-    }));
+    for (const member of tool.fileMembers) {
+      if (copyWork.shouldYield()) await copyWork.yield();
+      inserts.push(DOMAIN_REPOSITORIES.domain('FileChangeSetMember').insert({
+        ...member,
+        id: copyId(target, 'file_change_set_member', id(member.id, 'FileChangeSetMember.id')),
+        change_set_id: targetSetId
+      }));
+    }
     if (tool.fileDecision) inserts.push(DOMAIN_REPOSITORIES.domain('FileChangeDecision').insert({
       ...tool.fileDecision,
       id: copyId(target, 'file_change_decision', id(tool.fileDecision.id, 'FileChangeDecision.id')),
@@ -1467,35 +1534,48 @@ function addFileCopies(inserts: RepositoryTransactionStep[], tools: ToolFact[], 
   }
 }
 
-function addInteractionCopies(
+async function addInteractionCopies(
   inserts: RepositoryTransactionStep[],
   facts: { requests: DomainRow[]; owners: DomainRow[]; links: DomainRow[]; responses: DomainRow[] },
   target: string,
   turnIds: Map<string, string>,
-  toolIds: Map<string, string>
-): void {
-  const requestIds = idMap(target, 'interaction_request', facts.requests.map((request) => id(request.id, 'InteractionRequest.id')));
-  for (const request of facts.requests) inserts.push(DOMAIN_REPOSITORIES.domain('InteractionRequest').insert({
-    ...request,
-    id: mapped(requestIds, id(request.id, 'InteractionRequest.id'), 'InteractionRequest')
-  }));
-  for (const owner of facts.owners) inserts.push(DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').insert({
-    ...owner,
-    id: copyId(target, 'interaction_owner_link', id(owner.id, 'InteractionOwnerLink.id')),
-    request_id: mapped(requestIds, id(owner.request_id, 'InteractionOwnerLink.request_id'), 'InteractionRequest'),
-    turn_id: mapped(turnIds, id(owner.turn_id, 'InteractionOwnerLink.turn_id'), 'Turn')
-  }));
-  for (const link of facts.links) inserts.push(DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').insert({
-    ...link,
-    id: copyId(target, 'interaction_tool_call_link', id(link.id, 'InteractionToolCallLink.id')),
-    request_id: mapped(requestIds, id(link.request_id, 'InteractionToolCallLink.request_id'), 'InteractionRequest'),
-    tool_call_id: mapped(toolIds, id(link.tool_call_id, 'InteractionToolCallLink.tool_call_id'), 'ToolCall')
-  }));
-  for (const response of facts.responses) inserts.push(DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
-    ...response,
-    id: copyId(target, 'interaction_response', id(response.id, 'InteractionResponse.id')),
-    request_id: mapped(requestIds, id(response.request_id, 'InteractionResponse.request_id'), 'InteractionRequest')
-  }));
+  toolIds: Map<string, string>,
+  copyWork: ForkCopyWork
+): Promise<void> {
+  const requestIds = await idMap(target, 'interaction_request', facts.requests.map((request) => id(request.id, 'InteractionRequest.id')), copyWork);
+  for (const request of facts.requests) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    inserts.push(DOMAIN_REPOSITORIES.domain('InteractionRequest').insert({
+      ...request,
+      id: mapped(requestIds, id(request.id, 'InteractionRequest.id'), 'InteractionRequest')
+    }));
+  }
+  for (const owner of facts.owners) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    inserts.push(DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').insert({
+      ...owner,
+      id: copyId(target, 'interaction_owner_link', id(owner.id, 'InteractionOwnerLink.id')),
+      request_id: mapped(requestIds, id(owner.request_id, 'InteractionOwnerLink.request_id'), 'InteractionRequest'),
+      turn_id: mapped(turnIds, id(owner.turn_id, 'InteractionOwnerLink.turn_id'), 'Turn')
+    }));
+  }
+  for (const link of facts.links) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    inserts.push(DOMAIN_REPOSITORIES.domain('InteractionToolCallLink').insert({
+      ...link,
+      id: copyId(target, 'interaction_tool_call_link', id(link.id, 'InteractionToolCallLink.id')),
+      request_id: mapped(requestIds, id(link.request_id, 'InteractionToolCallLink.request_id'), 'InteractionRequest'),
+      tool_call_id: mapped(toolIds, id(link.tool_call_id, 'InteractionToolCallLink.tool_call_id'), 'ToolCall')
+    }));
+  }
+  for (const response of facts.responses) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    inserts.push(DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
+      ...response,
+      id: copyId(target, 'interaction_response', id(response.id, 'InteractionResponse.id')),
+      request_id: mapped(requestIds, id(response.request_id, 'InteractionResponse.request_id'), 'InteractionRequest')
+    }));
+  }
 }
 
 /** A batched first page equal to the page limit may be truncated; re-read that set completely. */
@@ -1527,8 +1607,13 @@ async function getRows(database: RuntimeDatabase, domain: string, ids: string[],
   return result;
 }
 
-function idMap(target: string, kind: string, sourceIds: string[]): Map<string, string> {
-  return new Map(sourceIds.map((sourceId) => [sourceId, copyId(target, kind, sourceId)]));
+async function idMap(target: string, kind: string, sourceIds: string[], copyWork: ForkCopyWork): Promise<Map<string, string>> {
+  const result = new Map<string, string>();
+  for (const sourceId of sourceIds) {
+    if (copyWork.shouldYield()) await copyWork.yield();
+    result.set(sourceId, copyId(target, kind, sourceId));
+  }
+  return result;
 }
 
 function mapped(values: Map<string, string>, sourceId: string, label: string): string {
