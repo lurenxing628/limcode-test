@@ -33,7 +33,7 @@ import type { RuntimeDeliveryControlPlane } from './answerDelivery';
 import type { RuntimeDeliveryModelProjection } from './runtimeDeliveryProjection';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
-import { ContextSequenceControlPlane } from './contextSequence';
+import { ContextSequenceControlPlane, type MaterializedContextStructure } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   compareGuidancePositions,
@@ -1171,15 +1171,19 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<PlainJsonValue> {
-    const [currentTurnState, runtimeStatus, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
-      this.readCurrentTurnInputReference(input.turnId, input.headRootId),
+    const [runtimeStatus, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
       this.readRuntimeStatusCard(input.turnId),
       readCurrentTurnTaskCard(this.database, input.turnId),
       this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round),
       this.readNativeRecipeFreeze(input)
     ]);
     const runtimeStatusCard = runtimeStatus.statusCard;
-    const materialized = await this.context.materialize(input.headRootId);
+    // One validated immutable root supplies both input membership and provider-visible bytes.
+    // Wait for the independent metadata first so a slow historical read cannot retain this body.
+    const { structure, content: materialized } = await this.context.materializeWithStructure(
+      requireId(input.headRootId, 'headRootId')
+    );
+    const currentTurnState = await this.readCurrentTurnInputReference(input.turnId, structure);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const attachmentCatalogState = await this.modelProvider.projectAttachmentCatalogState(
       conversationId,
@@ -1496,9 +1500,8 @@ export class ReliableAgentLoop {
 
   private async readCurrentTurnInputReference(
     turnId: string,
-    headRootId: string
+    current: MaterializedContextStructure
   ): Promise<CurrentTurnRequestState> {
-    const current = await this.context.materializeStructure(requireId(headRootId, 'headRootId'));
     const firstSegment = current.records[0]?.segment;
     const compressionBoundaryId = firstSegment?.segment_kind === 'compression'
       ? requireId(firstSegment.id, 'ContextSegment.id')
