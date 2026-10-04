@@ -905,6 +905,7 @@ test('审查 #8：当前库备份失败时不留临时文件与空目录并推�
     externalDataVersion: () => database.externalDataVersion(),
     mergeModelAggregates: (ids) => database.mergeModelAggregates(ids),
     snapshot: (reads) => database.snapshot(reads),
+    snapshotAll: (read) => database.snapshotAll(read),
     transaction: (steps, options) => database.transaction(steps, options),
     async backupTo(destination) {
       await fs.writeFile(destination, 'partial copy');
@@ -1585,11 +1586,11 @@ test('盲审 merge #1：提交后崩溃、没有删对话：下次启动实测�
     { id: 'conversation_alpha_after_commit_a', project: SHARED_PROJECT },
     { id: 'conversation_alpha_after_commit_b', project: SHARED_PROJECT }
   ]);
-  const before = totalRows(fixture.current);
+  const before = totalImportedRows(fixture.current);
   const killed = await runChild(['kill', fixture.root, 'after-row-commit']);
   assert.equal(killed.signal, 'SIGKILL', killed.stderr);
-  // The commit's own marker row (盲审2 #1) is not one of the merged rows.
-  const inserted = totalRows(fixture.current) - before - 1;
+  // The commit marker and receiving-root handle authority are not imported source rows.
+  const inserted = totalImportedRows(fixture.current) - before - 1;
   const database = await openTarget(t, fixture.current);
   const converged = await merge(fixture, database);
   assert.deepEqual(converged.merged.map((item) => [item.recoveredCommit, item.insertedConversations, item.insertedRows]), [[true, 2, inserted]]);
@@ -2829,11 +2830,13 @@ function readDatabase(dataSet) {
   };
 }
 
-/** Rows of every Runtime domain table of a data set. */
-function totalRows(dataSet) {
+/** Source-row accounting excludes handle authority derived locally by the receiving database. */
+function totalImportedRows(dataSet) {
   const target = readDatabase(dataSet);
   try {
-    return kernel.RUNTIME_DOMAIN_SCHEMAS.reduce((sum, schema) => sum + target.count(schema.table), 0);
+    return kernel.RUNTIME_DOMAIN_SCHEMAS
+      .filter(schema => schema.key !== 'ConversationContextHandleState' && schema.key !== 'ContextRootHandleCatalog')
+      .reduce((sum, schema) => sum + target.count(schema.table), 0);
   } finally { target.close(); }
 }
 

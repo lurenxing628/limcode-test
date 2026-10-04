@@ -146,7 +146,8 @@ function formatActivity(value: string): string {
 }
 
 function isPublishedOldDataSet(candidate: VscodeRuntimeDataSetCandidate): boolean {
-  return candidate.runtimeKernelEpoch === 3 || candidate.runtimeKernelEpoch === 4;
+  return candidate.runtimeKernelEpoch === 3 || candidate.runtimeKernelEpoch === 4
+    || candidate.runtimeKernelEpoch === 5 || candidate.runtimeKernelEpoch === 6;
 }
 
 /**

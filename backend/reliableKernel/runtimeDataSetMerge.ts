@@ -1864,7 +1864,7 @@ function assertNoCommitElsewhere(previous: RuntimeDataSetMergeLedgerRecord | und
   if (previous?.state === 'committing' && !sameRuntimeDataSetIdentity(previous.target, target.identity)) throw new Outcome(COMMIT_ELSEWHERE);
 }
 
-/** Identity, idle state, recovery, epoch (a published 3/4/5 source is upgraded in place first). */
+/** Identity, idle state, recovery, epoch (a published 3/4/5/6 source is upgraded in place first). */
 async function resolveSource(
   paths: { globalStoragePath: string },
   /** A migration's source check names the target identity only (it continues nothing it could refuse). */
@@ -1908,10 +1908,10 @@ async function resolveSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
   }
   const epoch = candidate.runtimeKernelEpoch;
-  if ((epoch === 3 || epoch === 4 || epoch === 5) && mode.readOnly) {
+  if ((epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6) && mode.readOnly) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-upgrade-pending', message: '这份旧聊天记录还是已发布的旧格式，启动时会先在后台升级，之后才能估计。' });
   }
-  if (epoch === 3 || epoch === 4 || epoch === 5) {
+  if (epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6) {
     const upgrade = await upgradeRuntimeDataSet(paths, {
       candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
     }).catch(async (error: unknown) => {

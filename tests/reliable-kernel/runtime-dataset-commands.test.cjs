@@ -27,6 +27,7 @@ function loadSource(relative, dependencies, globals = {}) {
 
 const compiled = process.env.LIMCODE_TEST_EXTENSION_ROOT
   ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT) : path.resolve(__dirname, '../../dist/extension');
+const { RUNTIME_KERNEL_EPOCH } = require(path.join(compiled, 'backend/reliableKernel/contracts.js'));
 const largeMergeSession = require(path.join(compiled, 'backend/reliableKernel/runtimeLargeMergeSession.js'));
 
 function emptyMergeReport(overrides = {}) {
@@ -37,7 +38,7 @@ function emptyMergeReport(overrides = {}) {
 const mergeHost = () => ({ product: { application: { database: { hostBootId: 'this-window' } } } });
 
 function fixture({
-  picks = [], confirmation, application, currentEpoch = 5, oldEpoch = 5,
+  picks = [], confirmation, application, currentEpoch = RUNTIME_KERNEL_EPOCH, oldEpoch = RUNTIME_KERNEL_EPOCH,
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
   mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
@@ -102,7 +103,7 @@ function fixture({
         if (upgradeError) throw upgradeError;
         const candidate = input.candidateId === current.id ? current : old;
         const previousEpoch = candidate.runtimeKernelEpoch;
-        candidate.runtimeKernelEpoch = 5;
+        candidate.runtimeKernelEpoch = RUNTIME_KERNEL_EPOCH;
         return {
           candidateId: candidate.id,
           binding: { dataSetId: candidate.dataSetId, rootInstanceId: candidate.rootInstanceId },
@@ -294,7 +295,7 @@ test('unavailable old data is shown as an error, never as absence of history or 
   assert.equal(f.calls.some(call => call[0] === 'info' && /尚无历史库/.test(call[1])), false);
 });
 
-for (const oldEpoch of [3, 4]) test(`epoch ${oldEpoch} history automatically backs up and upgrades without a user confirmation`, async () => {
+for (const oldEpoch of [3, 4, 5, 6]) test(`epoch ${oldEpoch} history automatically backs up and upgrades without a user confirmation`, async () => {
   const f = fixture({
     oldEpoch, picks: [action('history'), 0, 0, 0, undefined]
   });
@@ -1267,7 +1268,8 @@ test('最后一轮盲审 #6：本窗口因数据目录操作冻结时，“合�
   const frozen = { writeGate: { admit() { throw new Error(refused); } } };
   const writes = calls => calls.filter(call => ['delete', 'upgrade', 'merge-request', 'merge-online', 'history'].includes(call[0]));
   for (const [kind, what, extra] of [
-    ['merge', '合并到当前库', {}], ['delete', '删除其他历史库', {}], ['history', '升级这个旧历史库后查看', { oldEpoch: 4 }]
+    ['merge', '合并到当前库', {}], ['delete', '删除其他历史库', {}],
+    ...[3, 4, 5, 6].map(oldEpoch => ['history', '升级这个旧历史库后查看', { oldEpoch }])
   ]) {
     const f = fixture({ application: frozen, picks: [action(kind), 0, 0, 0], confirmation: kind === 'delete' ? '永久删除' : '合并', ...extra });
     await f.manageRuntimeDataSets(f.context, f.startup);
