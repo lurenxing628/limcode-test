@@ -2812,13 +2812,20 @@ function decodeContextRecords(
       if (binding && thinkingBindings.get(segmentId) !== 'strip_thinking') thinkingBindings.set(segmentId, binding);
     }
   }
-  return rows.map((row) => decodeContextRecord(
-    row,
-    roles.get(String(row.segment_id)) ?? [],
-    modelSources.get(String(row.segment_id)),
-    recipeSources.get(String(row.segment_id)),
-    thinkingBindings.get(String(row.segment_id))
-  ));
+  // Both callers transfer a fresh, private array. Replace its rows as they are decoded so the
+  // complete joined-row graph does not remain live alongside a separate decoded-record array.
+  const records: Array<Record<string, unknown> | ContextMaterializationRecord> = rows;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    records[index] = decodeContextRecord(
+      row,
+      roles.get(String(row.segment_id)) ?? [],
+      modelSources.get(String(row.segment_id)),
+      recipeSources.get(String(row.segment_id)),
+      thinkingBindings.get(String(row.segment_id))
+    );
+  }
+  return records as ContextMaterializationRecord[];
 }
 
 /** ModelRequest.stream_stats_json 里持久化的 Claude 保留思考处理；没有或形状不对时为空。 */
