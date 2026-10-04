@@ -151,6 +151,8 @@ async function withKernel(verify) {
           current_submission_id: `${id}-submission`, status: 'submitted', created_at: at, updated_at: at }),
         repo('AnswerSubmission').insert({ id: `${id}-submission`, answer_bridge_id: `${id}-bridge`, submission_seq: 1n,
           turn_id: `${id}-turn`, interrupted: 0n, created_at: at }),
+        repo('AnswerPayload').insert({ id: `${id}-answer-payload`, submission_id: `${id}-submission`, title: null,
+          content_object_id: payload.metadata.id, byte_length: payload.metadata.byte_length, created_at: at }),
         repo('RuntimeInboxItem').insert({ id: `${id}-inbox`, dedupe_key: `fixture:${id}`, source_kind: 'answer_submission',
           source_id: `${id}-submission`, state: 'available', created_at: at, updated_at: at }),
         repo('RuntimeInboxPayloadLink').insert({ id: `${id}-payload`, inbox_item_id: `${id}-inbox`,
@@ -341,6 +343,12 @@ test('an answer for a stopped parent Turn that a newer child generation supersed
     const [delivery] = await rows('RuntimeDelivery', { id: created.delivery.id });
     assert.equal(delivery.phase, 'notify_only', 'a superseded answer can no longer continue the stopped parent');
     assert.deepEqual(wakes.map(request => request.action), ['notify_only']);
+    const [payload] = await rows('AnswerPayload', { submission_id: 'superseded-submission' });
+    const [presentation] = await rows('RuntimeDeliveryAnswerPresentation', { delivery_id: created.delivery.id });
+    assert.equal(presentation.submission_id, 'superseded-submission');
+    assert.equal(presentation.body_content_object_id, payload.content_object_id,
+      'notification acceptance retains the immutable payload even after the bridge moves on');
+    assert.equal(presentation.body_representation, 'answer-payload');
   });
 });
 

@@ -714,7 +714,10 @@ test('清理失败不会覆盖已完成的结果；EPERM 等临时错误会重�
   console.warn = (...args) => warnings.push(String(args[0]));
   t.after(() => { console.warn = originalWarn; });
   fsPromises.rm = async (target, options) => {
-    if (blockRemoval && path.dirname(String(target)) === requests) throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    // Fail withdrawal of the request, not cleanup of an atomic publish's already-renamed .tmp file.
+    if (blockRemoval && path.dirname(String(target)) === requests && String(target).endsWith('.json')) {
+      throw Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    }
     return originalRm(target, options);
   };
   const outcome = await request(paths, { ...BASE, operationKey: 'sources-b' }, async () => assert.fail('must not run'));
@@ -1781,12 +1784,16 @@ async function createRoot(t) {
   return { root, binding, paths: binding.paths };
 }
 
+let nextTemporaryHost = 0;
 async function publishHost(binding, hostBootId, startedAt = STARTED) {
   const target = path.join(binding.paths.dataRootPath, `host-liveness/${hostBootId}.json`);
   await fs.mkdir(path.dirname(target), { recursive: true });
-  await fs.writeFile(target, JSON.stringify({ kind: 'limcode-runtime-host-liveness', dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId,
+  // Match RuntimeDatabase.writeHostHeartbeat: polling must never see a truncated liveness record.
+  const temporary = `${target}.${process.pid}.${nextTemporaryHost += 1}.tmp`;
+  await fs.writeFile(temporary, JSON.stringify({ kind: 'limcode-runtime-host-liveness', dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId,
     rootGeneration: binding.rootGeneration, hostBootId, livenessId: `${hostBootId}-liveness`, processId: process.pid,
     processStartIdentity: ownProcessStartIdentity(), startedAt, heartbeatAt: NOW }));
+  await fs.rename(temporary, target);
   return target;
 }
 
