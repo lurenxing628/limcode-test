@@ -3272,13 +3272,11 @@ test('显式安全错误与本地 SyntaxError 不重试，Provider 工具参数�
   assert.equal(events.length, 0, 'no malformed call crosses the provider boundary');
 });
 
-test('Provider 的 CONTENT/MODEL 服务错误不冒充本地故障，真实 wire invariant 则拒绝重试', async () => {
+test('Provider 的 CONTENT/MODEL 服务错误不冒充本地故障，正文损坏仍拒绝重试', async () => {
   for (const code of ['CONTENT_SERVICE_UNAVAILABLE', 'MODEL_OVERLOADED']) {
     assert.ok((await providerFailureOf('upstream problem', { status: 503, code })) instanceof kernel.ProviderTransientError);
   }
-  for (const raw of [{ code: 'LLM_WIRE_INVARIANT_FAILED' }, { code: 'CONTENT_DIGEST_MISMATCH', category: 'internal' }]) {
-    const error = await providerFailureOf('local invariant failed', raw);
-    assert.equal(error instanceof kernel.ProviderTransientError, false);
-    assert.equal(error.category, 'internal');
-  }
+  const error = await providerFailureOf('local invariant failed', { code: 'CONTENT_DIGEST_MISMATCH', category: 'internal' });
+  assert.equal(error instanceof kernel.ProviderTransientError, false);
+  assert.equal(error.category, 'internal');
 });

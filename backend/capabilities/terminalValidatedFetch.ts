@@ -1,22 +1,10 @@
 import type { LlmProviderKind } from '../../shared/protocol';
 import type { DebugHttpObservation } from '../reliableKernel/debugCapture/observer';
-import {
-  annotateProviderWireError,
-  emitProviderWireInvariantTrace,
-  inspectFinalProviderWireBody,
-  type LlmProviderWireInvariantTrace
-} from './providerWireInvariant';
-
-export type {
-  LlmProviderWireInvariantTrace,
-  LlmProviderWireToolItemTrace
-} from './providerWireInvariant';
 
 const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
 
 export interface TerminalValidatedFetchOptions {
   bodyIdleTimeoutMs?: number;
-  onWireInvariantTrace?: (trace: LlmProviderWireInvariantTrace) => void;
   createObservation?: () => DebugHttpObservation;
   /**
    * OpenAI Responses：线上看到的终态（流里的 response.completed / response.incomplete，或非流式响应体的 status）。
@@ -61,20 +49,14 @@ export function createTerminalValidatedFetch(
   const bodyIdleTimeoutMs = positiveTimeout(options.bodyIdleTimeoutMs ?? DEFAULT_BODY_IDLE_TIMEOUT_MS);
   return async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const observation = options.createObservation?.();
-    const wireTrace = await inspectFinalProviderWireBody(input, init, provider);
-    if (wireTrace) emitProviderWireInvariantTrace(options.onWireInvariantTrace, wireTrace);
     observation?.request(input, init);
     let response: Response;
     try { response = await baseFetch(input, init); }
     catch (error) { observation?.end('fetch_error', error); throw error; }
     const transportResponse = response;
-    if (!response.ok && wireTrace?.toolItems.length) {
-      response = annotateProviderWireError(response, wireTrace.bodySha256);
-    }
     const validatedStream = response.ok && isEventStream(response.headers.get('content-type'));
     const onResponsesTerminal = provider === 'openai-responses' ? options.onResponsesTerminal : undefined;
-    if (!response.body) return response === transportResponse
-      ? response : preserveResponseTransportMetadata(response, transportResponse);
+    if (!response.body) return response;
 
     const reader = response.body.getReader();
     const signal = init?.signal ?? (input instanceof Request ? input.signal : undefined);

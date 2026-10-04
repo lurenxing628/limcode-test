@@ -52,7 +52,6 @@ import {
   resetOpenAIResponsesWebSocketConnectionState,
   resolvedTimeouts,
   sendWithDeadline,
-  shortCanonicalHash,
   startOpenAIResponsesWebSocketHeartbeat,
   structuredTransportError,
   throwIfAborted,
@@ -115,9 +114,6 @@ export interface OpenAIResponsesWebSocketDecision {
   reason: string;
   fullInputItemCount: number;
   sentInputItemCount: number;
-  fullInputFingerprint: string;
-  sentInputFingerprint: string;
-  baselineFingerprint?: string;
   previousResponseIdUsed?: string;
   /** Multiplexed native lane carrying this request. */
   streamId?: string;
@@ -858,9 +854,6 @@ function prepareCreatePayload(
       reason,
       fullInputItemCount: fullInputItems.length,
       sentInputItemCount: sentInput.length,
-      fullInputFingerprint: shortCanonicalHash(fullInputItems),
-      sentInputFingerprint: shortCanonicalHash(sentInput),
-      ...(baseline ? { baselineFingerprint: shortCanonicalHash(baseline) } : {}),
       ...(canIncrement && continuation.lastResponse
         ? { previousResponseIdUsed: continuation.lastResponse.responseId }
         : {}),
@@ -1211,7 +1204,6 @@ async function* sendCreateAndReadEvents(
       }
     }, NETWORK_IDENTITY_CHECK_INTERVAL_MS);
     const payloadText = JSON.stringify(payload);
-    const responseCreateFrameSha256 = createHash('sha256').update(payloadText, 'utf8').digest('hex');
     const responseCreateFrameBytes = Buffer.byteLength(payloadText, 'utf8');
     const responseCreateSeq = nextResponseCreateSeq();
     sentSequence = responseCreateSeq;
@@ -1220,7 +1212,6 @@ async function* sendCreateAndReadEvents(
     observe?.('send_started');
     await sendWithDeadline(socket, payloadText, timeouts.sendMs, signal);
     observe?.('request_sent', {
-      responseCreateFrameSha256,
       responseCreateFrameBytes,
       responseCreateSeq
     });
@@ -2031,12 +2022,10 @@ async function sendNativeCreateFrame(
   payload: Record<string, unknown>
 ): Promise<number | undefined> {
   const payloadText = JSON.stringify(payload);
-  const responseCreateFrameSha256 = createHash('sha256').update(payloadText, 'utf8').digest('hex');
   const responseCreateFrameBytes = Buffer.byteLength(payloadText, 'utf8');
   observeNativePhase(state, 'send_started');
   const { responseCreateSeq } = await state.lease.sendFrame(payload, state.timeouts.sendMs, state.options.signal);
   observeNativePhase(state, 'request_sent', {
-    responseCreateFrameSha256,
     responseCreateFrameBytes,
     ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {})
   });

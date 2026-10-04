@@ -141,7 +141,6 @@ const ALLOWED_METADATA_KEYS = new Set([
   'renewalReason',
   'fullInputItemCount',
   'sentInputItemCount',
-  'responseCreateFrameSha256',
   'responseCreateFrameBytes',
   'responseCreateSeq',
   'kind',

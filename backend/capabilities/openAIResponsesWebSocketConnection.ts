@@ -58,7 +58,6 @@ export interface OpenAIResponsesWebSocketPhase {
   mode?: 'full' | 'incremental';
   reason?: string;
   timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
-  responseCreateFrameSha256?: string;
   responseCreateFrameBytes?: number;
   responseCreateSeq?: number;
   streamId?: string;
@@ -623,10 +622,6 @@ function positiveTimeout(value: number | undefined, fallback: number, label: str
 
 export function canonicalHash(value: unknown): string {
   return createHash('sha256').update(canonicalString(value)).digest('hex');
-}
-
-export function shortCanonicalHash(value: unknown): string {
-  return canonicalHash(value).slice(0, 16);
 }
 
 export function canonicalString(value: unknown): string {

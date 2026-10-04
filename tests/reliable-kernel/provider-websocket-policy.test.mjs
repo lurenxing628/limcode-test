@@ -1,6 +1,5 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
 import http from 'node:http';
 import { createRequire } from 'node:module';
 
@@ -404,10 +403,6 @@ test('reliable Attempt 2 forces a fresh physical WS and full request', async () 
     assert.ok(requestSent);
     assert.equal(requestSent.responseCreateSeq, 1);
     assert.equal(requestSent.responseCreateFrameBytes, Buffer.byteLength(requests[1].payloadText, 'utf8'));
-    assert.equal(
-      requestSent.responseCreateFrameSha256,
-      createHash('sha256').update(requests[1].payloadText, 'utf8').digest('hex')
-    );
   } finally {
     await server.close();
   }

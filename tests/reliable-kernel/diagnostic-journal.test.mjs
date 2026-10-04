@@ -50,7 +50,6 @@ test('ReliableDiagnosticJournal 只持久化脱敏 metadata 并保持文件/内�
       metadata: {
         modelRequestId: 'model-request-frame',
         stage: 'request_sent',
-        responseCreateFrameSha256: 'b'.repeat(64),
         responseCreateFrameBytes: 37,
         responseCreateSeq: 2,
         requestBody: '禁止持久化的请求体'
@@ -62,7 +61,6 @@ test('ReliableDiagnosticJournal 只持久化脱敏 metadata 并保持文件/内�
     assert.deepEqual(frameTrace.events[0].metadata, {
       modelRequestId: 'model-request-frame',
       stage: 'request_sent',
-      responseCreateFrameSha256: 'b'.repeat(64),
       responseCreateFrameBytes: 37,
       responseCreateSeq: 2
     });

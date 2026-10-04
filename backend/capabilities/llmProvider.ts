@@ -256,7 +256,6 @@ export interface LlmProviderTransportTrace {
   timeoutPhase?: OpenAIResponsesWebSocketTimeoutPhase;
   fullInputItemCount?: number;
   sentInputItemCount?: number;
-  responseCreateFrameSha256?: string;
   responseCreateFrameBytes?: number;
   responseCreateSeq?: number;
 }
@@ -1095,10 +1094,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
           mode: decision.mode,
           reason: decision.reason,
           fullInputItemCount: decision.fullInputItemCount,
-          sentInputItemCount: decision.sentInputItemCount,
-          fullInputFingerprint: decision.fullInputFingerprint,
-          sentInputFingerprint: decision.sentInputFingerprint,
-          baselineFingerprint: decision.baselineFingerprint
+          sentInputItemCount: decision.sentInputItemCount
         }));
       },
       onPhase: (phase) => reportTransportTrace(input, traceFromWebSocketPhase(input, phase))
@@ -1472,9 +1468,6 @@ function traceFromWebSocketPhase(
     ...(phase.mode ? { mode: phase.mode } : {}),
     ...(phase.reason ? { reason: phase.reason } : {}),
     ...(phase.timeoutPhase ? { timeoutPhase: phase.timeoutPhase } : {}),
-    ...(phase.responseCreateFrameSha256
-      ? { responseCreateFrameSha256: phase.responseCreateFrameSha256 }
-      : {}),
     ...(phase.responseCreateFrameBytes !== undefined
       ? { responseCreateFrameBytes: phase.responseCreateFrameBytes }
       : {}),
@@ -1542,14 +1535,6 @@ function messageFromRawError(rawError: LlmRawErrorInfoRecord): string {
 }
 
 export function summarizeLlmRawError(rawError: LlmRawErrorInfoRecord): string {
-  const summary = summarizeLlmRawErrorBase(rawError);
-  const evidence = wireInvariantEvidence(rawError);
-  return evidence && remoteReportsMissingToolResultId(rawError)
-    ? `${summary} Local wire invariant passed before fetch; ${evidence}.`
-    : summary;
-}
-
-function summarizeLlmRawErrorBase(rawError: LlmRawErrorInfoRecord): string {
   const direct = specificErrorMessage(rawError.message);
   if (direct) return direct;
   for (const candidate of [
@@ -1569,19 +1554,6 @@ function summarizeLlmRawErrorBase(rawError: LlmRawErrorInfoRecord): string {
   const kind = typeof rawError.kind === 'string' && rawError.kind.trim() ? rawError.kind.trim() : 'llm_error';
   const status = typeof rawError.status === 'number' ? ` HTTP ${rawError.status}` : '';
   return `LLM 请求失败：${kind}${status}`;
-}
-
-function wireInvariantEvidence(rawError: LlmRawErrorInfoRecord): string | undefined {
-  const headers = isRecord(rawError.headers) ? rawError.headers : undefined;
-  const value = headers?.['x-limcode-wire-invariant'];
-  return typeof value === 'string' && /^passed; body_sha256=[a-f0-9]{64}$/.test(value)
-    ? value.slice('passed; '.length)
-    : undefined;
-}
-
-function remoteReportsMissingToolResultId(rawError: LlmRawErrorInfoRecord): boolean {
-  const text = stringifyJson(toPlainJsonLike(rawError));
-  return /(?:missing|required)[^\n]{0,160}(?:tool_call_id|call_id|tool_use_id|functionResponse)|(?:tool_call_id|call_id|tool_use_id|functionResponse)[^\n]{0,160}(?:missing|required)/i.test(text);
 }
 
 function nestedMessage(value: unknown, depth = 0, seen = new Set<object>()): string | undefined {

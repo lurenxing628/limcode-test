@@ -2854,7 +2854,7 @@ function classifyProviderFailure(
     || providerErrorRecords(raw).some(record =>
       (typeof record.name === 'string' && ['RootAuthorityError', 'StaleRootBindingError', 'RuntimeDataInvariantError', 'LocalExecutionRecoveryExhaustedError'].includes(record.name))
       || (typeof record.code === 'string'
-        && /^(?:SQLITE\w*|RUNTIME_DATA_INVARIANT|LOCAL_EXECUTION_RECOVERY_EXHAUSTED|MODEL_STREAM_IDENTITY_STALE|MODEL_STREAM_IDEMPOTENCY_CONFLICT|CONTENT_OBJECT_CORRUPT|CONTENT_DIGEST_MISMATCH|LLM_WIRE_INVARIANT_FAILED|ENOSPC|EDQUOT|EACCES|EPERM|ENOENT|EIO|EBUSY|EAGAIN|EMFILE|ENFILE)$/i.test(record.code)))) {
+        && /^(?:SQLITE\w*|RUNTIME_DATA_INVARIANT|LOCAL_EXECUTION_RECOVERY_EXHAUSTED|MODEL_STREAM_IDENTITY_STALE|MODEL_STREAM_IDEMPOTENCY_CONFLICT|CONTENT_OBJECT_CORRUPT|CONTENT_DIGEST_MISMATCH|ENOSPC|EDQUOT|EACCES|EPERM|ENOENT|EIO|EBUSY|EAGAIN|EMFILE|ENFILE)$/i.test(record.code)))) {
     return Object.assign(permanent(), { category: 'internal' });
   }
   const nativeCompactionEndpoint = endpointKind === 'provider_native'

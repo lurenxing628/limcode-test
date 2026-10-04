@@ -1,6 +1,5 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { createHash } = require('node:crypto');
 const { once } = require('node:events');
 const { WebSocketServer } = require('ws');
 
@@ -599,7 +598,7 @@ test('100-round continuation performs one full rebase after every 16 successful 
   }
 });
 
-test('request_sent fingerprints the exact UTF-8 frame and response.create sequence resets on reconnect', { concurrency: false }, async () => {
+test('request_sent counts exact UTF-8 frame bytes and response.create sequence resets on reconnect', { concurrency: false }, async () => {
   resetOpenAIResponsesWebSocketSessions();
   const requests = [];
   const server = await createServer((socket, request, connection, _upgradeRequest, payloadText) => {
@@ -620,7 +619,7 @@ test('request_sent fingerprints the exact UTF-8 frame and response.create sequen
       await collect(streamOptions(
         server,
         format,
-        'utf8-frame-fingerprint',
+        'utf8-frame-length',
         requestBody(format, contents),
         {
           ...(index === 2 ? { forceNewConnection: true } : {}),
@@ -635,14 +634,10 @@ test('request_sent fingerprints the exact UTF-8 frame and response.create sequen
     assert.deepEqual(sentPhases.map((phase) => phase.connectionGeneration), [1, 1, 2]);
     for (const [index, phase] of sentPhases.entries()) {
       const payloadText = requests[index].payloadText;
-      assert.equal(
-        phase.responseCreateFrameSha256,
-        createHash('sha256').update(payloadText, 'utf8').digest('hex')
-      );
       assert.equal(phase.responseCreateFrameBytes, Buffer.byteLength(payloadText, 'utf8'));
       assert.doesNotMatch(
         JSON.stringify(requests[index].request),
-        /responseCreateFrameSha256|responseCreateFrameBytes|responseCreateSeq/
+        /responseCreateFrameBytes|responseCreateSeq/
       );
     }
   } finally {
