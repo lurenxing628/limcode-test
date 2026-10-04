@@ -48,6 +48,37 @@ export function estimateJsonTokens(value: unknown): number {
   return estimateTextTokens(safeJsonString(value));
 }
 
+/** Reuses one token-estimation serialization for preview skeleton sizing, without retaining it.
+ * Non-plain values still use the estimator's existing fallback; their canonical preview length is
+ * deliberately not inferred from this text (undefined, toJSON and repeated objects can differ).
+ */
+export function measureJsonTokens(value: unknown): { tokens: number; characters: number; plainJson: boolean } {
+  let plainJson = true;
+  const seen = new WeakSet<object>();
+  let text: string;
+  try {
+    text = JSON.stringify(value, function (key, candidate: unknown): unknown {
+      const descriptor = Object.getOwnPropertyDescriptor(this, key);
+      const original = descriptor && 'value' in descriptor ? descriptor.value : candidate;
+      if ((descriptor && !('value' in descriptor)) || original !== candidate
+        || candidate === undefined || typeof candidate === 'bigint'
+        || typeof candidate === 'function' || typeof candidate === 'symbol') plainJson = false;
+      if (candidate && typeof candidate === 'object') {
+        const prototype = Object.getPrototypeOf(candidate);
+        if (seen.has(candidate) || (!Array.isArray(candidate) && prototype !== Object.prototype && prototype !== null)) {
+          plainJson = false;
+        }
+        seen.add(candidate);
+      }
+      return candidate;
+    }) ?? '';
+  } catch {
+    plainJson = false;
+    text = String(value);
+  }
+  return { tokens: estimateTextTokens(text), characters: text.length, plainJson };
+}
+
 /** Removes the convenience ciphertext copy when rawItem already owns the exact replay value. */
 export function canonicalizeCompressionContents(contents: readonly MessageContent[]): MessageContent[] {
   return contents.map((content) => ({

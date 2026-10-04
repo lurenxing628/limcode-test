@@ -554,6 +554,8 @@ test('Reliable Context信封解码后同批结果共用16K且原CAS派生对象�
   assert.deepEqual(source, before);
   assert.deepEqual(first, kernel.projectToolResultBatch(source));
   assert.equal(first.items.length, source.length);
+  assert.ok(first.items.every((item) => !Object.hasOwn(item, 'digest')));
+  assert.equal(Object.hasOwn(first.items[1].response, 'sha256'), false);
   assert.equal(first.items[2].truncated, false);
   assert.deepEqual(first.items[2].response, source[2].response);
   assert.ok(first.projectedTokens <= 16_000);
@@ -590,7 +592,7 @@ test('water-fill使用priority且必要骨架软超时不丢配对身份', () =>
   assert.deepEqual(skeletons.items.map((item) => item.resultId), source.map((item) => item.resultId));
 });
 
-test('摘要投影保留首份托管媒体正文并把长工具参数改为digest描述', () => {
+test('摘要投影保留首份托管媒体正文并把长工具参数改为有界预览', () => {
   const raw = Buffer.from('SECRET-MEDIA-CONTENT'.repeat(2_000));
   const base64 = raw.toString('base64');
   const projected = kernel.projectSummaryModelWindow([
@@ -623,7 +625,13 @@ test('摘要投影保留首份托管媒体正文并把长工具参数改为diges
   assert.equal(projected.uniqueManagedMediaBodyCount, 1);
   assert.equal(projected.contents.some((content) => content.parts.some((part) => 'functionCall' in part)), false);
   assert.equal(projected.contents.some((content) => content.parts.some((part) => 'inlineData' in part)), true);
-  assert.match(encoded, /sha256/);
+  const call = projected.contents.flatMap((content) => content.parts)
+    .filter((part) => 'text' in part).map((part) => JSON.parse(part.text))
+    .find((value) => value.kind === 'historical_tool_call');
+  assert.equal(call.arguments.truncated, true);
+  assert.equal(Object.hasOwn(call.arguments, 'sha256'), false);
+  const media = projected.contents.flatMap((content) => content.parts).find((part) => 'inlineData' in part);
+  assert.equal(media.inlineData.sha256, 'a'.repeat(64), 'attachment identity remains intact');
   assert.doesNotMatch(encoded, /historical_media/);
 });
 

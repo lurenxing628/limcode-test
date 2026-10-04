@@ -20,6 +20,7 @@ import {
 import { renderLoadedSkill } from '../world/modules/skill/skillLookup';
 import {
   estimateJsonTokens,
+  measureJsonTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
   estimateTextTokens
@@ -671,7 +672,6 @@ export interface ToolResultProjectionItem {
   projectedTokens: number;
   allocatedTokens: number;
   truncated: boolean;
-  digest: string;
   /** Where the model continues reading a result cut at a line boundary; also stated in the response. */
   reread?: ToolResultRereadTarget;
 }
@@ -707,17 +707,17 @@ export function projectToolResultBatch(
   );
   // Loaded skills of one batch share one allowance: each keeps its whole text when that fits,
   // otherwise the allowance is split evenly (water filling) so several large skills loaded together
-  // stay bounded like one. The first pass only measures each skill's whole text.
-  const measured = inputs.map((input, index) =>
-    projectTextToolResult(input, index, perResultTokens, Number.MAX_SAFE_INTEGER));
+  // stay bounded like one. Prepare each text once before assigning its final allowance.
+  const measured = inputs.map((input, index) => prepareTextToolResult(input, index));
   const skillIndexes = measured.flatMap((item, index) => (item?.toolName === SKILLS_TOOL_NAME ? [index] : []));
   const skillShares = new Map(waterFillTokens(
     skillIndexes.map((index) => measured[index]!.originalTokens),
     skillResultTokens
   ).map((share, position): [number, number] => [skillIndexes[position], share]));
-  const dedicated = inputs.map((input, index) => measured[index] === undefined
+  const dedicated = measured.map((item, index) => item === undefined
     ? undefined
-    : projectTextToolResult(input, index, perResultTokens, skillShares.get(index) ?? skillResultTokens));
+    : projectTextToolResult(item, item.toolName === SKILLS_TOOL_NAME
+      ? skillShares.get(index)! : perResultTokens));
   const shared = inputs.flatMap((input, index) => dedicated[index] ? [] : [{ input, index }]);
   const prepared = shared.map(({ input, index }) => prepareToolResult(input, index, perResultTokens));
   const mandatoryTokens = safeSum(prepared.map((item) => item.baseTokens));
@@ -739,7 +739,6 @@ export function projectToolResultBatch(
       projectedTokens: estimateJsonTokens(response),
       allocatedTokens: target,
       truncated: !exact,
-      digest: item.digest,
       ...(preview?.reread ? { reread: preview.reread } : {})
     }];
   }));
@@ -818,22 +817,32 @@ function waterFillTokens(demands: readonly number[], total: number): number[] {
  * not fit, the head of its body is kept up to a line boundary and the text says where it was cut and
  * how to read the rest, with the same place as a structured rereadHint. Undefined for other results.
  */
-function projectTextToolResult(
-  rawInput: ToolResultProjectionInput,
-  index: number,
-  perResultTokens: number,
-  skillResultTokens: number
-): ToolResultProjectionItem | undefined {
+interface PreparedTextToolResult {
+  input: ToolResultProjectionInput;
+  toolName: string;
+  skill: ReturnType<typeof loadedSkillFromToolResult>;
+  error: boolean;
+  fullText: string;
+  originalTokens: number;
+}
+
+function prepareTextToolResult(rawInput: ToolResultProjectionInput, index: number): PreparedTextToolResult | undefined {
   const toolName = requireText(rawInput.toolName, `toolResults[${index}].toolName`);
   const skill = toolName === SKILLS_TOOL_NAME ? loadedSkillFromToolResult(rawInput.response) : undefined;
   const failure = toolName === SKILLS_TOOL_NAME && !skill ? skillLoadFailureText(rawInput.response) : undefined;
   const existing = !skill && failure === undefined ? readModelTextToolResponse(rawInput.response) : undefined;
   if (!skill && failure === undefined && !existing) return undefined;
-  const allocatedTokens = toolName === SKILLS_TOOL_NAME ? skillResultTokens : perResultTokens;
   const error = failure !== undefined || existing?.error === true;
-  const measure = (text: string): number => estimateJsonTokens(modelTextToolResponse(text, error));
   const fullText = skill ? renderLoadedSkill(skill, skill.body) : failure ?? existing!.text;
-  const originalTokens = measure(fullText);
+  return {
+    input: rawInput, toolName, skill, error, fullText,
+    originalTokens: estimateJsonTokens(modelTextToolResponse(fullText, error))
+  };
+}
+
+function projectTextToolResult(prepared: PreparedTextToolResult, allocatedTokens: number): ToolResultProjectionItem {
+  const { input, toolName, skill, error, fullText, originalTokens } = prepared;
+  const measure = (text: string): number => estimateJsonTokens(modelTextToolResponse(text, error));
   let text = fullText;
   let reread: ToolResultRereadTarget | undefined;
   if (originalTokens > allocatedTokens) {
@@ -850,14 +859,13 @@ function projectTextToolResult(
   const response = modelTextToolResponse(text, error);
   return {
     toolName,
-    ...(rawInput.callId ? { callId: rawInput.callId } : {}),
-    ...(rawInput.resultId ? { resultId: rawInput.resultId } : {}),
+    ...(input.callId ? { callId: input.callId } : {}),
+    ...(input.resultId ? { resultId: input.resultId } : {}),
     response,
     originalTokens,
-    projectedTokens: estimateJsonTokens(response),
+    projectedTokens: text === fullText ? originalTokens : estimateJsonTokens(response),
     allocatedTokens,
     truncated: text !== fullText,
-    digest: createHash('sha256').update(stableJson(rawInput.response)).digest('hex'),
     ...(reread ? { reread } : {})
   };
 }
@@ -1620,8 +1628,8 @@ function inlineMediaResolved(part: InlineDataPart): boolean {
 
 interface PreparedToolResult {
   input: ToolResultProjectionInput;
-  serialized: string;
-  digest: string;
+  /** Only non-plain inputs need their canonical text before the final allocation. */
+  serialized?: string;
   originalTokens: number;
   skeleton: Record<string, unknown>;
   skeletonTokens: number;
@@ -1641,20 +1649,21 @@ function prepareToolResult(
     ...rawInput,
     toolName: requireText(rawInput.toolName, `toolResults[${index}].toolName`)
   };
-  const serialized = stableJson(input.response);
-  const digest = createHash('sha256').update(serialized).digest('hex');
-  const originalTokens = estimateJsonTokens(input.response);
   const readView = input.toolName === READ_TOOL_NAME ? readResultView(input.response) : undefined;
+  const measurement = readView ? undefined : measureJsonTokens(input.response);
+  const originalTokens = measurement?.tokens ?? estimateJsonTokens(input.response);
+  // Canonical ordering changes JSON key order, not its length. Reuse the required token measure
+  // for normal results; only non-plain values need the old canonical-length fallback.
+  const serialized = measurement && !measurement.plainJson ? stableJson(input.response) : undefined;
   const skeleton = readView
     ? readPreviewResponse(readView, 0).response
-    : toolResultSkeleton(input, serialized.length, originalTokens, digest);
+    : toolResultSkeleton(input, measurement!.plainJson ? measurement!.characters : serialized!.length, originalTokens);
   const skeletonTokens = estimateJsonTokens(skeleton);
   const baseTokens = Math.min(originalTokens, skeletonTokens);
   const targetTokens = Math.min(originalTokens, Math.max(perResultTokens, baseTokens));
   return {
     input,
     serialized,
-    digest,
     originalTokens,
     skeleton,
     skeletonTokens,
@@ -1705,8 +1714,7 @@ function allocateToolResultPreviewTokens(
 function toolResultSkeleton(
   input: ToolResultProjectionInput,
   originalChars: number,
-  originalTokens: number,
-  digest: string
+  originalTokens: number
 ): Record<string, unknown> {
   const facts = collectImportantFacts(input.response, input.toolName);
   return {
@@ -1716,7 +1724,6 @@ function toolResultSkeleton(
     ...facts,
     originalChars,
     originalTokens,
-    sha256: digest,
     truncated: true,
     ...(input.reread ? { rereadHint: rereadHint(input.reread) } : {}),
     preview: ''
@@ -1787,12 +1794,13 @@ function rereadHint(target: ToolResultRereadTarget): Record<string, unknown> {
 
 function boundedPreviewEnvelope(item: PreparedToolResult, targetTokens: number): unknown {
   if (item.skeletonTokens > targetTokens) return cloneJsonValue(item.skeleton);
+  const serialized = item.serialized ?? stableJson(item.input.response);
   let low = 0;
-  let high = item.serialized.length;
+  let high = serialized.length;
   let best: unknown = cloneJsonValue(item.skeleton);
   while (low <= high) {
     const length = Math.floor((low + high) / 2);
-    const candidate = { ...item.skeleton, preview: headTailPreview(item.serialized, length) };
+    const candidate = { ...item.skeleton, preview: headTailPreview(serialized, length) };
     if (estimateJsonTokens(candidate) <= targetTokens) {
       best = candidate;
       low = length + 1;
@@ -1963,14 +1971,13 @@ function readPartialFirstLinePreview(
 }
 
 function boundedValueDescriptor(value: unknown, maxTokens: number): unknown {
-  if (estimateJsonTokens(value) <= maxTokens) return cloneJsonValue(value);
+  const originalTokens = estimateJsonTokens(value);
+  if (originalTokens <= maxTokens) return cloneJsonValue(value);
   const serialized = stableJson(value);
-  const digest = createHash('sha256').update(serialized).digest('hex');
   const base = {
     truncated: true,
     originalChars: serialized.length,
-    originalTokens: estimateJsonTokens(value),
-    sha256: digest,
+    originalTokens,
     preview: ''
   };
   let low = 0;
