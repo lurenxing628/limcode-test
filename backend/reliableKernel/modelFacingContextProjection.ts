@@ -484,7 +484,26 @@ export interface AtomicContextGroup<T = MessageContent> {
 
 /** Groups one assistant tool-call batch with every immediately following result message. */
 export function groupAtomicMessageContents(contents: readonly MessageContent[]): AtomicContextGroup[] {
-  const groups: AtomicContextGroup[] = [];
+  return groupAtomicMessageContentRanges(contents).map((group) => {
+    const items = contents.slice(group.startIndex, group.endIndexExclusive).map(cloneMessageContent);
+    return {
+      kind: group.kind,
+      items,
+      startIndex: group.startIndex,
+      endIndexExclusive: group.endIndexExclusive,
+      estimatedTokens: estimateMessageContentsTokens(items),
+      functionCallCount: group.functionCallCount,
+      functionResponseCount: group.functionResponseCount,
+      complete: group.complete
+    };
+  });
+}
+
+type AtomicContextGroupRange = Omit<AtomicContextGroup, 'items' | 'estimatedTokens'>;
+
+/** Shared grouping boundaries, without cloning or estimating content that a caller may not need. */
+function groupAtomicMessageContentRanges(contents: readonly MessageContent[]): AtomicContextGroupRange[] {
+  const groups: AtomicContextGroupRange[] = [];
   for (let index = 0; index < contents.length;) {
     const current = contents[index];
     const callCount = countFunctionCalls(current);
@@ -495,13 +514,10 @@ export function groupAtomicMessageContents(contents: readonly MessageContent[]):
         responseCount += countFunctionResponses(contents[end]);
         end += 1;
       }
-      const items = contents.slice(index, end).map(cloneMessageContent);
       groups.push({
         kind: 'tool_exchange',
-        items,
         startIndex: index,
         endIndexExclusive: end,
-        estimatedTokens: estimateMessageContentsTokens(items),
         functionCallCount: callCount,
         functionResponseCount: responseCount,
         complete: responseCount >= callCount
@@ -511,15 +527,15 @@ export function groupAtomicMessageContents(contents: readonly MessageContent[]):
     }
     if (isToolResultOnly(current)) {
       let end = index + 1;
-      while (end < contents.length && isToolResultOnly(contents[end])) end += 1;
-      const items = contents.slice(index, end).map(cloneMessageContent);
-      const responseCount = items.reduce((total, item) => total + countFunctionResponses(item), 0);
+      let responseCount = countFunctionResponses(current);
+      while (end < contents.length && isToolResultOnly(contents[end])) {
+        responseCount += countFunctionResponses(contents[end]);
+        end += 1;
+      }
       groups.push({
         kind: 'tool_results',
-        items,
         startIndex: index,
         endIndexExclusive: end,
-        estimatedTokens: estimateMessageContentsTokens(items),
         functionCallCount: 0,
         functionResponseCount: responseCount,
         complete: false
@@ -527,13 +543,10 @@ export function groupAtomicMessageContents(contents: readonly MessageContent[]):
       index = end;
       continue;
     }
-    const item = cloneMessageContent(current);
     groups.push({
       kind: 'message',
-      items: [item],
       startIndex: index,
       endIndexExclusive: index + 1,
-      estimatedTokens: estimateMessageContentsTokens([item]),
       functionCallCount: 0,
       functionResponseCount: 0,
       complete: true
@@ -1109,7 +1122,7 @@ export function projectOrdinaryModelWindow(
 ): ModelWindowProjection {
   const projected = contents.map(cloneMessageContent);
   const batches: ToolResultBatchProjection[] = [];
-  for (const group of groupAtomicMessageContents(projected)) {
+  for (const group of groupAtomicMessageContentRanges(projected)) {
     if (group.kind !== 'tool_exchange' && group.kind !== 'tool_results') continue;
     const refs: Array<{ contentIndex: number; partIndex: number; part: Extract<ContentPart, { functionResponse: unknown }> }> = [];
     for (let contentIndex = group.startIndex; contentIndex < group.endIndexExclusive; contentIndex += 1) {
