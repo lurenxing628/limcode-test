@@ -21,7 +21,7 @@ import {
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { ContextContentMaterializationRecord, ContextModelSource } from './databaseWorkerProtocol';
-import { projectStoredModelFacingWindow } from './modelFacingContextProjection';
+import { estimateStoredModelFacingWindowTokens } from './modelFacingContextProjection';
 import { currentExecutionLeaseFence } from './executionLeaseFence';
 import {
   NativeAsyncWorkPendingError,
@@ -2018,13 +2018,15 @@ export class ContextSequenceControlPlane {
   private async estimateEditableContextTokens(records: readonly EditableContextSegment[]): Promise<bigint> {
     if (records.length === 0) return 0n;
     const metadata = records.map((record) => asContentObjectMetadata(record.contentObject));
-    const content = await this.contentStore.readMany(metadata);
-    return BigInt(projectStoredModelFacingWindow(records.map((record, index) => ({
-      segmentKind: requireSegmentKind(record.segment.segment_kind),
-      messageRole: null,
-      contentType: metadata[index].content_type,
-      content: content[index].toString('utf8')
-    }))).tokenCount);
+    return BigInt(await estimateStoredModelFacingWindowTokens({
+      length: records.length,
+      read: async (index) => ({
+        segmentKind: requireSegmentKind(records[index].segment.segment_kind),
+        messageRole: null,
+        contentType: metadata[index].content_type,
+        content: (await this.contentStore.read(metadata[index])).toString('utf8')
+      })
+    }));
   }
 
   private async readEditableSegment(segmentId: string): Promise<EditableContextSegment> {

@@ -27,6 +27,7 @@ import {
 } from './modelTokenEstimator';
 import {
   buildModelHandleCatalog,
+  createModelHandleCatalogBuilder,
   modelHandleRef,
   prepareModelHandleCatalog,
   projectToolResultForModel,
@@ -725,22 +726,7 @@ export function projectToolResultBatch(
   const allocations = allocateToolResultPreviewTokens(prepared, remaining);
   const sharedItems = new Map(prepared.map((item, position): [number, ToolResultProjectionItem] => {
     const target = safeSum([item.baseTokens, allocations[position]]);
-    const exact = item.originalTokens <= target;
-    const preview = exact ? undefined : item.readView
-      ? boundedReadPreview(item.readView, target)
-      : { response: boundedPreviewEnvelope(item, target) };
-    const response = preview ? preview.response : cloneJsonValue(item.input.response);
-    return [shared[position].index, {
-      toolName: item.input.toolName,
-      ...(item.input.callId ? { callId: item.input.callId } : {}),
-      ...(item.input.resultId ? { resultId: item.input.resultId } : {}),
-      response,
-      originalTokens: item.originalTokens,
-      projectedTokens: estimateJsonTokens(response),
-      allocatedTokens: target,
-      truncated: !exact,
-      ...(preview?.reread ? { reread: preview.reread } : {})
-    }];
+    return [shared[position].index, projectPreparedToolResult(item, target)];
   }));
   const items = inputs.map((_, index) => dedicated[index] ?? sharedItems.get(index)!);
   return {
@@ -826,7 +812,11 @@ interface PreparedTextToolResult {
   originalTokens: number;
 }
 
-function prepareTextToolResult(rawInput: ToolResultProjectionInput, index: number): PreparedTextToolResult | undefined {
+function prepareTextToolResult(
+  rawInput: ToolResultProjectionInput,
+  index: number,
+  retainedOriginalTokens?: number
+): PreparedTextToolResult | undefined {
   const toolName = requireText(rawInput.toolName, `toolResults[${index}].toolName`);
   const skill = toolName === SKILLS_TOOL_NAME ? loadedSkillFromToolResult(rawInput.response) : undefined;
   const failure = toolName === SKILLS_TOOL_NAME && !skill ? skillLoadFailureText(rawInput.response) : undefined;
@@ -836,7 +826,7 @@ function prepareTextToolResult(rawInput: ToolResultProjectionInput, index: numbe
   const fullText = skill ? renderLoadedSkill(skill, skill.body) : failure ?? existing!.text;
   return {
     input: rawInput, toolName, skill, error, fullText,
-    originalTokens: estimateJsonTokens(modelTextToolResponse(fullText, error))
+    originalTokens: retainedOriginalTokens ?? estimateJsonTokens(modelTextToolResponse(fullText, error))
   };
 }
 
@@ -1070,6 +1060,157 @@ export function projectStoredModelFacingWindow(
   });
   placements.release();
   return projectOrdinaryModelWindow(contents, modelHandleCatalog);
+}
+
+/** An immutable, repeatable source. Each read owns just one stored Context body. */
+export interface StoredModelFacingContextSource {
+  length: number;
+  read(index: number): Promise<StoredModelFacingContextItem>;
+}
+
+type StoredToolResultDemand =
+  | { kind: 'text'; originalTokens: number; skill: boolean }
+  | ({ kind: 'shared'; baseTokens: number; measurement: ToolResultTokenMeasurement } & ToolResultPreviewDemand);
+
+interface StoredToolGroupRange {
+  startItem: number;
+  startContent: number;
+  endItem: number;
+  endContentExclusive: number;
+  demands: StoredToolResultDemand[];
+}
+
+/**
+ * Exact projectStoredModelFacingWindow(items).tokenCount for its default empty catalogs.
+ * Discover handles before rendering (later results can name earlier bodies), then reduce closed
+ * atomic groups with the same batch allocation and one window-wide media state. Only scalar demand
+ * facts survive between items, even for a group containing arbitrarily many large tool results.
+ * Earlier items in a cross-item group are reread at closure; the current decoded item is reused so
+ * compression bodies containing many groups are never reread once for each internal group.
+ * Memory is bounded by two stored items plus handle/media facts and the open group's scalar demands;
+ * an individual stored body remains indivisible. There is no retained history body cache.
+ */
+export async function estimateStoredModelFacingWindowTokens(source: StoredModelFacingContextSource): Promise<number> {
+  const builder = createModelHandleCatalogBuilder();
+  let readCount = 0;
+  let readCharacters = 0;
+  const read = async (index: number): Promise<StoredModelFacingContextItem> => {
+    const item = await source.read(index);
+    readCount += 1;
+    readCharacters += item.content.length;
+    if (readCount >= 32 || readCharacters >= 512 * 1024) {
+      readCount = 0;
+      readCharacters = 0;
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+    return item;
+  };
+  for (let index = 0; index < source.length; index += 1) builder.add((await read(index)).content);
+  const handles = prepareModelHandleCatalog(builder.finish());
+  const mediaState = createManagedMediaBodyProjectionState();
+  let tokenCount = 0;
+  let contentCount = 0;
+  let currentItem = -1;
+  let currentContents: MessageContent[] = [];
+  let pending: StoredToolGroupRange | undefined;
+  const countContent = async (content: MessageContent): Promise<void> => {
+    const projected = suppressRepeatedManagedMediaBodies([content], handles, mediaState);
+    tokenCount = safeSum([tokenCount, estimateMessageContentsTokens(projected)]);
+    contentCount += 1;
+    if (contentCount % 64 === 0) await new Promise<void>(resolve => setImmediate(resolve));
+  };
+  const closeGroup = async (): Promise<void> => {
+    if (!pending) return;
+    const group = pending;
+    pending = undefined;
+    const allocations = allocateStoredToolResultTokens(group.demands);
+    let responseIndex = 0;
+    for (let itemIndex = group.startItem; itemIndex <= group.endItem; itemIndex += 1) {
+      const contents = itemIndex === currentItem ? currentContents
+        : storedContextItemContents(await read(itemIndex), handles);
+      const start = itemIndex === group.startItem ? group.startContent : 0;
+      const end = itemIndex === group.endItem ? group.endContentExclusive : contents.length;
+      for (let contentIndex = start; contentIndex < end; contentIndex += 1) {
+        const content = contents[contentIndex];
+        const parts = content.parts.map((part): ContentPart => {
+          if (!('functionResponse' in part)) return part;
+          const index = responseIndex++;
+          const input = storedToolResultInput(part);
+          const demand = group.demands[index];
+          const text = prepareTextToolResult(input, index, demand.kind === 'text' ? demand.originalTokens : undefined);
+          const response = text ? projectTextToolResult(text, allocations[index]).response
+            : projectPreparedToolResult(prepareToolResult(input, index, TOOL_RESULT_MAX_TOKENS,
+              demand.kind === 'shared' ? demand.measurement : undefined), allocations[index]).response;
+          return { ...part, functionResponse: { ...part.functionResponse, response } };
+        });
+        await countContent({ ...content, parts });
+      }
+    }
+  };
+  for (let itemIndex = 0; itemIndex < source.length; itemIndex += 1) {
+    currentItem = itemIndex;
+    currentContents = storedContextItemContents(await read(itemIndex), handles);
+    for (let contentIndex = 0; contentIndex < currentContents.length; contentIndex += 1) {
+      const content = currentContents[contentIndex];
+      const callCount = countFunctionCalls(content);
+      const toolResult = isToolResultOnly(content);
+      // A call starts a new group; every consecutive result belongs to the preceding group,
+      // including interleaved/unmatched results. Never infer a boundary from matching call ids.
+      if (callCount > 0 || !toolResult) await closeGroup();
+      if (callCount === 0 && !toolResult) {
+        await countContent(content);
+        continue;
+      }
+      pending ??= { startItem: itemIndex, startContent: contentIndex,
+        endItem: itemIndex, endContentExclusive: contentIndex + 1, demands: [] };
+      pending.endItem = itemIndex;
+      pending.endContentExclusive = contentIndex + 1;
+      for (const part of content.parts) {
+        if (!('functionResponse' in part)) continue;
+        const input = storedToolResultInput(part);
+        const index = pending.demands.length;
+        const text = prepareTextToolResult(input, index);
+        if (text) {
+          pending.demands.push({ kind: 'text', originalTokens: text.originalTokens,
+            skill: text.toolName === SKILLS_TOOL_NAME });
+        } else {
+          const prepared = prepareToolResult(input, index, TOOL_RESULT_MAX_TOKENS);
+          pending.demands.push({ kind: 'shared', baseTokens: prepared.baseTokens, measurement: prepared.measurement,
+            demandTokens: prepared.demandTokens, shortExactEligible: prepared.shortExactEligible,
+            input: { priority: input.priority } });
+        }
+      }
+    }
+  }
+  await closeGroup();
+  return tokenCount;
+}
+
+function storedToolResultInput(part: Extract<ContentPart, { functionResponse: unknown }>): ToolResultProjectionInput {
+  return { toolName: part.functionResponse.name, ...(part.id ? { callId: part.id } : {}),
+    response: part.functionResponse.response, priority: toolResultPriority(part.functionResponse.response) };
+}
+
+function allocateStoredToolResultTokens(demands: readonly StoredToolResultDemand[]): number[] {
+  const skillIndexes: number[] = [];
+  const shared: Array<Extract<StoredToolResultDemand, { kind: 'shared' }>> = [];
+  const sharedIndexes: number[] = [];
+  const allocations = demands.map((demand, index) => {
+    if (demand.kind === 'text') {
+      if (demand.skill) skillIndexes.push(index);
+      return TOOL_RESULT_MAX_TOKENS;
+    }
+    shared.push(demand);
+    sharedIndexes.push(index);
+    return demand.baseTokens;
+  });
+  const skillShares = waterFillTokens(skillIndexes.map(index =>
+    (demands[index] as Extract<StoredToolResultDemand, { kind: 'text' }>).originalTokens), SKILL_TOOL_RESULT_MAX_TOKENS);
+  skillIndexes.forEach((index, position) => { allocations[index] = skillShares[position]; });
+  const mandatoryTokens = safeSum(shared.map(item => item.baseTokens));
+  const shares = allocateToolResultPreviewTokens(shared, Math.max(0, TOOL_RESULT_BATCH_MAX_TOKENS - mandatoryTokens));
+  sharedIndexes.forEach((index, position) => { allocations[index] = safeSum([allocations[index], shares[position]]); });
+  return allocations;
 }
 
 /**
@@ -1651,8 +1792,15 @@ function inlineMediaResolved(part: InlineDataPart): boolean {
     && /^[a-f\d]{64}$/i.test(value.sha256);
 }
 
+/** Scalar-only evidence from an immutable stored response, safe to retain across its reread. */
+interface ToolResultTokenMeasurement {
+  tokens: number;
+  json?: { characters: number; plainJson: boolean };
+}
+
 interface PreparedToolResult {
   input: ToolResultProjectionInput;
+  measurement: ToolResultTokenMeasurement;
   /** Only non-plain inputs need their canonical text before the final allocation. */
   serialized?: string;
   originalTokens: number;
@@ -1668,15 +1816,18 @@ interface PreparedToolResult {
 function prepareToolResult(
   rawInput: ToolResultProjectionInput,
   index: number,
-  perResultTokens: number
+  perResultTokens: number,
+  retainedMeasurement?: ToolResultTokenMeasurement
 ): PreparedToolResult {
   const input: ToolResultProjectionInput = {
     ...rawInput,
     toolName: requireText(rawInput.toolName, `toolResults[${index}].toolName`)
   };
   const readView = input.toolName === READ_TOOL_NAME ? readResultView(input.response) : undefined;
-  const measurement = readView ? undefined : measureJsonTokens(input.response);
-  const originalTokens = measurement?.tokens ?? estimateJsonTokens(input.response);
+  const measurement = readView ? undefined : retainedMeasurement?.json
+    ? { tokens: retainedMeasurement.tokens, ...retainedMeasurement.json }
+    : measureJsonTokens(input.response);
+  const originalTokens = retainedMeasurement?.tokens ?? measurement?.tokens ?? estimateJsonTokens(input.response);
   // Canonical ordering changes JSON key order, not its length. Reuse the required token measure
   // for normal results; only non-plain values need the old canonical-length fallback.
   const serialized = measurement && !measurement.plainJson ? stableJson(input.response) : undefined;
@@ -1688,6 +1839,9 @@ function prepareToolResult(
   const targetTokens = Math.min(originalTokens, Math.max(perResultTokens, baseTokens));
   return {
     input,
+    measurement: { tokens: originalTokens, ...(measurement ? {
+      json: { characters: measurement.characters, plainJson: measurement.plainJson }
+    } : {}) },
     serialized,
     originalTokens,
     skeleton,
@@ -1699,8 +1853,32 @@ function prepareToolResult(
   };
 }
 
+/** Shared renderer for whole-window projection and bounded stored-prefix reduction. */
+function projectPreparedToolResult(item: PreparedToolResult, target: number): ToolResultProjectionItem {
+  const exact = item.originalTokens <= target;
+  const preview = exact ? undefined : item.readView
+    ? boundedReadPreview(item.readView, target)
+    : { response: boundedPreviewEnvelope(item, target) };
+  const response = preview ? preview.response : cloneJsonValue(item.input.response);
+  return {
+    toolName: item.input.toolName,
+    ...(item.input.callId ? { callId: item.input.callId } : {}),
+    ...(item.input.resultId ? { resultId: item.input.resultId } : {}),
+    response,
+    originalTokens: item.originalTokens,
+    projectedTokens: estimateJsonTokens(response),
+    allocatedTokens: target,
+    truncated: !exact,
+    ...(preview?.reread ? { reread: preview.reread } : {})
+  };
+}
+
+type ToolResultPreviewDemand = Pick<PreparedToolResult, 'demandTokens' | 'shortExactEligible'> & {
+  input: Pick<ToolResultProjectionInput, 'priority'>;
+};
+
 function allocateToolResultPreviewTokens(
-  prepared: readonly PreparedToolResult[],
+  prepared: readonly ToolResultPreviewDemand[],
   budgetInput: number
 ): number[] {
   let budget = nonNegativeTokenCount(budgetInput, 'tool result preview budget');

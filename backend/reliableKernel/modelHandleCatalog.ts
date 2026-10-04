@@ -128,9 +128,32 @@ export function buildModelHandleCatalog(
   seededEntries: readonly ModelHandleEntry[] | ReadonlyModelHandleCatalog = []
 ): ModelHandleCatalog {
   const candidates: ModelHandleCandidate[] = [];
-  const seenObjects = new Set<object>();
+  const seenObjects = new WeakSet<object>();
   for (const value of values) collectCandidates(value, candidates, seenObjects);
+  const accumulator = createModelHandleCandidateAccumulator(seededEntries);
+  for (const candidate of candidates) accumulator.add(candidate);
+  return accumulator.finish();
+}
 
+/** Incremental discovery retains handle facts, never the parsed bodies used to discover them. */
+export function createModelHandleCatalogBuilder(
+  seededEntries: readonly ModelHandleEntry[] | ReadonlyModelHandleCatalog = []
+): { add(value: unknown): void; finish(): ModelHandleCatalog } {
+  const accumulator = createModelHandleCandidateAccumulator(seededEntries);
+  const seen = new WeakSet<object>();
+  return {
+    add(value) {
+      const candidates: ModelHandleCandidate[] = [];
+      collectCandidates(value, candidates, seen);
+      for (const candidate of candidates) accumulator.add(candidate);
+    },
+    finish: () => accumulator.finish()
+  };
+}
+
+function createModelHandleCandidateAccumulator(
+  seededEntries: readonly ModelHandleEntry[] | ReadonlyModelHandleCatalog
+): { add(candidate: ModelHandleCandidate): void; finish(): ModelHandleCatalog } {
   const seedCatalog = normalizeModelHandleCatalog(Array.isArray(seededEntries)
     ? { entries: seededEntries } : seededEntries);
   const normalizedSeeds = seedCatalog.entries;
@@ -166,12 +189,12 @@ export function buildModelHandleCatalog(
     byTarget.set(targetKey(seed.kind, seed.target), cloned);
     entries.push(cloned);
   }
-  for (const candidate of candidates) {
+  const add = (candidate: ModelHandleCandidate): void => {
     const key = targetKey(candidate.kind, candidate.target);
     const existing = byTarget.get(key);
     if (existing) {
       mergeMetadata(existing, candidate);
-      continue;
+      return;
     }
     const ordinal = counters[candidate.kind] + 1;
     if (!Number.isSafeInteger(ordinal)) throw new RangeError(`Model handle ${HANDLE_PREFIX[candidate.kind]} has exhausted its safe ordinal range.`);
@@ -187,8 +210,12 @@ export function buildModelHandleCatalog(
     };
     byTarget.set(key, entry);
     entries.push(entry);
-  }
-  return currentModelHandleCatalog(entries, seedCatalog.retiredRefs ?? [], seedCatalog.allocationHighWater);
+  };
+  return {
+    add,
+    finish: () => currentModelHandleCatalog(entries.map(entry => ({ ...entry })),
+      seedCatalog.retiredRefs ?? [], seedCatalog.allocationHighWater)
+  };
 }
 
 export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog {
@@ -710,7 +737,7 @@ function overlapsPartOfHandleToken(
 function collectCandidates(
   value: unknown,
   output: ModelHandleCandidate[],
-  seen: Set<object>,
+  seen: WeakSet<object>,
   collaborationScope = false
 ): void {
   if (typeof value === 'string') {
@@ -772,7 +799,7 @@ function collectCandidates(
   for (const child of Object.values(record)) collectCandidates(child, output, seen, collaborationScope);
 }
 
-function collectNestedJson(value: string, output: ModelHandleCandidate[], seen: Set<object>, collaborationScope: boolean): void {
+function collectNestedJson(value: string, output: ModelHandleCandidate[], seen: WeakSet<object>, collaborationScope: boolean): void {
   const trimmed = value.trim();
   if (trimmed.length === 0 || trimmed.length > MAX_NESTED_JSON_CHARS) return;
   if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) return;
