@@ -1,6 +1,6 @@
 import type { MessageContent } from '../../shared/protocol';
 import type { AttachmentCatalogState } from './attachmentCatalog';
-import { AttachmentCatalogProjection } from './attachmentCatalogProjection';
+import { AttachmentCatalogProjection, type PreparedAttachmentCatalogProjection } from './attachmentCatalogProjection';
 import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
 import { ContentAddressedStore } from './contentAddressedStore';
 import {
@@ -73,6 +73,14 @@ export interface ReliableContextTokenEstimate {
   coveredSegmentCount: number;
 }
 
+interface ObservedPrefixAnchor {
+  promptTokens: number;
+  modelRequestId: string;
+  coveredSegmentCount: number;
+  outputSegmentIndex?: number;
+  totalTokens?: number;
+}
+
 /**
  * Provider-aligned Context accounting.
  *
@@ -98,41 +106,7 @@ export class ReliableContextTokenEstimator {
   public async estimateRoot(rootIdInput: string): Promise<ReliableContextTokenEstimate> {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
-    return this.estimateMaterializedRoot(materialized);
-  }
-
-  /** Reuse only this call's immutable Context bytes; relationship projections remain fresh. */
-  private async estimateMaterializedRoot(materialized: MaterializedContext): Promise<ReliableContextTokenEstimate> {
-    const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const attachmentCatalogState = await this.attachmentCatalog.projectState(
-      conversationId,
-      materialized.segments.map((segment) => ({
-        segmentId: segment.segmentId
-      }))
-    );
-    const modelHandleCatalog = await this.attachmentHandles.ensure(
-      conversationId,
-      attachmentCatalogState.catalog
-    );
-    const projectedTokens = estimateMaterializedContextTokens(
-      materialized.segments,
-      attachmentCatalogState,
-      modelHandleCatalog
-    );
-    const compressed = compressionEstimate(materialized.segments);
-    const observed = await this.findObservedPrefix(
-      conversationId,
-      materialized.segments,
-      projectedTokens,
-      modelHandleCatalog
-    );
-    if (observed) return observed;
-    return {
-      estimatedTokens: projectedTokens,
-      source: compressed ? 'compression-output' : 'semantic',
-      conversationId,
-      coveredSegmentCount: materialized.segments.length
-    };
+    return (await this.estimateMaterializedRoot(materialized)).full;
   }
 
   /** Estimates the exact projected prefix while preserving any full-root Provider usage anchor. */
@@ -140,47 +114,97 @@ export class ReliableContextTokenEstimator {
     const rootId = requireId(rootIdInput, 'rootId');
     const materialized = await this.context.materialize(rootId);
     const segmentCount = requireSegmentCount(segmentCountInput, materialized.segments.length);
-    const full = await this.estimateMaterializedRoot(materialized);
-    if (segmentCount === materialized.segments.length) {
-      return full.estimatedTokens;
-    }
-    const prefixSegments = materialized.segments.slice(0, segmentCount);
+    return (await this.estimateMaterializedRoot(materialized, segmentCount)).prefixTokens;
+  }
+
+  /** Context bytes and attachment facts are shared only within this public estimator call. */
+  private async estimateMaterializedRoot(
+    materialized: MaterializedContext,
+    requestedPrefix = materialized.segments.length
+  ): Promise<{ full: ReliableContextTokenEstimate; prefixTokens: number }> {
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
-    const fullAttachmentState = await this.attachmentCatalog.projectState(
+    // Resolve history first, then take the call's fresh attachment relationship view. Preserve the
+    // earlier full-validation error precedence if read-only anchor discovery encounters corruption.
+    let anchor: ObservedPrefixAnchor | null = null;
+    let discoveryFailure: { error: unknown } | undefined;
+    try {
+      anchor = await this.findObservedPrefix(conversationId, materialized.segments);
+    } catch (error) {
+      discoveryFailure = { error };
+    }
+    const attachments = await this.attachmentCatalog.prepare(
       conversationId,
-      materialized.segments.map((segment) => ({
-        segmentId: segment.segmentId
-      }))
+      materialized.segments.map((segment) => ({ segmentId: segment.segmentId }))
     );
-    const prefixAttachmentState = await this.attachmentCatalog.projectState(
-      conversationId,
-      prefixSegments.map((segment) => ({
-        segmentId: segment.segmentId
-      }))
-    );
-    const modelHandleCatalog = await this.attachmentHandles.ensure(
-      conversationId,
-      fullAttachmentState.catalog
-    );
+    const fullAttachmentState = attachments.projectState();
+    const modelHandleCatalog = await this.attachmentHandles.ensure(conversationId, fullAttachmentState.catalog);
     const fullProjected = estimateMaterializedContextTokens(
       materialized.segments,
       fullAttachmentState,
       modelHandleCatalog
     );
+    const compressed = compressionEstimate(materialized.segments);
+    if (discoveryFailure) throw discoveryFailure.error;
+    const full = anchor
+      ? this.estimateObservedPrefix(conversationId, materialized.segments, fullProjected, anchor, attachments, modelHandleCatalog)
+      : {
+          estimatedTokens: fullProjected,
+          source: compressed ? 'compression-output' as const : 'semantic' as const,
+          conversationId,
+          coveredSegmentCount: materialized.segments.length
+        };
+    if (requestedPrefix === materialized.segments.length) {
+      return { full, prefixTokens: full.estimatedTokens };
+    }
     const prefixProjected = estimateMaterializedContextTokens(
-      prefixSegments,
-      prefixAttachmentState,
+      materialized.segments.slice(0, requestedPrefix),
+      attachments.projectRange(0, requestedPrefix),
       modelHandleCatalog
     );
-    return Math.max(0, full.estimatedTokens - Math.max(0, fullProjected - prefixProjected));
+    return {
+      full,
+      prefixTokens: Math.max(0, full.estimatedTokens - Math.max(0, fullProjected - prefixProjected))
+    };
+  }
+
+  private estimateObservedPrefix(
+    conversationId: string,
+    current: readonly MaterializedContextSegment[],
+    currentProjected: number,
+    anchor: ObservedPrefixAnchor,
+    attachments: PreparedAttachmentCatalogProjection,
+    modelHandleCatalog: ModelHandleCatalog
+  ): ReliableContextTokenEstimate {
+    let anchoredTokens = anchor.promptTokens;
+    if (anchor.outputSegmentIndex !== undefined) {
+      const index = anchor.outputSegmentIndex;
+      const outputAttachmentState = attachments.projectRange(index, index + 1);
+      anchoredTokens = anchor.totalTokens ?? (anchor.promptTokens + estimateMaterializedContextTokens(
+        [current[index]],
+        outputAttachmentState,
+        modelHandleCatalog
+      ));
+    }
+    const coveredProjected = estimateMaterializedContextTokens(
+      current.slice(0, anchor.coveredSegmentCount),
+      attachments.projectRange(0, anchor.coveredSegmentCount),
+      modelHandleCatalog
+    );
+    const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
+    return {
+      estimatedTokens: safeTokenCount(estimatedTokens, 'provider-observed Context estimate'),
+      source: 'provider-observed-delta',
+      conversationId,
+      observedPromptTokens: anchor.promptTokens,
+      observedModelRequestId: anchor.modelRequestId,
+      coveredSegmentCount: anchor.coveredSegmentCount
+    };
   }
 
   private async findObservedPrefix(
     conversationId: string,
-    current: readonly MaterializedContextSegment[],
-    currentProjected: number,
-    modelHandleCatalog: ModelHandleCatalog
-  ): Promise<ReliableContextTokenEstimate | null> {
+    current: readonly MaterializedContextSegment[]
+  ): Promise<ObservedPrefixAnchor | null> {
     const turns = (await listAllDomainRows(this.database, 'Turn', {
       conversation_id: conversationId
     })).sort(compareRequestsNewestFirst);
@@ -228,43 +252,18 @@ export class ReliableContextTokenEstimator {
         // ordinary request is not a prefix, no older ordinary request can be a safer calibration.
         if (!isSegmentPrefix(projected.records, current)) return null;
 
-        let coveredSegmentCount = projected.records.length;
-        let anchoredTokens = input;
-        const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
-        if (outputSegmentId && current[coveredSegmentCount]?.segmentId === outputSegmentId) {
-          const total = calibration.native ? undefined : providerTotalTokens(request.usage_json);
-          const outputSegment = current[coveredSegmentCount];
-          const outputAttachmentState = await this.attachmentCatalog.projectState(conversationId, [{
-            segmentId: outputSegment.segmentId
-          }]);
-          anchoredTokens = total ?? (input + estimateMaterializedContextTokens(
-            [outputSegment],
-            outputAttachmentState,
-            modelHandleCatalog
-          ));
-          coveredSegmentCount += 1;
-        }
-        const coveredSegments = current.slice(0, coveredSegmentCount);
-        const coveredAttachmentState = await this.attachmentCatalog.projectState(
-          conversationId,
-          coveredSegments.map((segment) => ({
-            segmentId: segment.segmentId
-          }))
-        );
-        const coveredProjected = estimateMaterializedContextTokens(
-          coveredSegments,
-          coveredAttachmentState,
-          modelHandleCatalog
-        );
-        const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
-        return {
-          estimatedTokens: safeTokenCount(estimatedTokens, 'provider-observed Context estimate'),
-          source: 'provider-observed-delta',
-          conversationId,
-          observedPromptTokens: input,
-          observedModelRequestId: requestId,
-          coveredSegmentCount
+        const anchor: ObservedPrefixAnchor = {
+          promptTokens: input,
+          modelRequestId: requestId,
+          coveredSegmentCount: projected.records.length
         };
+        const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
+        if (outputSegmentId && current[anchor.coveredSegmentCount]?.segmentId === outputSegmentId) {
+          anchor.outputSegmentIndex = anchor.coveredSegmentCount;
+          anchor.totalTokens = calibration.native ? undefined : providerTotalTokens(request.usage_json);
+          anchor.coveredSegmentCount += 1;
+        }
+        return anchor;
       }
     }
     return null;

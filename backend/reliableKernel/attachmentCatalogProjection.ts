@@ -20,6 +20,73 @@ export interface AttachmentCatalogProjectionSegment {
   segmentId: string;
 }
 
+interface PreparedAttachmentSegment {
+  readonly segmentId: string;
+  readonly segmentKind: ContextSegmentKind;
+  readonly catalog: readonly AttachmentCatalogEntry[];
+}
+
+/** Call-scoped facts only: no database, projector caches, or attachment bodies are retained. */
+export class PreparedAttachmentCatalogProjection {
+  public constructor(
+    private readonly segments: readonly PreparedAttachmentSegment[],
+    private readonly additionalCatalog: readonly AttachmentCatalogEntry[]
+  ) {}
+
+  public projectState(): AttachmentCatalogState {
+    return this.reduceRange(0, this.segments.length, this.additionalCatalog);
+  }
+
+  /** Replays a half-open range from an empty catalog, without current-Turn additions. */
+  public projectRange(start: number, end: number): AttachmentCatalogState {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)
+      || start < 0 || end < start || end > this.segments.length) {
+      throw new RangeError('Attachment catalog range must be within the prepared segment sequence.');
+    }
+    return this.reduceRange(start, end, []);
+  }
+
+  private reduceRange(
+    start: number,
+    end: number,
+    additionalCatalog: readonly AttachmentCatalogEntry[]
+  ): AttachmentCatalogState {
+    let catalog: AttachmentCatalogEntry[] = [];
+    const placements: AttachmentCatalogPlacement[] = [];
+    for (let index = start; index < end; index += 1) {
+      const segment = this.segments[index];
+      const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
+      catalog = mergeAttachmentCatalog(catalog, segment.catalog);
+      if (segment.segmentKind === 'compression') {
+        if (catalog.length > 0) {
+          placements.push({
+            kind: 'attachment_catalog_checkpoint',
+            afterSegmentId: segment.segmentId,
+            entries: catalog
+          });
+        }
+        continue;
+      }
+      const delta = segment.catalog.filter((entry) => !previousIds.has(entry.attachmentId));
+      if (delta.length > 0) {
+        placements.push({
+          kind: 'attachment_catalog_delta',
+          afterSegmentId: segment.segmentId,
+          entries: delta
+        });
+      }
+    }
+    const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
+    catalog = mergeAttachmentCatalog(catalog, additionalCatalog);
+    const currentTurnDelta = additionalCatalog.filter((entry) => !previousIds.has(entry.attachmentId));
+    if (currentTurnDelta.length > 0) {
+      placements.push({ kind: 'current_turn_delta', entries: currentTurnDelta });
+    }
+    // Normalization also gives each caller independent mutable result objects.
+    return normalizeAttachmentCatalogState({ catalog, placements }, 'projected attachmentCatalogState');
+  }
+}
+
 /**
  * Rebuilds the model-only attachment directory from immutable Context lineage and AttachmentLink
  * relations. It never reads attachment bodies or trusts convenience metadata embedded in CAS JSON.
@@ -47,25 +114,33 @@ export class AttachmentCatalogProjection {
     return (await this.projectState(conversationId, segments, additionalMessageRevisionIds)).catalog;
   }
 
-  public projectState(
+  public async projectState(
     conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[] = []
   ): Promise<AttachmentCatalogState> {
-    // One worker per projection keeps caches bounded and prevents concurrent freezes from clearing or
-    // mixing each other's lineage state. Late append-only AttachmentLink rows remain visible too.
-    return new AttachmentCatalogProjection(this.database).projectStateIsolated(
+    return (await this.prepare(conversationId, segments, additionalMessageRevisionIds)).projectState();
+  }
+
+  public prepare(
+    conversationId: string,
+    segments: readonly AttachmentCatalogProjectionSegment[],
+    additionalMessageRevisionIds: readonly string[] = []
+  ): Promise<PreparedAttachmentCatalogProjection> {
+    // One worker per preparation keeps caches bounded and concurrent calls isolated. Each call
+    // reads fresh relationships, including previously empty AttachmentLink results.
+    return new AttachmentCatalogProjection(this.database).prepareIsolated(
       requireId(conversationId, 'conversationId'),
       segments,
       additionalMessageRevisionIds
     );
   }
 
-  private async projectStateIsolated(
+  private async prepareIsolated(
     conversationId: string,
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[]
-  ): Promise<AttachmentCatalogState> {
+  ): Promise<PreparedAttachmentCatalogProjection> {
     const segmentIds = segments.map((segment) => requireId(segment.segmentId, 'segmentId'));
     await this.primeSegments(conversationId, segmentIds);
     await this.primeCompressionLineage(conversationId, segmentIds);
@@ -116,46 +191,27 @@ export class AttachmentCatalogProjection {
       catalogByRevision.set(revisionId, await this.catalogForRevision(revisionId));
     }
 
-    let catalog: AttachmentCatalogEntry[] = [];
-    const placements: AttachmentCatalogPlacement[] = [];
-    for (const [index, segmentId] of segmentIds.entries()) {
+    // Preserve every occurrence before cumulative deduplication: an output-only view must still
+    // contain an attachment that also appeared earlier in the full Context.
+    const preparedSegments = segmentIds.map((segmentId, index): PreparedAttachmentSegment => {
       const segmentCatalog = mergeAttachmentCatalog(...revisionsBySegment[index].map((revisionId) =>
         catalogByRevision.get(revisionId) ?? []
       ));
-      const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
-      catalog = mergeAttachmentCatalog(catalog, segmentCatalog);
       const segment = this.segmentCache.get(segmentId);
       if (!segment) throw new Error(`ContextSegment ${segmentId} cache was not primed.`);
-      if (requireSegmentKind(segment.segment_kind) === 'compression') {
-        if (catalog.length > 0) {
-          placements.push({
-            kind: 'attachment_catalog_checkpoint',
-            afterSegmentId: segmentId,
-            entries: catalog
-          });
-        }
-        continue;
-      }
-      const delta = segmentCatalog.filter((entry) => !previousIds.has(entry.attachmentId));
-      if (delta.length > 0) {
-        placements.push({
-          kind: 'attachment_catalog_delta',
-          afterSegmentId: segmentId,
-          entries: delta
-        });
-      }
-    }
-
+      return Object.freeze({
+        segmentId,
+        segmentKind: requireSegmentKind(segment.segment_kind),
+        catalog: Object.freeze(segmentCatalog.map((entry) => Object.freeze(entry)))
+      });
+    });
     const additionalCatalog = mergeAttachmentCatalog(...additionalRevisionIds.map((revisionId) =>
       catalogByRevision.get(revisionId) ?? []
     ));
-    const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
-    catalog = mergeAttachmentCatalog(catalog, additionalCatalog);
-    const currentTurnDelta = additionalCatalog.filter((entry) => !previousIds.has(entry.attachmentId));
-    if (currentTurnDelta.length > 0) {
-      placements.push({ kind: 'current_turn_delta', entries: currentTurnDelta });
-    }
-    return normalizeAttachmentCatalogState({ catalog, placements }, 'projected attachmentCatalogState');
+    return new PreparedAttachmentCatalogProjection(
+      Object.freeze(preparedSegments),
+      Object.freeze(additionalCatalog.map((entry) => Object.freeze(entry)))
+    );
   }
 
   private async collectSegmentRevisions(
