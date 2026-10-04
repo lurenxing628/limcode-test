@@ -110,6 +110,33 @@ export interface ConversationChildTaskProjection {
   tasks: ConversationChildTaskRecord[];
 }
 
+/** Compact model-request status, separate from the complete list/read task ledger. */
+export interface ConversationChildTaskRuntimeStatus {
+  totalChildCount: number;
+  descendantCount: number;
+  activeChildCount: number;
+  queuedInputCount: number;
+  awaitingHandlingCount: number;
+  childHandleTargets: Array<{ answerBridgeId: string }>;
+  children: Array<{
+    childExecutionId: string;
+    answerBridgeId: string;
+    status: ChildExecutionStatus;
+    label: string;
+    task: string;
+    initialTask?: string;
+    currentTasks: string[];
+    queuedTasks: string[];
+    currentInputCount: number;
+    queuedInputCount: number;
+    truncated: boolean;
+    latestTurnOutcome?: string;
+    answerAvailable: boolean;
+    answerHandling: 'handled' | 'runtime_pending' | 'tool_result' | 'failed' | 'unknown';
+    resumable: boolean;
+  }>;
+}
+
 export interface ConversationChildTaskPageOptions {
   scope?: ConversationChildTaskScope;
   status?: ChildExecutionStatus | ChildExecutionStatus[];
@@ -215,15 +242,115 @@ export async function readConversationChildTaskProjection(
   return buildConversationChildTaskProjection(barrier, contentStore);
 }
 
+export async function readConversationChildTaskRuntimeStatus(
+  database: RuntimeDatabase,
+  contentStore: ContentAddressedStore,
+  conversationId: string,
+  limit: number
+): Promise<ConversationChildTaskRuntimeStatus> {
+  const barrier = await database.conversationChildTaskSnapshot(requireText(conversationId, 'conversationId'));
+  return buildConversationChildTaskRuntimeStatus(barrier, contentStore, limit);
+}
+
+/**
+ * Rank/count before loading task/answer bodies. Chosen initial/current/queued sources and
+ * current-answer foreground evidence are materialized afterward. Native-steer identity and
+ * legacy bridge-wait evidence still require their CAS envelopes; those can contain body text.
+ * Full list/read continues to materialize the retained ledger.
+ */
+export async function buildConversationChildTaskRuntimeStatus(
+  barrier: SnapshotBarrier<ConversationChildTaskFacts>,
+  contentStore: Pick<ContentAddressedStore, 'read'>,
+  limit: number
+): Promise<ConversationChildTaskRuntimeStatus> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_PAGE_LIMIT) throw new Error('child_task_runtime_limit_invalid');
+  const facts = barrier.snapshot;
+  const contents = new SnapshotContentReader(facts.contentObjects, contentStore, false);
+  const projection = await projectConversationChildTaskFacts(barrier, contents);
+  const direct = projection.tasks.filter(task => task.depth === 1);
+  const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
+  const pendingHandling = (task: ConversationChildTaskRecord) => task.result.deliveries.some(delivery =>
+    delivery.state !== 'failed' && delivery.wakeState !== 'dead_letter' && delivery.phase !== 'notify_only'
+    && !delivery.handledAt && delivery.targetConversationId === facts.conversationId);
+  const ranked = [...direct].sort((a, b) =>
+    Number(live(b.status)) - Number(live(a.status))
+    || Number(b.queuedInputs.length > 0) - Number(a.queuedInputs.length > 0)
+    || Number(pendingHandling(b)) - Number(pendingHandling(a))
+    || Number(a.status === 'closed') - Number(b.status === 'closed')
+    || b.createdAt.localeCompare(a.createdAt) || a.childExecutionId.localeCompare(b.childExecutionId));
+  const preview = (text: string) => childTaskTextForPreview(text).replace(/\s+/g, ' ').trim();
+  const children: ConversationChildTaskRuntimeStatus['children'] = [];
+  for (const task of ranked.slice(0, limit)) {
+    const current = task.currentInputs.filter(source => source.classification === 'task');
+    const queued = task.queuedInputs.filter(source => source.classification === 'task');
+    const shownCurrent = current.slice(-2);
+    const shownQueued = queued.slice(0, 2);
+    const sourcePreviews = new Map<string, string>();
+    for (const source of [task.initialTask, ...shownCurrent, ...shownQueued]) {
+      if (source && !sourcePreviews.has(source.id)) {
+        sourcePreviews.set(source.id, preview((await contents.message(source.contentObjectId, true)).text));
+      }
+    }
+    const textFor = (source: ConversationChildTaskSource | undefined) => source ? sourcePreviews.get(source.id)!.slice(0, 180) : '';
+    const latestAnswer = task.result.latestAnswer;
+    let handling: ConversationChildTaskAnswerHandling[] = [];
+    if (latestAnswer) {
+      const parent = facts.parentLinks.find(link => link.child_execution_id === task.childExecutionId)!;
+      // Current waits belong to one exact answer Turn generation. Older settled generations
+      // cannot carry this answer; do not read their full result envelopes merely to reject them.
+      const candidates = new Set([String(parent.source_tool_call_id), ...facts.answerWaitOperations.filter(operation =>
+        (operation.owner_kind === 'answer_bridge_wait' && operation.owner_id === task.answerBridgeId)
+        || (operation.owner_kind === 'child_turn_answer_wait' && operation.owner_id === latestAnswer.turnId))
+        .map(operation => requireText(operation.tool_call_id, 'answer wait tool_call_id'))]);
+      handling = await answerHandling(facts, contents, new Set([latestAnswer.answerId]), task.result.deliveries, candidates);
+    }
+    children.push({
+      childExecutionId: task.childExecutionId, answerBridgeId: task.answerBridgeId,
+      status: task.status, label: preview(task.label).slice(0, 180),
+      task: textFor(current[current.length - 1] ?? task.initialTask),
+      ...(task.initialTask ? { initialTask: textFor(task.initialTask) } : {}),
+      currentTasks: shownCurrent.map(textFor), queuedTasks: shownQueued.map(textFor),
+      currentInputCount: current.length, queuedInputCount: queued.length,
+      truncated: current.length > 2 || queued.length > 2 || [...sourcePreviews.values()].some(text => text.length > 180),
+      ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {}),
+      answerAvailable: !!latestAnswer,
+      answerHandling: handling.some(item => item.answerId === latestAnswer?.answerId && !!item.handledAt)
+        ? 'handled'
+        : handling.some(item => item.answerId === latestAnswer?.answerId && item.via === 'tool_result')
+          ? 'tool_result'
+          : task.result.deliveries.some(item => item.sourceId === latestAnswer?.answerId
+              && item.phase !== 'notify_only' && item.state !== 'failed' && item.wakeState !== 'dead_letter' && !item.handledAt)
+            ? 'runtime_pending'
+            : task.result.deliveries.some(item => item.sourceId === latestAnswer?.answerId
+                && (item.state === 'failed' || item.wakeState === 'dead_letter')) ? 'failed' : 'unknown',
+      resumable: task.resumable
+    });
+  }
+  return {
+    totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
+    activeChildCount: direct.filter(task => live(task.status)).length,
+    queuedInputCount: direct.reduce((sum, task) => sum + task.queuedInputs.length, 0),
+    awaitingHandlingCount: direct.filter(pendingHandling).length,
+    childHandleTargets: projection.tasks.map(task => ({ answerBridgeId: task.answerBridgeId })),
+    children
+  };
+}
+
 /** A read-side join over authoritative domain rows; no new persisted task aggregate is created. */
 export async function buildConversationChildTaskProjection(
   barrier: SnapshotBarrier<ConversationChildTaskFacts>,
   contentStore: Pick<ContentAddressedStore, 'read'>
 ): Promise<ConversationChildTaskProjection> {
+  return projectConversationChildTaskFacts(barrier, new SnapshotContentReader(barrier.snapshot.contentObjects, contentStore));
+}
+
+async function projectConversationChildTaskFacts(
+  barrier: SnapshotBarrier<ConversationChildTaskFacts>,
+  contents: SnapshotContentReader
+): Promise<ConversationChildTaskProjection> {
   const facts = barrier.snapshot;
   const conversationId = requireText(facts.conversationId, 'snapshot.conversationId');
   if (facts.conversation.id !== conversationId) throw new Error('Child task snapshot root identity mismatch.');
-  const contents = new SnapshotContentReader(facts.contentObjects, contentStore);
   const turns = indexRows([...facts.parentTurns, ...facts.turns]);
   const conversations = indexRows(facts.conversations);
   const messages = indexRows(facts.messages);
@@ -267,6 +394,17 @@ export async function buildConversationChildTaskProjection(
     const conversation = requiredRow(conversations, childConversationId, 'child Conversation');
     const bridge = requiredRow(bridges, childExecutionId, 'AnswerBridge');
     const answerBridgeId = requireText(bridge.id, 'AnswerBridge.id');
+    const depth = depthFor(childExecutionId);
+    if (!contents.materializeBodies && depth > 1) {
+      // Descendants contribute counts/handle identities, never one of this root's cards.
+      const status = requireChildExecutionStatus(child.status);
+      tasks.push({ childExecutionId, answerBridgeId, parentConversationId: parentConversation(childExecutionId),
+        conversationId: childConversationId, depth, status,
+        resumable: childExecutionAcceptsContinuation(status) && bridge.status !== 'closed',
+        label: String(conversation.title), createdAt: requireText(child.created_at, 'ChildExecution.created_at'),
+        currentInputs: [], queuedInputs: [], timeline: [], execution: {}, result: { deliveries: [], handling: [] } });
+      continue;
+    }
     const parent = requiredRow(parents, childExecutionId, 'ChildExecutionParentLink');
     const sourceToolCallId = requireText(parent.source_tool_call_id, 'ChildExecutionParentLink.source_tool_call_id');
     const sourceTool = sourceTools.get(sourceToolCallId);
@@ -295,6 +433,8 @@ export async function buildConversationChildTaskProjection(
         .sort((a, b) => compareSequence(a.revision_seq, b.revision_seq));
       if (!history.length || !revisions.has(String(current.revision_id))) throw new Error('Child input has no current MessageRevision.');
       for (const revision of history) {
+        if (!contents.materializeBodies && revision.id !== current.revision_id
+          && !(link.turn_id === initialTurnId && revision === history[0])) continue;
         if (revision.role !== 'user') throw new Error('Child input MessageRevision must have user role.');
         const contentObjectId = requireText(revision.content_object_id, 'MessageRevision.content_object_id');
         const decoded = await contents.message(contentObjectId);
@@ -320,6 +460,7 @@ export async function buildConversationChildTaskProjection(
         .sort((a, b) => compareSequence(a.revision_seq, b.revision_seq));
       if (!history.length) throw new Error(`TurnIntent ${intentId} has no revision.`);
       for (const [index, revision] of history.entries()) {
+        if (!contents.materializeBodies && index !== history.length - 1) continue;
         const decoded = await contents.intent(requireText(revision.content_object_id, 'TurnIntentRevision.content_object_id'));
         const current = index === history.length - 1;
         const turnId = optionalText(intent.turn_id);
@@ -364,8 +505,9 @@ export async function buildConversationChildTaskProjection(
           sequence: integerText(pending.position), createdAt: requireText(pending.created_at, 'PendingTurnInput.created_at')
         });
       } else {
+        if (!contents.materializeBodies) continue;
         // Interrupts and result delivery are control facts, never new business assignments.
-        const body = await contents.raw(contentObjectId);
+        const body = await contents.body(contentObjectId);
         timeline.push({
           id: `pending_turn_input:${pendingId}`, kind: 'runtime_control', classification: 'runtime',
           state: pendingState(pending.state), text: body.text, contentObjectId, contentType: body.contentType,
@@ -374,14 +516,15 @@ export async function buildConversationChildTaskProjection(
         });
       }
     }
-    for (const submission of facts.answerSubmissions.filter(row => row.answer_bridge_id === answerBridgeId)) {
+    for (const submission of contents.materializeBodies
+      ? facts.answerSubmissions.filter(row => row.answer_bridge_id === answerBridgeId) : []) {
       const submissionId = requireText(submission.id, 'AnswerSubmission.id');
       const turnId = requireText(submission.turn_id, 'AnswerSubmission.turn_id');
       if (!childTurnIds.has(turnId)) throw new Error('AnswerSubmission belongs to another child Conversation.');
       const payloads = facts.answerPayloads.filter(row => row.submission_id === submissionId);
       if (payloads.length !== 1) throw new Error('AnswerSubmission must have exactly one AnswerPayload.');
       const contentObjectId = requireText(payloads[0].content_object_id, 'AnswerPayload.content_object_id');
-      const body = await contents.raw(contentObjectId);
+      const body = await contents.body(contentObjectId);
       timeline.push({
         id: `answer_submission:${submissionId}`, answerId: submissionId, kind: 'answer_submission',
         classification: 'runtime', state: bridge.current_submission_id === submissionId ? 'effective' : 'superseded',
@@ -416,7 +559,7 @@ export async function buildConversationChildTaskProjection(
         ...(optionalText(input?.handled_at) ? { handledAt: String(input?.handled_at) } : {})
       };
     }).sort((a, b) => compareText(a.id, b.id));
-    const handling = await answerHandling(facts, contents, submissions, deliveries);
+    const handling = contents.materializeBodies ? await answerHandling(facts, contents, submissions, deliveries) : [];
     const effectiveInputs = (turnId: string | undefined, seen = new Set<string>()): ConversationChildTaskSource[] => {
       if (!turnId) return [];
       if (!childTurnIds.has(turnId) || seen.has(turnId)) throw new Error('Child task input lineage is cyclic or crosses Conversation scope.');
@@ -433,7 +576,7 @@ export async function buildConversationChildTaskProjection(
     };
     const task = {
       childExecutionId, answerBridgeId, parentConversationId: parentConversation(childExecutionId),
-      conversationId: childConversationId, depth: depthFor(childExecutionId),
+      conversationId: childConversationId, depth,
       status: requireChildExecutionStatus(child.status),
       resumable: childExecutionAcceptsContinuation(requireChildExecutionStatus(child.status)) && bridge.status !== 'closed',
       label: String(conversation.title),
@@ -536,8 +679,16 @@ function sameOptional<T>(previous: T | undefined, current: T | undefined, same: 
 class SnapshotContentReader {
   private readonly metadata: Map<string, DomainRow>;
   private readonly cache = new Map<string, Promise<{ text: string; contentType: string }>>();
-  public constructor(rows: DomainRow[], private readonly store: Pick<ContentAddressedStore, 'read'>) {
+  public constructor(rows: DomainRow[], private readonly store: Pick<ContentAddressedStore, 'read'>,
+    public readonly materializeBodies = true) {
     this.metadata = indexRows(rows);
+  }
+  private contentType(id: string): string {
+    return requireText(requiredRow(this.metadata, id, 'snapshot ContentObject').content_type, 'ContentObject.content_type');
+  }
+  /** Runtime cards need body identities before choosing which previews to materialize. */
+  public body(id: string): Promise<{ text: string; contentType: string }> {
+    return this.materializeBodies ? this.raw(id) : Promise.resolve({ text: '', contentType: this.contentType(id) });
   }
   public raw(id: string): Promise<{ text: string; contentType: string }> {
     let value = this.cache.get(id);
@@ -556,7 +707,12 @@ class SnapshotContentReader {
     if (contentType && value.contentType !== contentType) throw new Error(`ContentObject ${id} has the wrong content type.`);
     return record(JSON.parse(value.text), `ContentObject ${id}`);
   }
-  public async message(id: string): Promise<{ text: string; contentType: string; content?: unknown }> {
+  public async message(id: string, materialize = this.materializeBodies): Promise<{ text: string; contentType: string; content?: unknown }> {
+    const contentType = this.contentType(id);
+    if (!contentType.startsWith('text/') && contentType !== MESSAGE_CONTENT_TYPE) {
+      throw new Error(`Task body ${id} has unsupported content type ${contentType}.`);
+    }
+    if (!materialize) return { text: '', contentType };
     const value = await this.raw(id);
     if (value.contentType.startsWith('text/')) return value;
     if (value.contentType !== MESSAGE_CONTENT_TYPE) throw new Error(`Task body ${id} has unsupported content type ${value.contentType}.`);
@@ -574,17 +730,19 @@ class SnapshotContentReader {
     text: string; contentType: string; contentObjectId: string; classification: 'task' | 'runtime';
     content?: unknown; hold?: 'none' | 'paused'; sourceTurnId?: string;
   }> {
-    const value = await this.raw(id);
-    if (value.contentType === CHILD_RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE) {
+    const contentType = this.contentType(id);
+    if (contentType === CHILD_RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE) {
+      const value = await this.raw(id);
       const envelope = await this.json(id);
       const continuation = parseRuntimeContinuationTurnIntentEnvelope(envelope);
       if (!continuation) throw new Error(`Child runtime continuation ${id} has an unsupported envelope kind.`);
       if (continuation.sourceTurnId === null) throw new Error(`Child runtime continuation ${id} has no source Turn.`);
       return { ...value, contentObjectId: id, classification: 'runtime', sourceTurnId: continuation.sourceTurnId };
     }
-    if (value.contentType !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
+    if (contentType !== TURN_INTENT_ENVELOPE_CONTENT_TYPE) {
       return { ...await this.message(id), contentObjectId: id, classification: 'task' };
     }
+    const value = await this.raw(id);
     const envelope = record(JSON.parse(value.text), `TurnIntent ${id}`);
     const input = parseInputTurnIntentEnvelope(envelope);
     if (input) return { ...await this.message(input.messageContentObjectId), contentObjectId: input.messageContentObjectId,
@@ -617,13 +775,13 @@ async function readLatestAnswer(
   const contentObjectId = requireText(payload.content_object_id, 'AnswerPayload.content_object_id');
   return { answerId: submissionId, turnId: requireText(submission.turn_id, 'AnswerSubmission.turn_id'),
     revision: integerText(submission.submission_seq), ...(optionalText(payload.title) ? { title: String(payload.title) } : {}),
-    contentObjectId, text: (await contents.raw(contentObjectId)).text,
+    contentObjectId, text: (await contents.body(contentObjectId)).text,
     interrupted: integerText(submission.interrupted) === '1' };
 }
 
 async function answerHandling(
   facts: ConversationChildTaskFacts, contents: SnapshotContentReader, submissionIds: Set<string>,
-  deliveries: ConversationChildTaskDelivery[]
+  deliveries: ConversationChildTaskDelivery[], candidateToolCallIds?: Set<string>
 ): Promise<ConversationChildTaskAnswerHandling[]> {
   const evidence: ConversationChildTaskAnswerHandling[] = deliveries.map(delivery => ({
     answerId: delivery.sourceId, via: 'runtime_delivery', deliveryId: delivery.id,
@@ -632,7 +790,7 @@ async function answerHandling(
     ...(delivery.failureReasonText ? { failureReasonText: delivery.failureReasonText } : {}),
     ...(delivery.handledAt ? { handledAt: delivery.handledAt } : {})
   }));
-  const candidates = new Set(facts.answerToolCalls.map(row => String(row.id)));
+  const candidates = candidateToolCallIds ?? new Set(facts.answerToolCalls.map(row => String(row.id)));
   const seen = new Set<string>();
   for (const row of [...facts.toolResultArtifacts, ...facts.toolOutcomes]) {
     const toolCallId = requireText(row.tool_call_id, 'answer tool_call_id');

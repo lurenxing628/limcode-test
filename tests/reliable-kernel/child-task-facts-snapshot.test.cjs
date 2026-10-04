@@ -108,7 +108,7 @@ function fixture() {
   } };
 }
 
-test('child task facts read every parent Turn, approved Plan children and descendant lineages without active runner memory', () => {
+test('child task facts read only related parent Turns, approved Plan children and descendant lineages without active runner memory', () => {
   const f = fixture();
   try {
     f.child('earlier');
@@ -116,7 +116,7 @@ test('child task facts read every parent Turn, approved Plan children and descen
     f.child('grandchild', 'earlier-turn', 'earlier');
     for (let i = 0; i < 1002; i++) f.insert('Turn', { id: `historic-${String(i).padStart(4, '0')}`, conversation_id: 'parent', status: 'terminated' });
     const facts = f.snapshot().snapshot;
-    assert.equal(facts.parentTurns.length, 1004);
+    assert.deepEqual(facts.parentTurns.map(row => row.id), ['parent-current-turn', 'parent-old-turn']);
     assert.deepEqual(facts.childExecutions.map((row) => row.id), ['earlier', 'grandchild', 'planned']);
     assert.equal(facts.sourceToolCalls.find((row) => row.id === 'planned-source').tool_name, 'submit_plan');
     assert.equal(facts.parentLinks.find((row) => row.id === 'grandchild-parent').parent_child_execution_id, 'earlier');

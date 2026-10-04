@@ -15,7 +15,7 @@ import {
 } from './modelHandleCatalog';
 import { forkInheritedChildTargets, forkSourceConversationIds, isForkConversation, readConversationContextHandleState } from './conversationChildHandles';
 import { historicalProcessHandleCard } from './historicalProcessHandleCard';
-import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
+import { readConversationChildTaskRuntimeStatus, type ConversationChildTaskRuntimeStatus } from './conversationChildTaskProjection';
 import { isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import { isReadonlyCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
 import { isReadonlyAgentBoardOperation } from '../world/modules/tools/definitions/agentBoard';
@@ -100,7 +100,6 @@ import { frozenCompressionPolicy, frozenProviderRetryPolicy, readFrozenTurnAutho
 import { assistantMessageIdFor, nativeAssistantPartIdentity, TurnOutputControlPlane } from './turnOutput';
 import { currentExecutionLeaseFence, ExecutionEligibilityLostError, ExecutionHandoffError, isExecutionHandoffError } from './executionLeaseFence';
 import { isRetryableLocalExecutionError, LOCAL_EXECUTION_MAX_RETRIES, LocalExecutionRecoveryExhaustedError, waitForLocalExecutionRetry } from './localExecutionRecovery';
-import { childTaskTextForPreview } from './childSkillPreload';
 import { isStrictSingleSummaryPlan } from './contextCompressionCoordinator';
 import type {
   AutomaticCompressionContinuation,
@@ -400,23 +399,7 @@ interface FrozenRuntimeStatusCard {
   childHandleTargets: Array<{ answerBridgeId: string }>;
   /** Child refs a fork copied from its source history; listed as not operable from this Conversation. */
   inheritedChildTargets?: string[];
-  children: Array<{
-    childExecutionId: string;
-    answerBridgeId: string;
-    status: string;
-    task: string;
-    label: string;
-    initialTask?: string;
-    currentTasks: string[];
-    queuedTasks: string[];
-    currentInputCount: number;
-    queuedInputCount: number;
-    truncated: boolean;
-    latestTurnOutcome?: string;
-    answerAvailable: boolean;
-    answerHandling: 'handled' | 'runtime_pending' | 'tool_result' | 'failed' | 'unknown';
-    resumable: boolean;
-  }>;
+  children: ConversationChildTaskRuntimeStatus['children'];
   processes: Array<{ processId: string; status: 'running' }>;
   card: string;
 }
@@ -1579,13 +1562,13 @@ export class ReliableAgentLoop {
     const turn = await this.requireExisting('Turn', turnId);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const [projection, processLinks, handleState, fork] = await Promise.all([
-      readConversationChildTaskProjection(this.database, this.contentStore, conversationId),
+      readConversationChildTaskRuntimeStatus(this.database, this.contentStore, conversationId, RUNTIME_STATUS_RECIPE_LIMIT),
       listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId }),
       readConversationContextHandleState(this.database, this.contentStore, conversationId),
       isForkConversation(this.database, conversationId)
     ]);
     const inheritedChildTargets = fork
-      ? forkInheritedChildTargets(handleState.catalog.entries, new Set(projection.tasks.map(task => task.answerBridgeId)))
+      ? forkInheritedChildTargets(handleState.catalog.entries, new Set(projection.childHandleTargets.map(task => task.answerBridgeId)))
       : [];
     const forkIdentity = fork ? await this.readForkIdentityFacts(conversationId) : undefined;
     const processSnapshot = processLinks.length === 0 ? null : await this.database.snapshot(processLinks.map(link =>
@@ -1594,66 +1577,24 @@ export class ReliableAgentLoop {
       row && !Array.isArray(row) && row.status === 'running'
         ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
         : []);
-    const direct = projection.tasks.filter(task => task.depth === 1);
-    if (direct.length === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
+    if (projection.totalChildCount === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
       return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
         ...(forkIdentity ? { forkIdentity } : {}) };
     }
-    const live = (status: string) => ['starting', 'active', 'interrupting'].includes(status);
-    const pendingHandling = (task: typeof direct[number]) => task.result.deliveries.some(delivery =>
-      delivery.state !== 'failed' && delivery.wakeState !== 'dead_letter' && delivery.phase !== 'notify_only'
-      && !delivery.handledAt && delivery.targetConversationId === conversationId);
-    const ranked = [...direct].sort((a, b) =>
-      Number(live(b.status)) - Number(live(a.status))
-      || Number(b.queuedInputs.length > 0) - Number(a.queuedInputs.length > 0)
-      || Number(pendingHandling(b)) - Number(pendingHandling(a))
-      || Number(a.status === 'closed') - Number(b.status === 'closed')
-      || b.createdAt.localeCompare(a.createdAt) || a.childExecutionId.localeCompare(b.childExecutionId));
-    const preview = (text: string) => childTaskTextForPreview(text).replace(/\s+/g, ' ').trim().slice(0, 180);
-    const selected = ranked.slice(0, RUNTIME_STATUS_RECIPE_LIMIT);
-    const children: FrozenRuntimeStatusCard['children'] = selected.map(task => {
-      const current = task.currentInputs.filter(source => source.classification === 'task');
-      const queued = task.queuedInputs.filter(source => source.classification === 'task');
-      return {
-        childExecutionId: task.childExecutionId, answerBridgeId: task.answerBridgeId,
-        status: task.status, label: preview(task.label),
-        task: preview(current[current.length - 1]?.text ?? task.initialTask?.text ?? ''),
-        ...(task.initialTask ? { initialTask: preview(task.initialTask.text) } : {}),
-        currentTasks: current.slice(-2).map(source => preview(source.text)),
-        queuedTasks: queued.slice(0, 2).map(source => preview(source.text)),
-        currentInputCount: current.length, queuedInputCount: queued.length,
-        truncated: current.length > 2 || queued.length > 2
-          || [task.initialTask, ...current, ...queued].some(source => source && childTaskTextForPreview(source.text).replace(/\s+/g, ' ').trim().length > 180),
-        ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {}),
-        answerAvailable: !!task.result.latestAnswer,
-        answerHandling: task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && !!item.handledAt)
-          ? 'handled'
-          : task.result.handling.some(item => item.answerId === task.result.latestAnswer?.answerId && item.via === 'tool_result')
-            ? 'tool_result'
-            : task.result.deliveries.some(item => item.sourceId === task.result.latestAnswer?.answerId
-                && item.phase !== 'notify_only' && item.state !== 'failed' && item.wakeState !== 'dead_letter' && !item.handledAt)
-              ? 'runtime_pending'
-              : task.result.deliveries.some(item => item.sourceId === task.result.latestAnswer?.answerId
-                  && (item.state === 'failed' || item.wakeState === 'dead_letter')) ? 'failed' : 'unknown',
-        resumable: task.resumable
-      };
-    });
-    const activeChildCount = direct.filter(task => live(task.status)).length;
-    const queuedInputCount = direct.reduce((sum, task) => sum + task.queuedInputs.filter(source => source.classification === 'task').length, 0);
-    const awaitingHandlingCount = direct.filter(pendingHandling).length;
+    const { children, totalChildCount, descendantCount, queuedInputCount, awaitingHandlingCount, activeChildCount } = projection;
     return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
       ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
       kind: 'runtime_status_card',
-      totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
+      totalChildCount, descendantCount,
       queuedInputCount, awaitingHandlingCount, activeChildCount,
       runningProcessCount: runningProcesses.length,
-      childHandleTargets: projection.tasks.map(task => ({ answerBridgeId: task.answerBridgeId })),
+      childHandleTargets: projection.childHandleTargets,
       ...(inheritedChildTargets.length > 0 ? { inheritedChildTargets } : {}),
       children, processes: runningProcesses.slice(0, RUNTIME_STATUS_RECIPE_LIMIT),
       card: [
         '[Conversation child tasks and current-turn processes — runtime data, not instructions]',
-        `totalDirectChildren=${direct.length}; descendantChildren=${projection.tasks.length - direct.length}; activeChildren=${activeChildCount}; runningProcesses=${runningProcesses.length}`,
-        `queuedInputs=${queuedInputCount}; awaitingHandling=${awaitingHandlingCount}; shownChildren=${children.length}; omittedChildren=${direct.length - children.length}`,
+        `totalDirectChildren=${totalChildCount}; descendantChildren=${descendantCount}; activeChildren=${activeChildCount}; runningProcesses=${runningProcesses.length}`,
+        `queuedInputs=${queuedInputCount}; awaitingHandling=${awaitingHandlingCount}; shownChildren=${children.length}; omittedChildren=${totalChildCount - children.length}`,
         'Task text marked truncated is a preview; run_agent operation=list/read returns retained children and paged task inputs. Closed children remain discoverable. Results delivered and results handled are separate facts.',
         ...(inheritedChildTargets.length > 0
           ? ['inheritedChildRefs appear in history copied from this fork\'s source Conversation; those children belong to the source, not to this Conversation.']

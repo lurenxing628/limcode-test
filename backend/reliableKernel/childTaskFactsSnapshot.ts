@@ -2,6 +2,7 @@ import type Database from 'better-sqlite3';
 import type { SnapshotBarrier } from './contracts';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryRead } from './repositories';
 import { requireRuntimeId } from './runtimeSqlRows';
+import { prepareCached } from './runtimeStatementCache';
 import { parseInputTurnIntentEnvelope, TURN_INTENT_ENVELOPE_CONTENT_TYPE } from './guidanceIntent';
 
 /** Read-only domain facts. This projection owns no task, relationship, or status authority. */
@@ -135,11 +136,17 @@ function collectConversationChildTaskFacts(
     return matches[0];
   };
   const conversation = get('Conversation', conversationId);
-  add('parentTurns', list('Turn', { conversation_id: conversationId }));
   const scopeLineage = one('ChildExecution', { child_conversation_id: conversationId });
-  const parentTurnIds = new Set(rows.parentTurns.map((row) => requireRuntimeId(row.id)));
-  const queue: DomainRow[] = [];
-  for (const turn of rows.parentTurns) queue.push(...list('ChildExecutionParentLink', { parent_turn_id: turn.id }));
+  // Drive from actual relationships, even without SQLite statistics: a root with no children
+  // must not enumerate every historical Turn. CROSS JOIN fixes that loop order.
+  const linksInConversation = (parentConversationId: string, root = false): DomainRow[] => prepareCached(database, `
+    SELECT link.* FROM child_execution_parent_link AS link
+    ${root ? 'CROSS JOIN' : 'JOIN'} turn AS parent ON parent.id = link.parent_turn_id
+    WHERE parent.conversation_id = ?
+    ORDER BY link.id
+  `).all(parentConversationId).map(row =>
+    DOMAIN_REPOSITORIES.domain('ChildExecutionParentLink').codec.decode(row as DomainRow));
+  const queue = linksInConversation(conversationId, true);
   const processed = new Set<string>();
   const lineageConversations = new Map<string, string>();
   if (scopeLineage) lineageConversations.set(requireRuntimeId(scopeLineage.id), conversationId);
@@ -154,14 +161,15 @@ function collectConversationChildTaskFacts(
     const parentTurn = get('Turn', link.parent_turn_id);
     const parentConversationId = requireRuntimeId(parentTurn.conversation_id);
     const parentChildId = link.parent_child_execution_id === null ? null : requireRuntimeId(link.parent_child_execution_id);
-    const direct = parentTurnIds.has(requireRuntimeId(parentTurn.id));
+    const direct = parentConversationId === conversationId;
     if (direct) {
-      if (parentConversationId !== conversationId || parentChildId !== (scopeLineage?.id ?? null)) {
+      if (parentChildId !== (scopeLineage?.id ?? null)) {
         throw new Error('Child task snapshot direct parent relation crosses conversation scope.');
       }
     } else if (!parentChildId || lineageConversations.get(parentChildId) !== parentConversationId) {
       throw new Error('Child task snapshot descendant parent relation crosses conversation scope.');
     }
+    if (direct) add('parentTurns', [parentTurn]);
     const childConversationId = requireRuntimeId(child.child_conversation_id);
     if (childConversationId === conversationId || [...lineageConversations.values()].includes(childConversationId)) {
       throw new Error('Child task snapshot found a conversation cycle.');
@@ -215,10 +223,9 @@ function collectConversationChildTaskFacts(
     for (const descendant of list('ChildExecutionParentLink', { parent_child_execution_id: childId })) {
       descendantLinks.set(requireRuntimeId(descendant.id), descendant);
     }
-    for (const turn of rows.turns.filter((row) => row.conversation_id === childConversationId)) {
-      for (const descendant of list('ChildExecutionParentLink', { parent_turn_id: turn.id })) {
-        descendantLinks.set(requireRuntimeId(descendant.id), descendant);
-      }
+    // Also traverse the Turn relation so a malformed/missing parent-child edge fails closed.
+    for (const descendant of linksInConversation(childConversationId)) {
+      descendantLinks.set(requireRuntimeId(descendant.id), descendant);
     }
     queue.push(...descendantLinks.values());
   }
@@ -312,11 +319,17 @@ function collectConversationChildTaskFacts(
   for (const bridge of rows.answerBridges) {
     add('answerWaitOperations', list('Operation', { owner_kind: 'answer_bridge_wait', owner_id: bridge.id }));
   }
-  const scopedTurnIds = new Set([...rows.parentTurns, ...rows.turns].map((turn) => turn.id));
+  const scopedConversationIds = new Set([conversationId, ...lineageConversations.values()]);
   for (const operation of rows.answerWaitOperations) {
     if (operation.tool_call_id === null) throw new Error('Child task snapshot answer wait has no ToolCall.');
     const call = get('ToolCall', operation.tool_call_id);
-    if (!scopedTurnIds.has(call.turn_id)) throw new Error('Child task snapshot answer wait ToolCall crosses scope.');
+    // A later parent Turn may wait/send to an older child. Validate that requested Turn on
+    // demand rather than collecting every parent Turn merely to prove membership in a Set.
+    const callTurn = get('Turn', call.turn_id);
+    if (!scopedConversationIds.has(requireRuntimeId(callTurn.conversation_id))) {
+      throw new Error('Child task snapshot answer wait ToolCall crosses scope.');
+    }
+    if (callTurn.conversation_id === conversationId) add('parentTurns', [callTurn]);
     add('answerToolCalls', [call]);
   }
   for (const toolCall of rows.answerToolCalls) {
