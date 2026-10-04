@@ -212,9 +212,11 @@ export interface TurnReminderHistoryEntry {
 
 /** 一次历史请求要原样放回的内容，只取决于它不可变的 recipe。 */
 interface HistoricalRequestFacts {
-  reminder?: string;
-  reminderIdentitySplit?: TurnReminderIdentitySplit;
-  reinjectedInput?: ReinjectedCurrentTurnInputReference & { currentTurnAttachmentState?: MessageContent };
+  readonly reminder?: string;
+  readonly reminderIdentitySplit?: Readonly<TurnReminderIdentitySplit>;
+  // The renderer produces one user text part. Keep only that immutable scalar in the cache,
+  // then reconstruct the tiny MessageContent envelope for each request.
+  readonly reinjectedInput?: Readonly<ReinjectedCurrentTurnInputReference & { currentTurnAttachmentText?: string }>;
 }
 
 export type ProviderOutputStreamEventKind = 'output_delta' | 'output_item_done' | 'completed' | 'native_control';
@@ -603,7 +605,7 @@ export class ModelProviderControlPlane {
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
-  private readonly historicalTurnReminders = new Map<string, HistoricalRequestFacts | null>();
+  private readonly historicalTurnReminders = new HistoricalTurnReminderCache();
   /** Durable Astra steering submissions/receipts; shared with the Agent loop's native session. */
   public readonly nativeSteering: NativeSteeringStore;
   private handoff: ExecutionHandoffError | undefined;
@@ -2781,9 +2783,9 @@ export class ModelProviderControlPlane {
       const metadata = snapshot.snapshot.map((row, index) => requireRow(row, `ModelRequest recipe ContentObject ${ids[index]}`));
       const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
       ids.forEach((id, index) => {
-        const historical = historicalRequestFacts(parsePlainJson(bytes[index], `ModelRequest recipe ${id}`), id);
+        const historical = parseHistoricalRequestFacts(bytes[index], id);
         facts.set(id, historical);
-        this.rememberHistoricalTurnReminder(id, historical);
+        this.historicalTurnReminders.set(id, historical);
       });
     }
     const placedInputs = new Set<string>();
@@ -2826,34 +2828,23 @@ export class ModelProviderControlPlane {
       return {
         segmentId: entry.segmentId,
         ...(entry.reminder !== undefined ? { content: entry.reminder } : {}),
-        ...(entry.reminderIdentitySplit ? { identitySplit: entry.reminderIdentitySplit } : {}),
+        ...(entry.reminderIdentitySplit ? { identitySplit: { ...entry.reminderIdentitySplit } } : {}),
         ...(entry.input && input
           ? {
               reinjectedInput: {
                 messageRevisionId: entry.input.messageRevisionId,
                 contentType: input.contentType,
                 content: input.content,
-                ...(entry.input.currentTurnAttachmentState
-                  ? { currentTurnAttachmentState: entry.input.currentTurnAttachmentState }
+                ...(entry.input.currentTurnAttachmentText !== undefined
+                  ? { currentTurnAttachmentState: {
+                      role: 'user' as const, parts: [{ text: entry.input.currentTurnAttachmentText }]
+                    } }
                   : {})
               }
             }
           : {})
       };
     });
-  }
-
-  /** recipe 是不可变的内容寻址对象，按对象 id 缓存生成结果；有界，超出时淘汰最早的条目。 */
-  private rememberHistoricalTurnReminder(
-    recipeObjectId: string,
-    facts: HistoricalRequestFacts | null
-  ): void {
-    this.historicalTurnReminders.set(recipeObjectId, facts);
-    while (this.historicalTurnReminders.size > HISTORICAL_REMINDER_CACHE_LIMIT) {
-      const oldest = this.historicalTurnReminders.keys().next().value;
-      if (oldest === undefined) break;
-      this.historicalTurnReminders.delete(oldest);
-    }
   }
 
   private async replayCreation(
@@ -3287,7 +3278,72 @@ function estimateFullProviderContextFallback(request: FullProviderRequest): numb
 }
 
 const HISTORICAL_REMINDER_READ_BATCH = 200;
-const HISTORICAL_REMINDER_CACHE_LIMIT = 4096;
+const HISTORICAL_REMINDER_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+
+/**
+ * Owned by one ModelProviderControlPlane: the database/store lifetime and immutable recipe CAS
+ * identity are unchanged. Cache only projected scalar facts, never recipes, catalogs, source
+ * membership or current authority. Source membership and Claude eligibility are checked per call.
+ * The budget counts UTF-16 scalar lengths plus fixed envelope/key/Map overhead, not exact V8 heap.
+ * A count cap made even tiny negative facts re-read fat recipes on every >4096-producer scan.
+ */
+class HistoricalTurnReminderCache {
+  private readonly entries = new Map<string, { facts: HistoricalRequestFacts | null; bytes: number }>();
+  private bytes = 0;
+
+  public get(recipeObjectId: string): HistoricalRequestFacts | null | undefined {
+    const entry = this.entries.get(recipeObjectId);
+    if (!entry) return undefined;
+    this.entries.delete(recipeObjectId);
+    this.entries.set(recipeObjectId, entry);
+    return entry.facts;
+  }
+
+  public set(recipeObjectId: string, facts: HistoricalRequestFacts | null): void {
+    const input = facts?.reinjectedInput;
+    // Fixed scalar work at insertion. Do not recursively measure a retained recipe or stringify
+    // attachment/catalog graphs merely to decide whether the small projection fits.
+    const bytes = 128 + recipeObjectId.length * 2 + (facts === null ? 0 : 256 + 2 * (
+      (facts.reminder?.length ?? 0)
+      + (facts.reminderIdentitySplit?.user.length ?? 0)
+      + (facts.reminderIdentitySplit?.system?.length ?? 0)
+      + (input?.messageRevisionId.length ?? 0)
+      + (input?.contentObjectId.length ?? 0)
+      + (input?.currentTurnAttachmentText?.length ?? 0)
+    ));
+    // An oversized fact must not empty the cache of useful small/negative facts.
+    if (!Number.isSafeInteger(bytes) || bytes > HISTORICAL_REMINDER_CACHE_MAX_BYTES) return;
+    const prior = this.entries.get(recipeObjectId);
+    if (prior) { this.entries.delete(recipeObjectId); this.bytes -= prior.bytes; }
+    this.entries.set(recipeObjectId, { facts, bytes });
+    this.bytes += bytes;
+    while (this.bytes > HISTORICAL_REMINDER_CACHE_MAX_BYTES) {
+      const oldest = this.entries.keys().next().value;
+      if (oldest === undefined) break;
+      this.bytes -= this.entries.get(oldest)!.bytes;
+      this.entries.delete(oldest);
+    }
+  }
+}
+
+/**
+ * JSON syntax and verified CAS identity still apply to every historical recipe. Only a recipe
+ * frozen as Claude turn-scoped can contribute reminder facts. Do not recursively normalize an
+ * unrelated legacy recipe's tools/handle catalog merely to establish this negative result.
+ * Positive candidates retain the existing full normalization and consumed-field validation.
+ */
+function parseHistoricalRequestFacts(bytes: Buffer, recipeObjectId: string): HistoricalRequestFacts | null {
+  const label = `ModelRequest recipe ${recipeObjectId}`;
+  let recipe: PlainJsonValue;
+  try {
+    const parsed: PlainJsonValue = JSON.parse(bytes.toString('utf8'));
+    if (!isRecord(parsed) || !recipeSentClaudeTurnScopedReminders(parsed)) return null;
+    recipe = normalizePlainJson(parsed, label);
+  } catch (error) {
+    throw new Error(`${label} is not valid plain JSON: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return historicalRequestFacts(recipe, recipeObjectId);
+}
 
 /**
  * 一次历史请求要原样放回的内容：它的提醒，以及它作为易失尾巴重新注入的当前 Turn 输入（连同那次一起渲染的
@@ -3300,7 +3356,7 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
   const reminder = projected?.content;
   const input = recipeReinjectedCurrentTurnInput(recipe);
   if (reminder === undefined && !input) return null;
-  let currentTurnAttachmentState: MessageContent | undefined;
+  let currentTurnAttachmentText: string | undefined;
   if (input && isRecord(recipe)) {
     const state = normalizeAttachmentCatalogState(
       recipe.attachmentCatalogState,
@@ -3309,18 +3365,24 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
     const delta = state.placements.find((placement) => placement.kind === 'current_turn_delta');
     if (delta) {
       const handles = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
-      currentTurnAttachmentState = renderAttachmentCatalogPlacement(delta, (entry) => {
+      const rendered = renderAttachmentCatalogPlacement(delta, (entry) => {
         const ref = modelHandleRef(handles, 'attachment', entry.attachmentId);
         if (!ref) throw new Error(`Attachment ${entry.attachmentId} has no frozen model handle.`);
         return ref;
       });
+      const part = rendered.parts[0];
+      if (rendered.role !== 'user' || rendered.parts.length !== 1 || !part || !('text' in part) || typeof part.text !== 'string') {
+        throw new Error('Historical Turn attachment placement must contain exactly one user text part.');
+      }
+      currentTurnAttachmentText = part.text;
     }
   }
-  return {
+  return Object.freeze({
     ...(reminder !== undefined ? { reminder } : {}),
-    ...(projected?.identitySplit ? { reminderIdentitySplit: projected.identitySplit } : {}),
-    ...(input ? { reinjectedInput: { ...input, ...(currentTurnAttachmentState ? { currentTurnAttachmentState } : {}) } } : {})
-  };
+    ...(projected?.identitySplit ? { reminderIdentitySplit: Object.freeze({ ...projected.identitySplit }) } : {}),
+    ...(input ? { reinjectedInput: Object.freeze({ ...input,
+      ...(currentTurnAttachmentText !== undefined ? { currentTurnAttachmentText } : {}) }) } : {})
+  });
 }
 
 function withTurnReminderHistory(
