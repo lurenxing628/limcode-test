@@ -151,6 +151,7 @@ export class RuntimeDatabase {
   };
   private nextRequestId = 1;
   private closed = false;
+  private readonly closeListeners = new Set<() => void>();
   private closePromise: Promise<void> | undefined;
   private readonly livenessId = randomUUID();
   private readonly startedAt = new Date().toISOString();
@@ -187,7 +188,7 @@ export class RuntimeDatabase {
       && !await this.conversationExecutedByLivePeer(conversationId));
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
     worker.on('error', (error) => {
-      this.closed = true;
+      this.markClosed();
       this.stopHistoryPreparation(error);
       this.failPending(error);
     });
@@ -200,7 +201,7 @@ export class RuntimeDatabase {
       // the liveness record and durable conversation owners stay fail-closed until an explicit
       // graceful close() drains and fences the work (or the OS proves the process dead).
       const unexpected = !this.closed && !this.closePromise;
-      this.closed = true;
+      this.markClosed();
       this.stopHistoryPreparation(new ExecutionHandoffError('SQLite database worker exited.'));
       if (unexpected || code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
     });
@@ -677,6 +678,19 @@ export class RuntimeDatabase {
     return () => this.commitListeners.delete(listener);
   }
 
+  /** Release process-local derived evidence on graceful close, worker failure or root fencing. */
+  public onClose(listener: () => void): () => void {
+    if (this.closed) { listener(); return () => undefined; }
+    this.closeListeners.add(listener);
+    return () => this.closeListeners.delete(listener);
+  }
+
+  private markClosed(): void {
+    this.closed = true;
+    for (const listener of this.closeListeners) listener();
+    this.closeListeners.clear();
+  }
+
   private refuseCommitListenerOnMaintenance(): void {
     if (this.maintenance) throw new Error('A maintenance Runtime database has no commit listeners.');
   }
@@ -872,7 +886,7 @@ export class RuntimeDatabase {
       await this.conversationOwnerSweepTask.catch(() => undefined);
       if (!this.closed) await this.sendRequest<null>({ kind: 'close' });
     } finally {
-      this.closed = true;
+      this.markClosed();
       if (OPEN_ROOT_POINTERS.get(this.registryKey) === this.hostBootId) {
         OPEN_ROOT_POINTERS.delete(this.registryKey);
       }
@@ -942,7 +956,7 @@ export class RuntimeDatabase {
           this.heartbeatFailure = error;
           this.stopHeartbeatTimer();
           this.failPending(error);
-          this.closed = true;
+          this.markClosed();
           this.commitListeners.clear();
           // Registration and conversation owners are retained fail-closed; only an explicit
           // graceful close() unregisters after the writer is fenced and work is drained.

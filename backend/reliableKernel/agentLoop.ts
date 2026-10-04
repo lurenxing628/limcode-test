@@ -3,6 +3,7 @@ import { acceptedNoticeMetadata, type AcceptedAnswerNotice } from './answerPrese
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
 import { isTransactionAssertionFailure } from './phaseFIdentity';
+import { readAgentLoopResumeState, type AgentLoopResumeState } from './agentLoopResumeState';
 
 import {
   buildModelHandleCatalog,
@@ -408,11 +409,6 @@ interface FrozenRuntimeStatusCard {
   children: ConversationChildTaskRuntimeStatus['children'];
   processes: Array<{ processId: string; status: 'running' }>;
   card: string;
-}
-
-interface AgentLoopResumeState {
-  requestSequence: bigint;
-  openTaskCompletionCheckConsumed: boolean;
 }
 
 export type OpenTaskCompletionAction = 'complete' | 'continue_once' | 'complete_with_open_tasks';
@@ -3248,40 +3244,7 @@ export class ReliableAgentLoop {
   }
 
   private async readResumeState(turnId: string): Promise<AgentLoopResumeState> {
-    const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
-      .sort((left, right) => compareInteger(left.request_seq, right.request_seq));
-    const recipes = await this.readModelRequestRecipes(requests);
-    let expectedPhysicalSequence = 1n;
-    let normalRound = 0n;
-    let openTaskCompletionCheckConsumed = false;
-    for (const request of requests) {
-      const actual = requirePositiveInteger(request.request_seq, 'ModelRequest.request_seq');
-      if (actual !== expectedPhysicalSequence) {
-        throw new Error(`Turn ${turnId} ModelRequest sequence is not contiguous at ${expectedPhysicalSequence.toString()}.`);
-      }
-      const requestId = requireId(request.id, 'ModelRequest.id');
-      const recipe = recipes.get(requestId);
-      if (!recipe) throw new Error(`ModelRequest ${requestId} recipe batch lost its request.`);
-      if (recipe.kind === 'reliable-agent-turn') {
-        normalRound += 1n;
-        openTaskCompletionCheckConsumed ||= recipeHasOpenTaskCompletionCheck(recipe);
-        const round = requirePositiveInteger(recipe.round, 'ModelRequest recipe.round');
-        if (round !== normalRound) {
-          throw new Error(`Turn ${turnId} ordinary ModelRequest round is not contiguous at ${normalRound.toString()}.`);
-        }
-        const expectedId = modelRequestIdFor(turnId, `agent-loop:${turnId}:round:${normalRound.toString()}`);
-        if (request.id !== expectedId) {
-          throw new Error(`Turn ${turnId} ordinary ModelRequest ${normalRound.toString()} has an invalid identity.`);
-        }
-      } else if (recipe.kind !== 'reliable-context-compression') {
-        throw new Error(`Turn ${turnId} ModelRequest ${String(request.id)} has unsupported recipe kind ${String(recipe.kind)}.`);
-      }
-      expectedPhysicalSequence += 1n;
-    }
-    return {
-      requestSequence: normalRound === 0n ? 1n : normalRound,
-      openTaskCompletionCheckConsumed
-    };
+    return readAgentLoopResumeState(this.database, this.contentStore, turnId);
   }
 
   private async cancelSupersededCompressionRequests(turnId: string, currentHeadRootId: string): Promise<void> {
@@ -3368,7 +3331,7 @@ export class ReliableAgentLoop {
     }
   }
 
-  /** Batches only the selected recipes; full recovery audits select their entire history. */
+  /** Full recipe reader for callers that need payloads; resume evidence uses its own bounded scan. */
   private async readModelRequestRecipes(
     requests: readonly DomainRow[]
   ): Promise<Map<string, { [key: string]: PlainJsonValue }>> {
