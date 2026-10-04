@@ -1,3 +1,4 @@
+import type { ModelProjectionWorkControls } from './modelProjectionWork';
 import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
 import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import { canonicalLlmProviderKind, type LlmThinkingConfigRecord, type LlmProviderKind } from '../../shared/protocol';
@@ -280,6 +281,9 @@ export interface FullRequestProviderAdapter {
   providerId: string;
   /** Optional exact projection hook. Production adapters use the same projected input for this and send. */
   estimateFullRequestInput?(request: FullProviderRequest): ProjectedRequestTokenBreakdown;
+  /** Optional cooperative ordinary preparation; synchronous callers keep their existing API. */
+  estimateFullRequestInputAsync?(request: FullProviderRequest, controls?: ModelProjectionWorkControls): Promise<ProjectedRequestTokenBreakdown>;
+  sendFullRequestAsync?(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
   sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
   /**
    * Astra native tool-result wire conversion with original call identity. Required on the native
@@ -1089,6 +1093,37 @@ export class ModelProviderControlPlane {
     const context = frozenContextProfile(fullRequest.authoritySnapshot);
     const breakdown = adapter.estimateFullRequestInput?.(fullRequest)
       ?? fallbackRequestBreakdown(estimateFullProviderContextFallback(fullRequest));
+    return calculateFullRequestPlanningBudget({
+      contextWindowTokens: compression?.provider.contextWindowTokens ?? context.contextWindowTokens,
+      maxOutputTokens: compression?.provider.maxOutputTokens
+        ?? frozenPrimaryMaxOutputTokens(fullRequest.authoritySnapshot),
+      compressionThresholdTokens: compression ? context.contextWindowTokens : context.compressionThresholdTokens,
+      breakdown
+    });
+  }
+
+  /** Kernel opt-in; same validation/estimation order, without changing synchronous planning callers. */
+  public async planFullRequestAsync(
+    fullRequest: FullProviderRequest,
+    adapter: FullRequestProviderAdapter,
+    controls: ModelProjectionWorkControls = {}
+  ): Promise<FullRequestPlanningBudget> {
+    if (adapter.providerId !== fullRequest.providerId) {
+      throw providerConflict('Request preview adapter does not match its frozen provider.');
+    }
+    const compression = isCompressionRecipe(fullRequest.recipe)
+      ? frozenCompressionPolicy(fullRequest.authoritySnapshot)
+      : undefined;
+    const context = frozenContextProfile(fullRequest.authoritySnapshot);
+    const breakdown = adapter.estimateFullRequestInputAsync
+      ? await adapter.estimateFullRequestInputAsync(fullRequest, {
+          ...controls,
+          checkpoint: async () => {
+            this.assertNotHandingOff(); await controls.checkpoint?.(); this.assertNotHandingOff();
+          }
+        })
+      : adapter.estimateFullRequestInput?.(fullRequest)
+        ?? fallbackRequestBreakdown(estimateFullProviderContextFallback(fullRequest));
     return calculateFullRequestPlanningBudget({
       contextWindowTokens: compression?.provider.contextWindowTokens ?? context.contextWindowTokens,
       maxOutputTokens: compression?.provider.maxOutputTokens
@@ -3186,7 +3221,8 @@ function startPreparedProviderAttempt(
   const request = prepared.request;
   if (!request) throw new Error('Prepared Provider attempt has already been transferred.');
   prepared.request = undefined;
-  return adapter.sendFullRequest(request, controls);
+  const send = adapter.sendFullRequestAsync ?? adapter.sendFullRequest;
+  return send.call(adapter, request, controls);
 }
 
 function requirePriorNativeFailures(fact: ProviderAttemptContinuation['priorNativeFailures']): number {

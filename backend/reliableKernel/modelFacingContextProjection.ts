@@ -1,3 +1,4 @@
+import { completeModelProjection, type ModelProjectionWork } from './modelProjectionWork';
 import {
   normalizeAttachmentCatalogState,
   renderAttachmentCatalogState,
@@ -23,6 +24,8 @@ import {
   measureJsonTokens,
   estimateMessageContentsMediaTokens,
   estimateMessageContentsTokens,
+  estimateMessageContentsTokenWork,
+  estimateMessageContentsMediaTokenWork,
   estimateTextTokens
 } from './modelTokenEstimator';
 import {
@@ -187,6 +190,10 @@ export type CompressionRequestPreflightResult =
   | ContextPlanningFailure;
 
 export function estimateProjectedModelInput(input: ProjectedModelInput): ProjectedRequestTokenBreakdown {
+  return completeModelProjection(estimateProjectedModelInputWork(input));
+}
+
+export function* estimateProjectedModelInputWork(input: ProjectedModelInput): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
   const context = input.contextContents ?? [];
   const currentInput = input.currentInputContents ?? [];
   const runtimeDeliveries = input.runtimeDeliveryContents ?? [];
@@ -194,22 +201,24 @@ export function estimateProjectedModelInput(input: ProjectedModelInput): Project
   const systemTokens = typeof input.systemInstruction === 'string'
     ? estimateTextTokens(input.systemInstruction)
     : input.systemInstruction
-      ? estimateMessageContentsTokens([input.systemInstruction])
+      ? (yield* estimateMessageContentsTokenWork([input.systemInstruction]))
       : 0;
   const prefixTokens = estimateTextTokens(input.systemPromptPrefix?.trim() ?? '');
-  const toolSchemaTokens = safeSum((input.tools ?? []).map((tool) => 10 + estimateJsonTokens(tool)));
+  const toolEstimates: number[] = [];
+  for (const tool of input.tools ?? []) { yield; toolEstimates.push(10 + estimateJsonTokens(tool)); }
+  const toolSchemaTokens = safeSum(toolEstimates);
   const providerFramingTokens = nonNegativeTokenCount(input.providerFramingTokens ?? 0, 'providerFramingTokens');
-  const contextTokens = estimateMessageContentsTokens(context);
-  const currentInputTokens = estimateMessageContentsTokens(currentInput);
-  const runtimeDeliveryTokens = estimateMessageContentsTokens(runtimeDeliveries);
-  const turnReminderTokens = estimateMessageContentsTokens(reminder);
+  const contextTokens = yield* estimateMessageContentsTokenWork(context);
+  const currentInputTokens = yield* estimateMessageContentsTokenWork(currentInput);
+  const runtimeDeliveryTokens = yield* estimateMessageContentsTokenWork(runtimeDeliveries);
+  const turnReminderTokens = yield* estimateMessageContentsTokenWork(reminder);
   const mediaTokens = safeSum([
-    estimateMessageContentsMediaTokens(context),
-    estimateMessageContentsMediaTokens(currentInput),
-    estimateMessageContentsMediaTokens(runtimeDeliveries),
-    estimateMessageContentsMediaTokens(reminder),
+    (yield* estimateMessageContentsMediaTokenWork(context)),
+    (yield* estimateMessageContentsMediaTokenWork(currentInput)),
+    (yield* estimateMessageContentsMediaTokenWork(runtimeDeliveries)),
+    (yield* estimateMessageContentsMediaTokenWork(reminder)),
     input.systemInstruction && typeof input.systemInstruction !== 'string'
-      ? estimateMessageContentsMediaTokens([input.systemInstruction])
+      ? (yield* estimateMessageContentsMediaTokenWork([input.systemInstruction]))
       : 0
   ]);
   const fixedTokens = safeSum([systemTokens, prefixTokens, toolSchemaTokens, providerFramingTokens]);
@@ -700,6 +709,13 @@ export function projectToolResultBatch(
   inputs: readonly ToolResultProjectionInput[],
   options: { perResultTokens?: number; batchTokens?: number; skillResultTokens?: number } = {}
 ): ToolResultBatchProjection {
+  return completeModelProjection(projectToolResultBatchWork(inputs, options));
+}
+
+function* projectToolResultBatchWork(
+  inputs: readonly ToolResultProjectionInput[],
+  options: { perResultTokens?: number; batchTokens?: number; skillResultTokens?: number } = {}
+): ModelProjectionWork<ToolResultBatchProjection> {
   const perResultTokens = positiveTokenCount(options.perResultTokens ?? TOOL_RESULT_MAX_TOKENS, 'perResultTokens');
   const batchTokens = positiveTokenCount(options.batchTokens ?? TOOL_RESULT_BATCH_MAX_TOKENS, 'batchTokens');
   const skillResultTokens = positiveTokenCount(
@@ -709,25 +725,31 @@ export function projectToolResultBatch(
   // Loaded skills of one batch share one allowance: each keeps its whole text when that fits,
   // otherwise the allowance is split evenly (water filling) so several large skills loaded together
   // stay bounded like one. Prepare each text once before assigning its final allowance.
-  const measured = inputs.map((input, index) => prepareTextToolResult(input, index));
+  const measured: Array<ReturnType<typeof prepareTextToolResult>> = [];
+  for (let index = 0; index < inputs.length; index++) { yield; measured.push(prepareTextToolResult(inputs[index], index)); }
   const skillIndexes = measured.flatMap((item, index) => (item?.toolName === SKILLS_TOOL_NAME ? [index] : []));
   const skillShares = new Map(waterFillTokens(
     skillIndexes.map((index) => measured[index]!.originalTokens),
     skillResultTokens
   ).map((share, position): [number, number] => [skillIndexes[position], share]));
-  const dedicated = measured.map((item, index) => item === undefined
-    ? undefined
-    : projectTextToolResult(item, item.toolName === SKILLS_TOOL_NAME
-      ? skillShares.get(index)! : perResultTokens));
+  const dedicated: Array<ToolResultProjectionItem | undefined> = [];
+  for (let index = 0; index < measured.length; index++) {
+    yield; const item = measured[index];
+    dedicated.push(item === undefined ? undefined : projectTextToolResult(item,
+      item.toolName === SKILLS_TOOL_NAME ? skillShares.get(index)! : perResultTokens));
+  }
   const shared = inputs.flatMap((input, index) => dedicated[index] ? [] : [{ input, index }]);
-  const prepared = shared.map(({ input, index }) => prepareToolResult(input, index, perResultTokens));
+  const prepared: PreparedToolResult[] = [];
+  for (const { input, index } of shared) { yield; prepared.push(prepareToolResult(input, index, perResultTokens)); }
   const mandatoryTokens = safeSum(prepared.map((item) => item.baseTokens));
   const remaining = Math.max(0, batchTokens - mandatoryTokens);
   const allocations = allocateToolResultPreviewTokens(prepared, remaining);
-  const sharedItems = new Map(prepared.map((item, position): [number, ToolResultProjectionItem] => {
+  const sharedItems = new Map<number, ToolResultProjectionItem>();
+  for (let position = 0; position < prepared.length; position++) {
+    yield; const item = prepared[position];
     const target = safeSum([item.baseTokens, allocations[position]]);
-    return [shared[position].index, projectPreparedToolResult(item, target)];
-  }));
+    sharedItems.set(shared[position].index, projectPreparedToolResult(item, target));
+  }
   const items = inputs.map((_, index) => dedicated[index] ?? sharedItems.get(index)!);
   return {
     status: 'projected',
@@ -1288,7 +1310,15 @@ export function projectOrdinaryModelContents(
   modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): MessageContent[] {
-  return projectOrdinaryModelWindowContents(contents, modelHandleCatalogInput, mediaState).contents;
+  return completeModelProjection(projectOrdinaryModelContentsWork(contents, modelHandleCatalogInput, mediaState));
+}
+
+export function* projectOrdinaryModelContentsWork(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
+  mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
+): ModelProjectionWork<MessageContent[]> {
+  return (yield* projectOrdinaryModelWindowWork(contents, modelHandleCatalogInput, mediaState)).contents;
 }
 
 function projectOrdinaryModelWindowContents(
@@ -1296,9 +1326,19 @@ function projectOrdinaryModelWindowContents(
   modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown,
   mediaState: ManagedMediaBodyProjectionState
 ): Omit<ModelWindowProjection, 'tokenCount' | 'mediaTokens'> {
-  const projected = contents.map(cloneMessageContent);
+  return completeModelProjection(projectOrdinaryModelWindowWork(contents, modelHandleCatalogInput, mediaState));
+}
+
+function* projectOrdinaryModelWindowWork(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown,
+  mediaState: ManagedMediaBodyProjectionState
+): ModelProjectionWork<Omit<ModelWindowProjection, 'tokenCount' | 'mediaTokens'>> {
+  const projected: MessageContent[] = [];
+  for (const content of contents) { yield; projected.push(cloneMessageContent(content)); }
   const batches: ToolResultBatchProjection[] = [];
   for (const group of groupAtomicMessageContentRanges(projected)) {
+    yield;
     if (group.kind !== 'tool_exchange' && group.kind !== 'tool_results') continue;
     const refs: Array<{ contentIndex: number; partIndex: number; part: Extract<ContentPart, { functionResponse: unknown }> }> = [];
     for (let contentIndex = group.startIndex; contentIndex < group.endIndexExclusive; contentIndex += 1) {
@@ -1307,7 +1347,7 @@ function projectOrdinaryModelWindowContents(
       });
     }
     if (refs.length === 0) continue;
-    const batch = projectToolResultBatch(refs.map(({ part }) => ({
+    const batch = yield* projectToolResultBatchWork(refs.map(({ part }) => ({
       toolName: part.functionResponse.name,
       ...(part.id ? { callId: part.id } : {}),
       response: part.functionResponse.response,
@@ -1327,7 +1367,7 @@ function projectOrdinaryModelWindowContents(
   }
   const uniqueBefore = mediaState.uniqueBodyCount;
   const suppressedBefore = mediaState.suppressedBodyCount;
-  const mediaProjected = suppressRepeatedManagedMediaBodies(
+  const mediaProjected = yield* suppressRepeatedManagedMediaBodiesWork(
     projected,
     modelHandleCatalogInput,
     mediaState
@@ -1346,10 +1386,17 @@ export function preserveCanonicalModelContents(
   contents: readonly MessageContent[],
   state: ManagedMediaBodyProjectionState
 ): MessageContent[] {
+  return completeModelProjection(preserveCanonicalModelContentsWork(contents, state));
+}
+
+export function* preserveCanonicalModelContentsWork(
+  contents: readonly MessageContent[], state: ManagedMediaBodyProjectionState
+): ModelProjectionWork<MessageContent[]> {
   // Native compact output is already the canonical next window, including raw provider items and
   // retained messages. Observe managed media for the ordinary tail without changing this window or
   // claiming its repeated bodies were suppressed.
   for (const content of contents) {
+    yield;
     for (const part of content.parts) {
       if ('inlineData' in part) rememberManagedMediaBody(part, state);
       if ('functionResponse' in part) {
@@ -1361,7 +1408,9 @@ export function preserveCanonicalModelContents(
       }
     }
   }
-  return contents.map(cloneMessageContent);
+  const projected: MessageContent[] = [];
+  for (const content of contents) { yield; projected.push(cloneMessageContent(content)); }
+  return projected;
 }
 
 /**
@@ -1374,8 +1423,19 @@ export function suppressRepeatedManagedMediaBodies(
   modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   state: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): MessageContent[] {
+  return completeModelProjection(suppressRepeatedManagedMediaBodiesWork(contents, modelHandleCatalogInput, state));
+}
+
+function* suppressRepeatedManagedMediaBodiesWork(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown,
+  state: ManagedMediaBodyProjectionState
+): ModelProjectionWork<MessageContent[]> {
   const modelHandleCatalog = prepareModelHandleCatalog(modelHandleCatalogInput);
-  return contents.map((content): MessageContent => ({
+  const projected: MessageContent[] = [];
+  for (const content of contents) {
+    yield;
+    projected.push({
     role: content.role,
     parts: content.parts.map((part): ContentPart => {
       if ('inlineData' in part) {
@@ -1410,7 +1470,9 @@ export function suppressRepeatedManagedMediaBodies(
       }
       return cloneJsonValue(part) as ContentPart;
     })
-  }));
+    });
+  }
+  return projected;
 }
 
 function repeatedManagedMediaOmission(

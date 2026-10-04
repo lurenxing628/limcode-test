@@ -1,3 +1,4 @@
+import { completeModelProjection, type ModelProjectionWork } from './modelProjectionWork';
 import { estimateTokenCount } from 'tokenx';
 import type { ContentPart, InlineDataPart, MessageContent } from '../../shared/protocol';
 
@@ -6,15 +7,28 @@ const FUNCTION_OVERHEAD_TOKENS = 4;
 const FILE_REFERENCE_TOKENS = 258;
 
 export function estimateMessageContentsTokens(contents: readonly MessageContent[]): number {
-  return safeTokenCount(contents.reduce((total, content) =>
-    total + estimateMessageContentTokens(content), 0), 'MessageContent token estimate');
+  return completeModelProjection(estimateMessageContentsTokenWork(contents));
+}
+
+/** Shared synchronous/cooperative loop; preserves per-message order and final overflow validation. */
+export function* estimateMessageContentsTokenWork(contents: readonly MessageContent[]): ModelProjectionWork<number> {
+  let total = 0;
+  for (const content of contents) { yield; total += estimateMessageContentTokens(content); }
+  return safeTokenCount(total, 'MessageContent token estimate');
 }
 
 /** Informational media subtotal. It is already included in estimateMessageContentsTokens(). */
 export function estimateMessageContentsMediaTokens(contents: readonly MessageContent[]): number {
-  return safeTokenCount(contents.reduce((total, content) => total + content.parts.reduce(
-    (partTotal, part) => partTotal + estimateContentPartMediaTokens(part), 0
-  ), 0), 'MessageContent media token estimate');
+  return completeModelProjection(estimateMessageContentsMediaTokenWork(contents));
+}
+
+export function* estimateMessageContentsMediaTokenWork(contents: readonly MessageContent[]): ModelProjectionWork<number> {
+  let total = 0;
+  for (const content of contents) {
+    yield;
+    total += content.parts.reduce((partTotal, part) => partTotal + estimateContentPartMediaTokens(part), 0);
+  }
+  return safeTokenCount(total, 'MessageContent media token estimate');
 }
 
 export function estimateMessageContentTokens(content: MessageContent): number {

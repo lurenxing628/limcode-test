@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { readConversationContextHandleStateRow, readCurrentConversationContextHandleState } from './conversationContextHandleState';
 import { acceptedNoticeMetadata, type AcceptedAnswerNotice } from './answerPresentation';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
@@ -1166,7 +1167,22 @@ export class ReliableAgentLoop {
     if (adapter.providerId !== preview.providerId) {
       throw new Error(`Provider registry returned ${adapter.providerId} for ${preview.providerId}.`);
     }
-    const budget = this.modelProvider.planFullRequest(preview, adapter);
+    const turnId = command.turnId;
+    let nextDurableCancellationCheck = performance.now() + 64;
+    const budget = typeof this.modelProvider.planFullRequestAsync === 'function'
+      ? await this.modelProvider.planFullRequestAsync(preview, adapter, {
+          checkpoint: async () => {
+            this.modelProvider.assertNotHandingOff();
+            if (performance.now() < nextDurableCancellationCheck) return;
+            nextDurableCancellationCheck = performance.now() + 64;
+            await this.assertRecoveryStillOwned(turnId);
+            if (await this.terminateIfRequested(turnId, 'cooperative-request-planning')) {
+              const error = new Error('Turn stopped during cooperative request planning.');
+              error.name = 'AbortError'; throw error;
+            }
+          }
+        })
+      : this.modelProvider.planFullRequest(preview, adapter);
     const compression = asRecord(preview.authoritySnapshot)?.compression;
     return {
       providerId: preview.providerId,
@@ -2653,6 +2669,14 @@ export class ReliableAgentLoop {
       ...(adapter.estimateFullRequestInput
         ? { estimateFullRequestInput: (fullRequest) => adapter.estimateFullRequestInput!(fullRequest) }
         : {}),
+      ...(adapter.sendFullRequestAsync ? {
+        sendFullRequestAsync: (fullRequest, controls) => {
+          activeSession?.bindStream({ attemptSeq: fullRequest.attemptSeq, socketGeneration: fullRequest.socketGeneration });
+          return adapter.sendFullRequestAsync!(fullRequest, streamControls(
+            fullRequest.attemptSeq, fullRequest.socketGeneration, controls
+          ));
+        }
+      } : {}),
       sendFullRequest: (fullRequest, controls) => {
         activeSession?.bindStream({
           attemptSeq: fullRequest.attemptSeq,

@@ -1,3 +1,4 @@
+import { completeModelProjection, completeModelProjectionCooperatively, type ModelProjectionWork, type ModelProjectionWorkControls } from './modelProjectionWork';
 import type { LlmCapability } from '../capabilities/types';
 import { openAIResponsesCompactSystemInstruction, resolveOpenAIResponsesNativeToolOutputs } from '../capabilities/llmProvider';
 import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNative';
@@ -52,9 +53,11 @@ import {
   createAttachmentPlacementQueue,
   createManagedMediaBodyProjectionState,
   estimateProjectedModelInput,
+  estimateProjectedModelInputWork,
   isToolResultContents,
   projectOrdinaryModelContents,
-  preserveCanonicalModelContents,
+  projectOrdinaryModelContentsWork,
+  preserveCanonicalModelContentsWork,
   projectSummaryModelWindow,
   withSummaryDispatchRefs,
   stripNativeConfigurationUpdates,
@@ -161,58 +164,16 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     if (isCompressionRequest(request.recipe)) {
       return estimateCompactProjection(toLlmCompactRequest(request));
     }
-    const projected = toLlmStartRequest(request);
-    // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
-    // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
-    // 只有按 user 消息发出的历史提醒（拆分发出的只有运行状态卡那条 user 消息）计入上下文；本轮提醒照常计入
-    // turnReminderTokens。重新注入输入的历史副本是普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，
-    // 也就没有本轮输入。
-    const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
-    let tailInputSuperseded = false;
-    const visibleContents = projected.contents.flatMap((content, index) => {
-      const marker = readTurnReminderMarker(content);
-      if (!marker) return [content];
-      if (marker.placement === 'current') {
-        if (deliveries[index] !== 'omitted') return [content];
-        if (marker.kind === 'reinjected_input') tailInputSuperseded = true;
-        return [];
-      }
-      const visible = visibleHistoryTurnReminder(content, deliveries[index]);
-      return visible ? [visible] : [];
-    });
-    const frozenCurrent = request.requestAddenda?.currentTurnInput;
-    const currentInputCount = frozenCurrent?.reinject && !tailInputSuperseded ? 1 : 0;
-    const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
-    const contextEnd = visibleContents.length - currentInputCount - reminderCount;
-    const currentEnd = contextEnd + currentInputCount;
-    const projectedContext = visibleContents.slice(0, contextEnd);
-    let currentInputContents = currentInputCount
-      ? visibleContents.slice(contextEnd, currentEnd)
-      : [];
-    if (frozenCurrent && !frozenCurrent.reinject) {
-      const decodedCurrent = decodeFrozenCurrentTurnInput(frozenCurrent.content, frozenCurrent.contentType);
-      if (!decodedCurrent || decodedCurrent.role !== 'user') {
-        throw new TypeError('Frozen current Turn input must be a user MessageContent.');
-      }
-      const identity = canonicalPlainJson(decodedCurrent, 'Frozen current Turn input');
-      let index = -1;
-      for (let candidate = projectedContext.length - 1; candidate >= 0; candidate -= 1) {
-        if (canonicalPlainJson(projectedContext[candidate], 'Projected model content') !== identity) continue;
-        index = candidate;
-        break;
-      }
-      if (index < 0) throw new Error('Frozen current Turn input is absent from its projected Context window.');
-      currentInputContents = [projectedContext[index]];
-      projectedContext.splice(index, 1);
-    }
-    return estimateProjectedModelInput({
-      ...(projected.systemInstruction ? { systemInstruction: projected.systemInstruction } : {}),
-      tools: projected.tools,
-      contextContents: projectedContext,
-      ...(currentInputContents.length ? { currentInputContents } : {}),
-      ...(reminderCount ? { turnReminderContents: visibleContents.slice(currentEnd) } : {}),
-      providerFramingTokens: 64
-    });
+    return completeModelProjection(estimateOrdinaryRequestInputWork(request));
+  }
+
+  /** Kernel-only opt-in; existing synchronous estimate API and its error timing stay unchanged. */
+  public async estimateFullRequestInputAsync(
+    request: FullProviderRequest, controls: ModelProjectionWorkControls = {}
+  ): Promise<ProjectedRequestTokenBreakdown> {
+    if (request.providerId !== this.providerId) throw new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`);
+    if (isCompressionRequest(request.recipe)) return this.estimateFullRequestInput(request);
+    return completeModelProjectionCooperatively(estimateOrdinaryRequestInputWork(request), controls);
   }
 
   public sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void> {
@@ -227,6 +188,32 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     const llmRequest = toLlmStartRequest(request);
     if (this.debugCapture) setDebugCaptureContext(llmRequest, debugContext);
     return this.startOrdinaryRequest(llmRequest, ordinaryStreamMetadata(request), debugContext, controls);
+  }
+
+  /** Non-async outer frame never keeps the raw request alive while the provider streams. */
+  public sendFullRequestAsync(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void> {
+    if (request.providerId !== this.providerId) {
+      return Promise.reject(new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`));
+    }
+    if (isCompressionRequest(request.recipe)) return this.sendFullRequest(request, controls);
+    return this.prepareOrdinaryRequestCooperatively(request, controls.signal).then(prepared => {
+      const projected = prepared.request;
+      prepared.request = undefined;
+      if (!projected) throw new Error('Cooperatively prepared request has already been transferred.');
+      return this.startOrdinaryRequest(projected, prepared.metadata, prepared.debugContext, controls);
+    });
+  }
+
+  private async prepareOrdinaryRequestCooperatively(request: FullProviderRequest, signal?: AbortSignal): Promise<{
+    request: LlmStartRequest | undefined; metadata: OrdinaryStreamMetadata; debugContext: ProviderDebugContext;
+  }> {
+    const debugContext = { conversationId: request.conversationId, modelRequestId: request.modelRequestId,
+      attemptSeq: request.attemptSeq, socketGeneration: request.socketGeneration };
+    const projected = await completeModelProjectionCooperatively(toLlmStartRequestWork(request), {
+      checkpoint() { if (signal?.aborted) throw abortError(signal); }
+    });
+    if (this.debugCapture) setDebugCaptureContext(projected, debugContext);
+    return { request: projected, metadata: ordinaryStreamMetadata(request), debugContext };
   }
 
   /** Callback scope owns the projected provider payload, never the raw Context request. */
@@ -790,7 +777,67 @@ function isGptModelId(modelId: string): boolean {
   return /^gpt[-_.]?\d/i.test(name);
 }
 
+function* estimateOrdinaryRequestInputWork(request: FullProviderRequest): ModelProjectionWork<ProjectedRequestTokenBreakdown> {
+  const projected = yield* toLlmStartRequestWork(request);
+  // 按实际发出的布局估算：网关拒绝过轮内系统消息的渠道与模型退回尾巴模式（与开关关闭时相同）。
+  // Claude 轮内系统消息：已清除的历史提醒不显示、不计 token（官方 “Token counting follows what renders”），
+  // 只有按 user 消息发出的历史提醒（拆分发出的只有运行状态卡那条 user 消息）计入上下文；本轮提醒照常计入
+  // turnReminderTokens。重新注入输入的历史副本是普通 user 消息，计入上下文；窗口里已有历史副本时尾巴副本不发送，
+  // 也就没有本轮输入。
+  const deliveries = turnReminderDeliveries(projected.contents, estimatedTurnReminderLayout(request.providerId, request.modelId));
+  let tailInputSuperseded = false;
+  const visibleContents = projected.contents.flatMap((content, index) => {
+    const marker = readTurnReminderMarker(content);
+    if (!marker) return [content];
+    if (marker.placement === 'current') {
+      if (deliveries[index] !== 'omitted') return [content];
+      if (marker.kind === 'reinjected_input') tailInputSuperseded = true;
+      return [];
+    }
+    const visible = visibleHistoryTurnReminder(content, deliveries[index]);
+    return visible ? [visible] : [];
+  });
+  const frozenCurrent = request.requestAddenda?.currentTurnInput;
+  const currentInputCount = frozenCurrent?.reinject && !tailInputSuperseded ? 1 : 0;
+  const reminderCount = request.requestAddenda?.turnReminder ? 1 : 0;
+  const contextEnd = visibleContents.length - currentInputCount - reminderCount;
+  const currentEnd = contextEnd + currentInputCount;
+  const projectedContext = visibleContents.slice(0, contextEnd);
+  let currentInputContents = currentInputCount
+    ? visibleContents.slice(contextEnd, currentEnd)
+    : [];
+  if (frozenCurrent && !frozenCurrent.reinject) {
+    const decodedCurrent = decodeFrozenCurrentTurnInput(frozenCurrent.content, frozenCurrent.contentType);
+    if (!decodedCurrent || decodedCurrent.role !== 'user') {
+      throw new TypeError('Frozen current Turn input must be a user MessageContent.');
+    }
+    const identity = canonicalPlainJson(decodedCurrent, 'Frozen current Turn input');
+    let index = -1;
+    for (let candidate = projectedContext.length - 1; candidate >= 0; candidate -= 1) {
+      yield;
+      if (canonicalPlainJson(projectedContext[candidate], 'Projected model content') !== identity) continue;
+      index = candidate;
+      break;
+    }
+    if (index < 0) throw new Error('Frozen current Turn input is absent from its projected Context window.');
+    currentInputContents = [projectedContext[index]];
+    projectedContext.splice(index, 1);
+  }
+  return yield* estimateProjectedModelInputWork({
+    ...(projected.systemInstruction ? { systemInstruction: projected.systemInstruction } : {}),
+    tools: projected.tools,
+    contextContents: projectedContext,
+    ...(currentInputContents.length ? { currentInputContents } : {}),
+    ...(reminderCount ? { turnReminderContents: visibleContents.slice(currentEnd) } : {}),
+    providerFramingTokens: 64
+  });
+}
+
 function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
+  return completeModelProjection(toLlmStartRequestWork(request));
+}
+
+function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWork<LlmStartRequest> {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
   const modelHandleCatalog = prepareModelHandleCatalog(recipe.modelHandleCatalog);
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
@@ -838,7 +885,8 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
   const appendAttachmentState = (segmentId: string, toolResults = false): void => {
     attachmentPlacements.leave(toolResults, renderedAttachmentState.afterSegment.get(segmentId));
   };
-  for (const item of nativeResultsAfterTheirCalls(request.context, provider)) {
+  for (const item of (yield* nativeResultsAfterTheirCallsWork(request.context, provider))) {
+    yield;
     const pairContents = item.segmentKind === 'tool_pair'
       ? toolPairContents(item.content, modelHandleCatalog)
       : undefined;
@@ -924,7 +972,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
     ...(turnReminder ? ['turn_reminder' as const] : [])
   ];
   const systemText = prependSystemPromptPrefix(systemParts.filter(Boolean).join('\n\n'), systemPromptPrefix);
-  const projection = projectOrdinaryContentsWithDetachedInputs(
+  const projection = yield* projectOrdinaryContentsWithDetachedInputsWork(
     contents,
     canonicalCompressionRanges,
     modelHandleCatalog,
@@ -1035,15 +1083,22 @@ function projectOrdinaryContentsWithDetachedInputs(
   modelHandleCatalog: ReadonlyModelHandleCatalog,
   insertions: readonly HistoryInsertion[]
 ): { contents: MessageContent[]; insertions: HistoryInsertion[] } {
+  return completeModelProjection(projectOrdinaryContentsWithDetachedInputsWork(contents, canonicalRanges, modelHandleCatalog, insertions));
+}
+
+function* projectOrdinaryContentsWithDetachedInputsWork(
+  contents: readonly MessageContent[], canonicalRanges: readonly { start: number; end: number }[],
+  modelHandleCatalog: ReadonlyModelHandleCatalog, insertions: readonly HistoryInsertion[]
+): ModelProjectionWork<{ contents: MessageContent[]; insertions: HistoryInsertion[] }> {
   const detached = insertions.filter((insertion) => insertion.input);
   if (detached.length === 0) {
     return {
-      contents: projectOrdinaryContentsPreservingRanges(contents, canonicalRanges, modelHandleCatalog),
+      contents: yield* projectOrdinaryContentsPreservingRangesWork(contents, canonicalRanges, modelHandleCatalog),
       insertions: [...insertions]
     };
   }
   const projectedInputs = new Map<number, MessageContent>();
-  const projected = projectOrdinaryContentsPreservingRanges(
+  const projected = yield* projectOrdinaryContentsPreservingRangesWork(
     contents,
     canonicalRanges,
     modelHandleCatalog,
@@ -1663,7 +1718,7 @@ function runtimeContextContent(
   };
 }
 
-function projectOrdinaryContentsPreservingRanges(
+function* projectOrdinaryContentsPreservingRangesWork(
   contents: readonly MessageContent[],
   canonicalRanges: readonly { start: number; end: number }[],
   modelHandleCatalog: ReadonlyModelHandleCatalog,
@@ -1672,25 +1727,25 @@ function projectOrdinaryContentsPreservingRanges(
     cuts: readonly number[];
     atCut(index: number, mediaState: ManagedMediaBodyProjectionState): void;
   }
-): MessageContent[] {
+): ModelProjectionWork<MessageContent[]> {
   if (canonicalRanges.length === 0 && !observer) {
-    return projectOrdinaryModelContents(contents, modelHandleCatalog);
+    return yield* projectOrdinaryModelContentsWork(contents, modelHandleCatalog);
   }
   const mediaState = createManagedMediaBodyProjectionState();
   const cuts = [...new Set(observer?.cuts ?? [])].sort((left, right) => left - right);
   let nextCut = 0;
   /** Ordinary slices are projected piecewise at observed cuts; the cuts sit before a model content. */
-  const projectOrdinarySlice = (start: number, end: number): MessageContent[] => {
+  const projectOrdinarySlice = function* (start: number, end: number): ModelProjectionWork<MessageContent[]> {
     const sliceProjection: MessageContent[] = [];
     let sliceStart = start;
     while (nextCut < cuts.length && cuts[nextCut] <= end) {
       const cut = cuts[nextCut++];
       if (cut < start) throw new RangeError('Detached projection cut falls inside a canonical compression range.');
-      sliceProjection.push(...projectOrdinaryModelContents(contents.slice(sliceStart, cut), modelHandleCatalog, mediaState));
+      sliceProjection.push(...(yield* projectOrdinaryModelContentsWork(contents.slice(sliceStart, cut), modelHandleCatalog, mediaState)));
       observer!.atCut(cut, mediaState);
       sliceStart = cut;
     }
-    sliceProjection.push(...projectOrdinaryModelContents(contents.slice(sliceStart, end), modelHandleCatalog, mediaState));
+    sliceProjection.push(...(yield* projectOrdinaryModelContentsWork(contents.slice(sliceStart, end), modelHandleCatalog, mediaState)));
     return sliceProjection;
   };
   const projected: MessageContent[] = [];
@@ -1700,16 +1755,16 @@ function projectOrdinaryContentsPreservingRanges(
       || range.start < cursor || range.end < range.start || range.end > contents.length) {
       throw new RangeError('Canonical compression ranges are invalid or overlapping.');
     }
-    projected.push(...projectOrdinarySlice(cursor, range.start));
+    projected.push(...(yield* projectOrdinarySlice(cursor, range.start)));
     // Preserve the entire native window, including retained messages' top-level raw provider items.
     // Its managed bodies only seed suppression of later ordinary content; canonical items stay exact.
-    projected.push(...preserveCanonicalModelContents(
+    projected.push(...(yield* preserveCanonicalModelContentsWork(
       contents.slice(range.start, range.end),
       mediaState
-    ));
+    )));
     cursor = range.end;
   }
-  projected.push(...projectOrdinarySlice(cursor, contents.length));
+  projected.push(...(yield* projectOrdinarySlice(cursor, contents.length)));
   if (nextCut !== cuts.length) throw new RangeError('Detached projection cut is outside the projected contents.');
   return projected;
 }
@@ -1922,12 +1977,13 @@ const PROVIDERS_KEEPING_CHRONOLOGICAL_NATIVE_RESULTS: ReadonlySet<LlmProviderKin
  * Only this outgoing order changes; the stored Context does not, and a window without a late native
  * result is returned as it is.
  */
-function nativeResultsAfterTheirCalls<T extends Pick<FullProviderContextItem, 'segmentKind' | 'content'>>(
+function* nativeResultsAfterTheirCallsWork<T extends Pick<FullProviderContextItem, 'segmentKind' | 'content'>>(
   items: readonly T[],
   provider: LlmProviderKind
-): readonly T[] {
+): ModelProjectionWork<readonly T[]> {
   if (PROVIDERS_KEEPING_CHRONOLOGICAL_NATIVE_RESULTS.has(provider)) return items;
-  const nativeOccurrences = items.map((item) => nativeToolOccurrence(item));
+  const nativeOccurrences: Array<ReturnType<typeof nativeToolOccurrence>> = [];
+  for (const item of items) { yield; nativeOccurrences.push(nativeToolOccurrence(item)); }
   const resultIndexByCall = new Map<string, number>();
   nativeOccurrences.forEach((occurrence, index) => {
     if (occurrence?.kind === 'result') resultIndexByCall.set(occurrence.toolCallId, index);
