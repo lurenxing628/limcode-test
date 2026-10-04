@@ -21,9 +21,9 @@ function task(index, extra = {}) {
   return { childExecutionId: `child-${index}`, answerBridgeId: `bridge-${index}`,
     parentConversationId: 'parent-conversation', conversationId: `child-conversation-${index}`,
     depth: 1, status: 'active', label: 'Same display label', createdAt: '2026-09-22T00:00:00.000Z',
-    revision: `revision-${index}`, initialTask, currentInputs: [current], queuedInputs: [queued],
+    resumable: true, initialTask, currentInputs: [current], queuedInputs: [queued],
     timeline: [initialTask, current, queued], execution: { activeTurnId: `active-${index}` },
-    result: { deliveries: [] }, ...extra };
+    result: { deliveries: [], handling: [] }, ...extra };
 }
 
 function fixture(initialTasks = [task(1)]) {
@@ -175,7 +175,7 @@ test('send appends to the validated existing child and never creates another exe
 test('wait supports multiple validated children and returns changed facts without sending work', async () => {
   const f = fixture([task(1), task(2)]);
   const waiting = f.call({ operation: 'wait', answerBridgeIds: ['bridge-1', 'bridge-2'], timeoutMs: 500 });
-  const timer = setTimeout(() => f.replaceTasks([task(1), task(2, { revision: 'changed-2', status: 'idle', queuedInputs: [] })]), 20);
+  const timer = setTimeout(() => f.replaceTasks([task(1), task(2, { status: 'idle', queuedInputs: [] })]), 20);
   try {
     const result = (await waiting).detail;
     assert.equal(result.changed, true);
@@ -219,4 +219,28 @@ test('internal canonical send enforces the original parent conversation before p
   value.contentStore = { prepare() { assert.fail('must not publish unauthorized task content'); } };
   await assert.rejects(value.send({ sourceKey: 'canonical-send', sourceToolCallId: 'canonical-call',
     childExecutionId: 'known-child', mode: 'queue_next_turn', content: 'unauthorized', completionPolicy: 'background' }), /outside.*parent lineage/);
+});
+
+test('wait ignores unrelated task commits and detects same-status source identity changes', async () => {
+  const initial = task(1); const f = fixture([initial, task(2)]);
+  const waiting = f.call({ operation: 'wait', answerBridgeId: 'bridge-1', timeoutMs: 5000 });
+  const observe = async count => {
+    for (let tries = 0; tries < 1000 && f.events.observations < count; tries++) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(f.events.observations >= count, `wait observed snapshot ${count}`);
+  };
+  await observe(1);
+  f.replaceTasks([structuredClone(initial), task(2, { label: 'unrelated change' })]);
+  await observe(2);
+  // Drain the snapshot continuation: a false positive would already have settled and unsubscribed.
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(f.events.settlements.length, 0);
+  assert.equal(f.listeners.size, 1);
+  const changed = structuredClone(initial);
+  changed.timeline[1].contentObjectId = 'new-immutable-body-with-same-visible-text';
+  f.replaceTasks([changed, task(2, { label: 'unrelated change' })]);
+  const result = (await waiting).detail;
+  assert.equal(result.changed, true);
+  assert.equal(result.timedOut, false);
+  assert.equal(result.tasks[0].status, 'active');
+  assert.equal(f.listeners.size, 0);
 });

@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import type { SnapshotBarrier } from './contracts';
 import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
@@ -88,7 +87,6 @@ export interface ConversationChildTaskRecord {
   resumable: boolean;
   label: string;
   createdAt: string;
-  revision: string;
   initialTask?: ConversationChildTaskSource;
   currentInputs: ConversationChildTaskSource[];
   queuedInputs: ConversationChildTaskSource[];
@@ -161,7 +159,6 @@ export interface ConversationChildTaskSourceChunk extends Omit<ConversationChild
   textOffset: number;
   totalCharacters: number;
   textComplete: boolean;
-  textSha256: string;
   textFormat: 'text' | 'message_json';
 }
 
@@ -454,10 +451,86 @@ export async function buildConversationChildTaskProjection(
       },
       result: { ...(latestAnswer ? { latestAnswer } : {}), deliveries, handling }
     };
-    tasks.push({ ...task, revision: createHash('sha256').update(JSON.stringify(task)).digest('hex') });
+    tasks.push(task);
   }
   tasks.sort((a, b) => compareText(a.createdAt, b.createdAt) || compareText(a.childExecutionId, b.childExecutionId));
   return { conversationId, snapshotCommitSeq: barrier.snapshotCommitSeq, tasks };
+}
+
+/**
+ * Compare only authoritative metadata and immutable source identities. Bodies are decoded
+ * deterministically from contentObjectId; a legitimate edit has a new source/body identity.
+ * Input lists select timeline members, so their ordered identities suffice after comparing
+ * each timeline source once. The comparison never serializes or reads text/content.
+ */
+export function sameConversationChildTaskState(
+  previous: ConversationChildTaskRecord,
+  current: ConversationChildTaskRecord
+): boolean {
+  return previous.childExecutionId === current.childExecutionId
+    && previous.answerBridgeId === current.answerBridgeId
+    && previous.parentConversationId === current.parentConversationId
+    && previous.conversationId === current.conversationId
+    && previous.depth === current.depth
+    && previous.status === current.status
+    && previous.resumable === current.resumable
+    && previous.label === current.label
+    && previous.createdAt === current.createdAt
+    && sameOrdered(previous.timeline, current.timeline, sameTaskSourceState)
+    && previous.initialTask?.id === current.initialTask?.id
+    && sameOrdered(previous.currentInputs, current.currentInputs, sameTaskSourceId)
+    && sameOrdered(previous.queuedInputs, current.queuedInputs, sameTaskSourceId)
+    && previous.execution.activeTurnId === current.execution.activeTurnId
+    && previous.execution.latestTurnId === current.execution.latestTurnId
+    && sameOptional(previous.execution.termination, current.execution.termination,
+      (a, b) => a.status === b.status && a.reason === b.reason && a.turnId === b.turnId)
+    && sameOptional(previous.result.latestAnswer, current.result.latestAnswer, sameTaskAnswerState)
+    && sameOrdered(previous.result.deliveries, current.result.deliveries, sameTaskDeliveryState)
+    && sameOrdered(previous.result.handling, current.result.handling, sameTaskAnswerHandlingState);
+}
+
+function sameTaskSourceState(a: ConversationChildTaskSource, b: ConversationChildTaskSource): boolean {
+  return a.id === b.id && a.kind === b.kind && a.classification === b.classification
+    && a.state === b.state && a.contentObjectId === b.contentObjectId && a.contentType === b.contentType
+    && a.turnId === b.turnId && a.sourceTurnId === b.sourceTurnId && a.intentId === b.intentId
+    && a.messageId === b.messageId && a.answerId === b.answerId
+    && a.sourceToolCallId === b.sourceToolCallId && a.sourceToolName === b.sourceToolName
+    && a.sequence === b.sequence && a.createdAt === b.createdAt && a.hold === b.hold;
+}
+
+function sameTaskSourceId(a: ConversationChildTaskSource, b: ConversationChildTaskSource): boolean {
+  return a.id === b.id;
+}
+
+function sameTaskAnswerState(a: ConversationChildTaskAnswer, b: ConversationChildTaskAnswer): boolean {
+  return a.answerId === b.answerId && a.turnId === b.turnId && a.revision === b.revision
+    && a.title === b.title && a.contentObjectId === b.contentObjectId && a.interrupted === b.interrupted;
+}
+
+function sameTaskDeliveryState(a: ConversationChildTaskDelivery, b: ConversationChildTaskDelivery): boolean {
+  return a.id === b.id && a.state === b.state && a.phase === b.phase && a.sourceId === b.sourceId
+    && a.targetConversationId === b.targetConversationId && a.targetTurnId === b.targetTurnId
+    && a.wakeState === b.wakeState && a.failureReason === b.failureReason
+    && a.failureReasonText === b.failureReasonText && a.handledAt === b.handledAt;
+}
+
+function sameTaskAnswerHandlingState(a: ConversationChildTaskAnswerHandling, b: ConversationChildTaskAnswerHandling): boolean {
+  return a.answerId === b.answerId && a.via === b.via && a.toolCallId === b.toolCallId
+    && a.contextCommitted === b.contextCommitted && a.deliveryId === b.deliveryId
+    && a.handledAt === b.handledAt && a.wakeState === b.wakeState
+    && a.failureReason === b.failureReason && a.failureReasonText === b.failureReasonText;
+}
+
+function sameOrdered<T>(previous: readonly T[], current: readonly T[], same: (a: T, b: T) => boolean): boolean {
+  if (previous.length !== current.length) return false;
+  for (let index = 0; index < previous.length; index++) {
+    if (!same(previous[index], current[index])) return false;
+  }
+  return true;
+}
+
+function sameOptional<T>(previous: T | undefined, current: T | undefined, same: (a: T, b: T) => boolean): boolean {
+  return previous === undefined || current === undefined ? previous === current : same(previous, current);
 }
 
 class SnapshotContentReader {
@@ -729,7 +802,7 @@ export function readConversationChildTask(
   const upperIndex = upperId ? task.timeline.findIndex(source => source.id === upperId) : -1;
   if (upperId && upperIndex < 0) throw new Error('child_task_cursor_source_missing');
   const timeline = task.timeline.slice(0, upperIndex + 1);
-  const bodies = new Map<string, { text: string; hash: string; format: 'text' | 'message_json' }>();
+  const bodies = new Map<string, { text: string; format: 'text' | 'message_json' }>();
   const bodyFor = (source: ConversationChildTaskSource) => {
     let body = bodies.get(source.id);
     if (!body) { body = sourceBody(source); bodies.set(source.id, body); }
@@ -738,10 +811,12 @@ export function readConversationChildTask(
   let sourceIndex = cursor ? timeline.findIndex(source => source.id === cursor.sourceId) : 0;
   if (sourceIndex < 0) throw new Error('child_task_cursor_source_missing');
   let offset = cursor ? cursorOffset(cursor.offset) : 0;
-  if (cursor && bodyFor(timeline[sourceIndex]).hash !== cursor.sourceHash) throw new Error('child_task_cursor_source_changed');
+  if (cursor && (timeline[sourceIndex].contentObjectId !== cursor.contentObjectId
+    || sourceTextFormat(timeline[sourceIndex]) !== cursor.textFormat)) throw new Error('child_task_cursor_source_changed');
   const firstSource = timeline[sourceIndex];
   const rereadCursor = options.cursor ?? (firstSource ? encodeCursor(projection, query, {
-    upperId, sourceId: firstSource.id, sourceHash: bodyFor(firstSource).hash, offset
+    upperId, sourceId: firstSource.id, contentObjectId: firstSource.contentObjectId,
+    textFormat: sourceTextFormat(firstSource), offset
   }) : undefined);
   const build = (chunks: ConversationChildTaskSourceChunk[], nextIndex: number, nextOffset: number): ConversationChildTaskReadPage => {
     const next = timeline[nextIndex];
@@ -751,7 +826,8 @@ export function readConversationChildTask(
       ...(rereadCursor ? { rereadCursor } : {}),
       sourceCounts: { total: timeline.length, shown: chunks.length, omitted: timeline.length - nextIndex },
       ...(next ? { nextCursor: encodeCursor(projection, query, {
-        upperId, sourceId: next.id, sourceHash: bodyFor(next).hash, offset: nextOffset
+        upperId, sourceId: next.id, contentObjectId: next.contentObjectId,
+        textFormat: sourceTextFormat(next), offset: nextOffset
       }) } : {})
     };
   };
@@ -764,7 +840,7 @@ export function readConversationChildTask(
       const { content: _content, ...identity } = source;
       return { ...identity, text: body.text.slice(offset, end), textOffset: offset,
         totalCharacters: body.text.length, textComplete: end === body.text.length,
-        textSha256: body.hash, textFormat: body.format };
+        textFormat: body.format };
     };
     const fits = (end: number) => estimateJsonTokens(build([...chunks, candidate(end)],
       end === body.text.length ? sourceIndex + 1 : sourceIndex,
@@ -801,10 +877,13 @@ export function childTaskSummary(task: ConversationChildTaskRecord): Conversatio
   };
 }
 
-function sourceBody(source: ConversationChildTaskSource): { text: string; hash: string; format: 'text' | 'message_json' } {
-  const text = source.content === undefined ? source.text : JSON.stringify(source.content);
-  return { text, hash: createHash('sha256').update(text).digest('hex'),
-    format: source.content === undefined ? 'text' : 'message_json' };
+function sourceTextFormat(source: ConversationChildTaskSource): 'text' | 'message_json' {
+  return source.content === undefined ? 'text' : 'message_json';
+}
+
+function sourceBody(source: ConversationChildTaskSource): { text: string; format: 'text' | 'message_json' } {
+  const format = sourceTextFormat(source);
+  return { text: format === 'text' ? source.text : JSON.stringify(source.content), format };
 }
 
 /** Model-facing summary only. Titles are labels; each preview retains a stable read-side source ref. */

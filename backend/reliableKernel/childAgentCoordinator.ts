@@ -64,6 +64,7 @@ import {
   listConversationChildTasks,
   readConversationChildTask,
   childTaskSummary,
+  sameConversationChildTaskState,
   type ConversationChildTaskProjection,
   type ConversationChildTaskRecord
 } from './conversationChildTaskProjection';
@@ -2111,7 +2112,6 @@ export class ReliableChildAgentCoordinator {
       signal?.throwIfAborted();
       let version = observation.version();
       const initial = await read();
-      const initialRevisions = initial.map(task => task.revision).join('\n');
       let observed = initial;
       let changed = false;
       const deadline = Date.now() + timeoutMs;
@@ -2120,7 +2120,7 @@ export class ReliableChildAgentCoordinator {
         signal?.throwIfAborted();
         version = observation.version();
         observed = await read();
-        changed = observed.map(task => task.revision).join('\n') !== initialRevisions;
+        changed = observed.some((task, index) => !sameConversationChildTaskState(initial[index], task));
         if (changed) break;
       }
       signal?.throwIfAborted();

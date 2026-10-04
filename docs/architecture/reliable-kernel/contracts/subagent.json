@@ -76,7 +76,7 @@
     ],
     "answers": "按精确 submission 与 delivery/input 区分答案存在、已注入及已处理，不只查询 AnswerBridge.current_submission_id。",
     "snapshot": "worker 在单个 SQLite 读事务内取得完整作用域事实及不可变正文 identity；事务外按 identity 读 CAS，禁止把多个时刻的查询结果拼成一个快照。",
-    "changeTracking": "不生成整份快照内容指纹；单任务 revision 用于等待变化，read 游标核对正文身份。snapshotCommitSeq 仅诊断，不能声明为跨 Host 全局提交序号。",
+    "changeTracking": "不生成整份快照内容指纹；等待逐项比较单任务元数据与有序来源身份，不读取或序列化正文；read 游标核对来源 id、ContentObject id 与文本表示。snapshotCommitSeq 仅诊断，不能声明为跨 Host 全局提交序号。",
     "freeze": "每个新 ModelRequest 将快照冻结到 recipe 与模型尾部；同 request retry 复用冻结快照，后续请求及压缩后请求重新投影。",
     "cardLimit": 32,
     "counts": "计数覆盖完整查询作用域；状态卡和列表详情的截断必须显式报告，不能用当前页长度代替成员总数。",
@@ -114,7 +114,7 @@
       "rereadCursor": true
     },
     "changesDeliveryState": false,
-    "bodyChunks": "长正文按 textOffset/totalCharacters/textComplete/textSha256/textFormat 分块；游标绑定 scope/query/来源高水位与正文身份，不以可变活动快照强制失效。",
+    "bodyChunks": "长正文按 textOffset/totalCharacters/textComplete/textFormat 分块；游标绑定 scope/query/来源高水位及来源 id、ContentObject id、textFormat，不以可变活动快照强制失效。",
     "rule": "按精确子任务引用读取任务来源、正文及答案；只读不能把 RuntimeDelivery 标记 consumed 或把 InputLink 标记 handled。"
   },
   "lineage": {

@@ -8,7 +8,7 @@ const compiledRoot = process.env.LIMCODE_TEST_EXTENSION_ROOT
   ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT) : path.resolve('dist/extension');
 const {
   buildConversationChildTaskProjection, listConversationChildTasks, readConversationChildTask,
-  childTaskCard, renderConversationChildTaskCard
+  childTaskCard, renderConversationChildTaskCard, sameConversationChildTaskState
 } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationChildTaskProjection.js'));
 const { estimateJsonTokens } = require(path.join(compiledRoot, 'backend/reliableKernel/modelTokenEstimator.js'));
 
@@ -133,7 +133,7 @@ test('初始原文不会被message edit与queued revision覆盖，旧来源明�
   assert.deepEqual(task.currentInputs.map(x => x.text), ['edited current input']);
 });
 
-test('task分页可枚举超过32项，tree显式授权；游标跨活动revision可续页而不跨scope/root', async () => {
+test('task分页可枚举超过32项，tree显式授权；游标跨活动状态变化可续页而不跨scope/root', async () => {
   const f = fixture();
   for (let index = 0; index < 40; index++) f.child(`worker-${String(index).padStart(2, '0')}`, undefined,
     ['active', 'idle', 'closed'][index % 3]);
@@ -148,7 +148,7 @@ test('task分页可枚举超过32项，tree显式授权；游标跨活动revisio
   f.facts.childExecutions[0].status = 'idle';
   const changed = await f.project();
   const firstWorker = projection => projection.tasks.find(task => task.childExecutionId === 'worker-00');
-  assert.notEqual(firstWorker(changed).revision, firstWorker(p).revision);
+  assert.equal(sameConversationChildTaskState(firstWorker(changed), firstWorker(p)), false);
   while (cursor) {
     const page = listConversationChildTasks(changed, { cursor });
     assert.ok(estimateJsonTokens(page) <= 2600);
@@ -225,6 +225,8 @@ test('超长任务跨预算分页可精确拼回；活动变化不使cursor失�
     const chunk = page.timelineSources[0];
     assert.equal(chunk.textOffset, restored.length);
     assert.equal(chunk.totalCharacters, original.length);
+    assert.equal(Object.hasOwn(chunk, 'textSha256'), false);
+    assert.ok(!/[\uD800-\uDBFF]$/.test(chunk.text), 'page never splits a surrogate pair');
     const reread = readConversationChildTask(p, { childExecutionId: 'worker', cursor: page.rereadCursor });
     assert.equal(reread.timelineSources[0].textOffset, chunk.textOffset);
     assert.equal(reread.timelineSources[0].text,
@@ -234,21 +236,22 @@ test('超长任务跨预算分页可精确拼回；活动变化不使cursor失�
   } while (cursor);
   assert.ok(pages > 5); assert.equal(restored, original);
   const first = readConversationChildTask(p, { childExecutionId: 'worker' });
-  const changed = { ...p, tasks: [{ ...p.tasks[0], timeline: [{ ...p.tasks[0].timeline[0], text: 'changed immutable body' }] }] };
+  const changed = { ...p, tasks: [{ ...p.tasks[0], timeline: [{ ...p.tasks[0].timeline[0], contentObjectId: 'replacement-body' }] }] };
   assert.throws(() => readConversationChildTask(changed, { childExecutionId: 'worker', cursor: first.nextCursor }), /source_changed/);
 });
 
-test('同名不同任务不合并，current和queue变化改变单task revision；closed bridge不能续接', async () => {
+test('同名不同任务不合并，current和queue变化改变单task状态；closed bridge不能续接', async () => {
   const f = fixture(); f.child('worker'); f.child('other');
   f.message('first', 'different A'); f.message('second', 'different B', { worker: 'other' });
   const first = await f.project();
   assert.equal(first.tasks.length, 2); assert.equal(new Set(first.tasks.map(x => x.label)).size, 1);
   assert.deepEqual(new Set(first.tasks.map(x => x.initialTask.text)), new Set(['different A', 'different B']));
-  const priorRevision = first.tasks.find(x => x.childExecutionId === 'worker').revision;
+  const previous = first.tasks.find(x => x.childExecutionId === 'worker');
+  assert.equal(Object.hasOwn(previous, 'revision'), false);
   f.message('follow-up', 'a second input', { sequence: 2 });
   f.facts.answerBridges.find(x => x.child_execution_id === 'worker').status = 'closed';
   const changed = (await f.project()).tasks.find(x => x.childExecutionId === 'worker');
-  assert.notEqual(changed.revision, priorRevision); assert.equal(changed.resumable, false);
+  assert.equal(sameConversationChildTaskState(previous, changed), false); assert.equal(changed.resumable, false);
 });
 
 test('foreground答案仅有artifact或outcome时交付未知，模型结果与Context提交分别提供证据', async () => {
@@ -313,4 +316,96 @@ test('同毫秒不同Turn以turn_seq判最新；runtime maintenance继承最近�
   assert.equal(task.execution.termination, undefined);
   assert.deepEqual(task.currentInputs.map(x => x.text), ['latest business task']);
   assert.equal(task.currentInputs[0].turnId, 'zzz-followup');
+});
+
+test('task state comparison covers every metadata field, ordered membership and optional result', async () => {
+  const f = fixture(); f.child(); f.message('first', 'same visible text'); f.message('second', 'same visible text', { sequence: 2 });
+  const previous = (await f.project()).tasks[0];
+  previous.queuedInputs = [...previous.timeline];
+  previous.execution.termination = { status: 'completed', reason: 'done', turnId: 'worker-turn' };
+  previous.result.latestAnswer = { answerId: 'answer', turnId: 'worker-turn', revision: '1', title: 'answer title',
+    contentObjectId: 'answer-body', text: 'answer body', interrupted: false };
+  previous.result.deliveries = ['one', 'two'].map(id => ({ id, state: 'consumed', phase: 'next_turn', sourceId: 'answer',
+    targetConversationId: 'root', targetTurnId: 'root-turn', wakeState: 'pending', failureReason: 'reason',
+    failureReasonText: 'readable reason', handledAt: NOW }));
+  previous.result.handling = ['one', 'two'].map(id => ({ answerId: id, via: 'runtime_delivery', toolCallId: 'tool-call',
+    contextCommitted: true, deliveryId: id, handledAt: NOW, wakeState: 'pending', failureReason: 'reason', failureReasonText: 'readable reason' }));
+  const groups = [
+    [value => value, ['childExecutionId', 'answerBridgeId', 'parentConversationId', 'conversationId', 'depth', 'status', 'resumable', 'label', 'createdAt']],
+    [value => value.timeline[0], ['id', 'kind', 'classification', 'state', 'contentObjectId', 'contentType', 'turnId', 'sourceTurnId',
+      'intentId', 'messageId', 'answerId', 'sourceToolCallId', 'sourceToolName', 'sequence', 'createdAt', 'hold']],
+    [value => value.execution, ['activeTurnId', 'latestTurnId']],
+    [value => value.execution.termination, ['status', 'reason', 'turnId']],
+    [value => value.result.latestAnswer, ['answerId', 'turnId', 'revision', 'title', 'contentObjectId', 'interrupted']],
+    [value => value.result.deliveries[0], ['id', 'state', 'phase', 'sourceId', 'targetConversationId', 'targetTurnId', 'wakeState',
+      'failureReason', 'failureReasonText', 'handledAt']],
+    [value => value.result.handling[0], ['answerId', 'via', 'toolCallId', 'contextCommitted', 'deliveryId', 'handledAt', 'wakeState',
+      'failureReason', 'failureReasonText']]
+  ];
+  assert.equal(sameConversationChildTaskState(previous, structuredClone(previous)), true);
+  for (const [select, fields] of groups) for (const key of fields) {
+    const current = structuredClone(previous); const object = select(current); const before = object[key];
+    object[key] = typeof before === 'boolean' ? !before : typeof before === 'number' ? before + 1 : `${before ?? ''}-changed`;
+    assert.equal(sameConversationChildTaskState(previous, current), false, `changed ${key}`);
+    assert.equal(sameConversationChildTaskState(current, previous), false, `changed ${key}, reverse comparison`);
+  }
+  for (const select of [value => value.timeline, value => value.currentInputs, value => value.queuedInputs,
+    value => value.result.deliveries, value => value.result.handling]) {
+    const reordered = structuredClone(previous); select(reordered).reverse();
+    assert.equal(sameConversationChildTaskState(previous, reordered), false, 'ordered membership');
+    const removed = structuredClone(previous); select(removed).pop();
+    assert.equal(sameConversationChildTaskState(previous, removed), false, 'removed membership');
+  }
+  for (const remove of [value => { delete value.initialTask; }, value => { delete value.execution.termination; },
+    value => { delete value.result.latestAnswer; }, value => { value.initialTask = value.timeline[1]; }]) {
+    const current = structuredClone(previous); remove(current);
+    assert.equal(sameConversationChildTaskState(previous, current), false, 'optional object presence or initial source identity');
+  }
+  const absent = structuredClone(previous); const undefinedValue = structuredClone(previous);
+  undefinedValue.timeline[0].hold = undefined;
+  assert.equal(sameConversationChildTaskState(absent, undefinedValue), true);
+});
+
+test('repeated task state comparison never reads bodies and compares timeline metadata only once', async () => {
+  const f = fixture(); f.child(); f.message('initial', 'large immutable body'.repeat(60000));
+  const previous = (await f.project()).tasks[0];
+  previous.queuedInputs = [...previous.timeline];
+  previous.result.latestAnswer = { answerId: 'answer', turnId: 'worker-turn', revision: '1',
+    contentObjectId: 'answer-body', text: previous.initialTask.text, interrupted: false };
+  const current = structuredClone(previous);
+  let identityReads = 0;
+  for (const task of [previous, current]) {
+    const source = task.timeline[0]; const contentObjectId = source.contentObjectId;
+    Object.defineProperty(source, 'contentObjectId', { get() { identityReads++; return contentObjectId; } });
+    for (const field of ['text', 'content']) Object.defineProperty(source, field, {
+      get() { assert.fail(`poll comparison read source ${field}`); }
+    });
+    Object.defineProperty(task.result.latestAnswer, 'text', { get() { assert.fail('poll comparison read answer text'); } });
+  }
+  for (let index = 0; index < 3; index++) assert.equal(sameConversationChildTaskState(previous, current), true);
+  assert.equal(identityReads, 6, 'once per side per comparison despite initial/current/queue aliases');
+});
+
+test('read cursor binds source, immutable content and representation; obsolete or missing sources fail closed', async () => {
+  const f = fixture(); f.child(); f.message('initial', 'same visible text');
+  const p = await f.project();
+  const page = readConversationChildTask(p, { childExecutionId: 'worker' });
+  const cursor = JSON.parse(Buffer.from(page.rereadCursor, 'base64url').toString('utf8'));
+  assert.equal(cursor.sourceId, p.tasks[0].timeline[0].id);
+  assert.equal(cursor.contentObjectId, p.tasks[0].timeline[0].contentObjectId);
+  assert.equal(cursor.textFormat, 'text');
+  assert.equal(Object.hasOwn(cursor, 'sourceHash'), false);
+  const read = projection => readConversationChildTask(projection, { childExecutionId: 'worker', cursor: page.rereadCursor });
+  for (const replacement of [{ contentObjectId: 'new-identity-with-same-text' }, { content: { parts: [{ text: 'same visible text' }] } }]) {
+    const changed = structuredClone(p); Object.assign(changed.tasks[0].timeline[0], replacement);
+    assert.throws(() => read(changed), /source_changed/);
+  }
+  const missing = structuredClone(p); missing.tasks[0].timeline = [];
+  assert.throws(() => read(missing), /source_missing/);
+  const obsolete = { ...cursor, sourceHash: 'old-full-text-digest' }; delete obsolete.contentObjectId; delete obsolete.textFormat;
+  assert.throws(() => readConversationChildTask(p, { childExecutionId: 'worker',
+    cursor: Buffer.from(JSON.stringify(obsolete)).toString('base64url') }), /source_changed/);
+  const tooFar = { ...cursor, offset: 1000 };
+  assert.throws(() => readConversationChildTask(p, { childExecutionId: 'worker',
+    cursor: Buffer.from(JSON.stringify(tooFar)).toString('base64url') }), /offset_invalid/);
 });

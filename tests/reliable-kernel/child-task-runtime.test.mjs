@@ -3,7 +3,6 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { createHash } from 'node:crypto';
 import { after, test } from 'node:test';
 
 const require = createRequire(import.meta.url);
@@ -230,7 +229,7 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
   let release;
   const gate = new Promise(resolve => { release = resolve; });
   let phase = 'spawn', spawnRound = 0, inspectRound = 0, alphaConversation, alphaRef, currentStarted = false;
-  let retryRequest, retryWire, retryRecipe, firstInspection, expectedReadCursor;
+  let retryRequest, retryWire, retryRecipe, firstInspection, expectedReadCursor, expectedReadSources;
   let readPages = 0;
   const readSources = new Map();
   const refs = new Map();
@@ -302,19 +301,25 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
           readPages += 1;
           assert.ok(readPages <= 20, 'bounded source paging must make forward progress');
           assert.ok(read.timelineSources.length > 0, 'a continuation page cannot silently omit the source body');
+          expectedReadSources ??= new Map((await f.projection()).tasks.find(task => task.conversationId === alphaConversation)
+            .timeline.map(source => [source.id, source]));
           for (const chunk of read.timelineSources) {
-            const source = readSources.get(chunk.id) ?? { text: '', hash: chunk.textSha256, total: chunk.totalCharacters,
+            const source = readSources.get(chunk.id) ?? { text: '', contentObjectId: chunk.contentObjectId, total: chunk.totalCharacters,
               format: chunk.textFormat, complete: false };
             assert.equal(chunk.textOffset, source.text.length, 'source chunks have no gaps or overlaps');
-            assert.equal(chunk.textSha256, source.hash, 'one source retains one full-body digest across pages');
+            assert.equal(chunk.contentObjectId, source.contentObjectId, 'one source retains its immutable body identity across pages');
+            assert.equal(chunk.textFormat, source.format, 'one source retains its representation across pages');
+            assert.equal(Object.hasOwn(chunk, 'textSha256'), false);
             assert.equal(chunk.totalCharacters, source.total);
-            assert.equal(chunk.textFormat, source.format);
             assert.equal(source.complete, false, 'a completed source must not reappear on the next page');
             source.text += chunk.text;
             source.complete = chunk.textComplete;
             if (source.complete) {
               assert.equal(source.text.length, source.total, 'source paging restores every character');
-              assert.equal(createHash('sha256').update(source.text).digest('hex'), source.hash,
+              const expected = expectedReadSources.get(chunk.id);
+              assert.ok(expected, 'paged source belongs to the committed timeline');
+              assert.equal(source.contentObjectId, expected.contentObjectId);
+              assert.equal(source.text, expected.content === undefined ? expected.text : JSON.stringify(expected.content),
                 'source paging restores the exact body, including text beyond the ordinary tool-result cap');
             }
             readSources.set(chunk.id, source);

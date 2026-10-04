@@ -12,7 +12,7 @@
 
 ## 派发清单与读取边界
 
-`list` 默认列当前会话的直接子任务，显式 `scope=tree` 才展开后代。计数描述完整作用域，分页结果不得冒充全部成员；被状态卡 32 条上限省略的成员仍能通过分页查询。`read` 根据已知引用读取具体任务和答案，`wait` 根据已知引用等待状态变化；等待支持单个 `childRef` 或 `childRefs` 集合，不能省略目标后自行新建任务。列表和详细读取默认每页 32 条、最多 100 条，等待最多接收 32 个引用。查询和等待不创建子任务、不改交付状态，也不把一次读取标记为父执行器已处理。list/read 另有 2600 token 页预算，实际返回数量可以少于 limit。read 的单份长正文按 textOffset/totalCharacters/textComplete/textSha256/textFormat 分块，nextCursor 继续，rereadCursor 重读本页起点。结构化 MessageContent 使用 message_json 保存附件引用。活动状态变化不使游标失效；作用域、查询条件、来源正文身份发生冲突则明确拒绝。并行工具批次再次裁剪结果时必须保留本页重读游标，不能直接跳到下一页丢掉正文。
+`list` 默认列当前会话的直接子任务，显式 `scope=tree` 才展开后代。计数描述完整作用域，分页结果不得冒充全部成员；被状态卡 32 条上限省略的成员仍能通过分页查询。`read` 根据已知引用读取具体任务和答案，`wait` 根据已知引用等待状态变化；等待支持单个 `childRef` 或 `childRefs` 集合，不能省略目标后自行新建任务。列表和详细读取默认每页 32 条、最多 100 条，等待最多接收 32 个引用。查询和等待不创建子任务、不改交付状态，也不把一次读取标记为父执行器已处理。list/read 另有 2600 token 页预算，实际返回数量可以少于 limit。read 的单份长正文按 textOffset/totalCharacters/textComplete/textFormat 分块，nextCursor 继续，rereadCursor 重读本页起点。结构化 MessageContent 使用 message_json 保存附件引用。活动状态变化不使游标失效；作用域、查询条件、来源正文身份发生冲突则明确拒绝。并行工具批次再次裁剪结果时必须保留本页重读游标，不能直接跳到下一页丢掉正文。
 
 `list/read/wait` 可显式读取真实后代树；`send/interrupt_subtree` 只操作当前会话的直接子任务，不能拿可见的孙级引用绕过中间父任务。所有操作先核对调用 ToolCall 属于当前 Turn，再核对当前 Conversation 的父链作用域。
 
@@ -24,7 +24,7 @@
 
 ## 快照、恢复与重复派发
 
-每个新 ModelRequest 在 worker 的同一 SQLite 读事务内取得作用域和相关事实，再以不可变 CAS identity 读取正文并冻结到 recipe。尾部状态卡和模型短引用使用这份快照；同一 ModelRequest 的重试复用其冻结 recipe，后续新请求重新投影，因此压缩后不依赖摘要是否记住派发记录。整份快照不携带内容指纹；单任务 revision 继续用于等待变化，read 游标继续核对正文身份。`snapshotCommitSeq` 只用于诊断，不能当成跨 Host 全局提交序号。
+每个新 ModelRequest 在 worker 的同一 SQLite 读事务内取得作用域和相关事实，再以不可变 CAS identity 读取正文并冻结到 recipe。尾部状态卡和模型短引用使用这份快照；同一 ModelRequest 的重试复用其冻结 recipe，后续新请求重新投影，因此压缩后不依赖摘要是否记住派发记录。整份快照不携带内容指纹；等待变化逐项比较单任务元数据与有序来源身份，不读取或序列化正文；read 游标核对来源 id、ContentObject id 与文本表示。`snapshotCommitSeq` 只用于诊断，不能当成跨 Host 全局提交序号。
 
 跨 Host 的清单读取共享 Runtime 数据，不依赖本进程的活动 Promise 集合。观察到另一 Host 正在驱动子任务时，仍应显示真实运行状态；发送、中断和恢复继续遵守现有 Conversation ownership 与 ExecutionLease，不通过清单绕开执行权边界。
 
