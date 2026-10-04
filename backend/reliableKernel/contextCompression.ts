@@ -200,21 +200,14 @@ export class ContextCompressionControlPlane {
     const title = requireText(command.title, 'title');
     const summary = normalizeCompressionSummary(command.summary, command.summaryMetadata);
     const requestedSourceCount = requirePositiveCount(command.compressSegmentCount);
-    const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
-    const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
     const observationPlans = normalizeAttachmentObservationCommits(command.attachmentObservations ?? []).map((observation) => {
       const content = attachmentObservationDocumentContent(observation.document);
       return {
         observation,
         content,
-        identity: this.contentStore.identity(content, ATTACHMENT_OBSERVATION_CONTENT_TYPE),
         linkId: attachmentObservationLinkId(observation.attachmentId, observation.analysisProfileSha256)
       };
     });
-    const expectedObservations = observationPlans.map((plan) => ({
-      linkId: plan.linkId,
-      contentObjectId: plan.identity.id
-    }));
     const blockId = compressionBlockIdFor(conversationId, headRootId, idempotencyKey);
     const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
@@ -229,12 +222,15 @@ export class ContextCompressionControlPlane {
         projectionId,
         conversationId,
         authoritySnapshotId,
-        titleObjectId: titleIdentity.id,
-        summaryObjectId: summaryIdentity.id,
+        titleObjectId: this.contentStore.identity(title, CONTENT_TYPE_TITLE).id,
+        summaryObjectId: this.contentStore.identity(summary.content, summary.contentType).id,
         projectionRootId: headRootId,
         projectionPurpose: 'compression-source',
         sourceCount: requestedSourceCount,
-        expectedObservations
+        expectedObservations: observationPlans.map((plan) => ({
+          linkId: plan.linkId,
+          contentObjectId: this.contentStore.identity(plan.content, ATTACHMENT_OBSERVATION_CONTENT_TYPE).id
+        }))
       });
     }
     const [materialized, semanticMaterialized] = await Promise.all([
@@ -379,12 +375,15 @@ export class ContextCompressionControlPlane {
         projectionId,
         conversationId,
         authoritySnapshotId,
-        titleObjectId: titleIdentity.id,
-        summaryObjectId: summaryIdentity.id,
+        titleObjectId: titleContent.metadata.id,
+        summaryObjectId: summaryContent.metadata.id,
         projectionRootId: headRootId,
         projectionPurpose: 'compression-source',
         sourceCount: compressCount,
-        expectedObservations
+        expectedObservations: observationPlans.map((plan, index) => ({
+          linkId: plan.linkId,
+          contentObjectId: observationContents[index].metadata.id
+        }))
       });
     }
   }
@@ -397,8 +396,6 @@ export class ContextCompressionControlPlane {
     const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
     const title = requireText(command.title, 'title');
     const summary = normalizeCompressionSummary(command.summary);
-    const titleIdentity = this.contentStore.identity(title, CONTENT_TYPE_TITLE);
-    const summaryIdentity = this.contentStore.identity(summary.content, summary.contentType);
     const blockId = stableId('compression_replacement', previousBlockId, idempotencyKey);
     const summarySegmentId = compressionSegmentIdFor(blockId);
     const summaryNodeId = contextSequenceNodeId(null, summarySegmentId);
@@ -428,8 +425,8 @@ export class ContextCompressionControlPlane {
         projectionId,
         conversationId,
         authoritySnapshotId,
-        titleObjectId: titleIdentity.id,
-        summaryObjectId: summaryIdentity.id,
+        titleObjectId: this.contentStore.identity(title, CONTENT_TYPE_TITLE).id,
+        summaryObjectId: this.contentStore.identity(summary.content, summary.contentType).id,
         projectionRootId: requireId(projection.root_id, 'ModelContextProjection.root_id'),
         projectionPurpose,
         sourceCount: sourceRows.length,
@@ -566,8 +563,8 @@ export class ContextCompressionControlPlane {
         projectionId,
         conversationId,
         authoritySnapshotId,
-        titleObjectId: titleIdentity.id,
-        summaryObjectId: summaryIdentity.id,
+        titleObjectId: titleContent.metadata.id,
+        summaryObjectId: summaryContent.metadata.id,
         projectionRootId: requireId(projection.root_id, 'ModelContextProjection.root_id'),
         projectionPurpose,
         sourceCount: sourceRows.length,

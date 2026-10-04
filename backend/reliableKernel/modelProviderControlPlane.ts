@@ -25,7 +25,6 @@ import {
 } from './conversationAttachmentHandles';
 import {
   ContentAddressedStore,
-  type ContentObjectIdentity,
   type ContentObjectMetadata
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
@@ -581,7 +580,7 @@ interface CreationIdentity {
   compressionThresholdTokens: number;
   estimatedContextTokens: number;
   settingsSnapshotContentObjectId: string | null;
-  recipeIdentity: ContentObjectIdentity;
+  recipeObjectId: string;
 }
 
 const CONTENT_TYPE_RECIPE = 'application/vnd.limcode.model-request-recipe+json';
@@ -713,7 +712,6 @@ export class ModelProviderControlPlane {
       : requireId(command.settingsSnapshotContentObjectId, 'settingsSnapshotContentObjectId');
     const recipe = normalizeModelRequestRecipe(command.recipe, 'ModelRequest recipe');
     const recipeBytes = canonicalPlainJson(recipe, 'ModelRequest recipe');
-    const recipeIdentity = this.contentStore.identity(recipeBytes, CONTENT_TYPE_RECIPE);
     const modelRequestId = modelRequestIdFor(turnId, idempotencyKey);
     const projectionId = stableId('model_request_projection', modelRequestId);
     const operationId = stableId('model_request_operation', modelRequestId);
@@ -767,15 +765,17 @@ export class ModelProviderControlPlane {
             ? 0
             : estimateRequestAuthorityTokens(frozen.document, recipe))
         ));
-    const identity: CreationIdentity = {
+    const identity = {
       ...identityBase,
       estimatedContextTokens: contextEstimate,
-      settingsSnapshotContentObjectId,
-      recipeIdentity
+      settingsSnapshotContentObjectId
     };
     const existing = await this.getOptional('ModelRequest', modelRequestId);
     if (existing) {
-      return this.replayCreation(existing, modelRequestId, projectionId, operationId, attemptId, identity);
+      return this.replayCreation(existing, modelRequestId, projectionId, operationId, attemptId, {
+        ...identity,
+        recipeObjectId: this.contentStore.identity(recipeBytes, CONTENT_TYPE_RECIPE).id
+      });
     }
     const recipeContent = await this.contentStore.prepare(this.database, recipeBytes, CONTENT_TYPE_RECIPE);
     const now = this.timestamp();
@@ -861,7 +861,10 @@ export class ModelProviderControlPlane {
       if (!isRecoverableProviderRace(error)) throw error;
       const raced = await this.getOptional('ModelRequest', modelRequestId);
       if (!raced) throw error;
-      return this.replayCreation(raced, modelRequestId, projectionId, operationId, attemptId, identity);
+      return this.replayCreation(raced, modelRequestId, projectionId, operationId, attemptId, {
+        ...identity,
+        recipeObjectId: recipeContent.metadata.id
+      });
     }
   }
 
@@ -2104,14 +2107,14 @@ export class ModelProviderControlPlane {
       socketGeneration.toString(),
       event.streamSeq.toString()
     );
-    const checkpointBytes = canonicalPlainJson({
+    // Callers normalize/copy the event before entering here; ignored events need no serialization.
+    const checkpointBytes = () => canonicalPlainJson({
       kind: event.envelopeKind,
       streamSeq: event.streamSeq.toString(),
       content: event.content,
       ...(event.usage !== undefined ? { usage: event.usage } : {}),
       ...(event.timing !== undefined ? { timing: event.timing } : {})
     });
-    const checkpointIdentity = this.contentStore.identity(checkpointBytes, CONTENT_TYPE_CHECKPOINT);
     const preflight = await this.database.snapshot([
       DOMAIN_REPOSITORIES.domain('ModelRequest').get(modelRequestId),
       DOMAIN_REPOSITORIES.domain('ModelStreamFence').list({ where: { model_request_id: modelRequestId }, limit: 1 }),
@@ -2131,7 +2134,7 @@ export class ModelProviderControlPlane {
         socketGeneration,
         streamSeq: event.streamSeq,
         checkpointKind,
-        contentObjectId: checkpointIdentity.id
+        contentObjectId: this.contentStore.identity(checkpointBytes(), CONTENT_TYPE_CHECKPOINT).id
       });
       return finish({
         accepted: false,
@@ -2181,7 +2184,7 @@ export class ModelProviderControlPlane {
       });
     }
     options.beforeSubmit?.();
-    const content = await this.contentStore.prepare(this.database, checkpointBytes, CONTENT_TYPE_CHECKPOINT);
+    const content = await this.contentStore.prepare(this.database, checkpointBytes(), CONTENT_TYPE_CHECKPOINT);
     options.beforeSubmit?.();
     const result = await this.database.commitModelStreamEvent({
       modelRequestId,
@@ -2878,7 +2881,7 @@ export class ModelProviderControlPlane {
       && request.compression_threshold_tokens === BigInt(expected.compressionThresholdTokens)
       && request.estimated_context_tokens === BigInt(expected.estimatedContextTokens)
       && (request.settings_snapshot_object_id ?? null) === expected.settingsSnapshotContentObjectId
-      && request.recipe_object_id === expected.recipeIdentity.id
+      && request.recipe_object_id === expected.recipeObjectId
       && projection.owner_kind === 'model_request'
       && projection.owner_id === modelRequestId
       && projection.root_id === expected.contextRootId

@@ -56,24 +56,27 @@ export class TurnOutputControlPlane {
     if (contextDisposition !== 'append' && contextDisposition !== 'exclude') {
       throw new TypeError(`Unsupported assistant output Context disposition: ${String(contextDisposition)}`);
     }
+    // Freeze mutable caller bytes before reads; replay and publication must prove the same content.
+    const outputContent = typeof input.content === 'string' ? input.content : new Uint8Array(input.content);
     const ids = outputIds(turnId, sourceKey);
-    const identity = this.contentStore.identity(input.content, contentType);
     const modelRequest = await this.requireExisting('ModelRequest', modelRequestId);
     if (modelRequest.turn_id !== turnId) throw new Error('ModelRequest belongs to another Turn.');
     const existing = await this.maybeGet('Message', ids.messageId);
-    if (existing) return this.replay(ids, identity.id, modelRequestId);
+    if (existing) {
+      return this.replay(ids, this.contentStore.identity(outputContent, contentType).id, modelRequestId);
+    }
 
     const turn = await this.requireExisting('Turn', turnId);
     if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
-    const content = await this.contentStore.prepare(this.database, input.content, contentType);
+    const content = await this.contentStore.prepare(this.database, outputContent, contentType);
     const currentHeadRootId = await this.context.currentHeadRootId(conversationId);
     if (!currentHeadRootId) throw new Error(`Conversation ${conversationId} has no Context head before assistant output commit.`);
     let contextSteps: RepositoryTransactionStep[] = [];
     if (contextDisposition === 'append') {
-      const contentEstimatedTokens = estimateStoredMessageContentTokens(input.content, contentType);
+      const contentEstimatedTokens = estimateStoredMessageContentTokens(outputContent, contentType);
       const projections = await this.list('ModelContextProjection', {
         owner_kind: 'model_request', owner_id: modelRequestId
       }, 2);
@@ -162,7 +165,7 @@ export class TurnOutputControlPlane {
       };
     } catch (error) {
       if (!isUniqueOrAssertionFailure(error) || !await this.maybeGet('Message', ids.messageId)) throw error;
-      return this.replay(ids, identity.id, modelRequestId);
+      return this.replay(ids, content.metadata.id, modelRequestId);
     }
   }
 
@@ -197,19 +200,21 @@ export class TurnOutputControlPlane {
     if (contextDisposition !== 'append' && contextDisposition !== 'exclude') {
       throw new TypeError(`Unsupported assistant output Context disposition: ${String(contextDisposition)}`);
     }
+    // Freeze mutable caller bytes before reads; replay and publication must prove the same content.
+    const outputContent = typeof input.content === 'string' ? input.content : new Uint8Array(input.content);
+    const cumulativeOutputContent = typeof input.cumulativeContent === 'string'
+      ? input.cumulativeContent : new Uint8Array(input.cumulativeContent);
     const ids = outputIds(turnId, modelRequestId);
     const revisionId = nativeItemRevisionId(turnId, modelRequestId, itemKey);
     const cumulativeRevisionId = nativeCumulativeRevisionId(turnId, modelRequestId, itemKey);
-    const identity = this.contentStore.identity(input.content, contentType);
-    const cumulativeIdentity = this.contentStore.identity(input.cumulativeContent, contentType);
     const existingRevision = await this.maybeGet('MessageRevision', revisionId);
     if (existingRevision) {
       return this.replayNativeAssistantItem(
         ids,
         revisionId,
         cumulativeRevisionId,
-        identity.id,
-        cumulativeIdentity.id,
+        this.contentStore.identity(outputContent, contentType).id,
+        this.contentStore.identity(cumulativeOutputContent, contentType).id,
         itemKey
       );
     }
@@ -220,12 +225,12 @@ export class TurnOutputControlPlane {
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
-    const content = await this.contentStore.prepare(this.database, input.content, contentType);
-    const cumulativeContent = await this.contentStore.prepare(this.database, input.cumulativeContent, contentType);
+    const content = await this.contentStore.prepare(this.database, outputContent, contentType);
+    const cumulativeContent = await this.contentStore.prepare(this.database, cumulativeOutputContent, contentType);
     const existingMessage = await this.maybeGet('Message', ids.messageId);
     let contextSteps: RepositoryTransactionStep[] = [];
     if (contextDisposition === 'append') {
-      const contentEstimatedTokens = estimateStoredMessageContentTokens(input.content, contentType);
+      const contentEstimatedTokens = estimateStoredMessageContentTokens(outputContent, contentType);
       const context = await this.context.prepareMessageAppendMutation({
         conversationId,
         messageRevisionId: revisionId,
@@ -353,8 +358,8 @@ export class TurnOutputControlPlane {
         ids,
         revisionId,
         cumulativeRevisionId,
-        identity.id,
-        cumulativeIdentity.id,
+        content.metadata.id,
+        cumulativeContent.metadata.id,
         itemKey
       );
     }
@@ -406,6 +411,8 @@ export class TurnOutputControlPlane {
   }): Promise<AssistantMessageCommit> {
     const turnId = requireId(input.turnId, 'turnId');
     const modelRequestId = requireId(input.modelRequestId, 'modelRequestId');
+    // Freeze mutable caller bytes before reads; replay and publication must prove the same content.
+    const outputContent = typeof input.content === 'string' ? input.content : new Uint8Array(input.content);
     const ids = outputIds(turnId, modelRequestId);
     const existingMessage = await this.maybeGet('Message', ids.messageId);
     if (!existingMessage) {
@@ -413,23 +420,22 @@ export class TurnOutputControlPlane {
         turnId,
         modelRequestId,
         sourceKey: modelRequestId,
-        content: input.content,
+        content: outputContent,
         ...(input.contentType ? { contentType: input.contentType } : {})
       });
     }
     const contentType = requireText(input.contentType ?? 'application/vnd.limcode.message+json', 'contentType');
-    const identity = this.contentStore.identity(input.content, contentType);
     const existingRevision = await this.maybeGet('MessageRevision', ids.revisionId);
     if (existingRevision) {
-      return this.replay(ids, identity.id, modelRequestId);
+      return this.replay(ids, this.contentStore.identity(outputContent, contentType).id, modelRequestId);
     }
-    await this.assertNativeAggregateItemsEnteredContext(turnId, modelRequestId, ids.messageId, input.content);
+    await this.assertNativeAggregateItemsEnteredContext(turnId, modelRequestId, ids.messageId, outputContent);
     const turn = await this.requireExisting('Turn', turnId);
     if (turn.status !== 'active') throw new Error(`Turn ${turnId} is not active.`);
     const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const leaseRows = await this.list('ExecutionLease', { turn_id: turnId }, 2);
     if (leaseRows.length !== 1) throw new Error(`Active Turn ${turnId} must have exactly one ExecutionLease.`);
-    const content = await this.contentStore.prepare(this.database, input.content, contentType);
+    const content = await this.contentStore.prepare(this.database, outputContent, contentType);
     const now = requireText(this.now(), 'clock result');
     try {
       const committed = await this.database.transaction([
@@ -476,7 +482,7 @@ export class TurnOutputControlPlane {
       };
     } catch (error) {
       if (!isUniqueOrAssertionFailure(error) || !await this.maybeGet('MessageRevision', ids.revisionId)) throw error;
-      return this.replay(ids, identity.id, modelRequestId);
+      return this.replay(ids, content.metadata.id, modelRequestId);
     }
   }
 
