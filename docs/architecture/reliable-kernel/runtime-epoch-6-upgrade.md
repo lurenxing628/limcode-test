@@ -13,7 +13,7 @@ Epoch 5 已公开发布，不能作为未发布格式原地补表。以下发布
 
 ## 唯一的新边界
 
-当前 epoch 为 6，在原有 107 领域之后新增 RuntimeDeliveryTimelineLink、CollaborationSendTimelineLink 和 TimelineImportProvenance 三张独立 insert-only 关系表。升级先创建空表，仅按不可变 Context append 链身份、父节点关系与相邻物理 Message 成员证明历史输入的位置；不能证明的输入、历史发送及 notify-only 不写位置。绝不从 created_at、updated_at 或跨对象排序猜测旧消息的收发顺序。既有领域记录、CAS、附件和旧表/index/trigger 原地保留。
+当前 epoch 为 6，在原有 107 领域之后新增 RuntimeDeliveryTimelineLink、CollaborationSendTimelineLink 、TimelineImportProvenance 和 RuntimeDeliveryAnswerPresentation 四张独立 insert-only 关系表。升级先创建空表，仅按不可变 Context append 链身份、父节点关系与相邻物理 Message 成员证明历史输入的位置；不能证明的输入、历史发送及 notify-only 不写位置。绝不从 created_at、updated_at 或跨对象排序猜测旧消息的收发顺序。既有领域记录、CAS、附件和旧表/index/trigger 原地保留。
 
 来源只接受：精确 epoch 3 的两个已发布 manifest、完整 epoch 4、严格缺 RuntimeDeliveryIntentLink 的已知 epoch-4 前驱、完整 epoch 5。其余缺表、DDL、manifest、RootBinding、完整性错误一律拒绝；不存在通用 migration fallback。未开始的 3/4 可以直接升级到 6，原 bounded Child continuation 转换仍只用于原来的两个适用前驱。
 
@@ -35,3 +35,11 @@ Epoch 5 已公开发布，不能作为未发布格式原地补表。以下发布
 ## 验证入口
 
 `tests/reliable-kernel/runtime-epoch-upgrade-preservation.test.mjs` 覆盖 3/4/5 正常保留、五个当前故障点、旧 3→4 与 3/4→5 各持久边界、epoch-5 全旧域记录与物理对象不变、空 timeline 关系，以及 DDL/manifest/backup/binding 漂移拒绝。实际运行须使用仓库构建后测试入口；仅源码检查不等于已运行测试。
+
+## 已接收的子任务结果
+
+RuntimeDeliveryAnswerPresentation 按 delivery_id 唯一，独立归属于接收方 Conversation。它只存软历史身份、每个最多 240 UTF-8 字节的标题预览、已证明的 outcome 和既有 CAS 引用；不存正文，也不把来源删除状态持久化。新输入使用接收事务已经核验过的有效 PendingTurnInput 正文，notify-only 使用精确 Inbox 正文；删除通知绝不退回原答案。正文按请求分页读取，历史 Context 的嵌套字符串与 MessageContent 的可见文本均流式解码。
+
+历史回填在原离线备份/日志保护及单一 SQLite 发布事务内按 250 行窗口推进，每行/每个有界 CAS 块让出执行，支持取消。输入只从已提交 Context occurrence 的不可变 envelope 读取身份和正文；不相信旧版追加/ACK 间隙可能已被替换的 PendingTurnInput。notify-only 没有原始 outcome 证明时明确为 unknown。原任务身份/标题仅取自核验过的不可变 spawn 请求；可选请求超过 1 MiB 时保留未知，不为预览读取整个大提示词。独立表示事实可以没有时间线坐标，不能借回填元数据发明先后顺序。
+
+快照和历史页只按索引加入当前卡片及其 canonical 已接收尝试的标量事实，不读取正文。派生的 peer liveness 受快照代数保护；旧历史页/旧详情不能在新快照后恢复过时的 known 状态。正文、来源身份和位置不因此清除。

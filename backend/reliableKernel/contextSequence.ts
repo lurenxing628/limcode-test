@@ -1,3 +1,4 @@
+import type { AcceptedAnswerNotice } from './answerPresentation';
 import { runtimeDeliveryTimelineStep } from './timelineAcceptance';
 import { createHash } from 'node:crypto';
 import {
@@ -44,7 +45,7 @@ export interface ContextSourceOccurrence {
 
 export interface ContextAppendCommand {
   /** Exact accepted input, committed with this Context occurrence and head. */
-  runtimeDeliveryAcceptance?: { deliveryId: string; pendingTurnInputId: string; inputContentObjectId: string };
+  runtimeDeliveryAcceptance?: { deliveryId: string; pendingTurnInputId: string; inputContentObjectId: string; answerNotice?: AcceptedAnswerNotice };
   conversationId: string;
   segmentKind: Exclude<ContextSegmentKind, 'message' | 'tool_pair' | 'compression'>;
   source: ContextSourceOccurrence;
@@ -216,7 +217,7 @@ interface AppendOccurrencePlan {
   nativePartialPair?: 'tool_call' | 'tool_model_result';
   /** Atomic execution fence asserted in every committing transaction of the native append. */
   executionFence?: { callTurnId: string };
-  runtimeDeliveryAcceptance?: { deliveryId: string; pendingTurnInputId: string; inputContentObjectId: string };
+  runtimeDeliveryAcceptance?: { deliveryId: string; pendingTurnInputId: string; inputContentObjectId: string; answerNotice?: AcceptedAnswerNotice };
 }
 
 interface BaseShape {
@@ -2037,7 +2038,7 @@ export class ContextSequenceControlPlane {
       ...(planInput.runtimeDeliveryAcceptance ? [runtimeDeliveryTimelineStep({
         conversationId, deliveryId: planInput.runtimeDeliveryAcceptance.deliveryId, now,
         context: { pendingTurnInputId: planInput.runtimeDeliveryAcceptance.pendingTurnInputId,
-          inputContentObjectId: planInput.runtimeDeliveryAcceptance.inputContentObjectId, rootId, nodeId }
+          inputContentObjectId: planInput.runtimeDeliveryAcceptance.inputContentObjectId, answerNotice: planInput.runtimeDeliveryAcceptance.answerNotice, rootId, nodeId }
       })] : [])
     ];
     try {

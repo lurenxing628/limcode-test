@@ -1638,7 +1638,8 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
     'compression-presentation',
     'compression-content',
     'compression-title',
-    'answer-content'
+    'answer-content',
+    'accepted-answer-content'
   ].includes(String(kind))) throw new TypeError('detail.kind is invalid.');
   if (!Number.isSafeInteger(message.offset) || (message.offset as number) < 0) {
     throw new TypeError('detail.offset must be a non-negative integer.');

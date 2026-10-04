@@ -26,6 +26,14 @@ const membership = (id: string, seq: string) => ({ id, conversation_id: 'self', 
 const deliveryPosition = (id: string, predecessorId: string | null, predecessorSeq: string, exchangeSeq: string, attempt = '1') =>
   ({ id: `${id}-position-${attempt}`, delivery_id: `${id}-delivery-${attempt}`, conversation_id: 'self',
     predecessor_message_id: predecessorId, predecessor_message_seq: predecessorSeq, exchange_seq: exchangeSeq });
+const acceptedAnswer = (id: string, outcome: string, attempt = '1') => ({
+  id: `${id}-accepted-${attempt}`, conversation_id: 'self', delivery_id: `${id}-delivery-${attempt}`,
+  inbox_item_id: `${id}-inbox`, attempt_seq: attempt, submission_id: id,
+  child_conversation_id: 'child-conversation', child_execution_id: 'child-execution', answer_bridge_id: 'bridge',
+  source_turn_id: `${id}-child-turn`, outcome, peer_state: 'known', peer_title_preview: '调研子任务',
+  answer_title_preview: `${id} 已接收标题`, body_content_object_id: `${id}-body`,
+  body_representation: 'effective-input', body_content_type: 'text/plain'
+});
 
 function project(records: Parameters<typeof projectCollaborationTimeline>[0]['records'], messages: Array<{ id: string }> = [],
   turnIdByMessageId: Record<string, string> = {}, removedConversationIds: string[] = []) {
@@ -227,6 +235,8 @@ test('a child answer delivered to this Conversation is the same card, labelled a
     RuntimeInboxItem: byId(...submissions.map((id) => ({ id: `${id}-inbox`, source_kind: 'answer_submission', source_id: id }))),
     RuntimeDelivery: byId(...submissions.map((id) => ({ ...delivery(id, 'self', 'self-turn', 'consumed'),
       created_at: `2026-01-01T00:00:0${answerIds[id]}.000Z` }))),
+    RuntimeDeliveryAnswerPresentation: byId(...submissions.map((id) => acceptedAnswer(id,
+      id === 'child-1' ? 'submitted' : id === 'child-2' ? 'interrupted' : 'failed'))),
     RuntimeDeliveryTimelineLink: byId(...submissions.map((id) => deliveryPosition(id, 'm1004', '1007', id.slice(-1))))
   };
   const visible = [{ id: 'm1004' }, { id: 'm1005' }];
@@ -242,6 +252,49 @@ test('a child answer delivered to this Conversation is the same card, labelled a
   const reloaded = JSON.parse(JSON.stringify(proofRecords));
   reloaded.RuntimeDeliveryTimelineLink = Object.fromEntries(Object.entries(reloaded.RuntimeDeliveryTimelineLink).reverse());
   assert.deepEqual(composeTimelineRows(visible, project(reloaded, visible)).map((row) => row.id), expected);
+
+  // Accepted parent history survives deleting every source entity and a cold reload. Source rows
+  // and the newest retry cannot change the frozen outcome, accepted body selector or dedup key.
+  Object.assign(reloaded, { Conversation: {}, ChildExecution: {}, AnswerBridge: {}, AnswerSubmission: {} });
+  for (const presentation of Object.values(reloaded.RuntimeDeliveryAnswerPresentation) as Array<Record<string, unknown>>) {
+    presentation.peer_state = 'deleted';
+  }
+  const deleted = project(JSON.parse(JSON.stringify(reloaded)), visible);
+  assert.deepEqual(composeTimelineRows(visible, deleted).map((row) => row.id), expected);
+  assert.deepEqual(deleted.afterMessage.m1004.map(collaborationCardKindLabel), ['最终结果', '部分结果（已中断）', '执行失败']);
+  assert.ok(deleted.afterMessage.m1004.every((card) => collaborationCardLabel(card) === '来自已删除的子 Agent'
+    && card.status === 'settled' && card.acceptedAnswerId === `${card.messageId.slice(7)}-accepted-1`));
+  assert.deepEqual(composeTimelineRows([{ id: 'm1005' }], project(reloaded, [{ id: 'm1005' }])).map((row) => row.id),
+    expected.slice(1), 'paging without the physical predecessor retains the same accepted cards');
+
+  const semantic = JSON.parse(JSON.stringify(reloaded));
+  semantic.RuntimeDeliveryTimelineLink = {};
+  semantic.RuntimeDelivery['child-2-delivery-2'].state = 'consumed';
+  semantic.RuntimeDeliveryAnswerPresentation['child-2-accepted-2'] = acceptedAnswer('child-2', 'failed', '2');
+  const unpositioned = project(semantic, visible);
+  const semanticCard = unpositioned.beforeMessages.find((card) => card.messageId === 'answer:child-2')!;
+  assert.equal(semanticCard.acceptedAnswerId, 'child-2-accepted-1', 'lowest accepted attempt is only a stable display identity');
+  assert.notEqual(semanticCard.placement, 'ordered');
+  assert.match(collaborationCardPlacementLabel(semanticCard), /位置待确认/);
+  semantic.RuntimeDeliveryTimelineLink = byId(deliveryPosition('child-2', 'm1004', '1007', '9', '2'));
+  const provenRetry = project(semantic, visible).afterMessage.m1004;
+  assert.equal(provenRetry.length, 1);
+  assert.equal(provenRetry[0].acceptedAnswerId, 'child-2-accepted-2', 'proven exchange order outranks unpositioned historical evidence');
+
+  const unknown = {
+    RuntimeInboxItem: byId({ id: 'unknown-inbox', source_kind: 'answer_submission', source_id: 'unknown' }),
+    RuntimeDelivery: byId({ ...delivery('unknown', 'self', null, 'consumed'), phase: 'notify_only' }),
+    RuntimeDeliveryAnswerPresentation: byId({ ...acceptedAnswer('unknown', 'unknown'), peer_state: 'unknown',
+      child_conversation_id: null, child_execution_id: null, source_turn_id: null, answer_bridge_id: null, peer_title_preview: null })
+  };
+  const historical = project(unknown).unlocated[0];
+  assert.equal(collaborationCardKindLabel(historical), '历史结果（状态未知）');
+  assert.equal(collaborationCardLabel(historical), '来自子 Agent（身份未知）');
+  assert.equal(historical.peer.conversationId, null, 'missing historical identity does not create a fake Conversation');
+  assert.equal(collaborationCardPlacementLabel(historical), '结果通知');
+  assert.equal(historical.status, 'settled');
+  unknown.RuntimeDeliveryAnswerPresentation['unknown-accepted-1'].conversation_id = 'foreign';
+  assert.deepEqual(project(unknown).unlocated, [], 'foreign accepted facts cannot grant a parent detail selector');
 
   const interrupted = project(answerRecords('interrupted', 'pending', null)).unlocated[0];
   assert.equal(collaborationCardKindLabel(interrupted), '部分结果（已中断）');

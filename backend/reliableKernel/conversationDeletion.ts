@@ -123,6 +123,7 @@ interface ConversationDeletionSnapshot {
     submission: DomainRow;
     bridge: DomainRow;
     title: string | null;
+    childConversationId: string | null;
     pendingInput?: { link: DomainRow; input: DomainRow };
   }>;
   /** A runtime continuation still queued for a pending answer delivery of the scope, by delivery. */
@@ -410,9 +411,10 @@ export class ConversationDeletionControlPlane {
       snapshot.parentNotices.splice(0);
       return steps;
     }
-    for (const { delivery, submission, bridge, title, pendingInput } of snapshot.parentNotices) {
+    for (const { delivery, submission, bridge, title, childConversationId, pendingInput } of snapshot.parentNotices) {
       const notice = await this.contentStore.prepare(this.database, JSON.stringify({
         kind: 'child_answer_source_deleted',
+        childConversationId,
         submissionId: String(submission.id),
         answerBridgeId: String(bridge.id),
         childExecutionId: String(bridge.child_execution_id),
@@ -567,6 +569,7 @@ export class ConversationDeletionControlPlane {
         submission,
         bridge,
         title: typeof child?.title === 'string' && child.title.trim() ? child.title : null,
+        childConversationId: typeof child?.id === 'string' ? child.id : null,
         ...(pendingInput ? { pendingInput } : {})
       });
     }

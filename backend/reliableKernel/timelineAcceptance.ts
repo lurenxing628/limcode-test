@@ -1,9 +1,10 @@
+import type { AcceptedAnswerNotice } from './answerPresentation';
 import { stablePhaseFId } from './phaseFIdentity';
 import { DOMAIN_REPOSITORIES, type RepositoryTransactionStep } from './repositories';
 
 export function runtimeDeliveryTimelineStep(input: {
   conversationId: string; deliveryId: string; now: string;
-  context?: { pendingTurnInputId: string; inputContentObjectId: string; rootId: string; nodeId: string };
+  context?: { pendingTurnInputId: string; inputContentObjectId: string; answerNotice?: AcceptedAnswerNotice; rootId: string; nodeId: string };
 }): RepositoryTransactionStep {
   return DOMAIN_REPOSITORIES.domain('RuntimeDeliveryTimelineLink').insertAtTimelineBoundary({
     id: stablePhaseFId('runtime_delivery_timeline', input.deliveryId),
@@ -12,7 +13,7 @@ export function runtimeDeliveryTimelineStep(input: {
     pending_turn_input_id: input.context?.pendingTurnInputId ?? null,
     context_root_id: input.context?.rootId ?? null, context_node_id: input.context?.nodeId ?? null,
     created_at: input.now
-  }, input.context?.inputContentObjectId);
+  }, input.context?.inputContentObjectId, input.context?.answerNotice);
 }
 
 export function collaborationSendTimelineStep(input: {

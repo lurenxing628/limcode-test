@@ -1,3 +1,4 @@
+import type { AcceptedAnswerNotice } from './answerPresentation';
 import type { InitialExecutionLeaseDuration } from './initialExecutionLease';
 import type { RuntimeDomainMutation } from './contracts';
 import {
@@ -22,7 +23,8 @@ export const HISTORICAL_COPY_DOMAINS: readonly string[] = [
   'ModelStreamCheckpoint',
   'RuntimeDeliveryTimelineLink',
   'CollaborationSendTimelineLink',
-  'TimelineImportProvenance'
+  'TimelineImportProvenance',
+  'RuntimeDeliveryAnswerPresentation'
 ];
 export type EncodedRow = Record<string, string | bigint | Buffer | null>;
 
@@ -34,6 +36,7 @@ export interface RepositoryInsertMutation {
   allocateTimelinePosition?: true;
   /** Exact raw input identity used to produce the accepted model Context envelope. */
   acceptedInputContentObjectId?: string;
+  acceptedAnswerNotice?: AcceptedAnswerNotice;
   /** Verified historical import only; the writer preserves the cut and allocates a shared suffix. */
   allocateImportedTimelineSequence?: {
     sourceDataSetId: string; sourceRootInstanceId: string; sourceExchangeSeq: bigint;
@@ -368,14 +371,14 @@ export class DomainRepository {
   }
 
   /** A typed exchange acceptance, with no caller-supplied transcript/order coordinates. */
-  public insertAtTimelineBoundary(row: DomainRow, acceptedInputContentObjectId?: string): RepositoryInsertMutation {
+  public insertAtTimelineBoundary(row: DomainRow, acceptedInputContentObjectId?: string, acceptedAnswerNotice?: AcceptedAnswerNotice): RepositoryInsertMutation {
     this.requireMutation('insert');
     if (this.schema.key !== 'RuntimeDeliveryTimelineLink' && this.schema.key !== 'CollaborationSendTimelineLink') {
       throw new TypeError(`${this.name} cannot allocate an exchange timeline position.`);
     }
     if (this.schema.key === 'RuntimeDeliveryTimelineLink' && row.acceptance_kind === 'input') {
       requireId(acceptedInputContentObjectId as string);
-    } else if (acceptedInputContentObjectId !== undefined) throw new TypeError('Only a model input has a projected content identity.');
+    } else if (acceptedInputContentObjectId !== undefined || acceptedAnswerNotice !== undefined) throw new TypeError('Only a model input has a projected content identity.');
     for (const name of ['predecessor_message_id', 'predecessor_message_seq', 'exchange_seq', 'position_basis']) {
       if (name in row) throw new TypeError(`${this.name}.${name} is allocated by the writer.`);
     }
@@ -383,7 +386,8 @@ export class DomainRepository {
     this.codec.encodeInsert({ ...row, ...(this.schema.key === 'RuntimeDeliveryTimelineLink' ? { inbox_item_id: 'writer-resolved-inbox' } : {}),
       predecessor_message_id: null, predecessor_message_seq: 0n, exchange_seq: 1n, position_basis: 'committed' });
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row), allocateTimelinePosition: true,
-      ...(acceptedInputContentObjectId === undefined ? {} : { acceptedInputContentObjectId }) };
+      ...(acceptedInputContentObjectId === undefined ? {} : { acceptedInputContentObjectId }),
+      ...(acceptedAnswerNotice === undefined ? {} : { acceptedAnswerNotice }) };
   }
 
   public insertHistoricalTimelineImport(row: DomainRow, source: {

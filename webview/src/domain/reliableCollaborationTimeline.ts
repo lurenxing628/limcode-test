@@ -2,6 +2,7 @@ import type { PlainData } from '@shared/plainData';
 import {
   collaborationPeerLabel,
   collaborationPeerRelation,
+  resolveAcceptedAnswerPeer,
   resolveCollaborationPeer,
   type CollaborationPeer,
   type CollaborationPeerRelation
@@ -22,8 +23,10 @@ export interface CollaborationTimelineCard {
   peer: CollaborationPeer;
   peerRelation: CollaborationPeerRelation;
   /** For a child answer: its Host-derived outcome (final, interrupted partial, or failed run). */
-  kind: 'message' | 'followup' | 'result' | 'answer' | 'partial_answer' | 'failed_answer';
+  kind: 'message' | 'followup' | 'result' | 'answer' | 'partial_answer' | 'failed_answer' | 'unknown_answer';
   textPreview: string;
+  /** Parent-owned accepted evidence; detail access never resolves a source or arbitrary CAS id. */
+  acceptedAnswerId?: string;
   /** Settled for a proven accepted event; otherwise the newest loaded delivery attempt. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
   readBy?: 'current-turn' | 'next-turn';
@@ -75,6 +78,12 @@ export function projectCollaborationTimeline(input: {
   messages: ReadonlyArray<{ id: string }>;
   turnIdByMessageId: Readonly<Record<string, string>>;
   removedConversationIds: readonly string[];
+  /** Snapshot generations invalidate only derived peer liveness, never the accepted fact. */
+  peerStateGeneration?: number;
+  acceptedAnswerPeerGenerations?: Readonly<Record<string, number>>;
+  acceptedAnswerDetails?: Readonly<Record<string, {
+    peerState?: 'known' | 'deleted' | 'unknown'; peerStateGeneration?: number;
+  }>>;
 }): CollaborationTimeline {
   const result: CollaborationTimeline = { beforeMessages: [], afterMessage: {}, unlocated: [] };
   if (!input.conversationId) return result;
@@ -95,6 +104,7 @@ export function projectCollaborationTimeline(input: {
       ? [{ messageId: message.id, messageSeq }] : [];
   }).sort((left, right) => compareBigint(left.messageSeq, right.messageSeq));
   const deliveryPositions = linksByField(input.records.RuntimeDeliveryTimelineLink, 'delivery_id');
+  const acceptedAnswers = acceptedAnswerByDelivery(input.records, input.conversationId);
   const sendPositions = linksByField(input.records.CollaborationSendTimelineLink, 'message_id');
   const placed: Array<{
     card: CollaborationTimelineCard;
@@ -103,7 +113,7 @@ export function projectCollaborationTimeline(input: {
   }> = [];
   const sources = linksByMessage(input.records.CollaborationMessageSourceLink);
   const targets = linksByMessage(input.records.CollaborationMessageTargetLink);
-  const acceptedDeliveries = acceptedDeliveryByTarget(input.records, input.conversationId);
+  const acceptedDeliveries = acceptedDeliveryByTarget(input.records, input.conversationId, acceptedAnswers);
   const deliveries = latestDeliveryByTarget(input.records.RuntimeDelivery);
   // A redelivery is another attempt, not a revocation of the already accepted logical envelope.
   // Keep the accepted attempt and its own proof together; never attach its link to the retry.
@@ -154,19 +164,30 @@ export function projectCollaborationTimeline(input: {
   for (const delivery of answerDeliveries) {
     const inbox = input.records.RuntimeInboxItem?.[text(delivery.inbox_item_id)];
     if (!inbox || inbox.source_kind !== 'answer_submission') continue;
+    const accepted = acceptedAnswers.get(text(delivery.id));
     const submission = input.records.AnswerSubmission?.[text(inbox.source_id)];
     const bridge = input.records.AnswerBridge?.[text(submission?.answer_bridge_id)];
     const child = input.records.ChildExecution?.[text(bridge?.child_execution_id)];
     const peerConversationId = text(child?.child_conversation_id);
-    const kind = submission ? ANSWER_KIND_BY_OUTCOME[text(submission.outcome)] : undefined;
-    if (!submission || !peerConversationId || !kind) continue;
+    const kind = accepted ? ANSWER_KIND_BY_OUTCOME[text(accepted.outcome)]
+      : submission && submission.outcome !== 'unknown' ? ANSWER_KIND_BY_OUTCOME[text(submission.outcome)] : undefined;
+    if (!kind || (!accepted && (!submission || !peerConversationId))) continue;
+    const acceptedId = text(accepted?.id);
+    const acceptedDetail = input.acceptedAnswerDetails?.[`accepted-answer-content:${acceptedId}`];
+    const peerStateCurrent = input.peerStateGeneration === undefined
+      || input.acceptedAnswerPeerGenerations?.[acceptedId] === input.peerStateGeneration;
+    const freshDetailPeerState = acceptedDetail?.peerStateGeneration === input.peerStateGeneration
+      ? acceptedDetail?.peerState : undefined;
     const card: CollaborationTimelineCard = {
-      messageId: `answer:${text(submission.id)}`,
+      messageId: `answer:${text(accepted?.submission_id ?? submission?.id)}`,
       direction: 'incoming',
-      peer: resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
+      peer: accepted ? resolveAcceptedAnswerPeer(input.records, accepted, input.removedConversationIds,
+        { current: peerStateCurrent, ...(freshDetailPeerState ? { state: freshDetailPeerState } : {}) })
+        : resolveCollaborationPeer(input.records, peerConversationId, input.removedConversationIds),
       peerRelation: 'child',
       kind,
-      textPreview: '',
+      textPreview: text(accepted?.answer_title_preview),
+      ...(accepted ? { acceptedAnswerId: text(accepted.id) } : {}),
       ...(delivery.phase === 'notify_only' ? { notificationOnly: true } : {}),
       status: acceptedDeliveries.has(deliveryKey(delivery.inbox_item_id, delivery.target_conversation_id)) ? 'settled'
         : delivery.state === 'failed' ? 'failed'
@@ -288,6 +309,7 @@ export function collaborationCardKindLabel(card: CollaborationTimelineCard): str
   if (card.kind === 'answer') return '最终结果';
   if (card.kind === 'failed_answer') return '执行失败';
   if (card.kind === 'partial_answer') return '部分结果（已中断）';
+  if (card.kind === 'unknown_answer') return '历史结果（状态未知）';
   if (card.kind === 'result') return '任务结果';
   return card.kind === 'followup' ? '续派任务' : '消息';
 }
@@ -295,7 +317,8 @@ export function collaborationCardKindLabel(card: CollaborationTimelineCard): str
 const ANSWER_KIND_BY_OUTCOME: Readonly<Record<string, CollaborationTimelineCard['kind']>> = Object.freeze({
   submitted: 'answer',
   interrupted: 'partial_answer',
-  failed: 'failed_answer'
+  failed: 'failed_answer',
+  unknown: 'unknown_answer'
 });
 
 function deliveryKey(inboxItemId: PlainData | undefined, conversationId: PlainData | undefined): string {
@@ -313,7 +336,11 @@ function timelinePosition(link: FeedRecord | undefined, conversationId: string):
 }
 
 /** Canonical accepted event per logical envelope; all status/position reads use that exact attempt. */
-function acceptedDeliveryByTarget(records: FeedRecords, conversationId: string): Map<string, FeedRecord> {
+function acceptedDeliveryByTarget(
+  records: FeedRecords,
+  conversationId: string,
+  presentations: ReadonlyMap<string, FeedRecord>
+): Map<string, FeedRecord> {
   const accepted = new Map<string, { delivery: FeedRecord; exchangeSeq: bigint }>();
   for (const link of Object.values(records.RuntimeDeliveryTimelineLink ?? {})) {
     const position = timelinePosition(link, conversationId);
@@ -325,7 +352,35 @@ function acceptedDeliveryByTarget(records: FeedRecords, conversationId: string):
       accepted.set(key, { delivery, exchangeSeq: position.exchangeSeq });
     }
   }
+  // Positioned acceptance always wins. With semantic-only evidence, the lowest accepted attempt
+  // is a stable display identity, not a claim about reception chronology or physical coordinates.
+  for (const deliveryId of presentations.keys()) {
+    const delivery = records.RuntimeDelivery?.[deliveryId];
+    if (!delivery) continue;
+    const key = deliveryKey(delivery.inbox_item_id, delivery.target_conversation_id);
+    const current = accepted.get(key);
+    if (!current || (current.exchangeSeq === 0n
+      && compareSequence(delivery.attempt_seq, current.delivery.attempt_seq) < 0)) {
+      accepted.set(key, { delivery, exchangeSeq: 0n });
+    }
+  }
   return new Map([...accepted].map(([key, entry]) => [key, entry.delivery]));
+}
+
+function acceptedAnswerByDelivery(records: FeedRecords, conversationId: string): Map<string, FeedRecord> {
+  const result = new Map<string, FeedRecord>();
+  for (const presentation of Object.values(records.RuntimeDeliveryAnswerPresentation ?? {})) {
+    const deliveryId = text(presentation.delivery_id);
+    const delivery = records.RuntimeDelivery?.[deliveryId];
+    const inbox = records.RuntimeInboxItem?.[text(delivery?.inbox_item_id)];
+    if (!text(presentation.id) || presentation.conversation_id !== conversationId
+      || delivery?.target_conversation_id !== conversationId || inbox?.source_kind !== 'answer_submission'
+      || presentation.inbox_item_id !== delivery.inbox_item_id
+      || compareSequence(presentation.attempt_seq, delivery.attempt_seq) !== 0
+      || !text(presentation.submission_id) || inbox.source_id !== presentation.submission_id) continue;
+    result.set(deliveryId, presentation);
+  }
+  return result;
 }
 
 /** One pass over the deliveries: the newest attempt per inbox item and target Conversation. */

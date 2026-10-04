@@ -1,3 +1,4 @@
+import { backfillAcceptedAnswerPresentations } from './answerPresentationBackfill';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
@@ -121,6 +122,7 @@ export type RuntimeEpochMigrationFaultPoint =
   | 'after-pointer-publication';
 
 export interface RuntimeEpochMigrationOptions {
+  signal?: AbortSignal;
   onFaultPoint?(point: RuntimeEpochMigrationFaultPoint): Promise<void> | void;
 }
 
@@ -274,7 +276,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
       } else {
         await verifyExistingBackup(controlRoot, journal);
       }
-      await migrateDatabase(previous.paths.databasePath, previous, next);
+      await migrateDatabase(previous.paths.databasePath, previous, next, options.signal);
     } else if (databaseState === 'current') {
       if (journal.state === 'fenced') {
         throw new RootAuthorityError(
@@ -718,7 +720,8 @@ function assertPreviousEpochDatabase(
 async function migrateDatabase(
   file: string,
   previous: HistoricalRootBinding,
-  next: RootBinding
+  next: RootBinding,
+  signal?: AbortSignal
 ): Promise<void> {
   const database = new Database(toSqliteFilePath(file), { fileMustExist: true });
   try {
@@ -749,6 +752,7 @@ async function migrateDatabase(
         await migrateChildRuntimeDeliveryIntentLinks(database, previous.paths.casRootPath);
       }
       backfillProvenRuntimeInputTimeline(database);
+      await backfillAcceptedAnswerPresentations(database, previous.paths.casRootPath, signal);
       replaceSchemaManifest(database);
       const update = database.prepare(`
         UPDATE root_binding

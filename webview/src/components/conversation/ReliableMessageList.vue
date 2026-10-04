@@ -160,7 +160,7 @@ const collaborationRecords = computed(() => {
   const records: typeof feed.records = { ...history, ...collaboration, ...feed.records };
   for (const type of [
     'Conversation', 'Message', 'Turn', 'CollaborationMessage', 'CollaborationMessageSourceLink',
-    'CollaborationMessageTargetLink', 'RuntimeDelivery', 'RuntimeDeliveryTimelineLink',
+    'CollaborationMessageTargetLink', 'RuntimeDelivery', 'RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation',
     'CollaborationSendTimelineLink', 'RuntimeInboxItem', 'AnswerSubmission', 'AnswerBridge',
     'ChildExecution', 'ChildExecutionParentLink', 'CollaborationPeerConversation'
   ]) {
@@ -173,7 +173,10 @@ const collaborationTimeline = computed(() => projectCollaborationTimeline({
   records: collaborationRecords.value,
   messages: messages.value,
   turnIdByMessageId: projection.value.turnIdByMessageId,
-  removedConversationIds: feed.removedConversationIds
+  removedConversationIds: feed.removedConversationIds,
+  peerStateGeneration: feed.peerStateGeneration,
+  acceptedAnswerPeerGenerations: feed.acceptedAnswerPeerGenerations,
+  acceptedAnswerDetails: feed.details
 }));
 const timelineRows = computed(() => composeTimelineRows(messages.value, collaborationTimeline.value));
 const visibleTimelineRows = computed(() => timelineRows.value.slice(
@@ -509,6 +512,8 @@ const visibleRetryBoundaryMessageId = computed(() => {
 
 watch(
   () => [
+    ...visibleTimelineRows.value.flatMap((row) => row.kind === 'collaboration' && row.card.acceptedAnswerId
+      ? [row.card.acceptedAnswerId] : []),
     ...visibleMessageRows.value.map(messageDetailDemandSignature),
     ...Object.entries(projection.value.interactionByToolCallId)
       .filter(([, interaction]) => interaction.status === 'pending')
@@ -519,7 +524,9 @@ watch(
       const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
       return revisionId ? [reliableKernelDetailKey('message-content', revisionId)] : [];
     });
-    feed.setPinnedDetailKeys(pinnedDetailKeys);
+    feed.setPinnedDetailKeys([...pinnedDetailKeys, ...visibleTimelineRows.value.flatMap((row) =>
+      row.kind === 'collaboration' && row.card.acceptedAnswerId
+        ? [reliableKernelDetailKey('accepted-answer-content', row.card.acceptedAnswerId)] : [])]);
     const demand = prioritizedTimelineDetailDemand(
       visibleMessageRows.value.map((message) => message.id)
     );

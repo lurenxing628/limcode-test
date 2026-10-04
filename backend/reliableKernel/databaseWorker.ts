@@ -1,3 +1,4 @@
+import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
 import { projectTimelineLinkRecord } from './clientTimelineHistory';
 import { allocateTimelinePosition, allocateHistoricalTimelineImport, timelineImportProvenanceRow, assertTimelinePosition, timelineInputAcknowledgementSteps } from './timelinePosition';
 import { AttachmentProjectionScopeCache, readAttachmentScopeSnapshot } from './attachmentProjectionScopeCache';
@@ -821,6 +822,7 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       if (row.domain === 'CollaborationMessage') {
         record = projectCollaborationMessageRecord(database, row.id, clientProjectionContent);
       }
+      if (row.domain === 'RuntimeDeliveryAnswerPresentation') record = projectAnswerPresentation(database, record);
       if (row.domain === 'RuntimeDeliveryTimelineLink' || row.domain === 'CollaborationSendTimelineLink') {
         record = projectTimelineLinkRecord(database, row.domain, record);
       }
@@ -1787,6 +1789,8 @@ function executeAssertNone(database: Database.Database, domain: string, where: D
   }
 }
 
+const CAPTURED_ANSWER_PRESENTATIONS = new WeakSet<object>();
+
 function executeMutation(
   database: Database.Database,
   mutation: RepositoryMutation,
@@ -1809,7 +1813,13 @@ function executeMutation(
     executeCheckpointPrune(database, mutation);
   } else if (mutation.kind === 'insert') {
     const historicalCopy = mutation.historicalCopy === true;
-    if (mutation.acceptedInputContentObjectId !== undefined && (schema.key !== 'RuntimeDeliveryTimelineLink'
+    if (schema.key === 'RuntimeDeliveryAnswerPresentation') {
+      if (!historicalCopy && !CAPTURED_ANSWER_PRESENTATIONS.has(mutation)) {
+        throw new TypeError('Answer presentation is captured only inside its acceptance transaction.');
+      }
+      assertAnswerPresentation(database, mutation.row);
+    }
+    if ((mutation.acceptedInputContentObjectId !== undefined || mutation.acceptedAnswerNotice !== undefined) && (schema.key !== 'RuntimeDeliveryTimelineLink'
       || mutation.row.acceptance_kind !== 'input' || historicalCopy || !mutation.allocateTimelinePosition)) {
       throw new TypeError('Projected input identity is restricted to ordinary model-input acceptance.');
     }
@@ -1936,6 +1946,14 @@ function executeMutation(
     for (const acknowledgement of inputAcknowledgements) {
       if (acknowledgement.kind !== 'update') throw new Error('Runtime input acceptance may only acknowledge its exact input/link.');
       executeMutation(database, acknowledgement, allocatedSequences, attachmentScopeCache);
+    }
+    if (schema.key === 'RuntimeDeliveryTimelineLink' && !historicalCopy) {
+      const presentation = captureAnswerPresentation(database, row, mutation.acceptedInputContentObjectId, mutation.acceptedAnswerNotice);
+      if (presentation) {
+        const capture = DOMAIN_REPOSITORIES.domain('RuntimeDeliveryAnswerPresentation').insert(presentation);
+        CAPTURED_ANSWER_PRESENTATIONS.add(capture);
+        executeMutation(database, capture, allocatedSequences, attachmentScopeCache);
+      }
     }
     const importProvenance = timelineImportProvenanceRow(mutation);
     if (importProvenance) executeMutation(database, DOMAIN_REPOSITORIES.domain('TimelineImportProvenance').insertHistoricalCopy(importProvenance), allocatedSequences, attachmentScopeCache);

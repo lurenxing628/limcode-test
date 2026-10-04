@@ -9,7 +9,7 @@ export type CollaborationPeer =
   | { state: 'known'; conversationId: string; title: string }
   | { state: 'deleted'; conversationId: string }
   /** No loaded fact names it: neither alive nor removed as far as this view knows. */
-  | { state: 'unknown'; conversationId: string };
+  | { state: 'unknown'; conversationId: string | null; historicalTitle?: string };
 
 /**
  * Resolves a peer from the live Conversation rows, the snapshot's peer set and the removals this
@@ -38,6 +38,26 @@ export function resolveCollaborationPeer(
       ...(fallbackTitle ? { fallbackTitle } : {})
     })
   };
+}
+
+/** Parent-owned acceptance can outlive every source row, without inventing a navigable peer. */
+export function resolveAcceptedAnswerPeer(
+  records: FeedRecords,
+  presentation: FeedRecord,
+  removedConversationIds: readonly string[],
+  liveness: { current: boolean; state?: 'known' | 'deleted' | 'unknown' } = { current: true }
+): CollaborationPeer {
+  const conversationId = text(presentation.child_conversation_id);
+  const historicalTitle = text(presentation.peer_title_preview);
+  if (!conversationId) return { state: 'unknown', conversationId: null, ...(historicalTitle ? { historicalTitle } : {}) };
+  if (removedConversationIds.includes(conversationId)) return { state: 'deleted', conversationId };
+  const state = liveness.state ?? (liveness.current ? presentation.peer_state : 'unknown');
+  if (state === 'deleted') return { state: 'deleted', conversationId };
+  if (state === 'unknown') return { state: 'unknown', conversationId, ...(historicalTitle ? { historicalTitle } : {}) };
+  const peer = resolveCollaborationPeer(records, conversationId, removedConversationIds);
+  if (peer.state !== 'unknown') return peer;
+  if (state === 'known' && historicalTitle) return { state: 'known', conversationId, title: historicalTitle };
+  return { ...peer, ...(historicalTitle ? { historicalTitle } : {}) };
 }
 
 /**
@@ -82,6 +102,8 @@ export function collaborationPeerLabel(peer: CollaborationPeer, relation: Collab
   const noun = relation === 'child' ? '子 Agent' : '对话';
   if (peer.state === 'known') return `${noun} ${peer.title}`;
   if (peer.state === 'deleted') return relation === 'child' ? '已删除的子 Agent' : '已删除的对话';
+  if (peer.historicalTitle) return `${noun} ${peer.historicalTitle}（身份待确认）`;
+  if (!peer.conversationId) return `${noun}（身份未知）`;
   return `${noun} ${shortConversationId(peer.conversationId)}…`;
 }
 

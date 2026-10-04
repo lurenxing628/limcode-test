@@ -1,3 +1,4 @@
+import { canonicalAnswerPresentations } from './answerPresentation';
 import { readTimelineWindow, canonicalDeliveryTimelineLinks, type TimelineWindow } from './clientTimelineHistory';
 import { normalizeCollaborationHistoryCursor } from './collaborationHistoryCursor';
 /**
@@ -734,7 +735,7 @@ export function executeClientProjectionSnapshot(
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [], childTurnTerminations: [], childTurnExecutorLinks: [],
       childExecutionActivities: [],
       answerBridges: [], answerSubmissions: [],
-      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [], runtimeDeliveryTimelineLinks: [], collaborationSendTimelineLinks: [],
+      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [], runtimeDeliveryTimelineLinks: [], collaborationSendTimelineLinks: [], runtimeDeliveryAnswerPresentations: [],
       collaborationMessages: [], collaborationMessageSourceLinks: [], collaborationMessageTargetLinks: [],
       collaborationMessageReplyLinks: [], collaborationRequests: [], collaborationRequestTurnLinks: [],
       collaborationPeerConversations: []
@@ -1269,6 +1270,7 @@ export function executeClientProjectionSnapshot(
         runtimeDeliveryIntentLinks,
         runtimeDeliveryTimelineLinks: timelineRecords.RuntimeDeliveryTimelineLink ?? [],
         collaborationSendTimelineLinks: timelineWindow.sends,
+        runtimeDeliveryAnswerPresentations: timelineRecords.RuntimeDeliveryAnswerPresentation ?? [],
         collaborationMessages,
         collaborationMessageSourceLinks,
         collaborationMessageTargetLinks,
@@ -2136,6 +2138,10 @@ function buildTimelineExchangeRecords(
     .filter(row => row.target_conversation_id === conversationId).map(row => String(row.inbox_item_id)));
   include('RuntimeDeliveryTimelineLink', [...canonicalReceives, ...extraCanonical]);
   deliveries = mergeRowsById([...deliveries, ...queryAllByIds(database, 'runtime_delivery', 'id', extraCanonical.map(row => String(row.delivery_id)))]);
+  const presentations = canonicalAnswerPresentations(database, conversationId, deliveries
+    .filter(row => row.target_conversation_id === conversationId).map(row => String(row.inbox_item_id)));
+  include('RuntimeDeliveryAnswerPresentation', presentations);
+  deliveries = mergeRowsById([...deliveries, ...queryAllByIds(database, 'runtime_delivery', 'id', presentations.map(row => String(row.delivery_id)))]);
   const inboxes = queryAllByIds(database, 'runtime_inbox_item', 'id', deliveries.map(row => String(row.inbox_item_id)));
   const messageIds = [...new Set([
     ...window.sends.map(row => String(row.message_id)),
@@ -2175,7 +2181,8 @@ function buildTimelineExchangeRecords(
   include('Turn', queryAllByIds(database, 'turn', 'id', turnIds).filter(row => row.conversation_id === conversationId));
   include('CollaborationPeerConversation', projectCollaborationPeerConversations(database, conversationId,
     [...sources.map(row => String(row.conversation_id)), ...targets.map(row => String(row.conversation_id)),
-      ...children.map(row => String(row.child_conversation_id))], content));
+      ...children.map(row => String(row.child_conversation_id)),
+      ...presentations.flatMap(row => typeof row.child_conversation_id === 'string' ? [row.child_conversation_id] : [])], content));
   return records;
 }
 

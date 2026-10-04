@@ -1,3 +1,5 @@
+import { AcceptedAnswerTextPages } from './acceptedAnswerTextPages';
+import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import {
@@ -706,7 +708,7 @@ export class BoundedClientFeed {
           if (change.domain === 'Message') messageWindowAdvanced = true;
           const count = incrementRecordCount(session.activeRecordCounts, change.domain);
           if (
-            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE * (change.domain === 'RuntimeDeliveryTimelineLink' ? 2 : 1)
+            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE * (['RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation'].includes(change.domain) ? 2 : 1)
             && LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(change.domain)
             && change.domain !== 'Message'
           ) {
@@ -907,6 +909,7 @@ export class BoundedClientFeed {
             ['CollaborationMessageTargetLink']
           ));
       }
+      case 'RuntimeDeliveryAnswerPresentation':
       case 'RuntimeDeliveryTimelineLink':
       case 'CollaborationSendTimelineLink':
         return field('conversation_id') === activeConversationId;
@@ -1226,6 +1229,7 @@ export interface ClientDetailChunk {
   totalBytes: number;
   hasMore: boolean;
   responseBytes: number;
+  peerState?: 'known' | 'deleted' | 'unknown';
 }
 
 interface ProcessStreamChunkIndexEntry {
@@ -1267,6 +1271,7 @@ const TURN_INTENT_SOURCE_ARGUMENTS_MAX_BYTES = 64 * 1024;
 
 /** On-demand CAS detail reader with an actual wire-byte response cap. */
 export class ClientDetailReader {
+  private readonly acceptedAnswerPages: AcceptedAnswerTextPages;
   /** Immutable member/CAS identities; every access still verifies the member exists. */
   private readonly fileDiffDetails = new Map<string, { identity: string; bytes: Buffer }>();
   private fileDiffDetailBytes = 0;
@@ -1284,7 +1289,7 @@ export class ClientDetailReader {
   public constructor(
     private readonly database: RuntimeDatabase,
     private readonly contentStore: ContentAddressedStore
-  ) {}
+  ) { this.acceptedAnswerPages = new AcceptedAnswerTextPages(contentStore); }
 
   /** Product composition supplies the verified spool importer after ProcessControlPlane exists. */
   public setProcessOutputReconciler(
@@ -1306,6 +1311,9 @@ export class ClientDetailReader {
     if (!Number.isSafeInteger(input.offset) || input.offset < 0) throw new RangeError('Detail offset must be non-negative.');
     if (!Number.isSafeInteger(input.maxBytes) || input.maxBytes <= 0) throw new RangeError('Detail maxBytes must be positive.');
     const maxRawBytes = detailRawByteLimit(input.maxBytes);
+    if (input.kind === 'accepted-answer-content') {
+      return this.readAcceptedAnswerDetail(recordId, input.offset, maxRawBytes, input.conversationId, input.expectedTotalBytes);
+    }
     if (input.kind === 'process-stdout' || input.kind === 'process-stderr') {
       return this.readProcessStreamDetail(
         recordId,
@@ -1341,6 +1349,46 @@ export class ClientDetailReader {
       : await this.resolveContentMetadata(input.kind, recordId, input.conversationId);
     const range = await this.contentStore.readChunk(contentRow, input.offset, maxRawBytes);
     return buildDetailChunk(recordId, input.offset, range.chunk, range.totalBytes);
+  }
+
+  private async readAcceptedAnswerDetail(recordId: string, offset: number, maximum: number,
+    conversationId?: string | null, expectedTotalBytes?: number): Promise<ClientDetailChunk> {
+    const presentation = await this.requireExisting('RuntimeDeliveryAnswerPresentation', recordId);
+    if (!conversationId || presentation.conversation_id !== conversationId) throw new Error('Accepted answer is outside the requesting Conversation.');
+    const body = await this.requireExisting('ContentObject', String(presentation.body_content_object_id)) as ContentObjectMetadata;
+    const expected = { submissionId: String(presentation.submission_id) };
+    let range: { chunk: Buffer; totalBytes: number };
+    if (presentation.body_representation === 'historical-runtime-envelope') {
+      range = await this.acceptedAnswerPages.read(body, 'historical-runtime-envelope', offset, maximum, { expected: {
+        ...expected, deliveryId: String(presentation.delivery_id), inboxItemId: String(presentation.inbox_item_id)
+      } });
+    } else if (body.content_type === CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE) {
+      range = await this.acceptedAnswerPages.read(body, 'source-deleted-notice', offset, maximum, { expected });
+    } else if (body.content_type === 'application/vnd.limcode.message+json' && presentation.body_representation === 'effective-input') {
+      // The input's exact normalized text already exists in its committed Context. Read it lazily
+      // instead of reparsing or duplicating a potentially large raw MessageContent payload.
+      const links = await this.listRows('RuntimeDeliveryInputLink', { delivery_id: String(presentation.delivery_id) }, 2);
+      const sources = links.length === 1 ? await this.listRows('ContextSegmentSource', {
+        source_kind: 'runtime_context', source_id: String(links[0].pending_turn_input_id), source_revision: 0n
+      }, 2) : [];
+      if (sources.length !== 1) throw new Error('Accepted model answer lost its exact Context occurrence.');
+      const segment = await this.requireExisting('ContextSegment', String(sources[0].segment_id));
+      const context = await this.requireExisting('ContentObject', String(segment.content_object_id)) as ContentObjectMetadata;
+      range = await this.acceptedAnswerPages.read(context, 'historical-runtime-envelope', offset, maximum, { expected: {
+        ...expected, deliveryId: String(presentation.delivery_id), inboxItemId: String(presentation.inbox_item_id)
+      } });
+    } else if (body.content_type === 'application/vnd.limcode.message+json') {
+      range = await this.acceptedAnswerPages.readMessageContent(body, offset, maximum);
+    } else {
+      range = await this.contentStore.readChunk(body, offset, maximum);
+    }
+    if (expectedTotalBytes !== undefined && expectedTotalBytes !== range.totalBytes) throw new Error('Accepted answer immutable detail length changed.');
+    const peerState = typeof presentation.child_conversation_id !== 'string' ? 'unknown'
+      : await this.maybeGet('Conversation', presentation.child_conversation_id) ? 'known' : 'deleted';
+    const result = { ...buildDetailChunk(recordId, offset, range.chunk, range.totalBytes), peerState } as ClientDetailChunk;
+    settleClientWireResponseBytes(result);
+    if (result.responseBytes > CLIENT_DETAIL_MAX_RESPONSE_BYTES) throw new Error('Accepted answer detail exceeds its wire bound.');
+    return result;
   }
 
   private async resolveContentMetadata(
@@ -2156,6 +2204,11 @@ export class ClientDetailReader {
         return this.objectIdFromRow('FileChangeSetMember', recordId, 'target_content_object_id');
       case 'process-output':
         return this.objectIdFromRow('ProcessOutputChunk', recordId, 'content_object_id');
+      case 'accepted-answer-content': {
+        const presentation = await this.requireExisting('RuntimeDeliveryAnswerPresentation', recordId);
+        if (!conversationId || presentation.conversation_id !== conversationId) throw new Error('Accepted answer is outside the requesting Conversation.');
+        return requirePhaseFId(presentation.body_content_object_id, 'RuntimeDeliveryAnswerPresentation.body_content_object_id');
+      }
       case 'answer-content': {
         const payload = await this.maybeGet('AnswerPayload', recordId)
           ?? (await this.listRows('AnswerPayload', { submission_id: recordId }, 2))[0];
@@ -2355,6 +2408,7 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'RuntimeDelivery',
   'CollaborationMessage',
   'RuntimeDeliveryTimelineLink',
+  'RuntimeDeliveryAnswerPresentation',
   'CollaborationSendTimelineLink'
 ]);
 
@@ -2467,6 +2521,7 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   runtimeDeliveries: 'RuntimeDelivery',
   runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
   runtimeDeliveryTimelineLinks: 'RuntimeDeliveryTimelineLink',
+  runtimeDeliveryAnswerPresentations: 'RuntimeDeliveryAnswerPresentation',
   collaborationSendTimelineLinks: 'CollaborationSendTimelineLink',
     collaborationMessages: 'CollaborationMessage',
     collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',

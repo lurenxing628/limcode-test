@@ -294,6 +294,136 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     assert.equal(feed.collaborationHistoryLoadedPages, 4);
     assert.equal(feed.collaborationHistoryHasMore, false);
 
+    // A retained answer page carries only parent-owned evidence. None of the deleted child's
+    // Conversation, ChildExecution, AnswerBridge or AnswerSubmission rows is reconstructed.
+    const accepted = { id: 'retained-answer', conversation_id: 'self', delivery_id: 'retained-delivery',
+      inbox_item_id: 'retained-inbox', attempt_seq: '1', submission_id: 'retained-submission',
+      child_conversation_id: 'deleted-child', child_execution_id: 'deleted-execution', answer_bridge_id: 'deleted-bridge',
+      source_turn_id: 'deleted-turn', outcome: 'failed', peer_state: 'deleted', peer_title_preview: '旧子任务',
+      answer_title_preview: '已接收的失败结果', body_content_object_id: 'retained-body',
+      body_representation: 'effective-input', body_content_type: 'text/plain' };
+    feed.collaborationHistoryHasMore = true;
+    feed.collaborationHistoryNextCursor = { kind: 'answer' };
+    assert.equal(feed.requestEarlierCollaborationHistory('self'), true);
+    const retainedRequest = posted.findLast((message) => message.type === 'reliable-kernel.collaboration-history-request');
+    const retainedPage = {
+      RuntimeDeliveryAnswerPresentation: [accepted],
+      RuntimeInboxItem: [{ id: 'retained-inbox', source_kind: 'answer_submission', source_id: 'retained-submission' }],
+      RuntimeDelivery: [{ id: 'retained-delivery', inbox_item_id: 'retained-inbox', target_conversation_id: 'self',
+        target_turn_id: 'turn', attempt_seq: '1', state: 'consumed', phase: 'current_turn',
+        history_inventory_item: true, created_at: '2026-01-02T00:00:00.000Z' }],
+      RuntimeDeliveryTimelineLink: [{ id: 'retained-position', delivery_id: 'retained-delivery', conversation_id: 'self',
+        predecessor_message_id: 'm9', predecessor_message_seq: '9', exchange_seq: '1' }]
+    };
+    feed.observe({ type: 'reliable-kernel.collaboration-history-result', requestId: retainedRequest.requestId,
+      sessionId: 'session', conversationId: 'self', page: { records: retainedPage,
+        hasMore: false, scanProgress: false, scannedRows: 1, responseBytes: 4096 } });
+    await frames.flush(vue.nextTick);
+    assert.equal(feed.collaborationHistoryError, null);
+    const retainedCard = live.timelineRows.find((row) => row.id === 'collaboration:answer:retained-submission').card;
+    assert.equal(retainedCard.acceptedAnswerId, accepted.id);
+    assert.equal(retainedCard.kind, 'failed_answer');
+    assert.equal(retainedCard.peer.state, 'deleted');
+    assert.equal(retainedCard.placement, 'ordered');
+    assert.equal(posted.some((message) => message.kind === 'accepted-answer-content'), false, 'paging never loads accepted bodies');
+
+    const { default: CollaborationCard } = await server.ssrLoadModule('/src/components/conversation/ReliableCollaborationCard.vue');
+    const renderCard = async (expand = false) => {
+      let cardSetup;
+      const card = live.timelineRows.find((row) => row.id === 'collaboration:answer:retained-submission')?.card ?? retainedCard;
+      const cardApp = vue.createSSRApp(CollaborationCard, { card }).use(isolated);
+      cardApp.mixin({ created() {
+        if (this.$.type.__name !== CollaborationCard.__name) return;
+        cardSetup = this.$.setupState;
+        if (expand) cardSetup.toggle();
+      } });
+      return { html: await renderToString(cardApp), setup: cardSetup };
+    };
+    const collapsed = await renderCard();
+    assert.match(collapsed.html, /来自已删除的子 Agent/);
+    assert.match(collapsed.html, /执行失败/);
+    assert.match(collapsed.html, /查看已接收结果/);
+    assert.doesNotMatch(collapsed.html, /打开子|重新执行|已接收结果正文/);
+    assert.equal(posted.some((message) => message.kind === 'accepted-answer-content'), false);
+
+    // Finish ordinary message demands before expanding one accepted body; only that explicit
+    // expansion is allowed to enqueue its detail. A wrong-session response cannot complete it.
+    while (feed.activeDetailRequestIds.length > 0) {
+      const requestId = feed.activeDetailRequestIds[0];
+      const pending = feed.pendingDetails[requestId];
+      const bytes = Buffer.from('{"role":"user","parts":[{"text":"正文"}]}');
+      feed.observe({ type: 'reliable-kernel.detail-result', requestId, sessionId: 'session', detail: {
+        recordId: pending.recordId, offset: 0, chunk: bytes.toString('base64'), encoding: 'base64',
+        totalBytes: bytes.length, hasMore: false, responseBytes: bytes.length + 128 } });
+    }
+    const loading = await renderCard(true);
+    assert.match(loading.html, /正在加载已接收结果/);
+    const bodyRequest = posted.findLast((message) => message.kind === 'accepted-answer-content');
+    assert.equal(bodyRequest?.recordId, accepted.id);
+    assert.equal(bodyRequest?.sessionId, 'session');
+    assert.equal(bodyRequest?.offset, 0);
+    const acceptedText = '  子任务对话已被用户删除，它的答复不会再送达。\n';
+    const body = Buffer.from(acceptedText);
+    const bodyResult = { type: 'reliable-kernel.detail-result', requestId: bodyRequest.requestId, sessionId: 'session', detail: {
+      recordId: accepted.id, offset: 0, chunk: body.toString('base64'), encoding: 'base64',
+      totalBytes: body.length, hasMore: false, responseBytes: body.length + 128 } };
+    feed.observe({ ...bodyResult, sessionId: 'stale-session' });
+    assert.equal(feed.details['accepted-answer-content:retained-answer'].status, 'loading');
+    feed.observe(bodyResult);
+    assert.equal(feed.details['accepted-answer-content:retained-answer'].text, acceptedText);
+    const expanded = await renderCard(true);
+    assert.match(expanded.html, /子任务对话已被用户删除，它的答复不会再送达。/);
+    assert.equal(posted.filter((message) => message.kind === 'accepted-answer-content').length, 1, 'reopening reuses the accepted-body cache');
+
+    // A structural snapshot cannot rewrite every retained page. It instead invalidates only the
+    // peer-state generation. Both pre-snapshot page and detail replies remain fenced off.
+    feed.collaborationHistoryHasMore = true;
+    feed.collaborationHistoryNextCursor = { kind: 'answer' };
+    assert.equal(feed.requestEarlierCollaborationHistory('self'), true);
+    const oldPeerPage = posted.findLast((message) => message.type === 'reliable-kernel.collaboration-history-request');
+    feed.refreshDetail('accepted-answer-content', accepted.id, { priority: 'expanded' });
+    const oldPeerDetail = posted.findLast((message) => message.kind === 'accepted-answer-content');
+    assert.equal(oldPeerDetail.offset, body.length);
+    feed.hostBootId = 'fixture-host';
+    feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'session', hostBootId: 'fixture-host', messageSeq: '1',
+      snapshotCommitSeq: '1', projections: { activeConversationWindow: { conversationId: 'self' } } });
+    feed.observe({ ...bodyResult, requestId: oldPeerDetail.requestId,
+      detail: { ...bodyResult.detail, offset: body.length, chunk: '', peerState: 'known' } });
+    feed.observe({ type: 'reliable-kernel.collaboration-history-result', requestId: oldPeerPage.requestId,
+      sessionId: 'session', conversationId: 'self', page: { records: {
+        ...retainedPage, RuntimeDeliveryAnswerPresentation: [{ ...accepted, peer_state: 'known' }]
+      }, hasMore: false, scanProgress: false, scannedRows: 1, responseBytes: 4096 } });
+    await vue.nextTick();
+    const afterSnapshot = live.timelineRows.find((row) => row.id === 'collaboration:answer:retained-submission').card;
+    assert.equal(afterSnapshot.peer.state, 'unknown', 'old page/detail responses cannot restore pre-snapshot peer liveness');
+    assert.equal(afterSnapshot.kind, 'failed_answer');
+    assert.equal(afterSnapshot.placement, 'ordered');
+    assert.equal(feed.details['accepted-answer-content:retained-answer'].text, acceptedText);
+    await renderCard(true);
+    const freshPeerDetail = posted.findLast((message) => message.kind === 'accepted-answer-content');
+    assert.notEqual(freshPeerDetail.requestId, oldPeerDetail.requestId);
+    assert.equal(freshPeerDetail.offset, body.length, 'fresh peer lookup uses an EOF range rather than refetching accepted text');
+    feed.observe({ ...bodyResult, requestId: freshPeerDetail.requestId,
+      detail: { ...bodyResult.detail, offset: body.length, chunk: '', peerState: 'deleted' } });
+    await vue.nextTick();
+    assert.equal(live.timelineRows.find((row) => row.id === 'collaboration:answer:retained-submission').card.peer.state, 'deleted');
+    assert.equal(feed.details['accepted-answer-content:retained-answer'].text, acceptedText);
+
+    feed.observe({ type: 'reliable-kernel.changes', sessionId: 'session', hostBootId: 'fixture-host', messageSeq: '2', commitSeq: '2',
+      changes: [{ type: 'RuntimeDeliveryAnswerPresentation', operation: 'upsert', id: accepted.id, record: accepted },
+        { type: 'RuntimeDeliveryAnswerPresentation', operation: 'remove', id: accepted.id, removalCause: 'window-eviction' },
+        { type: 'Conversation', operation: 'remove', id: 'deleted-child' },
+        { type: 'AnswerSubmission', operation: 'remove', id: 'retained-submission' }] });
+    assert.equal(feed.collaborationHistoryRecords.RuntimeDeliveryAnswerPresentation[accepted.id].id, accepted.id,
+      'live-window eviction and source deletion retain the already-paged parent fact');
+    assert.equal(feed.details['accepted-answer-content:retained-answer'].text, acceptedText);
+    feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'navigated-session', hostBootId: 'fixture-host',
+      messageSeq: '1', snapshotCommitSeq: '1', projections: { activeConversationWindow: { conversationId: 'other' } } });
+    feed.observe({ type: 'reliable-kernel.collaboration-history-result', requestId: retainedRequest.requestId,
+      sessionId: 'session', conversationId: 'self', page: { records: retainedPage,
+        hasMore: false, scanProgress: false, scannedRows: 1, responseBytes: 4096 } });
+    assert.deepEqual(feed.collaborationHistoryRecords, {}, 'a late page cannot restore the previous Conversation');
+
   } finally {
     try {
       app?.unmount();

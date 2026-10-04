@@ -46,5 +46,20 @@ export const TIMELINE_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
       text('receive_timeline_link_id', { nullable: true, references: { table: 'runtime_delivery_timeline_link', onDelete: 'CASCADE' } }),
       text('send_timeline_link_id', { nullable: true, references: { table: 'collaboration_send_timeline_link', onDelete: 'CASCADE' } }),
       text('source_data_set_id'), text('source_root_instance_id'), integer('source_exchange_seq')]
+  }),
+  domain({
+    key: 'RuntimeDeliveryAnswerPresentation', table: 'runtime_delivery_answer_presentation',
+    repository: 'RuntimeDeliveryAnswerPresentationRepository', codec: 'RuntimeDeliveryAnswerPresentationRowCodec',
+    mutations: ['insert'], client: 'summary', deletePolicy: 'cascade-with-conversation',
+    indexes: ['delivery_id UNIQUE', 'conversation_id,inbox_item_id,attempt_seq'],
+    columns: [id(), conversation(),
+      text('delivery_id', { references: { table: 'runtime_delivery', onDelete: 'RESTRICT' } }),
+      text('inbox_item_id', { references: { table: 'runtime_inbox_item', onDelete: 'RESTRICT' } }),
+      integer('attempt_seq'), text('submission_id'),
+      text('child_execution_id', { nullable: true }), text('child_conversation_id', { nullable: true }),
+      text('answer_bridge_id', { nullable: true }), text('source_turn_id', { nullable: true }), text('outcome'),
+      text('peer_title_preview', { nullable: true }), text('answer_title_preview', { nullable: true }),
+      text('body_content_object_id', { references: { table: 'content_object', onDelete: 'RESTRICT' } }),
+      text('body_representation')]
   })
 ];

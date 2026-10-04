@@ -15,7 +15,8 @@
     "r4: Process 使用 detached wrapper、durable spool与可续CAS chunks；MCP 调用复用 EffectIntent/Receipt",
     "r5: Provider 工具批次使用 ToolCallSourceLink 独立表达来源，并由 ToolCallPolicySnapshot 冻结展示、门禁、change-apply 与调度决定",
     "r6: RuntimeDeliveryIntentLink 明确记录 next-turn Delivery 触发的 TurnIntent；Runtime continuation 不再借用 retry 身份",
-    "Timeline acceptance: two independent typed links freeze physical Message membership cuts and one shared conversation-local exchange sequence; Context input acceptance shares its Context/root transaction; send and notify-only acceptance use their own commits. Published history is backfilled only from exact proof."
+    "Timeline acceptance: two independent typed links freeze physical Message membership cuts and one shared conversation-local exchange sequence; Context input acceptance shares its Context/root transaction; send and notify-only acceptance use their own commits. Published history is backfilled only from exact proof.",
+    "Accepted child-answer presentation is an independent parent-owned immutable delivery fact; effective input or exact notification CAS body and bounded scalar evidence are captured atomically. Source-child deletion never removes it. Historical acceptance proof does not manufacture timeline positions."
   ],
   "contractRevision": "2026-07-31-r4",
   "status": "planned",
@@ -2329,6 +2330,22 @@
       "indexes": [
         "receive_timeline_link_id",
         "send_timeline_link_id"
+      ]
+    },
+    {
+      "key": "RuntimeDeliveryAnswerPresentation",
+      "table": "runtime_delivery_answer_presentation",
+      "repository": "RuntimeDeliveryAnswerPresentationRepository",
+      "codec": "RuntimeDeliveryAnswerPresentationRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "delivery_id UNIQUE",
+        "conversation_id,inbox_item_id,attempt_seq"
       ]
     }
   ],

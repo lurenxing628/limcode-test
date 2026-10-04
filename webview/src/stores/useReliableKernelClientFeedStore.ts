@@ -76,6 +76,8 @@ export interface ReliableKernelDetailState {
   refreshing?: boolean;
   /** The last background refresh failed. This never invalidates the complete value in `text`. */
   refreshError?: string;
+  peerState?: 'known' | 'deleted' | 'unknown';
+  peerStateGeneration?: number;
 }
 
 interface PendingDetailRequest {
@@ -91,6 +93,8 @@ interface PendingDetailRequest {
   retryCount: number;
   /** A newer mutable-prefix demand arrived while this exact request was in flight. */
   refreshRequested?: boolean;
+  peerState?: 'known' | 'deleted' | 'unknown';
+  peerStateGeneration?: number;
 }
 
 export type ReliableKernelDetailPriority = 'critical' | 'expanded' | 'visible' | 'background';
@@ -169,6 +173,9 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   navigationGeneration: string | null;
   /** Causal visibility frontier of the current full snapshot, never advanced by a delta. */
   lastSnapshotCommitSeq: string | null;
+  /** Local snapshot fence for mutable peer existence on immutable accepted-answer facts. */
+  peerStateGeneration: number;
+  acceptedAnswerPeerGenerations: Record<string, number>;
   transientModelRequests: Record<string, ReliableKernelTransientState>;
   pendingTransientRecoveries: Record<string, PendingTransientRecovery>;
   /** Memory-only immutable history prefix for the currently projected Conversation. */
@@ -190,6 +197,7 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   collaborationHistoryLoading: boolean;
   collaborationHistoryError: string | null;
   collaborationHistoryRequestId: string | null;
+  collaborationHistoryRequestPeerGeneration: number | null;
   collaborationHistoryLoadedPages: number;
   /**
    * Conversations this view saw removed by a committed change. A peer merely missing from the
@@ -238,6 +246,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
     retiredSessionIds: [],
     navigationGeneration: null,
     lastSnapshotCommitSeq: null,
+    peerStateGeneration: 0,
+    acceptedAnswerPeerGenerations: {},
     transientModelRequests: {},
     pendingTransientRecoveries: {},
     historyConversationId: null,
@@ -257,6 +267,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
     collaborationHistoryLoading: false,
     collaborationHistoryError: null,
     collaborationHistoryRequestId: null,
+    collaborationHistoryRequestPeerGeneration: null,
     collaborationHistoryLoadedPages: 0,
     removedConversationIds: []
   }),
@@ -422,6 +433,27 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.records = result.state.records;
       this.snapshotRequired = result.state.snapshotRequired;
       if (result.ack) {
+        if (previousConversationId !== nextConversationId || previousSessionId !== this.sessionId) {
+          this.acceptedAnswerPeerGenerations = {};
+        }
+        if (incomingType === RELIABLE_KERNEL_SNAPSHOT_MESSAGE) {
+          this.peerStateGeneration += 1;
+          // Only the bounded live snapshot is fresh. Historical records keep their old stamp;
+          // their selector will render unknown liveness without rewriting or dropping the facts.
+          for (const id of Object.keys(this.records.RuntimeDeliveryAnswerPresentation ?? {})) {
+            this.acceptedAnswerPeerGenerations[id] = this.peerStateGeneration;
+          }
+        } else if (incomingType === RELIABLE_KERNEL_CHANGES_MESSAGE) {
+          for (const value of Array.isArray(envelope?.changes) ? envelope.changes : []) {
+            const change = plainRecord(value);
+            const id = nonEmptyString(change?.id);
+            if (change?.type !== 'RuntimeDeliveryAnswerPresentation' || !id) continue;
+            if (change.operation === 'upsert') this.acceptedAnswerPeerGenerations[id] = this.peerStateGeneration;
+            else if (change.removalCause !== 'window-eviction') delete this.acceptedAnswerPeerGenerations[id];
+          }
+        }
+      }
+      if (result.ack) {
         invalidateRetryableDetailsForDurableMessage(this.$state, envelope, incomingType);
       }
       if (result.ack && incomingType === RELIABLE_KERNEL_CHANGES_MESSAGE) {
@@ -525,6 +557,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.collaborationHistoryLoading = true;
       this.collaborationHistoryError = null;
       this.collaborationHistoryRequestId = requestId;
+      this.collaborationHistoryRequestPeerGeneration = this.peerStateGeneration;
       const timeout = setTimeout(() => {
         collaborationHistoryTimeouts.delete(requestId);
         if (this.collaborationHistoryRequestId !== requestId || this.sessionId !== sessionId
@@ -569,6 +602,11 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         this.collaborationHistoryRecords = mergeHistoryRecordPage(
           this.collaborationHistoryRecords, message.page.records, COLLABORATION_HISTORY_RECORD_TYPES
         );
+        for (const row of message.page.records.RuntimeDeliveryAnswerPresentation ?? []) {
+          const id = String(row.id);
+          this.acceptedAnswerPeerGenerations[id] = this.records.RuntimeDeliveryAnswerPresentation?.[id]
+            ? this.peerStateGeneration : this.collaborationHistoryRequestPeerGeneration ?? this.peerStateGeneration;
+        }
       } catch (error) {
         clearCollaborationHistoryTimeout(message.requestId);
         this.collaborationHistoryLoading = false;
@@ -1237,7 +1275,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         priority,
         enqueuedAt: Date.now(),
         mode: 'initial',
-        retryCount
+        retryCount,
+        ...(kind === 'accepted-answer-content' ? { peerStateGeneration: this.peerStateGeneration } : {})
       };
       this.detailQueue.push(requestId);
       this.sortDetailQueue();
@@ -1342,6 +1381,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         status: 'ready',
         text: current.text,
         totalBytes: current.totalBytes,
+        ...(current.peerState ? { peerState: current.peerState } : {}),
+        ...(current.peerStateGeneration === undefined ? {} : { peerStateGeneration: current.peerStateGeneration }),
         refreshing: true
       };
       detailTextChunks.set(requestId, [current.text]);
@@ -1354,7 +1395,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         priority,
         enqueuedAt: Date.now(),
         mode: 'refresh',
-        retryCount: options.retryCount ?? current.retryCount ?? 0
+        retryCount: options.retryCount ?? current.retryCount ?? 0,
+        ...(kind === 'accepted-answer-content' ? { peerStateGeneration: this.peerStateGeneration } : {})
       };
       this.detailQueue.push(requestId);
       this.sortDetailQueue();
@@ -1366,6 +1408,11 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       if (message.sessionId !== this.sessionId) return;
       const pending = this.pendingDetails[message.requestId];
       if (!pending || pending.sessionId !== message.sessionId || message.detail.recordId !== pending.recordId) return;
+      if (pending.kind === 'accepted-answer-content'
+        && pending.peerStateGeneration === this.peerStateGeneration
+        && ['known', 'deleted', 'unknown'].includes(message.detail.peerState ?? '')) {
+        pending.peerState = message.detail.peerState;
+      }
       if (
         message.detail.offset !== pending.nextOffset
         || (pending.totalBytes !== undefined && pending.totalBytes !== message.detail.totalBytes)
@@ -1425,7 +1472,9 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         this.details[pending.key] = {
           status: 'ready',
           text: chunks.join(''),
-          totalBytes: message.detail.totalBytes
+          totalBytes: message.detail.totalBytes,
+          ...(pending.kind === 'accepted-answer-content' && pending.peerStateGeneration === this.peerStateGeneration
+            ? { peerStateGeneration: this.peerStateGeneration, ...(pending.peerState ? { peerState: pending.peerState } : {}) } : {})
         };
         clearDetailRetryTimer(pending.key);
         this.detailCacheMeta[pending.key] = {
@@ -2005,6 +2054,7 @@ function resetCollaborationHistoryState(
   state.collaborationHistoryLoading = false;
   state.collaborationHistoryError = null;
   state.collaborationHistoryRequestId = null;
+  state.collaborationHistoryRequestPeerGeneration = null;
   state.collaborationHistoryLoadedPages = 0;
 }
 
@@ -2060,6 +2110,7 @@ function isCollaborationHistoryPage(
   for (const [type, rows] of Object.entries(page.records)) {
     if (!COLLABORATION_HISTORY_RECORD_TYPES.has(type) || !Array.isArray(rows)) return false;
     if (rows.some((row) => !isRecord(row) || !nonEmptyString(row.id))) return false;
+    if (type === 'RuntimeDeliveryAnswerPresentation' && rows.some((row) => row.conversation_id !== conversationId)) return false;
   }
   const links = [...(page.records.RuntimeDeliveryTimelineLink ?? []), ...(page.records.CollaborationSendTimelineLink ?? [])];
   if (links.length > HISTORY_PAGE_LIMIT) return false;
@@ -2478,6 +2529,9 @@ function invalidateRetryableDetailsForDurableMessage(
         case 'AnswerSubmission':
           add('answer-content');
           break;
+        case 'RuntimeDeliveryAnswerPresentation':
+          add('accepted-answer-content');
+          break;
       }
     }
   }
@@ -2557,7 +2611,7 @@ function isVisibleConversationMessage(
 
 const COLLABORATION_HISTORY_RECORD_TYPES = new Set([
   'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
-  'RuntimeDelivery', 'RuntimeDeliveryTimelineLink', 'CollaborationSendTimelineLink',
+  'RuntimeDelivery', 'RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation', 'CollaborationSendTimelineLink',
   'RuntimeInboxItem', 'AnswerSubmission', 'AnswerBridge', 'ChildExecution', 'ChildExecutionParentLink',
   'Turn', 'CollaborationPeerConversation'
 ]);

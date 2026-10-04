@@ -232,6 +232,8 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
     reads: ['CompressionBlockSource', 'ContextSegmentSource', 'MessageRevision', 'MessagePartOfConversation'], handling: { kind: 'tolerates-missing' } },
   { source: 'commit-projection', name: 'AnswerBridge', triggeredBy: ['AnswerBridge'], reads: ['AnswerSubmission', 'AnswerPayload'], handling: { kind: 'tolerates-missing' } },
   { source: 'commit-projection', name: 'AnswerSubmission', triggeredBy: ['AnswerSubmission'], reads: ['AnswerBridge'], handling: { kind: 'reads-earlier' } },
+  { source: 'commit-projection', name: 'RuntimeDeliveryAnswerPresentation', triggeredBy: ['RuntimeDeliveryAnswerPresentation'],
+    reads: ['ContentObject', 'Conversation'], handling: { kind: 'reads-earlier' } },
   { source: 'commit-projection', name: 'Process', triggeredBy: ['Process'], reads: ['ProcessOriginLink', 'ToolCall', 'ContentObject'], handling: { kind: 'tolerates-missing' } },
   // Exactly one payload link per message.
   { source: 'commit-projection', name: 'CollaborationMessage', triggeredBy: ['CollaborationMessage'], reads: ['CollaborationMessagePayloadLink', 'ContentObject'],
@@ -266,6 +268,10 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
     reads: ['MessagePartOfConversation', 'CollaborationMessageSourceLink', 'RuntimeDeliveryTimelineLink'], handling: { kind: 'tolerates-missing' } },
   { source: 'worker-insert', name: 'TimelineImportProvenance', triggeredBy: ['TimelineImportProvenance'],
     reads: ['RuntimeDeliveryTimelineLink', 'CollaborationSendTimelineLink'], handling: { kind: 'reads-earlier' } },
+  // Ordinary acceptance captures metadata in its own transaction; historical copy only checks
+  // retained immutable delivery identity and never needs source child rows that may be deleted.
+  { source: 'worker-insert', name: 'RuntimeDeliveryAnswerPresentation', triggeredBy: ['RuntimeDeliveryAnswerPresentation'],
+    reads: ['RuntimeDelivery', 'RuntimeInboxItem'], handling: { kind: 'reads-earlier' } },
   // SQL triggers (schema/domainManifest RUNTIME_SCHEMA_TRIGGERS)
   { source: 'sql-trigger', name: 'prevent_runtime_delivery_after_final_output_fence', triggeredBy: ['PendingTurnInput'], reads: ['TurnFinalOutputFence'],
     handling: { kind: 'insert-order' } },

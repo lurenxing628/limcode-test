@@ -151,6 +151,7 @@
     "closure": [
       "RuntimeDeliveryTimelineLink",
       "CollaborationSendTimelineLink",
+      "RuntimeDeliveryAnswerPresentation",
       "CollaborationMessage",
       "CollaborationMessageSourceLink",
       "CollaborationMessageTargetLink",
@@ -183,7 +184,8 @@
       "file-change-diff",
       "process-output",
       "context-projection-detail",
-      "answer-content"
+      "answer-content",
+      "accepted-answer-content"
     ],
     "turnIntentPreview": {
       "version": 3,
@@ -293,6 +295,8 @@
     "relations": "independent-message-source-target-reply-and-request-links",
     "peerConversations": "snapshot-only-collaborationPeerConversations-for-peers-of-the-loaded-links-outside-navigation; sidebar-display_title; runtime-absent-peer-status-deleted; client-reads-only-observed-Conversation-remove-or-deleted-status-as-deleted-and-a-missing-peer-as-unknown",
     "runtimeContinuationPreview": "collaboration_message-source-kind-retains-sourceConversationId-mode-and-320-character-text-preview; never-user-authorization",
-    "childAnswers": "every-projected-answer-RuntimeDelivery-carries-its-own-AnswerSubmission-AnswerBridge-and-ChildExecution-not-only-the-bridge-current-submission; AnswerSubmission-client-record-carries-Host-derived-outcome-submitted-interrupted-or-failed; failed-is-the-stable-failed-submission-of-a-failed-child-run; subagent-runtime-continuation-preview-carries-the-same-outcome-instead-of-an-interrupted-bit"
+    "childAnswers": "every-projected-answer-RuntimeDelivery-carries-its-own-AnswerSubmission-AnswerBridge-and-ChildExecution-not-only-the-bridge-current-submission; AnswerSubmission-client-record-carries-Host-derived-outcome-submitted-interrupted-or-failed; failed-is-the-stable-failed-submission-of-a-failed-child-run; subagent-runtime-continuation-preview-carries-the-same-outcome-instead-of-an-interrupted-bit",
+    "retainedAnswers": "RuntimeDeliveryAnswerPresentation scalar-only indexed canonical closure; scoped lazy verified body text pages; immutable metadata survives source deletion; absent historical coordinate remains uncertain; positioned canonical uses earliest exchange_seq and otherwise lowest accepted attempt_seq is display identity only",
+    "peerLiveness": "snapshot-generation-fenced derived state; stale retained peer state is unknown until fresh scoped history/detail lookup; immutable body and position remain; EOF detail refresh verifies peer without refetching body"
   }
 }

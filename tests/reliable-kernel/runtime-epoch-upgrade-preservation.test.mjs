@@ -253,7 +253,7 @@ for (const previousEpoch of [4]) test(`an exact epoch ${previousEpoch} upgrade r
         const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
         try {
           assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1);
-          assert.equal(database.prepare('SELECT count(*) AS n FROM schema_manifest').get().n, 110);
+          assert.equal(database.prepare('SELECT count(*) AS n FROM schema_manifest').get().n, 111);
         } finally { database.close(); }
       } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
     });
@@ -750,7 +750,7 @@ for (const fromEpoch of [4]) for (const state of ['pointer-published']) test(`pu
     const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
     try {
       assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1);
-      assert.equal(database.prepare('SELECT count(*) AS n FROM schema_manifest').get().n, 110);
+      assert.equal(database.prepare('SELECT count(*) AS n FROM schema_manifest').get().n, 111);
     } finally { database.close(); }
     if (retired.committed) {
       const completion = JSON.parse(await fs.readFile(path.join(retired.backupRoot,

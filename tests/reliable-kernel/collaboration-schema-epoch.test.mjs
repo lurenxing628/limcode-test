@@ -12,9 +12,9 @@ const Database = require('better-sqlite3');
 
 test('epoch6 collaboration schema and authority crosswalk have one exact definition', async () => {
   assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 6);
-  assert.equal(RUNTIME_DOMAIN_SCHEMAS.length, 110);
+  assert.equal(RUNTIME_DOMAIN_SCHEMAS.length, 111);
   const authority = JSON.parse(await fs.readFile('docs/architecture/reliable-kernel/contracts/authority.json', 'utf8'));
-  assert.equal(authority.runtimeDomains.length, 110);
+  assert.equal(authority.runtimeDomains.length, 111);
   // Cross-conversation reach is not a per-pair grant table; only team lineage and completion replies route.
   assert.equal(RUNTIME_DOMAIN_SCHEMAS.some(schema => schema.key === 'ConversationCommunicationLink'), false);
   assert.equal(authority.runtimeDomains.some(row => row.key === 'ConversationCommunicationLink'), false);

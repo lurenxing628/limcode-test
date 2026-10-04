@@ -154,7 +154,8 @@ export type ReliableKernelClientDetailKind =
   | 'compression-presentation'
   | 'compression-content'
   | 'compression-title'
-  | 'answer-content';
+  | 'answer-content'
+  | 'accepted-answer-content';
 
 export interface ReliableKernelGuidanceTurnIntentPreview {
   version: 3;
@@ -264,6 +265,8 @@ export interface ReliableKernelDetailResultMessage {
     totalBytes: number;
     hasMore: boolean;
     responseBytes: number;
+    /** Current scoped peer lookup for an accepted-answer detail; never persisted. */
+    peerState?: 'known' | 'deleted' | 'unknown';
   };
 }
 
@@ -550,6 +553,7 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'RuntimeDelivery',
   'RuntimeDeliveryIntentLink',
   'RuntimeDeliveryTimelineLink',
+  'RuntimeDeliveryAnswerPresentation',
   'CollaborationSendTimelineLink',
   'CollaborationMessage',
   'CollaborationMessageSourceLink',
@@ -730,6 +734,7 @@ function seedRecordsFromSnapshot(
     runtimeDeliveries: 'RuntimeDelivery',
     runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
     runtimeDeliveryTimelineLinks: 'RuntimeDeliveryTimelineLink',
+    runtimeDeliveryAnswerPresentations: 'RuntimeDeliveryAnswerPresentation',
     collaborationSendTimelineLinks: 'CollaborationSendTimelineLink',
     collaborationMessages: 'CollaborationMessage',
     collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',

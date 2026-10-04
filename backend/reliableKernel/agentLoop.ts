@@ -1,3 +1,5 @@
+import { acceptedNoticeMetadata, type AcceptedAnswerNotice } from './answerPresentation';
+import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
 import { isTransactionAssertionFailure } from './phaseFIdentity';
 
@@ -3527,7 +3529,7 @@ export class ReliableAgentLoop {
             conversationId,
             segmentKind: 'runtime_context',
             runtimeDeliveryAcceptance: { deliveryId: projection.envelope.deliveryId, pendingTurnInputId: inputId,
-              inputContentObjectId: projection.inputContentObjectId },
+              inputContentObjectId: projection.inputContentObjectId, answerNotice: projection.answerNotice },
             source: { sourceKind: 'runtime_context', sourceId: inputId, sourceRevision: 0n },
             content: projection.content,
             contentType: projection.contentType
@@ -3562,7 +3564,7 @@ export class ReliableAgentLoop {
    * answer that this Turn has not taken in by the deletion notice (ConversationDeletionControlPlane):
    * an input whose content changed while it was projected is projected once more as it is now.
    */
-  private async projectRuntimeInput(inputId: string, contentObjectIdInput: string): Promise<(RuntimeDeliveryModelProjection & { inputContentObjectId: string }) | null> {
+  private async projectRuntimeInput(inputId: string, contentObjectIdInput: string): Promise<(RuntimeDeliveryModelProjection & { inputContentObjectId: string; answerNotice?: AcceptedAnswerNotice }) | null> {
     let contentObjectId = contentObjectIdInput;
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -3574,7 +3576,9 @@ export class ReliableAgentLoop {
           content,
           contentType: requireText(metadata.content_type, 'ContentObject.content_type')
         });
-        return projection ? { ...projection, inputContentObjectId: contentObjectId } : null;
+        return projection ? { ...projection, inputContentObjectId: contentObjectId,
+          ...(metadata.content_type === CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE
+            ? { answerNotice: acceptedNoticeMetadata(content, projection.envelope) } : {}) } : null;
       } catch (error) {
         const latest = requireId((await this.requireExisting('PendingTurnInput', inputId)).content_object_id, 'PendingTurnInput.content_object_id');
         if (attempt > 0 || latest === contentObjectId) throw error;
