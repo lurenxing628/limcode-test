@@ -957,7 +957,7 @@ test('cached evidence fails closed on deletion, changed CAS metadata and fork re
   await assert.rejects(read(), /one projection and branch/);
 });
 
-test('cache bounds evict old conversations and decline oversized request histories without losing facts', async () => {
+test('cache bounds evict old conversations without dropping a long active request frontier', async () => {
   const fixture = historyFixture([]).enableCache();
   for (let index = 0; index < 9; index++) {
     fixture.append({ turn: `turn-${index}`, conversation: `conversation-${index}`,
@@ -971,7 +971,7 @@ test('cache bounds evict old conversations and decline oversized request histori
   await readConversationContextHandleCatalog(large.database, large.store, 'history');
   large.reads.length = 0;
   assert.deepEqual((await readConversationContextHandleCatalog(large.database, large.store, 'history')).entries, []);
-  assert.equal(large.reads.length, 2049, 'over-cap histories are still checked but not retained indefinitely');
+  assert.equal(large.reads.length, 0, 'a long active history retains validated facts instead of replaying every recipe each round');
 });
 
 

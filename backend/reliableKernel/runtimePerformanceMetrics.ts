@@ -19,6 +19,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'snapshotAll'
   | 'toolFactsSnapshot'
   | 'conversationChildTaskSnapshot'
+  | 'contextHandleEvidenceFrontier'
   | 'processOutputRegistrationMismatches'
   | 'effectReceiptReconciliationCandidates'
   | 'childConversationOriginCandidates'

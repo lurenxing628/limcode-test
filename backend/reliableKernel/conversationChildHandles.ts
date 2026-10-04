@@ -43,12 +43,11 @@ export async function readConversationContextHandleState(
   return readCachedContextHandleState(database, contentStore, conversationId, {
     fork: db => readForkContextHandleReservationEvidence(db, contentStore, conversationId),
     request: (db, request, covered) => readRequestContextHandleEvidence(db, contentStore, conversationId, request, covered),
-    reconcile: (fork, requests) => {
-      const catalogs = [...(fork ? [fork.catalog] : []), ...requests.flatMap(request => request.catalogs)];
+    reconcile: (fork, evidence) => {
+      const catalogs = [...(fork ? [fork.catalog] : []), ...evidence.catalogs];
       const catalog = reconcileHistoricalModelHandleCatalogs(catalogs);
-      const identity = contextCatalogIdentity(catalog);
       const requiresNativeReset = (catalog.retiredRefs?.length ?? 0) > 0
-        && !requests.some(request => request.currentOrdinaryIdentity === identity);
+        && !evidence.hasCurrentOrdinaryCatalog(catalog);
       return { catalog, requiresNativeReset };
     }
   });
@@ -86,18 +85,10 @@ async function readRequestContextHandleEvidence(database: RuntimeDatabase, conte
   const requestScope = nativeCatalogs.length > 0
     ? mergeModelHandleCatalogs(...(frozen ? [frozen.catalog] : []), ...nativeCatalogs) : frozen?.catalog;
   catalogs.push(...nativeCatalogs);
-  return { catalogs, ...(frozen?.kind === 'reliable-agent-turn'
+  return { catalogs, frontierCovered: covered || frozen?.kind !== 'reliable-context-compression'
+    || frozen.catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, ...(frozen?.kind === 'reliable-agent-turn'
     && frozen.catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION
-    ? { currentOrdinaryIdentity: contextCatalogIdentity(requestScope!) } : {}) };
-}
-
-function contextCatalogIdentity(catalog: ModelHandleCatalog): string {
-  return createHash('sha256').update(canonicalPlainJson(normalizePlainJson({
-    identityContractRevision: catalog.identityContractRevision,
-    entries: catalog.entries.map(({ kind, ref, target }) => ({ kind, ref, target }))
-      .sort((left, right) => left.ref.localeCompare(right.ref) || left.target.localeCompare(right.target)),
-    retiredRefs: [...(catalog.retiredRefs ?? [])].sort()
-  }, 'Context handle identity'))).digest('hex');
+    ? { currentOrdinaryCatalog: requestScope! } : {}) };
 }
 
 /** A fork target keeps exactly one ConversationBranchLink, even after its source is deleted. */

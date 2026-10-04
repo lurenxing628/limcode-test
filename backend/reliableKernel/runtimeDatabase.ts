@@ -48,6 +48,7 @@ import type {
   ToolFactsSnapshot
 } from './databaseWorkerProtocol';
 import type { ConversationChildTaskFacts } from './childTaskFactsSnapshot';
+import type { ContextHandleEvidenceFrontier } from './contextHandleEvidenceFrontier';
 import type { RuntimeContentUsageRow } from './runtimeContentUsage';
 import {
   DOMAIN_REPOSITORIES,
@@ -423,6 +424,12 @@ export class RuntimeDatabase {
       throw new TypeError('toolCallId must be non-empty.');
     }
     return this.request<SnapshotBarrier<ToolFactsSnapshot>>({ kind: 'toolFactsSnapshot', toolCallId });
+  }
+
+  /** One atomic, metadata-only inventory for cold handle evidence and external-change comparison. */
+  public async contextHandleEvidenceFrontier(conversationId: string): Promise<SnapshotBarrier<ContextHandleEvidenceFrontier>> {
+    if (typeof conversationId !== 'string' || !conversationId.trim()) throw new TypeError('conversationId must be non-empty.');
+    return this.request<SnapshotBarrier<ContextHandleEvidenceFrontier>>({ kind: 'contextHandleEvidenceFrontier', conversationId });
   }
 
   /** Full child lineage and task inputs from one SQLite read transaction; no in-memory runner state. */

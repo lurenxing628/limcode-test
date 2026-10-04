@@ -56,6 +56,8 @@ export interface RuntimeCommitResult {
   commitSeq: string;
   changes: RuntimeChange[];
   allocatedSequences: RuntimeAllocatedSequence[];
+  /** Bounded internal invalidations for client:none domains; never Client Feed row payloads. */
+  internalChangedDomains?: string[];
 }
 
 export interface SnapshotBarrier<T> {

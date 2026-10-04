@@ -33,6 +33,7 @@ import type { ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
+import { readContextHandleEvidenceFrontier } from './contextHandleEvidenceFrontier';
 import { executeRuntimeContentUsage } from './runtimeContentUsage';
 import { inventoryRelocatedWork } from './relocatedWorkInventory';
 import {
@@ -395,6 +396,15 @@ async function start(): Promise<void> {
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }
+      if (request.kind === 'contextHandleEvidenceFrontier') {
+        const snapshot = reader.transaction(() => {
+          assertDatabaseBinding(reader, data.binding);
+          return readContextHandleEvidenceFrontier(reader, request.conversationId);
+        })();
+        respond({ type: 'response', id: request.id, ok: true,
+          result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
+        return;
+      }
       if (request.kind === 'conversationChildTaskSnapshot') {
         assertDatabaseBinding(reader, data.binding);
         const result = executeConversationChildTaskSnapshot(
@@ -620,11 +630,24 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       domain TEXT NOT NULL,
       id TEXT NOT NULL,
       kind TEXT NOT NULL CHECK (kind IN ('upsert', 'remove'))
-    )
+    );
+    CREATE TEMP TABLE runtime_transaction_internal_domain_change (
+      domain TEXT PRIMARY KEY NOT NULL
+    ) WITHOUT ROWID
   `);
   for (const schema of DOMAIN_REPOSITORIES.all().map((repository) => repository.schema)) {
-    if (schema.client === 'none') continue;
     const domain = sqlText(schema.key);
+    if (schema.client === 'none') {
+      // One key per hidden domain, independent of how many private rows the transaction writes.
+      // This complete invalidation lane is deliberately separate from projected Client Feed rows.
+      for (const operation of ['insert', 'update', 'delete'] as const) {
+        database.exec(`CREATE TEMP TRIGGER ${quote(`capture_internal_${schema.table}_${operation}`)}
+          AFTER ${operation.toUpperCase()} ON ${quote(schema.table)} BEGIN
+            INSERT OR IGNORE INTO runtime_transaction_internal_domain_change (domain) VALUES (${domain});
+          END`);
+      }
+      continue;
+    }
     for (const operation of ['insert', 'update', 'delete'] as const) {
       const row = operation === 'delete' ? 'OLD' : 'NEW';
       const kind = operation === 'delete' ? 'remove' : 'upsert';
@@ -757,6 +780,11 @@ function configureTransactionChangeCapture(database: Database.Database): void {
       END
     `);
   }
+}
+
+function readInternalChangedDomains(database: Database.Database): string[] {
+  return prepareCached(database, 'SELECT domain FROM temp.runtime_transaction_internal_domain_change ORDER BY domain',
+    { rows: 'pluck' }).all() as string[];
 }
 
 function readTransactionChanges(database: Database.Database): RuntimeChange[] {
@@ -896,19 +924,21 @@ function executeTransaction(
   if (!Array.isArray(steps) || steps.length === 0) throw new Error('Runtime transaction requires at least one Repository step.');
   const allocatedSequences: RuntimeAllocatedSequence[] = [];
   let changes: RuntimeChange[] = [];
+  let internalChangedDomains: string[] = [];
   beginMeasuredWrite(database);
 
   try {
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     executeSteps(database, steps, allocatedSequences, attachmentScopeCache);
     assertTouchedRuntimeAggregates(database, steps);
     changes = readTransactionChanges(database);
+    internalChangedDomains = readInternalChangedDomains(database);
     commitMeasuredWrite(database);
   } catch (error) {
     database.exec('ROLLBACK');
     throw error;
   }
-  return { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences };
+  return { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences, internalChangedDomains };
 }
 
 /** Exact-owner renewal and its clock decision share one SQLite linearization point. */
@@ -935,7 +965,7 @@ function executeExecutionLeaseRenewal(
       database.exec('ROLLBACK');
       return { renewal };
     }
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     const allocatedSequences: RuntimeAllocatedSequence[] = [];
     const steps = [DOMAIN_REPOSITORIES.domain('ExecutionLease').update(input.fence.id, {
       expires_at: renewal.renewedExpiresAt
@@ -943,8 +973,9 @@ function executeExecutionLeaseRenewal(
     executeSteps(database, steps, allocatedSequences, attachmentScopeCache);
     assertTouchedRuntimeAggregates(database, steps);
     const changes = readTransactionChanges(database);
+    const internalChangedDomains = readInternalChangedDomains(database);
     commitMeasuredWrite(database);
-    return { renewal, commit: { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences } };
+    return { renewal, commit: { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences, internalChangedDomains } };
   } catch (error) {
     database.exec('ROLLBACK');
     throw error;
@@ -1014,7 +1045,7 @@ function beginMaintenanceTransaction(database: Database.Database): MaintenanceTr
     throw error;
   }
   try {
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     database.exec('DELETE FROM temp.runtime_maintenance_scratch');
   } catch (error) {
     rollbackMaintenanceTransaction(database);
@@ -1042,7 +1073,7 @@ function appendMaintenanceSteps(
   HISTORICAL_COPIES.set(allocated, open.historicalCopies);
   executeSteps(database, steps, allocated, attachmentScopeCache);
   assertTouchedRuntimeAggregates(database, steps, open.touched);
-  database.exec('DELETE FROM temp.runtime_transaction_change');
+  database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
   open.allocatedSequences += allocated.length;
 }
 
@@ -1055,7 +1086,7 @@ function commitMaintenanceTransaction(
   try {
     assertMaintenanceAggregates(database);
     database.exec('DELETE FROM temp.runtime_maintenance_scratch');
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     commitMeasuredWrite(database);
   } catch (error) {
     rollbackMaintenanceTransaction(database);
@@ -1103,7 +1134,7 @@ function executeModelStreamEvent(
   if (typeof input.now !== 'string' || input.now.length === 0) throw new TypeError('ModelStreamEvent.now must be non-empty.');
   beginMeasuredWrite(database);
   try {
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     assertExecutionLeaseFence(database, input.executionFence);
     const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
     if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
@@ -1259,10 +1290,12 @@ function executeModelStreamEvent(
       }
     }
     const changes = readTransactionChanges(database);
+    const internalChangedDomains = readInternalChangedDomains(database);
     commitMeasuredWrite(database);
     const commit: RuntimeCommitResult = {
       commitSeq: nextCommitSeq.toString(),
       changes,
+      internalChangedDomains,
       allocatedSequences: []
     };
     return {
@@ -1295,7 +1328,7 @@ function executeModelStreamActivity(
   }
   beginMeasuredWrite(database);
   try {
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     assertExecutionLeaseFence(database, input.executionFence);
     const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
     if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
@@ -1338,11 +1371,12 @@ function executeModelStreamActivity(
       })
     ], [], attachmentScopeCache);
     const changes = readTransactionChanges(database);
+    const internalChangedDomains = readInternalChangedDomains(database);
     commitMeasuredWrite(database);
     return {
       accepted: true,
       terminal: false,
-      commit: { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences: [] }
+      commit: { commitSeq: nextCommitSeq.toString(), changes, allocatedSequences: [], internalChangedDomains }
     };
   } catch (error) {
     database.exec('ROLLBACK');
@@ -1365,7 +1399,7 @@ function executeCancelCurrentModelRequest(
   }
   beginMeasuredWrite(database);
   try {
-    database.exec('DELETE FROM temp.runtime_transaction_change');
+    database.exec('DELETE FROM temp.runtime_transaction_change; DELETE FROM temp.runtime_transaction_internal_domain_change');
     assertExecutionLeaseFence(database, input.executionFence);
     const requestRaw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(modelRequestId);
     if (!requestRaw) throw new Error(`ModelRequest ${modelRequestId} does not exist.`);
@@ -1407,10 +1441,12 @@ function executeCancelCurrentModelRequest(
     ], [], attachmentScopeCache);
     assertModelRequestAggregate(database, modelRequestId);
     const changes = readTransactionChanges(database);
+    const internalChangedDomains = readInternalChangedDomains(database);
     commitMeasuredWrite(database);
     const commit: RuntimeCommitResult = {
       commitSeq: nextCommitSeq.toString(),
       changes,
+      internalChangedDomains,
       allocatedSequences: []
     };
     return {
