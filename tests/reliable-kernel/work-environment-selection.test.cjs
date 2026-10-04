@@ -175,7 +175,7 @@ test('ProductRuntime subscribes once, captures complete add/remove/reorder snaps
   const observed = [], broadcasts = [];
   let queue = Promise.resolve();
   const runtime = new VscodeReliableKernelProductRuntime({
-    application: { database: {}, async beginHandoff() {}, async close() {} },
+    application: { database: { onCommit() { return () => {}; } }, async beginHandoff() {}, async close() {} },
     configuration: { mutations: { retireModelProfileAuthority() {} }, synchronizeWorkspaceFolders(folders) {
       return queue = queue.then(async () => { observed.push(plain(folders)); });
     } },

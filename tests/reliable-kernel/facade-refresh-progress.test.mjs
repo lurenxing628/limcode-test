@@ -43,6 +43,7 @@ function fixture({ historyDelay = 0, attentionDelay = 0, attentionFailureAt = 0 
     if (name === 'node:crypto') return crypto;
     if (name === '../../../shared/protocol' || name === '../../../shared/plainData') return require(name);
     if (name === '../../../shared/conversationTitle') return require(name);
+    if (name === '../../reliableKernel/conversationContextHandleState') return require(name);
     if (name === './interactionAttention') return { ...attention, readPendingInteractionAttention: () => read('attention') };
     if (name === './VscodeReliableKernelCommandRouter') return { watchConversationRefresh: () => () => {} };
     if (name.endsWith('/repositories')) return { DOMAIN_REPOSITORIES: { domain: domain => ({
