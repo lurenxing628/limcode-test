@@ -7,6 +7,8 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 const MAX_REPLAY_SEGMENTS = 32768;
 const MAX_REPLAY_BYTES = 64 * 1024 * 1024;
 const MAX_REPLAY_DEPTH = 64;
+const MAX_REPLAY_CACHE_BYTES = 4 * 1024 * 1024;
+const MAX_REPLAY_CACHE_ENTRIES = 256;
 
 /** Hard caps of one source reconstruction; exceeding one is a size limit, not broken provenance. */
 export const COMPRESSION_SOURCE_REPLAY_LIMITS = Object.freeze({
@@ -55,18 +57,57 @@ export async function prepareTextCompressionSources(
   if (!input.some(shouldExpand)) return { items: [...input], sourceEndOffsets: input.map((_, index) => index + 1) };
   const sourceEndOffsets: number[] = [];
   const output: FullProviderContextItem[] = [];
-  const cache = new Map<string, FullProviderContextItem>();
+  const cache = new Map<string, { item: FullProviderContextItem; bytes: number }>();
+  let cacheBytes = 0;
   let visits = 0;
   let bytes = 0;
-  const stack: Array<{ item: FullProviderContextItem; ancestors: string[] } | { sourceEnd: number }> = [];
+  // Pending siblings carry only identities. Read one body when its DFS frame is visited, so
+  // the semantic byte budget is charged before another sibling can allocate its CAS body.
+  const stack: Array<{ item: FullProviderContextItem; ancestors: string[] }
+    | { segmentId: string; ancestors: string[] } | { sourceEnd: number }> = [];
   for (let index = input.length - 1; index >= 0; index -= 1) {
     stack.push({ sourceEnd: index }, { item: input[index]!, ancestors: [] });
   }
   while (stack.length) {
     const frame = stack.pop()!;
     if ('sourceEnd' in frame) { sourceEndOffsets[frame.sourceEnd] = output.length; continue; }
-    const { item, ancestors } = frame;
+    const { ancestors } = frame;
     if (++visits > MAX_REPLAY_SEGMENTS) throw limited('segments', '压缩来源超过重建数量上限。');
+    let item: FullProviderContextItem;
+    if ('item' in frame) item = frame.item;
+    else {
+      const cached = cache.get(frame.segmentId);
+      if (cached) {
+        cache.delete(frame.segmentId);
+        cache.set(frame.segmentId, cached);
+        item = cached.item;
+      } else {
+        const segment = await get(database, 'ContextSegment', frame.segmentId);
+        const metadata = await get(database, 'ContentObject', id(segment.content_object_id));
+        if (Number(metadata.byte_length) > MAX_REPLAY_BYTES - bytes) throw limited('bytes', '历史内容超过重建字节上限。');
+        const content = (await store.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
+        let role: string | null = null;
+        if (metadata.content_type === 'application/vnd.limcode.message+json') {
+          const message: unknown = JSON.parse(content);
+          if (record(message) && (message.role === 'user' || message.role === 'model')) role = message.role;
+        }
+        item = { segmentId: frame.segmentId, segmentKind: id(segment.segment_kind), messageRole: role,
+          contentType: id(metadata.content_type), content };
+        const contentBytes = Buffer.byteLength(content, 'utf8');
+        // This cache is only a read optimization, never a second replay admission limit.
+        // Oversized entries still replay normally and are released unless retained in output.
+        if (contentBytes <= MAX_REPLAY_CACHE_BYTES) {
+          while (cache.size > 0 && (cache.size >= MAX_REPLAY_CACHE_ENTRIES
+            || cacheBytes + contentBytes > MAX_REPLAY_CACHE_BYTES)) {
+            const oldest = cache.keys().next().value!;
+            cacheBytes -= cache.get(oldest)!.bytes;
+            cache.delete(oldest);
+          }
+          cache.set(frame.segmentId, { item, bytes: contentBytes });
+          cacheBytes += contentBytes;
+        }
+      }
+    }
     bytes += Buffer.byteLength(item.content, 'utf8');
     if (bytes > MAX_REPLAY_BYTES) throw limited('bytes', '压缩来源超过重建字节上限。');
     if (!shouldExpand(item)) { output.push(item); continue; }
@@ -93,28 +134,12 @@ export async function prepareTextCompressionSources(
     });
     if (!originals.length) throw invalid('原生压缩来源为空。');
     if (originals.length > MAX_REPLAY_SEGMENTS - visits) throw limited('segments', '压缩来源超过重建数量上限。');
-    const expanded: FullProviderContextItem[] = [];
+    const expanded: string[] = [];
     for (const [position, source] of originals.entries()) {
       if (BigInt(String(source.position)) !== BigInt(position)) throw invalid('原生压缩来源顺序不连续。');
-      const segmentId = id(source.segment_id);
-      let original = cache.get(segmentId);
-      if (!original) {
-        const segment = await get(database, 'ContextSegment', segmentId);
-        const metadata = await get(database, 'ContentObject', id(segment.content_object_id));
-        if (Number(metadata.byte_length) > MAX_REPLAY_BYTES - bytes) throw limited('bytes', '历史内容超过重建字节上限。');
-        const content = (await store.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
-        let role: string | null = null;
-        if (metadata.content_type === 'application/vnd.limcode.message+json') {
-          const message: unknown = JSON.parse(content);
-          if (record(message) && (message.role === 'user' || message.role === 'model')) role = message.role;
-        }
-        original = { segmentId, segmentKind: id(segment.segment_kind), messageRole: role,
-          contentType: id(metadata.content_type), content };
-        cache.set(segmentId, original);
-      }
-      expanded.push(original);
+      expanded.push(id(source.segment_id));
     }
-    for (const original of expanded.reverse()) stack.push({ item: original, ancestors: [...ancestors, item.segmentId] });
+    for (const segmentId of expanded.reverse()) stack.push({ segmentId, ancestors: [...ancestors, item.segmentId] });
   }
   return { items: output, sourceEndOffsets };
 }
