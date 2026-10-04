@@ -17,6 +17,7 @@ export type RuntimeDatabaseMetricRequestKind =
   | 'attachmentProjectionSegments'
   | 'attachmentProjectionLinks'
   | 'snapshotAll'
+  | 'currentTurnTaskSnapshot'
   | 'toolFactsSnapshot'
   | 'conversationChildTaskSnapshot'
   | 'contextHandleEvidenceFrontier'

@@ -1,4 +1,5 @@
 import type { NativePendingToolCall, NativePendingWorkInput, NativeSteeringInFlightEntry } from './nativeWorkTypes';
+import type { CurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
 import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
@@ -431,6 +432,11 @@ export class RuntimeDatabase {
   /** Reads every page of one repository list inside one SQLite read transaction. */
   public async snapshotAll(read: RepositoryListRead): Promise<SnapshotBarrier<DomainRow[]>> {
     return this.request<SnapshotBarrier<DomainRow[]>>({ kind: 'snapshotAll', read });
+  }
+
+  /** Latest task rewrite and update suffix, ordered and verified in one worker read snapshot. */
+  public currentTurnTaskSnapshot(turnId: string): Promise<SnapshotBarrier<CurrentTurnTaskSnapshot>> {
+    return this.request({ kind: 'currentTurnTaskSnapshot', turnId });
   }
 
   /** Fixed dependent Tool facts resolved inside one worker read transaction. */

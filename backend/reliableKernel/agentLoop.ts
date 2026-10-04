@@ -1173,7 +1173,7 @@ export class ReliableAgentLoop {
     const [currentTurnState, runtimeStatus, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
       this.readCurrentTurnInputReference(input.turnId, input.headRootId),
       this.readRuntimeStatusCard(input.turnId),
-      readCurrentTurnTaskCard(this.database, this.contentStore, input.turnId),
+      readCurrentTurnTaskCard(this.database, input.turnId),
       this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round),
       this.readNativeRecipeFreeze(input)
     ]);
@@ -1258,7 +1258,7 @@ export class ReliableAgentLoop {
     const turnTaskCardReminderEnabled = turnTaskCard
       ? shouldInjectTurnTaskCard({
           revision: turnTaskCard.revision,
-          cardSha256: turnTaskCard.cardSha256,
+          card: turnTaskCard.card,
           boundaryKey
         }, previousTaskCard)
       : false;
@@ -1491,12 +1491,12 @@ export class ReliableAgentLoop {
     if (!recipe || recipe.kind !== 'reliable-agent-turn') return undefined;
     const task = asRecord(recipe.turnTaskCard);
     const revision = typeof task?.revision === 'string' ? task.revision : undefined;
-    const cardSha256 = typeof task?.cardSha256 === 'string' ? task.cardSha256 : undefined;
+    const card = typeof task?.card === 'string' ? task.card : undefined;
     const boundaryKey = typeof recipe.turnTaskCardBoundaryKey === 'string'
       ? recipe.turnTaskCardBoundaryKey
       : 'pre-compression';
-    if (!revision || !cardSha256) return undefined;
-    return { revision, cardSha256, boundaryKey };
+    if (!revision || card === undefined) return undefined;
+    return { revision, card, boundaryKey };
   }
 
   private async readCurrentTurnInputReference(

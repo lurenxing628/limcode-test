@@ -1,4 +1,5 @@
 import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
+import { readCurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
 import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
 import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
 import { projectTimelineLinkRecord } from './clientTimelineHistory';
@@ -400,6 +401,14 @@ async function start(): Promise<void> {
         assertDatabaseBinding(reader, data.binding);
         const result = executeSnapshotAll(reader, request.read, commitSeq);
         respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'currentTurnTaskSnapshot') {
+        const snapshot = reader.transaction(() => {
+          assertDatabaseBinding(reader, data.binding);
+          return readCurrentTurnTaskSnapshot(reader, request.turnId, clientProjectionContent.readVerifiedBytes);
+        })();
+        respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
       }
       if (request.kind === 'toolFactsSnapshot') {
