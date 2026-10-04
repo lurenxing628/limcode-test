@@ -159,8 +159,10 @@ const collaborationRecords = computed(() => {
     ? feed.collaborationHistoryRecords : {};
   const records: typeof feed.records = { ...history, ...collaboration, ...feed.records };
   for (const type of [
-    'Conversation', 'Turn', 'CollaborationMessage', 'CollaborationMessageSourceLink',
-    'CollaborationMessageTargetLink', 'RuntimeDelivery', 'CollaborationPeerConversation'
+    'Conversation', 'Message', 'Turn', 'CollaborationMessage', 'CollaborationMessageSourceLink',
+    'CollaborationMessageTargetLink', 'RuntimeDelivery', 'RuntimeDeliveryTimelineLink',
+    'CollaborationSendTimelineLink', 'RuntimeInboxItem', 'AnswerSubmission', 'AnswerBridge',
+    'ChildExecution', 'ChildExecutionParentLink', 'CollaborationPeerConversation'
   ]) {
     records[type] = { ...(history[type] ?? {}), ...(collaboration[type] ?? {}), ...(feed.records[type] ?? {}) };
   }
@@ -234,6 +236,10 @@ watch(
   () => {
     const ids = timelineRows.value.map((row) => row.id);
     const previousFirst = previousRowIds[segmentStart.value];
+    const anchor = !followLatestSegment.value && !pendingScrollAnchor.value && !pendingCollaborationRowIds.value
+      ? captureScrollAnchor({ scroller: props.scroller,
+        visibleRows: previousRowIds.slice(segmentStart.value, segmentStart.value + TIMELINE_MOUNT_LIMIT).map((id) => ({ id })) })
+      : null;
     previousRowIds = ids;
     if (followLatestSegment.value) {
       segmentStart.value = latestTimelineSegmentStart(ids.length);
@@ -243,6 +249,10 @@ watch(
     // Turn) must not shift the rows the user is reading.
     const kept = previousFirst ? ids.indexOf(previousFirst) : -1;
     segmentStart.value = clampTimelineSegmentStart(ids.length, kept >= 0 ? kept : segmentStart.value);
+    if (anchor) {
+      pendingScrollAnchor.value = anchor;
+      void restorePendingScrollAnchor();
+    }
   },
   { immediate: true }
 );
@@ -276,9 +286,8 @@ watch(
   }
 );
 
-// Older collaboration records are placed with their Turns, which are older than the loaded
-// messages or outside loaded history: they appear above the first message. After the page the user
-// asked for arrives, mount the segment that starts at its first new card, directly below the button.
+// A collaboration page can fill any proven Message boundary, including between already loaded
+// messages. Mount the segment at its first new card instead of assuming the whole page prepends.
 watch(
   () => feed.collaborationHistoryLoadedPages,
   (pages, previousPages) => {
@@ -845,7 +854,9 @@ function messageRenderKey(message: MessageRecord): string {
       </div>
       <div v-else class="reliable-collaboration-row" :data-timeline-row-key="row.id">
         <ReliableCollaborationCard :card="row.card" />
-        <p class="reliable-collaboration-placement">{{ collaborationCardPlacementLabel(row.card) }}</p>
+        <p v-if="collaborationCardPlacementLabel(row.card)" class="reliable-collaboration-placement">
+          {{ collaborationCardPlacementLabel(row.card) }}
+        </p>
       </div>
     </template>
     <button

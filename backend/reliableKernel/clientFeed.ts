@@ -706,7 +706,7 @@ export class BoundedClientFeed {
           if (change.domain === 'Message') messageWindowAdvanced = true;
           const count = incrementRecordCount(session.activeRecordCounts, change.domain);
           if (
-            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE
+            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE * (change.domain === 'RuntimeDeliveryTimelineLink' ? 2 : 1)
             && LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(change.domain)
             && change.domain !== 'Message'
           ) {
@@ -907,6 +907,9 @@ export class BoundedClientFeed {
             ['CollaborationMessageTargetLink']
           ));
       }
+      case 'RuntimeDeliveryTimelineLink':
+      case 'CollaborationSendTimelineLink':
+        return field('conversation_id') === activeConversationId;
       case 'RuntimeDeliveryIntentLink':
         return materialized('RuntimeDelivery', field('delivery_id'))
           && materialized('TurnIntent', field('turn_intent_id'));
@@ -1163,8 +1166,7 @@ export class ClientHistoryReader {
     }
     const page: ReliableKernelCollaborationHistoryPage = {
       records,
-      ...(result.nextBeforeMessageSeq === undefined ? {} : { nextBeforeMessageSeq: result.nextBeforeMessageSeq }),
-      ...(result.nextBeforeId === undefined ? {} : { nextBeforeId: result.nextBeforeId }),
+      ...(result.nextCursor === undefined ? {} : { nextCursor: result.nextCursor }),
       hasMore: result.hasMore,
       scanProgress: result.scanProgress,
       scannedRows: result.scannedRows,
@@ -2351,7 +2353,9 @@ const LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS = new Set([
   'ChildExecution',
   'AnswerSubmission',
   'RuntimeDelivery',
-  'CollaborationMessage'
+  'CollaborationMessage',
+  'RuntimeDeliveryTimelineLink',
+  'CollaborationSendTimelineLink'
 ]);
 
 const SNAPSHOT_ON_STRUCTURAL_REMOVE_DOMAINS = new Set([
@@ -2462,6 +2466,8 @@ const CLIENT_PROJECTION_ARRAY_DOMAINS: Readonly<Record<string, string>> = Object
   runtimeInboxItems: 'RuntimeInboxItem',
   runtimeDeliveries: 'RuntimeDelivery',
   runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
+  runtimeDeliveryTimelineLinks: 'RuntimeDeliveryTimelineLink',
+  collaborationSendTimelineLinks: 'CollaborationSendTimelineLink',
     collaborationMessages: 'CollaborationMessage',
     collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',
     collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',
@@ -2983,6 +2989,8 @@ function recordStringField(record: Record<string, unknown>, field: string): stri
 }
 
 function recordTemporalKey(domain: string, record: Record<string, unknown>, id: string): string {
+  const exchangeSequence = runtimeNonNegativeBigInt(record.exchange_seq);
+  if (exchangeSequence !== undefined) return `${exchangeSequence.toString().padStart(32, '0')}\0${id}`;
   const messageSequence = runtimeNonNegativeBigInt(record.message_seq);
   if (messageSequence !== undefined) return `${messageSequence.toString().padStart(32, '0')}\0${id}`;
   if (domain === 'ModelRequest') {

@@ -182,7 +182,10 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'CollaborationBoardPostSourceLink',
   'CollaborationBoardReplyLink',
   'CollaborationBoardSubscriptionLink',
-  'CollaborationBoardCommandReceipt'
+  'CollaborationBoardCommandReceipt',
+  'RuntimeDeliveryTimelineLink',
+  'CollaborationSendTimelineLink',
+  'TimelineImportProvenance'
 ];
 
 const CONFIGURATION_DOMAINS = [
@@ -474,9 +477,9 @@ function validateMigration(root, migration, failures) {
     if (migration?.[field] !== false) failures.push(`migration.${field}必须为false`);
   }
   const upgrade = migration?.boundedEpochUpgrade;
-  failures.push(...exactSetProblems('精确升级前驱', [3, 4], upgrade?.fromEpochs ?? []));
-  if (migration?.currentRuntimeEpoch !== 5
-    || upgrade?.toEpoch !== 5
+  failures.push(...exactSetProblems('精确升级前驱', [3, 4, 5], upgrade?.fromEpochs ?? []));
+  if (migration?.currentRuntimeEpoch !== 6
+    || upgrade?.toEpoch !== 6
     || upgrade?.sourcePolicy !== 'exact-published-table-index-trigger-manifest-and-binding-fingerprint'
     || upgrade?.backupPolicy !== 'sqlite-backup-api-plus-root-binding-and-epoch-manifest'
     || upgrade?.recoveryPolicy !== 'durable-journal-forward-only'
@@ -485,11 +488,11 @@ function validateMigration(root, migration, failures) {
     || upgrade?.epoch4MissingLinkPredecessor !== 'exact-single-missing-runtime-delivery-intent-link'
     || upgrade?.unknownDriftPolicy !== 'fail-before-data-change'
     || upgrade?.compatibilityFallback !== false
-    || migration?.schemaUpgradePolicy?.olderEpoch !== 'published-3-and-4-exact-offline-upgrade-others-fail-closed'
+    || migration?.schemaUpgradePolicy?.olderEpoch !== 'published-3-4-and-5-exact-offline-upgrade-others-fail-closed'
     || migration?.schemaUpgradePolicy?.currentEpoch !== 'exact-manifest-and-physical-fingerprint-only'
     || migration?.schemaUpgradePolicy?.partialAdditiveUpgrade !== false
     || migration?.schemaUpgradePolicy?.unknownDrift !== 'fail-closed') {
-    failures.push('Runtime epoch 5 只接受已发布 3/4 精确备份升级及当前代完整指纹；未知漂移必须拒绝');
+    failures.push('Runtime epoch 6 只接受已发布 3/4/5 精确备份升级及当前代完整指纹；未知漂移必须拒绝');
   }
   failures.push(...exactSetProblems('epoch升级保留对象',
     ['runtime-rows', 'cas', 'sqlite-backup', 'runtime-archive', 'configuration', 'workspace'],
@@ -507,16 +510,16 @@ function validateMigration(root, migration, failures) {
   const expectedMerge = {
     sources: ['pre-switch-history-data-sets-automatic-once', 'user-kept-or-already-merged-explicit-request-only', 'foreign-history-root-verified-in-place-user-request-only'],
     target: 'selected-current-epoch-data-set-open-in-requesting-host',
-    initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-exact-schema-and-physical-fingerprint-published-3-4-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
+    initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-6-exact-schema-and-physical-fingerprint-published-3-4-5-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
     trigger: 'background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; selection-under-admission-reads-only-ledger-requests-and-file-states-uncached-fingerprints-judged-outside; hosts-prepare-without-claims-and-commit-one-at-a-time-under-admission-and-source-maintenance; later-host-rechecks-source-files-then-rereads-ledger-and-skips-source-already-merged-unreported; before-deferring-a-changed-source-or-an-unexpected-error-ledger-reread-source-merged-into-same-target-after-batch-picked-it-skipped-silently-explicit-request-told-already-merged',
     requiresUserConfirmation: false,
     explicitRequestConfirmation: 'modal-states-online-limit-bounded-cancellable-wait-for-busy-windows-one-reload-of-others-and-hard-limit-from-code-constants; states-interrupted-tasks-ended-queued-unsent-messages-cancelled-and-conversations-deleted-here-after-merge-never-merged-back-switch-states-it-too; then-online-merge-in-requesting-window-no-reload; outcome-always-told-already-merged-nothing-new-or-why-nothing-was-done',
     writePath: 'one-ordinary-runtime-database-write-transaction-per-source; repository-insert-steps-codec-validated-under-worker-insert-invariants; other-hosts-keep-running-and-see-an-external-commit; that-transaction-alone-commits-with-synchronous-full-then-normal-again-also-after-failure-synced-before-the-merged-record; large-session-source-is-one-streamed-maintenance-transaction-of-a-private-offline-instance-appended-in-chunks-of-250-source-rows-in-merge-domain-and-rowid-order-with-the-same-row-rules-and-each-chunks-presence-assertions; its-aggregates-asserted-at-commit-no-changes-read-back; committed-with-synchronous-full-then-wal-checkpoint-truncate-before-the-merged-record; cancel-or-disk-full-rolls-back-only-the-current-source; left-out-closure-in-a-temp-table-of-the-source-copy-single-table-rules-read-in-rowid-segments-of-64-read-chunks-all-member-rules-by-candidates-from-left-out-members-dropped-by-a-full-index-probe-or-rowid-segments-yielding-after-every-segment-and-step; a-conflict-found-in-the-session-stops-it-at-that-chunk-refused-as-at-least-that-many',
-    historicalCopyDomains: ['ModelRequest', 'Operation', 'Attempt', 'ModelStreamFence', 'ModelStreamCheckpoint'],
+    historicalCopyDomains: ['ModelRequest', 'Operation', 'Attempt', 'ModelStreamFence', 'ModelStreamCheckpoint', 'RuntimeDeliveryTimelineLink', 'CollaborationSendTimelineLink', 'TimelineImportProvenance'],
     historicalCopyPolicy: 'model-request-copy-terminal-with-terminal-state; its-operation-copy-completed-cancelled-or-failed; its-attempt-copy-transient-failed-completed-cancelled-or-failed; stream-fence-and-checkpoint-only-with-parent-model-request-copied-historically-in-the-same-transaction; not-started-request-and-its-pending-operation-and-attempt-inserted-as-the-runtime-creates-them',
     sizeLimit: 'online-transaction-at-most-4000-source-rows-and-12MiB-measured-worst-about-1.3s-below-busy-timeout; in-memory-transaction-limit-60000-source-rows-above-it-deferred-awaiting-exclusive-large-session-unrecorded-before-any-plan-coordination-backup-or-finalization-unless-its-audit-found-work-no-merge-can-close-and-nothing-of-it-is-left-out-then-refused-and-recorded-whatever-its-size; in-between-exclusive-maintenance-coordinated-outside-locks-after-checks-cas-and-target-backup-locks-wrap-only-source-recheck-and-transaction-keyed-by-source-content-fingerprint-else-deferred; automatic-batch-judges-sources-above-the-online-limit-last-deferred-awaiting-exclusive-too-when-one-awaits-the-large-session-and-it-has-room-by-the-estimates-figures-for-every-source-it-would-take-disk-by-disk-else-coordinated-each-explicit-request-coordinated-alone; streamed-transaction-hard-limit-20000000-source-rows-above-it-recorded-too-large-before-any-plan-coordination-backup-or-finalization',
     exclusivity: 'snapshot-audit-plan-cas-and-target-backup-without-claims; snapshot-counts-only-if-source-file-state-unchanged-across-copy-else-retaken-at-most-3-times; finalization-and-commit-under-configuration-admission-and-source-maintenance-rechecking-hosts-offline-identity-pointer-and-exact-file-state; exclusive-fallback-takes-admission-and-target-maintenance-around-that-commit; source-offline-by-host-liveness-and-legacy-runtime-owner-claim; large-session-prepared-online-by-the-engine-in-one-window-then-exclusive-phase-under-admission-and-target-maintenance-where-the-requester-closes-its-runtime-and-the-engine-merges-source-after-source-then-the-requester-reloads-after-the-locks-are-released-a-preparation-that-does-not-run-or-was-stopped-part-way-released-back-to-the-engine; large-session-space-checked-before-the-prompt-or-confirmation-by-the-estimates-figures-with-the-target-backup-and-copied-content-before-the-coordination-and-with-statfs-right-before-the-exclusive-phase-by-the-preparations-figures-target-disk-target-bytes-margin-included-temporary-disk-temporary-bytes-plus-64MiB-only-on-a-disk-of-its-own-sqlite-temporary-disk-likewise-one-check-per-disk; large-session-preparation-one-window-per-source-preparing-record-heartbeat-10s-taken-over-after-60s-or-once-its-process-is-gone-by-pid-and-start-identity-heartbeat-written-back-under-the-admission-only-while-the-record-is-still-its-own-a-disk-full-writing-it-defers-the-source-and-stops-the-preparation; large-session-exclusive-phase-only-under-admission-and-target-maintenance-with-hosts-offline-each-source-under-its-maintenance-rechecked-unchanged-and-copied-again; large-session-estimate-before-consent-read-only-no-finalization-backup-cas-transfer-ledger-record-preparation-claim-or-published-3-4-upgrade-audit-cache-or-one-private-copy-per-source-foreign-roots-only-under-their-claim-taken-outside-the-admission-their-objects-counted-as-copied-content-fingerprint-as-the-preparation-gives-it-preparation-and-exclusive-times-apart-from-sizes-at-conservative-rates-exclusive-time-scaled-by-the-last-measured-session-within-0.5x-to-4x-range-0.4x-to-2.5x; large-session-preparation-only-after-consent-cancelled-preparation-offers-nothing-releases-its-claims-and-unused-target-backup; large-session-estimate-called-outside-every-lock-the-adapter-refuses-it-inside-the-configuration-admission; large-session-space-model-source-databases-plus-1.5x-the-largest-plus-target-index-pages-measured-in-a-worker-on-the-preparations-backup-else-0.65x-the-target-files-plus-0.65x-the-other-sources-plus-64MiB; large-session-sqlite-temporary-files-0.25x-the-largest-source-in-sqlites-temporary-directory-and-its-private-copy-in-the-temporary-directory; large-session-each-chunk-followed-by-statfs-under-64MiB-left-rolled-back-early-need-projected-from-the-wal-written; sqlite-full-enospc-and-edquot-all-disk-full-in-chinese-without-the-system-text-later-sources-not-run-or-not-prepared-naming-a-full-temporary-directory-and-its-need-when-the-error-names-no-file-and-the-targets-disk-has-room; a-preparation-failing-as-a-whole-says-data-unchanged-only-when-it-closed-no-sources-work',
-    sourcePolicy: 'exact-published-3-4-backup-and-in-place-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot',
+    sourcePolicy: 'exact-published-3-4-5-backup-and-in-place-upgrade-first-then-current-epoch-fingerprint-and-integrity-from-offline-snapshot',
     foreignSourcePolicy: 'only-on-the-users-explicit-request-recorded-in-the-current-configuration-root-ledger-with-location-name-and-seen-identity-never-automatic-kept-semantics; its-claim-foreign-claims-id-under-the-current-configuration-root-held-from-preparation-to-commit-taken-before-admission-the-claim-of-verification-reading-and-backup-cleanup; located-paths-only-recorded-only-an-identity-fence; strictly-located-again-and-rechecked-under-its-claim-before-commit-pointer-root-binding-epoch-manifest-hosts-gone-and-exact-file-state-since-verification-else-deferred-nothing-committing; never-written-no-claim-ledger-source-backup-finalization-upgrade-wal-or-shm-inside-it-snapshot-and-audit-on-private-copies; records-requests-and-fingerprints-under-the-current-configuration-root-keyed-by-foreign-id-with-source-identity-its-committing-record-never-makes-it-unverifiable; cas-objects-copied-never-linked-read-through-no-follow-descriptors-digest-verified-after-free-space-for-missing-objects-plus-64MiB-else-deferred-disk-full; any-unfinished-work-blocked-with-counts-and-reason-never-finalized-read-only-view-kept; same-identity-as-a-local-data-set-or-one-any-local-data-set-the-current-or-another-continues-blocked-as-its-old-copy-left-to-backup-cleanup-by-coverage-named-readably-never-by-internal-id; any-local-data-set-unreadable-deferred-its-old-copy-not-ruled-out; interrupted-commit-converges-from-ledger-and-target-without-its-claim-root-or-request-expired-or-removed-requests-included-backup-cleanup-keeps-the-root-until-then; a-merge-that-left-conversations-out-records-the-count-list-and-notice-say-backup-cleanup-keeps-that-copy-times-shown-in-local-time; two-foreign-copies-of-one-identity-first-merges-later-nothing-new-or-conflict-left-out-conversations-by-the-union-of-that-identitys-records; same-size-routing-online-exclusive-or-large-session-by-a-readable-name',
     busySourcePolicy: 'defer-source',
     terminalUnknownProcessPolicy: 'preserve-outcome_unknown-with-matching-terminal-receipt-and-completed-at-only-without-pending-operations-deliveries-or-output-debt; no-fake-exit-no-redispatch; migration-keeps-stricter-process-policy',
@@ -693,7 +696,7 @@ function validateMigration(root, migration, failures) {
     listedOnly: 'copied-directory-as-a-whole-with-its-settings-rules-and-skills; archives-directory-entries-that-are-no-archive; foreign-history-that-failed-or-cannot-be-verified-now; control-root-legacy-backups; limcode-data-backups; name-location-size-and-reason-never-deleted',
     foreignHistory: 'archives-of-every-scope-of-the-current-and-the-left-data-directories-and-data-sets-of-copied-directories-beside-any-of-them-as-discovered-and-verified-by-runtime-foreign-history; only-verified-ones; deletion-unit-the-located-control-root-a-whole-archive-or-one-data-set-of-a-copied-directory-never-the-copied-directory-told-when-no-data-set-is-left; proven-by-same-identity-and-content-digest-as-a-local-data-set-other-than-the-open-one-its-ids-read-from-the-same-files-as-its-digest-and-every-body-in-its-cas-or-by-coverage-of-it-and-of-its-kept-backups-in-one-local-data-set-of-the-configuration-root; open-data-set-has-no-safe-digest-proven-only-by-coverage-through-its-reader; kept-backups-by-their-own-rules-and-content-lists; legacy-backups-debug-captures-process-output-diagnostics-beyond-the-journal-unknown-entries-entries-of-another-type-claim-look-alikes-links-or-special-files-keep-it-whole; unfinished-work-keeps-it-when-proven-by-coverage; databases-only-through-the-foreign-copy-dev-ino-checked-state-unchanged-and-records-as-small-regular-files; its-foreign-claim-taken-without-waiting-in-check-deletion-and-settling-held-by-verification-a-merge-or-another-cleanup-means-kept; a-merge-of-it-committing-or-requested-and-not-yet-run-keeps-it-in-check-and-deletion; a-read-only-view-registered-under-the-current-configuration-root-for-its-whole-life-means-kept-dead-registrations-removed-unreadable-ones-count; local-digest-and-ids-under-their-own-maintenance-never-inside-the-foreign-claim; deletion-under-admission-and-foreign-claim-relocates-and-verifies-again-compares-every-directory-by-identity-and-names-and-every-file-outside-its-content-store-by-exact-state-and-the-proving-data-set-compares-once-more-right-before-the-rename-renames-checks-coverage-and-tree-again-and-marks-with-its-id; admission-released-once-the-mark-is-durable-recursive-removal-under-the-foreign-claim-alone; only-writes-in-a-foreign-directory-rename-mark-and-removal-of-the-deleted-root-itself; leftovers-found-where-discovery-finds-roots-settled-under-admission-and-the-same-claim-removed-after-the-admission; two-installations-sharing-a-left-data-directory-do-not-exclude-each-other-known-limitation',
     coverage: 'every-conversation-message-revision-and-history-record-id-of-the-copy-turns-tool-calls-and-results-file-changes-interactions-and-answers-processes-and-output-attachments-compressions-child-executions-and-collaboration-messages-and-every-body-as-a-regular-file-of-its-size-in-the-proving-local-data-set-for-a-backup-the-one-of-its-control-root; every-message-visible-in-the-copy-shown-there-with-the-same-current-revision-else-deletable-only-as-replaced-content-grouped-apart-and-never-ticked-by-default; copy-read-in-facts-worker-from-private-copy-ids-and-visible-messages-read-from-the-tables-not-indexed-cached-gzip-compressed-by-exact-file-state-in-merge-ledger-coverage-a-copy-with-body-ids-only-checked-by-the-proving-data-sets-own-rows-a-local-data-set-also-with-body-locations-and-project-names; a-listed-copy-keeps-only-its-conversations-and-visible-messages-for-the-deletion-to-read-again; current-data-set-only-through-its-own-worker-reader-250-ids-per-read; other-local-data-sets-through-facts-worker-private-copy-under-their-maintenance; copy-or-data-set-sharing-an-inode-with-a-local-database-wal-or-shm-by-dev-ino-never-copied-kept-as-history; uncovered-kept-as-history-naming-what-is-missing; data-sets-named-as-the-history-management-names-them-never-by-id; reasons-in-words-technical-cause-only-in-the-log-times-in-local-time; an-unreadable-directory-noted-as-a-problem-its-backups-kept-the-check-completes',
-    conditions: 'upgrade-backup-completion-record-to-epoch-5-next-binding-same-data-set-local-generation-not-lower-and-7-days-after-completion-from-the-latest-of-record-time-directory-name-and-record-file-mtime-ctime-later-than-now-kept; published-3-to-4-upgrade-backups-kept; merge-and-source-backup-root-binding-same-data-set-local-generation-not-lower',
+    conditions: 'upgrade-backup-completion-record-exact-3-4-to-5-or-3-4-5-to-6-next-binding-same-data-set-local-generation-not-lower-and-7-days-after-completion-from-the-latest-of-record-time-directory-name-and-record-file-mtime-ctime-later-than-now-kept; published-3-to-4-upgrade-backups-kept; merge-and-source-backup-root-binding-same-data-set-local-generation-not-lower',
     protections: 'in-progress-control-root-journal-or-committing-merge; newest-complete-merge-backup-at-least-1h-old-per-control-root-and-every-newer-one; merge-backup-younger-than-1h; merge-backup-age-from-the-later-of-name-time-and-directory-mtime; directory-holding-anything-its-kind-does-not-write-tmp-files-meaning-unfinished; source-backup-referenced-by-unreported-finalization; large-merge-preparation-target-backup-while-its-registration-is-live-or-unused-never-deleted-nor-the-anchor-registrations-unreadable-keep-every-merge-backup',
     confirmation: 'first-confirm-panel-grouped-by-kind-name-size-created-purpose-owner-and-conclusion-only-deletable-items-have-boxes-complete-ones-ticked-replaced-content-grouped-apart-unticked-description-states-the-proof-as-it-is; second-danger-confirm-panel-items-total-size-messages-that-become-unreadable-check-time-cannot-be-undone',
     deletion: 'reverified-under-configuration-admission-and-control-root-maintenance-by-the-same-rules-file-state-hard-links-local-identity-and-generation-journals-newest-and-coverage; backup-cleanup-activity-marker-in-both-claims; current-data-set-checked-again-by-conversations-and-visible-messages-none-replaced-beyond-what-was-listed-others-by-file-state; directory-compared-once-more-right-before-the-rename-by-identity-names-and-exact-file-state-a-link-put-in-its-place-kept; rename-to-deleting-id-then-coverage-and-directory-checked-again; not-covered-or-unverifiable-renamed-back-and-kept; verified-mark-naming-the-renamed-directory-this-configuration-root-and-its-cleanup-identity-made-durable-then-recursive-remove-mark-last-only-of-a-real-directory-never-through-a-link; failure-after-the-mark-reported-unfinished-never-kept; crash-leftover-marked-by-this-installation-from-this-configuration-root-or-a-left-data-directory-whose-cleanup-identity-is-still-the-same-or-gone-with-its-bookkeeping-finished-by-next-cleanup-never-renamed-back-half-removed; any-other-renamed-back-and-checked-again; a-mark-or-identity-that-cannot-be-read-now-left-for-the-next-check',
@@ -1005,8 +1008,8 @@ function validateAuthority(authority, migration, failures) {
     || authority?.schemaPolicy?.incrementalLegacyMigrationChain !== false
     || authority?.schemaPolicy?.incompatibleRuntimeData !== 'exact-published-upgrade-else-fail-closed'
     || authority?.schemaPolicy?.exactPredecessorUpgrade
-      !== 'published-epoch-3-or-4-to-5-with-backup-journal'
-    || authority?.schemaPolicy?.currentEpoch !== 5) {
+      !== 'published-epoch-3-4-or-5-to-6-with-backup-journal'
+    || authority?.schemaPolicy?.currentEpoch !== 6) {
     failures.push('SQLite schema必须只有当前manifest和单一运行epoch，不维护旧迁移链');
   }
   if (authority?.rootPolicy?.mode !== 'offline-restart-only' || authority?.rootPolicy?.onlineMigration !== false) {
@@ -1550,14 +1553,14 @@ function validateSubagent(subagent, failures) {
 
 function validateClient(root, client, failures) {
   const history = client?.collaborationHistory;
-  if (history?.authority !== 'CollaborationMessage+CollaborationMessageSourceLink+CollaborationMessageTargetLink; independent-of-Message'
-    || history?.order !== 'CollaborationMessage.message_seq+id-desc; never-created_at'
-    || history?.cursor !== 'exclusive-beforeMessageSeq+beforeId; omitted-pair-starts-newest; matched-limit-stops-at-oldest-match; underfull-window-progresses-at-last-inspected-global-key-even-when-empty'
-    || history?.scan !== 'bounded-global-message_seq-index-window; indexed-source-target-message_id-probes; zero-match-page-requires-explicit-user-continue; never-infer-created_at-or-exhaustion'
+  if (history?.authority !== 'RuntimeDeliveryTimelineLink+CollaborationSendTimelineLink; independent-Message-acceptance-relations'
+    || history?.order !== 'physical-predecessor-message_seq-then-shared-exchange_seq; imported-order-explicit; no-clock-order'
+    || history?.cursor !== 'exchange-beforeExchangeSeq-then-message-beforeMessageSeq+beforeId-then-answer-beforeCreatedAt+beforeId; independent-bounded-inventory-lanes'
+    || history?.scan !== 'indexed-conversation-exchange-suffix; legacy-message-global-window; answer-conversation-created_at-id-index; no-unbounded-history-walk'
     || history?.peerTitle !== 'at-most-256-indexed-Message-memberships-per-placeholder-peer; fallback-to-stored-title'
     || history?.lostResponse !== 'collaboration-result-or-error-false-or-reject-reconnects-exact-session; renderer-deadline-clears-loading-and-allows-manual-retry'
     || history?.transport !== 'sessionId+requestId+conversationId+navigationGeneration-fenced; ACK-before-optional-read'
-    || history?.view !== 'separate-bounded-keyset-page; no-Message-row-or-display-floor; explicit-within-Turn-order-unknown'
+    || history?.view !== 'independent-bounded-card-rows; physical-membership-cut-not-display-floor; missing-proof-remains-explicitly-unlocated'
     || history?.merge !== 'historical-records-by-type-id; committed-live-records-win; no-duplicate-cards; reset-on-conversation-change'
     || history?.maxPageRows !== 200 || history?.maxScannedRows !== 4096
     || history?.maxPeerTitleMembershipRows !== 256
@@ -1565,12 +1568,23 @@ function validateClient(root, client, failures) {
     failures.push('协作历史必须按独立持久序号有界分页、按请求和会话隔离、与实时记录去重合并');
   }
   failures.push(...exactSetProblems('协作历史因果闭包', [
-    'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
-    'RuntimeDelivery(latest-attempt)', 'Turn(own-conversation)', 'CollaborationPeerConversation'
+    'RuntimeDeliveryTimelineLink',
+    'CollaborationSendTimelineLink',
+    'CollaborationMessage',
+    'CollaborationMessageSourceLink',
+    'CollaborationMessageTargetLink',
+    'RuntimeDelivery(canonical-accepted-and-latest-attempt)',
+    'RuntimeInboxItem',
+    'AnswerSubmission',
+    'AnswerBridge',
+    'ChildExecution',
+    'ChildExecutionParentLink',
+    'Turn(own-conversation)',
+    'CollaborationPeerConversation'
   ], history?.closure ?? []));
   const collaboration = client?.collaborationProjection;
   if (collaboration?.scope !== 'selected-conversation-source-or-target-only'
-    || collaboration?.snapshotSelection !== 'messages-sent-from-or-delivered-into-a-loaded-Turn-plus-incoming-pending-or-failed; each-incoming-card-loads-its-delivery; at-most-200-newest-by-message_seq'
+    || collaboration?.snapshotSelection !== 'bounded-accepted-exchange-suffix-plus-loaded-Turn-envelopes-and-bounded-pending-failed-inventory; canonical-accepted-attempt-closure'
     || collaboration?.messageBodiesInFeed !== false || collaboration?.boardBodiesInFeed !== false
     || collaboration?.messagePreview !== 'CollaborationMessage-envelope-carries-whitespace-normalized-text_preview-of-at-most-320-characters; full-body-only-through-explicit-read') {
     failures.push('协作前端投影必须有界、仅属于当前会话并按需读取正文');

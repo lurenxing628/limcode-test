@@ -19,6 +19,7 @@ const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 function minimalSource() {
   const source = new Database(':memory:');
   source.defaultSafeIntegers(true);
+  source.exec("CREATE TABLE root_binding(singleton INTEGER PRIMARY KEY, data_set_id TEXT, root_instance_id TEXT); INSERT INTO root_binding VALUES (1, 'source-data-set', 'source-root')");
   for (const schema of RUNTIME_DOMAIN_SCHEMAS) source.exec(`CREATE TABLE "${schema.table}" (${schema.columns.map((column) =>
     `"${column.name}" ${column.type}${column.name === 'id' ? ' PRIMARY KEY' : ''}`).join(',')})`);
   source.exec('CREATE TEMP TABLE limcode_merge_skip (domain TEXT, id TEXT, PRIMARY KEY(domain,id)) WITHOUT ROWID');

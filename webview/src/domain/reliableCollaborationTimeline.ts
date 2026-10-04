@@ -9,6 +9,7 @@ import {
 
 type FeedRecord = { [key: string]: PlainData };
 type FeedRecords = Record<string, Record<string, FeedRecord>>;
+interface TimelinePosition { predecessorSeq: bigint; exchangeSeq: bigint }
 
 /**
  * An independent envelope between Agents, never a Message or a transcript floor: a collaboration
@@ -23,13 +24,16 @@ export interface CollaborationTimelineCard {
   /** For a child answer: its Host-derived outcome (final, interrupted partial, or failed run). */
   kind: 'message' | 'followup' | 'result' | 'answer' | 'partial_answer' | 'failed_answer';
   textPreview: string;
-  /** The newest delivery attempt, or unknown when its delivery is not in the bounded feed. */
+  /** Settled for a proven accepted event; otherwise the newest loaded delivery attempt. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
   readBy?: 'current-turn' | 'next-turn';
   /** A child result delivered for display only, without creating a reply Turn. */
   notificationOnly?: boolean;
+  /** Independent provenance records distinguish target-preserving historical import order. */
+  imported?: boolean;
   /**
-   * Only Turn membership is known; no within-Turn acceptance/send order is inferred.
+   * - ordered: an independent committed link proves the physical Message boundary and exchange order.
+   * The remaining values explicitly describe older records whose exact position is unproven.
    * - turn: grouped after the newest loaded message of its Turn.
    * - turn-started: its Turn is loaded but none of its messages is; placed after the last loaded
    *   message whose Turn started no later than it (Turns of one Conversation share its start order).
@@ -38,7 +42,7 @@ export interface CollaborationTimelineCard {
    * - turn-not-loaded: its Turn is outside loaded history.
    * - unbound: it never entered a Turn (waiting or failed delivery, or sent outside a Turn).
    */
-  placement: 'turn' | 'turn-started' | 'earlier-turn' | 'turn-without-message' | 'turn-not-loaded' | 'unbound';
+  placement: 'ordered' | 'turn' | 'turn-started' | 'earlier-turn' | 'turn-without-message' | 'turn-not-loaded' | 'unbound';
 }
 
 /** The tail stays bounded: waiting, then failed, then recent display-only child results. */
@@ -46,30 +50,24 @@ export const COLLABORATION_UNLOCATED_TAIL_LIMIT = 3;
 
 export interface CollaborationTimeline {
   /**
-   * Above the first loaded message, oldest first: cards of Turns older than every loaded message
-   * or outside loaded history (history pages add these), and cards that never entered a Turn but
-   * are outside the bounded attention/notification tail. None may displace the newest messages.
+   * Proven boundaries before the first loaded Message (or before any Message exists), followed
+   * by unlocated historical cards outside the bounded attention/notification tail.
    */
   beforeMessages: CollaborationTimelineCard[];
-  /** Grouped by a loaded message, not inserted into a Message. */
+  /** Independent rows following a loaded physical boundary, never inserted into a Message. */
   afterMessage: Record<string, CollaborationTimelineCard[]>;
   /** At most COLLABORATION_UNLOCATED_TAIL_LIMIT waiting/failed cards and recent result notifications. */
   unlocated: CollaborationTimelineCard[];
 }
 
 /**
- * Group envelopes by committed source/delivery Turn membership only. The newest visible message
- * from that Turn holds the group, so a 35-message Turn keeps its cards in the newest render segment
- * rather than stranding them at message 1. This grouping does NOT assert that delivery or sending
- * happened after that message. There is no committed within-Turn acceptance position here: show
- * that uncertainty to the user rather than comparing unrelated created_at timestamps.
+ * Merge independent envelopes at their durable physical Message boundary, then by the shared
+ * Conversation-local exchange sequence. Display floors, timestamps and ids are never position
+ * evidence. A missing/deleted/unloaded predecessor is resolved against the loaded physical
+ * memberships; a transient reply has no membership and therefore follows accepted inputs.
  *
- * A card whose Turn has no loaded message is placed by that Turn only: a loaded Turn is compared
- * with the Turns of the loaded messages (never with a message or envelope timestamp); a Turn
- * outside loaded history belongs to older history and sits above the first loaded message. Of the
- * cards that never entered a Turn, a bounded tail prioritizes waiting/failed deliveries and then
- * recent notify-only child results. None are promoted to a Message, given a transcript floor, or silently
- * dropped.
+ * Published history without a proven link retains explicitly uncertain Turn grouping. Those
+ * records never acquire coordinates from the current Turn or from another delivery attempt.
  */
 export function projectCollaborationTimeline(input: {
   conversationId: string;
@@ -90,11 +88,26 @@ export function projectCollaborationTimeline(input: {
     const startedAt = ownTurnStart(turnId);
     if (startedAt) messageTurnStarts.push({ messageId: message.id, startedAt });
   }
-  // Every card in processing order (message_seq, then answers) with where it was placed.
-  const placed: Array<{ card: CollaborationTimelineCard; anchorId?: string }> = [];
+  const loadedMemberships = input.messages.flatMap((message) => {
+    const record = input.records.Message?.[message.id];
+    const messageSeq = nonnegativeSequence(record?.message_seq);
+    return record?.conversation_id === input.conversationId && messageSeq !== undefined && messageSeq > 0n
+      ? [{ messageId: message.id, messageSeq }] : [];
+  }).sort((left, right) => compareBigint(left.messageSeq, right.messageSeq));
+  const deliveryPositions = linksByField(input.records.RuntimeDeliveryTimelineLink, 'delivery_id');
+  const sendPositions = linksByField(input.records.CollaborationSendTimelineLink, 'message_id');
+  const placed: Array<{
+    card: CollaborationTimelineCard;
+    anchorId?: string;
+    position?: TimelinePosition;
+  }> = [];
   const sources = linksByMessage(input.records.CollaborationMessageSourceLink);
   const targets = linksByMessage(input.records.CollaborationMessageTargetLink);
-  const latestDeliveries = latestDeliveryByTarget(input.records.RuntimeDelivery);
+  const acceptedDeliveries = acceptedDeliveryByTarget(input.records, input.conversationId);
+  const deliveries = latestDeliveryByTarget(input.records.RuntimeDelivery);
+  // A redelivery is another attempt, not a revocation of the already accepted logical envelope.
+  // Keep the accepted attempt and its own proof together; never attach its link to the retry.
+  for (const [key, delivery] of acceptedDeliveries) deliveries.set(key, delivery);
   const messages = Object.values(input.records.CollaborationMessage ?? {})
     .filter((message) => typeof message.id === 'string')
     .sort((left, right) => compareSequence(left.message_seq, right.message_seq) || text(left.id).localeCompare(text(right.id)));
@@ -107,7 +120,8 @@ export function projectCollaborationTimeline(input: {
     if (!incoming && source.conversation_id !== input.conversationId) continue;
     const peerConversationId = text(incoming ? source.conversation_id : target.conversation_id);
     if (!peerConversationId) continue;
-    const delivery = latestDeliveries.get(deliveryKey(target.inbox_item_id, target.conversation_id));
+    const key = deliveryKey(target.inbox_item_id, target.conversation_id);
+    const delivery = deliveries.get(key);
     const card: CollaborationTimelineCard = {
       messageId,
       direction: incoming ? 'incoming' : 'outgoing',
@@ -115,7 +129,7 @@ export function projectCollaborationTimeline(input: {
       peerRelation: collaborationPeerRelation(input.records, input.conversationId, peerConversationId),
       kind: source.source_kind === 'completion' ? 'result' : message.mode === 'followup' ? 'followup' : 'message',
       textPreview: text(message.text_preview),
-      status: !delivery ? 'unknown' : delivery.state === 'failed' ? 'failed'
+      status: acceptedDeliveries.has(key) ? 'settled' : !delivery ? 'unknown' : delivery.state === 'failed' ? 'failed'
         : delivery.state === 'pending' ? 'waiting'
           : delivery.state === 'consumed' ? 'settled' : 'unknown',
       placement: 'unbound'
@@ -126,13 +140,13 @@ export function projectCollaborationTimeline(input: {
     const turnId = incoming
       ? card.status === 'failed' ? '' : text(delivery?.target_turn_id)
       : text(source.turn_id);
-    place(card, turnId);
+    place(card, turnId, incoming ? deliveryPositions.get(text(delivery?.id)) : sendPositions.get(messageId));
   }
   // A child's answer delivered to this Conversation: same card, told apart by its kind. An answer
   // that settled a waiting run_agent call has no delivery and stays with that tool call.
   // Delivery creation order selects the newest notification cards deterministically, including
   // after history paging/reload. It does not locate them relative to any ordinary Message.
-  const answerDeliveries = [...latestDeliveries.values()].filter((delivery) =>
+  const answerDeliveries = [...deliveries.values()].filter((delivery) =>
     text(delivery.target_conversation_id) === input.conversationId
     && input.records.RuntimeInboxItem?.[text(delivery.inbox_item_id)]?.source_kind === 'answer_submission'
   ).sort((left, right) =>
@@ -154,12 +168,13 @@ export function projectCollaborationTimeline(input: {
       kind,
       textPreview: '',
       ...(delivery.phase === 'notify_only' ? { notificationOnly: true } : {}),
-      status: delivery.state === 'failed' ? 'failed'
+      status: acceptedDeliveries.has(deliveryKey(delivery.inbox_item_id, delivery.target_conversation_id)) ? 'settled'
+        : delivery.state === 'failed' ? 'failed'
         : delivery.state === 'pending' ? 'waiting'
           : delivery.state === 'consumed' ? 'settled' : 'unknown',
       placement: 'unbound'
     };
-    place(card, card.status === 'failed' ? '' : text(delivery.target_turn_id));
+    place(card, card.status === 'failed' ? '' : text(delivery.target_turn_id), deliveryPositions.get(text(delivery.id)));
   }
   // A consumed notify-only result will never acquire Turn membership. Keep recent results in
   // the same bounded tail after waiting/failed priority, rather than moving a fresh result above
@@ -172,6 +187,13 @@ export function projectCollaborationTimeline(input: {
   const notifications = notificationRoom > 0 ? unbound
     .filter((card) => card.notificationOnly && card.status === 'settled').slice(-notificationRoom) : [];
   const tail = new Set([...waiting, ...failed, ...notifications]);
+  // Sort all proven rows together before splitting buckets, including sent messages interleaved
+  // with accepted child answers. Keep unproven records stable without assigning them a sequence.
+  placed.sort((left, right) => {
+    if (!left.position || !right.position) return left.position ? -1 : right.position ? 1 : 0;
+    return compareBigint(left.position.predecessorSeq, right.position.predecessorSeq)
+      || compareBigint(left.position.exchangeSeq, right.position.exchangeSeq);
+  });
   for (const { card, anchorId } of placed) {
     if (anchorId) (result.afterMessage[anchorId] ??= []).push(card);
     else if (tail.has(card)) result.unlocated.push(card);
@@ -184,7 +206,24 @@ export function projectCollaborationTimeline(input: {
     return turn && turn.conversation_id === input.conversationId ? text(turn.created_at) : '';
   }
 
-  function place(card: CollaborationTimelineCard, turnId: string): void {
+  function place(card: CollaborationTimelineCard, turnId: string, link?: FeedRecord): void {
+    const position = timelinePosition(link, input.conversationId);
+    if (position) {
+      const { predecessorSeq } = position;
+      // Upper bound over physical membership, not a linear scan per collaboration card. The
+      // predecessor itself need not be visible (hidden role, deleted message or another page).
+      let low = 0;
+      let high = loadedMemberships.length;
+      while (low < high) {
+        const middle = (low + high) >>> 1;
+        if (loadedMemberships[middle].messageSeq <= predecessorSeq) low = middle + 1;
+        else high = middle;
+      }
+      card.placement = 'ordered';
+      if (link?.imported === true) card.imported = true;
+      placed.push({ card, anchorId: loadedMemberships[low - 1]?.messageId, position });
+      return;
+    }
     if (!turnId) {
       placed.push({ card });
       return;
@@ -216,8 +255,9 @@ export function projectCollaborationTimeline(input: {
   }
 }
 
-/** Every card gets a truthful explanation of grouping instead of a fabricated exact position. */
+/** Proven positions need no warning; historical uncertainty is kept visible. */
 export function collaborationCardPlacementLabel(card: CollaborationTimelineCard): string {
+  if (card.placement === 'ordered') return card.imported ? '按导入顺序排列' : '';
   if (card.notificationOnly && card.placement === 'unbound') return '结果通知';
   if (card.placement === 'turn') return '按回合归组，具体顺序待确认';
   if (card.placement === 'turn-started') return '所属回合没有已加载的消息，按回合开始顺序排列';
@@ -262,6 +302,32 @@ function deliveryKey(inboxItemId: PlainData | undefined, conversationId: PlainDa
   return `${text(inboxItemId)}\0${text(conversationId)}`;
 }
 
+function timelinePosition(link: FeedRecord | undefined, conversationId: string): TimelinePosition | undefined {
+  const predecessorSeq = nonnegativeSequence(link?.predecessor_message_seq);
+  const exchangeSeq = nonnegativeSequence(link?.exchange_seq);
+  const predecessorId = text(link?.predecessor_message_id);
+  return link?.conversation_id === conversationId && predecessorSeq !== undefined
+    && exchangeSeq !== undefined && exchangeSeq > 0n
+    && (predecessorSeq === 0n ? link.predecessor_message_id === null : Boolean(predecessorId))
+    ? { predecessorSeq, exchangeSeq } : undefined;
+}
+
+/** Canonical accepted event per logical envelope; all status/position reads use that exact attempt. */
+function acceptedDeliveryByTarget(records: FeedRecords, conversationId: string): Map<string, FeedRecord> {
+  const accepted = new Map<string, { delivery: FeedRecord; exchangeSeq: bigint }>();
+  for (const link of Object.values(records.RuntimeDeliveryTimelineLink ?? {})) {
+    const position = timelinePosition(link, conversationId);
+    const delivery = records.RuntimeDelivery?.[text(link.delivery_id)];
+    if (!position || !delivery || delivery.target_conversation_id !== conversationId) continue;
+    const key = deliveryKey(delivery.inbox_item_id, delivery.target_conversation_id);
+    const current = accepted.get(key);
+    if (!current || position.exchangeSeq < current.exchangeSeq) {
+      accepted.set(key, { delivery, exchangeSeq: position.exchangeSeq });
+    }
+  }
+  return new Map([...accepted].map(([key, entry]) => [key, entry.delivery]));
+}
+
 /** One pass over the deliveries: the newest attempt per inbox item and target Conversation. */
 function latestDeliveryByTarget(records: Record<string, FeedRecord> | undefined): Map<string, FeedRecord> {
   const latest = new Map<string, FeedRecord>();
@@ -274,10 +340,14 @@ function latestDeliveryByTarget(records: Record<string, FeedRecord> | undefined)
 }
 
 function linksByMessage(records: Record<string, FeedRecord> | undefined): Map<string, FeedRecord> {
+  return linksByField(records, 'message_id');
+}
+
+function linksByField(records: Record<string, FeedRecord> | undefined, field: string): Map<string, FeedRecord> {
   const result = new Map<string, FeedRecord>();
   for (const link of Object.values(records ?? {})) {
-    const messageId = text(link.message_id);
-    if (messageId) result.set(messageId, link);
+    const value = text(link[field]);
+    if (value) result.set(value, link);
   }
   return result;
 }
@@ -289,9 +359,17 @@ function compareSequence(left: PlainData | undefined, right: PlainData | undefin
 }
 
 function sequence(value: PlainData | undefined): bigint {
-  if (typeof value === 'number' && Number.isSafeInteger(value)) return BigInt(value);
-  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
-  return 0n;
+  return nonnegativeSequence(value) ?? 0n;
+}
+
+function nonnegativeSequence(value: PlainData | undefined): bigint | undefined {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value)) return BigInt(value);
+  return undefined;
+}
+
+function compareBigint(left: bigint, right: bigint): number {
+  return left < right ? -1 : left > right ? 1 : 0;
 }
 
 function text(value: PlainData | undefined): string {

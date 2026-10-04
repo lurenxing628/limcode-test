@@ -1,3 +1,4 @@
+import { collaborationSendTimelineStep } from './timelineAcceptance';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
@@ -214,6 +215,7 @@ export class CollaborationControlPlane {
       : sourceTurn ? String(sourceTurn.conversation_id)
         : await this.requestTargetConversationId(source.kind === 'completion' ? source.requestId : '');
     if (targetConversationId === sourceConversationId) throw new Error('A collaboration message must target another Conversation.');
+    const sourceExists = !failureReply || Boolean(await this.maybe('Conversation', sourceConversationId));
     const prepared = await this.contentStore.prepare(this.database, input.text, COLLABORATION_MESSAGE_CONTENT_TYPE);
     const replay = async () => {
       const message = await this.maybe('CollaborationMessage', messageId);
@@ -328,6 +330,7 @@ export class CollaborationControlPlane {
         ...(failureReply ? [] : [DOMAIN_REPOSITORIES.domain('Conversation').assert(sourceConversationId, { status: 'active' })]), DOMAIN_REPOSITORIES.domain('Conversation').assert(targetConversationId, { status: 'active' }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence({ id: messageId, dedupe_key: dedupeKey, mode: input.mode, created_at: now }, { column: 'message_seq', scope: {} }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessageSourceLink').insert({ id: stablePhaseFId('collaboration_source', messageId), message_id: messageId, conversation_id: sourceConversationId, source_kind: source.kind, source_key: sourceKey, turn_id: sourceTurnId, tool_call_id: source.kind === 'tool' ? source.toolCallId : null, board_post_id: source.kind === 'board' ? source.postId : null, created_at: now }),
+        ...(!sourceExists ? [] : [collaborationSendTimelineStep({ conversationId: sourceConversationId, messageId, now })]),
         DOMAIN_REPOSITORIES.domain('RuntimeInboxItem').insert({ id: inboxItemId, dedupe_key: dedupeKey, source_kind: 'collaboration_message', source_id: messageId, state: 'routed', created_at: now, updated_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessageTargetLink').insert({ id: stablePhaseFId('collaboration_target', messageId), message_id: messageId, conversation_id: targetConversationId, inbox_item_id: inboxItemId, anchor_turn_id: source.kind === 'board' ? currentTurnId : queuedTurnId, created_at: now }),
         DOMAIN_REPOSITORIES.domain('CollaborationMessagePayloadLink').insert({ id: stablePhaseFId('collaboration_payload', messageId), message_id: messageId, content_object_id: prepared.metadata.id, created_at: now }),

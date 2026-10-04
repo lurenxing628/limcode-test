@@ -17,7 +17,7 @@ import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
  * opens and closes them, which releases this process's SQLite locks on them.
  */
 export interface RuntimeDataSetFactsRequest {
-  /** The checks opening it (or the exact published 3/4 upgrade) would perform; a failure rejects. */
+  /** The checks opening it (or the exact published 3/4/5 upgrade) would perform; a failure rejects. */
   openable?: boolean;
   contentDigest?: boolean;
   summary?: boolean;

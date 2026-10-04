@@ -56,7 +56,7 @@ async function read(input: RuntimeDataSetFactsWorkerData): Promise<Omit<RuntimeD
 
 /**
  * Epoch-agnostic: an upgrade to epoch 5 only added tables, so every table read here exists unchanged
- * in the published epochs 3 and 4, except the ones added later (read as empty). Every table is read
+ * in the published epochs 3, 4 and 5, except the ones added later (read as empty). Every table is read
  * by itself (NOT INDEXED), never through an index, and joined here: a copy whose index lost entries
  * must not look as if it held less history, or fewer visible messages, than it does.
  */

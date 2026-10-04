@@ -530,6 +530,13 @@ export class ConversationDeletionControlPlane {
         if (!link || link.handled_at !== null) continue;
         const input = await this.maybeGet('PendingTurnInput', String(link.pending_turn_input_id));
         if (input?.state !== 'pending' || input.turn_id !== delivery.target_turn_id) continue;
+        // Published runtimes could commit the exact input Context occurrence and crash before
+        // ACK. This indexed immutable occurrence proves acceptance even at a transcript tail
+        // where migration cannot prove a UI position; never replace its accepted bytes.
+        const occurrence = await listAllDomainRows(this.database, 'ContextSegmentSource', {
+          source_kind: 'runtime_context', source_id: String(input.id), source_revision: 0n
+        });
+        if (occurrence.length > 0) continue;
         pendingInput = { link, input };
       } else if (delivery.state === 'pending' && delivery.target_turn_id === null) {
         // A next_turn answer fails as `source-gone`; the continuation queued to open a Turn for it goes too.
@@ -749,6 +756,9 @@ function unabsorbedInputSteps(
   const inputId = requireId(input.id, 'PendingTurnInput.id');
   const linkId = requireId(link.id, 'RuntimeDeliveryInputLink.id');
   return [
+    DOMAIN_REPOSITORIES.domain('ContextSegmentSource').assertNone({
+      source_kind: 'runtime_context', source_id: inputId, source_revision: 0n
+    }),
     DOMAIN_REPOSITORIES.domain('RuntimeDeliveryInputLink').assert(linkId, {
       delivery_id: link.delivery_id,
       pending_turn_input_id: inputId,

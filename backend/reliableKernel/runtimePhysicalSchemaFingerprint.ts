@@ -10,6 +10,11 @@ import type { RuntimeDomainSchema } from './schema/types';
 
 export interface RuntimePhysicalSchemaFingerprintOptions {
   label?: string;
+  /** Exact shipped metadata/trigger contract, used only by the bounded epoch migrator. */
+  historicalContract?: {
+    metadataSql: readonly string[];
+    triggers: readonly { name: string; sql: string }[];
+  };
 }
 
 /** Exact sqlite_master DDL contract used only at bounded migration boundaries. */
@@ -19,9 +24,10 @@ export function assertRuntimePhysicalSchemaFingerprint(
   options: RuntimePhysicalSchemaFingerprintOptions = {}
 ): void {
   const label = options.label ?? 'Runtime physical';
+  const metadata = options.historicalContract?.metadataSql ?? [createRootBindingTableSql(), createSchemaManifestTableSql()];
   const expectedTables = new Map<string, string>([
-    ['root_binding', normalizeSql(createRootBindingTableSql())],
-    ['schema_manifest', normalizeSql(createSchemaManifestTableSql())],
+    ['root_binding', normalizeSql(metadata[0])],
+    ['schema_manifest', normalizeSql(metadata[1])],
     ...schemas.map((schema): [string, string] => [
       schema.table,
       normalizeSql(createRuntimeDomainTableSql(schema))
@@ -35,7 +41,7 @@ export function assertRuntimePhysicalSchemaFingerprint(
     });
   }
   const expectedTriggers = new Map(
-    RUNTIME_SCHEMA_TRIGGERS.map((trigger): [string, string] => [trigger.name, normalizeSql(trigger.sql)])
+    (options.historicalContract?.triggers ?? RUNTIME_SCHEMA_TRIGGERS).map((trigger): [string, string] => [trigger.name, normalizeSql(trigger.sql)])
   );
 
   assertSqlObjects(database, 'table', expectedTables, label);

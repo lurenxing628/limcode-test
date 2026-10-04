@@ -312,26 +312,27 @@ export interface ReliableKernelHistoryPageErrorMessage {
   message: string;
 }
 
-/** Independent CollaborationMessage sequence, unrelated to Message membership or its display floor. */
+/** Accepted exchanges have their own conversation-local sequence, separate from Message floors. */
+export type ReliableKernelCollaborationHistoryCursor =
+  | { kind: 'exchange'; beforeExchangeSeq?: string }
+  | { kind: 'message'; beforeMessageSeq?: string; beforeId?: string }
+  | { kind: 'answer'; beforeCreatedAt?: string; beforeId?: string };
+
 export interface ReliableKernelCollaborationHistoryRequestMessage {
   type: typeof RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE;
   requestId: string;
   sessionId: string;
   conversationId: string;
-  /** Exclusive backward cursor. Omit both fields for the newest page. */
-  beforeMessageSeq?: string;
-  beforeId?: string;
+  cursor?: ReliableKernelCollaborationHistoryCursor;
   limit: number;
 }
 
 export interface ReliableKernelCollaborationHistoryPage {
   records: Record<string, Array<Record<string, PlainData>>>;
-  nextBeforeMessageSeq?: string;
-  nextBeforeId?: string;
+  nextCursor?: ReliableKernelCollaborationHistoryCursor;
   hasMore: boolean;
-  /** The next cursor is the oldest inspected global CollaborationMessage, possibly not from this Conversation. */
+  /** An empty scan or transition to another independent historical source still advances. */
   scanProgress: boolean;
-  /** Exact number of immutable global-sequence candidates inspected, at most 4096. */
   scannedRows: number;
   responseBytes: number;
 }
@@ -548,6 +549,8 @@ export const RELIABLE_KERNEL_CLIENT_CHANGE_TYPES = new Set([
   'RuntimeInboxItem',
   'RuntimeDelivery',
   'RuntimeDeliveryIntentLink',
+  'RuntimeDeliveryTimelineLink',
+  'CollaborationSendTimelineLink',
   'CollaborationMessage',
   'CollaborationMessageSourceLink',
   'CollaborationMessageTargetLink',
@@ -726,6 +729,8 @@ function seedRecordsFromSnapshot(
     runtimeInboxItems: 'RuntimeInboxItem',
     runtimeDeliveries: 'RuntimeDelivery',
     runtimeDeliveryIntentLinks: 'RuntimeDeliveryIntentLink',
+    runtimeDeliveryTimelineLinks: 'RuntimeDeliveryTimelineLink',
+    collaborationSendTimelineLinks: 'CollaborationSendTimelineLink',
     collaborationMessages: 'CollaborationMessage',
     collaborationMessageSourceLinks: 'CollaborationMessageSourceLink',
     collaborationMessageTargetLinks: 'CollaborationMessageTargetLink',

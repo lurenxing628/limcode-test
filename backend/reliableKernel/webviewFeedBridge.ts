@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { normalizeCollaborationHistoryCursor } from './collaborationHistoryCursor';
 import { FileDiffPreviewBusyError, FileDiffPreviewTooLargeError } from '../capabilities/fileDiffAsync';
 import { captureDebug, type DebugCaptureRecorder } from './debugCapture/observer';
 import type * as vscode from 'vscode';
@@ -630,10 +631,7 @@ export class ReliableKernelWebviewFeedBridge {
       if (!this.history) throw new Error('当前 Runtime 未配置协作历史读取器。');
       const page = await this.history.backwardCollaboration({
         conversationId: request.conversationId,
-        ...(request.beforeMessageSeq === undefined ? {} : {
-          beforeMessageSeq: request.beforeMessageSeq,
-          beforeId: request.beforeId
-        }),
+        ...(request.cursor === undefined ? {} : { cursor: request.cursor }),
         limit: request.limit
       });
       if (client.closed || !client.ready || !client.visible || client.connection !== connectionPromise
@@ -1669,12 +1667,7 @@ function normalizeDetailRequest(message: Record<string, unknown>): ReliableKerne
 function normalizeCollaborationHistoryRequest(
   message: Record<string, unknown>
 ): ReliableKernelCollaborationHistoryRequestMessage {
-  if ((message.beforeMessageSeq === undefined) !== (message.beforeId === undefined)) {
-    throw new TypeError('collaborationHistory cursor requires both sequence and id.');
-  }
-  const beforeMessageSeq = message.beforeMessageSeq === undefined ? undefined
-    : requireDecimal(message.beforeMessageSeq, 'collaborationHistory.beforeMessageSeq');
-  if (beforeMessageSeq === '0') throw new TypeError('collaborationHistory.beforeMessageSeq must be positive.');
+  const cursor = normalizeCollaborationHistoryCursor(message.cursor);
   if (!Number.isSafeInteger(message.limit) || (message.limit as number) < 1 || (message.limit as number) > 200) {
     throw new TypeError('collaborationHistory.limit must be from 1 to 200.');
   }
@@ -1683,10 +1676,7 @@ function normalizeCollaborationHistoryRequest(
     requestId: requireText(message.requestId, 'collaborationHistory.requestId'),
     sessionId: requireText(message.sessionId, 'collaborationHistory.sessionId'),
     conversationId: requireText(message.conversationId, 'collaborationHistory.conversationId'),
-    ...(beforeMessageSeq === undefined ? {} : {
-      beforeMessageSeq,
-      beforeId: requireText(message.beforeId, 'collaborationHistory.beforeId')
-    }),
+    ...(cursor === undefined ? {} : { cursor }),
     limit: message.limit as number
   };
 }

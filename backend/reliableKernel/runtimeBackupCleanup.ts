@@ -28,7 +28,7 @@ import {
   readRuntimeDataSetMergeRequests, readRuntimeLargeMergeTargetBackups, runtimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
 import {
-  MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
+  MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
   RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE
 } from './runtimeEpochMigration';
 import {
@@ -233,6 +233,7 @@ const OTHER_DATA_SET_LABEL = '另一个历史库';
 const IN_PROGRESS_FILES: ReadonlyArray<readonly [file: string, operation: string]> = Object.freeze([
   [ROOT_BINDING_PENDING_FILE, '未完成的历史库切换'],
   [RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE, '未完成的升级'],
+  [RETIRED_EPOCH_TO_5_JOURNAL_FILE, '未完成的升级'],
   [RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, '旧版本未完成的 3→4 升级'],
   [CUTOVER_REQUEST_FILE, '未完成的旧格式数据切换'],
   [CUTOVER_JOURNAL_FILE, '未完成的旧格式数据切换']
@@ -1195,7 +1196,7 @@ async function newestMergeBackupProtection(root: ControlRoot, name: string, now:
 }
 
 interface UpgradeCompletion {
-  fromEpoch: 3 | 4;
+  fromEpoch: 3 | 4 | 5;
   previousBinding: HistoricalRootBinding;
   nextBinding: HistoricalRootBinding;
   completedAt: number;
@@ -1223,8 +1224,9 @@ async function readUpgradeCompletion(directory: string, read: TextReader = readL
   // v0.0.15–0.0.21 wrote the same kind for their 3→4 upgrade into the same directory.
   if (record.kind === MIGRATION_COMPLETION_KIND && record.toEpoch === 4) return '旧版本 3→4 升级留下的备份，一律保留';
   const completedAt = typeof record.completedAt === 'string' ? Date.parse(record.completedAt) : Number.NaN;
-  if (record.kind !== MIGRATION_COMPLETION_KIND || (record.fromEpoch !== 3 && record.fromEpoch !== 4) || record.toEpoch !== 5
-    || !Number.isFinite(completedAt)) {
+  const recognizedUpgrade = (record.toEpoch === 5 && (record.fromEpoch === 3 || record.fromEpoch === 4))
+    || (record.toEpoch === 6 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5));
+  if (record.kind !== MIGRATION_COMPLETION_KIND || !recognizedUpgrade || !Number.isFinite(completedAt)) {
     return '升级完成记录无法识别，按历史保留';
   }
   let previousBinding: HistoricalRootBinding;
@@ -1237,11 +1239,11 @@ async function readUpgradeCompletion(directory: string, read: TextReader = readL
   }
   const saved = await readBindingFile(path.join(directory, `root-binding.epoch-${record.fromEpoch}.json`), read);
   if (typeof saved === 'string' || !sameBinding(saved, previousBinding) || previousBinding.runtimeKernelEpoch !== record.fromEpoch
-    || nextBinding.runtimeKernelEpoch !== 5 || !sameDataSet(previousBinding, nextBinding)) {
+    || nextBinding.runtimeKernelEpoch !== record.toEpoch || !sameDataSet(previousBinding, nextBinding)) {
     return '升级完成记录与备份里的身份记录不一致，按历史保留';
   }
   return {
-    fromEpoch: record.fromEpoch, previousBinding, nextBinding, completedAt,
+    fromEpoch: record.fromEpoch as UpgradeCompletion['fromEpoch'], previousBinding, nextBinding, completedAt,
     recordedAt: Math.max(info.mtimeMs, info.ctimeMs)
   };
 }
@@ -2574,7 +2576,7 @@ async function isClaimDirectory(entry: string, name: string, info: { isDirectory
 
 /**
  * One backup a foreign control root keeps, by the rules of its kind: an upgrade backup needs its
- * completion record to epoch 5 (published 3→4 ones are kept) and 7 days since the latest of its
+ * exact completion record to epoch 5 or 6 (published 3→4 ones are kept) and 7 days since the latest of its
  * times; a pre-merge or source backup its saved binding; and its directory only what its kind writes
  * (see backupContentProblem). Records are read as small regular files of the foreign root. A string
  * says why the root stays whole.

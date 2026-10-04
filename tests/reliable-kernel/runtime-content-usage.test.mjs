@@ -134,7 +134,7 @@ function currentCandidate(binding, overrides = {}) {
     id: 'default', source: 'fixed', selected: true,
     configurationRootPath: '/fixture', runtimeScopeRootPath: '/fixture',
     runtimeDataRootPath: binding.paths.dataRootPath,
-    dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId, runtimeKernelEpoch: 5,
+    dataSetId: binding.dataSetId, rootInstanceId: binding.rootInstanceId, runtimeKernelEpoch: kernel.RUNTIME_KERNEL_EPOCH,
     ...overrides
   };
 }

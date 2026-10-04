@@ -180,7 +180,7 @@ export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   domain({
     key: 'RuntimeDelivery', table: 'runtime_delivery', repository: 'RuntimeDeliveryRepository', codec: 'RuntimeDeliveryRowCodec',
     mutations: ['insert', 'update'], client: 'summary', deletePolicy: 'cascade-with-inbox-item',
-    indexes: ['inbox_item_id,target_conversation_id,attempt_seq UNIQUE', 'retry_of_delivery_id', 'target_conversation_id,state,created_at'],
+    indexes: ['inbox_item_id,target_conversation_id,attempt_seq UNIQUE', 'retry_of_delivery_id', 'target_conversation_id,state,created_at', 'target_conversation_id,state,created_at,id', 'target_conversation_id,created_at,id'],
     columns: [id(), ref('inbox_item_id', 'runtime_inbox_item'), text('target_conversation_id'), text('target_turn_id', { nullable: true }), text('phase'), integer('attempt_seq'), ref('retry_of_delivery_id', 'runtime_delivery', true, 'RESTRICT'), text('state'), text('failure_reason', { nullable: true }), text('created_at'), text('updated_at')]
   }),
   domain({

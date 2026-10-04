@@ -1,3 +1,5 @@
+import { readTimelineWindow, canonicalDeliveryTimelineLinks, type TimelineWindow } from './clientTimelineHistory';
+import { normalizeCollaborationHistoryCursor } from './collaborationHistoryCursor';
 /**
  * Bounded client-facing projection over the runtime database: single-record client summaries used
  * by commit change capture, the atomic active-Conversation snapshot, keyset pages, visible Message
@@ -732,7 +734,7 @@ export function executeClientProjectionSnapshot(
       childExecutionActiveTurnLinks: [], childTurns: [], childExecutionLeases: [], childTurnTerminations: [], childTurnExecutorLinks: [],
       childExecutionActivities: [],
       answerBridges: [], answerSubmissions: [],
-      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [],
+      runtimeInboxItems: [], runtimeDeliveries: [], runtimeDeliveryIntentLinks: [], runtimeDeliveryTimelineLinks: [], collaborationSendTimelineLinks: [],
       collaborationMessages: [], collaborationMessageSourceLinks: [], collaborationMessageTargetLinks: [],
       collaborationMessageReplyLinks: [], collaborationRequests: [], collaborationRequestTurnLinks: [],
       collaborationPeerConversations: []
@@ -1119,14 +1121,21 @@ export function executeClientProjectionSnapshot(
       .map((bridge) => projectAnswerBridgeRecord(database, String(bridge.id)));
     // Collaboration cards sit at the Turns this snapshot loads, so the selection follows those
     // Turns instead of a fixed count of the newest messages.
-    const collaborationMessages = queryCollaborationMessagesForTurns(database, conversationId, turnIds)
-      .map((row) => projectCollaborationMessageRecord(database, String(row.id), content));
+    const timelineWindow = readTimelineWindow(database, conversationId, CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE);
+    const timelineRecords = buildTimelineExchangeRecords(database, conversationId, timelineWindow, content,
+      queryClientRuntimeDeliveries(database, conversationId).map(row => String(row.id)));
+    const collaborationMessages = mergeRowsById([
+      ...queryCollaborationMessagesForTurns(database, conversationId, turnIds)
+        .map((row) => projectCollaborationMessageRecord(database, String(row.id), content)),
+      ...(timelineRecords.CollaborationMessage ?? [])
+    ]);
     const collaborationIds = collaborationMessages.map(row => String(row.id));
     const collaborationMessageSourceLinks = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', collaborationIds);
     const collaborationMessageTargetLinks = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', collaborationIds);
     // Each card carries its own delivery: an incoming one is placed by it (it may be older than the
     // newest deliveries) and an outgoing one shows whether the peer received it.
     const deliveries = mergeRowsById([
+      ...(timelineRecords.RuntimeDelivery ?? []),
       ...queryClientRuntimeDeliveries(database, conversationId),
       ...queryAllByIds(database, 'runtime_delivery', 'inbox_item_id', collaborationMessageTargetLinks
         .map((link) => String(link.inbox_item_id)))
@@ -1181,7 +1190,9 @@ export function executeClientProjectionSnapshot(
     // Conversations (child tasks included), so an idle peer is usually not in it.
     const collaborationPeerConversations = projectCollaborationPeerConversations(database, conversationId, [
       ...collaborationMessageSourceLinks.map(row => String(row.conversation_id)),
-      ...collaborationMessageTargetLinks.map(row => String(row.conversation_id))
+      ...collaborationMessageTargetLinks.map(row => String(row.conversation_id)),
+      ...answeringChildren.map(row => String(row.child_conversation_id)),
+      ...childExecutions.map(row => String(row.child_conversation_id))
     ], content);
 
     const snapshot: ClientProjectionSnapshot = {
@@ -1256,6 +1267,8 @@ export function executeClientProjectionSnapshot(
         runtimeInboxItems: inboxItems,
         runtimeDeliveries: projectedDeliveries,
         runtimeDeliveryIntentLinks,
+        runtimeDeliveryTimelineLinks: timelineRecords.RuntimeDeliveryTimelineLink ?? [],
+        collaborationSendTimelineLinks: timelineWindow.sends,
         collaborationMessages,
         collaborationMessageSourceLinks,
         collaborationMessageTargetLinks,
@@ -2102,16 +2115,167 @@ export function executeClientVisibleMessageHistoryPage(
   }
 }
 
+/** Materialize every dependency for a bounded, independently keyed set of accepted exchanges. */
+function buildTimelineExchangeRecords(
+  database: Database.Database,
+  conversationId: string,
+  window: Pick<TimelineWindow, 'receives' | 'sends'>,
+  content: ClientProjectionContentAccess,
+  extraDeliveryIds: readonly string[] = []
+): Record<string, DomainRow[]> {
+  const records: Record<string, DomainRow[]> = {};
+  const include = (domain: string, rows: readonly DomainRow[]): void => {
+    if (rows.length) records[domain] = mergeRowsById(rows).map(row => boundClientRecordSummary(row, domain));
+  };
+  const canonicalReceives = canonicalDeliveryTimelineLinks(database, conversationId, window.receives.map(row => String(row.inbox_item_id)));
+  include('RuntimeDeliveryTimelineLink', canonicalReceives);
+  include('CollaborationSendTimelineLink', window.sends);
+  const deliveryIds = [...new Set([...canonicalReceives.map(row => String(row.delivery_id)), ...extraDeliveryIds])];
+  let deliveries = queryAllByIds(database, 'runtime_delivery', 'id', deliveryIds);
+  const extraCanonical = canonicalDeliveryTimelineLinks(database, conversationId, deliveries
+    .filter(row => row.target_conversation_id === conversationId).map(row => String(row.inbox_item_id)));
+  include('RuntimeDeliveryTimelineLink', [...canonicalReceives, ...extraCanonical]);
+  deliveries = mergeRowsById([...deliveries, ...queryAllByIds(database, 'runtime_delivery', 'id', extraCanonical.map(row => String(row.delivery_id)))]);
+  const inboxes = queryAllByIds(database, 'runtime_inbox_item', 'id', deliveries.map(row => String(row.inbox_item_id)));
+  const messageIds = [...new Set([
+    ...window.sends.map(row => String(row.message_id)),
+    ...inboxes.filter(row => row.source_kind === 'collaboration_message').map(row => String(row.source_id))
+  ])];
+  const sources = queryAllByIds(database, 'collaboration_message_source_link', 'message_id', messageIds);
+  const targets = queryAllByIds(database, 'collaboration_message_target_link', 'message_id', messageIds);
+  const latest = prepareCached(database, `SELECT * FROM runtime_delivery
+    WHERE inbox_item_id = ? AND target_conversation_id = ? ORDER BY attempt_seq DESC LIMIT 1`);
+  deliveries = mergeRowsById([...deliveries, ...targets.flatMap(target => {
+    const row = latest.get(target.inbox_item_id, target.conversation_id) as DomainRow | undefined;
+    return row ? [row] : [];
+  })]);
+  const allInboxes = mergeRowsById([...inboxes,
+    ...queryAllByIds(database, 'runtime_inbox_item', 'id', deliveries.map(row => String(row.inbox_item_id)))]);
+  include('RuntimeDelivery', deliveries.map(delivery => {
+    const links = queryPlainRows(database, 'SELECT handled_at FROM runtime_delivery_input_link WHERE delivery_id = @id LIMIT 2', { id: String(delivery.id) });
+    if (links.length > 1) throw new Error('Timeline delivery has multiple input links.');
+    return { ...delivery, parent_handling_state: deriveCommittedParentHandling(delivery,
+      links[0] ? { handled_at: links[0].handled_at as string | null } : null) };
+  }));
+  include('RuntimeInboxItem', allInboxes);
+  include('CollaborationMessage', messageIds.map(id => projectCollaborationMessageRecord(database, id, content)));
+  include('CollaborationMessageSourceLink', sources);
+  include('CollaborationMessageTargetLink', targets);
+  const answerIds = allInboxes.filter(row => row.source_kind === 'answer_submission').map(row => String(row.source_id));
+  const answers = projectAnswerSubmissionRecords(database, answerIds);
+  const bridges = queryAllByIds(database, 'answer_bridge', 'id', answers.map(row => String(row.answer_bridge_id)))
+    .map(row => projectAnswerBridgeRecord(database, String(row.id)));
+  const children = queryAllByIds(database, 'child_execution', 'id', bridges.map(row => String(row.child_execution_id)));
+  include('AnswerSubmission', answers);
+  include('AnswerBridge', bridges);
+  include('ChildExecution', children);
+  include('ChildExecutionParentLink', queryAllByIds(database, 'child_execution_parent_link', 'child_execution_id', children.map(row => String(row.id))));
+  const turnIds = [...new Set([...sources.map(row => row.turn_id), ...deliveries.map(row => row.target_turn_id)]
+    .filter((id): id is string => typeof id === 'string' && id.length > 0))];
+  include('Turn', queryAllByIds(database, 'turn', 'id', turnIds).filter(row => row.conversation_id === conversationId));
+  include('CollaborationPeerConversation', projectCollaborationPeerConversations(database, conversationId,
+    [...sources.map(row => String(row.conversation_id)), ...targets.map(row => String(row.conversation_id)),
+      ...children.map(row => String(row.child_conversation_id))], content));
+  return records;
+}
+
+/**
+ * Positioned exchanges, then message/answer inventory with no invented transcript coordinates.
+ * Each lane has an independent bounded keyset cursor; the inventory order is never presentation
+ * chronology. Even a child answer with no following ModelRequest remains pageable here.
+ */
+export function executeClientCollaborationHistoryPage(
+  database: Database.Database, input: ClientCollaborationHistoryPageInput, content: ClientProjectionContentAccess
+): ClientCollaborationHistoryPageResult {
+  if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) throw new RangeError('Invalid exchange history limit.');
+  const conversationId = requireRuntimeId(input.conversationId);
+  const cursor = normalizeCollaborationHistoryCursor(input.cursor) ?? { kind: 'exchange' as const };
+  if (cursor.kind === 'message') {
+    const legacy = executeCollaborationMessageInventoryPage(database, { conversationId, limit: input.limit,
+      ...(cursor.beforeMessageSeq === undefined ? {} : { beforeMessageSeq: cursor.beforeMessageSeq, beforeId: cursor.beforeId }) }, content);
+    const page: ClientCollaborationHistoryPageResult = {
+      records: legacy.records, hasMore: true, scannedRows: legacy.scannedRows, responseBytes: 0,
+      scanProgress: legacy.scanProgress || !legacy.hasMore,
+      nextCursor: legacy.hasMore ? { kind: 'message', beforeMessageSeq: legacy.nextBeforeMessageSeq!, beforeId: legacy.nextBeforeId! } : { kind: 'answer' }
+    };
+    settleClientWireResponseBytes(page);
+    if (page.responseBytes > CLIENT_PAGE_MAX_BYTES) {
+      if (input.limit <= 1) throw new Error('A single collaboration inventory item exceeds the final wire bound.');
+      return executeClientCollaborationHistoryPage(database, { ...input, limit: Math.max(1, Math.floor(input.limit / 2)) }, content);
+    }
+    return page;
+  }
+  database.exec('BEGIN');
+  try {
+    let page: ClientCollaborationHistoryPageResult;
+    if (cursor.kind === 'exchange') {
+      const before = cursor.beforeExchangeSeq === undefined ? undefined : BigInt(cursor.beforeExchangeSeq);
+      const window = readTimelineWindow(database, conversationId, input.limit, before);
+      const ordered = [...window.receives.map(row => ({ kind: 'receive', row })), ...window.sends.map(row => ({ kind: 'send', row }))]
+        .sort((a, b) => compareRuntimeRowInteger(b.row.exchange_seq, a.row.exchange_seq));
+      let count = ordered.length;
+      for (;;) {
+        const selected = ordered.slice(0, count);
+        const hasMore = window.hasMore || count < ordered.length;
+        page = {
+          records: buildTimelineExchangeRecords(database, conversationId, {
+            receives: selected.filter(item => item.kind === 'receive').map(item => item.row),
+            sends: selected.filter(item => item.kind === 'send').map(item => item.row)
+          }, content),
+          nextCursor: hasMore ? { kind: 'exchange', beforeExchangeSeq: String(selected[selected.length - 1].row.exchange_seq) } : { kind: 'message' },
+          hasMore: true, scanProgress: !hasMore, scannedRows: ordered.length, responseBytes: 0
+        };
+        settleClientWireResponseBytes(page);
+        if (page.responseBytes <= CLIENT_PAGE_MAX_BYTES) break;
+        if (count <= 1) throw new Error('A single exchange history item exceeds the wire bound.');
+        count = Math.max(1, Math.floor(count / 2));
+      }
+    } else {
+      // One exact indexed suffix is materialized before the Inbox join. Empty non-answer
+      // windows advance their last inspected delivery key without scanning other Conversations.
+      const candidates = queryPlainRows(database, `
+        SELECT * FROM runtime_delivery WHERE target_conversation_id = @conversationId
+          ${cursor.beforeCreatedAt === undefined ? '' : 'AND (created_at, id) < (@beforeCreatedAt, @beforeId)'}
+         ORDER BY created_at DESC, id DESC LIMIT @limit
+      `, { conversationId, limit: BigInt(CLIENT_COLLABORATION_SCAN_MAX_ROWS),
+        ...(cursor.beforeCreatedAt === undefined ? {} : { beforeCreatedAt: cursor.beforeCreatedAt, beforeId: cursor.beforeId! }) });
+      const inboxes = new Map(queryAllByIds(database, 'runtime_inbox_item', 'id', candidates.map(row => String(row.inbox_item_id))).map(row => [String(row.id), row]));
+      const answers = candidates.filter(row => inboxes.get(String(row.inbox_item_id))?.source_kind === 'answer_submission');
+      let count = Math.min(input.limit, answers.length);
+      for (;;) {
+        const selected = answers.slice(0, count);
+        const clipped = count < answers.length;
+        const oldest = clipped ? selected[selected.length - 1] : candidates[candidates.length - 1];
+        const hasMore = clipped || candidates.length === CLIENT_COLLABORATION_SCAN_MAX_ROWS;
+        page = {
+          records: buildTimelineExchangeRecords(database, conversationId, { receives: [], sends: [] }, content, selected.map(row => String(row.id))),
+          ...(hasMore && oldest ? { nextCursor: { kind: 'answer' as const, beforeCreatedAt: String(oldest.created_at), beforeId: String(oldest.id) } } : {}),
+          hasMore, scanProgress: selected.length === 0 && hasMore, scannedRows: candidates.length, responseBytes: 0
+        };
+        const selectedIds = new Set(selected.map(row => String(row.id)));
+        page.records.RuntimeDelivery = (page.records.RuntimeDelivery ?? []).map(row => selectedIds.has(String(row.id))
+          ? { ...row, history_inventory_item: true } : row);
+        settleClientWireResponseBytes(page);
+        if (page.responseBytes <= CLIENT_PAGE_MAX_BYTES) break;
+        if (count <= 1) throw new Error('A single historical answer exceeds the wire bound.');
+        count = Math.max(1, Math.floor(count / 2));
+      }
+    }
+    database.exec('COMMIT');
+    return page;
+  } catch (error) { database.exec('ROLLBACK'); throw error; }
+}
+
 /**
  * Read collaboration envelopes by their own immutable sequence. Message membership (including an
  * empty transcript) is irrelevant. Select only ids connected to this Conversation by an explicit
  * source/target link, then materialize every card dependency in the same SQLite read transaction.
  */
-export function executeClientCollaborationHistoryPage(
+function executeCollaborationMessageInventoryPage(
   database: Database.Database,
-  input: ClientCollaborationHistoryPageInput,
+  input: { conversationId: string; limit: number; beforeMessageSeq?: string; beforeId?: string },
   content: ClientProjectionContentAccess
-): ClientCollaborationHistoryPageResult {
+): ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } {
   if (!Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > CLIENT_PAGE_MAX_ROWS) {
     throw new RangeError(`Collaboration history page limit must be from 1 to ${CLIENT_PAGE_MAX_ROWS}.`);
   }
@@ -2170,7 +2334,7 @@ export function executeClientCollaborationHistoryPage(
     const candidates = matches.slice(0, input.limit + 1);
     if (candidates.length === 0) {
       const progress = olderGlobalExists;
-      const empty: ClientCollaborationHistoryPageResult = {
+      const empty: ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } = {
         records: {},
         ...(progress ? {
           nextBeforeMessageSeq: String(oldestInspected!.message_seq),
@@ -2211,7 +2375,7 @@ export function executeClientCollaborationHistoryPage(
       return [...new Set(peerIds)].filter((id) => id && id !== conversationId).sort()
         .flatMap((id) => peers.has(id) ? [peers.get(id)!] : []);
     };
-    const materialize = (count: number): ClientCollaborationHistoryPageResult => {
+    const materialize = (count: number): ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } => {
       const selected = candidates.slice(0, count);
       const ids = selected.map((row) => String(row.id));
       const records: Record<string, DomainRow[]> = {};
@@ -2264,7 +2428,7 @@ export function executeClientCollaborationHistoryPage(
       // advance across an inspected stretch of unrelated Conversations (including a zero-row page).
       const progress = count === candidates.length && candidates.length < input.limit && olderGlobalExists;
       const cursor = progress ? oldestInspected : oldest;
-      const page: ClientCollaborationHistoryPageResult = {
+      const page: ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } = {
         records,
         ...(cursor ? { nextBeforeMessageSeq: String(cursor.message_seq), nextBeforeId: String(cursor.id) } : {}),
         hasMore: matches.length > count || olderGlobalExists,
@@ -2279,7 +2443,7 @@ export function executeClientCollaborationHistoryPage(
     // the byte cap is actually crossed.
     const maximumCount = Math.min(input.limit, candidates.length);
     const full = materialize(maximumCount);
-    let page: ClientCollaborationHistoryPageResult | undefined = full.responseBytes <= CLIENT_PAGE_MAX_BYTES ? full : undefined;
+    let page: ClientVisibleMessageHistoryPageResult & { scanProgress: boolean; scannedRows: number } | undefined = full.responseBytes <= CLIENT_PAGE_MAX_BYTES ? full : undefined;
     let low = 1;
     let high = page ? 0 : maximumCount - 1;
     while (low <= high) {
@@ -2586,29 +2750,16 @@ function queryClientRuntimeDeliveries(
   database: Database.Database,
   conversationId: string
 ): Array<Record<string, unknown>> {
-  return queryPlainRows(database, `
-    WITH recent_deliveries AS (
-      SELECT id
-        FROM runtime_delivery
-       WHERE target_conversation_id = @conversationId
-       ORDER BY created_at DESC, id DESC
-       LIMIT @limit
-    )
-    SELECT delivery.*
-      FROM runtime_delivery AS delivery
-     WHERE delivery.target_conversation_id = @conversationId
-       AND (
-         delivery.state IN ('pending', 'failed')
-         OR EXISTS (
-           SELECT 1
-             FROM runtime_delivery_input_link AS input_link
-            WHERE input_link.delivery_id = delivery.id
-              AND input_link.handled_at IS NULL
-         )
-         OR delivery.id IN (SELECT id FROM recent_deliveries)
-       )
-     ORDER BY delivery.created_at DESC, delivery.id DESC
-  `, { conversationId, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) });
+  // Materialize bounded indexed state suffixes before combining them. Pending/failed attention
+  // remains represented without gathering every historical failed attempt into the live snapshot.
+  const byState = ['pending', 'failed', 'consumed'].map(state => queryPlainRows(database, `
+    SELECT * FROM runtime_delivery WHERE target_conversation_id = @conversationId AND state = @state
+     ORDER BY created_at DESC, id DESC LIMIT @limit
+  `, { conversationId, state, limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) }));
+  const recent = byState.flat().sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
+    || String(right.id).localeCompare(String(left.id)));
+  return mergeRowsById([...byState[0].slice(0, 3), ...byState[1].slice(0, 3), ...recent])
+    .slice(0, CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE);
 }
 
 function queryVisibleMessageRowsByIds(

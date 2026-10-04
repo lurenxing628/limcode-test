@@ -1,3 +1,4 @@
+import { runtimeDeliveryTimelineStep } from './timelineAcceptance';
 import { createHash } from 'node:crypto';
 import {
   ContentAddressedStore,
@@ -42,6 +43,8 @@ export interface ContextSourceOccurrence {
 }
 
 export interface ContextAppendCommand {
+  /** Exact accepted input, committed with this Context occurrence and head. */
+  runtimeDeliveryAcceptance?: { deliveryId: string; pendingTurnInputId: string; inputContentObjectId: string };
   conversationId: string;
   segmentKind: Exclude<ContextSegmentKind, 'message' | 'tool_pair' | 'compression'>;
   source: ContextSourceOccurrence;
@@ -213,6 +216,7 @@ interface AppendOccurrencePlan {
   nativePartialPair?: 'tool_call' | 'tool_model_result';
   /** Atomic execution fence asserted in every committing transaction of the native append. */
   executionFence?: { callTurnId: string };
+  runtimeDeliveryAcceptance?: { deliveryId: string; pendingTurnInputId: string; inputContentObjectId: string };
 }
 
 interface BaseShape {
@@ -287,7 +291,8 @@ export class ContextSequenceControlPlane {
       content,
       baseRootId: command.baseRootId,
       expectedHeadRootId: command.expectedHeadRootId,
-      activate: command.activate
+      activate: command.activate,
+      runtimeDeliveryAcceptance: command.runtimeDeliveryAcceptance
     });
   }
 
@@ -1930,6 +1935,12 @@ export class ContextSequenceControlPlane {
   private async appendOccurrence(planInput: AppendOccurrencePlan): Promise<ContextAppendResult> {
     const conversationId = requireId(planInput.conversationId, 'conversationId');
     const sources = normalizeSources(planInput.sources);
+    if (planInput.runtimeDeliveryAcceptance && (planInput.activate === false || sources.length !== 1
+      || sources[0].sourceKind !== 'runtime_context'
+      || sources[0].sourceId !== planInput.runtimeDeliveryAcceptance.pendingTurnInputId
+      || sources[0].sourceRevision !== 0n)) {
+      throw new TypeError('Runtime acceptance requires its activated, exact input Context occurrence.');
+    }
     const segmentKind = requireSegmentKind(planInput.segmentKind);
     if (planInput.nativePartialPair === undefined) {
       validateNewContextSegmentSources(segmentKind, sources);
@@ -2022,7 +2033,12 @@ export class ContextSequenceControlPlane {
         estimated_tokens: base.estimatedTokens + estimated,
         created_at: now
       }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
-      ...(activate ? headMutationSteps(conversationId, head, rootId, now) : [])
+      ...(activate ? headMutationSteps(conversationId, head, rootId, now) : []),
+      ...(planInput.runtimeDeliveryAcceptance ? [runtimeDeliveryTimelineStep({
+        conversationId, deliveryId: planInput.runtimeDeliveryAcceptance.deliveryId, now,
+        context: { pendingTurnInputId: planInput.runtimeDeliveryAcceptance.pendingTurnInputId,
+          inputContentObjectId: planInput.runtimeDeliveryAcceptance.inputContentObjectId, rootId, nodeId }
+      })] : [])
     ];
     try {
       const commit = await this.database.transaction(steps);

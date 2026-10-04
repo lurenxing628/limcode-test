@@ -29,7 +29,7 @@ export interface RuntimeDataSetUpgradeResult {
   candidateId: string;
   binding: RootBinding;
   migrated: boolean;
-  previousEpoch?: 3 | 4;
+  previousEpoch?: 3 | 4 | 5;
   backupPath?: string;
 }
 
@@ -105,7 +105,7 @@ export async function upgradeDiscoveredRuntimeDataSets(
             '此历史库有未认证的 pending 状态，不能自动推断为旧格式升级；原数据保持不变。'
           );
         }
-      } else if (candidate.runtimeKernelEpoch !== 3 && candidate.runtimeKernelEpoch !== 4) {
+      } else if (candidate.runtimeKernelEpoch !== 3 && candidate.runtimeKernelEpoch !== 4 && candidate.runtimeKernelEpoch !== 5) {
         throw new RootAuthorityError(
           'runtime-epoch-migration-unsupported',
           `第 ${candidate.runtimeKernelEpoch} 代运行数据没有已验证的无损升级路径；原数据保持不变。`
@@ -164,7 +164,7 @@ export async function upgradeRuntimeDataSet(
       }
 
       // Do not require a complete root before migration: the exact predecessor journal owns
-      // recovery of valid 3→4 and 3/4→5 pending boundaries, including a committed SQLite file.
+      // recovery of valid 3→4, 3/4→5 and 3/4/5→6 pending boundaries, including a committed SQLite file.
       const migration = await migratePreviousRuntimeEpochIfRequired(authority, options);
       const upgraded = await resolveVscodeRuntimeDataSet(storagePaths, request.candidateId);
       assertExpectedIdentity(upgraded, request);

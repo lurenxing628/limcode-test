@@ -26,6 +26,7 @@ import {
   createEmptyReliableKernelClientState,
   type ReliableKernelBoundedClientState,
   type ReliableKernelClientDetailKind,
+  type ReliableKernelCollaborationHistoryCursor,
   type ReliableKernelCollaborationHistoryErrorMessage,
   type ReliableKernelCollaborationHistoryResultMessage,
   type ReliableKernelDetailErrorMessage,
@@ -180,11 +181,10 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   historyError: string | null;
   historyRequestId: string | null;
   historyLoadedPages: number;
-  /** CollaborationMessage's own independent keyset, never seeded by Message membership. */
+  /** Independent exchange history, followed by envelopes without proven placement. */
   collaborationHistoryConversationId: string | null;
   collaborationHistoryRecords: ReliableKernelBoundedClientState['records'];
-  collaborationHistoryNextBeforeMessageSeq: string | null;
-  collaborationHistoryNextBeforeId: string | null;
+  collaborationHistoryNextCursor: ReliableKernelCollaborationHistoryCursor | null;
   collaborationHistoryHasMore: boolean;
   collaborationHistoryScanProgress: boolean;
   collaborationHistoryLoading: boolean;
@@ -251,8 +251,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
     historyLoadedPages: 0,
     collaborationHistoryConversationId: null,
     collaborationHistoryRecords: {},
-    collaborationHistoryNextBeforeMessageSeq: null,
-    collaborationHistoryNextBeforeId: null,
+    collaborationHistoryNextCursor: null,
     collaborationHistoryHasMore: false,
     collaborationHistoryScanProgress: false,
     collaborationHistoryLoading: false,
@@ -370,6 +369,14 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
           envelope,
           this.records,
           result.state.records
+        );
+      }
+      if (result.ack && incomingType === RELIABLE_KERNEL_CHANGES_MESSAGE
+        && previousConversationId === nextConversationId
+        && this.collaborationHistoryConversationId === nextConversationId) {
+        this.collaborationHistoryRecords = reconcileHistoryRecordsWithLiveChanges(
+          this.collaborationHistoryRecords, envelope, this.records, result.state.records,
+          COLLABORATION_HISTORY_RECORD_TYPES
         );
       }
       let replayDetails: Array<{
@@ -509,9 +516,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       if (!normalized || !sessionId || activeConversationId(this.projections) !== normalized
         || this.collaborationHistoryConversationId !== normalized || this.collaborationHistoryLoading
         || !this.collaborationHistoryHasMore) return false;
-      const beforeMessageSeq = this.collaborationHistoryNextBeforeMessageSeq;
-      const beforeId = this.collaborationHistoryNextBeforeId;
-      if ((beforeMessageSeq === null) !== (beforeId === null)) {
+      const cursor = this.collaborationHistoryNextCursor;
+      if (cursor && !isCollaborationHistoryCursor(cursor)) {
         this.collaborationHistoryError = '协作历史分页游标不可用。';
         return false;
       }
@@ -534,7 +540,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         bridge.postRaw({
           type: RELIABLE_KERNEL_COLLABORATION_HISTORY_REQUEST_MESSAGE,
           requestId, sessionId, conversationId: normalized,
-          ...(beforeMessageSeq === null ? {} : { beforeMessageSeq, beforeId }),
+          ...(cursor === null ? {} : { cursor }),
           limit: HISTORY_PAGE_LIMIT
         });
       } catch (error) {
@@ -552,8 +558,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         || message.conversationId !== this.collaborationHistoryConversationId
         || message.conversationId !== activeConversationId(this.projections)
         || message.requestId !== this.collaborationHistoryRequestId) return;
-      if (!isCollaborationHistoryPage(message.page, this.collaborationHistoryNextBeforeMessageSeq,
-        this.collaborationHistoryNextBeforeId)) {
+      if (!isCollaborationHistoryPage(message.page, this.collaborationHistoryNextCursor, message.conversationId)) {
         clearCollaborationHistoryTimeout(message.requestId);
         this.collaborationHistoryLoading = false;
         this.collaborationHistoryRequestId = null;
@@ -572,8 +577,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         return;
       }
       clearCollaborationHistoryTimeout(message.requestId);
-      this.collaborationHistoryNextBeforeMessageSeq = message.page.nextBeforeMessageSeq ?? null;
-      this.collaborationHistoryNextBeforeId = message.page.nextBeforeId ?? null;
+      this.collaborationHistoryNextCursor = message.page.nextCursor ?? null;
       this.collaborationHistoryHasMore = message.page.hasMore;
       this.collaborationHistoryScanProgress = message.page.scanProgress;
       this.collaborationHistoryLoading = false;
@@ -1995,8 +1999,7 @@ function resetCollaborationHistoryState(
   clearCollaborationHistoryTimeout(state.collaborationHistoryRequestId);
   state.collaborationHistoryConversationId = conversationId;
   state.collaborationHistoryRecords = {};
-  state.collaborationHistoryNextBeforeMessageSeq = null;
-  state.collaborationHistoryNextBeforeId = null;
+  state.collaborationHistoryNextCursor = null;
   state.collaborationHistoryHasMore = Boolean(conversationId);
   state.collaborationHistoryScanProgress = false;
   state.collaborationHistoryLoading = false;
@@ -2005,45 +2008,87 @@ function resetCollaborationHistoryState(
   state.collaborationHistoryLoadedPages = 0;
 }
 
-/** Reject a backward page that would loop or splice in foreign/mismatched independent facts. */
+/** Reject malformed, repeated or backward-lane cursors without deriving placement from them. */
+function isCollaborationHistoryCursor(value: unknown): value is ReliableKernelCollaborationHistoryCursor {
+  if (!isRecord(value)) return false;
+  if (value.kind === 'exchange') {
+    return value.beforeExchangeSeq === undefined || Boolean(positiveDecimal(value.beforeExchangeSeq));
+  }
+  if (value.kind === 'message') {
+    return (value.beforeMessageSeq === undefined && value.beforeId === undefined)
+      || Boolean(positiveDecimal(value.beforeMessageSeq) && nonEmptyString(value.beforeId));
+  }
+  if (value.kind === 'answer') {
+    return (value.beforeCreatedAt === undefined && value.beforeId === undefined)
+      || Boolean(nonEmptyString(value.beforeCreatedAt) && nonEmptyString(value.beforeId));
+  }
+  return false;
+}
+
 function isCollaborationHistoryPage(
   page: ReliableKernelCollaborationHistoryResultMessage['page'],
-  beforeMessageSeq: string | null,
-  beforeId: string | null
+  previousCursor: ReliableKernelCollaborationHistoryCursor | null,
+  conversationId: string
 ): boolean {
-  const rows = page.records.CollaborationMessage ?? [];
-  if (!Array.isArray(rows) || rows.length > HISTORY_PAGE_LIMIT || typeof page.hasMore !== 'boolean'
+  if (!isRecord(page) || !isRecord(page.records) || typeof page.hasMore !== 'boolean'
     || typeof page.scanProgress !== 'boolean'
     || !Number.isSafeInteger(page.scannedRows) || page.scannedRows < 0 || page.scannedRows > 4096
-    || !Number.isSafeInteger(page.responseBytes) || page.responseBytes > 524_288
+    || !Number.isSafeInteger(page.responseBytes) || page.responseBytes < 0 || page.responseBytes > 524_288
     || (page.scanProgress && !page.hasMore)
-    || (page.hasMore && !page.nextBeforeMessageSeq)
-    || (page.nextBeforeMessageSeq === undefined) !== (page.nextBeforeId === undefined)
-    || (rows.length > 0 && (page.nextBeforeMessageSeq === undefined || page.nextBeforeId === undefined))) return false;
-  const cursorSeq = page.nextBeforeMessageSeq === undefined ? undefined : positiveDecimal(page.nextBeforeMessageSeq);
-  const cursorId = page.nextBeforeId;
-  if (page.nextBeforeMessageSeq !== undefined && (!cursorSeq || !nonEmptyString(cursorId))) return false;
-  if (cursorSeq && beforeMessageSeq && (BigInt(cursorSeq) >= BigInt(beforeMessageSeq)
-    || cursorSeq === beforeMessageSeq && cursorId === beforeId)) return false;
-  let previous: { seq: bigint; id: string } | undefined;
+    || page.hasMore !== (page.nextCursor !== undefined)) return false;
+  const cursor: ReliableKernelCollaborationHistoryCursor = previousCursor ?? { kind: 'exchange' };
+  const next = page.nextCursor;
+  if (next !== undefined) {
+    if (!isCollaborationHistoryCursor(next)) return false;
+    const lane = { exchange: 0, message: 1, answer: 2 };
+    if (lane[next.kind] < lane[cursor.kind]) return false;
+    if (next.kind === cursor.kind) {
+      if (next.kind === 'exchange' && cursor.kind === 'exchange') {
+        if (!next.beforeExchangeSeq || (cursor.beforeExchangeSeq
+          && BigInt(next.beforeExchangeSeq) >= BigInt(cursor.beforeExchangeSeq))) return false;
+      } else if (next.kind === 'message' && cursor.kind === 'message') {
+        if (!next.beforeMessageSeq || !next.beforeId || (cursor.beforeMessageSeq && cursor.beforeId
+          && (BigInt(next.beforeMessageSeq) > BigInt(cursor.beforeMessageSeq)
+            || next.beforeMessageSeq === cursor.beforeMessageSeq && next.beforeId >= cursor.beforeId))) return false;
+      } else if (next.kind === 'answer' && cursor.kind === 'answer') {
+        if (!next.beforeCreatedAt || !next.beforeId || (cursor.beforeCreatedAt && cursor.beforeId
+          && (next.beforeCreatedAt > cursor.beforeCreatedAt
+            || next.beforeCreatedAt === cursor.beforeCreatedAt && next.beforeId >= cursor.beforeId))) return false;
+      }
+    }
+  }
+  for (const [type, rows] of Object.entries(page.records)) {
+    if (!COLLABORATION_HISTORY_RECORD_TYPES.has(type) || !Array.isArray(rows)) return false;
+    if (rows.some((row) => !isRecord(row) || !nonEmptyString(row.id))) return false;
+  }
+  const links = [...(page.records.RuntimeDeliveryTimelineLink ?? []), ...(page.records.CollaborationSendTimelineLink ?? [])];
+  if (links.length > HISTORY_PAGE_LIMIT) return false;
+  const seen = new Set<string>();
+  for (const link of links) {
+    const seq = positiveDecimal(link.exchange_seq);
+    if (link.conversation_id !== conversationId || !seq || seen.has(seq)) return false;
+    seen.add(seq);
+    if (cursor.kind === 'exchange' && cursor.beforeExchangeSeq && BigInt(seq) >= BigInt(cursor.beforeExchangeSeq)) return false;
+    // A selected retry can carry its older canonical acceptance as dependency closure. The
+    // cursor advances the inspected event window, not that retained proof's older coordinate.
+  }
+  const rows = cursor.kind === 'message' ? page.records.CollaborationMessage ?? []
+    : cursor.kind === 'answer' ? (page.records.RuntimeDelivery ?? []).filter(row => row.target_conversation_id === conversationId && row.history_inventory_item === true) : [];
+  if (rows.length > HISTORY_PAGE_LIMIT) return false;
   for (const row of rows) {
-    if (!isRecord(row) || !nonEmptyString(row.id)) return false;
-    const seq = positiveDecimal(row.message_seq);
-    if (!seq) return false;
-    const current = { seq: BigInt(seq), id: row.id as string };
-    if (previous && (current.seq < previous.seq || current.seq === previous.seq && current.id <= previous.id)) return false;
-    if (beforeMessageSeq && beforeId && (current.seq > BigInt(beforeMessageSeq)
-      || current.seq === BigInt(beforeMessageSeq) && current.id >= beforeId)) return false;
-    previous = current;
+    if (cursor.kind === 'message') {
+      const seq = positiveDecimal(row.message_seq);
+      if (!seq || (cursor.beforeMessageSeq && cursor.beforeId
+        && (BigInt(seq) > BigInt(cursor.beforeMessageSeq)
+          || seq === cursor.beforeMessageSeq && String(row.id) >= cursor.beforeId))) return false;
+    } else if (cursor.kind === 'answer') {
+      const createdAt = nonEmptyString(row.created_at);
+      if (!createdAt || (cursor.beforeCreatedAt && cursor.beforeId
+        && (createdAt > cursor.beforeCreatedAt
+          || createdAt === cursor.beforeCreatedAt && String(row.id) >= cursor.beforeId))) return false;
+    }
   }
-  const oldest = rows[0];
-  if (page.scanProgress) {
-    return Boolean(cursorSeq && cursorId && page.scannedRows > 0
-      && (rows.length === 0 || BigInt(cursorSeq) <= BigInt(String(oldest?.message_seq))));
-  }
-  return rows.length === 0
-    ? !page.hasMore && page.nextBeforeMessageSeq === undefined
-    : page.nextBeforeMessageSeq === oldest?.message_seq && page.nextBeforeId === oldest.id;
+  return true;
 }
 
 function clearHistoryRequestTimeout(requestId: string | null): void {
@@ -2297,7 +2342,8 @@ function reconcileHistoryRecordsWithLiveChanges(
   history: ReliableKernelBoundedClientState['records'],
   envelope: Record<string, unknown> | undefined,
   previousLive: ReliableKernelBoundedClientState['records'],
-  nextLive: ReliableKernelBoundedClientState['records']
+  nextLive: ReliableKernelBoundedClientState['records'],
+  allowedTypes?: ReadonlySet<string>
 ): ReliableKernelBoundedClientState['records'] {
   const changes = Array.isArray(envelope?.changes) ? envelope.changes : [];
   const finalEvictedRecords = new Map<
@@ -2330,7 +2376,7 @@ function reconcileHistoryRecordsWithLiveChanges(
     const change = plainRecord(value);
     const type = nonEmptyString(change?.type);
     const id = nonEmptyString(change?.id);
-    if (!type || !id) continue;
+    if (!type || !id || (allowedTypes && !allowedTypes.has(type))) continue;
     const windowEviction = change?.operation === 'remove'
       && change.removalCause === 'window-eviction';
     const previousRecord = previousLive[type]?.[id];
@@ -2511,7 +2557,9 @@ function isVisibleConversationMessage(
 
 const COLLABORATION_HISTORY_RECORD_TYPES = new Set([
   'CollaborationMessage', 'CollaborationMessageSourceLink', 'CollaborationMessageTargetLink',
-  'RuntimeDelivery', 'Turn', 'CollaborationPeerConversation'
+  'RuntimeDelivery', 'RuntimeDeliveryTimelineLink', 'CollaborationSendTimelineLink',
+  'RuntimeInboxItem', 'AnswerSubmission', 'AnswerBridge', 'ChildExecution', 'ChildExecutionParentLink',
+  'Turn', 'CollaborationPeerConversation'
 ]);
 
 function mergeHistoryRecordPage(

@@ -14,7 +14,8 @@
     "r4: 配置 authority 逐对象/ScopeLink crosswalk 到 migration physical manifest；不再用聚合 Policy 代替独立领域",
     "r4: Process 使用 detached wrapper、durable spool与可续CAS chunks；MCP 调用复用 EffectIntent/Receipt",
     "r5: Provider 工具批次使用 ToolCallSourceLink 独立表达来源，并由 ToolCallPolicySnapshot 冻结展示、门禁、change-apply 与调度决定",
-    "r6: RuntimeDeliveryIntentLink 明确记录 next-turn Delivery 触发的 TurnIntent；Runtime continuation 不再借用 retry 身份"
+    "r6: RuntimeDeliveryIntentLink 明确记录 next-turn Delivery 触发的 TurnIntent；Runtime continuation 不再借用 retry 身份",
+    "Timeline acceptance: two independent typed links freeze physical Message membership cuts and one shared conversation-local exchange sequence; Context input acceptance shares its Context/root transaction; send and notify-only acceptance use their own commits. Published history is backfilled only from exact proof."
   ],
   "contractRevision": "2026-07-31-r4",
   "status": "planned",
@@ -46,14 +47,16 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "exact-published-upgrade-else-fail-closed",
-    "exactPredecessorUpgrade": "published-epoch-3-or-4-to-5-with-backup-journal",
-    "currentEpoch": 5
+    "exactPredecessorUpgrade": "published-epoch-3-4-or-5-to-6-with-backup-journal",
+    "currentEpoch": 6
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
     "allocation": "single-writer-transaction-max-plus-one",
     "concurrency": "sqlite-serialized-writer-transactions",
-    "messageSeqReuse": "never-including-soft-deleted-messages"
+    "messageSeqReuse": "never-including-soft-deleted-messages",
+    "exchangeSeq": "shared-MAX-plus-one-across-both-insert-only-timeline-relations-in-acceptance-transaction; retained-until-own-conversation-delete; never-message-floor-or-clock",
+    "timelineImport": "new-source-events-joint-receive-send-ordered-union-allocated-as-target-suffix; reuse-keeps-target-exchange_seq; all-other-fields-equal; independent-source-data-set-root-instance-sequence-provenance; empty-root-copy-preserves-original"
   },
   "rootPolicy": {
     "mode": "offline-restart-only",
@@ -1940,7 +1943,9 @@
       "indexes": [
         "inbox_item_id,target_conversation_id,attempt_seq UNIQUE",
         "retry_of_delivery_id",
-        "target_conversation_id,state,created_at"
+        "target_conversation_id,state,created_at",
+        "target_conversation_id,state,created_at,id",
+        "target_conversation_id,created_at,id"
       ],
       "notes": [
         "target_turn_id 可空；同一Inbox/Conversation的初始自动投递只有一个attempt=1，phase/target可在authority CAS下收敛；人工 redeliver 创建全局attempt+1并写 retry_of_delivery_id；目标不存在时置 failed(reason=target-gone)"
@@ -2272,6 +2277,58 @@
         "source_kind,source_key UNIQUE",
         "source_tool_call_id UNIQUE",
         "conversation_id"
+      ]
+    },
+    {
+      "key": "RuntimeDeliveryTimelineLink",
+      "table": "runtime_delivery_timeline_link",
+      "repository": "RuntimeDeliveryTimelineLinkRepository",
+      "codec": "RuntimeDeliveryTimelineLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "delivery_id UNIQUE",
+        "pending_turn_input_id UNIQUE",
+        "conversation_id,inbox_item_id,exchange_seq",
+        "conversation_id,exchange_seq UNIQUE",
+        "conversation_id,predecessor_message_seq,exchange_seq"
+      ]
+    },
+    {
+      "key": "CollaborationSendTimelineLink",
+      "table": "collaboration_send_timeline_link",
+      "repository": "CollaborationSendTimelineLinkRepository",
+      "codec": "CollaborationSendTimelineLinkRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "summary",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "message_id UNIQUE",
+        "conversation_id,exchange_seq UNIQUE",
+        "conversation_id,predecessor_message_seq,exchange_seq"
+      ]
+    },
+    {
+      "key": "TimelineImportProvenance",
+      "table": "timeline_import_provenance",
+      "repository": "TimelineImportProvenanceRepository",
+      "codec": "TimelineImportProvenanceRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-timeline-link",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "receive_timeline_link_id",
+        "send_timeline_link_id"
       ]
     }
   ],

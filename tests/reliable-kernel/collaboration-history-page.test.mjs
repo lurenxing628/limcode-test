@@ -168,6 +168,8 @@ function assertPage(page) {
   assert.equal(page.responseBytes, bytes(page), 'exact self-inclusive wire byte count');
   assert.ok(page.responseBytes <= 524_288);
   assert.equal(typeof page.scanProgress, 'boolean');
+  assert.equal(page.hasMore, page.nextCursor !== undefined, 'only a continuation carries a unified cursor');
+  assert.equal(page.nextBeforeMessageSeq, undefined, 'legacy top-level cursors are not part of the wire page');
   assert.ok(Number.isSafeInteger(page.scannedRows) && page.scannedRows >= 0 && page.scannedRows <= 4096,
     'one page inspects at most 4096 immutable global sequence candidates');
   assert.ok((page.records.CollaborationMessage?.length ?? 0) <= 200);
@@ -182,8 +184,13 @@ test('SQLite/CAS collaboration keyset crosses 200 without Message, scopes both d
   try {
     const read = () => new kernel.ClientHistoryReader(f.database());
     await assert.rejects(read().backwardCollaboration({ conversationId: 'target', limit: 3,
-      beforeMessageSeq: '201' }), /cursor|beforeId/);
-    const first = await read().backwardCollaboration({ conversationId: 'target', limit: 200 });
+      cursor: { kind: 'message', beforeMessageSeq: '201' } }), /cursor|beforeId/);
+    const initial = await read().backwardCollaboration({ conversationId: 'target', limit: 200 });
+    assertPage(initial);
+    assert.deepEqual(initial.records, {});
+    assert.equal(initial.scanProgress, true);
+    assert.deepEqual(initial.nextCursor, { kind: 'message' });
+    const first = await read().backwardCollaboration({ conversationId: 'target', limit: 200, cursor: initial.nextCursor });
     assertPage(first);
     assert.equal(first.records.CollaborationMessage.length, 200);
     assert.equal(first.hasMore, true);
@@ -195,28 +202,30 @@ test('SQLite/CAS collaboration keyset crosses 200 without Message, scopes both d
     assert.equal(first.records.RuntimeDelivery.length, 200);
     assert.equal(first.records.CollaborationPeerConversation.find((peer) => peer.id === 'sender')?.display_title, '研究同伴');
     const second = await read().backwardCollaboration({ conversationId: 'target', limit: 200,
-      beforeMessageSeq: first.nextBeforeMessageSeq, beforeId: first.nextBeforeId });
+      cursor: first.nextCursor });
     assertPage(second);
     assert.equal(second.records.CollaborationMessage.length, 41);
-    assert.equal(second.hasMore, false);
+    assert.equal(second.hasMore, true);
+    assert.deepEqual(second.nextCursor, { kind: 'answer' });
     assert.equal(second.records.CollaborationMessage[0].id, 'collab-000');
     assert.equal(second.records.RuntimeDelivery.find((record) => record.inbox_item_id === 'collab-002-inbox')?.id,
       'collab-002-delivery-2', 'the newest delivery attempt is selected by attempt_seq, not created_at');
     assert.equal(second.records.Turn?.find((turn) => turn.id === 'target-turn')?.conversation_id, 'target');
     assert.equal(new Set([...first.records.CollaborationMessage, ...second.records.CollaborationMessage].map((record) => record.id)).size, 241);
     const empty = await read().backwardCollaboration({ conversationId: 'target', limit: 200,
-      beforeMessageSeq: second.nextBeforeMessageSeq, beforeId: second.nextBeforeId });
+      cursor: second.nextCursor });
     assertPage(empty);
     assert.equal(empty.hasMore, false);
-    assert.deepEqual(empty.records, {});
+    assert.equal(empty.nextCursor, undefined);
+    assert.deepEqual(Object.values(empty.records).flat(), [], 'terminal inventory has no records, including optional empty domain arrays');
     await new kernel.ConversationDeletionControlPlane(f.database()).delete('gone');
     const afterDeletion = await read().backwardCollaboration({ conversationId: 'target', limit: 50,
-      beforeMessageSeq: first.nextBeforeMessageSeq, beforeId: first.nextBeforeId });
+      cursor: first.nextCursor });
     assert.equal(afterDeletion.records.CollaborationPeerConversation.find((peer) => peer.id === 'gone')?.status, 'deleted');
     await f.database().close();
     await f.open('collaboration-history-reopened');
     const restarted = await read().backwardCollaboration({ conversationId: 'target', limit: 50,
-      beforeMessageSeq: first.nextBeforeMessageSeq, beforeId: first.nextBeforeId });
+      cursor: first.nextCursor });
     assertPage(restarted);
     assert.equal(restarted.records.CollaborationMessage[0].id, 'collab-000');
     assert.equal(restarted.records.CollaborationPeerConversation.find((peer) => peer.id === 'gone')?.status, 'deleted');
@@ -250,13 +259,14 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
     } finally { native.close(); }
     const reader = new kernel.ClientHistoryReader(f.database);
     const found = [];
-    let cursor;
+    let cursor = { kind: 'message' };
+    let lastPage;
     let pages = 0;
     let emptyProgressPages = 0;
     do {
       const page = await reader.backwardCollaboration({
         conversationId: 'target', limit: 200,
-        ...(cursor ? { beforeMessageSeq: cursor.nextBeforeMessageSeq, beforeId: cursor.nextBeforeId } : {})
+        cursor
       });
       assertPage(page);
       pages += 1;
@@ -269,32 +279,39 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
         assert.equal(page.scannedRows, 4096);
         assert.equal(page.hasMore, true);
       }
-      if (cursor && page.nextBeforeMessageSeq) {
-        assert.ok(BigInt(page.nextBeforeMessageSeq) < BigInt(cursor.nextBeforeMessageSeq),
+      if (cursor.beforeMessageSeq && page.nextCursor?.kind === 'message') {
+        assert.ok(BigInt(page.nextCursor.beforeMessageSeq) < BigInt(cursor.beforeMessageSeq),
           'each new scan cursor strictly moves backward, including an empty page');
       }
       if ((page.records.CollaborationMessage?.length ?? 0) === 0 && page.hasMore) {
         emptyProgressPages += 1;
         assert.equal(page.scanProgress, true);
-        assert.ok(page.nextBeforeMessageSeq && page.nextBeforeId, 'a zero-row page supplies its inspected progress key');
+        assert.equal(page.nextCursor.kind, 'message');
+        assert.ok(page.nextCursor.beforeMessageSeq && page.nextCursor.beforeId, 'a zero-row page supplies its inspected progress key');
       }
       found.push(...(page.records.CollaborationMessage ?? []).map((message) => message.id));
-      cursor = page;
+      lastPage = page;
+      cursor = page.nextCursor;
       assert.ok(pages < 40, 'every scan advances without an unbounded hidden retry');
-    } while (cursor.hasMore);
+    } while (cursor?.kind === 'message');
     assert.ok(emptyProgressPages > 20, `${emptyProgressPages} zero-row progress pages expected`);
     assert.deepEqual(found, ['own-new', ...Array.from({ length: 200 }, (_value, index) =>
       `own-old-${String(index).padStart(3, '0')}`)],
       'each page is an ascending render bundle, while its keyset advances toward older global sequence keys');
     assert.equal(new Set(found).size, found.length, 'no match is repeated or skipped');
-    assert.equal(cursor.records.CollaborationMessage.length, 200, 'the far historical page itself loads 200 owned rows');
-    assert.equal(cursor.records.CollaborationMessageSourceLink.length, 200);
-    assert.equal(cursor.records.CollaborationMessageTargetLink.length, 200);
-    assert.ok(cursor.records.CollaborationMessageSourceLink.every((link) => link.conversation_id === 'target'));
-    assert.ok(cursor.records.CollaborationMessageTargetLink.every((link) => link.conversation_id === 'sender'));
-    assert.equal(cursor.records.Message, undefined, 'CollaborationMessage is never an ordinary Message');
-    assert.equal(cursor.scanProgress, false);
-    assert.equal(cursor.hasMore, false);
+    assert.equal(lastPage.records.CollaborationMessage.length, 200, 'the far historical page itself loads 200 owned rows');
+    assert.equal(lastPage.records.CollaborationMessageSourceLink.length, 200);
+    assert.equal(lastPage.records.CollaborationMessageTargetLink.length, 200);
+    assert.ok(lastPage.records.CollaborationMessageSourceLink.every((link) => link.conversation_id === 'target'));
+    assert.ok(lastPage.records.CollaborationMessageTargetLink.every((link) => link.conversation_id === 'sender'));
+    assert.equal(lastPage.records.Message, undefined, 'CollaborationMessage is never an ordinary Message');
+    assert.equal(lastPage.scanProgress, true, 'exhausted message inventory advances to answer inventory');
+    assert.equal(lastPage.hasMore, true);
+    assert.deepEqual(cursor, { kind: 'answer' });
+    const terminal = await reader.backwardCollaboration({ conversationId: 'target', limit: 200, cursor });
+    assertPage(terminal);
+    assert.equal(terminal.hasMore, false);
+    assert.equal(terminal.nextCursor, undefined);
 
     const previousWindow = globalThis.window;
     const previousDocument = globalThis.document;
@@ -333,9 +350,10 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
         return page;
       };
       assert.equal(requests().length, 1, 'bootstrap is only one bounded read, not an automatic scan loop');
-      const firstPage = await answer(requests()[0]);
-      assert.equal(firstPage.scanProgress, true);
-      assert.deepEqual(firstPage.records.CollaborationMessage.map((message) => message.id), ['own-new']);
+      const initialPage = await answer(requests()[0]);
+      assert.equal(initialPage.scanProgress, true);
+      assert.deepEqual(initialPage.nextCursor, { kind: 'message' });
+      assert.equal(initialPage.records.CollaborationMessage, undefined);
       const mount = async () => {
         let setup;
         const app = createSSRApp(messageList, {}).use(scope);
@@ -344,21 +362,27 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
       };
       let view = await mount();
       assert.match(view.html, /继续查找更早协作记录/);
-      let lastSeq = BigInt(firstPage.nextBeforeMessageSeq);
+      view.setup.showEarlierCollaboration();
+      assert.equal(requests().length, 2, 'leaving an empty exchange lane still requires an explicit continue');
+      const firstPage = await answer(requests()[1]);
+      assert.deepEqual(firstPage.records.CollaborationMessage.map((message) => message.id), ['own-new']);
+      assert.equal(firstPage.nextCursor.kind, 'message');
+      let lastSeq = BigInt(firstPage.nextCursor.beforeMessageSeq);
+      view = await mount();
       for (let click = 0; click < 2; click += 1) {
         view.setup.showEarlierCollaboration();
-        assert.equal(requests().length, click + 2, 'one explicit click starts exactly one bounded request');
+        assert.equal(requests().length, click + 3, 'one explicit click starts exactly one bounded request');
         view.setup.showEarlierCollaboration();
-        assert.equal(requests().length, click + 2, 'the in-flight page cannot start an auto/busy retry');
-        const page = await answer(requests()[click + 1]);
+        assert.equal(requests().length, click + 3, 'the in-flight page cannot start an auto/busy retry');
+        const page = await answer(requests()[click + 2]);
         assert.equal(page.records.CollaborationMessage, undefined, 'two consecutive user clicks inspect foreign-only windows');
         assert.equal(page.scannedRows, 4096);
         assert.equal(page.hasMore, true);
         assert.equal(page.scanProgress, true);
-        assert.ok(BigInt(page.nextBeforeMessageSeq) < lastSeq);
-        lastSeq = BigInt(page.nextBeforeMessageSeq);
+        assert.ok(BigInt(page.nextCursor.beforeMessageSeq) < lastSeq);
+        lastSeq = BigInt(page.nextCursor.beforeMessageSeq);
         assert.equal(client.collaborationHistoryLoading, false);
-        assert.equal(requests().length, click + 2, 'an empty page does not start the next scan itself');
+        assert.equal(requests().length, click + 3, 'an empty page does not start the next scan itself');
         view = await mount();
         assert.match(view.html, /继续查找更早协作记录/);
       }
@@ -369,8 +393,10 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
         assert.equal(requests().length, explicitPages);
         const page = await answer(requests().at(-1));
         assertPage(page);
-        if (page.hasMore) assert.ok(BigInt(page.nextBeforeMessageSeq) < lastSeq);
-        if (page.nextBeforeMessageSeq) lastSeq = BigInt(page.nextBeforeMessageSeq);
+        if (page.nextCursor?.kind === 'message') {
+          assert.ok(BigInt(page.nextCursor.beforeMessageSeq) < lastSeq);
+          lastSeq = BigInt(page.nextCursor.beforeMessageSeq);
+        } else if (page.hasMore) assert.deepEqual(page.nextCursor, { kind: 'answer' });
         assert.ok(explicitPages < 40, 'one click cannot hide a full-history automatic loop');
         view = await mount();
       }
@@ -436,7 +462,7 @@ test('a placeholder peer title reads at most 256 indexed Message memberships', a
         target_conversation_id: 'target', target_turn_id: null, phase: 'next_turn', attempt_seq: 1n,
         retry_of_delivery_id: null, state: 'pending', failure_reason: null, created_at: NOW, updated_at: NOW })
     ]);
-    const page = await new kernel.ClientHistoryReader(f.database()).backwardCollaboration({ conversationId: 'target', limit: 200 });
+    const page = await new kernel.ClientHistoryReader(f.database()).backwardCollaboration({ conversationId: 'target', limit: 200, cursor: { kind: 'message' } });
     assertPage(page);
     assert.equal(page.records.CollaborationPeerConversation.find((peer) => peer.id === 'placeholder-peer')?.display_title,
       '新对话', 'no 300-message window query is allowed for an optional peer label');
@@ -475,17 +501,18 @@ test('large CAS previews and peer labels reduce page rows before crossing the by
       }));
     }
     const read = () => new kernel.ClientHistoryReader(f.database());
-    const first = await read().backwardCollaboration({ conversationId: 'target', limit: 200 });
+    const first = await read().backwardCollaboration({ conversationId: 'target', limit: 200, cursor: { kind: 'message' } });
     assertPage(first);
     assert.ok(first.records.CollaborationMessage.length < 200,
       'the reader must shrink the row count rather than exceed maxPageBytes');
     assert.ok(first.records.CollaborationMessage.length > 0);
     assert.equal(first.hasMore, true);
     const next = await read().backwardCollaboration({ conversationId: 'target', limit: 200,
-      beforeMessageSeq: first.nextBeforeMessageSeq, beforeId: first.nextBeforeId });
+      cursor: first.nextCursor });
     assertPage(next);
     assert.ok(next.records.CollaborationMessage.length > 0);
-    assert.ok(BigInt(next.nextBeforeMessageSeq) < BigInt(first.nextBeforeMessageSeq));
+    assert.equal(next.nextCursor.kind, 'message');
+    assert.ok(BigInt(next.nextCursor.beforeMessageSeq) < BigInt(first.nextCursor.beforeMessageSeq));
     assert.equal(new Set([...first.records.CollaborationMessage, ...next.records.CollaborationMessage]
       .map((message) => message.id)).size,
     first.records.CollaborationMessage.length + next.records.CollaborationMessage.length);
@@ -538,14 +565,14 @@ test('a page that fits reads each CAS preview once; only a page past the byte ca
       reads.set(metadata.id, (reads.get(metadata.id) ?? 0) + 1);
       return Buffer.from(metadata.id === large.id ? '汉'.repeat(1200) : '协作正文', 'utf8');
     } };
-    const crowded = executeClientCollaborationHistoryPage(native, { conversationId: 'target', limit: 200 }, content);
+    const crowded = executeClientCollaborationHistoryPage(native, { conversationId: 'target', limit: 200, cursor: { kind: 'message' } }, content);
     assert.ok(crowded.records.CollaborationMessage.length < 200, 'the byte cap still shortens a page that does not fit');
     assert.ok(crowded.responseBytes <= 524_288);
     assert.equal(reads.get(large.id), 200, 'searching a shorter prefix reuses each envelope preview it already read');
 
     reads.clear();
     const fitting = executeClientCollaborationHistoryPage(native, {
-      conversationId: 'target', limit: 50, beforeMessageSeq: '61', beforeId: 'large-000'
+      conversationId: 'target', limit: 50, cursor: { kind: 'message', beforeMessageSeq: '61', beforeId: 'large-000' }
     }, content);
     assert.equal(fitting.records.CollaborationMessage.length, 50);
     assert.equal(reads.get(small.id), 50, 'a page that fits is materialized once, one CAS read per envelope');
@@ -728,6 +755,11 @@ test('Vue SSR merges collaboration pages with ACKed live facts, fences old sessi
       await Promise.all(pending);
       await nextTick();
       assert.equal(client.collaborationHistoryHasMore, true);
+      assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage ?? {}).length, 0);
+      assert.deepEqual(client.collaborationHistoryNextCursor, { kind: 'message' });
+      assert.equal(client.requestEarlierCollaborationHistory('target'), true);
+      await Promise.all(pending);
+      await nextTick();
       assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage ?? {}).length, 200,
         `collaboration page rejected: ${client.collaborationHistoryError ?? 'no error'}; scope=${client.collaborationHistoryConversationId}; id=${client.collaborationHistoryRequestId}`);
       assert.equal(client.requestEarlierCollaborationHistory('target'), true);
@@ -746,8 +778,13 @@ test('Vue SSR merges collaboration pages with ACKed live facts, fences old sessi
       assert.equal(client.collaborationHistoryLoading, true);
       await Promise.all(pending);
       await nextTick();
-      assert.equal(client.collaborationHistoryHasMore, false);
+      assert.equal(client.collaborationHistoryHasMore, true);
+      assert.deepEqual(client.collaborationHistoryNextCursor, { kind: 'answer' });
       assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage).length, 241);
+      assert.equal(client.requestEarlierCollaborationHistory('target'), true);
+      await Promise.all(pending);
+      await nextTick();
+      assert.equal(client.collaborationHistoryHasMore, false);
       const oldRequest = posted.find((frame) => frame.type === 'reliable-kernel.collaboration-history-request');
       client.observe({ type: 'reliable-kernel.collaboration-history-result', sessionId: 'retired-session',
         requestId: oldRequest.requestId, conversationId: 'target', page: { records: {}, hasMore: false, responseBytes: 52 } });
@@ -782,10 +819,18 @@ test('Vue SSR merges collaboration pages with ACKed live facts, fences old sessi
         }
         assert.equal(client.requestEarlierCollaborationHistory('target'), true, 'the same keyset is retryable');
         await Promise.all(pending);
+        assert.deepEqual(client.collaborationHistoryNextCursor, { kind: 'message' });
+        assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage ?? {}).length, 0);
+        assert.equal(client.requestEarlierCollaborationHistory('target'), true);
+        await Promise.all(pending);
         assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage).length, 200);
         assert.equal(client.requestEarlierCollaborationHistory('target'), true);
         await Promise.all(pending);
         assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage).length, 241);
+        assert.deepEqual(client.collaborationHistoryNextCursor, { kind: 'answer' });
+        assert.equal(client.requestEarlierCollaborationHistory('target'), true);
+        await Promise.all(pending);
+        assert.equal(client.collaborationHistoryHasMore, false);
       } finally { replacement.close(); }
       let setup;
       const app = createSSRApp(messageList, {}).use(scope);

@@ -12,9 +12,9 @@ export type SegmentedTimelineRow<Message extends { id: string }, Card extends { 
 /**
  * Collaboration envelopes occupy real, independently keyed rows in the same bounded window as
  * Message rows. Their ids and count do not become Message ids, Message floors or detail demands.
- * Cards of older or unloaded Turns come before the first Message, a Turn group follows its last
- * loaded Message, and only a bounded few Turn-less cards follow the newest Message, so the latest
- * segment always keeps the newest Messages (including a streaming reply) mounted.
+ * Proven cards follow their physical Message boundary in exchange order. Cards before the loaded
+ * boundary precede the first Message; a bounded attention tail keeps unlocated pending/failed
+ * deliveries reachable. The same mount limit applies to every row, including streaming replies.
  */
 export function composeTimelineRows<Message extends { id: string }, Card extends { messageId: string }>(
   messages: readonly Message[],

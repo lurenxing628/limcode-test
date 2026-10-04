@@ -286,17 +286,27 @@ test('盲审严重-1 竞态：父 Turn 正在吸收子 Agent 的答复时子对�
   try {
     const before = await consumeAnswerIntoParent(setup);
     let deleted;
+    let projections = 0;
     deliveries.projectInputForModel = async function (command) {
-      if (!deleted && command.pendingTurnInputId === before.id) {
-        deleted = await deleteCommand(p1, setup.childConversationId, { timeoutMs: 30_000 });
+      const result = await project.call(this, command);
+      if (command.pendingTurnInputId === before.id) {
+        projections += 1;
+        if (!deleted) {
+          assert.ok(result, '原答复已经成功投影，但还没提交到 Context');
+          deleted = await deleteCommand(p1, setup.childConversationId, { timeoutMs: 30_000 });
+        }
       }
-      return project.call(this, command);
+      return result;
     };
     await finishParentAfterDeletion(setup);
-    assert.deepEqual(deleted?.deletedConversationIds, [setup.childConversationId], '删除发生在父 Turn 读取输入之后、投影之前');
+    assert.deepEqual(deleted?.deletedConversationIds, [setup.childConversationId], '删除发生在成功投影之后、Context 接收事务之前');
     const context = JSON.stringify(setup.requests.at(-1).context);
     assert.ok(context.includes(CHILD_CONVERSATION_DELETED_NOTICE), '父 Turn 收到删除通知');
     assert.equal(context.includes('CHILD_ANSWER_R1'), false);
+    assert.equal(projections, 2, '旧投影事务被拒绝后，只重新投影一次');
+    assert.equal((await rows(p1.app, 'PendingTurnInput', { id: before.id }))[0].state, 'consumed');
+    assert.ok((await rows(p1.app, 'RuntimeDeliveryInputLink', { pending_turn_input_id: before.id }))[0].handled_at);
+    assert.equal((await rows(p1.app, 'RuntimeDeliveryTimelineLink', { pending_turn_input_id: before.id })).length, 1);
     await assertNoPendingResults(p1.app);
     assert.deepEqual(errors(p1), []);
   } finally {

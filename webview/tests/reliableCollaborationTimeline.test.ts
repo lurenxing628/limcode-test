@@ -22,46 +22,59 @@ const delivery = (id: string, targetConversationId: string, turnId: string | nul
   ({ id: `${id}-delivery-${attempt}`, inbox_item_id: `${id}-inbox`, target_conversation_id: targetConversationId,
     target_turn_id: turnId, state, attempt_seq: attempt });
 
+const membership = (id: string, seq: string) => ({ id, conversation_id: 'self', message_seq: seq });
+const deliveryPosition = (id: string, predecessorId: string | null, predecessorSeq: string, exchangeSeq: string, attempt = '1') =>
+  ({ id: `${id}-position-${attempt}`, delivery_id: `${id}-delivery-${attempt}`, conversation_id: 'self',
+    predecessor_message_id: predecessorId, predecessor_message_seq: predecessorSeq, exchange_seq: exchangeSeq });
+
 function project(records: Parameters<typeof projectCollaborationTimeline>[0]['records'], messages: Array<{ id: string }> = [],
   turnIdByMessageId: Record<string, string> = {}, removedConversationIds: string[] = []) {
   return projectCollaborationTimeline({ conversationId: 'self', records, messages, turnIdByMessageId, removedConversationIds });
 }
 
-test('a 35-message Turn keeps an independent collaboration row in the newest bounded segment', () => {
+test('a proven exchange stays between Messages in a 35-message Turn and the same bounded segment', () => {
   const messages = Array.from({ length: 35 }, (_, index) => ({ id: `m${index + 1}` }));
   const turnLinks = Object.fromEntries(messages.map(({ id }) => [id, 'turn-35']));
   const timeline = project({
+    Message: byId(...messages.map(({ id }, index) => membership(id, String(1001 + index)))),
+    RuntimeDeliveryTimelineLink: byId(deliveryPosition('card', 'm34', '1034', '1')),
     CollaborationMessage: byId(message('card', '1', 'followup', '请继续处理')),
     CollaborationMessageSourceLink: byId(source('card', 'peer', 'peer-turn')),
     CollaborationMessageTargetLink: byId(target('card', 'self')),
     RuntimeDelivery: byId(delivery('card', 'self', 'turn-35', 'consumed'))
   }, messages, turnLinks);
-  assert.deepEqual(Object.keys(timeline.afterMessage), ['m35']);
+  assert.deepEqual(Object.keys(timeline.afterMessage), ['m34']);
   const rows = composeTimelineRows(messages, timeline);
   assert.equal(rows.length, 36);
   assert.deepEqual(rows.slice(latestTimelineSegmentStart(rows.length)).map((row) => row.id), [
-    ...messages.slice(6).map((row) => row.id), 'collaboration:card'
+    ...messages.slice(6, -1).map((row) => row.id), 'collaboration:card', 'm35'
   ]);
-  assert.equal(rows.at(-1)?.kind, 'collaboration');
+  assert.equal(rows.at(-1)?.id, 'm35');
   assert.equal(rows.filter((row) => row.kind === 'message').length, 35, 'collaboration has no Message floor');
-  assert.equal(collaborationCardPlacementLabel(timeline.afterMessage.m35[0]), '按回合归组，具体顺序待确认');
+  assert.equal(collaborationCardPlacementLabel(timeline.afterMessage.m34[0]), '');
   assert.equal(TIMELINE_MOUNT_LIMIT, 30);
 });
 
-test('sent and received cards keep their own sources, directions and newest delivery attempt', () => {
+test('sent and received cards keep their own sources and accepted position across redelivery', () => {
   const timeline = project({
     Conversation: byId({ id: 'peer', title: '调研对话', status: 'active' }),
+    Message: byId(membership('m1', '5')),
+    RuntimeDeliveryTimelineLink: byId(deliveryPosition('incoming', 'm1', '5', '2', '2'),
+      deliveryPosition('incoming', null, '0', '3', '4')),
+    CollaborationSendTimelineLink: byId({ id: 'outgoing-position', message_id: 'outgoing', conversation_id: 'self',
+      predecessor_message_id: 'm1', predecessor_message_seq: '5', exchange_seq: '1' }),
     CollaborationMessage: byId(message('incoming', '1', 'followup', '启动任务'), message('outgoing', '2', 'message', '任务结束')),
     CollaborationMessageSourceLink: byId(source('incoming', 'peer', 'peer-turn'), source('outgoing', 'self', 'self-turn', 'completion')),
     CollaborationMessageTargetLink: byId(target('incoming', 'self'), target('outgoing', 'peer')),
     RuntimeDelivery: byId(delivery('incoming', 'self', null, 'failed'), delivery('incoming', 'self', 'self-turn', 'consumed', '2'),
-      delivery('outgoing', 'peer', null, 'pending'))
+      delivery('incoming', 'self', null, 'failed', '3'), delivery('incoming', 'self', 'retry-turn', 'consumed', '4'),
+      delivery('incoming', 'self', null, 'pending', '5'), delivery('outgoing', 'peer', null, 'pending'))
   }, [{ id: 'm1' }], { m1: 'self-turn' });
-  assert.deepEqual(timeline.afterMessage.m1.map((card) => card.messageId), ['incoming', 'outgoing']);
-  const [incoming, outgoing] = timeline.afterMessage.m1;
+  assert.deepEqual(timeline.afterMessage.m1.map((card) => card.messageId), ['outgoing', 'incoming']);
+  const [outgoing, incoming] = timeline.afterMessage.m1;
   assert.equal(collaborationCardLabel(incoming), '来自对话 调研对话');
   assert.equal(collaborationCardKindLabel(incoming), '续派任务');
-  assert.equal(incoming.status, 'settled');
+  assert.equal(incoming.status, 'settled', 'later failed, pending or accepted retries do not undo the earliest accepted event');
   assert.equal(collaborationCardLabel(outgoing), '发往对话 调研对话');
   assert.equal(collaborationCardKindLabel(outgoing), '任务结果');
   assert.equal(collaborationCardStatusLabel(outgoing), '已送达，对方下一轮读取');
@@ -79,9 +92,11 @@ test('pending incoming delivery bound to a Turn does not impersonate a consumed 
   assert.equal(collaborationCardStatusLabel(card), '已送达，等待本轮处理');
 });
 
-test('no Message, loaded Turn without a Message, and transient reply all retain the card', () => {
+test('empty, transient, deleted and unloaded Message boundaries keep their proven order', () => {
   const records = {
     Turn: byId({ id: 'task-turn', conversation_id: 'self' }),
+    Message: byId(membership('m6', '6'), membership('m11', '11')),
+    RuntimeDeliveryTimelineLink: byId(deliveryPosition('task', null, '0', '1')),
     CollaborationMessage: byId(message('task', '1')),
     CollaborationMessageSourceLink: byId(source('task', 'peer', null)),
     CollaborationMessageTargetLink: byId(target('task', 'self')),
@@ -89,12 +104,17 @@ test('no Message, loaded Turn without a Message, and transient reply all retain 
   };
   const empty = project(records);
   assert.deepEqual(composeTimelineRows([], empty).map((row) => row.id), ['collaboration:task']);
-  assert.equal(empty.beforeMessages[0].placement, 'turn-without-message');
-  assert.equal(collaborationCardPlacementLabel(empty.beforeMessages[0]), '所属回合没有已加载的消息，位置待确认');
+  assert.equal(empty.beforeMessages[0].placement, 'ordered');
+  assert.equal(collaborationCardPlacementLabel(empty.beforeMessages[0]), '');
   const running = project(records, [{ id: 'transient:request' }], { 'transient:request': 'task-turn' });
   assert.deepEqual(composeTimelineRows([{ id: 'transient:request' }], running).map((row) => row.id),
-    ['transient:request', 'collaboration:task']);
-  assert.equal(running.afterMessage['transient:request'][0].messageId, 'task');
+    ['collaboration:task', 'transient:request']);
+  records.RuntimeDeliveryTimelineLink = byId(deliveryPosition('task', 'deleted-m9', '9', '1'));
+  const newest = project(records, [{ id: 'm11' }]);
+  assert.deepEqual(composeTimelineRows([{ id: 'm11' }], newest).map((row) => row.id), ['collaboration:task', 'm11']);
+  const paged = project(records, [{ id: 'm6' }, { id: 'm11' }]);
+  assert.deepEqual(composeTimelineRows([{ id: 'm6' }, { id: 'm11' }], paged).map((row) => row.id),
+    ['m6', 'collaboration:task', 'm11'], 'a deleted predecessor resolves by physical membership when history loads');
 });
 
 test('unbound, failed, no-delivery and unloaded Turn cards all remain independently pageable', () => {
@@ -196,6 +216,32 @@ test('a child answer delivered to this Conversation is the same card, labelled a
   assert.equal(collaborationCardLabel(card), '来自子 Agent 调研子任务');
   assert.equal(collaborationCardKindLabel(card), '最终结果');
   assert.equal(collaborationCardStatusLabel(card), '');
+
+  const ordered = answerRecords('submitted', 'consumed', 'self-turn');
+  const submissions = ['child-1', 'child-3', 'child-2'];
+  const answerIds = Object.fromEntries(submissions.map((id, index) => [id, index + 1]));
+  const proofRecords = {
+    ...ordered,
+    Message: byId(membership('m1004', '1007'), membership('m1005', '1008')),
+    AnswerSubmission: byId(...submissions.map((id) => ({ id, answer_bridge_id: 'bridge', outcome: 'submitted' }))),
+    RuntimeInboxItem: byId(...submissions.map((id) => ({ id: `${id}-inbox`, source_kind: 'answer_submission', source_id: id }))),
+    RuntimeDelivery: byId(...submissions.map((id) => ({ ...delivery(id, 'self', 'self-turn', 'consumed'),
+      created_at: `2026-01-01T00:00:0${answerIds[id]}.000Z` }))),
+    RuntimeDeliveryTimelineLink: byId(...submissions.map((id) => deliveryPosition(id, 'm1004', '1007', id.slice(-1))))
+  };
+  const visible = [{ id: 'm1004' }, { id: 'm1005' }];
+  const expected = ['m1004', 'collaboration:answer:child-1', 'collaboration:answer:child-2', 'collaboration:answer:child-3', 'm1005'];
+  assert.deepEqual(composeTimelineRows(visible, project(proofRecords, visible)).map((row) => row.id), expected,
+    'equal-boundary answers use exchange_seq, never creation time or id order');
+  const laterAttempt = delivery('child-2', 'self', null, 'pending', '2');
+  proofRecords.RuntimeDelivery[laterAttempt.id] = { ...laterAttempt, created_at: '2099-01-01T00:00:00.000Z' };
+  const retried = project(proofRecords, visible);
+  assert.deepEqual(composeTimelineRows(visible, retried).map((row) => row.id), expected,
+    'a retry cannot move or duplicate an already accepted child answer');
+  assert.equal(retried.afterMessage.m1004.find((card) => card.messageId === 'answer:child-2')?.status, 'settled');
+  const reloaded = JSON.parse(JSON.stringify(proofRecords));
+  reloaded.RuntimeDeliveryTimelineLink = Object.fromEntries(Object.entries(reloaded.RuntimeDeliveryTimelineLink).reverse());
+  assert.deepEqual(composeTimelineRows(visible, project(reloaded, visible)).map((row) => row.id), expected);
 
   const interrupted = project(answerRecords('interrupted', 'pending', null)).unlocated[0];
   assert.equal(collaborationCardKindLabel(interrupted), '部分结果（已中断）');

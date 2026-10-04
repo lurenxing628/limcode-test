@@ -116,7 +116,7 @@ export interface RuntimeDataSetCopyReceipt {
     /** Source queries of the whole copy (the sum over every batch). */
     reads: number;
   };
-  upgradedFromEpoch?: 3 | 4;
+  upgradedFromEpoch?: 3 | 4 | 5;
 }
 
 /**
@@ -236,6 +236,10 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
   // Exactly one payload link per message.
   { source: 'commit-projection', name: 'CollaborationMessage', triggeredBy: ['CollaborationMessage'], reads: ['CollaborationMessagePayloadLink', 'ContentObject'],
     handling: { kind: 'unit', anchor: 'CollaborationMessage' } },
+  { source: 'commit-projection', name: 'RuntimeDeliveryTimelineLink', triggeredBy: ['RuntimeDeliveryTimelineLink', 'TimelineImportProvenance'],
+    reads: ['TimelineImportProvenance'], handling: { kind: 'tolerates-missing' } },
+  { source: 'commit-projection', name: 'CollaborationSendTimelineLink', triggeredBy: ['CollaborationSendTimelineLink', 'TimelineImportProvenance'],
+    reads: ['TimelineImportProvenance'], handling: { kind: 'tolerates-missing' } },
   // A consumed current/next-turn delivery must have its InputLink (deriveCommittedParentHandling).
   { source: 'commit-projection', name: 'RuntimeDelivery', triggeredBy: ['RuntimeDelivery', 'RuntimeDeliveryInputLink'], reads: ['RuntimeDeliveryInputLink'],
     handling: { kind: 'unit', anchor: 'RuntimeDelivery' } },
@@ -253,6 +257,15 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
   { source: 'worker-insert', name: 'Operation', triggeredBy: ['Operation'], reads: [], handling: { kind: 'unit', anchor: 'Operation' } },
   { source: 'worker-insert', name: 'Attempt', triggeredBy: ['Attempt'], reads: ['Operation'], handling: { kind: 'unit', anchor: 'Operation' } },
   { source: 'worker-insert', name: 'ContentObject', triggeredBy: ['ContentObject'], reads: [], handling: { kind: 'cas-first' } },
+  // Proof dependencies are earlier; the opposite timeline relation may be copied later and is
+  // allowed to be empty. The later relation checks the shared sequence collision in its turn.
+  { source: 'worker-insert', name: 'RuntimeDeliveryTimelineLink', triggeredBy: ['RuntimeDeliveryTimelineLink'],
+    reads: ['MessagePartOfConversation', 'RuntimeDelivery', 'RuntimeDeliveryInputLink', 'PendingTurnInput',
+      'ContextSegmentSource', 'ContextSequenceNode', 'ContextSequenceRoot', 'ConversationContextHeadLink', 'CollaborationSendTimelineLink'], handling: { kind: 'tolerates-missing' } },
+  { source: 'worker-insert', name: 'CollaborationSendTimelineLink', triggeredBy: ['CollaborationSendTimelineLink'],
+    reads: ['MessagePartOfConversation', 'CollaborationMessageSourceLink', 'RuntimeDeliveryTimelineLink'], handling: { kind: 'tolerates-missing' } },
+  { source: 'worker-insert', name: 'TimelineImportProvenance', triggeredBy: ['TimelineImportProvenance'],
+    reads: ['RuntimeDeliveryTimelineLink', 'CollaborationSendTimelineLink'], handling: { kind: 'reads-earlier' } },
   // SQL triggers (schema/domainManifest RUNTIME_SCHEMA_TRIGGERS)
   { source: 'sql-trigger', name: 'prevent_runtime_delivery_after_final_output_fence', triggeredBy: ['PendingTurnInput'], reads: ['TurnFinalOutputFence'],
     handling: { kind: 'insert-order' } },

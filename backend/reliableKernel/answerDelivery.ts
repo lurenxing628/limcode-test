@@ -1,3 +1,4 @@
+import { runtimeDeliveryTimelineStep } from './timelineAcceptance';
 import {
   ContentAddressedStore,
   type ContentObjectMetadata,
@@ -1540,6 +1541,9 @@ export class RuntimeDeliveryControlPlane {
       inbox_item_id: failed.inbox_item_id,
       target_conversation_id: failed.target_conversation_id
     });
+    if (peers.some(row => row.state === 'pending' || row.state === 'consumed')) {
+      throw new Error('This inbox item already has an active or accepted delivery attempt.');
+    }
     const nextAttempt = peers.reduce((maximum, row) => {
       const attempt = requirePositiveInteger(row.attempt_seq, 'RuntimeDelivery.attempt_seq');
       return attempt > maximum ? attempt : maximum;
@@ -1560,6 +1564,10 @@ export class RuntimeDeliveryControlPlane {
         state: 'failed',
         attempt_seq: failed.attempt_seq
       }),
+      DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assertExactIds({
+        inbox_item_id: failed.inbox_item_id, target_conversation_id: failed.target_conversation_id
+      }, peers.map(row => String(row.id))),
+      ...peers.map(row => DOMAIN_REPOSITORIES.domain('RuntimeDelivery').assert(String(row.id), { state: 'failed' })),
       DOMAIN_REPOSITORIES.domain('RuntimeDelivery').insert({
         id: newId,
         inbox_item_id: command.inboxItemId,
@@ -1858,7 +1866,8 @@ export class RuntimeDeliveryControlPlane {
           state: 'consumed',
           failure_reason: null,
           updated_at: now
-        })
+        }),
+        runtimeDeliveryTimelineStep({ conversationId: String(delivery.target_conversation_id), deliveryId: String(delivery.id), now })
       ]);
       const latest = await this.requireExisting('RuntimeDelivery', delivery.id as string);
       return { ...(await this.summaryFromRow(latest)), changed: true, commitSeq: commit.commitSeq };

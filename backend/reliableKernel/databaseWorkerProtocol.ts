@@ -11,6 +11,7 @@ import type {
 import type { DatabaseFoundationInspection } from './databaseSchema';
 import type { RuntimeStatementCacheCounters } from './runtimeStatementCache';
 import type {
+  ReliableKernelCollaborationHistoryCursor,
   ActiveTurnWorkEnvironmentProjection,
   ChildConversationBoundaryProjection
 } from '../../shared/reliableKernelClientFeed';
@@ -197,14 +198,16 @@ export interface ClientVisibleMessageHistoryPageResult {
 export interface ClientCollaborationHistoryPageInput {
   conversationId: string;
   limit: number;
-  /** Independent CollaborationMessage.message_seq/id exclusive backward cursor. */
-  beforeMessageSeq?: string;
-  beforeId?: string;
+  cursor?: ReliableKernelCollaborationHistoryCursor;
 }
 
-export interface ClientCollaborationHistoryPageResult extends ClientVisibleMessageHistoryPageResult {
+export interface ClientCollaborationHistoryPageResult {
+  records: Record<string, DomainRow[]>;
+  nextCursor?: ReliableKernelCollaborationHistoryCursor;
+  hasMore: boolean;
   scanProgress: boolean;
   scannedRows: number;
+  responseBytes: number;
 }
 
 /** One (updated_at, id) key of the history order; `from` is inclusive, `after`/`before` exclusive. */

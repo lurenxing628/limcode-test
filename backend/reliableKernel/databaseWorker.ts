@@ -1,3 +1,5 @@
+import { projectTimelineLinkRecord } from './clientTimelineHistory';
+import { allocateTimelinePosition, allocateHistoricalTimelineImport, timelineImportProvenanceRow, assertTimelinePosition, timelineInputAcknowledgementSteps } from './timelinePosition';
 import { AttachmentProjectionScopeCache, readAttachmentScopeSnapshot } from './attachmentProjectionScopeCache';
 import { readAttachmentProjectionSegments, readAttachmentProjectionLinks } from './attachmentProjectionSnapshot';
 import { executeContextSequenceNodeBatch } from './contextSequenceNodeBatch';
@@ -655,6 +657,16 @@ function configureTransactionChangeCapture(database: Database.Database): void {
     }
   }
 
+  // Import provenance is its own retained relation. The card only needs a bounded existence
+  // projection, refreshed atomically even when historical copy writes provenance in a later batch.
+  database.exec(`CREATE TEMP TRIGGER capture_timeline_import_provenance
+    AFTER INSERT ON timeline_import_provenance BEGIN
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+        SELECT 'RuntimeDeliveryTimelineLink', NEW.receive_timeline_link_id, 'upsert' WHERE NEW.receive_timeline_link_id IS NOT NULL;
+      INSERT INTO runtime_transaction_change (domain, id, kind)
+        SELECT 'CollaborationSendTimelineLink', NEW.send_timeline_link_id, 'upsert' WHERE NEW.send_timeline_link_id IS NOT NULL;
+    END`);
+
   // RuntimeDeliveryInputLink 本身不是客户端领域；它改变的是 RuntimeDelivery 的派生
   // parent_handling_state，因此在同一 commit 中重新投影对应 Delivery。
   for (const operation of ['insert', 'update'] as const) {
@@ -808,6 +820,9 @@ function readTransactionChanges(database: Database.Database): RuntimeChange[] {
       }
       if (row.domain === 'CollaborationMessage') {
         record = projectCollaborationMessageRecord(database, row.id, clientProjectionContent);
+      }
+      if (row.domain === 'RuntimeDeliveryTimelineLink' || row.domain === 'CollaborationSendTimelineLink') {
+        record = projectTimelineLinkRecord(database, row.domain, record);
       }
       if (row.domain === 'RuntimeDelivery') {
         const links = prepareCached(database, `
@@ -1480,6 +1495,7 @@ function executeSteps(
     const marker = quote(step.name);
     const sequenceCount = allocatedSequences.length;
     const historicalCount = historicalCopiesOf(allocatedSequences).mark();
+    const notificationCount = notificationAcceptancesOf(allocatedSequences).length;
     database.exec(`SAVEPOINT ${marker}`);
     try {
       executeSteps(database, step.steps, allocatedSequences, attachmentScopeCache);
@@ -1489,6 +1505,7 @@ function executeSteps(
       database.exec(`RELEASE SAVEPOINT ${marker}`);
       allocatedSequences.length = sequenceCount;
       historicalCopiesOf(allocatedSequences).truncate(historicalCount);
+      notificationAcceptancesOf(allocatedSequences).length = notificationCount;
       if (!matchesSavepointContinuation(error, step.onError)) throw error;
     }
   }
@@ -1500,6 +1517,13 @@ function executeSteps(
  * a maintenance transaction registers its one set for the list of every append).
  */
 const HISTORICAL_COPIES = new WeakMap<RuntimeAllocatedSequence[], HistoricalCopies>();
+const NOTIFICATION_ACCEPTANCES = new WeakMap<RuntimeAllocatedSequence[], string[]>();
+function notificationAcceptancesOf(transaction: RuntimeAllocatedSequence[]): string[] {
+  let ids = NOTIFICATION_ACCEPTANCES.get(transaction);
+  if (!ids) NOTIFICATION_ACCEPTANCES.set(transaction, ids = []);
+  return ids;
+}
+
 
 interface HistoricalCopies {
   has(id: string): boolean;
@@ -1785,6 +1809,10 @@ function executeMutation(
     executeCheckpointPrune(database, mutation);
   } else if (mutation.kind === 'insert') {
     const historicalCopy = mutation.historicalCopy === true;
+    if (mutation.acceptedInputContentObjectId !== undefined && (schema.key !== 'RuntimeDeliveryTimelineLink'
+      || mutation.row.acceptance_kind !== 'input' || historicalCopy || !mutation.allocateTimelinePosition)) {
+      throw new TypeError('Projected input identity is restricted to ordinary model-input acceptance.');
+    }
     if (historicalCopy && !HISTORICAL_COPY_DOMAINS.includes(schema.key)) {
       throw new Error(`${schema.key} does not permit historical copy inserts.`);
     }
@@ -1807,9 +1835,24 @@ function executeMutation(
         throw new RuntimeDataInvariantError(schema.key, String(mutation.row.id), 'Historical ModelStreamCheckpoint copy requires its ModelRequest to be terminal.');
       }
     }
+    if (schema.key === 'RuntimeDeliveryTimelineLink' || schema.key === 'CollaborationSendTimelineLink') {
+      if (mutation.allocateSequence || mutation.messageRevisionSequenceReferenceId || mutation.initialExecutionLeaseDuration
+        || (historicalCopy ? mutation.allocateTimelinePosition !== undefined || mutation.acceptedInputContentObjectId !== undefined
+          : mutation.allocateTimelinePosition !== true || mutation.allocateImportedTimelineSequence !== undefined)) {
+        throw new TypeError('Ordinary exchange acceptance requires the writer allocator; only historical copies may supply coordinates.');
+      }
+    }
+    if (schema.key === 'TimelineImportProvenance') {
+      if (!historicalCopy || mutation.allocateSequence || mutation.allocateTimelinePosition || mutation.allocateImportedTimelineSequence
+        || (mutation.row.receive_timeline_link_id === null) === (mutation.row.send_timeline_link_id === null)
+        || typeof mutation.row.source_exchange_seq !== 'bigint' || mutation.row.source_exchange_seq < 1n) {
+        throw new TypeError('Timeline import provenance requires exactly one typed historical link and its source sequence.');
+      }
+    }
     const allocatedRow = mutation.allocateSequence
       ? allocateNextSequence(database, repository, mutation)
-      : mutation.row;
+      : mutation.allocateImportedTimelineSequence ? allocateHistoricalTimelineImport(database, mutation)
+        : allocateTimelinePosition(database, mutation);
     let row = resolveMessageRevisionSequenceReference(allocatedRow, mutation, allocatedSequences);
     if (mutation.initialExecutionLeaseDuration) {
       if (schema.key !== 'ExecutionLease' || historicalCopy || mutation.allocateSequence
@@ -1856,9 +1899,26 @@ function executeMutation(
         }
       }
     }
+    if (schema.key === 'RuntimeDeliveryTimelineLink' || schema.key === 'CollaborationSendTimelineLink') {
+      if (!historicalCopy) {
+        const sameTransaction = schema.key === 'CollaborationSendTimelineLink'
+          ? allocatedSequences.some(value => value.domain === 'CollaborationMessage' && value.id === row.message_id && value.column === 'message_seq')
+          : row.acceptance_kind === 'input'
+            ? allocatedSequences.some(value => value.domain === 'ContextSequenceRoot' && value.id === row.context_root_id && value.column === 'root_seq')
+            : notificationAcceptancesOf(allocatedSequences).includes(String(row.delivery_id));
+        if (!sameTransaction) throw new RuntimeDataInvariantError(schema.key, String(row.id),
+          'Timeline acceptance must be recorded in the same transaction as its send, Context append or notification consumption.');
+      }
+      assertTimelinePosition(database, schema.key, row);
+    }
+    const inputAcknowledgements = schema.key === 'RuntimeDeliveryTimelineLink' && !historicalCopy
+      ? timelineInputAcknowledgementSteps(database, row, mutation.acceptedInputContentObjectId) : [];
     const encoded = repository.codec.encodeInsert(row);
     attachmentScopeCache.beforeMutation(mutation, encoded);
     const id = requireEncodedId(encoded.id, schema.codec);
+    if (mutation.allocateTimelinePosition || mutation.allocateImportedTimelineSequence) {
+      allocatedSequences.push({ domain: schema.key, id, column: 'exchange_seq', value: String(encoded.exchange_seq) });
+    }
     if (mutation.allocateSequence) {
       const value = encoded[mutation.allocateSequence.column];
       if (typeof value !== 'bigint') throw new Error('Allocated sequence was not encoded as SQLite INTEGER.');
@@ -1873,16 +1933,25 @@ function executeMutation(
     const names = Object.keys(encoded);
     const sql = `INSERT INTO ${quote(schema.table)} (${names.map(quote).join(', ')}) VALUES (${names.map((name) => `@${name}`).join(', ')})`;
     prepareCached(database, sql).run(encoded);
+    for (const acknowledgement of inputAcknowledgements) {
+      if (acknowledgement.kind !== 'update') throw new Error('Runtime input acceptance may only acknowledge its exact input/link.');
+      executeMutation(database, acknowledgement, allocatedSequences, attachmentScopeCache);
+    }
+    const importProvenance = timelineImportProvenanceRow(mutation);
+    if (importProvenance) executeMutation(database, DOMAIN_REPOSITORIES.domain('TimelineImportProvenance').insertHistoricalCopy(importProvenance), allocatedSequences, attachmentScopeCache);
     if (schema.key === 'ModelRequest' && historicalCopy) historicalCopiesOf(allocatedSequences).add(id);
   } else if (mutation.kind === 'update') {
     const id = requireRuntimeId(mutation.id);
     assertRuntimeDomainUpdatePatch(schema.key, mutation.patch);
     assertRuntimeStateTransition(database, schema.key, id, mutation.patch);
+    const acceptedNotification = schema.key === 'RuntimeDelivery' && mutation.patch.state === 'consumed'
+      && Boolean(prepareCached(database, "SELECT id FROM runtime_delivery WHERE id = ? AND state = 'pending' AND phase = 'notify_only'").get(id));
     const encoded = repository.codec.encodePatch(mutation.patch);
     const assignments = Object.keys(encoded).map((name) => `${quote(name)} = @${name}`);
     const result = prepareCached(database, `UPDATE ${quote(schema.table)} SET ${assignments.join(', ')} WHERE id = @__id`)
       .run({ ...encoded, __id: id });
     if (result.changes !== 1) throw new Error(`${schema.repository} update expected one row: ${id}`);
+    if (acceptedNotification) notificationAcceptancesOf(allocatedSequences).push(id);
   } else if (mutation.kind === 'deleteWhere') {
     if (schema.key === 'ModelStreamCheckpoint') {
       throw new Error('ModelStreamCheckpoint rows can only be pruned by the fixed writer stream-finalization operation.');

@@ -1,4 +1,5 @@
 import { readRequestTurnAuthority } from './requestCompressionSettings';
+import { isTransactionAssertionFailure } from './phaseFIdentity';
 
 import {
   buildModelHandleCatalog,
@@ -3504,27 +3505,53 @@ export class ReliableAgentLoop {
     let absorbed = 0;
     for (const input of pending) {
       const inputId = requireId(input.id, 'PendingTurnInput.id');
-      const projection = await this.projectRuntimeInput(inputId, requireId(input.content_object_id, 'PendingTurnInput.content_object_id'));
-      if (!projection) {
+      // A published runtime may have committed this immutable occurrence before crashing at
+      // its separate ACK. It can now be an ancestor after recovery appended other work: do not
+      // reproject, duplicate it or reactivate its old head. Its original acceptance already won.
+      if ((await this.list('ContextSegmentSource', {
+        source_kind: 'runtime_context', source_id: inputId, source_revision: 0n
+      }, 1)).length > 0) {
         await this.runtimeDeliveries.markInputHandled(inputId);
         absorbed += 1;
         continue;
       }
-      await this.context.appendContent({
-        conversationId,
-        segmentKind: 'runtime_context',
-        source: {
-          sourceKind: 'runtime_context',
-          sourceId: inputId,
-          // Runtime context identity is carried by the stable PendingTurnInput id. Unlike a
-          // MessageRevision or tool call sequence it has no revision axis; ContextSequence's
-          // source contract therefore requires the sentinel revision 0.
-          sourceRevision: 0n
-        },
-        content: projection.content,
-        contentType: projection.contentType
-      });
-      await this.runtimeDeliveries.markInputHandled(inputId);
+      let contentObjectId = requireId(input.content_object_id, 'PendingTurnInput.content_object_id');
+      for (let attempt = 0; ; attempt += 1) {
+        const projection = await this.projectRuntimeInput(inputId, contentObjectId);
+        if (!projection) {
+          await this.runtimeDeliveries.markInputHandled(inputId);
+          break;
+        }
+        try {
+          await this.context.appendContent({
+            conversationId,
+            segmentKind: 'runtime_context',
+            runtimeDeliveryAcceptance: { deliveryId: projection.envelope.deliveryId, pendingTurnInputId: inputId,
+              inputContentObjectId: projection.inputContentObjectId },
+            source: { sourceKind: 'runtime_context', sourceId: inputId, sourceRevision: 0n },
+            content: projection.content,
+            contentType: projection.contentType
+          });
+          // New acceptance acknowledged the input atomically. Historical replay uses the same
+          // idempotent acknowledgement, without allocating a new timeline coordinate.
+          await this.runtimeDeliveries.markInputHandled(inputId);
+          break;
+        } catch (error) {
+          const latest = await this.requireExisting('PendingTurnInput', inputId);
+          const latestContent = requireId(latest.content_object_id, 'PendingTurnInput.content_object_id');
+          if (!isTransactionAssertionFailure(error)) throw error;
+          if (latest.state === 'consumed') {
+            // Another acceptance, or a source-deletion disposal without a notice, won first.
+            // Neither case may publish the stale projection as a new occurrence.
+            await this.runtimeDeliveries.markInputHandled(inputId);
+            break;
+          }
+          if (attempt > 0 || latestContent === projection.inputContentObjectId) throw error;
+          // A source-child deletion won before acceptance: project its now-authoritative notice
+          // once. The rejected transaction published neither Context nor a timeline receipt.
+          contentObjectId = latestContent;
+        }
+      }
       absorbed += 1;
     }
     return absorbed;
@@ -3535,18 +3562,19 @@ export class ReliableAgentLoop {
    * answer that this Turn has not taken in by the deletion notice (ConversationDeletionControlPlane):
    * an input whose content changed while it was projected is projected once more as it is now.
    */
-  private async projectRuntimeInput(inputId: string, contentObjectIdInput: string): Promise<RuntimeDeliveryModelProjection | null> {
+  private async projectRuntimeInput(inputId: string, contentObjectIdInput: string): Promise<(RuntimeDeliveryModelProjection & { inputContentObjectId: string }) | null> {
     let contentObjectId = contentObjectIdInput;
     for (let attempt = 0; ; attempt += 1) {
       try {
         const metadata = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
         const content = await this.contentStore.read(metadata);
-        return await this.runtimeDeliveries.projectInputForModel({
+        const projection = await this.runtimeDeliveries.projectInputForModel({
           pendingTurnInputId: inputId,
           contentObjectId,
           content,
           contentType: requireText(metadata.content_type, 'ContentObject.content_type')
         });
+        return projection ? { ...projection, inputContentObjectId: contentObjectId } : null;
       } catch (error) {
         const latest = requireId((await this.requireExisting('PendingTurnInput', inputId)).content_object_id, 'PendingTurnInput.content_object_id');
         if (attempt > 0 || latest === contentObjectId) throw error;

@@ -24,7 +24,7 @@ function createAnimationFrameQueue() {
 }
 
 // Synthetic feed only: no persisted runtime, user data or full extension build.
-test('SSR keeps collaboration visible in a 35-message Turn and pages it with the same 30-row window', async () => {
+test('SSR merges a proven exchange between Messages and pages it with the same 30-row window', async () => {
   const pinia = await import('pinia');
   const { createSSRApp, nextTick } = await import('vue');
   const { renderToString } = await import('@vue/server-renderer');
@@ -64,6 +64,8 @@ test('SSR keeps collaboration visible in a 35-message Turn and pages it with the
       CollaborationMessage: { card: { id: 'card', message_seq: '1', mode: 'followup', text_preview: '继续处理' } },
       CollaborationMessageSourceLink: { source: { id: 'source', message_id: 'card', conversation_id: 'peer', source_kind: 'tool' } },
       CollaborationMessageTargetLink: { target: { id: 'target', message_id: 'card', conversation_id: 'self', inbox_item_id: 'inbox' } },
+      RuntimeDeliveryTimelineLink: { position: { id: 'position', delivery_id: 'delivery', conversation_id: 'self',
+        predecessor_message_id: 'm34', predecessor_message_seq: '34', exchange_seq: '1' } },
       RuntimeDelivery: { delivery: { id: 'delivery', inbox_item_id: 'inbox', target_conversation_id: 'self',
         target_turn_id: 'turn', attempt_seq: '1', state: 'consumed' } }
     };
@@ -78,7 +80,8 @@ test('SSR keeps collaboration visible in a 35-message Turn and pages it with the
     assert.equal(recent.setup.visibleTimelineRows.length, 30);
     assert.match(recent.html, /data-timeline-row-key="collaboration:card"/);
     assert.match(recent.html, /来自对话 调研对话/);
-    assert.match(recent.html, /按回合归组，具体顺序待确认/);
+    assert.doesNotMatch(recent.html, /按回合归组，具体顺序待确认/);
+    assert.deepEqual(recent.setup.timelineRows.slice(-3).map((row) => row.id), ['m34', 'collaboration:card', 'm35']);
     assert.match(recent.html, /data-timeline-row-key="m35"/);
     assert.doesNotMatch(recent.html, /data-timeline-row-key="m1"/);
     const { captureScrollAnchor, restoreScrollAfterHistoryLoad } =
@@ -114,7 +117,8 @@ test('SSR keeps collaboration visible in a 35-message Turn and pages it with the
     await nextTick();
     const withoutMessage = await render();
     assert.match(withoutMessage.html, /来自已删除的对话/);
-    assert.match(withoutMessage.html, /所属回合没有已加载的消息，位置待确认/);
+    assert.doesNotMatch(withoutMessage.html, /位置待确认/);
+    assert.equal(withoutMessage.setup.timelineRows[0].id, 'collaboration:card');
     assert.doesNotMatch(withoutMessage.html, /还没有消息，发一条试试/);
     feed.records.CollaborationMessage['failed'] = { id: 'failed', message_seq: '2', mode: 'message', text_preview: '失败通知' };
     feed.records.CollaborationMessageSourceLink['failed-source'] = {
@@ -204,8 +208,7 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     };
     feed.collaborationHistoryConversationId = 'self';
     feed.collaborationHistoryRecords = olderCardRecords(Array.from({ length: 40 }, (_, index) => index + 41));
-    feed.collaborationHistoryNextBeforeMessageSeq = '41';
-    feed.collaborationHistoryNextBeforeId = 'older-41';
+    feed.collaborationHistoryNextCursor = { kind: 'message', beforeMessageSeq: '41', beforeId: 'older-41' };
     feed.collaborationHistoryHasMore = true;
     feed.collaborationHistoryLoadedPages = 1;
 
@@ -242,13 +245,13 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
 
     live.showEarlierCollaboration();
     const request = posted.findLast((message) => message.type === 'reliable-kernel.collaboration-history-request');
-    assert.equal(request?.beforeMessageSeq, '41');
+    assert.deepEqual(request?.cursor, { kind: 'message', beforeMessageSeq: '41', beforeId: 'older-41' });
     const page = olderCardRecords(Array.from({ length: 20 }, (_, index) => index + 21));
     feed.observe({
       type: 'reliable-kernel.collaboration-history-result', requestId: request.requestId, sessionId: 'session', conversationId: 'self',
       page: {
         records: Object.fromEntries(Object.entries(page).map(([type, rows]) => [type, Object.values(rows)])),
-        nextBeforeMessageSeq: '21', nextBeforeId: 'older-21', hasMore: true, scanProgress: false, scannedRows: 20, responseBytes: 4096
+        nextCursor: { kind: 'message', beforeMessageSeq: '21', beforeId: 'older-21' }, hasMore: true, scanProgress: false, scannedRows: 20, responseBytes: 4096
       }
     });
     await frames.flush(vue.nextTick);
@@ -269,6 +272,28 @@ test('40 older collaboration cards never push the 10 newest messages out, and an
     await vue.nextTick();
     assert.equal(live.timelineRows.length, 71);
     assert.equal(live.visibleTimelineRows[0].id, reading, 'an inserted older row keeps the reading position');
+
+    // A repeated cursor must fail rather than loop; an empty source-lane transition still counts
+    // as forward progress and the terminal page retires the same request path.
+    const deliverEmptyPage = (nextCursor) => {
+      assert.equal(feed.requestEarlierCollaborationHistory('self'), true);
+      const pending = posted.findLast((message) => message.type === 'reliable-kernel.collaboration-history-request');
+      feed.observe({ type: 'reliable-kernel.collaboration-history-result', requestId: pending.requestId,
+        sessionId: 'session', conversationId: 'self', page: { records: {},
+          ...(nextCursor ? { nextCursor } : {}), hasMore: Boolean(nextCursor), scanProgress: Boolean(nextCursor),
+          scannedRows: 0, responseBytes: 256 } });
+    };
+    deliverEmptyPage({ kind: 'message', beforeMessageSeq: '21', beforeId: 'older-21' });
+    assert.match(feed.collaborationHistoryError, /分页游标/);
+    assert.equal(feed.collaborationHistoryLoadedPages, 2);
+    deliverEmptyPage({ kind: 'answer' });
+    assert.equal(feed.collaborationHistoryError, null);
+    assert.equal(feed.collaborationHistoryLoadedPages, 3);
+    assert.deepEqual(feed.collaborationHistoryNextCursor, { kind: 'answer' });
+    deliverEmptyPage();
+    assert.equal(feed.collaborationHistoryLoadedPages, 4);
+    assert.equal(feed.collaborationHistoryHasMore, false);
+
   } finally {
     try {
       app?.unmount();

@@ -21,6 +21,10 @@ import {
 } from './runtimeDataSetMerge';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
+  TIMELINE_IMPORT_PROVENANCE_DOMAIN, TIMELINE_MERGE_DOMAINS, readTimelineMergeSourceIdentity,
+  timelineMergeSourceRows, type TimelineMergeSourceRow
+} from './timelineMergeSource';
+import {
   estimatedTargetIndexBytes, knownDiskDevice, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
   LARGE_MERGE_WAL_PEAK_FACTOR, sqliteTemporaryDirectory
 } from './runtimeDataSetLargeMergeSpace';
@@ -646,11 +650,11 @@ async function forEachSourceChunk(
   source: Database.Database,
   target: RuntimeDatabase,
   options: ChunkedRowsOptions,
-  visit: (schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number], chunk: DomainRow[], existing: Array<DomainRow | null>) => Promise<void>
+  visit: (entries: TimelineMergeSourceRow[], existing: Array<DomainRow | null>) => Promise<void>
 ): Promise<void> {
   if (!Number.isSafeInteger(options.chunkRows) || options.chunkRows < 1) throw new RangeError('chunkRows must be a positive integer.');
   const skipped = options.skipping ? source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`) : undefined;
-  for (const schema of engine.MERGE_DOMAIN_ORDER) {
+  const visitDomain = async (schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number]): Promise<void> => {
     options.signal?.throwIfAborted();
     const repository = DOMAIN_REPOSITORIES.domain(schema.key);
     const statement = source.prepare(sourceRowsSql(schema));
@@ -667,7 +671,7 @@ async function forEachSourceChunk(
       const existing = (await target.snapshot(chunk.map((row) => repository.get(String(row.id))))).snapshot as Array<DomainRow | null>;
       const rows = chunk;
       chunk = [];
-      await visit(schema, rows, existing);
+      await visit(rows.map(row => ({ schema, row })), existing);
       // Decoding stays on the extension thread; yield so a large source never monopolizes it.
       await pause();
     };
@@ -682,7 +686,35 @@ async function forEachSourceChunk(
       if (scannedSinceYield >= RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS) await pause();
     }
     await flush();
+  };
+  for (const schema of engine.MERGE_DOMAIN_ORDER) {
+    if (TIMELINE_MERGE_DOMAINS.has(schema.key) || schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN) continue;
+    await visitDomain(schema);
   }
+  let timelineChunk: TimelineMergeSourceRow[] = [];
+  let timelineScanned = 0;
+  const flushTimeline = async (): Promise<void> => {
+    if (timelineChunk.length === 0) return;
+    options.signal?.throwIfAborted();
+    const existing = (await target.snapshot(timelineChunk.map(({ schema, row }) =>
+      DOMAIN_REPOSITORIES.domain(schema.key).get(String(row.id))))).snapshot as Array<DomainRow | null>;
+    const entries = timelineChunk;
+    timelineChunk = [];
+    await visit(entries, existing);
+  };
+  for (const entry of timelineMergeSourceRows(source, (domain, id) => !skipped || skipped.get(domain, id) === undefined)) {
+    timelineScanned += 1;
+    if (!skipped || skipped.get(entry.schema.key, String(entry.row.id)) === undefined) timelineChunk.push(entry);
+    if (timelineChunk.length >= options.chunkRows) await flushTimeline();
+    if (timelineScanned >= RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS) {
+      await yieldThread();
+      timelineScanned = 0;
+      options.signal?.throwIfAborted();
+    }
+  }
+  await flushTimeline();
+  const provenance = engine.MERGE_DOMAIN_ORDER.find(schema => schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN);
+  if (provenance) await visitDomain(provenance);
 }
 
 /** Counts of a merge sink; steps are dropped after every chunk. */
@@ -716,6 +748,7 @@ export async function scanMergeRows(
   options: { skipping?: boolean; chunkRows?: number; signal?: AbortSignal; onRows?(rows: number): void } = {}
 ): Promise<RuntimeDataSetMergeScan> {
   const started = performance.now();
+  const timelineImportSource = readTimelineMergeSourceIdentity(source);
   const scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'> = {
     rows: 0, insertRows: 0, reusedRows: 0, insertConversations: 0, conflicts: { count: 0, samples: [] }
   };
@@ -724,6 +757,7 @@ export async function scanMergeRows(
   const counting = countingSink(scan, { next: 0 });
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
+    timelineImportSource,
     inserted: (domain, id, row) => {
       counting.inserted(domain, id, row);
       aggregates.touch(domain, row);
@@ -733,11 +767,11 @@ export async function scanMergeRows(
     await forEachSourceChunk(source, target, {
       skipping: options.skipping === true, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS,
       ...(options.signal ? { signal: options.signal } : {})
-    }, async (schema, chunk, existing) => {
-      planMergeChunk(schema, chunk, existing, sink);
+    }, async (entries, existing) => {
+      for (const [index, { schema, row }] of entries.entries()) planMergeChunk(schema, [row], [existing[index]], sink);
       sink.steps.length = 0;
       sink.presence.length = 0;
-      scan.rows += chunk.length;
+      scan.rows += entries.length;
       options.onRows?.(scan.rows);
     });
     if (scan.conflicts.count === 0) await aggregates.validate(options.signal);
@@ -807,6 +841,7 @@ async function streamMergeTransaction(
   const counting = countingSink(scan, { next: 0 });
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
+    timelineImportSource: readTimelineMergeSourceIdentity(source),
     inserted: (domain, id, row) => {
       counting.inserted(domain, id, row);
       input.evidence.add(domain, id);
@@ -819,9 +854,9 @@ async function streamMergeTransaction(
   };
   await database.maintenanceBegin();
   try {
-    await forEachSourceChunk(source, database, input, async (schema, rows, existing) => {
-      planMergeChunk(schema, rows, existing, sink);
-      scan.rows += rows.length;
+    await forEachSourceChunk(source, database, input, async (entries, existing) => {
+      for (const [index, { schema, row }] of entries.entries()) planMergeChunk(schema, [row], [existing[index]], sink);
+      scan.rows += entries.length;
       const steps: RepositoryTransactionStep[] = [...sink.steps, ...sink.presence];
       sink.steps.length = 0;
       sink.presence.length = 0;
@@ -1089,7 +1124,7 @@ export interface PreparedLargeMergeSource {
   casObjects: number;
   cas: RuntimeDataSetCasTransfer;
   finalized?: RuntimeDataSetMergeResult['finalized'];
-  upgradedFromEpoch?: 3 | 4;
+  upgradedFromEpoch?: 3 | 4 | 5;
   /** Estimated exclusive time of this source (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
   estimateMs: number;
   estimateRangeMs: [number, number];
@@ -1669,7 +1704,7 @@ type EstimatedOutcome = { kind: 'estimated'; source: LargeMergeEstimatedSource; 
 /**
  * What a large-merge session would take and how long it would pause every window, before the user
  * agreed to it: read-only. No finalization, no backup, no CAS transfer, no ledger record, no
- * preparation claim, no published 3/4 upgrade. A source whose exact files were audited before (by
+ * preparation claim, no published 3/4/5 upgrade. A source whose exact files were audited before (by
  * the startup batch, an earlier estimate or preparation) is judged from that audit's cached facts
  * without being read; any other is copied privately and audited once, which caches its facts (the
  * audit and fingerprint caches are the only files this call writes). Each source comes with the

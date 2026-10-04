@@ -2751,7 +2751,8 @@ async function seedAttachmentObservation(dataSet, createdAt, observationText) {
 }
 
 async function downgradeToEpoch4(binding) {
-  const oldKeys = new Set(kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS.map((schema) => schema.key));
+  const oldSchemas = kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS;
+  const oldKeys = new Set(oldSchemas.map((schema) => schema.key));
   const added = kernel.RUNTIME_DOMAIN_SCHEMAS.filter((schema) => !oldKeys.has(schema.key));
   const database = new Database(kernel.toSqliteFilePath(binding.paths.databasePath));
   try {
@@ -2759,9 +2760,16 @@ async function downgradeToEpoch4(binding) {
     database.pragma('foreign_keys = OFF');
     database.exec('BEGIN IMMEDIATE');
     for (const schema of [...added].reverse()) database.exec(`DROP TABLE ${schema.table}`);
-    const dropManifest = database.prepare('DELETE FROM schema_manifest WHERE domain_key = ?');
-    for (const schema of added) dropManifest.run(schema.key);
-    database.prepare('UPDATE schema_manifest SET runtime_kernel_epoch = 4').run();
+    const indexes = database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL");
+    for (const schema of oldSchemas) {
+      for (const { name } of indexes.all(schema.table)) database.exec(`DROP INDEX "${name.replaceAll('"', '""')}"`);
+      schema.indexes.forEach((index, ordinal) => database.exec(kernel.createRuntimeDomainIndexSql(schema, index, ordinal)));
+    }
+    database.exec('DELETE FROM schema_manifest');
+    const manifestRow = database.prepare('INSERT INTO schema_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const schema of oldSchemas) manifestRow.run(schema.key, schema.table, schema.schemaOwner, schema.repository, schema.codec,
+      JSON.stringify(schema.mutations), schema.client, schema.deletePolicy, schema.resetPolicy,
+      JSON.stringify(schema.indexes), kernel.domainSchemaDigest(schema), 4);
     database.prepare('UPDATE root_binding SET runtime_kernel_epoch = 4 WHERE singleton = 1').run();
     database.exec('COMMIT');
     database.pragma('wal_checkpoint(TRUNCATE)');

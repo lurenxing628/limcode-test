@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { TIMELINE_DOMAIN_SCHEMAS } from './domainsTimeline';
 import { CONTEXT_DOMAIN_SCHEMAS } from './domainsContext';
 import { CORE_DOMAIN_SCHEMAS } from './domainsCore';
 import { COLLABORATION_DOMAIN_SCHEMAS } from './domainsCollaboration';
@@ -11,7 +12,8 @@ export const RUNTIME_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = Object.fre
   ...EXECUTION_DOMAIN_SCHEMAS,
   ...CONTEXT_DOMAIN_SCHEMAS,
   ...COLLABORATION_DOMAIN_SCHEMAS,
-  ...COLLABORATION_BOARD_DOMAIN_SCHEMAS
+  ...COLLABORATION_BOARD_DOMAIN_SCHEMAS,
+  ...TIMELINE_DOMAIN_SCHEMAS
 ]);
 
 export const RUNTIME_DOMAIN_SCHEMA_BY_KEY: ReadonlyMap<string, RuntimeDomainSchema> = new Map(
@@ -152,8 +154,8 @@ export function createRuntimeDomainIndexSql(
 }
 
 function validateDomainManifest(): void {
-  if (RUNTIME_DOMAIN_SCHEMAS.length !== 107) {
-    throw new Error(`Runtime domain schema exact set must contain 107 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
+  if (RUNTIME_DOMAIN_SCHEMAS.length !== 110) {
+    throw new Error(`Runtime domain schema exact set must contain 110 entries, found ${RUNTIME_DOMAIN_SCHEMAS.length}.`);
   }
   for (const field of ['key', 'table', 'repository', 'codec'] as const) {
     const values = RUNTIME_DOMAIN_SCHEMAS.map((entry) => entry[field]);

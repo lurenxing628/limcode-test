@@ -38,23 +38,31 @@ const fixture = async (run) => {
   finally { await fs.rm(root, { recursive: true, force: true }); }
 };
 
-async function createRoot(scopeRoot, epoch = 5) {
+async function createRoot(scopeRoot, epoch = kernel.RUNTIME_KERNEL_EPOCH) {
   // A real Runtime root: the first automatic choice runs a read-only upgradability preflight on it.
   const authority = new RootAuthority(() => resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot }));
   const binding = await kernel.initializeEmptyRuntimeRoot(authority);
-  if (epoch === 5) return binding;
+  if (epoch === kernel.RUNTIME_KERNEL_EPOCH) return binding;
   // The exact published predecessor layout, as in the epoch upgrade tests.
-  const oldKeys = new Set((epoch === 3 ? kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS)
-    .map((schema) => schema.key));
+  const oldSchemas = epoch === 3 ? kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS
+    : epoch === 5 ? kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS;
+  const oldKeys = new Set(oldSchemas.map((schema) => schema.key));
   const added = kernel.RUNTIME_DOMAIN_SCHEMAS.filter((schema) => !oldKeys.has(schema.key));
   const database = new Database(kernel.toSqliteFilePath(binding.paths.databasePath));
   try {
     database.pragma('foreign_keys = OFF');
     database.exec('BEGIN IMMEDIATE');
     for (const schema of [...added].reverse()) database.exec(`DROP TABLE ${schema.table}`);
-    const dropManifest = database.prepare('DELETE FROM schema_manifest WHERE domain_key = ?');
-    for (const schema of added) dropManifest.run(schema.key);
-    database.prepare('UPDATE schema_manifest SET runtime_kernel_epoch = ?').run(epoch);
+    const indexes = database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL");
+    for (const schema of oldSchemas) {
+      for (const { name } of indexes.all(schema.table)) database.exec(`DROP INDEX "${name.replaceAll('"', '""')}"`);
+      schema.indexes.forEach((index, ordinal) => database.exec(kernel.createRuntimeDomainIndexSql(schema, index, ordinal)));
+    }
+    database.exec('DELETE FROM schema_manifest');
+    const manifestRow = database.prepare('INSERT INTO schema_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const schema of oldSchemas) manifestRow.run(schema.key, schema.table, schema.schemaOwner, schema.repository, schema.codec,
+      JSON.stringify(schema.mutations), schema.client, schema.deletePolicy, schema.resetPolicy,
+      JSON.stringify(schema.indexes), kernel.domainSchemaDigest(schema), epoch);
     database.prepare('UPDATE root_binding SET runtime_kernel_epoch = ? WHERE singleton = 1').run(epoch);
     database.exec('COMMIT');
     database.pragma('wal_checkpoint(TRUNCATE)');

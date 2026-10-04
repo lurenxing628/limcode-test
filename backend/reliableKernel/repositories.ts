@@ -19,7 +19,10 @@ export const HISTORICAL_COPY_DOMAINS: readonly string[] = [
   'Operation',
   'Attempt',
   'ModelStreamFence',
-  'ModelStreamCheckpoint'
+  'ModelStreamCheckpoint',
+  'RuntimeDeliveryTimelineLink',
+  'CollaborationSendTimelineLink',
+  'TimelineImportProvenance'
 ];
 export type EncodedRow = Record<string, string | bigint | Buffer | null>;
 
@@ -27,6 +30,14 @@ export interface RepositoryInsertMutation {
   kind: 'insert';
   domain: string;
   row: DomainRow;
+  /** Allocate the shared exchange sequence and transcript cut atomically in the writer. */
+  allocateTimelinePosition?: true;
+  /** Exact raw input identity used to produce the accepted model Context envelope. */
+  acceptedInputContentObjectId?: string;
+  /** Verified historical import only; the writer preserves the cut and allocates a shared suffix. */
+  allocateImportedTimelineSequence?: {
+    sourceDataSetId: string; sourceRootInstanceId: string; sourceExchangeSeq: bigint;
+  };
   allocateSequence?: {
     column: string;
     scope: DomainRow;
@@ -345,6 +356,40 @@ export class DomainRepository {
       throw new TypeError(`${this.name}.${allocation.column} is not a sequence column.`);
     }
     return this.insertWithNextAllocatedInteger(row, allocation);
+  }
+
+  /** A typed exchange acceptance, with no caller-supplied transcript/order coordinates. */
+  public insertAtTimelineBoundary(row: DomainRow, acceptedInputContentObjectId?: string): RepositoryInsertMutation {
+    this.requireMutation('insert');
+    if (this.schema.key !== 'RuntimeDeliveryTimelineLink' && this.schema.key !== 'CollaborationSendTimelineLink') {
+      throw new TypeError(`${this.name} cannot allocate an exchange timeline position.`);
+    }
+    if (this.schema.key === 'RuntimeDeliveryTimelineLink' && row.acceptance_kind === 'input') {
+      requireId(acceptedInputContentObjectId as string);
+    } else if (acceptedInputContentObjectId !== undefined) throw new TypeError('Only a model input has a projected content identity.');
+    for (const name of ['predecessor_message_id', 'predecessor_message_seq', 'exchange_seq', 'position_basis']) {
+      if (name in row) throw new TypeError(`${this.name}.${name} is allocated by the writer.`);
+    }
+    if (this.schema.key === 'RuntimeDeliveryTimelineLink' && 'inbox_item_id' in row) throw new TypeError('Timeline inbox identity is resolved by the writer.');
+    this.codec.encodeInsert({ ...row, ...(this.schema.key === 'RuntimeDeliveryTimelineLink' ? { inbox_item_id: 'writer-resolved-inbox' } : {}),
+      predecessor_message_id: null, predecessor_message_seq: 0n, exchange_seq: 1n, position_basis: 'committed' });
+    return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row), allocateTimelinePosition: true,
+      ...(acceptedInputContentObjectId === undefined ? {} : { acceptedInputContentObjectId }) };
+  }
+
+  public insertHistoricalTimelineImport(row: DomainRow, source: {
+    sourceDataSetId: string; sourceRootInstanceId: string; sourceExchangeSeq: bigint;
+  }): RepositoryInsertMutation {
+    this.requireMutation('insert');
+    if (this.schema.key !== 'RuntimeDeliveryTimelineLink' && this.schema.key !== 'CollaborationSendTimelineLink') {
+      throw new TypeError(`${this.name} cannot import an exchange timeline position.`);
+    }
+    if ('exchange_seq' in row) throw new TypeError('Imported exchange sequence is allocated by the writer.');
+    requireId(source.sourceDataSetId); requireId(source.sourceRootInstanceId);
+    if (typeof source.sourceExchangeSeq !== 'bigint' || source.sourceExchangeSeq < 1n) throw new TypeError('Invalid source exchange sequence.');
+    this.codec.encodeInsert({ ...row, exchange_seq: 1n });
+    return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row), historicalCopy: true,
+      allocateImportedTimelineSequence: { ...source } };
   }
 
   /** Fixed MessageRevision -> Context source relation resolved inside the same writer transaction. */
@@ -756,6 +801,7 @@ function cloneStep(step: RepositoryTransactionStep): RepositoryTransactionStep {
   if (step.kind === 'insert') return {
     ...step,
     row: clonePlainRecord(step.row),
+    ...(step.allocateImportedTimelineSequence ? { allocateImportedTimelineSequence: { ...step.allocateImportedTimelineSequence } } : {}),
     ...(step.initialExecutionLeaseDuration ? { initialExecutionLeaseDuration: {
       ...step.initialExecutionLeaseDuration, clock: { ...step.initialExecutionLeaseDuration.clock }
     } } : {}),

@@ -63,13 +63,17 @@ import { auditRuntimeSnapshot, RuntimeSnapshotAuditError, type RuntimeSnapshotAu
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 import { toSqliteFilePath } from './sqliteFilePath';
 import {
+  TIMELINE_IMPORT_PROVENANCE_DOMAIN, TIMELINE_MERGE_DOMAINS, readTimelineMergeSourceIdentity,
+  timelineMergeSourceRows, type TimelineMergeSourceIdentity, type TimelineMergeSourceRow
+} from './timelineMergeSource';
+import {
   createVscodeRootAuthority, inspectVscodeRuntimeDataSets, isVscodeRuntimeDataSetKept, legacyWorkspaceRuntimeOwnerState,
   markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataSet, vscodeRuntimeSwitchedBeforeUpgrade, type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
 /**
  * Historical data-set merge, online. The selected Runtime is already open; a source (another data
- * set of this configuration root) must be offline. Per source: exact published 3/4 upgrade, then,
+ * set of this configuration root) must be offline. Per source: exact published 3/4/5 upgrade, then,
  * without any claim, a private snapshot checked in a worker (integrity, unfinished work), the row
  * plan with its conflict and size checks and the CAS objects; only a source known to merge has its
  * unfinished work finalized (after a source backup, under its maintenance claim) and is checked
@@ -310,7 +314,7 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   /** A previous commit was found through its exact id set; rows were not merged again. */
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
-  upgradedFromEpoch?: 3 | 4;
+  upgradedFromEpoch?: 3 | 4 | 5;
   /**
    * Unfinished work closed before the merge (source backup kept beside the source): Turns ended as
    * cancelled or interrupted and queued, unsent user messages cancelled, as counted in the source.
@@ -1415,7 +1419,7 @@ interface SourceMode {
    * coordination) is postponed right after its audit, before any plan, backup or finalization.
    */
   postponeOversized?: boolean;
-  /** An estimate: nothing is written; a published 3/4 source is not upgraded (deferred instead). */
+  /** An estimate: nothing is written; a published 3/4/5 source is not upgraded (deferred instead). */
   readOnly?: boolean;
 }
 
@@ -1426,7 +1430,7 @@ interface SourceProgress {
    */
   files?: string;
   fingerprint?: RuntimeDataSetFingerprint;
-  upgradedFromEpoch?: 3 | 4;
+  upgradedFromEpoch?: 3 | 4 | 5;
   /**
    * Unfinished work was (being) closed in the source; `complete` once every transition succeeded.
    * `earlier`: closed by an earlier attempt whose outcome did not say so (none in this attempt).
@@ -1858,7 +1862,7 @@ function assertNoCommitElsewhere(previous: RuntimeDataSetMergeLedgerRecord | und
   if (previous?.state === 'committing' && !sameRuntimeDataSetIdentity(previous.target, target.identity)) throw new Outcome(COMMIT_ELSEWHERE);
 }
 
-/** Identity, idle state, recovery, epoch (a published 3/4 source is upgraded in place first). */
+/** Identity, idle state, recovery, epoch (a published 3/4/5 source is upgraded in place first). */
 async function resolveSource(
   paths: { globalStoragePath: string },
   /** A migration's source check names the target identity only (it continues nothing it could refuse). */
@@ -1902,10 +1906,10 @@ async function resolveSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
   }
   const epoch = candidate.runtimeKernelEpoch;
-  if ((epoch === 3 || epoch === 4) && mode.readOnly) {
+  if ((epoch === 3 || epoch === 4 || epoch === 5) && mode.readOnly) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-upgrade-pending', message: '这份旧聊天记录还是已发布的旧格式，启动时会先在后台升级，之后才能估计。' });
   }
-  if (epoch === 3 || epoch === 4) {
+  if (epoch === 3 || epoch === 4 || epoch === 5) {
     const upgrade = await upgradeRuntimeDataSet(paths, {
       candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
     }).catch(async (error: unknown) => {
@@ -3038,10 +3042,12 @@ async function planRows(
   skipped?: ReadonlyMap<string, ReadonlySet<string>>
 ): Promise<RowPlan> {
   const targetVersion = await mergeTargetVersion(target);
+  const timelineImportSource = readTimelineMergeSourceIdentity(source);
   const plan: RowPlan = { targetVersion, steps: [], assertions: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
   const presence = plan.assertions!;
   const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => !skipped?.get(domain)?.has(id));
   const sink: RuntimeDataSetMergeChunkSink = {
+    timelineImportSource,
     steps: plan.steps,
     presence,
     inserted: (domain, id, row) => {
@@ -3057,26 +3063,67 @@ async function planRows(
     savepointName: () => `merge_identity_${plan.steps.length}`
   };
   try {
-    for (const schema of MERGE_DOMAIN_ORDER) {
+    const planDomain = async (schema: (typeof RUNTIME_DOMAIN_SCHEMAS)[number]): Promise<void> => {
       const repository = DOMAIN_REPOSITORIES.domain(schema.key);
       const statement = source.prepare(mergeReadSql(schema));
       let chunk: DomainRow[] = [];
+      let scannedSinceYield = 0;
+      const pause = async (): Promise<void> => {
+        await new Promise((resolve) => setImmediate(resolve));
+        scannedSinceYield = 0;
+      };
       const flush = async (): Promise<void> => {
         if (chunk.length === 0) return;
         const existing = (await target.snapshot(chunk.map((row) => repository.get(String(row.id))))).snapshot as Array<DomainRow | null>;
         planMergeChunk(schema, chunk, existing, sink);
         chunk = [];
         // Decoding stays on the extension thread; yield so a large source never monopolizes it.
-        await new Promise((resolve) => setImmediate(resolve));
+        await pause();
       };
       const leftOut = skipped?.get(schema.key);
       for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
-        if (leftOut?.has(String(raw.id))) continue;
-        chunk.push(sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
-        if (chunk.length >= READ_CHUNK) await flush();
+        scannedSinceYield += 1;
+        if (!leftOut?.has(String(raw.id))) {
+          chunk.push(sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
+          if (chunk.length >= READ_CHUNK) await flush();
+        }
+        // A deleted closure can contain every row in a domain. Count raw rows so filtering
+        // cannot bypass the same bounded extension-thread work budget as retained rows.
+        if (scannedSinceYield >= READ_CHUNK) await pause();
       }
       await flush();
+    };
+    for (const schema of MERGE_DOMAIN_ORDER) {
+      if (TIMELINE_MERGE_DOMAINS.has(schema.key) || schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN) continue;
+      await planDomain(schema);
     }
+    // Every dependency is now planned. Allocate new exchanges in one source-relative stream,
+    // never all receives followed by all sends. Reused ids retain the destination's sequence.
+    let timelineChunk: TimelineMergeSourceRow[] = [];
+    let timelineScanned = 0;
+    const flushTimeline = async (): Promise<void> => {
+      if (timelineChunk.length === 0) return;
+      const existing = (await target.snapshot(timelineChunk.map(({ schema, row }) =>
+        DOMAIN_REPOSITORIES.domain(schema.key).get(String(row.id))))).snapshot as Array<DomainRow | null>;
+      for (const [index, { schema, row }] of timelineChunk.entries()) {
+        planMergeChunk(schema, [row], [existing[index]], sink);
+      }
+      timelineChunk = [];
+    };
+    for (const entry of timelineMergeSourceRows(source, (domain, id) => !skipped?.get(domain)?.has(id))) {
+      if (!skipped?.get(entry.schema.key)?.has(String(entry.row.id))) timelineChunk.push(entry);
+      timelineScanned += 1;
+      if (timelineScanned >= READ_CHUNK) {
+        await flushTimeline();
+        await new Promise(resolve => setImmediate(resolve));
+        timelineScanned = 0;
+      }
+    }
+    await flushTimeline();
+    // Earlier import edges refer to their source's timeline rows, now present or planned. Keep
+    // these edges unchanged so chained imports retain every verified origin/ordinal proof.
+    const provenance = MERGE_DOMAIN_ORDER.find(schema => schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN);
+    if (provenance) await planDomain(provenance);
     if (plan.conflicts.count === 0) await aggregates.validate();
   } finally { aggregates.close(); }
   // A loop, not push(...presence): an argument list of every source row overflows the call stack.
@@ -3089,6 +3136,8 @@ async function planRows(
  * (runtimeDataSetStreamedMerge.ts) appends every chunk to its maintenance transaction.
  */
 export interface RuntimeDataSetMergeChunkSink {
+  /** Verified snapshot identity, used only for newly imported timeline rows. */
+  timelineImportSource?: TimelineMergeSourceIdentity;
   /** Insert steps in source order (a content identity as a savepoint and its assertion). */
   steps: RepositoryTransactionStep[];
   /** Presence for inserts, contractual equality for reused rows, checked after the inserts. */
@@ -3123,7 +3172,8 @@ export function planMergeChunk(
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(schema.key);
   const allowed = IDENTITY_MERGE_DIFFERENCES.get(schema.key);
-  const renumbered = RENUMBERED_COLUMNS.get(schema.key);
+  const timelineImport = TIMELINE_MERGE_DOMAINS.has(schema.key);
+  const renumbered = timelineImport ? 'exchange_seq' : RENUMBERED_COLUMNS.get(schema.key);
   const historical = HISTORICAL_COPY_DOMAINS.includes(schema.key);
   // A request that has not started yet is inserted exactly as the Runtime itself creates it
   // (prepared request, pending Operation and Attempt); started or finished ones are historical copies.
@@ -3151,17 +3201,25 @@ export function planMergeChunk(
       }
       continue;
     }
-    const insert = sourceRow(schema.key, id, () => renumbered
+    if (timelineImport && !sink.timelineImportSource) throw new Error('Timeline merge requires the verified source snapshot identity.');
+    const insert = sourceRow(schema.key, id, () => timelineImport
+      ? repository.insertHistoricalTimelineImport(withoutColumn(row, 'exchange_seq'), {
+          ...sink.timelineImportSource!, sourceExchangeSeq: row.exchange_seq as bigint
+        })
+      : renumbered
       ? repository.insertWithNextSequence(withoutColumn(row, renumbered), { column: renumbered, scope: {} })
       : historical && !notStarted(row) ? repository.insertHistoricalCopy(row) : repository.insert(row));
-    if (allowed) {
+    if (allowed || schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN) {
       // Another window may create the same content-derived identity before this commit: inside
       // the transaction it is inserted only when still absent, else compared like above.
+      // A timeline import can also generate the exact provenance already present in a source
+      // that previously received the same event through a round trip. No provenance field may
+      // differ; only an identical row generated earlier in this transaction is reusable.
       sink.steps.push(savepoint(sink.savepointName(), [insert], {
         kind: 'rollback-and-continue-on-unique',
         constraints: uniqueIdentities(schema).map((columns) => ({ domain: schema.key, columns }))
       }), repository.assert(id, Object.fromEntries(schema.columns
-        .filter((column) => column.name !== 'id' && !allowed.has(column.name))
+        .filter((column) => column.name !== 'id' && !allowed?.has(column.name))
         .map((column) => [column.name, row[column.name]]))));
     } else {
       sink.steps.push(insert);
@@ -4068,13 +4126,13 @@ export interface RuntimeDataSetMigrationSource {
   /** Exact SQLite file state of the source the snapshot was taken from. */
   files: string;
   rows: number;
-  upgradedFromEpoch?: 3 | 4;
+  upgradedFromEpoch?: 3 | 4 | 5;
   close(): Promise<void>;
 }
 
 /**
  * An offline source resolved exactly as a migration merge resolves it (identity, no Host, no
- * pending recovery, published 3/4 upgraded in place), with its verified snapshot: integrity,
+ * pending recovery, published 3/4/5 upgraded in place), with its verified snapshot: integrity,
  * fingerprint and carried unfinished work (a streaming request or a running process refuses it).
  */
 export async function openRuntimeDataSetMigrationSource(
@@ -4172,7 +4230,7 @@ export function runtimeDataSetCopyRow(domain: string, raw: Record<string, unknow
  * The error a caller of the copy sees: a source refusal as RuntimeDataSetMergeError (code and
  * user-facing message, with the in-place upgrade noted); a cancellation and anything else unchanged.
  */
-export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 }): unknown {
+export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 }): unknown {
   if (error instanceof RuntimeDataSetMergeError || (error instanceof Error && error.name === 'AbortError')) return error;
   if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error) && !isRuntimeDataInvariant(error)) return error;
   const outcome = sourceOutcome(error, state);
