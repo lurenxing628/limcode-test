@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import {
   requireIsoTimestamp,
   requirePhaseFId,
@@ -271,21 +270,19 @@ export function renderRuntimeDeliveryModelEnvelope(
   const originalContent = envelope.kind === 'process_completion'
     ? canonicalPlainJson(modelEnvelope, 'Process completion model projection')
     : typeof modelEnvelope.content === 'string' ? modelEnvelope.content : envelope.content;
-  const digest = createHash('sha256').update(originalContent).digest('hex');
   const marker = envelope.kind === 'collaboration_message' && typeof modelEnvelope.messageRef === 'string'
     // The whole message stays readable: the marker names the exact paged read that returns it.
     ? `[Message truncated: only its start and end are shown below. Read the full text with read_agent_messages with messageRef=${modelEnvelope.messageRef} and offset=0, then repeat with offset=nextOffset until nextOffset is null.]`
-    : `[truncated runtime result; originalBytes=${Buffer.byteLength(originalContent, 'utf8')}; sha256=${digest}]`;
+    : `[truncated runtime result; originalBytes=${Buffer.byteLength(originalContent, 'utf8')}]`;
   let low = 0;
   let high = originalContent.length;
-  let best = render(runtimeRenderEnvelope(modelEnvelope, envelope.kind, marker, digest, originalContent.length));
+  let best = render(runtimeRenderEnvelope(modelEnvelope, envelope.kind, marker, originalContent.length));
   while (low <= high) {
     const length = Math.floor((low + high) / 2);
     const candidate = render(runtimeRenderEnvelope(
       modelEnvelope,
       envelope.kind,
       `${marker}\n${headTailPreview(originalContent, length)}`,
-      digest,
       originalContent.length
     ));
     if (estimateTextTokens(candidate) <= maxTokens) {
@@ -602,7 +599,6 @@ function runtimeRenderEnvelope(
   modelEnvelope: Record<string, unknown>,
   kind: RuntimeDeliveryModelKind,
   preview: string,
-  digest: string,
   originalCharacters: number
 ): unknown {
   if (kind !== 'process_completion') {
@@ -610,8 +606,7 @@ function runtimeRenderEnvelope(
       ...modelEnvelope,
       content: preview,
       truncated: true,
-      originalCharacters,
-      sha256: digest
+      originalCharacters
     };
   }
   return {
@@ -623,7 +618,6 @@ function runtimeRenderEnvelope(
     ]),
     truncated: true,
     originalCharacters,
-    sha256: digest,
     preview
   };
 }

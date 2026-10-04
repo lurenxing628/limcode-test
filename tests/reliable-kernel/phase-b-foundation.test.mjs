@@ -532,8 +532,30 @@ test('Runtime Delivery 模型投影使用 typed envelope，notify_only 与 Child
   );
   assert.ok(kernel.estimateTextTokens(boundedRender) <= 500);
   assert.match(boundedRender, /truncated runtime result/);
-  assert.match(boundedRender, /sha256=[a-f0-9]{64}/);
+  assert.doesNotMatch(boundedRender, /sha256/i);
+  const boundedChild = JSON.parse(boundedRender.split('\n')[1]);
+  assert.equal(boundedChild.truncated, true);
+  assert.equal(boundedChild.originalCharacters, oversizedChild.envelope.content.length);
+  assert.match(boundedChild.content, /HEAD-/);
+  assert.match(boundedChild.content, /-TAIL/);
   assert.equal(boundedRender.includes('x'.repeat(100_000)), false);
+
+  const oversizedProcess = { ...processProjection.envelope, content: {
+    ...processProjection.envelope.content,
+    output: { stdoutTail: `HEAD-${'x'.repeat(100_000)}-TAIL`, stderrTail: '' }
+  } };
+  const boundedProcessRender = runtimeDeliveryProjection.renderRuntimeDeliveryModelEnvelope(
+    oversizedProcess, 500, processHandles
+  );
+  assert.ok(kernel.estimateTextTokens(boundedProcessRender) <= 500);
+  assert.doesNotMatch(boundedProcessRender, /sha256/i);
+  const boundedProcess = JSON.parse(boundedProcessRender.split('\n')[1]);
+  assert.equal(boundedProcess.truncated, true);
+  assert.equal(boundedProcess.processRef, 'P1');
+  assert.equal(boundedProcess.outcome, completion.outcome);
+  assert.equal(boundedProcess.exitCode, completion.exitCode);
+  assert.equal(boundedProcess.completedAt, completion.completedAt);
+  assert.match(boundedProcess.preview, /truncated runtime result/);
 });
 
 test('Runtime Delivery 模型 codec hard-cut 旧裸文本和损坏的权限标签', () => {

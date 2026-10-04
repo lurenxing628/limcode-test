@@ -123,7 +123,7 @@ test('child task facts read every parent Turn, approved Plan children and descen
   } finally { f.close(); }
 });
 
-test('a cross-connection commit cannot tear dependent reads and changes the content revision even when local commitSeq stays zero', () => {
+test('a cross-connection commit cannot tear dependent reads even when local commitSeq stays zero', () => {
   const f = fixture();
   try {
     f.child('worker');
@@ -141,10 +141,11 @@ test('a cross-connection commit cannot tear dependent reads and changes the cont
     const after = f.snapshot();
     assert.equal(during.snapshot.childExecutions[0].status, 'active');
     assert.equal(during.snapshot.conversations[0].title, 'worker');
-    assert.equal(during.snapshot.snapshotRevision, before.snapshot.snapshotRevision);
+    assert.deepEqual(during.snapshot, before.snapshot);
+    assert.equal(Object.hasOwn(before.snapshot, 'snapshotRevision'), false);
     assert.equal(after.snapshot.childExecutions[0].status, 'completed');
     assert.equal(after.snapshot.conversations[0].title, 'Updated child task');
-    assert.notEqual(after.snapshot.snapshotRevision, before.snapshot.snapshotRevision);
+    assert.notDeepEqual(after.snapshot, before.snapshot);
     assert.equal(after.snapshotCommitSeq, before.snapshotCommitSeq);
   } finally { f.close(); }
 });
@@ -206,10 +207,9 @@ test('foreground result closure includes a later parent wait without inventing a
     assert.equal(facts.contextSegmentSources[0].source_kind, 'tool_model_result');
     assert.ok(facts.contentObjects.some((row) => row.id === resultId));
     assert.deepEqual(facts.deliveries, []);
-    const beforeRevision = facts.snapshotRevision;
     f.insert('ToolCall', { id: 'list-call', turn_id: 'parent-current-turn', tool_name: 'run_agent', arguments_object_id: f.content('list-args', { action: 'list' }, 'application/json') });
     f.insert('ToolOutcome', { id: 'list-outcome', tool_call_id: 'list-call', status: 'succeeded', content_object_id: f.content('list-result', { data: [] }, 'application/json') });
-    assert.equal(f.snapshot().snapshot.snapshotRevision, beforeRevision, 'list/read observation must not invalidate its own next-page cursor');
+    assert.deepEqual(f.snapshot().snapshot, facts, 'list/read observation must not add unrelated results to the task facts');
   } finally { f.close(); }
 });
 
@@ -238,19 +238,19 @@ test('consumed but unhandled delivery retains dead-letter wake state and failure
     }).snapshot;
     const after = f.snapshot().snapshot;
     assert.equal(during.deliveryWakes[0].state, 'pending');
-    assert.equal(during.snapshotRevision, before.snapshotRevision);
+    assert.deepEqual(during, before);
     assert.equal(after.deliveries[0].state, 'consumed');
     assert.equal(after.deliveryInputLinks[0].handled_at, null);
     assert.equal(after.deliveryWakes[0].state, 'dead_letter');
     assert.equal(after.deliveryWakes[0].last_error, 'Wake retries exhausted');
-    assert.notEqual(after.snapshotRevision, before.snapshotRevision);
+    assert.notDeepEqual(after, before);
     f.insert('RuntimeDeliveryWake', { id: 'duplicate-wake', delivery_id: 'delivery', state: 'pending' });
     assert.throws(() => f.snapshot(), /at most one RuntimeDeliveryWake relation/);
     assert.equal(f.reader.inTransaction, false);
   } finally { f.close(); }
 });
 
-test('streamed model output and unrelated tool-result history do not enter the task snapshot or change its revision', () => {
+test('streamed model output and unrelated tool-result history do not change the task snapshot', () => {
   const f = fixture();
   try {
     f.child('worker');
@@ -273,7 +273,7 @@ test('streamed model output and unrelated tool-result history do not enter the t
         f.writer.prepare('UPDATE message_current_revision_link SET revision_id = ? WHERE message_id = ?').run(revisionId, messageId);
         const requests = [];
         const after = f.snapshot((database, request) => { requests.push(request); return f.read(database, request); }).snapshot;
-        assert.equal(after.snapshotRevision, before.snapshotRevision);
+        assert.deepEqual(after, before);
         assert.deepEqual(after.messageRevisions.map((row) => row.id), ['task-revision']);
         assert.ok(!after.contentObjects.some((row) => String(row.id).startsWith('stream-')));
         assert.ok(!requests.some((request) => request.id === messageId || request.where?.message_id === messageId));

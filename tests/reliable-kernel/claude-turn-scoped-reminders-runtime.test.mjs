@@ -419,7 +419,7 @@ test('运行状态卡（带模型撰写的第三方文本）始终是 user 消�
     loop.readRuntimeStatusCard = async (turnId) => ({
       ...(await original(turnId)),
       statusCard: {
-        kind: 'runtime_status_card', activeChildCount: 0, runningProcessCount: 1, childTaskRevision: 'none',
+        kind: 'runtime_status_card', activeChildCount: 0, runningProcessCount: 1,
         totalChildCount: 0, descendantCount: 0, queuedInputCount: 0, awaitingHandlingCount: 0,
         childHandleTargets: [], children: [], processes: [{ processId: 'process-fixture', status: 'running' }], card: STATUS
       }

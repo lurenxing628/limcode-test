@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import type { SnapshotBarrier } from './contracts';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryRead } from './repositories';
@@ -8,8 +7,6 @@ import { parseInputTurnIntentEnvelope, TURN_INTENT_ENVELOPE_CONTENT_TYPE } from 
 /** Read-only domain facts. This projection owns no task, relationship, or status authority. */
 export interface ConversationChildTaskFacts {
   conversationId: string;
-  /** Content fingerprint of this complete SQLite read snapshot, valid across Runtime Hosts. */
-  snapshotRevision: string;
   conversation: DomainRow;
   parentTurns: DomainRow[];
   childExecutions: DomainRow[];
@@ -51,7 +48,7 @@ export interface ConversationChildTaskFacts {
   contentObjects: DomainRow[];
 }
 
-type FactsRows = Omit<ConversationChildTaskFacts, 'conversationId' | 'snapshotRevision' | 'conversation'>;
+type FactsRows = Omit<ConversationChildTaskFacts, 'conversationId' | 'conversation'>;
 type FactsRowsKey = keyof FactsRows;
 type ReadRepository = (database: Database.Database, read: RepositoryRead) => DomainRow | DomainRow[] | null;
 type ReadVerifiedEnvelope = (metadata: DomainRow) => Buffer;
@@ -70,7 +67,7 @@ export function executeConversationChildTaskSnapshot(
   try {
     const facts = collectConversationChildTaskFacts(database, conversationId, read, readVerifiedEnvelope);
     database.exec('COMMIT');
-    // Existing barrier sequencing is Host-local diagnostics; consumers use snapshotRevision.
+    // Existing barrier sequencing is Host-local diagnostics, not a cross-Host change token.
     return { snapshotCommitSeq: localCommitSeq.toString(), snapshot: facts };
   } catch (error) {
     database.exec('ROLLBACK');
@@ -377,14 +374,5 @@ function collectConversationChildTaskFacts(
   for (const key of Object.keys(rows) as FactsRowsKey[]) rows[key].sort((a, b) =>
     String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0
   );
-  const body = { conversationId, conversation, ...rows };
-  const snapshotRevision = createHash('sha256').update('limcode.child-task-facts\0').update(canonicalJson(body)).digest('hex');
-  return { ...body, snapshotRevision };
-}
-
-function canonicalJson(value: unknown): string {
-  if (typeof value === 'bigint') return JSON.stringify(value.toString());
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson((value as DomainRow)[key])}`).join(',')}}`;
+  return { conversationId, conversation, ...rows };
 }

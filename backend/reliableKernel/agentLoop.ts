@@ -382,7 +382,7 @@ function forkInheritedCollaborationTargets(catalog: ModelHandleCatalog, facts: F
 
 function emptyRuntimeStatusCard(heading: string): FrozenRuntimeStatusCard {
   return {
-    kind: 'runtime_status_card', activeChildCount: 0, runningProcessCount: 0, childTaskRevision: 'none',
+    kind: 'runtime_status_card', activeChildCount: 0, runningProcessCount: 0,
     totalChildCount: 0, descendantCount: 0, queuedInputCount: 0, awaitingHandlingCount: 0,
     childHandleTargets: [], children: [], processes: [], card: heading
   };
@@ -392,7 +392,6 @@ interface FrozenRuntimeStatusCard {
   kind: 'runtime_status_card';
   activeChildCount: number;
   runningProcessCount: number;
-  childTaskRevision: string;
   totalChildCount: number;
   descendantCount: number;
   queuedInputCount: number;
@@ -1644,7 +1643,7 @@ export class ReliableAgentLoop {
     const awaitingHandlingCount = direct.filter(pendingHandling).length;
     return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
       ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
-      kind: 'runtime_status_card', childTaskRevision: projection.revision,
+      kind: 'runtime_status_card',
       totalChildCount: direct.length, descendantCount: projection.tasks.length - direct.length,
       queuedInputCount, awaitingHandlingCount, activeChildCount,
       runningProcessCount: runningProcesses.length,

@@ -100,8 +100,8 @@ test('the client feed contract preview bound matches the projection constant', a
 
 test('the client feed contract snapshot numbers are the code constants the projection uses', async () => {
   const client = await contract('client-feed');
-  // queryCollaborationMessagesForTurns limits the collaboration selection by the per-type bound.
-  assert.match(client.collaborationProjection.snapshotSelection, new RegExp(`; at-most-${CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE}-newest-by-message_seq$`));
+  // Selection now preserves accepted exchange closure; record and byte bounds remain separate.
+  assert.equal(client.collaborationProjection.snapshotSelection, 'bounded-accepted-exchange-suffix-plus-loaded-Turn-envelopes-and-bounded-pending-failed-inventory; canonical-accepted-attempt-closure');
   assert.equal(client.snapshot.activeRecordLimitPerType, CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE);
   assert.equal(client.snapshot.messageWindowLimit, CLIENT_MESSAGE_WINDOW_LIMIT);
   // enforceSnapshotBounds trims to this byte limit; the collaboration trimming rule refers to it.
@@ -141,6 +141,7 @@ test('paged reads: the contract numbers are the code constants, every page fits 
     delivery: 'followup_task', senderKind: 'other_conversation', senderTitle: 'Sender',
     replyToMessageId: null, content: 'long task. '.repeat(4000) }, undefined, catalog);
   assert.match(rendered, new RegExp(`${pagingTool} with messageRef=M1 and offset=0`));
+  assert.doesNotMatch(rendered, /sha256/i);
   assert.match(messageText.preview, new RegExp(`marker-names-the-exact-call-${pagingTool}-with-messageRef-and-offset=0`));
   const document = await fs.readFile('docs/architecture/reliable-kernel/agent-collaboration.md', 'utf8');
   assert.match(document, new RegExp(`至多 ${COLLABORATION_TEXT_PAGE_TOKENS} 个估算 token（\`COLLABORATION_TEXT_PAGE_TOKENS\`）和 ${COLLABORATION_TEXT_PAGE_MAX_CHARACTERS} 个字符`));

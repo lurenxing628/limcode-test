@@ -24,7 +24,7 @@
 
 ## 快照、恢复与重复派发
 
-每个新 ModelRequest 在 worker 的同一 SQLite 读事务内取得作用域和相关事实，再以不可变 CAS identity 读取正文并冻结到 recipe。尾部状态卡和模型短引用使用这份快照；同一 ModelRequest 的重试复用其冻结 recipe，后续新请求重新投影，因此压缩后不依赖摘要是否记住派发记录。`snapshotRevision` 是该投影来源事实的内容指纹；`snapshotCommitSeq` 只用于诊断，不能当成跨 Host 全局提交序号。
+每个新 ModelRequest 在 worker 的同一 SQLite 读事务内取得作用域和相关事实，再以不可变 CAS identity 读取正文并冻结到 recipe。尾部状态卡和模型短引用使用这份快照；同一 ModelRequest 的重试复用其冻结 recipe，后续新请求重新投影，因此压缩后不依赖摘要是否记住派发记录。整份快照不携带内容指纹；单任务 revision 继续用于等待变化，read 游标继续核对正文身份。`snapshotCommitSeq` 只用于诊断，不能当成跨 Host 全局提交序号。
 
 跨 Host 的清单读取共享 Runtime 数据，不依赖本进程的活动 Promise 集合。观察到另一 Host 正在驱动子任务时，仍应显示真实运行状态；发送、中断和恢复继续遵守现有 Conversation ownership 与 ExecutionLease，不通过清单绕开执行权边界。
 

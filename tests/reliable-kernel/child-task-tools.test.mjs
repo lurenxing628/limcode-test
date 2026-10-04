@@ -30,7 +30,6 @@ function fixture(initialTasks = [task(1)]) {
   const events = { spawns: [], sends: [], interrupts: [], settlements: [], observations: 0 };
   const listeners = new Set();
   let tasks = initialTasks;
-  let revision = 'projection-1';
   const database = {
     hostBootId: 'task-tools-host',
     onCommit(listener) { listeners.add(listener); return () => listeners.delete(listener); },
@@ -50,7 +49,7 @@ function fixture(initialTasks = [task(1)]) {
       async readConversationTaskProjection(conversationId) {
         assert.equal(conversationId, 'parent-conversation');
         events.observations += 1;
-        return { conversationId, revision, snapshotCommitSeq: '42', tasks };
+        return { conversationId, snapshotCommitSeq: '42', tasks };
       },
       async readExecutionSnapshot(childExecutionId) {
         const value = tasks.find(item => item.childExecutionId === childExecutionId);
@@ -71,7 +70,7 @@ function fixture(initialTasks = [task(1)]) {
   };
   let calls = 0;
   return { coordinator, events, listeners,
-    replaceTasks(next) { tasks = next; revision = 'projection-2'; for (const listener of [...listeners]) listener(); },
+    replaceTasks(next) { tasks = next; for (const listener of [...listeners]) listener(); },
     call(args, signal, toolName = 'run_agent') {
       return coordinator.dispatch({ turnId: 'parent-turn', modelRequestId: 'parent-request',
         toolCallId: `call-${++calls}`, toolName, arguments: args }, signal);

@@ -109,8 +109,6 @@ export interface ConversationChildTaskProjection {
   conversationId: string;
   /** Diagnostic only: commit counters from separate Hosts are not comparable. */
   snapshotCommitSeq: string;
-  /** Worker-computed fingerprint of the complete transaction snapshot. */
-  revision: string;
   tasks: ConversationChildTaskRecord[];
 }
 
@@ -180,7 +178,6 @@ export interface ConversationChildTaskCounts {
 export interface ConversationChildTaskPage {
   operation: 'list';
   conversationId: string;
-  revision: string;
   snapshotCommitSeq: string;
   scope: ConversationChildTaskScope;
   tasks: ConversationChildTaskSummary[];
@@ -196,7 +193,6 @@ export interface ConversationChildTaskPage {
 export interface ConversationChildTaskReadPage {
   operation: 'read';
   conversationId: string;
-  revision: string;
   scope: ConversationChildTaskScope;
   task: ConversationChildTaskSummary;
   timelineSources: ConversationChildTaskSourceChunk[];
@@ -461,8 +457,7 @@ export async function buildConversationChildTaskProjection(
     tasks.push({ ...task, revision: createHash('sha256').update(JSON.stringify(task)).digest('hex') });
   }
   tasks.sort((a, b) => compareText(a.createdAt, b.createdAt) || compareText(a.childExecutionId, b.childExecutionId));
-  return { conversationId, snapshotCommitSeq: barrier.snapshotCommitSeq,
-    revision: requireText(facts.snapshotRevision, 'snapshotRevision'), tasks };
+  return { conversationId, snapshotCommitSeq: barrier.snapshotCommitSeq, tasks };
 }
 
 class SnapshotContentReader {
@@ -697,7 +692,7 @@ export function listConversationChildTasks(
   const build = (selected: ConversationChildTaskRecord[]): ConversationChildTaskPage => {
     const omitted = remaining.length - selected.length;
     return {
-      operation: 'list', conversationId: projection.conversationId, revision: projection.revision,
+      operation: 'list', conversationId: projection.conversationId,
       snapshotCommitSeq: projection.snapshotCommitSeq, scope,
       tasks: selected.map(childTaskSummary),
       counts: { total: scoped.length, totalDirect, totalDescendants, matched: matched.length, shown: selected.length, omitted, byStatus },
@@ -751,7 +746,7 @@ export function readConversationChildTask(
   const build = (chunks: ConversationChildTaskSourceChunk[], nextIndex: number, nextOffset: number): ConversationChildTaskReadPage => {
     const next = timeline[nextIndex];
     return {
-      operation: 'read', conversationId: projection.conversationId, revision: projection.revision, scope,
+      operation: 'read', conversationId: projection.conversationId, scope,
       task: childTaskSummary(task), timelineSources: chunks,
       ...(rereadCursor ? { rereadCursor } : {}),
       sourceCounts: { total: timeline.length, shown: chunks.length, omitted: timeline.length - nextIndex },

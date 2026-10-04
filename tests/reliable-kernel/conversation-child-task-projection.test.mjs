@@ -23,7 +23,7 @@ function fixture() {
     'contentObjects', 'contextSegmentSources', 'answerToolCalls', 'answerWaitOperations', 'toolOutcomes', 'deliveryWakes',
     'toolResultArtifacts', 'toolModelResults', 'toolResultMessageRevisions'];
   const facts = Object.fromEntries(arrays.map(key => [key, []]));
-  Object.assign(facts, { conversationId: 'root', snapshotRevision: 'facts-revision', conversation: { id: 'root' } });
+  Object.assign(facts, { conversationId: 'root', conversation: { id: 'root' } });
   facts.parentTurns.push({ id: 'root-turn', conversation_id: 'root', created_at: NOW });
   const bytes = new Map();
   const content = (id, text, contentType = 'text/plain') => {
@@ -139,12 +139,18 @@ test('task分页可枚举超过32项，tree显式授权；游标跨活动revisio
     ['active', 'idle', 'closed'][index % 3]);
   f.child('grandchild', 'worker-00');
   const p = await f.project(); const first = listConversationChildTasks(p);
+  assert.equal(Object.hasOwn(p, 'revision'), false);
+  assert.equal(Object.hasOwn(first, 'revision'), false);
   assert.ok(first.tasks.length <= 32); assert.equal(first.totalDirect, 40); assert.equal(first.totalDescendants, 1);
   assert.equal(first.omitted, 40 - first.tasks.length);
   assert.equal(first.counts.byStatus.active, 14); assert.equal(first.counts.byStatus.idle, 13); assert.equal(first.counts.byStatus.closed, 13);
   const all = [...first.tasks]; let cursor = first.nextCursor;
+  f.facts.childExecutions[0].status = 'idle';
+  const changed = await f.project();
+  const firstWorker = projection => projection.tasks.find(task => task.childExecutionId === 'worker-00');
+  assert.notEqual(firstWorker(changed).revision, firstWorker(p).revision);
   while (cursor) {
-    const page = listConversationChildTasks({ ...p, revision: 'changed' }, { cursor });
+    const page = listConversationChildTasks(changed, { cursor });
     assert.ok(estimateJsonTokens(page) <= 2600);
     all.push(...page.tasks); cursor = page.nextCursor;
   }
@@ -211,7 +217,9 @@ test('超长任务跨预算分页可精确拼回；活动变化不使cursor失�
   f.message('initial', original);
   const p = await f.project(); let cursor; let restored = ''; let pages = 0;
   do {
-    const page = readConversationChildTask({ ...p, revision: `live-${pages}` }, { childExecutionId: 'worker', cursor });
+    f.facts.childExecutions[0].status = pages % 2 ? 'idle' : 'active';
+    const page = readConversationChildTask(await f.project(), { childExecutionId: 'worker', cursor });
+    assert.equal(Object.hasOwn(page, 'revision'), false);
     assert.ok(estimateJsonTokens(page) <= 2600);
     assert.ok(page.timelineSources.length > 0);
     const chunk = page.timelineSources[0];
