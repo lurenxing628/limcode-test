@@ -305,11 +305,13 @@ export function readAll(dataSet) {
   } finally { reader.close(); }
 }
 
-/** Rows of every Runtime domain table, a historical merge's commit markers left out (no merged rows). */
+/** Imported-source row accounting excludes commit markers and receiving-root derived handle authority. */
 export function countRows(dataSet) {
   const reader = new Database(dataSet.binding.paths.databasePath, { readonly: true });
   try {
-    return RUNTIME_DOMAIN_SCHEMAS.reduce((sum, schema) => sum + Number(reader.prepare(`SELECT COUNT(*) FROM "${schema.table}"${schema.table === 'command_receipt'
+    return RUNTIME_DOMAIN_SCHEMAS
+      .filter(schema => schema.key !== 'ConversationContextHandleState' && schema.key !== 'ContextRootHandleCatalog')
+      .reduce((sum, schema) => sum + Number(reader.prepare(`SELECT COUNT(*) FROM "${schema.table}"${schema.table === 'command_receipt'
       ? " WHERE NOT (source_kind = 'internal' AND source_key LIKE 'historical-merge-commit:%')" : ''}`).pluck().get()), 0);
   } finally { reader.close(); }
 }

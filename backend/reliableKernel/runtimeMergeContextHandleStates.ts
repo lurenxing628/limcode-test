@@ -6,6 +6,8 @@ import type { RuntimeDatabase } from './runtimeDatabase';
 import { RuntimeDataInvariantError } from './runtimeDataInvariant';
 import { RUNTIME_DOMAIN_SCHEMA_BY_KEY } from './schema/domainManifest';
 
+export interface MergeContextHandleStateUpdate { before: DomainRow; after: DomainRow }
+
 const PAGE = 64;
 const TOUCHED = 'limcode_merge_context_handle_owners';
 const SEGMENTS = 'limcode_merge_context_handle_segments';
@@ -108,7 +110,7 @@ export class MergeContextHandleStates {
   }
 
   /** Append bounded pages after all evidence inserts, before the source transaction commits. */
-  public async append(consume: (steps: RepositoryTransactionStep[]) => void | Promise<void>, signal?: AbortSignal): Promise<void> {
+  public async append(consume: (steps: RepositoryTransactionStep[], updates: MergeContextHandleStateUpdate[]) => void | Promise<void>, signal?: AbortSignal): Promise<void> {
     const repository = DOMAIN_REPOSITORIES.domain(CONTEXT_HANDLE_STATE_DOMAIN);
     for (let after = ''; ;) {
       signal?.throwIfAborted();
@@ -118,6 +120,7 @@ export class MergeContextHandleStates {
       const current = (await this.target.snapshot(page.map(({ id }) => repository.get(conversationContextHandleStateId(id)))))
         .snapshot as Array<DomainRow | null>;
       const steps: RepositoryTransactionStep[] = [];
+      const updates: MergeContextHandleStateUpdate[] = [];
       for (const [index, { id, evidence_at, force_seed }] of page.entries()) {
         signal?.throwIfAborted();
         const previous = current[index];
@@ -126,10 +129,20 @@ export class MergeContextHandleStates {
         const rootId = heads[0]?.root_id ?? null;
         const affectsCurrent = Boolean(force_seed) || (rootId !== null && await this.affectsRoot(id, String(rootId), signal));
         const now = previous && String(previous.updated_at) > evidence_at ? String(previous.updated_at) : evidence_at;
-        steps.push(...importConversationContextHandleStateSteps(id, now, previous ?? undefined, rootId as string | null, affectsCurrent));
+        const transition = importConversationContextHandleStateSteps(id, now, previous ?? undefined, rootId as string | null, affectsCurrent);
+        if (previous) {
+          // Relocation recovery journals complete before/after images. Fence every old field,
+          // including timestamps, so those images describe precisely what the writer changes.
+          const { id: stateId, ...expected } = previous;
+          steps.push(repository.assert(String(stateId), expected));
+          for (const step of transition) if (step.kind === 'update') {
+            updates.push({ before: previous, after: { ...previous, ...step.patch } });
+          }
+        }
+        steps.push(...transition);
       }
       signal?.throwIfAborted();
-      if (steps.length > 0) await consume(steps);
+      if (steps.length > 0) await consume(steps, updates);
       after = page[page.length - 1]!.id;
       await new Promise(resolve => setImmediate(resolve));
     }

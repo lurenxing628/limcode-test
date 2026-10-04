@@ -19,7 +19,8 @@ import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runt
 import { classifyRecordedProcess, ownProcessStartIdentity, type RecordedProcessClassifier } from './runtimeClaimPrimitives';
 import { RuntimeDatabaseWorkerError, type RuntimeDatabase } from './runtimeDatabase';
 import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
-import { MergeContextHandleStates } from './runtimeMergeContextHandleStates';
+import { timelineImportProvenanceRow } from './timelinePosition';
+import { MergeContextHandleStates, type MergeContextHandleStateUpdate } from './runtimeMergeContextHandleStates';
 import { CONTEXT_HANDLE_STATE_DOMAIN, CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN } from './conversationContextHandleState';
 import { isRuntimeDataInvariant } from './runtimeDataInvariant';
 import {
@@ -286,11 +287,12 @@ export interface RuntimeDataSetIntoDatabaseOptions extends RuntimeDataSetMergeOp
   /** Objects an earlier online pre-copy verified ({@link precopyRuntimeDataSetCas}); unchanged ones are not hashed again. */
   casVerification?: RuntimeDataSetCasVerification;
   /**
-   * Migration only: called with exactly the rows the one row transaction inserts, right before it
-   * commits (the migration journals them, so an interrupted undo can tell its own rows apart). A
-   * failure stops the merge before the commit.
+   * Migration only: all inserts (including locally derived authority) and exact before/after images
+   * of updated handle state, right before the one transaction commits. The migration journals
+   * these separately from imported-source row counts so an interrupted undo can prove its entire
+   * change without hiding later target writes. A failure stops the merge before the commit.
    */
-  beforeCommit?(inserted: ReadonlyArray<readonly [domain: string, id: string]>): Promise<void>;
+  beforeCommit?(inserted: ReadonlyArray<readonly [domain: string, id: string]>, updated: readonly MergeContextHandleStateUpdate[]): Promise<void>;
 }
 
 export interface RuntimeDataSetCasTransfer {
@@ -308,6 +310,7 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   candidateId: string;
   sourceDataSetId: string;
   targetDataSetId: string;
+  /** Imported source rows only; excludes receiving-root derived authority and commit markers. */
   insertedRows: number;
   reusedRows: number;
   insertedConversations: number;
@@ -2380,7 +2383,7 @@ async function commitLocked(
       ...(previous ? { replaced: previous } : {}), ...skipped
     });
   }
-  if (mode.migration) await options.beforeCommit?.(plan.inserted);
+  if (mode.migration) await options.beforeCommit?.([...plan.inserted, ...(plan.derivedInserted ?? [])], plan.updated ?? []);
   const backupUsed = target.backup.used === true;
   target.backup.used = true;
   await fault(options, 'before-row-commit');
@@ -3025,7 +3028,11 @@ interface RowPlan {
    * targetVersion (captured before scanning) instead, retaining bounded memory.
    */
   assertions?: RepositoryTransactionStep[];
+  /** Imported source rows, used for user-facing and ledger counts. */
   inserted: Array<[string, string]>;
+  /** Additional local mutations, used only for a relocation's complete undo proof. */
+  derivedInserted?: Array<[string, string]>;
+  updated?: MergeContextHandleStateUpdate[];
   reused: number;
   insertedConversations: number;
   conflicts: { count: number; samples: string[] };
@@ -3130,7 +3137,33 @@ async function planRows(
     if (provenance) await planDomain(provenance);
     if (plan.conflicts.count === 0) {
       await aggregates.validate();
-      await handleStates.append(steps => { for (const step of steps) plan.steps.push(step); });
+      // The writer also creates immutable origin edges for newly imported timeline links.
+      // They are local output, not additional imported-source rows, but undo must remove them.
+      // A source may already carry the very same edge (round trip): its ordinary insert/savepoint
+      // owns that evidence then. Never journal an edge that existed in the target before planning.
+      const sourceProvenance = new Set(plan.inserted.filter(([domain]) => domain === TIMELINE_IMPORT_PROVENANCE_DOMAIN).map(([, id]) => id));
+      const provenanceRepository = DOMAIN_REPOSITORIES.domain(TIMELINE_IMPORT_PROVENANCE_DOMAIN);
+      let generated: string[] = [];
+      const flushGenerated = async (): Promise<void> => {
+        const existing = (await target.snapshot(generated.map(id => provenanceRepository.get(id)))).snapshot;
+        for (const [index, id] of generated.entries()) if (!existing[index] && !sourceProvenance.has(id)) {
+          (plan.derivedInserted ??= []).push([TIMELINE_IMPORT_PROVENANCE_DOMAIN, id]);
+        }
+        generated = [];
+      };
+      for (const step of plan.steps) if (step.kind === 'insert') {
+        const provenance = timelineImportProvenanceRow(step);
+        if (provenance) generated.push(String(provenance.id));
+        if (generated.length >= READ_CHUNK) await flushGenerated();
+      }
+      if (generated.length > 0) await flushGenerated();
+      await handleStates.append((steps, updates) => {
+        for (const step of steps) {
+          plan.steps.push(step);
+          if (step.kind === 'insert') (plan.derivedInserted ??= []).push([step.domain, String(step.row.id)]);
+        }
+        for (const update of updates) (plan.updated ??= []).push(update);
+      });
     }
   } finally { aggregates.close(); handleStates.close(); }
   // A loop, not push(...presence): an argument list of every source row overflows the call stack.

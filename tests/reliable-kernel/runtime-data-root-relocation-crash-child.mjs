@@ -7,8 +7,10 @@ import fsSync from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import {
-  compiled, createLimCodeTarget, planWithRuntime, populateFixture, relocate
+  compiled, createLimCodeTarget, kernelFile, NOW, planWithRuntime, populateFixture, PROJECT, relocate, repo, withRuntime
 } from './runtime-data-root-relocation-fixture.mjs';
+
+import { seedCollaborationMessages } from './fixtures/runtime-merge-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const fsp = require('node:fs/promises');
@@ -21,9 +23,50 @@ async function main() {
   const fixture = await populateFixture(base);
   const target = path.join(base, 'target');
   if (kind === 'limcode') {
-    await createLimCodeTarget(target, {
+    const existing = await createLimCodeTarget(target, {
+      ...(scenario === 'after-merge-commit' ? { conversations: [
+        { id: 'conversation_existing_1', project: PROJECT }, { id: 'conversation_current_1', project: PROJECT }
+      ] } : {}),
       agents: [{ id: 'agent-shared', name: 'target version' }, { id: 'agent-target-only', name: 'only in target' }]
     });
+    if (scenario === 'after-merge-commit') {
+      // Exercise both local inserts and an update of pre-existing target authority. The source
+      // contributes an empty selected root to the shared conversation; the target has a ready
+      // null-root pointer that the merge must demote atomically and recovery must restore exactly.
+      const { emptyConversationContextHandleStateStep, pendingConversationContextHandleStateSteps } = kernelFile('conversationContextHandleState.js');
+      await withRuntime(existing, database => database.transaction([emptyConversationContextHandleStateStep('conversation_current_1', NOW)]));
+      await withRuntime(fixture.current, database => database.transaction([
+        repo('ContextSequenceRoot').insert({ id: 'relocation_shared_root', conversation_id: 'conversation_current_1', root_seq: 1n,
+          root_node_id: null, tail_node_id: null, tail_segment_count: 0n, segment_count: 0n, estimated_tokens: 0n, created_at: NOW }),
+        repo('ConversationContextHeadLink').insert({ id: 'relocation_shared_head', conversation_id: 'conversation_current_1',
+          root_id: 'relocation_shared_root', updated_at: NOW }),
+        ...pendingConversationContextHandleStateSteps('conversation_current_1', NOW, undefined, 'relocation_shared_root')
+      ]));
+      const { timelineImportProvenanceRow } = kernelFile('timelinePosition.js');
+      for (const [dataSet, from, to, names] of [
+        [fixture.current, 'conversation_current_1', 'conversation_current_2', ['relocation_new_send', 'relocation_roundtrip_send']],
+        [existing, 'conversation_existing_1', 'conversation_current_1', ['relocation_existing_send']]
+      ]) {
+        await withRuntime(dataSet, database => database.transaction([
+          repo('Turn').insert({ id: `${from}_turn`, conversation_id: from, status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+          repo('TurnTermination').insert({ id: `${from}_termination`, turn_id: `${from}_turn`, terminal_status: 'completed', reason: 'fixture', created_at: NOW })
+        ]));
+        await seedCollaborationMessages(dataSet, from, to, names);
+        await withRuntime(dataSet, database => database.transaction(names.flatMap((name, index) => {
+          const row = { id: `${name}_timeline`, conversation_id: from, message_id: name,
+            predecessor_message_id: `${from}_message`, predecessor_message_seq: 1n,
+            exchange_seq: BigInt(index + 1), position_basis: 'committed', created_at: NOW };
+          const { exchange_seq, ...withoutSequence } = row;
+          const provenance = timelineImportProvenanceRow(repo('CollaborationSendTimelineLink').insertHistoricalTimelineImport(withoutSequence, {
+            sourceDataSetId: dataSet.binding.dataSetId, sourceRootInstanceId: dataSet.binding.rootInstanceId, sourceExchangeSeq: exchange_seq
+          }));
+          return [repo('CollaborationSendTimelineLink').insertHistoricalCopy(row),
+            // One source already carries the writer-generated edge; the other's edge is absent.
+            // Target-owned provenance must survive the same undo proof unchanged.
+            ...(name === 'relocation_new_send' ? [] : [repo('TimelineImportProvenance').insertHistoricalCopy(provenance)])];
+        })));
+      }
+    }
   }
   const pointer = path.join(base, 'pointer.json');
   const relocationId = randomUUID();

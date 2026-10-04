@@ -45,7 +45,7 @@ import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigrati
 import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, listActiveRuntimeHosts, withRuntimeDataRootAdmission, withRuntimeMaintenance
 } from './runtimeHostControl';
-import type { RelocationDigestWorkerResponse } from './runtimeDataRootRelocationWorker';
+import type { RelocationDigestWorkerResponse, RelocationHandleStateUpdate } from './runtimeDataRootRelocationWorker';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import { diskSpaceNeeds, knownDiskDevice } from './runtimeDataSetLargeMergeSpace';
@@ -544,11 +544,12 @@ type JournalEntry =
   | { op: 'received'; path: string; fingerprint: RuntimeDataSetFingerprint }
   /**
    * Written right before the merge into an existing receiving data set commits: the rows its one
-   * transaction inserts. An undo that finds the data set neither `before` nor `received` (e.g. killed
-   * between the commit and the 'received' entry) still goes ahead when removing exactly these rows
-   * gives back `before`: nobody else wrote there.
+   * transaction inserts and complete images of the local handle rows it updates. An undo that
+   * finds the data set neither `before` nor `received` (e.g. killed
+   * between the commit and the 'received' entry) still goes ahead when undoing exactly these
+   * changes gives back `before`, and every updated row still matches its after image.
    */
-  | { op: 'merging'; path: string; inserted: Array<[domain: string, id: string]> }
+  | { op: 'merging'; path: string; inserted: Array<[domain: string, id: string]>; updated: RelocationHandleStateUpdate[] }
   /** An existing directory: an undo removes every entry of it that is not in `keep`. */
   | { op: 'children'; path: string; keep: string[] };
 
@@ -1698,12 +1699,24 @@ async function mergeInto(
   return withRuntimeMaintenance(authority.expectedPaths(), async () => {
     const database = await RuntimeDatabase.open(authority, { hostBootId: `data-root-relocation-${randomUUID()}` });
     try {
-      // The rows the one transaction inserts are journaled before it commits (see JournalEntry 'merging').
+      // Journal every inserted row and exact handle-state update before the transaction commits.
       const relative = path.relative(target, runtimeDataRootPath);
       // Its one transaction commits durably (synchronous = FULL) before the relocation records it complete.
       return await mergeRuntimeDataSetIntoDatabase(sourcePaths, input, { configurationRootPath: target, database }, {
         migration: true, ...(options.linkFile ? { linkFile: options.linkFile } : {}),
-        beforeCommit: (inserted) => journal.append({ op: 'merging', path: relative, inserted: inserted.map(([domain, id]) => [domain, id]) })
+        beforeCommit: (inserted, updated) => journal.append({
+          op: 'merging', path: relative, inserted: inserted.map(([domain, id]) => [domain, id]),
+          updated: updated.map(({ before, after }) => {
+            const image = (row: Record<string, unknown>): Record<string, string | null> => Object.fromEntries(
+              Object.entries(row).map(([key, value]) => {
+                if (value !== null && typeof value !== 'string' && typeof value !== 'bigint') {
+                  throw new Error(`上下文目录行不能写入迁移日志：${key}`);
+                }
+                return [key, typeof value === 'bigint' ? value.toString() : value];
+              }));
+            return { before: image(before), after: image(after) };
+          })
+        })
       });
     } finally {
       await database.close();
@@ -2650,6 +2663,9 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
     const entry = value as Partial<JournalEntry> & { backup?: unknown; keep?: unknown; before?: unknown; fingerprint?: unknown } | null;
     const keep = entry?.keep;
     const fingerprint = (item: unknown): boolean => typeof (item as Partial<RuntimeDataSetFingerprint> | undefined)?.contentDigest === 'string';
+    const image = (row: unknown): boolean => !!row && typeof row === 'object' && !Array.isArray(row)
+      && Object.values(row).every(value => value === null || typeof value === 'string');
+    const updates = (entry as { updated?: unknown } | null)?.updated;
     const valid = !!entry && typeof entry.path === 'string' && (entry.op === 'entry'
       || (entry.op === 'children' && Array.isArray(keep) && keep.every((name) => typeof name === 'string'))
       || ((entry.op === 'replace' || entry.op === 'cas') && typeof entry.backup === 'string')
@@ -2659,13 +2675,18 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
       || (entry.op === 'received' && fingerprint(entry.fingerprint))
       || (entry.op === 'merging' && Array.isArray((entry as { inserted?: unknown }).inserted)
         && ((entry as { inserted: unknown[] }).inserted).every((row) => Array.isArray(row) && row.length === 2
-          && typeof row[0] === 'string' && typeof row[1] === 'string')));
+          && typeof row[0] === 'string' && typeof row[1] === 'string')
+        && (updates === undefined || (Array.isArray(updates)
+          && updates.every(update => update && image(update.before) && image(update.after))))));
     if (!valid) {
       throw new DataRootRelocationError('data-root-relocation-journal', `迁移日志里有无法识别的记录：${line}`);
     }
     requireRelative(entry!.path!);
     if (typeof entry!.backup === 'string') requireRelative(entry!.backup);
-    entries.push(entry as JournalEntry);
+    // Published journals predate local handle-state updates. Missing evidence means no updates
+    // may be undone, never permission to ignore those tables. Any unrecorded mutation still
+    // fails the complete before-digest check. An explicitly malformed field was rejected above.
+    entries.push(entry!.op === 'merging' ? { ...entry, updated: updates ?? [] } as JournalEntry : entry as JournalEntry);
   }
   return entries;
 }
@@ -2675,7 +2696,7 @@ type ReceivingCheck = { kind: 'unchanged' } | { kind: 'changed'; reason: string 
 /**
  * Whether the receiving data set may still be undone: it is what the relocation left there (its
  * 'received' journal entry), or what it was before (an existing one's 'database' entry; also what a
- * restore that already happened put back), or exactly `before` plus the rows the merge journaled
+ * restore that already happened put back), or exactly `before` plus the inserts and updates journaled
  * before its commit ('merging': e.g. killed between the commit and the 'received' entry). Otherwise
  * someone else wrote there since ('changed'). An existing data set that cannot be read right now is
  * 'unreadable': nothing is decided, the next attempt reads it again. A fresh root of this relocation
@@ -2714,7 +2735,7 @@ async function receivingChangedSince(target: string, marker: RelocationMarker): 
   if (received && sameRuntimeDataSetFingerprint(received.fingerprint, current)) return { kind: 'unchanged' };
   if (database && merging && current.dataSetId === database.before.dataSetId && current.rootInstanceId === database.before.rootInstanceId) {
     try {
-      if (await digestWithoutRows(candidate, merging.inserted) === database.before.contentDigest) return { kind: 'unchanged' };
+      if (await digestWithoutRows(candidate, merging.inserted, merging.updated) === database.before.contentDigest) return { kind: 'unchanged' };
     } catch (error) {
       // The check itself did not run (a defect of this build, e.g. its worker missing from the
       // package): never taken for a read that may pass, which would be retried forever.
@@ -2726,19 +2747,21 @@ async function receivingChangedSince(target: string, marker: RelocationMarker): 
 }
 
 /**
- * The content digest of a data set without the given rows, on a private copy in a worker. A read of
+ * The content digest after undoing the journaled inserts/updates on a private copy in a worker.
+ * An updated row differing from its exact after image returns null (a later write). A read of
  * the copy that fails is the worker's answer (`ok: false`); a worker that could not start (its file
  * missing, MODULE_NOT_FOUND) or ended without an answer (an uncaught error, an abnormal exit) is a
  * defect of this build: 'data-root-relocation-check-worker-failed' (see isCheckWorkerFailure).
  */
-async function digestWithoutRows(candidate: VscodeRuntimeDataSetCandidate, inserted: Array<[string, string]>): Promise<string> {
+async function digestWithoutRows(candidate: VscodeRuntimeDataSetCandidate, inserted: Array<[string, string]>,
+  updated: RelocationHandleStateUpdate[]): Promise<string | null> {
   const copy = await copyRuntimeDataSetDatabase(candidate, await requireCompleteRuntimeDataSet(candidate));
   try {
-    return await new Promise<string>((resolve, reject) => {
+    return await new Promise<string | null>((resolve, reject) => {
       let settled = false;
       let worker: Worker;
       try {
-        worker = new Worker(path.join(__dirname, 'runtimeDataRootRelocationWorker.js'), { workerData: { databasePath: copy.databasePath, inserted } });
+        worker = new Worker(path.join(__dirname, 'runtimeDataRootRelocationWorker.js'), { workerData: { databasePath: copy.databasePath, inserted, updated } });
       } catch (error) {
         reject(checkWorkerFailure(error));
         return;
