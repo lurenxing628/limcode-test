@@ -86,7 +86,7 @@ import {
 } from './currentTurnTaskProjection';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
 import { CLAUDE_TURN_SCOPED_REMINDER_DELIVERY, claudeTurnScopedRemindersEnabled } from './turnReminderProjection';
-import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
+import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryKeysetCursor } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { orderRuntimeDeliveriesForInjection } from './runtimeDeliveryOrder';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -413,6 +413,7 @@ export type OpenTaskCompletionAction = 'complete' | 'continue_once' | 'complete_
 
 const MESSAGE_CONTENT_TYPE = 'application/vnd.limcode.message+json';
 const RUNTIME_STATUS_RECIPE_LIMIT = 32;
+const REQUEST_HISTORY_PAGE_SIZE = 32;
 const OPEN_TASK_COMPLETION_CHECK_KIND = 'open_task_completion_check';
 const OPEN_TASK_COMPLETION_CHECK_CARD = [
   '[Open Task Completion Check — system continuation, not a new user instruction]',
@@ -1439,15 +1440,9 @@ export class ReliableAgentLoop {
     effectiveEffort?: string;
     pendingConfigurationUpdate?: { effort: string };
   } | undefined> {
-    const turns = (await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId }))
-      .sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)));
-    for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
-      const requests = (await listAllDomainRows(this.database, 'ModelRequest', {
-        turn_id: requireId(turns[turnIndex].id, 'Turn.id')
-      })).sort((left, right) => compareInteger(right.request_seq, left.request_seq));
-      for (const request of requests) {
-        const recipe = (await this.readModelRequestRecipes([request])).get(requireId(request.id, 'ModelRequest.id'));
-        if (!recipe || recipe.kind !== 'reliable-agent-turn') continue;
+    for await (const turn of this.readNewestHistoryRows('Turn', conversationId)) {
+      for await (const { request, recipe } of this.readNewestModelRequestRecipes(requireId(turn.id, 'Turn.id'))) {
+        if (recipe.kind !== 'reliable-agent-turn') continue;
         if (request.provider_id !== providerId || request.model_id !== modelId
           || asRecord(recipe.nativeResponses) === undefined) return undefined;
         const reasoning = asRecord(recipe.nativeReasoning);
@@ -2713,13 +2708,10 @@ export class ReliableAgentLoop {
   }
 
   private async readNativeErrorRecoveryBudget(turnId: string): Promise<{ failures: number; modelOutputRepair: boolean }> {
-    const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
-      .sort((left, right) => compareInteger(right.request_seq, left.request_seq));
-    const recipes = await this.readModelRequestRecipes(requests);
     let failures = 0;
     let modelOutputRepair = false;
-    for (const request of requests) {
-      if (recipes.get(requireId(request.id, 'ModelRequest.id'))?.kind !== 'reliable-agent-turn') continue;
+    for await (const { request, recipe } of this.readNewestModelRequestRecipes(turnId)) {
+      if (recipe.kind !== 'reliable-agent-turn') continue;
       if (request.terminal_state === 'completed' || request.status !== 'terminal') break;
       const stats = asRecord(request.stream_stats_json);
       const failure = asRecord(stats?.failure);
@@ -3128,14 +3120,11 @@ export class ReliableAgentLoop {
     if (request.status !== 'terminal' || request.terminal_state === 'completed'
       || asRecord(asRecord(request.stream_stats_json)?.failure)?.code !== 'CONTEXT_WINDOW_EXCEEDED'
       || !this.compressionCoordinator.recoverProviderContextOverflow) return false;
-    const requests = (await listAllDomainRows(this.database, 'ModelRequest', { turn_id: turnId }))
-      .sort((left, right) => compareInteger(right.request_seq, left.request_seq));
     // Paid repair is bounded across restart, but a genuinely successful ordinary round resets
     // the consecutive-failure budget. A long productive Turn may need compression again later.
-    const recipes = await this.readModelRequestRecipes(requests);
     let failures = 0;
-    for (const candidate of requests) {
-      if (recipes.get(requireId(candidate.id, 'ModelRequest.id'))?.kind !== 'reliable-agent-turn') continue;
+    for await (const { request: candidate, recipe } of this.readNewestModelRequestRecipes(turnId)) {
+      if (recipe.kind !== 'reliable-agent-turn') continue;
       if (candidate.terminal_state === 'completed') break;
       if (asRecord(asRecord(candidate.stream_stats_json)?.failure)?.code === 'CONTEXT_WINDOW_EXCEEDED') failures += 1;
     }
@@ -3246,7 +3235,52 @@ export class ReliableAgentLoop {
     return recipe;
   }
 
-  /** Preserves the full-history recipe audit while collapsing its SQLite and CAS round trips. */
+  /**
+   * Tail readers stop at their semantic boundary without loading the complete Turn or request
+   * history. Both orderings use existing owner-prefixed indexes; the id tie-breaker preserves
+   * newest-first ordering even when several Turns share a creation timestamp.
+   */
+  private async *readNewestHistoryRows(domain: 'Turn' | 'ModelRequest', ownerId: string): AsyncGenerator<DomainRow> {
+    const repository = DOMAIN_REPOSITORIES.domain(domain);
+    const column = domain === 'Turn' ? 'created_at' : 'request_seq';
+    const where = domain === 'Turn' ? { conversation_id: ownerId } : { turn_id: ownerId };
+    let keyset: RepositoryKeysetCursor | undefined;
+    while (true) {
+      const snapshot = await this.database.snapshot([repository.list({
+        where,
+        orderBy: { column, direction: 'desc' },
+        ...(keyset ? { keyset } : {}),
+        limit: REQUEST_HISTORY_PAGE_SIZE
+      })]);
+      const page = rows(snapshot.snapshot[0]);
+      for (const row of page) yield row;
+      if (page.length < REQUEST_HISTORY_PAGE_SIZE) return;
+      const last = page[page.length - 1];
+      keyset = {
+        column,
+        value: domain === 'Turn'
+          ? requireText(last.created_at, 'Turn.created_at')
+          : requirePositiveInteger(last.request_seq, 'ModelRequest.request_seq'),
+        id: requireId(last.id, `${domain}.id`),
+        direction: 'before'
+      };
+    }
+  }
+
+  /** Decode only visited recipes, including compression candidates before an ordinary boundary. */
+  private async *readNewestModelRequestRecipes(turnId: string): AsyncGenerator<{
+    request: DomainRow;
+    recipe: { [key: string]: PlainJsonValue };
+  }> {
+    for await (const request of this.readNewestHistoryRows('ModelRequest', turnId)) {
+      const requestId = requireId(request.id, 'ModelRequest.id');
+      const recipe = (await this.readModelRequestRecipes([request])).get(requestId);
+      if (!recipe) throw new Error(`ModelRequest ${requestId} recipe batch lost its request.`);
+      yield { request, recipe };
+    }
+  }
+
+  /** Batches only the selected recipes; full recovery audits select their entire history. */
   private async readModelRequestRecipes(
     requests: readonly DomainRow[]
   ): Promise<Map<string, { [key: string]: PlainJsonValue }>> {
