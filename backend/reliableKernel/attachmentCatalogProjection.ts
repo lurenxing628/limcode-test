@@ -1,6 +1,7 @@
 import { attachmentSourceBelongsToConversation } from './attachmentProjectionEvidence';
 import type { AttachmentCatalogEntry } from '../../shared/protocol';
 import {
+  AttachmentCatalogAccumulator,
   mergeAttachmentCatalog,
   normalizeAttachmentCatalogState,
   type AttachmentCatalogPlacement,
@@ -64,13 +65,26 @@ export class PreparedAttachmentCatalogProjection {
     end: number,
     additionalCatalog: readonly AttachmentCatalogEntry[]
   ): AttachmentCatalogState {
-    let catalog: AttachmentCatalogEntry[] = [];
+    const accumulated = new AttachmentCatalogAccumulator();
+    const append = (entries: readonly AttachmentCatalogEntry[]): ReadonlySet<string> => {
+      const addedIds = new Set<string>();
+      for (const candidate of entries) {
+        const addedId = accumulated.add(candidate);
+        if (addedId !== undefined) addedIds.add(addedId);
+      }
+      return addedIds;
+    };
+    // Match membership before each append, including repeated/noncanonical input ids. Keep
+    // raw deltas for the final state normalizer's validation order and independent copies.
+    const deltaFrom = (entries: readonly AttachmentCatalogEntry[], addedIds: ReadonlySet<string>): AttachmentCatalogEntry[] =>
+      entries.filter((entry) => !accumulated.has(entry.attachmentId) || addedIds.has(entry.attachmentId));
     const placements: AttachmentCatalogPlacement[] = [];
     for (let index = start; index < end; index += 1) {
       const segment = this.segments[index];
-      const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
-      catalog = mergeAttachmentCatalog(catalog, segment.catalog);
+      const addedIds = append(segment.catalog);
       if (segment.segmentKind === 'compression') {
+        // A checkpoint owns this prefix array; later appends must not extend it.
+        const catalog = accumulated.snapshot();
         if (catalog.length > 0) {
           placements.push({
             kind: 'attachment_catalog_checkpoint',
@@ -80,7 +94,7 @@ export class PreparedAttachmentCatalogProjection {
         }
         continue;
       }
-      const delta = segment.catalog.filter((entry) => !previousIds.has(entry.attachmentId));
+      const delta = deltaFrom(segment.catalog, addedIds);
       if (delta.length > 0) {
         placements.push({
           kind: 'attachment_catalog_delta',
@@ -89,14 +103,12 @@ export class PreparedAttachmentCatalogProjection {
         });
       }
     }
-    const previousIds = new Set(catalog.map((entry) => entry.attachmentId));
-    catalog = mergeAttachmentCatalog(catalog, additionalCatalog);
-    const currentTurnDelta = additionalCatalog.filter((entry) => !previousIds.has(entry.attachmentId));
+    const currentTurnDelta = deltaFrom(additionalCatalog, append(additionalCatalog));
     if (currentTurnDelta.length > 0) {
       placements.push({ kind: 'current_turn_delta', entries: currentTurnDelta });
     }
     // Normalization also gives each caller independent mutable result objects.
-    return normalizeAttachmentCatalogState({ catalog, placements }, 'projected attachmentCatalogState');
+    return normalizeAttachmentCatalogState({ catalog: accumulated.snapshot(), placements }, 'projected attachmentCatalogState');
   }
 }
 

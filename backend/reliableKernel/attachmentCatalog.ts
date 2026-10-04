@@ -74,29 +74,45 @@ export function collectAttachmentCatalogFromStoredItems(
   }));
 }
 
+/** One reduction's normalized entries, retained in first-model-visible-appearance order. */
+export class AttachmentCatalogAccumulator {
+  private readonly byId = new Map<string, AttachmentCatalogEntry>();
+
+  /** Returns the normalized id only when this candidate first enters the catalog. */
+  public add(candidate: AttachmentCatalogEntry): string | undefined {
+    const entry = normalizeEntry(candidate, 'attachmentCatalog entry');
+    const existing = this.byId.get(entry.attachmentId);
+    if (existing) {
+      if (existing.name !== entry.name
+        || existing.mimeType !== entry.mimeType
+        || existing.sizeBytes !== entry.sizeBytes) {
+        throw new Error(`Attachment catalog metadata changed for immutable attachment ${entry.attachmentId}.`);
+      }
+      return undefined;
+    }
+    this.byId.set(entry.attachmentId, entry);
+    return entry.attachmentId;
+  }
+
+  public has(attachmentId: string): boolean {
+    return this.byId.has(attachmentId);
+  }
+
+  /** Copies the prefix array; adding later entries never mutates an earlier snapshot. */
+  public snapshot(): AttachmentCatalogEntry[] {
+    return [...this.byId.values()];
+  }
+}
+
 /** Merges catalogs in first-model-visible-appearance order and rejects immutable metadata drift. */
 export function mergeAttachmentCatalog(
   ...catalogs: ReadonlyArray<readonly AttachmentCatalogEntry[]>
 ): AttachmentCatalogEntry[] {
-  const merged: AttachmentCatalogEntry[] = [];
-  const byId = new Map<string, AttachmentCatalogEntry>();
+  const accumulated = new AttachmentCatalogAccumulator();
   for (const catalog of catalogs) {
-    for (const candidate of catalog) {
-      const entry = normalizeEntry(candidate, 'attachmentCatalog entry');
-      const existing = byId.get(entry.attachmentId);
-      if (existing) {
-        if (existing.name !== entry.name
-          || existing.mimeType !== entry.mimeType
-          || existing.sizeBytes !== entry.sizeBytes) {
-          throw new Error(`Attachment catalog metadata changed for immutable attachment ${entry.attachmentId}.`);
-        }
-        continue;
-      }
-      byId.set(entry.attachmentId, entry);
-      merged.push(entry);
-    }
+    for (const candidate of catalog) accumulated.add(candidate);
   }
-  return merged;
+  return accumulated.snapshot();
 }
 
 export function normalizeAttachmentCatalog(
@@ -144,8 +160,9 @@ export function normalizeAttachmentCatalogState(
     }
 
     if (kind === 'attachment_catalog_checkpoint') {
+      const checkpointIds = new Set(entries.map((entry) => entry.attachmentId));
       for (const attachmentId of active.keys()) {
-        if (!entries.some((entry) => entry.attachmentId === attachmentId)) {
+        if (!checkpointIds.has(attachmentId)) {
           throw new Error(`${label}.placements[${index}] checkpoint drops active attachment ${attachmentId}.`);
         }
       }
