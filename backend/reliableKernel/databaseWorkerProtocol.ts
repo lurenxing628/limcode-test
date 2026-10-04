@@ -1,3 +1,4 @@
+import type { NativePendingWorkInput, NativePendingToolCall, NativeSteeringInFlightEntry } from './nativeWorkTypes';
 import type { AttachmentScopeCacheCounters } from './attachmentProjectionScopeCache';
 import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
 import type { RootBinding, RuntimeCommitResult, SnapshotBarrier } from './contracts';
@@ -326,6 +327,9 @@ export type DatabaseWorkerRequestPayload =
   /** `durable`: this commit is synced before the response (see RuntimeDatabase.transaction). */
   | { kind: 'transaction'; steps: RepositoryTransactionStep[]; durable?: true }
   | { kind: 'renewExecutionLease'; input: ExecutionLeaseRenewalInput }
+  | { kind: 'nativePendingWork'; input: NativePendingWorkInput }
+  | { kind: 'nativeSteeringInFlight'; conversationId: string }
+  | { kind: 'nativeAdmittedProviderCallIds'; conversationId: string; segmentIds: string[] }
   | { kind: 'snapshot'; reads: RepositoryRead[] }
   | { kind: 'attachmentProjectionSegments'; conversationId: string; segmentIds: string[] }
   | { kind: 'attachmentProjectionLinks'; revisionIds: string[] }
@@ -437,7 +441,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

@@ -99,7 +99,6 @@ import {
   type NativeSteeringReceipt,
   type NativeSteeringUpdate
 } from './nativeSteering';
-import { TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION } from './nativeToolFacts';
 import { foldNativeResponseMetrics, parseNativeResponseMetrics, parseNativeResponseTiming } from './nativeResponseMetrics';
 import type { AttachmentIngestService } from './attachmentIngest';
 
@@ -942,7 +941,7 @@ export class ModelProviderControlPlane {
       'ModelRequest recipe.attachmentCatalogState'
     );
     const nativeAdmittedCallIds = isRecord(recipe) && isRecord(recipe.nativeResponses)
-      ? await this.listNativeAdmittedProviderCallIds(contextConversationId)
+      ? await this.listNativeAdmittedProviderCallIds(contextConversationId, providerSegments)
       : undefined;
     const providerContext = providerSegments.map((segment) => ({
       segmentId: segment.segmentId,
@@ -2902,39 +2901,15 @@ export class ModelProviderControlPlane {
     };
   }
 
-  /** Every durably native-admitted provider call id of the Conversation, in ToolCall order. */
-  private async listNativeAdmittedProviderCallIds(conversationId: string): Promise<readonly string[]> {
-    const turns = await listAllDomainRows(this.database, 'Turn', { conversation_id: conversationId });
-    const providerCallIds: string[] = [];
-    for (const turn of turns) {
-      const calls = await listAllDomainRows(this.database, 'ToolCall', {
-        turn_id: requireId(turn.id, 'Turn.id')
-      });
-      if (calls.length === 0) continue;
-      const snapshot = await this.database.snapshot(calls.flatMap((call) => [
-        DOMAIN_REPOSITORIES.domain('ToolCallEvent').list({
-          where: {
-            tool_call_id: requireId(call.id, 'ToolCall.id'),
-            event_kind: TOOL_CALL_EVENT_KIND_NATIVE_ADMISSION
-          },
-          limit: 1
-        }),
-        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({
-          where: { tool_call_id: requireId(call.id, 'ToolCall.id') },
-          limit: 1
-        })
-      ]));
-      for (let index = 0; index < calls.length; index += 1) {
-        const events = rows(snapshot.snapshot[index * 2]);
-        if (events.length === 0) continue;
-        const links = rows(snapshot.snapshot[index * 2 + 1]);
-        const providerCallId = links[0]?.provider_call_id;
-        if (typeof providerCallId === 'string' && providerCallId.length > 0) {
-          providerCallIds.push(providerCallId);
-        }
-      }
-    }
-    return providerCallIds;
+  /** Admission is needed only for calls carried by this already materialized provider window. */
+  private async listNativeAdmittedProviderCallIds(
+    conversationId: string,
+    segments: readonly MaterializedContextSegment[]
+  ): Promise<readonly string[]> {
+    const segmentIds = segments.filter((segment) => segment.segmentKind === 'tool_pair')
+      .map((segment) => segment.segmentId);
+    if (segmentIds.length === 0) return [];
+    return (await this.database.nativeAdmittedProviderCallIds(conversationId, segmentIds)).snapshot;
   }
 
   private async requireDomain(domain: string, id: string): Promise<DomainRow> {

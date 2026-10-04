@@ -1,3 +1,4 @@
+import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
 import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
 import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
 import { projectTimelineLinkRecord } from './clientTimelineHistory';
@@ -375,6 +376,17 @@ async function start(): Promise<void> {
           ? readAttachmentScopeSnapshot(reader, writer, attachmentScopeCache,
             () => assertDatabaseBinding(reader, data.binding), read)
           : reader.transaction(() => { assertDatabaseBinding(reader, data.binding); return read(); })();
+        respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
+        return;
+      }
+      if (request.kind === 'nativePendingWork' || request.kind === 'nativeSteeringInFlight'
+        || request.kind === 'nativeAdmittedProviderCallIds') {
+        const snapshot = reader.transaction(() => {
+          assertDatabaseBinding(reader, data.binding);
+          if (request.kind === 'nativePendingWork') return readNativePendingWork(reader, request.input);
+          if (request.kind === 'nativeSteeringInFlight') return readNativeSteeringInFlightSnapshot(reader, request.conversationId);
+          return readNativeAdmittedProviderCallIds(reader, request.conversationId, request.segmentIds);
+        })();
         respond({ type: 'response', id: request.id, ok: true, result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
         return;
       }

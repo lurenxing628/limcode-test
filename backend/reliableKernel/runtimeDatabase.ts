@@ -1,3 +1,4 @@
+import type { NativePendingToolCall, NativePendingWorkInput, NativeSteeringInFlightEntry } from './nativeWorkTypes';
 import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
 import { createHash, randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
@@ -390,6 +391,20 @@ export class RuntimeDatabase {
   private assertMaintenanceInstance(): void {
     if (!this.maintenance) throw new Error('Maintenance transactions run only on a Runtime database opened for maintenance.');
     if (this.commitListeners.size > 0) throw new Error('Maintenance transactions run only on a Runtime database without commit listeners.');
+  }
+
+  /** Conversation-scoped native facts, validated and filtered in one worker read snapshot. */
+  public nativePendingWork(input: NativePendingWorkInput): Promise<SnapshotBarrier<NativePendingToolCall[]>> {
+    return this.request({ kind: 'nativePendingWork', input });
+  }
+
+  public nativeSteeringInFlight(conversationId: string): Promise<SnapshotBarrier<NativeSteeringInFlightEntry[]>> {
+    return this.request({ kind: 'nativeSteeringInFlight', conversationId });
+  }
+
+  /** Only native admissions referenced by this provider Context window. */
+  public nativeAdmittedProviderCallIds(conversationId: string, segmentIds: readonly string[]): Promise<SnapshotBarrier<string[]>> {
+    return this.request({ kind: 'nativeAdmittedProviderCallIds', conversationId, segmentIds: [...segmentIds] });
   }
 
   public async snapshot(
@@ -1197,6 +1212,7 @@ function isRuntimeTransactionAssertionError(error: unknown): boolean {
 function databaseMetricRequestKind(
   kind: DatabaseWorkerRequestPayload['kind']
 ): RuntimeDatabaseMetricRequestKind {
+  if (kind === 'nativePendingWork' || kind === 'nativeSteeringInFlight' || kind === 'nativeAdmittedProviderCallIds') return 'snapshot';
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
   // The conversation pending-work probe, the domain row count and the carried-work inventory are one

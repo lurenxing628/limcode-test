@@ -1,3 +1,4 @@
+import { NATIVE_STEERING_IN_FLIGHT_STATES, type NativeSteeringInFlightEntry } from './nativeWorkTypes';
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
 import {
@@ -23,14 +24,7 @@ export const NATIVE_STEER_INPUT_KIND = 'native_steer';
 /** MessageTurnLink.role for the visible steering user Message; never a second 'input' link. */
 export const NATIVE_STEER_MESSAGE_TURN_ROLE = 'native_steer';
 
-/** States in which the logical native request is still outstanding for this submission. */
-export const NATIVE_STEERING_IN_FLIGHT_STATES: readonly OpenAIResponsesSteeringState[] = Object.freeze([
-  'queued',
-  'sent',
-  'accepted',
-  'waiting_for_input',
-  'continuing'
-]);
+export { NATIVE_STEERING_IN_FLIGHT_STATES } from './nativeWorkTypes';
 
 export function isNativeSteeringInFlightState(state: string): boolean {
   return (NATIVE_STEERING_IN_FLIGHT_STATES as readonly string[]).includes(state);
@@ -445,12 +439,7 @@ export class NativeSteeringStore {
   }
 }
 
-export interface NativeSteeringInFlightEntry {
-  pendingInputId: string;
-  turnId: string;
-  state: OpenAIResponsesSteeringState;
-  updatedAt: string;
-}
+export type { NativeSteeringInFlightEntry } from './nativeWorkTypes';
 
 /**
  * In-flight steering reader for the compaction/switch guards. Historical terminal receipts
@@ -460,26 +449,7 @@ export async function readNativeSteeringInFlight(
   database: RuntimeDatabase,
   conversationIdInput: string
 ): Promise<NativeSteeringInFlightEntry[]> {
-  const conversationId = requireId(conversationIdInput, 'conversationId');
-  const turns = await listAllDomainRows(database, 'Turn', { conversation_id: conversationId });
-  const entries: NativeSteeringInFlightEntry[] = [];
-  for (const turn of turns) {
-    const rows = await listAllDomainRows(database, 'PendingTurnInput', {
-      turn_id: requireId(turn.id, 'Turn.id'),
-      input_kind: NATIVE_STEER_INPUT_KIND
-    });
-    for (const row of rows) {
-      const state = String(row.state) as OpenAIResponsesSteeringState;
-      if (!isNativeSteeringInFlightState(state)) continue;
-      entries.push({
-        pendingInputId: requireId(row.id, 'PendingTurnInput.id'),
-        turnId: requireId(row.turn_id, 'PendingTurnInput.turn_id'),
-        state,
-        updatedAt: String(row.updated_at)
-      });
-    }
-  }
-  return entries;
+  return (await database.nativeSteeringInFlight(requireId(conversationIdInput, 'conversationId'))).snapshot;
 }
 
 function nativeSteeringReceipt(row: DomainRow, envelope: NativeSteerEnvelope): NativeSteeringReceipt {
