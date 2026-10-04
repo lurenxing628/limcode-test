@@ -1461,9 +1461,10 @@ export class FileMutationDispatcher {
             }
             const current = await handle.readFile({ signal });
             const afterRead = await handle.stat({ bigint: true });
+            const currentDigest = digestBytes(current);
             if (!sameFileState(stat, afterRead)
-              || digestBytes(current) !== member.baseDigest) {
-              return memberObservation(member, 'conflict', digestBytes(current), 'File target changed before replacement.');
+              || currentDigest !== member.baseDigest) {
+              return memberObservation(member, 'conflict', currentDigest, 'File target changed before replacement.');
             }
             await resolveBoundedTarget(this.resolveBoundary, member);
             const pathStat = await fs.lstat(resolved, { bigint: true });
@@ -1520,11 +1521,11 @@ export class FileMutationDispatcher {
     const id = nullableId(member.targetContentObjectId, 'targetContentObjectId');
     if (!id) throw new Error(`${member.operation} requires target content.`);
     const metadata = await this.requireExisting('ContentObject', id) as ContentObjectMetadata;
-    const bytes = await this.contentStore.read(metadata);
-    if (createHash('sha256').update(bytes).digest('hex') !== member.targetDigest) {
+    if (metadata.sha256 !== member.targetDigest) {
       throw new Error('Target ContentObject digest does not match FileChangeSetMember.targetDigest.');
     }
-    return bytes;
+    // The store verifies the target bytes against this ContentObject before returning them.
+    return this.contentStore.read(metadata);
   }
 
   private async inspectActual(member: FileEffectRequest['members'][number]): Promise<PathInspection> {

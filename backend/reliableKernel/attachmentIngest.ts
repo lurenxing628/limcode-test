@@ -223,17 +223,14 @@ export class AttachmentIngestService {
       uniqueEmbedded.forEach((entry, index) => { entry.prepared = prepared[index]; });
     }
 
-    const scope = createHash('sha256')
-      .update(context.references.map((entry) => `${entry.attachmentId}:${entry.position}`).join('|'))
-      .digest('hex')
-      .slice(0, 12);
     const storageSteps: RepositoryTransactionStep[] = [];
     const preparedObjects = uniqueEmbedded.map((entry) => requirePrepared(entry.prepared, entry.attachmentId));
-    storageSteps.push(...preparedContentObjectSteps(preparedObjects, `attc_${scope}`));
+    // Each savepoint is released before the next step, including across concatenated admissions.
+    storageSteps.push(...preparedContentObjectSteps(preparedObjects, 'attachment_content'));
     uniqueEmbedded.forEach((entry, index) => {
       const prepared = requirePrepared(entry.prepared, entry.attachmentId);
       storageSteps.push(
-        savepoint(`atti_${scope}_${index}`, [
+        savepoint(`attachment_identity_${index}`, [
           DOMAIN_REPOSITORIES.domain('Attachment').insert({
             id: entry.attachmentId,
             sha256: entry.sha256,
@@ -478,12 +475,12 @@ export class AttachmentIngestService {
     if (attachment.storage_mode !== 'cas') throw new Error(`Attachment ${attachmentId} is not CAS-backed.`);
     const contentObjectId = requireId(attachment.content_object_id, 'Attachment.content_object_id');
     const metadata = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
-    const bytes = await this.contentStore.read(metadata);
     if (
-      createHash('sha256').update(bytes).digest('hex') !== attachment.sha256
-      || BigInt(bytes.byteLength) !== requireBigInt(attachment.byte_length, 'Attachment.byte_length')
+      metadata.sha256 !== attachment.sha256
+      || metadata.byte_length !== requireBigInt(attachment.byte_length, 'Attachment.byte_length')
     ) throw new Error(`Attachment ${attachmentId} CAS content does not match its immutable metadata.`);
-    return bytes;
+    // The store verifies these bytes against the ContentObject digest and length.
+    return this.contentStore.read(metadata);
   }
 
   public async managedReference(attachmentIdInput: string): Promise<InlineDataPart> {
