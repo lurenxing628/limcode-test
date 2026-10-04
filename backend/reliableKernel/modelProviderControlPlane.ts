@@ -2,6 +2,7 @@ import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
 import { createHash } from 'node:crypto';
+import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import { LocalExecutionRecoveryExhaustedError, markRestoredTerminalFailure, retryLocalExecution } from './localExecutionRecovery';
 import { compressionExecutionMetadata, readProviderRequestFailure, safeProviderFailureMessage,
   type CompressionRequestPurpose, type CompressionRecoveryDecision, type ProviderRequestFailureFact
@@ -2780,13 +2781,17 @@ export class ModelProviderControlPlane {
     for (let offset = 0; offset < missing.length; offset += HISTORICAL_REMINDER_READ_BATCH) {
       const ids = missing.slice(offset, offset + HISTORICAL_REMINDER_READ_BATCH);
       const snapshot = await this.database.snapshot(ids.map((id) => DOMAIN_REPOSITORIES.domain('ContentObject').get(id)));
-      const metadata = snapshot.snapshot.map((row, index) => requireRow(row, `ModelRequest recipe ContentObject ${ids[index]}`));
-      const bytes = await this.contentStore.readMany(metadata.map(asContentObjectMetadata));
-      ids.forEach((id, index) => {
-        const historical = parseHistoricalRequestFacts(bytes[index], id);
-        facts.set(id, historical);
-        this.historicalTurnReminders.set(id, historical);
-      });
+      const metadata = snapshot.snapshot.map((row, index) =>
+        asContentObjectMetadata(requireRow(row, `ModelRequest recipe ContentObject ${ids[index]}`)));
+      // Metadata batches are cheap; body batches must follow actual byte sizes. readMany briefly
+      // owns verified originals and returned copies, so never collect 200 fat recipes at once.
+      for (const range of historicalReminderBodyRanges(metadata)) {
+        await this.materializeHistoricalReminderBodyBatch(
+          ids.slice(range.start, range.end), metadata.slice(range.start, range.end), facts
+        );
+        // The helper has returned and dropped its body array before we yield or start another read.
+        await yieldToEventLoop();
+      }
     }
     const placedInputs = new Set<string>();
     const planned: Array<{
@@ -2845,6 +2850,23 @@ export class ModelProviderControlPlane {
           : {})
       };
     });
+  }
+
+  private async materializeHistoricalReminderBodyBatch(
+    ids: readonly string[],
+    metadata: readonly ContentObjectMetadata[],
+    facts: Map<string, HistoricalRequestFacts | null>
+  ): Promise<void> {
+    const bodies = await this.contentStore.readMany(metadata);
+    for (const id of ids) {
+      // Drop each consumed buffer from the batch immediately; cached facts retain scalar text only.
+      // Batches contain at most 32 objects, so shifting this small private array stays bounded.
+      const body = bodies.shift();
+      if (!body) throw new Error(`Historical reminder batch lost ModelRequest recipe ${id}.`);
+      const historical = parseHistoricalRequestFacts(body, id);
+      facts.set(id, historical);
+      this.historicalTurnReminders.set(id, historical);
+    }
   }
 
   private async replayCreation(
@@ -3277,7 +3299,32 @@ function estimateFullProviderContextFallback(request: FullProviderRequest): numb
   }, 0);
 }
 
+// Keep repository metadata queries batched independently of CAS body memory.
 const HISTORICAL_REMINDER_READ_BATCH = 200;
+const HISTORICAL_REMINDER_BODY_MAX_BYTES = 4n * 1024n * 1024n;
+const HISTORICAL_REMINDER_BODY_MAX_OBJECTS = 32;
+
+/** Ordered, bounded body windows. One oversized immutable object must be read alone, never truncated. */
+function* historicalReminderBodyRanges(
+  metadata: readonly ContentObjectMetadata[]
+): Generator<{ start: number; end: number }> {
+  let start = 0;
+  while (start < metadata.length) {
+    let end = start;
+    let bytes = 0n;
+    while (end < metadata.length && end - start < HISTORICAL_REMINDER_BODY_MAX_OBJECTS) {
+      const size = metadata[end].byte_length;
+      // Runtime ContentObject metadata uses bigint. Do not coerce malformed sizes or lose precision.
+      if (typeof size !== 'bigint' || size < 0n) throw new TypeError('Historical recipe byte_length must be a non-negative bigint.');
+      if (end > start && bytes + size > HISTORICAL_REMINDER_BODY_MAX_BYTES) break;
+      bytes += size;
+      end++;
+      if (bytes >= HISTORICAL_REMINDER_BODY_MAX_BYTES) break;
+    }
+    yield { start, end };
+    start = end;
+  }
+}
 const HISTORICAL_REMINDER_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
 /**
