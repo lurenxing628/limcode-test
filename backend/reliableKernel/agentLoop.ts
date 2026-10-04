@@ -344,6 +344,14 @@ interface FrozenCurrentTurnInputReference {
   reinject: boolean;
 }
 
+/** No model-visible Context or adapter survives the short-lived planning frame. */
+interface OrdinaryRequestPlanningFacts {
+  providerId: string;
+  modelId: string;
+  compressionAuthority: PlainJsonValue;
+  budget: ReturnType<ModelProviderControlPlane['planFullRequest']>;
+}
+
 interface CurrentTurnRequestState {
   reference?: FrozenCurrentTurnInputReference;
   compressionBoundaryId?: string;
@@ -649,7 +657,7 @@ export class ReliableAgentLoop {
               ...(recoveredRebase.freshConfigurationUpdate ? { freshConfigurationUpdate: recoveredRebase.freshConfigurationUpdate } : {})
             } } : {})
           });
-          let preview = await this.modelProvider.previewOrdinaryRequest({
+          let planning = await this.prepareOrdinaryRequestPlanning({
             turnId,
             settingsSnapshotContentObjectId,
             contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
@@ -657,11 +665,7 @@ export class ReliableAgentLoop {
             recipe: frozenRecipe,
             idempotencyKey
           });
-          let previewAdapter = await this.providers.resolve(preview.providerId);
-          if (previewAdapter.providerId !== preview.providerId) {
-            throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
-          }
-          let planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
+          let planningBudget = planning.budget;
           // Full-request tokenization is model-independent planning data. Compression admission is
           // level-triggered by the Provider-observed Context estimate; ordinary sending is never
           // rejected solely because this heuristic estimate is high.
@@ -686,7 +690,7 @@ export class ReliableAgentLoop {
               && compression.recoveryDecision) compressionDecision = compression.recoveryDecision;
             if (compression.status !== 'compressed') break;
             if (compression.capacityLimitedPrefix) {
-              const policy = frozenCompressionPolicy(preview.authoritySnapshot);
+              const policy = frozenCompressionPolicy(planning.compressionAuthority);
               if (!policy || !isStrictSingleSummaryPlan(policy.executionPlan)) {
                 throw new Error('Capacity continuation requires the frozen strict single-summary policy.');
               }
@@ -724,7 +728,7 @@ export class ReliableAgentLoop {
                   }
                 : {})
             });
-            preview = await this.modelProvider.previewOrdinaryRequest({
+            planning = await this.prepareOrdinaryRequestPlanning({
               turnId,
               settingsSnapshotContentObjectId,
               contextRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
@@ -732,11 +736,7 @@ export class ReliableAgentLoop {
               recipe: frozenRecipe,
               idempotencyKey
             });
-            previewAdapter = await this.providers.resolve(preview.providerId);
-            if (previewAdapter.providerId !== preview.providerId) {
-              throw new Error(`Provider registry returned ${previewAdapter.providerId} for ${preview.providerId}.`);
-            }
-            planningBudget = this.modelProvider.planFullRequest(preview, previewAdapter);
+            planningBudget = planning.budget;
             if (await this.terminateIfRequested(turnId, `round:${round}:after-capacity-compression`)) {
               return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
             }
@@ -753,7 +753,7 @@ export class ReliableAgentLoop {
             }, 'Request compression recovery decision');
           }
           if (readFrozenNativeCapabilities(requireRecord(frozenRecipe, 'Native request recipe'))) {
-            const compressionPolicy = frozenCompressionPolicy(preview.authoritySnapshot);
+            const compressionPolicy = frozenCompressionPolicy(planning.compressionAuthority);
             const nativeBudget: NativeLogicalRequestBudget = {
               planningInputCapacityTokens: planningBudget.planningInputCapacityTokens,
               compressionThresholdTokens: planningBudget.compressionThresholdTokens,
@@ -770,7 +770,7 @@ export class ReliableAgentLoop {
               const previousId = modelRequestIdFor(turnId,
                 `agent-loop:${turnId}:round:${(requestSequence - 1n).toString()}`);
               const previous = await this.maybeGet('ModelRequest', previousId);
-              if (previous && previous.provider_id === preview.providerId && previous.model_id === preview.modelId) {
+              if (previous && previous.provider_id === planning.providerId && previous.model_id === planning.modelId) {
                 const observed = await this.modelProvider.readNativeLatestResponseUsage(previousId);
                 const previousStream = asRecord(previous.stream_stats_json);
                 const sameStream = observed?.inputTokens !== undefined
@@ -795,8 +795,8 @@ export class ReliableAgentLoop {
           }
           await this.guardNativeModelSwitch(
             requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
-            preview.providerId,
-            preview.modelId
+            planning.providerId,
+            planning.modelId
           );
           const created = await this.modelProvider.createModelRequest({
             turnId,
@@ -1146,6 +1146,31 @@ export class ReliableAgentLoop {
         toolCallIds
       };
     }
+  }
+
+  /**
+   * The full preview is needed only for provider-aligned planning. Return its small continuation
+   * facts before awaiting compression, so the old full Context is not retained alongside the
+   * coordinator's materialized source and the compression Provider's separately built request.
+   */
+  private async prepareOrdinaryRequestPlanning(
+    command: Parameters<ModelProviderControlPlane['previewOrdinaryRequest']>[0]
+  ): Promise<OrdinaryRequestPlanningFacts> {
+    const preview = await this.modelProvider.previewOrdinaryRequest(command);
+    const adapter = await this.providers.resolve(preview.providerId);
+    if (adapter.providerId !== preview.providerId) {
+      throw new Error(`Provider registry returned ${adapter.providerId} for ${preview.providerId}.`);
+    }
+    const budget = this.modelProvider.planFullRequest(preview, adapter);
+    const compression = asRecord(preview.authoritySnapshot)?.compression;
+    return {
+      providerId: preview.providerId,
+      modelId: preview.modelId,
+      // Keep policy parsing in its original conditional branches: an unused malformed policy
+      // must not introduce a new eager error or retain the rest of the Authority/preview graph.
+      compressionAuthority: compression === undefined ? null : { compression: compression as PlainJsonValue },
+      budget
+    };
   }
 
   private async freezeOrdinaryRequestRecipe(input: {
