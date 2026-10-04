@@ -795,7 +795,11 @@ test('多进程：迁移执行期间重载的窗口在打开外壳里看到“�
   assert.equal(coordination.state, 'completed');
   const statuses = windows.events().filter((event) => event.name === 'W' && event.boot === 2 && event.event === 'opening-status')
     .map((event) => event.description);
-  assert.deepEqual(statuses, ['另一个窗口正在迁移数据目录，完成后自动打开；未发送的输入已保留。'], 'the shell text does not change while nothing but the time does');
+  const migrating = '另一个窗口正在迁移数据目录，完成后自动打开；未发送的输入已保留。';
+  const releasing = '正在等待其它 LimCode 窗口释放数据目录，完成后自动打开；未发送的输入已保留。';
+  // The activity marker can disappear before the final lock is released. That is one real
+  // phase transition, not an elapsed-time refresh; neither phase may emit duplicate updates.
+  assert.deepEqual(statuses, statuses.length === 1 ? [migrating] : [migrating, releasing]);
   const released = windows.events().find((event) => event.name === 'R' && event.event === 'locks-released').at;
   assert.ok(reopened.at >= released, 'opened only after the maintenance let go of the locks');
 });

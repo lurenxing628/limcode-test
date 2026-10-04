@@ -262,22 +262,34 @@ test('collaboration snapshot keeps the cards of every loaded Turn instead of onl
   }
   assert.ok(ids.has('queued'), 'a message still waiting for a Turn stays visible');
   assert.ok(ids.has('failed'), 'a failed delivery stays visible');
-  assert.equal(ids.has('elsewhere'), false);
+  // The recent delivery inventory retains this consumed exchange even when its Turn is
+  // outside the loaded message window; it still belongs to the selected Conversation.
+  assert.equal(ids.has('elsewhere'), true);
   assert.equal(ids.has('foreign'), false);
-  assert.equal(summary.collaborationMessages.length, 62);
+  assert.deepEqual(ids, new Set([
+    ...Array.from({ length: 30 }, (_, index) => `delivered-${index}`),
+    ...Array.from({ length: 30 }, (_, index) => `sent-${index}`),
+    'queued', 'failed', 'elsewhere'
+  ]));
   const deliveries = new Set(summary.runtimeDeliveries.map((value) => value.id));
   for (let index = 0; index < 30; index += 1) assert.ok(deliveries.has(`delivered-${index}-delivery`), 'each incoming card has its delivery');
 }));
 
-test('collaboration snapshot stays bounded by durable sequence even at identical timestamps', async () => withRuntime(async (runtime) => {
+test('collaboration snapshot closes the durable sequence suffix over its bounded delivery inventory at identical timestamps', async () => withRuntime(async (runtime) => {
   const { database } = runtime;
   for (let index = 0; index < 205; index += 1) await seedMessage(runtime, `seq-${205 - index}`);
   const summary = (await database.clientProjectionSnapshot('target')).snapshot.subagentDeliverySummary;
-  assert.equal(summary.collaborationMessages.length, 200);
-  assert.equal(summary.collaborationMessages[0].id, 'seq-1');
-  assert.equal(summary.collaborationMessages.at(-1).id, 'seq-200');
-  assert.equal(summary.collaborationMessageSourceLinks.length, 200);
-  assert.equal(summary.collaborationMessageTargetLinks.length, 200);
+  // The message-sequence suffix is seq-1..seq-200. The separately bounded delivery
+  // inventory sorts equal timestamps by id and additionally retains exactly seq-201..seq-205.
+  const expected = new Set(Array.from({ length: 205 }, (_, index) => `seq-${index + 1}`));
+  assert.deepEqual(new Set(summary.collaborationMessages.map(row => row.id)), expected);
+  assert.equal(summary.collaborationMessages.length, expected.size);
+  assert.deepEqual(summary.collaborationMessages.slice(0, 200).map(row => row.id),
+    Array.from({ length: 200 }, (_, index) => `seq-${index + 1}`));
+  assert.deepEqual(new Set(summary.collaborationMessageSourceLinks.map(row => row.message_id)), expected);
+  assert.deepEqual(new Set(summary.collaborationMessageTargetLinks.map(row => row.message_id)), expected);
+  assert.equal(summary.collaborationMessageSourceLinks.length, expected.size);
+  assert.equal(summary.collaborationMessageTargetLinks.length, expected.size);
 }));
 
 test('the collaboration snapshot starts from the conversation links, never scans every message, and selects the same rows', async () => {

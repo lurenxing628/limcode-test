@@ -1261,7 +1261,8 @@ async function sha256File(file: string): Promise<string> {
 }
 
 async function syncFile(file: string): Promise<void> {
-  const handle = await fs.open(file, 'r');
+  // These are this migration's own backup files. Windows FlushFileBuffers requires a writable handle.
+  const handle = await fs.open(file, 'r+');
   try { await handle.sync(); } finally { await handle.close(); }
 }
 

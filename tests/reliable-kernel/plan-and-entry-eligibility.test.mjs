@@ -88,6 +88,8 @@ test('复审 #1：计划审批“在新对话中执行”在不合格窗口只�
 });
 
 test('复审 #2：项目文件夹移动后，空闲对话在本窗口选择工作环境即可继续；新 Turn 由选中的工作环境定位', { timeout: 120000 }, async () => {
+  let markSendStarted;
+  const sendStarted = new Promise(resolve => { markSendStarted = resolve; });
   await runtimeFixture(async f => {
     const oldProject = { uri: Uri.file(path.join(f.root, 'project-old')).toString(), name: 'project-old' };
     const moved = Uri.file(path.join(f.root, 'project-renamed'));
@@ -115,7 +117,10 @@ test('复审 #2：项目文件夹移动后，空闲对话在本窗口选择工�
 
     const before = f.requests.length;
     const running = f.app.agentLoop.runInput(f.input('after-move'));
-    for (let waited = 0; f.requests.length === before && waited < 30_000; waited += 20) await new Promise((r) => setTimeout(r, 20));
+    // requests is recorded before async wire preparation. Wait for the send hook itself,
+    // and observe runInput immediately so fixture cleanup cannot create an unhandled rejection.
+    await Promise.race([sendStarted, running.then(() => { throw new Error('The Turn ended before its provider send started.'); })]);
+    assert.ok(f.requests.length > before);
     // While the Turn runs, its frozen chosen work environment places it here; the old project does not.
     assert.deepEqual(await evaluateConversationHostEligibility(dependencies, 'parent'), { eligible: true });
     f.releaseSend();
@@ -137,7 +142,7 @@ test('复审 #2：项目文件夹移动后，空闲对话在本窗口选择工�
     });
   }, {
     async send(_request, controls, f) {
-      await new Promise((resolve) => { f.releaseSend = resolve; });
+      await new Promise((resolve) => { f.releaseSend = resolve; markSendStarted(); });
       await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [{ text: 'done' }] } });
     }
   });

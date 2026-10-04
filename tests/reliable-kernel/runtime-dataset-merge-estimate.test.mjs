@@ -618,7 +618,10 @@ test('实测速率只按上下限换算独占阶段；读不懂的记录当作�
       await write(rate(sessionMs, modelMs));
       const scaled = await estimate(fixture, database);
       assert.deepEqual(scaled.sessionRate, { measuredAt: NOW, factor });
-      assert.ok(Math.abs(scaled.sources[0].sessionEstimateMs - source.sessionEstimateMs * factor) <= 1, `${factor}: ${scaled.sources[0].sessionEstimateMs}`);
+      // Each estimate rounds once after scaling the raw model. The rounded baseline has
+      // up to half a millisecond of error, which is itself multiplied by the rate.
+      assert.ok(Math.abs(scaled.sources[0].sessionEstimateMs - source.sessionEstimateMs * factor) <= (factor + 1) / 2,
+        `${factor}: ${scaled.sources[0].sessionEstimateMs}`);
       assert.deepEqual(scaled.sources[0].sessionEstimateRangeMs, unmeasuredRange(scaled.sources[0].sessionEstimateMs));
       assert.deepEqual([scaled.estimateMs, scaled.sessionEstimateMs], [scaled.sources[0].sessionEstimateMs, scaled.sources[0].sessionEstimateMs]);
       assert.deepEqual([scaled.sources[0].prepareEstimateMs, scaled.prepareEstimateMs], [source.prepareEstimateMs, plain.prepareEstimateMs], '准备阶段不换算');

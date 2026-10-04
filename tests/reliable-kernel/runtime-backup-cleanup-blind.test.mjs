@@ -452,9 +452,18 @@ async function downgradeToEpoch4(binding) {
     database.pragma('foreign_keys = OFF');
     database.exec('BEGIN IMMEDIATE');
     for (const schema of [...added].reverse()) database.exec(`DROP TABLE ${schema.table}`);
-    const dropManifest = database.prepare('DELETE FROM schema_manifest WHERE domain_key = ?');
-    for (const schema of added) dropManifest.run(schema.key);
-    database.prepare('UPDATE schema_manifest SET runtime_kernel_epoch = 4').run();
+    // Retained tables also gained indexes in epoch 6. Rebuild the exact published epoch-4
+    // indexes and manifest, as the preservation fixtures do, rather than relabeling current DDL.
+    const indexes = database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL");
+    for (const schema of kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS) {
+      for (const { name } of indexes.all(schema.table)) database.exec(`DROP INDEX "${name.replaceAll('"', '""')}"`);
+      schema.indexes.forEach((index, ordinal) => database.exec(kernel.createRuntimeDomainIndexSql(schema, index, ordinal)));
+    }
+    database.exec('DELETE FROM schema_manifest');
+    const manifestRow = database.prepare('INSERT INTO schema_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const schema of kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS) manifestRow.run(schema.key, schema.table, schema.schemaOwner, schema.repository, schema.codec,
+      JSON.stringify(schema.mutations), schema.client, schema.deletePolicy, schema.resetPolicy,
+      JSON.stringify(schema.indexes), kernel.domainSchemaDigest(schema), 4n);
     database.prepare('UPDATE root_binding SET runtime_kernel_epoch = 4 WHERE singleton = 1').run();
     database.exec('COMMIT');
     database.pragma('wal_checkpoint(TRUNCATE)');
