@@ -26,12 +26,25 @@ interface PreparedAttachmentSegment {
   readonly catalog: readonly AttachmentCatalogEntry[];
 }
 
-/** Call-scoped facts only: no database, projector caches, or attachment bodies are retained. */
+interface PreparedProjectionWeight { bytes: number; segments: number }
+const preparedProjectionWeights = new WeakMap<PreparedAttachmentCatalogProjection, PreparedProjectionWeight>();
+
+/** Immutable prepared facts only: no database, source-row caches, or attachment bodies are retained. */
 export class PreparedAttachmentCatalogProjection {
   public constructor(
     private readonly segments: readonly PreparedAttachmentSegment[],
     private readonly additionalCatalog: readonly AttachmentCatalogEntry[]
-  ) {}
+  ) {
+    const entryBytes = (entry: AttachmentCatalogEntry): number => 192
+      + 2 * (entry.attachmentId.length + entry.name.length + entry.mimeType.length);
+    preparedProjectionWeights.set(this, {
+      segments: segments.length,
+      bytes: 256 + segments.reduce((total, segment) => total + 160
+        + 2 * (segment.segmentId.length + segment.segmentKind.length)
+        + segment.catalog.reduce((sum, entry) => sum + entryBytes(entry), 0), 0)
+        + additionalCatalog.reduce((total, entry) => total + entryBytes(entry), 0)
+    });
+  }
 
   public projectState(): AttachmentCatalogState {
     return this.reduceRange(0, this.segments.length, this.additionalCatalog);
@@ -87,6 +100,95 @@ export class PreparedAttachmentCatalogProjection {
   }
 }
 
+// Live database identity only. Retain validated catalog facts, never source rows or CAS bodies.
+// These are optimization budgets: oversized preparations still use the complete original reader.
+const PREPARED_PROJECTION_CACHE_LIMITS = Object.freeze({
+  entries: 8, segments: 32_768, bytes: 8 * 1024 * 1024
+});
+const preparedProjectionCaches = new WeakMap<RuntimeDatabase, PreparedProjectionCache>();
+interface PreparedProjectionEntry extends PreparedProjectionWeight { value: PreparedAttachmentCatalogProjection }
+
+class PreparedProjectionCache {
+  private readonly entries = new Map<string, PreparedProjectionEntry>();
+  private bytes = 0;
+  private segments = 0;
+  private revision = 0;
+  private externalVersion?: string;
+
+  public constructor(private readonly database: RuntimeDatabase) {
+    database.onCommit(() => {
+      // Client change records omit client:none domains, including AttachmentLink and lineage.
+      // Every local commit must invalidate, even when changes is empty. The worker's external
+      // data_version deliberately does not change for its own writes.
+      this.clear();
+    });
+  }
+
+  public read(key: string, prepare: () => Promise<PreparedAttachmentCatalogProjection>): Promise<PreparedAttachmentCatalogProjection> {
+    const keyBytes = key.length * 2 + 128;
+    if (keyBytes > PREPARED_PROJECTION_CACHE_LIMITS.bytes) return prepare();
+    // Do not coalesce pending callers: each has its own freshness boundary, and a concurrent
+    // writer must not turn a waiter's nominal hit into reuse of an earlier unfenced result.
+    return this.readFenced(key, keyBytes, prepare);
+  }
+
+  private clear(): void {
+    this.entries.clear();
+    this.bytes = this.segments = 0;
+    this.revision++;
+  }
+
+  private synchronizeVersion(version: string): void {
+    if (version !== this.externalVersion) {
+      this.clear();
+      this.externalVersion = version;
+    }
+  }
+
+  private async readFenced(key: string, keyBytes: number,
+    prepare: () => Promise<PreparedAttachmentCatalogProjection>): Promise<PreparedAttachmentCatalogProjection> {
+    // This worker request revalidates the root binding, including on a cache hit or after close.
+    const version = await this.database.externalDataVersion();
+    this.synchronizeVersion(version);
+    const revision = this.revision;
+    const cached = this.entries.get(key);
+    // Never retry or conceal an error from the complete original ownership/lineage reader.
+    const value = cached?.value ?? await prepare();
+    const after = await this.database.externalDataVersion();
+    if (after !== version || revision !== this.revision) {
+      this.synchronizeVersion(after);
+      // A miss already ran the original reader: return its result without retaining it. A
+      // stale hit has not read current facts, so run that reader once without cache admission.
+      // Unrelated write churn therefore adds neither failures nor repeated full scans per call.
+      return cached ? prepare() : value;
+    }
+    const existing = this.entries.get(key);
+    if (existing) {
+      // Another independent miss may have filled this slot while this caller was reading.
+      this.entries.delete(key);
+      this.entries.set(key, existing);
+    } else {
+      const weight = preparedProjectionWeights.get(value)!;
+      const bytes = keyBytes + weight.bytes;
+      const limits = PREPARED_PROJECTION_CACHE_LIMITS;
+      if (bytes <= limits.bytes && weight.segments <= limits.segments) {
+        while (this.entries.size >= limits.entries || this.bytes + bytes > limits.bytes
+          || this.segments + weight.segments > limits.segments) {
+          const oldest = this.entries.entries().next().value!;
+          this.entries.delete(oldest[0]);
+          this.bytes -= oldest[1].bytes;
+          this.segments -= oldest[1].segments;
+        }
+        this.entries.set(key, { value, bytes, segments: weight.segments });
+        this.bytes += bytes;
+        this.segments += weight.segments;
+      }
+    }
+    return value;
+  }
+
+}
+
 /**
  * Rebuilds the model-only attachment directory from immutable Context lineage and AttachmentLink
  * relations. It never reads attachment bodies or trusts convenience metadata embedded in CAS JSON.
@@ -127,13 +229,27 @@ export class AttachmentCatalogProjection {
     segments: readonly AttachmentCatalogProjectionSegment[],
     additionalMessageRevisionIds: readonly string[] = []
   ): Promise<PreparedAttachmentCatalogProjection> {
-    // One worker per preparation keeps caches bounded and concurrent calls isolated. Each call
-    // reads fresh relationships, including previously empty AttachmentLink results.
-    return new AttachmentCatalogProjection(this.database).prepareIsolated(
-      requireId(conversationId, 'conversationId'),
+    const selectedConversationId = requireId(conversationId, 'conversationId');
+    const prepare = (): Promise<PreparedAttachmentCatalogProjection> => new AttachmentCatalogProjection(this.database).prepareIsolated(
+      selectedConversationId,
       segments,
       additionalMessageRevisionIds
     );
+    // Invalid runtime inputs keep the original reader's validation order. Maintenance has no
+    // commit stream, and repository test doubles must not claim freshness they cannot prove.
+    if (this.database.maintenance || typeof this.database.onCommit !== 'function'
+      || typeof this.database.externalDataVersion !== 'function'
+      || !Array.isArray(segments) || !segments.every(segment => segment && typeof segment.segmentId === 'string')
+      || !Array.isArray(additionalMessageRevisionIds) || !additionalMessageRevisionIds.every(id => typeof id === 'string')) return prepare();
+    // Snapshot the declared readonly input before the first asynchronous freshness fence. A
+    // caller retaining its arrays must not be able to publish facts under a different key.
+    const selectedSegments = segments.map(segment => ({ segmentId: segment.segmentId }));
+    const selectedRevisions = [...additionalMessageRevisionIds];
+    const key = JSON.stringify([selectedConversationId, selectedSegments.map(segment => segment.segmentId), selectedRevisions]);
+    let cache = preparedProjectionCaches.get(this.database);
+    if (!cache) { cache = new PreparedProjectionCache(this.database); preparedProjectionCaches.set(this.database, cache); }
+    return cache.read(key, () => new AttachmentCatalogProjection(this.database).prepareIsolated(
+      selectedConversationId, selectedSegments, selectedRevisions));
   }
 
   private async prepareIsolated(
