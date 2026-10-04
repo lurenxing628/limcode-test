@@ -57,6 +57,7 @@ import {
   NATIVE_CHAIN_REBASED_TERMINAL_STATE,
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
+  type ProviderDispatchControls,
   type ProviderTransientStreamEvent,
   type StreamEventResult
 } from './modelProviderControlPlane';
@@ -2497,6 +2498,109 @@ export class ReliableAgentLoop {
       span.unknownGap = false;
       return from.toString();
     };
+    // Stream callbacks outlive raw Context preparation. Build them in a scope that receives
+    // only stream identity and controls, so keeping a callback cannot keep the full request alive.
+    const streamControls = (
+      attemptSeq: string,
+      socketGeneration: string,
+      controls: ProviderDispatchControls
+    ): ProviderDispatchControls => ({
+      signal: controls.signal,
+      ...(controls.onFailedPartialOutput ? { onFailedPartialOutput: controls.onFailedPartialOutput } : {}),
+      ...(controls.native || activeSession
+        ? {
+            native: {
+              ...(controls.native ?? {}),
+              ...(activeSession ? activeSession.hooks(controls.signal, controls.onLocalFailure) : {})
+            }
+          }
+        : {}),
+      onEvent: async (event): Promise<StreamEventResult> => {
+        assertProviderCallbackAuthority(controls.signal, modelRequestId);
+        // Control observations go straight to durable control handling and the steering
+        // subscription; they are never fed into the text transient replay.
+        if (event.kind === 'native_control') {
+          const result = await controls.onEvent(event);
+          assertProviderCallbackAuthority(controls.signal, modelRequestId);
+          if (activeSession) await activeSession.afterNativeControl(event, result, controls.signal);
+          if (activeSession && (result.checkpointed || result.ignoredReason === 'duplicate')) {
+            const admission = parseNativeControlCheckpoint(event.content);
+            if (admission.type === 'response.created' && admission.admittedToolResultCallIds?.length) {
+              await this.markNativeCarrierDeliveries(
+                conversationId,
+                turnId,
+                modelRequestId,
+                admission.responseId,
+                admission.admittedToolResultCallIds
+              );
+            }
+          }
+          if (result.checkpointed || result.ignoredReason === 'duplicate') {
+            noteNativeControl(attemptSeq, socketGeneration, event.streamSeq);
+          }
+          return result;
+        }
+        const transientKind = event.kind;
+        const observe = (): void => this.observeTransientEvent({
+          conversationId,
+          turnId,
+          modelRequestId,
+          requestSeq,
+          providerId,
+          modelId,
+          attemptSeq,
+          socketGeneration,
+          afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
+          fromStreamSeq: visibleFromStreamSeq(attemptSeq, socketGeneration, event.streamSeq),
+          event: {
+            kind: transientKind,
+            streamSeq: event.streamSeq,
+            content: event.content,
+            ...(event.usage !== undefined ? { usage: event.usage } : {}),
+            ...(event.timing !== undefined ? { timing: event.timing } : {})
+          },
+          observedAt: this.timestamp()
+        });
+        if (activeSession) {
+          if (event.kind === 'output_delta') {
+            activeSession.observeDelta(event.content);
+          }
+          if (event.kind === 'output_item_done') {
+            const callItem = activeSession.parseCallItem(event.content);
+            if (callItem) {
+              const proof = activeSession.buildCallProof(callItem);
+              const result = await this.modelProvider.recordNativeToolCallProof(
+                modelRequestId,
+                attemptSeq,
+                socketGeneration,
+                event.streamSeq,
+                proof,
+                { beforeSubmit: () => assertProviderCallbackAuthority(controls.signal, modelRequestId) }
+              );
+              assertProviderCallbackAuthority(controls.signal, modelRequestId);
+              observe();
+              await activeSession.admitStreamedCall(callItem, event.streamSeq, result, controls.signal);
+              return result;
+            }
+            const result = await controls.onEvent(event);
+            assertProviderCallbackAuthority(controls.signal, modelRequestId);
+            observe();
+            await activeSession.admitStreamedContentItem(event, result, controls.signal);
+            return result;
+          }
+        }
+        // Streaming deltas are intentionally low-latency. A terminal visual state, however,
+        // must never outrun the durable terminal checkpoint it claims to represent.
+        if (event.kind === 'completed') {
+          const result = await controls.onEvent(event);
+          assertProviderCallbackAuthority(controls.signal, modelRequestId);
+          observe();
+          return result;
+        }
+        observe();
+        return controls.onEvent(event);
+      }
+    });
     const wrapped: FullRequestProviderAdapter = {
       providerId,
       ...(adapter.estimateFullRequestInput
@@ -2507,103 +2611,11 @@ export class ReliableAgentLoop {
           attemptSeq: fullRequest.attemptSeq,
           socketGeneration: fullRequest.socketGeneration
         });
-        return adapter.sendFullRequest(fullRequest, {
-          signal: controls.signal,
-          ...(controls.onFailedPartialOutput ? { onFailedPartialOutput: controls.onFailedPartialOutput } : {}),
-          ...(controls.native || activeSession
-            ? {
-                native: {
-                  ...(controls.native ?? {}),
-                  ...(activeSession ? activeSession.hooks(controls.signal, controls.onLocalFailure) : {})
-                }
-              }
-            : {}),
-          onEvent: async (event): Promise<StreamEventResult> => {
-            assertProviderCallbackAuthority(controls.signal, modelRequestId);
-            // Control observations go straight to durable control handling and the steering
-            // subscription; they are never fed into the text transient replay.
-            if (event.kind === 'native_control') {
-              const result = await controls.onEvent(event);
-              assertProviderCallbackAuthority(controls.signal, modelRequestId);
-              if (activeSession) await activeSession.afterNativeControl(event, result, controls.signal);
-              if (activeSession && (result.checkpointed || result.ignoredReason === 'duplicate')) {
-                const admission = parseNativeControlCheckpoint(event.content);
-                if (admission.type === 'response.created' && admission.admittedToolResultCallIds?.length) {
-                  await this.markNativeCarrierDeliveries(
-                    conversationId,
-                    turnId,
-                    modelRequestId,
-                    admission.responseId,
-                    admission.admittedToolResultCallIds
-                  );
-                }
-              }
-              if (result.checkpointed || result.ignoredReason === 'duplicate') {
-                noteNativeControl(fullRequest.attemptSeq, fullRequest.socketGeneration, event.streamSeq);
-              }
-              return result;
-            }
-            const transientKind = event.kind;
-            const observe = (): void => this.observeTransientEvent({
-              conversationId,
-              turnId,
-              modelRequestId,
-              requestSeq,
-              providerId,
-              modelId,
-              attemptSeq: fullRequest.attemptSeq,
-              socketGeneration: fullRequest.socketGeneration,
-              afterCommitSeq: dispatchBarrier.snapshotCommitSeq,
-              fromStreamSeq: visibleFromStreamSeq(fullRequest.attemptSeq, fullRequest.socketGeneration, event.streamSeq),
-              event: {
-                kind: transientKind,
-                streamSeq: event.streamSeq,
-                content: event.content,
-                ...(event.usage !== undefined ? { usage: event.usage } : {}),
-                ...(event.timing !== undefined ? { timing: event.timing } : {})
-              },
-              observedAt: this.timestamp()
-            });
-            if (activeSession) {
-              if (event.kind === 'output_delta') {
-                activeSession.observeDelta(event.content);
-              }
-              if (event.kind === 'output_item_done') {
-                const callItem = activeSession.parseCallItem(event.content);
-                if (callItem) {
-                  const proof = activeSession.buildCallProof(callItem);
-                  const result = await this.modelProvider.recordNativeToolCallProof(
-                    modelRequestId,
-                    fullRequest.attemptSeq,
-                    fullRequest.socketGeneration,
-                    event.streamSeq,
-                    proof,
-                    { beforeSubmit: () => assertProviderCallbackAuthority(controls.signal, modelRequestId) }
-                  );
-                  assertProviderCallbackAuthority(controls.signal, modelRequestId);
-                  observe();
-                  await activeSession.admitStreamedCall(callItem, event.streamSeq, result, controls.signal);
-                  return result;
-                }
-                const result = await controls.onEvent(event);
-                assertProviderCallbackAuthority(controls.signal, modelRequestId);
-                observe();
-                await activeSession.admitStreamedContentItem(event, result, controls.signal);
-                return result;
-              }
-            }
-            // Streaming deltas are intentionally low-latency. A terminal visual state, however,
-            // must never outrun the durable terminal checkpoint it claims to represent.
-            if (event.kind === 'completed') {
-              const result = await controls.onEvent(event);
-              assertProviderCallbackAuthority(controls.signal, modelRequestId);
-              observe();
-              return result;
-            }
-            observe();
-            return controls.onEvent(event);
-          }
-        })
+        return adapter.sendFullRequest(fullRequest, streamControls(
+          fullRequest.attemptSeq,
+          fullRequest.socketGeneration,
+          controls
+        ));
       }
     };
     const streamStats = asRecord(request.stream_stats_json);
