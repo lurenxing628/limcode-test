@@ -1,3 +1,4 @@
+import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
 import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
 import type { LlmThinkingConfigRecord, LlmProviderKind } from '../../shared/protocol';
 
@@ -39,7 +40,7 @@ import {
   type ReinjectedCurrentTurnInputReference,
   type TurnReminderIdentitySplit
 } from './turnReminderProjection';
-import { modelHandleRef, normalizeModelHandleCatalog } from './modelHandleCatalog';
+import { modelHandleRef, prepareModelHandleCatalog } from './modelHandleCatalog';
 import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   estimateRequestAuthorityTokens,
@@ -795,8 +796,13 @@ export class ModelProviderControlPlane {
       && (command.expectedContextHeadRootId !== contextRootId || !expectedHead)) {
       throw new Error('Automatic compression creation requires its exact active Context head.');
     }
+    const contextHandleSteps = isRecord(recipe) && (recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression')
+      ? await prepareConversationContextHandleUpdate({ database: this.database, contentStore: this.contentStore,
+          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'), catalog: recipe.modelHandleCatalog,
+          contextRootId, scope: recipe.contextHandleScope, source: compressionRequest ? 'compression' : 'ordinary', now }) : [];
     const steps: RepositoryTransactionStep[] = [
-      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active' }),
+      ...contextHandleSteps,
+      DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { status: 'active', conversation_id: turn.conversation_id }),
       ...(expectedHead ? [DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(
         requireId(expectedHead.id, 'Context head id'), { conversation_id: requireId(turn.conversation_id, 'Turn.conversation_id'), root_id: contextRootId }
       ), ...['interrupt_request', 'interrupt_current_turn', 'termination_request'].map(inputKind =>
@@ -862,7 +868,7 @@ export class ModelProviderControlPlane {
     } catch (error) {
       if (!isRecoverableProviderRace(error)) throw error;
       const raced = await this.getOptional('ModelRequest', modelRequestId);
-      if (!raced) throw error;
+      if (!raced) return rethrowContextHandleStateRace(this.database, contextHandleSteps, error);
       return this.replayCreation(raced, modelRequestId, projectionId, operationId, attemptId, {
         ...identity,
         recipeObjectId: recipeContent.metadata.id
@@ -3411,7 +3417,7 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
     );
     const delta = state.placements.find((placement) => placement.kind === 'current_turn_delta');
     if (delta) {
-      const handles = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+      const handles = prepareModelHandleCatalog(recipe.modelHandleCatalog);
       const rendered = renderAttachmentCatalogPlacement(delta, (entry) => {
         const ref = modelHandleRef(handles, 'attachment', entry.attachmentId);
         if (!ref) throw new Error(`Attachment ${entry.attachmentId} has no frozen model handle.`);

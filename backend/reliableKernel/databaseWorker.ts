@@ -1,5 +1,6 @@
 import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
 import { readCurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
+import { assertConversationContextHandleState, assertConversationContextHandleStateUpdate, assertContextRootHandleCatalog } from './conversationContextHandleStateInvariant';
 import { visitForkMessageCopyAssertions, visitForkMessageCopyInserts } from './forkMessageCopy';
 import { captureAnswerPresentation, assertAnswerPresentation, projectAnswerPresentation } from './answerPresentation';
 import { projectTimelineLinkRecord } from './clientTimelineHistory';
@@ -2009,6 +2010,8 @@ function executeMutation(
       });
     }
     if (schema.key === 'ContentObject') assertPublishedContentObject(encoded, data.binding.paths.casRootPath);
+    if (schema.key === 'ConversationContextHandleState') assertConversationContextHandleState(database, encoded);
+    if (schema.key === 'ContextRootHandleCatalog') assertContextRootHandleCatalog(database, encoded);
     const names = Object.keys(encoded);
     const sql = `INSERT INTO ${quote(schema.table)} (${names.map(quote).join(', ')}) VALUES (${names.map((name) => `@${name}`).join(', ')})`;
     prepareCached(database, sql).run(encoded);
@@ -2345,6 +2348,10 @@ function assertRuntimeStateTransition(
   id: string,
   patch: DomainRow
 ): void {
+  if (domain === 'ConversationContextHandleState') {
+    assertConversationContextHandleStateUpdate(database, id, patch);
+    return;
+  }
   if (domain === 'RuntimeDelivery') {
     const current = prepareCached(database, 'SELECT state FROM runtime_delivery WHERE id = ?').get(id) as {
       state?: unknown;

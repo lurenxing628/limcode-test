@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSession.js');
 const { readConversationChildHandles, readNativeRequestChildHandles, NATIVE_CHILD_HANDLE_PROJECTION_EVENT } =
   load('backend/reliableKernel/conversationChildHandles.js');
@@ -148,6 +149,7 @@ test(`native settled batches freeze child refs across ModelRequests and reopen${
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'parent', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
     ]);
     const started = await app.turns.input({ source: { kind: 'command', key: 'start-native-child-fixture' },
@@ -335,6 +337,10 @@ function nativeResultProjectionFixture(results) {
     if (!domains.has(domain)) domains.set(domain, new Map());
     domains.get(domain).set(row.id, row);
   };
+  put('Conversation', { id: 'projection-conversation' });
+  put('Turn', { id: 'projection-turn', conversation_id: 'projection-conversation' });
+  const initialState = emptyConversationContextHandleStateStep('projection-conversation', '2026-09-30T00:00:00.000Z');
+  put(initialState.domain, initialState.row);
   put('ModelRequest', { id: 'projection-request', turn_id: 'projection-turn' });
   for (const [index, result] of results.entries()) {
     const id = `projection-call-${index}`;
@@ -358,7 +364,17 @@ function nativeResultProjectionFixture(results) {
         if (step.kind === 'insert' || step.kind === 'insertWithNextSequence') {
           assert.equal(domains.get(step.domain)?.has(step.row.id) ?? false, false, 'projection must be frozen once');
           put(step.domain, { ...step.row });
-        }
+        } else if (step.kind === 'update') {
+          const current = domains.get(step.domain)?.get(step.id);
+          assert.ok(current, 'updates require an existing fixture row');
+          put(step.domain, { ...current, ...step.patch });
+        } else if (step.kind === 'assert') {
+          const current = domains.get(step.domain)?.get(step.id);
+          assert.ok(current, 'assertions require an existing fixture row');
+          for (const [key, value] of Object.entries(step.where)) assert.deepEqual(current[key], value);
+        } else if (step.kind === 'assertNone') {
+          assert.equal(select(step).length, 0);
+        } else assert.fail(`Unsupported fixture transaction step: ${step.kind}`);
       };
       steps.forEach(apply);
       return {};

@@ -1,3 +1,4 @@
+import { prepareContextHandleHeadTransition } from './conversationContextHandleState';
 import { createHash } from 'node:crypto';
 import type { MessageContent } from '../../shared/protocol';
 import { ContentAddressedStore } from './contentAddressedStore';
@@ -51,6 +52,8 @@ export interface CreateCompressionCommand {
   conversationId: string;
   headRootId: string;
   authoritySnapshotId: string;
+  /** Exact producing compression request; absent only for a manually supplied summary. */
+  modelRequestId?: string;
   compressSegmentCount: number;
   title: string;
   /** Provider-native compression remains structured; summary methods may keep Markdown. */
@@ -196,6 +199,7 @@ export class ContextCompressionControlPlane {
     const conversationId = requireId(command.conversationId, 'conversationId');
     const headRootId = requireId(command.headRootId, 'headRootId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
+    const modelRequestId = command.modelRequestId === undefined ? undefined : requireId(command.modelRequestId, 'modelRequestId');
     const idempotencyKey = requireText(command.idempotencyKey, 'idempotencyKey');
     const title = requireText(command.title, 'title');
     const summary = normalizeCompressionSummary(command.summary, command.summaryMetadata);
@@ -243,6 +247,11 @@ export class ContextCompressionControlPlane {
     const compressCount = requireRangeCount(requestedSourceCount, materialized.records.length);
     const frozen = await this.readFrozenProfile(authoritySnapshotId);
     if (frozen.conversationId !== conversationId) throw new Error('AuthoritySnapshot belongs to another Conversation.');
+    const producer = modelRequestId ? await this.requireDomain('ModelRequest', modelRequestId) : undefined;
+    if (producer && (producer.authority_snapshot_id !== authoritySnapshotId
+      || producer.status !== 'terminal' || producer.terminal_state !== 'completed')) {
+      throw new Error('Compression summary producer must be completed under this frozen Authority.');
+    }
     const head = await this.requireHead(conversationId, headRootId);
     const titleContent = await this.contentStore.prepare(this.database, title, CONTENT_TYPE_TITLE);
     const summaryContent = await this.contentStore.prepare(this.database, summary.content, summary.contentType);
@@ -258,6 +267,10 @@ export class ContextCompressionControlPlane {
       : requireEstimatedTokens(command.projectedEstimatedTokens, 'projectedEstimatedTokens');
     const steps: RepositoryTransactionStep[] = [
       headAssertion(head, conversationId, headRootId),
+      ...(producer ? [DOMAIN_REPOSITORIES.domain('ModelRequest').assert(requireId(producer.id, 'ModelRequest.id'), {
+        authority_snapshot_id: authoritySnapshotId, recipe_object_id: producer.recipe_object_id,
+        status: 'terminal', terminal_state: 'completed'
+      })] : []),
       ...preparedContentObjectSteps(
         [titleContent, summaryContent, ...observationContents],
         'compression_content'
@@ -347,6 +360,14 @@ export class ContextCompressionControlPlane {
         purpose: 'compression-source',
         created_at: now
       }),
+      ...(await prepareContextHandleHeadTransition({
+        database: this.database, contentStore: this.contentStore, conversationId,
+        previousRootId: headRootId, nextRootId: rootId, mode: 'append', now,
+        rootShape: { rootNodeId: summaryNodeId,
+          tailNodeId: tail.length ? requireId(tail[tail.length - 1].node.id, 'ContextSequenceNode.id') : null,
+          tailSegmentCount: BigInt(tail.length), segmentCount: BigInt(1 + tail.length) },
+        occurrence: { kind: 'compression', modelRequestId, compressionBlockId: blockId, content: summary.content }
+      })).steps,
       DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').update(requireId(head.id, 'Context head.id'), {
         root_id: rootId,
         updated_at: now
@@ -535,6 +556,15 @@ export class ContextCompressionControlPlane {
         status: previousStatus,
         updated_at: now
       }),
+      ...(await prepareContextHandleHeadTransition({
+        database: this.database, contentStore: this.contentStore, conversationId,
+        previousRootId: expectedHeadRootId, nextRootId: rootId, mode: 'append', now,
+        rootShape: { rootNodeId: summaryNodeId,
+          tailNodeId: current.root.tail_node_id === null ? null : requireId(current.root.tail_node_id, 'ContextSequenceRoot.tail_node_id'),
+          tailSegmentCount: requireBigInt(current.root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count'),
+          segmentCount: requireBigInt(current.root.segment_count, 'ContextSequenceRoot.segment_count') },
+        occurrence: { kind: 'compression', content: summary.content }
+      })).steps,
       DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').update(requireId(head.id, 'Context head.id'), {
         root_id: rootId,
         updated_at: now

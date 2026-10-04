@@ -10,6 +10,9 @@ const root = process.cwd();
 const kernel = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/reliableKernel/index.js')
 ).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(
+  path.join(root, 'dist/extension/backend/reliableKernel/conversationContextHandleState.js')
+).href);
 const { ReliableConversationRunner } = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js')
 ).href);
@@ -758,6 +761,7 @@ test('陈旧代际模型回调与栅栏写入被拒绝且不产生持久化副�
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `link-${conversationId}`, conversation_id: conversationId, agent_id: 'agent-main',
         role: 'default', created_at: now, updated_at: now
@@ -1224,6 +1228,7 @@ async function runTurnDriver() {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `link-${conversationId}`, conversation_id: conversationId, agent_id: 'agent-main',
         role: 'default', created_at: now, updated_at: now

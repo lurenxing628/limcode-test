@@ -20,6 +20,7 @@ import {
 import type { ReliableAgentProviderRegistry } from './agentLoop';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { readConversationContextHandleCatalog } from './conversationChildHandles';
+import { selectContextHandleBindings } from './contextHandleOccurrenceEvidence';
 import { expandTextCompressionSources, prepareTextCompressionSources } from './compressionSourceReplay';
 import {
   ContextCompressionControlPlane,
@@ -983,6 +984,12 @@ export class ReliableContextCompressionCoordinator {
       const attachmentRefs = new Map(fullAttachmentHandles.entries.map(entry => [entry.target, entry.ref]));
       fullModelHandleCatalog = { ...expandedCatalog, entries: expandedCatalog.entries.filter(entry =>
         entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
+      const selectedInputBindings = selectContextHandleBindings(handleSource.map(item => item.content), fullModelHandleCatalog);
+      const establishedRefs = new Map(historicalHandles.entries.map(entry => [entry.ref, entry]));
+      const contextHandleInputBindings = { ...selectedInputBindings, entries: selectedInputBindings.entries.filter(entry => {
+        const established = establishedRefs.get(entry.ref);
+        return !established || established.kind !== entry.kind || established.target !== entry.target;
+      }) };
       // An explicitly empty current tool list must not resurrect tools from an earlier model round.
       const tools = policy.methodKind !== 'provider_native' ? []
         : command.tools !== undefined ? normalizeCompressionToolDefinitions(command.tools, 'Compression command.tools')
@@ -1025,6 +1032,7 @@ export class ReliableContextCompressionCoordinator {
           ...(nativeRebase ? { nativeRebase } : {}),
           attachmentCatalogState: sourceAttachmentCatalogState,
           modelHandleCatalog: fullModelHandleCatalog,
+          ...(contextHandleInputBindings.entries.length ? { contextHandleInputBindings } : {}),
           ...(attachmentObservationProfileSha256
             ? {
                 attachmentObservationProfileSha256,
@@ -1252,6 +1260,7 @@ export class ReliableContextCompressionCoordinator {
       conversationId: frozen.conversationId,
       headRootId,
       authoritySnapshotId,
+      modelRequestId: expectedModelRequestId,
       compressSegmentCount: sourceSegmentCount,
       title: command.title?.trim() || (trigger === 'auto' ? '自动上下文压缩' : '上下文压缩'),
       summary,

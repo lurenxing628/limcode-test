@@ -237,6 +237,7 @@ test('run_agent navigation identity comes only from durable ChildExecution relat
 
 test('parent feed receives a bounded child activity change without child ToolCall leakage', async () => {
   const kernel = require(path.join(root, 'dist/extension/backend/reliableKernel/index.js'));
+  const { emptyConversationContextHandleStateStep } = require(path.join(root, 'dist/extension/backend/reliableKernel/conversationContextHandleState.js'));
   const parent = await fsPromises.mkdtemp(path.join(os.tmpdir(), 'limcode-child-activity-'));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
@@ -252,6 +253,7 @@ test('parent feed receives a bounded child activity change without child ToolCal
         created_at: now,
         updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'child-activity-parent-agent-link',
         conversation_id: conversationId,

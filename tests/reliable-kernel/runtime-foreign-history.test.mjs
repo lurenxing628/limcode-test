@@ -17,6 +17,7 @@ const require = createRequire(import.meta.url);
 const fsp = require('node:fs/promises');
 const fsSync = require('node:fs');
 const foreign = kernelFile('runtimeForeignHistory.js');
+const { RUNTIME_KERNEL_EPOCH } = kernelFile('contracts.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { listVscodeRuntimeDataSets, selectVscodeRuntimeDataSet } = kernelFile('vscodeRootAuthority.js');
@@ -339,7 +340,7 @@ test('每种拒绝原因各一例：未通过的列出位置、大小与原因�
     }],
     ['foreign-history-epoch-newer', 'failed', async (home) => {
       const copied = await copiedBeside(home, elsewhere, 1);
-      await fs.writeFile(pointer(copied), JSON.stringify({ ...JSON.parse(await fs.readFile(pointer(copied), 'utf8')), runtimeKernelEpoch: source.binding.runtimeKernelEpoch + 1 }));
+      await fs.writeFile(pointer(copied), JSON.stringify({ ...JSON.parse(await fs.readFile(pointer(copied), 'utf8')), runtimeKernelEpoch: RUNTIME_KERNEL_EPOCH + 1 }));
     }],
     ['foreign-history-audit-failed', 'failed', async (home) => {
       const sqlite = new Database(database(await copiedBeside(home, elsewhere, 1)));

@@ -15,6 +15,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = (file) => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const capabilitiesModule = load('shared/modelCapabilities.js');
 const { renderLoadedSkill } = load('backend/world/modules/skill/skillLookup.js');
 const { dryRunLlmProvider } = load('backend/capabilities/llmProvider.js');
@@ -162,6 +163,7 @@ async function withRuntime(method, run) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'skills', title: 'Skills', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('skills', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'skills-agent', conversation_id: 'skills', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now
       })

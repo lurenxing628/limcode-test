@@ -46,6 +46,8 @@ import { createVscodeRootAuthority } from './vscodeRootAuthority';
  *
  * Afterwards every domain's rows are compared in id order, streamed, between the source snapshot and
  * a Backup API copy of the target: the same ids with the same values, nothing more.
+ * This exact-identity relocation preserves ConversationContextHandleState and ContextRootHandleCatalog (including exact
+ * provenance revisions, ready CAS, and pending checkpoints). Unlike a history merge, it does not combine two evidence frontiers.
  */
 
 /**
@@ -116,7 +118,7 @@ export interface RuntimeDataSetCopyReceipt {
     /** Source queries of the whole copy (the sum over every batch). */
     reads: number;
   };
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
 }
 
 /**
@@ -259,6 +261,10 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
   { source: 'worker-insert', name: 'Operation', triggeredBy: ['Operation'], reads: [], handling: { kind: 'unit', anchor: 'Operation' } },
   { source: 'worker-insert', name: 'Attempt', triggeredBy: ['Attempt'], reads: ['Operation'], handling: { kind: 'unit', anchor: 'Operation' } },
   { source: 'worker-insert', name: 'ContentObject', triggeredBy: ['ContentObject'], reads: [], handling: { kind: 'cas-first' } },
+  { source: 'worker-insert', name: 'ConversationContextHandleState', triggeredBy: ['ConversationContextHandleState'],
+    reads: ['ContentObject', 'ContextSequenceRoot'], handling: { kind: 'reads-earlier' } },
+  { source: 'worker-insert', name: 'ContextRootHandleCatalog', triggeredBy: ['ContextRootHandleCatalog'],
+    reads: ['ContentObject', 'ContextSequenceRoot'], handling: { kind: 'reads-earlier' } },
   // Proof dependencies are earlier; the opposite timeline relation may be copied later and is
   // allowed to be empty. The later relation checks the shared sequence collision in its turn.
   { source: 'worker-insert', name: 'RuntimeDeliveryTimelineLink', triggeredBy: ['RuntimeDeliveryTimelineLink'],

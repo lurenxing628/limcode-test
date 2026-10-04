@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
@@ -7,7 +8,10 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const { readConversationChildHandles, mergeConversationChildHandles } = load('backend/reliableKernel/conversationChildHandles.js');
-const { buildModelHandleCatalog } = load('backend/reliableKernel/modelHandleCatalog.js');
+const { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } = load('backend/reliableKernel/modelHandleCatalog.js');
+const { emptyConversationContextHandleStateStep, pendingConversationContextHandleStateSteps } =
+  load('backend/reliableKernel/conversationContextHandleState.js');
+const { upgradeConversationContextHandles } = load('backend/reliableKernel/conversationContextHandleUpgrade.js');
 const { LlmCapabilityFullRequestAdapter } = load('backend/reliableKernel/llmCapabilityProviderAdapter.js');
 const { projectSummaryModelWindow } = load('backend/reliableKernel/modelFacingContextProjection.js');
 const { expandTextCompressionSources } = load('backend/reliableKernel/compressionSourceReplay.js');
@@ -69,55 +73,154 @@ test('compression fails closed when canonical child has no frozen reference', as
 });
 
 function recipeFixture(recipes, { missing = false } = {}) {
-  // These minimal recipes exercise current identity retention, not a published compression
-  // selector. Complete legacy source/projection proofs are covered by the historical fixtures.
-  const { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } = load('backend/reliableKernel/modelHandleCatalog.js');
-  recipes = recipes.map(recipe => recipe.modelHandleCatalog ? { ...recipe, modelHandleCatalog: {
-    ...recipe.modelHandleCatalog, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
-    retiredRefs: []
-  } } : recipe);
-  const domains = {
-    Turn: [{ id: 'fork-turn', conversation_id: 'fork' }, { id: 'source-turn', conversation_id: 'source' }],
-    ModelRequest: recipes.map((recipe, index) => ({ id: `copied-${index}`, turn_id: 'fork-turn', request_seq: BigInt(index), recipe_object_id: `recipe-${index}` })),
-    ContentObject: recipes.map((_, index) => ({ id: `recipe-${index}` }))
+  // An imported fork starts pending at its exact copied root. Only selected occurrences and
+  // their compression-source prefixes establish bindings; unrelated recipes remain private.
+  const now = '2026-10-04T00:00:00.000Z';
+  const domains = {}, contents = new Map(), reads = [];
+  const table = domain => domains[domain] ??= [];
+  const putContent = (id, value, contentType = 'application/json') => {
+    const bytes = Buffer.from(typeof value === 'string' ? value : JSON.stringify(value));
+    contents.set(id, bytes);
+    const metadata = { id, content_type: contentType, byte_length: BigInt(bytes.length),
+      sha256: createHash('sha256').update(bytes).digest('hex'), storage_key: id, created_at: now };
+    table('ContentObject').push(metadata);
+    return metadata;
   };
-  const select = read => (domains[read.domain] ?? []).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
-  const reads = [];
-  return {
-    reads,
-    domains,
-    database: {
-      async snapshotAll(read) { return { snapshot: select(read) }; },
-      async snapshot(reads) { return { snapshot: reads.map(read => read.kind === 'get'
-        ? missing ? null : (domains[read.domain] ?? []).find(row => row.id === read.id) ?? null
-        : select(read)) }; }
+  table('Conversation').push(...['fork', 'source'].map(id => ({ id })));
+  table('ConversationBranchLink').push({ id: 'branch', source_conversation_id: 'source', target_conversation_id: 'fork' });
+  table('Turn').push({ id: 'fork-turn', conversation_id: 'fork' }, { id: 'source-turn', conversation_id: 'source' });
+  let visible = [];
+  const addSegment = (key, contentId, kind, source) => {
+    const segment = { id: `segment-${key}`, content_object_id: contentId, segment_kind: kind };
+    const node = { id: `node-${key}`, parent_node_id: kind === 'compression' ? null : visible.at(-1)?.node.id ?? null,
+      segment_id: segment.id };
+    table('ContextSegment').push(segment); table('ContextSequenceNode').push(node);
+    table('ContextSegmentSource').push({ id: `source-${key}`, segment_id: segment.id, ...source });
+    if (kind === 'compression') visible = [];
+    visible.push({ node, segment, contentObject: table('ContentObject').find(row => row.id === contentId) });
+  };
+  putContent('input-body', 'Copied input');
+  table('MessageRevision').push({ id: 'input-revision', message_id: 'input-message', revision_seq: 1n,
+    role: 'user', content_object_id: 'input-body' });
+  table('MessagePartOfConversation').push({ id: 'input-member', conversation_id: 'fork', message_id: 'input-message' });
+  addSegment('input', 'input-body', 'message', { source_kind: 'message_revision', source_id: 'input-revision', source_revision: 1n });
+  recipes.forEach((recipe, index) => {
+    const compression = recipe.kind === 'reliable-context-compression';
+    const blockId = `block-${index}`;
+    recipe = { ...recipe, ...(compression ? { blockId } : {}), ...(recipe.modelHandleCatalog ? { modelHandleCatalog: {
+      ...recipe.modelHandleCatalog, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, retiredRefs: []
+    } } : {}) };
+    putContent(`recipe-${index}`, recipe);
+    table('ModelRequest').push({ id: `copied-${index}`, turn_id: 'fork-turn', request_seq: BigInt(index),
+      recipe_object_id: `recipe-${index}`, authority_snapshot_id: `authority-${index}`, ...(compression ? { stream_stats_json: { compressionPurpose: { blockId } } } : {}) });
+    // Every retained address is present in its immutable output; unused lookup entries alone
+    // cannot publish bindings in the current contract.
+    putContent(`body-${index}`, (recipe.modelHandleCatalog?.entries ?? []).map(entry => entry.ref).join(' '), 'text/plain');
+    table('AuthoritySnapshot').push({ id: `authority-${index}`, turn_id: 'fork-turn' });
+    if (compression) {
+      table('CompressionBlock').push({ id: blockId, conversation_id: 'fork', summary_object_id: `body-${index}`,
+        authority_snapshot_id: `authority-${index}` });
+      table('CompressionBlockSource').push(...visible.map(({ segment }, position) => ({
+        id: `block-source-${index}-${position}`, compression_block_id: blockId, position: BigInt(position), segment_id: segment.id
+      })));
+      addSegment(index, `body-${index}`, 'compression', { source_kind: 'compression_block', source_id: blockId, source_revision: 0n });
+    } else {
+      table('MessageRevision').push({ id: `revision-${index}`, message_id: `message-${index}`, revision_seq: 1n,
+        role: 'model', content_object_id: `body-${index}` });
+      table('MessagePartOfConversation').push({ id: `member-${index}`, conversation_id: 'fork', message_id: `message-${index}` });
+      table('ModelRequestMessageLink').push({ id: `producer-${index}`, model_request_id: `copied-${index}`, message_id: `message-${index}` });
+      addSegment(index, `body-${index}`, 'message', { source_kind: 'message_revision', source_id: `revision-${index}`, source_revision: 1n });
+    }
+  });
+  // This conflicting same-Turn retry has no occurrence in the selected root or source graph.
+  putContent('recipe-discarded', { kind: 'reliable-agent-turn', modelHandleCatalog: {
+    entries: [child('A1', 'discarded-bridge')], identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, retiredRefs: []
+  } });
+  table('AuthoritySnapshot').push({ id: 'authority-discarded', turn_id: 'fork-turn' });
+  table('ModelRequest').push({ id: 'discarded-request', turn_id: 'fork-turn', request_seq: 99n,
+    recipe_object_id: 'recipe-discarded', authority_snapshot_id: 'authority-discarded' });
+  if (missing) domains.ContentObject = table('ContentObject').filter(row => row.id !== 'recipe-0');
+  const root = { id: 'selected-root', conversation_id: 'fork', root_node_id: visible.at(-1).node.id,
+    tail_node_id: null, tail_segment_count: 0n, segment_count: BigInt(visible.length) };
+  table('ContextSequenceRoot').push(root);
+  table('ConversationContextHeadLink').push({ id: 'head', conversation_id: 'fork', root_id: root.id });
+  table('ConversationContextHandleState').push(emptyConversationContextHandleStateStep('source', now).row,
+    pendingConversationContextHandleStateSteps('fork', now, undefined, root.id).find(step => step.kind === 'insert').row);
+  const select = read => {
+    if (read.domain === 'Turn') throw new Error('Selected-root upgrade must not scan Turn history.');
+    return table(read.domain).filter(row => Object.entries(read.where ?? {}).every(([key, value]) => row[key] === value));
+  };
+  const database = {
+    conversationOwners: { async run(_id, run) { return run(); } },
+    async withHistoryPreparation(run) { return run({ assertActive() {} }); },
+    async snapshotAll(read) { return { snapshot: structuredClone(select(read)) }; },
+    async snapshot(queries) { return { snapshot: queries.map(read => structuredClone(read.kind === 'get'
+      ? table(read.domain).find(row => row.id === read.id) ?? null : select(read).slice(0, read.limit ?? Infinity))) }; },
+    async materializeContext(rootId) {
+      assert.equal(rootId, root.id);
+      return { snapshotCommitSeq: '1', snapshot: structuredClone({ root, records: visible }) };
     },
-    store: { async read(metadata) { reads.push(metadata.id); return Buffer.from(JSON.stringify(recipes[Number(metadata.id.slice(7))])); } }
+    async transaction(steps) {
+      const before = structuredClone(domains);
+      const apply = step => {
+        if (step.kind === 'savepoint') { step.steps.forEach(apply); return; }
+        const rows = table(step.domain), row = rows.find(row => row.id === step.id);
+        if (step.kind === 'assert') {
+          assert.ok(row, `Missing ${step.domain} ${step.id}`);
+          for (const [key, value] of Object.entries(step.where)) assert.deepEqual(row[key], value);
+        } else if (step.kind === 'assertNone') assert.equal(select(step).length, 0);
+        else if (step.kind === 'assertExactIds') assert.deepEqual(select(step).map(row => row.id).sort(), [...step.expectedIds].sort());
+        else if (step.kind === 'insert') { assert.ok(!rows.some(value => value.id === step.row.id)); rows.push(structuredClone(step.row)); }
+        else if (step.kind === 'update') { assert.ok(row); Object.assign(row, structuredClone(step.patch)); }
+        else throw new Error(`Unsupported fixture transaction step: ${step.kind}`);
+      };
+      try { steps.forEach(apply); } catch (error) {
+        for (const key of Object.keys(domains)) delete domains[key];
+        Object.assign(domains, before); throw error;
+      }
+    }
   };
+  const store = {
+    async read(metadata) { reads.push(metadata.id); return Buffer.from(contents.get(metadata.id)); },
+    async prepare(_database, text, contentType) {
+      const id = `state-${createHash('sha256').update(text).digest('hex')}`;
+      const existing = table('ContentObject').find(row => row.id === id);
+      if (existing) return { metadata: existing };
+      const metadata = putContent(id, text, contentType);
+      domains.ContentObject.pop();
+      return { metadata, insert: { kind: 'insert', domain: 'ContentObject', row: metadata } };
+    }
+  };
+  return { reads, domains, database, store,
+    async upgrade() { await upgradeConversationContextHandles(database, store, 'fork'); } };
 }
 
-test('copied fork request recipes preserve the complete historical mapping without scanning source turns', async () => {
+test('copied fork sources preserve selected historical mappings without scanning source turns', async () => {
   const fixture = recipeFixture([
     { kind: 'reliable-agent-turn', modelHandleCatalog: { entries: handles.slice(0, 1) } },
     { kind: 'reliable-agent-turn', modelHandleCatalog: { entries: handles.slice(0, 2) } },
     { kind: 'reliable-context-compression', modelHandleCatalog: { entries: handles } }
   ]);
+  await fixture.upgrade();
   assert.deepEqual(await readConversationChildHandles(fixture.database, fixture.store, 'fork'), handles);
-  assert.deepEqual([...fixture.reads].sort(), ['recipe-0', 'recipe-1', 'recipe-2'],
-    'published window-local identities require every frozen recipe, including before same-Turn compression');
+  assert.deepEqual(fixture.reads.filter(id => id.startsWith('recipe-')).sort(), ['recipe-0', 'recipe-1', 'recipe-2'],
+    'selected immutable sources require each producer recipe, including before same-Turn compression, but exclude discarded retries');
   assert.deepEqual(await readConversationChildHandles(fixture.database, fixture.store, 'source'), []);
 });
 
-test('same-timestamp parent turns merge newest recipes without trusting hashed turn id order', async () => {
+test('same-timestamp parent turns retain selected canonical sources without trusting hashed turn id order', async () => {
   const fixture = recipeFixture([
     { kind: 'reliable-agent-turn', modelHandleCatalog: { entries: handles.slice(0, 1) } },
     { kind: 'reliable-agent-turn', modelHandleCatalog: { entries: handles.slice(0, 2) } }
   ]);
-  fixture.domains.Turn = ['z-old-turn', 'a-new-turn'].map(id => ({ id, conversation_id: 'fork', created_at: '2026-09-22T00:00:00.000Z' }));
+  fixture.domains.Turn.push(...['z-old-turn', 'a-new-turn'].map(id => ({ id, conversation_id: 'fork', created_at: '2026-09-22T00:00:00.000Z' })));
+  fixture.domains.AuthoritySnapshot[0].turn_id = 'z-old-turn';
+  fixture.domains.AuthoritySnapshot[1].turn_id = 'a-new-turn';
   fixture.domains.ModelRequest[0].turn_id = 'z-old-turn';
   fixture.domains.ModelRequest[1].turn_id = 'a-new-turn';
+  await fixture.upgrade();
   assert.deepEqual(await readConversationChildHandles(fixture.database, fixture.store, 'fork'), handles.slice(0, 2));
-  assert.equal(fixture.reads.length, 2);
+  assert.equal(fixture.reads.filter(id => id.startsWith('recipe-')).length, 2);
 });
 
 test('a backwards clock between parent turns cannot discard or reassign a reserved child reference', async () => {
@@ -125,12 +228,15 @@ test('a backwards clock between parent turns cannot discard or reassign a reserv
     { kind: 'reliable-agent-turn', modelHandleCatalog: { entries: handles.slice(0, 1) } },
     { kind: 'reliable-context-compression', modelHandleCatalog: { entries: handles.slice(0, 2) } }
   ]);
-  fixture.domains.Turn = [
+  fixture.domains.Turn.push(
     { id: 'old-turn', conversation_id: 'fork', created_at: '2026-09-22T00:01:00.000Z' },
     { id: 'new-turn', conversation_id: 'fork', created_at: '2026-09-22T00:00:59.000Z' }
-  ];
+  );
   fixture.domains.ModelRequest[0].turn_id = 'old-turn';
   fixture.domains.ModelRequest[1].turn_id = 'new-turn';
+  fixture.domains.AuthoritySnapshot[0].turn_id = 'old-turn';
+  fixture.domains.AuthoritySnapshot[1].turn_id = 'new-turn';
+  await fixture.upgrade();
   const reserved = await readConversationChildHandles(fixture.database, fixture.store, 'fork');
   assert.deepEqual(reserved, handles.slice(0, 2));
   assert.deepEqual(buildModelHandleCatalog([{ answerBridgeId: 'bridge-new' }], reserved).entries, handles);
@@ -142,9 +248,9 @@ test('frozen history rejects missing CAS and conflicting targets or renamed chil
       error => error.code === 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT');
   }
   const duplicate = recipeFixture([{ kind: 'reliable-agent-turn', modelHandleCatalog: { entries: [...handles, child('A1', 'different')] } }]);
-  await assert.rejects(readConversationChildHandles(duplicate.database, duplicate.store, 'fork'), /Duplicate model handle ref/);
+  await assert.rejects(duplicate.upgrade(), /Duplicate model handle ref/);
   const missing = recipeFixture([{ kind: 'reliable-agent-turn' }], { missing: true });
-  await assert.rejects(readConversationChildHandles(missing.database, missing.store, 'fork'), /ContentObject.*missing/);
+  await assert.rejects(missing.upgrade(), /ContentObject.*missing/);
   assert.throws(() => mergeConversationChildHandles(handles, [child('A2', 'other')]), /Conflicting/);
 });
 
@@ -300,6 +406,7 @@ test('process, cursor and environment identities survive compression recipes and
     { kind: 'workEnvironment', ref: 'W1', target: 'work-env-old' }
   ];
   const fixture = recipeFixture([{ kind: 'reliable-context-compression', modelHandleCatalog: { entries: persistent } }]);
+  await fixture.upgrade();
   const remembered = await readConversationChildHandles(fixture.database, fixture.store, 'fork');
   const { buildModelHandleCatalog, resolveModelToolArguments } = load('backend/reliableKernel/modelHandleCatalog.js');
   const after = buildModelHandleCatalog([

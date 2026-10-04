@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, 'backend/reliableKernel', file));
 const kernel = load('index.js');
+const { emptyConversationContextHandleStateStep } = load('conversationContextHandleState.js');
 const { ReliableChildAgentCoordinator } = load('childAgentCoordinator.js');
 const { runWithExecutionLeaseFence, currentExecutionLeaseFence, ExecutionHandoffError } = load('executionLeaseFence.js');
 const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
@@ -59,6 +60,7 @@ async function fixture(run, options = {}) {
   try {
     await app.database.transaction([
       repo('Conversation').insert({ id: 'parent', title: 'Parent', status: 'active', created_at: now(), updated_at: now() }),
+      emptyConversationContextHandleStateStep('parent', now()),
       repo('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: 'parent-agent', role: 'default', created_at: now(), updated_at: now() })
     ]);
     const parent = await app.turns.input({ source: { kind: 'command', key: 'parent-input' }, conversationId: 'parent', content: 'Delegate',

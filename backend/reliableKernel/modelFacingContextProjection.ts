@@ -1128,6 +1128,33 @@ export function projectOrdinaryModelWindow(
   modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): ModelWindowProjection {
+  const projection = projectOrdinaryModelWindowContents(contents, modelHandleCatalogInput, mediaState);
+  return {
+    contents: projection.contents,
+    tokenCount: estimateMessageContentsTokens(projection.contents),
+    mediaTokens: estimateMessageContentsMediaTokens(projection.contents),
+    toolResultBatches: projection.toolResultBatches,
+    mandatoryBatchOverTarget: projection.mandatoryBatchOverTarget,
+    uniqueManagedMediaBodyCount: projection.uniqueManagedMediaBodyCount,
+    suppressedManagedMediaBodyCount: projection.suppressedManagedMediaBodyCount
+  };
+}
+
+/** Same exact model-visible projection, without aggregate estimates discarded by transport callers.
+ * Tool-result budgeting and truncation still run in the shared core before contents are returned. */
+export function projectOrdinaryModelContents(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
+  mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
+): MessageContent[] {
+  return projectOrdinaryModelWindowContents(contents, modelHandleCatalogInput, mediaState).contents;
+}
+
+function projectOrdinaryModelWindowContents(
+  contents: readonly MessageContent[],
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown,
+  mediaState: ManagedMediaBodyProjectionState
+): Omit<ModelWindowProjection, 'tokenCount' | 'mediaTokens'> {
   const projected = contents.map(cloneMessageContent);
   const batches: ToolResultBatchProjection[] = [];
   for (const group of groupAtomicMessageContentRanges(projected)) {
@@ -1166,8 +1193,6 @@ export function projectOrdinaryModelWindow(
   );
   return {
     contents: mediaProjected,
-    tokenCount: estimateMessageContentsTokens(mediaProjected),
-    mediaTokens: estimateMessageContentsMediaTokens(mediaProjected),
     toolResultBatches: batches,
     mandatoryBatchOverTarget: batches.some((batch) => batch.mandatoryBatchOverTarget),
     uniqueManagedMediaBodyCount: mediaState.uniqueBodyCount - uniqueBefore,

@@ -3,10 +3,11 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   createConfigurationRoot, removeConfigurationRoot, seedConversations, seedCollaborationMessages,
-  withRuntime, repo, kernelFile, Database
+  withRuntime, repo, kernelFile, Database, NOW
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const { TurnControlPlane } = kernelFile('turnControlPlane.js');
+const { emptyConversationContextHandleStateStep } = kernelFile('conversationContextHandleState.js');
 const { createReliableKernelRuntimeServices } = kernelFile('runtimeServices.js');
 const { inspectUnfinishedWork } = kernelFile('runtimeDataSetMergeProbes.js');
 const { mergeHistoricalDataSetsOnline, MERGE_FINALIZATION_REASON } = kernelFile('runtimeDataSetMerge.js');
@@ -46,6 +47,7 @@ for (const kind of ['input', 'continuation', 'runtime_continuation']) {
         await seedCollaborationMessages(fixture.alpha, 'sender', conversationId, ['message']);
       }
       const { active, queued } = await withRuntime(fixture.alpha, async (database, store) => {
+        await database.transaction([emptyConversationContextHandleStateStep(conversationId, NOW)]);
         const runtime = createReliableKernelRuntimeServices(database, store, { authorityCompiler });
         const turns = new TurnControlPlane(database, store, { authorityCompiler,
           prepareRuntimeContinuationSteps: id => runtime.collaboration.prepareWakeContinuationSteps(id) });
@@ -108,6 +110,7 @@ test('a pending delivery still refuses the whole source before cancelling queued
     await seedConversations(fixture.alpha, [{ id: conversationId }, { id: 'sender' }]);
     await seedCollaborationMessages(fixture.alpha, 'sender', conversationId, ['pending']);
     const { active, queued, delivery } = await withRuntime(fixture.alpha, async (database, store) => {
+      await database.transaction([emptyConversationContextHandleStateStep(conversationId, NOW)]);
       const runtime = createReliableKernelRuntimeServices(database, store, { authorityCompiler });
       const turns = new TurnControlPlane(database, store, { authorityCompiler });
       const command = { conversationId, ...lease(database) };

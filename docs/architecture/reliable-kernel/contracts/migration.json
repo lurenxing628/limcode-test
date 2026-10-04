@@ -9,13 +9,16 @@
   "fallbackToLegacyRuntime": false,
   "runtimeProtocolNegotiation": false,
   "boundedEpochUpgrade": {
-    "fromEpochs": [3, 4, 5],
-    "toEpoch": 6,
+    "fromEpochs": [3, 4, 5, 6],
+    "toEpoch": 7,
     "sourcePolicy": "exact-published-table-index-trigger-manifest-and-binding-fingerprint",
     "backupPolicy": "sqlite-backup-api-plus-root-binding-and-epoch-manifest",
     "recoveryPolicy": "durable-journal-forward-only",
     "retiredEpoch3To4Recovery": "exact-pending-or-journal-before-current-upgrade",
-    "publishedEpoch3Or4To5Recovery": "exact-original-epoch-to-5-journal-and-binding-before-epoch-to-6-upgrade",
+    "publishedEpoch3Or4To5Recovery": "exact-original-epoch-to-5-journal-and-binding-before-epoch-to-7-upgrade",
+    "publishedEpoch3Or4Or5To6Recovery": "exact-original-epoch-to-6-journal-and-binding-before-epoch-to-7-upgrade",
+    "epoch6Predecessor": "frozen-111-domain-metadata-trigger-contract-4392830e0136ec7a9423f17836e0a7f9f9fa6b10b846c299995589cb5b24a997",
+    "epoch7HandleStatePolicy": "conversation-current-pointer-and-immutable-scoped-root-catalog-domains; one-pending-current-head-root-null-cas-revision-zero-reset-row-per-existing-conversation-only; preserve-all-existing-rows-and-cas; no-history-or-catalog-rebuild-in-upgrade-transaction",
     "epoch5Predecessor": "frozen-107-domain-metadata-trigger-contract-2dba9bcdb8341cd613808cb198f0fde920fe85316ee70a31c7158530b8e0fd3c",
     "epoch6TimelinePolicy": "two-new-insert-only-timeline-relations-plus-independent-import-provenance-and-parent-owned-answer-presentation; exact-context-append-input-position-backfill-and-bounded-streaming-accepted-body-metadata-backfill; no-invented-original-mixed-order",
     "legacyChildContinuationPolicy": "epoch-3-and-exact-epoch-4-missing-link-only",
@@ -40,7 +43,7 @@
   "historicalMerge": {
     "sources": ["pre-switch-history-data-sets-automatic-once", "user-kept-or-already-merged-explicit-request-only", "foreign-history-root-verified-in-place-user-request-only"],
     "target": "selected-current-epoch-data-set-open-in-requesting-host",
-    "initialSelection": "no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-6-exact-schema-and-physical-fingerprint-published-3-4-5-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched",
+    "initialSelection": "no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-6-7-exact-schema-and-physical-fingerprint-published-3-4-5-6-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched",
     "trigger": "background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; selection-under-admission-reads-only-ledger-requests-and-file-states-uncached-fingerprints-judged-outside; hosts-prepare-without-claims-and-commit-one-at-a-time-under-admission-and-source-maintenance; later-host-rechecks-source-files-then-rereads-ledger-and-skips-source-already-merged-unreported; before-deferring-a-changed-source-or-an-unexpected-error-ledger-reread-source-merged-into-same-target-after-batch-picked-it-skipped-silently-explicit-request-told-already-merged",
     "requiresUserConfirmation": false,
     "explicitRequestConfirmation": "modal-states-online-limit-bounded-cancellable-wait-for-busy-windows-one-reload-of-others-and-hard-limit-from-code-constants; states-interrupted-tasks-ended-queued-unsent-messages-cancelled-and-conversations-deleted-here-after-merge-never-merged-back-switch-states-it-too; then-online-merge-in-requesting-window-no-reload; outcome-always-told-already-merged-nothing-new-or-why-nothing-was-done",
@@ -2251,18 +2254,18 @@
       "atomic-rename-pointer",
       "delete-pending"
     ],
-    "startupRule": "cutover request 存在时进入 cutover-only coordinator；精确已发布 epoch 3、4、5 在完整 RootBinding、物理 DDL、manifest 与其他 Host 离线核验后，先持久备份再以synchronous=FULL 单事务升级到 epoch 6，保留现有对话、消息和 CAS。中断按 durable journal 向前恢复，旧版 3→4 和 3/4→5 pending/journal 先核对并收敛。当前 epoch 6 仍只接受完整 table/index/trigger/manifest/RootBinding 指纹；未知漂移拒绝打开 Runtime。"
+    "startupRule": "cutover request 存在时进入 cutover-only coordinator；精确已发布 epoch 3、4、5、6 在完整 RootBinding、物理 DDL、manifest 与其他 Host 离线核验后，先持久备份再以synchronous=FULL 单事务升级到 epoch 7，保留现有对话、消息和 CAS。中断按 durable journal 向前恢复，旧版 3→4、3/4→5 和 3/4/5→6 pending/journal 先核对并收敛。当前 epoch 7 仍只接受完整 table/index/trigger/manifest/RootBinding 指纹；未知漂移拒绝打开 Runtime。"
   },
   "epochPolicy": {
-    "current": "epoch 6 单一当前 schema；已发布 epoch 3、4、5 以精确离线升级保留原 Runtime 内容；更早不受支持的旧根保持原样并拒绝自动重置。",
+    "current": "epoch 7 单一当前 schema；已发布 epoch 3、4、5、6 以精确离线升级保留原 Runtime 内容；更早不受支持的旧根保持原样并拒绝自动重置。",
     "status": "单一当前 schema，不做协议协商或长期 migration chain",
-    "roadmapNote": "新增 epoch 必须明确决策；当前仅有精确已发布 3/4/5→6 升级，保留原有 3→4 与 3/4→5 中断恢复，不引入开放式迁移链。"
+    "roadmapNote": "新增 epoch 必须明确决策；当前仅有精确已发布 3/4/5/6→7 升级，保留原有 3→4、3/4→5 与 3/4/5→6 中断恢复，不引入开放式迁移链。"
   },
   "failureRule": "激活前失败保持旧 active pointer 且旧数据可恢复；激活后失败只修复新内核，不自动回退旧写入器。",
   "rootChange": "配置入口继续拒绝 Runtime 运行期间切换 data root；迁移、回到旧目录与选择其它目录只经设置页的数据目录命令（dataRootRelocation）。创建、升级、归档和重置持有目标 Runtime 数据根的维护互斥；重置先核验其他宿主已退出，再关闭本宿主并重新核验。最终 VSIX 的新宿主在数据库打开前完成 cutover-only coordinator 与 RootBinding 原子激活；日常运行不持有工作区终身锁。",
-  "currentRuntimeEpoch": 6,
+  "currentRuntimeEpoch": 7,
   "schemaUpgradePolicy": {
-    "olderEpoch": "published-3-4-and-5-exact-offline-upgrade-others-fail-closed",
+    "olderEpoch": "published-3-4-5-and-6-exact-offline-upgrade-others-fail-closed",
     "currentEpoch": "exact-manifest-and-physical-fingerprint-only",
     "partialAdditiveUpgrade": false,
     "unknownDrift": "fail-closed",

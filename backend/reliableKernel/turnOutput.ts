@@ -92,6 +92,7 @@ export class TurnOutputControlPlane {
         contentObjectId: content.metadata.id,
         contentByteLength: content.metadata.byte_length,
         contentEstimatedTokens,
+        handleOccurrence: { kind: 'message', modelRequestId, content: input.content, contentType },
         ...(resultingEstimatedTokens === undefined ? {} : { resultingEstimatedTokens })
       });
       contextSteps = context.steps;
@@ -236,7 +237,8 @@ export class TurnOutputControlPlane {
         messageRevisionId: revisionId,
         contentObjectId: content.metadata.id,
         contentByteLength: content.metadata.byte_length,
-        contentEstimatedTokens
+        contentEstimatedTokens,
+        handleOccurrence: { kind: 'message', modelRequestId, content: input.content, contentType }
       });
       contextSteps = context.steps;
     }

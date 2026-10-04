@@ -140,6 +140,8 @@ const REQUIRED_RUNTIME_DOMAINS = [
   'ContextSequenceNode',
   'ContextSequenceRoot',
   'ConversationContextHeadLink',
+  'ConversationContextHandleState',
+  'ContextRootHandleCatalog',
   'ModelContextProjection',
   'ModelRequest',
   'ModelRequestMessageLink',
@@ -478,22 +480,26 @@ function validateMigration(root, migration, failures) {
     if (migration?.[field] !== false) failures.push(`migration.${field}必须为false`);
   }
   const upgrade = migration?.boundedEpochUpgrade;
-  failures.push(...exactSetProblems('精确升级前驱', [3, 4, 5], upgrade?.fromEpochs ?? []));
-  if (migration?.currentRuntimeEpoch !== 6
-    || upgrade?.toEpoch !== 6
+  failures.push(...exactSetProblems('精确升级前驱', [3, 4, 5, 6], upgrade?.fromEpochs ?? []));
+  if (migration?.currentRuntimeEpoch !== 7
+    || upgrade?.toEpoch !== 7
     || upgrade?.sourcePolicy !== 'exact-published-table-index-trigger-manifest-and-binding-fingerprint'
     || upgrade?.backupPolicy !== 'sqlite-backup-api-plus-root-binding-and-epoch-manifest'
     || upgrade?.recoveryPolicy !== 'durable-journal-forward-only'
     || upgrade?.retiredEpoch3To4Recovery !== 'exact-pending-or-journal-before-current-upgrade'
+    || upgrade?.publishedEpoch3Or4To5Recovery !== 'exact-original-epoch-to-5-journal-and-binding-before-epoch-to-7-upgrade'
+    || upgrade?.publishedEpoch3Or4Or5To6Recovery !== 'exact-original-epoch-to-6-journal-and-binding-before-epoch-to-7-upgrade'
+    || upgrade?.epoch6Predecessor !== 'frozen-111-domain-metadata-trigger-contract-4392830e0136ec7a9423f17836e0a7f9f9fa6b10b846c299995589cb5b24a997'
+    || upgrade?.epoch7HandleStatePolicy !== 'conversation-current-pointer-and-immutable-scoped-root-catalog-domains; one-pending-current-head-root-null-cas-revision-zero-reset-row-per-existing-conversation-only; preserve-all-existing-rows-and-cas; no-history-or-catalog-rebuild-in-upgrade-transaction'
     || upgrade?.legacyChildContinuationPolicy !== 'epoch-3-and-exact-epoch-4-missing-link-only'
     || upgrade?.epoch4MissingLinkPredecessor !== 'exact-single-missing-runtime-delivery-intent-link'
     || upgrade?.unknownDriftPolicy !== 'fail-before-data-change'
     || upgrade?.compatibilityFallback !== false
-    || migration?.schemaUpgradePolicy?.olderEpoch !== 'published-3-4-and-5-exact-offline-upgrade-others-fail-closed'
+    || migration?.schemaUpgradePolicy?.olderEpoch !== 'published-3-4-5-and-6-exact-offline-upgrade-others-fail-closed'
     || migration?.schemaUpgradePolicy?.currentEpoch !== 'exact-manifest-and-physical-fingerprint-only'
     || migration?.schemaUpgradePolicy?.partialAdditiveUpgrade !== false
     || migration?.schemaUpgradePolicy?.unknownDrift !== 'fail-closed') {
-    failures.push('Runtime epoch 6 只接受已发布 3/4/5 精确备份升级及当前代完整指纹；未知漂移必须拒绝');
+    failures.push('Runtime epoch 7 只接受已发布 3/4/5/6 精确备份升级及当前代完整指纹；未知漂移必须拒绝');
   }
   failures.push(...exactSetProblems('epoch升级保留对象',
     ['runtime-rows', 'cas', 'sqlite-backup', 'runtime-archive', 'configuration', 'workspace'],
@@ -511,7 +517,7 @@ function validateMigration(root, migration, failures) {
   const expectedMerge = {
     sources: ['pre-switch-history-data-sets-automatic-once', 'user-kept-or-already-merged-explicit-request-only', 'foreign-history-root-verified-in-place-user-request-only'],
     target: 'selected-current-epoch-data-set-open-in-requesting-host',
-    initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-6-exact-schema-and-physical-fingerprint-published-3-4-5-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
+    initialSelection: 'no-selection-file-only-candidates-passing-read-only-preflight-epoch-3-4-5-6-7-exact-schema-and-physical-fingerprint-published-3-4-5-6-also-quick-check-and-no-recorded-failure; pending-recovery-window-left-to-its-gate; fixed-root-with-complete-binding-else-latest-modified-scope; none-passing-or-unreadable-container-requires-explicit-choice-with-reasons; existing-selection-never-switched',
     trigger: 'background-after-selected-runtime-ready-and-historical-upgrades; one-source-at-a-time; selection-under-admission-reads-only-ledger-requests-and-file-states-uncached-fingerprints-judged-outside; hosts-prepare-without-claims-and-commit-one-at-a-time-under-admission-and-source-maintenance; later-host-rechecks-source-files-then-rereads-ledger-and-skips-source-already-merged-unreported; before-deferring-a-changed-source-or-an-unexpected-error-ledger-reread-source-merged-into-same-target-after-batch-picked-it-skipped-silently-explicit-request-told-already-merged',
     requiresUserConfirmation: false,
     explicitRequestConfirmation: 'modal-states-online-limit-bounded-cancellable-wait-for-busy-windows-one-reload-of-others-and-hard-limit-from-code-constants; states-interrupted-tasks-ended-queued-unsent-messages-cancelled-and-conversations-deleted-here-after-merge-never-merged-back-switch-states-it-too; then-online-merge-in-requesting-window-no-reload; outcome-always-told-already-merged-nothing-new-or-why-nothing-was-done',
@@ -1009,8 +1015,8 @@ function validateAuthority(authority, migration, failures) {
     || authority?.schemaPolicy?.incrementalLegacyMigrationChain !== false
     || authority?.schemaPolicy?.incompatibleRuntimeData !== 'exact-published-upgrade-else-fail-closed'
     || authority?.schemaPolicy?.exactPredecessorUpgrade
-      !== 'published-epoch-3-4-or-5-to-6-with-backup-journal'
-    || authority?.schemaPolicy?.currentEpoch !== 6) {
+      !== 'published-epoch-3-4-5-or-6-to-7-with-backup-journal'
+    || authority?.schemaPolicy?.currentEpoch !== 7) {
     failures.push('SQLite schema必须只有当前manifest和单一运行epoch，不维护旧迁移链');
   }
   if (authority?.rootPolicy?.mode !== 'offline-restart-only' || authority?.rootPolicy?.onlineMigration !== false) {
@@ -1313,6 +1319,8 @@ function validateContext(context, failures) {
     'ContextSequenceNode',
     'ContextSequenceRoot',
     'ConversationContextHeadLink',
+    'ConversationContextHandleState',
+  'ContextRootHandleCatalog',
     'ModelContextProjection',
     'ModelRequest',
     'ModelRequestMessageLink',

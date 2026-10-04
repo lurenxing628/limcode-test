@@ -20,9 +20,9 @@ import { ContextSequenceControlPlane, type StructuralContextRecord } from './con
 import { RuntimeDatabase } from './runtimeDatabase';
 import type { HistoryPreparationOptions, HistoryPreparationPermit } from './historyPreparationAdmission';
 import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
-import { NATIVE_CHILD_HANDLE_PROJECTION_EVENT, readConversationContextHandleCatalog } from './conversationChildHandles';
+import { readContextHandleRootEvidence } from './contextHandleOccurrenceEvidence';
 import { assertForkContextHandleReservations, FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND,
-  captureForkContextHandleFrontier, prepareForkContextHandleReservations, readForkContextHandleReservationEvidence } from './forkContextHandleReservations';
+  prepareForkContextHandleReservations, readExactForkContextHandleSnapshot } from './forkContextHandleReservations';
 
 export interface ConversationForkCommand {
   /** Stable user/command identity. Replays with a different shape are rejected. */
@@ -258,18 +258,6 @@ export class ConversationForkControlPlane {
     // frozen F addresses before the snapshot copies its registry, without exposing old attachments.
     await new ConversationAttachmentHandleRegistry(this.database, { contentStore: this.contentStore, now: this.now })
       .ensure(command.sourceConversationId, []);
-    // Capture before reading CAS. Transaction assertions reject even a new request/event that
-    // arrived during the reads, so a concurrent Host cannot add addresses outside this snapshot.
-    const handleFrontier = await captureForkContextHandleFrontier(this.database, command.sourceConversationId,
-      NATIVE_CHILD_HANDLE_PROJECTION_EVENT);
-    const sourceReservations = await readForkContextHandleReservationEvidence(this.database, this.contentStore, command.sourceConversationId);
-    const sourceHandleCatalog = await readConversationContextHandleCatalog(this.database, this.contentStore,
-      command.sourceConversationId);
-    const handleReservations = await prepareForkContextHandleReservations({ database: this.database,
-      contentStore: this.contentStore, sourceConversationId: command.sourceConversationId,
-      targetConversationId: ids.targetConversationId, catalog: sourceHandleCatalog,
-      coveredRecipeObjectIds: [...new Set([...handleFrontier.coveredRecipeObjectIds,
-        ...(sourceReservations?.coveredRecipeObjectIds ?? [])])], now });
     assertActive();
     const targetRootShape = await resolveForkRootShape(
       this.database,
@@ -300,6 +288,18 @@ export class ConversationForkControlPlane {
       await this.context.materializeStructure(command.sourceContextRootId)
     ).records.map((record) => requireId(record.segment.id, 'ContextSegment.id'));
     const retainedLineage = await readForkContextLineage(this.database, retainedSegmentIds, command.sourceConversationId);
+    // Exact current-generation snapshots are already the selected branch's authority. Only a
+    // missing shape needs occurrence reconstruction; copied abandoned requests are never unioned.
+    const handleEvidence = await readExactForkContextHandleSnapshot({ database: this.database,
+      contentStore: this.contentStore, sourceConversationId: command.sourceConversationId,
+      sourceRoot, selectedShape: targetRootShape }) ?? await readContextHandleRootEvidence(this.database, this.contentStore,
+        command.sourceConversationId, command.sourceContextRootId, { segmentIds: retainedSegmentIds });
+    const handleReservations = await prepareForkContextHandleReservations({ database: this.database,
+      contentStore: this.contentStore, sourceConversationId: command.sourceConversationId,
+      targetConversationId: ids.targetConversationId, targetContextRootId: ids.targetRootId, rootShape: targetRootShape,
+      catalog: handleEvidence.catalog, coveredRecipeObjectIds: [...new Set(handleEvidence.assertions.flatMap(step =>
+        step.kind === 'assert' && step.domain === 'ModelRequest' && typeof step.where.recipe_object_id === 'string'
+          ? [step.where.recipe_object_id] : []))], now });
     const historicalSourceRoots = await retainedForkHistoryRoots(
       this.database, sourceContextRoots, command.sourceContextRootId, retainedLineage.segmentIds
     );
@@ -385,7 +385,7 @@ export class ConversationForkControlPlane {
           )]
         : []),
       ...transcript.assertions,
-      ...handleFrontier.assertions,
+      ...handleEvidence.assertions,
       DOMAIN_REPOSITORIES.domain('AgentConversationLink').assertExactIds(
         { conversation_id: command.sourceConversationId },
         sourceAgentLinks.map((link) => requireId(link.id, 'AgentConversationLink.id'))
@@ -465,7 +465,6 @@ export class ConversationForkControlPlane {
         scope: { conversation_id: ids.targetConversationId }
       })),
       ...transcript.inserts,
-      ...handleReservations.steps,
       ...targetRootShape.nodeSteps,
       DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').insertWithNextSequence({
         id: ids.targetRootId,
@@ -486,6 +485,7 @@ export class ConversationForkControlPlane {
         root_id: ids.targetRootId,
         updated_at: now
       }),
+      ...handleReservations.steps,
       ...sourceAgentLinks.map((link) => DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         ...link,
         id: link.role === 'default'

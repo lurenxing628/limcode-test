@@ -1,4 +1,5 @@
 import { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, type ModelHandleCatalog } from './modelHandleCatalog';
+import { isImmutableContextHandleCatalog } from './contextHandleReadMemo';
 
 interface Fact<T> { id: number; key: string; value: T; leaf: SetNode<T> }
 interface SetNode<T> {
@@ -78,6 +79,14 @@ class FactSets<T> {
     return node;
   }
 
+  public retain(root: FactSet<T>): boolean {
+    if (!root) { this.emptyRoots++; return true; }
+    // A weak memo can outlive the final released owner. Do not resurrect freed branches/facts.
+    if (root.references === 0) return false;
+    root.roots++; root.references++;
+    return true;
+  }
+
   public release(root: FactSet<T>): void {
     if (!root) { this.emptyRoots--; return; }
     root.roots--;
@@ -111,12 +120,32 @@ export interface PackedContextHandleEvidence {
 export class ContextHandleEvidenceFacts {
   private readonly catalogs = new FactSets<ModelHandleCatalog>();
   private readonly ordinary = new FactSets<undefined>();
+  private readonly packedCatalogs = new WeakMap<ModelHandleCatalog, FactSet<ModelHandleCatalog>>();
+  private readonly packedOrdinary = new WeakMap<ModelHandleCatalog, FactSet<undefined>>();
 
   public add(catalogs: readonly ModelHandleCatalog[], currentOrdinaryCatalog?: ModelHandleCatalog): PackedContextHandleEvidence {
     return {
-      catalogs: catalogs.map(catalog => this.catalogs.acquire(catalogFacts(catalog))),
-      ...(currentOrdinaryCatalog ? { ordinary: this.ordinary.acquire(identityFacts(currentOrdinaryCatalog).map(key => [key, undefined])) } : {})
+      catalogs: catalogs.map(catalog => this.acquireCatalog(catalog)),
+      ...(currentOrdinaryCatalog ? { ordinary: this.acquireOrdinary(currentOrdinaryCatalog) } : {})
     };
+  }
+
+  private acquireCatalog(catalog: ModelHandleCatalog): FactSet<ModelHandleCatalog> {
+    const shareable = isImmutableContextHandleCatalog(catalog);
+    const prior = shareable ? this.packedCatalogs.get(catalog) : undefined;
+    if (prior !== undefined && this.catalogs.retain(prior)) return prior;
+    const packed = this.catalogs.acquire(catalogFacts(catalog));
+    if (shareable) this.packedCatalogs.set(catalog, packed);
+    return packed;
+  }
+
+  private acquireOrdinary(catalog: ModelHandleCatalog): FactSet<undefined> {
+    const shareable = isImmutableContextHandleCatalog(catalog);
+    const prior = shareable ? this.packedOrdinary.get(catalog) : undefined;
+    if (prior !== undefined && this.ordinary.retain(prior)) return prior;
+    const packed = this.ordinary.acquire(identityFacts(catalog).map(key => [key, undefined]));
+    if (shareable) this.packedOrdinary.set(catalog, packed);
+    return packed;
   }
 
   public remove(evidence: PackedContextHandleEvidence): void {

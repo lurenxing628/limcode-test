@@ -13,6 +13,7 @@ const compiledRoot = compiledRootInput
   ? path.resolve(root, compiledRootInput)
   : path.join(root, 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { RuntimePerformanceMetricCollector } = require(path.join(
   compiledRoot,
   'backend/reliableKernel/runtimePerformanceMetrics.js'
@@ -354,6 +355,7 @@ async function withApp(name, run) {
         created_at: now,
         updated_at: now
       }),
+      emptyConversationContextHandleStateStep(name, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `${name}-agent-link`,
         conversation_id: name,

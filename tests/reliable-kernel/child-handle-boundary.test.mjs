@@ -7,6 +7,7 @@ import test from 'node:test';
 
 const require = createRequire(import.meta.url);
 const root = process.env.LIMCODE_TEST_EXTENSION_ROOT || path.resolve('dist/extension');
+const { emptyConversationContextHandleStateStep } = require(path.join(root, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { buildModelHandleCatalog, resolveModelToolArguments, projectToolResultForModel } =
   require(path.join(root, 'backend/reliableKernel/modelHandleCatalog.js'));
 const catalog = buildModelHandleCatalog([{ answerBridgeIds: ['bridge-first', 'bridge-second'] }]);
@@ -171,6 +172,7 @@ async function withForkedChildHistory(run) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'Fork child refs', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
     ]);
     const input = (conversationId, key) => ({ source: { kind: 'command', key }, conversationId,

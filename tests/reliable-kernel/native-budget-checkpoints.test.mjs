@@ -10,6 +10,8 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
+const { readConversationContextHandleCatalog } = load('backend/reliableKernel/conversationChildHandles.js');
 const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSession.js');
 const { OpenAIResponsesNativeDeliveryError } = load('backend/capabilities/openAIResponsesNativeControl.js');
 const { nativePhysicalResponseBudgetPressure } = load('backend/reliableKernel/nativeCompressionGuard.js');
@@ -208,6 +210,7 @@ async function withNativeTurn(options, verify) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: 'native-budget', title: 'Native budget', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep('native-budget', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'native-agent', conversation_id: 'native-budget', agent_id: 'agent-main', role: 'default',
         created_at: now, updated_at: now
@@ -240,6 +243,7 @@ test('active ModelRequest survives Host/socket handoff: replayed async frame exe
       turnId: started.turnId, contextRootId: head.root_id,
       authoritySnapshotId: authority.id, idempotencyKey: `active-replay:${started.turnId}`,
       recipe: { kind: 'reliable-agent-turn', round: '1', tools: [definition], nativeResponses: capabilities,
+        modelHandleCatalog: await readConversationContextHandleCatalog(app.database, app.contentStore, 'native-budget'),
         nativeLogicalBudget: { planningInputCapacityTokens: 900000, compressionThresholdTokens: 800000,
           autoCompressionEnabled: false } }
     });

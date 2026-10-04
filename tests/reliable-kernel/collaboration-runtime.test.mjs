@@ -28,6 +28,7 @@ Module._load = function(request, parent, isMain) {
 };
 after(() => { Module._load = originalLoad; });
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { childConversationModelProfiles } = load('backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
@@ -138,6 +139,7 @@ async function fixture(send, run, providerType = 'openai-compatible') {
     const now = new Date().toISOString();
     await app.database.transaction(['root', 'ordinary'].flatMap(id => [
       repo('Conversation').insert({ id, title: id, status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep(id, now),
       repo('AgentConversationLink').insert({ id: `${id}-agent`, conversation_id: id, agent_id: parent.id, role: 'default', created_at: now, updated_at: now })
     ]));
     await app.recover();

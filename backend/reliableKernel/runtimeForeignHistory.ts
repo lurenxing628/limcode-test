@@ -1069,7 +1069,7 @@ function copiedNamePattern(base: string): RegExp {
 
 /** Why an older format is not opened here, saying only what is true of this root. */
 function oldFormatReason(location: ForeignRuntimeRootLocation, epoch: number): string {
-  if (epoch !== 3 && epoch !== 4 && epoch !== 5) {
+  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6) {
     return `它是不受支持的旧格式（第 ${epoch} 代），当前版本不能读取，也不能升级它。它原样保留，不会被删除。`;
   }
   if (location.kind === 'archive' || location.dataRootRelativePath.includes(`${VSCODE_RUNTIME_ARCHIVES_DIRECTORY}/`)) {

@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { createLlmProviderCapability } = require(path.join(compiledRoot, 'backend/capabilities/llmProvider.js'));
 const { NativeRequestSession } = require(path.join(compiledRoot, 'backend/reliableKernel/nativeRequestSession.js'));
 const MODEL = 'gpt-6-astra';
@@ -199,6 +200,7 @@ async function withHttpRuntime(run, { providerAdapter, retryPolicy = { enabled: 
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: CONVERSATION,
         title: 'Native HTTP Context', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep(CONVERSATION, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'native-http-context-agent',
         conversation_id: CONVERSATION, agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
     ]);

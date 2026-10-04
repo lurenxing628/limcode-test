@@ -11,6 +11,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { createLlmProviderCapability } = require(path.join(compiledRoot, 'backend/capabilities/llmProvider.js'));
 const { resetOpenAIResponsesWebSocketSessions } = require(path.join(compiledRoot, 'backend/capabilities/openAIResponsesWebSocketSession.js'));
 const { WebSocketServer } = require('ws');
@@ -266,6 +267,7 @@ async function withNativeRuntime(run, { transport = 'websocket', realAuthority =
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: conversationId, title: 'Native integration', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'native-integration-agent-link', conversation_id: conversationId, agent_id: stored?.agentId ?? 'agent-main',
         role: 'default', created_at: now, updated_at: now

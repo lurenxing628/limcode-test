@@ -10,6 +10,10 @@ const kernel = await import(pathToFileURL(path.join(
   root,
   'dist/extension/backend/reliableKernel/index.js'
 )).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(path.join(
+  root,
+  'dist/extension/backend/reliableKernel/conversationContextHandleState.js'
+)).href);
 
 test('StreamReset after a committed tool result never repeats the tool effect or loses its model result', {
   timeout: 60_000
@@ -89,6 +93,7 @@ test('StreamReset after a committed tool result never repeats the tool effect or
         created_at: now,
         updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `${conversationId}-agent`,
         conversation_id: conversationId,
@@ -201,6 +206,7 @@ test('同名 GPT 跨渠道隔离签名，切回原渠道保留签名，断流重
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: conversationId + '-agent', conversation_id: conversationId, agent_id: 'agent-main',
         role: 'default', created_at: now, updated_at: now

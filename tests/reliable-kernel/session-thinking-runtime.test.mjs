@@ -24,6 +24,7 @@ const vscode = { Uri, FileType: { Unknown: 0, File: 1, Directory: 2, SymbolicLin
 Module._load = function(request, parent, isMain) { return request === 'vscode' ? vscode : originalLoad.call(this, request, parent, isMain); };
 after(() => { Module._load = originalLoad; });
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = require('../../dist/extension/backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { childConversationModelProfiles } = require('../../dist/extension/backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
@@ -236,6 +237,7 @@ async function fixture(run, hooks = {}) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'Synthetic', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: agent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const input = key => ({ source: { kind: 'command', key }, conversationId: 'parent', leaseOwnerId: 'thinking-owner', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: 'synthetic input' });

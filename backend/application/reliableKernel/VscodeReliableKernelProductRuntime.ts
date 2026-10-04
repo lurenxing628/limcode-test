@@ -1,3 +1,5 @@
+import { readConversationContextHandleStateRow } from '../../reliableKernel/conversationContextHandleState';
+import { listPendingContextHandleUpgrades, upgradePendingConversationContextHandles, upgradeConversationContextHandles } from '../../reliableKernel/conversationContextHandleUpgrade';
 import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
 import { EXTENSION_USER_AGENT } from '../../../shared/extensionIdentity';
@@ -117,6 +119,7 @@ export class VscodeReliableKernelProductRuntime {
   private workspaceSyncFailed = false;
   private readonly externalRuntimeWatcher: ExternalDataVersionWatcher;
   private closing = false;
+  private readonly unsubscribeContextHandleUpgrades: () => void;
   private readonly initializeConfiguration: () => Promise<void>;
   private readonly workspaceFoldersSubscription: vscode.Disposable;
   private workspaceFoldersChangeTask: Promise<void> = Promise.resolve();
@@ -191,9 +194,19 @@ export class VscodeReliableKernelProductRuntime {
         if (!this.closing) void vscode.window.showErrorMessage(`LimCode 工作目录同步失败：${error instanceof Error ? error.message : String(error)}`);
       });
     });
+    this.unsubscribeContextHandleUpgrades = this.application.database.onCommit(commit => {
+      if (this.closing || !commit.internalChangedDomains?.includes('ConversationContextHandleState')) return;
+      void this.relocatedWorkSettled.then(() => this.closing ? undefined
+        : upgradeContextHandlesWithProgress(this.application, this.recoveryController.signal)).catch(error => {
+          if (!this.closing) console.error('[LimCode] 对话引用目录升级暂停。', error);
+        });
+    });
     this.externalRuntimeWatcher = new ExternalDataVersionWatcher(
       () => this.application.database.externalDataVersion(),
       async () => {
+        void upgradeContextHandlesWithProgress(this.application, this.recoveryController.signal).catch(error => {
+          if (!this.closing) console.error('[LimCode] 对话引用目录升级暂停。', error);
+        });
         await this.application.refreshExternalRuntimeWork();
         this.conversations.recoverUnheldTurns();
       },
@@ -474,7 +487,8 @@ export class VscodeReliableKernelProductRuntime {
         application: () => application,
         conversations: () => conversations,
         children: () => childAgents,
-        ready: () => Promise.all([toolHost.initialize(), initializeConfiguration()]).then(() => undefined),
+        ready: (conversationId) => Promise.all([toolHost.initialize(), initializeConfiguration(),
+          upgradeContextHandlesWithProgress(application!, undefined, conversationId)]).then(() => undefined),
         notify: request => {
           if (request.sourceKind === 'child_failure') {
             void vscode.window.showErrorMessage('LimCode 子 Agent 执行失败；失败详情已保留在可靠 Runtime 中。');
@@ -632,6 +646,9 @@ export class VscodeReliableKernelProductRuntime {
     const task = (async () => {
       await this.relocatedWorkSettled;
       await phase(() => this.externalRuntimeWatcher.start());
+      void upgradeContextHandlesWithProgress(this.application, controller.signal).catch(error => {
+        if (!this.closing) console.error('[LimCode] 对话引用目录升级暂停。', error);
+      });
       // Join every initialization branch even on failure; close() must not close the database
       // beneath a sibling still preparing capabilities. Retry each idempotent phase separately.
       const initial = await Promise.allSettled([
@@ -650,7 +667,12 @@ export class VscodeReliableKernelProductRuntime {
       this.recoveryError = undefined;
       return recovered.value;
     })().catch((error) => {
-      if (!this.closing) this.recoveryError = error;
+      if (!this.closing) {
+        this.recoveryError = error;
+        // Cancelling the visible upgrade preserves checkpoints. Explicit continuation may
+        // finish it and re-enter the remaining startup recovery rather than pinning a failure.
+        if (error instanceof Error && error.name === 'AbortError' && !controller.signal.aborted) this.recoveryTask = undefined;
+      }
       throw error;
     });
     this.recoveryTask = task;
@@ -658,11 +680,12 @@ export class VscodeReliableKernelProductRuntime {
   }
 
   /** Commands that freeze a new execution authority wait for the post-activation catalogs. */
-  public ensureCapabilitiesReady(): Promise<void> {
+  public ensureCapabilitiesReady(conversationId?: string): Promise<void> {
     if (this.closing) return Promise.reject(new Error('Reliable Runtime is closing.'));
     return Promise.all([
       this.toolHost.initialize(),
-      this.initializeConfiguration()
+      this.initializeConfiguration(),
+      ...(conversationId ? [upgradeContextHandlesWithProgress(this.application, undefined, conversationId)] : [])
     ]).then(() => undefined);
   }
 
@@ -716,7 +739,7 @@ export class VscodeReliableKernelProductRuntime {
       conversations: this.conversations,
       conversationId,
       signal,
-      ready: () => this.ensureCapabilitiesReady()
+      ready: () => this.ensureCapabilitiesReady(conversationId)
     })).finally(() => {
       if (this.conversationRecoveryTasks.get(conversationId) === task) {
         this.conversationRecoveryTasks.delete(conversationId);
@@ -799,6 +822,7 @@ export class VscodeReliableKernelProductRuntime {
   public async close(): Promise<void> {
     this.closing = true;
     this.workspaceFoldersSubscription.dispose();
+    this.unsubscribeContextHandleUpgrades();
     const cancellation = new Error('Reliable Runtime recovery cancelled for Host handoff.');
     cancellation.name = 'AbortError';
     this.configuration.mutations.retireModelProfileAuthority();
@@ -870,4 +894,49 @@ export function freezableClaimProbe(
   return async (conversationId) => (
     executionGate.frozen === 0 || (executionGate.owned ? executionGate.owned.has(conversationId) : owners.owns(conversationId))
   ) && await eligible(conversationId);
+}
+
+
+const contextHandleUpgradeNotifications = new WeakMap<ReliableKernelApplication, Map<string, Promise<void>>>();
+
+/** The one-time history pass is a visible cancellable recovery phase, never hidden in send preparation. */
+function upgradeContextHandlesWithProgress(application: ReliableKernelApplication, signal?: AbortSignal, conversationId?: string): Promise<void> {
+  let notifications = contextHandleUpgradeNotifications.get(application);
+  if (!notifications) { notifications = new Map(); contextHandleUpgradeNotifications.set(application, notifications); }
+  const key = conversationId ?? '*';
+  const existing = notifications.get(key);
+  if (existing) return existing;
+  const job = (async () => {
+    if (conversationId ? (await readConversationContextHandleStateRow(application.database, conversationId)).state === 'ready'
+      : (await listPendingContextHandleUpgrades(application.database)).length === 0) return;
+    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
+      title: 'LimCode：升级对话引用目录（仅一次，可取消后继续）', cancellable: true }, async (progress, token) => {
+      const controller = new AbortController();
+      const abort = () => controller.abort(signal?.reason ?? Object.assign(
+        new Error('对话引用目录升级已取消，下次可继续。'), { name: 'AbortError' }));
+      const cancellation = token.onCancellationRequested(abort);
+      signal?.addEventListener('abort', abort, { once: true });
+      if (signal?.aborted || token.isCancellationRequested) abort();
+      let reportedAt = 0;
+      try {
+        const upgrade = conversationId
+          ? (options: Parameters<typeof upgradePendingConversationContextHandles>[2]) => upgradeConversationContextHandles(application.database, application.contentStore, conversationId, options)
+          : (options: Parameters<typeof upgradePendingConversationContextHandles>[2]) => upgradePendingConversationContextHandles(application.database, application.contentStore, options);
+        await upgrade({
+          signal: controller.signal,
+          onProgress: state => {
+            const now = Date.now();
+            if (now - reportedAt < 100 && state.completedRequests !== state.totalRequests) return;
+            reportedAt = now;
+            progress.report({ message: `对话 ${state.conversationIndex}/${state.conversationCount}，已核对 ${state.completedRequests}/${state.totalRequests} 份历史请求` });
+          }
+        });
+      } finally { cancellation.dispose(); signal?.removeEventListener('abort', abort); }
+    });
+  })();
+  notifications.set(key, job);
+  void job.finally(() => {
+    if (notifications!.get(key) === job) notifications!.delete(key);
+  }).catch(() => undefined);
+  return job;
 }

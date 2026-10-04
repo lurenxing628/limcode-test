@@ -30,6 +30,8 @@ Module._load = function(request, parent, isMain) {
 };
 after(() => { Module._load = originalLoad; });
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep, readCurrentConversationContextHandleState } =
+  require('../../dist/extension/backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -89,6 +91,7 @@ async function fixture(run, hooks = {}) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'live-conversation', title: '测试', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('live-conversation', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'live-link', conversation_id: 'live-conversation', agent_id: agent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const input = (key, content = '测试输入') => ({ source: { kind: 'command', key }, conversationId: 'live-conversation', leaseOwnerId: 'live-owner', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content });
@@ -194,10 +197,14 @@ test('模型请求恢复只读已保存的压缩设置，不读取后来改变�
     await update();
     const settingsId = await app.modelProvider.freezeRequestSettings(started.turnId, authority.snapshot.id);
     const [head] = await list('ConversationContextHeadLink');
+    const handles = await readCurrentConversationContextHandleState(app.database, app.contentStore, 'live-conversation');
     const created = await app.modelProvider.createModelRequest({
       turnId: started.turnId, authoritySnapshotId: authority.snapshot.id, contextRootId: head.root_id,
       settingsSnapshotContentObjectId: settingsId,
-      recipe: { kind: 'reliable-context-compression', sourceRootId: head.root_id, sourceSegmentCount: 1 }, idempotencyKey: 'pending-compression'
+      recipe: { kind: 'reliable-context-compression', sourceRootId: head.root_id, sourceSegmentCount: 1,
+        modelHandleCatalog: handles.catalog, contextHandleScope: { conversationId: 'live-conversation',
+          rootId: handles.row.context_root_id, provenanceRevision: String(handles.row.provenance_revision),
+          resetFence: String(handles.row.requires_native_reset) } }, idempotencyKey: 'pending-compression'
     });
     await update({ kind: 'disabled' });
     const restarted = new kernel.ModelProviderControlPlane(app.database, app.contentStore, { compressionSettingsAuthority: configuration });

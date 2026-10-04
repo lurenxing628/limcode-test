@@ -19,6 +19,8 @@ import { openRuntimeCasVerificationCache, type RuntimeCasVerifier } from './runt
 import { classifyRecordedProcess, ownProcessStartIdentity, type RecordedProcessClassifier } from './runtimeClaimPrimitives';
 import { RuntimeDatabaseWorkerError, type RuntimeDatabase } from './runtimeDatabase';
 import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
+import { MergeContextHandleStates } from './runtimeMergeContextHandleStates';
+import { CONTEXT_HANDLE_STATE_DOMAIN, CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN } from './conversationContextHandleState';
 import { isRuntimeDataInvariant } from './runtimeDataInvariant';
 import {
   describeUnfinishedWork, finalizeUnfinishedWork, hasFinalizableWork, inspectUnfinishedWork, KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON,
@@ -314,7 +316,7 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   /** A previous commit was found through its exact id set; rows were not merged again. */
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   /**
    * Unfinished work closed before the merge (source backup kept beside the source): Turns ended as
    * cancelled or interrupted and queued, unsent user messages cancelled, as counted in the source.
@@ -1430,7 +1432,7 @@ interface SourceProgress {
    */
   files?: string;
   fingerprint?: RuntimeDataSetFingerprint;
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   /**
    * Unfinished work was (being) closed in the source; `complete` once every transition succeeded.
    * `earlier`: closed by an earlier attempt whose outcome did not say so (none in this attempt).
@@ -3046,12 +3048,14 @@ async function planRows(
   const plan: RowPlan = { targetVersion, steps: [], assertions: [], inserted: [], reused: 0, insertedConversations: 0, conflicts: { count: 0, samples: [] } };
   const presence = plan.assertions!;
   const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => !skipped?.get(domain)?.has(id));
+  const handleStates = new MergeContextHandleStates(source, target, (domain, id) => !skipped?.get(domain)?.has(id));
   const sink: RuntimeDataSetMergeChunkSink = {
     timelineImportSource,
     steps: plan.steps,
     presence,
     inserted: (domain, id, row) => {
       aggregates.touch(domain, row);
+      handleStates.touch(domain, row);
       plan.inserted.push([domain, id]);
       if (domain === 'Conversation') plan.insertedConversations += 1;
     },
@@ -3124,8 +3128,11 @@ async function planRows(
     // these edges unchanged so chained imports retain every verified origin/ordinal proof.
     const provenance = MERGE_DOMAIN_ORDER.find(schema => schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN);
     if (provenance) await planDomain(provenance);
-    if (plan.conflicts.count === 0) await aggregates.validate();
-  } finally { aggregates.close(); }
+    if (plan.conflicts.count === 0) {
+      await aggregates.validate();
+      await handleStates.append(steps => { for (const step of steps) plan.steps.push(step); });
+    }
+  } finally { aggregates.close(); handleStates.close(); }
   // A loop, not push(...presence): an argument list of every source row overflows the call stack.
   if (plan.steps.length > 0) for (const step of presence) plan.steps.push(step);
   return plan;
@@ -3170,6 +3177,9 @@ export function planMergeChunk(
   existing: ReadonlyArray<DomainRow | null>,
   sink: RuntimeDataSetMergeChunkSink
 ): void {
+  // Mutable derived authority is local to the receiving database. Its source row is neither a
+  // conflicting user fact nor proof that the target's union of frozen evidence is ready.
+  if (schema.key === CONTEXT_HANDLE_STATE_DOMAIN || schema.key === CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN) return;
   const repository = DOMAIN_REPOSITORIES.domain(schema.key);
   const allowed = IDENTITY_MERGE_DIFFERENCES.get(schema.key);
   const timelineImport = TIMELINE_MERGE_DOMAINS.has(schema.key);
@@ -4126,7 +4136,7 @@ export interface RuntimeDataSetMigrationSource {
   /** Exact SQLite file state of the source the snapshot was taken from. */
   files: string;
   rows: number;
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   close(): Promise<void>;
 }
 
@@ -4230,7 +4240,7 @@ export function runtimeDataSetCopyRow(domain: string, raw: Record<string, unknow
  * The error a caller of the copy sees: a source refusal as RuntimeDataSetMergeError (code and
  * user-facing message, with the in-place upgrade noted); a cancellation and anything else unchanged.
  */
-export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 }): unknown {
+export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 | 6 }): unknown {
   if (error instanceof RuntimeDataSetMergeError || (error instanceof Error && error.name === 'AbortError')) return error;
   if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error) && !isRuntimeDataInvariant(error)) return error;
   const outcome = sourceOutcome(error, state);

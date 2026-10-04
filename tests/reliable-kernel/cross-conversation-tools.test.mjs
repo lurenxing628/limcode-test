@@ -28,6 +28,7 @@ Module._load = function(request, parent, isMain) {
 };
 after(() => { Module._load = originalLoad; });
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { childConversationModelProfiles } = load('backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
@@ -218,6 +219,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
     await app.database.transaction([
       ...[[ROOT, 'Root title'], [PEER, 'Peer title']].flatMap(([id, title]) => [
         repo('Conversation').insert({ id, title, status: 'active', created_at: now, updated_at: now }),
+        emptyConversationContextHandleStateStep(id, now),
         repo('AgentConversationLink').insert({ id: `${id}-agent`, conversation_id: id, agent_id: agent.id, role: 'default', created_at: now, updated_at: now })
       ]),
       // Both belong to one project: cross-conversation tools reach only the caller's project.
@@ -228,6 +230,7 @@ async function fixture(send, run, { enabled = true, switchValue = true, wakeGate
       const at = new Date().toISOString();
       await app.database.transaction([
         repo('Conversation').insert({ id, title, status: 'active', created_at: at, updated_at: at }),
+        emptyConversationContextHandleStateStep(id, at),
         repo('AgentConversationLink').insert({ id: `${id}-agent`, conversation_id: id, agent_id: agent.id, role: 'default', created_at: at, updated_at: at }),
         ...(folder ? kernel.projectFolderAssignmentSteps({ conversationId: id, folder, now: at }) : [])
       ]);

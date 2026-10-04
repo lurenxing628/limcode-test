@@ -17,6 +17,9 @@ after(() => { Module._load = originalLoad; });
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
+const { upgradeConversationContextHandles } = load('backend/reliableKernel/conversationContextHandleUpgrade.js');
+const { VscodeReliableKernelProductRuntime: ProductRuntime } = load('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const { RuntimeWriteGate } = load('backend/application/reliableKernel/runtimeWriteGate.js');
 const { ForkContextCandidateProbe } = load('backend/reliableKernel/conversationForkContext.js');
@@ -148,6 +151,7 @@ async function withForkRuntime(run, {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: 'source', title: 'Source fixture', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep('source', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'source-agent', conversation_id: 'source', agent_id: agent.id,
         role: 'default', created_at: now, updated_at: now
@@ -168,12 +172,21 @@ async function withForkRuntime(run, {
           ? await app.turns.retry({ ...command, ...retry })
           : await app.turns.input({ ...command, content: message.content ?? key,
             ...(message.contentType ? { contentType: message.contentType } : {}) });
-        const [lease] = await rows(app, 'ExecutionLease', { turn_id: input.turnId });
-        assert.ok(lease);
-        const done = kernel.runWithExecutionLeaseFence({
-          id: lease.id, conversationId, turnId: input.turnId, ownerId: lease.owner_id,
-          hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
-        }, () => app.agentLoop.drive(input.turnId));
+        // This bare-application fixture intentionally has no ProductRuntime notification watcher.
+        // Pump only its explicit scope-upgrade parking result, using the production target job;
+        // all other waits remain observable and never become a fabricated completed Turn.
+        const done = (async () => {
+          for (;;) {
+            const [lease] = await rows(app, 'ExecutionLease', { turn_id: input.turnId });
+            assert.ok(lease);
+            const result = await kernel.runWithExecutionLeaseFence({
+              id: lease.id, conversationId, turnId: input.turnId, ownerId: lease.owner_id,
+              hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
+            }, () => app.agentLoop.drive(input.turnId));
+            if (result.terminalStatus !== 'waiting' || result.waitingContextHandleUpgrade !== true) return result;
+            await upgradeConversationContextHandles(app.database, app.contentStore, conversationId);
+          }
+        })();
         return { input, done };
       },
       async turn(conversationId, key, retry, message) {
@@ -217,6 +230,93 @@ function reachedGate(reached, running, step) {
     throw new Error(`The running Turn ended (${result.terminalStatus}) before ${step}.`);
   })]), step);
 }
+
+test('production rewrite watcher upgrades a parked target and the real Runner wakes its same Turn', async () => {
+  await withForkRuntime(async h => {
+    const first = await h.turn('source', 'before-watched-rewrite');
+    const errors = [];
+    const runner = new ReliableConversationRunner(h.app, 'watched-rewrite-owner', error => errors.push(error));
+    const priorWindow = vscode.window;
+    const priorProgressLocation = vscode.ProgressLocation;
+    const priorWorkspaceEvent = vscode.workspace.onDidChangeWorkspaceFolders;
+    let releaseUpgrade;
+    const upgradeGate = new Promise(resolve => { releaseUpgrade = resolve; });
+    let notificationEntered;
+    const notification = new Promise(resolve => { notificationEntered = resolve; });
+    let parkedTurn;
+    const parked = new Promise(resolve => { parkedTurn = resolve; });
+    const progressTasks = [];
+    const observedStates = [];
+    const drive = h.app.agentLoop.drive.bind(h.app.agentLoop);
+    h.app.agentLoop.drive = async turnId => {
+      const result = await drive(turnId);
+      if (result.waitingContextHandleUpgrade) parkedTurn(turnId);
+      return result;
+    };
+    vscode.ProgressLocation = { Notification: 15 };
+    vscode.workspace.onDidChangeWorkspaceFolders = () => ({ dispose() {} });
+    vscode.window = { ...priorWindow,
+      withProgress(_options, operation) {
+        notificationEntered();
+        const task = upgradeGate.then(() => operation({ report() {} }, {
+          isCancellationRequested: false, onCancellationRequested() { return { dispose() {} }; }
+        }));
+        progressTasks.push(task);
+        return task;
+      },
+      async showErrorMessage(message) { errors.push(new Error(message)); }
+    };
+    const product = new ProductRuntime({ application: h.app, configuration: h.configuration,
+      conversations: runner, childAgents: { setConversationRecovery() {} }, toolHost: {}, fileDiffs: {},
+      conversationLifecycle: {}, providerRegistry: {}, diagnostics: {}, debugCapture: {},
+      conversationEligibility: async () => ({ status: 'eligible' }),
+      conversationEntryEligibility: async () => ({ status: 'eligible' }),
+      initializeConfiguration: async () => {}, executionGate: { frozen: 0 }
+    });
+    const unwatch = h.app.database.onCommit(commit => {
+      if (commit.internalChangedDomains?.includes('ConversationContextHandleState')) {
+        void rows(h.app, 'ConversationContextHandleState', { conversation_id: 'source' })
+          .then(([state]) => observedStates.push(state.state)).catch(error => errors.push(error));
+      }
+    });
+    try {
+      const admitted = await runner.editAndRun({ commandId: 'watched-edit-and-run', conversationId: 'source',
+        messageId: first.messageId, expectedRevisionId: first.messageRevisionId, text: 'after-watched-rewrite' });
+      await bounded(notification, 'the actual ProductRuntime upgrade notification');
+      assert.equal(await bounded(parked, 'the actual Runner to park on the new scope'), admitted.turnId);
+      assert.equal((await rows(h.app, 'ConversationContextHandleState', { conversation_id: 'source' }))[0].state, 'pending');
+      assert.equal((await rows(h.app, 'Turn', { id: admitted.turnId }))[0].status, 'active');
+      assert.deepEqual(await rows(h.app, 'TurnTermination', { turn_id: admitted.turnId }), []);
+      releaseUpgrade();
+      await bounded((async () => {
+        for (;;) {
+          const [terminal] = await rows(h.app, 'TurnTermination', { turn_id: admitted.turnId });
+          if (terminal) return assert.equal(terminal.terminal_status, 'completed');
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      })(), 'the ready-state commit to wake and finish the same Turn');
+      await runner.waitForIdle();
+      assert.ok(observedStates.includes('pending'));
+      assert.ok(observedStates.includes('ready'));
+      assert.equal((await rows(h.app, 'ConversationContextHandleState', { conversation_id: 'source' }))[0].state, 'ready');
+      assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /after-watched-rewrite/);
+      assert.deepEqual(errors, []);
+    } finally {
+      releaseUpgrade();
+      product.closing = true;
+      product.recoveryController.abort();
+      product.unsubscribeContextHandleUpgrades();
+      product.workspaceFoldersSubscription.dispose();
+      await product.externalRuntimeWatcher.stop();
+      await Promise.allSettled(progressTasks);
+      unwatch(); runner.dispose(); await runner.waitForIdle();
+      h.app.agentLoop.drive = drive;
+      vscode.window = priorWindow;
+      vscode.ProgressLocation = priorProgressLocation;
+      vscode.workspace.onDidChangeWorkspaceFolders = priorWorkspaceEvent;
+    }
+  });
+});
 
 for (const role of ['user', 'model']) {
   test(`fork at ${role} boundary continues, reopens, continues again and forks its copied history`, async () => {
@@ -2148,7 +2248,7 @@ function createVscodeStub() {
     toString() { return `file://${this.path}`; }
   }
   const FileType = { Unknown: 0, File: 1, Directory: 2 };
-  return { Uri, FileType, workspace: { fs: {
+  return { Uri, FileType, window: {}, ProgressLocation: { Notification: 15 }, workspace: { fs: {
     async createDirectory(uri) { await fs.mkdir(uri.fsPath, { recursive: true }); },
     async readFile(uri) { return fs.readFile(uri.fsPath); },
     async writeFile(uri, bytes) { await fs.mkdir(path.dirname(uri.fsPath), { recursive: true }); await fs.writeFile(uri.fsPath, bytes); },

@@ -12,6 +12,12 @@ const compiledRoot = process.env.LIMCODE_COMPILED_ROOT
 const kernel = await import(pathToFileURL(
   path.join(compiledRoot, 'backend/reliableKernel/index.js')
 ).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(
+  path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js')
+).href);
+const { readConversationContextHandleCatalog } = await import(pathToFileURL(
+  path.join(compiledRoot, 'backend/reliableKernel/conversationChildHandles.js')
+).href);
 
 function modelOutput(text) {
   return { role: 'model', parts: [{ text }] };
@@ -198,6 +204,7 @@ async function withNativeApp(name, run, host, toolPolicyOverrides) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: name, title: name, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(name, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `${name}-agent-link`, conversation_id: name, agent_id: 'agent-main',
         role: 'default', created_at: now, updated_at: now
@@ -226,7 +233,8 @@ async function createStreamingRequest(app, turnId, key, tools = []) {
     turnId,
     contextRootId: head.root_id,
     authoritySnapshotId: authoritySnapshot.id,
-    recipe: { kind: 'reliable-agent-turn', round: '1', tools },
+    recipe: { kind: 'reliable-agent-turn', round: '1', tools,
+      modelHandleCatalog: await readConversationContextHandleCatalog(app.database, app.contentStore, turn.conversation_id) },
     idempotencyKey: key
   });
   // Drive the established dispatch socket-open: it commits the full streaming aggregate

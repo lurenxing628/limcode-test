@@ -272,3 +272,8 @@ docs/architecture/*
 !tests/reliable-kernel/history-preparation-admission.test.mjs
 
 !/tests/reliable-kernel/attachment-source-scope-cache.test.mjs
+
+!/tests/reliable-kernel/current-context-handle-state.test.mjs
+
+!/tests/reliable-kernel/current-context-handle-merge.test.mjs
+!/tests/reliable-kernel/context-handle-head-writers.test.mjs

@@ -1,3 +1,4 @@
+import { emptyConversationContextHandleStateStep } from '../../reliableKernel/conversationContextHandleState';
 import type { ContentObjectMetadata } from '../../reliableKernel/contentAddressedStore';
 import type { StructuralContextRecord } from '../../reliableKernel/contextSequence';
 import type { HistoryPreparationPermit } from '../../reliableKernel/historyPreparationAdmission';
@@ -175,6 +176,7 @@ export class ReliableConversationLifecycle {
           DOMAIN_REPOSITORIES.domain('Conversation').insert({
             id: conversationId, title, status: 'active', created_at: now, updated_at: now
           }),
+          emptyConversationContextHandleStateStep(conversationId, now),
           DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
             id: stablePhaseFId('agent_conversation_link', conversationId), conversation_id: conversationId,
             agent_id: agent.agentId, role: 'default', created_at: now, updated_at: now

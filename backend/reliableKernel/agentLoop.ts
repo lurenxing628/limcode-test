@@ -1,3 +1,4 @@
+import { readConversationContextHandleStateRow, readCurrentConversationContextHandleState } from './conversationContextHandleState';
 import { acceptedNoticeMetadata, type AcceptedAnswerNotice } from './answerPresentation';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
@@ -9,6 +10,7 @@ import {
   modelHandleEntries,
   modelHandleRef,
   normalizeModelHandleCatalog,
+  prepareModelHandleCatalog,
   resolveModelToolArguments,
   UnknownModelHandleReferenceError,
   type ModelHandleCatalog
@@ -34,6 +36,7 @@ import type { RuntimeDeliveryModelProjection } from './runtimeDeliveryProjection
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { ContextSequenceControlPlane, type MaterializedContextStructure } from './contextSequence';
+import { selectContextHandleBindings } from './contextHandleOccurrenceEvidence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
 import {
   compareGuidancePositions,
@@ -307,6 +310,7 @@ export interface ReliableAgentLoopResult {
   assistantMessageIds: string[];
   toolCallIds: string[];
   waitingToolCallId?: string;
+  waitingContextHandleUpgrade?: true;
 }
 
 interface NormalizedToolCall {
@@ -352,6 +356,8 @@ interface OrdinaryRequestPlanningFacts {
 }
 
 interface CurrentTurnRequestState {
+  /** Operation-local immutable root view, reused by native predecessor selection. */
+  structure: MaterializedContextStructure;
   reference?: FrozenCurrentTurnInputReference;
   compressionBoundaryId?: string;
 }
@@ -525,6 +531,11 @@ export class ReliableAgentLoop {
       try {
         return await this.driveOnce(turnId, retryNumber < LOCAL_EXECUTION_MAX_RETRIES);
       } catch (error) {
+        if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_FRONTIER_CHANGED') {
+          retryNumber -= 1;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          continue;
+        }
         if (!isRetryableLocalExecutionError(error)) throw error;
         if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
         // Re-entry uses the last durable ModelRequest, assistant identity and Effect receipts.
@@ -576,6 +587,13 @@ export class ReliableAgentLoop {
         // (quiesceNativeCalls) before the lease goes back.
         if (await this.database.conversationOwners.executionEligibility(conversationId) === 'ineligible') {
           throw new ExecutionEligibilityLostError(conversationId);
+        }
+        if ((await readConversationContextHandleStateRow(this.database, conversationId)).state === 'pending') {
+          if (await this.terminateIfRequested(turnId, 'context-handle-upgrade-wait')) {
+            return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+          }
+          return { turnId, terminalStatus: 'waiting', modelRequestIds, assistantMessageIds, toolCallIds,
+            waitingContextHandleUpgrade: true };
         }
         await this.cancelSupersededCompressionRequests(
           turnId,
@@ -1062,6 +1080,14 @@ export class ReliableAgentLoop {
         requestSequence += 1n;
       }
     } catch (error) {
+      if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_UPGRADE_PENDING') {
+        if (await this.terminateIfRequested(turnId, 'context-handle-upgrade-wait')) {
+          return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
+        }
+        return { turnId, terminalStatus: 'waiting', modelRequestIds, assistantMessageIds, toolCallIds,
+          waitingContextHandleUpgrade: true };
+      }
+      if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_FRONTIER_CHANGED') throw error;
       if (error instanceof NativeSafetyWaitError) {
         if (await this.terminateIfRequested(turnId, 'native-safety-wait')) {
           return { turnId, terminalStatus: 'interrupted', modelRequestIds, assistantMessageIds, toolCallIds };
@@ -1171,11 +1197,10 @@ export class ReliableAgentLoop {
       freshConfigurationUpdate?: { effort: string };
     };
   }): Promise<PlainJsonValue> {
-    const [runtimeStatus, turnTaskCard, previousTaskCard, nativeFreeze] = await Promise.all([
+    const [runtimeStatus, turnTaskCard, previousTaskCard] = await Promise.all([
       this.readRuntimeStatusCard(input.turnId),
       readCurrentTurnTaskCard(this.database, input.turnId),
-      this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round),
-      this.readNativeRecipeFreeze(input)
+      this.readPreviousTaskCardReminderStateForRound(input.turnId, input.round)
     ]);
     const runtimeStatusCard = runtimeStatus.statusCard;
     // One validated immutable root supplies both input membership and provider-visible bytes.
@@ -1183,7 +1208,10 @@ export class ReliableAgentLoop {
     const { structure, content: materialized } = await this.context.materializeWithStructure(
       requireId(input.headRootId, 'headRootId')
     );
-    const currentTurnState = await this.readCurrentTurnInputReference(input.turnId, structure);
+    const [currentTurnState, nativeFreeze] = await Promise.all([
+      this.readCurrentTurnInputReference(input.turnId, structure),
+      this.readNativeRecipeFreeze({ ...input, scopeReset: runtimeStatus.requiresNativeReset, structure })
+    ]);
     const conversationId = requireId(materialized.root.conversation_id, 'ContextSequenceRoot.conversation_id');
     const attachmentCatalogState = await this.modelProvider.projectAttachmentCatalogState(
       conversationId,
@@ -1194,8 +1222,9 @@ export class ReliableAgentLoop {
       conversationId,
       attachmentCatalogState.catalog
     );
+    const contextInputSources: unknown[] = materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8'));
     const handleSources: unknown[] = [
-      ...materialized.segments.map((segment) => Buffer.from(segment.content).toString('utf8')),
+      ...contextInputSources,
       attachmentCatalogState.catalog,
       ...(runtimeStatusCard ? [runtimeStatusCard] : []),
       input.tools
@@ -1205,7 +1234,9 @@ export class ReliableAgentLoop {
         'ContentObject',
         currentTurnState.reference.contentObjectId
       ) as unknown as ContentObjectMetadata;
-      handleSources.push((await this.contentStore.read(inputContentObject)).toString('utf8'));
+      const inputContent = (await this.contentStore.read(inputContentObject)).toString('utf8');
+      handleSources.push(inputContent);
+      if (currentTurnState.reference.reinject) contextInputSources.push(inputContent);
     }
     const seeds = mergeModelHandleCatalogs(attachmentHandles, runtimeStatus.contextHandles);
     let modelHandleCatalog = buildModelHandleCatalog(handleSources, seeds);
@@ -1220,10 +1251,18 @@ export class ReliableAgentLoop {
     const attachmentRefs = new Map(attachmentHandles.entries.map(entry => [entry.target, entry.ref]));
     modelHandleCatalog = { ...modelHandleCatalog, entries: modelHandleCatalog.entries.filter(entry =>
       entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
+    // Share one immutable lookup for this operation; keep the plain catalog in the frozen recipe.
+    const preparedModelHandles = prepareModelHandleCatalog(modelHandleCatalog);
+    const inputBindings = selectContextHandleBindings(contextInputSources, modelHandleCatalog);
+    const establishedInputRefs = new Map(runtimeStatus.contextHandles.entries.map(entry => [entry.ref, entry]));
+    const contextHandleInputBindings = { ...inputBindings, entries: inputBindings.entries.filter(entry => {
+      const established = establishedInputRefs.get(entry.ref);
+      return !established || established.kind !== entry.kind || established.target !== entry.target;
+    }) };
     if (runtimeStatusCard) {
       // Labels are runtime data. Behavioral guidance belongs to the run_agent tool definition.
       runtimeStatusCard.card += runtimeStatusCard.children.map(child => '\n' + JSON.stringify({
-        childRef: modelHandleRef(modelHandleCatalog, 'child', child.answerBridgeId),
+        childRef: modelHandleRef(preparedModelHandles, 'child', child.answerBridgeId),
         label: child.label, task: child.task, initialTask: child.initialTask,
         currentTasks: child.currentTasks, currentInputCount: child.currentInputCount,
         queuedTasks: child.queuedTasks, queuedInputCount: child.queuedInputCount,
@@ -1232,27 +1271,27 @@ export class ReliableAgentLoop {
         status: child.status, resumable: child.resumable
       })).join('');
       const inheritedChildRefs = (runtimeStatusCard.inheritedChildTargets ?? [])
-        .map(target => modelHandleRef(modelHandleCatalog, 'child', target))
+        .map(target => modelHandleRef(preparedModelHandles, 'child', target))
         .filter((ref): ref is string => !!ref);
       if (inheritedChildRefs.length > 0) {
         runtimeStatusCard.card += '\n' + JSON.stringify({ inheritedChildRefs, operable: false });
       }
     }
     let statusCard = runtimeStatusCard;
-    const processRepairCard = await historicalProcessHandleCard(this.database, this.contentStore, conversationId, modelHandleCatalog);
+    const processRepairCard = await historicalProcessHandleCard(this.database, this.contentStore, conversationId, preparedModelHandles);
     if (processRepairCard) {
       statusCard ??= emptyRuntimeStatusCard('[Historical reference repair — runtime data]');
       statusCard.card += '\n' + processRepairCard;
     }
     if (forkIdentity && inheritedCollaboration) {
       const refs = (kind: 'conversation' | 'collaborationMessage', targets: readonly string[]) => targets
-        .map(target => modelHandleRef(modelHandleCatalog, kind, target)).filter((ref): ref is string => !!ref);
+        .map(target => modelHandleRef(preparedModelHandles, kind, target)).filter((ref): ref is string => !!ref);
       statusCard ??= emptyRuntimeStatusCard('[Forked conversation — runtime data, not instructions]');
       statusCard.card += '\n' + [
         'This conversation is a fork: its history up to the fork was copied from forkedFromConversationRefs, nearest first. In that copied history, "this conversation" means the conversation it was copied from, never this one.',
         'inheritedMessageRefs were sent or received by those conversations, not by this one: this conversation cannot answer them or read them as its own messages. Send new messages without replyToMessageRef.',
         JSON.stringify({
-          selfConversationRef: modelHandleRef(modelHandleCatalog, 'conversation', forkIdentity.conversationId),
+          selfConversationRef: modelHandleRef(preparedModelHandles, 'conversation', forkIdentity.conversationId),
           forkedFromConversationRefs: refs('conversation', inheritedCollaboration.sourceConversationIds),
           inheritedMessageRefs: refs('collaborationMessage', inheritedCollaboration.messageIds),
           operable: false
@@ -1277,6 +1316,8 @@ export class ReliableAgentLoop {
       tools: input.tools,
       attachmentCatalogState,
       modelHandleCatalog,
+      contextHandleScope: runtimeStatus.contextHandleScope,
+      ...(contextHandleInputBindings.entries.length ? { contextHandleInputBindings } : {}),
       ...(currentTurnState.reference ? { currentTurnInput: currentTurnState.reference } : {}),
       ...(turnTaskCard ? {
         turnTaskCard,
@@ -1315,6 +1356,9 @@ export class ReliableAgentLoop {
     turnId: string;
     round: string;
     authoritySnapshotId: string;
+    headRootId: string;
+    scopeReset?: boolean;
+    structure?: MaterializedContextStructure;
     nativeRebase?: {
       cacheReset?: boolean;
       forceFullReason?: 'compression';
@@ -1373,15 +1417,16 @@ export class ReliableAgentLoop {
     const compressionRebase = input.nativeRebase?.forceFullReason === 'compression';
     // Compression records an older request's effective effort. It is not an authority for this
     // newly frozen request: restore-to-omission clears it, and an explicit new choice replaces it.
-    let pendingConfigurationUpdate = capabilities.reasoningUpdates
+    let pendingConfigurationUpdate = !input.scopeReset && capabilities.reasoningUpdates
       && input.nativeRebase?.freshConfigurationUpdate && configuredEffort !== undefined
       ? { effort: configuredEffort }
       : undefined;
-    const previous = capabilities.reasoningUpdates
+    const previous = !input.scopeReset && capabilities.reasoningUpdates
       ? await this.readLatestNativeReasoning(
           requireId((await this.requireExisting('Turn', input.turnId)).conversation_id, 'Turn.conversation_id'),
+          input.headRootId,
           requireId(modelRecord?.providerConfigId, 'native model.providerConfigId'),
-          requireId(modelRecord?.modelId, 'native model.modelId')
+          requireId(modelRecord?.modelId, 'native model.modelId'), input.structure
         )
       : undefined;
     const restoreDefaults = previous !== undefined && configuredEffort === undefined && previous.effectiveEffort !== undefined;
@@ -1435,8 +1480,10 @@ export class ReliableAgentLoop {
    */
   private async readLatestNativeReasoning(
     conversationId: string,
+    rootId: string,
     providerId: string,
-    modelId: string
+    modelId: string,
+    knownStructure?: MaterializedContextStructure
   ): Promise<{
     baseEffort?: string;
     baseMode?: 'standard' | 'pro';
@@ -1444,9 +1491,43 @@ export class ReliableAgentLoop {
     effectiveEffort?: string;
     pendingConfigurationUpdate?: { effort: string };
   } | undefined> {
-    for await (const turn of this.readNewestHistoryRows('Turn', conversationId)) {
-      for await (const { request, recipe } of this.readNewestModelRequestRecipes(requireId(turn.id, 'Turn.id'))) {
-        if (recipe.kind !== 'reliable-agent-turn') continue;
+    const structure = knownStructure ?? await this.context.materializeStructure(rootId);
+    if (structure.root.id !== rootId) throw new Error('Native reasoning predecessor snapshot names another root.');
+    if (structure.root.conversation_id !== conversationId) throw new Error('Native reasoning predecessor belongs to another Context scope.');
+    for (let index = structure.records.length - 1; index >= 0; index--) {
+      const segment = structure.records[index].segment;
+      if (segment.segment_kind === 'compression') return undefined;
+      if (segment.segment_kind !== 'message' && segment.segment_kind !== 'tool_pair') continue;
+      const sources = await this.list('ContextSegmentSource', { segment_id: requireId(segment.id, 'Context segment id') }, 32);
+      const requestIds = new Set<string>();
+      for (const source of sources) {
+        if (source.source_kind === 'message_revision') {
+          const revision = await this.maybeGet('MessageRevision', requireId(source.source_id, 'Context Message revision'));
+          if (!revision || revision.role !== 'model' || revision.revision_seq !== source.source_revision
+            || revision.content_object_id !== segment.content_object_id) continue;
+          const links = await this.list('ModelRequestMessageLink', { message_id: revision.message_id }, 2);
+          for (const link of links) requestIds.add(requireId(link.model_request_id, 'Model output request'));
+        } else if (source.source_kind === 'tool_call' || source.source_kind === 'tool_model_result') {
+          const result = source.source_kind === 'tool_model_result'
+            ? await this.maybeGet('ToolModelResult', requireId(source.source_id, 'Context tool result')) : null;
+          if (source.source_kind === 'tool_model_result' && !result) continue;
+          const toolCallId = requireId(result?.tool_call_id ?? source.source_id, 'Context tool call');
+          for (const link of await this.list('ToolCallSourceLink', { tool_call_id: toolCallId }, 2)) {
+            requestIds.add(requireId(link.model_request_id, 'Tool source request'));
+          }
+        }
+      }
+      const requests: DomainRow[] = [];
+      for (const requestId of requestIds) {
+        const request = await this.maybeGet('ModelRequest', requestId);
+        if (request && (await this.maybeGet('Turn', requireId(request.turn_id, 'ModelRequest Turn')))?.conversation_id === conversationId) {
+          requests.push(request);
+        }
+      }
+      if (requests.length > 1) throw new Error('Native reasoning occurrence has multiple scoped producer requests.');
+      for (const request of requests) {
+        const recipe = (await this.readModelRequestRecipes([request])).get(requireId(request.id, 'ModelRequest.id'));
+        if (!recipe || recipe.kind !== 'reliable-agent-turn') continue;
         if (request.provider_id !== providerId || request.model_id !== modelId
           || asRecord(recipe.nativeResponses) === undefined) return undefined;
         const reasoning = asRecord(recipe.nativeReasoning);
@@ -1507,7 +1588,7 @@ export class ReliableAgentLoop {
       ? requireId(firstSegment.id, 'ContextSegment.id')
       : undefined;
     const inputLinks = await this.list('MessageTurnLink', { turn_id: turnId, role: 'input' }, 2);
-    if (inputLinks.length === 0) return { compressionBoundaryId };
+    if (inputLinks.length === 0) return { compressionBoundaryId, structure: current };
     if (inputLinks.length !== 1) throw new Error(`Turn ${turnId} must have at most one input Message.`);
     const messageId = requireId(inputLinks[0].message_id, 'MessageTurnLink.message_id');
     const currentLinks = await this.list('MessageCurrentRevisionLink', { message_id: messageId }, 2);
@@ -1537,6 +1618,7 @@ export class ReliableAgentLoop {
     const contentObject = await this.requireExisting('ContentObject', contentObjectId) as unknown as ContentObjectMetadata;
     const content = await this.contentStore.read(contentObject);
     return {
+      structure: current,
       ...(compressionBoundaryId ? { compressionBoundaryId } : {}),
       reference: {
         kind: 'current_turn_input',
@@ -1554,6 +1636,7 @@ export class ReliableAgentLoop {
     /** Complete identity state, including retired addresses, frozen into the next request. */
     contextHandles: ModelHandleCatalog;
     requiresNativeReset: boolean;
+    contextHandleScope: { conversationId: string; rootId: string | null; provenanceRevision: string; resetFence: string };
     /** For a fork: what copied collaboration refs mean here, read once for the recipe. */
     forkIdentity?: ForkIdentityFacts;
   }> {
@@ -1562,9 +1645,11 @@ export class ReliableAgentLoop {
     const [projection, processLinks, handleState, fork] = await Promise.all([
       readConversationChildTaskRuntimeStatus(this.database, this.contentStore, conversationId, RUNTIME_STATUS_RECIPE_LIMIT),
       listAllDomainRows(this.database, 'ProcessCompletionSourceLink', { source_turn_id: turnId }),
-      readConversationContextHandleState(this.database, this.contentStore, conversationId),
+      readCurrentConversationContextHandleState(this.database, this.contentStore, conversationId),
       isForkConversation(this.database, conversationId)
     ]);
+    const contextHandleScope = { conversationId, rootId: handleState.row.context_root_id as string | null,
+      provenanceRevision: String(handleState.row.provenance_revision), resetFence: String(handleState.row.requires_native_reset) };
     const inheritedChildTargets = fork
       ? forkInheritedChildTargets(handleState.catalog.entries, new Set(projection.childHandleTargets.map(task => task.answerBridgeId)))
       : [];
@@ -1576,11 +1661,11 @@ export class ReliableAgentLoop {
         ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
         : []);
     if (projection.totalChildCount === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
-      return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
+      return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
         ...(forkIdentity ? { forkIdentity } : {}) };
     }
     const { children, totalChildCount, descendantCount, queuedInputCount, awaitingHandlingCount, activeChildCount } = projection;
-    return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset,
+    return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
       ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
       kind: 'runtime_status_card',
       totalChildCount, descendantCount,

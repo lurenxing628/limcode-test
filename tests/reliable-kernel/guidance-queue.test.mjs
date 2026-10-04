@@ -9,6 +9,9 @@ const root = process.cwd();
 const kernel = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/reliableKernel/index.js')
 ).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(
+  path.join(root, 'dist/extension/backend/reliableKernel/conversationContextHandleState.js')
+).href);
 const { ReliableConversationRunner } = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js')
 ).href);
@@ -182,6 +185,7 @@ test('引导消息等待当前回复和工具全部完成后按发送顺序自�
         created_at: now,
         updated_at: now
       }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'guidance-agent-link',
         conversation_id: conversationId,
@@ -890,6 +894,7 @@ async function createConversation(app, conversationId, linkId) {
       created_at: now,
       updated_at: now
     }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
       id: linkId,
       conversation_id: conversationId,

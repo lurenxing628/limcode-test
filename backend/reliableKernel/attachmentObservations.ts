@@ -8,7 +8,7 @@ import {
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { canonicalPlainJson, normalizePlainJson } from './plainJson';
 import type { ModelHandleCatalog } from './modelHandleCatalog';
-import { modelHandleRef, normalizeModelHandleCatalog } from './modelHandleCatalog';
+import { modelHandleRef, prepareModelHandleCatalog } from './modelHandleCatalog';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 
@@ -142,7 +142,7 @@ export async function loadAttachmentObservationRequirements(
 ): Promise<LlmAttachmentObservationRequirement[]> {
   const profileSha256 = requireSha256(profileSha256Input, 'analysisProfileSha256');
   const catalog = catalogInput.map((entry, index) => normalizeCatalogEntry(entry, index));
-  const modelHandleCatalog = normalizeModelHandleCatalog(modelHandleCatalogInput);
+  const modelHandleCatalog = prepareModelHandleCatalog(modelHandleCatalogInput);
   if (catalog.length === 0) return [];
   const linkIds = catalog.map((entry) => attachmentObservationLinkId(entry.attachmentId, profileSha256));
   const linkSnapshot = await database.snapshot(linkIds.map((id) =>

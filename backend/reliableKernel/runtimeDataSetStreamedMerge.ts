@@ -50,6 +50,7 @@ import {
   createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet, type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
+import { MergeContextHandleStates } from './runtimeMergeContextHandleStates';
 import { createVscodeRootAuthority, inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet } from './vscodeRootAuthority';
 
 /**
@@ -839,12 +840,15 @@ async function streamMergeTransaction(
     rows: 0, insertRows: 0, reusedRows: 0, insertConversations: 0, conflicts: { count: 0, samples: [] }
   };
   const counting = countingSink(scan, { next: 0 });
+  const handleStates = new MergeContextHandleStates(source, database, (domain, id) => !input.skipping
+    || !source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`).get(domain, id));
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
     timelineImportSource: readTimelineMergeSourceIdentity(source),
     inserted: (domain, id, row) => {
       counting.inserted(domain, id, row);
       input.evidence.add(domain, id);
+      handleStates.touch(domain, row);
     }
   };
   let open = true;
@@ -852,8 +856,8 @@ async function streamMergeTransaction(
   const refused = (error: unknown): never => {
     throw workerRefusal(error, input.state);
   };
-  await database.maintenanceBegin();
   try {
+    await database.maintenanceBegin();
     await forEachSourceChunk(source, database, input, async (entries, existing) => {
       for (const [index, { schema, row }] of entries.entries()) planMergeChunk(schema, [row], [existing[index]], sink);
       scan.rows += entries.length;
@@ -862,7 +866,7 @@ async function streamMergeTransaction(
       sink.presence.length = 0;
       if (scan.conflicts.count > 0) throw new engine.Outcome(engine.conflictRefusal(scan.conflicts, input.state, true));
       input.signal?.throwIfAborted();
-      await database.maintenanceAppend(steps).catch(refused);
+      if (steps.length > 0) await database.maintenanceAppend(steps).catch(refused);
       await input.onChunk(chunk, scan.rows);
       chunk += 1;
     });
@@ -873,15 +877,17 @@ async function streamMergeTransaction(
       return { committed: false, ...merged };
     }
     input.signal?.throwIfAborted();
+    await handleStates.append(steps => database.maintenanceAppend(steps).then(() => undefined).catch(refused), input.signal);
     await database.maintenanceAppend([input.marker]).catch(refused);
     await input.beforeCommit({ committed: true, ...merged });
+    input.signal?.throwIfAborted();
     open = false;
     await database.maintenanceCommit().catch(refused);
     return { committed: true, ...merged };
   } catch (error) {
     if (open) await database.maintenanceRollback().catch(() => undefined);
     throw error;
-  }
+  } finally { handleStates.close(); }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1124,7 +1130,7 @@ export interface PreparedLargeMergeSource {
   casObjects: number;
   cas: RuntimeDataSetCasTransfer;
   finalized?: RuntimeDataSetMergeResult['finalized'];
-  upgradedFromEpoch?: 3 | 4 | 5;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6;
   /** Estimated exclusive time of this source (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
   estimateMs: number;
   estimateRangeMs: [number, number];

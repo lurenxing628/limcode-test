@@ -901,6 +901,7 @@ function cloneStep(step: RepositoryTransactionStep,
 }
 
 const RESTRICTED_UPDATE_COLUMNS: ReadonlyMap<string, ReadonlySet<string>> = new Map([
+  ['ConversationContextHandleState', new Set(['context_root_id', 'state', 'revision', 'provenance_revision', 'content_object_id', 'requires_native_reset', 'updated_at'])],
   ['ExecutionLease', new Set(['owner_id', 'host_boot_id', 'generation', 'acquired_at', 'expires_at'])],
   ['ModelRequest', new Set(['status', 'terminal_state', 'usage_json', 'stream_stats_json', 'updated_at'])],
   ['CompressionBlock', new Set(['status', 'updated_at'])],

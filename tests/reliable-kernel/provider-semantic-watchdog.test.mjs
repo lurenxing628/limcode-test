@@ -13,6 +13,9 @@ const compiledRoot = process.env.LIMCODE_COMPILED_ROOT
 const kernel = await import(pathToFileURL(
   path.join(compiledRoot, 'backend/reliableKernel/index.js')
 ).href);
+const { emptyConversationContextHandleStateStep, readCurrentConversationContextHandleState } = await import(pathToFileURL(
+  path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js')
+).href);
 
 function modelContent(text = '') {
   return { role: 'model', parts: text ? [{ text }] : [] };
@@ -122,6 +125,7 @@ async function withApp(name, run, provider, retryPolicy, compression) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: name, title: name, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(name, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `${name}-agent-link`, conversation_id: name, agent_id: 'agent-main',
         role: 'default', created_at: now, updated_at: now
@@ -154,14 +158,23 @@ async function get(app, domain, id) {
   return (await app.database.snapshot([kernel.DOMAIN_REPOSITORIES.domain(domain).get(id)])).snapshot[0];
 }
 
+async function currentHandleRecipe(app, conversationId) {
+  const handles = await readCurrentConversationContextHandleState(app.database, app.contentStore, conversationId);
+  return { modelHandleCatalog: handles.catalog, contextHandleScope: { conversationId,
+    rootId: handles.row.context_root_id, provenanceRevision: String(handles.row.provenance_revision),
+    resetFence: String(handles.row.requires_native_reset) } };
+}
+
 async function createRequest(app, conversationId, turnId, key, compression = false) {
   const head = (await list(app, 'ConversationContextHeadLink', { conversation_id: conversationId }))[0];
   const authority = (await list(app, 'AuthoritySnapshot', { turn_id: turnId }))[0];
+  const handles = await currentHandleRecipe(app, conversationId);
   return app.modelProvider.createModelRequest({
     turnId,
     contextRootId: head.root_id,
     authoritySnapshotId: authority.id,
     recipe: compression ? {
+      ...handles,
       kind: 'reliable-context-compression',
       sourceRootId: head.root_id,
       sourceSegmentCount: 1,
@@ -170,6 +183,7 @@ async function createRequest(app, conversationId, turnId, key, compression = fal
       effectiveSummaryMaxTokens: 8000,
       sourceHash: 'frozen-source-hash'
     } : {
+      ...handles,
       kind: 'reliable-agent-turn',
       round: '3',
       previousTool: 'update_task_list',
@@ -2287,6 +2301,7 @@ test('native 继承一次失败后格式修复只剩一次重试，重连投影�
     const authority = (await list(app, 'AuthoritySnapshot', { turn_id: turnId }))[0];
     const created = await app.modelProvider.createModelRequest({ turnId, contextRootId: head.root_id,
       authoritySnapshotId: authority.id, recipe: { kind: 'reliable-agent-turn', round: '3', tools: [],
+        ...await currentHandleRecipe(app, conversationId),
         nativeErrorRecovery: { failures: 1, modelOutputRepair: false } }, idempotencyKey: 'native-limit' });
     let calls = 0;
     const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((request, emit) => {

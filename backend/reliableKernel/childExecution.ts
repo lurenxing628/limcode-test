@@ -551,7 +551,8 @@ export class ChildExecutionControlPlane {
       contentObjectId: promptContent.metadata.id,
       contentByteLength: promptContent.metadata.byte_length,
       contentEstimatedTokens: estimateStoredMessageContentTokens(input, 'text/plain'),
-      inheritedSegments: inheritedContext.segments
+      inheritedSegments: inheritedContext.segments,
+      handleState: inheritedContext.handleState
     });
     const steps: RepositoryTransactionStep[] = [
       ...capacitySteps,

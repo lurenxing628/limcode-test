@@ -10,6 +10,8 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
+const { upgradeConversationContextHandles } = load('backend/reliableKernel/conversationContextHandleUpgrade.js');
 const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSession.js');
 const { OpenAIResponsesNativeDeliveryError } = load('backend/capabilities/openAIResponsesNativeControl.js');
 const { parseNativeToolCallCheckpoint } = load('backend/reliableKernel/nativeToolFacts.js');
@@ -289,6 +291,7 @@ async function withNativeKernel(options, verify) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: CONVERSATION, title: 'Native chain recovery', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(CONVERSATION, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'native-chain-recovery-agent', conversation_id: CONVERSATION, agent_id: 'agent-main', role: 'default',
         created_at: now, updated_at: now
@@ -648,6 +651,11 @@ test('closure never appends a result for a call cut out of the current head', { 
     const [lease] = await rows(state.app, 'ExecutionLease', { turn_id: edited.turnId });
     const second = { turnId: edited.turnId, fence: { id: lease.id, conversationId: lease.conversation_id,
       turnId: lease.turn_id, ownerId: lease.owner_id, hostBootId: lease.host_boot_id, generation: BigInt(lease.generation) } };
+    const parked = await drive(second);
+    assert.equal(parked.terminalStatus, 'waiting');
+    assert.equal(parked.waitingContextHandleUpgrade, true, 'the edited scope awaits its explicit upgrade');
+    assert.equal((await rows(state.app, 'ConversationContextHandleState', { conversation_id: CONVERSATION }))[0].state, 'pending');
+    await upgradeConversationContextHandles(state.app.database, state.app.contentStore, CONVERSATION);
     const outcome = await drive(second);
     assert.equal(outcome.terminalStatus, 'completed',
       JSON.stringify(await rows(state.app, 'TurnTermination', { turn_id: second.turnId })));

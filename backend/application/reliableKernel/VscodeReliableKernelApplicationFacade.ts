@@ -1,3 +1,4 @@
+import { emptyConversationContextHandleStateStep } from '../../reliableKernel/conversationContextHandleState';
 import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -340,6 +341,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
           created_at: now,
           updated_at: now
         }),
+        emptyConversationContextHandleStateStep(conversationId, now),
         DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
           id: runtimeId('agent_conversation_link'),
           conversation_id: conversationId,

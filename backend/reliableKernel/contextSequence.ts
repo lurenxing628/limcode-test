@@ -8,6 +8,8 @@ import {
 } from './contentAddressedStore';
 import { resolveConversationCompressionBlock } from './compressionBlockOwnership';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
+import { prepareContextHandleHeadTransition, prepareEmptyContextHandleRootTransition } from './conversationContextHandleState';
+import type { ContextHandleOccurrenceEvidence } from './contextHandleOccurrenceEvidence';
 import {
   CONTEXT_SEQUENCE_NODE_BATCH_LIMIT,
   DOMAIN_REPOSITORIES,
@@ -149,6 +151,8 @@ export interface FreshConversationMessageContextPlanInput {
   contentEstimatedTokens?: number;
   /** Immutable occurrences whose independent target provenance is written in the same transaction. */
   inheritedSegments?: readonly { segmentId: string; estimatedTokens: number }[];
+  /** Planned initial state, already inserted by the same Conversation/fork transaction. */
+  handleState?: DomainRow;
 }
 
 export interface MessageContextAppendPlanInput {
@@ -162,6 +166,8 @@ export interface MessageContextAppendPlanInput {
   contentEstimatedTokens?: number;
   /** Provider-observed estimate for the complete resulting root (for example input + model output). */
   resultingEstimatedTokens?: number;
+  /** Exact model output admitted by this append; user input carries no private recipe catalog. */
+  handleOccurrence?: ContextHandleOccurrenceEvidence;
 }
 
 export interface MessageContextEditPlanInput {
@@ -206,6 +212,8 @@ interface AppendOccurrencePlan {
   segmentKind: ContextSegmentKind;
   sources: ContextSourceOccurrence[];
   content: PreparedContentObject;
+  handleOccurrence?: ContextHandleOccurrenceEvidence;
+  handleOccurrences?: readonly ContextHandleOccurrenceEvidence[];
   baseRootId?: string | null;
   expectedHeadRootId?: string | null;
   activate?: boolean;
@@ -363,6 +371,7 @@ export class ContextSequenceControlPlane {
         { sourceKind: 'tool_model_result', sourceId: toolModelResultId, sourceRevision: callSeq }
       ],
       content: pair,
+      handleOccurrences: [{ kind: 'tool_call', toolCallId }, { kind: 'tool_result', toolCallId, toolModelResultId }],
       baseRootId: command.baseRootId,
       expectedHeadRootId: command.expectedHeadRootId,
       activate: command.activate
@@ -658,10 +667,28 @@ export class ContextSequenceControlPlane {
       return plan;
     });
     const finalRootId = plans[plans.length - 1].rootId;
+    let handleState: DomainRow | undefined;
+    const handleTransitions: RepositoryTransactionStep[][] = [];
+    for (const plan of plans) {
+      const transition = await prepareContextHandleHeadTransition({
+        database: this.database, contentStore: this.contentStore, conversationId,
+        previousRootId: plan.previousRootId, nextRootId: plan.rootId, mode: 'append', now,
+        current: handleState,
+        rootShape: { rootNodeId: compression ? baseRootNodeId : plan.nodeId,
+          tailNodeId: compression ? plan.nodeId : null,
+          tailSegmentCount: compression ? plan.tailSegmentCount : 0n, segmentCount: plan.segmentCount },
+        occurrences: [
+          { kind: 'tool_call', toolCallId: plan.fact.toolCallId },
+          { kind: 'tool_result', toolCallId: plan.fact.toolCallId, toolModelResultId: plan.fact.toolModelResultId }
+        ]
+      });
+      handleTransitions.push(transition.steps);
+      handleState = transition.state;
+    }
     const steps: RepositoryTransactionStep[] = [
       ...headAssertionSteps(conversationId, head, expectedHeadRootId),
       ...preparedContentObjectSteps(prepared, 'context_tool_pair_content'),
-      ...plans.flatMap((plan): RepositoryTransactionStep[] => [
+      ...plans.flatMap((plan, index): RepositoryTransactionStep[] => [
         ...occurrenceInsertSteps({
           segmentId: plan.fact.segmentId,
           segmentKind: 'tool_pair',
@@ -684,7 +711,8 @@ export class ContextSequenceControlPlane {
           segment_count: plan.segmentCount,
           estimated_tokens: plan.estimatedTokens,
           created_at: now
-        }, { column: 'root_seq', scope: { conversation_id: conversationId } })
+        }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+        ...handleTransitions[index]
       ]),
       ...headMutationSteps(conversationId, head, finalRootId, now)
     ];
@@ -809,6 +837,7 @@ export class ContextSequenceControlPlane {
       baseRootId: command.baseRootId,
       expectedHeadRootId: command.expectedHeadRootId,
       activate: command.activate,
+      handleOccurrence: { kind: 'tool_call', toolCallId },
       nativePartialPair: 'tool_call',
       executionFence: { callTurnId: turnId }
     });
@@ -914,8 +943,32 @@ export class ContextSequenceControlPlane {
     const admission = parseNativeAdmissionContent(
       JSON.parse((await this.contentStore.read(await this.eventContentMetadata(admissionEvent))).toString('utf8'))
     );
+    // A rewind keeps immutable source rows for the abandoned branch. Their global existence is
+    // not permission to append a late result into today's branch. Check the caller's exact base;
+    // historical/non-activating appends and an already committed result remain replayable there.
+    const observedHead = await this.getHead(conversationId);
+    const observedHeadRootId = observedHead ? requireId(observedHead.root_id, 'Context head root') : null;
+    const expectedHeadRootId = command.expectedHeadRootId === undefined ? observedHeadRootId
+      : nullableId(command.expectedHeadRootId, 'expectedHeadRootId');
+    const selectedBaseRootId = command.baseRootId === undefined ? expectedHeadRootId
+      : nullableId(command.baseRootId, 'baseRootId');
+    const resultSources = rows((await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({ where: {
+        source_kind: 'tool_model_result', source_id: toolModelResultId
+      }, limit: 2 })
+    ])).snapshot[0]);
+    const selectedOccurrences = new Set([
+      requireId(callSources[0].segment_id, 'Native call Context segment'),
+      ...resultSources.map(source => requireId(source.segment_id, 'Native result Context segment'))
+    ]);
+    if (selectedBaseRootId === null
+      || !await this.nativeResultBaseContainsOccurrence(conversationId, selectedBaseRootId, selectedOccurrences)) {
+      throw Object.assign(new Error(`Native ToolCall ${toolCallId} is outside the selected Context branch.`), {
+        code: 'NATIVE_RESULT_OUTSIDE_CONTEXT_SCOPE'
+      });
+    }
     await this.preflightAppendTarget(
-      conversationId, command.baseRootId, command.expectedHeadRootId, command.activate !== false
+      conversationId, selectedBaseRootId, expectedHeadRootId, command.activate !== false
     );
     const [argumentsBytes, resultBytes] = await this.contentStore.readMany([argumentMetadata, resultMetadata]);
     const content = await this.contentStore.prepare(this.database, JSON.stringify({
@@ -947,12 +1000,55 @@ export class ContextSequenceControlPlane {
       segmentKind: 'tool_pair',
       sources: [{ sourceKind: 'tool_model_result', sourceId: toolModelResultId, sourceRevision: callSeq }],
       content,
-      baseRootId: command.baseRootId,
-      expectedHeadRootId: command.expectedHeadRootId,
+      baseRootId: selectedBaseRootId,
+      expectedHeadRootId,
       activate: command.activate,
+      handleOccurrence: { kind: 'tool_result', toolCallId, toolModelResultId },
       nativePartialPair: 'tool_model_result',
       executionFence: { callTurnId: turnId }
     });
+  }
+
+  /** Metadata-only reverse traversal; compression provenance is scoped to this Conversation. */
+  private async nativeResultBaseContainsOccurrence(
+    conversationId: string,
+    rootId: string,
+    targets: ReadonlySet<string>
+  ): Promise<boolean> {
+    const root = await this.getOptional('ContextSequenceRoot', rootId);
+    if (!root || root.conversation_id !== conversationId) throw new Error('Native result base belongs to another Conversation.');
+    const visitedSegments = new Set<string>();
+    const containsSegment = async (segmentId: string): Promise<boolean> => {
+      if (targets.has(segmentId)) return true;
+      if (visitedSegments.has(segmentId)) return false;
+      visitedSegments.add(segmentId);
+      const segment = await this.getOptional('ContextSegment', segmentId);
+      if (!segment) throw new Error(`Native result base ContextSegment ${segmentId} is missing.`);
+      if (segment.segment_kind !== 'compression') return false;
+      const block = await resolveConversationCompressionBlock(this.database, segmentId, conversationId);
+      const sources = (await this.database.snapshotAll(DOMAIN_REPOSITORIES.domain('CompressionBlockSource').list({
+        where: { compression_block_id: block.id }, orderBy: { column: 'id', direction: 'asc' }, limit: 1000
+      }))).snapshot.sort((left, right) => compareCompressionSourcePosition(left, right));
+      for (const [position, source] of sources.entries()) {
+        if (requireBigInt(source.position, 'CompressionBlockSource.position') !== BigInt(position)) {
+          throw new Error('Native result base compression source order is invalid.');
+        }
+      }
+      for (const source of [...sources].reverse()) if (await containsSegment(requireId(source.segment_id, 'Compression source segment'))) return true;
+      return false;
+    };
+    const containsChain = async (nodeIdInput: unknown, count: bigint): Promise<boolean> => {
+      let nodeId = nullableId(nodeIdInput, 'Native result base node');
+      for (let remaining = count; nodeId !== null && remaining > 0n; remaining--) {
+        const node = await this.getOptional('ContextSequenceNode', nodeId);
+        if (!node) throw new Error(`Native result base ContextSequenceNode ${nodeId} is missing.`);
+        if (await containsSegment(requireId(node.segment_id, 'Native result base segment'))) return true;
+        nodeId = nullableId(node.parent_node_id, 'Native result base parent');
+      }
+      return false;
+    };
+    return await containsChain(root.tail_node_id, requireBigInt(root.tail_segment_count, 'Context root tail count'))
+      || await containsChain(root.root_node_id, requireBigInt(root.segment_count, 'Context root count'));
   }
 
   /**
@@ -1217,6 +1313,9 @@ export class ContextSequenceControlPlane {
   public prepareFreshConversationMessageMutation(
     input: FreshConversationMessageContextPlanInput
   ): FreshConversationMessageContextPlan {
+    if ((input.inheritedSegments?.length ?? 0) > 0 && !input.handleState) {
+      throw new Error('Inherited Context requires the explicitly prepared fork handle state.');
+    }
     const conversationId = requireId(input.conversationId, 'conversationId');
     const revisionId = requireId(input.messageRevisionId, 'messageRevisionId');
     const contentObjectId = requireId(input.contentObjectId, 'contentObjectId');
@@ -1263,6 +1362,9 @@ export class ContextSequenceControlPlane {
           estimated_tokens: inheritedTokens + contentEstimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+        ...prepareEmptyContextHandleRootTransition(conversationId, rootId, now, input.handleState, {
+          rootNodeId: nodeId, tailNodeId: null, tailSegmentCount: 0n, segmentCount: BigInt(inheritedNodes.length) + 1n
+        }).steps,
         DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').insert({
           id: headLinkId,
           conversation_id: conversationId,
@@ -1326,6 +1428,14 @@ export class ContextSequenceControlPlane {
           estimated_tokens: resultingEstimatedTokens ?? (base.estimatedTokens + contentEstimatedTokens),
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+        ...(await prepareContextHandleHeadTransition({
+          database: this.database, contentStore: this.contentStore, conversationId,
+          previousRootId: baseRootId, nextRootId: rootId, mode: 'append', now,
+          rootShape: { rootNodeId: base.compression ? base.rootNodeId : nodeId,
+            tailNodeId: base.compression ? nodeId : null,
+            tailSegmentCount: base.compression ? base.tailSegmentCount + 1n : 0n, segmentCount: base.segmentCount + 1n },
+          occurrence: input.handleOccurrence
+        })).steps,
         ...headMutationSteps(conversationId, head, rootId, now)
       ]
     };
@@ -1391,6 +1501,16 @@ export class ContextSequenceControlPlane {
           estimated_tokens: requireBigInt(state.root.estimated_tokens, 'ContextSequenceRoot.estimated_tokens'),
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+        ...(await prepareContextHandleHeadTransition({
+          database: this.database, contentStore: this.contentStore, conversationId,
+          previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
+          rootShape: {
+            rootNodeId: compression ? requireId(state.root.root_node_id, 'ContextSequenceRoot.root_node_id') : rebuilt.lastNodeId,
+            tailNodeId: compression ? rebuilt.lastNodeId : null,
+            tailSegmentCount: compression ? requireBigInt(state.root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count') : 0n,
+            segmentCount: requireBigInt(state.root.segment_count, 'ContextSequenceRoot.segment_count')
+          }
+        })).steps,
         ...headMutationSteps(conversationId, state.head, rootId, now)
       ]
     };
@@ -1525,6 +1645,15 @@ export class ContextSequenceControlPlane {
           estimated_tokens: estimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+        ...(await prepareContextHandleHeadTransition({
+          database: this.database, contentStore: this.contentStore, conversationId,
+          previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
+          rootShape: {
+            rootNodeId: retainedSummary ? summaryNodeId : nodes.length ? nodes[nodes.length - 1].id : null,
+            tailNodeId: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
+            tailSegmentCount: retainedSummary ? BigInt(nodes.length) : 0n, segmentCount: BigInt(prefix.length)
+          }
+        })).steps,
         ...headMutationSteps(conversationId, state.head, rootId, now)
       ]
     };
@@ -1677,6 +1806,15 @@ export class ContextSequenceControlPlane {
             estimated_tokens: estimatedTokens,
             created_at: now
           }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+          ...(await prepareContextHandleHeadTransition({
+            database: this.database, contentStore: this.contentStore, conversationId,
+            previousRootId: state.rootId, nextRootId: rootId, mode: 'rewrite', now,
+            rootShape: {
+              rootNodeId: retainedSummary ? summaryNodeId : nodes.length ? nodes[nodes.length - 1].id : null,
+              tailNodeId: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
+              tailSegmentCount: retainedSummary ? BigInt(nodes.length) : 0n, segmentCount: BigInt(retained.length)
+            }
+          })).steps,
           ...headMutationSteps(conversationId, state.head, rootId, now),
           DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, { updated_at: now })
         ]);
@@ -1788,6 +1926,15 @@ export class ContextSequenceControlPlane {
           estimated_tokens: estimatedTokens,
           created_at: now
         }, { column: 'root_seq', scope: { conversation_id: input.conversationId } }),
+        ...(await prepareContextHandleHeadTransition({
+          database: this.database, contentStore: this.contentStore, conversationId: input.conversationId,
+          previousRootId: input.state.rootId, nextRootId: input.rootId, mode: 'rewrite', now,
+          rootShape: {
+            rootNodeId: retainedSummary ? summaryNodeId : nodes.length ? nodes[nodes.length - 1].id : null,
+            tailNodeId: retainedSummary && nodes.length ? nodes[nodes.length - 1].id : null,
+            tailSegmentCount: retainedSummary ? BigInt(nodes.length) : 0n, segmentCount: BigInt(finalSegments.length)
+          }
+        })).steps,
         ...headMutationSteps(input.conversationId, input.state.head, input.rootId, now)
       ]
     };
@@ -2034,6 +2181,13 @@ export class ContextSequenceControlPlane {
         estimated_tokens: base.estimatedTokens + estimated,
         created_at: now
       }, { column: 'root_seq', scope: { conversation_id: conversationId } }),
+      ...(await prepareContextHandleHeadTransition({
+        database: this.database, contentStore: this.contentStore, conversationId,
+        previousRootId: currentHeadRootId, baseRootId, nextRootId: rootId, mode: 'append', now,
+        rootShape: { rootNodeId: rootShape.rootNodeId, tailNodeId: rootShape.tailNodeId,
+          tailSegmentCount: rootShape.tailSegmentCount, segmentCount: base.segmentCount + 1n },
+        activate, occurrence: planInput.handleOccurrence, occurrences: planInput.handleOccurrences
+      })).steps,
       ...(activate ? headMutationSteps(conversationId, head, rootId, now) : []),
       ...(planInput.runtimeDeliveryAcceptance ? [runtimeDeliveryTimelineStep({
         conversationId, deliveryId: planInput.runtimeDeliveryAcceptance.deliveryId, now,
@@ -2083,10 +2237,16 @@ export class ContextSequenceControlPlane {
       return this.replayAppend(input.root, input.segmentId, input.nodeId, input.rootId);
     }
     if (latestHeadRootId !== input.expectedHeadRootId) throw staleHeadError(input.conversationId);
+    const now = this.timestamp();
+    const handleTransition = await prepareContextHandleHeadTransition({
+      database: this.database, contentStore: this.contentStore, conversationId: input.conversationId,
+      previousRootId: latestHeadRootId, nextRootId: input.rootId, mode: 'activate', now
+    });
     const commit = await this.database.transaction([
       ...headAssertionSteps(input.conversationId, latestHead, input.expectedHeadRootId),
       ...(input.fenceSteps ?? []),
-      ...headMutationSteps(input.conversationId, latestHead, input.rootId, this.timestamp())
+      ...handleTransition.steps,
+      ...headMutationSteps(input.conversationId, latestHead, input.rootId, now)
     ]);
     this.observeMetrics({ kind: 'transaction', operation: 'activate', count: 1 });
     return {

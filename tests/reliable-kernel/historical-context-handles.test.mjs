@@ -21,12 +21,14 @@ const {
 const {
   NATIVE_CHILD_HANDLE_PROJECTION_EVENT,
   forkInheritedChildTargets,
-  readConversationChildHandles,
-  readConversationContextHandleCatalog,
-  readConversationContextHandleState,
+  rebuildHistoricalConversationContextHandleState,
   readNativeRequestContextHandleCatalog,
   withChildHandles
 } = load('backend/reliableKernel/conversationChildHandles.js');
+// These tests exercise the explicit historical reconstruction boundary, not ordinary current-state reads.
+const readConversationContextHandleState = rebuildHistoricalConversationContextHandleState;
+const readConversationContextHandleCatalog = async (...args) => (await readConversationContextHandleState(...args)).catalog;
+const readConversationChildHandles = async (...args) => (await readConversationContextHandleCatalog(...args)).entries;
 const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgentCoordinator.js');
 
 const entry = (kind, ref, target) => ({ kind, ref, target });
@@ -624,6 +626,8 @@ test('later historical merge evidence is rechecked after a repaired request was 
 });
 
 const integrationKernel = load('backend/reliableKernel/index.js');
+const { pendingConversationContextHandleStateSteps } = load('backend/reliableKernel/conversationContextHandleState.js');
+const { upgradeConversationContextHandles } = load('backend/reliableKernel/conversationContextHandleUpgrade.js');
 const { LlmCapabilityFullRequestAdapter: HistoricalIntegrationAdapter } =
   load('backend/reliableKernel/llmCapabilityProviderAdapter.js');
 const { LlmEventType: historicalIntegrationEvents } = load('backend/world/modules/llm/events.js');
@@ -721,7 +725,9 @@ async function historicalRuntimeIntegration(nativeEnabled, verify, options = {})
     const now = '2026-09-30T00:00:00.000Z';
     const insert = (domain, row) => integrationKernel.DOMAIN_REPOSITORIES.domain(domain).insert(row);
     const historical = (domain, row) => integrationKernel.DOMAIN_REPOSITORIES.domain(domain).insertHistoricalCopy(row);
-    const original = await app.contentStore.ingest(app.database, 'Original history once referred to P1.', 'text/plain');
+    const original = await app.contentStore.ingest(app.database, JSON.stringify({
+      role: 'model', parts: [{ text: 'Original history once referred to P1.' }]
+    }), 'application/vnd.limcode.message+json');
     const summary = await app.contentStore.ingest(app.database, JSON.stringify({
       kind: 'compression_contents', version: 1,
       contents: [{ role: 'user', parts: [{ text: 'Retained compressed summary: an earlier process was called P1.' }] }]
@@ -741,10 +747,11 @@ async function historicalRuntimeIntegration(nativeEnabled, verify, options = {})
       })), 'application/json');
       const oldRecipe = await app.contentStore.ingest(app.database, JSON.stringify(index === 1 ? {
         ...recipe(legacy(entry('process', 'P1', target)), 'reliable-context-compression'),
-        compressionMethodKind: 'llm_summary', trigger: 'manual', sourceRootId: 'historical-original-root',
+        compressionMethodKind: 'llm_summary', trigger: 'manual', blockId: 'historical-compression-block',
+        sourceRootId: 'historical-original-root',
         sourceSegmentCount: 1, attachmentCatalogState: { catalog: [], placements: [] },
         sourceHash: createHash('sha256').update(JSON.stringify([{ segmentId: 'historical-original-segment',
-          contentObjectId: original.id, segmentKind: 'system' }])).digest('hex')
+          contentObjectId: original.id, segmentKind: 'message' }])).digest('hex')
       } : recipe(legacy(entry('process', 'P1', target)))), 'application/json');
       oldMetadata.push(authorityContent, oldRecipe);
       steps.push(
@@ -759,7 +766,9 @@ async function historicalRuntimeIntegration(nativeEnabled, verify, options = {})
           context_window_tokens: 128000n, compression_threshold_tokens: 100000n, estimated_context_tokens: 30n,
           authority_snapshot_id: `${turnId}-authority`, settings_snapshot_object_id: null,
           recipe_object_id: oldRecipe.id, usage_json: null,
-          stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null },
+          stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null,
+            ...(index === 1 ? { compressionPurpose: { groupId: 'historical-compression-group',
+              blockId: 'historical-compression-block', methodKind: 'llm_summary', trigger: 'manual', priorFailures: [] } } : {}) },
           created_at: now, updated_at: now }),
         historical('Operation', { id: `${requestId}-operation`, owner_kind: 'model_request', owner_id: requestId,
           operation_seq: 1n, tool_call_id: null, status: 'completed', created_at: now, updated_at: now }),
@@ -770,10 +779,19 @@ async function historicalRuntimeIntegration(nativeEnabled, verify, options = {})
       );
     }
     steps.push(
+      insert('Message', { id: 'historical-original-message', created_at: now, updated_at: now, deleted_at: null }),
+      insert('MessageRevision', { id: 'historical-original-revision', message_id: 'historical-original-message',
+        revision_seq: 1n, role: 'model', content_object_id: original.id, created_at: now }),
+      insert('MessageCurrentRevisionLink', { id: 'historical-original-current', message_id: 'historical-original-message',
+        revision_id: 'historical-original-revision', updated_at: now }),
+      insert('MessagePartOfConversation', { id: 'historical-original-membership', conversation_id: conversationId,
+        message_id: 'historical-original-message', message_seq: 1n, created_at: now }),
+      insert('ModelRequestMessageLink', { id: 'historical-original-producer', model_request_id: 'historical-completed-request-0',
+        message_id: 'historical-original-message', created_at: now }),
       insert('ContextSegment', { id: 'historical-original-segment', content_object_id: original.id,
-        segment_kind: 'system', created_at: now }),
+        segment_kind: 'message', created_at: now }),
       insert('ContextSegmentSource', { id: 'historical-original-source', segment_id: 'historical-original-segment',
-        source_kind: 'system', source_id: 'historical-original-system', source_revision: 0n, created_at: now }),
+        source_kind: 'message_revision', source_id: 'historical-original-revision', source_revision: 1n, created_at: now }),
       insert('ContextSequenceNode', { id: 'historical-original-node', parent_node_id: null,
         segment_id: 'historical-original-segment', created_at: now }),
       insert('ContextSequenceRoot', { id: 'historical-original-root', conversation_id: conversationId,
@@ -799,11 +817,14 @@ async function historicalRuntimeIntegration(nativeEnabled, verify, options = {})
         root_seq: 2n, root_node_id: 'historical-summary-node', tail_node_id: null,
         tail_segment_count: 0n, segment_count: 1n, estimated_tokens: 30n, created_at: now }),
       insert('ConversationContextHeadLink', { id: 'historical-context-head', conversation_id: conversationId,
-        root_id: 'historical-summary-root', updated_at: now })
+        root_id: 'historical-summary-root', updated_at: now }),
+      ...pendingConversationContextHandleStateSteps(conversationId, now, undefined, 'historical-summary-root')
     );
     await app.database.transaction(steps);
     const before = await Promise.all(oldMetadata.map(async metadata => [metadata.id,
       (await app.contentStore.read(metadata)).toString('utf8')]));
+    // Historical imports cross the explicit upgrade boundary before any ordinary or native request.
+    await upgradeConversationContextHandles(app.database, app.contentStore, conversationId);
     const continueConversation = async (key, expectedRequests = 1) => {
       const started = await app.turns.input({ source: { kind: 'command', key }, conversationId,
         leaseOwnerId: 'historical-test-owner', hostBootId: app.database.hostBootId,
@@ -849,6 +870,9 @@ for (const nativeEnabled of [false, true]) {
         for (const target of ['historical-process-a', 'historical-process-b']) {
           assert.ok(ordinal(modelHandleRef(frozen.modelHandleCatalog, 'process', target)) > 1);
         }
+        assert.equal(frozen.modelHandleCatalog.allocationHighWater.process,
+          Math.max(...frozen.modelHandleCatalog.entries.filter(entry => entry.kind === 'process').map(entry => ordinal(entry.ref))),
+          'bootstrap already reserves its repaired assignments before the first ordinary request');
         const system = fixture.wireRequests[0].systemInstruction.parts.map(part => part.text ?? '').join('\n');
         assert.match(system, /Retired historical references: P1/);
         assert.ok(fixture.wireRequests[0].contents.some(content => content.parts.some(part =>

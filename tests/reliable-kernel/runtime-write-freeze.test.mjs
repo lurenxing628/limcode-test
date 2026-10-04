@@ -47,6 +47,7 @@ const compiled = (relative) => path.join(process.env.LIMCODE_TEST_EXTENSION_ROOT
   ? path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT) : path.resolve('dist/extension'), relative);
 const load = (relative) => import(pathToFileURL(compiled(relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = await load('backend/reliableKernel/conversationContextHandleState.js');
 const { ReliableConversationRunner } = await load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const {
   createDiagnosedConversationHostEligibility, evaluateConversationEntryEligibility, evaluateConversationHostEligibility,
@@ -252,6 +253,7 @@ async function createConversation(app, conversationId) {
   const now = new Date().toISOString();
   await app.database.transaction([
     kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
       id: `link-${conversationId}`, conversation_id: conversationId, agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now
     })

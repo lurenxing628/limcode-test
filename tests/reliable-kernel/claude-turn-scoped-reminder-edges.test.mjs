@@ -34,6 +34,7 @@ Module._load = function (request, parent, isMain) {
 after(() => { Module._load = originalLoad; });
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const kernel = await import(pathToFileURL(path.join(compiled, 'backend/reliableKernel/index.js')).href);
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const { RuntimeWriteGate } = load('backend/application/reliableKernel/runtimeWriteGate.js');
@@ -640,6 +641,7 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, compression 
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'source', title: 'Source', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('source', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'source-agent', conversation_id: 'source', agent_id: agent.id, role: 'default', created_at: now, updated_at: now
       })

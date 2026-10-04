@@ -55,6 +55,7 @@ after(() => { Module._load = originalLoad; });
 
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiledRoot, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
 ));
@@ -117,6 +118,7 @@ async function openHarness(t) {
       const at = now();
       steps.push(
         row('Conversation', { id, title: id, status: 'active', created_at: at, updated_at: at }),
+        emptyConversationContextHandleStateStep(id, at),
         row('ConversationProjectLink', { id: `project-link-${id}`, conversation_id: id, project_context_id: 'project-p', role: 'primary', created_at: at, updated_at: at }),
         row('AgentConversationLink', { id: `agent-link-${id}`, conversation_id: id, agent_id: 'main', role: 'default', created_at: at, updated_at: at })
       );

@@ -203,14 +203,16 @@ test('升级前备份：升级完成满 7 天才可删；控制根里有进行�
   assert.equal(itemAt(later, backup).deletable, true, itemAt(later, backup).reason);
   assert.match(itemAt(later, backup).reason, /^可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在/);
 
-  const journal = path.join(controlRoot(fixture.current), 'epoch-to-5-migration.json');
-  await fs.writeFile(journal, '{}');
-  const journaled = await planRuntimeBackupCleanup(fixture.root, database, eightDays);
-  assert.equal(itemAt(journaled, backup).reason, '有进行中的操作（未完成的升级），完成之后再清理');
-  const result = await deleteRuntimeBackups(later, database, [itemAt(later, backup).key], eightDays);
-  assert.deepEqual(result.kept.map((item) => item.reason), ['有进行中的操作（未完成的升级），完成之后再清理；这一项没有删除'],
-    '锁内复核：列出之后出现的日志也挡住删除');
-  await fs.rm(journal);
+  for (const journalName of ['epoch-to-5-migration.json', 'epoch-to-6-migration.json', 'epoch-to-7-migration.json']) {
+    const journal = path.join(controlRoot(fixture.current), journalName);
+    await fs.writeFile(journal, '{}');
+    const journaled = await planRuntimeBackupCleanup(fixture.root, database, eightDays);
+    assert.equal(itemAt(journaled, backup).reason, '有进行中的操作（未完成的升级），完成之后再清理');
+    const result = await deleteRuntimeBackups(later, database, [itemAt(later, backup).key], eightDays);
+    assert.deepEqual(result.kept.map((item) => item.reason), ['有进行中的操作（未完成的升级），完成之后再清理；这一项没有删除'],
+      '锁内复核：列出之后出现的日志也挡住删除');
+    await fs.rm(journal);
+  }
 
   const records = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'records');
   await fs.mkdir(records, { recursive: true });
@@ -1023,18 +1025,20 @@ async function downgradeToEpoch4(binding) {
     database.pragma('foreign_keys = OFF');
     database.exec('BEGIN IMMEDIATE');
     for (const schema of [...added].reverse()) database.exec(`DROP TABLE ${schema.table}`);
-    // Retained tables also gained indexes in epoch 6. Rebuild the exact published epoch-4
-    // indexes and manifest, as the preservation fixtures do, rather than relabeling current DDL.
+    // Removing new tables does not remove newer indexes on retained tables. Reconstruct
+    // the exact published descriptors rather than labeling a current manifest as epoch 4.
     const indexes = database.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = ? AND sql IS NOT NULL");
     for (const schema of kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS) {
       for (const { name } of indexes.all(schema.table)) database.exec(`DROP INDEX "${name.replaceAll('"', '""')}"`);
       schema.indexes.forEach((index, ordinal) => database.exec(kernel.createRuntimeDomainIndexSql(schema, index, ordinal)));
     }
     database.exec('DELETE FROM schema_manifest');
-    const manifestRow = database.prepare('INSERT INTO schema_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-    for (const schema of kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS) manifestRow.run(schema.key, schema.table, schema.schemaOwner, schema.repository, schema.codec,
-      JSON.stringify(schema.mutations), schema.client, schema.deletePolicy, schema.resetPolicy,
-      JSON.stringify(schema.indexes), kernel.domainSchemaDigest(schema), 4n);
+    const manifest = database.prepare('INSERT INTO schema_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (const schema of kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS) {
+      manifest.run(schema.key, schema.table, schema.schemaOwner, schema.repository, schema.codec,
+        JSON.stringify(schema.mutations), schema.client, schema.deletePolicy, schema.resetPolicy,
+        JSON.stringify(schema.indexes), kernel.domainSchemaDigest(schema), 4n);
+    }
     database.prepare('UPDATE root_binding SET runtime_kernel_epoch = 4 WHERE singleton = 1').run();
     database.exec('COMMIT');
     database.pragma('wal_checkpoint(TRUNCATE)');

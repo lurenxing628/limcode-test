@@ -9,6 +9,9 @@ const root = process.cwd();
 const kernel = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/reliableKernel/index.js')
 ).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(
+  path.join(root, 'dist/extension/backend/reliableKernel/conversationContextHandleState.js')
+).href);
 const { ReliableConversationRunner } = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js')
 ).href);
@@ -178,6 +181,7 @@ async function createHarness(options = {}) {
       created_at: now,
       updated_at: now
     }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
       id: `link-${path.basename(parent)}`,
       conversation_id: conversationId,

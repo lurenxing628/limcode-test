@@ -12,7 +12,11 @@ const load = file => require(path.join(compiled, file));
 const { readHistoricalCompressionHandleCatalog } = load('backend/reliableKernel/historicalCompressionHandleCatalog.js');
 const { conversationForkSnapshotCopyId } = load('backend/reliableKernel/conversationForkSnapshot.js');
 const { stablePhaseFId } = load('backend/reliableKernel/phaseFIdentity.js');
-const { readConversationContextHandleCatalog } = load('backend/reliableKernel/conversationChildHandles.js');
+const { rebuildHistoricalConversationContextHandleState, readConversationContextHandleCatalog: readCurrentCatalog } =
+  load('backend/reliableKernel/conversationChildHandles.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
+// Legacy compression proofs are reconstructed explicitly; ordinary reads use durable current state.
+const readConversationContextHandleCatalog = async (...args) => (await rebuildHistoricalConversationContextHandleState(...args)).catalog;
 const { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
   modelHandleRef, normalizeModelHandleCatalog, reconcileHistoricalModelHandleCatalogs } =
   load('backend/reliableKernel/modelHandleCatalog.js');
@@ -532,6 +536,7 @@ test('real persisted Anthropic partial-native adapter failure remains readable a
       await app.database.transaction([
         kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'failed-history', title: 'Historical failed native request',
           status: 'active', created_at: now, updated_at: now }),
+        emptyConversationContextHandleStateStep('failed-history', now),
         kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'historical-agent-link',
           conversation_id: 'failed-history', agent_id: 'historical-agent', role: 'default', created_at: now, updated_at: now })
       ]);
@@ -545,14 +550,15 @@ test('real persisted Anthropic partial-native adapter failure remains readable a
       const sourceRootId = await app.context.currentHeadRootId('failed-history');
       const { records } = await app.context.materializeStructure(sourceRootId);
       assert.equal(records.length, 2);
-      // The published coordinator persisted this unmarked recipe before the adapter rejected its
-      // partial Anthropic input. Exercise the real writer, CAS, preflight and failure commit; do not
-      // manufacture ModelRequest failure rows or modify an already frozen recipe.
+      // Current request creation freezes a marked catalog. Exercise the same partial Anthropic
+      // rejection through the real writer, CAS, preflight and failure commit. The explicit legacy
+      // reconstruction cases above separately retain the published unmarked-recipe coverage.
       const recipe = { kind: 'reliable-context-compression', requestKind: 'context_compression_manual', trigger: 'manual',
         compressionMethodKind: 'provider_native', sourceRootId, sourceSegmentCount: 1, blockId: 'failed-native-block',
         sourceHash: createHash('sha256').update(JSON.stringify(records.slice(0, 1).map(record => ({
           segmentId: record.segment.id, contentObjectId: record.segment.content_object_id, segmentKind: record.segment.segment_kind
-        })))).digest('hex'), attachmentCatalogState: { catalog: [], placements: [] }, modelHandleCatalog: { entries: [] } };
+        })))).digest('hex'), attachmentCatalogState: { catalog: [], placements: [] },
+        modelHandleCatalog: { entries: [], retiredRefs: [], identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } };
       const created = await app.modelProvider.createModelRequest({ turnId: current.turnId, contextRootId: sourceRootId,
         authoritySnapshotId: authority.id, idempotencyKey: 'published-partial-native', recipe });
       await assert.rejects(app.modelProvider.dispatch(created.modelRequestId, adapter), /must freeze the complete model-visible Context projection/);
@@ -575,7 +581,7 @@ test('real persisted Anthropic partial-native adapter failure remains readable a
         terminalStatus: 'failed', reason: 'Historical partial-native rejection' });
       await app.close();
       app = await kernel.ReliableKernelApplication.open(root, options);
-      const catalog = await readConversationContextHandleCatalog(app.database, app.contentStore, 'failed-history');
+      const catalog = await readCurrentCatalog(app.database, app.contentStore, 'failed-history');
       assert.deepEqual(catalog.retiredRefs, []);
       assert.equal(modelHandleRef(buildModelHandleCatalog([{ processId: 'new-process' }], catalog), 'process', 'new-process'), 'P1');
       assert.deepEqual((await rows('ModelRequest', { id: created.modelRequestId }))[0], failed, 'historical facts are not rewritten');

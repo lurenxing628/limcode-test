@@ -48,8 +48,8 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "exact-published-upgrade-else-fail-closed",
-    "exactPredecessorUpgrade": "published-epoch-3-4-or-5-to-6-with-backup-journal",
-    "currentEpoch": 6
+    "exactPredecessorUpgrade": "published-epoch-3-4-5-or-6-to-7-with-backup-journal",
+    "currentEpoch": 7
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
@@ -1389,6 +1389,46 @@
       ],
       "notes": [
         "显式 Child subtree interruption 的持久化 level-trigger cleanup；只允许停止冻结 Turn target 通过 ProcessCompletionSourceLink 拥有的进程。"
+      ]
+    },
+    {
+      "key": "ConversationContextHandleState",
+      "table": "conversation_context_handle_state",
+      "repository": "ConversationContextHandleStateRepository",
+      "codec": "ConversationContextHandleStateRowCodec",
+      "mutations": [
+        "insert",
+        "update"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id UNIQUE",
+        "state"
+      ],
+      "notes": [
+        "epoch 7: Conversation 当前 root/provenance_revision 指针、pending/ready 检查点与独立 native reset；只在 Context admission/选根事务发布当前句柄，普通 recipe/pre-wire 私有分配不得污染输入根。"
+      ]
+    },
+    {
+      "key": "ContextRootHandleCatalog",
+      "table": "context_root_handle_catalog",
+      "repository": "ContextRootHandleCatalogRepository",
+      "codec": "ContextRootHandleCatalogRowCodec",
+      "mutations": [
+        "insert"
+      ],
+      "client": "none",
+      "deletePolicy": "cascade-with-conversation",
+      "resetPolicy": "runtime-dataset",
+      "indexes": [
+        "conversation_id,context_root_id,provenance_revision UNIQUE",
+        "conversation_id,provenance_revision,root_node_id,tail_node_id,tail_segment_count,segment_count",
+        "context_root_id"
+      ],
+      "notes": [
+        "epoch 7: Conversation、Context root、来源代数上的不可变目录快照；结构形状索引用于有界前缀恢复，完整性由 root ownership/shape worker 不变量验证。"
       ]
     },
     {

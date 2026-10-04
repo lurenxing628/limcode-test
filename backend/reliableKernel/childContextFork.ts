@@ -1,3 +1,4 @@
+import { CONTEXT_HANDLE_STATE_DOMAIN, emptyConversationContextHandleStateStep } from './conversationContextHandleState';
 import { visitForkCopiedMessageSources } from './forkMessageCopy';
 import { selectConversationCompressionBlock } from './compressionBlockOwnership';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
@@ -9,9 +10,8 @@ import { listAllDomainRows } from './repositoryPagination';
 import { requirePhaseFId, stablePhaseFId } from './phaseFIdentity';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { ConversationAttachmentHandleRegistry } from './conversationAttachmentHandles';
-import { NATIVE_CHILD_HANDLE_PROJECTION_EVENT, readConversationContextHandleCatalog } from './conversationChildHandles';
-import { captureForkContextHandleFrontier, prepareForkContextHandleReservations,
-  readForkContextHandleReservationEvidence } from './forkContextHandleReservations';
+import { readContextHandleRootEvidence } from './contextHandleOccurrenceEvidence';
+import { prepareForkContextHandleReservations, readExactForkContextHandleSnapshot } from './forkContextHandleReservations';
 
 export type ChildForkTurns = 'none' | 'all' | `${number}`;
 
@@ -29,6 +29,7 @@ export function normalizeChildForkTurns(value: unknown): ChildForkTurns {
 }
 
 export interface ChildContextForkPlan {
+  handleState: DomainRow;
   steps: RepositoryTransactionStep[];
   segments: Array<{ segmentId: string; estimatedTokens: number }>;
 }
@@ -51,18 +52,14 @@ export async function prepareChildContextFork(
     assertActive?: () => void;
   }
 ): Promise<ChildContextForkPlan> {
-  if (input.forkTurns === 'none') return { steps: [], segments: [] };
+  if (input.forkTurns === 'none') {
+    const step = emptyConversationContextHandleStateStep(input.targetConversationId, input.now);
+    if (step.kind !== 'insert') throw new Error('Fresh child Context handle state must be inserted.');
+    return { handleState: step.row, steps: [step], segments: [] };
+  }
   input.assertActive?.();
   await new ConversationAttachmentHandleRegistry(database, { contentStore: store, now: () => input.now })
     .ensure(input.sourceConversationId, []);
-  const handleFrontier = await captureForkContextHandleFrontier(database, input.sourceConversationId,
-    NATIVE_CHILD_HANDLE_PROJECTION_EVENT);
-  const sourceReservations = await readForkContextHandleReservationEvidence(database, store, input.sourceConversationId);
-  const sourceCatalog = await readConversationContextHandleCatalog(database, store, input.sourceConversationId);
-  const handleReservations = await prepareForkContextHandleReservations({ database, contentStore: store,
-    sourceConversationId: input.sourceConversationId, targetConversationId: input.targetConversationId,
-    catalog: sourceCatalog, coveredRecipeObjectIds: [...new Set([...handleFrontier.coveredRecipeObjectIds,
-      ...(sourceReservations?.coveredRecipeObjectIds ?? [])])], now: input.now });
   const list = (domain: string, where: Record<string, string>) => listAllDomainRows(database, domain, where);
   const [heads, turns, memberships] = await Promise.all([
     list('ConversationContextHeadLink', { conversation_id: input.sourceConversationId }),
@@ -227,6 +224,21 @@ export async function prepareChildContextFork(
   const selectedMessages = new Set(retained.flatMap(segment => [...segment.messages]));
   const segmentRows = retained.map(segment => segment.row);
   const segmentIds = segmentRows.map(row => id(row.id));
+  // Only an unchanged, ordered prefix of the unexpanded root has this ordinary node shape.
+  // Filtered suffixes and flattened compression sources must reconstruct their own evidence.
+  const exactPrefix = segmentIds.length > 0 && segmentIds.length <= structure.records.length
+    && segmentIds.every((segmentId, index) => segmentId === structure.records[index].segment.id);
+  const handleSnapshot = exactPrefix ? await readExactForkContextHandleSnapshot({ database, contentStore: store,
+    sourceConversationId: input.sourceConversationId, sourceRoot: structure.root,
+    selectedShape: { rootNodeId: id(structure.records[segmentIds.length - 1].node.id), tailNodeId: null,
+      tailSegmentCount: 0n, segmentCount: BigInt(segmentIds.length) } }) : undefined;
+  const handleEvidence = handleSnapshot ?? await readContextHandleRootEvidence(database, store,
+    input.sourceConversationId, id(heads[0].root_id), { segmentIds });
+  const handleReservations = await prepareForkContextHandleReservations({ database, contentStore: store,
+    sourceConversationId: input.sourceConversationId, targetConversationId: input.targetConversationId,
+    catalog: handleEvidence.catalog, coveredRecipeObjectIds: [...new Set(handleEvidence.assertions.flatMap(step =>
+      step.kind === 'assert' && step.domain === 'ModelRequest' && typeof step.where.recipe_object_id === 'string'
+        ? [step.where.recipe_object_id] : []))], now: input.now });
   let boundary = 0n;
   for (const messageId of selectedMessages) {
     const membership = membershipByMessage.get(messageId);
@@ -264,15 +276,20 @@ export async function prepareChildContextFork(
   input.assertActive?.();
   const segments = await estimateForkSegments(store, segmentRows, async objectId =>
     await get('ContentObject', objectId) as unknown as ContentObjectMetadata);
+  const state = handleReservations.steps.find(step => step.kind === 'insert' && step.domain === CONTEXT_HANDLE_STATE_DOMAIN);
+  if (!state || state.kind !== 'insert') throw new Error('Fork Context handle state must be seeded.');
   return {
+    handleState: state.row,
     segments,
     steps: [
       DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(id(heads[0].id), {
         conversation_id: input.sourceConversationId, root_id: heads[0].root_id
       }),
       ...snapshot.assertions,
+      // The copy adds this child's provenance to shared segments. Fence the captured source
+      // sets before those inserts so our own copy cannot invalidate its evidence assertions.
+      ...handleEvidence.assertions,
       ...snapshot.inserts,
-      ...handleFrontier.assertions,
       ...handleReservations.steps,
       DOMAIN_REPOSITORIES.domain('ConversationBranchLink').insert({
         id: stablePhaseFId('conversation_branch_link', 'child-context-fork', input.targetConversationId),

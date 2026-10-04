@@ -1,5 +1,5 @@
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
-import { modelHandleRef, type ModelHandleCatalog } from './modelHandleCatalog';
+import { modelHandleRef, prepareModelHandleCatalog, type ReadonlyModelHandleCatalog } from './modelHandleCatalog';
 import { DOMAIN_REPOSITORIES } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -15,11 +15,12 @@ export async function historicalProcessHandleCard(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   conversationId: string,
-  catalog: ModelHandleCatalog
+  catalog: ReadonlyModelHandleCatalog
 ): Promise<string | undefined> {
   if (!catalog.retiredRefs?.some(ref => ref.startsWith('P'))) return undefined;
+  const preparedModelHandles = prepareModelHandleCatalog(catalog);
   const sources = await listAllDomainRows(database, 'ProcessCompletionSourceLink', { conversation_id: conversationId });
-  const candidates = sources.filter(source => modelHandleRef(catalog, 'process', source.process_id))
+  const candidates = sources.filter(source => modelHandleRef(preparedModelHandles, 'process', source.process_id))
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)) || String(a.id).localeCompare(String(b.id)));
   const descriptions: Array<Record<string, unknown>> = [];
   for (const source of candidates.slice(0, CARD_PROCESS_LIMIT)) {
@@ -46,7 +47,7 @@ export async function historicalProcessHandleCard(
       }
     }
     descriptions.push({
-      processRef: modelHandleRef(catalog, 'process', process.id),
+      processRef: modelHandleRef(preparedModelHandles, 'process', process.id),
       status: process.status, startedAt: process.started_at,
       ...(command !== undefined ? { command } : {})
     });

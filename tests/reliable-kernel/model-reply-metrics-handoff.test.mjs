@@ -10,6 +10,7 @@ import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiled, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiled, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { ReliableLlmProviderRegistry } = require(path.join(compiled, 'backend/reliableKernel/llmCapabilityProviderRegistry.js'));
 const conversationId = 'metrics-handoff-conversation';
 const providerId = '20260925-120000-000-openai-compatible-provider-0123456';
@@ -110,6 +111,7 @@ async function openRuntime(provider) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: conversationId, title: 'Metrics', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep(conversationId, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'metrics-agent-link', conversation_id: conversationId, agent_id: 'metrics-agent', role: 'default', created_at: now, updated_at: now })
     ]);
     feed = new kernel.BoundedClientFeed(app.database);

@@ -27,6 +27,9 @@ const {
 } = kernelFile('runtimeDataSetBulkCopy.js');
 const { RUNTIME_DATA_SET_INSERT_ORDER } = kernelFile('runtimeDataSetMerge.js');
 const { RUNTIME_SCHEMA_TRIGGERS } = kernelFile('schema/domainManifest.js');
+const { prepareReadyConversationContextHandleState, pendingConversationContextHandleStateSteps,
+  emptyContextHandleCatalog, readCurrentConversationContextHandleState,
+  readConversationContextHandleStateRow } = kernelFile('conversationContextHandleState.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
@@ -73,6 +76,29 @@ test(`分批整库复制（每批 ${batchRows} 行）：逐领域 id、行数与
   assert.equal(await fs.readFile(casFile(target.dataSet.binding, messageText('rich_parent', 0)), 'utf8'), messageText('rich_parent', 0));
 });
 }
+
+test('exact whole-root copy preserves ready handle authority CAS and pending state across one-row batches', async (t) => {
+  const fixture = await createFixture(t);
+  await seed(fixture.current, ['copy_handles_ready', 'copy_handles_pending']);
+  const catalog = { ...emptyContextHandleCatalog(), entries: [{ kind: 'process', ref: 'P4', target: 'reserved_process' }], retiredRefs: ['P2'] };
+  await withRuntime(fixture.current, async (database, contentStore) => {
+    await database.transaction([
+      ...await prepareReadyConversationContextHandleState({ database, contentStore,
+        conversationId: 'copy_handles_ready', catalog, requiresNativeReset: true, now: NOW }),
+      ...pendingConversationContextHandleStateSteps('copy_handles_pending', NOW)
+    ]);
+  });
+  const target = await createTarget(t, 'default');
+  const receipt = await copy(fixture, fixture.current, target, { batchRows: 1 });
+  assert.equal(receipt.rowsByDomain.ConversationContextHandleState, 2);
+  assert.deepEqual(readAll(target.dataSet), readAll(fixture.current));
+  await withRuntime(target.dataSet, async (database, store) => {
+    const ready = await readCurrentConversationContextHandleState(database, store, 'copy_handles_ready');
+    assert.deepEqual(ready.catalog, catalog);
+    assert.equal(ready.requiresNativeReset, true);
+    assert.equal((await readConversationContextHandleStateRow(database, 'copy_handles_pending')).state, 'pending');
+  });
+});
 
 test('中途注入失败：目标只在本次准入内部分写入、没有任何 Host，可整体丢弃后重做；前置条件不满足时直接拒绝', async (t) => {
   const fixture = await createFixture(t);

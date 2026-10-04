@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSession.js');
 const { readConversationChildHandles, readNativeRequestChildHandles, NATIVE_CHILD_HANDLE_PROJECTION_EVENT } =
   load('backend/reliableKernel/conversationChildHandles.js');
@@ -148,6 +149,7 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'parent', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
     ]);
     const started = await app.turns.input({ source: { kind: 'command', key: 'start-native-child-fixture' },
@@ -371,6 +373,7 @@ test('native fork_conversation freezes the fork reference before a preflighted s
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'native-fork-dispatch-parent', title: 'parent', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('native-fork-dispatch-parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'native-fork-agent-link', conversation_id: 'native-fork-dispatch-parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
     ]);
     await drive('native-fork-history', 'NATIVE_FIRST_QUESTION_4503');

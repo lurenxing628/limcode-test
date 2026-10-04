@@ -6,6 +6,8 @@ import { pathToFileURL } from 'node:url';
 
 const root = process.cwd();
 const kernel = await import(pathToFileURL(path.join(root, 'dist/extension/backend/reliableKernel/index.js')).href);
+const { emptyConversationContextHandleStateStep } = await import(
+  pathToFileURL(path.join(root, 'dist/extension/backend/reliableKernel/conversationContextHandleState.js')).href);
 
 function request() {
   return {
@@ -1618,7 +1620,16 @@ test('Agent loop 开放任务的无工具输出只续行一轮再结束', async 
   let finalFenceCount = 0;
   let terminalReason;
   let assistantCommitCount = 0;
+  const handleState = { ...emptyConversationContextHandleStateStep('conversation-bounded', '2026-10-04T00:00:00.000Z').row,
+    context_root_id: 'root-bounded' };
   loop.database = {
+    async snapshot(reads) {
+      return { snapshot: reads.map(read => {
+        if (read.domain === 'ConversationContextHandleState') return handleState;
+        assert.equal(read.domain, 'ConversationContextHeadLink');
+        return [{ id: 'head-bounded', conversation_id: 'conversation-bounded', root_id: 'root-bounded' }];
+      }) };
+    },
     conversationOwners: {
       owns: (conversationId) => conversationId === 'conversation-bounded',
       async assertOwned(conversationId) {

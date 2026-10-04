@@ -9,6 +9,7 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiled, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiled, 'backend/reliableKernel/conversationContextHandleState.js'));
 const capabilities = { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
 const definition = { name: 'native_probe', description: 'native authority probe',
   parameters: { type: 'object' }, metadata: { nativeAsync: true } };
@@ -98,6 +99,7 @@ async function withNativeApp(stage, verify) {
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'native-authority', title: 'Native authority',
         status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('native-authority', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'native-authority-agent',
         conversation_id: 'native-authority', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
     ]);

@@ -27,6 +27,7 @@ after(() => { Module._load = originalLoad; });
 const dist = file => require(path.join(process.cwd(), 'dist/extension', file));
 const { childConversationModelProfiles } = dist('backend/reliableKernel/childThinkingInheritance.js');
 const kernel = dist('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = dist('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = dist('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = dist('backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = dist('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -471,6 +472,7 @@ test('startup recovery isolates one child whose model record cannot be written a
       const now = new Date().toISOString();
       await f.app.database.transaction([
         kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent-2', title: 'Second', status: 'active', created_at: now, updated_at: now }),
+        emptyConversationContextHandleStateStep('parent-2', now),
         kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-2-agent', conversation_id: 'parent-2', agent_id: f.parentAgent.id, role: 'default', created_at: now, updated_at: now })
       ]);
       await f.app.agentLoop.runInput(f.input('spawn-first'));
@@ -712,6 +714,7 @@ async function runtimeFixture(run, hooks, options = {}) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'Synthetic', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: parentAgent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const input = key => ({ source: { kind: 'command', key }, conversationId: 'parent', leaseOwnerId: 'boundary-owner', hostBootId: app.database.hostBootId, leaseExpiresAt: new Date(Date.now() + 120000).toISOString(), content: `synthetic input ${key}` });

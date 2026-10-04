@@ -2,7 +2,8 @@ import { createHash } from 'node:crypto';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isCollaborationHandleTool, isPersistentContextHandle, mergeModelHandleCatalogs, normalizeModelHandleCatalog, reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog, type ModelHandleEntry } from './modelHandleCatalog';
-import { canonicalPlainJson, normalizePlainJson } from './plainJson';
+import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { ContextHandleReadMemo } from './contextHandleReadMemo';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
 import { RuntimeDatabase } from './runtimeDatabase';
@@ -10,6 +11,7 @@ import type { OpenAIResponsesToolOutput } from '../../shared/openAIResponsesNati
 import { projectNativeToolResultOutput } from './modelFacingContextProjection';
 import { readForkContextHandleReservationEvidence } from './forkContextHandleReservations';
 import { readHistoricalCompressionHandleCatalog } from './historicalCompressionHandleCatalog';
+import { readCurrentConversationContextHandleState } from './conversationContextHandleState';
 import { readCachedContextHandleState, type ContextHandleRequestEvidence } from './contextHandleEvidenceCache';
 
 /**
@@ -40,9 +42,19 @@ export async function readConversationContextHandleState(
   conversationId: string
 ): Promise<{ catalog: ModelHandleCatalog; requiresNativeReset: boolean }> {
   if (!conversationId.trim()) throw new TypeError('conversationId must be non-empty.');
+  const state = await readCurrentConversationContextHandleState(database, contentStore, conversationId);
+  return { catalog: state.catalog, requiresNativeReset: state.requiresNativeReset };
+}
+
+/** Complete historical reader belongs to explicit upgrade/recovery, never ordinary request creation. */
+export async function rebuildHistoricalConversationContextHandleState(
+  database: RuntimeDatabase, contentStore: ContentAddressedStore, conversationId: string
+): Promise<{ catalog: ModelHandleCatalog; requiresNativeReset: boolean }> {
+  let memo = new ContextHandleReadMemo();
   return readCachedContextHandleState(database, contentStore, conversationId, {
+    beginRead: () => { memo = new ContextHandleReadMemo(); },
     fork: db => readForkContextHandleReservationEvidence(db, contentStore, conversationId),
-    request: (db, request, covered) => readRequestContextHandleEvidence(db, contentStore, conversationId, request, covered),
+    request: (db, request, covered) => readRequestContextHandleEvidence(db, contentStore, conversationId, request, covered, memo),
     reconcile: (fork, evidence) => {
       const catalogs = [...(fork ? [fork.catalog] : []), ...evidence.catalogs];
       const catalog = reconcileHistoricalModelHandleCatalogs(catalogs);
@@ -53,41 +65,55 @@ export async function readConversationContextHandleState(
   });
 }
 
-async function readRequestContextHandleEvidence(database: RuntimeDatabase, contentStore: ContentAddressedStore,
-  conversationId: string, request: DomainRow, covered: boolean): Promise<ContextHandleRequestEvidence> {
+export async function readRequestContextHandleEvidence(database: RuntimeDatabase, contentStore: ContentAddressedStore,
+  conversationId: string, request: DomainRow, covered: boolean, memo: ContextHandleReadMemo): Promise<ContextHandleRequestEvidence> {
   if (typeof request.recipe_object_id !== 'string' || !request.recipe_object_id) {
     throw childHandleError(`ModelRequest ${String(request.id)} has no frozen recipe.`);
   }
   const snapshot = await database.snapshot([DOMAIN_REPOSITORIES.domain('ContentObject').get(request.recipe_object_id)]);
   const row = snapshot.snapshot[0];
   if (!row || Array.isArray(row)) throw childHandleError(`Frozen recipe ContentObject ${request.recipe_object_id} is missing.`);
-  const content = await contentStore.read(row as unknown as ContentObjectMetadata);
-  const recipe = normalizePlainJson(JSON.parse(content.toString('utf8')), 'Frozen child handle recipe');
-  if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
-    throw childHandleError(`Frozen recipe ${request.recipe_object_id} is not an object.`);
+  const metadata = row as unknown as ContentObjectMetadata;
+  let frozen = memo.recipe(metadata);
+  let recipe: PlainJsonValue | undefined;
+  if (!frozen) {
+    const content = await contentStore.read(metadata);
+    // JSON.parse establishes syntax/plain objects. Only handle evidence is consumed here;
+    // full recipe schema validation belongs to its producer/import and execution boundaries.
+    recipe = JSON.parse(content.toString('utf8')) as PlainJsonValue;
+    if (!recipe || typeof recipe !== 'object' || Array.isArray(recipe)) {
+      throw childHandleError(`Frozen recipe ${request.recipe_object_id} is not an object.`);
+    }
+    frozen = recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression'
+      ? { kind: recipe.kind, catalog: memo.persistent(memo.catalog(recipe.modelHandleCatalog)) } : {};
+    // Legacy compression recovery is request/source-specific and still needs the original body.
+    // Never retain that graph or mistake another request's recovery for this request's proof.
+    if (frozen.kind !== 'reliable-context-compression'
+      || frozen.catalog?.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION) {
+      memo.rememberRecipe(metadata, frozen);
+    }
   }
-  const frozen = recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression'
-    ? { kind: recipe.kind, recipe, catalog: persistentContextCatalog(recipe.modelHandleCatalog) } : undefined;
   const catalogs: ModelHandleCatalog[] = [];
-  if (frozen) {
+  if (frozen.catalog) {
     catalogs.push(frozen.catalog);
     // A fork's private artifact already covers the named recipes outside its copied window.
-    if (!covered) {
+    if (!covered && frozen.kind === 'reliable-context-compression'
+      && frozen.catalog.identityContractRevision !== CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION) {
       const derived = await readHistoricalCompressionHandleCatalog(database, contentStore, {
-        recipe: frozen.recipe, requestId: String(request.id), conversationId
+        recipe, requestId: String(request.id), conversationId
       });
       if (derived) catalogs.push(derived);
     }
   }
-  const nativeCatalogs = await readNativeRequestContextCatalogs(database, contentStore, String(request.id), createFrozenHandleReadCache());
+  const nativeCatalogs = await readNativeRequestContextCatalogs(database, contentStore, String(request.id), createFrozenHandleReadCache(memo));
   // Native outputs from one immutable request share exactly its frozen scope. Legacy aliases
   // across requests can be reconciled, but contradictory identities within one scope cannot.
   const requestScope = nativeCatalogs.length > 0
-    ? mergeModelHandleCatalogs(...(frozen ? [frozen.catalog] : []), ...nativeCatalogs) : frozen?.catalog;
+    ? memo.scope([...(frozen.catalog ? [frozen.catalog] : []), ...nativeCatalogs]) : frozen.catalog;
   catalogs.push(...nativeCatalogs);
   return { catalogs, frontierCovered: covered || frozen?.kind !== 'reliable-context-compression'
-    || frozen.catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, ...(frozen?.kind === 'reliable-agent-turn'
-    && frozen.catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION
+    || frozen.catalog?.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, ...(frozen.kind === 'reliable-agent-turn'
+    && frozen.catalog?.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION
     ? { currentOrdinaryCatalog: requestScope! } : {}) };
 }
 
@@ -150,11 +176,12 @@ interface NativeChildProjection {
 }
 
 interface FrozenHandleReadCache {
+  memo?: ContextHandleReadMemo;
   nativeProjections: Map<string, NativeChildProjection>;
 }
 
-function createFrozenHandleReadCache(): FrozenHandleReadCache {
-  return { nativeProjections: new Map() };
+function createFrozenHandleReadCache(memo?: ContextHandleReadMemo): FrozenHandleReadCache {
+  return { nativeProjections: new Map(), memo };
 }
 
 function persistentContextCatalog(value: unknown): ModelHandleCatalog {
@@ -209,13 +236,13 @@ async function readNativeRequestContextCatalogs(
     }));
     if (contents.length !== uncachedIds.length) throw childHandleError('Native child projection CAS batch is incomplete.');
     for (let index = 0; index < contents.length; index += 1) {
-      cache.nativeProjections.set(uncachedIds[index], parseNativeChildProjection(contents[index].toString('utf8')));
+      cache.nativeProjections.set(uncachedIds[index], parseNativeChildProjection(contents[index].toString('utf8'), cache.memo));
     }
   }
   return events.map(event => {
     const projection = cache.nativeProjections.get(String(event.content_object_id));
     if (!projection) throw childHandleError(`Native child projection ${String(event.id)} is missing.`);
-    return persistentContextCatalog(projection.modelHandleCatalog);
+    return cache.memo?.persistent(projection.modelHandleCatalog) ?? persistentContextCatalog(projection.modelHandleCatalog);
   });
 }
 
@@ -273,7 +300,12 @@ export async function freezeNativeChildToolProjection(input: {
   };
   const content = await input.contentStore.prepare(input.database,
     canonicalPlainJson(normalizePlainJson(frozen, 'Native child projection')), NATIVE_CHILD_HANDLE_PROJECTION_CONTENT_TYPE);
+  const turn = (await input.database.snapshot([DOMAIN_REPOSITORIES.domain('Turn').get(String(request.turn_id))])).snapshot[0];
+  if (!turn || Array.isArray(turn) || typeof turn.conversation_id !== 'string') {
+    throw childHandleError('Native child projection carrier has no owning Conversation.');
+  }
   await input.database.transaction([
+    DOMAIN_REPOSITORIES.domain('Turn').assert(String(turn.id), { conversation_id: turn.conversation_id }),
     DOMAIN_REPOSITORIES.domain('ModelRequest').assert(input.modelRequestId, { turn_id: request.turn_id }),
     DOMAIN_REPOSITORIES.domain('ToolCall').assert(input.toolCallId, {
       turn_id: request.turn_id, tool_name: input.toolName, status: 'terminal'
@@ -311,8 +343,8 @@ export function withChildHandles(
   return { entries: merged.entries };
 }
 
-function parseNativeChildProjection(text: string): NativeChildProjection {
-  const value = normalizePlainJson(JSON.parse(text), 'Native child projection');
+function parseNativeChildProjection(text: string, memo?: ContextHandleReadMemo): NativeChildProjection {
+  const value = JSON.parse(text) as PlainJsonValue;
   if (!value || typeof value !== 'object' || Array.isArray(value) || value.kind !== NATIVE_CHILD_HANDLE_PROJECTION_EVENT
     || !(typeof value.output === 'string' || (Array.isArray(value.output) && value.output.every(block =>
       block !== null && typeof block === 'object' && !Array.isArray(block)
@@ -330,8 +362,8 @@ function parseNativeChildProjection(text: string): NativeChildProjection {
     || (!hasCatalog && !Array.isArray(value.childHandles))) {
     throw childHandleError('Native child projection has an invalid catalog shape.');
   }
-  const modelHandleCatalog = normalizeModelHandleCatalog(hasCatalog
-    ? value.modelHandleCatalog : { entries: value.childHandles });
+  const catalogValue = hasCatalog ? value.modelHandleCatalog : { entries: value.childHandles };
+  const modelHandleCatalog = memo?.catalog(catalogValue) ?? normalizeModelHandleCatalog(catalogValue);
   if (hasCatalog && (value.modelHandleCatalog === null || typeof value.modelHandleCatalog !== 'object'
     || Array.isArray(value.modelHandleCatalog)
     || !Array.isArray(value.modelHandleCatalog.entries))) {

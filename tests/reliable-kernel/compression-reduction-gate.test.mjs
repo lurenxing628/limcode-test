@@ -11,6 +11,7 @@ const compiledRoot = process.env.LIMCODE_COMPILED_ROOT
   ? path.resolve(root, process.env.LIMCODE_COMPILED_ROOT)
   : path.join(root, 'dist/extension');
 const kernel = await import(pathToFileURL(path.join(compiledRoot, 'backend/reliableKernel/index.js')).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js')).href);
 const capabilitiesModule = await import(pathToFileURL(path.join(compiledRoot, 'shared/modelCapabilities.js')).href);
 
 const PROVIDER_ID = 'provider-reduction-gate';
@@ -102,6 +103,7 @@ async function withTurn(name, thresholdTokens, run, options = {}) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: name, title: name, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(name, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `${name}-agent-link`, conversation_id: name, agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now
       })
@@ -410,9 +412,24 @@ test('committed prefix compression keeps historical process references stable in
       headRootId: head, round, tools: [], includeOpenTaskCompletionCheck: false
     });
     const before = await freeze(headRootId, '1');
+    const consumed = await app.modelProvider.createModelRequest({ turnId: seeded.turnId,
+      authoritySnapshotId: seeded.authoritySnapshotId, contextRootId: headRootId,
+      recipe: before, idempotencyKey: 'consume-process-references' });
+    const answer = { role: 'model', parts: [{ text: 'Both process results are available.' }] };
+    await app.modelProvider.dispatch(consumed.modelRequestId, { providerId: PROVIDER_ID,
+      async sendFullRequest(_request, controls) {
+        await controls.onEvent({ kind: 'completed', streamSeq: '1', content: answer });
+      }
+    });
+    await new kernel.TurnOutputControlPlane(app.database, app.contentStore).appendAssistantMessage({
+      turnId: seeded.turnId, modelRequestId: consumed.modelRequestId,
+      sourceKey: 'consume-process-references', content: JSON.stringify(answer) });
+    // The bindings were consumed and admitted even though this output does not echo P1/P2.
+    // Compress that original input prefix and retain the admitted output as the active tail.
+    const consumedHead = await app.context.currentHeadRootId(seeded.conversationId);
     const coordinator = summaryCoordinator(app, 'Build task output is available via P1 and O1.', () => {});
-    const compressed = await coordinator.coordinate({ ...seeded, headRootId, trigger: 'manual',
-      compressSegmentCount: 2, modelHandleCatalog: before.modelHandleCatalog });
+    const compressed = await coordinator.coordinate({ ...seeded, headRootId: consumedHead, trigger: 'manual',
+      compressSegmentCount: 3, modelHandleCatalog: before.modelHandleCatalog });
     assert.equal(compressed.status, 'compressed');
     const nextHead = await app.context.currentHeadRootId(seeded.conversationId);
     const after = await freeze(nextHead, '2');

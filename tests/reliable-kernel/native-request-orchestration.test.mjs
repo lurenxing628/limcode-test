@@ -12,6 +12,12 @@ const compiledRoot = process.env.LIMCODE_COMPILED_ROOT
 const kernel = await import(pathToFileURL(
   path.join(compiledRoot, 'backend/reliableKernel/index.js')
 ).href);
+const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(
+  path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js')
+).href);
+const { readConversationContextHandleCatalog } = await import(pathToFileURL(
+  path.join(compiledRoot, 'backend/reliableKernel/conversationChildHandles.js')
+).href);
 
 const ASTRA_MODEL = 'gpt-6-astra';
 const PROVIDER_ID = 'provider-native';
@@ -194,6 +200,7 @@ async function withNativeApp(name, nativeTools, run, behavior) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: name, title: name, status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(name, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: `${name}-agent-link`, conversation_id: name, agent_id: 'agent-main',
         role: 'default', created_at: now, updated_at: now
@@ -607,6 +614,7 @@ test('semantic idle watchdog stays quiet during a proven native input wait', asy
       authoritySnapshotId: authoritySnapshot.id,
       recipe: {
         kind: 'reliable-agent-turn',
+        modelHandleCatalog: await readConversationContextHandleCatalog(app.database, app.contentStore, name),
         round: '1',
         tools: [{ name: 'read_file', description: 'fixture', parameters: {}, metadata: { nativeAsync: true } }],
         nativeResponses: { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: true, explicitCaching: true }

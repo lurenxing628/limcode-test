@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSession.js');
 
 const capabilities = { asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
@@ -175,6 +176,7 @@ async function withNativeKernel(script, verify) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: CONVERSATION, title: 'Native closure', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(CONVERSATION, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'native-closure-agent', conversation_id: CONVERSATION, agent_id: 'agent-main', role: 'default',
         created_at: now, updated_at: now

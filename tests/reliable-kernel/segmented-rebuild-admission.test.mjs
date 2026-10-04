@@ -31,6 +31,7 @@ Module._load = function(request, parent, isMain) {
 };
 after(() => { Module._load = originalLoad; });
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = require('../../dist/extension/backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { createVscodeStoragePaths } = require('../../dist/extension/backend/capabilities/vscodeStorage/paths.js');
 const { createDefaultLlmProviderConfig } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -118,6 +119,7 @@ async function fixture({ contextWindowTokens, compression, historyText, oldSumma
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'rebuild-conversation', title: '重建', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('rebuild-conversation', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'rebuild-link', conversation_id: 'rebuild-conversation', agent_id: agent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     const history = await app.turns.input({

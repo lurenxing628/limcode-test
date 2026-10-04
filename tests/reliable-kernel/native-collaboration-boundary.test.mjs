@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { NativeRequestSession } = load('backend/reliableKernel/nativeRequestSession.js');
 const { readConversationChildHandles, readNativeRequestChildHandles, NATIVE_CHILD_HANDLE_PROJECTION_EVENT } =
   load('backend/reliableKernel/conversationChildHandles.js');
@@ -152,6 +153,7 @@ test('pending peer messages end a native tool loop at its first settled response
     const requestPayload = await app.contentStore.ingest(app.database, 'Please review the change.', 'text/vnd.limcode.collaboration-message');
     await app.database.transaction([
       ...['parent', 'peer'].map(id => repo('Conversation').insert({ id, title: id, status: 'active', created_at: now, updated_at: now })),
+      ...['parent', 'peer'].map(id => emptyConversationContextHandleStateStep(id, now)),
       repo('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'parent', agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now }),
       repo('Turn').insert({ id: 'peer-turn', conversation_id: 'peer', status: 'terminated', created_at: now, updated_at: now, terminal_at: now }),
       repo('TurnTermination').insert({ id: 'peer-turn-done', turn_id: 'peer-turn', terminal_status: 'completed', reason: 'fixture', created_at: now }),

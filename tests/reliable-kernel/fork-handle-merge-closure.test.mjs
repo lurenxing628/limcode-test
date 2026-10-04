@@ -14,6 +14,7 @@ const {
   FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND, readForkContextHandleReservationCatalog
 } = kernelFile('forkContextHandleReservations.js');
 const { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION } = kernelFile('modelHandleCatalog.js');
+const { prepareReadyConversationContextHandleState } = kernelFile('conversationContextHandleState.js');
 
 const SOURCE = 'fork_merge_source';
 const FORK = 'fork_merge_deleted_branch';
@@ -54,6 +55,11 @@ async function seedFork(dataSet) {
       ...modelRequestAggregate(`${SOURCE}_turn`, `${SOURCE}_request`, 1n,
         { recipe: recipe.id, body: body.id, checkpoints: 1 })
     ]);
+    // The empty head deliberately has retained reservations. Seed that exact scoped authority;
+    // unselected historical requests cannot establish mappings for an empty visible root.
+    await database.transaction(await prepareReadyConversationContextHandleState({ database, contentStore: store,
+      conversationId: SOURCE, contextRootId: `${SOURCE}_empty_root`, catalog: CATALOG,
+      requiresNativeReset: false, now: NOW }));
     const fork = await new kernel.ConversationForkControlPlane(database, store, { now: () => NOW }).fork({
       idempotencyKey: 'fork-merge-reservations', reuseKey: 'fork-merge-reservations',
       sourceConversationId: SOURCE, sourceContextRootId: `${SOURCE}_empty_root`,

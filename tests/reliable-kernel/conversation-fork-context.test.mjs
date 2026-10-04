@@ -8,6 +8,7 @@ import { createRequire } from 'node:module';
 const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { pendingConversationContextHandleStateSteps } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 const NOW = '2026-09-07T00:00:00.000Z';
 
 async function withContext(body, observed = true) {
@@ -69,7 +70,8 @@ async function withContext(body, observed = true) {
         id: 'source-full', conversation_id: 'source', root_seq: 3n, root_node_id: 'node-0', tail_node_id: 'node-2',
         tail_segment_count: 2n, segment_count: 3n, estimated_tokens: 6000n, created_at: NOW
       }),
-      insert('ConversationContextHeadLink', { id: 'source-head', conversation_id: 'source', root_id: 'source-full', updated_at: NOW })
+      insert('ConversationContextHeadLink', { id: 'source-head', conversation_id: 'source', root_id: 'source-full', updated_at: NOW }),
+      ...pendingConversationContextHandleStateSteps('source', NOW, undefined, 'source-full')
     ];
     if (observed) {
       const recipe = await store.ingest(database, '{}', 'application/json');

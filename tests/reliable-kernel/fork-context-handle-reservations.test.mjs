@@ -17,6 +17,7 @@ after(() => { Module._load = originalLoad; });
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 const { RuntimeWriteGate } = load('backend/application/reliableKernel/runtimeWriteGate.js');
 const { ForkContextCandidateProbe } = load('backend/reliableKernel/conversationForkContext.js');
@@ -147,6 +148,7 @@ async function withForkRuntime(run, {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: 'source', title: 'Source fixture', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep('source', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'source-agent', conversation_id: 'source', agent_id: agent.id,
         role: 'default', created_at: now, updated_at: now
@@ -252,7 +254,7 @@ function allTargets(prefix) {
 const identity = catalog => catalog.entries.map(({ kind, ref, target }) => ({ kind, ref, target }))
   .sort((left, right) => left.ref.localeCompare(right.ref));
 
-test('fork preserves every discarded Context address without copying discarded transcript or granting child/process ownership', async () => {
+test('fork excludes discarded branch bindings while copied occurrences survive nested forks and source deletion', async () => {
   let sourceCalled = false;
   let forkCalled = false;
   await withForkRuntime(async h => {
@@ -265,32 +267,29 @@ test('fork preserves every discarded Context address without copying discarded t
       ['process','cursor','workEnvironment','child','conversation','collaborationMessage','conversationMessage','boardChannel','boardThread','boardPost'].sort());
     await h.app.turns.edit({ source: { kind: 'command', key: 'discard-handle-suffix' }, conversationId: 'source',
       messageId: original.messageId, expectedRevisionId: original.expectedRevisionId,
-      content: 'Existing background process P1 and historical handles O1 W1 A1 C1 M1 R1 H1 T1 B1.', deleteFollowing: true });
+      content: 'Edited retained prefix without historical bindings.', deleteFollowing: true });
     const [current] = await rows(h.app, 'MessageCurrentRevisionLink', { message_id: original.messageId });
     const command = { ...original, expectedRevisionId: current.revision_id, command: { commandId: 'fork-context-reservations' } };
     const fork = await h.facade.forkConversation(command);
     const inherited = await readConversationContextHandleCatalog(h.app.database, h.app.contentStore, fork.conversationId);
-    assert.deepEqual(identity(inherited), identity(sourceCatalog));
+    assert.deepEqual(identity(inherited), []);
     const privateCatalog = await readForkContextHandleReservationCatalog(h.app.database, h.app.contentStore, fork.conversationId);
-    assert.deepEqual(identity(privateCatalog), identity(sourceCatalog));
+    assert.deepEqual(identity(privateCatalog), []);
     assert.equal((await h.facade.forkConversation(command)).deduplicated, true);
     const materialized = await h.app.context.materialize(await h.app.context.currentHeadRootId(fork.conversationId));
-    assert.ok(materialized.segments.some(segment => segment.content.toString('utf8').includes('historical handles O1')));
+    assert.ok(materialized.segments.some(segment => segment.content.toString('utf8').includes('Edited retained prefix')));
     assert.ok(materialized.segments.every(segment => !segment.content.toString('utf8').includes('old-process')));
     assert.ok(materialized.segments.every(segment => !segment.content.toString('utf8').includes('fork-context-handle-reservations')));
     await h.turn(fork.conversationId, 'fork-new-handles');
     const next = h.requests.at(-1).recipe.modelHandleCatalog;
     assert.equal((await h.facade.forkConversation(command)).deduplicated, true, 'current head changes do not alter the original fork identity');
     for (const old of sourceCatalog.entries) {
-      assert.equal(modelHandleTarget(next, old.kind, old.ref), old.target, `${old.ref} must keep its source identity`);
+      assert.equal(next.entries.some(entry => entry.kind === old.kind && entry.target === old.target), false,
+        `${old.ref} from the discarded branch must not regain an active binding`);
     }
-    assert.equal(modelHandleTarget(next, 'process', 'P2'), 'new-process');
-    assert.deepEqual(resolveModelToolArguments('bash', { mode: 'kill', processRef: 'P1' }, next),
-      { mode: 'kill', processId: 'old-process' });
+    assert.ok(next.entries.some(entry => entry.kind === 'process' && entry.target === 'new-process'));
     assert.equal((await rows(h.app, 'ProcessCompletionSourceLink', { conversation_id: fork.conversationId })).length, 0);
     assert.deepEqual(await rows(h.app, 'ChildExecution'), [], 'reserving A1 does not create child ownership');
-    assert.match(h.requests.at(-1).recipe.runtimeStatusCard.card, /"inheritedChildRefs":\["A1"\]/);
-    assert.match(h.requests.at(-1).recipe.runtimeStatusCard.card, /"operable":false/);
     assert.deepEqual(h.requests.at(-1).recipe.tools.map(tool => tool.name), ['read']);
     const beforeNested = await readConversationContextHandleCatalog(h.app.database, h.app.contentStore, fork.conversationId);
     const nestedCommand = await h.command(fork.conversationId, 'nested-context-reservations');
@@ -302,7 +301,7 @@ test('fork preserves every discarded Context address without copying discarded t
     await h.reopen();
     assert.deepEqual(identity(await readConversationContextHandleCatalog(h.app.database, h.app.contentStore, nested.conversationId)), identity(beforeNested));
     await h.turn(nested.conversationId, 'nested-continues-after-source-deletion');
-    assert.equal(modelHandleTarget(h.requests.at(-1).recipe.modelHandleCatalog, 'process', 'P1'), 'old-process');
+    assert.ok(h.requests.at(-1).recipe.modelHandleCatalog.entries.some(entry => entry.kind === 'process' && entry.target === 'new-process'));
   }, { script: {
     async configure(configuration) { await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read'] }); },
     definitions: [{ name: 'read', description: 'Synthetic Context identity fixture', parameters: { type: 'object' } }],
@@ -329,7 +328,9 @@ test('isolated fork reservation artifact preserves retired addresses, checks its
     const catalog = { ...buildModelHandleCatalog([allTargets('reserved')]),
       identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, retiredRefs: ['O9','P9','W9'] };
     const prepared = await prepareForkContextHandleReservations({ database: h.app.database, contentStore: h.app.contentStore,
-      sourceConversationId: 'source', targetConversationId: target, catalog, coveredRecipeObjectIds: [], now });
+      sourceConversationId: 'source', targetConversationId: target, targetContextRootId: 'private-visible-empty-root',
+      rootShape: { rootNodeId: null, tailNodeId: null, tailSegmentCount: 0n, segmentCount: 0n },
+      catalog, coveredRecipeObjectIds: [], now });
     await h.app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: target, title: 'Private reservation fixture', status: 'active', created_at: now, updated_at: now }),
       kernel.DOMAIN_REPOSITORIES.domain('ConversationBranchLink').insert({ id: 'private-branch', target_conversation_id: target,
@@ -361,17 +362,23 @@ test('isolated fork reservation artifact preserves retired addresses, checks its
   });
 });
 
-test('source Context identity frontier is rechecked inside the fork transaction after precommit work', async () => {
+test('fork keeps its selected immutable scope when an unrelated suffix is appended before commit', async () => {
   await withForkRuntime(async h => {
     await h.turn('source', 'before-concurrent-frontier');
     const rootId = await h.app.context.currentHeadRootId('source');
+    const before = await h.app.context.materializeStructure(rootId);
     const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source', role: 'default' });
-    await assert.rejects(h.app.runtime.conversationFork.fork({ idempotencyKey: 'frontier-race', reuseKey: 'frontier-race',
+    const fork = await h.app.runtime.conversationFork.fork({ idempotencyKey: 'frontier-race', reuseKey: 'frontier-race',
       sourceConversationId: 'source', sourceContextRootId: rootId, targetConversationId: 'frontier-race-target',
-      targetAgentId: agent.agent_id, targetTitle: 'Must not commit a stale identity frontier'
-    }, { beforeCommit: () => h.turn('source', 'concurrent-new-request') }));
-    assert.deepEqual(await rows(h.app, 'Conversation', { id: 'frontier-race-target' }), []);
-    assert.deepEqual(await rows(h.app, 'ModelContextProjection', { owner_kind: 'conversation_handle_catalog', owner_id: 'frontier-race-target' }), []);
+      targetAgentId: agent.agent_id, targetTitle: 'Frozen selected scope'
+    }, { beforeCommit: () => h.turn('source', 'concurrent-new-request') });
+    assert.notEqual(await h.app.context.currentHeadRootId('source'), rootId);
+    const copied = await h.app.context.materializeStructure(fork.targetRootId);
+    assert.deepEqual(copied.records.map(record => record.segment.id), before.records.map(record => record.segment.id));
+    assert.equal((await rows(h.app, 'Conversation', { id: 'frontier-race-target' })).length, 1);
+    assert.equal((await rows(h.app, 'ModelContextProjection', {
+      owner_kind: 'conversation_handle_catalog', owner_id: 'frontier-race-target'
+    })).length, 1);
   });
 });
 
@@ -381,17 +388,15 @@ test('child fork freezes source reservations and replay verifies the child origi
   let spawned = false;
   let childRead = false;
   let spawnCommand;
+  let spawnFailure;
   await withForkRuntime(async h => {
     await h.turn('source', 'first-child-fork-input');
-    const original = await h.command('source', 'child-original-input', 'user');
     await h.turn('source', 'supply-old-child-fork-handles');
     const sourceCatalog = await readConversationContextHandleCatalog(h.app.database, h.app.contentStore, 'source');
-    await h.app.turns.edit({ source: { kind: 'command', key: 'edit-child-fork-prefix' }, conversationId: 'source',
-      messageId: original.messageId, expectedRevisionId: original.expectedRevisionId,
-      content: 'Previously started process P1 must retain its original identity.', deleteFollowing: true });
     await h.turn('source', 'spawn-with-reservations');
     const [child] = await rows(h.app, 'ChildExecution');
-    assert.ok(child);
+    assert.ok(child, spawnFailure?.stack ?? `Child was not created; tool executions: ${JSON.stringify(
+      await rows(h.app, 'ToolExecution'), (_key, value) => typeof value === 'bigint' ? String(value) : value)}`);
     const evidence = await readForkContextHandleReservationCatalog(h.app.database, h.app.contentStore, child.child_conversation_id);
     for (const old of sourceCatalog.entries) assert.equal(modelHandleTarget(evidence, old.kind, old.ref), old.target);
     assert.equal((await h.app.runtime.children.spawn(spawnCommand)).deduplicated, true);
@@ -440,7 +445,10 @@ test('child fork freezes source reservations and replay verifies the child origi
           modelFallback: { providerConfigId: provider.id, model: provider.model }, prompt: 'Read retained P1; own process uses a fresh address.',
           forkTurns: 'all', completionPolicy: 'background', sourceSettlement: 'child_handle',
           leaseOwnerId: 'child-reservation-fixture', leaseExpiresAt: new Date(Date.now() + 120_000).toISOString() };
-        const created = await app.runtime.children.spawn(spawnCommand);
+        const created = await app.runtime.children.spawn(spawnCommand).catch(error => {
+          spawnFailure = error;
+          throw error;
+        });
         assert.equal(await app.runtime.children.claimSpawnDispatch(created.effectIntentId), true);
         const receipt = await app.runtime.children.recordSpawnReceipt({ sourceKey: `local-child-reservation:${created.attemptId}`,
           attemptId: created.attemptId, outcome: 'succeeded', detail: { adapter: 'reliable-local-agent-loop' } });

@@ -28,6 +28,7 @@ Module._load = function(request, parent, isMain) {
 };
 after(() => { Module._load = originalLoad; });
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
@@ -116,6 +117,7 @@ async function fixture({ providerKind, modelId, baseUrl = 'https://example.inval
     const now = new Date().toISOString();
     await app.database.transaction([
       repo('Conversation').insert({ id: CONVERSATION, title: 'tool batch', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep(CONVERSATION, now),
       repo('AgentConversationLink').insert({ id: `${CONVERSATION}-agent`, conversation_id: CONVERSATION, agent_id: 'main', role: 'default', created_at: now, updated_at: now })
     ]);
     await app.recover();

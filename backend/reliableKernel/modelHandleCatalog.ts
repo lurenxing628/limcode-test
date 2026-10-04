@@ -35,6 +35,8 @@ export interface ModelHandleEntry {
 
 export interface ModelHandleCatalog {
   entries: ModelHandleEntry[];
+  /** Reserved ordinals without an active target binding; private scopes never contribute aliases. */
+  allocationHighWater?: Partial<Record<ModelHandleKind, number>>;
   /** One current identity contract; unmarked published recipes remain immutable historical facts. */
   identityContractRevision?: string;
   /** Ambiguous published Context addresses are never assigned or resolved again. */
@@ -44,6 +46,7 @@ export interface ModelHandleCatalog {
 /** Read-only catalog data accepted by projection helpers; persisted catalogs keep their plain shape. */
 export interface ReadonlyModelHandleCatalog {
   readonly entries: readonly Readonly<ModelHandleEntry>[];
+  readonly allocationHighWater?: Readonly<Partial<Record<ModelHandleKind, number>>>;
   readonly identityContractRevision?: string;
   readonly retiredRefs?: readonly string[];
 }
@@ -78,6 +81,7 @@ export function prepareModelHandleCatalog(value: unknown): PreparedModelHandleCa
   }
   Object.freeze(catalog.entries);
   if (catalog.retiredRefs) Object.freeze(catalog.retiredRefs);
+  if (catalog.allocationHighWater) Object.freeze(catalog.allocationHighWater);
   // The opaque type has no wire marker; ownership is established only by the private map below.
   const prepared = Object.freeze(catalog) as unknown as PreparedModelHandleCatalog;
   preparedModelHandleLookups.set(prepared, { byTarget, byRef, retiredRefs: new Set(catalog.retiredRefs) });
@@ -149,6 +153,9 @@ export function buildModelHandleCatalog(
     counters[kind] = Math.max(counters[kind], Number(ref.slice(1)));
   }
   const entries: ModelHandleEntry[] = [];
+  for (const [kind, ordinal] of Object.entries(seedCatalog.allocationHighWater ?? {})) {
+    counters[kind as ModelHandleKind] = Math.max(counters[kind as ModelHandleKind], ordinal);
+  }
   for (const seed of normalizedSeeds) {
     const ordinal = Number(seed.ref.slice(1));
     if (!Number.isSafeInteger(ordinal) || ordinal <= 0) {
@@ -181,7 +188,7 @@ export function buildModelHandleCatalog(
     byTarget.set(key, entry);
     entries.push(entry);
   }
-  return currentModelHandleCatalog(entries, seedCatalog.retiredRefs ?? []);
+  return currentModelHandleCatalog(entries, seedCatalog.retiredRefs ?? [], seedCatalog.allocationHighWater);
 }
 
 export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog {
@@ -192,6 +199,7 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
     const prepared = value as PreparedModelHandleCatalog;
     return {
       entries: prepared.entries.map(entry => ({ ...entry })),
+      ...(prepared.allocationHighWater ? { allocationHighWater: { ...prepared.allocationHighWater } } : {}),
       ...(prepared.identityContractRevision === undefined ? {} : {
         identityContractRevision: prepared.identityContractRevision,
         retiredRefs: [...prepared.retiredRefs!]
@@ -238,7 +246,10 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
       ...(sizeBytes !== undefined ? { sizeBytes } : {})
     };
   });
-  if (!hasContract) return { entries };
+  if (!hasContract) {
+    if (record.allocationHighWater !== undefined) throw new TypeError('Allocation high-water reservations require the current identity contract.');
+    return { entries };
+  }
   const retired = new Set<string>();
   for (const candidate of record.retiredRefs as unknown[]) {
     const ref = requireText(candidate, 'modelHandleCatalog.retiredRefs entry');
@@ -251,7 +262,7 @@ export function normalizeModelHandleCatalog(value: unknown): ModelHandleCatalog 
     if (refs.has(ref)) throw modelHandleIdentityError(`Retired model handle reference ${ref} is still assigned.`);
     retired.add(ref);
   }
-  return currentModelHandleCatalog(entries, [...retired]);
+  return currentModelHandleCatalog(entries, [...retired], normalizeAllocationHighWater(record.allocationHighWater));
 }
 
 /** Strictly combines current identity facts; this never repairs or chooses among conflicting maps. */
@@ -273,7 +284,7 @@ export function mergeModelHandleCatalogs(...catalogs: readonly ModelHandleCatalo
     byRef.set(entry.ref, merged);
     byTarget.set(targetKey(entry.kind, entry.target), merged);
   }
-  return currentModelHandleCatalog([...byRef.values()], [...retired]);
+  return currentModelHandleCatalog([...byRef.values()], [...retired], mergeAllocationHighWater(normalized));
 }
 
 /**
@@ -389,7 +400,7 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
     entries.push({ ...entry, ref: `${HANDLE_PREFIX[entry.kind]}${ordinal}` });
   }
   entries.sort((left, right) => compareModelHandleRefs(left.ref, right.ref));
-  return currentModelHandleCatalog(entries, [...retired]);
+  return currentModelHandleCatalog(entries, [...retired], mergeAllocationHighWater(catalogs));
 }
 
 export function renderRetiredModelHandleNotice(catalogInput: ModelHandleCatalog | unknown): string | undefined {
@@ -409,9 +420,36 @@ function compareHandleText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
 }
 
-function currentModelHandleCatalog(entries: ModelHandleEntry[], retiredRefs: string[]): ModelHandleCatalog {
+function currentModelHandleCatalog(entries: ModelHandleEntry[], retiredRefs: string[],
+  allocationHighWater?: Partial<Record<ModelHandleKind, number>>): ModelHandleCatalog {
   return { entries, identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
-    retiredRefs: [...retiredRefs].sort(compareModelHandleRefs) };
+    retiredRefs: [...retiredRefs].sort(compareModelHandleRefs),
+    ...(allocationHighWater && Object.keys(allocationHighWater).length > 0 ? { allocationHighWater } : {}) };
+}
+
+function normalizeAllocationHighWater(value: unknown): Partial<Record<ModelHandleKind, number>> | undefined {
+  if (value === undefined) return undefined;
+  const record = asRecord(value);
+  if (!record) throw new TypeError('modelHandleCatalog.allocationHighWater must be an object.');
+  const result: Partial<Record<ModelHandleKind, number>> = {};
+  for (const key of Object.keys(record)) {
+    const kind = requireKind(key, 'Allocation high-water kind');
+    if (!isPersistentContextHandle(kind) || !Number.isSafeInteger(record[key]) || Number(record[key]) < 0) {
+      throw new TypeError('Allocation high-water requires a nonnegative persistent-handle ordinal.');
+    }
+  }
+  for (const kind of Object.keys(HANDLE_PREFIX) as ModelHandleKind[]) {
+    if (typeof record[kind] === 'number' && record[kind] > 0) result[kind] = record[kind];
+  }
+  return result;
+}
+
+function mergeAllocationHighWater(catalogs: readonly ModelHandleCatalog[]): Partial<Record<ModelHandleKind, number>> {
+  const result: Partial<Record<ModelHandleKind, number>> = {};
+  for (const catalog of catalogs) for (const [kind, ordinal] of Object.entries(catalog.allocationHighWater ?? {})) {
+    result[kind as ModelHandleKind] = Math.max(result[kind as ModelHandleKind] ?? 0, ordinal);
+  }
+  return normalizeAllocationHighWater(result)!;
 }
 
 function requireSafeHandleOrdinal(ref: string): void {

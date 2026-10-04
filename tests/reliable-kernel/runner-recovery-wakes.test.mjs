@@ -8,6 +8,7 @@ import { pathToFileURL } from 'node:url';
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = relative => import(pathToFileURL(path.join(compiled, relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = await load('backend/reliableKernel/conversationContextHandleState.js');
 const { ReliableConversationRunner } = await load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { preparedContentObjectSteps } = await load('backend/reliableKernel/contentObjectTransaction.js');
 const { askUserTool } = await load('backend/world/modules/tools/definitions/askUser/index.js');
@@ -78,6 +79,7 @@ async function withHarness(verify, options = {}) {
   const now = new Date().toISOString();
   await app.database.transaction([
     repo('Conversation').insert({ id: conversationId, title: 'Runner recovery', status: 'active', created_at: now, updated_at: now }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     repo('AgentConversationLink').insert({ id: 'runner-recovery-agent', conversation_id: conversationId,
       agent_id: 'agent-main', role: 'default', created_at: now, updated_at: now })
   ]);

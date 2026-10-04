@@ -172,6 +172,7 @@ test('fresh child-context planning emits compact batches without recreating per-
   const context = new ContextSequenceControlPlane({}, {}, { now: () => NOW });
   const plan = context.prepareFreshConversationMessageMutation({ conversationId: 'child', messageRevisionId: 'input',
     contentObjectId: 'body', contentByteLength: 1n, contentEstimatedTokens: 1,
+    handleState: load('conversationContextHandleState.js').emptyConversationContextHandleStateStep('child', NOW).row,
     inheritedSegments: Array.from({ length: LIMIT * 2 }, (_, index) => ({ segmentId: `segment-${index}`, estimatedTokens: 1 })) });
   const batches = plan.steps.filter(step => step.kind === 'ensureContextSequenceNodes');
   assert.equal(batches.length, 3);

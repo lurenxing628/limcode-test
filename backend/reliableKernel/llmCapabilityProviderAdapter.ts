@@ -53,7 +53,7 @@ import {
   createManagedMediaBodyProjectionState,
   estimateProjectedModelInput,
   isToolResultContents,
-  projectOrdinaryModelWindow,
+  projectOrdinaryModelContents,
   preserveCanonicalModelContents,
   projectSummaryModelWindow,
   withSummaryDispatchRefs,
@@ -1051,11 +1051,11 @@ function projectOrdinaryContentsWithDetachedInputs(
       cuts: detached.map((insertion) => insertion.beforeIndex),
       atCut(index, mediaState) {
         const insertion = detached.find((candidate) => candidate.beforeIndex === index)!;
-        projectedInputs.set(index, projectOrdinaryModelWindow(
+        projectedInputs.set(index, projectOrdinaryModelContents(
           [insertion.input!.content],
           modelHandleCatalog,
           cloneManagedMediaBodyProjectionState(mediaState)
-        ).contents[0]);
+        )[0]);
       }
     }
   );
@@ -1674,7 +1674,7 @@ function projectOrdinaryContentsPreservingRanges(
   }
 ): MessageContent[] {
   if (canonicalRanges.length === 0 && !observer) {
-    return projectOrdinaryModelWindow(contents, modelHandleCatalog).contents;
+    return projectOrdinaryModelContents(contents, modelHandleCatalog);
   }
   const mediaState = createManagedMediaBodyProjectionState();
   const cuts = [...new Set(observer?.cuts ?? [])].sort((left, right) => left - right);
@@ -1686,11 +1686,11 @@ function projectOrdinaryContentsPreservingRanges(
     while (nextCut < cuts.length && cuts[nextCut] <= end) {
       const cut = cuts[nextCut++];
       if (cut < start) throw new RangeError('Detached projection cut falls inside a canonical compression range.');
-      sliceProjection.push(...projectOrdinaryModelWindow(contents.slice(sliceStart, cut), modelHandleCatalog, mediaState).contents);
+      sliceProjection.push(...projectOrdinaryModelContents(contents.slice(sliceStart, cut), modelHandleCatalog, mediaState));
       observer!.atCut(cut, mediaState);
       sliceStart = cut;
     }
-    sliceProjection.push(...projectOrdinaryModelWindow(contents.slice(sliceStart, end), modelHandleCatalog, mediaState).contents);
+    sliceProjection.push(...projectOrdinaryModelContents(contents.slice(sliceStart, end), modelHandleCatalog, mediaState));
     return sliceProjection;
   };
   const projected: MessageContent[] = [];

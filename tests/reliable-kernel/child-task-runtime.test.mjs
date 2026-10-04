@@ -29,6 +29,8 @@ Module._load = function(request, parent, isMain) {
 after(() => { Module._load = originalLoad; });
 
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
+const { upgradeConversationContextHandles } = load('backend/reliableKernel/conversationContextHandleUpgrade.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { childConversationModelProfiles } = load('backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
@@ -185,6 +187,7 @@ async function fixture(mode, hooks, run) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'parent', title: 'Synthetic child task memory', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('parent', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'parent-agent', conversation_id: 'parent', agent_id: agent.id, role: 'default', created_at: now, updated_at: now })
     ]);
     await run(f);
@@ -644,6 +647,8 @@ test('a user fork of a forkTurns child stays forkable after a compression and a 
     await f.app.turns.delete({ source: { kind: 'command', key: 'delete-inside-inherited-history' }, conversationId: branch,
       messageId: secondInherited.messageId });
     assert.equal((await f.app.context.materializeStructure(await f.app.context.currentHeadRootId(branch))).records.length, 1);
+    // This fixture drives the runner without ProductRuntime's background upgrade coordinator.
+    await upgradeConversationContextHandles(f.app.database, f.app.contentStore, branch);
     assert.equal((await f.runInput('continue-truncated-child-fork', 'CONTINUE_TRUNCATED_FORK_6120', branch)).terminalStatus, 'completed');
 
     const again = await lifecycle.fork({ sourceConversationId: branch, ...await latestModel(branch), commandId: 'refork-truncated-child' });

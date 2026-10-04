@@ -28,6 +28,7 @@ Module._load = function(request, parent, isMain) {
 };
 
 export const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { childConversationModelProfiles } = load('backend/reliableKernel/childThinkingInheritance.js');
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
@@ -131,6 +132,7 @@ export async function createRootConversation(app, agentId, conversationId) {
   const now = new Date().toISOString();
   await app.database.transaction([
     repo('Conversation').insert({ id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     repo('AgentConversationLink').insert({ id: `${conversationId}-agent`, conversation_id: conversationId, agent_id: agentId, role: 'default', created_at: now, updated_at: now })
   ]);
 }

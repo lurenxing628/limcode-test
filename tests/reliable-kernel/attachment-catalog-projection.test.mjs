@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import * as kernel from '../../dist/extension/backend/reliableKernel/index.js';
+import { emptyConversationContextHandleStateStep } from '../../dist/extension/backend/reliableKernel/conversationContextHandleState.js';
 import { prepareConversationForkSnapshot } from '../../dist/extension/backend/reliableKernel/conversationForkSnapshot.js';
 import { createLlmProviderCapability } from '../../dist/extension/backend/capabilities/llmProvider.js';
 
@@ -427,6 +428,7 @@ async function seedObservationCompressionTurn(database, store) {
       id: conversationId, title: 'observation persistence', status: 'active',
       created_at: NOW, updated_at: NOW
     }),
+    emptyConversationContextHandleStateStep(conversationId, NOW),
     kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
       id: 'agent-link-observation-persistence',
       conversation_id: conversationId,

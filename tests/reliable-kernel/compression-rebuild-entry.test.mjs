@@ -8,6 +8,7 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js'));
 const { ReliableConversationRunner } = require(path.join(compiledRoot,
   'backend/application/reliableKernel/ReliableConversationRunner.js'));
 const protocol = require(path.join(compiledRoot, 'shared/protocol.js'));
@@ -133,6 +134,7 @@ test('重建方式持久保存到维护Turn，重启回放保留身份且拒绝�
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'conversation', title: 'fixture', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('conversation', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'agent-link', conversation_id: 'conversation', agent_id: 'agent', role: 'default', created_at: now, updated_at: now })
     ]);
     const history = await app.turns.input({ source: { kind: 'command', key: 'history' }, conversationId: 'conversation',

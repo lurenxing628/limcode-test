@@ -1,3 +1,4 @@
+import { readConversationContextHandleStateRow } from '../../reliableKernel/conversationContextHandleState';
 import type {
   ChatModelOverrideRecord,
   CompressionCommandTarget,
@@ -93,6 +94,7 @@ interface DriveSlot {
   terminal: boolean;
   waitingExternalDataVersion?: string;
   waitingWakeFingerprint?: string;
+  waitingContextHandleUpgrade?: true;
   waitingChildDeadlineAt?: number;
   maintenanceResult?: CoordinateCompressionResult;
   /** Why this Host did not drive the slot: another live Host owns it, or this Host does not serve it. */
@@ -136,6 +138,7 @@ interface WaitingOwnedTurn {
   turnId: string;
   externalDataVersion: string;
   wakeFingerprint: string;
+  waitingContextHandleUpgrade?: true;
   childDeadlineAt?: number;
   childDeadlineRetryAt?: number;
 }
@@ -181,7 +184,8 @@ export interface ReliableManualCompressionResult {
 }
 
 export interface ReliableManualCompressionDriveResult {
-  terminalStatus: 'completed' | 'interrupted';
+  terminalStatus: 'completed' | 'interrupted' | 'waiting';
+  waitingContextHandleUpgrade?: true;
   compression?: CoordinateCompressionResult;
 }
 
@@ -253,7 +257,8 @@ export class ReliableConversationRunner {
     private readonly diagnostics?: ReliableDiagnosticObserver
   ) {
     this.unsubscribeCommit = application.database.onCommit((commit) => {
-      if (!commit.changes.some((change) => LOCAL_TURN_WAKE_DOMAINS.has(change.domain))) return;
+      if (!commit.internalChangedDomains?.includes('ConversationContextHandleState')
+        && !commit.changes.some((change) => LOCAL_TURN_WAKE_DOMAINS.has(change.domain))) return;
       this.localWakeRequested = true;
       this.ensureExternalWakePolling();
     });
@@ -1825,14 +1830,21 @@ export class ReliableConversationRunner {
           return;
         }
         const renewal = this.startLeaseRenewal(slot, fence);
-        let result: { terminalStatus: string; waitingToolCallId?: string };
+        let result: { terminalStatus: string; waitingToolCallId?: string; waitingContextHandleUpgrade?: true };
         try {
           result = await runWithExecutionLeaseFence(fence, async () => {
             const maintenance = await this.readManualCompressionDrive(slot);
             if (!maintenance) return this.application.agentLoop.drive(slot.turnId);
+            if ((await readConversationContextHandleStateRow(this.application.database, slot.conversationId)).state === 'pending') {
+              if (await this.application.agentLoop.terminateRequested(slot.turnId, 'context-handle-upgrade-wait')) {
+                return { terminalStatus: 'interrupted' };
+              }
+              return { terminalStatus: 'waiting', waitingContextHandleUpgrade: true as const };
+            }
             const driven = await this.driveManualCompression(slot, maintenance);
             if (driven.compression) slot.maintenanceResult = driven.compression;
-            return { terminalStatus: driven.terminalStatus };
+            return { terminalStatus: driven.terminalStatus,
+              ...(driven.waitingContextHandleUpgrade ? { waitingContextHandleUpgrade: true as const } : {}) };
           });
         } finally {
           await renewal.stop();
@@ -1854,7 +1866,8 @@ export class ReliableConversationRunner {
             slot.completedGeneration = slot.requestedGeneration;
             return;
           }
-          const observation = await this.observeWaitingWake(slot.turnId, result.waitingToolCallId);
+          slot.waitingContextHandleUpgrade = result.waitingContextHandleUpgrade;
+          const observation = await this.observeWaitingWake(slot.turnId, result.waitingToolCallId, result.waitingContextHandleUpgrade);
           if (observation.ready) {
             // The answer/interrupt raced the Agent loop's final waiting read. Re-drive immediately;
             // the Turn-scoped observation below proves this is a target-Turn fact, not global noise.
@@ -2044,6 +2057,11 @@ export class ReliableConversationRunner {
       try {
         return await this.driveManualCompressionOnce(slot, frozen, retryNumber < LOCAL_EXECUTION_MAX_RETRIES);
       } catch (error) {
+        if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_FRONTIER_CHANGED') {
+          retryNumber -= 1;
+          await new Promise<void>(resolve => setImmediate(resolve));
+          continue;
+        }
         if (!isRetryableLocalExecutionError(error)) throw error;
         if (retryNumber >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
         await waitForLocalExecutionRetry(retryNumber + 1, async () => {
@@ -2063,7 +2081,8 @@ export class ReliableConversationRunner {
     frozen: FrozenManualCompressionDrive,
     allowLocalRetry: boolean
   ): Promise<{
-    terminalStatus: 'completed' | 'interrupted';
+    terminalStatus: 'completed' | 'interrupted' | 'waiting';
+    waitingContextHandleUpgrade?: true;
     compression?: CoordinateCompressionResult;
   }> {
     try {
@@ -2107,6 +2126,10 @@ export class ReliableConversationRunner {
         await this.settleManualCompressionInterrupted(slot, 'manual_context_compression_interrupted');
         return { terminalStatus: 'interrupted' };
       }
+      if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_UPGRADE_PENDING') {
+        return { terminalStatus: 'waiting', waitingContextHandleUpgrade: true };
+      }
+      if ((error as { code?: string }).code === 'MODEL_CONTEXT_HANDLE_FRONTIER_CHANGED') throw error;
       try {
         await this.application.turns.terminal({
           source: { kind: 'internal', key: `manual-compression-maintenance:${slot.turnId}:failed` },
@@ -2195,6 +2218,7 @@ export class ReliableConversationRunner {
         turnId: slot.turnId,
         externalDataVersion: slot.waitingExternalDataVersion,
         wakeFingerprint: slot.waitingWakeFingerprint,
+        waitingContextHandleUpgrade: slot.waitingContextHandleUpgrade,
         childDeadlineAt: slot.waitingChildDeadlineAt
       });
       this.ensureExternalWakePolling();
@@ -2254,7 +2278,7 @@ export class ReliableConversationRunner {
           if (!localWake && waiting.externalDataVersion === version && !deadlineWake) continue;
           // SQLite data_version is database-global: check first that this Turn's own facts changed,
           // so another window's unrelated commits never probe this window's eligibility.
-          const observation = await this.observeWaitingWake(waiting.turnId);
+          const observation = await this.observeWaitingWake(waiting.turnId, undefined, waiting.waitingContextHandleUpgrade);
           if (this.disposed) return;
           if (this.waitingOwned.get(waiting.turnId) !== waiting) continue;
           waiting.childDeadlineAt = observation.childDeadlineAt;
@@ -2400,10 +2424,11 @@ export class ReliableConversationRunner {
    */
   private async observeWaitingWake(
     turnId: string,
-    waitingToolCallId?: string
+    waitingToolCallId?: string,
+    waitingContextHandleUpgrade = false
   ): Promise<{ externalDataVersion: string; fingerprint: string; ready: boolean; childDeadlineAt?: number }> {
     const before = await this.application.database.externalDataVersion();
-    const observation = await this.waitingWakeFingerprint(turnId, waitingToolCallId);
+    const observation = await this.waitingWakeFingerprint(turnId, waitingToolCallId, waitingContextHandleUpgrade);
     const after = await this.application.database.externalDataVersion();
     // If another connection committed during the Turn-scoped read, retain the older edge. The next
     // poll must then re-observe the target facts. This closes the publish race without spinning or
@@ -2416,8 +2441,17 @@ export class ReliableConversationRunner {
 
   private async waitingWakeFingerprint(
     turnId: string,
-    waitingToolCallId?: string
+    waitingToolCallId?: string,
+    waitingContextHandleUpgrade = false
   ): Promise<{ fingerprint: string; ready: boolean; childDeadlineAt?: number }> {
+    if (waitingContextHandleUpgrade) {
+      const turns = await listAllDomainRows(this.application.database, 'Turn', { id: turnId });
+      if (!turns[0] || turns[0].status !== 'active') return { ready: true, fingerprint: 'context-handle-upgrade:turn-ended' };
+      const state = await readConversationContextHandleStateRow(this.application.database, String(turns[0].conversation_id));
+      const inputs = await listAllDomainRows(this.application.database, 'PendingTurnInput', { turn_id: turnId, state: 'pending' });
+      const stopped = inputs.some(row => TERMINATION_INPUT_KINDS.has(String(row.input_kind)));
+      return { ready: state.state === 'ready' || stopped, fingerprint: `context-handle-upgrade:${String(state.state)}:${stopped}` };
+    }
     const [turns, pendingInputs, toolCalls] = await Promise.all([
       listAllDomainRows(this.application.database, 'Turn', { id: turnId }),
       listAllDomainRows(this.application.database, 'PendingTurnInput', { turn_id: turnId }),

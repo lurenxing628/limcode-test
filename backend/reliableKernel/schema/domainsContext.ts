@@ -6,6 +6,18 @@ const ref = (name: string, table: string, nullable = false, onDelete: 'CASCADE' 
 
 export const CONTEXT_DOMAIN_SCHEMAS: readonly RuntimeDomainSchema[] = [
   domain({
+    key: 'ConversationContextHandleState', table: 'conversation_context_handle_state', repository: 'ConversationContextHandleStateRepository', codec: 'ConversationContextHandleStateRowCodec',
+    mutations: ['insert', 'update'], client: 'none', deletePolicy: 'cascade-with-conversation',
+    indexes: ['conversation_id UNIQUE', 'state'],
+    columns: [id(), ref('conversation_id', 'conversation'), ref('context_root_id', 'context_sequence_root', true, 'RESTRICT'), text('state'), integer('revision'), integer('provenance_revision'), ref('content_object_id', 'content_object', true, 'RESTRICT'), integer('requires_native_reset'), text('created_at'), text('updated_at')]
+  }),
+  domain({
+    key: 'ContextRootHandleCatalog', table: 'context_root_handle_catalog', repository: 'ContextRootHandleCatalogRepository', codec: 'ContextRootHandleCatalogRowCodec',
+    mutations: ['insert'], client: 'none', deletePolicy: 'cascade-with-conversation',
+    indexes: ['conversation_id,context_root_id,provenance_revision UNIQUE', 'conversation_id,provenance_revision,root_node_id,tail_node_id,tail_segment_count,segment_count', 'context_root_id'],
+    columns: [id(), ref('conversation_id', 'conversation'), ref('context_root_id', 'context_sequence_root', false, 'RESTRICT'), integer('provenance_revision'), ref('root_node_id', 'context_sequence_node', true, 'RESTRICT'), ref('tail_node_id', 'context_sequence_node', true, 'RESTRICT'), integer('tail_segment_count'), integer('segment_count'), ref('content_object_id', 'content_object', true, 'RESTRICT'), text('created_at')]
+  }),
+  domain({
     key: 'ContextSegment', table: 'context_segment', repository: 'ContextSegmentRepository', codec: 'ContextSegmentRowCodec',
     mutations: ['insert'], client: 'detail', deletePolicy: 'dataset-reset-only',
     indexes: ['content_object_id,segment_kind'],

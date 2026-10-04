@@ -1373,7 +1373,7 @@ export class VscodeReliableKernelCommandRouter {
     requestType: BridgeMessageType.TurnStart | BridgeMessageType.TurnEnqueue,
     payload: TurnStartPayload
   ): Promise<void> {
-    await this.product.ensureCapabilitiesReady();
+    await this.product.ensureCapabilitiesReady(payload.conversationId);
     const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
     const childContent = childExecutionId
       ? serializeMessagePayload(payload.text, payload.content)
@@ -1434,7 +1434,7 @@ export class VscodeReliableKernelCommandRouter {
     if (typeof leaseEpoch !== 'number' || !Number.isSafeInteger(leaseEpoch) || leaseEpoch <= 0) {
       throw new TypeError('Turn steer 缺少有效的 ExecutionLease generation。');
     }
-    await this.product.ensureCapabilitiesReady();
+    await this.product.ensureCapabilitiesReady(conversationId);
     const receipt = await this.followConversationRefresh(conversationId, () => provider.steer({
       commandId: requireText(payload.command.commandId, 'commandId'),
       conversationId,
@@ -1689,7 +1689,7 @@ export class VscodeReliableKernelCommandRouter {
     try {
       let result;
       if (payload.runAfterEdit) {
-        await this.product.ensureCapabilitiesReady();
+        await this.product.ensureCapabilitiesReady(payload.conversationId);
         const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
         if (childExecutionId) {
           const content = serializeMessagePayload(payload.text, payload.content);
@@ -1806,7 +1806,7 @@ export class VscodeReliableKernelCommandRouter {
     payload: MessageRetryFromPayload
   ): Promise<void> {
     try {
-      await this.product.ensureCapabilitiesReady();
+      await this.product.ensureCapabilitiesReady(payload.conversationId);
       const sourceTurnId = await this.turnIdForRetryTarget(payload.conversationId, payload.target);
       const childExecutionId = await this.childExecutionIdForConversation(payload.conversationId);
       const result = childExecutionId
@@ -2010,7 +2010,7 @@ export class VscodeReliableKernelCommandRouter {
 
     let result;
     try {
-      await this.product.ensureCapabilitiesReady();
+      await this.product.ensureCapabilitiesReady(conversationId);
       const childExecutionId = await this.childExecutionIdForConversation(conversationId);
       result = childExecutionId
         ? await this.product.childAgents.manualCompressionFromConversation({

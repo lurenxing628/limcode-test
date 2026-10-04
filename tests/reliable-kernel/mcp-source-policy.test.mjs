@@ -29,6 +29,7 @@ Module._load = function(request, parent, isMain) {
 };
 after(() => { Module._load = originalLoad; });
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeConfigurationAuthority } = load('backend/reliableKernel/vscodeConfigurationAuthority.js');
 const { FrozenAuthorityMcpPolicyGate } = load('backend/reliableKernel/frozenMcpPolicyGate.js');
 const { ReliableConversationRunner } = load('backend/application/reliableKernel/ReliableConversationRunner.js');
@@ -119,6 +120,7 @@ async function fixture(run, { policy } = {}) {
     const now = new Date().toISOString();
     await app.database.transaction(Object.entries(conversations).flatMap(([id, { agentId }]) => [
       repo('Conversation').insert({ id, title: id, status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep(id, now),
       repo('AgentConversationLink').insert({ id: `${id}-agent`, conversation_id: id, agent_id: agentId, role: 'default', created_at: now, updated_at: now })
     ]));
     await app.recover();

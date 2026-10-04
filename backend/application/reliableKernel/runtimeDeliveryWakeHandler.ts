@@ -12,7 +12,7 @@ export interface RuntimeDeliveryWakeDependencies {
    * The post-activation catalogs (skills, rules, workspace configuration) every Turn and model
    * request reads; a wake right after activation waits for them like a user command does.
    */
-  ready?(): Promise<void>;
+  ready?(conversationId: string): Promise<void>;
   notify?(request: ProcessCompletionWakeRequest): void;
 }
 
@@ -48,7 +48,7 @@ export function createRuntimeDeliveryWakeHandler(dependencies: RuntimeDeliveryWa
       if (eligibility === 'ineligible') await application.database.conversationOwners.handBack(request.conversationId);
       return { acknowledged: false };
     }
-    await dependencies.ready?.();
+    await dependencies.ready?.(request.conversationId);
     if (request.action !== 'resume_current_turn' && application.conversationDeletion.isStopping(request.conversationId)) {
       // This window is stopping the Conversation to delete it: the end of what it stopped opens no
       // Turn. The wake stays pending; the deletion settles it, or it is delivered if the deletion

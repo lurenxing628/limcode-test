@@ -9,6 +9,7 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiled, 'backend/reliableKernel/index.js'));
 const { preparedContentObjectSteps } = require(path.join(compiled, 'backend/reliableKernel/contentObjectTransaction.js'));
+const { emptyConversationContextHandleStateStep } = require(path.join(compiled, 'backend/reliableKernel/conversationContextHandleState.js'));
 const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
 
 const CONVERSATION = 'delivery-running-turn';
@@ -50,6 +51,7 @@ async function withKernel(verify) {
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
         id: CONVERSATION, title: 'Delivery', status: 'active', created_at: now, updated_at: now
       }),
+      emptyConversationContextHandleStateStep(CONVERSATION, now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
         id: 'delivery-agent', conversation_id: CONVERSATION, agent_id: 'agent-main', role: 'default',
         created_at: now, updated_at: now

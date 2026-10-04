@@ -16,6 +16,7 @@ export interface ContextHandleRequestEvidence {
 export interface ContextHandleState { catalog: ModelHandleCatalog; requiresNativeReset: boolean }
 type ForkEvidence = { catalog: ModelHandleCatalog; coveredRecipeObjectIds: string[] } | undefined;
 interface Readers {
+  beginRead(): void;
   fork(database: RuntimeDatabase): Promise<ForkEvidence>;
   request(database: RuntimeDatabase, request: DomainRow, covered: boolean): Promise<ContextHandleRequestEvidence>;
   reconcile(fork: ForkEvidence, evidence: { catalogs: ModelHandleCatalog[]; hasCurrentOrdinaryCatalog(catalog: ModelHandleCatalog): boolean }): ContextHandleState;
@@ -41,6 +42,7 @@ export async function readCachedContextHandleState(database: RuntimeDatabase, st
 }
 
 async function readUncached(database: RuntimeDatabase, readers: Readers, conversationId: string): Promise<ContextHandleState> {
+  readers.beginRead();
   const fork = await readers.fork(database);
   const covered = new Set(fork?.coveredRecipeObjectIds ?? []);
   const evidence = new ContextHandleEvidenceFacts();
@@ -170,6 +172,7 @@ class EvidenceCache {
   private async readSerial(store: ContentAddressedStore, conversationId: string, readers: Readers): Promise<ContextHandleState> {
     if (this.store !== store) { this.conversations.clear(); this.store = store; this.externalVersion = undefined; }
     for (let attempt = 0; attempt < 3; attempt++) {
+      readers.beginRead();
       // This ordinary database request also revalidates the fenced root, even for a cache hit.
       const version = await this.database.externalDataVersion();
       if (version !== this.externalVersion) {

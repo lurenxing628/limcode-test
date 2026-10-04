@@ -1,3 +1,6 @@
+import { CONTEXT_HANDLE_STATE_DOMAIN, CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN, contextHandleStateAssertion, readCatalogForRow,
+  readConversationContextHandleStateRow, prepareReadyConversationContextHandleState,
+  type ContextHandleRootShape } from './conversationContextHandleState';
 import { createHash } from 'node:crypto';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
@@ -6,7 +9,6 @@ import { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isPersistentContextHan
 import { canonicalPlainJson, normalizePlainJson } from './plainJson';
 import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { listAllDomainRows } from './repositoryPagination';
 
 export const FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND = 'conversation_handle_catalog';
 export const FORK_CONTEXT_HANDLE_RESERVATION_PURPOSE = 'fork-handle-reservations';
@@ -21,12 +23,54 @@ interface ForkHandlePayload {
   coveredRecipeObjectIds: string[];
 }
 
+/** Reuse only the exact selected shape in the current provenance generation. A whole-head
+ * catalog is not evidence for a narrower fork, and old-generation snapshots cannot fill a miss. */
+export async function readExactForkContextHandleSnapshot(input: {
+  database: RuntimeDatabase; contentStore: ContentAddressedStore; sourceConversationId: string;
+  sourceRoot: DomainRow; selectedShape: ContextHandleRootShape;
+}): Promise<{ catalog: ModelHandleCatalog; assertions: RepositoryTransactionStep[] } | undefined> {
+  const conversationId = requireId(input.sourceConversationId, 'sourceConversationId');
+  if (input.sourceRoot.conversation_id !== conversationId) throw reservationError('Fork source root belongs to another Conversation.');
+  const current = await readConversationContextHandleStateRow(input.database, conversationId);
+  const shape: DomainRow = { root_node_id: input.selectedShape.rootNodeId, tail_node_id: input.selectedShape.tailNodeId,
+    tail_segment_count: input.selectedShape.tailSegmentCount, segment_count: input.selectedShape.segmentCount };
+  const matches = (row: DomainRow): boolean => Object.entries(shape).every(([key, value]) => row[key] === value);
+  const where: DomainRow = { conversation_id: conversationId, provenance_revision: current.provenance_revision, ...shape };
+  const repository = DOMAIN_REPOSITORIES.domain(CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN);
+  const snapshots = requireRows((await input.database.snapshot([repository.list({ where, limit: 1 })])).snapshot[0],
+    'Exact fork Context catalog snapshots');
+  const snapshot = snapshots[0];
+  if (!snapshot) {
+    // An unrelated import can advance the generation while preserving the ready current
+    // pointer. With no immutable snapshot in that generation, only the exact pointer is proof.
+    if (current.state !== 'ready' || current.context_root_id !== input.sourceRoot.id || !matches(input.sourceRoot)) return undefined;
+    return { catalog: await readCatalogForRow(input.database, input.contentStore, current), assertions: [
+      contextHandleStateAssertion(current), DOMAIN_REPOSITORIES.domain('ContextSequenceRoot').assert(
+        requireId(input.sourceRoot.id, 'Fork source root'), { conversation_id: conversationId, ...shape })
+    ] };
+  }
+  if (!Object.entries(where).every(([key, value]) => snapshot[key] === value)) {
+    throw reservationError('Fork Context catalog does not match its selected shape and provenance generation.');
+  }
+  // The selected snapshot is insert-only and cannot be rebound when a suffix is appended or
+  // another head is activated. Only an evidence import changes its provenance generation.
+  // Keep the fork's independent selected-root/revision assertions, not an unrelated head fence.
+  return { catalog: await readCatalogForRow(input.database, input.contentStore, { ...snapshot, state: 'ready', requires_native_reset: 0n }),
+    assertions: [DOMAIN_REPOSITORIES.domain(CONTEXT_HANDLE_STATE_DOMAIN).assert(requireId(current.id, 'Fork source state'), {
+      conversation_id: conversationId, provenance_revision: current.provenance_revision
+    }), repository.assert(requireId(snapshot.id, 'Fork Context catalog'), {
+      ...where, context_root_id: snapshot.context_root_id, content_object_id: snapshot.content_object_id
+    })] };
+}
+
 /** Frozen address facts live in a registered private root, never in the model-visible head. */
 export async function prepareForkContextHandleReservations(input: {
   database: RuntimeDatabase;
   contentStore: ContentAddressedStore;
   sourceConversationId: string;
   targetConversationId: string;
+  targetContextRootId?: string;
+  rootShape?: ContextHandleRootShape;
   catalog: ModelHandleCatalog;
   coveredRecipeObjectIds: readonly string[];
   now: string;
@@ -41,7 +85,11 @@ export async function prepareForkContextHandleReservations(input: {
   const content = await input.contentStore.prepare(input.database,
     canonicalPlainJson(normalizePlainJson(payload, 'Fork Context handle reservations')),
     FORK_CONTEXT_HANDLE_RESERVATION_CONTENT_TYPE);
+  const currentStateSteps = await prepareReadyConversationContextHandleState({ database: input.database,
+    contentStore: input.contentStore, conversationId: target, catalog, contextRootId: input.targetContextRootId, rootShape: input.rootShape,
+    requiresNativeReset: (catalog.retiredRefs?.length ?? 0) > 0, now: input.now });
   return { steps: [
+    ...currentStateSteps,
     ...preparedContentObjectSteps([content], 'fork_handle_reservations'),
     DOMAIN_REPOSITORIES.domain('ContextSegment').insert({ id: ids.segment,
       content_object_id: content.metadata.id, segment_kind: 'runtime_context', created_at: input.now }),
@@ -207,50 +255,6 @@ function requireRows(value: DomainRow | DomainRow[] | null, label: string): Doma
 function reservationError(message: string): Error {
   return Object.assign(new Error(message), { code: 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT' });
 }
-
-export async function captureForkContextHandleFrontier(database: RuntimeDatabase, sourceConversationId: string,
-  nativeProjectionEventKind: string): Promise<{ assertions: RepositoryTransactionStep[]; coveredRecipeObjectIds: string[] }> {
-  const coveredRecipeObjectIds = new Set<string>();
-  const turns = await listAllDomainRows(database, 'Turn', { conversation_id: sourceConversationId });
-  const assertions: RepositoryTransactionStep[] = [DOMAIN_REPOSITORIES.domain('Turn').assertExactIds(
-    { conversation_id: sourceConversationId }, turns.map(turn => requireId(turn.id, 'Turn.id'))
-  )];
-  for (const turn of turns) {
-    const turnId = requireId(turn.id, 'Turn.id');
-    assertions.push(DOMAIN_REPOSITORIES.domain('Turn').assert(turnId, { conversation_id: sourceConversationId }));
-    const requests = await listAllDomainRows(database, 'ModelRequest', { turn_id: turnId });
-    assertions.push(DOMAIN_REPOSITORIES.domain('ModelRequest').assertExactIds({ turn_id: turnId },
-      requests.map(request => requireId(request.id, 'ModelRequest.id'))));
-    for (const request of requests) {
-      const requestId = requireId(request.id, 'ModelRequest.id');
-      coveredRecipeObjectIds.add(requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id'));
-      assertions.push(DOMAIN_REPOSITORIES.domain('ModelRequest').assert(requestId,
-        { turn_id: turnId, recipe_object_id: request.recipe_object_id }));
-      const sources = await listAllDomainRows(database, 'ToolCallSourceLink', { model_request_id: requestId });
-      assertions.push(DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assertExactIds({ model_request_id: requestId },
-        sources.map(source => requireId(source.id, 'ToolCallSourceLink.id'))));
-      for (const source of sources) {
-        const toolCallId = requireId(source.tool_call_id, 'ToolCallSourceLink.tool_call_id');
-        assertions.push(DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').assert(requireId(source.id, 'ToolCallSourceLink.id'),
-          { model_request_id: requestId, tool_call_id: toolCallId }));
-        const where = { tool_call_id: toolCallId, event_kind: nativeProjectionEventKind };
-        const events = await listAllDomainRows(database, 'ToolCallEvent', where);
-        assertions.push(DOMAIN_REPOSITORIES.domain('ToolCallEvent').assertExactIds(where,
-          events.map(event => requireId(event.id, 'ToolCallEvent.id'))));
-        for (const event of events) assertions.push(DOMAIN_REPOSITORIES.domain('ToolCallEvent').assert(
-          requireId(event.id, 'ToolCallEvent.id'), { ...where, content_object_id: event.content_object_id }));
-      }
-    }
-  }
-  const where = { owner_kind: FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND, owner_id: sourceConversationId };
-  const reservations = await listAllDomainRows(database, 'ModelContextProjection', where);
-  assertions.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').assertExactIds(where,
-    reservations.map(projection => requireId(projection.id, 'ModelContextProjection.id'))));
-  for (const projection of reservations) assertions.push(DOMAIN_REPOSITORIES.domain('ModelContextProjection').assert(
-    requireId(projection.id, 'ModelContextProjection.id'), { ...where, root_id: projection.root_id, purpose: projection.purpose }));
-  return { assertions, coveredRecipeObjectIds: [...coveredRecipeObjectIds].sort() };
-}
-
 
 function requireCoverage(value: unknown): string[] {
   if (!Array.isArray(value)) throw reservationError('Fork reservation coveredRecipeObjectIds must be an array.');

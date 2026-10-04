@@ -18,6 +18,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const root = process.cwd();
 const load = (relative) => import(pathToFileURL(path.join(root, 'dist/extension', relative)).href);
 const kernel = await load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = await load('backend/reliableKernel/conversationContextHandleState.js');
 const { ReliableConversationRunner } = await load('backend/application/reliableKernel/ReliableConversationRunner.js');
 const { recoverServedConversation } = await load('backend/application/reliableKernel/conversationTakeover.js');
 const {
@@ -1233,6 +1234,7 @@ async function createConversation(app, conversationId, project) {
     kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
       id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now
     }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
       id: `link-${conversationId}`, conversation_id: conversationId, agent_id: 'agent-main',
       role: 'default', created_at: now, updated_at: now

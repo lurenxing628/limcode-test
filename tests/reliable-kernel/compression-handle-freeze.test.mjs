@@ -9,10 +9,11 @@ const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? process.env.LIMCODE_COMPILED_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
 const kernel = load('backend/reliableKernel/index.js');
+const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const {
   CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, buildModelHandleCatalog, modelHandleRef, modelHandleTarget
 } = load('backend/reliableKernel/modelHandleCatalog.js');
-const { readConversationContextHandleCatalog } = load('backend/reliableKernel/conversationChildHandles.js');
+const { readConversationContextHandleCatalog, rebuildHistoricalConversationContextHandleState } = load('backend/reliableKernel/conversationChildHandles.js');
 const {
   COMPRESSION_SOURCE_REPLAY_LIMITS, expandTextCompressionSources
 } = load('backend/reliableKernel/compressionSourceReplay.js');
@@ -96,10 +97,10 @@ async function readFrozenCatalog(recipe) {
     ModelRequest: [{ id: 'request', turn_id: 'turn', recipe_object_id: 'recipe' }], ContentObject: [{ id: 'recipe' }] };
   const select = query => query.kind === 'get' ? (domains[query.domain] ?? []).find(row => row.id === query.id)
     : (domains[query.domain] ?? []).filter(row => Object.entries(query.where ?? {}).every(([key, value]) => row[key] === value));
-  return readConversationContextHandleCatalog({
+  return (await rebuildHistoricalConversationContextHandleState({
     async snapshotAll(query) { return { snapshot: select(query) }; },
     async snapshot(queries) { return { snapshot: queries.map(select) }; }
-  }, { async read() { return Buffer.from(JSON.stringify(recipe)); } }, 'history');
+  }, { async read() { return Buffer.from(JSON.stringify(recipe)); } }, 'history')).catalog;
 }
 
 test('current compression identity contract refuses every persistent identity discovered only during projection', () => {
@@ -233,6 +234,7 @@ async function withProductionSource(method, oldNative, run) {
     const now = new Date().toISOString();
     await app.database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'history', title: 'Old compressed source', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('history', now),
       kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({ id: 'history-agent', conversation_id: 'history', agent_id: 'freeze-agent', role: 'default', created_at: now, updated_at: now })
     ]);
     const started = await app.turns.input({ source: { kind: 'command', key: 'original' }, conversationId: 'history',
@@ -242,6 +244,39 @@ async function withProductionSource(method, oldNative, run) {
       where, orderBy: { column: 'id', direction: 'asc' }, limit: 1000 }))).snapshot;
     // Reproduce a committed tool result that predates frozen context catalogs. Canonical tool
     // results are projected; ordinary user text intentionally remains verbatim.
+    const [authority] = await rows('AuthoritySnapshot', { turn_id: started.turnId });
+    const producerRoot = await app.context.currentHeadRootId('history');
+    const producerContent = { role: 'model', parts: [{ id: 'old-provider-call',
+      functionCall: { name: 'bash', args: { mode: 'start', command: 'old-background-command' } } }] };
+    const producerRecipe = await app.contentStore.ingest(app.database, JSON.stringify({ kind: 'reliable-agent-turn',
+      round: '1', attachmentCatalogState: { catalog: [], placements: [] } }), 'application/vnd.limcode.model-request-recipe+json');
+    const producerCheckpoint = await app.contentStore.ingest(app.database,
+      JSON.stringify({ kind: 'completed', streamSeq: '1', content: producerContent }), 'application/vnd.limcode.model-stream-checkpoint+json');
+    // Import the complete published producer aggregate; its immutable recipe intentionally has no catalog.
+    await app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Operation').insertHistoricalCopy({ id: 'old-producer-operation',
+        owner_kind: 'model_request', owner_id: 'old-producer', operation_seq: 1n, tool_call_id: null,
+        status: 'completed', created_at: now, updated_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('Attempt').insertHistoricalCopy({ id: 'old-producer-attempt',
+        operation_id: 'old-producer-operation', attempt_seq: 1n, status: 'completed',
+        created_at: now, updated_at: now, completed_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').insertHistoricalCopy({ id: 'old-producer',
+        turn_id: started.turnId, request_seq: 1n, status: 'terminal', terminal_state: 'completed',
+        provider_id: provider.providerConfigId, model_id: provider.modelId, context_window_tokens: 200000n,
+        compression_threshold_tokens: 150000n, estimated_context_tokens: 100n, authority_snapshot_id: authority.id,
+        settings_snapshot_object_id: null, recipe_object_id: producerRecipe.id, usage_json: null,
+        stream_stats_json: { attemptSeq: '1', socketGeneration: '1', retryReason: null }, created_at: now, updated_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('ModelContextProjection').insert({ id: 'old-producer-projection',
+        owner_kind: 'model_request', owner_id: 'old-producer', root_id: producerRoot, purpose: 'provider-request', created_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').insertHistoricalCopy({ id: 'old-producer-checkpoint',
+        model_request_id: 'old-producer', attempt_seq: 1n, socket_generation: 1n, stream_seq: 1n,
+        checkpoint_kind: 'terminal_summary', content_object_id: producerCheckpoint.id, created_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('ModelStreamFence').insertHistoricalCopy({ id: 'old-producer-fence',
+        model_request_id: 'old-producer', attempt_seq: 1n, socket_generation: 1n, terminal_stream_seq: 1n,
+        outcome: 'completed', created_at: now })
+    ]);
+    const producerMessage = await app.turnOutput.appendAssistantMessage({ turnId: started.turnId,
+      modelRequestId: 'old-producer', sourceKey: 'old-producer', content: JSON.stringify(producerContent) });
     const argumentsObject = await app.contentStore.ingest(app.database, JSON.stringify({ mode: 'start', command: 'old-background-command' }), 'application/json');
     const resultObject = await app.contentStore.ingest(app.database,
       JSON.stringify({ ...targets, status: 'background_started', hasMore: true }), 'application/json');
@@ -257,12 +292,15 @@ async function withProductionSource(method, oldNative, run) {
         message_id: 'old-tool-message', role: 'tool_result', created_at: now }),
       kernel.DOMAIN_REPOSITORIES.domain('ToolCall').insert({ id: 'old-tool-call', turn_id: started.turnId, call_seq: 1n,
         tool_name: 'bash', status: 'terminal', arguments_object_id: argumentsObject.id, created_at: now, updated_at: now }),
+      kernel.DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').insert({ id: 'old-tool-source',
+        tool_call_id: 'old-tool-call', model_request_id: 'old-producer', message_id: producerMessage.messageId,
+        provider_call_id: 'old-provider-call', provider_ordinal: 0n, batch_id: 'old-tool-batch', batch_ordinal: 0n,
+        thought_signature: null, created_at: now }),
       kernel.DOMAIN_REPOSITORIES.domain('ToolModelResult').insert({ id: 'old-tool-result', tool_call_id: 'old-tool-call',
         message_revision_id: 'old-tool-revision', created_at: now })
     ]);
     await app.context.appendToolPair({ conversationId: 'history', toolCallId: 'old-tool-call',
       toolModelResultId: 'old-tool-result', providerCallId: 'old-provider-call' });
-    const [authority] = await rows('AuthoritySnapshot', { turn_id: started.turnId });
     const authorityObject = (await rows('ContentObject', { id: authority.content_object_id }))[0];
     const document = JSON.parse((await app.contentStore.read(authorityObject)).toString('utf8'));
     const originalRoot = await app.context.currentHeadRootId('history');

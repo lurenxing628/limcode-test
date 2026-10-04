@@ -1,3 +1,4 @@
+import { readConversationContextHandleStateRow } from './conversationContextHandleState';
 import type {
   ReliableAgentLoop,
   ReliableAgentLoopResult,
@@ -170,7 +171,8 @@ export interface ReliableChildManualCompressionResult {
 }
 
 export interface ReliableChildMaintenanceDriveResult {
-  terminalStatus: 'completed' | 'interrupted';
+  terminalStatus: 'completed' | 'interrupted' | 'waiting';
+  waitingContextHandleUpgrade?: true;
   compression?: CoordinateCompressionResult;
 }
 
@@ -235,6 +237,7 @@ export class ReliableChildAgentCoordinator {
     childExecutionId: string;
     externalDataVersion: string | undefined;
     waitingToolCallId?: string;
+    contextHandleUpgradeConversationId?: string;
     nextWakeAt?: number;
     childDeadlineAt?: number;
     deadlineReadPending?: boolean;
@@ -1747,6 +1750,16 @@ export class ReliableChildAgentCoordinator {
         for (const [turnId, waiting] of [...this.waitingOwned]) {
           if (this.disposing || this.handoff) return;
           if (this.activeTurns.has(turnId)) continue;
+          if (waiting.contextHandleUpgradeConversationId && Date.now() >= (waiting.nextWakeAt ?? 0)) {
+            const turn = await this.get('Turn', turnId);
+            if (!turn || turn.status !== 'active') { this.waitingOwned.delete(turnId); continue; }
+            const state = await readConversationContextHandleStateRow(this.dependencies.database, waiting.contextHandleUpgradeConversationId);
+            const pending = await listAllDomainRows(this.dependencies.database, 'PendingTurnInput', { turn_id: turnId, state: 'pending' });
+            const stopping = pending.some(row => ['interrupt_request', 'interrupt_current_turn', 'termination_request'].includes(String(row.input_kind)));
+            if (state.state === 'pending' && !stopping) { waiting.nextWakeAt = Date.now() + 1000; continue; }
+            waiting.externalDataVersion = undefined;
+            waiting.contextHandleUpgradeConversationId = undefined;
+          }
           const ordinaryWake = waiting.externalDataVersion !== version || Date.now() >= (waiting.nextWakeAt ?? Infinity);
           const deadlineWake = this.conversationRecovery
             && (waiting.deadlineReadPending || (waiting.childDeadlineAt !== undefined && waiting.childDeadlineAt <= Date.now()))
@@ -2718,6 +2731,13 @@ export class ReliableChildAgentCoordinator {
       result = await runWithExecutionLeaseFence(fence, async () => {
         if (this.dependencies.manualCompression) {
           const turn = await this.get('Turn', turnId);
+          if (turn && (await readConversationContextHandleStateRow(this.dependencies.database, String(turn.conversation_id))).state === 'pending') {
+            if (await this.dependencies.agentLoop.terminateRequested(turnId, 'context-handle-upgrade-wait')) {
+              return { turnId, terminalStatus: 'interrupted' as const, modelRequestIds: [], assistantMessageIds: [], toolCallIds: [] };
+            }
+            return { turnId, terminalStatus: 'waiting' as const, modelRequestIds: [], assistantMessageIds: [], toolCallIds: [],
+              waitingContextHandleUpgrade: true as const };
+          }
           if (!turn) throw new Error(`Child Turn ${turnId} does not exist.`);
           const maintenance = await this.dependencies.manualCompression.driveIfPresent({
             conversationId: requireId(turn.conversation_id, 'Child Turn.conversation_id'),
@@ -2727,6 +2747,7 @@ export class ReliableChildAgentCoordinator {
             return {
               turnId,
               terminalStatus: maintenance.terminalStatus,
+              ...(maintenance.waitingContextHandleUpgrade ? { waitingContextHandleUpgrade: true as const } : {}),
               modelRequestIds: [],
               assistantMessageIds: [],
               toolCallIds: [],
@@ -2760,6 +2781,7 @@ export class ReliableChildAgentCoordinator {
       this.waitingOwned.set(turnId, {
         childExecutionId,
         externalDataVersion: externalVersionBeforeDrive,
+        ...(result.waitingContextHandleUpgrade ? { contextHandleUpgradeConversationId: fence.conversationId, nextWakeAt: Date.now() + 1000 } : {}),
         ...(result.waitingToolCallId ? { waitingToolCallId: result.waitingToolCallId } : {}),
         ...(this.conversationRecovery ? { deadlineReadPending: true } : {})
       });

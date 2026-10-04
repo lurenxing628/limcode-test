@@ -8,7 +8,9 @@ const root = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/exten
 const load = file => require(path.join(root, file));
 const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborationToolDispatcher.js');
 const { buildModelHandleCatalog, resolveModelToolArguments, projectToolResultForModel } = load('backend/reliableKernel/modelHandleCatalog.js');
-const { mergeConversationChildHandles, readConversationChildHandles } = load('backend/reliableKernel/conversationChildHandles.js');
+const { mergeConversationChildHandles, rebuildHistoricalConversationContextHandleState } = load('backend/reliableKernel/conversationChildHandles.js');
+// Copied historical recipes are read only at the explicit reconstruction boundary.
+const rebuildHistoricalChildHandles = async (...args) => (await rebuildHistoricalConversationContextHandleState(...args)).catalog.entries;
 const { agentCollaborationToolModules } = load('backend/world/modules/tools/definitions/agentCollaboration/index.js');
 const { crossConversationToolModules } = load('backend/world/modules/tools/definitions/crossConversation/index.js');
 
@@ -103,12 +105,12 @@ test('compressed and fork-copied recipes reserve collaboration references withou
       assert.equal(createHash('sha256').update(bytes).digest('hex'), row.sha256);
       return Buffer.from(bytes);
     } };
-    assert.deepEqual(byRef(await readConversationChildHandles(database, store, 'fork')),
+    assert.deepEqual(byRef(await rebuildHistoricalChildHandles(database, store, 'fork')),
       byRef(mergeConversationChildHandles(catalog.entries)));
     assert.ok(reads.every(read => read.id !== 'source' && read.domain !== 'Conversation' && read.where?.conversation_id !== 'source'
       && read.where?.target_conversation_id !== 'source' && read.where?.owner_id !== 'source'),
     'copied frozen references do not cause a scan of a live source Conversation');
-    assert.deepEqual(await readConversationChildHandles(database, store, 'source'), []);
+    assert.deepEqual(await rebuildHistoricalChildHandles(database, store, 'source'), []);
   }
 });
 
