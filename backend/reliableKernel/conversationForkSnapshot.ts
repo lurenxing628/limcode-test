@@ -8,6 +8,7 @@ import {
   readForkContextLineage,
   readNativeMessageContextRevisions,
   readVisibleTurnMessages,
+  type ForkContextLineage,
   type ForkLineageCompressionBlock,
   type NativeMessageContextRevision
 } from './conversationForkContext';
@@ -50,6 +51,8 @@ export interface ForkContextRoots {
 }
 
 const PAGE_LIMIT = 1000;
+// Bound transient lookup instructions/results; the final copy remains one atomic transaction.
+const FORK_MESSAGE_READ_BATCH_SIZE = 128;
 
 interface MessageFact {
   message: DomainRow;
@@ -143,14 +146,18 @@ export async function prepareConversationForkSnapshot(
       id(membership.message_id, 'MessagePartOfConversation.message_id'), membership
     ]));
     const revisionIds = unique(contextLineage.messageSources.map((source) => id(source.source_id, 'ContextSegmentSource.source_id')));
-    const revisions = revisionIds.length > 0 ? await database.snapshot(revisionIds.map((revisionId) =>
-      DOMAIN_REPOSITORIES.domain('MessageRevision').get(revisionId)
-    )) : null;
     const revisionsById = new Map<string, DomainRow>();
-    for (const [index, revisionId] of revisionIds.entries()) {
-      const value = revisions!.snapshot[index];
-      if (value === null) continue;
-      revisionsById.set(revisionId, row(value, `MessageRevision ${revisionId}`));
+    for (let offset = 0; offset < revisionIds.length; offset += FORK_MESSAGE_READ_BATCH_SIZE) {
+      input.assertActive?.();
+      const batch = revisionIds.slice(offset, offset + FORK_MESSAGE_READ_BATCH_SIZE);
+      const revisions = await database.snapshot(batch.map((revisionId) =>
+        DOMAIN_REPOSITORIES.domain('MessageRevision').get(revisionId)
+      ));
+      for (const [index, revisionId] of batch.entries()) {
+        const value = revisions.snapshot[index];
+        if (value === null) continue;
+        revisionsById.set(revisionId, row(value, `MessageRevision ${revisionId}`));
+      }
     }
     for (const source of contextLineage.messageSources) {
       const revision = revisionsById.get(id(source.source_id, 'ContextSegmentSource.source_id'));
@@ -174,101 +181,21 @@ export async function prepareConversationForkSnapshot(
   }
 
   input.assertActive?.();
-  const basicReads = prefixMemberships.flatMap((membership): RepositoryRead[] => {
-    const messageId = id(membership.message_id, 'MessagePartOfConversation.message_id');
-    return [
-      DOMAIN_REPOSITORIES.domain('Message').get(messageId),
-      DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').list({
-        where: { message_id: messageId },
-        limit: 2
-      })
-    ];
-  });
-  const basic = basicReads.length > 0 ? await database.snapshot(basicReads) : { snapshot: [] };
-  const messageCandidates: Array<{
-    message: DomainRow;
-    membership: DomainRow;
-    current: DomainRow;
-  }> = [];
-  for (let index = 0; index < prefixMemberships.length; index += 1) {
-    const membership = prefixMemberships[index];
-    const messageId = id(membership.message_id, 'MessagePartOfConversation.message_id');
-    const message = row(basic.snapshot[index * 2], `Message ${messageId}`);
-    const currentRows = rows(basic.snapshot[index * 2 + 1], `MessageCurrentRevisionLink ${messageId}`);
-    if (currentRows.length !== 1) throw new Error(`Fork source Message ${messageId} must have one current Revision.`);
-    messageCandidates.push({ message, membership, current: currentRows[0] });
-  }
-
-  const revisionBarrier = messageCandidates.length > 0 ? await database.snapshot(messageCandidates.map((candidate) =>
-    DOMAIN_REPOSITORIES.domain('MessageRevision').get(
-      id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id')
-    )
-  )) : { snapshot: [] };
-  const visibleCandidates = messageCandidates.flatMap((candidate, index) => {
-    const revisionId = id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id');
-    const revision = row(revisionBarrier.snapshot[index], `MessageRevision ${revisionId}`);
-    if (revision.message_id !== candidate.message.id) {
-      throw new Error(`Fork source current Revision ${revisionId} belongs to another Message.`);
-    }
-    return candidate.message.deleted_at === null && (revision.role === 'user' || revision.role === 'model')
-      ? [{ ...candidate, revision }]
-      : [];
-  });
-
-  input.assertActive?.();
-  const relationReads = visibleCandidates.flatMap((candidate): RepositoryRead[] => {
-    const messageId = id(candidate.message.id, 'Message.id');
-    const revisionId = id(candidate.revision.id, 'MessageRevision.id');
-    return [
-      DOMAIN_REPOSITORIES.domain('AttachmentLink').list({
-        where: { message_revision_id: revisionId }, limit: 1000
-      }),
-      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
-        where: { source_kind: 'message_revision', source_id: revisionId }, limit: 1000
-      }),
-      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({ where: { message_id: messageId }, limit: 1000 }),
-      DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').list({ where: { message_id: messageId }, limit: 2 }),
-      DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { message_id: messageId }, limit: 1000 })
-    ];
-  });
-  const relationBarrier = relationReads.length > 0 ? await database.snapshot(relationReads) : null;
-  const messageFacts: MessageFact[] = [];
-  for (const [index, candidate] of visibleCandidates.entries()) {
-    const offset = index * 5;
-    const messageId = id(candidate.message.id, 'Message.id');
-    const revisionId = id(candidate.revision.id, 'MessageRevision.id');
-    const fact: MessageFact = {
-      ...candidate,
-      attachments: await completeRows(database, relationBarrier!.snapshot[offset], 'AttachmentLink', {
-        message_revision_id: revisionId
-      }),
-      contextSources: await completeRows(database, relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource', {
-        source_kind: 'message_revision', source_id: revisionId
-      }),
-      turnLinks: await completeRows(database, relationBarrier!.snapshot[offset + 2], 'MessageTurnLink', { message_id: messageId }),
-      requestLinks: rows(relationBarrier!.snapshot[offset + 3], 'ModelRequestMessageLink fork source lookup'),
-      toolSources: await completeRows(database, relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink', { message_id: messageId })
-    };
-    if (fact.turnLinks.some((link) => link.role === NATIVE_STEER_MESSAGE_TURN_ROLE)) {
-      if (!contextLineage) throw new Error('Native steering fork requires an explicit Context prefix.');
-      if (!fact.contextSources.some((source) => contextLineage.segmentIds.has(id(source.segment_id, 'ContextSegmentSource.segment_id')))) {
-        continue;
-      }
-    }
-    messageFacts.push(fact);
-  }
+  const messageFacts = await readSnapshotMessageFacts(
+    database, prefixMemberships, contextLineage, input.assertActive
+  );
   // A fork owns completed history only: an active Turn's messages, requests and tool calls are
   // still being written by the source executor and must never be silently copied.
   requireTerminatedTurns(await getRows(database, 'Turn', unique(messageFacts.flatMap((fact) =>
     fact.turnLinks.map((link) => id(link.turn_id, 'MessageTurnLink.turn_id'))
-  ))));
+  )), input.assertActive));
 
   const requestIds = unique(messageFacts.flatMap((fact) => [
     ...fact.requestLinks.map((link) => id(link.model_request_id, 'ModelRequestMessageLink.model_request_id')),
     ...fact.toolSources.map((link) => id(link.model_request_id, 'ToolCallSourceLink.model_request_id'))
   ]));
   input.assertActive?.();
-  const requestRows = await getRows(database, 'ModelRequest', requestIds);
+  const requestRows = await getRows(database, 'ModelRequest', requestIds, input.assertActive);
   const requestAggregates = await readRequestAggregates(database, requestRows);
   const requestIdSet = new Set(requestAggregates.map((entry) => id(entry.request.id, 'ModelRequest.id')));
   const requestRowsById = new Map(requestRows.map((request) => [id(request.id, 'ModelRequest.id'), request]));
@@ -297,7 +224,8 @@ export async function prepareConversationForkSnapshot(
   const toolRows = await getRows(
     database,
     'ToolCall',
-    unique(toolSources.map((source) => id(source.tool_call_id, 'ToolCallSourceLink.tool_call_id')))
+    unique(toolSources.map((source) => id(source.tool_call_id, 'ToolCallSourceLink.tool_call_id'))),
+    input.assertActive
   );
   const tools = await readToolFacts(database, toolSources, toolRows);
   if (contextLineage) {
@@ -309,13 +237,13 @@ export async function prepareConversationForkSnapshot(
       }
     }
   }
-  const toolResultMessages = await readToolResultMessages(database, tools, input.sourceConversationId);
+  const toolResultMessages = await readToolResultMessages(database, tools, input.sourceConversationId, input.assertActive);
 
   // Each copied block keeps the frozen authority of the Turn that compressed (a manual compression
   // Turn owns no Message), so that Turn is copied too; a Turn still running cannot be copied.
   const blockAuthorities = await getRows(database, 'AuthoritySnapshot', unique(compressionBlocks.map(({ block }) =>
     id(block.authority_snapshot_id, 'CompressionBlock.authority_snapshot_id')
-  )));
+  )), input.assertActive);
   if (input.boundaryMessageSeq !== undefined) {
     // A compressing Turn with visible transcript outside the copied history ran after the fork
     // point: its block is not part of this history (the caller forks from the pre-compression root
@@ -341,7 +269,7 @@ export async function prepareConversationForkSnapshot(
     ...blockAuthorities.map((snapshot) => id(snapshot.turn_id, 'AuthoritySnapshot.turn_id'))
   ]);
   input.assertActive?.();
-  const turnRows = await getRows(database, 'Turn', turnIds);
+  const turnRows = await getRows(database, 'Turn', turnIds, input.assertActive);
   requireTerminatedTurns(turnRows);
   const copiedTurnIds = new Set(turnIds);
   if ((await readNativeSteeringInFlight(database, input.sourceConversationId)).some((entry) => copiedTurnIds.has(entry.turnId))) {
@@ -357,7 +285,8 @@ export async function prepareConversationForkSnapshot(
     database,
     [...turnRelations.values()],
     copiedMessageIds,
-    new Set(tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id')))
+    new Set(tools.map((fact) => id(fact.toolCall.id, 'ToolCall.id'))),
+    input.assertActive
   );
   const completeTurnRequests = turnRows.flatMap((turn) => {
     const relation = turnRelations.get(id(turn.id, 'Turn.id'))!;
@@ -381,11 +310,11 @@ export async function prepareConversationForkSnapshot(
     listAllDomainRows(database, 'AuthoritySnapshot', { turn_id: id(turn.id, 'Turn.id') })
   ))).flat();
   const projections = input.contextRoots
-    ? await readRequestProjections(database, requestAggregates, input.contextRoots)
+    ? await readRequestProjections(database, requestAggregates, input.contextRoots, input.assertActive)
     : [];
-  const blockCopies = await readCompressionBlockCopies(database, compressionBlocks, input.contextRoots);
+  const blockCopies = await readCompressionBlockCopies(database, compressionBlocks, input.contextRoots, input.assertActive);
   const fileFacts = await readFileFacts(database, tools);
-  const interactionFacts = await readInteractionFacts(database, tools);
+  const interactionFacts = await readInteractionFacts(database, tools, input.assertActive);
 
   const attachmentIds = new Set([...messageFacts, ...toolResultMessages].flatMap((fact) =>
     fact.attachments.map((link) => id(link.attachment_id, 'AttachmentLink.attachment_id'))
@@ -621,6 +550,132 @@ export async function prepareConversationForkSnapshot(
   };
 }
 
+interface ForkMessageCandidate {
+  message: DomainRow;
+  membership: DomainRow;
+  current: DomainRow;
+}
+
+interface ForkVisibleMessageCandidate extends ForkMessageCandidate { revision: DomainRow }
+
+async function readSnapshotMessageFacts(
+  database: RuntimeDatabase,
+  memberships: readonly DomainRow[],
+  contextLineage: ForkContextLineage | undefined,
+  assertActive?: () => void
+): Promise<MessageFact[]> {
+  return readVisibleMessageFacts(database, await readVisibleMessageCandidates(
+    database, await readMessageCandidates(database, memberships, assertActive), assertActive
+  ), contextLineage, assertActive);
+}
+
+async function readMessageCandidates(
+  database: RuntimeDatabase,
+  memberships: readonly DomainRow[],
+  assertActive?: () => void
+): Promise<ForkMessageCandidate[]> {
+  const candidates: ForkMessageCandidate[] = [];
+  for (let offset = 0; offset < memberships.length; offset += FORK_MESSAGE_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = memberships.slice(offset, offset + FORK_MESSAGE_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.flatMap((membership): RepositoryRead[] => {
+      const messageId = id(membership.message_id, 'MessagePartOfConversation.message_id');
+      return [
+        DOMAIN_REPOSITORIES.domain('Message').get(messageId),
+        DOMAIN_REPOSITORIES.domain('MessageCurrentRevisionLink').list({ where: { message_id: messageId }, limit: 2 })
+      ];
+    }));
+    for (const [index, membership] of batch.entries()) {
+      const messageId = id(membership.message_id, 'MessagePartOfConversation.message_id');
+      const message = row(barrier.snapshot[index * 2], `Message ${messageId}`);
+      const currentRows = rows(barrier.snapshot[index * 2 + 1], `MessageCurrentRevisionLink ${messageId}`);
+      if (currentRows.length !== 1) throw new Error(`Fork source Message ${messageId} must have one current Revision.`);
+      candidates.push({ message, membership, current: currentRows[0] });
+    }
+  }
+  return candidates;
+}
+
+async function readVisibleMessageCandidates(
+  database: RuntimeDatabase,
+  candidates: readonly ForkMessageCandidate[],
+  assertActive?: () => void
+): Promise<ForkVisibleMessageCandidate[]> {
+  const visible: ForkVisibleMessageCandidate[] = [];
+  for (let offset = 0; offset < candidates.length; offset += FORK_MESSAGE_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = candidates.slice(offset, offset + FORK_MESSAGE_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.map((candidate) =>
+      DOMAIN_REPOSITORIES.domain('MessageRevision').get(id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id'))
+    ));
+    for (const [index, candidate] of batch.entries()) {
+      const revisionId = id(candidate.current.revision_id, 'MessageCurrentRevisionLink.revision_id');
+      const revision = row(barrier.snapshot[index], `MessageRevision ${revisionId}`);
+      if (revision.message_id !== candidate.message.id) {
+        throw new Error(`Fork source current Revision ${revisionId} belongs to another Message.`);
+      }
+      if (candidate.message.deleted_at === null && (revision.role === 'user' || revision.role === 'model')) {
+        visible.push({ ...candidate, revision });
+      }
+    }
+  }
+  return visible;
+}
+
+async function readVisibleMessageFacts(
+  database: RuntimeDatabase,
+  visibleCandidates: readonly ForkVisibleMessageCandidate[],
+  contextLineage: ForkContextLineage | undefined,
+  assertActive?: () => void
+): Promise<MessageFact[]> {
+  const messageFacts: MessageFact[] = [];
+  for (let start = 0; start < visibleCandidates.length; start += FORK_MESSAGE_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = visibleCandidates.slice(start, start + FORK_MESSAGE_READ_BATCH_SIZE);
+    const relationReads = batch.flatMap((candidate): RepositoryRead[] => {
+      const messageId = id(candidate.message.id, 'Message.id');
+      const revisionId = id(candidate.revision.id, 'MessageRevision.id');
+      return [
+        DOMAIN_REPOSITORIES.domain('AttachmentLink').list({
+          where: { message_revision_id: revisionId }, limit: 1000
+        }),
+        DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+          where: { source_kind: 'message_revision', source_id: revisionId }, limit: 1000
+        }),
+        DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({ where: { message_id: messageId }, limit: 1000 }),
+        DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').list({ where: { message_id: messageId }, limit: 2 }),
+        DOMAIN_REPOSITORIES.domain('ToolCallSourceLink').list({ where: { message_id: messageId }, limit: 1000 })
+      ];
+    });
+    const relationBarrier = relationReads.length > 0 ? await database.snapshot(relationReads) : null;
+    for (const [index, candidate] of batch.entries()) {
+      const offset = index * 5;
+      const messageId = id(candidate.message.id, 'Message.id');
+      const revisionId = id(candidate.revision.id, 'MessageRevision.id');
+      const fact: MessageFact = {
+        ...candidate,
+        attachments: await completeRows(database, relationBarrier!.snapshot[offset], 'AttachmentLink', {
+          message_revision_id: revisionId
+        }),
+        contextSources: await completeRows(database, relationBarrier!.snapshot[offset + 1], 'ContextSegmentSource', {
+          source_kind: 'message_revision', source_id: revisionId
+        }),
+        turnLinks: await completeRows(database, relationBarrier!.snapshot[offset + 2], 'MessageTurnLink', { message_id: messageId }),
+        requestLinks: rows(relationBarrier!.snapshot[offset + 3], 'ModelRequestMessageLink fork source lookup'),
+        toolSources: await completeRows(database, relationBarrier!.snapshot[offset + 4], 'ToolCallSourceLink', { message_id: messageId })
+      };
+      if (fact.turnLinks.some((link) => link.role === NATIVE_STEER_MESSAGE_TURN_ROLE)) {
+        if (!contextLineage) throw new Error('Native steering fork requires an explicit Context prefix.');
+        if (!fact.contextSources.some((source) => contextLineage.segmentIds.has(id(source.segment_id, 'ContextSegmentSource.segment_id')))) {
+          continue;
+        }
+      }
+      messageFacts.push(fact);
+    }
+  }
+  return messageFacts;
+}
+
 function requireTerminatedTurns(turns: readonly DomainRow[]): void {
   for (const turn of turns) {
     if (turn.status !== 'terminated') {
@@ -675,7 +730,8 @@ async function readRequestAggregates(database: RuntimeDatabase, requests: Domain
 async function readRequestProjections(
   database: RuntimeDatabase,
   aggregates: readonly RequestAggregate[],
-  roots: ForkContextRoots
+  roots: ForkContextRoots,
+  assertActive?: () => void
 ): Promise<Array<{ projection: DomainRow; rootId: string }>> {
   if (aggregates.length === 0) return [];
   const barrier = await database.snapshot(aggregates.map((aggregate) =>
@@ -690,7 +746,7 @@ async function readRequestProjections(
   });
   const sourceRoots = await getRows(database, 'ContextSequenceRoot', unique(projections.map((projection) =>
     id(projection.root_id, 'ModelContextProjection.root_id')
-  )));
+  )), assertActive);
   const rootsById = new Map(sourceRoots.map((root) => [id(root.id, 'ContextSequenceRoot.id'), root]));
   return projections.flatMap((projection) => {
     const rootId = mapForkContextRoot(rootsById.get(id(projection.root_id, 'ModelContextProjection.root_id'))!, roots);
@@ -777,12 +833,13 @@ async function readToolFacts(
 async function readToolResultMessages(
   database: RuntimeDatabase,
   tools: ToolFact[],
-  sourceConversationId: string
+  sourceConversationId: string,
+  assertActive?: () => void
 ): Promise<MessageFact[]> {
   if (tools.length === 0) return [];
   const revisions = await getRows(database, 'MessageRevision', tools.map((tool) =>
     id(tool.modelResult.message_revision_id, 'ToolModelResult.message_revision_id')
-  ));
+  ), assertActive);
   const messageIds = revisions.map((revision) => id(revision.message_id, 'MessageRevision.message_id'));
   const reads = revisions.flatMap((revision): RepositoryRead[] => {
     const revisionId = id(revision.id, 'MessageRevision.id');
@@ -866,7 +923,8 @@ async function readDiscardedTurnOutput(
   database: RuntimeDatabase,
   relations: readonly TurnRelations[],
   copiedMessageIds: ReadonlySet<string>,
-  copiedToolIds: ReadonlySet<string>
+  copiedToolIds: ReadonlySet<string>,
+  assertActive?: () => void
 ): Promise<{ messageIds: ReadonlySet<string>; toolCallIds: ReadonlySet<string> }> {
   const uncopiedTools = relations.flatMap((relation) => relation.toolCalls)
     .map((tool) => id(tool.id, 'ToolCall.id'))
@@ -882,7 +940,7 @@ async function readDiscardedTurnOutput(
     ...relations.flatMap((relation) => relation.messageLinks.map((link) => id(link.message_id, 'MessageTurnLink.message_id'))),
     ...toolSourceMessages.values()
   ].filter((messageId) => !copiedMessageIds.has(messageId)));
-  const messageIds = new Set((await getRows(database, 'Message', candidates))
+  const messageIds = new Set((await getRows(database, 'Message', candidates, assertActive))
     .filter((message) => message.deleted_at !== null)
     .map((message) => id(message.id, 'Message.id')));
   return {
@@ -938,7 +996,8 @@ interface CompressionBlockCopy {
 async function readCompressionBlockCopies(
   database: RuntimeDatabase,
   blocks: readonly ForkLineageCompressionBlock[],
-  roots: ForkContextRoots | undefined
+  roots: ForkContextRoots | undefined,
+  assertActive?: () => void
 ): Promise<CompressionBlockCopy[]> {
   const copies: CompressionBlockCopy[] = [];
   for (const lineage of blocks) {
@@ -946,7 +1005,7 @@ async function readCompressionBlockCopies(
     const observationLinks = await listAllDomainRows(database, 'CompressionBlockObservationLink', { compression_block_id: blockId });
     const sourceRootId = id(lineage.creationProjection.root_id, 'ModelContextProjection.root_id');
     const rootId = roots
-      ? roots.creation.get(sourceRootId) ?? mapForkContextRoot((await getRows(database, 'ContextSequenceRoot', [sourceRootId]))[0], roots)
+      ? roots.creation.get(sourceRootId) ?? mapForkContextRoot((await getRows(database, 'ContextSequenceRoot', [sourceRootId], assertActive))[0], roots)
       : undefined;
     if (!rootId) {
       throw new ConversationForkRejectedError(
@@ -1052,7 +1111,7 @@ async function readFileFacts(database: RuntimeDatabase, tools: ToolFact[]): Prom
   });
 }
 
-async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]): Promise<{
+async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[], assertActive?: () => void): Promise<{
   requests: DomainRow[];
   owners: DomainRow[];
   links: DomainRow[];
@@ -1069,7 +1128,7 @@ async function readInteractionFacts(database: RuntimeDatabase, tools: ToolFact[]
   )))).flat();
   const requestIds = unique(links.map((link) => id(link.request_id, 'InteractionToolCallLink.request_id')));
   if (requestIds.length === 0) return { requests: [], owners: [], links, responses: [] };
-  const requests = await getRows(database, 'InteractionRequest', requestIds);
+  const requests = await getRows(database, 'InteractionRequest', requestIds, assertActive);
   const detailBarrier = await database.snapshot(requestIds.flatMap((requestId): RepositoryRead[] => [
     DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').list({ where: { request_id: requestId }, limit: 2 }),
     DOMAIN_REPOSITORIES.domain('InteractionResponse').list({ where: { request_id: requestId }, limit: 2 })
@@ -1359,10 +1418,16 @@ async function completeRows(
   return found.length < PAGE_LIMIT ? found : listAllDomainRows(database, domain, where);
 }
 
-async function getRows(database: RuntimeDatabase, domain: string, ids: string[]): Promise<DomainRow[]> {
-  if (ids.length === 0) return [];
-  const barrier = await database.snapshot(ids.map((rowId) => DOMAIN_REPOSITORIES.domain(domain).get(rowId)));
-  return ids.map((rowId, index) => row(barrier.snapshot[index], `${domain} ${rowId}`));
+async function getRows(database: RuntimeDatabase, domain: string, ids: string[], assertActive?: () => void): Promise<DomainRow[]> {
+  const result: DomainRow[] = [];
+  for (let offset = 0; offset < ids.length; offset += FORK_MESSAGE_READ_BATCH_SIZE) {
+    assertActive?.();
+    const batch = ids.slice(offset, offset + FORK_MESSAGE_READ_BATCH_SIZE);
+    const barrier = await database.snapshot(batch.map((rowId) => DOMAIN_REPOSITORIES.domain(domain).get(rowId)));
+    assertActive?.();
+    for (const [index, rowId] of batch.entries()) result.push(row(barrier.snapshot[index], `${domain} ${rowId}`));
+  }
+  return result;
 }
 
 function idMap(target: string, kind: string, sourceIds: string[]): Map<string, string> {
