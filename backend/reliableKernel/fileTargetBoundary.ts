@@ -197,45 +197,64 @@ export async function readFileWithIdentityFence(
 }
 
 /**
- * Serialize overlapping mutations across dispatcher instances in this host. No portable Node
- * primitive offers atomic content CAS against external writers. The active root-claim registry
- * below also serializes cooperating window processes with equal or nested workspace roots.
- * Final identity/content fences detect observed external changes but cannot exclude their races.
+ * Serialize overlapping mutations across dispatcher instances in this host. The local queue
+ * covers the same equal/nested workspace roots as the cross-process registry, before its bounded
+ * wait begins. Disjoint targets in one root must not compete for their own host's active claim.
+ * No portable Node primitive offers atomic content CAS against non-cooperating external writers.
  */
-const pendingTargets: Array<{ targets: string[]; completed: Promise<void> }> = [];
+interface PendingMutationTurn { paths: string[]; completed: Promise<void> }
+const pendingMutations: PendingMutationTurn[] = [];
+const pendingAdmissions: PendingMutationTurn[] = [];
+
 export async function withFileMutationTargets<T>(
   inputs: Array<{ root: FilePlanningRoot; target: string }>,
   run: () => Promise<T>,
   signal?: AbortSignal
 ): Promise<T> {
-  const targets = inputs.map(input => input.target);
-  const overlaps = (left: string, right: string) => isCanonicalPathInside(left, right) || isCanonicalPathInside(right, left);
-  const prior = pendingTargets.filter(entry => entry.targets.some(left => targets.some(right => overlaps(left, right))));
-  let release!: () => void;
-  const entry = { targets, completed: new Promise<void>(resolve => { release = resolve; }) };
-  pendingTargets.push(entry);
   let started = false;
   try {
-    await waitForPendingTargets(Promise.all(prior.map(item => item.completed)), signal);
     const roots = [...new Map(inputs.map(input => [JSON.stringify(input.root), input.root])).values()]
       .sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)));
-    return await withWorkspaceMutationClaim(roots, () => { started = true; return run(); }, signal);
+    const paths = [...roots.map(root => root.canonicalPath), ...inputs.map(input => input.target)];
+    return await withLocalMutationTurn(pendingMutations, paths, () =>
+      withWorkspaceMutationClaim(roots, () => { started = true; return run(); }, signal), signal);
   } catch (error) {
     if (!started) throw new FileMutationNotStartedError(error);
     throw error;
+  }
+}
+
+function mutationPathsOverlap(left: string, right: string): boolean {
+  return isCanonicalPathInside(left, right) || isCanonicalPathInside(right, left);
+}
+
+/** Earlier overlapping turns stay ahead even while queued; unrelated roots can proceed. */
+async function withLocalMutationTurn<T>(
+  pending: PendingMutationTurn[], paths: string[], run: () => Promise<T>, signal?: AbortSignal
+): Promise<T> {
+  const prior = pending.filter(entry => entry.paths.some(left => paths.some(right => mutationPathsOverlap(left, right))));
+  let release!: () => void;
+  const entry = { paths, completed: new Promise<void>(resolve => { release = resolve; }) };
+  pending.push(entry);
+  try {
+    await waitForMutationTurn(Promise.all(prior.map(item => item.completed)), signal);
+    signal?.throwIfAborted();
+    return await run();
   } finally {
-    pendingTargets.splice(pendingTargets.indexOf(entry), 1);
+    // Every successor also waits on its own overlapping predecessors, so cancelling a queued
+    // turn can remove it immediately without allowing successors to bypass an active owner.
+    pending.splice(pending.indexOf(entry), 1);
     release();
   }
 }
 
-async function waitForPendingTargets(pending: Promise<unknown>, signal?: AbortSignal): Promise<void> {
+async function waitForMutationTurn(pending: Promise<unknown>, signal?: AbortSignal): Promise<void> {
   signal?.throwIfAborted();
   if (!signal) { await pending; return; }
   let abort!: () => void;
   try {
     await Promise.race([pending, new Promise<never>((_resolve, reject) => {
-      abort = () => reject(signal.reason ?? new Error('File mutation cancelled while waiting for a target.'));
+      abort = () => reject(signal.reason ?? new Error('File mutation cancelled while waiting for admission.'));
       signal.addEventListener('abort', abort, { once: true });
       if (signal.aborted) abort();
     })]);
@@ -290,9 +309,7 @@ async function withWorkspaceMutationClaim<T>(roots: FilePlanningRoot[], run: () 
         const other = await readClaimRecord(otherPath, 'owner.json', parseFileMutationClaim, invalid);
         if (!other) continue;
         if (other.kind !== 'file-mutation-active' || other.ownerToken !== name) throw invalid();
-        const overlap = other.roots.some(left => roots.some(right =>
-          isCanonicalPathInside(left.canonicalPath, right.canonicalPath)
-          || isCanonicalPathInside(right.canonicalPath, left.canonicalPath)));
+        const overlap = other.roots.some(left => roots.some(right => mutationPathsOverlap(left.canonicalPath, right.canonicalPath)));
         if (!overlap) continue;
         const state = classify(other.processId, other.processStartIdentity);
         if (state === 'unknown') throw invalid();
@@ -314,8 +331,10 @@ async function withWorkspaceMutationClaim<T>(roots: FilePlanningRoot[], run: () 
     if (Date.now() >= deadline) throw new FilePathConflictError('Timed out waiting for an overlapping workspace file mutation.');
     await delay(25);
   }
-  try { return await run(); }
-  finally {
+  try {
+    signal?.throwIfAborted();
+    return await run();
+  } finally {
     // Cleanup does not inherit cancellation: a live owner must release its exact active claim.
     await withMutationAdmission(namespace, Date.now() + 30_000, undefined, () =>
       releaseClaimRecord(claimPath, 'owner.json', metadata.ownerToken, parseFileMutationClaim, invalid, invalid));
@@ -329,25 +348,31 @@ function mutationClaim(kind: FileMutationClaim['kind'], roots: FilePlanningRoot[
 
 /** Only registry admission/release holds this global claim; workspace reads and writes never do. */
 async function withMutationAdmission<T>(namespace: string, deadline: number, signal: AbortSignal | undefined, run: () => Promise<T>): Promise<T> {
-  const claimPath = path.join(namespace, 'admission');
-  const metadata = mutationClaim('file-mutation-admission', []);
-  const invalid = () => new FilePathConflictError('File mutation admission owner cannot be verified.');
-  const classify = createCachedProcessClassifier();
-  for (;;) {
-    signal?.throwIfAborted();
-    if (await tryPublishClaimRecord(claimPath, 'owner.json', JSON.stringify(metadata))) break;
-    const owner = await readClaimRecord(claimPath, 'owner.json', parseFileMutationClaim, invalid);
-    if (!owner) continue;
-    if (owner.kind !== 'file-mutation-admission') throw invalid();
-    const state = classify(owner.processId, owner.processStartIdentity);
-    if (state === 'unknown') throw invalid();
-    if (state === 'dead') {
-      await isolateDeadClaimRecord(claimPath, 'owner.json', owner.ownerToken, parseFileMutationClaim, invalid);
-      continue;
+  // Distinct roots still share this short registry claim. Queue both acquisition and release
+  // locally so they cannot flood filesystem workers or starve cleanup with competing publishes.
+  return withLocalMutationTurn(pendingAdmissions, [namespace], async () => {
+    const claimPath = path.join(namespace, 'admission');
+    const metadata = mutationClaim('file-mutation-admission', []);
+    const invalid = () => new FilePathConflictError('File mutation admission owner cannot be verified.');
+    const classify = createCachedProcessClassifier();
+    for (;;) {
+      signal?.throwIfAborted();
+      if (await tryPublishClaimRecord(claimPath, 'owner.json', JSON.stringify(metadata))) break;
+      const owner = await readClaimRecord(claimPath, 'owner.json', parseFileMutationClaim, invalid);
+      if (!owner) continue;
+      if (owner.kind !== 'file-mutation-admission') throw invalid();
+      const state = classify(owner.processId, owner.processStartIdentity);
+      if (state === 'unknown') throw invalid();
+      if (state === 'dead') {
+        await isolateDeadClaimRecord(claimPath, 'owner.json', owner.ownerToken, parseFileMutationClaim, invalid);
+        continue;
+      }
+      if (Date.now() >= deadline) throw new FilePathConflictError('Timed out waiting for file mutation admission.');
+      await delay(25);
     }
-    if (Date.now() >= deadline) throw new FilePathConflictError('Timed out waiting for file mutation admission.');
-    await delay(25);
-  }
-  try { return await run(); }
-  finally { await releaseClaimRecord(claimPath, 'owner.json', metadata.ownerToken, parseFileMutationClaim, invalid, invalid); }
+    try {
+      signal?.throwIfAborted();
+      return await run();
+    } finally { await releaseClaimRecord(claimPath, 'owner.json', metadata.ownerToken, parseFileMutationClaim, invalid, invalid); }
+  }, signal);
 }

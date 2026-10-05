@@ -11,7 +11,7 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiled, 'backend/reliableKernel/index.js'));
-const { captureFilePlanningRoot, withFileMutationTargets } = require(path.join(compiled, 'backend/reliableKernel/fileTargetBoundary.js'));
+const { captureFilePlanningRoot, withFileMutationTargets, FileMutationNotStartedError } = require(path.join(compiled, 'backend/reliableKernel/fileTargetBoundary.js'));
 const repo = domain => kernel.DOMAIN_REPOSITORIES.domain(domain);
 const rows = async (database, domain, where = {}) => (await database.snapshotAll(repo(domain).list({ where, orderBy: { column: 'id', direction: 'asc' }, limit: 100 }))).snapshot;
 const deferred = () => { let resolve; const promise = new Promise(done => { resolve = done; }); return { promise, resolve }; };
@@ -193,6 +193,124 @@ test('a new proposal without planning evidence fails closed', async () => fixtur
   assert.equal((await rows(h.database, 'FileChangeSet')).length, 0);
 }));
 
+test('local workspace mutation queues keep FIFO before registry I/O, cancellation and callback failure', async () => {
+  const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-file-local-queue-')));
+  const release = deferred(), entered = deferred();
+  const originalMkdir = fs.mkdir;
+  const tasks = [];
+  try {
+    await fs.mkdir(path.join(temporary, 'workspace', 'nested'), { recursive: true });
+    await fs.mkdir(path.join(temporary, 'other'));
+    const root = await captureFilePlanningRoot(path.join(temporary, 'workspace'));
+    const nested = await captureFilePlanningRoot(path.join(temporary, 'workspace', 'nested'));
+    const other = await captureFilePlanningRoot(path.join(temporary, 'other'));
+    const mutate = (root, name, run, signal) => withFileMutationTargets([{ root, target: path.join(root.canonicalPath, name) }], run, signal);
+    const holder = mutate(nested, 'held.txt', async () => { entered.resolve(); await release.promise; });
+    tasks.push(holder);
+    await Promise.race([entered.promise, holder.then(() => assert.fail('holder exited before entry'))]);
+    const activeDirectory = path.join(os.tmpdir(), `limcode-file-mutations-${process.getuid?.() ?? 'user'}`, 'active');
+    let registryEntries = 0;
+    fs.mkdir = async (input, ...rest) => {
+      if (String(input) === activeDirectory) registryEntries++;
+      return originalMkdir(input, ...rest);
+    };
+    const order = [], abort = new AbortController(), failure = new Error('mutation callback failed');
+    tasks.push(assert.rejects(mutate(root, 'first.txt', async () => { order.push('first'); throw failure; }), error => error === failure));
+    tasks.push(assert.rejects(mutate(root, 'cancelled.txt', async () => { assert.fail('cancelled turn started'); }, abort.signal),
+      error => error instanceof FileMutationNotStartedError && error.cause === abort.signal.reason));
+    tasks.push(mutate(nested, 'second.txt', async () => { order.push('second'); }));
+    abort.abort(new Error('cancel queued turn'));
+    await mutate(other, 'unrelated.txt', async () => { order.push('unrelated'); });
+    assert.equal(registryEntries, 1, 'equal/nested roots must wait locally without polling the registry');
+    assert.deepEqual(order, ['unrelated']);
+    release.resolve();
+    await Promise.all(tasks);
+    assert.deepEqual(order, ['unrelated', 'first', 'second']);
+    await mutate(root, 'after-failure.txt', async () => { order.push('after'); });
+    assert.equal(order.at(-1), 'after');
+  } finally {
+    fs.mkdir = originalMkdir;
+    release.resolve();
+    await Promise.allSettled(tasks);
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
+test('local registry admission removes cancelled turns without bypassing owners and releases a cancelled publication', async () => {
+  const temporary = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-file-admission-queue-')));
+  const admissionEntered = deferred(), releaseAdmission = deferred(), releaseMutation = deferred();
+  const originalLstat = fs.lstat, originalMkdir = fs.mkdir, originalRename = fs.rename;
+  const tasks = [], roots = [], ready = [deferred(), deferred(), deferred()];
+  const namespace = path.join(os.tmpdir(), `limcode-file-mutations-${process.getuid?.() ?? 'user'}`);
+  const activeDirectory = path.join(namespace, 'active'), admissionPath = path.join(namespace, 'admission');
+  try {
+    for (let index = 0; index < 3; index++) {
+      const directory = path.join(temporary, String(index));
+      await fs.mkdir(directory);
+      roots.push(await captureFilePlanningRoot(directory));
+    }
+    let registryEntries = 0, admissionReads = 0;
+    fs.mkdir = async (input, ...rest) => {
+      const result = await originalMkdir(input, ...rest);
+      if (String(input) === activeDirectory) ready[registryEntries++]?.resolve();
+      return result;
+    };
+    fs.lstat = async (input, ...rest) => {
+      if (String(input) === admissionPath && ++admissionReads === 1) {
+        admissionEntered.resolve();
+        await releaseAdmission.promise;
+      }
+      return originalLstat(input, ...rest);
+    };
+    const order = [], mutate = (root, run, signal) => withFileMutationTargets([{ root, target: path.join(root.canonicalPath, 'note.txt') }], run, signal);
+    const holder = mutate(roots[0], async () => { order.push('first'); await releaseMutation.promise; });
+    tasks.push(holder);
+    await Promise.race([admissionEntered.promise, holder.then(() => assert.fail('holder exited before admission'))]);
+    const abort = new AbortController();
+    const cancelled = assert.rejects(mutate(roots[1], async () => { assert.fail('cancelled admission started'); }, abort.signal),
+      error => error instanceof FileMutationNotStartedError && error.cause === abort.signal.reason);
+    tasks.push(cancelled);
+    await Promise.race([ready[1].promise, cancelled.then(() => assert.fail('cancelled task exited before queuing'))]);
+    await new Promise(resolve => setImmediate(resolve));
+    abort.abort(new Error('cancel waiting registry admission'));
+    await cancelled;
+    const unrelated = mutate(roots[2], async () => { order.push('unrelated'); });
+    tasks.push(unrelated);
+    await Promise.race([ready[2].promise, unrelated.then(() => assert.fail('unrelated task bypassed held admission'))]);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(admissionReads, 1, 'cancelling the last queued turn must not let a successor bypass an active admission');
+    releaseAdmission.resolve();
+    await unrelated;
+    assert.deepEqual(order, ['first', 'unrelated'], 'unrelated workspace callbacks remain concurrent');
+    releaseMutation.resolve();
+    await Promise.all(tasks);
+    fs.lstat = originalLstat;
+    fs.mkdir = originalMkdir;
+
+    const publishedAbort = new AbortController();
+    let published = false;
+    fs.rename = async (from, to) => {
+      const result = await originalRename(from, to);
+      if (path.dirname(String(to)) === activeDirectory && String(from).includes('.candidate-')) {
+        published = true;
+        publishedAbort.abort(new Error('cancel after active claim publication'));
+      }
+      return result;
+    };
+    await assert.rejects(mutate(roots[0], async () => { assert.fail('mutation started after cancelled publication'); }, publishedAbort.signal),
+      error => error instanceof FileMutationNotStartedError && error.cause === publishedAbort.signal.reason);
+    assert.equal(published, true);
+    fs.rename = originalRename;
+    await mutate(roots[0], async () => { order.push('after-publication'); });
+    assert.equal(order.at(-1), 'after-publication');
+  } finally {
+    fs.lstat = originalLstat; fs.mkdir = originalMkdir; fs.rename = originalRename;
+    releaseAdmission.resolve(); releaseMutation.resolve();
+    await Promise.allSettled(tasks);
+    await fs.rm(temporary, { recursive: true, force: true });
+  }
+});
+
 for (const overlap of ['same-root', 'nested-root']) {
 test(`separate cooperating host processes serialize ${overlap} claims and allow unrelated roots`, async () => {
   const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-file-host-lock-'));
@@ -321,11 +439,12 @@ test('recovery of historical unfenced dispatched work records unknown without re
   assert.equal((await rows(h.database, 'EffectReceipt'))[0].outcome, 'outcome_unknown');
 }));
 
-test('cancellation while queued for a shared target settles cancelled without inspecting the workspace', async () => fixture(async h => {
+for (const target of ['cancelled.txt', 'disjoint.txt']) {
+test(`cancellation queued behind ${target} settles cancelled without inspecting the workspace`, async () => fixture(async h => {
   const call = await h.approve('write', { path: 'cancelled.txt', content: 'must not write' });
   const entered = deferred(), release = deferred();
   const planningRoot = await captureFilePlanningRoot(h.root);
-  const holder = withFileMutationTargets([{ root: planningRoot, target: path.join(h.root, 'cancelled.txt') }], async () => {
+  const holder = withFileMutationTargets([{ root: planningRoot, target: path.join(h.root, target) }], async () => {
     entered.resolve(); await release.promise;
   });
   await entered.promise;
@@ -343,6 +462,7 @@ test('cancellation while queued for a shared target settles cancelled without in
     assert.equal(await fs.stat(path.join(h.root, 'cancelled.txt')).then(() => true, () => false), false);
   } finally { release.resolve(); await holder; }
 }));
+}
 
 for (const mutation of ['target', 'root', 'member-tail']) {
   test(`effect request ${mutation} substitution cannot escape its complete approved proposal`, async () => fixture(async h => {
