@@ -110,7 +110,7 @@ export function openRuntime(dataSet) {
 export async function withRuntime(dataSet, run) {
   const runtime = await openRuntime(dataSet);
   try {
-    return await run(runtime, new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding));
+    return await run(runtime, new kernel.ContentAddressedStore(dataSet.authority, runtime.binding));
   } finally { await runtime.close(); }
 }
 
