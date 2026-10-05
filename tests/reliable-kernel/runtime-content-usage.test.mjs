@@ -106,6 +106,7 @@ after(() => { Module._load = originalLoad; });
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const kernel = require(path.join(compiledRoot, 'backend/reliableKernel/index.js'));
 const usage = require(path.join(compiledRoot, 'backend/reliableKernel/runtimeContentUsage.js'));
+const { PACKED_CAS_FILE } = require(path.join(compiledRoot, 'backend/reliableKernel/packedCasWorkerProtocol.js'));
 const NativeDatabase = require('better-sqlite3');
 
 const MESSAGE = 'application/vnd.limcode.message+json';
@@ -275,12 +276,16 @@ test('合成数据：每种类型的记录数、字节数与最大值准确，�
   const rows = await database.contentUsage();
   assert.deepEqual([...rows].sort((left, right) => (left.contentType < right.contentType ? -1 : 1)), expectedRows);
 
-  // Shared bytes count once per type: the per-record sum exceeds the CAS files by exactly that object.
+  // Shared bytes count once per type, but this small-body fixture has one packed row per digest.
   const recordBytes = records.reduce((sum, [, text]) => sum + Buffer.byteLength(text), 0);
   const casFiles = (await listFiles(root.binding.paths.casRootPath)).filter((file) => file.includes(`${path.sep}sha256${path.sep}`));
-  const casBytes = (await Promise.all(casFiles.map((file) => fs.stat(file)))).reduce((sum, stat) => sum + stat.size, 0);
-  assert.equal(casFiles.length, records.length - 1);
-  assert.equal(casBytes, recordBytes - 700);
+  assert.equal(casFiles.length, 0, 'all fixture bodies fit the packed tier');
+  const packed = new NativeDatabase(path.join(root.binding.paths.casRootPath, PACKED_CAS_FILE), { readonly: true, fileMustExist: true });
+  try {
+    const physical = packed.prepare('SELECT COUNT(*) AS count, SUM(length(body)) AS bytes FROM cas_body').get();
+    assert.equal(physical.count, records.length - 1);
+    assert.equal(physical.bytes, recordBytes - 700);
+  } finally { packed.close(); }
 
   const report = usage.summarizeRuntimeContentUsage(rows);
   assert.equal(report.countedBy, 'content-object-record');

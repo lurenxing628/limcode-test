@@ -142,10 +142,15 @@ test('packed corruption wins over a valid loose duplicate; FULL and bounded per-
   const bytes = Buffer.from('small immutable body');
   const store = kernel.ContentAddressedStore.forDatabase(f.authority, f.database);
   const metadata = await store.ingest(f.database, bytes, 'text/plain');
+  const looseBytes = Buffer.from('loose descriptor identity');
+  const looseObject = store.identity(looseBytes, 'text/plain');
+  await kernel.ContentAddressedStore.loose(f.authority, f.binding).publish(looseBytes, 'text/plain');
   await f.database.close();
   const result = await new Promise((resolve, reject) => {
     const worker = new Worker(`
       const { parentPort, workerData } = require('node:worker_threads');
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
       const crypto = require('node:crypto');
       const original = crypto.createHash; let hashes = 0;
       crypto.createHash = (...args) => { hashes += 1; return original(...args); };
@@ -156,9 +161,54 @@ test('packed corruption wins over a valid loose duplicate; FULL and bounded per-
       const appendHashes = hashes - before;
       store.readBytes(workerData.object);
       const full = store.database.pragma('synchronous', { simple: true });
-      store.close(); parentPort.postMessage({ appendHashes, readHashes: hashes - before - appendHashes, full });
+      const proof = { appendHashes, readHashes: hashes - before - appendHashes, full };
+      const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+      const stat = fs.statSync, fstat = fs.fstatSync;
+      const nativeInode = stat(workerData.looseFile, { bigint: true }).ino;
+      const device = 0x09abcdefn, inode = 0x20000000000000n;
+      let fault, pathReads, descriptorReads;
+      fs.statSync = (file, options) => {
+        const info = stat(file, options);
+        if (file === workerData.looseFile) {
+          info.dev = (0x12345678n << 32n) | device;
+          info.ino = inode;
+          if (++pathReads > 1 && fault === 'path') info.dev += 1n << 32n;
+        }
+        return info;
+      };
+      fs.fstatSync = (descriptor, options) => {
+        const info = fstat(descriptor, options);
+        if (info.ino === nativeInode) {
+          info.dev = device + (fault === 'device' ? 1n : 0n);
+          if (fault === 'full-device') info.dev |= 0x12345678n << 32n;
+          info.ino = inode + (fault === 'inode' || (++descriptorReads > 1 && fault === 'descriptor') ? 1n : 0n);
+        }
+        return info;
+      };
+      const publishLoose = () => {
+        pathReads = descriptorReads = 0;
+        return store.publishBatch([{ object: workerData.looseObject, bytes: Buffer.from(workerData.looseBytes) }]);
+      };
+      try {
+        Object.defineProperty(process, 'platform', { value: 'win32' });
+        assert.deepEqual(publishLoose(), ['loose'], 'Windows path/fd volume serial widths may differ');
+        fault = 'full-device';
+        assert.deepEqual(publishLoose(), ['loose'], 'equal full-width Windows device identities remain valid');
+        for (fault of ['device', 'inode', 'path', 'descriptor']) {
+          assert.throws(publishLoose, { code: 'packed-cas-corrupt', message: /changed during publication/ }, fault);
+        }
+        fault = undefined;
+        Object.defineProperty(process, 'platform', { value: 'linux' });
+        assert.throws(publishLoose, { code: 'packed-cas-corrupt' }, 'other platforms require full device identity');
+      } finally {
+        fs.statSync = stat; fs.fstatSync = fstat;
+        Object.defineProperty(process, 'platform', platform);
+        store.close();
+      }
+      parentPort.postMessage(proof);
     `, { eval: true, resourceLimits: { maxOldGenerationSizeMb: 32 }, workerData: {
-      module: path.join(compiled, 'backend/reliableKernel/packedCasStore.js'), binding: f.binding, object: metadata, bytes
+      module: path.join(compiled, 'backend/reliableKernel/packedCasStore.js'), binding: f.binding, object: metadata, bytes,
+      looseObject, looseBytes, looseFile: looseFile(f.binding, looseObject)
     } });
     let message;
     worker.on('message', value => { message = value; });

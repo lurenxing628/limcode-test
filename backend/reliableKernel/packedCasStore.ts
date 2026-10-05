@@ -352,7 +352,7 @@ function existingLooseMatches(root: string, object: CasObjectIdentity, expected:
   const descriptor = fs.openSync(file, 'r');
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true });
-    if (!sameFile(info, opened) || !opened.isFile() || opened.size !== object.byte_length) throw corrupt('Existing loose CAS object changed during publication.');
+    if (!sameOpenedFile(info, opened) || !opened.isFile() || opened.size !== object.byte_length) throw corrupt('Existing loose CAS object changed during publication.');
     const bytes = Buffer.alloc(expected.length + 1);
     let read = 0;
     while (read < bytes.length) {
@@ -361,6 +361,12 @@ function existingLooseMatches(root: string, object: CasObjectIdentity, expected:
       read += count;
     }
     if (read !== expected.length || !bytes.subarray(0, read).equals(expected)) throw corrupt('Existing loose CAS object does not match its published bytes.');
+    const afterRead = fs.fstatSync(descriptor, { bigint: true });
+    const current = statOrUndefined(file, false);
+    if (!sameFile(opened, afterRead) || !afterRead.isFile() || afterRead.size !== object.byte_length
+      || !current?.isFile() || !sameFile(info, current) || current.size !== object.byte_length) {
+      throw corrupt('Existing loose CAS object changed during publication.');
+    }
     return true;
   } finally { fs.closeSync(descriptor); }
 }
@@ -384,6 +390,13 @@ function statOrUndefined(file: string, noFollow: boolean): fs.BigIntStats | unde
 
 function sameFile(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameOpenedFile(pathInfo: fs.BigIntStats, descriptorInfo: fs.BigIntStats): boolean {
+  // Older libuv Windows path stats expose the 64-bit volume serial, while fstat exposes its
+  // low 32 bits. Normalize only this cross-API comparison; same-API fences stay full-width.
+  return pathInfo.ino === descriptorInfo.ino && (pathInfo.dev === descriptorInfo.dev
+    || (process.platform === 'win32' && BigInt.asUintN(32, pathInfo.dev) === descriptorInfo.dev));
 }
 
 function corrupt(message: string): Error {

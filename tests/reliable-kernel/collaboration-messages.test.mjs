@@ -25,7 +25,7 @@ async function fixture(run, budget = 32) {
   const authority = new RootAuthority(() => path.join(directory, 'runtime'));
   await initializeEmptyRuntimeRoot(authority);
   let database = await RuntimeDatabase.open(authority);
-  const store = ContentAddressedStore.forDatabase(authority, database);
+  let store = ContentAddressedStore.forDatabase(authority, database);
   let deliveries = new RuntimeDeliveryControlPlane(database, store, { now: () => NOW });
   let collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW });
   const rows = async (domain, where = {}) => (await database.snapshot([repo(domain).list({ where, limit: 1000 })])).snapshot[0];
@@ -47,8 +47,14 @@ async function fixture(run, budget = 32) {
         repo('ChildExecutionTurnLink').insert({ id: `${id}-child-turn`, child_execution_id: `${id}-child`, turn_id: `${id}-turn`, turn_seq: 1n, created_at: NOW })
       ])
     ]);
-    await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, store, rows, get, authority, runtimeDirectory: path.join(directory, 'runtime'),
-      async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); deliveries = new RuntimeDeliveryControlPlane(database, store, { now: () => NOW }); collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW }); },
+    await run({ get database() { return database; }, get deliveries() { return deliveries; }, get collaboration() { return collaboration; }, get store() { return store; }, rows, get, authority, runtimeDirectory: path.join(directory, 'runtime'),
+      async reopen() {
+        await database.close();
+        database = await RuntimeDatabase.open(authority);
+        store = ContentAddressedStore.forDatabase(authority, database);
+        deliveries = new RuntimeDeliveryControlPlane(database, store, { now: () => NOW });
+        collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW });
+      },
       async source(id = `call-${++callSeq}`, conversationId = 'left', turnId = `${conversationId}-turn`, toolName = 'send_agent_message') {
         const content = await store.prepare(database, '{}', 'application/json');
         await database.transaction([...preparedContentObjectSteps([content], 'message_tool'), repo('ToolCall').insert({ id, turn_id: turnId, call_seq: BigInt(++callSeq), tool_name: toolName, status: 'pending', arguments_object_id: content.metadata.id, created_at: NOW, updated_at: NOW })]);

@@ -23,7 +23,7 @@ async function fixture(run, notify) {
   const authority = new RootAuthority(() => path.join(directory, 'runtime'));
   await initializeEmptyRuntimeRoot(authority);
   let database = await RuntimeDatabase.open(authority);
-  const store = ContentAddressedStore.forDatabase(authority, database);
+  let store = ContentAddressedStore.forDatabase(authority, database);
   let clock = 0;
   const timestamp = () => new Date(Date.parse(now) + ++clock).toISOString();
   let board = new CollaborationBoard(database, store, { now: timestamp, notify });
@@ -48,8 +48,13 @@ async function fixture(run, notify) {
       repo('ChildExecution').insert({ id: `${id}-child`, child_conversation_id: id, status: id === 'idle' ? 'idle' : 'active', created_at: now, updated_at: now }),
       repo('ChildExecutionParentLink').insert({ id: `${id}-parent`, child_execution_id: `${id}-child`, source_tool_call_id: `${id}-spawn`, parent_child_execution_id: null, parent_turn_id: 'root-turn', created_at: now })
     ]));
-    await run({ get database() { return database; }, get board() { return board; }, store, rows, call, tool,
-      async reopen() { await database.close(); database = await RuntimeDatabase.open(authority); board = new CollaborationBoard(database, store, { now: timestamp, notify }); },
+    await run({ get database() { return database; }, get board() { return board; }, get store() { return store; }, rows, call, tool,
+      async reopen() {
+        await database.close();
+        database = await RuntimeDatabase.open(authority);
+        store = ContentAddressedStore.forDatabase(authority, database);
+        board = new CollaborationBoard(database, store, { now: timestamp, notify });
+      },
       async idle(conversationId) {
         await database.transaction([
           repo('Turn').update(`${conversationId}-turn`, { status: 'terminated', terminal_at: now, updated_at: now }),
