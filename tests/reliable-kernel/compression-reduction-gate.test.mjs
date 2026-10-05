@@ -12,6 +12,7 @@ const compiledRoot = process.env.LIMCODE_COMPILED_ROOT
   : path.join(root, 'dist/extension');
 const kernel = await import(pathToFileURL(path.join(compiledRoot, 'backend/reliableKernel/index.js')).href);
 const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(path.join(compiledRoot, 'backend/reliableKernel/conversationContextHandleState.js')).href);
+const { resolveFrozenModelHandleCatalog } = await import(pathToFileURL(path.join(compiledRoot, 'backend/reliableKernel/frozenModelHandleCatalog.js')).href);
 const capabilitiesModule = await import(pathToFileURL(path.join(compiledRoot, 'shared/modelCapabilities.js')).href);
 
 const PROVIDER_ID = 'provider-reduction-gate';
@@ -412,6 +413,7 @@ test('committed prefix compression keeps historical process references stable in
       headRootId: head, round, tools: [], includeOpenTaskCompletionCheck: false
     });
     const before = await freeze(headRootId, '1');
+    const beforeCatalog = await resolveFrozenModelHandleCatalog(app.database, app.contentStore, before);
     const consumed = await app.modelProvider.createModelRequest({ turnId: seeded.turnId,
       authoritySnapshotId: seeded.authoritySnapshotId, contextRootId: headRootId,
       recipe: before, idempotencyKey: 'consume-process-references' });
@@ -429,15 +431,16 @@ test('committed prefix compression keeps historical process references stable in
     const consumedHead = await app.context.currentHeadRootId(seeded.conversationId);
     const coordinator = summaryCoordinator(app, 'Build task output is available via P1 and O1.', () => {});
     const compressed = await coordinator.coordinate({ ...seeded, headRootId: consumedHead, trigger: 'manual',
-      compressSegmentCount: 3, modelHandleCatalog: before.modelHandleCatalog });
+      compressSegmentCount: 3, modelHandleCatalog: beforeCatalog });
     assert.equal(compressed.status, 'compressed');
     const nextHead = await app.context.currentHeadRootId(seeded.conversationId);
     const after = await freeze(nextHead, '2');
+    const afterCatalog = await resolveFrozenModelHandleCatalog(app.database, app.contentStore, after);
     const args = { mode: 'output', processRef: 'P1', cursor: 'O1' };
-    assert.deepEqual(kernel.resolveModelToolArguments('bash', args, after.modelHandleCatalog),
-      kernel.resolveModelToolArguments('bash', args, before.modelHandleCatalog));
+    assert.deepEqual(kernel.resolveModelToolArguments('bash', args, afterCatalog),
+      kernel.resolveModelToolArguments('bash', args, beforeCatalog));
     assert.equal(kernel.resolveModelToolArguments('bash', { mode: 'output', processRef: 'P2' },
-      after.modelHandleCatalog).processId, 'process-tests');
+      afterCatalog).processId, 'process-tests');
     const stored = await app.context.materialize(nextHead);
     assert.equal(stored.segments[0].segmentKind, 'compression');
     assert.match(stored.segments[0].content.toString(), /P1 and O1/);

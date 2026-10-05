@@ -591,8 +591,8 @@ test('低-4：只删子对话，父 Turn 拿到删除结果后向同一子 Agent
       parentRound += 1;
       if (parentRound === 1) return spawnCall('spawn-fg', 'child', '子任务', 600_000);
       if (parentRound === 2) {
-        // 模型只见得到子 Agent 的短引用（modelHandleCatalog），续派用它。
-        const ref = request.recipe?.modelHandleCatalog?.entries?.find((entry) => entry.kind === 'child')?.ref;
+        // 模型只见得到请求已解析的子 Agent 短引用，续派用它。
+        const ref = request.resolvedModelHandleCatalog.entries.find((entry) => entry.kind === 'child')?.ref;
         if (!ref) return { role: 'model', parts: [{ text: 'CHILD_GONE' }] };
         return { role: 'model', parts: [{ id: 'send-again', functionCall: { name: 'run_agent', args: {
           operation: 'send', childRef: ref, prompt: '再试一次', foregroundWaitMs: 600_000 } } }] };
