@@ -35,85 +35,13 @@ async function fixture(run) {
   } finally { await database.close(); await fs.rm(root, { recursive: true, force: true }); }
 }
 
-async function nativeLooseIdentityDiagnostic(binding, object, bytes) {
-  return new Promise((resolve, reject) => {
-    const worker = new Worker(`
-      const { parentPort, workerData } = require('node:worker_threads');
-      const fs = require('node:fs');
-      const { PackedCasStore } = require(workerData.module);
-      const fields = info => Object.fromEntries([
-        ...['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs', 'mode'].map(key => [key, String(info[key])]),
-        ['devHex', info.dev.toString(16)], ['inoHex', info.ino.toString(16)], ['isFile', info.isFile()]
-      ]);
-      (async () => {
-        const trace = [], descriptors = new Set();
-        const original = { statSync: fs.statSync, fstatSync: fs.fstatSync, openSync: fs.openSync };
-        const record = (api, info) => { if (trace.length < 8) trace.push({ api, ...fields(info) }); return info; };
-        const store = new PackedCasStore(workerData.binding);
-        let publication;
-        try {
-          fs.statSync = (file, ...args) => {
-            const info = original.statSync(file, ...args);
-            return file === workerData.file ? record('statSync', info) : info;
-          };
-          fs.openSync = (file, ...args) => {
-            const descriptor = original.openSync(file, ...args);
-            if (file === workerData.file) descriptors.add(descriptor);
-            return descriptor;
-          };
-          fs.fstatSync = (descriptor, ...args) => {
-            const info = original.fstatSync(descriptor, ...args);
-            return descriptors.has(descriptor) ? record('fstatSync', info) : info;
-          };
-          store.publishBatch([{ object: workerData.object, bytes: Buffer.from(workerData.bytes) }]);
-          publication = { status: 'succeeded' };
-        } catch (error) {
-          publication = { status: 'failed', name: error.name, code: error.code };
-        } finally { Object.assign(fs, original); store.close(); }
-        const asyncProbe = {};
-        try {
-          asyncProbe.before = fields(await fs.promises.stat(workerData.file, { bigint: true }));
-          const handle = await fs.promises.open(workerData.file, 'r');
-          try { asyncProbe.opened = fields(await handle.stat({ bigint: true })); }
-          finally { await handle.close(); }
-          asyncProbe.after = fields(await fs.promises.stat(workerData.file, { bigint: true }));
-        } catch (error) { asyncProbe.error = { name: error.name, code: error.code }; }
-        parentPort.postMessage({ node: process.version, uv: process.versions.uv, platform: process.platform, release: require('node:os').release(),
-          arch: process.arch, expectedBytes: String(workerData.object.byte_length), publication, trace, asyncProbe });
-      })().catch(error => { parentPort.postMessage({ diagnosticError: { name: error.name, code: error.code } }); });
-    `, { eval: true, resourceLimits: { maxOldGenerationSizeMb: 32 }, workerData: {
-      module: path.join(compiled, 'backend/reliableKernel/packedCasStore.js'), binding, object, bytes,
-      file: looseFile(binding, object)
-    } });
-    let message, failure, timedOut = false;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      void worker.terminate().catch(error => { failure = error; });
-    }, 10_000);
-    worker.on('message', value => { message = value; });
-    worker.on('error', error => { failure = error; });
-    worker.on('exit', code => {
-      clearTimeout(timer);
-      if (timedOut || failure || code !== 0) reject(failure ?? new Error(timedOut ? 'CAS diagnostic worker timed out' : `CAS diagnostic worker exited ${code}`));
-      else resolve(message);
-    });
-  });
-}
-
 test('packed CAS preserves identities, boundary bytes, aliases, batch ownership and close fencing', async () => fixture(async f => {
   const store = kernel.ContentAddressedStore.forDatabase(f.authority, f.database);
   const other = kernel.ContentAddressedStore.forDatabase(f.authority, f.database);
   assert.equal(store.byteAccess, other.byteAccess, 'facades borrow one Runtime-owned worker');
   await assert.rejects(fs.stat(packedFile(f.binding)), { code: 'ENOENT' });
   await kernel.ContentAddressedStore.loose(f.authority, f.binding).publish('legacy body', 'text/plain');
-  const legacy = await store.ingest(f.database, 'legacy body', 'text/legacy-alias').catch(async error => {
-    const bytes = Buffer.from('legacy body');
-    let diagnostic;
-    try { diagnostic = await nativeLooseIdentityDiagnostic(f.binding, store.identity(bytes, 'text/legacy-alias'), bytes); }
-    catch (failure) { diagnostic = { diagnosticError: { name: failure.name, code: failure.code } }; }
-    error.message += '; native loose identity diagnostic: ' + JSON.stringify(diagnostic);
-    throw error;
-  });
+  const legacy = await store.ingest(f.database, 'legacy body', 'text/legacy-alias');
   await assert.rejects(fs.stat(packedFile(f.binding)), { code: 'ENOENT' }, 'reusing loose bytes creates no container');
   assert.equal(await fs.readFile(looseFile(f.binding, legacy), 'utf8'), 'legacy body');
 
@@ -214,7 +142,7 @@ test('packed corruption wins over a valid loose duplicate; FULL and bounded per-
   const bytes = Buffer.from('small immutable body');
   const store = kernel.ContentAddressedStore.forDatabase(f.authority, f.database);
   const metadata = await store.ingest(f.database, bytes, 'text/plain');
-  const looseBytes = Buffer.from('loose descriptor identity');
+  const looseBytes = Buffer.from('legacy body');
   const looseObject = store.identity(looseBytes, 'text/plain');
   await kernel.ContentAddressedStore.loose(f.authority, f.binding).publish(looseBytes, 'text/plain');
   await f.database.close();
@@ -235,15 +163,20 @@ test('packed corruption wins over a valid loose duplicate; FULL and bounded per-
       const full = store.database.pragma('synchronous', { simple: true });
       const proof = { appendHashes, readHashes: hashes - before - appendHashes, full };
       const platform = Object.getOwnPropertyDescriptor(process, 'platform');
-      const stat = fs.statSync, fstat = fs.fstatSync;
-      const nativeInode = stat(workerData.looseFile, { bigint: true }).ino;
-      const device = 0x09abcdefn, inode = 0x20000000000000n;
-      let fault, pathReads, descriptorReads;
-      fs.statSync = (file, options) => {
-        const info = stat(file, options);
-        if (file === workerData.looseFile) {
-          info.dev = (0x12345678n << 32n) | device;
-          info.ino = inode;
+      const lstat = fs.lstatSync, fstat = fs.fstatSync, realpath = fs.realpathSync;
+      const canonical = realpath(workerData.looseFile);
+      const nativeInode = lstat(canonical, { bigint: true }).ino;
+      const device = 742408122n, inode = 0x20000000000000n;
+      // Captured Windows Server 2025 / Node 22.15.1 / libuv 1.49.2 failure fields.
+      const nativeState = { ino: 562949954785497n, size: 11n, mode: 33206n,
+        mtimeNs: 1791216812142445600n, ctimeNs: 1791216812152513100n };
+      let fault, nativePattern = false, pathReads, descriptorReads, resolutions;
+      fs.lstatSync = (file, options) => {
+        const info = lstat(file, options);
+        if (file === canonical) {
+          if (nativePattern) Object.assign(info, nativeState);
+          else info.ino = inode;
+          info.dev = nativePattern ? 0n : (0x12345678n << 32n) | device;
           if (++pathReads > 1 && fault === 'path') info.dev += 1n << 32n;
         }
         return info;
@@ -251,14 +184,24 @@ test('packed corruption wins over a valid loose duplicate; FULL and bounded per-
       fs.fstatSync = (descriptor, options) => {
         const info = fstat(descriptor, options);
         if (info.ino === nativeInode) {
+          if (nativePattern) Object.assign(info, nativeState);
+          else info.ino = inode;
           info.dev = device + (fault === 'device' ? 1n : 0n);
           if (fault === 'full-device') info.dev |= 0x12345678n << 32n;
-          info.ino = inode + (fault === 'inode' || (++descriptorReads > 1 && fault === 'descriptor') ? 1n : 0n);
+          if (fault === 'inode') info.ino += 1n;
+          if (fault === 'mtimeNs') info.mtimeNs += 1n;
+          if (++descriptorReads > 1 && fault === 'descriptor') info.dev += 1n << 32n;
         }
         return info;
       };
+      fs.realpathSync = file => {
+        const target = realpath(file);
+        return file === workerData.looseFile && ++resolutions > 2 && fault === 'target'
+          ? target + '.replacement' : target;
+      };
+      fs.realpathSync.native = () => { throw Object.assign(new Error('virtual-disk native realpath unavailable'), { code: 'EISDIR' }); };
       const publishLoose = () => {
-        pathReads = descriptorReads = 0;
+        pathReads = descriptorReads = resolutions = 0;
         return store.publishBatch([{ object: workerData.looseObject, bytes: Buffer.from(workerData.looseBytes) }]);
       };
       try {
@@ -266,14 +209,20 @@ test('packed corruption wins over a valid loose duplicate; FULL and bounded per-
         assert.deepEqual(publishLoose(), ['loose'], 'Windows path/fd volume serial widths may differ');
         fault = 'full-device';
         assert.deepEqual(publishLoose(), ['loose'], 'equal full-width Windows device identities remain valid');
-        for (fault of ['device', 'inode', 'path', 'descriptor']) {
+        for (fault of ['device', 'inode', 'path', 'descriptor', 'target', 'mtimeNs']) {
           assert.throws(publishLoose, { code: 'packed-cas-corrupt', message: /changed during publication/ }, fault);
+        }
+        fault = undefined;
+        nativePattern = true;
+        assert.deepEqual(publishLoose(), ['loose'], 'captured native dev=0 pathname matches its positive32-bit descriptor');
+        for (fault of ['inode', 'path', 'descriptor', 'target', 'mtimeNs']) {
+          assert.throws(publishLoose, { code: 'packed-cas-corrupt', message: /changed during publication/ }, 'native: ' + fault);
         }
         fault = undefined;
         Object.defineProperty(process, 'platform', { value: 'linux' });
         assert.throws(publishLoose, { code: 'packed-cas-corrupt' }, 'other platforms require full device identity');
       } finally {
-        fs.statSync = stat; fs.fstatSync = fstat;
+        fs.lstatSync = lstat; fs.fstatSync = fstat; fs.realpathSync = realpath;
         Object.defineProperty(process, 'platform', platform);
         store.close();
       }

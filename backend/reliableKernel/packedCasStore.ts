@@ -6,6 +6,7 @@ import Database from 'better-sqlite3';
 import { syncDirectoryDurablySync } from '../capabilities/filesystem/durableDirectorySync';
 import { requireCasObjectIdentity, type CasObjectIdentity } from './casObjectAccess';
 import { freezeRootBinding, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { fileDescriptorMatchesPathState, fileStateIdentity } from './fileTargetBoundary';
 import { looseCasObjectLocation, verifyCasObjectBytes } from './looseCasObjectAccess';
 import {
   PACKED_CAS_FILE, PACKED_CAS_MAX_BODY_BYTES, PACKED_CAS_MAX_QUEUED_BYTES,
@@ -346,13 +347,21 @@ function assertBinding(database: Database.Database, binding: RootBinding): void 
 
 function existingLooseMatches(root: string, object: CasObjectIdentity, expected: Buffer): boolean {
   const file = looseCasObjectLocation(root, object).absolutePath;
-  const info = statOrUndefined(file, false);
-  if (!info) return false;
+  const existing = statOrUndefined(file, false);
+  if (!existing) return false;
+  if (!existing.isFile() || existing.size !== object.byte_length) throw corrupt('Existing loose CAS object has the wrong length.');
+  // Portable realpath preserves supported virtual-disk roots and local symbolic CAS paths.
+  const canonical = fs.realpathSync(file);
+  const info = fs.lstatSync(canonical, { bigint: true });
   if (!info.isFile() || info.size !== object.byte_length) throw corrupt('Existing loose CAS object has the wrong length.');
-  const descriptor = fs.openSync(file, 'r');
+  const pathnameIdentity = fileStateIdentity(info);
+  const descriptor = fs.openSync(canonical, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0) | (fs.constants.O_NONBLOCK ?? 0));
   try {
     const opened = fs.fstatSync(descriptor, { bigint: true });
-    if (!sameOpenedFile(info, opened) || !opened.isFile() || opened.size !== object.byte_length) throw corrupt('Existing loose CAS object changed during publication.');
+    if (!fileDescriptorMatchesPathState(info, opened) || fs.realpathSync(file) !== canonical) {
+      throw corrupt('Existing loose CAS object changed during publication.');
+    }
+    const descriptorIdentity = fileStateIdentity(opened);
     const bytes = Buffer.alloc(expected.length + 1);
     let read = 0;
     while (read < bytes.length) {
@@ -362,9 +371,10 @@ function existingLooseMatches(root: string, object: CasObjectIdentity, expected:
     }
     if (read !== expected.length || !bytes.subarray(0, read).equals(expected)) throw corrupt('Existing loose CAS object does not match its published bytes.');
     const afterRead = fs.fstatSync(descriptor, { bigint: true });
-    const current = statOrUndefined(file, false);
-    if (!sameFile(opened, afterRead) || !afterRead.isFile() || afterRead.size !== object.byte_length
-      || !current?.isFile() || !sameFile(info, current) || current.size !== object.byte_length) {
+    const current = statOrUndefined(canonical, true);
+    if (!afterRead.isFile() || fileStateIdentity(afterRead) !== descriptorIdentity
+      || !current?.isFile() || fileStateIdentity(current) !== pathnameIdentity
+      || fs.realpathSync(file) !== canonical) {
       throw corrupt('Existing loose CAS object changed during publication.');
     }
     return true;
@@ -390,13 +400,6 @@ function statOrUndefined(file: string, noFollow: boolean): fs.BigIntStats | unde
 
 function sameFile(left: fs.BigIntStats, right: fs.BigIntStats): boolean {
   return left.dev === right.dev && left.ino === right.ino;
-}
-
-function sameOpenedFile(pathInfo: fs.BigIntStats, descriptorInfo: fs.BigIntStats): boolean {
-  // Older libuv Windows path stats expose the 64-bit volume serial, while fstat exposes its
-  // low 32 bits. Normalize only this cross-API comparison; same-API fences stay full-width.
-  return pathInfo.ino === descriptorInfo.ino && (pathInfo.dev === descriptorInfo.dev
-    || (process.platform === 'win32' && BigInt.asUintN(32, pathInfo.dev) === descriptorInfo.dev));
 }
 
 function corrupt(message: string): Error {
