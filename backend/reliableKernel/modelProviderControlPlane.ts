@@ -895,10 +895,13 @@ export class ModelProviderControlPlane {
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     const request = await this.requireDomain('ModelRequest', modelRequestId);
-    const projection = await this.requireDomain('ModelContextProjection', stableId('model_request_projection', modelRequestId));
-    if (projection.owner_kind !== 'model_request' || projection.owner_id !== modelRequestId) {
-      throw new Error(`ModelRequest ${modelRequestId} has an invalid frozen Context projection.`);
-    }
+    // Fork copies retain the owner relation under a copy-derived row id. The unique owner index
+    // identifies both original and copied projections without assuming their creation-time id.
+    const projections = rows((await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+      where: { owner_kind: 'model_request', owner_id: modelRequestId }, limit: 2
+    })])).snapshot[0]);
+    if (projections.length !== 1) throw new Error(`ModelRequest ${modelRequestId} must own exactly one frozen Context projection.`);
+    const projection = projections[0];
     const frozen = await readFrozenTurnAuthority(
       this.database,
       this.contentStore,
@@ -2768,16 +2771,15 @@ export class ModelProviderControlPlane {
         }),
         DOMAIN_REPOSITORIES.domain('ContentObject').get(contentObjectId)
       ]);
-      const revision = requireRow(snapshot.snapshot[0], `MessageRevision ${messageRevisionId}`);
+      const revision = snapshot.snapshot[0];
       const links = rows(snapshot.snapshot[1]);
       const metadata = requireRow(snapshot.snapshot[2], `ContentObject ${contentObjectId}`);
-      if (
-        revision.message_id !== messageId
-        || revision.content_object_id !== contentObjectId
-        || revision.role !== 'user'
-        || links.length !== 1
-      ) {
+      if (Array.isArray(revision) || (revision && (revision.message_id !== messageId
+        || revision.content_object_id !== contentObjectId || revision.role !== 'user')) || links.length > 1) {
         throw new Error('Frozen current Turn input reference conflicts with durable Message facts.');
+      }
+      if (!revision || links.length !== 1) {
+        await this.assertCopiedCurrentTurnInput(expectedTurnId, messageRevisionId, contentObjectId);
       }
       currentTurnInput = {
         messageId,
@@ -2797,6 +2799,46 @@ export class ModelProviderControlPlane {
       ...(currentTurnInput ? { currentTurnInput } : {}),
       ...(turnReminder ? { turnReminder } : {})
     } };
+  }
+
+  /** Copied recipes keep original input ids. Shared immutable segment provenance proves the
+   * target Turn's exact copied revision even after its source Message and Conversation are gone.
+   * Read neither a current revision nor a same-content substitute: revision ordinal, segment and
+   * CAS identity must all agree. Every lookup is bounded by an existing identity index.
+   */
+  private async assertCopiedCurrentTurnInput(turnId: string, originalRevisionId: string, contentObjectId: string): Promise<void> {
+    const evidence = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('MessageTurnLink').list({ where: { turn_id: turnId, role: 'input' }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+        where: { source_kind: 'message_revision', source_id: originalRevisionId }, limit: 2
+      })
+    ]);
+    const links = rows(evidence.snapshot[0]);
+    const originals = rows(evidence.snapshot[1]);
+    if (links.length !== 1 || originals.length !== 1) {
+      throw new Error('Frozen current Turn input has no unique copied Message provenance.');
+    }
+    const original = originals[0];
+    const source = await this.database.snapshot([
+      DOMAIN_REPOSITORIES.domain('MessageRevision').list({ where: {
+        message_id: requireId(links[0].message_id, 'Copied input MessageTurnLink.message_id'),
+        revision_seq: original.source_revision
+      }, limit: 2 }),
+      DOMAIN_REPOSITORIES.domain('ContextSegment').get(requireId(original.segment_id, 'Frozen input ContextSegmentSource.segment_id'))
+    ]);
+    const copies = rows(source.snapshot[0]);
+    const segment = requireRow(source.snapshot[1], 'Frozen input ContextSegment');
+    if (copies.length !== 1 || copies[0].role !== 'user' || copies[0].content_object_id !== contentObjectId
+      || segment.segment_kind !== 'message' || segment.content_object_id !== contentObjectId) {
+      throw new Error('Frozen current Turn input conflicts with its copied revision or immutable segment.');
+    }
+    const copiedSources = rows((await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ContextSegmentSource').list({
+      where: { source_kind: 'message_revision', source_id: requireId(copies[0].id, 'Copied input MessageRevision.id'),
+        source_revision: original.source_revision }, limit: 2
+    })])).snapshot[0]);
+    if (copiedSources.length !== 1 || copiedSources[0].segment_id !== original.segment_id) {
+      throw new Error('Frozen current Turn input does not share its copied revision provenance.');
+    }
   }
 
   /**
