@@ -714,7 +714,8 @@ export function projectToolResultBatch(
 
 function* projectToolResultBatchWork(
   inputs: readonly ToolResultProjectionInput[],
-  options: { perResultTokens?: number; batchTokens?: number; skillResultTokens?: number } = {}
+  options: { perResultTokens?: number; batchTokens?: number; skillResultTokens?: number } = {},
+  ownedResponseIndexes?: ReadonlySet<number>
 ): ModelProjectionWork<ToolResultBatchProjection> {
   const perResultTokens = positiveTokenCount(options.perResultTokens ?? TOOL_RESULT_MAX_TOKENS, 'perResultTokens');
   const batchTokens = positiveTokenCount(options.batchTokens ?? TOOL_RESULT_BATCH_MAX_TOKENS, 'batchTokens');
@@ -740,7 +741,10 @@ function* projectToolResultBatchWork(
   }
   const shared = inputs.flatMap((input, index) => dedicated[index] ? [] : [{ input, index }]);
   const prepared: PreparedToolResult[] = [];
-  for (const { input, index } of shared) { yield; prepared.push(prepareToolResult(input, index, perResultTokens)); }
+  for (const { input, index } of shared) {
+    yield;
+    prepared.push(prepareToolResult(input, index, perResultTokens, undefined, ownedResponseIndexes?.has(index) === true));
+  }
   const mandatoryTokens = safeSum(prepared.map((item) => item.baseTokens));
   const remaining = Math.max(0, batchTokens - mandatoryTokens);
   const allocations = allocateToolResultPreviewTokens(prepared, remaining);
@@ -1335,7 +1339,13 @@ function* projectOrdinaryModelWindowWork(
   mediaState: ManagedMediaBodyProjectionState
 ): ModelProjectionWork<Omit<ModelWindowProjection, 'tokenCount' | 'mediaTokens'>> {
   const projected: MessageContent[] = [];
-  for (const content of contents) { yield; projected.push(cloneMessageContent(content)); }
+  const ownedResponseContents = new Set<number>();
+  for (const content of contents) {
+    yield;
+    const ownership = { plainData: true };
+    projected.push(cloneJsonValue(content, new WeakMap<object, unknown>(), ownership) as MessageContent);
+    if (ownership.plainData) ownedResponseContents.add(projected.length - 1);
+  }
   const batches: ToolResultBatchProjection[] = [];
   for (const group of groupAtomicMessageContentRanges(projected)) {
     yield;
@@ -1352,7 +1362,7 @@ function* projectOrdinaryModelWindowWork(
       ...(part.id ? { callId: part.id } : {}),
       response: part.functionResponse.response,
       priority: toolResultPriority(part.functionResponse.response)
-    })));
+    })), {}, new Set(refs.flatMap((ref, index) => ownedResponseContents.has(ref.contentIndex) ? [index] : [])));
     batches.push(batch);
     refs.forEach((ref, index) => {
       const original = ref.part;
@@ -1862,6 +1872,8 @@ interface ToolResultTokenMeasurement {
 
 interface PreparedToolResult {
   input: ToolResultProjectionInput;
+  /** Private ordinary projection owns this detached plain-data response until emission. */
+  ownsResponse: boolean;
   measurement: ToolResultTokenMeasurement;
   /** Only non-plain inputs need their canonical text before the final allocation. */
   serialized?: string;
@@ -1879,7 +1891,8 @@ function prepareToolResult(
   rawInput: ToolResultProjectionInput,
   index: number,
   perResultTokens: number,
-  retainedMeasurement?: ToolResultTokenMeasurement
+  retainedMeasurement?: ToolResultTokenMeasurement,
+  ownsResponse = false
 ): PreparedToolResult {
   const input: ToolResultProjectionInput = {
     ...rawInput,
@@ -1901,6 +1914,7 @@ function prepareToolResult(
   const targetTokens = Math.min(originalTokens, Math.max(perResultTokens, baseTokens));
   return {
     input,
+    ownsResponse,
     measurement: { tokens: originalTokens, ...(measurement ? {
       json: { characters: measurement.characters, plainJson: measurement.plainJson }
     } : {}) },
@@ -1921,14 +1935,17 @@ function projectPreparedToolResult(item: PreparedToolResult, target: number): To
   const preview = exact ? undefined : item.readView
     ? boundedReadPreview(item.readView, target)
     : { response: boundedPreviewEnvelope(item, target) };
-  const response = preview ? preview.response : cloneJsonValue(item.input.response);
+  // For an exact owned result, transfer the same value that was measured. The final media
+  // projection clones emitted contents, preserving separation from returned batch metadata.
+  const response = preview ? preview.response : item.ownsResponse
+    ? item.input.response : cloneJsonValue(item.input.response);
   return {
     toolName: item.input.toolName,
     ...(item.input.callId ? { callId: item.input.callId } : {}),
     ...(item.input.resultId ? { resultId: item.input.resultId } : {}),
     response,
     originalTokens: item.originalTokens,
-    projectedTokens: estimateJsonTokens(response),
+    projectedTokens: exact && item.ownsResponse ? item.originalTokens : estimateJsonTokens(response),
     allocatedTokens: target,
     truncated: !exact,
     ...(preview?.reread ? { reread: preview.reread } : {})
@@ -2358,24 +2375,37 @@ function cloneAtomicGroup<T>(group: AtomicContextGroup<T>): AtomicContextGroup<T
   return { ...group, items: [...group.items] };
 }
 
+interface ClonedContentOwnership { plainData: boolean }
+
 function cloneMessageContent(content: MessageContent): MessageContent {
   return cloneJsonValue(content) as MessageContent;
 }
 
-function cloneJsonValue(value: unknown, seen = new WeakMap<object, unknown>()): unknown {
-  if (value === null || typeof value !== 'object') return value;
+function cloneJsonValue(
+  value: unknown, seen = new WeakMap<object, unknown>(), ownership?: ClonedContentOwnership
+): unknown {
+  if (value === null || typeof value !== 'object') {
+    if (ownership && value !== null && typeof value !== 'string' && typeof value !== 'boolean'
+      && !(typeof value === 'number' && Number.isFinite(value))) ownership.plainData = false;
+    return value;
+  }
   const existing = seen.get(value as object);
-  if (existing !== undefined) return existing;
+  if (existing !== undefined) {
+    if (ownership) ownership.plainData = false;
+    return existing;
+  }
   if (Array.isArray(value)) {
     const result: unknown[] = [];
     seen.set(value, result);
-    for (const entry of value) result.push(cloneJsonValue(entry, seen));
+    for (const entry of value) result.push(cloneJsonValue(entry, seen, ownership));
     return result;
   }
   const result: Record<string, unknown> = {};
   seen.set(value as object, result);
   for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
-    result[key] = cloneJsonValue(nested, seen);
+    // Record safety during the copy already required for caller isolation, without another walk.
+    if (ownership && (key === '__proto__' || key === 'toJSON')) ownership.plainData = false;
+    result[key] = cloneJsonValue(nested, seen, ownership);
   }
   return result;
 }
