@@ -349,7 +349,7 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
         await nextTick();
         return page;
       };
-      assert.equal(requests().length, 1, 'bootstrap is only one bounded read, not an automatic scan loop');
+      assert.equal(requests().length, 1, 'bootstrap starts with one bounded exchange read');
       const initialPage = await answer(requests()[0]);
       assert.equal(initialPage.scanProgress, true);
       assert.deepEqual(initialPage.nextCursor, { kind: 'message' });
@@ -361,12 +361,14 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
         return { html: await renderToString(app), setup };
       };
       let view = await mount();
-      assert.match(view.html, /继续查找更早协作记录/);
+      assert.match(view.html, /正在加载更早协作记录/);
+      assert.equal(requests().length, 2, 'bootstrap crosses an empty exchange lane automatically');
       view.setup.showEarlierCollaboration();
-      assert.equal(requests().length, 2, 'leaving an empty exchange lane still requires an explicit continue');
+      assert.equal(requests().length, 2, 'the automatic lane transition remains single-flight');
       const firstPage = await answer(requests()[1]);
       assert.deepEqual(firstPage.records.CollaborationMessage.map((message) => message.id), ['own-new']);
       assert.equal(firstPage.nextCursor.kind, 'message');
+      assert.equal(requests().length, 2, 'a same-lane scan cursor ends the bounded bootstrap');
       let lastSeq = BigInt(firstPage.nextCursor.beforeMessageSeq);
       view = await mount();
       for (let click = 0; click < 2; click += 1) {
@@ -407,6 +409,34 @@ test('100k foreign envelopes advance across empty pages to all 201 sparse own me
       assert.ok(view.setup.collaborationTimeline.unlocated.length <= 3, 'Turn-less cards below the messages stay bounded');
       assert.equal(view.setup.messages.length, 0);
       assert.doesNotMatch(view.html, /继续查找更早协作记录/);
+
+      // The fresh-chat wire sequence has three empty sources. Reuse this SSR/store fixture to
+      // verify it settles without user clicks; do not turn sparse same-lane scans into a loop.
+      client.$reset();
+      client.sessionId = 'empty-session';
+      client.projections.activeConversationWindow = { conversationId: 'empty' };
+      client.synchronizeCollaborationHistoryScope('empty');
+      const beforeEmptyBootstrap = requests().length;
+      assert.equal(client.requestEarlierCollaborationHistory('empty', true), true);
+      for (let lane = 0; lane < 3; lane += 1) {
+        assert.equal(requests().length, beforeEmptyBootstrap + lane + 1);
+        const request = requests().at(-1);
+        assert.equal(request.cursor?.kind ?? 'exchange', ['exchange', 'message', 'answer'][lane]);
+        const hasMore = lane < 2;
+        client.observe({ type: 'reliable-kernel.collaboration-history-result', requestId: request.requestId,
+          sessionId: request.sessionId, conversationId: request.conversationId, page: {
+            records: {}, hasMore, scanProgress: hasMore, scannedRows: 0, responseBytes: 0,
+            ...(hasMore ? { nextCursor: { kind: lane === 0 ? 'message' : 'answer' } } : {})
+          } });
+        await nextTick();
+      }
+      assert.equal(requests().length, beforeEmptyBootstrap + 3, 'bootstrap reads at most the three fixed lanes');
+      assert.equal(client.collaborationHistoryHasMore, false);
+      assert.equal(client.collaborationHistoryLoading, false);
+      assert.equal(client.collaborationHistoryLoadedPages, 3);
+      view = await mount();
+      assert.match(view.html, /还没有消息，发一条试试。/);
+      assert.doesNotMatch(view.html, /继续查找更早协作记录|本页未找到协作记录/);
     } finally {
       live?.close();
       pinia.setActivePinia(previousPinia);
@@ -754,12 +784,10 @@ test('Vue SSR merges collaboration pages with ACKed live facts, fences old sessi
       assert.equal(posted[1]?.type, 'reliable-kernel.collaboration-history-request');
       await Promise.all(pending);
       await nextTick();
-      assert.equal(client.collaborationHistoryHasMore, true);
-      assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage ?? {}).length, 0);
-      assert.deepEqual(client.collaborationHistoryNextCursor, { kind: 'message' });
-      assert.equal(client.requestEarlierCollaborationHistory('target'), true);
+      assert.equal(pending.length, 2, 'only the next fixed lane is read automatically');
       await Promise.all(pending);
       await nextTick();
+      assert.equal(client.collaborationHistoryHasMore, true);
       assert.equal(Object.keys(client.collaborationHistoryRecords.CollaborationMessage ?? {}).length, 200,
         `collaboration page rejected: ${client.collaborationHistoryError ?? 'no error'}; scope=${client.collaborationHistoryConversationId}; id=${client.collaborationHistoryRequestId}`);
       assert.equal(client.requestEarlierCollaborationHistory('target'), true);

@@ -198,6 +198,7 @@ interface ReliableKernelFeedStoreState extends ReliableKernelBoundedClientState 
   collaborationHistoryError: string | null;
   collaborationHistoryRequestId: string | null;
   collaborationHistoryRequestPeerGeneration: number | null;
+  collaborationHistoryRequestIsBootstrap: boolean;
   collaborationHistoryLoadedPages: number;
   /**
    * Conversations this view saw removed by a committed change. A peer merely missing from the
@@ -268,6 +269,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
     collaborationHistoryError: null,
     collaborationHistoryRequestId: null,
     collaborationHistoryRequestPeerGeneration: null,
+    collaborationHistoryRequestIsBootstrap: false,
     collaborationHistoryLoadedPages: 0,
     removedConversationIds: []
   }),
@@ -495,7 +497,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       if (result.ack && nextConversationId && this.collaborationHistoryLoadedPages === 0
         && !this.collaborationHistoryLoading && !this.collaborationHistoryError) {
         // Always bootstrap: a Conversation with no ordinary Message can still have older cards.
-        this.requestEarlierCollaborationHistory(nextConversationId);
+        this.requestEarlierCollaborationHistory(nextConversationId, true);
       }
       for (const detail of replayDetails) {
         if (detail.mode === 'refresh') {
@@ -542,7 +544,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       }
     },
 
-    requestEarlierCollaborationHistory(conversationId: string): boolean {
+    requestEarlierCollaborationHistory(conversationId: string, bootstrap = false): boolean {
       const normalized = conversationId.trim();
       const sessionId = this.sessionId;
       if (!normalized || !sessionId || activeConversationId(this.projections) !== normalized
@@ -558,12 +560,14 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.collaborationHistoryError = null;
       this.collaborationHistoryRequestId = requestId;
       this.collaborationHistoryRequestPeerGeneration = this.peerStateGeneration;
+      this.collaborationHistoryRequestIsBootstrap = bootstrap;
       const timeout = setTimeout(() => {
         collaborationHistoryTimeouts.delete(requestId);
         if (this.collaborationHistoryRequestId !== requestId || this.sessionId !== sessionId
           || this.collaborationHistoryConversationId !== normalized) return;
         this.collaborationHistoryLoading = false;
         this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryRequestIsBootstrap = false;
         this.collaborationHistoryError = '协作历史请求超时，请重试。';
       }, COLLABORATION_HISTORY_REQUEST_DEADLINE_MS);
       // Node SSR regressions must not keep the process alive for an unanswered optional read.
@@ -580,6 +584,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         clearCollaborationHistoryTimeout(requestId);
         this.collaborationHistoryLoading = false;
         this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryRequestIsBootstrap = false;
         this.collaborationHistoryError = error instanceof Error ? error.message : '请求更早协作历史失败。';
         return false;
       }
@@ -595,6 +600,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         clearCollaborationHistoryTimeout(message.requestId);
         this.collaborationHistoryLoading = false;
         this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryRequestIsBootstrap = false;
         this.collaborationHistoryError = '协作历史分页游标或记录格式无效。';
         return;
       }
@@ -611,9 +617,21 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         clearCollaborationHistoryTimeout(message.requestId);
         this.collaborationHistoryLoading = false;
         this.collaborationHistoryRequestId = null;
+        this.collaborationHistoryRequestIsBootstrap = false;
         this.collaborationHistoryError = error instanceof Error ? error.message : '协作历史页面格式无效。';
         return;
       }
+      // Bootstrap can cross the three fixed sources, but never scan another window in a lane.
+      // Empty transcripts may still have collaboration cards; only a terminal page proves absence.
+      const cursor = this.collaborationHistoryNextCursor;
+      const nextCursor = message.page.nextCursor;
+      const continueBootstrap = this.collaborationHistoryRequestIsBootstrap
+        && this.collaborationHistoryLoadedPages < 2
+        && message.page.hasMore
+        && Object.values(message.page.records).every((rows) => rows.length === 0)
+        && ((!cursor && nextCursor?.kind === 'message' && nextCursor.beforeMessageSeq === undefined)
+          || (cursor?.kind === 'message' && cursor.beforeMessageSeq === undefined
+            && nextCursor?.kind === 'answer' && nextCursor.beforeCreatedAt === undefined));
       clearCollaborationHistoryTimeout(message.requestId);
       this.collaborationHistoryNextCursor = message.page.nextCursor ?? null;
       this.collaborationHistoryHasMore = message.page.hasMore;
@@ -621,7 +639,9 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.collaborationHistoryLoading = false;
       this.collaborationHistoryError = null;
       this.collaborationHistoryRequestId = null;
+      this.collaborationHistoryRequestIsBootstrap = false;
       this.collaborationHistoryLoadedPages += 1;
+      if (continueBootstrap) this.requestEarlierCollaborationHistory(message.conversationId, true);
     },
 
     observeCollaborationHistoryError(message: ReliableKernelCollaborationHistoryErrorMessage): void {
@@ -631,6 +651,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       clearCollaborationHistoryTimeout(message.requestId);
       this.collaborationHistoryLoading = false;
       this.collaborationHistoryRequestId = null;
+      this.collaborationHistoryRequestIsBootstrap = false;
       this.collaborationHistoryError = message.message.trim() || '读取协作历史失败。';
     },
 
@@ -641,6 +662,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.historyRequestId = null;
       this.collaborationHistoryLoading = false;
       this.collaborationHistoryRequestId = null;
+      this.collaborationHistoryRequestIsBootstrap = false;
     },
 
     requestEarlierHistory(conversationId: string): boolean {
@@ -2055,6 +2077,7 @@ function resetCollaborationHistoryState(
   state.collaborationHistoryError = null;
   state.collaborationHistoryRequestId = null;
   state.collaborationHistoryRequestPeerGeneration = null;
+  state.collaborationHistoryRequestIsBootstrap = false;
   state.collaborationHistoryLoadedPages = 0;
 }
 
