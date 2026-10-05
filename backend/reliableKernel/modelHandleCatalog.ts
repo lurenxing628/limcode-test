@@ -1,5 +1,6 @@
 import { SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME } from '../../shared/protocol';
 import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
+import { createModelHandleTextProjection } from './modelHandleTextProjection';
 
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
   | 'conversation' | 'collaborationMessage' | 'conversationMessage' | 'boardChannel' | 'boardThread' | 'boardPost';
@@ -60,6 +61,7 @@ interface ModelHandleLookup {
   readonly byTarget: ReadonlyMap<string, Readonly<ModelHandleEntry>>;
   readonly byRef: ReadonlyMap<string, Readonly<ModelHandleEntry>>;
   readonly retiredRefs: ReadonlySet<string>;
+  projectText?: (value: string) => string;
 }
 
 // Only privately created, deeply frozen snapshots are keys. Never cache arbitrary caller objects:
@@ -115,7 +117,6 @@ const HANDLE_PREFIX: Record<ModelHandleKind, string> = {
 const compareModelHandleRefs = new Intl.Collator(undefined, { numeric: true }).compare;
 
 const HANDLE_PATTERN = /^(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*$/;
-const HANDLE_TOKEN_PATTERN = /\b(?:F|P|O|A|W|C|M|R|H|T|B)[1-9]\d*\b/g;
 const WORK_ENVIRONMENT_PATTERN = /\bwork-env-[a-zA-Z0-9._-]+\b/g;
 const MAX_NESTED_JSON_CHARS = 16 * 1024 * 1024;
 
@@ -694,58 +695,10 @@ function projectKnownValue(value: unknown, catalog: PreparedModelHandleCatalog):
 }
 
 function projectKnownText(value: string, catalog: PreparedModelHandleCatalog): string {
-  // A tool result can claim any code, including the kernel's invalid-model-reference code. Never
-  // exempt its "error" text from projection. Instead, avoid replacing only *part* of an already
-  // written short reference: target "999" must not turn a rejected P999 into an apparent PC1.
-  const references = Array.from(value.matchAll(HANDLE_TOKEN_PATTERN), (match) => ({
-    start: match.index,
-    end: match.index + match[0].length
-  }));
-  let projected = '';
-  let offset = 0;
-  // Keep each next match in the original text; rescanning a large result for every replacement
-  // would make a result with many IDs quadratic in its text length.
-  const nextIndexes = catalog.entries.map((entry) => value.indexOf(entry.target));
-  while (offset < value.length) {
-    let nextIndex = value.length;
-    let nextEntry: ModelHandleEntry | undefined;
-    for (let candidate = 0; candidate < catalog.entries.length; candidate += 1) {
-      const entry = catalog.entries[candidate];
-      let index = nextIndexes[candidate];
-      if (index >= 0 && index < offset) index = value.indexOf(entry.target, offset);
-      while (index >= 0 && overlapsPartOfHandleToken(index, index + entry.target.length, references)) {
-        index = value.indexOf(entry.target, index + 1);
-      }
-      nextIndexes[candidate] = index;
-      if (index >= 0 && (index < nextIndex
-        || (index === nextIndex && entry.target.length > (nextEntry?.target.length ?? 0)))) {
-        nextIndex = index;
-        nextEntry = entry;
-      }
-    }
-    if (!nextEntry) break;
-    projected += value.slice(offset, nextIndex) + nextEntry.ref;
-    offset = nextIndex + nextEntry.target.length;
-  }
-  return projected + value.slice(offset);
-}
-
-function overlapsPartOfHandleToken(
-  start: number,
-  end: number,
-  references: readonly { start: number; end: number }[]
-): boolean {
-  let low = 0;
-  let high = references.length;
-  while (low < high) {
-    const middle = Math.floor((low + high) / 2);
-    if (references[middle].end <= start) low = middle + 1;
-    else high = middle;
-  }
-  for (let index = low; index < references.length && references[index].start < end; index += 1) {
-    if (start > references[index].start || end < references[index].end) return true;
-  }
-  return false;
+  if (!value.length || !catalog.entries.length) return value;
+  const lookup = preparedModelHandleLookups.get(catalog)!;
+  lookup.projectText ??= createModelHandleTextProjection(catalog.entries);
+  return lookup.projectText(value);
 }
 
 function collectCandidates(
