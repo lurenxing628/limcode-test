@@ -1,10 +1,6 @@
-import { createHash, randomUUID } from 'node:crypto';
-import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import type { RootBinding } from './contracts';
-import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
-import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import {
   DOMAIN_REPOSITORIES,
   type DomainRow,
@@ -13,13 +9,18 @@ import {
 import { RootAuthority, RootAuthorityError, sameBindingIdentity } from './rootAuthority';
 import { isExecutionHandoffError } from './executionLeaseFence';
 import { RuntimeDatabase } from './runtimeDatabase';
-import { VerifiedContentRanges } from './verifiedContentRanges';
+import { storageKeyForDigest } from './casObjectAccess';
+import { LocalCasByteAccess, looseCasObjectLocation } from './looseCasObjectAccess';
+import { publishLooseCasObject } from './looseCasObjectPublication';
+
+export { storageKeyForDigest } from './casObjectAccess';
 
 export interface PublishedContent {
   contentType: string;
   sha256: string;
   byteLength: bigint;
   storageKey: string;
+  /** Physical hint of this loose publisher only; readers use logical CAS access. */
   absolutePath: string;
 }
 
@@ -95,10 +96,10 @@ const VERIFIED_READ_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const VERIFIED_READ_CACHE_MAX_SINGLE_BYTES = 64 * 1024 * 1024;
 
 export class ContentAddressedStore {
-  private readonly verifiedRanges = new VerifiedContentRanges();
+  private readonly byteAccess: LocalCasByteAccess;
 
-  public inspectRangeReadCache(): ReturnType<VerifiedContentRanges['inspect']> {
-    return this.verifiedRanges.inspect();
+  public inspectRangeReadCache(): ReturnType<LocalCasByteAccess['inspectRanges']> {
+    return this.byteAccess.inspectRanges();
   }
 
   /** Only fully length/digest-verified immutable bytes enter this cache. Callers receive copies. */
@@ -113,7 +114,9 @@ export class ContentAddressedStore {
     private readonly authority: RootAuthority,
     public readonly binding: RootBinding,
     private readonly observeMetric?: ContentAddressedStoreMetricObserver
-  ) {}
+  ) {
+    this.byteAccess = new LocalCasByteAccess(binding.paths.casRootPath);
+  }
 
   public identity(content: Uint8Array | string, contentType: string): ContentObjectIdentity {
     const { published } = identifyContent(this.binding, content, contentType);
@@ -137,43 +140,12 @@ export class ContentAddressedStore {
     await this.authority.validate(this.binding);
     this.recordMetric('publish');
     const { bytes, published } = content;
-    const { sha256, absolutePath } = published;
-    const casRoot = this.binding.paths.casRootPath;
-    const temporaryRoot = path.join(casRoot, 'tmp');
-    const digestRoot = path.join(casRoot, 'sha256');
-    const digestPrefix = path.dirname(absolutePath);
-    const recordDirectoryFsync = () => {
-      this.recordMetric('directory-fsync');
-      if (directoryFsyncs) directoryFsyncs.count += 1;
-    };
-    await ensureDurableChildDirectory(casRoot, temporaryRoot, recordDirectoryFsync);
-    await ensureDurableChildDirectory(casRoot, digestRoot, recordDirectoryFsync);
-    await ensureDurableChildDirectory(digestRoot, digestPrefix, recordDirectoryFsync);
-    const temporaryPath = path.join(temporaryRoot, `${process.pid}-${randomUUID()}.tmp`);
-    const handle = await fs.open(temporaryPath, 'wx', 0o600);
-    try {
-      await handle.writeFile(bytes);
-      this.recordMetric('temp-write');
-      await handle.sync();
-      this.recordMetric('file-fsync');
-    } finally {
-      await handle.close();
-    }
-
-    try {
-      try {
-        await fs.link(temporaryPath, absolutePath);
-      } catch (error) {
-        if (!isAlreadyExists(error)) throw error;
-        await assertExistingObject(absolutePath, sha256, BigInt(bytes.length));
-      }
-      // Both the publisher and an EEXIST observer must durably publish the directory entry before
-      // either is allowed to commit a SQLite reference.
-      await syncDirectory(digestPrefix, recordDirectoryFsync);
-    } finally {
-      await fs.rm(temporaryPath, { force: true });
-      await syncDirectory(temporaryRoot, recordDirectoryFsync);
-    }
+    await publishLooseCasObject(this.binding.paths.casRootPath, bytes, {
+      sha256: published.sha256, byte_length: published.byteLength, storage_key: published.storageKey
+    }, (metric) => {
+      this.recordMetric(metric);
+      if (metric === 'directory-fsync' && directoryFsyncs) directoryFsyncs.count += 1;
+    });
 
     return published;
   }
@@ -314,10 +286,7 @@ export class ContentAddressedStore {
     const length = Math.min(maxBytes, totalBytes - offset);
     // Stream-verify once per unchanged file identity, then read only the requested range. This
     // remains bounded for oversized objects and interleaved readers that exceed the byte cache.
-    const chunk = await this.verifiedRanges.read(
-      path.resolve(this.binding.paths.casRootPath), absoluteCasPath(this.binding, expectedKey),
-      metadata.sha256, metadata.byte_length, offset, length
-    );
+    const chunk = await this.byteAccess.readRange(metadata, offset, length);
     await this.authority.validate(this.binding);
     const nextOffset = offset + length;
     const hasMore = nextOffset < totalBytes;
@@ -420,7 +389,7 @@ export class ContentAddressedStore {
 
     this.verifiedReadCacheMisses += 1;
     const identity = verifiedContentIdentity(metadata);
-    const promise = readPublishedObject(this.binding, metadata)
+    const promise = this.byteAccess.readBytes(metadata)
       .then((bytes) => {
         this.rememberVerifiedRead({ ...identity, bytes });
         return bytes;
@@ -468,11 +437,6 @@ export class ContentAddressedStore {
       // Development metrics must never alter CAS correctness or availability.
     }
   }
-}
-
-export function storageKeyForDigest(sha256: string): string {
-  if (!/^[a-f0-9]{64}$/.test(sha256)) throw new TypeError('CAS digest must be lowercase SHA-256.');
-  return `sha256/${sha256.slice(0, 2)}/${sha256}`;
 }
 
 function contentObjectId(content: PublishedContent): string {
@@ -530,7 +494,9 @@ function identifyContent(
       sha256,
       byteLength: BigInt(bytes.length),
       storageKey,
-      absolutePath: absoluteCasPath(binding, storageKey)
+      absolutePath: looseCasObjectLocation(binding.paths.casRootPath, {
+        sha256, byte_length: BigInt(bytes.length), storage_key: storageKey
+      }).absolutePath
     }
   };
 }
@@ -547,13 +513,6 @@ function requireMatchingContentObject(row: DomainRow, expected: PublishedContent
     throw new Error('Existing ContentObject does not match the requested content identity.');
   }
   return metadata;
-}
-
-function absoluteCasPath(binding: RootBinding, storageKey: string): string {
-  const root = path.resolve(binding.paths.casRootPath);
-  const candidate = path.resolve(root, ...storageKey.split('/'));
-  if (!isPathBelow(root, candidate)) throw new Error('CAS storage key escapes its active root.');
-  return candidate;
 }
 
 function verifiedContentIdentity(
@@ -583,50 +542,6 @@ function assertSameVerifiedContentIdentity(
   }
 }
 
-function validatePublishedBytes(metadata: ContentObjectMetadata, bytes: Buffer): Buffer {
-  if (BigInt(bytes.length) !== metadata.byte_length) throw new Error('CAS object byte length mismatch.');
-  if (createHash('sha256').update(bytes).digest('hex') !== metadata.sha256) throw new Error('CAS object digest mismatch.');
-  return bytes;
-}
-
-async function readPublishedObject(binding: RootBinding, metadata: ContentObjectMetadata): Promise<Buffer> {
-  const expectedKey = storageKeyForDigest(metadata.sha256);
-  if (metadata.storage_key !== expectedKey) throw new Error('ContentObject storage key does not match sha256.');
-  const filePath = absoluteCasPath(binding, expectedKey);
-  return validatePublishedBytes(metadata, await fs.readFile(filePath));
-}
-
-async function assertExistingObject(filePath: string, digest: string, byteLength: bigint): Promise<void> {
-  const stat = await fs.stat(filePath);
-  if (!stat.isFile() || BigInt(stat.size) !== byteLength) throw new Error('Existing CAS object has the wrong length.');
-  const bytes = await fs.readFile(filePath);
-  if (createHash('sha256').update(bytes).digest('hex') !== digest) throw new Error('Existing CAS object has the wrong digest.');
-}
-
-async function ensureDurableChildDirectory(
-  parentPath: string,
-  childPath: string,
-  onFsync: () => void
-): Promise<void> {
-  if (path.dirname(childPath) !== parentPath) {
-    throw new Error(`CAS durable directory ${childPath} is not a direct child of ${parentPath}.`);
-  }
-  try {
-    await fs.mkdir(childPath);
-  } catch (error) {
-    if (!isAlreadyExists(error)) throw error;
-    const stat = await fs.stat(childPath);
-    if (!stat.isDirectory()) throw new Error(`CAS path ${childPath} exists but is not a directory.`);
-  }
-  // Sync both sides even after EEXIST: a competing creator may not yet have synced the parent.
-  await syncDirectory(childPath, onFsync);
-  await syncDirectory(parentPath, onFsync);
-}
-
-async function syncDirectory(directoryPath: string, onFsync: () => void): Promise<void> {
-  await syncDirectoryDurably(directoryPath, onFsync);
-}
-
 function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {
   return row as ContentObjectMetadata;
 }
@@ -634,8 +549,4 @@ function asContentObjectMetadata(row: DomainRow): ContentObjectMetadata {
 function requireContentType(value: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError('CAS contentType must be non-empty.');
   return value.trim();
-}
-
-function isAlreadyExists(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException)?.code === 'EEXIST';
 }

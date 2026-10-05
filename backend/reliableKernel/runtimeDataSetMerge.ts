@@ -1,6 +1,6 @@
 import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, createReadStream, lstatSync, type BigIntStats } from 'node:fs';
+import { constants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -8,7 +8,8 @@ import { isDeepStrictEqual } from 'node:util';
 import Database from 'better-sqlite3';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
-import { storageKeyForDigest } from './contentAddressedStore';
+import { requireCasObjectIdentity } from './casObjectAccess';
+import { casTransferCanLinkRoots, CasTransferError, LocalCasTransferSession, type CasTransferSource } from './runtimeCasTransfer';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding, type RuntimeRootPaths } from './contracts';
 import { assertCurrentSchema } from './databaseSchema';
 import {
@@ -44,7 +45,7 @@ import {
 } from './runtimeDataSetMergeLedger';
 import { runtimeDataSetFileState, runtimeDataSetFileStateBytes } from './runtimeDataSetFacts';
 import {
-  knownDiskDevice, largeMergeDiskDevice, largeMergeDiskNeeds, largeMergeSessionSpace, sqliteTemporaryDirectory, type LargeMergeDiskNeed,
+  largeMergeDiskDevice, largeMergeDiskNeeds, largeMergeSessionSpace, sqliteTemporaryDirectory, type LargeMergeDiskNeed,
   type LargeMergeSessionSpaceFacts
 } from './runtimeDataSetLargeMergeSpace';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
@@ -447,13 +448,8 @@ export interface ForeignHistoricalMergeCandidate {
 /** A merge source: a local data set of this configuration root, or a foreign history root read in place. */
 export type HistoricalMergeCandidate = VscodeRuntimeDataSetCandidate | ForeignHistoricalMergeCandidate;
 
-/** Content objects of a source that must be read without following any link (a foreign history root). */
-export interface HistoricalMergeSourceObjects {
-  /** Size of the object file when it is a regular file; undefined when it is absent or anything else. */
-  size(file: string): Promise<bigint | undefined>;
-  /** Its descriptor, opened read only as that same regular file (never a link, a FIFO or a held database file). */
-  open(file: string): Promise<fs.FileHandle>;
-}
+/** Logical copy-only objects of a foreign history root, opened under its existing safety policy. */
+export type HistoricalMergeSourceObjects = CasTransferSource;
 
 /**
  * The claim on one foreign history root that its merge holds from its start (or its large-merge
@@ -2534,9 +2530,7 @@ async function withSessionSpace(
     if (!(error instanceof Outcome) || !error.outcome.awaiting || !facts) throw error;
     let linked = false;
     if (!isForeignCandidate(candidate)) {
-      const [source, into] = await Promise.all([binding.paths.casRootPath, target.binding.paths.casRootPath]
-        .map((directory) => fs.stat(directory).then((info) => knownDiskDevice(info.dev), () => undefined)));
-      linked = source !== undefined && source === into;
+      linked = await casTransferCanLinkRoots(binding.paths.casRootPath, target.binding.paths.casRootPath);
     }
     error.outcome.space = { databaseBytes: facts.databaseBytes, casCopyBytes: linked ? 0 : facts.casBytes };
     throw error;
@@ -2682,9 +2676,7 @@ async function takeVerifiedSnapshot(
 export type RuntimeDataSetCasVerification = Map<string, string>;
 /** A Map, or the persistent cache of historical merges (see RuntimeCasVerifier). */
 type CasVerification = RuntimeCasVerifier;
-/** Suffix of a private temporary copy under the target CAS `tmp/` directory. */
-export const RUNTIME_DATA_SET_CAS_COPY_SUFFIX = '.merge.tmp';
-const CAS_COPY_SUFFIX = RUNTIME_DATA_SET_CAS_COPY_SUFFIX;
+export { RUNTIME_DATA_SET_CAS_COPY_SUFFIX } from './runtimeCasTransfer';
 
 async function transferSourceCas(
   candidate: HistoricalMergeCandidate,
@@ -3472,14 +3464,12 @@ async function transferCas(
     SELECT rowid AS position, storage_key, sha256, byte_length FROM content_object
      WHERE rowid > ? ORDER BY rowid LIMIT ${READ_CHUNK}
   `);
-  const objects = options.sourceObjects;
-  if (objects && !options.verifyOnly) await assertRoomForObjects(page, targetCas, options.freeSpace ?? freeSpace);
+  const transfer = new LocalCasTransferSession(sourceCas, targetCas, { ...options, verified });
+  if (options.sourceObjects && !options.verifyOnly) {
+    await assertRoomForObjects(page, targetCas, transfer, options.freeSpace ?? freeSpace);
+  }
   // Per storage key its length, in a TEMP table of the source's connection (on disk): nothing per object on this thread.
   const lengths = new HandledStorageKeys(source);
-  const touchedDirectories = new Set<string>();
-  const temporaryRoot = path.join(targetCas, 'tmp');
-  let temporaryUsed = false;
-  const link = options.linkFile ?? ((from: string, to: string) => fs.link(from, to));
   try {
     for (let after = 0n; ;) {
       const rows = page.all(after) as Array<{ position: bigint; storage_key: string; sha256: string; byte_length: bigint }>;
@@ -3488,96 +3478,30 @@ async function transferCas(
       for (const row of rows) {
         options.signal?.throwIfAborted();
         const known = lengths.length(row.storage_key);
-        if (storageKeyForDigest(row.sha256) !== row.storage_key || (known !== undefined && known !== row.byte_length)) {
+        let object;
+        try { object = requireCasObjectIdentity(row); }
+        catch {
+          throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源的正文登记不一致：${row.storage_key}。` });
+        }
+        if (known !== undefined && known !== row.byte_length) {
           throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源的正文登记不一致：${row.storage_key}。` });
         }
         if (known !== undefined) continue;
         lengths.add(row.storage_key, row.byte_length);
-        const sourceFile = casPath(sourceCas, row.storage_key);
-        const targetFile = casPath(targetCas, row.storage_key);
-        // One synchronous lstat (metadata only, microseconds): an object this copy or an earlier
-        // pre-copy verified and that is unchanged since is neither awaited nor hashed again.
-        const existing = lstatSync(targetFile, { bigint: true, throwIfNoEntry: false });
-        if (existing !== undefined) {
-          if (!existing.isFile()) {
-            throw new Outcome({ kind: 'blocked', code: 'runtime-data-set-merge-target-cas-damaged', message: `当前历史库里的正文位置不是普通文件：${row.storage_key}。为免覆盖，暂不合并。` });
-          }
-          // CAS files are never rewritten: an existing object must already be exactly these bytes.
-          if (existing.size !== row.byte_length
-            || (verified.get(targetFile) !== fileIdentity(existing) && !await hasDigest(targetFile, row.sha256, verified))) {
-            throw new Outcome({ kind: 'blocked', code: 'runtime-data-set-merge-target-cas-damaged', message: `当前历史库里的正文文件已损坏：${row.storage_key}。为免覆盖，暂不合并。` });
-          }
-          result.reusedCasObjects += 1;
-          continue;
-        }
-        if (objects) {
-          // Read only through its safe descriptor, hashed while copied: never linked, never followed.
-          const invalid = (): Outcome => new Outcome({
-            kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源缺少正文文件或内容与摘要不符：${row.storage_key}。`
-          });
-          if (await objects.size(sourceFile) !== row.byte_length) throw invalid();
-          if (options.verifyOnly) {
-            if (await objectDigest(objects, sourceFile, row.byte_length) !== row.sha256) throw invalid();
-            continue;
-          }
-          const prefix = path.dirname(targetFile);
-          await ensureDirectory(targetCas, path.join(targetCas, 'sha256'), touchedDirectories);
-          await ensureDirectory(path.join(targetCas, 'sha256'), prefix, touchedDirectories);
-          if (!temporaryUsed) {
-            await fs.mkdir(temporaryRoot, { recursive: true });
-            temporaryUsed = true;
-          }
-          if (!await copyObjectIntoCas(objects, temporaryRoot, sourceFile, targetFile, row.sha256, row.byte_length, verified)) throw invalid();
-          touchedDirectories.add(prefix);
-          result.copiedCasObjects += 1;
-          continue;
-        }
-        // A missing, irregular, short or different source object is the source's own lasting problem.
-        const sourceSize = await regularFileSize(sourceFile).catch((error: unknown) => {
-          if (error instanceof NotRegularFile) return undefined;
-          throw error;
-        });
-        if (sourceSize !== row.byte_length || !await hasDigest(sourceFile, row.sha256, verified)) {
-          throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源缺少正文文件或内容与摘要不符：${row.storage_key}。` });
-        }
-        if (options.verifyOnly) continue;
-        const prefix = path.dirname(targetFile);
-        await ensureDirectory(targetCas, path.join(targetCas, 'sha256'), touchedDirectories);
-        await ensureDirectory(path.join(targetCas, 'sha256'), prefix, touchedDirectories);
-        let copied = false;
-        try {
-          // The source object was verified just above; a hard link publishes those same bytes.
-          await link(sourceFile, targetFile);
-          await rememberLinked(sourceFile, targetFile, verified);
-        } catch (error) {
-          const code = (error as NodeJS.ErrnoException).code;
-          if (code === 'EEXIST') {
-            if (await regularFileSize(targetFile) !== row.byte_length || await sha256File(targetFile) !== row.sha256) throw error;
-          } else if (code === 'EXDEV' || code === 'EPERM' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EMLINK') {
-            if (!temporaryUsed) {
-              await fs.mkdir(temporaryRoot, { recursive: true });
-              temporaryUsed = true;
-            }
-            await copyIntoCas(temporaryRoot, sourceFile, targetFile, row.sha256, verified);
-            copied = true;
-          } else {
-            throw error;
-          }
-        }
-        touchedDirectories.add(prefix);
-        if (copied) result.copiedCasObjects += 1;
-        else result.linkedCasObjects += 1;
+        const kind = await transfer.transfer(object);
+        if (kind === 'reused') result.reusedCasObjects += 1;
+        else if (kind === 'copied') result.copiedCasObjects += 1;
+        else if (kind === 'linked') result.linkedCasObjects += 1;
       }
-      // Verified objects need no I/O wait at all: yield between pages so the thread stays responsive.
       await new Promise((resolve) => setImmediate(resolve));
     }
-    // Every file was fsynced before it was linked; one fsync per touched directory makes the new
-    // entries durable before any row that references them is committed.
-    for (const directory of touchedDirectories) await syncDirectoryDurably(directory);
+    await transfer.finish();
+  } catch (error) {
+    if (error instanceof CasTransferError) throw new Outcome(error.outcome);
+    throw error;
   } finally {
     lengths.drop();
-    // The temporary files are gone (each copy removes its own); their directory is synced once.
-    if (temporaryUsed) await syncDirectoryDurably(temporaryRoot).catch(() => undefined);
+    await transfer.close();
   }
   return result;
 }
@@ -3639,67 +3563,29 @@ function withTemporaryWrites<T>(database: Database.Database, run: () => T): T {
 }
 
 /**
- * Copy, fsync and verify a private temporary file; only verified bytes are linked into the CAS.
- * The temporary directory is synced once by the caller, not per object.
- */
-async function copyIntoCas(
-  temporaryRoot: string,
-  sourceFile: string,
-  targetFile: string,
-  digest: string,
-  verified: CasVerification
-): Promise<void> {
-  const temporary = path.join(temporaryRoot, `${process.pid}-${randomUUID()}${CAS_COPY_SUFFIX}`);
-  let published = false;
-  try {
-    await fs.copyFile(sourceFile, temporary, constants.COPYFILE_EXCL);
-    await fs.chmod(temporary, 0o600);
-    const handle = await fs.open(temporary, 'r');
-    try { await handle.sync(); } finally { await handle.close(); }
-    if (await sha256File(temporary) !== digest) {
-      throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `复制出的正文文件摘要不符：${path.basename(targetFile)}。` });
-    }
-    try {
-      await fs.link(temporary, targetFile);
-      published = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (await sha256File(targetFile) !== digest) throw error;
-    }
-  } finally {
-    await fs.rm(temporary, { force: true });
-  }
-  // The published inode is the verified private copy; recorded once its temporary name is gone
-  // (every link count change moves the ctime).
-  if (published) {
-    verified.delete(sourceFile);
-    verified.set(targetFile, fileIdentity(await fs.lstat(targetFile, { bigint: true })));
-  }
-}
-
-/**
  * Before any object of a copy-only source is written: the target's disk must hold every object the
  * target lacks, plus a margin (one lstat per object; the rows are paged as in the transfer).
  */
 async function assertRoomForObjects(
   page: Database.Statement,
   targetCas: string,
+  transfer: LocalCasTransferSession,
   available: (directory: string) => Promise<number | undefined>
 ): Promise<void> {
   const seen = new HandledStorageKeys(page.database);
   let missing = 0n;
   try {
     for (let after = 0n; ;) {
-      const rows = page.all(after) as Array<{ position: bigint; storage_key: string; byte_length: bigint }>;
+      const rows = page.all(after) as Array<{ position: bigint; storage_key: string; sha256: string; byte_length: bigint }>;
       if (rows.length === 0) break;
       after = rows[rows.length - 1].position;
       for (const row of rows) {
         if (seen.has(row.storage_key)) continue;
         seen.add(row.storage_key, row.byte_length);
-        let file: string;
-        try { file = casPath(targetCas, row.storage_key); }
+        let object;
+        try { object = requireCasObjectIdentity(row); }
         catch { continue; } // An invalid key fails the transfer itself.
-        if (lstatSync(file, { throwIfNoEntry: false }) === undefined) missing += BigInt(row.byte_length);
+        if (transfer.needsCopy(object)) missing += object.byte_length;
       }
       await new Promise((resolve) => setImmediate(resolve));
     }
@@ -3716,93 +3602,6 @@ async function assertRoomForObjects(
         + '不和原目录共用文件。腾出空间后再合并；两边的内容都没有改动。'
     });
   }
-}
-
-/**
- * One object of a copy-only source: read through its descriptor into a private temporary file while
- * hashed (never more than its recorded length), fsynced, and linked into the CAS only when exactly
- * those bytes. False when the bytes are not the recorded ones (nothing is published then).
- */
-async function copyObjectIntoCas(
-  objects: HistoricalMergeSourceObjects,
-  temporaryRoot: string,
-  sourceFile: string,
-  targetFile: string,
-  digest: string,
-  length: bigint,
-  verified: CasVerification
-): Promise<boolean> {
-  const temporary = path.join(temporaryRoot, `${process.pid}-${randomUUID()}${CAS_COPY_SUFFIX}`);
-  let published = false;
-  try {
-    const hash = createHash('sha256');
-    let copied = 0n;
-    const input = await objects.open(sourceFile);
-    try {
-      const output = await fs.open(temporary, 'wx', 0o600);
-      try {
-        const buffer = Buffer.allocUnsafe(objectBufferSize(length));
-        while (copied <= length) {
-          const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
-          if (bytesRead === 0) break;
-          hash.update(buffer.subarray(0, bytesRead));
-          for (let written = 0; written < bytesRead;) written += (await output.write(buffer, written, bytesRead - written)).bytesWritten;
-          copied += BigInt(bytesRead);
-        }
-        await output.sync();
-      } finally { await output.close(); }
-    } finally { await input.close(); }
-    if (copied !== length || hash.digest('hex') !== digest) return false;
-    try {
-      await fs.link(temporary, targetFile);
-      published = true;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-      if (await sha256File(targetFile) !== digest) throw error;
-    }
-  } finally {
-    await fs.rm(temporary, { force: true });
-  }
-  if (published) verified.set(targetFile, fileIdentity(await fs.lstat(targetFile, { bigint: true })));
-  return true;
-}
-
-/** One read holds a small object and one byte more (a longer file shows at once); at most 1 MiB. */
-function objectBufferSize(length: bigint): number {
-  return Number(length < 1024n * 1024n ? length + 1n : 1024n * 1024n);
-}
-
-/** sha256 of an object read through its safe descriptor (never more than its recorded length). */
-async function objectDigest(objects: HistoricalMergeSourceObjects, file: string, length: bigint): Promise<string | undefined> {
-  const hash = createHash('sha256');
-  let read = 0n;
-  const input = await objects.open(file);
-  try {
-    const buffer = Buffer.allocUnsafe(objectBufferSize(length));
-    while (read <= length) {
-      const { bytesRead } = await input.read(buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-      read += BigInt(bytesRead);
-    }
-  } finally { await input.close(); }
-  return read === length ? hash.digest('hex') : undefined;
-}
-
-/**
- * A hard link changes the shared inode's ctime. When the inode is still the one whose bytes were
- * just verified (same device, inode, size and mtime), the published name is recorded with its new
- * identity, so a later pass (the exclusive phase after an online pre-copy) does not hash it again.
- */
-async function rememberLinked(sourceFile: string, targetFile: string, verified: CasVerification): Promise<void> {
-  const before = verified.get(sourceFile);
-  if (before === undefined) return;
-  const after = await fs.lstat(targetFile, { bigint: true }).then(fileIdentity, () => undefined);
-  if (after === undefined) return;
-  // Only the published name is kept: a later pass checks the target object, and the source name
-  // is needed again only after the target was discarded (which changes the ctime anyway).
-  verified.delete(sourceFile);
-  if (sameContentIdentity(before, after)) verified.set(targetFile, after);
 }
 
 /**
@@ -4010,60 +3809,6 @@ function fingerprintDigest(fingerprint: RuntimeDataSetFingerprint): string {
 
 async function fault(options: RuntimeDataSetMergeOptions, point: RuntimeDataSetMergeFaultPoint): Promise<void> {
   await options.onFaultPoint?.(point);
-}
-
-function casPath(casRoot: string, storageKey: string): string {
-  const file = path.resolve(casRoot, ...storageKey.split('/'));
-  if (!isPathBelow(casRoot, file)) throw new Error(`CAS path escapes its root: ${storageKey}`);
-  return file;
-}
-
-class NotRegularFile extends Error {}
-
-async function regularFileSize(file: string): Promise<bigint | undefined> {
-  try {
-    const info = await fs.lstat(file, { bigint: true });
-    if (!info.isFile()) throw new NotRegularFile(`CAS entry is not a regular file: ${file}`);
-    return info.size;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
-}
-
-async function ensureDirectory(parent: string, directory: string, touched: Set<string>): Promise<void> {
-  try {
-    await fs.mkdir(directory, { mode: 0o700 });
-    touched.add(parent);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    const info = await fs.lstat(directory);
-    if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`CAS path is not a directory: ${directory}`);
-  }
-}
-
-/** sha256 of a file; one verified before and unchanged since (same device, inode, size, times) is not read again. */
-async function hasDigest(file: string, digest: string, verified: CasVerification): Promise<boolean> {
-  const identity = fileIdentity(await fs.lstat(file, { bigint: true }));
-  if (verified.get(file) === identity) return true;
-  if (await sha256File(file) !== digest) return false;
-  verified.set(file, identity);
-  return true;
-}
-
-function fileIdentity(info: BigIntStats): string {
-  return `${info.dev}:${info.ino}:${info.size}:${info.mtimeNs}:${info.ctimeNs}`;
-}
-
-/** Same device, inode, size and mtime (the ctime may differ: a link count change). */
-function sameContentIdentity(left: string, right: string): boolean {
-  return left.slice(0, left.lastIndexOf(':')) === right.slice(0, right.lastIndexOf(':'));
-}
-
-async function sha256File(file: string): Promise<string> {
-  const hash = createHash('sha256');
-  for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
-  return hash.digest('hex');
 }
 
 async function removeSqliteSidecars(file: string): Promise<void> {

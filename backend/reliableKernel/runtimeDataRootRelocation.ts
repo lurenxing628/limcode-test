@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, createReadStream, type Dirent, type Stats } from 'node:fs';
+import { constants, createReadStream, type Stats } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -13,6 +13,10 @@ import {
 } from '../capabilities/vscodeStorage/constants';
 import { createRuntimeRootPaths, ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
+import {
+  canHardLinkLooseCas, estimateLooseCasCopyBytes, listLooseCasPhysicalEntries, measureLooseCasRuntimeStorage,
+  removeAddedLooseCasPhysicalEntries
+} from './looseCasMaintenance';
 import type { HistoricalRootBinding } from './rootAuthority';
 import { classifyRecordedProcess, ownProcessStartIdentity } from './runtimeClaimPrimitives';
 import { initializeEmptyRuntimeRoot, RuntimeDatabase } from './runtimeDatabase';
@@ -139,10 +143,6 @@ const CLOUD_SYNC_SEGMENT = /^(onedrive.*|dropbox|icloud ?drive|iclouddrive|mobil
 const FREE_SPACE_MARGIN_BYTES = 64 * 1024 * 1024;
 /** Debug captures of a data set, below its Runtime data root (see debugCapture/files). */
 const DEBUG_CAPTURES_PATH: readonly string[] = ['diagnostics', 'debug-captures'];
-/** Allocation units a copy of the CAS objects is measured at (FAT/exFAT use up to 1 MiB clusters). */
-const CLUSTER_SIZES: readonly number[] = [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
-/** Linux statfs types of filesystems without hard links (msdos/vfat, exFAT): CAS objects are copied. */
-const NO_HARD_LINK_FILESYSTEMS: ReadonlySet<number> = new Set([0x4d44, 0x2011bab0]);
 const UUID_PATTERN = '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}';
 /**
  * Temporary copies named with their owner's process id (see sweepDataRootRelocationLeftovers).
@@ -220,7 +220,7 @@ export interface DataRootRelocationDataSet {
   casBytes: number;
   /** CAS bytes as allocated on disk (blocks), for a copy to another disk. */
   casAllocatedBytes: number;
-  /** CAS bytes a copy would allocate with each of CLUSTER_SIZES as allocation unit. */
+  /** Loose CAS bytes a copy would allocate with each of LOOSE_CAS_COPY_CLUSTER_SIZES as allocation unit. */
   casClusterBytes?: number[];
   /** Rows over every Runtime domain; undefined when the data set could not be read. */
   rows?: number;
@@ -532,8 +532,8 @@ type JournalEntry =
   | { op: 'database'; path: string; backup: string; before: RuntimeDataSetFingerprint; stamp: { database: string; wal?: string } }
   /**
    * The existing receiving data set's CAS (`path`) before the relocation put anything into it: the
-   * objects it had are listed at `backup`. An undo (after the database restore, which refers to none
-   * of the others) removes every object that is not listed.
+   * loose physical entries it had are listed at `backup`. An undo (after the database restore,
+   * which refers to none of the others) removes unlisted entries through the loose adapter.
    */
   | { op: 'cas'; path: string; backup: string }
   /**
@@ -916,21 +916,9 @@ function identityOf(candidate: VscodeRuntimeDataSetCandidate): { id: string; dat
   return { id: candidate.id, dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
 }
 
-/** One walk of the data set's Runtime directory: database, CAS (logical and allocated). */
+/** Explicit loose-format physical measurement; logical copy itself uses the CAS transfer adapter. */
 async function measureDataSet(binding: HistoricalRootBinding): Promise<Pick<DataRootRelocationDataSet, 'databaseBytes' | 'casBytes' | 'casAllocatedBytes' | 'casClusterBytes'>> {
-  const database = path.resolve(binding.paths.databasePath);
-  const databaseFiles = new Set([database, `${database}-wal`]);
-  const cas = path.resolve(binding.paths.casRootPath);
-  const result = { databaseBytes: 0, casBytes: 0, casAllocatedBytes: 0, casClusterBytes: CLUSTER_SIZES.map(() => 0) };
-  await walkSizes(path.resolve(binding.paths.dataRootPath), (file, info) => {
-    if (databaseFiles.has(file)) result.databaseBytes += info.size;
-    else if (isPathInside(cas, file)) {
-      result.casBytes += info.size;
-      result.casAllocatedBytes += allocatedBytes(info);
-      CLUSTER_SIZES.forEach((cluster, index) => { result.casClusterBytes[index] += Math.ceil(info.size / cluster) * cluster; });
-    }
-  });
-  return result;
+  return measureLooseCasRuntimeStorage(binding.paths);
 }
 
 /**
@@ -981,14 +969,13 @@ async function estimateSpace(input: {
   const sameDevice = targetDevice !== undefined && targetDevice === sourceDevice;
   const targetFilesystem = targetProbe ? await fs.statfs(targetProbe).catch(() => undefined) : undefined;
   // FAT/exFAT (USB sticks) have no hard links: the merge falls back to copying every object.
-  const hardLinks = sameDevice && !(process.platform === 'linux' && targetFilesystem && NO_HARD_LINK_FILESYSTEMS.has(Number(targetFilesystem.type)));
-  // A copy allocates whole clusters of the target's filesystem (up to 1 MiB on exFAT).
-  const clusterIndex = targetFilesystem ? CLUSTER_SIZES.findIndex((cluster) => cluster >= Number(targetFilesystem.bsize)) : -1;
-  const copiedCas = (dataSet: DataRootRelocationDataSet): number => !targetFilesystem ? dataSet.casAllocatedBytes
-    : Math.max(dataSet.casAllocatedBytes, dataSet.casClusterBytes?.[clusterIndex === -1 ? CLUSTER_SIZES.length - 1 : clusterIndex] ?? 0);
+  const hardLinks = canHardLinkLooseCas(sameDevice, targetFilesystem ? Number(targetFilesystem.type) : undefined);
   const moving = [input.current, ...input.others.filter((other) => !other.leaveBehind)];
   let targetBytes = input.configurationAllocated;
-  for (const dataSet of moving) targetBytes += 2 * dataSet.databaseBytes + (hardLinks ? 0 : copiedCas(dataSet));
+  for (const dataSet of moving) {
+    targetBytes += 2 * dataSet.databaseBytes + estimateLooseCasCopyBytes(dataSet, hardLinks,
+      targetFilesystem ? Number(targetFilesystem.bsize) : undefined);
+  }
   if (input.target.kind === 'limcode') {
     const receiving = await resolveVscodeRuntimeDataSet({ globalStoragePath: input.targetRootPath }, input.target.receivingId).catch(() => undefined);
     if (receiving) targetBytes += 2 * await databaseBytesOf(receiving.runtimeDataRootPath);
@@ -1320,35 +1307,16 @@ const RECEIVING_CAS_LISTING_FILE = 'receiving-cas-before.json';
 
 async function journalReceivingCas(target: string, binding: HistoricalRootBinding, journal: RelocationJournal): Promise<void> {
   const casRoot = path.resolve(binding.paths.casRootPath);
-  await writeTextDurably(path.join(journal.workDirectory, RECEIVING_CAS_LISTING_FILE), `${JSON.stringify(await filesBelow(casRoot))}\n`);
+  await writeTextDurably(path.join(journal.workDirectory, RECEIVING_CAS_LISTING_FILE), `${JSON.stringify(await listLooseCasPhysicalEntries(casRoot))}\n`);
   await journal.append({ op: 'cas', path: path.relative(target, casRoot), backup: RECEIVING_CAS_LISTING_FILE });
 }
 
-/** The undo of a 'cas' entry: every object the relocation added to the receiving CAS goes (a listing that is gone removes nothing). */
+/** The existing loose-format 'cas' journal entry; a missing listing still removes nothing. */
 async function removeAddedCasObjects(casRoot: string, listing: string): Promise<void> {
   const text = await readTextIfPresent(listing);
   if (text === undefined) return;
   const before = new Set(JSON.parse(text) as string[]);
-  for (const file of await filesBelow(casRoot)) {
-    if (!before.has(file)) await fs.rm(path.join(casRoot, ...file.split('/')), { force: true });
-  }
-}
-
-/** Every regular file below `root` ('/'-separated, relative, sorted); none when it is not there. */
-async function filesBelow(root: string): Promise<string[]> {
-  const files: string[] = [];
-  const visit = async (directory: string, prefix: string): Promise<void> => {
-    let entries: Dirent[];
-    try { entries = await fs.readdir(directory, { withFileTypes: true }); }
-    catch (error) { if (isMissing(error)) return; throw error; }
-    for (const entry of entries) {
-      const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) await visit(path.join(directory, entry.name), relative);
-      else files.push(relative);
-    }
-  };
-  await visit(root, '');
-  return files.sort();
+  await removeAddedLooseCasPhysicalEntries(casRoot, before);
 }
 
 /** Journals the new data set's directories (the topmost one that does not exist yet). */
@@ -1678,7 +1646,8 @@ async function copyDebugCaptures(fromDataRoot: string, toDataRoot: string, targe
  * `freshRoot`: the receiving root was created by this relocation and is still empty, so the data
  * set is copied into it in batches (copyRuntimeDataSetIntoEmptyRoot; the caller holds the target's
  * admission and undoes the whole root on failure). An existing receiving data set gets one merge
- * transaction (bounded by the plan's row check).
+ * transaction (bounded by the plan's row check). Both use logical CAS transfer before metadata;
+ * neither copies the whole CAS directory as a filesystem tree.
  */
 async function mergeInto(
   sourcePaths: { globalStoragePath: string },

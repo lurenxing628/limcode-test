@@ -7,6 +7,9 @@ import * as path from 'node:path';
 import { isSamePath } from '../capabilities/filesystem/pathContainment';
 import { inProcessSqliteDatabasePaths } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import { createRuntimeRootPaths, ROOT_BINDING_PENDING_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import { requireCasObjectIdentity, type CasObjectIdentity } from './casObjectAccess';
+import { looseCasObjectLocation, verifyCasObjectBytes } from './looseCasObjectAccess';
+import type { CasTransferSource } from './runtimeCasTransfer';
 import { CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
 import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
@@ -757,6 +760,58 @@ export async function readLocatedRuntimeFile(file: string, held: HeldDatabaseFil
   const handle = await openLocatedRuntimeFile(file, held, maxBytes);
   try { return await handle.readFile(); }
   finally { await handle.close(); }
+}
+
+/**
+ * Logical history bytes under the located reader policy: no symbolic components and no descriptor
+ * of a database held by this process. The history owner supplies its freshly checked held set.
+ */
+export async function readLocatedCasObject(
+  root: LocatedRuntimeRoot,
+  object: CasObjectIdentity,
+  held: HeldDatabaseFiles
+): Promise<Buffer> {
+  const identity = requireCasObjectIdentity(object);
+  if (identity.byte_length > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError('Historical CAS object is too large to read.');
+  const location = looseCasObjectLocation(root.located.casRootPath, identity);
+  await assertNoSymbolicPath(root.containerRoot, location.absolutePath);
+  return verifyCasObjectBytes(identity, await readLocatedRuntimeFile(location.absolutePath, held, Number(identity.byte_length)));
+}
+
+/**
+ * A claim-scoped, copy-only logical source. Physical path resolution and strict foreign-file safety
+ * are confined here; the transfer engine receives identities and sequential bytes, never filenames.
+ */
+export function locatedCasTransferSource(
+  root: LocatedRuntimeRoot,
+  heldFiles: () => Promise<HeldDatabaseFiles>
+): CasTransferSource {
+  // Validated loose identities have only 256 prefix directories; preserve the per-transfer checks.
+  const checked = new Set<string>();
+  let held: Promise<HeldDatabaseFiles> | undefined;
+  const reachable = async (object: CasObjectIdentity): Promise<string> => {
+    const { absolutePath } = looseCasObjectLocation(root.located.casRootPath, object);
+    const directory = path.dirname(absolutePath);
+    if (!checked.has(directory)) {
+      await assertNoSymbolicPath(root.containerRoot, directory);
+      checked.add(directory);
+    }
+    return absolutePath;
+  };
+  return {
+    size: async (object) => {
+      try {
+        const file = await reachable(object);
+        const info = await fs.lstat(file, { bigint: true });
+        return info.isFile() ? info.size : undefined;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException | undefined)?.code;
+        if (code === 'ENOENT' || code === 'ENOTDIR' || (error instanceof Error && /symbolic link/.test(error.message))) return undefined;
+        throw error;
+      }
+    },
+    open: async (object) => openLocatedRuntimeFile(await reachable(object), await (held ??= heldFiles()))
+  };
 }
 
 /**

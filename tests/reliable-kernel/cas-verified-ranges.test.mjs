@@ -9,6 +9,7 @@ const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/e
 const { RootAuthority } = require(path.join(compiled, 'backend/reliableKernel/rootAuthority.js'));
 const { initializeEmptyRuntimeRoot } = require(path.join(compiled, 'backend/reliableKernel/runtimeDatabase.js'));
 const { ContentAddressedStore } = require(path.join(compiled, 'backend/reliableKernel/contentAddressedStore.js'));
+const { LocalCasByteAccess, LocalSynchronousCasByteAccess } = require(path.join(compiled, 'backend/reliableKernel/looseCasObjectAccess.js'));
 async function fixture(run) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-range-test-'));
   try {
@@ -40,7 +41,7 @@ test('CAS concurrent first pages share verification and close every handle', asy
   assert.equal(store.inspectRangeReadCache().activeHandles, 0);
   assert.equal(store.inspectRangeReadCache().inflight, 0);
 }));
-test('CAS range cache revalidates replacement and mutation', async () => fixture(async ({ store, publish }) => {
+test('CAS range cache revalidates replacement and mutation', async () => fixture(async ({ store, publish, binding }) => {
   const item = await publish(4096);
   await store.readChunk(item, 0, 32);
   await fs.rename(item.file, item.file + '.old');
@@ -49,6 +50,10 @@ test('CAS range cache revalidates replacement and mutation', async () => fixture
   assert.equal(store.inspectRangeReadCache().verifications, 2);
   await fs.writeFile(item.file, Buffer.alloc(4096, 98));
   await assert.rejects(store.readChunk(item, 64, 32), /digest mismatch/);
+  const bytes = new LocalCasByteAccess(binding.paths.casRootPath);
+  new LocalSynchronousCasByteAccess(binding.paths.casRootPath).assertPublished(item);
+  assert.equal(await bytes.containsExactLength(item), true, 'admission and backup retain length-only proofs');
+  await assert.rejects(bytes.readBytes(item), /digest mismatch/);
   assert.equal(store.inspectRangeReadCache().entries, 0);
   assert.equal(store.inspectRangeReadCache().activeHandles, 0);
   assert.equal(store.inspectRangeReadCache().inflight, 0);
@@ -111,12 +116,15 @@ async function makeSymlink(t, target, link, type) {
     throw error;
   }
 }
-test('CAS supports an existing symbolic object path', async (t) => fixture(async ({ store, publish }) => {
+test('CAS supports an existing symbolic object path', async (t) => fixture(async ({ store, publish, binding }) => {
   const item = await publish(4096);
   await store.readChunk(item, 0, 32);
   await fs.rename(item.file, item.file + '.old');
   if (!await makeSymlink(t, item.file + '.old', item.file, 'file')) return;
   assert.equal((await store.readChunk(item, 0, 32)).chunk.equals(Buffer.alloc(32, 97)), true);
+  new LocalSynchronousCasByteAccess(binding.paths.casRootPath).assertPublished(item);
+  assert.equal(await new LocalCasByteAccess(binding.paths.casRootPath).containsExactLength(item), false,
+    'backup proof rejects a symbolic leaf while local reads and admission still follow it');
   assert.equal(store.inspectRangeReadCache().activeHandles, 0);
 }));
 test('CAS range boundaries handle EOF and reject invalid offsets and sizes', async () => fixture(async ({ store, publish }) => {

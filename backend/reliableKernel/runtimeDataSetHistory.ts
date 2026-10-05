@@ -1,13 +1,11 @@
-import { createHash } from 'node:crypto';
-import * as path from 'node:path';
 import { TextDecoder } from 'node:util';
 import Database from 'better-sqlite3';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
-import { storageKeyForDigest } from './contentAddressedStore';
+import { requireCasObjectIdentity } from './casObjectAccess';
 import { assertCurrentSchema } from './databaseSchema';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import {
-  copyLocatedRuntimeDatabase, heldDatabaseFiles, readLocatedRuntimeFile, relocateRuntimeRoot, withLocatedRuntimeRootFence,
+  copyLocatedRuntimeDatabase, heldDatabaseFiles, readLocatedCasObject, relocateRuntimeRoot, withLocatedRuntimeRootFence,
   type HeldDatabaseFiles
 } from './runtimeForeignHistory';
 import { registerForeignRuntimeHistoryView, type ForeignRuntimeHistoryViewRegistration } from './runtimeForeignHistoryViews';
@@ -15,7 +13,7 @@ import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runti
 import { sameLocatedRuntimeRoot, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
 import {
-  assertNoSymbolicPath, createLocatedRuntimeDatabaseSnapshot, type RuntimeDataSetDatabaseSnapshot
+  createLocatedRuntimeDatabaseSnapshot, type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
 
@@ -239,19 +237,11 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     const id = text(metadata.id);
     const cached = this.textCache.get(id);
     if (cached !== undefined) return cached;
-    const digest = text(metadata.sha256);
-    const key = storageKeyForDigest(digest);
-    if (metadata.storage_key !== key) throw new Error(`Historical ContentObject ${id} storage key does not match its digest.`);
+    const object = requireCasObjectIdentity(metadata);
     if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length < 0n || metadata.byte_length > MAX_MESSAGE_CONTENT_BYTES) {
       throw new Error(`Historical ContentObject ${id} exceeds the 64 MiB message read limit or has an invalid length.`);
     }
-    const filePath = path.join(this.root.located.casRootPath, ...key.split('/'));
-    await assertNoSymbolicPath(this.root.containerRoot, filePath);
-    // A regular file no larger than recorded, never a link, a FIFO or a file of a database this process holds.
-    const bytes = await readLocatedRuntimeFile(filePath, this.held, Number(metadata.byte_length));
-    if (BigInt(bytes.length) !== metadata.byte_length || createHash('sha256').update(bytes).digest('hex') !== digest) {
-      throw new Error(`Historical ContentObject ${id} digest or byte length mismatch.`);
-    }
+    const bytes = await readLocatedCasObject(this.root, object, this.held);
     const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const decoded = decodeHistoryText(source, text(metadata.content_type));
     this.textCache.set(id, decoded);

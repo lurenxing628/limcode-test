@@ -1,7 +1,6 @@
 import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { createRuntimeRootPaths, type RootBinding } from './contracts';
 import {
   HISTORICAL_MERGE_ENGINE as engine, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS, RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS, RuntimeDataSetMergeError,
@@ -15,13 +14,13 @@ import {
 } from './runtimeDataSetMergeLedger';
 import {
   copyLocatedRuntimeDatabase, ForeignRuntimeHistoryRejection, foreignFileState, heldDatabaseFiles, holdForeignRuntimeRootClaim,
-  isForeignRuntimeHistoryId, locateForeignRuntimeRoot, openLocatedRuntimeFile,
+  isForeignRuntimeHistoryId, locateForeignRuntimeRoot, locatedCasTransferSource,
   type ForeignRuntimeHistoryEntry, type ForeignRuntimeRootClaimHold, type HeldDatabaseFiles
 } from './runtimeForeignHistory';
 import { withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
-import { assertNoSymbolicPath, createLocatedRuntimeDatabaseSnapshot, type RuntimeDataSetDatabaseSnapshot } from './runtimeStorageInspection';
+import { createLocatedRuntimeDatabaseSnapshot, type RuntimeDataSetDatabaseSnapshot } from './runtimeStorageInspection';
 import { inspectVscodeRuntimeDataSets } from './vscodeRootAuthority';
 
 /**
@@ -324,38 +323,16 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
   }
 
   public objects(candidate: ForeignHistoricalMergeCandidate): HistoricalMergeSourceObjects {
-    const casRoot = candidate.root.located.casRootPath;
-    // Each directory of an object is checked for links once per transfer; the held files once as well.
-    const checked = new Set<string>();
-    let held: Promise<HeldDatabaseFiles> | undefined;
-    const reachable = async (file: string): Promise<void> => {
-      if (!isPathBelow(casRoot, file)) throw new Error(`Content object escapes its root: ${file}`);
-      const directory = path.dirname(file);
-      if (checked.has(directory)) return;
-      await assertNoSymbolicPath(candidate.root.containerRoot, directory);
-      checked.add(directory);
-    };
+    const objects = locatedCasTransferSource(candidate.root, () => this.heldFiles());
     return {
-      size: async (file) => {
+      size: async (object) => {
         this.assertHeld();
-        try {
-          await reachable(file);
-          const info = await fs.lstat(file, { bigint: true });
-          return info.isFile() ? info.size : undefined;
-        } catch (error) {
-          // Missing, or reached through a link: the source lacks it (its own lasting problem).
-          if (isMissing(error) || (error instanceof Error && /symbolic link/.test(error.message))) return undefined;
-          throw error;
-        }
+        return objects.size(object);
       },
-      open: async (file) => {
+      open: async (object) => {
         this.assertHeld();
-        await reachable(file);
-        try {
-          return await openLocatedRuntimeFile(file, await (held ??= this.heldFiles()));
-        } catch (error) {
-          throw refusal(error);
-        }
+        try { return await objects.open(object); }
+        catch (error) { throw refusal(error); }
       }
     };
   }

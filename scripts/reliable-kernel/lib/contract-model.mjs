@@ -607,8 +607,11 @@ function validateMigration(root, migration, failures) {
     || !expectedMerge.backupPolicy.includes(`-database-plus-wal-plus-${backupMarginMiB}MiB-`)) {
     failures.push('migration.json#historicalMerge 的在线上限、内存单事务上限、流式硬上限、流式每块行数、提交证据上限与首末条数、准备记录心跳与接手时限、合并请求期限、备份保留份数与备份前剩余空间余量必须与代码常量一致');
   }
+  const casTransferSource = readText(path.join(root, 'backend/reliableKernel/runtimeCasTransfer.ts'));
   if (!expectedMerge.foreignSourcePolicy.includes(`-free-space-for-missing-objects-plus-${backupMarginMiB}MiB-`)
-    || !/if \(objects && !options\.verifyOnly\) await assertRoomForObjects\(/.test(mergeSource)
+    || !/if \(options\.sourceObjects && !options\.verifyOnly\) \{\s+await assertRoomForObjects\(/.test(mergeSource)
+    || !mergeSource.includes('if (transfer.needsCopy(object)) missing += object.byte_length;')
+    || !casTransferSource.includes('lstatSync(looseCasObjectLocation(this.targetCas, object).absolutePath, { throwIfNoEntry: false }) === undefined')
     || !mergeSource.includes('const needed = Number(missing) + BACKUP_FREE_SPACE_MARGIN_BYTES;')) {
     failures.push('migration.json#historicalMerge.foreignSourcePolicy 的外来正文复制前空间余量必须与代码常量一致，且复制前先按缺失对象总量加余量查空间');
   }
@@ -896,6 +899,7 @@ function validateForeignHistory(root, authority, failures) {
   const read = (file) => readText(path.join(root, 'backend/reliableKernel', file));
   const foreignSource = read('runtimeForeignHistory.ts');
   const foreignMergeSource = read('runtimeForeignHistoryMerge.ts');
+  const casTransferSource = read('runtimeCasTransfer.ts');
   const forbidden = /\bRuntimeDatabase\b|new RootAuthority|withRuntimeMaintenance\(root\.recorded|recorded\.paths\.(databasePath|casRootPath|rootPointerPath|runtimeEpochPath)/;
   if (authority?.rootPolicy?.foreignHistory !== 'verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself; merged-into-current-only-on-user-request-under-its-claim-copied-never-linked-ledger-under-current-configuration-root; reset-archives-named-time-id8-or-time-epoch-n-to-m-id8-or-the-17-digits-of-the-manual-reset-of-released-0.0.10-0.0.20-a-published-older-format-listed-not-verified-with-location-size-and-reason'
     || !foreignSource.includes("const CACHE_DIRECTORY = 'foreign';") || !foreignSource.includes("const CLAIMS_DIRECTORY = 'foreign-claims';")
@@ -912,7 +916,15 @@ function validateForeignHistory(root, authority, failures) {
     [foreignMergeSource, 'const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, id, pointerOf(location));'],
     // Snapshots are private copies; its CAS is read through no-follow descriptors.
     [foreignMergeSource, 'copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles())'],
-    [foreignMergeSource, 'return await openLocatedRuntimeFile(file, await (held ??= this.heldFiles()));'],
+    [foreignMergeSource, 'const objects = locatedCasTransferSource(candidate.root, () => this.heldFiles());'],
+    [foreignMergeSource, 'try { return await objects.open(object); }'],
+    [foreignSource, 'open: async (object) => openLocatedRuntimeFile(await reachable(object), await (held ??= heldFiles()))'],
+    [foreignSource, 'await assertNoSymbolicPath(root.containerRoot, directory);'],
+    [foreignSource, 'const handle = await fs.open(file, OPEN_READ_ONLY);'],
+    [foreignSource, 'if (held.has(`${info.dev}:${info.ino}`)) throw openDatabase(file);'],
+    [casTransferSource, 'const objects = this.options.sourceObjects;'],
+    [casTransferSource, 'copyObjectIntoCas(objects, this.temporaryRoot, row, targetFile, row.sha256, row.byte_length, verified)'],
+    [casTransferSource, "return 'copied';"],
     // Never finalized, never a migration source, fenced by its held claim, its objects copied (never linked).
     [mergeSource, "if (isForeignCandidate(candidate)) throw new TypeError('A foreign history root is never finalized.');"],
     [mergeSource, "if (isForeignCandidate(candidate)) throw new TypeError('A data-root migration has no foreign sources.');"],

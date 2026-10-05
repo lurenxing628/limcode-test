@@ -35,10 +35,13 @@ if (requestedCommit && requestedCommit !== headCommit) {
 
 const require = createRequire(import.meta.url);
 let kernel;
+let emptyConversationContextHandleStateStep;
 let modelCapabilities;
 let Database;
 try {
   kernel = require(path.join(root, 'dist/extension/backend/reliableKernel/index.js'));
+  ({ emptyConversationContextHandleStateStep } = require(path.join(root,
+    'dist/extension/backend/reliableKernel/conversationContextHandleState.js')));
   modelCapabilities = require(path.join(root, 'dist/extension/shared/modelCapabilities.js'));
   Database = require('better-sqlite3');
 } catch (error) {
@@ -414,9 +417,18 @@ async function checkContextStorageGrowth() {
     assert.equal(forbiddenHistoryReads, 0, 'ordinary append must not materialize/read/hash historical Context content');
     assert.equal(ordinarySnapshotAllCalls, 0, 'ordinary append must not request an unbounded Repository snapshot');
     assert.ok(ordinaryReads.length <= 20, `ordinary append issued ${ordinaryReads.length} Repository reads`);
+    let sawCurrentHeadUniquenessProbe = false;
     for (const read of ordinaryReads) {
-      if (read.kind === 'list') assert.equal(read.limit, 1, `ordinary append list ${read.domain} must be identity-bounded`);
+      if (read.kind !== 'list') continue;
+      if (read.domain === 'ConversationContextHeadLink' && read.limit === 2) {
+        // Current handle state reads one extra row to reject duplicate heads for this conversation.
+        assert.deepEqual(read.where, { conversation_id: seeded.conversationId });
+        sawCurrentHeadUniquenessProbe = true;
+      } else {
+        assert.equal(read.limit, 1, `ordinary append list ${read.domain} must be identity-bounded`);
+      }
     }
+    assert.equal(sawCurrentHeadUniquenessProbe, true, 'ordinary append must validate its current head uniqueness');
     assert.ok(appendCommit, 'ordinary append commit was not observed');
     const appendChangesByDomain = Object.groupBy(appendCommit.changes, (change) => change.domain);
     for (const domain of ordinaryDomains) {
@@ -3211,6 +3223,7 @@ async function seedTurn(ctx, suffix, options = {}) {
     kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
       id: conversationId, title: conversationId, status: 'active', created_at: now, updated_at: now
     }),
+    emptyConversationContextHandleStateStep(conversationId, now),
     kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
       id: `agent-link-${suffix}`, conversation_id: conversationId, agent_id: agentId,
       role: 'default', created_at: now, updated_at: now

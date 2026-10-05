@@ -8,7 +8,6 @@ import { allocateTimelinePosition, allocateHistoricalTimelineImport, timelineImp
 import { AttachmentProjectionScopeCache, readAttachmentScopeSnapshot } from './attachmentProjectionScopeCache';
 import { readAttachmentProjectionSegments, readAttachmentProjectionLinks } from './attachmentProjectionSnapshot';
 import { executeContextSequenceNodeBatch } from './contextSequenceNodeBatch';
-import { createHash } from 'node:crypto';
 import * as fs from 'node:fs';
 import { mkdir } from 'node:fs/promises';
 import * as path from 'node:path';
@@ -33,6 +32,8 @@ import {
 } from './runtimeModelRequestAggregate';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
+import { requireCasObjectIdentity, type SynchronousCasByteAccess } from './casObjectAccess';
+import { LocalSynchronousCasByteAccess } from './looseCasObjectAccess';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
@@ -154,7 +155,7 @@ class VerifiedContextCasCache {
   private misses = 0;
   private evictions = 0;
 
-  public read(metadata: DomainRow, resolvedCasRootPath: string): Buffer {
+  public read(metadata: DomainRow, access: SynchronousCasByteAccess): Buffer {
     const identity = contextCasIdentity(metadata);
     const cached = this.entries.get(identity.id);
     if (cached) {
@@ -165,7 +166,7 @@ class VerifiedContextCasCache {
       return cached.bytes;
     }
     this.misses += 1;
-    const bytes = readVerifiedCasBytes(metadata, resolvedCasRootPath);
+    const bytes = access.readBytes(requireCasObjectIdentity(metadata));
     if (bytes.length <= CONTEXT_CAS_CACHE_MAX_BYTES) {
       while (
         this.entries.size >= CONTEXT_CAS_CACHE_MAX_ENTRIES
@@ -223,6 +224,7 @@ let measuringRequest: RequestMeasurement | undefined;
 
 const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
+const casByteAccess: SynchronousCasByteAccess = new LocalSynchronousCasByteAccess(data.binding.paths.casRootPath);
 
 /**
  * Bounded verified-CAS read capability handed to the client projection module. The worker keeps
@@ -230,7 +232,10 @@ const data = workerData as DatabaseWorkerData;
  * paths itself.
  */
 const clientProjectionContent: ClientProjectionContentAccess = {
-  readVerifiedBytes: (metadata) => readVerifiedCasBytes(metadata, path.resolve(data.binding.paths.casRootPath))
+  readVerifiedBytes: (metadata) => {
+    requireRuntimeId(metadata.id);
+    return casByteAccess.readBytes(requireCasObjectIdentity(metadata));
+  }
 };
 
 void start().catch((error) => {
@@ -483,7 +488,7 @@ async function start(): Promise<void> {
       if (request.kind === 'contextContentMaterialization') {
         assertDatabaseBinding(reader, data.binding);
         const structure = executeContextMaterialization(reader, request.rootId, commitSeq);
-        const attached = attachContextContent(structure, data.binding.paths.casRootPath, contextCasCache);
+        const attached = attachContextContent(structure, casByteAccess, contextCasCache);
         respond({ type: 'response', id: request.id, ok: true, result: attached.result }, attached.transferList);
         return;
       }
@@ -2010,7 +2015,7 @@ function executeMutation(
         value: value.toString()
       });
     }
-    if (schema.key === 'ContentObject') assertPublishedContentObject(encoded, data.binding.paths.casRootPath);
+    if (schema.key === 'ContentObject') casByteAccess.assertPublished(requireCasObjectIdentity(encoded));
     if (schema.key === 'ConversationContextHandleState') assertConversationContextHandleState(database, encoded);
     if (schema.key === 'ContextRootHandleCatalog') assertContextRootHandleCatalog(database, encoded);
     const names = Object.keys(encoded);
@@ -2650,20 +2655,19 @@ function executeContextMaterialization(
 
 function attachContextContent(
   barrier: SnapshotBarrier<ContextMaterializationSnapshot>,
-  casRootPath: string,
+  access: SynchronousCasByteAccess,
   cache: VerifiedContextCasCache
 ): {
   result: SnapshotBarrier<ContextContentMaterializationSnapshot>;
   transferList: ArrayBuffer[];
 } {
-  const rootPath = path.resolve(casRootPath);
   const unique = new Map<string, Buffer>();
   let totalBytes = 0;
   for (const record of barrier.snapshot.records) {
     const metadata = record.contentObject;
     const id = requireRuntimeId(metadata.id);
     if (unique.has(id)) continue;
-    const bytes = cache.read(metadata, rootPath);
+    const bytes = cache.read(metadata, access);
     totalBytes += bytes.length;
     if (!Number.isSafeInteger(totalBytes)) throw new RangeError('Materialized Context bytes exceed the safe packed-buffer range.');
     unique.set(id, bytes);
@@ -2693,14 +2697,8 @@ function attachContextContent(
 
 function contextCasIdentity(metadata: DomainRow): Omit<VerifiedContextCasCacheEntry, 'bytes'> {
   const id = requireRuntimeId(metadata.id);
-  const sha256 = typeof metadata.sha256 === 'string' && /^[a-f0-9]{64}$/.test(metadata.sha256)
-    ? metadata.sha256
-    : (() => { throw new Error(`ContentObject ${id} has an invalid sha256.`); })();
-  const byteLength = typeof metadata.byte_length === 'bigint' && metadata.byte_length >= 0n
-    ? metadata.byte_length
-    : (() => { throw new Error(`ContentObject ${id} has an invalid byte length.`); })();
-  const storageKey = `sha256/${sha256.slice(0, 2)}/${sha256}`;
-  if (metadata.storage_key !== storageKey) throw new Error(`ContentObject ${id} storage key does not match sha256.`);
+  const object = requireCasObjectIdentity(metadata);
+  const { sha256, byte_length: byteLength, storage_key: storageKey } = object;
   return { id, sha256, byteLength, storageKey };
 }
 
@@ -2715,27 +2713,6 @@ function assertSameContextCasIdentity(
   ) {
     throw new Error(`ContentObject ${current.id} metadata changed during one Runtime worker lifetime.`);
   }
-}
-
-function readVerifiedCasBytes(metadata: DomainRow, resolvedCasRootPath: string): Buffer {
-  const id = requireRuntimeId(metadata.id);
-  const sha256 = typeof metadata.sha256 === 'string' && /^[a-f0-9]{64}$/.test(metadata.sha256)
-    ? metadata.sha256
-    : (() => { throw new Error(`ContentObject ${id} has an invalid sha256.`); })();
-  const expectedKey = `sha256/${sha256.slice(0, 2)}/${sha256}`;
-  if (metadata.storage_key !== expectedKey) throw new Error(`ContentObject ${id} storage key does not match sha256.`);
-  if (!path.isAbsolute(resolvedCasRootPath)) throw new Error('CAS root must be resolved before verified reads.');
-  // The path segments are derived only from a validated lowercase SHA-256, so no per-object resolve
-  // or traversal check is needed on this 1000-record materialization hot path.
-  const candidate = path.join(resolvedCasRootPath, 'sha256', sha256.slice(0, 2), sha256);
-  const bytes = fs.readFileSync(candidate);
-  if (typeof metadata.byte_length !== 'bigint' || BigInt(bytes.length) !== metadata.byte_length) {
-    throw new Error(`ContentObject ${id} byte length mismatch.`);
-  }
-  if (createHash('sha256').update(bytes).digest('hex') !== sha256) {
-    throw new Error(`ContentObject ${id} digest mismatch.`);
-  }
-  return bytes;
 }
 
 function readContextChain(
@@ -3335,20 +3312,6 @@ function requireBackupDestination(value: unknown, dataRootPath: string): string 
   }
   if (fs.existsSync(destination)) throw new Error('Backup destination already exists.');
   return destination;
-}
-
-function assertPublishedContentObject(row: EncodedRow, casRootPath: string): void {
-  const digest = row.sha256;
-  const storageKey = row.storage_key;
-  const byteLength = row.byte_length;
-  if (typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)) throw new Error('ContentObject.sha256 must be lowercase SHA-256.');
-  const expectedKey = `sha256/${digest.slice(0, 2)}/${digest}`;
-  if (storageKey !== expectedKey) throw new Error('ContentObject.storage_key does not match its digest.');
-  if (typeof byteLength !== 'bigint' || byteLength < 0n) throw new Error('ContentObject.byte_length must be non-negative.');
-  const absolutePath = path.resolve(casRootPath, ...expectedKey.split('/'));
-  if (!isPathBelow(path.resolve(casRootPath), absolutePath)) throw new Error('ContentObject CAS path escapes the active root.');
-  const stat = fs.statSync(absolutePath);
-  if (!stat.isFile() || BigInt(stat.size) !== byteLength) throw new Error('ContentObject CAS file is missing or has the wrong length.');
 }
 
 function beginMeasuredWrite(database: Database.Database): void {

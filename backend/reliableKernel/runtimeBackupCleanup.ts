@@ -6,11 +6,13 @@ import { promisify } from 'node:util';
 import { gunzip, gzip } from 'node:zlib';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { DATA_ROOT_BACKUPS_DIR } from '../capabilities/vscodeStorage/constants';
+import { casObjectFromStorageKey, type CasByteAccess, type CasObjectIdentity } from './casObjectAccess';
 import {
   createRuntimeRootPaths, ROOT_BINDING_POINTER_FILE, ROOT_BINDING_PENDING_FILE, RUNTIME_CAS_DIRECTORY, RUNTIME_DATABASE_FILE,
   RUNTIME_EPOCH_FILE, type RuntimeRootPaths
 } from './contracts';
 import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
+import { LocalCasByteAccess } from './looseCasObjectAccess';
 import { CUTOVER_BACKUPS_DIRECTORY, CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
 import type { RepositoryGetRead } from './repositories';
 import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
@@ -56,7 +58,7 @@ import {
  * Conversation and MessageRevision id of the copy, the ids of the other history rows a person sees
  * (RUNTIME_HISTORY_RECORD_DOMAINS: turns, tool calls and results, file changes, interactions and
  * answers, processes and their output, attachments, compressions, child executions, collaboration
- * messages), every body as a regular file of its size in that data set's CAS, and what is visible:
+ * messages), every body present at its recorded size in that data set's CAS, and what is visible:
  * every message the copy shows is shown there with the same current revision. Conversations are
  * hard-deleted (with everything of theirs); a copy holding one the local data set no longer has is
  * kept as history. A message deleted, edited or retried there is only soft-deleted or replaced: its
@@ -84,7 +86,8 @@ import {
  * its files are never opened or closed by this process, and neither is any copy or other data set
  * whose database or WAL is the same inode (a hard link) as a local data set's database files (dev:ino
  * compared by stat before anything is copied). Other data sets and the copies are read in the facts
- * worker from private copies (runtimeDataSetFacts), straight from the tables. CAS files are only lstat'ed.
+ * worker from private copies (runtimeDataSetFacts), straight from the tables. CAS presence uses the
+ * logical byte boundary's length-only proof (the loose adapter only lstat's, never reads/hashes).
  *
  * Foreign history (runtimeForeignHistory): only roots that pass its verification, each deleted as
  * its located control root (a whole archive; in a copied directory only the data set, never the
@@ -1308,10 +1311,11 @@ function unreadableReason(error: unknown, subject: string): string {
 // Coverage: the copy's history is in one local data set, and shows the same there
 
 /**
- * lstat results of CAS files in this check, per CAS root by storage key (the size of a regular file,
- * undefined for anything else): a body is looked up once per data set.
+ * Presence/length results in this check, per CAS root by logical storage key (undefined when
+ * unproven). Each body is inspected once per data set, including when aliases disagree on length.
+ * The loose adapter retains the existing regular-leaf lstat proof; no body digest is introduced.
  */
-type BodyCheck = Map<string, Map<string, number | undefined>>;
+type BodyCheck = Map<string, { access: CasByteAccess; sizes: Map<string, bigint | undefined> }>;
 
 /**
  * How much of a copy's history (`ids`) one local data set holds. Conversations first (they are
@@ -1320,7 +1324,7 @@ type BodyCheck = Map<string, Map<string, number | undefined>>;
  * shows must be shown there too, with the same current revision (a message deleted, edited or retried
  * there is soft-deleted or replaced: its rows stay, but no reader shows it any more). The open data
  * set is read through its own worker reader; another one from its facts. A body counts only as a
- * regular file of its recorded size at its storage key in that data set's CAS (lstat only).
+ * confirmed body of its recorded size at its logical key (the loose adapter uses lstat only).
  */
 async function coverageIn(
   local: LocalDataSet,
@@ -1458,17 +1462,19 @@ async function readCurrent(current: RuntimeBackupCleanupCurrent, reads: Reposito
   return rows;
 }
 
-/** A body is present as a regular file of exactly its size at its storage key below `casRoot` (lstat: never followed, never opened). */
+/** Length-only logical presence proof, cached for this check; the adapter owns physical lookup. */
 async function bodyPresent(casRoot: string, storageKey: string, byteLength: string, bodies: BodyCheck): Promise<boolean> {
-  if (!/^sha256\/[0-9a-f]{2}\/[0-9a-f]{64}$/.test(storageKey) || !/^(0|[1-9][0-9]*)$/.test(byteLength)) return false;
-  let sizes = bodies.get(casRoot);
-  if (!sizes) bodies.set(casRoot, sizes = new Map());
-  if (!sizes.has(storageKey)) {
-    const info = await fs.lstat(path.join(casRoot, ...storageKey.split('/')), { bigint: true }).catch(() => undefined);
-    sizes.set(storageKey, info?.isFile() ? Number(info.size) : undefined);
+  if (!/^(0|[1-9][0-9]*)$/.test(byteLength)) return false;
+  let object: CasObjectIdentity;
+  try { object = casObjectFromStorageKey(storageKey, BigInt(byteLength)); }
+  catch { return false; }
+  let checked = bodies.get(casRoot);
+  if (!checked) {
+    checked = { access: new LocalCasByteAccess(casRoot), sizes: new Map() };
+    bodies.set(casRoot, checked);
   }
-  const size = sizes.get(storageKey);
-  return size !== undefined && BigInt(size) === BigInt(byteLength);
+  if (!checked.sizes.has(storageKey)) checked.sizes.set(storageKey, await checked.access.inspectByteLength(object));
+  return checked.sizes.get(storageKey) === object.byte_length;
 }
 
 /**
@@ -2906,12 +2912,13 @@ function sameIdentity(left: { dataSetId: string; rootInstanceId: string }, right
 
 /**
  * Every entry below `root` (never following a link), with sizes and a digest of every entry's exact
- * state. `objects` (a content store: files published once by link(), never written in place) is
- * described in `shallow` only by its directories.
+ * state. This is a physical loose-store tree adapter: `looseObjects` holds files published once,
+ * never written in place, so `shallow` describes it only by directories. A mutable CAS container
+ * must supply its own race-proof state here; it must not inherit this immutable-file shortcut.
  */
-async function describeTree(root: string, exclude: readonly string[] = [], objects?: string): Promise<TreeFacts> {
+async function describeTree(root: string, exclude: readonly string[] = [], looseObjects?: string): Promise<TreeFacts> {
   const skipped = new Set(exclude.map(comparable));
-  const objectRoot = objects === undefined ? undefined : comparable(objects);
+  const objectRoot = looseObjects === undefined ? undefined : comparable(looseObjects);
   const lines: string[] = [];
   const shallow: Array<readonly [string, string]> = [];
   let bytes = 0n;

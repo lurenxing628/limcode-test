@@ -11,6 +11,7 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
 import { RuntimeDatabase, RuntimeDatabaseWorkerError } from './runtimeDatabase';
+import { casTransferCanLinkRoots } from './runtimeCasTransfer';
 import {
   HISTORICAL_MERGE_ENGINE as engine, planMergeChunk, RuntimeDataSetMergeEvidence, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
   type ForeignHistoricalMergeCandidate, type ForeignHistoricalMergeHold, type HistoricalMergeCandidate,
@@ -25,7 +26,7 @@ import {
   timelineMergeSourceRows, type TimelineMergeSourceRow
 } from './timelineMergeSource';
 import {
-  estimatedTargetIndexBytes, knownDiskDevice, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
+  estimatedTargetIndexBytes, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
   LARGE_MERGE_WAL_PEAK_FACTOR, sqliteTemporaryDirectory
 } from './runtimeDataSetLargeMergeSpace';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
@@ -1864,9 +1865,7 @@ async function estimateSource(
   // Linked when both content stores are on one disk (a copy only across disks or where links fail);
   // a foreign root's objects are always copied.
   const foreign = engine.isForeignCandidate(candidate);
-  const devices = foreign ? [] : await Promise.all([binding.paths.casRootPath, target.binding.paths.casRootPath]
-    .map((directory) => stat(directory).then((info) => knownDiskDevice(info.dev), () => undefined)));
-  const linked = !foreign && devices[0] !== undefined && devices[0] === devices[1];
+  const linked = !foreign && await casTransferCanLinkRoots(binding.paths.casRootPath, target.binding.paths.casRootPath);
   const prepareEstimateMs = Math.round(prepareModelMs(facts, linked));
   const sessionEstimateMs = Math.round(sessionModelMs(facts) * sessionRate);
   return {

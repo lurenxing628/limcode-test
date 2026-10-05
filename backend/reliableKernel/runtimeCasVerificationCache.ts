@@ -5,9 +5,9 @@ import { toSqliteFilePath } from './sqliteFilePath';
 import { resolveVscodeRuntimeMergeLedgerRoot } from './vscodeRootAuthority';
 
 /**
- * What a CAS transfer needs of its record of verified files (see transferCas): the SHA-256 of the file
+ * The loose transfer backend's record of verified physical files (runtimeCasTransfer): the SHA-256 of the file
  * at an absolute path was verified while it had this identity (`dev:ino:size:mtimeNs:ctimeNs`). A Map
- * serves one merge; historical merges use {@link openRuntimeCasVerificationCache}.
+ * serves one merge; logical consumers never construct these keys. Historical merges use {@link openRuntimeCasVerificationCache}.
  */
 export interface RuntimeCasVerifier {
   get(file: string): string | undefined;
