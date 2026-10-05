@@ -1,5 +1,7 @@
 # Runtime epoch 6 的已发布来源升级
 
+本文记录 epoch 6 的历史边界，以下 epoch 6/目标 journal 说明保持其原义。当前准入 epoch 为 8；当前补充见文末。
+
 ## 已发布来源证据
 
 Epoch 5 已公开发布，不能作为未发布格式原地补表。以下发布源码的 8 个输入文件与基线 `9b1f15124838344eaae9d49a977991daaa7e1ef1` 的 Git blob SHA 全部相同：`contracts.ts`、`schema/domainManifest.ts`、`schema/types.ts`、五个 `schema/domains*.ts`（Core、Execution、Context、Collaboration、CollaborationBoard）。它们决定 epoch、107 个领域、物理 DDL、manifest digest 与两条 trigger。
@@ -43,3 +45,13 @@ RuntimeDeliveryAnswerPresentation 按 delivery_id 唯一，独立归属于接收
 历史回填在原离线备份/日志保护及单一 SQLite 发布事务内按 250 行窗口推进，每行/每个有界 CAS 块让出执行，支持取消。输入只从已提交 Context occurrence 的不可变 envelope 读取身份和正文；不相信旧版追加/ACK 间隙可能已被替换的 PendingTurnInput。notify-only 没有原始 outcome 证明时明确为 unknown。原任务身份/标题仅取自核验过的不可变 spawn 请求；可选请求超过 1 MiB 时保留未知，不为预览读取整个大提示词。独立表示事实可以没有时间线坐标，不能借回填元数据发明先后顺序。
 
 快照和历史页只按索引加入当前卡片及其 canonical 已接收尝试的标量事实，不读取正文。派生的 peer liveness 受快照代数保护；旧历史页/旧详情不能在新快照后恢复过时的 known 状态。正文、来源身份和位置不因此清除。
+
+## 当前 epoch 8 的目录引用准入
+
+Epoch 7 随后引入 ConversationContextHandleState 与 ContextRootHandleCatalog 两个独立领域，共 113 个领域。其已发布描述来自 `763614c8d6014cf8267a83baab7b3b7e1587a1de`，固定在 `schema/publishedEpoch7.ts`；完整 domains/triggers/metadata SHA-256 为 `fd069dee963b1ad5032d1ea3121a583b0bc93cc9cfed43b9e684fb11beb7be46`。从 epoch 6 及更早来源升级时仍只插入当前 head 的 pending 标记，绝不在升级事务内回放历史或重建目录。
+
+当前 epoch 8 为紧凑普通 catalog-reference recipe 提供全数据集准入栅栏，保持 epoch 7 的领域、DDL、索引和 trigger 定义不变。精确 7→8 仅更新 schema_manifest 的 epoch、数据库 RootBinding 与外部 epoch/指针元数据；所有领域行、CAS 字节、ready/pending 状态、revision、provenance_revision 和 requires_native_reset 原样保留，不读取历史正文、不将 ready 改为 pending。旧 epoch 7 reader 必须拒绝 epoch 8 的打开；存活或身份未知的旧 Host 阻止离线升级。
+
+当前精确来源为已发布 3/4/5/6/7。新的升级使用 `epoch-to-8-migration.json`，沿用离线准入、Backup API、pending fence、synchronous=FULL 单事务与持久完成记录。中断的 3→4、3/4→5、3/4/5→6 与 3/4/5/6→7 journal 仍只证明原目标；提交过的旧升级先完成原目标的指针和完成记录，再独立备份升级到 8。不能把旧 journal 改签为 epoch 8，也不能仅因 epoch 7 与 8 的领域定义相同而绕过准入校验。
+
+候选发现、只读 preflight、后台逐库升级、历史查看及本地合并来源均纳入精确 epoch 7；外来拷贝仍不原地升级，必须已经是当前 epoch 才能通过核验。升级备份清理保留原 3→4 永久保留规则；精确目标为 5/6/7/8 的已完成升级仍须满足 7 天、同身份和完整覆盖证明。任一旧/新未完成 journal 阻止清理。现有 preservation、schema、历史入口与清理测试随当前 epoch 更新，历史目标断言保持原值。

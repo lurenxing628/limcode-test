@@ -13,7 +13,8 @@ import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
 import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocation';
-import { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
+import { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RETIRED_EPOCH_TO_6_JOURNAL_FILE,
+  RETIRED_EPOCH_TO_7_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
 import {
   isRuntimeDataRootAdmissionHeld, judgeRuntimeHostLivenessRecords, RuntimeClaimHeldError, runtimeHostLivenessDirectory,
   RuntimeMaintenanceBusyError, withRuntimeClaimAtPath, withRuntimeMaintenance, type RuntimeMaintenanceMetadata
@@ -161,7 +162,8 @@ const MERGE_LEDGER_RECORDS = 'records';
 /** A control root with any of these is in the middle of a transition, upgrade or cutover. */
 const IN_PROGRESS_FILES: readonly string[] = Object.freeze([
   ROOT_BINDING_PENDING_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE,
-  RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, CUTOVER_REQUEST_FILE, CUTOVER_JOURNAL_FILE
+  RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RETIRED_EPOCH_TO_6_JOURNAL_FILE,
+  RETIRED_EPOCH_TO_7_JOURNAL_FILE, CUTOVER_REQUEST_FILE, CUTOVER_JOURNAL_FILE
 ]);
 /** Errors of the moment (space, I/O, permissions, busy): "not verifiable now", never "failed". */
 const TRANSIENT_CODES = new Set(['ENOSPC', 'EDQUOT', 'EIO', 'EAGAIN', 'EBUSY', 'ETIMEDOUT', 'EMFILE', 'ENFILE', 'EACCES', 'EPERM', 'ENOMEM']);
@@ -1069,7 +1071,7 @@ function copiedNamePattern(base: string): RegExp {
 
 /** Why an older format is not opened here, saying only what is true of this root. */
 function oldFormatReason(location: ForeignRuntimeRootLocation, epoch: number): string {
-  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6) {
+  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6 && epoch !== 7) {
     return `它是不受支持的旧格式（第 ${epoch} 代），当前版本不能读取，也不能升级它。它原样保留，不会被删除。`;
   }
   if (location.kind === 'archive' || location.dataRootRelativePath.includes(`${VSCODE_RUNTIME_ARCHIVES_DIRECTORY}/`)) {

@@ -29,7 +29,7 @@ export interface RuntimeDataSetUpgradeResult {
   candidateId: string;
   binding: RootBinding;
   migrated: boolean;
-  previousEpoch?: 3 | 4 | 5 | 6;
+  previousEpoch?: 3 | 4 | 5 | 6 | 7;
   backupPath?: string;
 }
 
@@ -105,7 +105,7 @@ export async function upgradeDiscoveredRuntimeDataSets(
             '此历史库有未认证的 pending 状态，不能自动推断为旧格式升级；原数据保持不变。'
           );
         }
-      } else if (candidate.runtimeKernelEpoch !== 3 && candidate.runtimeKernelEpoch !== 4 && candidate.runtimeKernelEpoch !== 5 && candidate.runtimeKernelEpoch !== 6) {
+      } else if (candidate.runtimeKernelEpoch !== 3 && candidate.runtimeKernelEpoch !== 4 && candidate.runtimeKernelEpoch !== 5 && candidate.runtimeKernelEpoch !== 6 && candidate.runtimeKernelEpoch !== 7) {
         throw new RootAuthorityError(
           'runtime-epoch-migration-unsupported',
           `第 ${candidate.runtimeKernelEpoch} 代运行数据没有已验证的无损升级路径；原数据保持不变。`

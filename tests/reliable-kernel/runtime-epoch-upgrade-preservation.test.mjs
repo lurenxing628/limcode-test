@@ -25,7 +25,7 @@ const { PHYSICAL_CUTOVER_MANIFEST } = require(path.resolve(
 ));
 
 for (const previousEpoch of [3, 4, 5, 6]) {
-  test(`published epoch ${previousEpoch} upgrades to 7 with the conversation, message and CAS intact`, async () => {
+  test(`published epoch ${previousEpoch} upgrades to 8 with the conversation, message and CAS intact`, async () => {
     const fixture = await createPublishedRuntime(previousEpoch);
     let runtime;
     try {
@@ -38,7 +38,7 @@ for (const previousEpoch of [3, 4, 5, 6]) {
       assert.equal(result.binding.rootInstanceId, fixture.previous.rootInstanceId);
       assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + 1);
       assert.equal(result.binding.pointerRevision, fixture.previous.pointerRevision + 1);
-      assert.equal(result.binding.runtimeKernelEpoch, 7);
+      assert.equal(result.binding.runtimeKernelEpoch, 8);
       assert.equal(await fs.readFile(fixture.settingsPath, 'utf8'), 'keep-settings');
       assert.equal(await fs.readFile(fixture.workspacePath, 'utf8'), 'keep-workspace');
 
@@ -192,7 +192,7 @@ test('a deep Runtime path upgrades with a durable backup and opens the preserved
 });
 
 for (const oldState of ['pending-only', 'backed-up']) test(
-  `an interrupted published 3→4 ${oldState} state recovers and continues to epoch 7`, async () => {
+  `an interrupted published 3→4 ${oldState} state recovers and continues to epoch 8`, async () => {
     const fixture = await createPublishedRuntime(3);
     try {
       const next4 = {
@@ -225,7 +225,7 @@ for (const oldState of ['pending-only', 'backed-up']) test(
       const result = await new VscodeReliableKernelCutoverCoordinator(
         fixture.authority, fixture.scope
       ).ensureCurrentRoot();
-      assert.equal(result.binding.runtimeKernelEpoch, 7);
+      assert.equal(result.binding.runtimeKernelEpoch, 8);
       assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
       const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
       try { assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1); }
@@ -553,7 +553,7 @@ test('explicit upgrade resumes each exact pending migration boundary without req
       }), /stop at/);
       const result = await kernel.upgradeRuntimeDataSet(storagePaths, input);
       assert.equal(result.migrated, true);
-      assert.equal(result.binding.runtimeKernelEpoch, 7);
+      assert.equal(result.binding.runtimeKernelEpoch, 8);
       assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
       await fs.access(path.join(result.backupPath, 'limcode.epoch-4.sqlite'));
       const reader = await openHistory(storagePaths, input.candidateId);
@@ -571,7 +571,7 @@ test('explicit upgrade resumes each exact pending migration boundary without req
       }));
       const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
       assert.equal(result.previousEpoch, 3);
-      assert.equal(result.binding.runtimeKernelEpoch, 7);
+      assert.equal(result.binding.runtimeKernelEpoch, 8);
       await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
     } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
   });
@@ -614,7 +614,7 @@ test('automatic discovery upgrades independent histories after one failure and f
     const report = await kernel.upgradeDiscoveredRuntimeDataSets(storagePaths);
     assert.equal(report.stopped, false);
     assert.deepEqual(report.results.map(item => item.candidateId), [upgradeInput(intact).candidateId, upgradeInput(interrupted).candidateId]);
-    assert.ok(report.results.every(item => item.migrated && item.binding.runtimeKernelEpoch === 7 && item.backupPath));
+    assert.ok(report.results.every(item => item.migrated && item.binding.runtimeKernelEpoch === 8 && item.backupPath));
     const failure = report.failures.find(item => item.candidateId === upgradeInput(failed).candidateId);
     assert.equal(failure.stage, 'upgrade');
     assert.equal(failure.code, 'runtime-epoch-migration-failed');
@@ -651,7 +651,7 @@ test('automatic discovery stops between sources after deactivation and leaves th
     await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
     const selectedBefore = await preservedFiles(selected);
     const report = await kernel.upgradeDiscoveredRuntimeDataSets(storagePaths, {
-      shouldContinue: () => JSON.parse(readFileSync(first.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch !== 7
+      shouldContinue: () => JSON.parse(readFileSync(first.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch !== 8
     });
     assert.equal(report.stopped, true);
     assert.equal(report.failures.length, 0);
@@ -727,7 +727,7 @@ test('published epoch 5 has the frozen release fingerprint and retains every old
     const before = publishedEpoch5Rows(fixture.paths.databasePath);
     const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
     assert.equal(result.previousEpoch, 5);
-    assert.equal(result.binding.runtimeKernelEpoch, 7);
+    assert.equal(result.binding.runtimeKernelEpoch, 8);
     assert.deepEqual(publishedEpoch5Rows(fixture.paths.databasePath), before);
     const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
     try {
@@ -738,12 +738,12 @@ test('published epoch 5 has the frozen release fingerprint and retains every old
   } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
 });
 
-for (const fromEpoch of [4]) for (const state of ['pointer-published']) test(`published ${fromEpoch}→5 ${state} boundary converges before epoch 7`, async () => {
+for (const fromEpoch of [4]) for (const state of ['pointer-published']) test(`published ${fromEpoch}→5 ${state} boundary converges before epoch 8`, async () => {
   const fixture = await createPublishedRuntime(fromEpoch, { omitLegacyContinuation: true });
   try {
     const retired = await seedPublishedEpochBoundary(fixture, 5, state);
     const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-    assert.equal(result.binding.runtimeKernelEpoch, 7);
+    assert.equal(result.binding.runtimeKernelEpoch, 8);
     assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
     assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + (retired.committed ? 2 : 1));
     assert.equal(result.binding.pointerRevision, fixture.previous.pointerRevision + (retired.committed ? 2 : 1));
@@ -771,7 +771,7 @@ test('published epoch 6 upgrades with only pending markers and preserves every o
   const fixture = await createPublishedRuntime(6, { attachment: true });
   try {
     const schema = require(path.resolve('dist/extension/backend/reliableKernel/schema/publishedEpoch6.js'));
-    assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 7);
+    assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 8);
     assert.equal(schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS.length, 111);
     assert.equal(createHash('sha256').update(JSON.stringify({
       domains: schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS, triggers: schema.EPOCH_6_RUNTIME_SCHEMA_TRIGGERS,
@@ -794,7 +794,7 @@ test('published epoch 6 upgrades with only pending markers and preserves every o
     const casBefore = await fileDigests(fixture.paths.casRootPath);
     const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
     assert.equal(result.previousEpoch, 6);
-    assert.equal(result.binding.runtimeKernelEpoch, 7);
+    assert.equal(result.binding.runtimeKernelEpoch, 8);
     assert.deepEqual(publishedRows(fixture.paths.databasePath, schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS), before);
     assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
     const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
@@ -813,7 +813,7 @@ test('published epoch 6 upgrades with only pending markers and preserves every o
     const completion = JSON.parse(await fs.readFile(path.join(result.backupPath,
       kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), 'utf8'));
     assert.equal(completion.fromEpoch, 6);
-    assert.equal(completion.toEpoch, 7);
+    assert.equal(completion.toEpoch, 8);
     assert.equal(await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority), undefined);
   } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
 });
@@ -822,12 +822,12 @@ test('published epoch 6 upgrades with only pending markers and preserves every o
 for (const fromEpoch of [3, 4, 5]) for (const state of fromEpoch === 5 ? [
   'pending-only', 'fenced', 'backed_up', 'commit-before-journal',
   'database_committed', 'manifest-published', 'pointer-published', 'completed'
-] : ['backed_up', 'commit-before-journal']) test(`published ${fromEpoch}→6 ${state} boundary retains target 6 before upgrading to 7`, async () => {
+] : ['backed_up', 'commit-before-journal']) test(`published ${fromEpoch}→6 ${state} boundary retains target 6 before upgrading to 8`, async () => {
   const fixture = await createPublishedRuntime(fromEpoch, { omitLegacyContinuation: true });
   try {
     const retired = await seedPublishedEpochBoundary(fixture, 6, state);
     const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-    assert.equal(result.binding.runtimeKernelEpoch, 7);
+    assert.equal(result.binding.runtimeKernelEpoch, 8);
     assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
     assert.equal(result.binding.rootInstanceId, fixture.previous.rootInstanceId);
     assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + (retired.committed ? 2 : 1));

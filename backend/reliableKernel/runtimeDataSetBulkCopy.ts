@@ -118,7 +118,7 @@ export interface RuntimeDataSetCopyReceipt {
     /** Source queries of the whole copy (the sum over every batch). */
     reads: number;
   };
-  upgradedFromEpoch?: 3 | 4 | 5 | 6;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7;
 }
 
 /**

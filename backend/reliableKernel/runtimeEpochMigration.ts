@@ -34,6 +34,11 @@ import {
   EPOCH_6_RUNTIME_DOMAIN_SCHEMAS, EPOCH_6_RUNTIME_SCHEMA_TRIGGERS,
   EPOCH_6_RUNTIME_METADATA_SQL, EPOCH_6_RUNTIME_CONTRACT_DIGEST
 } from './schema/publishedEpoch6';
+import {
+  EPOCH_7_RUNTIME_DOMAIN_SCHEMAS, EPOCH_7_RUNTIME_SCHEMA_TRIGGERS,
+  EPOCH_7_RUNTIME_METADATA_SQL, EPOCH_7_RUNTIME_CONTRACT_DIGEST
+} from './schema/publishedEpoch7';
+export { EPOCH_7_RUNTIME_DOMAIN_SCHEMAS, EPOCH_7_RUNTIME_CONTRACT_DIGEST } from './schema/publishedEpoch7';
 export { EPOCH_6_RUNTIME_DOMAIN_SCHEMAS, EPOCH_6_RUNTIME_CONTRACT_DIGEST } from './schema/publishedEpoch6';
 export { EPOCH_5_RUNTIME_DOMAIN_SCHEMAS, EPOCH_5_RUNTIME_CONTRACT_DIGEST } from './schema/publishedEpoch5';
 import { migrateChildRuntimeDeliveryIntentLinks } from './runtimeDeliveryIntentLinkMigration';
@@ -51,8 +56,9 @@ import {
 } from './rootAuthority';
 
 export const PREVIOUS_RUNTIME_KERNEL_EPOCH = 3;
-export const LATEST_PUBLISHED_RUNTIME_KERNEL_EPOCH = 6;
-export const RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE = 'epoch-to-7-migration.json';
+export const LATEST_PUBLISHED_RUNTIME_KERNEL_EPOCH = 7;
+export const RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE = 'epoch-to-8-migration.json';
+export const RETIRED_EPOCH_TO_7_JOURNAL_FILE = 'epoch-to-7-migration.json';
 export const RETIRED_EPOCH_TO_6_JOURNAL_FILE = 'epoch-to-6-migration.json';
 export const RETIRED_EPOCH_TO_5_JOURNAL_FILE = 'epoch-to-5-migration.json';
 export const RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY = 'epoch-migration-backups';
@@ -139,15 +145,15 @@ export interface RuntimeEpochMigrationOptions {
 export interface RuntimeEpochMigrationResult {
   binding: RootBinding;
   migrated: boolean;
-  previousEpoch?: 3 | 4 | 5 | 6;
+  previousEpoch?: 3 | 4 | 5 | 6 | 7;
   backupDirectoryName?: string;
   backupPath?: string;
 }
 
 interface HistoricalRuntimeEpochMigrationJournal {
   kind: typeof MIGRATION_KIND;
-  fromEpoch: 3 | 4 | 5 | 6;
-  toEpoch: 5 | 6 | typeof RUNTIME_KERNEL_EPOCH;
+  fromEpoch: 3 | 4 | 5 | 6 | 7;
+  toEpoch: 5 | 6 | 7 | typeof RUNTIME_KERNEL_EPOCH;
   attemptId: string;
   state: 'fenced' | 'backed_up' | 'database_committed' | 'completed';
   backupDirectoryName: string;
@@ -164,20 +170,20 @@ interface RuntimeEpochMigrationJournal extends HistoricalRuntimeEpochMigrationJo
 }
 
 /**
- * Read-only startup-gate preflight for the exact published epoch-3/4/5/6 predecessors and an
+ * Read-only startup-gate preflight for the exact published epoch-3/4/5/6/7 predecessors and an
  * interrupted upgrade journal. Current roots without a journal stay on the ordinary attach path.
  */
 export async function previousRuntimeEpochMigrationRequired(authority: RootAuthority): Promise<boolean> {
   const paths = authority.expectedPaths();
   const controlRoot = path.dirname(paths.dataRootPath);
   if (await readJournal(controlRoot) || await readMigrationJournal(controlRoot, 5)
-    || await readMigrationJournal(controlRoot, 6)) return true;
+    || await readMigrationJournal(controlRoot, 6) || await readMigrationJournal(controlRoot, 7)) return true;
   const initialPointer = await authority.readHistoricalPointerForCutover();
   return isSupportedPreviousEpoch(initialPointer?.runtimeKernelEpoch);
 }
 
 /**
- * Upgrades exact published epoch-3/4/5/6 SQLite/CAS roots to epoch 7 before the Runtime
+ * Upgrades exact published epoch-3/4/5/6/7 SQLite/CAS roots to epoch 8 before the Runtime
  * opens. Existing rows and CAS objects remain in place. A verified SQLite backup and durable
  * journal precede the single-transaction schema change. Epoch 3 and the exact epoch-4 predecessor
  * missing only RuntimeDeliveryIntentLink use the bounded Child continuation conversion. Unknown
@@ -195,11 +201,13 @@ export async function migratePreviousRuntimeEpochIfRequired(
   const existingJournal = await readJournal(controlRoot);
   const publishedEpoch5Journal = await readMigrationJournal(controlRoot, 5);
   const publishedEpoch6Journal = await readMigrationJournal(controlRoot, 6);
+  const publishedEpoch7Journal = await readMigrationJournal(controlRoot, 7);
   const initialPointer = await authority.readHistoricalPointerForCutover();
   if (
     !existingJournal
     && !publishedEpoch5Journal
     && !publishedEpoch6Journal
+    && !publishedEpoch7Journal
     && !isSupportedPreviousEpoch(initialPointer?.runtimeKernelEpoch)
   ) {
     return undefined;
@@ -208,7 +216,8 @@ export async function migratePreviousRuntimeEpochIfRequired(
   return withRuntimeMaintenance(paths, async () => {
     await assertRuntimeHostsOffline(paths);
     const journals = await Promise.all([readJournal(controlRoot),
-      readMigrationJournal(controlRoot, 5), readMigrationJournal(controlRoot, 6)]);
+      readMigrationJournal(controlRoot, 5), readMigrationJournal(controlRoot, 6),
+      readMigrationJournal(controlRoot, 7)]);
     if (journals.filter(Boolean).length > 1) {
       throw new RootAuthorityError('runtime-epoch-migration-conflict',
         'Two different epoch migrations cannot own the same Runtime root.');
@@ -221,6 +230,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
     await recoverRetiredEpoch3To4Boundary(authority, controlRoot);
     await recoverPublishedEpochBoundary(authority, controlRoot, 5);
     await recoverPublishedEpochBoundary(authority, controlRoot, 6);
+    await recoverPublishedEpochBoundary(authority, controlRoot, 7);
     let journal = await readJournal(controlRoot);
     const previous = await authority.readHistoricalPointerForCutover();
     if (previous?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
@@ -252,7 +262,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
     if (!previous || !isSupportedPreviousEpoch(previous.runtimeKernelEpoch)) {
       throw new RootAuthorityError(
         'runtime-epoch-migration-unsupported',
-        'The historical Runtime pointer is missing or is not an exact published epoch-3/4/5/6 predecessor.'
+        'The historical Runtime pointer is missing or is not an exact published epoch-3/4/5/6/7 predecessor.'
       );
     }
 
@@ -322,25 +332,25 @@ export async function migratePreviousRuntimeEpochIfRequired(
     return {
       binding,
       migrated: true,
-      previousEpoch: previous.runtimeKernelEpoch as 3 | 4 | 5 | 6,
+      previousEpoch: previous.runtimeKernelEpoch as 3 | 4 | 5 | 6 | 7,
       backupDirectoryName: journal.backupDirectoryName,
       backupPath: backupRootPath(controlRoot, journal)
     };
   });
 }
 
-function isSupportedPreviousEpoch(epoch: number | undefined): epoch is 3 | 4 | 5 | 6 {
-  return epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6;
+function isSupportedPreviousEpoch(epoch: number | undefined): epoch is 3 | 4 | 5 | 6 | 7 {
+  return epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7;
 }
 
 /**
- * Published binaries shipped 3/4→5 and 3/4/5→6 journals and pending bindings. Converge
- * only those exact historical boundaries before staging epoch 7. An uncommitted database keeps every old row and drops only
+ * Published binaries shipped 3/4→5, 3/4/5→6 and 3/4/5/6→7 journals and pending bindings.
+ * Converge only those exact historical boundaries before staging epoch 8. An uncommitted database keeps every old row and drops only
  * the authenticated fence; a committed historical database must prove its durable backup before
  * publishing its original target binding and completion receipt. Neither case invents rows.
  */
 async function recoverPublishedEpochBoundary(
-  authority: RootAuthority, controlRoot: string, targetEpoch: 5 | 6
+  authority: RootAuthority, controlRoot: string, targetEpoch: 5 | 6 | 7
 ): Promise<void> {
   const paths = authority.expectedPaths();
   const pointer = await authority.readHistoricalPointerForCutover();
@@ -359,7 +369,8 @@ async function recoverPublishedEpochBoundary(
   };
   const pointerPublished = historicalBindingsEqual(pointer, next);
   if ((previous.runtimeKernelEpoch !== 3 && previous.runtimeKernelEpoch !== 4
-      && !(targetEpoch === 6 && previous.runtimeKernelEpoch === 5))
+      && !(targetEpoch >= 6 && previous.runtimeKernelEpoch === 5)
+      && !(targetEpoch === 7 && previous.runtimeKernelEpoch === 6))
     || JSON.stringify(previous.paths) !== JSON.stringify(paths)
     || (!historicalBindingsEqual(pointer, previous) && !pointerPublished)
     || (pending && !historicalBindingsEqual(pending, next))
@@ -616,7 +627,7 @@ export async function assertPublishedPreviousRuntimeEpochSnapshot(
   if (!isSupportedPreviousEpoch(binding.runtimeKernelEpoch)) {
     throw new RootAuthorityError(
       'runtime-epoch-migration-unsupported',
-      'The historical Runtime pointer is not an exact published epoch-3/4/5/6 predecessor.'
+      'The historical Runtime pointer is not an exact published epoch-3/4/5/6/7 predecessor.'
     );
   }
   await assertPreviousEpochManifest(binding);
@@ -711,7 +722,9 @@ function assertPreviousEpochDatabase(
   try {
     assertRuntimePhysicalSchemaFingerprint(database, schemas, {
       label: `Epoch-${binding.runtimeKernelEpoch} Runtime physical`,
-      historicalContract: binding.runtimeKernelEpoch === 6
+      historicalContract: binding.runtimeKernelEpoch === 7
+        ? { metadataSql: EPOCH_7_RUNTIME_METADATA_SQL, triggers: EPOCH_7_RUNTIME_SCHEMA_TRIGGERS }
+        : binding.runtimeKernelEpoch === 6
         ? { metadataSql: EPOCH_6_RUNTIME_METADATA_SQL, triggers: EPOCH_6_RUNTIME_SCHEMA_TRIGGERS }
         : { metadataSql: EPOCH_5_RUNTIME_METADATA_SQL, triggers: EPOCH_5_RUNTIME_SCHEMA_TRIGGERS }
     });
@@ -776,8 +789,16 @@ async function migrateDatabase(
         backfillProvenRuntimeInputTimeline(database);
         await backfillAcceptedAnswerPresentations(database, previous.paths.casRootPath, signal);
       }
-      seedPendingConversationHandleStates(database);
-      replaceSchemaManifest(database);
+      if (previous.runtimeKernelEpoch < 7) seedPendingConversationHandleStates(database);
+      if (previous.runtimeKernelEpoch === 7) {
+        // Epoch 8 is a reader-admission boundary for reference-only ordinary recipes. Its
+        // physical schema is unchanged: preserve every domain row, including both ready and
+        // pending handle-state checkpoints, and never inspect or rewrite historical CAS bodies.
+        database.prepare('UPDATE schema_manifest SET runtime_kernel_epoch = ? WHERE runtime_kernel_epoch = 7')
+          .run(BigInt(RUNTIME_KERNEL_EPOCH));
+      } else {
+        replaceSchemaManifest(database);
+      }
       const update = database.prepare(`
         UPDATE root_binding
            SET root_generation = @rootGeneration,
@@ -1059,7 +1080,7 @@ async function readJournal(controlRoot: string): Promise<RuntimeEpochMigrationJo
 
 /** Only these exact published targets and the current target are recognized; this is not an open migration chain. */
 async function readMigrationJournal(
-  controlRoot: string, targetEpoch: 5 | 6 | typeof RUNTIME_KERNEL_EPOCH
+  controlRoot: string, targetEpoch: 5 | 6 | 7 | typeof RUNTIME_KERNEL_EPOCH
 ): Promise<HistoricalRuntimeEpochMigrationJournal | undefined> {
   const value = await readJsonIfExists(journalPath(controlRoot, targetEpoch));
   if (value === undefined) return undefined;
@@ -1070,6 +1091,8 @@ async function readMigrationJournal(
     || !isSupportedPreviousEpoch(record.fromEpoch as number)
     || (targetEpoch === 5 && record.fromEpoch !== 3 && record.fromEpoch !== 4)
     || (targetEpoch === 6 && record.fromEpoch !== 3 && record.fromEpoch !== 4 && record.fromEpoch !== 5)
+    || (targetEpoch === 7 && record.fromEpoch !== 3 && record.fromEpoch !== 4
+      && record.fromEpoch !== 5 && record.fromEpoch !== 6)
     || record.toEpoch !== targetEpoch
     || typeof record.attemptId !== 'string' || record.attemptId.length === 0
     || !states.has(String(record.state))
@@ -1176,7 +1199,7 @@ function assertPublishedPreviousEpochManifest(
       `Epoch-${epoch} schema manifest domain count is invalid.`
     );
   }
-  if (epoch === 4 || epoch === 5 || epoch === 6) {
+  if (epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7) {
     const byKey = new Map(schemas.map((schema) => [schema.key, schema]));
     const mismatch = rows.find((row) => {
       const schema = byKey.get(requireText(row.domain_key, 'schema_manifest.domain_key'));
@@ -1215,6 +1238,7 @@ function previousSchemas(database: Database.Database, epoch: number): readonly R
   if (epoch === PREVIOUS_RUNTIME_KERNEL_EPOCH) return PREVIOUS_RUNTIME_DOMAIN_SCHEMAS;
   if (epoch === 5) return EPOCH_5_RUNTIME_DOMAIN_SCHEMAS;
   if (epoch === 6) return EPOCH_6_RUNTIME_DOMAIN_SCHEMAS;
+  if (epoch === 7) return EPOCH_7_RUNTIME_DOMAIN_SCHEMAS;
   if (epoch === 4) {
     const count = (database.prepare('SELECT COUNT(*) AS count FROM schema_manifest').get() as { count: bigint }).count;
     if (count === BigInt(EPOCH_4_RUNTIME_DOMAIN_SCHEMAS.length)) return EPOCH_4_RUNTIME_DOMAIN_SCHEMAS;
@@ -1255,9 +1279,10 @@ function historicalBindingsEqual(
     && JSON.stringify(left.paths) === JSON.stringify(right.paths);
 }
 
-function journalPath(controlRoot: string, targetEpoch: 5 | 6 | typeof RUNTIME_KERNEL_EPOCH = RUNTIME_KERNEL_EPOCH): string {
+function journalPath(controlRoot: string, targetEpoch: 5 | 6 | 7 | typeof RUNTIME_KERNEL_EPOCH = RUNTIME_KERNEL_EPOCH): string {
   return path.join(controlRoot, targetEpoch === 5 ? RETIRED_EPOCH_TO_5_JOURNAL_FILE
-    : targetEpoch === 6 ? RETIRED_EPOCH_TO_6_JOURNAL_FILE : RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE);
+    : targetEpoch === 6 ? RETIRED_EPOCH_TO_6_JOURNAL_FILE
+    : targetEpoch === 7 ? RETIRED_EPOCH_TO_7_JOURNAL_FILE : RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE);
 }
 
 function backupRootPath(
@@ -1349,8 +1374,8 @@ function requireText(value: unknown, label: string): string {
   return value;
 }
 
-if (RUNTIME_KERNEL_EPOCH !== 7) {
-  throw new Error('The published epoch-3/4/5/6 migration is valid only for epoch 7.');
+if (RUNTIME_KERNEL_EPOCH !== 8) {
+  throw new Error('The published epoch-3/4/5/6/7 migration is valid only for epoch 8.');
 }
 
 if (EPOCH_5_RUNTIME_DOMAIN_SCHEMAS.length !== 107
@@ -1361,7 +1386,7 @@ if (EPOCH_5_RUNTIME_DOMAIN_SCHEMAS.length !== 107
   throw new Error('The exact published epoch-5 domain, trigger or metadata contract changed.');
 }
 
-// Epoch 7 preserves every published table, column and existing index. The only descriptor
+// Epoch 8 preserves every published table, column and existing index. The only descriptor
 // extension is this exact ordered pair of additional RuntimeDelivery seek indexes, explicitly
 // created by the migration above. No generic index filtering or changed-column allowance.
 for (const published of EPOCH_5_RUNTIME_DOMAIN_SCHEMAS) {
@@ -1371,7 +1396,7 @@ for (const published of EPOCH_5_RUNTIME_DOMAIN_SCHEMAS) {
       'target_conversation_id,state,created_at,id', 'target_conversation_id,created_at,id']
   } : published;
   if (!current || domainSchemaDigest(current) !== domainSchemaDigest(expected)) {
-    throw new Error(`Epoch 7 changed the published epoch-5 domain ${published.key}.`);
+    throw new Error(`Epoch 8 changed the published epoch-5 domain ${published.key}.`);
   }
 }
 
@@ -1386,19 +1411,36 @@ if (JSON.stringify(EPOCH_6_RUNTIME_SCHEMA_TRIGGERS) !== JSON.stringify(RUNTIME_S
   || JSON.stringify(EPOCH_6_RUNTIME_METADATA_SQL) !== JSON.stringify([
     createRootBindingTableSql(), createSchemaManifestTableSql()
   ])) {
-  throw new Error('Epoch 7 must preserve the published epoch-6 metadata and triggers.');
+  throw new Error('Epoch 8 must preserve the published epoch-6 metadata and triggers.');
 }
 for (const published of EPOCH_6_RUNTIME_DOMAIN_SCHEMAS) {
   const current = RUNTIME_DOMAIN_SCHEMAS.find((schema) => schema.key === published.key);
   if (!current || domainSchemaDigest(current) !== domainSchemaDigest(published)) {
-    throw new Error(`Epoch 7 changed the published epoch-6 domain ${published.key}.`);
+    throw new Error(`Epoch 8 changed the published epoch-6 domain ${published.key}.`);
   }
 }
-const epoch7Added = RUNTIME_DOMAIN_SCHEMAS.filter((schema) =>
+const epoch7Added = EPOCH_7_RUNTIME_DOMAIN_SCHEMAS.filter((schema) =>
   !EPOCH_6_RUNTIME_DOMAIN_SCHEMAS.some((published) => published.key === schema.key));
 if (epoch7Added.length !== 2 || !epoch7Added.some(schema => schema.key === 'ConversationContextHandleState')
   || !epoch7Added.some(schema => schema.key === 'ContextRootHandleCatalog')) {
   throw new Error('Epoch 7 must add exactly ConversationContextHandleState and ContextRootHandleCatalog to the published epoch-6 contract.');
+}
+
+// The epoch-7 snapshot is immutable and independent of current domain modules. Epoch 8
+// changes recipe reader admission only; no metadata DDL, trigger or domain descriptor changes.
+if (EPOCH_7_RUNTIME_DOMAIN_SCHEMAS.length !== 113
+  || createHash('sha256').update(JSON.stringify({
+    domains: EPOCH_7_RUNTIME_DOMAIN_SCHEMAS, triggers: EPOCH_7_RUNTIME_SCHEMA_TRIGGERS,
+    metadata: EPOCH_7_RUNTIME_METADATA_SQL
+  })).digest('hex') !== EPOCH_7_RUNTIME_CONTRACT_DIGEST) {
+  throw new Error('The exact published epoch-7 domain, trigger or metadata contract changed.');
+}
+if (JSON.stringify(EPOCH_7_RUNTIME_DOMAIN_SCHEMAS) !== JSON.stringify(RUNTIME_DOMAIN_SCHEMAS)
+  || JSON.stringify(EPOCH_7_RUNTIME_SCHEMA_TRIGGERS) !== JSON.stringify(RUNTIME_SCHEMA_TRIGGERS)
+  || JSON.stringify(EPOCH_7_RUNTIME_METADATA_SQL) !== JSON.stringify([
+    createRootBindingTableSql(), createSchemaManifestTableSql()
+  ])) {
+  throw new Error('Epoch 8 must preserve the exact published epoch-7 physical contract.');
 }
 
 if (PREVIOUS_RUNTIME_DOMAIN_SCHEMAS.length !== 87) {
