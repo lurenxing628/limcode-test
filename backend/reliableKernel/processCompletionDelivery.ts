@@ -846,7 +846,10 @@ export class ProcessCompletionDeliveryControlPlane {
     return created;
   }
 
-  private async ensureWakeForDelivery(delivery: DomainRow): Promise<{ wake: DomainRow; created: boolean }> {
+  private async ensureWakeForDelivery(
+    delivery: DomainRow,
+    retryPendingStateChange = true
+  ): Promise<{ wake: DomainRow; created: boolean }> {
     const deliveryId = requirePhaseFId(delivery.id, 'RuntimeDelivery.id');
     const inboxItemId = requirePhaseFId(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id');
     const wakeId = stablePhaseFId('runtime_delivery_wake', deliveryId);
@@ -884,6 +887,19 @@ export class ProcessCompletionDeliveryControlPlane {
       ]);
       return { wake: await this.requireExisting('RuntimeDeliveryWake', wakeId), created: true };
     } catch (error) {
+      if (retryPendingStateChange && delivery.state === 'pending'
+        && isTransactionAssertionFailure(error) && error instanceof Error
+        && error.message === `RuntimeDeliveryRepository transaction assertion failed for ${deliveryId}.`) {
+        const latest = await this.requireExisting('RuntimeDelivery', deliveryId);
+        // Injection or abandonment may win before this wake exists. Rebuild its state from that
+        // same attempt, once: consumed/failed are terminal, and the retried transaction keeps the
+        // exact state assertion. An unchanged row or a different identity is not a routing race.
+        if ((latest.state === 'consumed' || latest.state === 'failed')
+          && ['id', 'inbox_item_id', 'target_conversation_id', 'attempt_seq', 'retry_of_delivery_id', 'created_at']
+            .every((column) => latest[column] === delivery[column])) {
+          return this.ensureWakeForDelivery(latest, false);
+        }
+      }
       if (!sqliteUniqueFailureIncludes(error, [
         'runtime_delivery_wake.id',
         'runtime_delivery_wake.delivery_id'

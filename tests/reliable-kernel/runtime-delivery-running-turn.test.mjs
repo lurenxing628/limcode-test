@@ -354,6 +354,133 @@ test('an answer for a stopped parent Turn that a newer child generation supersed
   });
 });
 
+/** Interleave a real commit after the wake's delivery read, immediately before its state CAS. */
+async function duringWakeCreation(app, deliveryId, beforeFirstCreation, run) {
+  const transaction = app.database.transaction;
+  const assertedStates = [];
+  const errors = [];
+  app.database.transaction = async function(steps, options) {
+    if (!steps.some(step => step.kind === 'insert' && step.domain === 'RuntimeDeliveryWake'
+      && step.row.delivery_id === deliveryId)) return transaction.call(this, steps, options);
+    const guard = steps.find(step => step.kind === 'assert' && step.domain === 'RuntimeDelivery' && step.id === deliveryId);
+    assert.ok(guard, 'wake creation retains its delivery CAS');
+    assertedStates.push(guard.where.state);
+    try {
+      if (assertedStates.length === 1) await beforeFirstCreation(steps, transaction.bind(this));
+      return await transaction.call(this, steps, options);
+    } catch (error) {
+      errors.push(error);
+      throw error;
+    }
+  };
+  try {
+    return { result: await run(), assertedStates, errors };
+  } finally {
+    app.database.transaction = transaction;
+  }
+}
+
+for (const state of ['consumed', 'failed']) {
+  test(`wake creation retries a pending delivery that became ${state} before its CAS`, { timeout: 30000 }, async () => {
+    await withKernel(async ({ app, startTurn, childAnswer, wakes, rows }) => {
+      const parent = await startTurn(`wake-creation-${state}`);
+      const answer = await childAnswer(`wake-creation-${state}`, parent.turnId);
+      const created = await app.runtime.deliveries.createAutomatic({ inboxItemId: answer.inboxItemId,
+        targetConversationId: CONVERSATION, sourceTurnId: parent.turnId });
+      const deliveryId = created.delivery.id;
+      const observed = await duringWakeCreation(app, deliveryId, async () => {
+        if (state === 'consumed') {
+          await kernel.runWithExecutionLeaseFence(parent.fence,
+            () => app.runtime.deliveries.advance(deliveryId, { boundaryTurnId: parent.turnId }));
+          const [link] = await rows('RuntimeDeliveryInputLink', { delivery_id: deliveryId });
+          await app.runtime.deliveries.markInputHandled(link.pending_turn_input_id);
+        } else {
+          assert.equal((await app.runtime.deliveries.abandonPending({ deliveryId, reason: 'fixture-abandoned' })).outcome, 'abandoned');
+        }
+      }, () => app.processDeliveries.scanNow());
+      assert.deepEqual(observed.assertedStates, ['pending', state], 'the retry rebuilds exactly one state CAS');
+      assert.equal(observed.errors.length, 1);
+      assert.equal(observed.errors[0].code, 'RUNTIME_TRANSACTION_ASSERTION_FAILED');
+      assert.equal(observed.errors[0].message, `RuntimeDeliveryRepository transaction assertion failed for ${deliveryId}.`);
+      assert.equal(observed.result.failures, 0, 'a real delivery state race does not fail the scan');
+      assert.equal(observed.result.wakesCreated, 1);
+      const deliveries = await rows('RuntimeDelivery', { id: deliveryId });
+      assert.equal(deliveries.length, 1);
+      assert.equal(deliveries[0].state, state);
+      const outbox = await rows('RuntimeDeliveryWake', { delivery_id: deliveryId });
+      assert.equal(outbox.length, 1);
+      assert.equal(outbox[0].state, state === 'consumed' ? 'acknowledged' : 'dead_letter');
+      assert.equal(outbox[0].failure_count, state === 'consumed' ? 0n : 1n);
+      assert.equal(outbox[0].last_error, state === 'consumed' ? null : 'fixture-abandoned');
+      assert.deepEqual(wakes.map(wake => wake.action), state === 'consumed' ? ['resume_current_turn'] : []);
+      const links = await rows('RuntimeDeliveryInputLink', { delivery_id: deliveryId });
+      assert.equal(links.length, state === 'consumed' ? 1 : 0);
+      if (links.length) assert.notEqual(links[0].handled_at, null, 'the one input keeps its executor ACK');
+      assert.equal((await rows('PendingTurnInput', { turn_id: parent.turnId, input_kind: 'runtime_delivery' })).length,
+        state === 'consumed' ? 1 : 0, 'wake creation never duplicates the accepted input');
+      assert.equal((await rows('RuntimeDeliveryIntentLink', { delivery_id: deliveryId })).length, 0);
+      assert.equal((await app.processDeliveries.scanNow()).wakesCreated, 0, 'a later scan reuses the durable wake');
+    });
+  });
+}
+
+test('wake creation reuses the same stable wake when another creator wins', { timeout: 30000 }, async () => {
+  await withKernel(async ({ app, startTurn, childAnswer, rows }) => {
+    const parent = await startTurn('wake-creation-winner');
+    const answer = await childAnswer('wake-creation-winner', parent.turnId);
+    const created = await app.runtime.deliveries.createAutomatic({ inboxItemId: answer.inboxItemId,
+      targetConversationId: CONVERSATION, sourceTurnId: parent.turnId });
+    let winningWakeId;
+    const observed = await duringWakeCreation(app, created.delivery.id, async (steps, transaction) => {
+      winningWakeId = steps.find(step => step.kind === 'insert' && step.domain === 'RuntimeDeliveryWake').row.id;
+      await transaction(steps);
+    }, () => app.processDeliveries.scanNow());
+    assert.deepEqual(observed.assertedStates, ['pending'], 'a wake identity conflict needs no state retry');
+    assert.equal(observed.errors.length, 1);
+    assert.match(observed.errors[0].message, /UNIQUE constraint failed: runtime_delivery_wake\./);
+    assert.equal(observed.result.failures, 0);
+    assert.equal(observed.result.wakesCreated, 0);
+    const outbox = await rows('RuntimeDeliveryWake', { delivery_id: created.delivery.id });
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0].id, winningWakeId);
+    assert.equal(outbox[0].state, 'acknowledged');
+    assert.equal(outbox[0].failure_count, 0n);
+  });
+});
+
+test('wake creation leaves unchanged assertions, conflicting identities and unrelated errors fail-closed', { timeout: 30000 }, async () => {
+  await withKernel(async ({ app, startTurn, childAnswer, rows }) => {
+    const parent = await startTurn('wake-creation-fail-closed');
+    const answer = await childAnswer('wake-creation-fail-closed', parent.turnId);
+    const created = await app.runtime.deliveries.createAutomatic({ inboxItemId: answer.inboxItemId,
+      targetConversationId: CONVERSATION, sourceTurnId: parent.turnId });
+    const deliveryId = created.delivery.id;
+    const failures = [
+      Object.assign(new Error(`RuntimeDeliveryRepository transaction assertion failed for ${deliveryId}.`),
+        { code: 'RUNTIME_TRANSACTION_ASSERTION_FAILED' }),
+      Object.assign(new Error('ExecutionLeaseRepository transaction assertion failed for fixture-lease.'),
+        { code: 'RUNTIME_TRANSACTION_ASSERTION_FAILED' }),
+      Object.assign(new Error('fixture database failure'), { code: 'SQLITE_IOERR' })
+    ];
+    for (const failure of failures) {
+      const observed = await duringWakeCreation(app, deliveryId, async () => { throw failure; },
+        () => assert.rejects(app.processDeliveries.scanNow(), error => error === failure));
+      assert.deepEqual(observed.assertedStates, ['pending'], 'unproven races never retry');
+      assert.equal((await rows('RuntimeDeliveryWake', { delivery_id: deliveryId })).length, 0);
+      assert.equal((await rows('RuntimeDelivery', { id: deliveryId }))[0].state, 'pending');
+    }
+    const conflicted = { ...created.delivery, target_conversation_id: 'different-conversation' };
+    const observed = await duringWakeCreation(app, deliveryId, async () => {
+      await kernel.runWithExecutionLeaseFence(parent.fence,
+        () => app.runtime.deliveries.advance(deliveryId, { boundaryTurnId: parent.turnId }));
+    }, () => assert.rejects(app.processDeliveries.ensureWakeForDelivery(conflicted), error =>
+      error.code === 'RUNTIME_TRANSACTION_ASSERTION_FAILED'
+      && error.message === `RuntimeDeliveryRepository transaction assertion failed for ${deliveryId}.`));
+    assert.deepEqual(observed.assertedStates, ['pending'], 'a changed state does not excuse conflicting attempt identity');
+    assert.equal((await rows('RuntimeDeliveryWake', { delivery_id: deliveryId })).length, 0);
+  });
+});
+
 test('a wake rescans without a failure only when its delivery moved; an authority that keeps failing counts as a failed wake', { timeout: 30000 }, async () => {
   await withKernel(async ({ app, startTurn, endTurn, processResult, wakes, rows }) => {
     const source = await startTurn('wake-source');
