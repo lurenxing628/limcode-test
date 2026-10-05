@@ -1,4 +1,4 @@
-import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
+import { frozenRecipeAttachmentHandles } from './frozenModelHandleCatalog';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { toolArtifactIdentifiesCall } from './copiedToolIdentity';
 import { isPersistentContextHandle, normalizeModelHandleCatalog,
@@ -48,7 +48,7 @@ export async function readFrozenConversationAttachmentReservations(database: Run
       let frozen = recipeCache.get(recipeId);
       if (frozen === undefined) {
         const recipe = await readFrozenObject(database, contentStore, recipeId, RECIPE_CONTENT_TYPE);
-        frozen = (await resolveFrozenModelHandleCatalog(database, contentStore, recipe)).entries.filter(entry => entry.kind === 'attachment');
+        frozen = frozenRecipeAttachmentHandles(recipe).entries.filter(entry => entry.kind === 'attachment');
         recipeCache.set(recipeId, frozen);
         if (recipeCache.size > 64) recipeCache.delete(recipeCache.keys().next().value!);
       }
