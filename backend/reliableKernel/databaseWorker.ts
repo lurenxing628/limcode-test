@@ -2606,6 +2606,7 @@ function executeContextMaterialization(
     const rawRoot = prepareCached(database, 'SELECT * FROM context_sequence_root WHERE id = ?').get(normalizedRootId);
     if (!rawRoot) throw new Error(`ContextSequenceRoot ${normalizedRootId} does not exist.`);
     const root = rootRepository.codec.decode(rawRoot as Record<string, unknown>);
+    const conversationId = requireRuntimeId(root.conversation_id);
     const rootNodeId = nullableRuntimeId(root.root_node_id, 'ContextSequenceRoot.root_node_id');
     const tailNodeId = nullableRuntimeId(root.tail_node_id, 'ContextSequenceRoot.tail_node_id');
     const tailCount = nonNegativeSafeInteger(root.tail_segment_count, 'ContextSequenceRoot.tail_segment_count');
@@ -2616,7 +2617,7 @@ function executeContextMaterialization(
         throw new Error(`ContextSequenceRoot ${normalizedRootId} has an invalid empty shape.`);
       }
     } else {
-      const rootRecord = readContextRecord(database, rootNodeId);
+      const rootRecord = readContextRecord(database, rootNodeId, conversationId);
       if (rootRecord.segment.segment_kind === 'compression') {
         if (rootRecord.node.parent_node_id !== null) {
           throw new Error(`Compression root ${normalizedRootId} summary node must not have a parent.`);
@@ -2624,7 +2625,7 @@ function executeContextMaterialization(
         if ((tailCount === 0) !== (tailNodeId === null)) {
           throw new Error(`Compression root ${normalizedRootId} tail pointer/count mismatch.`);
         }
-        const tail = tailNodeId === null ? [] : readContextChain(database, tailNodeId, tailCount);
+        const tail = tailNodeId === null ? [] : readContextChain(database, tailNodeId, tailCount, conversationId);
         records = [rootRecord, ...tail];
         if (records.length !== segmentCount) {
           throw new Error(`Compression root ${normalizedRootId} segment_count mismatch.`);
@@ -2633,7 +2634,7 @@ function executeContextMaterialization(
         if (tailNodeId !== null || tailCount !== 0) {
           throw new Error(`Ordinary root ${normalizedRootId} must not carry a compression tail.`);
         }
-        records = readContextChain(database, rootNodeId, segmentCount);
+        records = readContextChain(database, rootNodeId, segmentCount, conversationId);
         if (records[0]?.node.parent_node_id !== null) {
           throw new Error(`Ordinary root ${normalizedRootId} chain does not terminate at NULL.`);
         }
@@ -2740,7 +2741,8 @@ function readVerifiedCasBytes(metadata: DomainRow, resolvedCasRootPath: string):
 function readContextChain(
   database: Database.Database,
   startNodeId: string,
-  count: number
+  count: number,
+  conversationId: string
 ): ContextMaterializationRecord[] {
   if (count <= 0) throw new Error('Context chain with a start node requires a positive segment count.');
   const rows = prepareCached(database, `
@@ -2775,10 +2777,10 @@ function readContextChain(
      ORDER BY chain.depth DESC
   `).all({ startNodeId, segmentCount: BigInt(count) }) as Array<Record<string, unknown>>;
   if (rows.length !== count) throw new Error(`Context chain expected ${count} nodes, found ${rows.length}.`);
-  return decodeContextRecords(database, rows);
+  return decodeContextRecords(database, rows, conversationId);
 }
 
-function readContextRecord(database: Database.Database, nodeId: string): ContextMaterializationRecord {
+function readContextRecord(database: Database.Database, nodeId: string, conversationId: string): ContextMaterializationRecord {
   const row = prepareCached(database, `
     SELECT node.id AS node_id,
            node.parent_node_id AS node_parent_node_id,
@@ -2801,20 +2803,22 @@ function readContextRecord(database: Database.Database, nodeId: string): Context
      WHERE node.id = ?
   `).get(nodeId) as Record<string, unknown> | undefined;
   if (!row) throw new Error(`ContextSequenceNode ${nodeId} does not exist or has missing content.`);
-  return decodeContextRecords(database, [row])[0];
+  return decodeContextRecords(database, [row], conversationId)[0];
 }
 
 function decodeContextRecords(
   database: Database.Database,
-  rows: Array<Record<string, unknown>>
+  rows: Array<Record<string, unknown>>,
+  conversationId: string
 ): ContextMaterializationRecord[] {
   const messageSegmentIds = rows
     .filter((row) => row.segment_kind === 'message')
     .map((row) => requireRuntimeId(row.segment_id));
   const roles = new Map<string, string[]>();
   const modelSources = new Map<string, ContextModelSource | null>();
-  // Frozen recipe of the ModelRequest that produced a model message segment. A fork copy of the same
-  // request shares the recipe object; any disagreement or an unlinked source leaves it unset.
+  // Producer metadata belongs to this immutable root's Conversation. Shared segments keep
+  // ancestor revisions after deletion; their orphaned links are not evidence against a live copy.
+  // Disagreement or an unlinked source within the selected Conversation still leaves it unset.
   const recipeSources = new Map<string, string | null>();
   const reminderAuthorities = new Map<string, ContextReminderAuthoritySource | null>();
   // Claude 保留思考处理：产生这条模型输出的请求终态里记下的对话选择；多个来源取更强的一种（只会单向推进）。
@@ -2825,6 +2829,7 @@ function decodeContextRecords(
     // One placeholder per segment: every chunk length is another SQL text, so it is never cached.
     const sourceRows = prepareUncached(database, `
       SELECT DISTINCT source.segment_id AS segment_id, revision.role AS role,
+             membership.conversation_id AS source_conversation_id,
              model_request.provider_id AS source_provider_id,
              model_request.model_id AS source_model_id,
              model_request.recipe_object_id AS source_recipe_object_id,
@@ -2836,12 +2841,17 @@ function decodeContextRecords(
         JOIN message_revision AS revision
           ON revision.id = source.source_id
          AND revision.revision_seq = source.source_revision
+        LEFT JOIN message_part_of_conversation AS membership
+          ON membership.message_id = revision.message_id
         LEFT JOIN model_request_message_link AS model_link
           ON model_link.message_id = revision.message_id
          AND revision.revision_seq = 1
          AND revision.role = 'model'
         LEFT JOIN model_request
           ON model_request.id = model_link.model_request_id
+         AND EXISTS (SELECT 1 FROM turn AS producer_turn
+                      WHERE producer_turn.id = model_request.turn_id
+                        AND producer_turn.conversation_id = membership.conversation_id)
         LEFT JOIN authority_snapshot AS authority
           ON authority.id = model_request.authority_snapshot_id
          AND authority.turn_id = model_request.turn_id
@@ -2851,6 +2861,7 @@ function decodeContextRecords(
     `).all(...chunk) as Array<{
       segment_id: string;
       role: string;
+      source_conversation_id: string | null;
       source_provider_id: string | null;
       source_model_id: string | null;
       source_recipe_object_id: string | null;
@@ -2867,6 +2878,9 @@ function decodeContextRecords(
       const current = roles.get(segmentId) ?? [];
       if (!current.includes(source.role)) current.push(source.role);
       roles.set(segmentId, current);
+      // Immutable roles remain available even when the root's original Conversation was deleted.
+      // Provider state, recipes and reminder authorities require ownership in this root's scope.
+      if (source.source_conversation_id !== conversationId) continue;
       const modelSource = source.source_provider_id && source.source_model_id
         ? { providerId: source.source_provider_id, modelId: source.source_model_id }
         : null;
