@@ -8,6 +8,7 @@ import { McpRuntimeManager, dedupeMcpToolNames } from '../mcpRuntimeManager';
 import { proxyForShellAndMcp } from './proxyEnvironment';
 import { createBuiltinToolDefinitions } from '../../world/modules/tools/definitions';
 import { commandDeclarationCapability } from '../../reliableKernel/builtinToolCatalog';
+import { immutableToolDefinition, isImmutableToolDeclaration } from '../../reliableKernel/immutableToolDeclarations';
 import {
   toolDefinitionRecord,
   type ToolDefinition,
@@ -64,7 +65,9 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   private readonly rules;
   private readonly workEnvironment = createWorkEnvironmentRuntimeCapability();
   private readonly commandDeclaration = commandDeclarationCapability();
-  private readonly builtins: ToolDefinition[];
+  private readonly builtins: readonly ToolDefinition[];
+  private definitionSnapshot: readonly ToolDefinition[] = Object.freeze([]);
+  private mcpDefinitionSources: readonly ToolDefinition[] | undefined;
   private readonly filePlanner: LocalFileToolPlanner;
   private initialization: Promise<void> | undefined;
   private skillWatcher: vscode.Disposable | undefined;
@@ -85,7 +88,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
         proxyForShellAndMcp((await configuration.loadGlobalSettings('common')).settings as GlobalSettingsRecord)
     });
     this.mcp.setStateChangeListener(() => this.notifyStateChange());
-    this.builtins = createBuiltinToolDefinitions({ command: this.commandDeclaration });
+    this.builtins = Object.freeze(createBuiltinToolDefinitions({ command: this.commandDeclaration }).map(immutableToolDefinition));
     this.filePlanner = new LocalFileToolPlanner((inputPath, authority) => this.resolveFilePath(inputPath, authority));
   }
 
@@ -135,11 +138,21 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     await this.mcp.dispose();
   }
 
-  public definitions(): ToolDefinition[] {
-    return [
-      ...this.builtins,
-      ...dedupeMcpToolNames(this.mcp.runtimeTools(), this.builtins.map((definition) => definition.declaration.name))
-    ];
+  public definitions(): readonly ToolDefinition[] {
+    const mcpTools = this.mcp.runtimeTools();
+    // Actual live discovery order/identity, including disconnects and name deduplication. Settings
+    // revisions cannot represent a connection finishing or losing its discovered declarations.
+    if (!this.mcpDefinitionSources || this.mcpDefinitionSources.length !== mcpTools.length
+      || mcpTools.some((definition, index) => definition !== this.mcpDefinitionSources![index]
+        || !isImmutableToolDeclaration(definition.declaration))) {
+      this.mcpDefinitionSources = Object.freeze(mcpTools);
+      this.definitionSnapshot = Object.freeze([
+        ...this.builtins,
+        ...dedupeMcpToolNames(mcpTools, this.builtins.map((definition) => definition.declaration.name))
+          .map(immutableToolDefinition)
+      ]);
+    }
+    return this.definitionSnapshot;
   }
 
   public definitionRecords(): ToolDefinitionRecord[] {

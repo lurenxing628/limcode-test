@@ -319,7 +319,7 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   /** A previous commit was found through its exact id set; rows were not merged again. */
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
   /**
    * Unfinished work closed before the merge (source backup kept beside the source): Turns ended as
    * cancelled or interrupted and queued, unsent user messages cancelled, as counted in the source.
@@ -1435,7 +1435,7 @@ interface SourceProgress {
    */
   files?: string;
   fingerprint?: RuntimeDataSetFingerprint;
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
   /**
    * Unfinished work was (being) closed in the source; `complete` once every transition succeeded.
    * `earlier`: closed by an earlier attempt whose outcome did not say so (none in this attempt).
@@ -1867,7 +1867,7 @@ function assertNoCommitElsewhere(previous: RuntimeDataSetMergeLedgerRecord | und
   if (previous?.state === 'committing' && !sameRuntimeDataSetIdentity(previous.target, target.identity)) throw new Outcome(COMMIT_ELSEWHERE);
 }
 
-/** Identity, idle state, recovery, epoch (a published 3/4/5/6/7 source is upgraded in place first). */
+/** Identity, idle state, recovery, epoch (a published 3/4/5/6/7/8 source is upgraded in place first). */
 async function resolveSource(
   paths: { globalStoragePath: string },
   /** A migration's source check names the target identity only (it continues nothing it could refuse). */
@@ -1911,10 +1911,10 @@ async function resolveSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
   }
   const epoch = candidate.runtimeKernelEpoch;
-  if ((epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7) && mode.readOnly) {
+  if ((epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7 || epoch === 8) && mode.readOnly) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-upgrade-pending', message: '这份旧聊天记录还是已发布的旧格式，启动时会先在后台升级，之后才能估计。' });
   }
-  if (epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7) {
+  if (epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7 || epoch === 8) {
     const upgrade = await upgradeRuntimeDataSet(paths, {
       candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
     }).catch(async (error: unknown) => {
@@ -4169,7 +4169,7 @@ export interface RuntimeDataSetMigrationSource {
   /** Exact SQLite file state of the source the snapshot was taken from. */
   files: string;
   rows: number;
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
   close(): Promise<void>;
 }
 
@@ -4273,7 +4273,7 @@ export function runtimeDataSetCopyRow(domain: string, raw: Record<string, unknow
  * The error a caller of the copy sees: a source refusal as RuntimeDataSetMergeError (code and
  * user-facing message, with the in-place upgrade noted); a cancellation and anything else unchanged.
  */
-export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 }): unknown {
+export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 }): unknown {
   if (error instanceof RuntimeDataSetMergeError || (error instanceof Error && error.name === 'AbortError')) return error;
   if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error) && !isRuntimeDataInvariant(error)) return error;
   const outcome = sourceOutcome(error, state);

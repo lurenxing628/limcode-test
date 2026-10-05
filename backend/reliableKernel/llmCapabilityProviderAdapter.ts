@@ -1,3 +1,5 @@
+import { providerRequestToolDefinitions } from './frozenToolDefinitions';
+import type { ReliableAgentToolDefinition } from './agentLoop';
 import { providerRequestModelHandleCatalog } from './frozenModelHandleCatalog';
 import { completeModelProjection, completeModelProjectionCooperatively, type ModelProjectionWork, type ModelProjectionWorkControls } from './modelProjectionWork';
 import type { LlmCapability } from '../capabilities/types';
@@ -843,7 +845,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
   const modelHandleCatalog = prepareModelHandleCatalog(providerRequestModelHandleCatalog(request));
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
   const toolPolicy = authorityToolPolicy(authority);
-  const availableTools = normalizeToolDefinitions(recipe.tools)
+  const availableTools = normalizeToolDefinitions(providerRequestToolDefinitions(request))
     .filter((tool) => providerToolAllowed(toolPolicy, tool))
     .map((tool) => tool.schema);
   const authorityModel = requireRecord(authority.model, 'Provider authority model');
@@ -1243,7 +1245,7 @@ function toLlmCompactRequest(request: FullProviderRequest): LlmCompactRequest {
   };
   const context = compressionContext(request, compressionProvider, methodKind);
   const toolPolicy = authorityToolPolicy(authority);
-  const availableTools = normalizeToolDefinitions(recipe.tools)
+  const availableTools = normalizeToolDefinitions(providerRequestToolDefinitions(request))
     .filter((tool) => providerToolAllowed(toolPolicy, tool))
     .map((tool) => tool.schema);
   const tools = modelFacingToolsForHandleCatalog(
@@ -2136,11 +2138,11 @@ interface NormalizedProviderToolDefinition {
   source?: { [key: string]: PlainJsonValue };
 }
 
-function normalizeToolDefinitions(value: PlainJsonValue | undefined): NormalizedProviderToolDefinition[] {
+function normalizeToolDefinitions(value: readonly ReliableAgentToolDefinition[] | undefined): NormalizedProviderToolDefinition[] {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new TypeError('Provider recipe.tools must be an array.');
   return value.map((entry, index) => {
-    const record = requireRecord(entry, `Provider recipe.tools[${index}]`);
+    const record = requireRecord(entry as unknown as PlainJsonValue, `Provider recipe.tools[${index}]`);
     return {
       schema: {
         name: requireText(record.name, `Provider recipe.tools[${index}].name`),

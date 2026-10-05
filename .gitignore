@@ -44,6 +44,7 @@ docs/architecture/*
 !/tests/webviewLocalResources.test.cjs
 !/tests/reliable-kernel/
 /tests/reliable-kernel/*
+!/tests/reliable-kernel/frozen-tool-definitions.test.mjs
 !/tests/reliable-kernel/context-sequence-node-batch.test.mjs
 !/tests/reliable-kernel/historical-context-handles.test.mjs
 !/tests/reliable-kernel/historical-process-handle-card.test.mjs

@@ -1,3 +1,4 @@
+import { freezeToolDefinitions, resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { performance } from 'node:perf_hooks';
 import { readConversationContextHandleStateRow, readCurrentConversationContextHandleState } from './conversationContextHandleState';
@@ -180,7 +181,7 @@ export interface ReliableAgentToolBatchConfirmationInput {
 /** Dispatcher owns capability-specific EffectIntent/Receipt semantics and may durably pause the Turn. */
 export interface ReliableAgentToolDispatcher {
   /** turnId selects definitions through that Turn's immutable authority snapshot. */
-  definitions(turnId?: string): Promise<ReliableAgentToolDefinition[]> | ReliableAgentToolDefinition[];
+  definitions(turnId?: string): Promise<readonly ReliableAgentToolDefinition[]> | readonly ReliableAgentToolDefinition[];
   /** Compiles display/gate/scheduling for a Provider batch from one immutable authority read. */
   freezeCalls?(inputs: ReadonlyArray<ReliableAgentToolDispatchInput & {
     definition: ReliableAgentToolDefinition;
@@ -1336,7 +1337,7 @@ export class ReliableAgentLoop {
       kind: 'reliable-agent-turn',
       projectionRevision: '2026-08-21',
       round: input.round,
-      tools: input.tools,
+      toolsReference: await freezeToolDefinitions(this.database, this.contentStore, input.tools),
       attachmentCatalogState,
       modelHandleCatalogReference,
       contextHandleScope: runtimeStatus.contextHandleScope,
@@ -2450,8 +2451,9 @@ export class ReliableAgentLoop {
     frozenRecipe?: { [key: string]: PlainJsonValue }
   ): Promise<ReliableAgentToolDefinition[]> {
     const recipe = frozenRecipe ?? await this.readModelRequestRecipe(modelRequestId);
-    if (!Array.isArray(recipe.tools)) throw new TypeError('ModelRequest recipe.tools must be an array.');
-    return recipe.tools.map((value, index) => normalizeFrozenToolDefinition(value, index));
+    if (!('toolsReference' in recipe) && !Array.isArray(recipe.tools)) throw new TypeError('ModelRequest recipe.tools must be an array.');
+    const tools = await resolveFrozenToolDefinitions(this.database, this.contentStore, recipe);
+    return tools.map((value, index) => normalizeFrozenToolDefinition(value as unknown as PlainJsonValue, index));
   }
 
   private async dispatchAndCapture(

@@ -726,13 +726,21 @@ async function validateCandidateEpoch(binding: HistoricalRootBinding, pending?: 
   // An exact published predecessor can write the current epoch manifest immediately before
   // publishing its pending pointer. Candidate selection must preserve that recovery window.
   if (
-    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7)
+    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7 || binding.runtimeKernelEpoch === 8)
     && pending?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH
     && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId
     && pending.rootGeneration === binding.rootGeneration + 1
     && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
   ) return;
-  // Published 3/4/5/6→7 boundaries retain their exact old target before the independent →8 upgrade.
+  // Published 3/4/5/6/7→8 boundaries retain their exact old target before the independent →9 upgrade.
+  if (
+    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7)
+    && pending?.runtimeKernelEpoch === 8
+    && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId
+    && pending.rootGeneration === binding.rootGeneration + 1
+    && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
+  ) return;
+  // Published 3/4/5/6→7 boundaries retain their exact old target before the independent →9 upgrade.
   if (
     (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6)
     && pending?.runtimeKernelEpoch === 7

@@ -1,3 +1,4 @@
+import { resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import { AGENT_COLLABORATION_TOOL_NAMES, isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import {
   CROSS_CONVERSATION_TOOL_NAMES,
@@ -90,6 +91,7 @@ import { frozenInteractionAutoApproval, frozenSkillPolicy, readFrozenTurnAuthori
 import { inheritedToolPolicyChain, type InheritedToolPolicyLayer } from './childExecutionBoundary';
 import type { McpEffectDispatcher } from './mcpEffects';
 import { canonicalPlainJson, normalizePlainJson, type PlainJsonValue } from './plainJson';
+import { EffectiveToolDefinitionProjection, type EffectiveToolDefinitionInput } from './effectiveToolDefinitionProjection';
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
 import {
   DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS,
@@ -135,8 +137,8 @@ export interface ReliableSpecialToolAdmission {
 
 export interface ReliableToolDispatcherHost {
   dispose?(): Promise<void> | void;
-  /** Current immutable declarations, including memory-only MCP discovery results. */
-  definitions(): Promise<ToolDefinition[]> | ToolDefinition[];
+  /** Current declarations, including memory-only MCP discovery results. Mutable hosts are copied. */
+  definitions(): Promise<readonly ToolDefinition[]> | readonly ToolDefinition[];
   /** 磁盘扫描出的技能目录快照；用于把可用技能列表拼进 skills 工具描述。 */
   skillDefinitions?(): SkillDefinitionRecord[];
   /** 按冻结 authority 解析出的工作环境边界；用于把环境列表拼进 switch/transfer 工具描述。 */
@@ -464,6 +466,7 @@ class NativeTurnToolScheduler {
 /** Product Tool dispatcher. Every non-readonly external effect is committed before dispatch. */
 export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   private readonly workEnvironmentTransfers: WorkEnvironmentTransferEffectDispatcher;
+  private readonly definitionProjection = new EffectiveToolDefinitionProjection();
   private readonly activeHostExecutions = new Map<string, {
     turnId: string;
     controller: AbortController;
@@ -657,38 +660,58 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     await Promise.allSettled([...completions, ...this.activeDispatches]);
   }
 
-  public async definitions(turnId?: string): Promise<ReliableAgentToolDefinition[]> {
+  public async definitions(turnId?: string): Promise<readonly ReliableAgentToolDefinition[]> {
     const available = await this.dependencies.host.definitions();
-    const definitions = turnId
-      ? await this.definitionsForTurn(available, turnId)
-      : available;
-    const nativeAsyncTools = turnId === undefined
-      ? undefined
-      : nativeAsyncEnabledTools(await this.readAuthority(turnId));
-    return definitions.map((definition) => {
-      const name = requireText(definition.declaration.name, 'Tool declaration.name');
-      const metadata = nativeAsyncToolMetadata(
-        toolConfigKey(definition.declaration),
-        definition.declaration.metadata
-          ? normalizePlainJson(definition.declaration.metadata, `Tool ${name} metadata`)
-          : undefined,
-        nativeAsyncTools
-      );
-      return {
-        name,
-        description: typeof definition.declaration.description === 'string'
-          ? definition.declaration.description
-          : '',
-        parameters: normalizePlainJson(definition.declaration.parameters ?? {}, `Tool ${name} parameters`),
-        ...(definition.declaration.source
-          ? { source: normalizePlainJson(definition.declaration.source, `Tool ${name} source`) }
-          : {}),
-        ...(metadata ? { metadata } : {}),
-        ...(definition.declaration.defaultConfig
-          ? { defaultConfig: normalizePlainJson(definition.declaration.defaultConfig, `Tool ${name} default config`) }
-          : {})
+    const inputs = turnId
+      ? await this.definitionInputsForTurn(available, turnId)
+      : available.map((definition) => ({ definition, allowChildSpawn: true, nativeAsync: false }));
+    return this.definitionProjection.resolve(inputs, (input) => this.projectDefinition(input));
+  }
+
+  private projectDefinition(input: EffectiveToolDefinitionInput): ReliableAgentToolDefinition {
+    let declaration = input.definition.declaration;
+    if (!input.allowChildSpawn) {
+      const parameters = plainOptionalRecord(normalizePlainJson(declaration.parameters ?? {})) ?? {};
+      const properties = plainOptionalRecord(parameters.properties) ?? {};
+      const operation = plainOptionalRecord(properties.operation) ?? {};
+      declaration = { ...declaration,
+        description: `${declaration.description}\nNew child spawning is unavailable at the current depth. Use list/read/wait/send/interrupt_subtree for existing children.`,
+        parameters: { ...parameters, properties: { ...properties,
+          operation: { ...operation, enum: RUN_AGENT_OPERATIONS.filter(value => value !== 'spawn') }
+        } }
       };
-    });
+    }
+    if (input.skillDescription !== undefined) declaration = { ...declaration, description: input.skillDescription };
+    if (input.environmentText !== undefined) {
+      const baseDescription = typeof declaration.description === 'string' ? declaration.description : '';
+      declaration = { ...declaration,
+        description: [baseDescription, input.environmentText].filter(Boolean).join('\n\n'),
+        parameters: declaration.name === SWITCH_WORK_ENVIRONMENT_TOOL_NAME
+          ? withWorkEnvironmentIdParameterHints(declaration.parameters, input.environmentText)
+          : withTransferEnvironmentParameterHints(declaration.parameters, input.environmentText)
+      };
+    }
+    if (input.agentTypeList !== undefined) {
+      declaration = { ...declaration, ...augmentRunAgentToolSchema({
+        description: typeof declaration.description === 'string' ? declaration.description : '',
+        parameters: declaration.parameters
+      }, input.agentTypeList) };
+    }
+    const name = requireText(declaration.name, 'Tool declaration.name');
+    const metadata = nativeAsyncToolMetadata(
+      toolConfigKey(declaration),
+      declaration.metadata ? normalizePlainJson(declaration.metadata, `Tool ${name} metadata`) : undefined,
+      input.nativeAsync ? new Set([toolConfigKey(declaration)]) : undefined
+    );
+    return {
+      name,
+      description: typeof declaration.description === 'string' ? declaration.description : '',
+      parameters: normalizePlainJson(declaration.parameters ?? {}, `Tool ${name} parameters`),
+      ...(declaration.source ? { source: normalizePlainJson(declaration.source, `Tool ${name} source`) } : {}),
+      ...(metadata ? { metadata } : {}),
+      ...(declaration.defaultConfig
+        ? { defaultConfig: normalizePlainJson(declaration.defaultConfig, `Tool ${name} default config`) } : {})
+    };
   }
 
   public async freezeCall(
@@ -2067,13 +2090,14 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     return this.settledResult(input.toolCallId, settled.status, settled.terminal);
   }
 
-  private async definitionsForTurn(
-    definitions: ToolDefinition[],
+  private async definitionInputsForTurn(
+    definitions: readonly ToolDefinition[],
     turnId: string
-  ): Promise<ToolDefinition[]> {
+  ): Promise<EffectiveToolDefinitionInput[]> {
     const authority = await this.readAuthority(turnId);
     const toolPolicy = authorityPolicy(authority.document);
     const workEnvironmentPolicy = authorityWorkEnvironmentPolicy(authority.document);
+    const nativeAsyncTools = nativeAsyncEnabledTools(authority);
     const runAgentDefinition = definitions.find((definition) =>
       definition.declaration.name === RUN_AGENT_TOOL_NAME
       && definitionAllowedByAuthority(toolPolicy, definition)
@@ -2082,36 +2106,27 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       await childAgentDepthForTurn(this.dependencies.database, turnId),
       toolPolicy.toolConfigs[RUN_AGENT_TOOL_NAME]?.config
     );
-    // The frozen switch grants the cross-conversation tools (see toolAllowedByPolicy); they stay
-    // with top-level conversations, since a child task collaborates inside its own team.
+    // A child task collaborates within its own team; the frozen switch exposes cross-conversation
+    // tools only to top-level conversations. Neither fact is inferred from a cached Turn id.
     const topLevel = definitions.some((definition) => isCrossConversationTool(definition.declaration.name))
       && crossConversationSwitchOn(toolPolicy.toolConfigs)
       && await this.topLevelTurn(turnId);
-    const allowed = definitions.filter((definition) =>
+    const inputs = definitions.filter((definition) =>
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
       && (!isCrossConversationTool(definition.declaration.name) || topLevel)
-    ).map(definition => {
-      if (definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn) return definition;
-      const parameters = plainOptionalRecord(normalizePlainJson(definition.declaration.parameters ?? {})) ?? {};
-      const properties = plainOptionalRecord(parameters.properties) ?? {};
-      const operation = plainOptionalRecord(properties.operation) ?? {};
-      return { ...definition, declaration: { ...definition.declaration,
-        description: `${definition.declaration.description}\nNew child spawning is unavailable at the current depth. Use list/read/wait/send/interrupt_subtree for existing children.`,
-        parameters: { ...parameters, properties: { ...properties,
-          operation: { ...operation, enum: RUN_AGENT_OPERATIONS.filter(value => value !== 'spawn') }
-        } }
-      } } as ToolDefinition;
-    });
-    const withSkills = this.augmentSkillsDefinition(allowed, authority.document);
-    const withEnvironments = await this.augmentWorkEnvironmentDefinitions(withSkills, authority, workEnvironmentPolicy.enabled);
-    return this.augmentRunAgentDefinition(withEnvironments);
+    ).map((definition): EffectiveToolDefinitionInput => ({
+      definition,
+      allowChildSpawn: definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn,
+      nativeAsync: nativeAsyncTools.has(toolConfigKey(definition.declaration))
+    }));
+    this.augmentSkillsInput(inputs, authority.document);
+    await this.augmentWorkEnvironmentInputs(inputs, authority, workEnvironmentPolicy.enabled);
+    await this.augmentRunAgentInput(inputs);
+    return inputs;
   }
 
-  /**
-   * Whether the Turn runs in a top-level conversation. Phase one offers the cross-conversation
-   * tools only there: a child task keeps collaborating inside its own team.
-   */
+  /** Whether the Turn runs in a top-level conversation rather than a child team. */
   private async topLevelTurn(turnId: string): Promise<boolean> {
     const turns = await this.list('Turn', { id: turnId }, 1);
     if (turns.length !== 1) throw new Error(`Turn ${turnId} does not exist.`);
@@ -2119,117 +2134,61 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     return (await this.list('ChildExecution', { child_conversation_id: conversationId }, 1)).length === 0;
   }
 
-  /**
-   * 把可指派的 agent.type 列表拼进 runAgent 工具描述与 agent.type 参数提示。
-   * 列表读取失败时保持原声明（降级为静态描述），不拖垮整个 Turn 的 schema 构建。
-   */
-  private async augmentRunAgentDefinition(definitions: ToolDefinition[]): Promise<ToolDefinition[]> {
+  /** Render live assignable types; schema copying occurs only on an effective-revision miss. */
+  private async augmentRunAgentInput(inputs: EffectiveToolDefinitionInput[]): Promise<void> {
     const host = this.dependencies.host;
-    if (!host.agentTypeEntries) return definitions;
-    const index = definitions.findIndex((definition) => definition.declaration.name === RUN_AGENT_TOOL_NAME);
-    if (index === -1) return definitions;
-    let typeList: string;
+    if (!host.agentTypeEntries) return;
+    const target = inputs.find((input) => input.definition.declaration.name === RUN_AGENT_TOOL_NAME);
+    if (!target) return;
     try {
-      typeList = formatAgentTypeList(await host.agentTypeEntries());
+      const typeList = formatAgentTypeList(await host.agentTypeEntries());
+      if (typeList) target.agentTypeList = typeList;
     } catch {
-      return definitions;
+      // Preserve the static declaration while the live catalog is unavailable.
     }
-    if (!typeList) return definitions;
-    const target = definitions[index];
-    const baseDescription = typeof target.declaration.description === 'string' ? target.declaration.description : '';
-    const augmented = augmentRunAgentToolSchema(
-      { description: baseDescription, parameters: target.declaration.parameters },
-      typeList
-    );
-    const next = [...definitions];
-    next[index] = {
-      ...target,
-      declaration: {
-        ...target.declaration,
-        description: augmented.description,
-        parameters: augmented.parameters as typeof target.declaration.parameters
-      }
-    };
-    return next;
   }
 
-  /**
-   * 把冻结策略允许的工作环境列表拼进 switch_work_environment / transfer 工具描述与参数提示。
-   * 环境解析失败时保持原声明（降级为静态描述），不拖垮整个 Turn 的 schema 构建。
-   */
-  private async augmentWorkEnvironmentDefinitions(
-    definitions: ToolDefinition[],
+  /** Render the actual live allowed environment descriptions under the frozen authority. */
+  private async augmentWorkEnvironmentInputs(
+    inputs: EffectiveToolDefinitionInput[],
     authority: ReliableToolDispatchAuthority,
     switchingEnabled: boolean
-  ): Promise<ToolDefinition[]> {
-    if (!switchingEnabled) return definitions;
+  ): Promise<void> {
+    if (!switchingEnabled) return;
     const host = this.dependencies.host;
-    if (!host.workEnvironmentsForAuthority) return definitions;
-    const hasEnvironmentTool = definitions.some((definition) => WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name));
-    if (!hasEnvironmentTool) return definitions;
+    if (!host.workEnvironmentsForAuthority
+      || !inputs.some((input) => WORK_ENVIRONMENT_TOOLS.has(input.definition.declaration.name))) return;
     let environments: WorkEnvironmentRecord[];
     try {
       environments = (await host.workEnvironmentsForAuthority(authority)).allowed;
     } catch {
-      return definitions;
+      return;
     }
-    return definitions.map((definition) => {
-      if (definition.declaration.name === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
-        const environmentText = workEnvironmentListText(environments, SWITCH_WORK_ENVIRONMENTS_TITLE);
-        const baseDescription = typeof definition.declaration.description === 'string' ? definition.declaration.description : '';
-        return {
-          ...definition,
-          declaration: {
-            ...definition.declaration,
-            description: [baseDescription, environmentText].filter(Boolean).join('\n\n'),
-            parameters: withWorkEnvironmentIdParameterHints(definition.declaration.parameters, environmentText) as typeof definition.declaration.parameters
-          }
-        };
+    for (const input of inputs) {
+      if (input.definition.declaration.name === SWITCH_WORK_ENVIRONMENT_TOOL_NAME) {
+        input.environmentText = workEnvironmentListText(environments, SWITCH_WORK_ENVIRONMENTS_TITLE);
+      } else if (input.definition.declaration.name === TRANSFER_TOOL_NAME) {
+        input.environmentText = workEnvironmentListText(environments, TRANSFER_WORK_ENVIRONMENTS_TITLE);
       }
-      if (definition.declaration.name === TRANSFER_TOOL_NAME) {
-        const environmentText = workEnvironmentListText(environments, TRANSFER_WORK_ENVIRONMENTS_TITLE);
-        const baseDescription = typeof definition.declaration.description === 'string' ? definition.declaration.description : '';
-        return {
-          ...definition,
-          declaration: {
-            ...definition.declaration,
-            description: [baseDescription, environmentText].filter(Boolean).join('\n\n'),
-            parameters: withTransferEnvironmentParameterHints(definition.declaration.parameters, environmentText) as typeof definition.declaration.parameters
-          }
-        };
-      }
-      return definition;
-    });
+    }
   }
 
-  /**
-   * 把按冻结 skillPolicy 过滤后的技能目录拼进 skills 工具描述。
-   * 声明本身是不可变模板，这里返回克隆体，绝不改写 host 持有的 definition。
-   */
-  private augmentSkillsDefinition(definitions: ToolDefinition[], document: PlainJsonValue): ToolDefinition[] {
+  /** Refresh and policy-filter skill descriptions even when all tool declarations are unchanged. */
+  private augmentSkillsInput(inputs: EffectiveToolDefinitionInput[], document: PlainJsonValue): void {
     const host = this.dependencies.host;
-    if (!host.skillDefinitions) return definitions;
-    const index = definitions.findIndex((definition) => definition.declaration.name === SKILLS_TOOL_NAME);
-    if (index === -1) return definitions;
+    if (!host.skillDefinitions) return;
+    const target = inputs.find((input) => input.definition.declaration.name === SKILLS_TOOL_NAME);
+    if (!target) return;
     let enabled: SkillDefinitionRecord[];
     try {
       const policy = frozenSkillPolicy(document);
       enabled = host.skillDefinitions().filter((skill) => isSkillEnabledByPolicy(policy, skill));
     } catch {
-      // 与其他动态注入点一致：目录/冻结策略异常时降级为静态描述，不拖垮整个 Turn。
-      return definitions;
+      return;
     }
-    const target = definitions[index];
-    const baseDescription = typeof target.declaration.description === 'string' ? target.declaration.description : '';
-    const next = [...definitions];
-    next[index] = {
-      ...target,
-      declaration: {
-        ...target.declaration,
-        description: composeSkillsToolDescription(baseDescription, enabled)
-      }
-    };
-    return next;
+    const baseDescription = typeof target.definition.declaration.description === 'string'
+      ? target.definition.declaration.description : '';
+    target.skillDescription = composeSkillsToolDescription(baseDescription, enabled);
   }
 
   /** The Turn's frozen authority, with one tool's per-tool settings when a tool is named. */
@@ -2331,7 +2290,8 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       ),
       'ModelRequest recipe'
     );
-    return providerDefinitionMismatchFromRecipe(input.toolName, definition, recipe);
+    const tools = await resolveFrozenToolDefinitions(this.dependencies.database, this.dependencies.contentStore, recipe);
+    return providerDefinitionMismatchFromRecipe(input.toolName, definition, { tools });
   }
 
   /** Resolves each ModelRequest recipe once for the whole Provider group. */
@@ -2372,13 +2332,12 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       metadata.push(row as unknown as ContentObjectMetadata);
       metadataIds.push(uniqueRecipeObjectIds[index]);
     }
-    const recipeByObjectId = new Map<string, PlainJsonValue>();
+    const recipeByObjectId = new Map<string, { tools: readonly ReliableAgentToolDefinition[] }>();
     const bytes = await this.dependencies.contentStore.readMany(metadata);
     for (let index = 0; index < metadata.length; index += 1) {
-      recipeByObjectId.set(metadataIds[index], normalizePlainJson(
-        JSON.parse(bytes[index].toString('utf8')),
-        'ModelRequest recipe'
-      ));
+      const recipe = normalizePlainJson(JSON.parse(bytes[index].toString('utf8')), 'ModelRequest recipe');
+      recipeByObjectId.set(metadataIds[index], { tools: await resolveFrozenToolDefinitions(
+        this.dependencies.database, this.dependencies.contentStore, recipe) });
     }
     for (const input of inputs) {
       if (mismatches.has(input.toolCallId)) continue;
@@ -2392,8 +2351,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       }
       const definition = definitionsByName.get(input.toolName);
       if (!definition) continue;
-      const recipe = requireRecord(recipeValue, 'ModelRequest recipe');
-      const mismatch = providerDefinitionMismatchFromRecipe(input.toolName, definition, recipe);
+      const mismatch = providerDefinitionMismatchFromRecipe(input.toolName, definition, recipeValue);
       if (mismatch) mismatches.set(input.toolCallId, mismatch);
     }
     return mismatches;

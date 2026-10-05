@@ -120,6 +120,7 @@ const KNOWN_CONTENT_TYPE_ENTRIES: ReadonlyArray<readonly [string, RuntimeContent
   ['application/vnd.limcode.turn-intent+json', 'message', '排队输入'],
   ['application/vnd.limcode.native-steer+json', 'message', '运行中插话'],
   ['application/vnd.limcode.model-request-recipe+json', 'modelRequestRecipe', '模型请求配方'],
+  ['application/vnd.limcode.frozen-tool-definitions+json', 'modelRequestRecipe', '冻结工具定义'],
   ['application/vnd.limcode.fork-context-handle-reservations+json', 'modelRequestRecipe', '分叉引用保留'],
   ['application/vnd.limcode.conversation-context-handle-state+json', 'contextHandleCatalog', '对话引用目录'],
   ['application/vnd.limcode.conversation-context-handle-upgrade+json', 'contextHandleCatalog', '引用目录重建进度'],

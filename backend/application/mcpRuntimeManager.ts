@@ -4,6 +4,7 @@ import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServerConfigRecord, McpServersSettingsRecord, McpToolSourceRecord } from '../../shared/protocol';
 import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../shared/extensionIdentity';
 import type { ToolDefinition, ToolResultOut } from '../world/modules/tools/registry';
+import { immutableToolDefinition } from '../reliableKernel/immutableToolDeclarations';
 import { McpInvocationError, type McpMemoryConnectionRegistry, type McpToolAnnotations } from '../reliableKernel/mcpEffects';
 import { createProxyFetch } from '../capabilities/proxyFetch';
 import { normalizeProxySetting, proxyEnvironmentVariables } from './reliableKernel/proxyEnvironment';
@@ -220,7 +221,7 @@ async function connectServer(config: McpServerConfigRecord, signal: AbortSignal,
   try {
     await client.connect(transport, { signal });
     const listed = await client.listTools(undefined, { signal });
-    const tools = listed.tools.map((tool) => mcpToolDeclaration(config, tool));
+    const tools = listed.tools.map((tool) => immutableToolDefinition(mcpToolDeclaration(config, tool)));
     const annotations = new Map(listed.tools.map((tool) => [tool.name, {
       ...(tool.annotations?.readOnlyHint === undefined ? {} : { readOnlyHint: tool.annotations.readOnlyHint }),
       ...(tool.annotations?.destructiveHint === undefined ? {} : { destructiveHint: tool.annotations.destructiveHint })

@@ -47,6 +47,7 @@ function isTestArtifactPath(file) {
 }
 
 const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
+  'tests/reliable-kernel/frozen-tool-definitions.test.mjs',
   'tests/webview-session-thinking.browser.mjs',
   'tests/webview-agent-status-panel.browser.mjs',
   'scripts/reliable-kernel/benchmark-concurrency-tuning.mjs',

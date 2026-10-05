@@ -1,6 +1,6 @@
 # Runtime epoch 6 的已发布来源升级
 
-本文记录 epoch 6 的历史边界，以下 epoch 6/目标 journal 说明保持其原义。当前准入 epoch 为 8；当前补充见文末。
+本文记录 epoch 6 的历史边界，以下 epoch 6/目标 journal 说明保持其原义。当前准入 epoch 为 9；当前补充见文末。
 
 ## 已发布来源证据
 
@@ -46,7 +46,7 @@ RuntimeDeliveryAnswerPresentation 按 delivery_id 唯一，独立归属于接收
 
 快照和历史页只按索引加入当前卡片及其 canonical 已接收尝试的标量事实，不读取正文。派生的 peer liveness 受快照代数保护；旧历史页/旧详情不能在新快照后恢复过时的 known 状态。正文、来源身份和位置不因此清除。
 
-## 当前 epoch 8 的目录引用准入
+## 已发布 epoch 8 的目录引用准入
 
 Epoch 7 随后引入 ConversationContextHandleState 与 ContextRootHandleCatalog 两个独立领域，共 113 个领域。其已发布描述来自 `763614c8d6014cf8267a83baab7b3b7e1587a1de`，固定在 `schema/publishedEpoch7.ts`；完整 domains/triggers/metadata SHA-256 为 `fd069dee963b1ad5032d1ea3121a583b0bc93cc9cfed43b9e684fb11beb7be46`。从 epoch 6 及更早来源升级时仍只插入当前 head 的 pending 标记，绝不在升级事务内回放历史或重建目录。
 
@@ -55,3 +55,11 @@ Epoch 7 随后引入 ConversationContextHandleState 与 ContextRootHandleCatalog
 当前精确来源为已发布 3/4/5/6/7。新的升级使用 `epoch-to-8-migration.json`，沿用离线准入、Backup API、pending fence、synchronous=FULL 单事务与持久完成记录。中断的 3→4、3/4→5、3/4/5→6 与 3/4/5/6→7 journal 仍只证明原目标；提交过的旧升级先完成原目标的指针和完成记录，再独立备份升级到 8。不能把旧 journal 改签为 epoch 8，也不能仅因 epoch 7 与 8 的领域定义相同而绕过准入校验。
 
 候选发现、只读 preflight、后台逐库升级、历史查看及本地合并来源均纳入精确 epoch 7；外来拷贝仍不原地升级，必须已经是当前 epoch 才能通过核验。升级备份清理保留原 3→4 永久保留规则；精确目标为 5/6/7/8 的已完成升级仍须满足 7 天、同身份和完整覆盖证明。任一旧/新未完成 journal 阻止清理。现有 preservation、schema、历史入口与清理测试随当前 epoch 更新，历史目标断言保持原值。
+
+## 当前 epoch 9 的冻结工具引用准入
+
+Epoch 8 的精确 113 领域、metadata DDL 与 trigger 固定在独立 `schema/publishedEpoch8.ts`，来源为 `b6a2bde3dc643cd7dc9c245e9c3881e29665ec4b`；完整 domains/triggers/metadata SHA-256 仍为 `fd069dee963b1ad5032d1ea3121a583b0bc93cc9cfed43b9e684fb11beb7be46`。epoch 9 为 toolsReference 冻结工具 CAS 引用设置全库准入栅栏，保持全部物理定义不变。精确 8→9（以及 7→9）仅更新 schema_manifest 的 epoch、数据库 RootBinding 和外部 epoch/指针元数据；全部领域行、CAS、ready/pending、revision、provenance_revision 与 requires_native_reset 原样保留，不读历史正文、不重建目录。旧 epoch 8 reader 拒绝 epoch 9；存活或身份未知的旧 Host 阻止升级。旧内联配方保留原字节并按原冻结事实重放。
+
+当前精确来源扩展为已发布 3/4/5/6/7/8。新升级只写 `epoch-to-9-migration.json`；历史 `epoch-to-8-migration.json` 仍只证明 3/4/5/6/7→8，先独立收敛其原指针和完成记录，再经新备份升级到 9，绝不改签旧 journal。候选发现、只读 preflight、后台升级、历史查看与本地合并同用精确来源集合；外来拷贝仍必须已是当前 epoch。备份清理新增识别精确目标 9 的完成记录，继续受同身份、完整覆盖和 7 天条件保护，全部旧新未完成 journal 阻止清理。
+
+新建普通与原生压缩请求配方以 toolsReference.contentObjectId 冻结工具定义，指向 application/vnd.limcode.frozen-tool-definitions+json 类型的不可变 CAS。旧内联 tools 配方保留原字节与原读取路径，引用缺失、类型或摘要不符时拒绝，绝不退回当前工具设置。该引用是独立于生产者 Turn/Conversation 的强 CAS 边：分支沿用原配方，删除源对话不删正文，整库复制与合库继续携带全部已登记 ContentObject；未来可达性 GC 必须沿 toolsReference.contentObjectId 保留正文。

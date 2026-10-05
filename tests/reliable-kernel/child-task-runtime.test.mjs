@@ -499,7 +499,7 @@ test('a child answers its parent with the final reply of its Turn, without any s
     assert.equal((await f.runInput('parent-waits-for-child-answer', 'Delegate the trace.')).terminalStatus, 'completed');
     await f.coordinator.waitForIdle();
     assert.ok(childRequest, 'the child ran');
-    const childTools = (childRequest.recipe.tools ?? []).map(definition => definition.name);
+    const childTools = childRequest.resolvedTools.map(definition => definition.name);
     assert.equal(childTools.includes('submit_agent_answer'), false, 'no separate answer tool is offered');
     const childPrompt = JSON.stringify(childRequest.context);
     assert.equal(childPrompt.includes('submit_agent_answer'), false);

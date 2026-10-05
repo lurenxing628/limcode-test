@@ -24,6 +24,7 @@ const WEBVIEW_TEST_FILES = Object.freeze([
   'webview/tests/reliableQueueOrdering.test.ts'
 ]);
 const CI_TEST_FILES = Object.freeze([
+  'tests/reliable-kernel/frozen-tool-definitions.test.mjs',
   'tests/reliable-kernel/composer-attachment-authority.test.mjs',
   'tests/reliable-kernel/conversation-owner-release.test.mjs',
   'tests/reliable-kernel/diagnostic-inspection-progress.test.mjs',

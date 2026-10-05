@@ -904,7 +904,16 @@ export class RuntimeDatabase {
     }
   }
 
-  private async request<T>(request: DatabaseWorkerRequestPayload, beforeSubmit?: () => void): Promise<T> {
+  /** Validate the live owner/root of immutable cached evidence without issuing a SQLite request. */
+  public async assertUsableBinding(requestKind: RuntimeDatabaseMetricRequestKind = 'snapshot'): Promise<RootBinding> {
+    this.assertUsable();
+    const binding = await this.validateBinding(requestKind);
+    // A worker exit or heartbeat failure while root validation yielded still fences cached reads.
+    this.assertUsable();
+    return binding;
+  }
+
+  private assertUsable(): void {
     if (this.closed) throw new Error('RuntimeDatabase is closed.');
     if (this.heartbeatFailure !== undefined) {
       const error = new Error('RuntimeDatabase Host liveness heartbeat failed; requests are fenced until restart.') as Error & {
@@ -913,7 +922,10 @@ export class RuntimeDatabase {
       error.cause = this.heartbeatFailure;
       throw error;
     }
-    await this.validateBinding(databaseMetricRequestKind(request.kind));
+  }
+
+  private async request<T>(request: DatabaseWorkerRequestPayload, beforeSubmit?: () => void): Promise<T> {
+    await this.assertUsableBinding(databaseMetricRequestKind(request.kind));
     beforeSubmit?.();
     return this.sendRequest<T>(request);
   }

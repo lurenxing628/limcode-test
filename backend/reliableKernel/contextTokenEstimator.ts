@@ -1,3 +1,5 @@
+import { providerRequestToolDefinitions } from './frozenToolDefinitions';
+import type { ReliableAgentToolDefinition } from './agentLoop';
 import type { MessageContent } from '../../shared/protocol';
 import type { AttachmentCatalogState } from './attachmentCatalog';
 import { AttachmentCatalogProjection, type PreparedAttachmentCatalogProjection } from './attachmentCatalogProjection';
@@ -359,7 +361,8 @@ export function estimateStoredMessageContentTokens(
 
 export function estimateRequestAuthorityTokens(
   authorityValue: PlainJsonValue,
-  recipeValue: PlainJsonValue
+  recipeValue: PlainJsonValue,
+  resolvedTools?: readonly ReliableAgentToolDefinition[]
 ): number {
   const authority = asRecord(authorityValue);
   const recipe = asRecord(recipeValue);
@@ -376,9 +379,9 @@ export function estimateRequestAuthorityTokens(
     : []);
   const sourceConfigs = asRecord(policy?.sourceConfigs) ?? {};
   const toolConfigs = asRecord(policy?.toolConfigs) ?? {};
-  const tools = Array.isArray(recipe.tools) ? recipe.tools : [];
+  const tools = providerRequestToolDefinitions({ recipe, resolvedTools });
   for (const value of tools) {
-    const tool = asRecord(value);
+    const tool = asRecord(value as unknown as PlainJsonValue);
     if (!tool || !providerToolAllowed(tool, { allowedTools: allowed, sourceConfigs, toolConfigs })) continue;
     total += 10;
     if (typeof tool.name === 'string') total += estimateTextTokens(tool.name);

@@ -13,9 +13,9 @@ export interface RuntimeDataSetPreflightProblem {
 }
 
 /**
- * Read-only check that a data set can be opened (after the exact published 3/4/5/6/7 upgrade when
+ * Read-only check that a data set can be opened (after the exact published 3/4/5/6/7/8 upgrade when
  * needed): recognized epoch, complete binding, the exact schema and physical fingerprint opening
- * checks, and for the published 3/4/5/6/7 formats the upgrade's own checks (quick_check included). A
+ * checks, and for the published 3/4/5/6/7/8 formats the upgrade's own checks (quick_check included). A
  * pending recovery window passes to its gate. Nothing is written; a worker reads a private copy.
  * Never call it for a database this process has open: copying its files would release this
  * process's POSIX locks.
@@ -25,7 +25,7 @@ export async function preflightRuntimeDataSet(
 ): Promise<RuntimeDataSetPreflightProblem | undefined> {
   const epoch = candidate.runtimeKernelEpoch;
   if (!candidate.dataSetId || epoch === undefined) return { code: 'runtime-data-set-empty', message: '这个历史库还没有数据。' };
-  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6 && epoch !== 7 && epoch !== RUNTIME_KERNEL_EPOCH) {
+  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6 && epoch !== 7 && epoch !== 8 && epoch !== RUNTIME_KERNEL_EPOCH) {
     return { code: 'runtime-data-set-epoch-unsupported', message: `这个历史库是不受支持的第 ${epoch} 代格式。` };
   }
   // An interrupted archive/cutover or root transition is an exact published recovery window: the

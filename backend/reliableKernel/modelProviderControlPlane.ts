@@ -1,3 +1,5 @@
+import { resolveFrozenToolDefinitions } from './frozenToolDefinitions';
+import type { ReliableAgentToolDefinition } from './agentLoop';
 import { frozenRecipeAttachmentHandles, resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import type { ModelProjectionWorkControls } from './modelProjectionWork';
 import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
@@ -156,6 +158,8 @@ export interface FullProviderRequest {
   recipe: PlainJsonValue;
   /** Resolved immutable identity facts, separate from the unmodified frozen recipe. */
   resolvedModelHandleCatalog: ModelHandleCatalog;
+  /** Original immutable tool snapshot, separate from the frozen recipe bytes. */
+  resolvedTools?: readonly ReliableAgentToolDefinition[];
   context: FullProviderContextItem[];
   /** Read-only native-source expansion for text summaries; the canonical head is unchanged. */
   compressionSourceContext?: FullProviderContextItem[];
@@ -724,6 +728,7 @@ export class ModelProviderControlPlane {
       ? null
       : requireId(command.settingsSnapshotContentObjectId, 'settingsSnapshotContentObjectId');
     const recipe = normalizeModelRequestRecipe(command.recipe, 'ModelRequest recipe');
+    const resolvedTools = await resolveFrozenToolDefinitions(this.database, this.contentStore, recipe);
     const recipeBytes = canonicalPlainJson(recipe, 'ModelRequest recipe');
     const modelRequestId = modelRequestIdFor(turnId, idempotencyKey);
     const projectionId = stableId('model_request_projection', modelRequestId);
@@ -776,7 +781,7 @@ export class ModelProviderControlPlane {
       : await this.tokenEstimator.estimateRoot(contextRootId).then((estimate) =>
           estimate.estimatedTokens + (estimate.source === 'provider-observed-delta'
             ? 0
-            : estimateRequestAuthorityTokens(frozen.document, recipe))
+            : estimateRequestAuthorityTokens(frozen.document, recipe, resolvedTools))
         ));
     const identity = {
       ...identityBase,
@@ -1016,6 +1021,7 @@ export class ModelProviderControlPlane {
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
       resolvedModelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
+      resolvedTools: await resolveFrozenToolDefinitions(this.database, this.contentStore, recipe),
       context: providerContext,
       ...(compressionSourceContext ? { compressionSourceContext } : {}),
       attachmentCatalogState,
@@ -1087,6 +1093,7 @@ export class ModelProviderControlPlane {
       authoritySnapshot: frozen.document,
       recipe,
       resolvedModelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
+      resolvedTools: await resolveFrozenToolDefinitions(this.database, this.contentStore, recipe),
       context: providerContext,
       attachmentCatalogState,
       ...conversationClaudeThinkingBinding(materialized.segments),

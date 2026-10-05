@@ -290,7 +290,7 @@ test('fork excludes discarded branch bindings while copied occurrences survive n
     assert.ok(next.entries.some(entry => entry.kind === 'process' && entry.target === 'new-process'));
     assert.equal((await rows(h.app, 'ProcessCompletionSourceLink', { conversation_id: fork.conversationId })).length, 0);
     assert.deepEqual(await rows(h.app, 'ChildExecution'), [], 'reserving A1 does not create child ownership');
-    assert.deepEqual(h.requests.at(-1).recipe.tools.map(tool => tool.name), ['read']);
+    assert.deepEqual(h.requests.at(-1).resolvedTools.map(tool => tool.name), ['read']);
     const beforeNested = await readConversationContextHandleCatalog(h.app.database, h.app.contentStore, fork.conversationId);
     const nestedCommand = await h.command(fork.conversationId, 'nested-context-reservations');
     const nested = await h.facade.forkConversation(nestedCommand);

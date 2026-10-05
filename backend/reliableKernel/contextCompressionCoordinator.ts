@@ -1,3 +1,4 @@
+import { freezeToolDefinitions, resolveFrozenToolDefinitions } from './frozenToolDefinitions';
 import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
 import { planCompressionSummaryCalls } from '../capabilities/llmProvider';
@@ -457,7 +458,7 @@ export class ReliableContextCompressionCoordinator {
       trigger: 'auto', providerContextOverflowRequestId: failedModelRequestId,
       requestBudget: this.modelProvider.planFullRequest(fullRequest, adapter),
       protectedCurrentInputTokens: typeof currentInputRecord?.estimatedTokens === 'number' ? currentInputRecord.estimatedTokens : 0,
-      tools: normalizeCompressionToolDefinitions(source.recipe.tools, 'Rejected request tools'),
+      tools: await resolveFrozenToolDefinitions(this.database, this.contentStore, source.recipe),
       modelHandleCatalog: fullRequest.resolvedModelHandleCatalog
     });
     if (result.status === 'compressed' && await this.context.currentHeadRootId(conversationId) !== result.result.rootId) {
@@ -994,7 +995,7 @@ export class ReliableContextCompressionCoordinator {
       }) };
       // An explicitly empty current tool list must not resurrect tools from an earlier model round.
       const tools = policy.methodKind !== 'provider_native' ? []
-        : command.tools !== undefined ? normalizeCompressionToolDefinitions(command.tools, 'Compression command.tools')
+        : command.tools !== undefined ? command.tools
           : await this.readLatestFrozenToolDefinitions(frozen.conversationId);
       const created = await this.modelProvider.createModelRequest({
         turnId,
@@ -1030,7 +1031,9 @@ export class ReliableContextCompressionCoordinator {
             groupId: recovery.groupId, blockId: compressionBlockId, trigger,
             methodKind: policy.methodKind, priorFailures: recovery.failures
           },
-          ...(policy.methodKind === 'provider_native' ? { tools } : {}),
+          ...(policy.methodKind === 'provider_native' ? {
+            toolsReference: await freezeToolDefinitions(this.database, this.contentStore, tools)
+          } : {}),
           ...(nativeRebase ? { nativeRebase } : {}),
           attachmentCatalogState: sourceAttachmentCatalogState,
           modelHandleCatalog: fullModelHandleCatalog,
@@ -1538,7 +1541,7 @@ export class ReliableContextCompressionCoordinator {
    * compaction receives the same frozen tool contract as the history it is summarizing. Automatic
    * callers pass the current definitions directly and never enter this lookup.
    */
-  private readLatestFrozenToolDefinitions(conversationId: string): Promise<CompressionToolDefinition[]> {
+  private readLatestFrozenToolDefinitions(conversationId: string): Promise<readonly CompressionToolDefinition[]> {
     return readLatestFrozenCompressionTools(this.database, this.contentStore, conversationId);
   }
 
@@ -1812,7 +1815,7 @@ export async function readLatestFrozenCompressionTools(
   database: RuntimeDatabase,
   contentStore: ContentAddressedStore,
   conversationIdInput: string
-): Promise<CompressionToolDefinition[]> {
+): Promise<readonly CompressionToolDefinition[]> {
   const conversationId = requireId(conversationIdInput, 'conversationId');
   const turns = (await listAllDomainRows(database, 'Turn', { conversation_id: conversationId }))
     .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at))
@@ -1837,7 +1840,7 @@ export async function readLatestFrozenCompressionTools(
         'ModelRequest recipe'
       );
       if (recipe.kind !== 'reliable-agent-turn') continue;
-      return normalizeCompressionToolDefinitions(recipe.tools, 'ModelRequest recipe.tools');
+      return resolveFrozenToolDefinitions(database, contentStore, recipe);
     }
   }
   return [];
@@ -1959,34 +1962,6 @@ function parseCompressionResult(value: PlainJsonValue): ParsedCompressionResult 
     contents,
     ...(attachmentObservationProfileSha256 ? { attachmentObservationProfileSha256, attachmentObservations } : {})
   };
-}
-
-function normalizeCompressionToolDefinitions(
-  value: unknown,
-  label: string
-): CompressionToolDefinition[] {
-  if (value === undefined || value === null) return [];
-  if (!Array.isArray(value)) throw new TypeError(`${label} must be an array.`);
-  return value.map((entry, index) => {
-    const normalized = normalizePlainJson(entry, `${label}[${index}]`);
-    const record = requireRecord(normalized, `${label}[${index}]`);
-    const description = typeof record.description === 'string' ? record.description : '';
-    const parameters = normalizePlainJson(record.parameters ?? {}, `${label}[${index}].parameters`);
-    return {
-      name: requireText(record.name, `${label}[${index}].name`),
-      description,
-      parameters,
-      ...(record.source === undefined
-        ? {}
-        : { source: normalizePlainJson(record.source, `${label}[${index}].source`) }),
-      ...(record.metadata === undefined
-        ? {}
-        : { metadata: normalizePlainJson(record.metadata, `${label}[${index}].metadata`) }),
-      ...(record.defaultConfig === undefined
-        ? {}
-        : { defaultConfig: normalizePlainJson(record.defaultConfig, `${label}[${index}].defaultConfig`) })
-    };
-  });
 }
 
 function compareBigIntDescending(left: unknown, right: unknown): number {
