@@ -24,8 +24,8 @@ export class ConversationAttachmentHandleRegistry {
     options: { now?: () => string; contentStore?: ContentAddressedStore } = {}
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
-    this.contentStore = options.contentStore ?? new ContentAddressedStore(
-      new RootAuthority(() => database.binding.paths.dataRootPath), database.binding);
+    this.contentStore = options.contentStore ?? ContentAddressedStore.forDatabase(
+      new RootAuthority(() => database.binding.paths.dataRootPath), database);
   }
 
   public async ensure(

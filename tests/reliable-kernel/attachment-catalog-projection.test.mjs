@@ -18,7 +18,7 @@ async function withRuntime(label, body) {
     const candidate = await kernel.resetCandidateRuntimeRoot(parent);
     database = await kernel.RuntimeDatabase.open(candidate.authority, { hostBootId: label });
 
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const fixtureContent = await store.ingest(
       database,
       JSON.stringify({ role: 'user', parts: [{ text: 'fixture' }] }),

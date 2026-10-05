@@ -361,7 +361,7 @@ test('复审 merge2 #7：模型流检查点和栅栏只能随父 ModelRequest �
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.current, [{ id: 'conversation_history_copy', project: SHARED_PROJECT }]);
   const database = await openTarget(t, fixture.current);
-  const store = new kernel.ContentAddressedStore(fixture.current.authority, fixture.current.binding);
+  const store = kernel.ContentAddressedStore.loose(fixture.current.authority, fixture.current.binding);
   const recipe = await store.ingest(database, '{}', 'application/json');
   const body = await store.ingest(database, JSON.stringify({ role: 'model', parts: [{ text: '检查点' }] }), MESSAGE_TYPE);
   const turnId = 'conversation_history_copy_turn';
@@ -2401,7 +2401,7 @@ async function conflictFixture(t) {
 
 /** Another window's ordinary collaboration message in the open target (allocated MAX(message_seq) + 1). */
 async function postCollaborationMessage(dataSet, runtime, conversationId, id) {
-  const store = new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding);
+  const store = kernel.ContentAddressedStore.loose(dataSet.authority, dataSet.binding);
   const payload = await store.ingest(runtime, `hello from ${id}`, 'text/vnd.limcode.collaboration-message');
   const inboxItemId = `${id}_inbox`;
   await runtime.transaction([
@@ -2479,7 +2479,7 @@ function requestMerge(fixture, dataSet) {
 async function withRuntime(dataSet, run) {
   const runtime = await kernel.RuntimeDatabase.open(dataSet.authority, { hostBootId: `seed-${randomUUID()}` });
   try {
-    return await run(runtime, new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding));
+    return await run(runtime, kernel.ContentAddressedStore.loose(dataSet.authority, dataSet.binding));
   } finally { await runtime.close(); }
 }
 

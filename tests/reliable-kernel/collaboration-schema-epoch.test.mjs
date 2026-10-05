@@ -10,9 +10,12 @@ const { RUNTIME_DOMAIN_SCHEMAS } = require(path.resolve('dist/extension/backend/
 const { VscodeReliableKernelCutoverCoordinator } = require(path.resolve('dist/extension/backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'));
 const Database = require('better-sqlite3');
 
-test('epoch9 collaboration schema and authority crosswalk have one exact definition', async () => {
-  assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 9);
+test('epoch10 collaboration schema and authority crosswalk have one exact definition', async () => {
+  assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 10);
   assert.equal(RUNTIME_DOMAIN_SCHEMAS.length, 113);
+  assert.deepEqual(kernel.EPOCH_9_RUNTIME_DOMAIN_SCHEMAS, RUNTIME_DOMAIN_SCHEMAS);
+  assert.equal(kernel.EPOCH_9_RUNTIME_CONTRACT_DIGEST,
+    'fd069dee963b1ad5032d1ea3121a583b0bc93cc9cfed43b9e684fb11beb7be46');
   const authority = JSON.parse(await fs.readFile('docs/architecture/reliable-kernel/contracts/authority.json', 'utf8'));
   assert.equal(authority.runtimeDomains.length, 113);
   // Cross-conversation reach is not a per-pair grant table; only team lineage and completion replies route.
@@ -35,7 +38,7 @@ for (const [label, mutate] of [
   ['manifest drift', db => db.prepare("UPDATE schema_manifest SET client_mapping = 'detail' WHERE domain_key = 'CollaborationMessage'").run()],
   ['extra physical object', db => db.exec('CREATE TABLE unknown_collaboration (id TEXT PRIMARY KEY)')],
   ['index drift', db => { db.exec('DROP INDEX ux_collaboration_request_01'); db.exec('CREATE INDEX ux_collaboration_request_01 ON collaboration_request (budget_id)'); }]
-]) test(`current epoch9 ${label} fails closed without repair or archive`, async () => {
+]) test(`current epoch10 ${label} fails closed without repair or archive`, async () => {
   const scope = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-collaboration-schema-'));
   try {
     const authority = new kernel.RootAuthority(() => path.join(scope, '.limcode-runtime', 'active'));

@@ -15,7 +15,7 @@ import {
 import {
   copyLocatedRuntimeDatabase, ForeignRuntimeHistoryRejection, foreignFileState, heldDatabaseFiles, holdForeignRuntimeRootClaim,
   isForeignRuntimeHistoryId, locateForeignRuntimeRoot, locatedCasTransferSource,
-  type ForeignRuntimeHistoryEntry, type ForeignRuntimeRootClaimHold, type HeldDatabaseFiles
+  type ForeignRuntimeHistoryEntry, type ForeignRuntimeRootClaimHold, type HeldDatabaseFiles, type LocatedCasAccess
 } from './runtimeForeignHistory';
 import { withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
@@ -218,6 +218,9 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
   /** Each located candidate's exact pointer, manifest, record and database state when it was located. */
   private readonly located = new WeakMap<ForeignHistoricalMergeCandidate, string>();
   private lastVerified: ForeignHistoricalMergeCandidate | undefined;
+  private readonly sourceObjects = new Map<ForeignHistoricalMergeCandidate, LocatedCasAccess>();
+  private readonly casOwners = new Set<LocatedCasAccess>();
+  private closing = false;
 
   public constructor(
     private readonly configurationRoot: string,
@@ -228,7 +231,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
   ) {}
 
   public get held(): boolean {
-    return this.claim.held;
+    return !this.closing && this.claim.held;
   }
 
   public get verified(): ForeignHistoricalMergeCandidate | undefined {
@@ -289,8 +292,28 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     } catch (error) {
       throw refusal(error);
     }
+    let objects: LocatedCasAccess;
+    try {
+      // The Runtime snapshot precedes the append-only packed CAS copy. All source SQLite opens
+      // remain confined to private copies, including the sidecar reader.
+      objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles());
+    } catch (error) {
+      await snapshot.close();
+      throw refusal(error);
+    }
+    this.sourceObjects.set(candidate, objects);
+    this.casOwners.add(objects);
     this.lastVerified = candidate;
-    return snapshot;
+    return {
+      get database() { return snapshot.database; },
+      withClosedReader: (run) => snapshot.withClosedReader(run),
+      close: async () => {
+        try { await objects.close(); }
+        finally { await snapshot.close(); }
+        this.casOwners.delete(objects);
+        if (this.sourceObjects.get(candidate) === objects) this.sourceObjects.delete(candidate);
+      }
+    };
   }
 
   public async fingerprint(candidate: ForeignHistoricalMergeCandidate): Promise<RuntimeDataSetFingerprint> {
@@ -323,8 +346,14 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
   }
 
   public objects(candidate: ForeignHistoricalMergeCandidate): HistoricalMergeSourceObjects {
-    const objects = locatedCasTransferSource(candidate.root, () => this.heldFiles());
+    const objects = this.sourceObjects.get(candidate);
+    if (!objects) throw new Error('Foreign CAS access requires its open Runtime snapshot.');
     return {
+      readPackedBytes: async (object) => {
+        this.assertHeld();
+        try { return await objects.readPackedBytes!(object); }
+        catch (error) { throw refusal(error); }
+      },
       size: async (object) => {
         this.assertHeld();
         return objects.size(object);
@@ -338,11 +367,17 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
   }
 
   public async release(): Promise<void> {
+    this.closing = true;
+    for (const owner of this.casOwners) {
+      await owner.close();
+      this.casOwners.delete(owner);
+    }
+    this.sourceObjects.clear();
     await this.claim.release();
   }
 
   private assertHeld(): void {
-    if (!this.claim.held) {
+    if (!this.held) {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '合并这个外来历史库时它的声明已不在，本次不合并。' });
     }
   }

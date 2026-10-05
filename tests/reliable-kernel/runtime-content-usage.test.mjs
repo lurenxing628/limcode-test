@@ -120,7 +120,7 @@ async function openRuntime(t, name) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-content-usage-${name}-`));
   const root = await kernel.resetCandidateRuntimeRoot(directory);
   const database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: `content-usage-${name}-${path.basename(directory)}` });
-  const store = new kernel.ContentAddressedStore(root.authority, root.binding);
+  const store = kernel.ContentAddressedStore.forDatabase(root.authority, database);
   t.after(async () => {
     await database.close();
     await fs.rm(directory, { recursive: true, force: true });

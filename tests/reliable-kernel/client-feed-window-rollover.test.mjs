@@ -120,7 +120,7 @@ async function createFixture(prefix, options = {}) {
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(parent);
     database = await kernel.RuntimeDatabase.open(candidate.authority);
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const content = await store.ingest(database, JSON.stringify({ fixture: prefix }), 'application/json');
     const conversationId = `${prefix}-conversation`;
     const turnId = `${prefix}-turn`;

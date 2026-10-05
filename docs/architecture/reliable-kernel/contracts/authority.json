@@ -48,8 +48,9 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "exact-published-upgrade-else-fail-closed",
-    "exactPredecessorUpgrade": "published-epoch-3-4-5-6-7-or-8-to-9-with-backup-journal",
-    "currentEpoch": 9,
+    "exactPredecessorUpgrade": "published-epoch-3-4-5-6-7-8-or-9-to-10-with-backup-journal",
+    "currentEpoch": 10,
+    "packedSmallCasAdmission": "whole-data-set-admission-fence-for-packed-small-cas; epoch-9-to-10-metadata-only-preserve-all-113-domain-rows-cas-and-ready-or-pending-handle-state; no-domain-ddl-or-history-body-read-or-startup-packing; old-epoch-9-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade",
     "frozenToolsReferenceAdmission": "whole-data-set-admission-fence-for-frozen-tools-reference-recipes; epoch-8-to-9-metadata-only-preserve-all-domain-rows-cas-and-ready-or-pending-handle-state; no-domain-ddl-or-history-body-read; old-epoch-8-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade",
     "catalogReferenceAdmission": "whole-data-set-admission-fence-for-compact-catalog-reference-recipes; epoch-7-to-8-metadata-only-preserve-all-domain-rows-cas-and-ready-or-pending-handle-state; no-domain-ddl-or-history-body-read; old-epoch-7-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade"
   },

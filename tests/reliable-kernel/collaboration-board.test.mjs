@@ -23,7 +23,7 @@ async function fixture(run, notify) {
   const authority = new RootAuthority(() => path.join(directory, 'runtime'));
   await initializeEmptyRuntimeRoot(authority);
   let database = await RuntimeDatabase.open(authority);
-  const store = new ContentAddressedStore(authority, database.binding);
+  const store = ContentAddressedStore.forDatabase(authority, database);
   let clock = 0;
   const timestamp = () => new Date(Date.parse(now) + ++clock).toISOString();
   let board = new CollaborationBoard(database, store, { now: timestamp, notify });

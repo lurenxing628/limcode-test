@@ -31,7 +31,7 @@ async function withCopyTarget(run) {
   await initializeEmptyRuntimeRoot(authority);
   const database = await RuntimeDatabase.open(authority);
   try {
-    const store = new ContentAddressedStore(authority, database.binding);
+    const store = ContentAddressedStore.forDatabase(authority, database);
     const recipe = await store.prepare(database, '{}', 'application/json');
     await database.transaction([
       ...preparedContentObjectSteps([recipe], 'historical_copy_fixture'),

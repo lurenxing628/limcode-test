@@ -15,7 +15,7 @@ async function withRuntime(body) {
   try {
     const fixture = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: 'collaboration-lifecycle-test' });
-    const store = new kernel.ContentAddressedStore(fixture.authority, fixture.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(fixture.authority, database);
     await database.transaction(['sender','target','unrelated'].map(id => row('Conversation', { id, title: id, status: 'active', created_at: NOW, updated_at: NOW })));
     return await body({ database, store });
   } finally { if (database) await database.close(); await fs.rm(directory, { recursive: true, force: true }); }

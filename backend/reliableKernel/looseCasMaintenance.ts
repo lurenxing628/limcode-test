@@ -3,11 +3,12 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { isPathInside } from '../capabilities/filesystem/pathContainment';
 import type { RuntimeRootPaths } from './contracts';
+import { PACKED_CAS_FILE } from './packedCasWorkerProtocol';
 
 /**
- * Physical maintenance adapter for the current loose-only CAS. These operations describe files,
- * not logical ContentObjects. Relocation owns the unchanged admission/offline/undo fences.
- * A mutable container must not inherit file-list rollback or the zero-cost hard-link estimate.
+ * Physical maintenance adapter for mixed CAS. These operations describe allocation and immutable
+ * loose leaves, not logical ContentObjects. Relocation owns admission/offline/undo fences.
+ * Packed SQLite files are always copied through their owner and are never rolled back as leaves.
  */
 
 /** Allocation units used by the relocation plan, including FAT/exFAT's largest clusters. */
@@ -18,6 +19,10 @@ export interface LooseCasStorageSize {
   casBytes: number;
   casAllocatedBytes: number;
   casClusterBytes?: number[];
+  /** Mutable packed SQLite, WAL/SHM and rollback journal, already included in the totals above. */
+  packedCasBytes?: number;
+  packedCasAllocatedBytes?: number;
+  packedCasClusterBytes?: number[];
 }
 
 /** One existing physical walk; no ContentObject queries, digest reads or extra CAS scans. */
@@ -27,7 +32,10 @@ export async function measureLooseCasRuntimeStorage(
   const database = path.resolve(paths.databasePath);
   const databaseFiles = new Set([database, `${database}-wal`]);
   const cas = path.resolve(paths.casRootPath);
-  const result = { databaseBytes: 0, casBytes: 0, casAllocatedBytes: 0, casClusterBytes: LOOSE_CAS_COPY_CLUSTER_SIZES.map(() => 0) };
+  const result = {
+    databaseBytes: 0, casBytes: 0, casAllocatedBytes: 0, casClusterBytes: LOOSE_CAS_COPY_CLUSTER_SIZES.map(() => 0),
+    packedCasBytes: 0, packedCasAllocatedBytes: 0, packedCasClusterBytes: LOOSE_CAS_COPY_CLUSTER_SIZES.map(() => 0)
+  };
   const walk = async (entry: string): Promise<void> => {
     let info: Stats;
     try { info = await fs.lstat(entry); }
@@ -38,10 +46,15 @@ export async function measureLooseCasRuntimeStorage(
       if (databaseFiles.has(entry)) result.databaseBytes += info.size;
       else if (isPathInside(cas, entry)) {
         result.casBytes += info.size;
-        result.casAllocatedBytes += typeof info.blocks === 'number' && info.blocks > 0
+        const allocated = typeof info.blocks === 'number' && info.blocks > 0
           ? info.blocks * 512 : Math.ceil(info.size / 4096) * 4096;
+        const packed = isPackedCasPhysicalEntry(path.relative(cas, entry));
+        result.casAllocatedBytes += allocated;
+        if (packed) { result.packedCasBytes += info.size; result.packedCasAllocatedBytes += allocated; }
         LOOSE_CAS_COPY_CLUSTER_SIZES.forEach((cluster, index) => {
-          result.casClusterBytes[index] += Math.ceil(info.size / cluster) * cluster;
+          const bytes = Math.ceil(info.size / cluster) * cluster;
+          result.casClusterBytes[index] += bytes;
+          if (packed) result.packedCasClusterBytes[index] += bytes;
         });
       }
     } else if (info.isDirectory()) {
@@ -63,17 +76,32 @@ export function canHardLinkLooseCas(
 
 /** Physical CAS allocation in the target. The caller separately reserves database/staging space. */
 export function estimateLooseCasCopyBytes(size: LooseCasStorageSize, hardLinks: boolean, targetAllocationUnit?: number): number {
-  if (hardLinks) return 0;
+  if (hardLinks) return estimatePackedCasCopyBytes(size, targetAllocationUnit);
   if (targetAllocationUnit === undefined) return size.casAllocatedBytes;
   const index = LOOSE_CAS_COPY_CLUSTER_SIZES.findIndex((cluster) => cluster >= targetAllocationUnit);
   return Math.max(size.casAllocatedBytes, size.casClusterBytes?.[index === -1 ? LOOSE_CAS_COPY_CLUSTER_SIZES.length - 1 : index] ?? 0);
+}
+
+/** Packed SQLite allocation is never reduced to zero by same-device loose hard links. */
+export function estimatePackedCasCopyBytes(size: LooseCasStorageSize, targetAllocationUnit?: number): number {
+  const allocated = size.packedCasAllocatedBytes ?? 0;
+  if (targetAllocationUnit === undefined) return allocated;
+  const index = LOOSE_CAS_COPY_CLUSTER_SIZES.findIndex((cluster) => cluster >= targetAllocationUnit);
+  return Math.max(allocated, size.packedCasClusterBytes?.[index === -1 ? LOOSE_CAS_COPY_CLUSTER_SIZES.length - 1 : index] ?? 0);
+}
+
+/** Exact fixed container files only, relative to the CAS root; no loose leaf is classified here. */
+export function isPackedCasPhysicalEntry(relative: string): boolean {
+  const name = process.platform === 'win32' || process.platform === 'darwin' ? relative.toLowerCase() : relative;
+  return ['', '-wal', '-shm', '-journal'].some(suffix => name === `${PACKED_CAS_FILE}${suffix}`);
 }
 
 /**
  * Physical loose-store listing for the existing relocation journal: sorted '/'-separated names
  * of all non-directory entries, without following discovered links. The caller admits the root
  * through relocation's existing no-symbolic-path checks. A missing tree contributes no names.
- * This intentionally retains the journal's existing representation, including temporary files.
+ * This retains the journal's existing representation, including temporary files. Fixed packed
+ * database files are excluded: appended immutable rows survive a metadata undo as safe orphans.
  */
 export async function listLooseCasPhysicalEntries(root: string): Promise<string[]> {
   const files: string[] = [];
@@ -83,6 +111,7 @@ export async function listLooseCasPhysicalEntries(root: string): Promise<string[
     catch (error) { if (isMissing(error)) return; throw error; }
     for (const entry of entries) {
       const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
+      if (isPackedCasPhysicalEntry(relative)) continue;
       if (entry.isDirectory()) await visit(path.join(directory, entry.name), relative);
       else files.push(relative);
     }
@@ -94,7 +123,8 @@ export async function listLooseCasPhysicalEntries(root: string): Promise<string[
 /**
  * Loose-only undo, after Runtime metadata has been restored and target writers are closed/fenced.
  * Keep every previously listed file; remove only added leaves, leaving the directory layout alone.
- * A future mutable CAS container must retain appended rows as orphans, never use this rollback.
+ * The packed database and its WAL/SHM are excluded even when first created by this relocation.
+ * Removing an entirely fresh target root is a separate operation after every owner closes.
  */
 export async function removeAddedLooseCasPhysicalEntries(root: string, before: ReadonlySet<string>): Promise<void> {
   for (const file of await listLooseCasPhysicalEntries(root)) {

@@ -5,8 +5,8 @@ import { requireCasObjectIdentity } from './casObjectAccess';
 import { assertCurrentSchema } from './databaseSchema';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import {
-  copyLocatedRuntimeDatabase, heldDatabaseFiles, readLocatedCasObject, relocateRuntimeRoot, withLocatedRuntimeRootFence,
-  type HeldDatabaseFiles
+  copyLocatedRuntimeDatabase, heldDatabaseFiles, openLocatedCasAccess, relocateRuntimeRoot, withLocatedRuntimeRootFence,
+  type HeldDatabaseFiles, type LocatedCasAccess
 } from './runtimeForeignHistory';
 import { registerForeignRuntimeHistoryView, type ForeignRuntimeHistoryViewRegistration } from './runtimeForeignHistoryViews';
 import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
@@ -52,8 +52,8 @@ const MAX_MESSAGE_CONTENT_BYTES = 64n * 1024n * 1024n;
  * admission + maintenance; foreign: its claim under this configuration root, verified again inside
  * it) with its Hosts offline, then open only that temporary copy, fenced by the recorded binding.
  * The copy counts only when the files kept their state while it was taken, and no file copied or
- * read is a file of a database this process may hold (copyLocatedRuntimeDatabase). CAS stays
- * on-demand, read from the located root as regular files only. A recorded path is never read. A
+ * read is a file of a database this process may hold (copyLocatedRuntimeDatabase). Packed CAS uses
+ * a later private copy, and loose bodies stay on-demand descriptor reads. A recorded path is never read. A
  * foreign root stays registered as viewed (runtimeForeignHistoryViews, written under its claim in the
  * current configuration root) until the reader is closed, so 清理备份 keeps it meanwhile.
  */
@@ -83,15 +83,21 @@ export async function openRuntimeDataSetHistory(
       }
       const view = current.origin.kind === 'foreign' ? await registerForeignRuntimeHistoryView(paths.globalStoragePath, current.id) : undefined;
       let snapshot: RuntimeDataSetDatabaseSnapshot | undefined;
+      let cas: LocatedCasAccess | undefined;
       try {
         snapshot = await createLocatedRuntimeDatabaseSnapshot(current, { copy: (located) => copyLocatedRuntimeDatabase(located, held) });
         const { database } = snapshot;
         assertCurrentSchema(database, binding);
         assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS, { label: 'Historical Runtime' });
-        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, held, view);
+        // Metadata first: the later append-only CAS copy contains every packed body it references.
+        cas = await openLocatedCasAccess(current, held, () => heldByThisProcess(paths, current));
+        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, cas, held, view);
       } catch (error) {
-        await snapshot?.close();
-        await view?.release().catch(() => undefined);
+        try { await cas?.close(); }
+        finally {
+          try { await snapshot?.close(); }
+          finally { await view?.release().catch(() => undefined); }
+        }
         if (error instanceof Error) {
           error.message = `无法读取历史库：${error.message} 未执行任何迁移或重置。`;
         }
@@ -113,6 +119,7 @@ function heldByThisProcess(paths: { globalStoragePath: string }, root: LocatedRu
 
 class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
   private closed = false;
+  private closing = false;
   private readonly textCache = new Map<string, string>();
 
   public constructor(
@@ -121,6 +128,7 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     private readonly binding: RootBinding,
     private readonly database: Database.Database,
     private readonly snapshot: RuntimeDataSetDatabaseSnapshot,
+    private readonly cas: LocatedCasAccess,
     private held: HeldDatabaseFiles,
     private readonly view?: ForeignRuntimeHistoryViewRegistration
   ) {}
@@ -187,17 +195,18 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
 
   public async close(): Promise<void> {
     if (this.closed) return;
-    this.closed = true;
+    this.closing = true;
     this.textCache.clear();
-    try {
-      await this.snapshot.close();
-    } finally {
-      await this.view?.release();
+    try { await this.cas.close(); }
+    finally {
+      try { await this.snapshot.close(); }
+      finally { await this.view?.release(); }
     }
+    this.closed = true;
   }
 
   private async validateSource(): Promise<void> {
-    if (this.closed) throw new Error('Runtime history reader is closed.');
+    if (this.closed || this.closing) throw new Error('Runtime history reader is closed.');
     this.held = await heldByThisProcess(this.paths, this.root);
     const current = await relocateRuntimeRoot(this.paths, this.root, this.held);
     if (!sameLocatedRuntimeRoot(current, this.root)) {
@@ -241,7 +250,7 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     if (typeof metadata.byte_length !== 'bigint' || metadata.byte_length < 0n || metadata.byte_length > MAX_MESSAGE_CONTENT_BYTES) {
       throw new Error(`Historical ContentObject ${id} exceeds the 64 MiB message read limit or has an invalid length.`);
     }
-    const bytes = await readLocatedCasObject(this.root, object, this.held);
+    const bytes = await this.cas.readBytes(object);
     const source = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const decoded = decodeHistoryText(source, text(metadata.content_type));
     this.textCache.set(id, decoded);

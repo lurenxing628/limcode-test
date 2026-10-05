@@ -20,7 +20,7 @@ async function openRuntime() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-request-wiring-'));
   const fixture = await kernel.resetCandidateRuntimeRoot(directory);
   const database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: 'fork-request-wiring' });
-  const store = new kernel.ContentAddressedStore(fixture.authority, fixture.binding);
+  const store = kernel.ContentAddressedStore.forDatabase(fixture.authority, database);
   const userMessage = async (id, revisionId, conversationId, text) => {
     const content = await store.ingest(database, JSON.stringify({ role: 'user', parts: [{ text }] }), 'application/vnd.limcode.message+json');
     return [

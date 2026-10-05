@@ -186,7 +186,7 @@ for (const usage of [null, 'usage unavailable', '{"looks":"structured"}']) {
     };
     await withRuntime(f.alpha, (database, store) => seed(database, store));
     await f.database.transaction([repo('Conversation').insert(conversation('shared'))]);
-    await seed(f.database, new kernel.ContentAddressedStore(f.current.authority, f.database.binding), true);
+    await seed(f.database, kernel.ContentAddressedStore.forDatabase(f.current.authority, f.database), true);
     // A valid stored JSON representation need not have the writer's usual whitespace. Use another
     // process so closing this fixture connection cannot release the live Runtime's POSIX locks.
     execFileSync(process.execPath, ['-e', `

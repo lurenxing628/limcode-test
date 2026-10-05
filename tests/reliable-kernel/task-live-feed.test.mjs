@@ -36,7 +36,7 @@ async function openRuntime({ laterMessages = 0 } = {}) {
   try {
     const root = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'task-live-feed' });
-    const cas = new kernel.ContentAddressedStore(root.authority, root.binding);
+    const cas = kernel.ContentAddressedStore.forDatabase(root.authority, database);
     const json = async (value, type = 'application/json') => (await cas.ingest(database, JSON.stringify(value), type)).id;
     const modelBody = await json({ role: 'model', parts: [{ text: '任务' }] }, 'application/vnd.limcode.message+json');
     const userBody = await json({ role: 'user', parts: [{ text: '继续' }] }, 'application/vnd.limcode.message+json');

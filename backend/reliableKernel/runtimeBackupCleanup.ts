@@ -12,7 +12,7 @@ import {
   RUNTIME_EPOCH_FILE, type RuntimeRootPaths
 } from './contracts';
 import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
-import { LocalCasByteAccess } from './looseCasObjectAccess';
+import { isPackedCasPhysicalEntry } from './looseCasMaintenance';
 import { CUTOVER_BACKUPS_DIRECTORY, CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
 import type { RepositoryGetRead } from './repositories';
 import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
@@ -30,12 +30,12 @@ import {
   readRuntimeDataSetMergeRequests, readRuntimeLargeMergeTargetBackups, runtimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
 import {
-  MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RETIRED_EPOCH_TO_6_JOURNAL_FILE, RETIRED_EPOCH_TO_7_JOURNAL_FILE, RETIRED_EPOCH_TO_8_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
+  MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RETIRED_EPOCH_TO_6_JOURNAL_FILE, RETIRED_EPOCH_TO_7_JOURNAL_FILE, RETIRED_EPOCH_TO_8_JOURNAL_FILE, RETIRED_EPOCH_TO_9_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
   RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE
 } from './runtimeEpochMigration';
 import {
   copyForeignRuntimeSqliteFiles, discoverForeignRuntimeHistory, foreignRuntimeHistoryId, ForeignRuntimeHistoryRejection,
-  heldDatabaseFiles, inspectForeignRuntimeRoot, listRenamedForeignRuntimeRoots, readForeignRuntimePointerIdentity,
+  heldDatabaseFiles, inspectForeignRuntimeRoot, listRenamedForeignRuntimeRoots, openLocatedCasAccess, readForeignRuntimePointerIdentity,
   readLocatedRuntimeFile, tryWithForeignRuntimeRootClaim, type DiscoveredForeignRuntimeRoot, type ForeignRuntimeHistoryEntry,
   type HeldDatabaseFiles
 } from './runtimeForeignHistory';
@@ -87,7 +87,8 @@ import {
  * whose database or WAL is the same inode (a hard link) as a local data set's database files (dev:ino
  * compared by stat before anything is copied). Other data sets and the copies are read in the facts
  * worker from private copies (runtimeDataSetFacts), straight from the tables. CAS presence uses the
- * logical byte boundary's length-only proof (the loose adapter only lstat's, never reads/hashes).
+ * logical boundary's length-only proof: live CAS borrows its Runtime owner; other packed stores
+ * use scoped private copies after the Runtime facts. Neither tier hashes bodies for this check.
  *
  * Foreign history (runtimeForeignHistory): only roots that pass its verification, each deleted as
  * its located control root (a whole archive; in a copied directory only the data set, never the
@@ -188,8 +189,8 @@ export interface RuntimeBackupCleanupResult {
   copiedDirectoriesWithoutDataSets: Array<{ name: string; path: string }>;
 }
 
-/** The data set open in this window: its binding and its worker reader. */
-export type RuntimeBackupCleanupCurrent = Pick<RuntimeDatabase, 'binding' | 'snapshot'>;
+/** The data set open in this window: its binding and its borrowed Runtime/CAS worker readers. */
+export type RuntimeBackupCleanupCurrent = Pick<RuntimeDatabase, 'binding' | 'snapshot' | 'casAccess'>;
 
 /**
  * before-rename, after-rename and after-verify (the mark is durable) hold every claim of the deletion;
@@ -240,6 +241,7 @@ const IN_PROGRESS_FILES: ReadonlyArray<readonly [file: string, operation: string
   [RETIRED_EPOCH_TO_6_JOURNAL_FILE, '未完成的升级'],
   [RETIRED_EPOCH_TO_7_JOURNAL_FILE, '未完成的升级'],
   [RETIRED_EPOCH_TO_8_JOURNAL_FILE, '未完成的升级'],
+  [RETIRED_EPOCH_TO_9_JOURNAL_FILE, '未完成的升级'],
   [RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, '旧版本未完成的 3→4 升级'],
   [CUTOVER_REQUEST_FILE, '未完成的旧格式数据切换'],
   [CUTOVER_JOURNAL_FILE, '未完成的旧格式数据切换']
@@ -318,7 +320,7 @@ interface TreeFacts {
   modifiedAt: number;
   /**
    * What sameShallowTree compares without reading every content object again: every directory by
-   * its identity and the names in it, every other entry outside `objects` by its exact state,
+   * its identity and names, every packed SQLite file and entry outside CAS by its exact state,
    * relative to the root ('' is the root itself).
    */
   shallow: ReadonlyArray<readonly [relative: string, state: string]>;
@@ -359,7 +361,7 @@ interface Coverage {
   missingRevisions: number;
   /** Other history rows it lacks, by domain (in RUNTIME_HISTORY_RECORD_DOMAINS order). */
   missingRecords: Array<[domain: string, count: number]>;
-  /** Bodies it lacks: no such content object, or no regular file of that size at its storage key. */
+  /** Bodies it lacks: no such content object, or no packed/loose body of that size at its logical key. */
   missingContents: number;
   /** Messages visible in the copy that are deleted there, or show another current revision (edited, retried). */
   replaced: string[];
@@ -510,7 +512,7 @@ export async function planRuntimeBackupCleanup(
   const proofs = new Map<string, BackupProof>();
   const foreignProofs = new Map<string, ForeignProof>();
   const cache = new CoverageCache(configurationRootPath);
-  const bodies: BodyCheck = new Map();
+  const bodies = new BodyCheck(current, databaseFiles);
   report('正在列出外来历史库…');
   let found: DiscoveredForeignRuntimeRoot[] = [];
   try {
@@ -640,7 +642,7 @@ export async function deleteRuntimeBackups(
             const entry = await backupEntry(configurationRootPath, root, proof.kind, proof.item.name);
             if (!entry) { keep('已经不在原处（可能已被其它操作删除）'); continue; }
             const evaluation = await evaluateBackup({
-              configurationRootPath, root, kind: proof.kind, entry, ledger, current, cache, databaseFiles, bodies: new Map(), now: now(), known: proof
+              configurationRootPath, root, kind: proof.kind, entry, ledger, current, cache, databaseFiles, bodies: new BodyCheck(current, databaseFiles), now: now(), known: proof
             });
             if (!evaluation.proof) { keep(`${evaluation.item.reason}；这一项没有删除`, evaluation.item.detail); continue; }
             try {
@@ -1202,7 +1204,7 @@ async function newestMergeBackupProtection(root: ControlRoot, name: string, now:
 }
 
 interface UpgradeCompletion {
-  fromEpoch: 3 | 4 | 5 | 6 | 7 | 8;
+  fromEpoch: 3 | 4 | 5 | 6 | 7 | 8 | 9;
   previousBinding: HistoricalRootBinding;
   nextBinding: HistoricalRootBinding;
   completedAt: number;
@@ -1234,7 +1236,8 @@ async function readUpgradeCompletion(directory: string, read: TextReader = readL
     || (record.toEpoch === 6 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5))
     || (record.toEpoch === 7 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5 || record.fromEpoch === 6))
     || (record.toEpoch === 8 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5 || record.fromEpoch === 6 || record.fromEpoch === 7))
-    || (record.toEpoch === 9 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5 || record.fromEpoch === 6 || record.fromEpoch === 7 || record.fromEpoch === 8));
+    || (record.toEpoch === 9 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5 || record.fromEpoch === 6 || record.fromEpoch === 7 || record.fromEpoch === 8))
+    || (record.toEpoch === 10 && (record.fromEpoch === 3 || record.fromEpoch === 4 || record.fromEpoch === 5 || record.fromEpoch === 6 || record.fromEpoch === 7 || record.fromEpoch === 8 || record.fromEpoch === 9));
   if (record.kind !== MIGRATION_COMPLETION_KIND || !recognizedUpgrade || !Number.isFinite(completedAt)) {
     return '升级完成记录无法识别，按历史保留';
   }
@@ -1315,7 +1318,53 @@ function unreadableReason(error: unknown, subject: string): string {
  * unproven). Each body is inspected once per data set, including when aliases disagree on length.
  * The loose adapter retains the existing regular-leaf lstat proof; no body digest is introduced.
  */
-type BodyCheck = Map<string, { access: CasByteAccess; sizes: Map<string, bigint | undefined> }>;
+interface BodyCheckEntry { access: Pick<CasByteAccess, 'inspectByteLength'>; sizes: Map<string, bigint | undefined> }
+
+/** A root's bodies are checked in one scoped session, never with a worker per object. */
+class BodyCheck {
+  private readonly sizes = new Map<string, Map<string, bigint | undefined>>();
+
+  public constructor(private readonly current: RuntimeBackupCleanupCurrent, private readonly databaseFiles: DatabaseFiles) {}
+
+  public async inRoot<T>(local: LocalDataSet, operation: (entry: BodyCheckEntry) => Promise<T>): Promise<T> {
+    const key = JSON.stringify(local.binding);
+    const sizes = this.sizes.get(key) ?? new Map<string, bigint | undefined>();
+    this.sizes.set(key, sizes);
+    if (local.current) return operation({ access: this.current.casAccess, sizes });
+    return withRuntimeMaintenance(local.binding.paths, async () => {
+      // The Runtime facts must precede the append-only packed snapshot: every referenced body
+      // was durable before those facts, and later packed rows are harmless for coverage.
+      const changed = await localUnchanged(local, this.databaseFiles, local.facts?.files);
+      if (changed || !sameBinding(await requireCompleteRuntimeDataSet(local.candidate), local.binding)) {
+        throw new CleanupRefusal(changed ?? '所在历史库的身份发生了变化，请重新检查');
+      }
+      const held = new Set([
+        ...await heldDatabaseFiles(local.candidate.configurationRootPath, { except: local.binding.paths.databasePath }),
+        ...this.databaseFiles.keys()
+      ]);
+      const access = await openLocatedCasAccess({
+        id: local.candidate.id, origin: { kind: 'local', candidateId: local.candidate.id },
+        containerRoot: local.candidate.configurationRootPath, located: local.binding.paths, recorded: local.binding
+      }, held);
+      try {
+        const result = await operation({ access, sizes });
+        const changedAfter = await localUnchanged(local, this.databaseFiles, local.facts?.files);
+        if (changedAfter) throw new CleanupRefusal(changedAfter);
+        return result;
+      } finally {
+        // Windows requires the worker to exit before its private SQLite copy is removed.
+        await access.close();
+      }
+    });
+  }
+
+  public async inCurrent<T>(operation: (entry: BodyCheckEntry) => Promise<T>): Promise<T> {
+    const key = JSON.stringify(this.current.binding);
+    const sizes = this.sizes.get(key) ?? new Map<string, bigint | undefined>();
+    this.sizes.set(key, sizes);
+    return operation({ access: this.current.casAccess, sizes });
+  }
+}
 
 /**
  * How much of a copy's history (`ids`) one local data set holds. Conversations first (they are
@@ -1333,7 +1382,6 @@ async function coverageIn(
   bodies: BodyCheck
 ): Promise<Coverage> {
   const coverage: Coverage = { missingConversations: 0, missingRevisions: 0, missingRecords: [], missingContents: 0, replaced: [] };
-  const casRoot = local.binding.paths.casRootPath;
   if (local.current) {
     coverage.missingConversations = await countMissingInCurrent(current, 'Conversation', ids.conversations);
     if (coverage.missingConversations > 0) return coverage;
@@ -1361,10 +1409,12 @@ async function coverageIn(
     if (missing > 0) coverage.missingRecords.push([domain.key, missing]);
   }
   if (coverage.missingRecords.length > 0) return coverage;
-  for (const id of ids.contents) {
-    const body = facts.contents.get(id);
-    if (!body || !await bodyPresent(casRoot, body[0], body[1], bodies)) coverage.missingContents += 1;
-  }
+  await bodies.inRoot(local, async (checked) => {
+    for (const id of ids.contents) {
+      const body = facts.contents.get(id);
+      if (!body || !await bodyPresent(body[0], body[1], checked)) coverage.missingContents += 1;
+    }
+  });
   if (coverage.missingContents > 0) return coverage;
   coverage.replaced = [...new Set(ids.visibleMessages.filter(([message, , revision]) => facts.visible.get(message) !== revision)
     .map(([message]) => message))];
@@ -1413,24 +1463,26 @@ async function countMissingInCurrent(current: RuntimeBackupCleanupCurrent, domai
   return missing;
 }
 
-/** Bodies of the copy the open data set lacks: its content object (read through its reader) and a regular file of that size at its storage key. */
+/** Bodies of the copy the open data set lacks: its content object and packed/loose bytes of the recorded size, through its own access owner. */
 async function missingBodiesInCurrent(
   current: RuntimeBackupCleanupCurrent,
   contents: readonly string[],
   bodies: BodyCheck
 ): Promise<number> {
-  let missing = 0;
-  for (let offset = 0; offset < contents.length; offset += RUNTIME_BACKUP_CLEANUP_READ_BATCH) {
-    const batch = contents.slice(offset, offset + RUNTIME_BACKUP_CLEANUP_READ_BATCH);
-    const rows = await readCurrent(current, batch.map((id) => ({ kind: 'get', domain: 'ContentObject', id })));
-    for (const row of rows) {
-      const storageKey = row?.storage_key;
-      const byteLength = row?.byte_length;
-      if (typeof storageKey !== 'string' || (typeof byteLength !== 'bigint' && typeof byteLength !== 'number')
-        || !await bodyPresent(current.binding.paths.casRootPath, storageKey, String(byteLength), bodies)) missing += 1;
+  return bodies.inCurrent(async (checked) => {
+    let missing = 0;
+    for (let offset = 0; offset < contents.length; offset += RUNTIME_BACKUP_CLEANUP_READ_BATCH) {
+      const batch = contents.slice(offset, offset + RUNTIME_BACKUP_CLEANUP_READ_BATCH);
+      const rows = await readCurrent(current, batch.map((id) => ({ kind: 'get', domain: 'ContentObject', id })));
+      for (const row of rows) {
+        const storageKey = row?.storage_key;
+        const byteLength = row?.byte_length;
+        if (typeof storageKey !== 'string' || (typeof byteLength !== 'bigint' && typeof byteLength !== 'number')
+          || !await bodyPresent(storageKey, String(byteLength), checked)) missing += 1;
+      }
     }
-  }
-  return missing;
+    return missing;
+  });
 }
 
 /** Visible messages of the copy the open data set shows deleted, with another current revision, or not at all. */
@@ -1463,16 +1515,11 @@ async function readCurrent(current: RuntimeBackupCleanupCurrent, reads: Reposito
 }
 
 /** Length-only logical presence proof, cached for this check; the adapter owns physical lookup. */
-async function bodyPresent(casRoot: string, storageKey: string, byteLength: string, bodies: BodyCheck): Promise<boolean> {
+async function bodyPresent(storageKey: string, byteLength: string, checked: BodyCheckEntry): Promise<boolean> {
   if (!/^(0|[1-9][0-9]*)$/.test(byteLength)) return false;
   let object: CasObjectIdentity;
   try { object = casObjectFromStorageKey(storageKey, BigInt(byteLength)); }
   catch { return false; }
-  let checked = bodies.get(casRoot);
-  if (!checked) {
-    checked = { access: new LocalCasByteAccess(casRoot), sizes: new Map() };
-    bodies.set(casRoot, checked);
-  }
   if (!checked.sizes.has(storageKey)) checked.sizes.set(storageKey, await checked.access.inspectByteLength(object));
   return checked.sizes.get(storageKey) === object.byte_length;
 }
@@ -2418,11 +2465,13 @@ async function evaluateForeign(
 
 /** Bodies a local data set's own content objects lack in its CAS (identical proof: they are the copy's too). */
 async function missingOwnBodies(local: LocalDataSet, bodies: BodyCheck): Promise<number> {
-  let missing = 0;
-  for (const [key, length] of local.facts?.contents.values() ?? []) {
-    if (!await bodyPresent(local.binding.paths.casRootPath, key, length, bodies)) missing += 1;
-  }
-  return missing;
+  return bodies.inRoot(local, async (checked) => {
+    let missing = 0;
+    for (const [key, length] of local.facts?.contents.values() ?? []) {
+      if (!await bodyPresent(key, length, checked)) missing += 1;
+    }
+    return missing;
+  });
 }
 
 /** Under the foreign claim: not viewed, verified again, its directory described, the backups it keeps and (when needed) itself read. */
@@ -2588,7 +2637,7 @@ async function isClaimDirectory(entry: string, name: string, info: { isDirectory
 
 /**
  * One backup a foreign control root keeps, by the rules of its kind: an upgrade backup needs its
- * exact completion record to epoch 5, 6, 7, 8 or 9 (published 3→4 ones are kept) and 7 days since the latest of its
+ * exact completion record to epoch 5, 6, 7, 8, 9 or 10 (published 3→4 ones are kept) and 7 days since the latest of its
  * times; a pre-merge or source backup its saved binding; and its directory only what its kind writes
  * (see backupContentProblem). Records are read as small regular files of the foreign root. A string
  * says why the root stays whole.
@@ -2912,9 +2961,8 @@ function sameIdentity(left: { dataSetId: string; rootInstanceId: string }, right
 
 /**
  * Every entry below `root` (never following a link), with sizes and a digest of every entry's exact
- * state. This is a physical loose-store tree adapter: `looseObjects` holds files published once,
- * never written in place, so `shallow` describes it only by directories. A mutable CAS container
- * must supply its own race-proof state here; it must not inherit this immutable-file shortcut.
+ * state. Immutable loose leaves need only their directories in `shallow`; packed SQLite and its
+ * WAL/SHM always retain their exact file state so append/checkpoint changes block a stale deletion.
  */
 async function describeTree(root: string, exclude: readonly string[] = [], looseObjects?: string): Promise<TreeFacts> {
   const skipped = new Set(exclude.map(comparable));
@@ -2942,7 +2990,8 @@ async function describeTree(root: string, exclude: readonly string[] = [], loose
       bytes += info.size;
       if (info.nlink <= 1n) reclaimableBytes += info.size;
       lines.push(`f ${relative} ${state}`);
-      if (objectRoot === undefined || !isBelow(objectRoot, comparable(current))) shallow.push([relative, `f ${state}`]);
+      if (objectRoot === undefined || !isBelow(objectRoot, comparable(current))
+        || isPackedCasPhysicalEntry(path.relative(objectRoot, comparable(current)))) shallow.push([relative, `f ${state}`]);
     } else if (info.isDirectory()) {
       lines.push(`d ${relative} ${state}`);
       const names = (await fs.readdir(current)).filter((name) => !skipped.has(comparable(path.join(current, name))));
@@ -2968,8 +3017,9 @@ async function describeTree(root: string, exclude: readonly string[] = [], loose
  * is the same one (dev:ino) with exactly the same names in it, so nothing was added, removed,
  * renamed or replaced anywhere; every entry outside the store keeps its exact state (databases,
  * records, the backups it keeps). A content object is only compared by its name: it is published
- * once and never written in place, and no proof relies on this copy's bodies (they are checked in the
- * proving data set's CAS). The same after the rename (the root keeps its dev:ino and names).
+ * once and never written in place. The mutable packed files retain their exact states, and no proof
+ * relies on this copy's bodies (they are checked in the proving data set's CAS). The same after
+ * the rename (the root keeps its dev:ino and names).
  */
 async function sameShallowTree(root: string, tree: TreeFacts): Promise<boolean> {
   try {

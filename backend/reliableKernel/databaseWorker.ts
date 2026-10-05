@@ -33,7 +33,7 @@ import {
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import { requireCasObjectIdentity, type SynchronousCasByteAccess } from './casObjectAccess';
-import { LocalSynchronousCasByteAccess } from './looseCasObjectAccess';
+import { RuntimeSynchronousCasByteAccess } from './synchronousCasAccess';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
@@ -224,7 +224,7 @@ let measuringRequest: RequestMeasurement | undefined;
 
 const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
-const casByteAccess: SynchronousCasByteAccess = new LocalSynchronousCasByteAccess(data.binding.paths.casRootPath);
+const casByteAccess = new RuntimeSynchronousCasByteAccess(data.binding);
 
 /**
  * Bounded verified-CAS read capability handed to the client projection module. The worker keeps
@@ -630,6 +630,7 @@ async function start(): Promise<void> {
       attachmentScopeCache.clear();
       detachRuntimeStatementCache(reader);
       detachRuntimeStatementCache(writer);
+      casByteAccess.close();
       reader.close();
       writer.close();
       respond({ type: 'response', id: request.id, ok: true, result: null });

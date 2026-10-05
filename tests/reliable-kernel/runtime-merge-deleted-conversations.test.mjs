@@ -296,7 +296,7 @@ async function openFacade(t, fixture) {
     ensureCapabilitiesReady: async () => undefined,
     application: {
       database,
-      contentStore: new kernel.ContentAddressedStore(fixture.current.authority, fixture.current.binding),
+      contentStore: kernel.ContentAddressedStore.forDatabase(fixture.current.authority, database),
       conversationDeletion: new ConversationDeletionControlPlane(database),
       modelProvider: { subscribeSteering: () => () => undefined },
       webviewFeed: { postToConversation() {}, reconnect() {} }

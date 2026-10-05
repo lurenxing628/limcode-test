@@ -512,7 +512,7 @@ function copy(fixture, dataSet, target, options = {}) {
 async function withRuntime(dataSet, run) {
   const runtime = await kernel.RuntimeDatabase.open(dataSet.authority, { hostBootId: `seed-${randomUUID()}` });
   try {
-    return await run(runtime, new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding));
+    return await run(runtime, kernel.ContentAddressedStore.loose(dataSet.authority, dataSet.binding));
   } finally { await runtime.close(); }
 }
 

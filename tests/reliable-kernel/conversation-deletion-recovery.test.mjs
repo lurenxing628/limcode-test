@@ -237,7 +237,7 @@ async function withRuntime(label, body) {
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(parent);
     database = await kernel.RuntimeDatabase.open(candidate.authority, { hostBootId: label });
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     return await body({ ...candidate, database, store });
   } finally {
     if (database) await database.close().catch(() => undefined);

@@ -23,7 +23,7 @@ async function fixture() {
   };
   try {
     await open('collaboration-history-original');
-    const cas = new kernel.ContentAddressedStore(authority.authority, authority.binding);
+    const cas = kernel.ContentAddressedStore.forDatabase(authority.authority, database);
     const payload = await cas.ingest(database, '来自另一个对话的真实 CAS 协作正文', 'text/vnd.limcode.collaboration-message');
     await database.transaction([
       row('Conversation', { id: 'target', title: '目标', status: 'active', created_at: NOW, updated_at: NOW }),
@@ -98,7 +98,7 @@ async function sparseFixture(foreignCount = 100_000) {
   };
   try {
     database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'sparse-seed' });
-    const cas = new kernel.ContentAddressedStore(root.authority, root.binding);
+    const cas = kernel.ContentAddressedStore.forDatabase(root.authority, database);
     const payload = await cas.ingest(database, '稀疏对话协作正文', 'text/vnd.limcode.collaboration-message');
     const own = (id) => [
       kernel.DOMAIN_REPOSITORIES.domain('CollaborationMessage').insertWithNextSequence(
@@ -556,7 +556,7 @@ test('a page that fits reads each CAS preview once; only a page past the byte ca
   try {
     const root = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'collaboration-page-reads' });
-    const cas = new kernel.ContentAddressedStore(root.authority, root.binding);
+    const cas = kernel.ContentAddressedStore.forDatabase(root.authority, database);
     const small = await cas.ingest(database, '协作正文', 'text/vnd.limcode.collaboration-message');
     const large = await cas.ingest(database, '汉'.repeat(1200), 'text/vnd.limcode.collaboration-message');
     await database.transaction([

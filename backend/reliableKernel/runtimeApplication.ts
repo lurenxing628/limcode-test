@@ -371,7 +371,7 @@ export class ReliableKernelApplication {
   ): Promise<ReliableKernelApplication> {
     const database = await RuntimeDatabase.open(authority);
     try {
-      const contentStore = new ContentAddressedStore(authority, database.binding);
+      const contentStore = ContentAddressedStore.forDatabase(authority, database);
       const application = new ReliableKernelApplication(authority, database, contentStore, dependencies);
       application.runtimeDiagnostics?.start();
       return application;

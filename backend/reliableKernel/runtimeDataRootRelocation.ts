@@ -1,3 +1,4 @@
+import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocationContract';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, createReadStream, type Stats } from 'node:fs';
 import * as fs from 'node:fs/promises';
@@ -14,7 +15,7 @@ import {
 import { createRuntimeRootPaths, ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
 import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
 import {
-  canHardLinkLooseCas, estimateLooseCasCopyBytes, listLooseCasPhysicalEntries, measureLooseCasRuntimeStorage,
+  canHardLinkLooseCas, estimateLooseCasCopyBytes, estimatePackedCasCopyBytes, listLooseCasPhysicalEntries, measureLooseCasRuntimeStorage,
   removeAddedLooseCasPhysicalEntries
 } from './looseCasMaintenance';
 import type { HistoricalRootBinding } from './rootAuthority';
@@ -85,7 +86,7 @@ import {
  */
 
 /** Relocation state kept in the target directory (never in the old one). */
-export const DATA_ROOT_RELOCATION_MARKER_FILE = '.limcode-data-root-relocation.json';
+export { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocationContract';
 /** Identity of a LimCode data directory; the data-root pointer records it (see assertDataRootAvailable). */
 export const DATA_ROOT_IDENTITY_FILE = '.limcode-data-root-identity.json';
 /** Replaced configuration versions, the journal and database backups of each relocation. */
@@ -220,8 +221,12 @@ export interface DataRootRelocationDataSet {
   casBytes: number;
   /** CAS bytes as allocated on disk (blocks), for a copy to another disk. */
   casAllocatedBytes: number;
-  /** Loose CAS bytes a copy would allocate with each of LOOSE_CAS_COPY_CLUSTER_SIZES as allocation unit. */
+  /** All CAS files at each target allocation unit; the packed subset is tracked separately below. */
   casClusterBytes?: number[];
+  /** Packed SQLite and WAL/SHM allocation; included in the CAS totals, never hard-linked. */
+  packedCasBytes?: number;
+  packedCasAllocatedBytes?: number;
+  packedCasClusterBytes?: number[];
   /** Rows over every Runtime domain; undefined when the data set could not be read. */
   rows?: number;
 }
@@ -250,7 +255,7 @@ export interface DataRootRelocationPlan {
   /** Estimated bytes per disk (a disk used for several purposes appears once). */
   space: DataRootRelocationSpace[];
   sameDevice: boolean;
-  /** CAS objects are hard-linked (same disk and a filesystem with hard links), not copied. */
+  /** Immutable loose CAS objects can be hard-linked; packed bodies are durably published separately. */
   hardLinks: boolean;
   /**
    * The target holds an unfinished relocation (a crashed one, or one from this same directory that
@@ -533,7 +538,8 @@ type JournalEntry =
   /**
    * The existing receiving data set's CAS (`path`) before the relocation put anything into it: the
    * loose physical entries it had are listed at `backup`. An undo (after the database restore,
-   * which refers to none of the others) removes unlisted entries through the loose adapter.
+   * which refers to none of the others) removes unlisted loose leaves. Packed SQLite and its
+   * WAL/SHM are always retained, including newly appended immutable orphan rows.
    */
   | { op: 'cas'; path: string; backup: string }
   /**
@@ -916,8 +922,8 @@ function identityOf(candidate: VscodeRuntimeDataSetCandidate): { id: string; dat
   return { id: candidate.id, dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId! };
 }
 
-/** Explicit loose-format physical measurement; logical copy itself uses the CAS transfer adapter. */
-async function measureDataSet(binding: HistoricalRootBinding): Promise<Pick<DataRootRelocationDataSet, 'databaseBytes' | 'casBytes' | 'casAllocatedBytes' | 'casClusterBytes'>> {
+/** One physical measurement of both tiers; logical copy itself uses the CAS transfer adapter. */
+async function measureDataSet(binding: HistoricalRootBinding): Promise<Pick<DataRootRelocationDataSet, 'databaseBytes' | 'casBytes' | 'casAllocatedBytes' | 'casClusterBytes' | 'packedCasBytes' | 'packedCasAllocatedBytes' | 'packedCasClusterBytes'>> {
   return measureLooseCasRuntimeStorage(binding.paths);
 }
 
@@ -942,10 +948,11 @@ async function countRows(candidate: VscodeRuntimeDataSetCandidate, binding: Hist
  * largest possible shared-disk sum while keeping each path's free-space probe:
  * - target: the new database twice (the database itself, and the Backup API copy the batched copy's
  *   final verification reads, one data set at a time; its WAL stays about one batch), CAS as allocated when copied
- *   across disks (hard links on the same disk), configuration; an existing receiving database is
+ *   across disks (immutable loose hard links on the same disk), plus packed destination WAL
+ *   overlap, configuration; an existing receiving database is
  *   backed up twice (the relocation's own undo copy and the merge backup);
- * - temporary directory: one private database copy at a time (audits, fingerprints);
- * - old directory: the Backup API staging copy of the current database during the CAS pre-copy.
+ * - temporary directory: one private Runtime and packed CAS copy at a time (audits, transfers);
+ * - old directory: the current Runtime staging copy and any packed snapshot during CAS pre-copy.
  */
 async function estimateSpace(input: {
   sourceRootPath: string;
@@ -974,17 +981,18 @@ async function estimateSpace(input: {
   let targetBytes = input.configurationAllocated;
   for (const dataSet of moving) {
     targetBytes += 2 * dataSet.databaseBytes + estimateLooseCasCopyBytes(dataSet, hardLinks,
-      targetFilesystem ? Number(targetFilesystem.bsize) : undefined);
+      targetFilesystem ? Number(targetFilesystem.bsize) : undefined)
+      + estimatePackedCasCopyBytes(dataSet, targetFilesystem ? Number(targetFilesystem.bsize) : undefined);
   }
   if (input.target.kind === 'limcode') {
     const receiving = await resolveVscodeRuntimeDataSet({ globalStoragePath: input.targetRootPath }, input.target.receivingId).catch(() => undefined);
     if (receiving) targetBytes += 2 * await databaseBytesOf(receiving.runtimeDataRootPath);
   }
-  const largestDatabase = Math.max(0, ...moving.map((dataSet) => dataSet.databaseBytes));
+  const largestSnapshot = Math.max(0, ...moving.map((dataSet) => dataSet.databaseBytes + estimatePackedCasCopyBytes(dataSet)));
   const needs: Array<{ device: number | undefined; label: string; path: string; bytes: number }> = [
     { device: targetDevice, label: '新数据目录', path: targetProbe ?? input.targetRootPath, bytes: targetBytes },
-    { device: temporaryDevice, label: '临时目录', path: temporaryProbe, bytes: largestDatabase },
-    { device: sourceDevice, label: '旧数据目录', path: sourceProbe, bytes: input.current.databaseBytes }
+    { device: temporaryDevice, label: '临时目录', path: temporaryProbe, bytes: largestSnapshot },
+    { device: sourceDevice, label: '旧数据目录', path: sourceProbe, bytes: input.current.databaseBytes + estimatePackedCasCopyBytes(input.current) }
   ];
   const probedNeeds = await Promise.all(needs.map(async (need) => {
     let freeBytes: number | undefined;
@@ -1311,7 +1319,7 @@ async function journalReceivingCas(target: string, binding: HistoricalRootBindin
   await journal.append({ op: 'cas', path: path.relative(target, casRoot), backup: RECEIVING_CAS_LISTING_FILE });
 }
 
-/** The existing loose-format 'cas' journal entry; a missing listing still removes nothing. */
+/** The 'cas' journal removes only new loose leaves; all packed rows and SQLite files survive undo. */
 async function removeAddedCasObjects(casRoot: string, listing: string): Promise<void> {
   const text = await readTextIfPresent(listing);
   if (text === undefined) return;

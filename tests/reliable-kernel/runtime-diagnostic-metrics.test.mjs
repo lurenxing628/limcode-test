@@ -154,7 +154,7 @@ test('写锁等待、持锁、SQLITE_BUSY、CAS 发布、外部提交快照与 W
     holder.exec('ROLLBACK');
 
     // CAS: a miss publishes durably (temp write + file fsync + directory fsyncs), a repeat is a hit.
-    const cas = new kernel.ContentAddressedStore(root.authority, root.binding);
+    const cas = kernel.ContentAddressedStore.loose(root.authority, root.binding);
     await cas.ingest(database, SECRET, 'text/plain');
     await cas.ingest(database, SECRET, 'text/plain');
 

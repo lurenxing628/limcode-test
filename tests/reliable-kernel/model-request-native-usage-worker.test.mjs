@@ -27,7 +27,7 @@ async function fixture(run) {
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(candidate.authority);
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const recipe = await store.ingest(database, '{}', 'application/json');
     await database.transaction([
       kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({

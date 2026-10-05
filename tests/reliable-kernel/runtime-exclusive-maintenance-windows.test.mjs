@@ -1241,7 +1241,7 @@ async function initialize(scopeRoot) {
 async function seed(dataSet, conversationIds) {
   const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
   const runtime = await kernel.RuntimeDatabase.open(dataSet.authority, { hostBootId: `seed-${randomUUID()}` });
-  const store = new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding);
+  const store = kernel.ContentAddressedStore.loose(dataSet.authority, dataSet.binding);
   try {
     for (const conversationId of conversationIds) {
       const content = await store.ingest(runtime, JSON.stringify({ role: 'user', parts: [{ text: `${conversationId} 的正文` }] }), MESSAGE_TYPE);

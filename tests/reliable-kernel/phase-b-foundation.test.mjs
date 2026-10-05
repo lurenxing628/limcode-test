@@ -161,7 +161,7 @@ test('CAS duplicate prepare命中SQLite fast path且不publish/fsync', async () 
   await withCasRuntime('cas-fast-path', async ({ authority, binding, database }) => {
     const metrics = createCasMetricCollector();
     const snapshots = countSnapshotRequests(database);
-    const store = new kernel.ContentAddressedStore(authority, binding, metrics.observe);
+    const store = kernel.ContentAddressedStore.loose(authority, binding, metrics.observe);
     const content = 'x'.repeat(1024);
 
     const coldMetrics = metrics.measureStart();
@@ -199,7 +199,7 @@ test('CAS prepareBatch一次worker snapshot并在publish前去重mixed identitie
   await withCasRuntime('cas-fast-path-batch', async ({ authority, binding, database }) => {
     const metrics = createCasMetricCollector();
     const snapshots = countSnapshotRequests(database);
-    const store = new kernel.ContentAddressedStore(authority, binding, metrics.observe);
+    const store = kernel.ContentAddressedStore.loose(authority, binding, metrics.observe);
     await store.ingest(database, 'existing', 'text/plain');
 
     const inputs = [
@@ -252,7 +252,7 @@ test('CAS prepareBatch一次worker snapshot并在publish前去重mixed identitie
 test('CAS concurrent first ingest保留唯一ContentObject并清理所有temp', async () => {
   await withCasRuntime('cas-fast-path-race', async ({ authority, binding, database }) => {
     const metrics = createCasMetricCollector();
-    const store = new kernel.ContentAddressedStore(authority, binding, metrics.observe);
+    const store = kernel.ContentAddressedStore.loose(authority, binding, metrics.observe);
     const start = metrics.measureStart();
     const results = await Promise.all(Array.from({ length: 8 }, () =>
       store.ingest(database, 'concurrent-first-publish', 'text/plain')
@@ -280,7 +280,7 @@ test('CAS concurrent first ingest保留唯一ContentObject并清理所有temp', 
 
 test('CAS pageable read reuses verified file identities and returns isolated chunks', async () => {
   await withCasRuntime('cas-verified-read-cache', async ({ authority, binding, database }) => {
-    const store = new kernel.ContentAddressedStore(authority, binding);
+    const store = kernel.ContentAddressedStore.loose(authority, binding);
     const content = Buffer.alloc((2 * 262_144) + 19, 0x61);
     const metadata = await store.ingest(database, content, 'application/test-pageable');
 
@@ -304,7 +304,7 @@ test('CAS pageable read reuses verified file identities and returns isolated chu
 test('CAS orphan EEXIST继续校验且错误digest不产生SQLite引用', async () => {
   await withCasRuntime('cas-fast-path-orphan', async ({ authority, binding, database }) => {
     const metrics = createCasMetricCollector();
-    const store = new kernel.ContentAddressedStore(authority, binding, metrics.observe);
+    const store = kernel.ContentAddressedStore.loose(authority, binding, metrics.observe);
     const repository = kernel.DOMAIN_REPOSITORIES.domain('ContentObject');
 
     const orphan = await store.publish('valid-orphan', 'text/plain');

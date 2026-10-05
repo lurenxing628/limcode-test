@@ -924,7 +924,7 @@ test('host consumes durable pre-identity failure instead of waiting for outcome_
   const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-wrapper-host-failure-'));
   const candidate = await kernel.resetCandidateRuntimeRoot(parent);
   const database = await kernel.RuntimeDatabase.open(candidate.authority, { hostBootId: 'wrapper-host-failure' });
-  const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+  const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
   const effects = new kernel.EffectControlPlane(database, store);
   const processes = new kernel.ProcessControlPlane(
     database,

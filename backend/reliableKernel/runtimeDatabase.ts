@@ -6,6 +6,7 @@ import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { Worker, type ResourceLimits } from 'node:worker_threads';
+import { RuntimeCasAccess } from './runtimeCasAccess';
 import type { RelocatedWorkInventory } from './relocatedWorkInventory';
 import { registerInProcessSqliteDatabase } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import {
@@ -173,6 +174,7 @@ export class RuntimeDatabase {
     private readonly worker: Worker,
     public readonly workerThreadId: number,
     private readonly registryKey: string,
+    public readonly casAccess: RuntimeCasAccess,
     initialPerformanceMetrics?: RuntimePerformanceMetricsSink,
     /** Opened offline for maintenance: a private instance without commit listeners (see open). */
     public readonly maintenance = false,
@@ -181,6 +183,13 @@ export class RuntimeDatabase {
     this.historyPreparation = new HistoryPreparationAdmission(historyPreparationConcurrency);
     if (initialPerformanceMetrics) this.performanceMetricSinks.add(initialPerformanceMetrics);
     this.conversationOwners = new ConversationRuntimeOwnerManager(binding, hostBootId);
+    this.casAccess.onFailure((error) => {
+      this.markClosed();
+      this.stopHistoryPreparation(error);
+      this.failPending(error);
+      void this.worker.terminate().catch(() => undefined);
+      void this.casAccess.close().catch(() => undefined);
+    });
     // Work whose execution lease another live Host holds runs there: it never keeps this Host's
     // claim, which would only stop that Host from taking the Conversation to drive it.
     this.conversationOwners.setPendingWorkProbe(async (conversationId) =>
@@ -189,19 +198,18 @@ export class RuntimeDatabase {
     worker.on('message', (message: DatabaseWorkerResponse) => this.onMessage(message));
     worker.on('error', (error) => {
       this.markClosed();
+      void this.casAccess.close().catch(() => undefined);
       this.stopHistoryPreparation(error);
       this.failPending(error);
     });
     worker.on('exit', (code) => {
-      if (OPEN_ROOT_POINTERS.get(this.registryKey) === this.hostBootId) {
-        OPEN_ROOT_POINTERS.delete(this.registryKey);
-      }
       this.stopHeartbeatTimer();
       // Unexpected worker exit is not proof that this Host's external capabilities quiesced:
       // the liveness record and durable conversation owners stay fail-closed until an explicit
       // graceful close() drains and fences the work (or the OS proves the process dead).
       const unexpected = !this.closed && !this.closePromise;
       this.markClosed();
+      void this.casAccess.close().catch(() => undefined);
       this.stopHistoryPreparation(new ExecutionHandoffError('SQLite database worker exited.'));
       if (unexpected || code !== 0) this.failPending(new Error(`SQLite database worker exited with code ${code}.`));
     });
@@ -243,28 +251,40 @@ export class RuntimeDatabase {
         throw new Error(`A Runtime database worker is already open for ${registryKey}.`);
       }
       OPEN_ROOT_POINTERS.set(registryKey, hostBootId);
-      const worker = createWorker(
-        { mode: 'runtime', binding, hostBootId, ...(options.maintenance ? { maintenance: true as const } : {}) },
-        options.resourceLimits
-      );
+      let worker: Worker | undefined;
+      let casAccess: RuntimeCasAccess | undefined;
+      let database: RuntimeDatabase | undefined;
       try {
+        // CAS owns its own startup/failure listeners. Start it first so Runtime's readiness
+        // handoff to its permanent listeners never contains an asynchronous second-worker gap.
+        casAccess = await RuntimeCasAccess.open(binding);
+        worker = createWorker(
+          { mode: 'runtime', binding, hostBootId, ...(options.maintenance ? { maintenance: true as const } : {}) },
+          options.resourceLimits
+        );
         const ready = await waitForReady(worker, 'runtime');
-        const database = new RuntimeDatabase(
+        database = new RuntimeDatabase(
           authority,
           binding,
           hostBootId,
           worker,
           ready.workerThreadId,
           registryKey,
+          casAccess,
           options.performanceMetrics,
           options.maintenance === true,
           options.historyPreparationConcurrency
         );
         await database.registerHostLiveness();
+        database.assertUsable();
         return database;
       } catch (error) {
-        if (OPEN_ROOT_POINTERS.get(registryKey) === hostBootId) OPEN_ROOT_POINTERS.delete(registryKey);
-        await worker.terminate();
+        if (database) await database.close();
+        else {
+          await worker?.terminate();
+          await casAccess?.close();
+          if (OPEN_ROOT_POINTERS.get(registryKey) === hostBootId) OPEN_ROOT_POINTERS.delete(registryKey);
+        }
         throw error;
       }
     }));
@@ -687,6 +707,7 @@ export class RuntimeDatabase {
 
   private markClosed(): void {
     this.closed = true;
+    this.casAccess.fence();
     for (const listener of this.closeListeners) listener();
     this.closeListeners.clear();
   }
@@ -861,6 +882,7 @@ export class RuntimeDatabase {
    * could have registered this Host's liveness identity.
    */
   public close(): Promise<void> {
+    this.casAccess.fence();
     this.stopHistoryPreparation(new ExecutionHandoffError('RuntimeDatabase is closing.'));
     if (!this.closePromise) {
       const task = this.closeRuntime();
@@ -887,11 +909,14 @@ export class RuntimeDatabase {
       if (!this.closed) await this.sendRequest<null>({ kind: 'close' });
     } finally {
       this.markClosed();
+      this.commitListeners.clear();
+      await this.worker.terminate();
+      // Keep root/Host/conversation admission fenced until both workers and every sidecar handle
+      // have closed. A failed resource close can be retried; it cannot release ownership early.
+      await this.casAccess.close();
       if (OPEN_ROOT_POINTERS.get(this.registryKey) === this.hostBootId) {
         OPEN_ROOT_POINTERS.delete(this.registryKey);
       }
-      this.commitListeners.clear();
-      await this.worker.terminate();
       // The worker ignores every request that reached it after 'close', and a graceful exit fails
       // none of them. Reject them here, or an owner operation awaiting one would hold close forever.
       this.failPending(new Error('RuntimeDatabase is closed.'));
@@ -915,6 +940,7 @@ export class RuntimeDatabase {
 
   private assertUsable(): void {
     if (this.closed) throw new Error('RuntimeDatabase is closed.');
+    this.casAccess.assertUsable();
     if (this.heartbeatFailure !== undefined) {
       const error = new Error('RuntimeDatabase Host liveness heartbeat failed; requests are fenced until restart.') as Error & {
         cause?: unknown;
@@ -1191,7 +1217,9 @@ async function initializeBindingStorage(binding: RootBinding): Promise<void> {
  * entry points refuse its database files under any name (sqliteDatabaseFileGuard).
  */
 function createWorker(data: DatabaseWorkerData, resourceLimits?: ResourceLimits): Worker {
-  const release = registerInProcessSqliteDatabase(data.binding.paths.databasePath);
+  const releaseRuntime = registerInProcessSqliteDatabase(data.binding.paths.databasePath);
+  const releaseCas = registerInProcessSqliteDatabase(path.join(data.binding.paths.casRootPath, 'limcode.cas-small.sqlite'));
+  const release = () => { releaseRuntime(); releaseCas(); };
   try {
     const worker = new Worker(path.join(__dirname, 'databaseWorker.js'), { workerData: data, ...(resourceLimits ? { resourceLimits } : {}) });
     worker.once('exit', release);

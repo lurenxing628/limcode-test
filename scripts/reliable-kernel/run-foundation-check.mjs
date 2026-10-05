@@ -208,7 +208,7 @@ async function checkSchemaRepositories() {
     const inbox = kernel.DOMAIN_REPOSITORIES.domain('RuntimeInboxItem');
     const deliveries = kernel.DOMAIN_REPOSITORIES.domain('RuntimeDelivery');
     const attempts = kernel.DOMAIN_REPOSITORIES.domain('Attempt');
-    const content = await new kernel.ContentAddressedStore(authority, binding).ingest(database, 'schema interaction', 'text/plain');
+    const content = await kernel.ContentAddressedStore.forDatabase(authority, database).ingest(database, 'schema interaction', 'text/plain');
     await database.transaction([
       conversations.insert(conversation('conv-schema', now)),
       reuseLinks.insert({
@@ -286,7 +286,7 @@ async function checkSchemaRepositories() {
 
 async function checkCasPublishBeforeReference() {
   return withRuntime('cas', async ({ authority, binding, database }) => {
-    const store = new kernel.ContentAddressedStore(authority, binding);
+    const store = kernel.ContentAddressedStore.loose(authority, binding);
     const contentObjects = kernel.DOMAIN_REPOSITORIES.domain('ContentObject');
     const durability = await traceFsDurability(async (events) => {
       const firstStart = events.length;
@@ -337,7 +337,7 @@ async function checkRootBindingFence() {
   try {
     const first = await kernel.resetCandidateRuntimeRoot(parent);
     firstDatabase = await kernel.RuntimeDatabase.open(first.authority, { hostBootId: 'root-first' });
-    const firstStore = new kernel.ContentAddressedStore(first.authority, first.binding);
+    const firstStore = kernel.ContentAddressedStore.forDatabase(first.authority, firstDatabase);
     await assert.rejects(
       kernel.resetCandidateRuntimeRoot(parent),
       /requires the current Runtime database worker to be closed/i

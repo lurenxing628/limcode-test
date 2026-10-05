@@ -118,7 +118,7 @@ export interface RuntimeDataSetCopyReceipt {
     /** Source queries of the whole copy (the sum over every batch). */
     reads: number;
   };
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
 }
 
 /**
@@ -399,7 +399,7 @@ export async function copyRuntimeDataSetIntoEmptyRoot(
       } finally { aggregates.close(); }
       const casVerification = options.casVerification ?? new Map<string, string>();
       const cas = await transferRuntimeDataSetMigrationCas(source, {
-        configurationRootPath: targetPlacement.configurationRootPath, binding: database.binding
+        configurationRootPath: targetPlacement.configurationRootPath, binding: database.binding, casAccess: database.casAccess
       }, { ...(options.linkFile ? { linkFile: options.linkFile } : {}), ...(options.signal ? { signal: options.signal } : {}), verified: casVerification });
       await options.onFaultPoint?.('after-cas-transfer');
       const batches = await writeBatches(source.database, database, batchRows, options);
@@ -425,8 +425,8 @@ export async function copyRuntimeDataSetIntoEmptyRoot(
     } catch (error) {
       throw runtimeDataSetMergeFailure(error, source ?? {});
     } finally {
-      await database.close();
-      await source?.close();
+      try { await database.close(); }
+      finally { await source?.close(); }
     }
   });
 }

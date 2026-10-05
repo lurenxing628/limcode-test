@@ -105,7 +105,7 @@ test('再次合并已删除的分支时，完整私有句柄证据属于删除�
   const first = await merge();
   assert.deepEqual([first.failures, first.blocked, first.deferred], [[], [], []]);
   assert.deepEqual(first.merged.map(item => item.insertedConversations), [2]);
-  const targetStore = new kernel.ContentAddressedStore(fixture.current.authority, database.binding);
+  const targetStore = kernel.ContentAddressedStore.forDatabase(fixture.current.authority, database);
   assert.deepEqual(await readForkContextHandleReservationCatalog(database, targetStore, FORK), CATALOG,
     'the first real merge copies the complete fork-owned address facts and CAS');
 

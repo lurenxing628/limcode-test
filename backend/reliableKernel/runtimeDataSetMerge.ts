@@ -9,7 +9,8 @@ import Database from 'better-sqlite3';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { requireCasObjectIdentity } from './casObjectAccess';
-import { casTransferCanLinkRoots, CasTransferError, LocalCasTransferSession, type CasTransferSource } from './runtimeCasTransfer';
+import { casTransferCanLinkRoots, casTransferPackedStorageBytes, CasTransferError, LocalCasTransferSession, type CasPackedSource, type CasTransferSource } from './runtimeCasTransfer';
+import type { CasStoreAccess } from './runtimeCasAccess';
 import { RUNTIME_KERNEL_EPOCH, type RootBinding, type RuntimeRootPaths } from './contracts';
 import { assertCurrentSchema } from './databaseSchema';
 import {
@@ -49,6 +50,7 @@ import {
   type LargeMergeSessionSpaceFacts
 } from './runtimeDataSetLargeMergeSpace';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
+import { copyForeignRuntimeSqliteFiles, heldDatabaseFiles, openPackedCasSnapshot, type PackedCasSnapshotAccess } from './runtimeForeignHistory';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
@@ -320,7 +322,7 @@ export interface RuntimeDataSetMergeResult extends RuntimeDataSetCasTransfer {
   /** A previous commit was found through its exact id set; rows were not merged again. */
   recoveredCommit: boolean;
   /** The source was upgraded from a published predecessor immediately before merging. */
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
   /**
    * Unfinished work closed before the merge (source backup kept beside the source): Turns ended as
    * cancelled or interrupted and queued, unsent user messages cancelled, as counted in the source.
@@ -1099,16 +1101,15 @@ export async function mergeRuntimeDataSetIntoDatabase(
 /**
  * Online CAS pre-copy for a later exclusive merge or migration. The source is resolved and
  * validated through its RootAuthority binding. Best effort by design: a live source is read
- * through a SQLite Backup API snapshot (so the source's own files are never opened outside
- * SQLite), every published object is digest-verified before it becomes visible, and anything
- * missed is transferred again inside the later merge. An offline source (no WAL) is copied as a
- * plain file instead, so no SQLite sidecar is left beside it. Precondition: this process must not
- * have the source open; pass `sourceDatabase` when it does (the backup then runs on its worker).
+ * through its supplied Runtime's Backup API and borrowed CAS owner. Without that owner the source
+ * must be offline: checked metadata and then packed main/WAL copies are taken under its admission
+ * and maintenance claim, and only private copies are opened. Every published object is verified
+ * before it becomes visible; anything missed is transferred again inside the later merge.
  */
 export async function precopyRuntimeDataSetCas(
   paths: { globalStoragePath: string },
   input: { candidateId: string; expectedDataSetId: string; expectedRootInstanceId: string },
-  target: { configurationRootPath: string; binding: HistoricalRootBinding },
+  target: { configurationRootPath: string; binding: HistoricalRootBinding; casAccess?: CasStoreAccess },
   options: Pick<RuntimeDataSetMergeOptions, 'linkFile'> & {
     sourceDatabase?: RuntimeDatabase;
     /** Cancels between objects (and around the snapshot); this call's temporary files are removed. */
@@ -1124,8 +1125,10 @@ export async function precopyRuntimeDataSetCas(
   options.signal?.throwIfAborted();
   // Named with this process id: a crashed process's copies are found and removed (sweepDataRootRelocationLeftovers).
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-merge-precopy-${process.pid}-`));
+  let sourceCopy: { databasePath: string; remove(): Promise<void> } | undefined;
+  let sourcePacked: PackedCasSnapshotAccess | undefined;
   try {
-    const snapshotPath = path.join(temporaryRoot, 'limcode.sqlite');
+    let snapshotPath = path.join(temporaryRoot, 'limcode.sqlite');
     if (options.sourceDatabase) {
       if (!sameRuntimeDataSetIdentity(options.sourceDatabase.binding, candidate)) {
         throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '传入的数据库与来源历史库不一致。');
@@ -1137,15 +1140,28 @@ export async function precopyRuntimeDataSetCas(
       } finally {
         await removeSqliteFiles(staged);
       }
-    } else if (await fs.stat(`${binding.paths.databasePath}-wal`).then(() => true, () => false)) {
-      // A live source (its WAL exists): read through SQLite's Backup API.
-      const live = new Database(toSqliteFilePath(binding.paths.databasePath), { readonly: true, fileMustExist: true });
-      try { await live.backup(toSqliteFilePath(snapshotPath), { progress: () => 0x7fffffff }); }
-      finally { live.close(); }
     } else {
-      // An offline, checkpointed source: a plain copy, so no SQLite sidecar appears beside it.
-      await assertNoSymbolicPath(candidate.configurationRootPath, binding.paths.databasePath);
-      await fs.copyFile(binding.paths.databasePath, snapshotPath, constants.COPYFILE_FICLONE);
+      // A source without a Runtime owner is copied under its offline claim. Neither the Runtime
+      // reader nor the packed reader ever opens the source's actual SQLite files.
+      const copied = await withRuntimeDataRootAdmission(candidate.configurationRootPath, () => withRuntimeMaintenance(binding.paths, async () => {
+        await assertSourceIdle(candidate);
+        if (!isDeepStrictEqual(await requireCompleteRuntimeDataSet(candidate), binding)) throw new SnapshotRaced();
+        const held = await heldDatabaseFiles(candidate.configurationRootPath, { except: binding.paths.databasePath });
+        const copy = await copyForeignRuntimeSqliteFiles(candidate.configurationRootPath, binding.paths.databasePath, held);
+        let packed: PackedCasSnapshotAccess | undefined;
+        try {
+          packed = await openPackedCasSnapshot(binding, candidate.configurationRootPath, held);
+          if (await runtimeDataSetFileState(binding.paths.databasePath) !== copy.files) throw new SnapshotRaced();
+          return { copy, packed };
+        } catch (error) {
+          try { await packed?.close(); }
+          finally { await copy.remove(); }
+          throw error;
+        }
+      }));
+      sourceCopy = copied.copy;
+      sourcePacked = copied.packed;
+      snapshotPath = sourceCopy.databasePath;
     }
     options.signal?.throwIfAborted();
     const snapshot = new Database(toSqliteFilePath(snapshotPath), { readonly: true, fileMustExist: true });
@@ -1153,12 +1169,20 @@ export async function precopyRuntimeDataSetCas(
       snapshot.defaultSafeIntegers(true);
       const verification: RuntimeDataSetCasVerification = new Map();
       const transfer = await transferCas(candidate.configurationRootPath, binding, target.configurationRootPath, target.binding, snapshot, {
-        ...(options.linkFile ? { linkFile: options.linkFile } : {}), ...(options.signal ? { signal: options.signal } : {}), verified: verification
+        ...(options.linkFile ? { linkFile: options.linkFile } : {}), ...(options.signal ? { signal: options.signal } : {}), verified: verification,
+        sourceAccess: options.sourceDatabase?.casAccess, sourcePacked, targetAccess: target.casAccess
       });
       return { ...transfer, verification };
-    } finally { snapshot.close(); }
+    } finally {
+      try { await sourcePacked?.close(); }
+      finally { snapshot.close(); }
+    }
   } finally {
-    await fs.rm(temporaryRoot, { recursive: true, force: true });
+    try { await sourcePacked?.close(); }
+    finally {
+      try { await sourceCopy?.remove(); }
+      finally { await fs.rm(temporaryRoot, { recursive: true, force: true }); }
+    }
   }
 }
 
@@ -1431,7 +1455,7 @@ interface SourceProgress {
    */
   files?: string;
   fingerprint?: RuntimeDataSetFingerprint;
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
   /**
    * Unfinished work was (being) closed in the source; `complete` once every transition succeeded.
    * `earlier`: closed by an earlier attempt whose outcome did not say so (none in this attempt).
@@ -1611,7 +1635,7 @@ async function mergeSource(
       // Everything that can refuse the source was checked on the unfinalized snapshot (unfinished
       // work, conflicts, size); the CAS objects are verified too. Only then is the source backed up
       // and its work closed, and the finalized source is checked again from a new snapshot.
-      await transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, true);
+      await transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, true);
       stopIfAsked();
       await fault(options, 'before-source-finalization');
       await finalizeSource(paths, target, candidate, binding, work, state, options, mode, stopIfAsked);
@@ -1632,7 +1656,7 @@ async function mergeSource(
     }
     await ensureTargetBackup(target, options);
     await fault(options, 'after-target-backup');
-    const cas = await transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, false);
+    const cas = await transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, false);
     await fault(options, 'after-cas-transfer');
     const commit = (): Promise<SourceOutcome> => commitSource(
       paths, target, candidate, binding, plan, cas, state, options, mode, stopIfAsked
@@ -1907,10 +1931,10 @@ async function resolveSource(
     throw new Outcome({ kind: 'failed', code: 'runtime-data-set-merge-recovery-required', message: '这个历史库有一次未完成的归档或切换，需要先切换到它完成恢复，才能合并。' });
   }
   const epoch = candidate.runtimeKernelEpoch;
-  if ((epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7 || epoch === 8) && mode.readOnly) {
+  if ((epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7 || epoch === 8 || epoch === 9) && mode.readOnly) {
     throw new Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-upgrade-pending', message: '这份旧聊天记录还是已发布的旧格式，启动时会先在后台升级，之后才能估计。' });
   }
-  if (epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7 || epoch === 8) {
+  if (epoch === 3 || epoch === 4 || epoch === 5 || epoch === 6 || epoch === 7 || epoch === 8 || epoch === 9) {
     const upgrade = await upgradeRuntimeDataSet(paths, {
       candidateId, expectedDataSetId: candidate.dataSetId, expectedRootInstanceId: candidate.rootInstanceId
     }).catch(async (error: unknown) => {
@@ -2532,7 +2556,11 @@ async function withSessionSpace(
     if (!isForeignCandidate(candidate)) {
       linked = await casTransferCanLinkRoots(binding.paths.casRootPath, target.binding.paths.casRootPath);
     }
-    error.outcome.space = { databaseBytes: facts.databaseBytes, casCopyBytes: linked ? 0 : facts.casBytes };
+    const packedBytes = await casTransferPackedStorageBytes(binding.paths.casRootPath);
+    error.outcome.space = {
+      databaseBytes: facts.databaseBytes + packedBytes,
+      casCopyBytes: linked ? 0 : facts.casBytes + packedBytes
+    };
     throw error;
   }
 }
@@ -2587,17 +2615,66 @@ async function assertSourceIdle(candidate: VscodeRuntimeDataSetCandidate): Promi
   await assertRuntimeHostsOffline(binding.paths);
 }
 
+export interface HistoricalCasSnapshot extends RuntimeDataSetDatabaseSnapshot {
+  /** Scoped private reader taken after the metadata snapshot; closed before that snapshot. */
+  readonly packedCas?: CasPackedSource;
+}
+
 interface VerifiedSnapshot {
-  snapshot: RuntimeDataSetDatabaseSnapshot;
+  snapshot: HistoricalCasSnapshot;
   audit: RuntimeSnapshotAudit;
+}
+
+/** Only descriptor copying touches the offline source; the returned worker owns private files. */
+async function openLocalPackedSnapshot(
+  candidate: VscodeRuntimeDataSetCandidate,
+  binding: HistoricalRootBinding,
+  files: string
+): Promise<PackedCasSnapshotAccess> {
+  return withRuntimeDataRootAdmission(candidate.configurationRootPath, () => withRuntimeMaintenance(binding.paths, async () => {
+    await assertSourceIdle(candidate);
+    if (!isDeepStrictEqual(await requireCompleteRuntimeDataSet(candidate), binding)
+      || await runtimeDataSetFileState(binding.paths.databasePath) !== files) throw new SnapshotRaced();
+    const held = await heldDatabaseFiles(candidate.configurationRootPath, { except: binding.paths.databasePath });
+    const packed = await openPackedCasSnapshot(binding, candidate.configurationRootPath, held);
+    try {
+      if (await runtimeDataSetFileState(binding.paths.databasePath) !== files) throw new SnapshotRaced();
+      return packed;
+    } catch (error) {
+      await packed.close();
+      throw error;
+    }
+  }));
+}
+
+/** Attach a metadata-first private packed owner, without retaining source SQLite handles. */
+async function withLocalPackedSnapshot(
+  candidate: VscodeRuntimeDataSetCandidate,
+  binding: HistoricalRootBinding,
+  snapshot: RuntimeDataSetDatabaseSnapshot,
+  files: string
+): Promise<HistoricalCasSnapshot> {
+  let packed: PackedCasSnapshotAccess;
+  try { packed = await openLocalPackedSnapshot(candidate, binding, files); }
+  catch (error) { await snapshot.close(); throw error; }
+  return {
+    get database() { return snapshot.database; },
+    packedCas: packed,
+    withClosedReader: (run) => snapshot.withClosedReader(run),
+    async close() {
+      try { await packed.close(); }
+      finally { await snapshot.close(); }
+    }
+  };
 }
 
 /**
  * Private snapshot copy of the source, verified in a worker before this thread opens it: current
  * schema, physical fingerprint, quick_check, foreign_key_check, the unfinished-work probes and the
  * size, all on the copy (see runtimeSnapshotAudit for why this keeps the POSIX lock rule). Taken
- * without a claim, so the copy counts only when the source files did not change while copied; the
- * fingerprint it represents becomes the judged state.
+ * without a claim, so the metadata copy counts only when the source files did not change while
+ * copied. Its later private packed copy is taken under the offline source claim, after rechecking
+ * the same metadata state; no live source SQLite reader escapes that claim.
  */
 async function takeVerifiedSnapshot(
   candidate: HistoricalMergeCandidate,
@@ -2635,7 +2712,8 @@ async function takeVerifiedSnapshot(
       };
       const snapshot = isForeignCandidate(candidate)
         ? await candidate.hold.snapshot(candidate, { beforeOpen })
-        : await createRuntimeDataSetDatabaseSnapshot(candidate, binding, { beforeOpen });
+        : await withLocalPackedSnapshot(candidate, binding,
+          await createRuntimeDataSetDatabaseSnapshot(candidate, binding, { beforeOpen }), files);
       if (isForeignCandidate(candidate)) {
         try { assertNoForeignUnfinishedWork(audit!.unfinishedWork!); }
         catch (error) {
@@ -2682,7 +2760,7 @@ async function transferSourceCas(
   candidate: HistoricalMergeCandidate,
   binding: HistoricalRootBinding,
   target: TargetContext,
-  source: Database.Database,
+  source: HistoricalCasSnapshot,
   options: RuntimeDataSetMergeOptions,
   verified: CasVerification,
   verifyOnly: boolean
@@ -2690,11 +2768,13 @@ async function transferSourceCas(
   // A foreign root's objects are copied (a link would share its inodes with a directory the user
   // may change or delete) and read through safe descriptors, below its container without any link.
   const transfer = isForeignCandidate(candidate)
-    ? transferCas(candidate.root.containerRoot, binding, target.configurationRootPath, target.binding, source, {
-      verified, verifyOnly, sourceObjects: candidate.hold.objects(candidate), freeSpace: options.freeSpace ?? freeSpace
+    ? transferCas(candidate.root.containerRoot, binding, target.configurationRootPath, target.binding, source.database, {
+      verified, verifyOnly, sourceObjects: candidate.hold.objects(candidate), freeSpace: options.freeSpace ?? freeSpace,
+      targetAccess: target.database.casAccess
     })
-    : transferCas(candidate.configurationRootPath, binding, target.configurationRootPath, target.binding, source, {
-      ...(options.linkFile ? { linkFile: options.linkFile } : {}), verified, verifyOnly
+    : transferCas(candidate.configurationRootPath, binding, target.configurationRootPath, target.binding, source.database, {
+      ...(options.linkFile ? { linkFile: options.linkFile } : {}), verified, verifyOnly,
+      sourcePacked: source.packedCas, targetAccess: target.database.casAccess
     });
   return transfer.catch((error: unknown) => {
     if (error instanceof Outcome) throw error;
@@ -3449,6 +3529,9 @@ async function transferCas(
      * found on the target's disk (`freeSpace`).
      */
     sourceObjects?: HistoricalMergeSourceObjects;
+    sourceAccess?: CasStoreAccess;
+    sourcePacked?: CasPackedSource;
+    targetAccess?: CasStoreAccess;
     freeSpace?(directory: string): Promise<number | undefined>;
   } = {}
 ): Promise<RuntimeDataSetCasTransfer> {
@@ -3464,13 +3547,15 @@ async function transferCas(
     SELECT rowid AS position, storage_key, sha256, byte_length FROM content_object
      WHERE rowid > ? ORDER BY rowid LIMIT ${READ_CHUNK}
   `);
-  const transfer = new LocalCasTransferSession(sourceCas, targetCas, { ...options, verified });
-  if (options.sourceObjects && !options.verifyOnly) {
-    await assertRoomForObjects(page, targetCas, transfer, options.freeSpace ?? freeSpace);
-  }
+  const transfer = await LocalCasTransferSession.open(sourceBinding, targetBinding, { ...options, verified });
   // Per storage key its length, in a TEMP table of the source's connection (on disk): nothing per object on this thread.
-  const lengths = new HandledStorageKeys(source);
+  let lengths: HandledStorageKeys | undefined;
   try {
+    if (options.sourceObjects && !options.verifyOnly) {
+      await assertRoomForObjects(page, targetCas, transfer, options.freeSpace ?? freeSpace,
+        await casTransferPackedStorageBytes(sourceCas));
+    }
+    lengths = new HandledStorageKeys(source);
     for (let after = 0n; ;) {
       const rows = page.all(after) as Array<{ position: bigint; storage_key: string; sha256: string; byte_length: bigint }>;
       if (rows.length === 0) break;
@@ -3500,7 +3585,7 @@ async function transferCas(
     if (error instanceof CasTransferError) throw new Outcome(error.outcome);
     throw error;
   } finally {
-    lengths.drop();
+    lengths?.drop();
     await transfer.close();
   }
   return result;
@@ -3570,7 +3655,8 @@ async function assertRoomForObjects(
   page: Database.Statement,
   targetCas: string,
   transfer: LocalCasTransferSession,
-  available: (directory: string) => Promise<number | undefined>
+  available: (directory: string) => Promise<number | undefined>,
+  packedBytes: number
 ): Promise<void> {
   const seen = new HandledStorageKeys(page.database);
   let missing = 0n;
@@ -3585,7 +3671,7 @@ async function assertRoomForObjects(
         let object;
         try { object = requireCasObjectIdentity(row); }
         catch { continue; } // An invalid key fails the transfer itself.
-        if (transfer.needsCopy(object)) missing += object.byte_length;
+        if (await transfer.needsCopy(object)) missing += object.byte_length;
       }
       await new Promise((resolve) => setImmediate(resolve));
     }
@@ -3593,7 +3679,7 @@ async function assertRoomForObjects(
     seen.drop();
   }
   if (missing === 0n) return;
-  const needed = Number(missing) + BACKUP_FREE_SPACE_MARGIN_BYTES;
+  const needed = Number(missing) + packedBytes + BACKUP_FREE_SPACE_MARGIN_BYTES;
   const free = await available(targetCas).catch(() => undefined);
   if (free !== undefined && free < needed) {
     throw new Outcome({
@@ -3911,10 +3997,11 @@ export interface RuntimeDataSetMigrationSource {
   binding: HistoricalRootBinding;
   /** The verified private snapshot (read-only, safe integers); never the source files. */
   database: Database.Database;
+  readonly packedCas?: CasPackedSource;
   /** Exact SQLite file state of the source the snapshot was taken from. */
   files: string;
   rows: number;
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
   close(): Promise<void>;
 }
 
@@ -3946,7 +4033,8 @@ export async function openRuntimeDataSetMigrationSource(
       throw error;
     }
     return {
-      candidate, binding, database: taken.snapshot.database, files: state.files!, rows: taken.audit.size!.rows,
+      candidate, binding, database: taken.snapshot.database, packedCas: taken.snapshot.packedCas,
+      files: state.files!, rows: taken.audit.size!.rows,
       ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
       close: () => taken.snapshot.close()
     };
@@ -3982,12 +4070,12 @@ export async function isRuntimeDataSetMigrationSourceUnchanged(
 /** CAS transfer of a migration source into another root (verified before publication, see transferCas). */
 export async function transferRuntimeDataSetMigrationCas(
   source: RuntimeDataSetMigrationSource,
-  target: { configurationRootPath: string; binding: HistoricalRootBinding },
-  options: Pick<RuntimeDataSetMergeOptions, 'linkFile'> & { verified: RuntimeDataSetCasVerification; signal?: AbortSignal }
+  target: { configurationRootPath: string; binding: HistoricalRootBinding; casAccess?: CasStoreAccess },
+  options: Pick<RuntimeDataSetMergeOptions, 'linkFile'> & { verified: RuntimeDataSetCasVerification; signal?: AbortSignal; sourceAccess?: CasStoreAccess }
 ): Promise<RuntimeDataSetCasTransfer> {
   try {
     return await transferCas(source.candidate.configurationRootPath, source.binding, target.configurationRootPath, target.binding,
-      source.database, options);
+      source.database, { ...options, sourcePacked: source.packedCas, targetAccess: target.casAccess });
   } catch (error) {
     throw runtimeDataSetMergeFailure(error, {});
   }
@@ -4018,7 +4106,7 @@ export function runtimeDataSetCopyRow(domain: string, raw: Record<string, unknow
  * The error a caller of the copy sees: a source refusal as RuntimeDataSetMergeError (code and
  * user-facing message, with the in-place upgrade noted); a cancellation and anything else unchanged.
  */
-export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 }): unknown {
+export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9 }): unknown {
   if (error instanceof RuntimeDataSetMergeError || (error instanceof Error && error.name === 'AbortError')) return error;
   if (!(error instanceof Outcome) && !(error instanceof StopRequested) && !isRuntimeHostsActiveError(error) && !isRuntimeDataInvariant(error)) return error;
   const outcome = sourceOutcome(error, state);
@@ -4037,7 +4125,7 @@ export function runtimeDataSetMergeFailure(error: unknown, state: { upgradedFrom
 export const HISTORICAL_MERGE_ENGINE = Object.freeze({
   invariantRefusal, mergeTargetVersion, MERGE_DOMAIN_ORDER, IDENTITY_MERGE_DIFFERENCES, SKIPPED_WITH, SKIPPED_WITH_MEMBERS, MAX_REPORTED_CONFLICTS, READ_CHUNK,
   BACKUP_FREE_SPACE_MARGIN_BYTES, Outcome, StopRequested, MergedMeanwhile,
-  targetContext, pickSources, runSourceAttempt, settledSource, resolveSource, recordedConversations, takeVerifiedSnapshot,
+  targetContext, pickSources, runSourceAttempt, settledSource, resolveSource, recordedConversations, takeVerifiedSnapshot, withLocalPackedSnapshot,
   countFinalized, assertMergeableSize, exceedsOnlineLimits, unfinishedWorkOutcome, conflictRefusal, deletedSinceMerge, keptUnfinishedWork, transferSourceCas, finalizeSource,
   cachedAudit, auditFacts,
   commitSource, ensureTargetBackup, settleTargetBackup, newestTargetBackup, assertSourceUnchanged, takeFinalized, finalizedResult,

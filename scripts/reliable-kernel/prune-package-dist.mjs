@@ -13,6 +13,7 @@ const seedPaths = [
   // __dirname rather than CommonJS require(): nothing else keeps them in the package. The package
   // validator (validators/package.mjs, DIRNAME_ENTRY_BOUNDARIES) fails a VSIX that starts one it lacks.
   'backend/reliableKernel/databaseWorker.js',
+  'backend/reliableKernel/packedCasWorker.js',
   'backend/reliableKernel/processWrapper.js',
   'backend/reliableKernel/runtimeSnapshotAuditWorker.js',
   'backend/reliableKernel/runtimeDataSetFactsWorker.js',

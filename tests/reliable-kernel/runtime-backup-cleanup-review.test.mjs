@@ -556,7 +556,7 @@ async function withDataSet(dataSet, operation) {
 /** Conversations with two messages each; ids are fixed, so seeding the same id elsewhere gives the same history ids. */
 async function seed(dataSet, conversationIds, project = PROJECT) {
   await withDataSet(dataSet, async (runtime) => {
-    const store = new kernel.ContentAddressedStore(dataSet.authority, runtime.binding);
+    const store = kernel.ContentAddressedStore.loose(dataSet.authority, runtime.binding);
     for (const id of conversationIds) {
       const turnId = `${id}_turn`;
       const steps = [
@@ -594,7 +594,7 @@ function softDeleteSteps(messageId) {
 
 /** What editing a message does to it: a new revision becomes the current one. */
 async function editMessage(dataSet, runtime, messageId) {
-  const store = new kernel.ContentAddressedStore(dataSet.authority, runtime.binding);
+  const store = kernel.ContentAddressedStore.loose(dataSet.authority, runtime.binding);
   const content = await store.ingest(runtime, JSON.stringify({ role: 'user', parts: [{ text: `${messageId} 改过之后` }] }), MESSAGE_TYPE);
   const revisionId = `${messageId}_revision_2`;
   await runtime.transaction([
@@ -611,7 +611,7 @@ async function editMessage(dataSet, runtime, messageId) {
  */
 async function addRecords(dataSet, conversationId) {
   return withDataSet(dataSet, async (runtime) => {
-    const store = new kernel.ContentAddressedStore(dataSet.authority, runtime.binding);
+    const store = kernel.ContentAddressedStore.loose(dataSet.authority, runtime.binding);
     const body = async (text) => (await store.ingest(runtime, JSON.stringify({ text }), 'application/json')).id;
     const [argumentsId, promptId, answerId, outputId] = [
       await body('read_file README.md'), await body('继续吗？'), await body('继续'), await body('hello\n')

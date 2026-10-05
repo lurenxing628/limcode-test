@@ -12,7 +12,7 @@ test('Bash 专属语法的进程输出完整保存，启动补扫后删除临时
   const database = await kernel.RuntimeDatabase.open(candidate.authority, {
     hostBootId: 'process-spool-cleanup-test'
   });
-  const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+  const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
   const effects = new kernel.EffectControlPlane(database, store);
   const processes = new kernel.ProcessControlPlane(
     database,

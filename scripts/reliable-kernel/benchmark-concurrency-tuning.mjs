@@ -112,7 +112,7 @@ async function runChildDurableStart(iteration) {
     database = await kernel.RuntimeDatabase.open(candidate.authority, {
       hostBootId: `concurrency-child-start-${iteration}`
     });
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const authorityCompiler = benchmarkAuthorityCompiler('child-start');
     services = kernel.createReliableKernelRuntimeServices(database, store, { authorityCompiler });
     const now = new Date().toISOString();

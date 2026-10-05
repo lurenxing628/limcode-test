@@ -173,7 +173,7 @@ test('online import fences a ready-state race and retries without overwriting th
   let raced;
   const result = await merge(fixture, 'online', { async fault(point, database) {
     if (point !== 'before-row-commit') return;
-    const contentStore = new kernel.ContentAddressedStore(fixture.current.authority, database.binding);
+    const contentStore = kernel.ContentAddressedStore.forDatabase(fixture.current.authority, database);
     const current = await readConversationContextHandleStateRow(database, CONVERSATION);
     await database.transaction(await prepareReadyConversationContextHandleState({ database, contentStore,
       conversationId: CONVERSATION, current, catalog: emptyContextHandleCatalog(), requiresNativeReset: false, now: NOW }));

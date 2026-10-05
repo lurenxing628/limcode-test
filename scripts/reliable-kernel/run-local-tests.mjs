@@ -144,6 +144,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/feed-history-ack-cost.test.mjs',
   'tests/reliable-kernel/sidebar-refresh-progress.test.mjs',
   'tests/reliable-kernel/cas-verified-ranges.test.mjs',
+  'tests/reliable-kernel/packed-cas.test.mjs',
   'tests/reliable-kernel/conversation-fork-context.test.mjs',
   'tests/reliable-kernel/conversation-fork-lifecycle.test.mjs',
   'tests/reliable-kernel/current-turn-task-projection.test.mjs',

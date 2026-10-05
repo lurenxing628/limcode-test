@@ -209,10 +209,22 @@ for (const scopeKind of ['default', 'workspace']) {
       read = await readAll(fixture.paths, root, conversationId);
       await foreign.inspectForeignRuntimeStorage(fixture.paths, root);
     } finally { probe.stop(); }
-    // The live root that occupies the archive's recorded location: only its database files are stat-ed (the files
-    // this process may hold SQLite locks on, which nothing here may open); nothing of it is listed, opened or read.
-    assert.deepEqual(probe.seen.filter((call) => inside(liveControl, call.path)
-      && !(call.name === 'stat' && /\/limcode\.sqlite(-wal|-shm|-journal)?$/.test(call.path))), [], '现存根除了数据库文件的 stat 之外从不被访问');
+    // The live root's Runtime and packed-CAS SQLite identities may be stat-ed for the held-inode
+    // guard. Only these eight exact files qualify; no body path or directory is exempted.
+    const sqliteSuffixes = ['', '-wal', '-shm', '-journal'];
+    const liveSqliteFiles = new Set(sqliteSuffixes.flatMap((suffix) => [
+      `${fresh.binding.paths.databasePath}${suffix}`,
+      path.join(fresh.binding.paths.casRootPath, `limcode.cas-small.sqlite${suffix}`)
+    ]));
+    const liveCalls = probe.seen.filter((call) => inside(liveControl, call.path));
+    assert.deepEqual(liveCalls.filter((call) => !(call.name === 'stat' && liveSqliteFiles.has(call.path))), [],
+      '现存根只允许固定 SQLite 身份文件的 stat');
+    const runtimeIdentityProbes = liveCalls.filter((call) => call.path === fresh.binding.paths.databasePath).length;
+    for (const suffix of sqliteSuffixes) {
+      const packedFile = path.join(fresh.binding.paths.casRootPath, `limcode.cas-small.sqlite${suffix}`);
+      assert.ok(liveCalls.filter((call) => call.path === packedFile).length <= runtimeIdentityProbes,
+        'packed metadata probes must remain bounded by the Runtime identity checks');
+    }
     assert.deepEqual(probe.seen.filter((call) => writes(call) && inside(archives, call.path)), [], '查看时不在归档目录里建声明或任何文件');
     assert.deepEqual(read.conversations, scopeKind === 'default' ? ['conversation_current_2', 'conversation_current_1'] : [conversationId]);
     assert.deepEqual(read.messages, [`${conversationId} 的正文`]);
@@ -257,9 +269,10 @@ test('启动发现只列目录、读小 JSON：找到上一个数据目录旁的
   ]);
   assert.equal(found[0].id, foreign.foreignRuntimeHistoryId(found[0].location, source.binding));
   // SQLite files are only stat-ed (which files this process may hold locks on), never opened; JSON is opened read-only.
-  assert.deepEqual(probe.seen.filter((call) => /limcode\.sqlite/.test(call.path) && call.name !== 'stat'), []);
+  const sqliteMetadataName = /^limcode(?:\.cas-small)?\.sqlite(?:-wal|-shm|-journal)?$/;
+  assert.deepEqual(probe.seen.filter((call) => sqliteMetadataName.test(path.basename(call.path)) && call.name !== 'stat'), []);
   assert.deepEqual(probe.seen.filter((call) => !['lstat', 'stat', 'readdir', 'open'].includes(call.name)).map((call) => call.name), []);
-  assert.ok(probe.seen.filter((call) => call.name === 'stat').every((call) => /limcode\.sqlite(-wal|-shm|-journal)?$/.test(call.path)));
+  assert.ok(probe.seen.filter((call) => call.name === 'stat').every((call) => sqliteMetadataName.test(path.basename(call.path))));
   assert.ok(probe.seen.filter((call) => call.name === 'open').every((call) => call.path.endsWith('.json') && !writes(call)));
 });
 

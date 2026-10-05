@@ -339,6 +339,7 @@ function packagedRuntimeClosureProblem() {
  */
 const DIRNAME_ENTRY_BOUNDARIES = new Map([
   ['dist/extension/backend/reliableKernel/databaseWorker.js', 'worker'],
+  ['dist/extension/backend/reliableKernel/packedCasWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeDataRootRelocationWorker.js', 'worker'],
@@ -442,6 +443,7 @@ function checkSourceSymbolsRemoved() {
 /** Extension-internal postMessage boundaries: worker threads and their launchers (structured clones between threads of this process). */
 const INTERNAL_STRUCTURED_CLONE_PATHS = new Set([
   'dist/extension/backend/reliableKernel/databaseWorker.js',
+  'dist/extension/backend/reliableKernel/packedCasWorker.js',
   'dist/extension/backend/reliableKernel/runtimeDatabase.js',
   'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js',
   'dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js',

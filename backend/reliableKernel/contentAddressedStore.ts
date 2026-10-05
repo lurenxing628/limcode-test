@@ -10,8 +10,7 @@ import { RootAuthority, RootAuthorityError, sameBindingIdentity } from './rootAu
 import { isExecutionHandoffError } from './executionLeaseFence';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { storageKeyForDigest } from './casObjectAccess';
-import { LocalCasByteAccess, looseCasObjectLocation } from './looseCasObjectAccess';
-import { publishLooseCasObject } from './looseCasObjectPublication';
+import { LooseCasStoreAccess, type CasStoreAccess, type CasPublicationLocation } from './runtimeCasAccess';
 
 export { storageKeyForDigest } from './casObjectAccess';
 
@@ -20,8 +19,9 @@ export interface PublishedContent {
   sha256: string;
   byteLength: bigint;
   storageKey: string;
-  /** Physical hint of this loose publisher only; readers use logical CAS access. */
-  absolutePath: string;
+  /** Present only when publication resolved to an independent immutable loose file. */
+  absolutePath?: string;
+  location?: CasPublicationLocation;
 }
 
 export interface ContentObjectMetadata extends DomainRow {
@@ -96,9 +96,7 @@ const VERIFIED_READ_CACHE_MAX_BYTES = 32 * 1024 * 1024;
 const VERIFIED_READ_CACHE_MAX_SINGLE_BYTES = 64 * 1024 * 1024;
 
 export class ContentAddressedStore {
-  private readonly byteAccess: LocalCasByteAccess;
-
-  public inspectRangeReadCache(): ReturnType<LocalCasByteAccess['inspectRanges']> {
+  public inspectRangeReadCache(): ReturnType<CasStoreAccess['inspectRanges']> {
     return this.byteAccess.inspectRanges();
   }
 
@@ -110,16 +108,28 @@ export class ContentAddressedStore {
   private verifiedReadCacheMisses = 0;
   private verifiedReadCacheEvictions = 0;
 
-  public constructor(
+  private constructor(
     private readonly authority: RootAuthority,
     public readonly binding: RootBinding,
+    private readonly byteAccess: CasStoreAccess,
     private readonly observeMetric?: ContentAddressedStoreMetricObserver
   ) {
-    this.byteAccess = new LocalCasByteAccess(binding.paths.casRootPath);
+    if (!byteAccess) throw new TypeError('ContentAddressedStore must borrow RuntimeDatabase access, or explicitly select the loose fixture adapter.');
+  }
+
+  public static forDatabase(authority: RootAuthority, database: RuntimeDatabase,
+    observeMetric?: ContentAddressedStoreMetricObserver): ContentAddressedStore {
+    return new ContentAddressedStore(authority, database.binding, database.casAccess, observeMetric);
+  }
+
+  /** Explicit loose-format fixture adapter. Production stores borrow the Runtime-owned access. */
+  public static loose(authority: RootAuthority, binding: RootBinding,
+    observeMetric?: ContentAddressedStoreMetricObserver): ContentAddressedStore {
+    return new ContentAddressedStore(authority, binding, new LooseCasStoreAccess(binding.paths.casRootPath), observeMetric);
   }
 
   public identity(content: Uint8Array | string, contentType: string): ContentObjectIdentity {
-    const { published } = identifyContent(this.binding, content, contentType);
+    const { published } = identifyContent(content, contentType);
     return {
       id: contentObjectId(published),
       content_type: published.contentType,
@@ -130,24 +140,40 @@ export class ContentAddressedStore {
   }
 
   public async publish(content: Uint8Array | string, contentType: string): Promise<PublishedContent> {
-    return await this.publishIdentified(identifyContent(this.binding, content, contentType));
+    return await this.publishIdentified(identifyContent(content, contentType));
   }
 
   private async publishIdentified(
     content: IdentifiedContent,
-    directoryFsyncs?: { count: number }
   ): Promise<PublishedContent> {
-    await this.authority.validate(this.binding);
-    this.recordMetric('publish');
-    const { bytes, published } = content;
-    await publishLooseCasObject(this.binding.paths.casRootPath, bytes, {
-      sha256: published.sha256, byte_length: published.byteLength, storage_key: published.storageKey
-    }, (metric) => {
-      this.recordMetric(metric);
-      if (metric === 'directory-fsync' && directoryFsyncs) directoryFsyncs.count += 1;
-    });
+    const published = await this.publishIdentifiedBatch([content]);
+    if (!published[0]) throw new Error('CAS publication lost its input.');
+    return published[0];
+  }
 
-    return published;
+  private async publishIdentifiedBatch(contents: readonly IdentifiedContent[], metrics?: {
+    tempWrites: number; fileFsyncs: number; directoryFsyncs: number;
+  }): Promise<PublishedContent[]> {
+    if (contents.length === 0) return [];
+    this.byteAccess.assertUsable();
+    await this.authority.validate(this.binding);
+    this.recordMetric('publish', contents.length);
+    const locations = await this.byteAccess.publishBatch(contents.map(({ bytes, published }) => ({ bytes, object: {
+      sha256: published.sha256, byte_length: published.byteLength, storage_key: published.storageKey
+    } })), (metric) => {
+      this.recordMetric(metric);
+      if (metrics) {
+        if (metric === 'directory-fsync') metrics.directoryFsyncs += 1;
+        else if (metric === 'file-fsync') metrics.fileFsyncs += 1;
+        else metrics.tempWrites += 1;
+      }
+    });
+    this.byteAccess.assertUsable();
+    await this.authority.validate(this.binding);
+    return contents.map(({ published }, index) => {
+      const location = locations[index];
+      return { ...published, location, ...(location.kind === 'loose' ? { absolutePath: location.absolutePath } : {}) };
+    });
   }
 
   /**
@@ -177,6 +203,7 @@ export class ContentAddressedStore {
     inputs: ReadonlyArray<{ content: Uint8Array | string; contentType: string }>,
     operation: 'prepare' | 'prepare_batch'
   ): Promise<PreparedContentObject[]> {
+    this.byteAccess.assertUsable();
     if (inputs.length === 0) return [];
     const startedAtMs = database.performanceMetrics ? performance.now() : undefined;
     if (!sameBindingIdentity(database.binding, this.binding)) {
@@ -184,7 +211,7 @@ export class ContentAddressedStore {
     }
     // Copy mutable Uint8Array inputs before the first await so identity and later publish always refer
     // to exactly the same bytes.
-    const identified = inputs.map((input) => identifyContent(this.binding, input.content, input.contentType));
+    const identified = inputs.map((input) => identifyContent(input.content, input.contentType));
     const unique = [...new Map(identified.map((entry) => [contentObjectId(entry.published), entry])).values()];
     const repository = DOMAIN_REPOSITORIES.domain('ContentObject');
     // One snapshot is one worker request even when it carries several unique identity lookups.
@@ -213,8 +240,8 @@ export class ContentAddressedStore {
     this.recordMetric('lookup-hit', lookupHits);
     this.recordMetric('lookup-miss', missing.length);
 
-    const directoryFsyncs = { count: 0 };
-    const publishedMisses = await Promise.all(missing.map((entry) => this.publishIdentified(entry, directoryFsyncs)));
+    const publicationMetrics = { tempWrites: 0, fileFsyncs: 0, directoryFsyncs: 0 };
+    const publishedMisses = await this.publishIdentifiedBatch(missing, publicationMetrics);
     for (const published of publishedMisses) {
       const metadata = contentObjectMetadata(published);
       preparedById.set(metadata.id, { metadata, insert: repository.insert(metadata) });
@@ -227,9 +254,7 @@ export class ContentAddressedStore {
         lookupHits,
         lookupMisses: missing.length,
         publishes: missing.length,
-        tempWrites: missing.length,
-        fileFsyncs: missing.length,
-        directoryFsyncs: directoryFsyncs.count,
+        ...publicationMetrics,
         durationMs: performance.now() - startedAtMs
       });
     }
@@ -265,8 +290,11 @@ export class ContentAddressedStore {
   }
 
   public async read(metadata: ContentObjectMetadata): Promise<Buffer> {
+    this.byteAccess.assertUsable();
     await this.authority.validate(this.binding);
-    return Buffer.from(await this.readVerifiedObject(metadata));
+    const bytes = await this.readVerifiedObject(metadata);
+    this.byteAccess.assertUsable();
+    return Buffer.from(bytes);
   }
 
   /** Fenced on-demand chunk read; callers still enforce their wire response budget. */
@@ -277,6 +305,7 @@ export class ContentAddressedStore {
   ): Promise<{ chunk: Buffer; nextOffset?: number; totalBytes: number; hasMore: boolean }> {
     if (!Number.isSafeInteger(offset) || offset < 0) throw new RangeError('CAS chunk offset must be a non-negative integer.');
     if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0) throw new RangeError('CAS chunk maxBytes must be a positive integer.');
+    this.byteAccess.assertUsable();
     await this.authority.validate(this.binding);
     const expectedKey = storageKeyForDigest(metadata.sha256);
     if (metadata.storage_key !== expectedKey) throw new Error('ContentObject storage key does not match sha256.');
@@ -287,6 +316,7 @@ export class ContentAddressedStore {
     // Stream-verify once per unchanged file identity, then read only the requested range. This
     // remains bounded for oversized objects and interleaved readers that exceed the byte cache.
     const chunk = await this.byteAccess.readRange(metadata, offset, length);
+    this.byteAccess.assertUsable();
     await this.authority.validate(this.binding);
     const nextOffset = offset + length;
     const hasMore = nextOffset < totalBytes;
@@ -300,6 +330,7 @@ export class ContentAddressedStore {
 
   /** One fenced async operation; duplicate ContentObjects are read and verified once, then fanned out. */
   public async readMany(metadata: readonly ContentObjectMetadata[]): Promise<Buffer[]> {
+    this.byteAccess.assertUsable();
     await this.authority.validate(this.binding);
     const unique = [...new Map(metadata.map((entry) => [entry.id, entry])).values()];
     const contents = new Map<string, Buffer>();
@@ -314,6 +345,7 @@ export class ContentAddressedStore {
         contents.set(entry.id, await this.readVerifiedObject(entry));
       }
     }));
+    this.byteAccess.assertUsable();
     return metadata.map((entry) => {
       const bytes = contents.get(entry.id);
       if (!bytes) throw new Error(`CAS batch read lost ContentObject ${entry.id}.`);
@@ -327,6 +359,7 @@ export class ContentAddressedStore {
    * Root fences are mandatory and deliberately outside the per-object failure boundary.
    */
   public async readOptionalMany(metadata: readonly ContentObjectMetadata[]): Promise<Array<Buffer | undefined>> {
+    this.byteAccess.assertUsable();
     await this.authority.validate(this.binding);
     const unique = [...new Map(metadata.map(entry => [entry.id, entry])).values()];
     const contents = new Map<string, Buffer | undefined>();
@@ -350,6 +383,7 @@ export class ContentAddressedStore {
         contents.set(entry.id, bytes);
       }
     }));
+    this.byteAccess.assertUsable();
     await this.authority.validate(this.binding);
     return metadata.map(entry => {
       const bytes = contents.get(entry.id);
@@ -479,7 +513,6 @@ function contentObjectMetadata(content: PublishedContent): ContentObjectMetadata
 }
 
 function identifyContent(
-  binding: RootBinding,
   content: Uint8Array | string,
   contentType: string
 ): IdentifiedContent {
@@ -493,10 +526,7 @@ function identifyContent(
       contentType: normalizedType,
       sha256,
       byteLength: BigInt(bytes.length),
-      storageKey,
-      absolutePath: looseCasObjectLocation(binding.paths.casRootPath, {
-        sha256, byte_length: BigInt(bytes.length), storage_key: storageKey
-      }).absolutePath
+      storageKey
     }
   };
 }

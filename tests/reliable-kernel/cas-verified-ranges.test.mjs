@@ -15,7 +15,7 @@ async function fixture(run) {
   try {
     const authority = new RootAuthority(() => path.join(directory, 'runtime'));
     const binding = await initializeEmptyRuntimeRoot(authority);
-    const store = new ContentAddressedStore(authority, binding);
+    const store = ContentAddressedStore.loose(authority, binding);
     const publish = async (size, byte = 97) => {
       const value = await store.publish(Buffer.alloc(size, byte), 'text/plain');
       return { id: value.sha256, content_type: value.contentType, sha256: value.sha256,

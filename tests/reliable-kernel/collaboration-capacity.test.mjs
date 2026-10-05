@@ -23,7 +23,7 @@ async function fixture(maximum, run) {
   const authority = new RootAuthority(() => path.join(directory, 'runtime'));
   await initializeEmptyRuntimeRoot(authority);
   const database = await RuntimeDatabase.open(authority);
-  const store = new ContentAddressedStore(authority, database.binding);
+  const store = ContentAddressedStore.forDatabase(authority, database);
   const content = await store.prepare(database, JSON.stringify({ toolPolicy: { toolConfigs: {
     run_agent: { config: { maxConcurrentAgents: maximum, maxAutomaticFollowups: 0 } }
   } } }), 'application/json');

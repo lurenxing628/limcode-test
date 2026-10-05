@@ -11,12 +11,12 @@ import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } f
 import type { HistoricalRootBinding } from './rootAuthority';
 import { openRuntimeCasVerificationCache, type RuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
 import { RuntimeDatabase, RuntimeDatabaseWorkerError } from './runtimeDatabase';
-import { casTransferCanLinkRoots } from './runtimeCasTransfer';
+import { casTransferCanLinkRoots, casTransferPackedStorageBytes } from './runtimeCasTransfer';
 import {
   HISTORICAL_MERGE_ENGINE as engine, planMergeChunk, RuntimeDataSetMergeEvidence, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
   type ForeignHistoricalMergeCandidate, type ForeignHistoricalMergeHold, type HistoricalMergeCandidate,
   type HistoricalMergePickedSource, type HistoricalMergeRowPlan, type HistoricalMergeSourceMode, type HistoricalMergeSourceOutcome, type HistoricalMergeSourceProgress,
-  type HistoricalMergeTargetContext, type RuntimeDataSetCasTransfer,
+  type HistoricalCasSnapshot, type HistoricalMergeTargetContext, type RuntimeDataSetCasTransfer,
   type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeChunkSink, type RuntimeDataSetMergeFaultPoint,
   type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeOptions, type RuntimeDataSetMergeResult
 } from './runtimeDataSetMerge';
@@ -229,7 +229,7 @@ export interface HistoricalMergeSourceResolver {
    */
   assertUnchanged(root: LocatedRuntimeRoot, check: SourceCheck): Promise<void>;
   /** A private copy of the source's database, fenced by its recorded binding. */
-  snapshot(root: LocatedRuntimeRoot): Promise<RuntimeDataSetDatabaseSnapshot>;
+  snapshot(root: LocatedRuntimeRoot): Promise<HistoricalCasSnapshot>;
 }
 
 interface SourceCheck {
@@ -250,7 +250,11 @@ export function localHistoricalMergeSources(paths: { globalStoragePath: string }
       const candidate = await resolveVscodeRuntimeDataSet(storagePaths, root.id);
       await engine.assertSourceUnchanged(check.paths, check.target, candidate, locatedBinding(root), check.state, check.mode);
     },
-    snapshot: (root) => createLocatedRuntimeDatabaseSnapshot(root)
+    async snapshot(root) {
+      const candidate = await resolveVscodeRuntimeDataSet(storagePaths, root.id);
+      const files = await runtimeDataSetFileState(root.located.databasePath);
+      return engine.withLocalPackedSnapshot(candidate, locatedBinding(root), await createLocatedRuntimeDatabaseSnapshot(root), files);
+    }
   };
 }
 
@@ -1131,7 +1135,7 @@ export interface PreparedLargeMergeSource {
   casObjects: number;
   cas: RuntimeDataSetCasTransfer;
   finalized?: RuntimeDataSetMergeResult['finalized'];
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8;
+  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
   /** Estimated exclusive time of this source (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
   estimateMs: number;
   estimateRangeMs: [number, number];
@@ -1482,7 +1486,7 @@ async function prepareSource(
       // Everything that can refuse the source was checked on the unfinalized snapshot; the CAS
       // objects are verified too. Only then is it backed up and its work closed, and checked again.
       progress('cas');
-      await engine.transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, true);
+      await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, true);
       stopIfAsked();
       await engine.fault(options, 'before-source-finalization');
       progress('finalize');
@@ -1512,7 +1516,7 @@ async function prepareSource(
     await engine.fault(options, 'after-target-backup');
     progress('cas');
     const unrecorded = verified.unrecorded();
-    const cas = await engine.transferSourceCas(candidate, binding, target, taken.snapshot.database, options, verified, false);
+    const cas = await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, false);
     if (verified.unrecorded() > unrecorded) {
       // The session would hash those objects again while every window waits: not this time.
       throw new engine.Outcome({
@@ -1522,7 +1526,8 @@ async function prepareSource(
     }
     await engine.fault(options, 'after-cas-transfer');
     const size = taken.audit.size!;
-    const databaseBytes = await sqliteFilesBytes(binding.paths.databasePath);
+    const databaseBytes = await sqliteFilesBytes(binding.paths.databasePath)
+      + await casTransferPackedStorageBytes(binding.paths.casRootPath);
     const casObjects = taken.audit.content!.objects;
     // Fixed part, copy, stream (the scan's measured rate with the inserts on top), checkpoint (about a copy's worth of writing), lstat per object.
     const estimateMs = Math.round(SESSION_SOURCE_FIXED_MS + 2 * timing.copyMs + scan.elapsedMs * SESSION_ROW_COST_FACTOR + casObjects * CAS_OBJECT_MS);
@@ -1680,7 +1685,7 @@ export interface LargeMergeEstimatedSource {
 export interface LargeMergeEstimateSpace extends LargeMergeSpace {
   /** Part of targetBytes: the online target backup the preparation takes (the target's database and WAL now). */
   targetBackupBytes: number;
-  /** Part of targetBytes: content objects that would be copied into the target (their CAS is on another disk); 0 when linked. */
+  /** Part of targetBytes: copied logical bodies plus packed storage allowance; 0 only for entirely linkable loose roots. */
   casCopyBytes: number;
 }
 
@@ -1862,21 +1867,22 @@ async function estimateSource(
   if (facts.refusedWork.length > 0 && await engine.leavesNothingOut(target, await engine.recordedConversations(paths, target, candidate))) {
     throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(facts.refusedWork), state));
   }
-  // Linked when both content stores are on one disk (a copy only across disks or where links fail);
-  // a foreign root's objects are always copied.
+  // Entirely loose local roots may link on one disk. Mixed roots count copies and packed storage
+  // overhead conservatively; every source needs its private sidecar snapshot in temp space.
   const foreign = engine.isForeignCandidate(candidate);
   const linked = !foreign && await casTransferCanLinkRoots(binding.paths.casRootPath, target.binding.paths.casRootPath);
+  const packedBytes = await casTransferPackedStorageBytes(binding.paths.casRootPath);
   const prepareEstimateMs = Math.round(prepareModelMs(facts, linked));
   const sessionEstimateMs = Math.round(sessionModelMs(facts) * sessionRate);
   return {
     kind: 'estimated',
-    casCopyBytes: linked ? 0 : facts.casBytes,
+    casCopyBytes: linked ? 0 : facts.casBytes + packedBytes,
     source: {
       candidateId, ...(foreign ? { label: candidate.label } : {}), sourceDataSetId: binding.dataSetId,
       runtimeDataRootPath: candidate.runtimeDataRootPath,
       // As the preparation gives it: the content digest of exactly these files (cached with their audit).
       fingerprint,
-      rows: facts.rows, bytes: facts.bytes, databaseBytes: facts.databaseBytes, casObjects: facts.casObjects,
+      rows: facts.rows, bytes: facts.bytes, databaseBytes: facts.databaseBytes + packedBytes, casObjects: facts.casObjects,
       prepareEstimateMs, prepareEstimateRangeMs: unmeasuredRange(prepareEstimateMs),
       sessionEstimateMs, sessionEstimateRangeMs: unmeasuredRange(sessionEstimateMs),
       estimateMs: sessionEstimateMs, estimateRangeMs: unmeasuredRange(sessionEstimateMs), cached
@@ -2274,7 +2280,7 @@ async function mergeLocked(
     const chunkRows = options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS;
     const skipping = await prepareSkippedRows(copy.database, target.database, merged, state, chunkRows);
     // Published online with their verified identities: unchanged objects are only lstat'ed here.
-    const cas = await engine.transferSourceCas(candidate, locatedBinding(root), target, copy.database, options, verified, false);
+    const cas = await engine.transferSourceCas(candidate, locatedBinding(root), target, copy, options, verified, false);
     await engine.fault(options, 'after-cas-transfer');
     const result: RuntimeDataSetMergeResult = {
       ...engine.unchangedResult(candidate, target), ...cas,

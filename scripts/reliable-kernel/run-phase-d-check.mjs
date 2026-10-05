@@ -1666,7 +1666,7 @@ async function checkEffectReceiptReconcile() {
     assert.equal((await list(ctx.database, 'ToolOutcome', { tool_call_id: tool.toolCallId })).length, 0);
     await ctx.database.close();
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'phase-d-receipt-reopen' });
-    ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+    ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
     effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     const files = new kernel.FileChangeControlPlane(ctx.database, ctx.store, effects);
     const processes = new kernel.ProcessControlPlane(ctx.database, ctx.store, effects, ctx.authority, ctx.binding);
@@ -1819,7 +1819,7 @@ async function checkAttachmentCasIngest() {
     try {
       const candidate = await kernel.resetCandidateRuntimeRoot(failingParent);
       failingDatabase = await kernel.RuntimeDatabase.open(candidate.authority);
-      const failingStore = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+      const failingStore = kernel.ContentAddressedStore.forDatabase(candidate.authority, failingDatabase);
       const base = await failingStore.ingest(failingDatabase, 'base', 'text/plain');
       await failingDatabase.transaction([
         kernel.DOMAIN_REPOSITORIES.domain('Message').insert({ id: 'm', created_at: now, updated_at: now, deleted_at: null }),
@@ -1966,7 +1966,7 @@ async function checkMcpEffectRecovery() {
     await ctx.database.close();
 
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'mcp-restart' });
-    ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+    ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
     effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     let rebuiltCalls = 0;
     mcp = new kernel.McpEffectDispatcher(ctx.database, effects, {
@@ -2249,7 +2249,7 @@ async function checkProcessWrapperRecovery() {
     }
 
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'process-restart-host' });
-    ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+    ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
     effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     processes = new kernel.ProcessControlPlane(
       ctx.database, ctx.store, effects, ctx.authority, ctx.binding
@@ -3559,7 +3559,7 @@ async function checkHangingEffectRecovery() {
 
     await ctx.database.close();
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'hanging-reopen' });
-    ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+    ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
     effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     files = new kernel.FileChangeControlPlane(ctx.database, ctx.store, effects);
     let recoveredMcpCalls = 0;
@@ -3699,7 +3699,7 @@ async function checkUnresolvedFileRecovery() {
     await ctx.database.close();
 
     ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId: 'unresolved-reopen' });
-    ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+    ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
     effects = new kernel.EffectControlPlane(ctx.database, ctx.store);
     files = new kernel.FileChangeControlPlane(ctx.database, ctx.store, effects);
     const mcp = new kernel.McpEffectDispatcher(
@@ -3940,7 +3940,7 @@ async function checkUnresolvedFileRecovery() {
 async function createRuntime(parent, label) {
   const candidate = await kernel.resetCandidateRuntimeRoot(parent);
   const database = await kernel.RuntimeDatabase.open(candidate.authority, { hostBootId: `phase-d-${label}` });
-  const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+  const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
   const now = new Date().toISOString();
   const conversationId = `conversation-${label}`;
   const turnId = `turn-${label}`;

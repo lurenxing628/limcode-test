@@ -27,7 +27,7 @@ async function openRuntime(answers) {
   try {
     const root = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'child-answer-cards' });
-    const cas = new kernel.ContentAddressedStore(root.authority, root.binding);
+    const cas = kernel.ContentAddressedStore.forDatabase(root.authority, database);
     const toolArguments = await cas.ingest(database, '{"task":"调研"}', 'application/json');
     const answerBody = await cas.ingest(database, '子任务的回答', 'text/plain');
     const turn = (id, conversationId, minute) => row('Turn', { id, conversation_id: conversationId, status: 'terminated',

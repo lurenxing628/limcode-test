@@ -52,7 +52,7 @@ async function checkTurnSoleExecutionIdentity() {
   assert.ok(negativeProblems.length >= 4, '旧执行身份负例必须被候选路径检查识别');
 
   return withRuntime('main', async ({ authority, binding, database }) => {
-    const store = new kernel.ContentAddressedStore(authority, binding);
+    const store = kernel.ContentAddressedStore.forDatabase(authority, database);
     const compiler = authorityCompiler(new Set(['agent-a', 'agent-b', 'agent-concurrent']));
     const control = createControl(database, store, compiler);
     const assertions = [];

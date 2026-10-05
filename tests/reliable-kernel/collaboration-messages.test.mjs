@@ -25,7 +25,7 @@ async function fixture(run, budget = 32) {
   const authority = new RootAuthority(() => path.join(directory, 'runtime'));
   await initializeEmptyRuntimeRoot(authority);
   let database = await RuntimeDatabase.open(authority);
-  const store = new ContentAddressedStore(authority, database.binding);
+  const store = ContentAddressedStore.forDatabase(authority, database);
   let deliveries = new RuntimeDeliveryControlPlane(database, store, { now: () => NOW });
   let collaboration = new CollaborationControlPlane(database, store, deliveries, { now: () => NOW });
   const rows = async (domain, where = {}) => (await database.snapshot([repo(domain).list({ where, limit: 1000 })])).snapshot[0];

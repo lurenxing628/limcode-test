@@ -18,7 +18,7 @@ for (const scenario of ['invalid-image', 'invalid-resource', 'oversized-audio', 
       const authority = new k.RootAuthority(() => path.join(temporary, 'runtime'));
       await k.initializeEmptyRuntimeRoot(authority);
       database = await k.RuntimeDatabase.open(authority);
-      const store = new k.ContentAddressedStore(authority, database.binding);
+      const store = k.ContentAddressedStore.forDatabase(authority, database);
       const attachments = new k.AttachmentIngestService(database, store, { async loadGlobalSettings() { return { settings: { maxStoredInlineFileMb: 1 } }; } });
       const effects = new k.EffectControlPlane(database, store, { attachments });
       const now = new Date().toISOString();

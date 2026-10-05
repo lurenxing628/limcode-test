@@ -3693,7 +3693,7 @@ async function reopenRuntime(ctx, hostBootId, now = ctx.now) {
   if (ctx.database) throw new Error('Runtime database must be closed before reopen.');
   ctx.now = now;
   ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId });
-  ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+  ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
   ctx.services = kernel.createReliableKernelRuntimeServices(ctx.database, ctx.store, {
     now,
     authorityCompiler: phaseFAuthorityCompiler('runtime-services')

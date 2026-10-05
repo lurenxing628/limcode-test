@@ -87,7 +87,7 @@ async function openHarness(t) {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-history-local-actions-'));
   const root = await kernel.resetCandidateRuntimeRoot(directory);
   const database = await kernel.RuntimeDatabase.open(root.authority, { hostBootId: 'history-local-actions' });
-  const store = new kernel.ContentAddressedStore(root.authority, root.binding);
+  const store = kernel.ContentAddressedStore.forDatabase(root.authority, database);
   let seconds = 0;
   let realClock = false;
   const now = () => realClock ? new Date().toISOString() : new Date(Date.UTC(2026, 8, 1) + ++seconds * 1000).toISOString();

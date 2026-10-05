@@ -30,7 +30,7 @@ async function openRuntime() {
   try {
     const fixture = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: 'collaboration-card-labels' });
-    const store = new kernel.ContentAddressedStore(fixture.authority, fixture.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(fixture.authority, database);
     const userMessage = async (id, turnId, text) => {
       const content = await store.ingest(database, JSON.stringify({ role: 'user', parts: [{ text }] }), 'application/vnd.limcode.message+json');
       return [
@@ -283,7 +283,7 @@ async function openScenario(name, seed) {
   try {
     const fixture = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(fixture.authority, { hostBootId: `collaboration-${name}` });
-    const store = new kernel.ContentAddressedStore(fixture.authority, fixture.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(fixture.authority, database);
     const ingest = {
       message: async (role, text) => (await store.ingest(database, JSON.stringify({ role, parts: [{ text }] }), 'application/vnd.limcode.message+json')).id,
       payload: async (text) => (await store.ingest(database, text, 'text/vnd.limcode.collaboration-message')).id

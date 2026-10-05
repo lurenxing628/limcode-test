@@ -17,7 +17,7 @@ async function withContext(body, observed = true) {
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(candidate.authority, { hostBootId: 'fork-context-test' });
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const contents = [
       { kind: 'compression_contents', contents: [{ role: 'user', parts: [{ text: 'retained summary' }] }], estimatedTokens: 32 },
       { role: 'user', parts: [{ text: 'inspect image' }, { inlineData: { mimeType: 'image/png', data: 'A'.repeat(800_000) } }] },

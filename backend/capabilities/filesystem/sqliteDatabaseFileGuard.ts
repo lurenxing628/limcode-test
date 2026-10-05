@@ -14,7 +14,7 @@ import { realPath } from './realPath';
  * files corrupts the database outright on every platform, and deleting a private copy while it is
  * being written or read makes that backup or verification fail.
  *
- * Only the Runtime worker registers its database by identity (registerInProcessSqliteDatabase); every
+ * Runtime and packed-CAS workers register their databases by identity (registerInProcessSqliteDatabase); every
  * other database this process opens carries one of LimCode's own names below, so they are refused by
  * name wherever they are.
  *

@@ -23,7 +23,7 @@ test('active Turn projection reads only selected frozen authority and exports no
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(parent);
     database = await kernel.RuntimeDatabase.open(candidate.authority);
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const frozen = { workEnvironmentPolicy: policy('inherited-environment'), model: { apiKey: 'must-not-cross-feed' } };
     const selectedAuthority = await store.ingest(database, JSON.stringify(frozen), authorityType);
     const otherAuthority = await store.ingest(database, JSON.stringify({

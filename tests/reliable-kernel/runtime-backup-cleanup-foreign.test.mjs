@@ -650,6 +650,7 @@ function countingReader(database) {
     calls: 0,
     maxBatch: 0,
     binding: database.binding,
+    casAccess: database.casAccess,
     async snapshot(reads) {
       reader.calls += 1;
       reader.maxBatch = Math.max(reader.maxBatch, reads.length);
@@ -663,7 +664,7 @@ function countingReader(database) {
 async function seed(dataSet, conversationIds) {
   const runtime = await kernel.RuntimeDatabase.open(dataSet.authority, { hostBootId: `seed-${randomUUID()}` });
   try {
-    const store = new kernel.ContentAddressedStore(dataSet.authority, dataSet.binding);
+    const store = kernel.ContentAddressedStore.loose(dataSet.authority, dataSet.binding);
     for (const id of conversationIds) {
       const turnId = `${id}_turn`;
       const steps = [

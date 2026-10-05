@@ -7,17 +7,19 @@ import * as path from 'node:path';
 import { isSamePath } from '../capabilities/filesystem/pathContainment';
 import { inProcessSqliteDatabasePaths } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import { createRuntimeRootPaths, ROOT_BINDING_PENDING_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
-import { requireCasObjectIdentity, type CasObjectIdentity } from './casObjectAccess';
+import { requireCasObjectIdentity, type CasByteAccess, type CasObjectIdentity } from './casObjectAccess';
 import { looseCasObjectLocation, verifyCasObjectBytes } from './looseCasObjectAccess';
-import type { CasTransferSource } from './runtimeCasTransfer';
+import type { CasObjectReadHandle, CasTransferSource } from './runtimeCasTransfer';
+import { PackedCasWorkerClient } from './packedCasWorkerClient';
+import { PACKED_CAS_FILE } from './packedCasWorkerProtocol';
 import { CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
 import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
-import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocation';
+import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocationContract';
 import { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RETIRED_EPOCH_TO_6_JOURNAL_FILE,
-  RETIRED_EPOCH_TO_7_JOURNAL_FILE, RETIRED_EPOCH_TO_8_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
+  RETIRED_EPOCH_TO_7_JOURNAL_FILE, RETIRED_EPOCH_TO_8_JOURNAL_FILE, RETIRED_EPOCH_TO_9_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } from './runtimeEpochMigration';
 import {
   isRuntimeDataRootAdmissionHeld, judgeRuntimeHostLivenessRecords, RuntimeClaimHeldError, runtimeHostLivenessDirectory,
   RuntimeMaintenanceBusyError, withRuntimeClaimAtPath, withRuntimeMaintenance, type RuntimeMaintenanceMetadata
@@ -166,7 +168,7 @@ const MERGE_LEDGER_RECORDS = 'records';
 const IN_PROGRESS_FILES: readonly string[] = Object.freeze([
   ROOT_BINDING_PENDING_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE,
   RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RETIRED_EPOCH_TO_6_JOURNAL_FILE,
-  RETIRED_EPOCH_TO_7_JOURNAL_FILE, RETIRED_EPOCH_TO_8_JOURNAL_FILE, CUTOVER_REQUEST_FILE, CUTOVER_JOURNAL_FILE
+  RETIRED_EPOCH_TO_7_JOURNAL_FILE, RETIRED_EPOCH_TO_8_JOURNAL_FILE, RETIRED_EPOCH_TO_9_JOURNAL_FILE, CUTOVER_REQUEST_FILE, CUTOVER_JOURNAL_FILE
 ]);
 /** Errors of the moment (space, I/O, permissions, busy): "not verifiable now", never "failed". */
 const TRANSIENT_CODES = new Set(['ENOSPC', 'EDQUOT', 'EIO', 'EAGAIN', 'EBUSY', 'ETIMEDOUT', 'EMFILE', 'ENFILE', 'EACCES', 'EPERM', 'ENOMEM']);
@@ -216,8 +218,11 @@ export async function heldDatabaseFiles(configurationRootPath: string, options: 
   // Every entry, as local data-set enumeration takes them; stat of a path that is no database finds nothing.
   for (const key of await fs.readdir(scopesRoot).catch(() => [] as string[])) scopes.push(path.join(scopesRoot, key));
   for (const scope of scopes) {
-    const database = createRuntimeRootPaths(path.join(scope, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_ACTIVE_DIRECTORY)).databasePath;
-    if (!options.except || !isSamePath(database, path.resolve(options.except))) databases.add(database);
+    const root = createRuntimeRootPaths(path.join(scope, VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_ACTIVE_DIRECTORY));
+    if (!options.except || !isSamePath(root.databasePath, path.resolve(options.except))) {
+      databases.add(root.databasePath);
+      databases.add(path.join(root.casRootPath, PACKED_CAS_FILE));
+    }
   }
   const held = new Set<string>();
   for (const database of databases) {
@@ -669,15 +674,19 @@ export async function copyLocatedRuntimeDatabase(
 export async function copyForeignRuntimeSqliteFiles(
   containerRoot: string,
   databasePath: string,
-  held: HeldDatabaseFiles
+  held: HeldDatabaseFiles,
+  targetFilename: 'limcode.sqlite' | typeof PACKED_CAS_FILE = 'limcode.sqlite'
 ): Promise<{ databasePath: string; files: string; remove(): Promise<void> }> {
+  if (targetFilename !== 'limcode.sqlite' && targetFilename !== PACKED_CAS_FILE) {
+    throw new TypeError('A private Runtime SQLite copy requires one of its fixed database filenames.');
+  }
   for (let attempt = 1; attempt <= COPY_ATTEMPTS; attempt += 1) {
     await assertNotHeldDatabase(databasePath, held);
     let before: string;
     let copy: { databasePath: string; remove(): Promise<void> };
     try {
       before = await runtimeDataSetFileState(databasePath);
-      copy = await copyForeignSqliteByDescriptor(containerRoot, databasePath, held);
+      copy = await copyForeignSqliteByDescriptor(containerRoot, databasePath, held, targetFilename);
     } catch (error) {
       // A file that turned out to be a link, a FIFO or a device, or one of a database this process holds.
       if (error instanceof ForeignRuntimeHistoryRejection) throw error;
@@ -706,13 +715,14 @@ export async function copyForeignRuntimeSqliteFiles(
 async function copyForeignSqliteByDescriptor(
   containerRoot: string,
   databasePath: string,
-  held: HeldDatabaseFiles
+  held: HeldDatabaseFiles,
+  targetFilename: 'limcode.sqlite' | typeof PACKED_CAS_FILE
 ): Promise<{ databasePath: string; remove(): Promise<void> }> {
   await assertNoSymbolicPath(containerRoot, databasePath);
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-runtime-history-${process.pid}-`));
   const remove = () => fs.rm(temporaryRoot, { recursive: true, force: true });
   try {
-    const copied = path.join(temporaryRoot, 'limcode.sqlite');
+    const copied = path.join(temporaryRoot, targetFilename);
     await copyFromDescriptor(await openLocatedRuntimeFile(databasePath, held), copied);
     const journal = await lstatIfPresent(`${databasePath}-journal`);
     if (journal && (!journal.isFile() || journal.size > 0)) {
@@ -739,7 +749,11 @@ async function copyFromDescriptor(source: fs.FileHandle, target: string): Promis
       for (let position = 0; ;) {
         const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
         if (bytesRead === 0) break;
-        await out.write(buffer, 0, bytesRead);
+        for (let written = 0; written < bytesRead;) {
+          const part = await out.write(buffer, written, bytesRead - written);
+          if (part.bytesWritten === 0) throw new Error('Private SQLite copy stopped making progress.');
+          written += part.bytesWritten;
+        }
         position += bytesRead;
       }
       await out.sync();
@@ -762,34 +776,81 @@ export async function readLocatedRuntimeFile(file: string, held: HeldDatabaseFil
   finally { await handle.close(); }
 }
 
-/**
- * Logical history bytes under the located reader policy: no symbolic components and no descriptor
- * of a database held by this process. The history owner supplies its freshly checked held set.
- */
-export async function readLocatedCasObject(
-  root: LocatedRuntimeRoot,
-  object: CasObjectIdentity,
-  held: HeldDatabaseFiles
-): Promise<Buffer> {
-  const identity = requireCasObjectIdentity(object);
-  if (identity.byte_length > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError('Historical CAS object is too large to read.');
-  const location = looseCasObjectLocation(root.located.casRootPath, identity);
-  await assertNoSymbolicPath(root.containerRoot, location.absolutePath);
-  return verifyCasObjectBytes(identity, await readLocatedRuntimeFile(location.absolutePath, held, Number(identity.byte_length)));
+/** A private, root-bound packed reader. Undefined is a normal old loose-only root. */
+export interface PackedCasSnapshotAccess {
+  readBytes(object: CasObjectIdentity): Promise<Buffer | undefined>;
+  inspectByteLength(object: CasObjectIdentity): Promise<bigint | undefined>;
+  close(): Promise<void>;
 }
 
 /**
- * A claim-scoped, copy-only logical source. Physical path resolution and strict foreign-file safety
- * are confined here; the transfer engine receives identities and sequential bytes, never filenames.
+ * Callers first snapshot Runtime metadata under the source fence, then take this append-only CAS
+ * copy. The source is never opened through SQLite: only checked descriptors copy its main/WAL.
  */
-export function locatedCasTransferSource(
+export async function openPackedCasSnapshot(
+  binding: HistoricalRootBinding,
+  containerRoot: string,
+  held: HeldDatabaseFiles
+): Promise<PackedCasSnapshotAccess> {
+  let worker: PackedCasWorkerClient | undefined;
+  let copy: { databasePath: string; remove(): Promise<void> } | undefined;
+  let closed = false;
+  if (binding.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+    const file = path.join(binding.paths.casRootPath, PACKED_CAS_FILE);
+    await assertNoSymbolicPath(containerRoot, binding.paths.casRootPath);
+    if (await lstatIfPresent(file)) {
+      await assertNoSymbolicPath(containerRoot, file);
+      copy = await copyForeignRuntimeSqliteFiles(containerRoot, file, held, PACKED_CAS_FILE);
+      try {
+        worker = await PackedCasWorkerClient.open({ ...binding,
+          paths: { ...binding.paths, casRootPath: path.dirname(copy.databasePath) }
+        } as RootBinding, { readOnly: true });
+      } catch (error) {
+        await copy.remove();
+        throw error;
+      }
+    } else {
+      for (const suffix of ['-wal', '-shm', '-journal']) {
+        if (await lstatIfPresent(`${file}${suffix}`)) {
+          throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-packed-cas-incomplete',
+            '小正文存储缺少数据库但仍有 SQLite 伴随文件，保留原样，不退回散文件。');
+        }
+      }
+    }
+  }
+  const assertOpen = (): void => { if (closed) throw new Error('Historical packed CAS reader is closed.'); };
+  return {
+    async readBytes(object) { assertOpen(); return worker?.readBytes(requireCasObjectIdentity(object)); },
+    async inspectByteLength(object) { assertOpen(); return worker?.inspectByteLength(requireCasObjectIdentity(object)); },
+    async close() {
+      if (closed) return;
+      // Do not remove a copy or release its owner's fence until every SQLite handle is closed.
+      await worker?.close();
+      await copy?.remove();
+      closed = true;
+    }
+  };
+}
+
+export interface LocatedCasAccess extends Pick<CasByteAccess, 'readBytes' | 'inspectByteLength' | 'containsExactLength'>, CasTransferSource {
+  close(): Promise<void>;
+}
+
+/**
+ * One history/claim-scoped logical reader. Packed bytes come from the private snapshot; large and
+ * legacy loose bodies keep strict descriptor reads, no symbolic prefixes and held-inode checks.
+ */
+export async function openLocatedCasAccess(
   root: LocatedRuntimeRoot,
-  heldFiles: () => Promise<HeldDatabaseFiles>
-): CasTransferSource {
-  // Validated loose identities have only 256 prefix directories; preserve the per-transfer checks.
+  held: HeldDatabaseFiles,
+  refreshHeld?: () => Promise<HeldDatabaseFiles>
+): Promise<LocatedCasAccess> {
+  const packed = await openPackedCasSnapshot({ ...root.recorded, paths: root.located }, root.containerRoot, held);
+  let closed = false;
   const checked = new Set<string>();
-  let held: Promise<HeldDatabaseFiles> | undefined;
+  const assertOpen = (): void => { if (closed) throw new Error('Historical CAS reader is closed.'); };
   const reachable = async (object: CasObjectIdentity): Promise<string> => {
+    assertOpen();
     const { absolutePath } = looseCasObjectLocation(root.located.casRootPath, object);
     const directory = path.dirname(absolutePath);
     if (!checked.has(directory)) {
@@ -798,20 +859,76 @@ export function locatedCasTransferSource(
     }
     return absolutePath;
   };
-  return {
-    size: async (object) => {
-      try {
-        const file = await reachable(object);
-        const info = await fs.lstat(file, { bigint: true });
-        return info.isFile() ? info.size : undefined;
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException | undefined)?.code;
-        if (code === 'ENOENT' || code === 'ENOTDIR' || (error instanceof Error && /symbolic link/.test(error.message))) return undefined;
-        throw error;
-      }
-    },
-    open: async (object) => openLocatedRuntimeFile(await reachable(object), await (held ??= heldFiles()))
+  const currentHeld = (): Promise<HeldDatabaseFiles> => refreshHeld ? refreshHeld() : Promise.resolve(held);
+  const size = async (object: CasObjectIdentity): Promise<bigint | undefined> => {
+    assertOpen();
+    const identity = requireCasObjectIdentity(object);
+    const length = await packed.inspectByteLength(identity);
+    if (length !== undefined) return length;
+    try {
+      const info = await fs.lstat(await reachable(identity), { bigint: true });
+      return info.isFile() ? info.size : undefined;
+    } catch (error) {
+      if (isMissing(error) || (error instanceof Error && /symbolic link/.test(error.message))) return undefined;
+      throw error;
+    }
   };
+  const readBytes = async (object: CasObjectIdentity): Promise<Buffer> => {
+    assertOpen();
+    const identity = requireCasObjectIdentity(object);
+    const bytes = await packed.readBytes(identity);
+    if (bytes !== undefined) return bytes;
+    if (identity.byte_length > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError('Historical CAS object is too large to read.');
+    return verifyCasObjectBytes(identity, await readLocatedRuntimeFile(await reachable(identity), await currentHeld(), Number(identity.byte_length)));
+  };
+  return {
+    size,
+    async readPackedBytes(object) { assertOpen(); return packed.readBytes(requireCasObjectIdentity(object)); },
+    inspectByteLength: size,
+    async containsExactLength(object) { return await size(object) === object.byte_length; },
+    readBytes,
+    async open(object) {
+      assertOpen();
+      const bytes = await packed.readBytes(requireCasObjectIdentity(object));
+      return bytes === undefined
+        ? openLocatedRuntimeFile(await reachable(object), await currentHeld()) : bufferReadHandle(bytes);
+    },
+    async close() {
+      if (closed) return;
+      await packed.close();
+      closed = true;
+    }
+  };
+}
+
+/** A sequential handle over one verified small body, never the SQLite container. */
+function bufferReadHandle(bytes: Buffer): CasObjectReadHandle {
+  let position = 0;
+  let closed = false;
+  return {
+    async read(buffer, offset, length) {
+      if (closed) throw new Error('Historical CAS object handle is closed.');
+      const copied = bytes.copy(buffer, offset, position, Math.min(bytes.length, position + length));
+      position += copied;
+      return { bytesRead: copied };
+    },
+    async close() { closed = true; }
+  };
+}
+
+/** Scoped convenience for occasional readers; history and merge borrow a single owner instead. */
+export async function readLocatedCasObject(root: LocatedRuntimeRoot, object: CasObjectIdentity, held: HeldDatabaseFiles): Promise<Buffer> {
+  const access = await openLocatedCasAccess(root, held);
+  try { return await access.readBytes(object); }
+  finally { await access.close(); }
+}
+
+/** A claim-scoped copy-only owner, shared for every object of a source snapshot. */
+export async function locatedCasTransferSource(
+  root: LocatedRuntimeRoot,
+  heldFiles: () => Promise<HeldDatabaseFiles>
+): Promise<LocatedCasAccess> {
+  return openLocatedCasAccess(root, await heldFiles(), heldFiles);
 }
 
 /**
@@ -1126,7 +1243,7 @@ function copiedNamePattern(base: string): RegExp {
 
 /** Why an older format is not opened here, saying only what is true of this root. */
 function oldFormatReason(location: ForeignRuntimeRootLocation, epoch: number): string {
-  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6 && epoch !== 7 && epoch !== 8) {
+  if (epoch !== 3 && epoch !== 4 && epoch !== 5 && epoch !== 6 && epoch !== 7 && epoch !== 8 && epoch !== 9) {
     return `它是不受支持的旧格式（第 ${epoch} 代），当前版本不能读取，也不能升级它。它原样保留，不会被删除。`;
   }
   if (location.kind === 'archive' || location.dataRootRelativePath.includes(`${VSCODE_RUNTIME_ARCHIVES_DIRECTORY}/`)) {

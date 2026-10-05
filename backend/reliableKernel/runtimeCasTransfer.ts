@@ -5,6 +5,11 @@ import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { requireCasObjectIdentity, type CasObjectIdentity } from './casObjectAccess';
 import { looseCasObjectLocation } from './looseCasObjectAccess';
+import { RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
+import type { HistoricalRootBinding } from './rootAuthority';
+import type { CasStoreAccess } from './runtimeCasAccess';
+import { PackedCasWorkerClient } from './packedCasWorkerClient';
+import { PACKED_CAS_FILE } from './packedCasWorkerProtocol';
 import type { RuntimeCasVerifier as CasVerification } from './runtimeCasVerificationCache';
 import { knownDiskDevice } from './runtimeDataSetLargeMergeSpace';
 
@@ -16,8 +21,25 @@ export interface CasObjectReadHandle {
 
 /** Copy-only capability: safe located readers never expose a hard-link optimization. */
 export interface CasTransferSource {
+  /** Explicit packed capability; absence denotes the historical loose-only source contract. */
+  readPackedBytes?(object: CasObjectIdentity): Promise<Buffer | undefined>;
   size(object: CasObjectIdentity): Promise<bigint | undefined>;
   open(object: CasObjectIdentity): Promise<CasObjectReadHandle>;
+}
+
+export interface CasTransferOptions {
+  verified: CasVerification;
+  verifyOnly?: boolean;
+  sourceObjects?: CasTransferSource;
+  sourceAccess?: CasStoreAccess;
+  /** Borrowed private packed reader, owned by the metadata snapshot being transferred. */
+  sourcePacked?: CasPackedSource;
+  targetAccess?: CasStoreAccess;
+  linkFile?: (from: string, to: string) => Promise<void>;
+}
+
+export interface CasPackedSource {
+  readBytes(object: CasObjectIdentity): Promise<Buffer | undefined>;
 }
 
 export class CasTransferError extends Error {
@@ -31,8 +53,8 @@ export const RUNTIME_DATA_SET_CAS_COPY_SUFFIX = '.merge.tmp';
 const CAS_COPY_SUFFIX = RUNTIME_DATA_SET_CAS_COPY_SUFFIX;
 
 /**
- * Logical transfer boundary. All filesystem publication, link optimization and verification-cache
- * identities stay in this loose backend. Callers page identities and retain their existing fences.
+ * Logical transfer boundary. Packed bodies use the root worker; legacy loose publication, link
+ * optimization and physical verification-cache identities remain inside this adapter.
  */
 export class LocalCasTransferSession {
   private readonly sourceCas: string;
@@ -42,13 +64,11 @@ export class LocalCasTransferSession {
   private temporaryUsed = false;
   private readonly verified: CasVerification;
   private readonly link: (from: string, to: string) => Promise<void>;
+  private targetPacked?: PackedCasWorkerClient;
+  private closed = false;
+  private closing = false;
 
-  public constructor(sourceCas: string, targetCas: string, private readonly options: {
-    verified: CasVerification;
-    verifyOnly?: boolean;
-    sourceObjects?: CasTransferSource;
-    linkFile?: (from: string, to: string) => Promise<void>;
-  }) {
+  private constructor(sourceCas: string, targetCas: string, private readonly options: CasTransferOptions) {
     this.sourceCas = path.resolve(sourceCas);
     this.targetCas = path.resolve(targetCas);
     this.temporaryRoot = path.join(this.targetCas, 'tmp');
@@ -56,13 +76,39 @@ export class LocalCasTransferSession {
     this.link = options.linkFile ?? ((from, to) => fs.link(from, to));
   }
 
+  public static async open(source: HistoricalRootBinding, target: HistoricalRootBinding, options: CasTransferOptions): Promise<LocalCasTransferSession> {
+    const session = new LocalCasTransferSession(source.paths.casRootPath, target.paths.casRootPath, options);
+    try {
+      // A source without a Runtime Host must provide a private snapshot owner. Opening its real
+      // sidecar here could outlive the source claim and race root relocation or removal.
+      if (!options.sourceObjects && !options.sourceAccess && !options.sourcePacked && source.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+        throw new Error('Current-epoch CAS transfer requires a source Runtime owner or private packed snapshot.');
+      }
+      if (!options.targetAccess && target.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+        session.targetPacked = await PackedCasWorkerClient.open(target as RootBinding, { readOnly: options.verifyOnly });
+      }
+      return session;
+    } catch (error) {
+      await session.close();
+      throw error;
+    }
+  }
+
   /** The pre-copy space proof never reads or hashes a body, and counts only absent locations. */
-  public needsCopy(object: CasObjectIdentity): boolean {
+  public async needsCopy(object: CasObjectIdentity): Promise<boolean> {
+    this.assertOpen();
+    if (await this.targetPackedLength(object) !== undefined) return false;
     return lstatSync(looseCasObjectLocation(this.targetCas, object).absolutePath, { throwIfNoEntry: false }) === undefined;
   }
 
   public async transfer(object: CasObjectIdentity): Promise<'reused' | 'copied' | 'linked' | 'verified'> {
+    this.assertOpen();
     const row = requireCasObjectIdentity(object);
+    // A present packed row is authoritative and verifies only this bounded body. Corruption must
+    // not fall through to an unrelated loose copy or overwrite the row.
+    const packedTarget = this.options.targetAccess
+      ? await this.options.targetAccess.readPackedBytes(row) : await this.targetPacked?.readBytes(row);
+    if (packedTarget !== undefined) return 'reused';
     const target = looseCasObjectLocation(this.targetCas, row);
     const targetFile = target.absolutePath;
     const verified = this.verified;
@@ -82,6 +128,15 @@ export class LocalCasTransferSession {
       kind: 'failed', code: 'runtime-data-set-merge-source-cas-invalid', message: `来源缺少正文文件或内容与摘要不符：${row.storage_key}。`
     });
     const objects = this.options.sourceObjects;
+    const packedSource = objects ? await objects.readPackedBytes?.(row)
+      : this.options.sourceAccess ? await this.options.sourceAccess.readPackedBytes(row) : await this.options.sourcePacked?.readBytes(row);
+    if (packedSource !== undefined) {
+      if (this.options.verifyOnly) return 'verified';
+      if (this.options.targetAccess) await this.options.targetAccess.publishBatch([{ object: row, bytes: packedSource }], () => undefined);
+      else if (this.targetPacked) await this.targetPacked.publishBatch([{ object: row, bytes: packedSource }]);
+      else throw new Error('A packed CAS body requires a current-epoch target owner.');
+      return 'copied';
+    }
     if (objects) {
       if (await objects.size(row) !== row.byte_length) throw invalid();
       if (this.options.verifyOnly) {
@@ -130,7 +185,23 @@ export class LocalCasTransferSession {
   }
 
   public async close(): Promise<void> {
+    if (this.closed) return;
+    this.closing = true;
     if (this.temporaryUsed) await syncDirectoryDurably(this.temporaryRoot).catch(() => undefined);
+    // Borrowed Runtime owners remain open. A failed close keeps this session retryable and fenced.
+    await this.targetPacked?.close();
+    this.closed = true;
+  }
+
+  private assertOpen(): void {
+    if (this.closing || this.closed) throw new Error('CAS transfer session is closed.');
+    this.options.sourceAccess?.assertUsable();
+    this.options.targetAccess?.assertUsable();
+  }
+
+  private targetPackedLength(object: CasObjectIdentity): Promise<bigint | undefined> {
+    return this.options.targetAccess ? this.options.targetAccess.inspectPackedByteLength(object)
+      : this.targetPacked?.inspectByteLength(object) ?? Promise.resolve(undefined);
   }
 
   private async prepareTarget(targetFile: string): Promise<void> {
@@ -148,9 +219,30 @@ export class LocalCasTransferSession {
 
 /** Loose stores may link on the same known disk; copy-only sources bypass this optimization. */
 export async function casTransferCanLinkRoots(sourceCas: string, targetCas: string): Promise<boolean> {
+  // A mutable SQLite container is never linked. Counting every logical body as a copy is a
+  // conservative estimate for mixed roots and does not inventory or hash packed objects.
+  if (await fs.lstat(path.join(sourceCas, PACKED_CAS_FILE)).then(() => true, (error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return false;
+    throw error;
+  })) return false;
   const [source, target] = await Promise.all([sourceCas, targetCas]
     .map((directory) => fs.stat(directory).then((info) => knownDiskDevice(info.dev), () => undefined)));
   return source !== undefined && source === target;
+}
+
+/** Physical packed-copy allowance, including SQLite staging files; never reads or hashes bodies. */
+export async function casTransferPackedStorageBytes(casRoot: string): Promise<number> {
+  let bytes = 0;
+  for (const suffix of ['', '-wal', '-shm']) {
+    const info = await fs.lstat(path.join(casRoot, `${PACKED_CAS_FILE}${suffix}`)).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (!info) continue;
+    if (!info.isFile()) throw new Error('Packed CAS storage must consist of regular files.');
+    bytes += info.size;
+  }
+  return bytes;
 }
 
 /**
@@ -326,4 +418,3 @@ async function sha256File(file: string): Promise<string> {
   for await (const chunk of createReadStream(file)) hash.update(chunk as Buffer);
   return hash.digest('hex');
 }
-

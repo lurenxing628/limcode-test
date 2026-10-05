@@ -279,7 +279,7 @@ async function withRuntimeFixture(run) {
   try {
     const candidate = await kernel.resetCandidateRuntimeRoot(directory);
     database = await kernel.RuntimeDatabase.open(candidate.authority);
-    const store = new kernel.ContentAddressedStore(candidate.authority, candidate.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(candidate.authority, database);
     const prepared = await store.prepare(database, 'node batch fixture', 'text/plain');
     const content = { ...prepared.metadata, created_at: NOW };
     const insert = (domain, row) => DOMAIN_REPOSITORIES.domain(domain).insert(row);

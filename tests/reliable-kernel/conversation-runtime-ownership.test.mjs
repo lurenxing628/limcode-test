@@ -401,7 +401,7 @@ test('pending-work 判定边界：超过 25 条来源记录不得遮蔽更旧的
   let database;
   try {
     database = await openObserverDatabase(binding, 'work-probe-host');
-    const store = new kernel.ContentAddressedStore(authority, binding);
+    const store = kernel.ContentAddressedStore.loose(authority, binding);
     const conversationId = 'conversation-work-probe';
     const now = new Date().toISOString();
     const hasWork = () => database.hasConversationRuntimeWork(conversationId);

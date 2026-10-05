@@ -140,7 +140,7 @@ test('worker mutation rollback evicts proofs and maintenance instances never pub
   const candidate = await api.resetCandidateRuntimeRoot(dir); let database;
   t.after(async () => { await database?.close(); fs.rmSync(dir, { recursive: true, force: true }); });
   database = await api.RuntimeDatabase.open(candidate.authority, { hostBootId: 'scope-test' });
-  const store = new api.ContentAddressedStore(candidate.authority, candidate.binding);
+  const store = api.ContentAddressedStore.forDatabase(candidate.authority, database);
   const content = await store.ingest(database, 'fixture', 'text/plain');
   const repo = name => api.DOMAIN_REPOSITORIES.domain(name);
   await database.transaction([

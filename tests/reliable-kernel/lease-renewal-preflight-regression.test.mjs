@@ -19,7 +19,7 @@ test('renewal does not wait for a host snapshot preflight that consumes its leas
   await kernel.initializeEmptyRuntimeRoot(authority);
   const binding = await authority.current();
   const database = await kernel.RuntimeDatabase.open(authority, { hostBootId: 'lease-regression-host' });
-  const store = new kernel.ContentAddressedStore(authority, binding);
+  const store = kernel.ContentAddressedStore.forDatabase(authority, database);
   let elapsed = 10000;
   const turns = new kernel.TurnControlPlane(database, store, {
     now: () => iso(elapsed),

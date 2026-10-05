@@ -26,7 +26,7 @@ async function fixture(run) {
     const authority = new kernel.RootAuthority(() => path.join(temporary, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(authority);
     database = await kernel.RuntimeDatabase.open(authority);
-    const store = new kernel.ContentAddressedStore(authority, database.binding);
+    const store = kernel.ContentAddressedStore.forDatabase(authority, database);
     const effects = new kernel.EffectControlPlane(database, store);
     const files = new kernel.FileChangeControlPlane(database, store, effects);
     const now = new Date().toISOString();

@@ -264,7 +264,7 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
 
 /**
  * First selection when no explicit choice exists (an upgrade from per-workspace versions). Only
- * data sets that pass the read-only upgrade preflight (recognized epoch 3/4/5/6, exact schema and
+ * data sets that pass the read-only upgrade preflight (recognized epoch 3/4/5/6/7/8/9, exact schema and
  * physical fingerprint, quick_check for the published 3/4 formats, no pending recovery, no recorded
  * merge failure for the same content) are eligible. The fixed default root with a complete
  * RootBinding wins; otherwise the historical workspace scope whose SQLite changed last. Every other
@@ -726,13 +726,21 @@ async function validateCandidateEpoch(binding: HistoricalRootBinding, pending?: 
   // An exact published predecessor can write the current epoch manifest immediately before
   // publishing its pending pointer. Candidate selection must preserve that recovery window.
   if (
-    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7 || binding.runtimeKernelEpoch === 8)
+    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7 || binding.runtimeKernelEpoch === 8 || binding.runtimeKernelEpoch === 9)
     && pending?.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH
     && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId
     && pending.rootGeneration === binding.rootGeneration + 1
     && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
   ) return;
-  // Published 3/4/5/6/7→8 boundaries retain their exact old target before the independent →9 upgrade.
+  // Published 3/4/5/6/7/8→9 boundaries retain their original target before the independent →10 upgrade.
+  if (
+    (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7 || binding.runtimeKernelEpoch === 8)
+    && pending?.runtimeKernelEpoch === 9
+    && pending.dataSetId === binding.dataSetId && pending.rootInstanceId === binding.rootInstanceId
+    && pending.rootGeneration === binding.rootGeneration + 1
+    && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
+  ) return;
+  // Published 3/4/5/6/7→8 boundaries retain their exact old target before the independent →10 upgrade.
   if (
     (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6 || binding.runtimeKernelEpoch === 7)
     && pending?.runtimeKernelEpoch === 8
@@ -740,7 +748,7 @@ async function validateCandidateEpoch(binding: HistoricalRootBinding, pending?: 
     && pending.rootGeneration === binding.rootGeneration + 1
     && pending.pointerRevision === binding.pointerRevision + 1 && matches(pending)
   ) return;
-  // Published 3/4/5/6→7 boundaries retain their exact old target before the independent →9 upgrade.
+  // Published 3/4/5/6→7 boundaries retain their exact old target before the independent →10 upgrade.
   if (
     (binding.runtimeKernelEpoch === 3 || binding.runtimeKernelEpoch === 4 || binding.runtimeKernelEpoch === 5 || binding.runtimeKernelEpoch === 6)
     && pending?.runtimeKernelEpoch === 7

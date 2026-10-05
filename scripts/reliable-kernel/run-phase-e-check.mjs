@@ -372,6 +372,10 @@ async function checkContextStorageGrowth() {
     for (let index = 0; index < 200; index += 1) await appendOne(index);
     let forbiddenHistoryReads = 0;
     let ordinarySnapshotAllCalls = 0;
+    const boundedOwnershipReads = new Map();
+    const boundedOwnershipTasks = [];
+    assert.ok(kernel.RUNTIME_DOMAIN_SCHEMAS.find((schema) => schema.key === 'ExecutionLease')
+      .indexes.includes('conversation_id UNIQUE'));
     const ordinaryReads = [];
     const originalSnapshot = ctx.database.snapshot.bind(ctx.database);
     const originalSnapshotAll = ctx.database.snapshotAll.bind(ctx.database);
@@ -384,8 +388,28 @@ async function checkContextStorageGrowth() {
       return originalSnapshot(reads);
     };
     ctx.database.snapshotAll = async (read) => {
-      ordinarySnapshotAllCalls += 1;
       ordinaryReads.push(read);
+      if (read.domain === 'ExecutionLease') {
+        // The commit-triggered ownership sweep may overlap the append. Its UNIQUE conversation
+        // lookup returns at most one row; it still counts against the same total read budget.
+        const task = (async () => {
+          assert.deepEqual(read, {
+            kind: 'list', domain: 'ExecutionLease', where: { conversation_id: seeded.conversationId },
+            orderBy: { column: 'id', direction: 'asc' }, limit: 1000
+          });
+          const measurement = { rows: null, durationMs: null };
+          boundedOwnershipReads.set(read, measurement);
+          const started = performance.now();
+          const result = await originalSnapshotAll(read);
+          assert.ok(result.snapshot.length <= 1, 'UNIQUE conversation ownership lookup returned multiple rows');
+          measurement.rows = result.snapshot.length;
+          measurement.durationMs = performance.now() - started;
+          return result;
+        })();
+        boundedOwnershipTasks.push(task);
+        return task;
+      }
+      ordinarySnapshotAllCalls += 1;
       return originalSnapshotAll(read);
     };
     ctx.database.materializeContext = async (...args) => { forbiddenHistoryReads += 1; return originalMaterialize(...args); };
@@ -401,6 +425,8 @@ async function checkContextStorageGrowth() {
     ));
     ordinarySnapshotAllCalls = 0;
     ordinaryReads.length = 0;
+    boundedOwnershipReads.clear();
+    boundedOwnershipTasks.length = 0;
     let appendCommit;
     const unsubscribe = ctx.database.onCommit((commit) => { appendCommit = commit; });
     const lower = [];
@@ -414,11 +440,13 @@ async function checkContextStorageGrowth() {
     ctx.database.materializeContextContent = originalMaterializeContent;
     ctx.store.read = originalRead;
     ctx.store.readMany = originalReadMany;
+    await Promise.all(boundedOwnershipTasks);
     assert.equal(forbiddenHistoryReads, 0, 'ordinary append must not materialize/read/hash historical Context content');
     assert.equal(ordinarySnapshotAllCalls, 0, 'ordinary append must not request an unbounded Repository snapshot');
     assert.ok(ordinaryReads.length <= 20, `ordinary append issued ${ordinaryReads.length} Repository reads`);
     let sawCurrentHeadUniquenessProbe = false;
     for (const read of ordinaryReads) {
+      if (boundedOwnershipReads.has(read)) continue; // Exact query and returned cardinality checked above.
       if (read.kind !== 'list') continue;
       if (read.domain === 'ConversationContextHeadLink' && read.limit === 2) {
         // Current handle state reads one extra row to reject duplicate heads for this conversation.
@@ -552,6 +580,7 @@ async function checkContextStorageGrowth() {
       contextCasCache: workerDiagnostics.contextCasCache,
       ordinaryAppendHistoricalReads: forbiddenHistoryReads,
       ordinaryAppendRepositoryReads: ordinaryReads.length,
+      ordinaryAppendOwnershipProbes: [...boundedOwnershipReads.values()],
       longHistoryWriteBytes,
       longHistoryWriteLimit
     };
@@ -3526,7 +3555,7 @@ async function withRuntime(label, body) {
 async function reopen(ctx, hostBootId) {
   if (ctx.database) throw new Error('Runtime database must be closed before reopen.');
   ctx.database = await kernel.RuntimeDatabase.open(ctx.authority, { hostBootId });
-  ctx.store = new kernel.ContentAddressedStore(ctx.authority, ctx.binding);
+  ctx.store = kernel.ContentAddressedStore.forDatabase(ctx.authority, ctx.database);
 }
 
 async function closeAndCheckpoint(ctx) {

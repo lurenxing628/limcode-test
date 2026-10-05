@@ -370,7 +370,7 @@ async function withDataSet(dataSet, operation) {
 /** Conversations with two messages each; ids are fixed, so seeding the same id elsewhere gives the same history ids. */
 async function seed(dataSet, conversationIds, project = PROJECT) {
   await withDataSet(dataSet, async (runtime) => {
-    const store = new kernel.ContentAddressedStore(dataSet.authority, runtime.binding);
+    const store = kernel.ContentAddressedStore.loose(dataSet.authority, runtime.binding);
     for (const id of conversationIds) {
       const turnId = `${id}_turn`;
       const steps = [

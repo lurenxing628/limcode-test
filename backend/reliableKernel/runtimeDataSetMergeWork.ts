@@ -56,7 +56,7 @@ export async function finalizeUnfinishedWork(
 ): Promise<void> {
   const database = await RuntimeDatabase.open(authority, { hostBootId: `merge-finalize-${randomUUID()}` });
   try {
-    const contentStore = new ContentAddressedStore(authority, database.binding);
+    const contentStore = ContentAddressedStore.forDatabase(authority, database);
     const authorityCompiler: TurnAuthorityCompiler = {
       compile: async () => { throw new Error('Merge finalization never starts a Turn.'); }
     };

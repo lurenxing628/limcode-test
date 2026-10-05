@@ -21,7 +21,7 @@ test('frozen tools retain ordered immutable CAS identity across reuse/reopen and
   let database = await kernel.RuntimeDatabase.open(authority, { hostBootId: 'frozen-tools-first' });
   try {
     let ingests = 0;
-    const store = new kernel.ContentAddressedStore(authority, binding);
+    const store = kernel.ContentAddressedStore.forDatabase(authority, database);
     const ingest = store.ingest.bind(store);
     store.ingest = (...args) => { ingests += 1; return ingest(...args); };
     const input = [{ name: 'b', description: 'B', parameters: { enum: ['first', 'second'] },
@@ -74,7 +74,7 @@ test('frozen tools retain ordered immutable CAS identity across reuse/reopen and
     await assert.rejects(resolveFrozenToolDefinitions(database, store, recipe), /closed/);
     await assert.rejects(freezeToolDefinitions(database, store, tools), /closed/);
     database = await kernel.RuntimeDatabase.open(authority, { hostBootId: 'frozen-tools-reopened' });
-    const reopenedStore = new kernel.ContentAddressedStore(authority, binding);
+    const reopenedStore = kernel.ContentAddressedStore.forDatabase(authority, database);
     const restored = await resolveFrozenToolDefinitions(database, reopenedStore, JSON.parse(JSON.stringify(recipe)));
     assert.deepEqual(restored, tools);
     const registered = (await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('ContentObject').get(reference.contentObjectId)])).snapshot[0];

@@ -388,6 +388,7 @@ function classifyControlRootPath(control: string, dataRootPath: string, filePath
     || controlRelative[0] === 'history-repair-backups') return 'historicalBackups';
   const relative = path.relative(dataRootPath, filePath).split(path.sep);
   if (relative.length === 1 && ['limcode.sqlite', 'limcode.sqlite-wal', 'limcode.sqlite-shm', 'limcode.sqlite-journal'].includes(relative[0])) return 'sqlite';
+  // Both physical tiers, including packed SQLite WAL/SHM, count as CAS in the existing walk.
   if (relative[0] === 'cas') return relative[1] === 'tmp' ? 'casTemporary' : 'cas';
   if (relative[0] === 'process-spool') return 'processSpool';
   if (relative[0] === 'diagnostics') return 'diagnostics';
