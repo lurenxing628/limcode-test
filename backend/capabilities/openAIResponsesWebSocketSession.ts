@@ -1575,6 +1575,7 @@ function hasMeaningfulChunk(chunk: LimCodeOpenAIResponsesStreamChunk): boolean {
     || chunk.reasoningItemDone === true
     || !!chunk.outputItemDone
     || !!chunk.completedContent
+    || (chunk.completedContents?.length ?? 0) > 0
     || !!chunk.nativeEvent;
 }
 

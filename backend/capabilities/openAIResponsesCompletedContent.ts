@@ -12,7 +12,11 @@ const installedFormats = new WeakSet<object>();
  * This adds a final aggregate only. It never fabricates deltas, native events or item-close
  * facts; the native decoder keeps sole ownership of those identities and admission rules.
  */
-export function installOpenAIResponsesCompletedContent<T>(provider: T, providerKind: LlmProviderKind): T {
+export function installOpenAIResponsesCompletedContent<T>(
+  provider: T,
+  providerKind: LlmProviderKind,
+  options: { visibleTextOnly?: boolean } = {}
+): T {
   if (providerKind !== 'openai-responses') return provider;
   const format = (provider as T & { format?: {
     decodeResponse?: (raw: unknown) => unknown;
@@ -41,7 +45,14 @@ export function installOpenAIResponsesCompletedContent<T>(provider: T, providerK
       throw new Error('OpenAI Responses completed output did not decode to canonical content.');
     }
     if (isRecord(state)) completedStates.add(state);
-    return { ...chunk, completedContents: [decoded.content] };
+    // Summary-only WS requests need final visible text independently of the session's
+    // stricter continuation proof. Never turn terminal-only reasoning/signatures or opaque
+    // provider items into continuation authority, or copy them into this summary aggregate.
+    const content = options.visibleTextOnly ? { role: 'model', parts: decoded.content.parts
+      .filter((part): part is Record<string, unknown> => isRecord(part)
+        && typeof part.text === 'string' && part.thought !== true)
+      .map(part => ({ text: part.text })) } : decoded.content;
+    return { ...chunk, completedContents: [content] };
   };
   installedFormats.add(format);
   return provider;

@@ -15,6 +15,7 @@ import { createTerminalValidatedFetch, type ResponsesTerminalEvidence } from './
 import { createLlmStreamEventBatcher } from './llmStreamEventBatcher';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from './openAIResponsesWebSocketIdentity';
 import { installProviderCompatibility } from './geminiProviderAdaptation';
+import { installOpenAIResponsesCompletedContent } from './openAIResponsesCompletedContent';
 import { adaptClaudeThinkingForFamily, claudeThinkingFamilyProfile, type ClaudeThinkingFamilyProfile } from './claudeThinkingAdaptation';
 import {
   adaptGpt6NoneCapableGenerationConfig,
@@ -4797,7 +4798,12 @@ async function* createSummaryWebSocketStream(
     outputFormat: 'unified',
     stream: true
   });
-  const format = new resolved.unified.OpenAIResponsesFormat(resolved.settings.model) as OpenAIResponsesFormatAdapter;
+  // This isolated summary format is not the trusted continuation projector. Only canonical
+  // visible terminal text is exposed here; the session still independently validates all
+  // continuation identities and reasoning signatures before reusing a provider baseline.
+  const { format } = installOpenAIResponsesCompletedContent({
+    format: new resolved.unified.OpenAIResponsesFormat(resolved.settings.model) as OpenAIResponsesFormatAdapter
+  }, 'openai-responses', { visibleTextOnly: true });
   const { streamOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
   yield* streamOpenAIResponsesWebSocketSession({
     sessionKey: resolved.webSocketSessionKey,
