@@ -44,6 +44,7 @@ import {
 } from './turnReminderProjection';
 import { modelHandleRef, prepareModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import { expandTextCompressionSources } from './compressionSourceReplay';
+import { assertCopiedProjection } from './historicalCompressionHandleCatalog';
 import {
   estimateRequestAuthorityTokens,
   ReliableContextTokenEstimator
@@ -948,11 +949,16 @@ export class ModelProviderControlPlane {
     if (frozenModel.providerId !== request.provider_id || frozenModel.modelId !== request.model_id) {
       throw new Error('Persisted ModelRequest provider/model no longer matches its frozen AuthoritySnapshot.');
     }
-    const providerSegments = compressionRequestSegments(
-      recipe,
-      requireId(projection.root_id, 'ModelContextProjection.root_id'),
-      materialized.segments
-    );
+    let compressionSourceRootId = requireId(projection.root_id, 'ModelContextProjection.root_id');
+    if (isRecord(recipe) && recipe.kind === 'reliable-context-compression' && recipe.sourceRootId !== compressionSourceRootId) {
+      const originalRootId = requireId(recipe.sourceRootId, 'Compression recipe.sourceRootId');
+      // A copied projection is re-homed, while the recipe keeps its immutable original root.
+      // Reuse the historical reader's exact fork timestamp, root shape and ordered-source proof.
+      await assertCopiedProjection(this.database, this.contentStore, contextConversationId, originalRootId,
+        await this.context.materializeStructure(compressionSourceRootId));
+      compressionSourceRootId = originalRootId;
+    }
+    const providerSegments = compressionRequestSegments(recipe, compressionSourceRootId, materialized.segments);
     const requestCreatedAt = domainTimestampMs(request.created_at);
     const requestAddenda = withTurnReminderHistory(
       await this.materializeRequestAddenda(recipe, requireId(request.turn_id, 'ModelRequest.turn_id')),
@@ -2804,7 +2810,7 @@ export class ModelProviderControlPlane {
   /** Copied recipes keep original input ids. Shared immutable segment provenance proves the
    * target Turn's exact copied revision even after its source Message and Conversation are gone.
    * Read neither a current revision nor a same-content substitute: revision ordinal, segment and
-   * CAS identity must all agree. Every lookup is bounded by an existing identity index.
+   * CAS identity must all agree. Results are bounded; the input lookup uses the Turn index prefix.
    */
   private async assertCopiedCurrentTurnInput(turnId: string, originalRevisionId: string, contentObjectId: string): Promise<void> {
     const evidence = await this.database.snapshot([

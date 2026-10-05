@@ -337,7 +337,7 @@ async function readPublishedProjectionlessCopy(database: RuntimeDatabase, store:
   return { structure, sourceConversationId: source };
 }
 
-async function assertCopiedProjection(database: RuntimeDatabase, store: ContentAddressedStore,
+export async function assertCopiedProjection(database: RuntimeDatabase, store: ContentAddressedStore,
   conversationId: string, originalRootId: string,
   target: { root: DomainRow; records: StructuralContextRecord[] }): Promise<void> {
   const branches = await listAllDomainRows(database, 'ConversationBranchLink', { target_conversation_id: conversationId });
