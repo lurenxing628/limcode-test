@@ -864,14 +864,15 @@ for (const nativeEnabled of [false, true]) {
         assert.equal(fixture.wireRequests.length, 1, 'the actual LLM capability is reached once');
         const frozen = await fixture.frozenRecipe(first.modelRequestIds[0]);
         assert.deepEqual(frozen, fixture.fullRequests[0].recipe, 'provider receives the persisted immutable recipe');
-        assert.equal(frozen.modelHandleCatalog.identityContractRevision, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION);
-        assert.deepEqual(frozen.modelHandleCatalog.retiredRefs, ['P1']);
-        assert.equal(modelHandleTarget(frozen.modelHandleCatalog, 'process', 'P1'), undefined);
+        const catalog = fixture.fullRequests[0].resolvedModelHandleCatalog;
+        assert.equal(catalog.identityContractRevision, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION);
+        assert.deepEqual(catalog.retiredRefs, ['P1']);
+        assert.equal(modelHandleTarget(catalog, 'process', 'P1'), undefined);
         for (const target of ['historical-process-a', 'historical-process-b']) {
-          assert.ok(ordinal(modelHandleRef(frozen.modelHandleCatalog, 'process', target)) > 1);
+          assert.ok(ordinal(modelHandleRef(catalog, 'process', target)) > 1);
         }
-        assert.equal(frozen.modelHandleCatalog.allocationHighWater.process,
-          Math.max(...frozen.modelHandleCatalog.entries.filter(entry => entry.kind === 'process').map(entry => ordinal(entry.ref))),
+        assert.equal(catalog.allocationHighWater.process,
+          Math.max(...catalog.entries.filter(entry => entry.kind === 'process').map(entry => ordinal(entry.ref))),
           'bootstrap already reserves its repaired assignments before the first ordinary request');
         const system = fixture.wireRequests[0].systemInstruction.parts.map(part => part.text ?? '').join('\n');
         assert.match(system, /Retired historical references: P1/);
@@ -888,7 +889,7 @@ for (const nativeEnabled of [false, true]) {
         assert.equal(fixture.fullRequests.length, 2);
         assert.equal(fixture.wireRequests.length, 2, 'the next input sends once after reopening the same Runtime root');
         const next = await fixture.frozenRecipe(second.modelRequestIds[0]);
-        assert.deepEqual(next.modelHandleCatalog, frozen.modelHandleCatalog);
+        assert.deepEqual(fixture.fullRequests[1].resolvedModelHandleCatalog, catalog);
         if (nativeEnabled) {
           assert.equal(next.nativeReasoning.forceFullReason, undefined, 'repair does not reset every native round');
           assert.notEqual(next.nativeReasoning.resetCache, true);
@@ -918,8 +919,8 @@ test('production request progression reuses historical identity proofs across lo
     };
     for (let round = 0; round < 5; round++) {
       const result = await fixture.continueConversation(`cache-progress-${round}`);
-      const frozen = await fixture.frozenRecipe(result.modelRequestIds[0]);
-      assert.deepEqual(frozen.modelHandleCatalog.retiredRefs, ['P1']);
+      const request = fixture.fullRequests.find(request => request.modelRequestId === result.modelRequestIds[0]);
+      assert.deepEqual(request.resolvedModelHandleCatalog.retiredRefs, ['P1']);
     }
     assert.equal(fixture.wireRequests.length, 6, 'six real inputs create and complete six distinct model requests');
     assert.equal(oldRequestScans, 0, 'new turns/requests are observed from local commits without rescanning old turns');
