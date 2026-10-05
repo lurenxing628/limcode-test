@@ -1,15 +1,19 @@
 import * as vscode from 'vscode';
 import type { ApplicationFacade } from '../ApplicationFacade';
 import type { GlobalSettingsSection } from '../../shared/protocol';
-import { SETTINGS_ROOT_DIR } from '../../backend/capabilities/vscodeStorage/constants';
+import { INDEX_FILE, RECORDS_DIR, SETTINGS_ROOT_DIR } from '../../backend/capabilities/vscodeStorage/constants';
 import { LIMCODE_GLOBAL_STATUS_FILE } from '../../backend/capabilities/vscodeStorage/globalStatus';
 
-/** 每个递归监听都从自己的小目录开始，避免扫描整个插件数据目录。 */
+// Snapshot reads also create lock owner.json files. Watch only durable store files so a
+// refresh cannot observe its own read lock and schedule another refresh indefinitely.
+const RECORD_STORE_WATCH_PATTERN = `{${INDEX_FILE},${RECORDS_DIR}/*.json}`;
+
+/** 每个监听都从自己的小目录开始，避免扫描整个插件数据目录和锁文件。 */
 const GLOBAL_SETTINGS_WATCH_SPECS = [
   { baseSegments: [], pattern: '{llm,llm-compression,appearance,attachments,checkpoint-maintenance,debug-capture}.json' },
-  { baseSegments: ['llm-provider-configs'], pattern: '**/*.json' },
-  { baseSegments: ['llm-compression-configs'], pattern: '**/*.json' },
-  { baseSegments: ['mcp-servers'], pattern: '**/*.json' }
+  { baseSegments: ['llm-provider-configs'], pattern: RECORD_STORE_WATCH_PATTERN },
+  { baseSegments: ['llm-compression-configs'], pattern: RECORD_STORE_WATCH_PATTERN },
+  { baseSegments: ['mcp-servers'], pattern: RECORD_STORE_WATCH_PATTERN }
 ] as const;
 
 const FILE_NAME_SECTIONS: Record<string, GlobalSettingsSection> = {
@@ -104,5 +108,11 @@ export function sectionFromSettingsUri(uri: vscode.Uri): GlobalSettingsSection |
   if (settingsIndex < 0) return undefined;
   const rest = segments.slice(settingsIndex + 1);
   if (rest.length === 1) return FILE_NAME_SECTIONS[rest[0]];
-  return rest.length > 1 ? DIRECTORY_SECTIONS[rest[0]] : undefined;
+  const section = DIRECTORY_SECTIONS[rest[0]];
+  if (!section) return undefined;
+  if (rest.length === 2 && rest[1] === INDEX_FILE) return section;
+  // Keep this boundary aligned with recordStore's direct records/<filename>.json layout.
+  if (rest.length === 3 && rest[1] === RECORDS_DIR
+    && rest[2].toLowerCase().endsWith('.json') && !rest[2].includes('\\')) return section;
+  return undefined;
 }
