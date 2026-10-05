@@ -35,13 +35,85 @@ async function fixture(run) {
   } finally { await database.close(); await fs.rm(root, { recursive: true, force: true }); }
 }
 
+async function nativeLooseIdentityDiagnostic(binding, object, bytes) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(`
+      const { parentPort, workerData } = require('node:worker_threads');
+      const fs = require('node:fs');
+      const { PackedCasStore } = require(workerData.module);
+      const fields = info => Object.fromEntries([
+        ...['dev', 'ino', 'size', 'mtimeNs', 'ctimeNs', 'mode'].map(key => [key, String(info[key])]),
+        ['devHex', info.dev.toString(16)], ['inoHex', info.ino.toString(16)], ['isFile', info.isFile()]
+      ]);
+      (async () => {
+        const trace = [], descriptors = new Set();
+        const original = { statSync: fs.statSync, fstatSync: fs.fstatSync, openSync: fs.openSync };
+        const record = (api, info) => { if (trace.length < 8) trace.push({ api, ...fields(info) }); return info; };
+        const store = new PackedCasStore(workerData.binding);
+        let publication;
+        try {
+          fs.statSync = (file, ...args) => {
+            const info = original.statSync(file, ...args);
+            return file === workerData.file ? record('statSync', info) : info;
+          };
+          fs.openSync = (file, ...args) => {
+            const descriptor = original.openSync(file, ...args);
+            if (file === workerData.file) descriptors.add(descriptor);
+            return descriptor;
+          };
+          fs.fstatSync = (descriptor, ...args) => {
+            const info = original.fstatSync(descriptor, ...args);
+            return descriptors.has(descriptor) ? record('fstatSync', info) : info;
+          };
+          store.publishBatch([{ object: workerData.object, bytes: Buffer.from(workerData.bytes) }]);
+          publication = { status: 'succeeded' };
+        } catch (error) {
+          publication = { status: 'failed', name: error.name, code: error.code };
+        } finally { Object.assign(fs, original); store.close(); }
+        const asyncProbe = {};
+        try {
+          asyncProbe.before = fields(await fs.promises.stat(workerData.file, { bigint: true }));
+          const handle = await fs.promises.open(workerData.file, 'r');
+          try { asyncProbe.opened = fields(await handle.stat({ bigint: true })); }
+          finally { await handle.close(); }
+          asyncProbe.after = fields(await fs.promises.stat(workerData.file, { bigint: true }));
+        } catch (error) { asyncProbe.error = { name: error.name, code: error.code }; }
+        parentPort.postMessage({ node: process.version, uv: process.versions.uv, platform: process.platform, release: require('node:os').release(),
+          arch: process.arch, expectedBytes: String(workerData.object.byte_length), publication, trace, asyncProbe });
+      })().catch(error => { parentPort.postMessage({ diagnosticError: { name: error.name, code: error.code } }); });
+    `, { eval: true, resourceLimits: { maxOldGenerationSizeMb: 32 }, workerData: {
+      module: path.join(compiled, 'backend/reliableKernel/packedCasStore.js'), binding, object, bytes,
+      file: looseFile(binding, object)
+    } });
+    let message, failure, timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      void worker.terminate().catch(error => { failure = error; });
+    }, 10_000);
+    worker.on('message', value => { message = value; });
+    worker.on('error', error => { failure = error; });
+    worker.on('exit', code => {
+      clearTimeout(timer);
+      if (timedOut || failure || code !== 0) reject(failure ?? new Error(timedOut ? 'CAS diagnostic worker timed out' : `CAS diagnostic worker exited ${code}`));
+      else resolve(message);
+    });
+  });
+}
+
 test('packed CAS preserves identities, boundary bytes, aliases, batch ownership and close fencing', async () => fixture(async f => {
   const store = kernel.ContentAddressedStore.forDatabase(f.authority, f.database);
   const other = kernel.ContentAddressedStore.forDatabase(f.authority, f.database);
   assert.equal(store.byteAccess, other.byteAccess, 'facades borrow one Runtime-owned worker');
   await assert.rejects(fs.stat(packedFile(f.binding)), { code: 'ENOENT' });
   await kernel.ContentAddressedStore.loose(f.authority, f.binding).publish('legacy body', 'text/plain');
-  const legacy = await store.ingest(f.database, 'legacy body', 'text/legacy-alias');
+  const legacy = await store.ingest(f.database, 'legacy body', 'text/legacy-alias').catch(async error => {
+    const bytes = Buffer.from('legacy body');
+    let diagnostic;
+    try { diagnostic = await nativeLooseIdentityDiagnostic(f.binding, store.identity(bytes, 'text/legacy-alias'), bytes); }
+    catch (failure) { diagnostic = { diagnosticError: { name: failure.name, code: failure.code } }; }
+    error.message += '; native loose identity diagnostic: ' + JSON.stringify(diagnostic);
+    throw error;
+  });
   await assert.rejects(fs.stat(packedFile(f.binding)), { code: 'ENOENT' }, 'reusing loose bytes creates no container');
   assert.equal(await fs.readFile(looseFile(f.binding, legacy), 'utf8'), 'legacy body');
 
