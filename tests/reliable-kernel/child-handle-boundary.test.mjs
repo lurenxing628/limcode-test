@@ -79,7 +79,7 @@ test('a fork lists inherited child refs as not operable and names the source whe
     assert.ok(card, 'a fork with only inherited child refs still receives a status card');
     assert.equal(card.totalChildCount, 0);
     assert.deepEqual(card.inheritedChildTargets, [bridge.id]);
-    const ref = first.recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'child' && entry.target === bridge.id).ref;
+    const ref = first.resolvedModelHandleCatalog.entries.find(entry => entry.kind === 'child' && entry.target === bridge.id).ref;
     assert.ok(card.card.split('\n').includes(JSON.stringify({ inheritedChildRefs: [ref], operable: false })), card.card);
 
     const [read] = (await h.rows('ToolCall', { tool_name: 'run_agent' }))
@@ -116,7 +116,7 @@ async function withForkedChildHistory(run) {
     }
     const inherited = request.recipe.runtimeStatusCard?.inheritedChildTargets ?? [];
     if (inherited.length > 0 && count === 1) {
-      const ref = request.recipe.modelHandleCatalog.entries.find(entry => entry.target === inherited[0]).ref;
+      const ref = request.resolvedModelHandleCatalog.entries.find(entry => entry.target === inherited[0]).ref;
       return [{ id: 'read-inherited', functionCall: { name: 'run_agent', args: { operation: 'read', childRef: ref } } }];
     }
     return [{ text: `done ${request.conversationId} ${count}` }];

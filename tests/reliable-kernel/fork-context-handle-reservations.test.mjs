@@ -281,7 +281,7 @@ test('fork excludes discarded branch bindings while copied occurrences survive n
     assert.ok(materialized.segments.every(segment => !segment.content.toString('utf8').includes('old-process')));
     assert.ok(materialized.segments.every(segment => !segment.content.toString('utf8').includes('fork-context-handle-reservations')));
     await h.turn(fork.conversationId, 'fork-new-handles');
-    const next = h.requests.at(-1).recipe.modelHandleCatalog;
+    const next = h.requests.at(-1).resolvedModelHandleCatalog;
     assert.equal((await h.facade.forkConversation(command)).deduplicated, true, 'current head changes do not alter the original fork identity');
     for (const old of sourceCatalog.entries) {
       assert.equal(next.entries.some(entry => entry.kind === old.kind && entry.target === old.target), false,
@@ -301,7 +301,7 @@ test('fork excludes discarded branch bindings while copied occurrences survive n
     await h.reopen();
     assert.deepEqual(identity(await readConversationContextHandleCatalog(h.app.database, h.app.contentStore, nested.conversationId)), identity(beforeNested));
     await h.turn(nested.conversationId, 'nested-continues-after-source-deletion');
-    assert.ok(h.requests.at(-1).recipe.modelHandleCatalog.entries.some(entry => entry.kind === 'process' && entry.target === 'new-process'));
+    assert.ok(h.requests.at(-1).resolvedModelHandleCatalog.entries.some(entry => entry.kind === 'process' && entry.target === 'new-process'));
   }, { script: {
     async configure(configuration) { await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read'] }); },
     definitions: [{ name: 'read', description: 'Synthetic Context identity fixture', parameters: { type: 'object' } }],
@@ -407,7 +407,7 @@ test('child fork freezes source reservations and replay verifies the child origi
       turnId: turnLink.turn_id, ownerId: lease.owner_id, hostBootId: lease.host_boot_id,
       generation: BigInt(lease.generation) }, () => h.app.agentLoop.drive(turnLink.turn_id));
     assert.equal(result.terminalStatus, 'completed');
-    const childCatalog = h.requests.filter(request => request.conversationId === child.child_conversation_id).at(-1).recipe.modelHandleCatalog;
+    const childCatalog = h.requests.filter(request => request.conversationId === child.child_conversation_id).at(-1).resolvedModelHandleCatalog;
     assert.equal(modelHandleTarget(childCatalog, 'process', 'P1'), 'old-process');
     assert.equal(modelHandleTarget(childCatalog, 'process', 'P2'), 'child-own-process');
     assert.deepEqual(await rows(h.app, 'ProcessCompletionSourceLink', { conversation_id: child.child_conversation_id }), []);

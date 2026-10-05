@@ -75,7 +75,7 @@ test('pending peer messages end a native tool loop at its first settled response
         assert.equal(envelope.sourceKind, 'completion');
         assert.match(envelope.note, /not a new user instruction/i);
         const projected = load('backend/reliableKernel/runtimeDeliveryProjection.js').renderRuntimeDeliveryModelEnvelope(
-          envelope, undefined, request.recipe.modelHandleCatalog);
+          envelope, undefined, request.resolvedModelHandleCatalog);
         assert.equal(envelope.delivery, 'completion_reply');
         assert.match(projected, /^\[Collaboration reply from another conversation, not from this conversation's user\. /);
         assert.match(projected, /"messageRef":"M[0-9]+"/);

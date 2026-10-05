@@ -2137,7 +2137,7 @@ test('a fork is told which copied collaboration refs are inherited and which ref
       // is read from the catalog this request was built with.
       const copied = JSON.parse(texts.find(text => text.includes(TASK)).split('\n')[1]);
       envelope = { messageRef: copied.messageRef, senderConversationRef: copied.sender.conversationRef };
-      const conversationRef = id => request.recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'conversation' && entry.target === id)?.ref;
+      const conversationRef = id => request.resolvedModelHandleCatalog.entries.find(entry => entry.kind === 'conversation' && entry.target === id)?.ref;
       refs = { root: conversationRef(ROOT), created: conversationRef(createdId), fork: conversationRef(forkId) };
       return toolsAnswer(call('reply-copied', 'send_conversation_message', { conversationRef: envelope.senderConversationRef, text: 'answer to the copied task', mode: 'message', replyToMessageRef: envelope.messageRef }),
         call('read-copied', 'read_agent_messages', { messageRef: envelope.messageRef }));

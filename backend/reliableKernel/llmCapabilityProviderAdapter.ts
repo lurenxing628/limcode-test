@@ -1,3 +1,4 @@
+import { providerRequestModelHandleCatalog } from './frozenModelHandleCatalog';
 import { completeModelProjection, completeModelProjectionCooperatively, type ModelProjectionWork, type ModelProjectionWorkControls } from './modelProjectionWork';
 import type { LlmCapability } from '../capabilities/types';
 import { openAIResponsesCompactSystemInstruction, resolveOpenAIResponsesNativeToolOutputs } from '../capabilities/llmProvider';
@@ -839,7 +840,7 @@ function toLlmStartRequest(request: FullProviderRequest): LlmStartRequest {
 
 function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWork<LlmStartRequest> {
   const recipe = requireRecord(request.recipe, 'Provider recipe');
-  const modelHandleCatalog = prepareModelHandleCatalog(recipe.modelHandleCatalog);
+  const modelHandleCatalog = prepareModelHandleCatalog(providerRequestModelHandleCatalog(request));
   const authority = requireRecord(request.authoritySnapshot, 'Provider authority snapshot');
   const toolPolicy = authorityToolPolicy(authority);
   const availableTools = normalizeToolDefinitions(recipe.tools)
@@ -1545,7 +1546,7 @@ function compressionContext(
     request.attachmentCatalogState,
     'Compression request attachmentCatalogState'
   );
-  const seededHandleCatalog = prepareModelHandleCatalog(recipe.modelHandleCatalog);
+  const seededHandleCatalog = prepareModelHandleCatalog(providerRequestModelHandleCatalog(request));
   for (const entry of attachmentCatalogState.catalog) {
     requireAttachmentHandle(seededHandleCatalog, entry.attachmentId);
   }

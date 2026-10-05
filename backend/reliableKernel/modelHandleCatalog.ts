@@ -136,9 +136,14 @@ export function buildModelHandleCatalog(
 }
 
 /** Incremental discovery retains handle facts, never the parsed bodies used to discover them. */
+export interface ModelHandleCatalogDelta {
+  addedEntries: ModelHandleEntry[];
+  metadataExtensions: ModelHandleEntry[];
+}
+
 export function createModelHandleCatalogBuilder(
   seededEntries: readonly ModelHandleEntry[] | ReadonlyModelHandleCatalog = []
-): { add(value: unknown): void; finish(): ModelHandleCatalog } {
+): { add(value: unknown): void; finish(): ModelHandleCatalog; delta(): ModelHandleCatalogDelta } {
   const accumulator = createModelHandleCandidateAccumulator(seededEntries);
   const seen = new WeakSet<object>();
   return {
@@ -147,13 +152,14 @@ export function createModelHandleCatalogBuilder(
       collectCandidates(value, candidates, seen);
       for (const candidate of candidates) accumulator.add(candidate);
     },
-    finish: () => accumulator.finish()
+    finish: () => accumulator.finish(),
+    delta: () => accumulator.delta()
   };
 }
 
 function createModelHandleCandidateAccumulator(
   seededEntries: readonly ModelHandleEntry[] | ReadonlyModelHandleCatalog
-): { add(candidate: ModelHandleCandidate): void; finish(): ModelHandleCatalog } {
+): { add(candidate: ModelHandleCandidate): void; finish(): ModelHandleCatalog; delta(): ModelHandleCatalogDelta } {
   const seedCatalog = normalizeModelHandleCatalog(Array.isArray(seededEntries)
     ? { entries: seededEntries } : seededEntries);
   const normalizedSeeds = seedCatalog.entries;
@@ -189,11 +195,16 @@ function createModelHandleCandidateAccumulator(
     byTarget.set(targetKey(seed.kind, seed.target), cloned);
     entries.push(cloned);
   }
+  const added = new Set<ModelHandleEntry>();
+  const extended = new Set<ModelHandleEntry>();
   const add = (candidate: ModelHandleCandidate): void => {
     const key = targetKey(candidate.kind, candidate.target);
     const existing = byTarget.get(key);
     if (existing) {
+      const changes = !existing.name && !!candidate.name || !existing.mimeType && !!candidate.mimeType
+        || existing.sizeBytes === undefined && candidate.sizeBytes !== undefined;
       mergeMetadata(existing, candidate);
+      if (changes && !added.has(existing)) extended.add(existing);
       return;
     }
     const ordinal = counters[candidate.kind] + 1;
@@ -210,11 +221,14 @@ function createModelHandleCandidateAccumulator(
     };
     byTarget.set(key, entry);
     entries.push(entry);
+    added.add(entry);
   };
   return {
     add,
     finish: () => currentModelHandleCatalog(entries.map(entry => ({ ...entry })),
-      seedCatalog.retiredRefs ?? [], seedCatalog.allocationHighWater)
+      seedCatalog.retiredRefs ?? [], seedCatalog.allocationHighWater),
+    delta: () => ({ addedEntries: [...added].map(entry => ({ ...entry })),
+      metadataExtensions: [...extended].map(entry => ({ ...entry })) })
   };
 }
 
@@ -922,7 +936,7 @@ function shortRefForm(kind: ModelHandleKind): string {
   return `${kindNoun(kind, '短引用')}（${HANDLE_PREFIX[kind]}#）`;
 }
 
-function handleKindOfRef(value: string): ModelHandleKind | undefined {
+export function handleKindOfRef(value: string): ModelHandleKind | undefined {
   if (!HANDLE_PATTERN.test(value)) return undefined;
   return (Object.keys(HANDLE_PREFIX) as ModelHandleKind[]).find((kind) => HANDLE_PREFIX[kind] === value[0]);
 }

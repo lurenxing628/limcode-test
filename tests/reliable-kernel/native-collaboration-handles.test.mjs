@@ -71,7 +71,7 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
           'all prior child refs freeze before the next request');
         assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
           'local checkpoint is not provider result admission');
-        const refs = request.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'conversation');
+        const refs = request.resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'conversation');
         assert.deepEqual(refs.map(entry => [entry.ref, entry.target]),
           [['C1', 'conversation_one'], ['C2', 'conversation_two']]);
         assert.ok(request.context.some(segment => segment.segmentKind === 'tool_pair'),
@@ -164,7 +164,7 @@ for (const [listTool, sendTool, resultKind] of [['list_agents', 'send_agent_mess
     }
     assert.equal(result.modelRequestIds.length, 3, 'two settled batches cross separately preflighted ModelRequests in ONE Turn');
     assert.equal(executed.length, 3, 'unknown short reference never dispatches or spawns');
-    assert.deepEqual(capturedRequests[0].recipe.modelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
+    assert.deepEqual(capturedRequests[0].resolvedModelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
     const frozenRefs = await readConversationChildHandles(app.database, app.contentStore, 'parent');
     assert.deepEqual(frozenRefs.map(entry => [entry.ref, entry.target]), [['C1', 'conversation_one'], ['C2', 'conversation_two']]);
     const eventRows = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });
@@ -280,7 +280,7 @@ test('native fork_conversation freezes the fork reference before a preflighted s
         assert.equal(forkOutput.status, 'succeeded', JSON.stringify(forkOutput));
         assert.match(forkOutput.detail.conversationRef, /^C\d+$/);
         assert.notEqual(forkOutput.detail.conversationRef, forkOutput.detail.sourceConversationRef);
-        assert.ok(request.recipe.modelHandleCatalog.entries.some(entry =>
+        assert.ok(request.resolvedModelHandleCatalog.entries.some(entry =>
           entry.ref === forkOutput.detail.conversationRef), 'successor recipe freezes the new fork reference');
         assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
         await control({ type: 'response.created', responseId: 'response-send', capabilities });
@@ -291,7 +291,7 @@ test('native fork_conversation freezes the fork reference before a preflighted s
         const frozen = await frozenNativeOutput(app, 'send-to-fork');
         assert.doesNotMatch(frozen.output, /conversationId|native-fork-dispatch-parent/);
         sendOutput = JSON.parse(frozen.output);
-        assert.ok(request.recipe.modelHandleCatalog.entries.some(entry =>
+        assert.ok(request.resolvedModelHandleCatalog.entries.some(entry =>
           entry.ref === forkOutput.detail.conversationRef), 'fork identity persists across the second checkpoint');
         assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
         await control({ type: 'response.created', responseId: 'response-final', capabilities });

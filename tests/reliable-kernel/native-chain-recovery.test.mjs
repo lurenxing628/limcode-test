@@ -1145,7 +1145,7 @@ for (const { restart, attachment } of [{ restart: false, attachment: false }, { 
             'the repaired full request consumes the already executed result');
           if (attachment) {
             assert.equal(request.recipe.attachmentCatalogState.catalog.length, 1);
-            assert.equal(request.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment').length, 1);
+            assert.equal(request.resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'attachment').length, 1);
           }
           await emitFinalText(emit, responseId, 'Completed using the saved native result.');
         }
@@ -1185,8 +1185,8 @@ for (const { restart, attachment } of [{ restart: false, attachment: false }, { 
         if (attachment) {
           assert.equal(first.recipe.attachmentCatalogState.catalog.length, 0);
           assert.equal((await rows(state.app, 'Attachment')).length, 1);
-          const attachmentHandles = state.requests[1].recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
-          assert.deepEqual(repair.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment'), attachmentHandles,
+          const attachmentHandles = state.requests[1].resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
+          assert.deepEqual(repair.resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'attachment'), attachmentHandles,
             'the repaired preview and successor preserve the same stable attachment handle');
         }
         assert.deepEqual(repair.authoritySnapshot.toolPolicy, first.authoritySnapshot.toolPolicy);

@@ -1,3 +1,4 @@
+import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { setImmediate as yieldToEventLoop } from 'node:timers/promises';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { ContextSequenceControlPlane, type MaterializedContextStructure } from './contextSequence';
@@ -455,7 +456,7 @@ class OccurrenceReader {
             || typeof scope.resetFence !== 'string' || !/^\d+$/.test(scope.resetFence)) throw invalid('Frozen Context handle scope is invalid.');
           producerScope = scope as unknown as ContextHandleProducerScope;
         }
-        const catalog = this.memo.persistent(this.memo.catalog(parsed.modelHandleCatalog as PlainJsonValue | undefined));
+        const catalog = this.memo.persistent(this.memo.catalog(await resolveFrozenModelHandleCatalog(this.database, this.store, parsed) as unknown as PlainJsonValue));
         let inputBindings: ModelHandleCatalog | undefined;
         if (parsed.contextHandleInputBindings !== undefined) {
           inputBindings = normalizeModelHandleCatalog(parsed.contextHandleInputBindings);
@@ -476,7 +477,11 @@ class OccurrenceReader {
           kind: parsed.kind, round: parsed.round, ...(parsed.nativeResponses ? { nativeResponses: {} } : {})
         };
         this.reserve(catalog);
-        const bytes = Number(content.metadata.byte_length) * 2;
+        const reference = parsed.modelHandleCatalogReference;
+        const baseId = reference && typeof reference === 'object' && !Array.isArray(reference)
+          ? (reference as Record<string, unknown>).baseContentObjectId : undefined;
+        const baseBytes = typeof baseId === 'string' ? Number((await this.get('ContentObject', baseId)).byte_length) : 0;
+        const bytes = Number(content.metadata.byte_length) * 2 + baseBytes * 8;
         this.requestSizes.set(key, bytes); this.requestBytes += bytes;
         while (this.requestBytes > 8 * 1024 * 1024 || this.requests.size > 16) {
           const oldest = this.requests.keys().next().value as string | undefined;

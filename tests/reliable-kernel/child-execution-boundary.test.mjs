@@ -414,7 +414,7 @@ test('spawned, continued and user-started child Turns all stay within the parent
       }
       if (turnInput === 'follow-up' && !f.sent.has('follow-up')) {
         f.sent.add('follow-up');
-        const ref = request.recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'child').ref;
+        const ref = request.resolvedModelHandleCatalog.entries.find(entry => entry.kind === 'child').ref;
         part = { id: 'follow-child', functionCall: { name: 'run_agent', args: { operation: 'send', childRef: ref, prompt: 'also add a test' } } };
       }
       await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { role: 'model', parts: [part] } });

@@ -1,3 +1,6 @@
+import { CONTEXT_HANDLE_STATE_CONTENT_TYPE, readFrozenContextHandleCatalogBase,
+  rememberFrozenContextHandleCatalogBase } from './frozenModelHandleCatalog';
+export { CONTEXT_HANDLE_STATE_CONTENT_TYPE } from './frozenModelHandleCatalog';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION, isPersistentContextHandle,
@@ -10,9 +13,7 @@ import { readContextHandleOccurrenceCatalog, type ContextHandleOccurrenceEvidenc
 
 export const CONTEXT_HANDLE_STATE_DOMAIN = 'ConversationContextHandleState';
 export const CONTEXT_ROOT_HANDLE_CATALOG_DOMAIN = 'ContextRootHandleCatalog';
-export const CONTEXT_HANDLE_STATE_CONTENT_TYPE = 'application/vnd.limcode.conversation-context-handle-state+json';
 const STATE_KIND = 'conversation-context-handle-state';
-const parsedCatalogs = new WeakMap<RuntimeDatabase, { store: ContentAddressedStore; values: Map<string, { conversationId: string; catalog: ModelHandleCatalog }> }>();
 
 export interface CurrentContextHandleState {
   row: DomainRow;
@@ -281,27 +282,8 @@ async function readReadyStateRow(database: RuntimeDatabase, store: ContentAddres
   if (row.content_object_id === null) {
     return { row, catalog: emptyContextHandleCatalog(), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
   }
-  let cache = parsedCatalogs.get(database);
-  if (!cache || cache.store !== store) {
-    cache = { store, values: new Map() }; parsedCatalogs.set(database, cache);
-  }
-  const contentId = String(row.content_object_id);
-  const cached = cache.values.get(contentId);
-  if (cached) {
-    if (cached.conversationId !== conversationId) throw stateError('Current catalog belongs to another Conversation.');
-    cache.values.delete(contentId); cache.values.set(contentId, cached);
-    return { row, catalog: structuredClone(cached.catalog), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
-  }
-  const value = await readContextHandleStateContent(database, store, row, CONTEXT_HANDLE_STATE_CONTENT_TYPE);
-  if (!value || typeof value !== 'object' || Array.isArray(value)
-    || value.kind !== STATE_KIND || value.conversationId !== conversationId
-    || Object.keys(value).some(key => !['kind', 'conversationId', 'catalog'].includes(key))) {
-    throw stateError('Current Context reference catalog has invalid ownership or shape.');
-  }
-  const catalog = requireCurrentPersistentCatalog(value.catalog);
-  cache.values.set(contentId, { conversationId, catalog });
-  while (cache.values.size > 8) cache.values.delete(cache.values.keys().next().value!);
-  return { row, catalog: structuredClone(catalog), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
+  const catalog = await readFrozenContextHandleCatalogBase(database, store, String(row.content_object_id), conversationId);
+  return { row, catalog: normalizeModelHandleCatalog(catalog), requiresNativeReset: BigInt(String(row.requires_native_reset)) > 0n };
 }
 
 export async function readContextHandleStateContent(database: RuntimeDatabase, store: ContentAddressedStore,
@@ -321,10 +303,14 @@ export async function prepareConversationContextHandleUpdate(input: {
   database: RuntimeDatabase; contentStore: ContentAddressedStore; conversationId: string;
   catalog: unknown; source: 'ordinary' | 'compression' | 'native'; now: string;
   contextRootId?: string;
+  baseContentObjectId?: unknown;
   scope?: unknown;
 }): Promise<RepositoryTransactionStep[]> {
   const current = await readCurrentConversationContextHandleState(input.database, input.contentStore, input.conversationId);
   const incoming = persistentContextHandleCatalog(input.catalog);
+  if (input.baseContentObjectId !== undefined && input.baseContentObjectId !== current.row.content_object_id) {
+    throw frontierChanged();
+  }
   if (input.scope !== undefined) {
     const scope = input.scope as Record<string, unknown>;
     if (!scope || typeof scope !== 'object' || Array.isArray(scope)
@@ -382,12 +368,7 @@ async function prepareCatalogContent(database: RuntimeDatabase, contentStore: Co
   const payload = { kind: STATE_KIND, conversationId, catalog };
   const content = await contentStore.prepare(database,
     canonicalPlainJson(normalizePlainJson(payload, 'Current Context reference state')), CONTEXT_HANDLE_STATE_CONTENT_TYPE);
-  let cache = parsedCatalogs.get(database);
-  if (!cache || cache.store !== contentStore) {
-    cache = { store: contentStore, values: new Map() }; parsedCatalogs.set(database, cache);
-  }
-  cache.values.set(content.metadata.id, { conversationId, catalog: structuredClone(catalog) });
-  while (cache.values.size > 8) cache.values.delete(cache.values.keys().next().value!);
+  rememberFrozenContextHandleCatalogBase(database, contentStore, content.metadata, conversationId, catalog);
   return { contentObjectId: content.metadata.id, steps: preparedContentObjectSteps([content], 'conversation_context_handle_state') };
 }
 

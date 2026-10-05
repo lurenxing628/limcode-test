@@ -15,6 +15,7 @@ Module._load = function (request, parent, isMain) {
 after(() => { Module._load = originalLoad; });
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(compiled, file));
+const { resolveFrozenModelHandleCatalog } = load('backend/reliableKernel/frozenModelHandleCatalog.js');
 const kernel = load('backend/reliableKernel/index.js');
 const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
@@ -204,7 +205,8 @@ async function frozenAttachmentEvidence(h, conversationId) {
     for (const request of await rows(h.app, 'ModelRequest', { turn_id: turn.id })) {
       const [metadata] = await rows(h.app, 'ContentObject', { id: request.recipe_object_id });
       const recipe = JSON.parse((await h.app.contentStore.read(metadata)).toString('utf8'));
-      result.push(...(recipe.modelHandleCatalog?.entries.filter(entry => entry.kind === 'attachment') ?? []));
+      const catalog = await resolveFrozenModelHandleCatalog(h.app.database, h.app.contentStore, recipe);
+      result.push(...catalog.entries.filter(entry => entry.kind === 'attachment'));
     }
   }
   return result;
@@ -226,13 +228,14 @@ test('fork retains discarded F1 identity without exposing its attachment or rout
       for (const request of await rows(h.app, 'ModelRequest', { turn_id: turn.id })) {
         const [metadata] = await rows(h.app, 'ContentObject', { id: request.recipe_object_id });
         const recipe = JSON.parse((await h.app.contentStore.read(metadata)).toString('utf8'));
-        frozenOldRef ||= recipe.modelHandleCatalog?.entries.some(entry => entry.ref === 'F1' && entry.target === oldHandle.attachment_id) ?? false;
+        const catalog = await resolveFrozenModelHandleCatalog(h.app.database, h.app.contentStore, recipe);
+        frozenOldRef ||= catalog.entries.some(entry => entry.ref === 'F1' && entry.target === oldHandle.attachment_id);
       }
     }
     assert.equal(frozenOldRef, true, 'the copied historical Recipe still names the old F1');
     await h.turn(fork.conversationId, 'upload-fork-image', undefined, attachmentMessage('new-image.png'));
     const request = h.requests.at(-1);
-    const catalog = request.recipe.modelHandleCatalog;
+    const catalog = request.resolvedModelHandleCatalog;
     const [attachment] = catalog.entries.filter(entry => entry.kind === 'attachment');
     assert.equal(attachment.ref, 'F2');
     assert.notEqual(attachment.target, oldHandle.attachment_id);
@@ -244,7 +247,7 @@ test('fork retains discarded F1 identity without exposing its attachment or rout
     h.requestReadOfOldRef();
     await h.turn(fork.conversationId, 'reject-old-ref-without-dispatch');
     assert.equal(h.dispatches.length, priorDispatches, 'a stale F1 cannot read the new image through the dispatcher');
-    assert.deepEqual((await h.app.modelProvider.replay(request.modelRequestId)).recipe.modelHandleCatalog, catalog);
+    assert.deepEqual((await h.app.modelProvider.replay(request.modelRequestId)).resolvedModelHandleCatalog, catalog);
   });
 });
 
@@ -266,10 +269,10 @@ test('nested forks keep the attachment watermark after source deletion, reopenin
       'the reserved immutable identity survives deleting its source Conversations');
     assert.deepEqual(await h.activeAttachments(nested.conversationId), []);
     await h.turn(nested.conversationId, 'nested-new-image', undefined, attachmentMessage('nested-image.png'));
-    assert.equal(h.requests.at(-1).recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'attachment').ref, 'F2');
+    assert.equal(h.requests.at(-1).resolvedModelHandleCatalog.entries.find(entry => entry.kind === 'attachment').ref, 'F2');
     await h.reopen();
     await h.turn(nested.conversationId, 'nested-next-image', undefined, attachmentMessage('third-image.png'));
-    assert.deepEqual(h.requests.at(-1).recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment').map(entry => entry.ref), ['F2', 'F3']);
+    assert.deepEqual(h.requests.at(-1).resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'attachment').map(entry => entry.ref), ['F2', 'F3']);
   });
 });
 
@@ -295,7 +298,7 @@ test('published forks recover known frozen F reservations before an empty ensure
     assert.equal(recovered.attachment_id, oldHandle.attachment_id);
     assert.deepEqual(await h.activeAttachments(fork.conversationId), [], 'restoring an address grants no attachment visibility');
     await h.turn(fork.conversationId, 'upgrade-new-image', undefined, attachmentMessage('upgrade-new-image.png'));
-    const catalog = h.requests.at(-1).recipe.modelHandleCatalog;
+    const catalog = h.requests.at(-1).resolvedModelHandleCatalog;
     const [newAttachment] = catalog.entries.filter(entry => entry.kind === 'attachment');
     assert.equal(newAttachment.ref, 'F2');
     assert.notEqual(newAttachment.target, oldHandle.attachment_id);
@@ -320,7 +323,7 @@ test('reforking a published fork restores its missing addresses without requirin
     await h.facade.deleteConversation(fork.conversationId);
     await h.reopen();
     await h.turn(nested.conversationId, 'refork-new-image', undefined, attachmentMessage('refork-new-image.png'));
-    assert.equal(h.requests.at(-1).recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'attachment').ref, 'F2');
+    assert.equal(h.requests.at(-1).resolvedModelHandleCatalog.entries.find(entry => entry.kind === 'attachment').ref, 'F2');
     assert.equal((await h.facade.forkConversation(command)).conversationId, nested.conversationId);
   });
 });
@@ -330,10 +333,10 @@ test('frozen F recovery accepts legal minimal handle entries without optional at
     const provider = h.app.modelProvider;
     const create = provider.createModelRequest;
     provider.createModelRequest = function (command) {
-      const catalog = command.recipe.modelHandleCatalog;
+      const reference = command.recipe.modelHandleCatalogReference;
       return create.call(this, { ...command, recipe: { ...command.recipe,
-        modelHandleCatalog: { ...catalog, entries: catalog.entries.map(entry => entry.kind === 'attachment'
-          ? { kind: entry.kind, ref: entry.ref, target: entry.target } : entry) } } });
+        modelHandleCatalogReference: { ...reference, attachmentEntries: reference.attachmentEntries.map(entry =>
+          ({ kind: entry.kind, ref: entry.ref, target: entry.target })) } } });
     };
     let result;
     try { result = await withPublishedAttachmentSnapshot(() => discardedAttachmentFork(h, 'minimal-frozen-fork')); }
@@ -348,7 +351,7 @@ test('frozen F recovery accepts legal minimal handle entries without optional at
     assert.equal(recovered.handle_seq, 1n);
     assert.equal(recovered.attachment_id, oldHandle.attachment_id);
     await h.turn(fork.conversationId, 'minimal-frozen-new-image', undefined, attachmentMessage('minimal-new-image.png'));
-    assert.equal(h.requests.at(-1).recipe.modelHandleCatalog.entries.find(entry => entry.kind === 'attachment').ref, 'F2');
+    assert.equal(h.requests.at(-1).resolvedModelHandleCatalog.entries.find(entry => entry.kind === 'attachment').ref, 'F2');
   });
 });
 
@@ -356,12 +359,12 @@ test('ordinary JSON attachmentId data cannot mint a hidden F alias or corrupt th
   await withRuntime(async h => {
     const { oldHandle, fork } = await discardedAttachmentFork(h, 'raw-candidate-fork');
     await h.turn(fork.conversationId, 'candidate-new-image', undefined, attachmentMessage('candidate-new-image.png'));
-    const [newAttachment] = h.requests.at(-1).recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
+    const [newAttachment] = h.requests.at(-1).resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
     assert.equal(newAttachment.ref, 'F2');
     await h.turn(fork.conversationId, 'raw-attachment-id-data', undefined,
       { content: JSON.stringify({ attachmentId: oldHandle.attachment_id, label: 'metadata only' }) });
     const rawRequest = h.requests.at(-1);
-    const catalog = rawRequest.recipe.modelHandleCatalog;
+    const catalog = rawRequest.resolvedModelHandleCatalog;
     assert.deepEqual(catalog.entries.filter(entry => entry.kind === 'attachment').map(entry => [entry.ref, entry.target]),
       [['F2', newAttachment.target]]);
     assert.throws(() => resolveModelToolArguments('read', { attachmentRef: 'F1' }, catalog), /当前可用/);
@@ -372,11 +375,11 @@ test('ordinary JSON attachmentId data cannot mint a hidden F alias or corrupt th
       [[1n, oldHandle.attachment_id], [2n, newAttachment.target]]);
     assert.deepEqual((await h.activeAttachments(fork.conversationId)).map(entry => entry.name), ['candidate-new-image.png']);
     const projected = projectStoredModelFacingWindow(rawRequest.context, rawRequest.attachmentCatalogState,
-      rawRequest.recipe.modelHandleCatalog);
+      rawRequest.resolvedModelHandleCatalog);
     assert.ok(!JSON.stringify(projected).includes('"attachmentId":"F3"'), 'pure current-contract projection cannot invent F3');
     await h.reopen();
     await h.turn(fork.conversationId, 'candidate-third-image', undefined, attachmentMessage('candidate-third-image.png'));
-    const attachments = h.requests.at(-1).recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
+    const attachments = h.requests.at(-1).resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'attachment');
     assert.deepEqual(attachments.map(entry => entry.ref), ['F2', 'F3']);
     const third = attachments.find(entry => entry.ref === 'F3');
     assert.notEqual(third.target, oldHandle.attachment_id);

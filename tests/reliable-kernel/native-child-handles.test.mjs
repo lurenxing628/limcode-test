@@ -60,7 +60,7 @@ test(`native settled batches freeze child refs across ModelRequests and reopen${
           'prior batch child refs are frozen before the carrier request');
         assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
           'context carryover is not a native provider admission');
-        const childRefs = request.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'child');
+        const childRefs = request.resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'child');
         assert.deepEqual(childRefs.map(entry => [entry.ref, entry.target]),
           [['A1', 'answer_bridge_one'], ['A2', 'answer_bridge_two']]);
         assert.ok(request.context.some(segment => segment.segmentKind === 'tool_pair'
@@ -165,7 +165,7 @@ test(`native settled batches freeze child refs across ModelRequests and reopen${
     assert.equal(result.modelRequestIds.length, 3, 'two safe tool batches yield before the final ModelRequest of ONE Turn');
     assert.equal(new Set(result.modelRequestIds).size, 3);
     assert.equal(executed.length, 3, 'unknown short reference never dispatches or spawns');
-    assert.deepEqual(capturedRequests[0].recipe.modelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
+    assert.deepEqual(capturedRequests[0].resolvedModelHandleCatalog?.entries ?? [], [], 'initial recipe remains frozen');
     const frozenRefs = await readConversationChildHandles(app.database, app.contentStore, 'parent');
     assert.deepEqual(frozenRefs.map(entry => [entry.ref, entry.target]), [['A1', 'answer_bridge_one'], ['A2', 'answer_bridge_two']]);
     const eventRows = await rows(app, 'ToolCallEvent', { event_kind: NATIVE_CHILD_HANDLE_PROJECTION_EVENT });

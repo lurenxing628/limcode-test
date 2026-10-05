@@ -371,7 +371,7 @@ for (const mode of ['llm_summary', 'provider_native']) test(`child task memory r
       assert.ok(alpha.currentInputs.some(source => source.text.includes(CURRENT)));
       assert.ok(alpha.queuedInputs.some(source => source.text.includes(QUEUED)));
       const compression = await f.compress(`${mode}-compact-first`);
-      assert.equal(new Set(compression.recipe.modelHandleCatalog.entries.filter(entry => entry.kind === 'child').map(entry => entry.ref)).size, 3);
+      assert.equal(new Set(compression.resolvedModelHandleCatalog.entries.filter(entry => entry.kind === 'child').map(entry => entry.ref)).size, 3);
       phase = 'inspect';
       const inspected = await f.runInput(`${mode}-inspect`);
       assert.equal(inspected.terminalStatus, 'completed', JSON.stringify(await f.list('TurnTermination', { turn_id: inspected.turnId })));

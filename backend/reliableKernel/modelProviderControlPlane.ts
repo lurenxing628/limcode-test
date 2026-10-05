@@ -1,3 +1,4 @@
+import { frozenRecipeAttachmentHandles, resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import type { ModelProjectionWorkControls } from './modelProjectionWork';
 import { prepareConversationContextHandleUpdate, rethrowContextHandleStateRace } from './conversationContextHandleState';
 import { sessionThinkingDisplayLabel } from '../../shared/sessionThinking';
@@ -41,7 +42,7 @@ import {
   type ReinjectedCurrentTurnInputReference,
   type TurnReminderIdentitySplit
 } from './turnReminderProjection';
-import { modelHandleRef, prepareModelHandleCatalog } from './modelHandleCatalog';
+import { modelHandleRef, prepareModelHandleCatalog, type ModelHandleCatalog } from './modelHandleCatalog';
 import { expandTextCompressionSources } from './compressionSourceReplay';
 import {
   estimateRequestAuthorityTokens,
@@ -152,6 +153,8 @@ export interface FullProviderRequest {
   authoritySnapshot: PlainJsonValue;
   settingsSnapshot?: PlainJsonValue;
   recipe: PlainJsonValue;
+  /** Resolved immutable identity facts, separate from the unmodified frozen recipe. */
+  resolvedModelHandleCatalog: ModelHandleCatalog;
   context: FullProviderContextItem[];
   /** Read-only native-source expansion for text summaries; the canonical head is unchanged. */
   compressionSourceContext?: FullProviderContextItem[];
@@ -804,7 +807,8 @@ export class ModelProviderControlPlane {
     }
     const contextHandleSteps = isRecord(recipe) && (recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression')
       ? await prepareConversationContextHandleUpdate({ database: this.database, contentStore: this.contentStore,
-          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'), catalog: recipe.modelHandleCatalog,
+          conversationId: requireId(turn.conversation_id, 'Turn.conversation_id'), catalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
+          ...(isRecord(recipe.modelHandleCatalogReference) ? { baseContentObjectId: recipe.modelHandleCatalogReference.baseContentObjectId } : {}),
           contextRootId, scope: recipe.contextHandleScope, source: compressionRequest ? 'compression' : 'ordinary', now }) : [];
     const steps: RepositoryTransactionStep[] = [
       ...contextHandleSteps,
@@ -1002,6 +1006,7 @@ export class ModelProviderControlPlane {
       authoritySnapshot: frozenAuthority,
       ...(settingsSnapshot === undefined ? {} : { settingsSnapshot }),
       recipe,
+      resolvedModelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
       context: providerContext,
       ...(compressionSourceContext ? { compressionSourceContext } : {}),
       attachmentCatalogState,
@@ -1072,6 +1077,7 @@ export class ModelProviderControlPlane {
       modelId: model.modelId,
       authoritySnapshot: frozen.document,
       recipe,
+      resolvedModelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe),
       context: providerContext,
       attachmentCatalogState,
       ...conversationClaudeThinkingBinding(materialized.segments),
@@ -3553,7 +3559,7 @@ function historicalRequestFacts(recipe: PlainJsonValue, recipeObjectId: string):
     );
     const delta = state.placements.find((placement) => placement.kind === 'current_turn_delta');
     if (delta) {
-      const handles = prepareModelHandleCatalog(recipe.modelHandleCatalog);
+      const handles = prepareModelHandleCatalog(frozenRecipeAttachmentHandles(recipe));
       const rendered = renderAttachmentCatalogPlacement(delta, (entry) => {
         const ref = modelHandleRef(handles, 'attachment', entry.attachmentId);
         if (!ref) throw new Error(`Attachment ${entry.attachmentId} has no frozen model handle.`);

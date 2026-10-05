@@ -1,3 +1,4 @@
+import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
 import { ContentAddressedStore, type ContentObjectMetadata } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
@@ -85,7 +86,7 @@ export async function readRequestContextHandleEvidence(database: RuntimeDatabase
       throw childHandleError(`Frozen recipe ${request.recipe_object_id} is not an object.`);
     }
     frozen = recipe.kind === 'reliable-agent-turn' || recipe.kind === 'reliable-context-compression'
-      ? { kind: recipe.kind, catalog: memo.persistent(memo.catalog(recipe.modelHandleCatalog)) } : {};
+      ? { kind: recipe.kind, catalog: memo.persistent(memo.catalog(await resolveFrozenModelHandleCatalog(database, contentStore, recipe) as unknown as PlainJsonValue)) } : {};
     // Legacy compression recovery is request/source-specific and still needs the original body.
     // Never retain that graph or mistake another request's recovery for this request's proof.
     if (frozen.kind !== 'reliable-context-compression'

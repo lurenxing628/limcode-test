@@ -847,7 +847,7 @@ test('运行中的子 Agent 默认排队续聊，保留当前执行和同一会�
     const count = f.requests.filter(r => r.conversationId === request.conversationId).length;
     if (request.conversationId === 'parent' && count === 1) part = { id: 'spawn-queued', functionCall: { name: 'run_agent', args: { operation: 'spawn', prompt: 'investigate', taskName: 'Investigate send failure' } } };
     if (request.conversationId === 'parent' && count === 2) {
-      const ref = request.recipe.modelHandleCatalog.entries.find(e => e.kind === 'child').ref;
+      const ref = request.resolvedModelHandleCatalog.entries.find(e => e.kind === 'child').ref;
       part = { id: 'followup-queued', functionCall: { name: 'run_agent', args: { operation: 'send', childRef: ref, prompt: 'also verify configuration saving' } } };
     }
     if (request.conversationId !== 'parent' && count === 1) await childGate;
@@ -878,13 +878,13 @@ test('实际 coordinator 从父工具创建/嵌套/继续子会话：最终普�
     });
     await f.coordinator.waitForIdle();
     assert.equal(f.wires.filter(w => w.conversationId === child.child_conversation_id).at(-1).body.reasoning_effort, 'medium');
-    const oldCatalog = f.requests.filter(r => r.conversationId === 'parent').at(-1).recipe.modelHandleCatalog;
+    const oldCatalog = f.requests.filter(r => r.conversationId === 'parent').at(-1).resolvedModelHandleCatalog;
     await f.app.agentLoop.runInput(f.input('parent-sees-completed-children'));
     const next = f.requests.filter(r => r.conversationId === 'parent').at(-1);
     assert.ok(next.recipe.runtimeStatusCard.children.some(c => c.status === 'idle' && c.resumable));
     assert.match(next.recipe.runtimeStatusCard.card, /"childRef":"A1"/);
     for (const ref of oldCatalog.entries.filter(e => e.kind === 'child')) {
-      assert.deepEqual(next.recipe.modelHandleCatalog.entries.find(e => e.target === ref.target), ref);
+      assert.deepEqual(next.resolvedModelHandleCatalog.entries.find(e => e.target === ref.target), ref);
     }
   }, {
     async send(request, controls, f) {

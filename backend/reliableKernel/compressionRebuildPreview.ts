@@ -226,6 +226,7 @@ export async function previewCompressionSourceReplay(
       modelId: policy.provider.modelId,
       authoritySnapshot: input.authority,
       recipe,
+      resolvedModelHandleCatalog: modelHandleCatalog,
       context,
       compressionSourceContext: sourceContext,
       attachmentCatalogState

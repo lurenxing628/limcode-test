@@ -227,7 +227,7 @@ test('the token estimate projects a parallel batch with the same catalog placeme
   await fixture({ providerKind: 'openai-compatible', modelId: 'gpt-5.5', async send(round, { request, start }) {
     if (round === 1) return { role: 'model', parts: [call('shot1', 'srv_shot'), call('list2', 'srv_list')] };
     if (round === 2) {
-      const stored = projectStoredModelFacingWindow(request.context, request.attachmentCatalogState, request.recipe.modelHandleCatalog);
+      const stored = projectStoredModelFacingWindow(request.context, request.attachmentCatalogState, request.resolvedModelHandleCatalog);
       const kinds = contents => contents.map(content => content.parts.map(part =>
         part.functionResponse ? 'result' : part.functionCall ? 'call' : JSON.stringify(part).includes(CATALOG_MARKER) ? 'catalog' : 'other').join('+'));
       assert.deepEqual(kinds(stored.contents), ['other', 'call+call', 'result', 'result', 'catalog']);

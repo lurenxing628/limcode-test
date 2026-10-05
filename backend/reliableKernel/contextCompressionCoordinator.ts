@@ -1,3 +1,4 @@
+import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { createHash } from 'node:crypto';
 import { planCompressionSummaryCalls } from '../capabilities/llmProvider';
 import { compactRequestForCompressionPlanning, estimateCompactProjection } from './llmCapabilityProviderAdapter';
@@ -426,13 +427,14 @@ export class ReliableContextCompressionCoordinator {
       const attachmentHandles = await this.modelProvider.ensureAttachmentHandles(conversationId, attachmentCatalogState.catalog);
       const persistentHandles = reconcileHistoricalModelHandleCatalogs([
         await readConversationContextHandleCatalog(this.database, this.contentStore, conversationId),
-        normalizeModelHandleCatalog(source.recipe.modelHandleCatalog)
+        await resolveFrozenModelHandleCatalog(this.database, this.contentStore, source.recipe)
       ]);
       const modelHandleCatalog = buildModelHandleCatalog([
         ...materialized.segments.map(segment => segment.content.toString('utf8')),
         attachmentCatalogState.catalog
       ], mergeModelHandleCatalogs({ entries: attachmentHandles.entries }, persistentHandles));
-      previewRecipe = requireRecord(normalizePlainJson({ ...source.recipe, attachmentCatalogState, modelHandleCatalog },
+      const { modelHandleCatalogReference: _reference, ...inlinePreviewRecipe } = source.recipe;
+      previewRecipe = requireRecord(normalizePlainJson({ ...inlinePreviewRecipe, attachmentCatalogState, modelHandleCatalog },
         'Provider context recovery preview recipe'), 'Provider context recovery preview recipe');
     }
     const fullRequest = headRootId === source.rootId
@@ -456,7 +458,7 @@ export class ReliableContextCompressionCoordinator {
       requestBudget: this.modelProvider.planFullRequest(fullRequest, adapter),
       protectedCurrentInputTokens: typeof currentInputRecord?.estimatedTokens === 'number' ? currentInputRecord.estimatedTokens : 0,
       tools: normalizeCompressionToolDefinitions(source.recipe.tools, 'Rejected request tools'),
-      modelHandleCatalog: normalizeModelHandleCatalog(previewRecipe.modelHandleCatalog)
+      modelHandleCatalog: fullRequest.resolvedModelHandleCatalog
     });
     if (result.status === 'compressed' && await this.context.currentHeadRootId(conversationId) !== result.result.rootId) {
       throw new Error('The proved context repair is not the current Conversation head.');
@@ -880,7 +882,7 @@ export class ReliableContextCompressionCoordinator {
           kind: 'full-model-request', modelRequestId: 'automatic-capacity-planning',
           conversationId: frozen.conversationId, attemptSeq: '1', socketGeneration: '0',
           providerId: policy.provider.providerConfigId, modelId: policy.provider.modelId,
-          authoritySnapshot: frozen.document, recipe, context: sourceContext,
+          authoritySnapshot: frozen.document, recipe, resolvedModelHandleCatalog: catalog, context: sourceContext,
           compressionSourceContext: expanded, attachmentCatalogState: attachmentState
         };
         const compact = compactRequestForCompressionPlanning(preview);

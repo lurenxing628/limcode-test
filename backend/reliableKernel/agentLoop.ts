@@ -1,3 +1,4 @@
+import { resolveFrozenModelHandleCatalog } from './frozenModelHandleCatalog';
 import { performance } from 'node:perf_hooks';
 import { readConversationContextHandleStateRow, readCurrentConversationContextHandleState } from './conversationContextHandleState';
 import { acceptedNoticeMetadata, type AcceptedAnswerNotice } from './answerPresentation';
@@ -7,11 +8,10 @@ import { isTransactionAssertionFailure } from './phaseFIdentity';
 import { readAgentLoopResumeState, type AgentLoopResumeState } from './agentLoopResumeState';
 
 import {
-  buildModelHandleCatalog,
+  createModelHandleCatalogBuilder,
   mergeModelHandleCatalogs,
   modelHandleEntries,
   modelHandleRef,
-  normalizeModelHandleCatalog,
   prepareModelHandleCatalog,
   resolveModelToolArguments,
   UnknownModelHandleReferenceError,
@@ -678,7 +678,7 @@ export class ReliableAgentLoop {
               headRootId: requireId(facts.head.root_id, 'ConversationContextHeadLink.root_id'),
               trigger: 'auto', requestBudget: planningBudget,
               protectedCurrentInputTokens: currentInputReferenceTokens(frozenRecipe),
-              modelHandleCatalog: normalizeModelHandleCatalog(asRecord(frozenRecipe)?.modelHandleCatalog),
+              modelHandleCatalog: await resolveFrozenModelHandleCatalog(this.database, this.contentStore, frozenRecipe),
               tools: toolDefinitions
             });
             if (compression.status === 'error') throw new ModelRequestPreflightError(
@@ -1251,19 +1251,30 @@ export class ReliableAgentLoop {
       if (currentTurnState.reference.reinject) contextInputSources.push(inputContent);
     }
     const seeds = mergeModelHandleCatalogs(attachmentHandles, runtimeStatus.contextHandles);
-    let modelHandleCatalog = buildModelHandleCatalog(handleSources, seeds);
+    const handleBuilder = createModelHandleCatalogBuilder(seeds);
+    for (const source of handleSources) handleBuilder.add(source);
+    let modelHandleCatalog = handleBuilder.finish();
     const forkIdentity = runtimeStatus.forkIdentity;
     const inheritedCollaboration = forkIdentity ? forkInheritedCollaborationTargets(modelHandleCatalog, forkIdentity) : undefined;
     if (forkIdentity && inheritedCollaboration) {
       // The fork's own address joins the catalog so the model can tell itself from its sources.
-      modelHandleCatalog = buildModelHandleCatalog([...handleSources, { kind: 'agent_collaboration', conversationId: forkIdentity.conversationId }], seeds);
+      handleBuilder.add({ kind: 'agent_collaboration', conversationId: forkIdentity.conversationId });
+      modelHandleCatalog = handleBuilder.finish();
     }
     // Raw user/tool JSON is not an attachment registry. It may mention a canonical Attachment
     // outside the visible catalog, but cannot mint an F address or change a reserved one.
     const attachmentRefs = new Map(attachmentHandles.entries.map(entry => [entry.target, entry.ref]));
     modelHandleCatalog = { ...modelHandleCatalog, entries: modelHandleCatalog.entries.filter(entry =>
       entry.kind !== 'attachment' || attachmentRefs.get(entry.target) === entry.ref) };
-    // Share one immutable lookup for this operation; keep the plain catalog in the frozen recipe.
+    // Record only builder-local changes; never diff or serialize the cumulative base for a recipe.
+    const delta = handleBuilder.delta();
+    const modelHandleCatalogReference = {
+      baseContentObjectId: runtimeStatus.contextHandleBaseContentObjectId,
+      attachmentEntries: modelHandleCatalog.entries.filter(entry => entry.kind === 'attachment'),
+      addedEntries: delta.addedEntries.filter(entry => entry.kind !== 'attachment'),
+      metadataExtensions: delta.metadataExtensions.filter(entry => entry.kind !== 'attachment')
+    };
+    // Share one immutable lookup during projection; replay resolves the frozen CAS base separately.
     const preparedModelHandles = prepareModelHandleCatalog(modelHandleCatalog);
     const inputBindings = selectContextHandleBindings(contextInputSources, modelHandleCatalog);
     const establishedInputRefs = new Map(runtimeStatus.contextHandles.entries.map(entry => [entry.ref, entry]));
@@ -1327,7 +1338,7 @@ export class ReliableAgentLoop {
       round: input.round,
       tools: input.tools,
       attachmentCatalogState,
-      modelHandleCatalog,
+      modelHandleCatalogReference,
       contextHandleScope: runtimeStatus.contextHandleScope,
       ...(contextHandleInputBindings.entries.length ? { contextHandleInputBindings } : {}),
       ...(currentTurnState.reference ? { currentTurnInput: currentTurnState.reference } : {}),
@@ -1647,6 +1658,7 @@ export class ReliableAgentLoop {
     statusCard?: FrozenRuntimeStatusCard;
     /** Complete identity state, including retired addresses, frozen into the next request. */
     contextHandles: ModelHandleCatalog;
+    contextHandleBaseContentObjectId: string | null;
     requiresNativeReset: boolean;
     contextHandleScope: { conversationId: string; rootId: string | null; provenanceRevision: string; resetFence: string };
     /** For a fork: what copied collaboration refs mean here, read once for the recipe. */
@@ -1673,11 +1685,11 @@ export class ReliableAgentLoop {
         ? [{ processId: requireId(row.id, 'Process.id'), status: 'running' as const }]
         : []);
     if (projection.totalChildCount === 0 && runningProcesses.length === 0 && inheritedChildTargets.length === 0) {
-      return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
+      return { contextHandles: handleState.catalog, contextHandleBaseContentObjectId: handleState.row.content_object_id as string | null, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
         ...(forkIdentity ? { forkIdentity } : {}) };
     }
     const { children, totalChildCount, descendantCount, queuedInputCount, awaitingHandlingCount, activeChildCount } = projection;
-    return { contextHandles: handleState.catalog, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
+    return { contextHandles: handleState.catalog, contextHandleBaseContentObjectId: handleState.row.content_object_id as string | null, requiresNativeReset: handleState.requiresNativeReset, contextHandleScope,
       ...(forkIdentity ? { forkIdentity } : {}), statusCard: {
       kind: 'runtime_status_card',
       totalChildCount, descendantCount,
@@ -1748,7 +1760,7 @@ export class ReliableAgentLoop {
     const recipe = input.recipe ?? await this.readModelRequestRecipe(input.modelRequestId);
     const definitions = await this.readModelRequestToolDefinitions(input.modelRequestId, recipe);
     const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
-    const catalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+    const catalog = await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe);
     const existingLinks = await listAllDomainRows(
       this.database,
       'ToolCallSourceLink',
@@ -2460,7 +2472,7 @@ export class ReliableAgentLoop {
     if (nativeCapabilities) {
       const definitions = await this.readModelRequestToolDefinitions(modelRequestId, recipe);
       const definitionsByName = new Map(definitions.map((definition) => [definition.name, definition]));
-      const catalog = normalizeModelHandleCatalog(recipe.modelHandleCatalog);
+      const catalog = await resolveFrozenModelHandleCatalog(this.database, this.contentStore, recipe);
       const projection = await this.list('ModelContextProjection', {
         owner_kind: 'model_request', owner_id: modelRequestId
       }, 2);
