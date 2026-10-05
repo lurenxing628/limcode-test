@@ -4675,6 +4675,7 @@ async function executeSummaryProviderCall(
   const execute = async (activeRequest: SummaryProviderCall['request']): Promise<string> => {
     if (resolved.stream || isOpenAIResponsesWebSocketMode(resolved.settings)) {
       let text = '';
+      let completedText: string | undefined;
       const stream = isOpenAIResponsesWebSocketMode(resolved.settings)
         ? createSummaryWebSocketStream(resolved, activeRequest, signal)
         : resolved.provider!.chatStream<UnifiedLLMStreamChunk>(activeRequest, {
@@ -4693,13 +4694,23 @@ async function executeSummaryProviderCall(
             { code: 'SUMMARY_OUTPUT_LIMIT_EXHAUSTED' });
         }
         text += chunk.textDelta ?? visibleTextFromParts(chunk.partsDelta ?? []);
+        // A terminal aggregate replaces streamed text; appending it duplicates ordinary
+        // deltas and loses terminal-only items when only some items streamed. HTTP and WS
+        // expose the same canonical content, without treating reasoning or opaque provider
+        // context as visible summary text. Item-close facts alone are not a final response.
+        const completedContent = (chunk as LimCodeOpenAIResponsesStreamChunk).completedContent;
+        if (completedContent) completedText = visibleTextFromParts(completedContent.parts);
+        else if (Array.isArray(chunk.completedContents)) {
+          completedText = chunk.completedContents.map(content => visibleTextFromParts(content.parts)).join('');
+        }
         if (chunk.textDelta?.trim() || chunk.partsDelta?.some((part) =>
           'text' in part && typeof part.text === 'string' && part.text.trim()
         )) {
           resolved.onCompressionProgress?.();
         }
       }
-      return requireSummaryVisibleOutput(text);
+      if (signal?.aborted) throw createAbortError('Aborted summary provider response.');
+      return requireSummaryVisibleOutput(completedText ?? text);
     }
 
     const response = await resolved.provider!.chat<UnifiedLLMResponse>(activeRequest, {

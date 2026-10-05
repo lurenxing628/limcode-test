@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { installOpenAIResponsesCompletedContent } from './openAIResponsesCompletedContent';
 /**
  * Gemini provider 适配：thinking 配置按模型能力规范化、工具 schema 清洗、
  * OpenAI 兼容 wire 上 Gemini thought signature 的请求/响应双向透传，
@@ -16,11 +17,11 @@ export function installProviderCompatibility<T>(
   providerKind: LlmProviderKind,
   modelId: string
 ): T {
-  return installGeminiOpenAICompatibleThoughtSignatures(
+  return installOpenAIResponsesCompletedContent(installGeminiOpenAICompatibleThoughtSignatures(
     installProviderSchemaEncoder(provider, providerKind, modelId),
     providerKind,
     modelId
-  );
+  ), providerKind);
 }
 
 function installProviderSchemaEncoder<T>(
