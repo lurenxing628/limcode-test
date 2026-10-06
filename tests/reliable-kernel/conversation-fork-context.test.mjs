@@ -168,3 +168,177 @@ test('尚无 Provider 用量的分支按语义估算并保留压缩摘要', asyn
     assert.equal(root.tail_segment_count, 1n);
   }, false);
 });
+
+function observedProjectionFixture(segmentCount, anchor) {
+  const events = [];
+  const conversions = Array(segmentCount).fill(0);
+  const ranges = [];
+  const segments = Array.from({ length: segmentCount }, (_, index) => ({
+    segmentId: `observed-segment-${index}`,
+    segmentKind: 'message',
+    messageRole: index % 2 === 0 ? 'user' : 'model',
+    contentObject: { content_type: 'application/vnd.limcode.message+json' },
+    content: Buffer.from(JSON.stringify({
+      role: index % 2 === 0 ? 'user' : 'model',
+      parts: [{ text: `Observed projection content ${index}.` }]
+    }))
+  }));
+  const prepared = new kernel.PreparedAttachmentCatalogProjection(segments.map(segment => ({
+    segmentId: segment.segmentId, segmentKind: segment.segmentKind, catalog: []
+  })), []);
+  const projectState = prepared.projectState.bind(prepared);
+  const projectRange = prepared.projectRange.bind(prepared);
+  const modelHandleCatalog = { entries: [] };
+  const projected = (start, end) => kernel.estimateMaterializedContextTokens(
+    segments.slice(start, end), projectRange(start, end), modelHandleCatalog
+  );
+  prepared.projectState = () => {
+    events.push('state');
+    return projectState();
+  };
+  prepared.projectRange = (start, end) => {
+    ranges.push([start, end]);
+    return projectRange(start, end);
+  };
+  const materialized = {
+    root: { conversation_id: 'observed-conversation' },
+    segments: segments.map((segment, index) => {
+      const content = Buffer.from(segment.content);
+      content.toString = (...args) => {
+        events.push(`content-${index}`);
+        conversions[index] += 1;
+        return Buffer.prototype.toString.apply(content, args);
+      };
+      return { ...segment, content };
+    })
+  };
+  // Keep the production estimator and projection paths; replace only the per-call fact readers.
+  const estimator = Object.create(kernel.ReliableContextTokenEstimator.prototype);
+  estimator.findObservedPrefix = async (conversationId, current) => {
+    events.push('anchor');
+    assert.equal(conversationId, materialized.root.conversation_id);
+    assert.equal(current, materialized.segments);
+    return anchor;
+  };
+  estimator.attachmentCatalog = {
+    async prepare(conversationId, selected) {
+      events.push('prepare');
+      assert.equal(conversationId, materialized.root.conversation_id);
+      assert.deepEqual(selected, segments.map(segment => ({ segmentId: segment.segmentId })));
+      return prepared;
+    }
+  };
+  estimator.attachmentHandles = {
+    async ensure(conversationId, catalog) {
+      events.push('handles');
+      assert.equal(conversationId, materialized.root.conversation_id);
+      assert.deepEqual(catalog, []);
+      return modelHandleCatalog;
+    }
+  };
+  return { estimator, materialized, prepared, conversions, ranges, events, projected };
+}
+
+for (const segmentCount of [100, 400]) {
+  test(`observed token projection reuses the validated full window (${segmentCount} segments)`, async () => {
+    const anchor = {
+      promptTokens: 5000, totalTokens: 7000, modelRequestId: 'observed-request',
+      coveredSegmentCount: segmentCount, outputSegmentIndex: segmentCount - 1
+    };
+    const fixture = observedProjectionFixture(segmentCount, anchor);
+    const { estimator, materialized, conversions, ranges, events } = fixture;
+    const result = await estimator.estimateMaterializedRoot(materialized);
+    assert.deepEqual(result, {
+      full: {
+        estimatedTokens: 7000, source: 'provider-observed-delta', conversationId: 'observed-conversation',
+        observedPromptTokens: 5000, observedModelRequestId: 'observed-request', coveredSegmentCount: segmentCount
+      },
+      prefixTokens: 7000
+    });
+    assert.deepEqual(conversions, Array(segmentCount).fill(1), 'each content is projected only once');
+    assert.deepEqual(ranges, [], 'neither the covered window nor known output needs another attachment range');
+    assert.deepEqual(events, ['anchor', 'prepare', 'state', 'handles',
+      ...Array.from({ length: segmentCount }, (_, index) => `content-${index}`)]);
+
+    // Reuse is local to one estimate, and zero is a supplied total rather than a fallback request.
+    anchor.totalTokens = 0;
+    const fresh = await estimator.estimateMaterializedRoot(materialized);
+    assert.equal(fresh.full.estimatedTokens, 0);
+    assert.equal(fresh.prefixTokens, 0);
+    assert.deepEqual(conversions, Array(segmentCount).fill(2));
+    assert.deepEqual(ranges, []);
+    assert.equal(events.filter(event => event === 'anchor').length, 2);
+    assert.equal(events.filter(event => event === 'prepare').length, 2);
+    assert.equal(events.filter(event => event === 'handles').length, 2);
+  });
+
+  test(`observed token projection estimates output only without provider total (${segmentCount} segments)`, async () => {
+    const fixture = observedProjectionFixture(segmentCount, {
+      promptTokens: 5000, modelRequestId: 'observed-request',
+      coveredSegmentCount: segmentCount, outputSegmentIndex: segmentCount - 1
+    });
+    const expected = 5000 + fixture.projected(segmentCount - 1, segmentCount);
+    const result = await fixture.estimator.estimateMaterializedRoot(fixture.materialized);
+    assert.equal(result.full.estimatedTokens, expected);
+    assert.equal(result.prefixTokens, expected);
+    assert.deepEqual(fixture.conversions, Array.from({ length: segmentCount }, (_, index) =>
+      index === segmentCount - 1 ? 2 : 1));
+    assert.deepEqual(fixture.ranges, [[segmentCount - 1, segmentCount]]);
+  });
+
+  test(`observed token projection still projects partial coverage (${segmentCount} segments)`, async () => {
+    const covered = segmentCount / 2;
+    const fixture = observedProjectionFixture(segmentCount, {
+      promptTokens: 5000, totalTokens: 7000, modelRequestId: 'observed-request',
+      coveredSegmentCount: covered, outputSegmentIndex: covered - 1
+    });
+    const expected = 7000 + Math.max(0, fixture.projected(0, segmentCount) - fixture.projected(0, covered));
+    const result = await fixture.estimator.estimateMaterializedRoot(fixture.materialized);
+    assert.equal(result.full.estimatedTokens, expected);
+    assert.equal(result.full.coveredSegmentCount, covered);
+    assert.equal(result.prefixTokens, expected);
+    assert.deepEqual(fixture.conversions, Array.from({ length: segmentCount }, (_, index) => index < covered ? 2 : 1));
+    assert.deepEqual(fixture.ranges, [[0, covered]]);
+  });
+}
+
+test('observed token projection preserves the requested prefix delta after full-window reuse', async () => {
+  const segmentCount = 100;
+  const requestedPrefix = 40;
+  const fixture = observedProjectionFixture(segmentCount, {
+    promptTokens: 5000, totalTokens: 7000, modelRequestId: 'observed-request',
+    coveredSegmentCount: segmentCount, outputSegmentIndex: segmentCount - 1
+  });
+  const expected = Math.max(0, 7000 - Math.max(0,
+    fixture.projected(0, segmentCount) - fixture.projected(0, requestedPrefix)));
+  const result = await fixture.estimator.estimateMaterializedRoot(fixture.materialized, requestedPrefix);
+  assert.equal(result.full.estimatedTokens, 7000);
+  assert.equal(result.prefixTokens, expected);
+  assert.deepEqual(fixture.conversions, Array.from({ length: segmentCount }, (_, index) => index < requestedPrefix ? 2 : 1));
+  assert.deepEqual(fixture.ranges, [[0, requestedPrefix]]);
+});
+
+test('observed token projection never bypasses full validation or changes discovery error precedence', async () => {
+  for (const discoveryFails of [false, true]) {
+    const fixture = observedProjectionFixture(100, {
+      promptTokens: 5000, totalTokens: 7000, modelRequestId: 'observed-request',
+      coveredSegmentCount: 100, outputSegmentIndex: 99
+    });
+    const discoveryError = new Error('Injected anchor discovery failure.');
+    if (discoveryFails) fixture.estimator.findObservedPrefix = async () => { throw discoveryError; };
+    fixture.prepared.projectState = () => ({ catalog: [], placements: [{ kind: 'invalid' }] });
+    await assert.rejects(fixture.estimator.estimateMaterializedRoot(fixture.materialized), error => {
+      assert.notEqual(error, discoveryError, 'the full projection error must take precedence over discovery');
+      assert.match(error.message, /attachmentCatalogState\.placements\[0\]\.kind/);
+      return true;
+    });
+    assert.deepEqual(fixture.conversions, Array(100).fill(1), 'the initial full projection must still run');
+    assert.deepEqual(fixture.ranges, []);
+    if (discoveryFails) {
+      fixture.prepared.projectState = () => ({ catalog: [], placements: [] });
+      await assert.rejects(fixture.estimator.estimateMaterializedRoot(fixture.materialized), error => error === discoveryError);
+      assert.deepEqual(fixture.conversions, Array(100).fill(2));
+      assert.deepEqual(fixture.ranges, []);
+    }
+  }
+});

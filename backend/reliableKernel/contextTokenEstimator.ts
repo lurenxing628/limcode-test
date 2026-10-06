@@ -180,18 +180,20 @@ export class ReliableContextTokenEstimator {
     let anchoredTokens = anchor.promptTokens;
     if (anchor.outputSegmentIndex !== undefined) {
       const index = anchor.outputSegmentIndex;
-      const outputAttachmentState = attachments.projectRange(index, index + 1);
       anchoredTokens = anchor.totalTokens ?? (anchor.promptTokens + estimateMaterializedContextTokens(
         [current[index]],
-        outputAttachmentState,
+        attachments.projectRange(index, index + 1),
         modelHandleCatalog
       ));
     }
-    const coveredProjected = estimateMaterializedContextTokens(
-      current.slice(0, anchor.coveredSegmentCount),
-      attachments.projectRange(0, anchor.coveredSegmentCount),
-      modelHandleCatalog
-    );
+    // The full window has already been validated and projected with this call's attachment facts.
+    const coveredProjected = anchor.coveredSegmentCount === current.length
+      ? currentProjected
+      : estimateMaterializedContextTokens(
+          current.slice(0, anchor.coveredSegmentCount),
+          attachments.projectRange(0, anchor.coveredSegmentCount),
+          modelHandleCatalog
+        );
     const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
     return {
       estimatedTokens: safeTokenCount(estimatedTokens, 'provider-observed Context estimate'),
