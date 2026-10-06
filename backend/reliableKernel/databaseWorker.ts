@@ -155,16 +155,22 @@ class VerifiedContextCasCache {
   private misses = 0;
   private evictions = 0;
 
-  public read(metadata: DomainRow, access: SynchronousCasByteAccess): Buffer {
+  /** Capture hits before a full-history scan admits misses that could evict later scan hits. */
+  public readCached(metadata: DomainRow): Buffer | undefined {
     const identity = contextCasIdentity(metadata);
     const cached = this.entries.get(identity.id);
-    if (cached) {
-      assertSameContextCasIdentity(cached, identity);
-      this.entries.delete(identity.id);
-      this.entries.set(identity.id, cached);
-      this.hits += 1;
-      return cached.bytes;
-    }
+    if (!cached) return undefined;
+    assertSameContextCasIdentity(cached, identity);
+    this.entries.delete(identity.id);
+    this.entries.set(identity.id, cached);
+    this.hits += 1;
+    return cached.bytes;
+  }
+
+  public read(metadata: DomainRow, access: SynchronousCasByteAccess): Buffer {
+    const cached = this.readCached(metadata);
+    if (cached !== undefined) return cached;
+    const identity = contextCasIdentity(metadata);
     this.misses += 1;
     const bytes = access.readBytes(requireCasObjectIdentity(metadata));
     if (bytes.length <= CONTEXT_CAS_CACHE_MAX_BYTES) {
@@ -2663,7 +2669,18 @@ function attachContextContent(
   transferList: ArrayBuffer[];
 } {
   const unique = new Map<string, Buffer>();
+  // A chronological scan larger than either LRU budget otherwise evicts each next hit before
+  // reaching it. Retain this request's existing verified hits before admitting any misses. These
+  // buffers already belong in the request-local materialization; the persistent budgets stay fixed.
+  for (const record of barrier.snapshot.records) {
+    const metadata = record.contentObject;
+    const id = requireRuntimeId(metadata.id);
+    if (unique.has(id)) continue;
+    const cached = cache.readCached(metadata);
+    if (cached !== undefined) unique.set(id, cached);
+  }
   let totalBytes = 0;
+  for (const bytes of unique.values()) totalBytes += bytes.length;
   for (const record of barrier.snapshot.records) {
     const metadata = record.contentObject;
     const id = requireRuntimeId(metadata.id);
