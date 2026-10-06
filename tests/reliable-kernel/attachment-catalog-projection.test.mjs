@@ -1144,6 +1144,181 @@ test('native tool attachments become visible only at the chronological result oc
   });
 });
 
+// Exercise the real lineage reader with already-primed facts, so traversal work can be
+// counted independently of database reads and without patching global Set behavior.
+function primedLineageProjection(graph) {
+  const conversationId = 'lineage-traversal-conversation';
+  const projection = new kernel.AttachmentCatalogProjection({
+    snapshot() { assert.fail('Lineage fixture must not read unprimed domain rows.'); },
+    attachmentProjectionSegments() { assert.fail('Lineage fixture must not read unprimed segments.'); }
+  });
+  for (const [segmentId, children] of Object.entries(graph)) {
+    const contentId = `content-${segmentId}`;
+    const sourceId = `${children ? 'block' : 'revision'}-${segmentId}`;
+    projection.segmentCache.set(segmentId, {
+      id: segmentId, content_object_id: contentId, segment_kind: children ? 'compression' : 'message'
+    });
+    projection.sourceCache.set(segmentId, [{
+      id: `source-${segmentId}`, segment_id: segmentId,
+      source_kind: children ? 'compression_block' : 'message_revision',
+      source_id: sourceId, source_revision: 0n
+    }]);
+    if (children) {
+      projection.compressionBlockCache.set(sourceId, {
+        id: sourceId, conversation_id: conversationId, summary_object_id: contentId
+      });
+      projection.blockSourceCache.set(sourceId, children.map((childId, position) => ({
+        id: `block-source-${segmentId}-${position}`, compression_block_id: sourceId,
+        segment_id: childId, position: BigInt(position)
+      })));
+    } else {
+      const messageId = `message-${segmentId}`;
+      projection.messageRevisionCache.set(sourceId, {
+        id: sourceId, message_id: messageId, revision_seq: 0n, content_object_id: contentId
+      });
+      projection.messageMembershipCache.set(messageId, [{
+        id: `membership-${segmentId}`, message_id: messageId, conversation_id: conversationId
+      }]);
+    }
+  }
+  return { projection, conversationId };
+}
+
+test('deep compression lineage uses linear active-path operations without copying ancestors', async () => {
+  const depth = 1024;
+  const graph = { leaf: null };
+  for (let index = 0; index < depth; index += 1) {
+    graph[`compression-${index}`] = [index + 1 === depth ? 'leaf' : `compression-${index + 1}`];
+  }
+  const { projection, conversationId } = primedLineageProjection(graph);
+  const operations = { has: 0, add: 0, delete: 0, copiedAncestors: 0, maximumSize: 0 };
+  class CountedPath extends Set {
+    has(value) { operations.has += 1; return super.has(value); }
+    add(value) {
+      operations.add += 1;
+      super.add(value);
+      operations.maximumSize = Math.max(operations.maximumSize, this.size);
+      return this;
+    }
+    delete(value) { operations.delete += 1; return super.delete(value); }
+    *[Symbol.iterator]() {
+      for (const value of super[Symbol.iterator]()) {
+        operations.copiedAncestors += 1;
+        yield value;
+      }
+    }
+  }
+  const activePath = new CountedPath();
+  const revisions = [];
+  await projection.collectSegmentRevisions(conversationId, 'compression-0', revisions, activePath);
+  assert.deepEqual(revisions, ['revision-leaf']);
+  assert.equal(activePath.size, 0);
+  assert.deepEqual(operations, {
+    has: depth + 1, add: depth, delete: depth, copiedAncestors: 0, maximumSize: depth
+  });
+});
+
+test('compression lineage preserves diamond occurrences and child order on repeated traversals', async () => {
+  const { projection, conversationId } = primedLineageProjection({
+    root: ['left', 'right'], left: ['first', 'shared'], right: ['shared', 'last'],
+    shared: ['a', 'b'], first: null, a: null, b: null, last: null
+  });
+  const activePath = new Set(['outer-ancestor']);
+  const expected = ['revision-first', 'revision-a', 'revision-b', 'revision-a', 'revision-b', 'revision-last'];
+  for (let occurrence = 0; occurrence < 2; occurrence += 1) {
+    const revisions = [];
+    await projection.collectSegmentRevisions(conversationId, 'root', revisions, activePath);
+    assert.deepEqual(revisions, expected);
+    assert.deepEqual([...activePath], ['outer-ancestor']);
+  }
+});
+
+test('compression lineage releases its active path after a true cycle', async () => {
+  const { projection, conversationId } = primedLineageProjection({ a: ['b'], b: ['a'], leaf: null });
+  const activePath = new Set(['outer-ancestor']);
+  await assert.rejects(
+    projection.collectSegmentRevisions(conversationId, 'a', [], activePath),
+    /Compression lineage cycle detected at a\./
+  );
+  assert.deepEqual([...activePath], ['outer-ancestor']);
+  projection.blockSourceCache.get('block-b')[0].segment_id = 'leaf';
+  const revisions = [];
+  await projection.collectSegmentRevisions(conversationId, 'a', revisions, activePath);
+  assert.deepEqual(revisions, ['revision-leaf']);
+  assert.deepEqual([...activePath], ['outer-ancestor']);
+});
+
+test('compression lineage releases every active ancestor after priming or child validation fails', async (t) => {
+  for (const failure of ['priming', 'child-id', 'child-kind']) {
+    await t.test(failure, async () => {
+      const { projection, conversationId } = primedLineageProjection({ root: ['inner'], inner: ['leaf'], leaf: null });
+      const primeSegments = projection.primeSegments.bind(projection);
+      let expectedError;
+      if (failure === 'priming') {
+        expectedError = new Error('Injected child priming failure.');
+        projection.primeSegments = async (selectedConversationId, segmentIds) => {
+          if (segmentIds.includes('leaf')) throw expectedError;
+          await primeSegments(selectedConversationId, segmentIds);
+        };
+      } else if (failure === 'child-id') {
+        projection.blockSourceCache.get('block-inner')[0].segment_id = '';
+        expectedError = /CompressionBlockSource.segment_id must be non-empty text/;
+      } else {
+        projection.segmentCache.get('leaf').segment_kind = 'invalid';
+        expectedError = /Unsupported Context segment kind/;
+      }
+      const activePath = new Set(['outer-ancestor']);
+      await assert.rejects(
+        projection.collectSegmentRevisions(conversationId, 'root', [], activePath), expectedError
+      );
+      assert.deepEqual([...activePath], ['outer-ancestor']);
+      projection.primeSegments = primeSegments;
+      projection.blockSourceCache.get('block-inner')[0].segment_id = 'leaf';
+      projection.segmentCache.get('leaf').segment_kind = 'message';
+      const revisions = [];
+      await projection.collectSegmentRevisions(conversationId, 'root', revisions, activePath);
+      assert.deepEqual(revisions, ['revision-leaf']);
+      assert.deepEqual([...activePath], ['outer-ancestor']);
+    });
+  }
+});
+
+test('overlapping compression lineage traversals keep independent active paths', async () => {
+  const { projection, conversationId } = primedLineageProjection({ root: ['inner'], inner: ['leaf'], leaf: null });
+  const primeSegments = projection.primeSegments.bind(projection);
+  let releaseFirst;
+  let markFirstPaused;
+  const gate = new Promise((resolve) => { releaseFirst = resolve; });
+  const firstPaused = new Promise((resolve) => { markFirstPaused = resolve; });
+  let paused = false;
+  projection.primeSegments = async (selectedConversationId, segmentIds) => {
+    await primeSegments(selectedConversationId, segmentIds);
+    if (!paused && segmentIds.includes('leaf')) {
+      paused = true;
+      markFirstPaused();
+      await gate;
+    }
+  };
+  const firstPath = new Set();
+  const firstRevisions = [];
+  const first = projection.collectSegmentRevisions(conversationId, 'root', firstRevisions, firstPath);
+  try {
+    await firstPaused;
+    assert.deepEqual([...firstPath], ['root', 'inner']);
+    const secondPath = new Set();
+    const secondRevisions = [];
+    await projection.collectSegmentRevisions(conversationId, 'root', secondRevisions, secondPath);
+    assert.deepEqual(secondRevisions, ['revision-leaf']);
+    assert.equal(secondPath.size, 0);
+    assert.deepEqual([...firstPath], ['root', 'inner']);
+  } finally {
+    releaseFirst();
+    await first;
+  }
+  assert.deepEqual(firstRevisions, ['revision-leaf']);
+  assert.equal(firstPath.size, 0);
+});
+
 test('compression lineage cycles fail closed without damaging the original expandable source', async () => {
   await withRuntime('attachment-catalog-cycle', async (database, fixtureContent) => {
     const repository = (name) => kernel.DOMAIN_REPOSITORIES.domain(name);

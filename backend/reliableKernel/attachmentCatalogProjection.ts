@@ -365,14 +365,19 @@ export class AttachmentCatalogProjection {
       }
       const blockSources = this.compressionBlockSources(blockId);
       if (blockSources.length === 0) throw new Error(`CompressionBlock ${blockId} has no registered sources.`);
-      const nextPath = new Set(path);
-      nextPath.add(segmentId);
-      const childSegmentIds = blockSources.map((source) =>
-        requireId(source.segment_id, 'CompressionBlockSource.segment_id')
-      );
-      await this.primeSegments(conversationId, childSegmentIds);
-      for (const childSegmentId of childSegmentIds) {
-        await this.collectSegmentRevisions(conversationId, childSegmentId, revisions, nextPath);
+      // Children run sequentially, so one active path preserves repeated DAG occurrences
+      // without copying every ancestor at each compression depth.
+      path.add(segmentId);
+      try {
+        const childSegmentIds = blockSources.map((source) =>
+          requireId(source.segment_id, 'CompressionBlockSource.segment_id')
+        );
+        await this.primeSegments(conversationId, childSegmentIds);
+        for (const childSegmentId of childSegmentIds) {
+          await this.collectSegmentRevisions(conversationId, childSegmentId, revisions, path);
+        }
+      } finally {
+        path.delete(segmentId);
       }
       return;
     }
