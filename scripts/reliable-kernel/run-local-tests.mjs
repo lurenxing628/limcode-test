@@ -118,6 +118,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/conversation-deletion-recovery.test.mjs',
   'tests/reliable-kernel/runtime-history-integrity.test.mjs',
   'tests/reliable-kernel/process-completion-integrity.test.mjs',
+  'tests/reliable-kernel/process-start-fingerprint-race.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-responsiveness.test.mjs',
   'tests/reliable-kernel/model-handle-catalog.test.mjs',
   'tests/reliable-kernel/runtime-history-repair.test.mjs',

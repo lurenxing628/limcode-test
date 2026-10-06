@@ -291,6 +291,7 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/packed-cas.test.mjs',
   'tests/reliable-kernel/runtime-history-repair-child.mjs',
   'tests/reliable-kernel/process-completion-integrity.test.mjs',
+  'tests/reliable-kernel/process-start-fingerprint-race.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-responsiveness.test.mjs',
   'tests/reliable-kernel/model-handle-catalog.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-state.test.mjs',

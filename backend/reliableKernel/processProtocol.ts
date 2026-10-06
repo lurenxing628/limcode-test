@@ -553,7 +553,16 @@ function firstLine(text: string | null | undefined): string | undefined {
 
 export function readLinuxStartFingerprint(pidInput: string | number): string {
   const pid = normalizePid(pidInput);
-  const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  let stat: string;
+  try {
+    stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  } catch (error) {
+    // A task can disappear after procfs opens stat but before it reads the body. Linux reports
+    // ESRCH for that race, which is the same missing-process observation as open-time ENOENT.
+    // Keep all other I/O errors and malformed identity evidence distinct and fail closed.
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') throw processInspectionMissing(pid, error);
+    throw error;
+  }
   const close = stat.lastIndexOf(')');
   if (close < 0) throw new Error(`Cannot parse /proc/${pid}/stat.`);
   const fieldsFromState = stat.slice(close + 2).trim().split(/\s+/);
