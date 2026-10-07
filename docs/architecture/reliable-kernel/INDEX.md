@@ -44,6 +44,7 @@
 
 - [模型、工具调度与工具执行性能画像（生产历史 + 当前受控基准，非机器合同）](./TOOL-MODEL-PERFORMANCE-PROFILE.md)
 - [工具调度器与执行器性能优化方案（本机源码研究，非机器合同）](./TOOL-SCHEDULER-EXECUTOR-OPTIMIZATION.md)
+- [每个数据目录只保留一个历史库（分期方案，非机器合同）](./one-history-library-plan.md)
 - [性能与打包边界](./appendices/performance-and-packaging-gates.md)
 - [可靠 Runtime 有界诊断](./appendices/runtime-diagnostics.md)
 - [术语](./appendices/terminology.md)
