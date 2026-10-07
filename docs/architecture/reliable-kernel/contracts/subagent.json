@@ -296,7 +296,8 @@
       ]
     },
     "parentTurnRecovery": "父Turn重启后的恢复判定以identity.json recoveryJudgment节为唯一权威。",
-    "rule": "统一自动路由只允许active source精确current_turn、completed source进入next_turn；interrupted/cancelled source仅允许由持久RuntimeInboxItem+AnswerSubmission证明的正常子Agent答案进入next_turn并创建新Turn，绝不复活旧Turn；中断部分结果、子执行失败、后台进程结果以及failed/outcome_unknown只通知；TurnFinalOutputFence后仍不得续写已展示最终回答。Child source还必须是该ChildExecution最新generation且未处于interrupting/interrupted/永久终态。pending或consumed-but-unhandled Delivery由持久RuntimeDeliveryWake跨Host唤醒owner，失败保留原因，人工重投创建新attempt；wake达到有界dead-letter时同步把仍pending的Delivery置failed，若已consumed但未handled则历史投影读取dead-letter事实显示答案交付失败，不得永久显示等待接收。"
+    "rule": "统一自动路由只允许active source精确current_turn、completed source进入next_turn；interrupted/cancelled source仅允许由持久RuntimeInboxItem+AnswerSubmission证明的正常子Agent答案进入next_turn并创建新Turn，绝不复活旧Turn；中断部分结果、子执行失败、后台进程结果以及failed/outcome_unknown只通知；TurnFinalOutputFence后仍不得续写已展示最终回答。Child source还必须是该ChildExecution最新generation且未处于interrupting/interrupted/永久终态。pending或consumed-but-unhandled Delivery由持久RuntimeDeliveryWake跨Host唤醒owner，失败保留原因，人工重投创建新attempt；wake达到有界dead-letter时同步把仍pending的Delivery置failed，若已consumed但未handled则历史投影读取dead-letter事实显示答案交付失败，不得永久显示等待接收。",
+    "historicalMerge": "合并前收尾复用 settleOfflineWork 与既有用户停止、deliverySettlementSteps 放弃转换，原因 historical-merge-settled，显示“合并前已中止，未送达”。本地来源先持久记录同意并备份，在来源维护声明内以 SETTLING_ONLY 打开；最多三轮，保留按对话返回的 live/unsettled，由合并规划剔除相应对话，无法归属到对话的失败整份推迟。外来来源不原地收尾，已剔除对话不再处理。迁移仍使用原原因与五轮收尾。"
   },
   "parentHandling": {
     "source": "RuntimeDelivery.state + RuntimeDeliveryInputLink.handled_at",
@@ -425,7 +426,7 @@
     "resultRouting": "AnswerSubmission-to-original-parent-remains-independent; peer-request-replies-have-explicit-ReplyLink",
     "permissions": "same-root-peer-communication; conversations-outside-the-team-are-reachable-only-through-cross-conversation-tools-or-completion-replies-to-the-original-requester; no-peer-interrupt-by-message-permission",
     "revocation": "check-current-team-lineage-and-target-state-again-at-admission",
-    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; deliveries-a-data-root-relocation-carried-away-fail-in-the-old-directory(data-root-relocated)-and-the-reply-that-tells-the-requester-would-open-a-Turn-so-the-next-settlement-round-gives-it-up-too; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply; a-reply-committed-before-the-deletion-only-settles-its-request(completed-when-a-Turn-wrote-it-failed-for-a-failure-reply)-and-is-never-sent-twice",
+    "history": "immutable-message-facts-remain-after-conversation-deletion; target-gone-deliveries-fail; deliveries-a-data-root-relocation-carried-away-fail-in-the-old-directory(data-root-relocated)-and-the-reply-that-tells-the-requester-would-open-a-Turn-so-the-next-settlement-round-gives-it-up-too; a-followup-no-Turn-will-answer-fails(all-deliveries-failed-or-acknowledged-without-a-Turn-or-its-Turn-deleted-with-the-target); a-cross-conversation-followup-first-gets-one-failure-completion-reply; a-team-followup-fails-without-a-reply; a-reply-committed-before-the-deletion-only-settles-its-request(completed-when-a-Turn-wrote-it-failed-for-a-failure-reply)-and-is-never-sent-twice; historical-merge-settled 使用相同的失败答复与放弃交付，收尾中新产生的协作结果在后续轮次处理",
     "limits": "frozen-policy-bounds-active-team-size-recursion-and-turn-wakeup-budget",
     "forkTurns": [
       "none",

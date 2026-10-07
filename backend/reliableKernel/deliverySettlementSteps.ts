@@ -122,7 +122,12 @@ export function abandonedDeliveryInsertSteps(
 /** The reason code a data-root relocation settles the carried results of the old directory with. */
 export const DATA_ROOT_RELOCATED_REASON = 'data-root-relocated';
 
+/** A local historical source whose unfinished work the user explicitly agreed to stop before merge. */
+export const HISTORICAL_MERGE_SETTLED_REASON = 'historical-merge-settled';
+
 /** What the user reads for a settlement reason code shown next to an undelivered result. */
 export function settlementReasonText(reason: string | undefined): string | undefined {
-  return reason === DATA_ROOT_RELOCATED_REASON ? '数据目录已迁移，未送达' : undefined;
+  if (reason === DATA_ROOT_RELOCATED_REASON) return '数据目录已迁移，未送达';
+  if (reason === HISTORICAL_MERGE_SETTLED_REASON) return '合并前已中止，未送达';
+  return undefined;
 }

@@ -191,9 +191,9 @@ export async function settleEarlierMovedWorkOffline(configurationRootPath: strin
 }
 
 /** Everything that could run work refuses: the Runtime above only takes the stop transitions. */
-const SETTLING_ONLY: ReliableKernelApplicationDependencies = (() => {
+export const SETTLING_ONLY: ReliableKernelApplicationDependencies = (() => {
   const refuse = (what: string) => (): never => {
-    throw new Error(`迁移前收尾迁走的任务时不执行任何工作（${what}）。`);
+    throw new Error(`离线收尾时不执行任何工作（${what}）。`);
   };
   return {
     holdRuntimeConvergence: true,

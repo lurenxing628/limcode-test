@@ -1588,6 +1588,7 @@ function validateSubagent(subagent, failures) {
   for (const marker of ['inbox_item_id,target_conversation_id,attempt_seq', 'attempt_seq+1', 'retry_of_delivery_id', '旧failed行不复活']) {
     if (!deliveryText.includes(marker)) failures.push(`subagent Delivery合同缺少${marker}`);
   }
+  if (!subagent?.delivery?.historicalMerge?.includes('historical-merge-settled')) failures.push('合并前收尾必须登记既有停止与放弃转换的原因');
   if (subagent?.parentHandling?.deliveryConsumedMeansParentCompleted !== false) failures.push('答案送达不能冒充父Turn已经处理完成');
   if (subagent?.parentHandling?.source !== 'RuntimeDelivery.state + RuntimeDeliveryInputLink.handled_at') failures.push('parentHandling必须只读取对应InputLink.handled_at');
   if (subagent?.interrupt?.requestIsTerminal !== false) failures.push('发出终止请求不能冒充Turn已经结束');

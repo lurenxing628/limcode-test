@@ -5,7 +5,7 @@ import {
   runWithoutExecutionLeaseFence,
   type ExecutionLeaseFence
 } from '../../reliableKernel/executionLeaseFence';
-import { DATA_ROOT_RELOCATED_REASON } from '../../reliableKernel/deliverySettlementSteps';
+import { DATA_ROOT_RELOCATED_REASON, HISTORICAL_MERGE_SETTLED_REASON } from '../../reliableKernel/deliverySettlementSteps';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
 import {
@@ -16,6 +16,15 @@ import {
 } from '../../reliableKernel/relocatedWorkInventory';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 
+import type {
+  RelocatedWorkSettlementCounts, RelocatedWorkItem, RelocatedWorkUnsettled,
+  RelocatedWorkItemList, RelocatedWorkSettlementResult
+} from '../../reliableKernel/historicalWorkSettlement';
+export type {
+  RelocatedWorkSettlementCounts, RelocatedWorkItem, RelocatedWorkUnsettled, RelocatedWorkUnsettledKind,
+  RelocatedWorkItemList, RelocatedWorkSettlementResult
+} from '../../reliableKernel/historicalWorkSettlement';
+
 /**
  * Closes, in the old data directory, the unfinished work a data-root relocation carried into the
  * new one (see relocatedWorkInventory), so that a Host recovering the old directory never runs it a
@@ -24,7 +33,7 @@ import type { ReliableKernelApplication } from '../../reliableKernel/runtimeAppl
  * Only public control-plane transitions are used: those of a user's explicit stop, in the order the
  * tested stop paths use them (ReliableConversationRunner.interrupt with its control-only settlement,
  * ReliableChildAgentCoordinator.interruptSubtree with `userStop`), and the abandon transitions that
- * give a result up with the reason code `data-root-relocated` (deliverySettlementSteps: the rows'
+ * give a result up with the selected settlement reason (deliverySettlementSteps: the rows'
  * existing terminal states failed / dead_letter, never retried, never opening a Turn):
  *
  * | Work                                              | Transition                                                   |
@@ -59,80 +68,17 @@ export function relocatedWorkSettlementReason(targetRootPath: string): string {
   return `数据目录已迁移到 ${targetRootPath}，这个任务已随数据迁走，可能已在新目录执行过；在这里按中止收尾，不再执行。`;
 }
 
-export interface RelocatedWorkSettlementCounts {
-  /** Top-level Turns stopped (recorded as interrupted; an orphan one as cancelled). */
-  turnsStopped: number;
-  /** Child Agent Turns stopped through their subtree. */
-  childTurnsStopped: number;
-  /** Child executions interrupted, each with its whole subtree. */
-  childExecutionsInterrupted: number;
-  /** Background child Agents of a completed parent Turn, stopped like from their own panel (they go idle). */
-  backgroundChildrenStopped: number;
-  /** Queued user messages cancelled. */
-  queuedMessagesCancelled: number;
-  /** Pending child continuations cancelled with their subtree. */
-  childContinuationsCancelled: number;
-  /** Questions and approvals that waited for the user, cancelled with their Turn. */
-  interactionsCancelled: number;
-  /** Model requests that never started, closed with their Turn. */
-  modelRequestsClosed: number;
-  /** Tool effects not dispatched yet, cancelled with their Turn. */
-  effectsCancelled: number;
-  /** Tool effects dispatched by a window that is gone, closed as outcome_unknown. */
-  effectsClosedAsUnknown: number;
-  /** Results already addressed to a stopped Turn, kept in its history instead of continuing it. */
-  deliveriesTakenIn: number;
-  /** Queued continuations that are not ordinary user messages (a retry, a runtime continuation), cancelled. */
-  queuedIntentsCancelled: number;
-  /** Pending results (a child answer, a process completion, a collaboration message) failed as not delivered here. */
-  deliveriesAbandoned: number;
-  /** Child answers nobody routed yet, given an already failed delivery. */
-  answersAbandoned: number;
-  /** Finished background processes whose completion notice is dead-lettered instead of delivered. */
-  processCompletionsAbandoned: number;
-}
-
-export type RelocatedWorkUnsettledKind =
-  /** A Turn the stop path does not close here (child spawn or cancel in flight, inconsistent facts). */
-  | 'needs_human'
-  /** Settling this item threw; `detail` has the error. */
-  | 'failed'
-  /**
-   * Still new executable work after MAX_SETTLEMENT_ROUNDS rounds (each round's settlement created
-   * more, for example requesters told that nobody will answer): not settled further this time.
-   */
-  | 'rounds_exhausted';
-
-/**
- * What an item is: the inventory list its id belongs to (`pendingProcessCompletionIds` holds dispatch
- * ids), `otherRuntimeWork` (the pending-work probe; id: the Conversation) or `round` (a whole round).
- */
-export type RelocatedWorkItemList = (typeof RELOCATED_WORK_LISTS)[number] | 'otherRuntimeWork' | 'round';
-
-export interface RelocatedWorkItem {
-  conversationId: string;
-  id: string;
-  list: RelocatedWorkItemList;
-}
-
-export interface RelocatedWorkUnsettled extends RelocatedWorkItem {
-  kind: RelocatedWorkUnsettledKind;
-  detail: string;
-}
-
-export interface RelocatedWorkSettlementResult {
-  reason: string;
-  counts: RelocatedWorkSettlementCounts;
-  /** Work a live Host executes or holds: a Turn has its durable stop request, the rest is left to that Host. */
-  live: RelocatedWorkItem[];
-  unsettled: RelocatedWorkUnsettled[];
-  /** Settlement rounds run: settling can create new work (see run), taken again up to the limit. */
-  rounds: number;
-}
-
-const SOURCE_PREFIX = 'data-root-relocated';
 /** Rounds of settle, converge collaboration, take the inventory again; more new work is left (`rounds_exhausted`). */
 const MAX_SETTLEMENT_ROUNDS = 5;
+export const HISTORICAL_MERGE_SETTLEMENT_MAX_ROUNDS = 3;
+export const HISTORICAL_MERGE_SETTLEMENT_REASON = '合并前按用户确认中止未完成的工作，不再执行。';
+
+export interface OfflineWorkSettlementPolicy {
+  reasonCode: typeof DATA_ROOT_RELOCATED_REASON | typeof HISTORICAL_MERGE_SETTLED_REASON;
+  reason: string;
+  sourceKeyPrefix: string;
+  maxRounds: number;
+}
 /** Converging and taking the inventory between rounds is tried this often (another Host may converge the same facts). */
 const ROUND_ATTEMPTS = 3;
 const ROUND_RETRY_DELAY_MS = 100;
@@ -140,7 +86,7 @@ const CONTROL_LEASE_MS = 30_000;
 const CHILD_RUNNING_STATUSES = ['starting', 'active', 'interrupting'] as const;
 
 type TurnOutcome = 'stopped' | 'terminal' | 'live' | 'unsupported' | 'needs_human' | 'failed';
-type IncludedChild = { parentChildExecutionId: string | null; parentTurn: DomainRow | null };
+type IncludedChild = { childConversationId: string; parentChildExecutionId: string | null; parentTurn: DomainRow | null };
 
 /**
  * Settles the carried work of every Conversation the inventory lists (the inventory as written into
@@ -152,15 +98,52 @@ export async function settleRelocatedWork(input: {
   inventory: RelocatedWorkInventory | unknown;
   targetRootPath: string;
 }): Promise<RelocatedWorkSettlementResult> {
-  const inventory = parseRelocatedWorkInventory(input.inventory);
   if (typeof input.targetRootPath !== 'string' || input.targetRootPath.trim().length === 0) {
     throw new TypeError('settleRelocatedWork requires the new data directory.');
   }
-  return new RelocatedWorkSettlement(
-    input.application,
-    inventory,
-    relocatedWorkSettlementReason(input.targetRootPath)
-  ).run();
+  return settleOfflineWork({
+    ...input,
+    policy: {
+      reasonCode: DATA_ROOT_RELOCATED_REASON,
+      reason: relocatedWorkSettlementReason(input.targetRootPath),
+      sourceKeyPrefix: DATA_ROOT_RELOCATED_REASON,
+      maxRounds: MAX_SETTLEMENT_ROUNDS
+    }
+  });
+}
+
+/**
+ * A local historical source only: the caller owns its offline maintenance claim, has backed it up
+ * and durably recorded the user's consent before this call. Never use this on a foreign root.
+ * Items in live/unsettled carry Conversation ids for exclusion; an empty id is a source-wide
+ * failure and must defer the source. Checkpoint the result before recording finalization counts.
+ */
+export function settleHistoricalMergeWork(input: {
+  application: ReliableKernelApplication;
+  inventory: RelocatedWorkInventory | unknown;
+  /** The merge exclusion closure, including child families, must not be settled in any round. */
+  excludedConversationIds?: ReadonlySet<string>;
+}): Promise<RelocatedWorkSettlementResult> {
+  return settleOfflineWork({
+    ...input,
+    policy: {
+      reasonCode: HISTORICAL_MERGE_SETTLED_REASON,
+      reason: HISTORICAL_MERGE_SETTLEMENT_REASON,
+      sourceKeyPrefix: HISTORICAL_MERGE_SETTLED_REASON,
+      maxRounds: HISTORICAL_MERGE_SETTLEMENT_MAX_ROUNDS
+    }
+  });
+}
+
+/** Shared stop transitions; the supplied policy changes only provenance, user-facing copy and round limit. */
+export function settleOfflineWork(input: {
+  application: ReliableKernelApplication;
+  inventory: RelocatedWorkInventory | unknown;
+  policy: OfflineWorkSettlementPolicy;
+  excludedConversationIds?: ReadonlySet<string>;
+}): Promise<RelocatedWorkSettlementResult> {
+  const inventory = parseRelocatedWorkInventory(input.inventory);
+  return new RelocatedWorkSettlement(input.application, inventory, input.policy, input.excludedConversationIds).run();
 }
 
 class RelocatedWorkSettlement {
@@ -189,10 +172,11 @@ class RelocatedWorkSettlement {
   public constructor(
     private readonly application: ReliableKernelApplication,
     private readonly inventory: RelocatedWorkInventory,
-    private readonly reason: string
+    private readonly policy: OfflineWorkSettlementPolicy,
+    private readonly excludedConversationIds: ReadonlySet<string> = new Set()
   ) {
     this.hostBootId = application.database.hostBootId;
-    this.leaseOwnerId = `${SOURCE_PREFIX}:${this.hostBootId}`;
+    this.leaseOwnerId = `${this.policy.sourceKeyPrefix}:${this.hostBootId}`;
   }
 
   /**
@@ -201,7 +185,7 @@ class RelocatedWorkSettlement {
    * Turn that ended completes the requests it took in; such a reply may open a Turn there. So after
    * each round the collaboration facts converge, the whole data set is taken again
    * (RuntimeDatabase.relocatedWorkInventory) and the Conversations with work not seen before are
-   * settled the same way, until no new work appears. After MAX_SETTLEMENT_ROUNDS rounds, what is
+   * settled the same way, until no new work appears. After the policy's maximum rounds, what is
    * still new is left (`rounds_exhausted`: the caller must not let it run). Converging and taking the
    * inventory is tried ROUND_ATTEMPTS times (another live Host of the old directory may converge the
    * same facts at once); when it keeps failing, the round is `failed`: what it would have found is
@@ -210,19 +194,20 @@ class RelocatedWorkSettlement {
   public async run(): Promise<RelocatedWorkSettlementResult> {
     const seen = new Set<string>();
     let round = 1;
-    await this.settleRound(this.inventory.conversations, seen);
+    await this.settleRound(this.inventory.conversations.filter((item) => !this.excludedConversationIds.has(item.conversationId)), seen);
     for (;;) {
       const next = await this.nextInventory(round + 1);
       if (!next) break;
-      const fresh = next.conversations.filter((conversation) => workKeys(conversation).some((key) => !seen.has(key)));
+      const fresh = next.conversations.filter((conversation) => !this.excludedConversationIds.has(conversation.conversationId)
+        && workKeys(conversation).some((key) => !seen.has(key)));
       if (fresh.length === 0) break;
-      if (round >= MAX_SETTLEMENT_ROUNDS) {
+      if (round >= this.policy.maxRounds) {
         for (const conversation of fresh) {
           for (const key of workKeys(conversation).filter((item) => !seen.has(item))) {
             const [list, id] = key.split('|');
             this.unsettled.push({
               conversationId: conversation.conversationId, list: list as RelocatedWorkItemList, kind: 'rounds_exhausted', id,
-              detail: `收尾 ${MAX_SETTLEMENT_ROUNDS} 轮后仍出现新的可执行项（${list}），这次不再收尾。`
+              detail: `收尾 ${this.policy.maxRounds} 轮后仍出现新的可执行项（${list}），这次不再收尾。`
             });
           }
         }
@@ -256,7 +241,7 @@ class RelocatedWorkSettlement {
   private result(rounds: number): RelocatedWorkSettlementResult {
     // A Conversation settled again in a later round reports what is still open once.
     return {
-      reason: this.reason,
+      reason: this.policy.reason,
       counts: { ...this.counts },
       live: uniqueBy(this.live, (item) => `${item.conversationId}|${item.id}`),
       unsettled: uniqueBy(this.unsettled, (item) => `${item.conversationId}|${item.kind}|${item.id}`),
@@ -302,7 +287,7 @@ class RelocatedWorkSettlement {
       }, 0n);
       try {
         const result = await this.application.turns.cancelGuidance({
-          source: { kind: 'command', key: `${SOURCE_PREFIX}:message:${intentId}` },
+          source: { kind: 'command', key: `${this.policy.sourceKeyPrefix}:message:${intentId}` },
           conversationId,
           intentId,
           expectedRevisionSeq: revisionSeq.toString()
@@ -324,7 +309,7 @@ class RelocatedWorkSettlement {
   private async cancelQueuedIntent(conversationId: string, intentId: string, expectedRevisionSeq: string): Promise<void> {
     try {
       const result = await this.application.turns.cancelQueuedIntent({
-        source: { kind: 'command', key: `${SOURCE_PREFIX}:intent:${intentId}` },
+        source: { kind: 'command', key: `${this.policy.sourceKeyPrefix}:intent:${intentId}` },
         conversationId,
         intentId,
         expectedRevisionSeq
@@ -355,9 +340,9 @@ class RelocatedWorkSettlement {
       const before = await this.turnWork(turnId);
       if (requestInterrupt) {
         const requested = await this.application.turns.requestExternalInterrupt(conversationId, {
-          source: { kind: 'command', key: `${SOURCE_PREFIX}:turn:${turnId}` },
+          source: { kind: 'command', key: `${this.policy.sourceKeyPrefix}:turn:${turnId}` },
           turnId,
-          reason: this.reason
+          reason: this.policy.reason
         });
         if (requested.ignoredBecauseTerminal) return 'terminal';
       }
@@ -372,7 +357,7 @@ class RelocatedWorkSettlement {
         this.unsettled.push({
           conversationId, list: 'activeTurnIds', kind: 'needs_human', id: turnId,
           detail: outcome === 'unsupported'
-            ? '子 Agent 的派生或取消仍在进行，停止路径不在这里收尾；已记录停止请求。'
+            ? '存在停止路径不支持的已派发效果或子 Agent 操作；已记录停止请求。'
             : 'Turn 的终态事实不一致，需要人工处理；已记录停止请求。'
         });
       } else if (outcome === 'failed') {
@@ -397,10 +382,10 @@ class RelocatedWorkSettlement {
     if (facts.turnStatus !== 'active') return 'terminal';
     if (facts.judgment === 'finalize') {
       await turns.finalizeRecovery({
-        source: { kind: 'recovery', key: `${SOURCE_PREFIX}:finalize:${turnId}` },
+        source: { kind: 'recovery', key: `${this.policy.sourceKeyPrefix}:finalize:${turnId}` },
         turnId,
         terminalStatus: 'cancelled',
-        reason: this.reason
+        reason: this.policy.reason
       });
       return 'stopped';
     }
@@ -423,16 +408,16 @@ class RelocatedWorkSettlement {
         if (current.state === 'dead') {
           const unknown = await this.withoutReceipt(current.effectIntentIds);
           await phaseD.abandonDeadHostEffects({
-            sourceKey: `${SOURCE_PREFIX}:dead-host:${turnId}`,
+            sourceKey: `${this.policy.sourceKeyPrefix}:dead-host:${turnId}`,
             effectIntentIds: current.effectIntentIds,
-            reason: this.reason
+            reason: this.policy.reason
           });
           this.counts.effectsClosedAsUnknown += unknown;
         } else {
           await phaseD.reconcileArrivedReceipts(current.receiptEffectIntentIds);
         }
         await this.closePendingInteractions(turnId);
-        return this.application.agentLoop.terminateRequested(turnId, SOURCE_PREFIX);
+        return this.application.agentLoop.terminateRequested(turnId, this.policy.sourceKeyPrefix);
       }));
     } finally {
       // Anything short of a terminal Turn, a failure included, hands the lease back in this hold.
@@ -454,8 +439,8 @@ class RelocatedWorkSettlement {
       const requestId = String(owner.request_id);
       const request = await this.require('InteractionRequest', requestId);
       if (request.status !== 'pending') continue;
-      const source = { kind: 'command' as const, key: `${SOURCE_PREFIX}:interaction:${requestId}` };
-      const response = { reason: this.reason };
+      const source = { kind: 'command' as const, key: `${this.policy.sourceKeyPrefix}:interaction:${requestId}` };
+      const response = { reason: this.policy.reason };
       switch (request.request_kind) {
         case 'ask_user':
           await this.application.interactions.resolveAskUser({ source, requestId, response, cancelled: true });
@@ -565,6 +550,7 @@ class RelocatedWorkSettlement {
     }
     const included = new Map<string, IncludedChild>();
     for (const [childExecutionId, child] of candidates) {
+      if (this.excludedConversationIds.has(String(child.child_conversation_id))) continue;
       const [parentLink] = await this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId });
       if (!parentLink) continue;
       const parentTurn = await this.get('Turn', String(parentLink.parent_turn_id));
@@ -572,6 +558,7 @@ class RelocatedWorkSettlement {
         continue;
       }
       included.set(childExecutionId, {
+        childConversationId: String(child.child_conversation_id),
         parentChildExecutionId: parentLink.parent_child_execution_id === null ? null : String(parentLink.parent_child_execution_id),
         parentTurn
       });
@@ -632,9 +619,9 @@ class RelocatedWorkSettlement {
     const parentConversationId = root.parentTurn ? String(root.parentTurn.conversation_id) : undefined;
     try {
       const interrupted = await this.application.runtime.children.interruptSubtree({
-        sourceKey: `${SOURCE_PREFIX}:child:${rootId}`,
+        sourceKey: `${this.policy.sourceKeyPrefix}:child:${rootId}`,
         childExecutionId: rootId,
-        reason: this.reason
+        reason: this.policy.reason
       });
       if (!interrupted.deduplicated) {
         this.counts.childExecutionsInterrupted += interrupted.lineageIds.length;
@@ -647,7 +634,7 @@ class RelocatedWorkSettlement {
       }
     } catch (error) {
       this.unsettled.push({
-        conversationId: parentConversationId ?? rootId, list: 'childExecutionIds', kind: 'failed', id: rootId, detail: errorMessage(error)
+        conversationId: parentConversationId ?? root.childConversationId, list: 'childExecutionIds', kind: 'failed', id: rootId, detail: errorMessage(error)
       });
     }
   }
@@ -686,7 +673,7 @@ class RelocatedWorkSettlement {
         continue;
       }
       try {
-        const result = await this.application.runtime.deliveries.abandonPending({ deliveryId, reason: DATA_ROOT_RELOCATED_REASON });
+        const result = await this.application.runtime.deliveries.abandonPending({ deliveryId, reason: this.policy.reasonCode });
         if (result.outcome === 'abandoned') {
           this.counts.deliveriesAbandoned += 1;
           this.counts.queuedIntentsCancelled += result.intentsCancelled;
@@ -746,7 +733,7 @@ class RelocatedWorkSettlement {
         const abandoned = await this.application.runtime.deliveries.createAbandoned({
           inboxItemId: disposition.inboxItemId,
           targetConversationId: disposition.command.targetConversationId,
-          reason: DATA_ROOT_RELOCATED_REASON
+          reason: this.policy.reasonCode
         });
         if (abandoned.created) this.counts.answersAbandoned += 1;
       } catch (error) {
@@ -776,7 +763,7 @@ class RelocatedWorkSettlement {
       try {
         const outcome = await this.application.processDeliveries.abandonDispatch({
           dispatchId: String(dispatch.id),
-          reason: DATA_ROOT_RELOCATED_REASON
+          reason: this.policy.reasonCode
         });
         if (outcome === 'abandoned') this.counts.processCompletionsAbandoned += 1;
         else if (outcome === 'live') this.live.push({ conversationId, id: String(dispatch.id), list: 'pendingProcessCompletionIds' });

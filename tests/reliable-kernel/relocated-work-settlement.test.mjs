@@ -28,7 +28,7 @@ const { preparedContentObjectSteps } = await load('backend/reliableKernel/conten
 const { askUserTool } = await load('backend/world/modules/tools/definitions/askUser/index.js');
 const { runAgentTool } = await load('backend/world/modules/tools/definitions/runAgent/index.js');
 const { inventoryRelocatedWork, parseRelocatedWorkInventory, countRelocatedWork } = await load('backend/reliableKernel/relocatedWorkInventory.js');
-const { settleRelocatedWork, relocatedWorkSettlementReason } = await load('backend/application/reliableKernel/relocatedWorkSettlement.js');
+const { settleRelocatedWork, settleHistoricalMergeWork, HISTORICAL_MERGE_SETTLEMENT_REASON, relocatedWorkSettlementReason } = await load('backend/application/reliableKernel/relocatedWorkSettlement.js');
 const { openSettlingRelocatedWork } = await load('backend/application/reliableKernel/relocatedWorkOpening.js');
 const reloc = await import(pathToFileURL(path.join(root, 'tests/reliable-kernel/runtime-data-root-relocation-fixture.mjs')).href);
 
@@ -1031,7 +1031,7 @@ test('轮间的协作收敛一时出错（另一个窗口同时收敛同样的�
   }
 });
 
-test('循环收尾有上限：每一轮之后都冒出新的可执行工作时，收尾 5 轮就停，之后冒出的留作 rounds_exhausted（这次不再收尾；开库时不放行，见最后一组）', { timeout: 120_000 }, async (t) => {
+test('合并前收尾复用离线路径：使用独立原因与文案，最多三轮，剩余工作按对话返回且不处理已剔除对话', { timeout: 120_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   const [requester, peer] = ['conversation-endless-requester', 'conversation-endless-peer'];
   // As on opening the old directory: this Runtime's own convergence is held, so it does not reconcile
@@ -1041,6 +1041,9 @@ test('循环收尾有上限：每一轮之后都冒出新的可执行工作时�
     const { app } = host;
     await createConversation(app, requester);
     await createConversation(app, peer);
+    const excluded = 'conversation-excluded';
+    await createConversation(app, excluded);
+    await pendingFollowup(app, 'excluded-followup', requester, excluded);
     await pendingFollowup(app, 'followup-0', requester, peer);
     // Every convergence between rounds also brings one more followup: work that keeps appearing.
     let appeared = 0;
@@ -1053,18 +1056,25 @@ test('循环收尾有上限：每一轮之后都冒出新的可执行工作时�
       }
     } } } });
     const inventory = parseRelocatedWorkInventory(await app.database.relocatedWorkInventory());
-    const settled = await settleRelocatedWork({ application, inventory, targetRootPath: path.join(fixture.base, 'new-home') });
+    const settled = await settleHistoricalMergeWork({ application, inventory, excludedConversationIds: new Set(['conversation-excluded']) });
+    assert.equal(settled.reason, HISTORICAL_MERGE_SETTLEMENT_REASON);
+    const [abandoned] = await rows(app, 'RuntimeDelivery', { id: 'followup-0-delivery' });
+    assert.equal(abandoned.failure_reason, 'historical-merge-settled');
+    const [replyLink] = await rows(app, 'CollaborationMessageReplyLink', { request_message_id: 'followup-0' });
+    const reply = await app.runtime.collaboration.readMessage({ conversationId: requester, messageId: replyLink.message_id });
+    assert.match(reply.text, /stopped by the user before its history was merged/);
+    assert.equal((await rows(app, 'RuntimeDelivery', { id: 'excluded-followup-delivery' }))[0].state, 'pending');
     const shown = JSON.stringify(settled.unsettled);
-    assert.equal(settled.rounds, 5, shown);
-    assert.equal(appeared, 5, `每轮之后都重新盘点：${shown}`);
+    assert.equal(settled.rounds, 3, shown);
+    assert.equal(appeared, 3, `每轮之后都重新盘点：${shown}`);
     assert.deepEqual(settled.live, []);
     const [lastReply] = await rows(app, 'RuntimeDelivery', { target_conversation_id: requester, state: 'pending' });
     assert.deepEqual(settled.unsettled.map((item) => [item.conversationId, item.kind, item.id, item.list]), [
-      [peer, 'rounds_exhausted', 'followup-5-delivery', 'pendingDeliveryIds'], [requester, 'rounds_exhausted', lastReply.id, 'pendingDeliveryIds']
-    ], '第 5 轮之后冒出的留下（rounds_exhausted）');
-    assert.match(settled.unsettled[0].detail, /收尾 5 轮后仍出现新的可执行项/);
-    assert.equal((await rows(app, 'RuntimeDelivery', { id: 'followup-5-delivery' }))[0].state, 'pending', '留下的项这次不收尾');
-    assert.equal(settled.counts.deliveriesAbandoned, 9, '5 条追问与前 4 条回复');
+      [peer, 'rounds_exhausted', 'followup-3-delivery', 'pendingDeliveryIds'], [requester, 'rounds_exhausted', lastReply.id, 'pendingDeliveryIds']
+    ], '第 3 轮之后冒出的留下（rounds_exhausted）');
+    assert.match(settled.unsettled[0].detail, /收尾 3 轮后仍出现新的可执行项/);
+    assert.equal((await rows(app, 'RuntimeDelivery', { id: 'followup-3-delivery' }))[0].state, 'pending', '留下的项这次不收尾');
+    assert.equal(settled.counts.deliveriesAbandoned, 5, '3 条追问与前 2 条回复');
   } finally {
     await host.close();
   }

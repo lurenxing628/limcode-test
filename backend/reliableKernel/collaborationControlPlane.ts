@@ -1282,6 +1282,7 @@ function compareSequence(left: unknown, right: unknown): number {
 function unstartedTaskReason(failureReason: unknown): string {
   const reason = typeof failureReason === 'string' ? failureReason : '';
   if (reason === 'target-gone') return 'the target conversation was deleted.';
+  if (reason === 'historical-merge-settled') return 'the unfinished task was stopped by the user before its history was merged.';
   if (reason === 'data-root-relocated') return 'the data directory was relocated; the task was closed here and may have run in the new directory.';
   if (reason.startsWith('wake-dead-letter:')) return `the target conversation could not start a turn (${reason.slice('wake-dead-letter:'.length).slice(0, 500)}).`;
   return reason ? `${reason.slice(0, 500)}.` : 'its delivery failed.';
