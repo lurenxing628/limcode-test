@@ -13,7 +13,7 @@ import type { CasObjectReadHandle, CasTransferSource } from './runtimeCasTransfe
 import { PackedCasWorkerClient } from './packedCasWorkerClient';
 import { PACKED_CAS_FILE } from './packedCasWorkerProtocol';
 import { CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
-import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
+import { migratedBinding, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDataSetSummary } from './runtimeDataSetContent';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
@@ -28,6 +28,7 @@ import {
 } from './runtimeLocatedRoot';
 import { findRuntimeIdentityOwner } from './runtimeMergeTombstones';
 import { auditRuntimeSnapshot, RuntimeSnapshotAuditError } from './runtimeSnapshotAudit';
+import { RuntimeSnapshotUpgradeError, upgradeRuntimeSnapshotInWorker } from './runtimeSnapshotUpgrade';
 import {
   assertNoSymbolicPath, inspectLocatedRuntimeStorage, type RuntimeDataSetStorageInspection
 } from './runtimeStorageInspection';
@@ -157,6 +158,8 @@ const MAX_HOST_RECORD_BYTES = 64 * 1024;
 const COPY_ATTEMPTS = 3;
 const CACHE_DIRECTORY = 'foreign';
 const CLAIMS_DIRECTORY = 'foreign-claims';
+/** Below the merge ledger root: one private CAS overlay per published-format foreign root (LocatedRuntimeRoot.upgradeCasOverlayRoot). */
+const UPGRADE_CAS_DIRECTORY = 'foreign-upgrade-cas';
 const CACHE_KIND = 'limcode-foreign-runtime-history-audit';
 const SIZE_CACHE_KIND = 'limcode-foreign-runtime-history-size';
 const RELOCATION_MARKER_KIND = 'limcode-data-root-relocation';
@@ -494,7 +497,8 @@ export async function readForeignRuntimePointerIdentity(
  * The exact checks of one foreign root (all but the private-snapshot audit), read only from its
  * located paths: no symbolic link from the container down; a strictly valid pointer, no pending
  * pointer, rollback journal, transition, upgrade, relocation or merge in progress; recorded paths
- * self-consistent and ending in `.limcode-runtime/active`; an exact current-epoch manifest; every
+ * self-consistent and ending in `.limcode-runtime/active`; an exact current or published 3/4/5 epoch manifest
+ * (a published format is upgraded only in private snapshot copies, see copyLocatedRuntimeDatabase); every
  * Host proven gone; none of its database files a file of a database this process holds. Throws
  * ForeignRuntimeHistoryRejection.
  */
@@ -582,18 +586,45 @@ export async function locateForeignRuntimeRoot(
     || manifest.rootInstanceId !== recorded.rootInstanceId || manifest.rootGeneration !== recorded.rootGeneration) {
     throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-epoch-manifest', 'epoch 清单与 RootBinding 不一致。');
   }
-  if (recorded.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
-    throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-epoch-not-current', oldFormatReason(location, recorded.runtimeKernelEpoch));
+  const published = isPublishedForeignEpoch(recorded.runtimeKernelEpoch);
+  if (recorded.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH && !published) {
+    throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-epoch-not-current', oldFormatReason(recorded.runtimeKernelEpoch));
   }
   await assertNoUnfinishedRelocationOrMerge(configurationRoot, location, recorded, held);
   await assertForeignHostsGone(liveness, container, held);
+  const id = foreignRuntimeHistoryId(location, recorded);
   return Object.freeze({
-    id: foreignRuntimeHistoryId(location, recorded),
+    id,
     origin: Object.freeze({ kind: 'foreign' as const, location: Object.freeze({ ...location }) }),
     containerRoot: container,
     located: Object.freeze(located),
-    recorded
+    recorded,
+    ...(published ? {
+      upgradeCasOverlayRoot: path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: configurationRoot }),
+        UPGRADE_CAS_DIRECTORY, id.replace(/:/g, '-'))
+    } : {})
   });
+}
+
+/**
+ * What a private copy of `root` holds as its root_binding once copyLocatedRuntimeDatabase returns:
+ * the recorded binding, or for a published-format foreign root exactly the binding its in-place
+ * upgrade would have published (same identity and recorded paths, generation and revision advanced).
+ * Recorded identity stays the fence for the foreign files themselves.
+ */
+export function locatedSnapshotBinding(root: LocatedRuntimeRoot): HistoricalRootBinding {
+  return root.origin.kind === 'foreign' && root.recorded.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH
+    ? migratedBinding(root.recorded) : root.recorded;
+}
+
+/** A cache key for results computed on `root`'s private copies of exactly `files`: an un-upgraded copy's never match. */
+export function locatedSnapshotCacheFiles(root: LocatedRuntimeRoot, files: string): string {
+  return root.recorded.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH ? files : `${files};snapshot=upgraded-to-epoch-${RUNTIME_KERNEL_EPOCH}`;
+}
+
+/** The exact published epochs a foreign root may keep: its private snapshot copies are upgraded. */
+function isPublishedForeignEpoch(epoch: number): boolean {
+  return epoch === 3 || epoch === 4 || epoch === 5;
 }
 
 /** Located again from where it was found (local candidate id, or foreign location): never from its records. */
@@ -651,13 +682,77 @@ export async function tryWithForeignRuntimeRootClaim<T>(
 
 /**
  * The private copy of a located root's database and WAL, taken under its fence (see
- * {@link copyForeignRuntimeSqliteFiles}). Shared by verification and by the read-only view.
+ * {@link copyForeignRuntimeSqliteFiles}). Shared by verification, fingerprints, the read-only view
+ * and merges. A foreign root of a published epoch 3/4/5 has its copy upgraded to the current epoch
+ * in a worker (the same checks and transaction as the in-place upgrade, never touching the foreign
+ * files); `binding` is what the copy's root_binding row holds afterwards, `files` stays the source's
+ * exact state.
  */
 export async function copyLocatedRuntimeDatabase(
   root: LocatedRuntimeRoot,
   held: HeldDatabaseFiles
-): Promise<{ databasePath: string; files: string; remove(): Promise<void> }> {
-  return copyForeignRuntimeSqliteFiles(root.containerRoot, root.located.databasePath, held);
+): Promise<{ databasePath: string; files: string; binding: HistoricalRootBinding; remove(): Promise<void> }> {
+  const copy = await copyForeignRuntimeSqliteFiles(root.containerRoot, root.located.databasePath, held);
+  if (root.origin.kind !== 'foreign' || root.recorded.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
+    return { ...copy, binding: root.recorded };
+  }
+  try {
+    const binding = await upgradeForeignSnapshot(root, copy.databasePath, held);
+    if (JSON.stringify(binding) !== JSON.stringify(locatedSnapshotBinding(root))) {
+      throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-upgrade-failed', '私有副本升级后的身份与记录不一致。');
+    }
+    return { ...copy, binding };
+  } catch (error) {
+    await copy.remove();
+    throw error;
+  }
+}
+
+/** Upgrades a published-format foreign snapshot copy; a failure is the root's own unless it is of the moment. */
+async function upgradeForeignSnapshot(root: LocatedRuntimeRoot, databasePath: string, held: HeldDatabaseFiles): Promise<HistoricalRootBinding> {
+  const epoch = root.recorded.runtimeKernelEpoch;
+  if (root.upgradeCasOverlayRoot) {
+    await assertNoSymbolicPath(path.dirname(root.upgradeCasOverlayRoot), root.upgradeCasOverlayRoot)
+      .catch((error: unknown) => { if (!isMissing(error)) throw error; });
+  }
+  const objects = await openLocatedCasAccess(root, held);
+  // A body this thread cannot use is classified here, by kind and errno, never by message text.
+  const readObject = async (object: CasObjectIdentity): Promise<Buffer> => {
+    try { return await objects.readBytes(object); }
+    catch (error) {
+      if (error instanceof ForeignRuntimeHistoryRejection) throw error;
+      if (isMissing(error)) {
+        throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-upgrade-body-missing',
+          `它是已发布旧格式（第 ${epoch} 代），升级到当前格式需要的正文文件缺失，原样保留。`);
+      }
+      if (typeof (error as { code?: unknown } | null)?.code === 'string') throw error;
+      // Without an errno the read itself succeeded: the bytes differ from the recorded length or digest.
+      throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-upgrade-body-invalid',
+        `它是已发布旧格式（第 ${epoch} 代），升级需要的正文与记录不符（${error instanceof Error ? error.message : String(error)}），原样保留。`);
+    }
+  };
+  try {
+    return await upgradeRuntimeSnapshotInWorker(databasePath, root.recorded, {
+      readObject,
+      ...(root.upgradeCasOverlayRoot ? { overlayCasRoot: root.upgradeCasOverlayRoot } : {})
+    });
+  } catch (error) {
+    if (error instanceof ForeignRuntimeHistoryRejection) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : undefined;
+    // Judged by result codes, never by message text: SQLite or filesystem trouble of the moment is
+    // "not verifiable now"; any other refusal of the exact published upgrade is the root's own.
+    if (code !== undefined && isTransientAuditCode(code)) {
+      throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-upgrade-unavailable', `暂时无法在私有副本上升级它（${message}），稍后再试。`);
+    }
+    if (error instanceof RuntimeSnapshotUpgradeError) {
+      throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-upgrade-failed',
+        `它是已发布旧格式（第 ${epoch} 代），在私有副本上升级时核验未通过：${message}`);
+    }
+    throw new ForeignRuntimeHistoryRejection('unavailable', 'foreign-history-upgrade-unavailable', `暂时无法在私有副本上升级它：升级线程没能完成（${message}）。`);
+  } finally {
+    await objects.close();
+  }
 }
 
 /**
@@ -836,7 +931,9 @@ export interface LocatedCasAccess extends Pick<CasByteAccess, 'readBytes' | 'ins
 
 /**
  * One history/claim-scoped logical reader. Packed bytes come from the private snapshot; large and
- * legacy loose bodies keep strict descriptor reads, no symbolic prefixes and held-inode checks.
+ * legacy loose bodies keep strict descriptor reads, no symbolic prefixes and held-inode checks. A
+ * published-format foreign root's private upgrade overlay (bodies its snapshot upgrade converted,
+ * below the current configuration root) is read first.
  */
 export async function openLocatedCasAccess(
   root: LocatedRuntimeRoot,
@@ -858,9 +955,17 @@ export async function openLocatedCasAccess(
     return absolutePath;
   };
   const currentHeld = (): Promise<HeldDatabaseFiles> => refreshHeld ? refreshHeld() : Promise.resolve(held);
+  const overlaid = async (object: CasObjectIdentity): Promise<{ file: string; size: bigint } | undefined> => {
+    if (!root.upgradeCasOverlayRoot) return undefined;
+    const file = looseCasObjectLocation(root.upgradeCasOverlayRoot, object).absolutePath;
+    const info = await fs.lstat(file, { bigint: true }).catch((error: unknown) => { if (isMissing(error)) return undefined; throw error; });
+    return info?.isFile() ? { file, size: info.size } : undefined;
+  };
   const size = async (object: CasObjectIdentity): Promise<bigint | undefined> => {
     assertOpen();
     const identity = requireCasObjectIdentity(object);
+    const overlay = await overlaid(identity);
+    if (overlay) return overlay.size;
     const length = await packed.inspectByteLength(identity);
     if (length !== undefined) return length;
     try {
@@ -874,6 +979,8 @@ export async function openLocatedCasAccess(
   const readBytes = async (object: CasObjectIdentity): Promise<Buffer> => {
     assertOpen();
     const identity = requireCasObjectIdentity(object);
+    const overlay = await overlaid(identity);
+    if (overlay) return verifyCasObjectBytes(identity, await fs.readFile(overlay.file));
     const bytes = await packed.readBytes(identity);
     if (bytes !== undefined) return bytes;
     if (identity.byte_length > BigInt(Number.MAX_SAFE_INTEGER)) throw new RangeError('Historical CAS object is too large to read.');
@@ -887,6 +994,8 @@ export async function openLocatedCasAccess(
     readBytes,
     async open(object) {
       assertOpen();
+      const overlay = await overlaid(requireCasObjectIdentity(object));
+      if (overlay) return bufferReadHandle(verifyCasObjectBytes(object, await fs.readFile(overlay.file)));
       const bytes = await packed.readBytes(requireCasObjectIdentity(object));
       return bytes === undefined
         ? openLocatedRuntimeFile(await reachable(object), await currentHeld()) : bufferReadHandle(bytes);
@@ -1047,7 +1156,8 @@ async function inspectOne(
   try {
     const result = await auditForeignRuntimeRoot(configurationRoot, root, held, waitForClaim);
     if (result.outcome === 'failed') {
-      return { entry: { ...base, ...identity, status: 'failed', code: result.code, reason: result.reason, size: result.size }, root };
+      const size = await cachedTreeSize(configurationRoot, root.id, found.location);
+      return { entry: { ...base, ...identity, status: 'failed', code: result.code, reason: result.reason, size }, root };
     }
     return { entry: { ...base, ...identity, status: 'verified', ...result.audit, size: result.size }, root };
   } catch (error) {
@@ -1101,20 +1211,29 @@ async function auditUnderClaim(configurationRoot: string, root: LocatedRuntimeRo
   const files = await foreignFileState(current);
   const cached = await readAuditCache(configurationRoot, current.id, files);
   if (cached) return cached;
-  const copy = await copyLocatedRuntimeDatabase(current, held);
-  let result: AuditResult;
-  try { result = await auditCopy(copy.databasePath, current); }
-  finally { await copy.remove(); }
+  const result = await auditPrivateCopy(current, held);
   const size = await measureTree(path.dirname(current.located.rootPointerPath));
   const complete: AuditResult = size ? { ...result, size } : result;
   await writeAuditCache(configurationRoot, current.id, files, complete).catch(() => undefined);
   return complete;
 }
 
-async function auditCopy(databasePath: string, root: LocatedRuntimeRoot): Promise<AuditResult> {
+/** The audit of a private copy; a published format whose exact private upgrade refuses is the root's own, for these exact files. */
+async function auditPrivateCopy(root: LocatedRuntimeRoot, held: HeldDatabaseFiles): Promise<AuditResult> {
+  let copy: Awaited<ReturnType<typeof copyLocatedRuntimeDatabase>>;
+  try { copy = await copyLocatedRuntimeDatabase(root, held); }
+  catch (error) {
+    if (!(error instanceof ForeignRuntimeHistoryRejection) || error.status !== 'failed' || !error.code.startsWith('foreign-history-upgrade-')) throw error;
+    return { outcome: 'failed', code: error.code, reason: error.message };
+  }
+  try { return await auditCopy(copy.databasePath, copy.binding); }
+  finally { await copy.remove(); }
+}
+
+async function auditCopy(databasePath: string, binding: HistoricalRootBinding): Promise<AuditResult> {
   try {
     const audit = await auditRuntimeSnapshot(databasePath, {
-      binding: root.recorded as RootBinding, contentDigest: true, measure: true, summary: true, unfinishedWork: 'finalize'
+      binding: binding as RootBinding, contentDigest: true, measure: true, summary: true, unfinishedWork: 'finalize'
     });
     const unfinished = audit.unfinishedWork;
     const finalizable = (unfinished?.turns.length ?? 0) + (unfinished?.intents.length ?? 0);
@@ -1240,16 +1359,8 @@ function copiedNamePattern(base: string): RegExp {
 }
 
 /** Why an older format is not opened here, saying only what is true of this root. */
-function oldFormatReason(location: ForeignRuntimeRootLocation, epoch: number): string {
-  if (epoch !== 3 && epoch !== 4 && epoch !== 5) {
-    return `它是不受支持的旧格式（第 ${epoch} 代），当前版本不能读取，也不能升级它。它原样保留，不会被删除。`;
-  }
-  if (location.kind === 'archive' || location.dataRootRelativePath.includes(`${VSCODE_RUNTIME_ARCHIVES_DIRECTORY}/`)) {
-    return `它是已发布旧格式（第 ${epoch} 代）的归档。旧格式只能在历史库原来的位置上先备份再升级，而这个位置在归档时已经交给了新建的库，`
-      + '所以当前版本不能打开它。它原样保留，不会被删除。';
-  }
-  return `它是已发布的旧格式（第 ${epoch} 代）。当前版本只在数据目录自己的历史库上先备份再升级旧格式，不升级从别处拷来的目录，`
-    + '所以不能在这里打开它。它原样保留，不会被删除。';
+function oldFormatReason(epoch: number): string {
+  return `它是不受支持的旧格式（第 ${epoch} 代），当前版本不能读取，也不能升级它。它原样保留，不会被删除。`;
 }
 
 async function containerScopes(containerPath: string): Promise<Array<{ label: string; relative: string[] }>> {
@@ -1587,12 +1698,13 @@ export async function foreignFileState(root: LocatedRuntimeRoot): Promise<string
     const stat: BigIntStats = await fs.stat(file, { bigint: true });
     return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
   };
-  return [
+  // What its private copies are is part of the state: an un-upgraded copy's results are never reused.
+  return locatedSnapshotCacheFiles(root, [
     await runtimeDataSetFileState(root.located.databasePath),
     `pointer=${await describe(root.located.rootPointerPath)}`,
     `epoch=${await describe(root.located.runtimeEpochPath)}`,
     `recorded=${createHash('sha256').update(JSON.stringify(root.recorded)).digest('hex')}`
-  ].join(';');
+  ].join(';'));
 }
 
 /** Logical size without following links; undefined when the tree cannot be walked. */

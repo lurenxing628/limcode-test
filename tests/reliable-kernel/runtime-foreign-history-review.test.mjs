@@ -158,7 +158,7 @@ async function lockSetup(t, name) {
   return { ...context, copied, liveDb };
 }
 
-test('已发布版本自动归档的名字 <时间>-epoch-N-to-M-<id8> 也被发现；第 3/4 代的归档与拷来目录如实说明不能打开的原因，不承诺“在原位置升级”；第 1/2 代说明不受支持', async (t) => {
+test('已发布版本自动归档的名字 <时间>-epoch-N-to-M-<id8> 也被发现；第 3/4 代的归档与拷来目录只在私有副本上升级，结构不符时如实列为未通过、不承诺“在原位置升级”；第 1/2 代说明不受支持', async (t) => {
   const fixture = await createFixture(t);
   const alpha = fixture.alpha;
   const authority = new RootAuthority(() => alpha.binding.paths.dataRootPath, undefined, () => fixture.root);
@@ -184,8 +184,8 @@ test('已发布版本自动归档的名字 <时间>-epoch-N-to-M-<id8> 也被发
   await setEpoch(path.join(released, 'root-binding.json'), path.join(released, 'active', 'runtime-kernel-epoch.json'), 3);
   const old = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root }), released);
   assert.equal(old?.status, 'failed');
-  assert.equal(old.code, 'foreign-history-epoch-not-current');
-  assert.match(old.reason, /已发布旧格式（第 3 代）的归档.*位置在归档时已经交给了新建的库.*当前版本不能打开它。它原样保留，不会被删除。/);
+  assert.equal(old.code, 'foreign-history-upgrade-failed');
+  assert.match(old.reason, /已发布旧格式（第 3 代），在私有副本上升级时核验未通过/);
   assert.doesNotMatch(old.reason, /只能在原位置由 LimCode 备份后升级|不在别处升级它/);
   assert.equal(typeof old.size?.bytes, 'string');
 
@@ -194,8 +194,8 @@ test('已发布版本自动归档的名字 <时间>-epoch-N-to-M-<id8> 也被发
   await setEpoch(pointerOf(copied), epochOf(copied), 4);
   const copiedOld = (await foreign.inspectForeignRuntimeHistory({ configurationRootPath: home })).entries
     .find((entry) => entry.location.containerPath === copied && entry.location.dataRootRelativePath === '.limcode-runtime/active');
-  assert.equal(copiedOld?.code, 'foreign-history-epoch-not-current');
-  assert.match(copiedOld.reason, /已发布的旧格式（第 4 代）.*不升级从别处拷来的目录.*原样保留，不会被删除。/);
+  assert.equal(copiedOld?.code, 'foreign-history-upgrade-failed');
+  assert.match(copiedOld.reason, /已发布旧格式（第 4 代），在私有副本上升级时核验未通过/);
 
   await setEpoch(path.join(released, 'root-binding.json'), path.join(released, 'active', 'runtime-kernel-epoch.json'), 2);
   const unsupported = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root }), released);

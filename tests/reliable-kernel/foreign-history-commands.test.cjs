@@ -53,7 +53,7 @@ const COPIED = entry({
     kind: 'copied', side: 'current', baseDataRootPath: ROOT, containerPath: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
     containerName: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', dataRootRelativePath: '.limcode-runtime/active'
   },
-  status: 'failed', code: 'foreign-history-epoch-not-current', reason: '它是已发布的旧格式（第 4 代）。当前版本只在数据目录自己的历史库上先备份再升级旧格式，不升级从别处拷来的目录，所以不能在这里打开它。它原样保留，不会被删除。',
+  status: 'failed', code: 'foreign-history-epoch-not-current', reason: '它是不受支持的旧格式（第 2 代），当前版本不能读取，也不能升级它。它原样保留，不会被删除。',
   locatedPath: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678/.limcode-runtime/active', size: { bytes: '8192', fileCount: 5 },
   summary: undefined
 });
@@ -159,7 +159,7 @@ test('外来历史库列表：核验通过的注明来源、原位置和“可�
   assert.match(archive.detail, /另有 1 份完全相同的拷贝/);
   assert.equal(copied.label, '未通过核验 · 从别处拷来 · limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678');
   assert.equal(copied.description, '8192 B（5 个文件）');
-  assert.match(copied.detail, /原因：它是已发布的旧格式（第 4 代）/);
+  assert.match(copied.detail, /原因：它是不受支持的旧格式（第 2 代）/);
   assert.match(copied.detail, /原样保留，不会自动删除/);
   assert.match(unavailable.label, /^暂时无法核验 · /);
   assert.match(unavailable.detail, /暂时无法核验：复制数据库到私有临时目录失败/);
@@ -169,7 +169,7 @@ test('选中未通过的外来库：说明原因与位置，只提供“打开�
   const f = fixture({ picks: [1, undefined], warnings: ['打开所在文件夹'] });
   await f.command.manageForeignRuntimeHistory(f.context);
   const warning = f.calls.find((call) => call[0] === 'warning');
-  assert.match(warning[1], /没有通过核验：它是已发布的旧格式/);
+  assert.match(warning[1], /没有通过核验：它是不受支持的旧格式/);
   assert.match(warning[1], /原样保留，不会被自动删除/);
   assert.deepEqual(warning.slice(2), ['打开所在文件夹']);
   assert.deepEqual(f.calls.find((call) => call[0] === 'command'),

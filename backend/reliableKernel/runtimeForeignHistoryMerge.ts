@@ -14,9 +14,10 @@ import {
 } from './runtimeDataSetMergeLedger';
 import {
   copyLocatedRuntimeDatabase, ForeignRuntimeHistoryRejection, foreignFileState, heldDatabaseFiles, holdForeignRuntimeRootClaim,
-  isForeignRuntimeHistoryId, locateForeignRuntimeRoot, locatedCasTransferSource,
+  isForeignRuntimeHistoryId, locateForeignRuntimeRoot, locatedCasTransferSource, locatedSnapshotCacheFiles,
   type ForeignRuntimeHistoryEntry, type ForeignRuntimeRootClaimHold, type HeldDatabaseFiles, type LocatedCasAccess
 } from './runtimeForeignHistory';
+import type { HistoricalRootBinding } from './rootAuthority';
 import { withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
@@ -305,6 +306,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     this.casOwners.add(objects);
     this.lastVerified = candidate;
     return {
+      binding: snapshot.binding,
       get database() { return snapshot.database; },
       withClosedReader: (run) => snapshot.withClosedReader(run),
       close: async () => {
@@ -324,13 +326,14 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
       rootGeneration: recorded.rootGeneration, pointerRevision: recorded.pointerRevision
     };
     const files = await runtimeDataSetFileState(located.databasePath);
-    const cached = await cachedRuntimeRootFingerprint({ globalStoragePath: this.configurationRoot }, this.id, files, identity);
+    const cached = await cachedRuntimeRootFingerprint({ globalStoragePath: this.configurationRoot }, this.id,
+      locatedSnapshotCacheFiles(candidate.root, files), identity);
     if (cached) return cached;
-    let copy: { databasePath: string; remove(): Promise<void> };
+    let copy: { databasePath: string; binding: HistoricalRootBinding; remove(): Promise<void> };
     try { copy = await copyLocatedRuntimeDatabase(candidate.root, await this.heldFiles()); }
     catch (error) { throw refusal(error); }
     try {
-      const audit = await auditRuntimeSnapshot(copy.databasePath, { binding: recorded as RootBinding, contentDigest: true, integrity: false });
+      const audit = await auditRuntimeSnapshot(copy.databasePath, { binding: copy.binding as RootBinding, contentDigest: true, integrity: false });
       const fingerprint: RuntimeDataSetFingerprint = { ...identity, contentDigest: audit.contentDigest! };
       if (await runtimeDataSetFileState(located.databasePath).catch(() => undefined) === files) {
         await this.rememberFingerprint(candidate, files, fingerprint).catch(() => undefined);
@@ -341,8 +344,9 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     }
   }
 
-  public async rememberFingerprint(_candidate: ForeignHistoricalMergeCandidate, files: string, fingerprint: RuntimeDataSetFingerprint): Promise<void> {
-    await rememberRuntimeRootFingerprint({ globalStoragePath: this.configurationRoot }, this.id, files, fingerprint);
+  public async rememberFingerprint(candidate: ForeignHistoricalMergeCandidate, files: string, fingerprint: RuntimeDataSetFingerprint): Promise<void> {
+    await rememberRuntimeRootFingerprint({ globalStoragePath: this.configurationRoot }, this.id,
+      locatedSnapshotCacheFiles(candidate.root, files), fingerprint);
   }
 
   public objects(candidate: ForeignHistoricalMergeCandidate): HistoricalMergeSourceObjects {

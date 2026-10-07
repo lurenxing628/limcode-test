@@ -346,7 +346,6 @@ function skippedRowsOf(source: Database.Database): Map<string, Set<string>> {
  */
 export async function reinspectLargeMergeKeptWork(
   snapshot: RuntimeDataSetDatabaseSnapshot,
-  binding: HistoricalRootBinding,
   signal?: AbortSignal
 ): Promise<UnfinishedWorkInspection> {
   const source = snapshot.database;
@@ -358,7 +357,7 @@ export async function reinspectLargeMergeKeptWork(
     await exportSkippedKeys(source, skippedRowsPath, signal);
     signal?.throwIfAborted();
     const audit = await snapshot.withClosedReader((snapshotPath) => auditRuntimeSnapshot(snapshotPath, {
-      binding: binding as RootBinding, unfinishedWork: 'finalize', integrity: false, skippedRowsPath
+      binding: snapshot.binding as RootBinding, unfinishedWork: 'finalize', integrity: false, skippedRowsPath
     }));
     signal?.throwIfAborted();
     return audit.unfinishedWork!;
@@ -1457,7 +1456,7 @@ async function prepareSource(
       if (work.refused.length === 0 && !hasFinalizableWork(work)) return work;
       boundSourcePageCache(taken.snapshot.database);
       if (!await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows)) return work;
-      return reinspectLargeMergeKeptWork(taken.snapshot, binding, input.signal).catch((error: unknown) => {
+      return reinspectLargeMergeKeptWork(taken.snapshot, input.signal).catch((error: unknown) => {
         if (isAbort(error)) throw new engine.StopRequested();
         throw error;
       });

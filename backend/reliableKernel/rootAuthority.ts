@@ -776,7 +776,8 @@ function samePaths(left: RuntimeRootPaths, right: RuntimeRootPaths): boolean {
     && left.runtimeEpochPath === right.runtimeEpochPath;
 }
 
-function migratedBinding(previous: HistoricalRootBinding): RootBinding {
+/** The binding an exact in-place epoch upgrade publishes: same identity and paths, generation and revision advanced. */
+export function migratedBinding(previous: HistoricalRootBinding): RootBinding {
   return freezeRootBinding({
     paths: previous.paths,
     dataSetId: previous.dataSetId,

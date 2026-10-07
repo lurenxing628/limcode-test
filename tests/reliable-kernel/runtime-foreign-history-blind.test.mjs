@@ -111,7 +111,7 @@ async function exists(file) {
 
 // --- #2: the archives of the manual reset of released 0.0.10–0.0.20 ------------------------------------
 
-test('盲审 #2：v0.0.10–v0.0.20 手动“归档并重置”的归档（<17 位数字>）被发现，按已发布旧格式如实列为未通过（位置、大小、原因）；只剩它的旧目录不被忘掉；清理备份不删它', async (t) => {
+test('盲审 #2：v0.0.10–v0.0.20 手动“归档并重置”的归档（<17 位数字>）被发现；结构与已发布格式不符时如实列为未通过（位置、大小、原因）；只剩它的旧目录不被忘掉；清理备份不删它', async (t) => {
   const fixture = await home(t);
   await seedConversations(fixture.alpha, [{ id: 'old_1' }]);
   const backupPath = await archive(fixture, fixture.alpha);
@@ -123,8 +123,8 @@ test('盲审 #2：v0.0.10–v0.0.20 手动“归档并重置”的归档（<17 �
   assert.deepEqual(found.map((entry) => [entry.location.kind, entry.location.containerPath, entry.name]), [['archive', legacyPath, LEGACY_NAME]]);
   const entry = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root }), legacyPath);
   assert.equal(entry?.status, 'failed');
-  assert.equal(entry.code, 'foreign-history-epoch-not-current');
-  assert.match(entry.reason, /已发布旧格式（第 4 代）的归档.*当前版本不能打开它。它原样保留，不会被删除。/);
+  assert.equal(entry.code, 'foreign-history-upgrade-failed');
+  assert.match(entry.reason, /已发布旧格式（第 4 代），在私有副本上升级时核验未通过/);
   assert.equal(entry.locatedPath, path.join(legacyPath, 'active'));
   assert.ok(Number(entry.size?.bytes) > 0, '列出大小');
 

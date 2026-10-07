@@ -153,6 +153,8 @@ export async function deleteUnselectedRuntimeDataSet(
 
 export interface RuntimeDataSetDatabaseSnapshot {
   database: Database.Database;
+  /** The copy's root_binding: the recorded one, or (a published-format foreign root) its private upgrade. */
+  readonly binding: HistoricalRootBinding;
   /** Temporarily closes this private reader; the callback may exclusively audit the copy in a worker. */
   withClosedReader<T>(run: (snapshotPath: string) => Promise<T>): Promise<T>;
   close(): Promise<void>;
@@ -197,11 +199,11 @@ export async function createLocatedRuntimeDatabaseSnapshot(
   options: {
     beforeOpen?(snapshotPath: string): Promise<void>;
     /** Takes the private copy instead, e.g. one that counts only when the files kept their state while copied. */
-    copy?(root: LocatedRuntimeRoot): Promise<{ databasePath: string; remove(): Promise<void> }>;
+    copy?(root: LocatedRuntimeRoot): Promise<{ databasePath: string; binding?: HistoricalRootBinding; remove(): Promise<void> }>;
   } = {}
 ): Promise<RuntimeDataSetDatabaseSnapshot> {
   const copy = options.copy ? await options.copy(root) : await copyRuntimeSqliteFiles(root.containerRoot, root.located.databasePath);
-  return openRuntimeDatabaseSnapshotCopy(copy, root.recorded, options);
+  return openRuntimeDatabaseSnapshotCopy(copy, (copy as { binding?: HistoricalRootBinding }).binding ?? root.recorded, options);
 }
 
 async function openRuntimeDatabaseSnapshotCopy(
@@ -227,6 +229,7 @@ async function openRuntimeDatabaseSnapshotCopy(
     let closed = false;
     let suspended = false;
     return {
+      binding,
       get database() {
         if (closed || suspended || !database) throw new Error('The private snapshot reader is closed.');
         return database;

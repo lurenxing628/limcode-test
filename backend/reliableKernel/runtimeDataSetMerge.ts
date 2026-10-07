@@ -50,7 +50,9 @@ import {
   type LargeMergeSessionSpaceFacts
 } from './runtimeDataSetLargeMergeSpace';
 import { runtimeDataSetReadableName } from './runtimeDataSetPreflight';
-import { copyForeignRuntimeSqliteFiles, heldDatabaseFiles, openPackedCasSnapshot, type PackedCasSnapshotAccess } from './runtimeForeignHistory';
+import {
+  copyForeignRuntimeSqliteFiles, heldDatabaseFiles, locatedSnapshotBinding, openPackedCasSnapshot, type PackedCasSnapshotAccess
+} from './runtimeForeignHistory';
 import { upgradeRuntimeDataSet } from './runtimeDataSetUpgrade';
 import {
   assertRuntimeHostsOffline, isRuntimeHostsActiveError, withRuntimeDataRootAdmission, withRuntimeMaintenance,
@@ -2658,6 +2660,7 @@ async function withLocalPackedSnapshot(
   try { packed = await openLocalPackedSnapshot(candidate, binding, files); }
   catch (error) { await snapshot.close(); throw error; }
   return {
+    binding: snapshot.binding,
     get database() { return snapshot.database; },
     packedCas: packed,
     withClosedReader: (run) => snapshot.withClosedReader(run),
@@ -2686,10 +2689,11 @@ async function takeVerifiedSnapshot(
   /** Where a foreign root's audit is cached (this configuration root); a local data set's is its own. */
   cacheRoot?: { globalStoragePath: string }
 ): Promise<VerifiedSnapshot> {
-  // A foreign root is read at its located paths (`binding`); its recorded binding alone is the fence.
-  // Its unfinished work is always probed: nothing of it may be carried or finalized.
+  // A foreign root is read at its located paths (`binding`); its private copy's binding alone is the
+  // fence (the recorded one, upgraded for a published format). Its unfinished work is always probed:
+  // nothing of it may be carried or finalized.
   if (isForeignCandidate(candidate) && unfinishedWork !== 'finalize') throw new TypeError('A foreign history root is audited for unfinished work.');
-  const fence = (isForeignCandidate(candidate) ? candidate.root.recorded : binding) as RootBinding;
+  const fence = (isForeignCandidate(candidate) ? locatedSnapshotBinding(candidate.root) : binding) as RootBinding;
   for (let attempt = 1; ; attempt += 1) {
     const files = await runtimeDataSetFileState(binding.paths.databasePath);
     let audit: RuntimeSnapshotAudit | undefined;

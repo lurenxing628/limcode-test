@@ -9,13 +9,14 @@ const extensionRoot = path.join(root, 'dist/extension');
 const manifestPath = path.join(root, 'dist/package-runtime-closure.json');
 const seedPaths = [
   'vscode/extension.js',
-  // RuntimeDatabase/ProcessControlPlane/snapshot audit/data-set facts/data-root relocation start these by
+  // RuntimeDatabase/ProcessControlPlane/snapshot audit/snapshot upgrade/data-set facts/data-root relocation start these by
   // __dirname rather than CommonJS require(): nothing else keeps them in the package. The package
   // validator (validators/package.mjs, DIRNAME_ENTRY_BOUNDARIES) fails a VSIX that starts one it lacks.
   'backend/reliableKernel/databaseWorker.js',
   'backend/reliableKernel/packedCasWorker.js',
   'backend/reliableKernel/processWrapper.js',
   'backend/reliableKernel/runtimeSnapshotAuditWorker.js',
+  'backend/reliableKernel/runtimeSnapshotUpgradeWorker.js',
   'backend/reliableKernel/runtimeDataSetFactsWorker.js',
   'backend/reliableKernel/runtimeDataRootRelocationWorker.js'
 ];

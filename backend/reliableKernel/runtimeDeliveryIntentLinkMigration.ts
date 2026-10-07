@@ -60,15 +60,36 @@ interface ParsedContinuationEnvelope {
 }
 
 /**
+ * Where the conversion reads existing bodies and publishes its new immutable ones: the Runtime's own
+ * CAS root for an in-place upgrade, or (for a private snapshot of a foreign root) checked descriptor
+ * reads of the foreign root plus a private content-addressed overlay that is never the foreign directory.
+ */
+export interface ChildContinuationContentAccess {
+  /** The bytes stored under a digest storage key; the caller checks their length and SHA-256 again. */
+  read(storageKey: string, sha256: string, byteLength: bigint): Promise<Buffer>;
+  /** Publishes immutable bytes under their digest storage key; identical existing bytes are reused. */
+  publish(storageKey: string, bytes: Buffer, sha256: string): Promise<void>;
+}
+
+/** The in-place upgrade's own CAS root. */
+export function localChildContinuationContent(casRootPathInput: string): ChildContinuationContentAccess {
+  const casRootPath = normalizedAbsolutePath(casRootPathInput, 'Runtime CAS root');
+  return {
+    read: (storageKey) => fs.readFile(safeCasPath(casRootPath, storageKey)),
+    publish: (storageKey, bytes, sha256) => publishCasFile(casRootPath, storageKey, bytes, sha256)
+  };
+}
+
+/**
  * Converts the one exact pre-Link Child Runtime continuation representation while the migration
  * writer transaction is fenced. CAS publication precedes the SQLite references, so a failed
  * transaction can leave only harmless immutable orphans and never a dangling ContentObject row.
  */
 export async function migrateChildRuntimeDeliveryIntentLinks(
   database: Database.Database,
-  casRootPathInput: string
+  contentInput: string | ChildContinuationContentAccess
 ): Promise<number> {
-  const casRootPath = normalizedAbsolutePath(casRootPathInput, 'Runtime CAS root');
+  const content = typeof contentInput === 'string' ? localChildContinuationContent(contentInput) : contentInput;
   const candidates = database.prepare(`
     SELECT intent.id AS turn_intent_id,
            intent.conversation_id AS conversation_id,
@@ -110,7 +131,7 @@ export async function migrateChildRuntimeDeliveryIntentLinks(
     seenIntentIds.add(intentId);
     requireIntegerOne(candidate.revision_seq, 'TurnIntentRevision.revision_seq');
 
-    const intentContent = await readVerifiedContent(casRootPath, contentMetadata(candidate, 'content'));
+    const intentContent = await readVerifiedContent(content, contentMetadata(candidate, 'content'));
     const envelope = parseContinuationEnvelope(intentContent);
     const identity = resolveContinuationIdentity(database, candidate, envelope);
     assertCandidateIdentity(candidate, identity);
@@ -138,7 +159,7 @@ export async function migrateChildRuntimeDeliveryIntentLinks(
     if (presetMetadata.contentType !== TURN_EXECUTION_PRESET_CONTENT_TYPE) {
       throw new Error(`Child Runtime continuation ${intentId} has an unexpected preset content type.`);
     }
-    const presetContent = await readVerifiedContent(casRootPath, presetMetadata);
+    const presetContent = await readVerifiedContent(content, presetMetadata);
 
     if (envelope.format === 'legacy') {
       assertExactJson(
@@ -148,7 +169,7 @@ export async function migrateChildRuntimeDeliveryIntentLinks(
       );
       const createdAt = requireText(candidate.intent_created_at, 'TurnIntent.created_at');
       const currentIntent = await publishMigrationContent(
-        casRootPath,
+        content,
         canonicalPlainJson(runtimeContinuationTurnIntentEnvelope({
           sourceTurnId: identity.sourceTurnId
         })),
@@ -156,7 +177,7 @@ export async function migrateChildRuntimeDeliveryIntentLinks(
         createdAt
       );
       const currentPreset = await publishMigrationContent(
-        casRootPath,
+        content,
         canonicalPlainJson({ kind: CURRENT_RUNTIME_CONTINUATION_KIND }),
         TURN_EXECUTION_PRESET_CONTENT_TYPE,
         createdAt
@@ -342,7 +363,7 @@ function contentMetadata(row: Record<string, unknown>, prefix: string): ContentM
   };
 }
 
-async function readVerifiedContent(casRootPath: string, metadata: ContentMetadata): Promise<Buffer> {
+async function readVerifiedContent(content: ChildContinuationContentAccess, metadata: ContentMetadata): Promise<Buffer> {
   const expectedStorageKey = storageKeyForDigest(metadata.sha256);
   if (
     metadata.storageKey !== expectedStorageKey
@@ -350,8 +371,7 @@ async function readVerifiedContent(casRootPath: string, metadata: ContentMetadat
   ) {
     throw new Error(`ContentObject ${metadata.id} identity does not match its CAS metadata.`);
   }
-  const filePath = safeCasPath(casRootPath, expectedStorageKey);
-  const bytes = await fs.readFile(filePath);
+  const bytes = await content.read(expectedStorageKey, metadata.sha256, metadata.byteLength);
   if (
     BigInt(bytes.byteLength) !== metadata.byteLength
     || createHash('sha256').update(bytes).digest('hex') !== metadata.sha256
@@ -362,16 +382,17 @@ async function readVerifiedContent(casRootPath: string, metadata: ContentMetadat
 }
 
 async function publishMigrationContent(
-  casRootPath: string,
-  content: string,
+  content: ChildContinuationContentAccess,
+  text: string,
   contentType: string,
   createdAt: string
 ): Promise<ContentMetadata> {
-  const bytes = Buffer.from(content, 'utf8');
+  const bytes = Buffer.from(text, 'utf8');
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const storageKey = storageKeyForDigest(sha256);
   const byteLength = BigInt(bytes.byteLength);
-  const metadata: ContentMetadata = {
+  await content.publish(storageKey, bytes, sha256);
+  return {
     id: migrationContentObjectId(contentType, sha256, byteLength),
     contentType,
     sha256,
@@ -379,6 +400,13 @@ async function publishMigrationContent(
     storageKey,
     createdAt
   };
+}
+
+/** Durable, link-published immutable file under a CAS root; an existing file must hold the same bytes. */
+export async function publishCasFile(casRootPath: string, storageKey: string, bytes: Buffer, sha256: string): Promise<void> {
+  if (storageKey !== storageKeyForDigest(sha256) || createHash('sha256').update(bytes).digest('hex') !== sha256) {
+    throw new Error(`Migration CAS object ${sha256} does not match its storage key.`);
+  }
   const targetPath = safeCasPath(casRootPath, storageKey);
   const digestRoot = path.join(casRootPath, 'sha256');
   const digestPrefix = path.dirname(targetPath);
@@ -411,7 +439,6 @@ async function publishMigrationContent(
     await syncDirectoryDurably(temporaryRoot);
     await syncDirectoryDurably(casRootPath);
   }
-  return metadata;
 }
 
 function ensureContentObject(database: Database.Database, metadata: ContentMetadata): void {

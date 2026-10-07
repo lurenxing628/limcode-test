@@ -67,13 +67,12 @@ export async function openRuntimeDataSetHistory(
     if (!sameLocatedRuntimeRoot(current, root)) {
       throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
     }
-    const historical = current.recorded;
-    if (historical.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
+    // A local data set is upgraded in place first; a published-format foreign root only in its private copy.
+    if (current.origin.kind === 'local' && current.recorded.runtimeKernelEpoch !== RUNTIME_KERNEL_EPOCH) {
       throw Object.assign(new Error('此旧历史库尚未完成自动备份升级，暂时不能读取。请查看自动升级失败原因；原数据未被重置。'), {
         code: 'runtime-history-offline-upgrade-required'
       });
     }
-    const binding = historical as RootBinding;
     return withLocatedRuntimeRootFence(paths, current, async () => {
       // A foreign root's Host records are read only as regular files (runtimeForeignHistory), never
       // through the local liveness reader: verified again here, under its claim.
@@ -87,6 +86,7 @@ export async function openRuntimeDataSetHistory(
       try {
         snapshot = await createLocatedRuntimeDatabaseSnapshot(current, { copy: (located) => copyLocatedRuntimeDatabase(located, held) });
         const { database } = snapshot;
+        const binding = snapshot.binding as RootBinding;
         assertCurrentSchema(database, binding);
         assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS, { label: 'Historical Runtime' });
         // Metadata first: the later append-only CAS copy contains every packed body it references.

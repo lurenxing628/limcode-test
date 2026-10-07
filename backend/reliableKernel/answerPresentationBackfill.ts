@@ -7,10 +7,19 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { stablePhaseFId, requirePhaseFId } from './phaseFIdentity';
 import { VerifiedContentRanges } from './verifiedContentRanges';
 
-/** Offline-only, bounded CAS capability under the caller's existing maintenance/backup fence. */
-function offlineContentReader(casRoot: string, signal?: AbortSignal) {
+/** Verified bytes `[offset, offset + length)` of one content object (its digest and length are checked). */
+export type HistoricalContentRangeReader = (metadata: ContentObjectMetadata, offset: number, length: number) => Promise<Buffer>;
+
+/** The in-place upgrade's own CAS root. */
+export function localHistoricalContentRanges(casRoot: string): HistoricalContentRangeReader {
   const root = path.resolve(casRoot);
   const verified = new VerifiedContentRanges();
+  return (metadata, offset, length) =>
+    verified.read(root, path.resolve(root, metadata.storage_key), metadata.sha256, metadata.byte_length, offset, length);
+}
+
+/** Offline-only, bounded CAS capability under the caller's existing maintenance/backup fence. */
+function offlineContentReader(readRange: HistoricalContentRangeReader, signal?: AbortSignal) {
   return { async readChunk(metadata: ContentObjectMetadata, offset: number, maximum: number) {
     signal?.throwIfAborted();
     if (metadata.storage_key !== storageKeyForDigest(metadata.sha256)) throw new Error('Historical answer CAS storage key conflicts with its digest.');
@@ -18,7 +27,8 @@ function offlineContentReader(casRoot: string, signal?: AbortSignal) {
     if (!Number.isSafeInteger(totalBytes) || !Number.isSafeInteger(offset) || offset < 0 || offset > totalBytes
       || !Number.isSafeInteger(maximum) || maximum < 1 || maximum > 1024 * 1024) throw new RangeError('Historical answer range exceeds its bounded contract.');
     const length = Math.min(maximum, totalBytes - offset);
-    const chunk = await verified.read(root, path.resolve(root, metadata.storage_key), metadata.sha256, metadata.byte_length, offset, length);
+    const chunk = await readRange(metadata, offset, length);
+    if (chunk.length !== length) throw new Error('Historical answer CAS range is incomplete.');
     signal?.throwIfAborted();
     await new Promise<void>(resolve => setImmediate(resolve));
     const nextOffset = offset + chunk.length;
@@ -27,8 +37,10 @@ function offlineContentReader(casRoot: string, signal?: AbortSignal) {
 }
 
 /** Semantic acceptance and a provable physical timeline position are independent. */
-export async function backfillAcceptedAnswerPresentations(database: Database.Database, casRoot: string, signal?: AbortSignal): Promise<number> {
-  const reader = offlineContentReader(casRoot, signal);
+export async function backfillAcceptedAnswerPresentations(
+  database: Database.Database, content: string | HistoricalContentRangeReader, signal?: AbortSignal
+): Promise<number> {
+  const reader = offlineContentReader(typeof content === 'string' ? localHistoricalContentRanges(content) : content, signal);
   const pages = new AcceptedAnswerTextPages(reader);
   const candidate = database.prepare(`SELECT * FROM runtime_delivery
     WHERE (target_conversation_id, created_at, id) > (@conversationId, @createdAt, @id)

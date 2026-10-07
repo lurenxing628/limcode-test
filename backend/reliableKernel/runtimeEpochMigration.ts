@@ -1,5 +1,7 @@
 import { stablePhaseFId } from './phaseFIdentity';
-import { backfillAcceptedAnswerPresentations } from './answerPresentationBackfill';
+import {
+  backfillAcceptedAnswerPresentations, localHistoricalContentRanges, type HistoricalContentRangeReader
+} from './answerPresentationBackfill';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import * as fs from 'node:fs/promises';
@@ -31,7 +33,9 @@ import {
   EPOCH_5_RUNTIME_METADATA_SQL, EPOCH_5_RUNTIME_CONTRACT_DIGEST
 } from './schema/publishedEpoch5';
 export { EPOCH_5_RUNTIME_DOMAIN_SCHEMAS, EPOCH_5_RUNTIME_CONTRACT_DIGEST } from './schema/publishedEpoch5';
-import { migrateChildRuntimeDeliveryIntentLinks } from './runtimeDeliveryIntentLinkMigration';
+import {
+  localChildContinuationContent, migrateChildRuntimeDeliveryIntentLinks, type ChildContinuationContentAccess
+} from './runtimeDeliveryIntentLinkMigration';
 import { backfillProvenRuntimeInputTimeline } from './timelineBackfill';
 import { assertRuntimeHostsOffline, withRuntimeMaintenance } from './runtimeHostControl';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
@@ -39,6 +43,7 @@ import { toSqliteFilePath } from './sqliteFilePath';
 import {
   RootAuthority,
   RootAuthorityError,
+  migratedBinding,
   parseHistoricalRootBinding,
   parseRootBinding,
   sameBindingIdentity,
@@ -723,6 +728,16 @@ function assertPreviousEpochDatabase(
   return schemas;
 }
 
+/** Where an upgrade reads historical bodies and publishes the few bodies it converts. */
+export interface RuntimeUpgradeContent {
+  ranges: HistoricalContentRangeReader;
+  childContinuations: ChildContinuationContentAccess;
+}
+
+function localUpgradeContent(casRootPath: string): RuntimeUpgradeContent {
+  return { ranges: localHistoricalContentRanges(casRootPath), childContinuations: localChildContinuationContent(casRootPath) };
+}
+
 async function migrateDatabase(
   file: string,
   previous: HistoricalRootBinding,
@@ -734,76 +749,7 @@ async function migrateDatabase(
     database.defaultSafeIntegers(true);
     configureWriterConnection(database);
     database.pragma('synchronous = FULL');
-    const predecessorSchemas = assertPreviousEpochDatabase(database, previous);
-    database.pragma('foreign_keys = OFF');
-    database.exec('BEGIN IMMEDIATE');
-    try {
-      const previousKeys = new Set(predecessorSchemas.map((schema) => schema.key));
-      const added = RUNTIME_DOMAIN_SCHEMAS.filter((schema) => !previousKeys.has(schema.key));
-      for (const schema of added) {
-        database.exec(createRuntimeDomainTableSql(schema));
-        schema.indexes.forEach((index, ordinal) =>
-          database.exec(createRuntimeDomainIndexSql(schema, index, ordinal))
-        );
-      }
-      // The only changed indexes on a published table. The global answer cursor and the live
-      // state suffix each need id in their seek index to bound equal-clock buckets before LIMIT.
-      const deliverySchema = RUNTIME_DOMAIN_SCHEMAS.find(schema => schema.key === 'RuntimeDelivery')!;
-      for (const index of ['target_conversation_id,state,created_at,id', 'target_conversation_id,created_at,id']) {
-        const ordinal = deliverySchema.indexes.indexOf(index);
-        if (ordinal < 0) throw new Error('Epoch-6 delivery history index is missing.');
-        database.exec(createRuntimeDomainIndexSql(deliverySchema, index, ordinal));
-      }
-      if (!previousKeys.has('RuntimeDeliveryIntentLink')) {
-        await migrateChildRuntimeDeliveryIntentLinks(database, previous.paths.casRootPath);
-      }
-      backfillProvenRuntimeInputTimeline(database);
-      await backfillAcceptedAnswerPresentations(database, previous.paths.casRootPath, signal);
-      // Epoch 6 also admits compact catalog-reference recipes, frozen toolsReference recipes and
-      // packed small CAS for new writes only. Existing rows, inline recipes and loose CAS keep their bytes.
-      seedPendingConversationHandleStates(database);
-      replaceSchemaManifest(database);
-      const update = database.prepare(`
-        UPDATE root_binding
-           SET root_generation = @rootGeneration,
-               pointer_revision = @pointerRevision,
-               runtime_kernel_epoch = @runtimeKernelEpoch
-         WHERE singleton = 1
-           AND data_set_id = @dataSetId
-           AND root_instance_id = @rootInstanceId
-           AND root_generation = @previousRootGeneration
-           AND pointer_revision = @previousPointerRevision
-           AND runtime_kernel_epoch = @previousEpoch
-      `).run({
-        rootGeneration: BigInt(next.rootGeneration),
-        pointerRevision: BigInt(next.pointerRevision),
-        runtimeKernelEpoch: BigInt(next.runtimeKernelEpoch),
-        dataSetId: previous.dataSetId,
-        rootInstanceId: previous.rootInstanceId,
-        previousRootGeneration: BigInt(previous.rootGeneration),
-        previousPointerRevision: BigInt(previous.pointerRevision),
-        previousEpoch: BigInt(previous.runtimeKernelEpoch)
-      });
-      if (update.changes !== 1) {
-        throw new RootAuthorityError(
-          'runtime-epoch-migration-binding-mismatch',
-          'Historical Runtime root_binding compare-and-swap failed.'
-        );
-      }
-      const violations = database.pragma('foreign_key_check') as unknown[];
-      if (violations.length > 0) {
-        throw new RootAuthorityError(
-          'runtime-epoch-migration-integrity',
-          `Upgraded Runtime has ${violations.length} foreign key violations.`
-        );
-      }
-      database.exec('COMMIT');
-    } catch (error) {
-      database.exec('ROLLBACK');
-      throw error;
-    } finally {
-      database.pragma('foreign_keys = ON');
-    }
+    await upgradeOpenDatabase(database, previous, next, localUpgradeContent(previous.paths.casRootPath), signal);
     assertCurrentSchema(database, next);
     database.pragma('wal_checkpoint(TRUNCATE)');
   } catch (error) {
@@ -814,6 +760,117 @@ async function migrateDatabase(
     );
   } finally {
     database.close();
+  }
+}
+
+/**
+ * Upgrades a private snapshot copy of an exact published epoch-3/4/5 root (a foreign archive or
+ * copied data directory) with the same checks and the same single transaction as the in-place
+ * upgrade, but without journal, backup or pointer: the source root is never touched, so a failure
+ * or crash only discards the copy. The copy's binding keeps the recorded identity and paths and
+ * advances exactly as the in-place upgrade advances them. Errors keep their own codes.
+ */
+export async function upgradePublishedRuntimeSnapshot(
+  databasePath: string,
+  previous: HistoricalRootBinding,
+  content: RuntimeUpgradeContent,
+  signal?: AbortSignal
+): Promise<RootBinding> {
+  if (!isSupportedPreviousEpoch(previous.runtimeKernelEpoch)) {
+    throw new RootAuthorityError('runtime-epoch-migration-unsupported',
+      'The snapshot is not an exact published epoch-3/4/5 predecessor.');
+  }
+  const next = migratedBinding(previous);
+  const database = new Database(toSqliteFilePath(databasePath), { fileMustExist: true });
+  try {
+    configureWriterConnection(database);
+    await upgradeOpenDatabase(database, previous, next, content, signal);
+    assertCurrentSchema(database, next);
+    assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS);
+    database.pragma('wal_checkpoint(TRUNCATE)');
+  } finally {
+    database.close();
+  }
+  return next;
+}
+
+/** The exact predecessor checks, then one transaction: new domains, seek indexes, backfills, seeds, manifest, binding. */
+async function upgradeOpenDatabase(
+  database: Database.Database,
+  previous: HistoricalRootBinding,
+  next: RootBinding,
+  content: RuntimeUpgradeContent,
+  signal?: AbortSignal
+): Promise<void> {
+  const predecessorSchemas = assertPreviousEpochDatabase(database, previous);
+  database.pragma('foreign_keys = OFF');
+  database.exec('BEGIN IMMEDIATE');
+  try {
+    const previousKeys = new Set(predecessorSchemas.map((schema) => schema.key));
+    const added = RUNTIME_DOMAIN_SCHEMAS.filter((schema) => !previousKeys.has(schema.key));
+    for (const schema of added) {
+      database.exec(createRuntimeDomainTableSql(schema));
+      schema.indexes.forEach((index, ordinal) =>
+        database.exec(createRuntimeDomainIndexSql(schema, index, ordinal))
+      );
+    }
+    // The only changed indexes on a published table. The global answer cursor and the live
+    // state suffix each need id in their seek index to bound equal-clock buckets before LIMIT.
+    const deliverySchema = RUNTIME_DOMAIN_SCHEMAS.find(schema => schema.key === 'RuntimeDelivery')!;
+    for (const index of ['target_conversation_id,state,created_at,id', 'target_conversation_id,created_at,id']) {
+      const ordinal = deliverySchema.indexes.indexOf(index);
+      if (ordinal < 0) throw new Error('Epoch-6 delivery history index is missing.');
+      database.exec(createRuntimeDomainIndexSql(deliverySchema, index, ordinal));
+    }
+    if (!previousKeys.has('RuntimeDeliveryIntentLink')) {
+      await migrateChildRuntimeDeliveryIntentLinks(database, content.childContinuations);
+    }
+    backfillProvenRuntimeInputTimeline(database);
+    await backfillAcceptedAnswerPresentations(database, content.ranges, signal);
+    // Epoch 6 also admits compact catalog-reference recipes, frozen toolsReference recipes and
+    // packed small CAS for new writes only. Existing rows, inline recipes and loose CAS keep their bytes.
+    seedPendingConversationHandleStates(database);
+    replaceSchemaManifest(database);
+    const update = database.prepare(`
+      UPDATE root_binding
+         SET root_generation = @rootGeneration,
+             pointer_revision = @pointerRevision,
+             runtime_kernel_epoch = @runtimeKernelEpoch
+       WHERE singleton = 1
+         AND data_set_id = @dataSetId
+         AND root_instance_id = @rootInstanceId
+         AND root_generation = @previousRootGeneration
+         AND pointer_revision = @previousPointerRevision
+         AND runtime_kernel_epoch = @previousEpoch
+    `).run({
+      rootGeneration: BigInt(next.rootGeneration),
+      pointerRevision: BigInt(next.pointerRevision),
+      runtimeKernelEpoch: BigInt(next.runtimeKernelEpoch),
+      dataSetId: previous.dataSetId,
+      rootInstanceId: previous.rootInstanceId,
+      previousRootGeneration: BigInt(previous.rootGeneration),
+      previousPointerRevision: BigInt(previous.pointerRevision),
+      previousEpoch: BigInt(previous.runtimeKernelEpoch)
+    });
+    if (update.changes !== 1) {
+      throw new RootAuthorityError(
+        'runtime-epoch-migration-binding-mismatch',
+        'Historical Runtime root_binding compare-and-swap failed.'
+      );
+    }
+    const violations = database.pragma('foreign_key_check') as unknown[];
+    if (violations.length > 0) {
+      throw new RootAuthorityError(
+        'runtime-epoch-migration-integrity',
+        `Upgraded Runtime has ${violations.length} foreign key violations.`
+      );
+    }
+    database.exec('COMMIT');
+  } catch (error) {
+    database.exec('ROLLBACK');
+    throw error;
+  } finally {
+    database.pragma('foreign_keys = ON');
   }
 }
 

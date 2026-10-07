@@ -270,6 +270,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/foreign-history-commands.test.cjs',
   'tests/reliable-kernel/runtime-foreign-history-review.test.mjs',
   'tests/reliable-kernel/runtime-foreign-history-merge.test.mjs',
+  'tests/reliable-kernel/runtime-foreign-history-published-upgrade.test.mjs',
   'tests/reliable-kernel/runtime-merge-deleted-conversations.test.mjs',
   'tests/reliable-kernel/runtime-foreign-history-blind.test.mjs',
   'tests/reliable-kernel/foreign-archive-only-relocation.test.mjs',

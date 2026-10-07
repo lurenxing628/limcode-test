@@ -210,6 +210,7 @@
     "tests/reliable-kernel/runtime-exclusive-maintenance.test.mjs": 64341.217,
     "tests/reliable-kernel/runtime-foreign-history-blind.test.mjs": 23218.735,
     "tests/reliable-kernel/runtime-foreign-history-merge.test.mjs": 30414.34,
+    "tests/reliable-kernel/runtime-foreign-history-published-upgrade.test.mjs": 9000,
     "tests/reliable-kernel/runtime-foreign-history-review.test.mjs": 24513.529,
     "tests/reliable-kernel/runtime-foreign-history.test.mjs": 6564.418,
     "tests/reliable-kernel/runtime-history-integrity.test.mjs": 13889.35,

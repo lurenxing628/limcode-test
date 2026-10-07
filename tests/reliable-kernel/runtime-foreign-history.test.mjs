@@ -283,6 +283,13 @@ async function copiedBeside(home, source, suffix) {
   return target;
 }
 
+async function relabelEpoch(copied, epoch) {
+  const pointerFile = path.join(copied, '.limcode-runtime', 'root-binding.json');
+  const epochFile = path.join(copied, '.limcode-runtime', 'active', 'runtime-kernel-epoch.json');
+  await fs.writeFile(pointerFile, JSON.stringify({ ...JSON.parse(await fs.readFile(pointerFile, 'utf8')), runtimeKernelEpoch: epoch }));
+  await fs.writeFile(epochFile, JSON.stringify({ ...JSON.parse(await fs.readFile(epochFile, 'utf8')), runtimeKernelEpoch: epoch }));
+}
+
 test('每种拒绝原因各一例：未通过的列出位置、大小与原因并原样保留；磁盘满与复制中变化只是暂时无法核验、不入缓存', async (t) => {
   const directory = await base(t, 'reasons');
   const elsewhere = path.join(directory, 'elsewhere');
@@ -310,12 +317,9 @@ test('每种拒绝原因各一例：未通过的列出位置、大小与原因�
       const file = path.join(control(await copiedBeside(home, elsewhere, 1)), 'active', 'runtime-kernel-epoch.json');
       await fs.writeFile(file, JSON.stringify({ ...JSON.parse(await fs.readFile(file, 'utf8')), extra: true }));
     }],
-    ['foreign-history-epoch-not-current', 'failed', async (home) => {
-      const copied = await copiedBeside(home, elsewhere, 1);
-      const epochFile = path.join(control(copied), 'active', 'runtime-kernel-epoch.json');
-      await fs.writeFile(pointer(copied), JSON.stringify({ ...JSON.parse(await fs.readFile(pointer(copied), 'utf8')), runtimeKernelEpoch: 4 }));
-      await fs.writeFile(epochFile, JSON.stringify({ ...JSON.parse(await fs.readFile(epochFile, 'utf8')), runtimeKernelEpoch: 4 }));
-    }],
+    ['foreign-history-epoch-not-current', 'failed', async (home) => relabelEpoch(await copiedBeside(home, elsewhere, 1), 2)],
+    // A current-format copy relabeled as published epoch 4 fails the exact epoch-4 check on its private copy.
+    ['foreign-history-upgrade-failed', 'failed', async (home) => relabelEpoch(await copiedBeside(home, elsewhere, 1), 4)],
     ['foreign-history-unfinished-relocation', 'failed', async (home) => {
       await fs.writeFile(path.join(await copiedBeside(home, elsewhere, 1), '.limcode-data-root-relocation.json'),
         JSON.stringify({ kind: 'limcode-data-root-relocation', state: 'staging' }));

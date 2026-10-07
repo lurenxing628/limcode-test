@@ -341,6 +341,7 @@ const DIRNAME_ENTRY_BOUNDARIES = new Map([
   ['dist/extension/backend/reliableKernel/databaseWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/packedCasWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js', 'worker'],
+  ['dist/extension/backend/reliableKernel/runtimeSnapshotUpgradeWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeDataRootRelocationWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/processWrapper.js', 'process']
@@ -446,6 +447,8 @@ const INTERNAL_STRUCTURED_CLONE_PATHS = new Set([
   'dist/extension/backend/reliableKernel/packedCasWorker.js',
   'dist/extension/backend/reliableKernel/runtimeDatabase.js',
   'dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js',
+  'dist/extension/backend/reliableKernel/runtimeSnapshotUpgrade.js',
+  'dist/extension/backend/reliableKernel/runtimeSnapshotUpgradeWorker.js',
   'dist/extension/backend/reliableKernel/runtimeDataSetFactsWorker.js',
   'dist/extension/backend/reliableKernel/runtimeDataRootRelocationWorker.js'
 ]);
