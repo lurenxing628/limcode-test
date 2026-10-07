@@ -281,3 +281,5 @@ docs/architecture/*
 
 !/tests/reliable-kernel/current-context-handle-merge.test.mjs
 !/tests/reliable-kernel/context-handle-head-writers.test.mjs
+
+!/tests/reliable-kernel/runtime-merge-conversation-ownership.test.mjs

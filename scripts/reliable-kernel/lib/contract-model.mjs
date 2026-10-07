@@ -554,9 +554,19 @@ function validateMigration(root, migration, failures) {
     selectionPolicy: 'never-switch',
     historicalExecutionPolicy: 'no-merged-conversation-resumes-in-any-host; source-host-registered-only-to-finalize'
   };
-  if (!plainObject(merge) || JSON.stringify(merge) !== JSON.stringify(expectedMerge)) {
+  if (!plainObject(merge) || JSON.stringify(Object.fromEntries(Object.entries(merge).filter(([key]) => key !== 'conversationOwnership'))) !== JSON.stringify(expectedMerge)) {
     failures.push('旧历史库只能在当前库打开后在线合并：来源离线，重活不持锁，全部检查通过才先备份再按现有终态收尾，每来源一个经 Repository 与 codec 的写事务，超过在线上限才在锁外协调独占兜底、超过内存单事务上限等大库会话的流式维护事务、超过流式硬上限记为太大，冲突整份拒绝，合并进来的对话不会被自动继续');
   }
+  const ownershipSource = readText(path.join(root, 'backend/reliableKernel/runtimeMergeConversationOwnership.ts'));
+  try {
+    const literal = ownershipSource.match(/RUNTIME_MERGE_CONVERSATION_OWNERSHIP[^=]*= (\{[\s\S]*?\n\});/)[1];
+    const ownership = JSON.parse(literal.replace(/([\{,]\s*)([A-Za-z][A-Za-z0-9_]*)\s*:/g, '$1"$2":')
+      .replace(/'([^']*)'/g, (_, value) => JSON.stringify(value)).replace(/,\s*([}\]])/g, '$1'));
+    if (JSON.stringify(merge.conversationOwnership) !== JSON.stringify(ownership)) failures.push('对话归属路径必须与实现一致');
+    const keys = ['Core', 'Execution', 'Context', 'Collaboration', 'CollaborationBoard', 'Timeline'].flatMap((name) =>
+      [...readText(path.join(root, `backend/reliableKernel/schema/domains${name}.ts`)).matchAll(/key:\s*'([^']+)'/g)].map((match) => match[1]));
+    failures.push(...exactSetProblems('对话归属领域覆盖', keys, Object.keys(ownership)));
+  } catch (error) { failures.push(`对话归属合同无法解析：${error.message}`); }
   const expectedHistoricalRepair = {
     entry: 'history-and-storage-management-explicit-inspect-then-confirm-never-merge-fallback',
     scope: 'only-current-epoch-local-nonselected-offline-data-set-exact-binding-and-schema-no-pending-recovery-or-committing-merge-no-shared-inode-or-links',

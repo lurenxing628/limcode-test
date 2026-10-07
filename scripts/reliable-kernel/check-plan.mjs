@@ -47,6 +47,7 @@ function isTestArtifactPath(file) {
 }
 
 const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
+  'tests/reliable-kernel/runtime-merge-conversation-ownership.test.mjs',
   'tests/reliable-kernel/context-cas-cache.test.mjs',
   'tests/reliable-kernel/frozen-tool-definitions.test.mjs',
   'tests/webview-session-thinking.browser.mjs',
