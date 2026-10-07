@@ -1,4 +1,5 @@
 import type { CommandCapability } from '../../../../../capabilities/types';
+import { DEFAULT_COMMAND_FOREGROUND_WAIT_MS } from '../../../../../capabilities/commandDefaults';
 import { powerShellCommandSyntaxGuidance, resolveWindowsPowerShell } from '../../../../../capabilities/windowsPowerShell';
 import type { ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
@@ -42,7 +43,8 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             type: 'integer',
             minimum: 0,
             maximum: 60000,
-            description: 'Required for mode=execute. Integer milliseconds from 0 to 60000 to wait before returning a still-running command as a background process. Use 0 to background immediately. This does not terminate the command; executionTimeoutMs controls the hard deadline.'
+            default: DEFAULT_COMMAND_FOREGROUND_WAIT_MS,
+            description: `Optional for mode=execute. Defaults to ${DEFAULT_COMMAND_FOREGROUND_WAIT_MS} milliseconds (10 seconds). Integer milliseconds from 0 to 60000 to wait before returning a still-running command as a background process. Use 0 to background immediately. This does not terminate the command; executionTimeoutMs controls the hard deadline.`
           },
           executionTimeoutMs: {
             type: 'integer',
@@ -148,8 +150,11 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
       if (typeof args.explanation !== 'string' || args.explanation.trim().length === 0) {
         return { ok: false, output: 'mode=execute 需要提供 explanation。' };
       }
-      if (typeof args.foregroundWaitMs !== 'number' || !Number.isSafeInteger(args.foregroundWaitMs) || args.foregroundWaitMs < 0 || args.foregroundWaitMs > 60_000) {
-        return { ok: false, output: 'foregroundWaitMs 为必填参数，需为 0 到 60000 的整数毫秒数（0 表示启动后立即转后台）。' };
+      const foregroundWaitMs = args.foregroundWaitMs === undefined
+        ? DEFAULT_COMMAND_FOREGROUND_WAIT_MS
+        : args.foregroundWaitMs;
+      if (typeof foregroundWaitMs !== 'number' || !Number.isSafeInteger(foregroundWaitMs) || foregroundWaitMs < 0 || foregroundWaitMs > 60_000) {
+        return { ok: false, output: `foregroundWaitMs 需为 0 到 60000 的整数毫秒数，省略时默认为 ${DEFAULT_COMMAND_FOREGROUND_WAIT_MS}（0 表示启动后立即转后台）。` };
       }
       if (args.executionTimeoutMs !== undefined && (
         typeof args.executionTimeoutMs !== 'number'
@@ -182,7 +187,7 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
       const result = await deps.command.run({
         command: args.command,
         cwd: args.cwd,
-        foregroundWaitMs: args.foregroundWaitMs,
+        foregroundWaitMs,
         executionTimeoutMs: args.executionTimeoutMs,
         maxOutputBytes: args.maxOutputBytes,
         executionId: ctx?.toolCallId,

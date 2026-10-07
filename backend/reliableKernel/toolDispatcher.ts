@@ -23,6 +23,7 @@ import {
 } from '../../shared/protocol';
 import { CHILD_PLAN_AUTO_APPROVAL_MESSAGE, PLAN_AUTO_APPROVAL_MESSAGE } from '../../shared/planReview';
 import { BACKGROUND_ASK_USER_AUTO_ANSWER } from '../../shared/askUser';
+import { DEFAULT_COMMAND_FOREGROUND_WAIT_MS } from '../capabilities/commandDefaults';
 import { EXTENSION_PACKAGE_NAME } from '../../shared/extensionIdentity';
 import {
   crossConversationSwitchOn,
@@ -1857,7 +1858,13 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         return this.reject(input, '命令未匹配上级对话冻结的 ToolPolicy 白名单；子 Agent 的命令不能超出上级对话允许的范围，因此不会执行。');
       }
     }
-    const foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
+    const foregroundWaitMs = requireOptionalBoundedInteger(
+      args.foregroundWaitMs,
+      DEFAULT_COMMAND_FOREGROUND_WAIT_MS,
+      'foregroundWaitMs',
+      0,
+      60_000
+    );
     const executionTimeoutMs = requireOptionalBoundedInteger(
       args.executionTimeoutMs,
       DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS,
@@ -3226,13 +3233,6 @@ export function effectiveProcessForegroundWaitMs(
   return replacesCurrentExtension
     ? Math.max(requestedWaitMs, executionTimeoutMs)
     : requestedWaitMs;
-}
-
-function requireWaitMs(value: PlainJsonValue | undefined): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > 60_000) {
-    throw new TypeError('foregroundWaitMs must be an integer from 0 to 60000.');
-  }
-  return value;
 }
 
 function requireOptionalBoundedInteger(

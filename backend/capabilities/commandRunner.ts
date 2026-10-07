@@ -12,8 +12,8 @@ import {
 } from '../../shared/workEnvironmentCatalog';
 import { isRemoteServerCommandEnvironment, runRemoteServerCommand } from './workEnvironmentProvider';
 import { powerShellCommandSyntaxGuidance, resolveWindowsPowerShell } from './windowsPowerShell';
+import { DEFAULT_COMMAND_FOREGROUND_WAIT_MS } from './commandDefaults';
 
-const DEFAULT_FOREGROUND_WAIT_MS = 30_000;
 /** 后台进程完整日志 buffer 的上限（远大于给模型的软上限，避免过早丢弃可能被 output 读取的历史）。 */
 const BACKGROUND_MAX_CHARS = 200_000;
 /** Legacy capability declarations use zero to mean complete output; reliable mode pages by outputHandle. */
@@ -366,7 +366,7 @@ function emitStreamDelta(observer: CommandRunObserver | undefined, kind: StreamO
 }
 
 function resolveForegroundWaitMs(value: number | undefined): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return DEFAULT_FOREGROUND_WAIT_MS;
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return DEFAULT_COMMAND_FOREGROUND_WAIT_MS;
   return Math.floor(value);
 }
 

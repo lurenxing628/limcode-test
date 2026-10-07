@@ -58,8 +58,8 @@ for (const toolName of ['shell', 'bash']) {
       );
       const validValues = [minimum, maximum];
       const invalidValues = [minimum - 1, maximum + 1, minimum + 0.5, '1000', null];
-      if (fieldName === 'foregroundWaitMs') invalidValues.push(undefined, 90000, 120000);
-      else validValues.push(undefined);
+      if (fieldName === 'foregroundWaitMs') invalidValues.push(90000, 120000);
+      validValues.push(undefined);
       for (const value of validValues) {
         await assert.rejects(dispatch(value), (error) => error === stoppedBeforeProcessStart);
       }
@@ -72,12 +72,65 @@ for (const toolName of ['shell', 'bash']) {
       assert.equal(field.minimum, minimum);
       assert.equal(field.maximum, maximum);
       if (fieldName === 'foregroundWaitMs') {
+        assert.equal(field.default, 10_000);
+        assert.match(field.description, /Defaults to 10000/);
         assert.match(field.description, /0 to 60000/);
         assert.match(field.description, /executionTimeoutMs/);
         assert.ok(!tool.declaration.parameters.required?.includes(fieldName));
       }
     });
   }
+}
+
+for (const toolName of ['bash', 'shell']) {
+  test(`${toolName} 可靠分派省略前台等待时传入 10000 毫秒，显式值保持不变`, async () => {
+    const starts = [];
+    const waits = [];
+    const terminal = { status: 'succeeded', detail: { exitCode: 0 } };
+    const dispatcher = {
+      dependencies: {
+        host: { async resolveProcessCwd() { return '/test-command-root'; } },
+        processes: {
+          async prepareStart(input) {
+            starts.push(input);
+            return { effect: { effectIntentId: 'test-process-start' } };
+          },
+          async dispatchStart(effectIntentId, foregroundWaitMs) {
+            assert.equal(effectIntentId, 'test-process-start');
+            waits.push(foregroundWaitMs);
+            return { terminal };
+          }
+        }
+      }
+    };
+    for (const args of [
+      {},
+      { foregroundWaitMs: undefined },
+      { foregroundWaitMs: 0 },
+      { foregroundWaitMs: 10_000 },
+      { foregroundWaitMs: 60_000 }
+    ]) {
+      const result = await ReliableToolDispatcher.prototype.dispatchProcess.call(
+        dispatcher,
+        {
+          toolName,
+          toolCallId: 'command-default-wait',
+          arguments: {
+            command: 'echo default-wait-test',
+            explanation: 'verify the foreground budget without starting a process',
+            ...args
+          }
+        },
+        {},
+        new AbortController().signal
+      );
+      assert.equal(result, terminal);
+    }
+    assert.deepEqual(waits, [10_000, 10_000, 0, 10_000, 60_000]);
+    assert.equal(starts.length, 5);
+    assert.ok(starts.every(input => input.executionTimeoutMs === 120_000),
+      '前台缺省值不能改变硬执行超时');
+  });
 }
 
 function readDeps() {
@@ -828,7 +881,7 @@ test('MCP 工具伪造引用失败 code 时不能绕过深层结果 ID 脱敏', 
 });
 
 for (const name of ['bash', 'shell']) {
-  test(`${name} execute 必填 foregroundWaitMs，错误不执行命令；边界值仍可用`, async () => {
+  test(`${name} execute 省略 foregroundWaitMs 时默认 10 秒，非法值不执行命令`, async () => {
     const runs = [];
     const command = {
       toolName: name, description: 'Test command',
@@ -836,20 +889,23 @@ for (const name of ['bash', 'shell']) {
     };
     const tool = createCommandTool(command);
     const properties = tool.declaration.parameters.properties;
-    assert.match(properties.foregroundWaitMs.description, /Required for mode=execute/);
+    assert.match(properties.foregroundWaitMs.description, /Defaults to 10000/);
+    assert.equal(properties.foregroundWaitMs.default, 10_000);
     assert.equal(properties.foregroundWaitMs.type, 'integer');
     const args = { command: 'pwd', explanation: 'Inspect working directory' };
-    for (const invalid of [undefined, null, -1, 60_001, 0.5, '0']) {
+    for (const invalid of [null, -1, 60_001, 0.5, '0', NaN, Infinity]) {
       const response = await tool.execute({ ...args, foregroundWaitMs: invalid }, { command });
       assert.equal(response.ok, false);
       assert.match(response.output, /foregroundWaitMs/);
     }
     assert.equal(runs.length, 0);
-    for (const wait of [0, 60_000]) {
+    const omitted = await tool.execute(args, { command });
+    assert.equal(omitted.ok, true);
+    for (const wait of [undefined, 0, 10_000, 60_000]) {
       const response = await tool.execute({ ...args, foregroundWaitMs: wait }, { command });
       assert.equal(response.ok, true);
     }
-    assert.deepEqual(runs.map(input => input.foregroundWaitMs), [0, 60_000]);
+    assert.deepEqual(runs.map(input => input.foregroundWaitMs), [10_000, 10_000, 0, 10_000, 60_000]);
   });
 
   test(`${name} output/kill 缺失、类型错误或额外游标返回一致可诊断错误，合法 ID 可用`, async () => {
