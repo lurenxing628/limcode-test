@@ -48,11 +48,11 @@
     "runtimeKernelEpoch": "single-current-epoch",
     "incrementalLegacyMigrationChain": false,
     "incompatibleRuntimeData": "exact-published-upgrade-else-fail-closed",
-    "exactPredecessorUpgrade": "published-epoch-3-4-5-6-7-8-or-9-to-10-with-backup-journal",
-    "currentEpoch": 10,
-    "packedSmallCasAdmission": "whole-data-set-admission-fence-for-packed-small-cas; epoch-9-to-10-metadata-only-preserve-all-113-domain-rows-cas-and-ready-or-pending-handle-state; no-domain-ddl-or-history-body-read-or-startup-packing; old-epoch-9-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade",
-    "frozenToolsReferenceAdmission": "whole-data-set-admission-fence-for-frozen-tools-reference-recipes; epoch-8-to-9-metadata-only-preserve-all-domain-rows-cas-and-ready-or-pending-handle-state; no-domain-ddl-or-history-body-read; old-epoch-8-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade",
-    "catalogReferenceAdmission": "whole-data-set-admission-fence-for-compact-catalog-reference-recipes; epoch-7-to-8-metadata-only-preserve-all-domain-rows-cas-and-ready-or-pending-handle-state; no-domain-ddl-or-history-body-read; old-epoch-7-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade"
+    "exactPredecessorUpgrade": "published-epoch-3-4-or-5-to-6-with-backup-journal",
+    "currentEpoch": 6,
+    "packedSmallCasAdmission": "epoch-6-whole-data-set-admission-fence-for-packed-small-cas; new-writes-only-loose-cas-keeps-its-bytes; no-history-body-rewrite-or-startup-packing; old-epoch-5-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade",
+    "frozenToolsReferenceAdmission": "epoch-6-whole-data-set-admission-fence-for-frozen-tools-reference-recipes; new-writes-only-inline-recipes-keep-their-bytes; no-domain-row-or-history-body-rewrite-in-upgrade; old-epoch-5-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade",
+    "catalogReferenceAdmission": "epoch-6-whole-data-set-admission-fence-for-compact-catalog-reference-recipes; new-writes-only-inline-recipes-keep-their-bytes; no-domain-row-or-history-body-rewrite-in-upgrade; old-epoch-5-readers-refuse-open; live-or-unknown-old-hosts-block-upgrade"
   },
   "sequenceAllocation": {
     "columnType": "INTEGER",
@@ -1411,7 +1411,7 @@
         "state"
       ],
       "notes": [
-        "epoch 7: Conversation 当前 root/provenance_revision 指针、pending/ready 检查点与独立 native reset；只在 Context admission/选根事务发布当前句柄，普通 recipe/pre-wire 私有分配不得污染输入根。"
+        "epoch 6: Conversation 当前 root/provenance_revision 指针、pending/ready 检查点与独立 native reset；只在 Context admission/选根事务发布当前句柄，普通 recipe/pre-wire 私有分配不得污染输入根。"
       ]
     },
     {
@@ -1431,7 +1431,7 @@
         "context_root_id"
       ],
       "notes": [
-        "epoch 7: Conversation、Context root、来源代数上的不可变目录快照；结构形状索引用于有界前缀恢复，完整性由 root ownership/shape worker 不变量验证。"
+        "epoch 6: Conversation、Context root、来源代数上的不可变目录快照；结构形状索引用于有界前缀恢复，完整性由 root ownership/shape worker 不变量验证。"
       ]
     },
     {

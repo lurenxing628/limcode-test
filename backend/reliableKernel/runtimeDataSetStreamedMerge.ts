@@ -1135,7 +1135,7 @@ export interface PreparedLargeMergeSource {
   casObjects: number;
   cas: RuntimeDataSetCasTransfer;
   finalized?: RuntimeDataSetMergeResult['finalized'];
-  upgradedFromEpoch?: 3 | 4 | 5 | 6 | 7 | 8 | 9;
+  upgradedFromEpoch?: 3 | 4 | 5;
   /** Estimated exclusive time of this source (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
   estimateMs: number;
   estimateRangeMs: [number, number];

@@ -203,7 +203,7 @@ test('升级前备份：升级完成满 7 天才可删；控制根里有进行�
   assert.equal(itemAt(later, backup).deletable, true, itemAt(later, backup).reason);
   assert.match(itemAt(later, backup).reason, /^可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在/);
 
-  for (const journalName of ['epoch-to-5-migration.json', 'epoch-to-6-migration.json', 'epoch-to-7-migration.json', 'epoch-to-8-migration.json', 'epoch-to-9-migration.json', kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE]) {
+  for (const journalName of ['epoch-to-5-migration.json', kernel.RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE]) {
     const journal = path.join(controlRoot(fixture.current), journalName);
     await fs.writeFile(journal, '{}');
     const journaled = await planRuntimeBackupCleanup(fixture.root, database, eightDays);

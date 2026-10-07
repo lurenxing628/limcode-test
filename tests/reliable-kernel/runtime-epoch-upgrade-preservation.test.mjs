@@ -25,8 +25,8 @@ const { PHYSICAL_CUTOVER_MANIFEST } = require(path.resolve(
   'dist/extension/backend/reliableKernel/generatedPhysicalCutoverManifest.js'
 ));
 
-for (const previousEpoch of [3, 4, 5, 6, 7, 8, 9]) {
-  test(`published epoch ${previousEpoch} upgrades to 10 with the conversation, message and CAS intact`, async () => {
+for (const previousEpoch of [3, 4, 5]) {
+  test(`published epoch ${previousEpoch} upgrades to 6 with the conversation, message and CAS intact`, async () => {
     const fixture = await createPublishedRuntime(previousEpoch);
     let runtime;
     try {
@@ -39,7 +39,7 @@ for (const previousEpoch of [3, 4, 5, 6, 7, 8, 9]) {
       assert.equal(result.binding.rootInstanceId, fixture.previous.rootInstanceId);
       assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + 1);
       assert.equal(result.binding.pointerRevision, fixture.previous.pointerRevision + 1);
-      assert.equal(result.binding.runtimeKernelEpoch, 10);
+      assert.equal(result.binding.runtimeKernelEpoch, 6);
       assert.equal(await fs.readFile(fixture.settingsPath, 'utf8'), 'keep-settings');
       assert.equal(await fs.readFile(fixture.workspacePath, 'utf8'), 'keep-workspace');
 
@@ -52,7 +52,7 @@ for (const previousEpoch of [3, 4, 5, 6, 7, 8, 9]) {
           BigInt(previousEpoch));
         assert.equal(backup.prepare('SELECT count(*) AS n FROM conversation').get().n, 1n);
         assert.equal(backup.prepare('SELECT count(*) AS n FROM schema_manifest').get().n,
-          BigInt(previousEpoch === 3 ? 87 : previousEpoch === 4 ? 91 : previousEpoch === 5 ? 107 : previousEpoch === 6 ? 111 : 113));
+          BigInt(previousEpoch === 3 ? 87 : previousEpoch === 4 ? 91 : 107));
       } finally { backup.close(); }
 
       runtime = await kernel.RuntimeDatabase.open(fixture.authority);
@@ -193,7 +193,7 @@ test('a deep Runtime path upgrades with a durable backup and opens the preserved
 });
 
 for (const oldState of ['pending-only', 'backed-up']) test(
-  `an interrupted published 3→4 ${oldState} state recovers and continues to epoch 10`, async () => {
+  `an interrupted published 3→4 ${oldState} state recovers and continues to epoch 6`, async () => {
     const fixture = await createPublishedRuntime(3);
     try {
       const next4 = {
@@ -226,7 +226,7 @@ for (const oldState of ['pending-only', 'backed-up']) test(
       const result = await new VscodeReliableKernelCutoverCoordinator(
         fixture.authority, fixture.scope
       ).ensureCurrentRoot();
-      assert.equal(result.binding.runtimeKernelEpoch, 10);
+      assert.equal(result.binding.runtimeKernelEpoch, 6);
       assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
       const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
       try { assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1); }
@@ -236,7 +236,7 @@ for (const oldState of ['pending-only', 'backed-up']) test(
   }
 );
 
-for (const previousEpoch of [4, 6, 8, 9]) test(`an exact epoch ${previousEpoch} upgrade recovers at every durable interruption without losing history`, async (t) => {
+for (const previousEpoch of [4, 5]) test(`an exact epoch ${previousEpoch} upgrade recovers at every durable interruption without losing history`, async (t) => {
   for (const point of [
     'after-writer-fence', 'before-backup', 'after-backup',
     'after-database-commit', 'after-pointer-publication'
@@ -308,7 +308,7 @@ test('a damaged migration backup blocks recovery without replacing the old Runti
   } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
 });
 
-for (const previousEpoch of [3, 4, 5, 6, 7, 8, 9]) {
+for (const previousEpoch of [3, 4, 5]) {
   test(`explicit epoch ${previousEpoch} data-set upgrade preserves history and attachments while another selected Runtime writes`, async () => {
     const fixture = await createPublishedRuntime(previousEpoch, { workspaceScope: true, attachment: true });
     const storagePaths = { globalStoragePath: fixture.cleanupRoot };
@@ -554,7 +554,7 @@ test('explicit upgrade resumes each exact pending migration boundary without req
       }), /stop at/);
       const result = await kernel.upgradeRuntimeDataSet(storagePaths, input);
       assert.equal(result.migrated, true);
-      assert.equal(result.binding.runtimeKernelEpoch, 10);
+      assert.equal(result.binding.runtimeKernelEpoch, 6);
       assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
       await fs.access(path.join(result.backupPath, 'limcode.epoch-4.sqlite'));
       const reader = await openHistory(storagePaths, input.candidateId);
@@ -572,7 +572,7 @@ test('explicit upgrade resumes each exact pending migration boundary without req
       }));
       const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
       assert.equal(result.previousEpoch, 3);
-      assert.equal(result.binding.runtimeKernelEpoch, 10);
+      assert.equal(result.binding.runtimeKernelEpoch, 6);
       await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
     } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
   });
@@ -615,7 +615,7 @@ test('automatic discovery upgrades independent histories after one failure and f
     const report = await kernel.upgradeDiscoveredRuntimeDataSets(storagePaths);
     assert.equal(report.stopped, false);
     assert.deepEqual(report.results.map(item => item.candidateId), [upgradeInput(intact).candidateId, upgradeInput(interrupted).candidateId]);
-    assert.ok(report.results.every(item => item.migrated && item.binding.runtimeKernelEpoch === 10 && item.backupPath));
+    assert.ok(report.results.every(item => item.migrated && item.binding.runtimeKernelEpoch === 6 && item.backupPath));
     const failure = report.failures.find(item => item.candidateId === upgradeInput(failed).candidateId);
     assert.equal(failure.stage, 'upgrade');
     assert.equal(failure.code, 'runtime-epoch-migration-failed');
@@ -652,7 +652,7 @@ test('automatic discovery stops between sources after deactivation and leaves th
     await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
     const selectedBefore = await preservedFiles(selected);
     const report = await kernel.upgradeDiscoveredRuntimeDataSets(storagePaths, {
-      shouldContinue: () => JSON.parse(readFileSync(first.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch !== 10
+      shouldContinue: () => JSON.parse(readFileSync(first.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch !== 6
     });
     assert.equal(report.stopped, true);
     assert.equal(report.failures.length, 0);
@@ -728,7 +728,7 @@ test('published epoch 5 has the frozen release fingerprint and retains every old
     const before = publishedEpoch5Rows(fixture.paths.databasePath);
     const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
     assert.equal(result.previousEpoch, 5);
-    assert.equal(result.binding.runtimeKernelEpoch, 10);
+    assert.equal(result.binding.runtimeKernelEpoch, 6);
     assert.deepEqual(publishedEpoch5Rows(fixture.paths.databasePath), before);
     const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
     try {
@@ -739,19 +739,72 @@ test('published epoch 5 has the frozen release fingerprint and retains every old
   } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
 });
 
-for (const fromEpoch of [4]) for (const state of ['pointer-published']) test(`published ${fromEpoch}→5 ${state} boundary converges before epoch 10`, async () => {
+test('published epoch 5 seeds only pending handle markers across bounded pages and preserves every old row, DDL and CAS byte', async () => {
+  const fixture = await createPublishedRuntime(5, { attachment: true });
+  try {
+    assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 6);
+    // Cross the bounded seeding page twice, including a legal negative rowid at its first edge.
+    const seed = new Database(fixture.paths.databasePath);
+    try {
+      seed.exec('BEGIN IMMEDIATE');
+      const insert = seed.prepare('INSERT INTO conversation (id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)');
+      for (let index = 0; index < 501; index += 1) {
+        insert.run(`preserved_empty_${index}`, `Empty ${index}`, 'active', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z');
+      }
+      seed.prepare('INSERT INTO conversation (rowid, id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
+        .run(-1, 'preserved_negative_rowid', 'Old negative rowid', 'active', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z');
+      seed.exec('COMMIT');
+      seed.pragma('wal_checkpoint(TRUNCATE)');
+    } finally { seed.close(); }
+    const before = publishedEpoch5Rows(fixture.paths.databasePath);
+    const casBefore = await fileDigests(fixture.paths.casRootPath);
+    const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
+    assert.equal(result.previousEpoch, 5);
+    assert.equal(result.binding.runtimeKernelEpoch, 6);
+    assert.deepEqual(publishedEpoch5Rows(fixture.paths.databasePath), before);
+    assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
+    const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      database.defaultSafeIntegers(true);
+      const conversations = database.prepare('SELECT id, created_at, updated_at FROM conversation ORDER BY id').all();
+      assert.deepEqual(database.prepare('SELECT * FROM conversation_context_handle_state ORDER BY conversation_id').all(),
+        conversations.map(row => ({
+          id: kernel.stablePhaseFId('conversation_context_handle_state', row.id), conversation_id: row.id,
+          context_root_id: database.prepare('SELECT root_id FROM conversation_context_head_link WHERE conversation_id = ?').get(row.id)?.root_id ?? null,
+          state: 'pending', revision: 0n, provenance_revision: 0n, content_object_id: null, requires_native_reset: 1n,
+          created_at: row.created_at, updated_at: row.updated_at
+        })));
+      assert.equal(database.prepare('SELECT count(*) AS n FROM context_root_handle_catalog').get().n, 0n);
+      assert.deepEqual(database.pragma('foreign_key_check'), []);
+    } finally { database.close(); }
+    const completion = JSON.parse(await fs.readFile(path.join(result.backupPath,
+      kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), 'utf8'));
+    assert.equal(completion.fromEpoch, 5);
+    assert.equal(completion.toEpoch, 6);
+    assert.equal(await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority), undefined);
+  } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
+});
+
+// Every recovery phase of the published 3/4→5 journal is covered once; epoch 3 retains both sides of the durable commit.
+for (const fromEpoch of [3, 4]) for (const state of fromEpoch === 4 ? [
+  'pending-only', 'fenced', 'backed_up', 'commit-before-journal',
+  'database_committed', 'manifest-published', 'pointer-published', 'completed'
+] : ['backed_up', 'commit-before-journal']) test(`published ${fromEpoch}→5 ${state} boundary retains target 5 before upgrading to 6`, async () => {
   const fixture = await createPublishedRuntime(fromEpoch, { omitLegacyContinuation: true });
   try {
     const retired = await seedPublishedEpochBoundary(fixture, 5, state);
     const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-    assert.equal(result.binding.runtimeKernelEpoch, 10);
+    assert.equal(result.binding.runtimeKernelEpoch, 6);
     assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
+    assert.equal(result.binding.rootInstanceId, fixture.previous.rootInstanceId);
     assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + (retired.committed ? 2 : 1));
     assert.equal(result.binding.pointerRevision, fixture.previous.pointerRevision + (retired.committed ? 2 : 1));
     const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
     try {
       assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1);
+      assert.equal(database.prepare('SELECT count(*) AS n FROM message_revision').get().n, 1);
       assert.equal(database.prepare('SELECT count(*) AS n FROM schema_manifest').get().n, 113);
+      assert.equal(database.prepare("SELECT count(*) AS n FROM conversation_context_handle_state WHERE state = 'pending' AND content_object_id IS NULL AND revision = 0").get().n, 1);
     } finally { database.close(); }
     if (retired.committed) {
       const completion = JSON.parse(await fs.readFile(path.join(retired.backupRoot,
@@ -768,233 +821,41 @@ for (const fromEpoch of [4]) for (const state of ['pointer-published']) test(`pu
   } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
 });
 
-test('published epoch 6 upgrades with only pending markers and preserves every old row, DDL and CAS byte', async () => {
-  const fixture = await createPublishedRuntime(6, { attachment: true });
-  try {
-    const schema = require(path.resolve('dist/extension/backend/reliableKernel/schema/publishedEpoch6.js'));
-    assert.equal(kernel.RUNTIME_KERNEL_EPOCH, 10);
-    assert.equal(schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS.length, 111);
-    assert.equal(createHash('sha256').update(JSON.stringify({
-      domains: schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS, triggers: schema.EPOCH_6_RUNTIME_SCHEMA_TRIGGERS,
-      metadata: schema.EPOCH_6_RUNTIME_METADATA_SQL
-    })).digest('hex'), '4392830e0136ec7a9423f17836e0a7f9f9fa6b10b846c299995589cb5b24a997');
-    // Cross the bounded seeding page twice, including a legal negative rowid at its first edge.
-    const seed = new Database(fixture.paths.databasePath);
-    try {
-      seed.exec('BEGIN IMMEDIATE');
-      const insert = seed.prepare('INSERT INTO conversation (id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?)');
-      for (let index = 0; index < 501; index += 1) {
-        insert.run(`preserved_empty_${index}`, `Empty ${index}`, 'active', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z');
-      }
-      seed.prepare('INSERT INTO conversation (rowid, id, title, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)')
-        .run(-1, 'preserved_negative_rowid', 'Old negative rowid', 'active', '2026-09-01T00:00:00.000Z', '2026-09-01T00:00:00.000Z');
-      seed.exec('COMMIT');
-      seed.pragma('wal_checkpoint(TRUNCATE)');
-    } finally { seed.close(); }
-    const before = publishedRows(fixture.paths.databasePath, schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS);
-    const casBefore = await fileDigests(fixture.paths.casRootPath);
-    const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
-    assert.equal(result.previousEpoch, 6);
-    assert.equal(result.binding.runtimeKernelEpoch, 10);
-    assert.deepEqual(publishedRows(fixture.paths.databasePath, schema.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS), before);
-    assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
-    const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
-    try {
-      database.defaultSafeIntegers(true);
-      const conversations = database.prepare('SELECT id, created_at, updated_at FROM conversation ORDER BY id').all();
-      assert.deepEqual(database.prepare('SELECT * FROM conversation_context_handle_state ORDER BY conversation_id').all(),
-        conversations.map(row => ({
-          id: kernel.stablePhaseFId('conversation_context_handle_state', row.id), conversation_id: row.id,
-          context_root_id: database.prepare('SELECT root_id FROM conversation_context_head_link WHERE conversation_id = ?').get(row.id)?.root_id ?? null,
-          state: 'pending', revision: 0n, provenance_revision: 0n, content_object_id: null, requires_native_reset: 1n,
-          created_at: row.created_at, updated_at: row.updated_at
-        })));
-      assert.deepEqual(database.pragma('foreign_key_check'), []);
-    } finally { database.close(); }
-    const completion = JSON.parse(await fs.readFile(path.join(result.backupPath,
-      kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), 'utf8'));
-    assert.equal(completion.fromEpoch, 6);
-    assert.equal(completion.toEpoch, 10);
-    assert.equal(await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority), undefined);
-  } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
-});
-
-// Every recovery phase is covered once; older schemas retain both sides of the durable commit.
-for (const fromEpoch of [3, 4, 5]) for (const state of fromEpoch === 5 ? [
-  'pending-only', 'fenced', 'backed_up', 'commit-before-journal',
-  'database_committed', 'manifest-published', 'pointer-published', 'completed'
-] : ['backed_up', 'commit-before-journal']) test(`published ${fromEpoch}→6 ${state} boundary retains target 6 before upgrading to 10`, async () => {
-  const fixture = await createPublishedRuntime(fromEpoch, { omitLegacyContinuation: true });
-  try {
-    const retired = await seedPublishedEpochBoundary(fixture, 6, state);
-    const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-    assert.equal(result.binding.runtimeKernelEpoch, 10);
-    assert.equal(result.binding.dataSetId, fixture.previous.dataSetId);
-    assert.equal(result.binding.rootInstanceId, fixture.previous.rootInstanceId);
-    assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + (retired.committed ? 2 : 1));
-    assert.equal(result.binding.pointerRevision, fixture.previous.pointerRevision + (retired.committed ? 2 : 1));
-    const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
-    try {
-      assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1);
-      assert.equal(database.prepare('SELECT count(*) AS n FROM message_revision').get().n, 1);
-      assert.equal(database.prepare('SELECT count(*) AS n FROM schema_manifest').get().n, 113);
-      assert.equal(database.prepare("SELECT count(*) AS n FROM conversation_context_handle_state WHERE state = 'pending' AND content_object_id IS NULL AND revision = 0").get().n, 1);
-    } finally { database.close(); }
-    if (retired.committed) {
-      const completion = JSON.parse(await fs.readFile(path.join(retired.backupRoot,
-        kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), 'utf8'));
-      assert.equal(completion.fromEpoch, fromEpoch);
-      assert.equal(completion.toEpoch, 6);
-      assert.deepEqual(completion.nextBinding, retired.next);
-    }
-    await assert.rejects(fs.access(retired.journalPath), { code: 'ENOENT' });
-    await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
-    const repeated = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-    assert.equal(repeated.migrated, false);
-    assert.deepEqual(repeated.binding, result.binding);
-  } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
-});
-
 for (const [label, mutate] of [
   ['manifest', db => db.prepare("UPDATE schema_manifest SET client_mapping = 'detail' WHERE domain_key = 'Conversation'").run()],
-  ['index', db => db.exec('DROP INDEX ix_runtime_delivery_05')],
+  ['index', db => db.exec('DROP INDEX ix_runtime_delivery_03')],
   ['trigger', db => db.exec('DROP TRIGGER delete_interaction_request_with_turn')],
   ['extra table', db => db.exec('CREATE TABLE guessed_handle_state (id TEXT PRIMARY KEY)')]
-]) test(`published epoch 6 ${label} drift fails closed without repairing or replacing history`, async () => {
-  const fixture = await createPublishedRuntime(6, { attachment: true });
+]) test(`published epoch 5 ${label} drift fails closed without repairing or replacing history`, async () => {
+  const fixture = await createPublishedRuntime(5, { attachment: true });
   try {
     const database = new Database(fixture.paths.databasePath);
     try { mutate(database); database.pragma('wal_checkpoint(TRUNCATE)'); } finally { database.close(); }
     const pointer = await fs.readFile(fixture.paths.rootPointerPath);
-    const before = publishedRows(fixture.paths.databasePath, kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS);
+    const before = publishedRows(fixture.paths.databasePath, kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS);
     const casBefore = await fileDigests(fixture.paths.casRootPath);
     await assert.rejects(kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority),
       error => error?.code === 'runtime-epoch-migration-schema-mismatch');
     assert.deepEqual(await fs.readFile(fixture.paths.rootPointerPath), pointer);
-    assert.deepEqual(publishedRows(fixture.paths.databasePath, kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS), before);
+    assert.deepEqual(publishedRows(fixture.paths.databasePath, kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS), before);
     assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
     await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
   } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
 });
 
-for (const previousEpoch of [7, 8, 9]) test(`published epoch ${previousEpoch} admission upgrades preserve ready and pending catalog rows byte-for-byte without CAS access`, async (t) => {
-  const fixture = await createPublishedRuntime(previousEpoch, { attachment: true });
+test('the published epoch-5 authority gate rejects an epoch-6 root before open', async () => {
+  const fixture = await createPublishedRuntime(5);
   try {
-    const schemas = previousEpoch === 9 ? kernel.EPOCH_9_RUNTIME_DOMAIN_SCHEMAS
-      : previousEpoch === 8 ? kernel.EPOCH_8_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_7_RUNTIME_DOMAIN_SCHEMAS;
-    const seed = new Database(fixture.paths.databasePath);
-    const now = '2026-09-01T00:00:00.000Z';
-    try {
-      seed.exec('BEGIN IMMEDIATE');
-      seed.prepare('INSERT INTO conversation VALUES (?, ?, ?, ?, ?)').run('pending_catalog', 'Pending', 'active', now, now);
-      seed.prepare('INSERT INTO context_sequence_root VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run('preserved_catalog_root', fixture.conversationId, 1, null, null, 0, 0, 0, now);
-      seed.prepare('INSERT INTO conversation_context_head_link VALUES (?, ?, ?, ?)')
-        .run('preserved_catalog_head', fixture.conversationId, 'preserved_catalog_root', now);
-      // Opaque frozen content must remain untouched; migration must not try to parse a catalog.
-      seed.prepare('INSERT INTO context_root_handle_catalog VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-        .run('preserved_catalog', fixture.conversationId, 'preserved_catalog_root', 11, null, null, 0, 0, fixture.contentId, now);
-      const insert = seed.prepare('INSERT INTO conversation_context_handle_state VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
-      insert.run('preserved_ready', fixture.conversationId, 'preserved_catalog_root', 'ready', 23, 11, fixture.contentId, 0, now, now);
-      insert.run('preserved_pending', 'pending_catalog', null, 'pending', 7, 3, fixture.contentId, 1, now, now);
-      seed.exec('COMMIT');
-      seed.pragma('wal_checkpoint(TRUNCATE)');
-    } finally { seed.close(); }
-    const before = publishedRows(fixture.paths.databasePath, schemas);
-    const casBefore = await fileDigests(fixture.paths.casRootPath);
-    // Metadata admission must not read, enumerate, rewrite or initialize historical CAS. The
-    // Existing root-directory stat and read-only open for its directory fsync remain required.
-    const casPrefix = `${path.resolve(fixture.paths.casRootPath)}${path.sep}`;
-    const accesses = [];
-    for (const name of ['readFile', 'writeFile', 'open', 'readdir', 'mkdir', 'copyFile', 'link', 'rename', 'rm', 'stat', 'lstat']) {
-      const original = fs[name];
-      t.mock.method(fs, name, async (...args) => {
-        for (const value of args.slice(0, ['copyFile', 'link', 'rename'].includes(name) ? 2 : 1)) {
-          if (typeof value !== 'string') continue;
-          const file = path.resolve(value);
-          const directorySync = name === 'open' && args[1] === 'r';
-          if (file.startsWith(casPrefix) || (file === path.resolve(fixture.paths.casRootPath) && name !== 'stat' && !directorySync)) {
-            accesses.push({ name, file });
-            throw new Error(`Admission accessed historical CAS: ${name}`);
-          }
-        }
-        return original.apply(fs, args);
-      });
-    }
-    let result;
-    try { result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority); }
-    finally { t.mock.restoreAll(); }
-    assert.deepEqual(accesses, []);
-    assert.equal(result.previousEpoch, previousEpoch);
-    assert.equal(result.binding.runtimeKernelEpoch, 10);
-    assert.deepEqual(publishedRows(fixture.paths.databasePath, schemas), before);
-    assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
-    assert.equal(await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority), undefined);
-  } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
-});
-
-for (const state of ['backed_up', 'manifest-published']) {
-  test(`published 7→8 ${state} boundary keeps its original target before epoch 10`, async () => {
-    const fixture = await createPublishedRuntime(7);
-    try {
-      const retired = await seedPublishedEpochBoundary(fixture, 8, state);
-      const before = publishedRows(fixture.paths.databasePath, kernel.EPOCH_8_RUNTIME_DOMAIN_SCHEMAS);
-      const casBefore = await fileDigests(fixture.paths.casRootPath);
-      const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-      assert.equal(result.binding.runtimeKernelEpoch, 10);
-      assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + (retired.committed ? 2 : 1));
-      assert.deepEqual(publishedRows(fixture.paths.databasePath, kernel.EPOCH_8_RUNTIME_DOMAIN_SCHEMAS), before);
-      assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
-      if (retired.committed) {
-        const completion = JSON.parse(await fs.readFile(path.join(retired.backupRoot,
-          kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), 'utf8'));
-        assert.equal(completion.toEpoch, 8);
-        assert.deepEqual(completion.nextBinding, retired.next);
-      }
-      await assert.rejects(fs.access(retired.journalPath), { code: 'ENOENT' });
-      await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
-    } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
-  });
-}
-
-for (const state of ['backed_up', 'commit-before-journal', 'manifest-published', 'pointer-published']) {
-  test(`published 8→9 ${state} boundary keeps target 9 before epoch 10`, async () => {
-    const fixture = await createPublishedRuntime(8);
-    try {
-      const retired = await seedPublishedEpochBoundary(fixture, 9, state);
-      const before = publishedRows(fixture.paths.databasePath, kernel.EPOCH_9_RUNTIME_DOMAIN_SCHEMAS);
-      const casBefore = await fileDigests(fixture.paths.casRootPath);
-      const result = await kernel.upgradeRuntimeDataSet({ globalStoragePath: fixture.cleanupRoot }, upgradeInput(fixture));
-      assert.equal(result.binding.runtimeKernelEpoch, 10);
-      assert.equal(result.previousEpoch, retired.committed ? 9 : 8);
-      assert.equal(result.binding.rootGeneration, fixture.previous.rootGeneration + (retired.committed ? 2 : 1));
-      assert.deepEqual(publishedRows(fixture.paths.databasePath, kernel.EPOCH_9_RUNTIME_DOMAIN_SCHEMAS), before);
-      assert.deepEqual(await fileDigests(fixture.paths.casRootPath), casBefore);
-      if (retired.committed) {
-        const completion = JSON.parse(await fs.readFile(path.join(retired.backupRoot,
-          kernel.RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE), 'utf8'));
-        assert.equal(completion.toEpoch, 9);
-        assert.deepEqual(completion.nextBinding, retired.next);
-      }
-      await assert.rejects(fs.access(retired.journalPath), { code: 'ENOENT' });
-      await assert.rejects(fs.access(fixture.paths.rootPendingPath), { code: 'ENOENT' });
-    } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
-  });
-}
-
-test('the unchanged epoch-9 authority gate rejects an epoch-10 root before open', async () => {
-  const fixture = await createPublishedRuntime(9);
-  try {
-    // RootAuthority is byte-identical to the published reader. Load it with the frozen epoch-9
+    // RootAuthority is byte-identical to the v0.0.36 reader. Load it with the published epoch-5
     // contracts constant so this exercises the shipped gate rather than inventing a new one.
     const file = path.resolve('dist/extension/backend/reliableKernel/rootAuthority.js');
     const localRequire = createRequire(file);
     const publishedReader = { exports: {} };
     const evaluate = runInThisContext(`(function(require, module, exports, __filename, __dirname) {${readFileSync(file, 'utf8')}\n})`, { filename: file });
-    evaluate(id => id === './contracts' ? { ...localRequire(id), RUNTIME_KERNEL_EPOCH: 9 } : localRequire(id),
+    evaluate(id => id === './contracts' ? { ...localRequire(id), RUNTIME_KERNEL_EPOCH: 5 } : localRequire(id),
       publishedReader, publishedReader.exports, file, path.dirname(file));
     const reader = new publishedReader.exports.RootAuthority(() => fixture.paths.dataRootPath);
-    assert.equal((await reader.current()).runtimeKernelEpoch, 9);
+    assert.equal((await reader.current()).runtimeKernelEpoch, 5);
     await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
     const readerAfterUpgrade = new publishedReader.exports.RootAuthority(() => fixture.paths.dataRootPath);
     await assert.rejects(readerAfterUpgrade.current(),
@@ -1030,11 +891,7 @@ async function seedPublishedEpochBoundary(fixture, targetEpoch, state) {
   const backupDirectoryName = '20260924T120000Z-deadbeef';
   const backupRoot = path.join(controlRoot, kernel.RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY, backupDirectoryName);
   const journalPath = path.join(controlRoot, targetEpoch === 4
-    ? kernel.RETIRED_EPOCH_3_TO_4_JOURNAL_FILE : targetEpoch === 5
-      ? kernel.RETIRED_EPOCH_TO_5_JOURNAL_FILE : targetEpoch === 6
-        ? kernel.RETIRED_EPOCH_TO_6_JOURNAL_FILE : targetEpoch === 7
-          ? kernel.RETIRED_EPOCH_TO_7_JOURNAL_FILE : targetEpoch === 8
-            ? kernel.RETIRED_EPOCH_TO_8_JOURNAL_FILE : kernel.RETIRED_EPOCH_TO_9_JOURNAL_FILE);
+    ? kernel.RETIRED_EPOCH_3_TO_4_JOURNAL_FILE : kernel.RETIRED_EPOCH_TO_5_JOURNAL_FILE);
   await fs.writeFile(fixture.paths.rootPendingPath, JSON.stringify(next));
   const journal = { kind: 'limcode-runtime-epoch-migration', fromEpoch: fixture.previous.runtimeKernelEpoch,
     toEpoch: targetEpoch, attemptId: 'published-boundary-fixture', state: 'fenced', backupDirectoryName,
@@ -1053,11 +910,7 @@ async function seedPublishedEpochBoundary(fixture, targetEpoch, state) {
     journal.state = 'backed_up';
   }
   if (committed) {
-    const target = targetEpoch === 4 ? kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS
-      : targetEpoch === 5 ? kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS
-      : targetEpoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS
-      : targetEpoch === 7 ? kernel.EPOCH_7_RUNTIME_DOMAIN_SCHEMAS
-      : targetEpoch === 8 ? kernel.EPOCH_8_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_9_RUNTIME_DOMAIN_SCHEMAS;
+    const target = targetEpoch === 4 ? kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS;
     const database = new Database(fixture.paths.databasePath);
     try {
       database.defaultSafeIntegers(true);
@@ -1068,13 +921,6 @@ async function seedPublishedEpochBoundary(fixture, targetEpoch, state) {
       for (const schema of target) if (!tables.has(schema.table)) {
         database.exec(kernel.createRuntimeDomainTableSql(schema));
         schema.indexes.forEach((index, ordinal) => database.exec(kernel.createRuntimeDomainIndexSql(schema, index, ordinal)));
-      }
-      // Epoch 6 also extends an existing table with the exact ordered delivery seek indexes.
-      if (targetEpoch === 6) {
-        const delivery = target.find(schema => schema.key === 'RuntimeDelivery');
-        for (const index of ['target_conversation_id,state,created_at,id', 'target_conversation_id,created_at,id']) {
-          database.exec(kernel.createRuntimeDomainIndexSql(delivery, index, delivery.indexes.indexOf(index)));
-        }
       }
       database.exec('DELETE FROM schema_manifest');
       const insert = database.prepare('INSERT INTO schema_manifest VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
@@ -1175,10 +1021,6 @@ async function createPublishedRuntime(previousEpoch, options = {}) {
 
     const oldSchemas = previousEpoch === 3
       ? kernel.PREVIOUS_RUNTIME_DOMAIN_SCHEMAS
-      : previousEpoch === 9 ? kernel.EPOCH_9_RUNTIME_DOMAIN_SCHEMAS
-      : previousEpoch === 8 ? kernel.EPOCH_8_RUNTIME_DOMAIN_SCHEMAS
-      : previousEpoch === 7 ? kernel.EPOCH_7_RUNTIME_DOMAIN_SCHEMAS
-      : previousEpoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS
       : previousEpoch === 5 ? kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS
       : options.missingDeliveryLink
         ? kernel.EPOCH_4_MISSING_DELIVERY_LINK_SCHEMAS
