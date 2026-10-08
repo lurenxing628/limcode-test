@@ -171,7 +171,7 @@ test('40 万个跳过键留在 SQLite：过滤后重检不构造 JS 全量 Map�
   recheckStarted = started;
   let inspection;
   try {
-    inspection = await reinspectLargeMergeKeptWork(snapshot, f.alpha.binding);
+    inspection = await reinspectLargeMergeKeptWork(snapshot);
     await new Promise((resolve) => setTimeout(resolve, 25));
   } finally { clearInterval(ticker); }
   const elapsedMs = performance.now() - started;
@@ -232,7 +232,7 @@ test('跳过索引导出中取消保留原 reader，临时索引清理 EBUSY 只
   const abort = new AbortController();
   const requested = setImmediate(() => abort.abort());
   try {
-    await assert.rejects(reinspectLargeMergeKeptWork(snapshot, f.alpha.binding, abort.signal), (error) => error.name === 'AbortError');
+    await assert.rejects(reinspectLargeMergeKeptWork(snapshot, abort.signal), (error) => error.name === 'AbortError');
   } finally { clearImmediate(requested); }
   assert.equal(snapshot.database, source, '导出被取消，尚未关闭私有 reader');
   assert.equal(source.open, true);
@@ -249,7 +249,7 @@ test('跳过索引导出中取消保留原 reader，临时索引清理 EBUSY 只
   };
   console.warn = (...args) => warnings.push(args);
   try {
-    const inspection = await reinspectLargeMergeKeptWork(snapshot, f.alpha.binding);
+    const inspection = await reinspectLargeMergeKeptWork(snapshot);
     assert.deepEqual(inspection, { refused: [], turns: [], intents: [] });
     assert.equal(snapshot.database.open, true);
     assert.equal(warnings.length, 1);
