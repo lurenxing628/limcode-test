@@ -125,13 +125,12 @@ test('迁移挪开的拷来目录：核验、只读查看与存储统计只经 l
   const elsewhere = path.join(fixture.base, 'elsewhere');
   const original = await createLimCodeTarget(elsewhere, { conversations: [{ id: 'conversation_elsewhere_1', project: PROJECT }] });
   const copied = path.join(fixture.base, 'copied');
-  await fs.cp(elsewhere, copied, { recursive: true });
-  const plan = await planWithRuntime(fixture, copied);
-  assert.equal(plan.target.kind, 'copied');
-  const { staged } = await relocate(fixture, plan);
-  const [aside] = (await fs.readdir(fixture.base)).filter((name) => name.startsWith('copied.limcode-copied-'));
-  assert.ok(aside, '迁移把拷来的数据挪到了旁边');
+  const aside = 'copied.limcode-copied-2026-10-08T00-00-00-000Z-12345678';
   const asidePath = path.join(fixture.base, aside);
+  await fs.cp(elsewhere, asidePath, { recursive: true });
+  const plan = await planWithRuntime(fixture, copied);
+  assert.equal(plan.target.kind, 'empty');
+  const { staged } = await relocate(fixture, plan);
   const asideBefore = await treeState(asidePath);
   const elsewhereBefore = await treeState(elsewhere);
   const paths = { globalStoragePath: copied };
@@ -156,7 +155,7 @@ test('迁移挪开的拷来目录：核验、只读查看与存储统计只经 l
   const entry = report.entries.find((item) => item.location.containerName === aside);
   assert.equal(entry.location.kind, 'copied');
   assert.equal(entry.location.side, 'current');
-  assert.equal(entry.movedAsideBy, staged.relocationId);
+  assert.equal(entry.movedAsideBy, undefined, '迁移不再改名产生外来目录');
   assert.equal(entry.scope, 'default');
   assert.match(entry.id, /^foreign:copied:[0-9a-f]{16}$/);
   assert.equal(entry.recordedDataRootPath, original.binding.paths.dataRootPath);

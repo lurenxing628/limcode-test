@@ -1207,12 +1207,10 @@ async function isAvailable(root: string, status: LimCodeGlobalStatus): Promise<b
 }
 
 function describePlan(plan: DataRootRelocationPlan): DataRootPromptSection[] {
-  const moving = plan.others.filter((other) => !other.leaveBehind);
-  const staying = plan.others.filter((other) => other.leaveBehind);
+  const staying = plan.others;
   const what = [
     `当前历史库：${plan.current.rows !== undefined ? `约 ${plan.current.rows} 行记录，` : ''}数据库 ${formatBytes(plan.current.databaseBytes)}，正文 ${formatBytes(plan.current.casBytes)}`
       + (plan.hardLinks ? '（同一磁盘上以硬链接共享，不重复占用）' : ''),
-    ...(moving.length ? [`其它 ${moving.length} 个历史库（成为新目录里单独保留的库；已合并进当前库且之后没改动的不再单独复制）`] : []),
     `设置约 ${formatBytes(plan.configurationBytes)}`
       + (plan.configurationEntries.some((name) => ['AGENTS.md', 'CLAUDE.md', 'skills'].includes(name)) ? '，含全局规则和技能' : ''),
     ...staying.map((other) => `不迁移、留在旧目录：${other.id}（${other.leaveBehind}）`)
@@ -1241,11 +1239,8 @@ function describePlan(plan: DataRootRelocationPlan): DataRootPromptSection[] {
 
 function describeResult(result: DataRootRelocationResult): string {
   const parts = [`${EXTENSION_BRAND} 数据目录已迁移到 ${result.targetRootPath}`];
-  if (result.others.migrated.length) parts.push(`${result.others.migrated.length} 个其它历史库已迁移为单独保留的库`);
-  if (result.others.covered.length) parts.push(`${result.others.covered.length} 个已合并进当前库的历史库不再单独复制`);
-  if (result.others.leftBehind.length) parts.push(`${result.others.leftBehind.length} 个历史库留在旧目录（见设置页）`);
+  if (result.leftBehind.length) parts.push(`${result.leftBehind.length} 个历史库留在旧目录（见设置页）`);
   if (result.configuration.replacedFiles) parts.push(`被替换的旧设置版本在 ${result.configuration.backupPath}`);
-  if (result.copiedDataMovedTo) parts.push(`新目录里原来那份拷贝过来的数据已改名保留在 ${result.copiedDataMovedTo}`);
   return `${parts.join('；')}。`;
 }
 

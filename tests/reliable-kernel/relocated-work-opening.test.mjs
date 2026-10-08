@@ -573,168 +573,6 @@ test('盲审 worker #1：“已收尾”只在收尾落盘之后记：记之前�
   assert.equal((await turnRow(fixture, turnId)).status, 'terminated');
 });
 
-test('遗留风险 1：A→B 迁移、回到 A（只打开了当前库，工作区库还没打开、没收尾）、再 A→C：规划逐库列出；不选收尾就拒绝（撤销，A 不变）；选“先按中止收尾再迁移”时在独占阶段离线收尾后才迁移；C 里 Provider、工具、进程都是 0 次，B 里各执行一次', { timeout: 300_000 }, async (t) => {
-  const fixture = await reloc.createFixture(t);
-  const current = await admitUnstartedTurn(fixture);
-  const alpha = await admitUnstartedTurn(fixture, { dataRoot: fixture.alpha.binding.paths.dataRootPath, conversationId: 'conversation-alpha-carried' });
-  const b = await relocateOldHomeTo(fixture, 'b-home');
-  const carried = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets;
-  assert.deepEqual(carried.map((item) => [item.id, item.settlement.state]).sort(), [['default', 'pending'], [fixture.alpha.id, 'pending']].sort());
-  // "回到旧目录": the initiating installation's confirmation consents; only the current data set opens (and settles).
-  assert.equal(await relocation.consentToDataRootMovedWork(fixture.root, b.relocationId, INSTALLATION_A), true);
-  await openSettleAndRecover(fixture, countingProvider(), INSTALLATION_A);
-  const states = async () => Object.fromEntries((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets.map((item) => [item.id, item.settlement.state]));
-  assert.deepEqual(await states(), { default: 'settled', [fixture.alpha.id]: 'consented' }, '前提：工作区库还没收尾');
-
-  const cTarget = path.join(fixture.base, 'c-home');
-  const plan = await reloc.planWithRuntime(fixture, cTarget);
-  assert.deepEqual(plan.problems, []);
-  assert.equal(plan.earlierMovedWork.relocationId, b.relocationId);
-  assert.equal(plan.earlierMovedWork.targetRootPath, b.target);
-  assert.deepEqual(plan.earlierMovedWork.dataSets.map((item) => [item.id, item.state, item.conversations.map((conversation) => conversation.title)]),
-    [[fixture.alpha.id, 'consented', ['conversation-alpha-carried']]]);
-  assert.match(plan.earlierMovedWork.dataSets[0].label, /迁走项目/, '用项目名标识这个库');
-  const described = relocation.describeEarlierMovedWork(plan.earlierMovedWork).join('\n');
-  assert.match(described, new RegExp(`这些历史库里还有上一次迁移到 ${escapeRegExp(b.target)} 时迁走、但这里还没收尾的任务`));
-  assert.match(described, /历史库“[^”]*迁走项目[^”]*”：1 个对话（“conversation-alpha-carried”）/);
-  assert.match(described, /先把这些任务按中止收尾，再迁移.*切换为当前历史库/s);
-
-  // Not chosen (no settlement given), or chosen but nothing got settled: refused before anything moves, undone.
-  for (const settleEarlierMovedWork of [undefined, async () => undefined]) {
-    await assert.rejects(relocateOldHomeTo(fixture, 'c-home', settleEarlierMovedWork ? { settleEarlierMovedWork } : {}),
-      (error) => error.code === 'data-root-relocation-earlier-moved-work' && /还没收尾的任务/.test(error.message));
-    assert.equal(await pathExists(cTarget), false, '撤销干净');
-    assert.equal((await relocation.readDataRootMovedNotice(fixture.root)).relocationId, b.relocationId, '旧目录还是上一次迁移的标记');
-    assert.deepEqual(await states(), { default: 'settled', [fixture.alpha.id]: 'consented' });
-  }
-  assert.equal((await turnRow(fixture, alpha.turnId, fixture.alpha.binding.paths.dataRootPath)).status !== 'terminated', true, '拒绝时什么都没收尾');
-
-  // Chosen: settled offline first (as at an open of that data set, nothing runs), then relocated.
-  const c = await relocateOldHomeTo(fixture, 'c-home', {
-    settleEarlierMovedWork: (dataSet) => settleEarlierMovedWorkOffline(fixture.root, dataSet.id, INSTALLATION_A)
-  });
-  assert.deepEqual(c.result.others.migrated, [fixture.alpha.id], '工作区库照常迁走');
-  assert.equal((await turnRow(fixture, alpha.turnId, fixture.alpha.binding.paths.dataRootPath)).status, 'terminated', '在 A 里按中止收尾');
-  const cNotice = await relocation.readDataRootMovedNotice(fixture.root);
-  assert.equal(cNotice.relocationId, c.relocationId);
-  assert.equal(cNotice.carriedWork, undefined, '这次没有带走任何未完成的工作');
-
-  const inC = await runsIn(fixture.alpha.id, c.target, 0);
-  assert.deepEqual(inC, { calls: 0, tools: [], processes: [] }, 'C 里什么都不执行');
-  assert.equal((await turnRow(undefined, alpha.turnId, alphaDataRoot(c.target, fixture.alpha.id))).status, 'terminated');
-  const inB = await runsIn(fixture.alpha.id, b.target, 1);
-  assert.equal(inB.calls, 1, 'B 里执行一次（B 和 C 合计一次）');
-  assert.deepEqual(await runsIn('default', c.target, 0), { calls: 0, tools: [], processes: [] }, 'C 里当前库也什么都不执行');
-  assert.equal(current.turnId.length > 0, true);
-});
-
-test('遗留风险 1：旧目录里上一次迁走的工作区库从没打开、同意也没记（pending）时，选“先按中止收尾再迁移”即同意：迁移先记下同意再离线收尾，然后迁移', { timeout: 240_000 }, async (t) => {
-  const fixture = await reloc.createFixture(t);
-  const alpha = await admitUnstartedTurn(fixture, { dataRoot: fixture.alpha.binding.paths.dataRootPath, conversationId: 'conversation-alpha-carried' });
-  const b = await relocateOldHomeTo(fixture, 'b-home');
-  const [entry] = (await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets;
-  assert.deepEqual([entry.id, entry.settlement.state], [fixture.alpha.id, 'pending'], '当前库没有迁走的任务，打开 A 不问、也不记同意');
-  const plan = await reloc.planWithRuntime(fixture, path.join(fixture.base, 'c-home'));
-  assert.deepEqual(plan.earlierMovedWork.dataSets.map((item) => [item.id, item.state]), [[fixture.alpha.id, 'pending']]);
-
-  // A library that cannot be read now may hold that work and cannot be settled: planning refuses, and so does the exclusive phase.
-  const scopeRoot = fixture.alpha.scopeRoot;
-  await fs.chmod(scopeRoot, 0o000);
-  let unreadablePlan;
-  try {
-    unreadablePlan = await reloc.planWithRuntime(fixture, path.join(fixture.base, 'c-home'));
-    assert.match(unreadablePlan.problems.join('\n'), /历史库“旧工作区历史”（现在读不出来，无法收尾）/);
-    assert.match(unreadablePlan.problems.join('\n'), /读不出来的历史库要等它能读了才能收尾；在这之前不能迁移/);
-    const source = await reloc.openRuntime(fixture.current);
-    let staged;
-    try { staged = await relocation.stageDataRootRelocation(unreadablePlan, source, { installation: INSTALLATION_A }); } finally { await source.close(); }
-    await assert.rejects(relocation.completeDataRootRelocation(staged, async () => undefined, {
-      installation: INSTALLATION_A, movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, pointerUnchanged: async () => true,
-      settleEarlierMovedWork: async () => assert.fail('读不出来的库不收尾')
-    }), (error) => error.code === 'data-root-relocation-earlier-moved-work' && /现在读不出来，无法收尾/.test(error.message));
-  } finally { await fs.chmod(scopeRoot, 0o755); }
-
-  // Work carried away after the plan was confirmed (the confirmation did not name it): staging refuses.
-  const early = await reloc.planWithRuntime(fixture, path.join(fixture.base, 'd-home'));
-  const source = await reloc.openRuntime(fixture.current);
-  try {
-    await assert.rejects(relocation.stageDataRootRelocation({ ...early, earlierMovedWork: undefined }, source, { installation: INSTALLATION_A }),
-      (error) => error.code === 'data-root-relocation-changed');
-  } finally { await source.close(); }
-  // ... or after staging (another relocation from here replaced the notice): the exclusive phase refuses before
-  // consenting to or settling anything, and undoes.
-  const noticeFile = path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE);
-  const confirmedNotice = await fs.readFile(noticeFile, 'utf8');
-  const eTarget = path.join(fixture.base, 'e-home');
-  const staged = await stageOldHome(fixture, eTarget, { installation: INSTALLATION_A });
-  await fs.writeFile(noticeFile, JSON.stringify({ ...JSON.parse(confirmedNotice), relocationId: randomUUID() }));
-  await assert.rejects(relocation.completeDataRootRelocation(staged, async () => undefined, {
-    installation: INSTALLATION_A, movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, pointerUnchanged: async () => true,
-    settleEarlierMovedWork: async () => assert.fail('确认框没有列出的不收尾')
-  }), (error) => error.code === 'data-root-relocation-changed' && /确认框没有列出/.test(error.message));
-  assert.equal(await pathExists(eTarget), false, '撤销干净');
-  assert.equal((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets[0].settlement.state, 'pending', '没有记同意');
-  await fs.writeFile(noticeFile, confirmedNotice);
-
-  // Chosen: the relocation consents first, then settles through a Runtime that is held and can run nothing, never recovered or released.
-  const Application = kernel.ReliableKernelApplication;
-  const realOpen = Application.open;
-  const composed = [];
-  Application.open = async function (authority, dependencies) {
-    const app = await realOpen.call(this, authority, dependencies);
-    const record = { dependencies, recovered: false, released: false };
-    composed.push(record);
-    const [recover, release] = [app.recover.bind(app), app.releaseRuntimeConvergence.bind(app)];
-    app.recover = async (...input) => { record.recovered = true; return recover(...input); };
-    app.releaseRuntimeConvergence = (...input) => { record.released = true; return release(...input); };
-    return app;
-  };
-  let c;
-  try {
-    c = await relocateOldHomeTo(fixture, 'c-home', {
-      settleEarlierMovedWork: (dataSet) => settleEarlierMovedWorkOffline(fixture.root, dataSet.id, INSTALLATION_A)
-    });
-  } finally { Application.open = realOpen; }
-  assert.equal(composed.length, 1, '只为那个库打开一次');
-  const [{ dependencies, recovered, released }] = composed;
-  assert.deepEqual([dependencies.holdRuntimeConvergence, recovered, released], [true, false, false], '扣住收敛，从不恢复、不放开');
-  assert.throws(() => dependencies.providers.resolve('any'), /不执行任何工作（模型）/);
-  await assert.rejects(dependencies.toolDispatcher.dispatch({}), /不执行任何工作（工具）/);
-  await assert.rejects(dependencies.authorityCompiler.compile({}), /不执行任何工作（开始回合）/);
-  await assert.rejects(dependencies.mcpConnections.callTool('server', 'tool', {}), /不执行任何工作（MCP）/);
-  await assert.rejects(dependencies.mcpPolicyGate.authorize({}), /不执行任何工作（MCP）/);
-  assert.equal((await turnRow(fixture, alpha.turnId, fixture.alpha.binding.paths.dataRootPath)).status, 'terminated');
-  assert.deepEqual(await runsIn(fixture.alpha.id, c.target, 0), { calls: 0, tools: [], processes: [] });
-  assert.equal((await runsIn(fixture.alpha.id, b.target, 1)).calls, 1);
-});
-
-test('迁移组 R1：A→B（工作区库带着没收尾的任务迁走）后再从 B 迁回 A（合并进已有目录）：A 的“已迁走”标记保留（规划写明），A 里那个库打开时照旧先问，不会在 A 里再执行一次', { timeout: 300_000 }, async (t) => {
-  const fixture = await reloc.createFixture(t);
-  await admitUnstartedTurn(fixture, { dataRoot: fixture.alpha.binding.paths.dataRootPath, conversationId: 'conversation-alpha-carried' });
-  const b = await relocateOldHomeTo(fixture, 'b-home');
-  const noticeFile = path.join(fixture.root, relocation.DATA_ROOT_MOVED_NOTICE_FILE);
-  const before = await fs.readFile(noticeFile, 'utf8');
-  assert.deepEqual((await relocation.readDataRootMovedNotice(fixture.root)).carriedWork.dataSets.map((item) => [item.id, item.settlement.state]), [[fixture.alpha.id, 'pending']]);
-  const bDataRoot = rootAuthority.resolveVscodeRuntimeDataRoot({ globalStoragePath: b.target });
-  const source = await reloc.openRuntime({ authority: new kernel.RootAuthority(() => bDataRoot) });
-  const options = { movedBy: { id: INSTALLATION_A, label: 'VS Code（A）' }, installation: INSTALLATION_A };
-  let staged;
-  try {
-    const plan = await relocation.planDataRootRelocation({ sourceRootPath: b.target, targetRootPath: fixture.root, sourceDatabase: source, installation: INSTALLATION_A });
-    assert.deepEqual(plan.problems, []);
-    assert.equal(plan.target.kind, 'limcode');
-    assert.ok(plan.warnings.some((warning) => warning.includes(`“${fixture.alpha.id}”`) && /迁入之后那份“已迁走”标记保留，打开这些库时仍会先问你是否按中止收尾/.test(warning)),
-      `规划写明标记保留：${JSON.stringify(plan.warnings)}`);
-    staged = await relocation.stageDataRootRelocation(plan, source, options);
-  } finally { await source.close(); }
-  await relocation.completeDataRootRelocation(staged, async () => undefined, { ...options, pointerUnchanged: async () => true });
-  assert.equal(await fs.readFile(noticeFile, 'utf8'), before, 'A 的“已迁走”标记原样保留');
-  const gate = await relocatedWorkBeforeOpen({
-    configurationRootPath: fixture.root, runtimeScopeRootPath: rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(fixture.root, fixture.alpha.id)
-  }).then(() => 'open', (error) => error.reason);
-  assert.equal(gate, 'moved-work', 'A 里那个库打开时照旧先问（不会直接恢复、再执行一次）');
-});
-
 test('迁移组 R2：切换指针之前失败、指针读不出、新目录又看不到时，本安装进行中记录所指的迁移写下的标记不把旧目录当作已迁走（别的安装照旧）；放弃记录时按迁移 id 去掉它、放回它替换的标记，别的迁移 id 不动', { timeout: 240_000 }, async (t) => {
   const fixture = await reloc.createFixture(t, { withAlpha: false });
   await admitUnstartedTurn(fixture);
@@ -1314,3 +1152,15 @@ function loadFacade() {
   };
   return { Facade: facadeModule.VscodeReliableKernelApplicationFacade, globalStatus, context };
 }
+
+test('迁移不带走非当前来源的任务：来源原位保留，目标不建立第二个运行库', async (t) => {
+  const fixture = await reloc.createFixture(t);
+  const alpha = await admitUnstartedTurn(fixture, { dataRoot: fixture.alpha.binding.paths.dataRootPath, conversationId: 'conversation-alpha-retained' });
+  const before = await turnRow(fixture, alpha.turnId, fixture.alpha.binding.paths.dataRootPath);
+  const moved = await relocateOldHome(fixture);
+  assert.deepEqual(await turnRow(fixture, alpha.turnId, fixture.alpha.binding.paths.dataRootPath), before);
+  const notice = await relocation.readDataRootMovedNotice(fixture.root);
+  assert.ok(!(notice.carriedWork?.dataSets ?? []).some(item=>item.id===fixture.alpha.id));
+  const candidates = (await rootAuthority.inspectVscodeRuntimeDataSets({globalStoragePath:moved.target})).candidates;
+  assert.equal(candidates.length, 1);
+});

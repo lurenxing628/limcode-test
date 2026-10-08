@@ -509,11 +509,10 @@ test('跨模块 B（other-host）旧目录里另一个库被在线 Host 占用�
     const plan = await planWithRuntime(fixture, target);
     assert.deepEqual(plan.problems, []);
     const alpha = plan.others.find((other) => other.id === fixture.alpha.id);
-    assert.match(alpha.leaveBehind ?? '', /正被其它 LimCode 窗口使用.*留在旧目录/);
+    assert.match(alpha.leaveBehind ?? '', /旧数据原位保留/);
     assert.doesNotMatch(alpha.leaveBehind, /自动合并/, '不用合并引擎的文案');
     const { result } = await relocate(fixture, plan);
-    assert.deepEqual(result.others.migrated, []);
-    assert.deepEqual(result.others.leftBehind.map((item) => item.id ?? item), [fixture.alpha.id]);
+    assert.deepEqual(result.leftBehind.map((item) => item.id ?? item), [fixture.alpha.id]);
     assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_current_1', 'conversation_current_2']);
     const deletion = await planOldDataRootDeletion({ oldRootPath: fixture.root, currentRootPath: target, relocationId: (await markerOf(target)).relocationId });
     const kept = deletion.items.find((item) => item.key === `data-set:${fixture.alpha.id}`);

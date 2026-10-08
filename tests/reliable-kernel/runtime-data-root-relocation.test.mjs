@@ -20,7 +20,7 @@ const {
   inspectVscodeRuntimeDataSets, isVscodeRuntimeDataSetKept, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot
 } = rootAuthority;
 
-test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文件复制、完成记录写明来源指纹、最后才切换指针；旧目录的数据不变', async (t) => {
+test('迁移到空目录：只迁当前库，其它来源原位登记、设置逐文件复制、完成记录写明来源指纹、最后才切换指针；旧目录的数据不变', async (t) => {
   const fixture = await createFixture(t);
   const target = path.join(fixture.base, 'moved', 'data');
   const sourceConfigBefore = await treeSnapshot(path.join(fixture.root, 'agents'));
@@ -38,7 +38,7 @@ test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文�
   assert.equal(published.length, 1, '指针只在全部完成后切换一次');
   assert.equal(published[0].dataRootId, await readDataRootIdentity(target), '指针记录新目录的身份');
   assert.equal(result.merged.insertedConversations, 2);
-  assert.deepEqual(result.others, { migrated: [fixture.alpha.id], covered: [], leftBehind: [] });
+  assert.deepEqual(result.leftBehind.map(item => item.id), [fixture.alpha.id]);
   assert.equal(result.configuration.replacedFiles, 0);
   assert.ok(result.configuration.copiedFiles >= 3);
 
@@ -52,12 +52,12 @@ test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文�
     assert.deepEqual(moved.ids('conversation'), ['conversation_current_1', 'conversation_current_2']);
     assert.deepEqual(moved.database.pragma('foreign_key_check'), []);
   } finally { moved.close(); }
-  const alpha = inspection.candidates.find((candidate) => candidate.id === fixture.alpha.id);
-  assert.ok(alpha?.dataSetId, '其它历史库按原 id 成为新目录里的独立历史库');
-  assert.equal(await isVscodeRuntimeDataSetKept(alpha), false, '迁移不再制造用户保留标记');
-  const pending = await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target });
-  assert.equal(pending.get(fixture.alpha.id)?.sourceKind, 'migration');
-  assert.deepEqual(pending.get(fixture.alpha.id)?.identity, { dataSetId: alpha.dataSetId, rootInstanceId: alpha.rootInstanceId });
+  assert.equal(inspection.candidates.length, 1, '目标只建立一个当前历史库');
+  const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target })).values()];
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].sourceKind, 'migration');
+  assert.equal(pending[0].location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
+  assert.deepEqual(pending[0].identity, { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId });
 
   assert.deepEqual(await treeSnapshot(path.join(target, 'agents')), sourceConfigBefore, '设置记录逐字节复制');
   assert.equal(await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8'), '{"activeProviderConfigId":"source"}\n');
@@ -66,7 +66,7 @@ test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文�
   assert.equal(marker.state, 'published', '切换指针之后记下已生效');
   assert.ok(marker.publishedAt);
   assert.equal(marker.sourceRootPath, fixture.root);
-  assert.deepEqual(marker.migrated.map((item) => item.id), ['default', fixture.alpha.id]);
+  assert.deepEqual(marker.migrated.map((item) => item.id), ['default']);
   assert.ok(marker.migrated.every((item) => typeof item.fingerprint.contentDigest === 'string'), '每个迁移过的库都记下来源内容指纹');
   assert.deepEqual(marker.configuration.map((item) => item.entry).sort(), ['agents', 'settings']);
 
@@ -211,15 +211,16 @@ test('新目录里的 LimCode 数据冲突时整体取消：两边内容都不�
   await assert.rejects(fs.stat(path.join(target, DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)), { code: 'ENOENT' });
 });
 
-test('预检：别处拷来的数据会被改名挪开并写明；当前目录内部、上级目录与普通文件都会被拒绝并说明原因；云同步目录给出警告', async (t) => {
+test('预检：别处拷来的数据保持原位并提示选择子目录；当前目录内部、上级目录与普通文件都会被拒绝并说明原因；云同步目录给出警告', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const copied = path.join(fixture.base, 'copied');
   await fs.cp(fixture.root, copied, { recursive: true });
   await fs.rm(path.join(copied, 'notes.txt'));
   const copiedPlan = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: copied });
-  assert.equal(copiedPlan.target.kind, 'copied');
-  assert.deepEqual(copiedPlan.problems, []);
-  assert.ok(copiedPlan.warnings.some((warning) => /旧拷贝.*改名.*保留在旁边/.test(warning)));
+  assert.equal(copiedPlan.target.kind, 'occupied');
+  assert.ok(copiedPlan.problems.length);
+  assert.ok(copiedPlan.target.suggestedPath.startsWith(copied));
+  assert.equal((await fs.stat(copied)).isDirectory(), true);
 
   const inside = await planDataRootRelocation({ sourceRootPath: fixture.root, targetRootPath: path.join(fixture.root, 'nested') });
   assert.match(inside.problems.join('\n'), /不能放在当前数据目录里面/);
@@ -364,7 +365,7 @@ test('迁移留下同名库：新根登记旧位置，后续清理previousDataRo
   const { result } = await relocate(fixture, plan);
   const residuals = [...(await registry.readRuntimeHistoryResidual({ globalStoragePath: target })).values()];
   assert.deepEqual(residuals.map(item => item.message).sort(), ['新目录残留', '旧目录残留']);
-  assert.deepEqual(result.others.leftBehind.map(item => item.id), [fixture.alpha.id]);
+  assert.deepEqual(result.leftBehind.map(item => item.id), [fixture.alpha.id]);
   const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target })).values()];
   const left = pending.find(item => item.identity?.dataSetId === fixture.alpha.binding.dataSetId);
   assert.equal(left?.sourceKind, 'migration');
@@ -382,4 +383,22 @@ test('迁移留下同名库：新根登记旧位置，后续清理previousDataRo
   assert.deepEqual(await kernelFile('runtimeForeignHistory.js').previousDataRootsWithoutForeignHistory({
     configurationRootPath: target, previousDataRootPaths: [fixture.root]
   }), []);
+});
+
+
+test('连续迁移 A→B→C：待合并来源仍指向 A，目标始终只有当前运行库', async (t) => {
+  const fixture = await createFixture(t);
+  const original = await treeSnapshot(path.dirname(fixture.alpha.binding.paths.dataRootPath));
+  const b = path.join(fixture.base, 'second-home');
+  await relocate(fixture, await planWithRuntime(fixture, b));
+  const c = path.join(fixture.base, 'third-home');
+  const plan = await planDataRootRelocation({sourceRootPath:b,targetRootPath:c});
+  assert.deepEqual(plan.problems, []);
+  const staged = await stageDataRootRelocation(plan);
+  await relocation.completeDataRootRelocation(staged, async () => {});
+  const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({globalStoragePath:c})).values()];
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
+  assert.deepEqual(await treeSnapshot(path.dirname(fixture.alpha.binding.paths.dataRootPath)), original);
+  assert.equal((await inspectVscodeRuntimeDataSets({globalStoragePath:c})).candidates.length, 1);
 });
