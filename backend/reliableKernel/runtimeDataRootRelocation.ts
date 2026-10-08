@@ -1461,7 +1461,7 @@ export async function completeDataRootRelocation(
         const record: RuntimeHistoryPending = {
           id: base === target ? id : `migration:${staged.relocationId}:${id}`,
           sourceKind: 'migration',
-          location: { kind: 'copied', containerPath: path.dirname(candidate.runtimeDataRootPath),
+          location: base === target ? { kind: 'local', candidateId: id } : { kind: 'copied', containerPath: path.dirname(candidate.runtimeDataRootPath),
             containerName: path.relative(base, path.dirname(candidate.runtimeDataRootPath)).split(path.sep).join('/'),
             dataRootRelativePath: 'active', baseDataRootPath: base },
           ...(candidate.dataSetId && candidate.rootInstanceId ? { identity: mergeIdentity(candidate) } : {}),
