@@ -16,8 +16,9 @@
 //   cancelCountdown            — the user presses “取消” as soon as the startup prompt appears
 //   closeWhenPostponed         — once the prompt says it moved to the next startup, this window closes
 //                                (after the startup recovery settled): the next boot is the next startup
-//   manual: 'menu'             — once the startup batch is done, the user opens 历史与存储管理, picks
-//                                “合并较大的旧聊天记录（…）” and confirms (the manual flow: estimate, confirm, then prepare)
+//   manual: 'menu' / 'all'     — after startup, choose 立即合并全部 in the menu or invoke its command;
+//                                sources are prepared directly, with settlement consent when needed.
+//   closeAfterBatch            — close without choosing a merge; large sources stay pending.
 //   lookAtMenu                 — the user only opens 历史与存储管理 and looks at the items
 //   cancelPreparationAt        — the user presses “取消” on the preparation's notification once a report
 //                                matches this pattern
@@ -141,13 +142,13 @@ const vscodeMock = {
       const modal = typeof rest[0] === 'object' && rest[0]?.modal === true;
       emit('warning', { message, modal, ...(typeof rest[0] === 'object' && rest[0]?.detail ? { detail: rest[0].detail } : {}) });
       // The manual large merge's confirmation.
-      return modal && /^合并较大的旧聊天记录（/.test(message) ? '开始合并' : undefined;
+      return message === '中止旧数据中的工作后合并？' ? '同意收尾并合并' : modal && /^合并较大的旧聊天记录（/.test(message) ? '开始合并' : undefined;
     },
     showQuickPick: async (items, options) => {
       const resolved = await items;
       emit('quick-pick', { placeHolder: options?.placeHolder, labels: resolved.map((item) => item.label) });
-      return behavior.manual === 'menu' && options?.placeHolder === '历史与存储管理'
-        ? resolved.find((item) => item.action === 'largeMerge') : undefined;
+      return behavior.manual === 'menu' && options?.placeHolder?.startsWith('历史与存储管理')
+        ? resolved.find((item) => item.action === 'mergeAll') : undefined;
     },
     showErrorMessage: async (message, ...rest) => {
       emit('error-message', { message, ...(typeof rest[0] === 'object' && rest[0]?.detail ? { detail: rest[0].detail } : {}) });
@@ -353,6 +354,12 @@ void management.upgradeHistoricalDataSetsOnStartup(context, isCurrent)
       blocked: report.blocked.map((item) => item.code),
       failures: report.failures.map((item) => item.code)
     });
+    if (behavior.closeAfterBatch) { await closeAfterPostponing(); return; }
+    if (behavior.manual === 'all') {
+      await management.mergeAllRuntimeHistory(context, { current: () => host });
+      emit('menu-done');
+      return;
+    }
     if (behavior.manual !== 'menu' && !behavior.lookAtMenu) return;
     // A moment later (not while the startup prompt still decides whether it is this window's), the user opens 历史与存储管理.
     await new Promise((resolve) => setTimeout(resolve, 500));
