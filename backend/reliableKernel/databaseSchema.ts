@@ -10,6 +10,7 @@ import {
   domainSchemaDigest
 } from './schema/domainManifest';
 import { sameBindingIdentity } from './rootAuthority';
+import { prepareCached } from './runtimeStatementCache';
 
 export interface DatabaseFoundationInspection {
   sqliteVersion: string;
@@ -176,7 +177,7 @@ export function auditDatabaseIntegrity(database: Database.Database): DatabaseInt
 }
 
 export function assertDatabaseBinding(database: Database.Database, binding: RootBinding): void {
-  const row = database.prepare('SELECT * FROM root_binding WHERE singleton = 1').get() as Record<string, unknown> | undefined;
+  const row = prepareCached(database, 'SELECT * FROM root_binding WHERE singleton = 1').get() as Record<string, unknown> | undefined;
   if (!row) throw new Error('Runtime database root_binding row is missing.');
   const stored: RootBinding = {
     paths: {

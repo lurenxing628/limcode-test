@@ -62,10 +62,18 @@ export interface ContentAddressedStoreMetricEvent {
 /** Optional development-only observer. Events contain counts only, never content or paths. */
 export type ContentAddressedStoreMetricObserver = (event: ContentAddressedStoreMetricEvent) => void;
 
-interface IdentifiedContent {
+/** Opaque, immutable identity; the copied publication bytes stay private to this module. */
+export interface IdentifiedContent {
+  readonly identity: Readonly<ContentObjectIdentity>;
+}
+
+interface IdentifiedContentBytes {
   bytes: Buffer;
   published: PublishedContent;
+  id: string;
 }
+
+const identifiedContentBytes = new WeakMap<IdentifiedContent, IdentifiedContentBytes>();
 
 interface VerifiedContentReadCacheEntry {
   id: string;
@@ -129,14 +137,15 @@ export class ContentAddressedStore {
   }
 
   public identity(content: Uint8Array | string, contentType: string): ContentObjectIdentity {
-    const { published } = identifyContent(content, contentType);
-    return {
-      id: contentObjectId(published),
-      content_type: published.contentType,
-      sha256: published.sha256,
-      byte_length: published.byteLength,
-      storage_key: published.storageKey
-    };
+    return identifiedContentIdentity(identifyContent(content, contentType));
+  }
+
+  /** Copies and identifies once, before any await; callers can share this result across identities. */
+  public identify(content: Uint8Array | string, contentType: string): IdentifiedContent {
+    const identified = identifyContent(content, contentType);
+    const handle = Object.freeze({ identity: Object.freeze(identifiedContentIdentity(identified)) });
+    identifiedContentBytes.set(handle, identified);
+    return handle;
   }
 
   public async publish(content: Uint8Array | string, contentType: string): Promise<PublishedContent> {
@@ -144,14 +153,14 @@ export class ContentAddressedStore {
   }
 
   private async publishIdentified(
-    content: IdentifiedContent,
+    content: IdentifiedContentBytes,
   ): Promise<PublishedContent> {
     const published = await this.publishIdentifiedBatch([content]);
     if (!published[0]) throw new Error('CAS publication lost its input.');
     return published[0];
   }
 
-  private async publishIdentifiedBatch(contents: readonly IdentifiedContent[], metrics?: {
+  private async publishIdentifiedBatch(contents: readonly IdentifiedContentBytes[], metrics?: {
     tempWrites: number; fileFsyncs: number; directoryFsyncs: number;
   }): Promise<PublishedContent[]> {
     if (contents.length === 0) return [];
@@ -186,7 +195,7 @@ export class ContentAddressedStore {
     content: Uint8Array | string,
     contentType: string
   ): Promise<PreparedContentObject> {
-    const prepared = await this.prepareContent(database, [{ content, contentType }], 'prepare');
+    const prepared = await this.prepareContent(database, () => [identifyContent(content, contentType)], 'prepare');
     if (!prepared[0]) throw new Error('CAS single prepare lost its input.');
     return prepared[0];
   }
@@ -195,24 +204,32 @@ export class ContentAddressedStore {
     database: RuntimeDatabase,
     inputs: ReadonlyArray<{ content: Uint8Array | string; contentType: string }>
   ): Promise<PreparedContentObject[]> {
-    return this.prepareContent(database, inputs, 'prepare_batch');
+    return this.prepareContent(database, () => inputs.map(input => identifyContent(input.content, input.contentType)), 'prepare_batch');
+  }
+
+  public async prepareIdentified(database: RuntimeDatabase, content: IdentifiedContent): Promise<PreparedContentObject> {
+    const prepared = await this.prepareContent(database, () => [requireIdentifiedContentBytes(content)], 'prepare');
+    if (!prepared[0]) throw new Error('CAS single prepare lost its input.');
+    return prepared[0];
+  }
+
+  public async prepareIdentifiedBatch(database: RuntimeDatabase, contents: readonly IdentifiedContent[]): Promise<PreparedContentObject[]> {
+    return this.prepareContent(database, () => contents.map(requireIdentifiedContentBytes), 'prepare_batch');
   }
 
   private async prepareContent(
     database: RuntimeDatabase,
-    inputs: ReadonlyArray<{ content: Uint8Array | string; contentType: string }>,
+    identify: () => readonly IdentifiedContentBytes[],
     operation: 'prepare' | 'prepare_batch'
   ): Promise<PreparedContentObject[]> {
     this.byteAccess.assertUsable();
-    if (inputs.length === 0) return [];
     const startedAtMs = database.performanceMetrics ? performance.now() : undefined;
     if (!sameBindingIdentity(database.binding, this.binding)) {
       throw new Error('CAS and RuntimeDatabase must use the same RootBinding.');
     }
-    // Copy mutable Uint8Array inputs before the first await so identity and later publish always refer
-    // to exactly the same bytes.
-    const identified = inputs.map((input) => identifyContent(input.content, input.contentType));
-    const unique = [...new Map(identified.map((entry) => [contentObjectId(entry.published), entry])).values()];
+    const identified = identify();
+    if (identified.length === 0) return [];
+    const unique = [...new Map(identified.map((entry) => [entry.id, entry])).values()];
     const repository = DOMAIN_REPOSITORIES.domain('ContentObject');
     // One snapshot is one worker request even when it carries several unique identity lookups.
     const existing = await database.snapshot(unique.map((entry) =>
@@ -223,16 +240,16 @@ export class ContentAddressedStore {
     }
 
     const preparedById = new Map<string, PreparedContentObject>();
-    const missing: IdentifiedContent[] = [];
+    const missing: IdentifiedContentBytes[] = [];
     let lookupHits = 0;
     unique.forEach((entry, index) => {
       const rows = existing.snapshot[index];
       if (!Array.isArray(rows)) throw new TypeError('ContentObject batch lookup did not return rows.');
       const row = rows[0];
-      const id = contentObjectId(entry.published);
+      const id = entry.id;
       if (row) {
         lookupHits += 1;
-        preparedById.set(id, { metadata: requireMatchingContentObject(row, entry.published) });
+        preparedById.set(id, { metadata: requireMatchingContentObject(row, entry) });
       } else {
         missing.push(entry);
       }
@@ -242,8 +259,8 @@ export class ContentAddressedStore {
 
     const publicationMetrics = { tempWrites: 0, fileFsyncs: 0, directoryFsyncs: 0 };
     const publishedMisses = await this.publishIdentifiedBatch(missing, publicationMetrics);
-    for (const published of publishedMisses) {
-      const metadata = contentObjectMetadata(published);
+    for (let index = 0; index < publishedMisses.length; index += 1) {
+      const metadata = contentObjectMetadata(publishedMisses[index], missing[index].id);
       preparedById.set(metadata.id, { metadata, insert: repository.insert(metadata) });
     }
     if (startedAtMs !== undefined) {
@@ -260,7 +277,7 @@ export class ContentAddressedStore {
     }
 
     return identified.map((entry) => {
-      const prepared = preparedById.get(contentObjectId(entry.published));
+      const prepared = preparedById.get(entry.id);
       if (!prepared) throw new Error('ContentObject batch prepare lost an identified input.');
       return prepared;
     });
@@ -501,9 +518,9 @@ function contentObjectIdentityFromMetadata(metadata: ContentObjectMetadata): Dom
   };
 }
 
-function contentObjectMetadata(content: PublishedContent): ContentObjectMetadata {
+function contentObjectMetadata(content: PublishedContent, id: string): ContentObjectMetadata {
   return {
-    id: contentObjectId(content),
+    id,
     content_type: content.contentType,
     sha256: content.sha256,
     byte_length: content.byteLength,
@@ -515,30 +532,39 @@ function contentObjectMetadata(content: PublishedContent): ContentObjectMetadata
 function identifyContent(
   content: Uint8Array | string,
   contentType: string
-): IdentifiedContent {
+): IdentifiedContentBytes {
   const normalizedType = requireContentType(contentType);
   const bytes = typeof content === 'string' ? Buffer.from(content, 'utf8') : Buffer.from(content);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
   const storageKey = storageKeyForDigest(sha256);
-  return {
-    bytes,
-    published: {
-      contentType: normalizedType,
-      sha256,
-      byteLength: BigInt(bytes.length),
-      storageKey
-    }
+  const published: PublishedContent = {
+    contentType: normalizedType,
+    sha256,
+    byteLength: BigInt(bytes.length),
+    storageKey
   };
+  return { bytes, published, id: contentObjectId(published) };
 }
 
-function requireMatchingContentObject(row: DomainRow, expected: PublishedContent): ContentObjectMetadata {
+function identifiedContentIdentity(content: IdentifiedContentBytes): ContentObjectIdentity {
+  return { id: content.id, content_type: content.published.contentType, sha256: content.published.sha256,
+    byte_length: content.published.byteLength, storage_key: content.published.storageKey };
+}
+
+function requireIdentifiedContentBytes(content: IdentifiedContent): IdentifiedContentBytes {
+  const identified = identifiedContentBytes.get(content);
+  if (!identified) throw new TypeError('CAS preparation requires a contentStore.identify result.');
+  return identified;
+}
+
+function requireMatchingContentObject(row: DomainRow, expected: IdentifiedContentBytes): ContentObjectMetadata {
   const metadata = asContentObjectMetadata(row);
   if (
-    metadata.id !== contentObjectId(expected)
-    || metadata.content_type !== expected.contentType
-    || metadata.sha256 !== expected.sha256
-    || metadata.byte_length !== expected.byteLength
-    || metadata.storage_key !== expected.storageKey
+    metadata.id !== expected.id
+    || metadata.content_type !== expected.published.contentType
+    || metadata.sha256 !== expected.published.sha256
+    || metadata.byte_length !== expected.published.byteLength
+    || metadata.storage_key !== expected.published.storageKey
   ) {
     throw new Error('Existing ContentObject does not match the requested content identity.');
   }

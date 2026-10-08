@@ -2,7 +2,7 @@ import type { RootBinding } from './contracts';
 import { ExecutionHandoffError } from './executionLeaseFence';
 import { requireCasObjectIdentity, type CasByteAccess, type CasObjectIdentity } from './casObjectAccess';
 import { LocalCasByteAccess, looseCasObjectLocation, type LooseCasObjectLocation } from './looseCasObjectAccess';
-import { publishLooseCasObject } from './looseCasObjectPublication';
+import { publishLooseCasBatch } from './looseCasObjectPublication';
 import { PackedCasWorkerClient } from './packedCasWorkerClient';
 import { PACKED_CAS_MAX_BODY_BYTES } from './packedCasWorkerProtocol';
 
@@ -27,10 +27,7 @@ export class LooseCasStoreAccess extends LocalCasByteAccess implements CasStoreA
   public async readPackedBytes(_object: CasObjectIdentity): Promise<undefined> { return undefined; }
   public async inspectPackedByteLength(_object: CasObjectIdentity): Promise<undefined> { return undefined; }
   public async publishBatch(inputs: readonly CasPublicationInput[], metric: (metric: CasPublicationMetric) => void): Promise<CasPublicationLocation[]> {
-    return Promise.all(inputs.map(async ({ object, bytes }) => {
-      await publishLooseCasObject(this.casRoot, bytes, object, metric);
-      return looseCasObjectLocation(this.casRoot, object);
-    }));
+    return publishLooseCasBatch(this.casRoot, inputs, metric);
   }
 }
 
@@ -101,24 +98,27 @@ export class RuntimeCasAccess implements CasStoreAccess {
     return this.operation(async () => {
       const result: CasPublicationLocation[] = new Array(inputs.length);
       const small: CasPublicationInput[] = [];
-      const indexes: number[] = [];
+      const smallIndexes: number[] = [];
+      const large: CasPublicationInput[] = [];
+      const largeIndexes: number[] = [];
       // The caller has already copied and identified the input before yielding. This preserves that
-      // batch, with no timer or cross-call accumulation. Large bodies retain their loose publisher.
+      // batch, with no timer or cross-call accumulation. Each physical backend publishes one batch.
       for (let index = 0; index < inputs.length; index += 1) {
         const input = inputs[index];
         requireCasObjectIdentity(input.object);
         if (input.object.byte_length !== BigInt(input.bytes.length)) throw new Error('CAS publication length mismatch.');
-        if (input.bytes.length <= SMALL_CAS_MAX_BYTES) { small.push(input); indexes.push(index); }
-        else {
-          await publishLooseCasObject(this.binding.paths.casRootPath, input.bytes, input.object, metric);
-          result[index] = looseCasObjectLocation(this.binding.paths.casRootPath, input.object);
-        }
+        if (input.bytes.length <= SMALL_CAS_MAX_BYTES) { small.push(input); smallIndexes.push(index); }
+        else { large.push(input); largeIndexes.push(index); }
+      }
+      if (large.length) {
+        const locations = await publishLooseCasBatch(this.binding.paths.casRootPath, large, metric);
+        locations.forEach((location, index) => { result[largeIndexes[index]] = location; });
       }
       if (small.length) {
         const locations = await this.packed.publishBatch(small);
         if (locations.length !== small.length) throw new Error('CAS publication batch lost an input.');
         locations.forEach((kind, index) => {
-          result[indexes[index]] = kind === 'loose'
+          result[smallIndexes[index]] = kind === 'loose'
             ? looseCasObjectLocation(this.binding.paths.casRootPath, small[index].object) : { kind: 'packed' };
         });
       }

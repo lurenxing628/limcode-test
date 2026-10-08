@@ -9,7 +9,7 @@ import test from 'node:test';
 // synchronous worker call and better-sqlite3 frees a statement's native memory only after the
 // thread returns to its event loop, so preparing per row made a large merge or relocation grow by
 // tens of KiB per row. These tests pin the reuse contract: result modes, iterator re-entry, the LRU
-// bound, and that no statement outlives its connection or schema.
+// bound, connection ownership and SQLite's automatic recompile after a schema change.
 
 const require = createRequire(import.meta.url);
 const compiledRoot = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
@@ -268,13 +268,35 @@ test('按 id 列表读回：单个 id 与满块复用语句，只有末尾不满
   });
 });
 
-test('连接关闭或 schema 变化后不复用旧语句，也不跨连接复用', async () => {
+test('schema 改动后同一缓存语句自动重编译并更新返回列', () => {
+  const statementCache = cacheModule();
+  const database = memoryDatabase();
+  try {
+    const cache = statementCache.attachRuntimeStatementCache(database);
+    const sql = 'SELECT * FROM t WHERE id = ?';
+    const statement = statementCache.prepareCached(database, sql);
+    assert.deepEqual(statement.get('row-1'), { id: 'row-1', n: 1n });
+
+    database.exec("ALTER TABLE t ADD COLUMN label TEXT NOT NULL DEFAULT 'added'");
+    assert.equal(statementCache.prepareCached(database, sql), statement);
+    assert.deepEqual(statement.get('row-1'), { id: 'row-1', n: 1n, label: 'added' });
+
+    database.exec("DROP TABLE t; CREATE TABLE t (id TEXT PRIMARY KEY, value INTEGER NOT NULL, note TEXT NOT NULL); INSERT INTO t VALUES ('row-1', 2, 'rebuilt')");
+    assert.equal(statementCache.prepareCached(database, sql), statement);
+    assert.deepEqual(statement.get('row-1'), { id: 'row-1', value: 2n, note: 'rebuilt' });
+    assert.equal(cache.inspect().prepares, 1, 'schema changes reuse the same cached Statement');
+  } finally {
+    statementCache.detachRuntimeStatementCache(database);
+    database.close();
+  }
+});
+
+test('连接关闭后不复用旧语句，也不跨连接复用', async () => {
   const statementCache = cacheModule();
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-statement-cache-unit-'));
   const file = path.join(directory, 'cache.sqlite');
   let first;
   let second;
-  let other;
   try {
     first = new Database(file);
     first.pragma('journal_mode = WAL');
@@ -287,22 +309,10 @@ test('连接关闭或 schema 变化后不复用旧语句，也不跨连接复用
 
     second = new Database(file);
     second.defaultSafeIntegers(true);
-    const secondCache = statementCache.attachRuntimeStatementCache(second);
+    statementCache.attachRuntimeStatementCache(second);
     const sibling = statementCache.prepareCached(second, sql);
     assert.notEqual(sibling, old, 'two connections never share a statement');
     assert.equal(sibling.database, second);
-
-    // Another connection changes the main schema: the next revalidation drops every entry.
-    other = new Database(file);
-    other.exec('CREATE TABLE schema_probe (x); DROP TABLE schema_probe;');
-    secondCache.revalidateSchema();
-    assert.equal(secondCache.inspect().invalidations, 1);
-    assert.equal(secondCache.inspect().entries, 0);
-    const recompiled = statementCache.prepareCached(second, sql);
-    assert.notEqual(recompiled, sibling);
-    assert.deepEqual(recompiled.get('row-1'), { n: 1n });
-    secondCache.revalidateSchema();
-    assert.equal(secondCache.inspect().invalidations, 1, 'an unchanged schema keeps the cache');
 
     statementCache.detachRuntimeStatementCache(first);
     first.close();
@@ -317,7 +327,7 @@ test('连接关闭或 schema 变化后不复用旧语句，也不跨连接复用
     assert.equal(reopened.database, first);
     assert.deepEqual(reopened.get('row-1'), { n: 1n });
   } finally {
-    for (const database of [first, second, other]) if (database?.open) database.close();
+    for (const database of [first, second]) if (database?.open) database.close();
     await fs.rm(directory, { recursive: true, force: true });
   }
 });
@@ -361,9 +371,10 @@ test('worker 大批插入不逐行 prepare；读回、断言与再次事务都�
   });
 });
 
-test('worker 读连接 LRU 有上限；关闭重开后缓存从空开始，schema 被改后整体作废', async () => {
-  await withRuntime(async ({ open, binding }) => {
+test('worker 读连接 LRU 有上限；关闭重开后缓存重新开始', async () => {
+  await withRuntime(async ({ open }) => {
     let database = await open();
+    const initialCache = (await database.inspect()).statementCache;
     const repositories = kernel.DOMAIN_REPOSITORIES.all();
     assert.ok(repositories.length * 3 > 256, 'the reads below need more distinct SQL than the LRU holds');
     for (const repository of repositories) {
@@ -386,28 +397,12 @@ test('worker 读连接 LRU 有上限；关闭重开后缓存从空开始，schem
     const reopened = await database.inspect();
     assert.notEqual(reopened.workerThreadId, beforeClose.workerThreadId);
     for (const side of ['writer', 'reader']) {
-      assert.equal(reopened.statementCache[side].entries, 0, `${side} starts empty after reopening`);
-      assert.equal(reopened.statementCache[side].hits, 0);
-      assert.equal(reopened.statementCache[side].prepares, 0);
+      assert.equal(reopened.statementCache[side].entries, initialCache[side].entries, `${side} starts fresh after reopening`);
+      assert.equal(reopened.statementCache[side].hits, initialCache[side].hits);
+      assert.equal(reopened.statementCache[side].prepares, initialCache[side].prepares);
     }
     await database.transaction([...receipts('after-reopen', 20), ...conversations('after-reopen', 5)]);
     const warmed = (await database.inspect()).statementCache.writer;
     assert.ok(warmed.misses > 0, 'the reopened worker prepares on its own connection');
-
-    const external = new Database(binding.paths.databasePath);
-    try {
-      external.exec('CREATE TABLE statement_cache_schema_probe (x); DROP TABLE statement_cache_schema_probe;');
-    } finally {
-      external.close();
-    }
-    const invalidated = (await database.inspect()).statementCache;
-    assert.equal(invalidated.writer.invalidations, 1);
-    assert.equal(invalidated.writer.entries, 0);
-    assert.equal(invalidated.reader.invalidations, 1);
-    await database.transaction([...receipts('after-schema', 20), ...conversations('after-schema', 5)]);
-    const recompiled = (await database.inspect()).statementCache.writer;
-    assert.ok(recompiled.misses > warmed.misses, 'statements are prepared again after the schema moved');
-    const rows = (await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('Conversation').get('after-schema-conversation-4')])).snapshot;
-    assert.equal(rows[0].id, 'after-schema-conversation-4');
   });
 });

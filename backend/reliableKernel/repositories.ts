@@ -94,7 +94,7 @@ export interface RepositoryDeleteWhereMutation {
 
 export interface RepositoryAssertStep {
   kind: 'assert';
-  /** Opt-in domain-codec equality (including structural JSON), used by historical merge reuse. */
+  /** Domain-codec equality: `where` contains decoded JSON values, including JSON string scalars. */
   decoded?: true;
   domain: string;
   id: string;
@@ -233,47 +233,72 @@ export class DomainRowCodec {
   }
 
   public encodeInsert(row: DomainRow): EncodedRow {
-    rejectUnknownKeys(row, this.columnsByName, this.name);
     const encoded: EncodedRow = {};
+    this.visitInsert(row, (column, value) => { encoded[column.name] = encodeValue(column, value, this.name); });
+    return encoded;
+  }
+
+  /** Construction checks shape only; the worker serializes JSON and owns the final SQL encoding. */
+  public validateInsert(row: DomainRow): void {
+    this.visitInsert(row, (column, value) => requireValueShape(column, value, this.name));
+  }
+
+  private visitInsert(row: DomainRow, visit: (column: ColumnDefinition, value: unknown) => void): void {
+    rejectUnknownKeys(row, this.columnsByName, this.name);
     for (const column of this.schema.columns) {
       const value = row[column.name];
       if (value === undefined) {
         if (column.defaultSql !== undefined) continue;
         if (column.nullable) {
-          encoded[column.name] = null;
+          visit(column, null);
           continue;
         }
         throw new TypeError(`${this.name}.${column.name} is required.`);
       }
-      encoded[column.name] = encodeValue(column, value, this.name);
+      visit(column, value);
     }
-    return encoded;
   }
 
   public encodePatch(patch: DomainRow): EncodedRow {
+    const encoded: EncodedRow = {};
+    this.visitPatch(patch, (column, value) => { encoded[column.name] = encodeValue(column, value, this.name); });
+    return encoded;
+  }
+
+  public validatePatch(patch: DomainRow): void {
+    this.visitPatch(patch, (column, value) => requireValueShape(column, value, this.name));
+  }
+
+  private visitPatch(patch: DomainRow, visit: (column: ColumnDefinition, value: unknown) => void): void {
     rejectUnknownKeys(patch, this.columnsByName, this.name);
     if ('id' in patch) throw new TypeError(`${this.name}.id is immutable.`);
-    const encoded: EncodedRow = {};
     for (const [name, value] of Object.entries(patch)) {
       const column = this.columnsByName.get(name);
       if (!column) throw new TypeError(`${this.name}.${name} is not a schema column.`);
       if (value === undefined) throw new TypeError(`${this.name}.${name} cannot be undefined.`);
-      encoded[name] = encodeValue(column, value, this.name);
+      visit(column, value);
     }
-    if (Object.keys(encoded).length === 0) throw new TypeError(`${this.name} update patch cannot be empty.`);
-    return encoded;
+    if (Object.keys(patch).length === 0) throw new TypeError(`${this.name} update patch cannot be empty.`);
   }
 
   public encodeWhere(where: DomainRow): EncodedRow {
-    rejectUnknownKeys(where, this.columnsByName, this.name);
     const encoded: EncodedRow = {};
+    this.visitWhere(where, (column, value) => { encoded[column.name] = encodeValue(column, value, this.name); });
+    return encoded;
+  }
+
+  public validateWhere(where: DomainRow): void {
+    this.visitWhere(where, (column, value) => requireValueShape(column, value, this.name));
+  }
+
+  private visitWhere(where: DomainRow, visit: (column: ColumnDefinition, value: unknown) => void): void {
+    rejectUnknownKeys(where, this.columnsByName, this.name);
     for (const [name, value] of Object.entries(where)) {
       const column = this.columnsByName.get(name);
       if (!column) throw new TypeError(`${this.name}.${name} is not a schema column.`);
       if (value === undefined) throw new TypeError(`${this.name}.${name} cannot be undefined.`);
-      encoded[name] = encodeValue(column, value, this.name);
+      visit(column, value);
     }
-    return encoded;
   }
 
   public decode(row: Record<string, unknown>): DomainRow {
@@ -319,7 +344,7 @@ export class DomainRepository {
 
   public insert(row: DomainRow): RepositoryInsertMutation {
     this.requireMutation('insert');
-    this.codec.encodeInsert(row);
+    this.codec.validateInsert(row);
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row) };
   }
 
@@ -362,7 +387,7 @@ export class DomainRepository {
     if (!HISTORICAL_COPY_DOMAINS.includes(this.schema.key)) {
       throw new TypeError(`${this.name} does not permit historical copy inserts.`);
     }
-    this.codec.encodeInsert(row);
+    this.codec.validateInsert(row);
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row), historicalCopy: true };
   }
 
@@ -389,7 +414,7 @@ export class DomainRepository {
       if (name in row) throw new TypeError(`${this.name}.${name} is allocated by the writer.`);
     }
     if (this.schema.key === 'RuntimeDeliveryTimelineLink' && 'inbox_item_id' in row) throw new TypeError('Timeline inbox identity is resolved by the writer.');
-    this.codec.encodeInsert({ ...row, ...(this.schema.key === 'RuntimeDeliveryTimelineLink' ? { inbox_item_id: 'writer-resolved-inbox' } : {}),
+    this.codec.validateInsert({ ...row, ...(this.schema.key === 'RuntimeDeliveryTimelineLink' ? { inbox_item_id: 'writer-resolved-inbox' } : {}),
       predecessor_message_id: null, predecessor_message_seq: 0n, exchange_seq: 1n, position_basis: 'committed' });
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row), allocateTimelinePosition: true,
       ...(acceptedInputContentObjectId === undefined ? {} : { acceptedInputContentObjectId }),
@@ -406,7 +431,7 @@ export class DomainRepository {
     if ('exchange_seq' in row) throw new TypeError('Imported exchange sequence is allocated by the writer.');
     requireId(source.sourceDataSetId); requireId(source.sourceRootInstanceId);
     if (typeof source.sourceExchangeSeq !== 'bigint' || source.sourceExchangeSeq < 1n) throw new TypeError('Invalid source exchange sequence.');
-    this.codec.encodeInsert({ ...row, exchange_seq: 1n });
+    this.codec.validateInsert({ ...row, exchange_seq: 1n });
     return { kind: 'insert', domain: this.schema.key, row: clonePlainRecord(row), historicalCopy: true,
       allocateImportedTimelineSequence: { ...source } };
   }
@@ -427,7 +452,7 @@ export class DomainRepository {
     if (row.source_kind !== 'message_revision' || row.source_id !== messageRevisionId) {
       throw new TypeError('Message Context source must identify the referenced MessageRevision.');
     }
-    this.codec.encodeInsert({ ...row, source_revision: 1n });
+    this.codec.validateInsert({ ...row, source_revision: 1n });
     return {
       kind: 'insert',
       domain: 'ContextSegmentSource',
@@ -454,7 +479,7 @@ export class DomainRepository {
     this.requireMutation('update');
     requireId(id);
     assertRuntimeDomainUpdatePatch(this.schema.key, patch);
-    this.codec.encodePatch(patch);
+    this.codec.validatePatch(patch);
     return { kind: 'update', domain: this.schema.key, id, patch: clonePlainRecord(patch) };
   }
 
@@ -501,20 +526,20 @@ export class DomainRepository {
     if (!coversUniqueIdentity(this.schema, where)) {
       throw new TypeError(`${this.name}.deleteByUnique requires a declared UNIQUE identity.`);
     }
-    this.codec.encodeWhere(where);
+    this.codec.validateWhere(where);
     return { kind: 'deleteWhere', domain: this.schema.key, where: clonePlainRecord(where), maxChanges: 1 };
   }
 
   public assert(id: string, where: DomainRow, options: { decoded?: true } = {}): RepositoryAssertStep {
     requireId(id);
-    this.codec.encodeWhere(where);
+    this.codec.validateWhere(where);
     return { kind: 'assert', domain: this.schema.key, id, where: clonePlainRecord(where), ...(options.decoded ? { decoded: true as const } : {}) };
   }
 
   /** Transaction-local assertion: every row matching `where` must also match `expected`. */
   public assertAll(where: DomainRow, expected: DomainRow): RepositoryAssertAllStep {
-    this.codec.encodeWhere(where);
-    this.codec.encodeWhere(expected);
+    this.codec.validateWhere(where);
+    this.codec.validateWhere(expected);
     if (Object.keys(expected).length === 0) throw new TypeError(`${this.name}.assertAll requires expected fields.`);
     return {
       kind: 'assertAll',
@@ -529,7 +554,7 @@ export class DomainRepository {
    * `collaborationBacklog` narrows a RuntimeDelivery set to the inbound collaboration backlog.
    */
   public assertExactIds(where: DomainRow, expectedIds: readonly string[], options: { collaborationBacklog?: true } = {}): RepositoryAssertExactIdsStep {
-    this.codec.encodeWhere(where);
+    this.codec.validateWhere(where);
     if (Object.keys(where).length === 0) throw new TypeError(`${this.name}.assertExactIds requires predicates.`);
     this.requireCollaborationBacklogScope(options.collaborationBacklog);
     const ids = expectedIds.map((id) => {
@@ -573,7 +598,7 @@ export class DomainRepository {
 
   /** Transaction-local assertion that no row matches `where`. */
   public assertNone(where: DomainRow): RepositoryAssertNoneStep {
-    this.codec.encodeWhere(where);
+    this.codec.validateWhere(where);
     if (Object.keys(where).length === 0) throw new TypeError(`${this.name}.assertNone requires predicates.`);
     return { kind: 'assertNone', domain: this.schema.key, where: clonePlainRecord(where) };
   }
@@ -587,7 +612,7 @@ export class DomainRepository {
     if (!Number.isSafeInteger(options.limit) || options.limit <= 0 || options.limit > 1000) {
       throw new RangeError('Repository list limit must be an integer from 1 to 1000.');
     }
-    if (options.where) this.codec.encodeWhere(options.where);
+    if (options.where) this.codec.validateWhere(options.where);
     if (options.orderBy && !this.codec.hasColumn(options.orderBy.column)) {
       throw new TypeError(`${this.name} cannot order by unknown column ${options.orderBy.column}.`);
     }
@@ -604,7 +629,7 @@ export class DomainRepository {
       if (options.orderBy?.column !== options.keyset.column) throw new TypeError('Keyset column must match orderBy.');
       if (!['before', 'after'].includes(options.keyset.direction)) throw new TypeError('Keyset direction must be before or after.');
       requireId(options.keyset.id);
-      this.codec.encodeWhere({ [column.name]: options.keyset.value });
+      this.codec.validateWhere({ [column.name]: options.keyset.value });
     }
     if (options.collaborationConversationId !== undefined) {
       if (this.schema.key !== 'CollaborationMessage') throw new TypeError('Mailbox scope is only valid for CollaborationMessage.');
@@ -645,8 +670,8 @@ export class DomainRepository {
       throw new TypeError(`${this.name}.${allocation.column} is not an allocatable INTEGER column.`);
     }
     if (allocation.column in row) throw new TypeError(`${this.name}.${allocation.column} must be allocated by the writer.`);
-    this.codec.encodeInsert({ ...row, [allocation.column]: '1' });
-    this.codec.encodeWhere(allocation.scope);
+    this.codec.validateInsert({ ...row, [allocation.column]: '1' });
+    this.codec.validateWhere(allocation.scope);
     return {
       kind: 'insert',
       domain: this.schema.key,
@@ -740,13 +765,13 @@ function forkMessageStepsForBatch(batch: ForkMessageCopyBatch): ForkMessageCopyS
 
 function validateForkCopyAssertion(step: RepositoryAssertStep): void {
   requireId(step.id);
-  DOMAIN_REPOSITORIES.domain(step.domain).codec.encodeWhere(step.where);
+  DOMAIN_REPOSITORIES.domain(step.domain).codec.validateWhere(step.where);
 }
 
 function validateForkCopyInsert(step: RepositoryInsertMutation): void {
   const repository = DOMAIN_REPOSITORIES.domain(step.domain);
   if (!repository.schema.mutations.includes('insert')) throw new Error(`${repository.name} does not allow insert.`);
-  repository.codec.encodeInsert(step.row);
+  repository.codec.validateInsert(step.row);
 }
 
 export function savepoint(
@@ -770,31 +795,36 @@ export function schemaForDomain(domainKey: string): RuntimeDomainSchema {
   return schema;
 }
 
-function encodeValue(column: ColumnDefinition, value: unknown, codecName: string): string | bigint | Buffer | null {
+function requireValueShape(column: ColumnDefinition, value: unknown, codecName: string): void {
   if (value === null) {
     if (!column.nullable) throw new TypeError(`${codecName}.${column.name} cannot be null.`);
-    return null;
+    return;
   }
-  if (column.json) {
-    if (typeof value === 'string') {
-      JSON.parse(value);
-      return value;
-    }
-    return JSON.stringify(value);
-  }
+  if (column.json) return;
   if (column.type === 'TEXT') {
     if (typeof value !== 'string') throw new TypeError(`${codecName}.${column.name} must be a string.`);
-    return value;
+    return;
   }
   if (column.type === 'BLOB') {
     if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) {
       throw new TypeError(`${codecName}.${column.name} must be bytes.`);
     }
-    return Buffer.from(value);
+    return;
   }
-  if (typeof value === 'bigint') return value;
-  if (typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value)) return BigInt(value);
+  if (typeof value === 'bigint' || (typeof value === 'string' && /^(?:0|[1-9]\d*)$/.test(value))) return;
   throw new TypeError(`${codecName}.${column.name} must be a bigint or decimal integer string.`);
+}
+
+function encodeValue(column: ColumnDefinition, value: unknown, codecName: string): string | bigint | Buffer | null {
+  requireValueShape(column, value, codecName);
+  if (value === null) return null;
+  if (column.json) {
+    if (typeof value === 'string') { JSON.parse(value); return value; }
+    return JSON.stringify(value);
+  }
+  if (column.type === 'BLOB') return Buffer.from(value as Uint8Array);
+  if (column.type === 'INTEGER') return typeof value === 'bigint' ? value : BigInt(value as string);
+  return value as string;
 }
 
 function coversUniqueIdentity(schema: RuntimeDomainSchema, where: DomainRow): boolean {

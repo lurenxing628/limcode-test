@@ -146,7 +146,8 @@ test('进程在SQLite commit前退出不会留下半事务', async () => {
   }
 });
 
-const CAS_DIRECTORY_FSYNC_PER_PUBLISH = process.platform === 'win32' ? 0 : 8;
+const CAS_DIRECTORY_FSYNC_PER_PUBLISH = process.platform === 'win32' ? 0 : 4;
+const CAS_DIRECTORY_FSYNC_PER_REUSE = process.platform === 'win32' ? 0 : 3;
 
 const CAS_METRICS = [
   'lookup-hit',
@@ -219,7 +220,9 @@ test('CAS prepareBatch一次worker snapshot并在publish前去重mixed identitie
       publish: 2,
       'temp-write': 2,
       'file-fsync': 2,
-      'directory-fsync': CAS_DIRECTORY_FSYNC_PER_PUBLISH * 2
+      'directory-fsync': process.platform === 'win32' ? 0 : new Set(
+        prepared.filter(entry => entry.insert).map(entry => entry.metadata.sha256.slice(0, 2))
+      ).size + 3
     });
     assert.equal(prepared.length, inputs.length);
     assert.equal(prepared[0].insert, undefined);
@@ -263,9 +266,11 @@ test('CAS concurrent first ingest保留唯一ContentObject并清理所有temp', 
     assert.equal(measured['lookup-hit'] + measured['lookup-miss'], 8);
     assert.ok(measured.publish >= 1);
     assert.equal(measured.publish, measured['lookup-miss']);
-    assert.equal(measured['temp-write'], measured.publish);
-    assert.equal(measured['file-fsync'], measured.publish);
-    assert.equal(measured['directory-fsync'], measured.publish * CAS_DIRECTORY_FSYNC_PER_PUBLISH);
+    assert.ok(measured['temp-write'] >= 1 && measured['temp-write'] <= measured.publish);
+    assert.equal(measured['file-fsync'], measured['temp-write']);
+    assert.equal(measured['directory-fsync'],
+      measured['temp-write'] * CAS_DIRECTORY_FSYNC_PER_PUBLISH
+      + (measured.publish - measured['temp-write']) * CAS_DIRECTORY_FSYNC_PER_REUSE);
     const rows = await database.snapshot([
       kernel.DOMAIN_REPOSITORIES.domain('ContentObject').list({
         where: { id: results[0].id },
@@ -301,7 +306,7 @@ test('CAS pageable read reuses verified file identities and returns isolated chu
   });
 });
 
-test('CAS orphan EEXIST继续校验且错误digest不产生SQLite引用', async () => {
+test('CAS orphan复用已发布正文且错误内容不产生SQLite引用', async () => {
   await withCasRuntime('cas-fast-path-orphan', async ({ authority, binding, database }) => {
     const metrics = createCasMetricCollector();
     const store = kernel.ContentAddressedStore.loose(authority, binding, metrics.observe);
@@ -316,9 +321,9 @@ test('CAS orphan EEXIST继续校验且错误digest不产生SQLite引用', async 
       'lookup-hit': 0,
       'lookup-miss': 1,
       publish: 1,
-      'temp-write': 1,
-      'file-fsync': 1,
-      'directory-fsync': CAS_DIRECTORY_FSYNC_PER_PUBLISH
+      'temp-write': 0,
+      'file-fsync': 0,
+      'directory-fsync': CAS_DIRECTORY_FSYNC_PER_REUSE
     });
     await database.transaction([prepared.insert]);
 
@@ -333,19 +338,170 @@ test('CAS orphan EEXIST继续校验且错误digest不产生SQLite引用', async 
     const corruptStart = metrics.measureStart();
     await assert.rejects(
       store.prepare(database, expected, 'application/test-corrupt'),
-      /wrong digest/i
+      /does not match its published bytes/i
     );
     const corruptMetrics = metrics.measureEnd(corruptStart);
     assert.equal(corruptMetrics['lookup-hit'], 0);
     assert.equal(corruptMetrics['lookup-miss'], 1);
     assert.equal(corruptMetrics.publish, 1);
-    assert.equal(corruptMetrics['temp-write'], 1);
-    assert.equal(corruptMetrics['file-fsync'], 1);
-    if (process.platform === 'win32') assert.equal(corruptMetrics['directory-fsync'], 0);
-    else assert.ok(corruptMetrics['directory-fsync'] > 0);
+    assert.equal(corruptMetrics['temp-write'], 0);
+    assert.equal(corruptMetrics['file-fsync'], 0);
+    assert.equal(corruptMetrics['directory-fsync'], 0);
     const absent = await database.snapshot([repository.get(identity.id)]);
     assert.equal(absent.snapshot[0], null);
     assert.deepEqual(await fs.readdir(path.join(binding.paths.casRootPath, 'tmp')), []);
+  });
+});
+
+test('CAS production大正文批次按物理正文去重并在共享目录落盘后返回', async () => {
+  await withCasRuntime('cas-large-batch', async ({ authority, binding, database }) => {
+    const metrics = createCasMetricCollector();
+    const store = kernel.ContentAddressedStore.forDatabase(authority, database, metrics.observe);
+    const first = Buffer.alloc(8193, 0x61);
+    const second = Buffer.alloc(16386, 0x62);
+    const inputs = [
+      { content: first, contentType: 'application/first' },
+      { content: 'packed in between', contentType: 'text/plain' },
+      { content: first, contentType: 'application/first-alias' },
+      { content: second, contentType: 'application/second' }
+    ];
+    const casRoot = path.resolve(binding.paths.casRootPath);
+    const originalOpen = fs.open;
+    const originalLink = fs.link;
+    const events = [];
+    let failRootSync = false;
+    fs.open = async (...args) => {
+      const handle = await originalOpen(...args);
+      const file = path.resolve(String(args[0]));
+      if (file === casRoot || file.startsWith(casRoot + path.sep)) {
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          events.push({ kind: file.endsWith('.tmp') ? 'file-sync' : 'directory-sync', file });
+          if (failRootSync && file === casRoot) throw Object.assign(new Error('CAS root sync failed'), { code: 'EIO' });
+          return sync();
+        };
+      }
+      return handle;
+    };
+    fs.link = async (source, target) => {
+      await originalLink(source, target);
+      events.push({ kind: 'link', file: path.resolve(String(source)), target: path.resolve(String(target)) });
+    };
+    try {
+      const start = metrics.measureStart();
+      const prepared = await store.prepareBatch(database, inputs);
+      const prefixCount = new Set([prepared[0], prepared[3]].map(entry => entry.metadata.sha256.slice(0, 2))).size;
+      assert.deepEqual(metrics.measureEnd(start), {
+        'lookup-hit': 0, 'lookup-miss': 4, publish: 4,
+        'temp-write': 2, 'file-fsync': 2,
+        'directory-fsync': process.platform === 'win32' ? 0 : prefixCount + 3
+      });
+      const linked = events.filter(event => event.kind === 'link');
+      const directories = events.filter(event => event.kind === 'directory-sync');
+      assert.equal(linked.length, 2, 'different MIME metadata must share one physical publication');
+      for (const link of linked) {
+        const fileBarrier = events.findIndex(event => event.kind === 'file-sync' && event.file === link.file);
+        assert.ok(fileBarrier >= 0 && fileBarrier < events.indexOf(link),
+          'each body must reach its file barrier before its immutable name is linked');
+      }
+      assert.equal(directories.length, prefixCount + 3);
+      assert.equal(new Set(directories.map(event => event.file)).size, directories.length);
+      assert.ok(events.indexOf(directories[0]) > events.indexOf(linked.at(-1)),
+        'the batch directory barrier follows all file publications and temporary cleanup');
+      for (const directory of directories) {
+        const parentIndex = directories.findIndex(event => event.file === path.dirname(directory.file));
+        if (parentIndex !== -1) assert.ok(directories.indexOf(directory) < parentIndex, 'sync children before their parent');
+      }
+      await database.transaction(prepared.map(entry => entry.insert));
+      const read = await store.readMany(prepared.map(entry => entry.metadata));
+      assert.deepEqual(read, [first, Buffer.from(inputs[1].content), first, second]);
+      assert.deepEqual(await fs.readdir(path.join(casRoot, 'tmp')), []);
+
+      const reuseStart = metrics.measureStart();
+      const alias = await store.ingest(database, first, 'application/new-alias');
+      assert.deepEqual(metrics.measureEnd(reuseStart), {
+        'lookup-hit': 0, 'lookup-miss': 1, publish: 1,
+        'temp-write': 0, 'file-fsync': 0, 'directory-fsync': CAS_DIRECTORY_FSYNC_PER_REUSE
+      });
+      assert.equal(alias.storage_key, prepared[0].metadata.storage_key);
+
+      const blockedIdentity = store.identity(second, 'application/blocked-alias');
+      failRootSync = true;
+      await assert.rejects(store.ingest(database, second, 'application/blocked-alias'), /CAS root sync failed/);
+      assert.equal((await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('ContentObject').get(blockedIdentity.id)])).snapshot[0], null,
+        'a failed batch metadata barrier must not acquire a Runtime reference');
+    } finally {
+      fs.open = originalOpen;
+      fs.link = originalLink;
+    }
+  });
+});
+
+test('CAS first-publication EEXIST保留精确正文检查和temp清理', async () => {
+  await withCasRuntime('cas-link-race', async ({ authority, binding, database }) => {
+    const store = kernel.ContentAddressedStore.loose(authority, binding);
+    const originalOpen = fs.open;
+    const originalLink = fs.link;
+    let corrupt = false;
+    let sharedDataset = false;
+    let racingTemporary;
+    let racingPublished;
+    let cleanupInjected = false;
+    let verificationReads = 0;
+    fs.open = async (...args) => {
+      const handle = await originalOpen(...args);
+      if (!corrupt && path.resolve(String(args[0])) === racingPublished) {
+        const read = handle.read.bind(handle);
+        handle.read = async (...readArgs) => {
+          verificationReads += 1;
+          const result = await read(...readArgs);
+          if (!cleanupInjected) {
+            cleanupInjected = true;
+            await fs.rm(racingTemporary);
+          }
+          return result;
+        };
+      }
+      return handle;
+    };
+    fs.link = async (source, target) => {
+      if (corrupt) {
+        const expected = await fs.readFile(source);
+        await fs.writeFile(target, Buffer.alloc(expected.length, 0x00), { flag: 'wx' });
+      } else {
+        await originalLink(source, target);
+        if (sharedDataset) {
+          const sharedFile = path.join(binding.paths.casRootPath, '..', 'linked-dataset', path.basename(String(target)));
+          await fs.mkdir(path.dirname(sharedFile), { recursive: true });
+          await originalLink(source, sharedFile);
+        }
+        racingTemporary = source;
+        racingPublished = await fs.realpath(target);
+        assert.equal((await fs.stat(racingPublished, { bigint: true })).nlink, sharedDataset ? 3n : 2n);
+      }
+      throw Object.assign(new Error('another publisher already linked this body'), { code: 'EEXIST' });
+    };
+    try {
+      for (sharedDataset of [false, true]) {
+        cleanupInjected = false;
+        verificationReads = 0;
+        const content = sharedDataset ? 'racing shared dataset bytes' : 'racing expected bytes';
+        const valid = await store.ingest(database, content, 'text/plain');
+        assert.equal(cleanupInjected, true);
+        if (process.platform === 'win32') assert.ok(verificationReads === 1 || verificationReads === 2);
+        else assert.equal(verificationReads, 2, 'one-link cleanup must restart exact verification with a stable new snapshot');
+        assert.equal((await fs.stat(racingPublished, { bigint: true })).nlink, sharedDataset ? 2n : 1n);
+        assert.equal((await store.read(valid)).toString(), content);
+      }
+      corrupt = true;
+      const identity = store.identity('racing corrupt bytes', 'text/plain');
+      await assert.rejects(store.ingest(database, 'racing corrupt bytes', 'text/plain'), /does not match its published bytes/);
+      assert.equal((await database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('ContentObject').get(identity.id)])).snapshot[0], null);
+      assert.deepEqual(await fs.readdir(path.join(binding.paths.casRootPath, 'tmp')), []);
+    } finally {
+      fs.open = originalOpen;
+      fs.link = originalLink;
+    }
   });
 });
 

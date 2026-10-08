@@ -62,6 +62,15 @@ export const METADATA_TABLES = Object.freeze(['root_binding', 'schema_manifest']
 
 validateDomainManifest();
 
+// Current descriptors are fixed for the lifetime of this module. Their nested foreign-key
+// definitions must also stay immutable before a digest can be reused by object identity.
+const currentDomainSchemaDigests = new Map(RUNTIME_DOMAIN_SCHEMAS.map((schema) => {
+  for (const column of schema.columns) {
+    if (column.references) Object.freeze(column.references);
+  }
+  return [schema, calculateDomainSchemaDigest(schema)] as const;
+}));
+
 export function createRuntimeSchemaSql(): string[] {
   const statements = [
     createRootBindingTableSql(),
@@ -76,6 +85,12 @@ export function createRuntimeSchemaSql(): string[] {
 }
 
 export function domainSchemaDigest(schema: RuntimeDomainSchema): string {
+  // Constructed and historical descriptors retain content-based calculation; a matching domain
+  // key must never reuse the current descriptor's digest when its actual definition differs.
+  return currentDomainSchemaDigests.get(schema) ?? calculateDomainSchemaDigest(schema);
+}
+
+function calculateDomainSchemaDigest(schema: RuntimeDomainSchema): string {
   return createHash('sha256').update(JSON.stringify(schema)).digest('hex');
 }
 

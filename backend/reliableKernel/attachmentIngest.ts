@@ -1,4 +1,3 @@
-import { createHash } from 'node:crypto';
 import { decodeCanonicalBase64 as decodeCanonicalBase64Value } from '../capabilities/canonicalBase64';
 import { sqliteDatabaseFileRefusal, sqliteDatabaseFileRefusalMessage } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
 import fs from 'node:fs/promises';
@@ -9,6 +8,7 @@ import {
 } from '../../shared/protocol';
 import {
   ContentAddressedStore,
+  type IdentifiedContent,
   type ContentObjectMetadata,
   type PreparedContentObject
 } from './contentAddressedStore';
@@ -63,7 +63,7 @@ export interface PreparedMessageAttachmentAdmission extends PreparedAttachmentAd
 }
 
 interface EmbeddedAttachmentCandidate extends PreparedAttachmentReference {
-  bytes: Buffer;
+  identified: IdentifiedContent;
   prepared?: PreparedContentObject;
 }
 
@@ -72,6 +72,9 @@ interface AttachmentTransformContext {
   embedded: EmbeddedAttachmentCandidate[];
   references: PreparedAttachmentReference[];
   outputs: InlineDataPart['inlineData'][];
+  localBytes: WeakMap<object, Buffer>;
+  decodedData: Map<string, Buffer>;
+  identifiedBytes: WeakMap<Buffer, Map<string, IdentifiedContent>>;
 }
 
 /** Reads the existing settings authority; attachment bytes never enter Runtime SQLite. */
@@ -166,22 +169,27 @@ export class AttachmentIngestService {
       const settings = await this.loadSettings();
       maxBytes = BigInt(settings.maxStoredInlineFileMb) * 1024n * 1024n;
     }
+    const localBytes = new WeakMap<object, Buffer>();
     const materialized = await this.materializeLocalPathAttachments(
       value,
       label,
       maxBytes,
-      new Map<string, Buffer>()
+      new Map<string, Promise<Buffer>>(),
+      localBytes
     );
-    const context: AttachmentTransformContext = { position: 0, embedded: [], references: [], outputs: [] };
+    const context: AttachmentTransformContext = { position: 0, embedded: [], references: [], outputs: [],
+      localBytes, decodedData: new Map(), identifiedBytes: new WeakMap() };
     const transformed = this.transformValue(materialized, context, label, maxBytes) as T;
     if (context.references.length === 0) {
       return { value: transformed, attachments: [], storageSteps: [], totalBytes: 0 };
     }
 
     const existingById = new Map<string, DomainRow>();
+    const embeddedIds = new Set(context.embedded.map((candidate) => candidate.attachmentId));
     for (const reference of context.references) {
-      if (context.embedded.some((candidate) => candidate.attachmentId === reference.attachmentId)) continue;
-      const existing = await this.requireExisting('Attachment', reference.attachmentId);
+      if (embeddedIds.has(reference.attachmentId)) continue;
+      const existing = existingById.get(reference.attachmentId)
+        ?? await this.requireExisting('Attachment', reference.attachmentId);
       existingById.set(reference.attachmentId, existing);
       const byteLength = requireBigInt(existing.byte_length, 'Attachment.byte_length');
       reference.sizeBytes = safeByteLength(byteLength, 'Attachment.byte_length');
@@ -195,7 +203,6 @@ export class AttachmentIngestService {
 
     let totalBytes = 0n;
     let newlyAdmittedBytes = 0n;
-    const embeddedIds = new Set(context.embedded.map((candidate) => candidate.attachmentId));
     for (const reference of context.references) {
       const size = BigInt(reference.sizeBytes);
       if (embeddedIds.has(reference.attachmentId)) {
@@ -216,9 +223,9 @@ export class AttachmentIngestService {
 
     const uniqueEmbedded = [...new Map(context.embedded.map((entry) => [entry.attachmentId, entry])).values()];
     if (uniqueEmbedded.length > 0) {
-      const prepared = await this.contentStore.prepareBatch(
+      const prepared = await this.contentStore.prepareIdentifiedBatch(
         this.database,
-        uniqueEmbedded.map((entry) => ({ content: entry.bytes, contentType: entry.mimeType }))
+        uniqueEmbedded.map((entry) => entry.identified)
       );
       uniqueEmbedded.forEach((entry, index) => { entry.prepared = prepared[index]; });
     }
@@ -266,7 +273,8 @@ export class AttachmentIngestService {
 
     return {
       value: transformed,
-      attachments: context.references,
+      attachments: context.references.map(({ attachmentId, position, mimeType, name, sha256, sizeBytes }) =>
+        ({ attachmentId, position, mimeType, name, sha256, sizeBytes })),
       storageSteps,
       totalBytes: safeByteLength(totalBytes, 'attachment total')
     };
@@ -317,11 +325,12 @@ export class AttachmentIngestService {
     value: unknown,
     label: string,
     maxBytes: bigint | undefined,
-    cache: Map<string, Buffer>
+    cache: Map<string, Promise<Buffer>>,
+    localBytes: WeakMap<object, Buffer>
   ): Promise<unknown> {
     if (Array.isArray(value)) {
       return Promise.all(value.map((entry, index) =>
-        this.materializeLocalPathAttachments(entry, `${label}[${index}]`, maxBytes, cache)));
+        this.materializeLocalPathAttachments(entry, `${label}[${index}]`, maxBytes, cache, localBytes)));
     }
     if (ArrayBuffer.isView(value)) return value;
     if (!value || typeof value !== 'object') return value;
@@ -341,28 +350,31 @@ export class AttachmentIngestService {
         return value;
       }
       const absolutePath = requireAbsoluteSourcePath(sourcePath, `${label}.inlineData.sourcePath`);
-      let bytes = cache.get(absolutePath);
-      if (!bytes) {
-        bytes = await readLocalAttachmentBytes(absolutePath, maxBytes, `${label}.inlineData`);
-        cache.set(absolutePath, bytes);
+      let pending = cache.get(absolutePath);
+      if (!pending) {
+        pending = readLocalAttachmentBytes(absolutePath, maxBytes, `${label}.inlineData`);
+        cache.set(absolutePath, pending);
+        void pending.catch(() => { if (cache.get(absolutePath) === pending) cache.delete(absolutePath); });
       }
+      const bytes = await pending;
+      const materializedInlineData = {
+        ...raw,
+        mimeType: optionalText(raw.mimeType) ?? 'application/octet-stream',
+        name: optionalText(raw.name) ?? path.basename(absolutePath),
+        sourcePath: absolutePath,
+        storage: 'localPath',
+        status: 'available',
+        sizeBytes: bytes.byteLength
+      };
+      localBytes.set(materializedInlineData, bytes);
       return {
         ...record,
-        inlineData: {
-          ...raw,
-          mimeType: optionalText(raw.mimeType) ?? 'application/octet-stream',
-          name: optionalText(raw.name) ?? path.basename(absolutePath),
-          sourcePath: absolutePath,
-          storage: 'localPath',
-          status: 'available',
-          sizeBytes: bytes.byteLength,
-          data: bytes.toString('base64')
-        }
+        inlineData: materializedInlineData
       };
     }
     const entries = await Promise.all(Object.entries(record).map(async ([key, entry]) => [
       key,
-      await this.materializeLocalPathAttachments(entry, `${label}.${key}`, maxBytes, cache)
+      await this.materializeLocalPathAttachments(entry, `${label}.${key}`, maxBytes, cache, localBytes)
     ] as const));
     return Object.fromEntries(entries);
   }
@@ -407,7 +419,8 @@ export class AttachmentIngestService {
     }
     await this.requireExisting('MessageRevision', messageRevisionId);
 
-    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const identified = this.contentStore.identify(bytes, mimeType);
+    const sha256 = identified.identity.sha256;
     const attachmentId = stablePhaseDId('attachment', JSON.stringify([sha256, mimeType, name]));
     const attachmentLinkId = stablePhaseDId(
       'attachment_link',
@@ -416,7 +429,7 @@ export class AttachmentIngestService {
     const existingLink = await this.maybeGet('AttachmentLink', attachmentLinkId);
     if (existingLink) return this.replay(existingLink, attachmentId, position);
 
-    const prepared = await this.contentStore.prepare(this.database, bytes, mimeType);
+    const prepared = await this.contentStore.prepareIdentified(this.database, identified);
     const now = this.timestamp();
     try {
       const committed = await this.database.transaction([
@@ -472,6 +485,11 @@ export class AttachmentIngestService {
   public async read(attachmentIdInput: string): Promise<Buffer> {
     const attachmentId = requireId(attachmentIdInput, 'attachmentId');
     const attachment = await this.requireExisting('Attachment', attachmentId);
+    return this.readAttachment(attachment);
+  }
+
+  private async readAttachment(attachment: DomainRow): Promise<Buffer> {
+    const attachmentId = requireId(attachment.id, 'Attachment.id');
     if (attachment.storage_mode !== 'cas') throw new Error(`Attachment ${attachmentId} is not CAS-backed.`);
     const contentObjectId = requireId(attachment.content_object_id, 'Attachment.content_object_id');
     const metadata = await this.requireExisting('ContentObject', contentObjectId) as ContentObjectMetadata;
@@ -486,6 +504,11 @@ export class AttachmentIngestService {
   public async managedReference(attachmentIdInput: string): Promise<InlineDataPart> {
     const attachmentId = requireId(attachmentIdInput, 'attachmentId');
     const attachment = await this.requireExisting('Attachment', attachmentId);
+    return this.referenceFromAttachment(attachment);
+  }
+
+  private referenceFromAttachment(attachment: DomainRow): InlineDataPart {
+    const attachmentId = requireId(attachment.id, 'Attachment.id');
     if (attachment.storage_mode !== 'cas') throw new Error(`Attachment ${attachmentId} is not CAS-backed.`);
     return {
       inlineData: {
@@ -504,9 +527,10 @@ export class AttachmentIngestService {
   }
 
   public async resolveInlineData(attachmentIdInput: string): Promise<InlineDataPart> {
-    const reference = await this.managedReference(attachmentIdInput);
-    const attachmentId = requireId(reference.inlineData.attachmentId, 'InlineDataPart.attachmentId');
-    const bytes = await this.read(attachmentId);
+    const attachmentId = requireId(attachmentIdInput, 'attachmentId');
+    const attachment = await this.requireExisting('Attachment', attachmentId);
+    const reference = this.referenceFromAttachment(attachment);
+    const bytes = await this.readAttachment(attachment);
     return {
       inlineData: {
         ...reference.inlineData,
@@ -542,9 +566,25 @@ export class AttachmentIngestService {
     const position = String(context.position++);
     const mimeType = optionalText(raw.mimeType) ?? 'application/octet-stream';
     const name = optionalText(raw.name) ?? `attachment-${Number(position) + 1}${extensionForMimeType(mimeType)}`;
-    if (typeof raw.data === 'string') {
-      const bytes = decodeAttachmentBase64(raw.data, `${label}.inlineData.data`, maxBytes);
-      const sha256 = createHash('sha256').update(bytes).digest('hex');
+    const localBytes = context.localBytes.get(raw);
+    if (typeof raw.data === 'string' || localBytes) {
+      let bytes = localBytes;
+      if (!bytes && typeof raw.data === 'string') {
+        bytes = context.decodedData.get(raw.data);
+        if (!bytes) {
+          bytes = decodeAttachmentBase64(raw.data, `${label}.inlineData.data`, maxBytes);
+          context.decodedData.set(raw.data, bytes);
+        }
+      }
+      if (!bytes) throw new AttachmentContentError(`${label}.inlineData has no materialized bytes.`);
+      let contentTypes = context.identifiedBytes.get(bytes);
+      if (!contentTypes) context.identifiedBytes.set(bytes, contentTypes = new Map());
+      let identified = contentTypes.get(mimeType);
+      if (!identified) {
+        identified = this.contentStore.identify(bytes, mimeType);
+        contentTypes.set(mimeType, identified);
+      }
+      const sha256 = identified.identity.sha256;
       const attachmentId = stablePhaseDId('attachment', JSON.stringify([sha256, mimeType, name]));
       const reference: EmbeddedAttachmentCandidate = {
         attachmentId,
@@ -553,7 +593,7 @@ export class AttachmentIngestService {
         name,
         sha256,
         sizeBytes: bytes.byteLength,
-        bytes
+        identified
       };
       context.embedded.push(reference);
       context.references.push(reference);

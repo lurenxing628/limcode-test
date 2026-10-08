@@ -349,7 +349,7 @@ test('统计查询不访问 CAS 目录：目录权限改成 000 时照样返回'
   }
 });
 
-test('统计在 worker 的 reader 连接上执行：写连接不参与，另一连接持有写锁时照常返回', async (t) => {
+test('统计业务只用 worker reader，RootBinding 检查保留且另一连接持写锁时照常返回', async (t) => {
   const { root, database, store } = await openRuntime(t, 'reader');
   await store.ingest(database, 'reader connection', MESSAGE);
   const counters = (cache) => ({ prepares: cache.prepares, hits: cache.hits, misses: cache.misses, uncached: cache.uncached });
@@ -358,10 +358,12 @@ test('统计在 worker 的 reader 连接上执行：写连接不参与，另一�
   const first = (await database.inspect()).statementCache;
   await database.contentUsage();
   const second = (await database.inspect()).statementCache;
-  assert.deepEqual(counters(first.writer), counters(before.writer));
-  assert.deepEqual(counters(second.writer), counters(before.writer));
+  // inspect itself still checks the live RootBinding on the writer; contentUsage only checks it
+  // on the reader. Exact hit deltas keep every domain query off the writer connection.
+  assert.deepEqual(counters(first.writer), { ...counters(before.writer), hits: before.writer.hits + 1 });
+  assert.deepEqual(counters(second.writer), { ...counters(before.writer), hits: before.writer.hits + 2 });
   assert.equal(first.reader.misses - before.reader.misses, 1, '第一次在 reader 上准备语句');
-  assert.equal(second.reader.hits - first.reader.hits, 1, '第二次复用 reader 上缓存的语句');
+  assert.equal(second.reader.hits - first.reader.hits, 2, '统计与 RootBinding 准入查询都复用 reader 缓存');
 
   const other = new NativeDatabase(root.binding.paths.databasePath);
   t.after(() => { if (other.open) other.close(); });

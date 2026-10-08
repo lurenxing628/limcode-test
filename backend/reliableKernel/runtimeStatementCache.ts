@@ -29,8 +29,6 @@ export interface RuntimeStatementCacheCounters {
   busyBypasses: number;
   /** Variable-text SQL (placeholder lists) that is prepared per call and never cached. */
   uncached: number;
-  /** Whole-cache drops after the main schema changed underneath the connection. */
-  invalidations: number;
 }
 
 export const RUNTIME_STATEMENT_CACHE_MAX_ENTRIES = 256;
@@ -54,16 +52,15 @@ interface NormalizedMode {
  * Entries are keyed by SQL text plus the requested result mode, and the mode is applied again on
  * every hit, so a Statement always behaves like the fresh prepare it replaces. A Statement that is
  * still iterating is never handed out twice. The cache belongs to exactly one connection object and
- * is dropped with it; another connection, a reopened worker or a changed main schema starts empty.
+ * is dropped with it; another connection or a reopened worker starts empty. SQLite automatically
+ * recompiles a Statement after a schema change, and better-sqlite3 updates its returned column shape.
  * The connection's default safeIntegers must not change after attaching: cached Statements keep the
  * default read at attach time, so attachRuntimeStatementCache makes such a change throw.
  */
 export class RuntimeStatementCache {
   private readonly entries = new Map<string, Database.Statement>();
-  private readonly schemaVersionStatement: Database.Statement;
   /** The connection default read when the cache was created; every cached Statement uses it. */
   public readonly connectionSafeIntegers: boolean;
-  private schemaVersion: bigint;
   private closed = false;
   private prepares = 0;
   private hits = 0;
@@ -71,7 +68,6 @@ export class RuntimeStatementCache {
   private evictions = 0;
   private busyBypasses = 0;
   private uncached = 0;
-  private invalidations = 0;
 
   public constructor(
     private readonly database: Database.Database,
@@ -82,8 +78,6 @@ export class RuntimeStatementCache {
     }
     // A fresh prepare inherits the connection default; read it back instead of assuming it.
     this.connectionSafeIntegers = typeof (database.prepare('SELECT 1 AS probe').get() as { probe: unknown }).probe === 'bigint';
-    this.schemaVersionStatement = database.prepare('PRAGMA schema_version').pluck().safeIntegers(true);
-    this.schemaVersion = this.readSchemaVersion();
   }
 
   /** Statement for fixed SQL text, reused while it stays in the LRU. */
@@ -127,19 +121,6 @@ export class RuntimeStatementCache {
     return this.prepareNative(sql, this.normalize(mode));
   }
 
-  /**
-   * Drops every cached Statement once the main schema cookie moved. SQLite already recompiles a
-   * Statement against a changed schema; this keeps the cache from outliving the schema it saw.
-   */
-  public revalidateSchema(): void {
-    this.assertOpen();
-    const current = this.readSchemaVersion();
-    if (current === this.schemaVersion) return;
-    this.schemaVersion = current;
-    this.entries.clear();
-    this.invalidations += 1;
-  }
-
   public inspect(): RuntimeStatementCacheCounters {
     return {
       entries: this.entries.size,
@@ -149,8 +130,7 @@ export class RuntimeStatementCache {
       misses: this.misses,
       evictions: this.evictions,
       busyBypasses: this.busyBypasses,
-      uncached: this.uncached,
-      invalidations: this.invalidations
+      uncached: this.uncached
     };
   }
 
@@ -174,10 +154,6 @@ export class RuntimeStatementCache {
       throw new TypeError('Statement safeIntegers mode must be a boolean.');
     }
     return { rows, safeIntegers: mode.safeIntegers ?? this.connectionSafeIntegers };
-  }
-
-  private readSchemaVersion(): bigint {
-    return this.schemaVersionStatement.get() as bigint;
   }
 
   private assertOpen(): void {

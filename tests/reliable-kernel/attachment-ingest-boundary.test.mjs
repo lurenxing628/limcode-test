@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 import { PDFDocument } from 'pdf-lib';
 import { AttachmentIngestService } from '../../dist/extension/backend/reliableKernel/attachmentIngest.js';
+import { ContentAddressedStore } from '../../dist/extension/backend/reliableKernel/contentAddressedStore.js';
 import {
   collectAttachmentCatalogFromStoredItems,
   normalizeAttachmentCatalogState,
@@ -28,23 +31,20 @@ const ATTACHMENT_LIMIT_BYTES = 20 * MIB;
 
 function serviceFixture() {
   let prepareBatchCalls = 0;
+  let identifyCalls = 0;
   const contentStore = {
-    async prepareBatch(_database, inputs) {
+    identify(content, contentType) {
+      identifyCalls += 1;
+      return ContentAddressedStore.prototype.identify.call(this, content, contentType);
+    },
+    async prepareIdentifiedBatch(_database, inputs) {
       prepareBatchCalls += 1;
-      return inputs.map(({ content, contentType }, index) => {
-        const bytes = Buffer.from(content);
-        const sha256 = createHash('sha256').update(bytes).digest('hex');
-        return {
-          metadata: {
-            id: `content-${index}-${sha256}`,
-            content_type: contentType,
-            sha256,
-            byte_length: BigInt(bytes.byteLength),
-            storage_key: `sha256/${sha256.slice(0, 2)}/${sha256}`,
-            created_at: '2026-01-01T00:00:00.000Z'
-          }
-        };
-      });
+      return inputs.map(({ identity }) => ({
+        metadata: {
+          ...identity,
+          created_at: '2026-01-01T00:00:00.000Z'
+        }
+      }));
     }
   };
   const settingsAuthority = {
@@ -59,7 +59,8 @@ function serviceFixture() {
   };
   return {
     service: new AttachmentIngestService({}, contentStore, settingsAuthority),
-    prepareBatchCalls: () => prepareBatchCalls
+    prepareBatchCalls: () => prepareBatchCalls,
+    identifyCalls: () => identifyCalls
   };
 }
 
@@ -101,6 +102,60 @@ test('AttachmentIngest accepts an exact 20 MiB embedded attachment and externali
   assert.equal(admission.value.parts[0].inlineData.data, undefined);
   assert.equal(admission.value.parts[0].inlineData.storage, 'managed');
   assert.equal(prepareBatchCalls(), 1);
+});
+
+test('one attachment admission identifies repeated embedded bytes once and keeps every occurrence', async () => {
+  const { service, identifyCalls } = serviceFixture();
+  const source = inlineAttachment(Buffer.from('one immutable attachment').toString('base64'));
+  const admission = await service.prepareValueAttachments({ parts: [source.parts[0], source.parts[0]] });
+  assert.equal(identifyCalls(), 1);
+  assert.equal(admission.attachments.length, 2);
+  assert.deepEqual(admission.attachments.map(({ position }) => position), ['0', '1']);
+  assert.equal(admission.attachments[0].attachmentId, admission.attachments[1].attachmentId);
+  assert.ok(admission.attachments.every(reference => !('identified' in reference) && !('prepared' in reference)));
+});
+
+test('concurrent local-path occurrences join one file read and enter CAS without a base64 round trip', async (context) => {
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-attachment-flight-'));
+  const target = path.join(parent, 'same-file.txt');
+  await fs.writeFile(target, 'shared local attachment');
+  const originalRead = fs.readFile;
+  let reads = 0;
+  context.mock.method(fs, 'readFile', async function (file, ...args) {
+    if (file === target) reads += 1;
+    return originalRead.call(this, file, ...args);
+  });
+  try {
+    const { service, identifyCalls } = serviceFixture();
+    const part = { inlineData: { sourcePath: target, storage: 'localPath', mimeType: 'text/plain', name: 'same-file.txt' } };
+    const admission = await service.prepareValueAttachments({ parts: [part, part, part] });
+    assert.equal(reads, 1);
+    assert.equal(identifyCalls(), 1);
+    assert.equal(admission.attachments.length, 3);
+    assert.ok(admission.value.parts.every(({ inlineData }) => inlineData.storage === 'managed'
+      && inlineData.data === undefined && inlineData.sourcePath === undefined));
+  } finally {
+    await fs.rm(parent, { recursive: true, force: true });
+  }
+});
+
+test('resolving an attachment reuses one metadata row and still rejects a conflicting CAS identity', async () => {
+  const attachment = { id: 'attachment', storage_mode: 'cas', content_object_id: 'content',
+    sha256: 'digest', byte_length: 5n, mime_type: 'text/plain', name: 'five.txt' };
+  const content = { id: 'content', sha256: 'digest', byte_length: 5n };
+  const reads = [];
+  let bodyReads = 0;
+  const service = new AttachmentIngestService({
+    async snapshot(queries) {
+      reads.push(...queries.map(query => query.domain));
+      return { snapshot: queries.map(query => query.domain === 'Attachment' ? attachment : content) };
+    }
+  }, { async read() { bodyReads += 1; return Buffer.from('hello'); } }, {});
+  assert.equal((await service.resolveInlineData('attachment')).inlineData.data, Buffer.from('hello').toString('base64'));
+  assert.deepEqual(reads, ['Attachment', 'ContentObject']);
+  content.sha256 = 'different';
+  await assert.rejects(service.resolveInlineData('attachment'), /does not match its immutable metadata/);
+  assert.equal(bodyReads, 1);
 });
 
 test('AttachmentIngest rejects encoded data over 20 MiB before CAS preparation', async () => {

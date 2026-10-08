@@ -123,7 +123,6 @@ import {
   sqlText
 } from './runtimeSqlRows';
 import {
-  type RuntimeStatementCache,
   attachRuntimeStatementCache,
   detachRuntimeStatementCache,
   prepareCached,
@@ -295,7 +294,6 @@ async function start(): Promise<void> {
       transferList: readonly ArrayBuffer[] = []
     ) => postMeasuredResponse(response, request, receivedAtMs, measurement.writeLock, transferList);
     try {
-      revalidateStatementCaches(writerStatements, readerStatements);
       if (maintenance && MAINTENANCE_EXCLUSIVE_WRITES.has(request.kind)) {
         throw new Error(`A maintenance transaction is open on this Runtime database; ${request.kind} is refused until it ends.`);
       }
@@ -356,7 +354,6 @@ async function start(): Promise<void> {
         return;
       }
       if (request.kind === 'renewExecutionLease') {
-        assertDatabaseBinding(writer, data.binding);
         const result = executeExecutionLeaseRenewal(writer, request.input, commitSeq + 1n, attachmentScopeCache);
         if (result.commit) {
           commitSeq += 1n;
@@ -648,14 +645,6 @@ async function start(): Promise<void> {
     }
   });
   port.on('message', (request: DatabaseWorkerRequest) => requestQueue.enqueue(request));
-}
-
-/**
- * Another connection that changes the main schema (never this worker: its only DDL is the TEMP
- * change capture above) drops every cached Statement before the next request uses one.
- */
-function revalidateStatementCaches(...caches: RuntimeStatementCache[]): void {
-  for (const cache of caches) cache.revalidateSchema();
 }
 
 function configureTransactionChangeCapture(database: Database.Database): void {
@@ -1301,15 +1290,15 @@ function executeModelStreamEvent(
         }),
         DOMAIN_REPOSITORIES.domain('Operation').update(operation.id, {
           status: 'completed', updated_at: input.now
-        }),
-        DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-          status: 'terminal',
-          terminal_state: 'completed',
-          usage_json: input.usage,
-          stream_stats_json: input.terminalStats,
-          updated_at: input.now
         })
       ], [], attachmentScopeCache);
+      executeMutation(database, DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+        status: 'terminal',
+        terminal_state: 'completed',
+        usage_json: input.usage,
+        stream_stats_json: input.terminalStats,
+        updated_at: input.now
+      }), [], attachmentScopeCache, request);
       executeSteps(database, [
         DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').pruneAfterTerminalFence(
           modelRequestId,
@@ -1394,17 +1383,15 @@ function executeModelStreamActivity(
       database.exec('ROLLBACK');
       return { accepted: false, terminal: false };
     }
-    executeSteps(database, [
-      DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-        status: 'streaming',
-        stream_stats_json: {
-          ...stats,
-          lastStreamSeq: nextSeq.toString(),
-          lastStreamEventAt: nextAt
-        },
-        updated_at: input.now
-      })
-    ], [], attachmentScopeCache);
+    executeMutation(database, DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+      status: 'streaming',
+      stream_stats_json: {
+        ...stats,
+        lastStreamSeq: nextSeq.toString(),
+        lastStreamEventAt: nextAt
+      },
+      updated_at: input.now
+    }), [], attachmentScopeCache, request);
     const changes = readTransactionChanges(database);
     const internalChangedDomains = readInternalChangedDomains(database);
     commitMeasuredWrite(database);
@@ -1469,11 +1456,11 @@ function executeCancelCurrentModelRequest(
       }),
       DOMAIN_REPOSITORIES.domain('Operation').update(operation.id, {
         status: 'cancelled', updated_at: input.now
-      }),
-      DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
-        status: 'terminal', terminal_state: input.terminalState, updated_at: input.now
       })
     ], [], attachmentScopeCache);
+    executeMutation(database, DOMAIN_REPOSITORIES.domain('ModelRequest').update(modelRequestId, {
+      status: 'terminal', terminal_state: input.terminalState, updated_at: input.now
+    }), [], attachmentScopeCache, request);
     assertModelRequestAggregate(database, modelRequestId);
     const changes = readTransactionChanges(database);
     const internalChangedDomains = readInternalChangedDomains(database);
@@ -1677,12 +1664,20 @@ function executeAssertion(
   decoded?: true
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(domain);
-  const encoded = repository.codec.encodeWhere(where);
+  const jsonColumns = decoded
+    ? repository.schema.columns.filter(column => column.json && Object.prototype.hasOwnProperty.call(where, column.name))
+    : [];
+  // Decoded assertions carry JSON values already obtained through the codec. Compare those
+  // structures directly rather than stringify them for SQL only to parse them back immediately.
+  if (decoded) repository.codec.validateWhere(where);
+  const jsonNames = decoded ? new Set(jsonColumns.map(column => column.name)) : undefined;
+  const encoded = repository.codec.encodeWhere(jsonNames
+    ? Object.fromEntries(Object.entries(where).filter(([name]) => !jsonNames.has(name)))
+    : where);
   const predicates = ['id = @__id'];
   const parameters: EncodedRow & { __id: string } = { __id: requireRuntimeId(id) };
   for (const [name, value] of Object.entries(encoded)) {
     if (name === 'id') throw new Error(`${repository.name} assertion id must be supplied separately.`);
-    if (decoded && repository.schema.columns.some((column) => column.name === name && column.json)) continue;
     if (value === null) predicates.push(`${quote(name)} IS NULL`);
     else {
       predicates.push(`${quote(name)} = @${name}`);
@@ -1697,11 +1692,8 @@ function executeAssertion(
       `SELECT * FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
     ).get(parameters);
     const current = raw ? repository.codec.decode(raw as Record<string, unknown>) : undefined;
-    matched = current && repository.schema.columns.filter((column) => column.json && Object.prototype.hasOwnProperty.call(encoded, column.name))
-      .every((column) => {
-        const value = encoded[column.name];
-        return isDeepStrictEqual(current[column.name], value === null ? null : JSON.parse(String(value)));
-      });
+    matched = current && jsonColumns
+      .every(column => isDeepStrictEqual(current[column.name], where[column.name]));
   } else {
     matched = prepareCached(database,
       `SELECT 1 AS matched FROM ${quote(repository.schema.table)} WHERE ${predicates.join(' AND ')} LIMIT 1`
@@ -1878,7 +1870,8 @@ function executeMutation(
   database: Database.Database,
   mutation: RepositoryMutation,
   allocatedSequences: RuntimeAllocatedSequence[],
-  attachmentScopeCache: AttachmentProjectionScopeCache
+  attachmentScopeCache: AttachmentProjectionScopeCache,
+  currentModelRequest?: DomainRow
 ): void {
   const repository = DOMAIN_REPOSITORIES.domain(mutation.domain);
   const schema = repository.schema;
@@ -2046,9 +2039,9 @@ function executeMutation(
   } else if (mutation.kind === 'update') {
     const id = requireRuntimeId(mutation.id);
     assertRuntimeDomainUpdatePatch(schema.key, mutation.patch);
-    assertRuntimeStateTransition(database, schema.key, id, mutation.patch);
+    const currentDelivery = assertRuntimeStateTransition(database, schema.key, id, mutation.patch, currentModelRequest);
     const acceptedNotification = schema.key === 'RuntimeDelivery' && mutation.patch.state === 'consumed'
-      && Boolean(prepareCached(database, "SELECT id FROM runtime_delivery WHERE id = ? AND state = 'pending' AND phase = 'notify_only'").get(id));
+      && currentDelivery?.state === 'pending' && currentDelivery.phase === 'notify_only';
     const encoded = repository.codec.encodePatch(mutation.patch);
     const assignments = Object.keys(encoded).map((name) => `${quote(name)} = @${name}`);
     const result = prepareCached(database, `UPDATE ${quote(schema.table)} SET ${assignments.join(', ')} WHERE id = @__id`)
@@ -2359,15 +2352,17 @@ function assertRuntimeStateTransition(
   database: Database.Database,
   domain: string,
   id: string,
-  patch: DomainRow
-): void {
+  patch: DomainRow,
+  currentModelRequest?: DomainRow
+): { state: string; phase: unknown } | undefined {
   if (domain === 'ConversationContextHandleState') {
     assertConversationContextHandleStateUpdate(database, id, patch);
     return;
   }
   if (domain === 'RuntimeDelivery') {
-    const current = prepareCached(database, 'SELECT state FROM runtime_delivery WHERE id = ?').get(id) as {
+    const current = prepareCached(database, 'SELECT state, phase FROM runtime_delivery WHERE id = ?').get(id) as {
       state?: unknown;
+      phase?: unknown;
     } | undefined;
     if (!current || typeof current.state !== 'string') {
       throw new Error(`RuntimeDeliveryRepository update expected one row: ${id}`);
@@ -2381,7 +2376,7 @@ function assertRuntimeStateTransition(
     if (!allowed[current.state]?.includes(nextState)) {
       throw new Error(`RuntimeDelivery state cannot transition from ${current.state} to ${nextState}.`);
     }
-    return;
+    return { state: current.state, phase: current.phase };
   }
   if (domain === 'RuntimeDeliveryInputLink') {
     const current = prepareCached(database, 'SELECT handled_at FROM runtime_delivery_input_link WHERE id = ?').get(id) as {
@@ -2403,9 +2398,15 @@ function assertRuntimeStateTransition(
     return;
   }
   if (domain === 'ModelRequest') {
-    const raw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(id);
-    if (!raw) throw new Error(`ModelRequestRepository update expected one row: ${id}`);
-    const current = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(raw as Record<string, unknown>);
+    // Fixed stream operations already read this row in the same writer transaction. Reuse that
+    // snapshot; ordinary Repository updates still acquire their current row here.
+    let current = currentModelRequest;
+    if (!current) {
+      const raw = prepareCached(database, 'SELECT * FROM model_request WHERE id = ?').get(id);
+      if (!raw) throw new Error(`ModelRequestRepository update expected one row: ${id}`);
+      current = DOMAIN_REPOSITORIES.codec('ModelRequest').decode(raw as Record<string, unknown>);
+    }
+    if (current.id !== id) throw new Error('ModelRequest transition snapshot does not match its update.');
     const currentStatus = String(current.status);
     const nextStatus = 'status' in patch ? String(patch.status) : currentStatus;
     const allowed: Record<string, readonly string[]> = {
