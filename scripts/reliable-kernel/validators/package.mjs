@@ -341,7 +341,8 @@ const DIRNAME_ENTRY_BOUNDARIES = new Map([
 
 /** __dirname uses that start no code, by file: the literal path each resolves (e.g. the extension root for its provenance file). */
 const DIRNAME_RESOURCE_USES = new Map([
-  ['dist/extension/backend/application/runtimeBuildIdentity.js', new Set(['../../compile-build-id.json'])]
+  ['dist/extension/backend/application/runtimeBuildIdentity.js', new Set(['../../compile-build-id.json'])],
+  ['dist/extension/backend/application/runtimeBuildInfo.js', new Set(['../../compile-build-id.json'])]
 ]);
 
 /**
