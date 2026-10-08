@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import test from 'node:test';
+import { createOpenAIResponsesProvider } from 'unified-llm-provider';
 import {
   createLlmProviderCapability,
   dryRunLlmProvider,
@@ -12,10 +13,37 @@ import {
   learnProviderRequestAdaptations,
   learnedProviderRequestAdaptations,
   providerErrorSearchText,
+  prepareEncodedProviderRequest,
+  prepareEncodedCompactProviderRequest,
+  installEncodedRequestPostProcessor,
   resetProviderRequestAdaptations,
   setProviderAdaptationClockForTests,
   unsupportedRequestParameters
 } from '../../dist/extension/backend/capabilities/providerParameterAdaptation.js';
+
+test('生产 wire 准备经过同一最终后处理，不生成 dryRun 展示内容', () => {
+  const provider = createOpenAIResponsesProvider({
+    provider: 'openai-responses', model: 'gpt-test', apiKey: 'test-key', baseUrl: 'https://example.invalid/v1'
+  });
+  provider.dryRun = () => { throw new Error('生产准备不应进入 dryRun'); };
+  installEncodedRequestPostProcessor(provider, request => ({
+    ...request, body: { ...request.body, max_output_tokens: 7 }, headers: { ...request.headers, 'x-final-adaptation': 'yes' }
+  }));
+  const prepared = prepareEncodedProviderRequest(provider, {
+    contents: [{ role: 'user', parts: [{ text: 'hello' }] }], tools: []
+  }, { inputFormat: 'unified', outputFormat: 'unified' }, true);
+  assert.equal(prepared.body.max_output_tokens, 7);
+  assert.equal(prepared.headers['x-final-adaptation'], 'yes');
+  assert.equal('bodyText' in prepared, false);
+  assert.equal('curl' in prepared, false);
+  provider.compactDryRun = () => { throw new Error('生产 compact 准备不应进入展示入口'); };
+  const compact = prepareEncodedCompactProviderRequest(provider, {
+    contents: [{ role: 'user', parts: [{ text: 'history' }] }]
+  }, { inputFormat: 'unified', outputFormat: 'unified' });
+  assert.equal('bodyText' in compact, false);
+  assert.equal('curl' in compact, false);
+  assert.ok(compact.url.endsWith('/responses/compact'));
+});
 
 // 真实错误文本：网关实测 + 官方/公开 issue（出处见 providerParameterAdaptation.ts 头注释）。
 const GATEWAY_REASONING_EFFORT = '{"error":{"message":"Error: Current provider response failed: reasoning_effort: Extra inputs are not permitted","type":"invalid_request_error"}}';

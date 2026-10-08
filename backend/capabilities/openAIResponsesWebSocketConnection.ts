@@ -196,7 +196,6 @@ export interface OpenAIResponsesWebSocketConnectionConfig {
 }
 
 export interface OpenAIResponsesWebSocketLastRequestState {
-  body: Record<string, unknown>;
   durableInputItems: unknown[];
   baseSignature: string;
   volatileTailLayout?: string;

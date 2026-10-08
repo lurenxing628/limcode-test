@@ -169,6 +169,39 @@ test('text fallback expands opaque native state before freezing its source handl
   for (const ref of ['P1', 'O1', 'W1']) assert.ok(JSON.stringify(compact.contents).includes(ref), ref);
 });
 
+test('nested source replay reads each immutable segment once while retaining the summary identity check', async () => {
+  const fixture = sourceFixture();
+  fixture.domains.CompressionBlockSource[0].segment_id = 'nested-summary';
+  fixture.domains.ContextSegment.push({ id: 'nested-summary', content_object_id: 'nested-object', segment_kind: 'compression' });
+  fixture.domains.ContentObject.push({ id: 'nested-object', content_type: fixture.summary.contentType,
+    byte_length: fixture.summary.content.length });
+  fixture.domains.ContextSegmentSource.push({ id: 'nested-source', segment_id: 'nested-summary', source_kind: 'compression_block',
+    source_id: 'nested-block', source_revision: 0n });
+  const nestedBlock = { id: 'nested-block', conversation_id: 'history', summary_object_id: 'nested-object' };
+  fixture.domains.CompressionBlock.push(nestedBlock);
+  fixture.domains.CompressionBlockSource.push({ id: 'nested-block-source', compression_block_id: 'nested-block',
+    position: 0n, segment_id: 'original' });
+  const snapshot = fixture.database.snapshot;
+  const read = fixture.store.read;
+  const segmentReads = new Map();
+  fixture.database.snapshot = async queries => {
+    for (const query of queries) if (query.kind === 'get' && query.domain === 'ContextSegment') {
+      segmentReads.set(query.id, (segmentReads.get(query.id) ?? 0) + 1);
+    }
+    return snapshot(queries);
+  };
+  fixture.store.read = async metadata => metadata.id === 'nested-object' ? Buffer.from(fixture.summary.content) : read(metadata);
+  const replay = () => expandTextCompressionSources(fixture.database, fixture.store, 'history', [fixture.summary],
+    { sourceReplay: 'immutable_provenance' });
+  assert.deepEqual(await replay(), [{ ...fixture.original, messageRole: null }]);
+  assert.equal(segmentReads.get('nested-summary'), 1, 'recursive body and provenance reuse the same ContextSegment');
+  assert.equal(segmentReads.get('summary'), 1, 'caller-supplied summaries still prove their registered identity');
+  assert.equal(segmentReads.get('original'), 1);
+  nestedBlock.summary_object_id = 'wrong-summary-object';
+  await assert.rejects(replay(), error => error.code === 'MODEL_CONTEXT_NATIVE_SOURCE_INVALID');
+  assert.equal(segmentReads.get('nested-summary'), 2, 'a new replay reads fresh evidence and still refuses mismatched content');
+});
+
 test('source expansion refuses missing, cyclic, non-contiguous and oversized immutable provenance', async () => {
   for (const alter of [
     fixture => { fixture.domains.CompressionBlockSource = []; },

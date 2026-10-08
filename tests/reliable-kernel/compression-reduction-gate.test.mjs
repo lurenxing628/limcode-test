@@ -205,7 +205,29 @@ test('small threshold dominated by fixed overhead still compresses a Context tha
     assert.ok(level.estimatedTokens <= fixedTokens + 400, `fixture Context ${level.estimatedTokens} is too large`);
 
     let dispatches = 0;
-    const result = await summaryCoordinator(app, 'FIXED-DOMINATED-SUMMARY', () => { dispatches += 1; }).coordinate({
+    let evaluations = 0;
+    const coordinator = summaryCoordinator(app, 'FIXED-DOMINATED-SUMMARY', () => { dispatches += 1; });
+    const evaluate = coordinator.compression.evaluate.bind(coordinator.compression);
+    coordinator.compression.evaluate = async (...args) => { evaluations += 1; return evaluate(...args); };
+    const create = coordinator.compression.create.bind(coordinator.compression);
+    coordinator.compression.create = async command => {
+      const structural = app.database.materializeContext;
+      const content = app.database.materializeContextContent;
+      let structuralReads = 0;
+      let contentReads = 0;
+      app.database.materializeContext = async (...args) => { structuralReads += 1; return structural.apply(app.database, args); };
+      app.database.materializeContextContent = async (...args) => { contentReads += 1; return content.apply(app.database, args); };
+      try {
+        const committed = await create(command);
+        assert.equal(structuralReads, 0, 'compression creation must not repeat the content snapshot\'s structural walk');
+        assert.equal(contentReads, 1, 'compression structure and content share one worker snapshot');
+        return committed;
+      } finally {
+        app.database.materializeContext = structural;
+        app.database.materializeContextContent = content;
+      }
+    };
+    const result = await coordinator.coordinate({
       turnId: seeded.turnId,
       authoritySnapshotId: seeded.authoritySnapshotId,
       headRootId: head,
@@ -214,8 +236,45 @@ test('small threshold dominated by fixed overhead still compresses a Context tha
     });
     assert.equal(result.status, 'compressed', JSON.stringify(result));
     assert.equal(dispatches, 1);
+    assert.equal(evaluations, 1, 'one automatic attempt estimates the current Context once');
     const after = await app.compression.evaluate(await app.context.currentHeadRootId(seeded.conversationId), seeded.authoritySnapshotId);
     assert.ok(after.estimatedTokens < level.estimatedTokens);
+  });
+});
+
+test('below-threshold coordination reads its frozen authority and settings once before skipping detailed budget validation', async () => {
+  await withTurn('compression-below-threshold-prepared', 100_000, async (app, seeded) => {
+    const settings = await app.contentStore.ingest(app.database, '{}', 'application/vnd.limcode.model-request-settings+json');
+    const headRootId = await app.context.currentHeadRootId(seeded.conversationId);
+    const coordinator = summaryCoordinator(app, 'unused', () => assert.fail('below-threshold work must not dispatch'));
+    const snapshot = app.database.snapshot;
+    const read = app.contentStore.read;
+    const evaluate = coordinator.compression.evaluate.bind(coordinator.compression);
+    let authorityReads = 0;
+    let settingsReads = 0;
+    let evaluations = 0;
+    app.database.snapshot = async (queries, ...args) => {
+      authorityReads += queries.filter(query => query.kind === 'get' && query.domain === 'AuthoritySnapshot').length;
+      return snapshot.call(app.database, queries, ...args);
+    };
+    app.contentStore.read = async (metadata, ...args) => {
+      if (metadata.id === settings.id) settingsReads += 1;
+      return read.call(app.contentStore, metadata, ...args);
+    };
+    coordinator.compression.evaluate = async (...args) => { evaluations += 1; return evaluate(...args); };
+    const command = { ...seeded, headRootId, trigger: 'auto', settingsSnapshotContentObjectId: settings.id, requestBudget: {} };
+    try {
+      const result = await coordinator.coordinate(command);
+      assert.equal(result.reason, 'below_threshold');
+      assert.equal(evaluations, 1);
+      assert.equal(authorityReads, 1, 'coordination and estimation reuse the same immutable authority');
+      assert.equal(settingsReads, 1, 'effective settings are parsed once within coordination');
+      await assert.rejects(coordinator.coordinate({ ...command, requestBudget: undefined }), /Automatic compression requires/);
+      assert.equal(evaluations, 1, 'missing automatic budget is still rejected before estimation');
+    } finally {
+      app.database.snapshot = snapshot;
+      app.contentStore.read = read;
+    }
   });
 });
 
@@ -597,14 +656,19 @@ test('restored transient connection interruption still advances the configured c
           contents: [{ role: 'model', parts: [{ text: 'Fallback summary' }] }] } });
       } }; }
     });
+    let evaluations = 0;
+    const evaluate = coordinator.compression.evaluate.bind(coordinator.compression);
+    coordinator.compression.evaluate = async (...args) => { evaluations += 1; return evaluate(...args); };
     const command = { turnId: seeded.turnId, authoritySnapshotId: seeded.authoritySnapshotId, headRootId,
       trigger: 'auto', requestBudget: requestBudget(1, 0, level.estimatedTokens) };
     const first = await coordinator.coordinate(command);
     assert.equal(first.status, 'compressed');
     assert.deepEqual(sent, ['llm_summary', 'deterministic_summary']);
+    assert.equal(evaluations, 2, 'fallback must take its own fresh Context and attachment estimate');
     const replay = await coordinator.coordinate(command);
     assert.equal(replay.status, 'compressed');
     assert.equal(replay.result.rootId, first.result.rootId);
+    assert.equal(evaluations, 4, 'a new coordination call must not reuse prior estimates');
     assert.deepEqual(sent, ['llm_summary', 'deterministic_summary'], 'restored interrupted metadata must not block the fallback or resend');
   }, { fallbacks: ['deterministic_summary'] });
 });

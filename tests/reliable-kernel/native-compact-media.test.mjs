@@ -25,7 +25,7 @@ test('Native Compact validates multi-megabyte canonical media without RegExp sta
   assert.equal(prepared[0].parts[0].inlineData.sizeBytes, bytes.byteLength);
 });
 
-test('Native Compact resolves one repeated managed attachment only once per request', async () => {
+test('Native Compact resolves and validates one repeated managed attachment only once per request', async (t) => {
   const reference = {
     inlineData: {
       attachmentId: 'attachment-native-repeat',
@@ -36,6 +36,13 @@ test('Native Compact resolves one repeated managed attachment only once per requ
     }
   };
   let resolveCalls = 0;
+  const from = Buffer.from;
+  let decodes = 0;
+  Buffer.from = function (value, ...args) {
+    if (value === 'Zg==' && args[0] === 'base64') decodes += 1;
+    return from.call(this, value, ...args);
+  };
+  t.after(() => { Buffer.from = from; });
   const prepared = await prepareNativeCompactContentsMultimodal([
     { role: 'user', parts: [structuredClone(reference)] },
     { role: 'user', parts: [structuredClone(reference)] }
@@ -50,6 +57,7 @@ test('Native Compact resolves one repeated managed attachment only once per requ
   });
 
   assert.equal(resolveCalls, 1);
+  assert.equal(decodes, 1);
   assert.equal(prepared[0].parts[0].inlineData.data, 'Zg==');
   assert.equal(prepared[1].parts[0].inlineData.data, 'Zg==');
   assert.notEqual(prepared[0].parts[0].inlineData, prepared[1].parts[0].inlineData);

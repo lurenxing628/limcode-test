@@ -40,7 +40,7 @@ import {
 } from './contextSequence';
 import { EffectControlPlane } from './effectControlPlane';
 import { isExecutionHandoffError } from './executionLeaseFence';
-import { frozenCompressionPolicy, frozenContextProfile } from './frozenAuthority';
+import { frozenCompressionPolicy, frozenContextProfile, type FrozenCompressionPolicy, type FrozenTurnAuthority } from './frozenAuthority';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
 import {
   evaluateNativeCompressionGuard,
@@ -280,20 +280,12 @@ export class ReliableContextCompressionCoordinator {
       .update(JSON.stringify([turnId, command.headRootId, settingsSnapshotContentObjectId, command.sourceReplay ?? null,
         ...(command.providerContextOverflowRequestId ? [command.providerContextOverflowRequestId] : [])])).digest('hex')}`;
     const attemptCommand: CoordinateCompressionCommand = { ...command, settingsSnapshotContentObjectId };
-    if (command.trigger === 'auto' && !command.providerContextOverflowRequestId) {
-      const evaluated = await this.compression.evaluate(command.headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
-      if (!evaluated.shouldCompress) return {
-        status: 'skipped', reason: 'below_threshold', estimatedTokens: evaluated.estimatedTokens,
-        thresholdTokens: evaluated.thresholdTokens
-      };
-    }
-
     for (let index = 0; index < policy.executionPlan.attempts.length; index += 1) {
       const attempt = policy.executionPlan.attempts[index]!;
       attemptedMethods.push(attempt.methodKind);
       let result: CoordinateCompressionResult;
       try {
-        result = await this.coordinateAttempt(attemptCommand, attempt, { groupId, failures: [...failures] });
+        result = await this.coordinateAttempt(attemptCommand, attempt, { groupId, failures: [...failures] }, { frozen, policy });
       } catch (error) {
         if (isExecutionHandoffError(error)) throw error;
         if (!(error instanceof CompressionProviderAttemptError) || !compressionAttemptMayFallback(error)) {
@@ -589,37 +581,26 @@ export class ReliableContextCompressionCoordinator {
   private async coordinateAttempt(
     command: CoordinateCompressionCommand,
     attempt: CompressionExecutionAttempt,
-    recovery: { groupId: string; failures: CompressionAttemptFailure[] }
+    recovery: { groupId: string; failures: CompressionAttemptFailure[] },
+    prepared: { frozen: FrozenTurnAuthority; policy: FrozenCompressionPolicy }
   ): Promise<CoordinateCompressionResult> {
     const turnId = requireId(command.turnId, 'turnId');
     const authoritySnapshotId = requireId(command.authoritySnapshotId, 'authoritySnapshotId');
     const headRootId = requireId(command.headRootId, 'headRootId');
     const trigger = requireTrigger(command.trigger);
-    const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId
-      ?? (command.providerContextOverflowRequestId ? undefined : await this.modelProvider.freezeRequestSettings(turnId, authoritySnapshotId));
-    const frozen = await readRequestTurnAuthority(
-      this.database, this.contentStore, authoritySnapshotId, turnId, settingsSnapshotContentObjectId
-    );
-    const basePolicy = frozenCompressionPolicy(frozen.document);
-    if (!basePolicy || basePolicy.methodKind === 'disabled') return { status: 'skipped', reason: 'disabled' };
-    if (!basePolicy.executionPlan.attempts.some((candidate) =>
-      candidate.methodKind === attempt.methodKind && candidate.nativeKind === attempt.nativeKind
-    )) {
-      throw new Error(`Compression attempt ${attempt.methodKind} is not part of the frozen execution plan.`);
-    }
+    const settingsSnapshotContentObjectId = command.settingsSnapshotContentObjectId;
+    // The caller selects this attempt from the same frozen policy and owns its effective settings.
+    const { frozen, policy: basePolicy } = prepared;
     const policy = { ...basePolicy, methodKind: attempt.methodKind };
     const strictAutomaticSummary = trigger === 'auto' && isStrictSingleSummaryPlan(basePolicy.executionPlan);
-    if (trigger === 'auto' && policy.triggerMode !== 'token_threshold') {
-      return { status: 'skipped', reason: 'manual_only' };
-    }
-    if (trigger === 'auto' && !command.requestBudget) {
-      throw new TypeError('Automatic compression requires the exact frozen ordinary request budget.');
-    }
-    const requestBudget = command.requestBudget
+    const resolveRequestBudget = (): FullRequestPlanningBudget => command.requestBudget
       ? requireFullRequestPlanningBudget(command.requestBudget, policy.thresholdTokens)
       : manualRequestPlanningBudget(frozen.document, policy.thresholdTokens);
-    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId);
-    if (trigger === 'auto' && !command.providerContextOverflowRequestId && !decision.shouldCompress) {
+    const usesConfiguredThreshold = trigger === 'auto' && !command.providerContextOverflowRequestId;
+    // Preserve the ordinary below-threshold short circuit before validating the detailed budget.
+    const preparedBudget = usesConfiguredThreshold ? undefined : resolveRequestBudget();
+    const decision = await this.compression.evaluate(headRootId, authoritySnapshotId, settingsSnapshotContentObjectId, frozen);
+    if (usesConfiguredThreshold && !decision.shouldCompress) {
       return {
         status: 'skipped',
         reason: 'below_threshold',
@@ -627,7 +608,8 @@ export class ReliableContextCompressionCoordinator {
         thresholdTokens: decision.thresholdTokens
       };
     }
-    if (trigger === 'auto' && !command.providerContextOverflowRequestId && requestBudget.fixedOverPolicy) {
+    const requestBudget = preparedBudget ?? resolveRequestBudget();
+    if (usesConfiguredThreshold && requestBudget.fixedOverPolicy) {
       return {
         status: 'skipped',
         reason: 'fixed_over_policy',
@@ -873,7 +855,7 @@ export class ReliableContextCompressionCoordinator {
         const recipe = normalizePlainJson({
           kind: 'reliable-context-compression', compressionMethodKind: policy.methodKind,
           compressionConfigId: policy.config.id, blockId: 'automatic-capacity-planning',
-          sourceRootId: headRootId, sourceSegmentCount: count, sourceHash: hashSource(materialized.records.slice(0, count)),
+          sourceRootId: headRootId, sourceSegmentCount: count,
           attachmentCatalogState: attachmentState, modelHandleCatalog: catalog,
           ...(observationProfile ? { attachmentObservationProfileSha256: observationProfile,
             attachmentObservationRequirements: observationRequirements } : {}),

@@ -67,7 +67,7 @@ export interface OpenAIResponsesWebSocketLaneLease {
     frame: Record<string, unknown>,
     timeoutMs: number,
     signal?: AbortSignal
-  ): Promise<{ responseCreateSeq?: number }>;
+  ): Promise<{ responseCreateSeq?: number; frameBytes: number }>;
   /** Routed wire events for this lease; ends on release, fails on connection loss. */
   events(): AsyncIterable<Record<string, unknown>>;
   /** True while the owning connection is open and usable for a continuation commit. */
@@ -262,7 +262,7 @@ class MultiplexedLaneLease implements OpenAIResponsesWebSocketLaneLease {
     frame: Record<string, unknown>,
     timeoutMs: number,
     signal?: AbortSignal
-  ): Promise<{ responseCreateSeq?: number }> {
+  ): Promise<{ responseCreateSeq?: number; frameBytes: number }> {
     if (this.released) throw new Error('OpenAI Responses WebSocket lane lease is released.');
     const connection = this.lane.connection;
     const socket = connection.socket;
@@ -286,7 +286,7 @@ class MultiplexedLaneLease implements OpenAIResponsesWebSocketLaneLease {
       }
     }));
     await sendWithDeadline(socket, payloadText, timeoutMs, signal);
-    return responseCreateSeq !== undefined ? { responseCreateSeq } : {};
+    return { frameBytes: Buffer.byteLength(payloadText, 'utf8'), ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {}) };
   }
 
   public events(): AsyncIterable<Record<string, unknown>> {

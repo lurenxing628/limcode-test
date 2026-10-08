@@ -31,7 +31,8 @@ import {
 import { RuntimeDatabase } from './runtimeDatabase';
 import {
   frozenContextProfile,
-  type FrozenContextProfile
+  type FrozenContextProfile,
+  type FrozenTurnAuthority
 } from './frozenAuthority';
 import { readRequestTurnAuthority } from './requestCompressionSettings';
 
@@ -173,11 +174,18 @@ export class ContextCompressionControlPlane {
     this.tokenEstimator = new ReliableContextTokenEstimator(database, contentStore);
   }
 
-  public async evaluate(rootIdInput: string, authoritySnapshotIdInput: string, settingsSnapshotContentObjectId?: string): Promise<CompressionDecision> {
+  public async evaluate(rootIdInput: string, authoritySnapshotIdInput: string, settingsSnapshotContentObjectId?: string,
+    preparedAuthority?: FrozenTurnAuthority): Promise<CompressionDecision> {
     const rootId = requireId(rootIdInput, 'rootId');
     const authoritySnapshotId = requireId(authoritySnapshotIdInput, 'authoritySnapshotId');
+    if (preparedAuthority && preparedAuthority.snapshot.id !== authoritySnapshotId) {
+      throw new Error('Prepared compression authority differs from the selected AuthoritySnapshot.');
+    }
+    // Reuse immutable authority within one coordination call; Context and attachment facts stay fresh.
     const [frozen, estimate] = await Promise.all([
-      this.readFrozenProfile(authoritySnapshotId, settingsSnapshotContentObjectId),
+      preparedAuthority ? {
+        profile: frozenContextProfile(preparedAuthority.document), conversationId: preparedAuthority.conversationId
+      } : this.readFrozenProfile(authoritySnapshotId, settingsSnapshotContentObjectId),
       this.tokenEstimator.estimateRoot(rootId)
     ]);
     if (frozen.conversationId !== estimate.conversationId) {
@@ -237,10 +245,8 @@ export class ContextCompressionControlPlane {
         }))
       });
     }
-    const [materialized, semanticMaterialized] = await Promise.all([
-      this.context.materializeStructure(headRootId),
-      this.context.materialize(headRootId)
-    ]);
+    const { structure: materialized, content: semanticMaterialized } =
+      await this.context.materializeWithStructure(headRootId);
     if (materialized.root.conversation_id !== conversationId) {
       throw new Error(`ContextSequenceRoot ${headRootId} belongs to another Conversation.`);
     }
@@ -456,10 +462,8 @@ export class ContextCompressionControlPlane {
       });
     }
     if (previousBlock.status !== 'enabled') throw new Error('Only an enabled CompressionBlock can be replaced.');
-    const [current, semanticCurrent] = await Promise.all([
-      this.context.materializeStructure(expectedHeadRootId),
-      this.context.materialize(expectedHeadRootId)
-    ]);
+    const { structure: current, content: semanticCurrent } =
+      await this.context.materializeWithStructure(expectedHeadRootId);
     if (current.root.conversation_id !== conversationId) throw new Error('Expected Context head belongs to another Conversation.');
     if (current.records[0]?.segment.segment_kind !== 'compression') {
       throw new Error('Current Context root is not a compression root.');

@@ -255,8 +255,8 @@ export function claudeTurnScopedRemindersFallenBackForModel(providerConfigId: st
 }
 
 /**
- * 在 provider 的“编码 + requestBody 合并”之后挂一个后处理器。chat、chatStream、dryRun（含 WebSocket
- * 路径取帧用的 dryRun）都经过这一步，因此适配同时作用于真实请求与 dry-run 展示。
+ * 在 provider 的“编码 + requestBody 合并”之后挂一个后处理器。HTTP、WebSocket 请求准备与
+ * dryRun 都经过同一个 SDK builder，适配同时作用于真实请求与展示。
  */
 export function installEncodedRequestPostProcessor<T>(provider: T, postProcess: EncodedProviderRequestPostProcessor): T {
   const runtime = provider as T & {
@@ -284,6 +284,41 @@ export function installEncodedRequestPostProcessor<T>(provider: T, postProcess: 
   };
   runtime.__limcodeEncodedRequestPostProcessor = true;
   return provider;
+}
+
+/** 固定 SDK 的请求编码接缝；生产发送只消费 wire 字段，不生成展示用正文和 curl。 */
+export function prepareEncodedProviderRequest(
+  provider: unknown,
+  request: unknown,
+  options: { inputFormat?: string; outputFormat?: string },
+  stream: boolean
+): { url: string; headers: Record<string, string>; body: unknown } {
+  const runtime = provider as {
+    buildProviderRequest?: (request: unknown, options: unknown, stream: boolean) => {
+      url: string; headers: Record<string, string>; body: unknown;
+    };
+  };
+  if (typeof runtime.buildProviderRequest !== 'function') {
+    throw new Error('当前模型接入库缺少请求编码入口。');
+  }
+  return runtime.buildProviderRequest(request, options, stream);
+}
+
+/** 原生 compact 沿 SDK 的 compact 编码入口，同样只准备实际发送字段。 */
+export function prepareEncodedCompactProviderRequest(
+  provider: unknown,
+  request: unknown,
+  options: { inputFormat?: string; outputFormat?: string; requestBody?: Record<string, unknown> }
+): { url: string; headers: Record<string, string>; body: unknown } {
+  const runtime = provider as {
+    buildCompactProviderRequest?: (request: unknown, options: unknown) => {
+      url: string; headers: Record<string, string>; body: unknown;
+    };
+  };
+  if (typeof runtime.buildCompactProviderRequest !== 'function') {
+    throw new Error('当前模型接入库缺少原生压缩请求编码入口。');
+  }
+  return runtime.buildCompactProviderRequest(request, options);
 }
 
 /**

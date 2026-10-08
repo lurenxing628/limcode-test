@@ -221,6 +221,65 @@ function llmCapability(start) {
   };
 }
 
+test('one dispatch reuses its frozen recipe across retries and rejects another control plane preparation', async () => {
+  await withApp('provider-prepared-recipe', async (app, conversationId, turnId) => {
+    const created = await createRequest(app, conversationId, turnId, 'prepared-recipe');
+    const row = await get(app, 'ModelRequest', created.modelRequestId);
+    const provider = controlPlane(app);
+    const other = controlPlane(app);
+    const foreign = await other.readModelRequestRecipe(row);
+    await assert.rejects(provider.buildFullRequest(created.modelRequestId, '1', '1', foreign), /registered request identity/);
+    const read = app.contentStore.read;
+    let recipeReads = 0;
+    app.contentStore.read = function(metadata) {
+      if (metadata.id === row.recipe_object_id) recipeReads += 1;
+      return read.call(this, metadata);
+    };
+    let attempts = 0;
+    try {
+      const preparedRecipe = await provider.readModelRequestRecipe(row);
+      assert.equal(Object.isFrozen(preparedRecipe.recipe), true);
+      const result = await provider.dispatch(created.modelRequestId, {
+        providerId: 'provider-watchdog',
+        async sendFullRequest(fullRequest, controls) {
+          attempts += 1;
+          assert.equal(fullRequest.recipe, preparedRecipe.recipe);
+          if (attempts === 1) throw new kernel.ProviderTransientError('connection_interrupted', 'offline retry fixture');
+          await controls.onEvent({ kind: 'completed', streamSeq: '1', content: modelContent('prepared recipe completed') });
+        }
+      }, { preparedRecipe });
+      assert.equal(result.terminalState, 'completed');
+      assert.equal(attempts, 2);
+      assert.equal(recipeReads, 1);
+    } finally {
+      app.contentStore.read = read;
+    }
+  }, 'openai-compatible', { enabled: true, maxRetries: 1 });
+});
+
+test('compression dispatch sends the prepared payload without running a second estimator projection', async () => {
+  await withApp('provider-prepared-compression', async (app, conversationId, turnId) => {
+    const created = await createRequest(app, conversationId, turnId, 'prepared-compression', true);
+    const capability = llmCapability(() => { throw new Error('ordinary start must not run'); });
+    let sends = 0;
+    capability.compact = (request, emit) => {
+      sends += 1;
+      emit({ type: 'llm:compactDone', payload: { requestId: request.id, result: {
+        id: 'prepared-summary', contents: [{ role: 'user', parts: [{ text: 'prepared summary' }] }]
+      } } });
+    };
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', capability);
+    let preparations = 0;
+    const prepare = adapter.prepareFullRequest;
+    adapter.prepareFullRequest = function(request) { preparations += 1; return prepare.call(this, request); };
+    adapter.estimateFullRequestInput = () => { throw new Error('duplicate compact projection'); };
+    const result = await controlPlane(app).dispatch(created.modelRequestId, adapter);
+    assert.equal(result.terminalState, 'completed');
+    assert.equal(preparations, 1);
+    assert.equal(sends, 1);
+  }, 'openai-compatible', { enabled: false, maxRetries: 0 }, true);
+});
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

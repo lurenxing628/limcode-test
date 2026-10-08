@@ -104,7 +104,7 @@ f0751b3的健康clear能凭本地submitted操作和缺少profile完成；本次�
 | 74e059b | 仅新增测试，生产源码/编译closure仍与f0751b3相同；14项2绿12红：六目标渠道+真实延迟clear回执operation缺失、5项结构防御无法拒绝；旧session/authority迟到fence原已通过 |
 | 8d090cb | 共同构造点统一operation/expectedRevision/profileState，前端严格核对；compile/typecheck及clear定向15/15通过；后续最终统一验收另记完整SHA |
 
-最终候选的构建SHA、完整命令与通过/失败计数见交付记录。每轮先固定干净提交再构建，`dist/build-provenance.json` 与 `dist/extension/reliable-kernel-compile-provenance.json` 必须匹配；不同SHA的结果不得混成一次通过。
+最终候选的构建SHA、完整命令与通过/失败计数见交付记录。每轮先固定干净提交再构建，`dist/build-provenance.json` 与 `dist/extension/compile-build-id.json` 的 buildId 必须匹配；不同构建的结果不得混成一次通过。
 
 最终复验约定（PowerShell，cwd为本feature独立副本；Node v23.11.0 / npm 10.9.2 / win32；锁文件依赖，不使用其他副本dist）：
 

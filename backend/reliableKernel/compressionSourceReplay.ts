@@ -57,7 +57,7 @@ export async function prepareTextCompressionSources(
   if (!input.some(shouldExpand)) return { items: [...input], sourceEndOffsets: input.map((_, index) => index + 1) };
   const sourceEndOffsets: number[] = [];
   const output: FullProviderContextItem[] = [];
-  const cache = new Map<string, { item: FullProviderContextItem; bytes: number }>();
+  const cache = new Map<string, { item: FullProviderContextItem; contentObjectId: string; bytes: number }>();
   let cacheBytes = 0;
   let visits = 0;
   let bytes = 0;
@@ -74,6 +74,7 @@ export async function prepareTextCompressionSources(
     const { ancestors } = frame;
     if (++visits > MAX_REPLAY_SEGMENTS) throw limited('segments', '压缩来源超过重建数量上限。');
     let item: FullProviderContextItem;
+    let contentObjectId: string | undefined;
     if ('item' in frame) item = frame.item;
     else {
       const cached = cache.get(frame.segmentId);
@@ -81,9 +82,11 @@ export async function prepareTextCompressionSources(
         cache.delete(frame.segmentId);
         cache.set(frame.segmentId, cached);
         item = cached.item;
+        contentObjectId = cached.contentObjectId;
       } else {
         const segment = await get(database, 'ContextSegment', frame.segmentId);
-        const metadata = await get(database, 'ContentObject', id(segment.content_object_id));
+        contentObjectId = id(segment.content_object_id);
+        const metadata = await get(database, 'ContentObject', contentObjectId);
         if (Number(metadata.byte_length) > MAX_REPLAY_BYTES - bytes) throw limited('bytes', '历史内容超过重建字节上限。');
         const content = (await store.read(metadata as unknown as ContentObjectMetadata)).toString('utf8');
         let role: string | null = null;
@@ -103,7 +106,7 @@ export async function prepareTextCompressionSources(
             cacheBytes -= cache.get(oldest)!.bytes;
             cache.delete(oldest);
           }
-          cache.set(frame.segmentId, { item, bytes: contentBytes });
+          cache.set(frame.segmentId, { item, contentObjectId, bytes: contentBytes });
           cacheBytes += contentBytes;
         }
       }
@@ -123,7 +126,9 @@ export async function prepareTextCompressionSources(
       throw invalid('原生压缩状态缺少本对话唯一的历史来源。');
     }
     const blockId = id(block.id);
-    if (block.summary_object_id !== (await get(database, 'ContextSegment', item.segmentId)).content_object_id) {
+    // Recursive items already carry the immutable segment identity read for their body above.
+    contentObjectId ??= id((await get(database, 'ContextSegment', item.segmentId)).content_object_id);
+    if (block.summary_object_id !== contentObjectId) {
       throw invalid('压缩摘要与不可变来源的内容身份不一致。');
     }
     const originals = (await database.snapshotAll(DOMAIN_REPOSITORIES.domain('CompressionBlockSource').list({

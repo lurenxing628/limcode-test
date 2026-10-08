@@ -233,10 +233,11 @@ interface AttachmentResolutionCacheEntry {
 
 export interface MultimodalPreparationContext {
   attachmentResolutions: Map<string, AttachmentResolutionCacheEntry>;
+  canonicalMediaSizes: Map<string, number>;
 }
 
 export function createMultimodalPreparationContext(): MultimodalPreparationContext {
-  return { attachmentResolutions: new Map<string, AttachmentResolutionCacheEntry>() };
+  return { attachmentResolutions: new Map<string, AttachmentResolutionCacheEntry>(), canonicalMediaSizes: new Map() };
 }
 
 async function prepareLlmContentMultimodal(
@@ -289,7 +290,7 @@ export async function prepareInlineDataForLlm(
     return attachmentPlaceholderPart(part, '附件类型不在工具响应白名单中');
   }
   if (part.inlineData.data) {
-    if (mode === 'native_compact') requireCanonicalInlineDataSize(part, 'Native Compact media');
+    if (mode === 'native_compact') requireCanonicalInlineDataSize(part, 'Native Compact media', preparation);
     return toolResponse && !isSupportedToolResponseInlineData(part)
       ? attachmentPlaceholderPart(part, '附件类型不在工具响应白名单中')
       : part;
@@ -306,7 +307,7 @@ export async function prepareInlineDataForLlm(
     resolved = undefined;
   }
   if (resolved?.inlineData.data) {
-    if (mode === 'native_compact') requireCanonicalInlineDataSize(resolved, 'Resolved Native Compact media');
+    if (mode === 'native_compact') requireCanonicalInlineDataSize(resolved, 'Resolved Native Compact media', preparation);
     return toolResponse && !isSupportedToolResponseInlineData(resolved)
       ? attachmentPlaceholderPart(resolved, '附件类型不在工具响应白名单中')
       : resolved;
@@ -378,24 +379,27 @@ export class LlmNativeCompactMediaError extends Error {
   }
 }
 
-export function requireCanonicalInlineDataSize(part: InlineDataPart, label: string): number {
+export function requireCanonicalInlineDataSize(part: InlineDataPart, label: string, preparation?: MultimodalPreparationContext): number {
   const data = part.inlineData.data;
   if (!data) {
     throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
   }
-  let bytes: Buffer;
-  try {
-    bytes = decodeCanonicalBase64(data);
-  } catch {
-    throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
+  let byteLength = preparation?.canonicalMediaSizes.get(data);
+  if (byteLength === undefined) {
+    try {
+      byteLength = decodeCanonicalBase64(data).byteLength;
+    } catch {
+      throw new LlmNativeCompactMediaError(mediaReferenceLabel(part), `${label} is not canonical base64`);
+    }
+    preparation?.canonicalMediaSizes.set(data, byteLength);
   }
-  if (part.inlineData.sizeBytes !== undefined && part.inlineData.sizeBytes !== bytes.byteLength) {
+  if (part.inlineData.sizeBytes !== undefined && part.inlineData.sizeBytes !== byteLength) {
     throw new LlmNativeCompactMediaError(
       mediaReferenceLabel(part),
-      `${label} declared ${part.inlineData.sizeBytes} bytes but resolved ${bytes.byteLength}`
+      `${label} declared ${part.inlineData.sizeBytes} bytes but resolved ${byteLength}`
     );
   }
-  return bytes.byteLength;
+  return byteLength;
 }
 
 export function mediaReferenceLabel(part: InlineDataPart): string {

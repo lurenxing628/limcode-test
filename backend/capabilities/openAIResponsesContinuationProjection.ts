@@ -696,7 +696,7 @@ function sameTerminalItem(left: Record<string, unknown>, right: Record<string, u
 }
 
 function terminalComparable(value: Record<string, unknown>): Record<string, unknown> {
-  const result = cloneJson(value);
+  const result = { ...value };
   delete result.id;
   delete result.status;
   delete result.encrypted_content;

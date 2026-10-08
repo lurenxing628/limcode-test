@@ -46,6 +46,7 @@ import type {
   FullProviderContextItem,
   FullProviderRequest,
   FullRequestProviderAdapter,
+  PreparedProviderRequest,
   ProviderDispatchControls,
   ProviderOutputStreamEvent,
   TurnReminderHistoryEntry
@@ -170,6 +171,28 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     return completeModelProjection(estimateOrdinaryRequestInputWork(request));
   }
 
+  public prepareFullRequest(request: FullProviderRequest): PreparedProviderRequest | undefined {
+    if (request.providerId !== this.providerId) {
+      throw new Error(`Provider request ${request.providerId} cannot use adapter ${this.providerId}.`);
+    }
+    if (!isCompressionRequest(request.recipe)) return undefined;
+    const compact = toLlmCompactRequest(request);
+    const breakdown = estimateCompactProjection(compact);
+    const modelRequestId = request.modelRequestId;
+    const debugContext = { conversationId: request.conversationId, modelRequestId,
+      attemptSeq: request.attemptSeq, socketGeneration: request.socketGeneration };
+    const pending = { request: compact as LlmCompactRequest | undefined };
+    return { breakdown, send: (controls) => {
+      const projected = pending.request;
+      pending.request = undefined;
+      if (!projected) throw new Error('Prepared compression request has already been transferred.');
+      return this.startCompressionRequest(projected, modelRequestId, {
+        attachmentObservationProfileSha256: projected.attachmentObservationProfileSha256,
+        attachmentObservationRequirements: projected.attachmentObservationRequirements
+      }, debugContext, controls);
+    } };
+  }
+
   /** Kernel-only opt-in; existing synchronous estimate API and its error timing stay unchanged. */
   public async estimateFullRequestInputAsync(
     request: FullProviderRequest, controls: ModelProjectionWorkControls = {}
@@ -185,8 +208,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     }
     const debugContext = { conversationId: request.conversationId, modelRequestId: request.modelRequestId, attemptSeq: request.attemptSeq, socketGeneration: request.socketGeneration };
     if (isCompressionRequest(request.recipe)) {
-      captureDebug(this.debugCapture, debugContext, () => ({ stage: 'scope.exit', metadata: { reason: '上下文压缩' } }));
-      return this.sendCompressionRequest(request, controls);
+      return this.sendCompressionRequest(request, debugContext, controls);
     }
     const llmRequest = toLlmStartRequest(request);
     if (this.debugCapture) setDebugCaptureContext(llmRequest, debugContext);
@@ -568,20 +590,23 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     });
   }
 
-  private sendCompressionRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void> {
+  private sendCompressionRequest(request: FullProviderRequest, debugContext: ProviderDebugContext,
+    controls: ProviderDispatchControls): Promise<void> {
     const compactRequest = toLlmCompactRequest(request);
     return this.startCompressionRequest(compactRequest, request.modelRequestId, {
       attachmentObservationProfileSha256: compactRequest.attachmentObservationProfileSha256,
       attachmentObservationRequirements: compactRequest.attachmentObservationRequirements
-    }, controls);
+    }, debugContext, controls);
   }
 
   private startCompressionRequest(
     compactRequest: LlmCompactRequest,
     modelRequestId: string,
     observationContract: CompactAttachmentObservationContract,
+    debugContext: ProviderDebugContext,
     controls: ProviderDispatchControls
   ): Promise<void> {
+    captureDebug(this.debugCapture, debugContext, () => ({ stage: 'scope.exit', metadata: { reason: '上下文压缩' } }));
     return new Promise<void>((resolve, reject) => {
       let terminal = false;
       let sequence = 0n;

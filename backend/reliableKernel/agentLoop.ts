@@ -66,6 +66,7 @@ import {
   NATIVE_CHAIN_REBASED_TERMINAL_STATE,
   PROVIDER_PARTIAL_OUTPUT_SNAPSHOT_TYPE,
   type FullRequestProviderAdapter,
+  type PreparedModelRequestRecipe,
   type ProviderDispatchControls,
   type ProviderTransientStreamEvent,
   type StreamEventResult
@@ -811,11 +812,12 @@ export class ReliableAgentLoop {
           }
           request = await this.requireExisting('ModelRequest', expectedModelRequestId);
         }
-        const modelRequestRecipe = await this.assertModelRequestRound(
+        const preparedModelRequestRecipe = await this.assertModelRequestRound(
           request,
           requestSequence,
           expectedModelRequestId
         );
+        const modelRequestRecipe = requireRecord(preparedModelRequestRecipe.recipe, 'ModelRequest recipe');
         includeOpenTaskCompletionCheck = false;
         if (recipeHasOpenTaskCompletionCheck(modelRequestRecipe)) {
           openTaskCompletionCheckConsumed = true;
@@ -841,7 +843,8 @@ export class ReliableAgentLoop {
               requireId(facts.turn.conversation_id, 'Turn.conversation_id'),
               turnId,
               modelRequestId,
-              request
+              request,
+              preparedModelRequestRecipe
             );
           } catch (error) {
             if (isExecutionHandoffError(error)) throw error;
@@ -2460,7 +2463,8 @@ export class ReliableAgentLoop {
     conversationId: string,
     turnId: string,
     modelRequestId: string,
-    request: DomainRow
+    request: DomainRow,
+    preparedRecipe: PreparedModelRequestRecipe
   ): Promise<NormalizedProviderOutput | typeof NATIVE_CHAIN_REBASED_TERMINAL_STATE> {
     const providerId = requireText(request.provider_id, 'ModelRequest.provider_id');
     const modelId = requireText(request.model_id, 'ModelRequest.model_id');
@@ -2468,7 +2472,7 @@ export class ReliableAgentLoop {
     const adapter = await this.providers.resolve(providerId);
     if (adapter.providerId !== providerId) throw new Error(`Provider registry returned ${adapter.providerId} for ${providerId}.`);
     const dispatchBarrier = await this.database.snapshot([]);
-    const recipe = await this.readModelRequestRecipe(modelRequestId);
+    const recipe = requireRecord(preparedRecipe.recipe, 'ModelRequest recipe');
     const nativeCapabilities = readFrozenNativeCapabilities(recipe);
     let session: NativeRequestSession | undefined;
     if (nativeCapabilities) {
@@ -2680,6 +2684,17 @@ export class ReliableAgentLoop {
     });
     const wrapped: FullRequestProviderAdapter = {
       providerId,
+      ...(adapter.prepareFullRequest ? {
+        prepareFullRequest: (fullRequest) => {
+          const prepared = adapter.prepareFullRequest!(fullRequest);
+          if (!prepared) return undefined;
+          const { attemptSeq, socketGeneration } = fullRequest;
+          return { breakdown: prepared.breakdown, send: (controls) => {
+            activeSession?.bindStream({ attemptSeq, socketGeneration });
+            return prepared.send(streamControls(attemptSeq, socketGeneration, controls));
+          } };
+        }
+      } : {}),
       ...(adapter.estimateFullRequestInput
         ? { estimateFullRequestInput: (fullRequest) => adapter.estimateFullRequestInput!(fullRequest) }
         : {}),
@@ -2708,6 +2723,7 @@ export class ReliableAgentLoop {
     let outcome: 'completed' | 'failed' | 'cancelled' | 'handoff' | 'rebase' = 'completed';
     try {
       await this.modelProvider.dispatch(modelRequestId, wrapped, {
+        preparedRecipe,
         ...(reconnect ? { reconnect: true } : {}),
         // A transient transport failure after durable chain progress must not start a new Attempt
         // that re-sends the frozen input: admitted tools would be issued again under new
@@ -3304,17 +3320,17 @@ export class ReliableAgentLoop {
     request: DomainRow,
     expected: bigint,
     expectedId: string
-  ): Promise<{ [key: string]: PlainJsonValue }> {
+  ): Promise<PreparedModelRequestRecipe> {
     if (request.id !== expectedId) throw new Error('ModelProvider returned an unexpected stable ModelRequest identity.');
-    const recipe = (await this.readModelRequestRecipes([request])).get(expectedId);
-    if (!recipe) throw new Error(`ModelRequest ${expectedId} recipe batch lost its request.`);
+    const prepared = await this.modelProvider.readModelRequestRecipe(request);
+    const recipe = requireRecord(prepared.recipe, 'ModelRequest recipe');
     const actual = requirePositiveInteger(recipe.round, 'ModelRequest recipe.round');
     if (recipe.kind !== 'reliable-agent-turn' || actual !== expected) {
       throw new Error(
         `ModelRequest ${expectedId} recipe round ${actual.toString()} does not match durable round ${expected.toString()}.`
       );
     }
-    return recipe;
+    return prepared;
   }
 
   private async readModelRequestRecipe(modelRequestId: string): Promise<{ [key: string]: PlainJsonValue }> {

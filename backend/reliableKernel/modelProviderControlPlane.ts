@@ -291,6 +291,8 @@ export interface FullRequestProviderAdapter {
   estimateFullRequestInput?(request: FullProviderRequest): ProjectedRequestTokenBreakdown;
   /** Optional cooperative ordinary preparation; synchronous callers keep their existing API. */
   estimateFullRequestInputAsync?(request: FullProviderRequest, controls?: ModelProjectionWorkControls): Promise<ProjectedRequestTokenBreakdown>;
+  /** One attempt's projected payload supplies both preflight and the actual send. */
+  prepareFullRequest?(request: FullProviderRequest): PreparedProviderRequest | undefined;
   sendFullRequestAsync?(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
   sendFullRequest(request: FullProviderRequest, controls: ProviderDispatchControls): Promise<void>;
   /**
@@ -301,6 +303,18 @@ export interface FullRequestProviderAdapter {
   materializeNativeToolOutput?(
     outputs: readonly OpenAIResponsesToolOutput[]
   ): Promise<readonly OpenAIResponsesToolOutput[]>;
+}
+
+export interface PreparedProviderRequest {
+  breakdown: ProjectedRequestTokenBreakdown;
+  send(controls: ProviderDispatchControls): Promise<void>;
+}
+
+/** A request-local, owned recipe read from this control plane's registered CAS object. */
+export interface PreparedModelRequestRecipe {
+  readonly modelRequestId: string;
+  readonly recipeObjectId: string;
+  readonly recipe: PlainJsonValue;
 }
 
 /** Only these scalar/policy facts survive an adapter's ownership of the request body. */
@@ -319,6 +333,7 @@ interface ProviderAttemptContinuation {
  */
 interface PreparedProviderAttempt {
   request: FullProviderRequest | undefined;
+  projectedRequest?: PreparedProviderRequest;
   continuation: ProviderAttemptContinuation;
 }
 
@@ -337,6 +352,7 @@ export class ModelRequestPreflightError extends Error {
 export interface ProviderDispatchOptions {
   signal?: AbortSignal;
   reconnect?: boolean;
+  preparedRecipe?: PreparedModelRequestRecipe;
   /** Last-resort adapter deadline; transport-specific watchdogs should normally fire first. */
   timeoutMs?: number;
   /** Memory-only terminal overlay, emitted only after the matching durable failure/cancel fact. */
@@ -618,6 +634,7 @@ export class ModelProviderControlPlane {
   private readonly cancelledPartialClosures = new WeakMap<AbortController, () => Promise<void>>();
   private readonly requestCancellations = new Map<string, Promise<ModelRequestCancelResult>>();
   private readonly activeDispatches = new Set<Promise<ProviderDispatchResult>>();
+  private readonly preparedRecipes = new WeakSet<PreparedModelRequestRecipe>();
   private readonly nativeSessions = new Map<string, NativeSteeringSessionHandle>();
   private readonly steeringListeners = new Set<(update: NativeSteeringUpdate) => void>();
   private readonly historicalTurnReminders = new HistoricalTurnReminderCache();
@@ -707,10 +724,9 @@ export class ModelProviderControlPlane {
       }
     }
     const frozen = await readFrozenTurnAuthority(this.database, this.contentStore, authoritySnapshotId, turnId);
-    const turn = await this.requireDomain('Turn', turnId);
     const snapshot = await this.resolveCurrentRequestSettings(
       frozen.document,
-      requireId(turn.conversation_id, 'Turn.conversation_id')
+      frozen.conversationId
     );
     if (snapshot === undefined) return undefined;
     const content = await this.contentStore.ingest(
@@ -736,10 +752,6 @@ export class ModelProviderControlPlane {
     const attemptId = stableId('model_request_attempt', modelRequestId, '1');
 
     const frozen = await this.readFrozenAuthority(authoritySnapshotId, turnId, settingsSnapshotContentObjectId ?? undefined);
-    if (settingsSnapshotContentObjectId) {
-      const settingsRow = await this.requireDomain('ContentObject', settingsSnapshotContentObjectId);
-      parsePlainJson(await this.contentStore.read(asContentObjectMetadata(settingsRow)), 'ModelRequest settings snapshot');
-    }
     const compressionRequest = isCompressionRecipe(recipe);
     const compressionPolicy = compressionRequest ? frozenCompressionPolicy(frozen.document) : undefined;
     if (compressionRequest && !compressionPolicy) {
@@ -895,12 +907,19 @@ export class ModelProviderControlPlane {
   private async buildFullRequest(
     modelRequestIdInput: string,
     attemptSeqInput: string | bigint,
-    socketGenerationInput: string | bigint
+    socketGenerationInput: string | bigint,
+    preparedRecipe?: PreparedModelRequestRecipe
   ): Promise<FullProviderRequest> {
     const modelRequestId = requireId(modelRequestIdInput, 'modelRequestId');
     const attemptSeq = decimalBigInt(attemptSeqInput, 'attemptSeq');
     const socketGeneration = decimalBigInt(socketGenerationInput, 'socketGeneration');
     const request = await this.requireDomain('ModelRequest', modelRequestId);
+    const loadedRecipe = preparedRecipe ?? await this.readModelRequestRecipe(request);
+    if (!this.preparedRecipes.has(loadedRecipe)
+      || loadedRecipe.modelRequestId !== modelRequestId
+      || loadedRecipe.recipeObjectId !== request.recipe_object_id) {
+      throw new Error('Prepared ModelRequest recipe differs from its registered request identity.');
+    }
     // Fork copies retain the owner relation under a copy-derived row id. The unique owner index
     // identifies both original and copied projections without assuming their creation-time id.
     const projections = rows((await this.database.snapshot([DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
@@ -914,9 +933,6 @@ export class ModelProviderControlPlane {
       requireId(request.authority_snapshot_id, 'ModelRequest.authority_snapshot_id'),
       requireId(request.turn_id, 'ModelRequest.turn_id')
     );
-    const recipeContent = await this.requireDomain(
-      'ContentObject', requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id')
-    );
     const settingsId = optionalId(request.settings_snapshot_object_id, 'ModelRequest.settings_snapshot_object_id');
     const settingsContent = settingsId ? await this.requireDomain('ContentObject', settingsId) : null;
     const materializeStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
@@ -929,10 +945,10 @@ export class ModelProviderControlPlane {
         durationMs: performance.now() - materializeStartedAt
       });
     }
-    const contentRows = [recipeContent, ...(settingsContent ? [settingsContent] : [])];
-    const bytes = await this.contentStore.readMany(contentRows.map(asContentObjectMetadata));
-    const recipe = parsePlainJson(bytes[0], 'ModelRequest recipe');
-    const settingsSnapshot = settingsContent ? parsePlainJson(bytes[1], 'ModelRequest settings snapshot') : undefined;
+    const recipe = loadedRecipe.recipe;
+    const settingsSnapshot = settingsContent
+      ? parsePlainJson(await this.contentStore.read(asContentObjectMetadata(settingsContent)), 'ModelRequest settings snapshot')
+      : undefined;
     const frozenAuthority = applyRequestCompressionSettings(frozen.document, settingsSnapshot);
     const contextConversationId = requireId(
       materialized.root.conversation_id,
@@ -1031,6 +1047,17 @@ export class ModelProviderControlPlane {
       ...conversationClaudeThinkingBinding(providerSegments),
       ...requestAddenda
     };
+  }
+
+  public async readModelRequestRecipe(request: DomainRow): Promise<PreparedModelRequestRecipe> {
+    const modelRequestId = requireId(request.id, 'ModelRequest.id');
+    const recipeObjectId = requireId(request.recipe_object_id, 'ModelRequest.recipe_object_id');
+    const metadata = await this.requireDomain('ContentObject', recipeObjectId);
+    const recipe = parsePlainJson(await this.contentStore.read(asContentObjectMetadata(metadata)), 'ModelRequest recipe');
+    freezeRecipeValue(recipe);
+    const prepared = Object.freeze({ modelRequestId, recipeObjectId, recipe });
+    this.preparedRecipes.add(prepared);
+    return prepared;
   }
 
   /** Explicit dry-run/replay; it reads only the immutable request projection and CAS objects. */
@@ -1347,6 +1374,7 @@ export class ModelProviderControlPlane {
     if (options.reconnect !== true && stats.socketGeneration !== '0') {
       throw new Error('ModelRequest was already dispatched; use reconnect explicitly.');
     }
+    const recipeRead = { recipe: options.preparedRecipe };
 
     let attemptSeq = decimalBigInt(stats.attemptSeq, 'ModelRequest attemptSeq');
     let retryPolicy: FrozenProviderRetryPolicy | undefined;
@@ -1401,7 +1429,7 @@ export class ModelProviderControlPlane {
       let prepared: PreparedProviderAttempt;
       try {
         prepared = await this.prepareProviderAttempt(request, modelRequestId, attemptSeq, expectedGeneration, adapter,
-          stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID', retryPolicy, options.signal);
+          stats.failure?.code === 'PROVIDER_MODEL_OUTPUT_INVALID', retryPolicy, options.signal, recipeRead);
         retryPolicy ??= prepared.continuation.retryPolicy;
       } catch (error) {
         if (isExecutionHandoffError(error)) throw error;
@@ -1751,14 +1779,17 @@ export class ModelProviderControlPlane {
     adapter: FullRequestProviderAdapter,
     repairOutput: boolean,
     retainedRetryPolicy: FrozenProviderRetryPolicy | undefined,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    recipeRead: { recipe?: PreparedModelRequestRecipe } = {}
   ): Promise<PreparedProviderAttempt> {
-    const fullRequest = await retryLocalExecution(() => {
+    const fullRequest = await retryLocalExecution(async () => {
       this.assertNotHandingOff();
-      return this.buildFullRequest(modelRequestId, attemptSeq, socketGeneration);
+      recipeRead.recipe ??= await this.readModelRequestRecipe(request);
+      return this.buildFullRequest(modelRequestId, attemptSeq, socketGeneration, recipeRead.recipe);
     }, { signal });
     if (repairOutput) fullRequest.modelOutputRepair = true;
-    this.assertRequestPreflight(request, fullRequest, adapter);
+    const projectedRequest = adapter.prepareFullRequest?.(fullRequest);
+    this.assertRequestPreflight(request, fullRequest, adapter, projectedRequest?.breakdown);
     // The first Attempt owns the frozen retry policy, as before. A reconnect/retry must not
     // acquire a second policy authority just because its request body is rebuilt.
     const retryPolicy = retainedRetryPolicy ?? retryPolicyForFullRequest(fullRequest);
@@ -1767,7 +1798,8 @@ export class ModelProviderControlPlane {
     try { priorNativeFailures = { kind: 'ready', value: nativePriorFailures(fullRequest) }; }
     catch (error) { priorNativeFailures = { kind: 'invalid', error }; }
     return {
-      request: fullRequest,
+      request: projectedRequest ? undefined : fullRequest,
+      ...(projectedRequest ? { projectedRequest } : {}),
       continuation: {
         retryPolicy,
         priorNativeFailures,
@@ -2727,7 +2759,8 @@ export class ModelProviderControlPlane {
   private assertRequestPreflight(
     request: DomainRow,
     fullRequest: FullProviderRequest,
-    adapter: FullRequestProviderAdapter
+    adapter: FullRequestProviderAdapter,
+    preparedBreakdown?: ProjectedRequestTokenBreakdown
   ): void {
     const compression = isCompressionRecipe(fullRequest.recipe)
       ? frozenCompressionPolicy(fullRequest.authoritySnapshot)
@@ -2741,7 +2774,7 @@ export class ModelProviderControlPlane {
       request.estimated_context_tokens,
       'ModelRequest.estimated_context_tokens'
     );
-    const breakdown = adapter.estimateFullRequestInput?.(fullRequest)
+    const breakdown = preparedBreakdown ?? adapter.estimateFullRequestInput?.(fullRequest)
       ?? fallbackRequestBreakdown(persistedEstimate);
     const result = preflightCompressionRequest({
       contextWindowTokens,
@@ -3279,6 +3312,9 @@ function startPreparedProviderAttempt(
   adapter: FullRequestProviderAdapter,
   controls: ProviderDispatchControls
 ): Promise<void> {
+  const projectedRequest = prepared.projectedRequest;
+  prepared.projectedRequest = undefined;
+  if (projectedRequest) return projectedRequest.send(controls);
   const request = prepared.request;
   if (!request) throw new Error('Prepared Provider attempt has already been transferred.');
   prepared.request = undefined;
@@ -4041,6 +4077,12 @@ function parsePlainJson(bytes: Buffer, label: string): PlainJsonValue {
   } catch (error) {
     throw new Error(`${label} is not valid plain JSON: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+function freezeRecipeValue(value: PlainJsonValue): void {
+  if (value === null || typeof value !== 'object') return;
+  Object.values(value).forEach(freezeRecipeValue);
+  Object.freeze(value);
 }
 
 function allocatedValue(

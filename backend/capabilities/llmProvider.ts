@@ -34,6 +34,8 @@ import {
   type ProviderRequestAdaptationRetry,
   type ProviderRequestAdaptationSession,
   installEncodedRequestPostProcessor,
+  prepareEncodedProviderRequest,
+  prepareEncodedCompactProviderRequest,
   type ProviderRequestTarget
 } from './providerParameterAdaptation';
 import {
@@ -492,6 +494,7 @@ export async function startLlmProvider(
       request.contents
     );
     if (proxy) console.log(`[LimCode] LLM proxy enabled: ${proxy}`);
+    const webSocketConfig = openAIResponsesWebSocketConfigEntry(settings, request.conversationId);
     const providerConfig = {
       provider: libraryProviderKind(settings),
       model: settings.model,
@@ -501,7 +504,7 @@ export async function startLlmProvider(
       ...(headers ? { headers } : {}),
       ...(requestBody ? { requestBody } : {}),
       ...unifiedPromptCacheConfigEntry(settings, requestBody),
-      ...openAIResponsesWebSocketConfigEntry(settings, request.conversationId),
+      ...webSocketConfig,
       ...(proxy ? { proxy } : {}),
       fetch: providerFetch
     };
@@ -563,7 +566,8 @@ export async function startLlmProvider(
           nativeCapabilities,
           controls,
           responsesTerminal,
-          adaptationSession
+          adaptationSession,
+          webSocketConfig.webSocketSessionKey
         );
         return;
       } catch (error) {
@@ -638,7 +642,8 @@ async function runLlmAttempt(
   nativeCapabilities?: OpenAIResponsesNativeCapabilities,
   controls?: LlmStartRuntimeControls,
   responsesTerminal: ResponsesTerminalObservation = {},
-  adaptationSession?: ProviderRequestAdaptationSession
+  adaptationSession?: ProviderRequestAdaptationSession,
+  webSocketSessionKey?: string
 ): Promise<void> {
   const attemptStarted = { at: Date.now(), mark: nowMonotonicMs() };
   // 这个对话的 Claude 保留思考处理随 Done 交回内核持久化（官方要求随会话保存、重启后也带上）。
@@ -744,6 +749,7 @@ async function runLlmAttempt(
   try {
     const stream: AsyncIterable<UnifiedLLMStreamChunk> = forceStreaming
       ? streamOpenAIResponsesWithLimCodeSession({
+          sessionKey: webSocketSessionKey!,
           request,
           settings,
           provider,
@@ -998,6 +1004,7 @@ function responsesEmptyTerminalFailure(
 }
 
 async function* streamOpenAIResponsesWithLimCodeSession(input: {
+  sessionKey: string;
   debugCapture?: DebugCaptureRecorder;
   request: LlmStartRequest;
   settings: LlmProviderConfigRecord;
@@ -1012,7 +1019,7 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   onTransportTrace?: (trace: LlmProviderTransportTrace) => void;
 }): AsyncGenerator<LimCodeOpenAIResponsesStreamChunk> {
   const conversationId = requireOpenAIResponsesWebSocketConversationId(input.request.conversationId);
-  const sessionKey = createOpenAIResponsesWebSocketSessionKey(input.settings, conversationId);
+  const sessionKey = input.sessionKey;
   const now = Date.now();
   for (const [key, expiresAt] of openAIResponsesHttpCooldowns) {
     if (expiresAt <= now) openAIResponsesHttpCooldowns.delete(key);
@@ -1043,11 +1050,10 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
   }
   if (cooldownUntil > 0) openAIResponsesHttpCooldowns.delete(sessionKey);
 
-  const dryRun = await input.provider.dryRun(input.unifiedRequest, {
+  const prepared = prepareEncodedProviderRequest(input.provider, input.unifiedRequest, {
     inputFormat: 'unified',
-    outputFormat: 'unified',
-    stream: true
-  });
+    outputFormat: 'unified'
+  }, true);
   const format = new input.unified.OpenAIResponsesFormat(input.settings.model) as OpenAIResponsesFormatAdapter;
   const continuation = openAIResponsesContinuationHint(input.request, input.unifiedRequest);
   try {
@@ -1056,12 +1062,12 @@ async function* streamOpenAIResponsesWithLimCodeSession(input: {
       debugCapture: input.debugCapture ? {
         recorder: input.debugCapture,
         context: getDebugCaptureContext(input.request) ?? { conversationId, modelRequestId: input.request.id },
-        metadata: { url: dryRun.url }
+        metadata: { url: prepared.url }
       } : undefined,
       sessionKey,
-      url: dryRun.url,
-      headers: dryRun.headers,
-      body: dryRun.body,
+      url: prepared.url,
+      headers: prepared.headers,
+      body: prepared.body,
       format,
       ...(continuation ? { continuation } : {}),
       ...(input.native ? { native: input.native } : {}),
@@ -1996,7 +2002,8 @@ export function registerLlmCompressionMethod(kind: LlmCompressionConfigRecord['k
 
 function ensureDefaultCompressionMethodsRegistered(): void {
   if (compressionMethodHandlers.size > 0) return;
-  registerLlmCompressionMethod('provider_native', compactWithProviderNative);
+  registerLlmCompressionMethod('provider_native', (request, config, options, signal) =>
+    compactWithProviderNative(request, config, options, signal, request.contents));
   registerLlmCompressionMethod('llm_summary', compactWithSummary);
   registerLlmCompressionMethod('segmented_summary', compactWithSegmentedSummary);
   registerLlmCompressionMethod('deterministic_summary', compactWithSummary);
@@ -2275,10 +2282,11 @@ async function compactWithProviderNative(
   request: LlmCompactRequest,
   methodConfig: LlmCompressionConfigRecord,
   options: LlmProviderOptions,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  preparedContext?: MessageContent[]
 ): Promise<LlmCompactResult> {
-  const preparedContext = await prepareNativeCompactContentsMultimodal(request.contents, options);
-  const canonicalContext = assertCanonicalProviderToolContext(preparedContext);
+  const canonicalContext = assertCanonicalProviderToolContext(
+    preparedContext ?? await prepareNativeCompactContentsMultimodal(request.contents, options));
   const settings = await resolveCompactProviderSettings(request, methodConfig, canonicalContext, options);
   // 每次尝试按当前记忆决定形态：网关明确拒绝过轮内系统消息的目标退回尾巴模式（历史提醒不发）。
   const normalizedContext = layoutTurnReminderContents(canonicalContext, turnReminderLayoutFor(request, settings));
@@ -2355,19 +2363,16 @@ async function compactWithProviderNative(
     const compactRequestBody = openAIResponsesCompactRequestBody(requestBody);
     const compactContents = openAIResponsesCompactRequest(request, normalizedContext, settings);
     if (usesOpenAIResponsesWebSocketNativeCompact(settings)) {
-      if (typeof provider.compactDryRun !== 'function') {
-        throw new Error('当前 unified-llm-provider 不支持 provider.compactDryRun。');
-      }
-      const dryRun = await provider.compactDryRun(compactContents, {
+      const prepared = prepareEncodedCompactProviderRequest(provider, compactContents, {
         inputFormat: 'unified',
         outputFormat: 'unified',
         ...(compactRequestBody ? { requestBody: compactRequestBody } : {})
       });
       const { compactOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
       const rawResponse = await compactOpenAIResponsesWebSocketSession({
-        url: openAIResponsesWebSocketCompactUrl(dryRun.url),
-        headers: dryRun.headers,
-        body: openAIResponsesWebSocketCompactPayload(dryRun.body, settings.model),
+        url: openAIResponsesWebSocketCompactUrl(prepared.url),
+        headers: prepared.headers,
+        body: openAIResponsesWebSocketCompactPayload(prepared.body, settings.model),
         signal,
         proxy
       });
@@ -2438,11 +2443,17 @@ async function dryRunAnthropicCompaction(
     methodConfig,
     contents,
     runtimeSettings,
-    options,
-    dryRunOptions.includeApiKey === true
+    options
   );
   return formatUnifiedDryRunResult(
-    built.result,
+    {
+      ...built.result,
+      bodyText: JSON.stringify(built.result.body, null, 2),
+      curl: built.unified.formatRequestAsCurl(built.result.url, built.result.headers, built.result.body, {
+        includeApiKey: dryRunOptions.includeApiKey === true, prettyBody: true
+      }),
+      timestamp: Date.now()
+    },
     runtimeSettings,
     built.unified,
     dryRunOptions,
@@ -2466,8 +2477,7 @@ async function compactWithAnthropic(
     methodConfig,
     contents,
     settings,
-    options,
-    true
+    options
   );
   const response = await built.fetch(built.result.url, {
     method: 'POST',
@@ -2543,10 +2553,9 @@ async function buildAnthropicCompactionRequest(
   methodConfig: LlmCompressionConfigRecord,
   contents: MessageContent[],
   settings: LlmProviderConfigRecord,
-  options: LlmProviderOptions,
-  includeApiKey: boolean
+  options: LlmProviderOptions
 ): Promise<{
-  result: UnifiedDryRunResult;
+  result: Omit<UnifiedDryRunResult, 'bodyText' | 'curl' | 'timestamp'>;
   unified: UnifiedModule;
   fetch: typeof fetch;
 }> {
@@ -2597,23 +2606,22 @@ async function buildAnthropicCompactionRequest(
     undefined,
     turnReminderLayoutFor(request, settings)
   );
-  const result = await provider.dryRun(unifiedRequest, {
+  const result = prepareEncodedProviderRequest(provider, unifiedRequest, {
     inputFormat: 'unified',
-    outputFormat: 'unified',
-    stream: false,
-    curl: { includeApiKey, prettyBody: true }
-  });
+    outputFormat: 'unified'
+  }, false);
   const body = anthropicCompactionBody(result.body, methodConfig);
   const headers = withAnthropicBetaHeader(result.headers, 'compact-2026-09-04');
   return {
     result: {
-      ...result,
+      url: result.url,
+      method: 'POST',
+      providerName: (provider as unknown as { providerName: string }).providerName,
+      inputFormat: 'unified',
+      outputFormat: 'unified',
       stream: false,
       headers,
-      body,
-      bodyText: JSON.stringify(body, null, 2),
-      curl: unified.formatRequestAsCurl(result.url, headers, body, { includeApiKey, prettyBody: true }),
-      timestamp: Date.now()
+      body
     },
     unified,
     fetch: providerFetch
@@ -3279,7 +3287,7 @@ async function prepareAttachmentObservationMedia(
       requirement.attachmentRef
     );
   }
-  const resolvedBytes = requireCanonicalInlineDataSize(prepared, 'Attachment observation media');
+  const resolvedBytes = requireCanonicalInlineDataSize(prepared, 'Attachment observation media', preparation);
   if (resolvedBytes !== requirement.sizeBytes || prepared.inlineData.mimeType !== requirement.mimeType) {
     throw new LlmMediaSemanticsUnavailableError(
       'resolved media bytes conflict with frozen Attachment metadata.',
@@ -4789,15 +4797,13 @@ async function* createSummaryWebSocketStream(
   request: SummaryProviderCall['request'],
   signal?: AbortSignal
 ): AsyncGenerator<UnifiedLLMStreamChunk> {
-  const providerDryRun = (resolved.provider as unknown as Partial<UnifiedDryRunCapable> | undefined)?.dryRun;
-  if (!resolved.provider || typeof providerDryRun !== 'function' || !resolved.unified || !resolved.webSocketSessionKey) {
+  if (!resolved.provider || !resolved.unified || !resolved.webSocketSessionKey) {
     throw new Error('OpenAI Responses WebSocket 摘要缺少已解析的 Provider 传输信息。');
   }
-  const dryRun = await providerDryRun.call(resolved.provider, request, {
+  const prepared = prepareEncodedProviderRequest(resolved.provider, request, {
     inputFormat: 'unified',
-    outputFormat: 'unified',
-    stream: true
-  });
+    outputFormat: 'unified'
+  }, true);
   // This isolated summary format is not the trusted continuation projector. Only canonical
   // visible terminal text is exposed here; the session still independently validates all
   // continuation identities and reasoning signatures before reusing a provider baseline.
@@ -4807,9 +4813,9 @@ async function* createSummaryWebSocketStream(
   const { streamOpenAIResponsesWebSocketSession } = await openAIResponsesWebSocketSession();
   yield* streamOpenAIResponsesWebSocketSession({
     sessionKey: resolved.webSocketSessionKey,
-    url: dryRun.url,
-    headers: dryRun.headers,
-    body: dryRun.body,
+    url: prepared.url,
+    headers: prepared.headers,
+    body: prepared.body,
     format,
     signal,
     proxy: resolved.proxy
@@ -5842,7 +5848,7 @@ function createOpenAIPromptCacheKey(settings: LlmProviderConfigRecord, conversat
     .slice(0, 32);
 }
 
-function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, conversationId?: string): Record<string, unknown> {
+function openAIResponsesWebSocketConfigEntry(settings: LlmProviderConfigRecord, conversationId?: string): { transport?: 'websocket'; webSocketSessionKey?: string } {
   if (!isOpenAIResponsesWebSocketMode(settings)) return {};
   return {
     transport: 'websocket',

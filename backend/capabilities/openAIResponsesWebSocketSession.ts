@@ -179,8 +179,6 @@ interface WebSocketSession extends OpenAIResponsesWebSocketContinuationState {
 
 interface PreparedCreatePayload {
   payload: Record<string, unknown>;
-  fullBody: Record<string, unknown>;
-  fullInputItems: unknown[];
   durableInputItems: unknown[];
   baseSignature: string;
   volatileTailLayout?: string;
@@ -467,7 +465,6 @@ async function* streamLocked(
     }
 
     session.lastRequest = {
-      body: cloneJson(prepared.fullBody),
       durableInputItems: prepared.durableInputItems.map(cloneJson),
       baseSignature: prepared.baseSignature,
       ...(prepared.volatileTailLayout ? { volatileTailLayout: prepared.volatileTailLayout } : {})
@@ -727,7 +724,7 @@ function prepareCreatePayload(
   streamId?: string
 ): PreparedCreatePayload {
   const connectionReused = connection.reused;
-  const fullInputItems = Array.isArray(fullBody.input) ? fullBody.input.map(cloneJson) : [];
+  const fullInputItems = Array.isArray(fullBody.input) ? [...fullBody.input] : [];
   const explicitBreakpoints = usesExplicitPromptCacheBreakpoints(fullBody);
   const boundary = localContinuationBoundary(
     fullInputItems,
@@ -831,8 +828,6 @@ function prepareCreatePayload(
       : reasoningEffortOf(fullBody.reasoning));
   return {
     payload,
-    fullBody,
-    fullInputItems,
     durableInputItems: boundary.durableInputItems,
     baseSignature,
     ...(boundary.volatileTailLayout ? { volatileTailLayout: boundary.volatileTailLayout } : {}),
@@ -1031,7 +1026,10 @@ function markNewestBreakpointCarrier(items: unknown[]): unknown[] {
 
 function sanitizeResponsesCreateBody(value: unknown, native = false): Record<string, unknown> {
   if (!isRecord(value)) throw new Error('OpenAI Responses WebSocket body must be a JSON object.');
-  const next = cloneJson(value);
+  const { input, ...properties } = value;
+  const copiedProperties = cloneJson(properties);
+  // Preserve the existing wire field order while input gets its one owned recursive copy below.
+  const next = Object.fromEntries(Object.keys(value).map(key => [key, key === 'input' ? input : copiedProperties[key]]));
   delete next.type;
   delete next.stream;
   delete next.background;
@@ -1040,7 +1038,7 @@ function sanitizeResponsesCreateBody(value: unknown, native = false): Record<str
   // (see preservesExplicitPromptCache); other models keep the historical strip behavior unchanged.
   if (!native) delete next.prompt_cache_options;
   next.store = false;
-  next.input = Array.isArray(next.input) ? next.input.map((item) => stripWebSocketOnlyInputFields(item, native)) : [];
+  next.input = Array.isArray(input) ? input.map((item) => stripWebSocketOnlyInputFields(item, native)) : [];
   return next;
 }
 
@@ -1623,7 +1621,7 @@ interface NativeChainLease {
     frame: Record<string, unknown>,
     timeoutMs: number,
     signal?: AbortSignal
-  ): Promise<{ responseCreateSeq?: number }>;
+  ): Promise<{ responseCreateSeq?: number; frameBytes: number }>;
   events(): AsyncIterable<Record<string, unknown>>;
   healthy(): boolean;
   /**
@@ -1723,7 +1721,6 @@ async function* streamOpenAIResponsesNativeSession(
   const native = options.native;
   const timeouts = resolvedTimeouts(options.timeouts);
   if (native.multiplexing) {
-    const sessionKeyHash = createHash('sha256').update(options.sessionKey).digest('hex').slice(0, 12);
     const admission = await acquireOpenAIResponsesWebSocketLane({
       sessionKey: options.sessionKey,
       url: options.url,
@@ -1740,7 +1737,8 @@ async function* streamOpenAIResponsesNativeSession(
         ? {
             debug: {
               ...options.debugCapture,
-              metadata: { ...options.debugCapture.metadata, sessionKeyHash, transport: 'websocket' }
+              metadata: { ...options.debugCapture.metadata,
+                sessionKeyHash: createHash('sha256').update(options.sessionKey).digest('hex').slice(0, 12), transport: 'websocket' }
             }
           }
         : {})
@@ -1889,7 +1887,7 @@ function createExclusiveNativeLease(
         }
       }));
       await sendWithDeadline(socket, payloadText, timeoutMs, signal);
-      return responseCreateSeq !== undefined ? { responseCreateSeq } : {};
+      return { frameBytes: Buffer.byteLength(payloadText, 'utf8'), ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {}) };
     },
     events() {
       return queue;
@@ -2022,12 +2020,10 @@ async function sendNativeCreateFrame(
   state: NativeChainState,
   payload: Record<string, unknown>
 ): Promise<number | undefined> {
-  const payloadText = JSON.stringify(payload);
-  const responseCreateFrameBytes = Buffer.byteLength(payloadText, 'utf8');
   observeNativePhase(state, 'send_started');
-  const { responseCreateSeq } = await state.lease.sendFrame(payload, state.timeouts.sendMs, state.options.signal);
+  const { responseCreateSeq, frameBytes } = await state.lease.sendFrame(payload, state.timeouts.sendMs, state.options.signal);
   observeNativePhase(state, 'request_sent', {
-    responseCreateFrameBytes,
+    responseCreateFrameBytes: frameBytes,
     ...(responseCreateSeq !== undefined ? { responseCreateSeq } : {})
   });
   return responseCreateSeq;
@@ -3152,7 +3148,6 @@ function commitNativeContinuation(state: NativeChainState): void {
     return;
   }
   state.lease.continuation.lastRequest = {
-    body: cloneJson(state.prepared.fullBody),
     durableInputItems: state.prepared.durableInputItems.map(cloneJson),
     baseSignature: state.prepared.baseSignature,
     ...(state.prepared.volatileTailLayout ? { volatileTailLayout: state.prepared.volatileTailLayout } : {}),

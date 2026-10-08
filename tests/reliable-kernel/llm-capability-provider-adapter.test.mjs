@@ -142,6 +142,46 @@ function memoryReadDatabase(tables = {}) {
   };
 }
 
+test('one prepared compression projection supplies both its budget and send', async () => {
+  const fullRequest = compressionRequest('llm_summary', request().context);
+  const source = fullRequest.context[0].content;
+  let sourceReads = 0;
+  Object.defineProperty(fullRequest.context[0], 'content', {
+    get() { sourceReads += 1; return source; }, enumerable: true
+  });
+  let sent;
+  const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider',
+    compressionCapability(value => { sent = value; }));
+  const prepared = adapter.prepareFullRequest(fullRequest);
+  assert.ok(prepared.breakdown.fullTokens > 0);
+  const readsAtPreparation = sourceReads;
+  assert.ok(readsAtPreparation > 0);
+  await prepared.send({ async onEvent() { return { accepted: true, checkpointed: true, terminal: true }; } });
+  assert.equal(sourceReads, readsAtPreparation, 'send must not re-project the source already measured for preflight');
+  assert.ok(sent.contents.some(content => content.parts.some(part => part.text?.includes('hello'))));
+  assert.throws(() => prepared.send({ async onEvent() {} }), /already been transferred/);
+});
+
+test('direct and prepared compression sends each record one matching debug scope exit', async () => {
+  for (const mode of ['direct', 'prepared']) {
+    const request = compressionRequest('llm_summary', []);
+    request.context = [{ segmentId: 'debug-source', segmentKind: 'message', messageRole: 'user',
+      contentType: 'application/vnd.limcode.message+json', content: JSON.stringify({ role: 'user', parts: [{ text: 'source' }] }) }];
+    request.recipe.sourceSegmentCount = 1;
+    const events = [];
+    const recorder = { active() { return 'debug-run'; }, record(event) { events.push(event); } };
+    const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', compressionCapability(() => {}), recorder);
+    const controls = { async onEvent() { return { accepted: true, checkpointed: true, terminal: true }; } };
+    if (mode === 'direct') await adapter.sendFullRequest(request, controls);
+    else await adapter.prepareFullRequest(request).send(controls);
+    const exits = events.filter(event => event.stage === 'scope.exit');
+    assert.equal(exits.length, 1, mode);
+    assert.equal(exits[0].metadata.reason, '上下文压缩');
+    assert.deepEqual(exits[0].context, { conversationId: request.conversationId, modelRequestId: request.modelRequestId,
+      attemptSeq: request.attemptSeq, socketGeneration: request.socketGeneration });
+  }
+});
+
 test('压缩进度持久化失败会终止对应 Provider，不遗留后台生成', async () => {
   const capability = fakeCapability(() => {});
   const aborted = [];
@@ -1653,13 +1693,17 @@ test('Agent loop 开放任务的无工具输出只续行一轮再结束', async 
   loop.cancelSupersededCompressionRequests = async () => {};
   loop.terminateIfRequested = async () => false;
   loop.maybeGet = async (_domain, id) => ({ id, status: 'terminal' });
-  loop.assertModelRequestRound = async (_request, sequence) => ({
-    kind: 'reliable-agent-turn',
-    round: sequence.toString(),
-    turnTaskCard: { counts: { unfinished: 1 } },
-    ...(sequence === 2n ? {
-      openTaskCompletionCheck: { kind: 'open_task_completion_check', card: 'check' }
-    } : {})
+  loop.assertModelRequestRound = async (request, sequence) => ({
+    modelRequestId: request.id,
+    recipeObjectId: `recipe-bounded-${sequence}`,
+    recipe: {
+      kind: 'reliable-agent-turn',
+      round: sequence.toString(),
+      turnTaskCard: { counts: { unfinished: 1 } },
+      ...(sequence === 2n ? {
+        openTaskCompletionCheck: { kind: 'open_task_completion_check', card: 'check' }
+      } : {})
+    }
   });
   loop.readTerminalProviderOutput = async () => ({
     content: { role: 'assistant', parts: [{ text: 'progress' }] },

@@ -190,7 +190,7 @@ test('同一任务打开自动压缩并降低阈值后，无需新用户消息�
   });
 });
 
-test('模型请求恢复只读已保存的压缩设置，不读取后来改变的配置', async () => {
+test('模型请求恢复只读已保存的压缩设置，不读取后来改变的配置', async (context) => {
   await fixture(async ({ app, update, input, frozen, list, configuration }) => {
     const started = await app.turns.input(input('recover', '恢复测试。'.repeat(300)));
     const authority = await frozen(started.turnId);
@@ -198,6 +198,12 @@ test('模型请求恢复只读已保存的压缩设置，不读取后来改变�
     const settingsId = await app.modelProvider.freezeRequestSettings(started.turnId, authority.snapshot.id);
     const [head] = await list('ConversationContextHeadLink');
     const handles = await readCurrentConversationContextHandleState(app.database, app.contentStore, 'live-conversation');
+    let settingsReads = 0;
+    const read = app.contentStore.read;
+    context.mock.method(app.contentStore, 'read', function(metadata) {
+      if (metadata.id === settingsId) settingsReads += 1;
+      return read.call(this, metadata);
+    });
     const created = await app.modelProvider.createModelRequest({
       turnId: started.turnId, authoritySnapshotId: authority.snapshot.id, contextRootId: head.root_id,
       settingsSnapshotContentObjectId: settingsId,
@@ -206,6 +212,7 @@ test('模型请求恢复只读已保存的压缩设置，不读取后来改变�
           rootId: handles.row.context_root_id, provenanceRevision: String(handles.row.provenance_revision),
           resetFence: String(handles.row.requires_native_reset) } }, idempotencyKey: 'pending-compression'
     });
+    assert.equal(settingsReads, 1, '同次请求创建只读取一次已冻结的设置正文');
     await update({ kind: 'disabled' });
     const restarted = new kernel.ModelProviderControlPlane(app.database, app.contentStore, { compressionSettingsAuthority: configuration });
     assert.equal(await restarted.freezeRequestSettings(started.turnId, authority.snapshot.id), settingsId);
