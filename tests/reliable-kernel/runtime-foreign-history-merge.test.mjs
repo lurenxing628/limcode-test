@@ -449,76 +449,25 @@ test('合并期间外来库被改动：提交前在声明内复核发现文件�
   assert.equal(query(fixture.current.binding.paths.databasePath, "SELECT COUNT(*) FROM conversation WHERE id LIKE 'moving_0%'")[0], 0);
 });
 
-test('与清理备份并发（真实的清理流程，同一个外来声明）：合并持有时清理不等待、保留这一份并说明原因；清理先持有并删掉它时合并等它结束、说明已不在、什么也不写；合并之后清理能按覆盖核对删除它', async (t) => {
-  const fixture = await home(t);
-  const { elsewhere, container: first } = await copiedDirectory(fixture, (source) => seedConversations(source.current, [{ id: 'kept_1' }, { id: 'kept_2' }]));
-  const second = (await copiedDirectory(fixture, undefined, { from: elsewhere })).container;
-  const third = (await copiedDirectory(fixture, undefined, { from: elsewhere })).container;
-  const [f1, f2, f3] = await Promise.all([first, second, third].map((container) => found(fixture, container)));
-  assert.deepEqual((await merge(fixture, [f1])).merged.map((item) => [item.candidateId, item.insertedConversations]), [[f1.id, 2]]);
-  const unit = (container) => path.join(container, '.limcode-runtime');
-  const database = await openWindow(fixture);
-  t.after(() => database.close().catch(() => undefined));
-  const itemAt = (plan, directory) => {
-    const item = plan.items.find((entry) => entry.path === directory);
-    assert.ok(item, `没有列出 ${directory}：${plan.items.map((entry) => entry.path).join(', ')}`);
-    return item;
-  };
-
-  // The merge of the second copy holds its claim (paused right after its private snapshot was copied).
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const covered = itemAt(plan, unit(second));
-  assert.equal(covered.deletable, true, covered.reason);
-  let resume;
-  const paused = new Promise((resolve) => { resume = resolve; });
-  let reached;
-  const atSnapshot = new Promise((resolve) => { reached = resolve; });
-  // One window merges and cleans up (its Runtime is the cleanup's current data set).
-  const merging = merge(fixture, [f2], { async onFaultPoint(point) { if (point === 'after-snapshot-copy') { reached(); await paused; } } }, database);
-  await atSnapshot;
-  try {
-    const started = Date.now();
-    const kept = await deleteRuntimeBackups(plan, database, [covered.key]);
-    assert.ok(Date.now() - started < 5_000, '清理不等待合并');
-    assert.deepEqual([kept.deleted, kept.kept.map((entry) => entry.reason)], [[], ['正在被另一个窗口或操作使用（只读查看、核验、合并或清理备份），这一项没有删除']]);
-    assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), unit(second)).deletable, false, '合并期间检查也不给删');
-    assert.ok(await exists(unit(second)), '正在合并的来源没有被删');
-  } finally { resume(); }
-  const report = await merging;
-  assert.deepEqual(report.merged.map((item) => [item.candidateId, item.alreadyMerged]), [[f2.id, true]], '同一个库的另一份：没有新内容');
-
-  // The cleanup holds the third copy's claim (paused right before its rename): the merge waits, then finds it gone.
-  const plan2 = await planRuntimeBackupCleanup(fixture.root, database);
-  const doomed = itemAt(plan2, unit(third));
-  assert.equal(doomed.deletable, true, doomed.reason);
-  let proceed;
-  const go = new Promise((resolve) => { proceed = resolve; });
-  let holding;
-  const holds = new Promise((resolve) => { holding = resolve; });
-  const deleting = deleteRuntimeBackups(plan2, database, [doomed.key], {
-    async onFaultPoint(point) { if (point === 'before-rename') { holding(); await go; } }
-  });
-  await holds;
-  let settled = false;
-  const waiting = merge(fixture, [f3], {}, database).finally(() => { settled = true; });
-  try {
-    await sleep(600);
-    assert.equal(settled, false, '清理持有时，合并等待');
-  } finally { proceed(); }
-  assert.deepEqual((await deleting).deleted.map((entry) => entry.path), [unit(third)]);
-  const refused = await waiting;
-  assert.deepEqual([refused.merged, refused.blocked, refused.deferred.map((issue) => [issue.candidateId, issue.code])],
-    [[], [], [[f3.id, 'foreign-history-gone']]]);
-  assert.equal(await readLedgerRecord(fixture, f3.id), undefined, '什么也没记');
-  assert.deepEqual(conversations(fixture), ['kept_1', 'kept_2']);
-
-  // Once merged, the archive or copied root is proven by coverage and backup cleanup deletes it.
-  const plan3 = await planRuntimeBackupCleanup(fixture.root, database);
-  const merged = [itemAt(plan3, unit(first)), itemAt(plan3, unit(second))];
-  assert.deepEqual(merged.map((item) => item.deletable), [true, true], merged.map((item) => item.reason).join(' | '));
-  const removed = await deleteRuntimeBackups(plan3, database, merged.map((item) => item.key));
-  assert.deepEqual(removed.deleted.map((entry) => entry.path).sort(), [unit(first), unit(second)].sort());
-  assert.deepEqual(conversations(fixture), ['kept_1', 'kept_2'], '当前库的对话都在');
+test('外来已合并来源：没有本来源成功账本不删，声明被占保留，释放后才能删除', async t=>{
+  const fixture=await home(t);
+  const {elsewhere,container:first}=await copiedDirectory(fixture,source=>seedConversations(source.current,[{id:'kept_1'}]));
+  const second=(await copiedDirectory(fixture,undefined,{from:elsewhere})).container;
+  const source=await found(fixture,first);
+  await merge(fixture,[source]);
+  const database=await openWindow(fixture);t.after(()=>database.close());
+  const plan=await planRuntimeBackupCleanup(fixture.root,database);
+  const item=plan.items.find(i=>i.path===path.join(first,'.limcode-runtime'));
+  assert.equal(item.deletable,true,item.reason);
+  assert.equal(plan.items.find(i=>i.path===path.join(second,'.limcode-runtime')).deletable,false,'同内容的另一份未合并来源不能仅凭覆盖删除');
+  const root=await foreign.locateForeignRuntimeRoot(fixture.root,source.location);
+  let release,entered;const ready=new Promise(r=>entered=r),hold=new Promise(r=>release=r);
+  const holding=foreign.tryWithForeignRuntimeRootClaim(fixture.root,source.id,root.located.rootPointerPath,async()=>{entered();await hold;});
+  await ready;
+  try{const kept=await deleteRuntimeBackups(plan,database,[item.key]);assert.equal(kept.deleted.length,0);assert.ok(await exists(root.located.databasePath));}
+  finally{release();await holding;}
+  const deleted=await deleteRuntimeBackups(plan,database,[item.key]);assert.equal(deleted.deleted.length,1,JSON.stringify(deleted));
+  assert.deepEqual(conversations(fixture),['kept_1']);
 });
 
 test('提交后中断：committing 记在当前配置根、以外来 id 为键，不影响这份归档的核验；下次合并按实测收敛为已合并', async (t) => {

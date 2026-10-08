@@ -35,25 +35,6 @@ const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 
-test('显式覆盖证明删除其他库：完整覆盖可删，当前库缺对话时保留', async (t) => {
-  const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
-  for (const covered of [false, true]) {
-    const fixture = await createFixture(t);
-    await seed(fixture.alpha, ['conversation_covered']);
-    if (covered) await seed(fixture.current, ['conversation_covered']);
-    const database = await openCurrent(t, fixture);
-    const remove = () => deleteUnselectedRuntimeDataSet(fixture.paths, fixture.alpha.id,
-      fixture.alpha.binding.dataSetId, { coveredByCurrent: database });
-    if (covered) {
-      await remove();
-      await assert.rejects(fs.stat(fixture.alpha.binding.paths.databasePath), { code: 'ENOENT' });
-    } else {
-      await assert.rejects(remove(), { code: 'runtime-data-set-delete-not-covered' });
-      assert.ok((await fs.stat(fixture.alpha.binding.paths.databasePath)).isFile());
-    }
-  }
-});
-
 test('合并前备份：内容全在当前库的旧备份可删、最新一份保留；删除先改名再删，当前库只经它自己的读取线程查询', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one', 'conversation_two']);
@@ -268,8 +249,8 @@ test('合并来源的收尾前备份：真实收尾留下的可删；被未报�
   assert.equal(item.kind, 'merge-source');
   assert.equal(item.deletable, true, item.reason);
   assert.equal(item.inCurrentDataSet, false);
-  assert.equal(item.reason, '可以删除：内容已完整在历史库“shared”里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）');
-  assert.equal(item.dataSetName, '历史库“shared”', '与“历史与存储管理”同样用项目名称呼它');
+  assert.equal(item.reason, '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）');
+  assert.equal(item.dataSetName, '旧工作区历史');
 
   await writeRuntimeDataSetMergeFinalization(fixture.paths, {
     candidateId: fixture.alpha.id,
@@ -283,35 +264,23 @@ test('合并来源的收尾前备份：真实收尾留下的可删；被未报�
   assert.deepEqual(refused.kept.map((entry) => entry.reason), ['被尚未报告的合并收尾记录引用，保留；这一项没有删除']);
   await fs.rm(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'finalizations', `${fixture.alpha.id.replace(/:/g, '-')}.json`));
 
-  rawEdit(fixture.alpha, (source) => {
+  rawEdit(fixture.current, (source) => {
     source.pragma('foreign_keys = OFF');
     source.prepare('DELETE FROM message_current_revision_link WHERE revision_id = ?').run('conversation_alpha_two_message_1_revision');
     source.prepare('DELETE FROM message_revision WHERE id = ?').run('conversation_alpha_two_message_1_revision');
   });
   const revision = itemAt(await planRuntimeBackupCleanup(fixture.root, database), sourceBackup);
   assert.deepEqual([revision.deletable, revision.missingConversations, revision.missingRevisions, revision.reason],
-    [false, 0, 1, '含 1 个历史库“shared”没有的消息版本，按历史保留']);
+    [false, 0, 1, '含 1 个当前库没有的消息版本，按历史保留']);
 
-  rawEdit(fixture.alpha, (source) => source.prepare('DELETE FROM conversation WHERE id = ?').run('conversation_alpha_one'));
+  rawEdit(fixture.current, (source) => source.prepare('DELETE FROM conversation WHERE id = ?').run('conversation_alpha_one'));
   const conversation = itemAt(await planRuntimeBackupCleanup(fixture.root, database), sourceBackup);
   assert.deepEqual([conversation.deletable, conversation.missingConversations],
     [false, 1]);
-  assert.equal(conversation.reason, '含 1 个历史库“shared”没有的对话（可能是你删掉的），按历史保留');
+  assert.equal(conversation.reason, '含 1 个当前库没有的对话（可能是你删掉的），按历史保留');
 });
 
-test('来源库在列出之后有改动：锁内按文件状态复核，那一项不删', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_current']);
-  await seed(fixture.alpha, ['conversation_alpha']);
-  const database = await openCurrent(t, fixture);
-  const backup = await sourceBackup(fixture.alpha);
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(itemAt(plan, backup).deletable, true, itemAt(plan, backup).reason);
-  await seed(fixture.alpha, ['conversation_alpha_later']);
-  const result = await deleteRuntimeBackups(plan, database, [itemAt(plan, backup).key]);
-  assert.deepEqual(result.kept.map((item) => item.reason), ['所在历史库在检查之后有改动，请重新检查；这一项没有删除']);
-  assert.ok((await fs.lstat(backup)).isDirectory());
-});
+
 
 test('不是所在历史库的备份（身份不一致）与比所在历史库更新（代数更高）的备份都保留', async (t) => {
   const fixture = await createFixture(t);
@@ -446,17 +415,17 @@ test('只列出的备份：归档目录里不认识的条目、没有库的拷�
   assert.match(itemAt(plan, resetBackups).reason, /不自动删除/);
   const listed = [archive, unknown, copied, legacy, dataBackups].map((directory) => itemAt(plan, directory));
   assert.deepEqual(listed.map((item) => [item.kind, item.deletable, item.bytes, item.name]), [
-    ['foreign-history', false, '11', path.basename(archive)],
+    ['merged-source', false, '0', path.basename(archive)],
     ['reset-archive', false, '5', 'notes'],
     ['copied-data-root', false, '22', path.basename(copied)],
     ['legacy-cutover', false, '33', 'backups'],
     ['data-backups', false, '44', '.limcode-data-backups']
   ]);
   assert.deepEqual(listed.map((item) => item.inCurrentDataSet), [false, false, false, false, false], '只列出的都不是当前库的一部分（归档就在当前库的目录下也一样）');
-  assert.match(listed[0].reason, /^未通过核验：历史库不完整.*，原样保留$/);
+  assert.match(listed[0].reason, /尚未完整合并.*原位保留/);
   assert.equal(listed[0].origin, '“归档并重置”的归档');
   assert.equal(listed[1].reason, '归档目录里不是“归档并重置”留下的归档（名字不认识）；只列出，不删除');
-  assert.equal(listed[2].reason, '拷来目录里已经没有库；其余内容（设置、规则、技能）保留，可自行处理');
+  assert.equal(listed[2].reason, '拷来目录整体保留，其余内容不自动删除');
   assert.equal(listed[0].createdAt, '2026-09-01T01:02:03.004Z');
   assert.equal(listed[2].createdAt, '2026-09-02T01:02:03.004Z');
   const result = await deleteRuntimeBackups(plan, database, listed.map((item) => item.key));
@@ -481,7 +450,7 @@ test('预计释放不计入还有其它硬链接的文件', async (t) => {
 
 test('读不出的记录按保护处理：收尾记录无法读取时来源备份保留，合并记录无法读取时全部保留；没有升级完成记录的升级备份保留', async (t) => {
   const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_current']);
+  await seed(fixture.current, ['conversation_current','conversation_alpha']);
   await seed(fixture.alpha, ['conversation_alpha']);
   const database = await openCurrent(t, fixture);
   const source = await sourceBackup(fixture.alpha);
@@ -516,7 +485,7 @@ test('读不出的记录按保护处理：收尾记录无法读取时来源备�
 
 test('所在历史库在列出之后换了代数：锁内复核身份与代数，那一项不删', async (t) => {
   const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_current']);
+  await seed(fixture.current, ['conversation_current','conversation_alpha']);
   await seed(fixture.alpha, ['conversation_alpha']);
   const database = await openCurrent(t, fixture);
   const backup = await sourceBackup(fixture.alpha);
@@ -697,7 +666,7 @@ test('改名之后的失败：再次核对或写标记失败时改回原名并�
 
 test('改名之后再核一次覆盖：改名与删除之间当前库删掉了备份里的对话（删除对话不取锁）、其它历史库有了改动，改回原名并保留', async (t) => {
   const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_kept', 'conversation_deleted']);
+  await seed(fixture.current, ['conversation_kept', 'conversation_deleted','conversation_alpha']);
   await seed(fixture.alpha, ['conversation_alpha']);
   const database = await openCurrent(t, fixture);
   const backup = await targetBackup(fixture.current, database, 180);
@@ -711,20 +680,20 @@ test('改名之后再核一次覆盖：改名与删除之间当前库删掉了�
     async onFaultPoint(point, key) {
       if (point !== 'after-rename') return;
       if (key === itemAt(plan, backup).key) await database.transaction([repo('Conversation').delete('conversation_deleted')]);
-      else rawEdit(fixture.alpha, (alpha) => alpha.prepare('UPDATE conversation SET title = ? WHERE id = ?').run('改过的标题', 'conversation_alpha'));
+      else await database.transaction([repo('Conversation').delete('conversation_alpha')]);
     }
   });
   assert.deepEqual(result.deleted, []);
   assert.deepEqual(result.kept.map((item) => [item.path, item.reason]).sort(), [
     [backup, '当前库刚刚少了 1 个这份备份里有的对话，已改回原名，保留'],
-    [source, '所在历史库在检查之后有改动，已改回原名，保留']
+    [source, '当前库刚刚少了 1 个这份备份里有的对话，已改回原名，保留']
   ].sort());
   for (const directory of [backup, source]) {
     assert.ok((await fs.lstat(directory)).isDirectory());
     assert.equal((await fs.readdir(path.dirname(directory))).some((name) => name.includes('.deleting-')), false);
   }
   const next = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(itemAt(next, backup).reason, '含 1 个当前库没有的对话（可能是你删掉的），按历史保留');
+  assert.equal(itemAt(next, backup).reason, '含 2 个当前库没有的对话（可能是你删掉的），按历史保留');
 });
 
 test('0.0.15–0.0.21 的 3→4 升级备份（完成记录 toEpoch 4、nextBinding 为 epoch 4）满 7 天、内容全在当前库也一律保留；完成记录与身份不符的也保留', async (t) => {
@@ -825,7 +794,7 @@ test('控制根里有其它进行中的操作（挂起的切换指针、旧版�
 
 test('删除期间在所持的 admission 与控制根 maintenance 里发布“清理备份”的维护进行中标记，等下一个控制根的锁时 admission 里仍有，结束后随锁消失', async (t) => {
   const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
+  await seed(fixture.current, ['conversation_one','conversation_alpha']);
   await seed(fixture.alpha, ['conversation_alpha']);
   const database = await openCurrent(t, fixture);
   const backup = await targetBackup(fixture.current, database, 180);
@@ -1195,3 +1164,78 @@ async function treeSnapshot(root) {
   await visit(root);
   return files;
 }
+
+async function mergedSourceFixture(t) {
+  const fixture=await createFixture(t);
+  await seed(fixture.alpha,['merged_source_conversation']);
+  const database=await openCurrent(t,fixture);
+  const report=await mergeHistoricalDataSetsOnline(fixture.paths,{configurationRootPath:fixture.root,database});
+  assert.equal(report.merged.length,1);
+  return {...fixture,database};
+}
+
+test('已合并来源：只有真实 merged 账本且未变来源可删，当前历史保留', async t=>{
+  const f=await mergedSourceFixture(t);
+  const plan=await planRuntimeBackupCleanup(f.root,f.database);
+  const source=plan.items.find(i=>i.key==='merged-source:'+f.alpha.id);
+  assert.equal(source?.deletable,true,source?.reason);
+  const result=await deleteRuntimeBackups(plan,f.database,[source.key]);
+  assert.equal(result.deleted.length,1,JSON.stringify(result));
+  await assert.rejects(fs.stat(f.alpha.binding.paths.dataRootPath),{code:'ENOENT'});
+  assert.equal((await f.database.snapshot([repo('Conversation').get('merged_source_conversation')])).snapshot[0]?.id,'merged_source_conversation');
+});
+
+test('已合并来源：残留、待合并、partial、缓存失效和独立备份均保留',async t=>{
+  for(const mode of ['residual','pending','partial','cache','backup']) {
+    const f=await mergedSourceFixture(t),registry=kernelFile('runtimeHistoryRegistry.js');
+    const base={id:f.alpha.id,sourceKind:'local',location:{kind:'local',candidateId:f.alpha.id}};
+    if(mode==='residual')await registry.writeRuntimeHistoryResidual(f.paths,{...base,code:'test',message:'keep',checkedAt:NOW});
+    if(mode==='pending')await registry.writeRuntimeHistoryPending(f.paths,{...base,reason:'retry',registeredAt:NOW});
+    if(mode==='partial') {
+      const file=path.join(resolveVscodeRuntimeMergeLedgerRoot(f.paths),'records',f.alpha.id.replace(/:/g,'-')+'.json');
+      const record=JSON.parse(await fs.readFile(file,'utf8'));record.state='partial';record.excluded=[{conversationId:'x',title:'x',reasons:['conflict']}];
+      await fs.writeFile(file,JSON.stringify(record));
+    }
+    if(mode==='cache')await fs.rm(path.join(resolveVscodeRuntimeMergeLedgerRoot(f.paths),'fingerprints'),{recursive:true,force:true});
+    if(mode==='backup')await fs.mkdir(path.join(path.dirname(f.alpha.binding.paths.dataRootPath),'backups'),{recursive:true});
+    const plan=await planRuntimeBackupCleanup(f.root,f.database);
+    assert.equal(plan.items.find(i=>i.key==='merged-source:'+f.alpha.id)?.deletable,false,mode);
+  }
+});
+
+test('已合并来源：确认后来源变化或登记残留，删除前重新检查并保留',async t=>{
+  for(const mode of ['write','residual']) {
+    const f=await mergedSourceFixture(t),plan=await planRuntimeBackupCleanup(f.root,f.database);
+    const source=plan.items.find(i=>i.key==='merged-source:'+f.alpha.id);assert.equal(source.deletable,true,source.reason);
+    if(mode==='write')await seed(f.alpha,['new_source_conversation']);
+    else await kernelFile('runtimeHistoryRegistry.js').writeRuntimeHistoryResidual(f.paths,{id:f.alpha.id,sourceKind:'local',location:{kind:'local',candidateId:f.alpha.id},code:'test',message:'keep',checkedAt:NOW});
+    const result=await deleteRuntimeBackups(plan,f.database,[source.key]);
+    assert.equal(result.deleted.length,0);assert.ok(await fs.stat(f.alpha.binding.paths.databasePath));
+  }
+});
+
+test('已合并来源：改名后未核对失败恢复原位，已核对后中断下次完成删除',async t=>{
+  for(const stop of ['after-rename','after-verify']) {
+    const f=await mergedSourceFixture(t),plan=await planRuntimeBackupCleanup(f.root,f.database);
+    const source=plan.items.find(i=>i.key==='merged-source:'+f.alpha.id);assert.equal(source.deletable,true,source.reason);
+    const result=await deleteRuntimeBackups(plan,f.database,[source.key],{onFaultPoint(point){if(point===stop)throw Error('injected');}});
+    assert.equal(result.deleted.length,0);
+    if(stop==='after-rename')assert.ok(await fs.stat(f.alpha.binding.paths.databasePath));
+    else {const again=await planRuntimeBackupCleanup(f.root,f.database);assert.equal(again.finishedDeletions.length,1);await assert.rejects(fs.stat(f.alpha.binding.paths.databasePath),{code:'ENOENT'});}
+  }
+});
+
+
+test('已合并来源：CAS链接与在线旧窗口都不删除',async t=>{
+  const linked=await mergedSourceFixture(t);
+  const outside=path.join(linked.root,'keep.bin');await fs.writeFile(outside,'keep');
+  await fs.symlink(outside,path.join(linked.alpha.binding.paths.casRootPath,'source-link'));
+  const plan=await planRuntimeBackupCleanup(linked.root,linked.database);
+  assert.equal(plan.items.find(i=>i.key==='merged-source:'+linked.alpha.id).deletable,false);
+  assert.equal(await fs.readFile(outside,'utf8'),'keep');
+  const live=await mergedSourceFixture(t),before=await planRuntimeBackupCleanup(live.root,live.database);
+  const item=before.items.find(i=>i.key==='merged-source:'+live.alpha.id);
+  const host=await kernel.RuntimeDatabase.open(live.alpha.authority,{hostBootId:'old-source-host'});
+  try{assert.equal((await deleteRuntimeBackups(before,live.database,[item.key])).deleted.length,0);assert.ok(await fs.stat(live.alpha.binding.paths.databasePath));}
+  finally{await host.close();}
+});

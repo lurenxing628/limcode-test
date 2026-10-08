@@ -1,25 +1,19 @@
-import type { RuntimeBackupCleanupCurrent } from './runtimeBackupCleanup';
-import { cachedRuntimeDataSetFingerprint, readRuntimeDataSetMergeLedgerRecord, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity } from './runtimeDataSetMergeLedger';
-import { RUNTIME_RESET_BACKUPS_DIRECTORY, readRuntimeHistoryResidual } from './runtimeHistoryRegistry';
+import Database from 'better-sqlite3';
 import { constants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import Database from 'better-sqlite3';
-import { createRuntimeRootPaths, type RootBinding } from './contracts';
-import { assertDatabaseBinding, configureReaderConnection } from './databaseSchema';
-import { RootAuthority, type HistoricalRootBinding } from './rootAuthority';
+import { isPathBelow,isSamePath } from '../capabilities/filesystem/pathContainment';
+import { createRuntimeRootPaths,type RootBinding } from './contracts';
+import { assertDatabaseBinding,configureReaderConnection } from './databaseSchema';
+import { RootAuthority,type HistoricalRootBinding } from './rootAuthority';
+import { RUNTIME_RESET_BACKUPS_DIRECTORY } from './runtimeHistoryRegistry';
 import type { LocatedRuntimeRoot } from './runtimeLocatedRoot';
-import {
-  assertRuntimeHostsOffline, runtimeMaintenanceClaimPath, withRuntimeDataRootAdmission, withRuntimeMaintenance
-} from './runtimeHostControl';
 import { toSqliteFilePath } from './sqliteFilePath';
-import { isPathBelow, isSamePath } from '../capabilities/filesystem/pathContainment';
 import {
-  listVscodeRuntimeDataSets,
-  resolveVscodeRuntimeDataSet,
-  VSCODE_RUNTIME_CONTROL_DIRECTORY,
-  type VscodeRuntimeDataSetCandidate
+resolveVscodeRuntimeDataSet,
+VSCODE_RUNTIME_CONTROL_DIRECTORY,
+type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
 export type RuntimeStorageCategory =
@@ -81,95 +75,6 @@ export async function inspectRuntimeDataSetStorage(
     candidateId, dataSetId: binding.dataSetId, observedAt: new Date().toISOString(),
     selected: current.selected, categories, total, archiveReclaimsBytes: false
   };
-}
-
-/**
- * The UI must obtain explicit permanent-delete confirmation for this complete candidate first.
- * Admission and offline checks are repeated here; no per-CAS-object deletion exists.
- */
-export async function deleteUnselectedRuntimeDataSet(
-  paths: StoragePaths,
-  candidateId: string,
-  expectedDataSetId: string,
-  options: { coveredByCurrent?: RuntimeBackupCleanupCurrent } = {}
-): Promise<{ candidateId: string; dataSetId: string; deleted: RuntimeStorageSize }> {
-  const configurationRootPath = path.resolve(paths.globalStoragePath);
-  return withRuntimeDataRootAdmission(configurationRootPath, async () => {
-    const selected = (await listVscodeRuntimeDataSets(paths)).filter((entry) => entry.selected);
-    if (selected.length !== 1 || !selected[0].dataSetId) {
-      throw new Error('Select a fixed current Runtime data set before permanently deleting another data set.');
-    }
-    const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId);
-    if (candidate.selected) throw new Error('The selected Runtime data set cannot be deleted.');
-    const binding = await requireCompleteRuntimeDataSet(candidate);
-    if (!expectedDataSetId || binding.dataSetId !== expectedDataSetId) {
-      throw new Error('The confirmed Runtime data-set identity changed before deletion.');
-    }
-    const result = await withRuntimeMaintenance(binding.paths, async () => {
-      await assertRuntimeHostsOffline(binding.paths);
-      const current = await resolveVscodeRuntimeDataSet(paths, candidateId);
-      if (current.selected) throw new Error('The selected Runtime data set cannot be deleted.');
-      const currentBinding = await requireCompleteRuntimeDataSet(current);
-      if (JSON.stringify(currentBinding) !== JSON.stringify(binding)) {
-        throw new Error('Runtime data-set identity changed before deletion.');
-      }
-      // Identity must also be present in the actual SQLite file, not only in adjacent JSON files.
-      if (!options.coveredByCurrent) {
-        const snapshot = await createRuntimeDataSetDatabaseSnapshot(current, currentBinding);
-        await snapshot.close();
-      }
-      const { trees, excluded } = await runtimeDataSetTrees(current);
-      const record = await readRuntimeDataSetMergeLedgerRecord(paths, candidateId);
-      const fingerprint = await cachedRuntimeDataSetFingerprint(current);
-      const target = await requireCompleteRuntimeDataSet(selected[0]);
-      const residuals = await readRuntimeHistoryResidual(paths);
-      if (options.coveredByCurrent && record?.state !== 'partial' && !residuals.has(candidateId)) {
-        const { assertRuntimeDataSetCoveredByCurrent } = await import('./runtimeBackupCleanup');
-        await assertRuntimeDataSetCoveredByCurrent(current, selected[0], options.coveredByCurrent);
-      } else if (record?.state !== 'merged' || !fingerprint
-        || !sameRuntimeDataSetFingerprint(record.source, fingerprint)
-        || !sameRuntimeDataSetIdentity(record.target, target) || residuals.has(candidateId)) {
-        throw Object.assign(new Error(record?.state === 'partial'
-          ? `还有 ${record.excluded.length} 个对话没有合并进来，原库必须保留。`
-          : '这份历史尚未确认完整合并进当前库，请先合并再删除。'), { code: 'runtime-data-set-delete-not-merged' });
-      }
-      const maintenancePath = runtimeMaintenanceClaimPath(binding.paths);
-      const deleted: RuntimeStorageSize = { fileCount: 0, bytes: '0' };
-      // Validate every tree before deleting any. Reset archives of the scope are never part of it:
-      // they stay, and are listed as foreign history afterwards.
-      for (const tree of trees) {
-        await walkRuntimeDataSetFiles(tree, async (_filePath, size) => addSize(deleted, size), [maintenancePath, ...excluded]);
-      }
-      for (const tree of trees) {
-        if (path.dirname(maintenancePath) === tree) {
-          // The per-scope claim is a sibling of its control root, inside the workspace scope.
-          // Keep our claim alive through all deletions; its finally block releases it normally.
-          for (const entry of await fs.readdir(tree)) {
-            const entryPath = path.join(tree, entry);
-            if (entryPath !== maintenancePath && !excluded.includes(entryPath)) await fs.rm(entryPath, { recursive: true, force: false });
-          }
-        } else await fs.rm(tree, { recursive: true, force: false });
-      }
-      return { candidateId, dataSetId: binding.dataSetId, deleted };
-    });
-    // Claim release may leave its non-authoritative generation directory after a cleanup error.
-    // Finish deleting this already-confirmed scope only after release, while configuration
-    // admission still excludes new Hosts. Never recursively remove the shared configuration root.
-    if (!isSamePath(candidate.runtimeScopeRootPath, configurationRootPath)) {
-      const archiveNames = [RUNTIME_SCOPE_BACKUPS_DIRECTORY, RUNTIME_RESET_BACKUPS_DIRECTORY];
-      const hasArchives = (await Promise.all(archiveNames.map(name => exists(path.join(candidate.runtimeScopeRootPath, name))))).some(Boolean);
-      if (!hasArchives) {
-        await fs.rm(candidate.runtimeScopeRootPath, { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
-      } else {
-        // The scope keeps only its reset archives; enumeration no longer counts it as a data set.
-        for (const entry of await fs.readdir(candidate.runtimeScopeRootPath)) {
-          if (archiveNames.includes(entry)) continue;
-          await fs.rm(path.join(candidate.runtimeScopeRootPath, entry), { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
-        }
-      }
-    }
-    return result;
-  });
 }
 
 export interface RuntimeDataSetDatabaseSnapshot {

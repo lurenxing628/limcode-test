@@ -537,7 +537,7 @@ export async function showRuntimeStorage(
   candidate ??= (await inspectVscodeRuntimeDataSets(pathsFor(context))).candidates.find(item => item.selected);
   if (!candidate) throw new Error('当前历史尚未初始化。');
   const id = candidate.id;
-  const report = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在统计历史库占用…' },
+  const report = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在统计当前历史占用…' },
     () => inspectRuntimeDataSetStorage(pathsFor(context), id));
   // Per content type only for the selected data set, read through this window's own open worker.
   const contentUsage = await describeCurrentRuntimeContentUsage({ ...candidate, selected: report.selected },
@@ -545,7 +545,7 @@ export async function showRuntimeStorage(
   const labels = { sqlite: 'SQLite 数据库', cas: '历史正文与附件（CAS）', casTemporary: 'CAS 临时残留', processSpool: '进程输出暂存', diagnostics: '诊断日志', other: '其它运行文件', historicalBackups: '完整历史备份' };
   const lines = Object.entries(report.categories).map(([key, size]) =>
     `${labels[key as keyof typeof labels]}：${size.fileCount} 个文件，${formatBytes(size.bytes)}`);
-  await showReadOnly(context, '历史库占用', [
+  await showReadOnly(context, '当前历史占用', [
     '当前历史', candidate.runtimeDataRootPath, '', ...lines,
     '', `合计：${report.total.fileCount} 个文件，${formatBytes(report.total.bytes)}`,
     '这里统计文件逻辑大小，运行中的库可能继续变化。历史正文不是可随意清除的缓存；保留归档不会释放其磁盘占用。',

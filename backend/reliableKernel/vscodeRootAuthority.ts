@@ -61,7 +61,6 @@ export const VSCODE_LEGACY_WORKSPACE_RUNTIME_OWNER_DIRECTORY = 'runtime-owner';
 
 const WORKSPACE_RUNTIME_ID_DOMAIN = 'limcode-vscode-workspace-runtime\0';
 const RUNTIME_SELECTION_KIND = 'limcode-runtime-selection';
-const RUNTIME_DATA_SET_KEPT_KIND = 'limcode-runtime-data-set-kept';
 const UPGRADE_SELECTION_KIND = 'limcode-runtime-upgrade-selection';
 
 export type VscodeWorkspaceRuntimeScopeKind =
@@ -363,25 +362,6 @@ export function resolveVscodeRuntimeMergeLedgerRoot(paths: Pick<VscodeStoragePat
 }
 
 /**
- * True when the user switched away from exactly this data set incarnation in this version, or
- * when that cannot be ruled out: automatic merging needs a readable marker that names another
- * incarnation, or no marker at all.
- */
-export async function isVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<boolean> {
-  if (!candidate.dataSetId || !candidate.rootInstanceId) return false;
-  const file = keptMarkerPath(candidate);
-  await assertSafeRootPath(candidate.configurationRootPath, file);
-  let value: unknown;
-  try { value = await readOptionalJson(file); }
-  catch { return true; }
-  if (value === undefined) return false;
-  const record = value as Record<string, unknown> | null;
-  if (record?.kind !== RUNTIME_DATA_SET_KEPT_KIND) return true;
-  if (record.anyIncarnation === true) return true;
-  return record.dataSetId === candidate.dataSetId && record.rootInstanceId === candidate.rootInstanceId;
-}
-
-/**
  * v0.0.10–v0.0.20 windows also claimed their scope through `<scope>/runtime-owner/owner.json`
  * (their Host liveness in the data root is checked as for every version). Judged with the same
  * process-start identity rule as other claims: only a proven dead or reused owner is absent; a
@@ -404,40 +384,6 @@ export async function legacyWorkspaceRuntimeOwnerState(
     || (record.processStartIdentity !== undefined && typeof record.processStartIdentity !== 'string')) return 'unknown';
   const state = classifyRecordedProcess(record.pid as number, record.processStartIdentity as string | undefined);
   return state === 'dead' ? 'absent' : state === 'alive' ? 'alive' : 'unknown';
-}
-
-/** Without an identity (a data set that could not be inspected) the marker covers any incarnation. */
-async function markRuntimeDataSetKept(
-  candidate: Pick<VscodeRuntimeDataSetCandidate, 'configurationRootPath' | 'runtimeDataRootPath' | 'dataSetId' | 'rootInstanceId'>
-): Promise<void> {
-  const file = keptMarkerPath(candidate);
-  await assertSafeRootPath(candidate.configurationRootPath, file);
-  const identity = candidate.dataSetId && candidate.rootInstanceId
-    ? { dataSetId: candidate.dataSetId, rootInstanceId: candidate.rootInstanceId }
-    : { anyIncarnation: true };
-  await writeJsonFileDurably(file, { kind: RUNTIME_DATA_SET_KEPT_KIND, ...identity, keptAt: new Date().toISOString() });
-}
-
-/** Written whole or not at all (a temporary file, synced, renamed, its directory synced). */
-async function writeJsonFileDurably(file: string, value: unknown): Promise<void> {
-  const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
-  try {
-    const handle = await fs.open(temporary, 'wx', 0o600);
-    try {
-      await handle.writeFile(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fs.rename(temporary, file);
-    await syncDirectoryDurably(path.dirname(file));
-  } finally {
-    await fs.rm(temporary, { force: true });
-  }
-}
-
-function keptMarkerPath(candidate: Pick<VscodeRuntimeDataSetCandidate, 'runtimeDataRootPath'>): string {
-  return path.join(path.dirname(path.resolve(candidate.runtimeDataRootPath)), VSCODE_RUNTIME_DATA_SET_KEPT_FILE);
 }
 
 /** Seal the fresh-root reservation after ensureCurrentRoot succeeds, before the Host opens. */

@@ -49,7 +49,7 @@ const KINDS: ReadonlyArray<{ kind: RuntimeBackupKind; title: string; purpose: st
   { kind: 'merge-target', title: '合并前备份', purpose: '把其它历史库合并进来之前，接收合并的库的整份备份' },
   { kind: 'merge-source', title: '合并来源的收尾前备份', purpose: '合并前收尾来源库里没有结束的任务之前，来源库的整份备份' },
   {
-    kind: 'foreign-history', title: '外来历史库',
+    kind: 'merged-source', title: '已合并来源',
     purpose: '“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过、且能证明内容已完整在当前库或某个历史库里的才可以删除（归档整份删除，拷来目录只删其中的库）'
   },
   { kind: 'reset-archive', title: '归档目录里的其它内容（只列出）', purpose: '“归档并重置”的归档目录里不是归档的内容' },
@@ -110,7 +110,7 @@ export async function cleanupBackups(context: vscode.ExtensionContext, startup: 
   const deletable = plan.items.filter((item) => item.deletable);
   const first = await ask({
     title: deletable.length > 0 ? '清理备份：勾选要删除的备份' : '清理备份：没有可以删除的备份',
-    description: '只删除能证明完整存在于本地库的副本：副本里的每个对话、消息版本和工具调用、输出、回答等记录都还在当前库或同一数据目录的某个历史库里，正文文件也在，副本里显示的每条消息在那里也显示同一个版本；外来历史库还要先通过核验。含有别处没有的对话或记录的一律保留；其中有消息在那里已被你删除、编辑或重试替换的，单独列出，默认不勾选。',
+    description: '普通备份只在其中的对话、消息版本、工具记录和正文都完整存在于当前库时可删；显示已被删除或替换的消息会单独列出，默认不勾选。已合并来源必须有完整合并进当前库的成功记录且来源未变；待合并、部分合并和残留数据保留。',
     sections: firstPanelSections(plan),
     actions: deletable.length > 0 ? [CANCEL, { key: 'next', label: '下一步', variant: 'default' }] : [OK]
   });
@@ -203,7 +203,7 @@ function firstPanelSections(plan: RuntimeBackupCleanupPlan): DataRootPromptSecti
       });
     }
     // Right after the kinds that can be proven (foreign history is the last of them).
-    if (group.kind === 'foreign-history' && replaced.length > 0) {
+    if (group.kind === 'merged-source' && replaced.length > 0) {
       sections.push({
         title: `${REPLACED_GROUP.title}（${replaced.length} 项）`,
         lines: [`用途：${REPLACED_GROUP.purpose}`],
@@ -248,7 +248,7 @@ function createdText(item: RuntimeBackupCleanupItem): string {
  * no name to show); foreign history says where it comes from; the listed-only ones just say where they are.
  */
 function locationText(item: RuntimeBackupCleanupItem): string {
-  if (item.kind === 'foreign-history') return `来源：${item.origin ?? '外来历史库'}　位置：${item.path}`;
+  if (item.kind === 'merged-source') return `来源：${item.origin ?? '外来历史库'}　位置：${item.path}`;
   const owner = item.dataSetName ?? (item.inCurrentDataSet ? '当前库' : undefined);
   if (!DELETABLE_KINDS.has(item.kind) || !owner) return `位置：${item.path}`;
   return `所属：${owner}　位置：${item.path}`;

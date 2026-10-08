@@ -42,13 +42,13 @@ const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 test('H1 当前库里被删除、编辑或重试替换的消息只在拷贝里还能看到：单列为可删、写明条数（replacedMessages），显示一致的拷贝才写“内容已完整”；删除时替换的消息不能比列出时多，改名之前和之后都复核', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one', 'conversation_two']);
-  const before = await copyAsArchive(fixture.current, fixture.root, archiveName(1));
+  const before = await sourceBackup(fixture.current);
   let database = await openCurrent(t, fixture);
   // Deleting or retrying a message soft-deletes it; editing one makes a new revision current.
   await database.transaction(softDeleteSteps('conversation_one_message_1'));
   await editMessage(fixture.current, database, 'conversation_one_message_0');
   await database.close();
-  const after = await copyAsArchive(fixture.current, fixture.root, archiveName(2));
+  const after = await sourceBackup(fixture.current);
   database = await openCurrent(t, fixture);
 
   const plan = await planRuntimeBackupCleanup(fixture.root, database);
@@ -63,15 +63,15 @@ test('H1 当前库里被删除、编辑或重试替换的消息只在拷贝里�
   const late = await deleteRuntimeBackups(plan, database, [replaced.key], {
     async onFaultPoint(point) { if (point === 'after-rename') await database.transaction(softDeleteSteps('conversation_two_message_1')); }
   });
-  assert.deepEqual(late.kept.map((entry) => entry.reason), ['当前库里刚刚又有 1 条它有的消息被删除、编辑或重试替换，已改回原名，保留']);
+  assert.deepEqual(late.kept.map((entry) => entry.reason), ['当前库里刚刚又有 1 条这份备份里有的消息被删除、编辑或重试替换，已改回原名，保留']);
   assert.ok((await fs.lstat(before)).isDirectory());
   // Already replaced when the deletion begins: refused before any rename; the complete copy too.
   const points = [];
   const early = await deleteRuntimeBackups(plan, database, [replaced.key, complete.key], { onFaultPoint(point) { points.push(point); } });
   assert.deepEqual(points, []);
   assert.deepEqual(early.kept.map((entry) => entry.reason), [
-    '列出之后当前库里又有 1 条它有的消息被删除、编辑或重试替换，请重新检查；这一项没有删除',
-    '列出之后当前库里又有 1 条它有的消息被删除、编辑或重试替换，请重新检查；这一项没有删除'
+    '列出之后这份备份有变化，请重新检查；这一项没有删除',
+    '列出之后当前库里又有 1 条这份备份里有的消息被删除、编辑或重试替换，请重新检查；这一项没有删除'
   ]);
   // Checked again: ticked knowingly, both are deleted.
   const again = await planRuntimeBackupCleanup(fixture.root, database);
@@ -80,211 +80,22 @@ test('H1 当前库里被删除、编辑或重试替换的消息只在拷贝里�
   assert.deepEqual(done.deleted.map((entry) => entry.path).sort(), [before, after].sort(), JSON.stringify(done));
 });
 
-test('H1 其它历史库（读取线程给出的显示集合）与本地备份（C1）同样：那个库里删掉的消息让它的备份单列、写明它的名字；当前库的合并前备份在删除时复核，列出之后又删的消息挡住删除', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
-  await seed(fixture.alpha, ['conversation_alpha']);
-  const alphaBackup = await sourceBackup(fixture.alpha);
-  // A window of that project deleted a message afterwards: only the backup still shows it.
-  await withDataSet(fixture.alpha, (runtime) => runtime.transaction(softDeleteSteps('conversation_alpha_message_1')));
-  const database = await openCurrent(t, fixture);
-  const older = await targetBackup(fixture.current, database, 180);
-  await targetBackup(fixture.current, database, 120);
-  await editMessage(fixture.current, database, 'conversation_one_message_0');
 
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const ofAlpha = itemAt(plan, alphaBackup);
-  assert.deepEqual([ofAlpha.deletable, ofAlpha.replacedMessages, ofAlpha.dataSetName, ofAlpha.reason],
-    [true, 1, '历史库“shared”', '其中 1 条消息在历史库“shared”里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了']);
-  const ofCurrent = itemAt(plan, older);
-  assert.deepEqual([ofCurrent.deletable, ofCurrent.replacedMessages, ofCurrent.dataSetName, ofCurrent.reason],
-    [true, 1, '当前库', '其中 1 条消息在当前库里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了']);
 
-  await database.transaction(softDeleteSteps('conversation_one_message_1'));
-  const refused = await deleteRuntimeBackups(plan, database, [ofCurrent.key, ofAlpha.key]);
-  assert.deepEqual(refused.kept.map((entry) => entry.reason),
-    ['列出之后当前库里又有 1 条这份备份里有的消息被删除、编辑或重试替换，请重新检查；这一项没有删除']);
-  assert.deepEqual(refused.deleted.map((entry) => entry.path), [alphaBackup], '勾选的替换项照常删除');
-  const again = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(itemAt(again, older).replacedMessages, 2);
-  const done = await deleteRuntimeBackups(again, database, [itemAt(again, older).key]);
-  assert.deepEqual(done.deleted.map((entry) => entry.path), [older]);
-});
 
-test('H1 几个本地库都能覆盖时取显示一致的那个：当前库里删了消息、另一个历史库还显示它，就写“内容已完整在”那个历史库里', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_shared']);
-  await seed(fixture.alpha, ['conversation_shared']);
-  const archived = await copyAsArchive(fixture.current, fixture.root, archiveName(1));
-  const database = await openCurrent(t, fixture);
-  await database.transaction(softDeleteSteps('conversation_shared_message_1'));
-  const item = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.deepEqual([item.deletable, item.replacedMessages, item.reason],
-    [true, undefined, `可以删除：内容已完整在历史库“shared”里（其中 1 个对话、2 个消息版本都在，${COMPLETE}）`]);
-});
 
-test('L5 覆盖不只看对话和消息版本：拷贝里有当前库没有的工具调用、交互与回答、进程与输出时保留并写明；当前库都有之后可删；它引用的正文在当前库的正文库里缺失或大小不对时保留', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
-  // The same conversation with more history, in a data set of another installation.
-  const other = await initialize(path.join(fixture.base, 'elsewhere'), 'elsewhere');
-  await seed(other, ['conversation_one']);
-  const records = await addRecords(other, 'conversation_one');
-  const archived = await copyAsArchive(other, fixture.root, archiveName(1));
-  let database = await openCurrent(t, fixture);
 
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const item = itemAt(plan, archived);
-  assert.deepEqual([item.deletable, item.missingConversations, item.missingRevisions, item.reason], [false, 0, 0,
-    '含当前库没有的记录（工具调用 1 条、交给模型的工具结果 1 条、交互请求 1 条 等），也没有别的本地库完整包含它，按历史保留']);
 
-  await database.close();
-  await addRecords(fixture.current, 'conversation_one');
-  database = await openCurrent(t, fixture);
-  const covered = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.equal(covered.reason, `可以删除：内容已完整在当前库里（其中 1 个对话、2 个消息版本都在，${COMPLETE}）`);
 
-  // The body of the process output is gone from the current data set's content store, then the wrong size.
-  const [row] = (await database.snapshot([{ kind: 'get', domain: 'ContentObject', id: records.outputContentId }])).snapshot;
-  const body = path.join(database.binding.paths.casRootPath, ...row.storage_key.split('/'));
-  const saved = await fs.readFile(body);
-  await fs.rm(body);
-  const missing = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.deepEqual([missing.deletable, missing.reason],
-    [false, '当前库里缺 1 个它引用的正文文件（可能已损坏或丢失），也没有别的本地库完整包含它，按历史保留']);
-  await fs.writeFile(body, Buffer.concat([saved, Buffer.from('x')]));
-  assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived).deletable, false, '大小不对也不算');
-  await fs.rm(body);
-  await fs.writeFile(body, saved);
-  const restored = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(itemAt(restored, archived).deletable, true, itemAt(restored, archived).reason);
-  const result = await deleteRuntimeBackups(restored, database, [itemAt(restored, archived).key]);
-  assert.deepEqual(result.deleted.map((entry) => entry.path), [archived]);
-});
 
-test('L5 其它历史库（读取线程给出的记录与正文）同样：缺记录的写明那个库的名字；都有之后可删；它的正文库里缺正文时保留；身份相同的拷贝也要孪生库的正文都在', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_current']);
-  await seed(fixture.alpha, ['conversation_one']);
-  const other = await initialize(path.join(fixture.base, 'elsewhere'), 'elsewhere');
-  await seed(other, ['conversation_one']);
-  const records = await addRecords(other, 'conversation_one');
-  const archived = await copyAsArchive(other, fixture.root, archiveName(1));
-  const database = await openCurrent(t, fixture);
 
-  const item = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.deepEqual([item.deletable, item.reason], [false,
-    '含历史库“shared”没有的记录（工具调用 1 条、交给模型的工具结果 1 条、交互请求 1 条 等），也没有别的本地库完整包含它，按历史保留']);
-  await addRecords(fixture.alpha, 'conversation_one');
-  const covered = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.equal(covered.reason, `可以删除：内容已完整在历史库“shared”里（其中 1 个对话、2 个消息版本都在，${COMPLETE}）`);
 
-  // The body of the process output is gone from alpha's content store.
-  const alphaBody = path.join(fixture.alpha.binding.paths.casRootPath, ...await storageKey(fixture.alpha, records.outputContentId));
-  const saved = await fs.readFile(alphaBody);
-  await fs.rm(alphaBody);
-  const missing = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.deepEqual([missing.deletable, missing.reason],
-    [false, '历史库“shared”里缺 1 个它引用的正文文件（可能已损坏或丢失），也没有别的本地库完整包含它，按历史保留']);
-  // An exact copy of alpha: identical, but its bodies are alpha's own, and one is missing.
-  const twin = await copyAsArchive(fixture.alpha, fixture.alpha.scopeRoot, archiveName(2));
-  const identical = itemAt(await planRuntimeBackupCleanup(fixture.root, database), twin);
-  assert.deepEqual([identical.deletable, identical.reason],
-    [false, '历史库“shared”里缺 1 个它引用的正文文件（可能已损坏或丢失），按历史保留']);
-  await fs.writeFile(alphaBody, saved);
-  const whole = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.equal(itemAt(whole, twin).reason, '可以删除：内容已完整在历史库“shared”里（与它身份相同、内容完全相同，正文文件也都在）');
-});
 
-test('L1 只读查看打开着的外来库：检查与删除都按“正在被使用”保留；关闭后可删；登记在当前配置根、外来目录里不写任何东西；进程已结束的登记不算并被清掉，读不懂的登记按还在用处理', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
-  const archived = await copyAsArchive(fixture.current, fixture.root, archiveName(1));
-  const database = await openCurrent(t, fixture);
-  const found = (await foreign.discoverForeignRuntimeHistory({ configurationRootPath: fixture.root }))
-    .find((entry) => entry.location.containerPath === archived);
-  const { root } = await foreign.inspectForeignRuntimeRoot(fixture.root, found);
-  const views = path.join(fixture.root, '.limcode-runtime-merges', 'foreign-views', found.id.replace(/:/g, '-'));
-  const untouched = await treeState(archived);
-
-  const view = await openRuntimeDataSetHistory(fixture.paths, root);
-  let closed = false;
-  t.after(() => closed ? undefined : view.close().catch(() => undefined));
-  assert.equal((await fs.readdir(views)).filter((name) => name.endsWith('.json')).length, 1, '查看登记写在当前配置根');
-  const busy = itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived);
-  assert.deepEqual([busy.deletable, busy.reason], [false, `${BUSY}，这次不能删除，稍后再检查`]);
-  assert.ok((await view.readMessages('conversation_one')).items.some((entry) => entry.text.includes('第 1 条消息')), '查看照常读正文');
-  await view.close();
-  closed = true;
-  assert.equal(await exists(views), false, '关闭时撤销登记');
-
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const key = itemAt(plan, archived).key;
-  assert.equal(itemAt(plan, archived).deletable, true, itemAt(plan, archived).reason);
-  // Opened after the listing: the deletion keeps it.
-  const late = await openRuntimeDataSetHistory(fixture.paths, root);
-  let kept;
-  try { kept = await deleteRuntimeBackups(plan, database, [key]); }
-  finally { await late.close(); }
-  assert.deepEqual(kept.kept.map((entry) => entry.reason), [`${BUSY}，这一项没有删除`]);
-  assert.deepEqual(await treeState(archived), untouched, '查看、检查与没删成的删除都不写外来目录');
-
-  // A record of a process that is gone does not count (and goes); one that cannot be read counts.
-  await fs.mkdir(views, { recursive: true });
-  const token = randomUUID();
-  const stale = path.join(views, `${token}.json`);
-  await fs.writeFile(stale, JSON.stringify({
-    kind: 'limcode-foreign-history-view', foreignId: found.id, token, processId: await exitedProcessId(), openedAt: NOW
-  }));
-  const unreadable = path.join(views, `${randomUUID()}.json`);
-  await fs.writeFile(unreadable, '{');
-  assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), archived).reason, `${BUSY}，这次不能删除，稍后再检查`);
-  assert.equal(await exists(stale), false, '进程已结束的登记被清掉');
-  await fs.rm(unreadable);
-  const done = await deleteRuntimeBackups(plan, database, [key]);
-  assert.deepEqual(done.deleted.map((entry) => entry.path), [archived], JSON.stringify(done));
-});
-
-test('M1 删除外来库：已核对标记落盘之前 admission 与外来声明都持有；落盘之后放开 admission，递归删除只在声明内进行（另一个进程能进 admission、拿不到声明）；这时崩溃由下次清理凭标记删完', { timeout: 120_000 }, async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
-  const archived = await copyAsArchive(fixture.current, fixture.root, archiveName(1));
-  const crashed = await copyAsArchive(fixture.current, fixture.root, archiveName(2));
-  const database = await openCurrent(t, fixture);
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const item = itemAt(plan, archived);
-  const id = item.key.slice('foreign-history:'.length);
-  const pointer = path.join(archived, 'root-binding.json');
-  const seen = {};
-  const result = await deleteRuntimeBackups(plan, database, [item.key], {
-    async onFaultPoint(point) {
-      if (point === 'after-verify' || point === 'before-removal') seen[point] = await probe(fixture.root, id, pointer);
-    }
-  });
-  assert.deepEqual(result.deleted.map((entry) => entry.path), [archived], JSON.stringify(result));
-  assert.deepEqual(seen, {
-    'after-verify': { admission: 'held', claim: 'held' },
-    'before-removal': { admission: 'free', claim: 'held' }
-  });
-
-  const killed = await runChild(['delete-then-crash', fixture.root, itemAt(plan, crashed).key, 'before-removal']);
-  assert.equal(killed.signal, 'SIGKILL', killed.stderr);
-  const parent = path.dirname(crashed);
-  const leftover = (await fs.readdir(parent)).find((name) => name.startsWith(`${path.basename(crashed)}.deleting-`));
-  assert.ok(leftover, (await fs.readdir(parent)).join(','));
-  const next = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.deepEqual([next.finishedDeletions, next.restoredDeletions], [[path.join(parent, leftover)], []]);
-  assert.deepEqual(await fs.readdir(parent), [], '两份都删完');
-});
 
 test('L2 备份目录按种类逐项核对：本地备份（C1）或外来库保留的备份里有它的种类不会写的内容（另一份数据库、说明文件、子目录、名为 .tmp 的目录）时整份保留；只有 .tmp 普通文件时算没写完', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one']);
   await seed(fixture.alpha, ['conversation_only_in_alpha']);
-  const nestedCase = await copyAsArchive(fixture.current, fixture.root, archiveName(1));
-  const nestedName = backupNameAt(1);
-  const nested = await backupInto(nestedCase, fixture.current, nestedName);
-  await fs.copyFile(fixture.alpha.binding.paths.databasePath, path.join(nested, 'limcode-before-restore.sqlite'));
   const database = await openCurrent(t, fixture);
   const cases = {};
   const local = async (name, minutesAgo, prepare) => {
@@ -310,8 +121,6 @@ test('L2 备份目录按种类逐项核对：本地备份（C1）或外来库保
     writing: '备份还没有写完（目录里有临时文件），保留',
     clean: `可以删除：内容已完整在当前库里（其中 1 个对话、2 个消息版本都在，${COMPLETE}）`
   });
-  assert.deepEqual([itemAt(plan, nestedCase).deletable, itemAt(plan, nestedCase).reason], [false,
-    `它保留的合并前备份 ${nestedName}：备份目录里有不认识的内容（limcode-before-restore.sqlite），整份保留`]);
 });
 
 test('L3 已核对标记绑定配置根：别处写的标记（没有身份、身份不同、配置根不同）不算，改回原名重新核对，含本地库没有的对话就保留；本配置根写的照常删完', async (t) => {
@@ -350,167 +159,21 @@ test('L3 已核对标记绑定配置根：别处写的标记（没有身份、�
   for (const name of ['legacy', 'otherIdentity', 'otherRoot']) {
     const item = itemAt(plan, leftovers[name].original);
     assert.equal(item.deletable, false, name);
-    assert.match(item.reason, /^含 1 个当前库没有的对话（可能是你删掉的）/, name);
+    assert.match(item.reason, /尚未完整合并.*原位保留/, name);
     assert.equal(await exists(path.join(leftovers[name].original, '.limcode-backup-cleanup-verified')), false, '改回原名时去掉不属于它的标记');
   }
   assert.equal(await exists(leftovers.ours.leftover), false);
 });
 
-test('L4 历史库的名字与“历史与存储管理”一致：当前库、项目名（最多三个）、没有项目的工作区库写“旧工作区历史”、没有项目的默认库写“默认历史库”；原因与名字都不写 id', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.alpha, ['conversation_alpha']);
-  const beta = await addWorkspaceDataSet(fixture, 'file:///workspace/beta');
-  await seed(beta, ['conversation_beta'], { uri: 'file:///workspace/beta', name: 'beta' });
-  await seed(beta, ['conversation_gamma'], { uri: 'file:///workspace/gamma', name: 'gamma' });
-  const empty = await addWorkspaceDataSet(fixture, 'file:///workspace/empty');
-  const backups = {
-    default: await sourceBackup(fixture.current),
-    beta: await sourceBackup(beta),
-    empty: await sourceBackup(empty)
-  };
-  // Alpha is the one open in this window.
-  await publishInitialRuntimeSelection(fixture.paths, fixture.alpha.id);
-  const database = await kernel.RuntimeDatabase.open(fixture.alpha.authority, { hostBootId: `window-${randomUUID()}` });
-  t.after(() => database.close().catch(() => undefined));
-  backups.current = await targetBackup(fixture.alpha, database, 180);
-  await targetBackup(fixture.alpha, database, 120);
 
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.deepEqual(Object.fromEntries(Object.entries(backups).map(([name, directory]) => [name, itemAt(plan, directory).dataSetName])), {
-    default: '历史库“默认历史库”', beta: '历史库“beta、gamma”', empty: '历史库“旧工作区历史”', current: '当前库'
-  });
-  assert.equal(itemAt(plan, backups.beta).reason, `可以删除：内容已完整在历史库“beta、gamma”里（其中 2 个对话、4 个消息版本都在，${COMPLETE}）`);
-  assert.doesNotMatch(JSON.stringify(plan.items.map((item) => [item.reason, item.dataSetName])), /workspace:|default|（workspace/);
-});
 
-test('L6 外来库里逐项核对：名为 .tmp 的目录、名字像声明但格式不对或装着别的东西的目录、诊断目录里日志以外的内容都让它整份保留；只有日志和空的调试取证目录、或一个真正的声明目录时照常可删', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
-  const cases = {};
-  let index = 0;
-  const make = async (name, prepare) => {
-    index += 1;
-    const unit = await copyAsArchive(fixture.current, fixture.root, archiveName(index));
-    await prepare(unit);
-    cases[name] = unit;
-  };
-  const claim = async (directory, files) => {
-    await fs.mkdir(directory, { recursive: true });
-    for (const [file, content] of Object.entries(files)) await fs.writeFile(path.join(directory, file), content);
-  };
-  const owner = JSON.stringify({ processId: 1, hostBootId: 'gone' });
-  await make('temporaryDirectoryInData', (unit) => fs.mkdir(path.join(unit, 'active', 'limcode.sqlite.1.tmp')));
-  await make('temporaryDirectoryInControl', (unit) => fs.mkdir(path.join(unit, 'root-binding.json.1.tmp')));
-  await make('forgedClaimName', (unit) => claim(path.join(unit, 'notes.runtime-maintenance-old'), { 'owner.json': owner }));
-  await make('claimWithMore', (unit) => claim(path.join(unit, 'active', 'limcode.sqlite.runtime-maintenance'), { 'owner.json': owner, 'notes.txt': 'mine' }));
-  await make('diagnosticsOther', (unit) => claim(path.join(unit, 'active', 'diagnostics'), { 'events.jsonl': '{}\n', 'notes.txt': 'mine' }));
-  await make('diagnosticsJournalDirectory', (unit) => fs.mkdir(path.join(unit, 'active', 'diagnostics', 'events.1.jsonl'), { recursive: true }));
-  await make('onlyJournal', async (unit) => {
-    await claim(path.join(unit, 'active', 'diagnostics'), { 'events.jsonl': '{}\n', 'events.1.jsonl': '{}\n', 'events.3.jsonl': '{}\n' });
-    await fs.mkdir(path.join(unit, 'active', 'diagnostics', 'debug-captures'));
-  });
-  await make('leftClaim', (unit) => claim(path.join(unit, 'active', 'limcode.sqlite.runtime-maintenance'), { 'owner.json': owner }));
-  const database = await openCurrent(t, fixture);
 
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const full = `可以删除：内容已完整在当前库里（其中 1 个对话、2 个消息版本都在，${COMPLETE}）`;
-  assert.deepEqual(Object.fromEntries(Object.entries(cases).map(([name, unit]) => [name, itemAt(plan, unit).reason])), {
-    temporaryDirectoryInData: '数据目录里有不认识的内容（limcode.sqlite.1.tmp），整份保留，可自行处理',
-    temporaryDirectoryInControl: '里面有不认识的内容（root-binding.json.1.tmp），整份保留，可自行处理',
-    forgedClaimName: '里面有不认识的内容（notes.runtime-maintenance-old），整份保留，可自行处理',
-    claimWithMore: '数据目录里有不认识的内容（limcode.sqlite.runtime-maintenance），整份保留，可自行处理',
-    diagnosticsOther: '诊断目录里有不认识的内容（diagnostics/notes.txt），整份保留，可自行处理',
-    diagnosticsJournalDirectory: '诊断目录里有不认识的内容（diagnostics/events.1.jsonl），整份保留，可自行处理',
-    onlyJournal: full,
-    leftClaim: full
-  });
-});
 
-test('L7 改名前的最后一步与改名之后都再比较一次目录：改名前写进去的不改名、保留；改名之后才写进去的改回原名；正文库里新添的文件同样看得出', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_one']);
-  const beforeRename = await copyAsArchive(fixture.current, fixture.root, archiveName(1));
-  const afterRename = await copyAsArchive(fixture.current, fixture.root, archiveName(2));
-  const storeAdded = await copyAsArchive(fixture.current, fixture.root, archiveName(3));
-  const rewritten = await copyAsArchive(fixture.current, fixture.root, archiveName(4));
-  const database = await openCurrent(t, fixture);
-  const plan = await planRuntimeBackupCleanup(fixture.root, database);
-  const parent = path.dirname(beforeRename);
 
-  const points = [];
-  const first = await deleteRuntimeBackups(plan, database, [itemAt(plan, beforeRename).key], {
-    async onFaultPoint(point) {
-      points.push(point);
-      // After its coverage was read again, right before the rename.
-      if (point === 'before-rename') await fs.writeFile(path.join(beforeRename, 'active', 'written-late.txt'), 'x');
-    }
-  });
-  assert.deepEqual(points, ['before-rename'], '没有改名');
-  assert.deepEqual(first.kept.map((entry) => entry.reason), ['列出之后它有变化，请重新检查；这一项没有删除']);
-  assert.ok(await exists(path.join(beforeRename, 'active', 'written-late.txt')));
 
-  const second = await deleteRuntimeBackups(plan, database, [itemAt(plan, afterRename).key], {
-    async onFaultPoint(point) {
-      if (point !== 'after-rename') return;
-      const renamed = (await fs.readdir(parent)).find((name) => name.startsWith(`${path.basename(afterRename)}.deleting-`));
-      await fs.writeFile(path.join(parent, renamed, 'active', 'written-late.txt'), 'x');
-    }
-  });
-  assert.deepEqual(second.kept.map((entry) => entry.reason), ['改名前后它有变化，请重新检查，已改回原名，保留']);
-  assert.ok(await exists(path.join(afterRename, 'active', 'written-late.txt')));
 
-  // A content object that appeared in its store after the listing (objects are compared by name only).
-  const objects = path.join(storeAdded, 'active', 'cas', 'sha256');
-  const bucket = (await fs.readdir(objects)).sort()[0];
-  await fs.writeFile(path.join(objects, bucket, `${bucket}${'0'.repeat(62)}`), 'x');
-  const third = await deleteRuntimeBackups(plan, database, [itemAt(plan, storeAdded).key]);
-  assert.deepEqual(third.kept.map((entry) => entry.reason), ['列出之后它有变化，请重新检查；这一项没有删除']);
-  // An existing file outside the content store written again (the same bytes): its state changed.
-  const epochFile = path.join(rewritten, 'active', 'runtime-kernel-epoch.json');
-  const fourth = await deleteRuntimeBackups(plan, database, [itemAt(plan, rewritten).key], {
-    async onFaultPoint(point) { if (point === 'before-rename') await fs.writeFile(epochFile, await fs.readFile(epochFile)); }
-  });
-  assert.deepEqual(fourth.kept.map((entry) => entry.reason), ['列出之后它有变化，请重新检查；这一项没有删除']);
-  assert.deepEqual((await fs.readdir(parent)).filter((name) => name.includes('.deleting-')), []);
-});
 
-test('L9 身份相同证明：外来拷贝保留的备份里有孪生库已删掉的对话时，不能按“内容完全相同”删除', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_current']);
-  await seed(fixture.alpha, ['conversation_kept', 'conversation_deleted_later']);
-  // A backup taken while alpha still had both conversations, kept aside; then an exact copy of alpha as it is now, keeping it.
-  const name = backupNameAt(1);
-  const backup = await backupInto(path.join(fixture.base, 'aside'), fixture.alpha, name);
-  await deleteConversation(fixture.alpha, 'conversation_deleted_later');
-  const copy = await copyAsArchive(fixture.alpha, fixture.alpha.scopeRoot, archiveName(1));
-  await fs.mkdir(path.join(copy, 'merge-backups'), { recursive: true });
-  await fs.rename(backup, path.join(copy, 'merge-backups', name));
-  const database = await openCurrent(t, fixture);
-  const item = itemAt(await planRuntimeBackupCleanup(fixture.root, database), copy);
-  // Identical: only the twin is compared (its own rows were never read).
-  assert.deepEqual([item.deletable, item.reason], [false, '含 1 个历史库“shared”没有的对话（可能是你删掉的），按历史保留']);
-});
 
-test('L9 读孪生库的摘要与读它的 id 之间它又变了（故障注入）：不按身份相同删除，写明暂时无法核对；再检查时按覆盖核对，写明缺的对话', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.current, ['conversation_current']);
-  await seed(fixture.alpha, ['conversation_alpha_one', 'conversation_alpha_two']);
-  const twin = await copyAsArchive(fixture.alpha, fixture.alpha.scopeRoot, archiveName(1));
-  const database = await openCurrent(t, fixture);
-  let injected = 0;
-  const plan = await planRuntimeBackupCleanup(fixture.root, database, {
-    async onPlanningPoint(point, candidateId) {
-      if (point !== 'after-local-digest' || candidateId !== fixture.alpha.id || injected++ > 0) return;
-      await deleteConversation(fixture.alpha, 'conversation_alpha_two');
-    }
-  });
-  assert.equal(injected, 1);
-  const item = itemAt(plan, twin);
-  assert.deepEqual([item.deletable, item.reason], [false, '暂时无法核对：所在历史库在读取期间有变化，稍后再试']);
-  const next = itemAt(await planRuntimeBackupCleanup(fixture.root, database), twin);
-  assert.deepEqual([next.deletable, next.reason],
-    [false, '含 1 个历史库“shared”没有的对话（可能是你删掉的），也没有别的本地库完整包含它，按历史保留']);
-});
 
 // ---------------------------------------------------------------------------------------------
 // Fixtures

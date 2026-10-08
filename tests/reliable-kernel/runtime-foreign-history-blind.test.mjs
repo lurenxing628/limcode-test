@@ -27,7 +27,6 @@ const foreignMerge = kernelFile('runtimeForeignHistoryMerge.js');
 const records = kernelFile('runtimeMergeTombstones.js');
 const ledger = kernelFile('runtimeDataSetMergeLedger.js');
 const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
-const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBackupCleanup.js');
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
@@ -203,7 +202,7 @@ test('盲审 #1：本版本在来源库里删掉的对话（删除记录记在�
   // a_1 deleted in alpha while it was the current data set: recorded under alpha's identity.
   await deleteWithCommand(fixture.alpha.authority, fixture.root, 'a_1');
   assert.deepEqual(brief(await batch(fixture, explicit(fixture.alpha.id))).merged, [[fixture.alpha.id, 1, 0]]);
-  await deleteUnselectedRuntimeDataSet(fixture.paths, fixture.alpha.id, fixture.alpha.binding.dataSetId);
+  await fs.rm(path.dirname(fixture.alpha.binding.paths.dataRootPath), {recursive:true});
 
   const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root });
   const copy = report.entries.find((entry) => entry.location.containerPath === container && entry.scope === fixture.alpha.id);

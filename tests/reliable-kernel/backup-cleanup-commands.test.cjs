@@ -64,12 +64,12 @@ const PLAN = {
       dataSetName: undefined, inCurrentDataSet: false, bytes: '100', reclaimableBytes: '100', deletable: false, reason: '归档目录里不是“归档并重置”留下的归档（名字不认识）；只列出，不删除'
     }),
     item({
-      key: 'foreign-history:foreign:archive:0123456789abcdef', kind: 'foreign-history', name: '20260901-010203-004-abcdef12',
+      key: 'foreign-history:foreign:archive:0123456789abcdef', kind: 'merged-source', name: '20260901-010203-004-abcdef12',
       path: `${ROOT}/.limcode-runtime-backups/20260901-010203-004-abcdef12`, origin: '“归档并重置”的归档', dataSetCandidateId: undefined,
       dataSetName: undefined, inCurrentDataSet: false, bytes: '4096', reclaimableBytes: '4096', reason: '可以删除：内容已完整在当前库里（其中 2 个对话、4 个消息版本都在，显示的消息相同，正文文件也都在）'
     }),
     item({
-      key: 'foreign-history:foreign:copied:fedcba9876543210', kind: 'foreign-history', name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
+      key: 'foreign-history:foreign:copied:fedcba9876543210', kind: 'merged-source', name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
       path: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678/.limcode-runtime', origin: '拷来目录里的库', dataSetCandidateId: undefined,
       dataSetName: undefined, inCurrentDataSet: false, bytes: '8192', reclaimableBytes: '8192', deletable: false, reason: '未通过核验：结构或完整性核验未通过，原样保留'
     }),
@@ -77,7 +77,7 @@ const PLAN = {
       key: 'copied-data-root:limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', kind: 'copied-data-root',
       name: 'limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678', path: '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678',
       dataSetCandidateId: undefined, dataSetName: undefined, inCurrentDataSet: false, bytes: '300', reclaimableBytes: '300', deletable: false,
-      reason: '迁移数据目录时挪到旁边的拷来目录。其中的库在“外来历史库”一组里逐个核对，只删能证明内容已完整在本地库里的库；目录本身和其余内容（设置、规则、技能）不删除'
+      reason: '迁移数据目录时挪到旁边的拷来目录。其中的库在“已合并来源”一组里逐个核对，只删能证明内容已完整在本地库里的库；目录本身和其余内容（设置、规则、技能）不删除'
     })
   ]
 };
@@ -161,15 +161,15 @@ test('两步确认：检查有进度通知；第一个面板按种类分组列�
 
   const [first, second, done] = f.prompts;
   assert.equal(first.title, '清理备份：勾选要删除的备份');
-  assert.match(first.description, /只删除能证明完整存在于本地库的副本/);
-  assert.match(first.description, /工具调用、输出、回答等记录都还在当前库或同一数据目录的某个历史库里，正文文件也在，副本里显示的每条消息在那里也显示同一个版本/);
-  assert.match(first.description, /已被你删除、编辑或重试替换的，单独列出，默认不勾选/);
+  assert.match(first.description, /普通备份只在/);
+  assert.match(first.description, /工具记录和正文都完整存在于当前库/);
+  assert.match(first.description, /显示已被删除或替换的消息会单独列出，默认不勾选/);
   assert.doesNotMatch(first.description, /包括编辑前的版本/, '不再说编辑前的版本都还在：被替换的消息单独列出');
   assert.deepEqual(first.actions.map((action) => action.key), ['cancel', 'next']);
   assert.equal(first.danger, undefined);
   assert.equal(first.options, undefined, '勾选框按种类放在各自的分组里');
   assert.deepEqual(first.sections.slice(1).map((section) => section.title), [
-    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '外来历史库（2 项）',
+    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '已合并来源（2 项）',
     '归档目录里的其它内容（只列出）（1 项）', '拷来目录（只列出）（1 项）'
   ]);
   const merge = first.sections.find((section) => section.title === '合并前备份（2 项）');
@@ -210,7 +210,7 @@ test('含你后来删除或替换的内容单独一组（审查 H1）：默认�
     reason: '其中 2 条消息在当前库里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了'
   });
   const replacedForeign = item({
-    key: 'foreign-history:foreign:archive:1111111111111111', kind: 'foreign-history', name: '20260902-010203-004-abcdef13',
+    key: 'foreign-history:foreign:archive:1111111111111111', kind: 'merged-source', name: '20260902-010203-004-abcdef13',
     path: `${ROOT}/.limcode-runtime-backups/20260902-010203-004-abcdef13`, origin: '“归档并重置”的归档', dataSetCandidateId: undefined,
     dataSetName: undefined, inCurrentDataSet: false, replacedMessages: 1,
     reason: '其中 1 条消息在历史库“项目甲”里已被你删除、编辑或重试替换，删除这份后它们就再也看不到了'
@@ -221,7 +221,7 @@ test('含你后来删除或替换的内容单独一组（审查 H1）：默认�
   await f.run();
   const [first, second] = f.prompts;
   assert.deepEqual(first.sections.slice(1).map((section) => section.title), [
-    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '外来历史库（2 项）', '含你后来删除或替换的内容（2 项）',
+    '升级前备份（1 项）', '合并前备份（2 项）', '合并来源的收尾前备份（1 项）', '已合并来源（2 项）', '含你后来删除或替换的内容（2 项）',
     '归档目录里的其它内容（只列出）（1 项）', '拷来目录（只列出）（1 项）'
   ], '紧跟在可以证明的几种之后');
   const group = first.sections.find((section) => section.title === '含你后来删除或替换的内容（2 项）');
@@ -431,7 +431,7 @@ test('检查结果：上次中断、改回原名的项写在面板上；技术�
   assert.ok(warnings.some((line) => line.includes('EACCES')), warnings.join('\n'));
 });
 
-test('外来历史库单独一组：可删的写明来源、位置和内容已完整在哪个库，不可删的写明原因；离开过的数据目录交给检查；删除后拷来目录里没有库时写明其余内容保留', async () => {
+test('已合并来源单独一组：可删的写明来源、位置和内容已完整在哪个库，不可删的写明原因；离开过的数据目录交给检查；删除后拷来目录里没有库时写明其余内容保留', async () => {
   const COPIED = '/data/limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678';
   const f = fixture({
     status: { dataRootPath: ROOT, lastMigration: { fromPath: '/old/limcode' } },
@@ -452,8 +452,8 @@ test('外来历史库单独一组：可删的写明来源、位置和内容已�
   assert.deepEqual(f.calls.find((call) => call[0] === 'plan'), ['plan', ROOT, true, ['/old/limcode']], '最近一次迁移离开的目录的归档和旁边的拷来目录一起核对');
   assert.deepEqual(f.calls.find((call) => call[0] === 'status'), ['status', true]);
   const [first, second, done] = f.prompts;
-  assert.match(first.description, /外来历史库还要先通过核验/);
-  const foreign = first.sections.find((section) => section.title === '外来历史库（2 项）');
+  assert.match(first.description, /已合并来源必须有完整合并/);
+  const foreign = first.sections.find((section) => section.title === '已合并来源（2 项）');
   assert.match(foreign.lines[0], /^用途：“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过/);
   assert.deepEqual(foreign.options.map((option) => option.key), ['foreign-history:foreign:archive:0123456789abcdef']);
   assert.match(foreign.options[0].detail,
@@ -470,7 +470,7 @@ test('外来历史库单独一组：可删的写明来源、位置和内容已�
   ]);
 });
 
-test('最后一轮 #5 连续迁移之后：离开过的数据目录（globalStatus 的列表，加上最近一次迁移离开的目录）都交给检查，和外来历史库的发现一致', async () => {
+test('最后一轮 #5 连续迁移之后：离开过的数据目录（globalStatus 的列表，加上最近一次迁移离开的目录）都交给检查，和已合并来源的发现一致', async () => {
   const f = fixture({
     status: { dataRootPath: ROOT, lastMigration: { fromPath: '/b/limcode' }, previousDataRoots: ['/b/limcode', '/a/limcode'] },
     answers: [{ choice: 'cancel', include: [] }]

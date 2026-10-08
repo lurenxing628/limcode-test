@@ -16,7 +16,6 @@ import {
 const require = createRequire(import.meta.url);
 const foreign = kernelFile('runtimeForeignHistory.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
-const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { inspectVscodeRuntimeDataSets } = kernelFile('vscodeRootAuthority.js');
 const { writeRuntimeDataSetMergeLedgerRecord } = kernelFile('runtimeDataSetMergeLedger.js');
 import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
@@ -74,7 +73,7 @@ test('foreign-archive-only-relocation：删掉本地库、只剩归档的工作�
   const fixture = await createFixture(t);
   const alpha = fixture.alpha;
   const { backupPath, fresh } = await archiveAndReset(fixture, alpha);
-  await withRuntime(fixture.current, current => deleteUnselectedRuntimeDataSet(fixture.paths, alpha.id, fresh.binding.dataSetId, { coveredByCurrent: current }));
+  await fs.rm(path.dirname(fresh.binding.paths.dataRootPath), {recursive:true});
   assert.deepEqual(await fs.readdir(alpha.scopeRoot), ['.limcode-runtime-backups'], '这个工作区只剩它的归档');
   const inspection = await inspectVscodeRuntimeDataSets(fixture.paths);
   assert.deepEqual(inspection.problems, []);
@@ -119,7 +118,7 @@ test('foreign-archive-only-relocation：迁走的工作区库带着归档，删�
   const key = `backup:${fixture.alpha.id}:.limcode-runtime-backups`;
   const { plan: deletion, result } = await deleteAsConfirmed({ oldRootPath: fixture.root, currentRootPath: target });
   assert.equal(deletion.items.filter((entry) => entry.key === key).length, 1, '归档只列一次（由历史库本身列出）');
-  assert.equal(result.remainingDataSets, 0);
+  assert.equal(result.remainingDataSets, 2, '非当前来源原位保留，不记成已迁走');
   assert.equal(result.remainingArchives, 1);
   assert.ok(await exists(backupPath));
   await verifiedFromNewDirectory(target, fixture.root, backupPath);

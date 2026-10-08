@@ -19,7 +19,6 @@ const fsSync = require('node:fs');
 const foreign = kernelFile('runtimeForeignHistory.js');
 const { RUNTIME_KERNEL_EPOCH } = kernelFile('contracts.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
-const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { listVscodeRuntimeDataSets, selectVscodeRuntimeDataSet } = kernelFile('vscodeRootAuthority.js');
 const { writeRuntimeDataSetMergeLedgerRecord } = kernelFile('runtimeDataSetMergeLedger.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
@@ -239,7 +238,7 @@ for (const scopeKind of ['default', 'workspace']) {
     await ledger.writeRuntimeDataSetMergeLedgerRecord(fixture.paths, { candidateId: target.id, source: fingerprint,
       target: { dataSetId: survivor.binding.dataSetId, rootInstanceId: survivor.binding.rootInstanceId },
       state: 'merged', mergedAt: NOW, insertedRows: 0, reusedRows: 0, insertedConversations: 0 });
-    await deleteUnselectedRuntimeDataSet(fixture.paths, target.id, current.dataSetId);
+    await fs.rm(path.dirname(fresh.binding.paths.dataRootPath), {recursive:true});
     assert.deepEqual(await treeState(backupPath), archiveBefore, '删除本地库不连带删除归档');
     assert.deepEqual((await listVscodeRuntimeDataSets(fixture.paths)).map((candidate) => candidate.id), [survivor.id]);
     const after = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root });
