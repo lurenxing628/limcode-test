@@ -6,9 +6,10 @@ import { RECORDS_DIR, STORAGE_VERSION } from './constants';
 import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
 import { readJson, readJsonStrict, writeJson } from './json';
 import { sortableName } from './naming';
-import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
+import { createMissingStorageRevision, createStorageRevision, sameStorageContent } from './storageRevision';
 import { isRetryableWindowsLockPublicationRenameError } from './lockRenameErrors';
 import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
+import { recordStorageFileRemoval } from './storageFilePublications';
 
 interface RecordsIndexFile {
   schemaVersion: typeof STORAGE_VERSION;
@@ -42,6 +43,11 @@ export interface SaveRecordStoreOptions {
 export interface RecordStoreSnapshot<TRecord> {
   records: TRecord[];
   revision: string;
+}
+
+interface LoadedRecordStore<TRecord> {
+  index: RecordsIndexFile;
+  records: TRecord[];
 }
 
 export interface RecordStoreCommitResult<TRecord> extends RecordStoreSnapshot<TRecord> {
@@ -201,18 +207,19 @@ export async function commitRecordStoreSnapshot<TRecord extends { id: string }, 
   options: CommitRecordStoreSnapshotOptions
 ): Promise<RecordStoreCommitResult<TRecord>> {
   return withRecordStoreMutationLock(indexUri, async () => {
-    const current = await loadRecordStoreSnapshotUnlocked<TRecord, TKey>(root, indexUri, recordKey);
-    const actualRevision = current?.revision ?? missingRecordStoreRevision(indexUri);
-    const defaultsForMissing = options.expectedRevision === missingRecordStoreRevision(indexUri)
-      && !!current && options.isDefaultRecords?.(current.records) === true;
+    const current = await loadRecordStoreUnlocked<TRecord, TKey>(root, indexUri, recordKey);
+    const actualRevision = current ? createStorageRevision(current.records) : missingRecordStoreRevision(indexUri);
+    const defaultsForMissing = actualRevision !== options.expectedRevision && !!current
+      && options.isDefaultRecords?.(current.records) === true
+      && options.expectedRevision === missingRecordStoreRevision(indexUri);
     if (actualRevision !== options.expectedRevision && !defaultsForMissing) {
       throw new SettingsRevisionConflictError(options.section, options.expectedRevision, actualRevision);
     }
 
-    await saveRecordStoreUnlocked(root, indexUri, records, recordKey, labelForRecord, options);
+    const changed = await saveRecordStoreUnlocked(root, indexUri, records, recordKey, labelForRecord, options, current ?? null);
     return {
       records: [...records],
-      revision: createStorageRevision(records),
+      revision: current && !changed ? actualRevision : createStorageRevision(records),
       previousRecords: current?.records ?? []
     };
   });
@@ -279,6 +286,15 @@ async function loadRecordStoreSnapshotUnlocked<TRecord extends { id: string }, T
   indexUri: vscode.Uri,
   recordKey: TKey
 ): Promise<RecordStoreSnapshot<TRecord> | undefined> {
+  const loaded = await loadRecordStoreUnlocked<TRecord, TKey>(root, indexUri, recordKey);
+  return loaded ? { records: loaded.records, revision: createStorageRevision(loaded.records) } : undefined;
+}
+
+async function loadRecordStoreUnlocked<TRecord extends { id: string }, TKey extends string>(
+  root: vscode.Uri,
+  indexUri: vscode.Uri,
+  recordKey: TKey
+): Promise<LoadedRecordStore<TRecord> | undefined> {
   const index = await loadRecordsIndex(indexUri, true);
   if (!index) {
     const orphanFiles = await listRecordFiles(root);
@@ -290,7 +306,7 @@ async function loadRecordStoreSnapshotUnlocked<TRecord extends { id: string }, T
 
   const files = await loadRecordFilesInBatches<TRecord, TKey>(root, index.records, recordKey, true);
   const records = files.filter((record): record is TRecord => record !== undefined);
-  return { records, revision: createStorageRevision(records) };
+  return { index, records };
 }
 
 export async function saveRecordStore<TRecord extends { id: string }, TKey extends string>(
@@ -301,7 +317,9 @@ export async function saveRecordStore<TRecord extends { id: string }, TKey exten
   labelForRecord: (record: TRecord) => string = (record) => record.id,
   options: SaveRecordStoreOptions = {}
 ): Promise<void> {
-  return withRecordStoreMutationLock(indexUri, () => saveRecordStoreUnlocked(root, indexUri, records, recordKey, labelForRecord, options));
+  return withRecordStoreMutationLock(indexUri, async () => {
+    await saveRecordStoreUnlocked(root, indexUri, records, recordKey, labelForRecord, options);
+  });
 }
 
 async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey extends string>(
@@ -310,27 +328,39 @@ async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey exte
   records: TRecord[],
   recordKey: TKey,
   labelForRecord: (record: TRecord) => string,
-  options: SaveRecordStoreOptions
-): Promise<void> {
+  options: SaveRecordStoreOptions,
+  current?: LoadedRecordStore<TRecord> | null
+): Promise<boolean> {
   const savedAt = new Date().toISOString();
   const recordsRoot = vscode.Uri.joinPath(root, RECORDS_DIR);
   await vscode.workspace.fs.createDirectory(recordsRoot);
   // Compare stored content, not just ids or timestamps. Existing callers may submit a full
   // catalog; unchanged files and index entries must not generate writes or watcher events.
   // Missing/invalid files still get rebuilt by this explicit full-catalog save.
-  const previousIndex = await loadRecordsIndex(indexUri, false);
+  const previousIndex = current === undefined ? await loadRecordsIndex(indexUri, false) : current?.index;
   const previousRecords = previousIndex?.records ?? [];
   const previousById = new Map(previousRecords.map((record) => [record.id, record]));
   const unchanged = new Set<string>();
-  for (let offset = 0; offset < records.length; offset += LOAD_RECORD_BATCH_SIZE) {
-    await Promise.all(records.slice(offset, offset + LOAD_RECORD_BATCH_SIZE).map(async record => {
-      const previous = previousById.get(record.id);
-      if (!previous) return;
-      const stored = await readJsonStrict<RecordFile<TKey, TRecord>>(vscode.Uri.joinPath(root, ...previous.file.split('/')));
-      if (stored.status === 'ioError') throw stored.error;
-      if (stored.status === 'ok' && stored.value?.schemaVersion === STORAGE_VERSION && stored.value?.[recordKey]
-        && createStorageRevision(stored.value[recordKey]) === createStorageRevision(record)) unchanged.add(record.id);
-    }));
+  if (current !== undefined) {
+    const storedById = new Map(current?.records.map(record => [record.id, record]));
+    for (let offset = 0; offset < records.length; offset += LOAD_RECORD_BATCH_SIZE) {
+      for (const record of records.slice(offset, offset + LOAD_RECORD_BATCH_SIZE)) {
+        const stored = storedById.get(record.id);
+        if (stored && sameStorageContent(stored, record)) unchanged.add(record.id);
+      }
+      if (offset + LOAD_RECORD_BATCH_SIZE < records.length) await yieldToExtensionHost();
+    }
+  } else {
+    for (let offset = 0; offset < records.length; offset += LOAD_RECORD_BATCH_SIZE) {
+      await Promise.all(records.slice(offset, offset + LOAD_RECORD_BATCH_SIZE).map(async record => {
+        const previous = previousById.get(record.id);
+        if (!previous) return;
+        const stored = await readJsonStrict<RecordFile<TKey, TRecord>>(vscode.Uri.joinPath(root, ...previous.file.split('/')));
+        if (stored.status === 'ioError') throw stored.error;
+        if (stored.status === 'ok' && stored.value?.schemaVersion === STORAGE_VERSION && stored.value?.[recordKey]
+          && sameStorageContent(stored.value[recordKey], record)) unchanged.add(record.id);
+      }));
+    }
   }
 
   const nextIndexRecords: RecordIndexRecord[] = [];
@@ -349,7 +379,10 @@ async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey exte
   }
 
   // 先发布新索引，再清理旧文件；并发读取者只会看到“旧索引 + 完整旧文件”或新索引。
-  if (!previousIndex || createStorageRevision(previousRecords) !== createStorageRevision(nextIndexRecords)) {
+  if (!previousIndex || previousRecords.length !== nextIndexRecords.length || previousRecords.some((record, index) => {
+    const next = nextIndexRecords[index];
+    return record.id !== next.id || record.file !== next.file || record.updatedAt !== next.updatedAt;
+  })) {
     await writeJson(indexUri, {
       schemaVersion: STORAGE_VERSION,
       savedAt,
@@ -364,6 +397,8 @@ async function saveRecordStoreUnlocked<TRecord extends { id: string }, TKey exte
       .filter((file) => !nextFiles.has(file))
       .map((file) => deleteRecordFile(root, file)));
   }
+  return !previousIndex || unchanged.size !== records.length || previousRecords.length !== records.length
+    || previousRecords.some((record, index) => record.id !== records[index].id);
 }
 
 
@@ -474,7 +509,11 @@ async function listRecordFiles(root: vscode.Uri): Promise<string[]> {
 async function deleteRecordFile(root: vscode.Uri, file: string): Promise<void> {
   try {
     const uri = vscode.Uri.joinPath(root, ...file.split('/'));
-    if (isNodeFsStorageUri(uri)) await fs.rm(nodeFsStoragePath(uri), { force: true });
+    if (isNodeFsStorageUri(uri)) {
+      const filePath = nodeFsStoragePath(uri);
+      await fs.rm(filePath, { force: true });
+      recordStorageFileRemoval(filePath);
+    }
     else await vscode.workspace.fs.delete(uri);
   } catch (error) {
     if (!isFileNotFound(error)) console.warn(`[LimCode] Failed to prune record file: ${file}`, error);

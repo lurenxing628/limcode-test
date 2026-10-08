@@ -3,6 +3,7 @@ import type { ApplicationFacade } from '../ApplicationFacade';
 import type { GlobalSettingsSection } from '../../shared/protocol';
 import { INDEX_FILE, RECORDS_DIR, SETTINGS_ROOT_DIR } from '../../backend/capabilities/vscodeStorage/constants';
 import { LIMCODE_GLOBAL_STATUS_FILE } from '../../backend/capabilities/vscodeStorage/globalStatus';
+import { isPublishedStorageFileUnchanged } from '../../backend/capabilities/vscodeStorage/storageFilePublications';
 
 // Snapshot reads also create lock owner.json files. Watch only durable store files so a
 // refresh cannot observe its own read lock and schedule another refresh indefinitely.
@@ -44,8 +45,9 @@ export function registerGlobalSettingsWatcher(
 
 class GlobalSettingsWatcher implements vscode.Disposable {
   private readonly watchers: vscode.FileSystemWatcher[] = [];
-  private readonly dirtySections = new Set<GlobalSettingsSection>();
+  private readonly dirtySections = new Map<GlobalSettingsSection, Map<string, vscode.Uri>>();
   private refreshTimer: ReturnType<typeof setTimeout> | undefined;
+  private disposed = false;
 
   public constructor(
     private readonly application: ApplicationFacade,
@@ -66,7 +68,7 @@ class GlobalSettingsWatcher implements vscode.Disposable {
     const statusWatcher = vscode.workspace.createFileSystemWatcher(
       new vscode.RelativePattern(this.canonicalStatusRoot, LIMCODE_GLOBAL_STATUS_FILE)
     );
-    const scheduleCommon = () => this.scheduleSection('common');
+    const scheduleCommon = (uri: vscode.Uri) => this.scheduleSection('common', uri);
     statusWatcher.onDidCreate(scheduleCommon);
     statusWatcher.onDidChange(scheduleCommon);
     statusWatcher.onDidDelete(scheduleCommon);
@@ -74,6 +76,7 @@ class GlobalSettingsWatcher implements vscode.Disposable {
   }
 
   public dispose(): void {
+    this.disposed = true;
     if (this.refreshTimer !== undefined) clearTimeout(this.refreshTimer);
     this.refreshTimer = undefined;
     for (const watcher of this.watchers) watcher.dispose();
@@ -83,21 +86,25 @@ class GlobalSettingsWatcher implements vscode.Disposable {
   private schedule(uri: vscode.Uri): void {
     const section = sectionFromSettingsUri(uri);
     if (!section) return;
-    this.scheduleSection(section);
+    this.scheduleSection(section, uri);
   }
 
-  private scheduleSection(section: GlobalSettingsSection): void {
-    this.dirtySections.add(section);
+  private scheduleSection(section: GlobalSettingsSection, uri: vscode.Uri): void {
+    const files = this.dirtySections.get(section) ?? new Map<string, vscode.Uri>();
+    files.set(uri.toString(), uri);
+    this.dirtySections.set(section, files);
     if (this.refreshTimer !== undefined) clearTimeout(this.refreshTimer);
-    this.refreshTimer = setTimeout(() => {
+    this.refreshTimer = setTimeout(async () => {
       this.refreshTimer = undefined;
       const sections = [...this.dirtySections];
       this.dirtySections.clear();
-      for (const item of sections) {
-        void this.application.refreshGlobalSettings(item).catch((error) => {
-          console.warn(`[LimCode] Failed to refresh externally changed settings: ${item}`, error);
+      await Promise.all(sections.map(async ([section, changedFiles]) => {
+        const known = await Promise.all([...changedFiles.values()].map(isPublishedStorageFileUnchanged));
+        if (this.disposed || known.every(Boolean)) return;
+        await this.application.refreshGlobalSettings(section).catch((error) => {
+          console.warn(`[LimCode] Failed to refresh externally changed settings: ${section}`, error);
         });
-      }
+      }));
     }, REFRESH_DEBOUNCE_MS);
   }
 }

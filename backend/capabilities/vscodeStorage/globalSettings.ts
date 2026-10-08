@@ -14,10 +14,11 @@ import { createDefaultLlmCompressionSettings } from '../../../shared/protocol';
 import { ATTACHMENT_SETTINGS_FILE, CHECKPOINT_MAINTENANCE_SETTINGS_FILE, LLM_COMPRESSION_SETTINGS_FILE, LLM_SETTINGS_FILE, STORAGE_VERSION } from './constants';
 import { APPEARANCE_SETTINGS_FILE } from './constants';
 import { SettingsRevisionConflictError } from '../settingsRevisionConflict';
-import { readJson, writeJson } from './json';
+import { isFileNotFoundError, readJson, writeJson } from './json';
+import * as fs from 'node:fs/promises';
 import { createDefaultLlmSettings, normalizeLlmSettings } from './llmSettings';
 import { normalizeLlmCompressionSettings } from './llmCompressionConfigs';
-import { storageDirectoryExists } from './localStorageUri';
+import { isNodeFsStorageUri, nodeFsStoragePath, storageDirectoryExists } from './localStorageUri';
 import { withRecordStoreTransaction } from './recordStore';
 import { createMissingStorageRevision, createStorageRevision } from './storageRevision';
 
@@ -156,7 +157,17 @@ export function normalizeAttachmentSettings(input: Partial<AttachmentSettingsRec
 }
 
 export async function ensureGlobalSettingsFile(root: vscode.Uri, section: GlobalSettingsSection): Promise<void> {
-  await loadGlobalSettingsFile(root, section);
+  const uri = globalSettingsFileUri(root, section);
+  try {
+    const exists = isNodeFsStorageUri(uri)
+      ? (await fs.stat(nodeFsStoragePath(uri))).isFile()
+      : ((await vscode.workspace.fs.stat(uri)).type & vscode.FileType.File) !== 0;
+    if (!exists) throw new Error(`Settings path is not a file: ${uri.fsPath}`);
+  } catch (error) {
+    if (!isFileNotFoundError(error)) throw error;
+    // Explicit configuration saves may create the settings directory; passive reads may not.
+    await materializeMissingGlobalSettingsFile(root, section);
+  }
 }
 
 export async function loadGlobalSettingsFile(
@@ -186,10 +197,11 @@ export async function writeGlobalSettingsFile(
       throw new SettingsRevisionConflictError(section, expectedRevision, actualRevision);
     }
     const normalized = getFileBackedSpec(section).normalize(settings as Partial<GlobalSettingsSectionValue> | undefined);
-    if (previous && createStorageRevision(normalized) === actualRevision) {
+    const revision = createStorageRevision(normalized);
+    if (previous && revision === actualRevision) {
       return { ...previous, previousSettings: previous.settings };
     }
-    const committed = await writeGlobalSettingsFileUnlocked(uri, section, settings);
+    const committed = await writeGlobalSettingsFileUnlocked(uri, section, normalized, revision);
     return {
       ...committed,
       ...(previous ? { previousSettings: previous.settings } : {})
@@ -212,10 +224,19 @@ async function initializeMissingGlobalSettingsFile(
   if (!await storageDirectoryExists(root)) {
     return { section, settings: getFileBackedSpec(section).createDefault(), filePath: uri.fsPath, revision: missingGlobalSettingsRevision(uri, section) };
   }
+  return materializeMissingGlobalSettingsFile(root, section);
+}
+
+async function materializeMissingGlobalSettingsFile(
+  root: vscode.Uri,
+  section: GlobalSettingsSection
+): Promise<GlobalSettingsFileResult> {
+  const uri = globalSettingsFileUri(root, section);
   return withRecordStoreTransaction(uri, async () => {
     const current = await readJson<unknown>(uri, { throwOnError: true });
     if (current !== undefined) return materializeGlobalSettingsFile(root, section, current);
-    return writeGlobalSettingsFileUnlocked(uri, section, getFileBackedSpec(section).createDefault());
+    const spec = getFileBackedSpec(section);
+    return writeGlobalSettingsFileUnlocked(uri, section, spec.normalize(spec.createDefault() as Partial<GlobalSettingsSectionValue>));
   });
 }
 
@@ -240,10 +261,9 @@ function materializeGlobalSettingsFile(
 async function writeGlobalSettingsFileUnlocked(
   uri: vscode.Uri,
   section: GlobalSettingsSection,
-  settings: GlobalSettingsSectionValue
+  normalized: GlobalSettingsSectionValue,
+  revision = createStorageRevision(normalized)
 ): Promise<GlobalSettingsFileResult> {
-  const spec = getFileBackedSpec(section);
-  const normalized = spec.normalize(settings as Partial<GlobalSettingsSectionValue> | undefined);
   await writeJson(uri, {
     schemaVersion: STORAGE_VERSION,
     savedAt: new Date().toISOString(),
@@ -253,7 +273,7 @@ async function writeGlobalSettingsFileUnlocked(
     section,
     settings: normalized,
     filePath: uri.fsPath,
-    revision: createStorageRevision(normalized)
+    revision
   };
 }
 
@@ -267,7 +287,9 @@ function missingGlobalSettingsRevision(uri: vscode.Uri, section: GlobalSettingsS
  * them earlier must not see its first save rejected because another read wrote them meanwhile.
  */
 function sameGlobalSettingsRevision(uri: vscode.Uri, section: GlobalSettingsSection, actual: string, expected: string): boolean {
+  if (actual === expected) return true;
   const missing = missingGlobalSettingsRevision(uri, section);
+  if (actual !== missing && expected !== missing) return false;
   const spec = getFileBackedSpec(section);
   const defaults = createStorageRevision(spec.normalize(spec.createDefault() as Partial<GlobalSettingsSectionValue>));
   const canonical = (revision: string): string => revision === missing ? defaults : revision;

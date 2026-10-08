@@ -2518,27 +2518,35 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
     },
     applySnapshot(payload: GlobalSettingsSnapshotPayload, correlationId?: string): void {
       const section = payload.section;
-      payload = { ...payload, settings: normalizeSettingsSnapshot(section, payload.settings) };
       const coordinator = coordinatorFor(section);
       if (correlationId && coordinator.ignoredReplyIds.has(correlationId)) return;
+      const recoveryReply = !!correlationId && coordinator.recoveryRequestId === correlationId;
+      const saveReply = !!correlationId && coordinator.inFlight?.requestId === correlationId;
+      if (!recoveryReply && !saveReply && this.loadedSections[section] && this.revisions[section] === payload.revision) {
+        this.clearLoadingSettingSection(section);
+        this.pumpSettingsUpdate(section);
+        settleSettingsStatus(this, '设置已同步');
+        return;
+      }
+      payload = { ...payload, settings: normalizeSettingsSnapshot(section, payload.settings) };
       if (correlationId && coordinator.recoveryRequestId === correlationId) {
         clearSectionSaveTimeout(coordinator);
         coordinator.recoveryRequestId = undefined;
         ignoreSettingsReply(coordinator, correlationId);
         const attempted = coordinator.inFlight;
         if (attempted && sameSettingsContent(attempted.payload.settings, payload.settings)) {
-          this.applySnapshot(payload, attempted.requestId);
+          correlationId = attempted.requestId;
+        } else {
+          if (attempted) {
+            ignoreSettingsReply(coordinator, attempted.requestId);
+            coordinator.inFlight = undefined;
+            coordinator.queued = { section, settings: plainSettingsFromState(this, section) };
+          }
+          coordinator.paused = false;
+          coordinator.awaitingConflictSnapshot = false;
+          this.resolveExternalSnapshot(payload);
           return;
         }
-        if (attempted) {
-          ignoreSettingsReply(coordinator, attempted.requestId);
-          coordinator.inFlight = undefined;
-          coordinator.queued = { section, settings: plainSettingsFromState(this, section) };
-        }
-        coordinator.paused = false;
-        coordinator.awaitingConflictSnapshot = false;
-        this.resolveExternalSnapshot(payload);
-        return;
       }
       const localAttempt = correlationId && coordinator.inFlight?.requestId === correlationId
         ? coordinator.inFlight
@@ -2576,11 +2584,6 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
       }
 
       this.clearLoadingSettingSection(section);
-      if (this.loadedSections[section] && this.revisions[section] === payload.revision) {
-        this.pumpSettingsUpdate(section);
-        settleSettingsStatus(this, '设置已同步');
-        return;
-      }
       if (!this.loadedSections[section]) {
         // The initial UI values are the edit baseline until the first read. Merge only changes
         // made locally since then, preserving both newly created records and existing disk rows.

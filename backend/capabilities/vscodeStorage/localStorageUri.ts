@@ -6,11 +6,11 @@ const NODE_FS_STORAGE_SCHEMES = new Set(['file', 'vscode-userdata']);
 
 /** 默认用户数据 URI 在部分桌面/远程宿主中仍对应扩展宿主可直接访问的本地路径。 */
 export function isNodeFsStorageUri(uri: vscode.Uri): boolean {
-  return NODE_FS_STORAGE_SCHEMES.has(uri.scheme) && !!normalizedFsPath(uri.fsPath);
+  return NODE_FS_STORAGE_SCHEMES.has(uri.scheme) && !!normalizeStorageFsPath(uri.fsPath);
 }
 
 export function nodeFsStoragePath(uri: vscode.Uri): string {
-  const resolved = normalizedFsPath(uri.fsPath);
+  const resolved = normalizeStorageFsPath(uri.fsPath);
   if (!NODE_FS_STORAGE_SCHEMES.has(uri.scheme) || !resolved) {
     throw new Error(`Storage URI is not backed by local node fs: ${uri.toString()}`);
   }
@@ -40,7 +40,7 @@ function isNotThere(error: unknown): boolean {
     || (typeof name === 'string' && /^(FileNotFound|EntryNotFound|FileNotADirectory|EntryNotADirectory)\b/.test(name));
 }
 
-function normalizedFsPath(value: string): string {
+export function normalizeStorageFsPath(value: string): string {
   if (!value) return '';
   const candidate = process.platform === 'win32' && /^[\\/][a-zA-Z]:[\\/]/.test(value)
     ? value.slice(1)

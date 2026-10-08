@@ -2,6 +2,7 @@ import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { writeFileAtomicDurable } from './durableWrite';
 import { isNodeFsStorageUri, nodeFsStoragePath } from './localStorageUri';
+import { storageWriteObserver } from './storageFilePublications';
 
 export interface ReadJsonOptions {
   /** @deprecated JSON corruption and I/O failures are always thrown. */
@@ -51,7 +52,8 @@ export async function readJson<T>(uri: vscode.Uri, _options: ReadJsonOptions = {
 export async function writeJson(uri: vscode.Uri, value: unknown): Promise<void> {
   const data = Buffer.from(`${JSON.stringify(value, null, 2)}\n`, 'utf8');
   if (isNodeFsStorageUri(uri)) {
-    await writeFileAtomicDurable(nodeFsStoragePath(uri), data);
+    const filePath = nodeFsStoragePath(uri);
+    await writeFileAtomicDurable(filePath, data, storageWriteObserver(filePath));
     return;
   }
   await vscode.workspace.fs.writeFile(uri, data);

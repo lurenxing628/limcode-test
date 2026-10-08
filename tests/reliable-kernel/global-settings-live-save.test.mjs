@@ -137,6 +137,20 @@ test('压缩配置的数据转换不制造新的修改时间，保存确认后�
   });
 });
 
+test('相同revision的设置广播不再遍历正文，保存确认仍正常完成', async () => {
+  await withStore(async ({ store, initial, edit, writes, ack }) => {
+    let traversals = 0;
+    const repeated = { ...initial, settings: { get configs() { traversals++; throw new Error('duplicate snapshot traversal'); } } };
+    store.applySnapshot(repeated);
+    assert.equal(traversals, 0);
+    edit(40000);
+    store.saveLlmCompressionConfigs();
+    ack(writes()[0], initial.revision);
+    assert.equal(store.pendingSettingsSections[section], undefined,
+      'a correlated save reply must settle even when its revision did not change');
+  });
+});
+
 test('渠道默认字段补齐不算未保存修改，未编辑时可以直接确认', async () => {
   await withStore(async ({ store, initial, writes }) => {
     const provider = providerFixture();

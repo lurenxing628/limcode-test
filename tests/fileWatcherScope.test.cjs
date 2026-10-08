@@ -1,13 +1,17 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
+const fsp = require('node:fs/promises');
 const Module = require('node:module');
 const path = require('node:path');
+const os = require('node:os');
 const test = require('node:test');
 const ts = require('typescript');
 
 class MockUri {
   constructor(uriPath) {
     this.path = String(uriPath).replace(/\/{2,}/g, '/');
+    this.scheme = 'file';
+    this.fsPath = this.path;
   }
 
   static joinPath(base, ...segments) {
@@ -70,6 +74,8 @@ Module._load = function loadWithVscodeMock(request, parent, isMain) {
 };
 
 const { registerGlobalSettingsWatcher, sectionFromSettingsUri } = require('../vscode/watchers/GlobalSettingsWatcher.ts');
+const { withPublishedStorageWrites, recordStorageFileRemoval } = require('../backend/capabilities/vscodeStorage/storageFilePublications.ts');
+const { writeJson } = require('../backend/capabilities/vscodeStorage/json.ts');
 
 Module._load = originalModuleLoad;
 if (previousTsLoader) require.extensions['.ts'] = previousTsLoader;
@@ -133,7 +139,7 @@ test('记录设置只接受持久索引和直接记录，不把读锁与临时�
   }
 });
 
-test('外部设置创建修改删除仍刷新，刷新产生的读锁事件不会循环', (context) => {
+test('外部设置创建修改删除仍刷新，刷新产生的读锁事件不会循环', async (context) => {
   const timers = new Map();
   let timerId = 0;
   context.mock.method(globalThis, 'setTimeout', (callback, delay) => {
@@ -142,10 +148,10 @@ test('外部设置创建修改删除仍刷新，刷新产生的读锁事件不�
     return timerId;
   });
   context.mock.method(globalThis, 'clearTimeout', (id) => timers.delete(id));
-  const flush = () => {
+  const flush = async () => {
     const callbacks = [...timers.values()];
     timers.clear();
-    callbacks.forEach((callback) => callback());
+    await Promise.all(callbacks.map((callback) => callback()));
     return callbacks.length;
   };
   const offset = createdWatchers.length;
@@ -176,9 +182,9 @@ test('外部设置创建修改删除仍刷新，刷新产生的读锁事件不�
       for (const file of ['index.json', 'records/config.json']) {
         const count = refreshed.length;
         watcher.listeners[event](MockUri.joinPath(watcher.pattern.baseUri, file));
-        assert.equal(flush(), 1);
+        assert.equal(await flush(), 1);
         assert.deepEqual(refreshed.slice(count), [section]);
-        assert.equal(flush(), 0, '读锁事件不得触发后续刷新');
+        assert.equal(await flush(), 0, '读锁事件不得触发后续刷新');
       }
     }
     const rootWatcher = watchers[0];
@@ -191,13 +197,77 @@ test('外部设置创建修改删除仍刷新，刷新产生的读锁事件不�
     for (const [file] of rootSections) {
       rootWatcher.listeners[event](MockUri.joinPath(rootWatcher.pattern.baseUri, file));
     }
-    assert.equal(flush(), 1, '同批根设置事件仍合并刷新');
+    assert.equal(await flush(), 1, '同批根设置事件仍合并刷新');
     assert.deepEqual(refreshed.slice(count), rootSections.map((entry) => entry[1]));
     const statusWatcher = watchers.at(-1);
     statusWatcher.listeners[event](MockUri.joinPath(statusWatcher.pattern.baseUri, '.limcode-global-status.json'));
-    assert.equal(flush(), 1);
+    assert.equal(await flush(), 1);
     assert.equal(refreshed.at(-1), 'common');
-    assert.equal(flush(), 0);
+    assert.equal(await flush(), 0);
+  }
+});
+
+test('设置监听复用已广播的确切文件身份，外部改写和失败的部分保存仍刷新', async (context) => {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-settings-watcher-publication-'));
+  const timers = new Map();
+  let timerId = 0;
+  context.mock.method(globalThis, 'setTimeout', (callback) => { timers.set(++timerId, callback); return timerId; });
+  context.mock.method(globalThis, 'clearTimeout', (id) => timers.delete(id));
+  const flush = async () => {
+    const callbacks = [...timers.values()]; timers.clear();
+    await Promise.all(callbacks.map(callback => callback()));
+  };
+  const subscriptions = [], refreshed = [];
+  const offset = createdWatchers.length;
+  registerGlobalSettingsWatcher({ globalStorageUri: new MockUri(root), subscriptions }, {
+    getStorageRootUri: () => new MockUri(root),
+    async refreshGlobalSettings(section) { refreshed.push(section); }
+  });
+  const watcher = createdWatchers[offset];
+  const uri = MockUri.joinPath(watcher.pattern.baseUri, 'appearance.json');
+  const published = (change) => withPublishedStorageWrites(async () => {
+    await change(); return { filePath: uri.fsPath };
+  }, () => {});
+  try {
+    await published(() => writeJson(uri, { value: 'own' }));
+    watcher.listeners.change(uri);
+    await flush();
+    assert.deepEqual(refreshed, [], 'the current file already has a committed snapshot');
+
+    await fsp.writeFile(uri.fsPath, JSON.stringify({ value: 'peer' }));
+    watcher.listeners.change(uri);
+    await flush();
+    assert.deepEqual(refreshed, ['appearance'], 'in-place peer edits invalidate the write identity');
+
+    await published(async () => { await fsp.rm(uri.fsPath); recordStorageFileRemoval(uri.fsPath); });
+    watcher.listeners.delete(uri);
+    await flush();
+    assert.equal(refreshed.length, 1, 'a published removal also needs no content read');
+
+    await assert.rejects(published(async () => {
+      await writeJson(uri, { value: 'partially saved' });
+      throw new Error('not published');
+    }), /not published/);
+    watcher.listeners.create(uri);
+    await flush();
+    assert.equal(refreshed.length, 2, 'partial writes without a snapshot must refresh');
+
+    let written, finish;
+    const ready = new Promise(resolve => { written = resolve; });
+    const hold = new Promise(resolve => { finish = resolve; });
+    const mutation = published(async () => {
+      await writeJson(uri, { value: 'own pending' });
+      watcher.listeners.change(uri); written();
+      await hold;
+    });
+    await ready;
+    const pendingRefresh = flush();
+    await fsp.writeFile(uri.fsPath, JSON.stringify({ value: 'peer before publication' }));
+    finish(); await mutation; await pendingRefresh;
+    assert.equal(refreshed.length, 3, 'the final identity is checked after a pending publication settles');
+  } finally {
+    subscriptions.forEach(subscription => subscription.dispose());
+    await fsp.rm(root, { recursive: true, force: true });
   }
 });
 

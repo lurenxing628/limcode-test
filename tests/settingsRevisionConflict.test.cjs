@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const fsp = require('node:fs/promises');
 const Module = require('node:module');
@@ -79,6 +80,36 @@ test('内容指纹不受对象键插入顺序影响', () => {
     revision.createStorageRevision({ b: 2, a: { y: true, x: false } }),
     revision.createStorageRevision({ a: { x: false, y: true }, b: 2 })
   );
+});
+
+test('配置提交在同一资源锁内只读一次每条记录，未变保存仍清理孤儿文件', async (context) => {
+  const tempRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'limcode-record-store-one-read-'));
+  const root = MockUri.file(tempRoot), index = MockUri.joinPath(root, 'index.json');
+  const records = [{ id: 'a', name: 'A', nested: { first: 1, second: 2 } }, { id: 'b', name: 'B' }];
+  try {
+    const initial = await recordStore.commitRecordStoreSnapshot(root, index, records, 'record', item => item.name,
+      { expectedRevision: recordStore.missingRecordStoreRevision(index), section: 'providers', pruneMissing: true });
+    const orphan = path.join(tempRoot, 'records', 'orphan.json');
+    await fsp.writeFile(orphan, JSON.stringify({ schemaVersion: 1, record: { id: 'orphan' } }));
+    const reads = new Map(), readFile = fsp.readFile;
+    let hashes = 0;
+    const createHash = crypto.createHash;
+    context.mock.method(crypto, 'createHash', (...args) => { hashes++; return createHash(...args); });
+    context.mock.method(fsp, 'readFile', (file, ...args) => {
+      const name = String(file);
+      if (name === index.fsPath || path.dirname(name) === path.join(tempRoot, 'records')) reads.set(name, (reads.get(name) ?? 0) + 1);
+      return readFile(file, ...args);
+    });
+    const result = await recordStore.commitRecordStoreSnapshot(root, index,
+      [{ ...records[0], nested: { second: 2, first: 1 } }, records[1]], 'record', item => item.name,
+      { expectedRevision: initial.revision, section: 'providers', pruneMissing: true });
+    assert.equal(result.revision, initial.revision, 'key insertion order is not a settings change');
+    assert.equal(reads.get(index.fsPath), 1);
+    assert.equal([...reads.values()].reduce((sum, count) => sum + count, 0), 3);
+    assert.ok([...reads.values()].every(count => count === 1));
+    assert.equal(hashes, 1, 'only the current external CAS revision needs a digest; local equality and the unchanged result reuse it');
+    await assert.rejects(fsp.stat(orphan), { code: 'ENOENT' });
+  } finally { await fsp.rm(tempRoot, { recursive: true, force: true }); }
 });
 
 test('旧窗口不能覆盖 record 设置集合的新提交', async () => {

@@ -49,6 +49,7 @@ import {
 import { isConversationHistoryBusyError } from '../../reliableKernel/turnControlPlane';
 import { ConversationForkRejectedError } from '../../reliableKernel/conversationFork';
 import { isSettingsRevisionConflictError } from '../../capabilities/settingsRevisionConflict';
+import { withPublishedStorageWrites } from '../../capabilities/vscodeStorage/storageFilePublications';
 import { assertNotSqliteDatabaseFile } from '../../capabilities/filesystem/sqliteDatabaseFileGuard';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import { listAllDomainRows } from '../../reliableKernel/repositoryPagination';
@@ -988,10 +989,11 @@ export class VscodeReliableKernelCommandRouter {
   ): Promise<void> {
     let stored: Awaited<ReturnType<VscodeReliableKernelProductRuntime['configuration']['loadGlobalSettings']>>;
     try {
-      stored = await this.product.configuration.saveGlobalSettings(
-        payload.section,
-        payload.settings,
-        payload.expectedRevision
+      stored = await withPublishedStorageWrites(
+        () => this.product.configuration.saveGlobalSettings(payload.section, payload.settings, payload.expectedRevision),
+        committed => {
+          this.broadcastOrPost(webview, this.globalSettingsSnapshot(committed, correlationId));
+        }
       );
     } catch (error) {
       if (!isSettingsRevisionConflictError(error)) throw error;
@@ -1010,8 +1012,6 @@ export class VscodeReliableKernelCommandRouter {
       );
       return;
     }
-    const snapshot = this.globalSettingsSnapshot(stored, correlationId);
-    this.broadcastOrPost(webview, snapshot);
     if (payload.section === 'common') {
       await this.applyCommonProxyRuntime(stored.settings as GlobalSettingsRecord);
     }

@@ -11,6 +11,8 @@ let atomicWriteSequence = 0;
 const TRANSIENT_FILE_OPERATION_MAX_ATTEMPTS = 4;
 const TRANSIENT_FILE_OPERATION_BASE_DELAY_MS = 10;
 
+export type DurableFileIdentity = Pick<fs.BigIntStats, 'dev' | 'ino' | 'size' | 'mtimeNs' | 'ctimeNs'>;
+
 /**
  * Write a file through a sibling temporary file, flush its contents, publish it
  * with rename, and finally flush the containing directory on POSIX.
@@ -19,12 +21,25 @@ const TRANSIENT_FILE_OPERATION_BASE_DELAY_MS = 10;
  * I/O failure therefore leaves the previous target intact. Ordinary file fsync is strict;
  * only the known Windows limitation for directory handles is tolerated after rename.
  */
-export async function writeFileAtomicDurable(filePath: string, data: Uint8Array | string): Promise<void> {
+export async function writeFileAtomicDurable(
+  filePath: string,
+  data: Uint8Array | string,
+  onPublished?: (identity: DurableFileIdentity) => void
+): Promise<void> {
   await fsp.mkdir(path.dirname(filePath), { recursive: true });
   const tempPath = createAtomicTempPath(filePath);
   try {
-    await writeFileDurable(tempPath, data);
+    const written = await writeFileDurable(tempPath, data, !!onPublished);
     await renameWithRetry(tempPath, filePath);
+    if (written && onPublished) {
+      // Match the inode we wrote, rather than attributing another writer's replacement to us.
+      // Identity collection is optional bookkeeping and cannot turn a committed write into failure.
+      const published = await fsp.stat(filePath, { bigint: true }).catch(() => undefined);
+      if (published && published.dev === written.dev && published.ino === written.ino
+        && published.size === written.size && published.mtimeNs === written.mtimeNs) {
+        onPublished(published);
+      }
+    }
   } finally {
     await removeAtomicTempBestEffort(tempPath);
   }
@@ -70,13 +85,18 @@ export function sleepSync(milliseconds: number): void {
   Atomics.wait(view, 0, 0, Math.max(1, Math.floor(milliseconds)));
 }
 
-async function writeFileDurable(filePath: string, data: Uint8Array | string): Promise<void> {
+async function writeFileDurable(
+  filePath: string,
+  data: Uint8Array | string,
+  captureIdentity = false
+): Promise<DurableFileIdentity | undefined> {
   await fsp.writeFile(filePath, data);
   const handle = await retryTransientFileOperation(() => fsp.open(filePath, 'r+'));
 
   let operationFailed = false;
   try {
     await syncFileHandle(handle, filePath);
+    return captureIdentity ? await handle.stat({ bigint: true }).catch(() => undefined) : undefined;
   } catch (error) {
     operationFailed = true;
     throw error;

@@ -76,7 +76,7 @@ import {
   DEFAULT_INTEGRATED_SYSTEM_PROMPT_ID,
   DEFAULT_INTEGRATED_SYSTEM_PROMPT_NAME
 } from '../../shared/defaultSystemPrompt';
-import { loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
+import { ensureGlobalSettingsFile, loadGlobalSettingsFile, writeGlobalSettingsFile } from '../capabilities/vscodeStorage/globalSettings';
 import {
   loadLlmCompressionConfigsSettings,
   normalizeLlmCompressionSettings,
@@ -849,12 +849,13 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       return writeGlobalSettingsFile(paths.settingsRootUri, section, normalized, expectedRevision);
     }
     if (section === 'llmProviderConfigs') {
+      // Materialize the initial selection once, without reading back the catalog just saved.
+      await ensureGlobalSettingsFile(paths.settingsRootUri, 'llm');
       const stored = await saveLlmProviderConfigsSettings(
         paths,
         settings as Partial<LlmProviderConfigsRecord> | undefined,
         expectedRevision
       );
-      await this.loadNormalizedLlmSettings(paths);
       return { section, ...stored };
     }
     if (section === 'llmCompressionConfigs') {

@@ -6,8 +6,17 @@ import { createHash } from 'node:crypto';
  * 对象键顺序不会制造假冲突；数组顺序与任何业务字段变化都会推进 revision。
  */
 export function createStorageRevision(value: unknown): string {
-  const canonical = JSON.stringify(canonicalizeJson(value));
+  const canonical = canonicalStorageJson(value);
   return `sha256:${createHash('sha256').update(canonical, 'utf8').digest('hex')}`;
+}
+
+/** Local equality uses the same JSON semantics as revisions, without computing a digest. */
+export function sameStorageContent(left: unknown, right: unknown): boolean {
+  return canonicalStorageJson(left) === canonicalStorageJson(right);
+}
+
+function canonicalStorageJson(value: unknown): string {
+  return JSON.stringify(canonicalizeJson(value));
 }
 
 /** 尚未创建资源时使用的确定性 revision，让首次写入也必须经过相同比对。 */
