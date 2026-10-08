@@ -190,7 +190,7 @@ function fixture({
           targetRootPath: TARGET,
           merged: { insertedConversations: 3, insertedRows: 40, linkedCasObjects: 2, copiedCasObjects: 0, reusedCasObjects: 1 },
           configuration: { copiedFiles: 5, replacedFiles: 0 },
-          others: { migrated: ['workspace:a'], covered: [], leftBehind: [{ id: 'workspace:b', reason: '数据较多' }] }
+          leftBehind: [{ id: 'workspace:b', reason: '数据较多' }]
         };
       },
       dataRootRelocationCleanupState: (error) => (error && typeof error === 'object' ? cleanupStates.get(error) : undefined),

@@ -1207,6 +1207,7 @@ async function revalidatePlan(planned: DataRootRelocationPlan, installation?: st
     if (offline) problems.push(offline);
   }
   if (target.kind === 'invalid') problems.push(target.message);
+  if (target.kind === 'occupied') problems.push(`所选目录已有其它内容，请使用新建子目录：${target.suggestedPath}`);
   if (problems.length > 0) throw new DataRootRelocationError('data-root-relocation-precondition', problems.join('\n'));
   const unplanned = unconfirmedEarlierMovedWork(await inspectEarlierMovedWork(planned.sourceRootPath, inspection), planned.earlierMovedWork);
   if (current.id !== planned.current.id || current.dataSetId !== planned.current.dataSetId || unplanned

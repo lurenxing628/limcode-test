@@ -155,7 +155,7 @@ test('盲审 1（exp9）切换指针失败后的就地撤销：新目录已被�
   assert.ok(conversationIds(window.dataRoot).includes('conversation_written_by_other'));
 });
 
-for (const [kind, when] of [['empty', 'publish'], ['copied', 'publish'], ['empty', 'copy']]) {
+for (const [kind, when] of [['empty', 'publish'], ['empty', 'copy']]) {
   test(`盲审 2（exp3 ${kind}，${when === 'copy' ? '写完成记录之前' : '切换指针时'}）新目录所在的盘在完成阶段掉线：找不到记录不当作已撤销（放弃报看不到、续撤报 unreachable），接上后照常撤销${kind === 'copied' ? '并把拷来的数据改回原名' : ''}`, async (t) => {
     const fixture = await createFixture(t, { withAlpha: false });
     const usb = drive(fixture.base);

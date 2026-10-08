@@ -2132,10 +2132,11 @@ async function foreignMergePending(configurationRootPath: string, foreignId: str
   try {
     const paths = { globalStoragePath: configurationRootPath };
     const record = (await readRuntimeDataSetMergeLedger(paths)).get(foreignId);
+    if (record?.state === 'committing') return '有进行中的操作（正在提交的合并），完成之后再清理';
+    if (record?.state === 'merged' && record.skippedConversations) return `含 ${record.skippedConversations} 个当前库没有的对话（可能是你删掉的），按历史保留`;
     if (record?.state === 'partial') return `还有 ${record.excluded.length} 个对话没有合并进来，原位保留，不自动删除`;
     if ((await readRuntimeHistoryResidual(paths)).has(foreignId)) return '未能合并的旧数据，原位保留，不自动删除';
     if ((await readRuntimeHistoryPending(paths)).has(foreignId)) return '旧数据尚待合并，完成之前保留';
-    if (record?.state === 'committing') return '有进行中的操作（正在提交的合并），完成之后再清理';
     return undefined;
   } catch {
     return '合并记录无法读取，不能确认它没有正在提交的合并或等待中的合并请求，这次不能删除';
@@ -2563,7 +2564,7 @@ async function planLocalMergedSources(configurationRootPath:string,current:Runti
     const candidate=local.candidate,record=ledger.get(candidate.id);
     const base:RuntimeBackupCleanupItem={key:'merged-source:'+candidate.id,kind:'merged-source',name:candidate.id,path:source.controlRootPath,
       origin:'已合并的旧来源',inCurrentDataSet:false,bytes:'0',reclaimableBytes:'0',fileCount:0,deletable:false,reason:'尚未完整合并进当前库，原位保留'};
-    if(record?.state!=='merged'||!sameRuntimeDataSetIdentity(record.target,current.binding)||pending.has(candidate.id)||residual.has(candidate.id)){items.push(base);continue;}
+    if(record?.state!=='merged'||record.skippedConversations||!sameRuntimeDataSetIdentity(record.target,current.binding)||pending.has(candidate.id)||residual.has(candidate.id)){items.push(base);continue;}
     try {
       const fingerprint=await cachedRuntimeDataSetFingerprint(candidate);
       if(!fingerprint||!sameRuntimeDataSetFingerprint(record.source,fingerprint)){items.push({...base,reason:'来源有变化或缓存失效，先重新合并'});continue;}

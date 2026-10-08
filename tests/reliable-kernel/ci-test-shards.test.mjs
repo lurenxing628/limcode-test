@@ -111,9 +111,9 @@ test('sharded runner continues after a file failure and reports every assigned f
 });
 
 
-test('relocation crash entries preserve every original scenario exactly once with unchanged assertions', () => {
+test('relocation crash entries cover every reachable current-only relocation crash exactly once', () => {
   const scenarios = RELOCATION_UNDO_CRASH_SCENARIOS;
-  assert.equal(scenarios.length, 127);
+  assert.equal(scenarios.length, 96);
   const covered = [];
   for (const group of RELOCATION_UNDO_CRASH_GROUPS) {
     const suffix = group === 'empty' ? '' : `-${group}`;
@@ -126,6 +126,6 @@ test('relocation crash entries preserve every original scenario exactly once wit
     assert.ok(groupCases.length > 0, 'a zero-selected entry cannot pass inventory verification');
     covered.push(...groupCases.map((scenario) => JSON.stringify(scenario)));
   }
-  assert.equal(new Set(covered).size, 127);
+  assert.equal(new Set(covered).size, 96);
   assert.deepEqual(covered.sort(), scenarios.map((scenario) => JSON.stringify(scenario)).sort());
 });

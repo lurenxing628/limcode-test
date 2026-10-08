@@ -1186,7 +1186,7 @@ test('已合并来源：只有真实 merged 账本且未变来源可删，当前
 });
 
 test('已合并来源：残留、待合并、partial、缓存失效和独立备份均保留',async t=>{
-  for(const mode of ['residual','pending','partial','cache','backup']) {
+  for(const mode of ['residual','pending','partial','skipped','cache','backup']) {
     const f=await mergedSourceFixture(t),registry=kernelFile('runtimeHistoryRegistry.js');
     const base={id:f.alpha.id,sourceKind:'local',location:{kind:'local',candidateId:f.alpha.id}};
     if(mode==='residual')await registry.writeRuntimeHistoryResidual(f.paths,{...base,code:'test',message:'keep',checkedAt:NOW});
@@ -1196,6 +1196,7 @@ test('已合并来源：残留、待合并、partial、缓存失效和独立备�
       const record=JSON.parse(await fs.readFile(file,'utf8'));record.state='partial';record.excluded=[{conversationId:'x',title:'x',reasons:['conflict']}];
       await fs.writeFile(file,JSON.stringify(record));
     }
+    if(mode==='skipped'){const file=path.join(resolveVscodeRuntimeMergeLedgerRoot(f.paths),'records',f.alpha.id.replace(/:/g,'-')+'.json');const record=JSON.parse(await fs.readFile(file,'utf8'));await fs.writeFile(file,JSON.stringify({...record,skippedConversations:1}));}
     if(mode==='cache')await fs.rm(path.join(resolveVscodeRuntimeMergeLedgerRoot(f.paths),'fingerprints'),{recursive:true,force:true});
     if(mode==='backup')await fs.mkdir(path.join(path.dirname(f.alpha.binding.paths.dataRootPath),'backups'),{recursive:true});
     const plan=await planRuntimeBackupCleanup(f.root,f.database);

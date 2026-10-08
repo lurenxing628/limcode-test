@@ -136,9 +136,9 @@ test('盲审 #2：v0.0.10–v0.0.20 手动“归档并重置”的归档（<17 �
   const database = await openWindow(fixture);
   try {
     const item = (await planRuntimeBackupCleanup(fixture.root, database)).items.find((candidate) => candidate.path === legacyPath);
-    assert.equal(item?.kind, 'foreign-history', JSON.stringify(item));
+    assert.equal(item?.kind, 'merged-source', JSON.stringify(item));
     assert.equal(item.deletable, false);
-    assert.match(item.reason, /未通过核验/);
+    assert.match(item.reason, /尚未完整合并/);
   } finally { await database.close(); }
   assert.ok(await exists(path.join(legacyPath, 'active', 'limcode.sqlite')));
 });
@@ -159,7 +159,7 @@ test('盲审 #2：迁移之后删除旧目录，默认保留的归档按新旧�
   const plan = await moving.planWithRuntime(fixture, target);
   await moving.relocate(fixture, plan);
   const { result } = await moving.deleteAsConfirmed({ oldRootPath: fixture.root, currentRootPath: target });
-  assert.equal(result.remainingDataSets, 0);
+  assert.equal(result.remainingDataSets, 2, '非当前来源留在旧目录');
   assert.equal(result.remainingArchives, 2, '17 位数字名的归档与清理中断留下的残留都算保留的归档');
   assert.ok(await exists(legacyPath));
   assert.ok(await exists(`${second.backupPath}${LEFTOVER}`));
@@ -202,7 +202,7 @@ test('盲审 #1：本版本在来源库里删掉的对话（删除记录记在�
   // a_1 deleted in alpha while it was the current data set: recorded under alpha's identity.
   await deleteWithCommand(fixture.alpha.authority, fixture.root, 'a_1');
   assert.deepEqual(brief(await batch(fixture, explicit(fixture.alpha.id))).merged, [[fixture.alpha.id, 1, 0]]);
-  await fs.rm(path.dirname(fixture.alpha.binding.paths.dataRootPath), {recursive:true});
+  await fs.rm(fixture.alpha.scopeRoot, {recursive:true});
 
   const report = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root });
   const copy = report.entries.find((entry) => entry.location.containerPath === container && entry.scope === fixture.alpha.id);
@@ -385,6 +385,8 @@ test('盲审 #8：外来库有等待中的合并请求时清理备份不判可�
   assert.deepEqual(brief(await batch(fixture)).merged, [[fixture.alpha.id, 1, 0]]);
   const archivePath = await archive(fixture, fixture.alpha);
   const entry = entryAt(await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root }), archivePath);
+  await requestMerge(fixture.root, entry);
+  await batch(fixture, explicit(entry.id));
   const itemOf = (plan) => plan.items.find((item) => item.path === archivePath);
   let database = await openWindow(fixture);
   try {
@@ -394,16 +396,16 @@ test('盲审 #8：外来库有等待中的合并请求时清理备份不判可�
     await requestMerge(fixture.root, entry);
     const result = await deleteRuntimeBackups(plan, database, [itemOf(plan).key]);
     assert.deepEqual(result.deleted, []);
-    assert.match(result.kept.map((kept) => kept.reason).join('\n'), /你已请求把它合并进当前库，合并还没完成；合并完成或请求过期之后再清理；这一项没有删除/);
+    assert.match(result.kept.map((kept) => kept.reason).join('\n'), /旧数据尚待合并，完成之前保留/);
     assert.ok(await exists(archivePath), '来源保留');
   } finally { await database.close(); }
 
   database = await openWindow(fixture);
   try {
     const item = itemOf(await planRuntimeBackupCleanup(fixture.root, database));
-    assert.deepEqual([item?.deletable, item?.reason], [false, '你已请求把它合并进当前库，合并还没完成；合并完成或请求过期之后再清理']);
+    assert.deepEqual([item?.deletable, item?.reason], [false, '旧数据尚待合并，完成之前保留']);
   } finally { await database.close(); }
-  await ledger.removeRuntimeDataSetMergeRequest(fixture.paths, entry.id);
+  await kernelFile('runtimeHistoryRegistry.js').removeRuntimeHistoryPending(fixture.paths, entry.id);
   database = await openWindow(fixture);
   try { assert.equal(itemOf(await planRuntimeBackupCleanup(fixture.root, database))?.deletable, true, '请求结束之后可删'); }
   finally { await database.close(); }

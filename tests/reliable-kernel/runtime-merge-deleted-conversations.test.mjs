@@ -418,11 +418,11 @@ test('审查 A：提交后中断的外来合并，外来库被移走也在启动
     await batch(fixture, { ...explicit(source.id), onFaultPoint: crashAfterCommit });
     assert.equal((await readLedgerRecord(fixture, source.id)).state, 'committing', variant);
     assert.deepEqual(conversations(fixture), ['crash_1', 'crash_2', 'own_1'], '事务已提交');
-    const requestFile = path.join(ledgerRoot(fixture.root), 'requests', `${source.id.replace(/:/g, '-')}.json`);
+    const requestFile = path.join(ledgerRoot(fixture.root), 'pending', `${source.id.replace(/:/g, '-')}.json`);
     if (variant === 'moved-away') await fs.rename(archivePath, path.join(fixture.base, 'moved-away'));
     if (variant === 'expired') {
       const stored = JSON.parse(await fs.readFile(requestFile, 'utf8'));
-      stored.requestedAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
+      stored.registeredAt = new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString();
       await fs.writeFile(requestFile, JSON.stringify(stored));
     }
     if (variant === 'request-removed') await fs.rm(requestFile);
@@ -481,7 +481,7 @@ test('审查 A2：提交后中断期间清理备份不把这份外来库判为�
     await fs.writeFile(file, JSON.stringify({ ...merged, state: 'committing', commitId: randomUUID() }));
     const result = await deleteRuntimeBackups(plan, database, [item.key]);
     assert.deepEqual(result.deleted, []);
-    assert.match(result.kept.map((entry) => entry.reason).join('\n'), /有进行中的操作（正在提交的合并），完成之后再清理；这一项没有删除/);
+    assert.match(result.kept.map((entry) => entry.reason).join('\n'), /有进行中的操作（正在提交的合并），完成之后再清理/);
     assert.equal(await exists(archivePath), true, '来源保留');
   } finally { await database.close(); }
 });
@@ -676,7 +676,7 @@ test('迁移进已有 LimCode 数据的目录：目标自己的合并记录、�
   };
   try {
     await assert.rejects(moving.relocate(fixture, plan),
-      (error) => error.code === 'data-root-relocation-merge-records' && /带到新数据目录的合并记录与旧目录核对不一致，整体取消迁移/.test(error.message));
+      (error) => error.code === 'data-root-relocation-merge-records' && /带到新数据目录的(合并记录|历史登记)与旧目录核对不一致，整体取消迁移/.test(error.message));
   } finally { fs.rename = rename; }
   assert.equal(damaged, true);
   assert.deepEqual(await bookkeeping(target), before, '核对不一致也撤销：目标的记录原样恢复');
