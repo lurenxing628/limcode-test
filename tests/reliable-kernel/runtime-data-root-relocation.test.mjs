@@ -54,8 +54,10 @@ test('迁移到空目录：当前库与其它库按原 id 迁入、设置逐文�
   } finally { moved.close(); }
   const alpha = inspection.candidates.find((candidate) => candidate.id === fixture.alpha.id);
   assert.ok(alpha?.dataSetId, '其它历史库按原 id 成为新目录里的独立历史库');
-  assert.equal(await isVscodeRuntimeDataSetKept(alpha), true, '其它历史库记为保留，不会被自动合并');
-  assert.equal((await readRuntimeDataSetMergeStates({ globalStoragePath: target })).get(fixture.alpha.id)?.state, 'kept');
+  assert.equal(await isVscodeRuntimeDataSetKept(alpha), false, '迁移不再制造用户保留标记');
+  const pending = await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target });
+  assert.equal(pending.get(fixture.alpha.id)?.sourceKind, 'migration');
+  assert.deepEqual(pending.get(fixture.alpha.id)?.identity, { dataSetId: alpha.dataSetId, rootInstanceId: alpha.rootInstanceId });
 
   assert.deepEqual(await treeSnapshot(path.join(target, 'agents')), sourceConfigBefore, '设置记录逐字节复制');
   assert.equal(await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8'), '{"activeProviderConfigId":"source"}\n');
@@ -343,4 +345,24 @@ test('删除旧目录：没有迁移完成记录时拒绝；迁移后只删除�
   const moved = readDatabase((await selectedDataSet(target)).runtimeDataRootPath);
   try { assert.equal(moved.ids('conversation').length, 2); }
   finally { moved.close(); }
+});
+
+test('迁移留下同名库：新根登记旧位置，后续清理previousDataRoots不会丢掉它', async (t) => {
+  const fixture = await createFixture(t);
+  const target = path.join(fixture.base, 'same-name-target');
+  await createLimCodeTarget(target);
+  const scopeRoot = rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(target, fixture.alpha.id);
+  await initialize(scopeRoot, fixture.alpha.id);
+  const plan = await planWithRuntime(fixture, target);
+  assert.deepEqual(plan.problems, []);
+  const { result } = await relocate(fixture, plan);
+  assert.deepEqual(result.others.leftBehind.map(item => item.id), [fixture.alpha.id]);
+  const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target })).values()];
+  const left = pending.find(item => item.identity?.dataSetId === fixture.alpha.binding.dataSetId);
+  assert.equal(left?.sourceKind, 'migration');
+  assert.equal(left?.location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
+  assert.equal(left?.location.baseDataRootPath, fixture.root);
+  assert.deepEqual(await kernelFile('runtimeForeignHistory.js').previousDataRootsWithoutForeignHistory({
+    configurationRootPath: target, previousDataRootPaths: [fixture.root]
+  }), []);
 });

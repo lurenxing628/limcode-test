@@ -250,3 +250,12 @@ function writeLockFree(databasePath) {
   ].join(' ');
   return new Promise((resolve, reject) => execFile(process.execPath, ['-e', probe, databasePath], (error, stdout) => error ? reject(error) : resolve(stdout === 'true')));
 }
+
+/** A published legacy archive name, independent of the current reset command. */
+let legacyArchiveSequence = 0;
+export async function archiveLegacyRuntimeRoot(authority, scopeRoot) {
+  const backupPath = path.join(scopeRoot, '.limcode-runtime-backups', `20260927-000000-000-${(++legacyArchiveSequence).toString(16).padStart(8, '0')}`);
+  await fs.mkdir(path.dirname(backupPath), { recursive: true });
+  await fs.rename(path.dirname(authority.expectedPaths().rootPointerPath), backupPath);
+  return { archived: true, backupPath };
+}

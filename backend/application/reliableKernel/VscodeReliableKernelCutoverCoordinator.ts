@@ -27,7 +27,8 @@ import {
   migratePreviousRuntimeEpochIfRequired,
   previousRuntimeEpochMigrationRequired
 } from '../../reliableKernel/runtimeEpochMigration';
-import { assertConfigurationRootRuntimesOffline } from '../../reliableKernel/vscodeRootAuthority';
+import { assertConfigurationRootRuntimesOffline, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY } from '../../reliableKernel/vscodeRootAuthority';
+import { registerRuntimeResetBackup } from '../../reliableKernel/runtimeHistoryRegistry';
 
 export const VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
 
@@ -192,7 +193,8 @@ export class VscodeReliableKernelCutoverCoordinator {
  */
 export async function archiveCurrentRuntimeRootForReset(
   authority: RootAuthority,
-  runtimeScopeRootPathInput: string
+  runtimeScopeRootPathInput: string,
+  configurationRootPathInput?: string
 ): Promise<{ archived: boolean; backupPath?: string }> {
   const runtimeScopeRootPath = normalizedAbsolutePath(runtimeScopeRootPathInput, 'Workspace Runtime scope root');
   const paths = authority.expectedPaths();
@@ -209,7 +211,7 @@ export async function archiveCurrentRuntimeRootForReset(
           `Runtime epoch reset path is outside the selected Workspace scope: ${controlRootPath}`
         );
       }
-      const backupRootPath = path.join(runtimeScopeRootPath, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY);
+      const backupRootPath = path.join(runtimeScopeRootPath, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY);
       const backupPath = path.join(backupRootPath, `${timestampSlug()}-${randomUUID().slice(0, 8)}`);
       try {
         await fs.mkdir(backupRootPath, { recursive: true, mode: 0o700 });
@@ -220,6 +222,12 @@ export async function archiveCurrentRuntimeRootForReset(
       }
       await syncDirectoryDurably(backupRootPath);
       await syncDirectoryDurably(runtimeScopeRootPath);
+      const configurationRootPath = configurationRootPathInput ?? (
+        path.basename(path.dirname(runtimeScopeRootPath)) === VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY
+          && path.basename(path.dirname(path.dirname(runtimeScopeRootPath))) === VSCODE_WORKSPACE_RUNTIMES_DIRECTORY
+          ? path.dirname(path.dirname(path.dirname(runtimeScopeRootPath))) : runtimeScopeRootPath
+      );
+      await registerRuntimeResetBackup({ globalStoragePath: configurationRootPath }, backupPath);
       return { archived: true, backupPath };
     })
   );

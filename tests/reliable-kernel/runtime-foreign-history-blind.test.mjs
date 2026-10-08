@@ -32,9 +32,7 @@ const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
 const { stopAndDeleteConversation } = require(path.join(compiled, 'backend/application/reliableKernel/conversationDeleteCommand.js'));
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 
 const POSIX = process.platform !== 'win32';
 const PYTHON = POSIX && spawnSync('python3', ['-c', 'import fcntl'], { stdio: 'ignore' }).status === 0;

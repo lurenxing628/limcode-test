@@ -35,7 +35,7 @@ import {
 import {
   inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories, resolveVscodeRuntimeMergeLedgerRoot,
   VSCODE_RUNTIME_ACTIVE_DIRECTORY, VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN, VSCODE_RUNTIME_ARCHIVES_DIRECTORY,
-  VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
+  VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
   type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
@@ -397,6 +397,16 @@ export async function previousDataRootsWithoutForeignHistory(input: ForeignRunti
       const scopes = path.join(base, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
       // Scopes that cannot be listed may hide archives.
       await fs.readdir(scopes).catch((error: unknown) => { if (!isMissing(error)) throw error; });
+      const scopeNames = await fs.readdir(scopes).catch((error: unknown) => { if (isMissing(error)) return []; throw error; });
+      const resetScopes = [base, ...scopeNames.map((name) => path.join(scopes, name))];
+      let hasResetBackup = false;
+      for (const scope of resetScopes) {
+        const backup = await fs.lstat(path.join(scope, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY)).catch((error: unknown) => { if (isMissing(error)) return undefined; throw error; });
+        if (backup) { hasResetBackup = true; break; }
+      }
+      if (hasResetBackup) continue;
+      const local = await inspectVscodeRuntimeDataSets({ globalStoragePath: base });
+      if (local.candidates.length > 0 || local.problems.length > 0) continue;
       const archives = await listVscodeRuntimeArchiveDirectories(base);
       if (archives.some((directory) => directory.unreadable || directory.names.length > 0)) continue;
       let leftover = false;

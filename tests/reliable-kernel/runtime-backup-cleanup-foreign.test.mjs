@@ -31,9 +31,7 @@ const { withRuntimeClaimAtPath } = kernelFile('runtimeHostControl.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot, selectVscodeRuntimeDataSet
 } = kernelFile('vscodeRootAuthority.js');
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const NOW = '2026-09-26T00:00:00.000Z';

@@ -19,9 +19,7 @@ const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
 const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
 const { inspectVscodeRuntimeDataSets } = kernelFile('vscodeRootAuthority.js');
 const { writeRuntimeDataSetMergeLedgerRecord } = kernelFile('runtimeDataSetMergeLedger.js');
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 
 async function archiveAndReset(fixture, dataSet) {
   const authority = new RootAuthority(() => dataSet.binding.paths.dataRootPath, undefined, () => fixture.root);

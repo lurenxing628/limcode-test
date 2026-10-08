@@ -23,9 +23,7 @@ const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.
 const { listVscodeRuntimeDataSets, selectVscodeRuntimeDataSet } = kernelFile('vscodeRootAuthority.js');
 const { writeRuntimeDataSetMergeLedgerRecord } = kernelFile('runtimeDataSetMergeLedger.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 const NOW = '2026-09-27T00:00:00.000Z';
 const TWO_PATH_CALLS = new Set(['copyFile', 'rename', 'link', 'symlink', 'cp', 'copyFileSync', 'renameSync', 'linkSync', 'symlinkSync', 'cpSync']);
 const WRITES_FIRST = new Set(['mkdir', 'mkdtemp', 'writeFile', 'appendFile', 'rm', 'rmdir', 'unlink', 'truncate', 'utimes', 'lutimes', 'chmod', 'lchmod', 'chown', 'lchown', 'rename']);
@@ -232,8 +230,16 @@ for (const scopeKind of ['default', 'workspace']) {
     assert.deepEqual(await treeState(backupPath), archiveBefore);
 
     // Deleting the local data set of that scope keeps the archive, which stays a foreign entry.
+    await fs.rm(kernelFile('vscodeRootAuthority.js').resolveVscodeRuntimeSelectionPath(fixture.paths));
     await selectVscodeRuntimeDataSet(fixture.paths, survivor.id);
     const current = (await listVscodeRuntimeDataSets(fixture.paths)).find((candidate) => candidate.id === target.id);
+    const fingerprint = { dataSetId: fresh.binding.dataSetId, rootInstanceId: fresh.binding.rootInstanceId,
+      rootGeneration: fresh.binding.rootGeneration, pointerRevision: fresh.binding.pointerRevision, contentDigest: 'fixture-merged' };
+    const ledger = kernelFile('runtimeDataSetMergeLedger.js');
+    await ledger.rememberRuntimeDataSetFingerprint(current, await kernelFile('runtimeDataSetFacts.js').runtimeDataSetFileState(fresh.binding.paths.databasePath), fingerprint);
+    await ledger.writeRuntimeDataSetMergeLedgerRecord(fixture.paths, { candidateId: target.id, source: fingerprint,
+      target: { dataSetId: survivor.binding.dataSetId, rootInstanceId: survivor.binding.rootInstanceId },
+      state: 'merged', mergedAt: NOW, insertedRows: 0, reusedRows: 0, insertedConversations: 0 });
     await deleteUnselectedRuntimeDataSet(fixture.paths, target.id, current.dataSetId);
     assert.deepEqual(await treeState(backupPath), archiveBefore, '删除本地库不连带删除归档');
     assert.deepEqual((await listVscodeRuntimeDataSets(fixture.paths)).map((candidate) => candidate.id), [survivor.id]);

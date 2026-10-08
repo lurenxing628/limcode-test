@@ -14,6 +14,14 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
       await vscode.window.showErrorMessage(`历史与存储管理失败：${error instanceof Error ? error.message : String(error)}`);
     }
   });
+  const mergeAllHistoryCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.mergeAllRuntimeHistory, async () => {
+    try {
+      const { mergeAllRuntimeHistory } = await import('./runtimeDataSetManagement');
+      await mergeAllRuntimeHistory(context, startup);
+    } catch (error) {
+      await vscode.window.showErrorMessage(`合并旧数据失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  });
   const openPanelCommand = vscode.commands.registerCommand(EXTENSION_COMMAND_IDS.openPanel, async (options?: unknown) => {
     const backendApp = await readyApplication(startup);
     if (!backendApp) return;
@@ -38,7 +46,7 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
       `归档并重置 ${EXTENSION_BRAND} 开发数据？`,
       {
         modal: true,
-        detail: `扩展将先停止当前历史库的运行，保留完整备份，再创建空历史库。共享设置与其它历史库保留。归档本身不会释放备份占用的磁盘空间。\n\n${dataRoot}`
+        detail: `当前历史挪到备份目录，打开一个空的新历史；挪走的历史在“未能合并的旧数据”里可以只读查看，也可以选择重新合并。备份仍占用磁盘空间。\n\n${dataRoot}`
       },
       '归档并重置'
     );
@@ -128,7 +136,7 @@ export function registerCommands(context: vscode.ExtensionContext, startup: Appl
   }));
 
   context.subscriptions.push(
-    openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand, runtimeDataSetsCommand,
+    openPanelCommand, revealGlobalStorageCommand, resetDevelopmentDataCommand, inspectReliabilityCommand, runtimeDataSetsCommand, mergeAllHistoryCommand,
     ...dataRootCommandDisposables
   );
 }

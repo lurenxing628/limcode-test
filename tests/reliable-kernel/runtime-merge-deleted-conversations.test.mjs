@@ -29,9 +29,7 @@ const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { createVscodeRootAuthority, resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
 const { stopAndDeleteConversation } = require(path.join(compiled, 'backend/application/reliableKernel/conversationDeleteCommand.js'));
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 
 const UNREADABLE = 'runtime-merge-records-unreadable';
 const EXPIRED = 'runtime-data-set-merge-request-expired';

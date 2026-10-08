@@ -40,6 +40,7 @@ import {
   sameRuntimeDataSetIdentity, withRuntimeDataSetMergeClosures,
   type RuntimeDataSetFingerprint, type RuntimeDataSetMergeFinalization, type RuntimeDataSetMergeLedgerRequest
 } from './runtimeDataSetMergeLedger';
+import { readRuntimeHistoryPending, readRuntimeHistoryResidual, runtimeHistoryRegistryFile, type RuntimeHistoryPending } from './runtimeHistoryRegistry';
 import { liveForeignRuntimeHistoryViews } from './runtimeForeignHistoryViews';
 import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
 import {
@@ -56,9 +57,9 @@ import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './run
 import { diskSpaceNeeds, knownDiskDevice } from './runtimeDataSetLargeMergeSpace';
 import {
   assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
-  markVscodeRuntimeDataSetKept, resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
+  resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
   resolveVscodeRuntimeMergeLedgerRoot, selectVscodeRuntimeDataSet, VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN, VSCODE_RUNTIME_CONTROL_DIRECTORY,
-  VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY,
+  VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY,
   VSCODE_RUNTIME_SELECTION_FILE, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
 } from './vscodeRootAuthority';
 
@@ -137,7 +138,7 @@ const GLOBAL_STATUS_FILE = '.limcode-global-status.json';
 /** Every top-level name a LimCode data directory itself may hold (anything else is a file of the user). */
 const LIMCODE_TOP_LEVEL_NAMES: ReadonlySet<string> = new Set([
   ...RUNTIME_ENTRY_NAMES, ...CONFIGURATION_ENTRIES, ...METADATA_ENTRIES,
-  DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, DATA_ROOT_BACKUPS_DIR, RESET_ARCHIVES_DIRECTORY
+  DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, DATA_ROOT_BACKUPS_DIR, RESET_ARCHIVES_DIRECTORY, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY
 ]);
 const CLOUD_SYNC_SEGMENT = /^(onedrive.*|dropbox|icloud ?drive|iclouddrive|mobile documents|cloudstorage|google ?drive|googledrive|my drive|box|box sync|pcloud ?drive|nutstore|坚果云|百度网盘|baidunetdisk|baidusyncdisk|seafile|nextcloud|owncloud|synologydrive|mega|yandex\.disk)$/i;
 /** Free space kept beyond the estimate on every disk involved. */
@@ -752,6 +753,8 @@ export async function planDataRootRelocation(input: {
   if (archives > 0) {
     warnings.push(`旧目录里有 ${archives} 份“归档并重置”留下的归档（含当时的对话）。归档不会迁移，留在旧目录；迁移之后它们列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看；删除旧目录时默认保留。`);
   }
+  const resetBackups = await resetBackupDirectories(sourceRootPath);
+  if (resetBackups.length > 0) warnings.push('旧目录里的重置备份不迁移，仍可在“未能合并的旧数据”中查看；删除旧目录时保留。');
   const configurationEntries: string[] = [];
   let configurationBytes = 0;
   let configurationAllocated = 0;
@@ -1452,6 +1455,24 @@ export async function completeDataRootRelocation(
       }));
       const carry = await planMergeRecordsCarry(source, target, [{ from: mergeIdentity(current), to: mergeIdentity(receivingFingerprint) }, ...moved],
         { relocationId: staged.relocationId, at: new Date().toISOString() });
+      for (const id of [...others.result.migrated, ...others.result.leftBehind.map((item) => item.id)]) {
+        const base = others.result.migrated.includes(id) ? target : source;
+        const candidate = await resolveVscodeRuntimeDataSet({ globalStoragePath: base }, id);
+        const record: RuntimeHistoryPending = {
+          id: base === target ? id : `migration:${staged.relocationId}:${id}`,
+          sourceKind: 'migration',
+          location: { kind: 'copied', containerPath: path.dirname(candidate.runtimeDataRootPath),
+            containerName: path.relative(base, path.dirname(candidate.runtimeDataRootPath)).split(path.sep).join('/'),
+            dataRootRelativePath: 'active', baseDataRootPath: base },
+          ...(candidate.dataSetId && candidate.rootInstanceId ? { identity: mergeIdentity(candidate) } : {}),
+          registeredAt: new Date().toISOString(), reason: '数据目录迁移带来的库'
+        };
+        const to = await runtimeHistoryRegistryFile({ globalStoragePath: target }, 'pending', record.id);
+        const previousWrite = carry.writes.findIndex((write) => write.to === to);
+        const write: MergeRecordsWrite = { kind: 'write', to, text: `${JSON.stringify(record, null, 2)}\n`, replaces: await pathExists(to) };
+        if (previousWrite < 0) carry.writes.push(write);
+        else carry.writes[previousWrite] = write;
+      }
       await applyMergeRecordsCarry(target, carry, journal);
       await verifyMergeRecordsCarry(source, target, carry);
       // Only what really moved: the current data set and the others copied now (not those merged earlier or left behind).
@@ -1922,7 +1943,6 @@ async function migrateOthers(
           { ...options, signal: undefined, progressLabel: `正在迁移其它历史库（${index + 1}/${plan.others.length}）` }, true, journal);
       }
       await copyDebugCaptures(candidate.runtimeDataRootPath, runtimeDataRootPath, target, journal);
-      await markVscodeRuntimeDataSetKept(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, other.id));
       migrated.push({ ...identityOf(candidate), fingerprint });
       carried.push({ ...identityOf(candidate), work });
       result.migrated.push(other.id);
@@ -2309,6 +2329,44 @@ async function planMergeRecordsCarry(
   const existing = async (file: string): Promise<Stats | undefined> => options.movedAside ? undefined : lstatOrUndefined(file);
   const writes: MergeRecordsWrite[] = [];
   const keptClosures: MergeRecordsCarry['keptClosures'] = [];
+
+  // Pending and residual records are authoritative; carry them through the same undo journal.
+  // Their locations stay at the old directory unless that exact data set was copied here.
+  for (const section of ['pending', 'residual'] as const) {
+    const records = section === 'pending' ? await readRuntimeHistoryPending(sourcePaths) : await readRuntimeHistoryResidual(sourcePaths);
+    for (const [id, record] of records) {
+      let carried = record;
+      const moved = record.identity && continued.find((entry) => sameRuntimeDataSetIdentity(entry.from, record.identity!));
+      if (record.location.kind === 'local') {
+        if (!moved?.to) {
+          const candidate = await resolveVscodeRuntimeDataSet(sourcePaths, record.location.candidateId);
+          carried = { ...record, sourceKind: 'migration', location: { kind: 'copied', containerPath: path.dirname(candidate.runtimeDataRootPath), containerName: path.relative(source, path.dirname(candidate.runtimeDataRootPath)).split(path.sep).join('/'), dataRootRelativePath: 'active', baseDataRootPath: source } };
+        } else carried = { ...record, identity: moved.to };
+      } else if (record.sourceKind === 'migration' || record.sourceKind === 'local') {
+        if (moved?.to) {
+          const relative = path.relative(source, record.location.containerPath);
+          carried = { ...record, identity: moved.to, location: { ...record.location, containerPath: path.resolve(target, relative), baseDataRootPath: target } };
+        }
+      } else {
+        carried = { ...record, location: foreignLocationFrom(record.location, path.resolve(source), path.resolve(target)) };
+      }
+      const to = await runtimeHistoryRegistryFile(targetPaths, section, id);
+      const there = await existing(to);
+      if (there) continue;
+      writes.push({ kind: 'write', to, text: `${JSON.stringify(carried, null, 2)}\n`, replaces: false });
+    }
+  }
+  for (const name of ['settlement-consent.json', 'convergence.json']) {
+    const from = path.join(sourceLedger, name);
+    const to = path.join(targetLedger, name);
+    const info = await lstatOrUndefined(from);
+    if (!info) continue;
+    if (!info.isFile()) throw mergeRecordsError(`旧数据目录的 ${name} 不是普通文件`);
+    if (!await existing(to)) {
+      const value: unknown = JSON.parse(await fs.readFile(from, 'utf8'));
+      writes.push({ kind: 'write', to, text: `${JSON.stringify(value, null, 2)}\n`, replaces: false });
+    }
+  }
 
   // Deletion records: files of unique names, never merged.
   const deletionIdentities = await readMergeRecords(() => deletionRecordIdentities(source), '旧目录里的删除记录');
@@ -3680,6 +3738,12 @@ export async function planOldDataRootDeletion(input: {
       optional: false, deletable: false, reason: `无法读取，保留：${problem.message}`
     });
   }
+  for (const directory of await resetBackupDirectories(oldRoot)) {
+    cover(directory);
+    items.push({ key: `reset-backup:${path.relative(oldRoot, directory)}`, kind: 'backup',
+      label: '归档并重置留下的备份（未自动合并）', paths: [directory], bytes: 0,
+      optional: true, deletable: false, reason: '重置备份保留，可在“未能合并的旧数据”中只读查看或重新合并' });
+  }
   // Archives listed by directory: also those of a scope whose data set was deleted (no candidate names them).
   const listed = new Set(items.flatMap((item) => item.paths));
   const known = new Set([...inspection.candidates.map((candidate) => candidate.id), ...inspection.problems.map((problem) => problem.id)]);
@@ -3836,6 +3900,21 @@ async function removeResetArchives(currentRoot: string, oldRoot: string, directo
  * archives directory counts once), and the `.deleting-` leftovers of an interrupted backup cleanup
  * there: those are settled only while the directory is remembered.
  */
+async function resetBackupDirectories(root: string): Promise<string[]> {
+  const scopes = [root];
+  const container = path.join(root, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY);
+  const info = await lstatOrUndefined(container);
+  if (info?.isDirectory() && !info.isSymbolicLink()) {
+    for (const entry of await fs.readdir(container, { withFileTypes: true })) if (entry.isDirectory()) scopes.push(path.join(container, entry.name));
+  }
+  const found: string[] = [];
+  for (const scope of scopes) {
+    const directory = path.join(scope, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY);
+    if (await lstatOrUndefined(directory)) found.push(directory);
+  }
+  return found;
+}
+
 async function countResetArchives(root: string): Promise<number> {
   const directories = await listVscodeRuntimeArchiveDirectories(root).catch(() => []);
   let count = 0;

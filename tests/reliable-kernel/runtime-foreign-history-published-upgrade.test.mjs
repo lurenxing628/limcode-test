@@ -24,9 +24,7 @@ const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 
 const CREATED_AT = '2026-08-12T10:40:00.000Z';
 

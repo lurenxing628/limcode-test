@@ -25,9 +25,7 @@ const { configureWriterConnection } = kernelFile('databaseSchema.js');
 const { ROOT_BINDING_PENDING_FILE } = kernelFile('contracts.js');
 const { RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE } = kernelFile('runtimeEpochMigration.js');
 const { CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } = kernelFile('physicalCutover.js');
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 const NOW = '2026-09-27T00:00:00.000Z';
 const POSIX = process.platform !== 'win32';
 const PYTHON = POSIX && spawnSync('python3', ['-c', 'import fcntl'], { stdio: 'ignore' }).status === 0;

@@ -32,9 +32,7 @@ const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBa
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
-const { archiveCurrentRuntimeRootForReset } = require(path.join(
-  compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'
-));
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
 
 /** Injected bounds: the large source is above the in-memory bound and spans many chunks. */
 const SMALL_LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
