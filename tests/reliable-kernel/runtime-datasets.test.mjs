@@ -98,7 +98,7 @@ test('无旧库时只预留固定默认根，初始化完成后根丢失不能�
   const second = await resolveVscodeWorkspaceRuntimePlacement(paths, scope('different'));
   assert.equal(second.runtimeDataRootPath, first.runtimeDataRootPath);
   await fs.rm(path.join(root, '.limcode-runtime'), { recursive: true });
-  await assertInitialFallbackPreservesRoot(root, paths, 'third');
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('third')), { code: 'runtime-dataset-invalid' });
 }));
 
 test('唯一完整旧根原地复用，RootBinding、数据集身份和CAS不改写', async () => fixture(async (root, paths) => {
