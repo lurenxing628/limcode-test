@@ -9,8 +9,7 @@ export async function analyzeDebugCapture(files: DebugCaptureFiles, runId: strin
     const result: DebugCaptureAnalysis = {
       runId, capturedSource: manifest.source, analyzerSource: source,
       versionMatches: manifest.source.extensionVersion === source.extensionVersion && manifest.source.sourceCommit === source.sourceCommit
-        && Object.values(source.moduleHashes).every(value => /^[a-f0-9]{64}$/.test(value))
-        && JSON.stringify(manifest.source.moduleHashes) === JSON.stringify(source.moduleHashes),
+        && source.buildId.length > 0 && manifest.source.buildId === source.buildId,
       integrity: [], findings: [], events: 0, tools: [], truncated: false
     };
     const note = (level: DebugCaptureAnalysis['findings'][number]['level'], sequence: number, message: string) => {

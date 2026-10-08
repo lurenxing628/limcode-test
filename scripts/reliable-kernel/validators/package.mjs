@@ -17,6 +17,7 @@ import {
   validateInstalledSmokeCheck
 } from '../lib/installed-smoke-evidence.mjs';
 import { isPathBelow } from '../lib/path-containment.mjs';
+import { readZipArchive } from '../lib/zip-archive.mjs';
 
 // package 出口校验器：stable check.id -> handler。
 // 只登记已有真实实现；其余 installed/migration/smoke checks 保持 PENDING。
@@ -54,17 +55,16 @@ function requireArtifact() {
   return absolute;
 }
 
+const vsixArchives = new Map();
+function readVsixArchive(absolute) {
+  if (!vsixArchives.has(absolute)) vsixArchives.set(absolute, readZipArchive(fs.readFileSync(absolute)));
+  return vsixArchives.get(absolute);
+}
+
 function unzipEntry(absolute, entry, options = {}) {
-  const result = childProcess.spawnSync('unzip', ['-p', absolute, entry], {
-    cwd: root,
-    encoding: options.encoding,
-    maxBuffer: options.maxBuffer ?? 16 * 1024 * 1024
-  });
-  const empty = options.encoding ? !result.stdout?.trim() : !result.stdout || result.stdout.length === 0;
-  if (result.error || result.status !== 0 || empty) {
-    throw new Error(`无法从VSIX读取${entry}：${result.error?.message ?? String(result.stderr ?? '').trim() ?? `退出码${result.status}`}`);
-  }
-  return result.stdout;
+  const bytes = readVsixArchive(absolute).read(entry, options.maxBuffer ?? 16 * 1024 * 1024);
+  if (!bytes) throw new Error(`无法从VSIX读取${entry}：文件不存在`);
+  return options.encoding ? bytes.toString(options.encoding) : bytes;
 }
 
 function readVsixManifest(absolute) {
@@ -89,18 +89,7 @@ function readVsixMainEntry(absolute) {
 }
 
 function listVsixFiles(absolute) {
-  const result = childProcess.spawnSync('unzip', ['-Z1', absolute], {
-    cwd: root,
-    encoding: 'utf8',
-    maxBuffer: 16 * 1024 * 1024
-  });
-  if (result.error || result.status !== 0) {
-    throw new Error(`无法读取VSIX文件清单：${result.error?.message ?? result.stderr?.trim() ?? `退出码${result.status}`}`);
-  }
-  return result.stdout
-    .split(/\r?\n/)
-    .map((value) => value.trim())
-    .filter(Boolean)
+  return readVsixArchive(absolute).names
     .map((file) => file.replace(/^extension\//, ''))
     .filter(Boolean)
     .sort();
@@ -192,6 +181,7 @@ function readBuildProvenance(absolute) {
     throw new Error('dist/build-provenance.json不是有效JSON');
   }
   if (typeof provenance.commitSha !== 'string' || !/^[0-9a-f]{40}$/i.test(provenance.commitSha)) throw new Error('build provenance.commitSha不是40位Git SHA');
+  if (typeof provenance.buildId !== 'string' || !provenance.buildId) throw new Error('build provenance.buildId缺失');
   if (typeof provenance.mainEntrySha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(provenance.mainEntrySha256)) throw new Error('build provenance.mainEntrySha256不是64位SHA-256');
   if (typeof provenance.worktreeClean !== 'boolean') throw new Error('build provenance.worktreeClean不是boolean');
   return provenance;
@@ -200,6 +190,8 @@ function readBuildProvenance(absolute) {
 function checkBuildProvenanceCommit() {
   const provenance = readBuildProvenance(requireArtifact());
   const problems = [];
+  const identity = JSON.parse(unzipEntry(requireArtifact(), 'extension/dist/extension/compile-build-id.json', { encoding: 'utf8' }));
+  if (identity.buildId !== provenance.buildId) problems.push('安装包的编译身份与build provenance不一致');
   if (provenance.worktreeClean !== true) problems.push('安装包构建时工作区不是干净状态');
   if (!commit) problems.push('缺少--commit，无法核对当前干净提交');
   else if (provenance.commitSha !== commit) problems.push(`安装包来自提交${provenance.commitSha}，与当前提交${commit}不一致`);
@@ -296,7 +288,7 @@ const legacyRuntimePaths = [
 
 let packagedRuntimeClosureResult;
 function checkPackagedRuntimeClosure() {
-  packagedRuntimeClosureResult ??= packagedRuntimeClosureProblem();
+  if (packagedRuntimeClosureResult === undefined) packagedRuntimeClosureResult = packagedRuntimeClosureProblem();
   return packagedRuntimeClosureResult;
 }
 
@@ -316,7 +308,7 @@ function packagedRuntimeClosureProblem() {
     if (digest !== entry.sha256) return `${entry.path}摘要与package runtime closure manifest不一致`;
     sources.set(entry.path, bytes.toString('utf8'));
   }
-  const graph = computeVsixRequireClosure(absolute, manifest.seeds, new Set(listed));
+  const graph = computeVsixRequireClosure(manifest.seeds, new Set(listed), sources);
   if (JSON.stringify([...graph].sort()) !== JSON.stringify(manifestPaths)) {
     return `独立重算require图(${graph.size})与manifest(${manifestPaths.length})不一致`;
   }
@@ -349,7 +341,7 @@ const DIRNAME_ENTRY_BOUNDARIES = new Map([
 
 /** __dirname uses that start no code, by file: the literal path each resolves (e.g. the extension root for its provenance file). */
 const DIRNAME_RESOURCE_USES = new Map([
-  ['dist/extension/backend/reliableKernel/debugCapture/source.js', new Set(['../../../../..'])]
+  ['dist/extension/backend/application/runtimeBuildIdentity.js', new Set(['../../compile-build-id.json'])]
 ]);
 
 /**
@@ -655,7 +647,7 @@ function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function computeVsixRequireClosure(absolute, seeds, listed) {
+function computeVsixRequireClosure(seeds, listed, sources) {
   const graph = new Set();
   const stack = seeds.map((seed) => `dist/extension/${seed}`);
   while (stack.length > 0) {
@@ -664,7 +656,7 @@ function computeVsixRequireClosure(absolute, seeds, listed) {
     if (!listed.has(file)) throw new Error(`require图入口或依赖不在VSIX：${file}`);
     graph.add(file);
     if (!file.endsWith('.js')) continue;
-    const source = unzipEntry(absolute, `extension/${file}`, { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const source = sources.get(file);
     for (const match of source.matchAll(/require\(["']([^"']+)["']\)/g)) {
       const specifier = match[1];
       if (!specifier.startsWith('.')) continue;

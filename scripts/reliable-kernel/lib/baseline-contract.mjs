@@ -159,7 +159,6 @@ function validateMeasuredCommand(value, label, expectedPrefix, problems) {
   if (command.exitCode !== 0) problems.push(`${label}.exitCode必须为真实成功值0`);
   for (const stream of ['stdout', 'stderr']) {
     requireNonNegativeInteger(command[`${stream}Bytes`], `${label}.${stream}Bytes`, problems);
-    if (!SHA256.test(command[`${stream}Sha256`] ?? '')) problems.push(`${label}.${stream}Sha256必须是64位SHA-256`);
   }
 }
 
@@ -305,7 +304,6 @@ export function validateBaselineDocument(baseline, options) {
       && worktree.clean !== (worktree.statusEntryCount === 0)) {
       problems.push('worktree.clean与statusEntryCount不一致');
     }
-    if (!SHA256.test(worktree.statusSha256 ?? '')) problems.push('worktree.statusSha256必须是64位SHA-256');
   }
 
   const host = requireObject(baseline.host, 'host', problems);

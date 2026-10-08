@@ -17,8 +17,8 @@ const sha256 = (file) => crypto.createHash('sha256').update(fs.readFileSync(file
 const sha256Buffer = (buffer) => crypto.createHash('sha256').update(buffer).digest('hex');
 
 /** npm pack 产出的 tgz（ustar，可能带 pax 扩展头）里 package/ 下每个普通文件的内容。 */
-function readPackedFiles(file) {
-  const tar = zlib.gunzipSync(fs.readFileSync(file));
+function readPackedFiles(bytes) {
+  const tar = zlib.gunzipSync(bytes);
   const files = new Map();
   let paxPath;
   for (let offset = 0; offset + 512 <= tar.length;) {
@@ -54,7 +54,7 @@ function listFiles(base, relative = '') {
 }
 
 /** package.json 与 package-lock.json 都指向 vendor 里的这个安装包，lock 里的版本和 integrity 与它一致。 */
-function checkDependencyDeclarations(archiveFile) {
+function checkDependencyDeclarations(archiveBytes) {
   const specifier = `file:vendor/${archive}`;
   const pkg = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   if (pkg.dependencies?.[packageName] !== specifier) {
@@ -62,7 +62,7 @@ function checkDependencyDeclarations(archiveFile) {
   }
   const lock = JSON.parse(fs.readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
   const locked = lock.packages?.[`node_modules/${packageName}`];
-  const integrity = `sha512-${crypto.createHash('sha512').update(fs.readFileSync(archiveFile)).digest('base64')}`;
+  const integrity = `sha512-${crypto.createHash('sha512').update(archiveBytes).digest('base64')}`;
   if (lock.packages?.['']?.dependencies?.[packageName] !== specifier
     || locked?.resolved !== specifier || locked?.version !== version || locked?.integrity !== integrity) {
     throw new Error(`package-lock.json 里的 ${packageName} 没有锁定到 ${specifier}（版本 ${version}、integrity 与安装包一致）。`);
@@ -70,7 +70,7 @@ function checkDependencyDeclarations(archiveFile) {
 }
 
 /** node_modules 里实际安装的包：版本一致，dist 文件集合与每个文件内容都与安装包相同。 */
-function checkInstalledPackage(archiveFile) {
+function checkInstalledPackage(archiveBytes) {
   const installed = path.join(root, 'node_modules', packageName);
   const installedManifest = path.join(installed, 'package.json');
   if (!fs.existsSync(installedManifest)) {
@@ -80,15 +80,14 @@ function checkInstalledPackage(archiveFile) {
   if (installedVersion !== version) {
     throw new Error(`已安装的 ${packageName} 版本是 ${installedVersion}，应为 ${version}，请重新安装依赖。`);
   }
-  const packed = new Map([...readPackedFiles(archiveFile)]
-    .filter(([name]) => name.startsWith('dist/'))
-    .map(([name, body]) => [name, sha256Buffer(body)]));
+  const packed = new Map([...readPackedFiles(archiveBytes)]
+    .filter(([name]) => name.startsWith('dist/')));
   const installedDist = path.join(installed, 'dist');
   const actual = new Map(fs.existsSync(installedDist)
-    ? listFiles(installedDist).map((name) => [`dist/${name}`, sha256(path.join(installedDist, name))])
+    ? listFiles(installedDist).map((name) => [`dist/${name}`, fs.readFileSync(path.join(installedDist, name))])
     : []);
   const differing = [...new Set([...packed.keys(), ...actual.keys()])]
-    .filter((name) => packed.get(name) !== actual.get(name))
+    .filter((name) => !packed.has(name) || !actual.get(name)?.equals(packed.get(name)))
     .sort();
   if (packed.size === 0 || differing.length > 0) {
     throw new Error(`已安装的 ${packageName} 与 vendor/${archive} 的 dist 不一致（${differing.slice(0, 5).join('、') || '安装包里没有 dist'}${differing.length > 5 ? ` 等 ${differing.length} 个文件` : ''}），请重新安装依赖。`);
@@ -98,13 +97,14 @@ function checkInstalledPackage(archiveFile) {
 if (process.argv.includes('--check')) {
   const source = JSON.parse(fs.readFileSync(manifest, 'utf8'));
   const archiveFile = path.join(directory, archive);
+  const archiveBytes = fs.readFileSync(archiveFile);
   if (source.upstreamCommit !== revision || source.version !== version || source.archive !== archive
-    || source.archiveSha256 !== sha256(archiveFile)
+    || source.archiveSha256 !== sha256Buffer(archiveBytes)
     || source.patchSha256 !== sha256(path.join(directory, patch))) {
     throw new Error('固定模型接入库的补丁或安装包摘要不匹配。');
   }
-  checkDependencyDeclarations(archiveFile);
-  checkInstalledPackage(archiveFile);
+  checkDependencyDeclarations(archiveBytes);
+  checkInstalledPackage(archiveBytes);
   console.log('固定模型接入库来源与摘要匹配，依赖声明与已安装包都是这个安装包。');
 } else {
   const temporary = fs.mkdtempSync(path.join(os.tmpdir(), 'limcode-provider-build-'));

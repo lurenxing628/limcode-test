@@ -240,26 +240,17 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Linux VSIX
-        run: npm run package:linux -- --out limcode-test-linux-x64-ci.vsix
+      - name: Prepare once and build all target VSIX packages
+        run: npm run package:all -- --out limcode-test-{target}-ci.vsix
 
       - name: Check Linux packaged files
         run: npm run check:package:surface -- --artifact limcode-test-linux-x64-ci.vsix
 
-      - name: Build Windows VSIX
-        run: npm run package:win32 -- --out limcode-test-win32-x64-ci.vsix
-
       - name: Check Windows packaged files
         run: npm run check:package:surface -- --artifact limcode-test-win32-x64-ci.vsix
 
-      - name: Build macOS x64 VSIX
-        run: npm run package:darwin-x64 -- --out limcode-test-darwin-x64-ci.vsix
-
       - name: Check macOS x64 packaged files
         run: npm run check:package:surface -- --artifact limcode-test-darwin-x64-ci.vsix
-
-      - name: Build macOS arm64 VSIX
-        run: npm run package:darwin-arm64 -- --out limcode-test-darwin-arm64-ci.vsix
 
       - name: Check macOS arm64 packaged files
         run: npm run check:package:surface -- --artifact limcode-test-darwin-arm64-ci.vsix

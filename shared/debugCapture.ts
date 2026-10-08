@@ -50,7 +50,7 @@ export interface DebugCaptureManifest {
   peakMemoryBytes: number;
   batches: number;
   elapsedMs: number;
-  source: { extensionVersion: string; sourceCommit: string; hostBootId: string; moduleHashes: Record<string, string> };
+  source: { extensionVersion: string; sourceCommit: string; hostBootId: string; buildId: string };
 }
 
 export interface DebugPayloadRef {

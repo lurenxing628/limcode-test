@@ -234,8 +234,7 @@ export class DebugCaptureFiles {
       || (run.target.scope === 'conversation' && typeof run.target.conversationId !== 'string')
       || typeof run.commandId !== 'string' || run.commandAliases.some(value => typeof value !== 'string')
       || typeof run.source?.extensionVersion !== 'string' || typeof run.source?.sourceCommit !== 'string'
-      || typeof run.source?.hostBootId !== 'string' || !run.source?.moduleHashes
-      || Object.values(run.source.moduleHashes).some(value => typeof value !== 'string')
+      || typeof run.source?.hostBootId !== 'string' || typeof run.source?.buildId !== 'string'
       || ![8, 16, 32].includes(run.maxBytes / 1_048_576)
       || !Number.isSafeInteger(run.lastAcceptedSeq) || run.lastAcceptedSeq < run.durableSeq
       || !Number.isSafeInteger(run.durableSeq) || run.durableSeq < 0

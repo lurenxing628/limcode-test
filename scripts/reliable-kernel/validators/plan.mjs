@@ -7,6 +7,12 @@ import process from 'node:process';
 // check-plan.mjs 负责工作区合同 exact-set；本文件补 tracked/selector/no-legacy formal checks。
 const GROUP_ID = 'plan';
 const root = process.cwd();
+// Bootstrap is unconditional: an unverified registry must not choose whether it gets checked.
+const coherenceProblem = checkContractCoherence();
+if (coherenceProblem) {
+  console.error(`失败：plan.contract-coherence：${coherenceProblem}`);
+  process.exit(1);
+}
 const registry = JSON.parse(
   fs.readFileSync(path.join(root, 'docs/architecture/reliable-kernel/contracts/gate-registry.json'), 'utf8')
 );
@@ -70,7 +76,7 @@ function checkNoLegacyCompatibility() {
 
 /** @type {Map<string, () => string | null>} */
 const implemented = new Map([
-  ['plan.contract-coherence', checkContractCoherence],
+  ['plan.contract-coherence', () => null],
   ['plan.transition-disposition', checkTransitionDisposition],
   ['plan.no-legacy-compatibility', checkNoLegacyCompatibility]
 ]);

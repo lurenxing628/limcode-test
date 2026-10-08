@@ -25,6 +25,13 @@ const WEBVIEW_TEST_FILES = Object.freeze([
 ]);
 const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-merge-conversation-ownership.test.mjs',
+  'tests/reliable-kernel/physical-configuration-validation.test.mjs',
+  'tests/reliable-kernel/runtime-build-identity.test.mjs',
+  'tests/reliable-kernel/build-pipeline.test.mjs',
+  'tests/reliable-kernel/content-identification.test.mjs',
+  'tests/reliable-kernel/repository-encoding-boundary.test.mjs',
+  'tests/reliable-kernel/runtime-schema-reuse.test.mjs',
+  'tests/reliable-kernel/process-output-prefix.test.mjs',
   'tests/reliable-kernel/context-cas-cache.test.mjs',
   'tests/reliable-kernel/frozen-tool-definitions.test.mjs',
   'tests/reliable-kernel/composer-attachment-authority.test.mjs',
@@ -371,8 +378,6 @@ const report = selectedShard ? {
   commit: process.env.GITHUB_SHA ?? null,
   index: selection.index,
   count: selection.count,
-  suiteDigest: plan.suiteDigest,
-  planDigest: plan.planDigest,
   assignedFiles: files,
   startedAt: new Date().toISOString(),
   completed: false,

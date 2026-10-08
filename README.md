@@ -97,7 +97,10 @@ npm run package:linux          # 打包 Linux x64 VSIX
 npm run package:win32          # 打包 Windows x64 VSIX
 npm run package:darwin-x64     # 打包 macOS Intel VSIX
 npm run package:darwin-arm64   # 打包 macOS Apple Silicon VSIX
+npm run package:all            # 构建与裁剪一次，打包上述四个平台
 ```
+
+项目的 `package:*` 入口会准备最新产物，单次 `package:all` 共用这一份产物。直接使用 `vsce package` 只打包已有产物。扩展编译、watch 成功轮次与 webview 构建完成后更新同一个 buildId；运行中的扩展保留装载时的身份，重新构建后提示重载，不扫描源树和模块正文来生成证明清单。
 
 ## 目录概览
 

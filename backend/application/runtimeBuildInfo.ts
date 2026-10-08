@@ -1,5 +1,7 @@
-import { createHash, randomUUID } from 'crypto';
-import { readFileSync } from 'fs';
+import { randomUUID } from 'crypto';
+import { readFileSync, statSync } from 'fs';
+import * as path from 'node:path';
+import { LOADED_RUNTIME_BUILD } from './runtimeBuildIdentity';
 import type { RuntimeBuildInfoRecord } from '../../shared/protocol';
 import { EXTENSION_PACKAGE_NAME, EXTENSION_VERSION } from '../../shared/extensionIdentity';
 import { LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION } from '../capabilities/openAIResponsesWebSocketIdentity';
@@ -9,7 +11,11 @@ const runtimeInstanceId = randomUUID();
 const providerVersion = readPackageVersion('unified-llm-provider');
 const webSocketVersion = readPackageVersion('ws');
 const proxyAgentVersion = readPackageVersion('https-proxy-agent');
-const activatedBuildFingerprint = calculateCurrentBuildFingerprint();
+const buildModulePaths = runtimeModulePaths();
+const activatedBuildFiles = currentBuildFileState();
+const activatedBuildFingerprint = LOADED_RUNTIME_BUILD.buildId ?? runtimeInstanceId;
+let observedBuildFiles = activatedBuildFiles;
+let currentBuildFingerprint = activatedBuildFingerprint;
 
 export const RUNTIME_BUILD_INFO: RuntimeBuildInfoRecord = Object.freeze({
   extensionName: EXTENSION_PACKAGE_NAME,
@@ -28,11 +34,14 @@ export const RUNTIME_BUILD_INFO: RuntimeBuildInfoRecord = Object.freeze({
 });
 
 /**
- * 每次 Hello 都重新读取磁盘上的关键编译产物。
- * `npm run compile` 会替换这些文件，但已运行的 Extension Host 仍持有旧模块；两者指纹不同即说明必须重载。
+ * 编译会替换模块文件；握手只比较文件身份，变化时更新诊断标识，不重新读取和散列正文。
  */
 export function getRuntimeBuildInfo(): RuntimeBuildInfoRecord {
-  const currentBuildFingerprint = calculateCurrentBuildFingerprint();
+  const currentFiles = currentBuildFileState();
+  if (currentFiles !== observedBuildFiles) {
+    observedBuildFiles = currentFiles;
+    currentBuildFingerprint = currentFiles === activatedBuildFiles ? activatedBuildFingerprint : randomUUID();
+  }
   const reloadRequired = currentBuildFingerprint !== RUNTIME_BUILD_INFO.buildFingerprint;
   return {
     ...RUNTIME_BUILD_INFO,
@@ -52,22 +61,19 @@ function readPackageVersion(packageName: string): string {
   }
 }
 
-function calculateCurrentBuildFingerprint(): string {
-  const hash = createHash('sha256');
-  hash.update(`${EXTENSION_PACKAGE_NAME}\n${EXTENSION_VERSION}\n${LIMCODE_OPENAI_RESPONSES_WS_IMPLEMENTATION}\n`);
-  for (const modulePath of runtimeModulePaths()) {
+function currentBuildFileState(): string {
+  return JSON.stringify(buildModulePaths.map(modulePath => {
     try {
-      hash.update(modulePath);
-      hash.update(readFileSync(modulePath));
+      const stat = statSync(modulePath, { bigint: true });
+      return [stat.dev, stat.ino, stat.size, stat.mtimeNs, stat.ctimeNs].map(String);
     } catch {
-      hash.update(`unreadable:${modulePath}`);
+      return 'unreadable';
     }
-  }
-  return hash.digest('hex').slice(0, 16);
+  }));
 }
 
 function runtimeModulePaths(): string[] {
-  const paths = [__filename];
+  const paths = [__filename, path.join(__dirname, '../../compile-build-id.json')];
   for (const moduleId of [
     '../capabilities/llmProvider',
     '../capabilities/llmStreamEventProjection',

@@ -2,8 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /** Source text with LF line endings, so a Windows checkout (core.autocrlf) matches the same multi-line snippets. */
+let sourceTextCache;
 function readText(file) {
-  return fs.readFileSync(file, 'utf8').replace(/\r\n/g, '\n');
+  const absolute = path.resolve(file);
+  if (sourceTextCache?.has(absolute)) return sourceTextCache.get(absolute);
+  const text = fs.readFileSync(absolute, 'utf8').replace(/\r\n/g, '\n');
+  sourceTextCache?.set(absolute, text);
+  return text;
 }
 
 export const CONTRACT_FILES = [
@@ -326,26 +331,32 @@ export function loadContractDocuments(root) {
 }
 
 export function validateContractDocuments(root, documents) {
-  const failures = [];
-  validatePlanFiles(root, failures);
-  validateCommon(documents, failures);
-  validateGateRegistry(documents['gate-registry.json'], failures);
-  validateValidatorProtocol(root, documents['gate-registry.json'], failures);
-  validateMigration(root, documents['migration.json'], failures);
-  validateAuthority(documents['authority.json'], documents['migration.json'], failures);
-  validateForeignHistory(root, documents['authority.json'], failures);
-  validateDeletedConversations(root, failures);
-  validateIdentity(documents['identity.json'], failures);
-  validateTool(documents['tool.json'], failures);
-  validateFile(documents['file.json'], failures);
-  validateContext(documents['context.json'], failures);
-  validateSubagent(documents['subagent.json'], failures);
-  validateClient(root, documents['client-feed.json'], failures);
-  validateTargets(documents['targets.json'], documents['gate-registry.json'], failures);
-  validateTransitionLedger(root, documents['transition-ledger.json'], failures);
-  validateCrossContract(documents, failures);
-  validateHumanPlanMarkers(root, failures);
-  return failures;
+  const previousCache = sourceTextCache;
+  sourceTextCache = new Map();
+  try {
+    const failures = [];
+    validatePlanFiles(root, failures);
+    validateCommon(documents, failures);
+    validateGateRegistry(documents['gate-registry.json'], failures);
+    validateValidatorProtocol(root, documents['gate-registry.json'], failures);
+    validateMigration(root, documents['migration.json'], failures);
+    validateAuthority(documents['authority.json'], documents['migration.json'], failures);
+    validateForeignHistory(root, documents['authority.json'], failures);
+    validateDeletedConversations(root, failures);
+    validateIdentity(documents['identity.json'], failures);
+    validateTool(documents['tool.json'], failures);
+    validateFile(documents['file.json'], failures);
+    validateContext(documents['context.json'], failures);
+    validateSubagent(documents['subagent.json'], failures);
+    validateClient(root, documents['client-feed.json'], failures);
+    validateTargets(documents['targets.json'], documents['gate-registry.json'], failures);
+    validateTransitionLedger(root, documents['transition-ledger.json'], failures);
+    validateCrossContract(documents, failures);
+    validateHumanPlanMarkers(root, failures);
+    return failures;
+  } finally {
+    sourceTextCache = previousCache;
+  }
 }
 
 export function selectGateValidators(registry, stage) {
@@ -469,9 +480,11 @@ function validateValidatorProtocol(root, registry, failures) {
   if (packageSource.includes("fs.readFileSync(path.join(root, 'package.json')")) failures.push('package validator不得用工作区package.json代替VSIX内manifest');
   const generatorSource = readText(path.join(root, 'scripts/reliable-kernel/write-build-provenance.mjs'));
   if (!generatorSource.includes('manifest.main') || !generatorSource.includes("crypto.createHash('sha256')")) failures.push('build provenance generator必须读取package.json.main并计算SHA-256');
-  for (const marker of ["'status'", "'--porcelain'", "'--untracked-files=all'", 'worktreeClean']) {
-    if (!generatorSource.includes(marker)) failures.push(`build provenance generator缺少构建时工作区洁净检查：${marker}`);
+  const compileIdentitySource = readText(path.join(root, 'scripts/reliable-kernel/lib/compile-build-id.mjs'));
+  for (const marker of ["'status'", "'--porcelain'", "'--untracked-files=all'", 'worktreeClean', 'randomUUID()']) {
+    if (!compileIdentitySource.includes(marker)) failures.push(`compile build identity缺少构建来源字段：${marker}`);
   }
+  if (!generatorSource.includes('compile-build-id.json')) failures.push('build provenance必须沿用编译身份');
 }
 
 function validateMigration(root, migration, failures) {
@@ -1827,7 +1840,7 @@ function validateTargets(targets, registry, failures) {
   }
   if ((targets?.unsupported ?? []).includes('windows')) failures.push('Windows已是正式VSIX目标，不能继续列为unsupported');
   const buildProvenance = targets?.validation?.buildProvenance;
-  for (const field of ['commitSha', 'mainEntrySha256', 'worktreeClean']) if (!(buildProvenance?.fields ?? []).includes(field)) failures.push(`构建来源缺少${field}`);
+  for (const field of ['buildId', 'commitSha', 'mainEntrySha256', 'worktreeClean']) if (!(buildProvenance?.fields ?? []).includes(field)) failures.push(`构建来源缺少${field}`);
   if (buildProvenance?.mainEntrySource !== 'VSIX内package.json.main') failures.push('制品校验必须从VSIX内package.json.main解析真实入口');
   const cleanlinessSource = String(buildProvenance?.worktreeCleanSource ?? '');
   for (const marker of ['git status', '--porcelain', '--untracked-files=all']) if (!cleanlinessSource.includes(marker)) failures.push(`构建时洁净来源缺少${marker}`);

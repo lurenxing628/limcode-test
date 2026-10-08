@@ -233,6 +233,7 @@ docs/architecture/*
 !/tests/reliable-kernel/runtime-history-integrity.test.mjs
 !/tests/reliable-kernel/process-completion-integrity.test.mjs
 !/tests/reliable-kernel/process-start-fingerprint-race.test.mjs
+!/tests/reliable-kernel/process-output-prefix.test.mjs
 !/tests/reliable-kernel/runtime-dataset-merge-responsiveness.test.mjs
 !/tests/reliable-kernel/model-handle-catalog.test.mjs
 !/tests/reliable-kernel/runtime-history-repair.test.mjs
@@ -283,3 +284,11 @@ docs/architecture/*
 !/tests/reliable-kernel/context-handle-head-writers.test.mjs
 
 !/tests/reliable-kernel/runtime-merge-conversation-ownership.test.mjs
+
+# Focused build and data boundary regressions.
+!/tests/reliable-kernel/physical-configuration-validation.test.mjs
+!/tests/reliable-kernel/runtime-build-identity.test.mjs
+!/tests/reliable-kernel/content-identification.test.mjs
+!/tests/reliable-kernel/repository-encoding-boundary.test.mjs
+!/tests/reliable-kernel/runtime-schema-reuse.test.mjs
+!/tests/reliable-kernel/build-pipeline.test.mjs

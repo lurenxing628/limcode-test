@@ -58,15 +58,16 @@
       "packageEntry": "dist/build-provenance.json",
       "generator": "scripts/reliable-kernel/write-build-provenance.mjs",
       "fields": [
+        "buildId",
         "commitSha",
         "mainEntrySha256",
         "worktreeClean"
       ],
       "mainEntrySource": "VSIX内package.json.main",
-      "worktreeCleanSource": "生成器写provenance前执行git status --porcelain --untracked-files=all；仅空输出记为true",
+      "worktreeCleanSource": "扩展编译和watch成功轮次生成compile-build-id.json时执行git status --porcelain --untracked-files=all；仅空输出记为true；webview单独构建仅更新buildId，保留已有backend的commitSha/worktreeClean；build provenance沿用同一份身份与backend来源",
       "packageVerification": "从VSIX读取package.json.main指向的真实入口并重算SHA-256，与provenance.mainEntrySha256比较；provenance.worktreeClean必须为true。",
       "installedVerification": "安装后重算实际加载入口SHA-256，并与同一VSIX入口摘要比较。",
-      "rule": "安装包由构建时干净工作区生成；生成脚本读取项目package.json.main、记录worktreeClean并在build后写入dist/build-provenance.json；package validator以VSIX内manifest为制品权威，不得只检查provenance字段存在。"
+      "rule": "安装包由构建时干净工作区生成；扩展编译和watch成功轮次生成随机buildId及backend提交和工作区状态；webview单独构建刷新组合buildId，保留原backend来源，不从当前HEAD推断未编译的backend，运行中模块固定加载时的buildId，build provenance沿用同次编译身份并读取真实package.json.main；package validator以VSIX内manifest为制品权威，不得只检查provenance字段存在。"
     },
     "smoke": [
       {

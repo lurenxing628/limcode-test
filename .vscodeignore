@@ -75,8 +75,6 @@ README copy.md
 !dist/**/*.wasm
 !dist/**/*.json
 
-# 本地编译闭包证明只供 gate 使用，不属于 Extension 运行时或安装包表面。
-dist/extension/reliable-kernel-compile-provenance.json
 dist/**/*.map
 
 # CI reports are never extension runtime assets.

@@ -7,12 +7,6 @@ import path from 'node:path';
 import process from 'node:process';
 import { performance } from 'node:perf_hooks';
 import { createRequire } from 'node:module';
-import {
-  RELIABLE_KERNEL_COMPILE_PROVENANCE,
-  manifestFilesAreTracked,
-  reliableKernelCompiledManifest,
-  reliableKernelSourceManifest
-} from './lib/compile-provenance.mjs';
 
 const root = process.cwd();
 const checkId = option('check');
@@ -3701,19 +3695,9 @@ function percentile95(values) {
 async function writeEvidence(stableId, evidence, commitSha) {
   const fileName = `${stableId.replaceAll('.', '-')}.json`;
   const evidencePath = path.join(root, 'tests/reliable-kernel/evidence', fileName);
-  const runnerPath = path.join(root, 'scripts/reliable-kernel/run-phase-e-check.mjs');
-  const compileProvenancePath = path.join(root, RELIABLE_KERNEL_COMPILE_PROVENANCE);
   const worktreeStatus = childProcess.execFileSync(
     'git', ['status', '--porcelain', '--untracked-files=all'], { cwd: root, encoding: 'utf8' }
   ).trim();
-  const compileProvenance = JSON.parse(await fs.readFile(compileProvenancePath, 'utf8'));
-  const sourceManifest = reliableKernelSourceManifest(root);
-  const compiledManifest = reliableKernelCompiledManifest(root);
-  const sourceFilesTracked = manifestFilesAreTracked(root, sourceManifest);
-  const compiledClosureMatches = compileProvenance.kind === 'limcode-reliable-kernel-compile-provenance'
-    && compileProvenance.commitSha === commitSha
-    && compileProvenance.sourceTreeSha256 === sourceManifest.sha256
-    && compileProvenance.compiledClosureSha256 === compiledManifest.sha256;
   const sqlite = new Database(':memory:');
   let sqliteVersion;
   try {
@@ -3731,21 +3715,6 @@ async function writeEvidence(stableId, evidence, commitSha) {
     provenance: {
       worktreeClean: worktreeStatus.length === 0,
       commitExplicitlyBound: requestedCommit === commitSha,
-      authoritative: worktreeStatus.length === 0
-        && requestedCommit === commitSha
-        && sourceFilesTracked
-        && compileProvenance.worktreeClean === true
-        && compileProvenance.sourceFilesTracked === true
-        && compiledClosureMatches,
-      runnerSha256: await fileSha256(runnerPath),
-      sourceTreeSha256: sourceManifest.sha256,
-      sourceFileCount: sourceManifest.files.length,
-      sourceFilesTracked,
-      compiledKernelSha256: compiledManifest.sha256,
-      compiledFileCount: compiledManifest.files.length,
-      compileProvenance: path.relative(root, compileProvenancePath),
-      compileWorktreeClean: compileProvenance.worktreeClean === true,
-      compiledClosureMatches,
       invocation: [process.execPath, ...process.argv.slice(1)],
       node: process.version,
       sqlite: sqliteVersion,
@@ -3756,10 +3725,6 @@ async function writeEvidence(stableId, evidence, commitSha) {
     ...evidence
   }, bigintJson, 2)}\n`);
   return evidencePath;
-}
-
-async function fileSha256(filePath) {
-  return crypto.createHash('sha256').update(await fs.readFile(filePath)).digest('hex');
 }
 
 function bigintJson(_key, value) {

@@ -2,7 +2,7 @@ import childProcess from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import zlib from 'node:zlib';
+import { readZipArchive } from './lib/zip-archive.mjs';
 
 const root = process.cwd();
 const artifact = option('artifact');
@@ -118,53 +118,6 @@ function listArtifactFiles(relativeArtifactPath) {
     console.error(`VSIX内容检查失败：无法读取artifact ZIP清单或package.json：${error.message}`);
     process.exit(1);
   }
-}
-
-/** Minimal ZIP central-directory reader; avoids a platform dependency on the external unzip CLI. */
-function readZipArchive(bytes) {
-  const endSignature = 0x06054b50;
-  const centralSignature = 0x02014b50;
-  const localSignature = 0x04034b50;
-  const minimumEndOffset = Math.max(0, bytes.length - 65_557);
-  let endOffset = -1;
-  for (let offset = bytes.length - 22; offset >= minimumEndOffset; offset -= 1) {
-    if (bytes.readUInt32LE(offset) === endSignature) {
-      endOffset = offset;
-      break;
-    }
-  }
-  if (endOffset < 0) throw new Error('ZIP end-of-central-directory记录缺失');
-  const entryCount = bytes.readUInt16LE(endOffset + 10);
-  let offset = bytes.readUInt32LE(endOffset + 16);
-  const entries = new Map();
-  for (let index = 0; index < entryCount; index += 1) {
-    if (bytes.readUInt32LE(offset) !== centralSignature) throw new Error('ZIP central-directory记录损坏');
-    const compressionMethod = bytes.readUInt16LE(offset + 10);
-    const compressedSize = bytes.readUInt32LE(offset + 20);
-    const fileNameLength = bytes.readUInt16LE(offset + 28);
-    const extraLength = bytes.readUInt16LE(offset + 30);
-    const commentLength = bytes.readUInt16LE(offset + 32);
-    const localHeaderOffset = bytes.readUInt32LE(offset + 42);
-    const name = bytes.subarray(offset + 46, offset + 46 + fileNameLength).toString('utf8');
-    entries.set(name, { compressionMethod, compressedSize, localHeaderOffset });
-    offset += 46 + fileNameLength + extraLength + commentLength;
-  }
-  return {
-    names: [...entries.keys()].sort(),
-    read(name) {
-      const entry = entries.get(name);
-      if (!entry) return undefined;
-      const localOffset = entry.localHeaderOffset;
-      if (bytes.readUInt32LE(localOffset) !== localSignature) throw new Error(`ZIP local header损坏：${name}`);
-      const localNameLength = bytes.readUInt16LE(localOffset + 26);
-      const localExtraLength = bytes.readUInt16LE(localOffset + 28);
-      const dataOffset = localOffset + 30 + localNameLength + localExtraLength;
-      const compressed = bytes.subarray(dataOffset, dataOffset + entry.compressedSize);
-      if (entry.compressionMethod === 0) return Buffer.from(compressed);
-      if (entry.compressionMethod === 8) return zlib.inflateRawSync(compressed);
-      throw new Error(`ZIP compression method不支持：${entry.compressionMethod}`);
-    }
-  };
 }
 
 function lines(value) {

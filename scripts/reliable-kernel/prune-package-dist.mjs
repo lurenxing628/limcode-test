@@ -27,6 +27,7 @@ const seeds = seedPaths.map((relative) => {
   if (!fs.existsSync(absolute)) throw new Error(`Package runtime seed is missing: ${relative}`);
   return absolute;
 });
+const sources = new Map();
 const reachable = commonJsClosure(seeds);
 const removed = [];
 for (const file of walkFiles(extensionRoot)) {
@@ -47,7 +48,7 @@ const entries = [...reachable]
   .sort()
   .map((file) => ({
     path: portable(path.relative(root, file)),
-    sha256: sha256(fs.readFileSync(file))
+    sha256: sha256(sources.get(file))
   }));
 const manifest = {
   kind: 'limcode-package-runtime-closure',
@@ -55,11 +56,10 @@ const manifest = {
   seeds: seedPaths,
   files: entries,
   fileCount: entries.length,
-  closureSha256: sha256(Buffer.from(entries.map((entry) => `${entry.path}\0${entry.sha256}`).join('\n'))),
   removedFileCount: removed.length
 };
 fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o600 });
-console.log(`已裁剪安装包Runtime闭包：保留${manifest.fileCount}个JS，删除${manifest.removedFileCount}个不可达JS/map，closure=${manifest.closureSha256}。`);
+console.log(`已裁剪安装包Runtime闭包：保留${manifest.fileCount}个JS，删除${manifest.removedFileCount}个不可达JS/map。`);
 
 function commonJsClosure(initial) {
   const seen = new Set();
@@ -70,7 +70,9 @@ function commonJsClosure(initial) {
     if (!isPathBelow(extensionRoot, file)) throw new Error(`Package closure escaped dist/extension: ${file}`);
     if (!fs.existsSync(file)) throw new Error(`Package closure dependency is missing: ${portable(path.relative(root, file))}`);
     seen.add(file);
-    const source = fs.readFileSync(file, 'utf8');
+    const bytes = fs.readFileSync(file);
+    sources.set(file, bytes);
+    const source = bytes.toString('utf8');
     for (const match of source.matchAll(/require\(["']([^"']+)["']\)/g)) {
       const specifier = match[1];
       if (!specifier.startsWith('.')) continue;

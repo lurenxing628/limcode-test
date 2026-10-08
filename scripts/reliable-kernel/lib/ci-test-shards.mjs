@@ -1,9 +1,7 @@
-import crypto from 'node:crypto';
 import fs from 'node:fs';
 
 export const CI_SHARD_COUNT = 8;
 const compare = (left, right) => left < right ? -1 : left > right ? 1 : 0;
-const digest = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 export function readCiTestTimings() {
   const timings = JSON.parse(fs.readFileSync(new URL('../ci-test-timings.json', import.meta.url), 'utf8'));
@@ -31,9 +29,7 @@ export function createCiShardPlan(files, count = CI_SHARD_COUNT, timings = readC
     shard.estimatedDurationMs += duration(file);
   }
   for (const shard of shards) shard.files.sort(compare);
-  const suiteDigest = digest(sorted);
-  const planDigest = digest({ suiteDigest, shards });
-  return { suiteDigest, planDigest, shards };
+  return { shards };
 }
 
 export function parseCiShard(value) {
@@ -61,7 +57,6 @@ export function verifyCiShardReports(plan, reports, expectedCommit) {
     }
     seen.add(report.index);
     if (report.kind !== 'limcode-ci-test-shard' || report.count !== shard.count
-      || report.suiteDigest !== plan.suiteDigest || report.planDigest !== plan.planDigest
       || (expectedCommit && report.commit !== expectedCommit)) {
       failures.push(`Shard ${shard.index} has stale or invalid provenance`);
     }

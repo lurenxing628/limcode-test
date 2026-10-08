@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const { DebugCaptureService } = require('../../dist/extension/backend/reliableKernel/debugCapture/service.js');
 const { boundedJsonBytes } = require('../../dist/extension/shared/debugCaptureEncoding.js');
 const context = { conversationId: 'conversation-a', modelRequestId: 'request-a', attemptSeq: 1, socketGeneration: 1 };
-const source = { extensionVersion: 'test', sourceCommit: 'test', hostBootId: 'host-a', moduleHashes: {} };
+const source = { extensionVersion: 'test', sourceCommit: 'test', hostBootId: 'host-a', buildId: 'test-build' };
 async function fixture(t) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-debug-files-'));
   let invalid = false;

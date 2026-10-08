@@ -4,8 +4,7 @@ import path from 'node:path';
 import process from 'node:process';
 import {
   loadContractDocuments,
-  selectGateValidators,
-  validateContractDocuments
+  selectGateValidators
 } from './lib/contract-model.mjs';
 
 const root = process.cwd();
@@ -90,8 +89,8 @@ if (!gate) {
   process.exit(2);
 }
 try {
-  for (const problem of validateContractDocuments(root, documents)) add('plan', problem);
   validators = selectGateValidators(documents['gate-registry.json'], stage);
+  if (!validators.includes('plan')) add('plan', '出口必须包含计划校验器');
 } catch (error) {
   add('plan', error instanceof Error ? error.message : String(error));
 }
@@ -122,6 +121,9 @@ for (const groupId of validators) {
   }
 }
 
+// Plan validation runs once and before any compilation or runtime checks.
+if (blockers.length === 0) runValidator('plan');
+
 if (blockers.length === 0 && validators.includes('foundation')) {
   const compile = childProcess.spawnSync('npm', ['run', 'compile'], {
     cwd: root,
@@ -135,21 +137,24 @@ if (blockers.length === 0 && validators.includes('foundation')) {
   }
 }
 
+function runValidator(groupId) {
+  const definition = documents['gate-registry.json'].validatorGroups.find((entry) => entry.id === groupId);
+  const validatorPath = groupId === 'plan' ? 'scripts/reliable-kernel/validators/plan.mjs' : definition.path;
+  const args = [path.join(root, validatorPath), `--stage=${stage}`, `--commit=${commitSha}`];
+  if (artifactPath) args.push(`--artifact=${artifactPath}`);
+  const run = childProcess.spawnSync(process.execPath, args, {
+    cwd: root,
+    encoding: 'utf8',
+    timeout: groupId === 'package' ? 600000 : 180000,
+    maxBuffer: 8 * 1024 * 1024
+  });
+  const diagnostic = [run.stdout, run.stderr].filter(Boolean).join('\n').trim();
+  results.push({ validator: groupId, status: run.status ?? 1, diagnostic });
+  if (run.error || run.status !== 0) add(groupId, run.error?.message ?? (diagnostic || `退出码${run.status}`));
+}
+
 if (blockers.length === 0) {
-  for (const groupId of validators) {
-    const definition = documents['gate-registry.json'].validatorGroups.find((entry) => entry.id === groupId);
-    const args = [path.join(root, definition.path), `--stage=${stage}`, `--commit=${commitSha}`];
-    if (artifactPath) args.push(`--artifact=${artifactPath}`);
-    const run = childProcess.spawnSync(process.execPath, args, {
-      cwd: root,
-      encoding: 'utf8',
-      timeout: groupId === 'package' ? 600000 : 180000,
-      maxBuffer: 8 * 1024 * 1024
-    });
-    const diagnostic = [run.stdout, run.stderr].filter(Boolean).join('\n').trim();
-    results.push({ validator: groupId, status: run.status ?? 1, diagnostic });
-    if (run.error || run.status !== 0) add(groupId, run.error?.message ?? (diagnostic || `退出码${run.status}`));
-  }
+  for (const groupId of validators.filter((id) => id !== 'plan')) runValidator(groupId);
 }
 
 finish(blockers.length === 0 ? 0 : 1, commitSha, validators);

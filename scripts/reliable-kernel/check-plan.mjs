@@ -48,6 +48,13 @@ function isTestArtifactPath(file) {
 
 const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/runtime-merge-conversation-ownership.test.mjs',
+  'tests/reliable-kernel/physical-configuration-validation.test.mjs',
+  'tests/reliable-kernel/runtime-build-identity.test.mjs',
+  'tests/reliable-kernel/build-pipeline.test.mjs',
+  'tests/reliable-kernel/content-identification.test.mjs',
+  'tests/reliable-kernel/repository-encoding-boundary.test.mjs',
+  'tests/reliable-kernel/runtime-schema-reuse.test.mjs',
+  'tests/reliable-kernel/process-output-prefix.test.mjs',
   'tests/reliable-kernel/context-cas-cache.test.mjs',
   'tests/reliable-kernel/frozen-tool-definitions.test.mjs',
   'tests/webview-session-thinking.browser.mjs',
@@ -469,12 +476,9 @@ function checkTrackedInputs() {
     'package.json',
     'package-lock.json'
   ].filter((relative) => !LOCAL_GENERATED_BENCHMARK_OUTPUTS.has(relative));
+  const trackedFiles = new Set(tracked);
   for (const relative of formalInputs) {
-    try {
-      git(['ls-files', '--error-unmatch', '--', relative]);
-    } catch {
-      failures.push(`正式输入未被版本库跟踪：${relative}`);
-    }
+    if (!trackedFiles.has(relative)) failures.push(`正式输入未被版本库跟踪：${relative}`);
   }
   const ledger = documents['transition-ledger.json'];
   const missingDeletionCommits = (ledger?.entries ?? [])

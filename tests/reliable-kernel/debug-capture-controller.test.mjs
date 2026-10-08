@@ -30,7 +30,7 @@ function fixture(overrides = {}) {
       timers.add(timer);
       return () => timers.delete(timer);
     },
-    source: { extensionVersion: 'test', sourceCommit: 'test', hostBootId: 'host-a', moduleHashes: {} },
+    source: { extensionVersion: 'test', sourceCommit: 'test', hostBootId: 'host-a', buildId: 'test-build' },
     ...overrides
   };
   const controller = new DebugCaptureController(ports);
