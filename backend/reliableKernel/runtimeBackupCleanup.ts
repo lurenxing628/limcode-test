@@ -1,56 +1,59 @@
-import { RUNTIME_RESET_BACKUPS_DIRECTORY, readRuntimeHistoryPending, readRuntimeHistoryResidual } from './runtimeHistoryRegistry';
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { createHash,randomBytes,randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { promisify } from 'node:util';
-import { gunzip, gzip } from 'node:zlib';
+import { gunzip,gzip } from 'node:zlib';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { DATA_ROOT_BACKUPS_DIR } from '../capabilities/vscodeStorage/constants';
-import { casObjectFromStorageKey, type CasByteAccess, type CasObjectIdentity } from './casObjectAccess';
+import { casObjectFromStorageKey,type CasByteAccess,type CasObjectIdentity } from './casObjectAccess';
 import {
-  createRuntimeRootPaths, ROOT_BINDING_POINTER_FILE, ROOT_BINDING_PENDING_FILE, RUNTIME_CAS_DIRECTORY, RUNTIME_DATABASE_FILE,
-  RUNTIME_EPOCH_FILE, type RuntimeRootPaths
+createRuntimeRootPaths,
+ROOT_BINDING_PENDING_FILE,
+ROOT_BINDING_POINTER_FILE,
+RUNTIME_CAS_DIRECTORY,RUNTIME_DATABASE_FILE,
+RUNTIME_EPOCH_FILE,type RuntimeRootPaths
 } from './contracts';
-import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
 import { isPackedCasPhysicalEntry } from './looseCasMaintenance';
-import { CUTOVER_BACKUPS_DIRECTORY, CUTOVER_JOURNAL_FILE, CUTOVER_REQUEST_FILE } from './physicalCutover';
+import { CUTOVER_BACKUPS_DIRECTORY,CUTOVER_JOURNAL_FILE,CUTOVER_REQUEST_FILE } from './physicalCutover';
+import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
 import type { RepositoryGetRead } from './repositories';
-import { parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
+import { parseHistoricalRootBinding,type HistoricalRootBinding } from './rootAuthority';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { comparable } from './runtimeDataSetBulkCopy';
 import {
-  readRuntimeBackupFacts, readRuntimeCopyFacts, readRuntimeDataSetFacts, RUNTIME_HISTORY_RECORD_DOMAINS, runtimeDataSetFileState,
-  type RuntimeDataSetContentBodies, type RuntimeDataSetHistoryIds
+readRuntimeBackupFacts,readRuntimeCopyFacts,readRuntimeDataSetFacts,RUNTIME_HISTORY_RECORD_DOMAINS,runtimeDataSetFileState,
+type RuntimeDataSetContentBodies,type RuntimeDataSetHistoryIds
 } from './runtimeDataSetFacts';
 import {
-  BACKUP_NAME as MERGE_BACKUP_NAME, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY
+BACKUP_NAME as MERGE_BACKUP_NAME,RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY,RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY
 } from './runtimeDataSetMerge';
 import {
-  isReadableRuntimeDataSetFingerprint, isRuntimeLargeMergeTargetBackupLive, readRuntimeDataSetMergeLedger,
-  readRuntimeDataSetMergeRequests, readRuntimeLargeMergeTargetBackups, runtimeDataSetFingerprint
+isReadableRuntimeDataSetFingerprint,isRuntimeLargeMergeTargetBackupLive,readRuntimeDataSetMergeLedger,
+readRuntimeLargeMergeTargetBackups,runtimeDataSetFingerprint
 } from './runtimeDataSetMergeLedger';
 import {
-  MIGRATION_COMPLETION_KIND, RETIRED_EPOCH_3_TO_4_JOURNAL_FILE, RETIRED_EPOCH_TO_5_JOURNAL_FILE, RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
-  RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE, RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE
+MIGRATION_COMPLETION_KIND,RETIRED_EPOCH_3_TO_4_JOURNAL_FILE,RETIRED_EPOCH_TO_5_JOURNAL_FILE,RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY,
+RUNTIME_EPOCH_MIGRATION_COMPLETION_FILE,RUNTIME_EPOCH_MIGRATION_JOURNAL_FILE
 } from './runtimeEpochMigration';
 import {
-  copyForeignRuntimeSqliteFiles, discoverForeignRuntimeHistory, foreignRuntimeHistoryId, ForeignRuntimeHistoryRejection,
-  heldDatabaseFiles, inspectForeignRuntimeRoot, listRenamedForeignRuntimeRoots, openLocatedCasAccess, readForeignRuntimePointerIdentity,
-  readLocatedRuntimeFile, tryWithForeignRuntimeRootClaim, type DiscoveredForeignRuntimeRoot, type ForeignRuntimeHistoryEntry,
-  type HeldDatabaseFiles
+copyForeignRuntimeSqliteFiles,discoverForeignRuntimeHistory,foreignRuntimeHistoryId,ForeignRuntimeHistoryRejection,
+heldDatabaseFiles,inspectForeignRuntimeRoot,listRenamedForeignRuntimeRoots,openLocatedCasAccess,readForeignRuntimePointerIdentity,
+readLocatedRuntimeFile,tryWithForeignRuntimeRootClaim,type DiscoveredForeignRuntimeRoot,type ForeignRuntimeHistoryEntry,
+type HeldDatabaseFiles
 } from './runtimeForeignHistory';
 import { liveForeignRuntimeHistoryViews } from './runtimeForeignHistoryViews';
+import { readRuntimeHistoryPending,readRuntimeHistoryResidual,RUNTIME_RESET_BACKUPS_DIRECTORY } from './runtimeHistoryRegistry';
 import {
-  RUNTIME_HOST_LIVENESS_DIRECTORY, withRuntimeDataRootAdmission, withRuntimeMaintenance, withRuntimeMaintenanceActivity,
-  type RuntimeMaintenanceActivity
+RUNTIME_HOST_LIVENESS_DIRECTORY,withRuntimeDataRootAdmission,withRuntimeMaintenance,withRuntimeMaintenanceActivity,
+type RuntimeMaintenanceActivity
 } from './runtimeHostControl';
-import { sameLocatedRuntimeRoot, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
-import { assertNoSymbolicPath, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
+import { sameLocatedRuntimeRoot,type LocatedRuntimeRoot } from './runtimeLocatedRoot';
+import { assertNoSymbolicPath,requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import {
-  inspectVscodeRuntimeDataSets, resolveVscodeRuntimeMergeLedgerRoot, VSCODE_RUNTIME_ACTIVE_DIRECTORY, VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN,
-  VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
-  type VscodeRuntimeDataSetCandidate
+inspectVscodeRuntimeDataSets,resolveVscodeRuntimeMergeLedgerRoot,VSCODE_RUNTIME_ACTIVE_DIRECTORY,VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN,
+VSCODE_RUNTIME_CONTROL_DIRECTORY,VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY,VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
+type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
 /**
@@ -2382,9 +2385,6 @@ async function foreignMergePending(configurationRootPath: string, foreignId: str
     if ((await readRuntimeHistoryResidual(paths)).has(foreignId)) return '未能合并的旧数据，原位保留，不自动删除';
     if ((await readRuntimeHistoryPending(paths)).has(foreignId)) return '旧数据尚待合并，完成之前保留';
     if (record?.state === 'committing') return '有进行中的操作（正在提交的合并），完成之后再清理';
-    if ((await readRuntimeDataSetMergeRequests(paths)).has(foreignId)) {
-      return '你已请求把它合并进当前库，合并还没完成；合并完成或请求过期之后再清理';
-    }
     return undefined;
   } catch {
     return '合并记录无法读取，不能确认它没有正在提交的合并或等待中的合并请求，这次不能删除';

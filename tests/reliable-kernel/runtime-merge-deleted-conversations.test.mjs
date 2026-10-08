@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 // What the user deleted never comes back through a merge: deleted-conversation records written by the
 // deletion command before it commits (runtimeMergeTombstones), identity continuations after a data-root
 // relocation, closures kept across incarnations and foreign copies, and the other fixes of the B phase 2
@@ -67,7 +68,7 @@ async function found(root, containerPath, scope = null, previousDataRootPaths) {
 }
 
 async function request(root, source) {
-  await foreignMerge.requestForeignRuntimeHistoryMerge({ globalStoragePath: root }, {
+  await registerPendingHistory({ globalStoragePath: root }, {
     id: source.id, location: source.location, label: source.label,
     expectedDataSetId: source.root.recorded.dataSetId, expectedRootInstanceId: source.root.recorded.rootInstanceId
   });
@@ -913,10 +914,11 @@ test('迁移合并也按删除记录：新目录的当前库里删掉的对话�
 });
 
 const ledgerModule = kernelFile('runtimeDataSetMergeLedger.js');
+const historyRegistry = kernelFile('runtimeHistoryRegistry.js');
 /** Merge requests and finalization notes under `root`, file by file. */
 async function requestsAndNotes(root) {
   const result = {};
-  for (const section of ['requests', 'finalizations']) {
+  for (const section of ['pending', 'finalizations']) {
     const directory = path.join(ledgerRoot(root), section);
     if (!await exists(directory)) continue;
     for (const [file, digest] of Object.entries(await moving.treeSnapshot(directory))) result[`${section}/${file}`] = digest;
@@ -924,11 +926,10 @@ async function requestsAndNotes(root) {
   return result;
 }
 
-test('盲审 F4：迁移带走迁走的库的合并请求（按新身份改写，期限不变）与收尾说明，新目录启动时照请求合并并报告收尾；带过去的请求核对不一致时撤销；旧目录的原样留着', async (t) => {
+test('盲审 F4：迁移带走待合并登记与收尾说明，新目录启动时照请求合并并报告收尾；带过去的请求核对不一致时撤销；旧目录的原样留着', async (t) => {
   const fixture = await moving.createFixture(t);
   const alpha = (await moving.rootAuthority.inspectVscodeRuntimeDataSets(fixture.paths)).candidates.find((item) => item.id === fixture.alpha.id);
-  await moving.rootAuthority.markVscodeRuntimeDataSetKept(alpha);
-  await ledgerModule.writeRuntimeDataSetMergeRequest(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     candidateId: alpha.id, expectedDataSetId: alpha.dataSetId, expectedRootInstanceId: alpha.rootInstanceId, target: identityOf(fixture.current.binding)
   });
   await ledgerModule.writeRuntimeDataSetMergeFinalization(fixture.paths, {
@@ -936,13 +937,13 @@ test('盲审 F4：迁移带走迁走的库的合并请求（按新身份改写�
     sourceBackupPath: path.join(fixture.root, 'merge-source-backup'), complete: true
   });
   const oldBookkeeping = await requestsAndNotes(fixture.root);
-  const { requestedAt } = (await ledgerModule.readRuntimeDataSetMergeRequests(fixture.paths)).get(alpha.id);
+  const { registeredAt } = (await historyRegistry.readRuntimeHistoryPending(fixture.paths)).get(alpha.id);
   const target = path.join(fixture.base, 'new-home');
   const plan = await moving.planWithRuntime(fixture, target);
   assert.deepEqual(plan.problems, []);
 
   // The carried request damaged right after it was written: the check finds it, the relocation is undone.
-  const requestFile = path.join(ledgerRoot(target), 'requests', `${alpha.id.replace(/:/g, '-')}.json`);
+  const requestFile = path.join(ledgerRoot(target), 'pending', `${alpha.id.replace(/:/g, '-')}.json`);
   const rename = fs.rename;
   let damaged = false;
   fs.rename = async function (from, to, ...rest) {
@@ -955,7 +956,7 @@ test('盲审 F4：迁移带走迁走的库的合并请求（按新身份改写�
   };
   try {
     await assert.rejects(moving.relocate(fixture, plan),
-      (error) => error.code === 'data-root-relocation-merge-records' && /带到新数据目录的合并请求与旧目录核对不一致，整体取消迁移/.test(error.message));
+      (error) => error.code === 'data-root-relocation-merge-records' && /带到新数据目录的历史登记与旧目录核对不一致，整体取消迁移/.test(error.message));
   } finally { fs.rename = rename; }
   assert.equal(damaged, true);
   assert.deepEqual(await requestsAndNotes(target), {}, '撤销去掉带过去的请求和说明');
@@ -964,11 +965,10 @@ test('盲审 F4：迁移带走迁走的库的合并请求（按新身份改写�
   assert.deepEqual(result.others.migrated, [alpha.id]);
   const current = await moving.selectedDataSet(target);
   const alphaCopy = (await moving.rootAuthority.inspectVscodeRuntimeDataSets({ globalStoragePath: target })).candidates.find((item) => item.id === alpha.id);
-  assert.deepEqual((await ledgerModule.readRuntimeDataSetMergeRequests({ globalStoragePath: target })).get(alpha.id), {
-    kind: 'limcode-runtime-data-set-merge-request', candidateId: alpha.id,
-    expectedDataSetId: alphaCopy.dataSetId, expectedRootInstanceId: alphaCopy.rootInstanceId,
-    target: { dataSetId: current.dataSetId, rootInstanceId: current.rootInstanceId }, requestedAt
-  }, '请求按迁走的库和新当前库的身份改写，期限不变');
+  const pending = (await historyRegistry.readRuntimeHistoryPending({ globalStoragePath: target })).get(alpha.id);
+  assert.deepEqual(pending.identity, identityOf(alphaCopy));
+  assert.equal(pending.location.kind, 'local');
+  assert.equal(pending.location.candidateId, alpha.id);
   const note = await ledgerModule.readRuntimeDataSetMergeFinalization({ globalStoragePath: target }, alphaCopy);
   assert.deepEqual([note?.source, note?.turns, note?.sourceBackupPath], [identityOf(alphaCopy), 1, path.join(fixture.root, 'merge-source-backup')]);
   assert.deepEqual(await requestsAndNotes(fixture.root), oldBookkeeping, '旧目录的请求和说明原样留着');
@@ -980,7 +980,7 @@ test('盲审 F4：迁移带走迁走的库的合并请求（按新身份改写�
   assert.ok(moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'));
 });
 
-test('盲审 F4：外来历史库的合并请求改写成新目录找到它的位置（旧目录的归档成为上一个目录的归档，id 随之而变），新目录启动时照请求合并', async (t) => {
+test('盲审 F4：外来待合并登记改写成新目录找到它的位置（旧目录的归档成为上一个目录的归档，id 随之而变），新目录启动时照请求合并', async (t) => {
   const fixture = await moving.createFixture(t);
   const archivePath = await archive(fixture, fixture.alpha);
   const source = await found(fixture.root, archivePath);
@@ -991,13 +991,12 @@ test('盲审 F4：外来历史库的合并请求改写成新目录找到它的�
   await moving.relocate(fixture, plan);
   const there = await found(target, archivePath, null, [fixture.root]);
   assert.notEqual(there.id, source.id, '前提：从新目录看，旧目录的归档是另一个 id');
-  const carried = await ledgerModule.readRuntimeDataSetMergeRequests({ globalStoragePath: target });
-  assert.deepEqual([...carried.keys()], [there.id]);
-  assert.deepEqual(carried.get(there.id).foreign, { location: there.location, label: source.label });
+  const carried = await historyRegistry.readRuntimeHistoryPending({ globalStoragePath: target });
+  assert.ok(carried.has(there.id));
+  assert.deepEqual(carried.get(there.id).location, there.location);
   const current = await moving.selectedDataSet(target);
-  assert.deepEqual(carried.get(there.id).target, { dataSetId: current.dataSetId, rootInstanceId: current.rootInstanceId });
   const startup = await mergeIntoCurrent(target, current);
-  assert.deepEqual(brief(startup).merged.map(([id]) => id), [there.id]);
+  assert.ok(brief(startup).merged.some(([id]) => id === there.id), JSON.stringify(brief(startup)));
   assert.ok(moving.conversationIds(current.runtimeDataRootPath).includes('conversation_alpha_1'));
 });
 

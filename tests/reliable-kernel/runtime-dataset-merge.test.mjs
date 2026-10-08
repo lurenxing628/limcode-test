@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 import { publishInitialRuntimeSelection as selectVscodeRuntimeDataSet } from './fixtures/runtime-selection.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
@@ -22,10 +23,9 @@ const { attachmentObservationLinkId } = kernelFile('attachmentObservations.js');
 const { stablePhaseDId } = kernelFile('effectControlPlane.js');
 const { createConversationRuntimeWorkProbe } = kernelFile('conversationRuntimePendingWork.js');
 const {
-  KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS,
+  KEPT_MERGE_FINALIZATION_REASON, MERGE_FINALIZATION_REASON, RUNTIME_DATA_SET_MERGE_BACKUP_RETENTION,
   RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS, mergeHistoricalDataSetsOnline,
-  mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge,
-  claimRuntimeDataSetUndecidedPrompt, keepRuntimeDataSetsApart
+  mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, readRuntimeDataSetMergeStates
 } = kernelFile('runtimeDataSetMerge.js');
 const ledgerModule = kernelFile('runtimeDataSetMergeLedger.js');
 const { runExclusiveRuntimeMaintenance } = kernelFile('runtimeExclusiveMaintenance.js');
@@ -851,7 +851,7 @@ test('复审 startup2 #2：合并中当前库被关闭（重载/切库）记为�
   await assert.rejects(fs.stat(path.join(controlRoot(stop.current), 'merge-backups')), { code: 'ENOENT' });
 });
 
-test('复审 startup2 #6：旧请求过期也照常收敛，成功后移除旧请求', async (t) => {
+test('待合并登记无期限，成功后移除登记', async (t) => {
   const fixture = await createFixture(t, { withBeta: false, selected: 'alpha' });
   await seed(fixture.current, [{ id: 'conversation_default_kept', project: SHARED_PROJECT }]);
   let database = await openTarget(t, fixture.alpha);
@@ -860,9 +860,9 @@ test('复审 startup2 #6：旧请求过期也照常收敛，成功后移除旧�
   await selectVscodeRuntimeDataSet(fixture.paths, 'default');
   await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
   await requestMerge(fixture, fixture.alpha);
-  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'requests', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
+  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'pending', `${fixture.alpha.id.replace(/:/g, '-')}.json`);
   const request = JSON.parse(await fs.readFile(file, 'utf8'));
-  await fs.writeFile(file, JSON.stringify({ ...request, requestedAt: new Date(Date.now() - RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS - 1000).toISOString() }));
+  await fs.writeFile(file, JSON.stringify({ ...request, registeredAt: new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString() }));
   assert.notEqual((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'kept');
   database = await openTarget(t, fixture.current);
   const report = await merge(fixture, database);
@@ -1290,7 +1290,8 @@ test('复审 merge3 #4：事务确定回滚后原样恢复的拒绝记录保留�
   });
   assert.match(rolledBack.deferred[0]?.message ?? '', /写入当前库时出错/);
   assert.deepEqual(await readLedgerRecord(fixture, fixture.alpha.id), judged, '恢复的记录与回滚前完全相同（包括判定时间）');
-  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'requested');
+  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'partial');
+  assert.equal(await exists(requestFile(fixture, fixture.alpha.id)), true);
   const retried = await merge(fixture, database);
   assert.deepEqual([retried.merged.length, retried.blocked], [1, []], '请求晚于判定，照常重试');
 });
@@ -1731,29 +1732,6 @@ test('盲审 merge #3/#5：收尾数按收尾后来源里的实际状态统计�
   assert.deepEqual(queuedReport.merged.map((item) => [item.finalized?.turns, item.finalized?.intents]), [[0, 1]]);
 });
 
-test('盲审 merge #8：收尾原因区分来源：本版本切走（用户保留）的库写“合并前收尾。”，旧版本留下的库写“在旧版本里中断，合并前收尾。”（盲审2 #2：不再说是升级时中断）', async (t) => {
-  const fixture = await createFixture(t, { selected: 'alpha' });
-  await selectVscodeRuntimeDataSet(fixture.paths, 'default');
-  await fs.writeFile(path.join(controlRoot(fixture.alpha), 'kept-by-user.json'), JSON.stringify({ kind: 'limcode-runtime-data-set-kept', dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId }));
-  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
-  await seed(fixture.beta, [{ id: 'conversation_beta_legacy', project: SHARED_PROJECT }]);
-  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_alpha_kept', kind: 'bare' }]);
-  await seedUnfinishedWork(fixture.beta, [{ conversationId: 'conversation_beta_legacy', kind: 'bare' }]);
-  const database = await openTarget(t, fixture.current);
-  assert.deepEqual((await merge(fixture, database)).merged.map((item) => item.candidateId).sort(), [fixture.alpha.id, fixture.beta.id].sort(), '旧保留来源也自动合并');
-  await requestMerge(fixture, fixture.alpha);
-  assert.deepEqual((await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true })).merged.map((item) => item.candidateId),
-    [fixture.alpha.id]);
-  const target = readDatabase(fixture.current);
-  try {
-    const reason = (turnId) => target.database.prepare('SELECT reason FROM turn_termination WHERE turn_id = ?').pluck().get(turnId);
-    assert.equal(reason('conversation_alpha_kept_unfinished_turn'), KEPT_MERGE_FINALIZATION_REASON);
-    assert.equal(reason('conversation_beta_legacy_unfinished_turn'), MERGE_FINALIZATION_REASON);
-  } finally { target.close(); }
-  assert.equal(KEPT_MERGE_FINALIZATION_REASON, '合并前收尾。');
-  assert.equal(MERGE_FINALIZATION_REASON, '在旧版本里中断，合并前收尾。');
-});
-
 test('盲审 merge #6：“历史与存储管理”读合并状态时，没缓存的内容指纹在该库的 admission 与 maintenance 里读取，缓存命中不取锁', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.alpha, [{ id: 'conversation_alpha_state', project: SHARED_PROJECT }]);
@@ -2060,7 +2038,7 @@ test('盲审2 merge #6：读不出的账本记录不当成“没有记录”：�
 });
 
 function requestFile(fixture, candidateId) {
-  return path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'requests', `${candidateId.replace(/:/g, '-')}.json`);
+  return path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'pending', `${candidateId.replace(/:/g, '-')}.json`);
 }
 
 const exists = (file) => fs.stat(file).then(() => true, () => false);
@@ -2112,7 +2090,7 @@ test('盲审2 merge #3：用户保留的库明确合并提交后崩溃、请求�
   assert.equal((await readLedgerRecord(fixture, fixture.alpha.id))?.state, 'committing');
   const file = requestFile(fixture, fixture.alpha.id);
   const request = JSON.parse(await fs.readFile(file, 'utf8'));
-  await fs.writeFile(file, JSON.stringify({ ...request, requestedAt: new Date(Date.now() - 8 * 24 * 3600 * 1000).toISOString() }));
+  await fs.writeFile(file, JSON.stringify({ ...request, registeredAt: new Date(Date.now() - 8 * 24 * 3600 * 1000).toISOString() }));
   const auto = await merge(fixture, database);
   assert.deepEqual([auto.blocked, auto.deferred], [[], []], '不报请求过期');
   assert.deepEqual(auto.merged.map((item) => [item.candidateId, item.recoveredCommit]), [[fixture.alpha.id, true]]);
@@ -2315,17 +2293,6 @@ test('盲审2 merge #2：把新建的默认库记为已初始化（修订号加�
   assert.deepEqual([report.merged.map((item) => item.candidateId), report.undecided ?? []], [[fixture.alpha.id], []]);
 });
 
-test('盲审2 merge #2：等决定的库只由一个窗口问一次：同一会话不再问，另一个存活窗口持有时不问，它的进程不在了就接手', async (t) => {
-  const fixture = await createFixture(t, { withBeta: false });
-  assert.equal(await claimRuntimeDataSetUndecidedPrompt(fixture.paths, { sessionId: 'session-1' }), true);
-  assert.equal(await claimRuntimeDataSetUndecidedPrompt(fixture.paths, { sessionId: 'session-1' }), false, '同一会话只问一次');
-  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'prompts', 'switched-before-upgrade.json');
-  const record = JSON.parse(await fs.readFile(file, 'utf8'));
-  await fs.writeFile(file, JSON.stringify({ ...record, processId: process.pid + 100_000, processStartIdentity: 'another-window' }));
-  assert.equal(await claimRuntimeDataSetUndecidedPrompt(fixture.paths, { sessionId: 'session-2', classify: () => 'alive' }), false,
-    '另一个窗口还在，由它问');
-  assert.equal(await claimRuntimeDataSetUndecidedPrompt(fixture.paths, { sessionId: 'session-2', classify: () => 'dead' }), true, '那个窗口不在了');
-});
 
 async function mergedInto(fixture) {
   const record = await readLedgerRecord(fixture, fixture.alpha.id);
@@ -2422,7 +2389,7 @@ function merge(fixture, database, options) {
 }
 
 function requestMerge(fixture, dataSet) {
-  return requestRuntimeDataSetMerge(fixture.paths, {
+  return registerPendingHistory(fixture.paths, {
     candidateId: dataSet.id,
     expectedDataSetId: dataSet.binding.dataSetId,
     expectedRootInstanceId: dataSet.binding.rootInstanceId

@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 // Foreign history, the last blind review: archives of the manual reset of released 0.0.10–0.0.20
 // (`<scope>/.limcode-runtime-backups/<17 digits>`) are found and listed as a published older format; a
 // previous data directory is forgotten only when it is provably there and empty (not when it is gone,
@@ -95,7 +96,7 @@ async function deleteWithCommand(authority, root, conversationId, deletion) {
 
 async function requestMerge(root, entry) {
   const located = await foreign.locateForeignRuntimeRoot(root, entry.location);
-  await foreignMerge.requestForeignRuntimeHistoryMerge({ globalStoragePath: root }, {
+  await registerPendingHistory({ globalStoragePath: root }, {
     id: entry.id, location: entry.location, label: `外来历史库（${entry.name}）`,
     expectedDataSetId: located.recorded.dataSetId, expectedRootInstanceId: located.recorded.rootInstanceId
   });

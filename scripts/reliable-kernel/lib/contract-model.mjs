@@ -1004,7 +1004,7 @@ function validateForeignHistory(root, authority, failures) {
     [streamedSource, 'const resolver = historicalMergeSources(paths, (candidateId) => internals.sources.get(candidateId)?.state.foreign);'],
     // Only a request names a foreign source (with its location), and only a foreign id carries one.
     [ledgerSource, foreignId], [foreignSource, foreignId],
-    [ledgerSource, 'if (FOREIGN_ID.test(request.candidateId) !== (foreign !== undefined)) continue;'],
+    [mergeSource, "if (recorded.location.kind === 'local' || !recorded.identity) continue;"],
     // Its own committing merge (only read from it) never makes a foreign root unverifiable.
     [foreignSource, 'const merged = typeof record.candidateId === \'string\' && FOREIGN_ID.test(record.candidateId) ? [record.target] : [record.source, record.target];']
   ].filter(([source, text]) => !source.includes(text));
@@ -1055,7 +1055,7 @@ function validateDeletedConversations(root, failures) {
     // What the user deleted from the source itself (an earlier copy of it still holds it), withdrawn when not deleted.
     [merge, "for (const id of await mergeRecordsReadable(() => readRuntimeDeletedConversations(root, sources), '这个历史库的删除记录')) merged.add(id);"],
     [command, 'for (const receipt of this.receipts.splice(0)) await receipt.withdraw().catch(() => undefined);'],
-    [cleanup, 'if ((await readRuntimeDataSetMergeRequests(paths)).has(foreignId)) {'],
+    [cleanup, 'if ((await readRuntimeHistoryPending(paths)).has(foreignId))'],
     [merge, 'for (const id of runtimeDataSetConversationsMergedFrom(record, source, targets)) merged.add(id);'],
     [streamed, '  const merged = await engine.recordedConversations(paths, target, candidate);'],
     [streamed, '    const merged = await engine.recordedConversations(paths, target, candidate);'],

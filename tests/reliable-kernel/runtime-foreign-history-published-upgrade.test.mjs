@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 // Foreign history left by released versions (published epochs 3/4/5): a reset archive and a copied data
 // directory whose schema is exactly the published one are upgraded only in private copies
 // (runtimeSnapshotUpgrade, run in a worker). They are verified, viewed read-only and merged, Child
@@ -243,7 +244,7 @@ async function found(fixture, containerPath, scope) {
 }
 
 async function merge(fixture, source) {
-  await foreignMerge.requestForeignRuntimeHistoryMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     id: source.id, location: source.location, label: source.label,
     expectedDataSetId: source.root.recorded.dataSetId, expectedRootInstanceId: source.root.recorded.rootInstanceId
   });

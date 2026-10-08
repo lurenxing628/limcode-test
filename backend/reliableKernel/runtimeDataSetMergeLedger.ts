@@ -16,7 +16,6 @@ import { resolveVscodeRuntimeMergeLedgerRoot,type VscodeRuntimeDataSetCandidate 
  * does not make its sources look unmerged. Every record names the exact source files it judged.
  */
 const RECORD_KIND = 'limcode-runtime-data-set-merge';
-const REQUEST_KIND = 'limcode-runtime-data-set-merge-request';
 const COMMIT_KIND = 'limcode-runtime-data-set-merge-commit';
 const FINGERPRINT_KIND = 'limcode-runtime-data-set-fingerprint';
 const FINALIZATION_KIND = 'limcode-runtime-data-set-merge-finalization';
@@ -24,7 +23,6 @@ const PREPARATION_KIND = 'limcode-runtime-data-set-merge-preparation';
 const AUDIT_KIND = 'limcode-runtime-data-set-audit';
 const TARGET_BACKUP_KIND = 'limcode-runtime-large-merge-target-backup';
 const RECORDS = 'records';
-const REQUESTS = 'requests';
 const COMMITS = 'commits';
 /** Cache only: the content digest last computed for an exact file state. Never a merge fact. */
 const FINGERPRINTS = 'fingerprints';
@@ -37,8 +35,6 @@ const PREPARATIONS = 'preparing';
 const TARGET_BACKUPS = 'preparing-backups';
 /** Content digest prefix of a data set whose content could not be read (see runtimeDataSetFingerprint). */
 const UNREADABLE_DIGEST = 'unreadable:';
-const PROMPTS = 'prompts';
-const PROMPT_KIND = 'limcode-runtime-data-set-merge-prompt';
 /** The id of a foreign history root (runtimeForeignHistory.foreignRuntimeHistoryId). */
 const FOREIGN_ID = /^foreign:(archive|copied):[0-9a-f]{16}$/;
 
@@ -146,20 +142,6 @@ export type RuntimeDataSetMergeLedgerRecord = {
    */
   | { state: 'too-large'; code: string; message: string; rows: number; maxRows: number }
 );
-
-export interface RuntimeDataSetMergeLedgerRequest {
-  kind: typeof REQUEST_KIND;
-  candidateId: string;
-  expectedDataSetId: string;
-  expectedRootInstanceId: string;
-  target: RuntimeDataSetIdentity;
-  requestedAt: string;
-  /**
-   * A foreign history root (candidateId is its foreign id): where it was found and its readable name.
-   * Only a request makes such a root a merge source; it is never enumerated like a data set.
-   */
-  foreign?: RuntimeDataSetMergeForeignSource;
-}
 
 /** Where a requested foreign history root was found (runtimeForeignHistory discovery), and its name. */
 export interface RuntimeDataSetMergeForeignSource {
@@ -720,32 +702,6 @@ export async function removeRuntimeDataSetMergeLedgerRecord(paths: StoragePaths,
   await removeLedgerJson(paths, RECORDS, candidateId);
 }
 
-/** Which window of which VS Code session asks the user something once (prompts/<name>.json); advisory only. */
-export interface RuntimeDataSetMergePrompt {
-  kind: typeof PROMPT_KIND;
-  sessionId: string;
-  processId: number;
-  processStartIdentity?: string;
-  claimedAt: string;
-}
-
-export async function readRuntimeDataSetMergePrompt(paths: StoragePaths, name: string): Promise<RuntimeDataSetMergePrompt | undefined> {
-  let value: Partial<RuntimeDataSetMergePrompt>;
-  try { value = JSON.parse(await fs.readFile(await ledgerFile(paths, PROMPTS, name), 'utf8')) as Partial<RuntimeDataSetMergePrompt>; }
-  catch { return undefined; }
-  if (value?.kind !== PROMPT_KIND || typeof value.sessionId !== 'string' || !Number.isSafeInteger(value.processId)
-    || (value.processStartIdentity !== undefined && typeof value.processStartIdentity !== 'string')) return undefined;
-  return value as RuntimeDataSetMergePrompt;
-}
-
-export async function writeRuntimeDataSetMergePrompt(
-  paths: StoragePaths,
-  name: string,
-  prompt: Omit<RuntimeDataSetMergePrompt, 'kind' | 'claimedAt'>
-): Promise<void> {
-  await writeLedgerJson(paths, PROMPTS, name, { kind: PROMPT_KIND, ...prompt, claimedAt: new Date().toISOString() });
-}
-
 /** A recorded, still applicable failure of this exact source state (for startup data-set choice). */
 export async function readRecordedRuntimeDataSetFailure(
   paths: StoragePaths,
@@ -757,48 +713,6 @@ export async function readRecordedRuntimeDataSetFailure(
   return fingerprint && sameRuntimeDataSetFingerprint(record.source, fingerprint)
     ? { code: record.code, message: record.message }
     : undefined;
-}
-
-export async function readRuntimeDataSetMergeRequests(paths: StoragePaths): Promise<Map<string, RuntimeDataSetMergeLedgerRequest>> {
-  const result = new Map<string, RuntimeDataSetMergeLedgerRequest>();
-  for (const [name, value] of await readDirectoryJson(paths, REQUESTS)) {
-    const request = value as Partial<RuntimeDataSetMergeLedgerRequest>;
-    if (request?.kind !== REQUEST_KIND || typeof request.candidateId !== 'string' || fileName(request.candidateId) !== name
-      || typeof request.expectedDataSetId !== 'string' || typeof request.expectedRootInstanceId !== 'string'
-      || !request.target) continue;
-    // A foreign root is found only where its request says: without a complete location it is no request,
-    // and only a foreign id names one (runtimeForeignHistory ids never collide with a data set's).
-    const foreign = request.foreign as Partial<RuntimeDataSetMergeForeignSource> | undefined;
-    if (FOREIGN_ID.test(request.candidateId) !== (foreign !== undefined)) continue;
-    if (foreign !== undefined && (typeof foreign?.label !== 'string' || !isForeignLocation(foreign.location))) continue;
-    result.set(request.candidateId, request as RuntimeDataSetMergeLedgerRequest);
-  }
-  return result;
-}
-
-export async function writeRuntimeDataSetMergeRequest(
-  paths: StoragePaths,
-  request: Omit<RuntimeDataSetMergeLedgerRequest, 'kind' | 'requestedAt'>
-): Promise<void> {
-  await writeLedgerJson(paths, REQUESTS, request.candidateId, { kind: REQUEST_KIND, ...request, requestedAt: new Date().toISOString() });
-}
-
-function isForeignLocation(value: unknown): value is ForeignRuntimeRootLocation {
-  const location = value as Partial<ForeignRuntimeRootLocation> | null | undefined;
-  return !!location && (location.kind === 'archive' || location.kind === 'copied')
-    && typeof location.containerPath === 'string' && typeof location.containerName === 'string'
-    && typeof location.dataRootRelativePath === 'string'
-    && (location.side === undefined || location.side === 'current' || location.side === 'previous')
-    && (location.baseDataRootPath === undefined || typeof location.baseDataRootPath === 'string');
-}
-
-/** The file of the request for `candidateId` (a data-root relocation carries it, see readRuntimeDataSetMergeRequests). */
-export function runtimeDataSetMergeRequestFile(paths: StoragePaths, candidateId: string): Promise<string> {
-  return ledgerFile(paths, REQUESTS, candidateId);
-}
-
-export async function removeRuntimeDataSetMergeRequest(paths: StoragePaths, candidateId: string): Promise<void> {
-  await removeLedgerJson(paths, REQUESTS, candidateId);
 }
 
 export async function readRuntimeDataSetMergeFinalization(

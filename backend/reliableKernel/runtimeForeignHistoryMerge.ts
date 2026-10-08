@@ -1,89 +1,38 @@
-import { readRuntimeHistoryPending } from './runtimeHistoryRegistry';
-import { isDeepStrictEqual } from 'node:util';
-import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import { createRuntimeRootPaths, type RootBinding } from './contracts';
-import {
-  HISTORICAL_MERGE_ENGINE as engine, RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS, RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS, RuntimeDataSetMergeError,
-  type ForeignHistoricalMergeCandidate, type ForeignHistoricalMergeHold, type HistoricalMergeSourceObjects
-} from './runtimeDataSetMerge';
+import { isDeepStrictEqual } from 'node:util';
+import { createRuntimeRootPaths,type RootBinding } from './contracts';
+import type { HistoricalRootBinding } from './rootAuthority';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
-  cachedRuntimeRootFingerprint, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergeRequests, rememberRuntimeRootFingerprint,
-  runtimeDataSetLastMerge, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeRequest,
-  type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeExcludedConversation
+HISTORICAL_MERGE_ENGINE as engine,
+RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS,RuntimeDataSetMergeError,
+type ForeignHistoricalMergeCandidate,type ForeignHistoricalMergeHold,type HistoricalMergeSourceObjects
+} from './runtimeDataSetMerge';
+import {
+cachedRuntimeRootFingerprint,readRuntimeDataSetMergeLedger,
+rememberRuntimeRootFingerprint,
+runtimeDataSetLastMerge,sameRuntimeDataSetIdentity,
+type RuntimeDataSetFingerprint,type RuntimeDataSetIdentity,
+type RuntimeDataSetMergeExcludedConversation,
+type RuntimeDataSetMergeForeignSource
 } from './runtimeDataSetMergeLedger';
 import {
-  copyLocatedRuntimeDatabase, ForeignRuntimeHistoryRejection, foreignFileState, heldDatabaseFiles, holdForeignRuntimeRootClaim,
-  isForeignRuntimeHistoryId, locateForeignRuntimeRoot, locatedCasTransferSource, locatedSnapshotCacheFiles,
-  type ForeignRuntimeHistoryEntry, type ForeignRuntimeRootClaimHold, type HeldDatabaseFiles, type LocatedCasAccess
+copyLocatedRuntimeDatabase,
+foreignFileState,
+ForeignRuntimeHistoryRejection,
+heldDatabaseFiles,holdForeignRuntimeRootClaim,
+isForeignRuntimeHistoryId,
+locatedCasTransferSource,locatedSnapshotCacheFiles,
+locateForeignRuntimeRoot,
+type ForeignRuntimeHistoryEntry,type ForeignRuntimeRootClaimHold,type HeldDatabaseFiles,type LocatedCasAccess
 } from './runtimeForeignHistory';
-import type { HistoricalRootBinding } from './rootAuthority';
-import { withRuntimeDataRootAdmission } from './runtimeHostControl';
-import { sameLocatedRuntimeRoot, type ForeignRuntimeRootLocation, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
+import { readRuntimeHistoryPending } from './runtimeHistoryRegistry';
+import { sameLocatedRuntimeRoot,type ForeignRuntimeRootLocation,type LocatedRuntimeRoot } from './runtimeLocatedRoot';
+import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
-import { createLocatedRuntimeDatabaseSnapshot, type RuntimeDataSetDatabaseSnapshot } from './runtimeStorageInspection';
+import { createLocatedRuntimeDatabaseSnapshot,type RuntimeDataSetDatabaseSnapshot } from './runtimeStorageInspection';
 import { inspectVscodeRuntimeDataSets } from './vscodeRootAuthority';
-
-/**
- * Merging a verified foreign history root (runtimeForeignHistory) into the current data set, only on
- * the user's request (as a data set the user kept). The engines (runtimeDataSetMerge online and
- * runtimeDataSetStreamedMerge for a large-merge session) run their usual steps; this module gives
- * them the source:
- * - the request, recorded in this configuration root's merge ledger by the root's foreign id with
- *   where the root was found (its located paths come only from there, never from its records);
- * - the hold: the root's claim (`.limcode-runtime-merges/foreign-claims/<id>` under this
- *   configuration root, the one verification, viewing and backup cleanup take), held from the start
- *   of a merge (or its large-merge preparation) to its commit, and every read of the root the
- *   engines make under it: strict locating again (pointer, epoch manifest, current epoch, every Host
- *   proven gone, nothing unfinished), the exact-state check before the commit, private snapshot
- *   copies (never a file of a database this process holds), its fingerprint cached under this
- *   configuration root, and its content objects opened only as the regular files they are, below
- *   the container without any link.
- * Nothing is ever written into a foreign directory: no claim, ledger, backup, finalization, upgrade,
- * or SQLite sidecar (SQLite only opens private copies).
- */
-
-/** Records the user's request to merge a verified foreign root into the selected data set. */
-export async function requestForeignRuntimeHistoryMerge(
-  paths: { globalStoragePath: string },
-  input: {
-    id: string;
-    location: ForeignRuntimeRootLocation;
-    /** Readable name for notices and the large-merge session. */
-    label: string;
-    expectedDataSetId: string;
-    expectedRootInstanceId: string;
-  }
-): Promise<void> {
-  const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
-  if (!isForeignRuntimeHistoryId(input.id)) throw new TypeError(`Not a foreign history id: ${input.id}`);
-  // Located strictly first, outside the admission: nothing of the root is read under it.
-  let root: LocatedRuntimeRoot;
-  try {
-    root = await locateForeignRuntimeRoot(storagePaths.globalStoragePath, input.location);
-  } catch (error) {
-    if (!(error instanceof ForeignRuntimeHistoryRejection)) throw error;
-    throw new RuntimeDataSetMergeError(error.code, `这个外来历史库现在不能合并：${error.message}`);
-  }
-  if (root.id !== input.id || root.recorded.dataSetId !== input.expectedDataSetId || root.recorded.rootInstanceId !== input.expectedRootInstanceId) {
-    throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '所选外来历史库已变化，请重新打开外来历史库。');
-  }
-  await withRuntimeDataRootAdmission(storagePaths.globalStoragePath, async () => {
-    const selected = (await inspectVscodeRuntimeDataSets(storagePaths)).candidates.filter((candidate) => candidate.selected);
-    if (selected.length !== 1 || !selected[0].dataSetId || !selected[0].rootInstanceId) {
-      throw new RuntimeDataSetMergeError('runtime-data-set-merge-target-missing', '请先选定当前历史库，再合并外来历史库。');
-    }
-    await writeRuntimeDataSetMergeRequest(storagePaths, {
-      candidateId: input.id,
-      expectedDataSetId: input.expectedDataSetId,
-      expectedRootInstanceId: input.expectedRootInstanceId,
-      target: { dataSetId: selected[0].dataSetId, rootInstanceId: selected[0].rootInstanceId },
-      foreign: { location: input.location, label: input.label }
-    });
-  });
-}
 
 /**
  * Takes a foreign root's claim for one merge (waiting as its fence waits) and returns the hold every
@@ -133,7 +82,7 @@ export type ForeignRuntimeHistoryMergeState =
   /** The last merge of this root (its identity) into a data set, and whether the root changed since (by its verified content digest). */
   | ({ state: 'merged' } & ForeignRuntimeHistoryLastMerge)
   | ({ state: 'partial'; excluded: RuntimeDataSetMergeExcludedConversation[] } & ForeignRuntimeHistoryLastMerge)
-  | { state: 'requested'; requestedAt: string; lastMerged?: ForeignRuntimeHistoryLastMerge }
+
   | { state: 'blocked' | 'failed'; code: string; message: string; lastMerged?: ForeignRuntimeHistoryLastMerge }
   | { state: 'too-large'; rows: number; maxRows: number; message: string; lastMerged?: ForeignRuntimeHistoryLastMerge };
 
@@ -164,7 +113,6 @@ export async function readForeignRuntimeHistoryMergeStates(
   const current: RuntimeDataSetIdentity | undefined = selected?.dataSetId && selected.rootInstanceId
     ? { dataSetId: selected.dataSetId, rootInstanceId: selected.rootInstanceId } : undefined;
   const ledger = await readRuntimeDataSetMergeLedger(storagePaths);
-  const requests = await readRuntimeDataSetMergeRequests(storagePaths);
   for (const entry of entries) {
     if (entry.status !== 'verified' || !entry.dataSetId || !entry.rootInstanceId) continue;
     const found = ledger.get(entry.id) ?? (entry.contentDigest === undefined ? undefined : [...ledger.values()].find((other) =>
@@ -179,12 +127,7 @@ export async function readForeignRuntimeHistoryMergeStates(
       ...(merge.excluded?.length ? { excluded: merge.excluded } : {})
     };
     const carried = lastMerged ? { lastMerged } : {};
-    const request = requests.get(entry.id);
-    if (request?.foreign && current && sameRuntimeDataSetIdentity(request.target, current)
-      && Date.now() - Date.parse(request.requestedAt) < RUNTIME_DATA_SET_MERGE_REQUEST_TTL_MS
-      && request.expectedDataSetId === entry.dataSetId && request.expectedRootInstanceId === entry.rootInstanceId) {
-      result.set(entry.id, { state: 'requested', requestedAt: request.requestedAt, ...carried });
-    } else if (unchanged && reusableRuntimeMergeRefusal(record) && (record.state === 'failed' || (record.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
+    if (unchanged && reusableRuntimeMergeRefusal(record) && (record.state === 'failed' || (record.state === 'blocked' && sameRuntimeDataSetIdentity(record.target, current)))) {
       result.set(entry.id, { state: record.state, code: record.code, message: record.message, ...carried });
     } else if (unchanged && record.state === 'too-large' && record.maxRows === RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS) {
       result.set(entry.id, { state: 'too-large', rows: record.rows, maxRows: record.maxRows, message: record.message, ...carried });

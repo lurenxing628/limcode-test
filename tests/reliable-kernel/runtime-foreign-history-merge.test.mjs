@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 // Merging verified foreign history roots (runtimeForeignHistoryMerge) into the current data set, only on
 // the user's request: copied data directories and reset archives, small (online), medium (exclusive
 // coordination) and large (streamed large-merge session). The foreign root is only read (fs probe, byte
@@ -130,7 +131,7 @@ async function archive(fixture, dataSet) {
 }
 
 async function request(fixture, source) {
-  await foreignMerge.requestForeignRuntimeHistoryMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     id: source.id, location: source.location, label: source.label,
     expectedDataSetId: source.root.recorded.dataSetId, expectedRootInstanceId: source.root.recorded.rootInstanceId
   });
@@ -224,7 +225,7 @@ test('拷来目录里的外来库在线合并进当前库：只经 located 读�
   assert.deepEqual([record.state, record.candidateId, record.source.dataSetId, record.target.dataSetId],
     ['merged', source.id, source.root.recorded.dataSetId, fixture.current.binding.dataSetId]);
   assert.ok(await exists(ledgerPath(fixture, 'fingerprints', source.id)), '指纹缓存记在当前配置根');
-  assert.deepEqual(await ledgerEntries(fixture, 'requests'), [], '请求在合并后移除');
+  assert.deepEqual(await ledgerEntries(fixture, 'pending'), [], '请求在合并后移除');
   assert.deepEqual(await fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'foreign-claims')).catch(() => []), [], '声明用完即释放');
 
   const { entries } = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root });
@@ -418,7 +419,7 @@ test('合并期间外来库被改动：提交前在声明内复核发现文件�
   assert.equal(await readLedgerRecord(fixture, source.id), undefined, '没有写 committing，也没有记录');
   assert.deepEqual(await ledgerEntries(fixture, 'commits'), []);
   assert.deepEqual(conversations(fixture), []);
-  assert.equal((await ledgerEntries(fixture, 'requests')).length, 1, '请求保留，以后再试');
+  assert.equal((await ledgerEntries(fixture, 'pending')).length, 1, '请求保留，以后再试');
   const settled = await merge(fixture, [source]);
   assert.deepEqual(settled.merged.map((item) => [item.candidateId, item.insertedConversations]), [[source.id, 1]]);
 
@@ -586,46 +587,6 @@ test('外来库正文目录里的符号链接不跟随：缺正文对话剔除�
   assert.deepEqual(conversations(fixture), []);
   assert.deepEqual(await treeState(container), before);
   assert.deepEqual(await treeState(moved), movedBefore);
-});
-
-test('合并请求：只收核验通过、身份与所见一致的外来库；缺位置、位置畸形或 id 不像外来库的请求记录不算请求', async (t) => {
-  const fixture = await home(t);
-  const { elsewhere, container } = await copiedDirectory(fixture, (source) => seedConversations(source.current, [{ id: 'asked_1' }]));
-  const source = await found(fixture, container);
-  await assert.rejects(foreignMerge.requestForeignRuntimeHistoryMerge(fixture.paths, {
-    id: source.id, location: source.location, label: source.label, expectedDataSetId: 'another', expectedRootInstanceId: source.root.recorded.rootInstanceId
-  }), { code: 'runtime-data-set-merge-identity-mismatch' });
-  const pointer = source.root.located.rootPointerPath;
-  const saved = await fs.readFile(pointer);
-  await fs.writeFile(pointer, '{ not json');
-  await assert.rejects(request(fixture, source), { code: 'foreign-history-pointer-invalid' });
-  await fs.writeFile(pointer, saved);
-  assert.deepEqual(await ledgerEntries(fixture, 'requests'), [], '拒绝的请求不落盘');
-
-  const requests = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'requests');
-  await fs.mkdir(requests, { recursive: true });
-  const target = { dataSetId: fixture.current.binding.dataSetId, rootInstanceId: fixture.current.binding.rootInstanceId };
-  const base = {
-    kind: 'limcode-runtime-data-set-merge-request', expectedDataSetId: source.root.recorded.dataSetId,
-    expectedRootInstanceId: source.root.recorded.rootInstanceId, target, requestedAt: new Date().toISOString()
-  };
-  await fs.writeFile(path.join(requests, `${source.id.replace(/:/g, '-')}.json`), JSON.stringify({ ...base, candidateId: source.id }));
-  await fs.writeFile(path.join(requests, 'workspace-folder-x.json'), JSON.stringify({
-    ...base, candidateId: 'workspace:folder-x', foreign: { location: source.location, label: 'x' }
-  }));
-  const malformed = 'foreign:copied:0123456789abcdef';
-  await fs.writeFile(path.join(requests, `${malformed.replace(/:/g, '-')}.json`), JSON.stringify({
-    ...base, candidateId: malformed, foreign: { location: { ...source.location, containerPath: 5 }, label: 'x' }
-  }));
-  const database = await openWindow(fixture);
-  let report;
-  try {
-    report = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database },
-      { candidateIds: [source.id, 'workspace:folder-x', malformed], requested: true });
-  } finally { await database.close(); }
-  assert.deepEqual([report.merged, report.deferred, report.blocked, report.failures, report.pendingSources], [[], [], [], [], 0]);
-  assert.deepEqual(conversations(fixture), []);
-  void elsewhere;
 });
 
 test('纵深防护：在配置准入内取外来库的声明直接拒绝（锁序是外来声明在前）；外来来源从不收尾，审计只按收尾口径查未结束的工作', async (t) => {

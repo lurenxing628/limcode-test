@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -29,7 +30,6 @@ const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('run
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { projectFolderAssignmentSteps } = kernelFile('conversationProject.js');
-const { requestRuntimeDataSetMerge } = kernelFile('runtimeDataSetMerge.js');
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope, resolveVscodeWorkspaceRuntimeScopeRoot,
   selectVscodeRuntimeDataSet
@@ -620,7 +620,7 @@ test('已登记请求的大来源在后续启动保持待合并，不触发反�
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
   // The user chose "合并到当前库" for alpha (mergeNow -> requestRuntimeDataSetMerge).
-  await requestRuntimeDataSetMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     candidateId: fixture.alpha.id,
     expectedDataSetId: fixture.alpha.binding.dataSetId,
     expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
@@ -657,7 +657,7 @@ test('复审 merge2 #3：大来源的正文复制失败发生在协调之前，�
 test('已登记大来源遇到忙窗口时后台保持待处理，新窗口可以立即打开', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
-  await requestRuntimeDataSetMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     candidateId: fixture.alpha.id,
     expectedDataSetId: fixture.alpha.binding.dataSetId,
     expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
@@ -737,7 +737,7 @@ test('多进程（复审 MP6）：go 阶段有窗口又变忙时这次调用结�
 test('多进程（复审 MP2）：用户点击的合并在其它窗口让出后提交失败——其它窗口只重载一次，刚重载后的再次点击被冷却挡住', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
-  await requestRuntimeDataSetMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     candidateId: fixture.alpha.id,
     expectedDataSetId: fixture.alpha.binding.dataSetId,
     expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
@@ -814,7 +814,7 @@ test('多进程：迁移执行期间重载的窗口在打开外壳里看到“�
 test('多进程（复审 N1）：启动只登记大库待合并，随后为另一个窗口迁移重载，不携带自动协调结果', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
-  await requestRuntimeDataSetMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     candidateId: fixture.alpha.id,
     expectedDataSetId: fixture.alpha.binding.dataSetId,
     expectedRootInstanceId: fixture.alpha.binding.rootInstanceId

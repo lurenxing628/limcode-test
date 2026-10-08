@@ -12,6 +12,7 @@ export type RuntimeHistorySourceKind = 'local' | 'migration' | 'archive' | 'copi
 type Paths = { globalStoragePath: string };
 interface RuntimeHistorySource {
   id: string;
+  label?: string;
   sourceKind: RuntimeHistorySourceKind;
   location: RuntimeHistoryLocation;
   identity?: RuntimeDataSetIdentity;

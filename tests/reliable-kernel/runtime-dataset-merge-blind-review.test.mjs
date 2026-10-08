@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 // Large-merge session after the blind review (大库会话组): refused sources that no longer wait, the
 // remaining time, the batch's room by the estimate's figures, the window's thread, full disks and
 // temporary directories, the content verification cache, process identities, held backups, heartbeats.
@@ -17,7 +18,7 @@ import {
 const require = createRequire(import.meta.url);
 const fsPromises = require('node:fs/promises');
 const {
-  HISTORICAL_MERGE_ENGINE, mergeHistoricalDataSetsOnline, requestRuntimeDataSetMerge, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE
+  HISTORICAL_MERGE_ENGINE, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE
 } = kernelFile('runtimeDataSetMerge.js');
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const {
@@ -86,7 +87,7 @@ test('盲审 #1：以前合并进来的对话在当前库删掉了、无法收�
     source.prepare('INSERT INTO interaction_request VALUES (?, ?, ?, ?, ?, ?)').run(`${ids[1]}_question`, 'ask_user', 'pending', contentId, NOW, NOW);
     source.prepare('INSERT INTO interaction_owner_link VALUES (?, ?, ?, ?)').run(`${ids[1]}_question_owner`, `${ids[1]}_question`, `${ids[1]}_waiting_turn`, NOW);
   });
-  await requestRuntimeDataSetMerge(fixture.paths, {
+  await registerPendingHistory(fixture.paths, {
     candidateId: fixture.alpha.id, expectedDataSetId: fixture.alpha.binding.dataSetId, expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
   });
   const batch = await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths,

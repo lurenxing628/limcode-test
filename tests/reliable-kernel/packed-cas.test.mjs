@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -355,7 +356,7 @@ test('packed foreign history reads and imports through a private snapshot withou
     const history = await openRuntimeDataSetHistory(home.paths, root);
     try { assert.equal((await history.readMessages('foreign_packed')).items[0].text, 'foreign packed bytes'); }
     finally { await history.close(); }
-    await load('runtimeForeignHistoryMerge.js').requestForeignRuntimeHistoryMerge(home.paths, {
+    await registerPendingHistory(home.paths, {
       id: entry.id, location: entry.location, label: 'packed fixture',
       expectedDataSetId: root.recorded.dataSetId, expectedRootInstanceId: root.recorded.rootInstanceId
     });

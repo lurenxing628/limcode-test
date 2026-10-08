@@ -1,16 +1,16 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash,randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
-import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/paths';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathInside } from '../capabilities/filesystem/pathContainment';
-import { RUNTIME_KERNEL_EPOCH, createRuntimeRootPaths } from './contracts';
-import { RootAuthority, parseHistoricalRootBinding, type HistoricalRootBinding } from './rootAuthority';
+import type { createVscodeStoragePaths } from '../capabilities/vscodeStorage/paths';
+import { RUNTIME_KERNEL_EPOCH,createRuntimeRootPaths } from './contracts';
+import { CUTOVER_JOURNAL_FILE,physicalCutoverRecoveryRequired } from './physicalCutover';
+import { RootAuthority,parseHistoricalRootBinding,type HistoricalRootBinding } from './rootAuthority';
 import { classifyRecordedProcess } from './runtimeClaimPrimitives';
 import {
-  assertRuntimeHostsOffline, runtimeHostLivenessDirectory, runtimeMaintenanceClaimPath, withRuntimeDataRootAdmission
+assertRuntimeHostsOffline,runtimeHostLivenessDirectory,runtimeMaintenanceClaimPath,withRuntimeDataRootAdmission
 } from './runtimeHostControl';
-import { CUTOVER_JOURNAL_FILE, physicalCutoverRecoveryRequired } from './physicalCutover';
 
 type VscodeStoragePaths = ReturnType<typeof createVscodeStoragePaths>;
 
@@ -357,39 +357,6 @@ export async function selectVscodeRuntimeDataSet(
   });
 }
 
-/**
- * Whether the user switched data sets before this version: 0.0.24–0.0.30 had “切换当前历史库” but
- * wrote no kept marker (isVscodeRuntimeDataSetKept), so a data set switched away from then looks like
- * one an older version left. Judged on the selection revision this version found before it first
- * switched, sealed a fresh selection or picked merge sources (0 without a selection), recorded then in
- * the merge ledger (`upgrade/selection.json`, when `record`; an estimate only reads) and read from then
- * on, so a switch in this version (which marks the data set kept) changes nothing. Unreadable: as
- * switched. Call under the configuration admission.
- */
-export async function vscodeRuntimeSwitchedBeforeUpgrade(
-  paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
-  record: boolean
-): Promise<boolean> {
-  const root = path.resolve(paths.globalStoragePath);
-  const file = path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: root }), 'upgrade', 'selection.json');
-  await assertSafeRootPath(root, file);
-  let value: unknown;
-  try { value = await readOptionalJson(file); }
-  catch { return true; }
-  if (value !== undefined) {
-    const found = value as { kind?: unknown; selectionRevision?: unknown } | null;
-    return found?.kind !== UPGRADE_SELECTION_KIND || !Number.isSafeInteger(found.selectionRevision) || Number(found.selectionRevision) > 1;
-  }
-  const selectionRevision = (await readRuntimeDataSetSelection(root))?.selectionRevision ?? 0;
-  if (record) {
-    // Not recorded (e.g. no room): recorded later, on a revision that is then at most higher (never merged more).
-    await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
-      .then(() => writeJsonFileDurably(file, { kind: UPGRADE_SELECTION_KIND, selectionRevision, recordedAt: new Date().toISOString() }))
-      .catch(() => undefined);
-  }
-  return selectionRevision > 1;
-}
-
 /** Configuration-root merge ledger; see {@link VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY}. */
 export function resolveVscodeRuntimeMergeLedgerRoot(paths: Pick<VscodeStoragePaths, 'globalStoragePath'>): string {
   return path.join(path.resolve(paths.globalStoragePath), VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY);
@@ -439,15 +406,6 @@ export async function legacyWorkspaceRuntimeOwnerState(
   return state === 'dead' ? 'absent' : state === 'alive' ? 'alive' : 'unknown';
 }
 
-/**
- * Records that this data set is kept apart by the user, so it is never merged automatically (a
- * data set carried to another data directory as its own data set, for example).
- */
-export async function markVscodeRuntimeDataSetKept(candidate: VscodeRuntimeDataSetCandidate): Promise<void> {
-  if (!candidate.dataSetId || !candidate.rootInstanceId) throw new VscodeRuntimeDataSetError('只有已初始化的数据集才能记为保留。');
-  await markRuntimeDataSetKept(candidate);
-}
-
 /** Without an identity (a data set that could not be inspected) the marker covers any incarnation. */
 async function markRuntimeDataSetKept(
   candidate: Pick<VscodeRuntimeDataSetCandidate, 'configurationRootPath' | 'runtimeDataRootPath' | 'dataSetId' | 'rootInstanceId'>
@@ -494,7 +452,6 @@ export async function completeVscodeRuntimeDataSetSelection(
     if (candidate.requiresRecovery) throw new VscodeRuntimeDataSetError('运行数据集必须先完成现有cutover恢复。');
     if (selection.initialized) return;
     // Sealing a fresh root is no switch: the revision this version found is recorded before it moves.
-    await vscodeRuntimeSwitchedBeforeUpgrade({ globalStoragePath: root }, true).catch(() => undefined);
     await publishSelection(root, selection.id, true, selection);
   });
 }

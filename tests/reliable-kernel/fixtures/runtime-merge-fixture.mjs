@@ -365,3 +365,15 @@ export async function treeSnapshot(root) {
 export function sha256(value) {
   return createHash('sha256').update(value).digest('hex');
 }
+
+/** Test setup for durable pending history; no retired request or target-selection policy. */
+export async function registerPendingHistory(paths, input) {
+  const foreign = input.location !== undefined;
+  return kernelFile('runtimeHistoryRegistry.js').writeRuntimeHistoryPending(paths, {
+    id: input.candidateId ?? input.id, sourceKind: foreign ? input.location.kind : 'local',
+    location: foreign ? input.location : {kind:'local',candidateId:input.candidateId},
+    identity: {dataSetId:input.expectedDataSetId,rootInstanceId:input.expectedRootInstanceId},
+    ...(input.label ? {label:input.label} : {}),
+    reason:'test explicit pending history',registeredAt:new Date().toISOString()
+  });
+}

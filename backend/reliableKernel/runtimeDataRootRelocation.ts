@@ -1,66 +1,70 @@
-import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocationContract';
-import { createHash, randomUUID } from 'node:crypto';
-import { constants, createReadStream, type Stats } from 'node:fs';
+import { foreignRuntimeHistoryId } from './runtimeForeignHistory';
+import { createHash,randomUUID } from 'node:crypto';
+import { constants,createReadStream,type Stats } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { Worker } from 'node:worker_threads';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
-import { isPathBelow, isPathInside, isSamePath } from '../capabilities/filesystem/pathContainment';
+import { isPathBelow,isPathInside,isSamePath } from '../capabilities/filesystem/pathContainment';
 import {
-  DATA_ROOT_BACKUPS_DIR, DATA_ROOT_RESET_PENDING_FILE, INDEX_FILE, RECORDS_DIR,
-  REGISTERED_STORAGE_ROOT_DIRS, REGISTERED_STORAGE_ROOT_FILES
+DATA_ROOT_BACKUPS_DIR,DATA_ROOT_RESET_PENDING_FILE,INDEX_FILE,RECORDS_DIR,
+REGISTERED_STORAGE_ROOT_DIRS,REGISTERED_STORAGE_ROOT_FILES
 } from '../capabilities/vscodeStorage/constants';
-import { createRuntimeRootPaths, ROOT_BINDING_POINTER_FILE, RUNTIME_KERNEL_EPOCH, type RootBinding } from './contracts';
-import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
+import { createRuntimeRootPaths,ROOT_BINDING_POINTER_FILE,RUNTIME_KERNEL_EPOCH,type RootBinding } from './contracts';
 import {
-  canHardLinkLooseCas, estimateLooseCasCopyBytes, estimatePackedCasCopyBytes, listLooseCasPhysicalEntries, measureLooseCasRuntimeStorage,
-  removeAddedLooseCasPhysicalEntries
+canHardLinkLooseCas,estimateLooseCasCopyBytes,estimatePackedCasCopyBytes,listLooseCasPhysicalEntries,measureLooseCasRuntimeStorage,
+removeAddedLooseCasPhysicalEntries
 } from './looseCasMaintenance';
+import { PROCESS_SPOOL_DIRECTORY } from './processProtocol';
+import { parseRelocatedWorkInventory,type RelocatedWorkInventory } from './relocatedWorkInventory';
 import type { HistoricalRootBinding } from './rootAuthority';
-import { classifyRecordedProcess, ownProcessStartIdentity } from './runtimeClaimPrimitives';
-import { initializeEmptyRuntimeRoot, RuntimeDatabase } from './runtimeDatabase';
+import { classifyRecordedProcess,ownProcessStartIdentity } from './runtimeClaimPrimitives';
+import { initializeEmptyRuntimeRoot,RuntimeDatabase } from './runtimeDatabase';
+import { DATA_ROOT_RELOCATION_MARKER_FILE } from './runtimeDataRootRelocationContract';
+import type { RelocationDigestWorkerResponse,RelocationHandleStateUpdate } from './runtimeDataRootRelocationWorker';
 import {
-  copyRuntimeDataSetIntoEmptyRoot, ensureRuntimeDataSetCopyCurrent, type RuntimeDataSetCopyOptions, type RuntimeDataSetCopyReceipt
+copyRuntimeDataSetIntoEmptyRoot,ensureRuntimeDataSetCopyCurrent,type RuntimeDataSetCopyOptions,type RuntimeDataSetCopyReceipt
 } from './runtimeDataSetBulkCopy';
-import {
-  mergeRuntimeDataSetIntoDatabase, precopyRuntimeDataSetCas, RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY,
-  RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY, type RuntimeDataSetCasPrecopy,
-  type RuntimeDataSetCasVerification, type RuntimeDataSetMergeOptions,
-  type RuntimeDataSetMergeResult
-} from './runtimeDataSetMerge';
 import { readRuntimeDataSetFacts } from './runtimeDataSetFacts';
-import { summarizeRuntimeDataSet } from './runtimeDataSetPreflight';
-import { parseRelocatedWorkInventory, type RelocatedWorkInventory } from './relocatedWorkInventory';
+import { diskSpaceNeeds,knownDiskDevice } from './runtimeDataSetLargeMergeSpace';
 import {
-  isForeignRuntimeHistoryId, readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeFinalizations, readRuntimeDataSetMergeLedger,
-  readRuntimeDataSetMergeRequests, runtimeDataSetConversationsMergedFrom, runtimeDataSetLastMerge, runtimeDataSetMergeClosures,
-  runtimeDataSetMergeFinalizationFile, runtimeDataSetMergeLedgerRecordFile, runtimeDataSetMergeRequestFile, sameRuntimeDataSetFingerprint,
-  sameRuntimeDataSetIdentity, withRuntimeDataSetMergeClosures,
-  type RuntimeDataSetFingerprint, type RuntimeDataSetMergeFinalization, type RuntimeDataSetMergeLedgerRequest
+mergeRuntimeDataSetIntoDatabase,precopyRuntimeDataSetCas,RUNTIME_DATA_SET_MERGE_BACKUPS_DIRECTORY,
+RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,RUNTIME_DATA_SET_MERGE_SOURCE_BACKUPS_DIRECTORY,type RuntimeDataSetCasPrecopy,
+type RuntimeDataSetCasVerification,type RuntimeDataSetMergeOptions,
+type RuntimeDataSetMergeResult
+} from './runtimeDataSetMerge';
+import {
+isForeignRuntimeHistoryId,readRuntimeDataSetMergeFinalization,readRuntimeDataSetMergeFinalizations,readRuntimeDataSetMergeLedger,
+runtimeDataSetConversationsMergedFrom,runtimeDataSetLastMerge,runtimeDataSetMergeClosures,
+runtimeDataSetMergeFinalizationFile,runtimeDataSetMergeLedgerRecordFile,
+sameRuntimeDataSetFingerprint,
+sameRuntimeDataSetIdentity,withRuntimeDataSetMergeClosures,
+type RuntimeDataSetFingerprint,type RuntimeDataSetMergeFinalization
 } from './runtimeDataSetMergeLedger';
-import { readRuntimeHistoryPending, readRuntimeHistoryResidual, runtimeHistoryRegistryFile, type RuntimeHistoryPending } from './runtimeHistoryRegistry';
+import { summarizeRuntimeDataSet } from './runtimeDataSetPreflight';
+import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigration';
 import { liveForeignRuntimeHistoryViews } from './runtimeForeignHistoryViews';
+import { readRuntimeHistoryPending,readRuntimeHistoryResidual,runtimeHistoryRegistryFile,type RuntimeHistoryPending } from './runtimeHistoryRegistry';
+import {
+assertRuntimeHostsOffline,isRuntimeHostsActiveError,listActiveRuntimeHosts,withRuntimeDataRootAdmission,withRuntimeMaintenance
+} from './runtimeHostControl';
 import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
 import {
-  readRuntimeDeletedConversations, readRuntimeIdentityAliases, recordRuntimeDeletedConversations, RUNTIME_DELETED_CONVERSATIONS_DIRECTORY,
-  RUNTIME_IDENTITY_ALIASES_DIRECTORY, runtimeMergeIdentityName, type RuntimeIdentityContinuation, type RuntimeMergeIdentity
+readRuntimeDeletedConversations,readRuntimeIdentityAliases,recordRuntimeDeletedConversations,RUNTIME_DELETED_CONVERSATIONS_DIRECTORY,
+RUNTIME_IDENTITY_ALIASES_DIRECTORY,runtimeMergeIdentityName,type RuntimeIdentityContinuation,type RuntimeMergeIdentity
 } from './runtimeMergeTombstones';
-import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigration';
-import {
-  assertRuntimeHostsOffline, isRuntimeHostsActiveError, listActiveRuntimeHosts, withRuntimeDataRootAdmission, withRuntimeMaintenance
-} from './runtimeHostControl';
-import type { RelocationDigestWorkerResponse, RelocationHandleStateUpdate } from './runtimeDataRootRelocationWorker';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
-import { copyRuntimeDataSetDatabase, requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
-import { diskSpaceNeeds, knownDiskDevice } from './runtimeDataSetLargeMergeSpace';
+import { copyRuntimeDataSetDatabase,requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
 import {
-  assertConfigurationRootRuntimesOffline, createVscodeRootAuthority, inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories,
-  resolveVscodeRuntimeDataRoot, resolveVscodeRuntimeDataSet, resolveVscodeRuntimeDataSetScopeRoot,
-  resolveVscodeRuntimeMergeLedgerRoot, selectVscodeRuntimeDataSet, VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN, VSCODE_RUNTIME_CONTROL_DIRECTORY,
-  VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY,
-  VSCODE_RUNTIME_SELECTION_FILE, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
+assertConfigurationRootRuntimesOffline,createVscodeRootAuthority,inspectVscodeRuntimeDataSets,listVscodeRuntimeArchiveDirectories,
+resolveVscodeRuntimeDataRoot,resolveVscodeRuntimeDataSet,resolveVscodeRuntimeDataSetScopeRoot,
+resolveVscodeRuntimeMergeLedgerRoot,selectVscodeRuntimeDataSet,VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN,VSCODE_RUNTIME_CONTROL_DIRECTORY,
+VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY,VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY,
+VSCODE_RUNTIME_SELECTION_FILE,
+VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY,
+VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,type VscodeRuntimeDataSetCandidate,type VscodeRuntimeDataSetInspection
 } from './vscodeRootAuthority';
 
 /**
@@ -2286,7 +2290,6 @@ interface MergeRecordsCarry {
   keptClosures: Array<{ candidateId: string; closures: ReturnType<typeof runtimeDataSetMergeClosures> }>;
   continuations: Array<{ to: RuntimeMergeIdentity; continues: RuntimeMergeIdentity[] }>;
   /** Exactly as the target must read them afterwards (a newer request the target had for the same source stays). */
-  requests: RuntimeDataSetMergeLedgerRequest[];
   finalizations: RuntimeDataSetMergeFinalization[];
 }
 
@@ -2346,7 +2349,10 @@ async function planMergeRecordsCarry(
       } else {
         carried = { ...record, location: foreignLocationFrom(record.location, path.resolve(source), path.resolve(target)) };
       }
-      let to = await runtimeHistoryRegistryFile(targetPaths, section, id);
+      if (carried.location.kind !== 'local' && carried.identity) {
+        carried = { ...carried, id: foreignRuntimeHistoryId(carried.location, carried.identity) };
+      }
+      let to = await runtimeHistoryRegistryFile(targetPaths, section, carried.id);
       const there = await existing(to);
       if (there) {
         if (!there.isFile()) throw mergeRecordsError(`新数据目录的历史登记不是普通文件（${to}）`);
@@ -2443,32 +2449,6 @@ async function planMergeRecordsCarry(
     return entry ? entry.to ?? null : undefined;
   };
   const ledgerJson = (value: unknown): string => `${JSON.stringify(value, null, 2)}\n`;
-  const requests: RuntimeDataSetMergeLedgerRequest[] = [];
-  const targetRequests = options.movedAside ? new Map() : await readMergeRecords(() => readRuntimeDataSetMergeRequests(targetPaths), '新数据目录里的合并请求');
-  for (const request of (await readMergeRecords(() => readRuntimeDataSetMergeRequests(sourcePaths), '旧目录里的合并请求')).values()) {
-    const expected = { dataSetId: request.expectedDataSetId, rootInstanceId: request.expectedRootInstanceId };
-    // A data set's request stays behind with it; a foreign root is found from the target too.
-    const moved = request.foreign ? expected : movedTo(expected);
-    const receiving = movedTo(request.target);
-    if (!moved || receiving === null) continue;
-    let carried: RuntimeDataSetMergeLedgerRequest = {
-      ...request, expectedDataSetId: moved.dataSetId, expectedRootInstanceId: moved.rootInstanceId, ...(receiving ? { target: receiving } : {})
-    };
-    if (request.foreign) {
-      const location = foreignLocationFrom(request.foreign.location, path.resolve(source), path.resolve(target));
-      carried = { ...carried, candidateId: (await foreignHistory()).foreignRuntimeHistoryId(location, expected), foreign: { ...request.foreign, location } };
-    }
-    const to = await runtimeDataSetMergeRequestFile(targetPaths, carried.candidateId);
-    const there = await existing(to);
-    const kept = targetRequests.get(carried.candidateId);
-    if (kept && Date.parse(kept.requestedAt) >= Date.parse(carried.requestedAt)) {
-      requests.push(kept);
-      continue;
-    }
-    if (there && !there.isFile()) throw mergeRecordsError(`新数据目录的合并请求里有同名的非普通文件（${to}）`);
-    requests.push(carried);
-    writes.push({ kind: 'write', to, text: ledgerJson(carried), replaces: there !== undefined });
-  }
   const finalizations: RuntimeDataSetMergeFinalization[] = [];
   for (const note of await readMergeRecords(() => readRuntimeDataSetMergeFinalizations(sourcePaths), '旧目录里的合并收尾说明')) {
     const source = movedTo(note.source);
@@ -2480,7 +2460,7 @@ async function planMergeRecordsCarry(
     finalizations.push(carried);
     writes.push({ kind: 'write', to, text: ledgerJson(carried), replaces: there !== undefined });
   }
-  return { writes, deletionIdentities, keptClosures, continuations, requests, finalizations };
+  return { writes, deletionIdentities, keptClosures, continuations, finalizations };
 }
 
 /**
@@ -2542,6 +2522,9 @@ async function verifyMergeRecordsCarry(source: string, target: string, carry: Me
   const mismatch = (what: string): DataRootRelocationError => new DataRootRelocationError('data-root-relocation-merge-records',
     `带到新数据目录的${what}与旧目录核对不一致，整体取消迁移。`);
   const targetPaths = { globalStoragePath: target };
+  for (const write of carry.writes) {
+    if (write.kind === 'write' && await fs.readFile(write.to, 'utf8') !== write.text) throw mismatch('历史登记');
+  }
   for (const identity of carry.deletionIdentities) {
     const carried = await readRuntimeDeletedConversations(target, [identity]);
     for (const id of await readRuntimeDeletedConversations(source, [identity])) if (!carried.has(id)) throw mismatch('删除记录');
@@ -2562,8 +2545,6 @@ async function verifyMergeRecordsCarry(source: string, target: string, carry: Me
     const read = await readRuntimeIdentityAliases(target, to);
     if (!continues.every((identity) => read.some((entry) => sameRuntimeDataSetIdentity(entry, identity)))) throw mismatch('身份延续记录');
   }
-  const requests = await readRuntimeDataSetMergeRequests(targetPaths);
-  if (!carry.requests.every((request) => isDeepStrictEqual(requests.get(request.candidateId), request))) throw mismatch('合并请求');
   for (const note of carry.finalizations) {
     if (!isDeepStrictEqual(await readRuntimeDataSetMergeFinalization(targetPaths, { id: note.candidateId, ...note.source }), note)) throw mismatch('合并收尾说明');
   }

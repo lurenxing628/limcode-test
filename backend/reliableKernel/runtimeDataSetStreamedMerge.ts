@@ -35,7 +35,7 @@ import {
 isRuntimeDataSetMergePreparationLive,
 pruneRuntimeDataSetMergeCommits,
 readRuntimeDataSetMergeFinalization,readRuntimeDataSetMergeLedger,readRuntimeDataSetMergePreparation,removeRuntimeDataSetMergeCommit,
-removeRuntimeDataSetMergePreparation,removeRuntimeDataSetMergeRequest,
+removeRuntimeDataSetMergePreparation,
 removeRuntimeLargeMergeTargetBackup,
 RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS,
 sameRuntimeDataSetFingerprint,sameRuntimeDataSetIdentity,
@@ -1244,7 +1244,6 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         if (outcome.kind === 'merged' || outcome.kind === 'current') {
           const { result } = outcome;
           if (outcome.kind === 'merged' || picked.requested || result.finalized || result.skippedConversations) report.merged.push(result);
-          await engine.mergeRequestDone(paths, candidateId, target).catch(() => undefined);
           return;
         }
         const refused = issue(outcome);
@@ -1256,7 +1255,6 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
           }
         } else {
           (outcome.kind === 'blocked' ? report.blocked : report.failures).push(refused);
-          await removeRuntimeDataSetMergeRequest(paths, candidateId).catch(() => undefined);
         }
       });
     }
@@ -1720,8 +1718,6 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         clock.sourceDone(prepared);
         const result = sourceResult(prepared.candidateId, outcome, internals.requested, prepared.label);
         results.results.push(result);
-        if (result.state === 'merged' || result.state === 'current') await engine.mergeRequestDone(paths, prepared.candidateId, target).catch(() => undefined);
-        if (result.state === 'blocked' || result.state === 'failed') await removeRuntimeDataSetMergeRequest(paths, prepared.candidateId).catch(() => undefined);
         sourceInternals.state.exclusions?.close();
       await sourceInternals.state.foreign?.release();
         await internals.claims.release(prepared.candidateId);

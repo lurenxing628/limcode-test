@@ -270,7 +270,7 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-history-convergence.test.cjs',
   'tests/reliable-kernel/runtime-content-usage.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge.test.mjs',
-  'tests/reliable-kernel/runtime-dataset-merge-state.test.mjs',
+  'tests/reliable-kernel/runtime-history-fingerprint-cache.test.mjs',
   'tests/reliable-kernel/runtime-backup-cleanup.test.mjs',
   'tests/reliable-kernel/runtime-backup-cleanup-foreign.test.mjs',
   'tests/reliable-kernel/runtime-backup-cleanup-review.test.mjs',

@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import test from 'node:test';
@@ -7,7 +8,7 @@ import {
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const {
-  HISTORICAL_MERGE_ENGINE, mergeHistoricalDataSetsOnline, requestRuntimeDataSetMerge
+  HISTORICAL_MERGE_ENGINE, mergeHistoricalDataSetsOnline
 } = kernelFile('runtimeDataSetMerge.js');
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const {
@@ -129,7 +130,7 @@ test('再次合并已删除的分支时，完整私有句柄证据属于删除�
 
   await seedConversations(fixture.alpha, [{ id: NEW }]);
   const sourceBefore = readAll(fixture.alpha);
-  await requestRuntimeDataSetMerge(fixture.paths, { candidateId: fixture.alpha.id,
+  await registerPendingHistory(fixture.paths, { candidateId: fixture.alpha.id,
     expectedDataSetId: fixture.alpha.binding.dataSetId, expectedRootInstanceId: fixture.alpha.binding.rootInstanceId });
   const second = await merge();
   assert.deepEqual([second.failures, second.blocked, second.deferred], [[], [], []]);

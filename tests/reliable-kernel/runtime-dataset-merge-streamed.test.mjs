@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
@@ -9,7 +10,7 @@ import {
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const {
-  mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE,
+  mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE,
   RUNTIME_DATA_SET_MERGE_COMMIT_EVIDENCE_ROWS, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS, RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS,
   RuntimeDataSetMergeEvidence
 } = kernelFile('runtimeDataSetMerge.js');
@@ -130,7 +131,7 @@ test('等价性：同一来源走内存单事务与流式维护事务（阈值 5
   await seedConversations(fixture.alpha, [{ id: 'alpha_conversation_new' }]);
   const deleted = await saveState(fixture, fixture.current);
   t.after(() => deleted.remove());
-  await requestRuntimeDataSetMerge(fixture.paths, { candidateId: fixture.alpha.id, expectedDataSetId: fixture.alpha.binding.dataSetId, expectedRootInstanceId: fixture.alpha.binding.rootInstanceId });
+  await registerPendingHistory(fixture.paths, { candidateId: fixture.alpha.id, expectedDataSetId: fixture.alpha.binding.dataSetId, expectedRootInstanceId: fixture.alpha.binding.rootInstanceId });
   const again = await mergeOnline(fixture, { candidateIds: [fixture.alpha.id], requested: true });
   assert.deepEqual(again.merged.map((item) => [item.insertedConversations, item.skippedConversations]), [[1, 1]]);
   const expectedAgain = readAll(fixture.current);

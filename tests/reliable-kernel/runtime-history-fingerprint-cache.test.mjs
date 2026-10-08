@@ -1,3 +1,4 @@
+import { registerPendingHistory } from './fixtures/runtime-merge-fixture.mjs';
 import { publishInitialRuntimeSelection } from './fixtures/runtime-selection.mjs';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
@@ -30,7 +31,7 @@ const kernel = kernelFile('index.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { projectFolderAssignmentSteps } = kernelFile('conversationProject.js');
 const {
-  mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, requestRuntimeDataSetMerge
+  mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates
 } = kernelFile('runtimeDataSetMerge.js');
 const { runtimeDataSetFingerprint } = kernelFile('runtimeDataSetMergeLedger.js');
 const { preflightRuntimeDataSet, summarizeRuntimeDataSet } = kernelFile('runtimeDataSetPreflight.js');
@@ -45,95 +46,6 @@ const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const SHARED_PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
 const SHARED_TEXT = JSON.stringify({ role: 'user', parts: [{ text: '各工作区都用过的同一段正文' }] });
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
-
-test('旧选择指针的目标被移走后，来源显示目标已不存在并自动并入当前库', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.alpha, [{ id: 'conversation_alpha_only_here', project: SHARED_PROJECT }]);
-  let database = await openTarget(t, fixture.current);
-  assert.equal((await merge(fixture, database, { candidateIds: [fixture.alpha.id] })).merged.length, 1);
-  let state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
-  assert.deepEqual(pick(state), { state: 'merged', intoCurrent: true, targetMissing: false, changedSinceMerge: false });
-  await database.close();
-
-  await publishInitialRuntimeSelection(fixture.paths, fixture.beta.id);
-  state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
-  assert.deepEqual(pick(state), { state: 'merged', intoCurrent: false, targetMissing: false, changedSinceMerge: false },
-    '目标仍存在时照常显示“已合并到其它历史库”');
-
-  await fs.rm(controlRoot(fixture.current), { recursive: true }); // Simulate an old directory removed outside LimCode.
-  state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
-  assert.deepEqual(pick(state), { state: 'merged', intoCurrent: false, targetMissing: true, changedSinceMerge: false });
-  database = await openTarget(t, fixture.beta);
-  const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id] });
-  assert.deepEqual(again.merged.map((item) => item.insertedConversations), [1], '旧来源自动并入固定当前库');
-  state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
-  assert.deepEqual(pick(state), { state: 'merged', intoCurrent: true, targetMissing: false, changedSinceMerge: false });
-});
-
-test('再次合并的冲突只剔除对应对话，partial保留早先插入归属且内容未变不重跑', async (t) => {
-  const fixture = await createFixture(t, { withBeta: false });
-  await seed(fixture.alpha, [{ id: 'conversation_alpha_before', project: SHARED_PROJECT }]);
-  let database = await openTarget(t, fixture.current);
-  assert.equal((await merge(fixture, database, { candidateIds: [fixture.alpha.id] })).merged.length, 1);
-  await database.close();
-
-  // The user continues the merged conversation in the source: the source side alone changes.
-  await publishInitialRuntimeSelection(fixture.paths, fixture.alpha.id);
-  await continueConversation(fixture.alpha, 'conversation_alpha_before');
-  await publishInitialRuntimeSelection(fixture.paths, 'default');
-  database = await openTarget(t, fixture.current);
-  assert.deepEqual(pick((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)),
-    { state: 'merged', intoCurrent: true, targetMissing: false, changedSinceMerge: true });
-
-  await requestMerge(fixture, fixture.alpha);
-  const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id] });
-  assert.equal(again.merged.length, 1);
-  assert.deepEqual(again.blocked, []);
-  const state = (await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id);
-  assert.equal(state.state, 'partial');
-  const record = await readLedgerRecord(fixture, fixture.alpha.id);
-  assert.equal(record.state, 'partial');
-  assert.deepEqual(record.excluded.map(item => item.conversationId), ['conversation_alpha_before']);
-  assert.deepEqual(record.mergedInto[0].conversationIds, ['conversation_alpha_before']);
-
-  // Unchanged partial sources are retained and not planned again.
-  const automatic = await merge(fixture, database);
-  assert.equal(automatic.pendingSources, 0);
-  assert.equal(automatic.merged.length + automatic.blocked.length + automatic.deferred.length, 0);
-});
-
-test('合并后只在来源里新建对话：再次明确合并只写入新对话', async (t) => {
-  const fixture = await createFixture(t, { withBeta: false });
-  await seed(fixture.alpha, [{ id: 'conversation_alpha_first', project: SHARED_PROJECT }]);
-  let database = await openTarget(t, fixture.current);
-  assert.equal((await merge(fixture, database, { candidateIds: [fixture.alpha.id] })).merged.length, 1);
-  await database.close();
-  await publishInitialRuntimeSelection(fixture.paths, fixture.alpha.id);
-  await seed(fixture.alpha, [{ id: 'conversation_alpha_new', project: SHARED_PROJECT, at: LATER }]);
-  await publishInitialRuntimeSelection(fixture.paths, 'default');
-  database = await openTarget(t, fixture.current);
-  await requestMerge(fixture, fixture.alpha);
-  const again = await merge(fixture, database, { candidateIds: [fixture.alpha.id] });
-  assert.deepEqual(again.blocked, []);
-  assert.deepEqual(again.merged.map((item) => item.insertedConversations), [1]);
-  const seen = (await database.snapshot([repo('Conversation').get('conversation_alpha_new')])).snapshot[0];
-  assert.equal(seen?.id, 'conversation_alpha_new');
-});
-
-test('旧用户保留标记损坏时也自动收敛，固定指针不再写保留标记', async (t) => {
-  const fixture = await createFixture(t);
-  await seed(fixture.alpha, [{ id: 'conversation_alpha_kept', project: SHARED_PROJECT }]);
-  const marker = path.join(controlRoot(fixture.alpha), 'kept-by-user.json');
-  await fs.writeFile(marker, '{"torn":');
-  const database = await openTarget(t, fixture.current);
-  const report = await merge(fixture, database, { candidateIds: [fixture.alpha.id] });
-  assert.deepEqual(report.merged.map(item => item.candidateId), [fixture.alpha.id]);
-  assert.equal((await readRuntimeDataSetMergeStates(fixture.paths)).get(fixture.alpha.id)?.state, 'merged');
-  const before = await fs.readFile(resolveVscodeRuntimeSelectionPath(fixture.paths), 'utf8');
-  await assert.rejects(selectVscodeRuntimeDataSet(fixture.paths, fixture.alpha.id), /已经固定/);
-  assert.equal(await fs.readFile(resolveVscodeRuntimeSelectionPath(fixture.paths), 'utf8'), before);
-  assert.equal(await fs.readFile(marker, 'utf8'), '{"torn":');
-});
 
 test('合并后有无改动按内容判断：旧窗口崩溃留下的 WAL 被打开一次、文件被原样恢复都不算改动，写入一行才算', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
@@ -270,7 +182,7 @@ function merge(fixture, database, options) {
 }
 
 function requestMerge(fixture, dataSet) {
-  return requestRuntimeDataSetMerge(fixture.paths, {
+  return registerPendingHistory(fixture.paths, {
     candidateId: dataSet.id,
     expectedDataSetId: dataSet.binding.dataSetId,
     expectedRootInstanceId: dataSet.binding.rootInstanceId

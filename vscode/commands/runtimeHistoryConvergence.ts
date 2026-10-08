@@ -67,7 +67,10 @@ export async function convergeRuntimeHistory(
         }));
       } finally { clearInterval(watch); cancellation.dispose(); }
     });
-    await report({ ...prepared.report, pendingSources: 0 });
+    if (!prepared.sources.length || prepared.report.merged.length || prepared.report.deferred.length
+      || prepared.report.blocked.length || prepared.report.failures.length) {
+      await report({ ...prepared.report, pendingSources: 0 });
+    }
     if (!prepared.sources.length || !current() || prepared.report.stopped) return;
     host.writeGate?.admit();
     const ready = prepared;
