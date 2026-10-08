@@ -1,3 +1,4 @@
+import { assertRuntimeDataSetCoveredByCurrent, type RuntimeBackupCleanupCurrent } from './runtimeBackupCleanup';
 import { cachedRuntimeDataSetFingerprint, readRuntimeDataSetMergeLedgerRecord, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity } from './runtimeDataSetMergeLedger';
 import { RUNTIME_RESET_BACKUPS_DIRECTORY, readRuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import { constants } from 'node:fs';
@@ -89,7 +90,8 @@ export async function inspectRuntimeDataSetStorage(
 export async function deleteUnselectedRuntimeDataSet(
   paths: StoragePaths,
   candidateId: string,
-  expectedDataSetId: string
+  expectedDataSetId: string,
+  options: { coveredByCurrent?: RuntimeBackupCleanupCurrent } = {}
 ): Promise<{ candidateId: string; dataSetId: string; deleted: RuntimeStorageSize }> {
   const configurationRootPath = path.resolve(paths.globalStoragePath);
   return withRuntimeDataRootAdmission(configurationRootPath, async () => {
@@ -112,14 +114,18 @@ export async function deleteUnselectedRuntimeDataSet(
         throw new Error('Runtime data-set identity changed before deletion.');
       }
       // Identity must also be present in the actual SQLite file, not only in adjacent JSON files.
-      const snapshot = await createRuntimeDataSetDatabaseSnapshot(current, currentBinding);
-      await snapshot.close();
+      if (!options.coveredByCurrent) {
+        const snapshot = await createRuntimeDataSetDatabaseSnapshot(current, currentBinding);
+        await snapshot.close();
+      }
       const { trees, excluded } = await runtimeDataSetTrees(current);
       const record = await readRuntimeDataSetMergeLedgerRecord(paths, candidateId);
       const fingerprint = await cachedRuntimeDataSetFingerprint(current);
       const target = await requireCompleteRuntimeDataSet(selected[0]);
       const residuals = await readRuntimeHistoryResidual(paths);
-      if (record?.state !== 'merged' || !fingerprint
+      if (options.coveredByCurrent && record?.state !== 'partial' && !residuals.has(candidateId)) {
+        await assertRuntimeDataSetCoveredByCurrent(current, selected[0], options.coveredByCurrent);
+      } else if (record?.state !== 'merged' || !fingerprint
         || !sameRuntimeDataSetFingerprint(record.source, fingerprint)
         || !sameRuntimeDataSetIdentity(record.target, target) || residuals.has(candidateId)) {
         throw Object.assign(new Error(record?.state === 'partial'

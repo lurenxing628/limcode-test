@@ -5,6 +5,7 @@
     "jobId": 109854706574,
     "nodeDurationMs": 3172086,
     "method": "Per-file TAP first-case start to next-file start (including teardown), bounded below by summed case durations. Relocation undo groups use unchanged scenario durations plus 1s process overhead.",
+    "historyRegistryEstimate": "runtime-history-registry: local targeted run 87 ms; provisional CI planning weight rounded to 250 ms until CI measures it.",
     "fixtureCleanup": "collaboration-timeline-ssr: existing 2 assertions groups pass and process exits in 3.556s after session cancellation cleanup; rounded to 4s."
   },
   "defaultDurationMs": 15000,
@@ -190,6 +191,7 @@
     "tests/reliable-kernel/runtime-database-durability-snapshots.test.mjs": 19351.876,
     "tests/reliable-kernel/runtime-dataset-bulk-copy.test.mjs": 21699.784,
     "tests/reliable-kernel/runtime-dataset-commands.test.cjs": 5892.663,
+    "tests/reliable-kernel/runtime-history-registry.test.mjs": 250,
     "tests/reliable-kernel/runtime-dataset-history-storage.test.mjs": 2426.771,
     "tests/reliable-kernel/runtime-dataset-merge-blind-review.test.mjs": 18569.482,
     "tests/reliable-kernel/runtime-dataset-merge-e2e.test.mjs": 9749.795,

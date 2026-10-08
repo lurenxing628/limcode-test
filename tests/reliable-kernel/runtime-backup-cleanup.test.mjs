@@ -35,6 +35,25 @@ const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 
+test('显式覆盖证明删除其他库：完整覆盖可删，当前库缺对话时保留', async (t) => {
+  const { deleteUnselectedRuntimeDataSet } = kernelFile('runtimeStorageInspection.js');
+  for (const covered of [false, true]) {
+    const fixture = await createFixture(t);
+    await seed(fixture.alpha, ['conversation_covered']);
+    if (covered) await seed(fixture.current, ['conversation_covered']);
+    const database = await openCurrent(t, fixture);
+    const remove = () => deleteUnselectedRuntimeDataSet(fixture.paths, fixture.alpha.id,
+      fixture.alpha.binding.dataSetId, { coveredByCurrent: database });
+    if (covered) {
+      await remove();
+      await assert.rejects(fs.stat(fixture.alpha.binding.paths.databasePath), { code: 'ENOENT' });
+    } else {
+      await assert.rejects(remove(), { code: 'runtime-data-set-delete-not-covered' });
+      assert.ok((await fs.stat(fixture.alpha.binding.paths.databasePath)).isFile());
+    }
+  }
+});
+
 test('合并前备份：内容全在当前库的旧备份可删、最新一份保留；删除先改名再删，当前库只经它自己的读取线程查询', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one', 'conversation_two']);

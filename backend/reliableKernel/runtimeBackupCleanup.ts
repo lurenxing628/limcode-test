@@ -1359,6 +1359,39 @@ class BodyCheck {
   }
 }
 
+/** Explicit deletion alternative; caller holds configuration admission and source maintenance. */
+export async function assertRuntimeDataSetCoveredByCurrent(
+  source: VscodeRuntimeDataSetCandidate,
+  selected: VscodeRuntimeDataSetCandidate,
+  current: RuntimeBackupCleanupCurrent
+): Promise<void> {
+  const target = await requireCompleteRuntimeDataSet(selected);
+  if (!sameBinding(target, current.binding)) throw new Error('当前历史已经变化，请重新检查。');
+  const fail = (message: string): never => { throw Object.assign(new Error(message), { code: 'runtime-data-set-delete-not-covered' }); };
+  const facts = await readRuntimeDataSetFacts(source, { openable: true, historyIds: true, relocatedWork: true });
+  if (!facts.historyIds || !facts.relocatedWork) fail('无法读取这份历史的覆盖清单。');
+  if (facts.relocatedWork!.conversations.length) fail('这份历史还有未结束的工作，请先合并并收尾。');
+  // The normal cleanup walker includes retained nested backups, so deleting the control tree
+  // cannot silently drop history that exists only in one of those backups.
+  const held = await heldFiles(source.configurationRootPath, new Map());
+  const content = await foreignUnitContent(path.dirname(facts.binding.paths.rootPointerPath), held, Date.now());
+  if ('refusal' in content) fail(content.refusal);
+  const ids = [facts.historyIds!];
+  for (const copy of (content as { copies: ForeignCopy[] }).copies) {
+    const read = await readRuntimeBackupFacts({ configurationRootPath: source.configurationRootPath,
+      databasePath: copy.databasePath, binding: copy.binding }, { historyIds: true });
+    if (!read.facts.historyIds) fail('无法读取这份历史保留的备份。');
+    ids.push(read.facts.historyIds!);
+  }
+  const all = unionIds(...ids);
+  const coverage = await coverageIn({ candidate: selected, binding: target, current: true }, all, current, new BodyCheck(current, new Map()));
+  const refusal = coverageRefusal(coverage, '当前库');
+  if (refusal) fail(refusal);
+  if (coverage.replaced.length) fail(replacedReason(coverage.replaced.length, '当前库'));
+  const changed = await recheckInCurrent(current, recheckIds(all), new Set(), '这份历史', false);
+  if (changed) fail(changed);
+}
+
 /**
  * How much of a copy's history (`ids`) one local data set holds. Conversations first (they are
  * hard-deleted, with everything of theirs), then message versions, the other history rows and the
