@@ -747,3 +747,27 @@ test('新重置备份仅在残留明确重试后按登记位置合并', async (t
   assert.deepEqual(report.blocked, []);
   assert.equal(report.merged[0]?.candidateId, residual.id, JSON.stringify(report));
 });
+
+test('后台外来核验取消等待worker退出并清理私有副本之后释放声明', async (t) => {
+  const fixture = await createFixture(t);
+  const backup = await archive(fixture, fixture.alpha);
+  const source = await found(fixture, backup, fixture.alpha.id);
+  const controller = new AbortController();
+  const reason = new Error('后台核验达到本次时限');
+  const hold = await foreignMerge.holdForeignHistoricalMergeSource(fixture.paths, source.id,
+    { location: source.location, label: source.label }, { signal: controller.signal });
+  const candidate = await hold.locate();
+  let snapshotPath;
+  try {
+    await assert.rejects(hold.snapshot(candidate, { beforeOpen: async (file) => {
+      snapshotPath = file;
+      const audit = kernelFile('runtimeSnapshotAudit.js').auditRuntimeSnapshot(file,
+        { binding: candidate.root.recorded }, { signal: controller.signal });
+      controller.abort(reason);
+      await audit;
+    } }), error => error === reason);
+    assert.equal(hold.held, true, '核验结束后仍由调用方负责释放声明');
+    await assert.rejects(fs.stat(snapshotPath), { code: 'ENOENT' }, 'worker退出后私有副本已清理');
+  } finally { await hold.release(); }
+  assert.equal(hold.held, false);
+});

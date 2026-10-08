@@ -92,9 +92,11 @@ export async function requestForeignRuntimeHistoryMerge(
 export async function holdForeignHistoricalMergeSource(
   paths: { globalStoragePath: string },
   id: string,
-  source: RuntimeDataSetMergeForeignSource
+  source: RuntimeDataSetMergeForeignSource,
+  options: { signal?: AbortSignal } = {}
 ): Promise<ForeignHistoricalMergeHold> {
   const configurationRoot = path.resolve(paths.globalStoragePath);
+  options.signal?.throwIfAborted();
   const location = source.location;
   let locatedId = id;
   if (!isForeignRuntimeHistoryId(id)) {
@@ -109,8 +111,8 @@ export async function holdForeignHistoricalMergeSource(
     locatedId = root.id;
   }
   // Claims share the physical located root's id with read-only views and foreign cleanup.
-  const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location));
-  return new ForeignMergeHold(configurationRoot, id, source.label, location, claim, locatedId);
+  const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location), { refuseWhenHeld: !!options.signal });
+  return new ForeignMergeHold(configurationRoot, id, source.label, location, claim, locatedId, options.signal);
 }
 
 /** The fingerprint of a requested foreign root, read under its claim for this read only (outside the admission). */
@@ -242,7 +244,8 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     public readonly label: string,
     private readonly location: ForeignRuntimeRootLocation,
     private readonly claim: ForeignRuntimeRootClaimHold,
-    private readonly locatedId: string
+    private readonly locatedId: string,
+    public readonly signal?: AbortSignal
   ) {}
 
   public get held(): boolean {
@@ -302,7 +305,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     try {
       snapshot = await createLocatedRuntimeDatabaseSnapshot(candidate.root, {
         ...(options.beforeOpen ? { beforeOpen: options.beforeOpen } : {}),
-        copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles())
+        copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles(), this.signal)
       });
     } catch (error) {
       throw refusal(error);
@@ -311,7 +314,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     try {
       // The Runtime snapshot precedes the append-only packed CAS copy. All source SQLite opens
       // remain confined to private copies, including the sidecar reader.
-      objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles());
+      objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles(), this.signal);
     } catch (error) {
       await snapshot.close();
       throw refusal(error);
@@ -344,10 +347,10 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
       locatedSnapshotCacheFiles(candidate.root, files), identity);
     if (cached) return cached;
     let copy: { databasePath: string; binding: HistoricalRootBinding; remove(): Promise<void> };
-    try { copy = await copyLocatedRuntimeDatabase(candidate.root, await this.heldFiles()); }
+    try { copy = await copyLocatedRuntimeDatabase(candidate.root, await this.heldFiles(), this.signal); }
     catch (error) { throw refusal(error); }
     try {
-      const audit = await auditRuntimeSnapshot(copy.databasePath, { binding: copy.binding as RootBinding, contentDigest: true, integrity: false });
+      const audit = await auditRuntimeSnapshot(copy.databasePath, { binding: copy.binding as RootBinding, contentDigest: true, integrity: false }, { signal: this.signal });
       const fingerprint: RuntimeDataSetFingerprint = { ...identity, contentDigest: audit.contentDigest! };
       if (await runtimeDataSetFileState(located.databasePath).catch(() => undefined) === files) {
         await this.rememberFingerprint(candidate, files, fingerprint).catch(() => undefined);
@@ -395,6 +398,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
   }
 
   private assertHeld(): void {
+    this.signal?.throwIfAborted();
     if (!this.held) {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '合并这个外来历史库时它的声明已不在，本次不合并。' });
     }

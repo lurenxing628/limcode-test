@@ -69,6 +69,7 @@ export function upgradeRuntimeSnapshotInWorker(
     // The first body this thread could not read decides the outcome (a refused foreign file stays that refusal).
     let readError: unknown;
     let aborted = false;
+    const reads = new Set<Promise<void>>();
     // Sequential range reads of one body read it once.
     let cached: { key: string; bytes: Buffer } | undefined;
     const worker = new Worker(path.join(__dirname, 'runtimeSnapshotUpgradeWorker.js'), { workerData: data });
@@ -77,12 +78,14 @@ export function upgradeRuntimeSnapshotInWorker(
       void worker.terminate();
     };
     options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
     worker.on('message', (message: RuntimeSnapshotUpgradeWorkerMessage) => {
       if (message.kind === 'done') {
         done = message;
         return;
       }
-      void (async () => {
+      if (aborted) return;
+      const reading = (async () => {
         let reply: RuntimeSnapshotUpgradeReadResult;
         try {
           const object = { sha256: message.sha256, byte_length: BigInt(message.byteLength), storage_key: message.storageKey };
@@ -97,13 +100,17 @@ export function upgradeRuntimeSnapshotInWorker(
           readError ??= error;
           reply = { kind: 'read-result', id: message.id, ok: false, message: error instanceof Error ? error.message : String(error) };
         }
-        worker.postMessage(reply);
+        if (!aborted) worker.postMessage(reply);
       })();
+      reads.add(reading);
+      void reading.finally(() => reads.delete(reading)).catch(() => undefined);
     });
     worker.once('error', (error) => {
       workerError = error;
     });
-    worker.once('exit', (code) => {
+    worker.once('exit', async (code) => {
+      // Body reads run on this thread; worker exit alone does not finish their descriptors.
+      await Promise.allSettled(reads);
       options.signal?.removeEventListener('abort', abort);
       // Settle only after the worker exited, so the caller never reopens a copy it still holds.
       if (aborted) reject(options.signal?.reason ?? new Error('Snapshot upgrade aborted.'));

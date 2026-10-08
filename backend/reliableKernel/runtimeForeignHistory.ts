@@ -703,14 +703,15 @@ export async function tryWithForeignRuntimeRootClaim<T>(
  */
 export async function copyLocatedRuntimeDatabase(
   root: LocatedRuntimeRoot,
-  held: HeldDatabaseFiles
+  held: HeldDatabaseFiles,
+  signal?: AbortSignal
 ): Promise<{ databasePath: string; files: string; binding: HistoricalRootBinding; remove(): Promise<void> }> {
-  const copy = await copyForeignRuntimeSqliteFiles(root.containerRoot, root.located.databasePath, held);
+  const copy = await copyForeignRuntimeSqliteFiles(root.containerRoot, root.located.databasePath, held, 'limcode.sqlite', signal);
   if (root.origin.kind !== 'foreign' || root.recorded.runtimeKernelEpoch === RUNTIME_KERNEL_EPOCH) {
     return { ...copy, binding: root.recorded };
   }
   try {
-    const binding = await upgradeForeignSnapshot(root, copy.databasePath, held);
+    const binding = await upgradeForeignSnapshot(root, copy.databasePath, held, signal);
     if (JSON.stringify(binding) !== JSON.stringify(locatedSnapshotBinding(root))) {
       throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-upgrade-failed', '私有副本升级后的身份与记录不一致。');
     }
@@ -722,13 +723,13 @@ export async function copyLocatedRuntimeDatabase(
 }
 
 /** Upgrades a published-format foreign snapshot copy; a failure is the root's own unless it is of the moment. */
-async function upgradeForeignSnapshot(root: LocatedRuntimeRoot, databasePath: string, held: HeldDatabaseFiles): Promise<HistoricalRootBinding> {
+async function upgradeForeignSnapshot(root: LocatedRuntimeRoot, databasePath: string, held: HeldDatabaseFiles, signal?: AbortSignal): Promise<HistoricalRootBinding> {
   const epoch = root.recorded.runtimeKernelEpoch;
   if (root.upgradeCasOverlayRoot) {
     await assertNoSymbolicPath(path.dirname(root.upgradeCasOverlayRoot), root.upgradeCasOverlayRoot)
       .catch((error: unknown) => { if (!isMissing(error)) throw error; });
   }
-  const objects = await openLocatedCasAccess(root, held);
+  const objects = await openLocatedCasAccess(root, held, undefined, signal);
   // A body this thread cannot use is classified here, by kind and errno, never by message text.
   const readObject = async (object: CasObjectIdentity): Promise<Buffer> => {
     try { return await objects.readBytes(object); }
@@ -746,10 +747,11 @@ async function upgradeForeignSnapshot(root: LocatedRuntimeRoot, databasePath: st
   };
   try {
     return await upgradeRuntimeSnapshotInWorker(databasePath, root.recorded, {
-      readObject,
+      readObject, signal,
       ...(root.upgradeCasOverlayRoot ? { overlayCasRoot: root.upgradeCasOverlayRoot } : {})
     });
   } catch (error) {
+    signal?.throwIfAborted();
     if (error instanceof ForeignRuntimeHistoryRejection) throw error;
     const message = error instanceof Error ? error.message : String(error);
     const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : undefined;
@@ -781,19 +783,22 @@ export async function copyForeignRuntimeSqliteFiles(
   containerRoot: string,
   databasePath: string,
   held: HeldDatabaseFiles,
-  targetFilename: 'limcode.sqlite' | typeof PACKED_CAS_FILE = 'limcode.sqlite'
+  targetFilename: 'limcode.sqlite' | typeof PACKED_CAS_FILE = 'limcode.sqlite',
+  signal?: AbortSignal
 ): Promise<{ databasePath: string; files: string; remove(): Promise<void> }> {
   if (targetFilename !== 'limcode.sqlite' && targetFilename !== PACKED_CAS_FILE) {
     throw new TypeError('A private Runtime SQLite copy requires one of its fixed database filenames.');
   }
   for (let attempt = 1; attempt <= COPY_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
     await assertNotHeldDatabase(databasePath, held);
     let before: string;
     let copy: { databasePath: string; remove(): Promise<void> };
     try {
       before = await runtimeDataSetFileState(databasePath);
-      copy = await copyForeignSqliteByDescriptor(containerRoot, databasePath, held, targetFilename);
+      copy = await copyForeignSqliteByDescriptor(containerRoot, databasePath, held, targetFilename, signal);
     } catch (error) {
+      signal?.throwIfAborted();
       // A file that turned out to be a link, a FIFO or a device, or one of a database this process holds.
       if (error instanceof ForeignRuntimeHistoryRejection) throw error;
       if (isMissing(error) && !await present(containerRoot).catch(() => true)) throw gone();
@@ -822,14 +827,15 @@ async function copyForeignSqliteByDescriptor(
   containerRoot: string,
   databasePath: string,
   held: HeldDatabaseFiles,
-  targetFilename: 'limcode.sqlite' | typeof PACKED_CAS_FILE
+  targetFilename: 'limcode.sqlite' | typeof PACKED_CAS_FILE,
+  signal?: AbortSignal
 ): Promise<{ databasePath: string; remove(): Promise<void> }> {
   await assertNoSymbolicPath(containerRoot, databasePath);
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-runtime-history-${process.pid}-`));
   const remove = () => fs.rm(temporaryRoot, { recursive: true, force: true });
   try {
     const copied = path.join(temporaryRoot, targetFilename);
-    await copyFromDescriptor(await openLocatedRuntimeFile(databasePath, held), copied);
+    await copyFromDescriptor(await openLocatedRuntimeFile(databasePath, held), copied, signal);
     const journal = await lstatIfPresent(`${databasePath}-journal`);
     if (journal && (!journal.isFile() || journal.size > 0)) {
       throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-rollback-journal', 'SQLite 有未完成的回滚日志（-journal），原样保留。');
@@ -837,7 +843,7 @@ async function copyForeignSqliteByDescriptor(
     const wal = `${databasePath}-wal`;
     if (await lstatIfPresent(wal)) {
       await assertNoSymbolicPath(containerRoot, wal);
-      await copyFromDescriptor(await openLocatedRuntimeFile(wal, held), `${copied}-wal`);
+      await copyFromDescriptor(await openLocatedRuntimeFile(wal, held), `${copied}-wal`, signal);
     }
     return { databasePath: copied, remove };
   } catch (error) {
@@ -847,12 +853,13 @@ async function copyForeignSqliteByDescriptor(
 }
 
 /** Copies what an open descriptor reads into a new private file (made durable), then closes the descriptor. */
-async function copyFromDescriptor(source: fs.FileHandle, target: string): Promise<void> {
+async function copyFromDescriptor(source: fs.FileHandle, target: string, signal?: AbortSignal): Promise<void> {
   try {
     const out = await fs.open(target, 'wx', 0o600);
     try {
       const buffer = Buffer.allocUnsafe(1024 * 1024);
       for (let position = 0; ;) {
+        signal?.throwIfAborted();
         const { bytesRead } = await source.read(buffer, 0, buffer.length, position);
         if (bytesRead === 0) break;
         for (let written = 0; written < bytesRead;) {
@@ -896,7 +903,8 @@ export interface PackedCasSnapshotAccess {
 export async function openPackedCasSnapshot(
   binding: HistoricalRootBinding,
   containerRoot: string,
-  held: HeldDatabaseFiles
+  held: HeldDatabaseFiles,
+  signal?: AbortSignal
 ): Promise<PackedCasSnapshotAccess> {
   let worker: PackedCasWorkerClient | undefined;
   let copy: { databasePath: string; remove(): Promise<void> } | undefined;
@@ -906,7 +914,7 @@ export async function openPackedCasSnapshot(
     await assertNoSymbolicPath(containerRoot, binding.paths.casRootPath);
     if (await lstatIfPresent(file)) {
       await assertNoSymbolicPath(containerRoot, file);
-      copy = await copyForeignRuntimeSqliteFiles(containerRoot, file, held, PACKED_CAS_FILE);
+      copy = await copyForeignRuntimeSqliteFiles(containerRoot, file, held, PACKED_CAS_FILE, signal);
       try {
         worker = await PackedCasWorkerClient.open({ ...binding,
           paths: { ...binding.paths, casRootPath: path.dirname(copy.databasePath) }
@@ -951,12 +959,13 @@ export interface LocatedCasAccess extends Pick<CasByteAccess, 'readBytes' | 'ins
 export async function openLocatedCasAccess(
   root: LocatedRuntimeRoot,
   held: HeldDatabaseFiles,
-  refreshHeld?: () => Promise<HeldDatabaseFiles>
+  refreshHeld?: () => Promise<HeldDatabaseFiles>,
+  signal?: AbortSignal
 ): Promise<LocatedCasAccess> {
-  const packed = await openPackedCasSnapshot({ ...root.recorded, paths: root.located }, root.containerRoot, held);
+  const packed = await openPackedCasSnapshot({ ...root.recorded, paths: root.located }, root.containerRoot, held, signal);
   let closed = false;
   const checked = new Set<string>();
-  const assertOpen = (): void => { if (closed) throw new Error('Historical CAS reader is closed.'); };
+  const assertOpen = (): void => { signal?.throwIfAborted(); if (closed) throw new Error('Historical CAS reader is closed.'); };
   const reachable = async (object: CasObjectIdentity): Promise<string> => {
     assertOpen();
     const { absolutePath } = looseCasObjectLocation(root.located.casRootPath, object);
@@ -1046,9 +1055,10 @@ export async function readLocatedCasObject(root: LocatedRuntimeRoot, object: Cas
 /** A claim-scoped copy-only owner, shared for every object of a source snapshot. */
 export async function locatedCasTransferSource(
   root: LocatedRuntimeRoot,
-  heldFiles: () => Promise<HeldDatabaseFiles>
+  heldFiles: () => Promise<HeldDatabaseFiles>,
+  signal?: AbortSignal
 ): Promise<LocatedCasAccess> {
-  return openLocatedCasAccess(root, await heldFiles(), heldFiles);
+  return openLocatedCasAccess(root, await heldFiles(), heldFiles, signal);
 }
 
 /**
@@ -1681,7 +1691,8 @@ export interface ForeignRuntimeRootClaimHold {
 export async function holdForeignRuntimeRootClaim(
   paths: { globalStoragePath: string },
   id: string,
-  targetPath: string
+  targetPath: string,
+  options: { refuseWhenHeld?: boolean } = {}
 ): Promise<ForeignRuntimeRootClaimHold> {
   const configurationRoot = path.resolve(paths.globalStoragePath);
   if (isRuntimeDataRootAdmissionHeld(configurationRoot)) {
@@ -1697,7 +1708,7 @@ export async function holdForeignRuntimeRootClaim(
     state.held = true;
     acquired();
     await released;
-  }).finally(() => { state.held = false; });
+  }, options).finally(() => { state.held = false; });
   await Promise.race([started, holder]);
   return {
     get held() { return state.held; },

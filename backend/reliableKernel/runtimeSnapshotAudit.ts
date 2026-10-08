@@ -77,7 +77,8 @@ export class RuntimeSnapshotAuditError extends Error {
 }
 
 /** Audits the snapshot copy at `databasePath`; the caller must not have it open meanwhile. */
-export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnapshotAuditRequest): Promise<RuntimeSnapshotAudit> {
+export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnapshotAuditRequest, options: { signal?: AbortSignal } = {}): Promise<RuntimeSnapshotAudit> {
+  options.signal?.throwIfAborted();
   if (request.skippedRowsPath && request.unfinishedWork !== 'finalize') {
     throw new TypeError('A skipped-row index is only used by a historical unfinished-work audit.');
   }
@@ -97,6 +98,10 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     let response: RuntimeSnapshotAuditWorkerResponse | undefined;
     let workerError: Error | undefined;
     const worker = new Worker(path.join(__dirname, 'runtimeSnapshotAuditWorker.js'), { workerData: data });
+    let aborted = false;
+    const abort = (): void => { aborted = true; void worker.terminate(); };
+    options.signal?.addEventListener('abort', abort, { once: true });
+    if (options.signal?.aborted) abort();
     worker.once('message', (message: RuntimeSnapshotAuditWorkerResponse) => {
       response = message;
     });
@@ -106,7 +111,9 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     worker.once('exit', (code) => {
       // Resolve only after the worker exited. A suspended snapshot reader may be reopened next;
       // even an error response must never let that overlap a worker still closing its descriptors.
-      if (workerError) reject(workerError);
+      options.signal?.removeEventListener('abort', abort);
+      if (aborted) reject(options.signal?.reason ?? new Error('Snapshot audit aborted.'));
+      else if (workerError) reject(workerError);
       else if (code !== 0 || !response) reject(new Error(`快照核验线程异常退出（退出码 ${code}）。`));
       else if (response.ok) resolve(response.audit);
       else reject(new RuntimeSnapshotAuditError(response.error.message, response.error.code));
