@@ -546,7 +546,7 @@ function validateMigration(root, migration, failures) {
     "busySourcePolicy": "defer-source",
     "terminalUnknownProcessPolicy": "preserve-outcome_unknown-with-matching-terminal-receipt-and-completed-at-only-without-pending-operations-deliveries-or-output-debt; no-fake-exit-no-redispatch; migration-keeps-stricter-process-policy",
     "validationRevisionPolicy": "dated-derived-rule-revision-invalidates-only-affected-refusals-and-audit-caches-not-content-digests-commits-or-tombstones",
-    "unfinishedWorkPolicy": "refusal-probes-conflicts-size-and-cas-checked-on-unfinalized-snapshot-first; kernel-pending-work-probe-judges-every-conversation-as-after-finalization-before-any-finalization; then-source-backup-and-existing-terminal-transitions-cancelled-or-interrupted-with-reason-by-source-legacy-interrupted-by-upgrade-user-kept-closed-before-merge; closed-counts-read-back-from-source-after-closing-never-planned-counts; states-without-transition-refuse-source-with-reason-and-way-out",
+    "unfinishedWorkPolicy": "refusal-probes-conflicts-size-and-cas-checked-on-unfinalized-snapshot-first; local-source-under-maintenance-after-durable-consent-and-source-backup-opened-SETTLING_ONLY-without-execution; reuse-existing-stop-and-abandon-transitions-reason-historical-merge-settled-at-most-three-rounds-then-durabilityCheckpoint-and-close; remaining-owned-work-excludes-conversations-unattributed-settlement-failure-defers-source; foreign-source-never-finalized-in-place; existing-terminal-transition-fallback-retained-for-callers-without-settlement-adapter; turn-and-intent-closed-counts-read-back-from-source-never-planned-counts",
     "backupPolicy": "sqlite-backup-api-of-open-target-once-per-batch-before-first-change-only-when-rows-to-insert; named-utc-millisecond-time-then-process-sequence; unused-by-any-transaction-removed-at-batch-end; used-then-newest-3-by-creation-kept-per-control-root-plus-this-batch-and-newest-before-it-a-large-session-preparations-backup-with-a-live-registration-neither-pruned-nor-counted; failed-backup-leaves-no-files; target-and-source-backups-first-check-free-space-for-database-plus-wal-plus-64MiB-on-their-disk-else-deferred-disk-full-with-needed-MB-before-writing-notified-once-per-cause; large-session-target-backed-up-online-once-while-preparing-removed-when-released-unused-no-backup-in-the-exclusive-phase; large-session-target-backup-registered-before-its-first-byte-with-the-preparation-heartbeat-stale-once-its-process-is-gone-by-pid-and-start-identity-or-after-24h-an-unused-one-removed-with-its-registration-by-the-next-pruning-of-preparations-at-every-batch-end-preparation-start-and-end-a-used-one-kept-and-only-its-registration-removed-one-that-cannot-be-removed-keeps-its-registration-marked-unused-again-when-its-session-merged-nothing-a-failed-preparation-removes-its-own; closing-the-private-instance-or-removing-a-private-copy-failing-only-logged-the-outcome-and-a-used-backup-stay",
     "casPolicy": "published-before-row-commit; verified-read-only-before-finalization; source-digest-verified-before-link-or-copy; missing-irregular-or-mismatched-source-object-fails-source; existing-target-object-damaged-or-irregular-blocks; verified-file-identities-kept-per-configuration-root-in-a-limcode-named-sqlite-cache-one-connection-per-process-unchanged-identity-not-hashed-again-any-change-hashed-in-full-unconfirmed-dropped-after-90-days; a-damaged-cache-file-rebuilt-an-unusable-one-keeps-at-most-10000-identities-in-memory-a-failed-batch-write-counts-its-entries-unrecorded-and-a-preparation-that-could-not-record-them-all-defers-its-source",
     "rowPolicy": "every-source-row-decoded-by-codec; identical-rows-reused; content-identity-domains-keep-target-and-insert-only-if-still-absent-inside-the-transaction-else-compare; renumbered-columns-allocated-inside-the-transaction-after-its-maximum-in-source-order; other-differences-exclude-the-owning-conversations-and-dependency-closure-before-target-change-content-derived-or-unowned-differences-refuse-source; any-failure-inside-the-transaction-rolls-back-the-whole-source; ordinary-and-streamed-preflight-check-every-touched-model-aggregate-bidirectionally-on-kept-source-union-target-worker-snapshot-including-added-attempts-and-missing-request-owners-with-bounded-temp-id-storage; writer-final-check-retained; typed-RUNTIME_DATA_INVARIANT-or-sqlite-constraint-refusals-block-and-record-both-merge-paths-infrastructure-errors-deferred; online-target-local-or-external-commit-since-planning-defers-refusal-without-recording",
@@ -580,7 +580,9 @@ function validateMigration(root, migration, failures) {
     "sourceRetention": "conversation-content-unchanged; published-3-4-5-backed-up-and-upgraded-in-place; backup-before-finalization",
     "selectionPolicy": "never-switch",
     "historicalExecutionPolicy": "no-merged-conversation-resumes-in-any-host; source-host-registered-only-to-finalize",
-    "convergencePolicy": "configuration-root-pending-records-have-no-expiry; convergence-registers-local-and-foreign-discovered-sources-and-relocation-left-behind-without-body-scan; residual-records-keep-location-reason-and-excluded-conversations; reset-backups-registered-residual-under-admission-and-reconciled-by-directory-enumeration-on-startup; residual-retry-explicitly-moves-the-source-back-to-pending; read-only-residual-list-and-open-folder-never-delete"
+    "convergencePolicy": "configuration-root-pending-records-have-no-expiry; convergence-registers-local-and-foreign-discovered-sources-and-relocation-left-behind-without-body-scan; residual-records-keep-location-reason-and-excluded-conversations; reset-backups-registered-residual-under-admission-and-reconciled-by-directory-enumeration-on-startup; residual-retry-explicitly-moves-the-source-back-to-pending; read-only-residual-list-and-open-folder-never-delete",
+    "backgroundPolicy": "one-source-at-a-time; automatic-source-start-requires-requester-runtime-idle; foreign-automatic-source-120000ms-abort-budget-from-before-claim-acquisition; held-foreign-claim-refused-without-waiting-for-automatic-calls; cancellation-forwarded-to-private-copy-audit-and-body-read; release-claim-and-clear-timer-in-finally; timeout-deferred-and-kept-pending; explicit-request-not-subject-to-background-budget",
+    "settlementConsentPolicy": "source-identity-and-counts-durable-before-source-backup-and-settlement; counts-turns-queued-intents-pending-deliveries-including-process-completions-and-undelivered-answers-child-executions-and-unreceipted-effects; displayed-counts-and-unknown-effect-outcome-explained; reuse-only-same-candidate-dataSetId-rootInstanceId-and-counts-not-increased; new-source-or-increased-counts-requires-confirmation; currently-confirmed-per-source-not-yet-a-batch-wide-confirmation"
   };
   if (!plainObject(merge) || JSON.stringify(Object.fromEntries(Object.entries(merge).filter(([key]) => key !== 'conversationOwnership'))) !== JSON.stringify(expectedMerge)) {
     failures.push('旧历史库只能在当前库打开后在线合并：来源离线，重活不持锁，全部检查通过才先备份再按现有终态收尾，每来源一个经 Repository 与 codec 的写事务，超过在线上限才在锁外协调独占兜底、超过内存单事务上限等大库会话的流式维护事务、超过流式硬上限记为太大，冲突按对话归属剔除、无归属或内容身份冲突拒绝整份，合并进来的对话不会被自动继续');
@@ -615,6 +617,18 @@ function validateMigration(root, migration, failures) {
   const selectionSource = readText(path.join(root, 'backend/reliableKernel/vscodeRootAuthority.ts'));
   if (!selectionSource.includes("if (previous) throw new VscodeRuntimeDataSetError('当前历史库已经固定")) failures.push('当前历史库选择只允许首次发布');
   const mergeSource = readText(path.join(root, 'backend/reliableKernel/runtimeDataSetMerge.ts'));
+  const convergenceSource = readText(path.join(root, 'backend/reliableKernel/runtimeHistoryConvergence.ts'));
+  const settlementSource = readText(path.join(root, 'backend/application/reliableKernel/historicalMergeSettlement.ts'));
+  if (!mergeSource.includes('options.isRuntimeIdle && !await options.isRuntimeIdle()')
+    || !mergeSource.includes('runtime-data-set-merge-background-timeout') || !mergeSource.includes('120_000)')
+    || !mergeSource.includes('await hold.release();')
+    || !convergenceSource.includes('(source.deliveries ?? 0) >= (input.deliveries ?? 0)')
+    || !convergenceSource.includes('(source.children ?? 0) >= (input.children ?? 0)')
+    || !convergenceSource.includes('(source.effects ?? 0) >= (input.effects ?? 0)')
+    || !settlementSource.includes('ReliableKernelApplication.open(authority, SETTLING_ONLY)')
+    || !settlementSource.includes('await application.database.durabilityCheckpoint();')) {
+    failures.push('后台合并须检查空闲与外来来源预算；收尾同意计数须包含投递、子 Agent 和已派发效果，离线收尾须禁止执行并持久化');
+  }
   const mergeConstant = (pattern) => pattern.exec(mergeSource)?.slice(1).map((value) => Number(value.replaceAll('_', ''))) ?? [];
   const [onlineRows, onlineMiB] = mergeConstant(/RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS = Object\.freeze\(\{ maxRows: ([\d_]+), maxBytes: ([\d_]+) \* 1024 \* 1024 \}\)/);
   const [transactionRows] = mergeConstant(/RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS = ([\d_]+);/);
@@ -954,16 +968,16 @@ function validateForeignHistory(root, authority, failures) {
   const missing = [
     // Its claim is held from preparation to commit, taken before (never inside) configuration admission.
     [foreignSource, 'if (isRuntimeDataRootAdmissionHeld(configurationRoot)) {'],
-    [foreignMergeSource, 'const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, id, pointerOf(location));'],
+    [foreignMergeSource, 'const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location), { refuseWhenHeld: !!options.signal });'],
     // Runtime metadata is snapshotted first. Packed bytes come from a scoped private SQLite
     // main/WAL copy; absent packed keys retain strict no-follow loose-file descriptor reads.
-    [foreignMergeSource, 'copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles())'],
-    [foreignMergeSource, 'objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles());'],
+    [foreignMergeSource, 'copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles(), this.signal)'],
+    [foreignMergeSource, 'objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles(), this.signal);'],
     [foreignMergeSource, 'try { await objects.close(); }'],
     [foreignMergeSource, 'finally { await snapshot.close(); }'],
     [foreignMergeSource, 'try { return await objects.open(object); }'],
-    [foreignSource, 'const packed = await openPackedCasSnapshot({ ...root.recorded, paths: root.located }, root.containerRoot, held);'],
-    [foreignSource, 'copy = await copyForeignRuntimeSqliteFiles(containerRoot, file, held, PACKED_CAS_FILE);'],
+    [foreignSource, 'const packed = await openPackedCasSnapshot({ ...root.recorded, paths: root.located }, root.containerRoot, held, signal);'],
+    [foreignSource, 'copy = await copyForeignRuntimeSqliteFiles(containerRoot, file, held, PACKED_CAS_FILE, signal);'],
     [foreignSource, 'worker = await PackedCasWorkerClient.open({ ...binding,'],
     [foreignSource, 'casRootPath: path.dirname(copy.databasePath)'],
     [foreignSource, '? openLocatedRuntimeFile(await reachable(object), await currentHeld()) : bufferReadHandle(bytes);'],
@@ -977,7 +991,7 @@ function validateForeignHistory(root, authority, failures) {
     [mergeSource, "if (isForeignCandidate(candidate)) throw new TypeError('A foreign history root is never finalized.');"],
     [mergeSource, "if (isForeignCandidate(candidate)) throw new TypeError('A data-root migration has no foreign sources.');"],
     [mergeSource, '? candidate.hold.fence(body) : withRuntimeMaintenance(binding.paths, body);'],
-    [mergeSource, 'verified, verifyOnly, exclusions, sourceObjects: candidate.hold.objects(candidate), freeSpace: options.freeSpace ?? freeSpace'],
+    [mergeSource, 'verified, verifyOnly, exclusions, signal: candidate.hold.signal, sourceObjects: candidate.hold.objects(candidate), freeSpace: options.freeSpace ?? freeSpace'],
     [mergeSource, "kind: 'blocked', code: 'runtime-data-set-merge-foreign-old-copy',"],
     [mergeSource, "kind: 'blocked', code: 'runtime-data-set-merge-foreign-unfinished-work',"],
     // The large-merge session reads a foreign source only through the hold its preparation took.
@@ -989,7 +1003,7 @@ function validateForeignHistory(root, authority, failures) {
     [foreignSource, 'const merged = typeof record.candidateId === \'string\' && FOREIGN_ID.test(record.candidateId) ? [record.target] : [record.source, record.target];']
   ].filter(([source, text]) => !source.includes(text));
   const metadataSnapshotAt = foreignMergeSource.indexOf('snapshot = await createLocatedRuntimeDatabaseSnapshot(candidate.root, {');
-  const packedSnapshotAt = foreignMergeSource.indexOf('objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles());');
+  const packedSnapshotAt = foreignMergeSource.indexOf('objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles(), this.signal);');
   if (missing.length > 0 || metadataSnapshotAt < 0 || packedSnapshotAt <= metadataSnapshotAt || forbidden.test(foreignMergeSource)
     || /withRuntimeMaintenance\(|withLocatedRuntimeRootFence\(|auditForeignRuntimeRoot\(/.test(foreignMergeSource)) {
     failures.push('外来历史库按待合并登记或用户请求合并进当前库：从准备到提交持有它在当前配置根的声明（在准入之外取得），快照与审计只在私有拷贝上，正文经不跟随链接的描述符复制、从不硬链接，'
