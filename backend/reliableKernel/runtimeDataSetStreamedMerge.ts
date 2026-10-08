@@ -1,3 +1,5 @@
+import { RuntimeMergeConversationExclusions } from './runtimeMergeConversationExclusions';
+import { inspectUnfinishedWorkRows } from './runtimeDataSetMergeWork';
 import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm, stat } from 'node:fs/promises';
 import * as os from 'node:os';
@@ -321,8 +323,8 @@ async function prepareSkippedRows(
   const deleted = merged.length > 0 ? await engine.deletedSinceMerge(source, target, merged) : undefined;
   state.skippedConversations = deleted?.count ?? 0;
   withTemporaryWrites(source, () => source.exec(`DROP TABLE IF EXISTS temp.${SKIP_TABLE}`));
-  if (!deleted) return false;
-  seedSkipTable(source, deleted.conversations);
+  if (!deleted && !state.excluded?.length) return false;
+  seedSkipTable(source, [...(deleted?.conversations ?? []), ...(state.excluded?.map(row => row.conversationId) ?? [])]);
   await closeOver(source, chunkRows * SKIP_SEGMENT_CHUNKS);
   return true;
 }
@@ -645,6 +647,8 @@ interface ChunkedRowsOptions {
   skipping: boolean;
   chunkRows: number;
   signal?: AbortSignal;
+  exclusions?: RuntimeMergeConversationExclusions;
+  collecting?: boolean;
 }
 
 /**
@@ -682,8 +686,13 @@ async function forEachSourceChunk(
     };
     for (const raw of statement.iterate() as IterableIterator<Record<string, unknown>>) {
       scannedSinceYield += 1;
-      if (!skipped || skipped.get(schema.key, String(raw.id)) === undefined) {
-        chunk.push(engine.sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw)));
+      if (options.collecting) options.exclusions?.observe(schema.key, raw);
+      if ((!skipped || skipped.get(schema.key, String(raw.id)) === undefined) && !options.exclusions?.includes(schema.key, String(raw.id))) {
+        try { chunk.push(engine.sourceRow(schema.key, String(raw.id), () => repository.codec.decode(raw))); }
+        catch (error) {
+          if (!options.collecting || !options.exclusions) throw error;
+          options.exclusions.exclude(schema.key, raw, 'runtime-data-set-merge-source-row-invalid');
+        }
         if (chunk.length >= options.chunkRows) await flush();
       }
       // Even an entirely deleted conversation produces pauses and prompt cancellation. The write
@@ -707,9 +716,13 @@ async function forEachSourceChunk(
     timelineChunk = [];
     await visit(entries, existing);
   };
-  for (const entry of timelineMergeSourceRows(source, (domain, id) => !skipped || skipped.get(domain, id) === undefined)) {
+  for (const entry of timelineMergeSourceRows(source, (domain, id) => (!skipped || skipped.get(domain, id) === undefined) && !options.exclusions?.includes(domain, id), options.collecting && options.exclusions ? (domain, raw) => {
+    options.exclusions!.observe(domain,raw);
+    options.exclusions!.exclude(domain,raw,'runtime-data-set-merge-source-row-invalid');
+  } : undefined)) {
     timelineScanned += 1;
-    if (!skipped || skipped.get(entry.schema.key, String(entry.row.id)) === undefined) timelineChunk.push(entry);
+    if (options.collecting) options.exclusions?.observe(entry.schema.key, entry.row);
+    if (!entry.invalid && (!skipped || skipped.get(entry.schema.key, String(entry.row.id)) === undefined)) timelineChunk.push(entry);
     if (timelineChunk.length >= options.chunkRows) await flushTimeline();
     if (timelineScanned >= RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS) {
       await yieldThread();
@@ -750,19 +763,23 @@ function countingSink(scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'>, savepoin
 export async function scanMergeRows(
   source: Database.Database,
   target: RuntimeDatabase,
-  options: { skipping?: boolean; chunkRows?: number; signal?: AbortSignal; onRows?(rows: number): void } = {}
+  options: { skipping?: boolean; chunkRows?: number; signal?: AbortSignal; onRows?(rows: number): void; exclusions?: RuntimeMergeConversationExclusions; collecting?: boolean } = {}
 ): Promise<RuntimeDataSetMergeScan> {
   const started = performance.now();
   const timelineImportSource = readTimelineMergeSourceIdentity(source);
   const scan: Omit<RuntimeDataSetMergeScan, 'elapsedMs'> = {
     rows: 0, insertRows: 0, reusedRows: 0, insertConversations: 0, conflicts: { count: 0, samples: [] }
   };
-  const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => !options.skipping
-    || source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`).get(domain, id) === undefined);
+  const aggregates = new MergeAggregatePreflight(source, target, (domain, id) => (!options.skipping
+    || source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`).get(domain, id) === undefined) && !options.exclusions?.includes(domain,id));
   const counting = countingSink(scan, { next: 0 });
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
     timelineImportSource,
+    conflict: (sample, domain, row) => {
+      counting.conflict(sample, domain, row);
+      if (options.collecting) options.exclusions?.exclude(domain, row, 'runtime-data-set-merge-conflict');
+    },
     inserted: (domain, id, row) => {
       counting.inserted(domain, id, row);
       aggregates.touch(domain, row);
@@ -771,7 +788,7 @@ export async function scanMergeRows(
   try {
     await forEachSourceChunk(source, target, {
       skipping: options.skipping === true, chunkRows: options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS,
-      ...(options.signal ? { signal: options.signal } : {})
+      ...(options.signal ? { signal: options.signal } : {}), exclusions: options.exclusions, collecting: options.collecting
     }, async (entries, existing) => {
       for (const [index, { schema, row }] of entries.entries()) planMergeChunk(schema, [row], [existing[index]], sink);
       sink.steps.length = 0;
@@ -779,7 +796,12 @@ export async function scanMergeRows(
       scan.rows += entries.length;
       options.onRows?.(scan.rows);
     });
-    if (scan.conflicts.count === 0) await aggregates.validate(options.signal);
+    if (scan.conflicts.count === 0 && (!options.collecting || !options.exclusions?.hasProblems())) await aggregates.validate(options.signal,
+      options.collecting && options.exclusions ? (domain,id,error) => {
+        const row = source.prepare('SELECT * FROM model_request WHERE id=?').get(id) as Record<string,unknown> | undefined;
+        if (!row) throw error;
+        options.exclusions!.exclude(domain,row,'runtime-data-set-merge-invariant');
+      } : undefined);
   } catch (error) {
     if (!isRuntimeDataInvariant(error)) throw error;
     return { ...scan, refusedAggregate: engine.errorMessage(error), elapsedMs: performance.now() - started };
@@ -844,8 +866,8 @@ async function streamMergeTransaction(
     rows: 0, insertRows: 0, reusedRows: 0, insertConversations: 0, conflicts: { count: 0, samples: [] }
   };
   const counting = countingSink(scan, { next: 0 });
-  const handleStates = new MergeContextHandleStates(source, database, (domain, id) => !input.skipping
-    || !source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`).get(domain, id));
+  const handleStates = new MergeContextHandleStates(source, database, (domain, id) => (!input.skipping
+    || !source.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain = ? AND id = ?`).get(domain, id)) && !input.exclusions?.includes(domain,id));
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
     timelineImportSource: readTimelineMergeSourceIdentity(source),
@@ -1280,6 +1302,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         internals.sources.set(candidateId, sourceInternals);
         continue;
       }
+      sourceInternals.state.exclusions?.close();
       await sourceInternals.state.foreign?.release();
       await internals.claims.release(candidateId);
       if (outcome.kind === 'small') {
@@ -1372,7 +1395,10 @@ async function holdForeignSource(
 
 /** Lets go of every foreign root's claim a preparation still holds. */
 async function releaseHolds(internals: PreparationInternals): Promise<void> {
-  for (const source of internals.sources.values()) await source.state.foreign?.release();
+  for (const source of internals.sources.values()) {
+    source.state.exclusions?.close();
+    await source.state.foreign?.release();
+  }
 }
 
 /**
@@ -1450,6 +1476,7 @@ async function prepareSource(
     if (!aboveThreshold(taken.audit.size!, threshold, options)) return { kind: 'small' };
     // What is verified here is kept on disk: the session (or a later preparation) only lstats it.
     verified = await openRuntimeCasVerificationCache(paths.globalStoragePath);
+    state.exclusions = new RuntimeMergeConversationExclusions(taken.snapshot.database);
     // What belongs to conversations deleted here since is left out: it neither refuses the source nor is closed.
     const keptWork = async (): Promise<UnfinishedWorkInspection> => {
       const work = taken.audit.unfinishedWork!;
@@ -1461,8 +1488,6 @@ async function prepareSource(
         throw error;
       });
     };
-    const work = await keptWork();
-    if (work.refused.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
     stopIfAsked();
     let scanTargetVersion: string;
     const scanSource = async (): Promise<RuntimeDataSetMergeScan> => {
@@ -1470,34 +1495,50 @@ async function prepareSource(
       boundSourcePageCache(taken.snapshot.database);
       const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows);
       progress('scan', 0);
-      const scan = await scanMergeRows(taken.snapshot.database, target.database, {
-        skipping, chunkRows, ...(input.signal ? { signal: input.signal } : {}), onRows: (rows) => progress('scan', rows)
+      for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate))) {
+        if (!skipping || !taken.snapshot.database.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain=? AND id=?`).get(issue.domain,String(issue.row.id))) {
+          state.exclusions!.exclude(issue.domain,issue.row,issue.code);
+        }
+      }
+      let scan = await scanMergeRows(taken.snapshot.database, target.database, {
+        skipping, chunkRows, ...(input.signal ? { signal: input.signal } : {}), onRows: (rows) => progress('scan', rows),
+        exclusions: state.exclusions, collecting: true
       }).catch((error: unknown) => {
         if (isAbort(error)) throw new engine.StopRequested();
         throw error;
       });
+      progress('cas');
+      await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified!, true, state.exclusions);
+      if (state.exclusions!.hasProblems()) {
+        await state.exclusions!.finish(chunkRows);
+        state.excluded = state.exclusions!.excluded();
+        scan = await scanMergeRows(taken.snapshot.database, target.database, { skipping, chunkRows, signal: input.signal, exclusions: state.exclusions });
+      }
       if (scan.refusedAggregate !== undefined) throw invariantRefusal(scan.refusedAggregate, state);
       if (scan.conflicts.count > 0) throw new engine.Outcome(engine.conflictRefusal(scan.conflicts, state));
       return scan;
     };
     let scan = await scanSource();
+    const work = await keptWork();
+    if (work.refused.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
     if (hasFinalizableWork(work)) {
       // Everything that can refuse the source was checked on the unfinalized snapshot; the CAS
       // objects are verified too. Only then is it backed up and its work closed, and checked again.
-      progress('cas');
-      await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, true);
       stopIfAsked();
       await engine.fault(options, 'before-source-finalization');
       progress('finalize');
       await engine.finalizeSource(paths, target, candidate, binding, work, state, options, mode, stopIfAsked);
+      state.exclusions?.close();
       await taken.snapshot.close();
       taken = await snapshot();
+      state.exclusions = new RuntimeMergeConversationExclusions(taken.snapshot.database);
+      state.excluded = undefined;
+      scan = await scanSource();
       const remaining = await keptWork();
       if (remaining.refused.length > 0 || hasFinalizableWork(remaining)) {
         throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(remaining.refused) || '收尾后仍有未结束的任务', state, true));
       }
       stopIfAsked();
-      scan = await scanSource();
     }
     if (scan.insertRows === 0) {
       // Nothing new (all its rows are here already): recorded as merged at once, as an online merge records it.
@@ -1515,7 +1556,7 @@ async function prepareSource(
     await engine.fault(options, 'after-target-backup');
     progress('cas');
     const unrecorded = verified.unrecorded();
-    const cas = await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, false);
+    const cas = await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, false, state.exclusions);
     if (verified.unrecorded() > unrecorded) {
       // The session would hash those objects again while every window waits: not this time.
       throw new engine.Outcome({
@@ -2046,7 +2087,8 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         }
         if (result.state === 'merged' || result.state === 'current') await engine.mergeRequestDone(paths, prepared.candidateId, target).catch(() => undefined);
         if (result.state === 'blocked' || result.state === 'failed') await removeRuntimeDataSetMergeRequest(paths, prepared.candidateId).catch(() => undefined);
-        await sourceInternals.state.foreign?.release();
+        sourceInternals.state.exclusions?.close();
+      await sourceInternals.state.foreign?.release();
         await internals.claims.release(prepared.candidateId);
         if (result.state === 'deferred' && result.issue.code === RUNTIME_DATA_SET_MERGE_CANCELLED) {
           results.cancelled = true;
@@ -2259,7 +2301,7 @@ async function mergeLocked(
   const candidate = await resolver.candidate(root);
   const previous = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
   engine.assertNoCommitElsewhere(previous, target);
-  if ((previous?.state === 'committing' || previous?.state === 'merged') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
+  if ((previous?.state === 'committing' || previous?.state === 'merged' || previous?.state === 'partial') && sameRuntimeDataSetIdentity(previous.target, target.identity)) {
     if (previous.state === 'committing') {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '另一个窗口合并这个库时中断，下次启动时先确认它的结果。' });
     }
@@ -2279,19 +2321,19 @@ async function mergeLocked(
     const chunkRows = options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS;
     const skipping = await prepareSkippedRows(copy.database, target.database, merged, state, chunkRows);
     // Published online with their verified identities: unchanged objects are only lstat'ed here.
-    const cas = await engine.transferSourceCas(candidate, locatedBinding(root), target, copy, options, verified, false);
+    const cas = await engine.transferSourceCas(candidate, locatedBinding(root), target, copy, options, verified, false, state.exclusions);
     await engine.fault(options, 'after-cas-transfer');
     const result: RuntimeDataSetMergeResult = {
       ...engine.unchangedResult(candidate, target), ...cas,
       ...(target.backup.path ? { backupPath: target.backup.path } : {}),
       ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
       ...(state.skippedConversations ? { skippedConversations: state.skippedConversations } : {}),
-      exclusive: true
+      exclusive: true, ...(state.excluded?.length ? { excluded: state.excluded } : {})
     };
     const evidence = new RuntimeDataSetMergeEvidence();
     const skipped = state.skippedConversations ? { skippedConversations: state.skippedConversations } : {};
     const record = (inserted: StreamedMerge) => ({
-      candidateId, state: 'merged' as const, source: state.fingerprint!, target: target.identity,
+      candidateId, ...(state.excluded?.length ? { state: 'partial' as const, excluded: state.excluded } : { state: 'merged' as const }), source: state.fingerprint!, target: target.identity,
       mergedAt: new Date().toISOString(), insertedRows: inserted.inserted, reusedRows: inserted.reused,
       insertedConversations: inserted.insertedConversations, insertedConversationIds: evidence.conversationIds, ...skipped
     });
@@ -2299,7 +2341,7 @@ async function mergeLocked(
     // commit happened is read off its marker alone, so a crash before it puts the replaced record back.
     const commitId = await writeRuntimeDataSetMergeCommit(paths, [], { insertedRows: 0, reusedRows: 0 });
     await writeRuntimeDataSetMergeLedgerRecord(paths, {
-      candidateId, state: 'committing', source: state.fingerprint!, target: target.identity, commitId, ...(previous ? { replaced: previous } : {}), ...skipped
+      candidateId, state: 'committing', source: state.fingerprint!, target: target.identity, ...(state.excluded?.length ? { excluded: state.excluded } : {}), commitId, ...(previous ? { replaced: previous } : {}), ...skipped
     });
     const backupUsed = target.backup.used === true;
     target.backup.used = true;
@@ -2312,7 +2354,7 @@ async function mergeLocked(
     try {
       progress('merging', 0);
       streamed = await streamMergeTransaction(copy.database, target.database, {
-        skipping, chunkRows, ...(signal ? { signal } : {}), evidence, marker: engine.mergeCommitMarkerStep(commitId), state,
+        skipping, chunkRows, ...(signal ? { signal } : {}), exclusions: state.exclusions, evidence, marker: engine.mergeCommitMarkerStep(commitId), state,
         onChunk: async (chunk, rows) => {
           written.rows = rows;
           progress('merging', rows);

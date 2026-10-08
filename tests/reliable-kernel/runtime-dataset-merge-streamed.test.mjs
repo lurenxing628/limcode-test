@@ -195,25 +195,26 @@ test('旧记录：以前按内存上限（maxRows=60000）记下的 too-large �
   assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'merged');
 });
 
-test('冲突：在线试算发现同一记录内容不同就整份拒绝并记为受阻，不收尾、不备份、不复制正文、不占准备记录', async (t) => {
+test('剔除等价性：冲突连带子 Agent 与跨对话链接，其余对话在线和流式都合并并记 partial', async (t) => {
   const fixture = await fixtureFor(t);
   await seedConversations(fixture.current, [{ id: 'alpha_conversation_1', title: 'current title' }]);
   await seedRichSource(fixture.alpha, 'alpha', 3);
-  const database = await openWindow(fixture);
-  let preparation;
-  try {
-    preparation = await prepareLargeMergeSources({
-      paths: fixture.paths, target: { configurationRootPath: fixture.root, database },
-      candidateIds: [fixture.alpha.id], requested: true, options: SMALL_LIMITS
-    });
-  } finally { await database.close(); }
-  assert.deepEqual(preparation.sources, []);
-  assert.deepEqual(preparation.report.blocked.map((issue) => [issue.code, issue.requested]), [['runtime-data-set-merge-conflict', true]]);
-  assert.match(preparation.report.blocked[0].message, /1 处同一条记录但内容不同[\s\S]*Conversation#alpha_conversation_1 字段不同：title/);
-  assert.equal(preparation.backupPath, undefined);
-  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'blocked');
-  assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
-  await assert.rejects(fs.stat(path.join(path.dirname(fixture.current.binding.paths.dataRootPath), 'merge-backups')), { code: 'ENOENT' });
+  const before = await saveState(fixture, fixture.current);
+  t.after(() => before.remove());
+  const online = await mergeOnline(fixture);
+  assert.deepEqual([online.merged.length, online.blocked, online.failures], [1, [], []]);
+  const expected = readAll(fixture.current);
+  const onlineRecord = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.equal(onlineRecord.state, 'partial');
+  assert.deepEqual(onlineRecord.excluded.map(row => row.conversationId).sort(), ['alpha_conversation_0', 'alpha_conversation_1']);
+  await before.restore();
+  const { preparation, session } = await mergeStreamed(fixture, { candidateIds: [fixture.alpha.id], requested: true });
+  assert.equal(preparation.sources.length, 1);
+  assert.deepEqual(session.results.map(result => result.state), ['merged']);
+  assertSameRows(readAll(fixture.current), expected, '剔除后在线与流式相同');
+  const record = await readLedgerRecord(fixture, fixture.alpha.id);
+  assert.equal(record.state, 'partial');
+  assert.deepEqual(record.excluded, onlineRecord.excluded);
 });
 
 test('冲突：准备之后当前库又写入了同一记录的另一份内容，独占阶段整份回滚并记为受阻，当前库没有这份来源的任何行', async (t) => {
