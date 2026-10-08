@@ -250,7 +250,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
       );
     }
 
-    if (!journal) await assertPreviousEpochRoot(previous);
+    const validatedPredecessor = !journal ? await assertPreviousEpochRoot(previous) : undefined;
     const next = await authority.stageInPlaceEpochMigration(previous);
     await fault(options, 'after-writer-fence');
 
@@ -275,7 +275,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
 
     const databaseState = inspectDatabaseBindingState(previous.paths.databasePath, previous, next);
     if (databaseState === 'previous') {
-      await assertPreviousEpochRoot(previous);
+      const predecessorSchemas = validatedPredecessor ?? await assertPreviousEpochRoot(previous);
       if (journal.state === 'fenced') {
         await fault(options, 'before-backup');
         journal.databaseBackupSha256 = await ensureDatabaseBackup(controlRoot, journal);
@@ -286,7 +286,7 @@ export async function migratePreviousRuntimeEpochIfRequired(
       } else {
         await verifyExistingBackup(controlRoot, journal);
       }
-      await migrateDatabase(previous.paths.databasePath, previous, next, options.signal);
+      await migrateDatabase(previous.paths.databasePath, previous, next, predecessorSchemas, options.signal);
     } else if (databaseState === 'current') {
       if (journal.state === 'fenced') {
         throw new RootAuthorityError(
@@ -380,7 +380,7 @@ async function recoverPublishedEpoch5Boundary(authority: RootAuthority, controlR
   } finally { database.close(); }
 
   if (!committed) {
-    await assertPreviousEpochRoot(previous);
+    await assertPreviousEpochRootFiles(previous);
     if (journal?.state === 'database_committed' || journal?.state === 'completed') {
       throw new RootAuthorityError('runtime-retired-epoch-migration-conflict',
         `The published epoch-${targetEpoch} upgrade journal records a database commit that is missing.`);
@@ -421,7 +421,7 @@ function assertMigratedDatabaseDurable(binding: HistoricalRootBinding): void {
       assertCurrentSchema(database, parseRootBinding(binding));
       assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS);
     } else {
-      assertPreviousEpochDatabase(database, binding);
+      assertPreviousEpochDatabaseSchema(database, binding);
     }
     const rows = database.pragma('wal_checkpoint(TRUNCATE)') as Array<{
       busy: bigint; log: bigint; checkpointed: bigint;
@@ -615,7 +615,12 @@ export async function assertPublishedPreviousRuntimeEpochSnapshot(
   assertPreviousEpochDatabase(database, binding);
 }
 
-async function assertPreviousEpochRoot(binding: HistoricalRootBinding): Promise<void> {
+async function assertPreviousEpochRoot(binding: HistoricalRootBinding): Promise<readonly RuntimeDomainSchema[]> {
+  await assertPreviousEpochRootFiles(binding);
+  return assertPreviousEpochDatabaseFile(binding);
+}
+
+async function assertPreviousEpochRootFiles(binding: HistoricalRootBinding): Promise<void> {
   await assertPreviousEpochManifest(binding);
   const casStat = await fs.stat(binding.paths.casRootPath).catch((error: unknown) => {
     throw new RootAuthorityError(
@@ -630,7 +635,6 @@ async function assertPreviousEpochRoot(binding: HistoricalRootBinding): Promise<
       `Historical Runtime CAS root is not a directory: ${binding.paths.casRootPath}`
     );
   }
-  assertPreviousEpochDatabaseFile(binding);
 }
 
 async function assertPreviousEpochManifest(binding: HistoricalRootBinding): Promise<void> {
@@ -676,11 +680,11 @@ function assertPreviousEpochManifestValue(value: unknown, binding: HistoricalRoo
   }
 }
 
-function assertPreviousEpochDatabaseFile(binding: HistoricalRootBinding): void {
+function assertPreviousEpochDatabaseFile(binding: HistoricalRootBinding): readonly RuntimeDomainSchema[] {
   const database = new Database(toSqliteFilePath(binding.paths.databasePath), { readonly: true, fileMustExist: true });
   try {
     database.defaultSafeIntegers(true);
-    assertPreviousEpochDatabase(database, binding);
+    return assertPreviousEpochDatabase(database, binding);
   } finally {
     database.close();
   }
@@ -697,8 +701,25 @@ function assertPreviousEpochDatabase(
       'Historical Runtime SQLite quick_check failed.'
     );
   }
+  const schemas = assertPreviousEpochDatabaseSchema(database, binding);
+
+  const violations = database.pragma('foreign_key_check') as unknown[];
+  if (violations.length > 0) {
+    throw new RootAuthorityError(
+      'runtime-epoch-migration-integrity',
+      `Historical Runtime database has ${violations.length} foreign key violations.`
+    );
+  }
+  return schemas;
+}
+
+function assertPreviousEpochDatabaseSchema(
+  database: Database.Database,
+  binding: HistoricalRootBinding,
+  validatedSchemas?: readonly RuntimeDomainSchema[]
+): readonly RuntimeDomainSchema[] {
   assertStoredBinding(database, binding);
-  const schemas = previousSchemas(database, binding.runtimeKernelEpoch);
+  const schemas = validatedSchemas ?? previousSchemas(database, binding.runtimeKernelEpoch);
 
   try {
     assertRuntimePhysicalSchemaFingerprint(database, schemas, {
@@ -718,13 +739,6 @@ function assertPreviousEpochDatabase(
   ).all() as Array<Record<string, unknown>>;
   assertPublishedPreviousEpochManifest(rows, binding.runtimeKernelEpoch, schemas);
 
-  const violations = database.pragma('foreign_key_check') as unknown[];
-  if (violations.length > 0) {
-    throw new RootAuthorityError(
-      'runtime-epoch-migration-integrity',
-      `Historical Runtime database has ${violations.length} foreign key violations.`
-    );
-  }
   return schemas;
 }
 
@@ -742,6 +756,7 @@ async function migrateDatabase(
   file: string,
   previous: HistoricalRootBinding,
   next: RootBinding,
+  validatedSchemas: readonly RuntimeDomainSchema[],
   signal?: AbortSignal
 ): Promise<void> {
   const database = new Database(toSqliteFilePath(file), { fileMustExist: true });
@@ -749,9 +764,8 @@ async function migrateDatabase(
     database.defaultSafeIntegers(true);
     configureWriterConnection(database);
     database.pragma('synchronous = FULL');
-    await upgradeOpenDatabase(database, previous, next, localUpgradeContent(previous.paths.casRootPath), signal);
+    await upgradeOpenDatabase(database, previous, next, localUpgradeContent(previous.paths.casRootPath), signal, validatedSchemas);
     assertCurrentSchema(database, next);
-    database.pragma('wal_checkpoint(TRUNCATE)');
   } catch (error) {
     throw new RootAuthorityError(
       'runtime-epoch-migration-failed',
@@ -800,9 +814,14 @@ async function upgradeOpenDatabase(
   previous: HistoricalRootBinding,
   next: RootBinding,
   content: RuntimeUpgradeContent,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  validatedSchemas?: readonly RuntimeDomainSchema[]
 ): Promise<void> {
-  const predecessorSchemas = assertPreviousEpochDatabase(database, previous);
+  // In-place maintenance already audited unchanged rows; recheck its writer binding and DDL.
+  // A private snapshot supplies no prior proof and retains the complete integrity audit.
+  const predecessorSchemas = validatedSchemas
+    ? assertPreviousEpochDatabaseSchema(database, previous, validatedSchemas)
+    : assertPreviousEpochDatabase(database, previous);
   database.pragma('foreign_keys = OFF');
   database.exec('BEGIN IMMEDIATE');
   try {
@@ -996,6 +1015,7 @@ async function ensureDatabaseBackup(
     await fs.rename(temporary, destination);
     await syncDirectory(backupRoot);
     await syncDirectory(path.dirname(backupRoot));
+    return await sha256File(destination);
   }
   try {
     verifyBackupDatabase(destination, journal.previousBinding);

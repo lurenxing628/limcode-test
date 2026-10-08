@@ -83,11 +83,12 @@ async function main() {
   fsp.open = async function hookedOpen(file, ...rest) {
     // The merge into an existing target committed (its rows journaled as 'merging' before), killed
     // before its 'received' journal entry: the undo must prove the target is only that plus these rows.
-    if (scenario === 'after-merge-commit' && typeof file === 'string' && rest[0] === 'a') {
+    if ((scenario === 'after-merge-commit' || scenario === 'during-merge') && typeof file === 'string' && rest[0] === 'a') {
       const handle = await open.call(this, file, ...rest);
       const appendFile = handle.appendFile.bind(handle);
       handle.appendFile = async (data, ...more) => {
-        if (String(data).includes('"op":"received"')) kill('merge committed, before the received journal entry');
+        if (scenario === 'after-merge-commit' && String(data).includes('"op":"received"')) kill('merge committed, before the received journal entry');
+        if (scenario === 'during-merge' && kind === 'limcode' && String(data).includes('"op":"merging"')) kill('merge (rows journaled, before the row commit)');
         return appendFile(data, ...more);
       };
       return handle;
@@ -115,13 +116,6 @@ async function main() {
       kill('pre-copy snapshot (Backup API staging beside the old database)');
     }
     return copyFile.call(this, from, to, ...rest);
-  };
-  const mkdir = fsp.mkdir;
-  fsp.mkdir = async function hookedMkdir(directory, ...rest) {
-    if (scenario === 'during-merge' && typeof directory === 'string' && directory.startsWith(target) && directory.includes('merge-backups')) {
-      kill('merge (target backup, before the row commit)');
-    }
-    return mkdir.call(this, directory, ...rest);
   };
 
   // An empty target is written in batches (no merge backup): killed once the first batch of the

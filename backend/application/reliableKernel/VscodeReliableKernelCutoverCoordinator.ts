@@ -65,7 +65,11 @@ export class VscodeReliableKernelCutoverCoordinator {
     const paths = this.authority.expectedPaths();
     return this.authority.withRuntimeHostAdmission(() =>
       withRuntimeMaintenance(paths, async () => {
-        const mutation = await this.requiredMutation();
+        const preparation = await this.inspectRootPreparation();
+        if (preparation && typeof preparation === 'object') {
+          return { binding: preparation, initialized: false, cutoverPerformed: false };
+        }
+        const mutation = preparation;
         if (mutation === 'physical-cutover') {
           // Legacy placements filter/delete shared configuration outside the Runtime control
           // tree, so every Runtime root contained in this scope root must be offline — not only
@@ -80,10 +84,10 @@ export class VscodeReliableKernelCutoverCoordinator {
   }
 
   /**
-   * Read-only classification run under both claims. The internal flow re-derives the same
-   * decision before acting, so a stale answer here can only surface as the exact existing error.
+   * Read-only classification under both claims. A complete current root is returned after its
+   * schema check; mutation paths continue through the recovery gate while the same claims hold.
    */
-  private async requiredMutation(): Promise<'physical-cutover' | 'runtime-root' | undefined> {
+  private async inspectRootPreparation(): Promise<'physical-cutover' | 'runtime-root' | RootBinding | undefined> {
     // A foreign or malformed pointer fences even physical-cutover preflight. Do not inspect
     // its journal/request or enumerate Hosts before the complete historical schema is checked.
     const historical = await this.authority.readHistoricalPointerForCutover();
@@ -101,7 +105,7 @@ export class VscodeReliableKernelCutoverCoordinator {
       return (await legacyRuntimeRequiresCutover(this.runtimeScopeRootPath)) ? undefined : 'runtime-root';
     }
     await validateCurrentRuntimeSchema(binding);
-    return undefined;
+    return binding;
   }
 
   private async ensureCurrentRootInternal(): Promise<VscodeReliableKernelCutoverResult> {

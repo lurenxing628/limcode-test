@@ -138,12 +138,15 @@ export async function repairRuntimeHistory(paths: Paths, plan: RuntimeHistoryRep
       if (prior && historyRepairMarker(prior.journal.input).key !== marker.key) throw new Error('同一次修复的计划证据不一致。');
       // Preflight stays on a private copy before opening the maintenance Runtime.
       let current: RuntimeHistoryRepairInspection | undefined;
+      let applied = false;
       const copy = await createRuntimeDataSetDatabaseSnapshot(candidate, binding, { beforeOpen: async (file) => {
-        current = (await auditRuntimeSnapshot(file, { binding: binding as RootBinding, historyRepair: true })).historyRepair;
+        const audit = await auditRuntimeSnapshot(file, {
+          binding: binding as RootBinding, historyRepair: true, historyRepairInput: plan
+        });
+        applied = audit.historyRepairCommitted!;
+        current = audit.historyRepair;
       } });
-      let applied: boolean;
-      try { applied = historyRepairWasCommitted(copy.database, plan); }
-      finally { await copy.close(); }
+      await copy.close();
       const expectedResult = (alreadyApplied: boolean): RuntimeHistoryRepairResult => ({
         repairId: plan.repairId, removedOperations: plan.expected.orphanOperations,
         removedAttempts: plan.expected.orphanAttempts, restoredUnknownProcesses: plan.expected.restoredUnknownProcesses, alreadyApplied

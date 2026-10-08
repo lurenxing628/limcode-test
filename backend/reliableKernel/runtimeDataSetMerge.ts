@@ -302,6 +302,8 @@ export interface RuntimeDataSetIntoDatabaseOptions extends RuntimeDataSetMergeOp
   migration?: boolean;
   /** Objects an earlier online pre-copy verified ({@link precopyRuntimeDataSetCas}); unchanged ones are not hashed again. */
   casVerification?: RuntimeDataSetCasVerification;
+  /** Migration only: its caller's durable, journaled main+WAL rollback snapshot; the caller owns cleanup. */
+  migrationBackupPath?: string;
   /**
    * Migration only: all inserts (including locally derived authority) and exact before/after images
    * of updated handle state, right before the one transaction commits. The migration journals
@@ -551,7 +553,7 @@ interface TargetContext {
   identity: RuntimeDataSetIdentity;
   controlRoot: string;
   /** This batch's backup; `used` once a row transaction ran that is not proven rolled back. */
-  backup: { path?: string; used?: boolean };
+  backup: { path?: string; used?: boolean; callerOwned?: boolean };
 }
 
 class Outcome extends Error {
@@ -1101,6 +1103,9 @@ export async function mergeRuntimeDataSetIntoDatabase(
 ): Promise<RuntimeDataSetMergeResult> {
   const storagePaths = { globalStoragePath: path.resolve(paths.globalStoragePath) };
   const target = targetContext(targetInput);
+  if (options.migration && options.migrationBackupPath) {
+    target.backup = { path: options.migrationBackupPath, callerOwned: true };
+  }
   const candidate = await resolveVscodeRuntimeDataSet(storagePaths, input.candidateId);
   if (candidate.dataSetId !== input.expectedDataSetId || candidate.rootInstanceId !== input.expectedRootInstanceId) {
     throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '来源历史库的身份已变化，本次不合并。');
@@ -3497,11 +3502,10 @@ export function planMergeChunk(
     // Fence exactly the fields used for reuse, not target-only presentation facts or sequences.
     // Merely asserting the id would let an edit between planning and commit silently conflict.
     // Keep target values: equal decoded JSON can have a different key order in the source.
-    // The codec accepts a string JSON input as serialized text, so quote decoded scalar strings.
+    // Decoded assertions preserve scalar strings as values, alongside objects and arrays.
     sink.presence.push(repository.assert(id, current ? Object.fromEntries(schema.columns
       .filter((column) => column.name !== 'id' && column.name !== renumbered && !allowed?.has(column.name))
-      .map((column) => [column.name, column.json && typeof current[column.name] === 'string'
-        ? JSON.stringify(current[column.name]) : current[column.name]])) : {}, current ? { decoded: true } : {}));
+      .map((column) => [column.name, current[column.name]])) : {}, current ? { decoded: true } : {}));
     if (current) {
       const differences = schema.columns.map((column) => column.name)
         .filter((column) => column !== renumbered && !isDeepStrictEqual(row[column], current[column]));
@@ -3960,7 +3964,7 @@ async function settleTargetBackup(
   options: { keepUsed?: boolean; keep?: string } = {}
 ): Promise<void> {
   const backup = target.backup.path;
-  if (!backup) return;
+  if (!backup || target.backup.callerOwned) return;
   if (!target.backup.used) {
     target.backup = {};
     await fs.rm(backup, { recursive: true, force: true });

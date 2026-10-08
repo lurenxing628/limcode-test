@@ -162,29 +162,29 @@ export async function filterPhysicalConfigurationRoot(dataRootPathInput: string)
     const counts = entry.relativePath === 'settings'
       ? await filterConversationSettings(absolute)
       : await filterScopeLinkRecordStore(absolute, new Set(entry.preservedScopeKinds ?? []));
-    if (entry.relativePath === 'settings') await verifySettingsRoot(absolute);
     filteredRootCount += 1;
     keptRecordCount += counts.kept;
     removedRecordCount += counts.removed;
   }
-  await verifyPhysicalConfigurationRoot(dataRootPath);
+  await verifyPhysicalConfigurationRoot(dataRootPath, true);
   return { filteredRootCount, keptRecordCount, removedRecordCount };
 }
 
-export async function verifyPhysicalConfigurationRoot(dataRootPathInput: string): Promise<void> {
+export async function verifyPhysicalConfigurationRoot(dataRootPathInput: string, requireConversationFiltered = false): Promise<void> {
   const dataRootPath = normalizedAbsolutePath(dataRootPathInput, 'configuration root');
+  const readJson = configurationJsonReader();
   for (const entry of PHYSICAL_CUTOVER_MANIFEST.preserveWhole) {
     const absolute = entryPath(dataRootPath, entry.relativePath);
     if (!await exists(absolute)) continue;
     const stat = await fs.lstat(absolute);
-    if (stat.isDirectory() && await exists(path.join(absolute, INDEX_FILE))) await verifyRecordStore(absolute);
-    await verifyJsonTree(absolute);
+    if (stat.isDirectory() && await exists(path.join(absolute, INDEX_FILE))) await verifyRecordStore(absolute, readJson);
+    await verifyJsonTree(absolute, readJson);
   }
   for (const entry of PHYSICAL_CUTOVER_MANIFEST.filterByScope) {
     const absolute = entryPath(dataRootPath, entry.relativePath);
     if (!await exists(absolute)) continue;
-    if (entry.relativePath === 'settings') await verifySettingsRoot(absolute, false);
-    else await verifyRecordStore(absolute);
+    if (entry.relativePath === 'settings') await verifySettingsRoot(absolute, requireConversationFiltered, readJson);
+    else await verifyRecordStore(absolute, readJson);
   }
 }
 
@@ -419,6 +419,7 @@ async function filterManifestEntry(
     await verifySettingsRoot(sourcePath);
   } else {
     counts = await filterScopeLinkRecordStore(sourcePath, new Set(entry.preservedScopeKinds ?? []));
+    await verifyRecordStore(sourcePath);
   }
   step.state = 'replacement-created';
   step.replacementDigest = await treeDigest(sourcePath);
@@ -456,7 +457,6 @@ async function filterScopeLinkRecordStore(rootPath: string, preservedScopeKinds:
   });
   for (const relativeFile of removedFiles) await fs.rm(safeJoinedPath(rootPath, relativeFile), { force: true });
   await syncDirectory(path.join(rootPath, RECORDS_DIRECTORY));
-  await verifyRecordStore(rootPath);
   return { kept: kept.length, removed: removedFiles.length };
 }
 
@@ -478,17 +478,18 @@ async function filterConversationSettings(settingsRootPath: string): Promise<{ k
   return { kept: Math.max(0, entries.length - removed), removed };
 }
 
-async function verifySettingsRoot(settingsRootPath: string, requireConversationFiltered = true): Promise<void> {
+async function verifySettingsRoot(settingsRootPath: string, requireConversationFiltered = true,
+  readJson: ConfigurationJsonReader = configurationJsonReader()): Promise<void> {
   for (const relativePath of await listTreeFiles(settingsRootPath)) {
     if (!relativePath.toLowerCase().endsWith('.json')) continue;
-    JSON.parse(await fs.readFile(path.join(settingsRootPath, ...relativePath.split('/')), 'utf8'));
+    await readJson(path.join(settingsRootPath, ...relativePath.split('/')));
   }
   for (const section of PHYSICAL_CUTOVER_MANIFEST.settingsSections) {
     const sectionPath = entryPath(settingsRootPath, section.relativePath);
     if (!await exists(sectionPath)) continue;
     const stat = await fs.lstat(sectionPath);
-    if (stat.isDirectory() && await exists(path.join(sectionPath, INDEX_FILE))) await verifyRecordStore(sectionPath);
-    else if (stat.isFile() && sectionPath.toLowerCase().endsWith('.json')) JSON.parse(await fs.readFile(sectionPath, 'utf8'));
+    if (stat.isDirectory() && await exists(path.join(sectionPath, INDEX_FILE))) await verifyRecordStore(sectionPath, readJson);
+    else if (stat.isFile() && sectionPath.toLowerCase().endsWith('.json')) await readJson(sectionPath);
   }
   if (requireConversationFiltered) {
     for (const name of await fs.readdir(settingsRootPath)) {
@@ -502,13 +503,14 @@ async function verifySettingsRoot(settingsRootPath: string, requireConversationF
 
 async function capturePreservedEvidence(dataRootPath: string): Promise<Record<string, string>> {
   const evidence: Record<string, string> = {};
+  const readJson = configurationJsonReader();
   for (const entry of [...PHYSICAL_CUTOVER_MANIFEST.preserveWhole, ...PHYSICAL_CUTOVER_MANIFEST.externalPreserve]) {
     const absolute = entryPath(dataRootPath, entry.relativePath);
     if (!await exists(absolute)) continue;
     if (entry.disposition === 'preserve-whole') {
       const stat = await fs.lstat(absolute);
-      if (stat.isDirectory() && await exists(path.join(absolute, INDEX_FILE))) await verifyRecordStore(absolute);
-      await verifyJsonTree(absolute);
+      if (stat.isDirectory() && await exists(path.join(absolute, INDEX_FILE))) await verifyRecordStore(absolute, readJson);
+      await verifyJsonTree(absolute, readJson);
     }
     evidence[entry.id] = await treeDigest(absolute);
   }
@@ -613,7 +615,28 @@ function resultFromJournal(binding: RootBinding, journal: PhysicalCutoverJournal
   };
 }
 
-async function readRecordStore(rootPath: string, requireScope: boolean): Promise<{
+type ConfigurationJsonReader = (filePath: string) => Promise<unknown>;
+
+async function readConfigurationJson(filePath: string): Promise<unknown> {
+  return JSON.parse(await fs.readFile(filePath, 'utf8'));
+}
+
+/** Only one verification pass owns these parsed values; mutations start with a new reader. */
+function configurationJsonReader(): ConfigurationJsonReader {
+  const parsed = new Map<string, Promise<unknown>>();
+  return (filePath) => {
+    const file = path.resolve(filePath);
+    let value = parsed.get(file);
+    if (!value) {
+      value = readConfigurationJson(file);
+      parsed.set(file, value);
+    }
+    return value;
+  };
+}
+
+async function readRecordStore(rootPath: string, requireScope: boolean,
+  readJson: ConfigurationJsonReader = readConfigurationJson): Promise<{
   index: { schemaVersion: number; savedAt: string; records: Array<{ id: string; file: string; updatedAt: string }> };
   records: Map<string, { recordKey: string; record: Record<string, unknown> }>;
 } | undefined> {
@@ -623,7 +646,7 @@ async function readRecordStore(rootPath: string, requireScope: boolean): Promise
     if (await exists(recordRoot) && (await listJsonFiles(recordRoot)).length > 0) throw new Error(`Record store缺少index：${rootPath}`);
     return undefined;
   }
-  const rawIndex = requireRecord(JSON.parse(await fs.readFile(indexPath, 'utf8')), `Record store index ${rootPath}`);
+  const rawIndex = requireRecord(await readJson(indexPath), `Record store index ${rootPath}`);
   if (!Array.isArray(rawIndex.records) || typeof rawIndex.schemaVersion !== 'number' || typeof rawIndex.savedAt !== 'string') {
     throw new Error(`Record store index格式无效：${rootPath}`);
   }
@@ -636,7 +659,7 @@ async function readRecordStore(rootPath: string, requireScope: boolean): Promise
     ids.add(indexed.id);
     files.add(indexed.file);
     const absolute = safeJoinedPath(rootPath, indexed.file);
-    const rawFile = requireRecord(JSON.parse(await fs.readFile(absolute, 'utf8')), `Record file ${indexed.file}`);
+    const rawFile = requireRecord(await readJson(absolute), `Record file ${indexed.file}`);
     const payloadKeys = Object.keys(rawFile).filter((key) => key !== 'schemaVersion' && key !== 'savedAt');
     if (payloadKeys.length !== 1) throw new Error(`Record file payload key不唯一：${indexed.file}`);
     const recordKey = payloadKeys[0];
@@ -657,19 +680,19 @@ async function readRecordStore(rootPath: string, requireScope: boolean): Promise
   };
 }
 
-async function verifyRecordStore(rootPath: string): Promise<void> {
-  await readRecordStore(rootPath, false);
+async function verifyRecordStore(rootPath: string, readJson: ConfigurationJsonReader = readConfigurationJson): Promise<void> {
+  await readRecordStore(rootPath, false, readJson);
 }
 
-async function verifyJsonTree(rootPath: string): Promise<void> {
+async function verifyJsonTree(rootPath: string, readJson: ConfigurationJsonReader = readConfigurationJson): Promise<void> {
   const stat = await fs.lstat(rootPath);
   if (stat.isFile()) {
-    if (rootPath.toLowerCase().endsWith('.json')) JSON.parse(await fs.readFile(rootPath, 'utf8'));
+    if (rootPath.toLowerCase().endsWith('.json')) await readJson(rootPath);
     return;
   }
   if (!stat.isDirectory()) return;
   for (const relativePath of await listTreeFiles(rootPath)) {
-    if (relativePath.toLowerCase().endsWith('.json')) JSON.parse(await fs.readFile(path.join(rootPath, ...relativePath.split('/')), 'utf8'));
+    if (relativePath.toLowerCase().endsWith('.json')) await readJson(path.join(rootPath, ...relativePath.split('/')));
   }
 }
 

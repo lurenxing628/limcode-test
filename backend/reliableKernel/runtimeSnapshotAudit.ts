@@ -1,4 +1,5 @@
 import type { RuntimeHistoryRepairInspection } from './runtimeHistoryRepairInspection';
+import type { RuntimeHistoryRepairInput } from './runtimeHistoryRepairTransaction';
 import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { RootBinding } from './contracts';
@@ -34,6 +35,8 @@ export interface RuntimeSnapshotAuditRequest {
   indexBytes?: boolean;
   /** Explicit history repair planning; reads only, and never starts old work. */
   historyRepair?: boolean;
+  /** Re-entry checks its exact commit receipt before inspecting any repair candidates. */
+  historyRepairInput?: RuntimeHistoryRepairInput;
   /** Private SQLite index of skipped domain/id keys, used only by the unfinished-work recheck. */
   skippedRowsPath?: string;
 }
@@ -48,6 +51,7 @@ export interface RuntimeSnapshotAudit {
   summary?: RuntimeDataSetSummary;
   indexBytes?: number;
   historyRepair?: RuntimeHistoryRepairInspection;
+  historyRepairCommitted?: boolean;
 }
 
 /** @internal Worker protocol; plain data only. */
@@ -61,6 +65,7 @@ export interface RuntimeSnapshotAuditWorkerData {
   summary?: true;
   indexBytes?: true;
   historyRepair?: true;
+  historyRepairInput?: RuntimeHistoryRepairInput;
   skippedRowsPath?: string;
 }
 
@@ -92,6 +97,7 @@ export function auditRuntimeSnapshot(databasePath: string, request: RuntimeSnaps
     ...(request.summary ? { summary: true as const } : {}),
     ...(request.indexBytes ? { indexBytes: true as const } : {}),
     ...(request.historyRepair ? { historyRepair: true as const } : {}),
+    ...(request.historyRepairInput ? { historyRepairInput: request.historyRepairInput } : {}),
     ...(request.skippedRowsPath ? { skippedRowsPath: path.resolve(request.skippedRowsPath) } : {})
   };
   return new Promise((resolve, reject) => {

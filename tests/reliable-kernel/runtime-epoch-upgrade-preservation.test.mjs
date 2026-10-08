@@ -193,6 +193,146 @@ test('a deep Runtime path upgrades with a durable backup and opens the preserved
   }
 });
 
+test('an offline upgrade audits unchanged source and new backup once and uses one checked checkpoint', async (t) => {
+  const fixture = await createPublishedRuntime(5);
+  const checks = [];
+  const pragma = Database.prototype.pragma;
+  t.mock.method(Database.prototype, 'pragma', function (sql, ...args) {
+    if (['quick_check', 'foreign_key_check', 'wal_checkpoint(TRUNCATE)'].includes(sql)) {
+      checks.push({ file: this.name, sql });
+    }
+    return pragma.call(this, sql, ...args);
+  });
+  try {
+    const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
+    const sourceChecks = checks.filter(({ file }) => file === kernel.toSqliteFilePath(fixture.paths.databasePath)).map(({ sql }) => sql);
+    assert.equal(sourceChecks.filter(sql => sql === 'quick_check').length, 1);
+    assert.equal(sourceChecks.filter(sql => sql === 'foreign_key_check').length, 2,
+      'the source audit and post-mutation constraint check remain');
+    assert.equal(sourceChecks.filter(sql => sql === 'wal_checkpoint(TRUNCATE)').length, 1);
+    const backupChecks = checks.filter(({ file }) => file.startsWith(kernel.toSqliteFilePath(result.backupPath))).map(({ sql }) => sql);
+    assert.deepEqual(backupChecks, ['quick_check', 'foreign_key_check']);
+    assert.equal(result.binding.runtimeKernelEpoch, 6);
+  } finally {
+    t.mock.restoreAll();
+    await fs.rm(fixture.cleanupRoot, { recursive: true, force: true });
+  }
+});
+
+test('migration still refuses writer schema drift after its source audit and backup', async () => {
+  const fixture = await createPublishedRuntime(4);
+  try {
+    const pointer = await fs.readFile(fixture.paths.rootPointerPath);
+    await assert.rejects(kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority, {
+      onFaultPoint: (point) => {
+        if (point !== 'after-backup') return;
+        const database = new Database(fixture.paths.databasePath);
+        try {
+          database.prepare("UPDATE schema_manifest SET client_mapping = 'detail' WHERE domain_key = 'Conversation'").run();
+        } finally { database.close(); }
+      }
+    }), error => error?.code === 'runtime-epoch-migration-failed'
+      && error.cause?.code === 'runtime-epoch-migration-schema-mismatch');
+    assert.deepEqual(await fs.readFile(fixture.paths.rootPointerPath), pointer);
+    const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(database.prepare('SELECT runtime_kernel_epoch FROM root_binding').get().runtime_kernel_epoch, 4);
+      assert.equal(database.prepare('SELECT count(*) AS n FROM conversation').get().n, 1);
+    } finally { database.close(); }
+  } finally { await fs.rm(fixture.cleanupRoot, { recursive: true, force: true }); }
+});
+
+test('legacy child continuations publish and reuse their shared preset once', async (t) => {
+  const fixture = await createPublishedRuntime(3, { continuationCount: 3 });
+  const presetBytes = Buffer.from(kernel.canonicalPlainJson({ kind: 'runtime_continuation' }));
+  const link = fs.link;
+  let publications = 0;
+  t.mock.method(fs, 'link', async (...args) => {
+    if (typeof args[1] === 'string' && args[1].startsWith(`${fixture.paths.casRootPath}${path.sep}`)) {
+      if ((await fs.readFile(args[0])).equals(presetBytes)) publications += 1;
+    }
+    return link.apply(fs, args);
+  });
+  try {
+    await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
+    assert.equal(publications, 1);
+    const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      const presets = fixture.legacyContinuations.map(({ ids }) => database.prepare(
+        'SELECT preset_object_id FROM turn_execution_preset_revision WHERE id = ?'
+      ).get(ids.presetRevisionId).preset_object_id);
+      assert.equal(new Set(presets).size, 1);
+      for (const { ids, deliveryId } of fixture.legacyContinuations) {
+        assert.equal(database.prepare('SELECT delivery_id FROM runtime_delivery_intent_link WHERE id = ?')
+          .get(ids.deliveryIntentLinkId).delivery_id, deliveryId);
+      }
+    } finally { database.close(); }
+  } finally {
+    t.mock.restoreAll();
+    await fs.rm(fixture.cleanupRoot, { recursive: true, force: true });
+  }
+});
+
+test('an interrupted child-continuation migration reuses loose CAS without rewriting bodies or creating packed storage', async (t) => {
+  const fixture = await createPublishedRuntime(3);
+  const presetBytes = Buffer.from(kernel.canonicalPlainJson({ kind: 'runtime_continuation' }));
+  const link = fs.link;
+  try {
+    t.mock.method(fs, 'link', async (...args) => {
+      const isPreset = typeof args[1] === 'string'
+        && args[1].startsWith(`${fixture.paths.casRootPath}${path.sep}`)
+        && (await fs.readFile(args[0])).equals(presetBytes);
+      const result = await link.apply(fs, args);
+      if (isPreset) throw new Error('interrupted after publishing the loose preset');
+      return result;
+    });
+    await assert.rejects(kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority),
+      error => error?.cause?.message === 'interrupted after publishing the loose preset');
+    t.mock.restoreAll();
+    const open = fs.open;
+    let temporaryWrites = 0;
+    t.mock.method(fs, 'open', async (...args) => {
+      if (typeof args[0] === 'string' && args[0].startsWith(`${fixture.paths.casRootPath}${path.sep}tmp${path.sep}`)
+        && args[1] === 'wx') temporaryWrites += 1;
+      return open.apply(fs, args);
+    });
+    const result = await kernel.migratePreviousRuntimeEpochIfRequired(fixture.authority);
+    assert.equal(temporaryWrites, 0, 'already published immutable bodies are verified and reused');
+    assert.equal(result.binding.runtimeKernelEpoch, 6);
+    await assert.rejects(fs.stat(path.join(fixture.paths.casRootPath, 'limcode.cas-small.sqlite')),
+      error => error?.code === 'ENOENT');
+    const database = new Database(fixture.paths.databasePath, { readonly: true, fileMustExist: true });
+    try {
+      assert.equal(database.prepare('SELECT delivery_id FROM runtime_delivery_intent_link WHERE id = ?')
+        .get(fixture.legacyContinuation.ids.deliveryIntentLinkId).delivery_id, fixture.legacyContinuation.deliveryId);
+    } finally { database.close(); }
+  } finally {
+    t.mock.restoreAll();
+    await fs.rm(fixture.cleanupRoot, { recursive: true, force: true });
+  }
+});
+
+test('ordinary current-root startup validates its schema once inside the admission window', async (t) => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-current-root-validation-'));
+  const authority = new kernel.RootAuthority(() => path.join(root, '.limcode-runtime', 'active'));
+  try {
+    const binding = await kernel.initializeEmptyRuntimeRoot(authority);
+    const prepare = Database.prototype.prepare;
+    let manifestReads = 0;
+    t.mock.method(Database.prototype, 'prepare', function (sql) {
+      if (this.name === kernel.toSqliteFilePath(binding.paths.databasePath) && /FROM schema_manifest/.test(sql)) manifestReads += 1;
+      return prepare.call(this, sql);
+    });
+    const result = await new VscodeReliableKernelCutoverCoordinator(authority, root).ensureCurrentRoot();
+    assert.equal(manifestReads, 1);
+    assert.equal(result.binding.dataSetId, binding.dataSetId);
+    assert.equal(result.initialized, false);
+  } finally {
+    t.mock.restoreAll();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 for (const oldState of ['pending-only', 'backed-up']) test(
   `an interrupted published 3→4 ${oldState} state recovers and continues to epoch 6`, async () => {
     const fixture = await createPublishedRuntime(3);
@@ -1014,9 +1154,21 @@ async function createPublishedRuntime(previousEpoch, options = {}) {
         position: 0n, created_at: '2026-09-01T00:00:00.000Z'
       })
     ]);
-    const legacyContinuation = !options.omitLegacyContinuation && (previousEpoch === 3 || options.missingDeliveryLink)
-      ? await seedLegacyChildRuntimeContinuation(runtime, store, conversationId, String(previousEpoch))
-      : undefined;
+    const legacyContinuations = [];
+    if (!options.omitLegacyContinuation && (previousEpoch === 3 || options.missingDeliveryLink)) {
+      for (let index = 0; index < (options.continuationCount ?? 1); index++) {
+        const childConversationId = index === 0 ? conversationId : `${conversationId}_continuation_${index}`;
+        if (index !== 0) await runtime.transaction([
+          kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+            id: childConversationId, title: `旧子任务 ${index}`, status: 'active',
+            created_at: '2026-09-01T00:00:00.000Z', updated_at: '2026-09-01T00:00:00.000Z'
+          })
+        ]);
+        legacyContinuations.push(await seedLegacyChildRuntimeContinuation(runtime, store, childConversationId,
+          index === 0 ? String(previousEpoch) : `${previousEpoch}_${index}`));
+      }
+    }
+    const legacyContinuation = legacyContinuations[0];
     await runtime.close();
     runtime = undefined;
 
@@ -1064,7 +1216,7 @@ async function createPublishedRuntime(previousEpoch, options = {}) {
     await fs.writeFile(settingsPath, 'keep-settings');
     await fs.writeFile(workspacePath, 'keep-workspace');
     return { scope, cleanupRoot, authority, paths: binding.paths, previous, conversationId, title, message,
-      contentId: content.id, settingsPath, workspacePath, legacyContinuation,
+      contentId: content.id, settingsPath, workspacePath, legacyContinuation, legacyContinuations,
       ...(attachmentContent ? { attachment: { id: attachmentId, content: attachmentContent, bytes: attachmentBytes } } : {}) };
   } catch (error) {
     await runtime?.close().catch(() => undefined);

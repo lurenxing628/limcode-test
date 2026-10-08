@@ -10,6 +10,7 @@
 //   aside-after                 after the copied directory was renamed aside (before the staging record)
 //   staging-marker-after        after the staging record was written
 //   dbbackup-before-rename      offline copy of the receiving database complete, before its rename
+//   dbbackup-journal-after     rollback snapshot's database entry appended, synced and closed
 //   selection-after             after the selection file is written (fresh root)
 //   identity-after              after the identity file is written
 //   complete-marker-after       after the completion record is written (before the moved notice)
@@ -58,12 +59,18 @@ function installHooks() {
         const handle = await open.call(this, file, flags, ...rest);
         const close = handle.close.bind(handle);
         const append = handle.appendFile.bind(handle);
+        let databaseEntry = false;
         handle.appendFile = async (data, ...more) => {
+          databaseEntry = String(data).includes('"op":"database"');
           if (point === 'count') log(`append #${index}: ${String(data).trim()}`);
+          if (point === 'during-merge' && phase === 'relocate' && kind === 'limcode' && String(data).includes('"op":"merging"')) {
+            kill('merge (rows journaled, before the row commit)');
+          }
           return append(data, ...more);
         };
         handle.close = async () => {
           await close();
+          if (point === 'dbbackup-journal-after' && databaseEntry) kill('receiving rollback snapshot journaled durably');
           if (point === 'journal-after' && index === nth) kill(`after journal append #${index}`);
         };
         return handle;
@@ -75,7 +82,7 @@ function installHooks() {
   let markerWrites = 0;
   fsp.rename = async function hookedRename(from, to, ...rest) {
     const toName = typeof to === 'string' ? path.basename(to) : '';
-    if (point === 'dbbackup-before-rename' && typeof to === 'string' && /[\\/]database-[0-9a-f]{16}$/.test(to)) kill('receiving database backup rename');
+    if (point === 'dbbackup-before-rename' && typeof to === 'string' && path.basename(to) === 'database-receiving') kill('receiving database backup rename');
     const result = await rename.call(this, from, to, ...rest);
     if (point === 'aside-after' && typeof to === 'string' && to.includes('.limcode-copied-')) kill('copied data renamed aside');
     if (toName === MARKER && phase === 'recover' && point === 'undo-marked') kill('undo: record marked undoing');
@@ -100,13 +107,6 @@ function installHooks() {
       kill('undo: receiving database renamed back');
     }
     return result;
-  };
-  const mkdir = fsp.mkdir;
-  fsp.mkdir = async function hookedMkdir(directory, ...rest) {
-    if (point === 'during-merge' && phase === 'relocate' && typeof directory === 'string' && directory.startsWith(target) && directory.includes('merge-backups')) {
-      kill('merge (target backup, before the row commit)');
-    }
-    return mkdir.call(this, directory, ...rest);
   };
   const rm = fsp.rm;
   fsp.rm = async function hookedRm(file, ...rest) {

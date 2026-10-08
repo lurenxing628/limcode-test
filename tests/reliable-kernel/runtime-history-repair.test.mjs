@@ -17,6 +17,9 @@ const { runtimeDataSetFileState } = kernelFile('runtimeDataSetFacts.js');
 const { runtimeDataSetContentDigest } = kernelFile('runtimeDataSetContent.js');
 const { withRuntimeMaintenance, withRuntimeDataRootAdmission } = kernelFile('runtimeHostControl.js');
 const { RuntimeDatabase } = kernelFile('runtimeDatabase.js');
+const { auditRuntimeSnapshot } = kernelFile('runtimeSnapshotAudit.js');
+const { createRuntimeDataSetDatabaseSnapshot } = kernelFile('runtimeStorageInspection.js');
+const { resolveVscodeRuntimeDataSet } = kernelFile('vscodeRootAuthority.js');
 
 function sql(dataSet, read) {
   const db = new Database(dataSet.binding.paths.databasePath, { readonly: true });
@@ -91,6 +94,19 @@ test('只读盘点、完整备份、精确修复、保护所有非修复记录�
   });
   assert.equal(await casDigest(f), cas);
   const after = readAll(f.alpha);
+  await withRuntimeDataRootAdmission(f.root, () => withRuntimeMaintenance(f.alpha.binding.paths, async () => {
+    let audit;
+    const candidate = await resolveVscodeRuntimeDataSet(f.paths, f.alpha.id);
+    const snapshot = await createRuntimeDataSetDatabaseSnapshot(candidate, f.alpha.binding, {
+      beforeOpen: async (file) => {
+        audit = await auditRuntimeSnapshot(file, { binding: f.alpha.binding, historyRepair: true, historyRepairInput: plan });
+      }
+    });
+    try {
+      assert.equal(audit.historyRepairCommitted, true);
+      assert.equal(audit.historyRepair, undefined, '已提交计划只查权威标记，不再次扫描修复候选或计算全库摘要');
+    } finally { await snapshot.close(); }
+  }));
   const again = await repairRuntimeHistory(f.paths, plan);
   assert.equal(again.result.alreadyApplied, true);
   assert.deepEqual(readAll(f.alpha), after);

@@ -1,4 +1,5 @@
 import { inspectHistoryRepair } from './runtimeHistoryRepairInspection';
+import { historyRepairWasCommitted } from './runtimeHistoryRepairTransaction';
 import { attachRuntimeStatementCache, detachRuntimeStatementCache } from './runtimeStatementCache';
 import { parentPort, workerData } from 'node:worker_threads';
 import Database from 'better-sqlite3';
@@ -40,7 +41,8 @@ function audit(input: RuntimeSnapshotAuditWorkerData): RuntimeSnapshotAudit {
     if (!input.skipIntegrity) auditDatabaseIntegrity(database);
     attachRuntimeStatementCache(database);
     const result: RuntimeSnapshotAudit = {};
-    if (input.historyRepair) result.historyRepair = inspectHistoryRepair(database);
+    if (input.historyRepairInput) result.historyRepairCommitted = historyRepairWasCommitted(database, input.historyRepairInput);
+    if (input.historyRepair && !result.historyRepairCommitted) result.historyRepair = inspectHistoryRepair(database);
     if (input.contentDigest) result.contentDigest = runtimeDataSetContentDigest(database);
     if (input.summary) result.summary = readRuntimeDataSetSummary(database);
     if (input.indexBytes) result.indexBytes = measuredIndexBytes(database);

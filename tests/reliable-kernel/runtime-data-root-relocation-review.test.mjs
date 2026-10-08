@@ -2,13 +2,14 @@
 // and the temporary row limit), each as the behaviour it must have.
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import {
   compiled, conversationIds, createFixture, relocationIdIn, createLimCodeTarget, Database, deleteAsConfirmed, indexIds, initialize, kernelFile, openRuntime,
-  planWithRuntime, PROJECT, relocate, relocation, renameConversation, RootAuthority, rootAuthority, seed, selectedDataSet, treeSnapshot,
+  planWithRuntime, NOW, PROJECT, relocate, relocation, renameConversation, repo, RootAuthority, rootAuthority, seed, selectedDataSet, treeSnapshot,
   writeRecordStore
 } from './runtime-data-root-relocation-fixture.mjs';
 
@@ -123,6 +124,110 @@ test('R4/#8 已有 LimCode 目标在合并提交后失败：用迁移自己的�
   try {
     assert.equal(database.prepare("SELECT title FROM conversation WHERE id = 'conversation_current_1'").pluck().get(), '改过的标题');
   } finally { database.close(); }
+});
+
+test('已有目标迁移复用预复制正文校验和唯一持久备份；备份包含迁移前记录并由迁移收尾', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const target = path.join(fixture.base, 'existing');
+  const existing = await createLimCodeTarget(target);
+  const uncheckpointed = path.join(fixture.base, 'uncheckpointed-target');
+  await fs.mkdir(uncheckpointed);
+  const receiving = await openRuntime(existing);
+  try {
+    await receiving.transaction([repo('Conversation').insert({
+      id: 'conversation_only_in_wal', title: 'only in WAL', status: 'active', created_at: NOW, updated_at: NOW
+    })]);
+    for (const suffix of ['', '-wal']) await fs.copyFile(`${existing.binding.paths.databasePath}${suffix}`, path.join(uncheckpointed, `limcode.sqlite${suffix}`));
+  } finally { await receiving.close(); }
+  for (const suffix of ['-wal', '-shm']) await fs.rm(`${existing.binding.paths.databasePath}${suffix}`, { force: true });
+  for (const suffix of ['', '-wal']) await fs.copyFile(path.join(uncheckpointed, `limcode.sqlite${suffix}`), `${existing.binding.paths.databasePath}${suffix}`);
+  const plan = await planWithRuntime(fixture, target);
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await relocation.stageDataRootRelocation(plan, source); }
+  finally { await source.close(); }
+  const targetCas = path.resolve(existing.binding.paths.casRootPath);
+  const precopiedFiles = [...staged.precopied.verification.keys()].filter((file) => file.startsWith(`${targetCas}${path.sep}`));
+  assert.ok(precopiedFiles.length > 0, '预复制已有正文文件校验记录');
+  const streamed = [];
+  const stream = fsSync.createReadStream;
+  const copy = fs.copyFile;
+  const runtimeBackup = kernelFile('runtimeDatabase.js').RuntimeDatabase.prototype.backupTo;
+  const receivingPath = path.resolve(existing.binding.paths.databasePath);
+  const originalMain = await fs.readFile(receivingPath);
+  const originalWal = await fs.readFile(`${receivingPath}-wal`).catch((error) => { if (error.code === 'ENOENT') return undefined; throw error; });
+  assert.ok(originalWal?.length > 0, '前提：目标有只在 WAL 里的已提交记录');
+  let receivingCopies = 0;
+  fsSync.createReadStream = function (file, ...options) {
+    if (precopiedFiles.includes(String(file))) streamed.push(String(file));
+    return stream.call(this, file, ...options);
+  };
+  fs.copyFile = function (from, destination, ...options) {
+    if (path.resolve(String(from)) === receivingPath && String(destination).includes(relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY)) receivingCopies += 1;
+    return copy.call(this, from, destination, ...options);
+  };
+  kernelFile('runtimeDatabase.js').RuntimeDatabase.prototype.backupTo = function (destination) {
+    assert.notEqual(path.resolve(this.binding.paths.dataRootPath), path.resolve(existing.binding.paths.dataRootPath),
+      '合并引擎必须复用迁移已持久化的备份，不再创建第二份');
+    return runtimeBackup.call(this, destination);
+  };
+  let result;
+  try { result = await relocation.completeDataRootRelocation(staged, async () => undefined); }
+  finally {
+    fsSync.createReadStream = stream;
+    fs.copyFile = copy;
+    kernelFile('runtimeDatabase.js').RuntimeDatabase.prototype.backupTo = runtimeBackup;
+  }
+  assert.deepEqual(streamed, [], '文件身份没变的预复制正文不再全读算摘要');
+  assert.equal(receivingCopies, 1, '迁移前目标数据库文件只复制一次');
+  const backupPath = path.join(target, relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, staged.relocationId, 'database-receiving');
+  assert.equal(result.merged.backupPath, backupPath);
+  const backupFiles = originalWal === undefined ? ['limcode.sqlite'] : ['limcode.sqlite', 'limcode.sqlite-wal'];
+  assert.deepEqual(await fs.readdir(backupPath), backupFiles, '撤销副本保留原来实际存在的 main/WAL 文件');
+  assert.deepEqual(await fs.readFile(path.join(backupPath, 'limcode.sqlite')), originalMain, '原数据库物理字节完整保留');
+  if (originalWal !== undefined) assert.deepEqual(await fs.readFile(path.join(backupPath, 'limcode.sqlite-wal')), originalWal, '原 WAL 物理字节完整保留');
+  // Inspect a private readonly copy: opening a WAL-mode database may create empty WAL/SHM even
+  // in readonly mode, so the production rollback snapshot itself must not be opened by this test.
+  const inspection = path.join(fixture.base, 'inspect-rollback');
+  await fs.mkdir(inspection);
+  for (const file of backupFiles) await fs.copyFile(path.join(backupPath, file), path.join(inspection, file));
+  const saved = new Database(path.join(inspection, 'limcode.sqlite'), { readonly: true, fileMustExist: true });
+  try { assert.deepEqual(saved.prepare('SELECT id FROM conversation ORDER BY id').pluck().all(), ['conversation_existing_1', 'conversation_only_in_wal']); }
+  finally { saved.close(); }
+  assert.deepEqual(await fs.readdir(backupPath), backupFiles, '只读检查不向撤销副本添加 WAL/SHM');
+  await relocation.finalizeDataRootRelocation(target);
+  await assert.rejects(fs.stat(backupPath), { code: 'ENOENT' }, '迁移收尾统一清理自己的撤销副本');
+});
+
+test('迁移预检不计算未复制删除记录的摘要，撤销在一次准入内只读取一次日志', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const { recordRuntimeDeletedConversations } = kernelFile('runtimeMergeTombstones.js');
+  await recordRuntimeDeletedConversations(fixture.root, fixture.current.binding, ['conversation_deleted_before_relocation']);
+  const target = path.join(fixture.base, 'moved');
+  const stream = fsSync.createReadStream;
+  const hashes = [];
+  fsSync.createReadStream = function (file, ...options) {
+    if (String(file).includes(`${path.sep}deleted-conversations${path.sep}`)) hashes.push(String(file));
+    return stream.call(this, file, ...options);
+  };
+  let plan;
+  try { plan = await planWithRuntime(fixture, target); }
+  finally { fsSync.createReadStream = stream; }
+  assert.deepEqual(plan.problems, []);
+  assert.deepEqual(hashes, [], '目标缺少记录时，预检只校验记录格式，不计算丢弃的复制摘要');
+  const source = await openRuntime(fixture.current);
+  let staged;
+  try { staged = await relocation.stageDataRootRelocation(plan, source); }
+  finally { await source.close(); }
+  const read = fs.readFile;
+  let journalReads = 0;
+  fs.readFile = function (file, ...options) {
+    if (path.basename(String(file)) === 'journal.jsonl') journalReads += 1;
+    return read.call(this, file, ...options);
+  };
+  try { await relocation.abandonStagedDataRootRelocation(staged); }
+  finally { fs.readFile = read; }
+  assert.equal(journalReads, 1, '离线判断、变化检查与撤销复用同一份日志');
 });
 
 test('R5 全局规则（AGENTS.md / CLAUDE.md）和全局技能（skills/）随迁移复制并在预检里写明；删除旧目录时按摘要认定', async (t) => {

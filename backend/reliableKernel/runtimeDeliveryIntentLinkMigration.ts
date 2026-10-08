@@ -1,14 +1,14 @@
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import Database from 'better-sqlite3';
-import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
 import { isPathBelow } from '../capabilities/filesystem/pathContainment';
 import { storageKeyForDigest } from './contentAddressedStore';
 import {
   runtimeContinuationTurnIntentEnvelope
 } from './guidanceIntent';
 import { canonicalPlainJson } from './plainJson';
+import { publishLooseCasBatch } from './looseCasObjectPublication';
 import {
   CHILD_RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE,
   TURN_EXECUTION_PRESET_CONTENT_TYPE,
@@ -122,6 +122,7 @@ export async function migrateChildRuntimeDeliveryIntentLinks(
   }) as ChildContinuationCandidate[];
 
   const seenIntentIds = new Set<string>();
+  let currentPreset: ContentMetadata | undefined;
   let migrated = 0;
   for (const candidate of candidates) {
     const intentId = requireText(candidate.turn_intent_id, 'TurnIntent.id');
@@ -176,14 +177,16 @@ export async function migrateChildRuntimeDeliveryIntentLinks(
         CHILD_RUNTIME_DELIVERY_CONTINUATION_CONTENT_TYPE,
         createdAt
       );
-      const currentPreset = await publishMigrationContent(
-        content,
-        canonicalPlainJson({ kind: CURRENT_RUNTIME_CONTINUATION_KIND }),
-        TURN_EXECUTION_PRESET_CONTENT_TYPE,
-        createdAt
-      );
+      if (!currentPreset) {
+        currentPreset = await publishMigrationContent(
+          content,
+          canonicalPlainJson({ kind: CURRENT_RUNTIME_CONTINUATION_KIND }),
+          TURN_EXECUTION_PRESET_CONTENT_TYPE,
+          createdAt
+        );
+        ensureContentObject(database, currentPreset);
+      }
       ensureContentObject(database, currentIntent);
-      ensureContentObject(database, currentPreset);
       const intentUpdate = database.prepare(`
         UPDATE turn_intent_revision
            SET content_object_id = @contentObjectId
@@ -407,38 +410,11 @@ export async function publishCasFile(casRootPath: string, storageKey: string, by
   if (storageKey !== storageKeyForDigest(sha256) || createHash('sha256').update(bytes).digest('hex') !== sha256) {
     throw new Error(`Migration CAS object ${sha256} does not match its storage key.`);
   }
-  const targetPath = safeCasPath(casRootPath, storageKey);
-  const digestRoot = path.join(casRootPath, 'sha256');
-  const digestPrefix = path.dirname(targetPath);
-  const temporaryRoot = path.join(casRootPath, 'tmp');
-  await fs.mkdir(temporaryRoot, { recursive: true, mode: 0o700 });
-  await fs.mkdir(digestPrefix, { recursive: true, mode: 0o700 });
-  const temporaryPath = path.join(temporaryRoot, `${process.pid}-${randomUUID()}.migration.tmp`);
-  const handle = await fs.open(temporaryPath, 'wx', 0o600);
-  try {
-    await handle.writeFile(bytes);
-    await handle.sync();
-  } finally {
-    await handle.close();
-  }
-  try {
-    try {
-      await fs.link(temporaryPath, targetPath);
-    } catch (error) {
-      if (!isAlreadyExists(error)) throw error;
-      const existing = await fs.readFile(targetPath);
-      if (
-        existing.byteLength !== bytes.byteLength
-        || createHash('sha256').update(existing).digest('hex') !== sha256
-      ) throw new Error(`Existing migration CAS object ${sha256} has conflicting bytes.`);
-    }
-    await syncDirectoryDurably(digestPrefix);
-    await syncDirectoryDurably(digestRoot);
-  } finally {
-    await fs.rm(temporaryPath, { force: true });
-    await syncDirectoryDurably(temporaryRoot);
-    await syncDirectoryDurably(casRootPath);
-  }
+  // Published predecessors and private overlays use loose CAS only. Share the exact-byte
+  // publication and durability path without initializing packed CAS during their upgrade.
+  await publishLooseCasBatch(casRootPath, [{
+    object: { sha256, byte_length: BigInt(bytes.byteLength), storage_key: storageKey }, bytes
+  }], () => undefined);
 }
 
 function ensureContentObject(database: Database.Database, metadata: ContentMetadata): void {
@@ -531,8 +507,4 @@ function requireIntegerOne(value: unknown, label: string): void {
 function normalizedAbsolutePath(value: string, label: string): string {
   if (!path.isAbsolute(value) || path.resolve(value) !== value) throw new TypeError(`${label} must be a normalized absolute path.`);
   return value;
-}
-
-function isAlreadyExists(error: unknown): boolean {
-  return (error as NodeJS.ErrnoException)?.code === 'EEXIST';
 }

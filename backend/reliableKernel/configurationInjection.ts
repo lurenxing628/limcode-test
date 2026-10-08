@@ -279,6 +279,7 @@ async function moveVerified(sourcePath: string, destinationPath: string, expecte
     if ((error as NodeJS.ErrnoException)?.code !== 'EXDEV') throw error;
     await copyVerified(sourcePath, destinationPath, expectedDigest);
     await fs.rm(sourcePath, { recursive: true, force: true });
+    return;
   }
   if (await treeDigest(destinationPath) !== expectedDigest) throw new Error('配置move摘要不一致。');
 }
