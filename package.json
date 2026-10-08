@@ -24,6 +24,7 @@
   ],
   "contributes": {
     "commands": [
+      { "command": "limcode-test.mergeAllRuntimeHistory", "title": "Limcode Test: 立即合并全部", "category": "Limcode Test" },
       {
         "command": "limcode-test.manageRuntimeDataSets",
         "title": "Limcode Test: 历史与存储管理",

@@ -213,28 +213,10 @@ test('以前的数据目录里的归档注明来源（连续迁移后不止上�
   assert.equal(items[0].label, '归档（以前的数据目录里） · 20260901-010203-004-abcdef12');
 });
 
-test('启动发现：新条目只提示一次，之后再出现的新条目另行提示；“查看”打开外来历史库列表', async () => {
-  const one = { id: 'foreign:archive:aaaaaaaaaaaaaaaa' };
-  const two = { id: 'foreign:copied:bbbbbbbbbbbbbbbb' };
-  const f = fixture({ discovered: [[one, two], [one, two], [one, two, { id: 'foreign:copied:cccccccccccccccc' }]], infos: [undefined, '查看'], picks: [undefined] });
+test('启动外来发现不重复发送旧通知，由收敛登记统一通知', async () => {
+  const f = fixture({ discovered: [[{ id: 'foreign:archive:aaaaaaaaaaaaaaaa' }]] });
   await f.command.announceForeignRuntimeHistoryOnStartup(f.context);
-  await f.command.announceForeignRuntimeHistoryOnStartup(f.context);
-  await f.command.announceForeignRuntimeHistoryOnStartup(f.context);
-  for (let turn = 0; turn < 100 && !f.calls.some((call) => call[0] === 'inspect'); turn += 1) await new Promise((resolve) => setImmediate(resolve));
-  const infos = f.calls.filter((call) => call[0] === 'info');
-  assert.equal(infos.length, 2);
-  assert.match(infos[0][1], /^发现 2 个外来历史库/);
-  assert.match(infos[0][1], /可以在“历史与存储管理 → 外来历史库”里核验，核验通过的可以只读查看，也可以选择合并进当前库（不会自动合并）。原数据保持原样。/,
-    '按发现计数，只承诺核验通过的可以查看和由用户选择合并');
-  assert.match(infos[1][1], /^发现 1 个外来历史库/);
-  assert.deepEqual(f.calls.find((call) => call[0] === 'discover'), ['discover', {
-    paths: { globalStoragePath: ROOT }, configurationRootPath: ROOT, previousDataRootPaths: ['/old/limcode', '/older/limcode']
-  }]);
-  assert.ok(!f.calls.some((call) => call[0] === 'status'), '都还有归档或拷来的目录：列表不变');
-  assert.equal(f.calls.filter((call) => call[0] === 'inspect').length, 1, '点“查看”才核验');
-  const stale = fixture({ discovered: [[one]] });
-  await stale.command.announceForeignRuntimeHistoryOnStartup(stale.context, () => false);
-  assert.equal(stale.calls.some((call) => call[0] === 'info'), false, '窗口已换了运行时就不提示');
+  assert.equal(f.calls.some(call => call[0] === 'info' || call[0] === 'inspect'), false);
 });
 
 test('最后一轮 #5 启动发现之后，里面已经没有归档也没有拷来目录的旧数据目录从列表里去掉（由后端保守判定），其它照旧', async () => {

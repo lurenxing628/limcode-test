@@ -9,6 +9,7 @@ export const EXTENSION_COMMAND_IDS = {
   revealGlobalStorage: 'limcode-test.revealGlobalStorage',
   inspectReliability: 'limcode-test.inspectReliability',
   manageRuntimeDataSets: 'limcode-test.manageRuntimeDataSets',
+  mergeAllRuntimeHistory: 'limcode-test.mergeAllRuntimeHistory',
   resetDevelopmentData: 'limcode-test.resetDevelopmentData',
   relocateDataRoot: 'limcode-test.relocateDataRoot',
   returnToPreviousDataRoot: 'limcode-test.returnToPreviousDataRoot',

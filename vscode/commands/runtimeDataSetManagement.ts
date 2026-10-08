@@ -1,3 +1,7 @@
+import { settleHistoricalMergeSourceOffline } from '../../backend/application/reliableKernel/historicalMergeSettlement';
+import { registerRuntimeHistoryConvergence } from '../../backend/reliableKernel/runtimeHistoryConvergence';
+import { readRuntimeHistoryPending } from '../../backend/reliableKernel/runtimeHistoryRegistry';
+import { manageRuntimeHistoryResiduals } from './runtimeHistoryResiduals';
 import { inspectRuntimeHistoryRepair, repairRuntimeHistory } from '../../backend/reliableKernel/runtimeHistoryRepair';
 import { historyRepairCount } from '../../backend/reliableKernel/runtimeHistoryRepairInspection';
 import type { RuntimeWriteGate } from '../../backend/application/reliableKernel/runtimeWriteGate';
@@ -32,7 +36,7 @@ import {
 } from '../../backend/reliableKernel/runtimeLargeMergeSession';
 import type { ApplicationStartup } from '../ApplicationStartup';
 import { canStartRuntimeDataSetUpgrade, runRuntimeDataSetUpgrade } from '../runtimeDataSetUpgradeLifetime';
-import { runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
+import { requesterWorkBusy, runWithExclusiveMaintenance } from '../runtimeExclusiveMaintenance';
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 import { manageForeignRuntimeHistory } from './foreignRuntimeHistory';
 import {
@@ -147,7 +151,7 @@ function formatActivity(value: string): string {
 
 function isPublishedOldDataSet(candidate: VscodeRuntimeDataSetCandidate): boolean {
   return candidate.runtimeKernelEpoch === 3 || candidate.runtimeKernelEpoch === 4
-    || candidate.runtimeKernelEpoch === 5 || candidate.runtimeKernelEpoch === 6;
+    || candidate.runtimeKernelEpoch === 5;
 }
 
 /**
@@ -220,8 +224,11 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   if (!canStartRuntimeDataSetUpgrade(context)) return;
   // Sources waiting for the large merge session, as this window's last batch measured them (nothing is read here).
   const waiting = await largeMergeEngine().waiting(pathsFor(context)).catch(() => [] as LargeMergeWaitingSource[]);
+  const pending = await readRuntimeHistoryPending(pathsFor(context));
   const waitingRows = waiting.reduce((sum, item) => sum + item.rows, 0);
   const action = await vscode.window.showQuickPick([
+    { label: '未能合并的旧数据', description: '只读查看保留的来源、原因和未合并对话；可以重新核验', action: 'residual' },
+    { label: '立即合并全部', description: '合并待处理的旧数据；较大来源完成准备后协调其它窗口', action: 'mergeAll' },
     { label: '其他历史库', description: '查看旧聊天；旧格式会先自动备份升级', action: 'history' },
     { label: '外来历史库', description: '归档与从别处拷来的目录里的旧聊天；只读查看，也可以选择合并进当前库', action: 'foreign' },
     { label: '查看存储占用', description: '按需统计正文、数据库、临时文件与备份', action: 'storage' },
@@ -230,14 +237,18 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
       label: `合并较大的旧聊天记录（${waiting.length} 份，${largeMergeWaitingText(waitingRows)}）`,
       description: '先在后台准备；合并期间所有 LimCode 窗口暂停并显示进度，完成后自动恢复', action: 'largeMerge'
     }] : []),
-    { label: '检查并修复历史残留', description: '只读检查非当前库；确认后先备份再清理终态孤立记录，不执行旧任务', action: 'repair' },
-    { label: '切换当前历史库', description: '保留完整原库，切换后重载窗口', action: 'select' },
+    { label: '检查并修复历史残留', description: '当前库先协调窗口离线；只读检查，确认后备份修复，不执行旧任务', action: 'repair' },
     { label: '删除其他历史库', description: '仅删除明确选定的非当前完整历史库', action: 'delete' },
     { label: '迁移数据目录', description: '把全部历史和设置复制到新目录并核对后切换；旧目录保留', action: 'relocate' },
     { label: '清理备份', description: '在设置页核对并删除已完整存在于本地库的备份', action: 'cleanupBackups' },
     { label: '归档并重置当前历史库', description: '保留备份并创建空库；归档本身不释放磁盘', action: 'reset' }
-  ], { placeHolder: '历史与存储管理' });
+  ], { placeHolder: `历史与存储管理${pending.size ? ` · 还有 ${pending.size} 份没合并` : ''}` });
   if (!action || !canStartRuntimeDataSetUpgrade(context)) return;
+  if (action.action === 'residual') {
+    await manageRuntimeHistoryResiduals(context, () => mergeAllRuntimeHistory(context, startup), async () => !await refusedWhileFrozen(startup, '重新合并旧数据'));
+    return;
+  }
+  if (action.action === 'mergeAll') { await mergeAllRuntimeHistory(context, startup); return; }
   if (action.action === 'reset') {
     await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.resetDevelopmentData);
     return;
@@ -272,7 +283,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   const mergeStates = await readRuntimeDataSetMergeStates(pathsFor(context)).catch(() => new Map<string, RuntimeDataSetMergeState>());
   const eligible = action.action === 'merge'
     ? candidates.filter(candidate => !candidate.selected && candidate.dataSetId && !alreadyMergedHere(mergeStates.get(candidate.id)))
-    : action.action === 'history' || action.action === 'delete' || action.action === 'repair'
+    : action.action === 'history' || action.action === 'delete'
       ? candidates.filter(candidate => !candidate.selected) : candidates;
   if (!eligible.length) {
     if (problems.length) {
@@ -287,7 +298,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   const candidate = await chooseDataSet(eligible, action.label, problems, mergeStates, { waiting });
   if (!candidate || !canStartRuntimeDataSetUpgrade(context)) return;
   if (action.action === 'merge') { await mergeNow(context, startup, candidate, mergeStates.get(candidate.id)); return; }
-  if (action.action === 'repair') { await repairHistoryNow(context, startup, candidate); return; }
+  if (action.action === 'repair') { await repairHistory(context, startup, candidate); return; }
   if (action.action === 'storage') { await showRuntimeStorage(context, candidate, startup); return; }
   if (action.action === 'history') {
     // Viewing is a read; upgrading a published old format in place first is a write.
@@ -297,6 +308,17 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     return;
   }
   if (action.action === 'delete') {
+    const host = startup.current() as Partial<HistoricalMergeHost> | undefined;
+    const current = host?.product?.application.database;
+    let coveredByCurrent: typeof current;
+    if (!alreadyMergedHere(mergeStates.get(candidate.id))) {
+      const next = await vscode.window.showWarningMessage('这份历史尚未完整合并。', {
+        modal: true, detail: '先合并可以保留对话。也可核对当前历史是否已包含这份库及其备份的全部可读历史，再永久删除。未能合并的残留不会删除。' + deletionNote(candidate, mergeStates.get(candidate.id))
+      }, '先合并', ...(current ? ['确认已被覆盖后删除'] : []));
+      if (next === '先合并') { await mergeNow(context, startup, candidate, mergeStates.get(candidate.id)); return; }
+      if (next !== '确认已被覆盖后删除' || !current) return;
+      coveredByCurrent = current;
+    }
     // Native VS Code command: no settings Webview exists here, so use the shell's modal confirmation.
     const confirmed = await vscode.window.showWarningMessage('永久删除这个历史库及其备份？', {
       modal: true, detail: `${dataSetLabel(candidate, mergeStates.get(candidate.id))}\n${candidate.runtimeDataRootPath}\n\n此操作不能撤销，不会删除当前历史库或共享设置。`
@@ -307,22 +329,63 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
     // Also when this window froze while the confirmation was open.
     if (await refusedWhileFrozen(startup, '删除其他历史库')) return;
     if (!candidate.dataSetId) throw new Error('历史库尚未完整初始化，不能删除。');
-    await deleteUnselectedRuntimeDataSet(pathsFor(context), candidate.id, candidate.dataSetId);
+    await deleteUnselectedRuntimeDataSet(pathsFor(context), candidate.id, candidate.dataSetId, { coveredByCurrent });
     await vscode.window.showInformationMessage('所选历史库已删除。');
     return;
   }
-  await switchHistory(context, startup, candidate, mergeStates.get(candidate.id));
+}
+
+/** The fixed current library is repaired under the same window coordination used for migration. */
+async function repairHistory(
+  context: vscode.ExtensionContext, startup: ApplicationStartup, candidate: VscodeRuntimeDataSetCandidate
+): Promise<void> {
+  if (!candidate.selected) return repairHistoryNow(context, startup, candidate);
+  const host = startup.current();
+  if (!host) return repairHistoryNow(context, startup, candidate);
+  if (!isLargeHistoricalMergeHost(host)) throw new Error('当前运行时无法进入独占维护，请重载窗口后重试。');
+  const confirmed = await vscode.window.showWarningMessage('让当前历史库离线并检查历史残留？', {
+    modal: true, detail: '会等待各窗口任务结束、暂停当前库并重载相关窗口。检查结果显示后，仍需确认才会备份并修复；当前历史库不会切换。'
+  }, '离线检查');
+  if (confirmed !== '离线检查' || await refusedWhileFrozen(startup, '检查历史残留')) return;
+  const { paths, hostBootId } = host.exclusiveMaintenanceTarget();
+  const configurationRootPath = host.dataRootPath();
+  const busy = requesterWorkBusy(host);
+  let closed = false;
+  try {
+    const outcome = await runWithExclusiveMaintenance(paths, {
+      operation: 'historical-repair', operationKey: `history-repair:${candidate.dataSetId}:${candidate.rootInstanceId}`,
+      message: '为检查并修复当前历史残留', waitingTitle: '正在等待其它窗口空闲后检查历史残留',
+      configurationRootPath, requesterHostBootId: hostBootId, requesterBusy: busy,
+      participantConfirmation: 'notice', whenBusy: 'wait', ignoreBackoff: true,
+      isCurrent: () => canStartRuntimeDataSetUpgrade(context) && host.dataRootPath() === configurationRootPath,
+      beforeGo: async () => {
+        const active = await busy();
+        if (active) return { busy: active };
+        const thaw = host.freezeNewWork('检查并修复历史残留');
+        try { const late = await busy(); return late ? { busy: late, thaw } : { thaw }; }
+        catch (error) { thaw(); throw error; }
+      },
+      withLocks: body => host.withDataRootLocks(body)
+    }, async () => {
+      closed = true;
+      await host.closeRuntime();
+      await repairHistoryNow(context, startup, candidate, true);
+    });
+    if (outcome.state !== 'completed') await vscode.window.showInformationMessage(`历史残留检查未开始：${outcome.reason}`);
+  } finally {
+    if (closed) await vscode.commands.executeCommand('workbench.action.reloadWindow');
+  }
 }
 
 /** Explicit, independently backed-up repair, never a hidden fallback of a failed merge. */
 async function repairHistoryNow(
-  context: vscode.ExtensionContext, startup: ApplicationStartup, candidate: VscodeRuntimeDataSetCandidate
+  context: vscode.ExtensionContext, startup: ApplicationStartup, candidate: VscodeRuntimeDataSetCandidate, exclusive = false
 ): Promise<void> {
   if (!candidate.dataSetId || !candidate.rootInstanceId) throw new Error('历史库身份不完整，不能修复。');
   const paths = pathsFor(context);
   const stillCurrent = () => canStartRuntimeDataSetUpgrade(context)
     && pathsFor(context).globalStoragePath === paths.globalStoragePath;
-  const gate = (startup.current() as { writeGate?: Pick<RuntimeWriteGate, 'run'> } | undefined)?.writeGate;
+  const gate = exclusive ? undefined : (startup.current() as { writeGate?: Pick<RuntimeWriteGate, 'run'> } | undefined)?.writeGate;
   const run = <T>(body: () => Promise<T>): Promise<T> => runRuntimeDataSetUpgrade(context, () => gate ? gate.run(body) : body());
   try {
     const plan = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在只读检查历史残留…' },
@@ -352,14 +415,14 @@ async function repairHistoryNow(
       modal: true, detail: detail + '\n\n先通过 SQLite 备份接口保存完整数据库，再在单个事务里修复。'
         + '只清理父记录缺失且无保留依赖的终态执行元数据；只按已有回执将误改为 exited 的状态恢复为 outcome_unknown。'
         + '不删除或重建对话，不虚构退出结果，不启动模型或进程，不清除合库账本；正文和附件不变。'
-        + '修复备份保留在该库的 history-repair-backups 中，不自动清理。修复后仍需另行选择“合并到当前库”。'
+        + '修复备份保留在该库的 history-repair-backups 中，不自动清理。' + (candidate.selected ? '完成后重载当前库。' : '修复后仍需另行选择“合并到当前库”。')
     }, '备份并修复');
-    if (confirmed !== '备份并修复' || !stillCurrent() || await refusedWhileFrozen(startup, '修复历史残留')) return;
+    if (confirmed !== '备份并修复' || !stillCurrent() || (!exclusive && await refusedWhileFrozen(startup, '修复历史残留'))) return;
     const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在备份并修复历史残留…' },
       () => run(() => repairRuntimeHistory(paths, plan)));
     if (!stillCurrent()) return;
     const text = result.result
-      ? `历史残留已修复：清理 ${result.result.removedOperations} 条终态操作和 ${result.result.removedAttempts} 条尝试，恢复 ${result.result.restoredUnknownProcesses} 个进程的未知结果状态。备份：${result.backupPath}。请重新选择“合并到当前库”。`
+      ? `历史残留已修复：清理 ${result.result.removedOperations} 条终态操作和 ${result.result.removedAttempts} 条尝试，恢复 ${result.result.restoredUnknownProcesses} 个进程的未知结果状态。备份：${result.backupPath}。${candidate.selected ? '完成后重载当前库。' : '请重新选择“合并到当前库”。'}`
       : '没有需要修复的历史残留。';
     if (result.warnings.length) await vscode.window.showWarningMessage(`${text}\n${result.warnings.join('\n')}`);
     else await vscode.window.showInformationMessage(text);
@@ -455,43 +518,7 @@ async function mergeNow(
   await mergeHistoricalDataSetsInBackground(context, host as HistoricalMergeHost, () => true, [candidate.id]);
 }
 
-async function switchHistory(
-  context: vscode.ExtensionContext,
-  startup: ApplicationStartup,
-  candidate: VscodeRuntimeDataSetCandidate,
-  merge?: RuntimeDataSetMergeState
-): Promise<void> {
-  if (candidate.selected) { await vscode.window.showInformationMessage('已经在使用这个历史库。'); return; }
-  const merged = lastMergeOf(merge);
-  const mergedHere = merged?.intoCurrent
-    ? (!merged.changedSinceMerge && !merged.sourceUnreadable
-      ? '\n\n这个库的对话已合并到当前库。切换过去后如果在已合并的对话里继续聊天，这个库以后就不能再合并回当前库（会整体不合并）；'
-        + '只新建对话、不动已合并的对话时，新对话以后仍可合并回来。'
-      : '')
-      + '\n\n在当前库删除过的对话（包括从这个库合并进当前库之后删掉的），以后再合并时不会被插回（在这个库里继续过也一样）。'
-    : '';
-  const confirmed = await vscode.window.showWarningMessage('切换当前历史库并重载窗口？', {
-    modal: true, detail: `目标：${candidate.runtimeDataRootPath}\n\n当前窗口的运行会停止。请先关闭其它使用同一数据目录的 VS Code 窗口。`
-      + '切换本身不合并、不搬移任何数据，所有原历史保留。'
-      + '\n\n切换后，现在的当前库会记为“你保留的库”，以后只在你选择“合并到当前库”时才合并；'
-      + '其它还没合并过、也不是你保留的旧库，会在下次打开时自动合并进新的当前库。' + mergedHere
-  }, '切换并重载');
-  if (confirmed !== '切换并重载') return;
-  const application = startup.current();
-  try {
-    if (application) await application.selectRuntimeDataSet(candidate.id);
-    else await selectVscodeRuntimeDataSet(pathsFor(context), candidate.id);
-  } catch (error) {
-    if (application) {
-      const message = error instanceof Error ? error.message : String(error);
-      await vscode.window.showErrorMessage(`切换未完成：${message}。将重载窗口恢复连接。`);
-      await vscode.commands.executeCommand('workbench.action.reloadWindow');
-      return;
-    }
-    throw error;
-  }
-  await vscode.commands.executeCommand('workbench.action.reloadWindow');
-}
+
 
 async function upgradeHistoryBeforeRead(
   context: vscode.ExtensionContext,
@@ -560,11 +587,21 @@ export async function mergeHistoricalDataSetsInBackground(
   let progress: vscode.Progress<{ message?: string }> | undefined;
   let report: RuntimeDataSetMergeBatchResult;
   try {
+    const status = await loadCommittedGlobalStatus(context);
+    const previous = [...(status?.previousDataRoots ?? []), ...(status?.lastMigration?.fromPath ? [status.lastMigration.fromPath] : [])];
+    const fresh = await registerRuntimeHistoryConvergence(paths, previous);
+    if (fresh && stillCurrent()) void vscode.window.showInformationMessage(`发现 ${fresh} 份旧数据，正在后台并入当前历史。你在本版本里删掉的对话不会回来；更早版本里删掉、而旧数据里还有的对话会被加回来，合并后可以再删。原库保留作为备份，可以在“清理备份”里删除。`);
     report = await runRuntimeDataSetUpgrade(context, () => oneMergeBatchAtATime(() => mergeHistoricalDataSetsOnline(paths, {
       configurationRootPath: paths.globalStoragePath,
       database: host.product.application.database
     }, {
       shouldContinue: stillCurrent,
+      settleSourceWork: settleHistoricalMergeSourceOffline,
+      confirmSettlement: async (input: { candidateId: string; turns: number; intents: number }) => {
+        if (!stillCurrent()) return false;
+        const answer = await vscode.window.showWarningMessage('中止旧数据中的工作后合并？', { modal: true, detail: `${input.candidateId}：${input.turns} 个进行中的轮次，${input.intents} 条排队消息。原库先备份；中止后的工作不会继续执行。` }, '同意收尾并合并');
+        return answer === '同意收尾并合并' && stillCurrent();
+      },
       // Only the call made for the user's click is an explicit request (the engine never infers it).
       ...(candidateIds ? { candidateIds, requested: true } : {}),
       onWorkStart: () => {
@@ -575,7 +612,7 @@ export async function mergeHistoricalDataSetsInBackground(
       onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` }),
       // An automatic source above the online limit goes along with a large merge session of the same
       // batch (the engine then leaves it awaiting); only without one is it coordinated on its own.
-      coordinateOversized: (input, merge) => requestOtherWindowsToYield(paths, input, merge, stillCurrent)
+      ...(candidateIds ? { coordinateOversized: (input: RuntimeDataSetOversizedMerge, merge: () => Promise<void>) => requestOtherWindowsToYield(paths, input, merge, stillCurrent) } : {})
     })));
   } catch (error) {
     console.error('[LimCode] 旧聊天记录合并检查失败。', error);
@@ -601,8 +638,8 @@ export async function mergeHistoricalDataSetsInBackground(
     const options = largeMergeOptions(context, paths.globalStoragePath, stillCurrent);
     if (candidateIds) await startLargeHistoricalMerge(context, host, { ...options, candidateIds: session });
     // Not awaited: the prompt counts down and the session may wait for other windows; the startup goes on.
-    else void offerLargeHistoricalMerge(context, host, session, options)
-      .catch(error => console.error('[LimCode] 合并较大的旧聊天记录失败。', error));
+    // Automatic batches leave large sources pending until 立即合并全部.
+    else void vscode.window.showInformationMessage(`还有 ${session.length} 份较大的旧数据没合并，可在“历史与存储管理”里选择“立即合并全部”。`);
   }
   return report;
 }
@@ -1057,4 +1094,16 @@ export function formatBytes(value: string): string {
     divisor *= 1024n;
   }
   return `${bytes} B`;
+}
+
+/** Explicit action is the sole entry to exclusive convergence. */
+export async function mergeAllRuntimeHistory(context: vscode.ExtensionContext, startup: ApplicationStartup): Promise<void> {
+  if (await refusedWhileFrozen(startup, '合并全部旧数据')) return;
+  const host = startup.current();
+  if (!isLargeHistoricalMergeHost(host)) { await vscode.window.showErrorMessage('运行时没有打开，不能合并旧数据。'); return; }
+  await mergeHistoricalDataSetsInBackground(context, host);
+  const waiting = await largeMergeEngine().waiting(pathsFor(context));
+  if (waiting.length && canStartRuntimeDataSetUpgrade(context)) {
+    await startLargeHistoricalMerge(context, host, largeMergeOptions(context, host.dataRootPath(), () => canStartRuntimeDataSetUpgrade(context)));
+  }
 }

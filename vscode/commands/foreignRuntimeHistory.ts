@@ -75,18 +75,9 @@ export async function announceForeignRuntimeHistoryOnStartup(
   if (empty.length > 0) await updateGlobalStatusDataRoot(context, { forgetPreviousDataRoots: empty }).catch((error: unknown) =>
     console.warn('[LimCode] 更新旧数据目录列表失败。', error));
   if (!isCurrent() || found.length === 0) return;
-  const fresh = await rememberAnnounced(context, input.configurationRootPath, found.map((entry) => entry.id));
-  if (fresh === 0) return;
-  void Promise.resolve(vscode.window.showInformationMessage(
-    `发现 ${fresh} 个外来历史库（归档并重置留下的归档，或从别处拷来的数据目录）。可以在“历史与存储管理 → 外来历史库”里核验，`
-      + '核验通过的可以只读查看，也可以选择合并进当前库（不会自动合并）。原数据保持原样。',
-    '查看'
-  )).then((pick) => {
-    if (pick === '查看') return manageForeignRuntimeHistory(context, startup);
-    return undefined;
-  }).catch((error: unknown) => {
-    void vscode.window.showErrorMessage(`外来历史库打开失败：${error instanceof Error ? error.message : String(error)}`);
-  });
+  // Convergence owns the durable per-source notice and background registration.
+  // Keep discovery/old-root housekeeping here until the phase-three UI removal.
+
 }
 
 /** Returns how many of `ids` were not announced before, and records them (bounded). */
