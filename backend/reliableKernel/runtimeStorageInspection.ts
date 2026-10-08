@@ -1,4 +1,4 @@
-import { assertRuntimeDataSetCoveredByCurrent, type RuntimeBackupCleanupCurrent } from './runtimeBackupCleanup';
+import type { RuntimeBackupCleanupCurrent } from './runtimeBackupCleanup';
 import { cachedRuntimeDataSetFingerprint, readRuntimeDataSetMergeLedgerRecord, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity } from './runtimeDataSetMergeLedger';
 import { RUNTIME_RESET_BACKUPS_DIRECTORY, readRuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import { constants } from 'node:fs';
@@ -124,6 +124,7 @@ export async function deleteUnselectedRuntimeDataSet(
       const target = await requireCompleteRuntimeDataSet(selected[0]);
       const residuals = await readRuntimeHistoryResidual(paths);
       if (options.coveredByCurrent && record?.state !== 'partial' && !residuals.has(candidateId)) {
+        const { assertRuntimeDataSetCoveredByCurrent } = await import('./runtimeBackupCleanup');
         await assertRuntimeDataSetCoveredByCurrent(current, selected[0], options.coveredByCurrent);
       } else if (record?.state !== 'merged' || !fingerprint
         || !sameRuntimeDataSetFingerprint(record.source, fingerprint)
