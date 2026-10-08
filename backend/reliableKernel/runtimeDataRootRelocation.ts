@@ -2350,9 +2350,15 @@ async function planMergeRecordsCarry(
       } else {
         carried = { ...record, location: foreignLocationFrom(record.location, path.resolve(source), path.resolve(target)) };
       }
-      const to = await runtimeHistoryRegistryFile(targetPaths, section, id);
+      let to = await runtimeHistoryRegistryFile(targetPaths, section, id);
       const there = await existing(to);
-      if (there) continue;
+      if (there) {
+        if (!there.isFile()) throw mergeRecordsError(`新数据目录的历史登记不是普通文件（${to}）`);
+        if (isDeepStrictEqual(JSON.parse(await fs.readFile(to, 'utf8')), carried)) continue;
+        carried = { ...carried, id: `migration:${options.relocationId}:${id}` };
+        to = await runtimeHistoryRegistryFile(targetPaths, section, carried.id);
+        if (await existing(to)) throw mergeRecordsError(`迁移历史登记的位置已经存在（${to}）`);
+      }
       writes.push({ kind: 'write', to, text: `${JSON.stringify(carried, null, 2)}\n`, replaces: false });
     }
   }
@@ -2362,10 +2368,15 @@ async function planMergeRecordsCarry(
     const info = await lstatOrUndefined(from);
     if (!info) continue;
     if (!info.isFile()) throw mergeRecordsError(`旧数据目录的 ${name} 不是普通文件`);
-    if (!await existing(to)) {
-      const value: unknown = JSON.parse(await fs.readFile(from, 'utf8'));
-      writes.push({ kind: 'write', to, text: `${JSON.stringify(value, null, 2)}\n`, replaces: false });
-    }
+    const value = JSON.parse(await fs.readFile(from, 'utf8')) as Record<string, unknown>;
+    const there = await existing(to);
+    if (there && !there.isFile()) throw mergeRecordsError(`新数据目录的 ${name} 不是普通文件`);
+    const kept = there ? JSON.parse(await fs.readFile(to, 'utf8')) as Record<string, unknown> : undefined;
+    const field = name === 'convergence.json' ? 'sourceIds' : 'sources';
+    if (kept && (!Array.isArray(value[field]) || !Array.isArray(kept[field]))) throw mergeRecordsError(`无法合并历史登记 ${name}`);
+    const joined = kept ? { ...value, ...kept, [field]: [...kept[field] as unknown[],
+      ...(value[field] as unknown[]).filter((entry) => !(kept[field] as unknown[]).some((known) => isDeepStrictEqual(entry, known)))] } : value;
+    writes.push({ kind: 'write', to, text: `${JSON.stringify(joined, null, 2)}\n`, replaces: there !== undefined });
   }
 
   // Deletion records: files of unique names, never merged.

@@ -353,9 +353,17 @@ test('迁移留下同名库：新根登记旧位置，后续清理previousDataRo
   await createLimCodeTarget(target);
   const scopeRoot = rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(target, fixture.alpha.id);
   await initialize(scopeRoot, fixture.alpha.id);
+  const registry = kernelFile('runtimeHistoryRegistry.js');
+  const record = { id: fixture.alpha.id, sourceKind: 'local', location: { kind: 'local', candidateId: fixture.alpha.id },
+    identity: { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId },
+    code: 'fixture-retained', message: '旧目录残留', checkedAt: NOW };
+  await registry.writeRuntimeHistoryResidual(fixture.paths, record);
+  await registry.writeRuntimeHistoryResidual({ globalStoragePath: target }, { ...record, message: '新目录残留' });
   const plan = await planWithRuntime(fixture, target);
   assert.deepEqual(plan.problems, []);
   const { result } = await relocate(fixture, plan);
+  const residuals = [...(await registry.readRuntimeHistoryResidual({ globalStoragePath: target })).values()];
+  assert.deepEqual(residuals.map(item => item.message).sort(), ['新目录残留', '旧目录残留']);
   assert.deepEqual(result.others.leftBehind.map(item => item.id), [fixture.alpha.id]);
   const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target })).values()];
   const left = pending.find(item => item.identity?.dataSetId === fixture.alpha.binding.dataSetId);
