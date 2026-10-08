@@ -81,9 +81,16 @@ export async function readRuntimeHistorySettlementConsent(paths: Paths, input: R
 }
 /** Durable publication precedes any source settlement; concurrent windows preserve all consent entries. */
 export async function recordRuntimeHistorySettlementConsent(paths: Paths, input: RuntimeHistorySettlementConsent): Promise<void> {
+  await recordRuntimeHistorySettlementConsents(paths, [input]);
+}
+
+/** Publish every displayed source together before the batch resumes any settlement. */
+export async function recordRuntimeHistorySettlementConsents(paths: Paths, inputs: readonly RuntimeHistorySettlementConsent[]): Promise<void> {
   await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
     const record = await read<{ sources: RuntimeHistorySettlementConsent[] }>(paths, '', 'settlement-consent');
-    const sources = (record?.sources ?? []).filter(source => source.candidateId !== input.candidateId);
-    await writeLedgerJson(paths, '', 'settlement-consent', { sources: [...sources, { ...input, agreedAt: new Date().toISOString() }] });
+    const ids = new Set(inputs.map(input => input.candidateId));
+    const sources = (record?.sources ?? []).filter(source => !ids.has(source.candidateId));
+    const agreedAt = new Date().toISOString();
+    await writeLedgerJson(paths, '', 'settlement-consent', { sources: [...sources, ...inputs.map(input => ({ ...input, agreedAt }))] });
   });
 }

@@ -1,3 +1,4 @@
+import { resolveVscodeRuntimeDataSetScopeRoot } from '../../backend/reliableKernel/vscodeRootAuthority';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { resolveDataRootUri } from '../../backend/capabilities/vscodeStorage/globalStatus';
@@ -20,7 +21,7 @@ export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionCon
   const choice = await vscode.window.showQuickPick([...records.values()].map(record => ({
     label: record.location.kind === 'local' ? record.location.candidateId : record.location.containerName,
     description: `${record.bytes === undefined ? '大小尚未统计' : formatBytes(record.bytes)}${record.excluded?.length ? ` · ${record.excluded.length} 个对话未合并` : ''}`,
-    detail: `${locationText(record)} · ${record.message}`, record
+    detail: `${locationText(record, paths.globalStoragePath)} · ${record.message}`, record
   })), { placeHolder: '未能合并的旧数据 · 原数据保留', matchOnDetail: true });
   if (!choice) return;
   const record = choice.record;
@@ -32,11 +33,11 @@ export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionCon
   ], { placeHolder: choice.label });
   if (!action) return;
   if (action.action === 'details') {
-    await showReadOnly(context, '未能合并的旧数据', [locationText(record), `[${record.code}] ${record.message}`,
+    await showReadOnly(context, '未能合并的旧数据', [locationText(record, paths.globalStoragePath), `[${record.code}] ${record.message}`,
       `最后核验：${record.checkedAt}`, ...(record.excluded ?? []).map(item => `${item.title || item.conversationId} [${item.code}] ${item.count}`)].join('\n'));
   } else if (action.action === 'folder') {
     const folder = record.location.kind === 'local'
-      ? (await locateLocalRuntimeDataSet(paths, record.location.candidateId)).located.dataRootPath
+      ? localDirectory(paths.globalStoragePath, record.location.candidateId)
       : record.location.containerPath;
     await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(folder));
   } else if (action.action === 'retry') {
@@ -57,8 +58,8 @@ export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionCon
   }
 }
 
-function locationText(record: RuntimeHistoryResidual): string {
-  return record.location.kind === 'local' ? record.location.candidateId
+function locationText(record: RuntimeHistoryResidual, configurationRootPath: string): string {
+  return record.location.kind === 'local' ? localDirectory(configurationRootPath, record.location.candidateId)
     : path.join(record.location.containerPath, record.location.dataRootRelativePath);
 }
 
@@ -87,4 +88,9 @@ export function residualHistory(history: RuntimeDataSetHistory, record: Pick<Run
     },
     close: () => history.close()
   };
+}
+
+function localDirectory(configurationRootPath: string, candidateId: string): string {
+  try { return resolveVscodeRuntimeDataSetScopeRoot(configurationRootPath, candidateId); }
+  catch { return configurationRootPath; } // An unreadable scope container is a diagnostic entry, not a candidate.
 }

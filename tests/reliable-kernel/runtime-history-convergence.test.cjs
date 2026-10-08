@@ -62,6 +62,7 @@ test('收尾同意落盘并绑定来源身份及用户看到的数量', async ()
 test('部分合并只读列表跨过已合并页面，只暴露剔除对话并释放原查看登记', async () => {
   const api = load('vscode/commands/runtimeHistoryResiduals.ts', {
     vscode: {}, '../../backend/capabilities/vscodeStorage/globalStatus': {}, '../../backend/capabilities/vscodeStorage/paths': {},
+    '../../backend/reliableKernel/vscodeRootAuthority': {},
     '../../backend/reliableKernel/runtimeDataSetHistory': {}, '../../backend/reliableKernel/runtimeForeignHistory': {},
     '../../backend/reliableKernel/runtimeHistoryRegistry': {}, './runtimeDataSetManagement': {}
   });
