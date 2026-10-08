@@ -126,8 +126,10 @@ const UNMEASURED_ROW_MS = 0.06;
 const UNMEASURED_COPY_BYTES_PER_MS = (100 * 1024 * 1024) / 1000;
 /** Preparation of one source that does not grow with it (records, claim, audit worker, caches; measured 150 to 200), ms. */
 const PREPARE_SOURCE_FIXED_MS = 300;
-/** Preparation per source row: the private copy's worker audit and the scan against the target (measured 0.013 to 0.016), ms. */
-const PREPARE_ROW_MS = 0.02;
+/** Preparation per source row, including audit, target scan and the exclusion dependency index.
+ * The full 60k-row preparation measured about 5.2 s on Linux CI; the prior rate covered only
+ * audit and scan. Keep the existing uncertainty range rather than changing the test bound. */
+const PREPARE_ROW_MS = 0.04;
 /**
  * The preparation's copy of a source and its online backup of the target, bytes per ms (200 MB/s;
  * measured 400 to 1,200 MB/s with the files cached, a disk that does not have them is slower).
