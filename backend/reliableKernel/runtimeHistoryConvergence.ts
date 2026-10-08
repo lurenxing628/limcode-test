@@ -31,8 +31,19 @@ export async function registerRuntimeHistoryConvergence(paths: Paths, previousDa
         reason: '升级收敛', registeredAt });
       known.add(candidate.id);
     }
+    for (const problem of local.problems ?? []) {
+      if (pending.has(problem.id) || residual.has(problem.id)) continue;
+      const location = { kind: 'local' as const, candidateId: problem.id };
+      // OS access/space/liveness failures may clear without changing the source.
+      const transient = /^(EACCES|EPERM|EIO|EBUSY|ENOSPC|EMFILE|ENFILE)$/.test(problem.code ?? '')
+        || /busy|active|live|maintenance|locked/.test(problem.code ?? '');
+      if (transient) await writeRuntimeHistoryPending(paths, { id: problem.id, sourceKind: 'local', location,
+        reason: problem.message, registeredAt });
+      else await writeRuntimeHistoryResidual(paths, { id: problem.id, sourceKind: 'local', location,
+        code: problem.code ?? 'runtime-history-source-unreadable', message: problem.message, checkedAt: registeredAt });
+    }
     for (const source of foreign) {
-      if (known.has(source.id) || pending.has(source.id) || residual.has(source.id)) continue;
+      if (pending.has(source.id) || residual.get(source.id)?.sourceKind === 'reset') continue;
       const identity = foreignIdentities.get(source.id);
       if (!identity) {
         await writeRuntimeHistoryResidual(paths, { id: source.id, sourceKind: source.location.kind, location: source.location, code: 'runtime-history-source-identity-unreadable', message: '无法读取旧数据身份，原数据保留；可以重新核验。', checkedAt: registeredAt });
@@ -57,11 +68,16 @@ export interface RuntimeHistorySettlementConsent {
   rootInstanceId: string;
   turns: number;
   intents: number;
+  deliveries?: number;
+  children?: number;
+  effects?: number;
 }
 export async function readRuntimeHistorySettlementConsent(paths: Paths, input: RuntimeHistorySettlementConsent): Promise<boolean> {
   const record = await read<{ sources: RuntimeHistorySettlementConsent[] }>(paths, '', 'settlement-consent');
   return record?.sources.some(source => source.candidateId === input.candidateId && source.dataSetId === input.dataSetId
-    && source.rootInstanceId === input.rootInstanceId && source.turns >= input.turns && source.intents >= input.intents) ?? false;
+    && source.rootInstanceId === input.rootInstanceId && source.turns >= input.turns && source.intents >= input.intents
+    && (source.deliveries ?? 0) >= (input.deliveries ?? 0) && (source.children ?? 0) >= (input.children ?? 0)
+    && (source.effects ?? 0) >= (input.effects ?? 0)) ?? false;
 }
 /** Durable publication precedes any source settlement; concurrent windows preserve all consent entries. */
 export async function recordRuntimeHistorySettlementConsent(paths: Paths, input: RuntimeHistorySettlementConsent): Promise<void> {

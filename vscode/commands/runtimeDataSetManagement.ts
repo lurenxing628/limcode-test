@@ -1,3 +1,4 @@
+import { confirmRuntimeHistorySettlement } from './runtimeHistorySettlement';
 import { settleHistoricalMergeSourceOffline } from '../../backend/application/reliableKernel/historicalMergeSettlement';
 import { registerRuntimeHistoryConvergence } from '../../backend/reliableKernel/runtimeHistoryConvergence';
 import { readRuntimeHistoryPending } from '../../backend/reliableKernel/runtimeHistoryRegistry';
@@ -40,7 +41,7 @@ import { requesterWorkBusy, runWithExclusiveMaintenance } from '../runtimeExclus
 import { EXTENSION_COMMAND_IDS } from '../../shared/extensionIdentity';
 import { manageForeignRuntimeHistory } from './foreignRuntimeHistory';
 import {
-  isLargeHistoricalMergeHost, LARGE_MERGE_SESSION_CAUSE, offerLargeHistoricalMerge, startLargeHistoricalMerge,
+  isLargeHistoricalMergeHost, LARGE_MERGE_SESSION_CAUSE, offerLargeHistoricalMerge, startLargeHistoricalMerge, mergeAllHistoricalSources,
   type LargeHistoricalMergeOptions
 } from './largeHistoricalMerge';
 
@@ -564,6 +565,7 @@ async function upgradeHistoryBeforeRead(
 
 /** The open Runtime of this window that receives historical merges. */
 export interface HistoricalMergeHost {
+  hasOwnedExecution?(): Promise<boolean>;
   product: { application: { database: RuntimeDatabase } };
 }
 
@@ -579,7 +581,8 @@ export async function mergeHistoricalDataSetsInBackground(
   context: vscode.ExtensionContext,
   host: HistoricalMergeHost,
   shouldContinue: () => boolean = () => true,
-  candidateIds?: readonly string[]
+  candidateIds?: readonly string[],
+  manualAll = false
 ): Promise<RuntimeDataSetMergeBatchResult | undefined> {
   if (!shouldContinue() || !canStartRuntimeDataSetUpgrade(context)) return undefined;
   const paths = pathsFor(context);
@@ -598,12 +601,9 @@ export async function mergeHistoricalDataSetsInBackground(
       database: host.product.application.database
     }, {
       shouldContinue: stillCurrent,
+      isRuntimeIdle: async () => manualAll || !await host.hasOwnedExecution?.(),
       settleSourceWork: settleHistoricalMergeSourceOffline,
-      confirmSettlement: async (input: { candidateId: string; turns: number; intents: number }) => {
-        if (!stillCurrent()) return false;
-        const answer = await vscode.window.showWarningMessage('中止旧数据中的工作后合并？', { modal: true, detail: `${input.candidateId}：${input.turns} 个进行中的轮次，${input.intents} 条排队消息。原库先备份；中止后的工作不会继续执行。` }, '同意收尾并合并');
-        return answer === '同意收尾并合并' && stillCurrent();
-      },
+      confirmSettlement: input => confirmRuntimeHistorySettlement(input, stillCurrent),
       // Only the call made for the user's click is an explicit request (the engine never infers it).
       ...(candidateIds ? { candidateIds, requested: true } : {}),
       onWorkStart: () => {
@@ -1105,9 +1105,9 @@ export async function mergeAllRuntimeHistory(context: vscode.ExtensionContext, s
   if (await refusedWhileFrozen(startup, '合并全部旧数据')) return;
   const host = startup.current();
   if (!isLargeHistoricalMergeHost(host)) { await vscode.window.showErrorMessage('运行时没有打开，不能合并旧数据。'); return; }
-  await mergeHistoricalDataSetsInBackground(context, host);
+  await mergeHistoricalDataSetsInBackground(context, host, () => canStartRuntimeDataSetUpgrade(context), undefined, true);
   const waiting = await largeMergeEngine().waiting(pathsFor(context));
   if (waiting.length && canStartRuntimeDataSetUpgrade(context)) {
-    await startLargeHistoricalMerge(context, host, largeMergeOptions(context, host.dataRootPath(), () => canStartRuntimeDataSetUpgrade(context)));
+    await mergeAllHistoricalSources(context, host, { ...largeMergeOptions(context, host.dataRootPath(), () => canStartRuntimeDataSetUpgrade(context)), candidateIds: waiting.map(source => source.candidateId) });
   }
 }

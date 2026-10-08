@@ -189,6 +189,7 @@ function fixture({
     },
     '../../backend/reliableKernel/runtimeLargeMergeSession': largeMergeSession,
     '../../backend/application/reliableKernel/historicalMergeSettlement': { settleHistoricalMergeSourceOffline: async () => ({ unsettled: [], live: [] }) },
+    './runtimeHistorySettlement': { confirmRuntimeHistorySettlement: async () => true },
     './runtimeHistoryResiduals': { manageRuntimeHistoryResiduals: async () => {} },
     '../../backend/reliableKernel/runtimeHistoryConvergence': { registerRuntimeHistoryConvergence: async () => 0 },
     '../../backend/reliableKernel/runtimeHistoryRegistry': { readRuntimeHistoryPending: async () => new Map() },

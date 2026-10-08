@@ -1,3 +1,5 @@
+import { confirmRuntimeHistorySettlement } from './runtimeHistorySettlement';
+import { settleHistoricalMergeSourceOffline } from '../../backend/application/reliableKernel/historicalMergeSettlement';
 import * as vscode from 'vscode';
 import type { RuntimeWriteGate } from '../../backend/application/reliableKernel/runtimeWriteGate';
 import type { RootBinding, RuntimeRootPaths } from '../../backend/reliableKernel/contracts';
@@ -296,6 +298,35 @@ export async function startLargeHistoricalMerge(
   }
 }
 
+/** Explicit convergence uses the existing exclusive coordinator without the retired estimate/countdown flow. */
+export async function mergeAllHistoricalSources(
+  context: vscode.ExtensionContext, host: LargeHistoricalMergeHost,
+  options: LargeHistoricalMergeOptions & { candidateIds: readonly string[] }
+): Promise<void> {
+  if (sessionRunning) { await vscode.window.showInformationMessage('本窗口已在合并旧数据。'); return; }
+  host.writeGate?.admit();
+  const stillCurrent = currentCheck(context, options);
+  const engine = options.engine ?? largeMergeEngine();
+  sessionRunning = true;
+  const releaseHold = holdOwnExclusiveMaintenanceWork(host, { operation: OPERATION, activity: '合并全部旧数据' });
+  let preparation: LargeMergePreparation | undefined;
+  try {
+    preparation = await vscode.window.withProgress({
+      location: vscode.ProgressLocation.Notification, title: '正在准备合并全部旧数据', cancellable: true
+    }, (progress, token) => prepare(context, host, engine, options.candidateIds, true, stillCurrent,
+      message => progress?.report({ message }), token));
+    if (!preparation || !stillCurrent()) return;
+    await tellSettled(options, preparation.report, true, preparation.sources.length);
+    if (!preparation.sources.length) return;
+    host.writeGate?.admit();
+    await runSession(context, host, engine, preparation, { requested: true, options, stillCurrent });
+  } finally {
+    if (preparation) await release(engine, preparation);
+    releaseHold();
+    sessionRunning = false;
+  }
+}
+
 /**
  * What a failed preparation left of the data: unchanged, unless it had closed some source's
  * unfinished work already (LargeMergePreparationError.finalizedSources).
@@ -368,6 +399,8 @@ async function prepare(
     const prepared = await runRuntimeDataSetUpgrade(context, () => engine.prepare({
       paths: { globalStoragePath: host.dataRootPath() },
       target: { configurationRootPath: host.dataRootPath(), database: host.product.application.database },
+      settleSourceWork: settleHistoricalMergeSourceOffline,
+      confirmSettlement: input => confirmRuntimeHistorySettlement(input, stillCurrent),
       candidateIds, requested, signal: abort.signal, onProgress
     }));
     // Stopped part way (“取消”, or the window closing): what was prepared so far is let go of.

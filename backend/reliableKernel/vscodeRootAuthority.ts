@@ -109,6 +109,7 @@ export interface VscodeRuntimeDataSetCandidate {
 }
 
 export interface VscodeRuntimeDataSetProblem {
+  code?: string;
   id: string;
   runtimeScopeRootPath: string;
   message: string;
@@ -559,7 +560,8 @@ async function inspectCandidates(
   const entries: Array<{ id: string; runtimeScopeRootPath: string }> = [];
   const recordProblem = (id: string, runtimeScopeRootPath: string, error: unknown): void => {
     if (strict) throw error;
-    result.problems.push({ id, runtimeScopeRootPath, message: error instanceof Error ? error.message : String(error) });
+    result.problems.push({ id, runtimeScopeRootPath, message: error instanceof Error ? error.message : String(error),
+      ...(typeof (error as { code?: unknown })?.code === 'string' ? { code: (error as { code: string }).code } : {}) });
   };
   const defaultControl = path.join(configurationRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY);
   try {

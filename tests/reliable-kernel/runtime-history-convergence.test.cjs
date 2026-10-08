@@ -16,12 +16,13 @@ function load(relative, dependencies) {
 }
 
 test('收敛登记仅入队新来源，残留须显式重试，通知来源跨重启去重', async () => {
+  const foreign = [];
   const records = new Map(), pending = new Map(), residual = new Map([['reset', {}]]);
   const candidates = [{ id: 'current', selected: true }, { id: 'old', selected: false }, { id: 'reset', selected: false }];
   const api = load('backend/reliableKernel/runtimeHistoryConvergence.ts', {
     'node:fs/promises': { readFile: async file => { if (!records.has(file)) throw Object.assign(new Error(), { code: 'ENOENT' }); return JSON.stringify(records.get(file)); } },
     './runtimeHostControl': { withRuntimeDataRootAdmission: async (_, run) => run() },
-    './runtimeForeignHistory': { discoverForeignRuntimeHistory: async () => [], heldDatabaseFiles: async () => new Set() },
+    './runtimeForeignHistory': { discoverForeignRuntimeHistory: async () => foreign, heldDatabaseFiles: async () => new Set(), readForeignRuntimePointerIdentity: async () => ({ dataSetId: 'data', rootInstanceId: 'root' }) },
     './vscodeRootAuthority': { inspectVscodeRuntimeDataSets: async () => ({ candidates }) },
     './runtimeDataSetMergeLedger': { ledgerFile: async (_, section, id) => `${section}/${id}`, writeLedgerJson: async (_, section, id, value) => records.set(`${section}/${id}`, value) },
     './runtimeHistoryRegistry': { readRuntimeHistoryPending: async () => pending, readRuntimeHistoryResidual: async () => residual,
@@ -34,6 +35,11 @@ test('收敛登记仅入队新来源，残留须显式重试，通知来源跨�
   assert.equal(pending.size, 0);
   candidates.push({ id: 'new', selected: false });
   assert.equal(await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' }), 1);
+  foreign.push({ id: 'foreign:archive:aaaaaaaaaaaaaaaa', location: { kind: 'archive' } });
+  assert.equal(await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' }), 1);
+  pending.delete(foreign[0].id);
+  assert.equal(await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' }), 0);
+  assert.equal(pending.has(foreign[0].id), true, 'known foreign sources are reconsidered using the merge engine file-state cache');
 });
 
 test('收尾同意落盘并绑定来源身份及用户看到的数量', async () => {
@@ -47,6 +53,7 @@ test('收尾同意落盘并绑定来源身份及用户看到的数量', async ()
     await api.recordRuntimeHistorySettlementConsent(paths, input);
     assert.equal(await api.readRuntimeHistorySettlementConsent(paths, input), true);
     assert.equal(await api.readRuntimeHistorySettlementConsent(paths, { ...input, turns: 3 }), false);
+    assert.equal(await api.readRuntimeHistorySettlementConsent(paths, { ...input, effects: 1 }), false);
     assert.equal(await api.readRuntimeHistorySettlementConsent(paths, { ...input, rootInstanceId: 'replacement' }), false);
     assert.ok(JSON.parse(await fsp.readFile(path.join(root, '.limcode-runtime-merges/settlement-consent.json'), 'utf8')).sources[0].agreedAt);
   } finally { await fsp.rm(root, { recursive: true, force: true }); }

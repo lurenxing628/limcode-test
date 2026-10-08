@@ -516,6 +516,16 @@ test('独占开始前用 statfs 再核一次空间：协调期间空间被占掉
   assert.match(automatic.ui.infos.at(-1), /^较大的旧聊天记录这次没有合并：有 2 份.+还差约 .+。下次启动时会再提示；也可以在“历史与存储管理”里手动开始。$/);
 });
 
+test('立即合并全部直接准备并独占合并，不显示旧会话估计和确认', async t => {
+  const fixture = await createRoot(t);
+  const window = loadWindow(fixture);
+  await window.all();
+  assert.equal(window.engine.calls.some(call => call[0] === 'estimate'), false);
+  assert.equal(window.engine.calls.some(call => call[0] === 'prepare'), true);
+  assert.equal(window.engine.calls.some(call => call[0] === 'run'), true);
+  assert.equal(window.ui.warnings.some(item => item[1]?.modal), false);
+});
+
 test('手动开始：先只读估计（可取消的通知），再确认（写明份数、约多少条记录、后台准备与所有窗口暂停两段时长、会等任务结束、期间暂停与取消的含义），确认之后才准备；以明确调用协调（不越过冷却以外的退避、其它窗口只提示、锁外等忙窗口、协调中不可取消），冻结并关闭本窗口运行时后才合并，然后重载；结果留到重载之后', async (t) => {
   const fixture = await createRoot(t);
   // This window's earlier explicit operation of the same kind left its requester token (it may retry after its reload).
@@ -968,6 +978,8 @@ function loadWindow(fixture, behavior = {}) {
   };
   const lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {});
   const module = loadSource('vscode/commands/largeHistoricalMerge.ts', {
+    './runtimeHistorySettlement': { confirmRuntimeHistorySettlement: async () => true },
+    '../../backend/application/reliableKernel/historicalMergeSettlement': { settleHistoricalMergeSourceOffline: async () => ({ unsettled: [], live: [] }) },
     vscode,
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': exclusive,
     '../../backend/reliableKernel/runtimeLargeMergeEngine': engineModule,
@@ -1106,6 +1118,7 @@ function loadWindow(fixture, behavior = {}) {
   return {
     ui, order, stages, ends, coordinations, reports, refusalQueries, host, engine, sources, state,
     offer: () => module.offerLargeHistoricalMerge(context, host, sources.map((item) => item.candidateId), options),
+    all: () => module.mergeAllHistoricalSources(context, host, { ...options, candidateIds: sources.map(item => item.candidateId) }),
     start: () => module.startLargeHistoricalMerge(context, host, options)
   };
 }

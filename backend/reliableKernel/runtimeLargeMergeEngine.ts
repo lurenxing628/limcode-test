@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import type { RootBinding } from './contracts';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import {
-  RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeResult
+  RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE, type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeResult, type RuntimeDataSetMergeOptions
 } from './runtimeDataSetMerge';
 import { peekRuntimeDataSetSummary } from './runtimeDataSetPreflight';
 import {
@@ -207,7 +207,7 @@ export interface LargeMergeEngine {
     requested: boolean;
     signal?: AbortSignal;
     onProgress?(message: string): void;
-  }): Promise<LargeMergePreparation>;
+  } & Pick<RuntimeDataSetMergeOptions, 'confirmSettlement' | 'settleSourceWork'>): Promise<LargeMergePreparation>;
   /**
    * Lets go of a preparation that will not run (the claims the engine keeps, a target backup no
    * session used). After run() there is nothing left to let go of; calling it then does nothing.
@@ -308,6 +308,7 @@ const STREAMED_MERGE_ENGINE: LargeMergeEngine = Object.freeze<LargeMergeEngine>(
       target: { configurationRootPath: input.target.configurationRootPath, database: input.target.database },
       candidateIds: input.candidateIds,
       requested: input.requested,
+      options: { confirmSettlement: input.confirmSettlement, settleSourceWork: input.settleSourceWork },
       // The session takes every source above the online bound the batch left to it, not only the largest.
       threshold: 'online',
       ...(input.signal ? { signal: input.signal } : {}),

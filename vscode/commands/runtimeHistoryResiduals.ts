@@ -3,7 +3,7 @@ import * as vscode from 'vscode';
 import { resolveDataRootUri } from '../../backend/capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths } from '../../backend/capabilities/vscodeStorage/paths';
 import { locateLocalRuntimeDataSet, openRuntimeDataSetHistory, type RuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeDataSetHistory';
-import { locateForeignRuntimeRoot } from '../../backend/reliableKernel/runtimeForeignHistory';
+import { locateForeignRuntimeRoot, readRuntimeHistoryResidualSize } from '../../backend/reliableKernel/runtimeForeignHistory';
 import { readRuntimeHistoryResidual, writeRuntimeHistoryPending, reconcileRuntimeResetBackups, type RuntimeHistoryResidual } from '../../backend/reliableKernel/runtimeHistoryRegistry';
 import { browseRuntimeHistory, formatBytes, showReadOnly } from './runtimeDataSetManagement';
 
@@ -13,6 +13,10 @@ export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionCon
   await reconcileRuntimeResetBackups(paths);
   const records = await readRuntimeHistoryResidual(paths);
   if (!records.size) { await vscode.window.showInformationMessage('没有未能合并的旧数据。'); return; }
+  for (const record of records.values()) {
+    const size = await readRuntimeHistoryResidualSize(paths, record);
+    if (size) record.bytes = size.bytes;
+  }
   const choice = await vscode.window.showQuickPick([...records.values()].map(record => ({
     label: record.location.kind === 'local' ? record.location.candidateId : record.location.containerName,
     description: `${record.bytes === undefined ? '大小尚未统计' : formatBytes(record.bytes)}${record.excluded?.length ? ` · ${record.excluded.length} 个对话未合并` : ''}`,
