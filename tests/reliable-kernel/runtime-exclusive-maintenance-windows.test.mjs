@@ -475,7 +475,7 @@ test('多进程：两个空闲窗口都倒计时确认之后才统一重载，�
   assert.ok(Math.max(...reloads) <= operationAt, 'the operation runs only after every window went offline');
 });
 
-test('多进程：一个窗口长期有任务时，后台合并请求立即放弃，任何窗口都不倒计时、不重载', async (t) => {
+test('多进程：忙窗口在场时后台超限来源保持待合并，任何窗口都不倒计时、不重载', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
   const windows = createWindows(t, fixture.root, { limits: LIMITS });
@@ -486,7 +486,7 @@ test('多进程：一个窗口长期有任务时，后台合并请求立即放�
   await delay(1_000);
   await windows.stop();
   assert.deepEqual(windows.reloads(), { B: 0, A: 0, C: 0 });
-  assert.deepEqual(report.deferred, ['runtime-data-set-merge-exclusive-busy']);
+  assert.deepEqual(report.deferred, ['runtime-data-set-merge-awaiting-exclusive']);
   assert.equal(windows.events().filter((event) => event.event === 'progress' && /即将重载/.test(event.title)).length, 0);
 });
 
@@ -571,7 +571,7 @@ test('多进程（盲审 #1）：迁移在锁外等一个忙窗口时用户关�
   }
 });
 
-test('多进程（盲审 #4）：两个窗口同时启动、各自自动合并同一个超限来源——较新的请求直接让先（不提示、不记退避），另一方完成合并，没有“有任务正在进行”的误报', async (t) => {
+test('多进程：两个窗口同时启动均保留超限来源待合并，不协调、不重载、不记退避', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
   const windows = createWindows(t, fixture.root, { limits: LIMITS });
@@ -581,7 +581,10 @@ test('多进程（盲审 #4）：两个窗口同时启动、各自自动合并�
   await windows.stop();
   const coordination = windows.events().filter((event) => event.event === 'coordination');
   assert.ok(!coordination.some((event) => event.state === 'busy'), JSON.stringify(coordination));
-  assert.equal(windows.reports().flatMap((report) => report.merged).length, 1, 'merged exactly once');
+  assert.equal(windows.reports().flatMap((report) => report.merged).length, 0);
+  assert.equal(coordination.length, 0);
+  assert.deepEqual(windows.reloads(), { A: 0, B: 0 });
+  for (const report of windows.reports()) assert.deepEqual(report.deferred, ['runtime-data-set-merge-awaiting-exclusive']);
   assert.ok(!windows.reports().some((report) => report.deferredMessages.some((message) => /有任务正在进行/.test(message))),
     JSON.stringify(windows.reports()));
   const ledger = path.join(runtimeExclusiveMaintenanceDirectory(fixture.current.binding.paths), 'ledger');
@@ -611,7 +614,7 @@ test('多进程：发起方进程崩溃后，残留请求不会让任何窗口�
   assert.deepEqual(windows.reloads(), { idle: 0, working: 0, requester: 0 });
 });
 
-test('复现改写（严重）：用户请求过的大来源在其它窗口让出后合并失败，不再无限互相重载', async (t) => {
+test('已登记请求的大来源在后续启动保持待合并，不触发反复协调重载', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
   // The user chose "合并到当前库" for alpha (mergeNow -> requestRuntimeDataSetMerge).
@@ -620,25 +623,26 @@ test('复现改写（严重）：用户请求过的大来源在其它窗口让�
     expectedDataSetId: fixture.alpha.binding.dataSetId,
     expectedRootInstanceId: fixture.alpha.binding.rootInstanceId
   });
-  const windows = createWindows(t, fixture.root, { limits: LIMITS, failCommit: true });
+  const windows = createWindows(t, fixture.root, { limits: LIMITS });
   const a = await windows.start('A');
   await a.waitFor('report');
-  await windows.start('B');
-  await delay(10_000);
+  const b = await windows.start('B');
+  await b.waitFor('report');
   await windows.stop();
   const reloads = windows.reloads();
-  // Before: within 25 s A reloaded 9–10 times and B 9 times, each round leaving a full backup.
-  assert.ok(reloads.A + reloads.B <= 1, JSON.stringify(reloads));
+  assert.deepEqual(reloads, { A: 0, B: 0 });
   const coordination = windows.events().filter((event) => event.event === 'coordination').map((event) => event.state);
-  // A alone: fails without anybody reloading; B: A reloads once and it fails; A again: backoff.
-  assert.ok(coordination.includes('backoff'), JSON.stringify(coordination));
-  for (const report of windows.reports()) assert.deepEqual(report.merged, []);
+  assert.deepEqual(coordination, []);
+  for (const report of windows.reports()) {
+    assert.deepEqual(report.merged, []);
+    assert.deepEqual(report.deferred, ['runtime-data-set-merge-awaiting-exclusive']);
+  }
 });
 
 test('复审 merge2 #3：大来源的正文复制失败发生在协调之前，从不请求其它窗口让出', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
-  const windows = createWindows(t, fixture.root, { limits: LIMITS, failLink: true });
+  const windows = createWindows(t, fixture.root, { limits: LIMITS, failLink: true, explicit: fixture.alpha.id });
   await (await windows.start('B', { noMerge: true })).waitFor('ready');
   const report = await (await windows.start('A')).waitFor('report');
   await delay(500);
@@ -648,7 +652,7 @@ test('复审 merge2 #3：大来源的正文复制失败发生在协调之前，�
   assert.deepEqual(windows.reloads(), { B: 0, A: 0 });
 });
 
-test('复现改写：用户请求过的大来源遇到忙窗口时不在锁内等待，新窗口可以立即打开', async (t) => {
+test('已登记大来源遇到忙窗口时后台保持待处理，新窗口可以立即打开', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
   await requestRuntimeDataSetMerge(fixture.paths, {
@@ -659,13 +663,14 @@ test('复现改写：用户请求过的大来源遇到忙窗口时不在锁内�
   const windows = createWindows(t, fixture.root, { limits: LIMITS });
   await (await windows.start('B', { busy: true, noMerge: true })).waitFor('ready');
   const a = await windows.start('A');
-  const coordination = await a.waitFor('coordination', 30_000);
+  const report = await a.waitFor('report', 30_000);
   const startedC = Date.now();
   const c = await windows.start('C', { noMerge: true });
   await c.waitFor('opened', 10_000);
   const openedWithin = Date.now() - startedC;
   await windows.stop();
-  assert.equal(coordination.state, 'busy');
+  assert.deepEqual(report.deferred, ['runtime-data-set-merge-awaiting-exclusive']);
+  assert.equal(windows.events().filter(event => event.event === 'coordination').length, 0);
   assert.ok(openedWithin < 8_000, `opened after ${openedWithin} ms`);
   assert.deepEqual(windows.reloads(), { B: 0, A: 0, C: 0 });
 });
@@ -804,7 +809,7 @@ test('多进程：迁移执行期间重载的窗口在打开外壳里看到“�
   assert.ok(reopened.at >= released, 'opened only after the maintenance let go of the locks');
 });
 
-test('多进程（复审 N1）：启动时的自动合并让先给另一个窗口的迁移，本窗口随后为迁移重载——不把自动调用的结果带过重载', async (t) => {
+test('多进程（复审 N1）：启动只登记大库待合并，随后为另一个窗口迁移重载，不携带自动协调结果', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.alpha, ['conversation_alpha_1', 'conversation_alpha_2']);
   await requestRuntimeDataSetMerge(fixture.paths, {
@@ -823,7 +828,7 @@ test('多进程（复审 N1）：启动时的自动合并让先给另一个窗�
   await delay(500);
   await windows.stop();
   const coordination = windows.events().filter((event) => event.name === 'A' && event.event === 'coordination');
-  assert.equal(coordination[0]?.requested, false, 'the automatic startup merge');
+  assert.deepEqual(coordination, [], '后台超限来源不请求独占');
   assert.equal(migration.state, 'completed');
   assert.equal(windows.reloads().A, 1);
   assert.deepEqual(windows.events().filter((event) => event.name === 'A' && event.event === 'kept-notice'), []);
