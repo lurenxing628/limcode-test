@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { publishInitialRuntimeSelection } from './fixtures/runtime-selection.mjs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -138,7 +139,7 @@ test('多旧库且无显式选择时固定根成为当前库，当前folder不�
   const selection = JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8'));
   assert.equal(selection.id, 'default');
   assert.equal(selection.initialized, true);
-  await selectVscodeRuntimeDataSet(paths, `workspace:${otherScope.key}`);
+  await publishInitialRuntimeSelection(paths, `workspace:${otherScope.key}`, 3);
   const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, scope('third'));
   assert.equal(placement.runtimeScopeRootPath, otherRoot);
 }));
@@ -381,7 +382,7 @@ for (const [fromEpoch, toEpoch] of [[3, 4], [3, 5], [4, 5]]) test(`合法epoch $
   assert.deepEqual(JSON.parse(await fs.readFile(previous.paths.rootPendingPath, 'utf8')), next);
 }));
 
-test('活跃或身份不明Host拒绝切换，原选择完整保留', async () => fixture(async (root, paths) => {
+test('已有选择拒绝再次发布，离线后也不改选', async () => fixture(async (root, paths) => {
   const current = await createRoot(root);
   await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'));
   const otherScope = scope('other');
@@ -401,13 +402,13 @@ test('活跃或身份不明Host拒绝切换，原选择完整保留', async () =
     startedAt: new Date().toISOString(),
     heartbeatAt: new Date().toISOString()
   }));
-  await assert.rejects(selectVscodeRuntimeDataSet(paths, `workspace:${otherScope.key}`), { code: 'runtime-hosts-active' });
+  await assert.rejects(selectVscodeRuntimeDataSet(paths, `workspace:${otherScope.key}`), /当前历史库已经固定/);
   assert.equal(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8'), before);
   assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('attached'))).runtimeDataRootPath, current.paths.dataRootPath);
-  // Idempotent selection does not switch the root and remains safe while attached.
-  assert.equal((await selectVscodeRuntimeDataSet(paths, 'default')).selected, true);
+  await assert.rejects(selectVscodeRuntimeDataSet(paths, 'default'), /当前历史库已经固定/);
   await fs.rm(livenessRoot, { recursive: true });
-  assert.equal((await selectVscodeRuntimeDataSet(paths, `workspace:${otherScope.key}`)).selected, true);
+  await assert.rejects(selectVscodeRuntimeDataSet(paths, `workspace:${otherScope.key}`), /当前历史库已经固定/);
+  assert.equal(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8'), before);
 }));
 
 test('已完成pending根保留原位置交给既有恢复入口', async () => fixture(async (root, paths) => {

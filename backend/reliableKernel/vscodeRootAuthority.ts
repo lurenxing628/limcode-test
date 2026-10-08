@@ -30,6 +30,8 @@ export const VSCODE_RUNTIME_MERGE_LEDGER_DIRECTORY = '.limcode-runtime-merges';
  * enumerated, and each archive is listed as foreign history (runtimeForeignHistory).
  */
 export const VSCODE_RUNTIME_ARCHIVES_DIRECTORY = '.limcode-runtime-backups';
+/** Explicit reset backups are residuals, never automatic foreign merge sources. */
+export const VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY = '.limcode-runtime-reset-backups';
 /**
  * Names of reset archives (one group, safe to embed): `<yyyyMMdd-HHmmss-SSS>-<id8>`
  * (archiveCurrentRuntimeRootForReset), `<yyyyMMdd-HHmmss-SSS>-epoch-<N>-to-<M>-<id8>` of the automatic
@@ -331,7 +333,7 @@ export async function resolveVscodeRuntimeDataSet(
   return inspectCandidate(root, id, selection, selection?.id === id && !selection.initialized);
 }
 
-/** Offline-only selection; every root in the configuration root must have no live/unknown Host. */
+/** Publish the fixed current-library pointer once, while all roots are offline. */
 export async function selectVscodeRuntimeDataSet(
   paths: Pick<VscodeStoragePaths, 'globalStoragePath'>,
   id: string
@@ -339,32 +341,10 @@ export async function selectVscodeRuntimeDataSet(
   const root = path.resolve(paths.globalStoragePath);
   return withRuntimeDataRootAdmission(root, async () => {
     const previous = await readRuntimeDataSetSelection(root);
-    const candidate = await inspectCandidate(root, id, previous, previous?.id === id && !previous.initialized);
-    if (previous?.id === id) return candidate;
+    if (previous) throw new VscodeRuntimeDataSetError('当前历史库已经固定，不能再次选择；其他历史库可以只读查看或合并到当前库。');
+    const candidate = await inspectCandidate(root, id);
     await assertConfigurationRootRuntimesOffline(root);
-    // Before this version's first switch moves it: what the selection said when this version came.
-    if (previous) await vscodeRuntimeSwitchedBeforeUpgrade({ globalStoragePath: root }, true).catch(() => undefined);
-    // Switching away is an explicit decision to keep that data set apart: it is never merged
-    // automatically afterwards. Data sets from before this version carry no such record. The
-    // record is written before the selection moves; a readable data set that cannot be marked is
-    // not switched away from. One that cannot even be inspected is marked for any incarnation, as
-    // far as its control root still takes a file: switching away from a broken data set never
-    // depends on it.
-    if (previous) {
-      let kept: VscodeRuntimeDataSetCandidate | undefined;
-      try { kept = await inspectCandidate(root, previous.id, previous, !previous.initialized); }
-      catch {
-        const runtimeDataRootPath = resolveVscodeRuntimeDataRoot({ globalStoragePath: runtimeScopeRootForId(root, previous.id) });
-        await markRuntimeDataSetKept({ configurationRootPath: root, runtimeDataRootPath }).catch(() => undefined);
-      }
-      if (kept?.dataSetId && kept.rootInstanceId) {
-        await markRuntimeDataSetKept(kept).catch((error: unknown) => {
-          throw new VscodeRuntimeDataSetError(
-            '无法在原当前库里记下“你保留的库”（切走的库以后只在你选择时才合并），切换未进行；请检查数据目录能否写入后重试。', error);
-        });
-      }
-    }
-    await publishSelection(root, id, true, previous);
+    await publishSelection(root, id, true);
     return Object.freeze({ ...candidate, selected: true });
   });
 }
@@ -831,8 +811,8 @@ async function keepsOnlyArchives(runtimeScopeRootPath: string): Promise<boolean>
   const claim = path.basename(runtimeMaintenanceClaimPath(createRuntimeRootPaths(
     resolveVscodeRuntimeDataRoot({ globalStoragePath: runtimeScopeRootPath })
   )));
-  return names.includes(VSCODE_RUNTIME_ARCHIVES_DIRECTORY)
-    && names.every((name) => name === VSCODE_RUNTIME_ARCHIVES_DIRECTORY || name === claim);
+  return names.some((name) => name === VSCODE_RUNTIME_ARCHIVES_DIRECTORY || name === VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY)
+    && names.every((name) => name === VSCODE_RUNTIME_ARCHIVES_DIRECTORY || name === VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY || name === claim);
 }
 
 /**

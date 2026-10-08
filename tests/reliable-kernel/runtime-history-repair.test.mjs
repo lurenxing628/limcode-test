@@ -198,11 +198,13 @@ test('writer 在源变化时原子拒绝；真实运行时或已有维护事务�
   assert.equal(sql(f.alpha, (db) => inspectHistoryRepair(db).orphanOperations), 2);
 });
 
-test('当前库、硬链接和损坏的历史修复日志一律不修复', async (t) => {
+test('离线当前库可检查，硬链接和损坏的历史修复日志不修复', async (t) => {
   const f = await seed(t);
-  await assert.rejects(inspectRuntimeHistoryRepair(f.paths, {
-    candidateId: f.current.id, expectedDataSetId: f.current.binding.dataSetId, expectedRootInstanceId: f.current.binding.rootInstanceId
-  }), /当前库/);
+  const currentTarget = { candidateId: f.current.id, expectedDataSetId: f.current.binding.dataSetId, expectedRootInstanceId: f.current.binding.rootInstanceId };
+  await inspectRuntimeHistoryRepair(f.paths, currentTarget);
+  await withRuntime(f.current, async () => {
+    await assert.rejects(inspectRuntimeHistoryRepair(f.paths, currentTarget), /离线|Host|使用|维护/);
+  });
   const link = `${f.alpha.binding.paths.databasePath}.hardlink`;
   await fs.link(f.alpha.binding.paths.databasePath, link);
   await assert.rejects(inspectRuntimeHistoryRepair(f.paths, f.target), /独立的普通文件/);

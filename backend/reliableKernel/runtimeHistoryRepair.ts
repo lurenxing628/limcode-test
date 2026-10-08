@@ -52,7 +52,6 @@ async function withSource<T>(paths: Paths, target: RuntimeHistoryRepairTarget,
   body: (candidate: VscodeRuntimeDataSetCandidate, binding: HistoricalRootBinding) => Promise<T>): Promise<T> {
   return withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
     const candidate = await resolveVscodeRuntimeDataSet(paths, target.candidateId);
-    if (candidate.selected) throw new Error('不能在正在使用的当前库里修复历史残留；请先切换到另一个库并关闭使用这份库的窗口。');
     if (candidate.dataSetId !== target.expectedDataSetId || candidate.rootInstanceId !== target.expectedRootInstanceId) {
       throw new Error('历史库身份已经变化，请重新选择。');
     }

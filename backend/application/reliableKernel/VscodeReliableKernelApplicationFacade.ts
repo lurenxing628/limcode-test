@@ -18,8 +18,6 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/reposi
 import {
   createVscodeRootAuthority,
   completeVscodeRuntimeDataSetSelection,
-  assertConfigurationRootRuntimesOffline,
-  selectVscodeRuntimeDataSet,
   resolveVscodeWorkspaceRuntimePlacement,
   resolveVscodeWorkspaceRuntimeScope,
   type VscodeWorkspaceRuntimePlacement
@@ -725,21 +723,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         turns: await this.list('Turn', { conversation_id: conversationId }, 200)
       } : {})
     };
-  }
-
-  /** Native command confirmation precedes this offline switch; callers reload the window after it. */
-  public selectRuntimeDataSet(id: string): Promise<void> {
-    return this.write(() => this.selectRuntimeDataSetNow(id));
-  }
-
-  private async selectRuntimeDataSetNow(id: string): Promise<void> {
-    this.requireOpen();
-    const paths = this.getPaths();
-    await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
-      await assertConfigurationRootRuntimesOffline(paths.globalStoragePath, this.product.application.database.hostBootId);
-      await this.dispose();
-      await selectVscodeRuntimeDataSet(this.getPaths(), id);
-    });
   }
 
   public attachWebview(webview: vscode.Webview, meta: WebviewClientMeta = { kind: 'unknown' }): BridgeClientId {
