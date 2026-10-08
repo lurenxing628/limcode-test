@@ -24,8 +24,6 @@ const foreign = kernelFile('runtimeForeignHistory.js');
 const foreignMerge = kernelFile('runtimeForeignHistoryMerge.js');
 const { HISTORICAL_MERGE_ENGINE: engine, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
 const { prepareLargeMergeSources, runLargeMergeSession } = kernelFile('runtimeDataSetStreamedMerge.js');
-const { keepLargeMergeResult, largeMergeBatchResult, largeMergeDetails, largeMergeOperationKey, takeLargeMergeResult } = kernelFile('runtimeLargeMergeSession.js');
-const { largeMergeEngine } = kernelFile('runtimeLargeMergeEngine.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
 const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBackupCleanup.js');
@@ -275,8 +273,6 @@ test('小、中、大三种规模的外来库各合并一次：小的在线，�
     [[largeSource.id, largeSource.label, largeSource.root.located.dataRootPath]]);
   assert.deepEqual(session.results.map((result) => [result.candidateId, result.state, result.result?.exclusive, result.result?.linkedCasObjects]),
     [[largeSource.id, 'merged', true, 0]]);
-  const [detail] = largeMergeDetails(preparation.sources, session.results);
-  assert.ok(detail.startsWith(`${largeSource.label}（${largeSource.root.located.dataRootPath}，`), `会话详情用可读名称：${detail}`);
   assert.equal((await readLedgerRecord(fixture, largeSource.id)).state, 'merged');
   assert.equal(query(fixture.current.binding.paths.databasePath, "SELECT COUNT(*) FROM conversation WHERE id LIKE 'large_%'")[0], 5);
   assert.deepEqual([await treeState(small.container), await treeState(archivePath), await treeState(large.container)], trees, '三份外来库都一字节不变');
@@ -297,99 +293,6 @@ test('小、中、大三种规模的外来库各合并一次：小的在线，�
     } finally { await opened.close(); }
   }
   assert.deepEqual(query(fixture.current.binding.paths.databasePath, "SELECT COUNT(*) FROM turn WHERE status = 'active'"), [0]);
-});
-
-test('大库会话的真实接线（largeMergeEngine 适配层）合并外来大库：先只读估计（只经它的声明读、估计完就释放，不写账本、不碰外来目录，正文按全部复制计空间，用可读名称），同意之后再准备（指纹与估计相同，操作键一致）；准备结果与详情用可读名称，会话合并成功、正文只复制，外来目录不变、声明释放', { timeout: 300_000 }, async (t) => {
-  const fixture = await home(t);
-  // Above the online bound: the adapter takes it into the session (its threshold is the online bound).
-  const big = await copiedDirectory(fixture, (source) => generateSyntheticSource(source.current, { rows: 4_200, prefix: 'wired' }));
-  const source = await found(fixture, big.container);
-  const before = await treeState(big.container);
-  await request(fixture, source);
-  const adapter = largeMergeEngine();
-  const claims = () => fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'foreign-claims')).catch(() => []);
-  const database = await openWindow(fixture);
-  let estimated;
-  let preparation;
-  try {
-    // Read-only first, as the session asks before the prompt or the confirmation.
-    estimated = await adapter.estimate({
-      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: [source.id], requested: true
-    });
-    assert.deepEqual(estimated.sources.map((item) => [item.candidateId, item.label]), [[source.id, source.label]], '估计也用可读名称');
-    assert.ok(estimated.preparing.expectedMs > 0 && estimated.duration.expectedMs > 0);
-    assert.deepEqual(await claims(), [], '估计完就释放声明');
-    assert.deepEqual(await treeState(big.container), before, '估计不碰外来目录');
-    assert.equal(await readLedgerRecord(fixture, source.id), undefined, '估计不写账本');
-    assert.deepEqual(await ledgerEntries(fixture, 'preparing'), []);
-    // Agreed: prepared now (under its claim until the session or the release).
-    preparation = await adapter.prepare({
-      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: estimated.sources.map((item) => item.candidateId), requested: true
-    });
-  } finally { await database.close(); }
-  // A foreign root is never finalized: the same fingerprint, the same coordination key before the countdown and in the session.
-  assert.deepEqual(preparation.sources.map((item) => item.fingerprint), estimated.sources.map((item) => item.fingerprint));
-  assert.equal(largeMergeOperationKey(fixture.current.binding, estimated.sources), largeMergeOperationKey(fixture.current.binding, preparation.sources));
-  // Its content objects are counted as copied into the target (never linked): the estimate's figure has them, the online backup too.
-  assert.ok(estimated.space.targetBytes > preparation.space.targetBytes, JSON.stringify([estimated.space, preparation.space]));
-  assert.deepEqual(preparation.sources.map((item) => [item.candidateId, item.label]), [[source.id, source.label]], '外来来源的名称透传到会话');
-  assert.ok(largeMergeDetails(preparation.sources, [])[0].startsWith(`${source.label}（`));
-  const outcomes = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
-    () => adapter.run({ paths: fixture.paths, target: { configurationRootPath: fixture.root, binding: fixture.current.binding }, preparation })));
-  assert.deepEqual(outcomes.map((item) => [item.candidateId, item.state, item.result?.linkedCasObjects, item.result?.label]), [[source.id, 'merged', 0, source.label]],
-    '会话的结果也带可读名称（合并通知据此附上清理备份的提示）');
-  assert.equal(query(fixture.current.binding.paths.databasePath, "SELECT COUNT(*) FROM conversation WHERE id LIKE 'wired_%'")[0], 67);
-  assert.equal((await readLedgerRecord(fixture, source.id)).state, 'merged');
-  assert.deepEqual(await treeState(big.container), before, '外来目录一字节不变');
-  assert.deepEqual(await fs.readdir(path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'foreign-claims')).catch(() => []), [], '声明已释放');
-});
-
-test('大库会话的真实接线：外来大库在会话里才受阻（准备之后当前库另写了它的一条记录）：会话结果、批结果与重载后保留的结果都带可读名称，原因列表不写 id；当前库只有另写的那一条', { timeout: 300_000 }, async (t) => {
-  const fixture = await home(t);
-  const big = await copiedDirectory(fixture, (source) => generateSyntheticSource(source.current, { rows: 4_200, prefix: 'clash' }));
-  const source = await found(fixture, big.container);
-  await request(fixture, source);
-  const adapter = largeMergeEngine();
-  const database = await openWindow(fixture);
-  let preparation;
-  try {
-    preparation = await adapter.prepare({
-      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds: [source.id], requested: true
-    });
-    // After the preparation compared it: this window writes a different version of one of its conversations.
-    await database.transaction([repo('Conversation').insert({ id: 'clash_0000000', title: '在当前库另写的', status: 'active', created_at: NOW, updated_at: NOW })]);
-  } finally { await database.close(); }
-  assert.deepEqual(preparation.sources.map((item) => item.candidateId), [source.id]);
-  const outcomes = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
-    () => adapter.run({ paths: fixture.paths, target: { configurationRootPath: fixture.root, binding: fixture.current.binding }, preparation })));
-  assert.deepEqual(outcomes.map((item) => [item.candidateId, item.state, item.code, item.label]),
-    [[source.id, 'blocked', 'runtime-data-set-merge-conflict', source.label]], '会话结果带外来来源的可读名称');
-  // As the session tells it after the reload (runtimeDataSetManagement's reasons list names an issue by its label).
-  const report = largeMergeBatchResult(outcomes, true);
-  assert.deepEqual(report.blocked.map((issue) => [issue.candidateId, issue.label, issue.requested]), [[source.id, source.label, true]]);
-  const values = new Map();
-  const state = { get: (key) => values.get(key), update: async (key, value) => { values.set(key, value); } };
-  await keepLargeMergeResult(state, { configurationRootPath: fixture.root, requested: true, report, details: largeMergeDetails(preparation.sources, outcomes) });
-  const kept = takeLargeMergeResult(state, Date.now());
-  assert.deepEqual(kept.report.blocked.map((issue) => `${issue.label ?? issue.candidateId}\n[${issue.code}]`), [`${source.label}\n[runtime-data-set-merge-conflict]`]);
-  assert.ok(kept.details[0].startsWith(`${source.label}（`));
-  assert.deepEqual(query(fixture.current.binding.paths.databasePath, "SELECT title FROM conversation WHERE id LIKE 'clash_%'"), ['在当前库另写的'], '整份回滚');
-
-  // A source that never started (the session was cancelled before it) has no issue: named by its preparation.
-  const other = await found(fixture, (await copiedDirectory(fixture, (copy) => generateSyntheticSource(copy.current, { rows: 4_200, prefix: 'later' }))).container);
-  await request(fixture, other);
-  const window = await openWindow(fixture);
-  let second;
-  try {
-    second = await adapter.prepare({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, candidateIds: [other.id], requested: true });
-  } finally { await window.close(); }
-  const cancelled = new AbortController();
-  cancelled.abort();
-  const notRun = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
-    () => adapter.run({ paths: fixture.paths, target: { configurationRootPath: fixture.root, binding: fixture.current.binding }, preparation: second, signal: cancelled.signal })));
-  assert.deepEqual(notRun.map((item) => [item.candidateId, item.state, item.code, item.label]),
-    [[other.id, 'deferred', 'runtime-data-set-merge-cancelled', other.label]]);
-  assert.deepEqual(largeMergeBatchResult(notRun, true).deferred.map((issue) => issue.label), [other.label]);
 });
 
 test('以前的数据目录里的归档（迁移后留在旧目录，globalStatus 记下的历次旧目录）同样可以合并：严格定位 side=previous 的位置，旧目录一字节不变', async (t) => {

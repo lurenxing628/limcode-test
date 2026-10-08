@@ -287,7 +287,6 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/runtime-maintenance-transaction.test.mjs',
   'tests/reliable-kernel/runtime-database-durability-snapshots.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-streamed.test.mjs',
-  'tests/reliable-kernel/runtime-dataset-merge-estimate.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-streamed-review.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-blind-review.test.mjs',
   'tests/reliable-kernel/runtime-dataset-merge-streamed-crash.test.mjs',

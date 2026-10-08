@@ -8,8 +8,6 @@ import {
 } from './fixtures/runtime-merge-fixture.mjs';
 
 const { largeMergeDiskDevice, largeMergeDiskNeeds, largeMergeSessionSpace } = kernelFile('runtimeDataSetLargeMergeSpace.js');
-const { planLargeMergeSpace, probeLargeMergeDisk } = kernelFile('runtimeLargeMergeSession.js');
-const { estimateLargeMergeSources } = kernelFile('runtimeDataSetStreamedMerge.js');
 const { planDataRootRelocation } = kernelFile('runtimeDataRootRelocation.js');
 const MiB = 1024 * 1024;
 const margin = 64 * MiB;
@@ -125,38 +123,8 @@ test('native disk probes treat zero as unavailable while retaining per-directory
     }
     return stat;
   });
-  assert.equal((await probeLargeMergeDisk(directories[0])).device, undefined);
   assert.equal(await largeMergeDiskDevice(directories[1]), undefined);
-  const result = await planLargeMergeSpace({
-    ...space, targetDirectory: directories[0], temporaryDirectory: directories[1], sqliteTemporaryDirectory: directories[2]
-  });
-  assert.equal(result.ok, false);
-  assert.equal(result.disks.length, 3);
-  assert.equal(result.disks.find(disk => disk.path === directories[1]).freeBytes, MiB);
-});
 
-test('large-merge estimate includes CAS copy bytes when source and target devices are unknown', async (t) => {
-  const fixture = await createConfigurationRoot();
-  t.after(() => removeConfigurationRoot(fixture.root));
-  const conversationId = 'unknown-volume-source';
-  await seedConversations(fixture.alpha, [{ id: conversationId }]);
-  const roots = new Set([fixture.alpha.binding.paths.casRootPath, fixture.current.binding.paths.casRootPath].map(value => path.resolve(value)));
-  const originalStat = fs.stat;
-  let probes = 0;
-  t.mock.method(fs, 'stat', async (input, ...args) => {
-    const stat = await originalStat(input, ...args);
-    if (roots.has(path.resolve(String(input)))) { stat.dev = 0; probes++; }
-    return stat;
-  });
-  await withRuntime(fixture.current, async (database) => {
-    const estimated = await estimateLargeMergeSources({
-      paths: fixture.paths, target: { configurationRootPath: fixture.root, database },
-      candidateIds: [fixture.alpha.id], options: { sizeLimits: { transactionRows: 1 } }
-    });
-    assert.equal(estimated.sources.length, 1, JSON.stringify(estimated.report));
-    assert.ok(probes >= 2, 'exercise both source and target CAS device probes');
-    assert.equal(estimated.space.casCopyBytes, Buffer.byteLength(SHARED_TEXT) + Buffer.byteLength(messageText(conversationId, 0)));
-  });
 });
 
 test('data-root relocation does not assume hard links when directory device identities are unavailable', async (t) => {

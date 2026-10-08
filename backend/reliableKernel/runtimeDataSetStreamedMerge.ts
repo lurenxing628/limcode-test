@@ -1,163 +1,80 @@
-import { recordRuntimeHistorySettlementConsents } from './runtimeHistoryConvergence';
-import { RuntimeMergeSettlementBatch } from './runtimeMergeSettlementBatch';
-import { RuntimeMergeConversationExclusions } from './runtimeMergeConversationExclusions';
-import { inspectUnfinishedWorkRows } from './runtimeDataSetMergeWork';
+import Database from 'better-sqlite3';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm, stat } from 'node:fs/promises';
+import { mkdtemp,rm,stat } from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { ResourceLimits } from 'node:worker_threads';
-import Database from 'better-sqlite3';
 import type { RootBinding } from './contracts';
-import { toSqliteFilePath } from './sqliteFilePath';
-import { DOMAIN_REPOSITORIES, type DomainRow, type RepositoryTransactionStep } from './repositories';
+import { DOMAIN_REPOSITORIES,type DomainRow,type RepositoryTransactionStep } from './repositories';
 import type { HistoricalRootBinding } from './rootAuthority';
-import { openRuntimeCasVerificationCache, type RuntimeCasVerificationCache, type RuntimeCasVerifier } from './runtimeCasVerificationCache';
-import { RuntimeDatabase, RuntimeDatabaseWorkerError } from './runtimeDatabase';
-import { casTransferCanLinkRoots, casTransferPackedStorageBytes } from './runtimeCasTransfer';
-import {
-  HISTORICAL_MERGE_ENGINE as engine, planMergeChunk, RuntimeDataSetMergeEvidence, RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
-  type ForeignHistoricalMergeCandidate, type ForeignHistoricalMergeHold, type HistoricalMergeCandidate,
-  type HistoricalMergePickedSource, type HistoricalMergeRowPlan, type HistoricalMergeSourceMode, type HistoricalMergeSourceOutcome, type HistoricalMergeSourceProgress,
-  type HistoricalCasSnapshot, type HistoricalMergeTargetContext, type RuntimeDataSetCasTransfer,
-  type RuntimeDataSetMergeBatchResult, type RuntimeDataSetMergeChunkSink, type RuntimeDataSetMergeFaultPoint,
-  type RuntimeDataSetMergeIssue, type RuntimeDataSetMergeOptions, type RuntimeDataSetMergeResult
-} from './runtimeDataSetMerge';
+import { casTransferPackedStorageBytes } from './runtimeCasTransfer';
+import { openRuntimeCasVerificationCache,type RuntimeCasVerificationCache,type RuntimeCasVerifier } from './runtimeCasVerificationCache';
+import { ownProcessStartIdentity } from './runtimeClaimPrimitives';
+import { RuntimeDatabase,RuntimeDatabaseWorkerError } from './runtimeDatabase';
+import { isRuntimeDataInvariant } from './runtimeDataInvariant';
 import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
-  TIMELINE_IMPORT_PROVENANCE_DOMAIN, TIMELINE_MERGE_DOMAINS, readTimelineMergeSourceIdentity,
-  timelineMergeSourceRows, type TimelineMergeSourceRow
-} from './timelineMergeSource';
-import {
-  estimatedTargetIndexBytes, largeMergeDiskDevice, largeMergeSessionSpace, largeMergeSqliteTemporaryBytes, largeMergeTargetBytes,
-  LARGE_MERGE_WAL_PEAK_FACTOR, sqliteTemporaryDirectory
+largeMergeDiskDevice,
+largeMergeSqliteTemporaryBytes,largeMergeTargetBytes,
+sqliteTemporaryDirectory
 } from './runtimeDataSetLargeMergeSpace';
+import {
+HISTORICAL_MERGE_ENGINE as engine,planMergeChunk,
+RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS,
+RuntimeDataSetMergeEvidence,
+type ForeignHistoricalMergeCandidate,type ForeignHistoricalMergeHold,
+type HistoricalCasSnapshot,
+type HistoricalMergeCandidate,
+type HistoricalMergePickedSource,type HistoricalMergeRowPlan,type HistoricalMergeSourceMode,type HistoricalMergeSourceOutcome,type HistoricalMergeSourceProgress,
+type HistoricalMergeTargetContext,type RuntimeDataSetCasTransfer,
+type RuntimeDataSetMergeBatchResult,type RuntimeDataSetMergeChunkSink,type RuntimeDataSetMergeFaultPoint,
+type RuntimeDataSetMergeIssue,type RuntimeDataSetMergeOptions,type RuntimeDataSetMergeResult
+} from './runtimeDataSetMerge';
+import {
+isRuntimeDataSetMergePreparationLive,
+pruneRuntimeDataSetMergeCommits,
+readRuntimeDataSetMergeFinalization,readRuntimeDataSetMergeLedger,readRuntimeDataSetMergePreparation,removeRuntimeDataSetMergeCommit,
+removeRuntimeDataSetMergePreparation,removeRuntimeDataSetMergeRequest,
+removeRuntimeLargeMergeTargetBackup,
+RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS,
+sameRuntimeDataSetFingerprint,sameRuntimeDataSetIdentity,
+writeRuntimeDataSetMergeCommit,writeRuntimeDataSetMergeLedgerRecord,writeRuntimeDataSetMergePreparation,
+writeRuntimeLargeMergeTargetBackup,
+type RuntimeDataSetIdentity,type RuntimeLargeMergeTargetBackup
+} from './runtimeDataSetMergeLedger';
+import { describeUnfinishedWork,hasFinalizableWork,inspectUnfinishedWorkRows,type UnfinishedWorkInspection } from './runtimeDataSetMergeWork';
 import { withLocatedRuntimeRootFence } from './runtimeForeignHistory';
 import { holdForeignHistoricalMergeSource } from './runtimeForeignHistoryMerge';
-import { locateLocalRuntimeDataSet, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
-import { ownProcessStartIdentity } from './runtimeClaimPrimitives';
-import {
-  readRuntimeDataSetMergeFinalization, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeCommit,
-  removeRuntimeDataSetMergePreparation, removeRuntimeDataSetMergeRequest, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity,
-  isRuntimeDataSetMergePreparationLive, RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS,
-  writeRuntimeDataSetMergeCommit, writeRuntimeDataSetMergeLedgerRecord, writeRuntimeDataSetMergePreparation,
-  pruneRuntimeDataSetMergeCommits, readRuntimeLargeMergeSessionRate, rememberRuntimeLargeMergeSessionRate,
-  removeRuntimeLargeMergeTargetBackup, writeRuntimeLargeMergeTargetBackup,
-  type RuntimeDataSetAuditFacts, type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeLargeMergeTargetBackup
-} from './runtimeDataSetMergeLedger';
-import { describeUnfinishedWork, hasFinalizableWork, type UnfinishedWorkInspection } from './runtimeDataSetMergeWork';
-import { isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, withRuntimeDataRootAdmission } from './runtimeHostControl';
+import { recordRuntimeHistorySettlementConsents } from './runtimeHistoryConvergence';
+import { isRuntimeDataRootAdmissionHeld,isRuntimeMaintenanceHeld,withRuntimeDataRootAdmission } from './runtimeHostControl';
+import { locateLocalRuntimeDataSet,type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { MergeAggregatePreflight } from './runtimeMergeAggregatePreflight';
-import { isRuntimeDataInvariant } from './runtimeDataInvariant';
+import { MergeContextHandleStates } from './runtimeMergeContextHandleStates';
+import { RuntimeMergeConversationExclusions } from './runtimeMergeConversationExclusions';
+import { RuntimeMergeSettlementBatch } from './runtimeMergeSettlementBatch';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
 import {
-  createLocatedRuntimeDatabaseSnapshot, requireCompleteRuntimeDataSet, type RuntimeDataSetDatabaseSnapshot
+createLocatedRuntimeDatabaseSnapshot,requireCompleteRuntimeDataSet,type RuntimeDataSetDatabaseSnapshot
 } from './runtimeStorageInspection';
 import { RUNTIME_DOMAIN_SCHEMAS } from './schema/domainManifest';
-import { MergeContextHandleStates } from './runtimeMergeContextHandleStates';
-import { createVscodeRootAuthority, inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet } from './vscodeRootAuthority';
+import { toSqliteFilePath } from './sqliteFilePath';
+import {
+readTimelineMergeSourceIdentity,
+TIMELINE_IMPORT_PROVENANCE_DOMAIN,TIMELINE_MERGE_DOMAINS,
+timelineMergeSourceRows,type TimelineMergeSourceRow
+} from './timelineMergeSource';
+import { createVscodeRootAuthority,inspectVscodeRuntimeDataSets,resolveVscodeRuntimeDataSet } from './vscodeRootAuthority';
 
-/**
- * Large-merge session: historical data sets above the in-memory transaction bound
- * (RUNTIME_DATA_SET_MERGE_MAX_TRANSACTION_ROWS) are merged while every window of the target is paused,
- * each source in ONE streamed maintenance transaction of a private RuntimeDatabase (atomic: any
- * version, any installation only ever sees the source unmerged or merged).
- *
- * 0. estimateLargeMergeSources, read-only, before the user agreed: which sources a session would
- *    take, their fingerprints, and how long the preparation and the exclusive phase would take (from
- *    the cached audit of each source's exact files, or one private copy; sizes at conservative rates,
- *    the exclusive phase scaled by the last measured session). Nothing is finalized, backed up,
- *    published, recorded or claimed.
- * 1. prepareLargeMergeSources, only once the user agreed (it finalizes, backs up, publishes CAS
- *    objects and records outcomes), online and without any claim held for long (every window keeps
- *    working): the sources are picked as a batch picks them; per source a private snapshot audited in
- *    a worker, the unfinished-work probes, a streamed scan against the open target (counts, at most 20
- *    conflict samples, time), finalization when needed (as an online merge does it, then snapshot,
- *    audit and scan again), the CAS objects published with their verified file identities kept, and
- *    one online Backup API copy of the target. Only one window prepares a source at a time
- *    (`preparing/<id>.json`, heartbeat, taken over when stale).
- * 2. Coordination, closing the window's Runtime and reloading afterwards belong to the caller.
- * 3. runLargeMergeSession, inside the caller's configuration admission and target maintenance claim
- *    with this process's target Runtime closed: the selected data set is opened privately
- *    (`historical-merge-<uuid>`, maintenance: true); per source under its maintenance claim the source
- *    is checked unchanged, copied privately again (the audit's conclusions hold for the same file
- *    state), CAS objects are only lstat'ed, the ledger is read again, the committing record written,
- *    then the source is streamed in chunks of RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS rows in
- *    MERGE_DOMAIN_ORDER and rowid order with exactly the row rules of an online merge (planMergeChunk:
- *    content identities in savepoints, renumbered columns allocated in the transaction, historical
- *    copies, the rows of conversations deleted here since an earlier merge left out) and each chunk's
- *    presence assertions; its commit marker is appended after the last chunk and its bounded commit
- *    evidence completed right before the durable commit, the WAL is checkpointed (TRUNCATE), and only
- *    then is the source recorded as merged. A cancellation or a full disk rolls back the current source
- *    only; the sources merged before it stay. How long the merged sources took against the size model
- *    is kept for later estimates.
- */
+/** Streamed history convergence. The explicit command prepares sources online, then coordinates
+ * all windows and merges each source in one durable maintenance transaction. Discovery, published
+ * upgrades, exclusions, source claims and per-source cancellation remain backend responsibilities.
+ * No duration estimate, countdown, historical session rate or result cache is maintained. */
 
 /** Source rows compared and appended per chunk (streamed merge and online scan). */
 export const RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS: number = engine.READ_CHUNK;
 const PREPARATION_HEARTBEAT_MS = 10_000;
 export { RUNTIME_DATA_SET_MERGE_PREPARATION_STALE_MS };
-/** The preparation's estimate of the exclusive time (from its measured scan) is shown as this range of it. */
-export const RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE = Object.freeze({ low: 0.7, high: 1.6 });
-/**
- * A streamed merge also inserts (worker invariants, presence assertions, the commit): the session's
- * time without its copy relative to the online scan of the same rows. Measured 3.9 to 5.4 times
- * (sources of 20,000 to 300,000 rows, the smaller ones lower, targets of 5,000 to 400,000 rows), and
- * about 6.8 on the same machine under load; the estimate's range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE)
- * covers that spread.
- */
-const SESSION_ROW_COST_FACTOR = 5.2;
-/**
- * Exclusive time of one source that does not grow with it, ms: its fence, the checks and the copy's
- * setup, the ledger records, its share of opening and closing the private instance (measured about
- * 150 to 250 in all).
- */
-const SESSION_SOURCE_FIXED_MS = 300;
-/** lstat of a CAS object that was verified online (measured 0.035). */
-const CAS_OBJECT_MS = 0.05;
-/**
- * Exclusive time per source row of an estimate without a measured scan (streamed merge, commit), ms:
- * the streamed transaction measured 0.044 to 0.054 per row (sources of 35,000 to 250,000 rows,
- * targets up to 400,000 rows, a small virtual machine), whole sessions 0.058 on the same machine under load.
- */
-const UNMEASURED_ROW_MS = 0.06;
-/** Copy and checkpoint throughput an estimate without a measurement assumes, bytes per ms (100 MB/s). */
-const UNMEASURED_COPY_BYTES_PER_MS = (100 * 1024 * 1024) / 1000;
-/** Preparation of one source that does not grow with it (records, claim, audit worker, caches; measured 150 to 200), ms. */
-const PREPARE_SOURCE_FIXED_MS = 300;
-/** Preparation per source row, including audit, target scan and the exclusion dependency index.
- * The full 60k-row preparation measured about 5.2 s on Linux CI; the prior rate covered only
- * audit and scan. Keep the existing uncertainty range rather than changing the test bound. */
-const PREPARE_ROW_MS = 0.04;
-/**
- * The preparation's copy of a source and its online backup of the target, bytes per ms (200 MB/s;
- * measured 400 to 1,200 MB/s with the files cached, a disk that does not have them is slower).
- */
-const PREPARE_COPY_BYTES_PER_MS = (200 * 1024 * 1024) / 1000;
-/** Preparation per content object not verified before: lstat, hash, link and record it (measured 0.72 with its bytes cached), ms. */
-const PREPARE_CAS_OBJECT_MS = 1;
-/**
- * Per object copied into the target's CAS instead of linked (a foreign history root's always, a local
- * one's across disks): a private file written, fsynced and linked, ms (measured 1.6 in all, fsync-bound:
- * a slower disk takes longer).
- */
-const PREPARE_CAS_COPY_OBJECT_MS = 1.5;
-/** Reading and hashing CAS bytes not verified before, bytes per ms (100 MB/s, a disk that does not have them cached). */
-const PREPARE_HASH_BYTES_PER_MS = (100 * 1024 * 1024) / 1000;
-/**
- * The range of an estimate from sizes only (estimateLargeMergeSources): another machine, disk and
- * mix of rows may well be this much faster or slower than the rates above or the measured one.
- */
-export const RUNTIME_DATA_SET_LARGE_MERGE_UNMEASURED_RANGE = Object.freeze({ low: 0.4, high: 2.5 });
-/**
- * How much the last session of this configuration root measured against the size model
- * (readRuntimeLargeMergeSessionRate) scales later estimates of the exclusive phase: at least `low`,
- * at most `high` times.
- */
-export const RUNTIME_DATA_SET_LARGE_MERGE_MEASURED_RATE_BOUNDS = Object.freeze({ low: 0.5, high: 4 });
-/** A session whose merged sources the model gives less than this is not measured: its fixed parts would dominate. */
-const RATE_MIN_MODEL_MS = 1000;
 const SKIP_TABLE = 'limcode_merge_skip';
 /** An `all` skip rule's owners during one pass (allSkipRule). */
 const SKIP_CANDIDATES = 'limcode_merge_skip_candidate';
@@ -1165,8 +1082,7 @@ export interface PreparedLargeMergeSource {
   finalized?: RuntimeDataSetMergeResult['finalized'];
   upgradedFromEpoch?: 3 | 4 | 5;
   /** Estimated exclusive time of this source (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
-  estimateMs: number;
-  estimateRangeMs: [number, number];
+
 }
 
 /**
@@ -1188,9 +1104,8 @@ export interface LargeMergePreparation {
   /** The online target backup taken for the session (removed again when no session uses it). */
   backupPath?: string;
   space: LargeMergeSpace;
-  /** Sum of the sources' estimates (ms) and its range (RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE). */
-  estimateMs: number;
-  estimateRangeMs: [number, number];
+
+
 }
 
 interface PreparationInternals {
@@ -1378,7 +1293,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     small.length = 0;
   }
   const { pendingSources: _pending, ...batch } = report;
-  const estimateMs = prepared.reduce((sum, source) => sum + source.estimateMs, 0);
+
   const preparation: LargeMergePreparation = {
     configurationRootPath: target.configurationRootPath,
     targetCandidateId: (await selectedCandidate(paths).catch(() => undefined))?.id ?? '',
@@ -1388,9 +1303,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     preparationTemporaryBytes: internals.peakSnapshotBytes,
     small,
     ...(target.backup.path ? { backupPath: target.backup.path } : {}),
-    space: await sessionSpace(target, prepared, internals.targetIndexBytes ?? 0),
-    estimateMs,
-    estimateRangeMs: estimateRange(estimateMs)
+    space: await sessionSpace(target, prepared, internals.targetIndexBytes ?? 0)
   };
   PREPARATIONS.set(preparation, internals);
   if (prepared.length === 0) await releaseLargeMergePreparation(preparation);
@@ -1487,18 +1400,8 @@ async function prepareSource(
   }
   const merged = await engine.recordedConversations(paths, target, candidate);
   const chunkRows = options.chunkRows ?? RUNTIME_DATA_SET_STREAMED_MERGE_CHUNK_ROWS;
-  // The copy's own time, for the estimate (the audit that follows is not part of the session).
-  const timing = { startedAt: 0, copyMs: 0 };
-  const snapshotOptions: RuntimeDataSetMergeOptions = {
-    ...options,
-    onFaultPoint: async (point) => {
-      if (point === 'after-snapshot-copy') timing.copyMs = performance.now() - timing.startedAt;
-      await options.onFaultPoint?.(point);
-    }
-  };
   const snapshot = async (): Promise<Awaited<ReturnType<typeof engine.takeVerifiedSnapshot>>> => {
     progress('snapshot');
-    timing.startedAt = performance.now();
     const bytes = await sqliteFilesBytes(binding.paths.databasePath) + await casTransferPackedStorageBytes(binding.paths.casRootPath);
     const held = [...internals.retainedSnapshots].reduce((sum, [id, size]) => sum + (id === candidateId ? 0 : size), 0);
     const short = await engine.largeMergeShortDisk({
@@ -1511,7 +1414,7 @@ async function prepareSource(
     // charged again here; the prompt's total is retained explicitly for estimates and diagnostics.
     internals.retainedSnapshots.set(candidateId, bytes);
     internals.peakSnapshotBytes = Math.max(internals.peakSnapshotBytes, held + bytes);
-    return engine.takeVerifiedSnapshot(candidate, binding, 'finalize', state, mode, snapshotOptions, paths).catch(error => {
+    return engine.takeVerifiedSnapshot(candidate, binding, 'finalize', state, mode, options, paths).catch(error => {
       internals.retainedSnapshots.delete(candidateId);
       throw error;
     });
@@ -1627,7 +1530,7 @@ async function prepareSource(
       + await casTransferPackedStorageBytes(binding.paths.casRootPath);
     const casObjects = taken.audit.content!.objects;
     // Fixed part, copy, stream (the scan's measured rate with the inserts on top), checkpoint (about a copy's worth of writing), lstat per object.
-    const estimateMs = Math.round(SESSION_SOURCE_FIXED_MS + 2 * timing.copyMs + scan.elapsedMs * SESSION_ROW_COST_FACTOR + casObjects * CAS_OBJECT_MS);
+
     const finalized = engine.finalizedResult(state).finalized;
     return {
       kind: 'prepared',
@@ -1636,8 +1539,7 @@ async function prepareSource(
         fingerprint: state.fingerprint!.contentDigest, rows: size.rows, bytes: size.bytes, databaseBytes,
         insertRows: scan.insertRows, reusedRows: scan.reusedRows, insertConversations: scan.insertConversations,
         skippedConversations: state.skippedConversations ?? 0, casObjects, cas,
-        ...(finalized ? { finalized } : {}), ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {}),
-        estimateMs, estimateRangeMs: estimateRange(estimateMs)
+        ...(finalized ? { finalized } : {}), ...(state.upgradedFromEpoch !== undefined ? { upgradedFromEpoch: state.upgradedFromEpoch } : {})
       }
     };
   } finally {
@@ -1670,42 +1572,6 @@ async function sessionSpace(
   };
 }
 
-function estimateRange(ms: number): [number, number] {
-  return [Math.round(ms * RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE.low), Math.round(ms * RUNTIME_DATA_SET_LARGE_MERGE_ESTIMATE_RANGE.high)];
-}
-
-/**
- * The size model of one source's exclusive time without any measurement (ms): its fixed part, the
- * streamed rows, the copy and the checkpoint, an lstat per content object. A session measures itself
- * against it (readRuntimeLargeMergeSessionRate).
- */
-function sessionModelMs(source: { rows: number; databaseBytes: number; casObjects: number }): number {
-  return SESSION_SOURCE_FIXED_MS + source.rows * UNMEASURED_ROW_MS + (2 * source.databaseBytes) / UNMEASURED_COPY_BYTES_PER_MS
-    + source.casObjects * CAS_OBJECT_MS;
-}
-
-/**
- * The size model of one source's preparation (ms), the target backup not included (one per
- * preparation): its fixed part, the private copy with its worker audit and the scan, and every content
- * object hashed and linked (copied, fsynced and hashed again when the target's CAS is on another disk);
- * unfinished work to close first adds the source's backup and a second copy, audit and scan.
- */
-function prepareModelMs(facts: RuntimeDataSetAuditFacts, linked: boolean): number {
-  const pass = PREPARE_SOURCE_FIXED_MS + facts.databaseBytes / PREPARE_COPY_BYTES_PER_MS + facts.rows * PREPARE_ROW_MS;
-  const finalize = facts.finalizableTurns + facts.finalizableIntents > 0 ? pass + facts.databaseBytes / PREPARE_COPY_BYTES_PER_MS : 0;
-  const cas = facts.casObjects * PREPARE_CAS_OBJECT_MS + facts.casBytes / PREPARE_HASH_BYTES_PER_MS
-    + (linked ? 0 : facts.casObjects * PREPARE_CAS_COPY_OBJECT_MS + facts.casBytes / PREPARE_COPY_BYTES_PER_MS + facts.casBytes / PREPARE_HASH_BYTES_PER_MS);
-  return pass + finalize + cas;
-}
-
-/** How much the last measured session of this configuration root scales the exclusive-phase model (bounded), if one was measured. */
-async function measuredSessionRate(paths: { globalStoragePath: string }): Promise<{ measuredAt: string; factor: number } | undefined> {
-  const rate = await readRuntimeLargeMergeSessionRate(paths).catch(() => undefined);
-  if (!rate) return undefined;
-  const { low, high } = RUNTIME_DATA_SET_LARGE_MERGE_MEASURED_RATE_BOUNDS;
-  return { measuredAt: rate.measuredAt, factor: Math.min(high, Math.max(low, rate.sessionMs / rate.modelMs)) };
-}
-
 async function sqliteFilesBytes(databasePath: string): Promise<number> {
   let bytes = 0;
   for (const file of [databasePath, `${databasePath}-wal`]) bytes += await stat(file).then((info) => info.size, () => 0);
@@ -1717,280 +1583,6 @@ async function selectedCandidate(paths: { globalStoragePath: string }) {
   return selected.length === 1 ? selected[0] : undefined;
 }
 
-// ---------------------------------------------------------------------------------------------
-// Estimate: read-only, before the user agreed to the session.
-// ---------------------------------------------------------------------------------------------
-
-export type LargeMergeEstimateStage = 'snapshot' | 'audit';
-
-export interface LargeMergeEstimateProgress {
-  stage: LargeMergeEstimateStage;
-  candidateId: string;
-  /** 0-based among the sources this call works on. */
-  index: number;
-  total: number;
-}
-
-export interface EstimateLargeMergeInput {
-  paths: { globalStoragePath: string };
-  target: LargeMergeTarget;
-  /** Only these sources (e.g. the batch's awaiting-exclusive ones); default every pending source. */
-  candidateIds?: readonly string[];
-  /** The user asked for `candidateIds` (as the preparation's `requested`): a source kept or merged before counts too. */
-  requested?: boolean;
-  /** As the preparation's: above the in-memory bound (default), or also above the online bound. */
-  threshold?: 'in-memory' | 'online';
-  /** Stops between sources and while one is copied: `report.stopped`, no sources. */
-  signal?: AbortSignal;
-  /** Only when a source is copied and audited (its exact files were not audited before). */
-  onProgress?(progress: LargeMergeEstimateProgress): void;
-  options?: LargeMergeEngineOptions;
-}
-
-export interface LargeMergeEstimatedSource {
-  candidateId: string;
-  /** A foreign history root's readable name (its id is not). */
-  label?: string;
-  sourceDataSetId: string;
-  /** Where the source is (its Runtime data root), for details the user can open. */
-  runtimeDataRootPath: string;
-  /**
-   * Content digest of the source files judged (the audit cache of their exact state, or this call's
-   * audit): the value the preparation's `fingerprint` has for the same files, so a coordination key
-   * made of it stays the same while the source does not change, and changes when it does. A
-   * preparation that first closes the source's unfinished work changes the source: its fingerprint,
-   * and every later estimate's, is then that of the finalized content.
-   */
-  fingerprint: string;
-  /** Rows and page bytes of every Runtime table, the SQLite database plus WAL, and the content objects. */
-  rows: number;
-  bytes: number;
-  databaseBytes: number;
-  casObjects: number;
-  /** Background preparation of this source (ms; the target backup is counted once, in the total), and its range. */
-  prepareEstimateMs: number;
-  prepareEstimateRangeMs: [number, number];
-  /** Exclusive phase of this source (every window paused), ms, and its range. */
-  sessionEstimateMs: number;
-  sessionEstimateRangeMs: [number, number];
-  /** The exclusive phase again (sessionEstimateMs, sessionEstimateRangeMs). */
-  estimateMs: number;
-  estimateRangeMs: [number, number];
-  /** From the audit cache of the source's exact files (nothing copied); false: copied and audited by this call. */
-  cached: boolean;
-}
-
-export interface LargeMergeEstimateSpace extends LargeMergeSpace {
-  /** Part of targetBytes: the online target backup the preparation takes (the target's database and WAL now). */
-  targetBackupBytes: number;
-  /** Part of targetBytes: copied logical bodies plus packed storage allowance; 0 only for entirely linkable loose roots. */
-  casCopyBytes: number;
-}
-
-export interface LargeMergeEstimate {
-  /** The sources a session would take, in candidate order. */
-  sources: LargeMergeEstimatedSource[];
-  /** Sources with an outcome that needs no session, as a batch reports them; nothing of it is recorded. */
-  report: Omit<RuntimeDataSetMergeBatchResult, 'pendingSources'>;
-  /** Largest sum of private source copies retained for the batch's single settlement prompt. */
-  preparationTemporaryBytes: number;
-  /** Left to the online merge: not above the chosen threshold. */
-  small: string[];
-  /** Disk space the preparation and the session would still need (the target backup included). */
-  space: LargeMergeEstimateSpace;
-  /** The background preparation: the sources' and one online target backup (ms), and its range. */
-  prepareEstimateMs: number;
-  prepareEstimateRangeMs: [number, number];
-  /** The exclusive phase, every window paused: the sum of the sources' (ms), and its range. */
-  sessionEstimateMs: number;
-  sessionEstimateRangeMs: [number, number];
-  /** The exclusive phase again (sessionEstimateMs, sessionEstimateRangeMs): how long every window pauses. */
-  estimateMs: number;
-  estimateRangeMs: [number, number];
-  /** Present when the last session of this configuration root measured this machine: the exclusive times are the size model's times `factor`. */
-  sessionRate?: { measuredAt: string; factor: number };
-}
-
-type EstimatedOutcome = { kind: 'estimated'; source: LargeMergeEstimatedSource; casCopyBytes: number } | { kind: 'small' };
-
-/**
- * What a large-merge session would take and how long it would pause every window, before the user
- * agreed to it: read-only. No finalization, no backup, no CAS transfer, no ledger record, no
- * preparation claim, no published 3/4/5 upgrade. A source whose exact files were audited before (by
- * the startup batch, an earlier estimate or preparation) is judged from that audit's cached facts
- * without being read; any other is copied privately and audited once, which caches its facts (the
- * audit and fingerprint caches are the only files this call writes). Each source comes with the
- * fingerprint the preparation gives it (a coordination key part). The background preparation and the
- * exclusive phase are estimated apart, from the sizes and conservative rates (no scan); the exclusive
- * phase at the rate the last session of this configuration root measured when there is one
- * (readRuntimeLargeMergeSessionRate, bounded by RUNTIME_DATA_SET_LARGE_MERGE_MEASURED_RATE_BOUNDS).
- * Each comes with a range that says how uncertain it is (RUNTIME_DATA_SET_LARGE_MERGE_UNMEASURED_RANGE);
- * the preparation measures the exclusive phase again. Never throws for a single source: its outcome
- * goes into `report` (never recorded).
- */
-export async function estimateLargeMergeSources(input: EstimateLargeMergeInput): Promise<LargeMergeEstimate> {
-  const paths = { globalStoragePath: path.resolve(input.paths.globalStoragePath) };
-  const options = input.options ?? {};
-  const report: RuntimeDataSetMergeBatchResult = { merged: [], deferred: [], blocked: [], failures: [], pendingSources: 0, stopped: false };
-  const keepGoing = (): boolean => {
-    if (!input.signal?.aborted) return true;
-    report.stopped = true;
-    return false;
-  };
-  const target = engine.targetContext({ configurationRootPath: input.target.configurationRootPath, database: input.target.database });
-  const requested = input.requested === true && input.candidateIds !== undefined;
-  const { sources } = await engine.pickSources(paths, target, {
-    ...(input.candidateIds ? { candidateIds: input.candidateIds } : {}), requested, readOnly: true,
-    ...(options.sizeLimits ? { sizeLimits: options.sizeLimits } : {})
-  }, report, keepGoing);
-  const estimated: LargeMergeEstimatedSource[] = [];
-  const small: string[] = [];
-  const spaceSources: Array<{ databaseBytes: number; casCopyBytes: number }> = [];
-  const rate = sources.length > 0 ? await measuredSessionRate(paths) : undefined;
-  for (const [index, picked] of sources.entries()) {
-    if (!keepGoing()) break;
-    const candidateId = picked.id;
-    const state: HistoricalMergeSourceProgress = {};
-    const mode: HistoricalMergeSourceMode = { finalizeWork: true, requested: picked.requested, readOnly: true };
-    const progress = (stage: LargeMergeEstimateStage): void => input.onProgress?.({ stage, candidateId, index, total: sources.length });
-    let outcome: EstimatedOutcome;
-    try {
-      // A foreign root is only read under its claim (under this configuration root), taken here outside
-      // the admission for this estimate only, as for its fingerprint (never its local paths directly).
-      if (picked.foreign) state.foreign = await holdForeignHistoricalMergeSource(paths, candidateId, picked.foreign);
-      outcome = await estimateSource(paths, target, candidateId, mode, state, input, rate?.factor ?? 1, progress);
-    } catch (error) {
-      const refusal = engine.sourceOutcome(error, state);
-      if (refusal.kind === 'stopped' || isAbort(error)) {
-        report.stopped = true;
-        break;
-      }
-      const issue: RuntimeDataSetMergeIssue = {
-        candidateId, code: refusal.code, message: refusal.message, newly: true, requested: picked.requested,
-        ...(picked.label ? { label: picked.label } : {}), ...(refusal.awaiting ? { size: refusal.awaiting } : {})
-      };
-      (refusal.kind === 'deferred' ? report.deferred : refusal.kind === 'blocked' ? report.blocked : report.failures).push(issue);
-      continue;
-    } finally {
-      await state.foreign?.release();
-    }
-    if (outcome.kind === 'small') {
-      small.push(candidateId);
-      continue;
-    }
-    estimated.push(outcome.source);
-    spaceSources.push({ databaseBytes: outcome.source.databaseBytes, casCopyBytes: outcome.casCopyBytes });
-  }
-  if (!keepGoing() || report.stopped) {
-    // Stopped: nothing of it is offered.
-    estimated.length = 0;
-    small.length = 0;
-    spaceSources.length = 0;
-  }
-  const { pendingSources: _pending, ...batch } = report;
-  const targetBackupBytes = estimated.length > 0 ? await sqliteFilesBytes(target.binding.paths.databasePath) : 0;
-  const casCopyBytes = spaceSources.reduce((sum, source) => sum + source.casCopyBytes, 0);
-  // The one online backup of the target the preparation takes (a copy's worth of reading and writing).
-  const prepareEstimateMs = estimated.length === 0 ? 0
-    : estimated.reduce((sum, source) => sum + source.prepareEstimateMs, 0) + Math.round(targetBackupBytes / PREPARE_COPY_BYTES_PER_MS);
-  const sessionEstimateMs = estimated.reduce((sum, source) => sum + source.sessionEstimateMs, 0);
-  // The figures a batch checks before sources wait for a session (largeMergeSessionSpace): the target's
-  // index pages at their share of its files (the preparation measures them on its backup).
-  const space = largeMergeSessionSpace({
-    targetDirectory: target.controlRoot, targetFilesBytes: targetBackupBytes, sources: spaceSources,
-    marginBytes: engine.BACKUP_FREE_SPACE_MARGIN_BYTES, temporaryDirectory: os.tmpdir(), sqliteTemporaryDirectory: await sqliteTemporaryDirectory()
-  });
-  return {
-    sources: estimated,
-    report: batch,
-    preparationTemporaryBytes: space.temporaryBytes,
-    small,
-    space: {
-      ...space,
-      targetIndexBytes: estimated.length === 0 ? 0 : estimatedTargetIndexBytes(targetBackupBytes),
-      targetBackupBytes, casCopyBytes
-    },
-    prepareEstimateMs,
-    prepareEstimateRangeMs: unmeasuredRange(prepareEstimateMs),
-    sessionEstimateMs,
-    sessionEstimateRangeMs: unmeasuredRange(sessionEstimateMs),
-    estimateMs: sessionEstimateMs,
-    estimateRangeMs: unmeasuredRange(sessionEstimateMs),
-    ...(rate && estimated.length > 0 ? { sessionRate: rate } : {})
-  };
-}
-
-/** One source of an estimate: the ledger, the preparation records and the source read, never written. */
-async function estimateSource(
-  paths: { globalStoragePath: string },
-  target: HistoricalMergeTargetContext,
-  candidateId: string,
-  mode: HistoricalMergeSourceMode,
-  state: HistoricalMergeSourceProgress,
-  input: EstimateLargeMergeInput,
-  sessionRate: number,
-  progress: (stage: LargeMergeEstimateStage) => void
-): Promise<EstimatedOutcome> {
-  const options = input.options ?? {};
-  const recorded = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
-  if (recorded?.state === 'committing' && sameRuntimeDataSetIdentity(recorded.target, target.identity)) {
-    throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '上次合并这个库时中断了，下次启动时先确认它的结果。' });
-  }
-  const preparing = await readRuntimeDataSetMergePreparation(paths, candidateId).catch(() => undefined);
-  if (preparing && isRuntimeDataSetMergePreparationLive(preparing)) {
-    throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-preparing-elsewhere', message: '另一个窗口正在准备合并这份较大的旧聊天记录，由那个窗口完成。' });
-  }
-  const { candidate, binding } = await engine.resolveSource(paths, target, candidateId, mode, state);
-  let facts: RuntimeDataSetAuditFacts | undefined = await engine.cachedAudit(paths, candidate, state);
-  const cached = facts !== undefined;
-  if (!facts) {
-    progress('snapshot');
-    const taken = await engine.takeVerifiedSnapshot(candidate, binding, 'finalize', state, mode, {
-      ...options,
-      onFaultPoint: async (point) => {
-        if (point === 'after-snapshot-copy') {
-          if (input.signal?.aborted) throw new engine.StopRequested();
-          progress('audit');
-        }
-        await options.onFaultPoint?.(point);
-      }
-    }, paths);
-    await engine.closeSnapshot(taken.snapshot);
-    facts = engine.auditFacts(state.files!, taken.audit);
-    if (!facts) throw new Error('The audit of this source measured nothing.');
-  }
-  const fingerprint = state.fingerprint?.contentDigest;
-  if (fingerprint === undefined) throw new Error('The audit of this source gave no fingerprint.');
-  engine.assertMergeableSize(facts, options, state, true);
-  if (!aboveThreshold(facts, input.threshold ?? 'in-memory', options)) return { kind: 'small' };
-  // Conversation-level refusals are resolved by preparation's existing scan, not a whole-source
-  // rejection from these aggregate estimate counts.
-  // Entirely loose local roots may link on one disk. Mixed roots count copies and packed storage
-  // overhead conservatively; every source needs its private sidecar snapshot in temp space.
-  const foreign = engine.isForeignCandidate(candidate);
-  const linked = !foreign && await casTransferCanLinkRoots(binding.paths.casRootPath, target.binding.paths.casRootPath);
-  const packedBytes = await casTransferPackedStorageBytes(binding.paths.casRootPath);
-  const prepareEstimateMs = Math.round(prepareModelMs(facts, linked));
-  const sessionEstimateMs = Math.round(sessionModelMs(facts) * sessionRate);
-  return {
-    kind: 'estimated',
-    casCopyBytes: linked ? 0 : facts.casBytes + packedBytes,
-    source: {
-      candidateId, ...(foreign ? { label: candidate.label } : {}), sourceDataSetId: binding.dataSetId,
-      runtimeDataRootPath: candidate.runtimeDataRootPath,
-      // As the preparation gives it: the content digest of exactly these files (cached with their audit).
-      fingerprint,
-      rows: facts.rows, bytes: facts.bytes, databaseBytes: facts.databaseBytes + packedBytes, casObjects: facts.casObjects,
-      prepareEstimateMs, prepareEstimateRangeMs: unmeasuredRange(prepareEstimateMs),
-      sessionEstimateMs, sessionEstimateRangeMs: unmeasuredRange(sessionEstimateMs),
-      estimateMs: sessionEstimateMs, estimateRangeMs: unmeasuredRange(sessionEstimateMs), cached
-    }
-  };
-}
-
-function unmeasuredRange(ms: number): [number, number] {
-  return [Math.round(ms * RUNTIME_DATA_SET_LARGE_MERGE_UNMEASURED_RANGE.low), Math.round(ms * RUNTIME_DATA_SET_LARGE_MERGE_UNMEASURED_RANGE.high)];
-}
 
 // ---------------------------------------------------------------------------------------------
 // Exclusive session.
@@ -2012,11 +1604,7 @@ export interface LargeMergeSessionProgress {
   sessionTotalRows: number;
   /** Since the session started. */
   elapsedMs: number;
-  /**
-   * The rest of the session: its rows at the rate measured while rows streamed, plus the fixed part
-   * per source still to start (the preparation's estimates before a second of streaming; LargeMergeSessionClock).
-   */
-  remainingMs: number;
+
 }
 
 export interface RunLargeMergeSessionInput {
@@ -2103,18 +1691,14 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
           : deferAll('runtime-data-set-merge-backup-unrecorded', '无法记下合并前备份的使用，这次没有合并；以后启动时会再合并。');
       }
     }
-    // This session against the size model, for later estimates: its merged sources with opening and closing the private instance.
-    const measured = { sources: 0, rows: 0, sessionMs: 0, modelMs: 0 };
-    const openingAt = performance.now();
     const database = await RuntimeDatabase.open(
       createVscodeRootAuthority({ runtimeDataRootPath: selected.runtimeDataRootPath, configurationRootPath: selected.configurationRootPath }),
       { hostBootId: `historical-merge-${randomUUID()}`, maintenance: true, ...(options.workerResourceLimits ? { resourceLimits: options.workerResourceLimits } : {}) }
     );
-    measured.sessionMs += performance.now() - openingAt;
     const target = engine.targetContext({ configurationRootPath: preparation.configurationRootPath, database });
     if (preparation.backupPath) target.backup = { path: preparation.backupPath };
     const resolver = historicalMergeSources(paths, (candidateId) => internals.sources.get(candidateId)?.state.foreign);
-    const clock = new LargeMergeSessionClock(preparation, input.onProgress);
+    const clock = new RuntimeHistoryMergeProgress(preparation, input.onProgress);
     let verified: (RuntimeCasVerifier & { close(): void }) | undefined;
     try {
       // The CAS objects the preparation verified and published: unchanged ones are only lstat'ed.
@@ -2128,7 +1712,6 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         await options.onFaultPoint?.('before-source', { candidateId: prepared.candidateId, index });
         const sourceInternals = internals.sources.get(prepared.candidateId)!;
         const mode: HistoricalMergeSourceMode = { finalizeWork: true, requested: internals.requested, pickedAt: internals.pickedAt };
-        const startedAt = performance.now();
         const outcome = await engine.runSourceAttempt(paths, target, prepared.candidateId, mode,
           (state) => mergePreparedSource(paths, target, resolver, prepared, verified!, state, mode, options, input.signal,
             clock.source(index, prepared), preparation.space.targetIndexBytes)
@@ -2137,12 +1720,6 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         clock.sourceDone(prepared);
         const result = sourceResult(prepared.candidateId, outcome, internals.requested, prepared.label);
         results.results.push(result);
-        if (result.state === 'merged') {
-          measured.sources += 1;
-          measured.rows += prepared.rows;
-          measured.sessionMs += performance.now() - startedAt;
-          measured.modelMs += sessionModelMs(prepared);
-        }
         if (result.state === 'merged' || result.state === 'current') await engine.mergeRequestDone(paths, prepared.candidateId, target).catch(() => undefined);
         if (result.state === 'blocked' || result.state === 'failed') await removeRuntimeDataSetMergeRequest(paths, prepared.candidateId).catch(() => undefined);
         sourceInternals.state.exclusions?.close();
@@ -2160,7 +1737,6 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
       }
     } finally {
       verified?.close();
-      const closingAt = performance.now();
       // Closing the private instance cannot undo what committed: a failure is logged, the results stand.
       await database.close().catch((error: unknown) => {
         console.warn('[LimCode] 合并较大的旧聊天记录之后关闭私有实例出错；已合并的部分不受影响。', error);
@@ -2172,14 +1748,8 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
       // A used backup stays as the pre-merge backup; an unused one that could not be removed stays
       // registered, as unused again (marked used before the first source), for the pruning to remove.
       await internals.claims.releaseBackup(used || settled);
-      measured.sessionMs += performance.now() - closingAt;
     }
-    // Only a session long enough that its fixed parts do not dominate; replaces the last one.
-    if (measured.sources > 0 && measured.modelMs >= RATE_MIN_MODEL_MS) {
-      await rememberRuntimeLargeMergeSessionRate(paths, {
-        sources: measured.sources, rows: measured.rows, sessionMs: Math.round(measured.sessionMs), modelMs: Math.round(measured.modelMs)
-      }).catch(() => undefined);
-    }
+
   } finally {
     internals.released = true;
     await releaseHolds(internals);
@@ -2201,104 +1771,29 @@ function sourceResult(candidateId: string, outcome: HistoricalMergeSourceOutcome
   return { candidateId, state: outcome.kind, issue: { candidateId, code: outcome.code, message: outcome.message, newly: true, requested, ...named } };
 }
 
-/**
- * Streaming measured for at least this long (all sources of the session together) before its rate
- * says how long the rest takes; until then the preparation's estimates do.
- */
-const SESSION_RATE_MIN_STREAM_MS = 1000;
-
-/**
- * Progress of a session: throttled, with the time the rest takes. Each source first does work whose
- * time does not grow with its rows (the private copy again, an lstat per content object, the
- * left-out closure, the committing record), then streams its rows. The rate is measured only while
- * rows stream (rows streamed per ms of streaming), never over the fixed parts: the rest takes its
- * rows at that rate plus, per source still to start, the fixed part the sources so far took. Before
- * there is such a rate (the first second of streaming), the preparation's estimates of the source
- * that runs (less the time it ran) and of the later ones. Exported for tests only.
- */
-export class LargeMergeSessionClock {
-  private readonly startedAt: number;
-  private readonly totalRows: number;
-  private lastReport = 0;
-  private lastStage: string | undefined;
-  /** Rows of finished sources; rows they streamed and for how long; their other (fixed) time. */
+/** Row/stage progress only; no time prediction or persisted rate. */
+class RuntimeHistoryMergeProgress {
   private doneRows = 0;
-  private streamedRows = 0;
-  private streamedMs = 0;
-  private fixedMs = 0;
-  private fixedSources = 0;
-  private current: {
-    index: number; prepared: PreparedLargeMergeSource; startedAt: number; streamStartedAt?: number; streamEndedAt?: number; rows: number;
-  } | undefined;
-
-  public constructor(
-    private readonly preparation: Pick<LargeMergePreparation, 'sources'>,
-    private readonly report?: (progress: LargeMergeSessionProgress) => void,
-    /** Tests: the clock (ms). */
-    private readonly now: () => number = () => performance.now()
-  ) {
-    this.startedAt = now();
+  private lastReport = 0;
+  private lastStage = '';
+  private readonly startedAt = performance.now();
+  private readonly totalRows: number;
+  public constructor(private readonly preparation: Pick<LargeMergePreparation, 'sources'>,
+    private readonly report?: (progress: LargeMergeSessionProgress) => void) {
     this.totalRows = preparation.sources.reduce((sum, source) => sum + source.rows, 0);
   }
-
   public source(index: number, prepared: PreparedLargeMergeSource): (stage: LargeMergeSessionStage, rows: number) => void {
     return (stage, rows) => {
-      const now = this.now();
-      if (this.current?.index !== index) this.current = { index, prepared, startedAt: now, rows: 0 };
-      const current = this.current;
-      if (stage === 'merging') {
-        current.streamStartedAt ??= now;
-        current.rows = Math.min(rows, prepared.rows);
-      } else if (current.streamStartedAt !== undefined) {
-        current.streamEndedAt ??= now;
-        current.rows = prepared.rows;
-      }
       if (!this.report) return;
-      const key = `${index}:${stage}`;
+      const now = performance.now(), key = index + ':' + stage;
       if (key === this.lastStage && now - this.lastReport < 200) return;
-      this.lastStage = key;
-      this.lastReport = now;
-      const sessionRows = this.doneRows + Math.min(rows, prepared.rows);
-      this.report({
-        stage, candidateId: prepared.candidateId, index, total: this.preparation.sources.length, rows, sourceRows: prepared.rows,
-        sessionRows, sessionTotalRows: this.totalRows, elapsedMs: Math.round(now - this.startedAt), remainingMs: Math.round(this.remainingMs(now))
-      });
+      this.lastStage = key; this.lastReport = now;
+      this.report({ stage, candidateId: prepared.candidateId, index, total: this.preparation.sources.length,
+        rows, sourceRows: prepared.rows, sessionRows: this.doneRows + Math.min(rows, prepared.rows),
+        sessionTotalRows: this.totalRows, elapsedMs: Math.round(now - this.startedAt) });
     };
   }
-
-  public sourceDone(prepared: PreparedLargeMergeSource): void {
-    const now = this.now();
-    const current = this.current;
-    if (current?.streamStartedAt !== undefined) {
-      const streamMs = (current.streamEndedAt ?? now) - current.streamStartedAt;
-      this.streamedRows += current.rows;
-      this.streamedMs += streamMs;
-      this.fixedMs += Math.max(0, now - current.startedAt - streamMs);
-      this.fixedSources += 1;
-    }
-    this.doneRows += prepared.rows;
-    this.current = undefined;
-  }
-
-  private remainingMs(now: number): number {
-    const current = this.current;
-    const later = this.preparation.sources.slice((current?.index ?? -1) + 1);
-    const streaming = current?.streamStartedAt !== undefined;
-    const streamedRows = this.streamedRows + (streaming ? current!.rows : 0);
-    const streamedMs = this.streamedMs + (streaming ? (current!.streamEndedAt ?? now) - current!.streamStartedAt! : 0);
-    if (streamedMs < SESSION_RATE_MIN_STREAM_MS || streamedRows <= 0) {
-      const own = current ? Math.max(0, current.prepared.estimateMs - (now - current.startedAt)) : 0;
-      return own + later.reduce((sum, source) => sum + source.estimateMs, 0);
-    }
-    const rate = streamedRows / streamedMs;
-    // The fixed part of a source: as the finished ones took it, else as the one that runs took it before streaming.
-    const fixedEach = this.fixedSources > 0 ? this.fixedMs / this.fixedSources
-      : streaming ? current!.streamStartedAt! - current!.startedAt : 0;
-    const own = current
-      ? (current.prepared.rows - current.rows) / rate + (streaming ? 0 : Math.max(0, fixedEach - (now - current.startedAt)))
-      : 0;
-    return own + later.reduce((sum, source) => sum + source.rows / rate + fixedEach, 0);
-  }
+  public sourceDone(prepared: PreparedLargeMergeSource): void { this.doneRows += prepared.rows; }
 }
 
 /**

@@ -194,7 +194,6 @@
     "tests/reliable-kernel/runtime-dataset-history-storage.test.mjs": 2426.771,
     "tests/reliable-kernel/runtime-dataset-merge-blind-review.test.mjs": 18569.482,
     "tests/reliable-kernel/runtime-dataset-merge-e2e.test.mjs": 9749.795,
-    "tests/reliable-kernel/runtime-dataset-merge-estimate.test.mjs": 51942.015,
     "tests/reliable-kernel/runtime-dataset-merge-responsiveness.test.mjs": 6399.515,
     "tests/reliable-kernel/runtime-dataset-merge-state.test.mjs": 9095.291,
     "tests/reliable-kernel/runtime-dataset-merge-streamed-crash.test.mjs": 23221.128,

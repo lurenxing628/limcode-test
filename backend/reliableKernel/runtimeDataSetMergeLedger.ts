@@ -1,14 +1,14 @@
-import type { RelocatedWorkSettlementCounts } from './historicalWorkSettlement';
-import { RUNTIME_MERGE_VALIDATION_REVISION, revisionedRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { syncDirectoryDurably } from '../capabilities/filesystem/durableDirectorySync';
+import type { RelocatedWorkSettlementCounts } from './historicalWorkSettlement';
 import { classifyRecordedProcess } from './runtimeClaimPrimitives';
-import { readRuntimeDataSetFacts, runtimeDataSetFileState } from './runtimeDataSetFacts';
+import { readRuntimeDataSetFacts,runtimeDataSetFileState } from './runtimeDataSetFacts';
 import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
+import { RUNTIME_MERGE_VALIDATION_REVISION,revisionedRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { requireCompleteRuntimeDataSet } from './runtimeStorageInspection';
-import { resolveVscodeRuntimeMergeLedgerRoot, type VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
+import { resolveVscodeRuntimeMergeLedgerRoot,type VscodeRuntimeDataSetCandidate } from './vscodeRootAuthority';
 
 /**
  * Durable per-source merge state of one configuration root. It is kept beside the data sets (see
@@ -22,7 +22,6 @@ const FINGERPRINT_KIND = 'limcode-runtime-data-set-fingerprint';
 const FINALIZATION_KIND = 'limcode-runtime-data-set-merge-finalization';
 const PREPARATION_KIND = 'limcode-runtime-data-set-merge-preparation';
 const AUDIT_KIND = 'limcode-runtime-data-set-audit';
-const SESSION_RATE_KIND = 'limcode-runtime-large-merge-session-rate';
 const TARGET_BACKUP_KIND = 'limcode-runtime-large-merge-target-backup';
 const RECORDS = 'records';
 const REQUESTS = 'requests';
@@ -31,9 +30,6 @@ const COMMITS = 'commits';
 const FINGERPRINTS = 'fingerprints';
 /** Cache only: what the audit of an exact file state found (see RuntimeDataSetAuditFacts). Never a merge fact. */
 const AUDITS = 'audits';
-/** Cache only: how fast the last large-merge session of this configuration root was (estimates only). Never a merge fact. */
-const RATES = 'rates';
-const SESSION_RATE_ID = 'large-merge-session';
 const FINALIZATIONS = 'finalizations';
 /** Advisory: the window preparing a large-merge session for a source (see RuntimeDataSetMergePreparation). */
 const PREPARATIONS = 'preparing';
@@ -431,46 +427,6 @@ async function writeAuditCache(
     rows: facts.rows, bytes: facts.bytes, databaseBytes: facts.databaseBytes, casObjects: facts.casObjects, casBytes: facts.casBytes,
     refusedWork: facts.refusedWork.map((item) => ({ label: item.label, count: item.count })),
     finalizableTurns: facts.finalizableTurns, finalizableIntents: facts.finalizableIntents, auditedAt: new Date().toISOString()
-  });
-}
-
-/**
- * What the last large-merge session of this configuration root measured for the sources it merged:
- * how long they took in the exclusive phase (with opening and closing the private instance) and how
- * long the size model of the estimate (estimateLargeMergeSources, before any measurement) said. It
- * only scales later estimates on this machine; never a merge fact.
- */
-export interface RuntimeLargeMergeSessionRate {
-  measuredAt: string;
-  sources: number;
-  rows: number;
-  sessionMs: number;
-  modelMs: number;
-}
-
-/** The last measured session rate, or undefined (none, unreadable, or not one). */
-export async function readRuntimeLargeMergeSessionRate(paths: StoragePaths): Promise<RuntimeLargeMergeSessionRate | undefined> {
-  let value: unknown;
-  try { value = JSON.parse(await fs.readFile(await ledgerFile(paths, RATES, SESSION_RATE_ID), 'utf8')) as unknown; }
-  catch { return undefined; }
-  const entry = value as Partial<RuntimeLargeMergeSessionRate> & { kind?: unknown } | null;
-  const positive = (item: unknown): item is number => typeof item === 'number' && Number.isFinite(item) && item > 0;
-  const count = (item: unknown): item is number => Number.isSafeInteger(item) && (item as number) > 0;
-  if (entry?.kind !== SESSION_RATE_KIND || typeof entry.measuredAt !== 'string' || !count(entry.sources) || !count(entry.rows)
-    || !positive(entry.sessionMs) || !positive(entry.modelMs)) {
-    return undefined;
-  }
-  return { measuredAt: entry.measuredAt, sources: entry.sources, rows: entry.rows, sessionMs: entry.sessionMs, modelMs: entry.modelMs };
-}
-
-/** Replaces the measured session rate with this session's. */
-export async function rememberRuntimeLargeMergeSessionRate(
-  paths: StoragePaths,
-  rate: Omit<RuntimeLargeMergeSessionRate, 'measuredAt'>
-): Promise<void> {
-  await writeLedgerJson(paths, RATES, SESSION_RATE_ID, {
-    kind: SESSION_RATE_KIND, measuredAt: new Date().toISOString(),
-    sources: rate.sources, rows: rate.rows, sessionMs: rate.sessionMs, modelMs: rate.modelMs
   });
 }
 

@@ -47,7 +47,6 @@ const {
   assertRuntimeHostsOffline, isRuntimeDataRootAdmissionHeld, isRuntimeMaintenanceHeld, openUnderCurrentDataRootAdmission,
   withRuntimeDataRootAdmission, withRuntimeMaintenance
 } = kernelFile('runtimeHostControl.js');
-const largeMergeSession = kernelFile('runtimeLargeMergeSession.js');
 const { VscodeReliableKernelApplicationFacade: Facade } = require(path.join(
   compiled, 'backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js'
 ));
@@ -167,14 +166,6 @@ if (behavior.participant !== false) {
 // Shown once after a reload (extension.ts).
 const kept = windowState ? layer.takeNoticeKeptAcrossReload(windowState, startedAt) : undefined;
 if (kept) await emit('kept-notice', { text: kept });
-// The large merge session's outcome, kept by this window before it reloaded (runtimeDataSetManagement).
-const keptLarge = windowState ? largeMergeSession.takeLargeMergeResult(windowState, startedAt) : undefined;
-if (keptLarge) {
-  await emit('kept-large-result', {
-    merged: keptLarge.report?.merged.map((item) => [item.candidateId, item.insertedConversations]) ?? [],
-    deferred: keptLarge.report?.deferred.map((item) => item.code) ?? [], details: keptLarge.details, error: keptLarge.error
-  });
-}
 await emit('ready');
 if (behavior.closeAfterMs) {
   setTimeout(async () => {
@@ -197,169 +188,6 @@ const withTrackedLocks = (take) => async (body) => {
     try { return await body(); } finally { await emit('locks-released', { heldMs: Date.now() - lockedAt }); }
   });
 };
-
-if (behavior.request === 'large-session') {
-  await runLargeSession();
-} else if (behavior.request) {
-  // This window asks the others to yield, outside the locks (a data-root migration the user confirmed;
-  // like dataRootRelocation.ts, the key carries the attempt's own id).
-  const outcome = await layer.runWithExclusiveMaintenance(paths, {
-    operation: 'data-root-migration', operationKey: `target:/new-root#${randomUUID()}`, message: '为迁移数据目录',
-    waitingTitle: '正在等待其它窗口空闲后迁移数据目录', configurationRootPath: root, requesterHostBootId: hostBootId,
-    requesterBusy: layer.requesterWorkBusy(host), ignoreBackoff: true, whenBusy: 'wait',
-    participantConfirmation: 'final-countdown', pollMs: 20, isCurrent: () => true,
-    ...(behavior.requestOptions ?? {}),
-    withLocks: withTrackedLocks((body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body)))
-  }, async () => {
-    await emit('operation');
-    if (behavior.operationMs) await new Promise((resolve) => setTimeout(resolve, behavior.operationMs));
-    if (behavior.failOperation) throw Object.assign(new Error('目标目录写入失败'), { code: behavior.failOperation });
-    return 'migrated';
-  }).catch((error) => ({ state: 'threw', reason: String(error?.message ?? error) }));
-  await emit('coordination', { state: outcome.state, reason: outcome.reason, retryAfter: outcome.retryAfter });
-  if (outcome.state === 'threw' && behavior.reloadAfterFailure) await vscodeMock.commands.executeCommand('workbench.action.reloadWindow');
-} else if (!behavior.noMerge) {
-  const report = await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, {
-    limits: behavior.limits,
-    ...(behavior.explicit ? { candidateIds: [behavior.explicit], requested: true } : {}),
-    ...(behavior.failLink ? {
-      // Stands in for a persistent I/O failure while linking/copying CAS (EIO, EACCES, ENOSPC …).
-      linkFile: async () => { throw Object.assign(new Error('input/output error'), { code: 'EIO' }); }
-    } : {}),
-    ...(behavior.failCommit ? {
-      // Stands in for a persistent failure of the final commit, the only step after the other
-      // windows yielded (the CAS transfer and the backup run before any coordination).
-      onFaultPoint(point) {
-        if (point === 'before-row-commit') throw Object.assign(new Error('input/output error'), { code: 'EIO' });
-      }
-    } : {}),
-    coordinateOversized: (input, merge) => requestOtherWindowsToYield({ globalStoragePath: root }, input, merge)
-  });
-  await emit('report', {
-    merged: report.merged.map((item) => item.candidateId),
-    deferred: report.deferred.map((item) => item.code),
-    deferredMessages: report.deferred.map((item) => item.message),
-    blocked: report.blocked.map((item) => item.code),
-    failures: report.failures.map((item) => item.code),
-    pending: report.pendingSources
-  });
-}
-
-/**
- * The large merge session of this window with the real session layer and coordination, and a fake
- * engine whose merge checks it runs in the exclusive phase (both claims held, every Host offline).
- */
-async function runLargeSession() {
-  const sources = (behavior.largeSources ?? []).map((source, index) => ({
-    candidateId: source.candidateId, runtimeDataRootPath: `/fixture/${source.candidateId}`, fingerprint: `fingerprint-${index}`,
-    rows: source.rows, databaseBytes: 1024 * 1024,
-    duration: { expectedMs: source.mergeMs, minMs: Math.round(source.mergeMs * 0.8), maxMs: Math.round(source.mergeMs * 1.6) }
-  }));
-  // The engine's own figures: the sources, the largest one's WAL peak, 64 MiB; one private copy in the temporary directory;
-  // SQLite's temporary files (a quarter of the largest source) in its temporary directory.
-  const space = {
-    targetDirectory: paths.dataRootPath, targetBytes: 70 * 1024 * 1024, temporaryDirectory: root, temporaryBytes: 1024 * 1024,
-    sqliteTemporaryDirectory: root, sqliteTemporaryBytes: 256 * 1024
-  };
-  const engine = {
-    waiting: async () => sources.map(({ candidateId, rows }) => ({ candidateId, rows, bytes: rows * 100 })),
-    noteBatch: () => {},
-    // Read-only, before the prompt or the confirmation: both durations (preparing here as long as the merge).
-    estimate: async ({ candidateIds }) => {
-      await emit('engine-estimate', { candidateIds });
-      const estimated = sources.filter((source) => candidateIds.includes(source.candidateId))
-        .map((source) => ({ ...source, preparing: source.duration, cached: true }));
-      const sum = (durations) => durations.reduce((total, item) => ({
-        expectedMs: total.expectedMs + item.expectedMs, minMs: total.minMs + item.minMs, maxMs: total.maxMs + item.maxMs
-      }), { expectedMs: 0, minMs: 0, maxMs: 0 });
-      return {
-        sources: estimated, report: { merged: [], deferred: [], blocked: [], failures: [] }, space,
-        preparing: sum(estimated.map((source) => source.preparing)), duration: sum(estimated.map((source) => source.duration)), stopped: false
-      };
-    },
-    prepare: async ({ candidateIds }) => {
-      await emit('engine-prepare', { candidateIds });
-      return {
-        sources: sources.filter((source) => candidateIds.includes(source.candidateId)),
-        report: { merged: [], deferred: [], blocked: [], failures: [] },
-        space,
-        engineState: 'fake'
-      };
-    },
-    release: async () => undefined,
-    run: async ({ preparation, signal, onProgress }) => {
-      let offline = 'offline';
-      try { await assertRuntimeHostsOffline(paths); } catch (error) { offline = String(error?.message ?? error); }
-      await emit('engine-run', { offline, admission: isRuntimeDataRootAdmissionHeld(root), maintenance: isRuntimeMaintenanceHeld(paths) });
-      const rowsTotal = preparation.sources.reduce((sum, source) => sum + source.rows, 0);
-      let rowsWritten = 0;
-      const outcomes = [];
-      for (const [index, source] of preparation.sources.entries()) {
-        const steps = Math.max(1, Math.round(source.duration.expectedMs / 20));
-        for (let step = 1; step <= steps; step += 1) {
-          if (signal.aborted) break;
-          await new Promise((resolve) => setTimeout(resolve, 20));
-          onProgress({
-            index, total: preparation.sources.length, candidateId: source.candidateId, stage: 'merging',
-            rowsDone: rowsWritten + Math.round((source.rows * step) / steps), rowsTotal
-          });
-        }
-        rowsWritten += source.rows;
-        outcomes.push({ candidateId: source.candidateId, state: 'merged', result: {
-          candidateId: source.candidateId, sourceDataSetId: `source-${index}`, targetDataSetId: 'target', insertedRows: source.rows, reusedRows: 0,
-          insertedConversations: 10 + index, linkedCasObjects: 0, copiedCasObjects: 0, reusedCasObjects: 0, recoveredCommit: false
-        } });
-      }
-      return outcomes;
-    }
-  };
-  const lifetime = loadLayer('vscode/runtimeDataSetUpgradeLifetime.ts', {});
-  const session = loadLayer('vscode/commands/largeHistoricalMerge.ts', {
-    './runtimeHistorySettlement': loadLayer('vscode/commands/runtimeHistorySettlement.ts', {}),
-    '../../backend/application/reliableKernel/historicalMergeSettlement': require(path.join(compiled, 'backend/application/reliableKernel/historicalMergeSettlement.js')),
-    '../../backend/reliableKernel/runtimeExclusiveMaintenance': exclusive,
-    '../../backend/reliableKernel/runtimeLargeMergeEngine': kernelFile('runtimeLargeMergeEngine.js'),
-    '../../backend/reliableKernel/runtimeLargeMergeSession': largeMergeSession,
-    '../../shared/extensionIdentity': require(path.join(compiled, 'shared/extensionIdentity.js')),
-    '../panels/MainPanel': { MainPanel: { saveComposerDrafts: () => 0 } },
-    '../runtimeDataSetUpgradeLifetime': lifetime,
-    '../runtimeExclusiveMaintenance': layer
-  });
-  const writeGate = facadeLike.writeGate;
-  const largeHost = {
-    product: { application: { database } },
-    hasOwnedExecution: host.hasOwnedExecution,
-    exclusiveMaintenanceTarget: host.exclusiveMaintenanceTarget,
-    dataRootPath: () => root,
-    withDataRootLocks: withTrackedLocks((body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body))),
-    freezeNewWork: (activity) => {
-      const thaw = writeGate.freeze(activity, []);
-      void emit('frozen', { activity });
-      return () => { thaw(); void emit('thawed'); };
-    },
-    closeRuntime: async () => {
-      await emit('runtime-closing');
-      await database.close();
-      await emit('runtime-closed');
-    },
-    writeGate
-  };
-  const options = {
-    report: async (batch, requested) => { await emit('large-report', { requested, deferred: batch.deferred.map((item) => item.code) }); },
-    isCurrent: () => true,
-    engine,
-    ...(windowState ? { windowState } : {}),
-    saveDrafts: () => 0,
-    probeDisk: async () => ({ device: 1, freeBytes: 1e12 }),
-    countdownSeconds: behavior.largeCountdownSeconds ?? 1,
-    coordination: { pollMs: 20 }
-  };
-  const context = { workspaceState: windowState };
-  const ids = sources.map((source) => source.candidateId);
-  if (behavior.largeManual) await session.startLargeHistoricalMerge(context, largeHost, { ...options, candidateIds: ids });
-  else await session.offerLargeHistoricalMerge(context, largeHost, ids, options);
-  await emit('large-session-ended');
-}
 
 /** The parameters of requestOtherWindowsToYield in vscode/commands/runtimeDataSetManagement.ts. */
 async function requestOtherWindowsToYield(storagePaths, input, merge) {

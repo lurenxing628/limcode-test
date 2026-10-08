@@ -21,14 +21,13 @@ const {
 } = kernelFile('runtimeDataSetMerge.js');
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const {
-  estimateLargeMergeSources, largeMergeSkippedRows, LargeMergeSessionClock, prepareLargeMergeSources, releaseLargeMergePreparation,
+  largeMergeSkippedRows, prepareLargeMergeSources, releaseLargeMergePreparation,
   runLargeMergeSession
 } = kernelFile('runtimeDataSetStreamedMerge.js');
 const { sqliteTemporaryDirectory } = kernelFile('runtimeDataSetLargeMergeSpace.js');
 const ledger = kernelFile('runtimeDataSetMergeLedger.js');
 const { ownProcessStartIdentity } = kernelFile('runtimeClaimPrimitives.js');
 const { openRuntimeCasVerificationCache } = kernelFile('runtimeCasVerificationCache.js');
-const engineModule = kernelFile('runtimeLargeMergeEngine.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
 const LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
@@ -51,28 +50,13 @@ test('盲审 #1：后台大来源等待显式合并，准备拒绝无法归属�
     });
     assert.ok(countRows(dataSet) > LIMITS.sizeLimits.transactionRows);
   }
-  const engine = engineModule.largeMergeEngine();
-
-  // The ordinary estimate removes a source below its default threshold from the waiting list
-  // and caches its audit. The explicit preparation below uses the test large-source threshold.
-  engine.noteBatch(fixture.paths, batchOf({ deferred: [awaitingIssue(fixture.beta.id, 700)] }));
-  assert.deepEqual((await engine.waiting(fixture.paths)).map((item) => item.candidateId), [fixture.beta.id]);
-  const estimated = await withWindow(fixture, (window) => engine.estimate({
-    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, candidateIds: [fixture.beta.id], requested: false
-  }));
-  assert.deepEqual(estimated.sources, []);
-  assert.deepEqual(await engine.waiting(fixture.paths), [], '估计判出不进会话：不再列为等待');
-  assert.deepEqual(await ledgerEntries(fixture, 'audits'), [`${fixture.beta.id.replace(/:/g, '-')}.json`], '只有 beta 的审计有缓存');
-
   for (const startup of [1, 2]) {
     const batch = await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths,
       { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits }));
-    engine.noteBatch(fixture.paths, batch);
     assert.deepEqual(batch.merged, []);
     assert.deepEqual(batch.blocked, []);
     assert.deepEqual(batch.deferred.map((issue) => [issue.candidateId, issue.code]).sort(),
       [[fixture.alpha.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE], [fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]].sort());
-    assert.deepEqual((await engine.waiting(fixture.paths)).map((item) => item.candidateId).sort(), [fixture.alpha.id, fixture.beta.id].sort());
   }
   const checked = await withWindow(fixture, (window) => prepareLargeMergeSources({
     paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window },
@@ -109,11 +93,6 @@ test('盲审 #1：以前合并进来的对话在当前库删掉了、无法收�
     { configurationRootPath: fixture.root, database: window }, { candidateIds: [fixture.alpha.id], requested: true, sizeLimits: LIMITS.sizeLimits }));
   assert.deepEqual(batch.blocked, [], '不按审计里没剔除的工作判受阻');
   assert.deepEqual(batch.deferred.map((issue) => [issue.candidateId, issue.code]), [[fixture.alpha.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]]);
-  // The estimate judges it as the batch does: offered for the session, not told as refused.
-  const estimate = await withWindow(fixture, (window) => estimateLargeMergeSources({
-    paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, candidateIds: [fixture.alpha.id], requested: true, options: LIMITS
-  }));
-  assert.deepEqual([estimate.sources.map((source) => source.candidateId), estimate.report.blocked], [[fixture.alpha.id], []]);
   const preparation = await withWindow(fixture, (window) => prepareLargeMergeSources({
     paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, candidateIds: [fixture.alpha.id], requested: true, options: LIMITS
   }));
@@ -123,49 +102,6 @@ test('盲审 #1：以前合并进来的对话在当前库删掉了、无法收�
   } finally {
     await releaseLargeMergePreparation(preparation);
   }
-});
-
-// ---------------------------------------------------------------------------------------------
-// #2 The remaining time.
-// ---------------------------------------------------------------------------------------------
-
-test('盲审 #2：会话的剩余时间只按开始写入之后的速率算，不被每份开头的固定开销（副本、逐个 lstat、跳过闭包、账本）放大；写入不到 1 秒时用准备的估计', () => {
-  // Two sources of 60,000 rows: 4 s of fixed work each, then 5 s of streaming (12 rows/ms).
-  const sources = [
-    { candidateId: 'a', rows: 60_000, estimateMs: 10_000 },
-    { candidateId: 'b', rows: 60_000, estimateMs: 10_000 }
-  ];
-  let now = 0;
-  const reports = [];
-  const clock = new LargeMergeSessionClock({ sources }, (progress) => reports.push({ at: now, ...progress }), () => now);
-  const end = 18_000;
-  const at = (time, report) => { now = time; report(); };
-  const a = clock.source(0, sources[0]);
-  at(0, () => a('checking', 0));
-  at(4_000, () => a('merging', 0));
-  at(4_500, () => a('merging', 6_000));
-  at(5_000, () => a('merging', 12_000));
-  at(7_000, () => a('merging', 36_000));
-  at(9_000, () => a('committing', 60_000));
-  at(9_500, () => clock.sourceDone(sources[0]));
-  const b = clock.source(1, sources[1]);
-  at(9_500, () => b('checking', 0));
-  at(13_000, () => b('merging', 0));
-  at(15_500, () => b('merging', 30_000));
-  const remaining = new Map(reports.map((report) => [report.at, report.remainingMs]));
-  assert.equal(reports.length, 9);
-  // Less than a second streamed: the preparation's estimates (the running source's less the time it ran).
-  assert.equal(remaining.get(0), 20_000);
-  assert.equal(remaining.get(4_000), 16_000);
-  assert.equal(remaining.get(4_500), 15_500);
-  // From then on the rate of streaming alone, plus a fixed part per source still to start.
-  assert.equal(remaining.get(5_000), 13_000, '第一次按速率报：与实际剩余相同（按总用时算会是 45 秒）');
-  for (const report of reports.filter((item) => item.at >= 5_000)) {
-    const actual = end - report.at;
-    assert.ok(Math.abs(report.remainingMs - actual) <= actual * 0.15 + 100, `${report.at} ms：报 ${report.remainingMs}，实际 ${actual}`);
-  }
-  // The session's rows stay counted as before.
-  assert.deepEqual(reports.map((report) => report.sessionRows), [0, 0, 6_000, 12_000, 36_000, 60_000, 60_000, 60_000, 90_000]);
 });
 
 // ---------------------------------------------------------------------------------------------
@@ -183,26 +119,17 @@ test('盲审 #3：批次判断“放得下大库会话”用与估计相同的�
   const coordinateOversized = async (input, run) => { coordinated.push(input.candidateId ?? input); await input.withLocks(run); return { state: 'completed' }; };
   const decide = (free) => withWindow(fixture, async (window) => {
     const target = { configurationRootPath: fixture.root, database: window };
-    // The estimate as the session's offer computes it (the medium source goes along), its disks as the window checks them.
-    const estimate = await estimateLargeMergeSources({ paths: fixture.paths, target, threshold: 'online', options: limits });
-    assert.deepEqual(estimate.sources.map((source) => source.candidateId).sort(), [fixture.alpha.id, fixture.beta.id].sort());
-    // Batch consent retains every source copy; SQLite temporary space follows the retained total.
-    const retained = estimate.sources.reduce((sum, source) => sum + source.databaseBytes, 0);
-    assert.deepEqual([estimate.space.temporaryBytes, estimate.space.sqliteTemporaryBytes], [retained, Math.ceil(retained * 0.25)]);
-    const needed = await neededOnOneDisk(estimate.space);
-    const freeSpace = async () => needed + free;
-    const short = await HISTORICAL_MERGE_ENGINE.largeMergeShortDisk(estimate.space, { freeSpace });
+    // Both cases leave room for a private audit copy; neither starts exclusive work.
+    const freeSpace = async () => free < 0 ? 80 * 1024 * 1024 : 1024 * 1024 * 1024;
     const batch = await mergeHistoricalDataSetsOnline(fixture.paths, target, { ...limits, coordinateOversized, freeSpace });
-    return { short, batch };
+    return { batch };
   });
   const cramped = await decide(-256 * 1024);
-  assert.ok(cramped.short, '估计说放不下');
   assert.deepEqual(cramped.batch.merged, []);
   assert.deepEqual(cramped.batch.deferred.map((issue) => [issue.candidateId, issue.code]).sort(),
     [[fixture.alpha.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE], [fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]].sort());
   assert.equal(coordinated.length, 0);
   const roomy = await decide(256 * 1024);
-  assert.equal(roomy.short, undefined, '估计说放得下');
   assert.deepEqual(roomy.batch.merged, []);
   assert.deepEqual(roomy.batch.deferred.map((issue) => [issue.candidateId, issue.code]).sort(),
     [[fixture.alpha.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE], [fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]].sort());

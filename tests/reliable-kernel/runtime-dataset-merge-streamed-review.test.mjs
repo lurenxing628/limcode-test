@@ -19,7 +19,7 @@ const require = createRequire(import.meta.url);
 const fsPromises = require('node:fs/promises');
 const { HISTORICAL_MERGE_ENGINE, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
 const {
-  estimateLargeMergeSources, prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession
+  prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession
 } = kernelFile('runtimeDataSetStreamedMerge.js');
 const { estimatedTargetIndexBytes, largeMergeTargetBytes } = kernelFile('runtimeDataSetLargeMergeSpace.js');
 const { isRuntimeLargeMergeTargetBackupLive } = kernelFile('runtimeDataSetMergeLedger.js');
@@ -494,8 +494,6 @@ test('空间计入目标会被改写的索引页：准备在它的目标备份�
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await withWindow(fixture, async (window) => {
     const target = { configurationRootPath: fixture.root, database: window };
-    const estimate = await estimateLargeMergeSources({ paths: fixture.paths, target, options: LIMITS });
-    assert.equal(estimate.space.targetIndexBytes, Math.ceil(estimate.space.targetBackupBytes * 0.65));
     const preparation = await prepareLargeMergeSources({ paths: fixture.paths, target, options: LIMITS });
     try {
       const measured = await indexBytesOf(path.join(preparation.backupPath, 'limcode.sqlite'));
