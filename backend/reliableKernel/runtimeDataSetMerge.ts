@@ -2997,7 +2997,7 @@ async function planSource(
   if (!state.exclusions) {
     state.exclusions = new RuntimeMergeConversationExclusions(source);
     state.excluded = [];
-    for (const problem of state.workPresent === false ? [] : inspectUnfinishedWorkRows(source, state.foreign !== undefined || state.finalized !== undefined)) {
+    for (const problem of state.workPresent === false ? [] : inspectUnfinishedWorkRows(source, state.foreign !== undefined || (state.finalized !== undefined && !state.finalized.earlier))) {
       state.exclusions.exclude(problem.domain, problem.row, problem.code);
     }
     for (const id of state.unsettledConversationIds ?? []) {
