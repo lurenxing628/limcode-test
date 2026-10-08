@@ -302,7 +302,7 @@ test('等待大库会话的来源：审计结果按确切文件状态缓存，�
   assert.equal(changed.sources[0].rows, rows);
 });
 
-test('估计的结论：阈值与分流同准备；太大、无法收尾、另一个窗口在准备、旧格式待升级、已合并的都不算进会话，也都不入账；取消时不给来源', async (t) => {
+test('估计的结论：阈值与分流同准备；太大、另一个窗口在准备、旧格式待升级、已合并的不算进会话，未结束工作留给准备按对话判断，也都不入账；取消时不给来源', async (t) => {
   const fixture = await fixtureFor(t, { beta: true });
   await seedRichSource(fixture.alpha, 'alpha', 3);
   await seedConversations(fixture.beta, [{ id: 'beta_small' }]);
@@ -314,6 +314,7 @@ test('估计的结论：阈值与分流同准备；太大、无法收尾、另�
     const online = await estimate(fixture, database, { threshold: 'online', options: { limits: { maxRows: 5, maxBytes: 1 << 30 } } });
     assert.deepEqual(online.sources.map((source) => source.candidateId).sort(), [fixture.alpha.id, fixture.beta.id].sort());
     assert.deepEqual(online.small, []);
+    assert.equal(online.space.temporaryBytes,online.sources.reduce((sum,source)=>sum+source.databaseBytes,0),'一次确认前可能同时保留全部来源快照');
     assert.equal(online.estimateMs, online.sources.reduce((sum, source) => sum + source.estimateMs, 0));
 
     const tooLarge = await estimate(fixture, database, {
@@ -357,15 +358,14 @@ test('估计的结论：阈值与分流同准备；太大、无法收尾、另�
   assert.deepEqual(JSON.parse(await fs.readFile(recordFile, 'utf8')), committing, '记录原样保留');
   await fs.rm(recordFile);
 
-  // Work no transition closes (a background process still running): refused, not recorded.
+  // Work that may need exclusion is judged in preparation; estimate does not reject its whole source.
   rawWrite(fixture.alpha, (source) => {
     source.prepare(`INSERT INTO process VALUES (?, 'running', 'nonce', 1, NULL, NULL, 'fp', 'digest', 'spool', 0, 0, 0, 0, ?, ?, ?)`)
       .run('alpha_running_process', NOW, NOW, NOW);
   });
   const refused = await withWindow(fixture, (database) => estimate(fixture, database));
-  assert.deepEqual(refused.sources, []);
-  assert.deepEqual(refused.report.blocked.map((issue) => [issue.candidateId, issue.code]), [[fixture.alpha.id, 'runtime-data-set-merge-unfinished-work']]);
-  assert.match(refused.report.blocked[0].message, /后台进程仍在运行、结束证据不一致或后续工作未收尾×1/);
+  assert.deepEqual(refused.sources.map(source=>source.candidateId), [fixture.alpha.id]);
+  assert.deepEqual(refused.report.blocked, []);
 
   // A published epoch-4 data set is not upgraded by an estimate.
   await downgradeToEpoch4(fixture.beta.binding);

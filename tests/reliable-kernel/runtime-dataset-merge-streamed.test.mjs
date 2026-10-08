@@ -476,3 +476,51 @@ for (const damage of ['invalid-row', 'missing-body']) test(`剔除等价性：${
   assertSameRows(readAll(fixture.current),expected,damage);
   assert.deepEqual((await readLedgerRecord(fixture,fixture.alpha.id)).excluded,onlineRecord.excluded);
 });
+
+for (const [accept,fullAfterFirst] of [[true,false],[false,false],[true,true]]) test(`大库批量收尾只确认一次，${fullAfterFirst ? '空间不足时等待挂起快照清理' : accept ? '保留两份快照后顺序恢复' : '拒绝后等待清理完毕'}`, async (t) => {
+  const fixture = await fixtureFor(t, {beta:true});
+  for (const [dataSet,id] of [[fixture.alpha,'active_alpha'],[fixture.beta,'active_beta']]) {
+    await seedConversations(dataSet,[{id}]);
+    rawWrite(dataSet, db => {
+      db.prepare('DELETE FROM turn_termination WHERE turn_id=?').run(`${id}_turn`);
+      db.prepare("UPDATE turn SET status='active',terminal_at=NULL WHERE id=?").run(`${id}_turn`);
+    });
+  }
+  let prompts = 0;
+  let snapshots = 0;
+  const database = await openWindow(fixture);
+  let preparation;
+  try {
+    preparation = await prepareLargeMergeSources({paths:fixture.paths,target:{configurationRootPath:fixture.root,database},
+      candidateIds:[fixture.alpha.id,fixture.beta.id], requested:true,
+      options:{sizeLimits:{transactionRows:1},chunkRows:7,
+        ...(fullAfterFirst?{freeSpace:async()=>snapshots>0?1:1024*1024*1024}:{}),
+        onFaultPoint:async point => {
+          if(point==='after-snapshot-copy') snapshots++;
+          if(point==='after-source-backup') {
+            const {readRuntimeHistorySettlementConsent} = kernelFile('runtimeHistoryConvergence.js');
+            for (const source of [fixture.alpha,fixture.beta]) assert.equal(await readRuntimeHistorySettlementConsent(fixture.paths,{
+              candidateId:source.id,dataSetId:source.binding.dataSetId,rootInstanceId:source.binding.rootInstanceId,turns:1,intents:0
+            }),true,'第一份收尾前全部来源的同意已持久化');
+          }
+        },
+        confirmSettlement:async request => {
+          prompts++;
+          assert.equal(request.sources.length,2);
+          assert.equal(request.turns,2);
+          assert.equal(snapshots,2,'确认前每份只用现有准备快照');
+          return accept;
+        }
+      }});
+  } finally {await database.close();}
+  assert.equal(prompts,fullAfterFirst?0:1);
+  const totalBytes = (await fs.stat(fixture.alpha.binding.paths.databasePath)).size + (await fs.stat(fixture.beta.binding.paths.databasePath)).size;
+  assert.ok(preparation.preparationTemporaryBytes>=(fullAfterFirst?totalBytes/2:totalBytes));
+  assert.equal(preparation.sources.length,accept&&!fullAfterFirst?2:0,JSON.stringify(preparation.report));
+  assert.equal(snapshots,fullAfterFirst?1:accept?4:2,'只因实际收尾后内容改变而重新快照');
+  await releaseLargeMergePreparation(preparation);
+  assert.deepEqual(await ledgerEntries(fixture,'preparing'),[]);
+  if (!accept||fullAfterFirst) {
+    for (const dataSet of [fixture.alpha,fixture.beta]) assert.equal(JSON.parse(readAll(dataSet).turn[0]).status,'active');
+  }
+});

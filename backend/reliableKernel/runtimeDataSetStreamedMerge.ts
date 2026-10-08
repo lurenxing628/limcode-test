@@ -1,3 +1,5 @@
+import { recordRuntimeHistorySettlementConsents } from './runtimeHistoryConvergence';
+import { RuntimeMergeSettlementBatch } from './runtimeMergeSettlementBatch';
 import { RuntimeMergeConversationExclusions } from './runtimeMergeConversationExclusions';
 import { inspectUnfinishedWorkRows } from './runtimeDataSetMergeWork';
 import { randomUUID } from 'node:crypto';
@@ -777,6 +779,7 @@ export async function scanMergeRows(
   const sink: RuntimeDataSetMergeChunkSink = {
     ...counting,
     timelineImportSource,
+    ...(options.collecting && options.exclusions ? {invalid:(domain:string,row:DomainRow) => options.exclusions?.exclude(domain,row,'runtime-data-set-merge-source-row-invalid')} : {}),
     conflict: (sample, domain, row) => {
       counting.conflict(sample, domain, row);
       if (options.collecting) options.exclusions?.exclude(domain, row, 'runtime-data-set-merge-conflict');
@@ -1176,6 +1179,8 @@ export interface LargeMergePreparation {
   sources: PreparedLargeMergeSource[];
   /** Outcomes that needed no session, as a batch reports them (already merged, nothing new, refused, deferred). */
   report: Omit<RuntimeDataSetMergeBatchResult, 'pendingSources'>;
+  /** Largest sum of private source copies retained for the batch's single settlement prompt. */
+  preparationTemporaryBytes: number;
   /** Left to the online merge: not above the chosen threshold. */
   small: string[];
   /** The online target backup taken for the session (removed again when no session uses it). */
@@ -1196,6 +1201,8 @@ interface PreparationInternals {
   options: LargeMergeEngineOptions;
   sources: Map<string, PreparedInternals>;
   released: boolean;
+  retainedSnapshots: Map<string, number>;
+  peakSnapshotBytes: number;
 }
 
 interface PreparedInternals {
@@ -1243,15 +1250,17 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     await withRuntimeDataRootAdmission(paths.globalStoragePath, () => engine.pruneMergePreparations(paths)).catch(() => undefined);
   }
   const internals: PreparationInternals = {
-    claims: new PreparationClaims(paths, options.heartbeatMs, options.onFaultPoint), pickedAt, requested, options, sources: new Map(), released: false
+    claims: new PreparationClaims(paths, options.heartbeatMs, options.onFaultPoint), pickedAt, requested, options, sources: new Map(), released: false, retainedSnapshots: new Map(), peakSnapshotBytes: 0
   };
   const prepared: PreparedLargeMergeSource[] = [];
   const small: string[] = [];
   let finalizedSources = 0;
+  let stopPreparing = false;
+  const settlements = new RuntimeMergeSettlementBatch<PreparedOutcome | HistoricalMergeSourceOutcome>();
   internals.earlierBackup = sources.length > 0 ? await engine.newestTargetBackup(target).catch(() => undefined) : undefined;
   try {
     for (const [index, picked] of sources.entries()) {
-      if (!keepGoing()) break;
+      if (!keepGoing() || stopPreparing) break;
       const candidateId = picked.id;
       const issue = (outcome: { code: string; message: string; awaiting?: { rows: number; bytes: number } }): RuntimeDataSetMergeIssue => ({
         candidateId, code: outcome.code, message: outcome.message, newly: true, requested: picked.requested,
@@ -1293,50 +1302,68 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
         if (held.kind !== 'stopped') report.deferred.push(issue(held));
         continue;
       }
-      const outcome = await engine.runSourceAttempt<PreparedOutcome>(paths, target, candidateId, mode,
-        (state) => prepareSource(paths, target, candidateId, mode, state, input, progress, internals)
+      internals.sources.set(candidateId, sourceInternals);
+      await settlements.prepare(confirm => engine.runSourceAttempt<PreparedOutcome>(paths, target, candidateId, mode,
+        (state) => prepareSource(paths, target, candidateId, mode, state,
+          { ...input, options: { ...options, confirmSettlement: confirm } }, progress, internals)
           .catch(async (error: unknown) => { throw await diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并', undefined, options); }),
-        sourceInternals.state);
-      // Its unfinished work was closed by this preparation (whatever came of it): its data changed.
-      if (sourceInternals.state.finalized && !sourceInternals.state.finalized.earlier) finalizedSources += 1;
-      if (outcome.kind === 'prepared') {
-        prepared.push(picked.label ? { ...outcome.source, label: picked.label } : outcome.source);
-        internals.sources.set(candidateId, sourceInternals);
-        continue;
-      }
-      sourceInternals.state.exclusions?.close();
-      await sourceInternals.state.foreign?.release();
-      await internals.claims.release(candidateId);
-      if (outcome.kind === 'small') {
-        small.push(candidateId);
-        continue;
-      }
-      if (outcome.kind === 'stopped') break;
-      if (outcome.kind === 'merged' || outcome.kind === 'current') {
-        const { result } = outcome;
-        if (outcome.kind === 'merged' || picked.requested || result.finalized || result.skippedConversations) report.merged.push(result);
-        await engine.mergeRequestDone(paths, candidateId, target).catch(() => undefined);
-        continue;
-      }
-      const refused = issue(outcome);
-      if (outcome.kind === 'deferred') {
-        report.deferred.push(refused);
-        if (outcome.code === DISK_FULL) {
-          notStartedAfter();
-          break;
+        sourceInternals.state), async outcome => {
+        // Its unfinished work was closed by this preparation (whatever came of it): its data changed.
+        if (sourceInternals.state.finalized && !sourceInternals.state.finalized.earlier) finalizedSources += 1;
+        if (outcome.kind === 'prepared') {
+          prepared.push(picked.label ? { ...outcome.source, label: picked.label } : outcome.source);
+          internals.sources.set(candidateId, sourceInternals);
+          return;
         }
-      } else {
-        (outcome.kind === 'blocked' ? report.blocked : report.failures).push(refused);
-        await removeRuntimeDataSetMergeRequest(paths, candidateId).catch(() => undefined);
-      }
+        sourceInternals.state.exclusions?.close();
+        await sourceInternals.state.foreign?.release();
+        await internals.claims.release(candidateId);
+        internals.sources.delete(candidateId);
+        if (outcome.kind === 'small') {
+          small.push(candidateId);
+          return;
+        }
+        if (outcome.kind === 'stopped') { stopPreparing = true; return; }
+        if (outcome.kind === 'merged' || outcome.kind === 'current') {
+          const { result } = outcome;
+          if (outcome.kind === 'merged' || picked.requested || result.finalized || result.skippedConversations) report.merged.push(result);
+          await engine.mergeRequestDone(paths, candidateId, target).catch(() => undefined);
+          return;
+        }
+        const refused = issue(outcome);
+        if (outcome.kind === 'deferred') {
+          report.deferred.push(refused);
+          if (outcome.code === DISK_FULL) {
+            notStartedAfter();
+            stopPreparing = true;
+          }
+        } else {
+          (outcome.kind === 'blocked' ? report.blocked : report.failures).push(refused);
+          await removeRuntimeDataSetMergeRequest(paths, candidateId).catch(() => undefined);
+        }
+      });
     }
+    await settlements.confirm(async request => {
+      if (!keepGoing() || stopPreparing || !await options.confirmSettlement?.(request)) return false;
+      const agreed = (request.sources ?? [request]).map(item => {
+        if (!item.dataSetId || !item.rootInstanceId) throw new Error('合并收尾同意缺少来源身份。');
+        return {...item,dataSetId:item.dataSetId,rootInstanceId:item.rootInstanceId};
+      });
+      await recordRuntimeHistorySettlementConsents(paths,agreed);
+      return true;
+    }, () => keepGoing() && !stopPreparing);
   } catch (error) {
+    // Resume denied continuations and await their snapshot finally blocks before releasing claims.
+    await settlements.close();
     // Nothing of it runs: the claims, and the target backup it took for no transaction.
     await releaseHolds(internals);
     await internals.claims.releaseAll();
     await removeUnusedBackup(target.backup.path, target.controlRoot, internals);
     throw new LargeMergePreparationError(error, finalizedSources);
   }
+  await settlements.close();
+  const sourceOrder = new Map(sources.map((source,index) => [source.id,index]));
+  prepared.sort((a,b) => sourceOrder.get(a.candidateId)! - sourceOrder.get(b.candidateId)!);
   if (sources.length > 0) {
     await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
       await pruneRuntimeDataSetMergeCommits(paths);
@@ -1356,6 +1383,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
     target: target.identity,
     sources: prepared,
     report: batch,
+    preparationTemporaryBytes: internals.peakSnapshotBytes,
     small,
     ...(target.backup.path ? { backupPath: target.backup.path } : {}),
     space: await sessionSpace(target, prepared, internals.targetIndexBytes ?? 0),
@@ -1441,7 +1469,8 @@ async function prepareSource(
   if (earlier) {
     state.finalized = {
       turnIds: earlier.turnIds, intentIds: earlier.intentIds, turns: earlier.turns, intents: earlier.intents,
-      sourceBackupPath: earlier.sourceBackupPath, complete: earlier.complete, earlier: true
+      sourceBackupPath: earlier.sourceBackupPath, complete: earlier.complete, earlier: true,
+      ...(earlier.settlement ? {settlement:earlier.settlement} : {})
     };
   }
   const settled = await engine.settledSource(paths, target, candidateId, state);
@@ -1468,7 +1497,22 @@ async function prepareSource(
   const snapshot = async (): Promise<Awaited<ReturnType<typeof engine.takeVerifiedSnapshot>>> => {
     progress('snapshot');
     timing.startedAt = performance.now();
-    return engine.takeVerifiedSnapshot(candidate, binding, 'finalize', state, mode, snapshotOptions, paths);
+    const bytes = await sqliteFilesBytes(binding.paths.databasePath) + await casTransferPackedStorageBytes(binding.paths.casRootPath);
+    const held = [...internals.retainedSnapshots].reduce((sum, [id, size]) => sum + (id === candidateId ? 0 : size), 0);
+    const short = await engine.largeMergeShortDisk({
+      targetDirectory: target.controlRoot, targetBytes: engine.BACKUP_FREE_SPACE_MARGIN_BYTES, temporaryDirectory: os.tmpdir(), temporaryBytes: bytes,
+      sqliteTemporaryDirectory: await sqliteTemporaryDirectory(), sqliteTemporaryBytes: largeMergeSqliteTemporaryBytes(bytes)
+    }, options);
+    if (short) throw new engine.Outcome({kind:'deferred',code:DISK_FULL,
+      message:`磁盘空间不足：待确认的来源快照合计需要约 ${megabytes(held + bytes)} MB，已有约 ${megabytes(held)} MB 保留在临时目录；${short.path} 还需要约 ${megabytes(short.requiredBytes)} MB。`});
+    // Existing retained copies already consume the measured free space. Only the next copy is
+    // charged again here; the prompt's total is retained explicitly for estimates and diagnostics.
+    internals.retainedSnapshots.set(candidateId, bytes);
+    internals.peakSnapshotBytes = Math.max(internals.peakSnapshotBytes, held + bytes);
+    return engine.takeVerifiedSnapshot(candidate, binding, 'finalize', state, mode, snapshotOptions, paths).catch(error => {
+      internals.retainedSnapshots.delete(candidateId);
+      throw error;
+    });
   };
   let taken = await snapshot();
   let verified: RuntimeCasVerificationCache | undefined;
@@ -1498,6 +1542,9 @@ async function prepareSource(
       const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows);
       progress('scan', 0);
       engine.prepareSettlement(taken.snapshot.database, state);
+      for (const id of state.unsettledConversationIds ?? []) {
+        state.exclusions!.exclude('Conversation', {id}, 'runtime-data-set-merge-unfinished-work');
+      }
       for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate) || state.finalized !== undefined)) {
         if (!skipping || !taken.snapshot.database.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain=? AND id=?`).get(issue.domain,String(issue.row.id))) {
           state.exclusions!.exclude(issue.domain,issue.row,issue.code);
@@ -1534,6 +1581,11 @@ async function prepareSource(
       state.exclusions?.close();
       await taken.snapshot.close();
       taken = await snapshot();
+      if (state.finalized) {
+        engine.countFinalized(taken.snapshot.database,state.finalized);
+        state.finalized.complete &&= !state.unsettledConversationIds?.length;
+        await engine.rememberFinalized(paths,candidate,state.finalized);
+      }
       state.exclusions = new RuntimeMergeConversationExclusions(taken.snapshot.database);
       state.excluded = undefined;
       scan = await scanSource();
@@ -1589,6 +1641,7 @@ async function prepareSource(
   } finally {
     verified?.close();
     await engine.closeSnapshot(taken.snapshot);
+    internals.retainedSnapshots.delete(candidateId);
   }
 }
 
@@ -1737,6 +1790,8 @@ export interface LargeMergeEstimate {
   sources: LargeMergeEstimatedSource[];
   /** Sources with an outcome that needs no session, as a batch reports them; nothing of it is recorded. */
   report: Omit<RuntimeDataSetMergeBatchResult, 'pendingSources'>;
+  /** Largest sum of private source copies retained for the batch's single settlement prompt. */
+  preparationTemporaryBytes: number;
   /** Left to the online merge: not above the chosen threshold. */
   small: string[];
   /** Disk space the preparation and the session would still need (the target backup included). */
@@ -1846,6 +1901,7 @@ export async function estimateLargeMergeSources(input: EstimateLargeMergeInput):
   return {
     sources: estimated,
     report: batch,
+    preparationTemporaryBytes: space.temporaryBytes,
     small,
     space: {
       ...space,

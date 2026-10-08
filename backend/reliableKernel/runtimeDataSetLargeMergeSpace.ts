@@ -109,7 +109,7 @@ export interface LargeMergeSessionSpaceFacts {
  * target's disk its model (largeMergeTargetBytes, the target's index pages at their share of its
  * files), plus the preparation's backup of the target (its SQLite files) and the content the
  * preparation copies into the target (a source's objects not on the target's disk, a foreign
- * root's always); the largest private copy; SQLite's temporary files.
+ * root's always); all private copies waiting for the single settlement prompt; their SQLite temporary indexes.
  */
 export function largeMergeSessionSpace(input: {
   targetDirectory: string;
@@ -121,16 +121,16 @@ export function largeMergeSessionSpace(input: {
   sqliteTemporaryDirectory: string;
 }): LargeMergeSessionSpaceFacts {
   const { sources } = input;
-  const largest = sources.reduce((max, source) => Math.max(max, source.databaseBytes), 0);
+  const retained = sources.reduce((sum, source) => sum + source.databaseBytes, 0);
   const copied = sources.reduce((sum, source) => sum + source.casCopyBytes, 0);
   return {
     targetDirectory: input.targetDirectory,
     targetBytes: sources.length === 0 ? 0
       : largeMergeTargetBytes(sources, estimatedTargetIndexBytes(input.targetFilesBytes), input.marginBytes) + input.targetFilesBytes + copied,
     temporaryDirectory: input.temporaryDirectory,
-    temporaryBytes: largest,
+    temporaryBytes: retained,
     sqliteTemporaryDirectory: input.sqliteTemporaryDirectory,
-    sqliteTemporaryBytes: sources.length === 0 ? 0 : largeMergeSqliteTemporaryBytes(largest)
+    sqliteTemporaryBytes: sources.length === 0 ? 0 : largeMergeSqliteTemporaryBytes(retained)
   };
 }
 
