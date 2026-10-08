@@ -73,9 +73,9 @@
     "runtimeSelection": "one-fixed-data-set-per-configuration-root-published-only-without-existing-selection",
     "runtimeSelectionPointer": ".limcode-runtime-selection.json; read-older-installation-revisions; initialize-once-never-switch-in-this-version",
     "workspaceFoldersSelectRuntime": false,
-    "unselectedHistory": "offline-snapshot-read-only-on-demand",
+    "unselectedHistory": "residual-list-offline-snapshot-read-only-on-demand",
     "historicalEpochUpgrade": "automatic-backup-then-exact-target-offline-upgrade",
-    "historyDiscovery": "per-candidate-errors-no-implicit-fallback",
+    "historyDiscovery": "per-source-errors-retained-fixed-current-fallback-only-before-first-selection",
     "foreignHistory": "verified-in-place-read-only-located-paths-recorded-fence-never-root-authority-never-written-except-backup-cleanup-deleting-a-proven-root-itself; registered-pending-and-merged-into-current-under-its-claim-copied-never-linked-ledger-under-current-configuration-root; reset-archives-named-time-id8-or-time-epoch-n-to-m-id8-or-the-17-digits-of-the-manual-reset-of-released-0.0.10-0.0.20; published-epochs-3-4-5-upgraded-by-the-exact-migrator-only-on-each-private-copy-in-a-worker-converted-bodies-in-an-overlay-under-the-current-configuration-root-read-before-the-root-a-failed-upgrade-listed-not-verified; other-epochs-listed-not-verified-with-location-size-and-reason; new-reset-backups-under-.limcode-runtime-reset-backups-registered-as-residual-never-automatically-discovered-for-merge",
     "sharedConfigurationMaintenance": "all-runtime-scopes-offline",
     "rootBindingFields": [

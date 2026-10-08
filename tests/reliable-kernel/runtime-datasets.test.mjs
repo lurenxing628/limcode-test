@@ -18,8 +18,7 @@ const {
   resolveVscodeWorkspaceRuntimePlacement,
   resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot,
-  selectVscodeRuntimeDataSet,
-  VscodeRuntimeDataSetSelectionRequiredError
+  selectVscodeRuntimeDataSet
 } = require('../../dist/extension/backend/reliableKernel/vscodeRootAuthority.js');
 const { RootAuthority } = require('../../dist/extension/backend/reliableKernel/rootAuthority.js');
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
@@ -182,20 +181,18 @@ test('首次自动选库只在通过可升级性预检的候选中选：漂移�
   assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, `workspace:${healthyScope.key}`);
 }));
 
-test('所有候选都过不了预检时不发布选择，退回显式选择并写明每个库的原因', async () => fixture(async (root, paths) => {
-  const driftedScope = scope('drifted-only');
-  const drifted = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, driftedScope), 4);
-  await dropOneIndex(drifted);
-  const currentScope = scope('drifted-current');
-  await dropOneIndex(await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, currentScope)));
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, driftedScope), (error) => {
-    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
-    assert.deepEqual(error.problems.map((problem) => problem.id).sort(),
-      [`workspace:${driftedScope.key}`, `workspace:${currentScope.key}`].sort());
-    assert.ok(error.problems.every((problem) => /结构或完整性核验未通过/.test(problem.message)));
-    return true;
-  });
-  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+test('所有候选都不能合并时建立固定当前历史并登记原来源', async () => fixture(async (root, paths) => {
+  const broken = scope('drifted-only');
+  const old = await createRoot(resolveVscodeWorkspaceRuntimeScopeRoot(paths, broken), 4);
+  await dropOneIndex(old);
+  const before = await fs.readFile(old.paths.databasePath);
+  const placement = await resolveVscodeWorkspaceRuntimePlacement(paths, broken);
+  assert.equal(placement.runtimeDataRootPath, resolveVscodeRuntimeDataRoot(paths));
+  assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, 'default');
+  const { readRuntimeHistoryResidual, readRuntimeHistoryPending } = require('../../dist/extension/backend/reliableKernel/runtimeHistoryRegistry.js');
+  assert.ok((await readRuntimeHistoryResidual(paths)).has(`workspace:${broken.key}`));
+  assert.ok((await readRuntimeHistoryPending(paths)).has(`workspace:${broken.key}`));
+  assert.deepEqual(await fs.readFile(old.paths.databasePath), before);
 }));
 
 test('选择界面用的历史库摘要：项目文件夹名、对话数与最后活动时间，旧格式同样可读', async () => fixture(async (root, paths) => {
@@ -225,16 +222,12 @@ test('选择界面用的历史库摘要：项目文件夹名、对话数与最�
   assert.deepEqual(await summarizeRuntimeDataSet(oldCandidate), { projectNames: [], conversationCount: 0 });
 }));
 
-test('旧工作区容器不可读时不自动选库，仍要求明确选择', async () => fixture(async (root, paths) => {
+test('旧工作区容器不可读时保留物理边界错误，不弹选库界面', async () => fixture(async (root, paths) => {
   await createRoot(root);
   const container = path.join(root, '.limcode-workspace-runtimes', 'scopes');
   await fs.mkdir(path.dirname(container), { recursive: true });
   await fs.writeFile(container, 'not-a-directory');
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), (error) => {
-    assert.ok(error instanceof VscodeRuntimeDataSetSelectionRequiredError);
-    assert.deepEqual(error.problems.map((problem) => problem.id), ['workspace-scopes']);
-    return true;
-  });
+  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')));
   await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
 }));
 

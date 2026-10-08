@@ -128,19 +128,7 @@ interface RuntimeDataSetSelection {
   selectedAt: string;
 }
 
-export class VscodeRuntimeDataSetSelectionRequiredError extends Error {
-  public readonly code = 'runtime-dataset-selection-required';
 
-  public constructor(
-    public readonly candidates: readonly VscodeRuntimeDataSetCandidate[],
-    public readonly problems: readonly VscodeRuntimeDataSetProblem[] = []
-  ) {
-    super(problems.length
-      ? '发现无法使用的历史库，请查看原因并明确选择可用数据集；不会自动跳过异常库或创建空库。'
-      : '发现多个已有运行数据集，请先选择当前数据集；工作区文件夹不会自动决定使用哪个数据库。');
-    this.name = 'VscodeRuntimeDataSetSelectionRequiredError';
-  }
-}
 
 export class VscodeRuntimeDataSetError extends Error {
   public readonly code = 'runtime-dataset-invalid';
@@ -236,23 +224,42 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
       candidate = await inspectCandidate(configurationRootPath, selection.id, selection, !selection.initialized);
     } else {
       const { candidates, problems } = await inspectCandidates(configurationRootPath);
-      if (problems.length && candidates.length === 0) {
-        throw new VscodeRuntimeDataSetError(
-          `已有运行数据集均无法使用，原数据保持不变：\n${problems.map(problem => problem.message).join('\n')}`
-        );
-      }
-      // An unreadable fixed root or scope container could hide data; that still needs a person.
-      if (problems.some(problem => problem.id === 'default' || problem.id === 'workspace-scopes')) {
-        throw new VscodeRuntimeDataSetSelectionRequiredError(candidates, problems);
-      }
       const choice = await chooseInitialRuntimeDataSet(configurationRootPath, candidates);
-      if (choice.rejected.length > 0 && !choice.candidate) {
-        // Nothing passed the read-only upgrade preflight: publishing a choice would only make every
-        // later startup fail on it. A person chooses, with each rejection explained.
-        throw new VscodeRuntimeDataSetSelectionRequiredError(candidates, [...problems, ...choice.rejected]);
-      }
-      candidate = choice.candidate ?? await inspectCandidate(configurationRootPath, 'default', undefined, true);
       await assertConfigurationRootRuntimesOffline(configurationRootPath);
+      const registry = await import('./runtimeHistoryRegistry');
+      const paths = { globalStoragePath: configurationRootPath };
+      const rejected = [...problems, ...choice.rejected];
+      if (choice.candidate) candidate = choice.candidate;
+      else {
+        // Preserve an unusable fixed root before making room for the one current root.
+        const control = path.join(configurationRootPath, VSCODE_RUNTIME_CONTROL_DIRECTORY);
+        if (await hasRuntimeArtifacts(control)) {
+          await assertSafeRootPath(configurationRootPath, control);
+          const backupDirectory = path.join(configurationRootPath, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY);
+          await fs.mkdir(backupDirectory, { recursive: true });
+          const backup = path.join(backupDirectory, `unreadable-${Date.now()}-${process.pid}`);
+          await fs.rename(control, backup);
+          await syncDirectoryDurably(backupDirectory);
+          await syncDirectoryDurably(configurationRootPath);
+          await registry.registerRuntimeResetBackup(paths, backup);
+        }
+        candidate = await inspectCandidate(configurationRootPath, 'default', undefined, true);
+      }
+      const registeredAt = new Date().toISOString();
+      for (const old of candidates) {
+        if (old.id === candidate.id) continue;
+        await registry.writeRuntimeHistoryPending(paths, {
+          id: old.id, sourceKind: 'local', location: { kind: 'local', candidateId: old.id },
+          reason: '升级后统一并入当前历史', registeredAt
+        });
+      }
+      for (const problem of rejected) {
+        if (problem.id === 'default' && candidate.id === 'default') continue;
+        await registry.writeRuntimeHistoryResidual(paths, {
+          id: problem.id, sourceKind: 'local', location: { kind: 'local', candidateId: problem.id },
+          code: 'runtime-history-initial-source-unavailable', message: problem.message, checkedAt: registeredAt
+        });
+      }
       await publishSelection(configurationRootPath, candidate.id, Boolean(candidate.dataSetId));
     }
     return Object.freeze({

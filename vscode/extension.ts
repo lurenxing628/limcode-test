@@ -1,12 +1,12 @@
 import * as vscode from 'vscode';
-import { registerCommands } from './commands/registerCommands';
-import { MainPanel } from './panels/MainPanel';
-import { registerSidebarEntryView } from './views/SidebarEntryView';
-import { ApplicationStartup } from './ApplicationStartup';
-import { stopRuntimeDataSetUpgrades } from './runtimeDataSetUpgradeLifetime';
 import type { VscodeReliableKernelApplicationFacade } from '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade';
 import type { DataRootUnavailableReason } from '../backend/reliableKernel/runtimeDataRootRelocation';
 import { EXTENSION_BRAND } from '../shared/extensionIdentity';
+import { ApplicationStartup } from './ApplicationStartup';
+import { registerCommands } from './commands/registerCommands';
+import { MainPanel } from './panels/MainPanel';
+import { stopRuntimeDataSetUpgrades } from './runtimeDataSetUpgradeLifetime';
+import { registerSidebarEntryView } from './views/SidebarEntryView';
 
 let backendApp: VscodeReliableKernelApplicationFacade | undefined;
 let exclusiveMaintenanceParticipant: { dispose(): Promise<void>; unregister(): Promise<void> } | undefined;
@@ -46,8 +46,7 @@ async function startApplication(
     );
     const moduleLoadedAt = Date.now();
     const {
-      announceForeignRuntimeHistoryOnStartup, mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection,
-      reportLargeHistoricalMergeKeptAcrossReload,
+      mergeHistoricalDataSetsInBackground, openWithRuntimeDataSetSelection,
       upgradeHistoricalDataSetsOnStartup
     } = await import('./commands/runtimeDataSetManagement');
     const dataRootCommands = await import('./commands/dataRootRelocation');
@@ -134,17 +133,11 @@ async function startApplication(
     setImmediate(() => {
       if (activeStartup !== startup || backendApp !== application) return;
       const isCurrent = () => activeStartup === startup && backendApp === application;
-      // This window reloaded after its large historical merge session: each source's outcome, once.
-      void reportLargeHistoricalMergeKeptAcrossReload(context, isCurrent, activationStartedAt)
-        .catch(error => console.warn(`${EXTENSION_BRAND} large historical merge result could not be shown.`, error));
       // Old data sets are upgraded, then merged online into this Runtime, both in the background.
       void upgradeHistoricalDataSetsOnStartup(context, isCurrent)
         .catch(error => console.error(`${EXTENSION_BRAND} historical data upgrade failed.`, error))
         .then(() => mergeHistoricalDataSetsInBackground(context, application, isCurrent))
-        .catch(error => console.error(`${EXTENSION_BRAND} historical data merge failed.`, error))
-        // Archives and copied data directories: listed once, announced once, read only on request.
-        .then(() => announceForeignRuntimeHistoryOnStartup(context, isCurrent, startup))
-        .catch(error => console.error(`${EXTENSION_BRAND} foreign history discovery failed.`, error));
+        .catch(error => console.error(`${EXTENSION_BRAND} historical data merge failed.`, error));
       const recoveryStartedAt = Date.now();
       void application.startRuntimeRecovery().then(
         () => console.log(`${EXTENSION_BRAND} reliable Runtime recovery converged in ${Date.now() - recoveryStartedAt}ms.`),
