@@ -66,7 +66,15 @@ export interface RuntimeDataSetIdentity {
 }
 
 /** The last successful merge of this source incarnation, and the source state it merged. */
+export interface RuntimeDataSetMergeExcludedConversation {
+  conversationId: string;
+  title: string;
+  code: string;
+  count: number;
+}
+
 export interface RuntimeDataSetLastMerge {
+  excluded?: RuntimeDataSetMergeExcludedConversation[];
   target: RuntimeDataSetIdentity;
   mergedAt: string;
   source: RuntimeDataSetFingerprint;
@@ -118,12 +126,11 @@ export type RuntimeDataSetMergeLedgerRecord = {
    * record it replaced, put back unchanged when the transaction is proven not to have committed.
    */
   | {
-    state: 'committing'; target: RuntimeDataSetIdentity; commitId: string; replaced?: RuntimeDataSetMergeLedgerRecord;
+    state: 'committing'; excluded?: RuntimeDataSetMergeExcludedConversation[]; target: RuntimeDataSetIdentity; commitId: string; replaced?: RuntimeDataSetMergeLedgerRecord;
     /** The plan's left-out conversations, for the merged record a crash converges to. */
     skippedConversations?: number;
   }
-  | {
-    state: 'merged';
+  | (({ state: 'merged'; excluded?: never } | { state: 'partial'; excluded: RuntimeDataSetMergeExcludedConversation[] }) & {
     target: RuntimeDataSetIdentity;
     mergedAt: string;
     insertedRows: number;
@@ -131,7 +138,7 @@ export type RuntimeDataSetMergeLedgerRecord = {
     insertedConversations: number;
     /** Conversations left out because the user had deleted them in the target (a copy then keeps them). */
     skippedConversations?: number;
-  }
+  })
   /** Unfinished work that has no terminal transition, or a conflict with this target. */
   | { state: 'blocked'; target: RuntimeDataSetIdentity; code: string; message: string }
   /** The source itself cannot be merged (unsupported format, integrity, drift); any target. */
@@ -523,12 +530,15 @@ export async function readRuntimeDataSetMergeLedger(paths: StoragePaths): Promis
   return result;
 }
 
-const RECORD_STATES: ReadonlySet<string> = new Set(['committing', 'merged', 'blocked', 'failed', 'too-large']);
+const RECORD_STATES: ReadonlySet<string> = new Set(['committing', 'merged', 'partial', 'blocked', 'failed', 'too-large']);
 
 function isLedgerRecord(value: unknown, name: string): value is RuntimeDataSetMergeLedgerRecord {
   const record = value as Partial<RuntimeDataSetMergeLedgerRecord> | null;
   return record?.kind === RECORD_KIND && typeof record.candidateId === 'string' && fileName(record.candidateId) === name
-    && !!record.source && typeof record.source.dataSetId === 'string' && RECORD_STATES.has(String(record.state));
+    && !!record.source && typeof record.source.dataSetId === 'string' && RECORD_STATES.has(String(record.state))
+    && (record.state !== 'partial' || (Array.isArray(record.excluded) && record.excluded.length > 0
+      && record.excluded.every((item) => !!item && typeof item.conversationId === 'string' && typeof item.title === 'string'
+        && typeof item.code === 'string' && Number.isSafeInteger(item.count) && item.count >= 0)));
 }
 
 /**
@@ -582,9 +592,14 @@ export async function writeRuntimeDataSetMergeLedgerRecord(
     & { insertedConversationIds?: readonly string[] }
 ): Promise<void> {
   const { insertedConversationIds, ...record } = input;
+  if (record.state === 'partial' && (!Array.isArray(record.excluded) || !record.excluded.length || record.excluded.some(item =>
+    !item || typeof item.conversationId !== 'string' || !item.conversationId || typeof item.title !== 'string'
+    || typeof item.code !== 'string' || !Number.isSafeInteger(item.count) || item.count < 0))) {
+    throw new TypeError('Partial merge requires its excluded conversations.');
+  }
   const previous = await readRuntimeDataSetMergeLedgerRecord(paths, record.candidateId, true);
   const same = previous !== undefined && sameRuntimeDataSetIdentity(previous.source, record.source);
-  const lastMerged = same && record.state !== 'merged' ? runtimeDataSetLastMerge(previous) : undefined;
+  const lastMerged = same && record.state !== 'merged' && record.state !== 'partial' ? runtimeDataSetLastMerge(previous) : undefined;
   const { mergedInto, formerMergedInto } = carriedConversations(previous, record.source);
   if (insertedConversationIds?.length && 'target' in record) {
     let entry = mergedInto.find((item) => sameRuntimeDataSetIdentity(item.target, record.target));
@@ -703,16 +718,17 @@ export function runtimeDataSetConversationsMergedFrom(
 
 /** The merge a record proves happened: its own, or the one it carried forward. */
 export function runtimeDataSetLastMerge(record: RuntimeDataSetMergeLedgerRecord): RuntimeDataSetLastMerge | undefined {
-  return record.state === 'merged'
+  return record.state === 'merged' || record.state === 'partial'
     ? {
       target: record.target, mergedAt: record.mergedAt, source: record.source,
+      ...(record.excluded?.length ? { excluded: record.excluded } : {}),
       ...(record.skippedConversations ? { skippedConversations: record.skippedConversations } : {})
     }
     : record.lastMerged;
 }
 
 /** `forWrite`: a newer version's record is refused (RuntimeDataSetMergeRecordNewerError), never replaced. */
-async function readRuntimeDataSetMergeLedgerRecord(
+export async function readRuntimeDataSetMergeLedgerRecord(
   paths: StoragePaths,
   candidateId: string,
   forWrite = false
@@ -1077,7 +1093,7 @@ function fileName(id: string): string {
   return `${id.replace(/:/g, '-')}.json`;
 }
 
-async function ledgerFile(paths: StoragePaths, section: string, id: string): Promise<string> {
+export async function ledgerFile(paths: StoragePaths, section: string, id: string): Promise<string> {
   const root = resolveVscodeRuntimeMergeLedgerRoot(paths);
   const file = path.join(root, section, fileName(id));
   if (path.dirname(file) !== path.join(root, section)) throw new TypeError('Merge ledger id is not a plain name.');
@@ -1106,7 +1122,7 @@ async function readDirectoryJson(paths: StoragePaths, section: string, unparsabl
   return result;
 }
 
-async function writeLedgerJson(paths: StoragePaths, section: string, id: string, value: unknown): Promise<void> {
+export async function writeLedgerJson(paths: StoragePaths, section: string, id: string, value: unknown): Promise<void> {
   const file = await ledgerFile(paths, section, id);
   await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 });
   const temporary = `${file}.${process.pid}.${randomUUID()}.tmp`;
@@ -1125,7 +1141,7 @@ async function writeLedgerJson(paths: StoragePaths, section: string, id: string,
   await syncDirectoryDurably(path.dirname(file));
 }
 
-async function removeLedgerJson(paths: StoragePaths, section: string, id: string): Promise<void> {
+export async function removeLedgerJson(paths: StoragePaths, section: string, id: string): Promise<void> {
   const file = await ledgerFile(paths, section, id);
   await fs.rm(file, { force: true });
   await syncDirectoryDurably(path.dirname(file)).catch(() => undefined);

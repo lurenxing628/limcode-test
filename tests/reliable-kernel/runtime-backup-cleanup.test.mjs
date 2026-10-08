@@ -411,6 +411,9 @@ test('只列出的备份：归档目录里不认识的条目、没有库的拷�
   t.after(() => fs.rm(copied, { recursive: true, force: true }));
   const legacy = path.join(controlRoot(fixture.alpha), 'backups');
   const dataBackups = path.join(fixture.root, '.limcode-data-backups');
+  const resetBackups = path.join(fixture.root, '.limcode-runtime-reset-backups');
+  await fs.mkdir(resetBackups);
+  await fs.writeFile(path.join(resetBackups, 'retained.bin'), 'reset');
   for (const [directory, bytes] of [[archive, 11], [unknown, 5], [copied, 22], [legacy, 33], [dataBackups, 44]]) {
     await fs.mkdir(directory, { recursive: true });
     await fs.writeFile(path.join(directory, 'data.bin'), Buffer.alloc(bytes, 1));
@@ -419,6 +422,8 @@ test('只列出的备份：归档目录里不认识的条目、没有库的拷�
   for (const directory of [archive, unknown, copied, legacy, dataBackups]) {
     assert.equal(plan.items.filter((item) => item.path === directory).length, 1, `${directory} 只列出一次`);
   }
+  assert.equal(itemAt(plan, resetBackups).deletable, false);
+  assert.match(itemAt(plan, resetBackups).reason, /不自动删除/);
   const listed = [archive, unknown, copied, legacy, dataBackups].map((directory) => itemAt(plan, directory));
   assert.deepEqual(listed.map((item) => [item.kind, item.deletable, item.bytes, item.name]), [
     ['foreign-history', false, '11', path.basename(archive)],

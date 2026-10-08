@@ -1,3 +1,5 @@
+import { cachedRuntimeDataSetFingerprint, readRuntimeDataSetMergeLedgerRecord, sameRuntimeDataSetFingerprint, sameRuntimeDataSetIdentity } from './runtimeDataSetMergeLedger';
+import { RUNTIME_RESET_BACKUPS_DIRECTORY, readRuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import { constants } from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -113,6 +115,17 @@ export async function deleteUnselectedRuntimeDataSet(
       const snapshot = await createRuntimeDataSetDatabaseSnapshot(current, currentBinding);
       await snapshot.close();
       const { trees, excluded } = await runtimeDataSetTrees(current);
+      const record = await readRuntimeDataSetMergeLedgerRecord(paths, candidateId);
+      const fingerprint = await cachedRuntimeDataSetFingerprint(current);
+      const target = await requireCompleteRuntimeDataSet(selected[0]);
+      const residuals = await readRuntimeHistoryResidual(paths);
+      if (record?.state !== 'merged' || !fingerprint
+        || !sameRuntimeDataSetFingerprint(record.source, fingerprint)
+        || !sameRuntimeDataSetIdentity(record.target, target) || residuals.has(candidateId)) {
+        throw Object.assign(new Error(record?.state === 'partial'
+          ? `还有 ${record.excluded.length} 个对话没有合并进来，原库必须保留。`
+          : '这份历史尚未确认完整合并进当前库，请先合并再删除。'), { code: 'runtime-data-set-delete-not-merged' });
+      }
       const maintenancePath = runtimeMaintenanceClaimPath(binding.paths);
       const deleted: RuntimeStorageSize = { fileCount: 0, bytes: '0' };
       // Validate every tree before deleting any. Reset archives of the scope are never part of it:
@@ -136,13 +149,14 @@ export async function deleteUnselectedRuntimeDataSet(
     // Finish deleting this already-confirmed scope only after release, while configuration
     // admission still excludes new Hosts. Never recursively remove the shared configuration root.
     if (!isSamePath(candidate.runtimeScopeRootPath, configurationRootPath)) {
-      const archives = path.join(candidate.runtimeScopeRootPath, RUNTIME_SCOPE_BACKUPS_DIRECTORY);
-      if (!await exists(archives)) {
+      const archiveNames = [RUNTIME_SCOPE_BACKUPS_DIRECTORY, RUNTIME_RESET_BACKUPS_DIRECTORY];
+      const hasArchives = (await Promise.all(archiveNames.map(name => exists(path.join(candidate.runtimeScopeRootPath, name))))).some(Boolean);
+      if (!hasArchives) {
         await fs.rm(candidate.runtimeScopeRootPath, { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
       } else {
         // The scope keeps only its reset archives; enumeration no longer counts it as a data set.
         for (const entry of await fs.readdir(candidate.runtimeScopeRootPath)) {
-          if (entry === RUNTIME_SCOPE_BACKUPS_DIRECTORY) continue;
+          if (archiveNames.includes(entry)) continue;
           await fs.rm(path.join(candidate.runtimeScopeRootPath, entry), { recursive: true, force: false, maxRetries: 3, retryDelay: 50 });
         }
       }
@@ -369,14 +383,15 @@ async function runtimeDataSetTrees(candidate: VscodeRuntimeDataSetCandidate): Pr
   if (!isPathBelow(configuration, tree)) {
     throw new Error('Runtime data-set tree escapes its configuration root.');
   }
-  const backups = path.join(scope, RUNTIME_SCOPE_BACKUPS_DIRECTORY);
-  const hasBackups = await exists(backups);
-  if (hasBackups) {
+  const excluded: string[] = [];
+  for (const name of [RUNTIME_SCOPE_BACKUPS_DIRECTORY, RUNTIME_RESET_BACKUPS_DIRECTORY]) {
+    const backups = path.join(scope, name);
+    if (!await exists(backups)) continue;
     await assertNoSymbolicPath(configuration, backups);
     if (!(await fs.lstat(backups)).isDirectory()) throw new Error('Runtime scope backups must be a directory.');
+    if (scope !== configuration) excluded.push(backups);
   }
-  // A workspace scope is one tree that also holds the archives directory; it is walked around.
-  return { trees: [tree], excluded: scope === configuration || !hasBackups ? [] : [backups] };
+  return { trees: [tree], excluded };
 }
 
 function classifyStoragePath(candidate: VscodeRuntimeDataSetCandidate, filePath: string): RuntimeStorageCategory {

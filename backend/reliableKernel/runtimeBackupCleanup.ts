@@ -1,3 +1,4 @@
+import { RUNTIME_RESET_BACKUPS_DIRECTORY, readRuntimeHistoryPending, readRuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import type { BigIntStats } from 'node:fs';
 import * as fs from 'node:fs/promises';
@@ -1755,6 +1756,11 @@ async function listKeptBackups(configurationRootPath: string, root: ControlRoot,
     items.push(await keptItem(configurationRootPath, configurationRootPath, 'legacy-cutover', legacy, root.candidateId,
       '旧格式备份（升级到 SQLite 内核之前的数据），从未导入；本版本只列出，不删除'));
   }
+  const resetBackups = path.join(root.scopeRootPath, RUNTIME_RESET_BACKUPS_DIRECTORY);
+  if (await lstatOrUndefined(resetBackups)) {
+    items.push(await keptItem(configurationRootPath, configurationRootPath, 'reset-archive', resetBackups, root.candidateId,
+      '归档并重置挪走的旧数据；原位保留，不自动删除'));
+  }
   const archives = path.join(root.scopeRootPath, RESET_ARCHIVES_DIRECTORY);
   if (handled.has(comparable(archives))) return items;
   const info = await lstatOrUndefined(archives);
@@ -2339,6 +2345,9 @@ async function foreignMergePending(configurationRootPath: string, foreignId: str
   try {
     const paths = { globalStoragePath: configurationRootPath };
     const record = (await readRuntimeDataSetMergeLedger(paths)).get(foreignId);
+    if (record?.state === 'partial') return `还有 ${record.excluded.length} 个对话没有合并进来，原位保留，不自动删除`;
+    if ((await readRuntimeHistoryResidual(paths)).has(foreignId)) return '未能合并的旧数据，原位保留，不自动删除';
+    if ((await readRuntimeHistoryPending(paths)).has(foreignId)) return '旧数据尚待合并，完成之前保留';
     if (record?.state === 'committing') return '有进行中的操作（正在提交的合并），完成之后再清理';
     if ((await readRuntimeDataSetMergeRequests(paths)).has(foreignId)) {
       return '你已请求把它合并进当前库，合并还没完成；合并完成或请求过期之后再清理';

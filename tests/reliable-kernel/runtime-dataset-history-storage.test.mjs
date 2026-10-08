@@ -19,7 +19,7 @@ const { inspectRuntimeDataSetStorage, deleteUnselectedRuntimeDataSet } = kernel(
 const {
   resolveVscodeRuntimeDataRoot, resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot, resolveVscodeRuntimeSelectionPath, selectVscodeRuntimeDataSet,
-  listVscodeRuntimeDataSets
+  listVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet
 } = kernel('vscodeRootAuthority.js');
 const { ownProcessStartIdentity } = kernel('runtimeClaimPrimitives.js');
 const { archiveCurrentRuntimeRootForReset, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY } = require(path.join(
@@ -182,6 +182,8 @@ test('删除拒绝当前、确认身份漂移、活Host和未知Host，允许当
   await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), { code: 'runtime-hosts-active' });
   await fs.rm(host);
   await publishHost(fixture.current.binding);
+  await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId), { code: 'runtime-data-set-delete-not-merged' });
+  await recordMerged(fixture, fixture.old, fixture.current);
   const result = await deleteUnselectedRuntimeDataSet(fixture.paths, fixture.old.id, fixture.old.binding.dataSetId);
   assert.equal(result.dataSetId, fixture.old.binding.dataSetId);
   await assert.rejects(fs.stat(fixture.old.scopeRoot), { code: 'ENOENT' });
@@ -190,7 +192,9 @@ test('删除拒绝当前、确认身份漂移、活Host和未知Host，允许当
 
 test('删除非当前legacy只删除完整Runtime控制树，保留配置及其它库；拒绝符号链接', async (t) => {
   const fixture = await createFixture(t);
+  await fs.rm(resolveVscodeRuntimeSelectionPath(fixture.paths));
   await selectVscodeRuntimeDataSet(fixture.paths, fixture.old.id);
+  await recordMerged(fixture, fixture.current, fixture.old);
   const settings = path.join(fixture.root, 'settings/keep.json');
   await fs.mkdir(path.dirname(settings), { recursive: true });
   await fs.writeFile(settings, '{"keep":true}');
@@ -210,6 +214,7 @@ test('删除非当前legacy只删除完整Runtime控制树，保留配置及其�
 test('删除旧workspace库会清理已释放维护锁的残留，后续历史库枚举仍可用', async (t) => {
   const fixture = await createFixture(t);
   await seedHistory(fixture.old.binding);
+  await recordMerged(fixture, fixture.old, fixture.current);
   const currentBefore = await treeSnapshot(path.dirname(fixture.current.binding.paths.dataRootPath));
   const settings = path.join(fixture.root, 'settings/keep.json');
   await fs.mkdir(path.dirname(settings), { recursive: true });
@@ -263,7 +268,7 @@ test('尚未确定当前数据集时允许只读历史但拒绝把未知当前�
 });
 
 for (const scopeKind of ['default', 'workspace']) {
-  test(`${scopeKind}真实reset归档不算本地库的一部分：统计不计入、整库删除保留归档，只剩归档的scope不再算库，共享配置保留`, async (t) => {
+  test(`${scopeKind}真实reset备份不成为外来来源：残留可补登记、统计不计入、未合并的库不能删除`, async (t) => {
     const fixture = await createFixture(t);
     const target = scopeKind === 'default' ? fixture.current : fixture.old;
     const survivor = scopeKind === 'default' ? fixture.old : fixture.current;
@@ -272,10 +277,21 @@ for (const scopeKind of ['default', 'workspace']) {
     const authority = new RootAuthority(() => target.binding.paths.dataRootPath, undefined, () => fixture.root);
     const archived = await archiveCurrentRuntimeRootForReset(authority, target.scopeRoot);
     assert.equal(archived.archived, true);
-    assert.equal(path.dirname(archived.backupPath), path.join(target.scopeRoot, VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY));
+    assert.equal(path.dirname(archived.backupPath), path.join(target.scopeRoot, ".limcode-runtime-reset-backups"));
+    const registry = require(path.join(compiled, 'backend/reliableKernel/runtimeHistoryRegistry.js'));
+    const foreign = require(path.join(compiled, 'backend/reliableKernel/runtimeForeignHistory.js'));
+    let residual = await registry.readRuntimeHistoryResidual(fixture.paths);
+    const retained = [...residual.values()].find(item => item.location.containerPath === archived.backupPath);
+    assert.equal(retained?.sourceKind, 'reset');
+    assert.deepEqual(await foreign.discoverForeignRuntimeHistory({ configurationRootPath: fixture.root }), [], '新重置备份不自动成为外来来源');
+    await registry.removeRuntimeHistoryResidual(fixture.paths, retained.id);
+    await registry.reconcileRuntimeResetBackups(fixture.paths);
+    residual = await registry.readRuntimeHistoryResidual(fixture.paths);
+    assert.equal(residual.get(retained.id)?.location.containerPath, archived.backupPath, '改名之后的登记中断可补齐');
     target.binding = await initialize(target.scopeRoot);
     assert.notEqual(target.binding.dataSetId, oldDataSetId);
     const archiveBefore = await treeSnapshot(archived.backupPath);
+    await fs.rm(resolveVscodeRuntimeSelectionPath(fixture.paths));
     await selectVscodeRuntimeDataSet(fixture.paths, survivor.id);
     const keep = path.join(fixture.root, 'settings/keep.json');
     const unrelated = path.join(fixture.root, 'independent-backups/keep.bin');
@@ -285,15 +301,11 @@ for (const scopeKind of ['default', 'workspace']) {
     const usage = await inspectRuntimeDataSetStorage(fixture.paths, target.id);
     assert.deepEqual(usage.categories.historicalBackups, { fileCount: 0, bytes: '0' }, '归档单独作为外来历史库统计');
     assert.equal(usage.archiveReclaimsBytes, false);
-    const result = await deleteUnselectedRuntimeDataSet(fixture.paths, target.id, target.binding.dataSetId);
-    assert.deepEqual(result.deleted, usage.total);
-    assert.deepEqual(await treeSnapshot(archived.backupPath), archiveBefore, '归档原样保留');
+    await assert.rejects(deleteUnselectedRuntimeDataSet(fixture.paths, target.id, target.binding.dataSetId), { code: 'runtime-data-set-delete-not-merged' });
+    await recordMerged(fixture, target, survivor);
+    await deleteUnselectedRuntimeDataSet(fixture.paths, target.id, target.binding.dataSetId);
+    assert.deepEqual(await treeSnapshot(archived.backupPath), archiveBefore, '重置备份原样保留');
     await assert.rejects(fs.stat(target.binding.paths.databasePath), { code: 'ENOENT' });
-    await assert.rejects(fs.stat(path.dirname(target.binding.paths.rootPointerPath)), { code: 'ENOENT' });
-    if (scopeKind === 'workspace') {
-      assert.deepEqual(await fs.readdir(target.scopeRoot), [VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY]);
-    }
-    assert.deepEqual((await listVscodeRuntimeDataSets(fixture.paths)).map((candidate) => candidate.id), [survivor.id]);
     assert.ok((await fs.stat(survivor.binding.paths.databasePath)).isFile());
     assert.equal(await fs.readFile(keep, 'utf8'), 'keep');
     assert.equal(await fs.readFile(unrelated, 'utf8'), 'keep');
@@ -390,4 +402,16 @@ async function treeSnapshot(root) {
   }
   await visit(root);
   return files;
+}
+
+async function recordMerged(fixture, source, target) {
+  const ledger = kernel('runtimeDataSetMergeLedger.js');
+  const { runtimeDataSetFileState } = kernel('runtimeDataSetFacts.js');
+  const candidate = await resolveVscodeRuntimeDataSet(fixture.paths, source.id);
+  const fingerprint = { dataSetId: source.binding.dataSetId, rootInstanceId: source.binding.rootInstanceId,
+    rootGeneration: source.binding.rootGeneration, pointerRevision: source.binding.pointerRevision, contentDigest: 'fixture-merged' };
+  await ledger.rememberRuntimeDataSetFingerprint(candidate, await runtimeDataSetFileState(source.binding.paths.databasePath), fingerprint);
+  await ledger.writeRuntimeDataSetMergeLedgerRecord(fixture.paths, { candidateId: source.id, source: fingerprint,
+    target: { dataSetId: target.binding.dataSetId, rootInstanceId: target.binding.rootInstanceId },
+    state: 'merged', mergedAt: now, insertedRows: 0, reusedRows: 0, insertedConversations: 0 });
 }
