@@ -428,7 +428,7 @@ test('协作消息 message_seq 在合并事务内接在当前库最大值之后�
   } finally { target.close(); }
 });
 
-test('同一身份内容不同：整份拒绝，当前库不备份、不新增正文，两边都不变', async (t) => {
+test('同一身份内容不同：只剔除冲突对话，其余合并并记部分合并', async (t) => {
   const fixture = await createFixture(t, { withBeta: false });
   await seed(fixture.current, [{ id: 'conversation_duplicate', project: SHARED_PROJECT, title: '当前库标题' }]);
   await seed(fixture.alpha, [
@@ -436,19 +436,24 @@ test('同一身份内容不同：整份拒绝，当前库不备份、不新增�
     { id: 'conversation_alpha_unique', project: SHARED_PROJECT }
   ]);
   const database = await openTarget(t, fixture.current);
-  const before = { rows: databaseDigest(fixture.current), cas: await treeSnapshot(fixture.current.binding.paths.casRootPath),
-    alpha: await treeSnapshot(fixture.alpha.scopeRoot) };
   const report = await merge(fixture, database);
-  assert.equal(report.blocked[0]?.code, 'runtime-data-set-merge-conflict');
-  assert.match(report.blocked[0].message, /Conversation#conversation_duplicate 字段不同：title/);
-  assert.match(report.blocked[0].message, /两边内容都没有改动/);
-  assert.equal(databaseDigest(fixture.current), before.rows);
-  assert.deepEqual(await treeSnapshot(fixture.current.binding.paths.casRootPath), before.cas);
-  assert.deepEqual(await treeSnapshot(fixture.alpha.scopeRoot), before.alpha);
-  await assert.rejects(fs.stat(path.join(controlRoot(fixture.current), 'merge-backups')), { code: 'ENOENT' });
+  assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
+  assert.equal(report.merged[0].insertedConversations, 1);
+  assert.deepEqual(report.merged[0].excluded.map(item => item.conversationId), ['conversation_duplicate']);
+  const target = readDatabase(fixture.current);
+  try {
+    assert.equal(target.database.prepare('SELECT title FROM conversation WHERE id=?').pluck().get('conversation_duplicate'), '当前库标题');
+    assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_unique'), 1);
+    assert.deepEqual(target.database.pragma('foreign_key_check'), []);
+  } finally { target.close(); }
+  const record = (await ledgerModule.readRuntimeDataSetMergeLedger(fixture.paths)).get(fixture.alpha.id);
+  assert.equal(record.state, 'partial');
+  assert.deepEqual(record.excluded.map(item => item.conversationId), ['conversation_duplicate']);
+  const again = await merge(fixture, database);
+  assert.equal(again.merged.length, 0);
 });
 
-test('正文校验：当前库同名正文损坏则拒绝且不覆盖；来源正文与摘要不符记为失败；跨设备时复制校验后发布', async (t) => {
+test('正文校验：目标损坏不覆盖，来源缺正文按对话剔除，跨设备正常复制', async (t) => {
   for (const damage of ['same-length', 'truncated']) {
     const fixture = await createFixture(t, { withBeta: false });
     await seed(fixture.current, [{ id: 'conversation_current_cas', project: SHARED_PROJECT }]);
@@ -478,11 +483,12 @@ test('正文校验：当前库同名正文损坏则拒绝且不覆盖；来源�
   await fs.writeFile(sourceFile, bytes);
   const sourceTarget = await openTarget(t, source.current);
   const bad = await merge(source, sourceTarget);
-  assert.equal(bad.failures[0]?.code, 'runtime-data-set-merge-source-cas-invalid');
-  assert.equal(bad.failures[0].newly, true);
+  assert.deepEqual([bad.failures, bad.blocked, bad.deferred], [[], [], []]);
+  assert.equal(bad.merged[0].excluded[0].conversationId, 'conversation_alpha_bad_source');
+  assert.equal(bad.merged[0].excluded[0].code, 'runtime-data-set-merge-source-cas-invalid');
   await assert.rejects(fs.stat(casFile(source.current.binding, messageText('conversation_alpha_bad_source', 0))), { code: 'ENOENT' },
     '摘要不符的来源文件不会被链接进当前库');
-  assert.equal((await merge(source, sourceTarget)).failures[0]?.newly, false, '同一来源状态不重复提示');
+  assert.equal((await merge(source, sourceTarget)).merged.length, 0, '同一来源状态不重复合并');
 
   const copy = await createFixture(t, { withBeta: false });
   await seed(copy.alpha, [{ id: 'conversation_alpha_copy', project: SHARED_PROJECT }]);
