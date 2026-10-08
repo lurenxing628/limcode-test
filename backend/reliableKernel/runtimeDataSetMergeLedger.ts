@@ -1,3 +1,4 @@
+import type { RelocatedWorkSettlementCounts } from './historicalWorkSettlement';
 import { RUNTIME_MERGE_VALIDATION_REVISION, revisionedRuntimeMergeRefusal } from './runtimeMergeValidation';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs/promises';
@@ -186,6 +187,8 @@ export interface RuntimeDataSetMergeFinalization {
   turns: number;
   intents: number;
   sourceBackupPath: string;
+  /** Complete counts returned by the offline settlement control plane. */
+  settlement?: RelocatedWorkSettlementCounts;
   /** False when closing failed partway (some of the work may be closed). */
   complete: boolean;
   finalizedAt: string;
@@ -871,6 +874,13 @@ export function runtimeDataSetMergeFinalizationFile(paths: StoragePaths, candida
   return ledgerFile(paths, FINALIZATIONS, candidateId);
 }
 
+const SETTLEMENT_COUNT_KEYS: readonly (keyof RelocatedWorkSettlementCounts)[] = [
+  'turnsStopped', 'childTurnsStopped', 'childExecutionsInterrupted', 'backgroundChildrenStopped',
+  'queuedMessagesCancelled', 'childContinuationsCancelled', 'interactionsCancelled', 'modelRequestsClosed',
+  'effectsCancelled', 'effectsClosedAsUnknown', 'deliveriesTakenIn', 'queuedIntentsCancelled',
+  'deliveriesAbandoned', 'answersAbandoned', 'processCompletionsAbandoned'
+];
+
 function finalizationOf(value: unknown, candidateId: string): RuntimeDataSetMergeFinalization | undefined {
   const entry = value as Partial<RuntimeDataSetMergeFinalization> | null;
   const ids = (list: unknown): list is string[] => Array.isArray(list) && list.every((id) => typeof id === 'string');
@@ -879,6 +889,8 @@ function finalizationOf(value: unknown, candidateId: string): RuntimeDataSetMerg
     || !ids(entry.turnIds) || !ids(entry.intentIds)
     || typeof entry.turns !== 'number' || typeof entry.intents !== 'number' || typeof entry.sourceBackupPath !== 'string'
     || typeof entry.complete !== 'boolean' || typeof entry.finalizedAt !== 'string') return undefined;
+  if (entry.settlement !== undefined && (!entry.settlement || typeof entry.settlement !== 'object'
+    || SETTLEMENT_COUNT_KEYS.some(key => !Number.isSafeInteger(entry.settlement![key]) || entry.settlement![key] < 0))) return undefined;
   return entry as RuntimeDataSetMergeFinalization;
 }
 
@@ -886,8 +898,9 @@ export async function writeRuntimeDataSetMergeFinalization(
   paths: StoragePaths,
   finalization: Omit<RuntimeDataSetMergeFinalization, 'kind' | 'finalizedAt'>
 ): Promise<void> {
-  await writeLedgerJson(paths, FINALIZATIONS, finalization.candidateId,
-    { kind: FINALIZATION_KIND, ...finalization, finalizedAt: new Date().toISOString() });
+  const record = { kind: FINALIZATION_KIND, ...finalization, finalizedAt: new Date().toISOString() };
+  if (!finalizationOf(record, finalization.candidateId)) throw new TypeError('Invalid merge finalization counts.');
+  await writeLedgerJson(paths, FINALIZATIONS, finalization.candidateId, record);
 }
 
 export async function removeRuntimeDataSetMergeFinalization(paths: StoragePaths, candidateId: string): Promise<void> {
