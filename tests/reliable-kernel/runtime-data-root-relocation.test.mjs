@@ -350,7 +350,7 @@ test('删除旧目录：没有迁移完成记录时拒绝；迁移后只删除�
 test('迁移留下同名库：新根登记旧位置，后续清理previousDataRoots不会丢掉它', async (t) => {
   const fixture = await createFixture(t);
   const target = path.join(fixture.base, 'same-name-target');
-  await createLimCodeTarget(target);
+  const targetDataSet = await createLimCodeTarget(target);
   const scopeRoot = rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(target, fixture.alpha.id);
   await initialize(scopeRoot, fixture.alpha.id);
   const registry = kernelFile('runtimeHistoryRegistry.js');
@@ -370,6 +370,15 @@ test('迁移留下同名库：新根登记旧位置，后续清理previousDataRo
   assert.equal(left?.sourceKind, 'migration');
   assert.equal(left?.location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
   assert.equal(left?.location.baseDataRootPath, fixture.root);
+  const database = await openRuntime(targetDataSet);
+  try {
+    const report = await kernelFile('runtimeDataSetMerge.js').mergeHistoricalDataSetsOnline({ globalStoragePath: target },
+      { configurationRootPath: target, database }, { candidateIds: [left.id] });
+    assert.deepEqual(report.failures, []);
+    assert.deepEqual(report.blocked, []);
+    assert.equal(report.merged[0]?.candidateId, left.id, JSON.stringify(report));
+  } finally { await database.close(); }
+
   assert.deepEqual(await kernelFile('runtimeForeignHistory.js').previousDataRootsWithoutForeignHistory({
     configurationRootPath: target, previousDataRootPaths: [fixture.root]
   }), []);

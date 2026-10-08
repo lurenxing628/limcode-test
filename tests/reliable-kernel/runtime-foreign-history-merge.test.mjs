@@ -32,7 +32,7 @@ const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBa
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
-import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset } from './runtime-data-root-relocation-fixture.mjs';
+import { archiveLegacyRuntimeRoot as archiveCurrentRuntimeRootForReset, createFixture, initialize } from './runtime-data-root-relocation-fixture.mjs';
 
 /** Injected bounds: the large source is above the in-memory bound and spans many chunks. */
 const SMALL_LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
@@ -727,4 +727,23 @@ test('纵深防护：在配置准入内取外来库的声明直接拒绝（锁�
   const candidate = { kind: 'foreign', id: source.id, label: source.label, root: source.root };
   await assert.rejects(engine.finalizeSource(fixture.paths, {}, candidate, {}, {}, {}, {}, {}), /A foreign history root is never finalized\./);
   await assert.rejects(engine.takeVerifiedSnapshot(candidate, {}, 'carry', {}, {}), /A foreign history root is audited for unfinished work\./);
+});
+
+
+test('新重置备份仅在残留明确重试后按登记位置合并', async (t) => {
+  const fixture = await createFixture(t, { withAlpha: false });
+  const reset = require(path.join(compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'));
+  const result = await reset.archiveCurrentRuntimeRootForReset(fixture.current.authority, fixture.root);
+  fixture.current = await initialize(fixture.root, 'default');
+  assert.deepEqual(await foreign.discoverForeignRuntimeHistory({ configurationRootPath: fixture.root }), []);
+  const registry = kernelFile('runtimeHistoryRegistry.js');
+  const residual = [...(await registry.readRuntimeHistoryResidual(fixture.paths)).values()].find(item => item.location.containerPath === result.backupPath);
+  const located = await foreign.locateForeignRuntimeRoot(fixture.root, residual.location);
+  await registry.writeRuntimeHistoryPending(fixture.paths, { id: residual.id, sourceKind: 'reset', location: residual.location,
+    identity: { dataSetId: located.recorded.dataSetId, rootInstanceId: located.recorded.rootInstanceId },
+    registeredAt: NOW, reason: '用户在残留列表里选择重新合并' });
+  const report = await merge(fixture, undefined, { candidateIds: [residual.id] });
+  assert.deepEqual(report.failures, []);
+  assert.deepEqual(report.blocked, []);
+  assert.equal(report.merged[0]?.candidateId, residual.id, JSON.stringify(report));
 });

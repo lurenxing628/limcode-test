@@ -152,6 +152,8 @@ const ARCHIVE_CONTAINER_NAME = new RegExp(`^${SCOPE_PREFIX}\\.limcode-runtime-ba
 const COPIED_DATA_ROOT = new RegExp(
   `^(?:${SCOPE_PREFIX}(?:\\.limcode-runtime/active|\\.limcode-runtime-backups/${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}/active|\\.limcode-runtime-backups))?$`
 );
+const RESET_BACKUP_CONTAINER_NAME = new RegExp(`^${SCOPE_PREFIX}\\.limcode-runtime-reset-backups/${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`);
+const MIGRATED_CONTROL_NAME = new RegExp(`^${SCOPE_PREFIX}\\.limcode-runtime$`);
 const FOREIGN_ID = /^foreign:(archive|copied):[0-9a-f]{16}$/;
 const MAX_SMALL_JSON_BYTES = 4 * 1024 * 1024;
 const MAX_HOST_RECORD_BYTES = 64 * 1024;
@@ -524,6 +526,7 @@ export async function locateForeignRuntimeRoot(
   let containerInfo;
   try {
     if (location.kind === 'archive') await assertNoSymbolicPath(archiveBase(configurationRoot, location), container);
+    else if (isMigratedLocation(location)) await assertNoSymbolicPath(location.baseDataRootPath!, container);
     containerInfo = await fs.lstat(container);
   } catch (error) {
     throw fileProblem(error, 'foreign-history-link', '所在位置有符号链接，不跟随链接读取。');
@@ -1314,16 +1317,27 @@ function requireStrictLocation(configurationRoot: string, location: ForeignRunti
     if (previous ? !normalizedBase || isSamePath(base!, configurationRoot) : location.side !== undefined || base !== undefined) invalid();
     const prefix = previous ? `${path.basename(base!)}/` : '';
     const relative = location.containerName.startsWith(prefix) ? location.containerName.slice(prefix.length) : '';
-    if (!ARCHIVE_CONTAINER_NAME.test(relative)
+    if ((!ARCHIVE_CONTAINER_NAME.test(relative) && !RESET_BACKUP_CONTAINER_NAME.test(relative))
       || location.containerPath !== path.join(previous ? path.dirname(base!) : configurationRoot, ...location.containerName.split('/'))
       || location.dataRootRelativePath !== (relative.endsWith(VSCODE_RUNTIME_ARCHIVES_DIRECTORY) ? '' : VSCODE_RUNTIME_ACTIVE_DIRECTORY)) invalid();
     return;
   }
+  if (isMigratedLocation(location)) return;
   if (location.kind !== 'copied' || !normalizedBase
     || (location.side === 'current') !== isSamePath(base!, configurationRoot) || (location.side !== 'current' && location.side !== 'previous')
     || !copiedNamePattern(base!).test(location.containerName)
     || location.containerPath !== path.join(path.dirname(base!), location.containerName)
     || !COPIED_DATA_ROOT.test(location.dataRootRelativePath)) invalid();
+}
+
+/** A local control root explicitly retained at its old location by relocation. */
+function isMigratedLocation(location: ForeignRuntimeRootLocation): boolean {
+  const base = location.baseDataRootPath;
+  return location.kind === 'copied' && location.side === undefined && !!base
+    && path.isAbsolute(base) && path.resolve(base) === base
+    && MIGRATED_CONTROL_NAME.test(location.containerName)
+    && location.containerPath === path.join(base, ...location.containerName.split('/'))
+    && location.dataRootRelativePath === VSCODE_RUNTIME_ACTIVE_DIRECTORY;
 }
 
 /** The data directory an archive belongs to: the current one, or the previous one it was found in. */
@@ -1437,9 +1451,10 @@ async function assertNoUnfinishedRelocationOrMerge(
   recorded: HistoricalRootBinding,
   held: HeldDatabaseFiles
 ): Promise<void> {
-  const ledgerRoot = location.kind === 'archive' ? archiveBase(configurationRoot, location) : location.containerPath;
+  const ledgerRoot = location.kind === 'archive' ? archiveBase(configurationRoot, location)
+    : isMigratedLocation(location) ? location.baseDataRootPath! : location.containerPath;
   if (location.kind === 'copied') {
-    const markerPath = path.join(location.containerPath, DATA_ROOT_RELOCATION_MARKER_FILE);
+    const markerPath = path.join(ledgerRoot, DATA_ROOT_RELOCATION_MARKER_FILE);
     if (await present(markerPath)) {
       let state: unknown;
       try { state = (JSON.parse(await readForeignFile(markerPath, held)) as { state?: unknown } | null)?.state; }

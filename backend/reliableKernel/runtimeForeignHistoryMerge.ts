@@ -1,3 +1,5 @@
+import { readRuntimeHistoryPending } from './runtimeHistoryRegistry';
+import { isDeepStrictEqual } from 'node:util';
 import { reusableRuntimeMergeRefusal } from './runtimeMergeValidation';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -93,11 +95,22 @@ export async function holdForeignHistoricalMergeSource(
   source: RuntimeDataSetMergeForeignSource
 ): Promise<ForeignHistoricalMergeHold> {
   const configurationRoot = path.resolve(paths.globalStoragePath);
-  if (!isForeignRuntimeHistoryId(id)) throw new TypeError(`Not a foreign history id: ${id}`);
   const location = source.location;
-  // Only recorded as text in the claim (what it guards); nothing there is touched.
-  const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, id, pointerOf(location));
-  return new ForeignMergeHold(configurationRoot, id, source.label, location, claim);
+  let locatedId = id;
+  if (!isForeignRuntimeHistoryId(id)) {
+    const registered = (await readRuntimeHistoryPending(paths)).get(id);
+    if (!registered || registered.location.kind === 'local' || !isDeepStrictEqual(registered.location, location)) {
+      throw new TypeError(`Not a registered located history source: ${id}`);
+    }
+    const root = await locateForeignRuntimeRoot(configurationRoot, location);
+    if (registered.identity && !sameRuntimeDataSetIdentity(registered.identity, root.recorded)) {
+      throw new RuntimeDataSetMergeError('runtime-data-set-merge-identity-mismatch', '登记的旧历史已变化，请重新核验。');
+    }
+    locatedId = root.id;
+  }
+  // Claims share the physical located root's id with read-only views and foreign cleanup.
+  const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location));
+  return new ForeignMergeHold(configurationRoot, id, source.label, location, claim, locatedId);
 }
 
 /** The fingerprint of a requested foreign root, read under its claim for this read only (outside the admission). */
@@ -228,7 +241,8 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     public readonly id: string,
     public readonly label: string,
     private readonly location: ForeignRuntimeRootLocation,
-    private readonly claim: ForeignRuntimeRootClaimHold
+    private readonly claim: ForeignRuntimeRootClaimHold,
+    private readonly locatedId: string
   ) {}
 
   public get held(): boolean {
@@ -247,7 +261,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     } catch (error) {
       throw refusal(await goneWhenRemoved(error, this.location));
     }
-    if (root.id !== this.id) {
+    if (root.id !== this.locatedId) {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '外来历史库所在位置现在是另一个库，本次不合并。' });
     }
     const candidate: ForeignHistoricalMergeCandidate = Object.freeze({
