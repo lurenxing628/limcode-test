@@ -898,9 +898,11 @@ function mergedNotes(results: readonly RuntimeDataSetMergeResult[]): string {
   const turns = total(result => result.finalized?.turns ?? 0);
   const intents = total(result => result.finalized?.intents ?? 0);
   const skipped = total(result => result.skippedConversations ?? 0);
+  const excluded = total(result => result.excluded?.length ?? 0);
   return (turns ? `其中 ${turns} 个中断的任务已按“中止”收尾，不会被继续执行。` : '')
     + (intents ? `另有 ${intents} 条排队未发送的消息已取消。` : '')
-    + (skipped ? `有 ${skipped} 个对话你删除过，这次没有合并回来。` : '');
+    + (skipped ? `有 ${skipped} 个对话你删除过，这次没有合并回来。` : '')
+    + (excluded ? `另有 ${excluded} 个对话未能合并，原数据保留，详情见“未能合并的旧数据”。` : '');
 }
 
 /** Runs after current Runtime startup. Historical upgrades never register or recover old tasks. */
