@@ -205,15 +205,17 @@ test('package gate shares successful closure verification across its two checks'
   const directory = fixture(t);
   const trace = path.join(directory, 'reads.json');
   const artifact = path.join(directory, 'fixture.vsix');
-  const workerNames = ['databaseWorker', 'packedCasWorker', 'runtimeSnapshotAuditWorker', 'runtimeDataSetFactsWorker', 'runtimeDataRootRelocationWorker'];
+  const workerNames = ['databaseWorker', 'packedCasWorker', 'runtimeSnapshotAuditWorker', 'runtimeSnapshotUpgradeWorker', 'runtimeDataSetFactsWorker', 'runtimeDataRootRelocationWorker'];
   const main = [
     "require('../backend/application/runtimeBuildIdentity');",
+    "require('../backend/application/runtimeBuildInfo');",
     ...workerNames.map(name => `new Worker(path.join(__dirname, '../backend/reliableKernel/${name}.js'));`),
     "spawn(process.execPath, [path.join(__dirname, '../backend/reliableKernel/processWrapper.js')]);"
   ].join('\n');
   const sources = new Map([
     ['dist/extension/vscode/extension.js', main],
     ['dist/extension/backend/application/runtimeBuildIdentity.js', "path.join(__dirname, '../../compile-build-id.json');"],
+    ['dist/extension/backend/application/runtimeBuildInfo.js', "path.join(__dirname, '../../compile-build-id.json');"],
     ...[...workerNames, 'processWrapper'].map(name => [`dist/extension/backend/reliableKernel/${name}.js`, 'exports.value = 1;'])
   ]);
   // The hash stub isolates memoization from cryptography. No new content proof is generated.
