@@ -299,7 +299,7 @@ async function checkCasPublishBeforeReference() {
     const orphan = durability.orphan;
     assert.equal(durability.duplicate.absolutePath, orphan.absolutePath);
     assertDurablePublishTrace(durability.first, binding, orphan.absolutePath, 'linked');
-    assertDurablePublishTrace(durability.second, binding, orphan.absolutePath, 'EEXIST');
+    assertDurablePublishTrace(durability.second, binding, orphan.absolutePath, 'reused');
     const beforeReference = await database.snapshot([contentObjects.list({
       where: { content_type: orphan.contentType, sha256: orphan.sha256, byte_length: orphan.byteLength },
       limit: 10
@@ -519,23 +519,30 @@ async function traceFsDurability(body) {
 function assertDurablePublishTrace(events, binding, objectPath, expectedLinkOutcome) {
   const target = path.resolve(objectPath);
   const linkIndex = events.findIndex((event) => event.kind === 'link' && event.targetPath === target);
-  assert.ok(linkIndex >= 0, `CAS trace missed link for ${target}`);
-  assert.equal(events[linkIndex].outcome, expectedLinkOutcome);
-  const beforeLink = events.slice(0, linkIndex);
-  const afterLink = events.slice(linkIndex + 1);
   const casRoot = path.resolve(binding.paths.casRootPath);
   const temporaryRoot = path.join(casRoot, 'tmp');
   const digestRoot = path.join(casRoot, 'sha256');
   const digestPrefix = path.dirname(target);
-  const syncCount = (part, directory) => part.filter((event) =>
-    event.kind === 'sync' && event.path === directory
-  ).length;
-  assert.ok(syncCount(beforeLink, temporaryRoot) >= 1, 'CAS tmp directory was not synced before publish');
-  assert.ok(syncCount(beforeLink, casRoot) >= 2, 'CAS root was not synced for both direct child directories');
-  assert.ok(syncCount(beforeLink, digestRoot) >= 2, 'CAS digest root was not synced as child and prefix parent');
-  assert.ok(syncCount(beforeLink, digestPrefix) >= 1, 'CAS digest prefix was not synced before publish');
-  assert.ok(syncCount(afterLink, digestPrefix) >= 1, 'CAS object directory entry was not synced after link/EEXIST');
-  assert.ok(syncCount(afterLink, temporaryRoot) >= 1, 'CAS temporary unlink was not synced');
+  let barrier = events;
+  if (expectedLinkOutcome === 'reused') {
+    assert.equal(linkIndex, -1, 'an existing identical CAS object must be reused without another link');
+  } else {
+    assert.ok(linkIndex >= 0, `CAS trace missed link for ${target}`);
+    assert.equal(events[linkIndex].outcome, expectedLinkOutcome);
+    const temporaryPath = events[linkIndex].sourcePath;
+    assert.ok(events.slice(0, linkIndex).some(event => event.kind === 'sync' && event.path === temporaryPath),
+      'CAS file bytes were not synced before link');
+    barrier = events.slice(linkIndex + 1);
+    assert.equal(barrier.filter(event => event.kind === 'sync' && event.path === temporaryRoot).length, 1,
+      'CAS temporary unlink must be synced once at the batch barrier');
+  }
+  for (const directory of [digestPrefix, digestRoot, casRoot]) {
+    assert.equal(barrier.filter(event => event.kind === 'sync' && event.path === directory).length, 1,
+      `CAS publication directory must be synced once before references: ${directory}`);
+  }
+  const index = directory => barrier.findIndex(event => event.kind === 'sync' && event.path === directory);
+  assert.ok(index(digestPrefix) < index(digestRoot) && index(digestRoot) < index(casRoot),
+    'CAS publication directories must be synced child before parent');
 }
 
 async function withRuntime(label, body) {
