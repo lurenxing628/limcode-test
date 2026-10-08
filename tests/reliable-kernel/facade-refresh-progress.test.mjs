@@ -43,6 +43,7 @@ function fixture({ historyDelay = 0, attentionDelay = 0, attentionFailureAt = 0 
     if (name === 'node:crypto') return crypto;
     if (name === '../../../shared/protocol' || name === '../../../shared/plainData') return require(name);
     if (name === '../../../shared/conversationTitle') return require(name);
+    if (name === './conversationHistoryProjection' || name === '../../capabilities/boundedConcurrency') return require(name);
     if (name === '../../reliableKernel/conversationContextHandleState') return require(name);
     if (name === './interactionAttention') return { ...attention, readPendingInteractionAttention: () => read('attention') };
     if (name === './VscodeReliableKernelCommandRouter') return { watchConversationRefresh: () => () => {} };
@@ -94,6 +95,25 @@ function fixture({ historyDelay = 0, attentionDelay = 0, attentionFailureAt = 0 
     }
   };
 }
+
+test('同一消息同时生成历史标题和预览时只读取、解析一次正文', async (context) => {
+  const h = fixture(); context.after(() => h.facade.dispose());
+  h.facade.historyPreviewByRevisionId = new Map();
+  h.facade.historyTitleByRevisionId = new Map();
+  const body = JSON.stringify({ role: 'user', parts: [{ text: '同一份消息正文' }] });
+  let reads = 0, parses = 0;
+  h.facade.product.application.contentStore = { async read() { reads++; return Buffer.from(body); } };
+  const parse = JSON.parse;
+  context.mock.method(JSON, 'parse', (source, ...args) => { if (source === body) parses++; return parse(source, ...args); });
+  const target = { conversationId: 'conversation', revisionId: 'revision', content: { content_type: 'application/vnd.limcode.message+json' } };
+  const result = await h.facade.readConversationHistoryProjectionContent([target], [target]);
+  assert.equal(result.titles.get('conversation'), '同一份消息正文');
+  assert.equal(result.previews.get('conversation'), '同一份消息正文');
+  assert.equal(reads, 1);
+  assert.equal(parses, 1);
+  await h.facade.readConversationHistoryProjectionContent([target], [target]);
+  assert.equal(reads, 1, 'both derived values share the same cached read');
+});
 
 function commandRoutingFixture() {
   const h = fixture();

@@ -81,8 +81,7 @@ import {
   runtimeCommitNeedsInteractionAttention
 } from './interactionAttention';
 import {
-  conversationHistoryPreviewFromBytes,
-  conversationHistoryTitleContentFromBytes,
+  conversationHistoryPresentationFromBytes,
   projectChildConversationHistory
 } from './conversationHistoryProjection';
 
@@ -1031,8 +1030,9 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       String(row.conversation_id),
       Number(row.message_count)
     ]));
-    const projectedTitles = await this.readConversationHistoryProjectionTitles(projection.titleTargets);
-    const previews = await this.readConversationHistoryProjectionPreviews(projection.previewTargets);
+    const { titles: projectedTitles, previews } = await this.readConversationHistoryProjectionContent(
+      projection.titleTargets, projection.previewTargets
+    );
     const activeTurnByConversation = new Map(
       projection.turns.filter((row) => row.status === 'active').map((row) => [String(row.conversation_id), row])
     );
@@ -1141,16 +1141,17 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     };
   }
 
-  private async readConversationHistoryProjectionPreviews(
-    targets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>
-  ): Promise<Map<string, string>> {
-    const previews = new Map<string, string>();
-    const unresolved = targets.filter((target) => {
-      const cached = this.historyPreviewByRevisionId.get(target.revisionId);
-      if (cached === undefined) return true;
-      previews.set(target.conversationId, cached);
-      return false;
-    });
+  private async readConversationHistoryProjectionContent(
+    titleTargets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>,
+    previewTargets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>
+  ): Promise<{ titles: Map<string, string>; previews: Map<string, string> }> {
+    const titleIds = new Set(titleTargets.map(target => target.revisionId));
+    const previewIds = new Set(previewTargets.map(target => target.revisionId));
+    const targets = [...new Map([...titleTargets, ...previewTargets].map(target => [target.revisionId, target])).values()];
+    const unresolved = targets.filter(target =>
+      titleIds.has(target.revisionId) && !this.historyTitleByRevisionId.has(target.revisionId)
+      || previewIds.has(target.revisionId) && !this.historyPreviewByRevisionId.has(target.revisionId)
+    );
     const settled = await mapSettledWithBoundedConcurrency(
       unresolved,
       HISTORY_CONTENT_READ_CONCURRENCY,
@@ -1160,56 +1161,28 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (result.status !== 'fulfilled') return;
       const target = unresolved[index];
       if (!target) return;
-      const preview = conversationHistoryPreviewFromBytes(result.value, String(target.content.content_type));
-      if (preview === undefined) return;
-      previews.set(target.conversationId, preview);
-      this.historyPreviewByRevisionId.set(target.revisionId, preview);
+      const presentation = conversationHistoryPresentationFromBytes(result.value, String(target.content.content_type));
+      if (presentation.preview !== undefined) this.historyPreviewByRevisionId.set(target.revisionId, presentation.preview);
+      if (presentation.titleContent) this.historyTitleByRevisionId.set(target.revisionId, displayConversationTitle({
+        id: target.conversationId,
+        messages: [{ role: 'user', content: presentation.titleContent }]
+      }));
     });
     while (this.historyPreviewByRevisionId.size > HISTORY_CACHE_LIMIT * 2) {
       const oldestRevisionId = this.historyPreviewByRevisionId.keys().next().value as string | undefined;
       if (!oldestRevisionId) break;
       this.historyPreviewByRevisionId.delete(oldestRevisionId);
     }
-    return previews;
-  }
-
-  private async readConversationHistoryProjectionTitles(
-    targets: Array<{ conversationId: string; revisionId: string; content: DomainRow }>
-  ): Promise<Map<string, string>> {
-    const titles = new Map<string, string>();
-    const unresolved = targets.filter((target) => {
-      const cached = this.historyTitleByRevisionId.get(target.revisionId);
-      if (cached === undefined) return true;
-      titles.set(target.conversationId, cached);
-      return false;
-    });
-    const settled = await mapSettledWithBoundedConcurrency(
-      unresolved,
-      HISTORY_CONTENT_READ_CONCURRENCY,
-      (target) => this.product.application.contentStore.read(target.content as unknown as ContentObjectMetadata)
-    );
-    settled.forEach((result, index) => {
-      if (result.status !== 'fulfilled') return;
-      const target = unresolved[index];
-      if (!target) return;
-      const content = conversationHistoryTitleContentFromBytes(
-        result.value,
-        String(target.content.content_type)
-      );
-      if (!content) return;
-      const title = displayConversationTitle({
-        id: target.conversationId,
-        messages: [{ role: 'user', content }]
-      });
-      titles.set(target.conversationId, title);
-      this.historyTitleByRevisionId.set(target.revisionId, title);
-    });
     while (this.historyTitleByRevisionId.size > HISTORY_CACHE_LIMIT * 2) {
       const oldestRevisionId = this.historyTitleByRevisionId.keys().next().value as string | undefined;
       if (!oldestRevisionId) break;
       this.historyTitleByRevisionId.delete(oldestRevisionId);
     }
-    return titles;
+    const project = (rows: typeof targets, cache: Map<string, string>): Map<string, string> => new Map(rows.flatMap(target => {
+      const value = cache.get(target.revisionId);
+      return value === undefined ? [] : [[target.conversationId, value] as const];
+    }));
+    return { titles: project(titleTargets, this.historyTitleByRevisionId), previews: project(previewTargets, this.historyPreviewByRevisionId) };
   }
 
   private mergeHistoryCache(

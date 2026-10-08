@@ -90,7 +90,7 @@ test('目标对话被另一个存活窗口持有：放弃待投递与放弃完�
   }
 });
 
-test('迁走工作的盘点在 worker 的读连接上执行并走语句缓存：第一次准备、第二次全部命中，写连接不参与', { timeout: 60_000 }, async (t) => {
+test('迁走工作的盘点业务只用 reader 缓存，RootBinding 准入检查照常执行', { timeout: 60_000 }, async (t) => {
   const { dataRoot } = await createIsolatedRoot(t, 'inventory');
   const app = await openApp(dataRoot);
   try {
@@ -108,15 +108,19 @@ test('迁走工作的盘点在 worker 的读连接上执行并走语句缓存：
     assert.deepEqual(second, first);
     assert.deepEqual(first.conversations.map((entry) => [entry.conversationId, entry.pendingDeliveryIds]),
       [['conversation-peer', ['followup-inventory-delivery']]]);
-    assert.deepEqual(counters(afterFirst.writer), counters(before.writer), '写连接不参与');
-    assert.deepEqual(counters(afterSecond.writer), counters(before.writer));
+    // Each diagnostics read itself checks RootBinding on the writer. The inventory's domain
+    // queries must add no writer prepares/misses/uncached work or any other writer cache hits.
+    assert.deepEqual(counters(afterFirst.writer), { ...counters(before.writer), hits: before.writer.hits + 1 },
+      '写连接只增加 inspect 自己的 RootBinding 缓存命中');
+    assert.deepEqual(counters(afterSecond.writer), { ...counters(before.writer), hits: before.writer.hits + 2 });
     // Nine work lists, the Conversation titles and the pending-work probe (the worker's own probe,
     // prepared once at startup, stays out of the cache).
     assert.equal(afterFirst.reader.misses - before.reader.misses, 11, '第一次在读连接上准备十一条盘点语句');
     assert.equal(afterFirst.reader.prepares - before.reader.prepares, 11);
     assert.equal(afterSecond.reader.misses, afterFirst.reader.misses, '第二次不再准备');
     assert.equal(afterSecond.reader.prepares, afterFirst.reader.prepares);
-    assert.equal(afterSecond.reader.hits - afterFirst.reader.hits, 11, '第二次十一条语句全部复用缓存');
+    assert.equal(afterSecond.reader.hits - afterFirst.reader.hits, 12,
+      '第二次十一条盘点语句与一条 RootBinding 准入查询都复用 reader 缓存');
   } finally {
     await app.close();
   }

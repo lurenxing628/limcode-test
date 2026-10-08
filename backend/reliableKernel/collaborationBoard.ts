@@ -178,14 +178,17 @@ export class CollaborationBoard {
   }
 
   private async read(source: Source, args: CollaborationBoardArguments, scope: BoardScope): Promise<Record<string, unknown>> {
+    // Scope evidence belongs to this one read, never to a later command or task tree.
+    const channelEvidence = new Map<string, DomainRow>();
     const limit = Math.min(integer(args.limit, 20, 1, 100, 'limit'), 20);
     if (args.operation === 'read_post') {
-      const post = await this.post(scope, required(args.postId, 'postId'));
-      const text = Array.from(await this.content(String(post.row.content_object_id)));
+      const post = await this.post(scope, required(args.postId, 'postId'), channelEvidence);
+      const body = await this.content(String(post.row.content_object_id));
+      const text = Array.from(body);
       const offsetChars = integer(args.offsetChars, 0, 0, MAX_TEXT_CHARS, 'offsetChars');
       const limitChars = integer(args.limitChars, 12000, 1, 20000, 'limitChars');
       const end = Math.min(text.length, offsetChars + limitChars);
-      return { post: await this.postRecord(post), text: text.slice(offsetChars, end).join(''), offsetChars,
+      return { post: await this.postRecord(post, body), text: text.slice(offsetChars, end).join(''), offsetChars,
         characterCount: text.length, ...(end < text.length ? { nextOffsetChars: end } : {}) };
     }
     const query = typeof args.query === 'string' ? args.query.toLocaleLowerCase() : '';
@@ -193,7 +196,7 @@ export class CollaborationBoard {
     const queryKey = hash(canonical({ root: scope.rootConversationId, operation: args.operation, channelId: args.channelId, threadId: args.threadId, query }));
     const cursor = parseCursor(args.cursor, queryKey);
     if (args.operation === 'list_channels') {
-      const channels = (await this.channels(scope)).filter(row => String(row.name).includes(query));
+      const channels = (await this.channels(scope, channelEvidence)).filter(row => String(row.name).includes(query));
       const start = cursor.position;
       const slice = channels.slice(start, start + limit);
       const output = [];
@@ -204,15 +207,15 @@ export class CollaborationBoard {
       return { channels: output, rereadCursor: args.cursor ?? encodeCursor(queryKey, 0), ...(start + slice.length < channels.length ? { nextCursor: encodeCursor(queryKey, start + slice.length) } : {}) };
     }
     if (args.operation === 'read_thread') {
-      const root = await this.post(scope, required(args.threadId, 'threadId'));
+      const root = await this.post(scope, required(args.threadId, 'threadId'), channelEvidence);
       if (root.threadId !== root.row.id) throw new Error('threadId must identify a discussion root.');
       const links = await this.rows('ReplyLink', { thread_id: root.row.id }, limit + 1, cursor.afterId);
       const replies = [];
-      for (const link of links.slice(0, limit)) replies.push(await this.postRecord(await this.post(scope, String(link.post_id))));
+      for (const link of links.slice(0, limit)) replies.push(await this.postRecord(await this.post(scope, String(link.post_id), channelEvidence)));
       const subscribed = (await this.get('SubscriptionLink', identity('subscription', source.conversationId, 'thread', String(root.row.id))))?.active === 1n;
       return { root: await this.postRecord(root), replies, subscribed, rereadCursor: args.cursor ?? encodeCursor(queryKey, 0), ...(links.length > limit ? { nextCursor: encodeCursor(queryKey, 0, String(links[limit - 1].id)) } : {}) };
     }
-    const channels = args.channelId ? [await this.channel(scope, args.channelId)] : await this.channels(scope);
+    const channels = args.channelId ? [await this.channel(scope, args.channelId, channelEvidence)] : await this.channels(scope, channelEvidence);
     if (args.operation === 'list_threads' && !args.channelId) throw new Error('list_threads requires channelId.');
     const posts: Record<string, unknown>[] = [];
     let position = cursor.position; let afterId = cursor.afterId; let scanned = 0;
@@ -222,7 +225,7 @@ export class CollaborationBoard {
       const scan = links.slice(0, remaining);
       for (const link of scan) {
         afterId = String(link.id); scanned += 1;
-        const post = await this.post(scope, String(link.post_id));
+        const post = await this.post(scope, String(link.post_id), channelEvidence);
         if (args.operation === 'list_threads' && post.threadId !== post.row.id) continue;
         const text = await this.content(String(post.row.content_object_id));
         if (query && !text.toLocaleLowerCase().includes(query)) continue;
@@ -279,26 +282,37 @@ export class CollaborationBoard {
     }), repo('SubscriptionLink').update(id, { active: active ? 1n : 0n, updated_at: now }));
   }
 
-  private async channels(scope: BoardScope): Promise<DomainRow[]> {
+  private async channels(scope: BoardScope, evidence?: Map<string, DomainRow>): Promise<DomainRow[]> {
     const links = await this.rows('ChannelScopeLink', { root_conversation_id: scope.rootConversationId }, MAX_CHANNELS + 1);
     if (links.length > MAX_CHANNELS) throw new Error('Board channel bound exceeded.');
     const channels: DomainRow[] = [];
-    for (const link of links) channels.push(await this.channel(scope, String(link.channel_id)));
+    for (const link of links) {
+      const channelId = String(link.channel_id);
+      const channel = await this.get('Channel', channelId);
+      if (!channel || link.id !== identity('scope', channelId) || link.root_conversation_id !== scope.rootConversationId) {
+        throw new Error('Board channel is unavailable in this task tree.');
+      }
+      evidence?.set(channelId, channel);
+      channels.push(channel);
+    }
     return channels.sort((a, b) => String(a.name).localeCompare(String(b.name)) || String(a.id).localeCompare(String(b.id)));
   }
 
-  private async channel(scope: BoardScope, channelId: string): Promise<DomainRow> {
+  private async channel(scope: BoardScope, channelId: string, evidence?: Map<string, DomainRow>): Promise<DomainRow> {
+    const known = evidence?.get(channelId);
+    if (known) return known;
     const [channel, link] = await Promise.all([this.get('Channel', channelId), this.get('ChannelScopeLink', identity('scope', channelId))]);
     if (!channel || !link || link.channel_id !== channelId || link.root_conversation_id !== scope.rootConversationId) throw new Error('Board channel is unavailable in this task tree.');
+    evidence?.set(channelId, channel);
     return channel;
   }
 
-  private async post(scope: BoardScope, postId: string): Promise<{ row: DomainRow; channelId: string; threadId: string; source: DomainRow }> {
+  private async post(scope: BoardScope, postId: string, channelEvidence?: Map<string, DomainRow>): Promise<{ row: DomainRow; channelId: string; threadId: string; source: DomainRow }> {
     const [row, links, replies, source] = await Promise.all([this.get('Post', postId), this.rows('PostChannelLink', { post_id: postId }, 2), this.rows('ReplyLink', { post_id: postId }, 2), this.get('PostSourceLink', identity('post_source', postId))]);
     if (links.length !== 1 || replies.length > 1) throw new Error('Board post relationship is invalid.');
     const [link] = links; const [reply] = replies;
     if (!row || !link || !source || source.post_id !== postId || link.post_id !== postId) throw new Error('Board post is unavailable.');
-    await this.channel(scope, String(link.channel_id));
+    await this.channel(scope, String(link.channel_id), channelEvidence);
     return { row, channelId: String(link.channel_id), threadId: String(reply?.thread_id ?? postId), source };
   }
 

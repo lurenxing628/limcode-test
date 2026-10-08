@@ -87,6 +87,42 @@ test('board derives sibling scope, preserves CAS text across reopen and rejects 
   });
 });
 
+test('board reads reuse one body and one channel proof within the authorized query', async () => {
+  await fixture(async f => {
+    const { channel } = await f.call('root', { operation: 'create_channel', name: 'read-evidence' });
+    const posted = await f.call('root', { operation: 'post', channelId: channel.id, text: 'body 中文 🛰️' });
+    for (let index = 0; index < 3; index++) await f.call('sibling', { operation: 'post', threadId: posted.threadId, text: `reply ${index}` });
+    const originalRead = f.store.read.bind(f.store), originalSnapshot = f.database.snapshot.bind(f.database);
+    let bodyReads = 0, scopeGets = 0, channelGets = 0;
+    f.store.read = async (...args) => { bodyReads++; return originalRead(...args); };
+    f.database.snapshot = async (reads, ...args) => {
+      scopeGets += reads.filter(read => read.kind === 'get' && read.domain === 'CollaborationBoardChannelScopeLink').length;
+      channelGets += reads.filter(read => read.kind === 'get' && read.domain === 'CollaborationBoardChannel').length;
+      return originalSnapshot(reads, ...args);
+    };
+    const read = await f.call('root', { operation: 'read_post', postId: posted.postId });
+    assert.equal(read.text, 'body 中文 🛰️');
+    assert.equal(read.post.preview, read.text);
+    assert.equal(bodyReads, 1, 'the preview reuses the already-read immutable body');
+    scopeGets = channelGets = 0;
+    const thread = await f.call('root', { operation: 'read_thread', threadId: posted.threadId });
+    assert.equal(thread.replies.length, 3);
+    assert.equal(scopeGets, 1, 'all replies reuse the root channel scope proof');
+    assert.equal(channelGets, 1);
+    scopeGets = channelGets = 0;
+    const search = await f.call('root', { operation: 'search', channelId: channel.id });
+    assert.equal(search.posts.length, 4);
+    assert.equal(scopeGets, 1, 'the channel selected for the query authorizes its returned posts');
+    assert.equal(channelGets, 1);
+    scopeGets = channelGets = 0;
+    const channels = await f.call('root', { operation: 'list_channels' });
+    assert.equal(channels.channels.length, 1);
+    assert.equal(scopeGets, 0, 'the scoped channel list already supplies the link evidence');
+    assert.equal(channelGets, 1);
+    await assert.rejects(f.call('outsider', { operation: 'read_post', postId: posted.postId }), /task tree/);
+  });
+});
+
 test('tool provenance is verified; exactly-once command retry cannot change body or resurrect subscriptions', async () => {
   await fixture(async f => {
     const { channel } = await f.call('root', { operation: 'create_channel', name: 'general' });

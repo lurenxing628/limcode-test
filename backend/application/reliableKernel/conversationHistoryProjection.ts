@@ -198,6 +198,10 @@ export function decodeConversationHistoryContent(value: string): MessageContent 
   } catch {
     return undefined;
   }
+  return conversationHistoryContentFromParsed(parsed);
+}
+
+function conversationHistoryContentFromParsed(parsed: unknown): MessageContent | undefined {
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined;
   const record = parsed as Record<string, unknown>;
   if (!Array.isArray(record.parts)) return undefined;
@@ -207,27 +211,30 @@ export function decodeConversationHistoryContent(value: string): MessageContent 
   };
 }
 
-export function conversationHistoryPreviewFromBytes(bytes: Buffer, contentType: string): string | undefined {
+/** One decoded immutable object supplies both sidebar title and preview. */
+export function conversationHistoryPresentationFromBytes(
+  bytes: Buffer,
+  contentType: string
+): { preview?: string; titleContent?: MessageContent } {
   const source = bytes.toString('utf8');
-  if (contentType === 'application/vnd.limcode.message+json') {
-    const content = decodeConversationHistoryContent(source);
-    return content ? conversationHistoryPreview(content) : undefined;
-  }
   if (contentType.toLowerCase().startsWith('text/plain')) {
-    return conversationHistoryPreview({ role: 'model', parts: source ? [{ text: source }] : [] });
+    const titleContent: MessageContent = { role: 'user', parts: source ? [{ text: source }] : [] };
+    return { preview: conversationHistoryPreview(titleContent), titleContent };
   }
-  const structured = decodeConversationHistoryContent(source);
-  if (structured) return conversationHistoryPreview(structured);
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(source) as unknown;
-    if (!parsed || typeof parsed !== 'object') return source.trim() ? '结构化消息' : undefined;
-    const record = Array.isArray(parsed) ? undefined : parsed as Record<string, unknown>;
-    if (record && ('inlineData' in record || 'fileData' in record || 'attachment' in record)) return '附件消息';
-    if (record && ('toolCallId' in record || 'toolName' in record || 'detail' in record)) return '工具结果';
-    return '结构化消息';
+    parsed = JSON.parse(source);
   } catch {
-    return undefined;
+    return {};
   }
+  const titleContent = conversationHistoryContentFromParsed(parsed);
+  if (titleContent) return { preview: conversationHistoryPreview(titleContent), titleContent };
+  if (contentType === 'application/vnd.limcode.message+json') return {};
+  if (!parsed || typeof parsed !== 'object') return source.trim() ? { preview: '结构化消息' } : {};
+  const record = Array.isArray(parsed) ? undefined : parsed as Record<string, unknown>;
+  if (record && ('inlineData' in record || 'fileData' in record || 'attachment' in record)) return { preview: '附件消息' };
+  if (record && ('toolCallId' in record || 'toolName' in record || 'detail' in record)) return { preview: '工具结果' };
+  return { preview: '结构化消息' };
 }
 
 /** Decode the canonical first-user content used by the shared conversation title formatter. */
