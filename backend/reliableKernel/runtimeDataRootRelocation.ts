@@ -3921,7 +3921,14 @@ async function resetBackupDirectories(root: string): Promise<string[]> {
   const found: string[] = [];
   for (const scope of scopes) {
     const directory = path.join(scope, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY);
-    if (await lstatOrUndefined(directory)) found.push(directory);
+    try {
+      if (await lstatOrUndefined(directory)) found.push(directory);
+    } catch (error) {
+      // Data-set inspection already reports an unreadable scope and preserves it as a whole.
+      // Its optional backup inventory must not replace that actionable migration result with EACCES.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EACCES' && code !== 'EPERM') throw error;
+    }
   }
   return found;
 }
