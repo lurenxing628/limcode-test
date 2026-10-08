@@ -1028,7 +1028,7 @@ async function selectSource(
       await removeRuntimeHistoryPending(paths, source.id);
     }
     // An explicit request always hears back, also when there is nothing new.
-    if (source.requested) report.merged.push({ ...unchangedResult(reference, target), alreadyMerged: true });
+    if (source.requested) report.merged.push({ ...unchangedResult(reference, target), alreadyMerged: true, ...(record.state === 'partial' ? { excluded: record.excluded } : {}) });
     return 'skip';
   }
   if (source.requested) return later ? 'later' : 'work';
@@ -1566,18 +1566,18 @@ async function recordRefusal(
     ? candidate.root.located.databasePath : (await requireCompleteRuntimeDataSet(candidate)).paths.databasePath;
   if (state.files !== undefined && await runtimeDataSetFileState(databasePath) !== state.files) return;
   const source = state.fingerprint ?? await sourceFingerprint(candidate);
-  await writeRuntimeHistoryResidual(paths, {
-    id: candidate.id,
-    sourceKind: isForeignCandidate(candidate) ? (candidate.root.origin as Extract<typeof candidate.root.origin, {kind:'foreign'}>).location.kind : 'local',
-    location: isForeignCandidate(candidate) ? (candidate.root.origin as Extract<typeof candidate.root.origin, {kind:'foreign'}>).location : {kind:'local', candidateId:candidate.id},
-    identity: {dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId!},
-    code: outcome.code, message: outcome.message, checkedAt: new Date().toISOString()
-  });
-  await removeRuntimeHistoryPending(paths, candidate.id);
   await withRuntimeDataRootAdmission(paths.globalStoragePath, async () => {
     const current = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
     // An interrupted commit (into any data set) is converged, never recorded over.
     if (current?.state === 'committing' || ((current?.state === 'merged' || current?.state === 'partial') && sameRuntimeDataSetFingerprint(current.source, source))) return;
+    await writeRuntimeHistoryResidual(paths, {
+      id: candidate.id,
+      sourceKind: isForeignCandidate(candidate) ? (candidate.root.origin as Extract<typeof candidate.root.origin, {kind:'foreign'}>).location.kind : 'local',
+      location: isForeignCandidate(candidate) ? (candidate.root.origin as Extract<typeof candidate.root.origin, {kind:'foreign'}>).location : {kind:'local', candidateId:candidate.id},
+      identity: {dataSetId: candidate.dataSetId!, rootInstanceId: candidate.rootInstanceId!},
+      code: outcome.code, message: outcome.message, checkedAt: new Date().toISOString()
+    });
+    await removeRuntimeHistoryPending(paths, candidate.id);
     await writeRuntimeDataSetMergeLedgerRecord(paths, outcome.tooLarge
       ? { candidateId, state: 'too-large', source, code: outcome.code, message: outcome.message, ...outcome.tooLarge }
       : outcome.kind === 'failed'
@@ -1663,16 +1663,19 @@ async function mergeSource(
     let verified: RuntimeCasVerifier | undefined = options.casVerification;
     if (!verified && !mode.migration) verified = verifiedCache = await openRuntimeCasVerificationCache(paths.globalStoragePath);
     verified ??= new Map<string, string>();
+    let casExclusionsChanged = false;
     if (!mode.migration) {
       await transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, true, state.exclusions);
       await state.exclusions!.finish(READ_CHUNK);
       const excluded = state.exclusions!.excluded();
       if (JSON.stringify(excluded) !== JSON.stringify(state.excluded ?? [])) {
+        casExclusionsChanged = true;
         state.excluded = excluded;
         plan = await planSource(taken.snapshot.database, target, merged, state);
         size = checkPlan(plan, taken.audit.size!, limits, { ...options, requested: mode.requested }, state);
       }
     }
+    if (work && casExclusionsChanged) work = inspectUnfinishedWork(taken.snapshot.database, exclusionSkippedTables(taken.snapshot.database, state));
     if (work && (hasFinalizableWork(work) || (options.settleSourceWork && state.settlementWork))) {
       // Everything that can refuse the source was checked on the unfinalized snapshot (unfinished
       // work, conflicts, size); the CAS objects are verified too. Only then is the source backed up
@@ -1693,6 +1696,15 @@ async function mergeSource(
       state.workPresent = taken.audit.unfinishedWork!.refused.length > 0 || hasFinalizableWork(taken.audit.unfinishedWork!);
       stopIfAsked();
       plan = await planSource(taken.snapshot.database, target, merged, state);
+      // Settlement can create new bodies; reuse the verification cache for unchanged ones while
+      // restoring recipe edges and any pre-existing missing-body exclusions on the new snapshot.
+      await transferSourceCas(candidate, binding, target, taken.snapshot, options, verified, true, state.exclusions);
+      await state.exclusions!.finish(READ_CHUNK);
+      const afterSettlement = state.exclusions!.excluded();
+      if (JSON.stringify(afterSettlement) !== JSON.stringify(state.excluded ?? [])) {
+        state.excluded = afterSettlement;
+        plan = await planSource(taken.snapshot.database, target, merged, state);
+      }
       size = checkPlan(plan, taken.audit.size!, limits, { ...options, requested: mode.requested }, state);
     }
     if (plan.steps.length === 0) {
@@ -2352,7 +2364,7 @@ async function mergedMeanwhile(
 ): Promise<RuntimeDataSetMergeResult | undefined> {
   if (mode.pickedAt === undefined || mode.migration) return undefined;
   const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidateId);
-  if (record?.state !== 'merged' || !sameRuntimeDataSetIdentity(record.target, target.identity) || record.mergedAt < mode.pickedAt) return undefined;
+  if ((record?.state !== 'merged' && record?.state !== 'partial') || !sameRuntimeDataSetIdentity(record.target, target.identity) || record.mergedAt < mode.pickedAt) return undefined;
   // A foreign id names the root's identity: the record is that root's, whatever the root is now.
   const candidate: SourceRef = state.foreign
     ? { id: candidateId, dataSetId: record.source.dataSetId, rootInstanceId: record.source.rootInstanceId, label: state.foreign.label }
@@ -2597,7 +2609,10 @@ async function currentResult(
   target: TargetContext,
   state: SourceProgress
 ): Promise<RuntimeDataSetMergeResult> {
-  return { ...unchangedResult(candidate, target), alreadyMerged: true, ...await takeFinalized(paths, candidate, state) };
+  const record = (await readRuntimeDataSetMergeLedger(paths)).get(candidate.id);
+  return { ...unchangedResult(candidate, target), alreadyMerged: true,
+    ...(record?.state === 'partial' ? { excluded: record.excluded } : {}),
+    ...await takeFinalized(paths, candidate, state) };
 }
 
 /**
@@ -2981,6 +2996,7 @@ async function planSource(
   const skipped = deleted && skippedRows(source, deleted.conversations);
   if (!state.exclusions) {
     state.exclusions = new RuntimeMergeConversationExclusions(source);
+    state.excluded = [];
     for (const problem of state.workPresent === false ? [] : inspectUnfinishedWorkRows(source, state.foreign !== undefined || state.finalized !== undefined)) {
       state.exclusions.exclude(problem.domain, problem.row, problem.code);
     }
@@ -3303,6 +3319,7 @@ async function planRows(
       plan.conflicts.count += 1;
       if (plan.conflicts.samples.length < MAX_REPORTED_CONFLICTS) plan.conflicts.samples.push(sample());
     },
+    ...(collecting ? { invalid: (domain: string, row: DomainRow) => exclusions!.exclude(domain, row, 'runtime-data-set-merge-source-row-invalid') } : {}),
     savepointName: () => `merge_identity_${plan.steps.length}`
   };
   try {
@@ -3430,6 +3447,7 @@ export interface RuntimeDataSetMergeChunkSink {
   reused(): void;
   /** A row that exists in the target with other values; `sample` describes it. */
   conflict(sample: () => string, domain: string, row: DomainRow): void;
+  invalid?(domain: string, row: DomainRow, error: unknown): void;
   /** A savepoint name not used before in this transaction. */
   savepointName(): string;
 }
@@ -3489,13 +3507,19 @@ export function planMergeChunk(
       continue;
     }
     if (timelineImport && !sink.timelineImportSource) throw new Error('Timeline merge requires the verified source snapshot identity.');
-    const insert = sourceRow(schema.key, id, () => timelineImport
+    let insert: RepositoryTransactionStep;
+    try { insert = sourceRow(schema.key, id, () => timelineImport
       ? repository.insertHistoricalTimelineImport(withoutColumn(row, 'exchange_seq'), {
           ...sink.timelineImportSource!, sourceExchangeSeq: row.exchange_seq as bigint
         })
       : renumbered
       ? repository.insertWithNextSequence(withoutColumn(row, renumbered), { column: renumbered, scope: {} })
-      : historical && !notStarted(row) ? repository.insertHistoricalCopy(row) : repository.insert(row));
+      : historical && !notStarted(row) ? repository.insertHistoricalCopy(row) : repository.insert(row)); }
+    catch (error) {
+      if (!sink.invalid || !(error instanceof Outcome)) throw error;
+      sink.invalid(schema.key, row, error);
+      continue;
+    }
     if (allowed || schema.key === TIMELINE_IMPORT_PROVENANCE_DOMAIN) {
       // Another window may create the same content-derived identity before this commit: inside
       // the transaction it is inserted only when still absent, else compared like above.
