@@ -200,6 +200,22 @@ interface ProcessOutputCounters {
   truncated: boolean;
 }
 
+interface VerifiedOutputPrefix {
+  identity: string;
+  retainedBytes: bigint;
+  retainedChunks: bigint;
+  /** The terminal scan also proved that no rows exist beyond this prefix. */
+  complete: boolean;
+}
+
+interface OutputPrefixReadFence {
+  externalVersion: string;
+  removalRevision: number;
+  mutationRevision: number;
+}
+
+interface OutputPrefixRetryBudget { remainingAttempts: number }
+
 interface WrapperLaunchMonitor {
   exit: { code: number | null; signal: NodeJS.Signals | null } | null;
   stderrText(): string;
@@ -244,6 +260,7 @@ const PROCESS_OUTPUT_HANDLE_PREFIX = 'rk-process-output:';
 const PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS = 4;
 const PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL = 4;
 const PROCESS_SPOOL_CLEANUP_BATCH_SIZE = 24;
+const PROCESS_OUTPUT_PROOF_CACHE_ENTRIES = 128;
 const ARCHIVABLE_PROCESS_STATUSES = new Set([
   'exited',
   'cancelled',
@@ -277,6 +294,14 @@ export class ProcessControlPlane {
   private readonly exitObservers = new Map<string, Promise<void>>();
   private readonly exitObserverWakeups = new Set<() => void>();
   private readonly processIdentityReadyAt = new Map<string, number>();
+  // Only already-validated immutable SQLite rows are covered. Spool files, manifests and CAS
+  // bytes are never cached here; their normal identity/content reads remain authoritative.
+  private readonly verifiedOutputPrefixes = new Map<string, VerifiedOutputPrefix>();
+  private outputPrefixExternalVersion: string | undefined;
+  private outputPrefixRemovalRevision = 0;
+  private outputPrefixMutationRevision = 0;
+  private outputPrefixCaching = false;
+  private readonly outputPrefixSubscriptions: Array<() => void> = [];
   private exitObserversEnabled = false;
   private exitObserversClosing = false;
   private exitObserversDisposePromise: Promise<void> | undefined;
@@ -292,6 +317,35 @@ export class ProcessControlPlane {
   ) {
     this.now = options.now ?? (() => new Date().toISOString());
     this.onExitObserverError = options.onExitObserverError;
+    if (!database.maintenance && typeof database.onCommit === 'function'
+      && typeof database.onClose === 'function' && typeof database.externalDataVersion === 'function') {
+      this.outputPrefixCaching = true;
+      this.outputPrefixSubscriptions.push(database.onCommit(commit => {
+        for (const change of commit.changes) {
+          if (change.domain === 'Process' && change.kind === 'remove') {
+            this.verifiedOutputPrefixes.delete(change.id);
+            this.outputPrefixRemovalRevision++;
+          }
+          if (change.domain !== 'ProcessOutputChunk') continue;
+          this.outputPrefixMutationRevision++;
+          if (change.kind === 'remove' || !change.record) {
+            this.verifiedOutputPrefixes.clear();
+            this.outputPrefixRemovalRevision++;
+            continue;
+          }
+          const processId = String(change.record.process_id);
+          const known = this.verifiedOutputPrefixes.get(processId);
+          if (!known) continue;
+          if (BigInt(String(change.record.chunk_seq)) <= known.retainedChunks) {
+            this.verifiedOutputPrefixes.delete(processId);
+            this.outputPrefixRemovalRevision++;
+          } else {
+            // Appending immutable rows preserves the old prefix but invalidates an exact total.
+            known.complete = false;
+          }
+        }
+      }), database.onClose(() => this.releaseOutputPrefixProofs()));
+    }
   }
 
   /**
@@ -967,28 +1021,31 @@ export class ProcessControlPlane {
     return report;
   }
 
-  private async reconcileOutputBounded(processId: string, maxAttempts: number): Promise<ReconciledOutput> {
+  private async reconcileOutputBounded(processId: string, maxAttempts: number,
+    proofFenceBudget: OutputPrefixRetryBudget = { remainingAttempts: PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL }): Promise<ReconciledOutput> {
     await this.validateBinding();
-    // A concurrent exit/import may make a selected running manifest stale. Restart only when the
-    // Process assertion proves that durable state advanced; every pass otherwise makes keyset
-    // progress and there is no retry count or retained-output ceiling.
+    // A concurrent exit/import or a changed metadata fence may invalidate the selected snapshot.
+    // Restart only on that explicit evidence; every import pass otherwise makes keyset progress.
     for (let attempt = 1; ; attempt += 1) {
-      const processRow = await this.requireExisting('Process', processId);
-      if (
-        ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))
-        && await this.terminalOutputIsFullyRegistered(processRow)
-      ) {
-        return { ...processRowOutputCounters(processRow), insertedChunks: 0 };
-      }
-      const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
-      await this.requireMatchingSpoolEvidence(processRow, spoolPath);
-      const manifest = await this.readManifest(spoolPath, processRow);
-      const counters = outputCounters(manifest);
-      assertProcessOutputProgress(processRow, counters, manifest.status);
       try {
+        const processRow = await this.requireExisting('Process', processId);
+        if (
+          ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))
+          && await this.terminalOutputIsFullyRegistered(processRow)
+        ) {
+          return { ...processRowOutputCounters(processRow), insertedChunks: 0 };
+        }
+        const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
+        await this.requireMatchingSpoolEvidence(processRow, spoolPath);
+        const manifest = await this.readManifest(spoolPath, processRow);
+        const counters = outputCounters(manifest);
+        assertProcessOutputProgress(processRow, counters, manifest.status);
         return await this.reconcileOutputPrefix(processRow, spoolPath, manifest, counters);
       } catch (error) {
-        if (error instanceof ProcessOutputSnapshotAdvancedError && attempt < maxAttempts) continue;
+        if (error instanceof ProcessOutputSnapshotAdvancedError) {
+          const proofCanRetry = error.reason !== 'proof_fence' || --proofFenceBudget.remainingAttempts > 0;
+          if (attempt < maxAttempts && proofCanRetry) continue;
+        }
         throw error;
       }
     }
@@ -1001,19 +1058,29 @@ export class ProcessControlPlane {
    */
   public async snapshotOutputForDetail(processIdInput: string): Promise<ProcessDetailOutputSnapshot> {
     const processId = requireId(processIdInput, 'processId');
+    const proofFenceBudget = { remainingAttempts: PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL };
     for (let attempt = 1; attempt <= PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS; attempt += 1) {
       try {
-        await this.reconcileOutputBounded(processId, PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL);
+        await this.reconcileOutputBounded(processId, PROCESS_RECONCILE_MAX_RETRIES_PER_DETAIL, proofFenceBudget);
       } catch (error) {
         if (!(error instanceof ProcessOutputSnapshotAdvancedError)) throw error;
         const current = await this.requireExisting('Process', processId);
         return processDetailDurablePrefix(processRowOutputCounters(current));
       }
       const processRow = await this.requireExisting('Process', processId);
-      if (
-        ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))
-        && await this.terminalOutputIsFullyRegistered(processRow)
-      ) return processDetailDurablePrefix(processRowOutputCounters(processRow));
+      if (ARCHIVABLE_PROCESS_STATUSES.has(String(processRow.status))) {
+        try {
+          if (await this.terminalOutputIsFullyRegistered(processRow)) {
+            return processDetailDurablePrefix(processRowOutputCounters(processRow));
+          }
+        } catch (error) {
+          if (!(error instanceof ProcessOutputSnapshotAdvancedError)) throw error;
+          const proofCanRetry = error.reason !== 'proof_fence' || --proofFenceBudget.remainingAttempts > 0;
+          if (attempt < PROCESS_DETAIL_SNAPSHOT_MAX_ATTEMPTS && proofCanRetry) continue;
+          const current = await this.requireExisting('Process', processId);
+          return processDetailDurablePrefix(processRowOutputCounters(current));
+        }
+      }
       const spoolPath = processSpoolPath(this.binding, requireText(processRow.spool_locator, 'Process.spool_locator'));
       await this.requireMatchingSpoolEvidence(processRow, spoolPath);
       const manifest = await this.readManifest(spoolPath, processRow);
@@ -1293,6 +1360,7 @@ export class ProcessControlPlane {
     if (this.exitObserversDisposePromise) return this.exitObserversDisposePromise;
     this.exitObserversEnabled = false;
     this.exitObserversClosing = true;
+    this.releaseOutputPrefixProofs();
     for (const wake of [...this.exitObserverWakeups]) wake();
     const active = [...this.exitObservers.values()];
     this.exitObserversDisposePromise = Promise.allSettled(active).then(() => undefined);
@@ -1679,9 +1747,11 @@ export class ProcessControlPlane {
   ): Promise<ReconciledOutput> {
     const processId = requireId(selectedProcessRow.id, 'Process.id');
     const outputImportStartedAt = this.database.performanceMetrics ? performance.now() : undefined;
-    let nextChunkSeq = 1n;
-    let representedBytes = 0n;
-    let representedChunks = 0n;
+    const proofFence = await this.outputPrefixReadFence();
+    const known = this.verifiedOutputPrefix(selectedProcessRow, counters);
+    let nextChunkSeq = (known?.retainedChunks ?? 0n) + 1n;
+    let representedBytes = known?.retainedBytes ?? 0n;
+    let representedChunks = known?.retainedChunks ?? 0n;
     let insertedChunks = 0;
     let pending: PreparedProcessOutputChunk[] = [];
     const estimateTimestamp = requireText(selectedProcessRow.updated_at, 'Process.updated_at');
@@ -1748,6 +1818,7 @@ export class ProcessControlPlane {
       counters.retainedChunks
     );
     await this.commitProcessOutputBatch(processId, manifest, counters, [], true);
+    await this.rememberOutputPrefix(selectedProcessRow, counters, false, proofFence);
     if (outputImportStartedAt !== undefined) {
       this.database.recordPerformanceMetric({
         kind: 'process.phase',
@@ -1898,6 +1969,10 @@ export class ProcessControlPlane {
   private async terminalOutputIsFullyRegistered(processRow: DomainRow): Promise<boolean> {
     const processId = requireId(processRow.id, 'Process.id');
     const counters = processRowOutputCounters(processRow);
+    const proofFence = await this.outputPrefixReadFence();
+    const known = this.verifiedOutputPrefix(processRow, counters);
+    if (known?.complete && known.retainedChunks === counters.retainedChunks
+      && known.retainedBytes === counters.retainedBytes) return true;
     const rows = await listAllDomainRows(this.database, 'ProcessOutputChunk', { process_id: processId });
     if (BigInt(rows.length) !== counters.retainedChunks) return false;
     const sequences = new Set<string>();
@@ -1909,8 +1984,67 @@ export class ProcessControlPlane {
       sequences.add(chunkSeq.toString());
       registeredBytes += requireBigInt(row.byte_length, 'ProcessOutputChunk.byte_length');
     }
-    return BigInt(sequences.size) === counters.retainedChunks
-      && registeredBytes === counters.retainedBytes;
+    if (BigInt(sequences.size) !== counters.retainedChunks || registeredBytes !== counters.retainedBytes) return false;
+    if (proofFence && !await this.rememberOutputPrefix(processRow, counters, true, proofFence)) {
+      // Complete rows were observed. A changed fence asks for a coherent recheck, never for a
+      // spool recovery: a valid historical spool may already have been removed.
+      throw new ProcessOutputSnapshotAdvancedError('proof_fence');
+    }
+    return true;
+  }
+
+  private async outputPrefixReadFence(): Promise<OutputPrefixReadFence | undefined> {
+    if (!this.outputPrefixCaching) return undefined;
+    // This request validates the current RootBinding even when the proof is reused. A foreign
+    // connection's commit invalidates every proof; local deletions invalidate via onCommit.
+    const externalVersion = await this.database.externalDataVersion();
+    if (externalVersion !== this.outputPrefixExternalVersion) {
+      this.verifiedOutputPrefixes.clear();
+      this.outputPrefixExternalVersion = externalVersion;
+      this.outputPrefixRemovalRevision++;
+    }
+    return { externalVersion, removalRevision: this.outputPrefixRemovalRevision,
+      mutationRevision: this.outputPrefixMutationRevision };
+  }
+
+  private verifiedOutputPrefix(processRow: DomainRow, counters: ProcessOutputCounters): VerifiedOutputPrefix | undefined {
+    const processId = requireId(processRow.id, 'Process.id');
+    const known = this.verifiedOutputPrefixes.get(processId);
+    const durable = processRowOutputCounters(processRow);
+    if (!known || known.identity !== processOutputIdentity(processRow)
+      || known.retainedChunks > counters.retainedChunks || known.retainedBytes > counters.retainedBytes
+      || known.retainedChunks > durable.retainedChunks || known.retainedBytes > durable.retainedBytes) return undefined;
+    this.verifiedOutputPrefixes.delete(processId);
+    this.verifiedOutputPrefixes.set(processId, known);
+    return known;
+  }
+
+  private async rememberOutputPrefix(processRow: DomainRow, counters: ProcessOutputCounters, complete: boolean,
+    fence: OutputPrefixReadFence | undefined): Promise<boolean> {
+    if (!fence) return false;
+    const current = await this.outputPrefixReadFence();
+    if (!current || current.externalVersion !== fence.externalVersion
+      || current.removalRevision !== fence.removalRevision
+      || (complete && current.mutationRevision !== fence.mutationRevision)) return false;
+    const processId = requireId(processRow.id, 'Process.id');
+    const previous = this.verifiedOutputPrefixes.get(processId);
+    if (previous?.identity === processOutputIdentity(processRow) && previous.retainedChunks > counters.retainedChunks) return false;
+    const samePrefix = previous?.identity === processOutputIdentity(processRow)
+      && previous.retainedChunks === counters.retainedChunks && previous.retainedBytes === counters.retainedBytes;
+    this.verifiedOutputPrefixes.delete(processId);
+    this.verifiedOutputPrefixes.set(processId, { identity: processOutputIdentity(processRow),
+      retainedBytes: counters.retainedBytes, retainedChunks: counters.retainedChunks,
+      complete: complete || Boolean(samePrefix && previous?.complete) });
+    while (this.verifiedOutputPrefixes.size > PROCESS_OUTPUT_PROOF_CACHE_ENTRIES) {
+      this.verifiedOutputPrefixes.delete(this.verifiedOutputPrefixes.keys().next().value!);
+    }
+    return true;
+  }
+
+  private releaseOutputPrefixProofs(): void {
+    this.outputPrefixCaching = false;
+    this.verifiedOutputPrefixes.clear();
+    for (const unsubscribe of this.outputPrefixSubscriptions.splice(0)) unsubscribe();
   }
 
   private async removeArchivedSpool(
@@ -2061,7 +2195,7 @@ export class ProcessControlPlane {
 }
 
 class ProcessOutputSnapshotAdvancedError extends Error {
-  public constructor() {
+  public constructor(public readonly reason: 'process_progress' | 'proof_fence' = 'process_progress') {
     super('Process output snapshot advanced during reconciliation.');
     this.name = 'ProcessOutputSnapshotAdvancedError';
   }
@@ -2069,6 +2203,11 @@ class ProcessOutputSnapshotAdvancedError extends Error {
 
 function processOutputChunkId(processId: string, chunkSeq: bigint): string {
   return stablePhaseDId('process_output_chunk', `${processId}:${chunkSeq}`);
+}
+
+function processOutputIdentity(row: DomainRow): string {
+  return JSON.stringify([row.id, row.wrapper_nonce, row.start_fingerprint, row.spool_locator,
+    row.command_digest, String(row.wrapper_pid), String(row.child_pid), String(row.process_group_id)]);
 }
 
 function processOutputTransactionSteps(
