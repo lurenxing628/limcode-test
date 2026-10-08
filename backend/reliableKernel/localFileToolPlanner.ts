@@ -92,7 +92,7 @@ export class LocalFileToolPlanner {
     const { current, planningRoot, targetPath } = await inspectPlannedTarget(resolved, {}, signal);
     signal?.throwIfAborted();
     if (current.kind !== 'file') throw new Error(`edit target must be an existing regular file: ${inputPath}`);
-    const source = decodeUtf8Exact(current.bytes, inputPath);
+    const source = decodeUtf8Exact(current.bytes);
     const target = applyEditArguments(source, args);
     return {
       operation: 'replace_file',
@@ -291,10 +291,8 @@ function normalizedRelativeTarget(resolved: ResolvedLocalToolPath): string {
   return relative.split(path.sep).join('/');
 }
 
-function decodeUtf8Exact(bytes: Buffer, label: string): string {
-  const decoded = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
-  if (!Buffer.from(decoded, 'utf8').equals(bytes)) throw new Error(`${label} is not canonical UTF-8 text.`);
-  return decoded;
+function decodeUtf8Exact(bytes: Buffer): string {
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
 }
 
 function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {

@@ -81,6 +81,71 @@ test('target CAS wait never overwrites a newer editor write', async () => fixtur
   assert.equal(await fs.readFile(target, 'utf8'), 'newer editor content');
 }));
 
+test('replacement reads the write baseline once, skips unchanged bytes and keeps the descriptor content fence', async () => fixture(async h => {
+  const target = path.join(h.root, 'note.txt');
+  await fs.writeFile(target, 'base');
+  const originalOpen = fs.open;
+  let reads = 0, writes = 0, truncates = 0, changeDuringWriteRead = false;
+  fs.open = async (input, ...rest) => {
+    const handle = await originalOpen(input, ...rest);
+    if (String(input) !== target) return handle;
+    const read = handle.readFile.bind(handle), write = handle.write.bind(handle), truncate = handle.truncate.bind(handle);
+    handle.readFile = async (...args) => {
+      reads++;
+      const bytes = await read(...args);
+      if (changeDuringWriteRead && typeof rest[0] === 'number' && (rest[0] & constants.O_RDWR) === constants.O_RDWR) {
+        changeDuringWriteRead = false;
+        await fs.writeFile(target, 'newer editor content');
+      }
+      return bytes;
+    };
+    handle.write = async (...args) => { writes++; return write(...args); };
+    handle.truncate = async (...args) => { truncates++; return truncate(...args); };
+    return handle;
+  };
+  try {
+    const replacement = await h.approve('write', { path: 'note.txt', content: 'approved' });
+    reads = writes = truncates = 0;
+    assert.equal((await h.dispatcher.dispatchRecordAndReconcile(replacement.effect)).observation.outcome, 'succeeded');
+    assert.equal(reads, 2, 'actual write descriptor baseline and resulting bytes; pathname fences only check identity');
+    assert.equal(writes, 1);
+    assert.equal(truncates, 1);
+
+    const unchanged = await h.approve('write', { path: 'note.txt', content: 'approved' });
+    const before = await fs.stat(target, { bigint: true });
+    reads = writes = truncates = 0;
+    assert.equal((await h.dispatcher.dispatchRecordAndReconcile(unchanged.effect)).terminal.status, 'succeeded');
+    assert.equal(reads, 1, 'unchanged bytes still verify the actual write descriptor and pathname identity');
+    assert.equal(writes, 0);
+    assert.equal(truncates, 0);
+    const after = await fs.stat(target, { bigint: true });
+    assert.equal(after.mtimeNs, before.mtimeNs);
+    assert.equal(after.ctimeNs, before.ctimeNs);
+
+    const raced = await h.approve('write', { path: 'note.txt', content: 'later approved' });
+    reads = writes = truncates = 0;
+    changeDuringWriteRead = true;
+    assert.equal((await h.dispatcher.dispatchRecordAndReconcile(raced.effect)).observation.outcome, 'conflict');
+    assert.equal(writes, 0);
+    assert.equal(truncates, 0);
+    assert.equal(await fs.readFile(target, 'utf8'), 'newer editor content');
+  } finally { fs.open = originalOpen; }
+}));
+
+test('edit planning preserves UTF-8 BOM bytes and refuses malformed UTF-8 before making a proposal', async () => fixture(async h => {
+  const target = path.join(h.root, 'utf8.txt');
+  const source = Buffer.from('\ufeffbody 中文');
+  const args = { path: 'utf8.txt', hunks: [{ oldContent: 'body', newContent: 'changed' }] };
+  await fs.writeFile(target, source);
+  const [member] = await h.planner.plan({ declaration: { name: 'edit' } }, { arguments: args }, {});
+  assert.deepEqual(member.baseContent, source);
+  assert.equal(member.targetContent, '\ufeffchanged 中文');
+  await fs.writeFile(target, Buffer.from([0xff]));
+  await assert.rejects(h.planner.plan({ declaration: { name: 'edit' } }, { arguments: args }, {}),
+    error => error.code === 'ERR_ENCODING_INVALID_ENCODED_DATA');
+  assert.deepEqual(await fs.readFile(target), Buffer.from([0xff]));
+}));
+
 test('different dispatcher instances serialize the same target across CAS waits', async () => fixture(async h => {
   const target = path.join(h.root, 'note.txt');
   await fs.writeFile(target, 'base');

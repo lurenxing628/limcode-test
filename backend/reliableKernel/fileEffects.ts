@@ -1412,20 +1412,38 @@ export class FileMutationDispatcher {
         ? await retryLocalExecution(() => this.readTargetBytes(member), { signal }) : undefined;
       resolved = await resolveBoundedTarget(this.resolveBoundary, member);
       await refuseSqliteDatabaseTarget(resolved, member.operation);
-      before = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal);
+      before = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal,
+        member.operation === 'replace_file' ? 'identity' : 'content');
       if (before.kind !== 'known') return memberObservation(member, before.kind === 'conflict' ? 'conflict' : 'outcome_unknown', null, before.error);
       if (before.symlink) return memberObservation(member, 'conflict', before.digest, 'Target path is a symbolic link.');
       const creates = member.operation === 'create_file' || member.operation === 'create_directory';
       const reuseParent = member.ensureParentDirectory && before.digest === DIRECTORY_DIGEST;
-      if (creates ? before.digest !== null && !reuseParent : !sameDigest(before.digest, member.baseDigest)) {
+      const invalidBase = member.operation === 'replace_file'
+        ? !before.state?.isFile()
+        : !sameDigest(before.digest, member.baseDigest);
+      if (creates ? before.digest !== null && !reuseParent : invalidBase) {
         return memberObservation(member, 'conflict', before.digest,
           creates ? 'Create target already exists.' : 'baseDigest does not match the actual target.');
       }
-      // Repeat root/component checks after all potentially slow inspection and SQLite guards.
+      // Repeat root/component and pathname identity checks after the asynchronous inspection.
+      // Replacement checks the content baseline on the actual write descriptor below; rereading
+      // the whole pathname here would only duplicate that descriptor read.
       await resolveBoundedTarget(this.resolveBoundary, member);
-      const final = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal);
-      if (!sameInspection(before, final)) {
-        return memberObservation(member, 'conflict', final.digest, 'File target identity or content changed before mutation.');
+      if (member.operation === 'replace_file') {
+        let finalState: BigIntStats;
+        try { finalState = await fs.lstat(resolved, { bigint: true }); }
+        catch (error) {
+          if (isNotFound(error)) throw new FilePathConflictError('File target disappeared before replacement.');
+          throw error;
+        }
+        if (!sameFileState(before.state, finalState)) {
+          return memberObservation(member, 'conflict', null, 'File target identity changed before replacement.');
+        }
+      } else {
+        const final = await inspectPath(resolved, () => resolveBoundedTarget(this.resolveBoundary, member), signal);
+        if (!sameInspection(before, final)) {
+          return memberObservation(member, 'conflict', final.digest, 'File target identity or content changed before mutation.');
+        }
       }
       if (signal?.aborted) return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before member dispatch.');
       if (reuseParent) {
@@ -1472,6 +1490,7 @@ export class FileMutationDispatcher {
               return memberObservation(member, 'conflict', null, 'File target identity changed before replacement.');
             }
             if (signal?.aborted) return memberObservation(member, 'cancelled', before.digest, 'File mutation cancelled before write dispatch.');
+            if (current.equals(bytes!)) return memberObservation(member, 'succeeded', currentDigest);
             mutationStarted = true;
             // Explicit positions: readFile advanced the handle offset to EOF.
             let offset = 0;
@@ -1585,12 +1604,14 @@ async function refuseSqliteDatabaseTarget(
   if (refusal) throw new FilePathConflictError(sqliteDatabaseFileRefusalMessage(refusal));
 }
 
-async function inspectPath(target: string, checkBoundary: () => Promise<unknown>, signal?: AbortSignal): Promise<PathInspection> {
+async function inspectPath(target: string, checkBoundary: () => Promise<unknown>, signal?: AbortSignal,
+  regularFileInspection: 'identity' | 'content' = 'content'): Promise<PathInspection> {
   try {
     const stat = await fs.lstat(target, { bigint: true });
     if (stat.isSymbolicLink()) return { kind: 'known', digest: 'symlink', symlink: true, state: stat };
     if (stat.isDirectory()) return { kind: 'known', digest: DIRECTORY_DIGEST, symlink: false, state: stat };
     if (!stat.isFile()) return { kind: 'known', digest: `other:${stat.mode}`, symlink: false, state: stat };
+    if (regularFileInspection === 'identity') return { kind: 'known', digest: null, symlink: false, state: stat };
     const bytes = await readFileWithIdentityFence(target, stat, checkBoundary, signal);
     return { kind: 'known', digest: digestBytes(bytes), symlink: false, state: stat };
   } catch (error) {
