@@ -115,6 +115,7 @@ function dataSetLabel(
 
 function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
   if (!merge) return '';
+  if (merge.state === 'partial') return ` · 部分合并，${merge.excluded.length} 个对话未合并`;
   if (merge.state === 'merged') {
     if (merge.targetMissing) return ' · 曾合并到的库已不存在或无法读取';
     if (merge.sourceUnreadable) return ' · 已合并，现在无法读取（不能判断合并后有没有变化）';
@@ -130,7 +131,7 @@ function mergeStateSuffix(merge?: RuntimeDataSetMergeState): string {
 
 /** The last merge of this data set, whatever happened to later attempts. */
 function lastMergeOf(merge?: RuntimeDataSetMergeState): RuntimeDataSetMergedFacts | undefined {
-  return merge?.state === 'merged' ? merge : merge?.lastMerged;
+  return merge?.state === 'merged' || merge?.state === 'partial' ? merge : merge?.lastMerged;
 }
 
 function dataSetFacts(candidate: VscodeRuntimeDataSetCandidate, summary?: RuntimeDataSetSummary): string {
@@ -439,6 +440,7 @@ function deletionNote(candidate: VscodeRuntimeDataSetCandidate, merge?: RuntimeD
       ? '\n\n注意：这个库还没有合并到当前库（它会在之后的启动中自动合并），删除后其中的对话会永久丢失；需要保留时请先选择“合并到当前库”。'
       : '';
   }
+  if (merge.state === 'partial') return `还有 ${merge.excluded.length} 个对话没有合并进来；原库由残留登记保留，不能删除。`;
   const merged = lastMergeOf(merge);
   if (!merged) return '\n\n注意：这个库的对话还没有合并到任何库，删除后会永久丢失。';
   if (merged.targetMissing) {
