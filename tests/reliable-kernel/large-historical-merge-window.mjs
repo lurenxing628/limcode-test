@@ -293,6 +293,8 @@ const watchedEngine = Object.freeze({
 const watchedEngineModule = { ...engineModule, largeMergeEngine: () => watchedEngine };
 const lifetime = loadLayer('vscode/runtimeDataSetUpgradeLifetime.ts', {});
 const largeMerge = loadLayer('vscode/commands/largeHistoricalMerge.ts', {
+    './runtimeHistorySettlement': loadLayer('vscode/commands/runtimeHistorySettlement.ts', {}),
+    '../../backend/application/reliableKernel/historicalMergeSettlement': require(path.join(compiled, 'backend/application/reliableKernel/historicalMergeSettlement.js')),
   '../../backend/reliableKernel/runtimeExclusiveMaintenance': exclusiveBackend,
   '../../backend/reliableKernel/runtimeLargeMergeEngine': watchedEngineModule,
   '../../backend/reliableKernel/runtimeLargeMergeSession': largeMergeSession,
@@ -304,6 +306,11 @@ const largeMerge = loadLayer('vscode/commands/largeHistoricalMerge.ts', {
 // Only shorter: the prompt's countdown and the coordination's poll interval.
 const shortened = { countdownSeconds: behavior.countdownSeconds ?? 1, coordination: { pollMs: 20 } };
 const management = loadLayer('vscode/commands/runtimeDataSetManagement.ts', {
+  './runtimeHistorySettlement': loadLayer('vscode/commands/runtimeHistorySettlement.ts', {}),
+  './runtimeHistoryResiduals': { manageRuntimeHistoryResiduals: async () => undefined },
+  '../../backend/application/reliableKernel/historicalMergeSettlement': require(path.join(compiled, 'backend/application/reliableKernel/historicalMergeSettlement.js')),
+  '../../backend/reliableKernel/runtimeHistoryConvergence': kernelFile('runtimeHistoryConvergence.js'),
+  '../../backend/reliableKernel/runtimeHistoryRegistry': kernelFile('runtimeHistoryRegistry.js'),
   '../../backend/reliableKernel/runtimeHistoryRepair': kernelFile('runtimeHistoryRepair.js'),
   '../../backend/reliableKernel/runtimeHistoryRepairInspection': kernelFile('runtimeHistoryRepairInspection.js'),
   '../../backend/capabilities/vscodeStorage/globalStatus': { loadCommittedGlobalStatus: async () => ({}), resolveDataRootUri: () => root },

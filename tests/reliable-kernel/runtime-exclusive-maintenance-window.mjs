@@ -315,6 +315,8 @@ async function runLargeSession() {
   };
   const lifetime = loadLayer('vscode/runtimeDataSetUpgradeLifetime.ts', {});
   const session = loadLayer('vscode/commands/largeHistoricalMerge.ts', {
+    './runtimeHistorySettlement': loadLayer('vscode/commands/runtimeHistorySettlement.ts', {}),
+    '../../backend/application/reliableKernel/historicalMergeSettlement': require(path.join(compiled, 'backend/application/reliableKernel/historicalMergeSettlement.js')),
     '../../backend/reliableKernel/runtimeExclusiveMaintenance': exclusive,
     '../../backend/reliableKernel/runtimeLargeMergeEngine': kernelFile('runtimeLargeMergeEngine.js'),
     '../../backend/reliableKernel/runtimeLargeMergeSession': largeMergeSession,
