@@ -41,7 +41,9 @@ export class RuntimeMergeConversationExclusions {
     this.edge = this.index.prepare(`INSERT OR IGNORE INTO temp.${EDGES} VALUES (?,?,?,?)`);
     this.identity = this.index.prepare(`INSERT OR IGNORE INTO temp.${CONTENT_EDGES} VALUES (?,?,?,?)`);
     this.content = this.index.prepare(`INSERT OR IGNORE INTO temp.${CONTENT} VALUES (?,?,?)`);
-    this.seed = this.index.prepare(`INSERT INTO temp.${NODES}(domain,id,code) VALUES ('Conversation',?,?) ON CONFLICT(domain,id) DO UPDATE SET count=count+1`);
+    this.seed = this.index.prepare(`INSERT INTO temp.${NODES}(domain,id,code) VALUES ('Conversation',?,?) ON CONFLICT(domain,id) DO UPDATE SET count=count+1,
+      code=CASE WHEN ${NODES}.code='runtime-data-set-merge-unfinished-work' THEN excluded.code ELSE ${NODES}.code END,
+      visited=CASE WHEN ${NODES}.code='runtime-data-set-merge-unfinished-work' AND excluded.code<>'runtime-data-set-merge-unfinished-work' THEN 0 ELSE ${NODES}.visited END`);
     this.contains = this.index.prepare(`SELECT 1 FROM temp.${NODES} WHERE domain=? AND id=?`);
   }
 
@@ -125,15 +127,17 @@ export class RuntimeMergeConversationExclusions {
   /** Expand linked families on disk, returning the thread after each bounded frontier page. */
   public async finish(chunkRows = 250): Promise<void> {
     const next = this.index.prepare(`SELECT domain,id,code FROM temp.${NODES} WHERE visited=0 LIMIT ?`);
-    const mark = this.index.prepare(`UPDATE temp.${NODES} SET visited=1 WHERE domain=? AND id=?`);
-    const spread = this.index.prepare(`INSERT OR IGNORE INTO temp.${NODES}(domain,id,code)
+    const mark = this.index.prepare(`UPDATE temp.${NODES} SET visited=1 WHERE domain=? AND id=? AND code=?`);
+    const spread = this.index.prepare(`INSERT INTO temp.${NODES}(domain,id,code)
       SELECT b_domain,b_id,? FROM temp.${EDGES} WHERE a_domain=? AND a_id=?
-      UNION SELECT a_domain,a_id,? FROM temp.${EDGES} WHERE b_domain=? AND b_id=?`);
+      UNION SELECT a_domain,a_id,? FROM temp.${EDGES} WHERE b_domain=? AND b_id=?
+      ON CONFLICT(domain,id) DO UPDATE SET code=excluded.code,visited=0
+      WHERE ${NODES}.code='runtime-data-set-merge-unfinished-work' AND excluded.code<>'runtime-data-set-merge-unfinished-work'`);
     for (;;) {
       const rows = next.all(chunkRows) as Array<{domain: string; id: string; code: string}>;
       if (!rows.length) return;
       this.write(() => { for (const row of rows) {
-        mark.run(row.domain,row.id);
+        if (!mark.run(row.domain,row.id,row.code).changes) continue;
         spread.run(row.code,row.domain,row.id,row.code,row.domain,row.id);
       } });
       await new Promise<void>(resolve => setImmediate(resolve));

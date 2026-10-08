@@ -100,3 +100,26 @@ test('single-pass edge helpers invert membership and keep content identities sep
   assert.ok(RUNTIME_MERGE_CONTENT_REFERENCE_COLUMNS.get('ModelRequest').includes('recipe_object_id'));
   assert.ok(RUNTIME_MERGE_CONTENT_REFERENCE_COLUMNS.get('RuntimeDeliveryAnswerPresentation').includes('body_content_object_id'));
 });
+
+test('冲突原因覆盖先前未完成工作并传到关联对话，避免收尾修改冲突来源', async (t) => {
+  const {db,insert} = fixture(t);
+  const {RuntimeMergeConversationExclusions} = kernel('runtimeMergeConversationExclusions.js');
+  const exclusions = new RuntimeMergeConversationExclusions(db);
+  t.after(()=>exclusions.close());
+  for (const id of ['parent','branch','unrelated']) {
+    const row = {id,title:id};
+    insert('Conversation',row);
+    exclusions.observe('Conversation',row);
+  }
+  const link = {id:'branch-link',source_conversation_id:'parent',target_conversation_id:'branch'};
+  insert('ConversationBranchLink',link);
+  exclusions.observe('ConversationBranchLink',link);
+  exclusions.exclude('Conversation',{id:'parent'},'runtime-data-set-merge-unfinished-work');
+  await exclusions.finish(1);
+  exclusions.exclude('Conversation',{id:'branch'},'runtime-data-set-merge-conflict');
+  await exclusions.finish(1);
+  assert.deepEqual(exclusions.excluded().map(row=>[row.conversationId,row.code]),[
+    ['branch','runtime-data-set-merge-conflict'],['parent','runtime-data-set-merge-conflict']
+  ]);
+  assert.equal(exclusions.includes('Conversation','unrelated'),false);
+});
