@@ -134,6 +134,13 @@ Agent / Workflow / Conversation 复用模型和渠道时，通过独立模型配
 - 渠道明确拒绝该格式（`clear_at` 多余字段、不支持 system 角色、位置错误的 400）时，按 `providerConfigId + baseUrl + model` 在本进程内退回原来的尾部 user 提醒并立即重发一次，不占普通重试次数。
 - 尾巴模式（关闭，或网关拒绝后退回）下，本轮提醒与重新注入的输入下一次请求就不在原位，Claude 的消息缓存断点因此放在它们之前最后一条 user 消息上，而不是尾巴上；除断点位置外请求与改动前逐字节一致。真实网关实测：断点在尾巴上时 `cache_read_input_tokens` 每轮停在 system + tools，历史每轮按写入价重写；挪到尾巴之前后每轮读到上一轮写入的整段历史。
 
+### 4.5 初始上下文模板
+
+- 初始上下文是独立的 `RuntimeContextRecord` 与 `RuntimeContextScopeLinkRecord`，沿用现有配置作用域与 `runtimeContext.scope.set/clear` 通道。模板和占位符目录统一定义在 `shared/promptTemplateCatalog.ts`，可靠内核编译与设置界面使用同一份内置默认。
+- 没有全局自定义记录时使用只读内置模板，不为读取默认值写配置文件。自定义记录完整取代全局默认；显式空模板也保留为空。Agent、工作流与对话范围仍按既有顺序追加各自的内容。全局“恢复默认”删除自定义关联；其它范围“恢复继承”删除本范围关联。
+- 首次启动时将模板原文、身份和渲染正文冻结在 `AuthoritySnapshot.runtimeContext`，`renderedTemplateText` 只含初始模板，不含规则文件。后续 Turn 从确切选中 Context 根的来源复用它，重试与编辑用已经验证的源 Turn；重启、分支和压缩继续保留原字节。子任务复制的父历史不能替代子任务自己的初始事实。已发布快照没有该事实时，在第一次新 Turn 建立，旧快照和旧请求不改写。规则文件与执行设置仍按现有入口读取最新内容。
+- 配置读取失败结束加载提示，保留本地草稿并显示原因；“重新读取”复用 bootstrap 的 Ready 请求与当前设置活动会话。成功读取之前保存按钮保持禁用，迟到的旧请求错误不能结束新请求。
+
 ## 5. 前端对接标准
 
 1. 页面组件不要直接调用 bridge，统一通过对应 Pinia store action。

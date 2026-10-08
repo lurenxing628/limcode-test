@@ -8,6 +8,7 @@ import {
 } from './contentAddressedStore';
 import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
+import { readInitialRuntimeContextForTurn } from './initialRuntimeContext';
 import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
 import { readConversationChildTaskProjection } from './conversationChildTaskProjection';
 import { readConversationChildHandles } from './conversationChildHandles';
@@ -1774,6 +1775,8 @@ export class ChildExecutionControlPlane {
       this.contentStore,
       requirePhaseFId(command.childExecutionId, 'childExecutionId')
     );
+    const initialRuntimeContext = await readInitialRuntimeContextForTurn(this.database, this.contentStore,
+      requirePhaseFId(previousTurn.id, 'previous Turn.id'), childConversationId, true);
     const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId: childConversationId,
       turnId: ids.turnId,
@@ -1781,6 +1784,7 @@ export class ChildExecutionControlPlane {
       intentKind: invisibleRuntimeDelivery ? 'runtime_continuation' : 'continuation',
       sourceTurnId: requirePhaseFId(previousTurn.id, 'previous Turn.id'),
       ...(workspace ? { workspace } : {}),
+      ...(initialRuntimeContext ? { initialRuntimeContext } : {}),
       ...(inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {}),
       ...(inherited.toolPolicy ? { inheritedToolPolicy: inherited.toolPolicy } : {}),
       ...(inherited.skillPolicy ? { inheritedSkillPolicy: inherited.skillPolicy } : {})

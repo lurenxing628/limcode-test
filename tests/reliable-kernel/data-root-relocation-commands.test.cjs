@@ -380,7 +380,7 @@ test('迁移成功：确认在设置页 ConfirmPanel 里；先记下迁移进行
   const text = JSON.stringify(confirmation.sections);
   assert.match(text, /旧目录的数据不会被修改/);
   assert.doesNotMatch(text, /原样保留/);
-  assert.match(f.globalState.get('limcode.dataRootRelocationNotice'), /1 个历史库留在旧目录/);
+  assert.match(f.globalState.get('limcode.dataRootRelocationNotice'), /1 份旧数据原位保留，已登记待合并或残留（见“历史与存储管理”）/);
   assert.deepEqual(f.calls.at(-1).slice(0, 2), ['command', 'workbench.action.reloadWindow']);
 });
 
@@ -673,7 +673,7 @@ test('删除旧目录：完整列出将删除与保留的内容，备份默认�
   assert.equal(emptied.calls.find((call) => call[0] === 'status')[1].lastMigration, null, '旧目录没有历史库了：不再显示');
 });
 
-test('删除旧目录后旧目录里还留着“归档并重置”的归档：继续记住旧目录（归档经它列在外来历史库里），并说明还保留几份', async () => {
+test('删除旧目录后还留着旧版“归档并重置”的归档：继续记住旧目录，说明保留数量和未能合并的旧数据入口', async () => {
   const lastMigration = { fromPath: '/vscode/global-storage', toPath: SOURCE, migratedAt: '2026-09-26T00:00:00.000Z' };
   const items = [
     { key: 'data-set:default', kind: 'data-set', label: '历史库 default', paths: [], bytes: 4096, optional: false, deletable: true },
@@ -685,7 +685,7 @@ test('删除旧目录后旧目录里还留着“归档并重置”的归档：�
   });
   await archived.commands.deletePreviousDataRoot(archived.context, archived.startup, archived.request);
   assert.ok(!archived.calls.some((call) => call[0] === 'status'), '旧目录里还有归档：不清空 lastMigration');
-  assert.match(JSON.stringify(archived.prompts.at(-1)), /还保留 2 份“归档并重置”留下的归档，列在“历史与存储管理 → 外来历史库”里，设置页仍会显示这个旧目录/);
+  assert.match(JSON.stringify(archived.prompts.at(-1)), /旧目录里还保留 2 份归档，未能合并的内容可在“历史与存储管理 → 未能合并的旧数据”里查看，设置页仍会显示这个旧目录/);
 
   const unreadable = fixture({
     lastMigration,

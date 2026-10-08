@@ -39,6 +39,12 @@ export const VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY = '.limcode-runtime-reset-ba
  * “归档并重置” of released 0.0.10–0.0.20 (resetDevelopmentData, a published older format).
  */
 export const VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN = String.raw`(?:\d{8}-\d{6}-\d{3}-(?:epoch-\d+-to-\d+-)?[0-9a-f]{8}|\d{17})`;
+/** The same accepted archive name is used by explicit resets and first-selection recovery. */
+export function createVscodeRuntimeResetBackupName(): string {
+  const timestamp = new Date().toISOString();
+  return `${timestamp.slice(0, 10).replace(/-/g, '')}-${timestamp.slice(11, 19).replace(/:/g, '')}`
+    + `-${timestamp.slice(20, 23)}-${randomUUID().slice(0, 8)}`;
+}
 const RUNTIME_ARCHIVE_NAME = new RegExp(`^${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`);
 const WORKSPACE_SCOPE_KEY = /^(workspace-file|folder|folder-set|empty)-[a-f0-9]{64}$/;
 
@@ -236,7 +242,7 @@ export async function resolveVscodeWorkspaceRuntimePlacement(
           await assertSafeRootPath(configurationRootPath, control);
           const backupDirectory = path.join(configurationRootPath, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY);
           await fs.mkdir(backupDirectory, { recursive: true });
-          const backup = path.join(backupDirectory, `unreadable-${Date.now()}-${process.pid}`);
+          const backup = path.join(backupDirectory, createVscodeRuntimeResetBackupName());
           await fs.rename(control, backup);
           await syncDirectoryDurably(backupDirectory);
           await syncDirectoryDurably(configurationRootPath);

@@ -159,7 +159,7 @@ test('#5 读不了的目录：工作区历史库的目录、一个控制根里�
   const backups = path.dirname(deletable);
   const restore = [];
   const deny = async (file, mode = 0o000) => { restore.push([file, (await fs.stat(file)).mode & 0o777]); await fs.chmod(file, mode); };
-  const noRawText = (plan) => assert.doesNotMatch(JSON.stringify([plan.problems, plan.items.map((item) => item.reason)]), /EACCES|permission denied|scandir/);
+  const noRawText = (plan) => assert.doesNotMatch(JSON.stringify([plan.problems, plan.items.map((item) => item.reason)]), /EACCES|permission denied|scandir|Runtime maintenance claim record is invalid/);
   try {
     assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), deletable).deletable, true);
     await deny(scopes);
@@ -187,15 +187,15 @@ test('#5 读不了的目录：工作区历史库的目录、一个控制根里�
   }
   assert.equal(itemAt(await planRuntimeBackupCleanup(fixture.root, database), deletable).deletable, true, '读得到之后照常核对');
 
-  // Settling what an earlier cleanup left behind fails as a whole (the maintenance claim of the data
-  // set it is in holds a record that is no claim): the check goes on, the leftover waits for the next one.
+  // A malformed maintenance claim blocks only this root's leftover; other backups are still checked.
   const claim = `${controlRoot(fixture.alpha)}.runtime-maintenance`;
   await fs.mkdir(claim, { recursive: true });
   await fs.writeFile(path.join(claim, 'owner.json'), '{"kind":"not a claim"}\n');
   const leftover = path.join(controlRoot(fixture.alpha), 'merge-backups', `${backupName(300)}.deleting-0123456789abcdef`);
   await fs.mkdir(leftover, { recursive: true });
   const settling = await planRuntimeBackupCleanup(fixture.root, database);
-  assert.ok(settling.problems.includes('上次没有删完的备份这次没有收尾，下次检查时再试。'), settling.problems.join('\n'));
+  assert.ok(settling.problems.includes(`${controlRoot(fixture.alpha)} 上次清理的收尾或维护声明释放出错；已完成的结果保留，其余下次再试。`), settling.problems.join('\n'));
+  assert.ok(settling.details.some((line) => line.includes(`Runtime maintenance claim record is invalid: ${claim}`)), settling.details.join('\n'));
   assert.equal(itemAt(settling, deletable).deletable, true, '别处的备份照常核对');
   assert.ok((await fs.lstat(leftover)).isDirectory(), '残留原样留着');
   noRawText(settling);

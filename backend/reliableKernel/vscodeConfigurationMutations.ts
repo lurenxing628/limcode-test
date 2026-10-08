@@ -683,7 +683,8 @@ export class VscodeConfigurationMutations {
 
   public setRuntimeContext(payload: RuntimeContextScopeSetPayload): Promise<void> {
     const scope = normalizeScope(payload.scopeKind, payload.scopeId);
-    const template = requireText(payload.template, 'Runtime Context template');
+    if (typeof payload.template !== 'string') throw new TypeError('Runtime Context template 必须是字符串。');
+    const template = payload.template.trim();
     return this.mutate((paths) => this.setScoped(
       runtimeContextStore(paths),
       runtimeContextLinkStore(paths),

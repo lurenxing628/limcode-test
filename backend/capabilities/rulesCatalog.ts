@@ -1,7 +1,9 @@
+import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import type { RuleFileRecord, RuleKind, RuleScope } from '../../shared/protocol';
 import type { RulesCatalogCapability } from './types';
 import { resolveDataRootUri } from './vscodeStorage/globalStatus';
+import { isNodeFsStorageUri, nodeFsStoragePath } from './vscodeStorage/localStorageUri';
 
 const RULE_FILE_NAMES: Record<RuleKind, string> = {
   AGENTS: 'AGENTS.md',
@@ -10,6 +12,32 @@ const RULE_FILE_NAMES: Record<RuleKind, string> = {
 
 /** 每个作用域下都读取 AGENTS + CLAUDE 两个规则文件。 */
 const RULE_KINDS: readonly RuleKind[] = ['AGENTS', 'CLAUDE'];
+
+export interface RuleFileRoot {
+  scope: RuleScope;
+  rootUri: vscode.Uri;
+  workspaceFolderUri?: string;
+}
+
+/** Fresh reads share one path for the rule catalog and immutable Turn authority. */
+export function readRuleFiles(roots: readonly RuleFileRoot[]): Promise<RuleFileRecord[]> {
+  return Promise.all(roots.flatMap(({ scope, rootUri, workspaceFolderUri }) =>
+    RULE_KINDS.map(async (kind): Promise<RuleFileRecord> => {
+      const uri = vscode.Uri.joinPath(rootUri, RULE_FILE_NAMES[kind]);
+      const content = await readTextFile(uri);
+      return {
+        id: `rule:${scope}:${kind}`,
+        scope,
+        kind,
+        editable: kind === 'AGENTS',
+        path: uri.fsPath,
+        exists: content !== undefined,
+        content: content ?? '',
+        ...(workspaceFolderUri ? { workspaceFolderUri } : {})
+      };
+    })
+  ));
+}
 
 /**
  * 规则文件扫描能力实现。
@@ -34,34 +62,12 @@ export function createRulesCatalogCapability(context: vscode.ExtensionContext): 
     return root ? vscode.Uri.joinPath(root, RULE_FILE_NAMES[kind]) : undefined;
   }
 
-  async function readRule(scope: RuleScope, kind: RuleKind, workspaceFolderUri?: string): Promise<RuleFileRecord | undefined> {
-    const uri = fileUri(scope, kind);
-    if (!uri) return undefined;
-    const read = await readTextFile(uri);
-    return {
-      id: `rule:${scope}:${kind}`,
-      scope,
-      kind,
-      editable: kind === 'AGENTS',
-      path: uri.fsPath,
-      exists: read !== undefined,
-      content: read ?? '',
-      ...(workspaceFolderUri ? { workspaceFolderUri } : {})
-    };
-  }
-
   async function refresh(): Promise<void> {
-    const discovered: RuleFileRecord[] = [];
-    const projectFolderUri = projectRootUri()?.toString();
-
-    for (const scope of ['global', 'project'] as const) {
-      for (const kind of RULE_KINDS) {
-        const record = await readRule(scope, kind, scope === 'project' ? projectFolderUri : undefined);
-        if (record) discovered.push(record);
-      }
-    }
-
-    rules = discovered;
+    const project = projectRootUri();
+    rules = await readRuleFiles([
+      { scope: 'global', rootUri: resolveDataRootUri(context) },
+      ...(project ? [{ scope: 'project' as const, rootUri: project, workspaceFolderUri: project.toString() }] : [])
+    ]);
   }
 
   return {
@@ -79,7 +85,11 @@ export function createRulesCatalogCapability(context: vscode.ExtensionContext): 
 /** 读取文本文件；文件不存在（或不可读）时返回 undefined，供“未创建”占位使用。 */
 async function readTextFile(uri: vscode.Uri): Promise<string | undefined> {
   try {
-    const bytes = await vscode.workspace.fs.readFile(uri);
+    // workspace.fs still awaits renderer activation for its local file-provider shortcut.
+    // Host-local rules must also remain readable while that renderer is reconnecting.
+    const bytes = isNodeFsStorageUri(uri)
+      ? await fs.readFile(nodeFsStoragePath(uri))
+      : await vscode.workspace.fs.readFile(uri);
     return Buffer.from(bytes).toString('utf8');
   } catch {
     return undefined;

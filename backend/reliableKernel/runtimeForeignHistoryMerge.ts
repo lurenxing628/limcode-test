@@ -42,7 +42,7 @@ export async function holdForeignHistoricalMergeSource(
   paths: { globalStoragePath: string },
   id: string,
   source: RuntimeDataSetMergeForeignSource,
-  options: { signal?: AbortSignal } = {}
+  options: { signal?: AbortSignal; refuseWhenHeld?: boolean } = {}
 ): Promise<ForeignHistoricalMergeHold> {
   const configurationRoot = path.resolve(paths.globalStoragePath);
   options.signal?.throwIfAborted();
@@ -60,7 +60,9 @@ export async function holdForeignHistoricalMergeSource(
     locatedId = root.id;
   }
   // Claims share the physical located root's id with read-only views and foreign cleanup.
-  const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location), { refuseWhenHeld: !!options.signal });
+  const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location), {
+    refuseWhenHeld: options.refuseWhenHeld === true || !!options.signal
+  });
   return new ForeignMergeHold(configurationRoot, id, source.label, location, claim, locatedId, options.signal);
 }
 
@@ -68,9 +70,10 @@ export async function holdForeignHistoricalMergeSource(
 export async function foreignHistoricalMergeFingerprint(
   paths: { globalStoragePath: string },
   id: string,
-  source: RuntimeDataSetMergeForeignSource
+  source: RuntimeDataSetMergeForeignSource,
+  options: { signal?: AbortSignal; refuseWhenHeld?: boolean } = {}
 ): Promise<RuntimeDataSetFingerprint> {
-  const hold = await holdForeignHistoricalMergeSource(paths, id, source);
+  const hold = await holdForeignHistoricalMergeSource(paths, id, source, options);
   try {
     return await hold.fingerprint(await hold.locate());
   } finally {
@@ -246,14 +249,16 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
 
   public async snapshot(
     candidate: ForeignHistoricalMergeCandidate,
-    options: { beforeOpen?(snapshotPath: string): Promise<void> } = {}
+    options: { beforeOpen?(snapshotPath: string): Promise<void>; signal?: AbortSignal } = {}
   ): Promise<RuntimeDataSetDatabaseSnapshot> {
+    const signal = options.signal ?? this.signal;
+    signal?.throwIfAborted();
     this.assertHeld();
     let snapshot: RuntimeDataSetDatabaseSnapshot;
     try {
       snapshot = await createLocatedRuntimeDatabaseSnapshot(candidate.root, {
         ...(options.beforeOpen ? { beforeOpen: options.beforeOpen } : {}),
-        copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles(), this.signal)
+        copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles(), signal)
       });
     } catch (error) {
       throw refusal(error);
@@ -262,7 +267,7 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
     try {
       // The Runtime snapshot precedes the append-only packed CAS copy. All source SQLite opens
       // remain confined to private copies, including the sidecar reader.
-      objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles(), this.signal);
+      objects = await locatedCasTransferSource(candidate.root, () => this.heldFiles(), signal);
     } catch (error) {
       await snapshot.close();
       throw refusal(error);
@@ -305,7 +310,9 @@ class ForeignMergeHold implements ForeignHistoricalMergeHold {
       }
       return fingerprint;
     } finally {
-      await copy.remove();
+      await copy.remove().catch((error: unknown) => {
+        console.warn('[LimCode] 历史核验的临时副本没有删掉，留在临时目录里。', error);
+      });
     }
   }
 

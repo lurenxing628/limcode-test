@@ -272,6 +272,8 @@ const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
   'tests/reliable-kernel/context-sequence-node-batch.test.mjs',
   'tests/reliable-kernel/settings-draft-retention.test.mjs',
   'tests/reliable-kernel/composer-attachment-authority.test.mjs',
+  'tests/reliable-kernel/inline-attachment-display.test.mjs',
+  'tests/reliable-kernel/selected-context-authority-source.test.mjs',
   'tests/reliable-kernel/conversation-owner-release.test.mjs',
   'tests/reliable-kernel/diagnostic-inspection-progress.test.mjs',
   'tests/reliable-kernel/foreign-file-volume-identity.test.mjs',

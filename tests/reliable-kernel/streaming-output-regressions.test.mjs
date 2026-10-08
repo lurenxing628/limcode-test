@@ -51,6 +51,76 @@ async function createWebviewTestServer() {
   return createWebviewSsrServer();
 }
 
+async function createToolResultDisplayHarness(context) {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  globalThis.window = { addEventListener() {}, removeEventListener() {} };
+  context.after(async () => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+  const sourceModule = (relative) => server.ssrLoadModule('/@fs' + path.join(root, relative));
+  const { EffectControlPlane } = await sourceModule('backend/reliableKernel/effectControlPlane.ts');
+  const { projectReliableConversation } = await server.ssrLoadModule('/src/domain/reliableConversationProjection.ts');
+  const { resolveToolDisplay } = await server.ssrLoadModule('/src/components/content/toolDisplay/registry.ts');
+  const now = '2026-10-08T00:00:00.000Z';
+  const database = {
+    hostBootId: 'tool-display-host', onCommit() { return () => {}; },
+    async snapshot(reads) { return { snapshot: reads.map((read) => read.domain === 'Turn'
+      ? { id: read.id, conversation_id: 'conversation', status: 'active' }
+      : read.domain === 'ToolCall' ? { id: read.id, turn_id: 'turn' } : read.kind === 'list' ? [] : null) }; }
+  };
+  const bodies = new Map();
+  let envelope;
+  const contentStore = {
+    async prepare(_database, content, content_type) {
+      const id = 'prepared-' + bodies.size;
+      bodies.set(id, content);
+      envelope = JSON.parse(content);
+      return { metadata: {
+        id, content_type, sha256: '0'.repeat(64), byte_length: BigInt(Buffer.byteLength(content)), storage_key: id
+      } };
+    },
+    async read(metadata) { return Buffer.from(bodies.get(metadata.id)); }
+  };
+  // Produce the real terminal CAS envelope; persistence/lease checks have their existing tests.
+  const effects = new EffectControlPlane(database, contentStore, { now: () => now });
+  effects.readTerminalResult = async () => null;
+  effects.requireToolFacts = async () => ({ toolCall: { id: 'call' }, execution: { id: 'execution' },
+    turn: { id: 'turn' }, conversation: { id: 'conversation' }, lease: { id: 'lease' } });
+  effects.assertCallIsNextForModelResult = async () => {};
+  const settle = async (input) => {
+    await effects.prepareTerminalPlan(input.toolCallId, input.status, input.detail,
+      undefined, new Set(), { requireLease: false });
+    return { status: input.status, terminal: { toolCallId: input.toolCallId, status: input.status, detail: input.detail } };
+  };
+  const ready = (value) => ({ status: 'ready', text: JSON.stringify(value) });
+  function display(toolName, args, events = []) {
+    const projection = projectReliableConversation({
+      conversationId: 'conversation',
+      records: {
+        Message: { message: { id: 'message', conversation_id: 'conversation', role: 'model', revision_id: 'revision', message_seq: '1' } },
+        MessageTurnLink: { link: { id: 'link', message_id: 'message', turn_id: 'turn', role: 'model' } },
+        Turn: { turn: { id: 'turn', conversation_id: 'conversation', status: 'active' } },
+        ToolCall: { call: { id: 'call', turn_id: 'turn', tool_name: toolName, status: 'terminal', call_seq: '1' } },
+        ToolCallSourceLink: { source: { id: 'source', tool_call_id: 'call', message_id: 'message', provider_call_id: 'call', provider_ordinal: '0' } },
+        ToolOutcome: { outcome: { id: 'outcome', tool_call_id: 'call', status: envelope.status } }
+      },
+      details: {
+        'message-content:revision': ready({ role: 'model', parts: [{ id: 'call', functionCall: { name: toolName, args } }] }),
+        'tool-arguments-content:call': ready(args),
+        'tool-result-content:call': ready(envelope)
+      }
+    });
+    assert.deepEqual(projection.toolResultByCallId.call, envelope.detail);
+    return resolveToolDisplay({ toolName, args, result: projection.toolResultByCallId.call,
+      toolCall: projection.toolCalls[0], events, stringifyValue: JSON.stringify });
+  }
+  return { sourceModule, database, contentStore, bodies, effects, settle, display, now,
+    get envelope() { return envelope; } };
+}
+
 test('detail load errors use bounded backoff, manual reset, and durable invalidation', async (context) => {
   const server = await createWebviewTestServer();
   const previousWindow = globalThis.window;
@@ -503,11 +573,16 @@ test('run_agent list reports an empty query without implying a child was started
   const { runAgentToolDisplay, isRunAgentSpawnArguments } = await server.ssrLoadModule(
     '/src/components/content/toolDisplay/runAgentToolDisplay.ts'
   );
+  const { listConversationChildTasks } = await server.ssrLoadModule(
+    '/@fs' + path.join(root, 'backend/reliableKernel/conversationChildTaskProjection.ts')
+  );
+  const result = { ...listConversationChildTasks({ conversationId: 'conversation', snapshotCommitSeq: '1', tasks: [] }, { scope: 'direct', limit: 32 }),
+    operation: 'list' };
   const display = runAgentToolDisplay({
-    result: { operation: 'list', scope: 'direct', totalDirect: 0, totalDescendants: 0, tasks: [] }
+    result, stringifyValue: JSON.stringify
   });
   assert.equal(display.headerActions.length, 0);
-  assert.equal(display.outputSections.length, 1);
+  assert.equal(display.outputSections.length, 2);
   assert.equal(display.outputSections[0].title, '子 Agent 查询结果');
   assert.deepEqual(display.outputSections[0].rows, [
     { label: '操作', value: '列出已有子 Agent（不会启动新任务）' },
@@ -515,6 +590,7 @@ test('run_agent list reports an empty query without implying a child was started
     { label: '已有子任务', value: '0 个' },
     { label: '结果', value: '当前没有子任务；本次查询未启动子 Agent' }
   ]);
+  assert.deepEqual(JSON.parse(display.outputSections[1].text), result);
   for (const operation of ['list', 'read', 'wait', 'send', 'interrupt_subtree']) {
     assert.equal(isRunAgentSpawnArguments(JSON.stringify({ operation })), false, operation);
   }
@@ -524,6 +600,274 @@ test('run_agent list reports an empty query without implying a child was started
     'webview/src/components/content/parts/FunctionCallPartView.vue'), 'utf8');
   assert.match(component, /isRunAgentSpawnArguments\(call\.args\)/,
     'the queued status must use the exact spawn operation');
+});
+
+test('transfer display retains committed counts and per-item results after detail loading', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  globalThis.window = { addEventListener() {}, removeEventListener() {} };
+  context.after(async () => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+  const { resolveToolDisplay } = await server.ssrLoadModule('/src/components/content/toolDisplay/registry.ts');
+  const args = { transfers: [
+    { fromEnvironment: 'current', fromPath: 'empty.txt', toEnvironment: 'W2', toPath: 'copies/empty.txt' },
+    { fromEnvironment: 'current', fromPath: 'missing.txt', toEnvironment: 'W2', toPath: 'copies/missing.txt' }
+  ] };
+  const observation = {
+    outcome: 'failed',
+    result: {
+      ok: false,
+      output: {
+        successCount: 1, failCount: 1, totalCount: 2,
+        results: [
+          {
+            success: true, index: 0, type: 'file',
+            from: { environment: 'current', path: 'empty.txt' },
+            to: { environment: 'work-env-remote', path: 'copies/empty.txt' },
+            files: 1, bytes: 0, verify: { mode: 'size', ok: true }, durationMs: 1
+          },
+          {
+            success: false, index: 1, type: 'file',
+            from: { environment: 'current', path: 'missing.txt' },
+            to: { environment: 'work-env-remote', path: 'copies/missing.txt' },
+            error: 'source does not exist', durationMs: 1
+          }
+        ]
+      }
+    }
+  };
+  // Use the production operation aggregation rather than passing the capability's output directly.
+  const terminal = await kernel.EffectControlPlane.prototype.readReadyToolOutcome.call({
+    async list() { return []; },
+    async operationsRequireModelResponse() { return false; },
+    async readOperationObservation() { return { effectReceiptId: 'transfer-receipt', detail: observation }; }
+  }, 'transfer-call', [{ id: 'transfer-operation', operation_seq: 1n, status: 'failed' }]);
+  const display = (result) => resolveToolDisplay({
+    toolName: 'transfer', args, result, events: [], stringifyValue: JSON.stringify
+  });
+  const unloaded = display(undefined);
+  assert.equal(unloaded.inputSections.length, 1);
+  const loaded = display(terminal.detail);
+  assert.equal(loaded.inputSections.length, 1);
+  assert.equal(loaded.outputSections.length, 3);
+  assert.deepEqual(loaded.outputSections[0].rows, [
+    { label: '结果', value: '失败' },
+    { label: '总数', value: '2' },
+    { label: '成功', value: '1' },
+    { label: '失败', value: '1' }
+  ]);
+  assert.deepEqual(loaded.outputSections[1].rows, [
+    { label: '结果', value: '成功' },
+    { label: '来源', value: 'current:empty.txt' },
+    { label: '目标', value: '工作环境:copies/empty.txt' },
+    { label: '文件数', value: '1' },
+    { label: '大小', value: '0 字节' },
+    { label: '验证', value: '大小一致' }
+  ]);
+  assert.deepEqual(loaded.outputSections[2].rows, [
+    { label: '结果', value: '失败' },
+    { label: '来源', value: 'current:missing.txt' },
+    { label: '目标', value: '工作环境:copies/missing.txt' },
+    { label: '错误', value: 'source does not exist' }
+  ]);
+});
+
+test('transfer display retains rejection and unknown-outcome explanations', async (context) => {
+  const server = await createWebviewTestServer();
+  const previousWindow = globalThis.window;
+  globalThis.window = { addEventListener() {}, removeEventListener() {} };
+  context.after(async () => {
+    if (previousWindow === undefined) delete globalThis.window;
+    else globalThis.window = previousWindow;
+    await server.close();
+  });
+  const { resolveToolDisplay } = await server.ssrLoadModule('/src/components/content/toolDisplay/registry.ts');
+  const display = (result) => resolveToolDisplay({
+    toolName: 'transfer', args: {}, result, events: [], stringifyValue: JSON.stringify
+  });
+  for (const result of [
+    { reason: '用户拒绝执行工具。' },
+    { error: 'transfer capability unavailable' },
+    { ok: false, output: 'invalid transfer arguments' }
+  ]) {
+    const loaded = display(result);
+    assert.equal(loaded.outputSections.length, 1);
+    assert.ok(loaded.outputSections[0].rows.some((row) => row.label === '说明'
+      && row.value === (result.reason ?? result.error ?? result.output)));
+  }
+  const unknown = display({ operations: [{
+    status: 'outcome_unknown',
+    detail: { reason: '无法证明宿主重启前已派发 transfer 的最终文件状态。', automaticRetry: false }
+  }] });
+  assert.deepEqual(unknown.outputSections[0].rows, [
+    { label: '结果', value: '结果未知' },
+    { label: '说明', value: '无法证明宿主重启前已派发 transfer 的最终文件状态。' }
+  ]);
+  assert.equal(display('transfer failed').outputSections[0].text, '"transfer failed"',
+    'unstructured failure text still uses the registry display');
+});
+
+test('Ask answers use committed typed results and cancelled questions retain their explanation', async (context) => {
+  const h = await createToolResultDisplayHarness(context);
+  const { ToolInteractionControlPlane } = await h.sourceModule('backend/reliableKernel/toolInteractions.ts');
+  const { BACKGROUND_ASK_USER_AUTO_ANSWER, askUserOutputFromResult } = await h.sourceModule('shared/askUser.ts');
+  const args = { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] };
+  for (const input of [
+    { source: { kind: 'command', key: 'human-answer' }, response: { answer: { selectedOptionIndexes: [1] } } },
+    { source: { kind: 'internal', key: 'automatic-answer' }, response: {
+      answer: { selectedOptionIndexes: [], customText: BACKGROUND_ASK_USER_AUTO_ANSWER }
+    } },
+    { source: { kind: 'command', key: 'cancel-answer' }, response: { reason: '用户取消了问题。' }, cancelled: true }
+  ]) {
+    const prompt = await h.contentStore.prepare(h.database, JSON.stringify({ toolCallId: 'call', prompt: args }), 'application/json');
+    const rows = {
+      InteractionRequest: { id: 'request', request_kind: 'ask_user', prompt_object_id: prompt.metadata.id },
+      Turn: { id: 'turn' }, OutcomePause: { id: 'pause', operation_id: 'operation' },
+      Operation: { id: 'operation', tool_call_id: 'call', status: 'waiting_answer' }
+    };
+    let committed;
+    const producer = {
+      database: h.database, contentStore: h.contentStore,
+      async requireExisting(domain, id) { return domain === 'ContentObject' ? { id } : rows[domain]; },
+      async list(domain) { return domain === 'InteractionOwnerLink' ? [{ turn_id: 'turn' }] : []; },
+      async autoApprovalAllowed() { return true; },
+      async toolCallIdForRequest() { return 'call'; }, async findSourceReceipt() {},
+      async requireActiveToolFacts() { return {
+        turn: { id: 'turn' }, toolCall: { id: 'call', status: 'waiting_answer' },
+        execution: { id: 'execution', status: 'waiting_answer' }, conversation: { id: 'conversation' }, lease: { id: 'lease' }
+      }; },
+      prepareAskResult: ToolInteractionControlPlane.prototype.prepareAskResult,
+      timestamp() { return h.now; },
+      async commitSource(value) { committed = value; return { deduplicated: false, commitSeq: '1' }; },
+      async finishCommittedInteraction(_turnId, read) { return read([]); },
+      effects: { async readTerminalResult() {} }
+    };
+    await ToolInteractionControlPlane.prototype.resolveAskUser.call(producer, { requestId: 'request', ...input });
+    const artifactSteps = committed.steps.filter((step) => step.kind === 'insert' && step.domain === 'ToolResultArtifact');
+    assert.equal(artifactSteps.length, 1, 'both response kinds and cancellation must publish their result with the winning response');
+    assert.ok(committed.steps.some((step) => step.kind === 'insert' && step.domain === 'InteractionResponse'));
+    const artifact = artifactSteps[0].row;
+    const status = input.cancelled ? 'cancelled' : 'succeeded';
+    const terminal = await h.effects.readReadyToolOutcome.call({
+      contentStore: h.contentStore,
+      async list(_domain, where) { return where.role === 'no_effect_result' ? [artifact] : []; },
+      async requireContentObject(id) { return { id }; }
+    }, 'call', [{ id: 'operation', operation_seq: 1n, status }]);
+    await h.settle({ toolCallId: 'call', ...terminal });
+    const view = h.display('ask_user', args, input.cancelled ? [{ status: 'awaiting_user_input' }] : []);
+    if (input.cancelled) {
+      assert.equal(view.outputSections[0].text, input.response.reason, 'a prior waiting event must not suppress the cancellation result');
+    } else {
+      const output = askUserOutputFromResult(h.envelope.detail);
+      assert.ok(output);
+      assert.equal(view.inputSections[0].title, '问题与回答');
+      assert.equal(view.outputSections.length, 0, 'the Ask component consumes its typed result without duplicate JSON');
+      if (input.source.kind === 'command') assert.deepEqual(output.selectedOptions, [{ label: '停止' }]);
+      else assert.equal(output.customText, BACKGROUND_ASK_USER_AUTO_ANSWER);
+    }
+    assert.ok(view.inputSections.length + view.outputSections.length > 0,
+      'ready result detail must still make the tool expandable');
+  }
+});
+
+test('Ask Plan and task-list policy refusals share visible explanations without replacing settled cards', async (context) => {
+  const h = await createToolResultDisplayHarness(context);
+  const { ReliableToolDispatcher } = await h.sourceModule('backend/reliableKernel/toolDispatcher.ts');
+  const { ToolInteractionControlPlane } = await h.sourceModule('backend/reliableKernel/toolInteractions.ts');
+  const { createSubmitPlanToolOutput } = await h.sourceModule('shared/planReview.ts');
+  const operation = { mode: 'rewrite', items: [{ title: '实际任务', status: 'pending' }] };
+  const argsByName = {
+    ask_user: { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] },
+    submit_plan: { plan: '检查实际状态。', taskList: operation }, update_task_list: operation
+  };
+  for (const [toolName, args] of Object.entries(argsByName)) {
+    const reason = '冻结 ToolPolicy 不允许工具 ' + toolName + '。';
+    await ReliableToolDispatcher.prototype.reject.call({
+      dependencies: { effects: { settleWithoutEffect: h.settle } }, settledResult() {}
+    }, { toolCallId: 'call', toolName }, reason);
+    const view = h.display(toolName, args);
+    assert.equal(view.outputSections[0].text, reason);
+    assert.ok(view.inputSections.length + view.outputSections.length > 0);
+    assert.equal(view.inputSections.some((section) => section.planProposal), false,
+      'a refused call must not pretend its Plan reached review');
+  }
+  await h.settle({ toolCallId: 'call', status: 'succeeded', detail: createSubmitPlanToolOutput({
+    proposalId: 'plan', status: 'approved', executionTarget: 'current_conversation'
+  }) });
+  const plan = h.display('submit_plan', argsByName.submit_plan);
+  assert.ok(plan.inputSections[0].planProposal);
+  assert.equal(plan.outputSections.length, 0, 'settled Plan decisions stay in the dedicated component');
+  await ToolInteractionControlPlane.prototype.settleTaskList.call({ effects: { settleWithoutEffect: h.settle } }, {
+    source: { kind: 'internal', key: 'actual-task' }, toolCallId: 'call', operation
+  });
+  const tasks = h.display('update_task_list', operation);
+  assert.ok(tasks.outputSections[0].taskList, 'a successful task result remains its actual task card');
+});
+
+test('child Agent result projection retains task queries background state and unanswered notices', async (context) => {
+  const h = await createToolResultDisplayHarness(context);
+  const { ReliableChildAgentCoordinator } = await h.sourceModule('backend/reliableKernel/childAgentCoordinator.ts');
+  const { ChildExecutionControlPlane } = await h.sourceModule('backend/reliableKernel/childExecution.ts');
+  const source = { id: 'source', kind: 'turn_intent_revision', classification: 'task', state: 'effective',
+    text: '实际任务正文', contentObjectId: 'source-body', contentType: 'text/plain', sequence: '1', createdAt: h.now };
+  const task = {
+    childExecutionId: 'child', answerBridgeId: 'bridge', parentConversationId: 'conversation', conversationId: 'child-conversation',
+    depth: 1, status: 'active', label: '子任务', createdAt: h.now, resumable: true, initialTask: source,
+    currentInputs: [source], queuedInputs: [], timeline: [source], execution: { activeTurnId: 'child-turn' },
+    result: { deliveries: [], handling: [] }
+  };
+  let answer = { status: 'running' };
+  const coordinator = new ReliableChildAgentCoordinator({
+    database: h.database, now: () => h.now, effects: { settleWithoutEffect: h.settle },
+    children: {
+      async readConversationTaskProjection() { return { conversationId: 'conversation', snapshotCommitSeq: '1', tasks: [task] }; },
+      async readExecutionSnapshot() { return {
+        childExecution: { id: 'child', child_conversation_id: 'child-conversation', status: 'active' },
+        answerBridge: { id: 'bridge' }, activeTurn: { id: 'child-turn', status: 'active' }
+      }; }
+    }, answers: { async readCurrent() { return answer; } }
+  });
+  const dispatch = (toolName, args) => coordinator.dispatch({
+    toolCallId: 'call', turnId: 'turn', modelRequestId: 'request', toolName, arguments: args
+  });
+  for (const operation of ['read', 'wait']) {
+    const args = { operation, answerBridgeId: 'bridge', ...(operation === 'wait' ? { timeoutMs: 0 } : {}) };
+    await dispatch('run_agent', args);
+    assert.deepEqual(JSON.parse(h.display('run_agent', args).outputSections[0].text), h.envelope.detail);
+  }
+  const listArgs = { operation: 'list', scope: 'tree' };
+  await dispatch('run_agent', listArgs);
+  let view = h.display('run_agent', listArgs);
+  assert.equal(h.envelope.detail.totalDescendants, 0);
+  assert.equal(view.outputSections[0].rows.find((row) => row.label === '已有子任务').value, '1 个');
+  assert.deepEqual(JSON.parse(view.outputSections[1].text), h.envelope.detail);
+  const answerArgs = { answerBridgeId: 'bridge' };
+  await dispatch('read_agent_answer', answerArgs);
+  view = h.display('read_agent_answer', answerArgs);
+  assert.equal(view.outputSections[0].text, '对应子 Agent 仍在运行，尚未提交回答。');
+  assert.deepEqual(JSON.parse(view.outputSections[1].text), h.envelope.detail);
+  answer = { status: 'submitted', title: '完成', content: '当前生产回答正文', submissionId: 'submission', interrupted: false };
+  await dispatch('read_agent_answer', answerArgs);
+  view = h.display('read_agent_answer', answerArgs);
+  assert.equal(view.outputSections[0].text, answer.content);
+  assert.equal(view.outputSections[0].markdown, true);
+  const children = new ChildExecutionControlPlane(h.database, h.contentStore, h.effects, {
+    now: () => h.now, authorityCompiler: { async compile() { throw new Error('unused'); } }
+  });
+  children.readExecutionSnapshot = async () => ({
+    childExecution: { id: 'child', child_conversation_id: 'child-conversation', status: 'active' },
+    answerBridge: { id: 'bridge' }, parentLink: { source_tool_call_id: 'call' }
+  });
+  children.listRows = async () => [{ status: 'waiting_answer', wait_deadline_at: '2026-10-07T00:00:00.000Z' }];
+  let handle;
+  children.prepareForegroundSettlement = async (input) => { handle = input.detail; return null; };
+  await children.settleForegroundTimeout('child', h.now);
+  await h.settle({ toolCallId: 'call', status: 'succeeded', detail: handle });
+  view = h.display('run_agent', { operation: 'spawn', taskName: '子任务', prompt: '执行' });
+  assert.equal(view.outputSections[0].rows.find((row) => row.label === '子 Agent 状态').value, '运行中');
 });
 
 test('process stream detail pages every CAS chunk beyond the projection window', async () => {

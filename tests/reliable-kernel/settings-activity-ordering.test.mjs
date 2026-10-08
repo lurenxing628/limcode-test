@@ -26,6 +26,7 @@ test('bootstrap binds Ready session, emits dirty before same-event send, and nev
     const { useBridgeBootstrap } = await server.ssrLoadModule('/src/composables/useBridgeBootstrap.ts');
     const { useGlobalSettingsStore } = await server.ssrLoadModule('/src/stores/useGlobalSettingsStore.ts');
     const { useSessionStore } = await server.ssrLoadModule('/src/stores/useSessionStore.ts');
+    const { useClientStateStore } = await server.ssrLoadModule('/src/stores/useClientStateStore.ts');
     const { bridge, BridgeMessageType: types } = await server.ssrLoadModule('/src/transport/index.ts');
     const store = useGlobalSettingsStore();
     let sequence;
@@ -35,6 +36,23 @@ test('bootstrap binds Ready session, emits dirty before same-event send, and nev
       const ready = posted.find(m => m.type === types.Ready);
       assert.ok(ready.payload.settingsActivitySessionId);
       assert.equal(posted.at(-1).payload.state, 'loading');
+      const client = useClientStateStore();
+      const receive = (message) => { for (const listener of listeners) listener({ data: message }); };
+      receive({ id: 'ready-error', type: types.Error, correlationId: ready.id,
+        payload: { requestType: types.Ready, message: 'Cannot read runtime template index' } });
+      assert.equal(client.configurationError, 'Cannot read runtime template index');
+      assert.equal(client.settingsClientStateLoading, false);
+      assert.equal(client.settingsClientStateReady, false);
+      client.reloadConfiguration();
+      const retryReady = posted.filter(m => m.type === types.Ready).at(-1);
+      assert.notEqual(retryReady.id, ready.id);
+      assert.equal(retryReady.payload.settingsActivitySessionId, ready.payload.settingsActivitySessionId);
+      assert.equal(posted.at(-1).type, types.GlobalSettingsActivity);
+      assert.equal(posted.at(-1).payload.sessionId, ready.payload.settingsActivitySessionId);
+      assert.equal(client.configurationError, ''); assert.equal(client.settingsClientStateLoading, true);
+      receive({ id: 'late-ready-error', type: types.Error, correlationId: ready.id,
+        payload: { requestType: types.Ready, message: 'stale failure' } });
+      assert.equal(client.configurationError, '', 'an old Ready failure cannot terminate the current read');
       store.applySnapshot({ section: 'llm', settings: { activeProviderConfigId: 'before' }, revision: 'disk-1', filePath: 'fixture' });
       assert.equal(posted.at(-1).payload.state, 'clean');
       const begin = posted.length;

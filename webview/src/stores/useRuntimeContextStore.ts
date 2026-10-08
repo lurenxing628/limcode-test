@@ -53,13 +53,6 @@ export const useRuntimeContextStore = defineStore('runtimeContext', {
       }
 
       const normalizedTemplate = template.trim();
-      if (!normalizedTemplate) {
-        this.status = scopeKind === 'global'
-          ? '全局初始上下文模板不能为空。'
-          : '模板内容为空；若要继承上级配置，请点击“恢复继承”。';
-        return;
-      }
-
       const requestId = createMessageId();
       this.pendingSaves[scopeKey(scopeKind, normalizedScopeId)] = {
         scopeKind,
@@ -77,13 +70,14 @@ export const useRuntimeContextStore = defineStore('runtimeContext', {
       return requestId;
     },
     clearContextScope(scopeKind: ConfigScopeKind, scopeId?: string): string | undefined {
-      if (scopeKind === 'global') return;
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
-      if (!normalizedScopeId) { this.status = '缺少初始上下文配置范围，无法恢复继承。'; return; }
+      if (scopeKind !== 'global' && !normalizedScopeId) { this.status = '缺少初始上下文配置范围，无法恢复继承。'; return; }
       const requestId = createMessageId();
-      this.pendingSaves[scopeKey(scopeKind, normalizedScopeId)] = { scopeKind, scopeId: normalizedScopeId, operation: 'clear', requestId };
-      this.status = '正在恢复继承...';
-      bridge.request(BridgeMessageType.RuntimeContextScopeClear, { scopeKind, scopeId: normalizedScopeId }, { requestId });
+      this.pendingSaves[scopeKey(scopeKind, normalizedScopeId)] = { scopeKind,
+        ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}), operation: 'clear', requestId };
+      this.status = scopeKind === 'global' ? '正在恢复默认模板...' : '正在恢复继承...';
+      bridge.request(BridgeMessageType.RuntimeContextScopeClear, { scopeKind,
+        ...(normalizedScopeId ? { scopeId: normalizedScopeId } : {}) }, { requestId });
       return requestId;
     },
     reconcilePendingSave(correlationId?: string): void {
@@ -93,7 +87,7 @@ export const useRuntimeContextStore = defineStore('runtimeContext', {
         const local = this.localContextFor(pending.scopeKind, pending.scopeId);
         if (pending.operation === 'clear' ? !!local.link : !local.runtimeContext || !local.link || local.runtimeContext.template.trim() !== pending.template) return;
         delete this.pendingSaves[key]; this.completedSaves[key] = correlationId;
-        this.status = pending.operation === 'clear' ? '已恢复继承' : '运行时模板已同步';
+        this.status = pending.operation === 'clear' ? pending.scopeKind === 'global' ? '已恢复默认模板' : '已恢复继承' : '运行时模板已同步';
         return;
       }
     },

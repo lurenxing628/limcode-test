@@ -42,19 +42,28 @@ function fixture({
   problems = [], upgradeError, informationChoice, changedAfterUpgrade = false,
   batchReport = { results: [], failures: [] }, batchHook, upgradeHook,
   mergeReport = emptyMergeReport(), mergeStates = {}, mergeError, mergeHook, exclusiveOutcome = 'completed', summaries = {}, globalState,
-  repairPlan, repairHook, emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState, undecidedClaim = true
+  repairPlan, repairHook, emptyOld = false, lifetime = loadSource('vscode/runtimeDataSetUpgradeLifetime.ts', {}), largeWaiting = [], workspaceState, undecidedClaim = true,
+  waitApplication, residualRetryId, streamedReport
 } = {}) {
   const current = { id: 'default', dataSetId: 'current', rootInstanceId: 'current-instance', runtimeKernelEpoch: currentEpoch, selected: true, runtimeDataRootPath: '/fixture/current', source: 'legacy' };
   const old = { id: 'workspace:old', ...(emptyOld ? {} : { dataSetId: 'old', rootInstanceId: 'old-instance' }), runtimeKernelEpoch: oldEpoch, selected: false, runtimeDataRootPath: '/fixture/old', source: 'workspace' };
   const calls = [];
+  let cancelProgress;
   class SelectionRequired extends Error { constructor() { super('select'); this.candidates = [current, old]; this.problems = problems; } }
   const vscode = {
     window: {
       async showQuickPick(items) { const pick = picks.shift(); calls.push(['pick', items]); return typeof pick === 'function' ? pick(items) : pick === undefined ? undefined : items[pick]; },
       async showWarningMessage(message, options) { calls.push(['warning', message, options]); return Array.isArray(confirmation) ? confirmation.shift() : confirmation; },
-      async showInformationMessage(message) { calls.push(['info', message]); return informationChoice; },
+      async showInformationMessage(message, options) {
+        calls.push(typeof options === 'object' ? ['info', message, options] : ['info', message]);
+        return informationChoice;
+      },
       async showErrorMessage(message) { calls.push(['error', message]); },
-      async withProgress(_options, action) { return action(); },
+      async withProgress(options, action) {
+        calls.push(['progress', options]);
+        return action({ report() {} }, { isCancellationRequested: false,
+          onCancellationRequested(listener) { cancelProgress = listener; return { dispose() { cancelProgress = undefined; } }; } });
+      },
       async showTextDocument(document) { calls.push(['document', document]); }
     },
     workspace: {
@@ -67,7 +76,10 @@ function fixture({
     commands: { async executeCommand(command) { calls.push(['command', command]); } }
   };
   const dependencies = {
-    './runtimeHistoryConvergence': { isHistoryConvergenceHost: host => !!host?.large, convergeRuntimeHistory: async (_context,_host,ids) => calls.push(['converge', [...ids]]) },
+    './runtimeHistoryConvergence': { isHistoryConvergenceHost: host => !!host?.large, convergeRuntimeHistory: async (_context,_host,ids,report) => {
+      calls.push(['converge', [...ids]]);
+      if (streamedReport) await report(streamedReport, true);
+    } },
     vscode,
     '../../backend/reliableKernel/runtimeHistoryRepair': {
       inspectRuntimeHistoryRepair: async (_paths, input) => {
@@ -191,7 +203,7 @@ function fixture({
 
     '../../backend/application/reliableKernel/historicalMergeSettlement': { settleHistoricalMergeSourceOffline: async () => ({ unsettled: [], live: [] }) },
     './runtimeHistorySettlement': { confirmRuntimeHistorySettlement: async () => true },
-    './runtimeHistoryResiduals': { manageRuntimeHistoryResiduals: async () => {} },
+    './runtimeHistoryResiduals': { manageRuntimeHistoryResiduals: async (_context,retry) => { if (residualRetryId) await retry(residualRetryId); } },
     '../../backend/reliableKernel/runtimeHistoryConvergence': { registerRuntimeHistoryConvergence: async () => 0 },
     '../../backend/reliableKernel/runtimeHistoryRegistry': { readRuntimeHistoryPending: async () => new Map() },
     './largeHistoricalMerge': {
@@ -210,11 +222,12 @@ function fixture({
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
   }).outputText, {
     module, exports: module.exports, require: name => dependencies[name] ?? require(name),
-    console: { info: log('info'), warn: log('warn'), error: log('error'), log: log('log') }
+    console: { info: log('info'), warn: log('warn'), error: log('error'), log: log('log') }, AbortController
   });
   return {
     ...module.exports, context: { subscriptions: [], ...(globalState ? { globalState } : {}), ...(workspaceState ? { workspaceState } : {}) },
-    startup: { current: () => application }, calls, logs, SelectionRequired, lifetime
+    startup: { current: () => application, async wait() { calls.push(['startup-wait']); application = await waitApplication?.(); return application; } },
+    cancelProgress: () => cancelProgress?.(), calls, logs, SelectionRequired, lifetime
   };
 }
 
@@ -467,20 +480,20 @@ test('background merge reports new outcomes once, stays silent for known ones an
   const fresh = fixture({ mergeReport: emptyMergeReport({ blocked: [{ ...blocked, newly: true }] }) });
   await fresh.mergeHistoricalDataSetsInBackground(fresh.context, mergeHost());
   assert.match(fresh.calls.find(call => call[0] === 'warning')[1],
-    /未能合并到当前库，当前库的对话没有改动；各库的情况（例如已发布的旧格式先备份并就地升级、中断的任务已收尾）见原因/);
+    /未能合并到当前历史，已完成的合并保留；各份旧数据的情况/);
   const deferredIssue = { candidateId: 'workspace:old', code: 'runtime-hosts-active', message: '这个历史库正被其它窗口使用', newly: true };
   const deferred = fixture({ mergeReport: emptyMergeReport({ deferred: [deferredIssue] }) });
   await deferred.mergeHistoricalDataSetsInBackground(deferred.context, mergeHost());
-  assert.match(deferred.calls.find(call => call[0] === 'info')[1], /1 份旧聊天记录暂时无法合并（这个历史库正被其它窗口使用），以后启动时会自动重试/);
+  assert.match(deferred.calls.find(call => call[0] === 'info')[1], /1 份旧聊天记录暂时无法合并（这个历史库正被其它窗口使用），原数据保留，可以在“历史与存储管理”中重新核验并合并/);
   const failing = fixture({ mergeError: Object.assign(new Error('磁盘已满'), { code: 'ENOSPC' }) });
   await failing.mergeHistoricalDataSetsInBackground(failing.context, mergeHost());
   assert.match(failing.calls.find(call => call[0] === 'warning')[1], /暂时无法合并.*磁盘已满/);
   const stopped = fixture({ mergeError: new Error('写入失败。') });
   await stopped.mergeHistoricalDataSetsInBackground(stopped.context, mergeHost());
-  assert.match(stopped.calls.find(call => call[0] === 'warning')[1], /暂时无法合并：写入失败。已有数据未被修改/, '拼接处不出现“。。”');
+  assert.match(stopped.calls.find(call => call[0] === 'warning')[1], /暂时无法合并：写入失败。已完成的合并保留/, '拼接处不出现“。。”');
   const period = fixture({ mergeReport: emptyMergeReport({ deferred: [{ ...deferredIssue, message: '这个历史库正被其它窗口使用。' }] }) });
   await period.mergeHistoricalDataSetsInBackground(period.context, mergeHost());
-  assert.match(period.calls.find(call => call[0] === 'info')[1], /暂时无法合并（这个历史库正被其它窗口使用），以后启动时会自动重试/);
+  assert.match(period.calls.find(call => call[0] === 'info')[1], /暂时无法合并（这个历史库正被其它窗口使用），原数据保留，可以在“历史与存储管理”中重新核验并合并/);
   const obsolete = fixture();
   await obsolete.mergeHistoricalDataSetsInBackground(obsolete.context, mergeHost(), () => false);
   assert.equal(obsolete.calls.some(call => call[0] === 'merge-online'), false);
@@ -617,6 +630,13 @@ test('外来历史库合并：通知与日志用可读名称，并提示这份�
   assert.ok(notice.endsWith(`${label}合并时跳过了 2 个你删除过的对话，它们只在这份里还有，所以“清理备份”会保留这份；确实不再需要时请手动删除。`), notice);
   assert.ok(!notice.includes('可以在“清理备份”里按覆盖核对后删除'), '不再说可以按覆盖删除');
 
+  const partial = fixture({ mergeReport: emptyMergeReport({ merged: [mergedOld({ candidateId: id, label,
+    excluded: [{ conversationId: 'conflict', title: '未能合并', code: 'conflict', count: 1 }] })] }) });
+  await partial.mergeHistoricalDataSetsInBackground(partial.context, mergeHost(), () => true, [id]);
+  const partialNotice = partial.calls.find(call => call[0] === 'info')[1];
+  assert.match(partialNotice, /未能合并，原数据保留/);
+  assert.doesNotMatch(partialNotice, /可以在“清理备份”里按覆盖核对后删除/);
+
   const refused = fixture({ confirmation: '查看原因', mergeReport: emptyMergeReport({ blocked: [{
     candidateId: id, label, code: 'runtime-data-set-merge-foreign-old-copy', message: '这个外来历史库是当前历史的旧拷贝。', newly: true, requested: true
   }] }) });
@@ -640,7 +660,7 @@ test('盲审 merge #4：明确合并时已合并、没有新内容也有回应�
   assert.deepEqual(await explicit(emptyMergeReport({ merged: [{ ...already, mergedByAnotherWindow: true }] })), ['旧数据已由另一个窗口合并到当前历史。'],
     '盲审2 #7：另一个窗口刚合并了它，不说“没有新内容”');
   assert.deepEqual(await explicit(emptyMergeReport()), ['这次没有需要合并的旧数据。']);
-  assert.deepEqual(await explicit(emptyMergeReport({ stopped: true })), [], '停止（窗口关闭或切库）时不回应');
+  assert.deepEqual(await explicit(emptyMergeReport({ stopped: true })), ['合并已取消，已完成的合并保留，其余旧数据仍保留在原位置。']);
 
   const quiet = fixture({ mergeReport: emptyMergeReport() });
   await quiet.mergeHistoricalDataSetsInBackground(quiet.context, mergeHost());
@@ -662,7 +682,7 @@ test('跨模块盲审 #7：磁盘空间不足的推迟只在新原因出现时�
     return f.calls.filter(call => ['warning', 'info'].includes(call[0])).map(call => call[1]);
   };
   assert.deepEqual(await notices(full(120)),
-    ['有 1 份旧聊天记录暂时无法合并（磁盘空间不足，需要约 120 MB：合并前要先在 /fixture/current 备份当前历史），以后启动时会自动重试。']);
+    ['有 1 份旧聊天记录暂时无法合并（磁盘空间不足，需要约 120 MB：合并前要先在 /fixture/current 备份当前历史），原数据保留，可以在“历史与存储管理”中重新核验并合并。']);
   assert.deepEqual(await notices(full(121)), [], '之后每次启动同一原因都不再提示');
 });
 
@@ -853,22 +873,88 @@ async function settle(done) {
   assert.equal(f.calls.some(call=>['pick','select'].includes(call[0])),false);
 });
 
+test('明确合并先启动 Runtime、残留重试限定来源，在线取消停止后续，重载前原因等待读完', async () => {
+  const host = { ...mergeHost(), large: true };
+  const f = fixture({ waitApplication: async () => host, mergeHook: async options => {
+    assert.equal(options.requested, true);
+    assert.equal(options.candidateIds, undefined);
+    assert.equal(options.coordinateOversized, undefined);
+    return emptyMergeReport({ blocked: [{ candidateId: 'workspace:old', newly: false,
+      code: 'runtime-data-set-merge-conflict', message: '同一份旧数据仍有冲突' }] });
+  } });
+  const handlers = new Map();
+  const commands = loadSource('vscode/commands/registerCommands.ts', {
+    vscode: { commands: { registerCommand: (id, handler) => { handlers.set(id, handler); return { dispose() {} }; } },
+      window: { showErrorMessage: async message => f.calls.push(['error', message]) } },
+    '../panels/MainPanel': { MainPanel: {} },
+    '../../shared/extensionIdentity': { EXTENSION_BRAND: 'Limcode Test', EXTENSION_COMMAND_IDS: new Proxy({}, { get: (_, name) => String(name) }) },
+    './runtimeDataSetManagement': f
+  });
+  commands.registerCommands(f.context, f.startup);
+  await handlers.get('mergeAllRuntimeHistory')();
+  assert.ok(f.calls.findIndex(call => call[0] === 'startup-wait') < f.calls.findIndex(call => call[0] === 'merge-online'));
+  assert.match(f.calls.find(call => call[0] === 'warning')[1], /未能合并到当前历史/);
+  assert.equal(f.calls.some(call => ['converge', 'exclusive', 'command', 'error'].includes(call[0])), false);
+
+  const retry = fixture({ picks: [action('residual')], application: host, residualRetryId: 'workspace:old', mergeHook: async options => {
+    assert.deepEqual(plain(options.candidateIds), ['workspace:old']);
+    assert.equal(options.requested, true);
+    assert.equal(options.coordinateOversized, undefined);
+    return emptyMergeReport({ deferred: [{ candidateId: 'workspace:old', code: 'runtime-data-set-merge-awaiting-exclusive', message: '等待流式合并' }] });
+  } });
+  await retry.manageRuntimeDataSets(retry.context, retry.startup);
+  assert.deepEqual(retry.calls.find(call => call[0] === 'converge'), ['converge', ['workspace:old']]);
+
+  const cancelled = fixture({ application: host, mergeHook: async options => {
+    cancelled.cancelProgress();
+    assert.equal(options.shouldContinue(), false);
+    assert.equal(options.signal.aborted, true);
+    return emptyMergeReport({ merged: [mergedOld()], deferred: [{ candidateId: 'workspace:large',
+      code: 'runtime-data-set-merge-awaiting-exclusive', message: '等待流式合并' }] });
+  } });
+  await cancelled.mergeAllRuntimeHistory(cancelled.context, cancelled.startup);
+  assert.equal(cancelled.calls.find(call => call[0] === 'progress')[1].cancellable, true);
+  assert.ok(cancelled.calls.some(call => call[0] === 'info' && /新增 1 个对话/.test(call[1])));
+  assert.ok(cancelled.calls.some(call => call[0] === 'info' && /合并已取消，已完成的合并保留/.test(call[1])));
+  assert.equal(cancelled.calls.some(call => ['converge', 'exclusive', 'command'].includes(call[0])), false);
+
+  let closeResult;
+  const acknowledgement = new Promise(resolve => { closeResult = resolve; });
+  const streamed = fixture({ application: { ...host, dataRootPath: () => '/fixture' }, informationChoice: acknowledgement,
+    mergeReport: emptyMergeReport({ deferred: [{ candidateId: 'workspace:large', code: 'runtime-data-set-merge-awaiting-exclusive', message: '等待流式合并' }] }),
+    streamedReport: emptyMergeReport({ deferred: [{ candidateId: 'workspace:large', label: '这份旧数据', code: 'source-changed', message: '具体推迟原因' }] }) });
+  let finished = false;
+  const reporting = streamed.mergeAllRuntimeHistory(streamed.context, streamed.startup).then(() => { finished = true; });
+  for (let i = 0; i < 10 && !streamed.calls.some(call => call[2]?.modal); i += 1) await new Promise(setImmediate);
+  const resultNotice = streamed.calls.find(call => call[2]?.modal);
+  assert.equal(resultNotice[2].modal, true);
+  assert.match(resultNotice[2].detail, /这份旧数据\n\[source-changed\] 具体推迟原因/);
+  assert.equal(finished, false, '重载前保留可读结果，等待这条通知结束');
+  closeResult('重载窗口');
+  await reporting;
+});
+
 for (const mode of ['success','cancelled-preparation','merge-failed']) test(`直接合并入口 ${mode}：释放准备、取消不关闭、关闭后重载`, async () => {
   const events=[];
+  let cancelProgress;
   const context={workspaceState:{}};
   const host={product:{application:{database:{}}},hasOwnedExecution:async()=>false,
     exclusiveMaintenanceTarget:()=>({paths:{dataRootPath:'/current'},hostBootId:'host'}),dataRootPath:()=>'/fixture',
     withDataRootLocks:async body=>body(),freezeNewWork:()=>()=>events.push('thaw'),closeRuntime:async()=>events.push('close'),
     writeGate:{admit(){events.push('admit');}}};
   const prepared={target:{dataSetId:'target',rootInstanceId:'instance'},
-    sources:mode==='cancelled-preparation'?[]:[{candidateId:'old'}],report:emptyMergeReport({stopped:mode==='cancelled-preparation'})};
+    sources:[{candidateId:'old'}],report:emptyMergeReport(mode!=='cancelled-preparation'?{
+      blocked:[{candidateId:'unready',code:'source-conflict',message:'准备阶段的具体原因'}]
+    }:{})};
   const dependencies={
     vscode:{ProgressLocation:{Notification:1},window:{showInformationMessage:async()=>{},showWarningMessage:async()=>{},
-      withProgress:async(_options,body)=>body({report(){}},{onCancellationRequested:()=>({dispose(){}})})},
+      withProgress:async(_options,body)=>body({report(){}},{onCancellationRequested:listener=>{
+        cancelProgress=listener;return {dispose(){cancelProgress=undefined;}};
+      }})},
       commands:{executeCommand:async name=>events.push(name)}},
     '../../backend/application/reliableKernel/historicalMergeSettlement':{settleHistoricalMergeSourceOffline:async()=>{}},
     '../../backend/reliableKernel/runtimeDataSetStreamedMerge':{
-      prepareLargeMergeSources:async()=>{events.push('prepare');return prepared;},
+      prepareLargeMergeSources:async()=>{events.push('prepare');if(mode==='cancelled-preparation')cancelProgress();return prepared;},
       releaseLargeMergePreparation:async()=>events.push('release'),
       runLargeMergeSession:async()=>{events.push('merge');if(mode==='merge-failed')throw new Error('merge failed');return {results:[],cancelled:false};}},
     '../panels/MainPanel':{MainPanel:{saveComposerDrafts:()=>0}},
@@ -880,11 +966,29 @@ for (const mode of ['success','cancelled-preparation','merge-failed']) test(`直
     './runtimeHistorySettlement':{confirmRuntimeHistorySettlement:async()=>true}
   };
   const module=loadSource('vscode/commands/runtimeHistoryConvergence.ts',dependencies,{AbortController,setInterval,clearInterval,setTimeout});
-  const run=module.convergeRuntimeHistory(context,host,['old'],async()=>events.push('report'));
+  const run=module.convergeRuntimeHistory(context,host,['old'],async (batch,beforeReload)=>{
+    events.push('report');if(mode==='cancelled-preparation')assert.equal(batch.stopped,true);
+    assert.equal(beforeReload === true,mode !== 'cancelled-preparation');
+    if(mode!=='cancelled-preparation')assert.equal(batch.blocked[0].message,'准备阶段的具体原因');
+    if(mode==='merge-failed') {
+      assert.equal(batch.failures[0].code,'runtime-history-convergence-failed');
+      assert.match(batch.failures[0].message,/merge failed/);
+      assert.equal(batch.merged.length,0,'不把未知执行结果写成成功');
+    }
+  });
   if(mode==='merge-failed')await assert.rejects(run,/merge failed/);else await run;
   assert.equal(events.filter(e=>e==='release').length,1);
   assert.equal(events.filter(e=>e==='release-hold').length,1);
   assert.equal(events.includes('close'),mode!=='cancelled-preparation');
   assert.equal(events.includes('workbench.action.reloadWindow'),mode!=='cancelled-preparation');
-  if(mode==='success')assert.ok(events.indexOf('close')<events.indexOf('merge'));
+  if(mode==='cancelled-preparation') {
+    assert.equal(events.includes('report'),true);
+    assert.equal(events.includes('coordinate'),false);
+    assert.equal(events.includes('merge'),false);
+  }
+  if(mode==='success') {
+    assert.ok(events.indexOf('close')<events.indexOf('merge'));
+    assert.ok(events.indexOf('merge')<events.indexOf('report'));
+    assert.equal(events.filter(event=>event==='report').length,1);
+  }
 });

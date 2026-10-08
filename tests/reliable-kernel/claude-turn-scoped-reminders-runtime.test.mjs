@@ -155,6 +155,7 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, retryOnError
     facade.product = { application: app, configuration };
     facade.writeGate = new RuntimeWriteGate();
     facade.historyEntries = [];
+    facade.historyRevealEmitter = { fire() {} };
     facade.refreshConversationHistory = async () => {};
   };
   try {
@@ -250,6 +251,76 @@ function assertPlacement(entry, label) {
 }
 
 const systemContents = (entry) => entry.wire.messages.filter(message => message.role === 'system').map(message => message.content);
+
+test('活动 Turn 在新输入编译期间推进 Context 时重新准备并保留排队消息', { timeout: 180_000 }, async () => {
+  await withRuntime(async h => {
+    const command = key => ({ source: { kind: 'command', key }, conversationId: 'source',
+      leaseOwnerId: 'reminder-fixture-owner', hostBootId: h.app.database.hostBootId,
+      leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(), content: key });
+    const first = await h.app.turns.input(command('active-input'));
+    const [firstAuthority] = await rows(h.app, 'AuthoritySnapshot', { turn_id: first.turnId });
+    const initial = (await readFrozenTurnAuthority(h.app.database, h.app.contentStore, firstAuthority.id)).document.runtimeContext;
+    const compile = h.configuration.compile.bind(h.configuration);
+    let compiles = 0;
+    h.configuration.compile = async request => {
+      const compiled = await compile(request);
+      if (++compiles === 1) {
+        await h.app.context.appendContent({ conversationId: 'source', segmentKind: 'system',
+          source: { sourceKind: 'system', sourceId: 'running-turn-context-advance', sourceRevision: 0n },
+          content: 'Context advanced while the new input prepared', contentType: 'text/plain' });
+      }
+      return compiled;
+    };
+    const queued = await h.app.turns.input(command('queued-input'));
+    assert.equal(queued.admitted, false);
+    assert.equal(compiles, 2, 'a changed head triggers one fresh preparation instead of rejecting the input');
+    const [intent] = await rows(h.app, 'TurnIntent', { id: queued.intentId });
+    assert.equal(intent.state, 'queued');
+    const [authority] = await rows(h.app, 'TurnIntentAuthorityRevision', { intent_id: queued.intentId });
+    const [content] = await rows(h.app, 'ContentObject', { id: authority.authority_object_id });
+    const frozen = JSON.parse((await h.app.contentStore.read(content)).toString('utf8'));
+    assert.equal(frozen.runtimeContext.renderedTemplateText, initial.renderedTemplateText);
+    assert.equal((await rows(h.app, 'CommandReceipt', { source_key: 'queued-input' })).length, 1,
+      'repreparation keeps the same command and creates only one receipt');
+  });
+});
+
+test('初始模板在后续 Turn、重启和 fork 保留，最新系统规则与新对话的显式空模板分别生效', { timeout: 180_000 }, async () => {
+  await withRuntime(async h => {
+    await h.turn('source', 'start-work');
+    const initial = h.requests.at(-1).request.authoritySnapshot.runtimeContext;
+    assert.match(initial.renderedTemplateText, /Initial time: \d{4}-\d{2}-\d{2}T/);
+    await h.configuration.mutations.setRuntimeContext({ scopeKind: 'global', template: 'LATER TEMPLATE {{$runtime.timestamp}}' });
+    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'global', text: 'LATEST SYSTEM RULES' });
+    await h.turn('source', 'after-template-edit');
+    const changed = h.requests.at(-1).request.authoritySnapshot;
+    assert.equal(changed.runtimeContext.renderedTemplateText, initial.renderedTemplateText);
+    assert.equal(changed.runtimeContext.template, initial.template);
+    assert.match(changed.systemPrompt.text, /LATEST SYSTEM RULES/, '执行设置仍读取最新值');
+    await h.reopen();
+    await h.turn('source', 'after-restart');
+    assert.equal(h.requests.at(-1).request.authoritySnapshot.runtimeContext.renderedTemplateText, initial.renderedTemplateText);
+    const fork = await h.facade.forkConversation({ ...(await h.lastMessage('source', 'model')), command: { commandId: 'fork-initial-context' } });
+    await h.turn(fork.conversationId, 'in-fork');
+    assert.equal(h.requests.at(-1).request.authoritySnapshot.runtimeContext.renderedTemplateText, initial.renderedTemplateText);
+    await h.configuration.mutations.setRuntimeContext({ scopeKind: 'global', template: '' });
+    await h.turn('source', 'after-template-cleared');
+    assert.equal(h.requests.at(-1).request.authoritySnapshot.runtimeContext.renderedTemplateText, initial.renderedTemplateText,
+      '后来保存空模板不会清除已有初始事实');
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source' });
+    const now = new Date().toISOString();
+    await h.app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({ id: 'fresh-context', title: 'Fresh', status: 'active', created_at: now, updated_at: now }),
+      emptyConversationContextHandleStateStep('fresh-context', now),
+      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+        id: 'fresh-context-agent', conversation_id: 'fresh-context', agent_id: agent.agent_id, role: 'default', created_at: now, updated_at: now
+      })
+    ]);
+    await h.turn('fresh-context', 'fresh-input');
+    assert.equal(h.requests.at(-1).request.authoritySnapshot.runtimeContext.renderedTemplateText, '');
+    assert.equal(h.requests.at(-1).request.authoritySnapshot.runtimeContext.template, '');
+  });
+});
 
 test('Claude 多轮工具循环：每次请求都是下一次的前缀，提醒原文原位、只显示最后一段，并经受重启、fork 与压缩', { timeout: 180_000 }, async () => {
   await withRuntime(async h => {

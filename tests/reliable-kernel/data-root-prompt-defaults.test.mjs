@@ -48,7 +48,7 @@ test('确认面板的勾选框：命令默认勾选（checked）的项一打开�
     assert.deepEqual(store.include, [], '没有勾选框的面板从空开始');
     deliver({
       flowId: 'flow-3', title: '清理备份：勾选要删除的备份',
-      sections: [{ title: '外来历史库（1 项）', lines: [], options: [{ key: 'unticked', label: 'e' }] }], actions: []
+      sections: [{ title: '已合并来源（1 项）', lines: [], options: [{ key: 'unticked', label: 'e' }] }], actions: []
     });
     assert.deepEqual(store.include, [], '没有 checked 的项不勾');
     const superseded = posted.filter((message) => message.type === 'dataRoot.action').at(-1);
@@ -61,9 +61,10 @@ test('确认面板的勾选框：命令默认勾选（checked）的项一打开�
 });
 
 // 盲审 #2: the hint beside 清理备份… in the settings page (其他 → 数据目录) says what the cleanup does
-// (AGENTS.md, 备份清理): verified foreign history is deletable too, the coverage it proves, which copies
-// are ticked by default and which are listed apart; copied directories themselves are never deleted.
-test('设置页“清理备份…”旁的说明与实际行为一致：核验通过的外来历史库也可以删除，写明覆盖口径、默认勾选与单列的一组', async () => {
+// (AGENTS.md, 备份清理): current history proves ordinary backup coverage; completed, unchanged
+// sources have their own deletion rule; retained data and new reset backups remain protected.
+// The first case above also keeps the prompt's checked-by-default behavior covered.
+test('设置页“清理备份…”旁的说明与实际行为一致：当前历史覆盖、已合并来源条件、残留保留与替换消息单列不勾选', async () => {
   const { createSSRApp } = await import('vue');
   const { renderToString } = await import('@vue/server-renderer');
   const pinia = await import('pinia');
@@ -88,14 +89,13 @@ test('设置页“清理备份…”旁的说明与实际行为一致：核验�
     assert.ok(hint, '找到数据目录一栏的说明');
     const cleanup = hint.slice(hint.indexOf('清理备份'));
     for (const phrase of [
-      '清理备份只删除能证明内容已完整在本地库里的副本',
-      '升级前、合并前与合并来源的收尾前备份，以及核验通过的外来历史库（“归档并重置”的归档、以前的数据目录里的归档和拷来目录里的库）',
-      '每个对话、消息版本和工具调用、输出、回答等记录都要还在当前库或同一数据目录的某个历史库里，正文文件也在，副本里显示的每条消息在那里也显示同一个版本',
-      '含有别处没有的对话或记录的一律保留',
-      '内容完整的默认勾选；有消息在那里已被你删除、编辑或重试替换的单独列出，默认不勾选',
-      '拷来目录本身和其中的设置、规则、技能不会被删除'
+      '清理备份先检查再确认',
+      '普通备份只由当前历史证明记录、正文和可见消息完整覆盖',
+      '已合并来源须完整合并且未改变，待合并、部分合并和残留数据保留',
+      '仅在备份里仍可见的已删除、编辑或替换消息单独列出，默认不勾选',
+      '新的归档重置备份不会自动删除'
     ]) assert.ok(cleanup.includes(phrase), `说明里没有“${phrase}”：${cleanup}`);
-    assert.doesNotMatch(cleanup, /只列出/, '归档和拷来目录里的库不再只列出');
+    assert.doesNotMatch(cleanup, /当前库或同一数据目录的某个历史库|核验通过的外来历史库/, '不恢复跨库覆盖或外来来源一概可删除的旧口径');
   } finally {
     await server?.close();
     globalThis.window = previousWindow;

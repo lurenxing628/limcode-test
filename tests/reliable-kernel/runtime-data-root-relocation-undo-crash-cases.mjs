@@ -1,10 +1,10 @@
-// Real SIGKILL at every durable step of a relocation and inside the undo itself (reloc2 review's 72
-// points plus the undo's own steps), then what the next startup does: the undo is always finished
-// (whatever the first kill or the interrupted undo left), the target is exactly as before, copied
-// data renamed aside is back, and the target receives the relocation again (also after a kill between
+// Real SIGKILL at the retained relocation and undo checkpoints, then what the next startup does:
+// with file ownership evidence the undo finishes, the target is exactly as before, copied data
+// renamed aside is back, and the target receives the relocation again (also after a kill between
 // the merge's commit and the journal entry of its fingerprint: the rows journaled before the commit
-// show that only the relocation wrote there). The old directory is
-// never touched. Child: runtime-data-root-relocation-undo-crash-child.mjs; runs against the compiled dist.
+// show that only the relocation wrote there). A kill before file after-state evidence is durable
+// instead holds the relocation, preserves the target and its backups, and leaves the old directory
+// usable. Child: runtime-data-root-relocation-undo-crash-child.mjs; runs against the compiled dist.
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
@@ -31,13 +31,48 @@ function child(base, scenario, kind, phase) {
 // a dead process's record never counts as online. The receiving CAS is compared too: what the
 // relocation added there goes with the undo.
 const noise = (file) => /\.runtime-(maintenance|admission)/.test(file) || file.endsWith('-shm') || /[\\/]host-liveness[\\/]/.test(file);
-function diffSnapshots(before, after) {
-  const keys = new Set([...Object.keys(before), ...Object.keys(after)].filter((key) => !noise(key)));
+function diffSnapshots(before, after, ignore = noise) {
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)].filter((key) => !ignore(key)));
   const diff = [];
   for (const key of [...keys].sort()) {
     if (before[key] !== after[key]) diff.push(`${key}: ${before[key] ? 'changed/removed' : 'added'}`);
   }
   return diff;
+}
+
+const covers = (parent, file) => {
+  const relative = path.relative(parent, file);
+  return !relative || (!path.isAbsolute(relative) && relative !== '..' && !relative.startsWith(`..${path.sep}`));
+};
+
+/** Only a missing file after-state permits held in this matrix; a changed database/file never does. */
+async function assertMissingFilesystemEvidence(target, relocationId, marker) {
+  const prefixes = [
+    '没有记下本次迁移写完后的文件状态，无法安全撤销：',
+    '没有记下上次恢复后的文件状态，无法安全继续撤销：',
+    '恢复副本已经不在，但没有记下恢复后的文件状态，无法安全继续撤销：'
+  ];
+  const reason = marker.held?.reason ?? '';
+  const prefix = prefixes.find(value => reason.startsWith(value));
+  assert.ok(prefix, `只允许明确缺少文件写后/恢复状态的窗口搁置：${reason}`);
+  const file = reason.slice(prefix.length);
+  assert.ok(covers(target, file) && path.resolve(file) !== path.resolve(target), '缺少证据的路径在目标目录内');
+  const work = path.join(target, relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, relocationId);
+  const entries = (await fs.readFile(path.join(work, 'journal.jsonl'), 'utf8')).trim().split('\n').filter(Boolean).map(line => JSON.parse(line));
+  const changes = entries.filter(entry => ['entry', 'replace', 'children'].includes(entry.op) && path.join(target, entry.path) === file);
+  assert.ok(changes.length > 0, '日志确实记录了该路径的创建、替换或子项修改');
+  const applicable = [];
+  for (const entry of entries) if (entry.op === 'filesystem' && covers(path.join(target, entry.path), file)) {
+    if (!entry.backup || !await fs.stat(path.join(work, entry.backup)).then(() => true, () => false)) applicable.push(entry);
+  }
+  if (prefix === prefixes[0]) assert.equal(applicable.length, 0, '该路径确实没有已写入的文件状态');
+  else {
+    assert.equal(applicable.filter(entry => entry.backup).length, 0, '该路径确实没有已恢复的文件状态');
+    const replacements = changes.filter(entry => entry.op === 'replace');
+    assert.ok(replacements.length > 0, '被替换文件需要恢复证据');
+    for (const entry of replacements) await assert.rejects(fs.stat(path.join(work, entry.backup)), { code: 'ENOENT' });
+  }
+  assert.ok((await fs.stat(work)).isDirectory(), '缺少证据时保留迁移撤销副本目录');
 }
 
 async function assertOldHomeIntact(root) {
@@ -95,6 +130,11 @@ export function registerRelocationUndoCrashTests(group) {
       if (undoPoint === 'undo-marked') assert.equal((await notice())?.relocationId, noticeWritten ? relocationId : undefined, '记下撤销中之后才删标记');
     }
     // Next startup (beforeDataRootOpen): the owner is gone.
+    const beforeRecovery = await treeSnapshot(target).catch(() => ({}));
+    const pointerBeforeRecovery = await fs.readFile(path.join(base, 'pointer.json'), 'utf8');
+    const noticeBeforeRecovery = await notice();
+    const markerBeforeRecovery = await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8')
+      .then(text => JSON.parse(text), error => { if (error.code === 'ENOENT') return undefined; throw error; });
     let outcome;
     try {
       outcome = await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId });
@@ -102,6 +142,21 @@ export function registerRelocationUndoCrashTests(group) {
       assert.fail(`下次启动撤销失败：${error?.code ?? ''} ${error?.message}\n${await log()}`);
     }
     t.diagnostic(`recover -> ${outcome}`);
+    if (outcome === 'held') {
+      const marker = JSON.parse(await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
+      assert.equal(marker.state, 'held');
+      await assertMissingFilesystemEvidence(target, relocationId, marker);
+      const { state: _oldState, held: _oldHeld, ...beforeFields } = markerBeforeRecovery;
+      const { state: _heldState, held: _held, ...afterFields } = marker;
+      assert.deepEqual(afterFields, beforeFields, 'held 只更新状态和原因');
+      const heldNoise = file => file === relocation.DATA_ROOT_RELOCATION_MARKER_FILE || /\.runtime-(maintenance|admission)/.test(file);
+      assert.deepEqual(diffSnapshots(beforeRecovery, await treeSnapshot(target), heldNoise), [], '搁置前后目标原样保留，包括所有迁移撤销副本');
+      assert.equal(await fs.readFile(path.join(base, 'pointer.json'), 'utf8'), pointerBeforeRecovery, '搁置不改旧目录指针与进行中记录');
+      assert.deepEqual(await notice(), noticeBeforeRecovery, '搁置不改旧目录迁走标记');
+      await relocation.assertDataRootAvailable(pointer.dataRootPath, pointer.dataRootId);
+      await assertOldHomeIntact(root);
+      return;
+    }
     assert.ok(outcome === 'recovered' || outcome === 'absent', outcome);
     await assertOldHomeIntact(root);
     assert.equal(await notice(), undefined, '撤销（包括续撤）删掉这次迁移写下的“已迁走”标记');

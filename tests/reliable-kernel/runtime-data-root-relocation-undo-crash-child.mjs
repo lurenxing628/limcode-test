@@ -13,9 +13,11 @@
 //   dbbackup-journal-after     rollback snapshot's database entry appended, synced and closed
 //   selection-after             after the selection file is written (fresh root)
 //   identity-after              after the identity file is written
+//   filesystem-ready            after all filesystem after-states are durable, before the completion marker
 //   complete-marker-after       after the completion record is written (before the moved notice)
 //   notice-after                after the old directory's moved notice is written (== before publish)
 //   publish-after               after the pointer switch
+//   filesystem-before-publish   source-only nested skill copied, before the pointer switch
 //   during-merge                killed inside the move: before the merge's row commit (existing target), after
 //                               the first committed batch (fresh root)
 //   undo-marked                 (phase recover) after the record was marked 'undoing', before any undo step
@@ -83,6 +85,9 @@ function installHooks() {
   fsp.rename = async function hookedRename(from, to, ...rest) {
     const toName = typeof to === 'string' ? path.basename(to) : '';
     if (point === 'dbbackup-before-rename' && typeof to === 'string' && path.basename(to) === 'database-receiving') kill('receiving database backup rename');
+    if (point === 'filesystem-ready' && phase === 'relocate' && toName === MARKER && markerWrites === 1) {
+      kill('filesystem after-states durable before completion marker');
+    }
     const result = await rename.call(this, from, to, ...rest);
     if (point === 'aside-after' && typeof to === 'string' && to.includes('.limcode-copied-')) kill('copied data renamed aside');
     if (toName === MARKER && phase === 'recover' && point === 'undo-marked') kill('undo: record marked undoing');
@@ -162,6 +167,11 @@ async function prepare() {
   await fsp.writeFile(path.join(fixture.root, 'CLAUDE.md'), '# source claude\n');
   await fsp.mkdir(path.join(fixture.root, 'skills', 'shared'), { recursive: true });
   await fsp.writeFile(path.join(fixture.root, 'skills', 'shared', 'SKILL.md'), 'source skill\n');
+  if (point === 'filesystem-before-publish') {
+    const nested = path.join(fixture.root, 'skills', 'source-only', 'references', 'nested');
+    await fsp.mkdir(nested, { recursive: true });
+    await fsp.writeFile(path.join(nested, 'details.md'), 'source nested skill reference\n');
+  }
   await writeRecordStore(path.join(fixture.root, 'settings'), 'llm-provider-configs', 'config', [
     { id: 'provider-shared', name: 'source', apiKey: 'sk-source' }, { id: 'provider-source-only', name: 'source only' }
   ]);
@@ -216,6 +226,7 @@ async function main() {
     // Its moved notice is written into the old directory right before the switch; an undo removes it.
     movedBy: { id: path.join(base, 'installation'), label: 'crash child' },
     publish: async ({ dataRootId }) => {
+      if (point === 'filesystem-before-publish') kill('completed filesystem copy before pointer switch');
       await writeFileAtomicDurable(pointer, JSON.stringify({ dataRootPath: target, dataRootId }));
       if (point === 'publish-after') kill('pointer switch');
     }

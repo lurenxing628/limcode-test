@@ -4,14 +4,18 @@ import { normalizeDisplayPath } from '@shared/displayPath';
 
 type ReadFileMode = 'text' | 'attachment';
 
-interface ReadFileArgs {
+interface ReadFileItem {
   path?: string;
+  startLine?: number;
+  endLine?: number;
+}
+
+interface ReadFileArgs extends ReadFileItem {
   attachmentId?: string;
   attachmentRef?: string;
   pages?: string;
   mode?: ReadFileMode;
-  startLine?: number;
-  endLine?: number;
+  items?: ReadFileItem[];
 }
 
 interface ReadFileLineRecord {
@@ -37,21 +41,33 @@ interface ReadFileOutputRecord {
   nextPages?: unknown;
   mimeType?: unknown;
   sizeBytes?: unknown;
+  files?: unknown;
 }
 
 export const readFileToolDisplay: ToolDisplayResolver = (context) => {
   const args = readFileArgs(context.args);
-  const inputSections = readFileInputSections(args, context);
+  const inputSections = readFileInputSections(args);
   const outputSections = readFileOutputSections(args, context);
 
   return {
     headerIcon: IconFileDescription,
-    inputSections: inputSections ?? [],
+    inputSections,
     outputSections: outputSections ?? []
   };
 };
 
-function readFileInputSections(args: ReadFileArgs, context: ToolDisplayContext): ToolDisplaySection[] | undefined {
+function readFileInputSections(args: ReadFileArgs): ToolDisplaySection[] {
+  if (args.items?.length && !normalizeDisplayPath(args.path) && !args.attachmentId && !args.attachmentRef) {
+    return args.items.flatMap((item) => {
+      const section = readFileInputSection(item, `读取参数 · ${normalizeDisplayPath(item.path)}`);
+      return section ? [section] : [];
+    });
+  }
+  const section = readFileInputSection(args);
+  return section ? [section] : [];
+}
+
+function readFileInputSection(args: ReadFileArgs, title = '读取参数'): ToolDisplaySection | undefined {
   const path = normalizeDisplayPath(args.path);
   const attachmentId = normalizedText(args.attachmentId);
   const attachmentRef = normalizedText(args.attachmentRef);
@@ -68,15 +84,25 @@ function readFileInputSections(args: ReadFileArgs, context: ToolDisplayContext):
     { label: '行范围', value: !attachmentId && !attachmentRef && args.mode !== 'attachment' ? lineRangeText(args.startLine, args.endLine) : undefined }
   ]);
 
-  return rows.length > 0
-    ? [{ kind: 'input', title: '读取参数', rows, rowStyle: 'keyValue' }]
-    : [{ kind: 'input', title: '输入', text: context.stringifyValue(context.args) }];
+  return { kind: 'input', title, rows, rowStyle: 'keyValue' };
 }
 
 function readFileOutputSections(args: ReadFileArgs, context: ToolDisplayContext): ToolDisplaySection[] | undefined {
   if (context.result === undefined) return undefined;
 
   const output = toolOutput(context.result);
+  const record = outputRecord(output);
+  if (Array.isArray(record?.files)) {
+    return record.files.flatMap((file, index) => {
+      const section = readFileResultSection(args.items?.[index] ?? {}, file);
+      return section ? [section] : [];
+    });
+  }
+  const section = readFileResultSection(args, output);
+  return section ? [section] : undefined;
+}
+
+function readFileResultSection(args: ReadFileArgs, output: unknown): ToolDisplaySection | undefined {
   const record = outputRecord(output);
   const path = normalizeDisplayPath(record?.path) || normalizeDisplayPath(args.path);
   const attachmentId = normalizedText(record?.attachmentId) || normalizedText(args.attachmentId);
@@ -86,30 +112,37 @@ function readFileOutputSections(args: ReadFileArgs, context: ToolDisplayContext)
   const pagesSuffix = normalizedText(record?.returnedPages) || args.pages
     ? `[pages ${normalizedText(record?.returnedPages) ?? args.pages}]`
     : '';
-  const rangeSuffix = mode === 'attachment' || attachmentId
+  const hasNoReturnedLines = record?.startLine !== undefined && record.endLine !== undefined
+    && record.endLine < record.startLine;
+  const rangeSuffix = mode === 'attachment' || attachmentId || hasNoReturnedLines
     ? ''
     : lineRangeSuffix(record?.startLine ?? args.startLine, record?.endLine ?? args.endLine);
   const title = displaySource
     ? `读取结果 · ${displaySource}${modeSuffix}${pagesSuffix}${rangeSuffix}`
     : '读取结果';
 
-  const section = readFileOutputSection(title, output);
-  if (!section) return undefined;
-
-  return [section];
+  return readFileOutputSection(title, output);
 }
 
 function readFileArgs(value: unknown): ReadFileArgs {
   const record = asRecord(value);
   if (!record) return {};
   return {
-    path: stringValue(record.path),
+    ...readFileItem(record),
     attachmentId: normalizedText(record.attachmentId),
     attachmentRef: normalizedText(record.attachmentRef),
     pages: normalizedText(record.pages),
     mode: readFileMode(record.mode),
-    startLine: numberValue(record.startLine),
-    endLine: numberValue(record.endLine)
+    items: Array.isArray(record.items) ? record.items.map(readFileItem) : undefined
+  };
+}
+
+function readFileItem(value: unknown): ReadFileItem {
+  const record = asRecord(value);
+  return {
+    path: stringValue(record?.path),
+    startLine: numberValue(record?.startLine),
+    endLine: numberValue(record?.endLine)
   };
 }
 

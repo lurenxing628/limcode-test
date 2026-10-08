@@ -52,12 +52,43 @@ for (const [scenario, kind] of [
   ['before-complete-marker', 'limcode'],
   ['before-publish', 'limcode']
 ]) {
-  test(`SIGKILL ${scenario}（${kind === 'empty' ? '空目标' : '已有 LimCode 目标'}）：指针不动，下次启动按进行中记录撤销新目录里的改动、清理临时副本，之后可以再次迁移`, async (t) => {
+  test(`SIGKILL ${scenario}（${kind === 'empty' ? '空目标' : '已有 LimCode 目标'}）：${scenario === 'config-index'
+    ? '指针不动，缺少配置写后状态时保留目标与撤销副本，旧目录仍可使用'
+    : '指针不动，下次启动按进行中记录撤销新目录里的改动、清理临时副本，之后可以再次迁移'}`, async (t) => {
     const run = await runChild(t, scenario, kind);
     assert.equal(run.signal, 'SIGKILL', run.log);
     const { root, target, relocationId, pid } = run.fixture;
     assert.equal(run.pointer.dataRootPath, root, '指针仍是旧目录');
     assert.equal(run.pointer.pendingRelocation?.relocationId, relocationId);
+
+    if (scenario === 'config-index') {
+      // This real kill occurs before configuration transfer can publish its after-state evidence.
+      const work = path.join(target, '.limcode-relocation-backups', relocationId);
+      const journalFile = path.join(work, 'journal.jsonl');
+      const journal = await fs.readFile(journalFile, 'utf8');
+      const entries = journal.trim().split('\n').map(line => JSON.parse(line));
+      assert.ok(entries.some(entry => entry.op === 'replace' && entry.path === path.join('agents', 'index.json')));
+      assert.equal(entries.some(entry => entry.op === 'filesystem' && (entry.path === 'agents'
+        || entry.path.startsWith(`agents${path.sep}`))), false, '已改动的配置尚无写后状态证据');
+      const files = [
+        path.join(target, 'agents', 'index.json'),
+        path.join(target, 'agents', 'records', 'agent-shared.json'),
+        path.join(target, 'agents', 'records', 'agent-source-only.json'),
+        path.join(work, 'configuration', 'agents', 'index.json'),
+        path.join(work, 'configuration', 'agents', 'records', 'agent-shared.json')
+      ];
+      const before = await Promise.all(files.map(file => fs.readFile(file)));
+      assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
+      const marker = JSON.parse(await fs.readFile(path.join(target, '.limcode-data-root-relocation.json'), 'utf8'));
+      assert.equal(marker.state, 'held');
+      assert.match(marker.held.reason, /^没有记下本次迁移写完后的文件状态，无法安全撤销：/);
+      assert.deepEqual(await Promise.all(files.map(file => fs.readFile(file))), before, '无证据时目标配置与撤销副本原样保留');
+      assert.equal(await fs.readFile(journalFile, 'utf8'), journal, '没有盲撤销配置');
+      assert.deepEqual(conversationIds((await selectedDataSet(target)).runtimeDataRootPath), ['conversation_existing_1']);
+      await sweepDataRootRelocationLeftovers(root);
+      await assertOldHomeIntact(root);
+      return;
+    }
 
     if (kind === 'limcode' && scenario === 'before-complete-marker') {
       // Published insert-only journals did not have an `updated` field. They remain readable;

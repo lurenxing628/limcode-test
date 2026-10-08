@@ -48,9 +48,10 @@ import { summarizeRuntimeDataSet } from './runtimeDataSetPreflight';
 import { RUNTIME_EPOCH_MIGRATION_BACKUPS_DIRECTORY } from './runtimeEpochMigration';
 import { foreignRuntimeHistoryId } from './runtimeForeignHistory';
 import { liveForeignRuntimeHistoryViews } from './runtimeForeignHistoryViews';
-import { readRuntimeHistoryPending,readRuntimeHistoryResidual,runtimeHistoryRegistryFile,type RuntimeHistoryPending } from './runtimeHistoryRegistry';
+import { readRuntimeHistoryPending,readRuntimeHistoryResidual,runtimeHistoryRegistryFile,type RuntimeHistoryPending,type RuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import {
 assertRuntimeHostsOffline,
+runtimeHostLivenessDirectory,
 withRuntimeDataRootAdmission,withRuntimeMaintenance
 } from './runtimeHostControl';
 import type { ForeignRuntimeRootLocation } from './runtimeLocatedRoot';
@@ -541,6 +542,8 @@ type JournalEntry =
    * changes gives back `before`, and every updated row still matches its after image.
    */
   | { op: 'merging'; path: string; inserted: Array<[domain: string, id: string]>; updated: RelocationHandleStateUpdate[] }
+  /** Filesystem state after a completed write, used to prove ownership before undoing it. */
+  | { op: 'filesystem'; path: string; state: Record<string, string>; backup?: string; removed?: true }
   /** An existing directory: an undo removes every entry of it that is not in `keep`. */
   | { op: 'children'; path: string; keep: string[] };
 
@@ -724,7 +727,7 @@ export async function planDataRootRelocation(input: {
   // Listed by directory, not by data set: a scope whose data set was deleted keeps its archives too.
   const archives = await countResetArchives(sourceRootPath);
   if (archives > 0) {
-    warnings.push(`旧目录里有 ${archives} 份“归档并重置”留下的归档（含当时的对话）。归档不会迁移，留在旧目录；迁移之后它们列在“历史与存储管理 → 外来历史库”里，核验通过的可以只读查看；删除旧目录时默认保留。`);
+    warnings.push(`旧目录里有 ${archives} 份“归档并重置”留下的归档（含当时的对话）。归档不会迁移，留在旧目录；迁移之后可在“历史与存储管理”中处理，未能合并的内容保留在残留列表中；删除旧目录时默认保留。`);
   }
   const resetBackups = await resetBackupDirectories(sourceRootPath);
   if (resetBackups.length > 0) warnings.push('旧目录里的重置备份不迁移，仍可在“未能合并的旧数据”中查看；删除旧目录时保留。');
@@ -763,7 +766,7 @@ export async function planDataRootRelocation(input: {
       const receiving = target.kind === 'limcode' ? await resolveVscodeRuntimeDataSet({ globalStoragePath: targetRootPath }, target.receivingId) : undefined;
       await planMergeRecordsCarry(sourceRootPath, targetRootPath, [
         { from: mergeIdentity(current), ...(receiving ? { to: mergeIdentity(receiving) } : {}) }
-      ], { relocationId: 'plan', at: new Date().toISOString(), preflight: true });
+      ], { relocationId: 'plan', at: new Date().toISOString(), preflight: true, inspection });
     } catch (error) {
       problems.push(errorMessage(error));
     }
@@ -850,7 +853,7 @@ export function describeEarlierMovedWork(work: DataRootEarlierMovedWork): string
     ...work.dataSets.map((item) => `历史库“${item.label}”${item.unreadable ? '（现在读不出来，无法收尾）' : ''}：${conversations(item)}`),
     work.dataSets.some((item) => item.unreadable)
       ? '读不出来的历史库要等它能读了才能收尾；在这之前不能迁移。'
-      : '可以在迁移确认框里选“先把这些任务按中止收尾，再迁移”；也可以先在这里打开它们（“历史与存储管理”里切换为当前历史库，打开时会先收尾），再迁移。'
+      : '可以在迁移确认框里选“先把这些任务按中止收尾，再迁移”。'
   ];
 }
 
@@ -1230,6 +1233,7 @@ async function prepareReceivingRoot(plan: DataRootRelocationPlan, journal: Reloc
   const runtimeDataRootPath = await createDataSetRoot(target, plan.current.id, journal);
   const authority = createVscodeRootAuthority({ runtimeDataRootPath, configurationRootPath: target });
   const binding = await withRuntimeMaintenance(authority.expectedPaths(), () => initializeEmptyRuntimeRoot(authority));
+  await journal.captureFilesystemChanges(binding.paths);
   return { id: plan.current.id, runtimeDataRootPath, binding };
 }
 
@@ -1352,6 +1356,7 @@ export async function completeDataRootRelocation(
       const { fingerprint: currentFingerprint, work: currentWork } = await dataSetFingerprintWithWork(current);
       options.onProgress?.('正在复制设置、全局规则和技能');
       const configuration = await transferConfiguration(source, target, journal);
+      await journal.captureFilesystemChanges(staged.receiving.binding.paths);
       options.onProgress?.('正在迁移当前历史库');
       let migrationBackupPath: string | undefined;
       if (plan.target.kind === 'limcode') {
@@ -1366,30 +1371,13 @@ export async function completeDataRootRelocation(
       const receivingFingerprint = await dataSetFingerprint(await resolveVscodeRuntimeDataSet({ globalStoragePath: target }, staged.receiving.id));
       await journal.append({ op: 'received', path: path.relative(target, staged.receiving.runtimeDataRootPath), fingerprint: receivingFingerprint });
       await copyDebugCaptures(current.runtimeDataRootPath, staged.receiving.runtimeDataRootPath, target, journal);
+      await journal.captureFilesystemChanges(staged.receiving.binding.paths);
 
       // After the merges (they read the receiving data set's own deletion records): what merges into the
       // data sets here must never bring back, and whose continuation each changed identity is.
       options.onProgress?.('正在带上删除记录、合并记录和身份延续');
       const carry = await planMergeRecordsCarry(source, target, [{ from: mergeIdentity(current), to: mergeIdentity(receivingFingerprint) }],
-        { relocationId: staged.relocationId, at: new Date().toISOString() });
-      for (const { id } of plan.others) {
-        const base = source;
-        const candidate = await resolveVscodeRuntimeDataSet({ globalStoragePath: base }, id);
-        const record: RuntimeHistoryPending = {
-          id: foreignRuntimeHistoryId({kind: 'copied', containerName: path.relative(base, path.dirname(candidate.runtimeDataRootPath)).split(path.sep).join('/'), dataRootRelativePath: 'active'}, candidate),
-          sourceKind: 'migration',
-          location: { kind: 'copied', containerPath: path.dirname(candidate.runtimeDataRootPath),
-            containerName: path.relative(base, path.dirname(candidate.runtimeDataRootPath)).split(path.sep).join('/'),
-            dataRootRelativePath: 'active', baseDataRootPath: base },
-          ...(candidate.dataSetId && candidate.rootInstanceId ? { identity: mergeIdentity(candidate) } : {}),
-          registeredAt: new Date().toISOString(), reason: '数据目录迁移带来的库'
-        };
-        const to = await runtimeHistoryRegistryFile({ globalStoragePath: target }, 'pending', record.id);
-        const previousWrite = carry.writes.findIndex((write) => write.to === to);
-        const write: MergeRecordsWrite = { kind: 'write', to, text: `${JSON.stringify(record, null, 2)}\n`, replaces: await pathExists(to) };
-        if (previousWrite < 0) carry.writes.push(write);
-        else carry.writes[previousWrite] = write;
-      }
+        { relocationId: staged.relocationId, at: new Date().toISOString(), inspection: await inspectVscodeRuntimeDataSets(sourcePaths) });
       await applyMergeRecordsCarry(target, carry, journal);
       await verifyMergeRecordsCarry(source, target, carry);
       // Only what really moved: the current data set and the others copied now (not those merged earlier or left behind).
@@ -1406,6 +1394,7 @@ export async function completeDataRootRelocation(
       }
       await journal.recordCreation(DATA_ROOT_IDENTITY_FILE);
       dataRootId = await ensureDataRootIdentity(target);
+      await journal.captureFilesystemChanges(staged.receiving.binding.paths);
       completed = {
         ...staging, state: 'complete', completedAt: new Date().toISOString(),
         migrated: [{
@@ -2027,7 +2016,7 @@ interface MergeRecordsCarry {
   deletionIdentities: RuntimeMergeIdentity[];
   keptClosures: Array<{ candidateId: string; closures: ReturnType<typeof runtimeDataSetMergeClosures> }>;
   continuations: Array<{ to: RuntimeMergeIdentity; continues: RuntimeMergeIdentity[] }>;
-  /** Exactly as the target must read them afterwards (a newer request the target had for the same source stays). */
+  /** Exactly as the target must read the carried settlement notes afterwards. */
   finalizations: RuntimeDataSetMergeFinalization[];
 }
 
@@ -2045,10 +2034,9 @@ function foreignHistory(): Promise<typeof import('./runtimeForeignHistory')> {
  * identity changes a continuation of its new identity: what the target kept for it, the old identity,
  * and what that one continued (chains expanded here, see readRuntimeMergeTargetIdentities). Without
  * it a copy of the old identity is no old copy any more and what the user deleted before the
- * relocation could be merged back. Recorded merge requests (their deadline kept) and finalization
- * notes follow the data sets they name, rewritten for the identities that change (a foreign root's
- * request for where the target finds it, see foreignLocationFrom); those of a data set that stays
- * behind stay with it there. A merge that is not finished into a data set that moves (committed or
+ * relocation could be merged back. Pending and residual sources keep their original identity and
+ * physical location; finalization notes follow the data set that actually moves. A merge that is
+ * not finished into a data set that moves (committed or
  * committing, its record not written yet) would never be finished once moved: refused, it finishes
  * at the next open of a window there. `movedAside`: the target's content is renamed aside first (a
  * copied target), so none of it counts. Throws DataRootRelocationError when something cannot be read.
@@ -2057,7 +2045,7 @@ async function planMergeRecordsCarry(
   source: string,
   target: string,
   continued: readonly ContinuedIdentity[],
-  options: { relocationId: string; at: string; movedAside?: boolean; preflight?: boolean }
+  options: { relocationId: string; at: string; movedAside?: boolean; preflight?: boolean; inspection: VscodeRuntimeDataSetInspection }
 ): Promise<MergeRecordsCarry> {
   const sourcePaths = { globalStoragePath: source };
   const targetPaths = { globalStoragePath: target };
@@ -2066,41 +2054,63 @@ async function planMergeRecordsCarry(
   const existing = async (file: string): Promise<Stats | undefined> => options.movedAside ? undefined : lstatOrUndefined(file);
   const writes: MergeRecordsWrite[] = [];
   const keptClosures: MergeRecordsCarry['keptClosures'] = [];
+  const registeredLocalSources = new Set<string>();
+  const registeredLocations: ForeignRuntimeRootLocation[] = [];
+  const queueRegistry = async (section: 'pending' | 'residual', record: RuntimeHistoryPending | RuntimeHistoryResidual, originalId = record.id): Promise<void> => {
+    let carried = record;
+    let to = await runtimeHistoryRegistryFile(targetPaths, section, carried.id);
+    const there = await existing(to);
+    if (there) {
+      if (!there.isFile()) throw mergeRecordsError(`新数据目录的历史登记不是普通文件（${to}）`);
+      if (isDeepStrictEqual(JSON.parse(await fs.readFile(to, 'utf8')), carried)) return;
+      carried = { ...carried, id: `migration:${options.relocationId}:${originalId}` };
+      to = await runtimeHistoryRegistryFile(targetPaths, section, carried.id);
+      if (await existing(to)) throw mergeRecordsError(`迁移历史登记的位置已经存在（${to}）`);
+    }
+    writes.push({ kind: 'write', to, text: `${JSON.stringify(carried, null, 2)}\n`, replaces: false });
+  };
 
   // Pending and residual records are authoritative; carry them through the same undo journal.
-  // Their locations stay at the old directory unless that exact data set was copied here.
+  // These are retained sources, not the identity continuation of the receiving Runtime.
   for (const section of ['pending', 'residual'] as const) {
     const records = section === 'pending' ? await readRuntimeHistoryPending(sourcePaths) : await readRuntimeHistoryResidual(sourcePaths);
     for (const [id, record] of records) {
       let carried = record;
-      const moved = record.identity && continued.find((entry) => sameRuntimeDataSetIdentity(entry.from, record.identity!));
       if (record.location.kind === 'local') {
-        if (!moved?.to) {
-          const candidate = await resolveVscodeRuntimeDataSet(sourcePaths, record.location.candidateId);
-          carried = { ...record, sourceKind: 'migration', location: { kind: 'copied', containerPath: path.dirname(candidate.runtimeDataRootPath), containerName: path.relative(source, path.dirname(candidate.runtimeDataRootPath)).split(path.sep).join('/'), dataRootRelativePath: 'active', baseDataRootPath: source } };
-        } else carried = { ...record, identity: moved.to };
-      } else if (record.sourceKind === 'migration' || record.sourceKind === 'local') {
-        if (moved?.to) {
-          const relative = path.relative(source, record.location.containerPath);
-          carried = { ...record, identity: moved.to, location: { ...record.location, containerPath: path.resolve(target, relative), baseDataRootPath: target } };
-        }
-      } else {
+        registeredLocalSources.add(record.location.candidateId);
+        carried = { ...record, sourceKind: 'migration', location: retainedLocalHistoryLocation(source, record.location.candidateId, options.inspection) };
+      } else if (!(record.location.kind === 'copied' && record.location.side === undefined)) {
         carried = { ...record, location: foreignLocationFrom(record.location, path.resolve(source), path.resolve(target)) };
       }
       if (carried.location.kind !== 'local' && carried.identity) {
         carried = { ...carried, id: foreignRuntimeHistoryId(carried.location, carried.identity) };
       }
-      let to = await runtimeHistoryRegistryFile(targetPaths, section, carried.id);
-      const there = await existing(to);
-      if (there) {
-        if (!there.isFile()) throw mergeRecordsError(`新数据目录的历史登记不是普通文件（${to}）`);
-        if (isDeepStrictEqual(JSON.parse(await fs.readFile(to, 'utf8')), carried)) continue;
-        carried = { ...carried, id: `migration:${options.relocationId}:${id}` };
-        to = await runtimeHistoryRegistryFile(targetPaths, section, carried.id);
-        if (await existing(to)) throw mergeRecordsError(`迁移历史登记的位置已经存在（${to}）`);
-      }
-      writes.push({ kind: 'write', to, text: `${JSON.stringify(carried, null, 2)}\n`, replaces: false });
+      if (carried.location.kind !== 'local') registeredLocations.push(carried.location);
+      await queueRegistry(section, carried, id);
     }
+  }
+  // A source discovered since startup must not vanish when only the current Runtime moves.
+  // Existing residuals keep their status; relocation does not ask to retry them.
+  for (const candidate of options.inspection.candidates) {
+    if (candidate.selected || registeredLocalSources.has(candidate.id) || !candidate.dataSetId || !candidate.rootInstanceId) continue;
+    const location = retainedLocalHistoryLocation(source, candidate.id, options.inspection);
+    const id = foreignRuntimeHistoryId(location, candidate);
+    if (registeredLocations.some(registered => isSamePath(registered.containerPath, location.containerPath))
+      || await existing(await runtimeHistoryRegistryFile(targetPaths, 'residual', id))) continue;
+    await queueRegistry('pending', {
+      id, sourceKind: 'migration', location, identity: mergeIdentity(candidate),
+      registeredAt: options.at, reason: '数据目录迁移带来的库'
+    });
+  }
+  for (const problem of options.inspection.problems) {
+    if (registeredLocalSources.has(problem.id)) continue;
+    const location = retainedLocalHistoryLocation(source, problem.id, options.inspection);
+    if (registeredLocations.some(registered => isSamePath(registered.containerPath, location.containerPath))) continue;
+    await queueRegistry('residual', {
+      id: `migration:${options.relocationId}:${problem.id}`, sourceKind: 'migration',
+      location,
+      code: problem.code ?? 'runtime-history-source-unreadable', message: problem.message, checkedAt: options.at
+    });
   }
   for (const name of ['settlement-consent.json', 'convergence.json']) {
     const from = path.join(sourceLedger, name);
@@ -2181,7 +2191,7 @@ async function planMergeRecordsCarry(
     writes.push({ kind: 'write', to: file, text: `${JSON.stringify({ version: 1, continues: entries }, null, 2)}\n`, replaces: await existing(file) !== undefined });
   }
 
-  // Merge requests and finalization notes follow their data sets (only once their new identity is known).
+  // Finalization notes follow their data sets (only once their new identity is known).
   const movedTo = (identity: { dataSetId: string; rootInstanceId: string }): RuntimeMergeIdentity | undefined | null => {
     const entry = continued.find((item) => sameRuntimeDataSetIdentity(item.from, identity));
     return entry ? entry.to ?? null : undefined;
@@ -2201,12 +2211,24 @@ async function planMergeRecordsCarry(
   return { writes, deletionIdentities, keptClosures, continuations, finalizations };
 }
 
+/** Use the inspected location even when a bad pointer prevents opening the retained source. */
+function retainedLocalHistoryLocation(source: string, id: string, inspection: VscodeRuntimeDataSetInspection): ForeignRuntimeRootLocation {
+  const inspected = inspection.candidates.find(candidate => candidate.id === id)
+    ?? inspection.problems.find(problem => problem.id === id);
+  const scope = inspected?.runtimeScopeRootPath ?? resolveVscodeRuntimeDataSetScopeRoot(source, id);
+  const containerPath = id === 'workspace-scopes' ? scope : path.dirname(resolveVscodeRuntimeDataRoot({ globalStoragePath: scope }));
+  return {
+    kind: 'copied', containerPath, containerName: path.relative(source, containerPath).split(path.sep).join('/'),
+    dataRootRelativePath: id === 'workspace-scopes' ? '' : 'active', baseDataRootPath: source
+  };
+}
+
 /**
  * Whether the old directory still finishes an interrupted commit of `candidateId` itself: a foreign
  * root's always (from the ledger and the target alone), a data set's while it is that source still.
  */
 async function finishesThere(paths: { globalStoragePath: string }, candidateId: string, source: RuntimeMergeIdentity): Promise<boolean> {
-  if (isForeignRuntimeHistoryId(candidateId)) return true;
+  if (isForeignRuntimeHistoryId(candidateId) || candidateId.startsWith('migration:') || candidateId.startsWith('reset:')) return true;
   const candidate = await resolveVscodeRuntimeDataSet(paths, candidateId).catch(() => undefined);
   return sameRuntimeDataSetIdentity(source, candidate);
 }
@@ -2355,6 +2377,8 @@ function mergeRecordsError(reason: string, cause?: unknown): DataRootRelocationE
 // Journal and undo
 
 class RelocationJournal {
+  private readonly filesystemChanges = new Set<string>();
+  private readonly keptChildren = new Map<string, readonly string[]>();
   private constructor(public readonly target: string, public readonly workDirectory: string) {}
 
   public static async create(target: string, relocationId: string): Promise<RelocationJournal> {
@@ -2391,6 +2415,21 @@ class RelocationJournal {
     } finally {
       await handle.close();
     }
+    if (entry.op === 'entry' || entry.op === 'replace' || entry.op === 'children') this.filesystemChanges.add(entry.path);
+    if (entry.op === 'children') this.keptChildren.set(entry.path, entry.keep);
+  }
+
+  public async captureFilesystemChanges(runtime: RootBinding['paths']): Promise<void> {
+    const paths = [...this.filesystemChanges].sort((left, right) => left.length - right.length);
+    const roots: string[] = [];
+    for (const relative of paths) {
+      if (roots.some(root => isSamePath(path.join(this.target, root), path.join(this.target, relative))
+        || isPathBelow(path.join(this.target, root), path.join(this.target, relative)))) continue;
+      roots.push(relative);
+      await this.append({ op: 'filesystem', path: relative,
+        state: await filesystemState(path.join(this.target, relative), runtime, this.keptChildren.get(relative)) });
+    }
+    this.filesystemChanges.clear();
   }
 
   /** Journals the topmost path of `relative` that does not exist yet (nothing when all exist). */
@@ -2429,7 +2468,11 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
     const image = (row: unknown): boolean => !!row && typeof row === 'object' && !Array.isArray(row)
       && Object.values(row).every(value => value === null || typeof value === 'string');
     const updates = (entry as { updated?: unknown } | null)?.updated;
+    const state = (entry as { state?: unknown } | null)?.state;
     const valid = !!entry && typeof entry.path === 'string' && (entry.op === 'entry'
+      || (entry.op === 'filesystem' && !!state && typeof state === 'object' && !Array.isArray(state)
+        && (entry.removed === undefined || entry.removed === true)
+        && Object.values(state).every(value => typeof value === 'string'))
       || (entry.op === 'children' && Array.isArray(keep) && keep.every((name) => typeof name === 'string'))
       || ((entry.op === 'replace' || entry.op === 'cas') && typeof entry.backup === 'string')
       || (entry.op === 'database' && typeof entry.backup === 'string' && fingerprint(entry.before)
@@ -2446,6 +2489,7 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
     }
     requireRelative(entry!.path!);
     if (typeof entry!.backup === 'string') requireRelative(entry!.backup);
+    if (entry!.op === 'filesystem') for (const relative of Object.keys(state as Record<string, string>)) if (relative) requireRelative(relative);
     // Published journals predate local handle-state updates. Missing evidence means no updates
     // may be undone, never permission to ignore those tables. Any unrecorded mutation still
     // fails the complete before-digest check. An explicitly malformed field was rejected above.
@@ -2455,6 +2499,84 @@ async function readJournal(target: string, relocationId: string): Promise<Journa
 }
 
 type ReceivingCheck = { kind: 'unchanged' } | { kind: 'changed'; reason: string } | { kind: 'unreadable'; reason: string };
+
+/** Metadata of the paths an undo owns. SQLite, CAS and Host declarations have their own fences. */
+async function filesystemState(root: string, runtime: RootBinding['paths'], keptChildren: readonly string[] = []): Promise<Record<string, string>> {
+  const state: Record<string, string> = Object.create(null) as Record<string, string>;
+  const liveness = runtimeHostLivenessDirectory(runtime);
+  const visit = async (file: string): Promise<void> => {
+    if (isSamePath(file, runtime.casRootPath) || isSamePath(file, liveness)
+      || ['', '-wal', '-shm', '-journal'].some(suffix => isSamePath(file, `${runtime.databasePath}${suffix}`))) return;
+    let info;
+    try { info = await fs.lstat(file, { bigint: true }); }
+    catch (error) { if (isMissing(error)) return; throw error; }
+    const relative = path.relative(root, file).split(path.sep).join('/');
+    const kind = info.isDirectory() ? 'd' : info.isFile() ? 'f' : info.isSymbolicLink() ? 'l' : 'x';
+    state[relative] = `${kind}:${info.dev}:${info.ino}:${info.mode}`
+      + (info.isDirectory() ? '' : `:${info.size}:${info.mtimeNs}`);
+    if (info.isDirectory()) for (const name of (await fs.readdir(file)).sort()) {
+      if ((isSamePath(root, file) && keptChildren.includes(name)) || isClaimName(name) || await isTransientEntry(file, name)) continue;
+      await visit(path.join(file, name));
+    }
+  };
+  await visit(root);
+  return state;
+}
+
+/** Before any undo step: edited or newly added files are never restored over or recursively removed. */
+async function filesystemChangedSince(
+  target: string, marker: RelocationMarker, entries: readonly JournalEntry[], verified: boolean, restored: readonly string[]
+): Promise<ReceivingCheck> {
+  const runtime = createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({
+    globalStoragePath: resolveVscodeRuntimeDataSetScopeRoot(target, marker.receivingId)
+  }));
+  const expected = new Map<string, string>();
+  const captured: string[] = [];
+  const restoredStates: string[] = [];
+  for (const entry of entries) if (entry.op === 'filesystem') {
+    const root = path.join(target, entry.path);
+    if (entry.backup) {
+      if (await pathExists(path.join(workDirectory(target, marker.relocationId), entry.backup))) {
+        continue;
+      }
+      restoredStates.push(root);
+    }
+    for (const file of expected.keys()) if (isSamePath(root, file) || isPathBelow(root, file)) expected.delete(file);
+    for (const [relative, stamp] of Object.entries(entry.state)) expected.set(path.join(root, relative), stamp);
+    captured.push(root);
+  }
+  const coveredBy = (file: string, paths: readonly string[]): boolean => paths.some(root => isSamePath(root, file) || isPathBelow(root, file));
+  const roots: string[] = [];
+  for (const entry of entries) {
+    if (entry.op !== 'entry' && entry.op !== 'replace' && entry.op !== 'children') continue;
+    const root = path.join(target, entry.path);
+    if (entry.op === 'replace' && !await pathExists(path.join(workDirectory(target, marker.relocationId), entry.backup))) {
+      if (!captured.some(parent => isSamePath(parent, root) || isPathBelow(parent, root))) continue;
+      if (!coveredBy(root, restoredStates)) return { kind: 'changed', reason: `恢复副本已经不在，但没有记下恢复后的文件状态，无法安全继续撤销：${root}` };
+    }
+    if (roots.some(parent => isSamePath(parent, root) || isPathBelow(parent, root))) continue;
+    const state = await filesystemState(root, runtime, entry.op === 'children' ? entry.keep : []);
+    const known = captured.some(parent => isSamePath(parent, root) || isPathBelow(parent, root));
+    if (coveredBy(root, restored) && !coveredBy(root, restoredStates)) {
+      return { kind: 'changed', reason: `没有记下上次恢复后的文件状态，无法安全继续撤销：${root}` };
+    }
+    if (!known) {
+      if (!verified && Object.keys(state).length > 0) return { kind: 'changed', reason: `没有记下本次迁移写完后的文件状态，无法安全撤销：${root}` };
+      continue;
+    }
+    roots.push(root);
+    for (const [relative, stamp] of Object.entries(state)) {
+      const file = path.join(root, relative);
+      if (expected.get(file) !== stamp) return { kind: 'changed', reason: `本次迁移或恢复之后这个文件或目录有了新的改动：${file}` };
+    }
+    for (const file of expected.keys()) {
+      if ((isSamePath(root, file) || isPathBelow(root, file)) && !Object.prototype.hasOwnProperty.call(state, path.relative(root, file).split(path.sep).join('/'))) {
+        return { kind: 'changed', reason: `本次迁移之后这个文件或目录被移走或删除：${file}` };
+      }
+    }
+  }
+  return { kind: 'unchanged' };
+}
 
 /**
  * Whether the receiving data set may still be undone: it is what the relocation left there (its
@@ -2558,7 +2680,8 @@ function heldError(target: string, marker: RelocationMarker): DataRootRelocation
 }
 
 function describeHeld(target: string, marker: RelocationMarker): string {
-  return `${marker.held?.reason ?? ''}为了不覆盖这些内容，那次迁移在新目录 ${target} 里做的改动没有撤销，之后也不会自动撤销；`
+  const reason = (marker.held?.reason ?? '').trim();
+  return `${reason}${reason && !/[。！？.!?]$/.test(reason) ? '。' : ''}为了不覆盖这些内容，那次迁移在新目录 ${target} 里做的改动没有撤销，之后也不会自动撤销；`
     + `迁移前的数据库副本和被替换的设置保存在 ${workDirectory(target, marker.relocationId)}，需要时可以据此手动恢复。`
     + '旧目录里的数据没有改动；那次迁移在旧目录写下的“数据已迁走”标记也保留（没撤销的迁移可能已被用过，标记照旧拦着迁走的任务）。';
 }
@@ -2601,11 +2724,21 @@ async function undoRelocation(target: string, found: RelocationMarker, options: 
     throw new DataRootRelocationError('data-root-relocation-published', '这次迁移已经生效（数据目录已切换到新目录），不会撤销。');
   }
   const entries = options.entries ?? await readJournal(target, found.relocationId);
-  if (!options.verified) {
-    const check = await receivingChangedSince(target, found, entries);
+  const restored: string[] = [];
+  if (found.state === 'undoing') for (const entry of entries) {
+    if (entry.op === 'replace' && !await pathExists(path.join(workDirectory(target, found.relocationId), entry.backup))) {
+      restored.push(path.join(target, entry.path));
+    }
+  }
+  {
+    let check: ReceivingCheck = options.verified ? { kind: 'unchanged' } : await receivingChangedSince(target, found, entries);
+    if (check.kind === 'unchanged') {
+      try { check = await filesystemChangedSince(target, found, entries, options.verified === true, restored); }
+      catch (error) { check = { kind: 'unreadable', reason: errorMessage(error) }; }
+    }
     if (check.kind === 'unreadable') {
       throw new DataRootRelocationError('data-root-relocation-undo-unreadable',
-        `那次没有完成的数据迁移还没有撤销：${target} 里的当前历史库现在读不出来（${check.reason}），无法确认那次迁移之后没有别人写入，`
+        `那次没有完成的数据迁移还没有撤销：${target} 里的历史或文件现在核对不了（${check.reason}），无法确认那次迁移之后没有别人写入，`
         + '这次没有撤销，记录保持不变；下次会再试。');
     }
     if (check.kind === 'changed') {
@@ -2630,18 +2763,27 @@ async function undoRelocation(target: string, found: RelocationMarker, options: 
     await markUndoing();
     await removeMovedNotice(target, found);
     const work = workDirectory(target, marker.relocationId);
+    const undoJournal = RelocationJournal.open(target, marker.relocationId);
+    const runtimePaths = createRuntimeRootPaths(resolveVscodeRuntimeDataRoot({
+      globalStoragePath: resolveVscodeRuntimeDataSetScopeRoot(target, marker.receivingId)
+    }));
     for (const entry of [...entries].reverse()) {
       await markUndoing();
       const destination = path.join(target, entry.path);
-      if (entry.op === 'received' || entry.op === 'merging') continue;
+      if (entry.op === 'received' || entry.op === 'merging' || entry.op === 'filesystem') continue;
       if (entry.op === 'entry') {
+        if (restored.some(root => isSamePath(root, destination))) continue;
         await removeWithTemporaries(destination);
+        await undoJournal.append({ op: 'filesystem', path: entry.path, state: {}, removed: true });
         continue;
       }
       if (entry.op === 'children') {
         // Entries created inside an existing directory (e.g. a merge backup of the receiving data set).
         for (const name of await fs.readdir(destination).catch(() => [] as string[])) {
-          if (!entry.keep.includes(name)) await fs.rm(path.join(destination, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+          if (!entry.keep.includes(name)) {
+            await fs.rm(path.join(destination, name), { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+            await undoJournal.append({ op: 'filesystem', path: path.join(entry.path, name), state: {}, removed: true });
+          }
         }
         continue;
       }
@@ -2654,7 +2796,14 @@ async function undoRelocation(target: string, found: RelocationMarker, options: 
         if (!await pathExists(backup)) continue;
         const previous = await fs.lstat(backup);
         const current = await lstatOrUndefined(destination);
-        if (current && (current.isDirectory() || !previous.isFile())) await fs.rm(destination, { recursive: true, force: true });
+        if (current && (current.isDirectory() || !previous.isFile())) {
+          await fs.rm(destination, { recursive: true, force: true });
+          await undoJournal.append({ op: 'filesystem', path: entry.path, state: {}, removed: true });
+        }
+        // Rename preserves this state. Record it before restoring, so a later recovery can
+        // distinguish our completed restore from a subsequent edit even after backup is consumed.
+        await undoJournal.append({ op: 'filesystem', path: entry.path, backup: entry.backup,
+          state: await filesystemState(backup, runtimePaths) });
         await fs.mkdir(path.dirname(destination), { recursive: true });
         await fs.rename(backup, destination);
         await syncDirectoryDurably(path.dirname(destination));

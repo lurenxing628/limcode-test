@@ -7,6 +7,13 @@ import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import {
+  observeTurnInputSubmission,
+  turnInputDisplayReady,
+  turnInputEcho,
+  type TurnInputDisplayTarget
+} from '@webview/domain/reliableTurnInputSubmission';
+import type { ReliableKernelDetailState } from '@webview/stores/useReliableKernelClientFeedStore';
+import {
   decideInterruptWatchdog,
   decideTurnInputWithdrawal,
   interruptTargetHasSettled,
@@ -210,6 +217,8 @@ export interface PendingTurnInputSubmission {
   sentSessionId?: string;
   automaticRetryCount?: number;
   result?: TurnInputResultPayload;
+  /** Exact committed identity for handing the original pending body to its durable row. */
+  displayTarget?: TurnInputDisplayTarget;
   withdrawnAt?: number;
   withdrawalReceiptReplayRequested?: boolean;
   withdrawalCancelRequested?: boolean;
@@ -231,6 +240,8 @@ interface PersistedConversationControls {
 
 interface TurnInputAcknowledgement {
   conversationId: string;
+  /** Composer consumed this one-shot handoff while the body still awaits its detail read. */
+  dismissed?: boolean;
 }
 
 export interface PendingGuidanceControl {
@@ -267,6 +278,7 @@ const actionNotices = ref<Record<string, string>>({});
 const pendingTurnInputSubmissions = ref<Record<string, PendingTurnInputSubmission>>(restored.pendingTurnInputs);
 const failedTurnInputSubmissions = ref<Record<string, FailedTurnInputSubmission>>(restored.failedTurnInputs);
 const turnInputAcknowledgements = ref<Record<string, TurnInputAcknowledgement>>({});
+const observedTurnInputTimings = new Set<string>();
 /** Local withdrawal retires a Composer wait; it is not evidence of submission or cancellation. */
 const turnInputWithdrawals = ref<Record<string, { conversationId: string }>>({});
 const pendingGuidanceControls = ref<Record<string, PendingGuidanceControl>>({});
@@ -348,10 +360,12 @@ bridge.on(BridgeMessageType.TurnInputResult, (message) => {
     persistControls();
     return;
   }
-  turnInputAcknowledgements.value = {
-    ...turnInputAcknowledgements.value,
-    [payload.commandId]: payload
-  };
+  if (!turnInputAcknowledgements.value[payload.commandId]?.dismissed) {
+    turnInputAcknowledgements.value = {
+      ...turnInputAcknowledgements.value,
+      [payload.commandId]: payload
+    };
+  }
   pendingTurnInputSubmissions.value = {
     ...pendingTurnInputSubmissions.value,
     [payload.commandId]: { ...pending, result: payload }
@@ -728,6 +742,7 @@ bridge.on(BridgeMessageType.Error, (message) => {
 function removePendingTurnInputSubmission(commandId: string): void {
   clearTurnInputRetry(commandId);
   clearWithdrawalReceiptReplay(commandId);
+  observedTurnInputTimings.delete(commandId);
   if (!pendingTurnInputSubmissions.value[commandId]) return;
   const next = { ...pendingTurnInputSubmissions.value };
   delete next[commandId];
@@ -741,6 +756,7 @@ function removePendingTurnInputSubmission(commandId: string): void {
 function failTurnInputSubmission(pending: PendingTurnInputSubmission, message: string): void {
   clearTurnInputRetry(pending.commandId);
   clearWithdrawalReceiptReplay(pending.commandId);
+  observedTurnInputTimings.delete(pending.commandId);
   const nextPending = { ...pendingTurnInputSubmissions.value };
   delete nextPending[pending.commandId];
   pendingTurnInputSubmissions.value = nextPending;
@@ -797,14 +813,23 @@ function traceTurnInputTiming(
 }
 
 function confirmTurnInputFromDurableReceipt(pending: PendingTurnInputSubmission): void {
-  turnInputAcknowledgements.value = {
-    ...turnInputAcknowledgements.value,
-    [pending.commandId]: { conversationId: pending.conversationId }
-  };
+  if (!turnInputAcknowledgements.value[pending.commandId]) {
+    turnInputAcknowledgements.value = {
+      ...turnInputAcknowledgements.value,
+      [pending.commandId]: { conversationId: pending.conversationId }
+    };
+  }
   clearTurnInputFailure(pending.commandId);
 }
 
-function reconcileTurnInputSubmissions(records: Record<string, Record<string, Record<string, unknown>>>): void {
+function reconcileTurnInputSubmissions(
+  records: Record<string, Record<string, Record<string, unknown>>>,
+  details: Record<string, ReliableKernelDetailState>,
+  conversationId: string,
+  historicalMessages: Record<string, Record<string, unknown>>,
+  snapshotRequired: boolean,
+  removedConversationIds: readonly string[]
+): void {
   let changed = false;
   const next = { ...pendingTurnInputSubmissions.value };
   for (const pending of Object.values(next)) {
@@ -814,6 +839,7 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
       if (updated === null) {
         clearTurnInputRetry(pending.commandId);
         clearWithdrawalReceiptReplay(pending.commandId);
+        observedTurnInputTimings.delete(pending.commandId);
         delete next[pending.commandId];
         changed = true;
       } else if (updated !== pending) {
@@ -822,18 +848,40 @@ function reconcileTurnInputSubmissions(records: Record<string, Record<string, Re
       }
       continue;
     }
-    if (!observation.observed) continue;
-    traceTurnInputTiming(pending, 'durable-observed', pending.result);
-    if (observation.durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
-    clearTurnInputRetry(pending.commandId);
-    delete next[pending.commandId];
-    changed = true;
+    if (observation.observed) {
+      if (!observedTurnInputTimings.has(pending.commandId)) {
+        observedTurnInputTimings.add(pending.commandId);
+        traceTurnInputTiming(pending, 'durable-observed', pending.result);
+      }
+      if (observation.durableReceiptObserved) confirmTurnInputFromDurableReceipt(pending);
+      // A lost direct ACK still needs the existing bounded command replay to recover the Turn id.
+      if (pending.result) clearTurnInputRetry(pending.commandId);
+    }
+    const target = observation.displayTarget;
+    const targetGone = !!pending.displayTarget && conversationId === pending.conversationId
+      && !snapshotRequired && !records.Message?.[pending.displayTarget.messageId]
+      && !historicalMessages[pending.displayTarget.messageId];
+    if ((pending.result?.admitted === false && observation.observed)
+      || turnInputDisplayReady(observation, details) || observation.displayInvalidated || targetGone
+      || removedConversationIds.includes(pending.conversationId)) {
+      clearTurnInputRetry(pending.commandId);
+      observedTurnInputTimings.delete(pending.commandId);
+      delete next[pending.commandId];
+      if (turnInputAcknowledgements.value[pending.commandId]?.dismissed) {
+        const acknowledgements = { ...turnInputAcknowledgements.value };
+        delete acknowledgements[pending.commandId];
+        turnInputAcknowledgements.value = acknowledgements;
+      }
+      changed = true;
+    } else if (target && !pending.displayTarget) {
+      next[pending.commandId] = { ...pending, displayTarget: target };
+      changed = true;
+    }
   }
   if (changed) {
     pendingTurnInputSubmissions.value = next;
-    // Durable Feed observation retires only the retransmission record. The direct ACK remains a
-    // one-shot UI handoff until Composer clears its draft and explicitly dismisses it; deleting the
-    // ACK here can race Vue's batched watcher and leave the input permanently disabled.
+    // Retire the pending body only after its exact durable revision is ready (or no longer current).
+    // An unconsumed ACK must survive this pass so Vue's batched Composer watcher can clear its draft.
     persistControls();
   }
 }
@@ -978,23 +1026,7 @@ function reconcileGuidanceControls(
   if (failureChanged) guidanceControlFailures.value = failures;
 }
 
-function turnInputDurableObservation(
-  records: Record<string, Record<string, Record<string, unknown>>>,
-  pending: PendingTurnInputSubmission
-): { observed: boolean; durableReceiptObserved: boolean } {
-  const result = pending.result;
-  const durableReceiptObserved = Object.values(records.ConversationCommandReceipt ?? {}).some((receipt) =>
-    receipt.command_id === pending.commandId
-    && receipt.conversation_id === pending.conversationId
-  );
-  const resultProjectionObserved = Boolean(result && (result.admitted
-    ? result.turnId && records.Turn?.[result.turnId]
-    : result.intentId && records.TurnIntent?.[result.intentId]));
-  return {
-    observed: durableReceiptObserved || resultProjectionObserved,
-    durableReceiptObserved
-  };
-}
+const turnInputDurableObservation = observeTurnInputSubmission;
 
 function replayTurnInputSubmissions(clientId: string, sessionId?: string): void {
   for (const submission of Object.values(pendingTurnInputSubmissions.value)) {
@@ -1484,6 +1516,12 @@ export function useChat() {
   const reliableRecords = computed(() =>
     reliableConversation.feed.records as unknown as Record<string, Record<string, Record<string, unknown>>>
   );
+  function reconcileCurrentTurnInputs(): void {
+    const feed = reliableConversation.feed;
+    reconcileTurnInputSubmissions(reliableRecords.value, feed.details, reliableConversation.conversationId.value,
+      feed.historyConversationId === reliableConversation.conversationId.value ? feed.historyRecords.Message ?? {} : {},
+      feed.snapshotRequired, feed.removedConversationIds);
+  }
   /** Exact non-withdrawn input identities: persistence can recognize their unchanged submitted drafts. */
   const inFlightTurnInputCommands = computed(() => Object.values(pendingTurnInputSubmissions.value)
     .filter((submission) => !submission.withdrawnAt)
@@ -1495,11 +1533,19 @@ export function useChat() {
       && !turnInputDurableObservation(reliableRecords.value, submission).observed
     )
     .sort((left, right) => left.submittedAt - right.submittedAt || left.commandId.localeCompare(right.commandId)));
+  const currentTurnInputEchoes = computed(() => Object.values(pendingTurnInputSubmissions.value)
+    .filter((submission) => submission.conversationId === reliableConversation.conversationId.value)
+    .sort((left, right) => left.submittedAt - right.submittedAt || left.commandId.localeCompare(right.commandId))
+    .flatMap((submission) => {
+      const echo = turnInputEcho(submission, turnInputDurableObservation(reliableRecords.value, submission),
+        reliableConversation.feed.details);
+      return echo ? [echo] : [];
+    }));
   const currentTurnInputAcknowledgements = computed(() => {
     const conversationId = reliableConversation.conversationId.value;
     const acknowledgements: Record<string, TurnInputAcknowledgement> = Object.fromEntries(
       Object.entries(turnInputAcknowledgements.value).filter(([, result]) =>
-        result.conversationId === conversationId
+        result.conversationId === conversationId && !result.dismissed
       )
     );
     // The direct control ACK may be lost during a Webview/Extension Host reconnect. Durable Feed
@@ -1509,6 +1555,7 @@ export function useChat() {
       if (
         pending.conversationId === conversationId
         && !pending.withdrawnAt
+        && !turnInputAcknowledgements.value[pending.commandId]?.dismissed
         && turnInputDurableObservation(reliableRecords.value, pending).observed
       ) acknowledgements[pending.commandId] = { conversationId };
     }
@@ -1552,7 +1599,7 @@ export function useChat() {
         string,
         Record<string, Record<string, unknown>>
       >;
-      reconcileTurnInputSubmissions(records);
+      reconcileCurrentTurnInputs();
       reconcileGuidanceControls(records);
     }
     if (clientId) replayTurnInputSubmissions(clientId, sessionId ?? undefined);
@@ -1695,7 +1742,7 @@ export function useChat() {
       ...turnInputWithdrawals.value,
       [commandId]: { conversationId: pending.conversationId }
     };
-    reconcileTurnInputSubmissions(reliableRecords.value);
+    reconcileCurrentTurnInputs();
     return true;
   }
 
@@ -2462,7 +2509,8 @@ export function useChat() {
   function dismissTurnInputAcknowledgement(commandId: string): void {
     if (!turnInputAcknowledgements.value[commandId]) return;
     const next = { ...turnInputAcknowledgements.value };
-    delete next[commandId];
+    if (pendingTurnInputSubmissions.value[commandId]) next[commandId] = { ...next[commandId], dismissed: true };
+    else delete next[commandId];
     turnInputAcknowledgements.value = next;
   }
 
@@ -2499,6 +2547,7 @@ export function useChat() {
     openForkReadyNotice,
     dismissForkReadyNotice,
     currentPendingTurnInputs,
+    currentTurnInputEchoes,
     inFlightTurnInputCommands,
     currentTurnInputAcknowledgements,
     turnInputWithdrawalsById: computed(() => turnInputWithdrawals.value),

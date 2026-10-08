@@ -3,6 +3,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
+import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 import { READ_SLICE_MAX_BYTES, sliceTextFile } from '../../dist/extension/backend/capabilities/textFileSlice.js';
 import {
   readRemoteServerRawTextFile,
@@ -77,6 +78,85 @@ test('小文件一次读完，行号与内容保持原样', () => {
   assert.equal(result.totalLines, 3);
   assert.equal(result.endLine, 3);
   assert.equal(result.content, '1 alpha\n2 beta\n3 gamma');
+});
+
+test('批量 read 在结果加载前后保留读取分段，并逐文件显示实际范围和截断', async (t) => {
+  const server = await createWebviewSsrServer();
+  t.after(() => server.close());
+  const { readFileToolDisplay } = await server.ssrLoadModule(
+    '/src/components/content/toolDisplay/readFileToolDisplay.ts'
+  );
+  const { projectReliableConversation } = await server.ssrLoadModule(
+    '/src/domain/reliableConversationProjection.ts'
+  );
+  const display = (args, result) => readFileToolDisplay({
+    toolName: 'read', args, result, events: [], stringifyValue: JSON.stringify
+  });
+  const args = { items: [
+    { path: 'a.ts', startLine: 10, endLine: 20 },
+    { path: 'b.ts', startLine: 200 }
+  ] };
+  const before = display(args);
+  assert.equal(before.inputSections.length, 2, '正文尚未加载时批量参数也必须可展开');
+  assert.deepEqual(before.inputSections[0].rows, [
+    { label: '路径', value: 'a.ts' },
+    { label: '读取方式', value: '文本' },
+    { label: '行范围', value: 'L10-20' }
+  ]);
+  assert.deepEqual(before.inputSections[1].rows, [
+    { label: '路径', value: 'b.ts' },
+    { label: '读取方式', value: '文本' },
+    { label: '行范围', value: 'L200-' }
+  ]);
+  const files = [
+    { path: 'a.ts', startLine: 10, endLine: 11, totalLines: 30,
+      content: '10 alpha\n11 beta', contentTruncated: true, omittedChars: 17 },
+    { path: 'b.ts', startLine: 200, endLine: 199, totalLines: 300,
+      content: '', contentTruncated: true, omittedChars: 23 }
+  ];
+  const ready = (value) => ({ status: 'ready', text: JSON.stringify(value) });
+  const projection = projectReliableConversation({
+    conversationId: 'read-conversation',
+    records: {
+      Turn: { turn: { id: 'turn', conversation_id: 'read-conversation', status: 'terminal' } },
+      Message: { message: { id: 'message', conversation_id: 'read-conversation', message_seq: '1',
+        revision_id: 'read-revision', role: 'model' } },
+      MessageTurnLink: { link: { id: 'link', message_id: 'message', turn_id: 'turn', role: 'model' } },
+      ToolCall: { call: { id: 'call', turn_id: 'turn', call_seq: '1', tool_name: 'read', status: 'terminal' } },
+      ToolCallSourceLink: { source: { id: 'source', tool_call_id: 'call', message_id: 'message',
+        provider_call_id: 'provider-read', provider_ordinal: '0' } },
+      ToolOutcome: { outcome: { id: 'outcome', tool_call_id: 'call', status: 'succeeded' } }
+    },
+    details: {
+      'message-content:read-revision': ready({ role: 'model', parts: [
+        { id: 'provider-read', functionCall: { name: 'read', args } }
+      ] }),
+      'tool-arguments-content:call': ready(args),
+      // dispatchNoEffect + settleWithoutEffect preserve read.output as detail, without operations.
+      'tool-result-content:call': ready({ toolCallId: 'call', status: 'succeeded', detail: { files } })
+    }
+  });
+  assert.deepEqual(projection.toolResultByCallId.call, { files });
+  const part = projection.messages[0].content.parts[0];
+  const after = display(part.functionCall.args, projection.toolResultByCallId.call);
+  assert.deepEqual(after.inputSections, before.inputSections, '结果加载不能使批量参数消失');
+  assert.deepEqual(after.outputSections.map((section) => ({ title: section.title, text: section.text })), [
+    { title: '读取结果 · a.ts[text][L10-11]', text: '10 alpha\n11 beta\n\n[内容已截断，省略 17 个字符]' },
+    { title: '读取结果 · b.ts[text]', text: '\n\n[内容已截断，省略 23 个字符]' }
+  ], '返回范围按实际文件显示，预算耗尽的文件仍须保留截断说明');
+  const single = display(args.items[0], files[0]);
+  assert.deepEqual(single.inputSections[0].rows, before.inputSections[0].rows);
+  assert.deepEqual(single.outputSections, [after.outputSections[0]], '单项与批量复用同一结果格式');
+  const failed = display(args, { ok: false, output: 'Cannot read b.ts' });
+  assert.equal(failed.inputSections.length, 2);
+  assert.equal(failed.outputSections[0].text, 'Cannot read b.ts');
+  const attachment = display({ path: 'image.png', mode: 'attachment' }, {
+    path: 'image.png', mimeType: 'image/png', sizeBytes: 25
+  });
+  assert.equal(attachment.outputSections[0].title, '读取结果 · image.png[attachment]');
+  assert.deepEqual(attachment.outputSections[0].rows, [
+    { label: '文件类型', value: 'image/png' }, { label: '大小', value: '25 bytes' }
+  ]);
 });
 
 // ---- 远端读取回归：本机 bash 替代 SSH transport ----

@@ -148,7 +148,7 @@ async function createHarness(options) {
     runtime = await openRuntime(options);
     server = await createWebviewSsrServer();
     const { default: TaskListTopPanel } = await server.ssrLoadModule('/src/components/taskList/TaskListTopPanel.vue');
-    const { taskListToolDisplay } = await server.ssrLoadModule('/src/components/content/toolDisplay/taskListToolDisplay.ts');
+    const { resolveToolDisplay } = await server.ssrLoadModule('/src/components/content/toolDisplay/registry.ts');
     const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
     globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
     feed = new kernel.BoundedClientFeed(runtime.database);
@@ -183,7 +183,7 @@ async function createHarness(options) {
     await drain();
     const render = () => renderToString(createSSRApp(TaskListTopPanel, {}).use(active));
     return {
-      runtime, feed, store, frames, connection, drain, drainUntilSnapshot, settleQuietly, render, taskListToolDisplay, close: release
+      runtime, feed, store, frames, connection, drain, drainUntilSnapshot, settleQuietly, render, resolveToolDisplay, close: release
     };
   } catch (error) {
     await release();
@@ -228,28 +228,41 @@ test('下方卡无成功结果时只能预览参数，成功结果必须来自�
   try {
     const args = { kind: 'task_list.operation', mode: 'rewrite', items: [{ title: 'Write tests', status: 'completed' }] };
     const actual = { kind: 'task_list.operation', mode: 'rewrite', items: [{ title: 'Write tests', status: 'in_progress' }] };
+    let settlement;
+    const effects = { async settleWithoutEffect(input) { settlement = input; return { status: input.status }; } };
+    await kernel.ToolInteractionControlPlane.prototype.settleTaskList.call({ effects }, {
+      source: { kind: 'internal', key: 'task-card-success' }, toolCallId: 'task-feed-update-one', operation: actual
+    });
+    const successDetail = settlement.detail;
+    await kernel.ReliableToolDispatcher.prototype.reject.call({
+      dependencies: { effects }, settledResult() {}
+    }, { toolCallId: 'task-feed-update-one', toolName: 'update_task_list' }, '冻结 ToolPolicy 不允许工具 update_task_list。');
+    const rejectedDetail = settlement.detail;
     const context = (status, result) => ({
       toolName: 'update_task_list', args, result, events: [],
       toolCall: {
         id: 'task-feed-update-one', messageId, name: 'update_task_list', args: JSON.stringify(args),
         status, createdAt: 0, updatedAt: 0
       },
-      stringifyValue: String
+      stringifyValue: JSON.stringify
     });
     for (const status of ['queued', 'warning', 'success']) {
-      const preview = h.taskListToolDisplay(context(status, status === 'warning'
-        ? { kind: 'task-list', operation: actual } : undefined));
-      assert.equal(preview.outputSections.length, 0, 'arguments alone cannot produce a completed output');
+      const preview = h.resolveToolDisplay(context(status, status === 'warning' ? rejectedDetail : undefined));
+      assert.equal(preview.outputSections.some((section) => section.taskList), false,
+        'arguments or a refused call cannot produce a confirmed task card');
+      if (status === 'warning') assert.equal(preview.outputSections[0].text, rejectedDetail.reason,
+        'the shared display must retain the actual refusal instead of suppressing its result');
+      else assert.equal(preview.outputSections.length, 0, 'arguments alone cannot produce a completed output');
       assert.match(preview.inputSections[0].title, /预览/);
       assert.equal(preview.inputSections[0].taskList, undefined, '未决/失败不能画已完成标记');
       assert.match(preview.inputSections[0].rows.at(-1).value, /目标状态：completed/);
     }
-    const completed = h.taskListToolDisplay(context('success', { kind: 'task-list', operation: actual }));
+    const completed = h.resolveToolDisplay(context('success', successDetail));
     assert.equal(completed.outputSections.length, 1);
     assert.equal(completed.outputSections[0].taskList.items[0].status, 'in_progress',
       'actual settled result, not optimistic completed argument, is shown');
     const withSpeculativeTimeline = {
-      ...context('success', { kind: 'task-list', operation: actual }),
+      ...context('success', successDetail),
       currentConversationId: conversationId,
       messages: [{
         id: messageId, conversationId, seq: 1, createdAt: 0,
@@ -257,7 +270,7 @@ test('下方卡无成功结果时只能预览参数，成功结果必须来自�
       }]
     };
     withSpeculativeTimeline.toolCalls = [withSpeculativeTimeline.toolCall];
-    const canonical = h.taskListToolDisplay(withSpeculativeTimeline);
+    const canonical = h.resolveToolDisplay(withSpeculativeTimeline);
     assert.equal(canonical.outputSections[0].taskList.items[0].status, 'in_progress',
       'a hydrated result must not be overwritten by a historical timeline reconstructed from arguments');
     assert.doesNotMatch(canonical.outputSections[0].title, /已完成/,

@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { syncDirectoryDurably } from '../../capabilities/filesystem/durableDirectorySync';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -27,7 +26,7 @@ import {
   migratePreviousRuntimeEpochIfRequired,
   previousRuntimeEpochMigrationRequired
 } from '../../reliableKernel/runtimeEpochMigration';
-import { assertConfigurationRootRuntimesOffline, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY } from '../../reliableKernel/vscodeRootAuthority';
+import { assertConfigurationRootRuntimesOffline, createVscodeRuntimeResetBackupName, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY } from '../../reliableKernel/vscodeRootAuthority';
 import { registerRuntimeResetBackup } from '../../reliableKernel/runtimeHistoryRegistry';
 
 export const VSCODE_INCOMPATIBLE_RUNTIME_BACKUPS_DIRECTORY = '.limcode-runtime-backups';
@@ -216,7 +215,7 @@ export async function archiveCurrentRuntimeRootForReset(
         );
       }
       const backupRootPath = path.join(runtimeScopeRootPath, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY);
-      const backupPath = path.join(backupRootPath, `${timestampSlug()}-${randomUUID().slice(0, 8)}`);
+      const backupPath = path.join(backupRootPath, createVscodeRuntimeResetBackupName());
       try {
         await fs.mkdir(backupRootPath, { recursive: true, mode: 0o700 });
         await fs.rename(controlRootPath, backupPath);
@@ -242,12 +241,4 @@ function normalizedAbsolutePath(value: string, label: string): string {
     throw new TypeError(`${label} must be a normalized absolute path.`);
   }
   return value;
-}
-
-function timestampSlug(): string {
-  const date = new Date();
-  const pad = (value: number, length = 2): string => String(value).padStart(length, '0');
-  return `${date.getUTCFullYear()}${pad(date.getUTCMonth() + 1)}${pad(date.getUTCDate())}`
-    + `-${pad(date.getUTCHours())}${pad(date.getUTCMinutes())}${pad(date.getUTCSeconds())}`
-    + `-${pad(date.getUTCMilliseconds(), 3)}`;
 }

@@ -5,9 +5,10 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite, readAll, readLedgerRecord,
-  removeConfigurationRoot, saveState, seedConversations, seedRichSource, treeSnapshot
+  compiled, countRows, createConfigurationRoot, Database, kernel, kernelFile, ledgerEntries, NOW, rawWrite, readAll, readLedgerRecord, repo,
+  removeConfigurationRoot, saveState, seedConversations, seedRichSource, treeSnapshot, withRuntime
 } from './fixtures/runtime-merge-fixture.mjs';
+import { createRequire } from 'node:module';
 
 const {
   mergeHistoricalDataSetsOnline, readRuntimeDataSetMergeStates, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE,
@@ -20,6 +21,8 @@ const {
 const { ConversationDeletionControlPlane } = kernelFile('conversationDeletion.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { resolveVscodeRuntimeMergeLedgerRoot } = kernelFile('vscodeRootAuthority.js');
+const { readRuntimeHistoryPending, readRuntimeHistoryResidual } = kernelFile('runtimeHistoryRegistry.js');
+const require = createRequire(import.meta.url);
 
 /** Injected bounds: every fixture source is "large" and spans many chunks. */
 const SMALL_LIMITS = { sizeLimits: { transactionRows: 50 }, chunkRows: 7 };
@@ -67,6 +70,31 @@ function assertSameRows(actual, expected, message) {
   assert.deepEqual(Object.keys(actual).sort(), Object.keys(expected).sort(), `${message}：表集合一致`);
   for (const table of Object.keys(expected)) assert.deepEqual(actual[table], expected[table], `${message}：${table} 逐行一致`);
 }
+
+test('流式执行时记录已被另一份操作写入：零新增仍先完成持久屏障再记成功', async (t) => {
+  const fixture = await fixtureFor(t);
+  const shared = { id: 'shared', title: 'shared', status: 'active', created_at: NOW, updated_at: NOW };
+  await withRuntime(fixture.alpha, database => database.transaction([repo('Conversation').insert(shared)]));
+  const checkpoint = kernel.RuntimeDatabase.prototype.durabilityCheckpoint;
+  t.after(() => { kernel.RuntimeDatabase.prototype.durabilityCheckpoint = checkpoint; });
+  let checkpoints = 0;
+  const { preparation, session } = await mergeStreamed(fixture, {
+    candidateIds: [fixture.alpha.id], requested: true, options: { sizeLimits: { transactionRows: 0 } },
+    beforeSession: async () => {
+      await withRuntime(fixture.current, database => database.transaction([repo('Conversation').insert(shared)]));
+      kernel.RuntimeDatabase.prototype.durabilityCheckpoint = async function () {
+        checkpoints += 1;
+        assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'committing', '屏障之前不能发布成功');
+        return checkpoint.call(this);
+      };
+    }
+  });
+  assert.equal(preparation.sources[0].insertRows, 1);
+  assert.equal(checkpoints, 1);
+  assert.deepEqual(session.results.map(item => [item.state, item.result?.insertedRows, item.result?.reusedRows]), [['current', 0, 1]]);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'merged');
+  assert.equal((await readRuntimeHistoryPending(fixture.paths)).has(fixture.alpha.id), false);
+});
 
 async function mergedInto(fixture, candidateId) {
   const record = await readLedgerRecord(fixture, candidateId);
@@ -216,6 +244,52 @@ test('剔除等价性：冲突连带子 Agent 与跨对话链接，其余对话�
   const record = await readLedgerRecord(fixture, fixture.alpha.id);
   assert.equal(record.state, 'partial');
   assert.deepEqual(record.excluded, onlineRecord.excluded);
+  assert.deepEqual((await readRuntimeHistoryResidual(fixture.paths)).get(fixture.alpha.id)?.excluded, record.excluded);
+  assert.equal((await readRuntimeHistoryPending(fixture.paths)).has(fixture.alpha.id), false);
+  await mergeOnline(fixture);
+  assert.deepEqual((await readRuntimeHistoryResidual(fixture.paths)).get(fixture.alpha.id)?.excluded, record.excluded, '再次启动仍能查看剔除对话');
+});
+
+test('流式重合并跳过已删除子对话的残留工作，健康父对话继续合并且只收尾未删除的工作', async (t) => {
+  const fixture = await fixtureFor(t);
+  await seedConversations(fixture.alpha, [{ id: 'parent' }, { id: 'child' }]);
+  rawWrite(fixture.alpha, source => source.prepare('INSERT INTO conversation_origin_link VALUES (?, ?, ?, ?, ?, ?, ?)')
+    .run('child_origin', 'child', 'parent', 'parent_turn', null, null, NOW));
+  assert.equal((await mergeOnline(fixture)).merged.length, 1);
+  const database = await openWindow(fixture);
+  try { await new ConversationDeletionControlPlane(database).delete('child'); }
+  finally { await database.close(); }
+  await seedConversations(fixture.alpha, [{ id: 'fresh' }]);
+  rawWrite(fixture.alpha, (source, contentId) => {
+    source.prepare(`INSERT INTO tool_call (id, turn_id, call_seq, tool_name, status, arguments_object_id, created_at, updated_at)
+      VALUES (?, ?, 1, 'read_file', 'terminal', ?, ?, ?)`).run('child_resultless_tool', 'child_turn', contentId, NOW, NOW);
+    // fresh 尚未合并；生产停止会更新它的 updated_at，父对话的健康增量仍保持相同基线。
+    for (const id of ['child', 'fresh']) source.prepare('INSERT INTO turn VALUES (?, ?, ?, ?, ?, ?)')
+      .run(`${id}_unfinished_turn`, id, 'active', NOW, NOW, null);
+    source.prepare('INSERT INTO turn VALUES (?, ?, ?, ?, ?, ?)').run('parent_later_turn', 'parent', 'terminated', NOW, NOW, NOW);
+    source.prepare('INSERT INTO turn_termination VALUES (?, ?, ?, ?, ?)').run('parent_later_termination', 'parent_later_turn', 'completed', 'fixture', NOW);
+  });
+  const childBody = new Database(fixture.alpha.binding.paths.databasePath, { readonly: true });
+  let storageKey;
+  try { storageKey = childBody.prepare(`SELECT storage_key FROM content_object WHERE id=(
+    SELECT content_object_id FROM message_revision WHERE id='child_message_0_revision')`).pluck().get(); }
+  finally { childBody.close(); }
+  await fs.rm(path.join(fixture.alpha.binding.paths.casRootPath, storageKey));
+  const { settleHistoricalMergeSourceOffline } = require(path.join(compiled, 'backend/application/reliableKernel/historicalMergeSettlement.js'));
+  const { session } = await mergeStreamed(fixture, { candidateIds: [fixture.alpha.id], requested: true,
+    options: { sizeLimits: { transactionRows: 0 }, settleSourceWork: settleHistoricalMergeSourceOffline, confirmSettlement: async request => {
+      assert.equal(request.turns, 1, '不让用户同意收尾已删除子对话');
+      return true;
+    } } });
+  assert.deepEqual(session.results.map(item => [item.state, item.result?.excluded, item.result?.finalized?.turns]), [['merged', undefined, 1]]);
+  const source = new Database(fixture.alpha.binding.paths.databasePath, { readonly: true });
+  const current = new Database(fixture.current.binding.paths.databasePath, { readonly: true });
+  try {
+    assert.equal(source.prepare('SELECT status FROM turn WHERE id=?').pluck().get('child_unfinished_turn'), 'active');
+    assert.equal(source.prepare('SELECT status FROM turn WHERE id=?').pluck().get('fresh_unfinished_turn'), 'terminated');
+    assert.equal(current.prepare('SELECT id FROM turn WHERE id=?').pluck().get('parent_later_turn'), 'parent_later_turn');
+    assert.equal(current.prepare('SELECT id FROM conversation WHERE id=?').get('child'), undefined);
+  } finally { current.close(); source.close(); }
 });
 
 test('冲突：准备之后当前库又写入了同一记录的另一份内容，独占阶段整份回滚并记为受阻，当前库没有这份来源的任何行', async (t) => {
@@ -451,6 +525,7 @@ test('批次：有待合并的大库时，自动批次里超过在线上限的�
 for (const damage of ['invalid-row', 'missing-body']) test(`剔除等价性：${damage} 只留下对应对话，其余在线和流式一致`, async (t) => {
   const fixture = await fixtureFor(t);
   await seedConversations(fixture.alpha, [{id:'damaged'}, {id:'kept'}]);
+  let missingBody;
   if (damage === 'invalid-row') {
     rawWrite(fixture.alpha, db => {
       db.prepare("UPDATE message_revision SET revision_seq='invalid' WHERE id=?").run('damaged_message_0_revision');
@@ -460,7 +535,9 @@ for (const damage of ['invalid-row', 'missing-body']) test(`剔除等价性：${
     let storageKey;
     try { storageKey = db.prepare(`SELECT storage_key FROM content_object WHERE id=(SELECT content_object_id FROM message_revision WHERE id=?)`).pluck().get('damaged_message_0_revision'); }
     finally { db.close(); }
-    await fs.rm(path.join(fixture.alpha.binding.paths.casRootPath, storageKey));
+    const file = path.join(fixture.alpha.binding.paths.casRootPath, storageKey);
+    missingBody = { file, bytes: await fs.readFile(file) };
+    await fs.rm(file);
   }
   const before = await saveState(fixture, fixture.current);
   t.after(() => before.remove());
@@ -476,6 +553,19 @@ for (const damage of ['invalid-row', 'missing-body']) test(`剔除等价性：${
   assert.deepEqual(session.results.map(result=>result.state),['merged']);
   assertSameRows(readAll(fixture.current),expected,damage);
   assert.deepEqual((await readLedgerRecord(fixture,fixture.alpha.id)).excluded,onlineRecord.excluded);
+  if (missingBody) {
+    await fs.writeFile(missingBody.file, missingBody.bytes);
+    assert.deepEqual((await mergeOnline(fixture)).merged, [], '自动路径继续复用未变的 partial');
+    const retried = await mergeStreamed(fixture, { candidateIds: [fixture.alpha.id], requested: true,
+      options: { sizeLimits: { transactionRows: 1 } } });
+    assert.equal(retried.preparation.sources.length, 1, '恢复正文后明确重核仍需重新准备');
+    assert.deepEqual(retried.session.results.map(item => [item.state, item.result?.insertedConversations]), [['merged', 1]]);
+    const record = await readLedgerRecord(fixture, fixture.alpha.id);
+    assert.equal(record.state, 'merged');
+    assert.equal(record.source.contentDigest, onlineRecord.source.contentDigest, '恢复 CAS 不改变数据库内容身份');
+    assert.equal((await readRuntimeHistoryResidual(fixture.paths)).has(fixture.alpha.id), false);
+    assert.equal((await readRuntimeHistoryPending(fixture.paths)).has(fixture.alpha.id), false);
+  }
 });
 
 for (const [accept,fullAfterFirst] of [[true,false],[false,false],[true,true]]) test(`大库批量收尾只确认一次，${fullAfterFirst ? '空间不足时等待挂起快照清理' : accept ? '保留两份快照后顺序恢复' : '拒绝后等待清理完毕'}`, async (t) => {

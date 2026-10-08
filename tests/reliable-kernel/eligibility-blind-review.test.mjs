@@ -55,7 +55,7 @@ const mcpTool = {
 };
 
 const ASK_USER = { role: 'model', parts: [{ id: 'ask', functionCall: {
-  name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }] } } }] };
+  name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] } } }] };
 const MCP_CALL = { role: 'model', parts: [{ id: 'mcp-call', functionCall: { name: 'fixture_call', args: {} } }] };
 const SPAWN_CHILD = { role: 'model', parts: [{ id: 'provider-spawn', functionCall: {
   name: 'run_agent', args: { operation: 'spawn', taskName: '子任务', prompt: '做子任务', foregroundWaitMs: 0 } } }] };

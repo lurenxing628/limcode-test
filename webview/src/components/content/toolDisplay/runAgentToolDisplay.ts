@@ -7,7 +7,7 @@ export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
   const conversationId = context.childConversationId?.trim() || undefined;
   const answer = answerFromValue(context.result);
   const metadataSections = [
-    ...runAgentListSections(context.result),
+    ...runAgentListSections(context),
     ...runAgentMetadataSections(context)
   ];
   const outputSections = metadataSections.length > 0 || answer?.content
@@ -19,7 +19,7 @@ export const runAgentToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconUsers,
-    outputSections: outputSections ?? [],
+    ...(outputSections ? { outputSections } : {}),
     headerActions: conversationId ? [{
         id: 'open-agent-run-conversation',
         label: '打开对话',
@@ -42,11 +42,11 @@ export function isRunAgentSpawnArguments(value: unknown): boolean {
   return asRecord(parsed)?.operation === 'spawn';
 }
 
-function runAgentListSections(value: unknown): ToolDisplaySection[] {
-  const record = asRecord(value);
+function runAgentListSections(context: ToolDisplayContext): ToolDisplaySection[] {
+  const record = asRecord(context.result);
   if (record?.operation !== 'list') return [];
   const scope = record.scope === 'tree' ? 'tree' : 'direct';
-  const count = scope === 'tree' ? record.totalDescendants : record.totalDirect;
+  const count = asRecord(record.counts)?.total;
   const total = typeof count === 'number' && Number.isSafeInteger(count) && count >= 0
     ? count
     : undefined;
@@ -56,49 +56,35 @@ function runAgentListSections(value: unknown): ToolDisplaySection[] {
     ...(total !== undefined ? [{ label: '已有子任务', value: `${total} 个` }] : []),
     ...(total === 0 ? [{ label: '结果', value: '当前没有子任务；本次查询未启动子 Agent' }] : [])
   ];
-  return [{ kind: 'output', title: '子 Agent 查询结果', rows, rowStyle: 'keyValue' }];
+  return [
+    { kind: 'output', title: '子 Agent 查询结果', rows, rowStyle: 'keyValue' },
+    { kind: 'output', title: '查询详情', text: context.stringifyValue(record) }
+  ];
 }
 
 function runAgentMetadataSections(context: ToolDisplayContext): ToolDisplaySection[] {
   const record = asRecord(context.result) ?? asRecord(context.progress);
-  if (!record) return [];
+  if (!record || typeof record.state !== 'string') return [];
   const rows = [
-    ...stateRow('子 Agent 状态', record.childExecutionState),
-    ...stateRow('当前任务状态', record.activeChildTurnState),
-    ...stateRow('回答提交状态', record.answerSubmissionState),
-    ...stateRow('回答发送状态', record.runtimeDeliveryState),
-    ...stateRow('主 Agent 处理状态', record.parentHandlingState),
-    ...stateRow('结束状态', record.terminationState)
+    ...stateRow('子 Agent 状态', record.state),
+    ...row('说明', record.reason)
   ];
   return rows.length > 0
     ? [{ kind: 'output', title: '子 Agent 运行结果', rows, rowStyle: 'keyValue' }]
     : [];
 }
 
-function stateRow(label: string, value: unknown): Array<{ label: string; value: string }> {
-  if (typeof value !== 'string') return row(label, value);
+function stateRow(label: string, value: string): Array<{ label: string; value: string }> {
   const text = value.trim();
   if (!text) return [];
   const labels: Record<string, string> = {
     starting: '启动中',
     active: '运行中',
-    running: '运行中',
     idle: '等待继续',
     interrupting: '正在终止',
     interrupted: '已终止',
     closed: '已结束',
-    pending: '等待中',
-    submitted: '已提交',
-    delivered: '已发送',
-    consumed: '已接收',
-    handled: '已处理',
-    failed: '失败',
-    complete: '已完成',
-    completed: '已完成',
-    cancelled: '已取消',
-    awaiting_parent: '等待主 Agent 处理',
-    delivery_failed: '回答发送失败',
-    success: '成功'
+    needs_human: '需要处理'
   };
   return [{ label, value: labels[text] ?? text }];
 }

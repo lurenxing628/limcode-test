@@ -9,6 +9,7 @@ const EDGES = 'merge_exclusion_edges';
 const NODES = 'merge_exclusion_nodes';
 const CONTENT = 'merge_exclusion_content';
 const CONTENT_EDGES = 'merge_exclusion_content_edges';
+const DELETED = 'deleted-before-merge';
 export class RuntimeMergeUnattributedError extends Error {
   public readonly code = 'runtime-data-set-merge-unattributed';
 }
@@ -20,13 +21,15 @@ export class RuntimeMergeConversationExclusions {
   private readonly index = new Database(':memory:');
   private readonly owners;
   private hasSeeds = false;
+  private hasDeleted = false;
+  private readonly deleted: Database.Statement;
   private readonly edge: Database.Statement;
   private readonly content: Database.Statement;
   private readonly identity: Database.Statement;
   private readonly seed: Database.Statement;
   private readonly contains: Database.Statement;
 
-  public constructor(private readonly source: Database.Database) {
+  public constructor(private readonly source: Database.Database, private readonly isSkipped?: (domain: string, id: string) => boolean) {
     this.owners = createRuntimeMergeConversationOwnership(source);
     this.index.pragma('temp_store = FILE');
     this.index.pragma('temp.cache_size = -8192');
@@ -45,12 +48,15 @@ export class RuntimeMergeConversationExclusions {
     this.seed = this.index.prepare(`INSERT INTO temp.${NODES}(domain,id,code) VALUES ('Conversation',?,?) ON CONFLICT(domain,id) DO UPDATE SET count=count+1,
       code=CASE WHEN ${NODES}.code='runtime-data-set-merge-unfinished-work' THEN excluded.code ELSE ${NODES}.code END,
       visited=CASE WHEN ${NODES}.code='runtime-data-set-merge-unfinished-work' AND excluded.code<>'runtime-data-set-merge-unfinished-work' THEN 0 ELSE ${NODES}.visited END`);
-    this.contains = this.index.prepare(`SELECT 1 FROM temp.${NODES} WHERE domain=? AND id=?`);
+    this.contains = this.index.prepare(`SELECT code FROM temp.${NODES} WHERE domain=? AND id=?`).pluck();
+    this.deleted = this.index.prepare(`INSERT OR IGNORE INTO temp.${NODES}(domain,id,code,count,visited) VALUES (?,?,?,0,1)`);
   }
 
   public observe(domain: string, row: RawRow): void {
     this.write(() => {
-      for (const edge of runtimeMergeOwnershipEdges(domain, row)) this.edge.run(edge.fromDomain, edge.fromId, edge.toDomain, edge.toId);
+      const skipped = typeof row.id === 'string' && this.isSkipped?.(domain, row.id);
+      if (skipped) { this.hasDeleted = true; this.deleted.run(domain, row.id, DELETED); }
+      else for (const edge of runtimeMergeOwnershipEdges(domain, row)) this.edge.run(edge.fromDomain, edge.fromId, edge.toDomain, edge.toId);
       for (const edge of runtimeMergeContentIdentityEdges(domain, row)) this.identity.run(edge.fromDomain, edge.fromId, edge.toDomain, edge.toId);
       if (typeof row.id !== 'string') return;
       for (const column of RUNTIME_MERGE_CONTENT_REFERENCE_COLUMNS.get(domain) ?? []) {
@@ -76,8 +82,10 @@ export class RuntimeMergeConversationExclusions {
   public exclude(domain: string, row: RawRow, code: string): void {
     const owners = this.owners.resolve(domain, row);
     if (!owners?.size) throw new RuntimeMergeUnattributedError(`无法按对话剔除 ${domain}:${String(row.id)}（${code}）：内容派生身份或无法归属。`);
+    const retained = [...owners].filter(id => !this.isSkipped?.('Conversation', id) && this.contains.get('Conversation', id) !== DELETED);
+    if (!retained.length) return;
     this.hasSeeds = true;
-    this.write(() => { for (const id of owners) this.seed.run(id, code); });
+    this.write(() => { for (const id of retained) this.seed.run(id, code); });
   }
 
   private contentUsers(id: string): Iterable<{ domain: string; id: string }> {
@@ -91,9 +99,10 @@ export class RuntimeMergeConversationExclusions {
   public excludeContent(id: string, code: string): void {
     let found = false;
     for (const user of this.contentUsers(id)) {
+      if (this.contains.get(user.domain, user.id) === DELETED) continue;
       found = true;
       // The graph already contains every ownership edge; use its source row only for the seed.
-      const owners = this.resolveIndexedOwners(user.domain, user.id);
+      const owners = this.resolveIndexedOwners(user.domain, user.id).filter(owner => this.contains.get('Conversation', owner) !== DELETED);
       if (!owners.length) throw new RuntimeMergeUnattributedError(`无法按对话剔除正文 ${id}（${code}）：引用 ${user.domain}:${user.id} 无法归属。`);
       this.hasSeeds = true;
       this.write(() => { for (const owner of owners) this.seed.run(owner, code); });
@@ -119,7 +128,7 @@ export class RuntimeMergeConversationExclusions {
   }
 
   public requiredContent(id: string): boolean {
-    if (!this.hasSeeds) return true;
+    if (!this.hasSeeds && !this.hasDeleted) return true;
     let found = false;
     for (const user of this.contentUsers(id)) {
       found = true;
@@ -148,10 +157,12 @@ export class RuntimeMergeConversationExclusions {
     }
   }
 
-  public hasProblems(): boolean { return this.hasSeeds; }
+  public hasExclusions(): boolean { return this.hasSeeds || this.hasDeleted; }
 
   public includes(domain: string, id: string): boolean {
-    if (!this.hasSeeds) return false;
+    const reason = (this.hasSeeds || this.hasDeleted) ? this.contains.get(domain,id) : undefined;
+    if (reason === DELETED) return true;
+    if (!this.hasSeeds && !this.hasDeleted) return false;
     if (domain === 'ContentObject') return !this.requiredContent(id);
     if (domain === 'Attachment' || domain === 'AttachmentObservationLink') {
       const users = this.pagedUsers(`WITH RECURSIVE users(domain,id) AS (
@@ -162,12 +173,12 @@ export class RuntimeMergeConversationExclusions {
       for (const user of users) { found = true; if (!this.includes(user.domain,user.id)) return false; }
       return found;
     }
-    return this.contains.get(domain,id) !== undefined;
+    return reason !== undefined;
   }
 
   public excluded(): RuntimeDataSetMergeExcludedConversation[] {
     const title = this.source.prepare('SELECT title FROM conversation WHERE id=?').pluck();
-    const rows = this.index.prepare(`SELECT id AS conversationId,code,count FROM temp.${NODES} WHERE domain='Conversation' ORDER BY id`).all() as Array<Omit<RuntimeDataSetMergeExcludedConversation,'title'>>;
+    const rows = this.index.prepare(`SELECT id AS conversationId,code,count FROM temp.${NODES} WHERE domain='Conversation' AND code<>? ORDER BY id`).all(DELETED) as Array<Omit<RuntimeDataSetMergeExcludedConversation,'title'>>;
     return rows.map(row => ({...row,title: String(title.get(row.conversationId) ?? row.conversationId)}));
   }
 

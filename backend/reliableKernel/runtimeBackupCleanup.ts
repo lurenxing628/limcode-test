@@ -43,7 +43,7 @@ heldDatabaseFiles,listRenamedForeignRuntimeRoots,locatedSnapshotCacheFiles,locat
 readLocatedRuntimeFile,tryWithForeignRuntimeRootClaim,type DiscoveredForeignRuntimeRoot,
 type HeldDatabaseFiles
 } from './runtimeForeignHistory';
-import { liveForeignRuntimeHistoryViews } from './runtimeForeignHistoryViews';
+import { liveRuntimeHistoryViews } from './runtimeForeignHistoryViews';
 import { readRuntimeHistoryPending,readRuntimeHistoryResidual,RUNTIME_RESET_BACKUPS_DIRECTORY } from './runtimeHistoryRegistry';
 import {
 assertRuntimeHostsOffline,RUNTIME_HOST_LIVENESS_DIRECTORY,withRuntimeDataRootAdmission,withRuntimeMaintenance,withRuntimeMaintenanceActivity,
@@ -58,59 +58,31 @@ type VscodeRuntimeDataSetCandidate
 } from './vscodeRootAuthority';
 
 /**
- * 清理备份 (migration.json#backupCleanup). Deletes only copies whose readable history is proven to
- * exist completely in one local data set of the same configuration root (see coverageIn): every
- * Conversation and MessageRevision id of the copy, the ids of the other history rows a person sees
- * (RUNTIME_HISTORY_RECORD_DOMAINS: turns, tool calls and results, file changes, interactions and
- * answers, processes and their output, attachments, compressions, child executions, collaboration
- * messages), every body present at its recorded size in that data set's CAS, and what is visible:
- * every message the copy shows is shown there with the same current revision. Conversations are
- * hard-deleted (with everything of theirs); a copy holding one the local data set no longer has is
- * kept as history. A message deleted, edited or retried there is only soft-deleted or replaced: its
- * rows stay, but nothing shows it any more, so a copy that still shows it is deletable only when the
- * user ticks it knowingly (replacedMessages; never ticked by default).
+ * 清理备份 (migration.json#backupCleanup). Ordinary upgrade, target-merge and source-finalization
+ * backups are proven only by the current Runtime's worker reader: every Conversation,
+ * MessageRevision, visible history record and body must exist there. Messages deleted, edited or
+ * retried in the current library are listed separately and never selected by default.
  *
- * Three kinds of backups can be deleted: upgrade backups (epoch-migration-backups/), pre-merge
- * backups of the target (merge-backups/) and source backups before finalization
- * (merge-source-backups/), each holding only what its kind writes; and foreign history (see
- * "Foreign history" below): verified archives of 归档并重置 and data sets in directories copied
- * aside by a data-root relocation. A copied directory as a whole (its settings, rules and skills),
- * the old-format backups/ of a control root and .limcode-data-backups are only listed. Planning reads
- * the copies without claims (settling leftovers and copying another data set take theirs; the window
- * runs it as a write command, like the deletion); deletion re-verifies under configuration admission
- * and the control root's maintenance (publishing 清理备份 to waiting windows), compares the directory
- * once more as the last step before renaming it to `<name>.deleting-<id>`, checks the coverage and the
- * directory once more (deleting a Conversation or a message takes no claim) and only then marks it
- * verified (for this configuration root) and removes it. A leftover of a crash is removed by the next
- * cleanup when this installation verified it (from this configuration root, or from a data directory
- * it left: never given its name back half removed); otherwise it gets its name back and is checked
- * again. Symbolic links are never followed. A pre-merge backup a large-merge preparation registered
- * (preparing-backups/) stays while registered and unused, and never anchors the newest one kept.
+ * Completely merged local and foreign sources use a separate proof: the latest successful ledger
+ * targets the current selected library, and the exact source file-state fingerprint remains cached
+ * and unchanged. Pending, partial, residual and deletion-skipped sources stay. New reset backups,
+ * independent nested backups, diagnostic captures and process output are also retained.
  *
- * POSIX lock rule: the current data set is read only through its own worker reader (`snapshot`);
- * its files are never opened or closed by this process, and neither is any copy or other data set
- * whose database or WAL is the same inode (a hard link) as a local data set's database files (dev:ino
- * compared by stat before anything is copied). Other data sets and the copies are read in the facts
- * worker from private copies (runtimeDataSetFacts), straight from the tables. CAS presence uses the
- * logical boundary's length-only proof: live CAS borrows its Runtime owner; other packed stores
- * use scoped private copies after the Runtime facts. Neither tier hashes bodies for this check.
+ * Deletion checks identities, registrations and the directory before and after renaming it to
+ * `<name>.deleting-<id>`, then writes a durable verified mark before removing anything. Unverified
+ * crash leftovers regain their names; verified leftovers finish under the original claims. Actual
+ * deletion outcomes survive later failures to release a claim.
  *
- * Foreign history (runtimeForeignHistory): only roots that pass its verification, each deleted as
- * its located control root (a whole archive; in a copied directory only the data set, never the
- * directory with its settings, rules and skills). One is proven when a local data set other than the
- * open one has its identity and exactly its content digest, with every body in its CAS (the open one
- * has no safe digest: its files are not copied), or when its history and that of every backup its
- * control root keeps is covered by one local data set of this configuration root. Anything else in
- * it (old-format backups/, debug captures, output of a process, an unknown entry or type, unfinished
- * tasks when proven by coverage) keeps it whole. Its claim (.limcode-runtime-merges/foreign-claims/<id>)
- * is taken without waiting, and a read-only view that is open on it (runtimeForeignHistoryViews)
- * counts as holding it: busy, it is kept. Inside the claim it is located and verified again; the
- * configuration admission is held until its verified mark is durable, and the removal of its content
- * store follows under the claim alone. The only writes in a foreign directory are the rename, the
- * verified mark and the removal of the deleted root itself; SQLite files of it are copied only
- * through the foreign copy (dev:ino checks, state before and after). Two installations sharing a
- * previous data directory do not exclude each other (their claims live in their own configuration
- * roots): a known limitation.
+ * Local sources are checked offline under configuration admission and their maintenance claim;
+ * foreign sources take their existing nonwaiting claim. Both retain an open read-only history view.
+ * A foreign source is removed only as its located control root: copied settings, rules and skills
+ * remain. Its admission is released after the verified mark, before removing the content store.
+ *
+ * The current SQLite files are never opened by this process: all current reads borrow `snapshot`.
+ * Backup facts use private worker copies, avoiding any database/WAL inode held by a local Runtime.
+ * CAS coverage borrows the current Runtime's length-only proof and does not hash historical bodies.
+ * Symbolic links are never followed. Separate installations sharing a previous data directory still
+ * have separate configuration-root claims.
  */
 
 /** An upgrade backup can be deleted only this long after its upgrade completed. */
@@ -591,68 +563,81 @@ export async function deleteRuntimeBackups(
   let started = 0;
   const stage = () => `正在删除第 ${Math.max(started, 1)}/${total} 份备份`;
   if (selected.length > 0) {
-    // Published in the admission as well as in each maintenance claim: a window waiting to open sees
-    // why (清理备份) for as long as the deletion holds either.
-    await withRuntimeDataRootAdmission(configurationRootPath, () => withRuntimeMaintenanceActivity({
-      ...ACTIVITY, stage: stage()
-    }, async (admission) => {
-      const cache = new CoverageCache(configurationRootPath);
-      for (const group of byRoot.values()) {
-        const controlRootPath = group[0].controlRootPath;
-        const paths = createRuntimeRootPaths(path.join(controlRootPath, VSCODE_RUNTIME_ACTIVE_DIRECTORY));
-        await withRuntimeMaintenance(paths, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage: stage() }, async (activity) => {
-          const { roots, databaseFiles } = await listControlRoots(configurationRootPath, current, () => undefined);
-          const root = roots.find((entry) => comparable(entry.controlRootPath) === comparable(controlRootPath));
-          const ledger = await readLedgerFacts(configurationRootPath);
-          for (const proof of group) {
-            started += 1;
-            activity.report(stage());
-            const keep = (reason: string, detail?: string) => result.kept.push({
-              key: proof.item.key, name: proof.item.name, path: proof.item.path, reason, ...(detail ? { detail } : {})
-            });
-            if (!root) { keep('所在历史库已不在原处，这一项没有删除'); continue; }
-            const entry = await backupEntry(configurationRootPath, root, proof.kind, proof.item.name);
-            if (!entry) { keep('已经不在原处（可能已被其它操作删除）'); continue; }
-            const evaluation = await evaluateBackup({
-              configurationRootPath, root, kind: proof.kind, entry, ledger, current, cache, databaseFiles, bodies: new BodyCheck(current), now: now(), known: proof
-            });
-            if (!evaluation.proof) { keep(`${evaluation.item.reason}；这一项没有删除`, evaluation.item.detail); continue; }
-            try {
-              await options.onFaultPoint?.('before-rename', proof.item.key);
-            } catch (error) {
-              keep('没有删除', errorMessage(error));
-              continue;
-            }
-            // The last step before the rename (its coverage was read again meanwhile): the same directory
-            // (not a link put in its place), with the same entries in the same state.
-            if (!await sameShallowTree(entry.path, proof.tree)) { keep('列出之后这份备份有变化，请重新检查；这一项没有删除'); continue; }
-            const outcome = await removeBackupDirectory(entry.path, {
-              configurationRootPath,
-              afterRename: () => options.onFaultPoint?.('after-rename', proof.item.key),
-              afterVerify: () => options.onFaultPoint?.('after-verify', proof.item.key),
-              stillCovered: async (deleting) => await stillCovered(root, proof, current)
-                ?? (await sameShallowTree(deleting, proof.tree) ? undefined : '改名前后这份备份有变化，请重新检查')
-            });
-            if (outcome.state === 'deleted') {
-              result.deleted.push({
-                key: proof.item.key, name: proof.item.name, path: proof.item.path,
-                bytes: proof.item.bytes, reclaimableBytes: proof.item.reclaimableBytes
+    try {
+      // Published in the admission as well as in each maintenance claim: a window waiting to open sees
+      // why (清理备份) for as long as the deletion holds either.
+      await withRuntimeDataRootAdmission(configurationRootPath, () => withRuntimeMaintenanceActivity({
+        ...ACTIVITY, stage: stage()
+      }, async (admission) => {
+        const cache = new CoverageCache(configurationRootPath);
+        for (const group of byRoot.values()) {
+          const controlRootPath = group[0].controlRootPath;
+          const paths = createRuntimeRootPaths(path.join(controlRootPath, VSCODE_RUNTIME_ACTIVE_DIRECTORY));
+          await withRuntimeMaintenance(paths, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage: stage() }, async (activity) => {
+            const { roots, databaseFiles } = await listControlRoots(configurationRootPath, current, () => undefined);
+            const root = roots.find((entry) => comparable(entry.controlRootPath) === comparable(controlRootPath));
+            const ledger = await readLedgerFacts(configurationRootPath);
+            for (const proof of group) {
+              started += 1;
+              activity.report(stage());
+              const keep = (reason: string, detail?: string) => result.kept.push({
+                key: proof.item.key, name: proof.item.name, path: proof.item.path, reason, ...(detail ? { detail } : {})
               });
-              await cache.remove(backupSubject(configurationRootPath, entry.path));
-            } else if (outcome.state === 'unfinished') {
-              result.unfinished.push({
-                key: proof.item.key, name: proof.item.name, path: proof.item.path, reason: outcome.reason,
-                ...(outcome.detail ? { detail: outcome.detail } : {})
+              if (!root) { keep('所在历史库已不在原处，这一项没有删除'); continue; }
+              const entry = await backupEntry(configurationRootPath, root, proof.kind, proof.item.name);
+              if (!entry) { keep('已经不在原处（可能已被其它操作删除）'); continue; }
+              const evaluation = await evaluateBackup({
+                configurationRootPath, root, kind: proof.kind, entry, ledger, current, cache, databaseFiles, bodies: new BodyCheck(current), now: now(), known: proof
               });
-            } else {
-              keep(outcome.reason, outcome.detail);
+              if (!evaluation.proof) { keep(`${evaluation.item.reason}；这一项没有删除`, evaluation.item.detail); continue; }
+              try {
+                await options.onFaultPoint?.('before-rename', proof.item.key);
+              } catch (error) {
+                keep('没有删除', errorMessage(error));
+                continue;
+              }
+              // The last step before the rename (its coverage was read again meanwhile): the same directory
+              // (not a link put in its place), with the same entries in the same state.
+              if (!await sameShallowTree(entry.path, proof.tree)) { keep('列出之后这份备份有变化，请重新检查；这一项没有删除'); continue; }
+              const outcome = await removeBackupDirectory(entry.path, {
+                configurationRootPath,
+                afterRename: () => options.onFaultPoint?.('after-rename', proof.item.key),
+                afterVerify: () => options.onFaultPoint?.('after-verify', proof.item.key),
+                stillCovered: async (deleting) => await stillCovered(root, proof, current)
+                  ?? (await sameShallowTree(deleting, proof.tree) ? undefined : '改名前后这份备份有变化，请重新检查')
+              });
+              if (outcome.state === 'deleted') {
+                result.deleted.push({
+                  key: proof.item.key, name: proof.item.name, path: proof.item.path,
+                  bytes: proof.item.bytes, reclaimableBytes: proof.item.reclaimableBytes
+                });
+                await cache.remove(backupSubject(configurationRootPath, entry.path));
+              } else if (outcome.state === 'unfinished') {
+                result.unfinished.push({
+                  key: proof.item.key, name: proof.item.name, path: proof.item.path, reason: outcome.reason,
+                  ...(outcome.detail ? { detail: outcome.detail } : {})
+                });
+              } else {
+                keep(outcome.reason, outcome.detail);
+              }
             }
-          }
-        }));
-        // Leaving the maintenance claim also took the marker out of the admission: publish it again.
-        admission.report(`已处理 ${started}/${total} 份备份`);
+          }));
+          // Leaving the maintenance claim also took the marker out of the admission: publish it again.
+          admission.report(`已处理 ${started}/${total} 份备份`);
+        }
+      }));
+    } catch (error) {
+      // Deletion is irreversible: releasing a claim cannot erase the outcomes already recorded.
+      console.warn('[LimCode] Backup cleanup stopped; completed deletion results are retained.', error);
+      const reported = new Set([...result.deleted, ...result.kept, ...result.unfinished].map((item) => item.key));
+      for (const proof of [...selected, ...selectedForeign]) {
+        if (!reported.has(proof.item.key)) result.kept.push({
+          key: proof.item.key, name: proof.item.name, path: proof.item.path,
+          reason: '清理途中出错，这一项没有删除', detail: errorMessage(error)
+        });
       }
-    }));
+      return result;
+    }
   }
   const cache = new CoverageCache(configurationRootPath);
   const emptied = new Map<string, string>();
@@ -684,7 +669,7 @@ export async function deleteRuntimeBackups(
           try {
             await options.onFaultPoint?.('after-verify', proof.item.key);
           } catch (error) {
-            return { value: unfinishedRemoval(marked.deleting, error) };
+            return { value: removal = unfinishedRemoval(marked.deleting, error) };
           }
           return {
             value: { state: 'deleted' },
@@ -802,7 +787,7 @@ async function listControlRoots(
     if (comparable(path.dirname(candidate.runtimeDataRootPath)) !== comparable(root.controlRootPath)) {
       root.unavailable = '历史库的位置与目录不一致，按历史保留';
     } else if (candidate.requiresRecovery) {
-      root.unavailable = '所在历史库有未完成的切换，打开它完成恢复之后再清理';
+      root.unavailable = '所在历史库有未完成的目录恢复，完成恢复后再清理';
     } else if (!candidate.dataSetId) {
       root.unavailable = '所在位置没有已初始化的历史库，无法核对';
     } else {
@@ -1914,19 +1899,34 @@ async function withForeignClaimReleasingAdmission<T>(
   let decided!: () => void;
   const decision = new Promise<void>((resolve) => { decided = resolve; });
   let claimed: Promise<{ acquired: true; value: T } | { acquired: false }> | undefined;
-  await withRuntimeDataRootAdmission(configurationRootPath, () => withRuntimeMaintenanceActivity(activity, async () => {
-    claimed = tryWithForeignRuntimeRootClaim(configurationRootPath, id, rootPointerPath, async () => {
-      let step: { value: T; after?: () => Promise<T> };
-      try {
-        step = await withRuntimeMaintenanceActivity(activity, decide);
-      } finally {
-        decided();
-      }
-      return step.after ? step.after() : step.value;
-    });
-    await Promise.race([decision, claimed.then(() => undefined, () => undefined)]);
-  }));
-  return claimed!;
+  let completed: { acquired: true; value: T } | undefined;
+  try {
+    await withRuntimeDataRootAdmission(configurationRootPath, () => withRuntimeMaintenanceActivity(activity, async () => {
+      claimed = tryWithForeignRuntimeRootClaim(configurationRootPath, id, rootPointerPath, async () => {
+        let step: { value: T; after?: () => Promise<T> };
+        try {
+          step = await withRuntimeMaintenanceActivity(activity, decide);
+        } finally {
+          decided();
+        }
+        const value = step.after ? await step.after() : step.value;
+        completed = { acquired: true, value };
+        return value;
+      });
+      await Promise.race([decision, claimed.then(() => undefined, () => undefined)]);
+    }));
+  } catch (error) {
+    if (!claimed) throw error;
+    // The foreign task owns its result after handoff; a release failure must still join that task.
+    console.warn('[LimCode] Backup cleanup admission release failed; awaiting the foreign operation result.', error);
+  }
+  try {
+    return await claimed!;
+  } catch (error) {
+    if (!completed) throw error;
+    console.warn('[LimCode] Backup cleanup foreign claim release failed; the completed result is retained.', error);
+    return completed;
+  }
 }
 
 /**
@@ -1983,25 +1983,39 @@ async function settleInterruptedDeletions(
   };
   const stage = '正在收尾上次没有删完的备份';
   if (pending.length > 0) {
-    await withRuntimeDataRootAdmission(configurationRootPath, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage }, async (admission) => {
-      for (const { root, leftovers } of pending) {
-        await withRuntimeMaintenance(root.paths, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage }, async () => {
-          for (const leftover of leftovers) {
-            if(leftover.original===root.controlRootPath) {
-              await assertRuntimeHostsOffline(root.paths);
-              if(await legacyWorkspaceRuntimeOwnerState({configurationRootPath,runtimeScopeRootPath:root.scopeRootPath})!=='absent') continue;
-            }
-            const decision = await decideLeftover(leftover, configurationRootPath, configurationRootPath, readLocalText, problem, previous);
-            record(decision === 'verified' ? await finishLeftover(leftover, problem) : decision, leftover);
+    try {
+      await withRuntimeDataRootAdmission(configurationRootPath, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage }, async (admission) => {
+        for (const { root, leftovers } of pending) {
+          try {
+            await withRuntimeMaintenance(root.paths, () => withRuntimeMaintenanceActivity({ ...ACTIVITY, stage }, async () => {
+              for (const leftover of leftovers) {
+                if(leftover.original===root.controlRootPath) {
+                  await assertRuntimeHostsOffline(root.paths);
+                  if(await legacyWorkspaceRuntimeOwnerState({configurationRootPath,runtimeScopeRootPath:root.scopeRootPath})!=='absent') continue;
+                }
+                const decision = await decideLeftover(leftover, configurationRootPath, configurationRootPath, readLocalText, problem, previous);
+                record(decision === 'verified' ? await finishLeftover(leftover, problem) : decision, leftover);
+              }
+            }));
+          } catch (error) {
+            problem(`${root.controlRootPath} 上次清理的收尾或维护声明释放出错；已完成的结果保留，其余下次再试。`, error);
           }
-        }));
-        // Leaving a claim also took the marker out of the admission: publish it again.
-        admission.report(`${stage}（${path.basename(root.controlRootPath)}）`);
-      }
-    }));
+          // Leaving a claim also took the marker out of the admission: publish it again.
+          admission.report(`${stage}（${path.basename(root.controlRootPath)}）`);
+        }
+      }));
+    } catch (error) {
+      problem('上次清理的准入操作出错；已完成的结果保留，其余下次再试。', error);
+      return { finished, restored };
+    }
   }
   if (foreign.length === 0) return { finished, restored };
-  const held = await heldFiles(configurationRootPath, context.databaseFiles);
+  let held: HeldDatabaseFiles;
+  try { held = await heldFiles(configurationRootPath, context.databaseFiles); }
+  catch (error) {
+    problem('外来备份收尾所需的文件状态无法核对；已完成的结果保留，其余下次再试。', error);
+    return { finished, restored };
+  }
   const read: TextReader = async (file) => (await readLocatedRuntimeFile(file, held, MAX_FOREIGN_RECORD_BYTES)).toString('utf8');
   for (const leftover of foreign) {
     const name = path.basename(leftover.path);
@@ -2139,7 +2153,7 @@ async function foreignMergePending(configurationRootPath: string, foreignId: str
     if ((await readRuntimeHistoryPending(paths)).has(foreignId)) return '旧数据尚待合并，完成之前保留';
     return undefined;
   } catch {
-    return '合并记录无法读取，不能确认它没有正在提交的合并或等待中的合并请求，这次不能删除';
+    return '合并记录无法读取，无法确认旧数据已完整合并，这次不能删除';
   }
 }
 async function evaluateForeign(input: ForeignPlanning, found: DiscoveredForeignRuntimeRoot, unit: string, held: HeldDatabaseFiles): Promise<{item:RuntimeBackupCleanupItem;proof?:ForeignProof}> {
@@ -2271,7 +2285,7 @@ async function isClaimDirectory(entry: string, name: string, info: { isDirectory
 async function markForeignRoot(proof:ForeignProof, context:{configurationRootPath:string;current:RuntimeBackupCleanupCurrent;options:RuntimeBackupDeletionOptions}):Promise<{state:'marked';deleting:string}|RemovalOutcome> {
   const {configurationRootPath,current,options}=context;
   const keep=(reason:string):RemovalOutcome=>({state:'kept',reason});
-  if (!proof.local && await liveForeignRuntimeHistoryViews(configurationRootPath,proof.root.id)>0) return keep(FOREIGN_BUSY);
+  if (await liveRuntimeHistoryViews(configurationRootPath,proof.root.id)>0) return keep(FOREIGN_BUSY);
   const recheck=async():Promise<string|undefined>=>{
     if (!sameBinding(current.binding,proof.target)) return '当前库身份已变化，请重新检查';
     const paths={globalStoragePath:configurationRootPath};

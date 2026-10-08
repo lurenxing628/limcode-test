@@ -566,7 +566,9 @@ export async function locateForeignRuntimeRoot(
   const pointerEpoch = (pointer as { runtimeKernelEpoch?: unknown } | null)?.runtimeKernelEpoch;
   if (typeof pointerEpoch === 'number' && pointerEpoch > RUNTIME_KERNEL_EPOCH) {
     throw new ForeignRuntimeHistoryRejection('failed', 'foreign-history-epoch-newer',
-      `它由更新版本的 LimCode 写入（第 ${pointerEpoch} 代格式），当前版本不能读取；更新扩展后可以再看。它原样保留，不会被删除。`);
+      [7, 8, 9, 10].includes(pointerEpoch)
+        ? `它使用未发布的开发版本格式（第 ${pointerEpoch} 代），当前版本不能读取。它原样保留，不会被删除。`
+        : `它由更新版本的 LimCode 写入（第 ${pointerEpoch} 代格式），当前版本不能读取；更新扩展后可以再看。它原样保留，不会被删除。`);
   }
   let recorded: HistoricalRootBinding;
   try { recorded = parseHistoricalRootBinding(pointer); }
@@ -944,8 +946,10 @@ export async function openPackedCasSnapshot(
       if (closed) return;
       // Do not remove a copy or release its owner's fence until every SQLite handle is closed.
       await worker?.close();
-      await copy?.remove();
       closed = true;
+      await copy?.remove().catch((error: unknown) => {
+        console.warn('[LimCode] 历史小正文的临时副本没有删掉，留在临时目录里。', error);
+      });
     }
   };
 }
@@ -1021,10 +1025,18 @@ export async function openLocatedCasAccess(
     async open(object) {
       assertOpen();
       const overlay = await overlaid(requireCasObjectIdentity(object));
-      if (overlay) return bufferReadHandle(verifyCasObjectBytes(object, await fs.readFile(overlay.file)));
-      const bytes = await packed.readBytes(requireCasObjectIdentity(object));
-      return bytes === undefined
-        ? openLocatedRuntimeFile(await reachable(object), await currentHeld()) : bufferReadHandle(bytes);
+      let handle: CasObjectReadHandle;
+      if (overlay) handle = bufferReadHandle(verifyCasObjectBytes(object, await fs.readFile(overlay.file)));
+      else {
+        const bytes = await packed.readBytes(requireCasObjectIdentity(object));
+        handle = bytes === undefined
+          ? await openLocatedRuntimeFile(await reachable(object), await currentHeld()) : bufferReadHandle(bytes);
+      }
+      if (!signal) return handle;
+      return {
+        read(buffer, offset, length, position) { assertOpen(); return handle.read(buffer, offset, length, position); },
+        close: () => handle.close()
+      };
     },
     async close() {
       if (closed) return;

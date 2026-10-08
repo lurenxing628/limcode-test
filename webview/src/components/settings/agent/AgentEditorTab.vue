@@ -80,7 +80,7 @@ function explainDeleteRestriction(): void { const agent = activeAgent.value; if 
     </label>
 
     <SystemPromptScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 角色提示词" description="按全局 → Agent → 工作流 → 对话 → 本次运行的顺序拼接。这里定义这个 Agent 的角色。" />
-    <RuntimeContextScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 初始上下文模板" description="用于生成 Agent 的初始上下文；变量只在生成或刷新时替换一次。" />
+    <RuntimeContextScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 初始上下文模板" description="用于生成 Agent 新对话的初始上下文；变量只在首次启动时替换一次。" />
     <ModelProfileScopeEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 默认 LLM" description="当对话、工作流或本次运行没有单独设置时使用。" />
     <ToolPolicyEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 工具能力上限" description="Agent 的工具策略决定能力上限；工作流、对话和本次运行只能继续收窄，不能扩大。" />
     <SkillPolicyEditor v-if="activeAgent" scope-kind="agent" :scope-id="activeAgent.id" title="Agent 技能策略" description="限制这个 Agent 可使用的技能；未配置时继承全局技能策略。" />

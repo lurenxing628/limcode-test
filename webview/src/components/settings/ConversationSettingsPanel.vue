@@ -63,7 +63,7 @@ function reload(): void {
       scope-kind="conversation"
       :scope-id="settings.common.conversationId"
       title="对话初始上下文模板"
-      description="用于生成当前对话的初始上下文；可以手动刷新，刷新内容不会写入聊天记录。"
+      description="用于生成当前对话尚未建立的初始上下文；已生成的内容保持不变。"
     />
 
     <WorkEnvironmentPolicyEditor

@@ -24,7 +24,7 @@ const fsSync = require('node:fs');
 const foreign = kernelFile('runtimeForeignHistory.js');
 const foreignMerge = kernelFile('runtimeForeignHistoryMerge.js');
 const { HISTORICAL_MERGE_ENGINE: engine, mergeHistoricalDataSetsOnline, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE } = kernelFile('runtimeDataSetMerge.js');
-const { prepareLargeMergeSources, runLargeMergeSession } = kernelFile('runtimeDataSetStreamedMerge.js');
+const { prepareLargeMergeSources, releaseLargeMergePreparation, runLargeMergeSession } = kernelFile('runtimeDataSetStreamedMerge.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { openRuntimeDataSetHistory } = kernelFile('runtimeDataSetHistory.js');
 const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBackupCleanup.js');
@@ -156,17 +156,17 @@ async function merge(fixture, sources, options = {}, open) {
 }
 
 /** The large-merge session as its caller runs it: prepared online, then run with the window's Runtime closed. */
-async function mergeStreamed(fixture, candidateIds, { beforeSession } = {}) {
+async function mergeStreamed(fixture, candidateIds, { beforeSession, options, signal } = {}) {
   const database = await openWindow(fixture);
   let preparation;
   try {
     preparation = await prepareLargeMergeSources({
-      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds, requested: true, options: SMALL_LIMITS
+      paths: fixture.paths, target: { configurationRootPath: fixture.root, database }, candidateIds, requested: true, options: { ...SMALL_LIMITS, ...options }
     });
   } finally { await database.close(); }
   await beforeSession?.(preparation);
   const session = await withRuntimeDataRootAdmission(fixture.root, () => withRuntimeMaintenance(fixture.current.binding.paths,
-    () => runLargeMergeSession({ paths: fixture.paths, prepared: preparation })));
+    () => runLargeMergeSession({ paths: fixture.paths, prepared: preparation, ...(signal ? { signal } : {}) })));
   return { preparation, session };
 }
 
@@ -238,6 +238,40 @@ test('拷来目录里的外来库在线合并进当前库：只经 located 读�
   assert.deepEqual(again.merged.map((item) => [item.candidateId, item.alreadyMerged, item.label, item.insertedRows]), [[source.id, true, source.label, 0]],
     '合并过、之后没变化：提示没有新内容');
   assert.deepEqual(await treeState(container), before);
+
+  // One automatic source keeps its deadline across fingerprinting and the actual held merge.
+  const sourceDatabase = new Database(source.databasePath);
+  try {
+    sourceDatabase.prepare('UPDATE conversation SET title=? WHERE id=?').run('来源的新标题', 'far_conversation_0');
+    sourceDatabase.pragma('wal_checkpoint(TRUNCATE)');
+  } finally { sourceDatabase.close(); }
+  await request(fixture, source);
+  const now = Date.now;
+  const timer = globalThis.setTimeout;
+  const fingerprint = foreignMerge.foreignHistoricalMergeFingerprint;
+  const clock = now();
+  let elapsed = 0;
+  const budgets = [];
+  Date.now = () => clock + elapsed;
+  globalThis.setTimeout = (callback, milliseconds, ...args) => {
+    if (milliseconds === 120_000 || milliseconds === 50_000) budgets.push(milliseconds);
+    return timer(callback, milliseconds, ...args);
+  };
+  foreignMerge.foreignHistoricalMergeFingerprint = async (...args) => {
+    const result = await fingerprint(...args);
+    elapsed = 70_000;
+    return result;
+  };
+  let automatic;
+  try { automatic = await merge(fixture, undefined); }
+  finally {
+    Date.now = now;
+    globalThis.setTimeout = timer;
+    foreignMerge.foreignHistoricalMergeFingerprint = fingerprint;
+  }
+  assert.deepEqual([automatic.deferred, automatic.failures], [[], []]);
+  assert.equal(elapsed, 70_000, '走过锁外指纹阶段，无需实际等待');
+  assert.deepEqual(budgets, [120_000, 50_000], '指纹用了70秒，实际合并只剩50秒，不重置来源预算');
 });
 
 test('小、中、大三种规模的外来库各合并一次：小的在线，中等的经独占协调，大的进入大库会话（会话里显示可读名称）；合并后两次打开当前库，Provider 调用都为 0', { timeout: 300_000 }, async (t) => {
@@ -555,8 +589,9 @@ test('纵深防护：在配置准入内取外来库的声明直接拒绝（锁�
 });
 
 
-test('新重置备份仅在残留明确重试后按登记位置合并', async (t) => {
+for (const mode of ['online', 'streamed']) test(`新重置备份仅在残留明确重试后按登记位置合并：${mode}`, async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
+  const expected = conversations(fixture);
   const reset = require(path.join(compiled, 'backend/application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js'));
   const result = await reset.archiveCurrentRuntimeRootForReset(fixture.current.authority, fixture.root);
   fixture.current = await initialize(fixture.root, 'default');
@@ -567,10 +602,19 @@ test('新重置备份仅在残留明确重试后按登记位置合并', async (t
   await registry.writeRuntimeHistoryPending(fixture.paths, { id: residual.id, sourceKind: 'reset', location: residual.location,
     identity: { dataSetId: located.recorded.dataSetId, rootInstanceId: located.recorded.rootInstanceId },
     registeredAt: NOW, reason: '用户在残留列表里选择重新合并' });
-  const report = await merge(fixture, undefined, { candidateIds: [residual.id] });
-  assert.deepEqual(report.failures, []);
-  assert.deepEqual(report.blocked, []);
-  assert.equal(report.merged[0]?.candidateId, residual.id, JSON.stringify(report));
+  if (mode === 'online') {
+    const report = await merge(fixture, undefined, { candidateIds: [residual.id] });
+    assert.deepEqual(report.failures, []);
+    assert.deepEqual(report.blocked, []);
+    assert.equal(report.merged[0]?.candidateId, residual.id, JSON.stringify(report));
+  } else {
+    const { preparation, session } = await mergeStreamed(fixture, [residual.id], { options: { sizeLimits: { transactionRows: 0 } } });
+    assert.equal(preparation.sources.length, 1);
+    assert.deepEqual(session.results.map(item => [item.state, item.result?.candidateId]), [['merged', residual.id]]);
+  }
+  assert.deepEqual(conversations(fixture), expected);
+  assert.equal((await registry.readRuntimeHistoryPending(fixture.paths)).has(residual.id), false);
+  assert.equal((await registry.readRuntimeHistoryResidual(fixture.paths)).has(residual.id), false);
 });
 
 test('后台外来核验取消等待worker退出并清理私有副本之后释放声明', async (t) => {
@@ -595,4 +639,145 @@ test('后台外来核验取消等待worker退出并清理私有副本之后释�
     await assert.rejects(fs.stat(snapshotPath), { code: 'ENOENT' }, 'worker退出后私有副本已清理');
   } finally { await hold.release(); }
   assert.equal(hold.held, false);
+});
+
+test('流式准备的取消传到外来审计，停止后释放声明和私有副本', async (t) => {
+  const fixture = await home(t);
+  const { container } = await copiedDirectory(fixture, source => seedConversations(source.current, [{ id: 'cancelled_source' }]));
+  const source = await found(fixture, container);
+  await request(fixture, source);
+  const controller = new AbortController();
+  const copy = foreign.copyLocatedRuntimeDatabase;
+  let snapshotPath;
+  foreign.copyLocatedRuntimeDatabase = async (...args) => {
+    const copied = await copy(...args);
+    snapshotPath = copied.databasePath;
+    return copied;
+  };
+  t.after(() => { foreign.copyLocatedRuntimeDatabase = copy; });
+  const database = await openWindow(fixture);
+  let preparation;
+  try {
+    preparation = await prepareLargeMergeSources({ paths: fixture.paths,
+      target: { configurationRootPath: fixture.root, database }, candidateIds: [source.id], requested: true, signal: controller.signal,
+      options: { sizeLimits: { transactionRows: 0 }, onFaultPoint: point => {
+        if (point === 'after-snapshot-copy') controller.abort();
+      } } });
+    assert.equal(preparation.report.stopped, true);
+    assert.deepEqual(preparation.sources, []);
+    assert.ok(snapshotPath);
+    await assert.rejects(fs.stat(snapshotPath), { code: 'ENOENT' });
+    const claim = await foreign.tryWithForeignRuntimeRootClaim(fixture.root, source.id, source.root.located.rootPointerPath, async () => true);
+    assert.equal(claim.acquired, true);
+  } finally {
+    foreign.copyLocatedRuntimeDatabase = copy;
+    if (preparation) await releaseLargeMergePreparation(preparation);
+    await database.close();
+  }
+});
+
+test('流式执行阶段复制外来来源时使用本阶段取消理由，停止复制并释放声明', async (t) => {
+  const fixture = await home(t);
+  const { container } = await copiedDirectory(fixture, source => seedConversations(source.current, [{ id: 'cancelled_copy' }]));
+  const source = await found(fixture, container);
+  await request(fixture, source);
+  const controller = new AbortController();
+  const reason = new Error('用户取消本次合并');
+  const copy = foreign.copyLocatedRuntimeDatabase;
+  let executing = false, copiedAfterCancel = false;
+  foreign.copyLocatedRuntimeDatabase = async (...args) => {
+    if (executing) controller.abort(reason);
+    const result = await copy(...args);
+    if (executing) copiedAfterCancel = true;
+    return result;
+  };
+  try {
+    const { session } = await mergeStreamed(fixture, [source.id], { options: { sizeLimits: { transactionRows: 0 } },
+      signal: controller.signal, beforeSession: () => { executing = true; } });
+    assert.equal(copiedAfterCancel, false);
+    assert.equal(session.cancelled, true);
+    assert.deepEqual(session.results.map(item => [item.state, item.issue?.code]), [['deferred', 'runtime-data-set-merge-cancelled']]);
+    assert.deepEqual(conversations(fixture), []);
+    const claim = await foreign.tryWithForeignRuntimeRootClaim(fixture.root, source.id, source.root.located.rootPointerPath, async () => true);
+    assert.equal(claim.acquired, true);
+  } finally { foreign.copyLocatedRuntimeDatabase = copy; }
+});
+
+test('同一外来位置的迁移登记别名不会等待本批已持有的声明', { timeout: 10_000 }, async (t) => {
+  const fixture = await home(t);
+  const { container } = await copiedDirectory(fixture, source => seedConversations(source.current, [{ id: 'shared_source' }]));
+  const source = await found(fixture, container);
+  await request(fixture, source);
+  const registry = kernelFile('runtimeHistoryRegistry.js');
+  const alias = `migration:fixture:${source.id}`;
+  await registry.writeRuntimeHistoryPending(fixture.paths, { id: alias, sourceKind: 'migration', location: source.location,
+    identity: { dataSetId: source.root.recorded.dataSetId, rootInstanceId: source.root.recorded.rootInstanceId },
+    reason: '迁入目录里的同位置登记', registeredAt: NOW });
+  const held = [];
+  const acquire = foreignMerge.holdForeignHistoricalMergeSource;
+  foreignMerge.holdForeignHistoricalMergeSource = async (...args) => {
+    const hold = await acquire(...args);
+    held.push(hold);
+    return hold;
+  };
+  const database = await openWindow(fixture);
+  let preparation;
+  const preparing = prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database },
+    candidateIds: [source.id, alias], requested: true, options: { sizeLimits: { transactionRows: 0 } } });
+  t.after(async () => {
+    foreignMerge.holdForeignHistoricalMergeSource = acquire;
+    for (const hold of held) await hold.release();
+    const ready = await preparing.catch(() => undefined);
+    if (ready) await releaseLargeMergePreparation(ready);
+    await database.close();
+  });
+  preparation = await preparing;
+  assert.deepEqual(preparation.sources.map(item => item.candidateId), [source.id]);
+  assert.deepEqual(preparation.report.deferred.map(item => item.candidateId), [alias]);
+  await releaseLargeMergePreparation(preparation);
+});
+
+test('外来 packed CAS 临时副本删除失败只记残留，已合并结果和声明释放保持成功', async (t) => {
+  const fixture = await home(t);
+  const { PACKED_CAS_FILE } = kernelFile('packedCasWorkerProtocol.js');
+  const { container } = await copiedDirectory(fixture, source => withRuntime(source.current, async database => {
+    const store = kernel.ContentAddressedStore.forDatabase(source.current.authority, database);
+    await store.ingest(database, 'packed source body', 'text/plain');
+    await database.transaction([repo('Conversation').insert({ id: 'packed_source', title: 'packed source', status: 'active', created_at: NOW, updated_at: NOW })]);
+  }));
+  const source = await found(fixture, container);
+  await request(fixture, source);
+  const remove = fsp.rm;
+  const warn = console.warn;
+  const acquire = foreignMerge.holdForeignHistoricalMergeSource;
+  const held = [], leftovers = new Set(), warnings = [];
+  let inject = false;
+  foreignMerge.holdForeignHistoricalMergeSource = async (...args) => {
+    const hold = await acquire(...args); held.push(hold); return hold;
+  };
+  fsp.rm = async (file, ...args) => {
+    const directory = path.resolve(String(file));
+    if (inject && path.basename(directory).startsWith(`limcode-runtime-history-${process.pid}-`)
+      && await fs.lstat(path.join(directory, PACKED_CAS_FILE)).then(info => info.isFile(), () => false)) {
+      leftovers.add(directory);
+      throw Object.assign(new Error('临时小正文副本被占用'), { code: 'EPERM' });
+    }
+    return remove.call(fsp, file, ...args);
+  };
+  console.warn = (...args) => { warnings.push(String(args[0])); };
+  try {
+    const { session } = await mergeStreamed(fixture, [source.id], { options: { sizeLimits: { transactionRows: 0 } },
+      beforeSession: () => { inject = true; } });
+    assert.deepEqual(session.results.map(item => item.state), ['merged']);
+    assert.equal((await readLedgerRecord(fixture, source.id)).state, 'merged');
+    assert.ok(conversations(fixture).includes('packed_source'));
+    assert.ok(leftovers.size > 0);
+    assert.ok(warnings.some(message => message.includes('历史小正文的临时副本没有删掉')));
+    const claim = await foreign.tryWithForeignRuntimeRootClaim(fixture.root, source.id, source.root.located.rootPointerPath, async () => true);
+    assert.equal(claim.acquired, true);
+  } finally {
+    inject = false; fsp.rm = remove; console.warn = warn; foreignMerge.holdForeignHistoricalMergeSource = acquire;
+    for (const hold of held) await hold.release();
+    for (const directory of leftovers) await remove.call(fsp, directory, { recursive: true, force: true });
+  }
 });

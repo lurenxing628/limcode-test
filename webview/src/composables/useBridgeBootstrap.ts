@@ -64,6 +64,12 @@ export function useBridgeBootstrap(): void {
     }
     return { sessionId: settingsActivitySessionId, revision: activityRevision, state };
   };
+  const requestConfiguration = (): void => {
+    clientState.beginConfigurationLoad(bridge.ready(settingsActivitySessionId));
+    publishSettingsActivity(true);
+  };
+  disposers.push(watch(() => clientState.configurationReloadRevision,
+    requestConfiguration, { flush: 'sync' }));
   // Sync is essential: a same-event edit + Send must post the dirty fence before the command.
   disposers.push(watch(settingsActivityState,
     () => publishSettingsActivity(), { flush: 'sync' }));
@@ -87,8 +93,7 @@ export function useBridgeBootstrap(): void {
         globalSettings.reconcilePendingSettings();
         systemPrompts.resetPendingSaveForReconnect();
         runtimeContexts.resetPendingSaveForReconnect();
-        bridge.ready(settingsActivitySessionId);
-        publishSettingsActivity(true);
+        requestConfiguration();
       }
       session.applyHello(message.payload?.meta, message.payload?.runtime);
       interactions.replayForClient(message.clientId ?? bridge.currentClientId(), message.id);
@@ -146,6 +151,9 @@ export function useBridgeBootstrap(): void {
     bridge.on(BridgeMessageType.Error, (message) => {
       const payload = message.payload;
       if (!payload) return;
+      if (payload.requestType === BridgeMessageType.Ready) {
+        clientState.rejectConfigurationLoad(message.correlationId, payload.message);
+      }
       if (payload.requestType === BridgeMessageType.InteractionResolve) {
         interactions.observeTransportError(message.correlationId, payload.message);
       }
@@ -221,8 +229,7 @@ export function useBridgeBootstrap(): void {
     )
   );
 
-  bridge.ready(settingsActivitySessionId);
-  publishSettingsActivity(true);
+  requestConfiguration();
   onBeforeUnmount(() => {
     reliableFeed.cancelHistoryRequests();
     globalSettings.closeFetchedModelsDialog();

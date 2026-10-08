@@ -308,9 +308,8 @@ export class VscodeReliableKernelCommandRouter {
   }
 
   /**
-   * Ordinary Conversation-mutating commands still acquire and pin the writer owner. Turn
-   * interruption is the only exception: it commits a fenced durable request for the owner to
-   * execute, without taking over its running capabilities.
+   * Commands that execute Conversation work acquire and pin its owner. Control commands record
+   * their fenced facts through followConversationRefresh without taking over running capabilities.
    */
   private runConversationCommand<T>(conversationId: string, operation: () => Promise<T>): Promise<T> {
     return this.followConversationRefresh(conversationId, () =>
@@ -1075,7 +1074,7 @@ export class VscodeReliableKernelCommandRouter {
     }
     const name = 'name' in payload.settings ? payload.settings.name.trim() : '';
     if (!name) throw new TypeError('Conversation 名称不能为空。');
-    await this.runConversationCommand(conversationId, async () => {
+    await this.followConversationRefresh(conversationId, async () => {
       await this.requireRow('Conversation', conversationId);
       await this.product.application.database.transaction([
         DOMAIN_REPOSITORIES.domain('Conversation').update(conversationId, {
@@ -2118,9 +2117,7 @@ export class VscodeReliableKernelCommandRouter {
   ): Promise<void> {
     // Recording the answer is control and works in any window; continuing the Turn (and applying
     // an approved file change) is execution, which only the window serving the Conversation does.
-    let hostView: ConversationHostEligibilityView | undefined;
-    const { requestKind, won } = await this.runConversationCommand(payload.conversationId, async () => {
-      hostView = await this.conversationHostEligibility(payload.conversationId);
+    const { requestKind, won } = await this.followConversationRefresh(payload.conversationId, async () => {
       const request = await this.requireRow('InteractionRequest', payload.interactionRequestId);
       const owner = (await this.list('InteractionOwnerLink', { request_id: payload.interactionRequestId }, 2))[0];
       const toolLink = (await this.list('InteractionToolCallLink', { request_id: payload.interactionRequestId }, 2))[0];
@@ -2149,9 +2146,6 @@ export class VscodeReliableKernelCommandRouter {
               : 'rejected',
           response: payload.response
         });
-        if (result.preparedEffect && hostView?.eligible !== false) {
-          await this.product.application.fileMutations.dispatchRecordAndReconcile(result.preparedEffect.effectIntentId);
-        }
         return { requestKind: String(request.request_kind), won: result.won };
       }
       if (request.request_kind === 'plan_review') {
@@ -2190,16 +2184,18 @@ export class VscodeReliableKernelCommandRouter {
         status: won ? 'committed' : 'already_resolved'
       }
     });
-    const recordedHere = hostView as ConversationHostEligibilityView | undefined;
-    if (recordedHere && !recordedHere.eligible) {
-      if (won) void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${conversationAnswerRecordedMessage(recordedHere)}`);
-      return;
-    }
     // Durable first-response-wins resolution is already committed. A slow child lookup or Agent
     // resume must not hold the Webview button receipt hostage; startup recovery/local DB wake remains
     // the execution safety net if this best-effort nudge fails.
     setImmediate(() => {
-      void this.resumeInteractionOwner(payload.ownerTurnId, payload.conversationId).catch((error) =>
+      void (async () => {
+        const hostView = await this.conversationHostEligibility(payload.conversationId);
+        if (hostView && !hostView.eligible) {
+          if (won) void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${conversationAnswerRecordedMessage(hostView)}`);
+          return;
+        }
+        await this.resumeInteractionOwner(payload.ownerTurnId, payload.conversationId);
+      })().catch((error) =>
         console.warn('[LimCode] Durable Interaction committed, but owner resume failed.', error)
       );
     });
@@ -2228,7 +2224,7 @@ export class VscodeReliableKernelCommandRouter {
       if (childLinks.length !== 1) {
         throw new Error(`${String(toolCall.tool_name)} 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。`);
       }
-      const result = await this.runConversationCommand(turnConversationId, () =>
+      const result = await this.followConversationRefresh(turnConversationId, () =>
         this.product.childAgents.interruptSubtree({
           sourceKey: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
           childExecutionId: String(childLinks[0].child_execution_id),
@@ -2272,7 +2268,7 @@ export class VscodeReliableKernelCommandRouter {
     if (toolCall.tool_name === 'run_agent') {
       throw new Error('run_agent 工具调用尚未建立唯一 ChildExecution，未中断父 Turn。');
     }
-    const interrupted = await this.runConversationCommand(turnConversationId, () =>
+    const interrupted = await this.followConversationRefresh(turnConversationId, () =>
       this.product.conversations.interrupt({
         commandId: `tool-cancel:${payload.toolCallId}:${correlationId ?? randomUUID()}`,
         conversationId: turnConversationId,
@@ -2313,7 +2309,7 @@ export class VscodeReliableKernelCommandRouter {
     if (payload.conversationId !== undefined && payload.conversationId !== conversationId) {
       throw new Error('后台进程不属于当前 Conversation。');
     }
-    const observation = await this.runConversationCommand(conversationId, async () => {
+    const observation = await this.followConversationRefresh(conversationId, async () => {
       const result = await this.product.application.processes.stopOwnedProcess(payload.processId);
       if (result.receipt) {
         await this.product.application.processes.reconcileProcessExit(payload.processId);

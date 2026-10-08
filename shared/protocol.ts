@@ -3065,8 +3065,6 @@ export interface GlobalSettingsRecord {
   defaultDataRootPath: string;
   /** The directory the data was moved away from (kept until deleted); empty when there is none. */
   previousDataRootPath: string;
-  /** Data sets the last relocation into this directory left in the old one, one line each (id and reason). */
-  relocationLeftBehind?: string[];
 }
 export interface NetworkSettingsRecord {
   /** LLM 请求的默认 User-Agent；空字符串使用扩展默认值，渠道或模型请求头可覆盖。 */

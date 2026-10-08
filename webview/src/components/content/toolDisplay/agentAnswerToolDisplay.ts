@@ -4,7 +4,7 @@ import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from
 export const readAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
   const answer = answerFromValue(context.result);
   if (!answer?.content) {
-    return { headerIcon: IconUsers, outputSections: [] };
+    return { headerIcon: IconUsers };
   }
 
   return {
@@ -31,7 +31,7 @@ export const submitAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
   return {
     headerIcon: IconUsers,
     inputSections,
-    outputSections: result ? [{
+    ...(result ? { outputSections: [{
       kind: 'output',
       title: '提交结果',
       rows: [
@@ -39,7 +39,7 @@ export const submitAgentAnswerToolDisplay: ToolDisplayResolver = (context) => {
         ...(result.updated !== undefined ? [{ label: '是否更新', value: result.updated ? '是' : '否' }] : [])
       ],
       rowStyle: 'keyValue'
-    }] : []
+    }] } : {})
   };
 };
 
@@ -50,10 +50,8 @@ export function answerMarkdownSection(title: string, content: string, kind: 'inp
 export function answerFromValue(value: unknown): { title?: string; content?: string } | undefined {
   const record = asRecord(value);
   if (!record) return undefined;
-  const nestedAnswer = asRecord(record.answer);
-  const source = nestedAnswer ?? record;
-  const title = stringValue(source.title);
-  const content = stringValue(source.content) ?? stringValue(source.result);
+  const title = stringValue(record.title);
+  const content = stringValue(record.content);
   return title || content ? { ...(title ? { title } : {}), ...(content ? { content } : {}) } : undefined;
 }
 

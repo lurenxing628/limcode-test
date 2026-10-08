@@ -17,7 +17,7 @@ function fixture({ historyDelay = 0, attentionDelay = 0, attentionFailureAt = 0 
   let activeHistoryReads = 0, maximumActiveHistoryReads = 0;
   let activeAttentionReads = 0, maximumActiveAttentionReads = 0;
   const timers = new Map(), historyReads = [], attentionReads = [], historyEvents = [], attentionEvents = [], pending = [];
-  const conversations = new Map([['existing', { id: 'existing', title: 'Before' }]]), owners = new Set();
+  const conversations = new Map([['existing', { id: 'existing', title: 'Before' }]]), owners = new Set(), ownerClaims = [];
   const schedule = (fn, delay) => { const key = ++id; timers.set(key, { fn, at: now + delay }); return key; };
   const read = async (kind) => {
     (kind === 'history' ? historyReads : attentionReads).push(now);
@@ -69,6 +69,7 @@ function fixture({ historyDelay = 0, attentionDelay = 0, attentionFailureAt = 0 
         facade.onRuntimeCommit({ changes: steps.map(step => ({ domain: step.domain })) });
       },
       conversationOwners: { run: async (conversationId, operation) => {
+        ownerClaims.push(conversationId);
         assert.ok(!owners.has(conversationId)); owners.add(conversationId);
         try { return await operation(); } finally { owners.delete(conversationId); }
       } }
@@ -79,7 +80,7 @@ function fixture({ historyDelay = 0, attentionDelay = 0, attentionFailureAt = 0 
     historyEmitter: { fire: () => historyEvents.push(now), dispose() {} }, historyRevealEmitter: { fire() {}, dispose() {} },
     externalHistoryWatcher: { start: async () => {}, cancel() {} }, webviews: new Map(), webviewConversationIds: new Map()
   });
-  return { facade, timers, historyReads, attentionReads, historyEvents, attentionEvents, owners,
+  return { facade, timers, historyReads, attentionReads, historyEvents, attentionEvents, owners, ownerClaims,
     maximumActiveHistoryReads: () => maximumActiveHistoryReads,
     maximumActiveAttentionReads: () => maximumActiveAttentionReads,
     commit(domain = 'Message') { facade.onRuntimeCommit({ changes: [{ domain, kind: 'upsert', id: 'id', record: {} }] }); },
@@ -385,7 +386,8 @@ test('product cleanup retires business commands before view disposal and never r
 });
 
 for (const action of ['create', 'rename']) {
-  test(`facade ${action} returns and releases its owner during continuous slow history refreshes`, async (t) => {
+  const ownerBehavior = action === 'create' ? 'and releases its owner' : 'without claiming an execution owner';
+  test(`facade ${action} returns ${ownerBehavior} during continuous slow history refreshes`, async (t) => {
     const h = fixture({ historyDelay: 100 });
     t.after(async () => { await h.facade.dispose(); h.release(); await h.advance(1000); });
     // The command must wait for a fresh pass: the first snapshot predates its committed change.
@@ -398,13 +400,13 @@ for (const action of ['create', 'rename']) {
       : h.facade.renameConversationTitleNow('existing', 'After');
     void command.then(value => { done = true; result = value; }, failure => { done = true; error = failure; });
     await flush();
-    assert.equal(h.owners.size, 1);
+    assert.equal(h.owners.size, action === 'create' ? 1 : 0);
     for (let i = 0; i < 100; i++) {
       h.commit(); await h.advance(10);
       if (i === 9) {
         assert.equal(firstDone, true, 'an earlier caller only waits for its own pass');
         assert.equal(done, false, 'the snapshot before the command cannot complete its refresh');
-        assert.equal(h.owners.size, 1);
+        assert.equal(h.owners.size, action === 'create' ? 1 : 0);
       }
       if (i === 21) {
         assert.equal(error, undefined);
@@ -414,6 +416,8 @@ for (const action of ['create', 'rename']) {
       }
     }
     await command;
+    assert.equal(h.ownerClaims.length, action === 'create' ? 1 : 0,
+      'rename is a control operation and must never claim execution ownership');
     assert.equal(h.maximumActiveHistoryReads(), 1);
     assert.ok(h.historyEvents.length >= 10, 'background refreshes must continue after the command returns');
   });

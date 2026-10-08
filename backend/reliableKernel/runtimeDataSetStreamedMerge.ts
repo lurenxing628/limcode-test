@@ -152,7 +152,7 @@ export interface HistoricalMergeSourceResolver {
    */
   assertUnchanged(root: LocatedRuntimeRoot, check: SourceCheck): Promise<void>;
   /** A private copy of the source's database, fenced by its recorded binding. */
-  snapshot(root: LocatedRuntimeRoot): Promise<HistoricalCasSnapshot>;
+  snapshot(root: LocatedRuntimeRoot, options?: { signal?: AbortSignal }): Promise<HistoricalCasSnapshot>;
 }
 
 interface SourceCheck {
@@ -191,8 +191,9 @@ export function historicalMergeSources(
   held: (candidateId: string) => ForeignHistoricalMergeHold | undefined
 ): HistoricalMergeSourceResolver {
   const local = localHistoricalMergeSources(paths);
+  const sourceIds = new WeakMap<LocatedRuntimeRoot, string>();
   const verified = (root: LocatedRuntimeRoot): { hold: ForeignHistoricalMergeHold; candidate: ForeignHistoricalMergeCandidate } => {
-    const hold = held(root.id);
+    const hold = held(sourceIds.get(root) ?? root.id);
     if (!hold?.verified) {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-source-changed', message: '这个外来历史库的准备已不在，本次不合并。' });
     }
@@ -201,7 +202,11 @@ export function historicalMergeSources(
   return {
     async locate(candidateId) {
       const hold = held(candidateId);
-      return hold ? (await hold.locate()).root : local.locate(candidateId);
+      if (!hold) return local.locate(candidateId);
+      const root = (await hold.locate()).root;
+      // Reset and relocation registrations name the operation; the located root keeps its physical id.
+      sourceIds.set(root, candidateId);
+      return root;
     },
     fence: (root, operation) => root.origin.kind === 'foreign' ? verified(root).hold.fence(operation) : local.fence(root, operation),
     candidate: async (root) => root.origin.kind === 'foreign' ? verified(root).candidate : local.candidate(root),
@@ -210,10 +215,10 @@ export function historicalMergeSources(
       const { candidate } = verified(root);
       await engine.assertSourceUnchanged(check.paths, check.target, candidate, engine.foreignBinding(candidate), check.state, check.mode);
     },
-    snapshot: (root) => {
-      if (root.origin.kind !== 'foreign') return local.snapshot(root);
+    snapshot: (root, options) => {
+      if (root.origin.kind !== 'foreign') return local.snapshot(root, options);
       const { hold, candidate } = verified(root);
-      return hold.snapshot(candidate);
+      return hold.snapshot(candidate, options);
     }
   };
 }
@@ -282,7 +287,7 @@ export async function reinspectLargeMergeKeptWork(
     signal?.throwIfAborted();
     const audit = await snapshot.withClosedReader((snapshotPath) => auditRuntimeSnapshot(snapshotPath, {
       binding: snapshot.binding as RootBinding, unfinishedWork: 'finalize', integrity: false, skippedRowsPath
-    }));
+    }, { signal }));
     signal?.throwIfAborted();
     return audit.unfinishedWork!;
   } finally {
@@ -719,7 +724,7 @@ export async function scanMergeRows(
       scan.rows += entries.length;
       options.onRows?.(scan.rows);
     });
-    if (options.collecting && options.exclusions?.hasProblems()) await options.exclusions.finish(options.chunkRows);
+    if (options.collecting && options.exclusions?.hasExclusions()) await options.exclusions.finish(options.chunkRows);
     if (scan.conflicts.count === 0 || options.collecting) await aggregates.validate(options.signal,
       options.collecting && options.exclusions ? (domain,id,error) => {
         const row = source.prepare('SELECT * FROM model_request WHERE id=?').get(id) as Record<string,unknown> | undefined;
@@ -1160,7 +1165,8 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
   const target = engine.targetContext({ configurationRootPath: input.target.configurationRootPath, database: input.target.database });
   const requested = input.requested === true && input.candidateIds !== undefined;
   const { sources, pickedAt } = await engine.pickSources(paths, target, {
-    ...(input.candidateIds ? { candidateIds: input.candidateIds } : {}), requested, ...(options.sizeLimits ? { sizeLimits: options.sizeLimits } : {})
+    ...(input.candidateIds ? { candidateIds: input.candidateIds } : {}), requested, ...(options.sizeLimits ? { sizeLimits: options.sizeLimits } : {}),
+    ...(input.signal ? { signal: input.signal } : {})
   }, report, keepGoing);
   if (sources.length > 0) {
     // Windows gone since leave preparations and unused target backups: removed before this one takes its own.
@@ -1213,7 +1219,7 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       });
       const mode: HistoricalMergeSourceMode = { finalizeWork: true, requested: picked.requested, pickedAt };
       const sourceInternals: PreparedInternals = { state: {} };
-      const held = await holdForeignSource(paths, picked, sourceInternals.state);
+      const held = await holdForeignSource(paths, picked, sourceInternals.state, input.signal);
       if (held !== true) {
         await internals.claims.release(candidateId);
         if (held.kind !== 'stopped') report.deferred.push(issue(held));
@@ -1223,7 +1229,10 @@ export async function prepareLargeMergeSources(input: PrepareLargeMergeInput): P
       await settlements.prepare(confirm => engine.runSourceAttempt<PreparedOutcome>(paths, target, candidateId, mode,
         (state) => prepareSource(paths, target, candidateId, mode, state,
           { ...input, options: { ...options, confirmSettlement: confirm } }, progress, internals)
-          .catch(async (error: unknown) => { throw await diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并', undefined, options); }),
+          .catch(async (error: unknown) => {
+            if (input.signal?.aborted) throw new engine.StopRequested();
+            throw await diskFull(error, target.controlRoot, '准备合并这份旧聊天记录时', '这次没有合并', undefined, options);
+          }),
         sourceInternals.state), async outcome => {
         // Its unfinished work was closed by this preparation (whatever came of it): its data changed.
         if (sourceInternals.state.finalized && !sourceInternals.state.finalized.earlier) finalizedSources += 1;
@@ -1325,14 +1334,15 @@ export async function releaseLargeMergePreparation(preparation: LargeMergePrepar
 async function holdForeignSource(
   paths: { globalStoragePath: string },
   picked: HistoricalMergePickedSource,
-  state: HistoricalMergeSourceProgress
+  state: HistoricalMergeSourceProgress,
+  signal?: AbortSignal
 ): Promise<true | ReturnType<typeof engine.sourceOutcome>> {
   if (!picked.foreign) return true;
   try {
-    state.foreign = await holdForeignHistoricalMergeSource(paths, picked.id, picked.foreign);
+    state.foreign = await holdForeignHistoricalMergeSource(paths, picked.id, picked.foreign, { signal, refuseWhenHeld: true });
     return true;
   } catch (error) {
-    return engine.sourceOutcome(error, {});
+    return engine.sourceOutcome(signal?.aborted ? new engine.StopRequested() : error, {});
   }
 }
 
@@ -1386,7 +1396,7 @@ async function prepareSource(
       ...(earlier.settlement ? {settlement:earlier.settlement} : {})
     };
   }
-  const settled = await engine.settledSource(paths, target, candidateId, state);
+  const settled = await engine.settledSource(paths, target, candidateId, state, mode.requested);
   if (settled) return settled;
   const { candidate, binding } = await engine.resolveSource(paths, target, candidateId, mode, state);
   const threshold = input.threshold ?? 'in-memory';
@@ -1425,7 +1435,6 @@ async function prepareSource(
     if (!aboveThreshold(taken.audit.size!, threshold, options)) return { kind: 'small' };
     // What is verified here is kept on disk: the session (or a later preparation) only lstats it.
     verified = await openRuntimeCasVerificationCache(paths.globalStoragePath);
-    state.exclusions = new RuntimeMergeConversationExclusions(taken.snapshot.database);
     // What belongs to conversations deleted here since is left out: it neither refuses the source nor is closed.
     const keptWork = async (): Promise<UnfinishedWorkInspection> => {
       const work = taken.audit.unfinishedWork!;
@@ -1443,13 +1452,15 @@ async function prepareSource(
       scanTargetVersion = await engine.mergeTargetVersion(target.database);
       boundSourcePageCache(taken.snapshot.database);
       const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows);
+      const skipped = skipping ? taken.snapshot.database.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain=? AND id=?`) : undefined;
+      state.exclusions ??= new RuntimeMergeConversationExclusions(taken.snapshot.database,
+        skipped ? (domain, id) => skipped.get(domain, id) !== undefined : undefined);
       progress('scan', 0);
-      engine.prepareSettlement(taken.snapshot.database, state);
       for (const id of state.unsettledConversationIds ?? []) {
-        state.exclusions!.exclude('Conversation', {id}, 'runtime-data-set-merge-unfinished-work');
+        if (!skipped?.get('Conversation', id)) state.exclusions!.exclude('Conversation', {id}, 'runtime-data-set-merge-unfinished-work');
       }
       for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate) || (state.finalized !== undefined && !state.finalized.earlier))) {
-        if (!skipping || !taken.snapshot.database.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain=? AND id=?`).get(issue.domain,String(issue.row.id))) {
+        if (!skipped?.get(issue.domain, String(issue.row.id))) {
           state.exclusions!.exclude(issue.domain,issue.row,issue.code);
         }
       }
@@ -1460,15 +1471,17 @@ async function prepareSource(
         if (isAbort(error)) throw new engine.StopRequested();
         throw error;
       });
+      await engine.indexSourceRecipeReferences(candidate, binding, taken.snapshot, state.exclusions, input.signal);
       progress('cas');
       await engine.transferSourceCas(candidate, binding, target, taken.snapshot, options, verified!, true, state.exclusions);
-      if (state.exclusions!.hasProblems()) {
+      if (state.exclusions!.hasExclusions()) {
         await state.exclusions!.finish(chunkRows);
         state.excluded = state.exclusions!.excluded();
         scan = await scanMergeRows(taken.snapshot.database, target.database, { skipping, chunkRows, signal: input.signal, exclusions: state.exclusions });
       }
       if (scan.refusedAggregate !== undefined) throw invariantRefusal(scan.refusedAggregate, state);
       if (scan.conflicts.count > 0) throw new engine.Outcome(engine.conflictRefusal(scan.conflicts, state));
+      engine.prepareSettlement(taken.snapshot.database, state);
       return scan;
     };
     let scan = await scanSource();
@@ -1489,7 +1502,7 @@ async function prepareSource(
         state.finalized.complete &&= !state.unsettledConversationIds?.length;
         await engine.rememberFinalized(paths,candidate,state.finalized);
       }
-      state.exclusions = new RuntimeMergeConversationExclusions(taken.snapshot.database);
+      state.exclusions = undefined;
       state.excluded = undefined;
       scan = await scanSource();
       const remaining = await keptWork();
@@ -1713,7 +1726,12 @@ export async function runLargeMergeSession(input: RunLargeMergeSessionInput): Pr
         const outcome = await engine.runSourceAttempt(paths, target, prepared.candidateId, mode,
           (state) => mergePreparedSource(paths, target, resolver, prepared, verified!, state, mode, options, input.signal,
             clock.source(index, prepared), preparation.space.targetIndexBytes)
-            .catch(async (error: unknown) => { throw await diskFull(error, target.controlRoot, '合并这份旧聊天记录时', '已撤回这份的写入', prepared, options); }),
+            .catch(async (error: unknown) => {
+              if (isAbort(error) || (input.signal?.aborted && error === input.signal.reason)) {
+                throw streamFailure(error, prepared, target, 0, undefined, input.signal);
+              }
+              throw await diskFull(error, target.controlRoot, '合并这份旧聊天记录时', '已撤回这份的写入', prepared, options);
+            }),
           { ...sourceInternals.state });
         clock.sourceDone(prepared);
         const result = sourceResult(prepared.candidateId, outcome, internals.requested, prepared.label);
@@ -1854,12 +1872,13 @@ async function mergeLocked(
     if (previous.state === 'committing') {
       throw new engine.Outcome({ kind: 'deferred', code: 'runtime-data-set-merge-commit-pending', message: '另一个窗口合并这个库时中断，下次启动时先确认它的结果。' });
     }
-    if (sameRuntimeDataSetIdentity(previous.source, candidate) && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
+    if ((previous.state === 'merged' || !mode.requested) && sameRuntimeDataSetIdentity(previous.source, candidate)
+      && sameRuntimeDataSetFingerprint(previous.source, state.fingerprint)) {
       return { kind: 'current', result: await engine.currentResult(paths, candidate, target, state) };
     }
   }
   progress('copying', 0);
-  const copy = await resolver.snapshot(root);
+  const copy = await resolver.snapshot(root, { signal });
   try {
     // Under the source's fence with no Host on it the files cannot change: the audit's conclusions hold.
     if (await runtimeDataSetFileState(root.located.databasePath) !== state.files) {
@@ -1940,7 +1959,7 @@ async function mergeLocked(
         const temporary = isDiskFull(error) ? await fullTemporaryDirectory(target.controlRoot, prepared, options) : undefined;
         // The rolled-back transaction's WAL is given back to the disk.
         await target.database.maintenanceCheckpoint().catch(() => undefined);
-        throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal), temporary);
+        throw streamFailure(error, prepared, target, measuredNeed(prepared, targetIndexBytes, written.rows, wal), temporary, signal);
       }
       // Its marker is there: the transaction committed, so it got to its commit and counted.
       streamed = written.counted!;
@@ -1948,7 +1967,8 @@ async function mergeLocked(
     if (!streamed.committed) {
       // Every row is here already: recorded as merged without a transaction, as an empty plan is.
       target.backup.used = backupUsed;
-      await writeRuntimeDataSetMergeLedgerRecord(paths, record(streamed));
+      await target.database.durabilityCheckpoint();
+      await engine.completeHistoricalMerge(paths, record(streamed), candidate);
       await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
       return { kind: 'current', result: {
         ...result, reusedRows: streamed.reused, alreadyMerged: true, ...await engine.takeFinalized(paths, candidate, state).catch(() => engine.finalizedResult(state))
@@ -1965,7 +1985,7 @@ async function mergeLocked(
     await options.onFaultPoint?.('before-merged-record', { candidateId });
     progress('recording', prepared.rows);
     try {
-      await writeRuntimeDataSetMergeLedgerRecord(paths, record(streamed));
+      await engine.completeHistoricalMerge(paths, record(streamed), candidate);
       await removeRuntimeDataSetMergeCommit(paths, commitId).catch(() => undefined);
     } catch (error) {
       console.warn('[LimCode] 较大的旧聊天记录已合并，但合并记录没有写成；下次启动时按实测确认。', error);
@@ -1997,10 +2017,11 @@ function streamFailure(
   prepared: PreparedLargeMergeSource,
   target: HistoricalMergeTargetContext,
   need: number,
-  temporary?: FullTemporaryDirectory
+  temporary?: FullTemporaryDirectory,
+  signal?: AbortSignal
 ): unknown {
   if (error instanceof engine.Outcome) return error;
-  if (isAbort(error)) {
+  if (isAbort(error) || (signal?.aborted && error === signal.reason)) {
     return new engine.Outcome({ kind: 'deferred', code: RUNTIME_DATA_SET_MERGE_CANCELLED, message: '合并已取消，这份旧聊天记录没有合并（之前合并完的库保留）；以后可以再合并。' });
   }
   if (isDiskFull(error)) {

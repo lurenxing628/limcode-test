@@ -43,7 +43,7 @@ export async function registerRuntimeHistoryConvergence(paths: Paths, previousDa
         code: problem.code ?? 'runtime-history-source-unreadable', message: problem.message, checkedAt: registeredAt });
     }
     for (const source of foreign) {
-      if (pending.has(source.id) || residual.get(source.id)?.sourceKind === 'reset') continue;
+      if (known.has(source.id) || pending.has(source.id) || residual.has(source.id)) continue;
       const identity = foreignIdentities.get(source.id);
       if (!identity) {
         await writeRuntimeHistoryResidual(paths, { id: source.id, sourceKind: source.location.kind, location: source.location, code: 'runtime-history-source-identity-unreadable', message: '无法读取旧数据身份，原数据保留；可以重新核验。', checkedAt: registeredAt });

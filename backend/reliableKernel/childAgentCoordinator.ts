@@ -318,13 +318,13 @@ export class ReliableChildAgentCoordinator {
     };
   }
 
-  /** Starting the delegated child runs the executor Agent: only a Host serving the parent may. */
+  /** Starting the delegated child runs the executor Agent in the Host owning and serving the parent. */
   public async mayEnsureApprovedPlan(input: PlanDelegationRequest): Promise<boolean> {
     const parentTurn = await this.get('Turn', requireId(input.parentTurnId, 'parentTurnId'));
     if (!parentTurn) throw new Error(`Plan delegation parent Turn ${input.parentTurnId} does not exist.`);
-    return await this.dependencies.database.conversationOwners.executionEligibility(
-      requireId(parentTurn.conversation_id, 'Turn.conversation_id')
-    ) === 'eligible';
+    const conversationId = requireId(parentTurn.conversation_id, 'Turn.conversation_id');
+    const owners = this.dependencies.database.conversationOwners;
+    return owners.owns(conversationId) && await owners.executionEligibility(conversationId) === 'eligible';
   }
 
   /**

@@ -5,6 +5,9 @@ import type { ClientState, ConversationRecord } from '@shared/protocol';
 export interface ClientStateStoreState extends ClientState {
   /** Configuration authority is independent from the reliable Runtime Feed. */
   configurationReady: boolean;
+  configurationError: string;
+  configurationRequestId: string;
+  configurationReloadRevision: number;
   /** Current Webview focus; reliable Runtime records remain in their own bounded store. */
   currentConversationId: string;
 }
@@ -13,6 +16,9 @@ const useClientStateStoreDefinition = defineStore('clientState', {
   state: (): ClientStateStoreState => ({
     ...createEmptyClientState(),
     configurationReady: false,
+    configurationError: '',
+    configurationRequestId: '',
+    configurationReloadRevision: 0,
     currentConversationId: ''
   }),
   getters: {
@@ -20,16 +26,29 @@ const useClientStateStoreDefinition = defineStore('clientState', {
       return state.configurationReady;
     },
     settingsClientStateLoading(state): boolean {
-      return !state.configurationReady;
+      return !state.configurationReady && !state.configurationError;
     },
     isConfigScopeClientStateLoading(state): () => boolean {
-      return (): boolean => !state.configurationReady;
+      return (): boolean => !state.configurationReady && !state.configurationError;
     },
     currentConversation(state): ConversationRecord | undefined {
       return state.conversations.find((conversation) => conversation.id === state.currentConversationId);
     }
   },
   actions: {
+    beginConfigurationLoad(requestId: string): void {
+      this.configurationReady = false;
+      this.configurationError = '';
+      this.configurationRequestId = requestId;
+    },
+    rejectConfigurationLoad(requestId: string | undefined, message: string): void {
+      if (!requestId || requestId !== this.configurationRequestId) return;
+      this.configurationRequestId = '';
+      this.configurationError = message;
+    },
+    reloadConfiguration(): void {
+      this.configurationReloadRevision++;
+    },
     applyConfigurationSnapshot(state: ClientState): void {
       Object.assign(this, {
         agents: state.agents.map(cloneRecord),
@@ -57,7 +76,9 @@ const useClientStateStoreDefinition = defineStore('clientState', {
         checkpointPolicyScopeLinks: state.checkpointPolicyScopeLinks.map(cloneRecord),
         conversationWorkflowSelections: state.conversationWorkflowSelections.map(cloneRecord),
         conversationWorkEnvironmentLinks: state.conversationWorkEnvironmentLinks.map(cloneRecord),
-        configurationReady: true
+        configurationReady: true,
+        configurationError: '',
+        configurationRequestId: ''
       });
     },
     setCurrentConversation(conversationId: string): void {
@@ -73,6 +94,9 @@ export interface ClientStateStorePublic extends ClientStateStoreState {
   readonly settingsClientStateLoading: boolean;
   readonly isConfigScopeClientStateLoading: (scopeKind?: string, scopeId?: string) => boolean;
   readonly currentConversation: ConversationRecord | undefined;
+  beginConfigurationLoad(requestId: string): void;
+  rejectConfigurationLoad(requestId: string | undefined, message: string): void;
+  reloadConfiguration(): void;
   applyConfigurationSnapshot(state: ClientState): void;
   setCurrentConversation(conversationId: string): void;
 }

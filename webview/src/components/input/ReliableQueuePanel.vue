@@ -50,6 +50,7 @@ const clientState = useClientStateStore();
 const ui = useConversationUiStore();
 const {
   currentPendingTurnInputs,
+  currentTurnInputEchoes,
   currentTurnInputFailure,
   retryTurnInputSubmission,
   withdrawTurnInputSubmission,
@@ -174,7 +175,9 @@ const retainedEdits = computed(() => {
 
 const optimisticItems = computed<QueueItem[]>(() => {
   const committedIds = new Set(committedItems.value.map((item) => item.id));
+  const displayedCommands = new Set(currentTurnInputEchoes.value.map((echo) => echo.submission.commandId));
   return currentPendingTurnInputs.value.flatMap((submission): QueueItem[] => {
+    if (displayedCommands.has(submission.commandId)) return [];
     const result = submission.result;
     const belongsInQueue = (
       submission.requestType === BridgeMessageType.TurnEnqueue
@@ -229,7 +232,7 @@ const reorderPending = computed(() => currentPendingGuidanceControls.value.some(
   control.action === 'reorder'
 ));
 const canReorder = computed(() =>
-  optimisticItems.value.length === 0
+  currentPendingTurnInputs.value.length === 0
   && committedItems.value.length > 1
   && committedItems.value.every((item) => Boolean(guidancePreview(item.preview)?.revisionSeq))
   && currentPendingGuidanceControls.value.length === 0

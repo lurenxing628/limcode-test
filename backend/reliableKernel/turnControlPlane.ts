@@ -18,6 +18,7 @@ import {
 } from './contentAddressedStore';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { estimateStoredMessageContentTokens } from './contextTokenEstimator';
+import { readInitialRuntimeContextForTurn, type FrozenInitialRuntimeContext } from './initialRuntimeContext';
 import {
   compareGuidancePositions,
   initialGuidancePosition,
@@ -188,6 +189,8 @@ export interface TurnAuthorityCompilationRequest {
    * 模型记录之前编译，对话还没有模型记录时按这里冻结，这个子 Agent 再派出的孙 Agent 才能接着继承。
    */
   inheritedThinkingOverride?: SessionThinkingOverride;
+  /** The selected branch's already rendered initial template; policies and rules remain fresh. */
+  initialRuntimeContext?: FrozenInitialRuntimeContext;
 }
 
 export interface TurnModelOverride {
@@ -208,6 +211,11 @@ export interface CompiledTurnAuthority {
   executionPreset: CompiledTurnAuthorityContent;
   authoritySnapshot: CompiledTurnAuthorityContent;
 }
+
+type PreparedCurrentTurnAuthority = ReturnType<typeof normalizeCompiledTurnAuthority> & {
+  /** The selected initial-template source remains on the same branch at command admission. */
+  initialContextAssertions?: RepositoryTransactionStep[];
+};
 
 export interface TurnAuthorityCompiler {
   compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority>;
@@ -1782,6 +1790,22 @@ export class TurnControlPlane {
   }
 
   private async startIntent(plan: StartIntentPlan): Promise<TurnCommandResult> {
+    // A running Turn may append Context while an input compiles its settings or prepares media.
+    // Replan that exact branch observation before retrying the unchanged command identity.
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        return await this.startIntentPrepared(plan);
+      } catch (error) {
+        if (attempt >= 3 || !isTransactionAssertionError(error)
+          || !(error instanceof Error)
+          || !/^ConversationContextHeadLinkRepository transaction (?:assertion|assertNone) failed for /.test(error.message)) {
+          throw error;
+        }
+      }
+    }
+  }
+
+  private async startIntentPrepared(plan: StartIntentPlan): Promise<TurnCommandResult> {
     const command = normalizeExecutionCommand(plan.command, plan.operation);
     const source = normalizeInitiatingSource(command.source, plan.operation);
     const retryTarget = plan.retryTarget ? normalizeRetryTarget(plan.retryTarget) : undefined;
@@ -1835,7 +1859,7 @@ export class TurnControlPlane {
           idempotencyKey: ids.intent
         })
       : null;
-    let compiled = plan.inheritSourceAuthority
+    let compiled: PreparedCurrentTurnAuthority = plan.inheritSourceAuthority
       ? await this.inheritTurnAuthority(
           requireId(plan.sourceTurnId, 'sourceTurnId'),
           ids.turn,
@@ -2011,6 +2035,7 @@ export class TurnControlPlane {
       turnId: null,
       requiresConversationIdle: Boolean(retryRewind || plan.runtimeMaintenance),
       steps: [
+        ...(compiled.initialContextAssertions ?? []),
         ...(plan.runtimeMaintenance ? conversationIdleAssertionSteps(conversation.id as string) : []),
         ...(retryRewind?.steps ?? []),
         ...(messageAttachmentAdmission?.storageSteps ?? []),
@@ -2230,13 +2255,13 @@ export class TurnControlPlane {
     requestedExecutorAgentId?: string,
     modelOverride?: TurnModelOverride,
     membership?: TurnExecutionMembership
-  ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
+  ): Promise<PreparedCurrentTurnAuthority> {
     const childExecutionId = membership
       ? requireId(membership.childExecutionId, 'membership.childExecutionId')
       : undefined;
     // A Turn the user starts in a child conversation keeps the child's bounds: the tools and skills
     // inherited at spawn, and the work environments of its latest Turn, as a continuation would.
-    const [defaultAgent, workspace, boundary, inheritedWorkEnvironmentPolicy] = await Promise.all([
+    const [defaultAgent, workspace, boundary, inheritedWorkEnvironmentPolicy, initialContext] = await Promise.all([
       requestedExecutorAgentId ? Promise.resolve(undefined) : this.getDefaultAgent(conversationId),
       projectFolderForConversation(this.database, conversationId),
       childExecutionId
@@ -2244,12 +2269,13 @@ export class TurnControlPlane {
         : Promise.resolve(undefined),
       childExecutionId
         ? readChildExecutionWorkEnvironmentBoundary(this.database, this.contentStore, childExecutionId)
-        : Promise.resolve(undefined)
+        : Promise.resolve(undefined),
+      this.prepareInitialRuntimeContext(conversationId, intentKind === 'retry' ? sourceTurnId : undefined)
     ]);
     const executorAgentId = requestedExecutorAgentId
       ? requireId(requestedExecutorAgentId, 'TurnExecutionCommand.executorAgentId')
       : requireId(defaultAgent?.agent_id, 'AgentConversationLink.agent_id');
-    return normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
+    const compiled = normalizeCompiledTurnAuthority(await this.authorityCompiler.compile({
       conversationId,
       turnId,
       executorAgentId,
@@ -2258,9 +2284,34 @@ export class TurnControlPlane {
       ...(modelOverride ? { modelOverride } : {}),
       ...(workspace ? { workspace } : {}),
       ...(inheritedWorkEnvironmentPolicy ? { inheritedWorkEnvironmentPolicy } : {}),
+      ...(initialContext.value ? { initialRuntimeContext: initialContext.value } : {}),
       ...(boundary?.toolPolicy ? { inheritedToolPolicy: boundary.toolPolicy } : {}),
       ...(boundary?.skillPolicy ? { inheritedSkillPolicy: boundary.skillPolicy } : {})
     }), turnId, executorAgentId);
+    return { ...compiled, initialContextAssertions: initialContext.assertions };
+  }
+
+  private async prepareInitialRuntimeContext(conversationId: string, sourceTurnId?: string): Promise<{
+    value?: FrozenInitialRuntimeContext;
+    assertions: RepositoryTransactionStep[];
+  }> {
+    if (sourceTurnId) {
+      // Retry/edit already proved this exact source and their prepared rewind guards its branch.
+      // The current head may still contain the suffix that the same transaction will discard.
+      const children = await this.listRows('ChildExecution', { child_conversation_id: conversationId }, 2);
+      if (children.length > 1) throw new Error('Conversation has multiple ChildExecution origins.');
+      const value = await readInitialRuntimeContextForTurn(this.database, this.contentStore,
+        sourceTurnId, conversationId, children.length === 1);
+      return { ...(value ? { value } : {}), assertions: [] };
+    }
+    const selected = (await this.database.readSelectedContextAuthoritySource({ conversationId })).snapshot;
+    const value = selected.source ? await readInitialRuntimeContextForTurn(this.database, this.contentStore,
+      selected.source.sourceTurnId, conversationId, selected.isChildConversation) : undefined;
+    const assertions = selected.contextHeadId
+      ? [DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assert(selected.contextHeadId,
+          { conversation_id: conversationId, root_id: selected.contextRootId })]
+      : [DOMAIN_REPOSITORIES.domain('ConversationContextHeadLink').assertNone({ conversation_id: conversationId })];
+    return { ...(value ? { value } : {}), assertions };
   }
 
   /**
@@ -2923,6 +2974,7 @@ export class TurnControlPlane {
       turnId: ids.turn,
       requiresConversationIdle: true,
       steps: [
+        ...(compiled.initialContextAssertions ?? []),
         ...conversationIdleAssertionSteps(conversationId),
         DOMAIN_REPOSITORIES.domain('Turn').assert(sourceTurnId, {
           conversation_id: conversationId,
@@ -4031,9 +4083,9 @@ function requireRetryTarget(input: MessageRetryTarget | undefined): MessageRetry
 }
 
 function withRetryLineage(
-  compiled: ReturnType<typeof normalizeCompiledTurnAuthority>,
+  compiled: PreparedCurrentTurnAuthority,
   lineage: RetryLineage
-): ReturnType<typeof normalizeCompiledTurnAuthority> {
+): PreparedCurrentTurnAuthority {
   const retryLineage = {
     sourceTurnId: lineage.sourceTurnId,
     ...(lineage.sourceMessageId ? { sourceMessageId: lineage.sourceMessageId } : {}),

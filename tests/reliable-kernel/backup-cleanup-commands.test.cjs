@@ -225,7 +225,7 @@ test('含你后来删除或替换的内容单独一组（审查 H1）：默认�
     '归档目录里的其它内容（只列出）（1 项）', '拷来目录（只列出）（1 项）'
   ], '紧跟在可以证明的几种之后');
   const group = first.sections.find((section) => section.title === '含你后来删除或替换的内容（2 项）');
-  assert.match(group.lines[0], /^用途：内容都还在当前库或某个历史库里，但其中一些消息在那里已被你删除、编辑或重试替换，只在这份副本里还能看到；默认不勾选/);
+  assert.match(group.lines[0], /^用途：内容都还在当前库里，但其中一些消息已被你删除、编辑或重试替换，只在这份副本里还能看到；默认不勾选/);
   assert.deepEqual(group.options.map((option) => [option.key, option.checked]), [
     ['merge-target:replaced', undefined], ['foreign-history:foreign:archive:1111111111111111', undefined]
   ], '默认不勾选');
@@ -454,7 +454,7 @@ test('已合并来源单独一组：可删的写明来源、位置和内容已�
   const [first, second, done] = f.prompts;
   assert.match(first.description, /已合并来源必须有完整合并/);
   const foreign = first.sections.find((section) => section.title === '已合并来源（2 项）');
-  assert.match(foreign.lines[0], /^用途：“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过/);
+  assert.match(foreign.lines[0], /^用途：旧本地库、旧版本归档和拷来目录里的库；只有完整合并进当前库的成功记录且来源未变时才可删除/);
   assert.deepEqual(foreign.options.map((option) => option.key), ['foreign-history:foreign:archive:0123456789abcdef']);
   assert.match(foreign.options[0].detail,
     /来源：“归档并重置”的归档　位置：\/data\/limcode\/\.limcode-runtime-backups\/20260901-010203-004-abcdef12　可以删除：内容已完整在当前库里/);

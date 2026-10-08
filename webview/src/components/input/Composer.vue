@@ -43,6 +43,7 @@ import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue
 import SteeringStatusPanel from '@webview/components/input/SteeringStatusPanel.vue';
 import SessionThinkingControl from '@webview/components/input/SessionThinkingControl.vue';
 import { modelRequestNativeCapabilities } from '@webview/reliability/modelRequestStreamStats';
+import AttachmentThumbnail from '@webview/components/input/AttachmentThumbnail.vue';
 
 const props = withDefaults(
   defineProps<{
@@ -973,8 +974,9 @@ function middleEllipsis(value: string, maxLength: number): string {
           <button type="button" class="composer-edit-cancel" @click="ui.cancelEditMode">取消编辑</button>
         </div>
         <div v-if="selectedAttachments.length" class="composer-attachments-shell">
-          <div ref="attachmentScroller" class="composer-attachments" aria-label="已选择附件" @wheel="onAttachmentWheel">
+          <div ref="attachmentScroller" class="composer-attachments" :class="{ 'has-images': selectedAttachments.some(part => part.inlineData.mimeType.startsWith('image/')) }" aria-label="已选择附件" @wheel="onAttachmentWheel">
             <span v-for="(attachment, index) in selectedAttachments" :key="`${attachment.inlineData.name}-${index}`" class="composer-attachment-chip">
+              <AttachmentThumbnail v-if="attachment.inlineData.mimeType.startsWith('image/')" :part="attachment" />
               <span class="composer-attachment-name">{{ attachmentDisplayName(attachment) }}</span>
               <span v-if="attachmentSizeLabel(attachment)" class="composer-attachment-size">{{ attachmentSizeLabel(attachment) }}</span>
               <button type="button" class="composer-attachment-remove" title="移除附件" @click="removeAttachment(index)">
@@ -1423,7 +1425,6 @@ function middleEllipsis(value: string, maxLength: number): string {
   position: relative;
   width: 100%;
   min-width: 0;
-  height: 32px;
   padding-bottom: 6px;
 }
 
@@ -1442,6 +1443,10 @@ function middleEllipsis(value: string, maxLength: number): string {
 
 .composer-attachments::-webkit-scrollbar {
   display: none;
+}
+
+.composer-attachments.has-images {
+  height: 56px;
 }
 
 .composer-attachments-scrollbar {

@@ -40,7 +40,7 @@ const DELETABLE_KINDS: ReadonlySet<RuntimeBackupKind> = new Set(['epoch-migratio
  */
 const REPLACED_GROUP = {
   title: '含你后来删除或替换的内容',
-  purpose: '内容都还在当前库或某个历史库里，但其中一些消息在那里已被你删除、编辑或重试替换，只在这份副本里还能看到；默认不勾选，勾选后才删除，删除后这些消息就再也看不到了'
+  purpose: '内容都还在当前库里，但其中一些消息已被你删除、编辑或重试替换，只在这份副本里还能看到；默认不勾选，勾选后才删除，删除后这些消息就再也看不到了'
 };
 
 /** Group order of the first panel: the kinds that can be proven first, then the listed ones. */
@@ -50,7 +50,7 @@ const KINDS: ReadonlyArray<{ kind: RuntimeBackupKind; title: string; purpose: st
   { kind: 'merge-source', title: '合并来源的收尾前备份', purpose: '合并前收尾来源库里没有结束的任务之前，来源库的整份备份' },
   {
     kind: 'merged-source', title: '已合并来源',
-    purpose: '“归档并重置”留下的归档，和迁移数据目录时挪到旁边的拷来目录里的库；只有核验通过、且能证明内容已完整在当前库或某个历史库里的才可以删除（归档整份删除，拷来目录只删其中的库）'
+    purpose: '旧本地库、旧版本归档和拷来目录里的库；只有完整合并进当前库的成功记录且来源未变时才可删除。待合并、部分合并、残留和新的重置备份保留；拷来目录只删其中的库'
   },
   { kind: 'reset-archive', title: '归档目录里的其它内容（只列出）', purpose: '“归档并重置”的归档目录里不是归档的内容' },
   { kind: 'copied-data-root', title: '拷来目录（只列出）', purpose: '迁移数据目录时挪到旁边的拷来目录本身，其中库以外的设置、规则、技能永远不会被整体删除' },
@@ -180,7 +180,7 @@ function firstPanelSections(plan: RuntimeBackupCleanupPlan): DataRootPromptSecti
           + (replaced.length > 0
             ? `内容完整的 ${deletable.length - replaced.length} 项默认勾选，含你后来删除或替换的内容的 ${replaced.length} 项默认不勾选。`
             : '默认都勾选，可以取消。')
-        : '没有能证明已完整存在于本地库的备份，全部保留。',
+        : '没有符合删除条件的备份，全部保留。',
       ...(plan.finishedDeletions.length > 0 ? [`已删完上次没有删完的 ${plan.finishedDeletions.length} 项。`] : []),
       ...(plan.restoredDeletions.length > 0
         ? [`上次清理在最后一次核对之前中断：${plan.restoredDeletions.length} 项已改回原名，按这次的核对结果列出。`] : []),
