@@ -495,3 +495,19 @@ test('只读查看期间外来库的记录变了（指针代数被改）：读�
     await assert.rejects(reader.readMessages('conversation_existing_1'), /identity changed/);
   } finally { await reader.close(); }
 });
+
+test('残留大小按实际工作区根统计，重复打开复用文件状态缓存不再遍历正文目录', async (t) => {
+  const fixture = await createFixture(t);
+  const record = { id: fixture.alpha.id, location: { kind: 'local', candidateId: fixture.alpha.id } };
+  const first = await foreign.readRuntimeHistoryResidualSize(fixture.paths, record);
+  assert.ok(BigInt(first.bytes) > 0n);
+  assert.ok(first.fileCount > 0);
+  const control = path.dirname(fixture.alpha.binding.paths.rootPointerPath);
+  const probe = probeFilesystem();
+  let second;
+  try { second = await foreign.readRuntimeHistoryResidualSize(fixture.paths, record); }
+  finally { probe.stop(); }
+  assert.deepEqual(second, first);
+  assert.deepEqual(probe.seen.filter(call => inside(control, call.path)
+    && ['readdir', 'readFile', 'open', 'copyFile'].includes(call.name)), [], '缓存命中只读文件状态，不遍历或打开正文');
+});

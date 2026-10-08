@@ -1,3 +1,5 @@
+import { ledgerFile } from './runtimeDataSetMergeLedger';
+import type { RuntimeHistoryResidual } from './runtimeHistoryRegistry';
 import { RUNTIME_MERGE_VALIDATION_REVISION } from './runtimeMergeValidation';
 import { createHash, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type BigIntStats } from 'node:fs';
@@ -34,6 +36,7 @@ import {
 } from './runtimeStorageInspection';
 import {
   inspectVscodeRuntimeDataSets, listVscodeRuntimeArchiveDirectories, resolveVscodeRuntimeMergeLedgerRoot,
+  resolveVscodeRuntimeDataSetScopeRoot, resolveVscodeRuntimeDataRoot,
   VSCODE_RUNTIME_ACTIVE_DIRECTORY, VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN, VSCODE_RUNTIME_ARCHIVES_DIRECTORY,
   VSCODE_RUNTIME_CONTROL_DIRECTORY, VSCODE_RUNTIME_RESET_BACKUPS_DIRECTORY, VSCODE_WORKSPACE_RUNTIME_SCOPES_DIRECTORY, VSCODE_WORKSPACE_RUNTIMES_DIRECTORY,
   type VscodeRuntimeDataSetCandidate
@@ -1640,7 +1643,8 @@ async function writeCacheFile(file: string, value: unknown): Promise<void> {
 async function cachedTreeSize(
   configurationRoot: string,
   id: string,
-  location: ForeignRuntimeRootLocation
+  location: ForeignRuntimeRootLocation,
+  cacheFile?: string
 ): Promise<{ bytes: string; fileCount: number } | undefined> {
   const tree = measuredPath(location);
   const located = hasDataRoot(location) ? locatedPaths(location) : undefined;
@@ -1657,7 +1661,7 @@ async function cachedTreeSize(
   } catch {
     return measureTree(tree);
   }
-  const file = await foreignRuntimeHistoryFile(configurationRoot, CACHE_DIRECTORY, id, '.size.json').catch(() => undefined);
+  const file = cacheFile ?? await foreignRuntimeHistoryFile(configurationRoot, CACHE_DIRECTORY, id, '.size.json').catch(() => undefined);
   if (!file) return measureTree(tree);
   try {
     const value = JSON.parse(await fs.readFile(file, 'utf8')) as {
@@ -1671,6 +1675,34 @@ async function cachedTreeSize(
   const size = await measureTree(tree);
   if (size) await writeCacheFile(file, { kind: SIZE_CACHE_KIND, id, state, size }).catch(() => undefined);
   return size;
+}
+
+/** On-demand display size: cached file-state counts only; never reads history bodies or writes its source. */
+export async function readRuntimeHistoryResidualSize(
+  paths: { globalStoragePath: string },
+  record: Pick<RuntimeHistoryResidual, 'id' | 'location'>
+): Promise<{ bytes: string; fileCount: number } | undefined> {
+  const root = path.resolve(paths.globalStoragePath);
+  try {
+    let location: ForeignRuntimeRootLocation;
+    if (record.location.kind === 'local') {
+      const scope = resolveVscodeRuntimeDataSetScopeRoot(root, record.location.candidateId);
+      const dataRoot = resolveVscodeRuntimeDataRoot({ globalStoragePath: scope });
+      await assertNoSymbolicPath(root, dataRoot);
+      location = { kind: 'copied', containerPath: path.dirname(dataRoot), containerName: record.location.candidateId,
+        dataRootRelativePath: VSCODE_RUNTIME_ACTIVE_DIRECTORY };
+    } else {
+      location = record.location;
+      requireStrictLocation(root, location);
+      const base = location.kind === 'archive' ? archiveBase(root, location)
+        : isMigratedLocation(location) ? location.baseDataRootPath! : path.dirname(location.containerPath);
+      await assertNoSymbolicPath(base, measuredPath(location));
+    }
+    const cache = isForeignRuntimeHistoryId(record.id) ? undefined : await ledgerFile(paths, 'residual-size', record.id);
+    return await cachedTreeSize(root, record.id, location, cache);
+  } catch {
+    return undefined;
+  }
 }
 
 /** One foreign root's claim (the one withLocatedRuntimeRootFence takes), held until released. */
