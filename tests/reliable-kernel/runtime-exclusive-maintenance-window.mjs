@@ -148,7 +148,8 @@ openingWait.end();
 const paths = authority.expectedPaths();
 await emit('opened', { hostBootId, startedAt, openMs: Date.now() - openStarted });
 
-const busyNow = () => Date.now() < workUntil;
+const busyNow = () => behavior.busyUntilFile
+  ? !fsSync.existsSync(behavior.busyUntilFile) : Date.now() < workUntil;
 const facadeLike = { requireOpen() {}, product: { application: { database } }, writeGate: new RuntimeWriteGate() };
 const host = {
   exclusiveMaintenanceTarget: () => ({ paths, hostBootId }),
@@ -188,6 +189,51 @@ const withTrackedLocks = (take) => async (body) => {
     try { return await body(); } finally { await emit('locks-released', { heldMs: Date.now() - lockedAt }); }
   });
 };
+
+if (behavior.request) {
+  // This window asks the others to yield, outside the locks (a data-root migration the user confirmed;
+  // like dataRootRelocation.ts, the key carries the attempt's own id).
+  const outcome = await layer.runWithExclusiveMaintenance(paths, {
+    operation: 'data-root-migration', operationKey: `target:/new-root#${randomUUID()}`, message: '为迁移数据目录',
+    waitingTitle: '正在等待其它窗口空闲后迁移数据目录', configurationRootPath: root, requesterHostBootId: hostBootId,
+    requesterBusy: layer.requesterWorkBusy(host), ignoreBackoff: true, whenBusy: 'wait',
+    participantConfirmation: 'final-countdown', pollMs: 20, isCurrent: () => true,
+    ...(behavior.requestOptions ?? {}),
+    withLocks: withTrackedLocks((body) => withRuntimeDataRootAdmission(root, () => withRuntimeMaintenance(paths, body)))
+  }, async () => {
+    await emit('operation');
+    if (behavior.operationMs) await new Promise((resolve) => setTimeout(resolve, behavior.operationMs));
+    if (behavior.failOperation) throw Object.assign(new Error('目标目录写入失败'), { code: behavior.failOperation });
+    return 'migrated';
+  }).catch((error) => ({ state: 'threw', reason: String(error?.message ?? error) }));
+  await emit('coordination', { state: outcome.state, reason: outcome.reason, retryAfter: outcome.retryAfter });
+  if (outcome.state === 'threw' && behavior.reloadAfterFailure) await vscodeMock.commands.executeCommand('workbench.action.reloadWindow');
+} else if (!behavior.noMerge) {
+  const report = await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, {
+    limits: behavior.limits,
+    ...(behavior.explicit ? { candidateIds: [behavior.explicit], requested: true } : {}),
+    ...(behavior.failLink ? {
+      // Stands in for a persistent I/O failure while linking/copying CAS (EIO, EACCES, ENOSPC …).
+      linkFile: async () => { throw Object.assign(new Error('input/output error'), { code: 'EIO' }); }
+    } : {}),
+    ...(behavior.failCommit ? {
+      // Stands in for a persistent failure of the final commit, the only step after the other
+      // windows yielded (the CAS transfer and the backup run before any coordination).
+      onFaultPoint(point) {
+        if (point === 'before-row-commit') throw Object.assign(new Error('input/output error'), { code: 'EIO' });
+      }
+    } : {}),
+    coordinateOversized: (input, merge) => requestOtherWindowsToYield({ globalStoragePath: root }, input, merge)
+  });
+  await emit('report', {
+    merged: report.merged.map((item) => item.candidateId),
+    deferred: report.deferred.map((item) => item.code),
+    deferredMessages: report.deferred.map((item) => item.message),
+    blocked: report.blocked.map((item) => item.code),
+    failures: report.failures.map((item) => item.code),
+    pending: report.pendingSources
+  });
+}
 
 /** The parameters of requestOtherWindowsToYield in vscode/commands/runtimeDataSetManagement.ts. */
 async function requestOtherWindowsToYield(storagePaths, input, merge) {

@@ -98,7 +98,7 @@ test('无旧库时只预留固定默认根，初始化完成后根丢失不能�
   const second = await resolveVscodeWorkspaceRuntimePlacement(paths, scope('different'));
   assert.equal(second.runtimeDataRootPath, first.runtimeDataRootPath);
   await fs.rm(path.join(root, '.limcode-runtime'), { recursive: true });
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('third')), { code: 'runtime-dataset-invalid' });
+  await assertInitialFallbackPreservesRoot(root, paths, 'third');
 }));
 
 test('唯一完整旧根原地复用，RootBinding、数据集身份和CAS不改写', async () => fixture(async (root, paths) => {
@@ -321,15 +321,16 @@ test('scope普通文件保留为问题条目，离线检查不拼接文件内的
   assert.equal(await fs.readFile(unrelated, 'utf8'), 'keep-unrelated-file');
 }));
 
-test('只有异常scope时保留错误，不发布选择、不创建默认空库', async () => fixture(async (root, paths) => {
+test('只有异常scope时保留来源与残留记录，首次建立固定默认选择', async () => fixture(async (root, paths) => {
   const failedRoot = resolveVscodeWorkspaceRuntimeScopeRoot(paths, scope('only-invalid'));
   await fs.mkdir(failedRoot, { recursive: true });
   const inspection = await inspectVscodeRuntimeDataSets(paths);
   assert.equal(inspection.candidates.length, 0);
   assert.equal(inspection.problems.length, 1);
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-invalid' });
-  await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
-  await assert.rejects(fs.stat(path.join(root, '.limcode-runtime')), { code: 'ENOENT' });
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope('first'))).runtimeScopeRootPath, root);
+  assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths), 'utf8')).id, 'default');
+  const residual = await require('../../dist/extension/backend/reliableKernel/runtimeHistoryRegistry.js').readRuntimeHistoryResidual(paths);
+  assert.equal(residual.has(`workspace:${scope('only-invalid').key}`), true);
   assert.deepEqual(await fs.readdir(failedRoot), []);
 }));
 
@@ -463,26 +464,24 @@ test('真实进程在cutover归档active后退出，选库仍放行原journal恢
   assert.equal((await resolveVscodeRuntimeDataSet(paths, 'default')).requiresRecovery, undefined);
 }));
 
-test('仅cutover request不能掩盖丢失数据库，首次未完成pending仍保持拒绝', async () => {
+test('首次选择遇到缺失数据库或未完成pending，归档原根后建立默认选择', async () => {
   await fixture(async (root, paths) => {
     const binding = await createRoot(root);
     await persistPhysicalCutoverRequest(root, {
       noActiveTurn: true, noBackgroundProcess: true, noPendingProviderStream: true, noPersistInflight: true
     });
     await fs.rm(binding.paths.databasePath);
-    await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('request-only')), { code: 'runtime-dataset-invalid' });
-    await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+    await assertInitialFallbackPreservesRoot(root, paths, 'request-only');
   });
   await fixture(async (root, paths) => {
     const binding = await createRoot(root);
     await fs.rename(binding.paths.rootPointerPath, binding.paths.rootPendingPath);
     await fs.rm(binding.paths.dataRootPath, { recursive: true });
-    await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('incomplete-pending')), { code: 'runtime-dataset-invalid' });
-    await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
+    await assertInitialFallbackPreservesRoot(root, paths, 'incomplete-pending');
   });
 });
 
-test('损坏指针、无binding数据、丢失CAS和epoch身份漂移均拒绝且不发布新选择', async () => {
+test('首次选择遇到损坏指针、无binding、丢失CAS和epoch漂移，原字节归档并登记残留', async () => {
   for (const mode of ['malformed', 'unbound', 'missing-cas', 'epoch-mismatch']) {
     await fixture(async (root, paths) => {
       const binding = await createRoot(root);
@@ -494,9 +493,9 @@ test('损坏指针、无binding数据、丢失CAS和epoch身份漂移均拒绝�
         const epoch = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
         await fs.writeFile(binding.paths.runtimeEpochPath, JSON.stringify({ ...epoch, dataSetId: 'wrong-data-set' }));
       }
-      await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('first')), { code: 'runtime-dataset-invalid' });
-      await assert.rejects(fs.stat(resolveVscodeRuntimeSelectionPath(paths)), { code: 'ENOENT' });
-      assert.deepEqual(await fs.readFile(binding.paths.databasePath), databaseBefore);
+      const backup = await assertInitialFallbackPreservesRoot(root, paths, 'first');
+      const relative = path.relative(path.join(root, '.limcode-runtime'), binding.paths.databasePath);
+      assert.deepEqual(await fs.readFile(path.join(backup, relative)), databaseBefore);
     });
   }
 });
@@ -511,7 +510,7 @@ test('已选指针损坏不能回退，candidate id和RootBinding路径不能越
   await fs.writeFile(binding.paths.rootPointerPath, JSON.stringify({
     ...binding, paths: { ...binding.paths, databasePath: path.join(root, 'another.sqlite') }
   }));
-  await assert.rejects(resolveVscodeWorkspaceRuntimePlacement(paths, scope('third')), { code: 'runtime-dataset-invalid' });
+  await assertInitialFallbackPreservesRoot(root, paths, 'third');
 }));
 
 test('并发空窗口通过同一admission发布单个完整固定选择', async () => fixture(async (root, paths) => {
@@ -526,3 +525,27 @@ test('并发空窗口通过同一admission发布单个完整固定选择', async
   assert.equal(selection.selectionRevision, 1);
   assert.deepEqual((await fs.readdir(root)).filter((entry) => entry.endsWith('.tmp')), []);
 }));
+
+async function assertInitialFallbackPreservesRoot(root, paths, workspace) {
+  const oldControl = path.join(root, '.limcode-runtime');
+  async function files(directory, prefix = '') {
+    const result = {};
+    for (const entry of await fs.readdir(directory, {withFileTypes:true})) {
+      const name = path.join(prefix, entry.name);
+      if (entry.isDirectory()) Object.assign(result, await files(path.join(directory,entry.name), name));
+      else result[name] = await fs.readFile(path.join(directory,entry.name));
+    }
+    return result;
+  }
+  const original = await files(oldControl);
+  assert.equal((await resolveVscodeWorkspaceRuntimePlacement(paths, scope(workspace))).runtimeScopeRootPath, root);
+  assert.equal(JSON.parse(await fs.readFile(resolveVscodeRuntimeSelectionPath(paths),'utf8')).id, 'default');
+  const backups = path.join(root,'.limcode-runtime-reset-backups');
+  const names = await fs.readdir(backups);
+  assert.equal(names.length, 1);
+  const backup = path.join(backups,names[0]);
+  assert.deepEqual(await files(backup), original, '异常旧根逐文件原字节保留');
+  const residuals = await require('../../dist/extension/backend/reliableKernel/runtimeHistoryRegistry.js').readRuntimeHistoryResidual(paths);
+  assert.ok([...residuals.values()].some(record => record.location.containerPath === backup));
+  return backup;
+}

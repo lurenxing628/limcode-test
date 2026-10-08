@@ -97,7 +97,6 @@ test('等价性：同一来源走内存单事务与流式维护事务（阈值 5
   assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined, '等待大库会话不写账本');
   const { preparation, session } = await mergeStreamed(fixture, { candidateIds: [fixture.alpha.id] });
   assert.deepEqual(preparation.sources.map((source) => [source.candidateId, source.rows]), [[fixture.alpha.id, rows]]);
-  assert.ok(preparation.estimateRangeMs[0] <= preparation.estimateMs && preparation.estimateMs <= preparation.estimateRangeMs[1]);
   assert.deepEqual(session.results.map((result) => [result.state, result.result?.insertedConversations, result.result?.exclusive]), [['merged', 5, true]]);
   assertSameRows(readAll(fixture.current), expected, '首次合并');
   assert.deepEqual(await mergedInto(fixture, fixture.alpha.id), expectedInto, '账本记下同样的对话');

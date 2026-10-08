@@ -523,7 +523,8 @@ test('多进程：有窗口的用户取消倒计时则放弃，没有任何窗�
 test('多进程：迁移由运行中的窗口在锁外发起——等自己和其它窗口的任务结束，期间新窗口能打开，其它窗口倒计时不可取消，自己不重载', async (t) => {
   const fixture = await createRoot(t);
   const windows = createWindows(t, fixture.root, { noMerge: true });
-  await (await windows.start('working', { busy: true, busyForMs: 2_500 })).waitFor('ready');
+  const releaseWork = path.join(fixture.root, 'test-release-work');
+  await (await windows.start('working', { busyUntilFile: releaseWork })).waitFor('ready');
   await (await windows.start('idle', { cancelCountdown: true })).waitFor('ready');
   const requester = await windows.start('requester', { request: true, busy: true, busyForMs: 1_500 });
   await requester.waitFor('progress');
@@ -532,13 +533,14 @@ test('多进程：迁移由运行中的窗口在锁外发起——等自己和�
   const late = await windows.start('late');
   await late.waitFor('ready', 10_000);
   const openedWithin = Date.now() - openedAt;
+  const workingEnd = Date.now();
+  await fs.writeFile(releaseWork, 'finished');
   const coordination = await requester.waitFor('coordination', 30_000);
   await windows.stop();
   assert.ok(openedWithin < 8_000, `a new window opened after ${openedWithin} ms`);
   assert.equal(coordination.state, 'completed');
   assert.deepEqual(windows.reloads(), { working: 1, idle: 1, requester: 0, late: 1 });
   const operation = windows.events().find((event) => event.event === 'operation');
-  const workingEnd = windows.events().find((event) => event.name === 'working' && event.event === 'opened').startedAt + 2_500;
   assert.ok(operation.at >= workingEnd, 'the working window finished first');
   const countdowns = windows.events().filter((event) => event.event === 'progress' && /即将重载/.test(event.title));
   assert.ok(countdowns.length >= 3 && countdowns.every((event) => event.cancellable === false), JSON.stringify(countdowns));
