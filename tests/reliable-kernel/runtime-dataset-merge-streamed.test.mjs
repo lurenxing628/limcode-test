@@ -445,3 +445,33 @@ test('批次：有待合并的大库时，自动批次里超过在线上限的�
   assert.deepEqual(clicked.deferred.map((issue) => [issue.candidateId, issue.code]), [[fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]]);
   assert.equal(coordinated.length, 2);
 });
+
+for (const damage of ['invalid-row', 'missing-body']) test(`剔除等价性：${damage} 只留下对应对话，其余在线和流式一致`, async (t) => {
+  const fixture = await fixtureFor(t);
+  await seedConversations(fixture.alpha, [{id:'damaged'}, {id:'kept'}]);
+  if (damage === 'invalid-row') {
+    rawWrite(fixture.alpha, db => {
+      db.prepare("UPDATE message_revision SET revision_seq='invalid' WHERE id=?").run('damaged_message_0_revision');
+    });
+  } else {
+    const db = new Database(fixture.alpha.binding.paths.databasePath, {readonly:true});
+    let storageKey;
+    try { storageKey = db.prepare(`SELECT storage_key FROM content_object WHERE id=(SELECT content_object_id FROM message_revision WHERE id=?)`).pluck().get('damaged_message_0_revision'); }
+    finally { db.close(); }
+    await fs.rm(path.join(fixture.alpha.binding.paths.casRootPath, storageKey));
+  }
+  const before = await saveState(fixture, fixture.current);
+  t.after(() => before.remove());
+  const online = await mergeOnline(fixture);
+  assert.deepEqual([online.blocked,online.failures,online.deferred], [[],[],[]]);
+  const expected = readAll(fixture.current);
+  const onlineRecord = await readLedgerRecord(fixture,fixture.alpha.id);
+  assert.equal(onlineRecord.state,'partial');
+  assert.deepEqual(onlineRecord.excluded.map(row=>row.conversationId),['damaged']);
+  await before.restore();
+  const {preparation,session} = await mergeStreamed(fixture,{candidateIds:[fixture.alpha.id], options:{sizeLimits:{transactionRows:1}}});
+  assert.equal(preparation.sources.length,1,JSON.stringify(preparation.report));
+  assert.deepEqual(session.results.map(result=>result.state),['merged']);
+  assertSameRows(readAll(fixture.current),expected,damage);
+  assert.deepEqual((await readLedgerRecord(fixture,fixture.alpha.id)).excluded,onlineRecord.excluded);
+});

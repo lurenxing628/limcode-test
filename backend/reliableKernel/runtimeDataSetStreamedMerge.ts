@@ -322,6 +322,7 @@ async function prepareSkippedRows(
 ): Promise<boolean> {
   const deleted = merged.length > 0 ? await engine.deletedSinceMerge(source, target, merged) : undefined;
   state.skippedConversations = deleted?.count ?? 0;
+  state.skippedConversationIds = deleted ? [...deleted.conversations].sort() : [];
   withTemporaryWrites(source, () => source.exec(`DROP TABLE IF EXISTS temp.${SKIP_TABLE}`));
   if (!deleted && !state.excluded?.length) return false;
   seedSkipTable(source, [...(deleted?.conversations ?? []), ...(state.excluded?.map(row => row.conversationId) ?? [])]);
@@ -1495,7 +1496,8 @@ async function prepareSource(
       boundSourcePageCache(taken.snapshot.database);
       const skipping = await prepareSkippedRows(taken.snapshot.database, target.database, merged, state, chunkRows);
       progress('scan', 0);
-      for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate))) {
+      engine.prepareSettlement(taken.snapshot.database, state);
+      for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate) || state.finalized !== undefined)) {
         if (!skipping || !taken.snapshot.database.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain=? AND id=?`).get(issue.domain,String(issue.row.id))) {
           state.exclusions!.exclude(issue.domain,issue.row,issue.code);
         }
@@ -1521,7 +1523,7 @@ async function prepareSource(
     let scan = await scanSource();
     const work = await keptWork();
     if (work.refused.length > 0) throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(work.refused), state));
-    if (hasFinalizableWork(work)) {
+    if (hasFinalizableWork(work) || (options.settleSourceWork && state.settlementWork)) {
       // Everything that can refuse the source was checked on the unfinalized snapshot; the CAS
       // objects are verified too. Only then is it backed up and its work closed, and checked again.
       stopIfAsked();
@@ -1902,11 +1904,8 @@ async function estimateSource(
   if (fingerprint === undefined) throw new Error('The audit of this source gave no fingerprint.');
   engine.assertMergeableSize(facts, options, state, true);
   if (!aboveThreshold(facts, input.threshold ?? 'in-memory', options)) return { kind: 'small' };
-  // Refused as a batch refuses it: only where nothing of it is left out (else the preparation judges
-  // the work that remains once the rows of conversations deleted here are left out).
-  if (facts.refusedWork.length > 0 && await engine.leavesNothingOut(target, await engine.recordedConversations(paths, target, candidate))) {
-    throw new engine.Outcome(engine.unfinishedWorkOutcome(describeUnfinishedWork(facts.refusedWork), state));
-  }
+  // Conversation-level refusals are resolved by preparation's existing scan, not a whole-source
+  // rejection from these aggregate estimate counts.
   // Entirely loose local roots may link on one disk. Mixed roots count copies and packed storage
   // overhead conservatively; every source needs its private sidecar snapshot in temp space.
   const foreign = engine.isForeignCandidate(candidate);
