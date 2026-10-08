@@ -217,7 +217,8 @@ test('盲审 #1：本版本在来源库里删掉的对话（删除记录记在�
   await seedConversations(second.alpha, [{ id: 'b_1' }, { id: 'b_2' }]);
   const copied = path.join(second.base, `${path.basename(second.root)}.limcode-copied-2026-09-28T01-02-03-004Z-0000abcd`);
   await fs.cp(second.root, copied, { recursive: true });
-  await deleteUnselectedRuntimeDataSet(second.paths, second.alpha.id, second.alpha.binding.dataSetId);
+  // Model a source no longer in this configuration root. The product now refuses deleting an unmerged library.
+  await fs.rename(second.alpha.scopeRoot, path.join(second.base, 'source-moved-away'));
   const earlier = { dataSetId: randomUUID(), rootInstanceId: randomUUID() };
   const aliases = path.join(resolveVscodeRuntimeMergeLedgerRoot({ globalStoragePath: second.root }), 'aliases');
   await fs.mkdir(aliases, { recursive: true });

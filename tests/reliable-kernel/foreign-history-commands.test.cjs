@@ -251,8 +251,8 @@ test('合并进当前库：确认框写明只读、复制正文、中断任务�
   assert.equal(options.modal, true);
   assert.match(options.detail, /来源：\/data\/limcode\/\.limcode-runtime-backups\/20260901-010203-004-abcdef12\/active/);
   assert.match(options.detail, /外来历史库只读：合并不在它的目录里写任何东西，它原样保留；它的正文文件会复制进当前库（不共用文件）/);
-  assert.match(options.detail, /还有中断的任务或排队未发送的消息，这次不合并并说明原因（当前版本不在外来目录里收尾），仍可只读查看/);
-  assert.match(options.detail, /与当前库有数据冲突时整体不合并/);
+  assert.match(options.detail, /还有中断的任务或排队未发送的消息，对应对话留在来源并说明原因（当前版本不在外来目录里收尾），其余对话继续合并，仍可只读查看/);
+  assert.match(options.detail, /与当前库有可定位到对话的数据冲突时，对应对话留在来源并说明原因，其余对话继续合并/);
   assert.match(options.detail, /你在本版本里删掉的对话不会回来；更早版本里删掉、而这份库里还有的对话会被加回来，合并后可以再删。/);
   assert.doesNotMatch(options.detail, /同一个库的其它拷贝合并进来的也一样/);
   assert.match(options.detail, /（较大的库另行说明。）/);
@@ -393,7 +393,7 @@ test('有未结束任务的外来库：列表写明原因、不说可以合并�
   });
   await f.command.manageForeignRuntimeHistory(f.context, f.startup);
   const [, items] = f.calls.find((call) => call[0] === 'pick');
-  assert.match(items[0].detail, /有 3 项未结束的任务（旧窗口中断时留下），合并前需要收尾，当前版本不在外来目录里收尾，所以暂不合并；可以只读查看/);
+  assert.match(items[0].detail, /有 3 项未结束的任务（旧窗口中断时留下），合并前需要收尾，当前版本不在外来目录里收尾，对应对话会保留为残留，其余对话可以合并；可以只读查看/);
   assert.doesNotMatch(items[0].detail, /可以合并进当前库/);
   const actions = f.calls.filter((call) => call[0] === 'pick')[1][1];
   assert.deepEqual(actions[1], { label: '合并进当前库', description: '暂不能合并：有 3 项未结束的任务', action: 'unfinished' });
@@ -410,4 +410,17 @@ test('合并结果与大库会话里的名称：来源和名称可读，工作�
     '外来历史库（从别处拷来 · limcode.limcode-copied-2026-09-02T01-02-03-004Z-12345678 · 工作区库）');
   assert.equal(f.command.foreignSourceLabel({ ...COPIED, archiveName: '20260903-010203-004-abcdef12' }),
     '外来历史库（拷来目录里的归档 · 20260903-010203-004-abcdef12）');
+});
+
+ test('外来部分合并保留剔除数量与残留入口说明', async () => {
+  const source = entry();
+  const f = fixture({ entries: [source], mergeStates: [[source.id, {
+    state: 'partial', mergedAt: '2026-09-27T08:09:10.000Z', intoCurrent: true, changedSinceMerge: false,
+    excluded: [{ conversationId: 'bad', title: 'bad', code: 'runtime-data-set-merge-conflict', count: 1 }]
+  }]] });
+  await f.command.manageForeignRuntimeHistory(f.context);
+  const [, items] = f.calls.find((call) => call[0] === 'pick');
+  assert.match(items[0].description, /部分合并，1 个对话留在来源/);
+  assert.match(items[0].detail, /1 个对话未合并，来源保留，可在历史残留中查看原因/);
+  assert.doesNotMatch(items[0].detail, /已合并进当前库/);
 });

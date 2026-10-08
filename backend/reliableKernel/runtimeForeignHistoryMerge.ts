@@ -12,7 +12,7 @@ import { runtimeDataSetFileState } from './runtimeDataSetFacts';
 import {
   cachedRuntimeRootFingerprint, readRuntimeDataSetMergeLedger, readRuntimeDataSetMergeRequests, rememberRuntimeRootFingerprint,
   runtimeDataSetLastMerge, sameRuntimeDataSetIdentity, writeRuntimeDataSetMergeRequest,
-  type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeForeignSource
+  type RuntimeDataSetFingerprint, type RuntimeDataSetIdentity, type RuntimeDataSetMergeForeignSource, type RuntimeDataSetMergeExcludedConversation
 } from './runtimeDataSetMergeLedger';
 import {
   copyLocatedRuntimeDatabase, ForeignRuntimeHistoryRejection, foreignFileState, heldDatabaseFiles, holdForeignRuntimeRootClaim,
@@ -131,7 +131,8 @@ export async function foreignHistoricalMergeFingerprint(
 
 export type ForeignRuntimeHistoryMergeState =
   /** The last merge of this root (its identity) into a data set, and whether the root changed since (by its verified content digest). */
-  | { state: 'merged'; mergedAt: string; intoCurrent: boolean; changedSinceMerge: boolean; skippedConversations?: number }
+  | ({ state: 'merged' } & ForeignRuntimeHistoryLastMerge)
+  | ({ state: 'partial'; excluded: RuntimeDataSetMergeExcludedConversation[] } & ForeignRuntimeHistoryLastMerge)
   | { state: 'requested'; requestedAt: string; lastMerged?: ForeignRuntimeHistoryLastMerge }
   | { state: 'blocked' | 'failed'; code: string; message: string; lastMerged?: ForeignRuntimeHistoryLastMerge }
   | { state: 'too-large'; rows: number; maxRows: number; message: string; lastMerged?: ForeignRuntimeHistoryLastMerge };
@@ -142,6 +143,7 @@ export interface ForeignRuntimeHistoryLastMerge {
   changedSinceMerge: boolean;
   /** That merge left out conversations the user had deleted there: backup cleanup keeps this root. */
   skippedConversations?: number;
+  excluded?: RuntimeDataSetMergeExcludedConversation[];
 }
 
 /**
@@ -173,7 +175,8 @@ export async function readForeignRuntimeHistoryMergeStates(
     const merge = record ? runtimeDataSetLastMerge(record) : undefined;
     const lastMerged: ForeignRuntimeHistoryLastMerge | undefined = merge && {
       mergedAt: merge.mergedAt, intoCurrent: sameRuntimeDataSetIdentity(merge.target, current), changedSinceMerge: merge.source.contentDigest !== entry.contentDigest,
-      ...(merge.skippedConversations ? { skippedConversations: merge.skippedConversations } : {})
+      ...(merge.skippedConversations ? { skippedConversations: merge.skippedConversations } : {}),
+      ...(merge.excluded?.length ? { excluded: merge.excluded } : {})
     };
     const carried = lastMerged ? { lastMerged } : {};
     const request = requests.get(entry.id);
@@ -186,7 +189,9 @@ export async function readForeignRuntimeHistoryMergeStates(
     } else if (unchanged && record.state === 'too-large' && record.maxRows === RUNTIME_DATA_SET_STREAMED_MERGE_MAX_ROWS) {
       result.set(entry.id, { state: 'too-large', rows: record.rows, maxRows: record.maxRows, message: record.message, ...carried });
     } else if (lastMerged) {
-      result.set(entry.id, { state: 'merged', ...lastMerged });
+      result.set(entry.id, lastMerged.excluded?.length
+        ? { ...lastMerged, state: 'partial', excluded: lastMerged.excluded }
+        : { ...lastMerged, state: 'merged' });
     }
   }
   return result;

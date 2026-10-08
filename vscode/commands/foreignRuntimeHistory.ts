@@ -203,16 +203,16 @@ async function mergeIntoCurrent(
   if (!entry.dataSetId || !entry.rootInstanceId) return;
   const again = merge?.state === 'merged' && merge.intoCurrent
     ? merge.changedSinceMerge
-      ? '\n\n它在上次合并之后又有变化：新增的对话会合并进来；已合并的对话如果内容不同，会整体不合并并说明原因。'
+      ? '\n\n它在上次合并之后又有变化：新增的对话会合并进来；已合并的对话如果内容不同，会保留冲突对话并说明原因。'
       : '\n\n它上次合并之后没有变化，这次会提示没有新内容。'
     : '';
   const confirmed = await vscode.window.showWarningMessage('把这个外来历史库合并进当前库？', {
     modal: true,
     detail: `来源：${entry.locatedPath}\n\n在后台合并，不需要重载窗口：先备份当前库，再把对话写入当前库。`
       + '外来历史库只读：合并不在它的目录里写任何东西，它原样保留；它的正文文件会复制进当前库（不共用文件），需要相应的磁盘空间。'
-      + '它里面如果还有中断的任务或排队未发送的消息，这次不合并并说明原因（当前版本不在外来目录里收尾），仍可只读查看。'
+      + '它里面如果还有中断的任务或排队未发送的消息，对应对话留在来源并说明原因（当前版本不在外来目录里收尾），其余对话继续合并，仍可只读查看。'
       + '你在本版本里删掉的对话不会回来；更早版本里删掉、而这份库里还有的对话会被加回来，合并后可以再删。'
-      + '与当前库有数据冲突时整体不合并，并说明原因。' + oversizedMergeNote() + again
+      + '与当前库有可定位到对话的数据冲突时，对应对话留在来源并说明原因，其余对话继续合并；无法归属的冲突才阻止整个来源。' + oversizedMergeNote() + again
       + `\n\n合并完成后，${CLEANUP_TIP}`
   }, '合并');
   if (confirmed !== '合并') return;
@@ -253,11 +253,12 @@ function unfinishedCount(entry: ForeignRuntimeHistoryEntry): number {
 function mergeStateText(merge: ForeignRuntimeHistoryMergeState | undefined): string {
   if (!merge) return '';
   const time = (iso: string): string => formatTime(iso);
-  const last = merge.state === 'merged' ? merge : merge.lastMerged;
+  const last = merge.state === 'merged' || merge.state === 'partial' ? merge : merge.lastMerged;
+  const label = last?.excluded?.length ? `部分合并，${last.excluded.length} 个对话留在来源` : '已合并';
   const merged = !last ? '' : last.intoCurrent
-    ? `已合并（${time(last.mergedAt)}）${merge.state === 'merged' && last.changedSinceMerge ? '，之后有变化' : ''}`
-    : `已合并到另一个历史库（${time(last.mergedAt)}）`;
-  const now = merge.state === 'merged' ? ''
+    ? `${label}（${time(last.mergedAt)}）${(merge.state === 'merged' || merge.state === 'partial') && last.changedSinceMerge ? '，之后有变化' : ''}`
+    : `${label}到另一个历史库（${time(last.mergedAt)}）`;
+  const now = merge.state === 'merged' || merge.state === 'partial' ? ''
     : merge.state === 'requested' ? `已请求合并（${time(merge.requestedAt)}），还没有完成`
       : merge.state === 'too-large' ? '太大，暂不能合并' : '暂不能合并';
   return [merged, now].filter(Boolean).join('；');
@@ -293,6 +294,9 @@ function mergeDetail(entry: ForeignRuntimeHistoryEntry, merge?: ForeignRuntimeHi
   if (merge?.state === 'merged' && merge.intoCurrent && !merge.changedSinceMerge) {
     return ['只读；已合并进当前库', merge.skippedConversations ? skippedTip(merge.skippedConversations) : CLEANUP_TIP];
   }
+  if (merge?.state === 'partial') {
+    return [`只读；${merge.excluded.length} 个对话未合并，来源保留，可在历史残留中查看原因`];
+  }
   // The line on its unfinished work says why it is not merged now.
   if (unfinishedCount(entry) > 0) return ['只读'];
   if (merge?.state === 'blocked' || merge?.state === 'failed' || merge?.state === 'too-large') {
@@ -319,7 +323,7 @@ function entryDetail(entry: ForeignRuntimeHistoryEntry, identicalCopies: number,
     `位置：${entry.locatedPath}`,
     ...(entry.recordedDataRootPath ? [`原位置：${entry.recordedDataRootPath}`] : []),
     ...(entry.status === 'verified' ? mergeDetail(entry, merge) : [`原因：${entry.reason ?? '原因未知'}`, '原样保留，不会自动删除']),
-    ...(unfinishedCount(entry) > 0 ? [`有 ${unfinishedCount(entry)} 项未结束的任务（旧窗口中断时留下），合并前需要收尾，当前版本不在外来目录里收尾，所以暂不合并；可以只读查看`] : []),
+    ...(unfinishedCount(entry) > 0 ? [`有 ${unfinishedCount(entry)} 项未结束的任务（旧窗口中断时留下），合并前需要收尾，当前版本不在外来目录里收尾，对应对话会保留为残留，其余对话可以合并；可以只读查看`] : []),
     ...(identicalCopies > 0 ? [`另有 ${identicalCopies} 份完全相同的拷贝`] : []),
     ...(entry.movedAsideBy ? [`迁移数据目录时挪到旁边（迁移 ${entry.movedAsideBy.slice(0, 8)}）`] : [])
   ].join(' · ');

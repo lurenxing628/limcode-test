@@ -409,7 +409,7 @@ test('以前的数据目录里的归档（迁移后留在旧目录，globalStatu
   assert.deepEqual(await treeState(older.root), before, '旧目录一字节不变');
 });
 
-test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两份同身份的外来库先合并的成功、没分叉的没有新内容、已分叉的按冲突拒绝；在当前库删掉的对话不会被另一份拷贝插回', async (t) => {
+test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两份同身份的外来库先合并的成功、没分叉的没有新内容、已分叉的只剔除冲突对话；在当前库删掉的对话不会被另一份拷贝插回', async (t) => {
   const fixture = await home(t);
   await seedConversations(fixture.current, [{ id: 'current_1' }]);
   await seedConversations(fixture.alpha, [{ id: 'alpha_1' }]);
@@ -425,7 +425,7 @@ test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两�
   // By a readable name (the project names a picker read, else the kind of history), never its internal id.
   assert.match(blocked.get(oldAlpha.id).message, /这个外来历史库是历史库“旧工作区历史”的旧拷贝/);
   assert.ok(!blocked.get(oldAlpha.id).message.includes(fixture.alpha.id), '原因里不写内部 id');
-  assert.match(blocked.get(oldAlpha.id).message, /可以在“清理备份”里按覆盖核对后删除/);
+  assert.match(blocked.get(oldAlpha.id).message, /已保留在“未能合并的旧数据”中，不会自动删除，可以只读查看/);
   assert.equal(blocked.get(oldAlpha.id).label, oldAlpha.label);
   assert.deepEqual(conversations(fixture), ['current_1']);
   assert.equal((await readLedgerRecord(fixture, oldAlpha.id)).state, 'blocked', '拒绝按确切状态记在当前配置根');
@@ -435,6 +435,7 @@ test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两�
   const identical = (await copiedDirectory(fixture, undefined, { from: elsewhere })).container;
   const later = (await copiedDirectory(fixture, undefined, { from: elsewhere })).container;
   await withRuntime(elsewhere.current, (runtime) => runtime.transaction([repo('Conversation').update('far_1', { title: '在别处改过', updated_at: '2026-09-27T00:00:00.000Z' })]));
+  await seedConversations(elsewhere.current, [{ id: 'far_3' }]);
   const diverged = (await copiedDirectory(fixture, undefined, { from: elsewhere })).container;
   const [f1, f2, f3, f4] = await Promise.all([first, identical, later, diverged].map((container) => found(fixture, container)));
   assert.ok(new Set([f1, f2, f3, f4].map((source) => source.id)).size === 4, '四份各有自己的 id');
@@ -446,9 +447,12 @@ test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两�
   const nothingNew = await merge(fixture, [f2]);
   assert.deepEqual(nothingNew.merged.map((item) => [item.candidateId, item.alreadyMerged, item.insertedRows]), [[f2.id, true, 0]], '没分叉的另一份：没有新内容');
   const conflict = await merge(fixture, [f4]);
-  assert.deepEqual([conflict.merged, conflict.blocked.map((issue) => [issue.candidateId, issue.code])],
-    [[], [[f4.id, 'runtime-data-set-merge-conflict']]], '已分叉的后一份按冲突拒绝');
-  assert.match(conflict.blocked[0].message, /同一个库的另一份拷贝先合并进来之后，这一份又有了不同的改动/);
+  assert.deepEqual([conflict.blocked, conflict.deferred, conflict.failures], [[], [], []]);
+  assert.deepEqual(conflict.merged.map(item => [item.candidateId, item.insertedConversations]), [[f4.id, 1]], '非冲突的新对话正常合并');
+  const partial = await readLedgerRecord(fixture, f4.id);
+  assert.equal(partial.state, 'partial');
+  assert.deepEqual(partial.excluded.map(item => [item.conversationId, item.code]), [['far_1', 'runtime-data-set-merge-conflict']]);
+  assert.deepEqual(conflict.merged[0].excluded, partial.excluded);
   assert.deepEqual(query(fixture.current.binding.paths.databasePath, "SELECT title FROM conversation WHERE id = 'far_1'"), ['far_1'], '当前库没有改动');
 
   // The user deletes a conversation the first copy brought in; the third copy never merged leaves it out.
@@ -456,13 +460,13 @@ test('身份：与本地库身份相同的旧拷贝拒绝并写明原因；两�
   try { await new ConversationDeletionControlPlane(database).delete('far_2'); } finally { await database.close(); }
   const afterDelete = await merge(fixture, [f3]);
   assert.deepEqual(afterDelete.merged.map((item) => [item.candidateId, item.skippedConversations, item.alreadyMerged]), [[f3.id, 1, true]]);
-  assert.deepEqual(conversations(fixture), ['current_1', 'far_1'], '删掉的对话没有被同一个库的另一份拷贝插回');
+  assert.deepEqual(conversations(fixture), ['current_1', 'far_1', 'far_3'], '删掉的对话没有被同一个库的另一份拷贝插回');
 });
 
-test('有中断任务或排队消息的外来库：记为 blocked 并写明原因，不收尾、不备份、不写入它，仍可只读查看；列表显示原因', async (t) => {
+test('有中断任务或排队消息的外来库：剔除忙碌对话并合并正常对话，来源不收尾不改写，账本与列表保留部分合并清单', async (t) => {
   const fixture = await home(t);
   const { container } = await copiedDirectory(fixture, async (source) => {
-    await seedConversations(source.current, [{ id: 'busy_1' }]);
+    await seedConversations(source.current, [{ id: 'busy_1' }, { id: 'ready_1' }]);
     await withRuntime(source.current, async (runtime, store) => {
       const text = await store.ingest(runtime, JSON.stringify({ role: 'user', parts: [{ text: '排队中的消息' }] }), MESSAGE_TYPE);
       await runtime.transaction([
@@ -475,18 +479,21 @@ test('有中断任务或排队消息的外来库：记为 blocked 并写明原�
   const source = await found(fixture, container);
   const before = await treeState(container);
   const report = await merge(fixture, [source]);
-  assert.deepEqual([report.merged, report.deferred, report.failures], [[], [], []]);
-  assert.deepEqual(report.blocked.map((issue) => [issue.candidateId, issue.code]), [[source.id, 'runtime-data-set-merge-foreign-unfinished-work']]);
-  assert.match(report.blocked[0].message, /1 个中断的任务、1 条排队未发送的消息/);
-  assert.match(report.blocked[0].message, /当前版本不在它的目录里收尾/);
-  assert.match(report.blocked[0].message, /只读查看/);
-  assert.deepEqual(conversations(fixture), []);
-  assert.deepEqual(await treeState(container), before, '没有收尾、没有备份，外来目录不变');
-  assert.equal((await readLedgerRecord(fixture, source.id)).state, 'blocked');
-  assert.deepEqual(await readForeign(fixture, source), ['busy_1'], '仍可只读查看');
+  assert.deepEqual([report.blocked, report.deferred, report.failures], [[], [], []]);
+  assert.deepEqual(report.merged.map(item => [item.candidateId, item.insertedConversations]), [[source.id, 1]]);
+  const partial = await readLedgerRecord(fixture, source.id);
+  assert.equal(partial.state, 'partial');
+  assert.deepEqual(partial.excluded.map(item => [item.conversationId, item.code]), [['busy_1', 'runtime-data-set-merge-unfinished-work']]);
+  assert.deepEqual(report.merged[0].excluded, partial.excluded);
+  assert.equal(report.merged[0].finalized, undefined, '外来来源不收尾');
+  assert.deepEqual(conversations(fixture), ['ready_1']);
+  assert.deepEqual(query(fixture.current.binding.paths.databasePath, "SELECT id FROM turn_intent"), [], '忙碌对话的排队消息不导入');
+  assert.deepEqual(await treeState(container), before, '没有收尾、没有来源备份，外来目录不变');
+  assert.deepEqual(await readForeign(fixture, source), ['busy_1', 'ready_1'], '原库仍可只读查看');
   const { entries } = await foreign.inspectForeignRuntimeHistory({ configurationRootPath: fixture.root });
   const state = (await foreignMerge.readForeignRuntimeHistoryMergeStates(fixture.paths, entries)).get(source.id);
-  assert.deepEqual([state?.state, state?.code], ['blocked', 'runtime-data-set-merge-foreign-unfinished-work']);
+  assert.equal(state?.state, 'partial');
+  assert.deepEqual(state?.excluded, partial.excluded);
 });
 
 test('合并期间外来库被改动：提交前在声明内复核发现文件状态变化就推迟，不写 committing、当前库不变；没变化后再合并成功；大库会话同样', async (t) => {
@@ -654,7 +661,7 @@ test('正文复制前先查空间：当前库所在的盘放不下外来库缺�
   assert.equal(await readLedgerRecord(fixture, source.id), undefined);
 });
 
-test('外来库正文目录里的符号链接不跟随：来源缺正文记为失败，链接指向的目录从不被读取，外来目录不变', async (t) => {
+test('外来库正文目录里的符号链接不跟随：缺正文对话剔除并保留残留，链接目标与外来目录不变', async (t) => {
   const fixture = await home(t);
   const { container } = await copiedDirectory(fixture, (source) => seedConversations(source.current, [{ id: 'linked_1' }]));
   const source = await found(fixture, container);
@@ -666,8 +673,13 @@ test('外来库正文目录里的符号链接不跟随：来源缺正文记为�
   const before = await treeState(container);
   const movedBefore = await treeState(moved);
   const report = await merge(fixture, [source]);
-  assert.deepEqual([report.merged, report.deferred], [[], []]);
-  assert.deepEqual(report.failures.map((issue) => [issue.candidateId, issue.code]), [[source.id, 'runtime-data-set-merge-source-cas-invalid']]);
+  assert.deepEqual([report.blocked, report.deferred, report.failures], [[], [], []]);
+  assert.deepEqual(report.merged.map(item => [item.candidateId, item.insertedConversations, item.copiedCasObjects]), [[source.id, 0, 0]]);
+  const partial = await readLedgerRecord(fixture, source.id);
+  assert.equal(partial.state, 'partial');
+  assert.deepEqual(partial.excluded.map(item => [item.conversationId, item.code]), [['linked_1', 'runtime-data-set-merge-source-cas-invalid']]);
+  const { readRuntimeHistoryResidual } = kernelFile('runtimeHistoryRegistry.js');
+  assert.deepEqual((await readRuntimeHistoryResidual(fixture.paths)).get(source.id)?.excluded, partial.excluded);
   assert.deepEqual(conversations(fixture), []);
   assert.deepEqual(await treeState(container), before);
   assert.deepEqual(await treeState(moved), movedBefore);
