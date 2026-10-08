@@ -71,7 +71,7 @@ for (const kind of ['input', 'continuation', 'runtime_continuation']) {
       assert.deepEqual(inspection.intents.map(intent => intent.intentId), [queued.intentId]);
       await withRuntime(fixture.current, async (database, store) => {
         const report = await mergeHistoricalDataSetsOnline(fixture.paths,
-          { configurationRootPath: fixture.root, database }, { candidateIds: [fixture.alpha.id], requested: true });
+          { configurationRootPath: fixture.root, database }, { candidateIds: [fixture.alpha.id], requested: true, confirmSettlement: async () => true });
         assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
         assert.equal(report.merged.length, 1);
         const { finalized } = report.merged[0];
@@ -103,7 +103,7 @@ for (const kind of ['input', 'continuation', 'runtime_continuation']) {
   });
 }
 
-test('a pending delivery still refuses the whole source before cancelling queued continuations', async () => {
+test('a pending delivery excludes its conversation and retains its queued continuations', async () => {
   const fixture = await createConfigurationRoot();
   try {
     const conversationId = 'blocked_delivery';
@@ -125,9 +125,10 @@ test('a pending delivery still refuses the whole source before cancelling queued
     assert.ok(inspection.refused.some(item => item.label === '待投递的消息或唤醒'));
     await withRuntime(fixture.current, async database => {
       const report = await mergeHistoricalDataSetsOnline(fixture.paths,
-        { configurationRootPath: fixture.root, database }, { candidateIds: [fixture.alpha.id], requested: true });
-      assert.equal(report.merged.length, 0);
-      assert.equal(report.blocked.length, 1);
+        { configurationRootPath: fixture.root, database }, { candidateIds: [fixture.alpha.id], requested: true, confirmSettlement: async () => true });
+      assert.equal(report.merged.length, 1);
+      assert.equal(report.blocked.length, 0);
+      assert.ok(report.merged[0].excluded.some(item => item.conversationId === conversationId));
       assert.deepEqual([report.failures, report.deferred], [[], []]);
       assert.equal((await database.snapshot([repo('Conversation').get(conversationId)])).snapshot[0], null);
     });

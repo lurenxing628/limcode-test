@@ -1,3 +1,4 @@
+import { publishInitialRuntimeSelection } from './fixtures/runtime-selection.mjs';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
@@ -319,7 +320,7 @@ for (const previousEpoch of [3, 4, 5]) {
     let current;
     try {
       const currentBinding = await kernel.initializeEmptyRuntimeRoot(currentAuthority);
-      await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
+      await publishInitialRuntimeSelection(storagePaths, 'default');
       const selectionPath = kernel.resolveVscodeRuntimeSelectionPath(storagePaths);
       const selection = await fs.readFile(selectionPath);
       current = await kernel.RuntimeDatabase.open(currentAuthority);
@@ -385,7 +386,7 @@ test('explicit upgrade publishes a maintenance activity marker in the admission 
   const fixture = await createPublishedRuntime(4);
   const storagePaths = { globalStoragePath: fixture.cleanupRoot };
   try {
-    await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
+    await publishInitialRuntimeSelection(storagePaths, 'default');
     await fs.rm(kernel.runtimeHostLivenessDirectory(fixture.paths), { recursive: true, force: true });
     const claims = [kernel.runtimeDataRootAdmissionClaimPath(fixture.cleanupRoot), kernel.runtimeMaintenanceClaimPath(fixture.paths)];
     const seen = [];
@@ -409,7 +410,7 @@ test('explicit upgrade accepts a selected offline predecessor and validates curr
   const fixture = await createPublishedRuntime(4);
   const storagePaths = { globalStoragePath: fixture.cleanupRoot };
   try {
-    await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
+    await publishInitialRuntimeSelection(storagePaths, 'default');
     await fs.rm(kernel.runtimeHostLivenessDirectory(fixture.paths), { recursive: true, force: true });
     const selection = await fs.readFile(kernel.resolveVscodeRuntimeSelectionPath(storagePaths));
     const input = upgradeInput(fixture);
@@ -608,7 +609,7 @@ test('automatic discovery upgrades independent histories after one failure and f
       runtimeDataRootPath: kernel.resolveVscodeRuntimeDataRoot(storagePaths)
     });
     await kernel.initializeEmptyRuntimeRoot(currentAuthority);
-    await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
+    await publishInitialRuntimeSelection(storagePaths, 'default');
     current = await kernel.RuntimeDatabase.open(currentAuthority);
     const selectionPath = kernel.resolveVscodeRuntimeSelectionPath(storagePaths);
     const selection = await fs.readFile(selectionPath);
@@ -649,7 +650,7 @@ test('automatic discovery stops between sources after deactivation and leaves th
     const second = await createPublishedRuntime(4, {
       configurationRoot: selected.cleanupRoot, workspaceScope: `folder-${'b'.repeat(64)}`
     });
-    await kernel.selectVscodeRuntimeDataSet(storagePaths, 'default');
+    await publishInitialRuntimeSelection(storagePaths, 'default');
     const selectedBefore = await preservedFiles(selected);
     const report = await kernel.upgradeDiscoveredRuntimeDataSets(storagePaths, {
       shouldContinue: () => JSON.parse(readFileSync(first.paths.rootPointerPath, 'utf8')).runtimeKernelEpoch !== 6
