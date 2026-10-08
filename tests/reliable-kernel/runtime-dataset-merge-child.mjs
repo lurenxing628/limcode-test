@@ -27,6 +27,7 @@ if (mode === 'kill') {
   const [point, candidateId] = rest;
   const report = await mergeHistoricalDataSetsOnline({ globalStoragePath: root }, { configurationRootPath: root, database }, {
     ...(candidateId ? { candidateIds: [candidateId] } : {}),
+    confirmSettlement: async () => true,
     onFaultPoint(reached) { if (reached === point) process.kill(process.pid, 'SIGKILL'); }
   });
   process.stderr.write(`not killed: ${JSON.stringify(report)}\n`);

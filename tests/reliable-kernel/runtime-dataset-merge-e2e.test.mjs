@@ -79,7 +79,9 @@ test('E2E 崩溃旧窗口留下的进行中 Turn（流式到一半）+ 排队消
   } });
   try {
     await live.startupRecovery();
-    const report = await mergeHistoricalDataSetsOnline(paths, { configurationRootPath: root, database: live.app.database });
+    const report = await mergeHistoricalDataSetsOnline(paths, { configurationRootPath: root, database: live.app.database }, {
+      confirmSettlement: async () => true
+    });
     t.diagnostic(`merge report: ${JSON.stringify({ merged: report.merged.map((item) => ({ finalized: item.finalized, inserted: item.insertedRows })),
       blocked: report.blocked, failures: report.failures, deferred: report.deferred })}`);
     assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);

@@ -507,10 +507,12 @@ test('审查 B1：同一候选 id 的记录被新化身覆盖后，旧身份的�
   const report = await batch(fixture, explicit(source.id));
   assert.deepEqual(brief(report).merged, [[source.id, 0, 1]]);
   assert.deepEqual(conversations(fixture), ['b_2', 'n_1', 'own_1'], '删掉的 b_1 没有回来');
-  // A refusal recorded for the candidate id keeps it as well.
+  // A partial merge recorded for the candidate id keeps it as well.
   await rawWrite(fresh, (database) => database.prepare('UPDATE conversation SET title = ? WHERE id = ?').run('changed', 'n_1'));
   await batch(fixture, explicit(fresh.id));
-  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'blocked');
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'partial');
+  assert.deepEqual((await readLedgerRecord(fixture, fixture.alpha.id)).excluded.map(item => [item.conversationId, item.code]),
+    [['n_1', 'runtime-data-set-merge-conflict']]);
   assert.deepEqual((await readLedgerRecord(fixture, fixture.alpha.id)).formerMergedInto.map((entry) => [...entry.conversationIds].sort()), [['b_1', 'b_2']]);
 });
 
@@ -742,18 +744,16 @@ test('迁移后其它本地库的旧身份：拷来目录里迁走的其它库�
   assert.deepEqual(brief(refused), { merged: [], blocked: [[source.id, 'runtime-data-set-merge-foreign-old-copy']], deferred: [], failures: [] },
     '迁移前这样的合并就被拒绝，迁移之后也一样');
   assert.equal(refused.blocked[0].message.match(/^这个外来历史库是历史库“([^”]+)”（迁移数据目录之前的那一份）的旧拷贝（同一个库的另一份），不合并/)?.[1], name);
-  assert.match(refused.blocked[0].message, /它的对话如果都已在那个库里，可以在“清理备份”里按覆盖核对后删除/);
+  assert.match(refused.blocked[0].message, /这份旧数据已保留在“未能合并的旧数据”中，不会自动删除，可以只读查看/);
   assert.deepEqual(moving.conversationIds(current.runtimeDataRootPath), before, '什么都没合并进来');
-  // The tip holds: backup cleanup checks coverage in every local data set, the one that continues it
-  // included (not by identity), and finds all of this copy in it.
+  // A refused source is residual data even when another local library covers it; cleanup preserves it.
   const window = await kernel.RuntimeDatabase.open(createVscodeRootAuthority({ runtimeDataRootPath: current.runtimeDataRootPath, configurationRootPath: copied }),
     { hostBootId: `window-${randomUUID()}` });
   try {
     const item = (await planRuntimeBackupCleanup(copied, window)).items.find((candidate) => candidate.key === `foreign-history:${source.id}`);
-    assert.equal(item?.deletable, true, JSON.stringify(item));
-    // Proved by alpha (by its project names; the list names it from a summary not read in this test): the
-    // current data set no longer holds alpha_1.
-    assert.match(item.reason, /^可以删除：内容已完整在历史库“[^”]+”里（其中 2 个对话、/);
+    assert.equal(item?.deletable, false, JSON.stringify(item));
+    assert.equal(item.reason, '未能合并的旧数据，原位保留，不自动删除');
+    assert.equal(await exists(item.path), true);
   } finally { await window.close(); }
 
   // The alpha carried here merges; merges of its old identity (carried with the ledger) still leave alpha_1 out.
@@ -1014,7 +1014,7 @@ test('盲审 F4：合并进当前库、提交后中断还没收尾（旧目录�
   await moving.relocate(fixture, plan);
 });
 
-test('审查低-4：外来正文一个对象同样大小、内容被改，合并记为失败，不发布这个对象、不提交任何行', async (t) => {
+test('审查低-4：外来正文一个对象同样大小、内容被改，只剔除引用对话且不发布坏对象', async (t) => {
   const fixture = await home(t);
   const elsewhere = await createConfigurationRoot({ tmp: fixture.base });
   await seedConversations(elsewhere.current, [{ id: 'obj_1' }, { id: 'obj_2' }]);
@@ -1022,8 +1022,14 @@ test('审查低-4：外来正文一个对象同样大小、内容被改，合并
   await fs.cp(elsewhere.root, container, { recursive: true });
   const source = await found(fixture.root, container, 'default');
   const sha256Root = path.join(source.root.located.casRootPath, 'sha256');
-  const prefix = (await fs.readdir(sha256Root)).sort()[0];
-  const object = path.join(sha256Root, prefix, (await fs.readdir(path.join(sha256Root, prefix))).sort()[0]);
+  const sourceDb = new Database(source.root.located.databasePath, { readonly: true });
+  let storageKey;
+  try {
+    storageKey = sourceDb.prepare(`SELECT object.storage_key FROM content_object object
+      JOIN message_revision revision ON revision.content_object_id = object.id
+      WHERE revision.message_id = 'obj_1_message_0'`).pluck().get();
+  } finally { sourceDb.close(); }
+  const object = path.join(source.root.located.casRootPath, storageKey);
   const bytes = await fs.readFile(object);
   bytes[0] ^= 0xff;
   await fs.chmod(object, 0o644);
@@ -1036,8 +1042,10 @@ test('审查低-4：外来正文一个对象同样大小、内容被改，合并
   };
   await request(fixture.root, source);
   const report = await batch(fixture, explicit(source.id));
-  assert.deepEqual(brief(report).failures, [[source.id, 'runtime-data-set-merge-source-cas-invalid']]);
-  assert.deepEqual(conversations(fixture), []);
+  assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
+  assert.deepEqual(report.merged[0].excluded.map(item => [item.conversationId, item.code]),
+    [['obj_1', 'runtime-data-set-merge-source-cas-invalid']]);
+  assert.deepEqual(conversations(fixture), ['obj_2']);
   assert.ok(!(await objectsOfTarget()).includes(path.relative(sha256Root, object)), '被改的对象没有发布');
-  assert.equal((await readLedgerRecord(fixture, source.id)).state, 'failed');
+  assert.equal((await readLedgerRecord(fixture, source.id)).state, 'partial');
 });

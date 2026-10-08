@@ -2038,7 +2038,7 @@ async function resolveForeignSource(
     throw new Outcome({
       kind: 'blocked', code: 'runtime-data-set-merge-foreign-old-copy',
       message: `这个外来历史库是${owner.name}${owner.continued ? '（迁移数据目录之前的那一份）' : ''}的旧拷贝（同一个库的另一份），不合并：同一个库的两份不能都并进当前库，`
-        + '两边的内容都没有改动。它的对话如果都已在那个库里，可以在“清理备份”里按覆盖核对后删除；需要时也可以在“外来历史库”里只读查看它。'
+        + '两边的内容都没有改动。这份旧数据已保留在“未能合并的旧数据”中，不会自动删除，可以只读查看。'
     });
   }
   if (inspection.problems.length > 0) {
