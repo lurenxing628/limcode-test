@@ -26,6 +26,7 @@ export function readTimelineMergeSourceIdentity(database: Database.Database): Ti
 export interface TimelineMergeSourceRow {
   schema: RuntimeDomainSchema;
   row: DomainRow;
+  invalid?: true;
 }
 
 /**
@@ -36,7 +37,8 @@ export interface TimelineMergeSourceRow {
  */
 export function* timelineMergeSourceRows(
   database: Database.Database,
-  includeInOrderProof: (domain: string, id: string) => boolean = () => true
+  includeInOrderProof: (domain: string, id: string) => boolean = () => true,
+  onInvalid?: (domain: string, raw: Record<string, unknown>, error: unknown) => void
 ): IterableIterator<TimelineMergeSourceRow> {
   const schemas = TIMELINE_DOMAIN_SCHEMAS.filter(schema => TIMELINE_MERGE_DOMAINS.has(schema.key));
   const columns = [...new Set(schemas.flatMap(schema => schema.columns.map(column => column.name)))];
@@ -57,11 +59,20 @@ export function* timelineMergeSourceRows(
       yield { schema, row: { id: String(raw.id) } };
       continue;
     }
-    if (previous && previous.conversationId === raw.conversation_id && previous.sequence === raw.exchange_seq) {
-      throw new RuntimeDataInvariantError(schema.key, String(raw.id), 'Source send and receive coordinates must share one unique sequence.');
+    const record = Object.fromEntries(schema.columns.map(column => [column.name, raw[column.name]]));
+    let decoded: DomainRow;
+    try {
+      if (previous && previous.conversationId === raw.conversation_id && previous.sequence === raw.exchange_seq) {
+        throw new RuntimeDataInvariantError(schema.key, String(raw.id), 'Source send and receive coordinates must share one unique sequence.');
+      }
+      decoded = DOMAIN_REPOSITORIES.domain(schema.key).codec.decode(record);
+    } catch (error) {
+      if (!onInvalid) throw error;
+      onInvalid(schema.key, record, error);
+      yield { schema, row: record as DomainRow, invalid: true };
+      continue;
     }
     previous = { conversationId: raw.conversation_id, sequence: raw.exchange_seq };
-    const record = Object.fromEntries(schema.columns.map(column => [column.name, raw[column.name]]));
-    yield { schema, row: DOMAIN_REPOSITORIES.domain(schema.key).codec.decode(record) };
+    yield { schema, row: decoded };
   }
 }

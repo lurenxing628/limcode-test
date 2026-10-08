@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import type { RuntimeDatabase } from './runtimeDatabase';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { assertModelRequestAggregate } from './runtimeModelRequestAggregate';
-import { RuntimeDataInvariantError } from './runtimeDataInvariant';
+import { RuntimeDataInvariantError, isRuntimeDataInvariant } from './runtimeDataInvariant';
 import { RUNTIME_DOMAIN_SCHEMA_BY_KEY } from './schema/domainManifest';
 import { attachRuntimeStatementCache, detachRuntimeStatementCache, prepareCached } from './runtimeStatementCache';
 
@@ -88,7 +88,10 @@ export class MergeAggregatePreflight {
     }
   }
 
-  public async validate(signal?: AbortSignal): Promise<void> {
+  public async validate(
+    signal?: AbortSignal,
+    onInvalid?: (domain: string, id: string, error: unknown) => void
+  ): Promise<void> {
     for (let after = ''; ;) {
       signal?.throwIfAborted();
       const page = prepareCached(this.scratch, `SELECT id, flags FROM temp.${TOUCHED} WHERE id > ? ORDER BY id LIMIT ${PAGE}`)
@@ -99,9 +102,16 @@ export class MergeAggregatePreflight {
       for (const target of targets) {
         signal?.throwIfAborted();
         const flags = page.find((entry) => entry.id === target.modelRequestId)!.flags;
-        if ((flags & 2n) !== 0n && (flags & 1n) === 0n) throw new RuntimeDataInvariantError('ModelRequest', target.modelRequestId,
-          `Historical stream copy requires its ModelRequest ${target.modelRequestId} to be copied in the same transaction.`);
-        this.validateOne(target);
+        try {
+          if ((flags & 2n) !== 0n && (flags & 1n) === 0n) throw new RuntimeDataInvariantError('ModelRequest', target.modelRequestId,
+            `Historical stream copy requires its ModelRequest ${target.modelRequestId} to be copied in the same transaction.`);
+          this.validateOne(target);
+        } catch (error) {
+          if (!onInvalid || !isRuntimeDataInvariant(error)) throw error;
+          // The aggregate's request is the stable ownership anchor, even when the assertion
+          // reports a related Operation/Attempt that exists only in the receiving snapshot.
+          onInvalid('ModelRequest', target.modelRequestId, error);
+        }
       }
       after = ids[ids.length - 1]!;
       await new Promise((resolve) => setImmediate(resolve));

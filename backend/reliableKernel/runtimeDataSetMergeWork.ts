@@ -8,9 +8,9 @@ import type { RootAuthority } from './rootAuthority';
 import type { UnfinishedWorkInspection } from './runtimeDataSetMergeProbes';
 
 export {
-  describeUnfinishedWork, hasFinalizableWork, inspectCarriedWork, inspectUnfinishedWork,
+  describeUnfinishedWork, hasFinalizableWork, inspectCarriedWork, inspectUnfinishedWork, inspectUnfinishedWorkRows,
   type CarriedWorkRefusals, type FinalizableIntent, type FinalizableTurn, type UnfinishedWorkInspection,
-  type UnfinishedWorkRefusal
+  type UnfinishedWorkRow, type UnfinishedWorkRefusal
 } from './runtimeDataSetMergeProbes';
 
 /**

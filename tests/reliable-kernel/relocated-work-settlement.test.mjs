@@ -1059,7 +1059,7 @@ test('合并前收尾复用离线路径：使用独立原因与文案，最多�
     const settled = await settleHistoricalMergeWork({ application, inventory, excludedConversationIds: new Set(['conversation-excluded']) });
     assert.equal(settled.reason, HISTORICAL_MERGE_SETTLEMENT_REASON);
     const [abandoned] = await rows(app, 'RuntimeDelivery', { id: 'followup-0-delivery' });
-    assert.equal(abandoned.failure_reason, 'historical-merge-settled');
+    assert.equal(abandoned.failure_reason, 'historical-merge-settled', JSON.stringify(settled));
     const [replyLink] = await rows(app, 'CollaborationMessageReplyLink', { request_message_id: 'followup-0' });
     const reply = await app.runtime.collaboration.readMessage({ conversationId: requester, messageId: replyLink.message_id });
     assert.match(reply.text, /stopped by the user before its history was merged/);

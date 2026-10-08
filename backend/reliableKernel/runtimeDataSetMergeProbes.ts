@@ -166,6 +166,64 @@ const REFUSAL_PROBES: readonly Probe[] = Object.freeze([
   ['进程输出尚未完整登记', UNREGISTERED_PROCESS_OUTPUT_SQL]
 ]);
 
+/** Row identities for the same refusal predicates; consumers resolve ownership once. */
+const REFUSAL_ROWS: readonly (readonly [domain: string, projection: string])[] = [
+  ['Turn', 'turn.*'], ['ExecutionLease', 'lease.*'], ['TurnIntent', 'intent.*'],
+  ['PendingTurnInput', 'input.*'], ['ToolCall', 'tool.*'], ['Operation', 'operation.*'],
+  ['EffectIntent', 'effect_intent.*'], ['ModelRequest', 'request.*'],
+  ['InteractionRequest', 'interaction_request.*'], ['FileChangeSet', 'file_change_set.*'],
+  ['ChildExecution', 'child.*'], ['AnswerSubmission', 'submission.*'],
+  ['AnswerBridge', 'bridge.*'], ['AnswerBridge', 'bridge.*'],
+  ['RuntimeDelivery', 'delivery.*'], ['CollaborationRequest', 'collaboration_request.*'],
+  ['Process', 'process_row.*'], ['ProcessCompletionDispatch', 'process_completion_dispatch.*'],
+  ['Process', 'process.*']
+];
+
+export interface UnfinishedWorkRow {
+  domain: string;
+  row: Record<string, unknown>;
+  code: string;
+  label: string;
+}
+
+/** Bounded iterator: no array of every refused row, and no per-row full-history ownership scan. */
+export function* inspectUnfinishedWorkRows(
+  source: Database.Database,
+  includeFinalizable = false
+): IterableIterator<UnfinishedWorkRow> {
+  for (let index = 0; index < REFUSAL_PROBES.length; index += 1) {
+    const [label, countSql] = REFUSAL_PROBES[index];
+    const [domain, projection] = REFUSAL_ROWS[index];
+    const sql = index === REFUSAL_PROBES.length - 1
+      ? `SELECT process.* FROM process WHERE process.id IN (${countSql.replace('SELECT COUNT(*) FROM (', 'SELECT id FROM (')})`
+      : countSql.replace('SELECT COUNT(*)', `SELECT ${projection}`);
+    for (const row of source.prepare(sql).iterate() as IterableIterator<Record<string, unknown>>) {
+      yield { domain, row, code: 'runtime-data-set-merge-unfinished-work', label };
+    }
+  }
+  if (includeFinalizable) {
+    for (const [domain, sql, label] of [
+      ['Turn', `SELECT * FROM turn WHERE ${FINALIZABLE_TURN_SQL}`, '进行中的任务'],
+      ['TurnIntent', "SELECT * FROM turn_intent WHERE state = 'queued'", '排队中的消息']
+    ]) {
+      for (const row of source.prepare(sql).iterate() as IterableIterator<Record<string, unknown>>) {
+        yield { domain, row, code: 'runtime-data-set-merge-unfinished-work', label };
+      }
+    }
+  }
+  const { turns, intents } = finalizableWork(source);
+  const restore = !includeFinalizable && (turns.length || intents.length)
+    ? shadowFinalization(source, turns, intents) : undefined;
+  try {
+    const busy = createConversationRuntimeWorkProbe(source);
+    for (const row of source.prepare('SELECT * FROM conversation ORDER BY id').iterate() as IterableIterator<Record<string, unknown>>) {
+      if (busy(String(row.id))) yield { domain: 'Conversation', row,
+        code: 'runtime-data-set-merge-unfinished-work', label: '其它未结束的对话工作' };
+    }
+  } finally { restore?.(); }
+
+}
+
 /**
  * Read-only classification on a source snapshot. The kernel's own per-Conversation pending-work
  * probe is applied to every Conversation as the final authority, including the Conversations whose
@@ -230,6 +288,15 @@ function inspect(source: Database.Database): UnfinishedWorkInspection {
     const count = Number(source.prepare(sql).pluck().get() as bigint | number);
     if (count > 0) refused.push({ label, count });
   }
+  const { turns, intents } = finalizableWork(source);
+  if (refused.length === 0) {
+    const remaining = busyAfterFinalization(source, turns, intents);
+    if (remaining > 0) refused.push({ label: '其它未结束的对话工作', count: remaining });
+  }
+  return { refused, turns, intents };
+}
+
+function finalizableWork(source: Database.Database): Pick<UnfinishedWorkInspection, 'turns' | 'intents'> {
   const turns = (source.prepare(`
     SELECT turn.id AS turn_id, turn.conversation_id AS conversation_id,
            EXISTS(SELECT 1 FROM execution_lease AS lease WHERE lease.turn_id = turn.id) AS has_lease,
@@ -263,11 +330,7 @@ function inspect(source: Database.Database): UnfinishedWorkInspection {
       conversationId: row.conversation_id,
       expectedRevisionSeq: String(row.revision_seq ?? 0)
     }));
-  if (refused.length === 0) {
-    const remaining = busyAfterFinalization(source, turns, intents);
-    if (remaining > 0) refused.push({ label: '其它未结束的对话工作', count: remaining });
-  }
-  return { refused, turns, intents };
+  return { turns, intents };
 }
 
 /**
