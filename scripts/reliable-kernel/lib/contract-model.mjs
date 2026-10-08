@@ -954,7 +954,7 @@ function validateForeignHistory(root, authority, failures) {
   const missing = [
     // Its claim is held from preparation to commit, taken before (never inside) configuration admission.
     [foreignSource, 'if (isRuntimeDataRootAdmissionHeld(configurationRoot)) {'],
-    [foreignMergeSource, 'const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, id, pointerOf(location));'],
+    [foreignMergeSource, 'const claim = await holdForeignRuntimeRootClaim({ globalStoragePath: configurationRoot }, locatedId, pointerOf(location));'],
     // Runtime metadata is snapshotted first. Packed bytes come from a scoped private SQLite
     // main/WAL copy; absent packed keys retain strict no-follow loose-file descriptor reads.
     [foreignMergeSource, 'copy: async (root) => copyLocatedRuntimeDatabase(root, await this.heldFiles())'],
