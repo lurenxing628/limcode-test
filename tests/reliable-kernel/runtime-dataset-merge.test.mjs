@@ -406,8 +406,21 @@ test('同一身份内容不同：只剔除冲突对话，其余合并并记部�
     { id: 'conversation_duplicate', project: SHARED_PROJECT, title: '旧库标题' },
     { id: 'conversation_alpha_unique', project: SHARED_PROJECT }
   ]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_duplicate', kind: 'leased-model-request' }]);
+  const toolsText = '[{"name":"read_file","description":"已登记的冻结工具"}]';
+  const tools = await ingest(fixture.alpha, toolsText, 'application/json');
+  const recipe = await ingest(fixture.alpha, JSON.stringify({ toolsReference: { contentObjectId: tools.id } }), 'application/json');
+  rawSource(fixture.alpha, source => source.prepare('UPDATE model_request SET recipe_object_id=? WHERE id=?')
+    .run(recipe.id, 'conversation_duplicate_unfinished_turn_request'));
+  await fs.rm(casFile(fixture.alpha.binding, toolsText));
   const database = await openTarget(t, fixture.current);
+  const interrupted = await merge(fixture, database, {
+    onFaultPoint(point) { if (point === 'after-row-commit') throw Object.assign(new Error('提交后中断'), { code: 'EIO' }); }
+  });
+  assert.equal(interrupted.deferred.length, 1);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'committing');
   const report = await merge(fixture, database);
+  assert.equal(report.merged[0].recoveredCommit, true);
   assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
   assert.equal(report.merged[0].insertedConversations, 1);
   assert.deepEqual(report.merged[0].excluded.map(item => item.conversationId), ['conversation_duplicate']);
@@ -415,13 +428,21 @@ test('同一身份内容不同：只剔除冲突对话，其余合并并记部�
   try {
     assert.equal(target.database.prepare('SELECT title FROM conversation WHERE id=?').pluck().get('conversation_duplicate'), '当前库标题');
     assert.equal(target.count('conversation', 'id = ?', 'conversation_alpha_unique'), 1);
+    assert.equal(target.count('content_object', 'id = ?', tools.id), 0, '已剔除请求的嵌入引用保留归属，缺正文及其元数据都不进入当前库');
     assert.deepEqual(target.database.pragma('foreign_key_check'), []);
   } finally { target.close(); }
   const record = (await ledgerModule.readRuntimeDataSetMergeLedger(fixture.paths)).get(fixture.alpha.id);
   assert.equal(record.state, 'partial');
   assert.deepEqual(record.excluded.map(item => item.conversationId), ['conversation_duplicate']);
+  const history = kernelFile('runtimeHistoryRegistry.js');
+  assert.deepEqual((await history.readRuntimeHistoryResidual(fixture.paths)).get(fixture.alpha.id).excluded, record.excluded);
+  assert.equal((await history.readRuntimeHistoryPending(fixture.paths)).has(fixture.alpha.id), false);
+  // Older completed paths could leave a partial ledger without its retained-history entry.
+  await history.removeRuntimeHistoryResidual(fixture.paths, fixture.alpha.id);
   const again = await merge(fixture, database);
   assert.equal(again.merged.length, 0);
+  assert.deepEqual((await history.readRuntimeHistoryResidual(fixture.paths)).get(fixture.alpha.id).excluded, record.excluded);
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).updatedAt, record.updatedAt, '重入只补登记，不改原合并统计与时间');
 });
 
 test('正文校验：目标损坏不覆盖，来源缺正文按对话剔除，跨设备正常复制', async (t) => {
@@ -451,6 +472,7 @@ test('正文校验：目标损坏不覆盖，来源缺正文按对话剔除，�
   const sourceFile = casFile(source.alpha.binding, messageText('conversation_alpha_bad_source', 0));
   await fs.chmod(sourceFile, 0o600);
   const bytes = await fs.readFile(sourceFile);
+  const intactSourceBody = Buffer.from(bytes);
   bytes[0] ^= 0x01;
   await fs.writeFile(sourceFile, bytes);
   const sourceTarget = await openTarget(t, source.current);
@@ -463,6 +485,17 @@ test('正文校验：目标损坏不覆盖，来源缺正文按对话剔除，�
   await assert.rejects(fs.stat(casFile(source.current.binding, messageText('conversation_alpha_bad_source', 0))), { code: 'ENOENT' },
     '摘要不符的来源文件不会被链接进当前库');
   assert.equal((await merge(source, sourceTarget)).merged.length, 0, '同一来源状态不重复合并');
+  const beforeRepair = await readLedgerRecord(source, source.alpha.id);
+  await fs.writeFile(sourceFile, intactSourceBody);
+  const repaired = await merge(source, sourceTarget, { candidateIds: [source.alpha.id], requested: true });
+  assert.deepEqual([repaired.blocked, repaired.deferred, repaired.failures], [[], [], []]);
+  assert.equal(repaired.merged[0]?.insertedConversations, 1, '修复正文文件后，明确重核重新导入此前剔除的对话');
+  assert.equal(repaired.merged[0]?.excluded, undefined);
+  const completed = await readLedgerRecord(source, source.alpha.id);
+  assert.equal(completed.source.contentDigest, beforeRepair.source.contentDigest, 'SQLite内容未变，只修复正文文件');
+  assert.equal(completed.state, 'merged');
+  assert.equal((await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryResidual(source.paths)).has(source.alpha.id), false);
+
 
   const copy = await createFixture(t, { withBeta: false });
   await seed(copy.alpha, [{ id: 'conversation_alpha_copy', project: SHARED_PROJECT }]);
@@ -1259,12 +1292,26 @@ test('复审 merge3 #3：选源阶段只读账本和文件状态，已记录来�
     reads.push(isRuntimeDataRootAdmissionHeld(fixture.root));
     return original(...args);
   };
+  const cachedFingerprint = ledgerModule.cachedRuntimeDataSetFingerprint;
+  let completedMeanwhile = false;
+  ledgerModule.cachedRuntimeDataSetFingerprint = async (...args) => {
+    if (!isRuntimeDataRootAdmissionHeld(fixture.root) && !completedMeanwhile) {
+      completedMeanwhile = true;
+      await database.transaction([repo('Conversation').update('conversation_both', { title: 'alpha title' })]);
+      const other = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+      assert.equal(other.merged[0].excluded, undefined);
+    }
+    return cachedFingerprint(...args);
+  };
   let report;
   try { report = await merge(fixture, database); }
-  finally { facts.readRuntimeDataSetFacts = original; }
+  finally { facts.readRuntimeDataSetFacts = original; ledgerModule.cachedRuntimeDataSetFingerprint = cachedFingerprint; }
   assert.deepEqual(reads, [false], '整库读取算指纹只在 admission 之外做一次');
   assert.equal(report.pendingSources, 0);
-  assert.deepEqual([report.merged, report.blocked], [[], []], '内容没变的partial不重复规划');
+  assert.equal(completedMeanwhile, true);
+  assert.deepEqual([report.merged, report.blocked], [[], []], '等待指纹期间已被另一窗口完整合并，不重复规划');
+  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'merged');
+  assert.equal((await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryResidual(fixture.paths)).has(fixture.alpha.id), false, '旧partial不得重新登记残留');
 });
 
 test('复审 merge3 #4：事务确定回滚后原样恢复的拒绝记录保留判定时间，之后的持久请求照常重试', async (t) => {
@@ -1911,19 +1958,35 @@ test('盲审2 merge #4：在当前库删掉（本来就跳过）的对话在来�
   // Later in alpha: a new conversation; a1 continued there and left waiting for an answer (no transition
   // closes that), a4 left with an interrupted task (one would close it).
   await seed(fixture.alpha, [{ id: 'conversation_a3', project: SHARED_PROJECT }]);
-  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_a4', kind: 'bare' }]);
+  await seedUnfinishedWork(fixture.alpha, [{ conversationId: 'conversation_a4', kind: 'bare' }, { conversationId: 'conversation_a3', kind: 'bare' }]);
+  let deletedPromptId;
   await withRuntime(fixture.alpha, async (runtime, store) => {
     const prompt = await store.ingest(runtime, '{"question":"继续吗？"}', 'application/json');
+    deletedPromptId = prompt.id;
     await runtime.transaction([
       repo('Turn').insert({ id: 'conversation_a1_turn2', conversation_id: 'conversation_a1', status: 'active', created_at: NOW, updated_at: NOW, terminal_at: null }),
       repo('InteractionRequest').insert({ id: 'interaction_a1', request_kind: 'ask_user', status: 'pending', prompt_object_id: prompt.id, created_at: NOW, updated_at: NOW }),
       repo('InteractionOwnerLink').insert({ id: 'interaction_a1_owner', request_id: 'interaction_a1', turn_id: 'conversation_a1_turn2', created_at: NOW })
     ]);
   });
-  const report = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true });
+  rawSource(fixture.alpha, source => {
+    source.prepare('INSERT INTO conversation_origin_link VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run('deleted_a1_origin', 'conversation_a1', 'conversation_a2', 'conversation_a2_turn', null, null, NOW);
+    source.prepare('INSERT INTO turn VALUES (?, ?, ?, ?, ?, ?)')
+      .run('conversation_a2_later', 'conversation_a2', 'terminated', NOW, NOW, NOW);
+    source.prepare('INSERT INTO turn_termination VALUES (?, ?, ?, ?, ?)')
+      .run('conversation_a2_later_termination', 'conversation_a2_later', 'completed', 'fixture', NOW);
+  });
+  await fs.rm(casFile(fixture.alpha.binding, '{"question":"继续吗？"}'));
+  let consentTurns;
+  const report = await merge(fixture, database, { candidateIds: [fixture.alpha.id], requested: true,
+    confirmSettlement: async input => { consentTurns = input.turns; return true; },
+    settleSourceWork: require(path.join(compiled, 'backend/application/reliableKernel/historicalMergeSettlement.js')).settleHistoricalMergeSourceOffline });
   assert.deepEqual([report.blocked, report.deferred, report.failures], [[], [], []]);
-  assert.deepEqual(report.merged.map((item) => [item.insertedConversations, item.skippedConversations, item.finalized]), [[1, 2, undefined]],
-    '只合并 a3，跳过 a1 与 a4，什么都不收尾');
+  assert.deepEqual(report.merged.map((item) => [item.insertedConversations, item.skippedConversations, item.finalized]), [[1, 2, { turns: 1, intents: 0, sourceBackupPath: report.merged[0].finalized.sourceBackupPath }]],
+    '只收尾健康的 a3，跳过 a1 与 a4');
+  assert.equal(consentTurns, 1, '同意盘点不包含已删除对话里的工作');
+  assert.equal(report.merged[0].excluded, undefined, '已删除子对话的残留不连带剔除健康父对话');
   const source = readDatabase(fixture.alpha);
   try {
     assert.equal(source.count('turn', "status = 'active'"), 2, '来源里那两个对话的任务原样留着');
@@ -1934,6 +1997,8 @@ test('盲审2 merge #4：在当前库删掉（本来就跳过）的对话在来�
   try {
     assert.deepEqual(target.database.prepare('SELECT id FROM conversation ORDER BY id').pluck().all(), ['conversation_a2', 'conversation_a3']);
     assert.equal(target.count('interaction_request'), 0);
+    assert.equal(target.count('content_object', 'id = ?', deletedPromptId), 0, '仅被删除闭包引用的缺失正文也不登记进当前库');
+    assert.equal(target.count('turn', 'id = ?', 'conversation_a2_later'), 1, '健康父对话的新历史照常合并');
     assertNothingResumes(target);
   } finally { target.close(); }
 });
@@ -2016,9 +2081,12 @@ test('盲审2 merge #6：读不出的账本记录不当成“没有记录”：�
     source: { dataSetId: fixture.beta.binding.dataSetId, rootInstanceId: fixture.beta.binding.rootInstanceId }, updatedAt: NOW
   });
   await fs.writeFile(betaFile, newer);
+  await requestMerge(fixture, fixture.alpha);
+  await requestMerge(fixture, fixture.beta);
   const database = await openTarget(t, fixture.current);
   const report = await merge(fixture, database);
-  assert.deepEqual(report.merged, []);
+  assert.deepEqual(report.merged, [], '自动 pending 登记不代表授权覆盖坏账本');
+  assert.equal(await fs.readFile(alphaFile, 'utf8'), '{"kind":"limcode-runtime-data-set-merge","candidateId":');
   assert.deepEqual(report.blocked.map((item) => [item.candidateId, item.code]), [[fixture.alpha.id, 'runtime-data-set-merge-record-damaged']]);
   assert.deepEqual(report.deferred.map((item) => [item.candidateId, item.code]), [[fixture.beta.id, 'runtime-data-set-merge-record-newer']]);
   const states = await readRuntimeDataSetMergeStates(fixture.paths);

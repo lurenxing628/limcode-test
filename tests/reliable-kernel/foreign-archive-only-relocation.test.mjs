@@ -1,4 +1,4 @@
-// Reset archives stay in the old data directory when it is relocated (only data sets move). The
+// Reset archives stay in the old data directory when it is relocated (only the current data set moves). The
 // preflight says so; "delete the old directory" lists them by directory (also those of a scope whose
 // data set was deleted, which no data-set enumeration names) and keeps them unless ticked; the old
 // directory stays remembered while any archive is left; and the new directory's foreign history lists,
@@ -82,7 +82,7 @@ test('foreign-archive-only-relocation：删掉本地库、只剩归档的工作�
 
   const target = path.join(fixture.base, 'new-home');
   const plan = await planWithRuntime(fixture, target);
-  assert.ok(plan.warnings.some((warning) => /旧目录里有 1 份“归档并重置”留下的归档.*归档不会迁移，留在旧目录.*外来历史库.*删除旧目录时默认保留/.test(warning)),
+  assert.ok(plan.warnings.some((warning) => /旧目录里有 1 份“归档并重置”留下的归档.*归档不会迁移，留在旧目录.*历史与存储管理.*未能合并的内容保留在残留列表中.*删除旧目录时默认保留/.test(warning)),
     `预检说明归档留在旧目录：${JSON.stringify(plan.warnings)}`);
   await relocate(fixture, plan);
 

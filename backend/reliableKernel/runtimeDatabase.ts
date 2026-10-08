@@ -27,6 +27,8 @@ import type {
   ClientProjectionSnapshot,
   ContextContentMaterializationSnapshot,
   ContextMaterializationSnapshot,
+  SelectedContextAuthoritySourceInput,
+  SelectedContextAuthoritySource,
   ChildConversationOriginCandidate,
   ChildProcessCleanupMaterializationCandidate,
   DatabaseWorkerData,
@@ -472,6 +474,13 @@ export class RuntimeDatabase {
   public async contextHandleEvidenceFrontier(conversationId: string): Promise<SnapshotBarrier<ContextHandleEvidenceFrontier>> {
     if (typeof conversationId !== 'string' || !conversationId.trim()) throw new TypeError('conversationId must be non-empty.');
     return this.request<SnapshotBarrier<ContextHandleEvidenceFrontier>>({ kind: 'contextHandleEvidenceFrontier', conversationId });
+  }
+
+  /** Nearest authority on the exact selected Context parent chain, with its observed head basis. */
+  public readSelectedContextAuthoritySource(
+    input: SelectedContextAuthoritySourceInput
+  ): Promise<SnapshotBarrier<SelectedContextAuthoritySource>> {
+    return this.request({ kind: 'selectedContextAuthoritySource', input });
   }
 
   /** Full child lineage and task inputs from one SQLite read transaction; no in-memory runner state. */
@@ -1273,6 +1282,7 @@ function databaseMetricRequestKind(
   kind: DatabaseWorkerRequestPayload['kind']
 ): RuntimeDatabaseMetricRequestKind {
   if (kind === 'nativePendingWork' || kind === 'nativeSteeringInFlight' || kind === 'nativeAdmittedProviderCallIds') return 'snapshot';
+  if (kind === 'selectedContextAuthoritySource') return 'snapshot';
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
   // The conversation pending-work probe, the domain row count and the carried-work inventory are one

@@ -171,8 +171,8 @@ interface OwnedConversation {
 
 /**
  * Durable single-owner registry for Conversations on one shared Runtime root. Distinct from
- * ExecutionLease: ownership identifies the one Runtime Host allowed to drive/mutate a
- * conversation and is only ever taken over from a definitely dead or reused process identity —
+ * ExecutionLease: ownership identifies the one Runtime Host allowed to execute conversation work
+ * and is only ever taken over from a definitely dead or reused process identity —
  * never because of elapsed time. Activity pins (commands, drives) delay idle release; a
  * conservative pending-work probe guards the durable gaps. Passive views do not own a writer.
  */

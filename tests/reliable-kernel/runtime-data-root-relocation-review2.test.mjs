@@ -117,7 +117,7 @@ test('F3 旧版本设置的自定义目录（没有记录身份）：只有设�
   await assert.rejects(assertDataRootAvailable(dataRoot), { reason: 'empty' });
 });
 
-test('F4 旧目录里无法读取的历史库记进完成记录的“留在旧目录”，设置页说明能怎么处理', async (t) => {
+test('F4 旧目录里无法读取的历史库原位登记残留，迁移后仍能定位', async (t) => {
   const fixture = await createFixture(t);
   const scopes = path.join(fixture.root, '.limcode-workspace-runtimes', 'scopes');
   const [alphaKey] = await fs.readdir(scopes);
@@ -132,6 +132,13 @@ test('F4 旧目录里无法读取的历史库记进完成记录的“留在旧�
   const unreadable = record.leftBehind.find((item) => item.id === inspection.problems[0].id);
   assert.match(unreadable?.reason ?? '', /^无法读取/);
   assert.match(unreadable.hint, /未能合并的旧数据/);
+  const registry = kernelFile('runtimeHistoryRegistry.js');
+  const retained = [...(await registry.readRuntimeHistoryResidual({ globalStoragePath: target })).values()];
+  assert.equal(retained.length, 1);
+  assert.equal(retained[0].location.containerPath, path.join(scopes, 'copied-scope-key', '.limcode-runtime'));
+  assert.equal(retained[0].location.baseDataRootPath, fixture.root);
+  await kernelFile('runtimeHistoryConvergence.js').registerRuntimeHistoryConvergence({ globalStoragePath: target }, [fixture.root]);
+  assert.deepEqual([...await registry.readRuntimeHistoryResidual({ globalStoragePath: target })], [...new Map(retained.map(item => [item.id, item]))]);
 });
 
 test('F6 迁回 VS Code 默认目录：只剩扩展自己的指针文件及其锁时算空目录，不强制子文件夹', async (t) => {

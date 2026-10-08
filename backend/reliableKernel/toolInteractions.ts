@@ -569,9 +569,7 @@ export class ToolInteractionControlPlane {
       canonicalJson({ requestId, sourceReceiptId: receiptId, response: input.response }),
       'application/vnd.limcode.ask-user-response+json'
     );
-    const automaticResult = source.kind === 'internal'
-      ? await this.prepareAutomaticAskResult(request, toolCallId)
-      : undefined;
+    const toolResult = await this.prepareAskResult(request, toolCallId, status, input.response);
     const now = this.timestamp();
     const committed = await this.commitSource({
       source,
@@ -580,7 +578,7 @@ export class ToolInteractionControlPlane {
       turnId: facts.turn.id as string,
       firstResponseRequestId: requestId,
       steps: [
-        ...preparedContentSteps(automaticResult ? [response, automaticResult] : [response], 'ask_user_response'),
+        ...preparedContentSteps([response, toolResult], 'ask_user_response'),
         // The first-response UNIQUE must linearize before lifecycle assertions so a concurrent
         // loser can replay the winner instead of surfacing a stale-state assertion.
         DOMAIN_REPOSITORIES.domain('InteractionResponse').insert({
@@ -597,13 +595,13 @@ export class ToolInteractionControlPlane {
         DOMAIN_REPOSITORIES.domain('ToolCall').assert(toolCallId, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('ToolExecution').assert(facts.execution.id as string, { status: 'waiting_answer' }),
         DOMAIN_REPOSITORIES.domain('Operation').assert(operation.id as string, { status: 'waiting_answer' }),
-        ...(automaticResult ? [DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
+        DOMAIN_REPOSITORIES.domain('ToolResultArtifact').insert({
           id: stablePhaseDId('tool_result_artifact', `ask-user:${toolCallId}`),
           tool_call_id: toolCallId,
           role: 'no_effect_result',
-          content_object_id: automaticResult.metadata.id,
+          content_object_id: toolResult.metadata.id,
           created_at: now
-        })] : []),
+        }),
         DOMAIN_REPOSITORIES.domain('InteractionRequest').update(requestId, {
           status,
           updated_at: now
@@ -1302,20 +1300,27 @@ export class ToolInteractionControlPlane {
     };
   }
 
-  private async prepareAutomaticAskResult(request: DomainRow, toolCallId: string): Promise<PreparedContentObject> {
-    const metadata = await this.requireExisting(
-      'ContentObject',
-      requireId(request.prompt_object_id, 'InteractionRequest.prompt_object_id')
-    ) as ContentObjectMetadata;
-    const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
-    if (body.toolCallId !== toolCallId) throw new Error('Ask 自动回复与请求的 ToolCall 不一致。');
-    const output = resolveAskUserAnswer(normalizeAskUserToolRequest(body.prompt), {
-      selectedOptionIndexes: [],
-      customText: BACKGROUND_ASK_USER_AUTO_ANSWER
-    });
+  private async prepareAskResult(
+    request: DomainRow,
+    toolCallId: string,
+    status: 'succeeded' | 'cancelled',
+    response: unknown
+  ): Promise<PreparedContentObject> {
+    let detail: unknown;
+    if (status === 'cancelled') {
+      detail = { reason: optionalText(optionalRecord(response)?.reason) ?? '问题已取消。' };
+    } else {
+      const metadata = await this.requireExisting(
+        'ContentObject',
+        requireId(request.prompt_object_id, 'InteractionRequest.prompt_object_id')
+      ) as ContentObjectMetadata;
+      const body = JSON.parse((await this.contentStore.read(metadata)).toString('utf8')) as Record<string, unknown>;
+      if (body.toolCallId !== toolCallId) throw new Error('Ask 回答与请求的 ToolCall 不一致。');
+      detail = resolveAskUserAnswer(normalizeAskUserToolRequest(body.prompt), optionalRecord(response)?.answer);
+    }
     return this.contentStore.prepare(
       this.database,
-      canonicalJson({ toolCallId, status: 'succeeded', detail: output }),
+      canonicalJson({ toolCallId, status, detail }),
       'application/vnd.limcode.tool-result-artifact+json'
     );
   }

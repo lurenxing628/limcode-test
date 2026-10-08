@@ -203,6 +203,49 @@ test('scope changes reset the editor while explicit restore resets both draft an
   scope.stop();
 });
 
+test('global runtime template displays the built-in default, saves explicit empty and restores through a correlated ACK', async t => {
+  const { DEFAULT_RUNTIME_CONTEXT_TEMPLATE } = await server.ssrLoadModule('../shared/promptTemplateCatalog.ts');
+  const h = fixture(t), runtime = useRuntime();
+  const view = h.mount('RuntimeContextScopeEditor', { scopeKind: 'global' });
+  assert.equal(view.draft, DEFAULT_RUNTIME_CONTEXT_TEMPLATE);
+  view.draft = ''; view.save(); const empty = posted.at(-1);
+  assert.equal(empty.type, 'runtimeContext.scope.set'); assert.equal(empty.payload.template, '');
+  h.client.runtimeContexts = [{ id: 'global-context', name: 'mine', template: '' }];
+  h.client.runtimeContextScopeLinks = [{ id: 'global-context-link', scopeKind: 'global', runtimeContextId: 'global-context',
+    role: 'active', createdAt: 1, updatedAt: 1 }];
+  runtime.reconcilePendingSave(empty.id); await vue.nextTick();
+  assert.equal(view.draft, '', 'a stored empty template remains empty');
+  assert.equal(view.draftState.dirty.value, false);
+  view.clear(); const clear = posted.at(-1);
+  assert.equal(clear.type, 'runtimeContext.scope.clear'); assert.equal(clear.payload.scopeKind, 'global');
+  assert.equal(view.draft, DEFAULT_RUNTIME_CONTEXT_TEMPLATE);
+  view.draft = 'typed after restore';
+  h.client.runtimeContexts = []; h.client.runtimeContextScopeLinks = [];
+  runtime.reconcilePendingSave(clear.id); await vue.nextTick();
+  assert.equal(runtime.completedSaveFor('global'), clear.id);
+  assert.equal(view.draft, 'typed after restore', 'the restore acknowledgement keeps a newer draft');
+  view.draftState.reset(); assert.equal(view.draft, DEFAULT_RUNTIME_CONTEXT_TEMPLATE);
+});
+
+test('runtime template load failure ends loading and a successful retry keeps the local draft', async t => {
+  const h = fixture(t), view = h.mount('RuntimeContextScopeEditor', { scopeKind: 'global' });
+  h.client.beginConfigurationLoad('first-ready');
+  view.draft = 'my unsaved draft';
+  h.client.rejectConfigurationLoad('old-ready', 'stale error');
+  assert.equal(h.client.configurationError, '');
+  h.client.rejectConfigurationLoad('first-ready', 'template index cannot be read');
+  assert.equal(h.client.settingsClientStateLoading, false);
+  assert.equal(h.client.settingsClientStateReady, false);
+  assert.equal(h.client.configurationError, 'template index cannot be read');
+  h.client.beginConfigurationLoad('retry-ready');
+  h.client.runtimeContexts = [{ id: 'global', name: 'saved', template: 'saved template' }];
+  h.client.runtimeContextScopeLinks = [{ id: 'global-link', scopeKind: 'global', runtimeContextId: 'global',
+    role: 'active', createdAt: 1, updatedAt: 1 }];
+  h.snapshot(); await vue.nextTick();
+  assert.equal(h.client.configurationError, ''); assert.equal(h.client.settingsClientStateReady, true);
+  assert.equal(view.draft, 'my unsaved draft'); assert.equal(view.draftChangedRemotely, true);
+});
+
 test('model settings retain an unsaved model when the same provider catalog is refreshed', async t => {
   const h = fixture(t), models = useProfiles(), global = useGlobal();
   global.llmProviderConfigs.configs = [{ id: 'provider', name: 'fixture', provider: 'openai', model: 'saved-model' }];

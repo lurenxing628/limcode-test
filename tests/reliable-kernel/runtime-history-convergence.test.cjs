@@ -38,8 +38,16 @@ test('收敛登记仅入队新来源，残留须显式重试，通知来源跨�
   foreign.push({ id: 'foreign:archive:aaaaaaaaaaaaaaaa', location: { kind: 'archive' } });
   assert.equal(await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' }), 1);
   pending.delete(foreign[0].id);
+  residual.set(foreign[0].id, { sourceKind: 'archive' });
   assert.equal(await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' }), 0);
-  assert.equal(pending.has(foreign[0].id), true, 'known foreign sources are reconsidered using the merge engine file-state cache');
+  assert.equal(pending.has(foreign[0].id), false, '外来残留不会在启动时自动重新入队');
+  foreign.push({ id: 'foreign:copied:bbbbbbbbbbbbbbbb', location: { kind: 'copied' } });
+  assert.equal(await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' }), 1);
+  assert.equal(pending.has(foreign[1].id), true, '新发现的正常来源继续登记');
+  residual.delete(foreign[0].id);
+  pending.set(foreign[0].id, { reason: '用户在残留列表里选择重新合并' });
+  await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' });
+  assert.equal(pending.get(foreign[0].id).reason, '用户在残留列表里选择重新合并');
 });
 
 test('收尾同意落盘并绑定来源身份及用户看到的数量', async () => {
@@ -74,4 +82,30 @@ test('部分合并只读列表跨过已合并页面，只暴露剔除对话并�
   assert.throws(() => reader.readMessages('merged'), /不在未合并清单/);
   await reader.close();
   assert.equal(closed, true);
+});
+
+test('外来残留恢复身份后以当前来源 id 重新入队，并只重试这一份', async () => {
+  const previousId = 'foreign:copied:aaaaaaaaaaaaaaaa';
+  const currentId = 'foreign:copied:bbbbbbbbbbbbbbbb';
+  const record = { id: previousId, sourceKind: 'copied', location: { kind: 'copied', containerPath: '/fixture/copied',
+    containerName: 'copied', dataRootRelativePath: '.limcode-runtime/active' }, code: 'identity-unreadable', message: '身份不可读', checkedAt: 'now' };
+  const queued = [], retried = [];
+  const api = load('vscode/commands/runtimeHistoryResiduals.ts', {
+    vscode: { window: { showQuickPick: async items => items.find(item => item.action === 'retry') ?? items[0] } },
+    '../../backend/capabilities/vscodeStorage/globalStatus': { resolveDataRootUri: () => '/fixture' },
+    '../../backend/capabilities/vscodeStorage/paths': { createVscodeStoragePaths: () => ({ globalStoragePath: '/fixture' }) },
+    '../../backend/reliableKernel/vscodeRootAuthority': {}, '../../backend/reliableKernel/runtimeDataSetHistory': {},
+    '../../backend/reliableKernel/runtimeForeignHistory': { isForeignRuntimeHistoryId: id => id.startsWith('foreign:'),
+      readRuntimeHistoryResidualSize: async () => undefined, locateForeignRuntimeRoot: async () => ({ id: currentId,
+        recorded: { dataSetId: 'restored-data', rootInstanceId: 'restored-root' } }) },
+    '../../backend/reliableKernel/runtimeHistoryRegistry': { reconcileRuntimeResetBackups: async () => {},
+      readRuntimeHistoryResidual: async () => new Map([[previousId, record]]),
+      requeueRuntimeHistoryResidual: async (_paths, oldId, pending) => queued.push({ oldId, pending }) },
+    './runtimeDataSetManagement': {}
+  });
+  await api.manageRuntimeHistoryResiduals({}, async id => retried.push(id));
+  assert.equal(queued[0].oldId, previousId);
+  assert.equal(queued[0].pending.id, currentId);
+  assert.equal(queued[0].pending.identity.dataSetId, 'restored-data');
+  assert.deepEqual(retried, [currentId]);
 });

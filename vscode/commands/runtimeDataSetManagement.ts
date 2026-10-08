@@ -92,7 +92,7 @@ export async function manageRuntimeDataSets(context: vscode.ExtensionContext, st
   ], { placeHolder: '历史与存储管理' + (pending.size ? ' · 还有 ' + pending.size + ' 份没合并' : '') });
   if (!action || !canStartRuntimeDataSetUpgrade(context)) return;
   if (action.action === 'residual') return manageRuntimeHistoryResiduals(context,
-    () => mergeAllRuntimeHistory(context, startup), async () => !await refusedWhileFrozen(startup, '重新合并旧数据'));
+    candidateId => mergeAllRuntimeHistory(context, startup, [candidateId]), async () => !await refusedWhileFrozen(startup, '重新合并旧数据'));
   if (action.action === 'mergeAll') return mergeAllRuntimeHistory(context, startup);
   if (action.action === 'storage') return showRuntimeStorage(context, undefined, startup);
   const command = action.action === 'reset' ? EXTENSION_COMMAND_IDS.resetDevelopmentData
@@ -185,14 +185,14 @@ async function repairHistoryNow(
       modal: true, detail: detail + '\n\n先通过 SQLite 备份接口保存完整数据库，再在单个事务里修复。'
         + '只清理父记录缺失且无保留依赖的终态执行元数据；只按已有回执将误改为 exited 的状态恢复为 outcome_unknown。'
         + '不删除或重建对话，不虚构退出结果，不启动模型或进程，不清除合库账本；正文和附件不变。'
-        + '修复备份保留在该库的 history-repair-backups 中，不自动清理。' + (candidate.selected ? '完成后重载当前库。' : '修复后仍需另行选择“合并到当前库”。')
+        + '修复备份保留在该库的 history-repair-backups 中，不自动清理。' + (candidate.selected ? '完成后重载当前库。' : '修复后可选择“立即合并全部”。')
     }, '备份并修复');
     if (confirmed !== '备份并修复' || !stillCurrent() || (!exclusive && await refusedWhileFrozen(startup, '修复历史残留'))) return;
     const result = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在备份并修复历史残留…' },
       () => run(() => repairRuntimeHistory(paths, plan)));
     if (!stillCurrent()) return;
     const text = result.result
-      ? `历史残留已修复：清理 ${result.result.removedOperations} 条终态操作和 ${result.result.removedAttempts} 条尝试，恢复 ${result.result.restoredUnknownProcesses} 个进程的未知结果状态。备份：${result.backupPath}。${candidate.selected ? '完成后重载当前库。' : '请重新选择“合并到当前库”。'}`
+      ? `历史残留已修复：清理 ${result.result.removedOperations} 条终态操作和 ${result.result.removedAttempts} 条尝试，恢复 ${result.result.restoredUnknownProcesses} 个进程的未知结果状态。备份：${result.backupPath}。${candidate.selected ? '完成后重载当前库。' : '可以选择“立即合并全部”。'}`
       : '没有需要修复的历史残留。';
     if (result.warnings.length) await vscode.window.showWarningMessage(`${text}\n${result.warnings.join('\n')}`);
     else await vscode.window.showInformationMessage(text);
@@ -211,10 +211,8 @@ export interface HistoricalMergeHost {
 /**
  * Runs after the current Runtime is ready, in the background, like the historical upgrades:
  * pending data sets are merged online, one source per short write transaction, while this and
- * other windows keep working. It never throws and never asks anything: every outcome is a
- * notification, each cause at most once unless the user explicitly asked for that merge.
- * Sources left to the large merge session (大库会话) go on there: offered in one window after a
- * startup, confirmed right away after the user's click.
+ * other windows keep working. Explicit calls share this online path, with cancellation and every
+ * outcome reported; sources above the online limit wait for the existing streamed backend.
  */
 export async function mergeHistoricalDataSetsInBackground(
   context: vscode.ExtensionContext,
@@ -229,46 +227,62 @@ export async function mergeHistoricalDataSetsInBackground(
     && shouldContinue() && pathsFor(context).globalStoragePath === paths.globalStoragePath;
   let finishProgress: (() => void) | undefined;
   let progress: vscode.Progress<{ message?: string }> | undefined;
+  const requested = candidateIds !== undefined || manualAll;
+  let cancelled = false;
+  const shouldMerge = () => stillCurrent() && !cancelled;
   let report: RuntimeDataSetMergeBatchResult;
   try {
     const status = await loadCommittedGlobalStatus(context);
     const previous = [...(status?.previousDataRoots ?? []), ...(status?.lastMigration?.fromPath ? [status.lastMigration.fromPath] : [])];
     const fresh = await registerRuntimeHistoryConvergence(paths, previous);
     if (fresh && stillCurrent()) void vscode.window.showInformationMessage(`发现 ${fresh} 份旧数据，正在后台并入当前历史。你在本版本里删掉的对话不会回来；更早版本里删掉、而旧数据里还有的对话会被加回来，合并后可以再删。原库保留作为备份，可以在“清理备份”里删除。`);
-    report = await runRuntimeDataSetUpgrade(context, () => oneMergeBatchAtATime(() => mergeHistoricalDataSetsOnline(paths, {
+    const merge = (signal?: AbortSignal) => runRuntimeDataSetUpgrade(context, () => oneMergeBatchAtATime(() => mergeHistoricalDataSetsOnline(paths, {
       configurationRootPath: paths.globalStoragePath,
       database: host.product.application.database
     }, {
-      shouldContinue: stillCurrent,
+      shouldContinue: shouldMerge,
+      ...(signal ? { signal } : {}),
       isRuntimeIdle: async () => manualAll || !await host.hasOwnedExecution?.(),
       settleSourceWork: settleHistoricalMergeSourceOffline,
-      confirmSettlement: input => confirmRuntimeHistorySettlement(input, stillCurrent),
+      confirmSettlement: input => confirmRuntimeHistorySettlement(input, shouldMerge),
       // Only the call made for the user's click is an explicit request (the engine never infers it).
-      ...(candidateIds ? { candidateIds, requested: true } : {}),
+      requested,
+      ...(candidateIds ? { candidateIds } : {}),
       onWorkStart: () => {
+        if (requested) return;
         const done = new Promise<void>(resolve => { finishProgress = resolve; });
         void vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: '正在合并旧聊天记录' },
           reporter => { progress = reporter; return done; });
       },
       onSourceStart: (_candidate, index, total) => progress?.report({ message: `${index + 1}/${total}` }),
-      // An automatic source above the online limit goes along with a large merge session of the same
-      // batch (the engine then leaves it awaiting); only without one is it coordinated on its own.
-      ...(candidateIds ? { coordinateOversized: (input: RuntimeDataSetOversizedMerge, merge: () => Promise<void>) => requestOtherWindowsToYield(paths, input, merge, stillCurrent) } : {})
+      // A request for one source may use its existing coordination; merge-all prepares the waiting
+      // sources together after this online batch.
+      ...(candidateIds && !manualAll ? { coordinateOversized: (input: RuntimeDataSetOversizedMerge, merge: () => Promise<void>) => requestOtherWindowsToYield(paths, input, merge, shouldMerge) } : {})
     })));
+    report = requested ? await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
+      title: '正在合并旧聊天记录', cancellable: true }, async (reporter, token) => {
+      progress = reporter;
+      const abort = new AbortController();
+      cancelled = token.isCancellationRequested;
+      if (cancelled) abort.abort();
+      const cancellation = token.onCancellationRequested(() => { cancelled = true; abort.abort(); });
+      try { return await merge(abort.signal); } finally { cancellation.dispose(); }
+    }) : await merge();
+    report.stopped ||= cancelled;
   } catch (error) {
     console.error('[LimCode] 旧聊天记录合并检查失败。', error);
     const fresh = await freshStartupNotices(context, paths.globalStoragePath, 'merge',
       [{ code: 'batch', message: describeError(error) }], new Set(['']));
-    if ((fresh.size > 0 || candidateIds) && stillCurrent()) {
-      void vscode.window.showWarningMessage(`旧聊天记录暂时无法合并：${describeError(error)}。已有数据未被修改，稍后会自动重试。`);
+    if ((fresh.size > 0 || requested) && stillCurrent()) {
+      void vscode.window.showWarningMessage(`旧聊天记录暂时无法合并：${describeError(error)}。已完成的合并保留，未完成的旧数据仍保留在原位置。`);
     }
     return undefined;
   } finally {
     finishProgress?.();
   }
-  // Which sources wait for the large merge session now (the management menu and list show them).
+  // Waiting sources are handled by the explicit merge-all command.
 
-  await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent, candidateIds !== undefined || manualAll);
+  await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent, requested);
   const waiting = largeMergeSessionSources(report);
   if (waiting.length && stillCurrent() && !manualAll) {
     void vscode.window.showInformationMessage('还有 ' + waiting.length + ' 份旧数据待合并，可选择“立即合并全部”。');
@@ -277,8 +291,8 @@ export async function mergeHistoricalDataSetsInBackground(
 }
 
 /**
- * Merge batches of this process run one after another (the startup batch, 合并到当前库, a foreign
- * root's merge, the answer to the question below): two at once would judge, close and copy the same
+ * Merge batches of this process run one after another (startup convergence, merge-all and a
+ * residual retry): two at once would judge, close and copy the same
  * sources side by side, and one could copy a data set the other has open (its SQLite locks released).
  */
 let mergeBatches: Promise<unknown> = Promise.resolve();
@@ -339,7 +353,7 @@ async function reportHistoricalMerge(
   report: RuntimeDataSetMergeBatchResult,
   stillCurrent: () => boolean,
   requested: boolean,
-  details?: readonly string[]
+  beforeReload = false
 ): Promise<void> {
   for (const merged of report.merged) console.info(`[LimCode] ${mergedLog(merged)}`);
   const issues = [...report.deferred, ...report.blocked, ...report.failures];
@@ -348,56 +362,63 @@ async function reportHistoricalMerge(
   const fresh = await freshStartupNotices(context, configurationRootPath, 'merge',
     issues.filter(issue => issue.newly !== false), evaluated);
   if (!stillCurrent()) return;
+  const information: string[] = [];
   const merged = report.merged.filter(item => !item.alreadyMerged);
   if (merged.length) {
     const conversations = merged.reduce((sum, item) => sum + item.insertedConversations, 0);
-    const text = `已把 ${merged.length} 份${details ? '较大的' : ''}旧聊天记录合并到当前历史（新增 ${conversations} 个对话），可直接在侧栏继续。`
+    const text = `已把 ${merged.length} 份旧聊天记录合并到当前历史（新增 ${conversations} 个对话），可直接在侧栏继续。`
       + mergedNotes(merged) + '原库和合并前备份都已保留。' + foreignMergedNote(merged);
-    if (!details?.length) void vscode.window.showInformationMessage(text);
-    else {
-      // The large merge session: how many conversations each source added (or why not), on request.
-      void Promise.resolve(vscode.window.showInformationMessage(text, '查看详情')).then(async choice => {
-        if (choice !== '查看详情' || !stillCurrent()) return;
-        await showReadOnly(context, '较大的旧聊天记录合并结果', details.join('\n\n'));
-      }).then(undefined, error => console.warn('[LimCode] 无法显示较大的旧聊天记录合并详情。', error));
-    }
+    information.push(text);
   }
   // Merged by another window after this batch picked it: that window told what was new.
   const byAnotherWindow = report.merged.filter(item => item.alreadyMerged && item.mergedByAnotherWindow);
   if (byAnotherWindow.length) {
-    void vscode.window.showInformationMessage(
+    information.push(
       `${requested ? '旧数据' : `${byAnotherWindow.length} 份旧聊天记录`}已由另一个窗口合并到当前历史。${mergedNotes(byAnotherWindow)}${foreignMergedNote(byAnotherWindow)}`
     );
   }
   const current = report.merged.filter(item => item.alreadyMerged && !item.mergedByAnotherWindow);
   if (current.length) {
-    void vscode.window.showInformationMessage(
+    information.push(
       `${requested ? '旧数据' : `${current.length} 份旧聊天记录`}已合并到当前历史，没有新内容。${mergedNotes(current)}${foreignMergedNote(current)}`
     );
   }
   // The user's click always hears back, also when the engine found nothing to do for it.
   if (requested && !report.stopped && !report.merged.length && !issues.length) {
-    void vscode.window.showInformationMessage('这次没有需要合并的旧数据。');
+    information.push('这次没有需要合并的旧数据。');
+  }
+  if (requested && report.stopped) {
+    information.push('合并已取消，已完成的合并保留，其余旧数据仍保留在原位置。');
   }
   // Another window's request merges the same source right now (superseded): nothing to tell here.
   // A source left to the large merge session is told by that session (its prompt, confirmation or result).
-  const announce = (issue: RuntimeDataSetMergeIssue) => !isLargeMergeSessionIssue(issue) && (issue.requested
+  const announce = (issue: RuntimeDataSetMergeIssue) => !isLargeMergeSessionIssue(issue) && (requested || issue.requested
     || (issue.code !== 'runtime-data-set-merge-exclusive-superseded' && fresh.has(noticeCause(issue))));
   const deferred = report.deferred.filter(announce);
-  if (deferred.length) {
-    void vscode.window.showInformationMessage(
-      `有 ${deferred.length} 份旧聊天记录暂时无法合并（${deferred.map(issue => withoutFullStop(issue.message)).join('；')}），以后启动时会自动重试。`
+  if (deferred.length && !beforeReload) {
+    information.push(
+      `有 ${deferred.length} 份旧聊天记录暂时无法合并（${deferred.map(issue => withoutFullStop(issue.message)).join('；')}），原数据保留，可以在“历史与存储管理”中重新核验并合并。`
     );
   }
   const problems = [...report.blocked, ...report.failures].filter(announce);
+  const message = '部分旧聊天记录未能合并到当前历史，已完成的合并保留；各份旧数据的情况（例如旧格式已备份升级、任务已收尾）见原因。';
+  const describe = (problem: RuntimeDataSetMergeIssue) =>
+    `${problem.label ?? problem.candidateId ?? '旧数据列表'}\n[${problem.code}] ${problem.message}`;
+  if (beforeReload && (deferred.length || problems.length)) {
+    const options = { modal: true, detail: [...information, ...deferred.map(describe), ...problems.map(describe),
+      '关闭这条结果后重载窗口。'].join('\n\n') };
+    if (problems.length) await vscode.window.showWarningMessage(message, options, '重载窗口');
+    else await vscode.window.showInformationMessage('部分旧数据暂时无法合并，原数据保留。', options, '重载窗口');
+    return;
+  }
+  for (const text of information) void vscode.window.showInformationMessage(text);
   if (!problems.length) return;
+  const reasons = problems.map(describe).join('\n\n');
   void vscode.window.showWarningMessage(
-    '部分旧聊天记录未能合并到当前库，当前库的对话没有改动；各库的情况（例如已发布的旧格式先备份并就地升级、中断的任务已收尾）见原因。', '查看原因'
+    message, '查看原因'
   ).then(async choice => {
     if (choice !== '查看原因' || !stillCurrent()) return;
-    await showReadOnly(context, '旧聊天记录合并结果', problems.map(problem =>
-      `${problem.label ?? problem.candidateId ?? '历史库列表'}\n[${problem.code}] ${problem.message}`
-    ).join('\n\n'));
+    await showReadOnly(context, '旧聊天记录合并结果', reasons);
   }).then(undefined, error => console.warn('[LimCode] 无法显示旧聊天记录合并详情。', error));
 }
 
@@ -420,7 +441,7 @@ function foreignMergedNote(results: readonly RuntimeDataSetMergeResult[]): strin
   const foreign = results.filter(result => result.label);
   if (!foreign.length) return '';
   const kept = foreign.filter(result => result.skippedConversations);
-  const covered = foreign.filter(result => !result.skippedConversations);
+  const covered = foreign.filter(result => !result.skippedConversations && !result.excluded?.length);
   return (covered.length ? `${covered.map(result => result.label).join('、')}原样保留；确认不再需要时，可以在“清理备份”里按覆盖核对后删除。` : '')
     + kept.map(result => `${result.label}${keptForSkippedTip(result.skippedConversations!)}`).join('');
 }
@@ -636,13 +657,19 @@ export function formatBytes(value: string): string {
 }
 
 /** Explicit action is the sole entry to exclusive convergence. */
-export async function mergeAllRuntimeHistory(context: vscode.ExtensionContext, startup: ApplicationStartup): Promise<void> {
-  if (await refusedWhileFrozen(startup, '合并全部旧数据')) return;
-  const host = startup.current();
-  if (!isHistoryConvergenceHost(host)) { void vscode.window.showErrorMessage('运行时没有打开，不能合并旧数据。'); return; }
-  const batch = await mergeHistoricalDataSetsInBackground(context, host, () => canStartRuntimeDataSetUpgrade(context), undefined, true);
-  if (!batch || !canStartRuntimeDataSetUpgrade(context)) return;
-  const waiting = largeMergeSessionSources(batch);
-  if (waiting.length) await convergeRuntimeHistory(context, host, waiting,
-    result => reportHistoricalMerge(context, host.dataRootPath(), result, () => canStartRuntimeDataSetUpgrade(context), true));
+let mergingAll = false;
+export async function mergeAllRuntimeHistory(context: vscode.ExtensionContext, startup: ApplicationStartup, candidateIds?: readonly string[]): Promise<void> {
+  if (mergingAll) { void vscode.window.showInformationMessage('本窗口已在合并旧数据。'); return; }
+  mergingAll = true;
+  try {
+    if (await refusedWhileFrozen(startup, '合并全部旧数据')) return;
+    const host = startup.current() ?? await startup.wait();
+    if (!canStartRuntimeDataSetUpgrade(context) || await refusedWhileFrozen(startup, '合并全部旧数据')) return;
+    if (!isHistoryConvergenceHost(host)) { void vscode.window.showErrorMessage('当前运行时不能合并旧数据，请重载窗口后重试。'); return; }
+    const batch = await mergeHistoricalDataSetsInBackground(context, host, () => canStartRuntimeDataSetUpgrade(context), candidateIds, true);
+    if (!batch || batch.stopped || !canStartRuntimeDataSetUpgrade(context)) return;
+    const waiting = largeMergeSessionSources(batch);
+    if (waiting.length) await convergeRuntimeHistory(context, host, waiting,
+      (result, beforeReload) => reportHistoricalMerge(context, host.dataRootPath(), result, () => canStartRuntimeDataSetUpgrade(context), true, beforeReload));
+  } finally { mergingAll = false; }
 }

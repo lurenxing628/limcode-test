@@ -39,7 +39,7 @@ let running = false;
 /** The sole explicit convergence command: prepare once, coordinate once, then reload. */
 export async function convergeRuntimeHistory(
   context: vscode.ExtensionContext, host: HistoryConvergenceHost, candidateIds: readonly string[],
-  report: (batch: RuntimeDataSetMergeBatchResult) => Promise<void>
+  report: (batch: RuntimeDataSetMergeBatchResult, beforeReload?: boolean) => Promise<void>
 ): Promise<void> {
   if (!candidateIds.length) return;
   if (running) { void vscode.window.showInformationMessage('本窗口已在合并旧数据。'); return; }
@@ -51,6 +51,7 @@ export async function convergeRuntimeHistory(
   const releaseHold = holdOwnExclusiveMaintenanceWork(host, { operation: 'historical-merge', activity: '合并全部旧数据' });
   let prepared: LargeMergePreparation | undefined;
   let runtimeClosed = false;
+  let preparationReported = false;
   try {
     prepared = await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
       title: '正在准备合并全部旧数据', cancellable: true }, async (progress, token) => {
@@ -58,20 +59,22 @@ export async function convergeRuntimeHistory(
       const cancellation = token.onCancellationRequested(() => abort.abort());
       const watch = setInterval(() => { if (!current()) abort.abort(); }, 200);
       try {
-        return await runRuntimeDataSetUpgrade(context, () => prepareLargeMergeSources({
+        const ready = await runRuntimeDataSetUpgrade(context, () => prepareLargeMergeSources({
           paths, target: { configurationRootPath: root, database: host.product.application.database },
           candidateIds, requested: true, threshold: 'online', signal: abort.signal,
           options: { settleSourceWork: settleHistoricalMergeSourceOffline,
-            confirmSettlement: input => confirmRuntimeHistorySettlement(input, current) },
+            confirmSettlement: input => confirmRuntimeHistorySettlement(input, () => current() && !abort.signal.aborted) },
           onProgress: item => progress.report({ message: `${item.index + 1}/${item.total} · ${item.stage}` })
         }));
+        ready.report.stopped ||= abort.signal.aborted;
+        return ready;
       } finally { clearInterval(watch); cancellation.dispose(); }
     });
-    if (!prepared.sources.length || prepared.report.merged.length || prepared.report.deferred.length
-      || prepared.report.blocked.length || prepared.report.failures.length) {
+    if (!prepared.sources.length || !current() || prepared.report.stopped) {
+      preparationReported = true;
       await report({ ...prepared.report, pendingSources: 0 });
+      return;
     }
-    if (!prepared.sources.length || !current() || prepared.report.stopped) return;
     host.writeGate?.admit();
     const ready = prepared;
     const { paths: targetPaths, hostBootId } = host.exclusiveMaintenanceTarget();
@@ -109,8 +112,29 @@ export async function convergeRuntimeHistory(
         } finally { clearInterval(watch); cancellation.dispose(); }
       });
     });
-    if (outcome.state === 'completed') await report(convergenceResult(outcome.result));
-    else void vscode.window.showWarningMessage(`旧数据这次未合并：${outcome.reason}`);
+    if (outcome.state === 'completed') {
+      const result = convergenceResult(outcome.result);
+      preparationReported = true;
+      await report({ ...result,
+        merged: [...prepared.report.merged, ...result.merged], deferred: [...prepared.report.deferred, ...result.deferred],
+        blocked: [...prepared.report.blocked, ...result.blocked], failures: [...prepared.report.failures, ...result.failures]
+      }, runtimeClosed);
+    } else {
+      if (prepared.report.merged.length || prepared.report.deferred.length || prepared.report.blocked.length || prepared.report.failures.length) {
+        preparationReported = true;
+        await report({ ...prepared.report, pendingSources: 0 }, runtimeClosed);
+      }
+      void vscode.window.showWarningMessage(`这次未进行后续合并：${outcome.reason}`);
+    }
+  } catch (error) {
+    if (!preparationReported) {
+      const known = prepared?.report ?? { merged: [], deferred: [], blocked: [], failures: [], stopped: false };
+      await report({ ...known, pendingSources: 0, failures: [...known.failures, {
+        code: 'runtime-history-convergence-failed', label: '本次合并操作', requested: true,
+        message: error instanceof Error ? error.message : String(error)
+      }] }, runtimeClosed);
+    }
+    throw error;
   } finally {
     try { if (prepared) await releaseLargeMergePreparation(prepared); }
     finally {

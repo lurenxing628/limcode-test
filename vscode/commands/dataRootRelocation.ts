@@ -639,14 +639,14 @@ export async function deletePreviousDataRoot(context: vscode.ExtensionContext, s
     await tell(ask, '旧数据目录没有删除', [describeError(error)]);
     return;
   }
-  // Archives kept in the old directory stay visible (外来历史库) only while it is remembered.
+  // Keep the old directory discoverable while it still contains retained history.
   if (removed.remainingDataSets === 0 && !removed.remainingArchives) await forgetPreviousDataRoot(context);
   await tell(ask, '已删除', [
     `已删除 ${removed.removed.length} 项。`,
     ...(removed.busy ?? []).map((entry) => `保留归档 ${entry.path}：${entry.reason}。`),
-    ...(removed.remainingDataSets > 0 ? [`旧目录里还保留 ${removed.remainingDataSets} 个历史库，设置页仍会显示这个旧目录。`] : []),
+    ...(removed.remainingDataSets > 0 ? [`旧目录里还保留 ${removed.remainingDataSets} 份旧数据，设置页仍会显示这个旧目录。`] : []),
     ...(removed.remainingArchives
-      ? [`旧目录里还保留 ${removed.remainingArchives} 份“归档并重置”留下的归档，列在“历史与存储管理 → 外来历史库”里${removed.remainingDataSets > 0 ? '' : '，设置页仍会显示这个旧目录'}。`] : [])
+      ? [`旧目录里还保留 ${removed.remainingArchives} 份归档，未能合并的内容可在“历史与存储管理 → 未能合并的旧数据”里查看，设置页仍会显示这个旧目录。`] : [])
   ]);
 }
 
@@ -1239,7 +1239,7 @@ function describePlan(plan: DataRootRelocationPlan): DataRootPromptSection[] {
 
 function describeResult(result: DataRootRelocationResult): string {
   const parts = [`${EXTENSION_BRAND} 数据目录已迁移到 ${result.targetRootPath}`];
-  if (result.leftBehind.length) parts.push(`${result.leftBehind.length} 个历史库留在旧目录（见设置页）`);
+  if (result.leftBehind.length) parts.push(`${result.leftBehind.length} 份旧数据原位保留，已登记待合并或残留（见“历史与存储管理”）`);
   if (result.configuration.replacedFiles) parts.push(`被替换的旧设置版本在 ${result.configuration.backupPath}`);
   return `${parts.join('；')}。`;
 }

@@ -38,6 +38,7 @@ import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { createConversationRuntimeWorkProbe } from './conversationRuntimePendingWork';
 import { executeConversationChildTaskSnapshot } from './childTaskFactsSnapshot';
 import { readContextHandleEvidenceFrontier } from './contextHandleEvidenceFrontier';
+import { readSelectedContextAuthoritySource } from './selectedContextAuthoritySource';
 import { executeRuntimeContentUsage } from './runtimeContentUsage';
 import { inventoryRelocatedWork } from './relocatedWorkInventory';
 import {
@@ -431,6 +432,15 @@ async function start(): Promise<void> {
         const snapshot = reader.transaction(() => {
           assertDatabaseBinding(reader, data.binding);
           return readContextHandleEvidenceFrontier(reader, request.conversationId);
+        })();
+        respond({ type: 'response', id: request.id, ok: true,
+          result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });
+        return;
+      }
+      if (request.kind === 'selectedContextAuthoritySource') {
+        const snapshot = reader.transaction(() => {
+          assertDatabaseBinding(reader, data.binding);
+          return readSelectedContextAuthoritySource(reader, request.input);
         })();
         respond({ type: 'response', id: request.id, ok: true,
           result: { snapshotCommitSeq: commitSeq.toString(), snapshot } });

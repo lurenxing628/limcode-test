@@ -22,7 +22,8 @@ export const taskListToolDisplay: ToolDisplayResolver = (context) => {
   return {
     headerIcon: IconPlaylistAdd,
     inputSections: inputSections(operation, !settled),
-    outputSections: settled ? outputSections(settled) : []
+    ...(settled ? { outputSections: outputSections(settled) }
+      : context.result === undefined ? { outputSections: [] } : {})
   };
 };
 

@@ -28,7 +28,7 @@ const { loading: promptLoading, text: promptLoadingText } = useSettingsLoadingTe
     <RuntimeContextScopeEditor
       scope-kind="global"
       title="全局初始上下文模板"
-      description="用于生成新对话初始上下文的默认模板。时间、工作环境等变量只在创建或手动刷新时更新。"
+      description="用于生成新对话初始上下文的默认模板。时间、工作环境等变量在首次启动时生成，之后保持不变。"
     />
   </section>
 </template>

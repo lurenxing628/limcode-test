@@ -1,50 +1,38 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { IconFile, IconRefresh, IconExternalLink } from '@tabler/icons-vue';
-import type { AttachmentOpenResultPayload, AttachmentReloadResultPayload, InlineDataPart } from '@shared/protocol';
+import type { AttachmentOpenResultPayload, InlineDataPart } from '@shared/protocol';
 import { BridgeMessageType } from '@shared/protocol';
 import { bridge } from '@webview/transport';
+import { useInlineAttachmentDisplay } from '@webview/composables/useInlineAttachmentDisplay';
 import CollapsibleContentBlock from '../CollapsibleContentBlock.vue';
 
 const props = defineProps<{
   part: InlineDataPart;
 }>();
 
-const expanded = ref(false);
-const localPart = ref<InlineDataPart>(cloneInlineDataPart(props.part));
-const loading = ref(false);
-const pendingRequestId = ref<string>('');
+const expanded = ref(props.part.inlineData.mimeType.startsWith('image/'));
+const { inlineData, mimeType, displayName, sizeLabel, dataUri, loading, canReload, canOpen, contentRevision, requestData } =
+  useInlineAttachmentDisplay(() => props.part, () => expanded.value || props.part.inlineData.mimeType.startsWith('image/'));
 const opening = ref(false);
 const pendingOpenRequestId = ref<string>('');
 const openError = ref('');
 
-const stopReloadListener = bridge.on(BridgeMessageType.AttachmentReloadResult, (message) => {
-  if (!message.payload || message.correlationId !== pendingRequestId.value) return;
-  applyReloadResult(message.payload);
-});
 const stopOpenListener = bridge.on(BridgeMessageType.AttachmentOpenResult, (message) => {
   if (!message.payload || message.correlationId !== pendingOpenRequestId.value) return;
   applyOpenResult(message.payload);
 });
 
 onBeforeUnmount(() => {
-  stopReloadListener();
   stopOpenListener();
 });
 
-watch(() => props.part, (next) => {
-  localPart.value = mergeIncomingPart(localPart.value, next);
-}, { deep: true });
-
-watch(expanded, (value) => {
-  if (value) requestAttachmentDataIfNeeded();
-});
-
-const inlineData = computed(() => localPart.value.inlineData);
-const mimeType = computed(() => inlineData.value.mimeType || 'application/octet-stream');
-const displayName = computed(() => inlineData.value.name || fileNameFromPath(inlineData.value.sourcePath) || inlineData.value.attachmentId || '内联附件');
-const sizeLabel = computed(() => formatBytes(inlineData.value.sizeBytes));
-const dataUri = computed(() => inlineData.value.data ? `data:${mimeType.value};base64,${inlineData.value.data}` : '');
+watch(contentRevision, () => {
+  pendingOpenRequestId.value = '';
+  opening.value = false;
+  openError.value = '';
+  expanded.value = props.part.inlineData.mimeType.startsWith('image/');
+}, { flush: 'sync' });
 const kind = computed<'image' | 'audio' | 'video' | 'pdf' | 'text' | 'file'>(() => {
   if (mimeType.value.startsWith('image/')) return 'image';
   if (mimeType.value.startsWith('audio/')) return 'audio';
@@ -61,8 +49,6 @@ const statusText = computed(() => {
   if (inlineData.value.status === 'unsupported') return '不支持的类型';
   return inlineData.value.data ? '已加载' : inlineData.value.sourcePath ? '本地文件引用' : inlineData.value.attachmentId ? '未加载' : '附件';
 });
-const canReload = computed(() => !!inlineData.value.attachmentId || !!inlineData.value.sourcePath);
-const canOpen = computed(() => canReload.value || !!inlineData.value.data);
 const decodedText = computed(() => {
   if (kind.value !== 'text' || !inlineData.value.data) return '';
   try {
@@ -78,22 +64,8 @@ function setExpanded(value: boolean): void {
   expanded.value = value;
 }
 
-function requestAttachmentDataIfNeeded(force = false): void {
-  if (loading.value) return;
-  if (!force && inlineData.value.data) return;
-  if (!canReload.value) return;
-  loading.value = true;
-  localPart.value = { inlineData: { ...inlineData.value, status: 'loading' } };
-  pendingRequestId.value = bridge.request(BridgeMessageType.AttachmentReload, {
-    attachmentId: inlineData.value.attachmentId,
-    sourcePath: inlineData.value.sourcePath,
-    mimeType: inlineData.value.mimeType,
-    name: inlineData.value.name
-  });
-}
-
 function reload(): void {
-  requestAttachmentDataIfNeeded(true);
+  requestData(true);
 }
 
 function openInVscode(): void {
@@ -117,58 +89,6 @@ function applyOpenResult(payload: AttachmentOpenResultPayload): void {
     : '';
 }
 
-function applyReloadResult(payload: AttachmentReloadResultPayload): void {
-  loading.value = false;
-  pendingRequestId.value = '';
-  if (payload.part) {
-    localPart.value = cloneInlineDataPart(payload.part);
-    return;
-  }
-  const { data: _staleData, ...currentReference } = inlineData.value;
-  localPart.value = {
-    inlineData: {
-      ...currentReference,
-      status: payload.status,
-      ...(payload.error ? { error: payload.error } : {})
-    }
-  };
-}
-
-function cloneInlineDataPart(part: InlineDataPart): InlineDataPart {
-  return { inlineData: { ...part.inlineData } };
-}
-
-function mergeIncomingPart(current: InlineDataPart, incoming: InlineDataPart): InlineDataPart {
-  const sameAttachment = attachmentIdentity(current) === attachmentIdentity(incoming);
-  if (sameAttachment && (incoming.inlineData.data || current.inlineData.data)) {
-    return { inlineData: { ...incoming.inlineData, data: incoming.inlineData.data ?? current.inlineData.data, status: incoming.inlineData.status ?? current.inlineData.status } };
-  }
-  return cloneInlineDataPart(incoming);
-}
-
-function attachmentIdentity(part: InlineDataPart): string {
-  const value = part.inlineData;
-  return value.attachmentId
-    ? `managed:${value.attachmentId}`
-    : value.sourcePath
-      ? `path:${value.sourcePath}`
-      : `embedded:${value.sha256 ?? ''}:${value.name ?? ''}:${value.mimeType}:${value.sizeBytes ?? ''}`;
-}
-
-function fileNameFromPath(path: string | undefined): string {
-  if (!path) return '';
-  return path.replace(/[\\/]+$/g, '').split(/[\\/]/).pop() ?? '';
-}
-
-function formatBytes(bytes: number | undefined): string {
-  if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return '';
-  if (bytes < 1024) return `${bytes} B`;
-  const kb = bytes / 1024;
-  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`;
-  const mb = kb / 1024;
-  if (mb < 1024) return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`;
-  return `${(mb / 1024).toFixed(1)} GB`;
-}
 </script>
 
 <template>

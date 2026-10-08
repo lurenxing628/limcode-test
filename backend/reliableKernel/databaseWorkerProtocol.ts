@@ -25,6 +25,8 @@ import type { RuntimeContentUsageRow } from './runtimeContentUsage';
 import type { RelocatedWorkInventory } from './relocatedWorkInventory';
 import type { MergeModelAggregate } from './runtimeMergeAggregatePreflight';
 import type { RuntimeHistoryRepairInput, RuntimeHistoryRepairResult } from './runtimeHistoryRepairTransaction';
+import type { SelectedContextAuthoritySourceInput, SelectedContextAuthoritySource } from './selectedContextAuthoritySource';
+export type { SelectedContextAuthoritySourceInput, SelectedContextAuthoritySource } from './selectedContextAuthoritySource';
 
 export const MODEL_STREAM_ACTIVE_CHECKPOINT_LIMIT = 33;
 export const MODEL_STREAM_OUTPUT_DELTA_CHECKPOINT_LIMIT = 1;
@@ -348,6 +350,7 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'toolFactsSnapshot'; toolCallId: string }
   | { kind: 'conversationChildTaskSnapshot'; conversationId: string }
   | { kind: 'contextHandleEvidenceFrontier'; conversationId: string }
+  | { kind: 'selectedContextAuthoritySource'; input: SelectedContextAuthoritySourceInput }
   | { kind: 'processOutputRegistrationMismatches' }
   | { kind: 'effectReceiptReconciliationCandidates' }
   | { kind: 'childConversationOriginCandidates' }
@@ -451,7 +454,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<CurrentTurnTaskSnapshot> | SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<CurrentTurnTaskSnapshot> | SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<SelectedContextAuthoritySource> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

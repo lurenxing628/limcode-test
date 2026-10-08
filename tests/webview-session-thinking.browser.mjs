@@ -146,7 +146,7 @@ test('history click keeps the visible message anchored after the production Vue 
     export const feed = reactive({records:{}, details:{}, transientModelRequests:{}, historyConversationId:'scroll-conversation', historyRecords:{}, historyHasMore:true, historyLoading:false, historyLoadedPages:1,
       requestEarlierHistory(){this.historyLoading=true;return true;}, setPinnedDetailKeys(){}, requestDetail(){} });
     export const useReliableConversation = () => ({feed, conversationId, projection, ensureDetails(){}});
-    export const useChat = () => ({conversationAction:ref(null), conversationActionPending:ref(false), conversationActionLabel:ref(null), conversationActionNotice:ref(null), forkPendingTargetIds:ref(new Set()), currentAuthoritySelection:()=>({})});
+    export const useChat = () => ({conversationAction:ref(null), conversationActionPending:ref(false), conversationActionLabel:ref(null), conversationActionNotice:ref(null), forkPendingTargetIds:ref(new Set()), currentAuthoritySelection:()=>({}), currentTurnInputEchoes:ref([])});
     export const useGlobalSettingsStore = () => ({llmProviderConfigs:{configs:[]},llm:{}});
     export const useModelProfileStore = () => ({effectiveFor:()=>({})});
     export const useReliableTimelinePresentationStore = () => ({isSuppressed:()=>false});

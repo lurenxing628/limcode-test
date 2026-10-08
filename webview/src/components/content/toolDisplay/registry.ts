@@ -101,7 +101,7 @@ function defaultToolDisplay(context: ToolDisplayContext): ToolDisplayResult {
 
   const outputSections: ToolDisplaySection[] = [];
   if (context.result !== undefined) {
-    outputSections.push({ kind: 'output', title: '输出', text: context.stringifyValue(context.result) });
+    outputSections.push(...defaultResultSections(context));
   } else if (context.progress !== undefined) {
     outputSections.push({ kind: 'output', title: '输出', text: context.stringifyValue(context.progress) });
   } else {
@@ -110,6 +110,22 @@ function defaultToolDisplay(context: ToolDisplayContext): ToolDisplayResult {
   }
 
   return { inputSections, outputSections, headerActions: [] };
+}
+
+function defaultResultSections(context: ToolDisplayContext): ToolDisplaySection[] {
+  const result = context.result;
+  if (result !== null && typeof result === 'object' && !Array.isArray(result)) {
+    const record = result as Record<string, unknown>;
+    const explanation = [record.error, record.reason].find((value): value is string =>
+      typeof value === 'string' && value.trim().length > 0);
+    if (explanation) return [
+      { kind: 'output', title: '结果说明', text: explanation },
+      ...(Object.keys(record).length > 1
+        ? [{ kind: 'output' as const, title: '输出', text: context.stringifyValue(result) }]
+        : [])
+    ];
+  }
+  return [{ kind: 'output', title: '输出', text: context.stringifyValue(result) }];
 }
 
 function defaultEventText(context: ToolDisplayContext): string {

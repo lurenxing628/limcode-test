@@ -18,7 +18,8 @@ const {
   resolveVscodeWorkspaceRuntimePlacement,
   resolveVscodeWorkspaceRuntimeScope,
   resolveVscodeWorkspaceRuntimeScopeRoot,
-  selectVscodeRuntimeDataSet
+  selectVscodeRuntimeDataSet,
+  VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN
 } = require('../../dist/extension/backend/reliableKernel/vscodeRootAuthority.js');
 const { RootAuthority } = require('../../dist/extension/backend/reliableKernel/rootAuthority.js');
 const kernel = require('../../dist/extension/backend/reliableKernel/index.js');
@@ -481,8 +482,8 @@ test('首次选择遇到缺失数据库或未完成pending，归档原根后建�
   });
 });
 
-test('首次选择遇到损坏指针、无binding、丢失CAS和epoch漂移，原字节归档并登记残留', async () => {
-  for (const mode of ['malformed', 'unbound', 'missing-cas', 'epoch-mismatch']) {
+test('首次选择遇到不可用根，原字节归档并登记残留，可读的归档可以重新定位', async () => {
+  for (const mode of ['malformed', 'unbound', 'missing-cas', 'epoch-mismatch', 'recorded-failure']) {
     await fixture(async (root, paths) => {
       const binding = await createRoot(root);
       const databaseBefore = await fs.readFile(binding.paths.databasePath);
@@ -493,9 +494,24 @@ test('首次选择遇到损坏指针、无binding、丢失CAS和epoch漂移，�
         const epoch = JSON.parse(await fs.readFile(binding.paths.runtimeEpochPath, 'utf8'));
         await fs.writeFile(binding.paths.runtimeEpochPath, JSON.stringify({ ...epoch, dataSetId: 'wrong-data-set' }));
       }
+      if (mode === 'recorded-failure') {
+        const candidate = await resolveVscodeRuntimeDataSet(paths, 'default');
+        await writeRuntimeDataSetMergeLedgerRecord(paths, {
+          candidateId: candidate.id, state: 'failed', source: await runtimeDataSetFingerprint(candidate),
+          code: 'runtime-data-set-merge-source-cas-invalid', message: '上次合并未通过'
+        });
+      }
       const backup = await assertInitialFallbackPreservesRoot(root, paths, 'first');
       const relative = path.relative(path.join(root, '.limcode-runtime'), binding.paths.databasePath);
       assert.deepEqual(await fs.readFile(path.join(backup, relative)), databaseBefore);
+      if (mode === 'recorded-failure') {
+        const { readRuntimeHistoryResidual } = require('../../dist/extension/backend/reliableKernel/runtimeHistoryRegistry.js');
+        const residual = [...(await readRuntimeHistoryResidual(paths)).values()].find(record => record.location.containerPath === backup);
+        const { locateForeignRuntimeRoot } = require('../../dist/extension/backend/reliableKernel/runtimeForeignHistory.js');
+        const located = await locateForeignRuntimeRoot(root, residual.location);
+        assert.equal(located.recorded.dataSetId, binding.dataSetId);
+        assert.equal(located.recorded.rootInstanceId, binding.rootInstanceId);
+      }
     });
   }
 });
@@ -543,6 +559,7 @@ async function assertInitialFallbackPreservesRoot(root, paths, workspace) {
   const backups = path.join(root,'.limcode-runtime-reset-backups');
   const names = await fs.readdir(backups);
   assert.equal(names.length, 1);
+  assert.match(names[0], new RegExp(`^${VSCODE_RUNTIME_ARCHIVE_NAME_PATTERN}$`));
   const backup = path.join(backups,names[0]);
   assert.deepEqual(await files(backup), original, '异常旧根逐文件原字节保留');
   const residuals = await require('../../dist/extension/backend/reliableKernel/runtimeHistoryRegistry.js').readRuntimeHistoryResidual(paths);

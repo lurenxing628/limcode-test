@@ -361,15 +361,15 @@ async function checkToolModelResultExactlyOnce() {
     const pause = await interactions.pauseForAskUser({
       source: source('internal', 'ask-user:pause'),
       toolCallId: askTool.toolCallId,
-      prompt: { question: '选择一个结果', options: ['a', 'b'] }
+      prompt: { question: '选择一个结果', options: [{ label: 'a' }, { label: 'b' }] }
     });
     assert.equal((await get(ctx.database, 'Operation', pause.operationId)).status, 'waiting_answer');
     assert.equal((await get(ctx.database, 'OutcomePause', pause.pauseId)).status, 'waiting');
     assert.equal((await list(ctx.database, 'InteractionRequest', { id: pause.requestId })).length, 1);
     assert.equal((await list(ctx.database, 'ToolModelResult', { tool_call_id: askTool.toolCallId })).length, 0);
     const answers = [
-      { source: source('command', 'ask-user:answer-a'), response: { selected: 'a' } },
-      { source: source('command', 'ask-user:answer-b'), response: { selected: 'b' } }
+      { source: source('command', 'ask-user:answer-a'), response: { answer: { selectedOptionIndexes: [0] } } },
+      { source: source('command', 'ask-user:answer-b'), response: { answer: { selectedOptionIndexes: [1] } } }
     ];
     const answerResults = await Promise.all(answers.map((entry) => interactions.resolveAskUser({
       source: entry.source,
@@ -407,12 +407,12 @@ async function checkToolModelResultExactlyOnce() {
     const orderedPause = await interactions.pauseForAskUser({
       source: source('internal', 'ask-order:pause'),
       toolCallId: orderedAsk.toolCallId,
-      prompt: { question: 'persist first response' }
+      prompt: { question: 'persist first response', options: [{ label: 'persisted' }, { label: 'skip' }] }
     });
     const orderedResponse = await interactions.resolveAskUser({
       source: source('command', 'ask-order:answer'),
       requestId: orderedPause.requestId,
-      response: { selected: 'persisted' }
+      response: { answer: { selectedOptionIndexes: [0] } }
     });
     assert.equal(orderedResponse.won, true);
     assert.equal(orderedResponse.terminal, undefined);
@@ -432,7 +432,7 @@ async function checkToolModelResultExactlyOnce() {
     const crashAskPause = await interactions.pauseForAskUser({
       source: source('internal', 'ask-finalizer-crash:pause'),
       toolCallId: crashAskTool.toolCallId,
-      prompt: { question: 'persist before finalizer crash' }
+      prompt: { question: 'persist before finalizer crash', options: [{ label: 'durable' }, { label: 'skip' }] }
     });
     const originalOrderedFinalize = effects.finalizeReadyInOrder.bind(effects);
     effects.finalizeReadyInOrder = async () => { throw new Error('fault-after-ask-response-commit'); };
@@ -440,7 +440,7 @@ async function checkToolModelResultExactlyOnce() {
       await assert.rejects(interactions.resolveAskUser({
         source: source('command', 'ask-finalizer-crash:answer'),
         requestId: crashAskPause.requestId,
-        response: { selected: 'durable' }
+        response: { answer: { selectedOptionIndexes: [0] } }
       }), /fault-after-ask-response-commit/);
     } finally {
       effects.finalizeReadyInOrder = originalOrderedFinalize;
@@ -450,7 +450,7 @@ async function checkToolModelResultExactlyOnce() {
     const crashAskReplay = await interactions.resolveAskUser({
       source: source('command', 'ask-finalizer-crash:answer'),
       requestId: crashAskPause.requestId,
-      response: { selected: 'durable' }
+      response: { answer: { selectedOptionIndexes: [0] } }
     });
     assert.equal(crashAskReplay.deduplicated, true);
     assert.equal(crashAskReplay.terminal.status, 'succeeded');

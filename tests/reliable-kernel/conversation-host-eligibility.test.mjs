@@ -551,7 +551,7 @@ test('盲审 3：产品运行时把接管无存活宿主持有的 Turn 接到与
   ]);
 });
 
-test('文件修改审批：不合格窗口只记录决定，不派发修改、不续跑并提示；合格窗口照常派发并续跑', async () => {
+test('文件修改审批：窗口只记录决定，文件效果由 owner 执行器派发；仅合格窗口安排续跑', async () => {
   for (const eligible of [false, true]) {
     informationMessages.length = 0;
     const calls = { decided: 0, dispatched: 0, resumed: 0 };
@@ -597,13 +597,12 @@ test('文件修改审批：不合格窗口只记录决定，不派发修改、�
     });
     await sleep(50);
     assert.equal(calls.decided, 1);
+    assert.equal(calls.dispatched, 0, '命令路由只记录批准，文件效果交给 owner 执行器派发');
     assert.deepEqual(posted.map((message) => message.payload.status), ['committed']);
     if (eligible) {
-      assert.equal(calls.dispatched, 1);
       assert.equal(calls.resumed, 1);
       assert.deepEqual(informationMessages, []);
     } else {
-      assert.equal(calls.dispatched, 0, '批准的文件修改留给打开项目的窗口派发');
       assert.equal(calls.resumed, 0);
       assert.deepEqual(informationMessages, [`${EXTENSION_BRAND}：回答已记录，将在打开项目“项目二”的窗口中继续执行。`]);
     }
@@ -769,11 +768,12 @@ test('审批与提问提示只在持有其 Turn 执行租约的窗口出现，�
         expires_at: new Date(Date.now() + 60_000).toISOString()
       })
     ]);
+    const askArgs = { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] };
     await app.runtime.effects.createToolCall({
-      source: { kind: 'internal', key: 'create:ask' }, toolCallId: 'ask-call', turnId, toolName: 'ask_user', arguments: {}
+      source: { kind: 'internal', key: 'create:ask' }, toolCallId: 'ask-call', turnId, toolName: 'ask_user', arguments: askArgs
     });
     const pause = await app.interactions.pauseForAskUser({
-      source: { kind: 'internal', key: 'pause-ask' }, toolCallId: 'ask-call', prompt: { question: '继续吗？' }
+      source: { kind: 'internal', key: 'pause-ask' }, toolCallId: 'ask-call', prompt: askArgs
     });
 
     assert.deepEqual(await readPendingInteractionAttention(app.database, hostBootId), [],
@@ -819,12 +819,114 @@ test('审批与提问提示只在持有其 Turn 执行租约的窗口出现，�
   }
 });
 
+test('存活窗口持有对话时，另一个窗口经真实路由回答 Ask、取消执行审批与批准当前对话 Plan，只写首答且不接管执行', { timeout: 120_000 }, async () => {
+  const { outer, dataRoot } = await createIsolatedRoot('live-owner-controls');
+  let owner;
+  let peer;
+  try {
+    const ownerProvider = gatedProvider();
+    owner = await openHost(dataRoot, ownerProvider, { folders: [PROJECT_TWO], label: 'control-owner' });
+    const conversationId = 'conversation-live-owner-controls';
+    const turnId = 'turn-live-owner-controls';
+    const leaseId = 'lease-live-owner-controls';
+    await createConversation(owner.app, conversationId, PROJECT_TWO_FOLDER);
+    const now = new Date().toISOString();
+    await owner.app.database.transaction([
+      kernel.DOMAIN_REPOSITORIES.domain('Turn').insert({
+        id: turnId, conversation_id: conversationId, status: 'active', created_at: now, updated_at: now, terminal_at: null
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('ExecutionLease').insert({
+        id: leaseId, conversation_id: conversationId, turn_id: turnId, owner_id: 'live-control-owner',
+        host_boot_id: owner.app.database.hostBootId, generation: 3n, acquired_at: now,
+        expires_at: new Date(Date.now() + 120_000).toISOString()
+      })
+    ]);
+    await owner.app.database.conversationOwners.claim(conversationId);
+    const ownerPath = path.join(conversationRuntimeOwnerClaimPath(owner.app.database.binding.paths, conversationId), 'owner.json');
+    const ownerRecord = await fs.readFile(ownerPath, 'utf8');
+    const lease = (await rows(owner.app, 'ExecutionLease', { id: leaseId }))[0];
+    const cases = [
+      {
+        kind: 'ask_user', toolName: 'ask_user', status: 'succeeded', decision: 'submit', laterDecision: 'submit',
+        arguments: { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] },
+        response: { answer: { selectedOptionIndexes: [0] } },
+        laterResponse: { answer: { selectedOptionIndexes: [1] } }
+      },
+      {
+        kind: 'exec_approval', toolName: 'guarded_action', status: 'cancelled', decision: 'cancel', laterDecision: 'accept',
+        arguments: {}, response: { reason: '这次不执行。' }, laterResponse: {}
+      },
+      {
+        kind: 'plan_review', toolName: 'submit_plan', status: 'succeeded', decision: 'accept', laterDecision: 'reject',
+        arguments: { plan: '按当前方案继续。', taskList: { mode: 'rewrite', items: [
+          { title: '实施方案', description: '在当前对话继续。', status: 'pending', delete: false }
+        ] } },
+        response: { executionTarget: 'current_conversation' }, laterResponse: { message: '后到的拒绝不覆盖批准。' }
+      }
+    ];
+    for (const entry of cases) {
+      const toolCallId = `live-control-${entry.kind}`;
+      await owner.app.runtime.effects.createToolCall({
+        source: { kind: 'internal', key: `create:${toolCallId}` }, toolCallId, turnId,
+        toolName: entry.toolName, arguments: entry.arguments
+      });
+      const pauseInput = { source: { kind: 'internal', key: `pause:${toolCallId}` }, toolCallId };
+      const pause = entry.kind === 'ask_user'
+        ? await owner.app.interactions.pauseForAskUser({ ...pauseInput, prompt: entry.arguments })
+        : entry.kind === 'exec_approval'
+          ? await owner.app.interactions.pauseForExecutionApproval({ ...pauseInput, prompt: { toolName: entry.toolName } })
+          : await owner.app.interactions.pauseForPlanReview({ ...pauseInput, request: entry.arguments });
+      entry.toolCallId = toolCallId;
+      entry.requestId = pause.requestId;
+    }
+    const files = workerFiles(outer, 'control-peer');
+    const descriptor = path.join(outer, 'control-responses.json');
+    await writeJson(descriptor, { conversationId, turnId, leaseId, ownerHostBootId: owner.app.database.hostBootId, cases });
+    peer = spawnWorker(dataRoot, 'live-owner-controls', {
+      ...files.env, LIMCODE_ELIGIBILITY_DESCRIPTOR: descriptor
+    });
+    const ready = await waitForWorkerJson(peer, files.ready, 90_000);
+    assert.equal(ready.ownerAlive, true, '回答期间 A 是真实存活 Host');
+    assert.deepEqual(ready.completedKinds, cases.map(entry => entry.kind));
+    assert.deepEqual(ready.postedStatuses, cases.flatMap(() => ['committed', 'already_resolved']));
+    assert.equal(ready.providerCalls, 0);
+    assert.equal(ready.owns, false);
+    for (const entry of cases) {
+      assert.equal((await rows(owner.app, 'InteractionResponse', { request_id: entry.requestId })).length, 1);
+      assert.equal((await rows(owner.app, 'InteractionRequest', { id: entry.requestId }))[0]?.status, entry.status);
+      assert.equal((await rows(owner.app, 'ToolOutcome', { tool_call_id: entry.toolCallId }))[0]?.status, entry.status);
+      assert.equal((await rows(owner.app, 'ToolModelResult', { tool_call_id: entry.toolCallId })).length, 1);
+      assert.equal((await rows(owner.app, 'ToolCall', { id: entry.toolCallId }))[0]?.status, 'terminal');
+    }
+    assert.equal(ownerProvider.calls, 0);
+    assert.equal(owner.owns(conversationId), true);
+    assert.equal(await fs.readFile(ownerPath, 'utf8'), ownerRecord);
+    assert.deepEqual(await rows(owner.app, 'ExecutionLease', { id: leaseId }), [lease]);
+    assert.deepEqual(await rows(owner.app, 'EffectIntent'), [], '纯控制答复不派发文件或其它工具效果');
+    assert.deepEqual(await rows(owner.app, 'ChildExecution'), [], '批准当前对话 Plan 不启动子 Agent');
+    await fs.writeFile(files.finish, 'finish\n', 'utf8');
+    await waitForExit(peer, 90_000, true);
+    const result = await readJson(files.result);
+    assert.equal(result.providerCalls, 0, 'B 不调用模型');
+    assert.equal(result.ownsAtFinish, false);
+    assert.deepEqual(result.runnerErrors, []);
+  } finally {
+    await stopChild(peer);
+    await owner?.close();
+    await fs.rm(outer, { recursive: true, force: true });
+  }
+});
+
 }
 
 async function runWorker(mode) {
   const dataRoot = requiredEnv('LIMCODE_ELIGIBILITY_DATA_ROOT');
   if (mode === 'recoverer') {
     await runRecoveryWorker(dataRoot);
+    return;
+  }
+  if (mode === 'live-owner-controls') {
+    await runLiveOwnerControlsWorker(dataRoot);
     return;
   }
   const conversationId = requiredEnv('LIMCODE_ELIGIBILITY_CONVERSATION');
@@ -962,6 +1064,69 @@ async function runWorker(mode) {
       providerCalls: provider.calls,
       ownsAtFinish: host.owns(conversationId),
       runnerErrors: host.runnerErrors.map((entry) => String(entry.error?.stack ?? entry.error))
+    });
+  } finally {
+    await host.close();
+  }
+}
+
+async function runLiveOwnerControlsWorker(dataRoot) {
+  const { conversationId, turnId, leaseId, ownerHostBootId, cases } = await readJson(requiredEnv('LIMCODE_ELIGIBILITY_DESCRIPTOR'));
+  const provider = gatedProvider();
+  const host = await openHost(dataRoot, provider, { folders: [PROJECT_TWO], label: 'control-peer' });
+  try {
+    const ownerAlive = await host.app.database.isHostAlive(ownerHostBootId);
+    assert.equal(ownerAlive, true);
+    const ownerPath = path.join(conversationRuntimeOwnerClaimPath(host.app.database.binding.paths, conversationId), 'owner.json');
+    const ownerRecord = await fs.readFile(ownerPath, 'utf8');
+    const lease = (await rows(host.app, 'ExecutionLease', { id: leaseId }))[0];
+    assert.equal(lease?.host_boot_id, ownerHostBootId);
+    const router = createRouter(host);
+    const posted = [];
+    const completedKinds = [];
+    for (const entry of cases) {
+      const dispatch = (suffix, decision, response) => router.dispatch('control-peer-client', webview(posted), {
+        id: `${entry.toolCallId}:${suffix}`, type: BridgeMessageType.InteractionResolve, channel: 'command',
+        payload: { conversationId, interactionRequestId: entry.requestId, interactionRevision: 1,
+          ownerTurnId: turnId, decision, response }
+      });
+      await dispatch('first', entry.decision, entry.response);
+      assert.equal(posted.at(-1)?.payload.status, 'committed', `${entry.kind} 在存活 peer 持有时仍能记录决定`);
+      const response = (await rows(host.app, 'InteractionResponse', { request_id: entry.requestId }))[0];
+      const outcome = (await rows(host.app, 'ToolOutcome', { tool_call_id: entry.toolCallId }))[0];
+      const modelResult = (await rows(host.app, 'ToolModelResult', { tool_call_id: entry.toolCallId }))[0];
+      assert.equal((await rows(host.app, 'InteractionRequest', { id: entry.requestId }))[0]?.status, entry.status);
+      assert.equal(outcome?.status, entry.status);
+      assert.ok(response && modelResult, `${entry.kind} 的真实首答和模型结果必须落库`);
+      assert.equal((await rows(host.app, 'ToolCall', { id: entry.toolCallId }))[0]?.status, 'terminal');
+      await dispatch('late', entry.laterDecision, entry.laterResponse);
+      assert.equal(posted.at(-1)?.payload.status, 'already_resolved');
+      assert.deepEqual(await rows(host.app, 'InteractionResponse', { request_id: entry.requestId }), [response]);
+      assert.deepEqual(await rows(host.app, 'ToolOutcome', { tool_call_id: entry.toolCallId }), [outcome]);
+      assert.deepEqual(await rows(host.app, 'ToolModelResult', { tool_call_id: entry.toolCallId }), [modelResult]);
+      assert.equal(host.owns(conversationId), false);
+      assert.equal(await fs.readFile(ownerPath, 'utf8'), ownerRecord, '记录与重放回答不改变 A 的归属文件');
+      assert.deepEqual(await rows(host.app, 'ExecutionLease', { id: leaseId }), [lease], '不接管、不续租 A 的执行租约');
+      completedKinds.push(entry.kind);
+    }
+    // 让路由的 setImmediate 续跑提示走过真实 Runner 的 owner 判定。
+    await sleep(50);
+    await host.runner.waitForIdle();
+    assert.equal(provider.calls, 0);
+    assert.equal(host.owns(conversationId), false);
+    assert.equal(await fs.readFile(ownerPath, 'utf8'), ownerRecord);
+    assert.deepEqual(await rows(host.app, 'ExecutionLease', { id: leaseId }), [lease]);
+    assert.deepEqual(await rows(host.app, 'EffectIntent'), []);
+    assert.deepEqual(await rows(host.app, 'ChildExecution'), []);
+    await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_READY'), {
+      ownerAlive, completedKinds, postedStatuses: posted.map(message => message.payload.status),
+      providerCalls: provider.calls, owns: host.owns(conversationId)
+    });
+    await waitForFile(requiredEnv('LIMCODE_ELIGIBILITY_FINISH'), 300_000);
+    await host.runner.waitForIdle();
+    await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_RESULT'), {
+      providerCalls: provider.calls, ownsAtFinish: host.owns(conversationId),
+      runnerErrors: host.runnerErrors.map(entry => String(entry.error?.stack ?? entry.error))
     });
   } finally {
     await host.close();

@@ -8,7 +8,7 @@ import {
   copyLocatedRuntimeDatabase, heldDatabaseFiles, openLocatedCasAccess, relocateRuntimeRoot, withLocatedRuntimeRootFence,
   type HeldDatabaseFiles, type LocatedCasAccess
 } from './runtimeForeignHistory';
-import { registerForeignRuntimeHistoryView, type ForeignRuntimeHistoryViewRegistration } from './runtimeForeignHistoryViews';
+import { registerRuntimeHistoryView, type RuntimeHistoryViewRegistration } from './runtimeForeignHistoryViews';
 import { assertRuntimeHostsOffline, withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { sameLocatedRuntimeRoot, type LocatedRuntimeRoot } from './runtimeLocatedRoot';
 import { assertRuntimePhysicalSchemaFingerprint } from './runtimePhysicalSchemaFingerprint';
@@ -54,13 +54,14 @@ const MAX_MESSAGE_CONTENT_BYTES = 64n * 1024n * 1024n;
  * The copy counts only when the files kept their state while it was taken, and no file copied or
  * read is a file of a database this process may hold (copyLocatedRuntimeDatabase). Packed CAS uses
  * a later private copy, and loose bodies stay on-demand descriptor reads. A recorded path is never read. A
- * foreign root stays registered as viewed (runtimeForeignHistoryViews, written under its claim in the
+ * source stays registered as viewed (runtimeForeignHistoryViews, written under its claim in the
  * current configuration root) until the reader is closed, so 清理备份 keeps it meanwhile.
  */
 export async function openRuntimeDataSetHistory(
   paths: { globalStoragePath: string },
   root: LocatedRuntimeRoot
 ): Promise<RuntimeDataSetHistory> {
+  let opened: RuntimeDataSetHistory | undefined;
   const open = async (): Promise<RuntimeDataSetHistory> => {
     const held = await heldByThisProcess(paths, root);
     const current = await relocateRuntimeRoot(paths, root, held);
@@ -80,7 +81,7 @@ export async function openRuntimeDataSetHistory(
       else if (!sameLocatedRuntimeRoot(await relocateRuntimeRoot(paths, current, held), current)) {
         throw new Error('Historical Runtime identity changed; close and reopen the history reader.');
       }
-      const view = current.origin.kind === 'foreign' ? await registerForeignRuntimeHistoryView(paths.globalStoragePath, current.id) : undefined;
+      const view = await registerRuntimeHistoryView(paths.globalStoragePath, current.id);
       let snapshot: RuntimeDataSetDatabaseSnapshot | undefined;
       let cas: LocatedCasAccess | undefined;
       try {
@@ -91,12 +92,12 @@ export async function openRuntimeDataSetHistory(
         assertRuntimePhysicalSchemaFingerprint(database, RUNTIME_DOMAIN_SCHEMAS, { label: 'Historical Runtime' });
         // Metadata first: the later append-only CAS copy contains every packed body it references.
         cas = await openLocatedCasAccess(current, held, () => heldByThisProcess(paths, current));
-        return new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, cas, held, view);
+        return opened = new ReadonlyRuntimeDataSetHistory(paths, current, binding, database, snapshot, cas, held, view);
       } catch (error) {
         try { await cas?.close(); }
         finally {
           try { await snapshot?.close(); }
-          finally { await view?.release().catch(() => undefined); }
+          finally { await view.release().catch(() => undefined); }
         }
         if (error instanceof Error) {
           error.message = `无法读取历史库：${error.message} 未执行任何迁移或重置。`;
@@ -106,7 +107,13 @@ export async function openRuntimeDataSetHistory(
     });
   };
   // A foreign root is no data set of this configuration root: nothing registers Hosts on it here.
-  return root.origin.kind === 'local' ? withRuntimeDataRootAdmission(paths.globalStoragePath, open) : open();
+  try {
+    return await (root.origin.kind === 'local' ? withRuntimeDataRootAdmission(paths.globalStoragePath, open) : open());
+  } catch (error) {
+    // A claim can fail to release after creating the reader; its snapshot and view still belong to us.
+    await opened?.close().catch((closeError) => console.warn('[LimCode] Failed to close a history reader after opening failed.', closeError));
+    throw error;
+  }
 }
 
 /**
@@ -120,6 +127,8 @@ function heldByThisProcess(paths: { globalStoragePath: string }, root: LocatedRu
 class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
   private closed = false;
   private closing = false;
+  private closeOperation?: Promise<void>;
+  private readonly reads = new Set<Promise<unknown>>();
   private readonly textCache = new Map<string, string>();
 
   public constructor(
@@ -130,79 +139,97 @@ class ReadonlyRuntimeDataSetHistory implements RuntimeDataSetHistory {
     private readonly snapshot: RuntimeDataSetDatabaseSnapshot,
     private readonly cas: LocatedCasAccess,
     private held: HeldDatabaseFiles,
-    private readonly view?: ForeignRuntimeHistoryViewRegistration
+    private readonly view: RuntimeHistoryViewRegistration
   ) {}
 
   public async listConversations(input: { limit?: number; after?: RuntimeHistoryConversationCursor } = {}) {
-    await this.validateSource();
-    const limit = pageLimit(input.limit);
-    if (input.after) {
-      text(input.after.updatedAt, 'Conversation cursor updatedAt');
-      text(input.after.id, 'Conversation cursor id');
-    }
-    const rows = this.database.prepare(`SELECT * FROM conversation
-      ${input.after ? 'WHERE updated_at < @updatedAt OR (updated_at = @updatedAt AND id < @id)' : ''}
-      ORDER BY updated_at DESC, id DESC LIMIT @limit`).all({
-      ...(input.after ?? {}), limit: limit + 1
-    }) as DomainRow[];
-    const items: RuntimeHistoryConversation[] = rows.slice(0, limit).map((raw) => {
-      const row = DOMAIN_REPOSITORIES.codec('Conversation').decode(raw);
-      return { id: text(row.id), title: text(row.title, 'Conversation.title', true), status: text(row.status),
-        createdAt: text(row.created_at), updatedAt: text(row.updated_at) };
+    return this.read(async () => {
+      await this.validateSource();
+      const limit = pageLimit(input.limit);
+      if (input.after) {
+        text(input.after.updatedAt, 'Conversation cursor updatedAt');
+        text(input.after.id, 'Conversation cursor id');
+      }
+      const rows = this.database.prepare(`SELECT * FROM conversation
+        ${input.after ? 'WHERE updated_at < @updatedAt OR (updated_at = @updatedAt AND id < @id)' : ''}
+        ORDER BY updated_at DESC, id DESC LIMIT @limit`).all({
+        ...(input.after ?? {}), limit: limit + 1
+      }) as DomainRow[];
+      const items: RuntimeHistoryConversation[] = rows.slice(0, limit).map((raw) => {
+        const row = DOMAIN_REPOSITORIES.codec('Conversation').decode(raw);
+        return { id: text(row.id), title: text(row.title, 'Conversation.title', true), status: text(row.status),
+          createdAt: text(row.created_at), updatedAt: text(row.updated_at) };
+      });
+      const last = items[items.length - 1];
+      return { items, ...(rows.length > limit && last ? { next: { updatedAt: last.updatedAt, id: last.id } } : {}) };
     });
-    const last = items[items.length - 1];
-    return { items, ...(rows.length > limit && last ? { next: { updatedAt: last.updatedAt, id: last.id } } : {}) };
   }
 
   public async readMessages(conversationId: string, input: { limit?: number; after?: string } = {}) {
-    await this.validateSource();
-    this.requireConversation(conversationId);
-    const limit = pageLimit(input.limit);
-    if (input.after !== undefined && !/^(0|[1-9][0-9]*)$/.test(input.after)) {
-      throw new TypeError('Message cursor must be a non-negative decimal sequence.');
-    }
-    const rows = this.database.prepare(`SELECT membership.* FROM message_part_of_conversation membership
-      LEFT JOIN message ON message.id = membership.message_id
-      WHERE membership.conversation_id = @conversationId AND message.deleted_at IS NULL
-      ${input.after !== undefined ? 'AND membership.message_seq > @after' : ''}
-      ORDER BY membership.message_seq ASC LIMIT @limit`).all({
-      conversationId, ...(input.after !== undefined ? { after: BigInt(input.after) } : {}), limit: limit + 1
-    }) as DomainRow[];
-    const items: RuntimeHistoryMessage[] = [];
-    for (const raw of rows.slice(0, limit)) {
-      const membership = DOMAIN_REPOSITORIES.codec('MessagePartOfConversation').decode(raw);
-      const { message, revision, metadata } = this.messageContent(conversationId, text(membership.message_id));
-      const content = await this.readText(metadata);
-      const page = textPage(content, 0, TEXT_PAGE_CHARACTERS);
-      items.push({
-        id: text(message.id), revisionId: text(revision.id), role: text(revision.role),
-        createdAt: text(message.created_at), updatedAt: text(message.updated_at),
-        messageSeq: sequence(membership.message_seq), text: page.text, hasMoreText: page.hasMore,
-        ...(page.nextOffset !== undefined ? { nextTextOffset: page.nextOffset } : {})
-      });
-    }
-    await this.validateSource();
-    return { items, ...(rows.length > limit && items.length ? { next: items[items.length - 1].messageSeq } : {}) };
+    return this.read(async () => {
+      await this.validateSource();
+      this.requireConversation(conversationId);
+      const limit = pageLimit(input.limit);
+      if (input.after !== undefined && !/^(0|[1-9][0-9]*)$/.test(input.after)) {
+        throw new TypeError('Message cursor must be a non-negative decimal sequence.');
+      }
+      const rows = this.database.prepare(`SELECT membership.* FROM message_part_of_conversation membership
+        LEFT JOIN message ON message.id = membership.message_id
+        WHERE membership.conversation_id = @conversationId AND message.deleted_at IS NULL
+        ${input.after !== undefined ? 'AND membership.message_seq > @after' : ''}
+        ORDER BY membership.message_seq ASC LIMIT @limit`).all({
+        conversationId, ...(input.after !== undefined ? { after: BigInt(input.after) } : {}), limit: limit + 1
+      }) as DomainRow[];
+      const items: RuntimeHistoryMessage[] = [];
+      for (const raw of rows.slice(0, limit)) {
+        const membership = DOMAIN_REPOSITORIES.codec('MessagePartOfConversation').decode(raw);
+        const { message, revision, metadata } = this.messageContent(conversationId, text(membership.message_id));
+        const content = await this.readText(metadata);
+        const page = textPage(content, 0, TEXT_PAGE_CHARACTERS);
+        items.push({
+          id: text(message.id), revisionId: text(revision.id), role: text(revision.role),
+          createdAt: text(message.created_at), updatedAt: text(message.updated_at),
+          messageSeq: sequence(membership.message_seq), text: page.text, hasMoreText: page.hasMore,
+          ...(page.nextOffset !== undefined ? { nextTextOffset: page.nextOffset } : {})
+        });
+      }
+      await this.validateSource();
+      return { items, ...(rows.length > limit && items.length ? { next: items[items.length - 1].messageSeq } : {}) };
+    });
   }
 
   public async readMessageText(conversationId: string, messageId: string, input: { offset: number; limit?: number }) {
-    await this.validateSource();
-    const { metadata } = this.messageContent(conversationId, messageId);
-    const page = textPage(await this.readText(metadata), input.offset, input.limit ?? TEXT_PAGE_CHARACTERS);
-    await this.validateSource();
-    return page;
+    return this.read(async () => {
+      await this.validateSource();
+      const { metadata } = this.messageContent(conversationId, messageId);
+      const page = textPage(await this.readText(metadata), input.offset, input.limit ?? TEXT_PAGE_CHARACTERS);
+      await this.validateSource();
+      return page;
+    });
   }
 
   public async close(): Promise<void> {
     if (this.closed) return;
+    if (this.closeOperation) return this.closeOperation;
     this.closing = true;
-    this.textCache.clear();
-    try { await this.cas.close(); }
-    finally {
-      try { await this.snapshot.close(); }
-      finally { await this.view?.release(); }
-    }
-    this.closed = true;
+    this.closeOperation = (async () => {
+      await Promise.allSettled(this.reads);
+      this.textCache.clear();
+      try { await this.cas.close(); }
+      finally {
+        try { await this.snapshot.close(); }
+        finally { await this.view.release(); }
+      }
+      this.closed = true;
+    })().catch((error) => { this.closeOperation = undefined; throw error; });
+    return this.closeOperation;
+  }
+
+  private read<T>(operation: () => Promise<T>): Promise<T> {
+    if (this.closed || this.closing) throw new Error('Runtime history reader is closed.');
+    const read = operation();
+    this.reads.add(read);
+    return read.finally(() => { this.reads.delete(read); });
   }
 
   private async validateSource(): Promise<void> {

@@ -632,7 +632,7 @@ async function runWorker(mode) {
   const conversationId = requiredEnv('LIMCODE_PLACEMENT_CONVERSATION');
   if (mode !== 'r5-w1' && mode !== 'x3-w1') throw new Error(`Unknown worker ${mode}`);
   const host = await openHost(dataRoot, scriptedProvider([{ role: 'model', parts: [{ id: 'ask', functionCall: {
-    name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }] } } }] }]), { folders: [PROJECT_TWO], label: 'w1', askUser: true });
+    name: 'ask_user', args: { question: '继续吗？', options: [{ label: '继续' }, { label: '停止' }] } } }] }]), { folders: [PROJECT_TWO], label: 'w1', askUser: true });
   try {
     await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
     const { turnId } = await host.runner.input({ commandId: 'r5', conversationId, text: '问我' });

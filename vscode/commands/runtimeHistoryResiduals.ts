@@ -4,12 +4,12 @@ import * as vscode from 'vscode';
 import { resolveDataRootUri } from '../../backend/capabilities/vscodeStorage/globalStatus';
 import { createVscodeStoragePaths } from '../../backend/capabilities/vscodeStorage/paths';
 import { locateLocalRuntimeDataSet, openRuntimeDataSetHistory, type RuntimeDataSetHistory } from '../../backend/reliableKernel/runtimeDataSetHistory';
-import { locateForeignRuntimeRoot, readRuntimeHistoryResidualSize } from '../../backend/reliableKernel/runtimeForeignHistory';
-import { readRuntimeHistoryResidual, writeRuntimeHistoryPending, reconcileRuntimeResetBackups, type RuntimeHistoryResidual } from '../../backend/reliableKernel/runtimeHistoryRegistry';
+import { isForeignRuntimeHistoryId, locateForeignRuntimeRoot, readRuntimeHistoryResidualSize } from '../../backend/reliableKernel/runtimeForeignHistory';
+import { readRuntimeHistoryResidual, requeueRuntimeHistoryResidual, reconcileRuntimeResetBackups, type RuntimeHistoryResidual } from '../../backend/reliableKernel/runtimeHistoryRegistry';
 import { browseRuntimeHistory, formatBytes, showReadOnly } from './runtimeDataSetManagement';
 
 /** The durable registry is the authority; opening this menu never scans the history bodies. */
-export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionContext, retry: () => Promise<void>, canRetry: () => Promise<boolean> = async () => true): Promise<void> {
+export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionContext, retry: (candidateId: string) => Promise<void>, canRetry: () => Promise<boolean> = async () => true): Promise<void> {
   const paths = createVscodeStoragePaths(resolveDataRootUri(context));
   await reconcileRuntimeResetBackups(paths);
   const records = await readRuntimeHistoryResidual(paths);
@@ -45,9 +45,11 @@ export async function manageRuntimeHistoryResiduals(context: vscode.ExtensionCon
     const located = record.location.kind === 'local'
       ? await locateLocalRuntimeDataSet(paths, record.location.candidateId)
       : await locateForeignRuntimeRoot(paths.globalStoragePath, record.location);
-    await writeRuntimeHistoryPending(paths, { id: record.id, sourceKind: record.sourceKind, location: record.location,
+    const id = isForeignRuntimeHistoryId(record.id) ? located.id : record.id;
+    await requeueRuntimeHistoryResidual(paths, record.id, { id, sourceKind: record.sourceKind, location: record.location,
+      ...(record.label ? { label: record.label } : {}),
       identity: { dataSetId: located.recorded.dataSetId, rootInstanceId: located.recorded.rootInstanceId }, reason: '用户在残留列表里选择重新合并', registeredAt: new Date().toISOString() });
-    await retry();
+    await retry(id);
   } else {
     await browseRuntimeHistory(context, choice.label, async () => {
       const root = record.location.kind === 'local'

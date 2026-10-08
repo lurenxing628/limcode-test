@@ -10,6 +10,7 @@ const registry=kernelFile('runtimeHistoryRegistry.js');
 const {mergeHistoricalDataSetsOnline}=kernelFile('runtimeDataSetMerge.js');
 const {planRuntimeBackupCleanup,deleteRuntimeBackups}=kernelFile('runtimeBackupCleanup.js');
 const {registerForeignRuntimeHistoryView}=kernelFile('runtimeForeignHistoryViews.js');
+const claimPrimitives=kernelFile('runtimeClaimPrimitives.js');
 
 async function fixture(t,merged=true){
  const f=await createConfigurationRoot();t.after(()=>removeConfigurationRoot(f.root));
@@ -29,8 +30,35 @@ async function fixture(t,merged=true){
 }
 async function item(f){const plan=await planRuntimeBackupCleanup(f.root,f.database);return {plan,item:plan.items.find(i=>i.path===f.backupPath)};}
 
-test('外来来源只有完整合并成功且缓存未变才可删除',async t=>{
- for(const merged of [false,true]){const f=await fixture(t,merged),v=await item(f);assert.equal(v.item.deletable,merged,v.item.reason);if(merged){const r=await deleteRuntimeBackups(v.plan,f.database,[v.item.key]);assert.equal(r.deleted.length,1,JSON.stringify(r));await assert.rejects(fs.stat(f.backupPath),{code:'ENOENT'});}}
+test('外来来源只有完整合并成功且缓存未变才可删除；admission释放失败仍等待实际删除完成',async t=>{
+ for(const merged of [false,true]){
+  const f=await fixture(t,merged),v=await item(f);assert.equal(v.item.deletable,merged,v.item.reason);
+  if(!merged)continue;
+  const releaseClaim=claimPrimitives.releaseClaimRecord;
+  let resume,releaseFailed,removalStarted=false,settled=false;
+  const paused=new Promise(resolve=>resume=resolve),failure=new Promise(resolve=>releaseFailed=resolve);
+  claimPrimitives.releaseClaimRecord=async(...args)=>{
+   await releaseClaim(...args);
+   if(removalStarted&&String(args[0]).endsWith('.runtime-admission')){
+    releaseFailed();
+    throw new Error('injected admission release failure during foreign removal');
+   }
+  };
+  const deletion=deleteRuntimeBackups(v.plan,f.database,[v.item.key],{
+   async onFaultPoint(point){if(point==='before-removal'){removalStarted=true;await paused;}}
+  }).then(result=>{settled=true;return result;});
+  try{
+   await failure;
+   await new Promise(resolve=>setImmediate(resolve));
+   assert.equal(settled,false,'已经交给来源声明的删除必须等待完成，不能提前返回保留');
+  }finally{
+   resume();claimPrimitives.releaseClaimRecord=releaseClaim;
+   const r=await deletion;
+   assert.equal(r.deleted.length,1,JSON.stringify(r));
+   assert.equal(r.kept.length,0,JSON.stringify(r));
+   await assert.rejects(fs.stat(f.backupPath),{code:'ENOENT'});
+  }
+ }
 });
 
 test('外来来源的只读查看登记与声明占用均阻止删除',async t=>{
@@ -55,14 +83,24 @@ test('外来来源的残留、待合并、嵌套备份、符号链接和缓存�
  }
 });
 
-test('外来来源改名后未核对失败恢复，已核对后中断在同一声明下收尾',async t=>{
+test('外来来源改名后未核对失败恢复，已核对后中断在同一声明下收尾，释放失败保留收尾结果',async t=>{
  for(const stop of ['after-rename','after-verify']){
   const f=await fixture(t),v=await item(f);assert.equal(v.item.deletable,true,v.item.reason);
   const r=await deleteRuntimeBackups(v.plan,f.database,[v.item.key],{onFaultPoint(point){if(point===stop)throw Error('injected');}});
   assert.equal(r.deleted.length,0);
-  const again=await planRuntimeBackupCleanup(f.root,f.database);
+  const releaseClaim=claimPrimitives.releaseClaimRecord;
+  let releaseFailed=false;
+  claimPrimitives.releaseClaimRecord=async(...args)=>{
+   await releaseClaim(...args);
+   if(stop==='after-verify'&&!releaseFailed&&String(args[0]).includes('/foreign-claims/')){
+    releaseFailed=true;throw new Error('injected foreign release failure after interrupted cleanup finished');
+   }
+  };
+  let again;
+  try{again=await planRuntimeBackupCleanup(f.root,f.database);}
+  finally{claimPrimitives.releaseClaimRecord=releaseClaim;}
   if(stop==='after-rename')assert.ok(await fs.stat(f.backupPath));
-  else{assert.equal(again.finishedDeletions.length,1);await assert.rejects(fs.stat(f.backupPath),{code:'ENOENT'});}
+  else{assert.equal(releaseFailed,true);assert.equal(again.finishedDeletions.length,1);await assert.rejects(fs.stat(f.backupPath),{code:'ENOENT'});}
  }
 });
 

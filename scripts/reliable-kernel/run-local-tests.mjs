@@ -35,6 +35,8 @@ const CI_TEST_FILES = Object.freeze([
   'tests/reliable-kernel/context-cas-cache.test.mjs',
   'tests/reliable-kernel/frozen-tool-definitions.test.mjs',
   'tests/reliable-kernel/composer-attachment-authority.test.mjs',
+  'tests/reliable-kernel/inline-attachment-display.test.mjs',
+  'tests/reliable-kernel/selected-context-authority-source.test.mjs',
   'tests/reliable-kernel/conversation-owner-release.test.mjs',
   'tests/reliable-kernel/diagnostic-inspection-progress.test.mjs',
   'tests/reliable-kernel/foreign-file-volume-identity.test.mjs',

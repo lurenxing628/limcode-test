@@ -634,6 +634,7 @@ async function withRuntime(run, { claudeTurnScopedReminders = true, compression 
     facade.product = { application: app, configuration };
     facade.writeGate = new RuntimeWriteGate();
     facade.historyEntries = [];
+    facade.historyRevealEmitter = { fire() {} };
     facade.refreshConversationHistory = async () => {};
   };
   try {

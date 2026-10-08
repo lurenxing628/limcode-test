@@ -2,6 +2,7 @@ import { canonicalModelProfile, loadScopedModelProfiles } from './scopedModelPro
 import { hasThinkingBodyConflict } from '../../shared/sessionThinkingBody';
 import { applySessionThinkingOverride, resolveSavedSessionThinkingOverride } from '../../shared/sessionThinking';
 import type { RequestGenerationSettings } from './requestCompressionSettings';
+import { DEFAULT_RUNTIME_CONTEXT, PROMPT_PLACEHOLDERS } from '../../shared/promptTemplateCatalog';
 
 import type * as vscode from 'vscode';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
@@ -31,7 +32,6 @@ import type {
   PlanReviewPolicyRecord,
   PlanReviewPolicyScopeLinkRecord,
   RuleFileRecord,
-  RuleScope,
   RuntimeContextRecord,
   RuntimeContextScopeLinkRecord,
   SkillPolicyRecord,
@@ -97,6 +97,7 @@ import {
   resolveDataRootUri
 } from '../capabilities/vscodeStorage/globalStatus';
 import type { StoragePaths } from '../capabilities/vscodeStorage/paths';
+import { readRuleFiles } from '../capabilities/rulesCatalog';
 import {
   composeRuntimeContextRuleParts,
   renderReliableRuntimeContextTemplate,
@@ -109,7 +110,6 @@ import {
 } from '../world/modules/agent/blueprints';
 import { composeSystemInstruction, type SystemPromptTextPart } from '../world/modules/chat/systemPromptText';
 import { VscodeConfigurationMutations } from './vscodeConfigurationMutations';
-import { readDataRootRelocationRecord } from './runtimeDataRootRelocation';
 import { builtinDefaultToolNames } from './builtinToolCatalog';
 import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
@@ -401,6 +401,13 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       scopesLowToHigh,
       (link) => link.runtimeContextId
     );
+    const globalRuntimeContext = resolveRecordAtScope(
+      records.runtimeContextScopeLinks,
+      records.runtimeContexts,
+      { scopeKind: 'global' },
+      (link) => link.runtimeContextId
+    );
+    if (!globalRuntimeContext) runtimeContexts.unshift({ ...DEFAULT_RUNTIME_CONTEXT });
     const runtimeContext = runtimeContexts[runtimeContexts.length - 1];
     const workEnvironmentPolicy = resolveScopedRecord(
       records.workEnvironmentPolicyScopeLinks,
@@ -478,7 +485,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         : {})
     };
     const ruleFiles = await this.loadRuleFiles(request.workspace);
-    const renderedRuntimeContextParts = runtimeContexts
+    const renderedRuntimeContextParts = request.initialRuntimeContext ? [] : runtimeContexts
       .map((context) => {
         const text = renderReliableRuntimeContextTemplate(context.template, promptRenderContext).trim();
         if (!text) return '';
@@ -486,8 +493,15 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         return name ? `[${name}]\n${text}` : text;
       })
       .filter(Boolean);
-    // 与旧 ECS RuntimeContextSnapshotSystem 一致：渲染后的运行时上下文在前，规则区域原样追加在后。
-    const runtimeContextText = [...renderedRuntimeContextParts, ...composeRuntimeContextRuleParts(ruleFiles)].join('\n\n');
+    const initialRuntimeContext = request.initialRuntimeContext ?? {
+      id: runtimeContext?.id ?? null,
+      name: runtimeContexts.map((context) => context.name.trim()).filter(Boolean).join(' + '),
+      template: runtimeContexts.map((context) => context.template.trim()).filter(Boolean).join('\n\n'),
+      text: renderedRuntimeContextParts.join('\n\n')
+    };
+    // The initial template keeps its original rendered bytes. Project/global rules still follow
+    // the current authority read and are appended once for this new Turn.
+    const runtimeContextText = [initialRuntimeContext.text, ...composeRuntimeContextRuleParts(ruleFiles)].filter(Boolean).join('\n\n');
     const executionPreset = {
       kind: 'turn-execution-preset',
       turnId: request.turnId,
@@ -555,9 +569,10 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         text: renderReliableSystemPromptTemplate(composeSystemInstruction(orderedPromptParts), promptRenderContext)
       },
       runtimeContext: {
-        id: runtimeContext?.id ?? null,
-        name: runtimeContexts.map((context) => context.name.trim()).filter(Boolean).join(' + '),
-        template: runtimeContexts.map((context) => context.template.trim()).filter(Boolean).join('\n\n'),
+        id: initialRuntimeContext.id,
+        name: initialRuntimeContext.name,
+        template: initialRuntimeContext.template,
+        renderedTemplateText: initialRuntimeContext.text,
         // 占位符已渲染 + 规则区域注入后的模型可见文本；适配器优先使用，template 保留原文供编辑。
         ...(runtimeContextText ? { text: runtimeContextText } : {})
       },
@@ -613,37 +628,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
    */
   private async loadRuleFiles(workspace?: { uri: string }): Promise<RuleFileRecord[]> {
     if (!this.context) return [];
-    // 使用 VS Code FS API，远程 workspace / 非 file scheme 与 rulesCatalog 行为一致。
-    const { Uri, workspace: vscodeWorkspace } = await import('vscode');
-    const roots: Array<{ scope: RuleScope; rootUri: vscode.Uri | undefined }> = [
+    const { Uri } = await import('vscode');
+    return readRuleFiles([
       { scope: 'global', rootUri: resolveDataRootUri(this.context) },
-      { scope: 'project', rootUri: workspace ? Uri.parse(workspace.uri) : undefined }
-    ];
-    const rules: RuleFileRecord[] = [];
-    for (const { scope, rootUri } of roots) {
-      if (!rootUri) continue;
-      for (const kind of ['AGENTS', 'CLAUDE'] as const) {
-        const fileUri = Uri.joinPath(rootUri, kind === 'AGENTS' ? 'AGENTS.md' : 'CLAUDE.md');
-        let content = '';
-        let exists = false;
-        try {
-          content = Buffer.from(await vscodeWorkspace.fs.readFile(fileUri)).toString('utf8');
-          exists = true;
-        } catch {
-          // 规则文件未创建（或不可读）时按「不存在」处理。
-        }
-        rules.push({
-          id: `rule:${scope}:${kind}`,
-          scope,
-          kind,
-          editable: kind === 'AGENTS',
-          path: fileUri.fsPath,
-          exists,
-          content
-        });
-      }
-    }
-    return rules;
+      ...(workspace ? [{ scope: 'project' as const, rootUri: Uri.parse(workspace.uri) }] : [])
+    ]);
   }
 
   public synchronizeWorkspaceFolders(folders: readonly CurrentWorkspaceFolder[]): Promise<void> {
@@ -689,6 +678,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       skillPolicyScopeLinks: records.skillPolicyScopeLinks.map(clonePlain),
       systemPrompts: records.systemPrompts.map(clonePlain),
       systemPromptScopeLinks: records.systemPromptScopeLinks.map(clonePlain),
+      promptPlaceholders: PROMPT_PLACEHOLDERS.map(clonePlain),
       runtimeContexts: records.runtimeContexts.map(clonePlain),
       runtimeContextScopeLinks: records.runtimeContextScopeLinks.map(clonePlain),
       workEnvironments: records.workEnvironments.map(clonePlain),
@@ -768,7 +758,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     if (section === 'common') {
       const context = this.requireContext();
       const status = await loadCommittedGlobalStatus(context);
-      const settings = await withRelocationRecord(createGlobalSettingsRecord(context, status));
+      const settings = createGlobalSettingsRecord(context, status);
       return {
         section,
         settings,
@@ -831,7 +821,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         expectedRevision,
         input.proxyShellAndMcp ?? current.proxyShellAndMcp
       );
-      const committed = await withRelocationRecord(createGlobalSettingsRecord(context, committedStatus.current));
+      const committed = createGlobalSettingsRecord(context, committedStatus.current);
       return {
         section,
         settings: committed,
@@ -1600,11 +1590,4 @@ function clonePlain<T>(value: T): T {
 function requireId(value: unknown, label: string): string {
   if (typeof value !== 'string' || value.trim().length === 0) throw new TypeError(`${label} must be non-empty.`);
   return value.trim();
-}
-
-/** Data sets the relocation into the current directory left in the old one (shown until the next move). */
-async function withRelocationRecord(record: GlobalSettingsRecord): Promise<GlobalSettingsRecord> {
-  const relocation = await readDataRootRelocationRecord(record.activeDataRootPath).catch(() => undefined);
-  if (!relocation?.leftBehind.length || relocation.invalidated) return record;
-  return { ...record, relocationLeftBehind: relocation.leftBehind.map((item) => `${item.id}：${item.reason}。${item.hint}`) };
 }

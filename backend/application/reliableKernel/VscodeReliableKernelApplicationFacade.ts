@@ -449,7 +449,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   private async renameConversationTitleNow(conversationId: string, title: string): Promise<boolean> {
     this.requireOpen();
-    return this.revealingConversationRefresh(conversationId, () => this.product.application.database.conversationOwners.run(conversationId, async () => {
+    return this.revealingConversationRefresh(conversationId, async () => {
       const existing = await this.maybeRow('Conversation', conversationId);
       if (!existing) return false;
       const normalized = title.trim();
@@ -462,7 +462,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       ]);
       await this.refreshConversationHistory();
       return true;
-    }));
+    });
   }
 
   /**

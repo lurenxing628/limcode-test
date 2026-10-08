@@ -348,10 +348,10 @@ test('删除旧目录：没有迁移完成记录时拒绝；迁移后只删除�
   finally { moved.close(); }
 });
 
-test('迁移留下同名库：新根登记旧位置，后续清理previousDataRoots不会丢掉它', async (t) => {
+test('迁移留下同名残留库：新根保留旧位置与残留状态，不自动重新排队', async (t) => {
   const fixture = await createFixture(t);
   const target = path.join(fixture.base, 'same-name-target');
-  const targetDataSet = await createLimCodeTarget(target);
+  await createLimCodeTarget(target);
   const scopeRoot = rootAuthority.resolveVscodeRuntimeDataSetScopeRoot(target, fixture.alpha.id);
   await initialize(scopeRoot, fixture.alpha.id);
   const registry = kernelFile('runtimeHistoryRegistry.js');
@@ -367,18 +367,11 @@ test('迁移留下同名库：新根登记旧位置，后续清理previousDataRo
   assert.deepEqual(residuals.map(item => item.message).sort(), ['新目录残留', '旧目录残留']);
   assert.deepEqual(result.leftBehind.map(item => item.id), [fixture.alpha.id]);
   const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({ globalStoragePath: target })).values()];
-  const left = pending.find(item => item.identity?.dataSetId === fixture.alpha.binding.dataSetId);
+  assert.equal(pending.length, 0, '迁移没有请求重新合并已有残留');
+  const left = residuals.find(item => item.location.containerPath === path.dirname(fixture.alpha.binding.paths.dataRootPath));
   assert.equal(left?.sourceKind, 'migration');
   assert.equal(left?.location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
   assert.equal(left?.location.baseDataRootPath, fixture.root);
-  const database = await openRuntime(targetDataSet);
-  try {
-    const report = await kernelFile('runtimeDataSetMerge.js').mergeHistoricalDataSetsOnline({ globalStoragePath: target },
-      { configurationRootPath: target, database }, { candidateIds: [left.id] });
-    assert.deepEqual(report.failures, []);
-    assert.deepEqual(report.blocked, []);
-    assert.equal(report.merged[0]?.candidateId, left.id, JSON.stringify(report));
-  } finally { await database.close(); }
 
   assert.deepEqual(await kernelFile('runtimeForeignHistory.js').previousDataRootsWithoutForeignHistory({
     configurationRootPath: target, previousDataRootPaths: [fixture.root]
@@ -386,8 +379,22 @@ test('迁移留下同名库：新根登记旧位置，后续清理previousDataRo
 });
 
 
-test('连续迁移 A→B→C：待合并来源仍指向 A，目标始终只有当前运行库', async (t) => {
+test('连续迁移 A→B→C：待合并和不可读残留仍指向 A，迁入身份不改原来源', async (t) => {
   const fixture = await createFixture(t);
+  const registry = kernelFile('runtimeHistoryRegistry.js');
+  const brokenScope = rootAuthority.resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: ['file:///workspace/broken'] });
+  const brokenRoot = rootAuthority.resolveVscodeWorkspaceRuntimeScopeRoot(fixture.paths, brokenScope);
+  await fs.mkdir(brokenRoot, { recursive: true });
+  await registry.writeRuntimeHistoryResidual(fixture.paths, {
+    id: `workspace:${brokenScope.key}`, sourceKind: 'local', location: { kind: 'local', candidateId: `workspace:${brokenScope.key}` },
+    code: 'runtime-history-source-unreadable', message: '旧来源缺少 RootBinding', checkedAt: NOW
+  });
+  // An older installation may select a previously pending source before this relocation.
+  await registry.writeRuntimeHistoryPending(fixture.paths, {
+    id: 'default', sourceKind: 'local', location: { kind: 'local', candidateId: 'default' },
+    identity: { dataSetId: fixture.current.binding.dataSetId, rootInstanceId: fixture.current.binding.rootInstanceId },
+    registeredAt: NOW, reason: '旧版改选前的待合并登记'
+  });
   const original = await treeSnapshot(path.dirname(fixture.alpha.binding.paths.dataRootPath));
   const b = path.join(fixture.base, 'second-home');
   await relocate(fixture, await planWithRuntime(fixture, b));
@@ -396,9 +403,59 @@ test('连续迁移 A→B→C：待合并来源仍指向 A，目标始终只有�
   assert.deepEqual(plan.problems, []);
   const staged = await stageDataRootRelocation(plan);
   await relocation.completeDataRootRelocation(staged, async () => {});
-  const pending = [...(await kernelFile('runtimeHistoryRegistry.js').readRuntimeHistoryPending({globalStoragePath:c})).values()];
-  assert.equal(pending.length, 1);
-  assert.equal(pending[0].location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
+  const pending = [...(await registry.readRuntimeHistoryPending({globalStoragePath:c})).values()];
+  assert.equal(pending.length, 2);
+  const alpha = pending.find(item => item.identity.dataSetId === fixture.alpha.binding.dataSetId);
+  assert.equal(alpha.location.containerPath, path.dirname(fixture.alpha.binding.paths.dataRootPath));
+  const formerCurrent = pending.find(item => item.identity.dataSetId === fixture.current.binding.dataSetId);
+  assert.equal(formerCurrent.location.containerPath, path.dirname(fixture.current.binding.paths.dataRootPath));
+  assert.equal(formerCurrent.identity.rootInstanceId, fixture.current.binding.rootInstanceId);
+  assert.equal(formerCurrent.location.baseDataRootPath, fixture.root);
+  assert.equal(formerCurrent.location.side, undefined);
+  const residuals = [...(await registry.readRuntimeHistoryResidual({globalStoragePath:c})).values()];
+  assert.equal(residuals.length, 1);
+  assert.equal(residuals[0].location.containerPath, path.join(brokenRoot, '.limcode-runtime'));
+  assert.equal(residuals[0].location.baseDataRootPath, fixture.root);
+  assert.equal(residuals[0].message, '旧来源缺少 RootBinding');
   assert.deepEqual(await treeSnapshot(path.dirname(fixture.alpha.binding.paths.dataRootPath)), original);
   assert.equal((await inspectVscodeRuntimeDataSets({globalStoragePath:c})).candidates.length, 1);
+});
+
+test('重置或迁移登记的合并提交未收敛时，先拒绝迁移；按提交凭据收敛后正常迁移', async (t) => {
+  const { archiveCurrentRuntimeRootForReset } = kernelFile('../application/reliableKernel/VscodeReliableKernelCutoverCoordinator.js');
+  const registry = kernelFile('runtimeHistoryRegistry.js');
+  const ledger = kernelFile('runtimeDataSetMergeLedger.js');
+  const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
+  for (const kind of ['reset', 'migration']) {
+    const fixture = await createFixture(t);
+    const archive = await archiveCurrentRuntimeRootForReset(fixture.alpha.authority, fixture.alpha.scopeRoot, fixture.root);
+    const residual = [...(await registry.readRuntimeHistoryResidual(fixture.paths)).values()].find(item => item.location.containerPath === archive.backupPath);
+    const id = kind === 'reset' ? residual.id : `migration:fixture:${residual.id}`;
+    await registry.writeRuntimeHistoryPending(fixture.paths, {
+      id, sourceKind: kind, location: residual.location,
+      identity: { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId },
+      registeredAt: NOW, reason: '用户明确重新合并'
+    });
+    const runtime = await openRuntime(fixture.current);
+    try {
+      const crashed = await mergeHistoricalDataSetsOnline(fixture.paths,
+        { configurationRootPath: fixture.root, database: runtime }, {
+          candidateIds: [id], requested: true,
+          onFaultPoint(point) { if (point === 'after-row-commit') throw Object.assign(new Error('提交后记录失败'), { code: 'EIO' }); }
+        });
+      assert.deepEqual(crashed.deferred.map(item => item.code), ['EIO']);
+      assert.equal((await ledger.readRuntimeDataSetMergeLedger(fixture.paths)).get(id).state, 'committing');
+    } finally { await runtime.close(); }
+    const target = path.join(fixture.base, 'target');
+    const refused = await planWithRuntime(fixture, target);
+    assert.match(refused.problems.join('\n'), /合并还没有收尾/);
+    const retry = await openRuntime(fixture.current);
+    try {
+      const recovered = await mergeHistoricalDataSetsOnline(fixture.paths,
+        { configurationRootPath: fixture.root, database: retry }, { candidateIds: [id], requested: true });
+      assert.equal(recovered.merged[0].recoveredCommit, true);
+      assert.equal((await ledger.readRuntimeDataSetMergeLedger(fixture.paths)).get(id).state, 'merged');
+    } finally { await retry.close(); }
+    assert.deepEqual((await planWithRuntime(fixture, target)).problems, []);
+  }
 });

@@ -52,7 +52,7 @@ test('复审 #1：计划审批“在新对话中执行”在不合格窗口只�
     // This window does not serve the parent Conversation (its project folder is not open here).
     owners.setClaimEligibilityProbe(async () => false);
     const before = f.requests.length;
-    // VscodeReliableKernelCommandRouter.handleInteractionResolve: resolvePlanReview inside runConversationCommand.
+    // Hold this fixture's owner while proving that an ineligible Host only records the approval.
     const resolved = await owners.run('parent', () => f.app.interactions.resolvePlanReview({
       source: { kind: 'command', key: 'approve-in-ineligible-window' }, requestId: request.id,
       decision: 'accept', response: { executionTarget: 'new_conversation', agentType: f.childAgent.id } }));

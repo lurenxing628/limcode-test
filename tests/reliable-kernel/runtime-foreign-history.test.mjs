@@ -420,6 +420,7 @@ test('每种拒绝原因各一例：未通过的列出位置、大小与原因�
       assert.equal(entry?.status, status, JSON.stringify(entry));
       assert.equal(entry.code, code);
       assert.ok(entry.reason.length > 0);
+      if (code === 'foreign-history-epoch-newer') assert.match(entry.reason, /未发布的开发版本格式/);
       assert.equal(typeof entry.size?.bytes, 'string');
       if (status === 'unavailable') assert.match(entry.reason, /暂时无法核验|关闭后再核验|稍后/);
       // The changing case rewrites the source's time stamp itself; every other case leaves it exactly as it was.

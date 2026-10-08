@@ -20,6 +20,8 @@ const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
 const { writeRuntimeDataSetMergeFinalization } = kernelFile('runtimeDataSetMergeLedger.js');
 const { migratePreviousRuntimeEpochIfRequired } = kernelFile('runtimeEpochMigration.js');
 const { deleteRuntimeBackups, planRuntimeBackupCleanup } = kernelFile('runtimeBackupCleanup.js');
+const claimPrimitives = kernelFile('runtimeClaimPrimitives.js');
+const { openRuntimeDataSetHistory, locateLocalRuntimeDataSet } = kernelFile('runtimeDataSetHistory.js');
 const { runtimeDataRootAdmissionClaimPath, runtimeMaintenanceClaimPath, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const durableDirectorySync = require(path.join(compiled, 'backend/capabilities/filesystem/durableDirectorySync.js'));
 const {
@@ -35,7 +37,7 @@ const MESSAGE_TYPE = 'application/vnd.limcode.message+json';
 const PROJECT = { uri: 'file:///workspace/shared', name: 'shared' };
 const repo = (domain) => kernel.DOMAIN_REPOSITORIES.domain(domain);
 
-test('合并前备份：内容全在当前库的旧备份可删、最新一份保留；删除先改名再删，当前库只经它自己的读取线程查询', async (t) => {
+test('合并前备份：内容全在当前库的旧备份可删、最新一份保留；删除先改名再删，释放失败保留删除结果，当前库只经它自己的读取线程查询', async (t) => {
   const fixture = await createFixture(t);
   await seed(fixture.current, ['conversation_one', 'conversation_two']);
   const database = await openCurrent(t, fixture);
@@ -62,9 +64,22 @@ test('合并前备份：内容全在当前库的旧备份可删、最新一份�
   assert.ok(reader.maxBatch <= 250, '每次最多查 250 个 id');
 
   const renames = [];
-  const result = await deleteRuntimeBackups(plan, reader, [olderItem.key, newestItem.key], {
-    onFaultPoint(point) { renames.push(point); }
-  });
+  const releaseClaim = claimPrimitives.releaseClaimRecord;
+  let releaseFailed = false;
+  claimPrimitives.releaseClaimRecord = async (...args) => {
+    await releaseClaim(...args);
+    if (!releaseFailed && String(args[0]).endsWith('.runtime-maintenance')) {
+      releaseFailed = true;
+      throw new Error('injected maintenance release failure after deletion');
+    }
+  };
+  let result;
+  try {
+    result = await deleteRuntimeBackups(plan, reader, [olderItem.key, newestItem.key], {
+      onFaultPoint(point) { renames.push(point); }
+    });
+  } finally { claimPrimitives.releaseClaimRecord = releaseClaim; }
+  assert.equal(releaseFailed, true);
   assert.deepEqual(result.deleted.map((item) => item.path), [older]);
   assert.deepEqual(result.kept.map((item) => [item.path, item.reason]), [[newest, '不在可以删除的清单里']]);
   assert.deepEqual(renames, ['before-rename', 'after-rename', 'after-verify']);
@@ -1227,13 +1242,21 @@ test('已合并来源：改名后未核对失败恢复原位，已核对后中�
 });
 
 
-test('已合并来源：CAS链接与在线旧窗口都不删除',async t=>{
+test('已合并来源：CAS链接、只读查看与在线旧窗口都不删除',async t=>{
   const linked=await mergedSourceFixture(t);
   const outside=path.join(linked.root,'keep.bin');await fs.writeFile(outside,'keep');
   await fs.symlink(outside,path.join(linked.alpha.binding.paths.casRootPath,'source-link'));
   const plan=await planRuntimeBackupCleanup(linked.root,linked.database);
   assert.equal(plan.items.find(i=>i.key==='merged-source:'+linked.alpha.id).deletable,false);
   assert.equal(await fs.readFile(outside,'utf8'),'keep');
+  const viewed=await mergedSourceFixture(t),viewPlan=await planRuntimeBackupCleanup(viewed.root,viewed.database);
+  const viewedItem=viewPlan.items.find(i=>i.key==='merged-source:'+viewed.alpha.id);
+  const history=await openRuntimeDataSetHistory(viewed.paths,await locateLocalRuntimeDataSet(viewed.paths,viewed.alpha.id));
+  try {
+    assert.equal((await deleteRuntimeBackups(viewPlan,viewed.database,[viewedItem.key])).deleted.length,0);
+    assert.equal((await history.readMessages('merged_source_conversation')).items.length,2);
+  } finally { await history.close(); }
+  assert.equal((await deleteRuntimeBackups(viewPlan,viewed.database,[viewedItem.key])).deleted.length,1);
   const live=await mergedSourceFixture(t),before=await planRuntimeBackupCleanup(live.root,live.database);
   const item=before.items.find(i=>i.key==='merged-source:'+live.alpha.id);
   const host=await kernel.RuntimeDatabase.open(live.alpha.authority,{hostBootId:'old-source-host'});

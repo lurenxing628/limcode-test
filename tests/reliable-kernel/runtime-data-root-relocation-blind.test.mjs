@@ -218,33 +218,54 @@ test('盲审 2 读记录和“已迁走”标记只把不存在当作没有：�
   await assert.rejects(readDataRootMovedNotice(fixture.root), { code: 'EACCES' });
 });
 
-test('盲审 3（exp5）新目录所在的盘写满：完成记录写不进去时就地撤销只删不写，腾出空间；完成记录已在时放弃也不因写不了“撤销中”而停下', async (t) => {
+test('盲审 3（exp5）新目录所在的盘写满：完成记录写不进去时先删除本次新建内容腾出空间，再记录撤销进度；完成记录已在时放弃也不因写不了“撤销中”而停下', async (t) => {
   const fixture = await createFixture(t, { withAlpha: false });
   const target = path.join(fixture.base, 'full-disk');
-  // Armed: the disk fills up at the next record write (the completion record) and stays full.
-  const full = { armed: false, on: false };
+  // The completion write fills the disk; only a successful removal of a nonempty target file
+  // frees space for the durable filesystem undo progress. No write is allowed before that.
+  const full = { armed: false, on: false, refused: 0, freedBytes: 0 };
   const open = fsp.open;
+  const rm = fsp.rm;
   fsp.open = async function (file, flags, ...rest) {
     if (typeof file === 'string' && file.startsWith(target) && typeof flags === 'string' && /[wa]/.test(flags)) {
-      if (full.armed && path.basename(file).startsWith(`${DATA_ROOT_RELOCATION_MARKER_FILE}.`)) full.on = true;
-      if (full.on) throw Object.assign(new Error(`ENOSPC: no space left on device, open '${file}'`), { code: 'ENOSPC' });
+      if (full.armed && path.basename(file).startsWith(`${DATA_ROOT_RELOCATION_MARKER_FILE}.`)) {
+        full.armed = false;
+        full.on = true;
+      }
+      if (full.on) {
+        full.refused += 1;
+        throw Object.assign(new Error(`ENOSPC: no space left on device, open '${file}'`), { code: 'ENOSPC' });
+      }
     }
     return open.call(this, file, flags, ...rest);
   };
-  t.after(() => { fsp.open = open; });
+  fsp.rm = async function (file, ...rest) {
+    const previous = full.on && typeof file === 'string' && file.startsWith(`${target}${path.sep}`)
+      ? await fsp.lstat(file).catch(error => { if (error.code === 'ENOENT') return undefined; throw error; }) : undefined;
+    const result = await rm.call(this, file, ...rest);
+    if (previous?.isFile() && previous.size > 0) {
+      full.freedBytes += previous.size;
+      full.on = false;
+    }
+    return result;
+  };
+  t.after(() => { fsp.open = open; fsp.rm = rm; });
   let staged = await stage(fixture, target);
   full.armed = true;
   const failure = await completeDataRootRelocation(staged, async () => undefined, { pointerUnchanged: async () => true })
     .then(() => assert.fail('应当失败'), (error) => error);
-  assert.ok(full.on, '前提：完成记录写不进去');
+  assert.ok(full.refused > 0, '前提：完成记录写不进去，腾出空间之前后续写入同样失败');
+  assert.ok(full.freedBytes > 0, '实际删除本次新建的非空文件之后才恢复写入');
   Object.assign(full, { armed: false, on: false });
   assert.equal(dataRootRelocationCleanupState(failure), 'cleaned');
   assert.equal(await exists(target), false, '半截数据删掉了，空间腾出来了');
 
   staged = await stage(fixture, target);
   await unconfirmedCompletion(staged);
-  full.on = true;
+  Object.assign(full, { on: true, refused: 0, freedBytes: 0 });
   await abandonStagedDataRootRelocation(staged, { pointerUnchanged: true });
+  assert.ok(full.refused > 0, '前提：开始时写不进“撤销中”');
+  assert.ok(full.freedBytes > 0, '先真实释放空间，再继续记录撤销进度');
   full.on = false;
   assert.equal(await exists(target), false);
 });
@@ -340,21 +361,27 @@ test('盲审 4（exp6）续撤时接收库一时读不出来：这次不撤销�
   };
   t.after(() => { fsp.copyFile = copyFile; });
   // An interrupted staging record (merged, database backup journaled): opening the directory settles it.
-  const staging = await killedInto(t, 'identity-after');
+  const staging = await killedInto(t, 'filesystem-ready');
+  const stagingBefore = await fs.readFile(path.join(staging.target, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8');
   failures = 1;
-  await assert.rejects(settleDataRootRelocationBeforeOpen(staging.target), (error) => error.reason === 'unreadable' && /读不出来/.test(error.message));
+  await assert.rejects(settleDataRootRelocationBeforeOpen(staging.target), (error) => error.reason === 'unreadable'
+    && error.cause?.code === 'data-root-relocation-undo-unreadable'
+    && /EIO: i\/o error, copyfile/.test(error.message));
   assert.equal(failures, 0, '前提：核对时确实读了接收库');
   const record = await markerOf(staging.target);
   assert.equal(record.state, 'staging', '记录不变');
   assert.equal(record.held, undefined, '读不出来不是“有人写过”');
+  assert.equal(await fs.readFile(path.join(staging.target, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'), stagingBefore, '核对失败没有重写迁移记录');
   assert.deepEqual(await settleDataRootRelocationBeforeOpen(staging.target), { undone: true });
   assert.deepEqual(conversationIds((await selectedDataSet(staging.target)).runtimeDataRootPath), ['conversation_existing_1']);
   // A completion never switched to: the relocating installation's next start undoes it.
   const complete = await killedInto(t, 'complete-marker-after');
+  const completeBefore = await fs.readFile(path.join(complete.target, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8');
   failures = 1;
   const input = { targetRootPath: complete.target, relocationId: complete.relocationId };
   assert.equal(await recoverInterruptedDataRootRelocation(input), 'unreadable');
   assert.equal((await markerOf(complete.target)).state, 'complete');
+  assert.equal(await fs.readFile(path.join(complete.target, DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'), completeBefore, '完成记录同样原样保留');
   assert.equal(await recoverInterruptedDataRootRelocation(input), 'recovered');
   assert.deepEqual(conversationIds((await selectedDataSet(complete.target)).runtimeDataRootPath), ['conversation_existing_1']);
 });
@@ -411,7 +438,7 @@ test('盲审 6（exp7）顶层的规则与技能是符号链接：预检列入�
 
 for (const caller of ['abandon', 'recover', 'settle']) {
   test(`盲审 8 ${caller}：新目录的库开着真实 Runtime（在线窗口）时不还原数据库：拒绝，数据库文件没有被替换；窗口关闭后照常撤销`, async (t) => {
-    const { target, relocationId } = await killedInto(t, 'identity-after');
+    const { target, relocationId } = await killedInto(t, 'filesystem-ready');
     const attempt = () => caller === 'abandon' ? abandonStagedDataRootRelocation({ plan: { targetRootPath: target }, relocationId })
       : caller === 'recover' ? recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId })
         : settleDataRootRelocationBeforeOpen(target);

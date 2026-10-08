@@ -24,6 +24,7 @@ import {
 } from '@webview/domain/reliableTransientActivity';
 import { modelRequestRetryForTurn, projectReliableTurnTermination } from '@webview/domain/reliableConversationProjection';
 import { modelRequestStreamStats } from '@webview/reliability/modelRequestStreamStats';
+import { turnInputEchoContent, turnInputEchoMessage } from '@webview/domain/reliableTurnInputSubmission';
 import { collaborationCardPlacementLabel, projectCollaborationTimeline } from '@webview/domain/reliableCollaborationTimeline';
 import MessageItem from './MessageItem.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
@@ -34,6 +35,7 @@ import ReliableCompressionWarningRow from './ReliableCompressionWarningRow.vue';
 import TimelineActivityRow from './TimelineActivityRow.vue';
 import {
   TIMELINE_MOUNT_LIMIT,
+  PENDING_TIMELINE_MOUNT_LIMIT,
   TIMELINE_SEGMENT_STEP,
   absoluteTimelineFloor,
   clampTimelineSegmentStart,
@@ -72,7 +74,9 @@ const {
   openForkReadyNotice,
   dismissForkReadyNotice,
   forkPendingTargetIds,
-  currentAuthoritySelection
+  currentAuthoritySelection,
+  currentTurnInputEchoes,
+  retryTurnInputSubmission
 } = useChat();
 const historyDismissSelection = shallowRef<NonNullable<typeof unconfirmedHistoryCommands.value>>();
 function confirmHistoryDismiss(): void {
@@ -87,6 +91,14 @@ const globalSettings = useGlobalSettingsStore();
 const modelProfiles = useModelProfileStore();
 const timelinePresentation = useReliableTimelinePresentationStore();
 const messages = computed(() => projection.value.messages);
+const submissionEchoByMessageId = computed(() => Object.fromEntries(currentTurnInputEchoes.value.flatMap((echo) =>
+  echo.displayTarget ? [[echo.displayTarget.messageId, echo] as const] : [])));
+const unlocatedSubmissionEchoes = computed(() => currentTurnInputEchoes.value
+  .filter((echo) => !echo.displayTarget).slice(-PENDING_TIMELINE_MOUNT_LIMIT));
+function displayedMessage(message: MessageRecord): MessageRecord {
+  const echo = submissionEchoByMessageId.value[message.id];
+  return echo ? { ...message, content: turnInputEchoContent(echo) } : message;
+}
 const mountedTransientRequestIds = computed(() => new Set(messages.value.flatMap((message) =>
   message.id.startsWith('transient:')
     ? [message.id.slice('transient:'.length)]
@@ -705,6 +717,7 @@ function messageDetailReady(message: MessageRecord): boolean {
 }
 
 function messageDetailLoading(message: MessageRecord): boolean {
+  if (submissionEchoByMessageId.value[message.id]) return false;
   if (message.content.parts.length > 0) return false;
   const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
   if (!revisionId) return false;
@@ -810,7 +823,7 @@ function messageRenderKey(message: MessageRecord): string {
           {{ retryBoundaryLabel }}
         </p>
         <MessageItem
-          :message="row.message"
+          :message="displayedMessage(row.message)"
           :run-id="projection.turnIdByMessageId[row.message.id]"
           :termination="messageTermination(row.message)"
           :termination-notice-suppressed="isMessageTerminationSuppressed(row.message)"
@@ -819,12 +832,12 @@ function messageRenderKey(message: MessageRecord): string {
           :compact-count="Math.max(1, timelineFloor(row.message))"
           :detail-loading="messageDetailLoading(row.message)"
           :detail-ready="messageDetailReady(row.message)"
-          :mutation-pending="conversationActionPending && isConversationActionTarget(row.message)"
-          :mutation-blocked="(conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
-          :retry-blocked="retryBlocked(row.message)"
-          :compact-blocked="(conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
-          :fork-blocked="forkBlocked(row.message)"
-          :pending-label="conversationActionLabel ?? '正在提交操作'"
+          :mutation-pending="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message))"
+          :mutation-blocked="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
+          :retry-blocked="!!submissionEchoByMessageId[row.message.id] || retryBlocked(row.message)"
+          :compact-blocked="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
+          :fork-blocked="!!submissionEchoByMessageId[row.message.id] || forkBlocked(row.message)"
+          :pending-label="submissionEchoByMessageId[row.message.id]?.label ?? conversationActionLabel ?? '正在提交操作'"
           :floor-number="timelineFloor(row.message)"
           @edit-message="emit('edit-message', row.message, deleteCount(row.message))"
           @resend-as-new="emit('resend-as-new', row.message)"
@@ -882,6 +895,16 @@ function messageRenderKey(message: MessageRecord): string {
       {{ retryBoundaryLabel }}
     </p>
     <template v-if="!hasLaterSegment">
+      <div v-for="echo in unlocatedSubmissionEchoes" :key="echo.submission.commandId"
+        class="reliable-message-row" :data-pending-command-id="echo.submission.commandId">
+        <MessageItem :message="turnInputEchoMessage(echo)" :mutation-pending="true"
+          :mutation-blocked="true" :retry-blocked="true" :compact-blocked="true" :fork-blocked="true"
+          :detail-ready="false" :pending-label="echo.label" />
+        <p v-if="!echo.submission.result && (echo.submission.automaticRetryCount ?? 0) > 0"
+          class="reliable-action-notice">
+          <button type="button" @click="retryTurnInputSubmission(echo.submission.commandId)">重试确认消息</button>
+        </p>
+      </div>
       <ReliableCompressionWarningRow v-for="warning in unanchoredCompressionWarnings"
         :key="warning.id" :title="warning.title" :detail="warning.detail"
         @dismiss="dismissCompressionWarning(warning)" />
@@ -919,7 +942,7 @@ function messageRenderKey(message: MessageRecord): string {
       <button type="button" @click="openForkReadyNotice">打开分支</button>
       <button type="button" aria-label="关闭分支提示" @click="dismissForkReadyNotice">关闭</button>
     </p>
-    <div v-if="messages.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard && unanchoredTerminationRows.length === 0 && unanchoredCompressionWarnings.length === 0" class="reliable-message-empty-container">
+    <div v-if="messages.length === 0 && unlocatedSubmissionEchoes.length === 0 && !hasCollaborationCards && !activityLabel && !activeCompressionCard && unanchoredTerminationRows.length === 0 && unanchoredCompressionWarnings.length === 0" class="reliable-message-empty-container">
       <p class="reliable-message-empty">
         {{ feed.collaborationHistoryLoading ? '正在查找协作记录…'
           : feed.collaborationHistoryScanProgress ? '本页未找到协作记录，可继续查找更早记录。' : emptyHint }}

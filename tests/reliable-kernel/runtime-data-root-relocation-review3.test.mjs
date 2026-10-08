@@ -56,7 +56,7 @@ async function writeMeanwhile(target) {
 
 const markerOf = async (target) => JSON.parse(await fs.readFile(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE), 'utf8'));
 
-for (const scenario of ['identity-after', 'undo-db-restored@identity-after', 'undo-marked@complete-marker-after']) {
+for (const scenario of ['identity-after', 'undo-db-restored@filesystem-ready', 'undo-marked@complete-marker-after']) {
   test(`问题 1 ${scenario}：迁移中断后另一个安装在撤销之前打开新目录写了对话，之后的续撤不覆盖它：撤销被搁置、什么都不动，并写明迁移前备份在哪`, async (t) => {
     const { target, relocationId } = await crashedInto(t, scenario);
     const settingsBefore = await fs.readFile(path.join(target, 'settings', 'llm.json'), 'utf8');
@@ -91,8 +91,71 @@ for (const scenario of ['identity-after', 'undo-db-restored@identity-after', 'un
   });
 }
 
+for (const change of [
+  { label: '已替换的全局规则被修改', relative: ['AGENTS.md'], content: '# user rules after the crash\n' },
+  { label: '新建技能子树的深层文件被修改', relative: ['skills', 'source-only', 'references', 'nested', 'details.md'], content: 'user nested skill reference after the crash\n' },
+  { label: '新建技能目录里增加用户文件', relative: ['skills', 'source-only', 'references', 'nested', 'user-note.txt'], content: 'user file created after the crash\n' }
+]) {
+  test(`P1 文件撤销保护：${change.label}，真实 SIGKILL 后恢复应搁置并保留全部内容`, async (t) => {
+    const { base, root, target, relocationId } = await crashedInto(t, 'filesystem-before-publish');
+    assert.equal((await markerOf(target)).state, 'complete', '完成记录已落地，指针还没发布');
+    const pointer = JSON.parse(await fs.readFile(path.join(base, 'pointer.json'), 'utf8'));
+    assert.equal(pointer.dataRootPath, root);
+    assert.equal(pointer.pendingRelocation.relocationId, relocationId);
+    assert.equal(relocation.dataRootRelocationOwnerState((await markerOf(target)).owner), 'dead', '真实被杀的进程已退出');
+    const selected = await selectedDataSet(target);
+    const conversationsBefore = conversationIds(selected.runtimeDataRootPath);
+    const changed = path.join(target, ...change.relative);
+    await fs.writeFile(changed, change.content);
+    const tracked = [
+      path.join(target, 'AGENTS.md'),
+      path.join(target, 'settings', 'llm.json'),
+      path.join(target, 'skills', 'shared', 'SKILL.md'),
+      path.join(target, 'skills', 'source-only', 'references', 'nested', 'details.md'),
+      changed
+    ];
+    const expected = new Map(await Promise.all(tracked.map(async file => [file, await fs.readFile(file, 'utf8')])));
+
+    assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
+    assert.equal((await markerOf(target)).state, 'held');
+    assert.deepEqual(conversationIds(selected.runtimeDataRootPath), conversationsBefore, '文件变化拒绝整次撤销，接收库也不能还原');
+    for (const [file, content] of expected) assert.equal(await fs.readFile(file, 'utf8'), content, `搁置时保留 ${path.relative(target, file)}`);
+    assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held', '下一次启动也不再撤销');
+    assert.equal(await fs.readFile(changed, 'utf8'), change.content);
+    assert.equal((await readDataRootRelocationHold(target)).relocationId, relocationId);
+  });
+}
+
+test('P1 文件撤销保护：一次恢复已耗尽配置备份后再次中断，用户改了已恢复文件，续撤不能跳过核对', async (t) => {
+  const { target, relocationId } = await crashedInto(t, 'undo-restored@filesystem-before-publish');
+  const work = path.join(target, relocation.DATA_ROOT_RELOCATION_BACKUPS_DIRECTORY, relocationId);
+  const entries = (await fs.readFile(path.join(work, 'journal.jsonl'), 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+  let restored;
+  for (const entry of entries) {
+    if (entry.op === 'filesystem' && entry.backup && !await fs.stat(path.join(work, entry.backup)).then(() => true, () => false)) restored = entry;
+  }
+  assert.ok(restored, '真实恢复已消耗了一份配置备份');
+  const file = path.join(target, restored.path);
+  const edited = 'user changed the restored file after the second crash\n';
+  await fs.writeFile(file, edited);
+  const selected = await selectedDataSet(target);
+  const conversationsBefore = conversationIds(selected.runtimeDataRootPath);
+  assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
+  assert.equal(await fs.readFile(file, 'utf8'), edited);
+  assert.deepEqual(conversationIds(selected.runtimeDataRootPath), conversationsBefore);
+});
+
+test('P1 文件撤销保护：数据库已恢复但配置还未恢复时再次中断，用户删除配置不能被当成自身撤销', async (t) => {
+  const { target, relocationId } = await crashedInto(t, 'undo-db-restored@filesystem-before-publish');
+  const file = path.join(target, 'AGENTS.md');
+  await fs.rm(file);
+  assert.equal(await recoverInterruptedDataRootRelocation({ targetRootPath: target, relocationId }), 'held');
+  await assert.rejects(fs.stat(file), { code: 'ENOENT' });
+});
+
 test('问题 1 打开目录时（准入内）：发起进程已结束的中断迁移先撤销完再打开，之后写入的内容不再被任何续撤影响', async (t) => {
-  const { target, relocationId } = await crashedInto(t, 'identity-after');
+  const { target, relocationId } = await crashedInto(t, 'filesystem-ready');
+  assert.equal((await markerOf(target)).state, 'staging', '写后状态已落盘，完成记录还没发布');
   assert.equal((await inspectDataRootForReturn(target)).usable, true, '进程已结束：打开时会先撤销，可以切换过去');
   assert.deepEqual(await settleDataRootRelocationBeforeOpen(target), { undone: true });
   await assert.rejects(fs.stat(path.join(target, relocation.DATA_ROOT_RELOCATION_MARKER_FILE)), { code: 'ENOENT' });

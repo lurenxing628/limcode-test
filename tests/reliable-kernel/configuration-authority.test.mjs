@@ -21,7 +21,9 @@ const {
   normalizeLlmProviderConfig
 } = require('../../dist/extension/backend/capabilities/vscodeStorage/llmProviderConfigs.js');
 const { loadRecordStore } = require('../../dist/extension/backend/capabilities/vscodeStorage/recordStore.js');
+const { createRulesCatalogCapability, readRuleFiles } = require('../../dist/extension/backend/capabilities/rulesCatalog.js');
 const { VscodeConfigurationAuthority } = require('../../dist/extension/backend/reliableKernel/vscodeConfigurationAuthority.js');
+const { DEFAULT_RUNTIME_CONTEXT_TEMPLATE, PROMPT_PLACEHOLDERS } = require('../../dist/extension/shared/promptTemplateCatalog.js');
 const { frozenCompressionPolicy, frozenInteractionAutoApproval } = require('../../dist/extension/backend/reliableKernel/frozenAuthority.js');
 const {
   createDefaultLlmCompressionConfig,
@@ -57,6 +59,139 @@ test('全局内置提示词只在没有自定义记录时生效，清除后恢�
     await authority.mutations.clearSystemPrompt('global');
     assert.equal(await compiledPrompt(), defaultPrompt, '清除自定义后回到只读内置模板');
   } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('初始上下文默认模板进入可靠内核，保留自定义和显式空模板，清除后恢复且不写默认记录', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-default-runtime-context-'));
+  try {
+    const paths = createVscodeStoragePaths(vscode.Uri.file(root));
+    const authority = new VscodeConfigurationAuthority(() => paths);
+    const provider = { ...createDefaultLlmProviderConfig({ name: 'Context fixture' }), id: 'context-provider', model: 'o3',
+      models: [{ id: 'o3', name: 'o3' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    const compile = async () => JSON.parse((await authority.compile({ conversationId: 'context-conversation',
+      turnId: 'context-turn', executorAgentId: 'main', intentKind: 'input' })).authoritySnapshot.content).runtimeContext;
+    const initial = await compile();
+    assert.equal(initial.template, DEFAULT_RUNTIME_CONTEXT_TEMPLATE);
+    assert.equal(initial.renderedTemplateText, initial.text);
+    assert.match(initial.text, /Initial time: \d{4}-\d{2}-\d{2}T/);
+    assert.match(initial.text, new RegExp(`Platform: ${process.platform}`));
+    assert.doesNotMatch(initial.text, /\{\{\$/);
+    const client = await authority.configurationClientState();
+    assert.deepEqual(client.promptPlaceholders, PROMPT_PLACEHOLDERS);
+    assert.deepEqual(client.runtimeContexts, []);
+    await assert.rejects(fs.stat(paths.runtimeContextsRootUri.fsPath), { code: 'ENOENT' }, '读默认模板不创建用户配置');
+    await authority.mutations.setRuntimeContext({ scopeKind: 'global', template: 'ONLY MY TEMPLATE' });
+    assert.equal((await compile()).template, 'ONLY MY TEMPLATE');
+    assert.doesNotMatch((await compile()).text, /Runtime Background/);
+    await authority.mutations.setRuntimeContext({ scopeKind: 'global', template: '' });
+    assert.equal((await compile()).template, '', '显式空模板不自动恢复默认');
+    assert.equal((await authority.configurationClientState()).runtimeContexts[0].template, '');
+    await authority.mutations.clearRuntimeContext('global');
+    assert.equal((await compile()).template, DEFAULT_RUNTIME_CONTEXT_TEMPLATE);
+  } finally { await fs.rm(root, { recursive: true, force: true }); }
+});
+
+test('规则读取本地文件不等待 VS Code RPC，目录与 Turn 都读取最新规则且保留各自项目来源', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-local-rules-'));
+  const originalRead = vscode.workspace.fs.readFile;
+  const originalFolders = vscode.workspace.workspaceFolders;
+  try {
+    const first = path.join(root, 'first');
+    const bound = path.join(root, 'bound');
+    await Promise.all([fs.mkdir(first), fs.mkdir(bound)]);
+    await Promise.all([
+      fs.writeFile(path.join(root, 'AGENTS.md'), 'GLOBAL-A'),
+      fs.writeFile(path.join(first, 'AGENTS.md'), 'FIRST-A'),
+      fs.writeFile(path.join(bound, 'AGENTS.md'), 'BOUND-A {{$agent.name}}'),
+      fs.writeFile(path.join(bound, 'CLAUDE.md'), 'BOUND-C')
+    ]);
+    const folders = [first, bound].map((folder, index) => ({
+      uri: vscode.Uri.file(folder).toString(), rootPath: folder, name: path.basename(folder), index
+    }));
+    vscode.workspace.workspaceFolders = [{ uri: vscode.Uri.file(first) }];
+    const globalStorageUri = vscode.Uri.file(root);
+    globalStorageUri.scheme = 'vscode-userdata';
+    const context = { globalStorageUri, globalState: { get: () => undefined } };
+    const authority = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(context.globalStorageUri), context, folders);
+    const provider = { ...createDefaultLlmProviderConfig(), id: 'rules-provider', model: 'o3',
+      models: [{ id: 'o3', name: 'o3' }], modelConfigs: [] };
+    await saveLatestGlobalSettings(authority, 'llmProviderConfigs', { configs: [provider] });
+    await saveLatestGlobalSettings(authority, 'llm', { activeProviderConfigId: provider.id });
+    let rpcReads = 0;
+    vscode.workspace.fs.readFile = async () => { rpcReads++; throw new Error('renderer unavailable'); };
+    const catalog = createRulesCatalogCapability(context);
+    await catalog.refresh();
+    assert.deepEqual(catalog.list().map(record => [record.scope, record.kind, record.exists, record.content]), [
+      ['global', 'AGENTS', true, 'GLOBAL-A'], ['global', 'CLAUDE', false, ''],
+      ['project', 'AGENTS', true, 'FIRST-A'], ['project', 'CLAUDE', false, '']
+    ]);
+    assert.equal(catalog.list()[2].workspaceFolderUri, folders[0].uri);
+    const compile = async (turnId, initialRuntimeContext) => {
+      const runtimeContext = JSON.parse((await authority.compile({
+        conversationId: 'rules-conversation', turnId, executorAgentId: 'main', intentKind: 'input',
+        workspace: { uri: folders[1].uri, name: 'Bound' },
+        ...(initialRuntimeContext ? { initialRuntimeContext } : {})
+      })).authoritySnapshot.content).runtimeContext;
+      return runtimeContext;
+    };
+    const frozen = await compile('rules-first');
+    assert.equal(frozen.text.slice(frozen.text.indexOf('[全局规则 (AGENTS.md)]')), '[全局规则 (AGENTS.md)]\nGLOBAL-A\n\n[项目规则 (AGENTS.md)]\nBOUND-A {{$agent.name}}\n\n[项目规则 (CLAUDE.md)]\nBOUND-C');
+    await Promise.all([
+      fs.writeFile(path.join(root, 'AGENTS.md'), 'GLOBAL-EDIT'),
+      fs.writeFile(path.join(root, 'CLAUDE.md'), 'GLOBAL-C')
+    ]);
+    await authority.mutations.setRuntimeContext({ scopeKind: 'global', template: '' });
+    const next = await compile('rules-next', { id: frozen.id, name: frozen.name, template: frozen.template, text: frozen.renderedTemplateText });
+    assert.equal(next.renderedTemplateText, frozen.renderedTemplateText, '后续 Turn 不重渲染时间，也不采用后来清空的模板');
+    assert.equal(next.text.slice(next.text.indexOf('[全局规则 (AGENTS.md)]')), '[全局规则 (AGENTS.md)]\nGLOBAL-EDIT\n\n[全局规则 (CLAUDE.md)]\nGLOBAL-C\n\n[项目规则 (AGENTS.md)]\nBOUND-A {{$agent.name}}\n\n[项目规则 (CLAUDE.md)]\nBOUND-C');
+    assert.equal(next.text.match(/\[全局规则 \(AGENTS.md\)\]/g).length, 1, '规则不从初始模板重复注入');
+    const empty = await compile('rules-new-conversation');
+    assert.equal(empty.renderedTemplateText, '', '未生成初始事实的新对话采用当前显式空模板');
+    await catalog.refresh();
+    assert.equal(catalog.list()[0].content, 'GLOBAL-EDIT');
+    assert.equal(catalog.list()[1].content, 'GLOBAL-C');
+    assert.equal(rpcReads, 0, '本地规则读取与缺失文件都不能进入 renderer RPC');
+  } finally {
+    vscode.workspace.fs.readFile = originalRead;
+    vscode.workspace.workspaceFolders = originalFolders;
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('规则读取非本地 provider 并行启动四份读取，乱序完成仍保序且后续读取保持新鲜', async () => {
+  const originalRead = vscode.workspace.fs.readFile;
+  const pending = [];
+  let reading;
+  try {
+    const roots = [
+      { scope: 'global', rootUri: vscode.Uri.parse('rules-provider:///global') },
+      { scope: 'project', rootUri: vscode.Uri.parse('rules-provider:///project') }
+    ];
+    vscode.workspace.fs.readFile = uri => new Promise(resolve => { pending.push({ uri, resolve }); });
+    reading = readRuleFiles(roots);
+    await Promise.resolve();
+    assert.equal(pending.length, 4, '任意一个 provider 返回前，四份规则都必须已开始读取');
+    assert.ok(pending.every(({ uri }) => uri.scheme === 'rules-provider'));
+    for (const { uri, resolve } of [...pending].reverse()) resolve(Buffer.from(uri.path));
+    const records = await reading;
+    assert.deepEqual(records.map(record => [record.id, record.editable, record.content]), [
+      ['rule:global:AGENTS', true, '/global/AGENTS.md'],
+      ['rule:global:CLAUDE', false, '/global/CLAUDE.md'],
+      ['rule:project:AGENTS', true, '/project/AGENTS.md'],
+      ['rule:project:CLAUDE', false, '/project/CLAUDE.md']
+    ]);
+    let rereads = 0;
+    vscode.workspace.fs.readFile = async uri => { rereads++; return Buffer.from(`updated:${uri.path}`); };
+    const updated = await readRuleFiles(roots);
+    assert.equal(rereads, 4);
+    assert.ok(updated.every(record => record.exists && record.content.startsWith('updated:')));
+  } finally {
+    vscode.workspace.fs.readFile = originalRead;
+    for (const { resolve } of pending) resolve(Buffer.from(''));
+    await reading;
+  }
 });
 
 test('渠道、压缩与 MCP 目录保存只修改选中记录，重复保存保持文件和 revision', async () => {
@@ -542,7 +677,7 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
     assert.equal(forkFrozen.model.modelId, 'model:test');
     assert.equal(forkFrozen.planReviewPolicy.mode, 'before_mutation');
     assert.match(forkFrozen.systemPrompt.text, /\[对话规则\]\nCONVERSATION$/);
-    assert.equal(forkFrozen.runtimeContext.template, 'ENV:\n{{$workEnvironment.current}}');
+    assert.equal(forkFrozen.runtimeContext.template, `${DEFAULT_RUNTIME_CONTEXT_TEMPLATE}\n\nENV:\n{{$workEnvironment.current}}`);
     assert.equal(forkPreset.defaultWorkEnvironmentId, workEnvironmentId);
 
     await authority.mutations.setModelProfile({
@@ -589,7 +724,7 @@ test('VscodeConfigurationAuthority 独立持久化配置记录/Link，并按 Run
       frozen.systemPrompt.text,
       '[全局规则]\nGLOBAL\n\n[Agent 规则]\nAGENT\n\n[工作流规则]\nWORKFLOW\n\n[对话规则]\nCONVERSATION'
     );
-    assert.equal(frozen.runtimeContext.template, 'ENV:\n{{$workEnvironment.current}}');
+    assert.equal(frozen.runtimeContext.template, `${DEFAULT_RUNTIME_CONTEXT_TEMPLATE}\n\nENV:\n{{$workEnvironment.current}}`);
     assert.match(frozen.runtimeContext.text, /Workspace · 本地/);
     assert.doesNotMatch(frozen.runtimeContext.text, /work-env-/);
     assert.equal(frozen.workEnvironmentPolicy.enabled, true);
@@ -1608,8 +1743,22 @@ function createVscodeStub() {
       this.path = this.fsPath.split(path.sep).join('/');
     }
     static file(filePath) { return new Uri(filePath); }
-    static joinPath(base, ...segments) { return new Uri(path.join(base.fsPath, ...segments)); }
-    toString() { return `file://${this.path}`; }
+    static parse(value) {
+      if (value.startsWith('file://')) return new Uri(decodeURIComponent(value.slice('file://'.length)));
+      const parsed = new URL(value);
+      const uri = new Uri(decodeURIComponent(parsed.pathname));
+      uri.scheme = parsed.protocol.slice(0, -1);
+      uri.path = decodeURIComponent(parsed.pathname);
+      uri.fsPath = uri.path;
+      return uri;
+    }
+    static joinPath(base, ...segments) {
+      const uri = new Uri(path.join(base.fsPath, ...segments));
+      uri.scheme = base.scheme;
+      if (base.scheme !== 'file') uri.fsPath = uri.path = path.posix.join(base.path, ...segments);
+      return uri;
+    }
+    toString() { return `${this.scheme}://${this.path}`; }
   }
   return {
     Uri,
