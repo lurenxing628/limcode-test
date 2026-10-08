@@ -33,7 +33,7 @@
 
 迁移复制的其它库不再写用户保留标记，而在新配置根登记 pending；留在旧目录的来源同样登记其可读位置。迁移日志携带 pending、residual、settlement-consent 与 convergence 记录。旧目录还含本地库或新重置备份时保留，不能因其它内容已迁走就整目录删除。
 
-`runtimeHistoryRegistry.ts` 在配置根维护无期限 pending 与 residual，收敛登记去重记录在 convergence.json。`partial` 不是 `merged`：必须保留每个剔除对话的 conversationId、title、code、count，committing 与 lastMerged 同样携带；mergedInto 只登记实际插入的对话。`partial`、pending 与 residual 的外来来源受备份清理保护；删除非当前本地库须有合并到当前目标的 merged 记录、确切缓存文件状态与身份均未变化、且不存在 residual，否则拒绝。残留列表只读展示（部分合并仅展示剔除对话），重新核验将来源重新登记待合并。
+`runtimeHistoryRegistry.ts` 在配置根维护无期限 pending 与 residual，收敛登记去重记录在 convergence.json。`partial` 不是 `merged`：必须保留每个剔除对话的 conversationId、title、code、count，committing 与 lastMerged 同样携带；mergedInto 只登记实际插入的对话。`partial`、pending 与 residual 的外来来源受备份清理保护；删除非当前本地库须有合并到当前目标的 merged 记录、确切缓存文件状态与身份均未变化、且不存在 residual，否则须明确选择覆盖核验路径。覆盖核验复用备份清理的当前库覆盖证明，连同来源嵌套备份一起核对；有未完成工作、缺对话/版本/正文、可见消息被编辑删除或替换均拒绝，partial/residual 始终拒绝删除。残留列表只读展示（部分合并仅展示剔除对话），重新核验将来源重新登记待合并。
 
 ### 历史残留的删除、检查与修复
 
