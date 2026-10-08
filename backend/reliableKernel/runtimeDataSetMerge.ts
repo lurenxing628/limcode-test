@@ -1652,7 +1652,7 @@ async function mergeSource(
     state.workPresent = mode.finalizeWork && (taken.audit.unfinishedWork!.refused.length > 0 || hasFinalizableWork(taken.audit.unfinishedWork!));
     const limits = options.limits ?? RUNTIME_DATA_SET_ONLINE_MERGE_LIMITS;
     stopIfAsked();
-    let plan = mode.migration ? await planRows(taken.snapshot.database, target.database, await skippedSourceRows(taken.snapshot.database, target, merged))
+    let plan = mode.migration ? await planRows(taken.snapshot.database, target.database, await skippedSourceRows(taken.snapshot.database, target, merged, state))
       : await planSource(taken.snapshot.database, target, merged, state);
     if (mode.finalizeWork) {
       work = inspectUnfinishedWork(taken.snapshot.database, exclusionSkippedTables(taken.snapshot.database, state));
@@ -3060,9 +3060,12 @@ async function keptUnfinishedWork(
 async function skippedSourceRows(
   source: Database.Database,
   target: TargetContext,
-  merged: readonly string[]
+  merged: readonly string[],
+  state: SourceProgress
 ): Promise<Map<string, Set<string>> | undefined> {
   const deleted = merged.length > 0 ? await deletedSinceMerge(source, target.database, merged) : undefined;
+  state.skippedConversations = deleted?.count ?? 0;
+  state.skippedConversationIds = deleted ? [...deleted.conversations].sort() : [];
   return deleted && skippedRows(source, deleted.conversations);
 }
 
@@ -3392,9 +3395,12 @@ async function planRows(
     if (provenance) await planDomain(provenance);
     if (plan.conflicts.count === 0 || collecting) {
       if (collecting) await exclusions!.finish(READ_CHUNK);
-      await aggregates.validate(undefined, collecting ? (domain, id) => {
+      await aggregates.validate(undefined, collecting ? (domain, id, error) => {
         const schema = RUNTIME_DOMAIN_SCHEMAS.find(entry => entry.key === domain)!;
-        const raw = source.prepare(`SELECT * FROM "${schema.table}" WHERE id=?`).get(id) as Record<string,unknown>;
+        const raw = source.prepare(`SELECT * FROM "${schema.table}" WHERE id=?`).get(id) as Record<string,unknown> | undefined;
+        // A missing aggregate parent has no row from which to prove its conversation owner.
+        // Keep the original deterministic invariant refusal instead of treating it as I/O.
+        if (!raw) throw error;
         exclusions!.exclude(domain, raw, 'runtime-data-set-merge-invariant');
       } : undefined);
       if (collecting && exclusions?.hasProblems()) return plan;

@@ -160,23 +160,31 @@ test('终态进程同时核对结果和退出元组：有效历史放行，矛�
   }
 });
 
-test('矛盾的退出结果整份拒绝合并，不能当作历史导入或猜测修复，两边记录不变', async (t) => {
+test('矛盾退出结果只剔除所属对话，其余历史合并且来源不被猜测修复', async (t) => {
   const f = await fixture(t);
   rawWrite(f.alpha, (db) => {
     unknownProcess(db, { status: 'exited' });
     db.prepare("UPDATE process_receipt SET outcome = 'succeeded', exit_code = 1 WHERE id = 'old_receipt'").run();
   });
-  const before = { source: readAll(f.alpha), target: readAll(f.current) };
+  const before = readAll(f.alpha);
   await withRuntime(f.current, async (db) => {
     const report = await mergeHistoricalDataSetsOnline(f.paths, { configurationRootPath: f.root, database: db }, {
       candidateIds: [f.alpha.id], requested: true
     });
-    assert.deepEqual(report.merged, []);
-    assert.deepEqual(report.blocked.map((issue) => issue.code), ['runtime-data-set-merge-unfinished-work']);
-    assert.deepEqual(report.deferred, []);
+    assert.deepEqual([report.blocked, report.failures, report.deferred], [[], [], []]);
+    assert.equal(report.merged.length, 1);
+    assert.deepEqual(report.merged[0].excluded.map(item => item.conversationId), ['kept']);
+    assert.equal(report.merged[0].insertedConversations, 1);
   });
-  assert.deepEqual(readAll(f.alpha), before.source);
-  assert.deepEqual(readAll(f.current), before.target);
+  assert.deepEqual(readAll(f.alpha), before);
+  read(f.current, db => {
+    assert.equal(db.prepare("SELECT COUNT(*) FROM conversation WHERE id='kept'").pluck().get(), 0n);
+    assert.equal(db.prepare("SELECT COUNT(*) FROM conversation WHERE id='deleted'").pluck().get(), 1n);
+    assert.equal(db.prepare('SELECT COUNT(*) FROM process').pluck().get(), 0n);
+    assert.deepEqual(db.pragma('foreign_key_check'), []);
+  });
+  const record = (await kernelFile('runtimeDataSetMergeLedger.js').readRuntimeDataSetMergeLedger(f.paths)).get(f.alpha.id);
+  assert.equal(record.state, 'partial');
 });
 
 test('进程观察不能把矛盾回执当作退出，单个及批量 spool 清理均保留结束证据', async (t) => {
