@@ -10,7 +10,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import test from 'node:test';
 import {
-  compiled, createFixture, deleteAsConfirmed, initialize, kernelFile, planWithRuntime, relocate, RootAuthority
+  compiled, createFixture, deleteAsConfirmed, initialize, kernelFile, planWithRuntime, relocate, RootAuthority, withRuntime
 } from './runtime-data-root-relocation-fixture.mjs';
 
 const require = createRequire(import.meta.url);
@@ -74,7 +74,7 @@ test('foreign-archive-only-relocation：删掉本地库、只剩归档的工作�
   const fixture = await createFixture(t);
   const alpha = fixture.alpha;
   const { backupPath, fresh } = await archiveAndReset(fixture, alpha);
-  await deleteUnselectedRuntimeDataSet(fixture.paths, alpha.id, fresh.binding.dataSetId);
+  await withRuntime(fixture.current, current => deleteUnselectedRuntimeDataSet(fixture.paths, alpha.id, fresh.binding.dataSetId, { coveredByCurrent: current }));
   assert.deepEqual(await fs.readdir(alpha.scopeRoot), ['.limcode-runtime-backups'], '这个工作区只剩它的归档');
   const inspection = await inspectVscodeRuntimeDataSets(fixture.paths);
   assert.deepEqual(inspection.problems, []);

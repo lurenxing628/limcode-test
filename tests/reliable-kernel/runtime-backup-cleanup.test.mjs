@@ -257,7 +257,7 @@ test('合并来源的收尾前备份：真实收尾留下的可删；被未报�
   await seed(fixture.alpha, ['conversation_alpha_one', 'conversation_alpha_two']);
   await seedActiveTurn(fixture.alpha, 'conversation_alpha_one');
   const database = await openCurrent(t, fixture);
-  const report = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database });
+  const report = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database }, { confirmSettlement: async () => true });
   assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
   const sourceBackup = report.merged[0].finalized.sourceBackupPath;
   assert.equal(path.basename(path.dirname(sourceBackup)), 'merge-source-backups');
@@ -274,6 +274,7 @@ test('合并来源的收尾前备份：真实收尾留下的可删；被未报�
   await writeRuntimeDataSetMergeFinalization(fixture.paths, {
     candidateId: fixture.alpha.id,
     source: { dataSetId: fixture.alpha.binding.dataSetId, rootInstanceId: fixture.alpha.binding.rootInstanceId },
+    turnIds: ['conversation_alpha_one_unfinished_turn'], intentIds: [],
     turns: 1, intents: 0, sourceBackupPath: sourceBackup, complete: true
   });
   const referenced = await planRuntimeBackupCleanup(fixture.root, database);

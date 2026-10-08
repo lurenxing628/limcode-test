@@ -1,3 +1,4 @@
+import { publishInitialRuntimeSelection } from './fixtures/runtime-selection.mjs';
 // 清理备份（runtimeBackupCleanup）C 项第二部分的审查修复：H1 显示一致（拷贝里显示的消息在证明它的库里被删除、
 // 编辑或重试替换时单列、默认不勾选，删除时替换的不能比列出时多）、L5 其它历史记录与正文文件、M1 已核对标记落盘后
 // 放开 admission、L1 只读查看的登记、L2 备份目录逐项核对、L3 已核对标记绑定配置根、L4 历史库的名字、L6 外来库里的
@@ -368,7 +369,7 @@ test('L4 历史库的名字与“历史与存储管理”一致：当前库、�
     empty: await sourceBackup(empty)
   };
   // Alpha is the one open in this window.
-  await selectVscodeRuntimeDataSet(fixture.paths, fixture.alpha.id);
+  await publishInitialRuntimeSelection(fixture.paths, fixture.alpha.id);
   const database = await kernel.RuntimeDatabase.open(fixture.alpha.authority, { hostBootId: `window-${randomUUID()}` });
   t.after(() => database.close().catch(() => undefined));
   backups.current = await targetBackup(fixture.alpha, database, 180);
