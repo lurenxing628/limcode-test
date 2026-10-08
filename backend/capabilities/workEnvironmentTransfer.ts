@@ -58,6 +58,7 @@ interface StreamHandle {
 interface Endpoint {
   environment: WorkEnvironmentRecord;
   resolvePath(input: string): Promise<string>;
+  canonicalPath(p: string): Promise<string>;
   normalize(p: string): string;
   dirname(p: string): string;
   basename(p: string): string;
@@ -216,7 +217,7 @@ async function runTransfer(
 
   const tracker = createTransferTracker(observer, { files: 0, bytes: 0 }, false);
   reportTransferProgress(tracker, false, true);
-  const copied = await copyDirectory({ from, to, sourceDir: sourcePath, targetDir: targetPath, overwrite: item.overwrite, createDirs: item.createDirs, verify, tracker, mkdirCache: new Set<string>(), signal: context.signal });
+  const copied = await copyDirectory({ from, to, sourceDir: sourcePath, targetDir: targetPath, overwrite: item.overwrite, createDirs: item.createDirs, verify, tracker, mkdirCache: new Set<string>(), sourceAncestors: new Set<string>(), signal: context.signal });
   reportTransferProgress(tracker, true, true);
   return {
     success: true,
@@ -253,6 +254,19 @@ function createEndpoint(environment: WorkEnvironmentRecord, signal: AbortSignal 
   throw new Error(`工作环境 ${workEnvironmentDisplayName(environment)} (${environment.kind}) 暂未接入文件传输 provider。`);
 }
 
+function sameFileSystem(from: Endpoint, to: Endpoint): boolean {
+  if (isLocalFolderWorkEnvironment(from.environment) && isLocalFolderWorkEnvironment(to.environment)) return true;
+  if (!isRemoteServerWorkEnvironment(from.environment) || !isRemoteServerWorkEnvironment(to.environment)) return false;
+  // Different roots on the same SSH target still share a filesystem. Paths on different targets
+  // have no containment relationship, even when their absolute spelling is identical.
+  const sshTarget = (environment: WorkEnvironmentRecord): string => JSON.stringify([
+    environment.host?.trim() || environment.name.trim(),
+    environment.user ?? '',
+    environment.port && environment.port > 0 ? Math.floor(environment.port) : 0
+  ]);
+  return sshTarget(from.environment) === sshTarget(to.environment);
+}
+
 async function copyDirectory(input: {
   from: Endpoint;
   to: Endpoint;
@@ -263,35 +277,49 @@ async function copyDirectory(input: {
   verify: WorkEnvironmentTransferVerifyMode;
   tracker: TransferProgressTracker;
   mkdirCache: Set<string>;
+  sourceAncestors: Set<string>;
   signal?: AbortSignal;
 }): Promise<{ files: number; dirs: number; bytes: number; verifyOk: boolean }> {
-  const { from, to, sourceDir, targetDir, overwrite, createDirs, verify, tracker, mkdirCache, signal } = input;
+  const { from, to, sourceDir, targetDir, overwrite, createDirs, verify, tracker, mkdirCache, sourceAncestors, signal } = input;
   signal?.throwIfAborted();
-  if (createDirs) await mkdirpCached(to, targetDir, mkdirCache);
-  const entries = await from.readdir(sourceDir);
-  let files = 0;
-  let dirs = 1;
-  let bytes = 0;
-  let verifyOk = true;
-
-  for (const entry of entries) {
-    signal?.throwIfAborted();
-    const childSource = from.join(sourceDir, entry.name);
-    const childTarget = to.join(targetDir, entry.name);
-    if (entry.type === 'directory') {
-      const nested = await copyDirectory({ from, to, sourceDir: childSource, targetDir: childTarget, overwrite, createDirs, verify, tracker, mkdirCache, signal });
-      files += nested.files;
-      dirs += nested.dirs;
-      bytes += nested.bytes;
-      verifyOk = verifyOk && nested.verifyOk;
-    } else {
-      const copied = await copyFile({ from, to, sourcePath: childSource, targetPath: childTarget, overwrite, createDirs, verify, tracker, knownSize: entry.size, mkdirCache, signal });
-      files += 1;
-      bytes += copied.bytes;
-      verifyOk = verifyOk && copied.verifyOk;
+  const sourceCanonical = await from.canonicalPath(sourceDir);
+  if (sourceAncestors.has(sourceCanonical)) throw new Error(`源目录符号链接形成循环：${sourceDir}`);
+  if (sameFileSystem(from, to)) {
+    const targetCanonical = await to.canonicalPath(targetDir);
+    if (isPathInside(sourceCanonical, targetCanonical, isRemoteServerWorkEnvironment(from.environment) ? path.posix : path)) {
+      throw new Error(`不能将目录传到自身或其子目录：${sourceDir} -> ${targetDir}`);
     }
   }
-  return { files, dirs, bytes, verifyOk };
+  sourceAncestors.add(sourceCanonical);
+  try {
+    if (createDirs) await mkdirpCached(to, targetDir, mkdirCache);
+    const entries = await from.readdir(sourceDir);
+    let files = 0;
+    let dirs = 1;
+    let bytes = 0;
+    let verifyOk = true;
+
+    for (const entry of entries) {
+      signal?.throwIfAborted();
+      const childSource = from.join(sourceDir, entry.name);
+      const childTarget = to.join(targetDir, entry.name);
+      if (entry.type === 'directory') {
+        const nested = await copyDirectory({ from, to, sourceDir: childSource, targetDir: childTarget, overwrite, createDirs, verify, tracker, mkdirCache, sourceAncestors, signal });
+        files += nested.files;
+        dirs += nested.dirs;
+        bytes += nested.bytes;
+        verifyOk = verifyOk && nested.verifyOk;
+      } else {
+        const copied = await copyFile({ from, to, sourcePath: childSource, targetPath: childTarget, overwrite, createDirs, verify, tracker, knownSize: entry.size, mkdirCache, signal });
+        files += 1;
+        bytes += copied.bytes;
+        verifyOk = verifyOk && copied.verifyOk;
+      }
+    }
+    return { files, dirs, bytes, verifyOk };
+  } finally {
+    sourceAncestors.delete(sourceCanonical);
+  }
 }
 
 async function copyFile(input: {
@@ -554,7 +582,11 @@ class LocalEndpoint implements Endpoint {
   // symlink 的情况），候选路径解析最近现存祖先的真实路径，写操作额外拒绝最终组件是符号链接的目标；
   // 仅当输入路径就是声明的 root 本身时豁免（如 root 是 symlink 时的 mkdirp(root)），root 内其他指向
   // root 的 symlink 不误豁免。
-  private async guardPath(p: string, intent: TransferPathIntent): Promise<void> {
+  async canonicalPath(p: string): Promise<string> {
+    this.signal?.throwIfAborted();
+    return canonicalLocalPath(await this.guardPath(p, 'read') ?? await realpathNearestExistingLocal(p));
+  }
+  private async guardPath(p: string, intent: TransferPathIntent): Promise<string | undefined> {
     if (this.policy.allowOutsideProjectPaths) return;
     const root = localProjectRootPath(this.environment);
     if (!root) throw new Error(`本地工作环境缺少 rootPath，无法限制项目外路径：${workEnvironmentDisplayName(this.environment)}`);
@@ -565,8 +597,8 @@ class LocalEndpoint implements Endpoint {
     if (!isLocalPathInsideRoot(resolved, realRoot)) {
       throw new Error(`路径经符号链接解析后超出当前本地工作环境根目录：${p} -> ${resolved}（root=${realRoot}）`);
     }
-    if (intent !== 'write') return;
-    if (canonicalLocalPath(p) === canonicalLocalPath(root)) return;
+    if (intent !== 'write') return resolved;
+    if (canonicalLocalPath(p) === canonicalLocalPath(root)) return resolved;
     let stat: fs.Stats | undefined;
     try {
       stat = await fsp.lstat(p);
@@ -574,6 +606,7 @@ class LocalEndpoint implements Endpoint {
       if (!isNotFoundError(error)) throw error;
     }
     if (stat?.isSymbolicLink()) throw new Error(`拒绝通过符号链接写入：${p}`);
+    return resolved;
   }
   normalize(p: string): string { return path.normalize(trimTrailingSeparators(p, false)); }
   dirname(p: string): string { return path.dirname(p); }
@@ -635,50 +668,8 @@ class LocalEndpoint implements Endpoint {
   }
 }
 
-class RemoteCommandEndpoint implements Endpoint {
-  /** Login user's home once `~` appears in workdir/rootPath or a path; every path below is absolute after it. */
-  private home?: string;
-  public constructor(
-    public environment: WorkEnvironmentRecord,
-    private readonly signal: AbortSignal | undefined,
-    private readonly policy: TransferPathPolicy
-  ) {}
-  async resolvePath(input: string): Promise<string> {
-    const text = normalizeString(input);
-    if (!text) throw new Error('远端路径不能为空。');
-    this.home ??= await remoteHomeFor(this.environment, [text], this.signal);
-    const slashed = text.replace(/\\/g, '/');
-    const isAbsolute = slashed.startsWith('/') || slashed === '~' || slashed.startsWith('~/');
-    const root = remoteProjectRootPath(this.environment, this.home);
-    if (!isAbsolute && !root) throw new Error(`远程工作环境缺少 workdir/rootPath，无法解析相对路径: ${text}`);
-    return this.normalize(resolveRemotePath(text, this.environment, undefined, {
-      allowOutsideProjectPaths: this.policy.allowOutsideProjectPaths,
-      home: this.home
-    }));
-  }
-  // allowOutsideProjectPaths=false 时 resolveRemotePath 的词法限制可被符号链接绕过（root/link -> 外部目录），
-  // 因此在同一条远程脚本内先用 bash 内建把源、目标父目录链、目标自身解析成真实路径并复核仍在物理根目录内，
-  // 再执行原操作；写操作额外拒绝最终组件是符号链接的目标，仅当输入路径就是声明的 root 本身时豁免
-  // （覆盖 root 自身是 symlink 时的 mkdirp(root)，root 内其他指向 root 的 symlink 不误豁免）。
-  // 路径字节精确性：命令替换会剥尾随换行，pwd -P 用 `&& printf .` 哨兵捕获后只剥哨兵与单个换行（pwd
-  // 在 GNU/BSD 都追加换行）；readlink 统一加 -n（GNU 默认追加换行、BSD 不追加，-n 使两边都不追加），
-  // 捕获只剥哨兵点，避免误删目标名自带的尾随换行；dirname/basename 用参数展开实现；不存在尾段拼回后由
-  // __we_normalize 纯参数展开消除 ./..，避免相对 symlink 目标（如 sub/../../outside）在尾段留下可绕过
-  // 前缀比较的 ..。契约：远端为 bash + GNU/BusyBox userland（既有脚本已依赖 `cat --`、`base64`、`wc -c`），
-  // 校验与操作在同一脚本内相邻执行，属 time-of-check；root 为 / 时不存在根外路径，词法策略已完备，直接放行。
-  private withGuard(body: string, checks: Array<{ path: string; intent: TransferPathIntent }>): string {
-    if (this.policy.allowOutsideProjectPaths || checks.length === 0) return body;
-    const root = remoteProjectRootPath(this.environment, this.home);
-    if (!root || !path.posix.isAbsolute(root)) {
-      throw new Error(`当前远程工作环境缺少绝对 workdir/rootPath，无法限制项目外路径：${workEnvironmentDisplayName(this.environment)}`);
-    }
-    if (root === '/') return body;
-    const lines = checks.map((check) => `__we_check ${shQuote(check.path)} ${check.intent}`);
-    return `__we_root=${shQuote(root)}
-__we_physroot=$(cd -- "$__we_root" 2>/dev/null && pwd -P && printf .) || { echo "transfer: 无法解析远程工作环境根目录: $__we_root" >&2; exit 46; }
-__we_physroot=\${__we_physroot%.}
-__we_physroot=\${__we_physroot%\$'\\n'}
-__we_normalize() {
+function remotePathResolutionScript(paths: ReadonlyArray<string> = []): string {
+  return `__we_normalize() {
   local input=$1 out= comp=
   while [ -n "$input" ]; do
     case $input in
@@ -724,6 +715,61 @@ __we_resolve() {
   __we_normalize "$__we_resolved$rest"
   __we_resolved=$__we_normalized
 }
+${paths.map((p) => `__we_resolve ${shQuote(p)} || { echo 'transfer: 无法解析目录路径' >&2; exit 46; }`).join('\n')}`;
+}
+
+class RemoteCommandEndpoint implements Endpoint {
+  /** Login user's home once `~` appears in workdir/rootPath or a path; every path below is absolute after it. */
+  private home?: string;
+  public constructor(
+    public environment: WorkEnvironmentRecord,
+    private readonly signal: AbortSignal | undefined,
+    private readonly policy: TransferPathPolicy
+  ) {}
+  async resolvePath(input: string): Promise<string> {
+    const text = normalizeString(input);
+    if (!text) throw new Error('远端路径不能为空。');
+    this.home ??= await remoteHomeFor(this.environment, [text], this.signal);
+    const slashed = text.replace(/\\/g, '/');
+    const isAbsolute = slashed.startsWith('/') || slashed === '~' || slashed.startsWith('~/');
+    const root = remoteProjectRootPath(this.environment, this.home);
+    if (!isAbsolute && !root) throw new Error(`远程工作环境缺少 workdir/rootPath，无法解析相对路径: ${text}`);
+    return this.normalize(resolveRemotePath(text, this.environment, undefined, {
+      allowOutsideProjectPaths: this.policy.allowOutsideProjectPaths,
+      home: this.home
+    }));
+  }
+  async canonicalPath(p: string): Promise<string> {
+    const script = this.withGuard(`printf '%s' "$__we_resolved" | base64`, [{ path: p, intent: 'read' }], true);
+    const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `realpath ${p}`, signal: this.signal });
+    assertExecOk(result, `realpath ${p}`);
+    return Buffer.from(result.stdout.replace(/\s+/g, ''), 'base64').toString('utf8');
+  }
+  // allowOutsideProjectPaths=false 时 resolveRemotePath 的词法限制可被符号链接绕过（root/link -> 外部目录），
+  // 因此在同一条远程脚本内先用 bash 内建把源、目标父目录链、目标自身解析成真实路径并复核仍在物理根目录内，
+  // 再执行原操作；写操作额外拒绝最终组件是符号链接的目标，仅当输入路径就是声明的 root 本身时豁免
+  // （覆盖 root 自身是 symlink 时的 mkdirp(root)，root 内其他指向 root 的 symlink 不误豁免）。
+  // 路径字节精确性：命令替换会剥尾随换行，pwd -P 用 `&& printf .` 哨兵捕获后只剥哨兵与单个换行（pwd
+  // 在 GNU/BSD 都追加换行）；readlink 统一加 -n（GNU 默认追加换行、BSD 不追加，-n 使两边都不追加），
+  // 捕获只剥哨兵点，避免误删目标名自带的尾随换行；dirname/basename 用参数展开实现；不存在尾段拼回后由
+  // __we_normalize 纯参数展开消除 ./..，避免相对 symlink 目标（如 sub/../../outside）在尾段留下可绕过
+  // 前缀比较的 ..。契约：远端为 bash + GNU/BusyBox userland（既有脚本已依赖 `cat --`、`base64`、`wc -c`），
+  // 校验与操作在同一脚本内相邻执行，属 time-of-check；root 为 / 时不存在根外路径，词法策略已完备，直接放行。
+  private withGuard(body: string, checks: Array<{ path: string; intent: TransferPathIntent }>, includePathResolver = false): string {
+    if (this.policy.allowOutsideProjectPaths || checks.length === 0) {
+      return includePathResolver ? `${remotePathResolutionScript(checks.map((check) => check.path))}\n${body}` : body;
+    }
+    const root = remoteProjectRootPath(this.environment, this.home);
+    if (!root || !path.posix.isAbsolute(root)) {
+      throw new Error(`当前远程工作环境缺少绝对 workdir/rootPath，无法限制项目外路径：${workEnvironmentDisplayName(this.environment)}`);
+    }
+    if (root === '/') return includePathResolver ? `${remotePathResolutionScript(checks.map((check) => check.path))}\n${body}` : body;
+    const lines = checks.map((check) => `__we_check ${shQuote(check.path)} ${check.intent}`);
+    return `__we_root=${shQuote(root)}
+__we_physroot=$(cd -- "$__we_root" 2>/dev/null && pwd -P && printf .) || { echo "transfer: 无法解析远程工作环境根目录: $__we_root" >&2; exit 46; }
+__we_physroot=\${__we_physroot%.}
+__we_physroot=\${__we_physroot%\$'\\n'}
+${remotePathResolutionScript()}
 __we_check() {
   local p=$1
   case $p in
@@ -772,7 +818,7 @@ ${body}`;
     assertExecOk(result, `mkdir -p ${p}`);
   }
   async readdir(p: string): Promise<DirEntry[]> {
-    const script = this.withGuard(`cd -- ${shQuote(p)} && for x in ./* ./.??* ./.?*; do [ -e "$x" ] || continue; name="\${x#./}"; if [ -d "$x" ]; then printf 'd\t%s\t0\0' "$name"; elif [ -f "$x" ]; then size="$(wc -c < "$x" 2>/dev/null || printf '0')"; printf 'f\t%s\t%s\0' "$name" "$size"; fi; done | base64 | tr -d '\n\r'`, [{ path: p, intent: 'read' }]);
+    const script = this.withGuard(`cd -- ${shQuote(p)} && for x in ./* ./.[!.]* ./..?*; do [ -e "$x" ] || continue; name="\${x#./}"; if [ -d "$x" ]; then printf 'd\t%s\t0\\0' "$name"; elif [ -f "$x" ]; then size="$(wc -c < "$x" 2>/dev/null || printf '0')"; printf 'f\t%s\t%s\\0' "$name" "$size"; fi; done | base64 | tr -d '\n\r'`, [{ path: p, intent: 'read' }]);
     const result = await executeRemoteServerScript(this.environment, script, { timeout: 30_000, displayCommand: `readdir ${p}`, signal: this.signal });
     assertExecOk(result, `readdir ${p}`);
     return decodeNulListFromBase64(result.stdout).map((record) => {

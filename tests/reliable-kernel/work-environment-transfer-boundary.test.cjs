@@ -102,6 +102,26 @@ test('allowOutsideProjectPaths=false 允许普通根内文件与目录递归传�
   assert.equal(await fs.readFile(path.join(root, 'out', 'nested', 'deep.txt'), 'utf8'), 'deep-data');
 });
 
+test('本地目录传输在写入前拒绝自身、子目录及指向源目录的目标别名', async (t) => {
+  const { root, environment } = await makeFixture(t);
+  const transfers = [
+    item('tree', 'tree', { type: 'directory', overwrite: true }),
+    item('tree', 'tree/copy', { type: 'directory' })
+  ];
+  if (await trySymlink(path.join(root, 'tree'), path.join(root, 'alias-tree'), 'dir')) {
+    transfers.push(item('tree', 'alias-tree/copy', { type: 'directory' }));
+  }
+  const before = await entriesOf(path.join(root, 'tree'));
+  const result = await run(createWorkEnvironmentRuntimeCapability(), environment, transfers, {
+    allowOutsideProjectPaths: false,
+    signal: AbortSignal.timeout(5_000)
+  });
+  assert.equal(result.failCount, transfers.length);
+  for (const entry of result.results) assert.match(entry.error, /自身或其子目录/);
+  assert.deepEqual(await entriesOf(path.join(root, 'tree')), before);
+  assert.equal(await fs.readFile(path.join(root, 'tree', 'top.txt'), 'utf8'), 'top-data');
+});
+
 test('allowOutsideProjectPaths=false 拒绝直接根外绝对路径且不改动任何目录', async (t) => {
   const { root, outside, environment } = await makeFixture(t);
   const rootBefore = await entriesOf(root);
@@ -290,6 +310,87 @@ async function makeRemoteFixture(t) {
   await fs.writeFile(path.join(outside, 'secret.txt'), 'remote-secret');
   return { base, root, outside, environment: remoteEnvironment(root) };
 }
+
+test('远程目录枚举每个隐藏项一次且不包含父目录（真实 bash 脚本）', posixOnly, async (t) => {
+  const { root, environment } = await makeRemoteFixture(t);
+  const source = path.join(root, 'source');
+  await fs.mkdir(path.join(source, '.git', '.config'), { recursive: true });
+  const files = { '.x': 'one', '..named': 'two', '.git/.config/item.txt': 'three', 'visible.txt': 'four' };
+  for (const [name, body] of Object.entries(files)) await fs.writeFile(path.join(source, name), body);
+  const result = await run(createWorkEnvironmentRuntimeCapability(), environment, [
+    item('source', 'destination', { type: 'directory' })
+  ], { allowOutsideProjectPaths: false });
+  assert.equal(result.failCount, 0, JSON.stringify(result.results));
+  assert.equal(result.results[0].files, Object.keys(files).length);
+  for (const [name, body] of Object.entries(files)) {
+    assert.equal(await fs.readFile(path.join(root, 'destination', name), 'utf8'), body);
+  }
+  assert.deepEqual(await entriesOf(path.join(root, 'destination')), ['..named', '.git', '.x', 'visible.txt']);
+});
+
+test('远程同端点目录拒绝自身及经真实路径别名进入源子目录', posixOnly, async (t) => {
+  const { root, environment } = await makeRemoteFixture(t);
+  const source = path.join(root, 'source');
+  await fs.mkdir(source);
+  await fs.symlink(source, path.join(root, 'source-alias'), 'dir');
+  // Different catalog IDs and roots do not make the same SSH target a different filesystem.
+  const target = { ...environment, id: 'same-ssh-target-alias', rootPath: path.join(root, 'source-alias') };
+  const result = await run(createWorkEnvironmentRuntimeCapability(), environment, [
+    item('source', 'source', { type: 'directory', overwrite: true }),
+    item('source', 'source/copy', { type: 'directory' }),
+    { ...item('source', 'copy', { type: 'directory' }), toEnvironment: target.id }
+  ], { availableWorkEnvironments: [environment, target], signal: AbortSignal.timeout(30_000) });
+  assert.equal(result.failCount, 3, JSON.stringify(result.results));
+  for (const entry of result.results) assert.match(entry.error, /自身或其子目录/);
+  assert.deepEqual(await entriesOf(source), []);
+});
+
+test('远程目录符号链接回到当前递归祖先时在创建该目标目录前拒绝', posixOnly, async (t) => {
+  const { root, environment } = await makeRemoteFixture(t);
+  const source = path.join(root, 'source');
+  await fs.mkdir(source);
+  await fs.symlink(source, path.join(source, 'loop'), 'dir');
+  const result = await run(createWorkEnvironmentRuntimeCapability(), environment, [
+    item('source', 'destination', { type: 'directory' })
+  ], { allowOutsideProjectPaths: false, signal: AbortSignal.timeout(30_000) });
+  assert.equal(result.failCount, 1, JSON.stringify(result.results));
+  assert.match(result.results[0].error, /符号链接形成循环/);
+  assert.deepEqual(await entriesOf(path.join(root, 'destination')), []);
+});
+
+test('普通远程目录链接可重复指向同一非祖先目录并遵守根外路径策略', posixOnly, async (t) => {
+  const { root, outside, environment } = await makeRemoteFixture(t);
+  const source = path.join(root, 'source');
+  await fs.mkdir(source);
+  await fs.symlink(outside, path.join(source, 'first'), 'dir');
+  await fs.symlink(outside, path.join(source, 'second'), 'dir');
+  const capability = createWorkEnvironmentRuntimeCapability();
+  const allowed = await run(capability, environment, [
+    item('source', 'destination', { type: 'directory' })
+  ], { signal: AbortSignal.timeout(30_000) });
+  assert.equal(allowed.failCount, 0, JSON.stringify(allowed.results));
+  assert.equal(allowed.results[0].files, 2);
+  for (const alias of ['first', 'second']) {
+    assert.equal(await fs.readFile(path.join(root, 'destination', alias, 'secret.txt'), 'utf8'), 'remote-secret');
+  }
+  const refused = await run(capability, environment, [
+    item('source', 'restricted', { type: 'directory' })
+  ], { allowOutsideProjectPaths: false, signal: AbortSignal.timeout(30_000) });
+  assert.equal(refused.failCount, 1, JSON.stringify(refused.results));
+  assert.match(refused.results[0].error, /超出当前远程工作环境根目录/);
+  assert.deepEqual(await entriesOf(path.join(root, 'restricted')), []);
+});
+
+test('不同远程机器上的相同目录路径允许传输', posixOnly, async (t) => {
+  const { root, environment } = await makeRemoteFixture(t);
+  await fs.mkdir(path.join(root, 'empty'));
+  const target = { ...environment, id: 'different-ssh-target', host: 'another.boundary.test.invalid' };
+  const result = await run(createWorkEnvironmentRuntimeCapability(), environment, [
+    { ...item('empty', 'empty', { type: 'directory' }), toEnvironment: target.id }
+  ], { availableWorkEnvironments: [environment, target], signal: AbortSignal.timeout(30_000) });
+  assert.equal(result.failCount, 0, JSON.stringify(result.results));
+  assert.equal(result.results[0].files, 0);
+});
 
 test('远程受限传输在同脚本真实路径守卫下拒绝符号链接逃逸（本机 bash 替代 SSH transport）', posixOnly, async (t) => {
   const { root, outside, environment } = await makeRemoteFixture(t);
