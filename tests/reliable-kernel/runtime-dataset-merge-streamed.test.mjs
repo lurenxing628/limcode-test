@@ -198,7 +198,8 @@ test('旧记录：以前按内存上限（maxRows=60000）记下的 too-large �
 test('剔除等价性：冲突连带子 Agent 与跨对话链接，其余对话在线和流式都合并并记 partial', async (t) => {
   const fixture = await fixtureFor(t);
   await seedConversations(fixture.current, [{ id: 'alpha_conversation_1', title: 'current title' }]);
-  await seedRichSource(fixture.alpha, 'alpha', 3);
+  await seedRichSource(fixture.alpha, 'alpha', 4);
+  rawWrite(fixture.alpha, db => db.prepare('DELETE FROM model_stream_fence WHERE model_request_id=?').run('alpha_conversation_2_request_completed'));
   const before = await saveState(fixture, fixture.current);
   t.after(() => before.remove());
   const online = await mergeOnline(fixture);
@@ -206,7 +207,7 @@ test('剔除等价性：冲突连带子 Agent 与跨对话链接，其余对话�
   const expected = readAll(fixture.current);
   const onlineRecord = await readLedgerRecord(fixture, fixture.alpha.id);
   assert.equal(onlineRecord.state, 'partial');
-  assert.deepEqual(onlineRecord.excluded.map(row => row.conversationId).sort(), ['alpha_conversation_0', 'alpha_conversation_1']);
+  assert.deepEqual(onlineRecord.excluded.map(row => row.conversationId).sort(), ['alpha_conversation_0', 'alpha_conversation_1', 'alpha_conversation_2']);
   await before.restore();
   const { preparation, session } = await mergeStreamed(fixture, { candidateIds: [fixture.alpha.id], requested: true });
   assert.equal(preparation.sources.length, 1);

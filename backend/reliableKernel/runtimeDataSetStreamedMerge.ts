@@ -797,7 +797,8 @@ export async function scanMergeRows(
       scan.rows += entries.length;
       options.onRows?.(scan.rows);
     });
-    if (scan.conflicts.count === 0 && (!options.collecting || !options.exclusions?.hasProblems())) await aggregates.validate(options.signal,
+    if (options.collecting && options.exclusions?.hasProblems()) await options.exclusions.finish(options.chunkRows);
+    if (scan.conflicts.count === 0 || options.collecting) await aggregates.validate(options.signal,
       options.collecting && options.exclusions ? (domain,id,error) => {
         const row = source.prepare('SELECT * FROM model_request WHERE id=?').get(id) as Record<string,unknown> | undefined;
         if (!row) throw error;
