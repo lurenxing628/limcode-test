@@ -731,6 +731,7 @@ async function upgradeForeignSnapshot(root: LocatedRuntimeRoot, databasePath: st
   if (root.upgradeCasOverlayRoot) {
     await assertNoSymbolicPath(path.dirname(root.upgradeCasOverlayRoot), root.upgradeCasOverlayRoot)
       .catch((error: unknown) => { if (!isMissing(error)) throw error; });
+    await fs.mkdir(root.upgradeCasOverlayRoot, { recursive: true, mode: 0o700 });
   }
   const objects = await openLocatedCasAccess(root, held, undefined, signal);
   // A body this thread cannot use is classified here, by kind and errno, never by message text.
