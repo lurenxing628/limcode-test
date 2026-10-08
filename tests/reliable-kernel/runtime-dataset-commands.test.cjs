@@ -1264,7 +1264,7 @@ test('最后一轮盲审 #6：本窗口因数据目录操作冻结时，“合�
   for (const [kind, confirmation] of [['delete', '永久删除'], ['merge', '合并']]) {
     let checks = 0;
     const late = { writeGate: { admit() { if ((checks += 1) > 1) throw new Error(refused); } } };
-    const f = fixture({ application: late, picks: [action(kind), 0], confirmation, mergeStates: { 'workspace:old': { state: 'merged', intoCurrent: true, changedSinceMerge: false } } });
+    const f = fixture({ application: late, picks: [action(kind), 0], confirmation, mergeStates: kind === 'delete' ? { 'workspace:old': { state: 'merged', intoCurrent: true, changedSinceMerge: false } } : {} });
     await f.manageRuntimeDataSets(f.context, f.startup);
     assert.deepEqual(writes(f.calls), [], kind);
     assert.equal(checks, 2, kind);
