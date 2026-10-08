@@ -1545,7 +1545,7 @@ async function prepareSource(
       for (const id of state.unsettledConversationIds ?? []) {
         state.exclusions!.exclude('Conversation', {id}, 'runtime-data-set-merge-unfinished-work');
       }
-      for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate) || state.finalized !== undefined)) {
+      for (const issue of inspectUnfinishedWorkRows(taken.snapshot.database, engine.isForeignCandidate(candidate) || (state.finalized !== undefined && !state.finalized.earlier))) {
         if (!skipping || !taken.snapshot.database.prepare(`SELECT 1 FROM temp.${SKIP_TABLE} WHERE domain=? AND id=?`).get(issue.domain,String(issue.row.id))) {
           state.exclusions!.exclude(issue.domain,issue.row,issue.code);
         }

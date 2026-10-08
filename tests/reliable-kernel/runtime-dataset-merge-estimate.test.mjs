@@ -414,7 +414,7 @@ test('正文核验按文件身份持久缓存：准备交还后再准备不再�
   let preparation;
   try {
     const firstHashes = await hashedFiles(roots, async () => {
-      const first = await prepare(fixture, database);
+      const first = await prepare(fixture, database, {options:{confirmSettlement:async()=>true}});
       assert.deepEqual(first.sources.map((source) => source.candidateId), [fixture.alpha.id]);
       await releaseLargeMergePreparation(first);
     });
@@ -656,7 +656,7 @@ test('来源指纹与准备一致：没变就不变（可作操作键），来�
     // Work to close first: the preparation backs beta up, then copies, audits and compares it again.
     const [alphaFirst, betaFirst] = [fixture.alpha, fixture.beta].map((dataSet) => first.sources.find((source) => source.candidateId === dataSet.id));
     assert.ok(betaFirst.prepareEstimateMs - alphaFirst.prepareEstimateMs >= 300, JSON.stringify(first.sources));
-    const preparation = await prepare(fixture, database);
+    const preparation = await prepare(fixture, database, {options:{confirmSettlement:async()=>true}});
     await releaseLargeMergePreparation(preparation);
     const prepared = fingerprints(preparation);
     assert.deepEqual(Object.keys(prepared).sort(), Object.keys(estimated).sort());
@@ -771,16 +771,17 @@ test('外来大库的估计：只经它的声明读（声明记在当前配置�
   assert.deepEqual(await mergeBackups(fixture), []);
   assert.ok((await ledgerEntries(fixture, 'fingerprints')).includes(`${entry.id.replace(/:/g, '-')}.json`), '指纹缓存在当前配置根');
 
-  // Its request ran out: a batch would remove it with a notice, an estimate leaves it (named or not).
+  // Old request timestamps do not expire a registered source; estimates keep the request untouched.
   const requestFile = path.join(resolveVscodeRuntimeMergeLedgerRoot(fixture.paths), 'requests', requests[0]);
   const expired = { ...JSON.parse(await fs.readFile(requestFile, 'utf8')), requestedAt: new Date(Date.now() - 8 * 24 * 60 * 60 * 1000).toISOString() };
   await fs.writeFile(requestFile, JSON.stringify(expired));
   await withWindow(fixture, async (database) => {
     for (const input of [{ candidateIds: [fixture.alpha.id] }, {}]) {
       const result = await estimate(fixture, database, input);
-      assert.deepEqual([result.sources, result.report.blocked], [[], []], JSON.stringify(input));
+      assert.deepEqual([result.sources.map(source=>source.candidateId),result.report.blocked],
+        [input.candidateIds?[]:[entry.id],[]],JSON.stringify(input));
     }
   });
-  assert.deepEqual(JSON.parse(await fs.readFile(requestFile, 'utf8')), expired, '过期的请求原样保留');
+  assert.deepEqual(JSON.parse(await fs.readFile(requestFile, 'utf8')), expired, '旧时间的请求原样保留，不按天数删掉来源');
   assert.deepEqual(await treeState(container), before);
 });

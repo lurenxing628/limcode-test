@@ -392,7 +392,7 @@ test('会话前置条件：不在配置 admission 内、不持有当前库维护
   assert.equal(await readLedgerRecord(fixture, fixture.alpha.id), undefined);
 });
 
-test('批次：有待合并的大库时，自动批次里超过在线上限的中等来源不单独协调，随大库会话等待（排在大库前面也一样），准备时 threshold 为 online 就一起合并；没有大库时照常协调，用户点的那份照常单独协调', async (t) => {
+test('批次：有待合并的大库时，自动批次里超过在线上限的中等来源不单独协调，随大库会话等待（排在大库前面也一样），准备时 threshold 为 online 就一起合并；没有大库时也等待用户决定，用户点的那份照常单独协调', async (t) => {
   const fixture = await fixtureFor(t, { beta: true });
   await seedConversations(fixture.alpha, [{ id: 'alpha_medium' }]);
   await seedRichSource(fixture.beta, 'beta', 3);
@@ -435,16 +435,17 @@ test('批次：有待合并的大库时，自动批次里超过在线上限的�
   assert.deepEqual(coordinated, []);
   await initial.restore();
 
-  // Without a large source in the batch the medium one is merged after the others, coordinated on its own.
+  // Automatic work never interrupts windows, even when this medium source is the only one.
   const alone = await mergeOnline(fixture, { ...limits, coordinateOversized, candidateIds: [fixture.alpha.id] });
-  assert.deepEqual([alone.merged.map((item) => item.candidateId), alone.deferred, coordinated.length], [[fixture.alpha.id], [], 1]);
+  assert.deepEqual([alone.merged,alone.deferred.map(item=>[item.candidateId,item.code]),coordinated.length],
+    [[],[[fixture.alpha.id,RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]],0]);
   await initial.restore();
 
   // The one the user clicked is coordinated on its own at once, a large one alongside still waits.
   const clicked = await mergeOnline(fixture, { ...limits, coordinateOversized, candidateIds: [fixture.alpha.id, fixture.beta.id], requested: true });
   assert.deepEqual(clicked.merged.map((item) => item.candidateId), [fixture.alpha.id]);
   assert.deepEqual(clicked.deferred.map((issue) => [issue.candidateId, issue.code]), [[fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]]);
-  assert.equal(coordinated.length, 2);
+  assert.equal(coordinated.length, 1);
 });
 
 for (const damage of ['invalid-row', 'missing-body']) test(`剔除等价性：${damage} 只留下对应对话，其余在线和流式一致`, async (t) => {

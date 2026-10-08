@@ -19,6 +19,7 @@ type RawRow = Readonly<Record<string, unknown>>;
 export class RuntimeMergeConversationExclusions {
   private readonly index = new Database(':memory:');
   private readonly owners;
+  private hasSeeds = false;
   private readonly edge: Database.Statement;
   private readonly content: Database.Statement;
   private readonly identity: Database.Statement;
@@ -75,6 +76,7 @@ export class RuntimeMergeConversationExclusions {
   public exclude(domain: string, row: RawRow, code: string): void {
     const owners = this.owners.resolve(domain, row);
     if (!owners?.size) throw new RuntimeMergeUnattributedError(`无法按对话剔除 ${domain}:${String(row.id)}（${code}）：内容派生身份或无法归属。`);
+    this.hasSeeds = true;
     this.write(() => { for (const id of owners) this.seed.run(id, code); });
   }
 
@@ -93,6 +95,7 @@ export class RuntimeMergeConversationExclusions {
       // The graph already contains every ownership edge; use its source row only for the seed.
       const owners = this.resolveIndexedOwners(user.domain, user.id);
       if (!owners.length) throw new RuntimeMergeUnattributedError(`无法按对话剔除正文 ${id}（${code}）：引用 ${user.domain}:${user.id} 无法归属。`);
+      this.hasSeeds = true;
       this.write(() => { for (const owner of owners) this.seed.run(owner, code); });
     }
     if (!found) throw new RuntimeMergeUnattributedError(`无法按对话剔除正文 ${id}（${code}）：没有可归属的引用。`);
@@ -116,6 +119,7 @@ export class RuntimeMergeConversationExclusions {
   }
 
   public requiredContent(id: string): boolean {
+    if (!this.hasSeeds) return true;
     let found = false;
     for (const user of this.contentUsers(id)) {
       found = true;
@@ -144,9 +148,10 @@ export class RuntimeMergeConversationExclusions {
     }
   }
 
-  public hasProblems(): boolean { return this.index.prepare(`SELECT 1 FROM temp.${NODES} LIMIT 1`).get() !== undefined; }
+  public hasProblems(): boolean { return this.hasSeeds; }
 
   public includes(domain: string, id: string): boolean {
+    if (!this.hasSeeds) return false;
     if (domain === 'ContentObject') return !this.requiredContent(id);
     if (domain === 'Attachment' || domain === 'AttachmentObservationLink') {
       const users = this.pagedUsers(`WITH RECURSIVE users(domain,id) AS (

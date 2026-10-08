@@ -510,7 +510,7 @@ test('空间计入目标会被改写的索引页：准备在它的目标备份�
   });
 });
 
-test('空间不够、开不了大库会话时，中等来源照常单独协调合并，不被连带挡住；空间够时照旧随会话一起等待', { timeout: 300_000 }, async (t) => {
+test('空间不足或充足时自动批次都等待用户决定，不主动独占窗口', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot({ beta: true });
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedConversations(fixture.alpha, [{ id: 'alpha_medium' }]);
@@ -529,13 +529,14 @@ test('空间不够、开不了大库会话时，中等来源照常单独协调�
     for (const file of [database, `${database}-wal`]) bytes += await fs.stat(file).then((info) => info.size, () => 0);
     return bytes;
   };
-  // Room for the online merge's backup of the target (its files and the 64 MB margin), not for the session.
+  // Even when one online backup would fit, the automatic batch does not interrupt windows.
   const tight = async () => (await targetFiles()) + 64 * MiB + 16 * 1024;
   const cramped = await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths,
     { configurationRootPath: fixture.root, database: window }, { ...limits, coordinateOversized, freeSpace: tight }));
-  assert.deepEqual(cramped.merged.map((item) => item.candidateId), [fixture.alpha.id], '中等来源照常合并');
-  assert.deepEqual(cramped.deferred.map((issue) => [issue.candidateId, issue.code]), [[fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]]);
-  assert.equal(coordinated.length, 1, '单独协调了一次');
+  assert.deepEqual(cramped.merged,[]);
+  assert.deepEqual(cramped.deferred.map(issue=>[issue.candidateId,issue.code]).sort(),[[fixture.alpha.id,RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE],[fixture.beta.id,RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]].sort());
+
+  assert.equal(coordinated.length, 0, '自动批次不触发独占协调');
   await initial.restore();
 
   const roomy = await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths,
@@ -543,23 +544,9 @@ test('空间不够、开不了大库会话时，中等来源照常单独协调�
   assert.deepEqual(roomy.merged, []);
   assert.deepEqual(roomy.deferred.map((issue) => [issue.candidateId, issue.code]).sort(),
     [[fixture.alpha.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE], [fixture.beta.id, RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]].sort());
-  assert.equal(coordinated.length, 1, '空间够时中等来源随会话等待，不单独协调');
+  assert.equal(coordinated.length, 0, '空间充足也等用户决定，不自动独占');
 
-  // Room for the session's target side, not for the private copy of its source on the same disk (the temporary directory).
-  const [rootDevice, temporaryDevice] = await Promise.all([fixture.root, os.tmpdir()].map(async (directory) => (await fs.stat(directory)).dev));
-  if (rootDevice === temporaryDevice) {
-    await initial.restore();
-    const betaBytes = cramped.deferred[0].size?.bytes;
-    assert.ok(betaBytes > 0, JSON.stringify(cramped.deferred[0]));
-    const targetSideOnly = async () => {
-      const files = await targetFiles();
-      return files + largeMergeTargetBytes([{ databaseBytes: betaBytes }], estimatedTargetIndexBytes(files), 64 * MiB) + MiB;
-    };
-    const copyTooMuch = await withWindow(fixture, (window) => mergeHistoricalDataSetsOnline(fixture.paths,
-      { configurationRootPath: fixture.root, database: window }, { ...limits, coordinateOversized, freeSpace: targetSideOnly }));
-    assert.deepEqual(copyTooMuch.merged.map((item) => item.candidateId), [fixture.alpha.id], '放不下来源的私有副本：中等来源照常合并');
-    assert.equal(coordinated.length, 2);
-  }
+
 });
 
 test('准备时写不下目标备份或正文对象（ENOSPC）：这份推迟为磁盘空间不足（中文、写明写不下的目录、没有系统原文），后面的来源也不开始准备，不留备份和登记', { timeout: 300_000 }, async (t) => {
@@ -688,37 +675,27 @@ test('正文核验缓存用不了时（它的位置被一个目录占着）：�
 // Rows the Runtime refuses (review #5) and conflicts found in the session (#9).
 // ---------------------------------------------------------------------------------------------
 
-test('不变量在试算里就查出（来源里一个已结束请求缺 Operation）：准备按受阻入账，不备份、不进会话，当前库不变；下次启动直接报告为受阻，不再等待大库会话', { timeout: 300_000 }, async (t) => {
+test('试算定位缺 Operation 的请求所属对话：有效对话照常进入会话并记 partial，来源不变不再准备', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
   const request = 'alpha_conversation_2_request_completed';
-  rawWrite(fixture.alpha, (source) => {
-    source.prepare('DELETE FROM attempt WHERE id = ?').run(`${request}_attempt`);
-    source.prepare('DELETE FROM operation WHERE id = ?').run(`${request}_operation`);
+  rawWrite(fixture.alpha, source => {
+    source.prepare('DELETE FROM attempt WHERE id=?').run(`${request}_attempt`);
+    source.prepare('DELETE FROM operation WHERE id=?').run(`${request}_operation`);
   });
-  const before = readAll(fixture.current);
-  const preparation = await withWindow(fixture, async (window) => {
-    const batch = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
-    assert.deepEqual(batch.deferred.map((issue) => issue.code), [RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE]);
-    return prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
-  });
-  assert.deepEqual(preparation.sources, [], '不进会话');
-  assert.deepEqual(preparation.report.blocked.map((issue) => issue.code), [INVARIANT]);
-  assert.match(preparation.report.blocked[0].message,
-    /当前库不接受的数据[\s\S]*两边内容都没有改动[\s\S]*不再自动重试[\s\S]*ModelRequest alpha_conversation_2_request_completed must own exactly one Operation/);
-  assert.equal(preparation.backupPath, undefined);
-  assert.deepEqual(await targetBackups(fixture), []);
-  assert.deepEqual(readAll(fixture.current), before, '当前库不变');
-  const record = await readLedgerRecord(fixture, fixture.alpha.id);
-  assert.deepEqual([record.state, record.code], ['blocked', INVARIANT]);
-
-  await withWindow(fixture, async (window) => {
-    const batch = await mergeHistoricalDataSetsOnline(fixture.paths, { configurationRootPath: fixture.root, database: window }, { sizeLimits: LIMITS.sizeLimits });
-    assert.deepEqual(batch.deferred, [], '不再等待大库会话');
-    assert.deepEqual(batch.blocked.map((issue) => [issue.code, issue.newly]), [[INVARIANT, false]], '照记下的结果报告');
-    const again = await prepareLargeMergeSources({ paths: fixture.paths, target: { configurationRootPath: fixture.root, database: window }, options: LIMITS });
-    assert.deepEqual(again.sources, [], '不再准备');
+  const {preparation,session} = await prepareAndRun(fixture,LIMITS);
+  assert.equal(preparation.sources.length,1);
+  assert.deepEqual(preparation.report.blocked,[]);
+  assert.deepEqual(session.results.map(result=>result.state),['merged']);
+  const record = await readLedgerRecord(fixture,fixture.alpha.id);
+  assert.equal(record.state,'partial');
+  assert.deepEqual(record.excluded.map(row=>[row.conversationId,row.code]),[['alpha_conversation_2',INVARIANT]]);
+  assert.deepEqual(readAll(fixture.current).conversation.map(row=>JSON.parse(row).id),['alpha_conversation_0','alpha_conversation_1']);
+  await withWindow(fixture,async window=>{
+    const again = await prepareLargeMergeSources({paths:fixture.paths,target:{configurationRootPath:fixture.root,database:window},options:LIMITS});
+    assert.deepEqual(again.sources,[]);
+    assert.deepEqual(again.report.blocked,[]);
   });
 });
 
@@ -749,7 +726,7 @@ test('不变量在会话里才查出（来源里一个对话的项目链接换�
   });
 });
 
-test('已有请求的新增尝试也在预检时验证：非法聚合不备份、不进入会话，按受阻入账', { timeout: 300_000 }, async (t) => {
+test('已有请求的新增尝试也在预检时验证：非法聚合剔除关联对话，保留当前内容并记 partial', { timeout: 300_000 }, async (t) => {
   const fixture = await createConfigurationRoot();
   t.after(() => removeConfigurationRoot(fixture.root));
   await seedRichSource(fixture.alpha, 'alpha', 3);
@@ -765,11 +742,13 @@ test('已有请求的新增尝试也在预检时验证：非法聚合不备份�
     candidateIds: [fixture.alpha.id], requested: true
   }));
   assert.equal(preparation.sources.length, 0);
-  assert.deepEqual(preparation.report.blocked.map((issue) => issue.code), [INVARIANT]);
+  assert.deepEqual(preparation.report.blocked,[]);
   assert.equal(preparation.backupPath, undefined);
-  assert.match(preparation.report.blocked[0].message, new RegExp(`ModelRequest ${request} current Attempt must be the contiguous tail`));
+  const record = await readLedgerRecord(fixture,fixture.alpha.id);
+  assert.equal(record.state,'partial');
+  assert.deepEqual(record.excluded.map(row=>[row.conversationId,row.code]),[['alpha_conversation_0',INVARIANT],['alpha_conversation_1',INVARIANT]]);
   assert.deepEqual(readAll(fixture.current), before, '整份回滚');
-  assert.equal((await readLedgerRecord(fixture, fixture.alpha.id)).state, 'blocked');
+
 });
 
 test('预检通过后的最终 worker 聚合校验仍然有效：提交前多出的非法 Attempt 整份回滚', { timeout: 300_000 }, async (t) => {
