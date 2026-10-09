@@ -330,6 +330,7 @@ function packagedRuntimeClosureProblem() {
  * INTERNAL_STRUCTURED_CLONE_PATHS) or 'process' (argv strings and stdio bytes, no structured clone).
  */
 const DIRNAME_ENTRY_BOUNDARIES = new Map([
+  ['dist/extension/backend/capabilities/fileDiffWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/databaseWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/packedCasWorker.js', 'worker'],
   ['dist/extension/backend/reliableKernel/runtimeSnapshotAuditWorker.js', 'worker'],
@@ -436,6 +437,8 @@ function checkSourceSymbolsRemoved() {
 
 /** Extension-internal postMessage boundaries: worker threads and their launchers (structured clones between threads of this process). */
 const INTERNAL_STRUCTURED_CLONE_PATHS = new Set([
+  'dist/extension/backend/capabilities/fileDiffAsync.js',
+  'dist/extension/backend/capabilities/fileDiffWorker.js',
   'dist/extension/backend/reliableKernel/databaseWorker.js',
   'dist/extension/backend/reliableKernel/packedCasWorker.js',
   'dist/extension/backend/reliableKernel/runtimeDatabase.js',

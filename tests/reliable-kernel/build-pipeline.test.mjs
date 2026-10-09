@@ -201,6 +201,30 @@ test('plan bootstraps complete contract validation even when its registry remove
   }
 });
 
+test('package pruning keeps the path-started file diff worker and its dependencies', t => {
+  const directory = fixture(t);
+  const output = 'dist/extension/';
+  for (const name of ['databaseWorker', 'packedCasWorker', 'processWrapper', 'runtimeSnapshotAuditWorker',
+    'runtimeSnapshotUpgradeWorker', 'runtimeDataSetFactsWorker', 'runtimeDataRootRelocationWorker']) {
+    write(directory, `${output}backend/reliableKernel/${name}.js`, 'exports.value = 1;');
+  }
+  write(directory, `${output}vscode/extension.js`, "require('../backend/capabilities/fileDiffAsync');");
+  write(directory, `${output}backend/capabilities/fileDiffAsync.js`, "new Worker(path.join(__dirname, 'fileDiffWorker.js'));");
+  write(directory, `${output}backend/capabilities/fileDiffWorker.js`, "require('./fileDiff');");
+  write(directory, `${output}backend/capabilities/fileDiff.js`, 'exports.buildFileDiffRecord = () => {};');
+  write(directory, `${output}backend/capabilities/unused.js`, 'exports.value = 1;');
+  const result = childProcess.spawnSync(process.execPath, [path.join(root, 'scripts/reliable-kernel/prune-package-dist.mjs')], {
+    cwd: directory, encoding: 'utf8'
+  });
+  assert.equal(result.status, 0, result.stderr);
+  for (const name of ['fileDiffAsync', 'fileDiffWorker', 'fileDiff']) {
+    assert.ok(fs.existsSync(path.join(directory, `${output}backend/capabilities/${name}.js`)), `${name} must ship`);
+  }
+  assert.equal(fs.existsSync(path.join(directory, `${output}backend/capabilities/unused.js`)), false);
+  const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'dist/package-runtime-closure.json'), 'utf8'));
+  assert.ok(manifest.seeds.includes('backend/capabilities/fileDiffWorker.js'));
+});
+
 test('package gate shares successful closure verification across its two checks', async t => {
   const directory = fixture(t);
   const trace = path.join(directory, 'reads.json');
@@ -209,18 +233,20 @@ test('package gate shares successful closure verification across its two checks'
   const main = [
     "require('../backend/application/runtimeBuildIdentity');",
     "require('../backend/application/runtimeBuildInfo');",
+    "new Worker(path.join(__dirname, '../backend/capabilities/fileDiffWorker.js'));",
     ...workerNames.map(name => `new Worker(path.join(__dirname, '../backend/reliableKernel/${name}.js'));`),
     "spawn(process.execPath, [path.join(__dirname, '../backend/reliableKernel/processWrapper.js')]);"
   ].join('\n');
   const sources = new Map([
     ['dist/extension/vscode/extension.js', main],
+    ['dist/extension/backend/capabilities/fileDiffWorker.js', 'exports.value = 1;'],
     ['dist/extension/backend/application/runtimeBuildIdentity.js', "path.join(__dirname, '../../compile-build-id.json');"],
     ['dist/extension/backend/application/runtimeBuildInfo.js', "path.join(__dirname, '../../compile-build-id.json');"],
     ...[...workerNames, 'processWrapper'].map(name => [`dist/extension/backend/reliableKernel/${name}.js`, 'exports.value = 1;'])
   ]);
   // The hash stub isolates memoization from cryptography. No new content proof is generated.
   const manifest = { kind: 'limcode-package-runtime-closure', files: [...sources.keys()].map(file => ({ path: file, sha256: '0'.repeat(64) })),
-    fileCount: sources.size, seeds: ['vscode/extension.js', ...[...workerNames, 'processWrapper'].map(name => `backend/reliableKernel/${name}.js`)] };
+    fileCount: sources.size, seeds: ['vscode/extension.js', 'backend/capabilities/fileDiffWorker.js', ...[...workerNames, 'processWrapper'].map(name => `backend/reliableKernel/${name}.js`)] };
   fs.writeFileSync(artifact, await zip([
     ['extension/dist/package-runtime-closure.json', JSON.stringify(manifest)],
     ...[...sources].map(([file, content]) => [`extension/${file}`, content])
