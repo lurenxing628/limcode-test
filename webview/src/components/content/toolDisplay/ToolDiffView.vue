@@ -25,13 +25,17 @@ const props = defineProps<{
 const viewMode = ref<DiffViewMode>('unified');
 const files = computed<ParsedDiffFile[]>(() =>
   props.diff.files
-    .filter((file) => file.text.trim().length > 0)
     .map((file) => {
-      const lines = parseUnifiedDiffLines(file.text);
+      const lines = file.text ? parseUnifiedDiffLines(file.text) : [];
       const lineNumberDigits = getLineNumberDigits(lines);
       return { ...file, lines, lineNumberWidth: `calc(${lineNumberDigits}ch + 12px)` };
     })
 );
+
+function fileActionLabel(action: string): string {
+  return ({ created: '创建', modified: '修改', deleted: '删除',
+    'created-directory': '创建目录', 'deleted-directory': '删除目录' } as Record<string, string>)[action] ?? action;
+}
 
 function setViewMode(mode: DiffViewMode): void {
   viewMode.value = mode;
@@ -135,13 +139,13 @@ function parseUnifiedDiffLines(diffText: string): ParsedDiffLine[] {
     >
       <div class="tool-diff-file-header">
         <span class="tool-diff-file-path">{{ file.path }}</span>
-        <span v-if="file.action" class="tool-diff-file-action">{{ file.action }}</span>
-        <span class="tool-diff-file-stat is-add">+{{ file.added ?? 0 }}</span>
-        <span class="tool-diff-file-stat is-delete">-{{ file.removed ?? 0 }}</span>
+        <span v-if="file.action" class="tool-diff-file-action">{{ fileActionLabel(file.action) }}</span>
+        <span v-if="file.added !== undefined" class="tool-diff-file-stat is-add">+{{ file.added }}</span>
+        <span v-if="file.removed !== undefined" class="tool-diff-file-stat is-delete">-{{ file.removed }}</span>
         <span v-if="file.truncated" class="tool-diff-file-truncated">已截断</span>
       </div>
 
-      <div v-if="viewMode === 'unified'" class="tool-diff-lines is-unified">
+      <div v-if="file.lines.length > 0 && viewMode === 'unified'" class="tool-diff-lines is-unified">
         <div
           v-for="(line, index) in file.lines"
           :key="`${file.path}-u-${index}`"
@@ -153,7 +157,7 @@ function parseUnifiedDiffLines(diffText: string): ParsedDiffLine[] {
         </div>
       </div>
 
-      <div v-else class="tool-diff-lines is-split">
+      <div v-else-if="file.lines.length > 0" class="tool-diff-lines is-split">
         <template v-for="(line, index) in file.lines" :key="`${file.path}-s-${index}`">
           <div v-if="line.kind === 'meta' || line.kind === 'hunk'" class="tool-diff-split-full" :class="`is-${line.kind}`">
             <code>{{ line.raw }}</code>

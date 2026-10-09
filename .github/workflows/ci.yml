@@ -142,7 +142,7 @@ jobs:
       - name: Install browser for chat regression
         run: npx playwright install --with-deps chromium
       - name: Check built chat interaction without rebuilding
-        run: node --test tests/webview-session-thinking.browser.mjs tests/webview-agent-status-panel.browser.mjs
+        run: node --test tests/webview-session-thinking.browser.mjs tests/webview-agent-status-panel.browser.mjs tests/webview-file-change-preview.browser.mjs
 
   # Preserve the original required-check name. always() makes missing/cancelled matrix jobs fail
   # closed instead of silently skipping the check; both job results and per-file evidence are checked.

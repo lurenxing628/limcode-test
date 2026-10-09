@@ -87,6 +87,7 @@ export function resolveToolDisplay(context: ToolDisplayContext): ToolDisplayResu
   return {
     inputSections: custom?.inputSections ?? fallback.inputSections,
     outputSections: custom?.outputSections ?? fallback.outputSections,
+    detailSections: custom?.detailSections ?? [],
     headerIcon: custom?.headerIcon ?? fallback.headerIcon ?? resolveToolHeaderIcon(context.toolName),
     headerActions: custom?.headerActions ?? fallback.headerActions,
     headerPreview: custom?.headerPreview

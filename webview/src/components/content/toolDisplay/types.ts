@@ -99,6 +99,8 @@ export interface ToolHeaderPreview {
 export interface ToolDisplayResult {
   inputSections: ToolDisplaySection[];
   outputSections: ToolDisplaySection[];
+  /** Raw call parameters and execution metadata, hidden until the user opens call details. */
+  detailSections?: ToolDisplaySection[];
   headerIcon?: Component;
   headerActions: ToolHeaderAction[];
   headerPreview?: ToolHeaderPreview;

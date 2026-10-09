@@ -76,8 +76,7 @@ export const writeToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconWriting,
-    inputSections,
-    ...(outputSections ? { outputSections } : {}),
+    ...fileChangeSections(inputSections, outputSections ?? [], output),
     headerActions: diff ? diffHeaderActions(context, diff) : [],
     ...(headerPreview ? { headerPreview } : {})
   };
@@ -93,8 +92,7 @@ export const editToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconPencil,
-    inputSections,
-    ...(outputSections ? { outputSections } : {}),
+    ...fileChangeSections(inputSections, outputSections ?? [], output),
     headerActions: diff ? diffHeaderActions(context, diff) : [],
     ...(headerPreview ? { headerPreview } : {})
   };
@@ -109,13 +107,35 @@ export const deleteToolDisplay: ToolDisplayResolver = (context) => {
 
   return {
     headerIcon: IconTrash,
-    inputSections,
-    ...(outputSections ? { outputSections } : {}),
+    ...fileChangeSections(inputSections, outputSections ?? [], output),
     headerActions: [],
     ...(headerPreview ? { headerPreview } : {})
   };
 };
 
+
+/** Keep call syntax and receipt metadata out of the main file preview. */
+function fileChangeSections(
+  inputSections: ToolDisplaySection[],
+  outputSections: ToolDisplaySection[],
+  output: FileChangeOutput | string | undefined
+): Pick<import('./types').ToolDisplayResult, 'inputSections' | 'outputSections' | 'detailSections'> {
+  const diff = diffFromOutput(output);
+  const error = typeof output === 'object' ? stringValue(output.error) : undefined;
+  return {
+    inputSections: [],
+    outputSections: [
+      ...(diff ? [{ kind: 'output' as const, title: '文件变化', diff }] : []),
+      ...(error ? [{ kind: 'output' as const, title: '错误', text: error }] : [])
+    ],
+    detailSections: [...inputSections, ...outputSections.filter(section => !section.diff)]
+  };
+}
+
+/** Existing structured tool output, also used by commands that already return file diffs. */
+export function fileChangeDiffFromResult(result: unknown): ToolDisplayDiff | undefined {
+  return diffFromOutput(fileChangeOutput(result));
+}
 
 function writeInputSections(args: WriteArgs, context: ToolDisplayContext): ToolDisplaySection[] {
   const path = normalizeDisplayPath(args.path);
@@ -232,7 +252,6 @@ function fileChangeOutputSections(title: string, output: FileChangeOutput | stri
 function diffFromOutput(output: FileChangeOutput | string | undefined): ToolDisplayDiff | undefined {
   if (!output || typeof output === 'string') return undefined;
   const files = fileChangeItems(output.files)
-    .filter((file) => file.diffText && file.diffText.trim())
     .map((file) => ({
       path: file.path,
       action: actionLabel(file.action),

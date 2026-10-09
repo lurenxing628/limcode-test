@@ -75,6 +75,7 @@ const props = defineProps<{
 const reliableConversation = useReliableConversation();
 const interactions = useInteractionStore();
 const expanded = ref(false);
+const callDetailsExpanded = ref(false);
 const userChangedExpanded = ref(false);
 const autoOpenedActionIds = ref<Set<string>>(new Set());
 const expandedPlanSectionKeys = ref<Set<string>>(new Set());
@@ -221,13 +222,17 @@ const reliableFileDiff = computed<ToolDisplayDiff | undefined>(() => {
   };
 });
 const inputSections = computed(() => toolDisplay.value.inputSections);
+const detailSections = computed(() => toolDisplay.value.detailSections ?? []);
 const outputSections = computed(() => {
-  const sections = [...toolDisplay.value.outputSections];
-  if (reliableFileDiff.value && !sections.some((section) => section.diff)) {
-    sections.push({ kind: 'output', title: 'Diff 预览', diff: reliableFileDiff.value });
-  }
-  return sections;
+  const sections = toolDisplay.value.outputSections;
+  return reliableFileDiff.value
+    ? [{ kind: 'output' as const, title: '文件变化', diff: reliableFileDiff.value },
+      ...sections.filter(section => !section.diff)]
+    : sections;
 });
+const hasFilePreview = computed(() => !isCommandTool(props.part.functionCall.name)
+  && (['edit', 'write', 'delete'].includes(props.part.functionCall.name)
+    || outputSections.value.some(section => section.diff)));
 const toolIcon = computed(() => toolDisplay.value.headerIcon ?? IconTool);
 const retryableDetailTargets = computed(() => {
   const callId = toolCall.value?.id;
@@ -242,7 +247,6 @@ const headerActions = computed<ToolHeaderAction[]>(() => {
   const actions: ToolHeaderAction[] = (
     call
     && reliableConversation.projection.value.fileChangeSetIdByToolCallId[call.id]
-    && reliableFileDiff.value
   )
     ? [{
         id: `open-reliable-diff-${call.id}`,
@@ -272,7 +276,15 @@ const headerActions = computed<ToolHeaderAction[]>(() => {
   }
   return actions;
 });
-const headerPreview = computed(() => toolDisplay.value.headerPreview);
+const headerPreview = computed(() => {
+  if (isCommandTool(props.part.functionCall.name)) return undefined;
+  const preview = toolDisplay.value.headerPreview;
+  const files = outputSections.value.flatMap(section => section.diff?.files ?? []);
+  const file = files.find(file => file.path === preview?.filePath) ?? files[0];
+  if (!file) return preview;
+  return { fileName: file.path.split(/[\\/]/).pop() ?? file.path,
+    filePath: file.path, added: file.added, removed: file.removed };
+});
 const hasArgs = computed(() => inputSections.value.length > 0);
 const hasOutput = computed(() => outputSections.value.length > 0);
 const executionApproved = computed(() => isExecutionApprovedProgress(toolCall.value?.progress));
@@ -332,14 +344,17 @@ const defaultAutoExpandTool = computed(() => [
   'write',
   'edit'
 ].includes(props.part.functionCall.name));
-const hasDetails = computed(() => hasArgs.value
+const hasDetails = computed(() => hasFilePreview.value
+  || detailSections.value.length > 0
+  || hasArgs.value
   || hasOutput.value
   || toolResponseParts.value.length > 0
   || terminalResultDetailUnavailable.value
   || Boolean(toolCall.value?.error)
   || executionApprovalPending.value
   || hasMandatoryInteraction.value);
-const autoExpandDetails = computed(() => hasMandatoryInteraction.value
+const autoExpandDetails = computed(() => hasFilePreview.value
+  || hasMandatoryInteraction.value
   || toolCall.value?.display?.autoExpand === true
   || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value));
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
@@ -467,6 +482,7 @@ watch(autoExpandDetails, (autoExpand) => {
 }, { immediate: true });
 
 watch(() => toolCall.value?.id, () => {
+  callDetailsExpanded.value = false;
   userChangedExpanded.value = false;
   expanded.value = autoExpandDetails.value;
   autoOpenedActionIds.value = new Set();
@@ -1153,6 +1169,30 @@ function isFinalizingProgress(progress: unknown): boolean {
           @panel-expanded-change="updatePlanSectionExpanded(section, $event)"
         />
       </ContentBlockSection>
+      <CollapsibleContentBlock
+        v-if="detailSections.length > 0"
+        v-model:expanded="callDetailsExpanded"
+        class="tool-call-details"
+        kind="input"
+        aria-label="调用详情"
+        lazy
+      >
+        <template #summary>调用详情</template>
+        <ContentBlockSection
+          v-for="(section, index) in detailSections"
+          :key="`detail-${index}-${section.title}`"
+          :kind="section.kind"
+          :title="section.title"
+          :text="section.text"
+        >
+          <div v-if="section.rows?.length" class="tool-display-rows" :class="`is-${section.rowStyle ?? 'keyValue'}`">
+            <template v-for="(row, rowIndex) in section.rows" :key="`${rowIndex}-${row.label}`">
+              <span class="tool-display-row-label">{{ row.label }}</span>
+              <span class="tool-display-row-value">{{ row.value }}</span>
+            </template>
+          </div>
+        </ContentBlockSection>
+      </CollapsibleContentBlock>
       <div v-if="toolResponseParts.length > 0" class="tool-response-attachments" aria-label="工具返回附件">
         <InlineDataPartView
           v-for="(attachment, index) in toolResponseParts"

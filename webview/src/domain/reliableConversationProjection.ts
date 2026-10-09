@@ -495,20 +495,20 @@ function projectReliableFileChanges(
       const memberId = text(member.id);
       if (!memberId) continue;
       const detail = details[reliableKernelDetailKey('file-change-diff', memberId)];
-      if (!detail || detail.status === 'loading') {
+      if (!detail || detail.status === 'loading' || detail.status === 'error' && !detail.terminalError) {
         missingMemberIds.push(memberId);
-        continue;
       }
-      if (detail.status === 'error') {
-        if (!detail.terminalError) missingMemberIds.push(memberId);
-        continue;
-      }
-      const payload = record(parsedDetail(detail).value);
+      // File identity comes from the change member, not from successful diff rendering. Empty
+      // files, directories and a still-loading preview must not disappear from the tool card.
+      const payload = detail?.status === 'ready' ? record(parsedDetail(detail).value) : undefined;
       const diff = record(payload?.diff);
-      const diffText = textPreserveWhitespace(diff?.text);
-      const path = text(payload?.path);
-      if (!diffText || !path) continue;
-      const action = text(payload?.action);
+      const diffText = textPreserveWhitespace(diff?.text) ?? '';
+      const path = text(member.target_path);
+      if (!path) continue;
+      const action = ({
+        create_file: 'created', replace_file: 'modified', delete_file: 'deleted',
+        create_directory: 'created-directory', delete_directory_tree: 'deleted-directory'
+      } as Record<string, string>)[String(member.operation)] ?? text(payload?.action);
       const added = finiteNumber(diff?.added);
       const removed = finiteNumber(diff?.removed);
       files.push({

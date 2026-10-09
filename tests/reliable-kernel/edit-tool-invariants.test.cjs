@@ -400,7 +400,7 @@ test('mixed-EOL files keep untouched separators while replacement uses the match
   });
 });
 
-test('edit keeps execution selection and ignored branch diagnostics', async (t) => {
+test('edit keeps branch diagnostics in collapsed call details without exposing parameters in the preview', async (t) => {
   const previousWindow = globalThis.window;
   globalThis.window = {
     addEventListener() {}, removeEventListener() {},
@@ -416,10 +416,11 @@ test('edit keeps execution selection and ignored branch diagnostics', async (t) 
   const { editToolDisplay } = await server.ssrLoadModule('/src/components/content/toolDisplay/fileChangeToolDisplay.ts');
   const display = (args, result) => {
     const view = editToolDisplay({ toolName: 'edit', args, result, events: [], stringifyValue: JSON.stringify });
+    assert.deepEqual(view.inputSections, [], 'parameters do not appear in the main preview');
     return {
       ...view,
-      inputDetails: view.inputSections.filter(section => section.kind === 'input'),
-      outputDetails: (view.outputSections ?? []).filter(section => section.kind === 'output')
+      inputDetails: view.detailSections.filter(section => section.kind === 'input'),
+      outputDetails: view.detailSections.filter(section => section.kind === 'output')
     };
   };
   const row = (section, label) => section.rows?.find((item) => item.label === label)?.value;

@@ -304,3 +304,5 @@ docs/architecture/*
 !/tests/reliable-kernel/tool-argument-admission.test.mjs
 !/tests/reliable-kernel/command-tool-presentation.test.mjs
 !/tests/reliable-kernel/file-tool-arguments.test.cjs
+!/tests/reliable-kernel/file-change-preview-ui.test.mjs
+!/tests/webview-file-change-preview.browser.mjs
