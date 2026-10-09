@@ -1369,3 +1369,67 @@ async function seedLegacyChildRuntimeContinuation(runtime, store, conversationId
   ]);
   return { deliveryId, childExecutionId, sourceTurnId, ids };
 }
+
+for (const changedBeforeUpgrade of [false, true]) test(`已合并 epoch 5 来源升级${changedBeforeUpgrade ? '不掩盖既有内容变化' : '延续原合并结果且明确操作报告没有新内容'}`, async () => {
+  const fixture = await createPublishedRuntime(5, { workspaceScope: true });
+  const paths = { globalStoragePath: fixture.cleanupRoot };
+  const load = name => require(path.resolve('dist/extension/backend/reliableKernel', name));
+  const ledger = load('runtimeDataSetMergeLedger.js');
+  const { runtimeDataSetFileState } = load('runtimeDataSetFacts.js');
+  const { registerRuntimeHistoryConvergence } = load('runtimeHistoryConvergence.js');
+  const { readRuntimeHistoryPending } = load('runtimeHistoryRegistry.js');
+  const { resolveVscodeRuntimeDataSet } = load('vscodeRootAuthority.js');
+  const { mergeHistoricalDataSetsOnline } = load('runtimeDataSetMerge.js');
+  const currentAuthority = kernel.createVscodeRootAuthority({ configurationRootPath: fixture.cleanupRoot,
+    runtimeDataRootPath: kernel.resolveVscodeRuntimeDataRoot(paths) });
+  let current;
+  try {
+    const currentBinding = await kernel.initializeEmptyRuntimeRoot(currentAuthority);
+    await publishInitialRuntimeSelection(paths, 'default');
+    current = await kernel.RuntimeDatabase.open(currentAuthority);
+    await current.transaction([kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+      id: fixture.conversationId, title: '目标合入后又更新了对话', status: 'active',
+      created_at: '2026-09-01T00:00:00.000Z', updated_at: '2026-10-01T00:00:00.000Z'
+    })]);
+    const input = upgradeInput(fixture);
+    const candidate = await resolveVscodeRuntimeDataSet(paths, input.candidateId);
+    const source = { dataSetId: fixture.previous.dataSetId, rootInstanceId: fixture.previous.rootInstanceId,
+      rootGeneration: fixture.previous.rootGeneration, pointerRevision: fixture.previous.pointerRevision,
+      contentDigest: 'previously-verified-merge-content' };
+    await ledger.writeRuntimeDataSetMergeLedgerRecord(paths, { candidateId: input.candidateId, state: 'merged', source,
+      target: { dataSetId: currentBinding.dataSetId, rootInstanceId: currentBinding.rootInstanceId },
+      mergedAt: '2026-09-30T00:00:00.000Z', insertedRows: 1, reusedRows: 0, insertedConversations: 1,
+      insertedConversationIds: [fixture.conversationId] });
+    await ledger.rememberRuntimeDataSetFingerprint(candidate, await runtimeDataSetFileState(fixture.paths.databasePath), source);
+    if (changedBeforeUpgrade) {
+      const db = new Database(fixture.paths.databasePath);
+      try { db.prepare('UPDATE conversation SET title=? WHERE id=?').run('来源后来也有更新', fixture.conversationId); }
+      finally { db.close(); }
+    }
+    const result = await kernel.upgradeRuntimeDataSet(paths, input);
+    assert.equal(result.migrated, true);
+    const upgraded = await resolveVscodeRuntimeDataSet(paths, input.candidateId);
+    const record = await ledger.readRuntimeDataSetMergeLedgerRecord(paths, input.candidateId);
+    assert.deepEqual(record.source, source, '不编造新摘要，不覆盖原成功来源');
+    assert.equal(record.mergedAt, '2026-09-30T00:00:00.000Z');
+    assert.deepEqual(record.mergedInto[0].conversationIds, [fixture.conversationId]);
+    assert.equal(!!record.formatUpgrade, !changedBeforeUpgrade);
+    assert.equal(await ledger.runtimeDataSetMergeSourceUnchanged(upgraded, record), !changedBeforeUpgrade);
+    await registerRuntimeHistoryConvergence(paths);
+    assert.equal((await readRuntimeHistoryPending(paths)).has(input.candidateId), changedBeforeUpgrade);
+    if (changedBeforeUpgrade) return;
+    const report = await mergeHistoricalDataSetsOnline(paths, { configurationRootPath: fixture.cleanupRoot, database: current },
+      { requested: true, candidateIds: [input.candidateId] });
+    assert.deepEqual([report.failures, report.blocked, report.deferred], [[], [], []]);
+    assert.equal(report.merged.length, 1);
+    assert.equal(report.merged[0].alreadyMerged, true);
+    assert.equal(report.merged[0].insertedRows, 0);
+    const db = new Database(fixture.paths.databasePath);
+    try { db.prepare('UPDATE conversation SET title=? WHERE id=?').run('升级后来源的新编辑', fixture.conversationId); }
+    finally { db.close(); }
+    assert.equal(await ledger.runtimeDataSetMergeSourceUnchanged(upgraded, record), false, '升级后的新编辑不能被跳过');
+  } finally {
+    await current?.close();
+    await fs.rm(fixture.cleanupRoot, { recursive: true, force: true });
+  }
+});

@@ -99,6 +99,8 @@ export type RuntimeDataSetMergeLedgerRecord = {
   candidateId: string;
   source: RuntimeDataSetFingerprint;
   updatedAt: string;
+  /** A format-only upgrade of an already merged source; no new content identity is invented. */
+  formatUpgrade?: { rootGeneration: number; pointerRevision: number; files: string };
   /** Revision of a derived refusal only, never part of content identity or commit proof. */
   validationRevision?: string;
   /**
@@ -247,6 +249,33 @@ export async function cachedRuntimeDataSetFingerprint(candidate: VscodeRuntimeDa
   const files = await runtimeDataSetFileState(binding.paths.databasePath);
   const cached = await readFingerprintCache({ globalStoragePath: candidate.configurationRootPath }, candidate.id).catch(() => undefined);
   return cached?.files === files && sameFingerprintIdentity(cached.fingerprint, fingerprintIdentity(binding)) ? cached.fingerprint : undefined;
+}
+
+/** Reuse an existing merge proof, including a source changed only by our offline format upgrade. */
+export async function runtimeDataSetMergeSourceUnchanged(
+  candidate: VscodeRuntimeDataSetCandidate,
+  record: RuntimeDataSetMergeLedgerRecord,
+  fingerprint?: RuntimeDataSetFingerprint
+): Promise<boolean> {
+  if (!sameRuntimeDataSetIdentity(record.source, candidate)) return false;
+  if (sameRuntimeDataSetFingerprint(record.source, fingerprint ?? await cachedRuntimeDataSetFingerprint(candidate))) return true;
+  const upgrade = record.state === 'merged' ? record.formatUpgrade : undefined;
+  if (!upgrade) return false;
+  const binding = await requireCompleteRuntimeDataSet(candidate);
+  return upgrade.rootGeneration === binding.rootGeneration && upgrade.pointerRevision === binding.pointerRevision
+    && upgrade.files === await runtimeDataSetFileState(binding.paths.databasePath);
+}
+
+/** Called within the existing offline upgrade admission, after its database has closed. */
+export async function rememberMergedSourceFormatUpgrade(
+  candidate: VscodeRuntimeDataSetCandidate,
+  record: RuntimeDataSetMergeLedgerRecord
+): Promise<void> {
+  const binding = await requireCompleteRuntimeDataSet(candidate);
+  await writeRuntimeDataSetMergeLedgerRecord({ globalStoragePath: candidate.configurationRootPath }, {
+    ...record, formatUpgrade: { rootGeneration: binding.rootGeneration, pointerRevision: binding.pointerRevision,
+      files: await runtimeDataSetFileState(binding.paths.databasePath) }
+  });
 }
 
 /**

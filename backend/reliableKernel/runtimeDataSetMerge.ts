@@ -44,7 +44,7 @@ removeRuntimeDataSetMergeCommit,
 removeRuntimeDataSetMergeFinalization,removeRuntimeDataSetMergeLedgerRecord,
 removeRuntimeLargeMergeTargetBackupFile,
 restoreRuntimeDataSetMergeLedgerRecord,runtimeDataSetConversationsMergedFrom,runtimeDataSetFingerprint,runtimeDataSetLastMerge,
-runtimeDataSetMergeRecordName,
+runtimeDataSetMergeRecordName,runtimeDataSetMergeSourceUnchanged,
 sameRuntimeDataSetFingerprint,sameRuntimeDataSetIdentity,writeRuntimeDataSetMergeCommit,writeRuntimeDataSetMergeFinalization,
 writeRuntimeDataSetMergeLedgerRecord,
 type RuntimeDataSetAuditCacheEntry,type RuntimeDataSetAuditFacts,type RuntimeDataSetFingerprint,type RuntimeDataSetIdentity,
@@ -996,7 +996,9 @@ async function selectSource(
   const { record, pendingAt, pending } = source;
   const reference: SourceRef = source.candidate ?? { id: source.id, ...source.identity, ...(source.label ? { label: source.label } : {}) };
   const later = record !== undefined && fingerprint === 'uncached';
-  const unchanged = record !== undefined && fingerprint !== 'uncached' && sameRuntimeDataSetFingerprint(record.source, fingerprint);
+  const unchanged = record !== undefined && ((fingerprint !== 'uncached' && sameRuntimeDataSetFingerprint(record.source, fingerprint))
+    || (source.candidate !== undefined && record.formatUpgrade !== undefined
+      && await runtimeDataSetMergeSourceUnchanged(source.candidate, record, fingerprint === 'uncached' ? undefined : fingerprint)));
   if ((record?.state === 'merged' || (record?.state === 'partial' && !source.requested)) && sameRuntimeDataSetIdentity(record.target, target.identity) && unchanged) {
     const completed = await completeHistoricalMerge(paths, record, source.candidate);
     if (!completed) return 'work';
@@ -1719,6 +1721,10 @@ async function settledSource(
     // Whether a foreign root is unchanged is read under its hold only (a merge of it takes one).
     if (foreign && !state.foreign) return undefined;
     const candidate = await sourceCandidate(paths, candidateId, state);
+    if (!isForeignCandidate(candidate) && recorded.formatUpgrade
+      && await runtimeDataSetMergeSourceUnchanged(candidate, recorded)) {
+      return { kind: 'current', result: await currentResult(paths, candidate, target, state) };
+    }
     const fingerprint = await sourceFingerprint(candidate).catch(() => undefined);
     return sameRuntimeDataSetIdentity(recorded.source, candidate) && sameRuntimeDataSetFingerprint(recorded.source, fingerprint)
       ? { kind: 'current', result: await currentResult(paths, candidate, target, state) } : undefined;

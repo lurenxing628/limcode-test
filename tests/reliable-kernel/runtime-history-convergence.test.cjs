@@ -11,7 +11,7 @@ function load(relative, dependencies) {
   const module = { exports: {} };
   vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.resolve(__dirname, '../..', relative), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
-  }).outputText, { module, exports: module.exports, require: name => dependencies[name] ?? require(name) });
+  }).outputText, { module, exports: module.exports, AbortController, require: name => dependencies[name] ?? require(name) });
   return module.exports;
 }
 
@@ -24,7 +24,10 @@ test('收敛登记仅入队新来源，残留须显式重试，通知来源跨�
     './runtimeHostControl': { withRuntimeDataRootAdmission: async (_, run) => run() },
     './runtimeForeignHistory': { discoverForeignRuntimeHistory: async () => foreign, heldDatabaseFiles: async () => new Set(), readForeignRuntimePointerIdentity: async () => ({ dataSetId: 'data', rootInstanceId: 'root' }) },
     './vscodeRootAuthority': { inspectVscodeRuntimeDataSets: async () => ({ candidates }) },
-    './runtimeDataSetMergeLedger': { ledgerFile: async (_, section, id) => `${section}/${id}`, writeLedgerJson: async (_, section, id, value) => records.set(`${section}/${id}`, value) },
+    './runtimeDataSetMergeLedger': { ledgerFile: async (_, section, id) => `${section}/${id}`, writeLedgerJson: async (_, section, id, value) => records.set(`${section}/${id}`, value),
+      readRuntimeDataSetMergeLedgerRecord: async (_, id) => records.get(`records/${id}`),
+      sameRuntimeDataSetIdentity: (a, b) => !!a && !!b && a.dataSetId === b.dataSetId && a.rootInstanceId === b.rootInstanceId,
+      runtimeDataSetMergeSourceUnchanged: async candidate => candidate.unchanged === true },
     './runtimeHistoryRegistry': { readRuntimeHistoryPending: async () => pending, readRuntimeHistoryResidual: async () => residual,
       writeRuntimeHistoryPending: async (_, item) => pending.set(item.id, item), reconcileRuntimeResetBackups: async () => {} }
   });
@@ -48,6 +51,20 @@ test('收敛登记仅入队新来源，残留须显式重试，通知来源跨�
   pending.set(foreign[0].id, { reason: '用户在残留列表里选择重新合并' });
   await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' });
   assert.equal(pending.get(foreign[0].id).reason, '用户在残留列表里选择重新合并');
+  const target = { dataSetId: 'current-data', rootInstanceId: 'current-root' };
+  Object.assign(candidates[0], target);
+  for (const [id, state, unchanged, differentTarget] of [
+    ['already-merged', 'merged', true, false], ['updated-source', 'merged', false, false],
+    ['partial-source', 'partial', true, false], ['another-target', 'merged', true, true]
+  ]) {
+    candidates.push({ id, selected: false, unchanged });
+    records.set(`records/${id}`, { state, target: differentTarget ? { dataSetId: 'other', rootInstanceId: 'root' } : target });
+  }
+  await api.registerRuntimeHistoryConvergence({ globalStoragePath: '/fixture' });
+  assert.equal(pending.has('already-merged'), false, '旧成功账本且来源未变，不因首次建立收敛登记重复入队');
+  for (const id of ['updated-source', 'partial-source', 'another-target']) assert.equal(pending.has(id), true, id);
+  assert.ok(records.get('/convergence').sourceIds.includes('already-merged'));
+
 });
 
 test('收尾同意落盘并绑定来源身份及用户看到的数量', async () => {
@@ -108,4 +125,119 @@ test('外来残留恢复身份后以当前来源 id 重新入队，并只重试�
   assert.equal(queued[0].pending.id, currentId);
   assert.equal(queued[0].pending.identity.dataSetId, 'restored-data');
   assert.deepEqual(retried, [currentId]);
+});
+
+function upgradeNotificationFixture() {
+  const rows = [{ conversation_id: 'bad', context_root_id: 'root', provenance_revision: 0n }];
+  const warnings = [], progress = [], attempts = [], explicit = [];
+  let fail = true;
+  const api = load('backend/application/reliableKernel/contextHandleUpgradeNotification.ts', {
+    vscode: { ProgressLocation: { Notification: 1 }, window: {
+      withProgress: async (options, run) => {
+        progress.push(options);
+        return run({ report() {} }, { isCancellationRequested: false, onCancellationRequested: () => ({ dispose() {} }) });
+      },
+      showWarningMessage: (text, ...actions) => new Promise(resolve => warnings.push({ text, actions, resolve }))
+    } },
+    '../../reliableKernel/conversationContextHandleState': {
+      readConversationContextHandleStateRow: async (_, id) => ({ state: rows.some(row => row.conversation_id === id) ? 'pending' : 'ready' })
+    },
+    '../../reliableKernel/conversationContextHandleUpgrade': {
+      listPendingContextHandleUpgrades: async () => rows.map(row => ({ ...row })),
+      upgradePendingConversationContextHandles: async (_, __, options) => {
+        options.signal.throwIfAborted();
+        const selected = rows.filter(row => !options.skipConversationIds.has(row.conversation_id));
+        attempts.push(selected.map(row => row.conversation_id));
+        for (const row of selected) if (!fail || row.conversation_id !== 'bad') rows.splice(rows.indexOf(row), 1);
+        return selected.filter(row => fail && row.conversation_id === 'bad').map(row => ({
+          conversationId: row.conversation_id, contextRootId: row.context_root_id,
+          provenanceRevision: String(row.provenance_revision), error: new Error('broken compression')
+        }));
+      },
+      upgradeConversationContextHandles: async (_, __, id, options) => {
+        options.signal.throwIfAborted(); explicit.push(id);
+        if (fail) throw new Error('explicit failure');
+        const index = rows.findIndex(row => row.conversation_id === id);
+        if (index >= 0) rows.splice(index, 1);
+      }
+    }
+  });
+  return { rows, warnings, progress, attempts, explicit, recover() { fail = false; }, application: { database: {}, contentStore: {} }, ...api };
+}
+
+test('引用目录失败通知在同一运行时去重，新会话继续升级，明确重试仍可执行', async () => {
+  const f = upgradeNotificationFixture();
+  const upgrade = () => f.upgradeContextHandlesWithProgress(f.application);
+  await Promise.all([upgrade(), upgrade()]);
+  assert.equal(f.progress.length, 1);
+  assert.equal(f.warnings.length, 1);
+  assert.deepEqual(f.warnings[0].actions, ['重试升级']);
+  await upgrade();
+  assert.equal(f.progress.length, 1, '重复事件不再弹出同一失败进度');
+  f.rows.push({ conversation_id: 'healthy', context_root_id: 'new-root', provenance_revision: 0n });
+  await upgrade();
+  assert.deepEqual(f.attempts[1], ['healthy']);
+  assert.equal(f.warnings.length, 1);
+  f.recover();
+  f.warnings[0].resolve('重试升级');
+  await new Promise(resolve => setImmediate(resolve));
+  await upgrade();
+  assert.equal(f.rows.length, 0);
+  assert.equal(f.progress.length, 3);
+});
+
+test('失败目录的根或来源代数变化后可以重新升级，明确单会话升级不被屏蔽', async () => {
+  const f = upgradeNotificationFixture();
+  await f.upgradeContextHandlesWithProgress(f.application);
+  f.rows[0].provenance_revision = 1n;
+  await f.upgradeContextHandlesWithProgress(f.application);
+  f.rows[0].context_root_id = 'changed-root';
+  await f.upgradeContextHandlesWithProgress(f.application);
+  assert.equal(f.attempts.length, 3);
+  await assert.rejects(f.upgradeContextHandlesWithProgress(f.application, undefined, 'bad'), /explicit failure/);
+  assert.deepEqual(f.explicit, ['bad']);
+  f.recover();
+  await f.upgradeContextHandlesWithProgress(f.application, undefined, 'bad');
+  assert.equal(f.rows.length, 0);
+});
+
+test('取消引用目录升级不记为失败，后续仍能继续', async () => {
+  const f = upgradeNotificationFixture();
+  const controller = new AbortController(); controller.abort();
+  await assert.rejects(f.upgradeContextHandlesWithProgress(f.application, controller.signal), { name: 'AbortError' });
+  assert.equal(f.warnings.length, 0);
+  await f.upgradeContextHandlesWithProgress(f.application);
+  assert.equal(f.attempts.length, 1);
+  assert.equal(f.warnings.length, 1);
+});
+
+test('待合并通知按钮调用既有合并命令，关闭或过期通知不执行', async () => {
+  const relative = 'vscode/commands/runtimeDataSetManagement.ts';
+  const parsed = ts.createSourceFile(relative, fs.readFileSync(path.resolve(__dirname, '../..', relative), 'utf8'), ts.ScriptTarget.Latest);
+  const dependencies = Object.fromEntries(parsed.statements.filter(ts.isImportDeclaration).map(item => [item.moduleSpecifier.text, {}]));
+  const notices = [], commands = [], saved = new Map(); let current = true;
+  Object.assign(dependencies, {
+    vscode: { window: { showInformationMessage: (text, ...actions) => new Promise(resolve => notices.push({ text, actions, resolve })) },
+      commands: { executeCommand: async command => commands.push(command) } },
+    '../../shared/extensionIdentity': { EXTENSION_COMMAND_IDS: { mergeAllRuntimeHistory: 'existing-merge-command' } },
+    '../../backend/capabilities/vscodeStorage/globalStatus': { loadCommittedGlobalStatus: async () => ({}), resolveDataRootUri: () => '/fixture' },
+    '../../backend/capabilities/vscodeStorage/paths': { createVscodeStoragePaths: () => ({ globalStoragePath: '/fixture' }) },
+    '../runtimeDataSetUpgradeLifetime': { canStartRuntimeDataSetUpgrade: () => true, runRuntimeDataSetUpgrade: async (_, run) => run() },
+    '../../backend/reliableKernel/runtimeHistoryConvergence': { registerRuntimeHistoryConvergence: async () => 0 },
+    '../../backend/reliableKernel/runtimeDataSetMerge': { RUNTIME_DATA_SET_MERGE_AWAITING_EXCLUSIVE: 'awaiting-exclusive',
+      mergeHistoricalDataSetsOnline: async () => ({ merged: [], failures: [], blocked: [], stopped: false,
+        deferred: [{ candidateId: 'old', code: 'awaiting-exclusive', message: 'waiting' }] }) }
+  });
+  const api = load(relative, dependencies);
+  const context = { globalState: { get: (key, fallback) => saved.get(key) ?? fallback, update: async (key, value) => saved.set(key, value) } };
+  const host = { product: { application: { database: {} } } };
+  for (const action of ['立即合并全部', undefined, '立即合并全部']) {
+    await api.mergeHistoricalDataSetsInBackground(context, host, () => current);
+    const notice = notices.at(-1);
+    assert.deepEqual(notice.actions, ['立即合并全部']);
+    if (notices.length === 3) current = false;
+    notice.resolve(action);
+    await new Promise(resolve => setImmediate(resolve));
+  }
+  assert.deepEqual(commands, ['existing-merge-command']);
 });

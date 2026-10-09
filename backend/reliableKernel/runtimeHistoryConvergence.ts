@@ -2,7 +2,8 @@ import * as fs from 'node:fs/promises';
 import { withRuntimeDataRootAdmission } from './runtimeHostControl';
 import { discoverForeignRuntimeHistory, heldDatabaseFiles, readForeignRuntimePointerIdentity } from './runtimeForeignHistory';
 import { inspectVscodeRuntimeDataSets } from './vscodeRootAuthority';
-import { ledgerFile, writeLedgerJson } from './runtimeDataSetMergeLedger';
+import { ledgerFile, writeLedgerJson, readRuntimeDataSetMergeLedgerRecord, runtimeDataSetMergeSourceUnchanged,
+  sameRuntimeDataSetIdentity } from './runtimeDataSetMergeLedger';
 import { readRuntimeHistoryPending, readRuntimeHistoryResidual, writeRuntimeHistoryPending, writeRuntimeHistoryResidual, reconcileRuntimeResetBackups } from './runtimeHistoryRegistry';
 
 type Paths = { globalStoragePath: string };
@@ -24,8 +25,15 @@ export async function registerRuntimeHistoryConvergence(paths: Paths, previousDa
     const pending = await readRuntimeHistoryPending(paths);
     const residual = await readRuntimeHistoryResidual(paths);
     const registeredAt = new Date().toISOString();
+    const target = local.candidates.find(item => item.selected);
     for (const candidate of local.candidates.filter(item => !item.selected)) {
       if (known.has(candidate.id) || pending.has(candidate.id) || residual.has(candidate.id)) continue;
+      const record = await readRuntimeDataSetMergeLedgerRecord(paths, candidate.id);
+      if (record?.state === 'merged' && sameRuntimeDataSetIdentity(record.target, target)
+        && await runtimeDataSetMergeSourceUnchanged(candidate, record)) {
+        known.add(candidate.id);
+        continue;
+      }
       await writeRuntimeHistoryPending(paths, { id: candidate.id, sourceKind: 'local', location: { kind: 'local', candidateId: candidate.id },
         ...(candidate.dataSetId && candidate.rootInstanceId ? { identity: { dataSetId: candidate.dataSetId, rootInstanceId: candidate.rootInstanceId } } : {}),
         reason: '升级收敛', registeredAt });

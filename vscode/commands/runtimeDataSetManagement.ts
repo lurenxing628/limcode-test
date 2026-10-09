@@ -285,7 +285,11 @@ export async function mergeHistoricalDataSetsInBackground(
   await reportHistoricalMerge(context, paths.globalStoragePath, report, stillCurrent, requested);
   const waiting = largeMergeSessionSources(report);
   if (waiting.length && stillCurrent() && !manualAll) {
-    void vscode.window.showInformationMessage('还有 ' + waiting.length + ' 份旧数据待合并，可选择“立即合并全部”。');
+    void vscode.window.showInformationMessage('还有 ' + waiting.length + ' 份旧数据待合并。', '立即合并全部')
+      .then(action => {
+        if (action === '立即合并全部' && stillCurrent()) return vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.mergeAllRuntimeHistory);
+        return undefined;
+      }).then(undefined, error => console.error('[LimCode] 立即合并全部未能启动。', error));
   }
   return report;
 }

@@ -14,6 +14,8 @@ import {
   assertNoSymbolicPath, createRuntimeDataSetDatabaseSnapshot, requireCompleteRuntimeDataSet
 } from './runtimeStorageInspection';
 import { auditRuntimeSnapshot } from './runtimeSnapshotAudit';
+import { readRuntimeDataSetMergeLedgerRecord, runtimeDataSetMergeSourceUnchanged,
+  rememberMergedSourceFormatUpgrade } from './runtimeDataSetMergeLedger';
 import {
   createVscodeRootAuthority, inspectVscodeRuntimeDataSets, resolveVscodeRuntimeDataSet,
   type VscodeRuntimeDataSetCandidate, type VscodeRuntimeDataSetInspection
@@ -165,6 +167,10 @@ export async function upgradeRuntimeDataSet(
 
       // Do not require a complete root before migration: the exact predecessor journal owns
       // recovery of valid 3→4, 3/4→5 and 3/4/5→6 pending boundaries, including a committed SQLite file.
+      const record = await readRuntimeDataSetMergeLedgerRecord(storagePaths, request.candidateId);
+      // Consult only already cached evidence before migration; do not hash the historical database again.
+      const mergedBeforeUpgrade = record?.state === 'merged'
+        && await runtimeDataSetMergeSourceUnchanged(current, record).catch(() => false);
       const migration = await migratePreviousRuntimeEpochIfRequired(authority, options);
       const upgraded = await resolveVscodeRuntimeDataSet(storagePaths, request.candidateId);
       assertExpectedIdentity(upgraded, request);
@@ -183,6 +189,7 @@ export async function upgradeRuntimeDataSet(
         beforeOpen: async (snapshotPath) => { await auditRuntimeSnapshot(snapshotPath, { binding }); }
       });
       await snapshot.close();
+      if (migration?.migrated && mergedBeforeUpgrade && record) await rememberMergedSourceFormatUpgrade(upgraded, record);
       return {
         candidateId: request.candidateId,
         binding,
