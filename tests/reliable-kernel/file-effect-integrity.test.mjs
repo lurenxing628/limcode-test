@@ -59,6 +59,169 @@ async function fixture(run) {
   }
 }
 
+async function readToolOutcome(h, toolCallId) {
+  const outcomes = await rows(h.database, 'ToolOutcome', { tool_call_id: toolCallId });
+  assert.equal(outcomes.length, 1);
+  const outcome = outcomes[0];
+  const metadata = (await rows(h.database, 'ContentObject', { id: outcome.content_object_id }))[0];
+  const body = JSON.parse((await h.store.read(metadata)).toString('utf8'));
+  assert.equal(body.toolCallId, toolCallId);
+  assert.equal(body.status, outcome.status);
+  return { ...body, contentObjectId: outcome.content_object_id };
+}
+
+const mixedEditArguments = mode => ({
+  path: 'note.txt', mode,
+  hunks: [{ oldContent: 'alpha', newContent: 'hunk-only' }],
+  insert: { line: 2, content: 'insert-only' },
+  delete: { startLine: 2, endLine: 2 }
+});
+const editCases = [
+  { mode: 'hunk', content: 'hunk-only\nbeta\ngamma\n', ignoredBranches: ['insert', 'delete'], warning: '已选择 mode=hunk；未执行分支：insert、delete。' },
+  { mode: 'insert', content: 'alpha\ninsert-only\nbeta\ngamma\n', ignoredBranches: ['hunks', 'delete'], warning: '已选择 mode=insert；未执行分支：hunks、delete。' },
+  { mode: 'delete', content: 'alpha\ngamma\n', ignoredBranches: ['hunks', 'insert'], warning: '已选择 mode=delete；未执行分支：hunks、insert。' }
+];
+
+for (const expected of editCases) {
+  test(`approved edit mode=${expected.mode} applies only its selected branch and publishes model-result metadata`, async () => fixture(async h => {
+    const target = path.join(h.root, 'note.txt');
+    const baseline = 'alpha\nbeta\ngamma\n';
+    await fs.writeFile(target, baseline);
+    const call = await h.propose('edit', mixedEditArguments(expected.mode));
+    assert.equal(call.members.length, 1);
+    assert.equal(call.members[0].targetContent, expected.content);
+    assert.equal(await fs.readFile(target, 'utf8'), baseline);
+    assert.equal((await rows(h.database, 'EffectIntent')).length, 0);
+    assert.equal((await rows(h.database, 'ToolOutcome')).length, 0);
+
+    const decision = await h.files.decide({ source: { kind: 'command', key: `approve-${call.id}` }, changeSetId: call.proposal.changeSetId, decision: 'approved' });
+    assert.equal(await fs.readFile(target, 'utf8'), baseline, 'approval alone must not mutate the file');
+    const result = await h.dispatcher.dispatchRecordAndReconcile(decision.preparedEffect.effectIntentId);
+    assert.equal(result.observation.outcome, 'succeeded');
+    assert.equal(result.terminal.status, 'succeeded');
+    assert.equal(await fs.readFile(target, 'utf8'), expected.content);
+    const outcome = await readToolOutcome(h, call.id);
+    assert.equal(outcome.detail.mode, expected.mode);
+    assert.deepEqual(outcome.detail.ignoredBranches, expected.ignoredBranches);
+    assert.equal(outcome.detail.warning, expected.warning);
+    assert.equal(outcome.detail.inferredMode, undefined);
+    const operations = await rows(h.database, 'Operation', { tool_call_id: call.id });
+    assert.equal(operations.length, 1);
+    assert.equal(operations[0].owner_id, call.proposal.changeSetId);
+    assert.equal(operations[0].status, 'succeeded');
+    const attempts = await rows(h.database, 'Attempt', { operation_id: operations[0].id });
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0].status, 'succeeded');
+    const receipts = await rows(h.database, 'EffectReceipt', { attempt_id: attempts[0].id });
+    assert.equal(receipts.length, 1);
+    assert.equal(receipts[0].outcome, 'succeeded');
+    const fileReceipts = await rows(h.database, 'FileMutationReceipt', { effect_receipt_id: receipts[0].id });
+    assert.equal(fileReceipts.length, 1);
+    assert.equal(fileReceipts[0].change_set_id, call.proposal.changeSetId);
+    assert.equal(fileReceipts[0].outcome, 'succeeded');
+  }));
+
+  test(`edit safely infers mode=${expected.mode} from its sole non-empty branch in the durable result`, async () => fixture(async h => {
+    const target = path.join(h.root, 'note.txt');
+    await fs.writeFile(target, 'alpha\nbeta\ngamma\n');
+    const allBranches = mixedEditArguments(expected.mode);
+    const branch = expected.mode === 'hunk' ? 'hunks' : expected.mode;
+    const call = await h.approve('edit', { path: 'note.txt', [branch]: allBranches[branch] });
+    assert.equal((await h.dispatcher.dispatchRecordAndReconcile(call.effect)).terminal.status, 'succeeded');
+    assert.equal(await fs.readFile(target, 'utf8'), expected.content);
+    const outcome = await readToolOutcome(h, call.id);
+    assert.equal(outcome.detail.mode, expected.mode);
+    assert.equal(outcome.detail.inferredMode, true);
+    assert.equal(outcome.detail.ignoredBranches, undefined);
+    assert.equal(outcome.detail.warning, undefined);
+  }));
+}
+
+for (const decision of ['rejected', 'cancelled']) {
+  test(`${decision} edit preserves selection metadata without executing any branch`, async () => fixture(async h => {
+    const target = path.join(h.root, 'note.txt');
+    const baseline = 'alpha\nbeta\ngamma\n';
+    await fs.writeFile(target, baseline);
+    const call = await h.propose('edit', mixedEditArguments('hunk'));
+    const input = { source: { kind: 'command', key: `${decision}-${call.id}` }, changeSetId: call.proposal.changeSetId, decision };
+    const result = await h.files.decide(input);
+    assert.equal(result.terminal.status, decision);
+    const outcome = await readToolOutcome(h, call.id);
+    assert.equal(outcome.detail.decision, decision);
+    assert.equal(outcome.detail.mode, 'hunk');
+    assert.deepEqual(outcome.detail.ignoredBranches, ['insert', 'delete']);
+    assert.equal(outcome.detail.warning, '已选择 mode=hunk；未执行分支：insert、delete。');
+    assert.equal(await fs.readFile(target, 'utf8'), baseline);
+    assert.equal((await rows(h.database, 'Operation')).length, 0);
+    assert.equal((await rows(h.database, 'EffectIntent')).length, 0);
+    assert.equal((await rows(h.database, 'EffectReceipt')).length, 0);
+    assert.equal((await h.files.decide(input)).deduplicated, true);
+    assert.deepEqual(await readToolOutcome(h, call.id), outcome);
+    assert.equal(await fs.readFile(target, 'utf8'), baseline);
+  }));
+}
+
+test('edit recovery and dispatch replay preserve frozen arguments without repeating the mutation', async () => fixture(async h => {
+  const target = path.join(h.root, 'note.txt');
+  await fs.writeFile(target, 'alpha\nbeta\ngamma\n');
+  const args = mixedEditArguments('hunk');
+  const call = await h.approve('edit', args);
+  args.mode = 'delete';
+  args.hunks[0].newContent = 'later caller mutation';
+  assert.equal(await h.effects.claimEffectDispatch(call.effect), true);
+  assert.equal((await h.dispatcher.executeDispatched(call.effect)).outcome, 'succeeded');
+  assert.equal(await fs.readFile(target, 'utf8'), 'hunk-only\nbeta\ngamma\n');
+  assert.equal((await rows(h.database, 'EffectReceipt')).length, 0, 'simulate interruption after file I/O but before its receipt');
+  const effects = new kernel.EffectControlPlane(h.database, h.store);
+  const files = new kernel.FileChangeControlPlane(h.database, h.store, effects);
+  const recovered = await files.recoverDispatchedEffect({ source: { kind: 'recovery', key: 'recover-edit-receipt-gap' }, effectIntentId: call.effect, resolver: h.resolver });
+  assert.equal(recovered.status, 'succeeded');
+  const outcome = await readToolOutcome(h, call.id);
+  assert.equal(outcome.detail.mode, 'hunk');
+  assert.deepEqual(outcome.detail.ignoredBranches, ['insert', 'delete']);
+  assert.equal(outcome.detail.warning, '已选择 mode=hunk；未执行分支：insert、delete。');
+  await fs.writeFile(target, 'later editor content');
+  const dispatcher = new kernel.FileMutationDispatcher(h.database, h.store, effects, () => { assert.fail('terminal replay must not inspect the workspace'); });
+  assert.equal((await dispatcher.dispatchRecordAndReconcile(call.effect)).terminal.status, 'succeeded');
+  const receipts = await rows(h.database, 'EffectReceipt');
+  assert.equal((await files.reconcileEffectReceipt(receipts[0].id)).status, 'succeeded');
+  assert.deepEqual(await readToolOutcome(h, call.id), outcome);
+  assert.equal(receipts.length, 1);
+  assert.equal((await rows(h.database, 'FileMutationReceipt')).length, 1);
+  assert.equal(await fs.readFile(target, 'utf8'), 'later editor content');
+}));
+
+test('batched no-effect edit rejection publishes selection metadata without claiming execution', async () => fixture(async h => {
+  const target = path.join(h.root, 'note.txt');
+  await fs.writeFile(target, 'alpha\nbeta\ngamma\n');
+  const calls = [
+    { id: 'blocked-hunk', arguments: mixedEditArguments('hunk') },
+    { id: 'blocked-insert', arguments: { path: 'note.txt', insert: { line: 2, content: 'insert-only' } } }
+  ];
+  for (const call of calls) await h.effects.createToolCall({ source: { kind: 'internal', key: `create-${call.id}` }, toolCallId: call.id,
+    turnId: 'turn', toolName: 'edit', arguments: call.arguments });
+  await h.effects.settleWithoutEffectBatch({ turnId: 'turn', settlements: calls.map(call => ({
+    source: { kind: 'internal', key: `reject-${call.id}` }, toolCallId: call.id, status: 'rejected', detail: { error: 'execution gate rejected this edit' }
+  })) });
+  const effects = new kernel.EffectControlPlane(h.database, h.store);
+  assert.equal((await effects.finalizeReadyInOrder('turn')).length, 2);
+  const hunk = await readToolOutcome(h, calls[0].id);
+  assert.equal(hunk.status, 'rejected');
+  assert.equal(hunk.detail.error, 'execution gate rejected this edit');
+  assert.equal(hunk.detail.mode, 'hunk');
+  assert.deepEqual(hunk.detail.ignoredBranches, ['insert', 'delete']);
+  assert.equal(hunk.detail.warning, '已选择 mode=hunk；未执行分支：insert、delete。');
+  const insert = await readToolOutcome(h, calls[1].id);
+  assert.equal(insert.status, 'rejected');
+  assert.equal(insert.detail.mode, 'insert');
+  assert.equal(insert.detail.inferredMode, true);
+  assert.equal(insert.detail.warning, undefined);
+  assert.equal((await effects.finalizeReadyInOrder('turn')).length, 0);
+  assert.equal((await rows(h.database, 'EffectIntent')).length, 0);
+  assert.equal((await rows(h.database, 'EffectReceipt')).length, 0);
+  assert.equal(await fs.readFile(target, 'utf8'), 'alpha\nbeta\ngamma\n');
+}));
+
 test('target CAS wait never overwrites a newer editor write', async () => fixture(async h => {
   const target = path.join(h.root, 'note.txt');
   await fs.writeFile(target, 'base');

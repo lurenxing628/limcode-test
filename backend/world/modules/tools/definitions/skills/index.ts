@@ -1,10 +1,22 @@
-import { SKILLS_TOOL_NAME } from '../../../../../../shared/protocol';
+import { SKILLS_TOOL_NAME, type SkillSource } from '../../../../../../shared/protocol';
+import { isEmptyToolArgument, ToolArgumentError, toolArgumentRecord } from '../../../../../../shared/toolArgumentUtils';
 import type { ToolDefinition } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 import { SKILL_SOURCE_PRIORITY, describeSkillLookupFailure, normalizeSkillSource, skillSourceDisplay } from '../../../skill/skillLookup';
 
-interface SkillsToolArgs { name?: unknown; source?: unknown }
+export function validateSkillsToolArguments(value: unknown): { name: string; source?: SkillSource } {
+  const args = toolArgumentRecord(value, 'skills arguments');
+  if (typeof args.name !== 'string' || !args.name.trim()) {
+    throw new ToolArgumentError('Missing required argument: name');
+  }
+  const emptySource = isEmptyToolArgument(args.source) || typeof args.source === 'string' && !args.source.trim();
+  const source = emptySource ? undefined : normalizeSkillSource(args.source);
+  if (!emptySource && !source) {
+    throw new ToolArgumentError(`skills.source must be one of ${SKILL_SOURCE_PRIORITY.map(skillSourceDisplay).join(', ')}; no skill was loaded.`);
+  }
+  return { name: args.name.trim(), ...(source ? { source } : {}) };
+}
 
 export const skillsToolModule = defineToolDefinitionModule({
   id: SKILLS_TOOL_NAME,
@@ -71,10 +83,14 @@ export const skillsTool: ToolDefinition = {
   scheduling: staticToolScheduling('parallel', 'readonly_skill_load'),
   summary: summarizeSkillsToolCall,
   async execute(rawArgs, deps) {
-    const args = (rawArgs ?? {}) as SkillsToolArgs;
-    const name = typeof args.name === 'string' ? args.name.trim() : '';
-    if (!name) return { ok: false, output: 'Missing required argument: name' };
-    const source = normalizeSkillSource(args.source);
+    let args: ReturnType<typeof validateSkillsToolArguments>;
+    try {
+      args = validateSkillsToolArguments(rawArgs);
+    } catch (error) {
+      if (!(error instanceof ToolArgumentError)) throw error;
+      return { ok: false, output: error.message };
+    }
+    const { name, source } = args;
     let lookup = deps.skills.lookup(name, source);
     if (lookup.status === 'missing' && !lookup.disabled) {
       // A skill created or installed moments ago (possibly by this agent) is found without a manual refresh.
@@ -99,8 +115,10 @@ export const skillsTool: ToolDefinition = {
 };
 
 function summarizeSkillsToolCall(rawArgs: unknown): string | undefined {
-  const args = (rawArgs ?? {}) as SkillsToolArgs;
-  const name = typeof args.name === 'string' ? args.name.trim() : '';
-  const source = normalizeSkillSource(args.source);
-  return name ? `载入技能 · ${source ? `${skillSourceDisplay(source)}:` : ''}${name}` : undefined;
+  try {
+    const { name, source } = validateSkillsToolArguments(rawArgs);
+    return `载入技能 · ${source ? `${skillSourceDisplay(source)}:` : ''}${name}`;
+  } catch {
+    return undefined;
+  }
 }

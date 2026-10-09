@@ -7,7 +7,8 @@ import type {
   ReliableAgentToolSettled
 } from './agentLoop';
 import type { AnswerControlPlane, RuntimeDeliveryControlPlane } from './answerDelivery';
-import { normalizeChildForkTurns } from './childContextFork';
+import { normalizeChildForkTurns, type ChildForkTurns } from './childContextFork';
+import { isEmptyToolArgument, normalizeToolInteger, ToolArgumentError, toolArgumentRecord } from '../../shared/toolArgumentUtils';
 import {
   childContinuationTurnId,
   childExecutionSpawnIdentity,
@@ -277,6 +278,19 @@ export class ReliableChildAgentCoordinator {
     if (this.handoff) throw this.handoff;
     const aborted = await this.settleUserAbort(input.toolCallId, signal, 'before-special-dispatch');
     if (aborted) return aborted;
+    if (input.toolName === 'run_agent' || input.toolName === 'read_agent_answer') {
+      const operations = await this.list('Operation', { tool_call_id: input.toolCallId }, 1);
+      if (operations.length > 0) {
+        const settled = await this.dependencies.children.finalizeWaitSettlement(input.toolCallId);
+        if (settled) return this.childWaitResult(settled);
+        // Existing work belongs to its durable child/continuation facts. Recovery resumes those
+        // facts without parsing old arguments or assigning the task a second time.
+        this.triggerRecoveryPass();
+        return { disposition: 'paused', toolCallId: input.toolCallId,
+          reason: operations[0].status === 'waiting_answer' ? 'awaiting_child' : 'converging',
+          resumeKey: requireId(operations[0].owner_id, 'Operation.owner_id') };
+      }
+    }
     switch (input.toolName) {
       case 'run_agent':
         return this.runAgent(input, signal, authority, admission);
@@ -2058,16 +2072,14 @@ export class ReliableChildAgentCoordinator {
     authority?: ReliableToolDispatchAuthority,
     admission?: ReliableSpecialToolAdmission
   ): Promise<ChildDispatchResult> {
-    const args = requireRecord(input.arguments, 'run_agent arguments');
-    const operation = requireText(args.operation, 'run_agent.operation');
-    assertRunAgentArguments(operation, args);
+    const args = validateRunAgentToolArguments(input.arguments);
+    const operation = args.operation;
     switch (operation) {
       case 'spawn':
         requireText(args.taskName, 'run_agent.taskName');
         return this.spawnChild(input, args, requireText(args.prompt, 'run_agent.prompt'),
           requireWaitMs(args.foregroundWaitMs), authority, signal, admission);
       case 'send':
-        if (args.interrupt !== undefined && typeof args.interrupt !== 'boolean') throw new Error('run_agent.interrupt must be a boolean.');
         return this.continueChild(input, requireText(args.answerBridgeId, 'run_agent.answerBridgeId'),
           requireText(args.prompt, 'run_agent.prompt'), requireWaitMs(args.foregroundWaitMs), args.interrupt === true, signal, admission);
       case 'list':
@@ -2210,7 +2222,7 @@ export class ReliableChildAgentCoordinator {
       : undefined;
     const inheritance = childThinkingInheritanceFromAuthority(authority?.document);
     const inheritedThinkingOverride = childThinkingOverrideForSpawn(inheritance);
-    const skillNames = normalizeRunAgentSkillNames(args.skills);
+    const skillNames = (args.skills as string[] | undefined) ?? [];
     const skillLoader = this.dependencies.skills;
     if (skillNames.length > 0 && !skillLoader) {
       throw new Error('当前宿主没有接入技能目录，run_agent 不能预载技能；没有创建子 Agent。请去掉 skills，在 prompt 里让子 Agent 自己载入。');
@@ -2229,7 +2241,7 @@ export class ReliableChildAgentCoordinator {
           load: async (names: readonly string[], policy: Pick<SkillPolicyRecord, 'sourceConfigs'> | undefined) =>
             (await skillLoader!.loadSkillsWithinPolicy(names, policy)).map((loaded) => loaded.text)
         } } : {}),
-        forkTurns: normalizeChildForkTurns(args.forkTurns),
+        forkTurns: (args.forkTurns as ChildForkTurns | undefined) ?? 'none',
         completionPolicy,
         sourceSettlement: 'child_handle',
         ...(deadline ? { waitDeadlineAt: deadline } : {}),
@@ -2548,7 +2560,7 @@ export class ReliableChildAgentCoordinator {
   }
 
   private async readAnswer(input: ReliableAgentToolDispatchInput): Promise<ChildDispatchResult> {
-    const args = requireRecord(input.arguments, 'read_agent_answer arguments');
+    const args = validateReadAgentAnswerToolArguments(input.arguments);
     const answerBridgeId = requireText(args.answerBridgeId, 'read_agent_answer.answerBridgeId');
     await this.scopedSnapshotForBridge(input, answerBridgeId, childTaskScope(args.scope));
     const answer = await this.dependencies.answers.readCurrent(answerBridgeId);
@@ -3413,16 +3425,7 @@ function assertExpectedPlanDelegation(
 const CHILD_LEASE_DURATION_MS = 30_000;
 
 function requireWaitMs(value: PlainJsonValue | undefined): number {
-  if (value === undefined) return 0;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0 || value > 86_400_000) {
-    throw new TypeError('run_agent.foregroundWaitMs 省略时默认为 0；传入时必须是 0 到 86400000 的整数毫秒数。');
-  }
-  return value;
-}
-
-function requireRecord(value: PlainJsonValue | undefined, label: string): { [key: string]: PlainJsonValue } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
-  return value;
+  return normalizeToolInteger(value, 'run_agent.foregroundWaitMs', 0, 0, 86_400_000);
 }
 
 function optionalRecord(value: PlainJsonValue | undefined): { [key: string]: PlainJsonValue } | undefined {
@@ -3443,36 +3446,123 @@ function optionalText(value: PlainJsonValue | undefined): string {
   return typeof value === 'string' ? value.trim() : '';
 }
 
-function assertRunAgentArguments(operation: string, args: { [key: string]: PlainJsonValue }): void {
-  if (!(RUN_AGENT_OPERATIONS as readonly string[]).includes(operation)) {
-    throw new Error(`Unsupported run_agent operation: ${operation}.`);
+const RUN_AGENT_OPERATION_FIELDS: Record<typeof RUN_AGENT_OPERATIONS[number], readonly string[]> = {
+  spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs', 'forkTurns', 'skills'],
+  send: ['answerBridgeId', 'prompt', 'interrupt', 'foregroundWaitMs'],
+  list: ['scope', 'status', 'limit', 'cursor'],
+  read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
+  wait: ['answerBridgeId', 'answerBridgeIds', 'scope', 'timeoutMs'],
+  interrupt_subtree: ['answerBridgeId']
+};
+const RUN_AGENT_ARGUMENT_FIELDS = new Set(Object.values(RUN_AGENT_OPERATION_FIELDS).flat());
+
+/** Canonical internal arguments, after the model's childRef/childRefs have been resolved. */
+export function validateRunAgentToolArguments(value: unknown): { [key: string]: PlainJsonValue } & {
+  operation: typeof RUN_AGENT_OPERATIONS[number];
+} {
+  const raw = toolArgumentRecord(value, 'run_agent arguments');
+  if (typeof raw.operation !== 'string' || !(RUN_AGENT_OPERATIONS as readonly string[]).includes(raw.operation.trim())) {
+    throw new ToolArgumentError(`run_agent.operation must explicitly select ${RUN_AGENT_OPERATIONS.join(', ')}; no child task was started.`);
   }
-  const fields: Record<string, readonly string[]> = {
-    spawn: ['taskName', 'prompt', 'agent', 'foregroundWaitMs', 'forkTurns', 'skills'],
-    send: ['answerBridgeId', 'prompt', 'interrupt', 'foregroundWaitMs'],
-    list: ['scope', 'status', 'limit', 'cursor'],
-    read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
-    wait: ['answerBridgeId', 'answerBridgeIds', 'scope', 'timeoutMs'],
-    interrupt_subtree: ['answerBridgeId']
+  const operation = raw.operation.trim() as typeof RUN_AGENT_OPERATIONS[number];
+  const allowed = new Set(['scheduling', ...RUN_AGENT_OPERATION_FIELDS[operation]]);
+  const args: { [key: string]: PlainJsonValue } & { operation: typeof operation } = { operation };
+  for (const [key, entry] of Object.entries(raw)) {
+    if (key === 'operation' || emptyAgentArgument(entry)) continue;
+    if (allowed.has(key)) args[key] = entry as PlainJsonValue;
+  }
+  try {
+    if (args.scheduling !== undefined && args.scheduling !== 'serial' && args.scheduling !== 'parallel') {
+      throw new ToolArgumentError('run_agent.scheduling must be parallel or serial.');
+    }
+    if (operation === 'spawn') {
+      args.taskName = requireText(args.taskName, 'run_agent.taskName');
+      args.prompt = requireText(args.prompt, 'run_agent.prompt');
+      if (args.forkTurns !== undefined) args.forkTurns = normalizeChildForkTurns(args.forkTurns);
+      if (args.skills !== undefined) args.skills = normalizeRunAgentSkillNames(args.skills);
+    } else if (operation === 'send') {
+      args.answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
+      args.prompt = requireText(args.prompt, 'run_agent.prompt');
+      if (args.interrupt !== undefined && typeof args.interrupt !== 'boolean') {
+        throw new ToolArgumentError('run_agent.interrupt must be a boolean.');
+      }
+    } else if (operation === 'read' || operation === 'interrupt_subtree') {
+      args.answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
+    } else if (operation === 'wait') {
+      const references = childTaskWaitReferences(args);
+      if (args.answerBridgeId !== undefined) {
+        args.answerBridgeId = references[0];
+        delete args.answerBridgeIds;
+      } else args.answerBridgeIds = references;
+    }
+    if (args.agent !== undefined) {
+      const agent = toolArgumentRecord(args.agent, 'run_agent.agent');
+      args.agent = emptyAgentArgument(agent.type) ? {} : { type: requireText(agent.type as PlainJsonValue, 'run_agent.agent.type') };
+    }
+    if (args.foregroundWaitMs !== undefined) args.foregroundWaitMs = requireWaitMs(args.foregroundWaitMs);
+    if (args.scope !== undefined) args.scope = childTaskScope(args.scope);
+    if (args.limit !== undefined) args.limit = boundedChildTaskInteger(args.limit, 'limit', 32, 1, 100);
+    if (args.timeoutMs !== undefined) args.timeoutMs = boundedChildTaskInteger(args.timeoutMs, 'timeoutMs', 0, 0, 60_000);
+    if (args.status !== undefined) args.status = requireChildExecutionStatus(args.status, 'run_agent.status');
+    if (args.cursor !== undefined) args.cursor = requireText(args.cursor, 'run_agent.cursor');
+  } catch (error) {
+    if (error instanceof ToolArgumentError) throw error;
+    if (error instanceof Error) throw new ToolArgumentError(error.message);
+    throw error;
+  }
+  return args;
+}
+
+/** This tool only reads the selected answer; extra operation controls do not change that action. */
+export function validateReadAgentAnswerToolArguments(value: unknown): { [key: string]: PlainJsonValue } {
+  const raw = toolArgumentRecord(value, 'read_agent_answer arguments');
+  try {
+    return {
+      answerBridgeId: requireText(raw.answerBridgeId as PlainJsonValue, 'read_agent_answer.answerBridgeId'),
+      ...(emptyAgentArgument(raw.scope) ? {} : { scope: childTaskScope(raw.scope as PlainJsonValue) })
+    };
+  } catch (error) {
+    if (error instanceof Error) throw new ToolArgumentError(error.message);
+    throw error;
+  }
+}
+
+/** Result presentation from the frozen input; never rewrites canonical arguments or starts work. */
+export function agentToolArgumentMetadata(toolName: string, value: unknown): {
+  ignoredFields?: string[];
+  warning?: string;
+  adjustedArguments?: Record<string, number>;
+} {
+  if (toolName !== 'run_agent' && toolName !== 'read_agent_answer') return {};
+  const raw = toolArgumentRecord(value, `${toolName} arguments`);
+  const args = toolName === 'run_agent' ? validateRunAgentToolArguments(raw) : validateReadAgentAnswerToolArguments(raw);
+  const operation = toolName === 'run_agent' ? args.operation as typeof RUN_AGENT_OPERATIONS[number] : 'read';
+  const allowed = new Set(toolName === 'run_agent'
+    ? ['scheduling', ...RUN_AGENT_OPERATION_FIELDS[operation]]
+    : ['answerBridgeId', 'scope']);
+  if (operation === 'wait' && !emptyAgentArgument(raw.answerBridgeId)) allowed.delete('answerBridgeIds');
+  const fields = [...RUN_AGENT_ARGUMENT_FIELDS, 'childRef', 'childRefs', 'mode', ...(toolName === 'read_agent_answer' ? ['operation', 'scheduling'] : [])];
+  const ignoredFields = [...new Set(fields.filter(key => !allowed.has(key) && !emptyAgentArgument(raw[key]))
+    .map(key => key === 'answerBridgeId' ? 'childRef' : key === 'answerBridgeIds' ? 'childRefs' : key))];
+  if (allowed.has('agent') && raw.agent && typeof raw.agent === 'object' && !Array.isArray(raw.agent)
+    && !emptyAgentArgument((raw.agent as Record<string, unknown>).id)) ignoredFields.push('agent.id');
+  const adjustedArguments: Record<string, number> = {};
+  for (const key of ['foregroundWaitMs', 'timeoutMs', 'limit']) {
+    if (allowed.has(key) && !emptyAgentArgument(raw[key]) && typeof args[key] === 'number' && args[key] !== raw[key]) adjustedArguments[key] = args[key] as number;
+  }
+  const changes = [
+    ...(ignoredFields.length ? [`未使用参数：${ignoredFields.join('、')}`] : []),
+    ...(Object.keys(adjustedArguments).length ? [`已调整参数：${Object.keys(adjustedArguments).join('、')}`] : [])
+  ];
+  return {
+    ...(ignoredFields.length ? { ignoredFields } : {}),
+    ...(Object.keys(adjustedArguments).length ? { adjustedArguments } : {}),
+    ...(changes.length ? { warning: `已选择 ${toolName === 'run_agent' ? `operation=${operation}` : 'read_agent_answer'}；${changes.join('；')}。` } : {})
   };
-  const allowed = new Set(['operation', 'scheduling', ...fields[operation]]);
-  for (const key of Object.keys(args)) {
-    // Models often fill every schema field; an empty skills list asks for nothing and is fine anywhere.
-    if (key === 'skills' && Array.isArray(args.skills) && args.skills.length === 0) continue;
-    if (!allowed.has(key)) throw new Error(`run_agent.${operation} does not accept ${key}.`);
-  }
-  if (args.scheduling !== undefined && args.scheduling !== 'serial' && args.scheduling !== 'parallel') {
-    throw new Error('run_agent.scheduling must be parallel or serial.');
-  }
-  if (operation === 'spawn') {
-    normalizeChildForkTurns(args.forkTurns);
-    normalizeRunAgentSkillNames(args.skills);
-  }
-  if (args.agent !== undefined) {
-    const agent = requireRecord(args.agent, 'run_agent.agent');
-    if (Object.keys(agent).some(key => key !== 'type')) throw new Error('run_agent.agent only accepts type.');
-    if (agent.type !== undefined) requireText(agent.type, 'run_agent.agent.type');
-  }
+}
+
+function emptyAgentArgument(value: unknown): boolean {
+  return isEmptyToolArgument(value) || typeof value === 'string' && value.trim() === '';
 }
 
 function childTaskScope(value: PlainJsonValue | undefined): 'direct' | 'tree' {
@@ -3483,11 +3573,7 @@ function childTaskScope(value: PlainJsonValue | undefined): 'direct' | 'tree' {
 
 function boundedChildTaskInteger(value: PlainJsonValue | undefined, name: string,
   fallback: number, minimum: number, maximum: number): number {
-  if (value === undefined) return fallback;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
-    throw new RangeError(`run_agent.${name} must be an integer from ${minimum} to ${maximum}.`);
-  }
-  return value;
+  return normalizeToolInteger(value, `run_agent.${name}`, fallback, minimum, maximum);
 }
 
 function scopedChildTask(projection: ConversationChildTaskProjection, bridgeId: string,
@@ -3501,9 +3587,6 @@ function scopedChildTask(projection: ConversationChildTaskProjection, bridgeId: 
 }
 
 function childTaskWaitReferences(args: { [key: string]: PlainJsonValue }): string[] {
-  if ((args.answerBridgeId !== undefined) === (args.answerBridgeIds !== undefined)) {
-    throw new Error('run_agent.wait requires exactly one of answerBridgeId or answerBridgeIds.');
-  }
   if (args.answerBridgeId !== undefined) return [requireText(args.answerBridgeId, 'run_agent.answerBridgeId')];
   if (!Array.isArray(args.answerBridgeIds) || args.answerBridgeIds.length < 1 || args.answerBridgeIds.length > 32) {
     throw new Error('run_agent.answerBridgeIds must contain 1 to 32 distinct references.');

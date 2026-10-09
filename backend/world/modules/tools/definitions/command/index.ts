@@ -5,6 +5,7 @@ import type { ToolConfigRecord } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
 import { normalizeSchedulingHint } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
+import { commandToolMode, validateCommandToolArguments } from '../../../../../../shared/commandToolArguments';
 
 export const commandToolModule = defineToolDefinitionModule({
   id: 'command',
@@ -27,7 +28,8 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           },
           mode: {
             type: 'string',
-            description: 'Operation mode. Defaults to execute. execute starts a new command; output reads one resumable page from a background process; kill terminates a background process. output/kill require a processId returned by an earlier execute result.'
+            enum: ['execute', 'output', 'kill'],
+            description: 'Operation mode. Defaults to execute. execute starts a new command; output reads one resumable page from a background process; kill terminates a background process. Only parameters used by the selected mode are consumed; unrelated parameters are ignored and reported. output/kill require a processId returned by an earlier execute result.'
           },
           command: {
             type: 'string',
@@ -44,21 +46,21 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
             minimum: 0,
             maximum: 60000,
             default: DEFAULT_COMMAND_FOREGROUND_WAIT_MS,
-            description: `Optional for mode=execute. Defaults to ${DEFAULT_COMMAND_FOREGROUND_WAIT_MS} milliseconds (10 seconds). Integer milliseconds from 0 to 60000 to wait before returning a still-running command as a background process. Use 0 to background immediately. This does not terminate the command; executionTimeoutMs controls the hard deadline.`
+            description: `Optional for mode=execute. Defaults to ${DEFAULT_COMMAND_FOREGROUND_WAIT_MS} milliseconds (10 seconds). Integer milliseconds from 0 to 60000 to wait before returning a still-running command as a background process; larger values are capped at 60000 and reported. Use 0 to background immediately. This does not terminate the command; executionTimeoutMs controls the hard deadline.`
           },
           executionTimeoutMs: {
             type: 'integer',
             minimum: 1000,
             maximum: 600000,
             default: 120000,
-            description: 'Optional hard execution deadline in milliseconds, independent of foregroundWaitMs. Defaults to 120000; allowed range 1000-600000. The detached runtime terminates the process group at this deadline and reports timed_out.'
+            description: 'Optional hard execution deadline in milliseconds, independent of foregroundWaitMs. Defaults to 120000; values are bounded to 1000-600000 and adjustments are reported. The detached runtime terminates the process group at this deadline and reports timed_out.'
           },
           maxOutputBytes: {
             type: 'integer',
             minimum: 1024,
             maximum: 1073741824,
             default: 268435456,
-            description: 'Optional combined stdout+stderr safety limit in bytes. Defaults to 268435456 (256 MiB); allowed range 1024-1073741824. Exceeding it terminates the process and reports output_limit_exceeded.'
+            description: 'Optional combined stdout+stderr limit in bytes. Defaults to 268435456 (256 MiB); values are bounded to 1024-1073741824 and adjustments are reported. Exceeding it terminates the process and reports output_limit_exceeded.'
           },
           processId: {
             type: 'string',
@@ -128,9 +130,11 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
     scheduling: (rawArgs) => resolveCommandScheduling(rawArgs),
     summary: summarizeCommandToolCall,
     async execute(rawArgs, deps, ctx) {
-      const args = (rawArgs ?? {}) as CommandToolArgs;
+      let args: CommandToolArgs;
+      try { args = validateCommandToolArguments(rawArgs) as CommandToolArgs; }
+      catch (error) { return { ok: false, output: error instanceof Error ? error.message : String(error) }; }
       const config = normalizeCommandToolConfig(ctx?.config);
-      const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
+      const mode = args.mode;
 
       if (mode === 'output' || mode === 'kill') {
         const processId = typeof args.processId === 'string' ? args.processId.trim() : '';
@@ -145,33 +149,10 @@ export function createCommandTool(command: CommandCapability): ToolDefinition {
           : { ok: true, output: deps.command.kill(processId) };
       }
 
-      const commandText = typeof args.command === 'string' ? args.command.trim() : '';
-      if (!commandText) return { ok: false, output: 'mode=execute 需要提供 command。' };
-      if (typeof args.explanation !== 'string' || args.explanation.trim().length === 0) {
-        return { ok: false, output: 'mode=execute 需要提供 explanation。' };
-      }
+      const commandText = args.command!.trim();
       const foregroundWaitMs = args.foregroundWaitMs === undefined
         ? DEFAULT_COMMAND_FOREGROUND_WAIT_MS
         : args.foregroundWaitMs;
-      if (typeof foregroundWaitMs !== 'number' || !Number.isSafeInteger(foregroundWaitMs) || foregroundWaitMs < 0 || foregroundWaitMs > 60_000) {
-        return { ok: false, output: `foregroundWaitMs 需为 0 到 60000 的整数毫秒数，省略时默认为 ${DEFAULT_COMMAND_FOREGROUND_WAIT_MS}（0 表示启动后立即转后台）。` };
-      }
-      if (args.executionTimeoutMs !== undefined && (
-        typeof args.executionTimeoutMs !== 'number'
-        || !Number.isSafeInteger(args.executionTimeoutMs)
-        || args.executionTimeoutMs < 1_000
-        || args.executionTimeoutMs > 600_000
-      )) {
-        return { ok: false, output: 'executionTimeoutMs 需为 1000 到 600000 的整数毫秒数。' };
-      }
-      if (args.maxOutputBytes !== undefined && (
-        typeof args.maxOutputBytes !== 'number'
-        || !Number.isSafeInteger(args.maxOutputBytes)
-        || args.maxOutputBytes < 1_024
-        || args.maxOutputBytes > 1_073_741_824
-      )) {
-        return { ok: false, output: 'maxOutputBytes 需为 1024 到 1073741824 的整数。' };
-      }
       const deniedBy = firstMatchedCommandRule(commandText, config.denyCommands);
       if (deniedBy) return { ok: false, output: `命令已被工具策略黑名单拒绝：${deniedBy}` };
 
@@ -263,7 +244,8 @@ export function classifyCommandCall(rawArgs: unknown): TrustedCommandClassificat
   if (!isCommandArgsRecord(rawArgs)) {
     return untrustedExecuteClassification('invalid_arguments');
   }
-  const mode = rawArgs.mode === 'output' || rawArgs.mode === 'kill' ? rawArgs.mode : 'execute';
+  let mode: ReturnType<typeof commandToolMode>;
+  try { mode = commandToolMode(rawArgs); } catch { return untrustedExecuteClassification('invalid_mode'); }
   if (mode === 'output') {
     return { mode, readonly: true, parallelSafe: true, reason: 'trusted_process_output' };
   }
@@ -291,6 +273,7 @@ export function classifyCommandCall(rawArgs: unknown): TrustedCommandClassificat
 /** 接受模型的只读声明，同时保留后端对常见只读命令的自动识别。 */
 export function isReadonlyCommandCall(rawArgs: unknown): boolean {
   const args = isCommandArgsRecord(rawArgs) ? rawArgs : undefined;
+  try { if (commandToolMode(rawArgs) === 'kill') return false; } catch { return false; }
   const hintedReadonly = typeof args?.readonly === 'string'
     && args.readonly.trim().toLowerCase() === 'true';
   return hintedReadonly || classifyCommandCall(rawArgs).readonly;

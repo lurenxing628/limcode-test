@@ -10,6 +10,7 @@ import {
   type TaskListToolOperationRecord,
   type ToolCallRecord
 } from './protocol';
+import { isEmptyToolArgument, ToolArgumentError } from './toolArgumentUtils';
 
 const TERMINAL_STATUSES = new Set<TaskListItemStatus>(['completed', 'cancelled']);
 
@@ -187,29 +188,28 @@ export function taskListOperationFromArgs(args: unknown): TaskListToolOperationR
  */
 export function requireTaskListOperation(value: unknown): TaskListToolOperationRecord {
   const record = asRecord(value);
-  if (!record) throw new TypeError('Task list operation must be a plain object.');
-  const unknownOperationFields = Object.keys(record).filter((key) =>
-    key !== 'kind' && key !== 'mode' && key !== 'items');
-  if (unknownOperationFields.length > 0) {
-    throw new TypeError(`Task list operation has unsupported fields: ${unknownOperationFields.join(', ')}.`);
-  }
-  if (record.kind !== undefined && record.kind !== 'task_list.operation') {
-    throw new TypeError('Task list operation kind must be task_list.operation when present.');
-  }
+  if (!record) throw new ToolArgumentError('Task list operation must be a plain object.');
   const mode = normalizeMode(record.mode);
-  if (!mode) throw new TypeError('Task list operation mode must be rewrite or update.');
-  if (!Array.isArray(record.items)) throw new TypeError('Task list operation items must be an array.');
+  if (!mode) throw new ToolArgumentError('Task list operation mode must be rewrite or update.');
+  if (!Array.isArray(record.items)) throw new ToolArgumentError('Task list operation items must be an array.');
 
   const items = record.items.map((rawItem, index) => requireOperationItem(rawItem, index, mode));
-  const seenTitles = new Set<string>();
-  for (const item of items) {
-    const key = titleKey(item.title);
-    if (seenTitles.has(key)) {
-      throw new TypeError(`Task list operation contains duplicate title: ${item.title}.`);
-    }
-    seenTitles.add(key);
-  }
   return { kind: 'task_list.operation', mode, items };
+}
+
+/** Describes controls unused by the selected mode without changing the canonical operation. */
+export function taskListToolArgumentMetadata(value: unknown): { ignoredFields?: string[]; warning?: string } {
+  const operation = requireTaskListOperation(value);
+  const record = asRecord(value)!;
+  const ignoredFields: string[] = [];
+  if (!isEmptyToolArgument(record.kind) && record.kind !== 'task_list.operation') ignoredFields.push('kind');
+  (record.items as unknown[]).forEach((value, index) => {
+    const item = asRecord(value)!;
+    const fields = operation.mode === 'rewrite' ? ['delete'] : item.delete === true ? ['status', 'description'] : [];
+    for (const field of fields) if (!isEmptyToolArgument(item[field])) ignoredFields.push(`items[${index}].${field}`);
+  });
+  return ignoredFields.length ? { ignoredFields,
+    warning: `已选择 mode=${operation.mode}；未使用参数：${ignoredFields.join('、')}。` } : {};
 }
 
 export function taskListDisplayItemsFromOperation(operation: TaskListToolOperationRecord): TaskListChangeItemView[] {
@@ -324,34 +324,27 @@ function requireOperationItem(
   mode: TaskListToolMode
 ): TaskListToolItemRecord {
   const record = asRecord(value);
-  if (!record) throw new TypeError(`Task list items[${index}] must be a plain object.`);
-  const unknownItemFields = Object.keys(record).filter((key) =>
-    key !== 'title' && key !== 'description' && key !== 'status' && key !== 'delete');
-  if (unknownItemFields.length > 0) {
-    throw new TypeError(`Task list items[${index}] has unsupported fields: ${unknownItemFields.join(', ')}.`);
-  }
+  if (!record) throw new ToolArgumentError(`Task list items[${index}] must be a plain object.`);
   const title = stringValue(record.title);
-  if (!title) throw new TypeError(`Task list items[${index}].title must be non-empty text.`);
-  if (record.description !== undefined && typeof record.description !== 'string') {
-    throw new TypeError(`Task list items[${index}].description must be text when present.`);
+  if (!title) throw new ToolArgumentError(`Task list items[${index}].title must be non-empty text.`);
+  if (mode === 'update') {
+    if (!isEmptyToolArgument(record.delete) && typeof record.delete !== 'boolean') {
+      throw new ToolArgumentError(`Task list items[${index}].delete must be boolean when present.`);
+    }
+    if (record.delete === true) return { title, delete: true };
+  }
+  if (!isEmptyToolArgument(record.description) && typeof record.description !== 'string') {
+    throw new ToolArgumentError(`Task list items[${index}].description must be text when present.`);
   }
   const description = stringValue(record.description);
-  if (record.status !== undefined && !taskStatusValue(record.status)) {
-    throw new TypeError(`Task list items[${index}].status is invalid.`);
-  }
-  if (record.delete !== undefined && typeof record.delete !== 'boolean') {
-    throw new TypeError(`Task list items[${index}].delete must be boolean when present.`);
-  }
-  const deletion = record.delete === true;
-  if (mode === 'rewrite' && deletion) {
-    throw new TypeError(`Task list items[${index}].delete can only be used in update mode.`);
+  if (!isEmptyToolArgument(record.status) && !taskStatusValue(record.status)) {
+    throw new ToolArgumentError(`Task list items[${index}].status is invalid.`);
   }
   const status = taskStatusValue(record.status);
   return {
     title,
     ...(description ? { description } : {}),
-    ...(status && !deletion ? { status } : {}),
-    ...(deletion ? { delete: true } : {})
+    ...(status ? { status } : {})
   };
 }
 

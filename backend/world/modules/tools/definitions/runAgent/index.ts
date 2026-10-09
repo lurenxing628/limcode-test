@@ -1,5 +1,6 @@
 import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '../../../../../../shared/agentScheduling';
 import { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY, type ToolConfigRecord } from '../../../../../../shared/protocol';
+import { isEmptyToolArgument } from '../../../../../../shared/toolArgumentUtils';
 import type { ToolCallSummaryContext, ToolDefinition } from '../../registry';
 import { defineToolDefinitionModule } from '../types';
 
@@ -20,7 +21,8 @@ export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
 
 export function isReadonlyRunAgentOperation(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-  return ['list', 'read', 'wait'].includes(String((value as { operation?: unknown }).operation));
+  const operation = (value as { operation?: unknown }).operation;
+  return typeof operation === 'string' && ['list', 'read', 'wait'].includes(operation.trim());
 }
 
 /**
@@ -28,7 +30,7 @@ export function isReadonlyRunAgentOperation(value: unknown): boolean {
  * list of at most MAX_RUN_AGENT_SKILLS non-empty names throws a model-readable error.
  */
 export function normalizeRunAgentSkillNames(value: unknown): string[] {
-  if (value === undefined) return [];
+  if (isEmptyToolArgument(value)) return [];
   if (!Array.isArray(value)) throw new TypeError('run_agent.skills must be an array of skill names.');
   const names: string[] = [];
   for (const entry of value) {
@@ -72,19 +74,19 @@ export const runAgentTool: ToolDefinition = {
   execution: 'agentRun',
   declaration: {
     name: RUN_AGENT_TOOL_NAME,
-    description: `Inspect and control child tasks using an explicit operation.
+    description: `Inspect and control child tasks using an explicit operation. Only the selected operation's parameters are used; fields for other operations are ignored and reported.
 - Before spawn, inspect the conversation roster. Use list for omitted tasks and read for the original assignment, current inputs and queued work. These operations never create or resume a child.
-- spawn requires taskName and prompt. Give the complete objective, context, constraints, expected result, verification and editing permission. agent.type chooses a configuration, never an existing child identity.
+- spawn requires taskName and prompt. Give the complete objective, context, constraints, expected result, verification and editing permission. agent.type chooses a configuration; an unused agent.id never selects an existing child.
 - spawn skills optionally preloads skills, by the names the skills tool lists, into the child's first input. The child does not inherit skills you loaded; an unknown or disabled name fails the spawn without creating a child.
 - spawn forkTurns defaults to "none". Use "all" or a positive integer string to inherit all or the most recent N completed turns. Current, failed and interrupted turns are excluded; inherited child references never grant control. The prompt always starts a new assignment.
 - send requires answerBridgeId and prompt, reusing that child conversation and answer channel. It queues after the current child turn unless interrupt=true explicitly redirects current work. An unknown or missing reference fails; it never creates a replacement child.
 - A child's answer is the final reply of each of its turns: it settles a foreground wait, otherwise it is delivered to you as that child's final result. Progress the child reports mid-task arrives separately as a collaboration message.
 - read/list/wait default to direct children; scope="tree" also permits verified descendants. send and interrupt_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
-- wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change or the bounded timeout. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
+- wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change or the bounded timeout. A single answerBridgeId takes priority over an unused answerBridgeIds array, which is reported. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
 - interrupt_subtree explicitly stops a direct child and its descendants without assigning a new task. Do not interrupt merely because a child is slow.
 - list/read pages are bounded by both limit and a token budget. Follow nextCursor to continue. If a tool-result preview was truncated, repeat the same operation and target with cursor=rereadCursor, preferably as a single call, so omitted text is not skipped. A read source may span pages; reassemble its text by textOffset and respect textFormat (text or message_json).
 - List cursors keep the original upper boundary; start a new list to include children created during pagination. Activity changes do not invalidate cursors.
-- foregroundWaitMs is optional for spawn/send and defaults to 0. It bounds the foreground wait, not child execution. At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} starts enter admission concurrently per parent turn.`,
+- foregroundWaitMs is optional for spawn/send and defaults to 0. It bounds the foreground wait, not child execution. Numeric budgets use their documented bounds, accept integer strings, and preserve 0 for immediate observation. At most ${MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN} starts enter admission concurrently per parent turn.`,
     parameters: {
       type: 'object',
       properties: {
@@ -99,11 +101,11 @@ export const runAgentTool: ToolDefinition = {
         },
         answerBridgeId: {
           type: 'string',
-          description: 'Required for send, read and interrupt_subtree. For wait, supply this or answerBridgeIds, never both.'
+          description: 'Required for send, read and interrupt_subtree. For wait, this single target takes priority over answerBridgeIds.'
         },
         answerBridgeIds: {
           type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32,
-          description: 'For wait only: 1 to 32 distinct existing child references. Mutually exclusive with answerBridgeId.'
+          description: 'For wait only: 1 to 32 distinct existing child references, used when answerBridgeId is absent.'
         },
         taskName: {
           type: 'string',
@@ -209,19 +211,20 @@ interface RunAgentSchedulingArgs {
 }
 
 function summarizeRunAgentToolCall(rawArgs: unknown, context: ToolCallSummaryContext): string | undefined {
-  const args = (rawArgs ?? {}) as RunAgentSchedulingArgs & { prompt?: unknown; answerBridgeId?: unknown; skills?: unknown; agent?: { type?: unknown; id?: unknown } };
+  const args = (rawArgs ?? {}) as RunAgentSchedulingArgs & { prompt?: unknown; answerBridgeId?: unknown; skills?: unknown; agent?: { type?: unknown } };
+  const operation = typeof args.operation === 'string' ? args.operation.trim() : '';
+  if (!(RUN_AGENT_OPERATIONS as readonly string[]).includes(operation)) return undefined;
   const answerBridgeId = typeof args.answerBridgeId === 'string' ? args.answerBridgeId.trim() : '';
-  if (args.operation === 'interrupt_subtree') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
-  if (args.operation && ['list', 'read', 'wait'].includes(args.operation)) return `${args.operation} child tasks${answerBridgeId ? ` · ${answerBridgeId}` : ''}`;
+  if (operation === 'interrupt_subtree') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
+  if (['list', 'read', 'wait'].includes(operation)) return `${operation} child tasks${answerBridgeId ? ` · ${answerBridgeId}` : ''}`;
   const prompt = typeof args.prompt === 'string' ? normalizeSummaryText(args.prompt) : '';
   const resolvedType = runAgentTypeFromValue(context.result) ?? runAgentTypeFromValue(context.progress);
-  const requestedType = typeof args.agent?.type === 'string' && args.agent.type.trim()
+  const requestedType = operation === 'spawn' && typeof args.agent?.type === 'string' && args.agent.type.trim()
     ? args.agent.type.trim()
     : undefined;
-  const hasIndirectTarget = (typeof args.answerBridgeId === 'string' && !!args.answerBridgeId.trim())
-    || (typeof args.agent?.id === 'string' && !!args.agent.id.trim());
+  const hasIndirectTarget = typeof args.answerBridgeId === 'string' && !!args.answerBridgeId.trim();
   const targetType = resolvedType ?? requestedType ?? (hasIndirectTarget ? 'Agent' : DEFAULT_RUN_AGENT_TYPE);
-  const skills = Array.isArray(args.skills)
+  const skills = operation === 'spawn' && Array.isArray(args.skills)
     ? args.skills.filter((name): name is string => typeof name === 'string' && !!name.trim()).map((name) => name.trim())
     : [];
   const target = skills.length > 0 ? `${targetType} · skills ${truncateSummary(skills.join(', '), 48)}` : targetType;
@@ -243,7 +246,7 @@ function runAgentTypeFromValue(value: unknown): string | undefined {
 
 function resolveRunAgentScheduling(rawArgs: unknown): { mode: 'parallel' | 'serial'; reason: string } {
   const args = (rawArgs ?? {}) as RunAgentSchedulingArgs;
-  if (args.operation === 'interrupt_subtree') return { mode: 'serial', reason: 'interrupt_subtree' };
+  if (typeof args.operation === 'string' && args.operation.trim() === 'interrupt_subtree') return { mode: 'serial', reason: 'interrupt_subtree' };
   if (args.scheduling === 'serial') return { mode: 'serial', reason: 'explicit_serial' };
   if (args.scheduling === 'parallel') return { mode: 'parallel', reason: 'explicit_parallel' };
 

@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { validateEditToolArguments, type ValidatedEditToolArguments } from '../../shared/editToolArguments';
+import { validateWriteToolArguments, validateDeleteToolArguments } from '../../shared/fileToolArguments';
 import { applyDeleteEdit, applyHunkEdit, applyInsertEdit } from '../capabilities/editStrategies';
 import { assertFilePlanningRoot, captureFilePlanningRoot, readFileWithIdentityFence, resolveFileTarget, resolvePlanningFileTarget, FilePathConflictError, type FilePlanningRoot } from './fileTargetBoundary';
 import { assertNotSqliteDatabaseFile } from '../capabilities/filesystem/sqliteDatabaseFileGuard';
@@ -52,9 +53,9 @@ export class LocalFileToolPlanner {
     authority: ReliableToolDispatchAuthority,
     signal?: AbortSignal
   ): Promise<FileChangeProposalMemberInput[]> {
-    const args = requireRecord(input.arguments, 'write arguments');
-    const inputPath = requireText(args.path, 'write.path');
-    const content = requireString(args.content, 'write.content');
+    const args = validateWriteToolArguments(input.arguments);
+    const inputPath = args.path;
+    const content = args.content;
     const resolved = await this.resolvePath(inputPath, authority);
     signal?.throwIfAborted();
     const { current, planningRoot, targetPath } = await inspectPlannedTarget(resolved, {}, signal);
@@ -112,14 +113,11 @@ export class LocalFileToolPlanner {
     authority: ReliableToolDispatchAuthority,
     signal?: AbortSignal
   ): Promise<FileChangeProposalMemberInput[]> {
-    const args = requireRecord(input.arguments, 'delete arguments');
-    if (!Array.isArray(args.paths) || args.paths.length === 0) {
-      throw new TypeError('delete.paths must be a non-empty array.');
-    }
+    const args = validateDeleteToolArguments(input.arguments);
     const members: FileChangeProposalMemberInput[] = [];
     for (let index = 0; index < args.paths.length; index += 1) {
       signal?.throwIfAborted();
-      const inputPath = requireText(args.paths[index], `delete.paths[${index}]`);
+      const inputPath = args.paths[index];
       const resolved = await this.resolvePath(inputPath, authority);
       signal?.throwIfAborted();
       const { current, planningRoot, targetPath } = await inspectPlannedTarget(resolved, { recursive: true }, signal);
@@ -295,11 +293,6 @@ function decodeUtf8Exact(bytes: Buffer): string {
   return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
 }
 
-function requireRecord(value: PlainJsonValue, label: string): { [key: string]: PlainJsonValue } {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError(`${label} must be an object.`);
-  return value;
-}
-
 function requireString(value: unknown, label: string): string {
   if (typeof value !== 'string') throw new TypeError(`${label} must be a string.`);
   return value;
@@ -314,5 +307,3 @@ function requireText(value: unknown, label: string): string {
 function isNotFound(error: unknown): boolean {
   return !!error && typeof error === 'object' && (error as NodeJS.ErrnoException).code === 'ENOENT';
 }
-
-type PlainJsonValue = import('./plainJson').PlainJsonValue;

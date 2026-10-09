@@ -6,7 +6,7 @@ export const TRANSFER_WORK_ENVIRONMENTS_TITLE = 'Work environments available for
 
 /**
  * 把可用工作环境列表渲染为工具描述文本。
- * ECS schema contributor 与 reliableKernel toolDispatcher 共用此纯函数。
+ * reliableKernel toolDispatcher 使用的纯描述函数。
  */
 export function workEnvironmentListText(
   environments: readonly WorkEnvironmentRecord[],

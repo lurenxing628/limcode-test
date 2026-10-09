@@ -1,5 +1,10 @@
 import type { NativePendingToolCall } from './nativeWorkTypes';
 import type { InlineDataPart, ModelOutputItemReference } from '../../shared/protocol';
+import { editToolResultMetadata, validateEditToolArguments } from '../../shared/editToolArguments';
+import { commandToolArgumentMetadata } from '../../shared/commandToolArguments';
+import { validateReadFileToolArguments, readFileToolResultMetadata } from '../world/modules/tools/definitions/readFile';
+import { agentToolArgumentMetadata } from './childAgentCoordinator';
+import { taskListToolArgumentMetadata } from '../../shared/taskListProjection';
 import {
   AttachmentAdmissionError,
   type AttachmentIngestService,
@@ -2140,11 +2145,12 @@ export class EffectControlPlane {
     await this.assertCallIsNextForModelResult(facts.toolCall, plannedPredecessors);
     const now = this.timestamp();
     const ids = terminalIds(toolCallId);
+    const terminalDetail = await this.toolTerminalDetail(facts.toolCall, detail);
     const attachmentAdmission = this.attachments
       ? options.attachmentsFrozen
-        ? await this.attachments.prepareFrozenValueAttachments(detail, `Tool ${toolCallId} terminal result`)
-        : await this.attachments.prepareValueAttachments(detail, `Tool ${toolCallId} terminal result`)
-      : { value: detail, attachments: [], storageSteps: [], totalBytes: 0 };
+        ? await this.attachments.prepareFrozenValueAttachments(terminalDetail, `Tool ${toolCallId} terminal result`)
+        : await this.attachments.prepareValueAttachments(terminalDetail, `Tool ${toolCallId} terminal result`)
+      : { value: terminalDetail, attachments: [], storageSteps: [], totalBytes: 0 };
     const content = await this.contentStore.prepare(
       this.database,
       canonicalJson({ toolCallId, status, detail: attachmentAdmission.value }),
@@ -2431,7 +2437,7 @@ export class EffectControlPlane {
       if (body.toolCallId !== toolCallId || status !== facts.operation.status) {
         throw new Error(`ToolCall ${toolCallId} no-effect result artifact is inconsistent.`);
       }
-      return { ...facts, toolCallId, status, detail: body.detail };
+      return { ...facts, toolCallId, status, detail: await this.toolTerminalDetail(facts.call, body.detail) };
     }));
     const context = await this.requireActiveTurnContext(turnId);
     const attachmentAdmissions = await Promise.all(ready.map((entry) => this.attachments
@@ -2866,6 +2872,36 @@ export class EffectControlPlane {
 
   private async findToolOutcome(toolCallId: string): Promise<DomainRow | undefined> {
     return (await this.list('ToolOutcome', { tool_call_id: toolCallId }, 2))[0];
+  }
+
+  /** Presentation from frozen arguments; this never approves or executes an operation. */
+  private async toolTerminalDetail(toolCall: DomainRow, detail: unknown): Promise<unknown> {
+    const record = plainRecord(detail);
+    if (!['edit', 'bash', 'shell', 'read', 'run_agent', 'read_agent_answer', 'update_task_list'].includes(String(toolCall.tool_name)) || !record) return detail;
+    const metadata = await this.requireContentObject(requireId(toolCall.arguments_object_id, 'ToolCall.arguments_object_id'));
+    const rawArguments: unknown = JSON.parse((await this.contentStore.read(metadata)).toString('utf8'));
+    try {
+      if (toolCall.tool_name === 'bash' || toolCall.tool_name === 'shell') {
+        return { ...record, ...commandToolArgumentMetadata(rawArguments) };
+      }
+      if (toolCall.tool_name === 'read') {
+        const selected = readFileToolResultMetadata(validateReadFileToolArguments(rawArguments));
+        return selected.warning ? { ...record, ...selected } : detail;
+      }
+      if (toolCall.tool_name === 'run_agent' || toolCall.tool_name === 'read_agent_answer') {
+        return { ...record, ...agentToolArgumentMetadata(String(toolCall.tool_name), rawArguments) };
+      }
+      if (toolCall.tool_name === 'update_task_list') return { ...record, ...taskListToolArgumentMetadata(rawArguments) };
+      const args = validateEditToolArguments(rawArguments);
+      return {
+        ...record,
+        ...editToolResultMetadata(args.mode, { ignoredBranches: args.ignoredBranches, inferredMode: args.inferred })
+      };
+    } catch (error) {
+      // Malformed calls keep their original rejection; do not present a guessed branch as selected.
+      if (error instanceof TypeError) return detail;
+      throw error;
+    }
   }
 
   private async readReadyToolOutcome(

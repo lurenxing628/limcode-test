@@ -1,13 +1,14 @@
 import { TextDecoder } from 'node:util';
 import { PDFDocument } from 'pdf-lib';
 import { READ_TOOL_NAME, type InlineDataPart } from '../../../../../../shared/protocol';
-import type { ToolDefinition, ToolDeps, ToolExecutionContext } from '../../registry';
+import type { ToolDefinition, ToolDeps, ToolExecutionContext, ToolResultOut } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig, filePathPolicyDescription } from '../filePathPolicy';
-import { compactReadPagesArgument, resolveReadPageRange } from './pageRange';
+import { compactReadPagesArgument, parseReadPageRange, resolveReadPageRange } from './pageRange';
 import { readTextPages } from './textPages';
 import { normalizeDisplayPath } from '../../../../../../shared/displayPath';
+import { ToolArgumentError, toolArgumentRecord, isEmptyToolArgument } from '../../../../../../shared/toolArgumentUtils';
 
 export type ReadFileMode = 'text' | 'attachment';
 
@@ -17,15 +18,16 @@ interface ReadFileItem {
   endLine?: number;
 }
 
-interface ReadFileArgs {
-  path?: string;
-  attachmentId?: string;
-  pages?: string;
-  mode?: ReadFileMode;
-  startLine?: number;
-  endLine?: number;
-  items?: ReadFileItem[];
+export interface ReadFileToolArgumentMetadata {
+  ignoredFields?: string[];
+  warning?: string;
 }
+
+export type ValidatedReadFileToolArguments = (
+  | { source: 'path'; path: string; mode: ReadFileMode; startLine?: number; endLine?: number }
+  | { source: 'items'; items: ReadFileItem[]; mode: 'text' }
+  | { source: 'attachment'; attachmentId?: string; attachmentRef?: string; pages?: string }
+) & ReadFileToolArgumentMetadata;
 
 const READ_BATCH_MAX_ITEMS = 8;
 const READ_BATCH_MAX_CONTENT_CHARS = 256 * 1024;
@@ -40,9 +42,9 @@ export function readFileToolDescription(
   includeManagedPageRanges = includeManagedAttachments
 ): string {
   const parts = [
-    'Read UTF-8 text from one local file path or a batch of up to 8 local text files. For the common single-file case, pass only { path }; mode is inferred as "attachment" for local PNG, JPEG, WebP, or PDF paths and as "text" otherwise. Use an explicit mode only when the caller needs to require one behavior. For independent text files, prefer one items batch; results preserve input order. For local reads, provide exactly one of path or items.',
+    'Read UTF-8 text from one local file path or a batch of up to 8 local text files. For the common single-file case, pass only { path }; mode is inferred as "attachment" for local PNG, JPEG, WebP, or PDF paths and as "text" otherwise. Use an explicit mode only when the caller needs to require one path behavior. Target priority is path, then a managed attachment handle, then items. Only the selected target is read; unused target fields and controls are reported. For independent text files, prefer one items batch; results preserve input order and each item keeps its own line range.',
     includeManagedAttachments
-      ? 'A LimCode managed attachment catalog is present. To read a past user-supplied attachment that has no usable local path, use an exact non-empty attachmentId from that catalog. Never send an empty or invented attachmentId, and never use a file name as the id. When attachmentId is used, provide neither path nor items.'
+      ? 'A LimCode managed attachment catalog is present. To read a past user-supplied attachment that has no usable local path, use an exact non-empty attachmentId from that catalog. Never use an invented attachmentId or a file name as the id. A supplied path takes priority; otherwise the attachment takes priority over items. Unused mode and line fields do not affect managed reads.'
       : '',
     includeManagedPageRanges
       ? 'For managed TXT and PDF attachments, optional pages accepts "N" or "N-M", defaults to "1", and allows at most 4 consecutive pages. TXT uses stable text pages; PDF uses real PDF pages. Copy nextPages from the result to continue. Omit pages for images.'
@@ -60,20 +62,21 @@ export function readFileToolParameters(
   properties: Record<string, unknown>;
 } {
   const properties: Record<string, unknown> = {
-    path: { type: 'string', description: 'The usual input: a local file path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
+    path: { type: 'string', description: 'The usual input, with priority over attachmentId and items: a local file path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
     mode: { type: 'string', enum: ['text', 'attachment'], description: 'Optional for path reads only. When omitted, recognized local PNG, JPEG, WebP, and PDF paths use "attachment"; all other paths use "text". Explicit "attachment" is supported only for those media paths.' },
-    startLine: { type: 'number', description: 'Text path reads only. Optional 1-based start line (inclusive); omit it when not needed. A read longer than the per-read budget returns a leading slice instead of failing; compare the returned endLine with totalLines and continue from endLine + 1.' },
-    endLine: { type: 'number', description: 'Text path reads only. Optional 1-based end line (inclusive); omit it when not needed.' },
+    startLine: { type: 'integer', minimum: 1, description: 'Text path reads only. Optional 1-based start line (inclusive); omit it when not needed. A read longer than the per-read budget returns a leading slice instead of failing; compare the returned endLine with totalLines and continue from endLine + 1.' },
+    endLine: { type: 'integer', minimum: 1, description: 'Text path reads only. Optional 1-based end line (inclusive); omit it when not needed.' },
     items: {
       type: 'array',
+      minItems: 1,
       maxItems: READ_BATCH_MAX_ITEMS,
-      description: 'Optional batch of 2-8 independent local text reads. Use this instead of path; omit it for a single-file read. Attachments are not supported in a batch.',
+      description: 'Optional batch of 1-8 independent local text reads, used only when path and attachmentId are absent. Each item has its own line range; root line fields are ignored. Attachments are not supported in a batch.',
       items: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Local text file path.' },
-          startLine: { type: 'number', description: 'Optional 1-based inclusive start line. A read longer than the per-read budget returns a leading slice instead of failing; compare the returned endLine with totalLines and continue from endLine + 1.' },
-          endLine: { type: 'number', description: 'Optional 1-based inclusive end line.' }
+          startLine: { type: 'integer', minimum: 1, description: 'Optional 1-based inclusive start line. A read longer than the per-read budget returns a leading slice instead of failing; compare the returned endLine with totalLines and continue from endLine + 1.' },
+          endLine: { type: 'integer', minimum: 1, description: 'Optional 1-based inclusive end line.' }
         },
         required: ['path']
       }
@@ -82,7 +85,7 @@ export function readFileToolParameters(
   if (includeManagedAttachments) {
     properties.attachmentId = {
       type: 'string',
-      description: 'Rare optional input for a past user-supplied attachment. Use only an exact non-empty id shown in the LimCode managed attachment catalog. Omit this field for local path and batch reads; never send an empty or invented id.'
+      description: 'Rare optional input for a past user-supplied attachment, used when path is absent and with priority over items. Use only an exact non-empty id shown in the LimCode managed attachment catalog; omit it when unused.'
     };
   }
   if (includeManagedPageRanges) {
@@ -94,55 +97,64 @@ export function readFileToolParameters(
   return { type: 'object', properties };
 }
 
-/** Removes only transport-generated Read placeholders; other tools keep their own empty-value rules. */
+/** An execution-only copy. Provider facts must retain the original arguments. */
 export function compactReadFileToolArguments(value: unknown): Record<string, unknown> {
-  const source = value && typeof value === 'object' && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
-  const result: Record<string, unknown> = {};
-  const path = normalizeDisplayPath(source.path);
-  const attachmentId = normalizeAttachmentId(source.attachmentId);
-  const attachmentRef = normalizeAttachmentId(source.attachmentRef);
-  const compactItems = compactReadItems(source.items);
-  const pages = compactReadPagesArgument(source.pages);
-  if (path) result.path = path;
-  if (attachmentId) result.attachmentId = attachmentId;
-  if (attachmentRef) result.attachmentRef = attachmentRef;
-  if (compactItems !== undefined) result.items = compactItems;
-  if (pages !== undefined) result.pages = pages;
-
-  const managedAttachment = !!attachmentId || !!attachmentRef;
-  const mode = normalizeReadMode(source.mode);
-  if (!managedAttachment && mode) result.mode = mode;
-  else if (source.mode !== undefined && mode === undefined) result.mode = source.mode;
-
-  // Provider-facing attachmentRef is resolved to attachmentId after completed calls leave the
-  // capability adapter. Providers sometimes materialize unrelated optional line fields from the
-  // flat schema; neither managed attachment handle accepts those path-only placeholders.
-  if (!managedAttachment) {
-    const startLine = normalizeLineNumber(source.startLine);
-    const endLine = normalizeLineNumber(source.endLine);
-    if (startLine !== undefined) result.startLine = startLine;
-    if (endLine !== undefined) result.endLine = endLine;
+  const source = toolArgumentRecord(value, 'read arguments');
+  const result = { ...source };
+  for (const key of ['path', 'attachmentId', 'attachmentRef', 'mode', 'startLine', 'endLine', 'pages']) {
+    const field = result[key];
+    if (isEmptyToolArgument(field) || typeof field === 'string' && !field.trim()) delete result[key];
   }
+  if (typeof result.path === 'string') result.path = normalizeDisplayPath(result.path);
+  for (const key of ['attachmentId', 'attachmentRef', 'mode']) {
+    if (typeof result[key] === 'string') result[key] = (result[key] as string).trim();
+  }
+  if (isEmptyToolArgument(result.items) || isSyntheticEmptyReadItems(result.items)) delete result.items;
+  if (result.pages !== undefined) result.pages = compactReadPagesArgument(result.pages);
   return result;
 }
 
-function compactReadItems(value: unknown): unknown {
-  if (value === undefined || isSyntheticEmptyReadItems(value)) return undefined;
-  if (!Array.isArray(value)) return value;
-  return value.map((candidate) => {
-    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return candidate;
-    const source = candidate as Record<string, unknown>;
-    const item: Record<string, unknown> = {};
-    const path = normalizeDisplayPath(source.path);
-    const startLine = normalizeLineNumber(source.startLine);
-    const endLine = normalizeLineNumber(source.endLine);
-    if (path) item.path = path;
-    if (startLine !== undefined) item.startLine = startLine;
-    if (endLine !== undefined) item.endLine = endLine;
-    return item;
-  });
+/** Public priority: path, then managed attachment, then items. Validate only the chosen target. */
+export function validateReadFileToolArguments(value: unknown): ValidatedReadFileToolArguments {
+  const args = compactReadFileToolArguments(value);
+  if (args.path !== undefined) {
+    const path = normalizeDisplayPath(requireReadText(args.path, 'read.path'));
+    const explicitMode = normalizeReadMode(args.mode);
+    if (args.mode !== undefined && !explicitMode) throw new ToolArgumentError('Invalid argument: mode. Expected "text" or "attachment".');
+    const mode = effectiveLocalPathReadMode(path, explicitMode);
+    const unused = ['attachmentId', 'attachmentRef', 'items', 'pages'];
+    if (mode === 'attachment') {
+      if (!inferMimeType(path)) throw new ToolArgumentError(unsupportedAttachmentMessage(path));
+      return { source: 'path', path, mode, ...readUnusedMetadata('path', args, [...unused, 'startLine', 'endLine']) };
+    }
+    assertTextReadPath(path);
+    return { source: 'path', path, mode, ...validateReadLineRange(args, 'read'), ...readUnusedMetadata('path', args, unused) };
+  }
+  if (args.attachmentId !== undefined || args.attachmentRef !== undefined) {
+    const key = args.attachmentId !== undefined ? 'attachmentId' : 'attachmentRef';
+    const attachment = requireReadText(args[key], `read.${key}`);
+    const pages = args.pages === undefined ? undefined : parseReadPageRange(args.pages);
+    if (pages && !pages.ok) throw new ToolArgumentError(pages.error);
+    return { source: 'attachment', [key]: attachment, ...(pages?.ok ? { pages: pages.range.canonical } : {}),
+      ...readUnusedMetadata('attachmentRef', args, ['items', 'mode', 'startLine', 'endLine', ...(key === 'attachmentId' ? ['attachmentRef'] : [])]) };
+  }
+  if (args.items !== undefined) {
+    const items = normalizeReadItems(args.items);
+    if (typeof items === 'string') throw new ToolArgumentError(items);
+    return { source: 'items', items, mode: 'text', ...readUnusedMetadata('items', args, ['mode', 'pages', 'startLine', 'endLine']) };
+  }
+  throw new ToolArgumentError('Provide a non-empty path, attachmentRef, or items.');
+}
+
+export function readFileToolResultMetadata(args: ValidatedReadFileToolArguments): ReadFileToolArgumentMetadata & { source: 'path' | 'attachmentRef' | 'items' } {
+  return { source: args.source === 'attachment' ? 'attachmentRef' : args.source,
+    ...(args.ignoredFields?.length ? { ignoredFields: [...args.ignoredFields], warning: args.warning } : {}) };
+}
+
+function readUnusedMetadata(source: 'path' | 'attachmentRef' | 'items', args: Record<string, unknown>, fields: string[]): ReadFileToolArgumentMetadata {
+  const ignoredFields = [...new Set(fields.filter(key => !isEmptyToolArgument(args[key]))
+    .map(key => key === 'attachmentId' ? 'attachmentRef' : key))];
+  return ignoredFields.length ? { ignoredFields, warning: `已选择 ${source}；未使用参数：${ignoredFields.join('、')}。` } : {};
 }
 
 export const readFileToolModule = defineToolDefinitionModule({
@@ -172,137 +184,117 @@ export const readFileTool: ToolDefinition = {
   scheduling: staticToolScheduling('parallel', 'readonly_file_read'),
   summary: summarizeReadFileToolCall,
   async execute(rawArgs, deps, ctx) {
-    const args = compactReadFileToolArguments(rawArgs) as ReadFileArgs;
-    const path = normalizeDisplayPath(args.path);
-    const attachmentId = normalizeAttachmentId(args.attachmentId);
-    // Some tool transports materialize optional schema fields as empty placeholders. Do not let an
-    // empty items array (or minItems-shaped blank objects) turn a valid single-file call into a
-    // false path/items conflict.
-    const items = (path || attachmentId) && isSyntheticEmptyReadItems(args.items) ? undefined : args.items;
-    if (items !== undefined) {
-      if (path || attachmentId) return { ok: false, output: 'Provide exactly one of path, attachmentId, or items.' };
-      if (args.pages !== undefined) return { ok: false, output: 'pages is supported only for managed TXT and PDF attachments.' };
-      const explicitMode = normalizeReadMode(args.mode);
-      if (args.mode !== undefined && !explicitMode) {
-        return { ok: false, output: 'Invalid argument: mode. Expected "text" or "attachment".' };
-      }
-      if (explicitMode === 'attachment') {
-        return { ok: false, output: 'Batch items support text mode only.' };
-      }
-      const normalizedItems = normalizeReadItems(items);
-      if (typeof normalizedItems === 'string') return { ok: false, output: normalizedItems };
-      const files = await Promise.all(normalizedItems.map((item) => readTextFile(item, deps, ctx)));
-      return { ok: true, output: { files: boundBatchReadOutput(files) } };
+    let validated: ValidatedReadFileToolArguments;
+    try {
+      validated = validateReadFileToolArguments(rawArgs);
+    } catch (error) {
+      if (!(error instanceof ToolArgumentError)) throw error;
+      return { ok: false, output: error.message };
     }
-    const explicitMode = normalizeReadMode(args.mode);
-    if (args.mode !== undefined && !explicitMode) {
-      return { ok: false, output: 'Invalid argument: mode. Expected "text" or "attachment".' };
-    }
-    if (attachmentId) {
-      if (path) return { ok: false, output: 'Provide exactly one of path, attachmentId, or items.' };
-      if (normalizeLineNumber(args.startLine) !== undefined || normalizeLineNumber(args.endLine) !== undefined) {
-        return { ok: false, output: 'startLine and endLine are not supported for managed attachments.' };
-      }
-      if (!deps.attachments) {
-        return { ok: false, output: 'Managed attachment resolver is unavailable.' };
-      }
-      const part = await deps.attachments.reference(attachmentId);
-      if (READ_MANAGED_TEXT_MIME_TYPES.has(part.inlineData.mimeType)) {
-        if (!deps.attachments.resolve) {
-          return { ok: false, output: 'Managed text attachment content resolver is unavailable.' };
-        }
-        const resolved = await deps.attachments.resolve(attachmentId);
-        return managedTextAttachmentResult(attachmentId, resolved, args.pages);
-      }
-      if (!READ_ATTACHMENT_MIME_TYPES.has(part.inlineData.mimeType)) {
-        return { ok: false, output: `Managed attachment MIME type is not supported by read: ${part.inlineData.mimeType}` };
-      }
-      if (ctx?.settingsSnapshot?.enableMultimodalTools === false) {
-        return { ok: true, status: 'warning', output: '当前渠道未启用多模态工具，无法读取托管图片或 PDF。' };
-      }
-      if (part.inlineData.mimeType === READ_PDF_MIME_TYPE) {
-        if (!deps.attachments.resolve) {
-          return { ok: false, output: 'Managed PDF content resolver is unavailable.' };
-        }
-        const resolved = await deps.attachments.resolve(attachmentId);
-        return managedPdfAttachmentResult(attachmentId, resolved, args.pages);
-      }
-      if (args.pages !== undefined) {
-        return { ok: false, output: 'pages is not supported for image attachments.' };
-      }
-      return {
-        ok: true,
-        output: {
-          attachmentId,
-          name: part.inlineData.name ?? attachmentId,
-          mimeType: part.inlineData.mimeType,
-          sizeBytes: part.inlineData.sizeBytes ?? 0
-        },
-        parts: [part]
-      };
-    }
-    if (!path) {
-      return { ok: false, output: 'Missing required argument: path, attachmentId, or items' };
-    }
-    if (args.pages !== undefined) {
-      return { ok: false, output: 'pages is supported only for managed TXT and PDF attachments.' };
-    }
-    const mimeType = inferMimeType(path);
-    const isSupportedAttachment = !!mimeType && READ_ATTACHMENT_MIME_TYPES.has(mimeType);
-    const mode = effectiveLocalPathReadMode(path, explicitMode);
-    if (mode === 'attachment') {
-      if (!isSupportedAttachment || !mimeType) {
-        return { ok: false, output: unsupportedAttachmentMessage(path) };
-      }
-      if (ctx?.settingsSnapshot?.enableMultimodalTools === false) {
-        return { ok: true, status: 'warning', output: multimodalDisabledMessage(mimeType) };
-      }
-      const file = await deps.fs.readBinaryFile(path, mimeType, {
-        signal: ctx?.signal,
-        workEnvironment: ctx?.workEnvironment,
-        accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
-        allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true),
-        ...(ctx?.skillDirectories ? { localReadOnlyRoots: ctx.skillDirectories } : {}),
-        ...(ctx?.attachmentMaxBytes ? { maxBytes: ctx.attachmentMaxBytes } : {})
-      });
-      const part: InlineDataPart = {
-        inlineData: {
-          mimeType,
-          data: file.data,
-          name: file.name,
-          sourcePath: file.path,
-          storage: 'embedded',
-          status: 'available',
-          sizeBytes: file.sizeBytes
-        }
-      };
-      return { ok: true, output: { mimeType, sizeBytes: file.sizeBytes }, parts: [part] };
-    }
-
-    if (isSupportedAttachment) {
-      return { ok: false, output: `Cannot read ${mimeType} as UTF-8 text. Use mode="attachment" for ${path}.` };
-    }
-    const output = await readTextFile({ ...args, path }, deps, ctx);
-    return { ok: true, output };
+    const result = await executeReadFileArguments(validated, deps, ctx);
+    if (!validated.ignoredFields?.length) return result;
+    const metadata = { ignoredFields: [...validated.ignoredFields], warning: validated.warning };
+    const output = result.output;
+    return { ...result, output: output !== null && typeof output === 'object' && !Array.isArray(output)
+      ? { ...output, ...metadata }
+      : { message: output, ...metadata } };
   }
 };
 
-function summarizeReadFileToolCall(rawArgs: unknown): string | undefined {
-  const args = compactReadFileToolArguments(rawArgs) as ReadFileArgs;
-  const attachmentId = normalizeAttachmentId(args.attachmentId);
-  if (attachmentId) return `${attachmentId}[attachment]${args.pages ? `[pages=${args.pages}]` : ''}`;
-  const path = normalizeDisplayPath(args.path);
-  const items = Array.isArray(args.items) && !((path || attachmentId) && isSyntheticEmptyReadItems(args.items))
-    ? args.items
-    : undefined;
-  if (items) return `${items.length} text files`;
-  if (!path) return undefined;
+async function executeReadFileArguments(
+  validated: ValidatedReadFileToolArguments,
+  deps: ToolDeps,
+  ctx: ToolExecutionContext | undefined
+): Promise<ToolResultOut> {
+  if (validated.source === 'attachment' && validated.attachmentRef) {
+    return { ok: false, output: 'attachmentRef must be resolved by the reliable tool dispatcher.' };
+  }
+  if (validated.source === 'items') {
+    const files = await Promise.all(validated.items.map((item) => readTextFile(item, deps, ctx)));
+    return { ok: true, output: { files: boundBatchReadOutput(files) } };
+  }
+  if (validated.source === 'attachment') {
+    const attachmentId = validated.attachmentId!;
+    if (!deps.attachments) {
+      return { ok: false, output: 'Managed attachment resolver is unavailable.' };
+    }
+    const part = await deps.attachments.reference(attachmentId);
+    if (READ_MANAGED_TEXT_MIME_TYPES.has(part.inlineData.mimeType)) {
+      if (!deps.attachments.resolve) {
+        return { ok: false, output: 'Managed text attachment content resolver is unavailable.' };
+      }
+      const resolved = await deps.attachments.resolve(attachmentId);
+      return managedTextAttachmentResult(attachmentId, resolved, validated.pages);
+    }
+    if (!READ_ATTACHMENT_MIME_TYPES.has(part.inlineData.mimeType)) {
+      return { ok: false, output: `Managed attachment MIME type is not supported by read: ${part.inlineData.mimeType}` };
+    }
+    if (ctx?.settingsSnapshot?.enableMultimodalTools === false) {
+      return { ok: true, status: 'warning', output: '当前渠道未启用多模态工具，无法读取托管图片或 PDF。' };
+    }
+    if (part.inlineData.mimeType === READ_PDF_MIME_TYPE) {
+      if (!deps.attachments.resolve) {
+        return { ok: false, output: 'Managed PDF content resolver is unavailable.' };
+      }
+      const resolved = await deps.attachments.resolve(attachmentId);
+      return managedPdfAttachmentResult(attachmentId, resolved, validated.pages);
+    }
+    if (validated.pages !== undefined) {
+      return { ok: false, output: 'pages is not supported for image attachments.' };
+    }
+    return {
+      ok: true,
+      output: {
+        attachmentId,
+        name: part.inlineData.name ?? attachmentId,
+        mimeType: part.inlineData.mimeType,
+        sizeBytes: part.inlineData.sizeBytes ?? 0
+      },
+      parts: [part]
+    };
+  }
+  const path = validated.path;
+  if (validated.mode === 'attachment') {
+    const mimeType = inferMimeType(path)!;
+    if (ctx?.settingsSnapshot?.enableMultimodalTools === false) {
+      return { ok: true, status: 'warning', output: multimodalDisabledMessage(mimeType) };
+    }
+    const file = await deps.fs.readBinaryFile(path, mimeType, {
+      signal: ctx?.signal,
+      workEnvironment: ctx?.workEnvironment,
+      accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,
+      allowOutsideProjectPaths: allowOutsideProjectPathsFromConfig(ctx?.config, true),
+      ...(ctx?.skillDirectories ? { localReadOnlyRoots: ctx.skillDirectories } : {}),
+      ...(ctx?.attachmentMaxBytes ? { maxBytes: ctx.attachmentMaxBytes } : {})
+    });
+    const part: InlineDataPart = {
+      inlineData: {
+        mimeType,
+        data: file.data,
+        name: file.name,
+        sourcePath: file.path,
+        storage: 'embedded',
+        status: 'available',
+        sizeBytes: file.sizeBytes
+      }
+    };
+    return { ok: true, output: { mimeType, sizeBytes: file.sizeBytes }, parts: [part] };
+  }
 
-  const mode = effectiveLocalPathReadMode(path, normalizeReadMode(args.mode));
-  const modeSuffix = `[${mode}]`;
-  if (mode === 'attachment') return `${path}${modeSuffix}`;
+  const output = await readTextFile(validated, deps, ctx);
+  return { ok: true, output };
+}
+
+function summarizeReadFileToolCall(rawArgs: unknown): string | undefined {
+  let args: ValidatedReadFileToolArguments;
+  try { args = validateReadFileToolArguments(rawArgs); }
+  catch { return undefined; }
+  if (args.source === 'attachment') return `${args.attachmentId ?? args.attachmentRef}[attachment]${args.pages ? `[pages=${args.pages}]` : ''}`;
+  if (args.source === 'items') return `${args.items.length} text files`;
+  const modeSuffix = `[${args.mode}]`;
+  if (args.mode === 'attachment') return `${args.path}${modeSuffix}`;
   const range = lineRangeSuffix(args.startLine, args.endLine);
-  return `${path}${modeSuffix}${range}`;
+  return `${args.path}${modeSuffix}${range}`;
 }
 
 async function readTextFile(
@@ -453,17 +445,17 @@ function pagedPdfName(name: string, pages: string): string {
 
 function isSyntheticEmptyReadItems(value: unknown): boolean {
   return Array.isArray(value) && value.every((candidate) => {
-    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return false;
-    const item = candidate as ReadFileItem;
-    return !normalizeDisplayPath(item.path)
-      && normalizeLineNumber(item.startLine) === undefined
-      && normalizeLineNumber(item.endLine) === undefined;
+    if (isEmptyToolArgument(candidate)) return true;
+    if (typeof candidate !== 'object' || Array.isArray(candidate)) return false;
+    const item = candidate as Record<string, unknown>;
+    return ['path', 'startLine', 'endLine', 'attachmentId', 'attachmentRef', 'mode', 'pages'].every((key) =>
+      isEmptyToolArgument(item[key]) || typeof item[key] === 'string' && !(item[key] as string).trim());
   });
 }
 
 function normalizeReadItems(value: unknown): ReadFileItem[] | string {
-  if (!Array.isArray(value) || value.length < 2 || value.length > READ_BATCH_MAX_ITEMS) {
-    return `items must contain 2-${READ_BATCH_MAX_ITEMS} text read requests.`;
+  if (!Array.isArray(value) || value.length < 1 || value.length > READ_BATCH_MAX_ITEMS) {
+    return `items must contain 1-${READ_BATCH_MAX_ITEMS} text read requests.`;
   }
   const items: ReadFileItem[] = [];
   for (let index = 0; index < value.length; index += 1) {
@@ -471,12 +463,43 @@ function normalizeReadItems(value: unknown): ReadFileItem[] | string {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) {
       return `items[${index}] must be an object.`;
     }
-    const item = candidate as ReadFileItem;
-    const path = normalizeDisplayPath(item.path);
-    if (!path) return `items[${index}].path must be non-empty.`;
-    items.push({ path, startLine: item.startLine, endLine: item.endLine });
+    const item = candidate as Record<string, unknown>;
+    try {
+      const path = normalizeDisplayPath(requireReadText(item.path, `items[${index}].path`));
+      for (const key of ['attachmentId', 'attachmentRef', 'pages']) {
+        if (!isEmptyToolArgument(item[key])) throw new ToolArgumentError(`items[${index}].${key} is not supported in a text batch.`);
+      }
+      if (!isEmptyToolArgument(item.mode) && item.mode !== 'text') throw new ToolArgumentError('Batch items support text mode only.');
+      assertTextReadPath(path);
+      items.push({ path, ...validateReadLineRange(item, `items[${index}]`) });
+    } catch (error) {
+      if (!(error instanceof ToolArgumentError)) throw error;
+      return error.message;
+    }
   }
   return items;
+}
+
+function requireReadText(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !value.trim()) throw new ToolArgumentError(`${label} must be a non-empty string.`);
+  return value.trim();
+}
+
+function validateReadLineRange(args: Record<string, unknown>, label: string): { startLine?: number; endLine?: number } {
+  const range: { startLine?: number; endLine?: number } = {};
+  for (const key of ['startLine', 'endLine'] as const) {
+    const value = args[key];
+    if (isEmptyToolArgument(value) || typeof value === 'string' && !value.trim()) continue;
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 1) throw new ToolArgumentError(`${label}.${key} must be a positive integer.`);
+    range[key] = value;
+  }
+  if (range.endLine !== undefined && range.endLine < (range.startLine ?? 1)) throw new ToolArgumentError(`${label}.endLine must not be smaller than startLine.`);
+  return range;
+}
+
+function assertTextReadPath(path: string): void {
+  const mimeType = inferMimeType(path);
+  if (mimeType) throw new ToolArgumentError(`Cannot read ${mimeType} as UTF-8 text. Use mode="attachment" for ${path}.`);
 }
 
 /**
@@ -500,10 +523,6 @@ function boundBatchReadOutput<T extends { content: string; startLine: number; en
     remaining = 0;
     return { ...file, content, endLine: file.startLine + keptLines - 1, contentTruncated: true, omittedChars };
   });
-}
-
-function normalizeAttachmentId(value: unknown): string {
-  return typeof value === 'string' ? value.trim() : '';
 }
 
 function lineRangeSuffix(startLine: number | undefined, endLine: number | undefined): string {

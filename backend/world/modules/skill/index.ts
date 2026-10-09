@@ -6,5 +6,4 @@ export * from './queries';
 export * from './bundles';
 export * from './clientSync';
 export * from './skillDescription';
-export * from './skillsToolSchemaContributor';
 export * from './plugin';

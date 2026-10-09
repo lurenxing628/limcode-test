@@ -381,7 +381,7 @@ test('LLM capability adapter 过滤未授权工具并提交一个完整终态事
   });
 });
 
-test('LLM capability adapter hides managed attachment input without a catalog and compacts Read placeholders', async () => {
+test('LLM capability adapter hides unmanaged attachment inputs and preserves original Read arguments', async () => {
   const fullRequest = request();
   fullRequest.authoritySnapshot.toolPolicy.allowedTools = ['read'];
   fullRequest.recipe.tools = [{
@@ -434,8 +434,13 @@ test('LLM capability adapter hides managed attachment input without a catalog an
   assert.equal(Object.keys(captured.tools[0].parameters.properties)[0], 'path');
   assert.doesNotMatch(captured.tools[0].description, /attachmentId/);
   assert.deepEqual(events.at(-1).content.parts[0].functionCall.args, {
+    attachmentId: '',
+    endLine: 0,
+    items: [],
     mode: 'text',
-    path: 'src/demo.ts'
+    pages: '',
+    path: 'src\\demo.ts',
+    startLine: 0
   });
 });
 
@@ -2797,7 +2802,7 @@ test('LLM capability adapter interleaves typed attachment catalog checkpoint and
   assert.match(ordinary.tools[0].description, /at most 4 consecutive pages/);
   assert.deepEqual(
     ordinaryEvents.at(-1).content.parts.find((part) => part.functionCall)?.functionCall.args,
-    { attachmentRef: 'F1' }
+    { attachmentRef: ' F1 ', endLine: 1, mode: 'attachment', startLine: 1 }
   );
 
   let imageOnly;

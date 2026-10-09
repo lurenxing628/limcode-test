@@ -62,7 +62,7 @@ test('task card reminder 只在任务快照或压缩边界变化时注入', () =
   assert.equal(shouldInjectTurnTaskCard({ ...unchanged, boundaryKey: 'compression-segment-2' }, unchanged), true);
 });
 
-test('task operation 只在一个严格边界规范化完整 mode/items', () => {
+test('task operation 按选中 mode 规范化字段并保留重复项输入顺序', () => {
   assert.deepEqual(requireTaskListOperation({
     mode: 'rewrite',
     items: [{ title: '  First   task ', description: ' two   words ', status: 'in_progress', delete: false }]
@@ -72,16 +72,24 @@ test('task operation 只在一个严格边界规范化完整 mode/items', () => 
     items: [{ title: 'First task', description: 'two words', status: 'in_progress' }]
   });
   assert.throws(() => requireTaskListOperation({ mode: 'rewrite', items: [{ title: 'x', status: 'done' }] }), /status is invalid/);
-  assert.throws(() => requireTaskListOperation({ mode: 'rewrite', items: [{ title: 'x', delete: true }] }), /only be used in update mode/);
+  assert.deepEqual(requireTaskListOperation({ mode: 'rewrite', items: [{ title: 'x', delete: true }] }), rewrite([{ title: 'x' }]));
   assert.deepEqual(requireTaskListOperation({ mode: 'update', items: [{ title: 'x', delete: true, status: 'completed' }] }), {
     kind: 'task_list.operation', mode: 'update', items: [{ title: 'x', delete: true }]
   });
-  assert.throws(() => requireTaskListOperation({ mode: 'rewrite', items: [], extra: true }), /unsupported fields/);
-  assert.throws(() => requireTaskListOperation({
+  assert.deepEqual(requireTaskListOperation({ mode: 'rewrite', items: [], extra: true }), rewrite([]));
+  assert.deepEqual(requireTaskListOperation({
     mode: 'rewrite',
     items: [{ title: 'Same task' }, { title: '  same   TASK ' }]
-  }), /duplicate title/);
-  assert.equal(taskListOperationFromArgs({ mode: 'rewrite', items: [{ title: 'x', unknown: true }] }), undefined);
+  }), rewrite([{ title: 'Same task' }, { title: 'same TASK' }]));
+  const repeated = buildCurrentTurnTaskProjection({
+    turnId: 'turn-repeated-titles',
+    operations: [fact(1, requireTaskListOperation({ mode: 'rewrite', items: [
+      { title: 'Same task', status: 'pending' },
+      { title: '  same   TASK ', status: 'completed' }
+    ] }))]
+  });
+  assert.deepEqual(repeated.snapshot.items.map(item => [item.title, item.status]), [['same TASK', 'completed']]);
+  assert.deepEqual(taskListOperationFromArgs({ mode: 'rewrite', items: [{ title: 'x', unknown: true }] }), rewrite([{ title: 'x' }]));
 });
 
 test('submit_plan 必须携带完整结构化 taskList 合同', () => {
@@ -103,12 +111,12 @@ test('submit_plan 必须携带完整结构化 taskList 合同', () => {
     }),
     /at least one task/
   );
-  assert.throws(
-    () => normalizeSubmitPlanToolRequest({
+  assert.deepEqual(
+    normalizeSubmitPlanToolRequest({
       plan: 'inspect then fix',
       taskList: { mode: 'rewrite', items: [{ title: 'inspect' }, { title: ' Inspect ' }] }
     }),
-    /taskList must use the same shape/
+    { plan: 'inspect then fix', taskList: rewrite([{ title: 'inspect' }, { title: 'Inspect' }]) }
   );
   assert.deepEqual(normalizeSubmitPlanToolRequest({
     plan: 'inspect then fix',

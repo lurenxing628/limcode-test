@@ -39,7 +39,7 @@ Reliable Turn authority is immutable: passing the already-active work environmen
   scheduling: staticToolScheduling('serial', 'work_environment_switch'),
   summary: summarizeSwitchWorkEnvironmentToolCall,
   async execute() {
-    // 该工具必须由可靠工具规划器在 durable transition 中原子更新 Turn 与工作环境关系。
+    // 生产 dispatcher 只校验 Turn 已冻结的工作环境；直接 executor 不执行切换。
     return { ok: false, output: 'switch_work_environment 必须由可靠工具规划器处理。' };
   }
 };

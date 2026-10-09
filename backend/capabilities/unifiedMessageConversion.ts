@@ -416,7 +416,7 @@ function toUnifiedPart(part: ContentPart, nativeAsync = false): UnifiedPart {
 
 function toUnifiedFunctionDeclaration(tool: ToolSchema, nativeAsync = false): UnifiedFunctionDeclaration {
   const parameters = isFunctionParameters(tool.parameters)
-    ? providerCompatibleFunctionParameters(tool.name, tool.parameters)
+    ? tool.parameters
     : { type: 'object' as const, properties: {} };
   return {
     name: tool.name,
@@ -425,16 +425,6 @@ function toUnifiedFunctionDeclaration(tool: ToolSchema, nativeAsync = false): Un
     // Astra 原生异步声明：仅 per-tool nativeAsync 且当前 capability.asyncTools 时编码。
     ...(nativeAsync && tool.async === true ? { async: true } : {})
   } as UnifiedFunctionDeclaration;
-}
-
-function providerCompatibleFunctionParameters(
-  toolName: string,
-  parameters: UnifiedFunctionDeclaration['parameters']
-): UnifiedFunctionDeclaration['parameters'] {
-  if (toolName !== 'edit' || !isRecord(parameters)) return parameters;
-  const parameterRecord = parameters as unknown as Record<string, unknown>;
-  const { oneOf: _unsupportedUnion, ...compatible } = parameterRecord;
-  return compatible as UnifiedFunctionDeclaration['parameters'];
 }
 
 function asRecord(value: unknown): Record<string, unknown> {

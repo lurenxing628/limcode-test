@@ -6,7 +6,7 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const root = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const load = file => require(path.join(root, file));
-const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborationToolDispatcher.js');
+const { CollaborationToolDispatcher, selectCollaborationToolArguments } = load('backend/reliableKernel/collaborationToolDispatcher.js');
 const { buildModelHandleCatalog, resolveModelToolArguments, projectToolResultForModel } = load('backend/reliableKernel/modelHandleCatalog.js');
 const { mergeConversationChildHandles, rebuildHistoricalConversationContextHandleState } = load('backend/reliableKernel/conversationChildHandles.js');
 // Copied historical recipes are read only at the explicit reconstruction boundary.
@@ -126,13 +126,14 @@ function fixture({ toolName = 'send_agent_message', args = { targetConversationI
     ToolCallSourceLink: [{ id: 'source', tool_call_id: 'call', model_request_id: 'request' }]
   };
   const calls = [];
+  const memberPages = [];
   const settlements = [];
   const dispatcher = new CollaborationToolDispatcher({
     database: { async snapshot(reads) { return { snapshot: reads.map(read => read.domain === 'ContentObject' ? { id: read.id } : records[read.domain]) }; } },
     contentStore: { async read(row) { return Buffer.from(JSON.stringify(row.id === 'authority-content' ? document : args)); } },
     collaboration: {
       async send(input) { calls.push(input); return { messageId: 'message', accepted: true }; },
-      async listMembers(id) { calls.push(id); return { members: [] }; },
+      async listMembers(id, options) { calls.push(id); memberPages.push(options); return { members: [] }; },
       async listMessages(input) { calls.push(input); return { messages: [] }; },
       async readConversation(input) { calls.push(input); return { conversationId: input.targetConversationId, title: 'peer', status: 'active',
         messages: [{ messageId: 'chat-message', role: 'model', text: 'retained reply' }], olderMessageId: 'chat-message', hasMore: true }; },
@@ -150,7 +151,7 @@ function fixture({ toolName = 'send_agent_message', args = { targetConversationI
     effects: { async settleWithoutEffect(input) { settlements.push(input); return { status: input.status, terminal: input }; } }
   });
   const input = { turnId: 'turn', modelRequestId: 'request', toolCallId: 'call', toolName, arguments: args };
-  return { dispatcher, input, authority, document, records, calls, settlements };
+  return { dispatcher, input, authority, document, records, calls, memberPages, settlements };
 }
 
 test('special dispatch preserves peer source and separates message delivery from follow-up wake', async () => {
@@ -179,16 +180,134 @@ test('frozen tool source, snapshot and committed arguments cannot be forged befo
   }
 });
 
-test('read and wait validation rejects unbounded or mixed arguments without side effects', async () => {
-  for (const [toolName, args] of [['read_agent_messages', { messageId: 'm', limit: 20 }],
-    ['read_agent_messages', { limit: 101 }], ['wait_agent_messages', { timeoutMs: 60001 }], ['list_agents', { conversationId: 'other' }]]) {
+test('used collaboration budgets clamp useful calls and report the actual bounds', async () => {
+  for (const [toolName, args, expected] of [
+    ['read_agent_messages', { limit: 101 }, { conversationId: 'conversation', limit: 100 }],
+    ['read_agent_messages', { limit: 0 }, { conversationId: 'conversation', limit: 1 }],
+    ['read_agent_messages', { view: 'conversation', targetConversationId: 'peer', limit: '999' }, { conversationId: 'conversation', targetConversationId: 'peer', limit: 50 }],
+    ['wait_agent_messages', { timeoutMs: '120000' }, { conversationId: 'conversation', signal: undefined, timeoutMs: 60000 }],
+    ['read_conversation', { targetConversationId: 'peer', limit: 100 }, { conversationId: 'conversation', targetConversationId: 'peer', crossConversationTurnId: 'turn', limit: 50 }],
+    ['list_conversations', { limit: '100' }, { list: { turnId: 'turn', limit: 50 } }]
+  ]) {
+    const f = fixture({ toolName, args, crossConversation: true });
+    const result = await f.dispatcher.dispatch(f.input, undefined, f.authority);
+    assert.deepEqual(f.calls, [expected]);
+    assert.match(result.detail.warning, /已限制为/);
+    assert.equal(result.detail.ignoredFields, undefined);
+  }
+  const members = fixture({ toolName: 'list_agents', args: { cursor: 'members-page', limit: '999' } });
+  await members.dispatcher.dispatch(members.input, undefined, members.authority);
+  assert.deepEqual(members.calls, ['conversation']);
+  assert.deepEqual(members.memberPages, [{ cursor: 'members-page', limit: 256 }]);
+});
+
+test('optional placeholders and harmless extra keys preserve frozen collaboration scope and actions', async () => {
+  const members = fixture({ toolName: 'list_agents', args: { cursor: [], limit: null, conversationId: 'other', note: 'hint' } });
+  await members.dispatcher.dispatch(members.input, undefined, members.authority);
+  assert.deepEqual(members.calls, ['conversation']);
+  assert.deepEqual(members.memberPages, [{}]);
+  const send = fixture({ args: { targetConversationId: 'peer', text: ' hello ', replyToMessageId: null,
+    conversationId: 'other', turnId: 'other-turn', mode: 'followup', note: 'hint' } });
+  await send.dispatcher.dispatch(send.input, undefined, send.authority);
+  assert.deepEqual(send.calls, [{ source: { kind: 'tool', turnId: 'turn', toolCallId: 'call' }, targetConversationId: 'peer', text: ' hello ', mode: 'message' }]);
+  const wait = fixture({ toolName: 'wait_agent_messages', args: { afterMessageId: {}, timeoutMs: null, note: true } });
+  await wait.dispatcher.dispatch(wait.input, undefined, wait.authority);
+  assert.deepEqual(wait.calls, [{ conversationId: 'conversation', signal: undefined, timeoutMs: 30000 }]);
+  const create = fixture({ toolName: 'create_conversation', args: { prompt: 'do it', title: null, note: true }, crossConversation: true });
+  await create.dispatcher.dispatch(create.input, undefined, create.authority);
+  assert.deepEqual(create.calls, [{ authorize: { turnId: 'turn' } }, { spawnCapacity: { turnId: 'turn', toolCallId: 'call' } },
+    { create: { turnId: 'turn', toolCallId: 'call', sourceConversationId: 'conversation', prompt: 'do it' } }]);
+});
+
+test('used invalid collaboration arguments fail before observation or mutation while timeout zero polls', async () => {
+  for (const [toolName, args] of [
+    ['read_agent_messages', { limit: false }], ['read_agent_messages', { limit: 'many' }],
+    ['read_agent_messages', { limit: -1 }], ['read_agent_messages', { messageId: false, cursor: 'unused' }],
+    ['read_agent_messages', { beforeMessageId: 'old', afterMessageId: 'new' }],
+    ['read_agent_messages', { view: 'typo' }], ['wait_agent_messages', { timeoutMs: false }],
+    ['wait_agent_messages', { timeoutMs: 'soon' }], ['list_agents', { cursor: false }]
+  ]) {
     const f = fixture({ toolName, args });
     await assert.rejects(f.dispatcher.dispatch(f.input, undefined, f.authority));
     assert.deepEqual(f.calls, []);
+    assert.deepEqual(f.settlements, []);
   }
   const f = fixture({ toolName: 'wait_agent_messages', args: { timeoutMs: 0 } });
   await f.dispatcher.dispatch(f.input, undefined, f.authority);
   assert.equal(f.calls[0].timeoutMs, 0);
+});
+
+test('single-message selection ignores lower-priority invalid pagination without changing the requested scope', async () => {
+  for (const [toolName, view] of [['read_agent_messages', undefined], ['read_agent_messages', 'conversation'], ['read_conversation', undefined]]) {
+    const args = { ...(view ? { view } : {}), targetConversationId: 'peer', messageId: 'requested-message', offset: '40',
+      cursor: false, inputCursor: 'unused', beforeMessageId: false, afterMessageId: 0, limit: false, conversationId: 'other', turnId: 'other' };
+    const original = structuredClone(args);
+    const f = fixture({ toolName, args, crossConversation: true });
+    const result = await f.dispatcher.dispatch(f.input, undefined, f.authority);
+    const expected = { conversationId: 'conversation', targetConversationId: 'peer', messageId: 'requested-message', offset: 40,
+      ...(toolName === 'read_conversation' ? { crossConversationTurnId: 'turn' } : {}) };
+    assert.deepEqual(f.calls, [toolName === 'read_conversation' || view === 'conversation' ? { readConversationMessage: expected } : expected]);
+    assert.deepEqual(result.detail.ignoredFields, ['cursor', 'inputCursor', 'beforeMessageRef', 'afterMessageRef', 'limit']);
+    assert.equal(result.detail.warning, '已选择 messageRef；未使用参数：cursor、inputCursor、beforeMessageRef、afterMessageRef、limit。');
+    assert.deepEqual(args, original, 'the original ToolCall arguments remain unchanged');
+  }
+});
+
+test('page cursor selection ignores unused page parameters and transcript input cursors keep their target', async () => {
+  const cursor = fixture({ toolName: 'read_conversation', crossConversation: true,
+    args: { targetConversationId: 'peer', cursor: 'selected-page', inputCursor: 'unused-input', beforeMessageId: false, limit: false, offset: 0 } });
+  const result = await cursor.dispatcher.dispatch(cursor.input, undefined, cursor.authority);
+  assert.deepEqual(cursor.calls, [{ conversationId: 'conversation', targetConversationId: 'peer', crossConversationTurnId: 'turn', cursor: 'selected-page' }]);
+  assert.deepEqual(result.detail.ignoredFields, ['inputCursor', 'beforeMessageRef', 'limit', 'offset']);
+  assert.match(result.detail.warning, /^已选择 cursor；/);
+  const input = fixture({ toolName: 'read_agent_messages', args: { view: 'conversation', targetConversationId: 'peer',
+    inputCursor: 'selected-input', cursor: null, beforeMessageId: false, limit: false } });
+  await input.dispatcher.dispatch(input.input, undefined, input.authority);
+  assert.deepEqual(input.calls, [{ conversationId: 'conversation', targetConversationId: 'peer', inputCursor: 'selected-input' }]);
+  const mailbox = fixture({ toolName: 'read_agent_messages', args: { cursor: 'mail-page', inputCursor: 'unused', offset: false, limit: false } });
+  await mailbox.dispatcher.dispatch(mailbox.input, undefined, mailbox.authority);
+  assert.deepEqual(mailbox.calls, [{ conversationId: 'conversation', cursor: 'mail-page' }]);
+  const list = fixture({ toolName: 'list_conversations', args: { cursor: 'conversation-page', limit: false }, crossConversation: true });
+  const listed = await list.dispatcher.dispatch(list.input, undefined, list.authority);
+  assert.deepEqual(list.calls, [{ list: { turnId: 'turn', cursor: 'conversation-page' } }]);
+  assert.deepEqual(listed.detail.ignoredFields, ['limit']);
+});
+
+test('pure read selection removes unused public handles before resolution and never rewrites the frozen object', () => {
+  const raw = { view: 'conversation', conversationRef: 'C1', messageRef: 'R1', offset: 0, cursor: false,
+    inputCursor: 'unused', beforeMessageRef: 'M999', afterMessageRef: false, limit: false, note: 'hint' };
+  const original = structuredClone(raw);
+  const selected = selectCollaborationToolArguments('read_agent_messages', raw);
+  assert.deepEqual(selected.arguments, { conversationRef: 'C1', view: 'conversation', messageRef: 'R1', offset: 0 });
+  assert.deepEqual(selected.ignoredFields, ['cursor', 'inputCursor', 'beforeMessageRef', 'afterMessageRef', 'limit']);
+  assert.deepEqual(raw, original);
+  const invalidSelected = selectCollaborationToolArguments('read_conversation', { conversationRef: 'C1', messageRef: false, cursor: 'valid-page' });
+  assert.equal(invalidSelected.arguments.messageRef, false, 'the selector leaves real selected-reference errors for normal validation');
+});
+
+test('model reference admission resolves only the selected message or page while retaining unused argument evidence', () => {
+  const handles = buildModelHandleCatalog([{ kind: 'cross_conversation', conversationId: 'peer', conversationMessageId: 'transcript-message' },
+    { kind: 'agent_collaboration', messageId: 'mail-message' }]);
+  for (const [toolName, view, messageRef, messageId] of [
+    ['read_conversation', undefined, 'R1', 'transcript-message'],
+    ['read_agent_messages', ' conversation ', 'R1', 'transcript-message'],
+    ['read_agent_messages', null, 'M1', 'mail-message']
+  ]) {
+    const raw = { ...(view !== undefined ? { view } : {}), conversationRef: 'C1', messageRef,
+      beforeMessageRef: 'INVALID_UNUSED_REF', cursor: false, limit: false, offset: 0 };
+    const original = structuredClone(raw);
+    assert.deepEqual(resolveModelToolArguments(toolName, raw, handles), {
+      ...(view !== undefined ? { view } : {}), targetConversationId: 'peer', messageId,
+      beforeMessageRef: 'INVALID_UNUSED_REF', cursor: false, limit: false, offset: 0
+    });
+    assert.deepEqual(raw, original);
+  }
+  assert.deepEqual(resolveModelToolArguments('read_conversation', {
+    conversationRef: 'C1', cursor: 'selected-page', beforeMessageRef: 'INVALID_UNUSED_REF', limit: false
+  }, handles), { targetConversationId: 'peer', cursor: 'selected-page', beforeMessageRef: 'INVALID_UNUSED_REF', limit: false });
+  assert.throws(() => resolveModelToolArguments('read_conversation', {
+    conversationRef: 'C1', messageRef: 'INVALID_SELECTED_REF', cursor: 'unused-page'
+  }, handles), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
 });
 
 test('collaboration declarations classify only observations as read-only and expose no permission mutation', () => {
@@ -259,9 +378,10 @@ test('authorized conversation history uses a separate reference kind from collab
   await page.dispatcher.dispatch(page.input, undefined, page.authority);
   assert.deepEqual(page.calls, [{ readConversationMessage: { conversationId: 'conversation', targetConversationId: 'peer', messageId: 'chat-message', offset: 40 } }]);
   for (const args of [{ view: 'conversation', targetConversationId: 'peer', messageId: 'chat-message', limit: 5 }, { view: 'conversation', targetConversationId: 'peer', offset: 3 }]) {
-    const refused = fixture({ toolName: 'read_agent_messages', args });
-    await assert.rejects(refused.dispatcher.dispatch(refused.input, undefined, refused.authority));
-    assert.deepEqual(refused.calls, []);
+    const selected = fixture({ toolName: 'read_agent_messages', args });
+    const observed = await selected.dispatcher.dispatch(selected.input, undefined, selected.authority);
+    assert.equal(selected.calls.length, 1);
+    assert.deepEqual(observed.detail.ignoredFields, [args.messageId ? 'limit' : 'offset']);
   }
 });
 

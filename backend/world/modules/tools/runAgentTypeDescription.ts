@@ -21,7 +21,7 @@ export function formatAgentTypeList(entries: readonly AgentTypeListEntry[]): str
 
 /**
  * 把可用 agent.type 列表注入 runAgent 工具描述与 agent.type 参数提示。
- * ECS schema contributor 与 reliableKernel toolDispatcher 共用此纯函数。
+ * reliableKernel toolDispatcher 使用的纯描述函数。
  */
 export function augmentRunAgentToolSchema<T extends { description: string; parameters: unknown }>(
   tool: T,

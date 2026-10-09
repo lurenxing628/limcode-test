@@ -1,6 +1,10 @@
 import { SWITCH_WORK_ENVIRONMENT_TOOL_NAME, TRANSFER_TOOL_NAME } from '../../shared/protocol';
 import { isCrossConversationTool } from '../world/modules/tools/definitions/crossConversation';
 import { createModelHandleTextProjection } from './modelHandleTextProjection';
+import { commandToolMode } from '../../shared/commandToolArguments';
+import { isEmptyToolArgument, ToolArgumentError } from '../../shared/toolArgumentUtils';
+import { compactReadFileToolArguments } from '../world/modules/tools/definitions/readFile';
+import { selectCollaborationToolArguments } from './collaborationToolDispatcher';
 
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
   | 'conversation' | 'collaborationMessage' | 'conversationMessage' | 'boardChannel' | 'boardThread' | 'boardPost';
@@ -599,13 +603,20 @@ export function resolveModelToolArguments(
   if (isCollaborationHandleTool(toolName)) {
     resolveCollaborationArguments(toolName, record, catalog);
   } else if (toolName === 'read') {
-    replaceRef(toolName, record, 'attachmentRef', 'attachmentId', 'attachment', catalog);
+    // Unused references must not reject an otherwise executable selected path.
+    if (compactReadFileToolArguments(record).path === undefined) {
+      replaceRef(toolName, record, 'attachmentRef', 'attachmentId', 'attachment', catalog);
+    }
   } else if (toolName === 'bash' || toolName === 'shell') {
     resolveCommandArguments(toolName, record, catalog);
   } else if (toolName === 'run_agent' || toolName === 'read_agent_answer') {
-    replaceRef(toolName, record, 'childRef', 'answerBridgeId', 'child', catalog);
-    if ('answerBridgeIds' in record) throw canonicalArgumentError(toolName, 'answerBridgeIds', 'childRefs', 'child', true);
-    if ('childRefs' in record) {
+    const operation = typeof record.operation === 'string' ? record.operation.trim() : '';
+    const ignoresChild = toolName === 'run_agent' && (operation === 'spawn' || operation === 'list');
+    if (!ignoresChild) replaceRef(toolName, record, 'childRef', 'answerBridgeId', 'child', catalog);
+    const usesChildList = toolName === 'run_agent' && !['spawn', 'send', 'list', 'read', 'interrupt_subtree'].includes(operation)
+      && !('answerBridgeId' in record);
+    if (usesChildList && 'answerBridgeIds' in record) throw canonicalArgumentError(toolName, 'answerBridgeIds', 'childRefs', 'child', true);
+    if (usesChildList && 'childRefs' in record) {
       if (!Array.isArray(record.childRefs) || record.childRefs.length === 0 || record.childRefs.length > 32) {
         throw new UnknownModelHandleReferenceError('child', 'childRefs',
           `childRefs 必须是包含 1 到 32 个${shortRefForm('child')}的数组。`);
@@ -805,6 +816,7 @@ function replaceRef(
   kind: ModelHandleKind,
   catalog: PreparedModelHandleCatalog
 ): void {
+  if (isEmptyToolArgument(record[targetKey]) || typeof record[targetKey] === 'string' && !(record[targetKey] as string).trim()) delete record[targetKey];
   if (targetKey in record) throw canonicalArgumentError(toolName, targetKey, refKey, kind);
   if (!(refKey in record)) return;
   const target = requireRefTarget(catalog, kind, refKey, record[refKey], toolName);
@@ -899,29 +911,37 @@ export function handleKindOfRef(value: string): ModelHandleKind | undefined {
  * process. Mode misuse is reported as such, so a valid P#/O# is never described as unknown.
  */
 function resolveCommandArguments(toolName: string, record: Record<string, unknown>, catalog: PreparedModelHandleCatalog): void {
-  if ('processId' in record) throw canonicalArgumentError(toolName, 'processId', 'processRef', 'process');
-  if ('outputHandle' in record) throw canonicalArgumentError(toolName, 'outputHandle', 'cursor', 'cursor');
-  const mode = record.mode === 'output' || record.mode === 'kill' ? record.mode : 'execute';
+  let mode: ReturnType<typeof commandToolMode>;
+  try {
+    // Resolve the selector first; the checks below explain process/cursor misuse with its ref.
+    mode = commandToolMode({ mode: record.mode });
+  } catch (error) {
+    if (!(error instanceof ToolArgumentError)) throw error;
+    rejectArgument('process', 'mode', error.message);
+  }
+  const hasExplicitMode = typeof record.mode === 'string' && record.mode.trim() !== '';
+  if ((mode !== 'execute' || !hasExplicitMode) && 'processId' in record) throw canonicalArgumentError(toolName, 'processId', 'processRef', 'process');
+  if ((mode === 'output' || !hasExplicitMode) && 'outputHandle' in record) throw canonicalArgumentError(toolName, 'outputHandle', 'cursor', 'cursor');
   const executeText = record.mode === undefined
     ? '未传 mode 时按 mode=execute 执行新命令'
     : record.mode === 'execute' ? 'mode=execute 用于执行新命令' : 'mode 只能是 execute、output 或 kill';
-  if (mode === 'execute' && 'processRef' in record) {
+  if (mode === 'execute' && !hasExplicitMode && 'processRef' in record) {
     const ref = optionalText(record.processRef);
     const known = ref && modelHandleTarget(catalog, 'process', ref) ? ref : undefined;
     rejectArgument('process', 'processRef',
       `processRef 只用于 mode=output（读取后台进程输出）或 mode=kill（终止后台进程），${executeText}。`
       + (known ? `要读取或终止 ${known}，请同时传 mode=output 或 mode=kill。` : '执行新命令时不要传 processRef。'));
   }
-  if (mode !== 'output' && 'cursor' in record) {
+  if (mode === 'execute' && !hasExplicitMode && 'cursor' in record) {
     rejectArgument('cursor', 'cursor',
-      `cursor 只用于 mode=output 的分页读取；${mode === 'kill' ? 'mode=kill 不接受 cursor' : executeText}。`);
+      `cursor 只用于 mode=output 的分页读取；${executeText}。`);
   }
   if (mode !== 'execute' && !('processRef' in record)) {
     rejectArgument('process', 'processRef',
       `mode=${mode} 需要 processRef：请传之前 ${toolName} 结果或后台完成通知中给出的${shortRefForm('process')}。`);
   }
-  replaceRef(toolName, record, 'processRef', 'processId', 'process', catalog);
-  replaceRef(toolName, record, 'cursor', 'outputHandle', 'cursor', catalog);
+  if (mode !== 'execute') replaceRef(toolName, record, 'processRef', 'processId', 'process', catalog);
+  if (mode === 'output') replaceRef(toolName, record, 'cursor', 'outputHandle', 'cursor', catalog);
 }
 
 /** Joins a kind label and a following noun, keeping a space after a Latin word such as "Agent". */
@@ -1099,9 +1119,12 @@ function collaborationArgumentFields(
 }
 
 function resolveCollaborationArguments(toolName: string, record: Record<string, unknown>, catalog: PreparedModelHandleCatalog): void {
-  const fields = collaborationArgumentFields(toolName, record);
+  const selected = toolName === 'agent_board' ? record : selectCollaborationToolArguments(toolName, record).arguments;
+  const fields = collaborationArgumentFields(toolName, selected);
   // Provider contracts accept only frozen short references. Canonical IDs cannot bypass the map.
-  for (const [refKey, targetKey, kind] of fields) replaceRef(toolName, record, refKey, targetKey, kind, catalog);
+  for (const [refKey, targetKey, kind] of fields) {
+    if (refKey in selected || targetKey in selected) replaceRef(toolName, record, refKey, targetKey, kind, catalog);
+  }
   if (toolName === 'agent_board') {
     if ('notifyConversationIds' in record) {
       throw canonicalArgumentError(toolName, 'notifyConversationIds', 'notifyConversationRefs', 'conversation', true);

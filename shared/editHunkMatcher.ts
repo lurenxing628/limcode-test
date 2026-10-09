@@ -15,7 +15,10 @@ export interface ExactEditHunkResult {
   matches: ExactEditMatch[];
   matchCount: number;
   replacements: number;
+  matchStrategy?: EditHunkMatchStrategy;
 }
+
+export type EditHunkMatchStrategy = 'exact' | 'trim_end' | 'trim' | 'unicode';
 
 interface CanonicalText {
   text: string;
@@ -23,23 +26,34 @@ interface CanonicalText {
   sourceOffsets: number[];
 }
 
+interface LineSpan {
+  text: string;
+  start: number;
+  end: number;
+  hasNewline: boolean;
+}
+
 /**
- * Applies one exact hunk after canonicalizing only newline spellings for comparison. No whitespace,
- * indentation, case, or context fuzz is permitted. Unmatched source bytes remain untouched.
+ * Searches exact text first, then complete lines with Codex's trim_end, trim, and Unicode
+ * punctuation comparisons. One comparison tier is selected for the entire hunk, including
+ * replaceAll. Every replacement uses the actual source range; untouched text stays unchanged.
  */
 export function applyExactEditHunk(source: string, hunk: ExactEditHunk): ExactEditHunkResult {
   if (!hunk.oldContent) throw new TypeError('oldContent must be non-empty.');
   const canonicalSource = canonicalizeWithOffsets(source);
   const canonicalSearch = normalizeLineEndings(hunk.oldContent);
   if (!canonicalSearch) throw new TypeError('oldContent must be non-empty.');
-  const normalizedIndexes = findNonOverlappingMatches(canonicalSource.text, canonicalSearch);
-  if (normalizedIndexes.length === 0) return { content: source, matches: [], matchCount: 0, replacements: 0 };
+  const exactIndexes = findNonOverlappingMatches(canonicalSource.text, canonicalSearch);
+  const located = exactIndexes.length > 0
+    ? { strategy: 'exact' as const, ranges: exactIndexes.map((start) => ({ start, end: start + canonicalSearch.length })) }
+    : findLineMatches(canonicalSource.text, canonicalSearch);
+  if (!located) return { content: source, matches: [], matchCount: 0, replacements: 0 };
 
-  const matches = normalizedIndexes.map((normalizedIndex): ExactEditMatch => {
+  const matches = located.ranges.map(({ start: normalizedIndex, end }): ExactEditMatch => {
     const sourceStart = canonicalSource.sourceOffsets[normalizedIndex];
-    const sourceEnd = canonicalSource.sourceOffsets[normalizedIndex + canonicalSearch.length];
+    const sourceEnd = canonicalSource.sourceOffsets[end];
     if (sourceStart === undefined || sourceEnd === undefined) {
-      throw new Error('Exact edit match boundary could not be mapped to the source text.');
+      throw new Error('Edit match boundary could not be mapped to the source text.');
     }
     return { normalizedIndex, sourceStart, sourceEnd };
   });
@@ -55,7 +69,7 @@ export function applyExactEditHunk(source: string, hunk: ExactEditHunk): ExactEd
     const replacement = convertLineEndings(hunk.newContent, replacementEol);
     content = `${content.slice(0, match.sourceStart)}${replacement}${content.slice(match.sourceEnd)}`;
   }
-  return { content, matches, matchCount: matches.length, replacements: replacements.length };
+  return { content, matches, matchCount: matches.length, replacements: replacements.length, matchStrategy: located.strategy };
 }
 
 export function normalizeLineEndings(value: string): string {
@@ -98,4 +112,63 @@ function findNonOverlappingMatches(content: string, search: string): number[] {
     fromIndex = found + search.length;
   }
   return matches;
+}
+
+function findLineMatches(content: string, search: string): {
+  strategy: Exclude<EditHunkMatchStrategy, 'exact'>;
+  ranges: Array<{ start: number; end: number }>;
+} | undefined {
+  const sourceLines = lineSpans(content);
+  const patternLines = search.split('\n');
+  const includesLastNewline = search.endsWith('\n');
+  if (includesLastNewline) patternLines.pop();
+  if (patternLines.length > sourceLines.length) return undefined;
+  const comparisons = [
+    ['trim_end', (line: string) => line.replace(/\p{White_Space}+$/u, '')],
+    ['trim', trimWhitespace],
+    ['unicode', normalizePunctuation]
+  ] as const;
+  for (const [strategy, compare] of comparisons) {
+    const pattern = patternLines.map(compare);
+    const lines = sourceLines.map((line) => compare(line.text));
+    const ranges: Array<{ start: number; end: number }> = [];
+    for (let index = 0; index + pattern.length <= lines.length;) {
+      const last = sourceLines[index + pattern.length - 1]!;
+      if ((!includesLastNewline || last.hasNewline)
+        && pattern.every((line, offset) => line === lines[index + offset])) {
+        ranges.push({ start: sourceLines[index]!.start, end: last.end + (includesLastNewline ? 1 : 0) });
+        index += pattern.length;
+      } else {
+        index += 1;
+      }
+    }
+    if (ranges.length > 0) return { strategy, ranges };
+  }
+  return undefined;
+}
+
+function lineSpans(content: string): LineSpan[] {
+  const lines: LineSpan[] = [];
+  // A file's BOM belongs to the file header, outside a line replacement.
+  for (let start = content.startsWith('\ufeff') ? 1 : 0; start < content.length;) {
+    const newline = content.indexOf('\n', start);
+    const end = newline < 0 ? content.length : newline;
+    lines.push({ text: content.slice(start, end), start, end, hasNewline: newline >= 0 });
+    if (newline < 0) break;
+    start = newline + 1;
+  }
+  return lines;
+}
+
+function trimWhitespace(value: string): string {
+  return value.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, '');
+}
+
+/** The small punctuation table used by Codex apply-patch's seek_sequence. */
+function normalizePunctuation(value: string): string {
+  return trimWhitespace(value)
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/[\u2018-\u201b]/g, "'")
+    .replace(/[\u201c-\u201f]/g, '"')
+    .replace(/[\u00a0\u2002-\u200a\u202f\u205f\u3000]/g, ' ');
 }

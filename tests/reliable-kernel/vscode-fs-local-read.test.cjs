@@ -25,6 +25,10 @@ class Uri {
   toString() {
     return `${this.scheme}://${this.path}`;
   }
+
+  with(changes) {
+    return new Uri(this.scheme, changes.path ?? this.fsPath);
+  }
 }
 
 const vscode = {
@@ -34,7 +38,9 @@ const vscode = {
     workspaceFolders: [],
     fs: {
       stat: () => neverSettles('stat'),
-      readFile: () => neverSettles('readFile')
+      readFile: () => neverSettles('readFile'),
+      createDirectory: (uri) => fs.mkdir(uri.fsPath, { recursive: true }),
+      writeFile: (uri, bytes) => fs.writeFile(uri.fsPath, bytes)
     }
   }
 };
@@ -46,9 +52,11 @@ Module._load = function loadWithVscodeMock(request, parent, isMain) {
 };
 const {
   readWorkspaceBinaryFile,
-  readWorkspaceTextFile
+  readWorkspaceTextFile,
+  createVsCodeFsCapability
 } = require('../../dist/extension/backend/capabilities/vscodeFs.js');
 Module._load = originalLoad;
+const { editTool } = require('../../dist/extension/backend/world/modules/tools/definitions/edit/index.js');
 
 function localEnvironment(rootPath) {
   return {
@@ -135,6 +143,53 @@ test('超过单次预算的本地文件返回首段切片，行范围照常精�
     assert.equal(ranged.endLine, 504);
     assert.equal(ranged.totalLines, lineCount);
     assert.deepEqual(workspaceFsCalls, []);
+  } finally {
+    vscode.workspace.workspaceFolders = [];
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+test('edit capability 保留提案与应用结果的忽略分支和推断模式', async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-vscode-fs-edit-'));
+  try {
+    const environment = localEnvironment(root);
+    vscode.workspace.workspaceFolders = [{ uri: Uri.file(root) }];
+    const options = { workEnvironment: environment, accessibleWorkEnvironments: [environment], allowOutsideProjectPaths: false };
+    const target = path.join(root, 'sample.txt');
+    const capability = createVsCodeFsCapability();
+    await fs.writeFile(target, 'first\nsecond\n', 'utf8');
+    const result = await editTool.execute({
+      path: 'sample.txt', mode: 'hunk', hunks: [{ oldContent: 'first', newContent: 'changed' }],
+      insert: { line: 1, content: 'unused' }, delete: { startLine: 1, endLine: 1 }
+    }, { fs: capability }, options);
+    assert.equal(result.ok, true, JSON.stringify(result.output));
+    assert.equal(result.output.pending, true);
+    assert.deepEqual(result.output.ignoredBranches, ['insert', 'delete']);
+    assert.deepEqual(result.output.proposal.ignoredBranches, ['insert', 'delete']);
+    assert.equal(result.output.warning, '已选择 mode=hunk；未执行分支：insert、delete。');
+    assert.equal(await fs.readFile(target, 'utf8'), 'first\nsecond\n');
+    const applied = await capability.applyPendingFileChange(structuredClone(result.output.proposal), options);
+    assert.deepEqual(applied.ignoredBranches, ['insert', 'delete']);
+    assert.equal(applied.warning, result.output.warning);
+    assert.equal(await fs.readFile(target, 'utf8'), 'changed\nsecond\n');
+
+    const inferred = await editTool.execute({
+      path: 'sample.txt', insert: { line: 1, content: 'prefix' }, hunks: [], delete: null
+    }, { fs: capability }, options);
+    assert.equal(inferred.output.inferredMode, true);
+    assert.equal(inferred.output.proposal.inferredMode, true);
+    const inferredApplied = await capability.applyPendingFileChange(structuredClone(inferred.output.proposal), options);
+    assert.equal(inferredApplied.mode, 'insert');
+    assert.equal(inferredApplied.inferredMode, true);
+    assert.equal(await fs.readFile(target, 'utf8'), 'prefix\nchanged\nsecond\n');
+
+    const unchanged = await capability.proposeEditFile({
+      path: 'sample.txt', mode: 'hunk', hunks: [{ oldContent: 'changed', newContent: 'changed' }], ignoredBranches: ['insert']
+    }, options);
+    assert.equal(unchanged.action, 'unchanged');
+    assert.equal(unchanged.proposal, undefined);
+    assert.deepEqual(unchanged.ignoredBranches, ['insert']);
+    assert.match(unchanged.warning, /未执行分支：insert/);
   } finally {
     vscode.workspace.workspaceFolders = [];
     await fs.rm(root, { recursive: true, force: true });

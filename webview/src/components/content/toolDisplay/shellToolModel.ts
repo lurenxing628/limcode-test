@@ -1,4 +1,5 @@
 import type { ToolCallEventRecord } from '@shared/protocol';
+import { commandToolArgumentMetadata } from '@shared/commandToolArguments';
 import type { ToolDisplayContext, ToolDisplaySection } from './types';
 
 export interface ShellArgs {
@@ -25,6 +26,10 @@ export interface ShellResultOutput {
   processId?: string;
   running?: boolean;
   droppedChars?: number;
+  mode?: string;
+  inferredMode?: boolean;
+  ignoredFields?: string[];
+  warning?: string;
 }
 
 export function parseShellArgs(value: unknown): ShellArgs {
@@ -62,17 +67,23 @@ export function parseShellResultOutput(result: unknown): ShellResultOutput | und
     : resultRecord && 'output' in resultRecord
       ? resultRecord.output
       : detailRecord ?? result;
-  if (typeof output === 'string') return parseStringOutput(output);
   const outputRecord = asRecord(output);
-  return outputRecord ? shellResultOutput(outputRecord) : undefined;
+  const parsed = typeof output === 'string' ? parseStringOutput(output)
+    : outputRecord ? shellResultOutput(outputRecord) : undefined;
+  // The reliable result keeps selection metadata beside output, not inside stdout/stderr.
+  const metadata = shellPresentationMetadata({ ...outputRecord, ...resultRecord, ...detailRecord });
+  return parsed || Object.keys(metadata).length > 0 ? { ...parsed, ...metadata } : undefined;
 }
 
 export function shellInputSections(args: ShellArgs, context: ToolDisplayContext): ToolDisplaySection[] {
   const sections: ToolDisplaySection[] = [];
+  const metadata = commandArgumentMetadata(context.args);
+  const rows = shellPresentationRows(metadata);
+  if (rows.length > 0) sections.push({ kind: 'input', title: '操作', rows });
   const explanation = args.explanation?.trim();
   if (explanation) sections.push({ kind: 'input', title: '说明', text: explanation });
   const command = args.command?.trim();
-  if (command) sections.push({ kind: 'input', title: '命令', text: command });
+  if (command) sections.push({ kind: 'input', title: metadata.ignoredFields?.includes('command') ? '未使用的命令' : '命令', text: command });
 
   const optionLines = [
     args.cwd?.trim() ? `工作目录 ${args.cwd.trim()}` : undefined,
@@ -104,6 +115,9 @@ export function shellOutputSections(context: ToolDisplayContext): ToolDisplaySec
   if (sections.length === 0 && context.result !== undefined) {
     sections.push({ kind: 'output', title: '输出', text: context.stringifyValue(context.result) });
   }
+
+  const rows = shellPresentationRows(output);
+  if (rows.length > 0) sections.push({ kind: 'output', title: '操作说明', rows });
 
   return sections;
 }
@@ -156,8 +170,40 @@ function shellResultOutput(record: Record<string, unknown>): ShellResultOutput {
     status: stringValue(record.status),
     processId: stringValue(record.processId),
     running: booleanValue(record.running),
-    droppedChars: numberValue(record.droppedChars)
+    droppedChars: numberValue(record.droppedChars),
+    ...shellPresentationMetadata(record)
   };
+}
+
+function commandArgumentMetadata(value: unknown): ShellResultOutput {
+  try {
+    return shellPresentationMetadata(commandToolArgumentMetadata(value));
+  } catch {
+    return {};
+  }
+}
+
+function shellPresentationMetadata(record: Record<string, unknown>): ShellResultOutput {
+  const mode = stringValue(record.mode);
+  const inferredMode = booleanValue(record.inferredMode);
+  const ignoredFields = Array.isArray(record.ignoredFields)
+    ? record.ignoredFields.filter((field): field is string => typeof field === 'string') : undefined;
+  const warning = stringValue(record.warning);
+  return {
+    ...(mode ? { mode } : {}),
+    ...(inferredMode !== undefined ? { inferredMode } : {}),
+    ...(ignoredFields?.length ? { ignoredFields } : {}),
+    ...(warning ? { warning } : {})
+  };
+}
+
+function shellPresentationRows(output: ShellResultOutput | undefined): Array<{ label: string; value: string }> {
+  if (!output) return [];
+  const rows: Array<{ label: string; value: string }> = [];
+  if (output.mode) rows.push({ label: '模式', value: `${output.mode}${output.inferredMode ? '（自动识别）' : ''}` });
+  if (output.ignoredFields?.length) rows.push({ label: '未使用参数', value: output.ignoredFields.join('、') });
+  if (output.warning) rows.push({ label: '说明', value: output.warning });
+  return rows;
 }
 
 function withoutInternalIds(value: unknown): unknown {

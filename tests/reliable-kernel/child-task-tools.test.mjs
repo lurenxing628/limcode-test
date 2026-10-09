@@ -6,8 +6,9 @@ import test from 'node:test';
 const require = createRequire(import.meta.url);
 const extensionDist = process.env.LIMCODE_EXTENSION_DIST
   ? path.resolve(process.env.LIMCODE_EXTENSION_DIST) : path.resolve('dist/extension');
-const { ReliableChildAgentCoordinator } = require(path.join(extensionDist, 'backend/reliableKernel/childAgentCoordinator.js'));
+const { ReliableChildAgentCoordinator, validateRunAgentToolArguments, validateReadAgentAnswerToolArguments, agentToolArgumentMetadata } = require(path.join(extensionDist, 'backend/reliableKernel/childAgentCoordinator.js'));
 const { ChildExecutionControlPlane } = require(path.join(extensionDist, 'backend/reliableKernel/childExecution.js'));
+const { runAgentTool } = require(path.join(extensionDist, 'backend/world/modules/tools/definitions/runAgent/index.js'));
 
 function source(id, text, state = 'effective') {
   return { id, kind: 'turn_intent_revision', classification: 'task', state, text,
@@ -83,14 +84,117 @@ test('missing operation, missing spawn identity and malformed send fail before c
   for (const args of [
     { prompt: 'accidental duplicate' }, { mode: 'run', prompt: 'old implicit spawn' },
     { operation: 'spawn', prompt: 'missing label' },
-    { operation: 'spawn', taskName: 'label', prompt: 'task', answerBridgeId: 'bridge-1' },
-    { operation: 'spawn', taskName: 'label', prompt: 'task', agent: { id: 'worker' } },
     { operation: 'send', prompt: 'missing ref' },
     { operation: 'send', answerBridgeId: 'unknown-bridge', prompt: 'never fall back to spawn' }
   ]) await assert.rejects(f.call(args));
   assert.deepEqual(f.events.spawns, []);
   assert.deepEqual(f.events.sends, []);
   assert.deepEqual(f.events.settlements, []);
+});
+
+test('explicit readonly operations accept empty unrelated placeholders without sending or spawning work', async () => {
+  const f = fixture();
+  for (const empty of [null, '', [], {}]) {
+    const result = await f.call({ operation: 'list', prompt: empty, taskName: empty, agent: empty,
+      skills: empty, answerBridgeId: empty, answerBridgeIds: empty, forkTurns: empty,
+      foregroundWaitMs: empty, interrupt: empty, cursor: empty, scope: empty, trackingNote: 'harmless extra' });
+    assert.equal(result.detail.tasks.length, 1);
+    assert.equal(result.detail.operation, 'list');
+  }
+  const read = await f.call({ operation: 'read', answerBridgeId: 'bridge-1', cursor: null, skills: [], prompt: '' });
+  assert.equal(read.detail.task.answerBridgeId, 'bridge-1');
+  const wait = await f.call({ operation: 'wait', answerBridgeId: 'bridge-1', answerBridgeIds: [], timeoutMs: 0, agent: {} });
+  assert.equal(wait.detail.operation, 'wait');
+  assert.deepEqual(f.events.spawns, []);
+  assert.deepEqual(f.events.sends, []);
+  assert.deepEqual(f.events.interrupts, []);
+  assert.equal(f.listeners.size, 0);
+});
+
+test('explicit readonly operation ignores nonempty cross-operation arguments without assigning work', async () => {
+  const f = fixture();
+  for (const extra of [{ prompt: 'assign new work' }, { agent: { type: 'worker' } },
+    { skills: ['review'] }, { foregroundWaitMs: 0 }, { interrupt: false }, { mode: 'spawn' }]) {
+    const raw = { operation: 'list', ...extra };
+    assert.equal((await f.call(raw)).detail.operation, 'list');
+    assert.ok(agentToolArgumentMetadata('run_agent', raw).ignoredFields.includes(Object.keys(extra)[0]));
+  }
+  assert.equal(f.events.observations, 6);
+  assert.deepEqual(f.events.spawns, []);
+  assert.deepEqual(f.events.sends, []);
+  assert.deepEqual(f.events.interrupts, []);
+  assert.equal(f.events.settlements.length, 6);
+});
+
+test('run-agent normalization keeps explicit zero and false without changing caller-owned arguments', () => {
+  const send = Object.freeze({ operation: 'send', answerBridgeId: ' bridge-1 ', prompt: ' task ', interrupt: false,
+    foregroundWaitMs: 0, skills: null, unknownNote: 'ignored' });
+  assert.deepEqual(validateRunAgentToolArguments(send), { operation: 'send', answerBridgeId: 'bridge-1', prompt: 'task', interrupt: false, foregroundWaitMs: 0 });
+  assert.equal(send.answerBridgeId, ' bridge-1 ');
+  const spawn = Object.freeze({ operation: 'spawn', taskName: ' review ', prompt: ' complete review ', agent: Object.freeze({ type: ' worker ', note: 'ignored' }),
+    skills: Object.freeze(['review', ' review ']), forkTurns: '2', foregroundWaitMs: 0 });
+  assert.deepEqual(validateRunAgentToolArguments(spawn), { operation: 'spawn', taskName: 'review', prompt: 'complete review', agent: { type: 'worker' },
+    skills: ['review'], forkTurns: '2', foregroundWaitMs: 0 });
+  assert.equal(spawn.skills.length, 2);
+  assert.deepEqual(validateRunAgentToolArguments({ operation: 'wait', answerBridgeId: 'a', answerBridgeIds: ['b'] }), { operation: 'wait', answerBridgeId: 'a' });
+  assert.deepEqual(agentToolArgumentMetadata('run_agent', { operation: 'wait', answerBridgeId: 'a', answerBridgeIds: ['b'] }).ignoredFields, ['childRefs']);
+  assert.deepEqual(validateRunAgentToolArguments({ operation: 'spawn', taskName: 'label', prompt: 'task', agent: { id: 'worker' } }),
+    { operation: 'spawn', taskName: 'label', prompt: 'task', agent: {} });
+  assert.deepEqual(agentToolArgumentMetadata('run_agent', { operation: 'spawn', taskName: 'label', prompt: 'task', agent: { id: 'worker' } }).ignoredFields, ['agent.id']);
+  for (const invalid of [{ operation: 'wait', answerBridgeId: false, answerBridgeIds: ['b'] },
+    { operation: 'send', answerBridgeId: 'a', prompt: 'task', interrupt: 'false' },
+    { operation: 'spawn', taskName: 'label', prompt: 'task', agent: { type: false } }]) {
+    assert.throws(() => validateRunAgentToolArguments(invalid), error => error.name === 'ToolArgumentError');
+  }
+});
+
+test('reading an answer ignores unrelated operation controls and never assigns or interrupts work', async () => {
+  const f = fixture();
+  const answer = await f.call({ answerBridgeId: 'bridge-1', scope: null, prompt: '', unknownNote: 'ignored' }, undefined, 'read_agent_answer');
+  assert.equal(answer.detail.status, 'running');
+  for (const extra of [{ operation: 'send' }, { mode: 'spawn' }, { prompt: 'new assignment' }, { interrupt: true }]) {
+    const raw = { answerBridgeId: 'bridge-1', ...extra };
+    assert.equal((await f.call(raw, undefined, 'read_agent_answer')).detail.status, 'running');
+    assert.ok(agentToolArgumentMetadata('read_agent_answer', raw).ignoredFields.includes(Object.keys(extra)[0]));
+  }
+  assert.deepEqual(f.events.spawns, []);
+  assert.deepEqual(f.events.sends, []);
+  assert.deepEqual(f.events.interrupts, []);
+});
+
+test('agent numeric budgets accept integer strings and clamp without changing targets or zero polling', () => {
+  const raw = Object.freeze({ operation: 'wait', answerBridgeId: 'bridge-1', timeoutMs: '120000', foregroundWaitMs: false, prompt: 'unused' });
+  assert.deepEqual(validateRunAgentToolArguments(raw), { operation: 'wait', answerBridgeId: 'bridge-1', timeoutMs: 60_000 });
+  assert.deepEqual(agentToolArgumentMetadata('run_agent', raw).adjustedArguments, { timeoutMs: 60_000 });
+  assert.equal(raw.timeoutMs, '120000');
+  assert.equal(validateRunAgentToolArguments({ operation: 'wait', answerBridgeId: 'bridge-1', timeoutMs: 0 }).timeoutMs, 0);
+  assert.equal(validateRunAgentToolArguments({ operation: 'list', limit: '0' }).limit, 1);
+  assert.equal(validateRunAgentToolArguments({ operation: 'list', limit: 1000 }).limit, 100);
+  assert.equal(validateRunAgentToolArguments({ operation: 'spawn', taskName: 'label', prompt: 'task', foregroundWaitMs: 100_000_000 }).foregroundWaitMs, 86_400_000);
+  for (const timeoutMs of [false, -1, 1.5, '1.5']) assert.throws(() => validateRunAgentToolArguments({ operation: 'wait', answerBridgeId: 'bridge-1', timeoutMs }), { name: 'ToolArgumentError' });
+  assert.deepEqual(validateReadAgentAnswerToolArguments({ answerBridgeId: 'bridge-1', operation: 'spawn', interrupt: true, prompt: 'ignored' }), { answerBridgeId: 'bridge-1' });
+});
+
+test('run-agent scheduling and summary consume the selected trimmed operation', () => {
+  const raw = Object.freeze({ operation: ' interrupt_subtree ', answerBridgeId: 'bridge-1', scheduling: 'parallel', prompt: 'unused' });
+  assert.deepEqual(runAgentTool.scheduling(raw), { mode: 'serial', reason: 'interrupt_subtree' });
+  assert.equal(runAgentTool.summary(raw, {}), 'Interrupt Agent · bridge-1');
+  assert.equal(raw.operation, ' interrupt_subtree ');
+  assert.equal(runAgentTool.summary({ operation: ' send ', answerBridgeId: 'bridge-1', prompt: 'continue', agent: { type: 'unused-type' }, skills: ['unused-skill'] }, {}), 'Run Agent · continue');
+});
+
+test('existing child work replays or resumes durable facts before new argument validation', async () => {
+  const f = fixture();
+  f.coordinator.list = async domain => domain === 'Operation' ? [{ owner_id: 'existing-child', status: 'waiting_answer' }] : [];
+  const replay = await f.call({ mode: 'old-spawn', agent: { id: 'old-agent' }, prompt: 'original work' });
+  assert.equal(replay.status, 'succeeded');
+  f.coordinator.dependencies.children.finalizeWaitSettlement = async () => null;
+  const pending = await f.call({ mode: 'old-spawn', prompt: 'original work' });
+  assert.equal(pending.reason, 'awaiting_child');
+  assert.equal(pending.resumeKey, 'existing-child');
+  assert.deepEqual(f.events.spawns, []);
+  assert.deepEqual(f.events.sends, []);
+  assert.deepEqual(f.events.interrupts, []);
 });
 
 test('canonical and inherited references never authorize unrelated or sibling task operations', async () => {
@@ -189,12 +293,16 @@ test('wait supports multiple validated children and returns changed facts withou
   } finally { clearTimeout(timer); }
 });
 
-test('wait validates bounds and reference forms, and timeout or parent abort never cancels a child', async () => {
+test('wait selects a single target before array scaffolding and timeout or parent abort never cancels a child', async () => {
   const f = fixture();
+  const single = (await f.call({ operation: 'wait', answerBridgeId: 'bridge-1', answerBridgeIds: ['unrelated-child'], timeoutMs: 0 })).detail;
+  assert.deepEqual(single.tasks.map(task => task.answerBridgeId), ['bridge-1']);
+  assert.equal(f.events.observations, 1);
   for (const args of [
-    { answerBridgeId: 'bridge-1', answerBridgeIds: ['bridge-1'] },
     { answerBridgeIds: [] }, { answerBridgeIds: ['bridge-1', 'bridge-1'] },
-    { answerBridgeId: 'bridge-1', timeoutMs: 60_001 }
+    { answerBridgeIds: Array.from({ length: 33 }, (_, i) => `bridge-${i}`) },
+    { answerBridgeId: false, answerBridgeIds: ['bridge-1'] },
+    { answerBridgeId: 'bridge-1', timeoutMs: false }
   ]) await assert.rejects(f.call({ operation: 'wait', ...args }));
   const timeout = (await f.call({ operation: 'wait', answerBridgeId: 'bridge-1', timeoutMs: 5 })).detail;
   assert.equal(timeout.timedOut, true);

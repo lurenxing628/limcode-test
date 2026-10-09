@@ -39,6 +39,7 @@ import { buildFileDiffRecord, buildFileReplacementHunks } from './fileDiff';
 import { applyHunkEdit, applyInsertEdit, applyDeleteEdit } from './editStrategies';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS, LIVE_DIFF_SCHEME } from '../../shared/extensionIdentity';
 import { normalizeDisplayPath } from '../../shared/displayPath';
+import { editToolResultMetadata } from '../../shared/editToolArguments';
 
 /** Reading a file only to return a slice of it is cheap, so the ceiling guards memory, not usefulness. */
 const MAX_SOURCE_BYTES = 20 * 1024 * 1024;
@@ -187,7 +188,7 @@ export async function proposeWorkspaceTextFileEdit(
   };
   return {
     kind: 'file_edit.result',
-    mode: request.mode,
+    ...editToolResultMetadata(request.mode, request),
     path,
     success: true,
     action,
@@ -212,6 +213,8 @@ export async function proposeWorkspaceTextFileEdit(
             applyHunks: request.mode === 'hunk' ? request.hunks : buildFileReplacementHunks(before.content, applied.newContent),
             editMode: request.mode,
             editResults: applied.results,
+            ...(request.ignoredBranches?.length ? { ignoredBranches: [...request.ignoredBranches] } : {}),
+            ...(request.inferredMode ? { inferredMode: true } : {}),
             ...(applied.fallbackMode ? { editFallbackMode: applied.fallbackMode } : {})
           }
         }
@@ -369,7 +372,7 @@ function buildEditFileResultFromAppliedProposal(
   const failedCount = applied?.failed ?? 0;
   return {
     kind: 'file_edit.result',
-    mode: proposal.editMode ?? 'hunk',
+    ...editToolResultMetadata(proposal.editMode ?? 'hunk', proposal),
     path: preview.path,
     success: true,
     action: preview.action === 'unchanged' ? 'unchanged' : 'modified',

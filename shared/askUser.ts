@@ -4,8 +4,9 @@ import type {
   AskUserToolOutputRecord,
   AskUserToolRequestRecord
 } from './protocol';
+import { isEmptyToolArgument, ToolArgumentError } from './toolArgumentUtils';
 
-export const ASK_USER_MIN_OPTIONS = 2;
+export const ASK_USER_MIN_OPTIONS = 1;
 export const ASK_USER_MAX_OPTIONS = 8;
 export const ASK_USER_MAX_QUESTION_LENGTH = 2_000;
 export const ASK_USER_MAX_OPTION_LABEL_LENGTH = 200;
@@ -18,23 +19,25 @@ export const BACKGROUND_ASK_USER_AUTO_ANSWER = '系统自动回复：请根据�
 /** 把模型工具参数规范化为前后端共用的 Ask User 请求。自定义回答固定可用。 */
 export function normalizeAskUserToolRequest(value: unknown): AskUserToolRequestRecord {
   const record = asRecord(parseJsonValue(value));
-  if (!record) throw new Error('ask_user arguments must be an object');
+  if (!record) throw new ToolArgumentError('ask_user arguments must be an object');
 
   const question = requiredText(record.question, 'question', ASK_USER_MAX_QUESTION_LENGTH);
-  if (!Array.isArray(record.options)) throw new Error('options must be an array');
+  if (!Array.isArray(record.options)) throw new ToolArgumentError('options must be an array');
   if (record.options.length < ASK_USER_MIN_OPTIONS || record.options.length > ASK_USER_MAX_OPTIONS) {
-    throw new Error(`options must contain ${ASK_USER_MIN_OPTIONS} to ${ASK_USER_MAX_OPTIONS} items`);
+    throw new ToolArgumentError(`options must contain ${ASK_USER_MIN_OPTIONS} to ${ASK_USER_MAX_OPTIONS} items`);
   }
 
   const options = record.options.map((option, index) => normalizeOption(option, index));
   const optionLabels = new Set<string>();
   for (const option of options) {
-    if (optionLabels.has(option.label)) throw new Error(`option labels must be unique: ${option.label}`);
+    if (optionLabels.has(option.label)) throw new ToolArgumentError(`option labels must be unique: ${option.label}`);
     optionLabels.add(option.label);
   }
 
-  if (record.multiple !== undefined && typeof record.multiple !== 'boolean') {
-    throw new Error('multiple must be a boolean');
+  if (!isEmptyToolArgument(record.multiple)
+    && !(typeof record.multiple === 'string' && !record.multiple.trim())
+    && typeof record.multiple !== 'boolean') {
+    throw new ToolArgumentError('multiple must be a boolean');
   }
 
   return {
@@ -138,7 +141,7 @@ export function askUserOptionKey(option: AskUserOptionRecord): string {
 
 function normalizeOption(value: unknown, index: number): AskUserOptionRecord {
   const record = asRecord(value);
-  if (!record) throw new Error(`options[${index}] must be an object`);
+  if (!record) throw new ToolArgumentError(`options[${index}] must be an object`);
   const label = requiredText(record.label, `options[${index}].label`, ASK_USER_MAX_OPTION_LABEL_LENGTH);
   const description = optionalLimitedText(record.description, `options[${index}].description`, ASK_USER_MAX_OPTION_DESCRIPTION_LENGTH);
   return {
@@ -162,7 +165,7 @@ function parseJsonValue(value: unknown): unknown {
   try {
     return JSON.parse(text) as unknown;
   } catch {
-    throw new Error('ask_user arguments must be valid JSON');
+    throw new ToolArgumentError('ask_user arguments must be valid JSON');
   }
 }
 
@@ -173,19 +176,19 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 }
 
 function requiredText(value: unknown, label: string, maxLength: number): string {
-  if (typeof value !== 'string') throw new Error(`${label} must be a non-empty string`);
+  if (typeof value !== 'string') throw new ToolArgumentError(`${label} must be a non-empty string`);
   const text = value.trim();
-  if (!text) throw new Error(`${label} must be a non-empty string`);
-  if (text.length > maxLength) throw new Error(`${label} must not exceed ${maxLength} characters`);
+  if (!text) throw new ToolArgumentError(`${label} must be a non-empty string`);
+  if (text.length > maxLength) throw new ToolArgumentError(`${label} must not exceed ${maxLength} characters`);
   return text;
 }
 
 function optionalLimitedText(value: unknown, label: string, maxLength: number): string | undefined {
-  if (value === undefined) return undefined;
-  if (typeof value !== 'string') throw new Error(`${label} must be a string`);
+  if (isEmptyToolArgument(value)) return undefined;
+  if (typeof value !== 'string') throw new ToolArgumentError(`${label} must be a string`);
   const text = value.trim();
   if (!text) return undefined;
-  if (text.length > maxLength) throw new Error(`${label} must not exceed ${maxLength} characters`);
+  if (text.length > maxLength) throw new ToolArgumentError(`${label} must not exceed ${maxLength} characters`);
   return text;
 }
 

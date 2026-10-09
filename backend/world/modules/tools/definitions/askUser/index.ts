@@ -1,4 +1,4 @@
-import { askUserOutputFromResult, normalizeAskUserToolRequest } from '../../../../../../shared/askUser';
+import { ASK_USER_MIN_OPTIONS, ASK_USER_MAX_OPTIONS, askUserOutputFromResult, normalizeAskUserToolRequest } from '../../../../../../shared/askUser';
 import { ASK_USER_TOOL_NAME } from '../../../../../../shared/protocol';
 import type { ToolDefinition } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
@@ -32,7 +32,7 @@ export const askUserTool: ToolDefinition = {
     name: ASK_USER_TOOL_NAME,
     description: `Ask the user one blocking question and wait for their answer before continuing.
 
-Provide 2-8 concise options using only user-facing labels and optional descriptions. The user can always write a custom answer. Questions are single-choice by default; set multiple=true only when selecting more than one option is meaningful. Use this tool only when the next action genuinely depends on a user decision; do not ask rhetorical or informational questions with it.`,
+Provide 1-8 concise options using only user-facing labels and optional descriptions. The user can always write a custom answer. Questions are single-choice by default; set multiple=true only when selecting more than one option is meaningful. Use this tool only when the next action genuinely depends on a user decision; do not ask rhetorical or informational questions with it.`,
     parameters: {
       type: 'object',
       additionalProperties: false,
@@ -43,8 +43,8 @@ Provide 2-8 concise options using only user-facing labels and optional descripti
         },
         options: {
           type: 'array',
-          minItems: 2,
-          maxItems: 8,
+          minItems: ASK_USER_MIN_OPTIONS,
+          maxItems: ASK_USER_MAX_OPTIONS,
           items: OPTION_SCHEMA,
           description: 'The choices offered to the user. Each label must be unique within the question.'
         },

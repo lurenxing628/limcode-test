@@ -1,6 +1,7 @@
 import { IconFileDescription } from '@tabler/icons-vue';
 import type { ToolDisplayContext, ToolDisplayResolver, ToolDisplaySection } from './types';
 import { normalizeDisplayPath } from '@shared/displayPath';
+import { isEmptyToolArgument } from '@shared/toolArgumentUtils';
 
 type ReadFileMode = 'text' | 'attachment';
 
@@ -15,7 +16,10 @@ interface ReadFileArgs extends ReadFileItem {
   attachmentRef?: string;
   pages?: string;
   mode?: ReadFileMode;
+  invalidMode?: boolean;
   items?: ReadFileItem[];
+  ignoredFields?: string[];
+  warning?: string;
 }
 
 interface ReadFileLineRecord {
@@ -42,11 +46,21 @@ interface ReadFileOutputRecord {
   mimeType?: unknown;
   sizeBytes?: unknown;
   files?: unknown;
+  ignoredFields?: unknown;
+  warning?: unknown;
 }
 
 export const readFileToolDisplay: ToolDisplayResolver = (context) => {
   const args = readFileArgs(context.args);
   const inputSections = readFileInputSections(args);
+  const inputMetadata = readMetadataSection('input', args, '读取说明');
+  if (inputMetadata) inputSections.push(inputMetadata, {
+    kind: 'input', title: '原始参数', text: context.stringifyValue(context.args)
+  });
+  else if (args.invalidMode) inputSections.push({ kind: 'input', title: '原始参数', text: context.stringifyValue(context.args) });
+  if (inputSections.length === 0) inputSections.push({
+    kind: 'input', title: '读取参数', text: context.stringifyValue(context.args)
+  });
   const outputSections = readFileOutputSections(args, context);
 
   return {
@@ -79,7 +93,7 @@ function readFileInputSection(args: ReadFileArgs, title = '读取参数'): ToolD
     { label: '页范围', value: args.pages },
     {
       label: '读取方式',
-      value: attachmentId || attachmentRef ? '历史附件（自动识别）' : args.mode === 'attachment' ? '附件' : '文本'
+      value: args.invalidMode ? '无效模式' : attachmentId || attachmentRef ? '历史附件（自动识别）' : args.mode === 'attachment' ? '附件' : '文本'
     },
     { label: '行范围', value: !attachmentId && !attachmentRef && args.mode !== 'attachment' ? lineRangeText(args.startLine, args.endLine) : undefined }
   ]);
@@ -92,14 +106,20 @@ function readFileOutputSections(args: ReadFileArgs, context: ToolDisplayContext)
 
   const output = toolOutput(context.result);
   const record = outputRecord(output);
+  const metadata = readResultMetadata(context.result, output);
+  const metadataSection = readMetadataSection('output', metadata, '读取说明');
+  const sections: ToolDisplaySection[] = [];
   if (Array.isArray(record?.files)) {
-    return record.files.flatMap((file, index) => {
+    sections.push(...record.files.flatMap((file, index) => {
       const section = readFileResultSection(args.items?.[index] ?? {}, file);
       return section ? [section] : [];
-    });
+    }));
+  } else {
+    const section = readFileResultSection(args, output);
+    if (section) sections.push(section);
   }
-  const section = readFileResultSection(args, output);
-  return section ? [section] : undefined;
+  if (metadataSection) sections.push(metadataSection);
+  return sections.length > 0 ? sections : undefined;
 }
 
 function readFileResultSection(args: ReadFileArgs, output: unknown): ToolDisplaySection | undefined {
@@ -127,7 +147,7 @@ function readFileResultSection(args: ReadFileArgs, output: unknown): ToolDisplay
 function readFileArgs(value: unknown): ReadFileArgs {
   const record = asRecord(value);
   if (!record) return {};
-  return {
+  const parsed: ReadFileArgs = {
     ...readFileItem(record),
     attachmentId: normalizedText(record.attachmentId),
     attachmentRef: normalizedText(record.attachmentRef),
@@ -135,6 +155,25 @@ function readFileArgs(value: unknown): ReadFileArgs {
     mode: readFileMode(record.mode),
     items: Array.isArray(record.items) ? record.items.map(readFileItem) : undefined
   };
+  // Match the public execution precedence while keeping the original parameters available below.
+  if (hasReadArgument(record.path)) {
+    const path = normalizeDisplayPath(parsed.path);
+    const mode = parsed.mode ?? (/\.(?:png|jpe?g|webp|pdf)$/i.test(path) ? 'attachment' : 'text');
+    const ignoredFields = ignoredReadFields(record, ['attachmentId', 'attachmentRef', 'items', 'pages',
+      ...(mode === 'attachment' ? ['startLine', 'endLine'] : [])]);
+    return { ...readFileItem(record), mode, invalidMode: hasReadArgument(record.mode) && parsed.mode === undefined,
+      ...readArgumentMetadata('path', ignoredFields) };
+  }
+  if (hasReadArgument(record.attachmentId) || hasReadArgument(record.attachmentRef)) {
+    const ignoredFields = ignoredReadFields(record, ['items', 'mode', 'startLine', 'endLine']);
+    return { attachmentId: parsed.attachmentId, attachmentRef: parsed.attachmentRef, pages: parsed.pages,
+      ...readArgumentMetadata('attachmentRef', ignoredFields) };
+  }
+  if (hasReadArgument(record.items)) {
+    return { items: parsed.items, mode: 'text',
+      ...readArgumentMetadata('items', ignoredReadFields(record, ['mode', 'pages', 'startLine', 'endLine'])) };
+  }
+  return {};
 }
 
 function readFileItem(value: unknown): ReadFileItem {
@@ -148,7 +187,47 @@ function readFileItem(value: unknown): ReadFileItem {
 
 function toolOutput(result: unknown): unknown {
   const record = asRecord(result);
-  return record && 'output' in record ? record.output : result;
+  const value = record && 'detail' in record ? record.detail : result;
+  const envelope = asRecord(value);
+  return envelope && 'output' in envelope ? envelope.output : value;
+}
+
+function hasReadArgument(value: unknown): boolean {
+  return !isEmptyToolArgument(value) && !(typeof value === 'string' && !value.trim());
+}
+
+function ignoredReadFields(record: Record<string, unknown>, keys: string[]): string[] {
+  return [...new Set(keys.filter((key) => hasReadArgument(record[key]))
+    .map((key) => key === 'attachmentId' ? 'attachmentRef' : key))];
+}
+
+function readArgumentMetadata(source: string, ignoredFields: string[]): Pick<ReadFileArgs, 'ignoredFields' | 'warning'> {
+  return ignoredFields.length > 0 ? {
+    ignoredFields, warning: `已选择 ${source}；未使用参数：${ignoredFields.join('、')}。`
+  } : {};
+}
+
+function readResultMetadata(result: unknown, output: unknown): Pick<ReadFileArgs, 'ignoredFields' | 'warning'> {
+  const root = asRecord(result);
+  const detail = asRecord(root?.detail);
+  const record = { ...root, ...detail, ...asRecord(output) };
+  return {
+    ignoredFields: Array.isArray(record.ignoredFields)
+      ? record.ignoredFields.filter((field): field is string => typeof field === 'string') : undefined,
+    warning: normalizedText(record.warning)
+  };
+}
+
+function readMetadataSection(
+  kind: 'input' | 'output',
+  metadata: Pick<ReadFileArgs, 'ignoredFields' | 'warning'>,
+  title: string
+): ToolDisplaySection | undefined {
+  const rows = parameterRows([
+    { label: '未使用参数', value: metadata.ignoredFields?.length ? metadata.ignoredFields.join('、') : undefined },
+    { label: '说明', value: metadata.warning }
+  ]);
+  return rows.length > 0 ? { kind, title, rows, rowStyle: 'keyValue' } : undefined;
 }
 
 function readFileOutputSection(title: string, output: unknown): ToolDisplaySection | undefined {
@@ -248,7 +327,8 @@ function normalizedText(value: unknown): string | undefined {
 }
 
 function readFileMode(value: unknown): ReadFileMode | undefined {
-  return value === 'text' || value === 'attachment' ? value : undefined;
+  const mode = typeof value === 'string' ? value.trim() : value;
+  return mode === 'text' || mode === 'attachment' ? mode : undefined;
 }
 
 function attachmentOutput(record: ReadFileOutputRecord | undefined): boolean {

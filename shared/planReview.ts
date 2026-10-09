@@ -161,7 +161,12 @@ function requiredTaskList(value: unknown): TaskListToolOperationRecord {
   if (value === undefined) {
     throw new Error('taskList is required and must use the same shape as update_task_list: { mode, items }');
   }
-  const operation = taskListOperationFromArgs(value);
+  const record = asRecord(value);
+  const mode = record?.mode;
+  // This tool always submits a complete plan; an omitted mode cannot select an update.
+  const operation = taskListOperationFromArgs(record
+    && (mode === undefined || mode === null || typeof mode === 'string' && !mode.trim())
+    ? { ...record, mode: 'rewrite' } : value);
   if (!operation) throw new Error('taskList must use the same shape as update_task_list: { mode, items }');
   if (operation.mode !== 'rewrite') throw new Error('submit_plan taskList must use mode="rewrite"');
   if (operation.items.length === 0) throw new Error('submit_plan taskList must contain at least one task');

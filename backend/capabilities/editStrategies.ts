@@ -53,7 +53,7 @@ export function applyHunkEdit(originalContent: string, hunks: FsHunkEditRequest[
     const matches = applied.matches;
     const candidateLines = matches.slice(0, 20).map((match) => getLineNumberAtIndex(currentContent, match.sourceStart));
     if (matches.length === 0) {
-      results.push({ index, success: false, error: `Hunk ${index}: no exact match found for oldContent.`, matchCount: 0 });
+      results.push({ index, success: false, error: `Hunk ${index}: no match found for oldContent after exact, whitespace, and Unicode punctuation comparisons.`, matchCount: 0 });
       continue;
     }
 
@@ -70,7 +70,11 @@ export function applyHunkEdit(originalContent: string, hunks: FsHunkEditRequest[
       appliedBy: replaceAll ? 'search_replace_all' : 'search_replace_first',
       matchCount: applied.matchCount,
       replacements: applied.replacements,
-      candidateLines
+      candidateLines,
+      ...(applied.matchStrategy && applied.matchStrategy !== 'exact' ? { fallback: {
+        strategy: applied.matchStrategy,
+        message: `Matched existing source lines using ${applied.matchStrategy}.`
+      } } : {})
     });
   }
 

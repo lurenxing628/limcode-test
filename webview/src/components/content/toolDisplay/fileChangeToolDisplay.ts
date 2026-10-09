@@ -4,7 +4,8 @@ import {
   hasRequestedEditDelete,
   hasRequestedEditHunks,
   hasRequestedEditInsert,
-  selectEditToolMode
+  inspectEditToolArguments,
+  validateEditToolArguments
 } from '@shared/editToolArguments';
 import { CHECKPOINT_FEATURE_ENABLED } from '@shared/featureFlags';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -20,6 +21,7 @@ interface WriteArgs {
 
 interface EditArgs {
   path?: string;
+  mode?: 'hunk' | 'insert' | 'delete';
   hunks?: unknown;
   insert?: { line?: number; content?: string };
   delete?: { startLine?: number; endLine?: number };
@@ -47,6 +49,9 @@ interface FileChangeOutput {
   deleted?: unknown;
   files?: unknown;
   results?: unknown;
+  ignoredBranches?: unknown;
+  warning?: string;
+  inferredMode?: boolean;
   totalCount?: number;
   successCount?: number;
   failCount?: number;
@@ -129,31 +134,34 @@ function writeInputSections(args: WriteArgs, context: ToolDisplayContext): ToolD
 function editInputSections(args: EditArgs, context: ToolDisplayContext): ToolDisplaySection[] {
   const path = normalizeDisplayPath(args.path);
   if (!path) return [{ kind: 'input', title: '输入', text: context.stringifyValue(context.args) }];
-  const mode = selectEditToolMode(args);
-  return [{
+  // Use original arguments: the display-only copy drops unknown fields and nulls.
+  const analysis = inspectEditToolArguments(context.args);
+  let validated: ReturnType<typeof validateEditToolArguments> | undefined;
+  let validationError: string | undefined;
+  try {
+    validated = validateEditToolArguments(context.args);
+  } catch (error) {
+    validationError = error instanceof Error ? error.message : String(error);
+  }
+  const modeLabel = analysis.explicitMode ?? (validated ? `${validated.mode}（自动识别）` : undefined);
+  const ignored = validated?.ignoredBranches.length ? validated.ignoredBranches.join('、') : undefined;
+  const sections: ToolDisplaySection[] = [{
     kind: 'input',
     title: '修改参数',
     rows: parameterRows([
       { label: '路径', value: path },
-      {
-        label: '修改片段',
-        value: mode === 'hunk' && hasRequestedEditHunks(args.hunks) ? `${args.hunks.length} 个` : undefined
-      },
-      {
-        label: '插入',
-        value: mode === 'insert' && hasRequestedEditInsert(args.insert)
-          ? `第 ${args.insert?.line} 行，${args.insert?.content?.length ?? 0} 字符`
-          : undefined
-      },
-      {
-        label: '删除',
-        value: mode === 'delete' && hasRequestedEditDelete(args.delete)
-          ? `第 ${args.delete?.startLine}-${args.delete?.endLine} 行`
-          : undefined
-      }
+      { label: '模式', value: modeLabel },
+      { label: '非空参数分支', value: analysis.activeBranches.join('、') || undefined },
+      { label: '修改片段', value: analysis.activeBranches.includes('hunks') && hasRequestedEditHunks(args.hunks) ? `${args.hunks.length} 个` : undefined },
+      { label: '插入', value: analysis.activeBranches.includes('insert') && hasRequestedEditInsert(args.insert) ? `第 ${args.insert?.line} 行，${args.insert?.content?.length ?? 0} 字符` : undefined },
+      { label: '删除', value: analysis.activeBranches.includes('delete') && hasRequestedEditDelete(args.delete) ? `第 ${args.delete?.startLine}-${args.delete?.endLine} 行` : undefined },
+      { label: '忽略的参数分支', value: ignored },
+      { label: '参数错误', value: validationError }
     ]),
     rowStyle: 'keyValue'
   }];
+  if (validationError || ignored) sections.push({ kind: 'input', title: '原始参数', text: context.stringifyValue(context.args) });
+  return sections;
 }
 
 function deleteInputSections(args: DeleteArgs, context: ToolDisplayContext): ToolDisplaySection[] {
@@ -204,10 +212,12 @@ function fileChangeOutputSections(title: string, output: FileChangeOutput | stri
     { label: '状态', value: output.pending === true ? '等待应用' : undefined },
     { label: '错误', value: stringValue(output.error) },
     { label: '路径', value: normalizeDisplayPath(output.path) || undefined },
-    { label: '修改方式', value: stringValue(output.mode) },
+    { label: '修改方式', value: output.inferredMode === true && stringValue(output.mode) ? `${output.mode}（自动识别）` : stringValue(output.mode) },
     { label: '操作', value: actionLabel(stringValue(output.action)) },
     { label: '修改数', value: editCountText(output) },
     { label: '备用方式', value: stringValue(output.fallbackMode) },
+    { label: '未执行分支', value: stringArray(output.ignoredBranches).join('、') || undefined },
+    { label: '说明', value: stringValue(output.warning) },
     { label: '已修改文件', value: changedFilesText(output.changedFiles) }
   ]);
   const sections: ToolDisplaySection[] = rows.length > 0
@@ -411,6 +421,7 @@ function editArgs(value: unknown): EditArgs {
   if (!record) return {};
   return {
     path: stringValue(record.path),
+    mode: record.mode === 'hunk' || record.mode === 'insert' || record.mode === 'delete' ? record.mode : undefined,
     hunks: record.hunks,
     insert: asRecord(record.insert) ? { line: numberValue(asRecord(record.insert)?.line), content: stringValue(asRecord(record.insert)?.content) } : undefined,
     delete: asRecord(record.delete) ? { startLine: numberValue(asRecord(record.delete)?.startLine), endLine: numberValue(asRecord(record.delete)?.endLine) } : undefined

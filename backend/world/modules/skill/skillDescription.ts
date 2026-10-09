@@ -17,7 +17,7 @@ const SKILL_DESCRIPTION_SHORT_CHARS = 240;
  * 把「当前已启用的技能」列表拼进 skills 工具描述，让 AI 感知可用技能。
  * 技能正文只在 AI 调用 skills({ name }) 时按需返回，避免污染 system prompt。
  * `disable-model-invocation` 的技能不列出（被点名时仍可载入）。超出预算时依次缩短描述、只列名字、
- * 最后省略尾部条目并注明数量。ECS schema contributor 与 reliableKernel toolDispatcher 共用此纯函数。
+ * 最后省略尾部条目并注明数量。供 reliableKernel toolDispatcher 使用。
  */
 export function composeSkillsToolDescription(baseDescription: string, skills: readonly SkillDescriptionEntry[]): string {
   const listed = skills.filter((skill) => !skill.hiddenFromModel);

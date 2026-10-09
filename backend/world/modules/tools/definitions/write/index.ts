@@ -4,6 +4,8 @@ import { staticToolScheduling } from '../../schedulingContract';
 import { defineToolDefinitionModule } from '../types';
 import { allowOutsideProjectPathsDefaultConfig, allowOutsideProjectPathsField, allowOutsideProjectPathsFromConfig, filePathPolicyDescription } from '../filePathPolicy';
 import { normalizeDisplayPath } from '../../../../../../shared/displayPath';
+import { validateWriteToolArguments } from '../../../../../../shared/fileToolArguments';
+import { ToolArgumentError } from '../../../../../../shared/toolArgumentUtils';
 
 interface WriteArgs {
   path?: string;
@@ -25,12 +27,13 @@ export const writeTool: ToolDefinition = {
       'Creates parent directories automatically when the file does not exist.',
       'Returns unchanged when the target content is identical to the existing file.',
       'Use edit for small targeted replacements; use write when you intentionally provide the complete file content.',
+      'Append, dry-run, and no-overwrite operations are not supported by this tool.',
       filePathPolicyDescription(false)
     ].join(' '),
     parameters: {
       type: 'object',
       properties: {
-        path: { type: 'string', description: 'File path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
+        path: { type: 'string', minLength: 1, description: 'File path. Relative paths are resolved from the current work environment root; absolute paths are supported when allowed by tool policy or when they are inside an explicitly allowed local work environment root.' },
         content: { type: 'string', description: 'Complete UTF-8 content to write to the file.' }
       },
       required: ['path', 'content']
@@ -58,9 +61,12 @@ export const writeTool: ToolDefinition = {
   scheduling: staticToolScheduling('serial', 'filesystem_write_side_effect'),
   summary: summarizeWriteToolCall,
   async execute(rawArgs, deps, ctx) {
-    const args = (rawArgs ?? {}) as WriteArgs;
-    if (!args.path) return { ok: false, output: 'Missing required argument: path' };
-    if (typeof args.content !== 'string') return { ok: false, output: 'Missing required argument: content' };
+    let args: ReturnType<typeof validateWriteToolArguments>;
+    try { args = validateWriteToolArguments(rawArgs); }
+    catch (error) {
+      if (!(error instanceof ToolArgumentError)) throw error;
+      return { ok: false, output: error.message };
+    }
     const result = await deps.fs.proposeWriteFile(args.path, args.content, {
       workEnvironment: ctx?.workEnvironment,
       accessibleWorkEnvironments: ctx?.accessibleWorkEnvironments,

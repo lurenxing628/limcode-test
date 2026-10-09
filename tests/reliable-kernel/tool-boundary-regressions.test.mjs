@@ -56,15 +56,16 @@ for (const toolName of ['shell', 'bash']) {
         {},
         new AbortController().signal
       );
-      const validValues = [minimum, maximum];
-      const invalidValues = [minimum - 1, maximum + 1, minimum + 0.5, '1000', null];
-      if (fieldName === 'foregroundWaitMs') invalidValues.push(90000, 120000);
-      validValues.push(undefined);
+      const validValues = [minimum, maximum, maximum + 1, '1000'];
+      const invalidValues = [-1, minimum + 0.5, 'invalid', false];
+      if (minimum > 0) validValues.push(minimum - 1);
+      if (fieldName === 'foregroundWaitMs') validValues.push(90000, 120000);
+      validValues.push(undefined, null);
       for (const value of validValues) {
         await assert.rejects(dispatch(value), (error) => error === stoppedBeforeProcessStart);
       }
       for (const value of invalidValues) {
-        await assert.rejects(dispatch(value), new RegExp(`${fieldName} must be an integer from ${minimum} to ${maximum}`));
+        await assert.rejects(dispatch(value), new RegExp(`${fieldName} must be a non-negative integer`));
       }
       const tool = createCommandTool({ toolName, description: toolName });
       const field = tool.declaration.parameters.properties[fieldName];
@@ -181,6 +182,19 @@ test('read 省略 mode 时按 Windows PNG 扩展名读取附件，显式 text �
   assert.match(String(textResult.output), /mode="attachment"/);
   assert.equal(explicitText.calls.binary.length, 0);
   assert.equal(explicitText.calls.text.length, 0);
+});
+
+test('read 的顶层 path 优先于有效 batch，并明确说明没有读取其余目标', async () => {
+  const raw = { path: 'selected.txt', mode: 'text', items: [{ path: 'x.txt' }, { path: 'y.txt' }] };
+  const original = structuredClone(raw);
+  const harness = readDeps();
+  const result = await readFileTool.execute(raw, harness.deps);
+  assert.equal(result.ok, true);
+  assert.deepEqual(harness.calls.text, ['selected.txt']);
+  assert.deepEqual(harness.calls.binary, []);
+  assert.deepEqual(result.output.ignoredFields, ['items']);
+  assert.equal(result.output.warning, '已选择 path；未使用参数：items。');
+  assert.deepEqual(raw, original);
 });
 
 const editDefinition = { declaration: { name: 'edit' } };
@@ -534,18 +548,13 @@ for (const tool of ['bash', 'shell']) {
       assert.match(error.message, /mode=output 需要 processRef/);
       return true;
     });
-    assert.throws(() => resolveModelToolArguments(tool, { mode: 'kill', processRef, cursor }, catalog), error => {
-      assert.equal(error.code, 'UNKNOWN_MODEL_HANDLE_REFERENCE');
-      assert.equal(error.kind, 'cursor');
-      assert.match(error.message, /cursor 只用于 mode=output.*mode=kill 不接受 cursor/);
-      return true;
-    });
+    assert.deepEqual(resolveModelToolArguments(tool, { mode: 'kill', processRef, cursor: 'O999' }, catalog),
+      { mode: 'kill', processId: 'internal-process', cursor: 'O999' }, 'kill ignores its unused cursor without resolving it');
 
     for (const args of [
       { mode: 'output' }, { mode: 'kill' }, { mode: 'output', processRef: '' },
       { mode: 'output', processRef: 'P999' }, { mode: 'output', processRef: ref('child') },
-      { mode: 'output', processRef: 3 },
-      { mode: 'execute', processRef, command: 'pwd', foregroundWaitMs: 0 }
+      { mode: 'output', processRef: 3 }
     ]) rejected(tool, args, 'process');
     for (const args of [
       { mode: 'output', processId: 'internal-process' },
@@ -553,7 +562,6 @@ for (const tool of ['bash', 'shell']) {
       { command: 'pwd', processId: 'internal-process', foregroundWaitMs: 0 }
     ]) rejected(tool, args, 'process');
     for (const args of [
-      { mode: 'kill', processRef, cursor },
       { cursor, command: 'pwd', foregroundWaitMs: 0 },
       { mode: 'output', processRef, cursor: 'O999' },
       { mode: 'output', processRef, cursor: ref('conversation') },
@@ -584,9 +592,9 @@ test('参数错误说明具体字段、应传形式和正确键名，不把有�
   assert.match(missingMode.message, /processRef 只用于 mode=output.*mode=kill/);
   assert.match(missingMode.message, /未传 mode 时按 mode=execute/);
   assert.match(missingMode.message, new RegExp(`要读取或终止 ${processRef}，请同时传 mode=output 或 mode=kill`));
-  const unknownWithExecute = failure('shell', { mode: 'execute', processRef: 'P999', command: 'pwd' });
-  assert.match(unknownWithExecute.message, /mode=execute 用于执行新命令.*执行新命令时不要传 processRef/);
-  assert.doesNotMatch(unknownWithExecute.message, /要读取或终止/, '未知 P# 不能被描述成可读取的进程');
+  const unusedRefWithExecute = { mode: 'execute', processRef: 'P999', command: 'pwd' };
+  assert.deepEqual(resolveModelToolArguments('shell', unusedRefWithExecute, catalog), unusedRefWithExecute,
+    'explicit execute must not resolve a process reference that it will not use');
 
   // 游标误用归为输出游标，不归为进程。
   const cursorMisuse = failure('bash', { command: 'pwd', foregroundWaitMs: 0, cursor });
@@ -893,7 +901,7 @@ for (const name of ['bash', 'shell']) {
     assert.equal(properties.foregroundWaitMs.default, 10_000);
     assert.equal(properties.foregroundWaitMs.type, 'integer');
     const args = { command: 'pwd', explanation: 'Inspect working directory' };
-    for (const invalid of [null, -1, 60_001, 0.5, '0', NaN, Infinity]) {
+    for (const invalid of [-1, 0.5, 'invalid', false, NaN, Infinity]) {
       const response = await tool.execute({ ...args, foregroundWaitMs: invalid }, { command });
       assert.equal(response.ok, false);
       assert.match(response.output, /foregroundWaitMs/);
@@ -901,11 +909,11 @@ for (const name of ['bash', 'shell']) {
     assert.equal(runs.length, 0);
     const omitted = await tool.execute(args, { command });
     assert.equal(omitted.ok, true);
-    for (const wait of [undefined, 0, 10_000, 60_000]) {
+    for (const wait of [undefined, null, 0, '0', 10_000, 60_000, 90_000]) {
       const response = await tool.execute({ ...args, foregroundWaitMs: wait }, { command });
       assert.equal(response.ok, true);
     }
-    assert.deepEqual(runs.map(input => input.foregroundWaitMs), [10_000, 10_000, 0, 10_000, 60_000]);
+    assert.deepEqual(runs.map(input => input.foregroundWaitMs), [10_000, 10_000, 10_000, 0, 0, 10_000, 60_000, 60_000]);
   });
 
   test(`${name} output/kill 缺失、类型错误或额外游标返回一致可诊断错误，合法 ID 可用`, async () => {
@@ -929,8 +937,7 @@ for (const name of ['bash', 'shell']) {
     assert.deepEqual(reads, ['internal-process']);
     assert.deepEqual(kills, ['internal-process']);
     const killCursor = await tool.execute({ mode: 'kill', processId: 'internal-process', outputHandle: 'opaque' }, { command });
-    assert.equal(killCursor.ok, false);
-    assert.match(killCursor.output, /outputHandle/);
-    assert.deepEqual(kills, ['internal-process'], 'kill 不应静默丢弃额外的输出游标');
+    assert.equal(killCursor.ok, true);
+    assert.deepEqual(kills, ['internal-process', 'internal-process'], 'kill only consumes its selected process target');
   });
 }

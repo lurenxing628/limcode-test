@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { IconChevronLeft, IconChevronRight, IconMessageQuestion } from '@tabler/icons-vue';
-import { askUserRequestFromArgs } from '@shared/askUser';
+import { normalizeAskUserToolRequest } from '@shared/askUser';
 import { ASK_USER_TOOL_NAME, type AskUserToolRequestRecord, type ToolCallRecord } from '@shared/protocol';
 import AdvancedScrollbar from '@webview/components/navigation/AdvancedScrollbar.vue';
 import CollapsibleContentBlock from '@webview/components/content/CollapsibleContentBlock.vue';
@@ -11,11 +11,14 @@ import {
 } from '@webview/domain/interactionProjection';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useAskUserStore } from '@webview/stores/useAskUserStore';
+import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import AskUserContent from './AskUserContent.vue';
 
 interface PendingAskUserView {
   toolCall: ToolCallRecord;
-  request: AskUserToolRequestRecord;
+  request?: AskUserToolRequestRecord;
+  error?: string;
+  loading?: boolean;
   interactionView: InteractionView;
 }
 
@@ -26,6 +29,7 @@ interface PendingAskUserBatchView {
 }
 
 const askUser = useAskUserStore();
+const interactions = useInteractionStore();
 const reliableConversation = useReliableConversation();
 const expanded = ref(true);
 const scroller = ref<HTMLElement | null>(null);
@@ -63,7 +67,7 @@ const pendingBatches = computed<PendingAskUserBatchView[]>(() => {
 const pendingQuestionCount = computed(() => pendingBatches.value.reduce((count, batch) => count + batch.items.length, 0));
 const activeQuestionLabel = computed(() => {
   const firstBatch = pendingBatches.value[0];
-  return firstBatch ? activeQuestion(firstBatch).request.question : '';
+  return firstBatch ? activeQuestion(firstBatch).request?.question ?? '问题内容暂不可用' : '';
 });
 const panelSummary = computed(() => {
   const countLabel = `${pendingQuestionCount.value} 个问题等待回答`;
@@ -127,12 +131,21 @@ function appendPendingQuestion(
   toolCall: ToolCallRecord,
   interactionView: InteractionView
 ): void {
-  const request = askUserRequestFromArgs(toolCall.args);
-  if (!request) return;
+  let request: AskUserToolRequestRecord | undefined;
+  let error: string | undefined;
+  let loading = false;
+  try {
+    request = normalizeAskUserToolRequest(toolCall.args);
+  } catch (cause) {
+    const projection = reliableConversation.projection.value;
+    loading = projection.missingToolArgumentIds.includes(toolCall.id)
+      && projection.missingInteractionPromptIds.includes(interactionView.request.id);
+    if (!loading) error = cause instanceof Error ? cause.message : '问题内容不完整。';
+  }
   // 同一 Turn 的多个 pending AskUser Interaction 构成当前并行回答批。
   const key = `turn:${interactionView.owner.turnId}`;
   const batch = batches.get(key) ?? { key, turnId: interactionView.owner.turnId, items: [] };
-  batch.items.push({ toolCall, request, interactionView });
+  batch.items.push({ toolCall, request, error, loading, interactionView });
   batches.set(key, batch);
 }
 
@@ -153,6 +166,22 @@ function move(batch: PendingAskUserBatchView, delta: number): void {
 function selectQuestion(batch: PendingAskUserBatchView, index: number): void {
   if (index < 0 || index >= batch.items.length) return;
   activeIndexByBatch.value = { ...activeIndexByBatch.value, [batch.key]: index };
+}
+
+function cancellationPending(question: PendingAskUserView): boolean {
+  const requestId = question.interactionView.request.id;
+  return interactions.isPending(requestId) || interactions.resultFor(requestId) !== undefined;
+}
+
+function cancellationIssue(question: PendingAskUserView): string | undefined {
+  return askUser.draftFor(question.toolCall.id).error || interactions.issueFor(question.interactionView.request.id);
+}
+
+function cancelUnavailableQuestion(question: PendingAskUserView): void {
+  if (cancellationPending(question)) return;
+  const draft = askUser.draftFor(question.toolCall.id);
+  if (draft.submitting) askUser.releaseSubmission(question.toolCall.id, cancellationIssue(question) ?? '取消暂未得到确认，请重试。');
+  askUser.cancel(question.toolCall.id, question.interactionView);
 }
 </script>
 
@@ -198,12 +227,24 @@ function selectQuestion(batch: PendingAskUserBatchView, index: number): void {
             </nav>
 
             <AskUserContent
+              v-if="activeQuestion(batch).request"
               :key="activeQuestion(batch).toolCall.id"
-              :request="activeQuestion(batch).request"
+              :request="activeQuestion(batch).request!"
               :tool-call="activeQuestion(batch).toolCall"
               :interaction-view="activeQuestion(batch).interactionView"
               placement="composer"
             />
+            <div v-else class="ask-user-unavailable">
+              <p v-if="activeQuestion(batch).loading">正在读取问题内容…</p>
+              <template v-else>
+                <p role="alert">这个问题的内容无效，无法回答。请取消提问后让 Agent 重新提问。</p>
+                <p class="ask-user-unavailable-detail">{{ activeQuestion(batch).error }}</p>
+              </template>
+              <p v-if="cancellationIssue(activeQuestion(batch))" role="alert">{{ cancellationIssue(activeQuestion(batch)) }}</p>
+              <button type="button" class="ask-user-unavailable-cancel" :disabled="cancellationPending(activeQuestion(batch))" @click="cancelUnavailableQuestion(activeQuestion(batch))">
+                {{ cancellationPending(activeQuestion(batch)) ? '正在取消…' : '取消提问' }}
+              </button>
+            </div>
           </section>
         </div>
         <AdvancedScrollbar
@@ -310,6 +351,33 @@ function selectQuestion(batch: PendingAskUserBatchView, index: number): void {
   align-items: center;
   justify-content: flex-end;
   gap: 5px;
+}
+
+.ask-user-unavailable {
+  padding: var(--space-2);
+  border: 1px solid var(--vscode-inputValidation-warningBorder, var(--vscode-panel-border));
+}
+
+.ask-user-unavailable p {
+  margin: 0 0 var(--space-2);
+}
+
+.ask-user-unavailable-detail {
+  color: var(--vscode-descriptionForeground);
+  overflow-wrap: anywhere;
+}
+
+.ask-user-unavailable-cancel {
+  padding: 4px 8px;
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+  border: 0;
+  cursor: pointer;
+}
+
+.ask-user-unavailable-cancel:disabled {
+  opacity: 0.6;
+  cursor: default;
 }
 
 .ask-user-batch-progress {

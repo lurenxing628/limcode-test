@@ -10,6 +10,9 @@ import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { RuntimeDatabase } from './runtimeDatabase';
 import { retryLocalExecution } from './localExecutionRecovery';
 import { handoffReason } from './executionLeaseFence';
+import { validateWorkEnvironmentTransferArguments } from '../capabilities/workEnvironmentTransfer';
+
+export { validateWorkEnvironmentTransferArguments } from '../capabilities/workEnvironmentTransfer';
 
 export const WORK_ENVIRONMENT_TRANSFER_EFFECT_KIND = 'file_transfer' as const;
 
@@ -40,15 +43,20 @@ export class WorkEnvironmentTransferEffectDispatcher {
     private readonly effects: EffectControlPlane
   ) {}
 
-  public prepare(input: {
+  public async prepare(input: {
     source: PhaseDCommandSource;
     toolCallId: string;
     authoritySnapshotId: string;
     arguments: PlainJsonValue;
   }): Promise<PreparedEffectIntent> {
+    // Replaying the existing preparation uses its committed request, even if newer argument
+    // rules would reject the original payload. prepareEffectIntent verifies that receipt's identity.
+    const replay = await this.list('CommandReceipt', { source_kind: input.source.kind, source_key: input.source.key }, 1);
     const request: WorkEnvironmentTransferEffectRequest = {
       authoritySnapshotId: requireId(input.authoritySnapshotId, 'authoritySnapshotId'),
-      arguments: normalizeTransferArguments(input.arguments)
+      arguments: replay.length > 0
+        ? input.arguments
+        : normalizePlainJson(validateWorkEnvironmentTransferArguments(input.arguments), 'transfer execution arguments')
     };
     return this.effects.prepareEffectIntent({
       source: input.source,

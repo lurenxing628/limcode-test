@@ -31,7 +31,6 @@ import {
 } from './attachmentObservations';
 import { prependSystemPromptPrefix } from '../world/modules/chat/systemPromptText';
 import {
-  compactReadFileToolArguments,
   readFileToolDescription,
   readFileToolParameters
 } from '../world/modules/tools/definitions/readFile';
@@ -523,11 +522,11 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               ? undefined
               : normalizePlainJson(payload.usageMetadata, 'LLM usage metadata');
             const authoritativeContent = messageContentFromDonePayload(payload?.content);
-            const completedContent = compactReadToolCallsInContent(applyThoughtDurations(
+            const completedContent = applyThoughtDurations(
               authoritativeContent ?? { role: 'model', parts: outputParts },
               completedThoughtBlockDurations,
               thoughtTimingObserved ? completedThoughtDurationMs : undefined
-            ));
+            );
             // 这次请求实际使用的 Claude 保留思考处理（含本次新学到的）写进请求终态；没带时沿用窗口里已有的选择。
             const claudeThinkingBinding = payload?.claudeThinkingBinding === 'drop_block' || payload?.claudeThinkingBinding === 'strip_thinking'
               ? payload.claudeThinkingBinding
@@ -2530,22 +2529,6 @@ function appendProviderContextPart(parts: MessageContent['parts'], part: Provide
   parts.push(part);
 }
 
-function compactReadToolCallsInContent(content: MessageContent): MessageContent {
-  return {
-    ...content,
-    parts: content.parts.map((part) => {
-      if (!('functionCall' in part) || part.functionCall.name !== READ_TOOL_NAME) return part;
-      return {
-        ...part,
-        functionCall: {
-          ...part.functionCall,
-          args: compactReadFileToolArguments(part.functionCall.args)
-        }
-      };
-    })
-  };
-}
-
 function applyThoughtDurations(
   content: MessageContent,
   blockDurations: readonly number[],
@@ -2683,9 +2666,7 @@ function normalizeCapabilityToolCalls(value: unknown): NormalizedCapabilityToolC
       ordinal: explicitOrdinal ?? index,
       hasExplicitOrdinal: explicitOrdinal !== undefined,
       name,
-      arguments: name === READ_TOOL_NAME
-        ? normalizePlainJson(compactReadFileToolArguments(normalizedArguments), `LLM tool call ${index}.compactedReadArguments`)
-        : normalizedArguments,
+      arguments: normalizedArguments,
       ...(optionalText(record.thoughtSignature) ? { thoughtSignature: optionalText(record.thoughtSignature) } : {}),
       ...(record.async === true ? { async: true } : {})
     };

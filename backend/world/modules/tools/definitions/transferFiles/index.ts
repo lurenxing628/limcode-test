@@ -21,6 +21,7 @@ export const transferFilesTool: ToolDefinition = {
       'fromPath / toPath accept relative and absolute paths; relative paths are resolved against the root/workdir of fromEnvironment / toEnvironment respectively.',
       'A path ending with / or \\ denotes a directory; when type=auto, the kind is inferred from the stat result of the source path.',
       'overwrite defaults to false, so the transfer fails if the target exists; files are written via a temp file + verification + rename.',
+      'Transfers copy sources without deleting them. Omit unused optional fields; empty optional placeholders use their defaults. Invalid non-empty types or verification modes are rejected before transfer begins.',
       'The tool policy allows paths outside the project by default; when disabled, both the source and target paths must resolve inside their respective work environment roots.'
     ].join('\n'),
     parameters: {
@@ -28,14 +29,15 @@ export const transferFilesTool: ToolDefinition = {
       properties: {
         transfers: {
           type: 'array',
+          minItems: 1,
           description: 'Array of transfer tasks. Must be an array, even when transferring a single file.',
           items: {
             type: 'object',
             properties: {
-              fromEnvironment: { type: 'string', description: 'Source work environment: its W# reference from the listed work environments, or current for the currently active work environment.' },
-              fromPath: { type: 'string', description: 'Source path, relative or absolute. Relative paths are resolved against the root/workdir of fromEnvironment; directories should end with / or \\.' },
-              toEnvironment: { type: 'string', description: 'Target work environment: its W# reference from the listed work environments, or current for the currently active work environment.' },
-              toPath: { type: 'string', description: 'Target path, relative or absolute. Relative paths are resolved against the root/workdir of toEnvironment; a directory path refers to the target directory itself.' },
+              fromEnvironment: { type: 'string', minLength: 1, description: 'Source work environment: its W# reference from the listed work environments, or current for the currently active work environment.' },
+              fromPath: { type: 'string', minLength: 1, description: 'Source path, relative or absolute. Relative paths are resolved against the root/workdir of fromEnvironment; directories should end with / or \\.' },
+              toEnvironment: { type: 'string', minLength: 1, description: 'Target work environment: its W# reference from the listed work environments, or current for the currently active work environment.' },
+              toPath: { type: 'string', minLength: 1, description: 'Target path, relative or absolute. Relative paths are resolved against the root/workdir of toEnvironment; a directory path refers to the target directory itself.' },
               type: { type: 'string', enum: ['auto', 'file', 'directory'], description: 'Transfer type, defaults to auto.' },
               overwrite: { type: 'boolean', description: 'Whether to overwrite when the target exists, defaults to false.' },
               createDirs: { type: 'boolean', description: 'Whether to automatically create the target parent directory / target directory, defaults to true.' }

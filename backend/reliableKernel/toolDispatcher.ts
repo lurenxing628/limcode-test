@@ -1,4 +1,7 @@
 import { resolveFrozenToolDefinitions } from './frozenToolDefinitions';
+import { validateBuiltinToolArguments } from './builtinToolArguments';
+import { ToolArgumentError } from '../../shared/toolArgumentUtils';
+import { validateCommandToolArguments } from '../../shared/commandToolArguments';
 import { AGENT_COLLABORATION_TOOL_NAMES, isReadonlyAgentCollaborationTool } from '../world/modules/tools/definitions/agentCollaboration';
 import {
   CROSS_CONVERSATION_TOOL_NAMES,
@@ -49,7 +52,7 @@ import {
   isReadonlyRunAgentOperation,
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
-import { effectiveLocalPathReadMode } from '../world/modules/tools/definitions/readFile';
+import { validateReadFileToolArguments } from '../world/modules/tools/definitions/readFile';
 import { isSkillEnabledByPolicy } from '../world/modules/skill/policy';
 import { composeSkillsToolDescription } from '../world/modules/skill/skillDescription';
 import {
@@ -96,11 +99,7 @@ import { EffectiveToolDefinitionProjection, type EffectiveToolDefinitionInput } 
 import type { ProcessControlPlane, ProcessWaitObservation } from './processEffects';
 import {
   DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS,
-  DEFAULT_PROCESS_MAX_OUTPUT_BYTES,
-  MAX_PROCESS_EXECUTION_TIMEOUT_MS,
-  MAX_PROCESS_MAX_OUTPUT_BYTES,
-  MIN_PROCESS_EXECUTION_TIMEOUT_MS,
-  MIN_PROCESS_MAX_OUTPUT_BYTES
+  DEFAULT_PROCESS_MAX_OUTPUT_BYTES
 } from './processProtocol';
 import { DOMAIN_REPOSITORIES, type DomainRow } from './repositories';
 import { listAllDomainRows } from './repositoryPagination';
@@ -879,27 +878,50 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const config = authority.toolConfig;
     const yolo = policy.preset === 'yolo';
     const supportsChangeApply = FILE_TOOLS.has(input.toolName) || metadata?.supportsChangeApply === true;
+    let analysisInput = input;
+    try {
+      if (live?.declaration.source?.kind !== 'mcp') {
+        // Policy must classify the selected command/agent action, using its normalized fields.
+        const validated = validateBuiltinToolArguments(input.toolName, input.arguments);
+        if (PROCESS_TOOLS.has(input.toolName) || input.toolName === 'run_agent' || input.toolName === 'read_agent_answer') {
+          analysisInput = { ...input, arguments: normalizePlainJson(validated, 'Tool policy arguments') };
+        }
+      }
+    } catch (error) {
+      if (!(error instanceof ToolArgumentError)) throw error;
+      // Freeze a serial slot so one malformed call can settle without failing the provider batch.
+      return {
+        displayAutoExpand: config?.display?.autoExpand ?? metadata?.defaultAutoExpand ?? false,
+        displayAutoOpenDiff: false,
+        executionGate: 'automatic',
+        changeApplyMode: 'unsupported',
+        changeApplyDelaySeconds: 0,
+        autoSubmitResult: true,
+        schedulingMode: 'serial',
+        schedulingReason: 'invalid_tool_arguments'
+      };
+    }
     const commandClassification = PROCESS_TOOLS.has(input.toolName)
-      ? classifyCommandCall(input.arguments)
+      ? classifyCommandCall(analysisInput.arguments)
       : undefined;
     const scheduling = commandClassification
-      ? frozenCommandScheduling(commandClassification, input.arguments)
-      : live?.scheduling?.(input.arguments, { toolName: input.toolName })
-        ?? frozenSchedulingFallback(input.definition, input.arguments);
+      ? frozenCommandScheduling(commandClassification, analysisInput.arguments)
+      : live?.scheduling?.(analysisInput.arguments, { toolName: input.toolName })
+        ?? frozenSchedulingFallback(input.definition, analysisInput.arguments);
     const command = PROCESS_TOOLS.has(input.toolName)
-      ? optionalText(requireRecord(input.arguments, `${input.toolName} arguments`).command)
+      ? optionalText(requireRecord(analysisInput.arguments, `${input.toolName} arguments`).command)
       : '';
     // A child Turn's call is automatic only where its own settings and every ancestor Turn's agree.
     const sides = [
       { preset: policy.preset, toolConfig: config },
       ...(authority.inheritedToolConfigs ?? [])
-    ].map((side) => sideAutomation(input, metadata, supportsChangeApply, command, side.preset === 'yolo', side.toolConfig));
+    ].map((side) => sideAutomation(analysisInput, metadata, supportsChangeApply, command, side.preset === 'yolo', side.toolConfig));
     const automaticChangeApply = sides.every((side) => side.automaticChangeApply);
     const delay = automaticChangeApply ? Math.max(...sides.map((side) => side.changeApplyDelaySeconds)) : 0;
     const executionAutomatic = sides.every((side) => side.executionAutomatic);
-    const summary = live?.summary?.(input.arguments, {
+    const summary = live?.summary?.(analysisInput.arguments, {
       toolName: input.toolName,
-      argsJson: canonicalPlainJson(input.arguments, `Tool ${input.toolName} summary arguments`)
+      argsJson: canonicalPlainJson(analysisInput.arguments, `Tool ${input.toolName} summary arguments`)
     });
     return {
       ...(summary?.trim() ? { summary: summary.trim() } : {}),
@@ -1433,6 +1455,30 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       : await this.providerDefinitionMismatch(input, definition);
     if (definitionMismatch) return this.reject(input, definitionMismatch);
     const authority = options.authority ?? await this.readAuthority(input.turnId, definition.declaration);
+    let existingOperation: DomainRow | undefined;
+    if (definition.declaration.source?.kind !== 'mcp') {
+      // A proposal or Operation is already a frozen execution fact. Re-entry uses that fact;
+      // merely approving execution does not exempt a call from validation before new work.
+      const [operations, changeSets] = options.assumeFresh ? [[], []] : await Promise.all([
+        this.list('Operation', { tool_call_id: input.toolCallId }, 1),
+        FILE_TOOLS.has(input.toolName) ? this.list('FileChangeSet', { tool_call_id: input.toolCallId }, 1) : []
+      ]);
+      existingOperation = operations[0];
+      if (operations.length === 0 && changeSets.length === 0) {
+        try {
+          validateBuiltinToolArguments(input.toolName, input.arguments);
+        } catch (error) {
+          if (!(error instanceof ToolArgumentError)) throw error;
+          const settled = await this.dependencies.effects.settleWithoutEffect({
+            source: { kind: 'internal', key: `tool-dispatch:${input.toolCallId}:invalid-arguments` },
+            toolCallId: input.toolCallId,
+            status: 'failed',
+            detail: { code: 'invalid_tool_arguments', error: error.message }
+          });
+          return this.settledResult(input.toolCallId, settled.status, settled.terminal);
+        }
+      }
+    }
     const policy = authorityPolicy(authority.document);
     if (isCrossConversationTool(input.toolName)) {
       if (!crossConversationSwitchOn(policy.toolConfigs) || !await this.topLevelTurn(input.turnId)) {
@@ -1484,7 +1530,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       return this.settledResult(input.toolCallId, settled.status, settled.terminal);
     }
 
-    if (frozenDecision.executionGate === 'approval_required' && !FILE_TOOLS.has(input.toolName)) {
+    if (frozenDecision.executionGate === 'approval_required' && !FILE_TOOLS.has(input.toolName) && !existingOperation) {
       const approval = await this.executionApprovalState(input.toolCallId);
       if (approval === 'rejected' || approval === 'cancelled') {
         const cancelled = approval === 'cancelled';
@@ -1521,7 +1567,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         this.dispatchFile(definition, input, authority, frozenDecision, signal));
     }
     if (PROCESS_TOOLS.has(input.toolName)) {
-      return this.captureAbortableExecution(input, (signal) => this.dispatchProcess(input, authority, signal));
+      return this.captureAbortableExecution(input, (signal) => this.dispatchProcess(input, authority, signal, existingOperation));
     }
     if (input.toolName === TRANSFER_TOOL_NAME) {
       return this.captureHostEvents(input, (emit, signal) =>
@@ -1828,20 +1874,39 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
   private async dispatchProcess(
     input: ReliableAgentToolDispatchInput,
     authority: ReliableToolDispatchAuthority,
-    signal: AbortSignal
+    signal: AbortSignal,
+    existingOperation?: DomainRow
   ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
     if (signal.aborted) {
       const handoff = handoffReason(signal);
       if (handoff) throw handoff;
       return this.settleCancelledCapability(input, 'Process capability execution was cancelled before dispatch.');
     }
-    const args = requireRecord(input.arguments, `${input.toolName} arguments`);
-    const mode = args.mode === 'output' || args.mode === 'kill' ? args.mode : 'execute';
+    if (existingOperation) {
+      // The intent, rather than today's argument rules, owns an already prepared process action.
+      const attempts = await this.list('Attempt', { operation_id: existingOperation.id }, 2);
+      if (attempts.length !== 1) throw new Error('A process Operation must have one Attempt.');
+      const intents = await this.list('EffectIntent', { attempt_id: attempts[0].id }, 2);
+      if (intents.length !== 1) throw new Error('A process Operation must have one EffectIntent.');
+      const intent = intents[0];
+      const intentId = requireId(intent.id, 'EffectIntent.id');
+      const resumed = intent.effect_kind === 'process_start'
+        ? await this.dependencies.processes.dispatchStart(intentId, 0, signal)
+        : intent.effect_kind === 'process_stop_request'
+          ? await this.dependencies.processes.dispatchStop(intentId, signal)
+          : undefined;
+      if (resumed === undefined) throw new Error(`Unexpected process EffectIntent kind: ${String(intent.effect_kind)}.`);
+      const terminal = resumed?.terminal ?? await this.dependencies.effects.readTerminalResult(input.toolCallId, false);
+      if (terminal) return terminal;
+      return await this.readReadySettlement(input.toolCallId) ?? {
+        disposition: 'paused', toolCallId: input.toolCallId, reason: 'background_process', resumeKey: intentId
+      };
+    }
+    const executionArgs = validateCommandToolArguments(input.arguments);
+    const args = normalizePlainJson(executionArgs, 'Command execution arguments') as { [key: string]: PlainJsonValue };
+    const mode = args.mode;
     if (mode === 'output') return this.readProcessOutput(input, args, signal);
     if (mode === 'kill') return this.stopProcess(input, args, signal);
-    if (typeof args.explanation !== 'string' || args.explanation.trim().length === 0) {
-      return this.reject(input, `${input.toolName} mode=execute 需要 explanation。`);
-    }
     const command = requireText(args.command, `${input.toolName}.command`);
     const commandConfig = commandPolicyConfig(authority.toolConfig);
     const deniedBy = firstMatchedCommandRule(command, commandConfig.denyCommands);
@@ -1858,31 +1923,13 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
         return this.reject(input, '命令未匹配上级对话冻结的 ToolPolicy 白名单；子 Agent 的命令不能超出上级对话允许的范围，因此不会执行。');
       }
     }
-    const foregroundWaitMs = requireOptionalBoundedInteger(
-      args.foregroundWaitMs,
-      DEFAULT_COMMAND_FOREGROUND_WAIT_MS,
-      'foregroundWaitMs',
-      0,
-      60_000
-    );
-    const executionTimeoutMs = requireOptionalBoundedInteger(
-      args.executionTimeoutMs,
-      DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS,
-      'executionTimeoutMs',
-      MIN_PROCESS_EXECUTION_TIMEOUT_MS,
-      MAX_PROCESS_EXECUTION_TIMEOUT_MS
-    );
-    const maxOutputBytes = requireOptionalBoundedInteger(
-      args.maxOutputBytes,
-      DEFAULT_PROCESS_MAX_OUTPUT_BYTES,
-      'maxOutputBytes',
-      MIN_PROCESS_MAX_OUTPUT_BYTES,
-      MAX_PROCESS_MAX_OUTPUT_BYTES
-    );
+    const foregroundWaitMs = executionArgs.foregroundWaitMs ?? DEFAULT_COMMAND_FOREGROUND_WAIT_MS;
+    const executionTimeoutMs = executionArgs.executionTimeoutMs ?? DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS;
+    const maxOutputBytes = executionArgs.maxOutputBytes ?? DEFAULT_PROCESS_MAX_OUTPUT_BYTES;
     if (!this.dependencies.host.resolveProcessCwd) {
       return this.reject(input, `${input.toolName} 没有工作目录 resolver。`);
     }
-    const cwd = await this.dependencies.host.resolveProcessCwd(input, authority);
+    const cwd = await this.dependencies.host.resolveProcessCwd({ ...input, arguments: args }, authority);
     if (signal.aborted) {
       const handoff = handoffReason(signal);
       if (handoff) throw handoff;
@@ -3181,10 +3228,13 @@ function isDeferredNoEffectSettlement(result: InternalDispatchResult): result is
 
 function isAttachmentReadInput(input: ReliableAgentToolDispatchInput): boolean {
   if (input.toolName !== 'read') return false;
-  const args = plainOptionalRecord(input.arguments);
-  const explicitMode = optionalText(args?.mode);
-  if (explicitMode !== undefined && explicitMode !== 'text' && explicitMode !== 'attachment') return false;
-  return effectiveLocalPathReadMode(args?.path, explicitMode as 'text' | 'attachment' | undefined) === 'attachment';
+  try {
+    const args = validateReadFileToolArguments(input.arguments);
+    return args.source === 'attachment' || args.source === 'path' && args.mode === 'attachment';
+  } catch {
+    // Invalid requests settle in the ordinary lane, without materializing attachment content.
+    return false;
+  }
 }
 
 function noEffectModelDetail(toolName: string, result: ToolResultOut): PlainJsonValue {
@@ -3233,20 +3283,6 @@ export function effectiveProcessForegroundWaitMs(
   return replacesCurrentExtension
     ? Math.max(requestedWaitMs, executionTimeoutMs)
     : requestedWaitMs;
-}
-
-function requireOptionalBoundedInteger(
-  value: PlainJsonValue | undefined,
-  defaultValue: number,
-  label: string,
-  minimum: number,
-  maximum: number
-): number {
-  if (value === undefined) return defaultValue;
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < minimum || value > maximum) {
-    throw new TypeError(`${label} must be an integer from ${minimum} to ${maximum}.`);
-  }
-  return value;
 }
 
 function plainRecord(value: PlainJsonValue | undefined, label: string): Record<string, unknown> {

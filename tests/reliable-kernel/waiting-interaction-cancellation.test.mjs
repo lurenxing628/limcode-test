@@ -25,7 +25,7 @@ test('全局停止把 AskUser、执行审批和文件审批统一收敛为 cance
     await harness.app.interactions.pauseForAskUser({
       source: { kind: 'internal', key: 'pause-ask' },
       toolCallId: askCallId,
-      prompt: { question: '继续吗？' }
+      prompt: { question: '继续吗？', options: [{ label: '继续' }] }
     });
 
     const execCallId = await harness.createTool('exec-call', 'shell');

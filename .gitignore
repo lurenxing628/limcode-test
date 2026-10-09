@@ -294,3 +294,12 @@ docs/architecture/*
 !/tests/reliable-kernel/repository-encoding-boundary.test.mjs
 !/tests/reliable-kernel/runtime-schema-reuse.test.mjs
 !/tests/reliable-kernel/build-pipeline.test.mjs
+!/tests/reliable-kernel/edit-hunk-matcher.test.cjs
+!/tests/reliable-kernel/read-transfer-arguments.test.cjs
+!/tests/reliable-kernel/read-tool-presentation.test.mjs
+!/tests/reliable-kernel/ask-plan-placeholder.test.mjs
+!/tests/reliable-kernel/tool-tolerance-defaults.test.mjs
+!/tests/reliable-kernel/agent-tool-arguments.test.mjs
+!/tests/reliable-kernel/tool-argument-admission.test.mjs
+!/tests/reliable-kernel/command-tool-presentation.test.mjs
+!/tests/reliable-kernel/file-tool-arguments.test.cjs

@@ -11,7 +11,7 @@ function fromDist(relativePath) {
   return require(path.join(extensionDist, relativePath));
 }
 
-const { ReliableChildAgentCoordinator } = fromDist('backend/reliableKernel/childAgentCoordinator.js');
+const { ReliableChildAgentCoordinator, agentToolArgumentMetadata } = fromDist('backend/reliableKernel/childAgentCoordinator.js');
 const { ReliableToolDispatcher } = fromDist('backend/reliableKernel/toolDispatcher.js');
 const { stablePhaseFId } = fromDist('backend/reliableKernel/phaseFIdentity.js');
 const {
@@ -87,6 +87,7 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，spawn 与 in
   const toolCallId = 'optional-wait-tool-call';
   const answerBridgeId = stablePhaseFId('answer_bridge', toolCallId);
   let spawnCommand;
+  let sendCommand;
   let resolvedSelection;
   let initializedModel;
   const coordinator = new ReliableChildAgentCoordinator({
@@ -158,7 +159,8 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，spawn 与 in
           }
         };
       },
-      async send() {
+      async send(command) {
+        sendCommand = command;
         return { turnIntentId: 'continuation-intent' };
       },
       async admitQueuedIntent(command) {
@@ -224,13 +226,20 @@ test('可靠 run_agent 省略 foregroundWaitMs 时立即转后台，spawn 与 in
     arguments: { operation: 'spawn', taskName: 'Preload', prompt: 'read the report', skills: ['pdf'] }
   }, undefined, frozenRunAgentAuthority(1)), /没有接入技能目录.*没有创建子 Agent/,
   '没有技能目录的宿主拒绝预载，而不是悄悄丢掉技能');
-  await assert.rejects(() => coordinator.dispatch({
+  const spawnBeforeSend = spawnCommand;
+  const sendArgs = { operation: 'send', answerBridgeId: 'continuation-bridge', prompt: 'continue', skills: ['pdf'] };
+  const sendWithUnusedSkills = await coordinator.dispatch({
     turnId: 'parent-turn',
     modelRequestId: 'send-skills-request',
     toolCallId: 'send-skills-tool-call',
     toolName: 'run_agent',
-    arguments: { operation: 'send', answerBridgeId: 'continuation-bridge', prompt: 'continue', skills: ['pdf'] }
-  }), /run_agent\.send does not accept skills/);
+    arguments: sendArgs
+  });
+  assert.equal(sendWithUnusedSkills.disposition, 'settled');
+  assert.equal(sendCommand.childExecutionId, 'continuation-child');
+  assert.equal(spawnCommand, spawnBeforeSend, 'send 的额外 skills 不会预载技能或创建新子 Agent');
+  assert.deepEqual(agentToolArgumentMetadata('run_agent', sendArgs).ignoredFields, ['skills']);
+  assert.deepEqual(sendArgs.skills, ['pdf'], '冻结输入保持原样');
 
   await assert.rejects(() => coordinator.dispatch({
     turnId: 'parent-turn',

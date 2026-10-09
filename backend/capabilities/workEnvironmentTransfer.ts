@@ -32,6 +32,7 @@ import {
 import { isPathInside } from './filesystem/pathContainment';
 import { realPath } from './filesystem/realPath';
 import { assertNotSqliteDatabaseFile } from './filesystem/sqliteDatabaseFileGuard';
+import { ToolArgumentError, toolArgumentRecord, isEmptyToolArgument } from '../../shared/toolArgumentUtils';
 
 const STREAM_HIGH_WATER_MARK = 1024 * 1024;
 const PROGRESS_THROTTLE_MS = 1000;
@@ -104,6 +105,61 @@ interface NormalizedTransferItem extends WorkEnvironmentTransferItem {
   createDirs: boolean;
 }
 
+export interface ValidatedWorkEnvironmentTransferArguments {
+  transfers: NormalizedTransferItem[];
+  verify: WorkEnvironmentTransferVerifyMode;
+}
+
+/** Validates new transfers before effect preparation. Frozen effects retain their original request. */
+export function validateWorkEnvironmentTransferArguments(value: unknown): ValidatedWorkEnvironmentTransferArguments {
+  const args = toolArgumentRecord(value, 'transfer arguments');
+  if (!Array.isArray(args.transfers) || args.transfers.length === 0) throw new ToolArgumentError('transfer requires a non-empty transfers array.');
+  const verify = transferEnum(args.verify, ['none', 'size'] as const, 'size', 'transfer.verify');
+  assertCopyTransferIntent(args, 'transfer');
+  const transfers = args.transfers.map((value, index): NormalizedTransferItem => {
+    const item = toolArgumentRecord(value, `transfer.transfers[${index}]`);
+    const label = `transfer.transfers[${index}]`;
+    assertCopyTransferIntent(item, label);
+    const required = (key: string): string => {
+      if (typeof item[key] !== 'string' || !(item[key] as string).trim()) throw new ToolArgumentError(`${label}.${key} must be a non-empty string.`);
+      return (item[key] as string).trim();
+    };
+    return {
+      fromEnvironment: required('fromEnvironment'), fromPath: required('fromPath'),
+      toEnvironment: required('toEnvironment'), toPath: required('toPath'),
+      type: transferEnum(item.type, ['auto', 'file', 'directory'] as const, 'auto', `${label}.type`),
+      overwrite: transferBoolean(item.overwrite, false, `${label}.overwrite`),
+      createDirs: transferBoolean(item.createDirs, true, `${label}.createDirs`)
+    };
+  });
+  return { transfers, verify };
+}
+
+function transferEnum<T extends string>(value: unknown, allowed: readonly T[], defaultValue: T, label: string): T {
+  if (isEmptyToolArgument(value) || typeof value === 'string' && !value.trim()) return defaultValue;
+  if (typeof value === 'string' && allowed.includes(value.trim() as T)) return value.trim() as T;
+  throw new ToolArgumentError(`${label} must be one of ${allowed.join(', ')}.`);
+}
+
+function transferBoolean(value: unknown, defaultValue: boolean, label: string): boolean {
+  if (isEmptyToolArgument(value)) return defaultValue;
+  if (typeof value !== 'boolean') throw new ToolArgumentError(`${label} must be a boolean.`);
+  return value;
+}
+
+function assertCopyTransferIntent(args: Record<string, unknown>, label: string): void {
+  for (const key of ['move', 'deleteSource', 'removeSource']) {
+    const value = args[key];
+    if (!isEmptyToolArgument(value) && !(typeof value === 'string' && !value.trim()) && value !== false) {
+      throw new ToolArgumentError(`${label}.${key} is not supported: transfer copies the source without deleting it.`);
+    }
+  }
+  for (const key of ['operation', 'mode']) {
+    const value = typeof args[key] === 'string' ? args[key].trim() : args[key];
+    if (!isEmptyToolArgument(value) && value !== 'copy') throw new ToolArgumentError(`${label}.${key} is not supported: transfer only copies files or directories.`);
+  }
+}
+
 export function createWorkEnvironmentRuntimeCapability(): WorkEnvironmentRuntimeCapability {
   return {
     transferFiles(args, observer, context) {
@@ -152,6 +208,8 @@ async function transferFiles(
 }
 
 function normalizeTransfers(args: { transfers?: WorkEnvironmentTransferItem[] }): NormalizedTransferItem[] {
+  // New production requests were validated before EffectIntent creation. Keep this projection
+  // compatible with an already-frozen transfer request; never add a post-claim rejection here.
   const rawList = Array.isArray(args.transfers) ? args.transfers : [];
   const result: NormalizedTransferItem[] = [];
   for (const raw of rawList) {

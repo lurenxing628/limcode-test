@@ -136,19 +136,20 @@ export class ToolInteractionControlPlane {
   }): Promise<AskUserPauseResult> {
     const source = normalizeSource(input.source, ['internal'], 'ask-user-pause');
     const toolCallId = requireId(input.toolCallId, 'toolCallId');
-    const facts = await this.requireActiveToolFacts(toolCallId);
-    if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
-      throw new Error(`ToolCall ${toolCallId} cannot enter ask_user waiting from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
-    }
     const requestId = stablePhaseDId('interaction_request', `ask-user:${toolCallId}`);
     const operationId = stablePhaseDId('operation', `ask-user:${toolCallId}`);
     const pauseId = stablePhaseDId('outcome_pause', operationId);
     const receiptId = sourceReceiptId(source, 'ask-user-pause', toolCallId);
     const duplicate = await this.findSourceReceipt(source);
     if (duplicate) return this.replayPause(duplicate, receiptId, requestId, operationId, pauseId);
+    const request = normalizeAskUserToolRequest(input.prompt);
+    const facts = await this.requireActiveToolFacts(toolCallId);
+    if (facts.toolCall.status !== 'pending' || facts.execution.status !== 'pending') {
+      throw new Error(`ToolCall ${toolCallId} cannot enter ask_user waiting from ${String(facts.toolCall.status)}/${String(facts.execution.status)}.`);
+    }
     const prompt = await this.contentStore.prepare(
       this.database,
-      canonicalJson({ toolCallId, prompt: input.prompt }),
+      canonicalJson({ toolCallId, prompt: request }),
       'application/vnd.limcode.ask-user-prompt+json'
     );
     const now = this.timestamp();

@@ -30,6 +30,7 @@ import type {
   WorkEnvironmentRecord
 } from '../../shared/protocol';
 import type { EditToolMode } from '../../shared/protocol';
+import type { EditBranchName } from '../../shared/editToolArguments';
 import type { OpenAIResponsesNativeHooks } from './openAIResponsesNativeControl';
 
 export type Emit = (event: WorldEvent) => void;
@@ -104,9 +105,16 @@ export interface FsDeleteEditRequest {
 }
 
 export type FsEditFileRequest =
-  | { path: string; mode: 'hunk'; hunks: FsHunkEditRequest[] }
-  | { path: string; mode: 'insert'; insert: FsInsertEditRequest }
-  | { path: string; mode: 'delete'; delete: FsDeleteEditRequest };
+  | ({ path: string; mode: 'hunk'; hunks: FsHunkEditRequest[] } & FsEditArgumentMetadata)
+  | ({ path: string; mode: 'insert'; insert: FsInsertEditRequest } & FsEditArgumentMetadata)
+  | ({ path: string; mode: 'delete'; delete: FsDeleteEditRequest } & FsEditArgumentMetadata);
+
+export interface FsEditArgumentMetadata {
+  /** Branches present in the model payload but intentionally not executed because mode selected another branch. */
+  ignoredBranches?: EditBranchName[];
+  /** True when mode was safely inferred because exactly one branch was non-empty. */
+  inferredMode?: boolean;
+}
 
 export type FsFileWriteAction = 'created' | 'modified' | 'unchanged' | 'deleted';
 
@@ -144,6 +152,8 @@ export interface FsPendingFileChangeProposal {
   editMode?: EditToolMode;
   editResults?: unknown[];
   editFallbackMode?: string;
+  ignoredBranches?: EditBranchName[];
+  inferredMode?: boolean;
 }
 
 export interface FsPendingFileChangeDiffSaveEvent {
@@ -178,6 +188,9 @@ export interface FsEditFileResult {
   applied: number;
   failed: number;
   fallbackMode?: string;
+  ignoredBranches?: EditBranchName[];
+  inferredMode?: boolean;
+  warning?: string;
   results: unknown[];
   summary: string;
   changedFiles: string[];

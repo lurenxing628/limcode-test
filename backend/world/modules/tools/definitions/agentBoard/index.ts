@@ -1,5 +1,4 @@
 import type { ToolDefinition } from '../../registry';
-import { defineToolDefinitionModule } from '../types';
 
 export const AGENT_BOARD_TOOL_NAME = 'agent_board';
 export const AGENT_BOARD_OPERATIONS = [
@@ -49,5 +48,3 @@ export const agentBoardTool: ToolDefinition = {
   },
   scheduling: args => ({ mode: isReadonlyAgentBoardOperation(args) ? 'parallel' : 'serial', reason: 'board_operation' })
 };
-
-export const agentBoardToolModule = defineToolDefinitionModule({ id: AGENT_BOARD_TOOL_NAME, create: () => agentBoardTool });
