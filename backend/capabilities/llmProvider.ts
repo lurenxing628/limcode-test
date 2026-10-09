@@ -1,3 +1,4 @@
+import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
 import { createHash } from 'crypto';
 import { discoverAnthropicModels } from './modelCapabilityDiscovery';
 import { resolveSummaryOutputBudget } from '../../shared/summaryOutputBudget';
@@ -451,14 +452,7 @@ export async function startLlmProvider(
     const settings = await retryProviderInputRead(
       () => resolveRuntimeSettings(request, options, resolvedRuntimeSettingsByInvocationId), { signal });
     emitLlmStarted(streamEmit, request.id, request.invocationId, resolveModelDisplayName(settings));
-    const nativeCapabilities = openAIResponsesNativeCapabilities({
-      provider: settings.provider,
-      model: settings.model,
-      baseUrl: settings.baseUrl,
-      transport: settings.openaiResponsesTransport,
-      nativeResponses: settings.nativeResponses,
-      ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, settings))
-    });
+    const nativeCapabilities = requestNativeCapabilities(request, settings);
 
     const unified = await importUnifiedLlmProvider();
     const registry = unified.createBootstrapExtensionRegistry();
@@ -746,6 +740,7 @@ async function runLlmAttempt(
       }
     : undefined;
   const nativeHttpSession = usesOpenAIResponsesNativeHttpSession(settings, nativeCapabilities);
+  const nativeBilling = nativeSessionCapabilities(nativeCapabilities) !== undefined;
   try {
     const stream: AsyncIterable<UnifiedLLMStreamChunk> = forceStreaming
       ? streamOpenAIResponsesWithLimCodeSession({
@@ -848,7 +843,8 @@ async function runLlmAttempt(
           completedContents.push(fromUnifiedCompletedContent(content, nativeChain));
         }
       }
-      if (hasStreamTimingChunk(chunk)) {
+      // Stream liveness/retry notices may use control events; first output may not.
+      if (hasModelOutputChunk(chunk)) {
         timing.firstStreamChunkAt ??= chunkAt;
         timing.firstStreamChunkMark ??= chunkMark;
         timing.streamTimingChunkCount += 1;
@@ -896,7 +892,16 @@ async function runLlmAttempt(
     : completedContents.length === 1
       ? completedContents[0]
       : { role: 'model' as const, parts: completedContents.flatMap((content) => content.parts) };
-  const aggregatedUsageMetadata = nativeUsage.started ? nativeUsage.billingTotals() : latestUsageMetadata;
+  if (!nativeBilling && nativeUsage.responseCount > 1) {
+    throw new TypeError('Ordinary Responses request returned multiple physical responses.');
+  }
+  let aggregatedUsageMetadata = nativeUsage.started ? nativeUsage.billingTotals() : latestUsageMetadata;
+  if (!nativeBilling && nativeUsage.started && aggregatedUsageMetadata) {
+    // One physical response has no chain-completeness status. Keep known numeric observations,
+    // but do not invent usage (or native flags) when the provider omitted it entirely.
+    const { nativeChainUsageIncomplete: _incomplete, nativeChainUsageDetailsIncomplete: _details, ...observed } = aggregatedUsageMetadata;
+    aggregatedUsageMetadata = Object.keys(observed).length ? observed : undefined;
+  }
   emit({
     type: LlmEventType.Done,
     payload: {
@@ -906,7 +911,7 @@ async function runLlmAttempt(
       completedAt: finishedAt,
       ...(aggregatedUsageMetadata ? { usageMetadata: {
         ...aggregatedUsageMetadata,
-        ...(nativeUsage.started ? { nativeChainBilling: true } : {})
+        ...(nativeBilling && nativeUsage.started ? { nativeChainBilling: true } : {})
       } } : {}),
       ...conversationAdaptation
     }
@@ -1700,6 +1705,18 @@ export async function resolveLlmInvocationProvider(
   }
 }
 
+/** The kernel freezes session eligibility in the recipe. Never reclassify it from stream events. */
+function requestNativeCapabilities(request: LlmStartRequest, settings: LlmProviderConfigRecord): OpenAIResponsesNativeCapabilities {
+  if (request.nativeSessionCapabilities !== undefined) {
+    return request.nativeSessionCapabilities ?? openAIResponsesNativeCapabilities({});
+  }
+  return openAIResponsesNativeCapabilities({
+    provider: settings.provider, model: settings.model, baseUrl: settings.baseUrl,
+    transport: settings.openaiResponsesTransport, nativeResponses: settings.nativeResponses,
+    ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, settings))
+  });
+}
+
 export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmProviderOptions, dryRunOptions: LlmDryRunOptions = {}, resolvedRuntimeSettingsByInvocationId?: Map<string, LlmProviderConfigRecord>): Promise<LlmDryRunResult> {
   const settings = await resolveRuntimeSettings(request, options, resolvedRuntimeSettingsByInvocationId);
   const apiKeyAvailable = !!settings.apiKey;
@@ -1719,14 +1736,7 @@ export async function dryRunLlmProvider(request: LlmStartRequest, options: LlmPr
     requestBodyWithOpenAIPromptCacheKey(runtimeSettings, request.conversationId),
     request.contents
   );
-  const nativeCapabilities = openAIResponsesNativeCapabilities({
-    provider: runtimeSettings.provider,
-    model: runtimeSettings.model,
-    baseUrl: runtimeSettings.baseUrl,
-    transport: runtimeSettings.openaiResponsesTransport,
-    nativeResponses: runtimeSettings.nativeResponses,
-    ...nativeReasoningModeInput(effectiveRequestGenerationConfig(request, runtimeSettings))
-  });
+  const nativeCapabilities = requestNativeCapabilities(request, runtimeSettings);
   const provider = installRequestAdaptation(installProviderCompatibility(unified.createLLMFromConfig({
     provider: libraryProviderKind(runtimeSettings),
     model: runtimeSettings.model,

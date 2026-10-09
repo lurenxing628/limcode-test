@@ -1,3 +1,4 @@
+import type { OpenAIResponsesNativeCapabilities } from '../../../../shared/openAIResponsesNative';
 import type { LlmCompressionConfigRecord, LlmInvocationSettingsSnapshotRecord, LlmProviderKind, LlmUsageMetadataRecord, MessageContent } from '../../../../shared/protocol';
 
 export type { LlmProviderKind };
@@ -28,6 +29,9 @@ export interface LlmStartRequest {
   conversationId?: string;
   model?: LlmModelSettings;
   settingsSnapshot?: LlmInvocationSettingsSnapshotRecord;
+  /** Frozen reliable recipe decision; null means ordinary. Direct capability callers may omit
+   * this and resolve their capabilities once at admission. Never sent to the provider. */
+  nativeSessionCapabilities?: OpenAIResponsesNativeCapabilities | null;
   /** Process-local reliable dispatch metadata; never persisted as Provider settings. */
   reliableProviderAttempt?: {
     attemptSeq: number;

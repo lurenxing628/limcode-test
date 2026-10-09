@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { modelRequestObservedUsage } from '@shared/modelRequestMeasurement';
 import { computed } from 'vue';
 import {
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
@@ -63,9 +64,11 @@ const inputObservation = computed<ContextInputObservation>(() => {
   let latest: ContextInputObservation | undefined;
   for (const [index, request] of ordinaryRequests.value.entries()) {
     const requestId = text(request.id);
+    const committedUsage = usageFromRequest(request);
+    const transientUsage = reliableConversation.feed.transientModelRequests[requestId]?.usageMetadata;
     const observation = observeContextInput({
       native: isNativeRequest(request),
-      usage: reliableConversation.feed.transientModelRequests[requestId]?.usageMetadata ?? usageFromRequest(request),
+      usage: request.status === 'terminal' ? committedUsage ?? transientUsage : transientUsage ?? committedUsage,
       streamStats: request.stream_stats_json,
       requestRootId: text(requestProjections.value.get(requestId)?.root_id),
       currentRootId: text(currentContextStatus.value?.root_id)
@@ -204,9 +207,7 @@ function isNativeRequest(request: Record<string, unknown> | undefined): boolean 
 }
 
 function usageFromRequest(request: Record<string, unknown> | undefined): LlmUsageMetadataRecord | undefined {
-  if (!request) return undefined;
-  const value = typeof request.usage_json === 'string' ? parseJson(request.usage_json) : request.usage_json;
-  return asRecord(value) as LlmUsageMetadataRecord | undefined;
+  return modelRequestObservedUsage(request);
 }
 
 function tokenValueLabel(value: number | undefined): string {

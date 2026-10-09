@@ -18,14 +18,18 @@ export function projectCompressionNotices(input: {
   unanchored: CompressionNotice[];
   unanchoredFailures: CompressionNotice[];
 } {
-  const turns = new Set(Object.values(input.records.Turn ?? {})
-    .filter((turn) => turn.conversation_id === input.conversationId).map((turn) => String(turn.id)));
+  const conversationTurns = Object.values(input.records.Turn ?? {})
+    .filter((turn) => turn.conversation_id === input.conversationId);
+  const turns = new Set(conversationTurns.map((turn) => String(turn.id)));
+  const latestTurnTime = conversationTurns.reduce((latest, turn) => Math.max(latest, time(turn.created_at)), 0);
+  const hasActiveTurn = conversationTurns.some((turn) => turn.status === 'active');
   const anchors = new Map<string, string>();
   for (const message of input.messages) {
     if (message.role === 'user' && input.turnIdByMessageId[message.id]) anchors.set(input.turnIdByMessageId[message.id], message.id);
   }
   const validTimes = input.messages.map((message) => message.createdAt).filter((time) => time > 0);
   const floor = validTimes.length ? Math.min(...validTimes) : 0;
+  const latestMessageTime = validTimes.reduce((latest, value) => Math.max(latest, value), 0);
   const groups = new Map<string, CompressionNotice>();
   const compressionTurns = new Set<string>();
   for (const request of Object.values(input.records.ModelRequest ?? {})) {
@@ -71,6 +75,8 @@ export function projectCompressionNotices(input: {
     const turnId = String(termination.turn_id);
     const createdAt = time(termination.created_at);
     if (!turns.has(turnId) || termination.terminal_status !== 'failed' || placed.has(id) || createdAt < floor) return [];
+    // This fallback represents only the current tail, never a sticky historical error.
+    if (hasActiveTurn || latestTurnTime > createdAt || latestMessageTime > createdAt) return [];
     return [{ id, turnId, createdAt, title: compressionTurns.has(turnId) ? '上下文压缩失败' : '本轮执行失败',
       detail: safeProviderFailureMessage(termination.reason) }];
   }).sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id));

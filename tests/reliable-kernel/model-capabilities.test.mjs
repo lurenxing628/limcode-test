@@ -367,3 +367,23 @@ test('渠道请求体自己写了思考参数时，摘要请求仍按方言改�
   assert.deepEqual(summaryRequestBody({ chat_template_kwargs: { enable_thinking: false, custom_template_flag: 1 } }, plan),
     { chat_template_kwargs: { custom_template_flag: 1 } }, '与思考无关的模板参数保留');
 });
+
+
+test('unanchored failure leaves the tail when later messages or Turns arrive, even with old history still loaded', () => {
+  const input = noticeInput();
+  input.records.TurnTermination = { f: { id: 'f', turn_id: 't', terminal_status: 'failed', reason: 'quota', created_at: created } };
+  input.turnIdByMessageId = {};
+  const failures = () => projectCompressionNotices(input).unanchoredFailures;
+  assert.equal(failures().length, 1);
+  input.messages.push({ id: 'later', role: 'model', createdAt: Date.parse(created) + 1000 });
+  assert.equal(failures().length, 0, 'keeping the original floor must not pin the old error below newer messages');
+  input.messages.pop();
+  input.records.Turn.newer = { id: 'newer', conversation_id: 'c', status: 'active' };
+  assert.equal(failures().length, 0, 'a continuation with no Message also retires the tail notice');
+  input.records.Turn.newer.status = 'terminated';
+  input.records.Turn.newer.created_at = new Date(Date.parse(created) + 1000).toISOString();
+  assert.equal(failures().length, 0, 'completion of the new Turn must not bring the old notice back');
+  input.records.Turn.newer.conversation_id = 'other';
+  input.records.Turn.newer.status = 'active';
+  assert.equal(failures().length, 1, 'other conversations have no effect');
+});

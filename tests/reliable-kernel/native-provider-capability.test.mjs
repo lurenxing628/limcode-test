@@ -281,8 +281,9 @@ async function withNativeSseServer(state, run) {
       const events = state.scripts[state.calls.length - 1] ?? [];
       response.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
       for (const event of events) {
-        // `{ delayMs }` holds the stream, e.g. to model the time before a response's first output.
-        if (typeof event.delayMs === 'number') await delay(event.delayMs);
+        // A test may hold completion until it has observed a genuinely incremental output.
+        if (event.waitFor) await event.waitFor;
+        else if (typeof event.delayMs === 'number') await delay(event.delayMs);
         else response.write(`data: ${JSON.stringify(event)}\n\n`);
       }
       response.write('data: [DONE]\n\n');
@@ -703,4 +704,120 @@ test('adapter materializeNativeToolOutput：托管媒体解析为线级块', asy
     ]),
     /Responses content blocks/
   );
+});
+
+
+test('dry-run：冻结的普通/原生会话资格优先于当前渠道开关，不能在重试时重新分类', async () => {
+  const tools = [{ name: 'probe', description: 'd', parameters: { type: 'object', properties: {} }, async: true }];
+  const ordinary = await dryRunLlmProvider(chatRequest('frozen-ordinary', { tools, nativeSessionCapabilities: null }), {
+    settings: async () => providerConfig({ nativeResponses: { enabled: true } })
+  });
+  assert.equal('async' in ordinary.body.tools[0], false);
+  const capabilities = { asyncTools: true, steering: false, reasoningUpdates: true, multiplexing: false, explicitCaching: true };
+  const native = await dryRunLlmProvider(chatRequest('frozen-native', { tools, nativeSessionCapabilities: capabilities }), {
+    settings: async () => providerConfig({ nativeResponses: { enabled: false } })
+  });
+  assert.equal(native.body.tools[0].async, true);
+});
+
+
+for (const [label, model, native] of [
+  ['普通GPT-6', ASTRA, false], ['原生GPT-6', ASTRA, true], ['普通GPT-5', 'gpt-5.5', false]
+]) test(`HTTP工具参数增量及时进入首输出计时：${label}，完整JSON也须等done才发布调用`, async () => {
+  const releaseDone = deferred();
+  const responseId = `response-argument-timing-${label}`;
+  const callId = 'call-argument-timing';
+  const itemId = 'item-argument-timing';
+  const fragments = ['{"path":', '"demo.ts"}'];
+  const args = fragments.join('');
+  const item = { type: 'function_call', id: itemId, call_id: callId, name: 'probe', arguments: args };
+  const state = { calls: [], scripts: [[
+    { type: 'response.created', response: { id: responseId, model, status: 'in_progress' } },
+    { type: 'response.output_item.added', response_id: responseId, output_index: 0,
+      item: { ...item, arguments: '' } },
+    { type: 'response.function_call_arguments.delta', response_id: responseId, output_index: 0, item_id: itemId, delta: fragments[0] },
+    { delayMs: 30 },
+    { type: 'response.function_call_arguments.delta', response_id: responseId, output_index: 0, item_id: itemId, delta: fragments[1] },
+    { waitFor: releaseDone.promise },
+    { type: 'response.function_call_arguments.done', response_id: responseId, output_index: 0, item_id: itemId, arguments: args },
+    { type: 'response.output_item.done', response_id: responseId, output_index: 0, item },
+    { type: 'response.completed', response: { id: responseId, model, status: 'completed', output: [item],
+      usage: { input_tokens: 100, output_tokens: 20, total_tokens: 120 } } }
+  ]] };
+  await withNativeSseServer(state, async port => {
+    const capability = createLlmProviderCapability({ settings: () => providerConfig({ model,
+      baseUrl: `http://127.0.0.1:${port}/v1`, nativeResponses: { enabled: native }
+    }) });
+    const events = [];
+    let firstDeltaAt, releaseAt, controller;
+    const id = `argument-timing-${label}`;
+    try {
+      capability.start(chatRequest(id, { tools: [{ name: 'probe', description: 'd', parameters: { type: 'object', properties: {} } }] }), event => {
+        events.push(event);
+        if (event.type === LlmEventType.ToolCallDelta) firstDeltaAt ??= Date.now();
+        if (native && event.type === LlmEventType.NativeControl && event.payload.event.type === 'response.completed') {
+          controller.endLogicalRequest();
+        }
+      }, native ? { native: { onController(value) { controller = value; } } } : undefined);
+      await until(() => events.filter(event => event.type === LlmEventType.ToolCallDelta)
+        .flatMap(event => event.payload.calls).map(call => call.argumentsDelta).join('') === args,
+      'argument deltas before the provider is allowed to send done');
+      assert.equal(events.some(event => event.type === LlmEventType.ToolCall), false,
+        '参数尚未关闭，即使已拼成合法JSON，也不能发布可执行工具调用');
+      releaseAt = Date.now();
+      releaseDone.resolve();
+      const done = await until(() => events.find(event => event.type === LlmEventType.Done), 'completed argument stream');
+      assert.ok(done.payload.createdAt <= firstDeltaAt, '首输出不能等到arguments.done');
+      assert.ok(done.payload.streamOutputDurationMs >= releaseAt - firstDeltaAt,
+        '输出区间必须覆盖done前已经收到的参数增量');
+      const calls = events.filter(event => event.type === LlmEventType.ToolCall).flatMap(event => event.payload.calls);
+      assert.equal(calls.length, 1, 'arguments.done、item.done和response.completed不能重复发布调用');
+      assert.equal(calls[0].id, callId);
+      assert.deepEqual(JSON.parse(calls[0].argsJson), { path: 'demo.ts' });
+      assert.equal(state.calls[0].stream, true);
+      if (native) {
+        const timing = events.find(event => event.type === LlmEventType.NativeControl
+          && event.payload.event.type === 'response.completed').payload.event.timing;
+        assert.ok(timing.firstOutputAt <= firstDeltaAt);
+      }
+    } finally {
+      releaseDone.resolve();
+      capability.abort(id);
+    }
+  });
+});
+
+test('HTTP参数增量复用SDK调用身份：并行交错不串号，空增量不算输出', async () => {
+  const { OpenAIResponsesFormat } = await import('unified-llm-provider');
+  const { installOpenAIResponsesCompletedContent } = require(path.join(compiledRoot,
+    'backend/capabilities/openAIResponsesCompletedContent.js'));
+  const { hasModelOutputChunk } = require(path.join(compiledRoot,
+    'backend/capabilities/llmStreamEventProjection.js'));
+  const { format } = installOpenAIResponsesCompletedContent({ format: new OpenAIResponsesFormat(ASTRA, undefined, true) }, 'openai-responses');
+  const state = format.createStreamState();
+  const decode = event => format.decodeStreamChunk(event, state);
+  decode({ type: 'response.created', response: { id: 'resp-parallel-deltas' } });
+  for (const [index, suffix] of ['a', 'b'].entries()) {
+    const added = decode({ type: 'response.output_item.added', output_index: index,
+      item: { id: `item-${suffix}`, type: 'function_call', call_id: `call-${suffix}`, name: 'probe', arguments: '' } });
+    assert.equal(hasModelOutputChunk(added), false, '只有调用元数据，不是参数输出');
+  }
+  assert.equal(hasModelOutputChunk(decode({ type: 'response.function_call_arguments.delta',
+    item_id: 'item-a', output_index: 0, delta: '' })), false);
+  for (const [suffix, delta] of [['a', '{"path":'], ['b', '{"path":'], ['b', '"b.ts"}'], ['a', '"a.ts"}']]) {
+    const chunk = decode({ type: 'response.function_call_arguments.delta', item_id: `item-${suffix}`,
+      output_index: suffix === 'a' ? 0 : 1, delta });
+    assert.deepEqual(chunk.toolCallArgumentDeltas, [{ callId: `call-${suffix}`, name: 'probe', argumentsDelta: delta }]);
+    assert.equal(hasModelOutputChunk(chunk), true);
+    assert.equal(chunk.functionCalls, undefined);
+  }
+  for (const [index, suffix] of ['a', 'b'].entries()) {
+    const done = decode({ type: 'response.function_call_arguments.done', item_id: `item-${suffix}`,
+      output_index: index, arguments: `{"path":"${suffix}.ts"}` });
+    assert.equal(done.functionCalls[0].functionCall.callId, `call-${suffix}`);
+    assert.deepEqual(done.functionCalls[0].functionCall.args, { path: `${suffix}.ts` });
+    const repeated = decode({ type: 'response.output_item.done', output_index: index,
+      item: { type: 'function_call', id: `item-${suffix}`, call_id: `call-${suffix}`, name: 'probe', arguments: `{"path":"${suffix}.ts"}` } });
+    assert.equal(repeated.functionCalls, undefined);
+  }
 });

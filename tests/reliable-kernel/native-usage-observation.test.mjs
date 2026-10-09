@@ -693,3 +693,21 @@ test('估算口径：Provider 观测只校准首响应根；压缩后窗口计�
   });
   assert.ok(budget.planningInputCapacityTokens < 130_000);
 });
+
+
+test('历史单响应的核验投影恢复主输入，终态不被残留原生计费瞬态覆盖', async () => {
+  const fixture = contextStatusFixture({ input: 120_000 });
+  const request = fixture.conversation.feed.records.ModelRequest.request;
+  Object.assign(request, { recipe_object_id: 'recipe', status: 'terminal', terminal_state: 'completed',
+    usage_json: { promptTokenCount: 120_000, candidatesTokenCount: 111, totalTokenCount: 120_111, nativeChainBilling: true },
+    stream_stats_json: { attemptSeq: '1', socketGeneration: '1' },
+    single_response_measurement: { recipeObjectId: 'recipe', responseId: 'response', attemptSeq: '1', socketGeneration: '1',
+      inputTokens: 120_000, outputTokens: 111, totalTokens: 120_111,
+      timing: { startedAt: 1000, firstOutputAt: 1100, completedAt: 1200, ttftMs: 100, outputDurationMs: 100 } } });
+  fixture.conversation.feed.transientModelRequests.request = {
+    usageMetadata: { promptTokenCount: 330_000, nativeChainBilling: true }
+  };
+  assert.equal(primaryContextLabel(await renderContextStatus(fixture)), '120k / 200k');
+  request.recipe_object_id = 'different';
+  assert.equal(primaryContextLabel(await renderContextStatus(fixture)), '? / 200k', '身份不符不使用误贴的计量投影');
+});

@@ -1,3 +1,4 @@
+import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
 import { providerRequestToolDefinitions } from './frozenToolDefinitions';
 import type { ReliableAgentToolDefinition } from './agentLoop';
 import { providerRequestModelHandleCatalog } from './frozenModelHandleCatalog';
@@ -1048,6 +1049,7 @@ function* toLlmStartRequestWork(request: FullProviderRequest): ModelProjectionWo
         : {})
     },
     reliableProviderAttempt: reliableProviderAttempt(request),
+    nativeSessionCapabilities: nativeSessionCapabilities(recipe.nativeResponses) ?? null,
     openAIResponsesContinuation: {
       volatileTailContentKinds,
       ...(nativeReasoning?.forceFullReason

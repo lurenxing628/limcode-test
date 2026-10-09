@@ -1,3 +1,4 @@
+import type { SingleResponseMeasurement } from '../../shared/modelRequestMeasurement';
 import type { NativePendingWorkInput, NativePendingToolCall, NativeSteeringInFlightEntry } from './nativeWorkTypes';
 import type { CurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
 import type { AttachmentScopeCacheCounters } from './attachmentProjectionScopeCache';
@@ -364,6 +365,7 @@ export type DatabaseWorkerRequestPayload =
   | { kind: 'modelStreamEvent'; input: ModelStreamEventCommitInput }
   | { kind: 'modelStreamActivity'; input: ModelStreamActivityInput }
   | { kind: 'cancelCurrentModelRequest'; input: ModelRequestCancelInput }
+  | { kind: 'singleResponseMeasurement'; requestId: string; expectedIdentity: string }
   | { kind: 'clientProjectionSnapshot'; activeConversationId: string | null }
   | { kind: 'clientKeysetPage'; input: ClientKeysetPageInput }
   | { kind: 'clientVisibleMessageHistoryPage'; input: ClientVisibleMessageHistoryPageInput }
@@ -454,7 +456,7 @@ export interface DatabaseWorkerDiagnostics extends DatabaseFoundationInspection 
 
 export type DatabaseWorkerResponse =
   | { type: 'ready'; workerThreadId: number; mode: DatabaseWorkerData['mode'] }
-  | ({ type: 'response'; id: number; ok: true; result: SnapshotBarrier<CurrentTurnTaskSnapshot> | SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<SelectedContextAuthoritySource> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
+  | ({ type: 'response'; id: number; ok: true; result: SingleResponseMeasurement | SnapshotBarrier<CurrentTurnTaskSnapshot> | SnapshotBarrier<ContextHandleEvidenceFrontier> | SnapshotBarrier<SelectedContextAuthoritySource> | SnapshotBarrier<NativePendingToolCall[] | NativeSteeringInFlightEntry[] | string[]> | SnapshotBarrier<AttachmentProjectionSegmentSnapshot | AttachmentProjectionLinksSnapshot> | ExecutionLeaseRenewalResult | RuntimeHistoryRepairResult | MergeModelAggregate[] | RuntimeCommitResult | ModelStreamEventCommitResult | ModelStreamActivityResult | ModelRequestCancelResult | ClientKeysetPageResult | ClientVisibleMessageHistoryPageResult | ClientCollaborationHistoryPageResult | ConversationHistoryProjectionResult | ProcessOutputRegistrationMismatch[] | EffectReceiptReconciliationCandidate[] | ChildConversationOriginCandidate[] | ChildProcessCleanupMaterializationCandidate[] | RuntimeContentUsageRow[] | RelocatedWorkInventory | SnapshotBarrier<ToolFactsSnapshot> | SnapshotBarrier<ConversationChildTaskFacts> | SnapshotBarrier<ClientProjectionSnapshot> | SnapshotBarrier<Array<DomainRow | DomainRow[] | null>> | SnapshotBarrier<DomainRow[]> | SnapshotBarrier<ContextMaterializationSnapshot> | SnapshotBarrier<ContextContentMaterializationSnapshot> | DatabaseWorkerDiagnostics | RuntimeMaintenanceCommitResult | RuntimeMaintenanceRollbackResult | RuntimeWalCheckpointResult | boolean | string | null;
       /**
        * Answer of a committed `transaction`: its RuntimeCommitResult is the `commit` message posted
        * right before this response (with this commitSeq) and `result` is null, so a large commit is

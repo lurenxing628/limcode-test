@@ -75,6 +75,7 @@ import {
   openAIResponsesNativeCapabilities,
   normalizeOpenAIResponsesNativeSettings
 } from '../../shared/openAIResponsesCapabilities';
+import { nativeSessionCapabilities } from '../../shared/nativeSessionCapabilities';
 import type { OpenAIResponsesNativeCapabilities } from '../../shared/openAIResponsesNative';
 import { NativeRequestSession } from './nativeRequestSession';
 import { NativeAsyncWorkPendingError, TOOL_CALL_EVENT_KIND_NATIVE_DELIVERY, parseNativeControlCheckpoint } from './nativeToolFacts';
@@ -1425,7 +1426,7 @@ export class ReliableAgentLoop {
       nativeResponses: normalizeOpenAIResponsesNativeSettings(modelRecord?.nativeResponses),
       ...(typeof thinking?.reasoningMode === 'string' ? { reasoningMode: thinking.reasoningMode } : {})
     });
-    if (!capabilities.asyncTools && !capabilities.steering && !capabilities.reasoningUpdates) {
+    if (!nativeSessionCapabilities(capabilities)) {
       return delivery;
     }
     const configuredEffort = typeof thinking?.thinkingLevel === 'string' && thinking.thinkingLevel !== 'not-set' && thinking.thinkingLevel !== 'non-set'
@@ -4185,18 +4186,7 @@ function isToolPause(
 function readFrozenNativeCapabilities(
   recipe: { [key: string]: PlainJsonValue }
 ): OpenAIResponsesNativeCapabilities | undefined {
-  const record = asRecord(recipe.nativeResponses);
-  if (!record) return undefined;
-  const capabilities: OpenAIResponsesNativeCapabilities = {
-    asyncTools: record.asyncTools === true,
-    steering: record.steering === true,
-    reasoningUpdates: record.reasoningUpdates === true,
-    multiplexing: record.multiplexing === true,
-    explicitCaching: record.explicitCaching === true
-  };
-  return capabilities.asyncTools || capabilities.steering || capabilities.reasoningUpdates
-    ? capabilities
-    : undefined;
+  return nativeSessionCapabilities(recipe.nativeResponses);
 }
 
 function readFrozenNativeLogicalBudget(

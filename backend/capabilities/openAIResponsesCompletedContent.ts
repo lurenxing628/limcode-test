@@ -1,5 +1,6 @@
 import type { LlmProviderKind } from '../../shared/protocol';
 import { isRecord } from './llmStreamEventProjection';
+import type { OpenAIResponsesToolCallArgumentDelta } from './openAIResponsesWebSocketSession';
 
 const installedFormats = new WeakSet<object>();
 
@@ -9,8 +10,9 @@ const installedFormats = new WeakSet<object>();
  * than reconstructing text or tools from raw protocol fields in each consumer.
  * https://platform.openai.com/docs/api-reference/responses-streaming/response/completed
  *
- * This adds a final aggregate only. It never fabricates deltas, native events or item-close
- * facts; the native decoder keeps sole ownership of those identities and admission rules.
+ * Full HTTP requests also pass through received tool-argument deltas for preview/timing. The
+ * SDK still owns argument assembly and completed calls; this never creates executable partial
+ * calls, native events or item-close facts. Summary-only WS decoding stays text-only.
  */
 export function installOpenAIResponsesCompletedContent<T>(
   provider: T,
@@ -29,8 +31,25 @@ export function installOpenAIResponsesCompletedContent<T>(
   const completedStates = new WeakSet<object>();
   format.decodeStreamChunk = (raw, state) => {
     const chunk = decodeStreamChunk(raw, state);
-    if (!isRecord(raw) || (raw.event ?? raw.type) !== 'response.completed'
-      || !isRecord(chunk) || chunk.error !== undefined || chunk.nativeEvent !== undefined
+    if (!isRecord(raw) || !isRecord(chunk)) return chunk;
+    const event = raw.event ?? raw.type;
+    if (!options.visibleTextOnly && event === 'response.function_call_arguments.delta'
+      && typeof raw.delta === 'string' && raw.delta.length > 0) {
+      // Reuse the SDK's item_id → call_id association, not a second tool-call accumulator.
+      const pendingCalls = isRecord(state) ? state.pendingFunctionCalls : undefined;
+      const itemId = raw.item_id ?? raw.id ?? raw.call_id;
+      const pending = pendingCalls instanceof Map ? pendingCalls.get(itemId) : undefined;
+      const callId = isRecord(pending) ? pending.callId ?? itemId : undefined;
+      if (typeof callId === 'string' && callId) {
+        const delta: OpenAIResponsesToolCallArgumentDelta = {
+          callId,
+          ...(typeof pending.name === 'string' ? { name: pending.name } : {}),
+          argumentsDelta: raw.delta
+        };
+        chunk.toolCallArgumentDeltas = [delta];
+      }
+    }
+    if (event !== 'response.completed' || chunk.error !== undefined || chunk.nativeEvent !== undefined
       || chunk.completedOutputItems !== undefined || Array.isArray(chunk.completedContents)) return chunk;
     const response = isRecord(raw.response) ? raw.response : raw;
     // Some compatible endpoints finish a correctly streamed response with output: []. That

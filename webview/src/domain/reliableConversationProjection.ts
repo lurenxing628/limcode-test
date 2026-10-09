@@ -1,3 +1,4 @@
+import { modelRequestObservedUsage, modelRequestObservedTiming } from '@shared/modelRequestMeasurement';
 import type {
   FunctionCallPart,
   InlineDataPart,
@@ -604,6 +605,9 @@ function appendTransientMessages(input: {
           ? { streamOutputDurationMs: transient.streamOutputDurationMs }
           : {})
       };
+      // Content may still be supplied by the transient overlay before detail hydration, but a
+      // terminal request's verified measurement/timing is already authoritative.
+      if (request?.status === 'terminal') applyModelRequestMetadata(durableTarget, request);
       continue;
     }
 
@@ -852,9 +856,7 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
   const turnId = text(request.turn_id);
   const model = text(request.model_id);
   const usageMetadata = usageMetadataFromRequest(request);
-  const streamStats = record(typeof request.stream_stats_json === 'string'
-    ? parseJson(request.stream_stats_json)
-    : request.stream_stats_json);
+  const streamStats = modelRequestObservedTiming(request);
   const providerStartedAt = timestamp(streamStats?.providerStartedAt);
   const firstChunkAt = timestamp(streamStats?.firstOutputAt);
   const completedAt = timestamp(streamStats?.completedAt);
@@ -889,9 +891,7 @@ function applyModelRequestMetadata(entry: ParsedMessage, request: ReliableClient
 }
 
 function usageMetadataFromRequest(request: ReliableClientRecord | undefined): LlmUsageMetadataRecord | undefined {
-  if (!request) return undefined;
-  const value = typeof request.usage_json === 'string' ? parseJson(request.usage_json) : request.usage_json;
-  return record(value) as LlmUsageMetadataRecord | undefined;
+  return modelRequestObservedUsage(request);
 }
 
 function compareParsedMessages(left: ParsedMessage, right: ParsedMessage): number {
@@ -1343,7 +1343,8 @@ export function modelRequestRetryForTurn(
   const turn = turns.find((candidate) => text(candidate.id) === turnId);
   if (!turn || turn.status !== 'terminated') return { blockedReason: '本轮尚未结束，请等待状态同步' };
   if (turns.some((candidate) => candidate.status === 'active')) {
-    return { blockedReason: '对话中还有任务正在执行，请先等待或停止它' };
+    // New work makes an older failure historical; do not prompt users to stop it for that error.
+    return {};
   }
   const termination = values(records.TurnTermination).filter((item) => text(item.turn_id) === turnId);
   if (termination.length !== 1 || termination[0].terminal_status !== 'failed') {

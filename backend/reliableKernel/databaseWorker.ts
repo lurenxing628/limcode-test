@@ -1,3 +1,4 @@
+import { executeSingleResponseMeasurement } from './singleResponseMeasurement';
 import { readNativePendingWork, readNativeSteeringInFlightSnapshot, readNativeAdmittedProviderCallIds } from './nativeWorkSnapshot';
 import { readCurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
 import { assertConversationContextHandleState, assertConversationContextHandleStateUpdate, assertContextRootHandleCatalog } from './conversationContextHandleStateInvariant';
@@ -532,6 +533,12 @@ async function start(): Promise<void> {
           commitSeq += 1n;
           post({ type: 'commit', result: result.commit });
         }
+        respond({ type: 'response', id: request.id, ok: true, result });
+        return;
+      }
+      if (request.kind === 'singleResponseMeasurement') {
+        assertDatabaseBinding(reader, data.binding);
+        const result = executeSingleResponseMeasurement(reader, clientProjectionContent, request.requestId, request.expectedIdentity);
         respond({ type: 'response', id: request.id, ok: true, result });
         return;
       }

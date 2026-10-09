@@ -1,3 +1,4 @@
+import { singleResponseMeasurement } from '../../shared/modelRequestMeasurement';
 import type { PlainData } from '../../shared/plainData';
 import { parseNativeResponseMetrics } from './nativeResponseMetrics';
 
@@ -58,6 +59,8 @@ export function projectModelRequestSummary(record: RecordData): RecordData {
       summary.stream_stats_json = projected;
     }
   }
+  const measurement = singleResponseMeasurement(record);
+  if (measurement) summary.single_response_measurement = measurement as unknown as PlainData;
   return summary;
 }
 

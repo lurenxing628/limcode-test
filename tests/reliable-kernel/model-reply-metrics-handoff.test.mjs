@@ -15,7 +15,7 @@ const { ReliableLlmProviderRegistry } = require(path.join(compiled, 'backend/rel
 const conversationId = 'metrics-handoff-conversation';
 const providerId = '20260925-120000-000-openai-compatible-provider-0123456';
 const modelId = 'gpt-6-astra';
-const nativeResponses = { enabled: true, asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false };
+const defaultNativeResponses = { enabled: true, asyncTools: true, steering: true, reasoningUpdates: true, multiplexing: false };
 const usage = {
   prompt_tokens: 537, completion_tokens: 111, total_tokens: 648,
   prompt_tokens_details: { cached_tokens: 500, audio_tokens: 0 },
@@ -25,7 +25,10 @@ const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 // No key or external service: use the production OpenAI-compatible decoder, capability, adapter,
 // control plane and SQLite writer against a loopback SSE endpoint. Never open the user's data root.
-async function openRuntime(provider) {
+async function openRuntime(provider, options = {}) {
+  const nativeResponses = Object.hasOwn(options, 'nativeResponses') ? options.nativeResponses : defaultNativeResponses;
+  const inputTokens = options.inputTokens ?? 537;
+  let firstOutputSentAt;
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-metrics-handoff-'));
   const timeline = [];
   const wireRequests = [];
@@ -43,12 +46,13 @@ async function openRuntime(provider) {
         content: [{ type: 'output_text', text: '已提交的普通回复', annotations: [] }] };
       send({ type: 'response.created', response: { id: responseId, status: 'in_progress', model: modelId, output: [] } });
       await delay(15);
+      firstOutputSentAt = Date.now();
       send({ type: 'response.output_text.delta', response_id: responseId, item_id: item.id, output_index: 0, content_index: 0, delta: '已提交的普通回复' });
       await delay(20);
       send({ type: 'response.output_item.done', response_id: responseId, output_index: 0, item });
       send({ type: 'response.completed', response: { id: responseId, status: 'completed', model: modelId, output: [item],
-        usage: { input_tokens: 537, output_tokens: 111, total_tokens: 648,
-          input_tokens_details: { cached_tokens: 500 }, output_tokens_details: { reasoning_tokens: 11 } } } });
+        ...(options.omitUsage ? {} : { usage: { input_tokens: inputTokens, output_tokens: 111, total_tokens: inputTokens + 111,
+          input_tokens_details: { cached_tokens: Math.min(500, inputTokens) }, output_tokens_details: { reasoning_tokens: 11 } } }) } });
       response.end('data: [DONE]\n\n');
       return;
     }
@@ -76,6 +80,28 @@ async function openRuntime(provider) {
         models: [{ id: modelId, name: modelId }], modelConfigs: [], generationConfig: {}, apiKey: 'local-fixture',
         baseUrl: `http://127.0.0.1:${endpoint.address().port}/v1` };
     } });
+    if (options.mislabelOrdinaryUsage) {
+      // Reproduce the released producer defect before persistence, not by editing terminal rows.
+      const resolve = providers.resolve.bind(providers);
+      providers.resolve = id => {
+        const adapter = resolve(id);
+        const decorate = controls => ({ ...controls, onEvent: event => controls.onEvent(event.kind === 'completed'
+          ? { ...event, usage: { ...event.usage, nativeChainBilling: true },
+              timing: { ...event.timing, firstOutputAt: event.timing.providerStartedAt } }
+          : event) });
+        return new Proxy(adapter, { get(target, key) {
+          const value = Reflect.get(target, key);
+          if (key === 'prepareFullRequest' && typeof value === 'function') return request => {
+            const prepared = value.call(target, request);
+            return prepared && { ...prepared, send: controls => prepared.send(decorate(controls)) };
+          };
+          if ((key === 'sendFullRequest' || key === 'sendFullRequestAsync') && typeof value === 'function') {
+            return (request, controls) => value.call(target, request, decorate(controls));
+          }
+          return typeof value === 'function' ? value.bind(target) : value;
+        } });
+      };
+    }
     const root = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(root);
     app = await kernel.ReliableKernelApplication.open(root, {
@@ -128,7 +154,7 @@ async function openRuntime(provider) {
         && frame.projections.activeTurnSummary.turns.some(turn => turn.id === result.turnId && turn.status === 'terminated')));
       return result;
     };
-    return { app, feed, connection, run, timeline, wireRequests, close };
+    return { app, feed, connection, run, timeline, wireRequests, close, get firstOutputSentAt() { return firstOutputSentAt; } };
   } catch (error) { await close(); throw error; }
 }
 
@@ -158,6 +184,7 @@ async function openWebview() {
     const { useReliableKernelClientFeedStore } = await server.ssrLoadModule('/src/stores/useReliableKernelClientFeedStore.ts');
     const { projectReliableConversation } = await server.ssrLoadModule('/src/domain/reliableConversationProjection.ts');
     const { modelRunMetrics } = await server.ssrLoadModule('/src/components/conversation/runMetricsModel.ts');
+    const { observeContextInput } = await server.ssrLoadModule('/src/components/conversation/contextUsageModel.ts');
     const { default: MessageItem } = await server.ssrLoadModule('/src/components/conversation/MessageItem.vue');
     globalThis.document = { documentElement: { clientWidth: 1280, clientHeight: 800 } };
     const active = pinia.createPinia();
@@ -168,7 +195,7 @@ async function openWebview() {
     const render = message => renderToString(createSSRApp(MessageItem, {
       message, floorNumber: project().absoluteFloorByMessageId[message.id], detailReady: true
     }).use(active));
-    return { store, project, render, modelRunMetrics, posted, close };
+    return { store, project, render, modelRunMetrics, observeContextInput, posted, close };
   } catch (error) { await close(); throw error; }
 }
 
@@ -273,4 +300,116 @@ for (const provider of ['openai-compatible', 'openai-responses']) test(`${provid
   assert.deepEqual(historical.usageMetadata, after.usageMetadata);
   assert.deepEqual(view.modelRunMetrics(historical, false), metrics);
   assert.match(await view.render(historical), /message-floor-index[^>]*>#2</);
+});
+
+
+for (const [label, nativeResponses] of [['未配置原生', undefined], ['明确关闭原生', { enabled: false }]]) {
+  test(`第三方 Responses HTTP ${label}：完整 usage 不能误标原生链，显示及压缩保留实测`, async t => {
+    const runtime = await openRuntime('openai-responses', { nativeResponses, inputTokens: 120_000 });
+    t.after(() => runtime.close());
+    const view = await openWebview();
+    t.after(() => view.close());
+    await runtime.run();
+    const frames = [];
+    await runtime.feed.connect({ activeConversationId: conversationId, send(frame) { frames.push(frame); } });
+    view.store.observe(frames[0]);
+    const request = Object.values(view.store.records.ModelRequest)[0];
+    const usage = parse(request.usage_json);
+    const stats = parse(request.stream_stats_json);
+    assert.equal(runtime.wireRequests.length, 1);
+    assert.equal(usage.promptTokenCount, 120_000);
+    assert.equal(usage.candidatesTokenCount, 111);
+    assert.notEqual(usage.nativeChainBilling, true, '生命周期事件不意味着执行了原生多响应链');
+    assert.equal(stats.nativeLatestResponseUsage, undefined, '普通执行不伪造原生会话的指标');
+    assert.ok(stats.firstOutputAt >= runtime.firstOutputSentAt, 'response.created 不是首次模型输出');
+    const rootId = await runtime.app.context.currentHeadRootId(conversationId);
+    assert.equal(view.observeContextInput({ native: false, usage, streamStats: stats, currentRootId: rootId }).tokens, 120_000);
+    const message = view.project().messages.find(message => message.role === 'model');
+    const metrics = view.modelRunMetrics(message, false);
+    assert.ok(metrics.ttftMs >= 0 && metrics.outputDurationMs > 0 && metrics.tokenSpeed > 0);
+    const decision = await runtime.app.compression.evaluate(rootId, request.authority_snapshot_id,
+      request.settings_snapshot_object_id ?? undefined);
+    assert.equal(decision.source, 'provider-observed-delta');
+    assert.ok(decision.estimatedTokens >= 120_000);
+    assert.equal(decision.shouldCompress, true, '120k 实测超过100k阈值，不能丢弃实测退回小额估算');
+  });
+}
+
+
+test('历史误标单响应经冻结证据只读恢复：重载、历史页、首输出和压缩一致，原始行不变', async t => {
+  const runtime = await openRuntime('openai-responses', {
+    nativeResponses: undefined, inputTokens: 120_000, mislabelOrdinaryUsage: true
+  });
+  t.after(() => runtime.close());
+  const view = await openWebview();
+  t.after(() => view.close());
+  const { turnId } = await runtime.run();
+  const [raw] = (await runtime.app.database.snapshotAll(kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').list({
+    where: { turn_id: turnId }, limit: 2, orderBy: { column: 'id', direction: 'asc' }
+  }))).snapshot;
+  const before = structuredClone(raw);
+  assert.equal(raw.usage_json.nativeChainBilling, true);
+  assert.equal(raw.stream_stats_json.nativeResponseMetrics, undefined);
+  const frames = [];
+  await runtime.feed.connect({ activeConversationId: conversationId, send(frame) { frames.push(frame); } });
+  view.store.observe(frames[0]);
+  const request = view.store.records.ModelRequest[raw.id];
+  assert.equal(request.usage_json.nativeChainBilling, true, '原始计费事实不能被读投影重写');
+  if (!request.single_response_measurement) {
+    const facts = await runtime.app.database.snapshot([
+      kernel.DOMAIN_REPOSITORIES.domain('ModelStreamCheckpoint').list({ where: { model_request_id: raw.id, checkpoint_kind: 'native_control' }, limit: 3 }),
+      kernel.DOMAIN_REPOSITORIES.domain('ModelStreamFence').list({ where: { model_request_id: raw.id }, limit: 1 }),
+      kernel.DOMAIN_REPOSITORIES.domain('ContentObject').get(raw.recipe_object_id)
+    ]);
+    const proof = [];
+    for (const checkpoint of facts.snapshot[0]) {
+      const metadata = (await runtime.app.database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('ContentObject').get(checkpoint.content_object_id)])).snapshot[0];
+      proof.push(JSON.parse((await runtime.app.contentStore.read(metadata)).toString('utf8')));
+    }
+    t.diagnostic(JSON.stringify({ stats: raw.stream_stats_json, fence: facts.snapshot[1], proof,
+      recipe: JSON.parse((await runtime.app.contentStore.read(facts.snapshot[2])).toString('utf8')) }, (_key, value) => typeof value === 'bigint' ? value.toString() : value));
+  }
+  assert.equal(request.single_response_measurement?.inputTokens, 120_000);
+  const message = view.project().messages.find(message => message.role === 'model');
+  assert.equal(message.usageMetadata.nativeChainBilling, false, '消费者只在已核验投影上解释单响应语义');
+  const metrics = view.modelRunMetrics(message, false);
+  assert.ok(message.firstChunkAt >= runtime.firstOutputSentAt);
+  assert.ok(metrics.outputDurationMs > 0 && metrics.tokenSpeed > 0);
+  const rootId = await runtime.app.context.currentHeadRootId(conversationId);
+  const decision = await runtime.app.compression.evaluate(rootId, raw.authority_snapshot_id,
+    raw.settings_snapshot_object_id ?? undefined);
+  assert.equal(decision.source, 'provider-observed-delta');
+  assert.equal(decision.shouldCompress, true);
+  const history = await new kernel.ClientHistoryReader(runtime.app.database).backwardVisibleMessages({
+    conversationId, limit: 20, beforeMessageSeq: '100', beforeId: 'history-upper-bound'
+  });
+  assert.deepEqual(history.records.ModelRequest.find(row => row.id === raw.id).single_response_measurement,
+    request.single_response_measurement);
+  const after = (await runtime.app.database.snapshot([kernel.DOMAIN_REPOSITORIES.domain('ModelRequest').get(raw.id)])).snapshot[0];
+  assert.deepEqual(after, before, '只读恢复不得更新请求、终态计量或时间');
+  // Delete the fixture's Conversation through the writer. Stream checkpoint deletion itself is
+  // protected; do not bypass that invariant just to test evidence invalidation.
+  await runtime.app.database.transaction([kernel.DOMAIN_REPOSITORIES.domain('Conversation').delete(conversationId)]);
+  assert.equal(await runtime.app.database.singleResponseMeasurement(raw), undefined);
+});
+
+
+for (const omitUsage of [false, true]) test(`普通 Responses ${omitUsage ? '缺失usage' : '输入为零'}仍保留独立计时，不伪造计量`, async t => {
+  const runtime = await openRuntime('openai-responses', { nativeResponses: undefined, inputTokens: 0, omitUsage });
+  t.after(() => runtime.close());
+  const view = await openWebview(); t.after(() => view.close());
+  await runtime.run();
+  const frames = [];
+  await runtime.feed.connect({ activeConversationId: conversationId, send(frame) { frames.push(frame); } });
+  view.store.observe(frames[0]);
+  const request = Object.values(view.store.records.ModelRequest)[0];
+  const usage = parse(request.usage_json) ?? undefined;
+  assert.notEqual(usage?.nativeChainBilling, true);
+  assert.equal(view.observeContextInput({ native: false, usage, streamStats: request.stream_stats_json }).tokens,
+    omitUsage ? undefined : 0);
+  const message = view.project().messages.find(message => message.role === 'model');
+  const metrics = view.modelRunMetrics(message, false);
+  assert.ok(metrics.ttftMs >= 0 && metrics.outputDurationMs > 0);
+  if (omitUsage) assert.equal(metrics.tokenSpeed, undefined);
+  else assert.ok(metrics.tokenSpeed > 0);
 });

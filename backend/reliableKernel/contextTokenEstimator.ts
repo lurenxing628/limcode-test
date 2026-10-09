@@ -1,3 +1,5 @@
+import { modelRequestObservedUsage } from '../../shared/modelRequestMeasurement';
+import { needsSingleResponseMeasurement } from './singleResponseMeasurement';
 import { providerRequestToolDefinitions } from './frozenToolDefinitions';
 import type { ReliableAgentToolDefinition } from './agentLoop';
 import type { MessageContent } from '../../shared/protocol';
@@ -224,6 +226,10 @@ export class ReliableContextTokenEstimator {
       ).sort(compareRequestsNewestFirst);
 
       for (const request of requests) {
+        const measurement = needsSingleResponseMeasurement(request)
+          ? await this.database.singleResponseMeasurement(request) : undefined;
+        const observedUsage = modelRequestObservedUsage(measurement
+          ? { ...request, single_response_measurement: measurement } : request);
         const calibration = nativePromptCalibration(request.stream_stats_json);
         // A native logical ModelRequest spans multiple physical responses whose usage_json is
         // cumulative billing; only the FIRST physical response's prompt count calibrates the
@@ -231,7 +237,7 @@ export class ReliableContextTokenEstimator {
         // all rather than an invalid aggregate. Other providers keep the usage_json anchor.
         const input = calibration.native
           ? calibration.promptTokens
-          : providerPromptTokens(request.usage_json);
+          : providerPromptTokens(observedUsage);
         if (input === undefined) continue;
         const requestId = requireId(request.id, 'ModelRequest.id');
         const related = await this.database.snapshot([
@@ -264,7 +270,7 @@ export class ReliableContextTokenEstimator {
         const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
         if (outputSegmentId && current[anchor.coveredSegmentCount]?.segmentId === outputSegmentId) {
           anchor.outputSegmentIndex = anchor.coveredSegmentCount;
-          anchor.totalTokens = calibration.native ? undefined : providerTotalTokens(request.usage_json);
+          anchor.totalTokens = calibration.native ? undefined : providerTotalTokens(observedUsage);
           anchor.coveredSegmentCount += 1;
         }
         return anchor;

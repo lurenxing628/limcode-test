@@ -1,3 +1,5 @@
+import type { SingleResponseMeasurement } from '../../shared/modelRequestMeasurement';
+import { needsSingleResponseMeasurement, singleResponseMeasurementIdentity } from './singleResponseMeasurement';
 import type { NativePendingToolCall, NativePendingWorkInput, NativeSteeringInFlightEntry } from './nativeWorkTypes';
 import type { CurrentTurnTaskSnapshot } from './currentTurnTaskSnapshot';
 import type { AttachmentProjectionSegmentSnapshot, AttachmentProjectionLinksSnapshot } from './attachmentProjectionSnapshot';
@@ -531,6 +533,16 @@ export class RuntimeDatabase {
     onCommit: (result: RuntimeCommitResult) => void
   ): Promise<SnapshotSubscription<Array<DomainRow | DomainRow[] | null>>> {
     return this.barrierAndSubscribe(() => this.snapshot(reads), onCommit);
+  }
+
+  /** Read-only verified interpretation; original ModelRequest and CAS facts are untouched. */
+  public async singleResponseMeasurement(request: DomainRow): Promise<SingleResponseMeasurement | undefined> {
+    if (!needsSingleResponseMeasurement(request)) return undefined;
+    const result = await this.request<SingleResponseMeasurement | null>({
+      kind: 'singleResponseMeasurement', requestId: String(request.id),
+      expectedIdentity: singleResponseMeasurementIdentity(request)
+    });
+    return result ?? undefined;
   }
 
   public async clientProjectionSnapshot(
@@ -1282,7 +1294,7 @@ function databaseMetricRequestKind(
   kind: DatabaseWorkerRequestPayload['kind']
 ): RuntimeDatabaseMetricRequestKind {
   if (kind === 'nativePendingWork' || kind === 'nativeSteeringInFlight' || kind === 'nativeAdmittedProviderCallIds') return 'snapshot';
-  if (kind === 'selectedContextAuthoritySource') return 'snapshot';
+  if (kind === 'selectedContextAuthoritySource' || kind === 'singleResponseMeasurement') return 'snapshot';
   // Historical Message pages are the backwards/keyset form of the existing bounded page metric.
   if (kind === 'clientVisibleMessageHistoryPage' || kind === 'clientCollaborationHistoryPage') return 'clientKeysetPage';
   // The conversation pending-work probe, the domain row count and the carried-work inventory are one

@@ -524,6 +524,7 @@ export class NativePhysicalUsageAccumulator {
   private currentResponseId?: string;
 
   public get started(): boolean { return this.currentResponseId !== undefined; }
+  public get responseCount(): number { return this.usageByResponse.size; }
 
   public beginResponse(responseId: string): boolean {
     if (typeof responseId !== 'string' || responseId.trim().length === 0) {

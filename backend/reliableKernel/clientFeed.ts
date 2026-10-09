@@ -1,3 +1,4 @@
+import { needsSingleResponseMeasurement } from './singleResponseMeasurement';
 import { AcceptedAnswerTextPages } from './acceptedAnswerTextPages';
 import { CHILD_ANSWER_SOURCE_DELETED_CONTENT_TYPE } from './deliverySettlementSteps';
 import { randomUUID } from 'node:crypto';
@@ -336,6 +337,13 @@ export class BoundedClientFeed {
     // A successful Operation may be durable before an earlier tool lets the ordered terminal
     // writer emit ToolOutcome. Probe calls outside the live window by their committed identity.
     const taskCandidates = committedTaskToolCandidates(commit.changes);
+    // Imported terminal rows may carry the erroneous single-response chain label. Interpret
+    // them at the bounded snapshot boundary, not by doing CAS I/O inside this sync commit listener.
+    if (scoped.changes.some(change => change.domain === 'ModelRequest' && change.record
+      && needsSingleResponseMeasurement(change.record))) {
+      this.enterSnapshotRequired(session, 'commit_scope');
+      return;
+    }
     if (scoped.requiresSnapshot || this.refreshForCommittedTaskCandidates(session, taskCandidates)) {
       this.enterSnapshotRequired(session, scoped.requiresSnapshot ? 'commit_scope' : 'task_candidate');
       return;

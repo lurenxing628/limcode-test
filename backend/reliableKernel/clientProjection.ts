@@ -1,3 +1,4 @@
+import { singleResponseMeasurementReader } from './singleResponseMeasurement';
 import { canonicalAnswerPresentations } from './answerPresentation';
 import { readTimelineWindow, canonicalDeliveryTimelineLinks, type TimelineWindow } from './clientTimelineHistory';
 import { normalizeCollaborationHistoryCursor } from './collaborationHistoryCursor';
@@ -1223,7 +1224,7 @@ export function executeClientProjectionSnapshot(
         executionLeases: leases,
         turnTerminations: terminations,
         turnExecutorLinks: executorLinks,
-        modelRequests,
+        modelRequests: singleResponseMeasurementReader(database, content).project(modelRequests),
         modelContextProjections,
         modelRequestMessageLinks
       },
@@ -2500,7 +2501,7 @@ function buildClientVisibleMessageHistoryRecords(
   ])];
   const modelRequests = queryAllByIds(database, 'model_request', 'id', requestIds)
     .sort(compareModelRequestRows);
-  include('ModelRequest', modelRequests);
+  include('ModelRequest', singleResponseMeasurementReader(database, content).project(modelRequests));
   include('ModelContextProjection', queryAllByIds(
     database,
     'model_context_projection',
