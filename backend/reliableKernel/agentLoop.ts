@@ -3155,7 +3155,10 @@ export class ReliableAgentLoop {
           || request.terminal_state === NATIVE_CHAIN_REBASED_TERMINAL_STATE))
     ) return undefined;
 
-    const checkpoints = await this.list('ModelStreamCheckpoint', { model_request_id: modelRequestId }, 512);
+    const checkpoints = await this.list('ModelStreamCheckpoint', {
+      model_request_id: modelRequestId,
+      checkpoint_kind: 'partial_summary'
+    }, 512);
     const partialCheckpoints = checkpoints.filter((row) => row.checkpoint_kind === 'partial_summary');
     if (partialCheckpoints.length === 0) return undefined;
     const stats = asRecord(request.stream_stats_json);

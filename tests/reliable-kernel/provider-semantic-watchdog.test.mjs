@@ -2232,7 +2232,9 @@ test('总期限和非用户 AbortError 都可替换部分输出，真正用户�
       // otherwise that callback loses authority before it can issue the intended user abort.
       const schedule = globalThis.setTimeout;
       const deadlines = [];
+      const observedTimeouts = [];
       subtest.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
+        observedTimeouts.push(milliseconds);
         if (milliseconds !== 80) return schedule(callback, milliseconds, ...args);
         const handle = schedule(() => {}, 2 ** 31 - 1);
         handle.unref();
@@ -2244,6 +2246,14 @@ test('总期限和非用户 AbortError 都可替换部分输出，真正用户�
         calls += 1;
         if (calls > 1) return controls.onEvent({ kind: 'completed', streamSeq: '1', content: modelContent('recovered') });
         await controls.onEvent({ kind: 'output_delta', streamSeq: '1', content: { type: 'text_delta', text: 'partial' } });
+        if (scenario === 'user_abort') {
+          controls.onFailedPartialOutput?.({
+            kind: 'output_item_done',
+            streamSeq: '2',
+            semanticProgress: false,
+            content: { type: 'partial_output_snapshot', message: modelContent('partial') }
+          });
+        }
         if (scenario === 'sdk_abort') throw Object.assign(new Error('socket hang up'), { name: 'AbortError' });
         if (scenario === 'user_abort') caller.abort();
         if (scenario === 'deadline') {
@@ -2259,6 +2269,8 @@ test('总期限和非用户 AbortError 都可替换部分输出，真正用户�
         assert.equal(calls, 1);
         assert.equal(caller.signal.aborted, true);
         assert.match((await get(app, 'ModelRequest', created.modelRequestId)).terminal_state, /cancelled/);
+        assert.ok(observedTimeouts.includes(750), 'user cancellation uses the short partial-output deadline');
+        assert.equal(observedTimeouts.includes(5_000), false, 'user cancellation does not wait for the generic failure deadline');
       } else {
         assert.equal((await run).terminalState, 'completed');
         assert.equal(calls, 2);

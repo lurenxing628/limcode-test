@@ -402,6 +402,13 @@ const DEFAULT_PROVIDER_ACTIVITY_HEARTBEAT_MS = 5_000;
 const DEFAULT_COMPRESSION_COMPLETION_TIMEOUT_MS = 4.5 * 60 * 1_000;
 const DEFAULT_PROVIDER_RETRY_DELAYS_MS = [500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000] as const;
 const DEFAULT_ADAPTER_DRAIN_TIMEOUT_MS = 1_000;
+/**
+ * Display-only partial output is best effort during user cancellation. Waiting several seconds for
+ * this secondary transcript decoration keeps the authoritative ModelRequest/Turn cancellation
+ * behind a slow CAS/SQLite write, even though the transport has already been aborted.
+ */
+const USER_CANCELLED_PARTIAL_OUTPUT_FINALIZATION_TIMEOUT_MS = 750;
+const DEFAULT_PARTIAL_OUTPUT_FINALIZATION_TIMEOUT_MS = 5_000;
 
 export interface ProviderSemanticTimeouts {
   firstSemanticMs: number;
@@ -1471,7 +1478,12 @@ export class ModelProviderControlPlane {
           const handoff = handoffReason(controller.signal);
           if (handoff) throw handoff;
           const close = () => this.finalizeFailedPartialOutput(
-            modelRequestId, identity, failedPartialOutput, abortError()
+            modelRequestId,
+            identity,
+            failedPartialOutput,
+            abortError(),
+            undefined,
+            USER_CANCELLED_PARTIAL_OUTPUT_FINALIZATION_TIMEOUT_MS
           );
           return executionFence ? runWithExecutionLeaseFence(executionFence, close) : close();
         });
@@ -1822,7 +1834,8 @@ export class ModelProviderControlPlane {
     identity: StreamIdentity,
     event: ProviderOutputStreamEvent | undefined,
     failure: unknown,
-    callerSignal?: AbortSignal
+    callerSignal?: AbortSignal,
+    timeoutMs = DEFAULT_PARTIAL_OUTPUT_FINALIZATION_TIMEOUT_MS
   ): Promise<void> {
     if (!event) return;
     const controller = new AbortController();
@@ -1839,11 +1852,13 @@ export class ModelProviderControlPlane {
           identity.socketGeneration, event, { beforeSubmit }), { signal: controller.signal }),
         new Promise<never>((_, reject) => {
           timer = setTimeout(() => {
-            const error = new Error('Provider partial-output finalization exceeded its 5 second deadline.');
+            const error = new Error(
+              `Provider partial-output finalization exceeded its ${timeoutMs}ms deadline.`
+            );
             timedOut = true;
             controller.abort(error);
             reject(error);
-          }, 5_000);
+          }, timeoutMs);
         })
       ]);
     } catch (error) {
