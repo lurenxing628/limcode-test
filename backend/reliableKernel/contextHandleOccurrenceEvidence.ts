@@ -144,16 +144,25 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
     const unit: SegmentEvidence = { id: segmentId, kind: id(segment.segment_kind), contentId: id(segment.content_object_id),
       occurrences: [], producerIds: [] };
     if (segment.segment_kind === 'compression') {
-      const owned: DomainRow[] = [];
+      const blocks: DomainRow[] = [];
       for (const source of sources) {
         if (source.source_kind !== 'compression_block' || BigInt(String(source.source_revision)) !== 0n) {
           throw invalid('Compression has an invalid immutable source selector.');
         }
         const block = await reader.maybe('CompressionBlock', id(source.source_id));
-        if (block?.conversation_id === conversationId) owned.push(block);
+        if (block) blocks.push(block);
+      }
+      let owned = blocks.filter(block => block.conversation_id === conversationId);
+      if (!owned.length) {
+        // Published early forks shared their ancestor's block as well as its summary segment.
+        // Prefer the nearest recorded ancestor; unrelated forks sharing this segment are not sources.
+        for (const ancestor of (await reader.branchScopes(conversationId)).slice(1)) {
+          owned = blocks.filter(block => block.conversation_id === ancestor);
+          if (owned.length) break;
+        }
       }
       if (owned.length !== 1 || owned[0].summary_object_id !== segment.content_object_id) {
-        throw invalid('Compression has no unique Conversation-owned source block.');
+        throw invalid(`Compression segment ${segmentId} has no unique source block for Conversation ${conversationId} or its branch ancestors.`);
       }
       const block = owned[0];
       const children = (await reader.list('CompressionBlockSource', { compression_block_id: block.id }))
@@ -232,8 +241,9 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
     for (let cursor = low; cursor < producerPositions.length; cursor++) {
       const producer = producerPositions[cursor];
       const requestId = producer.requestId ?? (producer.compressionBlock
-        ? (await reader.compressionRequest(producer.compressionBlock, conversationId))?.request.id as string | undefined : undefined);
-      if (requestId && await reader.requestContainsSegment(requestId, segment.id, conversationId)) {
+        ? (await reader.compressionRequest(producer.compressionBlock, id(producer.compressionBlock.conversation_id)))?.request.id as string | undefined : undefined);
+      const producerConversationId = producer.compressionBlock ? id(producer.compressionBlock.conversation_id) : conversationId;
+      if (requestId && await reader.requestContainsSegment(requestId, segment.id, producerConversationId)) {
         return [(await reader.request(requestId)).catalog];
       }
       await yieldToEventLoop();
@@ -257,12 +267,12 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
     const lookups = await consumingCatalog(segment, index);
     const content = await reader.content(segment.contentId);
     if (segment.compressionBlock) {
-      const compression = await reader.compressionRequest(segment.compressionBlock, conversationId);
+      const compression = await reader.compressionRequest(segment.compressionBlock, id(segment.compressionBlock.conversation_id));
       if (compression) {
         lookups.push(compression.catalog);
         if (compression.catalog.identityContractRevision === undefined) {
           const legacy = await readHistoricalCompressionHandleCatalog(database, store, {
-            recipe: compression.recipe, requestId: id(compression.request.id), conversationId
+            recipe: compression.recipe, requestId: id(compression.request.id), conversationId: compression.conversationId
           });
           if (legacy) facts.add(legacy);
         }
@@ -779,8 +789,7 @@ class OccurrenceReader {
     this.compressionRequestIds.set(id(block.id), matches[0] ? id(matches[0].request.id) : null);
     return matches[0];
   }
-  private async matchesCopy(conversationId: string, kind: string, frozenId: string, actualId: string): Promise<boolean> {
-    if (frozenId === actualId) return true;
+  public branchScopes(conversationId: string): Promise<string[]> {
     let scopes = this.scopes.get(conversationId);
     if (!scopes) {
       scopes = (async () => {
@@ -801,7 +810,11 @@ class OccurrenceReader {
       })();
       this.scopes.set(conversationId, scopes);
     }
-    const known = await scopes;
+    return scopes;
+  }
+  private async matchesCopy(conversationId: string, kind: string, frozenId: string, actualId: string): Promise<boolean> {
+    if (frozenId === actualId) return true;
+    const known = await this.branchScopes(conversationId);
     for (let count = 1; count <= known.length; count++) {
       const copied = known.slice(0, count).reverse().reduce((value, scope) => conversationForkSnapshotCopyId(scope, kind, value), frozenId);
       if (copied === actualId) return true;

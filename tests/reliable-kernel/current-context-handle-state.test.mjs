@@ -247,3 +247,79 @@ test('P3520 follows the selected retry branch and exact-prefix restoration reuse
   assert.deepEqual(restored.catalog.entries, [a]); assert.equal(restored.requiresNativeReset, true);
   assert.equal(f.metrics.historicalFrontiers, 0);
 });
+
+async function inheritedCompressionFixture(owner = 'parent') {
+  const f = await legacyFixture(1);
+  const put = (id, text, content_type = 'text/plain') => {
+    const bytes = Buffer.from(text);
+    f.shared.contents.set(id, bytes);
+    f.table('ContentObject').push({ id, content_type, byte_length: BigInt(bytes.length) });
+  };
+  f.table('Conversation').push({ id: 'parent' });
+  f.table('ConversationBranchLink').push({ id: 'branch', target_conversation_id: 'conversation', source_conversation_id: 'parent' });
+  put('inherited-input', 'P2');
+  f.table('ContextSegment').push({ id: 'inherited-input', segment_kind: 'runtime_context', content_object_id: 'inherited-input' });
+  f.table('ContextSequenceNode').push({ id: 'inherited-input-node', segment_id: 'inherited-input', parent_node_id: 'node-0' });
+  f.table('ContextSequenceRoot').push({ ...f.table('ContextSequenceRoot')[0], id: 'compression-source-root',
+    conversation_id: owner, root_node_id: 'inherited-input-node', segment_count: 2n });
+  const blockId = 'inherited-block';
+  put('summary', 'Inherited summary keeps P2');
+  put('compression-recipe', JSON.stringify({ kind: 'reliable-context-compression', blockId,
+    modelHandleCatalog: catalog(processHandle(2)) }), 'application/json');
+  f.table('Turn').push({ id: 'compression-turn', conversation_id: owner, status: 'terminated' });
+  f.table('AuthoritySnapshot').push({ id: 'compression-authority', turn_id: 'compression-turn' });
+  f.table('ModelRequest').push({ id: 'compression-request', turn_id: 'compression-turn',
+    authority_snapshot_id: 'compression-authority', recipe_object_id: 'compression-recipe',
+    stream_stats_json: { compressionPurpose: { blockId } } });
+  f.table('ModelContextProjection').push({ id: 'compression-input', owner_kind: 'model_request',
+    owner_id: 'compression-request', root_id: 'compression-source-root' });
+  f.table('CompressionBlock').push({ id: blockId, conversation_id: owner, authority_snapshot_id: 'compression-authority', summary_object_id: 'summary' });
+  for (const [position, segment_id] of ['segment-0', 'inherited-input'].entries()) {
+    f.table('CompressionBlockSource').push({ id: `block-source-${position}`, compression_block_id: blockId, segment_id, position: BigInt(position) });
+  }
+  f.table('ContextSegment').push({ id: 'summary', segment_kind: 'compression', content_object_id: 'summary' });
+  f.table('ContextSegmentSource').push({ id: 'summary-source', segment_id: 'summary', source_kind: 'compression_block', source_id: blockId, source_revision: 0n });
+  f.table('ContextSequenceNode').push({ id: 'summary-node', parent_node_id: null, segment_id: 'summary' });
+  Object.assign(f.table('ContextSequenceRoot')[0], { root_node_id: 'summary-node', segment_count: 1n });
+  return f;
+}
+
+for (const owner of ['parent', 'conversation']) test(`引用目录升级保留${owner === 'parent' ? '早期父会话共享' : '分支独立'}压缩块的原始引用`, async () => {
+  const f = await inheritedCompressionFixture(owner);
+  const before = structuredClone(f.table('CompressionBlock'));
+  assert.deepEqual(await upgradePendingConversationContextHandles(f.database, f.store), []);
+  assert.deepEqual((await readConversationContextHandleState(f.database, f.store, 'conversation')).catalog.entries,
+    [processHandle(1), processHandle(2)]);
+  assert.deepEqual(f.table('CompressionBlock'), before, '只重建目录，不改写历史压缩块');
+});
+
+test('早期多层分支沿祖先链读取压缩块，但不会采用共享摘要的无关会话块', async () => {
+  const f = await inheritedCompressionFixture();
+  f.table('ConversationBranchLink')[0].source_conversation_id = 'middle';
+  f.table('ConversationBranchLink').push({ id: 'middle-branch', target_conversation_id: 'middle', source_conversation_id: 'parent' });
+  f.table('CompressionBlock').push({ id: 'unrelated-block', conversation_id: 'unrelated', summary_object_id: 'summary' });
+  f.table('ContextSegmentSource').push({ id: 'unrelated-source', segment_id: 'summary', source_kind: 'compression_block', source_id: 'unrelated-block', source_revision: 0n });
+  assert.deepEqual(await upgradePendingConversationContextHandles(f.database, f.store), []);
+  assert.deepEqual((await readConversationContextHandleState(f.database, f.store, 'conversation')).catalog.entries,
+    [processHandle(1), processHandle(2)]);
+});
+
+for (const damage of ['unrelated', 'duplicate', 'summary']) test(`压缩来源${damage}不会被分支兼容吞掉，后续会话仍能升级`, async () => {
+  const f = await inheritedCompressionFixture();
+  if (damage === 'unrelated') f.table('CompressionBlock')[0].conversation_id = 'unrelated';
+  if (damage === 'summary') f.table('CompressionBlock')[0].summary_object_id = 'different';
+  if (damage === 'duplicate') {
+    f.table('CompressionBlock').push({ ...f.table('CompressionBlock')[0], id: 'duplicate' });
+    f.table('ContextSegmentSource').push({ ...f.table('ContextSegmentSource').find(row => row.segment_id === 'summary'), id: 'duplicate-source', source_id: 'duplicate' });
+  }
+  f.table('Conversation').push({ id: 'healthy', title: 'Healthy' });
+  await f.database.transaction(state.pendingConversationContextHandleStateSteps('healthy', now));
+  const failures = await upgradePendingConversationContextHandles(f.database, f.store);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].conversationId, 'conversation');
+  assert.equal(failures[0].error.code, 'MODEL_CONTEXT_HANDLE_STATE_INVALID');
+  assert.match(failures[0].error.message, /summary.*conversation/);
+  assert.equal(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN).find(row => row.conversation_id === 'conversation').state, 'pending');
+  assert.equal(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN).find(row => row.conversation_id === 'healthy').state, 'ready');
+  assert.deepEqual(await upgradePendingConversationContextHandles(f.database, f.store, { skipConversationIds: new Set(['conversation']) }), []);
+});

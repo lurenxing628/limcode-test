@@ -1,5 +1,4 @@
-import { readConversationContextHandleStateRow } from '../../reliableKernel/conversationContextHandleState';
-import { listPendingContextHandleUpgrades, upgradePendingConversationContextHandles, upgradeConversationContextHandles } from '../../reliableKernel/conversationContextHandleUpgrade';
+import { upgradeContextHandlesWithProgress } from './contextHandleUpgradeNotification';
 import { createRuntimeDeliveryWakeHandler } from './runtimeDeliveryWakeHandler';
 import * as vscode from 'vscode';
 import { EXTENSION_USER_AGENT } from '../../../shared/extensionIdentity';
@@ -894,49 +893,4 @@ export function freezableClaimProbe(
   return async (conversationId) => (
     executionGate.frozen === 0 || (executionGate.owned ? executionGate.owned.has(conversationId) : owners.owns(conversationId))
   ) && await eligible(conversationId);
-}
-
-
-const contextHandleUpgradeNotifications = new WeakMap<ReliableKernelApplication, Map<string, Promise<void>>>();
-
-/** The one-time history pass is a visible cancellable recovery phase, never hidden in send preparation. */
-function upgradeContextHandlesWithProgress(application: ReliableKernelApplication, signal?: AbortSignal, conversationId?: string): Promise<void> {
-  let notifications = contextHandleUpgradeNotifications.get(application);
-  if (!notifications) { notifications = new Map(); contextHandleUpgradeNotifications.set(application, notifications); }
-  const key = conversationId ?? '*';
-  const existing = notifications.get(key);
-  if (existing) return existing;
-  const job = (async () => {
-    if (conversationId ? (await readConversationContextHandleStateRow(application.database, conversationId)).state === 'ready'
-      : (await listPendingContextHandleUpgrades(application.database)).length === 0) return;
-    await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification,
-      title: 'LimCode：升级对话引用目录（仅一次，可取消后继续）', cancellable: true }, async (progress, token) => {
-      const controller = new AbortController();
-      const abort = () => controller.abort(signal?.reason ?? Object.assign(
-        new Error('对话引用目录升级已取消，下次可继续。'), { name: 'AbortError' }));
-      const cancellation = token.onCancellationRequested(abort);
-      signal?.addEventListener('abort', abort, { once: true });
-      if (signal?.aborted || token.isCancellationRequested) abort();
-      let reportedAt = 0;
-      try {
-        const upgrade = conversationId
-          ? (options: Parameters<typeof upgradePendingConversationContextHandles>[2]) => upgradeConversationContextHandles(application.database, application.contentStore, conversationId, options)
-          : (options: Parameters<typeof upgradePendingConversationContextHandles>[2]) => upgradePendingConversationContextHandles(application.database, application.contentStore, options);
-        await upgrade({
-          signal: controller.signal,
-          onProgress: state => {
-            const now = Date.now();
-            if (now - reportedAt < 100 && state.completedRequests !== state.totalRequests) return;
-            reportedAt = now;
-            progress.report({ message: `对话 ${state.conversationIndex}/${state.conversationCount}，已核对 ${state.completedRequests}/${state.totalRequests} 份历史请求` });
-          }
-        });
-      } finally { cancellation.dispose(); signal?.removeEventListener('abort', abort); }
-    });
-  })();
-  notifications.set(key, job);
-  void job.finally(() => {
-    if (notifications!.get(key) === job) notifications!.delete(key);
-  }).catch(() => undefined);
-  return job;
 }

@@ -19,6 +19,12 @@ export interface ContextHandleUpgradeProgress {
   conversationId: string; conversationIndex: number; conversationCount: number;
   completedRequests: number; totalRequests: number;
 }
+export interface ContextHandleUpgradeFailure {
+  conversationId: string;
+  contextRootId: string | null;
+  provenanceRevision: string;
+  error: unknown;
+}
 interface Checkpoint extends ContextHandleRootCheckpoint {
   kind: typeof CHECKPOINT_KIND; conversationId: string;
 }
@@ -35,11 +41,13 @@ export async function listPendingContextHandleUpgrades(database: RuntimeDatabase
 
 /** Explicit resumable recovery job. This is never called by the ordinary catalog reader. */
 export async function upgradePendingConversationContextHandles(database: RuntimeDatabase, store: ContentAddressedStore,
-  options: { signal?: AbortSignal; onProgress?(progress: ContextHandleUpgradeProgress): void } = {}): Promise<void> {
-  const busy = new Set<string>();
+  options: { signal?: AbortSignal; skipConversationIds?: ReadonlySet<string>;
+    onProgress?(progress: ContextHandleUpgradeProgress): void } = {}): Promise<ContextHandleUpgradeFailure[]> {
+  const busy = new Set(options.skipConversationIds);
+  const failures: ContextHandleUpgradeFailure[] = [];
   for (;;) {
     const pending = (await listPendingContextHandleUpgrades(database)).filter(row => !busy.has(String(row.conversation_id)));
-    if (pending.length === 0) return;
+    if (pending.length === 0) return failures;
     for (const [index, row] of pending.entries()) {
       options.signal?.throwIfAborted();
       try {
@@ -48,8 +56,12 @@ export async function upgradePendingConversationContextHandles(database: Runtime
             conversationIndex: index + 1, conversationCount: pending.length })
         });
       } catch (error) {
-        if (error instanceof ConversationRuntimeOwnerBusyError) { busy.add(String(row.conversation_id)); continue; }
-        throw error;
+        options.signal?.throwIfAborted();
+        if ((error as { name?: string })?.name === 'AbortError') throw error;
+        busy.add(String(row.conversation_id));
+        if (error instanceof ConversationRuntimeOwnerBusyError) continue;
+        failures.push({ conversationId: String(row.conversation_id), contextRootId: row.context_root_id as string | null,
+          provenanceRevision: String(row.provenance_revision), error });
       }
     }
   }
