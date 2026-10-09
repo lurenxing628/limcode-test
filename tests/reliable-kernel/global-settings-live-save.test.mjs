@@ -424,3 +424,31 @@ test('跨页面确认遇到冲突、关闭、发送失败或超时均明确拒�
     await rejected;
   }
 });
+
+
+test('强制重试开关经过前端草稿、模型复制、plain payload 和保存确认后不丢失', async () => {
+  await withStore(async ({ store, posted }) => {
+    const section = 'llmProviderConfigs';
+    const initial = { section, settings: { configs: [{ ...providerFixture(), retryForceAllErrors: true }] },
+      filePath: 'fixture', revision: 'force-initial' };
+    store.applySnapshot(initial);
+    const created = store.createModelConfigForActiveConfig('model');
+    assert.equal(created.retryForceAllErrors, true, 'new model copies the channel setting');
+    const latestWrite = () => posted.filter(m => m.type === protocol.BridgeMessageType.GlobalSettingsUpdate
+      && m.payload.section === section).at(-1);
+    const write = latestWrite();
+    const payload = structuredClone(write.payload);
+    assert.equal(payload.settings.configs[0].retryForceAllErrors, true);
+    assert.equal(payload.settings.configs[0].modelConfigs[0].retryForceAllErrors, true);
+    store.applySnapshot({ ...initial, settings: payload.settings, revision: 'force-saved' }, write.id);
+    store.updateActiveModelConfig(created.id, { retryForceAllErrors: false });
+    store.saveLlmProviderConfigs();
+    const offWrite = latestWrite();
+    assert.notEqual(offWrite.id, write.id);
+    const offPayload = structuredClone(offWrite.payload);
+    assert.equal(offPayload.settings.configs[0].retryForceAllErrors, true);
+    assert.equal(offPayload.settings.configs[0].modelConfigs[0].retryForceAllErrors, false);
+    store.applySnapshot({ ...initial, settings: offPayload.settings, revision: 'force-off-saved' }, offWrite.id);
+    assert.equal(store.activeLlmProviderConfig.modelConfigs[0].retryForceAllErrors, false);
+  });
+});

@@ -83,3 +83,18 @@ test('per-model nativeResponses is normalized and inherits nothing implicitly', 
   });
   assert.equal('nativeResponses' in (withoutModelNative.modelConfigs[0] ?? {}), false);
 });
+
+
+test('强制重试默认关闭，渠道与模型按各自完整配置保存，不隐式继承', () => {
+  assert.equal(normalizeLlmProviderConfig({}).retryForceAllErrors, false);
+  const provider = normalizeLlmProviderConfig({ name: 'force', retryForceAllErrors: true,
+    models: [{ id: 'on', name: 'on' }, { id: 'off', name: 'off' }, { id: 'unset', name: 'unset' }],
+    modelConfigs: [{ modelId: 'on', retryForceAllErrors: true }, { modelId: 'off', retryForceAllErrors: false }, { modelId: 'unset' }]
+  });
+  assert.equal(provider.retryForceAllErrors, true);
+  assert.deepEqual(Object.fromEntries(provider.modelConfigs.map(m => [m.modelId, m.retryForceAllErrors])),
+    { off: false, on: true, unset: false });
+  const saved = normalizeLlmProviderConfig(JSON.parse(JSON.stringify(provider)));
+  assert.equal(saved.retryForceAllErrors, true);
+  assert.deepEqual(saved.modelConfigs, provider.modelConfigs);
+});

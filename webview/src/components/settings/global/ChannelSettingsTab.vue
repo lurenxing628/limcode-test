@@ -79,7 +79,7 @@ const createService = ref('');
 
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
-  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryForceAllErrors' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
   | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
 >>;
 
@@ -240,6 +240,7 @@ function modelConfigAsProviderConfig(modelConfig: LlmProviderModelConfigRecord):
     openaiResponsesTransport: modelConfig.openaiResponsesTransport,
     stream: modelConfig.stream,
     retryOnError: modelConfig.retryOnError,
+    retryForceAllErrors: modelConfig.retryForceAllErrors === true,
     retryMaxAttempts: modelConfig.retryMaxAttempts,
     retryDelaySeconds: modelConfig.retryDelaySeconds,
     enableMultimodalTools: modelConfig.enableMultimodalTools,

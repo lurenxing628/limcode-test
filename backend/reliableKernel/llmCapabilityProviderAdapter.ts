@@ -177,6 +177,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     }
     if (!isCompressionRequest(request.recipe)) return undefined;
     const compact = toLlmCompactRequest(request);
+    const forceAllErrors = forceCompressionRetries(request);
     const breakdown = estimateCompactProjection(compact);
     const modelRequestId = request.modelRequestId;
     const debugContext = { conversationId: request.conversationId, modelRequestId,
@@ -189,7 +190,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       return this.startCompressionRequest(projected, modelRequestId, {
         attachmentObservationProfileSha256: projected.attachmentObservationProfileSha256,
         attachmentObservationRequirements: projected.attachmentObservationRequirements
-      }, debugContext, controls);
+      }, debugContext, controls, forceAllErrors);
     } };
   }
 
@@ -248,6 +249,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     debugContext: ProviderDebugContext,
     controls: ProviderDispatchControls
   ): Promise<void> {
+    const forceAllErrors = metadata.retryPolicy.kind === 'ready'
+      && metadata.retryPolicy.value.enabled && metadata.retryPolicy.value.forceAllErrors === true;
     return new Promise<void>((resolve, reject) => {
       let sequence = 0n;
       let text = '';
@@ -557,12 +560,12 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
           case LlmEventType.RetryStarted:
             // Reliable ModelRequest/Attempt owns the only retry loop. If a misconfigured capability
             // still announces an internal retry, stop it and surface the transient failure now.
-            finish(capabilityRetryError(payload));
+            finish(capabilityRetryError(payload, forceAllErrors));
             this.capability.cancelRetry(metadata.modelRequestId);
             if (event.type === LlmEventType.RetryStarted) this.capability.abort(metadata.modelRequestId);
             return;
           case LlmEventType.Error:
-            finish(capabilityProviderError(payload));
+            finish(capabilityProviderError(payload, forceAllErrors));
             return;
             default:
               return;
@@ -585,7 +588,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       try {
         this.capability.start(llmRequest, emit, controls.native ? { native: controls.native } : undefined);
       } catch (error) {
-        finish(capabilityThrownProviderError(error));
+        finish(capabilityThrownProviderError(error, forceAllErrors));
       }
     });
   }
@@ -596,7 +599,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     return this.startCompressionRequest(compactRequest, request.modelRequestId, {
       attachmentObservationProfileSha256: compactRequest.attachmentObservationProfileSha256,
       attachmentObservationRequirements: compactRequest.attachmentObservationRequirements
-    }, debugContext, controls);
+    }, debugContext, controls, forceCompressionRetries(request));
   }
 
   private startCompressionRequest(
@@ -604,7 +607,8 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
     modelRequestId: string,
     observationContract: CompactAttachmentObservationContract,
     debugContext: ProviderDebugContext,
-    controls: ProviderDispatchControls
+    controls: ProviderDispatchControls,
+    forceAllErrors: boolean
   ): Promise<void> {
     captureDebug(this.debugCapture, debugContext, () => ({ stage: 'scope.exit', metadata: { reason: '上下文压缩' } }));
     return new Promise<void>((resolve, reject) => {
@@ -675,13 +679,13 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           if (event.type === LlmEventType.RetryScheduled || event.type === LlmEventType.RetryStarted) {
-            finish(capabilityRetryError(payload));
+            finish(capabilityRetryError(payload, forceAllErrors));
             this.capability.cancelRetry(modelRequestId);
             if (event.type === LlmEventType.RetryStarted) this.capability.abort(modelRequestId);
             return;
           }
           if (event.type === LlmEventType.CompactError) {
-            finish(compactProviderError(payload));
+            finish(compactProviderError(payload, forceAllErrors));
           }
         } catch (error) {
           finish(error);
@@ -700,7 +704,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       try {
         this.capability.compact(compactRequest, emit);
       } catch (error) {
-        finish(capabilityThrownProviderError(error));
+        finish(capabilityThrownProviderError(error, forceAllErrors));
       }
     });
   }
@@ -1236,6 +1240,13 @@ function reliableProviderAttempt(request: FullProviderRequest): NonNullable<LlmS
     maxAttempts,
     ...(request.requestCreatedAt === undefined ? {} : { requestCreatedAt: request.requestCreatedAt })
   };
+}
+
+/** Dispatch has already validated the frozen policy; projection needs only these two flags. */
+function forceCompressionRetries(request: FullProviderRequest): boolean {
+  const compression = asRecord(asRecord(request.authoritySnapshot)?.compression);
+  const retryPolicy = asRecord(asRecord(compression?.provider)?.retryPolicy);
+  return retryPolicy?.enabled === true && retryPolicy.forceAllErrors === true;
 }
 
 function isCompressionRequest(recipe: PlainJsonValue): boolean {
@@ -2835,12 +2846,12 @@ function requireText(value: unknown, label: string): string {
   return value.trim();
 }
 
-function capabilityProviderError(payload: Record<string, unknown> | undefined): Error {
+function capabilityProviderError(payload: Record<string, unknown> | undefined, forceAllErrors = false): Error {
   const message = optionalText(payload?.message) || 'Provider 调用失败。';
-  return classifyProviderFailure(message, asRecord(payload?.rawError));
+  return classifyProviderFailure(message, asRecord(payload?.rawError), true, forceAllErrors);
 }
 
-function capabilityThrownProviderError(error: unknown): Error {
+function capabilityThrownProviderError(error: unknown, forceAllErrors = false): Error {
   if (error instanceof ProviderTransientError) return error;
   const record = asRecord(error);
   const raw: Record<string, unknown> = record ? { ...record } : {};
@@ -2879,7 +2890,7 @@ function capabilityThrownProviderError(error: unknown): Error {
     : optionalText(raw.message) || 'Provider 调用失败。';
   // A synchronous start exception may be local adapter/configuration work. Only recognized
   // provider evidence is retryable here; the default-retry policy belongs to llm:error events.
-  return classifyProviderFailure(message, raw, false);
+  return classifyProviderFailure(message, raw, false, forceAllErrors);
 }
 
 /** Maximum automatic server-directed wait. Longer hints remain explicit, never shortened. */
@@ -2889,7 +2900,8 @@ const MODEL_OUTPUT_REPAIR_MAX_RETRIES = 2;
 function classifyProviderFailure(
   message: string,
   raw: Record<string, unknown> | undefined,
-  allowUnknownProviderFailure = true
+  allowUnknownProviderFailure = true,
+  forceAllErrors = false
 ): Error {
   const outerSignature = collectErrorSignature(raw, message).toLowerCase();
   // Only recognized error envelopes contribute body evidence, never arbitrary output/tool arguments.
@@ -2900,14 +2912,21 @@ function classifyProviderFailure(
     && embeddedStatus !== undefined ? embeddedStatus : structuredStatus;
   const endpointKind = findStringMetadata(raw, 'endpointKind');
   const code = providerErrorCode(raw);
-  const permanent = (detail = message): Error => Object.assign(new Error(detail), {
-    ...(status === undefined ? {} : { status }), ...(code ? { code } : {}),
-    ...(endpointKind ? { endpointKind } : {})
-  });
+  const permanent = (detail = message, canForce = true): Error => {
+    // Only provider failures opt in. Synchronous setup exceptions need HTTP evidence;
+    // local failures and context repair keep their existing paths below.
+    if (forceAllErrors && canForce && (allowUnknownProviderFailure || (status !== undefined && status >= 400))) {
+      return transient('temporary_service_error');
+    }
+    return Object.assign(new Error(detail), {
+      ...(status === undefined ? {} : { status }), ...(code ? { code } : {}),
+      ...(endpointKind ? { endpointKind } : {})
+    });
+  };
   const transient = (reason: ConstructorParameters<typeof ProviderTransientError>[0], maxRetries?: number): Error => {
     const retryAfterMs = providerRetryAfterMs(raw);
     if (retryAfterMs !== undefined && retryAfterMs > MAX_PROVIDER_RETRY_AFTER_MS) {
-      return permanent(`${message}（服务要求至少等待 ${Math.ceil(retryAfterMs / 1_000)} 秒，超过自动等待上限；请在服务限流解除后继续。）`);
+      return permanent(`${message}（服务要求至少等待 ${Math.ceil(retryAfterMs / 1_000)} 秒，超过自动等待上限；请在服务限流解除后继续。）`, false);
     }
     return Object.assign(new ProviderTransientError(reason, message, true, {
       ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
@@ -2922,18 +2941,20 @@ function classifyProviderFailure(
       (typeof record.name === 'string' && ['RootAuthorityError', 'StaleRootBindingError', 'RuntimeDataInvariantError', 'LocalExecutionRecoveryExhaustedError'].includes(record.name))
       || (typeof record.code === 'string'
         && /^(?:SQLITE\w*|RUNTIME_DATA_INVARIANT|LOCAL_EXECUTION_RECOVERY_EXHAUSTED|MODEL_STREAM_IDENTITY_STALE|MODEL_STREAM_IDEMPOTENCY_CONFLICT|CONTENT_OBJECT_CORRUPT|CONTENT_DIGEST_MISMATCH|ENOSPC|EDQUOT|EACCES|EPERM|ENOENT|EIO|EBUSY|EAGAIN|EMFILE|ENFILE)$/i.test(record.code)))) {
-    return Object.assign(permanent(), { category: 'internal' });
+    return Object.assign(permanent(message, false), { category: 'internal' });
   }
   const nativeCompactionEndpoint = endpointKind === 'provider_native'
     || endpointKind === 'openai_responses_compact'
     || endpointKind === 'anthropic_messages_compact'
     || outerSignature.includes('llm compact api');
   if (nativeCompactionEndpoint && (status === 404 || status === 405 || status === 501)) {
+    if (forceAllErrors) return transient('temporary_service_error');
     return new ProviderCapabilityError('native_compaction_unsupported', message, status,
       endpointKind ?? 'provider_native_compaction');
   }
   if ((status === 400 || status === 422)
     && /unsupported|not supported|unknown parameter|invalid.*(?:reasoning|thinking|compaction)|thinking.*(?:disabled|adaptive|enabled)/.test(outerSignature)) {
+    if (forceAllErrors) return transient('temporary_service_error');
     return new ProviderCapabilityError(
       /reasoning|thinking/.test(outerSignature) ? 'unsupported_reasoning_mode' : 'unsupported_parameter',
       message, status, endpointKind);
@@ -2946,7 +2967,7 @@ function classifyProviderFailure(
   }
   if (/\b(?:invalid_api_key|authentication_error|permission_denied|unauthorized|forbidden|err_tls_cert_altname_invalid|cert_has_expired|depth_zero_self_signed_cert|unable_to_verify_leaf_signature)\b/.test(signature)) return permanent();
   if (/\b(?:context_length_exceeded|model_context_window_exceeded)\b|context (?:length|window).*(?:exceed|too (?:large|long))|maximum context length|input exceeds.*token limit/.test(signature)) {
-    return Object.assign(permanent(), { code: 'CONTEXT_WINDOW_EXCEEDED' });
+    return Object.assign(permanent(message, false), { code: 'CONTEXT_WINDOW_EXCEEDED' });
   }
   if (/\binvalid_request_error\b/.test(signature) && !(status !== undefined && [408, 409, 425, 429].includes(status))
     && !(status !== undefined && status >= 500)) {
@@ -3172,13 +3193,13 @@ function isStructuredOpenAIResponsesWebSocketTimeout(
     isStructuredOpenAIResponsesWebSocketTimeout(nested, depth + 1, seen));
 }
 
-function compactProviderError(payload: Record<string, unknown> | undefined): Error {
-  return capabilityProviderError(payload);
+function compactProviderError(payload: Record<string, unknown> | undefined, forceAllErrors = false): Error {
+  return capabilityProviderError(payload, forceAllErrors);
 }
 
-function capabilityRetryError(payload: Record<string, unknown> | undefined): Error {
-  // A dependency scheduling a retry is not authority to relabel a permanent 4xx as transient.
-  return capabilityProviderError(payload);
+function capabilityRetryError(payload: Record<string, unknown> | undefined, forceAllErrors = false): Error {
+  // Only the frozen opt-in, not a dependency retry hint, can override permanent 4xx handling.
+  return capabilityProviderError(payload, forceAllErrors);
 }
 
 /**

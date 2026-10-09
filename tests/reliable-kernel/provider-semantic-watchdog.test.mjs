@@ -2380,3 +2380,37 @@ test('native 继承一次失败后格式修复只剩一次重试，重连投影�
     category: 'transient', message: 'fixture', retryMaxAttempts
   }), /retry limit/);
 });
+
+
+test('强制重试沿用持久 Attempt 预算：额度恢复、鉴权耗尽和总开关关闭', async () => {
+  for (const scenario of ['quota-recovered', 'auth-exhausted', 'disabled']) {
+    const enabled = scenario !== 'disabled';
+    const policy = { enabled, maxRetries: enabled ? 2 : 0, retryDelayMs: 1, forceAllErrors: true };
+    await withApp(`force-retry-${scenario}`, async (app, conversationId, turnId) => {
+      const created = await createRequest(app, conversationId, turnId, scenario);
+      let calls = 0;
+      const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-watchdog', llmCapability((req, emit) => {
+        calls += 1;
+        if (scenario === 'quota-recovered' && calls === 3) {
+          emit({ type: 'llm:done', payload: { requestId: req.id, content: modelContent('recovered') } });
+        } else {
+          emit({ type: 'llm:error', payload: { requestId: req.id, message: scenario,
+            rawError: scenario === 'quota-recovered' ? { status: 429, code: 'insufficient_quota' } : { status: 401, code: 'invalid_api_key' }
+          } });
+        }
+      }));
+      const dispatch = controlPlane(app).dispatch(created.modelRequestId, adapter);
+      if (scenario === 'quota-recovered') assert.equal((await dispatch).terminalState, 'completed');
+      else await assert.rejects(dispatch, error => {
+        if (enabled) assert.match(error.message, /已自动重试 2 次/);
+        return true;
+      });
+      assert.equal(calls, enabled ? 3 : 1);
+      const attempts = await list(app, 'Attempt', { operation_id: created.operationId });
+      assert.equal(attempts.length, calls, 'one durable Attempt for each actual dispatch');
+      const row = await get(app, 'ModelRequest', created.modelRequestId);
+      assert.equal(row.status, 'terminal');
+      assert.equal(row.stream_stats_json.attemptSeq, String(calls));
+    }, 'openai-compatible', policy);
+  }
+});

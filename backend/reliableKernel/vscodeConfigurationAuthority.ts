@@ -1392,7 +1392,7 @@ function positiveSafeIntegerOrUndefined(value: unknown): number | undefined {
 function frozenProviderRetryPolicy(
   provider: LlmProviderConfigRecord,
   modelId: string
-): { enabled: boolean; maxRetries: number; retryDelayMs: number } {
+): { enabled: boolean; maxRetries: number; retryDelayMs: number; forceAllErrors?: boolean } {
   const model = provider.modelConfigs.find((candidate) => candidate.modelId.trim() === modelId.trim());
   const enabled = model?.retryOnError ?? provider.retryOnError;
   const configured = model?.retryMaxAttempts ?? provider.retryMaxAttempts;
@@ -1408,7 +1408,8 @@ function frozenProviderRetryPolicy(
   return {
     enabled: enabled === true && normalized > 0,
     maxRetries: enabled === true ? normalized : 0,
-    retryDelayMs: retryDelaySeconds * 1_000
+    retryDelayMs: retryDelaySeconds * 1_000,
+    ...((model ?? provider).retryForceAllErrors === true ? { forceAllErrors: true } : {})
   };
 }
 

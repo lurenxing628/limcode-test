@@ -1539,6 +1539,7 @@ test('重试间隔按模型覆盖渠道冻结成 retryDelayMs，并夹到 0..600
       retryOnError: true,
       retryMaxAttempts: 4,
       retryDelaySeconds: 30,
+      retryForceAllErrors: true,
       modelConfigs: [{
         id: 'model-config:override',
         modelId: 'model:override',
@@ -1548,6 +1549,7 @@ test('重试间隔按模型覆盖渠道冻结成 retryDelayMs，并夹到 0..600
         retryOnError: true,
         retryMaxAttempts: 2,
         retryDelaySeconds: 60,
+        retryForceAllErrors: false,
         enableMultimodalTools: true,
         systemPromptPrefix: '',
         createdAt: 1,
@@ -1566,7 +1568,8 @@ test('重试间隔按模型覆盖渠道冻结成 retryDelayMs，并夹到 0..600
     assert.deepEqual(channelFrozen.model.retryPolicy, {
       enabled: true,
       maxRetries: 4,
-      retryDelayMs: 30_000
+      retryDelayMs: 30_000,
+      forceAllErrors: true
     });
 
     await authority.mutations.setModelProfile({

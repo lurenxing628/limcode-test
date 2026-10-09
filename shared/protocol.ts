@@ -809,6 +809,8 @@ export interface LlmProviderModelConfigRecord {
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
+  /** 忽略供应商错误类型，仍使用现有重试次数与间隔；默认关闭。 */
+  retryForceAllErrors: boolean;
   /** 最大重试次数 0–10，不包含原始请求；0 关闭自动重试。 */
   retryMaxAttempts: number;
   /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
@@ -844,6 +846,8 @@ export interface LlmProviderConfigRecord {
   stream: boolean;
   /** 请求报错时是否自动重试。 */
   retryOnError: boolean;
+  /** 忽略供应商错误类型，仍使用现有重试次数与间隔；默认关闭。 */
+  retryForceAllErrors: boolean;
   /** 最大重试次数 0–10，不包含原始请求；0 关闭自动重试。 */
   retryMaxAttempts: number;
   /** 每次重试前固定等待的秒数；0 表示沿用自动指数退避。 */
@@ -896,6 +900,7 @@ export interface LlmInvocationSettingsSnapshotRecord {
   openaiResponsesTransport?: LlmOpenAIResponsesTransport;
   stream?: boolean;
   retryOnError?: boolean;
+  retryForceAllErrors?: boolean;
   retryMaxAttempts?: number;
   retryDelaySeconds?: number;
   enableMultimodalTools?: boolean;

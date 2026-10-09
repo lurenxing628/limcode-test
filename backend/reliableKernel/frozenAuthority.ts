@@ -30,6 +30,8 @@ export interface FrozenTurnAuthority {
 }
 
 export interface FrozenProviderRetryPolicy {
+  /** Explicit opt-in; absent means ordinary error classification. */
+  forceAllErrors?: boolean;
   enabled: boolean;
   /** Number of retries after the original Provider attempt. */
   maxRetries: number;
@@ -294,7 +296,8 @@ function normalizeFrozenRetryPolicy(
   if (retryDelayMs > MAX_LLM_RETRY_DELAY_SECONDS * 1_000) {
     throw new Error(`Frozen ${label}.retryDelayMs exceeds the reliable limit.`);
   }
-  return { enabled: value.enabled, maxRetries, retryDelayMs };
+  return { enabled: value.enabled, maxRetries, retryDelayMs,
+    ...(value.forceAllErrors === true ? { forceAllErrors: true } : {}) };
 }
 
 function requireCompressionKind(value: unknown): LlmCompressionConfigRecord['kind'] {

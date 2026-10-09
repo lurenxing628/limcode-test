@@ -2064,12 +2064,14 @@ test('LLM capability adapter 不因稍后重试文案放宽永久错误', async 
   }
 });
 
-async function providerFailureOf(message, rawError) {
+async function providerFailureOf(message, rawError, retryPolicy) {
+  const input = request();
+  if (retryPolicy) input.authoritySnapshot.model.retryPolicy = retryPolicy;
   const adapter = new kernel.LlmCapabilityFullRequestAdapter('provider-config', fakeCapability((llmRequest, emit) => {
     emit({ type: 'llm:error', payload: { requestId: llmRequest.id, message, rawError } });
   }));
   try {
-    await adapter.sendFullRequest(request(), { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
+    await adapter.sendFullRequest(input, { onEvent: async () => ({ accepted: true, checkpointed: true, terminal: false }) });
   } catch (error) {
     return error;
   }
@@ -3339,4 +3341,59 @@ test('Provider 的 CONTENT/MODEL 服务错误不冒充本地故障，正文损�
   const error = await providerFailureOf('local invariant failed', { code: 'CONTENT_DIGEST_MISMATCH', category: 'internal' });
   assert.equal(error instanceof kernel.ProviderTransientError, false);
   assert.equal(error.category, 'internal');
+});
+
+
+const forcePolicy = { enabled: true, maxRetries: 2, retryDelayMs: 0, forceAllErrors: true };
+test('强制重试覆盖鉴权、额度、参数、供应商拒绝并保留原错误和 Retry-After', async () => {
+  for (const rawError of [
+    { status: 401, code: 'invalid_api_key' },
+    { status: 403, code: 'permission_denied' },
+    { status: 429, code: 'insufficient_quota' },
+    { status: 400, code: 'invalid_request_error' },
+    { status: 400, message: 'unsupported reasoning parameter' },
+    { status: 501 }, { code: 'content_filter' }, { retryable: false }
+  ]) {
+    const message = rawError.message ?? 'original provider failure';
+    const normal = await providerFailureOf(message, rawError);
+    assert.equal(normal instanceof kernel.ProviderTransientError, false);
+    const forced = await providerFailureOf(message, { ...rawError, headers: { 'retry-after': '2' } }, forcePolicy);
+    assert.ok(forced instanceof kernel.ProviderTransientError, JSON.stringify(rawError));
+    assert.equal(forced.message, message, 'quota must not claim automatic retry is impossible in force mode');
+    assert.equal(forced.retryOptions.retryAfterMs, 2000);
+    assert.equal(forced.retryAfterOutput, true);
+  }
+});
+
+test('强制重试不绕过总开关、本地故障、上下文修复或服务端最早重试时间', async () => {
+  const disabled = await providerFailureOf('invalid key', { status: 401 }, { ...forcePolicy, enabled: false, maxRetries: 0 });
+  assert.equal(disabled instanceof kernel.ProviderTransientError, false);
+  for (const rawError of [
+    { failureOrigin: 'setup', status: 401 }, { failureOrigin: 'request_preparation' },
+    { category: 'internal' }, { code: 'SQLITE_BUSY' }, { code: 'CONTEXT_WINDOW_EXCEEDED', message: 'context length exceeded' },
+    { status: 401, headers: { 'retry-after': '1200' } }
+  ]) {
+    const error = await providerFailureOf(rawError.message ?? 'failure', rawError, forcePolicy);
+    assert.equal(error instanceof kernel.ProviderTransientError, false, JSON.stringify(rawError));
+  }
+  const repair = await providerFailureOf('malformed_function_call', { code: 'malformed_function_call' }, forcePolicy);
+  assert.equal(repair.retryOptions.maxRetries, 2);
+});
+
+test('压缩直发与 prepared 请求都使用压缩 Provider 自己的强制重试开关', async () => {
+  for (const prepared of [false, true]) {
+    for (const force of [false, true]) {
+      const input = compressionRequest('llm_summary', request().context);
+      input.authoritySnapshot.model.retryPolicy = { ...forcePolicy, forceAllErrors: !force };
+      input.authoritySnapshot.compression.provider.retryPolicy = { ...forcePolicy, forceAllErrors: force };
+      const capability = fakeCapability(() => assert.fail('not an ordinary request'));
+      capability.compact = (req, emit) => emit({ type: 'llm:compactError', payload: {
+        requestId: req.id, message: 'invalid key', rawError: { status: 401 }
+      } });
+      const adapter = new kernel.LlmCapabilityFullRequestAdapter('compression-provider', capability);
+      const controls = { onEvent: async () => assert.fail('no output expected') };
+      await assert.rejects(prepared ? adapter.prepareFullRequest(input).send(controls) : adapter.sendFullRequest(input, controls),
+        error => (error instanceof kernel.ProviderTransientError) === force);
+    }
+  }
 });

@@ -48,7 +48,7 @@ const TOKEN_STEP = 1_000;
 
 type AdvancedConfigPatch = Partial<Pick<
   LlmProviderConfigRecord,
-  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
+  'toolCallFormat' | 'openaiResponsesTransport' | 'stream' | 'retryOnError' | 'retryForceAllErrors' | 'retryMaxAttempts' | 'retryDelaySeconds' | 'enableMultimodalTools' | 'systemPromptPrefix'
   | 'claudeTurnScopedReminders' | 'openaiCompatibleThinkingFormat'
 >>;
 
@@ -614,7 +614,23 @@ function updateNativeFlag(key: 'asyncTools' | 'steering' | 'reasoningUpdates' | 
           <span class="stream-checkbox-enable">启用</span>
         </LcCheckbox>
       </div>
-      <span class="stream-checkbox-text">对可恢复的模型请求错误自动重试，默认 8 次，最多 10 次（不包含原始请求）；0 关闭自动重试。鉴权、额度或请求参数等需要处理的问题会停止并说明原因；不会盲目重放结果不明的外部工具操作。设置在后续回合生效。</span>
+      <span class="stream-checkbox-text">对可恢复的模型请求错误自动重试，默认 8 次，最多 10 次（不包含原始请求）；0 关闭自动重试。默认遇到鉴权、额度或请求参数错误时停止；开启下方强制重试后也会重试这些错误。不会盲目重放结果不明的外部工具操作。设置在后续回合生效。</span>
+    </div>
+
+    <div class="global-settings-field stream-field retry-field">
+      <span>强制重试</span>
+      <div class="stream-checkbox-row">
+        <LcCheckbox
+          :model-value="config.retryForceAllErrors === true"
+          :disabled="!config.retryOnError || normalizeRetryMaxAttempts(config.retryMaxAttempts) === 0"
+          size="sm"
+          aria-label="无视供应商错误类型强制重试"
+          @update:model-value="emit('update-field', { retryForceAllErrors: $event })"
+        >
+          <span class="stream-checkbox-enable">启用</span>
+        </LcCheckbox>
+      </div>
+      <span class="stream-checkbox-text">包括鉴权失败、额度不足、请求参数等供应商错误，仍按设定次数和间隔重试，可能产生额外费用。停止操作始终有效；本地错误不重发模型请求，已完成工具不重复执行，上下文超限仍走压缩修复。</span>
     </div>
 
     <label class="global-settings-field retry-attempts-field">
