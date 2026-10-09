@@ -377,10 +377,12 @@ const LOOP_HISTORY = [{ segmentId: 'seg-model-1', content: REMINDER_K }, { segme
  * definitions instead of `tools: []`, and the channel's cache breakpoints (system in block form); nothing else changed.
  * `compact` re-pinned once more when the compaction settings snapshot started to carry the turn's frozen
  * systemPromptPrefix (same channel and model); the wire is unchanged.
+ * Both fingerprints now include the current Read declaration. Comparing with v0.0.37 verified
+ * that only tools[].description/parameters (wire input_schema) changed, not messages or settings.
  */
 const COMPACTION_BASELINE = {
-  compact: '7d527234ab5402ab3cc3596187ae4ee3fb390531e1bb3e5f7d1f0ad5b114789c',
-  wire: 'bccd0de636d8ae778f64c6b42e5dc0c4175b8e60450d398f86d8296ca9f476a8'
+  compact: 'b6aa2d7f4ddc5ebd5c28bc6e3ebd9cf30633948d4fa98e1479d5e25fe75ecce2',
+  wire: '4359116863860e17a96a794d77dd1ee3e5f9270638c03b04c7e6e5e4443d41ab'
 };
 const compactionFingerprint = (rendered) => ({
   compact: sha256(rendered.compact),

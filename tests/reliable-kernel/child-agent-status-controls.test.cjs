@@ -22,6 +22,9 @@ function loadTypeScript(relativePath) {
   const loaded = { exports: {} };
   const fromSource = createRequire(absolute);
   const localRequire = (specifier) => {
+    if (specifier.startsWith('@shared/')) {
+      return loadTypeScript(`shared/${specifier.slice('@shared/'.length)}.ts`);
+    }
     if (specifier.startsWith('.') && specifier.endsWith('.ts')) {
       return loadTypeScript(path.relative(root, path.resolve(path.dirname(absolute), specifier)));
     }

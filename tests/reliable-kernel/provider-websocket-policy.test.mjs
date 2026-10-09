@@ -221,7 +221,8 @@ test('自动切换连接后仍明确保留编辑工具的非严格参数约束',
     const edit = body.tools.find(tool => tool.name === 'edit');
     assert.equal(edit.strict, false, '连接切换不能恢复自动严格模式');
     assert.equal(edit.parameters.oneOf, undefined);
-    assert.deepEqual(edit.parameters.required, ['path']);
+    assert.deepEqual(edit.parameters.required, ['path', 'mode']);
+    assert.deepEqual(edit.parameters.properties.mode.enum, ['hunk', 'insert', 'delete']);
   }
   assert.deepEqual(parameters, original);
 });

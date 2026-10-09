@@ -26,15 +26,24 @@ test('multi-child wait resolves all frozen references without changing caller in
 
 test('invalid or conflicting child references cannot silently select a different child', () => {
   for (const args of [
-    { childRef: 1 }, { childRef: 'A3' },
-    { childRef: 'A1', answerBridgeId: 'bridge-second' },
-    { childRefs: ['A1', ''] }, { childRefs: ['A1', 'A3'] },
-    { childRefs: ['A1'], answerBridgeIds: ['bridge-second'] },
-    { childRefs: Array(33).fill('A1') }
+    { operation: 'send', childRef: 1 }, { operation: 'send', childRef: 'A3' },
+    { operation: 'send', childRef: 'A1', answerBridgeId: 'bridge-second' },
+    { operation: 'wait', childRefs: ['A1', ''] }, { operation: 'wait', childRefs: ['A1', 'A3'] },
+    { operation: 'wait', childRefs: ['A1'], answerBridgeIds: ['bridge-second'] },
+    { operation: 'wait', childRefs: Array(33).fill('A1') }
   ]) {
-    assert.throws(() => resolveModelToolArguments('run_agent', { operation: 'send', ...args }, catalog),
+    assert.throws(() => resolveModelToolArguments('run_agent', args, catalog),
       error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
   }
+});
+
+test('send resolves only its selected child, leaving unused lists for the argument diagnostics', () => {
+  assert.deepEqual(resolveModelToolArguments('run_agent', {
+    operation: 'send', childRef: 'A1', childRefs: ['A3'], prompt: 'p'
+  }, catalog), { operation: 'send', answerBridgeId: 'bridge-first', childRefs: ['A3'], prompt: 'p' });
+  assert.throws(() => resolveModelToolArguments('run_agent', {
+    operation: 'wait', childRef: 'A3', childRefs: ['A1']
+  }, catalog), error => error.code === 'UNKNOWN_MODEL_HANDLE_REFERENCE');
 });
 
 test('empty child references from strict-schema models count as omitted and never pick a child', () => {

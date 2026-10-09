@@ -56,12 +56,15 @@ const SCENARIOS = ['tool-loop', 'reinjected', 'completion-check', 'no-reminder']
  * limcode/provider-fixes ac4409f) produced for exactly these Claude requests. All 20 provider/scenario
  * cases were compared against that build and were identical; the non-Claude ones are asserted below as
  * "the switch changes nothing" so that parallel Responses/GPT work does not have to re-pin them.
+ * Re-pinned for the current Read declaration and private nativeSessionCapabilities:null. Comparing
+ * actual snapshots against v0.0.37 proved the only other change is the Read schema's 75-token
+ * estimate increase; model messages, headers and all non-tool wire fields are unchanged.
  */
 const CLAUDE_BASELINE = {
-  'claude/tool-loop': { start: 'f5e83c9693b17f0093940d5fc9330d7b2630de7a5a555b221ef115820440add9', wire: '8c1f436702a7e9bfb34ee3e31d165119974b874f87f1f265774dfb512d213244', estimate: 'b3f95b4bc48e1561bfe84388d1005b20c85af5d8a0647eca2e8cac0be5fc8065' },
-  'claude/reinjected': { start: 'd7da699ce4d212a22cf04f747ee2cf47f61dc9fd615f7724691eaafb80728121', wire: '5d886ea685fa092cf48c1dbd98b0507314dd2c0f3a8eeafaacdb3356ed0575ed', estimate: '34ce892ce7f84282c3a3175e655a95087d77abd036ae94c088ce323f60a32121' },
-  'claude/completion-check': { start: '3c9a04fc6d51d6cb41e75b6ea9c515459298c002b4211dfcc3d9cf02937d3019', wire: '8fabd57fbe575db2d200d2037d8bb5d7a470518b513f726932efa4c7a0ca2535', estimate: '4bc24f9158805883e15dab13b8c95d95a34c14717bcb931498b099c671f2a323' },
-  'claude/no-reminder': { start: '89fe51e53b80760a3c74b89917204c70df3cba541e645490765d99f3e0458edb', wire: '624b967160025afe3dbd41cab24321461cbb4870a158ceb53ea75c14c63f3eb3', estimate: '5c85693fa924c7b84ddb6bc1931772615ffbb2200c1899b8dde6789bac41bd75' }
+  'claude/tool-loop': { start: '395fb386d39645f14985f921c2f572dfbe1b27998f82b200c8eac282490a3383', wire: 'eae7240cfb3425ed78a08b5e12070efbe5314a4d9357a7bbf545420ed848a446', estimate: '2c4abf7d95c8540cd2956a47b10e578af5764903dc9a6cd23aa04b46577ff906' },
+  'claude/reinjected': { start: 'b43985a7c6b28d95fc9f33006784008ddfd29cd337fa8c756dbb997cfe1e6c2b', wire: '067dbefd053069d4dce3077b8a8fb3f086ef827483f0da024b1b8b516b03afbd', estimate: '14cf49bfaac6259f9ad9b5d228bf95baf05452892db5c90ad1c0e16c9ca4b928' },
+  'claude/completion-check': { start: '935abec8f4d7daa6b2e36e2f2e1bd751174bb71d499fe3b3f0ea505a7744a9f3', wire: 'b09c051a08a512fbe8572dacaf6194fc0afed0d2ea74b37950c1fe43df0c0a58', estimate: 'fdfc48f99d791e7851aa46069182c4506052028a9807340c984cbce9758b2684' },
+  'claude/no-reminder': { start: '0e0ea6b525d18e1e5b0fd157305aa9abae5309a9453a889d425a5566d5ab8067', wire: '818f52f06f984a2e688c7251f2b9aa3c54776fc453c64954f6cb553bd5a2305e', estimate: '91702eee377c9327ee4b338d053f498ad41b70fcbf6f9acd28ffcc7c6e249f0b' }
 };
 
 const sha256 = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
@@ -226,6 +229,7 @@ test('关闭时 Claude 请求与改动前的构建逐字节一致（LlmStartRequ
   for (const scenario of SCENARIOS) {
     const rendered = await render(fullRequest({ provider: 'claude', modelId: 'claude-opus-5-5', scenario }));
     const key = `claude/${scenario}`;
+    assert.equal(rendered.start.nativeSessionCapabilities, null, 'ordinary mode is frozen privately, not inferred from live settings');
     assert.equal(sha256(rendered.start), CLAUDE_BASELINE[key].start, `${key} LlmStartRequest`);
     // 唯一的有意差异：有易失尾巴（本轮提醒）时消息断点在尾巴之前；放回原位后与改动前逐字节相同。
     assert.equal(sha256(withLegacyBreakpoint(rendered.wire)), CLAUDE_BASELINE[key].wire, `${key} wire`);

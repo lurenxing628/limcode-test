@@ -74,7 +74,7 @@ function loopContext(k, modelId, head = conversationHead(modelId)) {
   return context;
 }
 
-function fullRequest({ modelId, provider = 'openai-responses', context, reminderText, reinject = false, id = 'request' }) {
+function fullRequest({ modelId, provider = 'openai-responses', context, reminderText, reinject = false, id = 'request', nativeResponses }) {
   return {
     kind: 'full-model-request', modelRequestId: id, conversationId: 'conversation-responses-tail-cache', attemptSeq: '1', socketGeneration: '1',
     providerId: PROVIDER_ID, modelId,
@@ -83,7 +83,8 @@ function fullRequest({ modelId, provider = 'openai-responses', context, reminder
       toolPolicy: { allowedTools: ['get_weather'], preset: 'custom', sourceConfigs: {} },
       systemPrompt: { text: 'You are a careful assistant.' }
     },
-    recipe: { kind: 'reliable-agent-turn', round: '1', tools: TOOLS },
+    recipe: { kind: 'reliable-agent-turn', round: '1', tools: TOOLS,
+      ...(nativeResponses ? { nativeResponses } : {}) },
     context,
     attachmentCatalogState: { catalog: [], placements: [] },
     requestAddenda: {
@@ -487,7 +488,11 @@ test('GPT-6 官方渠道 HTTP 原生会话：续接读到首请求的全部输�
   });
 
   // 第一回合：首请求模型调用工具，结果经原生控制器交付，同一个会话续接一次。
-  const first = await project(fullRequest({ modelId, context: loopContext(1, modelId), reminderText: reminder(1), id: 'native-http-turn-1' }));
+  // Reliable requests must freeze native eligibility; editable channel settings cannot replace it.
+  const nativeResponses = { asyncTools: true, steering: false, reasoningUpdates: false,
+    multiplexing: false, explicitCaching: true };
+  const first = await project(fullRequest({ modelId, context: loopContext(1, modelId), reminderText: reminder(1), id: 'native-http-turn-1', nativeResponses }));
+  assert.equal(first.nativeSessionCapabilities.asyncTools, true);
   const events = [];
   let controller;
   const finished = startLlmProvider(first, (event) => events.push(event), { settings: async () => settings }, undefined, undefined, undefined, {
@@ -510,7 +515,7 @@ test('GPT-6 官方渠道 HTTP 原生会话：续接读到首请求的全部输�
     message('seg-answer', 'model', { role: 'model', parts: [{ text: 'It rains in Paris.' }] }, modelId),
     message('seg-next', 'user', { role: 'user', parts: [{ text: 'And tomorrow?' }] })
   ];
-  const second = await project(fullRequest({ modelId, context: secondContext, reminderText: reminder(2), id: 'native-http-turn-2' }));
+  const second = await project(fullRequest({ modelId, context: secondContext, reminderText: reminder(2), id: 'native-http-turn-2', nativeResponses }));
   await startLlmProvider(second, () => {}, { settings: async () => settings });
   assert.equal(sent.length, 3);
 
