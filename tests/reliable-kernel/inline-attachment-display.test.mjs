@@ -21,10 +21,12 @@ before(async () => {
 });
 after(async () => { await server?.close(); globalThis.window = previousWindow; });
 
-const image = (attachmentId, mimeType = 'image/png') => ({ inlineData: {
-  attachmentId, sha256: `content-${attachmentId}`, mimeType, sizeBytes: 8, storage: 'managed', status: 'available', name: 'image.png'
+const image = (attachmentId, mimeType = 'image/png', sha256 = `content-${attachmentId}`) => ({ inlineData: {
+  attachmentId, sha256, mimeType, sizeBytes: 8, storage: 'managed', status: 'available', name: 'image.png'
 } });
-const embedded = data => ({ inlineData: { mimeType: 'image/png', name: 'image.png', data, sizeBytes: 8, storage: 'embedded' } });
+const embedded = (data, sha256) => ({ inlineData: {
+  mimeType: 'image/png', name: 'image.png', data, ...(sha256 ? { sha256 } : {}), sizeBytes: 8, storage: 'embedded'
+} });
 
 function fixture(t, initial, component = InlineDataPartView) {
   const part = vue.ref(initial), start = posted.length;
@@ -93,6 +95,22 @@ test('metadata updates preserve loaded bytes, embedded replacements update bytes
   assert.equal(failed.view.inlineData.status, 'missing');
   assert.equal(failed.view.inlineData.error, 'missing fixture');
   failed.view.reload(); assert.equal(failed.requests().length, 2);
+});
+
+test('a previously loaded managed image is reused without another reload', async t => {
+  const sha256 = 'a'.repeat(64);
+  const first = fixture(t, image('sent', 'image/png', sha256));
+  const request = first.requests()[0];
+  first.reply(request, {
+    part: { inlineData: { ...request.payload, sha256, data: 'YQ==', status: 'available', storage: 'managed', sizeBytes: 8 } },
+    status: 'available'
+  });
+  assert.equal(first.view.dataUri, 'data:image/png;base64,YQ==');
+  first.unmount();
+
+  const reopened = fixture(t, image('sent-again', 'image/png', sha256));
+  assert.equal(reopened.view.dataUri, 'data:image/png;base64,YQ==');
+  assert.equal(reopened.requests().length, 0);
 });
 
 test('unmount ignores pending bytes and production templates expose the image without a click', async t => {

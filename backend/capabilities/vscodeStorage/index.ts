@@ -41,7 +41,6 @@ import { openShadowCheckpointDiff, registerShadowDiffProvider } from './shadowDi
 import { cleanupUnusedShadowWorktrees, collectShadowWorktreeStats, deleteShadowWorktrees } from './shadowCheckpointMaintenance';
 import { withConversationDataTransaction } from './conversationDataStore';
 import { conversationSettingsFileName } from './naming';
-import { ingestMessageContentAttachments } from './attachmentStore';
 import { loadToolResultContent, stagePreparedToolResultContent, stageToolResultContent } from './toolResultStore';
 import { ensureCurrentDataEpoch, resetManagedDataRoot } from './dataEpoch';
 
@@ -114,9 +113,6 @@ export function createVsCodeStorageCapability(context: vscode.ExtensionContext):
       readyRootPath = paths.globalStoragePath;
       readinessCheck = { rootPath: paths.globalStoragePath, promise: Promise.resolve() };
       return result;
-    },
-    async ingestMessageContentAttachments(content) {
-      return ingestMessageContentAttachments(await getReadyPaths(), content);
     },
     async stageToolResultContent(content) {
       return stageToolResultContent(await getReadyPaths(), content);

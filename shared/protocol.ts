@@ -1763,18 +1763,6 @@ export interface FunctionResponsePart extends ModelOutputPartMetadata {
 export type AttachmentStorageMode = 'embedded' | 'managed' | 'localPath';
 export type AttachmentAvailabilityStatus = 'available' | 'loading' | 'missing' | 'tooLarge' | 'unsupported' | 'failed';
 
-export interface AttachmentRecord {
-  id: string;
-  mimeType: string;
-  name?: string;
-  sizeBytes: number;
-  base64Bytes: number;
-  sha256: string;
-  blobFile: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
 export interface AttachmentCatalogEntry {
   attachmentId: string;
   name: string;

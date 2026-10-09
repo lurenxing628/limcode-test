@@ -709,11 +709,6 @@ export interface StorageCapability {
   ensureReady(): Promise<void>;
   /** 归档或删除 LimCode 受管条目后创建当前 data epoch；不会触碰 data root 内的其它用户文件。 */
   resetDataRoot(options?: { archive?: boolean }): Promise<StorageDataResetResult>;
-  /**
-   * Blob-first attachment admission boundary. Returns the only MessageContent representation that
-   * may enter durable conversation facts: immutable managed/local references with no inline bytes.
-   */
-  ingestMessageContentAttachments(content: import('../../shared/protocol').MessageContent): Promise<import('../../shared/protocol').MessageContent>;
   /** Canonicalizes and blob-first stages one raw tool result before the reliable terminal transaction. */
   stageToolResultContent(content: import('../../shared/conversationReliability').JsonValue): Promise<import('../../shared/protocol').StagedToolResultContent>;
   /** Strict lazy read of one canonical ToolResult Artifact. */

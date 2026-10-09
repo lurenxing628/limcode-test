@@ -656,12 +656,13 @@ async function addFilesAsAttachments(files: File[]): Promise<void> {
       globalSettings.status = `本条消息的附件总大小超过 ${limitMb}MB，未添加 ${file.name}。`;
       continue;
     }
+    const part: InlineDataPart = { inlineData: {
+      mimeType, data, name: file.name,
+      storage: 'embedded', status: 'available', sizeBytes: file.size
+    } };
     attachmentSnapshots.value = {
       ...attachmentSnapshots.value,
-      [targetMode]: [
-        ...targetAttachments,
-        { inlineData: { mimeType, data, name: file.name, storage: 'embedded', status: 'available', sizeBytes: file.size } }
-      ]
+      [targetMode]: [...targetAttachments, part]
     };
   }
 }
@@ -979,7 +980,13 @@ function middleEllipsis(value: string, maxLength: number): string {
               <AttachmentThumbnail v-if="attachment.inlineData.mimeType.startsWith('image/')" :part="attachment" />
               <span class="composer-attachment-name">{{ attachmentDisplayName(attachment) }}</span>
               <span v-if="attachmentSizeLabel(attachment)" class="composer-attachment-size">{{ attachmentSizeLabel(attachment) }}</span>
-              <button type="button" class="composer-attachment-remove" title="移除附件" @click="removeAttachment(index)">
+              <button
+                type="button"
+                class="composer-attachment-remove"
+                :aria-label="`移除附件 ${attachmentDisplayName(attachment)}`"
+                title="移除附件"
+                @click="removeAttachment(index)"
+              >
                 <IconTrash stroke="2" aria-hidden="true" />
               </button>
             </span>
@@ -1481,9 +1488,12 @@ function middleEllipsis(value: string, maxLength: number): string {
 }
 
 .composer-attachment-remove {
+  flex: 0 0 20px;
   width: 20px;
+  min-width: 20px;
   height: 20px;
   display: inline-flex;
+  padding: 0;
   align-items: center;
   justify-content: center;
   border: 0;

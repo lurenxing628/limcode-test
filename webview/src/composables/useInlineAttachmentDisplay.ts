@@ -1,10 +1,11 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import { BridgeMessageType, type InlineDataPart } from '@shared/protocol';
 import { bridge } from '@webview/transport';
+import { cachedInlineAttachmentPreview, rememberInlineAttachmentPreview } from './inlineAttachmentPreviewCache';
 
 /** Preview bytes belong to this view, never to the persisted message or Composer draft. */
 export function useInlineAttachmentDisplay(source: () => InlineDataPart, visible: () => boolean) {
-  const localPart = ref<InlineDataPart>(clonePart(source()));
+  const localPart = ref<InlineDataPart>(initialPart(source()));
   const loading = ref(false);
   const contentRevision = ref(0);
   let reference = clonePart(source());
@@ -19,12 +20,15 @@ export function useInlineAttachmentDisplay(source: () => InlineDataPart, visible
   const canReload = computed(() => !!inlineData.value.attachmentId || !!inlineData.value.sourcePath);
   const canOpen = computed(() => canReload.value || !!inlineData.value.data);
 
+  rememberInlineAttachmentPreview(localPart.value);
+
   const stopReloadListener = bridge.on(BridgeMessageType.AttachmentReloadResult, (message) => {
     if (!pendingRequestId || message.correlationId !== pendingRequestId || !message.payload) return;
     pendingRequestId = '';
     loading.value = false;
     if (message.payload.part) {
       localPart.value = clonePart(message.payload.part);
+      rememberInlineAttachmentPreview(localPart.value);
       return;
     }
     const { data: _staleData, ...currentReference } = inlineData.value;
@@ -41,7 +45,7 @@ export function useInlineAttachmentDisplay(source: () => InlineDataPart, visible
     if (!sameContent) {
       pendingRequestId = '';
       loading.value = false;
-      localPart.value = clonePart(incoming);
+      localPart.value = initialPart(incoming);
       contentRevision.value += 1;
     } else {
       // Feed metadata updates must not discard bytes already read for this exact attachment.
@@ -53,6 +57,7 @@ export function useInlineAttachmentDisplay(source: () => InlineDataPart, visible
         status: incoming.inlineData.data ? incoming.inlineData.status : current.status,
         ...(incoming.inlineData.data ? {} : current.error ? { error: current.error } : {})
       } };
+      rememberInlineAttachmentPreview(localPart.value);
     }
     if (!sameContent && visible()) requestData();
   }, { deep: true, flush: 'sync' });
@@ -68,6 +73,12 @@ export function useInlineAttachmentDisplay(source: () => InlineDataPart, visible
 
   function requestData(force = false): void {
     if (loading.value || (!force && inlineData.value.data) || !canReload.value) return;
+    const cached = force ? undefined : cachedInlineAttachmentPreview(localPart.value);
+    if (cached) {
+      localPart.value = cached;
+      rememberInlineAttachmentPreview(localPart.value);
+      return;
+    }
     loading.value = true;
     localPart.value = { inlineData: { ...inlineData.value, status: 'loading' } };
     pendingRequestId = bridge.request(BridgeMessageType.AttachmentReload, {
@@ -79,6 +90,11 @@ export function useInlineAttachmentDisplay(source: () => InlineDataPart, visible
   }
 
   return { inlineData, mimeType, displayName, sizeLabel, dataUri, loading, canReload, canOpen, contentRevision, requestData };
+}
+
+function initialPart(part: InlineDataPart): InlineDataPart {
+  const clone = clonePart(part);
+  return clone.inlineData.data ? clone : cachedInlineAttachmentPreview(clone) ?? clone;
 }
 
 function clonePart(part: InlineDataPart): InlineDataPart {

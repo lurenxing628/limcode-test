@@ -151,7 +151,12 @@ test('resolving an attachment reuses one metadata row and still rejects a confli
       return { snapshot: queries.map(query => query.domain === 'Attachment' ? attachment : content) };
     }
   }, { async read() { bodyReads += 1; return Buffer.from('hello'); } }, {});
-  assert.equal((await service.resolveInlineData('attachment')).inlineData.data, Buffer.from('hello').toString('base64'));
+  const [first, second] = await Promise.all([
+    service.resolveInlineData('attachment'),
+    service.resolveInlineData('attachment')
+  ]);
+  assert.equal(first.inlineData.data, Buffer.from('hello').toString('base64'));
+  assert.equal(second.inlineData.data, Buffer.from('hello').toString('base64'));
   assert.deepEqual(reads, ['Attachment', 'ContentObject']);
   content.sha256 = 'different';
   await assert.rejects(service.resolveInlineData('attachment'), /does not match its immutable metadata/);
@@ -340,7 +345,7 @@ test('read keeps path as the ordinary input and only exposes pages for managed T
   const withPagedAttachments = readFileToolParameters(true, true);
   assert.match(withPagedAttachments.properties.pages.description, /"N" or "N-M"/);
   assert.match(readFileToolDescription(true, true), /at most 4 consecutive pages/);
-  assert.match(readFileToolDescription(true, true), /Never send an empty or invented attachmentId/);
+  assert.match(readFileToolDescription(true, true), /exact non-empty attachmentId from that catalog/);
   assert.deepEqual(compactReadFileToolArguments({
     attachmentId: '',
     endLine: 0,
@@ -349,7 +354,7 @@ test('read keeps path as the ordinary input and only exposes pages for managed T
     pages: '',
     path: 'src\\demo.ts',
     startLine: 0
-  }), { path: 'src/demo.ts', mode: 'text' });
+  }), { path: 'src/demo.ts', mode: 'text', startLine: 0, endLine: 0 });
   assert.deepEqual(compactReadFileToolArguments({
     attachmentId: ' attachment-one ',
     endLine: 1,
@@ -358,13 +363,13 @@ test('read keeps path as the ordinary input and only exposes pages for managed T
     pages: '1 - 4',
     path: '',
     startLine: 1
-  }), { attachmentId: 'attachment-one', pages: '1-4' });
+  }), { attachmentId: 'attachment-one', pages: '1-4', mode: 'attachment', startLine: 1, endLine: 1 });
   assert.deepEqual(compactReadFileToolArguments({
     attachmentRef: ' F1 ',
     endLine: 1,
     mode: 'attachment',
     startLine: 1
-  }), { attachmentRef: 'F1' });
+  }), { attachmentRef: 'F1', mode: 'attachment', startLine: 1, endLine: 1 });
 });
 
 test('read page ranges reject ambiguous or oversized requests and report actual totals', () => {
@@ -463,13 +468,24 @@ test('read copies only the requested real PDF pages and reports the next range',
   const clampedPdf = await PDFDocument.load(Buffer.from(clamped.parts[0].inlineData.data, 'base64'));
   assert.deepEqual(clampedPdf.getPages().map((page) => page.getWidth()), [605, 606]);
 
-  const conflict = await readFileTool.execute(
+  const localReads = [];
+  const local = await readFileTool.execute(
     { path: 'other.pdf', attachmentId, mode: 'attachment' },
-    deps,
+    { ...deps,
+      fs: { async readBinaryFile(file, mimeType) {
+        localReads.push([file, mimeType]);
+        return { path: file, name: 'other.pdf', data: sourceBytes.toString('base64'), sizeBytes: sourceBytes.byteLength };
+      } },
+      attachments: { reference() { assert.fail('the selected local path must not resolve the managed attachment'); },
+        resolve() { assert.fail('the selected local path must not read managed bytes'); } }
+    },
     context
   );
-  assert.equal(conflict.ok, false);
-  assert.match(String(conflict.output), /exactly one/);
+  assert.equal(local.ok, true);
+  assert.deepEqual(localReads, [['other.pdf', 'application/pdf']]);
+  assert.deepEqual(local.output.ignoredFields, ['attachmentRef']);
+  assert.equal(local.output.warning, '已选择 path；未使用参数：attachmentRef。');
+  assert.equal(local.parts[0].inlineData.sourcePath, 'other.pdf');
 });
 
 test('read keeps images whole and rejects pages for image attachments', async () => {
@@ -568,15 +584,18 @@ test('read decodes a managed TXT as bounded UTF-8 without requiring multimodal s
     mode: 'text',
     path: '',
     items: [{}],
-    startLine: 0,
-    endLine: 0
+    startLine: null,
+    endLine: null
   }, deps, {
     settingsSnapshot: { enableMultimodalTools: false },
     emit() {}
   });
 
   assert.equal(result.ok, true);
-  assert.deepEqual(result.output, {
+  const { ignoredFields, warning, ...textOutput } = result.output;
+  assert.deepEqual(ignoredFields, ['mode']);
+  assert.equal(warning, '已选择 attachmentRef；未使用参数：mode。');
+  assert.deepEqual(textOutput, {
     attachmentId,
     name: 'notes.txt',
     mimeType: 'text/plain',
