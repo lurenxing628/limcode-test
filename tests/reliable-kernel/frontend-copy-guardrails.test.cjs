@@ -586,6 +586,9 @@ test('failure without assistant output keeps an exact eligible request retry and
   records.TurnTermination.terminal.terminal_status = 'failed';
   records.Turn.newer = { id: 'newer', conversation_id: 'conversation', status: 'active' };
   assert.equal(retry().target, undefined, 'new work cannot be stopped by a stale failure retry');
+  assert.equal(retry().blockedReason, undefined, 'an old failure must not tell users to stop their current work');
+  assert.equal(projectReliableConversation({ conversationId: 'conversation', records, details: {} })
+    .terminationByMessageId.user.id, 'terminal', 'the historical notice stays at its original message');
   delete records.Turn.newer;
   records.ConversationContextStatus.head.root_id = 'newer-root';
   assert.equal(retry().target, undefined, 'old requests cannot rewind newer context');

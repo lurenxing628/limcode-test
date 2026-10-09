@@ -141,8 +141,7 @@ const historyCountText = computed(() => {
   const page = pageInfo.value ? `第 ${pageInfo.value.pageIndex + 1} 页` : "当前页";
   return `${total} 个对话 · ${page}`;
 });
-const currentScopeLabel = computed(() => currentProjectScope.value.kind === 'all' ? '全部历史'
-  : currentProjectScope.value.kind === 'unbound' ? '未绑定' : '当前项目');
+const currentScopeLabel = computed(() => currentProjectScope.value.kind === 'unbound' ? '未绑定' : '当前项目');
 const activeScopeKey = computed(() => favoritesViewActive.value ? 'favorites' : scopeOptionKey(activeScopeKind.value, activeProjectFolderUri.value));
 const scopeOptions = computed<ScopeOption[]>(() => {
   const options: ScopeOption[] = [
