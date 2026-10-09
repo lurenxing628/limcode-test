@@ -2,7 +2,7 @@
   "name": "limcode-test",
   "displayName": "Limcode Test",
   "description": "VS Code AI assistant with a TypeScript reliable runtime, SQLite/CAS persistence, and Vue webviews.",
-  "version": "0.0.37",
+  "version": "0.0.38",
   "publisher": "your-publisher",
   "private": true,
   "repository": {
@@ -24,7 +24,11 @@
   ],
   "contributes": {
     "commands": [
-      { "command": "limcode-test.mergeAllRuntimeHistory", "title": "Limcode Test: 立即合并全部", "category": "Limcode Test" },
+      {
+        "command": "limcode-test.mergeAllRuntimeHistory",
+        "title": "Limcode Test: 立即合并全部",
+        "category": "Limcode Test"
+      },
       {
         "command": "limcode-test.manageRuntimeDataSets",
         "title": "Limcode Test: 历史与存储管理",
@@ -74,7 +78,11 @@
     ],
     "menus": {
       "view/title": [
-        { "command": "limcode-test.manageRuntimeDataSets", "when": "view == limcode-test-entry-view", "group": "navigation" }
+        {
+          "command": "limcode-test.manageRuntimeDataSets",
+          "when": "view == limcode-test-entry-view",
+          "group": "navigation"
+        }
       ]
     },
     "keybindings": [
