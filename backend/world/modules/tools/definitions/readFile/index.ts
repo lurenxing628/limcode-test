@@ -1,5 +1,4 @@
 import { TextDecoder } from 'node:util';
-import { PDFDocument } from 'pdf-lib';
 import { READ_TOOL_NAME, type InlineDataPart } from '../../../../../../shared/protocol';
 import type { ToolDefinition, ToolDeps, ToolExecutionContext, ToolResultOut } from '../../registry';
 import { staticToolScheduling } from '../../schedulingContract';
@@ -379,6 +378,8 @@ async function managedPdfAttachmentResult(
   }
 
   try {
+    // Argument inspection is also used during Runtime startup; only PDF reads need this parser.
+    const { PDFDocument } = await import('pdf-lib');
     const sourceBytes = Buffer.from(inlineData.data, 'base64');
     const source = await PDFDocument.load(sourceBytes);
     const totalPages = source.getPageCount();
