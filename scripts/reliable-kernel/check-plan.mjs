@@ -47,6 +47,18 @@ function isTestArtifactPath(file) {
 }
 
 const TRACKED_VERIFICATION_SOURCE_ALLOWLIST = new Set([
+  'tests/reliable-kernel/agent-tool-arguments.test.mjs',
+  'tests/reliable-kernel/ask-plan-placeholder.test.mjs',
+  'tests/reliable-kernel/command-tool-presentation.test.mjs',
+  'tests/reliable-kernel/edit-hunk-matcher.test.cjs',
+  'tests/reliable-kernel/file-change-preview-ui.test.mjs',
+  'tests/reliable-kernel/file-tool-arguments.test.cjs',
+  'tests/reliable-kernel/read-tool-presentation.test.mjs',
+  'tests/reliable-kernel/read-transfer-arguments.test.cjs',
+  'tests/reliable-kernel/single-response-measurement.test.mjs',
+  'tests/reliable-kernel/tool-argument-admission.test.mjs',
+  'tests/reliable-kernel/tool-tolerance-defaults.test.mjs',
+  'tests/webview-file-change-preview.browser.mjs',
   'tests/reliable-kernel/runtime-merge-conversation-ownership.test.mjs',
   'tests/reliable-kernel/physical-configuration-validation.test.mjs',
   'tests/reliable-kernel/runtime-build-identity.test.mjs',
@@ -405,7 +417,8 @@ const LOCAL_GENERATED_BENCHMARK_OUTPUTS = new Set([
 const TRACKED_TESTS_OUTSIDE_CI = new Map([
   // Drive a real browser against the built webview; the CI list runs in Node only.
   ['tests/webview-session-thinking.browser.mjs', 'test:browser'],
-  ['tests/webview-agent-status-panel.browser.mjs', 'test:browser']
+  ['tests/webview-agent-status-panel.browser.mjs', 'test:browser'],
+  ['tests/webview-file-change-preview.browser.mjs', 'test:browser']
 ]);
 
 function isRunnableTestPath(file) {
