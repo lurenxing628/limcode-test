@@ -8,10 +8,16 @@ import { after, test } from 'node:test';
 const require = createRequire(import.meta.url);
 const Module = require('node:module');
 const originalLoad = Module._load;
+const vscodeMock = {
+  EventEmitter: class { event = () => {}; },
+  Uri: { parse: (text) => ({ toString: () => text }) },
+  // 顶层键必须在 require 前定义：__importStar 只捕获加载时已存在的属性。
+  TabInputText: class { constructor(uri) { this.uri = uri; } },
+  window: {},
+  workspace: {}
+};
 Module._load = function load(name, parent, isMain) {
-  return name === 'vscode'
-    ? { EventEmitter: class { event = () => {}; }, Uri: { parse: (text) => ({ toString: () => text }) } }
-    : originalLoad.call(this, name, parent, isMain);
+  return name === 'vscode' ? vscodeMock : originalLoad.call(this, name, parent, isMain);
 };
 after(() => { Module._load = originalLoad; });
 
@@ -351,4 +357,133 @@ test('超出精确页码窗口的深页按键集边界读取，最后一页从�
   assert.equal(f.calls(), 1);
   assert.equal(overflow.pageInfo.pageIndex, lastPageIndex);
   assert.deepEqual(ids(overflow), currentOrder.slice(lastPageIndex * LIMIT));
+});
+
+const workspaceFolder = (uri, index) => ({ uri: { toString: () => uri }, name: uri.split('/').pop(), index });
+
+/** Drives the real Facade's current-project resolution with the vscode boundary replaced. */
+function projectResolutionFixture({ folders = [], activeEditorUri = null, remembered, writes = [], stored = {}, textTabs = [], otherTabs = 0 } = {}) {
+  const facade = Object.create(Facade.prototype);
+  const listeners = [];
+  Object.assign(facade, {
+    lastActiveProjectFolderUri: remembered,
+    context: { workspaceState: {
+      get: (key) => stored[key],
+      update: (key, value) => { writes.push({ key, value }); return Promise.resolve(); }
+    } }
+  });
+  vscodeMock.window.activeTextEditor = activeEditorUri === null ? undefined : { document: { uri: { toString: () => activeEditorUri } } };
+  vscodeMock.window.onDidChangeActiveTextEditor = (listener) => { listeners.push(listener); return { dispose() {} }; };
+  vscodeMock.workspace.workspaceFolders = folders;
+  vscodeMock.workspace.getWorkspaceFolder = (uri) => {
+    const text = uri.toString();
+    return folders.find((folder) => {
+      const base = folder.uri.toString();
+      return text === base || text.startsWith(base + '/');
+    });
+  };
+  vscodeMock.window.tabGroups = {
+    all: [{ tabs: [
+      ...textTabs.map((uri) => ({ input: new vscodeMock.TabInputText({ toString: () => uri }) })),
+      ...Array.from({ length: otherTabs }, () => ({ input: { viewType: 'limcode.chat' } }))
+    ] }]
+  };
+  return { facade, writes, listeners };
+}
+
+test('多根工作区没有活动编辑器时当前项目沿用最近编辑过的文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)], remembered: P });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('活动编辑器所在文件夹优先于记住的文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)], activeEditorUri: Q, remembered: P });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
+});
+
+test('单根工作区没有记忆时当前项目仍解析到唯一文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0)] });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('单根工作区忽略过期的记忆，当前项目仍解析到唯一文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(Q, 0)], remembered: P });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
+});
+
+test('记住的文件夹已不在工作区时当前项目回落到全部历史', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)], remembered: 'file:///workspace/project-removed' });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'all' });
+});
+
+test('多根工作区新建对话未指定项目时使用当前项目解析结果', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade } = projectResolutionFixture({ folders, remembered: Q });
+  assert.equal(facade.resolveProjectFolderForNewConversation(), folders[1]);
+});
+
+test('新建对话显式指定的项目仍必须属于当前工作区', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade } = projectResolutionFixture({ folders, remembered: Q });
+  assert.equal(facade.resolveProjectFolderForNewConversation(Q), folders[1]);
+  assert.throws(() => facade.resolveProjectFolderForNewConversation('file:///workspace/project-x'), /不属于当前 VS Code 工作区/);
+});
+
+test('活动编辑器切换时记住所在文件夹并持久化，工作区外或未变化时不重复写入', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade, writes } = projectResolutionFixture({ folders, remembered: P, activeEditorUri: Q });
+  facade.rememberActiveProjectFolder();
+  facade.rememberActiveProjectFolder();
+  vscodeMock.window.activeTextEditor = { document: { uri: { toString: () => 'file:///outside/notes.md' } } };
+  facade.rememberActiveProjectFolder();
+  assert.equal(facade.lastActiveProjectFolderUri, Q);
+  assert.deepEqual(writes, [{ key: 'limcode.lastActiveProjectFolderUri', value: Q }]);
+});
+
+test('工厂启动跟踪时读取记住的文件夹并订阅活动编辑器切换，切换后记忆随之更新', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade, writes, listeners } = projectResolutionFixture({ folders, stored: { 'limcode.lastActiveProjectFolderUri': P } });
+  facade.trackActiveProjectFolder();
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+  assert.equal(listeners.length, 1);
+  vscodeMock.window.activeTextEditor = { document: { uri: { toString: () => Q } } };
+  listeners[0]();
+  vscodeMock.window.activeTextEditor = undefined;
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
+  assert.deepEqual(writes, [{ key: 'limcode.lastActiveProjectFolderUri', value: Q }]);
+});
+
+test('多根工作区没有记忆也没有活动编辑器时，打开的文本标签全在一个文件夹就采用它', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade } = projectResolutionFixture({
+    folders,
+    textTabs: [`${P}/src/a.ts`, `${P}/src/b.ts`, 'file:///outside/notes.md'],
+    otherTabs: 1
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('打开的文本标签横跨多个文件夹时当前项目回落到全部历史', () => {
+  const { facade } = projectResolutionFixture({
+    folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)],
+    textTabs: [`${P}/src/a.ts`, `${Q}/src/b.ts`]
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'all' });
+});
+
+test('记住的文件夹优先于打开的文本标签', () => {
+  const { facade } = projectResolutionFixture({
+    folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)],
+    remembered: P,
+    textTabs: [`${Q}/src/b.ts`]
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('没有打开任何文本标签时当前项目回落到全部历史', () => {
+  const { facade } = projectResolutionFixture({
+    folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)],
+    otherTabs: 1
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'all' });
 });

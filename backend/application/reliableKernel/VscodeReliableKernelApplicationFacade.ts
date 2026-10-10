@@ -89,6 +89,8 @@ const HISTORY_CACHE_LIMIT = 512;
 const HISTORY_CONTENT_READ_CONCURRENCY = 4;
 const DEFAULT_HISTORY_PAGE_SIZE = 50;
 const INTERACTION_ATTENTION_REFRESH_DELAY_MS = 25;
+/** Workspace-scoped memory of the folder the last active text editor was in; read when no editor has focus. */
+const LAST_ACTIVE_PROJECT_FOLDER_URI_KEY = 'limcode.lastActiveProjectFolderUri';
 
 
 /** VS Code shell facade backed only by the reliable SQLite/CAS Runtime and independent settings authority. */
@@ -131,6 +133,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private hydration: Promise<void> | undefined;
   private unsubscribeCommit: (() => void) | undefined;
   private unsubscribeSteering: (() => void) | undefined;
+  private activeEditorSubscription: vscode.Disposable | undefined;
+  private lastActiveProjectFolderUri: string | undefined;
   private disposed = false;
   private productClosing = false;
   private productClosed = false;
@@ -283,6 +287,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
       );
+      facade.trackActiveProjectFolder();
       return facade;
     }, undefined, wait);
   }
@@ -866,6 +871,8 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       this.unsubscribeCommit = undefined;
       this.unsubscribeSteering?.();
       this.unsubscribeSteering = undefined;
+      this.activeEditorSubscription?.dispose();
+      this.activeEditorSubscription = undefined;
       this.externalHistoryWatcher.cancel();
       // Host handoff must not wait behind a projection read which the old Host no longer needs.
       // Closing the product below rejects/settles ordinary database work; keep rejection observed.
@@ -1218,15 +1225,63 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       if (!folder) throw new Error('新对话指定的项目不属于当前 VS Code 工作区。');
       return folder;
     }
-    return folders.length === 1 ? folders[0] : undefined;
+    return this.currentWorkspaceFolder();
   }
 
   private currentWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
-    const activeDocument = vscode.window.activeTextEditor?.document.uri;
-    const activeFolder = activeDocument ? vscode.workspace.getWorkspaceFolder(activeDocument) : undefined;
+    const activeFolder = this.activeEditorWorkspaceFolder();
     if (activeFolder) return activeFolder;
     const folders = vscode.workspace.workspaceFolders ?? [];
-    return folders.length === 1 ? folders[0] : undefined;
+    if (folders.length === 1) return folders[0];
+    // Multi-root with focus outside the editors (e.g. the chat panel): keep the folder the user
+    // last edited in, instead of losing the current project and falling back to every conversation.
+    const remembered = folders.find((folder) => folder.uri.toString() === this.lastActiveProjectFolderUri);
+    if (remembered) return remembered;
+    // Nothing edited yet in this window: fall back to the open text tabs, but only when they all
+    // belong to one folder. Anything ambiguous keeps the every-conversation scope.
+    return this.soleFolderAmongOpenTextTabs(folders);
+  }
+
+  /** Infers the folder from open text tabs; used when no editor was ever activated in this window. */
+  private soleFolderAmongOpenTextTabs(folders: readonly vscode.WorkspaceFolder[]): vscode.WorkspaceFolder | undefined {
+    const tabGroups = vscode.window.tabGroups as typeof vscode.window.tabGroups | undefined;
+    const TabInputText = vscode.TabInputText as typeof vscode.TabInputText | undefined;
+    if (!tabGroups || !TabInputText || folders.length === 0) return undefined;
+    const folderUris = new Set<string>();
+    for (const group of tabGroups.all) {
+      for (const tab of group.tabs) {
+        if (!(tab.input instanceof TabInputText)) continue;
+        const folder = vscode.workspace.getWorkspaceFolder(tab.input.uri);
+        if (folder) folderUris.add(folder.uri.toString());
+      }
+    }
+    if (folderUris.size !== 1) return undefined;
+    const [uri] = folderUris;
+    return folders.find((folder) => folder.uri.toString() === uri);
+  }
+
+  /** Loads the remembered folder and follows the active editor; only the VS Code factory starts this. */
+  private trackActiveProjectFolder(): void {
+    this.lastActiveProjectFolderUri = this.context.workspaceState.get<string>(LAST_ACTIVE_PROJECT_FOLDER_URI_KEY);
+    this.rememberActiveProjectFolder();
+    this.activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => this.rememberActiveProjectFolder());
+  }
+
+  private activeEditorWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
+    const activeDocument = vscode.window.activeTextEditor?.document.uri;
+    return activeDocument ? vscode.workspace.getWorkspaceFolder(activeDocument) : undefined;
+  }
+
+  /** Remembers the active editor's folder so a multi-root window keeps a current project across sessions. */
+  private rememberActiveProjectFolder(): void {
+    const folder = this.activeEditorWorkspaceFolder();
+    if (!folder) return;
+    const uri = folder.uri.toString();
+    if (uri === this.lastActiveProjectFolderUri) return;
+    this.lastActiveProjectFolderUri = uri;
+    void this.context.workspaceState.update(LAST_ACTIVE_PROJECT_FOLDER_URI_KEY, uri).then(undefined, (error) => {
+      console.warn('[LimCode] Failed to remember the active project folder.', error);
+    });
   }
 
   private async maybeRow(domain: string, id: string): Promise<DomainRow | null> {
