@@ -1069,3 +1069,61 @@ test('oversized histories remain readable during unrelated local commits', async
   };
   assert.deepEqual((await readConversationContextHandleCatalog(fixture.database, fixture.store, 'history')).entries, []);
 });
+
+for (const [kind, prefix, floor] of [['process', 'P', 3526], ['cursor', 'O', 8200]]) {
+  test(`historical ${prefix} reallocation respects both persisted and occurrence-only allocation floors`, () => {
+    const ambiguous = [legacy(entry(kind, `${prefix}1`, `${kind}-a`)), legacy(entry(kind, `${prefix}1`, `${kind}-b`))];
+    const reserved = { ...current([]), allocationHighWater: { [kind]: floor } };
+    const persisted = reconcileHistoricalModelHandleCatalogs([...ambiguous, reserved]);
+    assert.deepEqual(persisted.entries.map(value => value.ref), [`${prefix}${floor + 1}`, `${prefix}${floor + 2}`]);
+    const occurrence = reconcileHistoricalModelHandleCatalogs(ambiguous, { allocationHighWater: { [kind]: floor } });
+    assert.deepEqual(occurrence, persisted);
+    assert.deepEqual(reconcileHistoricalModelHandleCatalogs([reserved, ...ambiguous.slice().reverse()]), persisted);
+    assert.deepEqual(reconcileHistoricalModelHandleCatalogs([persisted, ...ambiguous]), persisted);
+  });
+}
+
+test('historical reallocation refuses exhausted or malformed reservation floors before publishing any catalog', () => {
+  const ambiguous = [legacy(entry('process', 'P1', 'process-a')), legacy(entry('process', 'P1', 'process-b'))];
+  for (const floor of [-1, 1.5, Number.MAX_SAFE_INTEGER + 1]) {
+    assert.throws(() => reconcileHistoricalModelHandleCatalogs(ambiguous, { allocationHighWater: { process: floor } }), TypeError);
+  }
+  assert.throws(() => reconcileHistoricalModelHandleCatalogs(ambiguous,
+    { allocationHighWater: { process: Number.MAX_SAFE_INTEGER } }), RangeError);
+});
+
+test('current identity conflict diagnostics distinguish same-ref and same-target using original IDs without display metadata', () => {
+  const target = 'process-original-id';
+  for (const changed of [entry('process', 'P3526', 'process-other'), entry('process', 'P7', target)]) {
+    assert.throws(() => reconcileHistoricalModelHandleCatalogs([
+      current([{ ...entry('process', 'P3526', target), name: 'private-display-metadata' }]), legacy(changed)
+    ]), error => {
+      assert.equal(error.code, 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT');
+      assert.match(error.message, /model handle reference P3526 \(process;/);
+      assert.equal(error.conflict.kind, 'process');
+      assert.equal(error.conflict.referenceCount, changed.ref === 'P3526' ? 1 : 2);
+      assert.equal(error.conflict.targetCount, changed.ref === 'P3526' ? 2 : 1);
+      assert.equal(error.conflict.currentFactCount, 1);
+      assert.equal(error.conflict.legacyFactCount, 1);
+      assert.equal(error.conflict.facts.length, 2);
+      assert.equal(error.conflict.truncated, false);
+      assert.ok(error.conflict.facts.some(value => value.ref === 'P3526' && value.target === target && value.current));
+      assert.ok(error.conflict.facts.some(value => value.ref === changed.ref && value.target === changed.target && !value.current));
+      assert.doesNotMatch(JSON.stringify(error), /private-display-metadata|targetDigest/);
+      return true;
+    });
+  }
+});
+
+test('large connected current conflicts report bounded samples rather than cumulative catalogs', () => {
+  const inputs = [current([entry('process', 'P1', 'process-current')]),
+    ...Array.from({ length: 100 }, (_, index) => legacy(entry('process', 'P1', `process-${index}`)))];
+  assert.throws(() => reconcileHistoricalModelHandleCatalogs(inputs), error => {
+    assert.equal(error.conflict.targetCount, 101);
+    assert.equal(error.conflict.legacyFactCount, 100);
+    assert.equal(error.conflict.facts.length, 8);
+    assert.equal(error.conflict.truncated, true);
+    assert.ok(JSON.stringify(error.conflict).length < 2000);
+    return isConflict(error);
+  });
+});

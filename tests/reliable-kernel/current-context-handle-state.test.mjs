@@ -323,3 +323,217 @@ for (const damage of ['unrelated', 'duplicate', 'summary']) test(`压缩来源${
   assert.equal(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN).find(row => row.conversation_id === 'healthy').state, 'ready');
   assert.deepEqual(await upgradePendingConversationContextHandles(f.database, f.store, { skipConversationIds: new Set(['conversation']) }), []);
 });
+
+async function selectedHistoryFixture(inputs) {
+  const f = await legacyFixture(0);
+  let parent = null;
+  for (const [index, input] of inputs.entries()) {
+    parent = addModelOccurrence(f, `history-${index}`, input.catalog, parent, input.text).nodeId;
+  }
+  Object.assign(f.table('ContextSequenceRoot')[0], { root_node_id: parent, segment_count: BigInt(inputs.length) });
+  return f;
+}
+const oldProcess = (target, ref = 'P1') => ({ entries: [{ kind: 'process', ref, target }] });
+
+test('upgrade reports bounded frozen recipe witnesses for real mixed-contract conflicts and keeps other conversations usable', async () => {
+  const f = await selectedHistoryFixture([
+    { catalog: oldProcess('old-process', 'P3526') },
+    { catalog: catalog({ kind: 'process', ref: 'P3526', target: 'current-process' }) }
+  ]);
+  f.table('Conversation').push({ id: 'healthy', title: 'Healthy' });
+  await f.database.transaction(state.pendingConversationContextHandleStateSteps('healthy', now));
+  const before = new Map(f.shared.contents);
+  const failures = await upgradePendingConversationContextHandles(f.database, f.store);
+  assert.equal(failures.length, 1);
+  const error = failures[0].error;
+  assert.equal(error.code, 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT');
+  assert.equal(error.conflict.currentFactCount, 1);
+  assert.equal(error.conflict.legacyFactCount, 1);
+  assert.equal(error.contextHandleEvidence.rootId, 'legacy-root');
+  const witnesses = error.contextHandleEvidence.witnesses;
+  assert.equal(witnesses.length, 2);
+  assert.ok(witnesses.some(value => value.currentOrigin?.requestId === 'request-history-1'
+    && value.currentOrigin.contentObjectId === 'recipe-history-1'));
+  assert.ok(witnesses.some(value => value.legacyOrigin?.requestId === 'request-history-0'
+    && value.legacyOrigin.contentObjectId === 'recipe-history-0'));
+  assert.equal(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN).find(row => row.conversation_id === 'conversation').state, 'pending');
+  assert.equal(f.table(state.CONTEXT_HANDLE_STATE_DOMAIN).find(row => row.conversation_id === 'healthy').state, 'ready');
+  for (const [key, bytes] of before) assert.deepEqual(f.shared.contents.get(key), bytes);
+});
+
+test('unused request-private reservations raise the repair floor without becoming published target mappings', async () => {
+  const old = oldProcess('old-a');
+  old.entries.push({ kind: 'process', ref: 'P3526', target: 'never-visible-private-target' });
+  const f = await selectedHistoryFixture([{ catalog: old, text: 'P1' }, { catalog: oldProcess('old-b'), text: 'P1' }]);
+  assert.deepEqual(await upgradePendingConversationContextHandles(f.database, f.store), []);
+  const repaired = (await readConversationContextHandleState(f.database, f.store, 'conversation')).catalog;
+  assert.deepEqual(repaired.entries.map(entry => entry.ref), ['P3527', 'P3528']);
+  assert.ok(repaired.entries.every(entry => entry.target !== 'never-visible-private-target'));
+  assert.deepEqual(repaired.retiredRefs, ['P1']);
+});
+
+test('legacy conflict repair stays identical across checkpoints and reserves visible unbound short references before allocation', async () => {
+  const inputs = Array.from({ length: 66 }, (_, index) => ({
+    catalog: oldProcess(index < 40 ? 'old-a' : 'old-b'), text: index === 33 ? 'P1 P9000' : 'P1'
+  }));
+  const uninterrupted = await selectedHistoryFixture(inputs);
+  assert.deepEqual(await upgradePendingConversationContextHandles(uninterrupted.database, uninterrupted.store), []);
+  const expected = await readConversationContextHandleState(uninterrupted.database, uninterrupted.store, 'conversation');
+  assert.deepEqual(expected.catalog.entries.map(entry => entry.ref), ['P9001', 'P9002']);
+  assert.deepEqual(expected.catalog.retiredRefs, ['P1']);
+  assert.equal(expected.requiresNativeReset, true);
+
+  const interrupted = await selectedHistoryFixture(inputs);
+  const before = new Map(interrupted.shared.contents);
+  const controller = new AbortController();
+  await assert.rejects(upgradePendingConversationContextHandles(interrupted.database, interrupted.store, {
+    signal: controller.signal, onProgress(value) { if (value.completedRequests === 35) controller.abort(); }
+  }), { name: 'AbortError' });
+  const checkpointRow = interrupted.table(state.CONTEXT_HANDLE_STATE_DOMAIN)[0];
+  const checkpoint = JSON.parse(interrupted.shared.contents.get(checkpointRow.content_object_id));
+  assert.equal(checkpoint.nextOccurrence, 32);
+  assert.ok(checkpoint.facts.filter(value => value.entries.length).every(value => value.identityContractRevision === undefined));
+  assert.doesNotMatch(JSON.stringify(checkpoint), /currentOrigin|legacyOrigin|frozen_recipe/,
+    'diagnostic provenance is not part of the persistent checkpoint format');
+
+  const resumed = fixture(interrupted.shared);
+  assert.deepEqual(await upgradePendingConversationContextHandles(resumed.database, resumed.store), []);
+  assert.deepEqual((await readConversationContextHandleState(resumed.database, resumed.store, 'conversation')).catalog, expected.catalog);
+  assert.equal(resumed.metrics.reads.filter(id => id.startsWith('recipe-')).length, 34);
+  const row = structuredClone(resumed.table(state.CONTEXT_HANDLE_STATE_DOMAIN)[0]);
+  const cold = fixture(resumed.shared);
+  assert.deepEqual(await upgradePendingConversationContextHandles(cold.database, cold.store), []);
+  assert.deepEqual((await readConversationContextHandleState(cold.database, cold.store, 'conversation')).catalog, expected.catalog);
+  assert.deepEqual(cold.table(state.CONTEXT_HANDLE_STATE_DOMAIN)[0], row);
+  for (const [key, bytes] of before) assert.deepEqual(cold.shared.contents.get(key), bytes);
+});
+
+test('a conflicting fact restored from a checkpoint is identified as checkpoint evidence, not invented original request provenance', async () => {
+  const inputs = Array.from({ length: 40 }, (_, index) => ({ catalog: index < 36
+    ? catalog({ kind: 'process', ref: 'P3526', target: 'current-target' }) : oldProcess('old-target', 'P3526') }));
+  const f = await selectedHistoryFixture(inputs);
+  const controller = new AbortController();
+  await assert.rejects(upgradePendingConversationContextHandles(f.database, f.store, {
+    signal: controller.signal, onProgress(value) { if (value.completedRequests === 35) controller.abort(); }
+  }), { name: 'AbortError' });
+  const cold = fixture(f.shared);
+  const [failure] = await upgradePendingConversationContextHandles(cold.database, cold.store);
+  assert.equal(failure.error.code, 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT');
+  assert.ok(failure.error.contextHandleEvidence.witnesses.some(value =>
+    value.currentOrigin?.source === 'upgrade_checkpoint' && value.currentOrigin.nextOccurrence === 32));
+  assert.ok(failure.error.contextHandleEvidence.witnesses.some(value => value.legacyOrigin?.source === 'frozen_recipe'));
+});
+
+test('selected-root upgrade excludes a discarded current-contract branch instead of retiring its colliding process number', async () => {
+  const f = await selectedHistoryFixture([{ catalog: catalog({ kind: 'process', ref: 'P3526', target: 'selected-process' }) }]);
+  addModelOccurrence(f, 'discarded', catalog({ kind: 'process', ref: 'P3526', target: 'discarded-process' }));
+  assert.deepEqual(await upgradePendingConversationContextHandles(f.database, f.store), []);
+  const upgraded = (await readConversationContextHandleState(f.database, f.store, 'conversation')).catalog;
+  assert.deepEqual(upgraded.entries, [{ kind: 'process', ref: 'P3526', target: 'selected-process' }]);
+  assert.deepEqual(upgraded.retiredRefs, []);
+  assert.ok(!f.metrics.reads.includes('recipe-discarded'));
+});
+
+/** Mirror SQLite's indexed immutable-source reads, rather than benchmarking this fake's Array.find. */
+function indexImmutableHistory(f) {
+  const mutable = new Set([state.CONTEXT_HANDLE_STATE_DOMAIN, 'ContextRootHandleCatalog', 'ConversationContextHeadLink', 'ContentObject']);
+  const indexes = new Map();
+  const rowsFor = read => {
+    const keys = Object.keys(read.where ?? {}).sort();
+    const indexKey = `${read.domain}/${keys.join(',')}`;
+    const encode = row => JSON.stringify(keys.map(key => typeof row[key] === 'bigint' ? String(row[key]) : row[key]));
+    let index = indexes.get(indexKey);
+    if (!index) {
+      index = new Map();
+      for (const row of f.table(read.domain)) {
+        const key = encode(row); const rows = index.get(key) ?? [];
+        rows.push(row); index.set(key, rows);
+      }
+      indexes.set(indexKey, index);
+    }
+    return index.get(encode(read.where ?? {})) ?? [];
+  };
+  const byId = new Map([...f.shared.tables].map(([domain, rows]) => [domain, new Map(rows.map(row => [row.id, row]))]));
+  const transaction = f.database.transaction.bind(f.database);
+  const filterSteps = steps => {
+    const mutableSteps = [];
+    for (const step of steps) {
+      if (step.kind === 'savepoint') {
+        mutableSteps.push({ ...step, steps: filterSteps(step.steps) });
+        continue;
+      }
+      const sourceAssertion = step.kind === 'assert' && step.domain === 'ContentObject' && byId.get(step.domain)?.has(step.id);
+      if (mutable.has(step.domain) && !sourceAssertion) { mutableSteps.push(step); continue; }
+      // These test sources never change. Validate every assertion using the same indexes as
+      // reads; retain all mutable assertions and writes in the ordinary transactional fixture.
+      if (step.kind === 'assert') {
+        const row = byId.get(step.domain)?.get(step.id);
+        assert.ok(row && Object.entries(step.where).every(([key, value]) => row[key] === value));
+      } else if (step.kind === 'assertNone') assert.equal(rowsFor(step).length, 0);
+      else if (step.kind === 'assertExactIds') {
+        assert.deepEqual(rowsFor(step).map(row => row.id).sort(), [...step.expectedIds].sort());
+      } else throw new Error(`Long-history upgrade unexpectedly mutated immutable source domain ${step.domain}.`);
+    }
+    return mutableSteps;
+  };
+  f.database.transaction = steps => transaction(filterSteps(steps));
+  const snapshot = f.database.snapshot.bind(f.database), snapshotAll = f.database.snapshotAll.bind(f.database);
+  f.database.snapshot = async reads => ({ snapshot: await Promise.all(reads.map(async read => {
+    const immutableContent = read.kind === 'get' && read.domain === 'ContentObject' && byId.get(read.domain)?.has(read.id);
+    if (mutable.has(read.domain) && !immutableContent) return (await snapshot([read])).snapshot[0];
+    f.metrics.queries.push(read);
+    return structuredClone(read.kind === 'get' ? byId.get(read.domain)?.get(read.id) ?? null
+      : rowsFor(read).slice(0, read.limit ?? Infinity));
+  })) });
+  f.database.snapshotAll = async read => {
+    if (mutable.has(read.domain)) return snapshotAll(read);
+    f.metrics.queries.push(read);
+    return { snapshot: structuredClone(rowsFor(read)) };
+  };
+  f.database.materializeContext = async rootId => {
+    const root = byId.get('ContextSequenceRoot').get(rootId), records = [];
+    for (let nodeId = root.root_node_id; nodeId !== null;) {
+      const node = byId.get('ContextSequenceNode').get(nodeId);
+      const segment = byId.get('ContextSegment').get(node.segment_id);
+      records.push({ node, segment, contentObject: byId.get('ContentObject').get(segment.content_object_id) });
+      nodeId = node.parent_node_id;
+    }
+    return { snapshotCommitSeq: '1', snapshot: structuredClone({ root, records: records.reverse() }) };
+  };
+}
+
+test('17000 historical occurrences resume from their raw checkpoint with bounded facts and event-loop progress', { timeout: 120000 }, async () => {
+  const count = 17000;
+  const f = await selectedHistoryFixture(Array.from({ length: count }, (_, index) => ({
+    catalog: oldProcess(index === count - 1 ? 'old-b' : 'old-a'), text: index === 8200 ? 'P1 P90000' : 'P1'
+  })));
+  indexImmutableHistory(f);
+  const controller = new AbortController();
+  let eventLoopProgress = false;
+  const pendingTick = new Promise(resolve => setImmediate(() => { eventLoopProgress = true; resolve(); }));
+  await assert.rejects(upgradePendingConversationContextHandles(f.database, f.store, {
+    signal: controller.signal, onProgress(value) {
+      if (value.completedRequests === 8193) {
+        assert.equal(eventLoopProgress, true);
+        controller.abort();
+      }
+    }
+  }).then(failures => { assert.deepEqual(failures, []); }), { name: 'AbortError' });
+  await pendingTick;
+  const row = f.table(state.CONTEXT_HANDLE_STATE_DOMAIN)[0];
+  const checkpoint = JSON.parse(f.shared.contents.get(row.content_object_id));
+  assert.equal(checkpoint.nextOccurrence, 8192);
+  assert.equal(checkpoint.facts.reduce((sum, value) => sum + value.entries.length, 0), 1,
+    'repeated cumulative evidence is retained once, not once per occurrence');
+  assert.ok(f.metrics.prepares <= Math.ceil(Math.log2(count)));
+  assert.ok(JSON.stringify(checkpoint).length < 1000);
+
+  const resumed = fixture(f.shared); indexImmutableHistory(resumed);
+  assert.deepEqual(await upgradePendingConversationContextHandles(resumed.database, resumed.store), []);
+  const result = await readConversationContextHandleState(resumed.database, resumed.store, 'conversation');
+  assert.deepEqual(result.catalog.entries.map(entry => entry.ref), ['P90001', 'P90002']);
+  assert.deepEqual(result.catalog.retiredRefs, ['P1']);
+  assert.equal(result.requiresNativeReset, true);
+  assert.equal(resumed.metrics.reads.filter(id => id.startsWith('recipe-')).length, count - 8192);
+  assert.ok(resumed.metrics.prepares <= 2, 'only the next exponential checkpoint and ready catalog are written');
+});

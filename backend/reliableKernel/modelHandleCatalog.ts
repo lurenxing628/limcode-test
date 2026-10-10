@@ -96,6 +96,24 @@ export function prepareModelHandleCatalog(value: unknown): PreparedModelHandleCa
 
 export const CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION = '2026-10-01';
 
+/** Bounded diagnostics contain identities, never display metadata or historical message bodies. */
+export interface ModelHandleIdentityConflict {
+  kind: ModelHandleKind;
+  referenceCount: number;
+  targetCount: number;
+  currentFactCount: number;
+  legacyFactCount: number;
+  facts: Array<{ ref: string; target: string; current: boolean }>;
+  truncated: boolean;
+}
+export class ModelHandleIdentityConflictError extends Error {
+  public readonly code = 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT';
+  public constructor(message: string, public readonly conflict?: ModelHandleIdentityConflict) {
+    super(message);
+    this.name = 'ModelHandleIdentityConflictError';
+  }
+}
+
 interface ModelHandleCandidate {
   kind: ModelHandleKind;
   target: string;
@@ -338,13 +356,23 @@ export function mergeModelHandleCatalogs(...catalogs: readonly ModelHandleCatalo
  * or request windows changed. Retire each ambiguous identity component in full instead of choosing
  * a historical target. Current-contract facts and registry-owned attachment identities stay strict.
  */
-export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelHandleCatalog[]): ModelHandleCatalog {
+export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelHandleCatalog[],
+  options: { allocationHighWater?: Partial<Record<ModelHandleKind, number>> } = {}): ModelHandleCatalog {
   const retired = new Set<string>();
-  const counters = new Map<ModelHandleKind, number>();
+  // A reserved ordinal can have no selected binding (private lookup entries, edited prose or a
+  // fork's reservation scope). It must fence repair allocation, not just the returned catalog.
+  const allocationHighWater = normalizeAllocationHighWater(options.allocationHighWater) ?? {};
+  const counters = new Map<ModelHandleKind, number>(
+    Object.entries(allocationHighWater) as Array<[ModelHandleKind, number]>);
   const uniqueFacts = new Map<string, { entry: ModelHandleEntry; current: boolean }>();
   const retiredTargets = new Map<string, ModelHandleEntry>();
   for (const input of catalogs) {
     const catalog = normalizeModelHandleCatalog(input);
+    for (const [kind, ordinal] of Object.entries(catalog.allocationHighWater ?? {})) {
+      const handleKind = kind as ModelHandleKind;
+      allocationHighWater[handleKind] = Math.max(allocationHighWater[handleKind] ?? 0, ordinal);
+      counters.set(handleKind, Math.max(counters.get(handleKind) ?? 0, ordinal));
+    }
     const current = catalog.identityContractRevision === CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION;
     for (const ref of catalog.retiredRefs ?? []) {
       retired.add(ref);
@@ -426,7 +454,15 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
       continue;
     }
     if (component.some(fact => fact.current || !isPersistentContextHandle(fact.entry.kind))) {
-      throw modelHandleIdentityError(`Conflicting frozen child reference ${component[0]!.entry.ref}.`);
+      const currentFactCount = component.filter(fact => fact.current).length;
+      throw modelHandleIdentityError(
+        `Conflicting frozen model handle reference ${component[0]!.entry.ref} (${component[0]!.entry.kind}; `
+        + `${refs.size} refs, ${targets.size} targets, ${currentFactCount} current and ${component.length - currentFactCount} legacy facts).`,
+        { kind: component[0]!.entry.kind, referenceCount: refs.size, targetCount: targets.size,
+          currentFactCount, legacyFactCount: component.length - currentFactCount,
+          facts: component.slice(0, 8).map(fact => ({ ref: fact.entry.ref,
+            target: fact.entry.target, current: fact.current })),
+          truncated: component.length > 8 });
     }
     for (const ref of refs) retired.add(ref);
     for (const entry of targets.values()) reallocate.push(entry);
@@ -446,7 +482,7 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
     entries.push({ ...entry, ref: `${HANDLE_PREFIX[entry.kind]}${ordinal}` });
   }
   entries.sort((left, right) => compareModelHandleRefs(left.ref, right.ref));
-  return currentModelHandleCatalog(entries, [...retired], mergeAllocationHighWater(catalogs));
+  return currentModelHandleCatalog(entries, [...retired], allocationHighWater);
 }
 
 export function renderRetiredModelHandleNotice(catalogInput: ModelHandleCatalog | unknown): string | undefined {
@@ -503,8 +539,8 @@ function requireSafeHandleOrdinal(ref: string): void {
   if (!Number.isSafeInteger(ordinal) || ordinal <= 0) throw new RangeError(`Model handle ${ref} is outside the safe ordinal range.`);
 }
 
-function modelHandleIdentityError(message: string): Error {
-  return Object.assign(new Error(message), { code: 'MODEL_CONTEXT_CHILD_HANDLE_CONFLICT' });
+function modelHandleIdentityError(message: string, conflict?: ModelHandleIdentityConflict): ModelHandleIdentityConflictError {
+  return new ModelHandleIdentityConflictError(message, conflict);
 }
 
 export function modelHandleRef(

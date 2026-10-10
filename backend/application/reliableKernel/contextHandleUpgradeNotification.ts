@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import type { ReliableKernelApplication } from '../../reliableKernel/runtimeApplication';
 import { readConversationContextHandleStateRow } from '../../reliableKernel/conversationContextHandleState';
+import { ModelHandleIdentityConflictError } from '../../reliableKernel/modelHandleCatalog';
 import { listPendingContextHandleUpgrades, upgradePendingConversationContextHandles, upgradeConversationContextHandles,
   type ContextHandleUpgradeFailure } from '../../reliableKernel/conversationContextHandleUpgrade';
 
@@ -67,6 +68,11 @@ export function upgradeContextHandlesWithProgress(application: ReliableKernelApp
     for (const failure of failures) {
       notification.failed.set(failure.conversationId, failure);
       console.error(`[LimCode] 对话 ${failure.conversationId} 的引用目录升级暂停。`, failure.error);
+      if (failure.error instanceof ModelHandleIdentityConflictError && failure.error.conflict) {
+        // Error inspection otherwise collapses nested witnesses to [Object]. Only our bounded,
+        // body-free identity diagnostics are serialized, never arbitrary provider/tool errors.
+        console.error(`[LimCode] 引用目录冲突证据：${JSON.stringify(failure.error)}`);
+      }
     }
     void vscode.window.showWarningMessage(
       `${failures.length} 个对话的引用目录暂未升级，其余对话已继续处理。原历史保留，详细原因见日志。`, '重试升级'

@@ -11,7 +11,8 @@ import { readForkContextHandleReservationEvidence } from './forkContextHandleRes
 import { readHistoricalCompressionHandleCatalog } from './historicalCompressionHandleCatalog';
 import { buildModelHandleCatalog, CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION,
   isCollaborationHandleTool, isPersistentContextHandle, normalizeModelHandleCatalog,
-  mergeModelHandleCatalogs, reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog,
+  mergeModelHandleCatalogs, ModelHandleIdentityConflictError,
+  reconcileHistoricalModelHandleCatalogs, type ModelHandleCatalog,
   type ModelHandleEntry, type ModelHandleKind } from './modelHandleCatalog';
 import { modelRequestIdFor } from './modelProviderControlPlane';
 import { parseNativeToolCallCheckpoint } from './nativeToolFacts';
@@ -65,6 +66,14 @@ const empty = (): ModelHandleCatalog => ({ entries: [], retiredRefs: [],
   identityContractRevision: CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION });
 interface RequestEvidence { request: DomainRow; conversationId: string; recipe: Record<string, unknown>; catalog: ModelHandleCatalog;
   reminder?: string; reinjectedContentId?: string; inputBindings?: ModelHandleCatalog; producerScope?: ContextHandleProducerScope }
+interface ContextHandleEvidenceOrigin {
+  source: 'frozen_recipe' | 'native_projection' | 'native_admission' | 'native_request_scope' | 'upgrade_checkpoint';
+  requestId?: string;
+  contentObjectId?: string;
+  eventId?: string;
+  rootId?: string;
+  nextOccurrence?: number;
+}
 interface SegmentEvidence {
   id: string; kind: string; contentId: string;
   occurrences: ContextHandleOccurrenceEvidence[];
@@ -80,7 +89,7 @@ export async function readContextHandleOccurrenceCatalog(database: RuntimeDataba
   reader.onProducerScope = onProducerScope;
   reader.reserve(baseCatalog);
   const facts = await reader.occurrence(occurrence, baseCatalog);
-  return withFloor(reconcileHistoricalModelHandleCatalogs(facts), reader.highWater);
+  return withFloor(reconcileHistoricalModelHandleCatalogs(facts, { allocationHighWater: reader.highWater }), reader.highWater);
 }
 
 /** Exact visible input values select a subset of the already allocated request-private lookup. */
@@ -255,7 +264,8 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
   if (!Number.isSafeInteger(start) || start < 0 || start > segments.length) throw invalid('Context reference checkpoint is outside its source scope.');
   if (options.resume) reader.reserveFloor(options.resume.allocationHighWater);
   const facts = new SelectedFactIndex();
-  for (const fact of options.resume?.facts ?? []) facts.add(fact);
+  for (const fact of options.resume?.facts ?? []) facts.add(fact, { source: 'upgrade_checkpoint',
+    rootId, nextOccurrence: start });
   if (!options.resume && (base.retiredRefs?.length ?? 0)) facts.add({ ...base, entries: [] });
   reader.selectedFacts = facts;
   let nextCheckpoint = 32;
@@ -282,12 +292,12 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
       for (const planned of segment.occurrences) {
         const occurrence = planned.kind === 'message' ? { ...planned, content: content.text,
           contentType: id(content.metadata.content_type) } : planned;
-        for (const fact of await reader.occurrence(occurrence, base, lookups)) facts.add(fact);
+        for (const fact of await reader.occurrence(occurrence, base, lookups)) facts.add(fact, reader.origins.get(fact));
       }
     } else {
       // Runtime content and compression summaries may contain frozen short refs. A summary never
       // supplies an identity that was absent from its proved producer/source lookup.
-      for (const fact of reader.select([content.text], lookups, base)) facts.add(fact);
+      for (const fact of reader.select([content.text], lookups, base)) facts.add(fact, reader.origins.get(fact));
     }
     // Reconciliation is delayed across the selected raw facts: a legacy map is never prematurely
     // promoted to the strict current contract merely because it happened to be read first.
@@ -300,8 +310,14 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
     options.onProgress?.({ completedRequests: index + 1, totalRequests: segments.length });
     await yieldToEventLoop();
   }
-  const catalog = withFloor(reconcileHistoricalModelHandleCatalogs(facts.catalogs()), reader.highWater);
-  return { catalog, allocationHighWater: { ...catalog.allocationHighWater }, assertions: reader.assertions };
+  try {
+    const catalog = withFloor(reconcileHistoricalModelHandleCatalogs(facts.catalogs(),
+      { allocationHighWater: reader.highWater }), reader.highWater);
+    return { catalog, allocationHighWater: { ...catalog.allocationHighWater }, assertions: reader.assertions };
+  } catch (error) {
+    facts.annotateConflict(error, conversationId, rootId);
+    throw error;
+  }
 }
 
 /**
@@ -370,6 +386,8 @@ async function readUserTailPrefixCatalog(database: RuntimeDatabase, store: Conte
 }
 
 class OccurrenceReader {
+  /** Transient provenance belongs to selected evidence, not to persisted handle identities. */
+  public readonly origins = new WeakMap<ModelHandleCatalog, ContextHandleEvidenceOrigin>();
   public readonly assertions: RepositoryTransactionStep[] = [];
   public readonly highWater: ContextHandleAllocationHighWater = {};
   public segmentPositions = new Map<string, number>();
@@ -466,7 +484,11 @@ class OccurrenceReader {
             || typeof scope.resetFence !== 'string' || !/^\d+$/.test(scope.resetFence)) throw invalid('Frozen Context handle scope is invalid.');
           producerScope = scope as unknown as ContextHandleProducerScope;
         }
-        const catalog = this.memo.persistent(this.memo.catalog(await resolveFrozenModelHandleCatalog(this.database, this.store, parsed) as unknown as PlainJsonValue));
+        // The memo can share equal maps across requests. A private shallow wrapper keeps their
+        // diagnostic origins distinct without copying the cumulative entries or changing markers.
+        const catalog = { ...this.memo.persistent(this.memo.catalog(
+          await resolveFrozenModelHandleCatalog(this.database, this.store, parsed) as unknown as PlainJsonValue)) };
+        this.origins.set(catalog, { source: 'frozen_recipe', requestId: key, contentObjectId: id(request.recipe_object_id) });
         let inputBindings: ModelHandleCatalog | undefined;
         if (parsed.contextHandleInputBindings !== undefined) {
           inputBindings = normalizeModelHandleCatalog(parsed.contextHandleInputBindings);
@@ -584,7 +606,12 @@ class OccurrenceReader {
       const entries = catalog.entries.filter(entry => isPersistentContextHandle(entry.kind)
         && (refs.has(entry.ref) || targets.has(`${entry.kind}\0${entry.target}`)));
       for (const entry of entries) { resolvedRefs.add(entry.ref); resolvedTargets.add(`${entry.kind}\0${entry.target}`); }
-      if (entries.length || catalog.retiredRefs?.length) chosen.push({ ...catalog, entries });
+      if (entries.length || catalog.retiredRefs?.length) {
+        const selected = { ...catalog, entries };
+        const origin = this.origins.get(catalog);
+        if (origin) this.origins.set(selected, origin);
+        chosen.push(selected);
+      }
     }
     this.reserve(base);
     for (const fact of this.selectedFacts?.select(refs, targets, resolvedRefs, resolvedTargets) ?? []) {
@@ -639,6 +666,8 @@ class OccurrenceReader {
           const envelope = object(JSON.parse((await this.content(id(checkpoint.content_object_id))).text), 'Native checkpoint');
           const proof = parseNativeToolCallCheckpoint(envelope.content);
           if (proof.providerCallId !== source.provider_call_id || proof.toolName !== call.tool_name) throw invalid('Native call proof conflicts with its source.');
+          this.origins.set(proof.modelHandleCatalog, { source: 'native_admission', requestId: id(evidence.request.id),
+            contentObjectId: id(checkpoint.content_object_id), eventId: id(admission.id) });
           catalogs.push(proof.modelHandleCatalog); values.push(proof.arguments, proof.resolvedArguments);
         }
         if (this.selectedFacts) catalogs.push(...await this.nativeLookups(evidence));
@@ -655,6 +684,8 @@ class OccurrenceReader {
           const projection = object(JSON.parse((await this.content(id(projections[0].content_object_id))).text), 'Native result projection');
           await this.validateProjection(projection, evidence, occurrence.toolCallId, occurrence.toolModelResultId);
           const catalog = projectionCatalog(projection);
+          this.origins.set(catalog, { source: 'native_projection', requestId: id(evidence.request.id),
+            contentObjectId: id(projections[0].content_object_id), eventId: id(projections[0].id) });
           catalogs.push(catalog);
           // Projected P# tokens belong to this exact frozen table. Feeding them back through
           // every other lookup would turn an unrelated table's unused P# into false evidence.
@@ -686,6 +717,8 @@ class OccurrenceReader {
           await yieldToEventLoop(); this.check();
         }
       }
+      if (catalog !== evidence.catalog) this.origins.set(catalog, { source: 'native_request_scope', requestId,
+        contentObjectId: id(evidence.request.recipe_object_id) });
       return catalog;
     })() };
     return [await this.nativeScope.catalog];
@@ -828,23 +861,43 @@ function projectionCatalog(value: Record<string, unknown>): ModelHandleCatalog {
 }
 /** Compact raw identity facts plus O(1) unambiguous lookup. No cumulative recipe is retained. */
 class SelectedFactIndex {
-  private readonly facts = new Map<string, { entry: ModelHandleEntry; current: boolean }>();
+  private readonly facts = new Map<string, { entry: ModelHandleEntry; current: boolean;
+    currentOrigin?: ContextHandleEvidenceOrigin; legacyOrigin?: ContextHandleEvidenceOrigin }>();
   private readonly byRef = new Map<string, Set<string>>();
   private readonly byTarget = new Map<string, Set<string>>();
   private readonly retired = new Set<string>();
-  public add(catalog: ModelHandleCatalog): void {
+  public add(catalog: ModelHandleCatalog, origin?: ContextHandleEvidenceOrigin): void {
     for (const ref of catalog.retiredRefs ?? []) this.retired.add(ref);
     const current = catalog.identityContractRevision !== undefined;
     for (const entry of catalog.entries) {
       const target = `${entry.kind}\0${entry.target}`;
       const key = `${entry.ref}\0${target}`;
       const previous = this.facts.get(key);
-      if (previous) { previous.current ||= current; continue; }
-      this.facts.set(key, { entry, current });
+      const originKey = current ? 'currentOrigin' : 'legacyOrigin';
+      if (previous) {
+        previous.current ||= current;
+        // Repeated cumulative recipes share the first witness. At most two source objects are
+        // retained per unique mapping, never a list of every request that repeated that mapping.
+        if (origin && !previous[originKey]) previous[originKey] = origin;
+        continue;
+      }
+      this.facts.set(key, { entry, current, ...(origin ? { [originKey]: origin } : {}) });
       for (const [index, identity] of [[this.byRef, entry.ref], [this.byTarget, target]] as const) {
         const members = index.get(identity) ?? new Set<string>(); members.add(key); index.set(identity, members);
       }
     }
+  }
+  public annotateConflict(error: unknown, conversationId: string, rootId: string): void {
+    if (!(error instanceof ModelHandleIdentityConflictError) || !error.conflict) return;
+    const wanted = new Set(error.conflict.facts.map(fact => `${fact.ref}\0${fact.target}`));
+    const witnesses = [];
+    for (const { entry, currentOrigin, legacyOrigin } of this.facts.values()) {
+      if (entry.kind !== error.conflict.kind || !wanted.has(`${entry.ref}\0${entry.target}`)) continue;
+      witnesses.push({ ref: entry.ref, target: entry.target,
+        ...(currentOrigin ? { currentOrigin } : {}), ...(legacyOrigin ? { legacyOrigin } : {}) });
+      if (witnesses.length === wanted.size) break;
+    }
+    Object.assign(error, { contextHandleEvidence: { conversationId, rootId, witnesses } });
   }
   public catalogs(): ModelHandleCatalog[] {
     const current = empty(); const legacy: ModelHandleCatalog = { entries: [] };
