@@ -145,6 +145,7 @@ async function rebuildConversation(database: RuntimeDatabase, store: ContentAddr
     await readContextHandleRootEvidence(database, store, conversationId, rootId, {
       signal, ...(checkpoint ? { resume: checkpoint }
         : { prefixProvenanceRevision: BigInt(String(row.provenance_revision)) }),
+      allowCurrentPersistentReallocation: true,
       onProgress: value => { assertActive(); progress(value.completedRequests, value.totalRequests); },
       onCheckpoint: async checkpoint => {
         assertActive();
