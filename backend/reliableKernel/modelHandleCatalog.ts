@@ -357,7 +357,10 @@ export function mergeModelHandleCatalogs(...catalogs: readonly ModelHandleCatalo
  * a historical target. Current-contract facts and registry-owned attachment identities stay strict.
  */
 export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelHandleCatalog[],
-  options: { allocationHighWater?: Partial<Record<ModelHandleKind, number>> } = {}): ModelHandleCatalog {
+  options: {
+    allocationHighWater?: Partial<Record<ModelHandleKind, number>>;
+    allowCurrentPersistentReallocation?: boolean;
+  } = {}): ModelHandleCatalog {
   const retired = new Set<string>();
   // A reserved ordinal can have no selected binding (private lookup entries, edited prose or a
   // fork's reservation scope). It must fence repair allocation, not just the returned catalog.
@@ -453,7 +456,7 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
       entries.push([...targets.values()][0]!);
       continue;
     }
-    if (component.some(fact => fact.current || !isPersistentContextHandle(fact.entry.kind))) {
+    if (component.some(fact => (!options.allowCurrentPersistentReallocation && fact.current) || !isPersistentContextHandle(fact.entry.kind))) {
       const currentFactCount = component.filter(fact => fact.current).length;
       throw modelHandleIdentityError(
         `Conflicting frozen model handle reference ${component[0]!.entry.ref} (${component[0]!.entry.kind}; `

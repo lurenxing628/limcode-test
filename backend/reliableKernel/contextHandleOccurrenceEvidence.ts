@@ -49,6 +49,7 @@ export interface ContextHandleRootEvidenceOptions {
   resume?: ContextHandleRootCheckpoint;
   /** Explicit recovery may reuse a same-generation prefix only behind a producer-free user tail. */
   prefixProvenanceRevision?: bigint;
+  allowCurrentPersistentReallocation?: boolean;
   onProgress?(progress: { completedRequests: number; totalRequests: number }): void;
   onCheckpoint?(checkpoint: ContextHandleRootCheckpoint): Promise<void>;
 }
@@ -312,7 +313,7 @@ export async function readContextHandleRootEvidence(database: RuntimeDatabase, s
   }
   try {
     const catalog = withFloor(reconcileHistoricalModelHandleCatalogs(facts.catalogs(),
-      { allocationHighWater: reader.highWater }), reader.highWater);
+      { allocationHighWater: reader.highWater, allowCurrentPersistentReallocation: options.allowCurrentPersistentReallocation }), reader.highWater);
     return { catalog, allocationHighWater: { ...catalog.allocationHighWater }, assertions: reader.assertions };
   } catch (error) {
     facts.annotateConflict(error, conversationId, rootId);

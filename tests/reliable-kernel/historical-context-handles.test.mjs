@@ -1127,3 +1127,18 @@ test('large connected current conflicts report bounded samples rather than cumul
     return isConflict(error);
   });
 });
+
+test('historical context handle upgrade reallocates conflicting current persistent handles instead of failing', () => {
+  const target1 = 'process-1';
+  const target2 = 'process-2';
+  const result = reconcileHistoricalModelHandleCatalogs([
+    current([entry('process', 'P3526', target1)]),
+    current([entry('process', 'P3526', target2)])
+  ], { allowCurrentPersistentReallocation: true });
+  assert.deepEqual(result.retiredRefs, ['P3526']);
+  assert.equal(result.entries.length, 2);
+  assert.notEqual(modelHandleRef(result, 'process', target1), 'P3526');
+  assert.notEqual(modelHandleRef(result, 'process', target2), 'P3526');
+  assert.notEqual(modelHandleRef(result, 'process', target1), modelHandleRef(result, 'process', target2));
+});
+
