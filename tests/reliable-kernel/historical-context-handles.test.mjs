@@ -1142,3 +1142,9 @@ test('historical context handle upgrade reallocates conflicting current persiste
   assert.notEqual(modelHandleRef(result, 'process', target1), modelHandleRef(result, 'process', target2));
 });
 
+test('historical upgrade reallocation stays limited to current-contract facts: a current fact against a legacy fact still conflicts', () => {
+  assert.throws(() => reconcileHistoricalModelHandleCatalogs([
+    legacy(entry('process', 'P3526', 'old-target')),
+    current([entry('process', 'P3526', 'new-target')])
+  ], { allowCurrentPersistentReallocation: true }), isConflict);
+});

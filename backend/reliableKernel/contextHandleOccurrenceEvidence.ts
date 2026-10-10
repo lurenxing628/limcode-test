@@ -49,6 +49,7 @@ export interface ContextHandleRootEvidenceOptions {
   resume?: ContextHandleRootCheckpoint;
   /** Explicit recovery may reuse a same-generation prefix only behind a producer-free user tail. */
   prefixProvenanceRevision?: bigint;
+  /** Offline upgrade only: current-contract facts that collide among themselves are retired and reallocated. */
   allowCurrentPersistentReallocation?: boolean;
   onProgress?(progress: { completedRequests: number; totalRequests: number }): void;
   onCheckpoint?(checkpoint: ContextHandleRootCheckpoint): Promise<void>;

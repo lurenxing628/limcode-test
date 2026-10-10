@@ -359,6 +359,7 @@ export function mergeModelHandleCatalogs(...catalogs: readonly ModelHandleCatalo
 export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelHandleCatalog[],
   options: {
     allocationHighWater?: Partial<Record<ModelHandleKind, number>>;
+    /** Offline upgrade only: current-contract facts that collide among themselves are retired and reallocated. */
     allowCurrentPersistentReallocation?: boolean;
   } = {}): ModelHandleCatalog {
   const retired = new Set<string>();
@@ -456,7 +457,10 @@ export function reconcileHistoricalModelHandleCatalogs(catalogs: readonly ModelH
       entries.push([...targets.values()][0]!);
       continue;
     }
-    if (component.some(fact => (!options.allowCurrentPersistentReallocation && fact.current) || !isPersistentContextHandle(fact.entry.kind))) {
+    // An offline upgrade may retire and reallocate current-contract facts that collide only among
+    // themselves; a current fact against a legacy fact stays a real conflict to report.
+    const reallocatesCurrent = options.allowCurrentPersistentReallocation === true && component.every(fact => fact.current);
+    if (component.some(fact => (!reallocatesCurrent && fact.current) || !isPersistentContextHandle(fact.entry.kind))) {
       const currentFactCount = component.filter(fact => fact.current).length;
       throw modelHandleIdentityError(
         `Conflicting frozen model handle reference ${component[0]!.entry.ref} (${component[0]!.entry.kind}; `
