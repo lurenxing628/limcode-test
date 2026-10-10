@@ -39,6 +39,7 @@ const vscodeMock = {
   ProgressLocation: { Notification: 15 },
   window: {
     state: { focused: true },
+    onDidChangeActiveTextEditor: () => ({ dispose() {} }),
     async showOpenDialog() { ui.calls.push(['open-dialog']); return [MockUri.file(ui.picked)]; },
     async showWarningMessage(message, options, ...items) {
       ui.calls.push(['warning', message, options?.detail]);

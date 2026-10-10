@@ -1132,7 +1132,7 @@ function loadFacade() {
     Uri: MockUri,
     EventEmitter: class { event = () => ({ dispose() {} }); fire() {} dispose() {} },
     ProgressLocation: { Notification: 15 },
-    window: { state: { focused: true }, async showWarningMessage() {}, async showInformationMessage() {}, async showErrorMessage() {} },
+    window: { state: { focused: true }, onDidChangeActiveTextEditor: () => ({ dispose() {} }), async showWarningMessage() {}, async showInformationMessage() {}, async showErrorMessage() {} },
     workspace: { workspaceFile: undefined, workspaceFolders: [] },
     commands: { async executeCommand() {} }
   };

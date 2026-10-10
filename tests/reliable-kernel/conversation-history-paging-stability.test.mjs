@@ -360,16 +360,21 @@ test('超出精确页码窗口的深页按键集边界读取，最后一页从�
 const workspaceFolder = (uri, index) => ({ uri: { toString: () => uri }, name: uri.split('/').pop(), index });
 
 /** Drives the real Facade's current-project resolution with the vscode boundary replaced. */
-function projectResolutionFixture({ folders = [], activeEditorUri = null, remembered, writes = [] } = {}) {
+function projectResolutionFixture({ folders = [], activeEditorUri = null, remembered, writes = [], stored = {} } = {}) {
   const facade = Object.create(Facade.prototype);
+  const listeners = [];
   Object.assign(facade, {
     lastActiveProjectFolderUri: remembered,
-    context: { workspaceState: { update: (key, value) => { writes.push({ key, value }); return Promise.resolve(); } } }
+    context: { workspaceState: {
+      get: (key) => stored[key],
+      update: (key, value) => { writes.push({ key, value }); return Promise.resolve(); }
+    } }
   });
   vscodeMock.window.activeTextEditor = activeEditorUri === null ? undefined : { document: { uri: { toString: () => activeEditorUri } } };
+  vscodeMock.window.onDidChangeActiveTextEditor = (listener) => { listeners.push(listener); return { dispose() {} }; };
   vscodeMock.workspace.workspaceFolders = folders;
   vscodeMock.workspace.getWorkspaceFolder = (uri) => folders.find((folder) => folder.uri.toString() === uri.toString());
-  return { facade, writes };
+  return { facade, writes, listeners };
 }
 
 test('多根工作区没有活动编辑器时当前项目沿用最近编辑过的文件夹', () => {
@@ -418,5 +423,18 @@ test('活动编辑器切换时记住所在文件夹并持久化，工作区外�
   vscodeMock.window.activeTextEditor = { document: { uri: { toString: () => 'file:///outside/notes.md' } } };
   facade.rememberActiveProjectFolder();
   assert.equal(facade.lastActiveProjectFolderUri, Q);
+  assert.deepEqual(writes, [{ key: 'limcode.lastActiveProjectFolderUri', value: Q }]);
+});
+
+test('工厂启动跟踪时读取记住的文件夹并订阅活动编辑器切换，切换后记忆随之更新', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade, writes, listeners } = projectResolutionFixture({ folders, stored: { 'limcode.lastActiveProjectFolderUri': P } });
+  facade.trackActiveProjectFolder();
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+  assert.equal(listeners.length, 1);
+  vscodeMock.window.activeTextEditor = { document: { uri: { toString: () => Q } } };
+  listeners[0]();
+  vscodeMock.window.activeTextEditor = undefined;
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
   assert.deepEqual(writes, [{ key: 'limcode.lastActiveProjectFolderUri', value: Q }]);
 });

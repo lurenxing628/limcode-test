@@ -194,9 +194,6 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         }
       });
     });
-    this.lastActiveProjectFolderUri = this.context.workspaceState.get<string>(LAST_ACTIVE_PROJECT_FOLDER_URI_KEY);
-    this.rememberActiveProjectFolder();
-    this.activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => this.rememberActiveProjectFolder());
   }
 
   /**
@@ -290,6 +287,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       facade = new VscodeReliableKernelApplicationFacade(
         context, product, pinnedDataRootPaths(context, runtimePlacement.configurationRootPath), runtimePlacement
       );
+      facade.trackActiveProjectFolder();
       return facade;
     }, undefined, wait);
   }
@@ -1238,6 +1236,13 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     // Multi-root with focus outside the editors (e.g. the chat panel): keep the folder the user
     // last edited in, instead of losing the current project and falling back to every conversation.
     return folders.find((folder) => folder.uri.toString() === this.lastActiveProjectFolderUri);
+  }
+
+  /** Loads the remembered folder and follows the active editor; only the VS Code factory starts this. */
+  private trackActiveProjectFolder(): void {
+    this.lastActiveProjectFolderUri = this.context.workspaceState.get<string>(LAST_ACTIVE_PROJECT_FOLDER_URI_KEY);
+    this.rememberActiveProjectFolder();
+    this.activeEditorSubscription = vscode.window.onDidChangeActiveTextEditor(() => this.rememberActiveProjectFolder());
   }
 
   private activeEditorWorkspaceFolder(): vscode.WorkspaceFolder | undefined {
