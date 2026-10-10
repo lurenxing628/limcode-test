@@ -1235,7 +1235,29 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     if (folders.length === 1) return folders[0];
     // Multi-root with focus outside the editors (e.g. the chat panel): keep the folder the user
     // last edited in, instead of losing the current project and falling back to every conversation.
-    return folders.find((folder) => folder.uri.toString() === this.lastActiveProjectFolderUri);
+    const remembered = folders.find((folder) => folder.uri.toString() === this.lastActiveProjectFolderUri);
+    if (remembered) return remembered;
+    // Nothing edited yet in this window: fall back to the open text tabs, but only when they all
+    // belong to one folder. Anything ambiguous keeps the every-conversation scope.
+    return this.soleFolderAmongOpenTextTabs(folders);
+  }
+
+  /** Infers the folder from open text tabs; used when no editor was ever activated in this window. */
+  private soleFolderAmongOpenTextTabs(folders: readonly vscode.WorkspaceFolder[]): vscode.WorkspaceFolder | undefined {
+    const tabGroups = vscode.window.tabGroups as typeof vscode.window.tabGroups | undefined;
+    const TabInputText = vscode.TabInputText as typeof vscode.TabInputText | undefined;
+    if (!tabGroups || !TabInputText || folders.length === 0) return undefined;
+    const folderUris = new Set<string>();
+    for (const group of tabGroups.all) {
+      for (const tab of group.tabs) {
+        if (!(tab.input instanceof TabInputText)) continue;
+        const folder = vscode.workspace.getWorkspaceFolder(tab.input.uri);
+        if (folder) folderUris.add(folder.uri.toString());
+      }
+    }
+    if (folderUris.size !== 1) return undefined;
+    const [uri] = folderUris;
+    return folders.find((folder) => folder.uri.toString() === uri);
   }
 
   /** Loads the remembered folder and follows the active editor; only the VS Code factory starts this. */

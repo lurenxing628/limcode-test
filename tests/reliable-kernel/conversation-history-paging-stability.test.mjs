@@ -11,6 +11,8 @@ const originalLoad = Module._load;
 const vscodeMock = {
   EventEmitter: class { event = () => {}; },
   Uri: { parse: (text) => ({ toString: () => text }) },
+  // 顶层键必须在 require 前定义：__importStar 只捕获加载时已存在的属性。
+  TabInputText: class { constructor(uri) { this.uri = uri; } },
   window: {},
   workspace: {}
 };
@@ -360,7 +362,7 @@ test('超出精确页码窗口的深页按键集边界读取，最后一页从�
 const workspaceFolder = (uri, index) => ({ uri: { toString: () => uri }, name: uri.split('/').pop(), index });
 
 /** Drives the real Facade's current-project resolution with the vscode boundary replaced. */
-function projectResolutionFixture({ folders = [], activeEditorUri = null, remembered, writes = [], stored = {} } = {}) {
+function projectResolutionFixture({ folders = [], activeEditorUri = null, remembered, writes = [], stored = {}, textTabs = [], otherTabs = 0 } = {}) {
   const facade = Object.create(Facade.prototype);
   const listeners = [];
   Object.assign(facade, {
@@ -373,7 +375,19 @@ function projectResolutionFixture({ folders = [], activeEditorUri = null, rememb
   vscodeMock.window.activeTextEditor = activeEditorUri === null ? undefined : { document: { uri: { toString: () => activeEditorUri } } };
   vscodeMock.window.onDidChangeActiveTextEditor = (listener) => { listeners.push(listener); return { dispose() {} }; };
   vscodeMock.workspace.workspaceFolders = folders;
-  vscodeMock.workspace.getWorkspaceFolder = (uri) => folders.find((folder) => folder.uri.toString() === uri.toString());
+  vscodeMock.workspace.getWorkspaceFolder = (uri) => {
+    const text = uri.toString();
+    return folders.find((folder) => {
+      const base = folder.uri.toString();
+      return text === base || text.startsWith(base + '/');
+    });
+  };
+  vscodeMock.window.tabGroups = {
+    all: [{ tabs: [
+      ...textTabs.map((uri) => ({ input: new vscodeMock.TabInputText({ toString: () => uri }) })),
+      ...Array.from({ length: otherTabs }, () => ({ input: { viewType: 'limcode.chat' } }))
+    ] }]
+  };
   return { facade, writes, listeners };
 }
 
@@ -437,4 +451,39 @@ test('工厂启动跟踪时读取记住的文件夹并订阅活动编辑器切�
   vscodeMock.window.activeTextEditor = undefined;
   assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
   assert.deepEqual(writes, [{ key: 'limcode.lastActiveProjectFolderUri', value: Q }]);
+});
+
+test('多根工作区没有记忆也没有活动编辑器时，打开的文本标签全在一个文件夹就采用它', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade } = projectResolutionFixture({
+    folders,
+    textTabs: [`${P}/src/a.ts`, `${P}/src/b.ts`, 'file:///outside/notes.md'],
+    otherTabs: 1
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('打开的文本标签横跨多个文件夹时当前项目回落到全部历史', () => {
+  const { facade } = projectResolutionFixture({
+    folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)],
+    textTabs: [`${P}/src/a.ts`, `${Q}/src/b.ts`]
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'all' });
+});
+
+test('记住的文件夹优先于打开的文本标签', () => {
+  const { facade } = projectResolutionFixture({
+    folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)],
+    remembered: P,
+    textTabs: [`${Q}/src/b.ts`]
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('没有打开任何文本标签时当前项目回落到全部历史', () => {
+  const { facade } = projectResolutionFixture({
+    folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)],
+    otherTabs: 1
+  });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'all' });
 });
