@@ -8,10 +8,14 @@ import { after, test } from 'node:test';
 const require = createRequire(import.meta.url);
 const Module = require('node:module');
 const originalLoad = Module._load;
+const vscodeMock = {
+  EventEmitter: class { event = () => {}; },
+  Uri: { parse: (text) => ({ toString: () => text }) },
+  window: {},
+  workspace: {}
+};
 Module._load = function load(name, parent, isMain) {
-  return name === 'vscode'
-    ? { EventEmitter: class { event = () => {}; }, Uri: { parse: (text) => ({ toString: () => text }) } }
-    : originalLoad.call(this, name, parent, isMain);
+  return name === 'vscode' ? vscodeMock : originalLoad.call(this, name, parent, isMain);
 };
 after(() => { Module._load = originalLoad; });
 
@@ -351,4 +355,68 @@ test('超出精确页码窗口的深页按键集边界读取，最后一页从�
   assert.equal(f.calls(), 1);
   assert.equal(overflow.pageInfo.pageIndex, lastPageIndex);
   assert.deepEqual(ids(overflow), currentOrder.slice(lastPageIndex * LIMIT));
+});
+
+const workspaceFolder = (uri, index) => ({ uri: { toString: () => uri }, name: uri.split('/').pop(), index });
+
+/** Drives the real Facade's current-project resolution with the vscode boundary replaced. */
+function projectResolutionFixture({ folders = [], activeEditorUri = null, remembered, writes = [] } = {}) {
+  const facade = Object.create(Facade.prototype);
+  Object.assign(facade, {
+    lastActiveProjectFolderUri: remembered,
+    context: { workspaceState: { update: (key, value) => { writes.push({ key, value }); return Promise.resolve(); } } }
+  });
+  vscodeMock.window.activeTextEditor = activeEditorUri === null ? undefined : { document: { uri: { toString: () => activeEditorUri } } };
+  vscodeMock.workspace.workspaceFolders = folders;
+  vscodeMock.workspace.getWorkspaceFolder = (uri) => folders.find((folder) => folder.uri.toString() === uri.toString());
+  return { facade, writes };
+}
+
+test('多根工作区没有活动编辑器时当前项目沿用最近编辑过的文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)], remembered: P });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('活动编辑器所在文件夹优先于记住的文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)], activeEditorUri: Q, remembered: P });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
+});
+
+test('单根工作区没有记忆时当前项目仍解析到唯一文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0)] });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: P });
+});
+
+test('单根工作区忽略过期的记忆，当前项目仍解析到唯一文件夹', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(Q, 0)], remembered: P });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'project', folderUri: Q });
+});
+
+test('记住的文件夹已不在工作区时当前项目回落到全部历史', () => {
+  const { facade } = projectResolutionFixture({ folders: [workspaceFolder(P, 0), workspaceFolder(Q, 1)], remembered: 'file:///workspace/project-removed' });
+  assert.deepEqual(facade.getCurrentProjectHistoryScope(), { kind: 'all' });
+});
+
+test('多根工作区新建对话未指定项目时使用当前项目解析结果', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade } = projectResolutionFixture({ folders, remembered: Q });
+  assert.equal(facade.resolveProjectFolderForNewConversation(), folders[1]);
+});
+
+test('新建对话显式指定的项目仍必须属于当前工作区', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade } = projectResolutionFixture({ folders, remembered: Q });
+  assert.equal(facade.resolveProjectFolderForNewConversation(Q), folders[1]);
+  assert.throws(() => facade.resolveProjectFolderForNewConversation('file:///workspace/project-x'), /不属于当前 VS Code 工作区/);
+});
+
+test('活动编辑器切换时记住所在文件夹并持久化，工作区外或未变化时不重复写入', () => {
+  const folders = [workspaceFolder(P, 0), workspaceFolder(Q, 1)];
+  const { facade, writes } = projectResolutionFixture({ folders, remembered: P, activeEditorUri: Q });
+  facade.rememberActiveProjectFolder();
+  facade.rememberActiveProjectFolder();
+  vscodeMock.window.activeTextEditor = { document: { uri: { toString: () => 'file:///outside/notes.md' } } };
+  facade.rememberActiveProjectFolder();
+  assert.equal(facade.lastActiveProjectFolderUri, Q);
+  assert.deepEqual(writes, [{ key: 'limcode.lastActiveProjectFolderUri', value: Q }]);
 });
