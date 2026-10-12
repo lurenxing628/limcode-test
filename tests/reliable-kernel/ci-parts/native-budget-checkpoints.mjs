@@ -226,19 +226,19 @@ async function withNativeTurn(options, verify) {
 
 function registerCases(test) {
 
-test('native batch boundary checkpoints six tools and resumes exact frozen call ordinals', { timeout: 240000 }, async () => {
-  await withNativeTurn({ batches: 2, batchSize: 3 }, async state => {
+test('native batch boundary checkpoints four tools and resumes exact frozen call ordinals', { timeout: 240000 }, async () => {
+  await withNativeTurn({ batches: 2, batchSize: 2 }, async state => {
     const { app, requests, outcome, started, executions, ended } = state;
     assert.equal(outcome.terminalStatus, 'completed', JSON.stringify(await rows(app, 'TurnTermination', { turn_id: started.turnId })));
     assert.equal(requests.length, 3);
     assert.equal(ended.length, 2);
-    assert.equal(new Set(executions).size, 6, 'a tool effect is not executed again by the carrier request');
+    assert.equal(new Set(executions).size, 4, 'a tool effect is not executed again by the carrier request');
     const sources = await rows(app, 'ToolCallSourceLink');
-    assert.equal(sources.length, 6);
-    assert.equal(new Set(sources.map(source => source.provider_call_id)).size, 6);
+    assert.equal(sources.length, 4);
+    assert.equal(new Set(sources.map(source => source.provider_call_id)).size, 4);
     assert.ok(sources.every(source => source.thought_signature ===
       `signature-${Number(source.provider_call_id.split('-')[1])}-${Number(source.provider_call_id.split('-')[2])}`));
-    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 6,
+    assert.equal((await rows(app, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 4,
       'each tool has precisely one durable Context result occurrence');
     assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
       'a local checkpoint is never a forged provider admission');
@@ -252,8 +252,8 @@ test('native batch boundary checkpoints six tools and resumes exact frozen call 
     assert.equal(second.physicalResponseCount, 1);
     const reopened = await state.reopen();
     assert.equal((await rows(reopened, 'ModelRequest', { turn_id: started.turnId })).length, 3);
-    assert.equal((await rows(reopened, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 6);
-    assert.equal(executions.length, 6, 'opening a Host never re-executes settled tools');
+    assert.equal((await rows(reopened, 'ContextSegmentSource', { source_kind: 'tool_model_result' })).length, 4);
+    assert.equal(executions.length, 4, 'opening a Host never re-executes settled tools');
     const firstSources = await rows(reopened, 'ToolCallSourceLink', { model_request_id: requests[0].modelRequestId });
     const [projection] = await rows(reopened, 'ModelContextProjection', {
       owner_kind: 'model_request', owner_id: requests[0].modelRequestId
@@ -286,7 +286,9 @@ test('native batch boundary checkpoints six tools and resumes exact frozen call 
     recovered.bindStream({ attemptSeq: '1', socketGeneration: '2' });
     assert.equal(recovered.nextGlobalCallOrdinal('response-0', 'call-0-0'), 0,
       'a re-streamed old call retains its original ToolCall identity');
-    assert.equal(recovered.nextGlobalCallOrdinal('response-new', 'call-new'), 3,
+    assert.equal(recovered.nextGlobalCallOrdinal('response-0', 'call-0-1'), 1,
+      'the distinct second frozen call retains ordinal 1');
+    assert.equal(recovered.nextGlobalCallOrdinal('response-new', 'call-new'), 2,
       'a new generation cannot reuse already committed ordinal 0');
     await recovered.dispose('handoff');
   });

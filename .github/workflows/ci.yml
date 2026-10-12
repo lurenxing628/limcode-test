@@ -28,15 +28,17 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
       - name: Build extension and webview once
-        run: npm run build
+        run: |
+          npm run compile &
+          extension_pid=$!
+          npm exec --offline -- vite build &
+          webview_pid=$!
+          status=0
+          wait "$extension_pid" || status=1
+          wait "$webview_pid" || status=1
+          if [ "$status" -ne 0 ]; then exit "$status"; fi
+          node scripts/reliable-kernel/write-build-provenance.mjs
       - name: Check architecture contracts
         run: npm run check:contracts:plan
       - name: Run webview typecheck, core suites and browser workflows
-        env:
-          TMPDIR: /dev/shm/limcode-tests
-          LIMCODE_TEST_EXECUTABLE_TMPDIR: ${{ runner.temp }}
-        run: |
-          mkdir -p "$TMPDIR"
-          df -h "$TMPDIR"
-          findmnt -no OPTIONS /dev/shm
-          npm run test:ci
+        run: npm run test:ci

@@ -1,14 +1,14 @@
-// An old window on a merge source that crashes mid-Turn (runtime-dataset-merge-e2e.test.mjs).
+// An old window on a merge source that crashes mid-Turn (runtime-history-merge-core.test.mjs).
 //   <scopeRoot> <settingsRoot> <readyFile>
 // Turn 1 completes; Turn 2 streams partial output and hangs; a second user message is queued
-// behind it. Then readyFile is written and the parent SIGKILLs this process.
-import fs from 'node:fs/promises';
+// behind it. Then a complete readyFile is atomically published and the parent SIGKILLs this process.
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { openFullRuntime, createRootConversation, modelAnswer } from './runtime-dataset-merge-full-runtime.mjs';
 
 const require = createRequire(import.meta.url);
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
+const { writeFileAtomicDurable } = require(path.join(compiled, 'backend/capabilities/vscodeStorage/durableWrite.js'));
 const kernelFile = (file) => require(path.join(compiled, 'backend/reliableKernel', file));
 const { RootAuthority } = kernelFile('rootAuthority.js');
 const { resolveVscodeRuntimeDataRoot } = kernelFile('vscodeRootAuthority.js');
@@ -40,7 +40,7 @@ await runtime.runner.input({ conversationId: 'crash_conversation', commandId: 's
 await streaming;
 // A user message sent while Turn 2 is still streaming waits in the queue.
 const queued = await runtime.runner.input({ conversationId: 'crash_conversation', commandId: 'third', text: '排队的第三条' });
-await fs.writeFile(readyFile, JSON.stringify({ firstTurnId: first.turnId, queued }));
+await writeFileAtomicDurable(readyFile, JSON.stringify({ firstTurnId: first.turnId, queued }));
 await new Promise(() => {});
 
 function repo(name) { return require(path.join(compiled, 'backend/reliableKernel/index.js')).DOMAIN_REPOSITORIES.domain(name); }

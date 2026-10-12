@@ -317,72 +317,46 @@ function nativeOverflow() {
 
 function registerCases(test) {
 const restart=true,attachment=true;
-test('a transient failure after a tool executed never retries the frozen input; the Turn continues from Context', { timeout: 30000 }, async () => {
+test('a settled native effect survives rebase and a later running effect parks re-drives without duplicate dispatch', { timeout: 30000 }, async () => {
   await withNativeKernel({
     retryPolicy,
     async script({ round, request, emit, responseId, app }) {
+      assert.equal(request.attemptSeq, '1', 'native recovery never re-sends the frozen input as a second Attempt');
       if (round === 0) {
         await emit('native_control', { type: 'response.created', responseId, capabilities });
         await emitCall(emit, responseId, 'call-A', 0, { async: true });
         await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'call-A settled');
         await delay(30);
-        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture socket reset after output', true);
+        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture reset after the first tool settled', true);
       }
-      if (request.attemptSeq !== '1') {
-        // A replayed frozen input makes the model re-issue the executed tool under a new identity.
+      assert.deepEqual(nativeToolPairs(request).get('call-A'), { calls: 1, results: 1 },
+        'every carrier keeps the already executed result once');
+      if (round === 1) {
         await emit('native_control', { type: 'response.created', responseId, capabilities });
-        await emitCall(emit, responseId, 'call-B', 0, { async: true });
-        await emitFinalText(emit, `${responseId}-final`, 'replayed');
-        return;
+        await emitCall(emit, responseId, 'call-slow', 0, { async: true });
+        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture reset while the next tool runs', true);
       }
-      await emitFinalText(emit, responseId, 'continued from Context');
-    }
-  }, async ({ app, requests, executions, startTurn, driveUntilSettled }) => {
-    const turn = await startTurn('transient-after-tool', 'Run the probe.');
-    const outcome = await driveUntilSettled(turn);
-    assert.equal(outcome.terminalStatus, 'completed',
-      JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
-    assert.deepEqual(executions, ['call-A'], 'the external effect runs exactly once; no re-issued call');
-    assert.equal(requests.length, 2);
-    assert.deepEqual(requests.map(request => request.attemptSeq), ['1', '1'], 'no second Attempt re-sent the frozen input');
-    assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
-    const modelRequests = (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
-      .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
-    assert.equal(modelRequests[0].terminal_state, 'native_chain_rebased');
-    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
-    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0);
-  });
-});
-test('a transient failure while an admitted tool runs parks the Turn; re-drives never dispatch it twice', { timeout: 30000 }, async () => {
-  await withNativeKernel({
-    retryPolicy,
-    async script({ round, request, emit, responseId }) {
-      if (round === 0) {
-        await emit('native_control', { type: 'response.created', responseId, capabilities });
-        await emitCall(emit, responseId, 'call-A', 0, { async: true });
-        throw new kernel.ProviderTransientError('connection_interrupted', 'fixture socket reset while the tool runs', true);
-      }
-      if (request.attemptSeq !== '1') {
-        await emit('native_control', { type: 'response.created', responseId, capabilities });
-        await emitCall(emit, responseId, 'call-B', 0, { async: true });
-        return;
-      }
-      await emitFinalText(emit, responseId, 'continued after the tool settled');
+      assert.equal(round, 2);
+      assert.deepEqual(nativeToolPairs(request).get('call-slow'), { calls: 1, results: 1 });
+      await emitFinalText(emit, responseId, 'continued from both saved results');
     }
   }, async ({ app, requests, executions, duplicates, gates, startTurn, drive }) => {
-    gates.set('call-A', deferred());
-    const turn = await startTurn('transient-while-running', 'Run the slow probe.');
+    gates.set('call-slow', deferred());
+    const turn = await startTurn('transient-settled-then-running', 'Run the first and slow probes.');
     const first = await drive(turn);
-    assert.equal(first.terminalStatus, 'waiting', 'the running admitted tool is neither cancelled nor abandoned');
-    assert.equal(requests.length, 1, 'nothing is re-sent while the admitted tool is still running');
-    assert.deepEqual(executions, ['call-A']);
-    // The runner re-drives a waiting Turn whenever its facts change; the tool is still running.
+    assert.equal(first.terminalStatus, 'waiting', 'the second running tool is neither cancelled nor abandoned');
+    assert.equal(requests.length, 2, 'only the settled first effect permits a carrier request');
+    assert.deepEqual(executions, ['call-A', 'call-slow']);
+    const initialRequests = (await rows(app, 'ModelRequest', { turn_id: turn.turnId }))
+      .sort((left, right) => Number(left.request_seq) - Number(right.request_seq));
+    assert.equal(initialRequests[0].terminal_state, 'native_chain_rebased');
+    assert.notEqual(requests[1].modelRequestId, requests[0].modelRequestId);
     const second = await drive(turn);
     assert.equal(second.terminalStatus, 'waiting');
-    assert.equal(requests.length, 1, 'a re-drive never freezes a request with the running call unresolved');
+    assert.equal(requests.length, 2, 'a re-drive never freezes a request with the running call unresolved');
     assert.deepEqual(duplicates, [], 'the re-drive attaches to the running execution instead of dispatching again');
-    gates.get('call-A').resolve();
-    await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 1, 'call-A settled');
+    gates.get('call-slow').resolve();
+    await waitFor(async () => (await rows(app, 'ToolModelResult')).length === 2, 'the slow result settled');
     let outcome = await drive(turn);
     for (let index = 0; outcome.terminalStatus === 'waiting' && index < 10; index += 1) {
       await delay(20);
@@ -390,13 +364,17 @@ test('a transient failure while an admitted tool runs parks the Turn; re-drives 
     }
     assert.equal(outcome.terminalStatus, 'completed',
       JSON.stringify(await rows(app, 'TurnTermination', { turn_id: turn.turnId })));
-    assert.deepEqual(executions, ['call-A']);
+    assert.deepEqual(executions, ['call-A', 'call-slow'], 'each external effect runs once throughout both recoveries');
     assert.deepEqual(duplicates, []);
-    const [result] = await rows(app, 'ToolModelResult');
-    const [outcomeRow] = await rows(app, 'ToolOutcome', { tool_call_id: result.tool_call_id });
-    assert.equal(outcomeRow.status, 'succeeded', 'the real result is the call\'s only outcome');
-    assert.equal(requests.length, 2);
-    assert.deepEqual(nativeToolPairs(requests[1]).get('call-A'), { calls: 1, results: 1 });
+    for (const result of await rows(app, 'ToolModelResult')) {
+      const [outcomeRow] = await rows(app, 'ToolOutcome', { tool_call_id: result.tool_call_id });
+      assert.equal(outcomeRow.status, 'succeeded', 'the real result is the call only outcome');
+    }
+    assert.equal(requests.length, 3);
+    assert.deepEqual(requests.map(request => request.attemptSeq), ['1', '1', '1']);
+    assert.notEqual(requests[2].modelRequestId, requests[1].modelRequestId);
+    assert.equal((await rows(app, 'ToolCallEvent', { event_kind: 'native_delivery' })).length, 0,
+      'local Context recovery never invents provider delivery');
   });
 });
 test(`error-driven native rebases share a bounded retry budget${restart ? ' across Host restart' : ''}`, { timeout: 30000 }, async () => {

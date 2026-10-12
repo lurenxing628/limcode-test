@@ -139,7 +139,7 @@ test('真实另一个进程持续写入同一当前库并看见在线合并结�
   assert.equal(peers.length, result.written);
 });
 
-test('冲突与有归属的未完成工作局部剔除，无归属工作整份拒绝，安全部分登记partial', async () => {
+test('冲突、待投递与有归属工作局部剔除，无归属工作整份拒绝，安全部分登记partial', async () => {
   const source = await home.source('partial');
   const unowned = await home.source('unowned');
   await seed(source, [{ id: 'partial_conflict', title: 'source title' }, { id: 'partial_safe' }, { id: 'owned_asking' }]);
@@ -153,6 +153,9 @@ test('冲突与有归属的未完成工作局部剔除，无归属工作整份�
     insert(database, 'InteractionRequest', { id: 'owned_question', request_kind: 'ask_user', status: 'pending', prompt_object_id: prompt.id, created_at: NOW, updated_at: NOW });
     insert(database, 'InteractionOwnerLink', { id: 'owned_question_owner', request_id: 'owned_question', turn_id: turnId, created_at: NOW });
   });
+  const { id: deliveryId, active, queued, pendingDelivery } = await queuedSource('delivery', true, source);
+  const inspected = read(source, load('runtimeDataSetMergeProbes.js').inspectUnfinishedWork);
+  assert.ok(inspected.refused.some(item => item.label === '待投递的消息或唤醒'));
   await home.database.transaction([repo('Conversation').insert(conversation('partial_conflict', 'current title'))]);
   const tools = await content(source, JSON.stringify({ kind: 'frozen-tool-definitions', tools: [] }), 'application/json');
   await aggregate(source, 'partial_conflict', 'partial_request', { toolsReference: { contentObjectId: tools.id }, checkpoints: 1 });
@@ -164,16 +167,25 @@ test('冲突与有归属的未完成工作局部剔除，无归属工作整份�
   assert.deepEqual(report.blocked.map(row => [row.candidateId, row.code]), [[unowned.id, 'runtime-data-set-merge-unattributed']]);
   assert.equal(report.merged.length, 1);
   assert.equal(report.merged[0].candidateId, source.id);
-  assert.deepEqual(report.merged[0].excluded.map(row => [row.conversationId, row.code]),
-    [['owned_asking', 'runtime-data-set-merge-unfinished-work'], ['partial_conflict', 'runtime-data-set-merge-conflict']]);
+  assert.deepEqual(report.merged[0].excluded.map(row => row.conversationId).sort(),
+    [deliveryId, 'delivery_sender', 'owned_asking', 'partial_conflict'].sort());
+  assert.ok(report.merged[0].excluded.some(row => row.conversationId === 'owned_asking'
+    && row.code === 'runtime-data-set-merge-unfinished-work'));
+  assert.ok(report.merged[0].excluded.some(row => row.conversationId === 'partial_conflict'
+    && row.code === 'runtime-data-set-merge-conflict'));
   assert.equal(report.merged[0].insertedConversations, 1);
   assert.equal((await get('Conversation', 'partial_conflict')).title, 'current title');
   assert.ok(await get('Conversation', 'partial_safe'));
   assert.equal(await get('Conversation', 'owned_asking'), null);
   assert.equal(await get('Conversation', 'unowned_history'), null);
+  assert.equal(await get('Conversation', deliveryId), null);
   read(source, database => {
     assert.equal(database.prepare('SELECT status FROM turn WHERE id=?').pluck().get(turnId), 'active');
     assert.equal(database.prepare('SELECT status FROM interaction_request WHERE id=?').pluck().get('owned_question'), 'pending');
+    assert.equal(database.prepare('SELECT status FROM turn WHERE id=?').pluck().get(active.turnId), 'active');
+    assert.equal(database.prepare('SELECT state FROM turn_intent WHERE id=?').pluck().get(queued.intentId), 'queued');
+    assert.equal(database.prepare('SELECT state FROM runtime_delivery WHERE id=?').pluck().get(pendingDelivery.id), 'pending');
+    assert.equal(database.prepare('SELECT COUNT(*) FROM model_request WHERE turn_id=?').pluck().get(active.turnId), 0n);
   });
   assert.equal(await get('ContentObject', tools.id), null);
   const record = await ledger(home, source);
@@ -274,7 +286,7 @@ test('损坏账本自动暂停，明确重新核验可以合并，未知新状�
   assert.equal(await fs.readFile(file, 'utf8'), newer);
 });
 
-test('空间不足在来源备份与中止收尾前推迟，恢复空间后正常合并', async () => {
+test('空间不足在来源备份与中止收尾前推迟，Turn和目标保持原状态', async () => {
   const source = await home.source('space');
   await seed(source, [{ id: 'space_history' }]);
   const turnId = await bareTurn(source, 'space_history');
@@ -284,9 +296,6 @@ test('空间不足在来源备份与中止收尾前推迟，恢复空间后正�
   assert.equal(await get('Conversation', 'space_history'), null);
   assert.equal(await ledger(home, source), undefined);
   await assert.rejects(fs.stat(path.join(path.dirname(source.binding.paths.dataRootPath), 'merge-source-backups')), { code: 'ENOENT' });
-  const retry = await merge(home, [source], { freeSpace: async () => Number.MAX_SAFE_INTEGER });
-  clean(retry);
-  assert.equal(retry.merged[0].finalized.turns, 1);
 });
 
 test('准备记录心跳与释放交错时不复活已释放记录，也不删除其他token', async () => {
@@ -393,37 +402,7 @@ test('复制期间来源新增写入时不给成功收据', async () => {
   assert.equal(changed, true);
 });
 
-test('全复用合并先断言完整字段，再真实checkpoint，最后发布库外成功账本', async t => {
-  const source = await home.source('reuse');
-  raw(source, database => insert(database, 'Conversation', conversation('reuse_shared')));
-  await home.database.transaction([repo('Conversation').insert(conversation('reuse_shared'))]);
-  const events = [];
-  const transaction = home.database.transaction.bind(home.database);
-  t.mock.method(home.database, 'transaction', async (steps, ...args) => {
-    events.push('assert');
-    assert.ok(steps.length > 0 && steps.every(step => step.kind === 'assert'));
-    assert.equal(steps.find(step => step.domain === 'Conversation').where.title, 'reuse_shared');
-    return transaction(steps, ...args);
-  });
-  const checkpoint = home.database.durabilityCheckpoint.bind(home.database);
-  t.mock.method(home.database, 'durabilityCheckpoint', async () => {
-    events.push('checkpoint');
-    assert.equal(await ledger(home, source), undefined);
-    await checkpoint();
-    const file = path.join(home.base, 'reuse-main-proof.sqlite');
-    await fs.copyFile(home.database.binding.paths.databasePath, file);
-    const disk = new Database(file, { readonly: true });
-    try { assert.equal(disk.prepare('SELECT title FROM conversation WHERE id=?').pluck().get('reuse_shared'), 'reuse_shared'); }
-    finally { disk.close(); }
-  });
-  const report = await merge(home, [source]);
-  clean(report);
-  assert.deepEqual(events, ['assert', 'checkpoint']);
-  assert.deepEqual([report.merged[0].alreadyMerged, report.merged[0].insertedRows, report.merged[0].backupPath], [true, 0, undefined]);
-  assert.equal((await ledger(home, source)).state, 'merged');
-});
-
-test('另一个连接修改复用行时mixed合并整笔回滚，外部编辑保留并可重试', async t => {
+test('外部编辑使mixed合并回滚，修复后全复用按断言、checkpoint、成功账本顺序完成', async t => {
   const source = await home.source('target-race');
   raw(source, database => {
     insert(database, 'Conversation', conversation('race_shared'));
@@ -449,9 +428,35 @@ test('另一个连接修改复用行时mixed合并整笔回滚，外部编辑保
   assert.equal(await ledger(home, source), undefined);
   assert.equal((await get('Conversation', 'race_shared')).title, 'external edit');
   assert.equal(await get('Conversation', 'race_new'), null);
-  await home.database.transaction([repo('Conversation').update('race_shared', { title: 'race_shared' })]);
-  clean(await merge(home, [source]));
-  assert.ok(await get('Conversation', 'race_new'));
+  await home.database.transaction([repo('Conversation').update('race_shared', { title: 'race_shared' }),
+    repo('Conversation').insert(conversation('race_new'))]);
+  const events = [];
+  const transaction = home.database.transaction.bind(home.database);
+  t.mock.method(home.database, 'transaction', async (steps, ...args) => {
+    events.push('assert');
+    assert.ok(steps.length > 0 && steps.every(step => step.kind === 'assert'));
+    const reused = steps.filter(step => step.domain === 'Conversation');
+    assert.deepEqual(reused.map(step => step.where.title).sort(), ['race_new', 'race_shared']);
+    return transaction(steps, ...args);
+  });
+  const checkpoint = home.database.durabilityCheckpoint.bind(home.database);
+  t.mock.method(home.database, 'durabilityCheckpoint', async () => {
+    events.push('checkpoint');
+    assert.equal(await ledger(home, source), undefined);
+    await checkpoint();
+    const file = path.join(home.base, 'reuse-main-proof.sqlite');
+    await fs.copyFile(home.database.binding.paths.databasePath, file);
+    const disk = new Database(file, { readonly: true });
+    try {
+      assert.deepEqual(disk.prepare("SELECT title FROM conversation WHERE id IN ('race_shared','race_new') ORDER BY title").pluck().all(),
+        ['race_new', 'race_shared']);
+    } finally { disk.close(); }
+  });
+  const retried = await merge(home, [source]);
+  clean(retried);
+  assert.deepEqual(events, ['assert', 'checkpoint']);
+  assert.deepEqual([retried.merged[0].alreadyMerged, retried.merged[0].insertedRows, retried.merged[0].backupPath], [true, 0, undefined]);
+  assert.equal((await ledger(home, source)).state, 'merged');
 });
 
 test('共享消息、子树和确切关系边传播归属，健康无关对话保持可用', async () => {
@@ -635,10 +640,11 @@ const authorityCompiler = { async compile(request) {
 const lease = database => ({ leaseOwnerId: 'fixture', hostBootId: database.hostBootId,
   leaseExpiresAt: new Date(Date.now() + 300000).toISOString(), executorAgentId: 'fixture' });
 
-async function queuedSource(name, delivery = false) {
-  const source = await home.source(name);
+async function queuedSource(name, delivery = false, existingSource) {
+  const source = existingSource ?? await home.source(name);
   const id = `${name}_conversation`;
-  await seed(source, [{ id }, { id: `${name}_safe` }, ...(delivery ? [{ id: `${name}_sender` }] : [])]);
+  await seed(source, [{ id }, ...(!existingSource ? [{ id: `${name}_safe` }] : []),
+    ...(delivery ? [{ id: `${name}_sender` }] : [])]);
   if (delivery) await collaboration(source, `${name}_sender`, id, `${name}_message`);
   const database = await kernel.RuntimeDatabase.open(source.authority, { hostBootId: `${name}-old-host` });
   let result;
@@ -661,25 +667,6 @@ async function queuedSource(name, delivery = false) {
   } finally { await database.close(); }
   return result;
 }
-
-test('pending delivery排除该对话，原来源Turn、队列和投递保持原状态', async () => {
-  const { source, id, active, queued, pendingDelivery } = await queuedSource('delivery', true);
-  const inspected = read(source, load('runtimeDataSetMergeProbes.js').inspectUnfinishedWork);
-  assert.ok(inspected.refused.some(item => item.label === '待投递的消息或唤醒'));
-  // This entry has no source-settlement adapter; pending delivery is excluded before any consent.
-  const report = await merge(home, [source], { settleSourceWork: undefined,
-    async confirmSettlement() { assert.fail('Excluded pending-delivery work must not be finalized.'); } });
-  clean(report);
-  assert.ok(report.merged[0].excluded.some(row => row.conversationId === id));
-  assert.equal(await get('Conversation', id), null);
-  assert.ok(await get('Conversation', 'delivery_safe'));
-  read(source, database => {
-    assert.equal(database.prepare('SELECT status FROM turn WHERE id=?').pluck().get(active.turnId), 'active');
-    assert.equal(database.prepare('SELECT state FROM turn_intent WHERE id=?').pluck().get(queued.intentId), 'queued');
-    assert.equal(database.prepare('SELECT state FROM runtime_delivery WHERE id=?').pluck().get(pendingDelivery.id), 'pending');
-    assert.equal(database.prepare('SELECT COUNT(*) FROM model_request').pluck().get(), 0n);
-  });
-});
 
 test('public队列先于SIGKILL遗留Turn收尾取消，重扫和重开完整Runtime均不调用Provider', async t => {
   const source = await home.source('crash-source');

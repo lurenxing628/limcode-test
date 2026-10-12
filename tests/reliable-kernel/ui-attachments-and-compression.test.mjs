@@ -4,10 +4,10 @@ import path from 'node:path';
 import { before, after, test } from 'node:test';
 import { PDFDocument } from 'pdf-lib';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
-import { kernel, readFileTool, createLlmProviderCapability, dryRunCompactLlmProvider, expandTextCompressionSources,
+import { kernel, readFileTool, createLlmProviderCapability, expandTextCompressionSources,
   createAttachmentCompressionFixture, compactRequest, compact, deferred, SUMMARY, IMAGE, words } from './ui-attachments-and-compression-fixture.mjs';
 
-let h, ssr, vue, ImageView, RebuildConfirm, bridgeTypes, limitHistory;
+let h, ssr, vue, ImageView, RebuildConfirm, bridgeTypes;
 const previousWindow = globalThis.window;
 const posted = [], listeners = new Set();
 before(async () => { h = await createAttachmentCompressionFixture(); });
@@ -45,13 +45,17 @@ test('20 MiB 实际进入 CAS，超限先拒绝，重复本地 occurrence 只读
     mimeType: 'application/octet-stream', name: 'limit.bin', data: Buffer.alloc(size, 0x6d).toString('base64'), storage: 'embedded' } });
   await h.app.database.transaction(exact.storageSteps);
   assert.equal(exact.totalBytes, size);
-  const resolved = await h.app.attachments.resolveInlineData(exact.attachments[0].attachmentId);
-  assert.equal(Buffer.from(resolved.inlineData.data, 'base64').byteLength, size);
+  const [attachment] = await h.list('Attachment', { id: exact.attachments[0].attachmentId });
+  const [metadata] = await h.list('ContentObject', { id: attachment.content_object_id });
+  assert.equal(metadata.byte_length, BigInt(size));
+  const persisted = await h.app.contentStore.readChunk(metadata, size - 16, 16);
+  assert.equal(persisted.totalBytes, size); assert.equal(persisted.hasMore, false);
+  assert.deepEqual(persisted.chunk, Buffer.alloc(16, 0x6d));
   const prepare = h.app.contentStore.prepareIdentifiedBatch.bind(h.app.contentStore);
   let preparations = 0;
   t.mock.method(h.app.contentStore, 'prepareIdentifiedBatch', (...args) => { preparations += 1; return prepare(...args); });
   await assert.rejects(h.app.attachments.prepareValueAttachments({ inlineData: {
-    mimeType: 'application/octet-stream', name: 'over.bin', data: Buffer.alloc(size + 1).toString('base64'), storage: 'embedded' } }),
+    mimeType: 'application/octet-stream', name: 'over.bin', data: 'A'.repeat(Math.ceil((size + 1) / 3) * 4), storage: 'embedded' } }),
   error => error.name === 'AttachmentSizeLimitError');
   assert.equal(preparations, 0);
   const file = path.join(h.directory, 'same.txt'), original = '不可变的中文附件 😀';
@@ -194,62 +198,73 @@ test('托管图像自动加载，替换和卸载后迟到回执不覆盖当前�
   assert.match(html, /<img[^>]+src="data:image\/png;base64,YQ=="/);
 });
 
-test('冻结设置的只读预估与随后实际重建使用相同分段请求数', async () => {
-  const history = await h.seed('preview-rebuild', `SOURCE-START ${words(20_000)} SOURCE-END`, true);
-  const before = (await h.app.database.inspect()).currentCommitSeq, sent = h.bodies.length;
-  const preview = await h.runner.previewSourceReplayCompression({ conversationId: history.conversationId, expectedRootId: history.rootId });
-  assert.equal(preview.outcome.kind, 'ready'); assert.ok(preview.outcome.summaryRequests >= 2);
-  assert.equal(preview.estimate.contextWindowTokens, 40_000);
-  assert.equal((await h.app.database.inspect()).currentCommitSeq, before); assert.equal(h.bodies.length, sent);
-  const rebuilt = await h.rebuild(history);
-  assert.equal(rebuilt.compression.status, 'compressed');
-  const leaves = h.bodies.slice(sent).filter(record => record.text.includes('本段历史记录'));
-  assert.equal(leaves.length, preview.outcome.summaryRequests);
-  assert.match(leaves.map(record => record.text).join('\n'), /SOURCE-START/);
-  assert.match(leaves.map(record => record.text).join('\n'), /SOURCE-END/);
-  assert.equal((await h.list('ModelRequest', { turn_id: rebuilt.turnId }))[0].terminal_state, 'completed');
+test('过大 Unicode 回合分段压缩成功，随后只读预估与原文重建一致且 leaf 完成后才合并', async () => {
+  await h.withProviderWindow(28_000, async () => {
+    const text = Array.from({ length: 1100 }, (_, i) => `He said "hi" C:\\tmp\\${i}\n\t中文😀\u0001 {"k":[${i}]}\r\n`).join('');
+    const history = await h.seed('unicode-rebuild', text);
+    let start = h.bodies.length;
+    const leavesFrom = records => records.filter(record => record.text.includes('本段历史记录'));
+    const assertSource = records => {
+      const leaves = leavesFrom(records), marker = '【本段历史记录】\n1. user: ';
+      assert.ok(leaves.length >= 2);
+      const chunks = leaves.map(record => {
+        const user = record.body.messages.find(message => message.role === 'user').content;
+        assert.ok(user.includes(marker)); return user.slice(user.indexOf(marker) + marker.length);
+      });
+      // The provider runs leaves concurrently; HTTP arrival order is not source order.
+      chunks.sort((left, right) => text.indexOf(left) - text.indexOf(right));
+      assert.equal(chunks.join(''), text);
+      assert.ok(records.some(record => record.text.includes('新增分段摘要')));
+      return leaves.length;
+    };
+    h.state.reply = record => {
+      if (record.text.includes('新增分段摘要')) assert.ok(leavesFrom(h.bodies.slice(start)).every(leaf => leaf.done));
+      return SUMMARY;
+    };
+    try {
+      const compressed = await h.rebuild(history, 'unicode-ordinary-compression', null);
+      assert.equal(compressed.compression.status, 'compressed');
+      assert.deepEqual(compressed.compression.attemptedMethods, ['segmented_summary']);
+      const ordinaryLeafCount = assertSource(h.bodies.slice(start));
+      const current = { ...history, rootId: compressed.compression.result.rootId };
+      const before = (await h.app.database.inspect()).currentCommitSeq; start = h.bodies.length;
+      const preview = await h.runner.previewSourceReplayCompression({ conversationId: current.conversationId, expectedRootId: current.rootId });
+      assert.equal(preview.outcome.kind, 'ready'); assert.equal(preview.outcome.summaryRequests, ordinaryLeafCount);
+      assert.equal(preview.estimate.contextWindowTokens, 28_000);
+      assert.ok(preview.estimate.sourceTokens > preview.estimate.inputCapacityTokens, 'one original Turn genuinely exceeds the frozen input room');
+      assert.equal((await h.app.database.inspect()).currentCommitSeq, before); assert.equal(h.bodies.length, start);
+      const rebuilt = await h.rebuild(current, 'unicode-source-rebuild');
+      assert.equal(rebuilt.compression.status, 'compressed');
+      assert.equal(assertSource(h.bodies.slice(start)), preview.outcome.summaryRequests);
+      assert.equal((await h.list('ModelRequest', { turn_id: rebuilt.turnId }))[0].terminal_state, 'completed');
+    } finally { h.state.reply = undefined; }
+  });
 });
 
-test('真实来源超过 32 leaf 或确认前 root 已变化时，预估和确认按钮都拒绝准入', async () => {
-  h.provider.contextWindowTokens = 28_000; await h.save('llmProviderConfigs', { configs: [h.provider] });
-  limitHistory = await h.seed('leaf-limit', words(120_000), true);
-  const sent = h.bodies.length;
-  const blocked = await h.runner.previewSourceReplayCompression({ conversationId: limitHistory.conversationId, expectedRootId: limitHistory.rootId });
-  assert.deepEqual(blocked.outcome, { kind: 'blocked', reason: 'leaf_budget_exceeded', leafRequestLimit: 32 });
-  await webview(); const { renderToString } = await import('@vue/server-renderer');
-  async function button(result, targetCurrent) {
-    const context = {}; await renderToString(vue.createSSRApp(RebuildConfirm, { open: true, targetCurrent, preview: { status: 'loaded', result } }), context);
-    const html = Object.values(context.teleports ?? {}).join('');
-    const tag = html.match(/<button[^>]*data-testid="compression-rebuild-confirm-confirm"[^>]*>/)?.[0];
-    assert.ok(tag); return tag;
-  }
-  assert.match(await button(blocked, true), /\sdisabled/);
-  const moved = await h.seed('moved-preview', 'source', true);
-  const ready = await h.runner.previewSourceReplayCompression({ conversationId: moved.conversationId, expectedRootId: moved.rootId });
-  await h.app.context.appendContent({ conversationId: moved.conversationId, segmentKind: 'runtime_context',
-    source: { sourceKind: 'runtime_context', sourceId: 'moved-source', sourceRevision: '0' }, contentType: 'text/plain', content: 'Later root.' });
-  assert.match(await button(ready, false), /\sdisabled/);
-  await assert.rejects(h.rebuild(moved), /当前上下文已变化/); assert.equal(h.bodies.length, sent);
-  h.provider.contextWindowTokens = 40_000; await h.save('llmProviderConfigs', { configs: [h.provider] });
-});
-
-test('emoji、转义与控制字符无损分段，leaf 完成之后才发送 hierarchy merge', async () => {
-  const text = Array.from({ length: 1800 }, (_, i) => `He said "hi" C:\\tmp\\${i}\n\t中文😀\u0001 {"k":[${i}]}\r\n`).join('');
-  const request = compactRequest('unicode-hierarchy', text), options = h.providerOptions({ contextWindowTokens: 30_000 });
-  const planned = await dryRunCompactLlmProvider(request, options); assert.equal(planned.kind, 'provider_requests');
-  const marker = '【本段历史记录】\n1. user: ';
-  const chunks = planned.calls.map(call => { const user = JSON.parse(call.bodyText).messages.find(message => message.role === 'user').content;
-    assert.ok(user.includes(marker)); return user.slice(user.indexOf(marker) + marker.length); });
-  assert.ok(chunks.length >= 2); assert.equal(chunks.join(''), text);
-  const start = h.bodies.length;
-  h.state.reply = record => { if (record.text.includes('新增分段摘要')) {
-    const leaves = h.bodies.slice(start).filter(item => item.text.includes('本段历史记录'));
-    assert.equal(leaves.length, planned.calls.length); assert.ok(leaves.every(item => item.done));
-  } return SUMMARY; };
-  const capability = createLlmProviderCapability(options);
-  try { assert.equal((await compact(capability, request)).type, 'llm:compactDone');
-    assert.ok(h.bodies.slice(start).some(record => record.text.includes('新增分段摘要'))); }
-  finally { capability.dispose(); h.state.reply = undefined; }
+test('超过 32 leaf 的预估和实际重建均无模型调用，root 变化也阻止确认与准入', async () => {
+  await h.withProviderWindow(26_000, async () => {
+    const limitHistory = await h.seed('leaf-limit', words(30_000), true);
+    const sent = h.bodies.length;
+    const blocked = await h.runner.previewSourceReplayCompression({ conversationId: limitHistory.conversationId, expectedRootId: limitHistory.rootId });
+    assert.deepEqual(blocked.outcome, { kind: 'blocked', reason: 'leaf_budget_exceeded', leafRequestLimit: 32 });
+    await webview(); const { renderToString } = await import('@vue/server-renderer');
+    async function button(result, targetCurrent) {
+      const context = {}; await renderToString(vue.createSSRApp(RebuildConfirm, { open: true, targetCurrent, preview: { status: 'loaded', result } }), context);
+      const html = Object.values(context.teleports ?? {}).join('');
+      const tag = html.match(/<button[^>]*data-testid="compression-rebuild-confirm-confirm"[^>]*>/)?.[0];
+      assert.ok(tag); return tag;
+    }
+    assert.match(await button(blocked, true), /\sdisabled/);
+    await assert.rejects(h.rebuild(limitHistory), /compression_source_too_large/);
+    assert.equal(h.bodies.length, sent);
+    assert.equal((await h.list('CompressionBlock', { conversation_id: limitHistory.conversationId })).length, 1);
+    const moved = await h.seed('moved-preview', 'source', true);
+    const ready = await h.runner.previewSourceReplayCompression({ conversationId: moved.conversationId, expectedRootId: moved.rootId });
+    await h.app.context.appendContent({ conversationId: moved.conversationId, segmentKind: 'runtime_context',
+      source: { sourceKind: 'runtime_context', sourceId: 'moved-source', sourceRevision: '0' }, contentType: 'text/plain', content: 'Later root.' });
+    assert.match(await button(ready, false), /\sdisabled/);
+    await assert.rejects(h.rebuild(moved), /当前上下文已变化/); assert.equal(h.bodies.length, sent);
+  });
 });
 
 test('超长摘要至多请求删短一次，实际用户取消在途压缩不提交摘要', { timeout: 10_000 }, async () => {
@@ -278,19 +293,6 @@ test('超长摘要至多请求删短一次，实际用户取消在途压缩不�
     const requests = await h.list('ModelRequest', { turn_id: turn.id });
     assert.equal(requests.length, 1); assert.equal(requests[0].status, 'terminal'); assert.notEqual(requests[0].terminal_state, 'completed');
   } finally { h.state.reply = undefined; }
-});
-
-test('单个过大 Turn 走 segmented_summary 成功，全来源超 leaf 上限无模型调用', async () => {
-  const history = await h.seed('oversized-single-turn', `HISTORY-START ${words(20_000)} HISTORY-END`), start = h.bodies.length;
-  const compressed = await h.rebuild(history, 'single-turn-manual', null);
-  assert.equal(compressed.compression.status, 'compressed'); assert.deepEqual(compressed.compression.attemptedMethods, ['segmented_summary']);
-  assert.ok(h.bodies.slice(start).filter(record => record.text.includes('本段历史记录')).length >= 2);
-  h.provider.contextWindowTokens = 28_000; await h.save('llmProviderConfigs', { configs: [h.provider] });
-  const before = h.bodies.length;
-  await assert.rejects(h.rebuild(limitHistory), /compression_source_too_large/);
-  assert.equal(h.bodies.length, before);
-  assert.equal((await h.list('CompressionBlock', { conversation_id: limitHistory.conversationId })).length, 1);
-  h.provider.contextWindowTokens = 40_000; await h.save('llmProviderConfigs', { configs: [h.provider] });
 });
 
 test('切回 Context 并 fork 后只展开当前 root 来源，丢弃的分支保留在历史但不混入', async () => {

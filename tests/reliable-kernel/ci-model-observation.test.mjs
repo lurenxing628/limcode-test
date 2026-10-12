@@ -9,10 +9,16 @@ before(async () => { fixture = await openProviderRuntimeFixture(); });
 after(async () => { await fixture?.close(); });
 afterEach(() => fixture.setFetch(() => sse([compatDelta({ content: 'reply' }), compatDelta({}, 'stop')])));
 
-test('Claude 对话绑定模式真正提交，重启后第一次发送即去掉失配思考', async () => {
-  const bodies = [];
+test('Claude 绑定与 Gemini 文本尾签名各自提交，共享重启后首次请求保持正确回放', async () => {
+  const claudeBodies = [];
+  const geminiBodies = [];
   fixture.setFetch(entry => {
-    bodies.push(entry.body);
+    if (entry.body.contents) {
+      geminiBodies.push(entry.body);
+      return sse([geminiChunk([{ text: 'answer' }]),
+        geminiChunk([{ text: '', thoughtSignature: 'TEXT_TAIL_SIGNATURE' }], 'STOP')]);
+    }
+    claudeBodies.push(entry.body);
     const hasThinking = entry.body.messages.some(message => Array.isArray(message.content)
       && message.content.some(block => block.type === 'thinking'));
     if (hasThinking) return new Response(JSON.stringify({ error: { type: 'invalid_request_error', message:
@@ -24,30 +30,20 @@ test('Claude 对话绑定模式真正提交，重启后第一次发送即去掉�
   await fixture.createConversation('binding-persistence', 'claude');
   await fixture.turn('binding-persistence', 'first');
   const second = await fixture.turn('binding-persistence', 'second');
-  assert.equal(bodies.length, 4);
-  assert.equal(bodies[2].thinking.block_binding.prefix_mismatch_behavior, 'drop_block');
+  assert.equal(claudeBodies.length, 4);
+  assert.equal(claudeBodies[2].thinking.block_binding.prefix_mismatch_behavior, 'drop_block');
   const [learned] = await fixture.rows('ModelRequest', { turn_id: second });
   assert.equal(learned.stream_stats_json.claudeThinkingBinding, 'strip_thinking');
-  await fixture.restart();
-  const third = await fixture.turn('binding-persistence', 'third');
-  assert.equal(bodies.length, 5);
-  assert.equal(JSON.stringify(bodies[4]).includes('"type":"thinking"'), false);
-  assert.equal((await fixture.rows('ModelRequest', { turn_id: third }))[0].stream_stats_json.claudeThinkingBinding,
-    'strip_thinking');
-});
-
-test('Gemini 文本尾签名随原 part 落库，重启后在下一请求原位回放', async () => {
-  const bodies = [];
-  fixture.setFetch(entry => {
-    bodies.push(entry.body);
-    return sse([geminiChunk([{ text: 'answer' }]),
-      geminiChunk([{ text: '', thoughtSignature: 'TEXT_TAIL_SIGNATURE' }], 'STOP')]);
-  });
   await fixture.createConversation('gemini-signature', 'gemini');
   await fixture.turn('gemini-signature', 'first');
   await fixture.restart();
+  const third = await fixture.turn('binding-persistence', 'third');
+  assert.equal(claudeBodies.length, 5);
+  assert.equal(JSON.stringify(claudeBodies[4]).includes('"type":"thinking"'), false);
+  assert.equal((await fixture.rows('ModelRequest', { turn_id: third }))[0].stream_stats_json.claudeThinkingBinding,
+    'strip_thinking');
   await fixture.turn('gemini-signature', 'second');
-  assert.deepEqual(bodies[1].contents.find(content => content.role === 'model').parts,
+  assert.deepEqual(geminiBodies[1].contents.find(content => content.role === 'model').parts,
     [{ text: 'answer' }, { text: '', thoughtSignature: 'TEXT_TAIL_SIGNATURE' }]);
   const replay = fixture.requests.at(-1).request.context.find(segment => segment.messageRole === 'model');
   assert.deepEqual(JSON.parse(replay.content).parts,

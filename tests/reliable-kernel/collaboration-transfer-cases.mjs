@@ -70,8 +70,8 @@ export async function remoteBashEscapeRefusal(t) {
   if (process.platform === 'win32') { t.skip('远程 bash transport 场景在 POSIX runner 执行'); return; }
   const f = await fixture(t, 'transfer-remote-escape');
   await fs.symlink('sub/../../outside', path.join(f.root, 'bad'), 'dir');
-  const bin = await fs.mkdtemp(path.join(process.env.LIMCODE_TEST_EXECUTABLE_TMPDIR ?? os.tmpdir(), 'limcode-ssh-bin-'));
-  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  const bin = path.join(f.base, 'bin');
+  await fs.mkdir(bin);
   const fakeSsh = path.join(bin, 'ssh');
   await fs.writeFile(fakeSsh, '#!/bin/sh\nfor last do :; done\nexec sh -c "$last"\n');
   await fs.chmod(fakeSsh, 0o755);

@@ -213,30 +213,24 @@ function boundaryFeed() {
     }, disconnect(id) { disconnected.push(id); }, acknowledge() {}, requestSnapshot() {} };
 }
 
-test('Feed：终态bundle原子滚出当前窗口，历史仍保留准确请求与工具事实', async t => {
-  const h = await createRolloverFixture('ui-terminal'); t.after(() => h.close());
-  const frame = await h.append(201), old = ids(h.prefix, 1), current = ids(h.prefix, 201);
-  assert.equal(frame.type, 'reliable-kernel.changes');
-  const removed = windowEvictions(frame); assert.ok(removed.length >= 7);
-  assert.equal(h.state.records.Message[old.message], undefined);
-  assert.equal(h.state.records.ModelRequest[old.request], undefined);
-  assert.equal(h.state.records.ToolCall[old.tool], undefined);
-  assert.ok(h.state.records.Message[current.message]);
-  const page = await h.history.backwardVisibleMessages({ conversationId: h.conversationId, beforeMessageSeq: '2', beforeId: ids(h.prefix, 2).message, limit: 20 });
-  assert.equal(page.records.Message[0].id, old.message);
-  assert.equal(page.records.ModelRequest[0].id, old.request);
-  assert.equal(page.records.ToolCall[0].id, old.tool);
-  assert.equal(h.frames.filter(frame => frame.type === 'reliable-kernel.snapshot').length, 1);
-});
-
-test('Feed：运行Process固定源bundle，结束后下一次滚动释放全部关联记录', async t => {
+test('Feed：运行Process固定源bundle，结束后原子滚出全部关系且历史事实仍完整', async t => {
   const h = await createRolloverFixture('ui-running', { runningProcessOnFirst: true }); t.after(() => h.close());
   await h.append(201); const first = ids(h.prefix, 1), processId = `${h.prefix}-process-001`;
   assert.ok(h.state.records.Message[first.message]); assert.ok(h.state.records.Process[processId]);
   assert.equal(Object.keys(h.state.records.Message).length, 201);
   await h.finishProcess(); const frame = await h.append(202);
-  assert.ok(windowEvictions(frame).some(change => change.id === first.message));
-  assert.equal(h.state.records.Message[first.message], undefined); assert.equal(h.state.records.Process[processId], undefined);
+  assert.equal(frame.type, 'reliable-kernel.changes');
+  const removed = windowEvictions(frame); assert.ok(removed.length >= 7);
+  assert.ok(removed.some(change => change.id === first.message));
+  assert.equal(h.state.records.Message[first.message], undefined);
+  assert.equal(h.state.records.ModelRequest[first.request], undefined);
+  assert.equal(h.state.records.ToolCall[first.tool], undefined);
+  assert.equal(h.state.records.Process[processId], undefined);
+  assert.ok(h.state.records.Message[ids(h.prefix, 202).message]);
+  const page = await h.history.backwardVisibleMessages({ conversationId: h.conversationId, beforeMessageSeq: '2', beforeId: ids(h.prefix, 2).message, limit: 20 });
+  assert.equal(page.records.Message[0].id, first.message);
+  assert.equal(page.records.ModelRequest[0].id, first.request);
+  assert.equal(page.records.ToolCall[0].id, first.tool);
   assert.equal(h.frames.filter(frame => frame.type === 'reliable-kernel.snapshot').length, 1);
 });
 
@@ -370,85 +364,89 @@ test('任务：批准Plan建立rewrite基线，后续Turn只应用有效update',
   assert.deepEqual(card.snapshot.items.map(item => [item.title, item.status]), [['Implement', 'in_progress']]);
 });
 
-async function taskHarness(t, options) {
+async function taskHarness(t) {
   const h = ui.stores(t); h.feed.$reset();
-  const runtime = await createTaskRuntime(options), feed = new kernel.BoundedClientFeed(runtime.database), frames = [];
+  const runtime = await createTaskRuntime(), feed = new kernel.BoundedClientFeed(runtime.database), frames = [];
   t.after(async () => { feed.close(); await runtime.close(); });
-  const connection = await feed.connect({ activeConversationId: 'task-feed-conversation', send(frame) { frames.push(frame); } });
+  const connect = () => feed.connect({ activeConversationId: 'task-feed-conversation', send(frame) { frames.push(frame); } });
+  let connection = await connect();
   let consumed = 0;
   const drain = async () => { await when(() => consumed < frames.length); const frame = frames[consumed++];
     h.feed.observeData(frame); feed.acknowledge({ sessionId: frame.sessionId, hostBootId: frame.hostBootId, messageSeq: frame.messageSeq }); return frame; };
   await drain(); const panel = (await ui.load('components/taskList/TaskListTopPanel.vue')).default;
-  return { runtime, feed, store: h.feed, connection, drain, render: async () => (await h.render(panel)).html };
+  return { runtime, feed, store: h.feed, drain, render: async () => (await h.render(panel)).html,
+    async reconnect() { feed.disconnect(connection.sessionId); connection = await connect(); return drain(); }
+  };
 }
 
-test('任务：worker只读取本Conversation最新有效rewrite，别处Plan不取得权威', async t => {
-  const h = await taskHarness(t);
+test('任务：artifact经Feed和Pinia立即显示，滚出来源与重连后仍采用本对话最新rewrite', async t => {
+  const h = await taskHarness(t); assert.ok((await h.render()).includes('0/1'));
   await h.runtime.settle('task-feed-foreign-plan', { detail: { output: { kind: 'submit_plan.result', proposalId: 'foreign', status: 'approved', executionTarget: 'current_conversation' } } });
   const before = await readCurrentTurnTaskCard(h.runtime.database, 'task-feed-turn');
   assert.equal(before.baselineToolCallId, 'task-feed-base');
-  await h.runtime.settle('task-feed-update-two', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'rewrite', items: [{ title: 'Latest', status: 'pending' }] } } });
-  const latest = await readCurrentTurnTaskCard(h.runtime.database, 'task-feed-turn');
-  assert.equal(latest.baselineToolCallId, 'task-feed-update-two');
-  assert.equal(latest.operationCount, 1); assert.ok(latest.card.includes('Latest')); assert.equal(latest.card.includes('Write tests'), false);
-});
-
-test('任务：真实成功artifact提交立即刷新Feed→Pinia→顶栏，迟到Outcome不回退', async t => {
-  const h = await taskHarness(t); assert.ok((await h.render()).includes('0/1'));
   await h.runtime.settle('task-feed-update-one', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'update', items: [{ title: 'Write tests', status: 'in_progress' }] } } });
   const frame = await h.drain(); assert.equal(frame.projections.activeConversationWindow.currentTaskList.sourceToolCallId, 'task-feed-update-one');
   assert.ok((await h.render()).includes('Write tests'));
   await h.runtime.settle('task-feed-update-one', { operation: null, outcome: true }); await h.drain();
   assert.equal(h.store.projections.activeConversationWindow.currentTaskList.sourceToolCallId, 'task-feed-update-one');
-});
-
-test('任务：来源ToolCall滚出窗口后仍推进，历史分页和重连不重放参数', async t => {
-  const h = await taskHarness(t, { laterMessages: 205 }); assert.equal(h.store.records.ToolCall?.['task-feed-base'], undefined);
+  for (let from = 0; from < 205; from += 50) {
+    await h.runtime.appendMessages(from, Math.min(50, 205 - from)); await h.drain();
+  }
+  await h.reconnect();
+  assert.equal(h.store.records.ToolCall?.['task-feed-base'], undefined);
   await h.runtime.settle('task-feed-update-two', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'update', items: [{ title: 'Write tests', status: 'completed' }] } } });
   await h.drain(); assert.ok((await h.render()).includes('1/1'));
   assert.equal(h.store.records.ToolCall?.['task-feed-update-two'], undefined);
   h.store.historyConversationId = 'task-feed-conversation';
   h.store.historyRecords = { Message: { old: { id: 'task-feed-old-message', conversation_id: 'task-feed-conversation', message_seq: '1', display_seq: '1', role: 'model' } } };
   assert.ok((await h.render()).includes('1/1'));
-  h.feed.disconnect(h.connection.sessionId);
-  const reloaded = await h.feed.connect({ activeConversationId: 'task-feed-conversation', send(frame) { h.store.observeData(frame); } });
-  assert.ok((await h.render()).includes('1/1')); h.feed.disconnect(reloaded.sessionId);
+  await h.reconnect(); assert.ok((await h.render()).includes('1/1'));
+  await h.runtime.settle('task-feed-latest-rewrite', { detail: { kind: 'task-list', operation: { kind: 'task_list.operation', mode: 'rewrite', items: [{ title: 'Latest', status: 'pending' }] } } });
+  await h.drain();
+  const latest = await readCurrentTurnTaskCard(h.runtime.database, 'task-feed-turn');
+  assert.equal(latest.baselineToolCallId, 'task-feed-latest-rewrite');
+  assert.equal(latest.operationCount, 1); assert.ok(latest.card.includes('Latest')); assert.equal(latest.card.includes('Write tests'), false);
+  assert.ok((await h.render()).includes('0/1'));
 });
 
 import { createHistoryFixture, projectionDatabase, projection, visited, sidebar, flushMicrotasks, P, Q } from './ui-history-fixture.mjs';
 
-test('历史：其它项目的提交不改变当前项目页、游标和完整分页划分', async t => {
+test('历史：项目分页隔离外部提交，更新删除和改名后准确重排，计数与刷新同步收敛', async t => {
   const h = await createHistoryFixture(t), first = await h.page(), second = await h.page('project', first.pageInfo.nextCursor);
-  await h.create('foreign-latest'); await h.touch('q-3');
-  const again = await h.page('project', second.pageInfo.cursor);
-  assert.deepEqual(again, second);
-  const pages = [first, second, await h.page('project', second.pageInfo.nextCursor)];
-  assert.deepEqual(pages.flatMap(page => page.entries.map(row => row.id)), await h.order());
-});
-
-test('历史：当前项目更新和删除后页码重新定位，各页不漏不重', async t => {
-  const h = await createHistoryFixture(t), first = await h.page(), oldSecond = await h.page('project', first.pageInfo.nextCursor);
-  await h.touch('p-04'); await h.remove('p-12');
-  const moved = await h.page('project', oldSecond.pageInfo.cursor), order = await h.order();
-  assert.equal(moved.pageInfo.pageIndex, 1); assert.deepEqual(moved.entries.map(row => row.id), order.slice(5, 10));
-  let page = await h.page(); const ids = [];
-  for (;;) { ids.push(...page.entries.map(row => row.id)); if (!page.pageInfo.nextCursor) break; page = await h.page('project', page.pageInfo.nextCursor); }
-  assert.deepEqual(ids, order); assert.equal(new Set(ids).size, ids.length);
-});
-
-test('历史：项目计数只认确切URI与primary关联，删除后准确收敛', async t => {
-  const h = await createHistoryFixture(t);
   const read = input => h.database.conversationHistoryProjection({ ...input, limit: 5, pageIndex: 0 });
   assert.equal((await read({ scopeKind: 'all' })).total, 19);
   assert.equal((await read({ scopeKind: 'unbound' })).total, 2);
   assert.equal((await read({ scopeKind: 'project', projectFolderUri: P })).total, 13);
   assert.equal((await read({ scopeKind: 'project', projectFolderUri: `${P}/` })).total, 0);
+  await h.create('foreign-latest'); await h.touch('q-3');
+  const again = await h.page('project', second.pageInfo.cursor);
+  assert.deepEqual(again, second);
+  const pages = [first, second, await h.page('project', second.pageInfo.nextCursor)];
+  assert.deepEqual(pages.flatMap(page => page.entries.map(row => row.id)), await h.order());
+  await h.touch('p-04'); await h.remove('p-12');
+  const moved = await h.page('project', second.pageInfo.cursor), order = await h.order();
+  assert.equal(moved.pageInfo.pageIndex, 1); assert.deepEqual(moved.entries.map(row => row.id), order.slice(5, 10));
+  let page = await h.page(); const ids = [];
+  for (;;) { ids.push(...page.entries.map(row => row.id)); if (!page.pageInfo.nextCursor) break; page = await h.page('project', page.pageInfo.nextCursor); }
+  assert.deepEqual(ids, order); assert.equal(new Set(ids).size, ids.length);
+  assert.ok(moved.entries.some(row => row.id === 'p-06'));
+  assert.equal(await h.facade.renameConversationTitle('p-06', 'Renamed'), true);
+  const top = await h.page(); assert.equal(top.entries[0].id, 'p-06'); assert.equal(top.entries[0].title, 'Renamed');
+  assert.deepEqual(h.reveals, [{ conversationId: 'p-06', projectFolderUri: P }]);
   const links = kernel.DOMAIN_REPOSITORIES.domain('ConversationProjectLink');
   await h.database.transaction([links.delete('p-01-project'), links.insert({ id: 'p-01-secondary', conversation_id: 'p-01', project_context_id: 'p',
     role: 'secondary', created_at: '2000-01-01T00:00:00Z', updated_at: '2000-01-01T00:00:00Z' })]);
-  assert.equal((await read({ scopeKind: 'project', projectFolderUri: P })).total, 12);
+  assert.equal((await read({ scopeKind: 'project', projectFolderUri: P })).total, 11);
   assert.equal((await read({ scopeKind: 'unbound' })).total, 3);
-  await h.remove('p-02'); assert.equal((await read({ scopeKind: 'project', projectFolderUri: P })).total, 11);
+  await h.remove('p-02'); assert.equal((await read({ scopeKind: 'project', projectFolderUri: P })).total, 10);
+  let release, started = 0; const gate = new Promise(resolve => { release = resolve; });
+  h.facade.product.application.database = new Proxy(h.database, { get(target, key) {
+    if (key === 'conversationHistoryProjection') return async input => { started++; if (started === 1) await gate; return target.conversationHistoryProjection(input); };
+    const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+  } });
+  const active = h.facade.refreshConversationHistory(), next = h.facade.refreshConversationHistory();
+  assert.equal(started, 1); assert.equal(h.facade.refreshConversationHistory(), next);
+  release(); await Promise.all([active, next]); assert.equal(started, 2);
 });
 
 test('历史：侧栏首尾seek读取量不随可见正文历史增长', t => {
@@ -477,14 +475,6 @@ test('历史：旧消息页保留绝对可见序号，新后缀不增大其读�
   assert.deepEqual(read(), before); assert.equal(visited(f.db, sql, parameters), visits);
 });
 
-test('历史：真实改名提交把本窗口操作的项目对话移到第一页', async t => {
-  const h = await createHistoryFixture(t), first = await h.page(), second = await h.page('project', first.pageInfo.nextCursor);
-  assert.ok(second.entries.some(row => row.id === 'p-06'));
-  assert.equal(await h.facade.renameConversationTitle('p-06', 'Renamed'), true);
-  const top = await h.page(); assert.equal(top.entries[0].id, 'p-06'); assert.equal(top.entries[0].title, 'Renamed');
-  assert.deepEqual(h.reveals, [{ conversationId: 'p-06', projectFolderUri: P }]);
-});
-
 test('历史：持续刷新合并在途读取，页面导航和关闭拒绝迟到发布', async t => {
   const h = sidebar(t); h.request('page-2'); await flushMicrotasks(); h.hold(); h.change(); await h.advance(180);
   h.change(); await h.advance(100); h.change(); await h.advance(100);
@@ -494,15 +484,6 @@ test('历史：持续刷新合并在途读取，页面导航和关闭拒绝迟�
   h.hold(); h.change(); await h.advance(180); h.reveal(Q); assert.equal(h.requests.length, 4);
   h.closeView(); h.release(); await flushMicrotasks(); await h.advance(1000);
   assert.equal(h.posted.length, 3); assert.equal(h.timers.size, 0);
-  const runtime = await createHistoryFixture(t), database = runtime.database;
-  let release, started = 0; const gate = new Promise(resolve => { release = resolve; });
-  runtime.facade.product.application.database = new Proxy(database, { get(target, key) {
-    if (key === 'conversationHistoryProjection') return async input => { started++; if (started === 1) await gate; return target.conversationHistoryProjection(input); };
-    const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
-  } });
-  const first = runtime.facade.refreshConversationHistory(), next = runtime.facade.refreshConversationHistory();
-  assert.equal(started, 1); assert.equal(runtime.facade.refreshConversationHistory(), next);
-  release(); await Promise.all([first, next]); assert.equal(started, 2);
 });
 
 test('历史：用户折叠保留运行子任务汇总，主动展开恢复自动展开资格', async () => {

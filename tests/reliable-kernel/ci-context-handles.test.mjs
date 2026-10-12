@@ -5,7 +5,8 @@ import { createRequire } from 'node:module';
 import test, { before, after } from 'node:test';
 import {
   createConfigurationRoot, Database, kernel, kernelFile, compiled, MESSAGE_TYPE,
-  modelRequestAggregate, NOW, removeConfigurationRoot, repo, seedConversations, withRuntime
+  modelRequestAggregate, NOW, removeConfigurationRoot, repo, SHARED_PROJECT, SHARED_TEXT,
+  messageText, withRuntime
 } from './fixtures/runtime-merge-fixture.mjs';
 import * as memory from './fixtures/ci-context-handle-memory.mjs';
 import { registerContextHandleBoundaryTests } from './fixtures/ci-context-handle-boundaries.mjs';
@@ -18,6 +19,7 @@ const { upgradePendingConversationContextHandles } = kernelFile('conversationCon
 const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
 const { RUNTIME_DOMAIN_SCHEMAS } = kernelFile('schema/domainManifest.js');
 const { CURRENT_MODEL_HANDLE_IDENTITY_CONTRACT_REVISION: contract } = kernelFile('modelHandleCatalog.js');
+const { projectFolderAssignmentSteps } = kernelFile('conversationProject.js');
 const CONVERSATION = 'ci_handle_import_owner';
 const INACTIVE_CONVERSATION = 'ci_handle_inactive_owner';
 const IMPORT_CATALOG = { identityContractRevision: contract,
@@ -29,17 +31,18 @@ async function openRuntime() {
 }
 before(async () => {
   configuration = await createConfigurationRoot();
-  await seedConversations(configuration.current, [{ id: CONVERSATION }, { id: INACTIVE_CONVERSATION }]);
-  await seedConversations(configuration.alpha, [{ id: CONVERSATION }, { id: INACTIVE_CONVERSATION }]);
   await withRuntime(configuration.alpha, async (sourceDatabase, sourceStore) => {
+    await seedHandleConversations(sourceDatabase, sourceStore);
     await sourceDatabase.transaction([
       ...state.pendingConversationContextHandleStateSteps(CONVERSATION, NOW),
       ...state.pendingConversationContextHandleStateSteps(INACTIVE_CONVERSATION, NOW)
     ]);
     await seedHandleRequest(sourceDatabase, sourceStore, 'selected_handle_request', 1n, true);
     await seedHandleRequest(sourceDatabase, sourceStore, 'other_selected_request', 1n, true, INACTIVE_CONVERSATION);
+    await seedHandleRequest(sourceDatabase, sourceStore, 'inactive_handle_request', 2n, false, INACTIVE_CONVERSATION);
   });
   await openRuntime();
+  await seedHandleConversations(database, store);
   await database.transaction([
     state.emptyConversationContextHandleStateStep(CONVERSATION, NOW),
     state.emptyConversationContextHandleStateStep(INACTIVE_CONVERSATION, NOW)
@@ -75,6 +78,29 @@ async function directory(name) {
 async function reopen() {
   await database.close();
   await openRuntime();
+}
+async function seedHandleConversations(target, contentStore) {
+  const shared = await contentStore.ingest(target, SHARED_TEXT, MESSAGE_TYPE);
+  for (const conversationId of [CONVERSATION, INACTIVE_CONVERSATION]) {
+    const own = await contentStore.ingest(target, messageText(conversationId, 0), MESSAGE_TYPE);
+    const turnId = conversationId + '_turn';
+    const steps = [
+      repo('Conversation').insert({ id: conversationId, title: conversationId, status: 'active', created_at: NOW, updated_at: NOW }),
+      ...projectFolderAssignmentSteps({ conversationId, folder: SHARED_PROJECT, now: NOW }),
+      repo('Turn').insert({ id: turnId, conversation_id: conversationId, status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW }),
+      repo('TurnTermination').insert({ id: conversationId + '_termination', turn_id: turnId, terminal_status: 'completed', reason: 'fixture', created_at: NOW })
+    ];
+    for (const [index, contentId] of [own.id, shared.id].entries()) {
+      const messageId = conversationId + '_message_' + index;
+      steps.push(
+        repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
+        repo('MessageRevision').insert({ id: messageId + '_revision', message_id: messageId, revision_seq: 1n, role: 'user', content_object_id: contentId, created_at: NOW }),
+        repo('MessageCurrentRevisionLink').insert({ id: messageId + '_current', message_id: messageId, revision_id: messageId + '_revision', updated_at: NOW }),
+        repo('MessagePartOfConversation').insert({ id: messageId + '_member', conversation_id: conversationId, message_id: messageId, message_seq: BigInt(index + 1), created_at: NOW })
+      );
+    }
+    await target.transaction(steps);
+  }
 }
 async function seedHandleRequest(target, contentStore, id, sequence, represented, conversationId = CONVERSATION) {
   const recipe = await contentStore.ingest(target, JSON.stringify({
@@ -218,7 +244,7 @@ test('H3 selected-root upgrade resumes 65 occurrences across 32 and 64 checkpoin
   assert.equal(reopened.metrics.historicalFrontiers, 0);
 });
 
-test('H4 real worker merge rebuilds only a new selected-root provenance generation and preserves old catalog bytes', async () => {
+test('H4 one real merge invalidates selected evidence and preserves the inactive ready branch until explicit activation', async () => {
   const rootId = 'selected_handle_request_root';
   const empty = await state.readConversationContextHandleStateRow(database, CONVERSATION);
   await store.ingest(database, JSON.stringify({ role: 'model', parts: [{ text: 'P1' }] }), MESSAGE_TYPE);
@@ -242,9 +268,16 @@ test('H4 real worker merge rebuilds only a new selected-root provenance generati
     catalog: { ...IMPORT_CATALOG, entries: [{ kind: 'process', ref: 'P1', target: 'stale-derived-process' }] },
     requiresNativeReset: false, now: NOW }));
   const before = await state.readConversationContextHandleStateRow(database, CONVERSATION);
+  const inactiveBefore = await state.readConversationContextHandleStateRow(database, INACTIVE_CONVERSATION);
   const [metadata] = await rows('ContentObject', { id: before.content_object_id });
   const oldBytes = await store.read(metadata);
   await mergeSource();
+  const inactiveImported = await state.readConversationContextHandleStateRow(database, INACTIVE_CONVERSATION);
+  assert.equal(inactiveImported.state, 'ready');
+  assert.equal(inactiveImported.context_root_id, inactiveBefore.context_root_id);
+  assert.equal(inactiveImported.content_object_id, inactiveBefore.content_object_id);
+  assert.equal(inactiveImported.requires_native_reset, inactiveBefore.requires_native_reset);
+  assert.equal(inactiveImported.provenance_revision, inactiveBefore.provenance_revision + 1n);
   const pending = await state.readConversationContextHandleStateRow(database, CONVERSATION);
   assert.equal(pending.state, 'pending');
   assert.equal(pending.context_root_id, rootId);
@@ -259,21 +292,8 @@ test('H4 real worker merge rebuilds only a new selected-root provenance generati
   });
   assert.equal(oldScope.content_object_id, before.content_object_id);
   assert.deepEqual(await store.read(metadata), oldBytes);
-});
-
-test('H5 real worker import of an inactive branch advances provenance while current ready scope stays unchanged', async () => {
-  await withRuntime(configuration.alpha, (sourceDatabase, sourceStore) =>
-    seedHandleRequest(sourceDatabase, sourceStore, 'inactive_handle_request', 2n, false, INACTIVE_CONVERSATION));
-  const before = await state.readConversationContextHandleStateRow(database, INACTIVE_CONVERSATION);
-  await mergeSource();
-  const imported = await state.readConversationContextHandleStateRow(database, INACTIVE_CONVERSATION);
-  assert.equal(imported.state, 'ready');
-  assert.equal(imported.context_root_id, before.context_root_id);
-  assert.equal(imported.content_object_id, before.content_object_id);
-  assert.equal(imported.requires_native_reset, before.requires_native_reset);
-  assert.equal(imported.provenance_revision, before.provenance_revision + 1n);
   const switchPlan = await state.prepareContextHandleHeadTransition({ database, contentStore: store,
-    conversationId: INACTIVE_CONVERSATION, previousRootId: imported.context_root_id,
+    conversationId: INACTIVE_CONVERSATION, previousRootId: inactiveImported.context_root_id,
     nextRootId: 'inactive_handle_request_root', mode: 'activate', now: NOW });
   await database.transaction([...switchPlan.steps, repo('ConversationContextHeadLink').update('other_selected_request_head',
     { root_id: 'inactive_handle_request_root', updated_at: NOW })]);

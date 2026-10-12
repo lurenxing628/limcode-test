@@ -128,6 +128,13 @@ export async function createAttachmentCompressionFixture() {
         ...(sourceReplay ? { sourceReplay } : {}) });
     };
     return { directory, app, agent, configuration, runner, list, seed, rebuild, provider, config, save, bodies, state,
+      async withProviderWindow(contextWindowTokens, operation) {
+        const original = provider.contextWindowTokens;
+        provider.contextWindowTokens = contextWindowTokens;
+        await save('llmProviderConfigs', { configs: [provider] });
+        try { return await operation(); }
+        finally { provider.contextWindowTokens = original; await save('llmProviderConfigs', { configs: [provider] }); }
+      },
       providerOptions: overrides => ({ settings: async () => ({ ...provider, ...overrides }), compressionSettings: async () => undefined,
         resolveAttachment: input => app.attachments.resolveProviderInlineData(input) }),
       async admit(bytes, mimeType, name) {

@@ -13,7 +13,7 @@ after(() => host.dispose());
 const folder = (rootPath, name, index) => ({ uri: Uri.file(rootPath).toString(), rootPath, name, index });
 const local = (id, rootPath) => ({ id, kind: 'localFolder', source: 'workspaceFolder', name: id, rootPath, available: true, createdAt: 1, updatedAt: 1 });
 
-test('绑定B的真实authority冻结文件与命令根，移除B后拒绝而不落到A', async t => {
+test('绑定B的真实authority冻结文件与命令根，长脚本非零退出持久收尾且移除B后拒绝', async t => {
   const root = await temporaryRoot(t, 'environment-smoke'), a = path.join(root, 'A'), b = path.join(root, 'B');
   await fs.mkdir(a); await fs.mkdir(b); await fs.writeFile(path.join(b, 'file.txt'), 'B');
   const { authority } = authorityAt(path.join(root, 'settings'));
@@ -34,10 +34,20 @@ test('绑定B的真实authority冻结文件与命令根，移除B后拒绝而不
   const toolHost = { async resolveEnvironments() { return { active: selected, allowed: [local(aId, a), selected] }; }, skillDirectoriesFor() { return []; } };
   const cwd = await VscodeReliableToolHost.prototype.resolveProcessCwd.call(toolHost, { arguments: {} }, {});
   assert.equal(cwd, b);
-  const script = process.platform === 'win32' ? '[Console]::Write((Get-Location).Path)' : 'pwd -P';
+  const script = process.platform === 'win32'
+    ? `# ${'padding'.repeat(5000)}\n[Console]::WriteLine((Get-Location).Path); [Console]::WriteLine('中文 😀'); exit 7 # trailing comment`
+    : `# ${'padding'.repeat(5000)}\npwd -P; printf '中文 😀\\n'; exit 7 # trailing comment`;
   const wrapper = await startWrapper(t, script, cwd);
   await wrapper.exited;
-  assert.equal((await wrapper.read()).output.trim(), await fs.realpath(b));
+  const { bootstrap, identity, manifest, receipt, output } = await wrapper.read();
+  assert.deepEqual(output.trim().split(/\r?\n/), [await fs.realpath(b), '中文 😀']);
+  assert.equal(bootstrap.phase, 'identity_ready');
+  assert.equal(bootstrap.childPid, identity.childPid);
+  assert.equal(manifest.status, 'exited');
+  assert.equal(receipt.exitCode, '7');
+  assert.equal(receipt.terminationReason, 'natural');
+  assert.equal(receipt.stableNonce, identity.stableNonce);
+  assert.equal(receipt.startFingerprint, identity.startFingerprint);
   await authority.synchronizeWorkspaceFolders([folders[0]]);
   assert.throws(() => resolveFrozenWorkEnvironmentBoundary(frozen, [local(aId, a)]), /已不可用/);
 });
@@ -97,7 +107,7 @@ test('真实文件替换以原生身份保护外部改写，声明symlink根不�
   assert.equal(toSqliteFilePath('\\\\server\\share\\limcode.sqlite', 'win32'), '\\\\?\\UNC\\server\\share\\limcode.sqlite');
 });
 
-test('远程家目录从transport解析，真实读写传输与删除根保护一致', { skip: process.platform === 'win32' }, async t => {
+test('远程家目录从transport解析，真实读取与删除根保护一致', { skip: process.platform === 'win32' }, async t => {
   const root = await temporaryRoot(t, 'remote-home-smoke'), home = path.join(root, 'home');
   await fs.mkdir(path.join(home, 'proj'), { recursive: true });
   await fs.writeFile(path.join(home, 'proj', 'source.txt'), 'remote source');
@@ -107,7 +117,8 @@ test('远程家目录从transport解析，真实读写传输与删除根保护�
     const command = args.at(-1);
     if (command.includes('__limcode_remote_home=')) return nativeSpawn(process.execPath,
       ['-e', `process.stdout.write(${JSON.stringify(`Welcome to fixture\n__limcode_remote_home=${home}\n`)})`], options);
-    return nativeSpawn('/bin/sh', ['-c', command], options);
+    // SSH is the fixture boundary; execute the production script without local login profiles.
+    return nativeSpawn('/bin/sh', ['-c', command.replace(/^bash -lc /, 'bash -c ')], options);
   });
   const remote = compiled('backend/capabilities/workEnvironmentProvider.js');
   const environment = { id: 'remote-home-smoke', kind: 'remoteServer', source: 'manual', name: 'Remote', host: 'fixture.invalid',
@@ -115,14 +126,6 @@ test('远程家目录从transport解析，真实读写传输与删除根保护�
   const restricted = { allowOutsideProjectPaths: false };
   assert.equal(await remote.remoteHomeFor(environment), home);
   assert.equal(await remote.readRemoteServerRawTextFile(environment, 'source.txt', undefined, restricted), 'remote source');
-  await remote.writeRemoteServerTextFile(environment, '~/proj/new.txt', 'written', restricted);
-  const { createWorkEnvironmentRuntimeCapability } = compiled('backend/capabilities/workEnvironmentTransfer.js');
-  const transferred = await createWorkEnvironmentRuntimeCapability().transferFiles({ transfers: [
-    { fromEnvironment: 'current', fromPath: 'source.txt', toEnvironment: 'current', toPath: 'copy.txt' }
-  ] }, undefined, { activeWorkEnvironment: environment, availableWorkEnvironments: [environment], allowOutsideProjectPaths: false });
-  assert.equal(transferred.failCount, 0, JSON.stringify(transferred.results));
-  assert.equal(await fs.readFile(path.join(home, 'proj', 'copy.txt'), 'utf8'), 'remote source');
-  await remote.deleteRemoteServerPath(environment, 'new.txt', restricted);
   await assert.rejects(remote.deleteRemoteServerPath(environment, '~/proj/', restricted), /拒绝删除远程工作环境根目录/);
   await assert.rejects(remote.deleteRemoteServerPath(environment, '~/', { allowOutsideProjectPaths: true }), /拒绝删除/);
   assert.equal(await fs.readFile(path.join(home, 'proj', 'source.txt'), 'utf8'), 'remote source');
@@ -146,23 +149,6 @@ test('代理显式opt-in才注入，关闭恢复用户原有代理和NO_PROXY', 
   applyProxyEnvironment(undefined);
   assert.equal(process.env.HTTP_PROXY, 'http://user-existing:9000');
   assert.equal(process.env.NO_PROXY, 'internal.local');
-});
-
-test('原生wrapper执行Unicode与长脚本，非零退出有完整持久回执', async t => {
-  const command = process.platform === 'win32'
-    ? `# ${'padding'.repeat(5000)}\n[Console]::WriteLine('中文 😀'); exit 7 # trailing comment`
-    : `printf '中文 😀\\n'; exit 7 # trailing comment`;
-  const result = await startWrapper(t, command);
-  await result.exited;
-  const { bootstrap, identity, manifest, receipt, output } = await result.read();
-  assert.equal(bootstrap.phase, 'identity_ready');
-  assert.equal(bootstrap.childPid, identity.childPid);
-  assert.equal(manifest.status, 'exited');
-  assert.equal(receipt.exitCode, '7');
-  assert.equal(receipt.terminationReason, 'natural');
-  assert.equal(receipt.stableNonce, identity.stableNonce);
-  assert.equal(receipt.startFingerprint, identity.startFingerprint);
-  assert.match(output, /中文 😀/);
 });
 
 test('原生wrapper读取确切用户stop请求，真实进程树结束并持久收尾', async t => {

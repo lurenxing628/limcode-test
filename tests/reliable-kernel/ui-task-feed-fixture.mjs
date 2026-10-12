@@ -22,7 +22,7 @@ const planResult = (status) => ({ output: {
 } });
 
 /** The Runtime a Conversation with a task list, its settled rewrite and still-running task tools. */
-export async function createTaskRuntime({ laterMessages = 0 } = {}) {
+export async function createTaskRuntime() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-task-live-feed-'));
   let database;
   const close = async () => {
@@ -86,6 +86,7 @@ export async function createTaskRuntime({ laterMessages = 0 } = {}) {
       ...await call('task-feed-update-two', 'update_task_list', update('completed'), nativeSource, 1, turnId, 3),
       ...await call('task-feed-plan', 'submit_plan', { plan: '完成', taskList: rewrite('completed') }, nativeSource, 2, turnId, 4),
       ...await call('task-feed-rejected-plan', 'submit_plan', { plan: '放弃', taskList: rewrite('completed') }, nativeSource, 3, turnId, 5),
+      ...await call('task-feed-latest-rewrite', 'update_task_list', rewrite('completed'), nativeSource, 4, turnId, 6),
       ...await call('task-feed-foreign-plan', 'submit_plan', { plan: '别处', taskList: rewrite('completed') }, foreignSource, 0, foreignTurnId, 1)
     ]);
     const settle = async (toolCallId, { operation = 'succeeded', detail, outcome = false } = {}) => {
@@ -99,11 +100,12 @@ export async function createTaskRuntime({ laterMessages = 0 } = {}) {
       await database.transaction(steps);
     };
     await settle('task-feed-base', { detail: { kind: 'task-list', operation: rewrite('pending') }, outcome: true });
-    for (let start = 0; start < laterMessages; start += 50) {
-      await database.transaction(Array.from({ length: Math.min(50, laterMessages - start) }, (_value, offset) =>
-        message(`task-feed-later-${start + offset}`, 3 + start + offset, 'user')).flat());
-    }
-    return { database, settle, close };
+    return { database, settle, close,
+      appendMessages(from, count) {
+        return database.transaction(Array.from({ length: count }, (_value, offset) =>
+          message(`task-feed-later-${from + offset}`, 3 + from + offset, 'user')).flat());
+      }
+    };
   } catch (error) {
     await close();
     throw error;
