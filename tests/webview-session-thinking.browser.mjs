@@ -11,7 +11,7 @@ const { createEmptyClientState } = require('../dist/extension/shared/clientState
 const { BridgeMessageType: T } = require('../dist/extension/shared/protocol.js');
 
 // Exercise the packaged Vue application and real browser events. The host is synthetic:
-// backend persistence, CAS and wire bodies are covered by session-thinking-runtime.test.mjs.
+// Backend persistence, CAS and wire bodies are covered by configuration-runtime-smoke.test.mjs.
 test('built chat can read thinking, recover an expired save session, and send with inherited model', async () => {
   const root = path.resolve('dist/webview');
   const server = createServer(async (req, res) => {

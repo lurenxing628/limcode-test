@@ -109,7 +109,7 @@
 后续小项（随第 1 期一起做即可）：
 
 - `foreign-history-epoch-newer` 的文案写“更新扩展后可以再看”。开发期 main 上的 epoch 7–10 已压成一次 5→6、永不会再有能读它们的版本，这类库的说明应改成如实写明“这是未发布的开发版本格式”。只影响跑过 10 月 4 日之后 main 构建的机器。
-- 新测试的 CI 耗时是估计值，第一次 CI 实测后改写 `ci-test-timings.json`。
+- 场景并入相同职责的精简行为套件，复用临时数据与 worker；完成后以 GitHub CI 的实际执行用时验收。
 
 ## 5. 第 1 期：不再产生新的历史库
 
@@ -362,7 +362,7 @@
 - `migration.json`：`boundedEpochUpgrade`（选库相关）、`historicalMerge`（多处，见第 2 期改写后的版本，再删会话与倒计时）、`exclusiveMaintenance` 的 `uses`、`dataRootRelocation`（删 `otherDataSets`，改 `oldDirectory`）、`backupCleanup`（删 `foreignHistory`，加 `mergedSource`，改 `listedOnly`）。
 - `authority.json`：`rootPolicy` 的选择、保留、外来库字段。
 - `contract-model.mjs`：删会话、估计、速率、外来声明与查看登记的整段检查；改 `historicalMerge`、`dataRootRelocation`、`backupCleanup` 的逐字期望；改外来库源码片段。
-- `check-plan.mjs` 的 `TRACKED_VERIFICATION_SOURCE_ALLOWLIST`、`run-local-tests.mjs` 的 `CI_TEST_FILES`、`ci-test-timings.json`：删除被删测试文件的条目。
+- 行为套件由 `run-local-tests.mjs` 统一发现和并行执行；旧测试的有效场景合入职责主题，旧文件及重复登记随替换删除。
 - AGENTS.md：第 19 段（约 1.4 万字）删切换、保留、请求、独占兜底与会话界面约 6000 字，其余改写成单库收敛；第 21 段删外来与其它本地库约 2400 字，补“已合并来源”；第 23 段整段换成约 600 字的“未能合并的旧数据”；第 25 段删约 1900 字；第 386 行外来历史根改成残留只读的说法。01-invariants 第 313、315（删约 7600 字）、317、319 段对应改写。
 
 ### 8.5 测试

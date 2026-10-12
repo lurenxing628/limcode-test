@@ -1,0 +1,15 @@
+import test from 'node:test';
+import { registerCases as register0 } from './ci-parts/compression-handle-freeze.mjs';
+import { registerCases as register1 } from './ci-parts/compression-provider-contracts.mjs';
+import { registerCases as register2 } from './ci-parts/openai-request-shaping.mjs';
+import { registerCases as register3 } from './ci-parts/compression-reduction-gate.mjs';
+import { registerCases as register4 } from './ci-parts/context-token-estimator.mjs';
+import { registerCases as register5 } from './ci-parts/request-compression-settings.mjs';
+import { registerCases as register6 } from './ci-parts/skill-reattachment-compression.mjs';
+register0(test);
+register1(test);
+register2(test);
+register3(test);
+register4(test);
+register5(test);
+register6(test);
