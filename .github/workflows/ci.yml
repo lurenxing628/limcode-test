@@ -32,4 +32,11 @@ jobs:
       - name: Check architecture contracts
         run: npm run check:contracts:plan
       - name: Run webview typecheck, core suites and browser workflows
-        run: npm run test:ci
+        env:
+          TMPDIR: /dev/shm/limcode-tests
+          LIMCODE_TEST_EXECUTABLE_TMPDIR: ${{ runner.temp }}
+        run: |
+          mkdir -p "$TMPDIR"
+          df -h "$TMPDIR"
+          findmnt -no OPTIONS /dev/shm
+          npm run test:ci

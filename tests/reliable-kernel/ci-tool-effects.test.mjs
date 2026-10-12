@@ -145,8 +145,9 @@ test('TE03 native local reads return large Unicode ranges and attachments withou
 
 test('TE04 remote bytes added after the size check fail instead of returning a truncated prefix', { skip: process.platform === 'win32' }, async t => {
   const base = await directory('remote-read');
-  const bin = path.join(base, 'bin'), root = path.join(base, 'root');
-  await fs.mkdir(bin);
+  const bin = await fs.mkdtemp(path.join(process.env.LIMCODE_TEST_EXECUTABLE_TMPDIR ?? os.tmpdir(), 'limcode-ssh-bin-'));
+  t.after(() => fs.rm(bin, { recursive: true, force: true }));
+  const root = path.join(base, 'root');
   await fs.mkdir(root);
   await fs.writeFile(path.join(bin, 'ssh'), '#!/bin/sh\nfor last do :; done\nsh -c "$last"\nprintf surplus\n');
   await fs.chmod(path.join(bin, 'ssh'), 0o755);
