@@ -15,7 +15,7 @@ if (files.length === 0) throw new Error('没有找到可靠内核行为测试。
 if (args.includes('--list')) {
   await new Promise((resolve, reject) => process.stdout.write(`${files.join('\n')}\n`, error => error ? reject(error) : resolve()));
 } else {
-  const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=4', ...files], {
+  const child = spawn(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=3', ...files], {
     cwd: process.cwd(), stdio: 'inherit'
   });
   let stoppedBy;

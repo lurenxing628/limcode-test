@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import path from 'node:path';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { createBrowserFixtureServer } from './reliable-kernel/browser-fixture-server.mjs';
 
 // Mount the production child Agent panel with the global theme stylesheet, so the global button
 // hover rule and the real grid/flex layout apply. Only the feed, Agent store and bridge are stubbed.
@@ -58,10 +58,8 @@ const stubbedImports = [
 ];
 
 test('child Agent list titles rows by task and keeps them readable in narrow and wide panels', async () => {
-  const { createServer: createViteServer } = await import('vite');
-  const server = await createViteServer({
-    configFile: path.resolve('vite.config.ts'),
-    server: { host: '127.0.0.1', port: 0, strictPort: false, hmr: false },
+  const server = await createBrowserFixtureServer({
+    dependencies: ['vue', '@tabler/icons-vue'],
     plugins: [{
       name: 'agent-status-panel-browser-fixture', enforce: 'pre',
       resolveId(id) { if (id === 'virtual:agent-panel-fixture') return '\0' + id; },
@@ -96,7 +94,8 @@ test('child Agent list titles rows by task and keeps them readable in narrow and
       const page = await browser.newPage({ viewport: { width, height: 800 } });
       page.setDefaultTimeout(10000);
       page.on('pageerror', error => errors.push(error.message));
-      await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/agent-status-panel-fixture`);
+      await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/agent-status-panel-fixture`, { waitUntil: 'domcontentloaded' });
+      await page.locator('.agent-run-trigger').waitFor();
       await page.locator('.agent-run-trigger').click();
       await page.locator('.agent-run-item').first().waitFor();
 

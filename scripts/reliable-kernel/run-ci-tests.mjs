@@ -34,7 +34,7 @@ async function browser() {
       : await run('npx', ['--offline', ...args]);
     if (status !== 0) return status;
   }
-  return run(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=3',
+  return run(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1',
     'tests/webview-session-thinking.browser.mjs',
     'tests/webview-agent-status-panel.browser.mjs',
     'tests/webview-file-change-preview.browser.mjs'

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { createRequire } from 'node:module';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { createBrowserFixtureServer } from './reliable-kernel/browser-fixture-server.mjs';
 
 const require = createRequire(import.meta.url);
 const { createEmptyClientState } = require('../dist/extension/shared/clientStateSchema.js');
@@ -28,6 +29,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
   try {
     browser = await chromium.launch({ headless: true, ...(process.env.LIMCODE_TEST_BROWSER_PATH ? { executablePath: process.env.LIMCODE_TEST_BROWSER_PATH } : {}) });
     page = await browser.newPage();
+    page.setDefaultTimeout(10000);
     page.on('pageerror', error => errors.push(error.message));
     await page.addInitScript(({ T, state }) => {
       let host = 'host-a', seq = 0, session = 'edit-a';
@@ -78,7 +80,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
       } });
       window.replaceHost = () => { host = 'host-b'; session = 'edit-b'; emit(T.Hello, { meta: { kind: 'mainPanel', conversationId: 'conversation' } }); };
     }, { T, state: createEmptyClientState() });
-    await page.goto(`http://127.0.0.1:${server.address().port}`);
+    await page.goto(`http://127.0.0.1:${server.address().port}`, { waitUntil: 'domcontentloaded' });
     const thinking = page.locator('.session-thinking-dropdown');
     await thinking.getByRole('button').filter({ hasText: '思考：高' }).waitFor();
     await page.locator('textarea').fill('browser regression message');
@@ -137,7 +139,6 @@ test('built chat can read thinking, recover an expired save session, and send wi
 // Only the host feed and message bodies are stubbed; varying row heights prevent a
 // fixed scrollTop or message-count formula from accidentally passing this test.
 test('history click keeps the visible message anchored after the production Vue list updates', async () => {
-  const { createServer: createViteServer } = await import('vite');
   const fixture = `
     import { reactive, ref } from 'vue';
     const rows = (from, count) => Array.from({length:count}, (_, i) => ({id:'message-'+(from+i), seq:from+i, role:'user', content:{role:'user',parts:[{text:'synthetic history'}]}, createdAt:from+i, status:'completed', conversationId:'scroll-conversation'}));
@@ -153,9 +154,8 @@ test('history click keeps the visible message anchored after the production Vue 
     window.fulfillEarlier = () => {projection.value={...projection.value,messages:rows(81,50)};feed.historyLoading=false;feed.historyLoadedPages++;};
   `;
   const stubs = ['useReliableConversation', 'useChat', 'useGlobalSettingsStore', 'useModelProfileStore', 'useReliableTimelinePresentationStore'];
-  const server = await createViteServer({
-    configFile: path.resolve('vite.config.ts'),
-    server: { host: '127.0.0.1', port: 0, strictPort: false, hmr: false },
+  const server = await createBrowserFixtureServer({
+    dependencies: ['vue', '@tabler/icons-vue'],
     plugins: [{
       name: 'history-scroll-browser-fixture', enforce: 'pre',
       resolveId(id) { if (id.startsWith('virtual:scroll-')) return '\0' + id; },
@@ -189,7 +189,7 @@ test('history click keeps the visible message anchored after the production Vue 
     const page = await browser.newPage();
     page.setDefaultTimeout(10000);
     page.on('pageerror', error => { errors.push(error.message); console.error('History fixture error:', error.message); });
-    await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/history-scroll-fixture`);
+    await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/history-scroll-fixture`, { waitUntil: 'domcontentloaded' });
     const scroller = page.locator('#scroll-fixture');
     const row = id => page.locator(`.reliable-message-row[data-timeline-row-key="${id}"]`);
     const offset = target => target.evaluate(element => element.getBoundingClientRect().top - document.querySelector('#scroll-fixture').getBoundingClientRect().top);

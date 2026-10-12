@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import path from 'node:path';
 import test from 'node:test';
 import { chromium } from 'playwright';
+import { createBrowserFixtureServer } from './reliable-kernel/browser-fixture-server.mjs';
 
 const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"></head><body>
 <div id="app" style="width:720px"></div>
@@ -50,10 +50,8 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
 </script></body></html>`;
 
 test('file preview loads arriving members, starts expanded and respects the user collapsing it', async () => {
-  const { createServer } = await import('vite');
-  const server = await createServer({
-    configFile: path.resolve('vite.config.ts'),
-    server: { host: '127.0.0.1', port: 0, strictPort: false, hmr: false },
+  const server = await createBrowserFixtureServer({
+    dependencies: ['vue', 'pinia', '@tabler/icons-vue', 'markdown-it', 'markdown-it-texmath', 'katex'],
     plugins: [{
       name: 'file-preview-browser-fixture',
       configureServer(vite) {
@@ -73,7 +71,7 @@ test('file preview loads arriving members, starts expanded and respects the user
     const page = await browser.newPage({ viewport: { width: 1000, height: 800 } });
     page.setDefaultTimeout(10000);
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/file-preview-fixture`);
+    await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/file-preview-fixture`, { waitUntil: 'domcontentloaded' });
     const toggle = page.locator('.tool-call-card > .lc-collapsible-header .lc-collapsible-summary');
     await toggle.waitFor();
     assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
@@ -116,7 +114,7 @@ test('file preview loads arriving members, starts expanded and respects the user
     assert.equal(await detailsToggle.getAttribute('aria-expanded'), 'false');
 
     for (const command of ['bash', 'shell']) {
-      await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/file-preview-fixture?command=${command}`);
+      await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/file-preview-fixture?command=${command}`, { waitUntil: 'domcontentloaded' });
       await toggle.waitFor();
       assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
       assert.match(await toggle.innerText(), /运行命令并收集结果/);
