@@ -27,11 +27,18 @@ jobs:
           cache: npm
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
-      - name: Build extension and webview once
-        run: npm run build
-      - name: Typecheck webview
-        run: npm run typecheck:webview
-      - name: Check architecture contracts
-        run: npm run check:contracts:plan
+      - name: Build, typecheck and validate contracts once
+        run: |
+          npm run build &
+          limcode_build_pid=$!
+          npm run typecheck:webview &
+          limcode_typecheck_pid=$!
+          npm run check:contracts:plan &
+          limcode_contracts_pid=$!
+          limcode_verification_status=0
+          wait "$limcode_build_pid" || limcode_verification_status=$?
+          wait "$limcode_typecheck_pid" || limcode_verification_status=$?
+          wait "$limcode_contracts_pid" || limcode_verification_status=$?
+          exit "$limcode_verification_status"
       - name: Run core suites and browser workflows
         run: npm run test:ci

@@ -97,15 +97,17 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
   const timers = [];
   let retryWaiting = () => {};
   context.mock.method(globalThis, 'setTimeout', (callback, milliseconds, ...args) => {
-    if (milliseconds === 7 || (milliseconds > 59000 && milliseconds <= 60000)) {
-      const handle = schedule(callback, 60_000, ...args);
+    if (milliseconds === 7 || milliseconds === 11 || milliseconds === 60_000) {
+      // Keep native clearTimeout handles; only the fixture fires watchdog callbacks.
+      const handle = schedule(() => {}, 60_000).unref();
       timers.push({ milliseconds, handle, fire() { clearTimeout(handle); callback(...args); } });
-      if (milliseconds !== 7) retryWaiting();
+      if (milliseconds === 60_000) retryWaiting();
       return handle;
     }
     return schedule(callback, milliseconds, ...args);
   });
-  const options = { semanticTimeouts: { firstSemanticMs: 7, semanticIdleMs: 11 },
+  const epoch = Date.now();
+  const options = { epochNow: () => epoch, semanticTimeouts: { firstSemanticMs: 7, semanticIdleMs: 11 },
     retryDelaysMs: [0], adapterDrainTimeoutMs: 20 };
   const first = new kernel.ModelProviderControlPlane(fixture.app.database, fixture.app.contentStore, options);
   let progressSeen;
@@ -115,7 +117,7 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
   let calls = 0;
   const adapter = { providerId: 'compatible', async sendFullRequest(request, controls) {
     calls += 1;
-    await controls.onEvent({ kind: 'output_delta', streamSeq: '1', content: {
+    await controls.onEvent({ kind: 'output_delta', streamSeq: '1', semanticProgress: false, content: {
       type: 'thought_progress', thoughtStartedAt: Date.now(), thoughtElapsedMs: 10
     } });
     progressSeen();
@@ -127,13 +129,14 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
   const interrupted = assert.rejects(running, /handoff/);
   try {
     await progressed;
-    assert.equal(timers.filter(timer => timer.milliseconds === 7).length, 1);
+    assert.deepEqual(timers.map(timer => timer.milliseconds), [7]);
     timers.find(timer => timer.milliseconds === 7).fire();
     await persistedRetry;
     const [retrying] = await fixture.rows('ModelRequest', { id: created.modelRequestId });
     assert.equal(retrying.status, 'retrying');
     assert.equal(retrying.stream_stats_json.attemptSeq, '2');
     assert.equal(retrying.stream_stats_json.retryDelayMs, 60_000);
+    assert.equal(retrying.stream_stats_json.retryNotBeforeAt, epoch + 60_000);
     await first.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture handoff'));
     await interrupted;
     const caller = new AbortController();
@@ -147,6 +150,9 @@ test('伪思考进度不续命，持久重试等待经接手仍保持并可取�
       .stream_stats_json.retryNotBeforeAt, retrying.stream_stats_json.retryNotBeforeAt);
     caller.abort();
     await cancelled;
+    assert.equal(calls, 1);
+    assert.equal((await fixture.rows('ModelRequest', { id: created.modelRequestId }))[0].terminal_state,
+      'cancelled-during-provider-retry-delay');
   } finally {
     await first.quiesceAllActiveDispatches(new kernel.ExecutionHandoffError('fixture cleanup'));
     for (const timer of timers) clearTimeout(timer.handle);

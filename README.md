@@ -86,7 +86,7 @@ Limcode Test: 历史与存储管理
 - 通过 Pull Request 合并改动，不直接改写已经共享的历史。
 - 提交消息只写简明中文标题，不添加类型前缀，也不写正文。
 - 提交前运行 `npm run check:plan:tracked` 检查构建、类型和合同；行为回归运行 `npm run test:core` 或相关主题测试。构建完成后用 `npm run test:ci` 执行核心套件与真实浏览器验证。
-- 常规 CI 只有一个 Linux job，构建、类型和合同各执行一次，主题套件以三个独立进程并行，浏览器安装及验证同时执行。每个主题使用自己的临时目录，主题内复用 SQLite worker、Vue SSR 和已准备的数据；测试覆盖真实生产入口的独立行为，新增场景先并入相同职责。
+- 常规 CI 只有一个 Linux job，构建、类型和合同各执行一次并行完成，随后主题套件以四个独立进程并行，浏览器安装及验证同时执行。每个主题使用自己的临时目录，主题内复用 SQLite worker、Vue SSR 和已准备的数据；测试覆盖真实生产入口的独立行为，新增场景先并入相同职责。
 - Windows/macOS 的真实原生宿主差异在发布准备时运行 `npm run build`，再运行 `node --test tests/reliable-kernel/host-environment-smoke.test.mjs tests/reliable-kernel/storage-authority-durability.test.mjs`。四平台包用 `npm run package:all` 生成，各自运行 `npm run check:package:surface -- --artifact <VSIX路径>` 核验内容。通用类型、合同与数据库矩阵由 Linux 常规 CI 验证，大规模内存和吞吐基准按相应性能开发工作调用。
 
 ## 常用脚本
