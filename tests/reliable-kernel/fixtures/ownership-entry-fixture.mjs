@@ -1,3 +1,4 @@
+import { createOwnershipScope } from './ownership-scope-fixture.mjs';
 // Focused production ownership boundary; old review matrices are absent.
 import assert from 'node:assert/strict';
 
@@ -81,6 +82,7 @@ const { readPendingInteractionAttention, InteractionLeaseEdgeTracker } = await l
 const { projectFolderAssignmentSteps } = await load('backend/reliableKernel/conversationProject.js');
 
 const { conversationRuntimeOwnerClaimPath } = await load('backend/reliableKernel/ConversationRuntimeOwnerManager.js');
+const { claimGenerationPath } = await load('backend/reliableKernel/runtimeClaimPrimitives.js');
 
 const { askUserTool } = await load('backend/world/modules/tools/definitions/askUser/index.js');
 
@@ -120,7 +122,8 @@ async function runWorker(mode) {
       await createConversation(host.app, conversationId, PROJECT_TWO_FOLDER);
       const started = await host.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '开始' });
       await provider.started;
-      await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_READY'), { turnId: started.turnId });
+      const owner = JSON.parse(await fs.readFile(path.join(conversationRuntimeOwnerClaimPath(host.app.database.binding.paths, conversationId), 'owner.json'), 'utf8'));
+      await writeJson(requiredEnv('LIMCODE_ELIGIBILITY_READY'), { turnId: started.turnId, ownerToken: owner.ownerToken, hostBootId: host.app.database.hostBootId });
       await waitForFile(requiredEnv('LIMCODE_ELIGIBILITY_FINISH'), 300_000);
     } finally {
       await host.close();
@@ -365,20 +368,6 @@ function createRouter(host) {
   });
 }
 
-async function startTurnThenCloseHost(dataRoot, conversationId, project) {
-  const provider = gatedProvider();
-  const origin = await openHost(dataRoot, provider, { folders: [project.uri], label: 'origin-window' });
-  try {
-    await createConversation(origin.app, conversationId, project);
-    const started = await origin.runner.input({ commandId: `input-${conversationId}`, conversationId, text: '开始执行' });
-    await provider.started;
-    await eventually(async () => (await rows(origin.app, 'ExecutionLease', { turn_id: started.turnId })).length === 1,
-      30_000, 'Turn 未建立 ExecutionLease');
-    return started.turnId;
-  } finally {
-    await origin.close();
-  }
-}
 
 async function openHost(dataRoot, provider, options) {
   const folders = [...options.folders];
@@ -564,10 +553,7 @@ function fixtureDependencies(provider, defaultWorkEnvironmentId, tools = {}) {
 }
 
 async function createIsolatedRoot(label) {
-  const outer = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-eligibility-${label}-`));
-  await fs.mkdir(path.join(outer, 'control'), { recursive: true });
-  const candidate = await kernel.resetCandidateRuntimeRoot(path.join(outer, 'control'));
-  return { outer, dataRoot: candidate.binding.paths.dataRootPath };
+  return createOwnershipScope(label);
 }
 
 async function ownerRecordExists(dataRoot, conversationId) {
@@ -904,7 +890,13 @@ export const scenario3 = async () => {
   let observer;
   try {
     const conversationId = 'conversation-race';
-    const turnId = await startTurnThenCloseHost(dataRoot, conversationId, PROJECT_TWO_FOLDER);
+    const originFiles = workerFiles(outer, 'dead-origin');
+    const origin = spawnWorker(dataRoot, 'origin', { ...originFiles.env, LIMCODE_ELIGIBILITY_CONVERSATION: conversationId });
+    children.push({ child: origin });
+    const deadOwner = await waitForWorkerJson(origin, originFiles.ready, 90000);
+    const turnId = deadOwner.turnId;
+    origin.kill('SIGKILL');
+    await waitForExit(origin, 30000);
     const go = path.join(outer, 'go');
     const gate = path.join(outer, 'gate');
     const finish = path.join(outer, 'finish');
@@ -945,13 +937,18 @@ export const scenario3 = async () => {
     assert.deepEqual(reports.p1.ineligibleTurnIds, [turnId]);
     assert.deepEqual(reports.p1.resumedTurnIds, []);
     assert.deepEqual(reports.p1.liveOwnedTurnIds, []);
+    const claimPath = conversationRuntimeOwnerClaimPath((await new kernel.RootAuthority(() => dataRoot).current()).paths, conversationId);
+    const currentOwner = JSON.parse(await fs.readFile(path.join(claimPath, 'owner.json'), 'utf8'));
+    assert.notEqual(currentOwner.ownerToken, deadOwner.ownerToken, 'dead Host replacement publishes a new durable owner token');
+    assert.notEqual(currentOwner.hostBootId, deadOwner.hostBootId);
+    assert.ok((await fs.readdir(claimGenerationPath(claimPath, `dead-${deadOwner.ownerToken}`))).length > 0, 'dead owner generation remains a nonempty tombstone');
 
     await fs.writeFile(gate, 'release\n', 'utf8');
     observer = await kernel.RuntimeDatabase.open(new kernel.RootAuthority(() => dataRoot), { hostBootId: 'race-observer' });
     await eventually(async () => (await rows(observer, 'Turn', { id: turnId }))[0]?.status === 'terminated',
       90_000, '承接方未完成 Turn');
     await fs.writeFile(finish, 'finish\n', 'utf8');
-    for (const { child } of children) await waitForExit(child, 90_000, true);
+    for (const { child } of children) if (child !== origin) await waitForExit(child, 90_000, true);
     const results = Object.fromEntries(await Promise.all(workers.map(async (worker) =>
       [worker.name, await readJson(worker.result)])));
     assert.equal(results[winners[0]].providerCalls, 1);

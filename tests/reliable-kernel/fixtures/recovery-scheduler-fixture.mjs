@@ -94,7 +94,7 @@ function deferred() {
   return { promise, resolve, reject };
 }
 
-function dependencies(host = { definitions: () => [] }, toolPolicyOverrides = {}) {
+function dependencies(host, toolPolicyFor) {
   return {
     authorityCompiler: {
       async compile(request) {
@@ -127,7 +127,7 @@ function dependencies(host = { definitions: () => [] }, toolPolicyOverrides = {}
                 preset: 'custom',
                 toolConfigs: {},
                 sourceConfigs: {},
-                ...toolPolicyOverrides
+                ...toolPolicyFor(request.conversationId)
               },
               planReviewPolicy: { mode: 'never' },
               systemPrompt: { id: 'prompt-default', text: '' },
@@ -182,11 +182,32 @@ async function list(app, domain, where = {}) {
   }))).snapshot;
 }
 
-async function withNativeApp(name, run, host, toolPolicyOverrides) {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), `${name}-`));
+let sharedNative;
+async function nativeApplication() {
+  if (sharedNative) return sharedNative;
+  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-native-schedule-'));
   const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
-  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(host, toolPolicyOverrides));
+  const hosts = new Map(), policies = new Map(), dispatches = new Map(), tasks = new Map();
+  const host = {
+    definitions: () => SCHEDULER_DEFINITIONS,
+    executeNoEffect: (definition, input, ...args) => hosts.get(input.turnId).executeNoEffect(definition, input, ...args),
+    dispatchSpecial: (definition, input, ...args) => hosts.get(input.turnId).dispatchSpecial(definition, input, ...args)
+  };
+  const app = await kernel.ReliableKernelApplication.open(authority, dependencies(host, id => policies.get(id)));
+  return sharedNative = { app, parent, hosts, policies, dispatches, tasks };
+}
+
+export async function close() {
+  if (!sharedNative) return;
+  await sharedNative.app.close();
+  await fs.rm(sharedNative.parent, { recursive: true, force: true });
+}
+
+async function withNativeApp(name, run, host, toolPolicyOverrides) {
+  const fixture = await nativeApplication(), app = fixture.app;
+  fixture.policies.set(name, toolPolicyOverrides);
+  let turnId;
   try {
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -207,10 +228,21 @@ async function withNativeApp(name, run, host, toolPolicyOverrides) {
       leaseExpiresAt: new Date(Date.now() + 120_000).toISOString(),
       content: 'native tool admission fixture'
     });
-    await run(app, name, started.turnId);
+    turnId = started.turnId;
+    fixture.hosts.set(turnId, host);
+    await run(app, name, turnId);
   } finally {
-    await app.close();
-    await fs.rm(parent, { recursive: true, force: true });
+    if (turnId) {
+      host.closing = true;
+      host.release();
+      await Promise.allSettled(fixture.tasks.get(turnId) ?? []);
+      await app.modelProvider.quiesceTurnDispatches(turnId);
+      await Promise.allSettled(fixture.dispatches.get(turnId) ?? []);
+      fixture.hosts.delete(turnId);
+      fixture.tasks.delete(turnId);
+      fixture.dispatches.delete(turnId);
+    }
+    fixture.policies.delete(name);
   }
 }
 
@@ -243,6 +275,9 @@ async function createStreamingRequest(app, turnId, key, tools = []) {
     }
   });
   // Teardown aborts the held stream; the terminal classification is not part of any assertion.
+  const dispatches = sharedNative.dispatches.get(turnId) ?? [];
+  dispatches.push(dispatchPromise);
+  sharedNative.dispatches.set(turnId, dispatches);
   void dispatchPromise.catch(() => undefined);
   const controls = await opened.promise;
   const request = (await list(app, 'ModelRequest', { id: created.modelRequestId }))[0];
@@ -380,11 +415,12 @@ export const scenario1 = async () => {
   const gates = new Map();
   const host = {
     definitions: () => SCHEDULER_DEFINITIONS,
+    release() { for (const gate of gates.values()) gate.resolve(); },
     async executeNoEffect(definition, input) {
       started.push(input.toolCallId);
       const gate = deferred();
       gates.set(input.toolCallId, gate);
-      await gate.promise;
+      if (!host.closing) await gate.promise;
       return { ok: true, output: 'done' };
     }
   };
@@ -407,6 +443,7 @@ export const scenario1 = async () => {
     const tasks = entries.map((entry) =>
       app.toolDispatcher.scheduleAdmittedCall(scheduleInput(turnId, modelRequestId, entry))
     );
+    sharedNative.tasks.set(turnId, tasks);
     const watch = watchScheduled(tasks);
     const allowedSettled = new Set();
     await untilScheduling(watch, allowedSettled, () => started.length === 8, 'ordinary lane admits exactly eight calls');
@@ -429,11 +466,12 @@ export const scenario2 = async () => {
   const gates = new Map();
   const host = {
     definitions: () => SCHEDULER_DEFINITIONS,
+    release() { for (const gate of gates.values()) gate.resolve(); },
     async executeNoEffect(definition, input) {
       started.push(input.toolCallId);
       const gate = deferred();
       gates.set(input.toolCallId, gate);
-      await gate.promise;
+      if (!host.closing) await gate.promise;
       return { ok: true, output: 'done' };
     }
   };
@@ -463,6 +501,7 @@ export const scenario2 = async () => {
     const tasks = entries.map((entry) =>
       app.toolDispatcher.scheduleAdmittedCall(scheduleInput(turnId, modelRequestId, entry))
     );
+    sharedNative.tasks.set(turnId, tasks);
     const watch = watchScheduled(tasks);
     const allowedSettled = new Set();
     await untilScheduling(watch, allowedSettled, () => started.length === 1, 'only the first parallel call runs before the serial point');
@@ -492,12 +531,13 @@ export const scenario3 = async () => {
   const gates = new Map();
   const host = {
     definitions: () => SCHEDULER_DEFINITIONS,
+    release() { for (const gate of gates.values()) gate.resolve(); },
     async dispatchSpecial(definition, input, authority, signal, admission) {
       started.push(input.toolCallId);
       admissions.set(input.toolCallId, admission);
       const gate = deferred();
       gates.set(input.toolCallId, gate);
-      await gate.promise;
+      if (!host.closing) await gate.promise;
       return {
         disposition: 'paused',
         toolCallId: input.toolCallId,
@@ -526,6 +566,7 @@ export const scenario3 = async () => {
     const tasks = entries.map((entry) =>
       app.toolDispatcher.scheduleAdmittedCall(scheduleInput(turnId, modelRequestId, entry))
     );
+    sharedNative.tasks.set(turnId, tasks);
     const watch = watchScheduled(tasks);
     const allowedSettled = new Set();
     await untilScheduling(watch, allowedSettled, () => started.length === 8, 'child starts are bounded by the shared admission barrier');

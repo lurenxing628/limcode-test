@@ -1,3 +1,4 @@
+import { createOwnershipScope } from './ownership-scope-fixture.mjs';
 // Focused production ownership boundary; old review matrices are absent.
 import assert from 'node:assert/strict';
 import { after } from 'node:test';
@@ -116,9 +117,7 @@ function createPanel() {
 }
 
 async function createFixture() {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-panel-owner-'));
-  const authority = new RootAuthority(() => path.join(directory, 'control', 'active'));
-  const binding = await initializeEmptyRuntimeRoot(authority);
+  const { outer: directory, binding } = await createOwnershipScope('panel');
   const owner = new ConversationRuntimeOwnerManager(binding, 'restoring-window');
   const peer = new ConversationRuntimeOwnerManager(binding, 'peer-window');
   owner.setPendingWorkProbe(async () => false);

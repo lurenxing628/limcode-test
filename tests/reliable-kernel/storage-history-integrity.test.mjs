@@ -132,7 +132,7 @@ test('reset只补登residual，不自动排队，完整合并后不重复补登'
   assert.ok((await fs.stat(backup)).isDirectory());
 });
 
-test('修复只清理终态模型孤儿并恢复未知状态，备份和其它正文保留', async () => {
+test('修复先核对备份fsync，日志失败后按提交凭据重入，消息和正文保留', async t => {
   insertOrphan(f.alpha, 'exact');
   rawSql(f.alpha, db => db.prepare("UPDATE process SET status='exited' WHERE id='history_unknown'").run());
   const bodyFile = path.join(f.alpha.binding.paths.casRootPath, ...keptContent.storage_key.split('/'));
@@ -140,8 +140,32 @@ test('修复只清理终态模型孤儿并恢复未知状态，备份和其它�
   const kept = readSql(f.alpha, db => db.prepare("SELECT * FROM conversation WHERE id='kept'").get());
   const plan = await repairPlan();
   assert.deepEqual([plan.expected.orphanOperations, plan.expected.orphanAttempts, plan.expected.restoredUnknownProcesses], [1, 1, 1]);
-  const result = await repairRuntimeHistory(f.paths, plan);
+  const parent = backupRoot();
+  let backupPath, fail = true, transactions = 0;
+  const original = directorySync.syncDirectoryDurably;
+  t.mock.method(directorySync, 'syncDirectoryDurably', async (directory, ...args) => {
+    if (path.dirname(directory) === parent) backupPath = directory;
+    if (fail && directory === parent && backupPath
+      && await fs.access(path.join(backupPath, 'repair.json')).then(() => true, () => false)) {
+      throw Object.assign(new Error('injected backup-parent fsync'), { code: 'EIO' });
+    }
+    return original(directory, ...args);
+  });
+  const options = { onFaultPoint(point) {
+    if (point === 'before-transaction') transactions++;
+    if (point === 'before-completion') throw Object.assign(new Error('injected journal failure'), { code: 'ENOSPC' });
+  } };
+  await assert.rejects(repairRuntimeHistory(f.paths, plan, options), /injected backup-parent fsync/);
+  assert.equal(transactions, 0);
+  assert.equal(orphanCount(), 1n);
+  assert.equal(readSql(f.alpha, db => db.prepare("SELECT status FROM process WHERE id='history_unknown'").pluck().get()), 'exited');
+  fail = false;
+  const result = await repairRuntimeHistory(f.paths, plan, options);
+  assert.equal(result.backupPath, backupPath);
+  assert.equal(transactions, 1);
   assert.equal(result.result.removedOperations, 1);
+  assert.equal(result.result.restoredUnknownProcesses, 1);
+  assert.ok(result.warnings.length > 0);
   assert.equal(orphanCount(), 0n);
   readSql(f.alpha, db => {
     assert.deepEqual(db.prepare("SELECT * FROM conversation WHERE id='kept'").get(), kept);
@@ -151,8 +175,11 @@ test('修复只清理终态模型孤儿并恢复未知状态，备份和其它�
   try { assert.equal(backup.prepare("SELECT id FROM operation WHERE id='exact_operation'").pluck().get(), 'exact_operation'); }
   finally { backup.close(); }
   assert.deepEqual(await captureFiles([bodyFile]), before);
+  const journal = path.join(result.backupPath, 'repair.json');
+  assert.equal(JSON.parse(await fs.readFile(journal, 'utf8')).state, 'prepared');
   const again = await repairRuntimeHistory(f.paths, plan);
   assert.equal(again.result.alreadyApplied, true);
+  assert.equal(JSON.parse(await fs.readFile(journal, 'utf8')).state, 'completed');
   assert.equal((await backupNames()).length, 1);
 });
 
@@ -184,45 +211,4 @@ test('确认后的内容变化拒绝旧修复计划，不生成备份', async ()
     assert.equal(orphanCount(), 1n);
     assert.equal((await backupNames()).length, 1);
   } finally { rawSql(f.alpha, db => db.prepare("DELETE FROM operation WHERE id='stale_operation'").run()); }
-});
-
-test('提交后结果日志失败仍以库内CommandReceipt恢复，不重复修复', async () => {
-  insertOrphan(f.alpha, 'committed');
-  const plan = await repairPlan();
-  const result = await repairRuntimeHistory(f.paths, plan, { onFaultPoint(point) {
-    if (point === 'before-completion') throw Object.assign(new Error('injected journal failure'), { code: 'ENOSPC' });
-  } });
-  assert.equal(result.result.removedOperations, 1);
-  assert.ok(result.warnings.length > 0);
-  const journal = path.join(result.backupPath, 'repair.json');
-  assert.equal(JSON.parse(await fs.readFile(journal, 'utf8')).state, 'prepared');
-  assert.equal((await repairRuntimeHistory(f.paths, plan)).result.alreadyApplied, true);
-  assert.equal(JSON.parse(await fs.readFile(journal, 'utf8')).state, 'completed');
-  assert.equal((await backupNames()).length, 2);
-});
-
-test('复用备份必须重过目录fsync，失败不修复，恢复后只提交一次', async t => {
-  insertOrphan(f.alpha, 'durable');
-  const plan = await repairPlan();
-  const parent = backupRoot();
-  let backupPath, fail = true, transactions = 0;
-  const original = directorySync.syncDirectoryDurably;
-  t.mock.method(directorySync, 'syncDirectoryDurably', async (directory, ...args) => {
-    if (path.dirname(directory) === parent) backupPath = directory;
-    if (fail && directory === parent && backupPath
-      && await fs.access(path.join(backupPath, 'repair.json')).then(() => true, () => false)) {
-      throw Object.assign(new Error('injected backup-parent fsync'), { code: 'EIO' });
-    }
-    return original(directory, ...args);
-  });
-  const options = { onFaultPoint(point) { if (point === 'before-transaction') transactions++; } };
-  await assert.rejects(repairRuntimeHistory(f.paths, plan, options), /injected backup-parent fsync/);
-  assert.equal(transactions, 0);
-  assert.equal(orphanCount(), 1n);
-  fail = false;
-  const result = await repairRuntimeHistory(f.paths, plan, options);
-  assert.equal(result.backupPath, backupPath);
-  assert.equal(result.result.removedOperations, 1);
-  assert.equal(transactions, 1);
-  assert.equal((await backupNames()).length, 3);
 });

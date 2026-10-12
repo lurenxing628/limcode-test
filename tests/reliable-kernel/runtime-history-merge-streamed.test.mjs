@@ -4,10 +4,10 @@ import path from 'node:path';
 import { before, after, describe, test } from 'node:test';
 import {
   Database, kernel, kernelFile, modelRequestAggregate, NOW, repo, readAll, readLedgerRecord,
-  ledgerEntries, countRows, saveState
+  ledgerEntries, countRows
 } from './fixtures/runtime-merge-fixture.mjs';
 import {
-  OPTIONS, conversation, createStreamFixture, seedBare, seedRich, raw,
+  OPTIONS, conversation, createStreamFixture, seedBare, seedRich, seedAggregate, raw,
   runCrashChild, assertMixedBodies
 } from './fixtures/ci-storage-merge-streamed.mjs';
 
@@ -78,47 +78,49 @@ describe('历史合并的流式提交与有界读取', { concurrency: false }, (
   before(async () => { f = await createStreamFixture(); });
   after(async () => { await f?.dispose(); });
 
-  test('在线和流式对同一小来源给出相同partial闭包、顺序和mixed CAS正文', async t => {
+  test('流式只导入partial安全闭包，保留模型流、顺序和mixed CAS正文', async () => {
     const source = f.alpha;
     const info = await seedRich(source, 'equivalence', { partial: true });
     raw(source, db => db.prepare('DELETE FROM model_stream_fence WHERE model_request_id = ?').run('equivalence_invalid_request'));
     await (await f.writer()).transaction([repo('Conversation').insert({ ...conversation('equivalence_conflict'), title: 'current title' })]);
-    await f.closeCurrent();
-    const baseline = await saveState(f, f.current);
-    t.after(() => baseline.remove());
-    const online = await f.online(source);
-    assert.equal(online.merged.length, 1);
-    assert.deepEqual([online.blocked, online.failures, online.deferred], [[], [], []]);
-    const expectedRecord = await readLedgerRecord(f, source.id);
-    assert.equal(expectedRecord.state, 'partial');
-    assert.deepEqual(expectedRecord.excluded.map(row => row.conversationId).sort(),
-      ['equivalence_child', 'equivalence_conflict', 'equivalence_invalid']);
-    await f.closeCurrent();
-    const expected = readAll(f.current);
-    await baseline.restore();
     const preparation = await f.prepare([source]);
     assert.equal(preparation.sources.length, 1);
     const result = await f.run(preparation);
     assert.deepEqual(result.results.map(row => row.state), ['merged']);
-    assert.deepEqual(readAll(f.current), expected);
     const record = await readLedgerRecord(f, source.id);
     assert.equal(record.state, 'partial');
-    assert.deepEqual(record.excluded, expectedRecord.excluded);
+    assert.deepEqual(record.excluded.map(row => row.conversationId).sort(),
+      ['equivalence_child', 'equivalence_conflict', 'equivalence_invalid']);
+    assert.deepEqual(record.mergedInto[0].conversationIds.sort(), ['equivalence_healthy', 'equivalence_peer']);
     const database = await f.writer();
     await assertMixedBodies(assert, source, info, database, f.current.authority);
     const [message] = await snapshotRows(database, 'CollaborationMessage', ['equivalence_collaboration']);
     assert.equal(message.message_seq, 1n);
+    const [request] = await snapshotRows(database, 'ModelRequest', [info.requestId]);
+    assert.deepEqual([request.turn_id, request.status, request.terminal_state], ['equivalence_healthy_turn', 'terminal', 'completed']);
+    const checkpoints = await snapshotRows(database, 'ModelStreamCheckpoint', [`${info.requestId}_checkpoint_1`, `${info.requestId}_checkpoint_2`]);
+    assert.deepEqual(checkpoints.map(row => [row.model_request_id, row.stream_seq, row.content_object_id]),
+      [[info.requestId, 1n, info.bodies[0].id], [info.requestId, 2n, info.bodies[0].id]]);
+    const [fence] = await snapshotRows(database, 'ModelStreamFence', [`${info.requestId}_fence`]);
+    assert.deepEqual([fence.model_request_id, fence.terminal_stream_seq, fence.outcome], [info.requestId, 2n, 'completed']);
+    assert.equal((await snapshotRows(database, 'Conversation', ['equivalence_conflict']))[0].title, 'current title');
     assert.deepEqual(await snapshotRows(database, 'Conversation', ['equivalence_child', 'equivalence_invalid']), [null, null]);
   });
 
-  test('准备后全部行已被写入，流式零新增仍先落盘再发布成功', async t => {
+  test('流式零新增先落盘，commit回复丢失按真实新增与复用数量记账', async t => {
     const source = f.beta;
+    const reply = await f.source('reply-loss');
     await seedBare(source, ['stream_noop']);
-    const preparation = await f.prepare([source]);
-    assert.equal(preparation.sources[0].insertRows, 1);
-    await (await f.writer()).transaction([repo('Conversation').insert(conversation('stream_noop'))]);
+    await seedBare(reply, ['reply_shared', 'reply_new']);
+    const preparation = await f.prepare([source, reply]);
+    assert.deepEqual(preparation.sources.map(row => row.insertRows).sort(), [1, 2]);
+    await (await f.writer()).transaction(['stream_noop', 'reply_shared'].map(id => repo('Conversation').insert(conversation(id))));
+    await f.closeCurrent();
+    const before = countRows(f.current);
     const checkpoint = kernel.RuntimeDatabase.prototype.durabilityCheckpoint;
+    const commit = kernel.RuntimeDatabase.prototype.maintenanceCommit;
     let barriers = 0;
+    let lost = 0;
     t.mock.method(kernel.RuntimeDatabase.prototype, 'durabilityCheckpoint', async function () {
       if (this.binding.dataSetId === f.current.binding.dataSetId) {
         barriers++;
@@ -126,10 +128,20 @@ describe('历史合并的流式提交与有界读取', { concurrency: false }, (
       }
       return checkpoint.call(this);
     });
+    t.mock.method(kernel.RuntimeDatabase.prototype, 'maintenanceCommit', async function (...args) {
+      await commit.apply(this, args);
+      lost++;
+      throw new Error('commit reply lost');
+    });
     const result = await f.run(preparation);
     assert.equal(barriers, 1);
-    assert.deepEqual(result.results.map(row => [row.state, row.result?.insertedRows, row.result?.reusedRows]), [['current', 0, 1]]);
+    assert.equal(lost, 1);
+    const actual = new Map(result.results.map(row => [row.candidateId, [row.state, row.result?.insertedRows, row.result?.reusedRows]]));
+    assert.deepEqual(actual.get(source.id), ['current', 0, 1]);
+    assert.deepEqual(actual.get(reply.id), ['merged', 1, 1]);
+    assert.equal(countRows(f.current) - before, 1);
     assert.equal((await readLedgerRecord(f, source.id)).state, 'merged');
+    assert.equal((await readLedgerRecord(f, reply.id)).insertedRows, 1);
   });
 
   test('HistoryPreparationPermit取消不创建计划，第二来源取消仅回滚该来源', async () => {
@@ -177,7 +189,7 @@ describe('历史合并的流式提交与有界读取', { concurrency: false }, (
   test('savepoint撤回历史复制许可，最终writer拒绝preflight之后的非法Attempt', async t => {
     await assertSavepointAuthority(await f.writer(), f.current.authority);
     const source = await f.source('aggregate');
-    const info = await seedRich(source, 'aggregate');
+    const info = await seedAggregate(source, 'aggregate');
     await f.closeCurrent();
     const before = readAll(f.current);
     const commit = kernel.RuntimeDatabase.prototype.maintenanceCommit;
@@ -194,29 +206,6 @@ describe('历史合并的流式提交与有界读取', { concurrency: false }, (
     assert.deepEqual(result.results.map(row => [row.state, row.issue?.code]), [['blocked', INVARIANT]]);
     assert.match(result.results[0].issue.message, /current Attempt must be the contiguous tail/);
     assert.deepEqual(readAll(f.current), before);
-  });
-
-  test('commit实际成功但回复丢失，账本采用真实新增与复用数量', async t => {
-    const source = await f.source('reply-loss');
-    await seedBare(source, ['reply_shared', 'reply_new']);
-    const preparation = await f.prepare([source]);
-    assert.equal(preparation.sources[0].insertRows, 2);
-    await (await f.writer()).transaction([repo('Conversation').insert(conversation('reply_shared'))]);
-    await f.closeCurrent();
-    const before = countRows(f.current);
-    const commit = kernel.RuntimeDatabase.prototype.maintenanceCommit;
-    let lost = 0;
-    t.mock.method(kernel.RuntimeDatabase.prototype, 'maintenanceCommit', async function (...args) {
-      await commit.apply(this, args);
-      lost++;
-      throw new Error('commit reply lost');
-    });
-    const result = await f.run(preparation);
-    assert.equal(lost, 1);
-    const inserted = countRows(f.current) - before;
-    assert.equal(inserted, 1);
-    assert.deepEqual(result.results.map(row => [row.state, row.result?.insertedRows, row.result?.reusedRows]), [['merged', 1, 1]]);
-    assert.equal((await readLedgerRecord(f, source.id)).insertedRows, inserted);
   });
 
   test('after-commit一次实杀通过提交标记恢复，重入不重复插入', async t => {

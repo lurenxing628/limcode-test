@@ -5,15 +5,13 @@ import { createCommittedRelocationFixture, loadRelocationModule } from './ci-sto
 
 const require = createRequire(import.meta.url);
 const sharedFs = require('node:fs/promises');
-const kernel = loadRelocationModule('index.js');
 const relocation = loadRelocationModule('runtimeDataRootRelocation.js');
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const { writeFileAtomicDurable } = require(path.join(compiled, 'backend/capabilities/vscodeStorage/durableWrite.js'));
 
 async function main() {
   const base = process.argv[2];
-  const { source, fixture } = await createCommittedRelocationFixture(base);
-  const database = await kernel.RuntimeDatabase.open(source.authority);
+  const { source, fixture, database } = await createCommittedRelocationFixture(base);
   let staged;
   try {
     const plan = await relocation.planDataRootRelocation({ sourceRootPath: source.root,

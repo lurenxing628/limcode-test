@@ -1,3 +1,4 @@
+import { createOwnershipScope } from './ownership-scope-fixture.mjs';
 // Focused production ownership boundary; old review matrices are absent.
 import assert from 'node:assert/strict';
 
@@ -418,10 +419,7 @@ function ownerProofDependencies(provider) {
 }
 
 async function createIsolatedRoot(label) {
-  const outer = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-owner-proof-${label}-`));
-  await fs.mkdir(path.join(outer, 'control'), { recursive: true });
-  const candidate = await kernel.resetCandidateRuntimeRoot(path.join(outer, 'control'));
-  return { outer, authority: candidate.authority, binding: candidate.binding };
+  return createOwnershipScope(label);
 }
 
 async function openWorkerDatabase(hostBootId) {
@@ -558,74 +556,6 @@ function requiredEnv(name) {
 }
 
 if (workerMode) runWorker(workerMode).then(() => process.exit(0), error => { console.error(error?.stack ?? error); process.exit(1); });
-
-export const scenario1 = async () => {
-  const children = [];
-  const { outer, binding } = await createIsolatedRoot('takeover');
-  const dataRoot = binding.paths.dataRootPath;
-  try {
-    const conversationId = 'conversation-takeover';
-    const holder = spawnTracked(children, 'host-holder', dataRoot, {
-      LIMCODE_OWNER_HOST: 'doomed-host',
-      LIMCODE_OWNER_CLAIM: conversationId,
-      LIMCODE_OWNER_READY: path.join(outer, 'holder-ready.json')
-    });
-    const ready = await waitForJson(path.join(outer, 'holder-ready.json'), 60_000);
-    assert.equal(typeof ready.pid, 'number');
-    assert.equal(typeof ready.ownerToken, 'string');
-    holder.kill('SIGKILL');
-    await waitForExit(holder, 30_000);
-
-    const goPath = path.join(outer, 'go');
-    const holdA = path.join(outer, 'takeover-a-hold');
-    const holdB = path.join(outer, 'takeover-b-hold');
-    const claimerA = spawnTracked(children, 'claimer', dataRoot, {
-      LIMCODE_OWNER_HOST: 'takeover-host-a',
-      LIMCODE_OWNER_CLAIM: conversationId,
-      LIMCODE_OWNER_MODE: 'claim',
-      LIMCODE_OWNER_READY: path.join(outer, 'takeover-a-ready'),
-      LIMCODE_OWNER_GO: goPath,
-      LIMCODE_OWNER_HOLD: holdA,
-      LIMCODE_OWNER_RESULT: path.join(outer, 'takeover-a-result.json')
-    });
-    const claimerB = spawnTracked(children, 'claimer', dataRoot, {
-      LIMCODE_OWNER_HOST: 'takeover-host-b',
-      LIMCODE_OWNER_CLAIM: conversationId,
-      LIMCODE_OWNER_MODE: 'claim',
-      LIMCODE_OWNER_READY: path.join(outer, 'takeover-b-ready'),
-      LIMCODE_OWNER_GO: goPath,
-      LIMCODE_OWNER_HOLD: holdB,
-      LIMCODE_OWNER_RESULT: path.join(outer, 'takeover-b-result.json')
-    });
-    await waitForFile(path.join(outer, 'takeover-a-ready'), 60_000);
-    await waitForFile(path.join(outer, 'takeover-b-ready'), 60_000);
-    await fs.writeFile(goPath, 'go\n', 'utf8');
-    const results = await Promise.all([
-      waitForJson(path.join(outer, 'takeover-a-result.json'), 60_000),
-      waitForJson(path.join(outer, 'takeover-b-result.json'), 60_000)
-    ]);
-    const winners = results.filter((result) => result.outcome === 'claimed');
-    const losers = results.filter((result) => result.outcome === 'busy');
-    assert.equal(winners.length, 1, '死亡宿主被接管时必须恰好一个胜者');
-    assert.equal(losers.length, 1);
-    assert.equal(losers[0].code, OWNER_BUSY_CODE);
-    assert.equal(losers[0].ownerHostBootId, winners[0].hostBootId);
-
-    const record = await readOwnerRecord(binding.paths, conversationId);
-    assert.equal(record.hostBootId, winners[0].hostBootId);
-    assert.notEqual(record.ownerToken, ready.ownerToken, '接管必须发布新的 ownerToken');
-    const claimPath = conversationRuntimeOwnerClaimPath(binding.paths, conversationId);
-    const tombstone = claimPrimitives.claimGenerationPath(claimPath, `dead-${ready.ownerToken}`);
-    assert.ok((await fs.readdir(tombstone)).length > 0, '死亡代际墓碑必须保持非空');
-    await fs.writeFile(holdA, 'release\n', 'utf8');
-    await fs.writeFile(holdB, 'release\n', 'utf8');
-    await waitForExit(claimerA, 60_000, true);
-    await waitForExit(claimerB, 60_000, true);
-  } finally {
-    await cleanupChildren(children);
-    await fs.rm(outer, { recursive: true, force: true });
-  }
-};
 
 export const scenario2 = async () => {
   const { outer, binding } = await createIsolatedRoot('stale-callback');

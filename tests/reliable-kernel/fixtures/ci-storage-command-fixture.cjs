@@ -4,7 +4,6 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const vm = require('node:vm');
-const ts = require('typescript');
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 const primitive = require(path.join(compiled, 'backend/reliableKernel/runtimeExclusiveMaintenance.js'));
 const hostControl = require(path.join(compiled, 'backend/reliableKernel/runtimeHostControl.js'));
@@ -16,13 +15,11 @@ fs.mkdirSync(SOURCE);
 process.on('exit', () => fs.rmSync(WORK, { recursive: true, force: true }));
 const plain = value => JSON.parse(JSON.stringify(value));
 
-function loadSource(relative, dependencies) {
-  const filename = path.resolve(__dirname, '../../..', relative);
+function loadCompiled(relative, dependencies) {
+  const filename = path.join(compiled, relative.replace(/\.ts$/, '.js'));
   const module = { exports: {} };
   const builtins = { 'node:crypto': crypto, 'node:os': os, 'node:fs/promises': fs.promises, 'node:path': path };
-  vm.runInNewContext(ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
-    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS }
-  }).outputText, {
+  vm.runInNewContext(fs.readFileSync(filename, 'utf8'), {
     module, exports: module.exports, console, process, AbortController, setTimeout, clearTimeout,
     require(name) {
       if (Object.hasOwn(builtins, name)) return builtins[name];
@@ -78,7 +75,7 @@ function fixture({ answers = [], busy = () => false, cancelStage = false, afterL
     freezeNewWork() { frozen++; calls.push(['freeze']); return () => { frozen--; calls.push(['thaw']); }; },
     postToWebview() { return true; }
   };
-  const layer = loadSource('vscode/runtimeExclusiveMaintenance.ts', { vscode, '../backend/reliableKernel/runtimeExclusiveMaintenance': primitive });
+  const layer = loadCompiled('vscode/runtimeExclusiveMaintenance.ts', { vscode, '../backend/reliableKernel/runtimeExclusiveMaintenance': primitive });
   const dependencies = {
     vscode,
     '../../backend/capabilities/vscodeStorage/globalStatus': {
@@ -143,7 +140,7 @@ function fixture({ answers = [], busy = () => false, cancelStage = false, afterL
       }
     }
   };
-  const commands = loadSource('vscode/commands/dataRootRelocation.ts', dependencies);
+  const commands = loadCompiled('vscode/commands/dataRootRelocation.ts', dependencies);
   const globalState = new Map(), workspaceState = new Map();
   const context = { globalStorageUri: { fsPath: '/vscode/global-storage' },
     globalState: { get: key => globalState.get(key), update: async (key, value) => { globalState.set(key, value); } },

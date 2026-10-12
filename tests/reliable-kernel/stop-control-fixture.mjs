@@ -157,6 +157,28 @@ export async function openStopFixture() {
     peers.add(peer);
     return peer;
   };
+  let controlPeer;
+  const deadPeers = new Map();
+  const alive = peer => peer && peer.child.exitCode === null && peer.child.signalCode === null;
+  f.livePeer = async () => {
+    if (!alive(controlPeer)) controlPeer = await f.peer('mcp', 'live-owner');
+    return controlPeer;
+  };
+  f.deadPeer = async (mode, label) => {
+    if (deadPeers.has(mode)) return deadPeers.get(mode);
+    const reused = alive(controlPeer);
+    const peer = reused ? controlPeer : await f.peer(mode, label);
+    const ready = reused ? await peer.request('prepare', { mode, label }) : peer.ready;
+    // Both dead-host contracts get separate durable identities from one actual Host death.
+    // A standalone spawn test opens only its own spawn; the preceding MCP test prepares it in a full run.
+    if (mode === 'mcp') {
+      const spawn = await peer.request('prepare', { mode: 'spawn', label: 'dead-spawn' });
+      deadPeers.set('spawn', { ...peer, ready: spawn });
+    }
+    const view = { ...peer, ready };
+    deadPeers.set(mode, view);
+    return view;
+  };
   const closeHost = f.close;
   f.close = async () => {
     for (const peer of peers) await peer.close();

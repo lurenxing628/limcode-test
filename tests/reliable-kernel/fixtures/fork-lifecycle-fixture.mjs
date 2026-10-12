@@ -13,8 +13,6 @@ import { after } from 'node:test';
 
 const require = createRequire(import.meta.url);
 
-const Database = require('better-sqlite3');
-
 const Module = require('node:module');
 
 const originalLoad = Module._load;
@@ -25,7 +23,11 @@ Module._load = function (request, parent, isMain) {
   return request === 'vscode' ? vscode : originalLoad.call(this, request, parent, isMain);
 };
 
-after(() => { Module._load = originalLoad; });
+let sharedRuntime;
+after(async () => {
+  await sharedRuntime?.close();
+  Module._load = originalLoad;
+});
 
 const compiled = path.resolve(process.env.LIMCODE_TEST_EXTENSION_ROOT ?? 'dist/extension');
 
@@ -36,8 +38,6 @@ const kernel = load('backend/reliableKernel/index.js');
 const { emptyConversationContextHandleStateStep } = load('backend/reliableKernel/conversationContextHandleState.js');
 
 const { upgradeConversationContextHandles } = load('backend/reliableKernel/conversationContextHandleUpgrade.js');
-
-const { VscodeReliableKernelProductRuntime: ProductRuntime } = load('backend/application/reliableKernel/VscodeReliableKernelProductRuntime.js');
 
 const { VscodeReliableKernelApplicationFacade: Facade } = load('backend/application/reliableKernel/VscodeReliableKernelApplicationFacade.js');
 
@@ -59,8 +59,6 @@ const { workEnvironmentIdFromUri } = load('shared/workEnvironmentCatalog.js');
 
 const protocol = load('shared/protocol.js');
 
-const { stablePhaseFId } = load('backend/reliableKernel/phaseFIdentity.js');
-
 const { FORK_CONTEXT_HANDLE_RESERVATION_OWNER_KIND, FORK_CONTEXT_HANDLE_RESERVATION_PURPOSE,
   readForkContextHandleReservationEvidence } = load('backend/reliableKernel/forkContextHandleReservations.js');
 
@@ -70,10 +68,13 @@ async function rows(app, domain, where = {}) {
   }))).snapshot;
 }
 
-async function withForkRuntime(run, {
-  withTool = false, toolCallRequests = [1], beforeDispatch, beforeReply, compression = false, failRequests = [], script,
-  extraModels = []
-} = {}) {
+// Each scenario owns a separate Conversation and policy. The expensive Application/SQLite
+// lifecycle is shared, while explicit reopen probes still close and reopen the real Host.
+export async function runtime() {
+  return sharedRuntime ??= await createForkRuntime();
+}
+
+async function createForkRuntime() {
   const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-fork-lifecycle-'));
   const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
   await kernel.initializeEmptyRuntimeRoot(authority);
@@ -81,7 +82,7 @@ async function withForkRuntime(run, {
   let configuration = new VscodeConfigurationAuthority(getPaths);
   const provider = { ...createDefaultLlmProviderConfig({ name: 'Offline fork fixture' }),
     id: 'offline-fork-provider', model: 'offline-fork-model',
-    models: [{ id: 'offline-fork-model', name: 'Offline model' }, ...extraModels.map(id => ({ id, name: id }))] };
+    models: [{ id: 'offline-fork-model', name: 'Offline model' }] };
   for (const [section, settings] of [
     ['llmProviderConfigs', { configs: [provider] }],
     ['llm', { activeProviderConfigId: provider.id }]
@@ -89,43 +90,32 @@ async function withForkRuntime(run, {
     const current = await configuration.loadGlobalSettings(section);
     await configuration.saveGlobalSettings(section, settings, current.revision);
   }
-  if (withTool) await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read'] });
+  const agent = await configuration.mutations.createAgent({ name: 'Fork fixture', kind: 'custom' });
+  const folderPath = path.join(directory, 'workspace');
+  await fs.mkdir(folderPath);
+  const uri = vscode.Uri.file(folderPath).toString();
+  const environmentId = workEnvironmentIdFromUri(uri);
   const compressionConfig = { ...protocol.createDefaultLlmCompressionConfig('Fork compression'), kind: 'llm_summary',
     fallbacks: [], trigger: { mode: 'manual', thresholdUnit: 'tokens', thresholdTokens: 120000 } };
   const saveCompression = async (patch = {}) => {
     const current = await configuration.loadGlobalSettings('llmCompressionConfigs');
     await configuration.saveGlobalSettings('llmCompressionConfigs', { configs: [{ ...compressionConfig, ...patch }] }, current.revision);
   };
-  if (compression) {
-    await saveCompression();
-    const current = await configuration.loadGlobalSettings('llmCompression');
-    await configuration.saveGlobalSettings('llmCompression', {
-      defaultConfigId: compressionConfig.id, providerBindings: [], modelBindings: []
-    }, current.revision);
-  }
-  await script?.configure(configuration);
-  const agent = await configuration.mutations.createAgent({ name: 'Fork fixture', kind: 'custom' });
-  await configuration.mutations.setModelProfile({
-    scopeKind: 'conversation', scopeId: 'source', providerConfigId: provider.id,
-    provider: provider.provider, model: provider.model
-  });
-  const folderPath = path.join(directory, 'workspace');
-  await fs.mkdir(folderPath);
-  const uri = vscode.Uri.file(folderPath).toString();
-  const environmentId = workEnvironmentIdFromUri(uri);
-  await configuration.synchronizeWorkspaceFolders([{ uri, name: 'Fixture', rootPath: folderPath, index: 0 }]);
-  await configuration.mutations.selectConversationWorkEnvironment('source', environmentId);
-  const requests = [];
+  const initialCompressionSettings = (await configuration.loadGlobalSettings('llmCompression')).settings;
+  let compressionEnabled = false;
+  let active;
   let app;
   let facade;
+  let sequence = 0;
+  const sourceIds = [];
+  let opens = 0;
   const open = async () => {
     configuration = new VscodeConfigurationAuthority(getPaths);
     // Reopening a Host must re-establish its local folder presence, as ProductRuntime.open does.
-    // Persisted environment records alone do not prove that this window has the folder open.
     await configuration.synchronizeWorkspaceFolders([{ uri, name: 'Fixture', rootPath: folderPath, index: 0 }]);
     app = await kernel.ReliableKernelApplication.open(authority, {
       authorityCompiler: configuration,
-      ...(compression ? { compressionSettingsAuthority: configuration } : {}),
+      compressionSettingsAuthority: configuration,
       resolveWorkEnvironment: async () => undefined,
       mcpConnections: { async toolAnnotations() { return {}; }, async callTool() { assert.fail('no MCP'); } },
       mcpPolicyGate: { async authorize() { assert.fail('no MCP'); } },
@@ -133,6 +123,7 @@ async function withForkRuntime(run, {
       providers: { resolve(providerId) {
         assert.equal(providerId, provider.id);
         return { providerId, async sendFullRequest(request, controls) {
+          const { requests, sourceId, withTool, toolCallRequests, beforeReply, failRequests, script } = active;
           requests.push(request);
           if (request.recipe?.compressionMethodKind) {
             await controls.onEvent({ kind: 'completed', streamSeq: '1', content: { type: 'compression_result',
@@ -142,17 +133,18 @@ async function withForkRuntime(run, {
           await beforeReply?.(request);
           if (failRequests.includes(requests.length)) throw new Error(`offline provider rejected request ${requests.length}`);
           await controls.onEvent({ kind: 'completed', streamSeq: '1',
-            content: { role: 'model', parts: script?.reply(request) ?? (withTool && toolCallRequests.includes(requests.length)
+            content: { role: 'model', parts: script?.reply(request, sourceId) ?? (withTool && toolCallRequests.includes(requests.length)
               ? [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }]
               : [{ text: `offline reply ${requests.length}` }]) } });
         } };
       } },
       toolDispatcher: {
         definitions() {
-          return script?.definitions
-            ?? (withTool ? [{ name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }] : []);
+          return active?.script?.definitions
+            ?? (active?.withTool ? [{ name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }] : []);
         },
         async dispatch(input) {
+          const { withTool, script, beforeDispatch } = active;
           assert.equal(withTool || !!script, true, 'only the tool fixtures may dispatch');
           await beforeDispatch?.(input);
           const settled = await app.runtime.effects.settleWithoutEffect({
@@ -164,85 +156,134 @@ async function withForkRuntime(run, {
         }
       }
     });
-    // Exercise the production fork method without starting VS Code watchers/panels. The database,
-    // ownership pins, configuration stores, context writer and agent loop remain real.
+    opens += 1;
+    // Exercise the production Facade with real ownership, configuration, Context and agent loop.
     facade = Object.create(Facade.prototype);
     facade.product = { application: app, configuration };
-    // Deleting a conversation records it beside the merge ledger of this configuration root.
     facade.runtimePlacement = { configurationRootPath: path.join(directory, 'configuration') };
     facade.writeGate = new RuntimeWriteGate();
     facade.historyEntries = [];
+    facade.historyRevealEmitter = { fire() {} };
     facade.refreshConversationHistory = async () => {};
   };
-  try {
-    await open();
-    const now = new Date().toISOString();
-    await app.database.transaction([
-      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
-        id: 'source', title: 'Source fixture', status: 'active', created_at: now, updated_at: now
-      }),
-      emptyConversationContextHandleStateStep('source', now),
-      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-        id: 'source-agent', conversation_id: 'source', agent_id: agent.id,
-        role: 'default', created_at: now, updated_at: now
-      })
-    ]);
-    const harness = {
-      get app() { return app; }, get facade() { return facade; },
-      get configuration() { return configuration; }, requests, environmentId, saveCompression, provider,
-      /** `whileClosed` runs with the Runtime database closed, for example to stage an older data shape. */
-      async reopen(whileClosed) { await app.close(); await whileClosed?.(); await open(); },
-      async start(conversationId, key, retry, message = {}) {
-        const command = {
-          source: { kind: 'command', key }, conversationId,
-          leaseOwnerId: 'fork-fixture-owner', hostBootId: app.database.hostBootId,
-          leaseExpiresAt: new Date(Date.now() + 120_000).toISOString()
-        };
-        const input = retry
-          ? await app.turns.retry({ ...command, ...retry })
-          : await app.turns.input({ ...command, content: message.content ?? key,
-            ...(message.contentType ? { contentType: message.contentType } : {}) });
-        // This bare-application fixture intentionally has no ProductRuntime notification watcher.
-        // Pump only its explicit scope-upgrade parking result, using the production target job;
-        // all other waits remain observable and never become a fabricated completed Turn.
-        const done = (async () => {
-          for (;;) {
-            const [lease] = await rows(app, 'ExecutionLease', { turn_id: input.turnId });
-            assert.ok(lease);
-            const result = await kernel.runWithExecutionLeaseFence({
-              id: lease.id, conversationId, turnId: input.turnId, ownerId: lease.owner_id,
-              hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
-            }, () => app.agentLoop.drive(input.turnId));
-            if (result.terminalStatus !== 'waiting' || result.waitingContextHandleUpgrade !== true) return result;
-            await upgradeConversationContextHandles(app.database, app.contentStore, conversationId);
-          }
-        })();
-        return { input, done };
-      },
-      async turn(conversationId, key, retry, message) {
-        const { input, done } = await harness.start(conversationId, key, retry, message);
-        const result = await done;
-        assert.equal(result.terminalStatus, 'completed', JSON.stringify(await rows(app, 'TurnTermination', { turn_id: input.turnId })));
-        return input;
-      },
-      async command(conversationId, commandId, role = 'model') {
-        const memberships = await rows(app, 'MessagePartOfConversation', { conversation_id: conversationId });
-        for (const member of memberships.sort((a, b) => Number(b.message_seq - a.message_seq))) {
-          const [current] = await rows(app, 'MessageCurrentRevisionLink', { message_id: member.message_id });
-          const [revision] = await rows(app, 'MessageRevision', { id: current.revision_id });
-          if (revision.role === role) return {
-            sourceConversationId: conversationId, messageId: member.message_id,
-            expectedRevisionId: revision.id, command: { commandId }
-          };
-        }
-        assert.fail('fixture has no matching message');
+  await open();
+  return {
+    get app() { return app; }, get configuration() { return configuration; }, get opens() { return opens; },
+    get sourcePreparations() { return sourceIds.length; },
+    async scope(options) {
+      const scenarioId = `fork-scenario-${++sequence}`;
+      const sourceId = options.sourceId ?? `${scenarioId}-source`;
+      if (!options.sourceId) sourceIds.push(sourceId);
+      const previous = new Set((await rows(app, 'Conversation')).map(row => row.id));
+      previous.delete(sourceId);
+      const requests = [];
+      active = { ...options, sourceId, requests };
+      if (!options.sourceId) {
+        await configuration.mutations.setModelProfile({
+          scopeKind: 'conversation', scopeId: sourceId, providerConfigId: provider.id,
+          provider: provider.provider, model: provider.model
+        });
+        await configuration.mutations.selectConversationWorkEnvironment(sourceId, environmentId);
       }
-    };
-    await run(harness);
-  } finally {
-    await app?.close();
-    await fs.rm(directory, { recursive: true, force: true });
+      if (options.withTool) await configuration.mutations.setToolPolicy({
+        scopeKind: 'conversation', scopeId: sourceId, allowedTools: ['read']
+      });
+      if (Boolean(options.compression) !== compressionEnabled) {
+        if (options.compression) await saveCompression();
+        const current = await configuration.loadGlobalSettings('llmCompression');
+        await configuration.saveGlobalSettings('llmCompression', options.compression ? {
+          defaultConfigId: compressionConfig.id, providerBindings: [], modelBindings: []
+        } : initialCompressionSettings, current.revision);
+        compressionEnabled = Boolean(options.compression);
+      }
+      await options.script?.configure(configuration, sourceId);
+      if (!options.sourceId) {
+        const now = new Date().toISOString();
+        await app.database.transaction([
+          kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
+            id: sourceId, title: 'Source fixture', status: 'active', created_at: now, updated_at: now
+          }),
+          emptyConversationContextHandleStateStep(sourceId, now),
+          kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
+            id: `${sourceId}-agent`, conversation_id: sourceId, agent_id: agent.id,
+            role: 'default', created_at: now, updated_at: now
+          })
+        ]);
+      }
+      const harness = {
+        sourceId, settingsOwners: [...previous, ...sourceIds],
+        get app() { return app; }, get facade() { return facade; },
+        get configuration() { return configuration; }, requests, environmentId, saveCompression, provider,
+        async conversations() { return (await rows(app, 'Conversation')).filter(row => !previous.has(row.id)); },
+        async reopen() { await app.close(); await open(); },
+        async start(conversationId, key, retry, message = {}) {
+          const command = {
+            source: { kind: 'command', key: `${scenarioId}:${key}` }, conversationId,
+            leaseOwnerId: 'fork-fixture-owner', hostBootId: app.database.hostBootId,
+            leaseExpiresAt: new Date(Date.now() + 120_000).toISOString()
+          };
+          const input = retry
+            ? await app.turns.retry({ ...command, ...retry })
+            : await app.turns.input({ ...command, content: message.content ?? key,
+              ...(message.contentType ? { contentType: message.contentType } : {}) });
+          // This bare-application fixture intentionally has no ProductRuntime notification watcher.
+          // Pump only its explicit scope-upgrade parking result, using the production target job;
+          // all other waits remain observable and never become a fabricated completed Turn.
+          const done = (async () => {
+            for (;;) {
+              const [lease] = await rows(app, 'ExecutionLease', { turn_id: input.turnId });
+              assert.ok(lease);
+              const result = await kernel.runWithExecutionLeaseFence({
+                id: lease.id, conversationId, turnId: input.turnId, ownerId: lease.owner_id,
+                hostBootId: lease.host_boot_id, generation: BigInt(lease.generation)
+              }, () => app.agentLoop.drive(input.turnId));
+              if (result.terminalStatus !== 'waiting' || result.waitingContextHandleUpgrade !== true) return result;
+              await upgradeConversationContextHandles(app.database, app.contentStore, conversationId);
+            }
+          })();
+          return { input, done };
+        },
+        async turn(conversationId, key, retry, message) {
+          const { input, done } = await harness.start(conversationId, key, retry, message);
+          const result = await done;
+          assert.equal(result.terminalStatus, 'completed', JSON.stringify(await rows(app, 'TurnTermination', { turn_id: input.turnId })));
+          return input;
+        },
+        async command(conversationId, commandId, role = 'model') {
+          const memberships = await rows(app, 'MessagePartOfConversation', { conversation_id: conversationId });
+          for (const member of memberships.sort((a, b) => Number(b.message_seq - a.message_seq))) {
+            const [current] = await rows(app, 'MessageCurrentRevisionLink', { message_id: member.message_id });
+            const [revision] = await rows(app, 'MessageRevision', { id: current.revision_id });
+            if (revision.role === role) return {
+              sourceConversationId: conversationId, messageId: member.message_id,
+              expectedRevisionId: revision.id, command: { commandId: `${scenarioId}:${commandId}` }
+            };
+          }
+          assert.fail('fixture has no matching message');
+        }
+      };
+      return harness;
+    },
+    async close() { await app.close(); await fs.rm(directory, { recursive: true, force: true }); }
+  };
+}
+
+async function withForkRuntime(run, options = {}) {
+  const host = await runtime();
+  await run(await host.scope({ withTool: false, toolCallRequests: [1], failRequests: [], ...options }));
+}
+
+// The completed transcript is one shared preparation. Each probe gets fresh request counters,
+// command identities and targets; edits happen after rollback and acknowledgment replay probes.
+let completedSourceId;
+async function withCompletedSource(run) {
+  const host = await runtime();
+  const h = await host.scope({ withTool: false, toolCallRequests: [1], failRequests: [], sourceId: completedSourceId });
+  if (!completedSourceId) {
+    await h.turn(h.sourceId, 'source-input');
+    completedSourceId = h.sourceId;
   }
+  await run(h);
 }
 
 function bounded(promise, step, ms = 30_000) {
@@ -299,8 +340,8 @@ async function strayConversationSettings(configuration, keep) {
 }
 
 async function withSourceSettings(h) {
-  await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
-  await h.configuration.mutations.selectConversationWorkflow({ conversationId: 'source', scopeKind: 'global' });
+  await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: h.sourceId, text: 'source prompt' });
+  await h.configuration.mutations.selectConversationWorkflow({ conversationId: h.sourceId, scopeKind: 'global' });
 }
 
 async function firstMessageCommand(h, conversationId, commandId) {
@@ -338,9 +379,8 @@ const suffixCount = 24;
 const compressed = false;
 
 export const scenario1 = async () => {
-    await withForkRuntime(async h => {
-      await h.turn('source', 'source-input');
-      const command = await h.command('source', `fork-${role}`, role);
+    await withCompletedSource(async h => {
+      const command = await h.command(h.sourceId, `fork-${role}`, role);
       const result = await h.facade.forkConversation(command);
       const target = result.conversationId;
       assert.equal(result.deduplicated, false);
@@ -364,8 +404,8 @@ export const scenario1 = async () => {
         throw error;
       });
       await h.turn(nested.conversationId, 'nested-input');
-      assert.equal((await rows(h.app, 'Conversation')).length, 3);
-      assert.equal((await rows(h.app, 'MessagePartOfConversation', { conversation_id: 'source' })).length, 2);
+      assert.equal((await h.conversations()).length, 3);
+      assert.equal((await rows(h.app, 'MessagePartOfConversation', { conversation_id: h.sourceId })).length, 2);
     });
   };
 
@@ -376,28 +416,28 @@ export const scenario2 = async () => {
   const gate = new Promise(resolve => { release = resolve; });
   let dispatches = 0;
   await withForkRuntime(async h => {
-    await h.turn('source', 'completed-tool-turn');
-    const completed = await h.command('source', 'fork-completed-turn');
-    const running = await h.start('source', 'running-tool-turn');
+    await h.turn(h.sourceId, 'completed-tool-turn');
+    const completed = await h.command(h.sourceId, 'fork-completed-turn');
+    const running = await h.start(h.sourceId, 'running-tool-turn');
     await reachedGate(reached, running, 'its second tool dispatch');
-    const [activeTurn] = (await rows(h.app, 'Turn', { conversation_id: 'source' })).filter(turn => turn.status === 'active');
+    const [activeTurn] = (await rows(h.app, 'Turn', { conversation_id: h.sourceId })).filter(turn => turn.status === 'active');
     assert.equal(activeTurn.id, running.input.turnId);
-    const activeModel = await h.command('source', 'fork-active-model');
-    const activeUser = await h.command('source', 'fork-active-user', 'user');
+    const activeModel = await h.command(h.sourceId, 'fork-active-model');
+    const activeUser = await h.command(h.sourceId, 'fork-active-user', 'user');
     const watched = ['Conversation', 'ConversationBranchLink', 'ConversationReuseLink', 'ConversationAttachmentHandleLink',
       'ContextSequenceRoot', 'ContextSegmentSource', 'Message', 'Turn', 'TurnTermination'];
     const before = await Promise.all(watched.map(domain => rows(h.app, domain)));
     for (const command of [activeModel, activeUser]) {
       await assert.rejects(h.facade.forkConversation(command), kernel.ConversationForkRejectedError);
     }
-    const rootId = await h.app.context.currentHeadRootId('source');
+    const rootId = await h.app.context.currentHeadRootId(h.sourceId);
     const [userSource] = await rows(h.app, 'ContextSegmentSource', {
       source_kind: 'message_revision', source_id: activeUser.expectedRevisionId
     });
-    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: 'source', role: 'default' });
+    const [agent] = await rows(h.app, 'AgentConversationLink', { conversation_id: h.sourceId, role: 'default' });
     await assert.rejects(h.app.runtime.conversationFork.fork({
       idempotencyKey: 'direct-active-fork', reuseKey: 'direct-active-fork',
-      sourceConversationId: 'source', sourceContextRootId: rootId,
+      sourceConversationId: h.sourceId, sourceContextRootId: rootId,
       sourceContextEndSegmentId: userSource.segment_id,
       sourceMessageRevisionId: activeUser.expectedRevisionId,
       targetTitle: 'Rejected active turn', targetAgentId: agent.agent_id
@@ -420,16 +460,17 @@ export const scenario2 = async () => {
     assert.doesNotMatch(JSON.stringify(await rows(h.app, 'Message')), /running-tool-turn/);
 
     // Completed tool-pair segments are shared with the fork; closing the source pair again is a no-op.
-    const sourceCalls = (await rows(h.app, 'ToolCall')).filter(call => call.turn_id !== running.input.turnId
-      && !copiedTurns.some(turn => turn.id === call.turn_id));
+    const sourceTurnIds = new Set((await rows(h.app, 'Turn', { conversation_id: h.sourceId })).map(turn => turn.id));
+    const sourceCalls = (await rows(h.app, 'ToolCall')).filter(call => sourceTurnIds.has(call.turn_id)
+      && call.turn_id !== running.input.turnId);
     assert.equal(sourceCalls.length, 1);
     const [modelResult] = await rows(h.app, 'ToolModelResult', { tool_call_id: sourceCalls[0].id });
     const [resultSource] = await rows(h.app, 'ContextSegmentSource', { source_kind: 'tool_model_result', source_id: modelResult.id });
     assert.equal((await rows(h.app, 'ContextSegmentSource', { segment_id: resultSource.segment_id, source_kind: 'tool_call' })).length, 2);
     await h.app.agentLoop.appendTerminalToolPairOnce({
-      conversationId: 'source', toolCallId: sourceCalls[0].id, toolModelResultId: modelResult.id
+      conversationId: h.sourceId, toolCallId: sourceCalls[0].id, toolModelResultId: modelResult.id
     });
-    await h.turn('source', 'source-after-stop');
+    await h.turn(h.sourceId, 'source-after-stop');
     await h.turn(fork.conversationId, 'fork-after-source-stop');
   }, {
     withTool: true,
@@ -444,12 +485,11 @@ export const scenario2 = async () => {
 };
 
 export const scenario3 = async () => {
-  await withForkRuntime(async h => {
-    await h.turn('source', 'old-user-question');
-    const user = await h.command('source', 'user-to-edit', 'user');
-    const assistant = await h.command('source', 'assistant-after-edit');
+  await withCompletedSource(async h => {
+    const user = await h.command(h.sourceId, 'user-to-edit', 'user');
+    const assistant = await h.command(h.sourceId, 'assistant-after-edit');
     await h.app.turns.edit({
-      source: { kind: 'command', key: 'edit-question-only' }, conversationId: 'source',
+      source: { kind: 'command', key: 'edit-question-only' }, conversationId: h.sourceId,
       messageId: user.messageId, expectedRevisionId: user.expectedRevisionId,
       content: 'new-user-question', deleteFollowing: false
     });
@@ -469,7 +509,7 @@ export const scenario3 = async () => {
     await h.turn(fork.conversationId, 'continue-edited-question');
     const context = h.requests.at(-1).context.map(item => item.content).join('\n');
     assert.match(context, /new-user-question/);
-    assert.doesNotMatch(context, /old-user-question/);
+    assert.doesNotMatch(context, /source-input|changed source after the fork committed/);
     const nested = await h.facade.forkConversation(await h.command(fork.conversationId, 'fork-after-edited-question'));
     await h.turn(nested.conversationId, 'nested-edited-question');
   });
@@ -477,24 +517,23 @@ export const scenario3 = async () => {
 
 export const scenario4 = async () => {
   await withForkRuntime(async h => {
-    await h.turn('source', 'manual-compressed-input-1');
-    await h.turn('source', 'manual-compressed-input-2');
+    await h.turn(h.sourceId, 'manual-compressed-input-1');
     const runner = new ReliableConversationRunner(h.app, 'fork-fixture-owner');
     let compressionTurnId;
     try {
-      const expectedRootId = await h.app.context.currentHeadRootId('source');
+      const expectedRootId = await h.app.context.currentHeadRootId(h.sourceId);
       const structure = await h.app.context.materializeStructure(expectedRootId);
       const compressed = await runner.manualCompression({
-        commandId: 'manual-compression-before-fork', conversationId: 'source',
+        commandId: 'manual-compression-before-fork', conversationId: h.sourceId,
         compressSegmentCount: structure.records.length, target: { kind: 'current_head', expectedRootId }
       });
       assert.equal(compressed.compression.status, 'compressed');
       compressionTurnId = compressed.turnId;
     } finally { runner.dispose(); }
     assert.equal((await rows(h.app, 'MessageTurnLink', { turn_id: compressionTurnId })).length, 0);
-    await h.turn('source', 'after-manual-compression');
-    const fork = await h.facade.forkConversation(await h.command('source', 'fork-compressed-source'));
-    const [sourceBlock] = await rows(h.app, 'CompressionBlock', { conversation_id: 'source' });
+    await h.turn(h.sourceId, 'after-manual-compression');
+    const fork = await h.facade.forkConversation(await h.command(h.sourceId, 'fork-compressed-source'));
+    const [sourceBlock] = await rows(h.app, 'CompressionBlock', { conversation_id: h.sourceId });
     const [forkBlock] = await rows(h.app, 'CompressionBlock', { conversation_id: fork.conversationId });
     assert.ok(forkBlock, 'the fork owns a copy of the reachable compression block');
     assert.notEqual(forkBlock.id, sourceBlock.id);
@@ -515,7 +554,7 @@ export const scenario4 = async () => {
     const forkMessageIds = (await rows(h.app, 'MessagePartOfConversation', { conversation_id: fork.conversationId })).map(row => row.message_id);
     assert.ok(forkMessageIds.includes(feed.compressionBlocks[0].anchor_message_id));
 
-    assert.deepEqual(await h.facade.deleteConversation('source'), ['source']);
+    assert.deepEqual(await h.facade.deleteConversation(h.sourceId), [h.sourceId]);
     assert.deepEqual(await rows(h.app, 'CompressionBlock', { id: sourceBlock.id }), []);
     await h.turn(fork.conversationId, 'fork-after-compressed-source-delete');
     assert.match(h.requests.at(-1).context.map(item => item.content).join('\n'), /offline summary/);
@@ -541,16 +580,15 @@ export const scenario4 = async () => {
 };
 
 export const scenario5 = async () => {
-  await withForkRuntime(async h => {
-    await h.turn('source', 'late-rejection-input');
+  await withCompletedSource(async h => {
     await withSourceSettings(h);
-    const command = await h.command('source', 'late-rejection', 'user');
+    const command = await h.command(h.sourceId, 'late-rejection', 'user');
     const database = h.app.database;
     const transaction = database.transaction.bind(database);
     let copied;
     database.transaction = async (steps, ...rest) => {
       if (copied === undefined && steps.some(step => step.kind === 'insert' && step.domain === 'Conversation')) {
-        copied = await strayConversationSettings(h.configuration, ['source']);
+        copied = await strayConversationSettings(h.configuration, h.settingsOwners);
         throw new kernel.ConversationForkRejectedError('injected rejection at the fork commit');
       }
       return transaction(steps, ...rest);
@@ -562,16 +600,15 @@ export const scenario5 = async () => {
     }
     assert.ok(copied.some(([key]) => key === 'conversationWorkflowSelections') && copied.some(([key]) => key === 'systemPromptScopeLinks'),
       'fixture: the settings, the workflow selection included, were copied before the commit');
-    assert.deepEqual(await strayConversationSettings(h.configuration, ['source']), []);
-    assert.equal((await rows(h.app, 'Conversation')).length, 1);
+    assert.deepEqual(await strayConversationSettings(h.configuration, h.settingsOwners), []);
+    assert.equal((await h.conversations()).length, 1);
   });
 };
 
 export const scenario6 = async () => {
-  await withForkRuntime(async h => {
-    await h.turn('source', 'revision-source-input');
-    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: 'source', text: 'source prompt' });
-    const command = await h.command('source', 'lost-result', 'user');
+  await withCompletedSource(async h => {
+    await h.configuration.mutations.setSystemPrompt({ scopeKind: 'conversation', scopeId: h.sourceId, text: 'source prompt' });
+    const command = await h.command(h.sourceId, 'lost-result', 'user');
     const first = await h.facade.forkConversation(command);
     await h.configuration.mutations.selectConversationWorkflow({
       conversationId: first.conversationId, scopeKind: 'global'
@@ -579,7 +616,7 @@ export const scenario6 = async () => {
     // The user resets the copied prompt on the branch; a replay must not refill the empty slot.
     await h.configuration.mutations.clearSystemPrompt('conversation', first.conversationId);
     await h.app.turns.edit({
-      source: { kind: 'command', key: 'edit-after-fork' }, conversationId: 'source',
+      source: { kind: 'command', key: 'edit-after-fork' }, conversationId: h.sourceId,
       messageId: command.messageId, expectedRevisionId: command.expectedRevisionId,
       content: 'changed source after the fork committed'
     });
@@ -590,7 +627,7 @@ export const scenario6 = async () => {
     assert.equal(config.systemPromptScopeLinks.some(link => link.scopeKind === 'conversation' && link.scopeId === first.conversationId), false);
     await assert.rejects(h.facade.forkConversation({ ...command, command: { commandId: 'new-stale-fork' } }),
       error => error instanceof kernel.ConversationForkRejectedError && /Revision/.test(error.message));
-    assert.equal((await rows(h.app, 'Conversation')).length, 2);
+    assert.equal((await h.conversations()).length, 2);
     await h.turn(first.conversationId, 'unchanged-fork-input');
     assert.doesNotMatch(h.requests.at(-1).context.map(item => item.content).join('\n'), /changed source after/);
   });
@@ -599,10 +636,10 @@ export const scenario6 = async () => {
 export const scenario7 = async () => {
   const planPolicy = { mode: 'before_mutation', allowReadonlyBeforeApproval: false, requireForToolRiskLevels: ['write'] };
   await withForkRuntime(async h => {
-    await h.turn('source', 'plan-source-input');
+    await h.turn(h.sourceId, 'plan-source-input');
     const [originalPlan] = await rows(h.app, 'ToolCall', { tool_name: 'submit_plan' });
     assert.ok(originalPlan);
-    const first = await h.facade.forkConversation(await h.command('source', 'plan-first-fork'));
+    const first = await h.facade.forkConversation(await h.command(h.sourceId, 'plan-first-fork'));
     const second = await h.facade.forkConversation(await h.command(first.conversationId, 'plan-second-fork'));
     const [copiedTurn] = await rows(h.app, 'Turn', { conversation_id: second.conversationId });
     const [copiedPlan] = await rows(h.app, 'ToolCall', { turn_id: copiedTurn.id, tool_name: 'submit_plan' });
@@ -631,18 +668,18 @@ export const scenario7 = async () => {
     assert.equal((await review({ authorityDocument: withoutLineage })).allowed, false,
       'the nested fork is authorized by the inherited approval, not by an unrelated fact');
   }, { script: {
-    async configure(configuration) {
-      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['read', 'submit_plan'], sourceConfigs: { 'fixture-mcp': { enabled: true } } });
-      await configuration.mutations.setPlanReviewPolicy({ scopeKind: 'global', ...planPolicy });
+    async configure(configuration, sourceId) {
+      await configuration.mutations.setToolPolicy({ scopeKind: 'conversation', scopeId: sourceId, allowedTools: ['read', 'submit_plan'], sourceConfigs: { 'fixture-mcp': { enabled: true } } });
+      await configuration.mutations.setPlanReviewPolicy({ scopeKind: 'conversation', scopeId: sourceId, ...planPolicy });
     },
     definitions: [
       { name: 'submit_plan', description: 'Synthetic plan', parameters: { type: 'object' } },
       { name: 'read', description: 'Synthetic offline probe', parameters: { type: 'object' } }
     ],
     // Scripted by the Context each request already holds, so extra model requests cannot shift it.
-    reply(request) {
+    reply(request, sourceId) {
       const called = contextToolNames(request);
-      if (request.conversationId === 'source') {
+      if (request.conversationId === sourceId) {
         return called.includes('submit_plan') ? undefined : [{ functionCall: { name: 'submit_plan', args: { plan: 'fork plan' } } }];
       }
       return called.includes('read') ? undefined : [{ functionCall: { name: 'read', args: { path: 'synthetic-file.txt' } } }];
@@ -657,21 +694,21 @@ export const scenario7 = async () => {
 
 export const scenario8 = async t => {
     await withForkRuntime(async h => {
-      const turn = await h.turn('source', 'scale-boundary');
-      const command = await h.command('source', `scale-fork-${suffixCount}`, 'user');
+      const turn = await h.turn(h.sourceId, 'scale-boundary');
+      const command = await h.command(h.sourceId, `scale-fork-${suffixCount}`, 'user');
       if (compressed) {
         const [authority] = await rows(h.app, 'AuthoritySnapshot', { turn_id: turn.turnId });
-        const rootId = await h.app.context.currentHeadRootId('source');
+        const rootId = await h.app.context.currentHeadRootId(h.sourceId);
         const structure = await h.app.context.materializeStructure(rootId);
         await h.app.compression.create({
-          conversationId: 'source', headRootId: rootId, authoritySnapshotId: authority.id,
+          conversationId: h.sourceId, headRootId: rootId, authoritySnapshotId: authority.id,
           compressSegmentCount: structure.records.length, title: 'Scale summary',
           summary: 'Synthetic compressed history', idempotencyKey: 'scale-compression'
         });
       }
       for (let index = 0; index < suffixCount; index += 1) {
         await h.app.context.appendContent({
-          conversationId: 'source', segmentKind: 'system',
+          conversationId: h.sourceId, segmentKind: 'system',
           source: { sourceKind: 'system', sourceId: `scale-${index}`, sourceRevision: 0n },
           content: `synthetic suffix ${index}`, contentType: 'text/plain'
         });

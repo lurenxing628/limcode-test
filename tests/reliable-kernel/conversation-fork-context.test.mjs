@@ -1,18 +1,32 @@
 import assert from 'node:assert/strict';
-import { test, after } from 'node:test';
+import { test } from 'node:test';
 import * as fork from './fixtures/fork-lifecycle-fixture.mjs';
 import * as estimate from './fixtures/fork-estimate-fixture.mjs';
-import { createBatchFixture, kernel, repo } from './fixtures/runtime-behavior-fixture.mjs';
-let batch;
-async function nodes() { return batch ??= await createBatchFixture(); }
-after(async () => { await batch?.close(); });
+import { kernel, repo } from './fixtures/runtime-behavior-fixture.mjs';
 
+let batch;
+async function nodes() {
+  if (batch) return batch;
+  const { app } = await fork.runtime();
+  const now = '2026-10-13T00:00:00.000Z';
+  const body = await app.contentStore.ingest(app.database, 'shared context batch body', 'text/plain');
+  return batch = {
+    database: app.database, now,
+    async segments(ids) {
+      await app.database.transaction(ids.map(id => repo('ContextSegment').insert({
+        id, content_object_id: body.id, segment_kind: 'system', created_at: now
+      })));
+    }
+  };
+}
+
+// These probes share the completed source. The transcript edit runs after durable replay.
 test('fork completed history, reopen, continue and replay the same target', fork.scenario1);
-test('an active source Turn cannot be copied and remains stoppable', fork.scenario2);
-test('fork uses the current transcript after an earlier message edit', fork.scenario3);
-test('owned compression survives source deletion and nested forks', fork.scenario4);
-test('a rejected fork clears every setting copied before its commit', fork.scenario5);
 test('lost fork acknowledgment replays without overwriting target settings', fork.scenario6);
+test('a rejected fork clears every setting copied before its commit', fork.scenario5);
+test('fork uses the current transcript after an earlier message edit', fork.scenario3);
+test('an active source Turn cannot be copied and remains stoppable', fork.scenario2);
+test('owned compression survives source deletion and nested forks', fork.scenario4);
 test('copied Plan approval authorizes retry through the fork owned ToolCall', fork.scenario7);
 test('fork candidate search reads shared history once within its visible range', fork.scenario8);
 test('fork prefix preserves Provider calibration without counting image storage bytes', estimate.scenario1);
@@ -38,7 +52,7 @@ test('a context node identity collision rolls back earlier batch inserts', async
  assert.equal((await h.database.snapshot([repo('ContextSequenceNode').get('collision-prefix')])).snapshot[0],null);
 });
 
-test('a rolled back savepoint forgets new context node identities before reuse', async () => {
+test('a rolled back savepoint forgets new context node identities before reuse', async t => {
  const h=await nodes();await h.segments(['savepoint-a-segment']);
  const a={id:'savepoint-a',parent_node_id:null,segment_id:'savepoint-a-segment',created_at:h.now};
  await h.database.transaction([
@@ -46,4 +60,5 @@ test('a rolled back savepoint forgets new context node identities before reuse',
  {kind:'rollback-and-continue-on-unique',constraints:[{domain:'ContextSequenceNode',columns:['id']},{domain:'ContextSequenceNode',columns:['segment_id']}]}),
  repo('ContextSequenceNode').ensureContextSequenceNodes([{...a,created_at:'2026-10-13T01:00:00.000Z'}])]);
  assert.equal((await h.database.snapshot([repo('ContextSequenceNode').get(a.id)])).snapshot[0].created_at,'2026-10-13T01:00:00.000Z');
+ t.diagnostic(JSON.stringify({ applicationOpens: (await fork.runtime()).opens, sourcePreparations: (await fork.runtime()).sourcePreparations, estimateAndBatchReuseWriter: true }));
 });

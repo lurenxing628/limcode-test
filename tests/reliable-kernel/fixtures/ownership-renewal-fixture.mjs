@@ -1,3 +1,4 @@
+import { createOwnershipScope } from './ownership-scope-fixture.mjs';
 // Focused production ownership boundary; old review matrices are absent.
 import assert from 'node:assert/strict';
 
@@ -51,10 +52,7 @@ function scheduled(execute) {
 }
 
 async function withDatabase(verify, options = {}) {
-  const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-lease-renewal-'));
-  const authority = new kernel.RootAuthority(() => path.join(directory, 'runtime'));
-  await kernel.initializeEmptyRuntimeRoot(authority);
-  const binding = await authority.current();
+  const { outer: directory, authority, binding } = await createOwnershipScope('renewal');
   const open = async () => {
     const database = await kernel.RuntimeDatabase.open(authority, { hostBootId: 'host', ...(options.maintenance ? { maintenance: true } : {}) });
     try {

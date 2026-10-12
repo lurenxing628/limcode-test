@@ -19,10 +19,6 @@ const { emptyConversationContextHandleStateStep } = await import(pathToFileURL(
   path.join(root, 'dist/extension/backend/reliableKernel/conversationContextHandleState.js')
 ).href);
 
-const { ReliableConversationRunner } = await import(pathToFileURL(
-  path.join(root, 'dist/extension/backend/application/reliableKernel/ReliableConversationRunner.js')
-).href);
-
 function modelContent(text = '', toolCalls = []) {
   return {
     role: 'model',
@@ -169,12 +165,9 @@ async function withTimeout(promise, timeoutMs, message) {
 
 
 
-export const scenario1 = async () => {
-  const parent = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-guidance-queue-'));
-  const authority = new kernel.RootAuthority(() => path.join(parent, 'runtime'));
-  await kernel.initializeEmptyRuntimeRoot(authority);
-
-  let app;
+export const scenario1 = async getRuntime => {
+  const fixture = await getRuntime();
+  const app = fixture.app;
   let releaseTool = () => {};
   let markToolStarted = () => {};
   const toolStarted = new Promise((resolve) => { markToolStarted = resolve; });
@@ -198,7 +191,7 @@ export const scenario1 = async () => {
           kind: 'completed',
           streamSeq: '1',
           content: modelContent('先完成当前工具。', [
-            { id: 'guidance-tool-provider-call', name: 'guidance_tool', arguments: {} }
+            { id: 'guidance-tool-provider-call', name: 'counter', arguments: { value: 1 } }
           ])
         });
         return;
@@ -220,63 +213,27 @@ export const scenario1 = async () => {
     }
   };
   const errors = [];
-  const conversationId = 'guidance-queue-conversation';
-  app = await kernel.ReliableKernelApplication.open(authority, dependencies({
-    providers: { resolve: () => provider },
-    toolDispatcher: {
-      definitions() {
-        return [{ name: 'guidance_tool', description: '等待测试放行', parameters: { type: 'object' } }];
-      },
-      async dispatch(input) {
-        toolDispatches += 1;
-        markToolStarted();
-        await toolGate;
-        const settled = await app.runtime.effects.settleWithoutEffect({
-          source: { kind: 'internal', key: `guidance-tool:${input.toolCallId}` },
-          toolCallId: input.toolCallId,
-          status: 'succeeded',
-          detail: { completed: true }
-        });
-        toolFinished = true;
-        return settled.terminal ?? app.runtime.effects.readTerminalResult(input.toolCallId, true);
-      },
-      async cancelWaiting() {
-        toolCancellationCalls += 1;
-      }
+  const scope = await fixture.scope('guidance-queue', {
+    reply: (request, controls) => provider.sendFullRequest(request, controls),
+    async execute() {
+      toolDispatches += 1;
+      markToolStarted();
+      await toolGate;
+      toolFinished = true;
+      return { ok: true, output: 'Current tool completed.' };
     }
-  }));
-  const runner = new ReliableConversationRunner(
-    app,
-    `guidance-runner:${app.database.hostBootId}`,
-    (error, context) => errors.push({ error, context })
-  );
+  });
+  const conversationId = scope.id;
+  const cancelWaiting = app.toolDispatcher.cancelWaiting;
+  app.toolDispatcher.cancelWaiting = async (...args) => {
+    toolCancellationCalls += 1;
+    return cancelWaiting.apply(app.toolDispatcher, args);
+  };
+  const runner = scope.runner(errors);
 
   try {
-    const now = new Date().toISOString();
-    await app.database.transaction([
-      kernel.DOMAIN_REPOSITORIES.domain('Conversation').insert({
-        id: conversationId,
-        title: 'Guidance queue',
-        status: 'active',
-        created_at: now,
-        updated_at: now
-      }),
-      emptyConversationContextHandleStateStep(conversationId, now),
-      kernel.DOMAIN_REPOSITORIES.domain('AgentConversationLink').insert({
-        id: 'guidance-agent-link',
-        conversation_id: conversationId,
-        agent_id: 'agent-main',
-        role: 'default',
-        created_at: now,
-        updated_at: now
-      })
-    ]);
-
-    const first = await runner.input({
-      commandId: 'guidance-first',
-      conversationId,
-      text: '先完成当前任务'
-    });
+    const first = await scope.input('先完成当前任务', 'guidance-first');
+    await runner.recoverStartup(undefined, conversationId);
     await withTimeout(toolStarted, 5_000, '当前回复未进入工具执行');
 
     const firstGuidance = await runner.input({
@@ -297,7 +254,7 @@ export const scenario1 = async () => {
     assert.equal(toolDispatches, 1);
     assert.equal(toolFinished, false);
     assert.equal(toolCancellationCalls, 0);
-    assert.equal((await listRows(app.database, 'TurnIntent', { state: 'queued' })).length, 2);
+    assert.equal((await listRows(app.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued' })).length, 2);
 
     releaseTool();
     await withTimeout(runner.waitForIdle(), 10_000, '当前工具完成后引导消息未自动接续');
@@ -315,14 +272,13 @@ export const scenario1 = async () => {
     const turns = await listRows(app.database, 'Turn', { conversation_id: conversationId });
     assert.equal(turns.length, 3);
     assert.ok(turns.every((turn) => turn.status === 'terminated'));
-    assert.equal((await listRows(app.database, 'TurnIntent', { state: 'queued' })).length, 0);
+    assert.equal((await listRows(app.database, 'TurnIntent', { conversation_id: conversationId, state: 'queued' })).length, 0);
     assert.equal((await listRows(app.database, 'MessageRevision', { role: 'user' })).length, 3);
   } finally {
     releaseTool();
     runner.dispose();
     await runner.waitForIdle();
-    await app.close();
-    await fs.rm(parent, { recursive: true, force: true });
+    app.toolDispatcher.cancelWaiting = cancelWaiting;
   }
 };
 

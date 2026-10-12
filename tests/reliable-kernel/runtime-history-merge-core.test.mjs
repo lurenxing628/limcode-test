@@ -139,20 +139,42 @@ test('真实另一个进程持续写入同一当前库并看见在线合并结�
   assert.equal(peers.length, result.written);
 });
 
-test('同身份冲突只剔除冲突对话，安全部分导入并登记partial与residual', async () => {
+test('冲突与有归属的未完成工作局部剔除，无归属工作整份拒绝，安全部分登记partial', async () => {
   const source = await home.source('partial');
-  await seed(source, [{ id: 'partial_conflict', title: 'source title' }, { id: 'partial_safe' }]);
+  const unowned = await home.source('unowned');
+  await seed(source, [{ id: 'partial_conflict', title: 'source title' }, { id: 'partial_safe' }, { id: 'owned_asking' }]);
+  await seed(unowned, [{ id: 'unowned_history' }]);
+  const unownedPrompt = await content(unowned, '{"question":"continue"}', 'application/json');
+  raw(unowned, database => insert(database, 'InteractionRequest', { id: 'unowned_question', request_kind: 'ask_user', status: 'pending',
+    prompt_object_id: unownedPrompt.id, created_at: NOW, updated_at: NOW }));
+  const turnId = await bareTurn(source, 'owned_asking');
+  const prompt = await content(source, '{"question":"answer me"}', 'application/json');
+  raw(source, database => {
+    insert(database, 'InteractionRequest', { id: 'owned_question', request_kind: 'ask_user', status: 'pending', prompt_object_id: prompt.id, created_at: NOW, updated_at: NOW });
+    insert(database, 'InteractionOwnerLink', { id: 'owned_question_owner', request_id: 'owned_question', turn_id: turnId, created_at: NOW });
+  });
   await home.database.transaction([repo('Conversation').insert(conversation('partial_conflict', 'current title'))]);
   const tools = await content(source, JSON.stringify({ kind: 'frozen-tool-definitions', tools: [] }), 'application/json');
   await aggregate(source, 'partial_conflict', 'partial_request', { toolsReference: { contentObjectId: tools.id }, checkpoints: 1 });
   await fs.chmod(path.dirname(loosePath(source.binding, tools)), 0o700);
   await fs.rm(loosePath(source.binding, tools));
-  const report = await merge(home, [source]);
-  clean(report);
-  assert.deepEqual(report.merged[0].excluded.map(row => row.conversationId), ['partial_conflict']);
+  const report = await merge(home, [source, unowned], { settleSourceWork: undefined,
+    async confirmSettlement() { assert.fail('Excluded work must not be finalized.'); } });
+  assert.deepEqual([report.deferred, report.failures], [[], []], JSON.stringify(report));
+  assert.deepEqual(report.blocked.map(row => [row.candidateId, row.code]), [[unowned.id, 'runtime-data-set-merge-unattributed']]);
+  assert.equal(report.merged.length, 1);
+  assert.equal(report.merged[0].candidateId, source.id);
+  assert.deepEqual(report.merged[0].excluded.map(row => [row.conversationId, row.code]),
+    [['owned_asking', 'runtime-data-set-merge-unfinished-work'], ['partial_conflict', 'runtime-data-set-merge-conflict']]);
   assert.equal(report.merged[0].insertedConversations, 1);
   assert.equal((await get('Conversation', 'partial_conflict')).title, 'current title');
   assert.ok(await get('Conversation', 'partial_safe'));
+  assert.equal(await get('Conversation', 'owned_asking'), null);
+  assert.equal(await get('Conversation', 'unowned_history'), null);
+  read(source, database => {
+    assert.equal(database.prepare('SELECT status FROM turn WHERE id=?').pluck().get(turnId), 'active');
+    assert.equal(database.prepare('SELECT status FROM interaction_request WHERE id=?').pluck().get('owned_question'), 'pending');
+  });
   assert.equal(await get('ContentObject', tools.id), null);
   const record = await ledger(home, source);
   assert.equal(record.state, 'partial');
@@ -195,27 +217,6 @@ test('来源坏正文局部剔除，目标已有坏正文保持原字节', async
     assert.equal(await get('Conversation', 'cas_target_new'), null);
     assert.deepEqual(await fs.readFile(targetFile), wrong);
   } finally { await fs.writeFile(targetFile, valid); }
-});
-
-test('无法归属的工作整份拒绝，有归属的未完成工作只排除关联对话', async () => {
-  const unowned = await home.source('unowned');
-  const owned = await home.source('owned');
-  await seed(unowned, [{ id: 'unowned_history' }]);
-  const prompt = await content(unowned, '{"question":"continue"}', 'application/json');
-  raw(unowned, database => insert(database, 'InteractionRequest', { id: 'unowned_question', request_kind: 'ask_user', status: 'pending', prompt_object_id: prompt.id, created_at: NOW, updated_at: NOW }));
-  await seed(owned, [{ id: 'owned_asking' }, { id: 'owned_safe' }]);
-  const turnId = await bareTurn(owned, 'owned_asking');
-  const ownedPrompt = await content(owned, '{"question":"answer me"}', 'application/json');
-  raw(owned, database => {
-    insert(database, 'InteractionRequest', { id: 'owned_question', request_kind: 'ask_user', status: 'pending', prompt_object_id: ownedPrompt.id, created_at: NOW, updated_at: NOW });
-    insert(database, 'InteractionOwnerLink', { id: 'owned_question_owner', request_id: 'owned_question', turn_id: turnId, created_at: NOW });
-  });
-  const report = await merge(home, [unowned, owned]);
-  assert.deepEqual(report.blocked.map(row => [row.candidateId, row.code]), [[unowned.id, 'runtime-data-set-merge-unattributed']]);
-  assert.deepEqual(report.merged[0].excluded.map(row => row.conversationId), ['owned_asking']);
-  assert.ok(await get('Conversation', 'owned_safe'));
-  assert.equal(await get('Conversation', 'owned_asking'), null);
-  assert.equal(read(owned, database => database.prepare('SELECT status FROM turn WHERE id=?').pluck().get(turnId)), 'active');
 });
 
 test('规划后来源改变使过期计划推迟，下次导入新的内容', async () => {
@@ -343,6 +344,14 @@ test('小rich库按7行分批复制，聚合、关系、ready/pending句柄与mi
       const disk = new Database(file, { readonly: true });
       try { proof = disk.prepare('SELECT COUNT(*) FROM model_stream_checkpoint WHERE model_request_id=?').pluck().get('bulk_request'); }
       finally { disk.close(); }
+      // Reuse the copy's actual target writer at its completed durability boundary.
+      const store = kernel.ContentAddressedStore.forDatabase(destination.dataSet.authority, this);
+      const state = await readCurrentConversationContextHandleState(this, store, 'bulk_ready');
+      assert.deepEqual(state.catalog, richCatalog);
+      assert.equal(state.requiresNativeReset, true);
+      assert.equal((await readConversationContextHandleStateRow(this, 'bulk_pending')).state, 'pending');
+      assert.equal(JSON.parse((await store.read(packed)).toString()).parts[0].text, 'bulk packed body');
+      assert.equal(JSON.parse((await store.read(loose)).toString()).parts[0].text, 'body bulk_ready');
     }
     return result;
   });
@@ -356,16 +365,6 @@ test('小rich库按7行分批复制，聚合、关系、ready/pending句柄与mi
   for (const batch of batches) assert.ok(batch.rows <= 6 + batch.largestUnitRows);
   assert.deepEqual(domainRows(destination.dataSet), domainRows(rich));
   assert.equal(receipt.rowsByDomain.ModelRequest, 1);
-  const database = await kernel.RuntimeDatabase.open(destination.dataSet.authority, { hostBootId: 'bulk-readback' });
-  try {
-    const store = kernel.ContentAddressedStore.forDatabase(destination.dataSet.authority, database);
-    const state = await readCurrentConversationContextHandleState(database, store, 'bulk_ready');
-    assert.deepEqual(state.catalog, richCatalog);
-    assert.equal(state.requiresNativeReset, true);
-    assert.equal((await readConversationContextHandleStateRow(database, 'bulk_pending')).state, 'pending');
-    assert.equal(JSON.parse((await store.read(packed)).toString()).parts[0].text, 'bulk packed body');
-    assert.equal(JSON.parse((await store.read(loose)).toString()).parts[0].text, 'body bulk_ready');
-  } finally { await database.close(); }
 });
 
 test('复制中断的部分目标无Host与成功收据，后续复制拒绝把它当空库复用', async () => {
@@ -663,33 +662,6 @@ async function queuedSource(name, delivery = false) {
   return result;
 }
 
-test('public API排队输入先于活动Turn收尾取消，合入历史后不再准入', async t => {
-  const { source, id, active, queued } = await queuedSource('queue');
-  const interrupt = TurnControlPlane.prototype.requestExternalInterrupt;
-  let queueWasCancelled;
-  t.mock.method(TurnControlPlane.prototype, 'requestExternalInterrupt', async function (conversationId, ...args) {
-    if (conversationId === id) {
-      const [intent] = (await this.database.snapshot([repo('TurnIntent').get(queued.intentId)])).snapshot;
-      queueWasCancelled = intent.state === 'cancelled';
-      assert.equal(queueWasCancelled, true, 'queue cancellation is durable before the Turn stop request');
-    }
-    return interrupt.call(this, conversationId, ...args);
-  });
-  const report = await merge(home, [source]);
-  clean(report);
-  assert.equal(queueWasCancelled, true);
-  assert.deepEqual([report.merged[0].finalized.turns, report.merged[0].finalized.intents], [1, 1]);
-  assert.equal((await get('TurnIntent', queued.intentId)).state, 'cancelled');
-  assert.equal((await get('Turn', active.turnId)).status, 'terminated');
-  const targetTurns = new TurnControlPlane(home.database, home.store, { authorityCompiler: { async compile() { assert.fail('merged queue must not start a Turn'); } } });
-  assert.equal(await targetTurns.admitNextQueued({ conversationId: id, ...lease(home.database) }), null);
-  const backup = new Database(path.join(report.merged[0].finalized.sourceBackupPath, 'limcode.sqlite'), { readonly: true });
-  try {
-    assert.equal(backup.prepare('SELECT state FROM turn_intent WHERE id=?').pluck().get(queued.intentId), 'queued');
-    assert.equal(backup.prepare('SELECT status FROM turn WHERE id=?').pluck().get(active.turnId), 'active');
-  } finally { backup.close(); }
-});
-
 test('pending delivery排除该对话，原来源Turn、队列和投递保持原状态', async () => {
   const { source, id, active, queued, pendingDelivery } = await queuedSource('delivery', true);
   const inspected = read(source, load('runtimeDataSetMergeProbes.js').inspectUnfinishedWork);
@@ -709,7 +681,7 @@ test('pending delivery排除该对话，原来源Turn、队列和投递保持原
   });
 });
 
-test('流式中断来源收尾合入完整Runtime，重扫和重新打开均不调用Provider', async t => {
+test('public队列先于SIGKILL遗留Turn收尾取消，重扫和重开完整Runtime均不调用Provider', async t => {
   const source = await home.source('crash-source');
   const second = await home.source('crash-second');
   await seed(second, [{ id: 'crash_second_history' }]);
@@ -720,11 +692,23 @@ test('流式中断来源收尾合入完整Runtime，重扫和重新打开均不�
   await waitForFile(ready, process);
   process.child.kill('SIGKILL');
   assert.equal((await process.exited).signal, 'SIGKILL');
+  const { queued } = JSON.parse(await fs.readFile(ready, 'utf8'));
+  const activeTurnId = read(source, database => database.prepare("SELECT id FROM turn WHERE status='active'").pluck().get());
   read(source, database => {
     assert.equal(database.prepare("SELECT COUNT(*) FROM turn WHERE status='active'").pluck().get(), 1n);
     assert.equal(database.prepare('SELECT COUNT(*) FROM execution_lease').pluck().get(), 1n);
     assert.equal(database.prepare("SELECT COUNT(*) FROM turn_intent WHERE state='queued'").pluck().get(), 1n);
     assert.ok(database.prepare("SELECT COUNT(*) FROM model_request WHERE status<>'terminal'").pluck().get() > 0n);
+  });
+  const interrupt = TurnControlPlane.prototype.requestExternalInterrupt;
+  let queueWasCancelled = false;
+  t.mock.method(TurnControlPlane.prototype, 'requestExternalInterrupt', async function (conversationId, ...args) {
+    if (conversationId === 'crash_conversation') {
+      const [intent] = (await this.database.snapshot([repo('TurnIntent').get(queued.intentId)])).snapshot;
+      queueWasCancelled = intent.state === 'cancelled';
+      assert.equal(queueWasCancelled, true, 'the public queued input is durable-cancelled before the Turn stop request');
+    }
+    return interrupt.call(this, conversationId, ...args);
   });
   let confirmations = 0;
   let backups = 0;
@@ -742,6 +726,19 @@ test('流式中断来源收尾合入完整Runtime，重扫和重新打开均不�
   assert.equal(confirmations, 1);
   assert.equal(backups, 2);
   assert.equal(report.merged.reduce((n, item) => n + item.finalized.turns, 0), 2);
+  assert.equal(queueWasCancelled, true);
+  assert.equal((await get('TurnIntent', queued.intentId)).state, 'cancelled');
+  assert.equal((await get('Turn', activeTurnId)).status, 'terminated');
+  const targetTurns = new TurnControlPlane(home.database, home.store, { authorityCompiler: {
+    async compile() { assert.fail('Merged public queue must not admit another Turn.'); }
+  } });
+  assert.equal(await targetTurns.admitNextQueued({ conversationId: 'crash_conversation', ...lease(home.database) }), null);
+  const original = report.merged.find(item => item.candidateId === source.id);
+  const backup = new Database(path.join(original.finalized.sourceBackupPath, 'limcode.sqlite'), { readonly: true });
+  try {
+    assert.equal(backup.prepare('SELECT state FROM turn_intent WHERE id=?').pluck().get(queued.intentId), 'queued');
+    assert.equal(backup.prepare('SELECT status FROM turn WHERE id=?').pluck().get(activeTurnId), 'active');
+  } finally { backup.close(); }
   await home.live.app.refreshExternalRuntimeWork();
   await home.live.runner.recoverStartup();
   await home.live.coordinator.recoverStartup();

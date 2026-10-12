@@ -64,8 +64,9 @@ export async function stopForeignProcess(f) {
 }
 
 export async function liveOwnerStops(f) {
-  const peer = await f.peer('mcp', 'live-owner');
+  const peer = await f.livePeer();
   const ready = peer.ready;
+  let passed = false;
   try {
     await controlOnly(f, async () => {
       const result = await f.runner.interrupt({ commandId: f.id('stop-live'), conversationId: ready.conversationId, turnId: ready.turnId, reason: '用户停止' });
@@ -79,7 +80,8 @@ export async function liveOwnerStops(f) {
       assert.equal(receipt.outcome, 'succeeded');
       assert.notEqual((await body(f, receipt.response_object_id)).reason, DEAD_HOST_STOP_REASON);
     });
-  } finally { await peer.close(); }
+    passed = true;
+  } finally { if (!passed) await peer.close(); }
 }
 
 export async function unknownDispatchIdentity(f) {
@@ -123,7 +125,7 @@ export async function stopAllWaits(f) {
 }
 
 export async function userStopsDeadHost(f) {
-  const peer = await f.peer('mcp', 'dead-owner'), ready = peer.ready;
+  const peer = await f.deadPeer('mcp', 'dead-owner'), ready = peer.ready;
   await peer.kill();
   const beforeCalls = f.modelCalls.length;
   await controlOnly(f, async () => {
@@ -159,7 +161,7 @@ export async function liveDispatchKeepsReceipt(f) {
 }
 
 export async function recoverDispatchedSpawn(f) {
-  const peer = await f.peer('spawn', 'dead-spawn'), ready = peer.ready;
+  const peer = await f.deadPeer('spawn', 'dead-spawn'), ready = peer.ready;
   await peer.kill();
   const beforeCalls = f.modelCalls.length;
   await controlOnly(f, async () => {

@@ -15,7 +15,7 @@ let shared, processFixture, completion;
 async function runtime() { return shared ??= await createBehaviorRuntime('recovery'); }
 after(async () => {
   await completion?.dispatcher.dispose(); await completion?.processes.dispose();
-  await processFixture?.close(); await shared?.close();
+  await scheduler.close(); await processFixture?.close(); await shared?.close();
 });
 
 const ASK = { question: 'Continue?', options: [{ label: 'Continue' }, { label: 'Stop' }] };
@@ -35,7 +35,7 @@ async function finish(h, turnId, status = 'completed') {
 }
 
 // Queue controls use the production admission/revision APIs, including reopen and CAS conflicts.
-test('guidance waits for the current model and tool batch then continues in FIFO order', queue.scenario1);
+test('guidance waits for the current model and tool batch then continues in FIFO order', () => queue.scenario1(runtime));
 test('queued guidance edits, cancellation and hold survive reopen with the same revision', queue.scenario2);
 
 test('only the frozen explicit Plan approval setting grants automatic approval', async () => {
@@ -72,9 +72,9 @@ test('human cancellation and an automatic Ask response commit one durable decisi
   await finish(h, turn.turnId);
 });
 
-test('a busy queued admission recovers without another user event', recovery.scenario1);
-test('a lost assistant commit acknowledgment recovers without another model call', recovery.scenario2);
-test('durable stop cancels local output recovery before another model request', recovery.scenario3);
+test('a busy queued admission recovers without another user event', () => recovery.scenario1(runtime));
+test('a lost assistant commit acknowledgment recovers without another model call', () => recovery.scenario2(runtime));
+test('durable stop cancels local output recovery before another model request', () => recovery.scenario3(runtime));
 
 test('a completed source result joins the running Turn and moves to next Turn when idle', async () => {
   const f = await runtime(), h = await f.scope('running-result');

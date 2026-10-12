@@ -9,9 +9,9 @@ for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => {
   for (const child of children) child.kill(signal);
 });
 
-function run(command, args) {
+function run(command, args, options = {}) {
   if (stoppedBy) return Promise.resolve(128 + os.constants.signals[stoppedBy]);
-  const child = spawn(command, args, { stdio: 'inherit' });
+  const child = spawn(command, args, { stdio: 'inherit', ...options });
   children.add(child);
   return new Promise((resolve, reject) => {
     child.once('error', error => { children.delete(child); reject(error); });
@@ -22,6 +22,12 @@ function run(command, args) {
   });
 }
 
+function npm(args) {
+  return process.env.npm_execpath
+    ? run(process.execPath, [process.env.npm_execpath, ...args])
+    : run(process.platform === 'win32' ? 'npm.cmd' : 'npm', args, { shell: process.platform === 'win32' });
+}
+
 async function core() {
   return run(process.execPath, ['scripts/reliable-kernel/run-local-tests.mjs', '--ci']);
 }
@@ -29,9 +35,7 @@ async function core() {
 async function browser() {
   if (!process.env.LIMCODE_TEST_BROWSER_PATH) {
     const args = ['playwright', 'install', '--only-shell', ...(process.env.GITHUB_ACTIONS ? ['--with-deps'] : []), 'chromium'];
-    const status = process.env.npm_execpath
-      ? await run(process.execPath, [process.env.npm_execpath, 'exec', '--offline', '--', ...args])
-      : await run('npx', ['--offline', ...args]);
+    const status = await npm(['exec', '--offline', '--', ...args]);
     if (status !== 0) return status;
   }
   return run(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1',
@@ -42,8 +46,8 @@ async function browser() {
 }
 
 const started = performance.now();
-const results = await Promise.allSettled([core(), browser()]);
+const results = await Promise.allSettled([core(), browser(), npm(['run', 'typecheck:webview'])]);
 for (const result of results) if (result.status === 'rejected') console.error(result.reason);
 const failed = results.some(result => result.status === 'rejected' || result.value !== 0);
-console.log(`核心套件与浏览器验证完成，用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒。`);
+console.log(`类型检查、核心套件与浏览器验证完成，用时 ${((performance.now() - started) / 1000).toFixed(1)} 秒。`);
 process.exitCode = stoppedBy ? 128 + os.constants.signals[stoppedBy] : failed ? 1 : 0;

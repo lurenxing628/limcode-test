@@ -1,3 +1,4 @@
+import { createOwnershipScope } from './ownership-scope-fixture.mjs';
 // Focused production ownership boundary; old review matrices are absent.
 import assert from 'node:assert/strict';
 
@@ -434,10 +435,7 @@ function fixtureDependencies(provider, defaultWorkEnvironmentId, tools = {}) {
 }
 
 async function createIsolatedRoot(label) {
-  const outer = await fs.mkdtemp(path.join(os.tmpdir(), `limcode-eligibility-${label}-`));
-  await fs.mkdir(path.join(outer, 'control'), { recursive: true });
-  const candidate = await kernel.resetCandidateRuntimeRoot(path.join(outer, 'control'));
-  return { outer, dataRoot: candidate.binding.paths.dataRootPath };
+  return createOwnershipScope(label);
 }
 
 async function rows(appOrDatabase, domain, where = {}) {

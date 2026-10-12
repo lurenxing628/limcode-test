@@ -1,8 +1,9 @@
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import {
-  compiled, createConfigurationRoot, initializeScope, removeConfigurationRoot,
+  compiled, removeConfigurationRoot,
   Database, kernel, kernelFile, modelRequestAggregate, NOW, repo
 } from './runtime-merge-fixture.mjs';
 
@@ -10,6 +11,8 @@ const { mergeHistoricalDataSetsOnline } = kernelFile('runtimeDataSetMerge.js');
 const { prepareLargeMergeSources, runLargeMergeSession } = kernelFile('runtimeDataSetStreamedMerge.js');
 const { withRuntimeDataRootAdmission, withRuntimeMaintenance } = kernelFile('runtimeHostControl.js');
 const { preparedContentObjectSteps } = kernelFile('contentObjectTransaction.js');
+const roots = kernelFile('vscodeRootAuthority.js');
+const schema = kernelFile('databaseSchema.js');
 export const OPTIONS = { sizeLimits: { transactionRows: 0 }, chunkRows: 7 };
 export const conversation = id => ({ id, title: id, status: 'active', created_at: NOW, updated_at: NOW });
 export const turn = id => ({ id: `${id}_turn`, conversation_id: id, status: 'terminated', created_at: NOW, updated_at: NOW, terminal_at: NOW });
@@ -19,7 +22,27 @@ const MESSAGE = 'application/vnd.limcode.message+json';
 // One configuration root for the suite. A streamed session still closes the ordinary writer and
 // opens the real maintenance writer; caching never crosses that production lifecycle boundary.
 export async function createStreamFixture() {
-  const fixture = await createConfigurationRoot({ beta: true });
+  const root = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-ci-streamed-')));
+  const paths = { globalStoragePath: root };
+  const initialize = async (scopeRoot, id) => {
+    const authority = new kernel.RootAuthority(() => roots.resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot }));
+    const binding = await authority.initializeEmptyRoot(async value => {
+      await fs.mkdir(value.paths.casRootPath, { recursive: true });
+      const database = new Database(value.paths.databasePath);
+      try { schema.configureWriterConnection(database); schema.initializeCurrentSchema(database, value); }
+      finally { database.close(); }
+    });
+    return { id, scopeRoot, authority, binding };
+  };
+  const initializeScope = name => {
+    const scope = roots.resolveVscodeWorkspaceRuntimeScope({ workspaceFolderUris: [`file:///ci-streamed/${name}`] });
+    return initialize(roots.resolveVscodeWorkspaceRuntimeScopeRoot(paths, scope), `workspace:${scope.key}`);
+  };
+  const current = await initialize(root, 'default');
+  const alpha = await initializeScope('partial');
+  const beta = await initializeScope('noop');
+  await roots.selectVscodeRuntimeDataSet(paths, 'default');
+  const fixture = { root, paths, current, alpha, beta };
   let writer, next = 0;
   return Object.assign(fixture, {
     async writer() {
@@ -27,7 +50,7 @@ export async function createStreamFixture() {
       return writer;
     },
     async closeCurrent() { if (writer) { const closing = writer; writer = undefined; await closing.close(); } },
-    source: name => initializeScope(fixture.paths, `ci-streamed-${name}-${++next}`),
+    source: name => initializeScope(`${name}-${++next}`),
     async prepare(sources, options = {}) {
       return prepareLargeMergeSources({ paths: fixture.paths,
         target: { configurationRootPath: fixture.root, database: await this.writer() },
@@ -48,9 +71,32 @@ export async function createStreamFixture() {
 }
 
 export async function seedBare(source, ids) {
-  const writer = await kernel.RuntimeDatabase.open(source.authority, { hostBootId: 'ci-streamed-seed' });
-  try { await writer.transaction(ids.map(id => repo('Conversation').insert(conversation(id)))); }
-  finally { await writer.close(); }
+  raw(source, database => { for (const id of ids) insert(database, 'Conversation', conversation(id)); });
+}
+
+function insert(database, domain, row) {
+  const repository = repo(domain);
+  const encoded = repository.codec.encodeInsert(row);
+  const columns = Object.keys(encoded);
+  database.prepare(`INSERT INTO "${repository.schema.table}" (${columns.map(name => `"${name}"`).join(',')}) VALUES (${columns.map(() => '?').join(',')})`)
+    .run(...Object.values(encoded));
+}
+
+// The final-writer test needs one complete aggregate, without unrelated messages or collaboration.
+export async function seedAggregate(source, id) {
+  const store = kernel.ContentAddressedStore.loose(source.authority, source.binding);
+  const text = JSON.stringify({ kind: 'reliable-agent-turn', conversationId: id, turnId: `${id}_turn`,
+    modelHandleCatalog: { entries: [] }, tools: [] });
+  const recipe = { ...store.identity(text, 'application/json'), created_at: NOW };
+  await store.publish(text, 'application/json');
+  const requestId = `${id}_request`;
+  raw(source, database => {
+    for (const [domain, row] of [['ContentObject', recipe], ['Conversation', conversation(id)],
+      ['Turn', turn(id)], ['TurnTermination', termination(id)]]) insert(database, domain, row);
+    for (const step of modelRequestAggregate(`${id}_turn`, requestId, 1n,
+      { recipe: recipe.id, body: recipe.id, checkpoints: 0 })) insert(database, step.domain, step.row);
+  });
+  return { requestId };
 }
 
 // Mixed storage and one complete model aggregate are enough to exercise the real copy path. The

@@ -16,10 +16,9 @@ const { GlobalSettingsSaveBarrier } = load('backend/application/reliableKernel/G
 
 test('execution eligibility uses frozen project and environment facts before writing input', entry.scenario1);
 test('another live window can answer controls without taking execution ownership', entry.scenario2);
-test('concurrent eligible windows recover one Turn with one execution owner', entry.scenario3);
+test('dead Host handoff gives one eligible window a fresh durable owner token', entry.scenario3);
 test('removing the project folder hands execution back at a round boundary', folder.scenario1);
 test('failed owner release revokes local authority and retries the exact token', release.scenario1);
-test('a dead Host owner is replaced by a new durable owner token', hosts.scenario1);
 test('stale execution generations cannot commit model callbacks or writes', hosts.scenario2);
 
 test('application close fences its worker and retries only failed owner cleanup', async () => {

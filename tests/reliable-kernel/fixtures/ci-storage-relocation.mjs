@@ -14,6 +14,7 @@ export const repo = name => kernel.DOMAIN_REPOSITORIES.domain(name);
 export const relocation = kernelFile('runtimeDataRootRelocation.js');
 export const roots = kernelFile('vscodeRootAuthority.js');
 export const registry = kernelFile('runtimeHistoryRegistry.js');
+const schema = kernelFile('databaseSchema.js');
 export const NOW = '2026-10-01T00:00:00.000Z';
 export const PROJECT = { uri: 'file:///workspace/ci-storage', name: 'storage' };
 
@@ -24,7 +25,12 @@ export async function temporaryRoot(prefix) {
 export async function initializeRoot(root, id = 'default') {
   await fs.mkdir(root, { recursive: true });
   const authority = new kernel.RootAuthority(() => roots.resolveVscodeRuntimeDataRoot({ globalStoragePath: root }));
-  const binding = await kernel.initializeEmptyRuntimeRoot(authority);
+  const binding = await authority.initializeEmptyRoot(async value => {
+    await fs.mkdir(value.paths.casRootPath, { recursive: true });
+    const database = new Database(value.paths.databasePath);
+    try { schema.configureWriterConnection(database); schema.initializeCurrentSchema(database, value); }
+    finally { database.close(); }
+  });
   return { root, id, authority, binding };
 }
 
@@ -34,22 +40,22 @@ export async function seedMessages(dataSet, specs) {
   const database = await openDatabase(dataSet);
   const store = kernel.ContentAddressedStore.forDatabase(dataSet.authority, database);
   try {
-    const metadata = [];
-    for (const spec of specs) {
-      const text = spec.text ?? `${spec.id} 的原始用户输入`;
-      const body = JSON.stringify({ role: 'user', parts: [{ text }] });
-      const content = await store.ingest(database, body, 'application/vnd.limcode.message+json');
+    const bodies = specs.map(spec => JSON.stringify({ role: 'user', parts: [{ text: spec.text ?? `${spec.id} 的原始用户输入` }] }));
+    const prepared = await store.prepareBatch(database, bodies.map(content => ({ content, contentType: 'application/vnd.limcode.message+json' })));
+    const steps = prepared.flatMap(entry => entry.insert ? [entry.insert] : []);
+    for (const [index, spec] of specs.entries()) {
+      const content = prepared[index].metadata;
       const messageId = `${spec.id}-message`;
-      await database.transaction([
+      steps.push(
         repo('Conversation').insert({ id: spec.id, title: spec.title ?? spec.id, status: 'active', created_at: NOW, updated_at: NOW }),
         repo('Message').insert({ id: messageId, created_at: NOW, updated_at: NOW, deleted_at: null }),
         repo('MessageRevision').insert({ id: `${messageId}-revision`, message_id: messageId, revision_seq: 1n, role: 'user', content_object_id: content.id, created_at: NOW }),
         repo('MessageCurrentRevisionLink').insert({ id: `${messageId}-current`, message_id: messageId, revision_id: `${messageId}-revision`, updated_at: NOW }),
         repo('MessagePartOfConversation').insert({ id: `${messageId}-member`, conversation_id: spec.id, message_id: messageId, message_seq: 1n, created_at: NOW })
-      ]);
-      metadata.push({ ...content, body });
+      );
     }
-    return metadata;
+    await database.transaction(steps);
+    return prepared.map(({ metadata }, index) => ({ ...metadata, body: bodies[index] }));
   } finally { await database.close(); }
 }
 
@@ -89,8 +95,13 @@ export function readRows(dataRoot, table, columns = '*') {
   finally { database.close(); }
 }
 
-export async function readBody(dataSet, metadata) {
+export async function readBodies(dataSet, metadata) {
   const database = await openDatabase(dataSet);
-  try { return (await kernel.ContentAddressedStore.forDatabase(dataSet.authority, database).read(metadata)).toString(); }
+  try {
+    const store = kernel.ContentAddressedStore.forDatabase(dataSet.authority, database);
+    const bodies = [];
+    for (const entry of metadata) bodies.push((await store.read(entry)).toString());
+    return bodies;
+  }
   finally { await database.close(); }
 }

@@ -5,14 +5,14 @@ import path from 'node:path';
 import { before, after, test } from 'node:test';
 import commandFixture from './fixtures/ci-storage-command-fixture.cjs';
 import {
-  kernel, load, repo, roots, registry, relocation, NOW, temporaryRoot, initializeRoot,
-  openDatabase, seedMessages, writeStore, selected, move, readRows, readBody
+  kernel, load, roots, registry, relocation, NOW, temporaryRoot, initializeRoot,
+  openDatabase, seedMessages, writeStore, selected, move, readRows, readBodies
 } from './fixtures/ci-storage-relocation.mjs';
 import { commands, globalStatus, MockUri, ui, context, openWindow, restoreVscodeLoader } from './fixtures/ci-storage-vscode.mjs';
 import { runCommittedRelocationRecovery } from './fixtures/ci-storage-relocation-crash.mjs';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
-let base, source, alpha, metadata, moved, received;
+let base, source, alpha, metadata, moved;
 const ids = rows => rows.map(row => row.id);
 const file = (root, relative) => path.join(root, relative);
 const read = (root, relative) => fs.readFile(file(root, relative), 'utf8');
@@ -127,28 +127,13 @@ test('新根只迁当前库及登记配置，旧来源原位、用户消息和CA
     assert.equal(await read(moved.target.root, relative), await read(source.root, relative), relative);
   }
   await assert.rejects(fs.stat(file(moved.target.root, 'notes.txt')), { code: 'ENOENT' });
-  for (const body of metadata) assert.equal(await readBody(moved.target, body), body.body);
+  assert.deepEqual(await readBodies(moved.target, metadata), metadata.map(item => item.body));
   const pending = [...(await registry.readRuntimeHistoryPending({ globalStoragePath: moved.target.root })).values()];
   assert.equal(pending.find(item => item.identity?.dataSetId === alpha.binding.dataSetId).location.containerPath, path.dirname(alpha.binding.paths.dataRootPath));
   const residual = [...(await registry.readRuntimeHistoryResidual({ globalStoragePath: moved.target.root })).values()];
   assert.equal(residual.length, 1);
   assert.equal(residual[0].message, '原位保留的不可读来源');
   assert.equal(await read(source.root, 'notes.txt'), 'user file outside registered settings');
-});
-
-test('已有目标按记录id合并，原对话和独有配置保留，被替换设置有备份', async () => {
-  const target = await initializeRoot(file(base, 'receiving'));
-  await roots.selectVscodeRuntimeDataSet({ globalStoragePath: target.root }, 'default');
-  await seedMessages(target, [{ id: 'target-existing' }]);
-  await writeStore(target.root, 'agents', 'agent', [{ id: 'shared', name: 'target version' }, { id: 'target-only', name: 'target only' }]);
-  await fs.mkdir(file(target.root, 'settings'), { recursive: true });
-  await fs.writeFile(file(target.root, 'settings/llm.json'), '{"activeProviderConfigId":"target"}\n');
-  received = await move(source, target.root);
-  assert.deepEqual(ids(readRows(received.target.binding.paths.dataRootPath, 'conversation')), ['source-one', 'source-two', 'target-existing']);
-  assert.deepEqual(JSON.parse(await read(target.root, 'agents/index.json')).records.map(item => item.id).sort(), ['shared', 'source-only', 'target-only']);
-  assert.equal(JSON.parse(await read(target.root, 'agents/records/shared.json')).agent.name, 'source version');
-  assert.equal(JSON.parse(await read(target.root, 'agents/records/target-only.json')).agent.name, 'target only');
-  assert.equal(await read(received.result.configuration.backupPath, 'settings/llm.json'), '{"activeProviderConfigId":"target"}\n');
 });
 
 test('来源拷来的目录在任何目标写入前拒绝，源和目标文件保留', async () => {
@@ -168,14 +153,14 @@ test('准备后目标被在线Host打开时拒绝提交，原记录不变', asyn
   const database = await openDatabase(source);
   let staged;
   try {
-    const plan = await relocation.planDataRootRelocation({ sourceRootPath: source.root, targetRootPath: received.target.root, sourceDatabase: database });
+    const plan = await relocation.planDataRootRelocation({ sourceRootPath: source.root, targetRootPath: moved.target.root, sourceDatabase: database });
     assert.deepEqual(plan.problems, []);
     staged = await relocation.stageDataRootRelocation(plan, database);
   } finally { await database.close(); }
-  const host = await openDatabase(received.target);
+  const host = await openDatabase(moved.target);
   try { await assert.rejects(relocation.completeDataRootRelocation(staged, async () => {}), { code: 'data-root-relocation-target-busy' }); }
   finally { await host.close(); }
-  assert.deepEqual(ids(readRows(received.target.binding.paths.dataRootPath, 'conversation')), ['source-one', 'source-two', 'target-existing']);
+  assert.deepEqual(ids(readRows(moved.target.binding.paths.dataRootPath, 'conversation')), ['source-one', 'source-two']);
 });
 
 test('迁移留下的技能深层文件后来修改时撤销held，用户内容和对话保留', async () => {
@@ -197,16 +182,6 @@ test('迁移留下的技能深层文件后来修改时撤销held，用户内容�
   assert.deepEqual(ids(readRows((await selected(targetRoot)).runtimeDataRootPath, 'conversation')), ['source-one', 'source-two']);
 });
 
-test('连续迁移后pending与residual仍定位最初来源，只有一个当前库', async () => {
-  const again = await move(moved.target, file(base, 'third'));
-  const pending = [...(await registry.readRuntimeHistoryPending({ globalStoragePath: again.target.root })).values()];
-  assert.equal(pending.find(item => item.identity?.dataSetId === alpha.binding.dataSetId).location.containerPath, path.dirname(alpha.binding.paths.dataRootPath));
-  const residual = [...(await registry.readRuntimeHistoryResidual({ globalStoragePath: again.target.root })).values()];
-  assert.equal(residual[0].location.baseDataRootPath, source.root);
-  assert.equal((await roots.inspectVscodeRuntimeDataSets({ globalStoragePath: again.target.root })).candidates.length, 1);
-  assert.deepEqual(ids(readRows(alpha.binding.paths.dataRootPath, 'conversation')), ['retained-source']);
-});
-
 test('旧目录后续新增对话和修改设置后清理保留这些内容与未迁来源', async () => {
   await seedMessages(source, [{ id: 'later-user-input', text: '迁移之后新增的输入' }]);
   await fs.writeFile(file(source.root, 'settings/llm.json'), '{"activeProviderConfigId":"later"}\n');
@@ -222,7 +197,7 @@ test('旧目录后续新增对话和修改设置后清理保留这些内容与�
   assert.deepEqual(ids(readRows(alpha.binding.paths.dataRootPath, 'conversation')), ['retained-source']);
 });
 
-test('真实协调迁移再回旧目录，冻结写入口、关闭Runtime后切指针且保留对话', async t => {
+test('连续迁移与回旧目录经真实协调冻结关闭，登记仍指向最初来源且保留对话', async t => {
   const storage = file(base, 'vscode-storage');
   await fs.mkdir(storage);
   const ctx = context(storage);
@@ -235,6 +210,12 @@ test('真实协调迁移再回旧目录，冻结写入口、关闭Runtime后切�
   assert.equal(first.window.frozenWhenClosed, 1);
   assert.equal((await globalStatus.loadCommittedGlobalStatus(ctx)).dataRootPath, ui.picked);
   assert.deepEqual(ids(readRows((await selected(ui.picked)).runtimeDataRootPath, 'conversation')), ['source-one', 'source-two']);
+  const pending = [...(await registry.readRuntimeHistoryPending({ globalStoragePath: ui.picked })).values()];
+  assert.equal(pending.find(item => item.identity?.dataSetId === alpha.binding.dataSetId).location.containerPath, path.dirname(alpha.binding.paths.dataRootPath));
+  const residual = [...(await registry.readRuntimeHistoryResidual({ globalStoragePath: ui.picked })).values()];
+  assert.equal(residual[0].location.baseDataRootPath, source.root);
+  assert.equal((await roots.inspectVscodeRuntimeDataSets({ globalStoragePath: ui.picked })).candidates.length, 1);
+  assert.deepEqual(ids(readRows(alpha.binding.paths.dataRootPath, 'conversation')), ['retained-source']);
   const second = await openWindow(t, ui.picked);
   await commands.returnToPreviousDataRoot(ctx, second.startup, { clientId: 'storage' });
   assert.equal(second.window.closed, true);

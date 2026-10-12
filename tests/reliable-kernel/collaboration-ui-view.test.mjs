@@ -4,6 +4,9 @@ import os from 'node:os';
 import path from 'node:path';
 import test, { before, after, afterEach } from 'node:test';
 import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { fileURLToPath } from 'node:url';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
 const require = createRequire(import.meta.url);
@@ -278,8 +281,11 @@ test('real SQLite keyset advances through one foreign-only scan before scoped me
   await database.transaction([conversation('page-self'), conversation('page-peer'), conversation('page-other')]);
   const body = await cas.ingest(database, '真实的分页协作正文', 'text/vnd.limcode.collaboration-message');
   await database.transaction(envelope('page-own-old', 'page-self', 'page-peer', body.id));
-  await database.transaction(Array.from({ length: bounds.CLIENT_COLLABORATION_SCAN_MAX_ROWS }, (_, index) =>
-    envelope(`page-foreign-${index}`, 'page-other', 'page-peer', body.id)).flat());
+  // Keep one complete envelope and the real 4096-row global SQL window. Seed the unrelated
+  // background in one external transaction so setup emits no thousands of unused feed changes.
+  await database.transaction(envelope('page-foreign-0', 'page-other', 'page-peer', body.id));
+  await promisify(execFile)(process.execPath, [fileURLToPath(new URL('./collaboration-history-seed.mjs', import.meta.url)),
+    root.binding.paths.databasePath, body.id, String(bounds.CLIENT_COLLABORATION_SCAN_MAX_ROWS - 1), NOW]);
   await database.transaction(envelope('page-own-new', 'page-peer', 'page-self', body.id));
   await database.transaction([update('RuntimeDelivery', 'page-own-old-delivery', { state: 'failed', failure_reason: 'retry', updated_at: NOW }),
     row('RuntimeDelivery', { id: 'page-own-old-retry', inbox_item_id: 'page-own-old-inbox', target_conversation_id: 'page-peer', target_turn_id: null,

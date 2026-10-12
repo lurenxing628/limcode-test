@@ -21,6 +21,7 @@ export const repo = domain => kernel.DOMAIN_REPOSITORIES.domain(domain);
 export const schemas = load('schema/domainManifest.js').RUNTIME_DOMAIN_SCHEMAS;
 const schemaByKey = new Map(schemas.map(schema => [schema.key, schema]));
 const roots = load('vscodeRootAuthority.js');
+const schema = load('databaseSchema.js');
 const histories = load('runtimeHistoryRegistry.js');
 const ledgerModule = load('runtimeDataSetMergeLedger.js');
 const mergeModule = load('runtimeDataSetMerge.js');
@@ -35,7 +36,15 @@ export const loosePath = (binding, metadata) => path.join(binding.paths.casRootP
 async function initialize(scopeRoot, id) {
   await fs.mkdir(scopeRoot, { recursive: true });
   const authority = new kernel.RootAuthority(() => roots.resolveVscodeRuntimeDataRoot({ globalStoragePath: scopeRoot }));
-  const binding = await kernel.initializeEmptyRuntimeRoot(authority);
+  // Empty fixture roots need the production DDL; a seed worker adds no exercised behavior here.
+  const binding = await authority.initializeEmptyRoot(async value => {
+    await fs.mkdir(value.paths.casRootPath, { recursive: true });
+    const database = new Database(value.paths.databasePath);
+    try {
+      schema.configureWriterConnection(database);
+      schema.initializeCurrentSchema(database, value);
+    } finally { database.close(); }
+  });
   return { scopeRoot, id, authority, binding };
 }
 

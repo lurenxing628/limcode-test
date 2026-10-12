@@ -1,3 +1,4 @@
+import { createOwnershipScope } from './ownership-scope-fixture.mjs';
 // Focused production ownership boundary; old review matrices are absent.
 import assert from 'node:assert/strict';
 
@@ -35,9 +36,7 @@ function loadWithFileSystem(fileName, fileSystem, claimPrimitives) {
 }
 
 async function fixture(t) {
-  const temporary = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-owner-release-'));
-  const authority = new kernel.RootAuthority(() => path.join(temporary, 'runtime'));
-  const binding = await kernel.initializeEmptyRuntimeRoot(authority);
+  const { outer: temporary, binding } = await createOwnershipScope('release');
   const managers = [];
   let failRelease = false;
   let holdPublication;
