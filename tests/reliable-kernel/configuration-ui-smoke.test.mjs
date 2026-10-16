@@ -352,6 +352,23 @@ test('浏览、新建和添加模型不激活；目标绑定编辑与迟到确�
   channel.openNewModel(); channel.editingConfigId = 'A'; channel.confirmNewModel('B-three');
   assert.equal(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').model, 'B-one');
   assert.ok(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').models.some(item => item.id === 'B-three'));
+  f.global.requestModelsForActiveConfig('B');
+  const modelRead = f.last(T.LlmProviderModelsGet);
+  assert.equal(modelRead.payload.config.id, 'B');
+  f.global.updateActiveLlmProviderConfig({ apiKey: 'sk-active-a' }, 'A');
+  assert.equal(f.global.fetchedModelsDialog.open, true, '修改默认渠道不关闭非默认渠道的获取弹窗');
+  f.global.applyLlmProviderModelsSnapshot({
+    configId: 'B', provider: 'openai-responses', baseUrl: 'https://api.openai.com/v1',
+    models: [{ id: 'B-fetched', name: 'Fetched' }]
+  }, modelRead.id);
+  assert.equal(f.global.fetchedModelsDialog.loading, false);
+  assert.deepEqual(f.global.fetchedModelsDialog.models.map(item => item.id), ['B-fetched']);
+  f.global.addFetchedModelsToConfig(f.global.fetchedModelsDialog.models);
+  assert.equal(f.global.llm.activeProviderConfigId, 'A');
+  assert.ok(f.global.llmProviderConfigs.configs.find(item => item.id === 'B').models.some(item => item.id === 'B-fetched'));
+  f.global.requestModelsForActiveConfig('B');
+  f.global.updateActiveLlmProviderConfig({ apiKey: 'sk-edited-b' }, 'B');
+  assert.equal(f.global.fetchedModelsDialog.open, false, '修改目标渠道凭证会关闭当前获取弹窗');
   const editor = f.mount('ChannelEditor', { providerConfigId: 'B' }).view;
   editor.updateGenerationConfig({ temperature: 0.2 });
   await f.clock.advance(400);

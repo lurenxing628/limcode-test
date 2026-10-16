@@ -1967,16 +1967,27 @@ export async function listLlmProviderModels(config: LlmProviderConfigRecord, opt
 
   const unified = await importUnifiedLlmProvider();
   const headers = mergeHeaders(await resolveMaybe(options.headers), settings.headers);
+  const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
+  const proxyFetch = proxy ? createProxyFetch(proxy) : undefined;
   if (settings.provider === 'claude') {
-    const proxy = normalizeOptionalString(await resolveMaybe(options.proxy));
-    return discoverAnthropicModels(settings, proxy ? createProxyFetch(proxy) : fetch, headers);
+    return discoverAnthropicModels(settings, proxyFetch ?? fetch, headers);
   }
-  const result = await unified.listAvailableModels({
+  const requestHeaders = settings.provider === 'gemini' && settings.apiKey
+    ? mergeHeaders({ 'x-goog-api-key': settings.apiKey }, headers)
+    : headers;
+  const fetchCatalog = (baseUrl: string) => unified.listAvailableModels({
     provider: settings.provider,
     apiKey: settings.apiKey,
-    baseUrl: settings.baseUrl,
-    ...(headers ? { headers } : {}),
+    baseUrl,
+    ...(proxyFetch ? { fetch: proxyFetch } : {}),
+    ...(requestHeaders ? { headers: requestHeaders } : {}),
     outputFormat: 'unified'
+  });
+  const result = await fetchCatalog(settings.baseUrl).catch(async (error) => {
+    if (settings.provider === 'gemini' && /\/v1\/?$/i.test(settings.baseUrl)) {
+      return fetchCatalog(settings.baseUrl.replace(/\/v1\/?$/i, '/v1beta'));
+    }
+    throw error;
   });
 
   return result.models.map(modelCatalogEntryToRecord);

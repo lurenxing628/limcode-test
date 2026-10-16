@@ -1165,7 +1165,7 @@ export class VscodeReliableKernelCommandRouter {
     try {
       model = await this.product.providerRegistry.probeOpenAICompatibleThinking(payload.config);
     } catch (error) {
-      this.postRequestError(webview, BridgeMessageType.LlmProviderModelsGet, error instanceof Error ? error.message : String(error), correlationId);
+      this.postRequestError(webview, BridgeMessageType.LlmProviderModelsGet, errorMessage(error), correlationId);
       return;
     }
     this.post(webview, {
@@ -2544,7 +2544,14 @@ function attachmentExtension(mimeType: string): string {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: unknown }).cause;
+  const causeText = cause instanceof Error ? cause.message : typeof cause === 'string' ? cause : '';
+  const code = cause && typeof cause === 'object' && 'code' in cause && typeof (cause as { code?: unknown }).code === 'string'
+    ? (cause as { code: string }).code
+    : '';
+  const detail = [causeText.trim(), code && !causeText.includes(code) ? code : ''].filter(Boolean).join(' ');
+  return detail && !error.message.includes(detail) ? `${error.message}: ${detail}` : error.message;
 }
 
 function isFileNotFoundError(error: unknown): boolean {
