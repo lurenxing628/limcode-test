@@ -1864,9 +1864,11 @@ export interface ModelResponseMetrics {
   recent: ModelResponseMetric[];
   ttftTotalMs: number;
   ttftCount: number;
-  /** Output tokens and output time summed over the responses that reported both. */
+  /** Output tokens and observed streaming time for responses with known usage and request time. */
   speedOutputTokens: number;
   speedOutputDurationMs: number;
+  /** Request time (including first-output wait) for the same responses; excludes tool waits. */
+  speedTotalDurationMs?: number;
 }
 
 export interface MessageRecord {

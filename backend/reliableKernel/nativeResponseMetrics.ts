@@ -15,7 +15,7 @@ const MAX_RESPONSE_ID_LENGTH = 512;
 const TIMING_FIELDS = new Set(['startedAt', 'completedAt', 'firstOutputAt', 'ttftMs', 'outputDurationMs']);
 const METRIC_FIELDS = new Set([...TIMING_FIELDS, 'responseId', 'outputTokens', 'reasoningTokens']);
 const METRICS_FIELDS = new Set([
-  'responseCount', 'first', 'recent', 'ttftTotalMs', 'ttftCount', 'speedOutputTokens', 'speedOutputDurationMs'
+  'responseCount', 'first', 'recent', 'ttftTotalMs', 'ttftCount', 'speedOutputTokens', 'speedOutputDurationMs', 'speedTotalDurationMs'
 ]);
 
 /** Validates timing attached to a native response-end event; first output fields come together. */
@@ -51,7 +51,11 @@ export function foldNativeResponseMetrics(
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(reasoningTokens === undefined ? {} : { reasoningTokens })
   };
-  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined && metric.outputDurationMs > 0;
+  const durationMs = Math.max(0, metric.completedAt - metric.startedAt);
+  const timed = metric.outputTokens !== undefined && durationMs > 0;
+  // An existing aggregate without this measurement cannot supply its earlier request time.
+  const speedTotalDurationMs = previous && previous.speedTotalDurationMs === undefined ? undefined
+    : (previous?.speedTotalDurationMs ?? 0) + (timed ? durationMs : 0);
   return {
     responseCount: (previous?.responseCount ?? 0) + 1,
     first: previous?.first ?? metric,
@@ -59,7 +63,8 @@ export function foldNativeResponseMetrics(
     ttftTotalMs: (previous?.ttftTotalMs ?? 0) + (metric.ttftMs ?? 0),
     ttftCount: (previous?.ttftCount ?? 0) + (metric.ttftMs === undefined ? 0 : 1),
     speedOutputTokens: (previous?.speedOutputTokens ?? 0) + (timed ? metric.outputTokens! : 0),
-    speedOutputDurationMs: (previous?.speedOutputDurationMs ?? 0) + (timed ? metric.outputDurationMs! : 0)
+    speedOutputDurationMs: (previous?.speedOutputDurationMs ?? 0) + (timed ? metric.outputDurationMs ?? 0 : 0),
+    ...(speedTotalDurationMs === undefined ? {} : { speedTotalDurationMs })
   };
 }
 
@@ -82,7 +87,10 @@ export function parseNativeResponseMetrics(
     ttftTotalMs: requireInteger(record.ttftTotalMs, `${label}.ttftTotalMs`, 0),
     ttftCount,
     speedOutputTokens: requireInteger(record.speedOutputTokens, `${label}.speedOutputTokens`, 0),
-    speedOutputDurationMs: requireInteger(record.speedOutputDurationMs, `${label}.speedOutputDurationMs`, 0)
+    speedOutputDurationMs: requireInteger(record.speedOutputDurationMs, `${label}.speedOutputDurationMs`, 0),
+    ...(record.speedTotalDurationMs === undefined ? {} : {
+      speedTotalDurationMs: requireInteger(record.speedTotalDurationMs, `${label}.speedTotalDurationMs`, 0)
+    })
   };
 }
 

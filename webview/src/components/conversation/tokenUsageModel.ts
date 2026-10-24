@@ -16,7 +16,7 @@ const CACHED_TOKEN_KEYS = ['cachedContentTokenCount', 'cached_content_token_coun
 export interface NormalizedTokenUsage {
   total?: number;
   input?: number;
-  /** 模型输出 token，优先按 total - input 计算，因此会包含思考/推理 token。 */
+  /** 模型输出 token（含思考），总量差值必须与明确报告的输出计数一致。 */
   output?: number;
   reasoning?: number;
   cached?: number;
@@ -191,11 +191,13 @@ function outputTokensIncludingReasoning(
   // authoritative even when a raw total is absent or inconsistent. Reasoning alone is only a
   // subset of native output: it cannot prove a complete output bill.
   if (nativeChainBilling && rawOutput !== undefined) return rawOutput;
+  const explicitOutput = sumDefined([rawOutput, reasoning]);
   if (total !== undefined && input !== undefined) {
-    return Math.max(0, total - input);
+    const derived = Math.max(0, total - input);
+    // Totals may include other billed inputs. They cannot enlarge the explicit output count.
+    if (rawOutput === undefined || derived === rawOutput || derived === explicitOutput) return derived;
   }
-  // Non-native Gemini-style candidates exclude thinking unless the Provider supplied a total.
-  return nativeChainBilling ? undefined : sumDefined([rawOutput, reasoning]);
+  return nativeChainBilling ? undefined : explicitOutput;
 }
 
 export function formatTokenNumber(value: number): string {
