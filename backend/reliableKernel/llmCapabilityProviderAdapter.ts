@@ -2488,19 +2488,6 @@ const FORGED_DELIVERY_DROPPED_EVENTS: ReadonlySet<string> = new Set([
   LlmEventType.OutputItemDone
 ]);
 
-/** Where the first line opening with a Runtime Delivery header starts (at its preceding newline), or -1. */
-function forgedRuntimeDeliveryIndex(text: string): number {
-  let lineStart = 0;
-  while (lineStart <= text.length) {
-    const line = text.slice(lineStart);
-    if (RUNTIME_DELIVERY_HEADER_OPENINGS.some(opening => line.startsWith(opening))) return Math.max(0, lineStart - 1);
-    const next = text.indexOf('\n', lineStart);
-    if (next < 0) return -1;
-    lineStart = next + 1;
-  }
-  return -1;
-}
-
 interface ForgedRuntimeDeliveryCutter {
   readonly cut: boolean;
   consume(value: string): string;
@@ -2510,40 +2497,61 @@ interface ForgedRuntimeDeliveryCutter {
 
 /**
  * Gemini sometimes goes on after its reply by writing a Runtime Delivery itself, with an invented
- * result. Visible text stops at that line; a tail that may still become one is held until it cannot.
+ * result. Visible text stops at a line opening with a delivery header; a line that may still become
+ * one is held, with its preceding newline, until it cannot. Lines inside a fenced code block are the
+ * model quoting the format, never cut.
  */
 function createForgedRuntimeDeliveryCutter(): ForgedRuntimeDeliveryCutter {
-  // pending 是还可能长成投递标题的最后一行（连同它前面的换行）；replyStart 表示 pending 从回复开头算起。
-  let pending = '';
-  let replyStart = true;
+  let line = '';
+  let held = '';
+  let candidate = true;
+  let fence: string | undefined;
   let cut = false;
   return {
     get cut() { return cut; },
     consume(value: string): string {
       if (cut || !value) return '';
-      const text = pending + value;
-      const index = forgedRuntimeDeliveryIndex(replyStart ? text : `\u0000${text}`);
-      if (index >= 0) {
-        cut = true;
-        pending = '';
-        return text.slice(0, Math.max(0, replyStart ? index : index - 1)).trimEnd();
+      let out = '';
+      for (const char of value) {
+        if (char === '\n') {
+          const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+          if (marker && (fence === undefined || (marker[0] === fence[0] && marker.length >= fence.length))) {
+            fence = fence === undefined ? marker : undefined;
+          }
+          out += held;
+          held = '';
+          line = '';
+          candidate = fence === undefined;
+          if (candidate) held = char;
+          else out += char;
+          continue;
+        }
+        line += char;
+        if (!candidate) {
+          out += char;
+          continue;
+        }
+        held += char;
+        if (RUNTIME_DELIVERY_HEADER_OPENINGS.some(opening => line.startsWith(opening))) {
+          cut = true;
+          held = '';
+          return out.trimEnd();
+        }
+        if (!RUNTIME_DELIVERY_HEADER_OPENINGS.some(opening => opening.startsWith(line))) {
+          candidate = false;
+          out += held;
+          held = '';
+        }
       }
-      const newline = text.lastIndexOf('\n');
-      const lastLine = text.slice(newline + 1);
-      const mayBecomeHeader = (newline >= 0 || replyStart)
-        && RUNTIME_DELIVERY_HEADER_OPENINGS.some(opening => opening.startsWith(lastLine));
-      const held = mayBecomeHeader ? Math.max(0, newline) : text.length;
-      pending = text.slice(held);
-      if (held > 0) replyStart = false;
-      return text.slice(0, held);
+      return out;
     },
     flush(): string {
-      const value = cut ? '' : pending;
-      pending = '';
+      const value = cut ? '' : held;
+      held = '';
       return value;
     },
     discard(): void {
-      pending = '';
+      held = '';
     }
   };
 }
@@ -2554,24 +2562,30 @@ function createForgedRuntimeDeliveryCutter(): ForgedRuntimeDeliveryCutter {
  * are already in the history.
  */
 function cutForgedRuntimeDeliveries(content: MessageContent, mode: 'drop_following' | 'text_only'): MessageContent {
-  let cut = false;
+  // 可见文本 part 依次接成一段正文判断，代码块的开合可以跨 part。
+  const cutter = createForgedRuntimeDeliveryCutter();
   const parts: MessageContent['parts'] = [];
   for (const part of content.parts) {
     const text = 'text' in part && part.thought !== true && typeof part.text === 'string' ? part.text : undefined;
-    if (cut) {
+    if (cutter.cut) {
       if (mode === 'text_only' && text === undefined) parts.push(part);
       continue;
     }
-    const index = text === undefined ? -1 : forgedRuntimeDeliveryIndex(text);
-    if (index < 0) {
+    if (text === undefined) {
       parts.push(part);
       continue;
     }
-    cut = true;
-    const kept = text!.slice(0, index).trimEnd();
-    if (kept || ('thoughtSignature' in part && part.thoughtSignature)) parts.push({ ...part, text: kept } as MessageContent['parts'][number]);
+    const visible = cutter.consume(text);
+    if (!cutter.cut) {
+      parts.push(part);
+      cutter.flush();
+      continue;
+    }
+    if (visible || ('thoughtSignature' in part && part.thoughtSignature)) {
+      parts.push({ ...part, text: visible } as MessageContent['parts'][number]);
+    }
   }
-  if (!cut) return content;
+  if (!cutter.cut) return content;
   return { ...content, parts: parts.length ? parts : [{ text: '' }] };
 }
 
