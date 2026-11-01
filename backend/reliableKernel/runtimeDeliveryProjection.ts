@@ -430,6 +430,18 @@ const COLLABORATION_DELIVERY_TEXT: Record<CollaborationDeliveryMode, { label: st
 };
 
 /**
+ * How each header written by runtimeDeliveryHeader begins. Only the kernel writes one, in a user-role
+ * slot; a model line opening with one is a forged delivery, never a result.
+ */
+export const RUNTIME_DELIVERY_HEADER_OPENINGS: readonly string[] = [
+  '[Background command result:',
+  '[Child task failure:',
+  '[Child task partial result',
+  '[Child task final result:',
+  ...Object.values(COLLABORATION_DELIVERY_TEXT).map(text => `[Collaboration ${text.label} from `)
+];
+
+/**
  * Fixed kernel header of a model-facing Runtime Delivery. A collaboration delivery travels in the
  * user-role transport slot, so its header states plainly that it is not this conversation's user.
  */
