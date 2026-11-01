@@ -38,7 +38,7 @@ export interface WebviewClientMeta {
   planProposalId?: string;
 }
 
-export const GLOBAL_SETTINGS_SECTIONS = ['common', 'network', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'attachments', 'mcpServers', 'debugCapture'] as const;
+export const GLOBAL_SETTINGS_SECTIONS = ['common', 'network', 'llm', 'llmProviderConfigs', 'llmCompression', 'llmCompressionConfigs', 'checkpointMaintenance', 'appearance', 'taskCompletionSound', 'attachments', 'mcpServers', 'debugCapture'] as const;
 export type GlobalSettingsSection = typeof GLOBAL_SETTINGS_SECTIONS[number];
 
 export const CONVERSATION_SETTINGS_SECTIONS = ['common', 'llm'] as const;
@@ -55,6 +55,7 @@ export enum BridgeMessageType {
   ShowInfo = 'vscode.showInfo',
   Error = 'bridge.error',
   InteractionResult = 'interaction.result',
+  TaskCompleted = 'task.completed',
   TurnStart = 'turn.start',
   TurnEnqueue = 'turn.enqueue',
   TurnInputResult = 'turn.input.result',
@@ -3127,7 +3128,18 @@ export interface AppearanceSettingsRecord {
   /** AI 已输出工具调用、工具正在排队或执行时显示的文字。 */
   streamingTextToolExecuting: string;
 }
-export type GlobalSettingsSectionValue = GlobalSettingsRecord | NetworkSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord | DebugCaptureSettings;
+export interface TaskCompletionSoundSettingsRecord {
+  enabled: boolean;
+  volume: number;
+  /** 空值使用内置音效；导入的短音频随设置保存，播放时复用。 */
+  audioDataUrl: string;
+  audioName: string;
+}
+export interface TaskCompletedPayload {
+  conversationId: string;
+  turnId: string;
+}
+export type GlobalSettingsSectionValue = GlobalSettingsRecord | NetworkSettingsRecord | LlmSettingsRecord | LlmProviderConfigsRecord | LlmCompressionSettingsRecord | LlmCompressionConfigsRecord | CheckpointMaintenanceSettingsRecord | AppearanceSettingsRecord | TaskCompletionSoundSettingsRecord | AttachmentSettingsRecord | McpServersSettingsRecord | DebugCaptureSettings;
 export interface GlobalSettingsGetPayload {
   section: GlobalSettingsSection;
 }
@@ -3424,6 +3436,7 @@ export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.WorkspaceInfo, WorkspaceInfo>
   | BridgeEnvelope<BridgeMessageType.Error, BridgeErrorPayload>
   | BridgeEnvelope<BridgeMessageType.InteractionResult, InteractionResultPayload>
+  | BridgeEnvelope<BridgeMessageType.TaskCompleted, TaskCompletedPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInputResult, TurnInputResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnInterruptResult, TurnInterruptResultPayload>
   | BridgeEnvelope<BridgeMessageType.TurnSteerResult, TurnSteerResultPayload>

@@ -15,6 +15,8 @@ import InputPanel from '/src/components/ui/InputPanel.vue';
 import { useGlobalSettingsStore } from '/src/stores/useGlobalSettingsStore';
 import { useClientStateStore } from '/src/stores/useClientStateStore';
 import { useModelProfileStore } from '/src/stores/useModelProfileStore';
+import { useBridgeBootstrap } from '/src/composables/useBridgeBootstrap';
+import builtInSound from '/src/assets/task-complete.wav';
 import { GLOBAL_SETTINGS_SECTIONS, createDefaultLlmCompressionConfig } from '@shared/protocol';
 import '/src/theme/tokens.css'; import '/src/theme/base.css';
 import '/src/theme/motion/dialog.css'; import '/src/theme/motion/dropdown.css'; import '/src/theme/motion/collapse.css';
@@ -22,6 +24,7 @@ const pinia = createPinia(), mode = ref('settings'), confirmed = [];
 const inputProps = reactive({ open: true, title: '名称校验', label: '名称', initialValue: 'duplicate', required: true,
   validate: value => value === 'duplicate' ? '名称已存在' : '' });
 const app = createApp({ setup: () => () => mode.value === 'settings' ? h(Panel)
+  : mode.value === 'soundChat' ? h(SoundChat)
   : mode.value === 'model' ? h(ModelProfileScopeEditor, { scopeKind: 'agent', scopeId: 'worker', title: 'Agent 默认 LLM' }) : h(InputPanel, {
   ...inputProps, onConfirm: value => confirmed.push(value), onCancel: () => inputProps.open = false }) });
 app.use(pinia);
@@ -39,7 +42,8 @@ for (const section of GLOBAL_SETTINGS_SECTIONS) settings.applySnapshot({ section
 client.toolDefinitions = [{ id: 'edit', name: 'edit', description: '修改文件内容', parameters: {}, execution: 'immediate', source: { kind: 'builtin' } }];
 client.toolPolicies = [{ id: 'policy', name: '测试策略', preset: 'custom', allowedTools: ['edit'], toolConfigs: { edit: { autoSubmitResult: false, config: {} } } }];
 client.toolPolicyScopeLinks = [{ id: 'link', scopeKind: 'global', toolPolicyId: 'policy', role: 'active', createdAt: 1, updatedAt: 1 }];
-window.fixture = { settings, client, mode, inputProps, confirmed, models: useModelProfileStore(pinia) };
+const SoundChat = { setup() { useBridgeBootstrap(); return () => h('div', 'sound chat'); } };
+window.fixture = { settings, client, mode, inputProps, confirmed, builtInSound, models: useModelProfileStore(pinia) };
 app.mount('#app');
 `;
 const theme = `:root {
@@ -90,6 +94,84 @@ async function pageFor(t) {
 async function shot(page, name) {
   if (screenshotDir) await page.screenshot({ path: path.join(screenshotDir, name + '.png'), animations: 'disabled' });
 }
+
+test('完成提示音可试听、导入、调音量、保存和恢复内置音效', async t => {
+  const p = await pageFor(t);
+  await p.getByRole('button', { name: '其他', exact: true }).click();
+  const toggle = p.getByRole('checkbox', { name: '任务完成提示音', exact: true });
+  assert.equal(await toggle.isChecked(), false);
+  await p.evaluate(() => {
+    const play = HTMLMediaElement.prototype.play;
+    HTMLMediaElement.prototype.play = function() { window.previewPlayer = this; return play.call(this); };
+  });
+  await p.getByRole('button', { name: '试听', exact: true }).click();
+  await p.waitForFunction(() => window.previewPlayer?.readyState >= 2);
+  assert.equal(await p.getByRole('alert').count(), 0, '内置 WAV 在真实浏览器中可以解码播放');
+  await toggle.check();
+  await p.getByRole('spinbutton', { name: '提示音音量', exact: true }).fill('70');
+  const bytes = await p.evaluate(async () => Array.from(new Uint8Array(await (await fetch(window.fixture.builtInSound)).arrayBuffer())));
+  await p.getByLabel('选择提示音文件', { exact: true }).setInputFiles({ name: '任务完成.wav', mimeType: 'audio/wav', buffer: Buffer.from(bytes) });
+  await p.getByText('当前音效：任务完成.wav。', { exact: false }).waitFor();
+  await p.getByRole('button', { name: '保存其他设置', exact: true }).click();
+  await p.waitForFunction(() => window.fixtureMessages.some(m => m.type === 'settings.global.update' && m.payload.section === 'taskCompletionSound'));
+  const saved = await p.evaluate(() => window.fixtureMessages.find(m => m.type === 'settings.global.update' && m.payload.section === 'taskCompletionSound').payload);
+  assert.equal(saved.settings.enabled, true);
+  assert.equal(saved.settings.volume, 70);
+  assert.equal(saved.settings.audioName, '任务完成.wav');
+  assert.match(saved.settings.audioDataUrl, /^data:audio\/wav;base64,/);
+  assert.equal(saved.expectedRevision, 'fixture:taskCompletionSound');
+  await shot(p, 'task-completion-sound');
+  await p.getByRole('button', { name: '恢复内置音效', exact: true }).click();
+  assert.equal(await p.evaluate(() => window.fixture.settings.taskCompletionSound.audioDataUrl), '');
+  assert.equal(await p.getByRole('spinbutton', { name: '提示音音量', exact: true }).inputValue(), '70');
+  await p.getByLabel('选择提示音文件', { exact: true }).setInputFiles({ name: 'too-large.wav', mimeType: 'audio/wav', buffer: Buffer.alloc(2 * 1024 * 1024 + 1) });
+  assert.match(await p.getByRole('alert').textContent(), /2 MB/);
+});
+
+test('真实桥接只在对应主对话收到新完成通知时播放，播放器与音频复用', async t => {
+  const p = await pageFor(t);
+  const result = await p.evaluate(async () => {
+    window.soundPlayers = [];
+    window.Audio = class {
+      constructor() { this.plays = 0; this.pauses = 0; this.sources = 0; window.soundPlayers.push(this); }
+      set src(value) { this.source = value; this.sources++; }
+      pause() { this.pauses++; }
+      play() { this.plays++; return Promise.resolve(); }
+    };
+    const send = (type, payload) => window.dispatchEvent(new MessageEvent('message', { data: { id: crypto.randomUUID(), type, channel: 'control', payload } }));
+    const hello = kind => send('bridge.hello', { meta: { kind, conversationId: 'conversation' } });
+    const done = (turnId, conversationId = 'conversation') => send('task.completed', { turnId, conversationId });
+    const settings = window.fixture.settings;
+    window.fixture.mode.value = 'soundChat';
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    hello('mainPanel');
+    done('disabled');
+    const defaultOff = window.soundPlayers.length === 0;
+    settings.taskCompletionSound.enabled = true;
+    done('other', 'other-conversation');
+    const scoped = window.soundPlayers.length === 0;
+    done('one'); done('two');
+    const reused = window.soundPlayers.length === 1 && window.soundPlayers[0].plays === 2 && window.soundPlayers[0].sources === 1;
+    settings.taskCompletionSound.audioDataUrl = 'data:audio/wav;base64,AAAA';
+    settings.taskCompletionSound.volume = 35;
+    done('three');
+    const imported = window.soundPlayers[0].sources === 2 && window.soundPlayers[0].volume === 0.35;
+    window.fixture.mode.value = 'input';
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    window.fixture.mode.value = 'soundChat';
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    const reopenSilent = window.soundPlayers[0].plays === 3;
+    hello('planDetail'); done('plan');
+    const planSilent = window.soundPlayers[0].plays === 3;
+    hello('mainPanel');
+    settings.taskCompletionSound.enabled = false;
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    done('disabled-again');
+    return { defaultOff, scoped, reused, imported, reopenSilent, planSilent, disabled: window.soundPlayers[0].plays === 3, stops: window.soundPlayers[0].pauses };
+  });
+  assert.deepEqual({ ...result, stops: undefined }, { defaultOff: true, scoped: true, reused: true, imported: true, reopenSilent: true, planSilent: true, disabled: true, stops: undefined });
+  assert.ok(result.stops >= 5, '关闭开关或销毁视图停止播放');
+});
 
 test('Agent 模型可下拉选择并获取，默认显示选中渠道的默认配置', async t => {
   const p = await pageFor(t);

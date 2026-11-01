@@ -1,4 +1,5 @@
 import { emptyConversationContextHandleStateStep } from '../../reliableKernel/conversationContextHandleState';
+import { completedMainTasks } from './taskCompletionSound';
 import { randomUUID } from 'node:crypto';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
@@ -914,6 +915,14 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   private onRuntimeCommit(commit: RuntimeCommitResult): void {
     if (this.disposed) return;
+    if (!commit.observedExternal && commit.changes.some(change => change.domain === 'TurnTermination')) {
+      void completedMainTasks(this.product.application.database, commit).then(completed => {
+        if (this.disposed || this.productClosing) return;
+        for (const payload of completed) this.product.application.webviewFeed.postToConversation(payload.conversationId, {
+          id: randomUUID(), type: BridgeMessageType.TaskCompleted, channel: 'control', payload
+        });
+      }).catch(error => console.warn('[LimCode] 任务完成提示音通知失败。', error));
+    }
     const leaseAcquired = this.interactionLeaseEdges.observe(commit);
     if (leaseAcquired || runtimeCommitNeedsInteractionAttention(commit)) this.scheduleInteractionAttentionRefresh();
     if (!commit.changes.some((change) => [

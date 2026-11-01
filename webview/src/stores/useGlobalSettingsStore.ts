@@ -1,4 +1,5 @@
 import { normalizeHistoryImageSettings } from '@shared/historyImages';
+import { defaultTaskCompletionSoundSettings, normalizeTaskCompletionSoundSettings } from '@shared/taskCompletionSound';
 import { normalizeModelCapabilitySnapshot } from '@shared/modelCapabilities';
 import { describeOpenAICompatibleThinkingProbe, OPENAI_COMPATIBLE_THINKING_PROBE_MAX_REQUESTS } from '@shared/openAICompatibleThinkingProbe';
 import { defineStore } from 'pinia';
@@ -8,6 +9,7 @@ import {
   GLOBAL_SETTINGS_SECTIONS,
   type AttachmentSettingsRecord,
   type AppearanceSettingsRecord,
+  type TaskCompletionSoundSettingsRecord,
   createMessageId,
   DEFAULT_LLM_COMPRESSION_TRIGGER_PERCENT,
   normalizeLlmCompressionBodyTargetTokens,
@@ -103,6 +105,7 @@ interface GlobalSettingsState {
   checkpointMaintenance: CheckpointMaintenanceSettingsRecord;
   /** 外观：自定义流式状态文字。 */
   appearance: AppearanceSettingsRecord;
+  taskCompletionSound: TaskCompletionSoundSettingsRecord;
   /** 附件：控制 base64 小附件托管阈值。 */
   attachments: AttachmentSettingsRecord;
   mcpServers: McpServersSettingsRecord;
@@ -962,6 +965,7 @@ function plainSettingsFromState(state: GlobalSettingsState, section: GlobalSetti
     case 'llmCompressionConfigs': return { configs: state.llmCompressionConfigs.configs.map(toPlainCompressionConfig) };
     case 'checkpointMaintenance': return { ...state.checkpointMaintenance };
     case 'appearance': return { ...state.appearance };
+    case 'taskCompletionSound': return { ...state.taskCompletionSound };
     case 'attachments': return { maxStoredInlineFileMb: state.attachments.maxStoredInlineFileMb };
     case 'mcpServers': return { servers: state.mcpServers.servers.map(toPlainMcpServer) };
     case 'debugCapture': return normalizeDebugCaptureSettings(state.debugCapture);
@@ -978,6 +982,7 @@ function initialSettingsValue(section: GlobalSettingsSection): GlobalSettingsSec
     case 'llmCompressionConfigs': return emptyLlmCompressionConfigs();
     case 'checkpointMaintenance': return emptyCheckpointMaintenance();
     case 'appearance': return emptyAppearance();
+    case 'taskCompletionSound': return defaultTaskCompletionSoundSettings();
     case 'attachments': return emptyAttachments();
     case 'mcpServers': return emptyMcpServers();
     case 'debugCapture': return normalizeDebugCaptureSettings();
@@ -1284,6 +1289,7 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
     llmCompressionConfigs: emptyLlmCompressionConfigs(),
     checkpointMaintenance: emptyCheckpointMaintenance(),
     appearance: emptyAppearance(),
+    taskCompletionSound: defaultTaskCompletionSoundSettings(),
     attachments: emptyAttachments(),
     mcpServers: emptyMcpServers(),
     debugCapture: normalizeDebugCaptureSettings(),
@@ -1578,6 +1584,17 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
           streamingTextWriting: this.appearance.streamingTextWriting,
           streamingTextToolExecuting: this.appearance.streamingTextToolExecuting
         }
+      });
+    },
+    ensureTaskCompletionSound(): void {
+      if (this.loadedSections.taskCompletionSound || this.loadingSettingsSections.taskCompletionSound) return;
+      this.markLoadingSettingSection('taskCompletionSound');
+      bridge.request(BridgeMessageType.GlobalSettingsGet, { section: 'taskCompletionSound' });
+    },
+    saveTaskCompletionSound(): void {
+      this.enqueueSettingsUpdate({
+        section: 'taskCompletionSound',
+        settings: normalizeTaskCompletionSoundSettings(this.taskCompletionSound)
       });
     },
     ensureAttachments(): void {
@@ -2729,6 +2746,8 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
         this.checkpointMaintenance = { ...emptyCheckpointMaintenance(), ...(value as CheckpointMaintenanceSettingsRecord) };
       } else if (section === 'appearance') {
         this.appearance = { ...emptyAppearance(), ...(value as AppearanceSettingsRecord) };
+      } else if (section === 'taskCompletionSound') {
+        this.taskCompletionSound = normalizeTaskCompletionSoundSettings(value as TaskCompletionSoundSettingsRecord);
       } else if (section === 'attachments') {
         this.attachments = { ...emptyAttachments(), ...(value as AttachmentSettingsRecord) };
       } else if (section === 'debugCapture') {

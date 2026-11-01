@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { defaultTaskCompletionSoundSettings, normalizeTaskCompletionSoundSettings } from '../../../shared/taskCompletionSound';
 import { normalizeDebugCaptureSettings, type DebugCaptureSettings } from '../../../shared/debugCapture';
 import type {
   AttachmentSettingsRecord,
@@ -8,7 +9,8 @@ import type {
   GlobalSettingsSectionValue,
   LlmCompressionSettingsRecord,
   LlmSettingsRecord,
-  NetworkSettingsRecord
+  NetworkSettingsRecord,
+  TaskCompletionSoundSettingsRecord
 } from '../../../shared/protocol';
 import { createDefaultLlmCompressionSettings } from '../../../shared/protocol';
 import { ATTACHMENT_SETTINGS_FILE, CHECKPOINT_MAINTENANCE_SETTINGS_FILE, LLM_COMPRESSION_SETTINGS_FILE, LLM_SETTINGS_FILE, STORAGE_VERSION } from './constants';
@@ -47,6 +49,11 @@ const GLOBAL_SETTINGS_SECTION_SPECS: Record<FileBackedGlobalSettingsSection, {
     fileName: 'network.json',
     createDefault: () => ({ userAgent: '' }),
     normalize: (input) => normalizeNetworkSettings(input as Partial<NetworkSettingsRecord> | undefined)
+  },
+  taskCompletionSound: {
+    fileName: 'task-completion-sound.json',
+    createDefault: defaultTaskCompletionSoundSettings,
+    normalize: (input) => normalizeTaskCompletionSoundSettings(input as Partial<TaskCompletionSoundSettingsRecord> | undefined)
   },
   debugCapture: {
     fileName: 'debug-capture.json',
@@ -322,6 +329,11 @@ function isValidGlobalSettingsSectionValue(section: GlobalSettingsSection, value
   if (!record) return false;
   if (section === 'llm') return typeof record.activeProviderConfigId === 'string';
   if (section === 'network') return typeof record.userAgent === 'string';
+  if (section === 'taskCompletionSound') {
+    return typeof record.enabled === 'boolean' && typeof record.volume === 'number'
+      && Number.isFinite(record.volume) && typeof record.audioDataUrl === 'string'
+      && typeof record.audioName === 'string';
+  }
   if (section === 'llmCompression') {
     return Array.isArray(record.providerBindings) && Array.isArray(record.modelBindings)
       && (record.defaultConfigId === undefined || typeof record.defaultConfigId === 'string');

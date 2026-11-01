@@ -234,6 +234,7 @@
         "setting.llmCompression",
         "setting.checkpointMaintenance",
         "setting.appearance",
+        "setting.taskCompletionSound",
         "setting.attachments",
         "setting.debugCapture"
       ]

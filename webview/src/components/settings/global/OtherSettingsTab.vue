@@ -1,13 +1,14 @@
 <script setup lang="ts">
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import DebugCaptureSettings from './DebugCaptureSettings.vue';
+import TaskCompletionSoundSettings from './TaskCompletionSoundSettings.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 import { EXTENSION_USER_AGENT } from '@shared/extensionIdentity';
 
 const settings = useGlobalSettingsStore();
-const { loading: otherLoading, text: otherLoadingText } = useSettingsLoadingText('其他设置', 'global', undefined, { globalSettingsSections: ['common', 'network', 'attachments'] as const });
+const { loading: otherLoading, text: otherLoadingText } = useSettingsLoadingText('其他设置', 'global', undefined, { globalSettingsSections: ['common', 'network', 'attachments', 'taskCompletionSound'] as const });
 
 function inputNumber(event: Event): number {
   const target = event.target as HTMLInputElement | null;
@@ -17,6 +18,7 @@ function inputNumber(event: Event): number {
 function saveOtherSettings(): void {
   settings.saveCommon();
   settings.saveNetwork();
+  settings.saveTaskCompletionSound();
 }
 </script>
 
@@ -31,6 +33,8 @@ function saveOtherSettings(): void {
         <p>除渠道外，其余全局配置暂时统一放在这里。</p>
       </div>
     </header>
+
+    <TaskCompletionSoundSettings />
 
     <label class="global-settings-field">
       <span>网络代理地址（留空则直连；可省略 http://，例如 127.0.0.1:7897）</span>

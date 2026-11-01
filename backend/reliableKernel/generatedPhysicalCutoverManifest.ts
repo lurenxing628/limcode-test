@@ -494,6 +494,11 @@ export const PHYSICAL_CUTOVER_MANIFEST: PhysicalCutoverManifest = Object.freeze(
       "disposition": "preserve-whole"
     },
     {
+      "id": "setting.taskCompletionSound",
+      "relativePath": "task-completion-sound.json",
+      "disposition": "preserve-whole"
+    },
+    {
       "id": "setting.appearance",
       "relativePath": "appearance.json",
       "disposition": "preserve-whole"

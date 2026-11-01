@@ -3563,6 +3563,25 @@
         "unknownFilePolicy": "leave-untouched-unless-indexed"
       },
       {
+        "id": "setting.taskCompletionSound",
+        "logicalDomain": "TaskCompletionSoundSettings",
+        "physicalKind": "settings-section",
+        "pathSource": {
+          "storagePathsProperty": "settingsRootUri",
+          "relativePath": "task-completion-sound.json"
+        },
+        "repository": "GlobalSettingsRepository",
+        "codec": "TaskCompletionSoundSettingsRecord",
+        "disposition": "preserve-whole",
+        "indexPolicy": "not-applicable-single-record",
+        "recordsPolicy": "parse-normalize-and-preserve",
+        "verification": [
+          "json-parse",
+          "semantic-normalization-round-trip"
+        ],
+        "unknownFilePolicy": "leave-untouched-unless-indexed"
+      },
+      {
         "id": "setting.appearance",
         "logicalDomain": "AppearanceSettings",
         "physicalKind": "settings-section",

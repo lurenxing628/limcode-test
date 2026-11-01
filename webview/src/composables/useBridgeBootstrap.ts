@@ -17,6 +17,7 @@ import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { useReliableKernelClientFeedStore } from '@webview/stores/useReliableKernelClientFeedStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useAgentStore } from '@webview/stores/useAgentStore';
+import { playTaskCompletionSound, stopTaskCompletionSound } from '@webview/platform/taskCompletionSound';
 
 function globalSettingsSectionFromScope(scope: BridgeScope | undefined): GlobalSettingsSection | undefined {
   if (scope?.kind !== 'settings' || scope.level !== 'global') return undefined;
@@ -39,6 +40,9 @@ export function useBridgeBootstrap(): void {
   const modelProfiles = useModelProfileStore();
   const agents = useAgentStore();
   const disposers: Array<() => void> = [];
+  disposers.push(watch(() => globalSettings.taskCompletionSound.enabled, enabled => {
+    if (!enabled) stopTaskCompletionSound();
+  }));
   // A retained Webview survives Extension Host restarts. Its one-time bootstrap Ready belonged to
   // the previous Feed client, so remember the Hello client identity and re-declare readiness once
   // when a replacement Host attaches. The reconnect Hello keeps the same id and cannot loop.
@@ -110,6 +114,13 @@ export function useBridgeBootstrap(): void {
       if (session.viewKind === 'chat' || session.viewKind === 'planDetail') {
         globalSettings.ensureAppearance();
       }
+      if (session.viewKind === 'chat') globalSettings.ensureTaskCompletionSound();
+    }),
+    bridge.on(BridgeMessageType.TaskCompleted, (message) => {
+      if (session.viewKind !== 'chat' || message.payload?.conversationId !== session.conversationId
+        || !globalSettings.taskCompletionSound.enabled) return;
+      void playTaskCompletionSound(globalSettings.taskCompletionSound)
+        .catch(error => console.warn('[LimCode] 无法播放任务完成提示音。', error));
     }),
     bridge.on(BridgeMessageType.ConfigurationSnapshot, (message) => {
       if (!message.payload) return;
@@ -237,6 +248,7 @@ export function useBridgeBootstrap(): void {
 
   requestConfiguration();
   onBeforeUnmount(() => {
+    stopTaskCompletionSound();
     reliableFeed.cancelHistoryRequests();
     globalSettings.closeFetchedModelsDialog();
     for (const dispose of disposers) dispose();
