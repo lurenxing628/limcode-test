@@ -162,7 +162,7 @@ export function normalizeTokenUsage(usage: LlmUsageMetadataRecord): NormalizedTo
   const rawOutput = usageNumber(usage, OUTPUT_TOKEN_KEYS);
   const reasoning = usageNumber(usage, REASONING_TOKEN_KEYS);
   const cached = usageNumber(usage, CACHED_TOKEN_KEYS);
-  const explicitTotal = usageNumber(usage, TOTAL_TOKEN_KEYS);
+  const explicitTotal = plausibleTotal(usageNumber(usage, TOTAL_TOKEN_KEYS), input, rawOutput, reasoning);
   const attachmentTokens = normalizeTokenNumber(usage.attachmentTokenEstimate);
   const output = outputTokensIncludingReasoning(input, rawOutput, reasoning, explicitTotal, usage.nativeChainBilling === true);
   const fallbackTotal = explicitTotal === undefined ? sumDefined([input, output]) : undefined;
@@ -178,6 +178,17 @@ export function normalizeTokenUsage(usage: LlmUsageMetadataRecord): NormalizedTo
     ...(usage.nativeChainBilling === true ? { nativeChainBilling: true } : {}),
     ...(sourceEstimated ? { sourceEstimated: true } : {})
   };
+}
+
+/** Some Gemini relays occasionally count the prompt twice in the total; such a total is dropped. */
+function plausibleTotal(
+  total: number | undefined,
+  input: number | undefined,
+  output: number | undefined,
+  reasoning: number | undefined
+): number | undefined {
+  if (total === undefined || input === undefined || output === undefined || input === 0) return total;
+  return total - (input + output + (reasoning ?? 0)) >= input ? undefined : total;
 }
 
 function outputTokensIncludingReasoning(

@@ -323,6 +323,20 @@ test('时间线：停止按钮和旧版执行器原因都显示为手动暂停�
   assert.equal(stop('interrupted', 'Executor observed termination_request at model_request.').detail, 'Executor observed termination_request at model_request.');
 });
 
+test('用量：中转重复计入输入的总量不当作上下文占用', async () => {
+  const { normalizeTokenUsage } = await ui.load('components/conversation/tokenUsageModel.ts');
+  // 实测 Gemini 中转偶发的 total ≈ 2 × prompt + 输出；思考计在 total 里不算重复。
+  const doubled = normalizeTokenUsage({ promptTokenCount: 228887, candidatesTokenCount: 624, thoughtsTokenCount: 30, totalTokenCount: 458601 });
+  assert.equal(doubled.total, 229541); assert.equal(doubled.output, 654); assert.equal(doubled.totalEstimated, true);
+  const normal = normalizeTokenUsage({ promptTokenCount: 220909, candidatesTokenCount: 392, thoughtsTokenCount: 67, totalTokenCount: 221368 });
+  assert.equal(normal.total, 221368); assert.equal(normal.totalEstimated, undefined);
+  const { providerTotalTokens } = require(path.join(compiled, 'backend/reliableKernel/contextTokenEstimator.js'));
+  assert.equal(providerTotalTokens({ promptTokenCount: 228887, candidatesTokenCount: 624, thoughtsTokenCount: 30, totalTokenCount: 458601 }), 229541);
+  assert.equal(providerTotalTokens({ promptTokenCount: 220909, candidatesTokenCount: 392, thoughtsTokenCount: 67, totalTokenCount: 221368 }), 221368);
+  assert.equal(providerTotalTokens({ prompt_tokens: 100, total_tokens: 120 }), 120);
+  assert.equal(providerTotalTokens({ promptTokenCount: 100, candidatesTokenCount: 20 }), 120);
+});
+
 test('时间线：持久Message壳的正文就绪前由同一个overlay占位', async () => {
   const { projectReliableConversation: project } = await ui.load('domain/reliableConversationProjection.ts');
   const input = { conversationId: 'conversation-a', records: nativeShellRecords('streaming'), details: {}, transientModelRequests: nativeTransient([ITEM_LIVE]) };

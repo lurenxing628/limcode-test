@@ -536,10 +536,16 @@ export function providerTotalTokens(value: unknown): number | undefined {
   const usage = usageRecord(value);
   if (usage?.nativeChainBilling === true) return undefined;
   const explicit = firstTokenCount(usage, ['totalTokenCount', 'total_tokens', 'totalTokens']);
-  if (explicit !== undefined) return explicit;
   const input = firstTokenCount(usage, ['promptTokenCount', 'prompt_tokens', 'input_tokens', 'inputTokens']);
   const output = firstTokenCount(usage, ['candidatesTokenCount', 'completion_tokens', 'output_tokens', 'outputTokens']);
-  return input !== undefined && output !== undefined ? input + output : undefined;
+  // Some Gemini relays occasionally report a total that counts the prompt twice (about 2 × prompt
+  // + output). Taken as Context occupancy it doubled the estimate and fired compression far below
+  // the configured threshold. A total exceeding prompt + output + thoughts by a whole prompt is not
+  // occupancy; fall back to the parts.
+  if (input === undefined || output === undefined) return explicit;
+  const thoughts = optionalTokenCount(usage?.thoughtsTokenCount) ?? 0;
+  if (explicit === undefined) return input + output;
+  return input > 0 && explicit - (input + output + thoughts) >= input ? input + output + thoughts : explicit;
 }
 
 /**
