@@ -97,6 +97,7 @@ import {
   withoutGeminiFunctionCallSignatures
 } from '../capabilities/geminiProviderAdaptation';
 import {
+  RUNTIME_DELIVERY_HEADER_OPENINGS,
   decodeRuntimeDeliveryModelEnvelope,
   renderRuntimeDeliveryModelEnvelope
 } from './runtimeDeliveryProjection';
@@ -297,6 +298,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
       let thoughtSignature: string | undefined;
       const runtimeDeliveryEchoText = runtimeProcessCompletionText(llmRequest);
       const runtimeDeliveryEchoFilter = createRuntimeDeliveryEchoFilter(runtimeDeliveryEchoText);
+      const forgedDeliveryCutter = createForgedRuntimeDeliveryCutter();
+      // 原生会话的工具调用边流边登记到 provider 链上，丢掉会让链一直等结果，只截正文。
+      const dropAfterForgedDelivery = !llmRequest.nativeSessionCapabilities;
       const itemThoughtSignatures = new Map<string, string>();
       const observedThoughtSignature = (outputItem: ModelOutputItemReference | undefined, value: unknown): string | undefined => {
         const received = optionalText(value);
@@ -349,6 +353,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         if (terminalError !== undefined) {
           // A prefix held only to identify a possible envelope echo is not durable partial output.
           runtimeDeliveryEchoFilter.discard();
+          forgedDeliveryCutter.discard();
           const partialOutput = partialOutputSnapshot(outputParts);
           if (partialOutput && shouldFreezeFailedPartialOutput(metadata, terminalError)) {
             const partialEvent: Omit<ProviderOutputStreamEvent, 'streamSeq'> = {
@@ -378,12 +383,14 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
         try {
           const enqueue = (output: Omit<ProviderOutputStreamEvent, 'streamSeq'>) => pushEvent(output, event);
           const payload = asRecord(event.payload);
+          // 模型自己写出投递标题之后的思考和工具调用都建立在它编造的结果上，一律不采用。
+          if (forgedDeliveryCutter.cut && dropAfterForgedDelivery && FORGED_DELIVERY_DROPPED_EVENTS.has(event.type)) return;
           switch (event.type) {
           case LlmEventType.Started:
             providerStartedAt = optionalPositiveNumber(payload?.startedAt) ?? providerStartedAt;
             return;
           case LlmEventType.Delta: {
-            const delta = runtimeDeliveryEchoFilter.consume(optionalText(payload?.text));
+            const delta = forgedDeliveryCutter.consume(runtimeDeliveryEchoFilter.consume(optionalText(payload?.text)));
             const outputItem = modelOutputItemFromPayload(payload);
             const partSignature = optionalText(payload?.thoughtSignature);
             text += delta;
@@ -555,7 +562,7 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
             return;
           }
           case LlmEventType.Done: {
-            const bufferedText = runtimeDeliveryEchoFilter.flush();
+            const bufferedText = forgedDeliveryCutter.consume(runtimeDeliveryEchoFilter.flush()) + forgedDeliveryCutter.flush();
             if (bufferedText) {
               text += bufferedText;
               appendTextPart(outputParts, bufferedText, false);
@@ -579,9 +586,9 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
               : normalizePlainJson(payload.usageMetadata, 'LLM usage metadata');
             const authoritativeContent = messageContentFromDonePayload(payload?.content);
             const completedContent = applyThoughtDurations(
-              authoritativeContent
+              cutForgedRuntimeDeliveries(authoritativeContent
                 ? stripRuntimeDeliveryEchoFromMessageContent(authoritativeContent, runtimeDeliveryEchoText)
-                : { role: 'model', parts: outputParts },
+                : { role: 'model', parts: outputParts }, dropAfterForgedDelivery ? 'drop_following' : 'text_only'),
               completedThoughtBlockDurations,
               thoughtTimingObserved ? completedThoughtDurationMs : undefined
             );
@@ -1049,7 +1056,9 @@ function* toLlmStartRequestWork(request: FullProviderRequest, checkCompressionBi
       const historical = decoded.role === 'model' ? reminderHistory?.get(item.segmentId) : undefined;
       if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
       observeOutput(item, [decoded]);
-      contents.push(isolateCrossSourceProviderState(decoded, item.modelSource, request, provider));
+      // 旧回复里已存下的伪造投递不再发回去，免得模型照着历史接着编；同条消息的工具调用照常保留。
+      const visible = decoded.role === 'model' ? cutForgedRuntimeDeliveries(decoded, 'text_only') : decoded;
+      contents.push(isolateCrossSourceProviderState(visible, item.modelSource, request, provider));
       appendAttachmentState(item.segmentId);
       continue;
     }
@@ -2468,6 +2477,116 @@ function createRuntimeDeliveryEchoFilter(expected: string | undefined): RuntimeD
       complete = true;
     }
   };
+}
+
+const FORGED_DELIVERY_DROPPED_EVENTS: ReadonlySet<string> = new Set([
+  LlmEventType.ThoughtDelta,
+  LlmEventType.ThoughtProgress,
+  LlmEventType.ThoughtDone,
+  LlmEventType.ToolCallDelta,
+  LlmEventType.ToolCall,
+  LlmEventType.OutputItemDone
+]);
+
+interface ForgedRuntimeDeliveryCutter {
+  readonly cut: boolean;
+  consume(value: string): string;
+  flush(): string;
+  discard(): void;
+}
+
+/**
+ * Gemini sometimes goes on after its reply by writing a Runtime Delivery itself, with an invented
+ * result. Visible text stops at a line opening with a delivery header; a line that may still become
+ * one is held, with its preceding newline, until it cannot. Lines inside a fenced code block are the
+ * model quoting the format, never cut.
+ */
+function createForgedRuntimeDeliveryCutter(): ForgedRuntimeDeliveryCutter {
+  let line = '';
+  let held = '';
+  let candidate = true;
+  let fence: string | undefined;
+  let cut = false;
+  return {
+    get cut() { return cut; },
+    consume(value: string): string {
+      if (cut || !value) return '';
+      let out = '';
+      for (const char of value) {
+        if (char === '\n') {
+          const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+          if (marker && (fence === undefined || (marker[0] === fence[0] && marker.length >= fence.length))) {
+            fence = fence === undefined ? marker : undefined;
+          }
+          out += held;
+          held = '';
+          line = '';
+          candidate = fence === undefined;
+          if (candidate) held = char;
+          else out += char;
+          continue;
+        }
+        line += char;
+        if (!candidate) {
+          out += char;
+          continue;
+        }
+        held += char;
+        if (RUNTIME_DELIVERY_HEADER_OPENINGS.some(opening => line.startsWith(opening))) {
+          cut = true;
+          held = '';
+          return out.trimEnd();
+        }
+        if (!RUNTIME_DELIVERY_HEADER_OPENINGS.some(opening => opening.startsWith(line))) {
+          candidate = false;
+          out += held;
+          held = '';
+        }
+      }
+      return out;
+    },
+    flush(): string {
+      const value = cut ? '' : held;
+      held = '';
+      return value;
+    },
+    discard(): void {
+      held = '';
+    }
+  };
+}
+
+/**
+ * Drops a forged Runtime Delivery from a model reply. A fresh reply loses everything after it, since
+ * its thoughts and calls rest on the invented result; a stored one keeps its calls, whose results
+ * are already in the history.
+ */
+function cutForgedRuntimeDeliveries(content: MessageContent, mode: 'drop_following' | 'text_only'): MessageContent {
+  // 可见文本 part 依次接成一段正文判断，代码块的开合可以跨 part。
+  const cutter = createForgedRuntimeDeliveryCutter();
+  const parts: MessageContent['parts'] = [];
+  for (const part of content.parts) {
+    const text = 'text' in part && part.thought !== true && typeof part.text === 'string' ? part.text : undefined;
+    if (cutter.cut) {
+      if (mode === 'text_only' && text === undefined) parts.push(part);
+      continue;
+    }
+    if (text === undefined) {
+      parts.push(part);
+      continue;
+    }
+    const visible = cutter.consume(text);
+    if (!cutter.cut) {
+      parts.push(part);
+      cutter.flush();
+      continue;
+    }
+    if (visible || ('thoughtSignature' in part && part.thoughtSignature)) {
+      parts.push({ ...part, text: visible } as MessageContent['parts'][number]);
+    }
+  }
+  if (!cutter.cut) return content;
+  return { ...content, parts: parts.length ? parts : [{ text: '' }] };
 }
 
 function stripRuntimeDeliveryEchoFromMessageContent(
