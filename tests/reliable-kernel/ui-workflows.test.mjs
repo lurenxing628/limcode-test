@@ -636,6 +636,41 @@ test('滚动：内容检查和贴底共用frame，卸载回收观察者与排队
   app.unmount(); assert.equal(frames.size, 0);
 });
 
+test('滚动：触屏拖动上滑视为用户离开底部，不再被拉回', async t => {
+  const sticky = await ui.load('composables/useBottomStickyScroller.ts');
+  const old = Object.fromEntries(['Element', 'HTMLElement', 'ResizeObserver', 'MutationObserver'].map(key => [key, globalThis[key]]));
+  const oldRequest = window.requestAnimationFrame, oldCancel = window.cancelAnimationFrame;
+  t.after(() => { Object.assign(globalThis, old); window.requestAnimationFrame = oldRequest; window.cancelAnimationFrame = oldCancel; });
+  const frames = new Map(); let next = 0;
+  const flush = () => { for (const [id, fn] of [...frames]) { frames.delete(id); fn(); } };
+  class Element { constructor() { this.scrollTop = 500; this.scrollHeight = 1000; this.clientHeight = 500; this.listeners = new Map(); }
+    addEventListener(name, fn) { if (!this.listeners.has(name)) this.listeners.set(name, []); this.listeners.get(name).push(fn); }
+    removeEventListener(name, fn) { this.listeners.set(name, (this.listeners.get(name) ?? []).filter(item => item !== fn)); }
+    dispatchEvent(event) { for (const fn of this.listeners.get(event.type) ?? []) fn(event); return true; }
+    emit(type, init = {}) { this.dispatchEvent({ type, target: this, ...init }); } closest() { return null; } }
+  globalThis.Element = globalThis.HTMLElement = Element;
+  window.requestAnimationFrame = fn => { const id = ++next; frames.set(id, fn); return id; }; window.cancelAnimationFrame = id => frames.delete(id);
+  globalThis.ResizeObserver = class { observe() {} unobserve() {} disconnect() {} };
+  globalThis.MutationObserver = class { observe() {} disconnect() {} };
+  const element = new Element(); let api;
+  const app = ui.renderer.createApp({ setup() { api = sticky.useBottomStickyScroller(ui.vue.ref(element)); return () => null; } }); app.mount({});
+  t.after(() => app.unmount()); await tick(); flush();
+  // 没有手指时，同样的位移仍按布局漂移处理并回到底部。
+  element.scrollTop = 300; element.emit('scroll'); flush();
+  assert.equal(element.scrollTop, 500); assert.equal(api.stickyToBottom.value, true);
+  // 远程触屏只有 pointerdown，开始平移后不再有 touchmove。
+  element.emit('pointerdown', { pointerType: 'touch' });
+  element.scrollTop = 300; element.emit('scroll'); flush();
+  assert.equal(element.scrollTop, 300); assert.equal(api.stickyToBottom.value, false);
+  // 手指按着时跟随新内容向下不算离开；松手后、或鼠标按下时，上移仍按布局漂移处理。
+  api.scrollToBottomNow(); element.emit('touchstart'); element.scrollHeight = 1100; element.scrollTop = 600; element.emit('scroll'); flush();
+  assert.equal(api.stickyToBottom.value, true); element.emit('touchend');
+  element.scrollTop = 300; element.emit('scroll'); flush(); assert.equal(element.scrollTop, 600);
+  element.emit('pointerdown', { pointerType: 'mouse' });
+  element.scrollTop = 300; element.emit('scroll'); flush();
+  assert.equal(element.scrollTop, 600);
+});
+
 test('显示：不可变正文warm projection复用解析，替换详情立即失效', async () => {
   const { projectReliableConversation: project } = await ui.load('domain/reliableConversationProjection.ts');
   const records = nativeShellRecords('terminal'); records.ModelRequest['request-a'].terminal_state = 'completed';

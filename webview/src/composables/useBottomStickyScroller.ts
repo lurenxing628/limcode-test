@@ -33,6 +33,7 @@ const DEFAULT_INTERACTION_THRESHOLD_PX = 96;
 const DEFAULT_REATTACH_THRESHOLD_PX = 1;
 const DEFAULT_REATTACH_DELAY_MS = 800;
 const DEFAULT_SETTLE_MS = 0;
+const TOUCH_END_EVENTS = ['touchend', 'touchcancel', 'pointerup'] as const;
 
 /**
  * 统一管理滚动容器的底部粘滞行为。
@@ -69,6 +70,7 @@ export function useBottomStickyScroller(
   let userDetachedFromBottom = false;
   let reattachLockedUntil = 0;
   let lastMetrics: ScrollMetrics | undefined;
+  let touchActive = false;
 
   function distanceFromBottom(metrics: ScrollMetrics): number {
     return metrics.scrollHeight - metrics.scrollTop - metrics.clientHeight;
@@ -153,6 +155,13 @@ export function useBottomStickyScroller(
     }
 
     const currentMetrics = metricsForElement(element);
+    // Touch and pen scrolling produce no wheel event, and remote touch may deliver no touchmove once
+    // panning starts. An upward scroll while a finger is down is the user's; without this a swipe up
+    // looked like layout drift and was pulled back to the bottom every frame. Downward moves are
+    // left alone: following new content also scrolls down while a finger merely rests on the page.
+    if (touchActive && lastMetrics && currentMetrics.scrollTop < lastMetrics.scrollTop - 1) {
+      dispatchUserScrollIntent(element, { direction: 'toward-start', source: 'touch' });
+    }
     if (userDetachedFromBottom) {
       if (canAutoReattach() && isNearBottomMetrics(currentMetrics, reattachThresholdPx)) {
         stickyToBottom.value = true;
@@ -191,6 +200,19 @@ export function useBottomStickyScroller(
     if (event.deltaY !== 0) dispatchUserScrollIntent(scroller.value, {
       direction: event.deltaY < 0 ? 'toward-start' : 'toward-end', source: 'wheel'
     });
+  }
+
+  function handleTouchStart(): void {
+    touchActive = true;
+  }
+
+  function handlePointerDown(event: PointerEvent): void {
+    // pointercancel arrives as soon as the browser takes over panning, so only pointerup ends contact.
+    touchActive = event.pointerType !== 'mouse';
+  }
+
+  function handleTouchEnd(): void {
+    touchActive = false;
   }
 
   function handleUserScrollIntent(event: Event): void {
@@ -331,6 +353,9 @@ export function useBottomStickyScroller(
     rememberScrollMetrics(element);
     element.addEventListener('scroll', updateStickyFromUserScroll, { passive: true });
     element.addEventListener('wheel', handleWheel, { passive: true });
+    element.addEventListener('touchstart', handleTouchStart, { passive: true });
+    element.addEventListener('pointerdown', handlePointerDown, { passive: true });
+    for (const name of TOUCH_END_EVENTS) element.addEventListener(name, handleTouchEnd, { passive: true });
     element.addEventListener(USER_SCROLL_INTENT_EVENT, handleUserScrollIntent);
     element.addEventListener('pointerdown', primeStickyFromBottomInteraction, { capture: true });
     element.addEventListener('keydown', handleKeyboardInteraction, { capture: true });
@@ -355,6 +380,9 @@ export function useBottomStickyScroller(
     if (observedScroller) {
       observedScroller.removeEventListener('scroll', updateStickyFromUserScroll);
       observedScroller.removeEventListener('wheel', handleWheel);
+      observedScroller.removeEventListener('touchstart', handleTouchStart);
+      observedScroller.removeEventListener('pointerdown', handlePointerDown);
+      for (const name of TOUCH_END_EVENTS) observedScroller.removeEventListener(name, handleTouchEnd);
       observedScroller.removeEventListener(USER_SCROLL_INTENT_EVENT, handleUserScrollIntent);
       observedScroller.removeEventListener('pointerdown', primeStickyFromBottomInteraction, { capture: true });
       observedScroller.removeEventListener('keydown', handleKeyboardInteraction, { capture: true });
@@ -362,6 +390,7 @@ export function useBottomStickyScroller(
     observedScroller = null;
     observedContent = null;
     lastMetrics = undefined;
+    touchActive = false;
 
     resizeObserver?.disconnect();
     resizeObserver = undefined;
