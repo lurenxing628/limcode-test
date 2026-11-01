@@ -18,7 +18,7 @@ import {
 } from '@tabler/icons-vue';
 import { isVisibleTextPart, type LlmUsageMetadataRecord, type MessageContent, type MessageRecord, type RunTerminationRecord } from '@shared/protocol';
 import type { ReliableMessageContentWindowPresentation } from '@webview/domain/reliableMessageContentWindow';
-import { terminationNotice as terminationNoticeText } from './terminationNotice';
+import { isManualStop, terminationNotice as terminationNoticeText } from './terminationNotice';
 import RichContentView from '@webview/components/content/RichContentView.vue';
 import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/ConfirmPanel.vue';
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
@@ -300,6 +300,7 @@ const terminationLabel = computed<string | undefined>(() => {
   if (termination.kind === 'stale') return '已失效';
   if (termination.reasonCode === 'empty_model_result') return '未生成正文';
   if (termination.kind === 'failed') return '执行失败';
+  if (isManualStop(termination)) return '已暂停';
   if (termination.reasonCode === 'run_promoted'
     || termination.reasonCode === 'retry_requested'
     || termination.reasonCode === 'regenerate_requested'
@@ -307,7 +308,7 @@ const terminationLabel = computed<string | undefined>(() => {
   return '已终止';
 });
 
-const terminationClass = computed<string | undefined>(() => props.termination
+const terminationClass = computed<string | undefined>(() => props.termination && !isManualStop(props.termination)
   ? `termination-${props.termination.kind}`
   : undefined);
 const terminatedPartial = computed(() => props.message.role === 'model'

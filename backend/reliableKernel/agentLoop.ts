@@ -3761,7 +3761,7 @@ export class ReliableAgentLoop {
           source: { kind: 'internal', key: `agent-loop:${turnId}:termination-request:${request.id}` },
           turnId,
           terminalStatus: 'interrupted',
-          reason: `Executor observed ${String(request.input_kind)} at ${stage}.`
+          reason: await this.terminationRequestReason(request, stage)
         });
         return true;
       } catch (error) {
@@ -4011,6 +4011,26 @@ export class ReliableAgentLoop {
   private async list(domain: string, where: DomainRow, limit: number): Promise<DomainRow[]> {
     const snapshot = await this.database.snapshot([DOMAIN_REPOSITORIES.domain(domain).list({ where, limit })]);
     return rows(snapshot.snapshot[0]);
+  }
+
+  /**
+   * 普通中断请求沿用发起方写下的原因（如“用户请求中断当前 Turn。”），界面据此区分手动停止和系统停止；
+   * 子 Agent 的 termination_request 以及读不到原因时，仍记录执行器观察到的阶段。
+   */
+  private async terminationRequestReason(request: DomainRow, stage: string): Promise<string> {
+    const observed = `Executor observed ${String(request.input_kind)} at ${stage}.`;
+    if (request.input_kind !== 'interrupt_request') return observed;
+    try {
+      const metadata = await this.requireExisting(
+        'ContentObject',
+        requireId(request.content_object_id, 'PendingTurnInput.content_object_id')
+      ) as unknown as ContentObjectMetadata;
+      const parsed: unknown = JSON.parse((await this.contentStore.read(metadata)).toString('utf8'));
+      const reason = parsed && typeof parsed === 'object' ? (parsed as { reason?: unknown }).reason : undefined;
+      return typeof reason === 'string' && reason.trim() ? reason.trim() : observed;
+    } catch {
+      return observed;
+    }
   }
 
   private async readTurnTerminationFacts(

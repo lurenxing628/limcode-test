@@ -11,6 +11,7 @@ import {
   IconPlayerPlay,
   IconRefresh,
   IconRobot,
+  IconSend,
   IconTerminal2,
   IconTrash,
   IconX
@@ -62,7 +63,8 @@ const {
   reorderGuidance,
   currentPendingGuidanceControls,
   currentGuidanceControlFailure,
-  dismissGuidanceControlFailure
+  dismissGuidanceControlFailure,
+  interruptCurrentConversation
 } = useChat();
 
 const requestedIntentVersions = new Map<string, string>();
@@ -237,6 +239,17 @@ const canReorder = computed(() =>
   && committedItems.value.every((item) => Boolean(guidancePreview(item.preview)?.revisionSeq))
   && currentPendingGuidanceControls.value.length === 0
 );
+const activeTurnId = computed(() => {
+  const turn = Object.values(reliableConversation.feed.records.Turn ?? {}).find((candidate) =>
+    candidate.conversation_id === reliableConversation.conversationId.value && candidate.status === 'active');
+  return typeof turn?.id === 'string' ? turn.id : undefined;
+});
+/** The queue admits the first non-paused entry once the running Turn ends. */
+const firstAdmissibleId = computed(() =>
+  committedItems.value.find((item) => guidancePreview(item.preview)?.hold !== 'paused')?.id);
+// “立即发送”：先把这条排到队首，排好后停止点击时正在运行的那一轮，队列随即发送它。
+// 只停点击时记下的那一轮：若它已自行结束（队列已接手），绝不去停这条消息自己开出的新一轮。
+const sendNowTarget = ref<{ conversationId: string; intentId: string; turnId: string; startedAt: number }>();
 const waitingItems = computed(() => queueItems.value.filter((item) =>
   item.state === 'queued' || item.state === 'acknowledged'
 ));
@@ -582,6 +595,49 @@ function confirmRemoveItem(): void {
   closeRemovePanel();
 }
 
+function canSendNow(item: QueueItem): boolean {
+  const preview = guidancePreview(item.preview);
+  if (!preview || preview.hold === 'paused' || itemBusy(item) || !activeTurnId.value || sendNowTarget.value) return false;
+  return firstAdmissibleId.value === item.id || canReorder.value;
+}
+
+function sendNow(item: QueueItem): void {
+  const turnId = activeTurnId.value;
+  if (!canSendNow(item) || !turnId) return;
+  sendNowTarget.value = { conversationId: reliableConversation.conversationId.value, intentId: item.id, turnId, startedAt: Date.now() };
+  if (firstAdmissibleId.value === item.id) return;
+  const ordered = committedItems.value.filter((candidate) => guidancePreview(candidate.preview));
+  const accepted = reorderGuidance([item, ...ordered.filter((candidate) => candidate.id !== item.id)].map((candidate) => ({
+    intentId: candidate.id,
+    expectedRevisionSeq: guidancePreview(candidate.preview)!.revisionSeq
+  })));
+  if (!accepted) sendNowTarget.value = undefined;
+}
+
+watch(() => {
+  const target = sendNowTarget.value;
+  if (!target) return undefined;
+  const failure = currentGuidanceControlFailure.value;
+  return {
+    live: target.conversationId === reliableConversation.conversationId.value
+      && activeTurnId.value === target.turnId
+      && committedItems.value.some((item) => item.id === target.intentId),
+    reorderFailed: failure?.action === 'reorder' && failure.failedAt >= target.startedAt,
+    // The reorder reply settles before the Feed carries the new positions; wait for the order itself.
+    ready: !reorderPending.value && firstAdmissibleId.value === target.intentId
+  };
+}, (state) => {
+  if (!state) return;
+  // A failed reorder keeps its own failure notice; a Turn that already ended handed off by itself.
+  if (!state.live || state.reorderFailed) {
+    sendNowTarget.value = undefined;
+    return;
+  }
+  if (!state.ready) return;
+  sendNowTarget.value = undefined;
+  interruptCurrentConversation();
+}, { flush: 'post' });
+
 function togglePause(item: QueueItem): void {
   const preview = guidancePreview(item.preview);
   if (!preview || itemBusy(item)) return;
@@ -744,6 +800,15 @@ function timestamp(value: unknown): number {
           <span class="reliable-queue-text">{{ item.text }}</span>
 
           <div v-if="item.committed && guidancePreview(item.preview)" class="reliable-queue-actions">
+            <button
+              v-if="activeTurnId"
+              type="button"
+              :title="guidancePreview(item.preview)?.hold === 'paused' ? '先恢复这条引导消息再立即发送' : '停止当前回复，立即发送这条消息'"
+              :disabled="!canSendNow(item)"
+              @click="sendNow(item)"
+            >
+              <IconSend :size="13" stroke="2" aria-hidden="true" />
+            </button>
             <button
               type="button"
               title="编辑引导消息"

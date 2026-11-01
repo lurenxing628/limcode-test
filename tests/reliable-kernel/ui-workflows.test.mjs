@@ -310,6 +310,19 @@ test('时间线：模型用量和失败重试从真实关系恢复，不借用�
   delete records.ModelRequestMessageLink; assert.equal(project(input).messages[0].model, undefined);
 });
 
+test('时间线：停止按钮和旧版执行器原因都显示为手动暂停，失败原因原样保留', async () => {
+  const { projectReliableTurnTermination: terminate } = await ui.load('domain/reliableConversationProjection.ts');
+  const records = nativeShellRecords('terminal');
+  const stop = (terminal_status, reason) => terminate({ id: 'stop', turn_id: 'turn-a', terminal_status, reason, created_at: '2026-10-13T00:00:00Z' }, records);
+  for (const reason of ['用户请求中断当前 Turn。', 'Executor observed interrupt_request at tool_batch_boundary.']) {
+    const row = stop('interrupted', reason);
+    assert.equal(row.actor, 'user'); assert.equal(row.reasonCode, 'user_cancelled'); assert.equal(row.detail, '手动暂停');
+  }
+  const failed = stop('failed', 'provider failed');
+  assert.notEqual(failed.actor, 'user'); assert.equal(failed.detail, 'provider failed');
+  assert.equal(stop('interrupted', 'Executor observed termination_request at model_request.').detail, 'Executor observed termination_request at model_request.');
+});
+
 test('时间线：持久Message壳的正文就绪前由同一个overlay占位', async () => {
   const { projectReliableConversation: project } = await ui.load('domain/reliableConversationProjection.ts');
   const input = { conversationId: 'conversation-a', records: nativeShellRecords('streaming'), details: {}, transientModelRequests: nativeTransient([ITEM_LIVE]) };

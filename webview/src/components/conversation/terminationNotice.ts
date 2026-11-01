@@ -2,9 +2,14 @@ import type { RunTerminationRecord } from '@shared/protocol';
 
 /** The placeholder text a terminated model message shows instead of its unfinished content. */
 export function terminationNotice(
-  termination: Pick<RunTerminationRecord, 'kind' | 'reasonCode' | 'detail'> | undefined,
+  termination: Pick<RunTerminationRecord, 'kind' | 'reasonCode' | 'detail' | 'actor'> | undefined,
   runHadCompletedTools: boolean | undefined
 ): string {
+  if (isManualStop(termination)) {
+    return runHadCompletedTools
+      ? '本次回复已手动暂停。已执行的工具结果已保留，未完成的正文不会进入后续 LLM 上下文。'
+      : '本次回复已手动暂停。未完成的正文不会进入后续 LLM 上下文。';
+  }
   const detail = termination?.detail?.trim().replace(/[。.!！?？]+$/, '');
   if (termination?.reasonCode === 'empty_model_result') {
     return runHadCompletedTools
@@ -22,4 +27,9 @@ export function terminationNotice(
   return termination?.kind === 'failed'
     ? '本次回复未正常完成。未完成的回复正文不会进入后续 LLM 上下文；已完成的工具结果和中断位置仍会保留。'
     : '本次回复已终止。未完成的回复正文不会进入后续 LLM 上下文；已完成的工具结果和中断位置仍会保留。';
+}
+
+/** 用户自己停止的一轮（停止按钮，或删除、编辑前的自动停止）：不是故障，不用错误样式。 */
+export function isManualStop(termination: Pick<RunTerminationRecord, 'kind' | 'actor'> | undefined): boolean {
+  return termination?.actor === 'user' && termination.kind !== 'failed';
 }

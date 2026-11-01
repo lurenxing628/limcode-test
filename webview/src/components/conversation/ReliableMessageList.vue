@@ -34,6 +34,7 @@ import MessageItem from './MessageItem.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import ReliableCollaborationCard from './ReliableCollaborationCard.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
+import { isManualStop } from './terminationNotice';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
 import ReliableCompressionWarningRow from './ReliableCompressionWarningRow.vue';
 import TimelineActivityRow from './TimelineActivityRow.vue';
@@ -180,10 +181,14 @@ const compressionTimeline = computed(() => projectReliableCompressionTimeline(
 ));
 const compressionBlocksByAnchor = computed(() => compressionTimeline.value.byAnchor);
 const messageRoles = computed(() => new Map(messageMetadata.value.map(message => [message.id, message.role])));
+// Only rows anchored to the user message render here; a reply's own termination renders in MessageItem.
+// A manual stop with no reply left (stopped before output, or its reply deleted afterwards) adds
+// nothing the user does not already know, so it is not shown instead of lingering under the question.
 const terminationRowsByAnchor = computed(() => {
   const result: Record<string, RunTerminationRecord[]> = {};
   for (const [messageId, termination] of Object.entries(terminations.value)) {
-    if (messageRoles.value.get(messageId) !== 'user' || isTerminationSuppressed(termination)) continue;
+    if (messageRoles.value.get(messageId) !== 'user' || isTerminationSuppressed(termination)
+      || isManualStop(termination)) continue;
     (result[messageId] ??= []).push(termination);
   }
   return result;

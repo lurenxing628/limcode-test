@@ -1664,11 +1664,24 @@ export function projectReliableTurnTermination(
   const turnId = text(raw.turn_id);
   if (!terminalStatus || terminalStatus === 'completed' || !id || !turnId) return undefined;
   const reason = textPreserveWhitespace(raw.reason) ?? terminalStatus;
+  const manualStop = (terminalStatus === 'interrupted' || terminalStatus === 'cancelled') && isManualStopReason(reason);
   return {
-    id, runId: turnId, kind: terminationKind(terminalStatus), actor: terminationActor(terminalStatus, reason),
+    id, runId: turnId, kind: terminationKind(terminalStatus),
+    actor: manualStop ? 'user' : terminationActor(terminalStatus, reason),
     interruptedPhase: inferredInterruptedPhase(turnId, index),
-    reasonCode: terminationReasonCode(terminalStatus, reason), detail: reason, createdAt: timestamp(raw.created_at)
+    reasonCode: manualStop ? 'user_cancelled' : terminationReasonCode(terminalStatus, reason),
+    detail: manualStop ? MANUAL_STOP_DETAIL : reason, createdAt: timestamp(raw.created_at)
   };
+}
+
+const MANUAL_STOP_DETAIL = '手动暂停';
+
+/**
+ * 停止按钮（以及删除、编辑前的自动停止）写下的原因。旧版本只记录了执行器观察到的英文阶段说明，
+ * 那时几乎都来自手动停止，一并按手动暂停显示。
+ */
+function isManualStopReason(reason: string): boolean {
+  return reason.startsWith('用户请求中断当前 Turn') || reason.startsWith('Executor observed interrupt_request');
 }
 
 function projectTurnTerminations(
@@ -1721,7 +1734,7 @@ function terminationKind(value: string): RunTerminationRecord['kind'] {
 
 function terminationActor(value: string, reason: string): RunTerminationRecord['actor'] {
   const normalized = reason.toLowerCase();
-  if ((value === 'cancelled' || value === 'interrupted') && normalized.includes('user')) return 'user';
+  if ((value === 'cancelled' || value === 'interrupted') && (normalized.includes('user') || reason.startsWith('用户'))) return 'user';
   if (normalized.includes('provider') || normalized.includes('model')) return 'provider';
   if (normalized.includes('tool')) return 'tool';
   return 'system';
