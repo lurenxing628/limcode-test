@@ -60,6 +60,9 @@ test('Agent 删除开关关闭时不提供删除操作，后续设置不改变�
 
 test('Agent 只能删除自己的直属子 Agent，删除先停止整棵子树并保留父任务', async () => {
   f.allowDeleteSubagents = true;
+  const model = f.model;
+  // 子 Agent 的模型调用一直挂着直到被停止，保证删除时它确实还没交答复。
+  f.model = (_request, signal) => new Promise((_resolve, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
   try {
     const parent = await f.conversation('delete-own-child');
     const turn = await f.input(parent);
@@ -72,11 +75,30 @@ test('Agent 只能删除自己的直属子 Agent，删除先停止整棵子树�
     await assert.rejects(deleteChild(foreignTurn.turnId, child.answerBridgeId), /outside.*direct/);
     assert.ok(await f.get('Conversation', child.childConversationId));
     await assert.rejects(deleteChild(turn.turnId, grandchild.answerBridgeId), /outside.*direct/);
+    // 还在运行、没交答复的子 Agent 不能直接删，否则答复会丢；先中断再删。
+    await assert.rejects(deleteChild(turn.turnId, child.answerBridgeId), /仍在运行.*interrupt_subtree/);
+    assert.ok(await f.get('Conversation', child.childConversationId));
+    await f.coordinator.interruptSubtree({ sourceKey: f.id('delete-own-child-stop'), childExecutionId: child.childExecutionId,
+      reason: '用户停止' }, { userStop: true });
     assert.equal((await deleteChild(turn.turnId, child.answerBridgeId)).status, 'succeeded');
     assert.equal(await f.get('Conversation', child.childConversationId), null);
     assert.equal(await f.get('Conversation', grandchild.childConversationId), null);
     assert.ok(await f.get('Conversation', parent));
     assert.equal((await f.get('Turn', turn.turnId)).status, 'active');
     assert.equal((await deleteChild(turn.turnId, child.answerBridgeId)).status, 'succeeded');
+  } finally { f.allowDeleteSubagents = false; f.model = model; }
+});
+
+test('Agent 可以删除已经交了答复的子 Agent', async () => {
+  f.allowDeleteSubagents = true;
+  try {
+    const parent = await f.conversation('delete-answered-child');
+    const turn = await f.input(parent);
+    const child = await f.spawn(turn.turnId);
+    assert.equal(f.coordinator.launch(child.childExecutionId, child.childTurnId), true);
+    await f.until(async () => (await f.coordinator.dependencies.answers.readCurrent(child.answerBridgeId)).status === 'submitted',
+      'child answer submitted');
+    assert.equal((await deleteChild(turn.turnId, child.answerBridgeId)).status, 'succeeded');
+    assert.equal(await f.get('Conversation', child.childConversationId), null);
   } finally { f.allowDeleteSubagents = false; }
 });

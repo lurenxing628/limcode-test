@@ -2519,6 +2519,12 @@ export class ReliableChildAgentCoordinator {
       { ok: true, operation: 'delete_subtree', status: 'not_found', answerBridgeId, deletedCount: 0 }, `run-agent-delete:${input.toolCallId}`);
     const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
     const task = await this.requireScopedChildTask(projection, answerBridgeId, 'direct');
+    // Deleting a child that has not answered yet silently drops its answer. Giving it up must be an
+    // explicit interrupt first; the interrupted child is then deletable like any finished one.
+    if ((await this.dependencies.answers.readCurrent(answerBridgeId)).status === 'running') {
+      throw new Error(`子 Agent ${answerBridgeId} 仍在运行、尚未提交答复，不能删除：删除会丢掉它的答复。`
+        + '请先用 wait 等待答复；确定不再需要它时，先用 interrupt_subtree 中断，再删除。');
+    }
     signal?.throwIfAborted();
     const deleted = await remove({ conversationId: task.conversationId,
       requestId: `run-agent-delete:${input.toolCallId}` });
