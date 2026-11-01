@@ -5,7 +5,7 @@
  * that excludes the time spent running tools.
  */
 
-import type { ModelResponseMetric, ModelResponseMetrics, ModelResponseTiming } from '../../shared/protocol';
+import { MIN_TOKEN_SPEED_OUTPUT_MS, type ModelResponseMetric, type ModelResponseMetrics, type ModelResponseTiming } from '../../shared/protocol';
 
 /** Newest responses kept for the per-round breakdown; the totals below cover every response. */
 export const MAX_RECENT_NATIVE_RESPONSE_METRICS = 8;
@@ -14,8 +14,9 @@ const MAX_RESPONSE_ID_LENGTH = 512;
 
 const TIMING_FIELDS = new Set(['startedAt', 'completedAt', 'firstOutputAt', 'ttftMs', 'outputDurationMs']);
 const METRIC_FIELDS = new Set([...TIMING_FIELDS, 'responseId', 'outputTokens', 'reasoningTokens']);
+// speedTotalDurationMs was written by an earlier build; it is accepted and ignored.
 const METRICS_FIELDS = new Set([
-  'responseCount', 'first', 'recent', 'ttftTotalMs', 'ttftCount', 'speedOutputTokens', 'speedOutputDurationMs'
+  'responseCount', 'first', 'recent', 'ttftTotalMs', 'ttftCount', 'speedOutputTokens', 'speedOutputDurationMs', 'speedTotalDurationMs'
 ]);
 
 /** Validates timing attached to a native response-end event; first output fields come together. */
@@ -51,7 +52,8 @@ export function foldNativeResponseMetrics(
     ...(outputTokens === undefined ? {} : { outputTokens }),
     ...(reasoningTokens === undefined ? {} : { reasoningTokens })
   };
-  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined && metric.outputDurationMs > 0;
+  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined
+    && metric.outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS;
   return {
     responseCount: (previous?.responseCount ?? 0) + 1,
     first: previous?.first ?? metric,

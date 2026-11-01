@@ -1,4 +1,4 @@
-import type { MessageRecord, ModelResponseMetric } from '../../../../shared/protocol';
+import { MIN_TOKEN_SPEED_OUTPUT_MS, type MessageRecord, type ModelResponseMetric } from '../../../../shared/protocol';
 import { normalizeTokenUsage } from './tokenUsageModel';
 
 /** One physical response of a native request, numbered from the request's first response. */
@@ -15,9 +15,10 @@ export interface ModelRunMetrics {
   ttftMs?: number;
   /** Only once the request has finished. */
   totalMs?: number;
-  /** Time the model spent producing output; a native request excludes the tool time between responses. */
+  /** First observed output to completion; native responses exclude the tool time between them. */
   outputDurationMs?: number;
   outputTokens?: number;
+  /** Output tokens over output time, only for spans of at least MIN_TOKEN_SPEED_OUTPUT_MS. */
   tokenSpeed?: number;
   /** Native requests only. */
   roundCount?: number;
@@ -47,11 +48,11 @@ export function modelRunMetrics(message: MessageRecord, streaming: boolean): Mod
     return {
       ...(ttftMs === undefined ? {} : { ttftMs }),
       ...totalMetric(requestStartedAt, completedAt),
-      ...(outputDurationMs === undefined ? {} : {
-        outputDurationMs,
+      ...(outputDurationMs === undefined ? {} : { outputDurationMs }),
+      ...(outputDurationMs !== undefined && outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS ? {
         outputTokens: response.speedOutputTokens,
         tokenSpeed: response.speedOutputTokens / (outputDurationMs / 1000)
-      }),
+      } : {}),
       roundCount: response.responseCount,
       ...(response.ttftCount > 0 ? { averageTtftMs: response.ttftTotalMs / response.ttftCount } : {}),
       rounds: response.recent.map((metric, offset) => roundMetric(metric, firstRoundIndex + offset))
@@ -73,14 +74,15 @@ export function modelRunMetrics(message: MessageRecord, streaming: boolean): Mod
     ...(totalMs === undefined ? {} : { totalMs }),
     ...(outputDurationMs === undefined ? {} : { outputDurationMs }),
     ...(outputTokens === undefined ? {} : { outputTokens }),
-    ...(outputDurationMs !== undefined && outputDurationMs > 0 && outputTokens !== undefined
+    ...(outputDurationMs !== undefined && outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS && outputTokens !== undefined
       ? { tokenSpeed: outputTokens / (outputDurationMs / 1000) }
       : {})
   };
 }
 
 function roundMetric(metric: ModelResponseMetric, index: number): ModelRunRound {
-  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined && metric.outputDurationMs > 0;
+  const timed = metric.outputTokens !== undefined && metric.outputDurationMs !== undefined
+    && metric.outputDurationMs >= MIN_TOKEN_SPEED_OUTPUT_MS;
   return {
     index,
     ...(metric.ttftMs === undefined ? {} : { ttftMs: metric.ttftMs }),

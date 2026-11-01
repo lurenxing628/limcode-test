@@ -247,7 +247,7 @@ const runMetricItems = computed<RunMetricItem[]>(() => {
           key: 'speed' as const,
           label: '速度',
           value: formattokenSpeed(metrics.tokenSpeed),
-          tooltipTitle: metrics.roundCount ? '输出 Token 速度（含思考，不含工具时间）' : '输出 Token 速度（含思考）',
+          tooltipTitle: metrics.roundCount ? '输出 Token 速度（含思考，从首字到结束，不含工具时间）' : '输出 Token 速度（含思考，从首字到结束）',
           details: [
             { label: '输出 Token（含思考）', value: formatExactNumber(metrics.outputTokens!) },
             { label: '输出耗时', value: formatDurationMs(metrics.outputDurationMs!) },
