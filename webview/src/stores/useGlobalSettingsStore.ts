@@ -194,7 +194,8 @@ function emptyAppearance(): AppearanceSettingsRecord {
     streamingTextWaiting: '...少女等待中',
     streamingTextThinking: '...少女思考中',
     streamingTextWriting: '...少女编写中',
-    streamingTextToolExecuting: '...少女执行中'
+    streamingTextToolExecuting: '...少女执行中',
+    conciseMode: false
   };
 }
 
@@ -1582,7 +1583,8 @@ const useGlobalSettingsStoreDefinition = defineStore('globalSettings', {
           streamingTextWaiting: this.appearance.streamingTextWaiting,
           streamingTextThinking: this.appearance.streamingTextThinking,
           streamingTextWriting: this.appearance.streamingTextWriting,
-          streamingTextToolExecuting: this.appearance.streamingTextToolExecuting
+          streamingTextToolExecuting: this.appearance.streamingTextToolExecuting,
+          conciseMode: this.appearance.conciseMode
         }
       });
     },

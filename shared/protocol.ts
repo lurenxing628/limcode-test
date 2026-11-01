@@ -3129,6 +3129,8 @@ export interface AppearanceSettingsRecord {
   streamingTextWriting: string;
   /** AI 已输出工具调用、工具正在排队或执行时显示的文字。 */
   streamingTextToolExecuting: string;
+  /** 简洁模式：工具调用一律显示为收起的一行，不显示流式参数预览，点开才看详情；需要用户处理的交互仍会展开。 */
+  conciseMode: boolean;
 }
 export interface TaskCompletionSoundSettingsRecord {
   enabled: boolean;

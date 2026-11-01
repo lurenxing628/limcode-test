@@ -35,6 +35,31 @@
   }
 }
 
+/* 进行中的单行文字：一道淡光从左扫到右，比颜色闪烁柔和；颜色跟随文字本身。 */
+.lc-shimmer-text {
+  background: linear-gradient(
+    90deg,
+    currentColor 0%,
+    currentColor 40%,
+    color-mix(in srgb, currentColor 35%, transparent) 50%,
+    currentColor 60%,
+    currentColor 100%
+  );
+  background-size: 200% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: lc-streaming-wave var(--lc-streaming-wave-duration) linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lc-shimmer-text {
+    animation: none;
+    background: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
 /* 流式状态光标闪烁。 */
 @keyframes lc-streaming-cursor-blink {
   0%, 100% {

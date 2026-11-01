@@ -2,6 +2,7 @@
 import { onMounted } from 'vue';
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import StreamingIndicatorTail from '@webview/components/content/StreamingIndicatorTail.vue';
+import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
 
@@ -26,6 +27,21 @@ onMounted(() => {
         <p>自定义 LLM 流式输出时的状态提示文字。文字会以波浪动画追加到内容末尾。</p>
       </div>
     </header>
+
+    <div class="appearance-group">
+      <h3 class="appearance-group-title">显示</h3>
+      <div class="global-settings-field">
+        <LcCheckbox
+          :model-value="settings.appearance.conciseMode"
+          size="sm"
+          aria-label="简洁模式"
+          @update:model-value="settings.appearance.conciseMode = $event"
+        >
+          <span class="global-settings-checkbox-label">简洁模式</span>
+        </LcCheckbox>
+        <small class="appearance-field-hint">工具调用只显示收起的一行，不再边生成边展开参数和结果，点开才看详情。需要你确认或回答的内容仍会展开。</small>
+      </div>
+    </div>
 
     <div class="appearance-group">
       <h3 class="appearance-group-title">自定义 LLM 响应文字</h3>

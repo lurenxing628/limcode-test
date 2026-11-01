@@ -16,8 +16,10 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
   import { createPinia, setActivePinia } from 'pinia';
   import Card from '/src/components/content/parts/FunctionCallPartView.vue';
   import { useReliableKernelClientFeedStore } from '/src/stores/useReliableKernelClientFeedStore.ts';
+  import { useGlobalSettingsStore } from '/src/stores/useGlobalSettingsStore.ts';
   const pinia = createPinia();
   setActivePinia(pinia);
+  useGlobalSettingsStore().appearance.conciseMode = new URLSearchParams(window.location.search).has('concise');
   const feed = useReliableKernelClientFeedStore();
   window.feed = feed;
   window.requests = [];
@@ -62,7 +64,7 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
   createApp(Card, { part, messageId: 'message', toolOrdinal: 0 }).use(pinia).mount('#app');
 </script></body></html>`;
 
-test('file preview loads arriving members, starts expanded and respects the user collapsing it', async () => {
+test('file preview loads arriving members, starts expanded unless concise, and respects the user collapsing it', async () => {
   const server = await createBrowserFixtureServer({
     dependencies: ['vue', 'pinia', '@tabler/icons-vue', 'markdown-it', 'markdown-it-texmath', 'katex'],
     plugins: [{
@@ -141,6 +143,16 @@ test('file preview loads arriving members, starts expanded and respects the user
       await toggle.click();
       await page.locator('.tool-diff-view').waitFor({ state: 'detached' });
     }
+
+    // 简洁模式：本该自动展开的修改卡片也先收起，点开后照常显示差异。
+    await page.goto(`http://127.0.0.1:${server.httpServer.address().port}/file-preview-fixture?concise`, { waitUntil: 'domcontentloaded' });
+    await toggle.waitFor();
+    await page.evaluate(() => window.deliverFileChanges());
+    await setDiff('@@ -10,1 +10,1 @@\n-before\n+concise change');
+    assert.equal(await toggle.getAttribute('aria-expanded'), 'false');
+    assert.equal(await page.locator('.tool-diff-view').count(), 0);
+    await toggle.click();
+    await page.locator('.tool-diff-line-code').filter({ hasText: 'concise change' }).waitFor();
     assert.deepEqual(errors, []);
     await page.close();
   } finally {

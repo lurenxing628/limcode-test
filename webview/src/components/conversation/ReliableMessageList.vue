@@ -560,13 +560,16 @@ const activityLabel = computed(() => {
     call.turn_id === turn.id && call.status !== 'terminal'
   );
   if (activeTool) return undefined;
+  const concise = globalSettings.appearance.conciseMode;
+  // 简洁模式下这行和随后的步骤卡用同一句等待文案，换成步骤卡时文字不变。
   if (latest.status === 'prepared' || latest.status === 'pending') {
-    return '正在启动 LLM 请求';
+    return concise ? globalSettings.appearance.streamingTextWaiting : '正在启动 LLM 请求';
   }
   if (latest.status === 'streaming') {
-    return '正在等待模型回复';
+    return concise ? globalSettings.appearance.streamingTextWaiting : '正在等待模型回复';
   }
-  return 'LLM 结果已提交，正在准备工具或下一轮';
+  // 上一轮的步骤卡已经在显示进度；这行只会在工具登记前闪一下，简洁模式下不显示。
+  return concise ? undefined : 'LLM 结果已提交，正在准备工具或下一轮';
 });
 const retryBoundaryLabel = computed(() => {
   const action = conversationAction.value;
@@ -1115,6 +1118,7 @@ function messageRenderKey(message: MessageRecord): string {
       activity-kind="preparing"
       :label="activityLabel"
       :model-label="activityModelLabel"
+      :concise="globalSettings.appearance.conciseMode"
     />
     <p v-if="conversationActionNotice" class="reliable-action-notice" role="status">
       {{ conversationActionNotice }}

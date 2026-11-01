@@ -12,7 +12,10 @@ import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { reliableToolCallForPart } from '@webview/domain/reliablePresentationIndex';
 import { useContentBlockWindow } from '@webview/composables/useContentBlockWindow';
+import { IconTool } from '@tabler/icons-vue';
 import StreamingIndicatorTail from './StreamingIndicatorTail.vue';
+import CollapsibleContentBlock from './CollapsibleContentBlock.vue';
+import { formatThoughtDuration } from './thoughtTiming';
 import { partViewComponent, RichRenderNodeProjector, type RichRenderNode } from './partRegistry';
 
 const props = defineProps<{
@@ -33,6 +36,36 @@ interface ToolBatchMeta {
   batchColorIndex: number;
 }
 
+interface StepGroup {
+  items: { node: RichRenderNode; index: number }[];
+  label: string;
+  meta: string;
+  active: boolean;
+  forceOpen: boolean;
+}
+
+/** 简洁模式下，连续的思考与工具调用合并成一行可展开的步骤摘要；其余节点照常逐个显示。 */
+/** 按动作概括步骤：有单位的动作按目标计数（读取 3 个文件），只有一个目标时直接写出目标；认不出的工具写工具名。 */
+const STEP_ACTIONS: Record<string, { verb: string; unit?: string }> = {
+  read: { verb: '读取', unit: '个文件' },
+  write: { verb: '修改', unit: '个文件' },
+  edit: { verb: '修改', unit: '个文件' },
+  delete: { verb: '删除', unit: '个文件' },
+  bash: { verb: '运行', unit: '条命令' },
+  shell: { verb: '运行', unit: '条命令' },
+  update_task_list: { verb: '更新任务清单' },
+  skills: { verb: '载入技能' },
+  run_agent: { verb: '调度子 Agent' },
+  ask_user: { verb: '提问' },
+  submit_plan: { verb: '提交计划' },
+  transfer: { verb: '传输文件' },
+  switch_work_environment: { verb: '切换工作环境' }
+};
+
+type DisplayBlock =
+  | { key: string; node: RichRenderNode; index: number; group?: undefined }
+  | { key: string; group: StepGroup; node?: undefined; index?: undefined };
+
 interface ToolCallNodeInfo {
   nodeIndex: number;
   call?: ToolCallRecord;
@@ -46,21 +79,26 @@ const nodeProjector = new RichRenderNodeProjector();
 const rawNodes = computed(() => nodeProjector.project(props.parts));
 let previousBatchNodes = new Map<string, RichRenderNode>();
 const nodes = computed(() => withToolBatchMeta(rawNodes.value));
+const displayBlocks = computed(() => globalSettings.appearance.conciseMode
+  ? groupStepRuns(nodes.value)
+  : nodes.value.map((node, index): DisplayBlock => ({ key: node.key, node, index })));
+const expandedGroups = ref(new Set<string>());
 const blockKeys = computed<readonly string[]>((previous) => {
-  const next = nodes.value.map(node => node.key);
+  const next = displayBlocks.value.map(block => block.key);
   return previous?.length === next.length && next.every((key, index) => key === previous[index]) ? previous : next;
 });
 const root = ref<HTMLElement | null>(null);
 const blockWindow = useContentBlockWindow({ keys: blockKeys, root, scroller: computed(() => props.scroller) });
-const visibleNodes = computed(() => nodes.value.slice(blockWindow.start.value, blockWindow.end.value));
+const visibleBlocks = computed(() => displayBlocks.value.slice(blockWindow.start.value, blockWindow.end.value));
 const messageToolCalls = computed(() => props.messageId
   ? reliableConversation.projection.value.toolCallsByMessageId[props.messageId] : undefined);
+const endsWithStepGroup = computed(() => displayBlocks.value[displayBlocks.value.length - 1]?.group !== undefined);
 const showToolExecutingTail = computed(() => {
-  if (props.streaming || !props.messageId) return false;
+  if (props.streaming || !props.messageId || endsWithStepGroup.value) return false;
   return messageToolCalls.value?.some(call => isToolExecutingStatus(call.status, call.progress)) ?? false;
 });
 const showStandaloneStreamingTail = computed(() => {
-  if (!props.streaming || nodes.value.length === 0) return false;
+  if (!props.streaming || nodes.value.length === 0 || endsWithStepGroup.value) return false;
   const lastIndex = nodes.value.length - 1;
   const last = nodes.value[lastIndex];
   return !!last && !nodeStreaming(last, lastIndex);
@@ -173,6 +211,101 @@ function streamingPhase(): 'waiting' | 'thinking' | 'writing' {
   const last = nodes.value[nodes.value.length - 1]!;
   if (last.kind === 'thought') return 'thinking';
   return 'writing';
+}
+
+function groupStepRuns(inputNodes: RichRenderNode[]): DisplayBlock[] {
+  const blocks: DisplayBlock[] = [];
+  let run: { node: RichRenderNode; index: number }[] = [];
+  const flushRun = (): void => {
+    // 思考一出现就进步骤卡，之后只在这一行里更新文字，不再从思考行、编写中尾行切换成卡片。
+    if (run.some(item => item.node.kind === 'thought' || item.node.kind === 'functionCall')) {
+      blocks.push({ key: `steps:${run[0]!.node.key}`, group: stepGroup(run, run[run.length - 1]!.index === inputNodes.length - 1) });
+    } else {
+      for (const item of run) blocks.push({ key: item.node.key, ...item });
+    }
+    run = [];
+  };
+  inputNodes.forEach((node, index) => {
+    if (node.kind === 'thought' || node.kind === 'functionCall' || node.kind === 'functionResponse') {
+      run.push({ node, index });
+      return;
+    }
+    flushRun();
+    blocks.push({ key: node.key, node, index });
+  });
+  flushRun();
+  return blocks;
+}
+
+function stepGroup(items: StepGroup['items'], atEnd: boolean): StepGroup {
+  const actions = new Map<string, { verb: string; unit?: string; calls: number; targets: Map<string, string> }>();
+  let active = props.streaming === true && atEnd;
+  let forceOpen = false;
+  let failed = 0;
+  for (const { node } of items) {
+    if (node.kind !== 'functionCall') continue;
+    const call = toolCallForNode(node);
+    addStepAction(actions, node.props.part as FunctionCallPart);
+    if (!call) {
+      active ||= props.streaming === true;
+      continue;
+    }
+    active ||= isBlockingToolCall(call);
+    // 等待用户处理（执行审批、修改审批、提问等）的调用不能藏在收起的摘要里。
+    forceOpen ||= call.status === 'awaiting_user_input'
+      || reliableConversation.projection.value.interactionByToolCallId[call.id]?.status === 'pending';
+    if (call.status === 'error') failed += 1;
+  }
+  const last = items[items.length - 1]!.node;
+  const thinking = props.streaming === true && atEnd && last.kind === 'thought' && last.props.thoughtOpen === true;
+  let label = [...actions.values()].map((action) => {
+    if (!action.unit) return action.calls > 1 && action.verb.startsWith('调用 ') ? `${action.verb} ×${action.calls}` : action.verb;
+    const count = action.targets.size || action.calls;
+    const [only] = action.targets.values();
+    return count === 1 && only ? `${action.verb} ${only}` : `${action.verb} ${count} ${action.unit}`;
+  }).join(' · ');
+  if (!label) label = thinking ? globalSettings.appearance.streamingTextThinking : thoughtLabel(items);
+  const meta = [failed > 0 ? `${failed} 失败` : '',
+    thinking && actions.size > 0 ? '思考中' : active && !thinking ? '进行中' : ''].filter(Boolean).join(' · ');
+  return { items, label, meta, active, forceOpen };
+}
+
+function thoughtLabel(items: StepGroup['items']): string {
+  const durationMs = items.reduce((sum, { node }) => sum + (typeof node.props.durationMs === 'number' ? node.props.durationMs : 0), 0);
+  return durationMs > 0 ? `已思考 ${formatThoughtDuration(durationMs)}` : '思考';
+}
+
+function addStepAction(
+  actions: Map<string, { verb: string; unit?: string; calls: number; targets: Map<string, string> }>,
+  part: FunctionCallPart
+): void {
+  const name = part.functionCall.name;
+  const known = STEP_ACTIONS[name];
+  const verb = known?.verb ?? `调用 ${name}`;
+  const action = actions.get(verb) ?? { verb, unit: known?.unit, calls: 0, targets: new Map<string, string>() };
+  actions.set(verb, action);
+  action.calls += 1;
+  if (!action.unit) return;
+  const args = part.functionCall.args && typeof part.functionCall.args === 'object' && !Array.isArray(part.functionCall.args)
+    ? part.functionCall.args as Record<string, unknown> : {};
+  const paths = Array.isArray(args.paths) ? args.paths : [args.path];
+  for (const path of paths) {
+    if (typeof path === 'string' && path.trim()) action.targets.set(path, path.split(/[\\/]/).filter(Boolean).pop() ?? path);
+  }
+  if (typeof args.command === 'string' && args.command.trim()) action.targets.set(args.command, commandProgram(args.command));
+}
+
+/** 命令只显示开头的程序名（npm、git）；以变量、引号、括号或路径开头的看不出在做什么，返回空串让摘要只写条数。 */
+function commandProgram(command: string): string {
+  const first = command.trim().split(/\s+/)[0] ?? '';
+  return /^[A-Za-z][\w.-]*$/.test(first) ? first : '';
+}
+
+function toggleStepGroup(key: string, expanded: boolean): void {
+  const next = new Set(expandedGroups.value);
+  if (expanded) next.add(key);
+  else next.delete(key);
+  expandedGroups.value = next;
 }
 
 function withToolBatchMeta(inputNodes: RichRenderNode[]): RichRenderNode[] {
@@ -306,10 +439,26 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
   <div ref="root" class="rich-content">
     <template v-if="nodes.length">
       <div v-if="blockWindow.beforeHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.beforeHeight.value}px` }" aria-hidden="true" />
-      <div v-for="(node, index) in visibleNodes" :key="node.key"
-        :ref="element => blockWindow.bindBlock(node.key, element)"
-        class="rich-content-block" :data-content-block-key="node.key">
-        <component :is="partViewComponent(node.kind)" v-bind="nodeComponentProps(node, blockWindow.start.value + index)" />
+      <div v-for="block in visibleBlocks" :key="block.key"
+        :ref="element => blockWindow.bindBlock(block.key, element)"
+        class="rich-content-block" :data-content-block-key="block.key">
+        <component :is="partViewComponent(block.node.kind)" v-if="block.node" v-bind="nodeComponentProps(block.node, block.index)" />
+        <CollapsibleContentBlock v-else class="rich-step-group"
+          :expanded="block.group.forceOpen || expandedGroups.has(block.key)"
+          :icon-active="block.group.active"
+          :aria-label="`${block.group.label}（${block.group.meta}）`"
+          @update:expanded="toggleStepGroup(block.key, $event)">
+          <template #icon><IconTool stroke="2" /></template>
+          <template #summary>
+            <span class="rich-step-group-label" :class="{ 'lc-shimmer-text': block.group.active }">{{ block.group.label }}</span>
+            <span class="rich-step-group-meta">{{ block.group.meta }}</span>
+          </template>
+          <div class="rich-step-group-body">
+            <div v-for="item in block.group.items" :key="item.node.key" class="rich-content-block">
+              <component :is="partViewComponent(item.node.kind)" v-bind="nodeComponentProps(item.node, item.index)" />
+            </div>
+          </div>
+        </CollapsibleContentBlock>
       </div>
       <div v-if="blockWindow.afterHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.afterHeight.value}px` }" aria-hidden="true" />
       <div v-if="shownTail" class="rich-streaming-tail-row lc-collapse-shell" :class="{ 'is-expanded': tailExpanded }">
@@ -318,6 +467,12 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
         </div>
       </div>
     </template>
+    <!-- 简洁模式下等待首个内容块时就显示步骤卡的样子，内容到达后原地变成步骤摘要。 -->
+    <CollapsibleContentBlock v-else-if="streaming && globalSettings.appearance.conciseMode" class="rich-step-group"
+      :collapsible="false" icon-active :aria-label="globalSettings.appearance.streamingTextWaiting">
+      <template #icon><IconTool stroke="2" /></template>
+      <template #summary><span class="rich-step-group-label lc-shimmer-text">{{ globalSettings.appearance.streamingTextWaiting }}</span></template>
+    </CollapsibleContentBlock>
     <!-- 流式中但还没有任何内容块：渲染一个仅含光标的空文本节点。 -->
     <component
       :is="partViewComponent('text')"
@@ -339,6 +494,28 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
 }
 
 .rich-content-block { min-width: 0; }
+
+.rich-step-group-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rich-step-group-meta {
+  flex: 0 0 auto;
+  margin-left: 6px;
+  opacity: 0.75;
+  white-space: nowrap;
+}
+
+.rich-step-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+}
 .rich-content-spacer { flex-shrink: 0; pointer-events: none; }
 
 .rich-streaming-tail-row {

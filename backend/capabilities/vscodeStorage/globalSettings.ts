@@ -133,7 +133,8 @@ export function createDefaultAppearanceSettings(): AppearanceSettingsRecord {
     streamingTextWaiting: DEFAULT_APPEARANCE_STREAMING_TEXT_WAITING,
     streamingTextThinking: DEFAULT_APPEARANCE_STREAMING_TEXT_THINKING,
     streamingTextWriting: DEFAULT_APPEARANCE_STREAMING_TEXT_WRITING,
-    streamingTextToolExecuting: DEFAULT_APPEARANCE_STREAMING_TEXT_TOOL_EXECUTING
+    streamingTextToolExecuting: DEFAULT_APPEARANCE_STREAMING_TEXT_TOOL_EXECUTING,
+    conciseMode: false
   };
 }
 
@@ -145,7 +146,8 @@ export function normalizeAppearanceSettings(input: Partial<AppearanceSettingsRec
     streamingTextWaiting: sanitize(input?.streamingTextWaiting, DEFAULT_APPEARANCE_STREAMING_TEXT_WAITING),
     streamingTextThinking: sanitize(input?.streamingTextThinking, DEFAULT_APPEARANCE_STREAMING_TEXT_THINKING),
     streamingTextWriting: sanitize(input?.streamingTextWriting, DEFAULT_APPEARANCE_STREAMING_TEXT_WRITING),
-    streamingTextToolExecuting: sanitize(input?.streamingTextToolExecuting, DEFAULT_APPEARANCE_STREAMING_TEXT_TOOL_EXECUTING)
+    streamingTextToolExecuting: sanitize(input?.streamingTextToolExecuting, DEFAULT_APPEARANCE_STREAMING_TEXT_TOOL_EXECUTING),
+    conciseMode: input?.conciseMode === true
   };
 }
 
@@ -353,7 +355,9 @@ function isValidGlobalSettingsSectionValue(section: GlobalSettingsSection, value
       record.streamingTextThinking,
       record.streamingTextWriting,
       record.streamingTextToolExecuting
-    ].every((item) => typeof item === 'string');
+    ].every((item) => typeof item === 'string')
+      // 旧版本保存的外观设置没有这一项。
+      && (record.conciseMode === undefined || typeof record.conciseMode === 'boolean');
   }
   if (section === 'attachments') {
     return typeof record.maxStoredInlineFileMb === 'number'

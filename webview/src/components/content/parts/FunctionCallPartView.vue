@@ -40,6 +40,7 @@ import {
   reliableKernelDetailKey
 } from '@webview/domain/reliableDetailKey';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
+import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
 import { useSwapHeightTransition } from '@webview/composables/useSwapHeightTransition';
 import { bridge, BridgeMessageType } from '@webview/transport';
@@ -79,6 +80,7 @@ const reliableConversation = useReliableConversation();
 const detailOwner = `function-call:${getCurrentInstance()!.uid}`;
 onBeforeUnmount(() => reliableConversation.feed.setDetailOwnerKeys(detailOwner, []));
 const interactions = useInteractionStore();
+const globalSettings = useGlobalSettingsStore();
 const expanded = ref(false);
 const callDetailsExpanded = ref(false);
 const userChangedExpanded = ref(false);
@@ -133,7 +135,7 @@ const toolEvents = computed<ToolCallEventRecord[]>(() => {
 });
 const transientPreview = computed(() => {
   const partId = props.part.id;
-  if (!partId || !props.messageId) return undefined;
+  if (!partId || !props.messageId || globalSettings.appearance.conciseMode) return undefined;
   const projection = reliableConversation.projection.value;
   const durableCallId = toolCall.value?.id;
   // 转向边界拆分出的展示条目没有独立的持久化身份；预览与正文详请一律回溯到来源聚合消息，
@@ -357,10 +359,10 @@ const hasDetails = computed(() => hasFilePreview.value
   || Boolean(toolCall.value?.error)
   || executionApprovalPending.value
   || hasMandatoryInteraction.value);
-const autoExpandDetails = computed(() => hasFilePreview.value
-  || hasMandatoryInteraction.value
-  || toolCall.value?.display?.autoExpand === true
-  || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value));
+const autoExpandDetails = computed(() => hasMandatoryInteraction.value
+  || (!globalSettings.appearance.conciseMode && (hasFilePreview.value
+    || toolCall.value?.display?.autoExpand === true
+    || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value))));
 // read 这类默认收起的普通工具，参数预览只会先撑开一张 JSON 卡片、生成完又缩回一行，像抽搐；
 // 只有内容会展开显示的工具才用流式预览，其余直接显示收起的工具卡（“正在生成工具调用”）。
 const showStreamingPreview = computed(() => {
