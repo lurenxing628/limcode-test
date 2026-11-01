@@ -663,6 +663,10 @@ export class VscodeReliableKernelCommandRouter {
         await this.product.toolHost.refreshSkillCatalog();
         await this.broadcastConfigurationSnapshot(webview, message.id);
         return;
+      case BridgeMessageType.SkillCatalogAction:
+        await this.product.toolHost.runSkillCatalogAction(requirePayload(message.payload, 'Skill catalog action').action);
+        await this.broadcastConfigurationSnapshot(webview, message.id);
+        return;
       case BridgeMessageType.RulesCatalogRefresh:
         await this.product.toolHost.refreshRulesCatalog();
         await this.broadcastConfigurationSnapshot(webview, message.id);

@@ -115,9 +115,8 @@ function lastNonEmptyLine(text: string): string {
       <span class="thought-tail">{{ tailText }}</span>
     </template>
 
-    <!-- 折叠时不渲染完整 Markdown；展开后由正文组件直接消费原始流，不能把预览的平滑帧误当成最终文本替换。 -->
+    <!-- 折叠时不渲染完整 Markdown（折叠块按需挂载，收起动画结束后卸载）；展开后由正文组件直接消费原始流，不能把预览的平滑帧误当成最终文本替换。 -->
     <TextPartView
-      v-if="expanded"
       class="thought-content"
       :text="text"
       :streaming="streaming"

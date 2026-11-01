@@ -201,7 +201,7 @@ function cancelUnavailableQuestion(question: PendingAskUserView): void {
         <span class="ask-user-top-summary">{{ panelSummary }}</span>
       </template>
 
-      <div v-if="expanded" class="ask-user-top-scroll-shell">
+      <div class="ask-user-top-scroll-shell">
         <div ref="scroller" class="ask-user-top-scroll">
           <section v-for="batch in pendingBatches" :key="batch.key" class="ask-user-batch">
             <nav v-if="batch.items.length > 1" class="ask-user-batch-nav" aria-label="切换同批待回答问题">

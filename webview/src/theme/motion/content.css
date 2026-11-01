@@ -7,6 +7,8 @@
   --lc-content-output-background: var(--lc-content-input-background);
   --lc-content-icon-color: var(--vscode-descriptionForeground);
   --lc-content-block-section-max-height: 180px;
+  /* 新出现的内容块（工具预览卡、工具卡、状态尾巴）只做透明度淡入，不触发布局。 */
+  --lc-block-reveal-duration: 0.16s;
 
   /* 流式状态文字波浪动画。 */
   --lc-streaming-wave-duration: 1.6s;
@@ -40,5 +42,15 @@
   }
   50% {
     opacity: 0;
+  }
+}
+
+/* 内容块出现：只动透明度，由合成器完成，不重排。 */
+@keyframes lc-block-reveal {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }

@@ -38,6 +38,7 @@ const props = withDefaults(
   line-height: inherit;
   white-space: nowrap;
   vertical-align: baseline;
+  animation: lc-block-reveal var(--lc-block-reveal-duration) ease-out both;
 }
 
 .streaming-tail-text {

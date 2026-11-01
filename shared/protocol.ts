@@ -97,6 +97,7 @@ export enum BridgeMessageType {
   SkillPolicyScopeSet = 'skillPolicy.scope.set',
   SkillPolicyScopeClear = 'skillPolicy.scope.clear',
   SkillCatalogRefresh = 'skill.catalog.refresh',
+  SkillCatalogAction = 'skill.catalog.action',
   RulesFileSave = 'rules.file.save',
   RulesCatalogRefresh = 'rules.catalog.refresh',
   ToolExecutionCancel = 'tool.execution.cancel',
@@ -3225,6 +3226,11 @@ export interface SkillCatalogRefreshPayload {
   reason?: string;
 }
 
+/** Skill settings buttons: create a SKILL.md template, copy skill folders in, or reveal a skills directory. */
+export interface SkillCatalogActionPayload {
+  action: 'create' | 'import' | 'openFolder';
+}
+
 export interface RulesFileSavePayload {
   scope: RuleScope;
   /** 仅 AGENTS.md 可写；CLAUDE.md 为只读兼容读取，不通过此通道保存。 */
@@ -3367,6 +3373,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.SkillPolicyScopeSet, SkillPolicyScopeSetPayload>
   | BridgeEnvelope<BridgeMessageType.SkillPolicyScopeClear, SkillPolicyScopeClearPayload>
   | BridgeEnvelope<BridgeMessageType.SkillCatalogRefresh, SkillCatalogRefreshPayload>
+  | BridgeEnvelope<BridgeMessageType.SkillCatalogAction, SkillCatalogActionPayload>
   | BridgeEnvelope<BridgeMessageType.RulesFileSave, RulesFileSavePayload>
   | BridgeEnvelope<BridgeMessageType.RulesCatalogRefresh, RulesCatalogRefreshPayload>
   | BridgeEnvelope<BridgeMessageType.PlanReviewPolicyScopeSet, PlanReviewPolicyScopeSetPayload>

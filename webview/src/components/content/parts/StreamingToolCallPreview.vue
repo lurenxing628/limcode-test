@@ -10,11 +10,14 @@ import TextPartView from './TextPartView.vue';
 const props = withDefaults(defineProps<{
   preview: ReliableTransientToolCallState;
   active: boolean;
+  /** 参数已生成、工具还没开始执行（模型仍在输出或工具在排队）：标题不能读成“已完成”。 */
+  awaitingExecution?: boolean;
   maxBodyHeight?: number;
   compact?: boolean;
 }>(), {
   maxBodyHeight: 168,
-  compact: false
+  compact: false,
+  awaitingExecution: false
 });
 
 const framedPreview = shallowRef<ReliableTransientToolCallState>({ ...props.preview });
@@ -32,9 +35,11 @@ const previewStyle = computed(() => ({
 }));
 const previewFinal = computed(() => framedPreview.value.final === true);
 const previewStreaming = computed(() => props.active && !previewFinal.value);
+const previewAwaitingExecution = computed(() => previewFinal.value && props.awaitingExecution);
 const displayTitle = computed(() => {
   if (previewStreaming.value) return presentation.value.title;
   if (!previewFinal.value) return stoppedPreviewTitle(presentation.value.kind);
+  if (previewAwaitingExecution.value) return awaitingPreviewTitle(presentation.value.kind);
   switch (presentation.value.kind) {
     case 'plan': return 'Plan 已生成';
     case 'agent_answer': return 'Agent 回答已生成';
@@ -106,6 +111,17 @@ function flushPreviewFrame(): void {
   frameRequest = window.requestAnimationFrame(flushPreviewFrame);
 }
 
+function awaitingPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation>['kind']): string {
+  switch (kind) {
+    case 'plan': return 'Plan 已生成，正在提交';
+    case 'agent_answer': return 'Agent 回答已生成，正在提交';
+    case 'write': return '文件内容已生成，等待写入';
+    case 'edit': return '文件修改参数已生成，等待应用';
+    case 'command': return '命令已生成，等待执行';
+    case 'generic': return `${framedPreview.value.name?.trim() || '工具'} 参数已生成，等待执行`;
+  }
+}
+
 function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation>['kind']): string {
   switch (kind) {
     case 'plan': return 'Plan 生成已停止';
@@ -132,7 +148,7 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
         <strong>{{ displayTitle }}</strong>
         <span v-if="presentation.subject" class="tool-preview-subject">{{ presentation.subject }}</span>
       </span>
-      <span v-if="previewStreaming" class="tool-preview-pulse" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span v-if="previewStreaming || previewAwaitingExecution" class="tool-preview-pulse" aria-hidden="true"><i></i><i></i><i></i></span>
     </header>
     <div class="tool-preview-detail">{{ presentation.detail }}</div>
     <div v-if="presentation.previewText" class="tool-preview-code-shell">
@@ -164,6 +180,7 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
   background: color-mix(in srgb, var(--vscode-editor-background) 96%, var(--vscode-foreground) 4%);
   color: var(--vscode-foreground);
   min-width: 0;
+  animation: lc-block-reveal var(--lc-block-reveal-duration) ease-out both;
 }
 
 .tool-preview-card.is-compact {
@@ -306,6 +323,7 @@ function stoppedPreviewTitle(kind: ReturnType<typeof toolCallPreviewPresentation
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .tool-preview-card,
   .tool-preview-pulse i,
   .tool-preview-caret { animation: none; }
 }

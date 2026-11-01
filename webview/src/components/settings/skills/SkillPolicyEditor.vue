@@ -197,6 +197,11 @@ function toggleSkillExpanded(id: string): void {
     <p v-if="childBoundNote" class="skill-policy-note">{{ childBoundNote }}</p>
 
     <div class="skill-policy-actions">
+      <template v-if="scopeKind === 'global'">
+        <button type="button" @click="store.runCatalogAction('create')">新建技能…</button>
+        <button type="button" class="secondary" @click="store.runCatalogAction('import')">导入技能…</button>
+        <button type="button" class="secondary" @click="store.runCatalogAction('openFolder')">打开技能目录…</button>
+      </template>
       <button type="button" class="secondary" :disabled="refreshing" @click="refreshCatalog">{{ refreshing ? '刷新中…' : '刷新技能' }}</button>
       <button type="button" :disabled="readonly || skills.length === 0" @click="enableAll">启用全部</button>
       <button type="button" class="secondary" :disabled="readonly || skills.length === 0" @click="disableAll">禁用全部</button>
@@ -206,7 +211,7 @@ function toggleSkillExpanded(id: string): void {
     <div class="skill-list-shell">
       <div ref="scroller" class="skill-list-scroll">
         <div v-if="skills.length === 0" class="skill-list-empty">
-          未发现技能。将 SKILL.md 放入项目或用户主目录的 .agents/skills/&lt;名称&gt;/、.claude/skills/&lt;名称&gt;/ 等技能目录，或数据根 skills/&lt;名称&gt;/ 后会自动出现。
+          未发现技能。在全局设置的技能页点「新建技能」或「导入技能」即可添加；也可以把 SKILL.md 放入项目或用户主目录的 .agents/skills/&lt;名称&gt;/、.claude/skills/&lt;名称&gt;/ 等技能目录，或数据根 skills/&lt;名称&gt;/，会自动出现。
         </div>
         <template v-else>
           <section v-for="group in groups" :key="group.source" class="skill-source-group" aria-label="技能来源分组">

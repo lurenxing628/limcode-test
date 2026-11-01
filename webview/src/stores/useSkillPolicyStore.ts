@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 import type {
+  SkillCatalogActionPayload,
   SkillDefinitionRecord,
   SkillPolicyRecord,
   SkillPolicyScopeKind,
@@ -119,6 +120,10 @@ export const useSkillPolicyStore = defineStore('skillPolicy', {
     },
     refreshCatalog(): void {
       bridge.request(BridgeMessageType.SkillCatalogRefresh, {});
+    },
+    /** 新建、导入技能或打开技能目录：选择目录和输入名称都在 VS Code 原生对话框里完成。 */
+    runCatalogAction(action: SkillCatalogActionPayload['action']): void {
+      bridge.request(BridgeMessageType.SkillCatalogAction, { action });
     },
     clearPolicyScope(scopeKind: SkillPolicyScopeKind, scopeId?: string): void {
       if (scopeKind === 'global') return;

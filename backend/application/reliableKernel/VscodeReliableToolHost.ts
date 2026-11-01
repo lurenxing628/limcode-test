@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import type * as vscode from 'vscode';
 import { createSkillCatalogCapability } from '../../capabilities/skillCatalog';
+import { runSkillCatalogAction } from '../../capabilities/skillInstall';
 import { createRulesCatalogCapability } from '../../capabilities/rulesCatalog';
 import { createVsCodeFsCapability } from '../../capabilities/vscodeFs';
 import { createWorkEnvironmentRuntimeCapability } from '../../capabilities/workEnvironmentTransfer';
@@ -16,7 +17,7 @@ import {
   type ToolResultOut,
   type ToolRuntimeEvent
 } from '../../world/modules/tools/registry';
-import { SKILLS_TOOL_NAME, type GlobalSettingsRecord, type RuleFileRecord, type RuleScope, type SkillDefinitionRecord, type SkillPolicyRecord, type ToolDefinitionRecord, type WorkEnvironmentRecord } from '../../../shared/protocol';
+import { SKILLS_TOOL_NAME, type GlobalSettingsRecord, type SkillCatalogActionPayload, type RuleFileRecord, type RuleScope, type SkillDefinitionRecord, type SkillPolicyRecord, type ToolDefinitionRecord, type WorkEnvironmentRecord } from '../../../shared/protocol';
 import type {
   ReliableAgentToolDispatchInput,
   ReliableAgentToolPause,
@@ -82,7 +83,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   }>>();
 
   public constructor(
-    context: vscode.ExtensionContext,
+    private readonly context: vscode.ExtensionContext,
     private readonly configuration: VscodeConfigurationAuthority,
     private readonly options: VscodeReliableToolHostOptions = {}
   ) {
@@ -176,6 +177,11 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
   public async refreshSkillCatalog(): Promise<void> {
     await this.skills.refresh();
     this.notifyStateChange();
+  }
+
+  /** Create, import or reveal skills from the settings page; a change rescans the catalog. */
+  public async runSkillCatalogAction(action: SkillCatalogActionPayload['action']): Promise<void> {
+    if (await runSkillCatalogAction(this.context, action)) await this.refreshSkillCatalog();
   }
 
   /**
