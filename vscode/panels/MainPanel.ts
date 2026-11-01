@@ -423,6 +423,10 @@ export class MainPanel {
           this.openLocalFileFromPanel(message.payload.source);
           return;
         }
+        if (message.type === BridgeMessageType.AgentSettingsOpen) {
+          void MainPanel.createOrShow(this.extensionUri, this.backendApp, { kind: 'agentSettings', reuse: true });
+          return;
+        }
         if (message.type === BridgeMessageType.DataRootAction && message.payload?.action) {
           this.runDataRootActionFromPanel(message.payload);
           return;

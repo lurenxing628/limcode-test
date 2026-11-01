@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onBeforeUnmount, ref, watch } from 'vue';
 import {
   isFunctionCallPart,
   type ContentPart,
@@ -70,6 +70,59 @@ const standaloneStreamingText = computed(() => standaloneStreamingPhase.value ==
   ? globalSettings.appearance.streamingTextThinking
   : globalSettings.appearance.streamingTextWriting
 );
+
+/** 状态尾巴消失前先等一会儿：“正在输出”到“正在执行工具”之间常有短暂空档，不让这一行先缩回再弹出。 */
+const TAIL_HIDE_GRACE_MS = 320;
+/** 与 lc-collapse-shell 的行高过渡一致，收起动画结束后再卸载尾巴（停掉它的循环动画）。 */
+const TAIL_COLLAPSE_MS = 200;
+type TailState = { text: string; variant: 'thinking' | 'writing' | 'waiting' | 'executing' };
+const tailState = computed<TailState | undefined>(() => {
+  if (showStandaloneStreamingTail.value) return { text: standaloneStreamingText.value, variant: standaloneStreamingPhase.value };
+  if (showToolExecutingTail.value) return { text: globalSettings.appearance.streamingTextToolExecuting, variant: 'executing' };
+  return undefined;
+});
+const shownTail = ref<TailState | undefined>(tailState.value);
+const tailExpanded = ref(tailState.value !== undefined);
+let tailTimer: number | undefined;
+let tailFrame: number | undefined;
+watch(tailState, (next) => {
+  clearTailTimers();
+  if (next) {
+    const entering = !shownTail.value;
+    shownTail.value = next;
+    if (!entering) {
+      tailExpanded.value = true;
+      return;
+    }
+    // 先以收起状态挂上，下一帧再展开，才有过渡。
+    tailExpanded.value = false;
+    tailFrame = window.requestAnimationFrame(() => {
+      tailFrame = undefined;
+      tailExpanded.value = true;
+    });
+    return;
+  }
+  if (!shownTail.value) return;
+  // 仍在流式时尾巴让位给正文自己的光标，立即收起；流式刚结束才可能紧接着进入工具执行。
+  if (props.streaming) collapseTail();
+  else tailTimer = window.setTimeout(collapseTail, TAIL_HIDE_GRACE_MS);
+});
+onBeforeUnmount(clearTailTimers);
+
+function collapseTail(): void {
+  tailExpanded.value = false;
+  tailTimer = window.setTimeout(() => {
+    tailTimer = undefined;
+    shownTail.value = undefined;
+  }, TAIL_COLLAPSE_MS);
+}
+
+function clearTailTimers(): void {
+  if (tailTimer !== undefined) window.clearTimeout(tailTimer);
+  if (tailFrame !== undefined) window.cancelAnimationFrame(tailFrame);
+  tailTimer = undefined;
+  tailFrame = undefined;
+}
 
 function nodeStreaming(node: RichRenderNode, index: number): boolean {
   if (!props.streaming || index !== nodes.value.length - 1) return false;
@@ -259,11 +312,10 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
         <component :is="partViewComponent(node.kind)" v-bind="nodeComponentProps(node, blockWindow.start.value + index)" />
       </div>
       <div v-if="blockWindow.afterHeight.value > 0" class="rich-content-spacer" :style="{ height: `${blockWindow.afterHeight.value}px` }" aria-hidden="true" />
-      <div v-if="showStandaloneStreamingTail" class="rich-streaming-tail-row">
-        <StreamingIndicatorTail :text="standaloneStreamingText" :variant="standaloneStreamingPhase" />
-      </div>
-      <div v-if="showToolExecutingTail" class="rich-streaming-tail-row">
-        <StreamingIndicatorTail :text="globalSettings.appearance.streamingTextToolExecuting" variant="executing" />
+      <div v-if="shownTail" class="rich-streaming-tail-row lc-collapse-shell" :class="{ 'is-expanded': tailExpanded }">
+        <div class="lc-collapse-frame">
+          <StreamingIndicatorTail :text="shownTail.text" :variant="shownTail.variant" />
+        </div>
       </div>
     </template>
     <!-- 流式中但还没有任何内容块：渲染一个仅含光标的空文本节点。 -->
@@ -294,5 +346,13 @@ function isExecutionApprovedProgress(progress: unknown): boolean {
   font-size: var(--font-size-sm);
   font-style: italic;
   min-width: 0;
+  /* 收起时连同上方的 flex 间距一起让出，展开/收起都只是这一行在过渡。 */
+  margin-top: calc(-1 * var(--space-2));
+  transition-property: grid-template-rows, opacity, transform, margin-top;
+  transition-duration: var(--lc-collapse-grid-duration);
+}
+
+.rich-streaming-tail-row.is-expanded {
+  margin-top: 0;
 }
 </style>

@@ -13,6 +13,7 @@ import {
   TRANSFER_TOOL_NAME
 } from '@shared/protocol';
 import { MAX_CONCURRENT_CHILD_AGENT_STARTS_PER_TURN } from '@shared/agentScheduling';
+import { toolCallPreviewPresentation } from '@shared/toolCallPreview';
 import { submitPlanOutputFromResult } from '@shared/planReview';
 import type {
   FunctionCallPart,
@@ -40,6 +41,7 @@ import {
 } from '@webview/domain/reliableDetailKey';
 import { useInteractionStore } from '@webview/stores/useInteractionStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { useSwapHeightTransition } from '@webview/composables/useSwapHeightTransition';
 import { bridge, BridgeMessageType } from '@webview/transport';
 import AskUserContent from '@webview/components/askUser/AskUserContent.vue';
 import PlanProposalContent from '@webview/components/plan/PlanProposalContent.vue';
@@ -359,6 +361,15 @@ const autoExpandDetails = computed(() => hasFilePreview.value
   || hasMandatoryInteraction.value
   || toolCall.value?.display?.autoExpand === true
   || (toolCall.value?.display?.autoExpand === undefined && defaultAutoExpandTool.value));
+// read 这类默认收起的普通工具，参数预览只会先撑开一张 JSON 卡片、生成完又缩回一行，像抽搐；
+// 只有内容会展开显示的工具才用流式预览，其余直接显示收起的工具卡（“正在生成工具调用”）。
+const showStreamingPreview = computed(() => {
+  const preview = transientPreview.value;
+  return !!preview && (autoExpandDetails.value || toolCallPreviewPresentation(preview).kind !== 'generic');
+});
+const swapShell = ref<HTMLElement | null>(null);
+// 预览换成工具卡（命令开始执行、参数生成完）时高度会骤降，过渡一下，不让下方内容一帧跳上来。
+useSwapHeightTransition(swapShell, () => showStreamingPreview.value);
 const autoOpenDiffPreview = computed(() => toolCall.value?.display?.autoOpenDiffPreview === true);
 const autoApplyChange = computed(() => {
   const policy = fileChangeInteraction.value?.policySnapshot;
@@ -1006,8 +1017,9 @@ function isFinalizingProgress(progress: unknown): boolean {
 </script>
 
 <template>
+  <div ref="swapShell" class="tool-call-swap-shell">
   <StreamingToolCallPreview
-    v-if="transientPreview"
+    v-if="showStreamingPreview && transientPreview"
     :preview="transientPreview"
     :active="props.streaming === true"
     :awaiting-execution="transientPreviewAwaitingExecution"
@@ -1217,12 +1229,13 @@ function isFinalizingProgress(progress: unknown): boolean {
       </p>
     </div>
   </CollapsibleContentBlock>
+  </div>
 
   <p v-if="interactionResolutionMessage" class="part-card-note tool-interaction-resolution-note" role="status">
     {{ interactionResolutionMessage }}
   </p>
 
-  <div v-if="!transientPreview && needsExecutionDecision" class="tool-decision-actions is-external">
+  <div v-if="!showStreamingPreview && needsExecutionDecision" class="tool-decision-actions is-external">
     <button type="button" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'accept')">批准执行</button>
     <button type="button" class="secondary" :disabled="interactionDecisionPending" @click="resolveToolInteraction('exec_approval', 'reject')">拒绝</button>
   </div>
@@ -1238,6 +1251,10 @@ function isFinalizingProgress(progress: unknown): boolean {
 </template>
 
 <style scoped>
+.tool-call-swap-shell {
+  display: flow-root;
+}
+
 .tool-response-attachments {
   display: grid;
   gap: var(--space-2, 8px);

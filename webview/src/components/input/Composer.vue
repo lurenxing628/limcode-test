@@ -1,6 +1,6 @@
 ﻿<script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
-import { IconInfoCircle, IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconTrash, IconWorld } from '@tabler/icons-vue';
+import { IconInfoCircle, IconFolder, IconHistory, IconListDetails, IconPaperclip, IconPencilExclamation, IconPlayerStop, IconRobot, IconSend2, IconSettings, IconTrash, IconWorld } from '@tabler/icons-vue';
 import { workEnvironmentDisplayPath, workEnvironmentSortKey as buildWorkEnvironmentSortKey } from '@shared/workEnvironmentCatalog';
 import { toStructuredClonePlainData } from '@shared/plainData';
 import {
@@ -164,6 +164,9 @@ function compressCurrentContext(): void {
   const conversationId = reliableConversation.conversationId.value;
   if (!conversationId || !canCompressCurrentContext.value) return;
   compressContext(conversationId, { kind: 'current_head' });
+}
+function openAgentSettings(): void {
+  bridge.request(BridgeMessageType.AgentSettingsOpen, undefined);
 }
 const summaryRebuildTarget = ref<{ conversationId: string; rootId: string }>();
 const currentContextRootId = computed(() => {
@@ -1104,6 +1107,13 @@ function agentSourceDescription(agent: AgentRecord): string {
             @open="onAgentDropdownOpen"
           />
         </template>
+        <button
+          type="button"
+          class="composer-directory-info composer-agent-settings"
+          aria-label="打开 Agent 设置"
+          title="打开 Agent 设置"
+          @click="openAgentSettings"
+        ><IconSettings :size="14" aria-hidden="true" /></button>
         <template v-if="workflowOptions.length">
           <SettingsDropdown
             panel-sizing="content"

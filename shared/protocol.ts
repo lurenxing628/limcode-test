@@ -107,6 +107,7 @@ export enum BridgeMessageType {
   PlanProposalExport = 'planProposal.export',
   CheckpointDiffOpen = 'checkpoint.diff.open',
   LocalFileOpen = 'localFile.open',
+  AgentSettingsOpen = 'agentSettings.open',
   DataRootAction = 'dataRoot.action',
   DataRootPrompt = 'dataRoot.prompt',
   AttachmentOpen = 'attachment.open',
@@ -3387,6 +3388,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.PlanProposalExport, PlanProposalExportPayload>
   | BridgeEnvelope<BridgeMessageType.CheckpointDiffOpen, CheckpointDiffOpenPayload>
   | BridgeEnvelope<BridgeMessageType.LocalFileOpen, LocalFileOpenPayload>
+  | BridgeEnvelope<BridgeMessageType.AgentSettingsOpen, undefined>
   | BridgeEnvelope<BridgeMessageType.DataRootAction, DataRootActionPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentOpen, AttachmentOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReload, AttachmentReloadPayload>
