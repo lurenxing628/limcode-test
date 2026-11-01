@@ -15,8 +15,12 @@ export const EXTENSION_COMMAND_IDS = {
   returnToPreviousDataRoot: 'limcode-test.returnToPreviousDataRoot',
   deletePreviousDataRoot: 'limcode-test.deletePreviousDataRoot',
   cleanupBackups: 'limcode-test.cleanupBackups',
+  lanMobileAccess: 'limcode-test.lanMobileAccess',
   applyLiveDiffPreview: 'limcode-test.applyLiveDiffPreview'
 } as const;
+
+/** workspaceState key: LAN remote access stays on across reloads of the window that switched it on. */
+export const LAN_MOBILE_ACCESS_STATE_KEY = 'lanMobileAccess.enabled';
 
 export const MAIN_PANEL_VIEW_TYPE = 'limcode-test.mainPanel';
 export const SIDEBAR_CONTAINER_ID = 'limcode-test-sidebar';

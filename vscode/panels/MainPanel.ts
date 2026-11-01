@@ -431,6 +431,10 @@ export class MainPanel {
           this.runDataRootActionFromPanel(message.payload);
           return;
         }
+        if (message.type === BridgeMessageType.LanMobileAccessRequest) {
+          void vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.lanMobileAccess, { clientId: this.clientId, ...message.payload });
+          return;
+        }
         this.backendApp.handleWebviewMessage(this.clientId, message);
         this.refreshTitleFromOutgoingMessage(message);
       },

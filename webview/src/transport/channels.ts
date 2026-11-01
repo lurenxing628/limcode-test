@@ -60,6 +60,7 @@ export function channelForType(type: WebviewToExtensionMessage['type']): BridgeC
     case BridgeMessageType.LocalFileOpen:
     case BridgeMessageType.AgentSettingsOpen:
     case BridgeMessageType.DataRootAction:
+    case BridgeMessageType.LanMobileAccessRequest:
     case BridgeMessageType.AttachmentOpen:
       return 'command';
     case BridgeMessageType.ClientResync:

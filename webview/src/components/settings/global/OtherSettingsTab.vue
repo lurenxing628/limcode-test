@@ -2,6 +2,7 @@
 import SettingsLoadingInline from '@webview/components/settings/SettingsLoadingInline.vue';
 import DebugCaptureSettings from './DebugCaptureSettings.vue';
 import TaskCompletionSoundSettings from './TaskCompletionSoundSettings.vue';
+import LanMobileAccessSettings from './LanMobileAccessSettings.vue';
 import LcCheckbox from '@webview/components/ui/LcCheckbox.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { useSettingsLoadingText } from '@webview/composables/useSettingsLoading';
@@ -66,6 +67,8 @@ function saveOtherSettings(): void {
       </LcCheckbox>
       <span class="global-settings-field-hint">默认关闭，仅 LLM 提供商连接使用代理；勾选后新启动的 shell 子进程继承代理环境变量，MCP 连接保存后自动重建。</span>
     </div>
+
+    <LanMobileAccessSettings />
 
     <div class="global-settings-field" aria-label="数据目录">
       <span>数据目录</span>

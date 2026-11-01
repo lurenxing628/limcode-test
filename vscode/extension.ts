@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import type { VscodeReliableKernelApplicationFacade } from '../backend/application/reliableKernel/VscodeReliableKernelApplicationFacade';
 import type { DataRootUnavailableReason } from '../backend/reliableKernel/runtimeDataRootRelocation';
-import { EXTENSION_BRAND } from '../shared/extensionIdentity';
+import { EXTENSION_BRAND, LAN_MOBILE_ACCESS_STATE_KEY } from '../shared/extensionIdentity';
 import { ApplicationStartup } from './ApplicationStartup';
 import { registerCommands } from './commands/registerCommands';
 import { MainPanel } from './panels/MainPanel';
@@ -24,6 +24,9 @@ export function activate(context: vscode.ExtensionContext): void {
   MainPanel.registerSerializer(context, startup);
   registerCommands(context, startup);
   registerSidebarEntryView(context, startup);
+  if (context.workspaceState.get(LAN_MOBILE_ACCESS_STATE_KEY) === true) {
+    void import('./lanMobileAccess').then(({ restoreLanMobileAccess }) => restoreLanMobileAccess(context, startup));
+  }
   console.log(`${EXTENSION_BRAND} visible surfaces registered in ${Date.now() - activationStartedAt}ms.`);
 
   // Runtime evaluation is demand-started by the first command or Webview handshake. A sidebar

@@ -357,3 +357,23 @@ test('InputPanel delays error display without relaxing required, custom, optiona
   await p.evaluate(() => { window.fixture.inputProps.required = false; window.fixture.inputProps.initialValue = ''; });
   await name.press('Enter'); assert.deepEqual(await p.evaluate(() => window.fixture.confirmed), ['good', '']);
 });
+
+test('其他页的远程访问开关：打开时读取状态，勾选后请求开启并显示地址', async t => {
+  const p = await pageFor(t);
+  await p.getByText('其他', { exact: true }).first().click();
+  const toggle = p.getByRole('checkbox', { name: '开启局域网远程访问' });
+  await toggle.waitFor();
+  assert.deepEqual(await p.evaluate(() => window.fixtureMessages.filter(message => message.type === 'lanMobileAccess.request').map(message => [message.channel, message.payload])),
+    [['command', {}]]);
+  assert.equal(await toggle.isDisabled(), true, '收到状态前不可操作');
+  const reply = payload => p.evaluate(data => window.dispatchEvent(new MessageEvent('message', { data })),
+    { id: 'state', type: 'lanMobileAccess.state', channel: 'settings', payload });
+  await reply({ enabled: false, urls: [] });
+  assert.equal(await toggle.isChecked(), false);
+  await toggle.click();
+  assert.deepEqual(await p.evaluate(() => window.fixtureMessages.filter(message => message.type === 'lanMobileAccess.request').at(-1).payload), { enabled: true });
+  await reply({ enabled: true, urls: ['http://192.168.1.20:14319'] });
+  assert.equal(await toggle.isChecked(), true);
+  await p.getByText('http://192.168.1.20:14319').waitFor();
+  await shot(p, 'other-lan-mobile-access');
+});

@@ -110,6 +110,8 @@ export enum BridgeMessageType {
   AgentSettingsOpen = 'agentSettings.open',
   DataRootAction = 'dataRoot.action',
   DataRootPrompt = 'dataRoot.prompt',
+  LanMobileAccessRequest = 'lanMobileAccess.request',
+  LanMobileAccessState = 'lanMobileAccess.state',
   AttachmentOpen = 'attachment.open',
   AttachmentOpenResult = 'attachment.open.result',
   AttachmentReload = 'attachment.reload',
@@ -3299,6 +3301,19 @@ export interface DataRootPromptSection {
   options?: DataRootPromptOption[];
 }
 
+/** Settings page switch of LAN remote access; without `enabled` it only asks for the current state. */
+export interface LanMobileAccessRequestPayload {
+  enabled?: boolean;
+}
+
+/** Sent to every settings page that asked, again whenever the switch changes. */
+export interface LanMobileAccessStatePayload {
+  enabled: boolean;
+  /** Addresses a phone on the same network can open; empty while off. */
+  urls: string[];
+  error?: string;
+}
+
 /** A confirmation or notice of a data-directory command, shown in the settings page's ConfirmPanel. */
 export interface DataRootPromptPayload {
   flowId: string;
@@ -3392,6 +3407,7 @@ export type WebviewToExtensionMessage =
   | BridgeEnvelope<BridgeMessageType.LocalFileOpen, LocalFileOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AgentSettingsOpen, undefined>
   | BridgeEnvelope<BridgeMessageType.DataRootAction, DataRootActionPayload>
+  | BridgeEnvelope<BridgeMessageType.LanMobileAccessRequest, LanMobileAccessRequestPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentOpen, AttachmentOpenPayload>
   | BridgeEnvelope<BridgeMessageType.AttachmentReload, AttachmentReloadPayload>
   | BridgeEnvelope<BridgeMessageType.ClientResync, ClientResyncPayload>
@@ -3440,6 +3456,7 @@ export interface BridgeErrorPayload {
 
 export type ExtensionToWebviewMessage =
   | BridgeEnvelope<BridgeMessageType.DataRootPrompt, DataRootPromptPayload>
+  | BridgeEnvelope<BridgeMessageType.LanMobileAccessState, LanMobileAccessStatePayload>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureResult, DebugCaptureResult>
   | BridgeEnvelope<BridgeMessageType.DebugCaptureObservationAck, DebugCaptureUiAck>
   | BridgeEnvelope<BridgeMessageType.Hello, BridgeHelloPayload>

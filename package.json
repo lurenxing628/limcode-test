@@ -20,7 +20,8 @@
   ],
   "main": "./dist/extension/vscode/extension.js",
   "activationEvents": [
-    "onWebviewPanel:limcode-test.mainPanel"
+    "onWebviewPanel:limcode-test.mainPanel",
+    "onStartupFinished"
   ],
   "contributes": {
     "commands": [
@@ -73,6 +74,11 @@
       {
         "command": "limcode-test.cleanupBackups",
         "title": "Limcode Test: 清理备份",
+        "category": "Limcode Test"
+      },
+      {
+        "command": "limcode-test.lanMobileAccess",
+        "title": "Limcode Test: 远程访问（局域网）",
         "category": "Limcode Test"
       }
     ],
