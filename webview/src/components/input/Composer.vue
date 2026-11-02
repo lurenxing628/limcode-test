@@ -23,6 +23,7 @@ import { useAgentStore } from '@webview/stores/useAgentStore';
 import { useModelProfileStore } from '@webview/stores/useModelProfileStore';
 import { useChat } from '@webview/composables/useChat';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
+import { reliableKernelDetailKey } from '@webview/domain/reliableDetailKey';
 import RichContentEditor from '@webview/components/content/RichContentEditor.vue';
 import AskUserTopPanel from '@webview/components/askUser/AskUserTopPanel.vue';
 import SettingsDropdown, { type SettingsDropdownOption } from '@webview/components/settings/global/SettingsDropdown.vue';
@@ -76,6 +77,7 @@ const workEnvironmentStore = useWorkEnvironmentStore();
 const ui = useConversationUiStore();
 const session = useSessionStore();
 const reliableConversation = useReliableConversation();
+const HISTORY_DETAIL_OWNER = 'composer-history';
 const {
   interruptCurrentConversation,
   sendMessage,
@@ -558,6 +560,7 @@ onBeforeUnmount(() => {
   conversationRevision += 1;
   submissionDraftRevision += 1;
   draftPersistence.dispose();
+  reliableConversation.feed.setDetailOwnerKeys(HISTORY_DETAIL_OWNER, []);
   window.removeEventListener('keydown', onWindowKeydown);
   window.removeEventListener('resize', onWindowResize);
   if (highlightTimer !== undefined) window.clearTimeout(highlightTimer);
@@ -612,6 +615,27 @@ async function submit(): Promise<void> {
   currentSubmissionDraft = { conversationId: submission.conversationId, revision: draftRevision, generation: ui.chatDraftGeneration, restoreFocus };
   currentSubmissionCommandId.value = submission.commandId;
 }
+
+// 消息列表只读取挂载的 30 行里的正文，一个长回合就能把用户消息挤出去；翻看用的最近 20 条由输入框自己持有。
+const historyContentDemand = computed(() => {
+  const current = reliableConversation.projection.value;
+  const metadata = current.index.messageMetadata;
+  const messageIds: string[] = [];
+  const keys: string[] = [];
+  for (let index = metadata.length - 1; index >= 0 && messageIds.length < 20; index -= 1) {
+    const { id, role } = metadata[index]!;
+    const revisionId = current.messageRevisionIdByMessageId[id];
+    if (role !== 'user' || !revisionId || current.contentWindowByMessageId[id]) continue;
+    messageIds.push(id);
+    keys.push(reliableKernelDetailKey('message-content', revisionId));
+  }
+  return { messageIds, keys };
+});
+watch(() => historyContentDemand.value.keys.join('|'), () => {
+  const { messageIds, keys } = historyContentDemand.value;
+  reliableConversation.feed.setDetailOwnerKeys(HISTORY_DETAIL_OWNER, keys);
+  reliableConversation.ensureDetails({ messageIds, priority: 'background', includePendingInteractions: false });
+}, { immediate: true });
 
 /** 本对话已加载的、自己发过的文字，新的在前，相邻重复只留一条；按 ↑ 翻看时才计算。 */
 function sentMessageHistory(): string[] {
