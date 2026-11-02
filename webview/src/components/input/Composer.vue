@@ -15,7 +15,7 @@ import {
 } from '@shared/protocol';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
-import { useConversationUiStore } from '@webview/stores/useConversationUiStore';
+import { useConversationUiStore, visibleMessageText } from '@webview/stores/useConversationUiStore';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { DEFAULT_WORKFLOW_OPTION_ID, useWorkflowStore } from '@webview/stores/useWorkflowStore';
 import { useWorkEnvironmentStore } from '@webview/stores/useWorkEnvironmentStore';
@@ -613,6 +613,18 @@ async function submit(): Promise<void> {
   currentSubmissionCommandId.value = submission.commandId;
 }
 
+/** 本对话已加载的、自己发过的文字，新的在前，相邻重复只留一条；按 ↑ 翻看时才计算。 */
+function sentMessageHistory(): string[] {
+  const texts: string[] = [];
+  const messages = reliableConversation.projection.value.messages;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]!;
+    const text = message.role === 'user' ? visibleMessageText(message) : '';
+    if (text && text !== texts[texts.length - 1]) texts.push(text);
+  }
+  return texts;
+}
+
 function openFilePicker(): void { fileInput.value?.click(); }
 
 async function onPasteFiles(files: File[]): Promise<void> {
@@ -1007,6 +1019,7 @@ function agentSourceDescription(agent: AgentRecord): string {
           :placeholder="ui.isEditing ? (ui.editingTurnIntent ? '编辑排队消息内容...' : '编辑消息内容...') : effectivePlaceholder"
           :disabled="conversationInputDisabled"
           :rows="5"
+          :history="ui.isEditing ? undefined : sentMessageHistory"
           @submit="submit"
           @paste-files="onPasteFiles"
         />

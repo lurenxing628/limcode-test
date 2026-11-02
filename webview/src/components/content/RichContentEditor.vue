@@ -12,6 +12,8 @@ const props = withDefaults(
     rows?: number;
     /** 按 Enter（不含 Shift）是否触发 submit。Shift+Enter 始终换行。 */
     submitOnEnter?: boolean;
+    /** 空输入框按 ↑ 可翻看的历史文字，新的在前；开始翻看时才读取。 */
+    history?: () => readonly string[];
   }>(),
   { placeholder: '', disabled: false, rows: 2, submitOnEnter: true }
 );
@@ -26,6 +28,9 @@ const textarea = ref<HTMLTextAreaElement | null>(null);
 const scrollbarRefreshKey = ref(0);
 const pathDragActive = ref(false);
 const pendingDrops = new Set<() => void>();
+// 正在翻看的历史。输入框里仍是放进去的那条才算翻看：打字、点击、离开或除 ↑↓ 外的按键都转为普通编辑。
+const browsing = ref<{ entries: readonly string[]; index: number }>();
+const MODIFIER_KEYS = new Set(['Shift', 'Control', 'Alt', 'Meta']);
 
 const focusRecoveryDelays = [80, 180] as const;
 const focusVerificationDelays = [140] as const;
@@ -93,6 +98,7 @@ function onFocusNavigation(event: KeyboardEvent): void {
 }
 
 function onTextareaPointerDown(): void {
+  browsing.value = undefined;
   if (props.disabled) return;
   lastTextareaPointerDownFromBlurredWindow = !document.hasFocus();
   lastTextareaPointerDownAt = performance.now();
@@ -137,10 +143,46 @@ function clearFocusRecoveryTimers(): void {
 function onKeydown(event: KeyboardEvent): void {
   // 输入法用回车确认文字时，这次按键归输入法：Chromium 标 isComposing；Safari（局域网手机页）先结束组合，只剩 keyCode 229。
   if (event.isComposing || event.keyCode === 229) return;
+  if (browseHistory(event)) return;
   if (props.submitOnEnter && event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
     emit('submit');
   }
+}
+
+/** ↑ 从空输入框开始翻看，↑↓ 连续翻，翻过最新一条或按 Esc 回到空；其它按键照常处理并转为编辑。 */
+function browseHistory(event: KeyboardEvent): boolean {
+  const plain = !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey;
+  const step = plain && event.key === 'ArrowUp' ? 1 : plain && event.key === 'ArrowDown' ? -1 : 0;
+  const current = browsing.value;
+  if (!current) {
+    const entries = step === 1 && props.modelValue === '' ? props.history?.() ?? [] : [];
+    if (entries.length === 0) return false;
+    showHistory(entries, 0);
+  } else if (step !== 0 || (plain && event.key === 'Escape')) {
+    const index = event.key === 'Escape' ? -1 : Math.min(current.index + step, current.entries.length - 1);
+    if (index < 0) {
+      browsing.value = undefined;
+      emit('update:modelValue', '');
+    } else showHistory(current.entries, index);
+  } else {
+    if (!MODIFIER_KEYS.has(event.key)) browsing.value = undefined;
+    return false;
+  }
+  event.preventDefault();
+  return true;
+}
+
+function showHistory(entries: readonly string[], index: number): void {
+  const text = entries[index]!;
+  browsing.value = { entries, index };
+  emit('update:modelValue', text);
+  void nextTick(() => textarea.value?.setSelectionRange(text.length, text.length));
+}
+
+function onTextareaInput(): void {
+  browsing.value = undefined;
+  queueScrollbarRefresh();
 }
 
 function onPaste(event: ClipboardEvent): void {
@@ -312,7 +354,7 @@ defineExpose({ focus, captureFocusRestore });
 </script>
 
 <template>
-  <div class="rich-editor" :class="{ 'is-disabled': disabled, 'is-path-drag-active': pathDragActive }" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
+  <div class="rich-editor" :class="{ 'is-disabled': disabled, 'is-path-drag-active': pathDragActive, 'is-browsing-history': browsing }" @dragover="onDragOver" @dragleave="onDragLeave" @drop="onDrop">
     <textarea
       ref="textarea"
       v-model="value"
@@ -322,10 +364,14 @@ defineExpose({ focus, captureFocusRestore });
       :disabled="disabled"
       @pointerdown.capture="onTextareaPointerDown"
       @focus="onTextareaFocus"
+      @blur="browsing = undefined"
       @keydown="onKeydown"
-      @input="queueScrollbarRefresh"
+      @input="onTextareaInput"
       @paste="onPaste"
     ></textarea>
+    <div v-if="browsing" class="rich-editor-history-hint" aria-live="polite">
+      历史 {{ browsing.index + 1 }}/{{ browsing.entries.length }} · ↑↓ 翻看 · ←→ 或输入开始修改
+    </div>
     <AdvancedScrollbar
       class="rich-editor-scrollbar"
       :scroller="textarea"
@@ -390,6 +436,25 @@ defineExpose({ focus, captureFocusRestore });
 
 .rich-editor-control::placeholder {
   color: var(--vscode-input-placeholderForeground);
+}
+
+.rich-editor.is-browsing-history .rich-editor-control {
+  padding-bottom: calc(var(--space-2) + 16px);
+}
+
+.rich-editor-history-hint {
+  position: absolute;
+  left: var(--space-2);
+  right: calc(var(--space-2) + 9px);
+  bottom: var(--space-1);
+  overflow: hidden;
+  background: var(--vscode-input-background);
+  color: var(--vscode-descriptionForeground);
+  font-size: var(--font-size-xs);
+  line-height: 16px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  pointer-events: none;
 }
 
 .rich-editor :deep(.advanced-scrollbar.rich-editor-scrollbar) {
