@@ -233,3 +233,19 @@ test('协作查找跨过已展示卡片和空页，找到新卡片即停', async
   assert.equal(await p.getByRole('button', { name: '停止查找', exact: true }).count(), 0);
   assert.equal(await p.evaluate(() => window.fixture.pages), 3);
 });
+
+test('输入法用回车确认文字时不发送，确认后的回车照常发送', async t => {
+  const p = await pageFor(t), input = p.locator('textarea.rich-editor-control');
+  const sent = () => p.evaluate(() => window.fixture.posted.filter(m => m.type === 'turn.start' || m.type === 'turn.enqueue').map(m => m.payload?.text));
+  await input.fill('你好 ');
+  // macOS 上 Chromium 的顺序：先把回车作为 keyCode 229、isComposing 的 keydown 交给页面，再提交输入法文字。
+  const cdp = await p.context().newCDPSession(p);
+  await cdp.send('Input.imeSetComposition', { text: 'test', selectionStart: 4, selectionEnd: 4 });
+  await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 229 });
+  await cdp.send('Input.insertText', { text: 'test' });
+  assert.equal(await input.inputValue(), '你好 test');
+  assert.deepEqual(await sent(), []);
+  await input.press('Enter');
+  await p.waitForFunction(() => window.fixture.posted.some(m => m.type === 'turn.start' || m.type === 'turn.enqueue'));
+  assert.deepEqual(await sent(), ['你好 test']);
+});

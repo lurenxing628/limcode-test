@@ -135,6 +135,8 @@ function clearFocusRecoveryTimers(): void {
 }
 
 function onKeydown(event: KeyboardEvent): void {
+  // 输入法用回车确认文字时，这次按键归输入法：Chromium 标 isComposing；Safari（局域网手机页）先结束组合，只剩 keyCode 229。
+  if (event.isComposing || event.keyCode === 229) return;
   if (props.submitOnEnter && event.key === 'Enter' && !event.shiftKey) {
     event.preventDefault();
     emit('submit');
