@@ -71,7 +71,7 @@ const definitions = computed(() => {
       result.push({ ...definition, label: `${definition.label}（未确认支持）`, options: [], description: '当前模型未确认支持；已保存值保留供检查或清除。' });
     }
   }
-  const order = ['thinkingLevel', 'thinkingBudget', 'reasoningMode', 'topK', 'includeThoughts'];
+  const order = ['maxOutputTokens', 'thinkingLevel', 'thinkingBudget', 'reasoningMode', 'topK', 'includeThoughts'];
   return result.sort((a, b) => order.indexOf(a.key) - order.indexOf(b.key));
 });
 const hasRequestBody = computed(() => Object.keys(requestBody.value).length > 0);
@@ -104,6 +104,14 @@ function updateKnownValue(definition: LlmParameterDefinition, value: unknown): v
       if (otherThinkingKey && generationConfig.value.thinkingConfig?.[otherThinkingKey] !== undefined
         && !(props.config.provider === 'claude' && capabilities.value.reasoning.family === 'anthropic_extended')) {
         throw new Error('思考预算和强度只能保留一个，请先清除另一项。');
+      }
+      if (definition.key === 'maxOutputTokens' && !(Number.isSafeInteger(value) && (value as number) > 0)) {
+        throw new Error('最大输出 Token 必须是正整数。');
+      }
+      const budget = next.thinkingConfig?.thinkingBudget, maximum = next.maxOutputTokens;
+      // Claude 要求 budget_tokens 小于 max_tokens，否则请求被拒；其它渠道不做此限制。
+      if (props.config.provider === 'claude' && typeof budget === 'number' && budget > 0 && maximum !== undefined && budget >= maximum) {
+        throw new Error('思考预算必须小于最大输出 Token；请先调高最大输出或降低思考预算。');
       }
       const thinking = thinkingCapability.value;
       if (definition.key === 'thinkingLevel' && thinking && 'values' in thinking && !thinking.values.includes(value as LlmThinkingLevel)) {

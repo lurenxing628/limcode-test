@@ -261,7 +261,9 @@ test('图片发送开关独立并默认开启，关闭保留数字与选择，�
 
 test('settings fields align at wide and narrow widths; full model identity is available on hover and focus', async t => {
   const p = await pageFor(t);
-  assert.doesNotMatch(await p.locator('.llm-generation-settings').innerText(), /最大输出 Token|Temperature|Top P/);
+  const generationText = await p.locator('.llm-generation-settings').innerText();
+  assert.match(generationText, /最大输出 Token/);
+  assert.doesNotMatch(generationText, /Temperature|Top P/);
   for (const width of [360, 420, 750, 1100]) {
     await p.setViewportSize({ width, height: 900 });
     const geometry = await p.evaluate(() => {
