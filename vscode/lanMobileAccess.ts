@@ -436,15 +436,17 @@ export async function lanMobileAccessCommand(context: vscode.ExtensionContext, s
   if (choice === '关闭') await setLanMobileAccess(context, startup, false);
 }
 
-/** 这个窗口上次开着就在启动时接着开；只监听端口，手机连上来才启动运行时。 */
+/** 状态栏常驻一个开关；这个窗口上次开着就在启动时接着开。只监听端口，手机连上来才启动运行时。 */
 export async function restoreLanMobileAccess(context: vscode.ExtensionContext, startup: ApplicationStartup): Promise<void> {
-  if (!activeServer) await start(context, startup);
+  if (context.workspaceState.get(LAN_MOBILE_ACCESS_STATE_KEY) === true && !activeServer) await start(context, startup);
+  updateStatusItem(context);
 }
 
 async function setLanMobileAccess(context: vscode.ExtensionContext, startup: ApplicationStartup, enabled: boolean): Promise<void> {
   await context.workspaceState.update(LAN_MOBILE_ACCESS_STATE_KEY, enabled);
   if (enabled && !activeServer) await start(context, startup);
   if (!enabled) stop();
+  updateStatusItem(context);
   postState(startup, [...watchingClients]);
 }
 
@@ -468,20 +470,30 @@ async function start(context: vscode.ExtensionContext, startup: ApplicationStart
   }
   lastError = undefined;
   activeServer = server;
-  statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 97);
-  statusItem.command = EXTENSION_COMMAND_IDS.lanMobileAccess;
-  statusItem.text = `$(remote) 远程访问 :${server.port}`;
-  statusItem.tooltip = `${EXTENSION_BRAND} 远程访问已开启：${currentUrls().join('  ')}
-点击复制地址或关闭`;
-  statusItem.show();
   context.subscriptions.push({ dispose: stop });
 }
 
 function stop(): void {
   activeServer?.stop();
   activeServer = undefined;
-  statusItem?.dispose();
-  statusItem = undefined;
+}
+
+/** 关着时点一下就开启，开着时点一下复制地址或关闭。 */
+function updateStatusItem(context: vscode.ExtensionContext): void {
+  if (!statusItem) {
+    statusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 97);
+    statusItem.command = EXTENSION_COMMAND_IDS.lanMobileAccess;
+    context.subscriptions.push(statusItem);
+  }
+  if (activeServer) {
+    statusItem.text = `$(remote) 远程访问 :${activeServer.port}`;
+    statusItem.tooltip = `${EXTENSION_BRAND} 远程访问已开启：${currentUrls().join('  ')}
+点击复制地址或关闭`;
+  } else {
+    statusItem.text = '$(remote) 远程访问：关';
+    statusItem.tooltip = `${EXTENSION_BRAND} 远程访问未开启，点击开启（同一局域网内的设备可以打开并操作对话）`;
+  }
+  statusItem.show();
 }
 
 function currentUrls(): string[] {

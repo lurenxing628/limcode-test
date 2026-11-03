@@ -69,7 +69,8 @@ test('真实extension在Runtime ready后才升级，deactivate停止新准入并
     './runtimeOpeningWait': { createRuntimeOpeningWaitPresenter: () => ({ announce() {}, settle() {}, onWait() {}, end() {} }) },
     './watchers/GlobalSettingsWatcher': { registerGlobalSettingsWatcher() {} },
     './runtimeExclusiveMaintenance': { startExclusiveMaintenanceParticipant: () => ({ async dispose() {}, async unregister() {} }), takeNoticeKeptAcrossReload() {} },
-    '../backend/application/runtimeBuildInfo': { RUNTIME_BUILD_INFO: {} }
+    '../backend/application/runtimeBuildInfo': { RUNTIME_BUILD_INFO: {} },
+    './lanMobileAccess': { async restoreLanMobileAccess() {} }
   });
   const context = { subscriptions: [], workspaceState: { get() {} } };
   t.after(async () => { opened.resolve(app); release.resolve(); await extension.deactivate(); });
