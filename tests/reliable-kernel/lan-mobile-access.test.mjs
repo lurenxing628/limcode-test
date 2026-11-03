@@ -113,7 +113,8 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
     workspaceName: () => '工作区',
     activeConversationId: () => 'open-a',
     openConversations: () => ['open-a'],
-    openConversation: async (conversationId) => { opened.push(conversationId); }
+    openConversation: async (conversationId) => { opened.push(conversationId); },
+    waiting: () => undefined
   });
   const port = await server.start(0, '127.0.0.1');
   t.after(() => server.stop());
@@ -200,6 +201,56 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
   server.stop();
   assert.deepEqual(application.calls.detached, ['client-1']);
   assert.equal(server.listening, false);
+});
+
+test('手机访问：运行时没启动好时说明原因，桌面没打开对话时按当前项目选一个', async (t) => {
+  const application = fakeApplication();
+  const pages = [];
+  application.getConversationHistoryPage = async (input) => {
+    pages.push(input);
+    return { scope: { kind: input.scopeKind }, originLinks: [], entries: application.emptyHistory ? [] : [{ id: 'recent', title: '最近' }], pageInfo: { limit: 1, hasNext: false, total: 1 } };
+  };
+  let ready;
+  let startupResult = new Promise((resolve, reject) => { ready = { resolve, reject }; });
+  let waiting = { title: '正在等待另一个窗口', description: '它正在合并旧数据' };
+  let active;
+  const opened = [];
+  const server = new LanMobileAccessServer({
+    application: () => startupResult,
+    webviewRoot: os.tmpdir(),
+    workspaceName: () => '工作区',
+    activeConversationId: () => active,
+    openConversations: () => [],
+    openConversation: async (conversationId) => { opened.push(conversationId); },
+    waiting: () => waiting
+  });
+  const base = `http://127.0.0.1:${await server.start(0, '127.0.0.1')}`;
+  t.after(() => server.stop());
+  const startup = async () => (await fetch(`${base}/__limcode_startup`)).json();
+  const land = async () => (await fetch(`${base}/__limcode_landing`, { method: 'POST' })).json();
+
+  assert.deepEqual(await startup(), { ready: false, waiting }, '还在启动时马上返回，不等运行时');
+  waiting = undefined;
+  assert.deepEqual(await startup(), { ready: false });
+  ready.resolve(application);
+  assert.deepEqual(await startup(), { ready: true });
+
+  assert.equal((await fetch(`${base}/__limcode_landing`)).status, 404, '只接受 POST，避免预取时新建对话');
+  assert.deepEqual(await land(), { conversationId: 'recent' });
+  assert.deepEqual(pages.at(-1), { scopeKind: 'currentProject', limit: 1 });
+  application.folders = [];
+  await land();
+  assert.deepEqual(pages.at(-1), { scopeKind: 'unbound', limit: 1 }, '窗口没打开文件夹时不进入其它项目的对话');
+  application.emptyHistory = true;
+  assert.deepEqual(await land(), { conversationId: 'created-conversation' }, '没有对话就新建');
+  assert.equal(application.calls.created.length, 1);
+  active = 'desktop-active';
+  assert.deepEqual(await land(), { conversationId: 'desktop-active' }, '桌面已打开对话时进入它');
+  assert.deepEqual(opened, ['recent', 'recent', 'created-conversation', 'desktop-active'], '进入的对话由这个窗口接管');
+
+  startupResult = Promise.reject(new Error('数据目录不可用'));
+  startupResult.catch(() => undefined);
+  assert.deepEqual(await startup(), { ready: false, error: '数据目录不可用' });
 });
 
 test('远程访问开关：设置页开启后出现状态栏项并记住，关闭后撤下，状态回传给设置页', async (t) => {

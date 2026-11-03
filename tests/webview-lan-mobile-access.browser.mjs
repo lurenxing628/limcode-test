@@ -33,16 +33,28 @@ const entries = Array.from({ length: 70 }, (_, index) => {
 const created = [];
 const opened = [];
 const failures = { page: false, create: false };
+// 运行时启动可以被挂住，用来观察等待提示；桌面当前对话可以清空，用来观察进入时自动选对话。
+const startup = { ready: Promise.resolve(), waiting: undefined };
+let desktopConversation = 'c1';
+const bodies = { 'rev-user': { role: 'user', parts: [{ text: '第一条消息' }] }, 'rev-model': { role: 'model', parts: [{ text: '第二条消息' }] } };
 const application = {
   attachWebview(webview, meta) { this.client = { webview, meta }; return 'client'; },
   setWebviewVisible() {},
   detachWebview() {},
-  handleReliableKernelControl() { return true; },
+  handleReliableKernelControl(clientId, message) {
+    if (message.type !== 'reliable-kernel.detail-request') return true;
+    const bytes = Buffer.from(JSON.stringify(bodies[message.recordId]), 'utf8');
+    this.client.webview.postMessage({ type: 'reliable-kernel.detail-result', requestId: message.requestId, sessionId: 'feed',
+      detail: { recordId: message.recordId, offset: 0, chunk: bytes.toString('base64'), encoding: 'base64', totalBytes: bytes.length, hasMore: false, responseBytes: bytes.length } });
+    return true;
+  },
   handleWebviewMessage(clientId, message) {
     if (message.type !== 'bridge.ready') return;
     this.client.webview.postMessage({ id: 'hello', clientId, type: 'bridge.hello', channel: 'control', payload: { clientId, attachedAt: 1, meta: this.client.meta } });
     this.client.webview.postMessage({ type: 'reliable-kernel.snapshot', sessionId: 'feed', hostBootId: 'host', messageSeq: '1', snapshotCommitSeq: '1',
-      projections: { activeConversationWindow: { conversationId: this.client.meta.conversationId } } });
+      projections: { activeConversationWindow: { conversationId: this.client.meta.conversationId, visibleMessageCount: '2',
+        messages: [['user', 1, 'rev-user'], ['model', 2, 'rev-model']].map(([role, seq, revision]) => ({ id: `m${seq}`, conversation_id: this.client.meta.conversationId,
+          role, message_seq: String(seq), revision_id: revision, created_at: new Date(Date.now() - (3 - seq) * 60_000).toISOString() })) } } });
   },
   getConversationDisplayTitle: (id) => `标题 ${id}`,
   getProjectFolderCandidates: () => [{ uri: PROJECT_A, name: 'project-a', index: 0 }, { uri: PROJECT_B, name: 'project-b', index: 1 }],
@@ -65,12 +77,13 @@ const application = {
 let server, browser, base;
 before(async () => {
   server = new LanMobileAccessServer({
-    application: async () => application,
+    application: async () => { await startup.ready; return application; },
     webviewRoot: path.resolve('dist/webview'),
     workspaceName: () => '工作区',
-    activeConversationId: () => 'c1',
+    activeConversationId: () => desktopConversation,
     openConversations: () => ['c1'],
-    openConversation: async (id) => { opened.push(id); }
+    openConversation: async (id) => { opened.push(id); },
+    waiting: () => startup.waiting
   });
   base = `http://127.0.0.1:${await server.start(0, '127.0.0.1')}`;
   browser = await chromium.launch({ headless: true, ...(process.env.LIMCODE_TEST_BROWSER_PATH ? { executablePath: process.env.LIMCODE_TEST_BROWSER_PATH } : {}) });
@@ -80,7 +93,7 @@ after(async () => {
   server?.stop();
 });
 
-async function pageFor(t, viewport = { width: 390, height: 844 }) {
+async function pageFor(t, viewport = { width: 390, height: 844 }, url = '/?cid=c1') {
   const context = await browser.newContext({ viewport, hasTouch: true, isMobile: true });
   t.after(() => context.close());
   const page = await context.newPage();
@@ -88,8 +101,8 @@ async function pageFor(t, viewport = { width: 390, height: 844 }) {
   const errors = [];
   page.on('pageerror', (error) => errors.push(error.message));
   t.after(() => assert.deepEqual(errors, []));
-  await page.goto(`${base}/?cid=c1`);
-  await page.locator('textarea').waitFor();
+  await page.goto(base + url);
+  if (url.includes('cid=')) await page.locator('textarea').waitFor();
   return page;
 }
 const drawer = (page) => page.locator('#limcode-mobile-drawer');
@@ -220,4 +233,55 @@ test('新建带上所选项目；读取和新建失败时显示原因', async (t
   await waitClosed(page);
   assert.deepEqual(created.at(-1), { projectFolderUri: PROJECT_B });
   assert.equal(opened.at(-1), 'c1');
+});
+
+test('输入框下方选项默认收起，一个按钮展开并记住；收起时发送按钮仍在', async (t) => {
+  const page = await pageFor(t);
+  const toggle = page.locator('.composer-actions #limcode-composer-toggle');
+  const meta = page.locator('.composer-meta');
+  await toggle.waitFor();
+  assert.equal(await toggle.getAttribute('aria-label'), '显示输入框下方选项');
+  assert.equal(await meta.isVisible(), false);
+  assert.equal(await page.locator('.composer-token-usage').isVisible(), false);
+  assert.equal(await page.locator('.composer-send').isVisible(), true);
+  const collapsedTop = (await page.locator('.composer-send').boundingBox()).y;
+
+  await toggle.tap();
+  assert.equal(await meta.isVisible(), true);
+  assert.equal(await toggle.getAttribute('aria-expanded'), 'true');
+  assert.ok((await page.locator('.composer-send').boundingBox()).y <= collapsedTop, '展开后发送按钮仍在屏幕内');
+  await page.reload();
+  await page.locator('.composer-actions #limcode-composer-toggle').waitFor();
+  assert.equal(await meta.isVisible(), true, '刷新后记住展开');
+  await page.locator('#limcode-composer-toggle').tap();
+  assert.equal(await meta.isVisible(), false);
+});
+
+test('触屏上点一下消息才显示它的操作按钮，点另一条时换过去', async (t) => {
+  const page = await pageFor(t);
+  const floors = page.locator('.message-floor');
+  await floors.nth(1).locator('.message-actions').waitFor({ state: 'attached' });
+  const opacity = (index) => floors.nth(index).locator('.message-actions').evaluate((element) => getComputedStyle(element).opacity);
+  await page.waitForFunction(() => document.querySelectorAll('.message-floor').length === 2);
+  assert.deepEqual([await opacity(0), await opacity(1)], ['0', '0'], '默认不压住正文');
+  await floors.nth(0).tap();
+  await page.waitForFunction(() => getComputedStyle(document.querySelectorAll('.message-floor .message-actions')[0]).opacity === '1');
+  await floors.nth(1).tap();
+  await page.waitForFunction(() => getComputedStyle(document.querySelectorAll('.message-floor .message-actions')[1]).opacity === '1');
+  await page.waitForFunction(() => getComputedStyle(document.querySelectorAll('.message-floor .message-actions')[0]).opacity === '0');
+});
+
+test('运行时还在等待时说明原因；桌面没打开对话时自动进入当前项目最近的对话', async (t) => {
+  let release;
+  startup.ready = new Promise((resolve) => { release = resolve; });
+  startup.waiting = { title: '正在等待另一个窗口', description: '它正在合并旧数据' };
+  desktopConversation = undefined;
+  t.after(() => { release(); startup.ready = Promise.resolve(); startup.waiting = undefined; desktopConversation = 'c1'; });
+  const page = await pageFor(t, undefined, '/');
+  await page.locator('#limcode-mobile-notice', { hasText: '正在等待另一个窗口：它正在合并旧数据' }).waitFor();
+  release();
+  await page.waitForURL(/cid=c0$/);
+  await page.locator('textarea').waitFor();
+  assert.equal(await page.locator('#limcode-mobile-notice').count(), 0);
+  assert.equal(opened.at(-1), 'c0', '进入的对话由这个窗口接管');
 });

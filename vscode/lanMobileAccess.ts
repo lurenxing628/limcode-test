@@ -152,13 +152,28 @@ body { display: flex; flex-direction: column; padding: 0 4px 4px; }
 @media (min-width: 600px) {
   #limcode-mobile-drawer { width: 400px; border-right: 1px solid #333; }
 }
+#limcode-mobile-notice {
+  flex: none; margin: 0 -4px; padding: 8px 12px;
+  background: #3a3d41; color: #e0e0e0; font-size: 13px; line-height: 1.5; overflow-wrap: anywhere;
+}
+#limcode-mobile-notice.error { background: #5a1d1d; }
+#limcode-composer-toggle {
+  flex: none; width: 32px; height: 32px; margin-right: auto; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: transparent; color: var(--vscode-icon-foreground); border: none; border-radius: 6px;
+}
+#limcode-composer-toggle svg { width: 18px; height: 18px; }
+/* 收起时输入框下方只留展开按钮和发送按钮。 */
+html[data-limcode-composer-collapsed] .composer-meta,
+html[data-limcode-composer-collapsed] .composer-actions > :not(#limcode-composer-toggle):not(.composer-send):not(.composer-interrupt-status) { display: none !important; }
+html[data-limcode-composer-collapsed] .composer-actions { flex: 1 1 auto !important; }
 @media (max-width: 599px) {
   /* 输入框固定 5 行，键盘弹出后几乎挤掉消息区；手机上默认 3 行，展开按钮照常可用。 */
   .composer:not(.is-editor-expanded) .rich-editor-control { flex: none !important; height: calc(4.5em + 16px) !important; }
 }
 @media (hover: none), (pointer: coarse) {
-  /* 触屏没有悬停：消息操作常显；输入控件不足 16px 时 iOS 聚焦会放大整页。 */
-  .message-actions { opacity: 0.75 !important; pointer-events: auto !important; }
+  /* 触屏没有悬停：点一下消息才显示它的操作按钮（常显会压住正文）；输入控件不足 16px 时 iOS 聚焦会放大整页。 */
+  .message-floor[data-limcode-touched] .message-actions { opacity: 1 !important; pointer-events: auto !important; }
   textarea, input, select { font-size: 16px !important; }
 }
 `;
@@ -198,6 +213,8 @@ export interface LanMobileAccessHost {
   openConversations(): string[];
   /** 在桌面打开对话：由本窗口接管执行，与在侧栏点开相同。 */
   openConversation(conversationId: string): Promise<void>;
+  /** 运行时还在等什么（例如另一个窗口占着数据目录），没有在等时为空。 */
+  waiting(): { title: string; description: string } | undefined;
 }
 
 interface MobileSession {
@@ -262,6 +279,16 @@ export class LanMobileAccessServer {
         if (!application) return this.sendJson(response, { error: '运行时未就绪' }, 503);
         return this.sendJson(response, await this.status(application, url.searchParams));
       }
+      case '/__limcode_startup': return this.sendJson(response, await this.startupState());
+      case '/__limcode_landing': {
+        if (request.method !== 'POST') break;
+        // 桌面没有打开对话时，手机按桌面打开面板的规则选一个：当前项目最近的对话，没有就新建。
+        const application = await this.host.application();
+        if (!application) return this.sendJson(response, { error: '运行时未就绪' }, 503);
+        const target = this.host.activeConversationId() ?? await landingConversation(application);
+        await this.host.openConversation(target);
+        return this.sendJson(response, { conversationId: target });
+      }
       case '/__limcode_open':
         if (conversationId) await this.host.openConversation(conversationId);
         return this.sendJson(response, { ok: true });
@@ -314,6 +341,21 @@ export class LanMobileAccessServer {
       nextCursor: page.pageInfo.nextCursor ?? null,
       total: page.pageInfo.total
     };
+  }
+
+  /** 不等运行时：已经启动失败的马上带回原因，还在启动的带回等待原因。 */
+  private async startupState(): Promise<{ ready: boolean; waiting?: { title: string; description: string }; error?: string }> {
+    const pending = Symbol('pending');
+    try {
+      const application = await Promise.race([this.host.application(), new Promise<typeof pending>((resolve) => setImmediate(resolve, pending))]);
+      if (application === pending) {
+        const waiting = this.host.waiting();
+        return { ready: false, ...(waiting ? { waiting } : {}) };
+      }
+      return application ? { ready: true } : { ready: false, error: '运行时未就绪' };
+    } catch (error) {
+      return { ready: false, error: error instanceof Error ? error.message : String(error) };
+    }
   }
 
   private async session(sessionId: string, conversationId: string | undefined): Promise<MobileSession | undefined> {
@@ -424,6 +466,12 @@ export class LanMobileAccessServer {
   }
 }
 
+async function landingConversation(application: ApplicationFacade): Promise<string> {
+  const scopeKind = application.getProjectFolderCandidates().length > 0 ? 'currentProject' : 'unbound';
+  const page = await application.getConversationHistoryPage({ scopeKind, limit: 1 });
+  return page.entries[0]?.id ?? await application.createConversation();
+}
+
 /** 默认看当前项目；记住的项目不在这个窗口时退回当前项目，窗口没有打开文件夹时看全部。 */
 function resolveHistoryScope(kind: string | null, folder: string | null, folders: { uri: string }[]): LanMobileHistoryScope {
   if (kind === 'project' && folder && folders.some((candidate) => candidate.uri === folder)) return { kind, folderUri: folder };
@@ -457,13 +505,14 @@ function mobileShim(initialConversationId: string, workspaceName: string): strin
     window.visualViewport.addEventListener('resize', fitViewport);
     window.visualViewport.addEventListener('scroll', fitViewport);
   }
-  new EventSource('/__limcode_sse' + query).onmessage = event => {
+  if (cid) new EventSource('/__limcode_sse' + query).onmessage = event => {
     window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(event.data) }));
   };
   let state = { kind: 'mainPanel', conversationId: cid };
   let sending = Promise.resolve();
   window.acquireVsCodeApi = () => ({
     postMessage(message) {
+      if (!cid) return;
       // 逐条发送，保持和面板 postMessage 相同的先后顺序。
       sending = sending.then(() => fetch('/__limcode_msg' + query, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(message)
@@ -506,6 +555,64 @@ function mobileShim(initialConversationId: string, workspaceName: string): strin
     bar.innerHTML = '<button data-menu aria-label="对话列表">☰</button><b></b><button data-new aria-label="新对话">＋</button><button data-reload aria-label="刷新页面">↻</button>';
     bar.querySelector('b').textContent = WORKSPACE_NAME;
     document.body.prepend(bar);
+
+    // 运行时可能要等另一个窗口（占着数据目录、合并旧数据），或者启动失败；页面上说明原因，不要一直空转。
+    let notice;
+    const showNotice = (text, error) => {
+      if (!notice) { notice = element('div', '', ''); notice.id = 'limcode-mobile-notice'; notice.setAttribute('role', 'status'); bar.after(notice); }
+      notice.textContent = text;
+      notice.classList.toggle('error', Boolean(error));
+    };
+    const land = () => fetchJson('/__limcode_landing', { method: 'POST' })
+      .then(data => location.replace('/?cid=' + encodeURIComponent(data.conversationId)))
+      .catch(error => showNotice('打开对话失败：' + error.message, true));
+    const watchStartup = () => fetchJson('/__limcode_startup').then(state => {
+      if (state.ready) {
+        if (notice) { notice.remove(); notice = undefined; }
+        if (!cid) land();
+        return;
+      }
+      if (state.error) return showNotice('运行时无法启动：' + state.error, true);
+      showNotice(state.waiting ? state.waiting.title + '：' + state.waiting.description : '正在启动运行时…');
+      setTimeout(watchStartup, 1000);
+    }).catch(() => { showNotice('连接电脑失败，正在重试…', true); setTimeout(watchStartup, 2000); });
+    watchStartup();
+
+    // 输入框下方的选项在手机上占好几行，默认收起，只留一个按钮。
+    const COLLAPSE_KEY = 'limcode-mobile-composer-collapsed';
+    let collapsed = true;
+    try { collapsed = localStorage.getItem(COLLAPSE_KEY) !== '0'; } catch {}
+    const toggle = element('button', '', '');
+    toggle.id = 'limcode-composer-toggle';
+    toggle.type = 'button';
+    const applyCollapsed = () => {
+      document.documentElement.toggleAttribute('data-limcode-composer-collapsed', collapsed);
+      toggle.setAttribute('aria-expanded', String(!collapsed));
+      toggle.setAttribute('aria-label', collapsed ? '显示输入框下方选项' : '收起输入框下方选项');
+      toggle.title = toggle.getAttribute('aria-label');
+      toggle.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="' + (collapsed ? 'M6 15l6 -6l6 6' : 'M6 9l6 6l6 -6') + '"/></svg>';
+    };
+    applyCollapsed();
+    toggle.addEventListener('click', () => {
+      collapsed = !collapsed;
+      try { localStorage.setItem(COLLAPSE_KEY, collapsed ? '1' : '0'); } catch {}
+      applyCollapsed();
+    });
+    // 输入框由页面渲染，可能晚于这里出现或被重建；出现后把按钮放进发送按钮那一行。
+    new MutationObserver(() => {
+      const actions = document.querySelector('.composer-actions');
+      if (actions && toggle.parentNode !== actions) actions.prepend(toggle);
+    }).observe(document.body, { childList: true, subtree: true });
+
+    let touched;
+    document.addEventListener('pointerdown', event => {
+      if (event.pointerType !== 'touch') return;
+      const floor = event.target instanceof Element ? event.target.closest('.message-floor') : null;
+      if (floor === touched) return;
+      if (touched) touched.removeAttribute('data-limcode-touched');
+      touched = floor;
+      if (floor) floor.setAttribute('data-limcode-touched', '');
+    }, true);
 
     drawer = document.createElement('dialog');
     drawer.id = 'limcode-mobile-drawer';
@@ -677,7 +784,8 @@ async function start(context: vscode.ExtensionContext, startup: ApplicationStart
     openConversations: () => MainPanel.getOpenConversationPanelStates().map((item) => item.conversationId),
     openConversation: async (conversationId) => {
       await vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.openPanel, { conversationId, reuse: true });
-    }
+    },
+    waiting: () => startup.waiting()
   });
   try {
     await server.start();
