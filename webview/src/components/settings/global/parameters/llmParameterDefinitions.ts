@@ -53,8 +53,8 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
   claude: {
     maxOutputTokens: {
       path: 'max_tokens',
-      description: '单次回复的输出上限，思考和正文共用；思考用完上限会以 MAX_TOKENS 结束且没有正文。未设置时发送 16000。',
-      placeholder: '未设置（发送 16000）'
+      description: '单次回复的输出上限，思考和正文共用；思考用完上限会以 MAX_TOKENS 结束且没有正文。未设置时发送 64000。',
+      placeholder: '未设置（发送 64000）'
     },
     topK: { path: 'top_k', label: 'Top K / top_k' },
     thinkingBudget: {

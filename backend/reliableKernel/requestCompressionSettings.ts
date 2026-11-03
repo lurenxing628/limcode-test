@@ -1,5 +1,5 @@
 import type { ChatModelOverrideRecord, LlmGenerationConfigRecord, LlmRequestBodyRecord } from '../../shared/protocol';
-import { DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, canonicalLlmProviderKind } from '../../shared/protocol';
+import { DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS, canonicalLlmProviderKind, defaultMaxOutputTokensForProvider } from '../../shared/protocol';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import {
   frozenCompressionPolicy,
@@ -41,7 +41,8 @@ export function applyRequestCompressionSettings(
       || !sameModelSelection(generation.model, authority)) throw new Error('请求生成设置不能更换本轮模型。');
     authority = normalizePlainJson({ ...authority, model: {
       ...authority.model, generationConfig: generation.generationConfig,
-      maxOutputTokens: generation.generationConfig.maxOutputTokens ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+      maxOutputTokens: generation.generationConfig.maxOutputTokens ?? defaultMaxOutputTokensForProvider(authority.model.provider)
+        ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
       requestBody: generation.requestBody, thinkingControlledByBody: generation.thinkingControlledByBody,
       thinkingConfig: generation.generationConfig.thinkingConfig ?? {}
     } }, '请求生成设置');

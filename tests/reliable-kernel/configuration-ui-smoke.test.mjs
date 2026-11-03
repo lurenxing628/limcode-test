@@ -689,8 +689,8 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   parameters.updateKnownValue(topK, undefined);
   assert.deepEqual(emitted.pop(), saved);
   const claudeMax = parameters.definitions.find(item => item.key === 'maxOutputTokens');
-  assert.match(claudeMax.description, /16000/, 'Claude 说明未设置时实际发送的默认上限');
-  assert.equal(claudeMax.placeholder, '未设置（发送 16000）');
+  assert.match(claudeMax.description, /64000/, 'Claude 说明未设置时实际发送的默认上限');
+  assert.equal(claudeMax.placeholder, '未设置（发送 64000）');
   assert.equal(maxOutput.placeholder, undefined, '其它渠道未设置时不发送');
   await parameterMount.setProps({ config: { ...config, provider: 'claude', model: 'claude-sonnet-4-5', baseUrl: 'https://api.anthropic.com',
     generationConfig: { thinkingConfig: { thinkingBudget: 8000 } } } });

@@ -50,6 +50,7 @@ import { normalizePlainJson } from './plainJson';
 import type { RequestCompressionSettings } from './requestCompressionSettings';
 import {
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+  defaultMaxOutputTokensForProvider,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   MAX_LLM_RETRY_DELAY_SECONDS,
   MAX_RELIABLE_PROVIDER_RETRY_ATTEMPTS,
@@ -432,7 +433,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       ? conversationModelProfile.inheritThinkingToChildren === true
       : effectiveConversationThinkingOverride !== undefined;
     const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
-      ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
+      ?? defaultMaxOutputTokensForProvider(provider.provider) ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
     const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
     // Native facts freeze with the Turn: the kernel capability gate must replay identically after
     // recovery even if the editable channel settings change mid-request.
