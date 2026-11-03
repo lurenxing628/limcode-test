@@ -25,6 +25,7 @@ import { isReliableKernelControlMessage } from '../shared/reliableKernelClientFe
 export const LAN_MOBILE_ACCESS_PORT = 14_319;
 const SESSION_LINGER_MS = 15_000;
 const SESSION_QUEUE_LIMIT = 500;
+const HISTORY_PAGE_SIZE = 50;
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -99,21 +100,66 @@ const VSCODE_DARK_VARS_CSS = `
   margin: 0;
   padding: 0;
 }
+`;
+
+// 放在 </head> 前，排在应用样式之后；组件样式带作用域，覆盖时需要 !important。只影响手机页面，不影响桌面面板。
+const MOBILE_LAYOUT_CSS = `
+html, body { height: var(--limcode-app-height, 100dvh); overflow: hidden; overscroll-behavior: none; }
+body { display: flex; flex-direction: column; padding: 0 4px 4px; }
+#app { flex: 1 1 0; min-height: 0; height: auto; }
 #limcode-mobile-bar {
-  position: sticky; top: 0; z-index: 99999;
-  display: flex; align-items: center; gap: 6px;
-  padding: 6px 10px;
+  flex: none; display: flex; align-items: center; gap: 4px;
+  margin: 0 -4px; padding: 2px 4px;
   background: #181818; border-bottom: 1px solid #333;
-  font-size: 12px; font-family: var(--vscode-font-family);
+  font-family: var(--vscode-font-family);
 }
-#limcode-mobile-bar select {
-  flex: 1; min-width: 0;
-  background: #2d2d2d; color: #e0e0e0; border: 1px solid #454545; border-radius: 4px;
-  padding: 4px 6px; font-size: 12px;
+#limcode-mobile-bar b { flex: 1; min-width: 0; padding: 0 4px; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#limcode-mobile-bar button, #limcode-mobile-drawer header button {
+  flex: none; width: 40px; height: 40px; padding: 0;
+  background: transparent; color: #e0e0e0; border: none; border-radius: 6px; font-size: 20px; line-height: 1;
 }
-#limcode-mobile-bar button {
-  background: #3a3d41; color: #fff; border: none; border-radius: 4px;
-  padding: 4px 8px; font-size: 12px; white-space: nowrap;
+#limcode-mobile-drawer {
+  position: fixed; inset: 0 auto 0 0; margin: 0; padding: 0;
+  width: 100%; max-width: none; height: var(--limcode-app-height, 100dvh); max-height: none;
+  background: #1e1e1e; color: #cccccc; border: none;
+  font-family: var(--vscode-font-family);
+}
+#limcode-mobile-drawer[open] { display: flex; flex-direction: column; }
+#limcode-mobile-drawer::backdrop { background: rgba(0, 0, 0, 0.5); }
+#limcode-mobile-drawer header {
+  flex: none; display: flex; align-items: center; gap: 4px; padding: 2px 4px;
+  background: #181818; border-bottom: 1px solid #333;
+}
+#limcode-mobile-drawer header b { flex: 1; min-width: 0; padding: 0 4px; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#limcode-mobile-drawer select {
+  flex: none; margin: 8px; padding: 8px; min-height: 40px;
+  background: #2d2d2d; color: #e0e0e0; border: 1px solid #454545; border-radius: 6px; font-size: 16px;
+}
+#limcode-mobile-drawer .items { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+#limcode-mobile-drawer .item {
+  display: block; width: 100%; min-height: 56px; padding: 8px 12px; text-align: left;
+  background: transparent; color: inherit; border: none; border-bottom: 1px solid #2d2d2d; border-radius: 0;
+}
+#limcode-mobile-drawer .item.current { background: #37373d; }
+#limcode-mobile-drawer .item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#limcode-mobile-drawer .title { font-size: 15px; }
+#limcode-mobile-drawer .meta { margin-top: 4px; font-size: 12px; color: #9d9d9d; }
+#limcode-mobile-drawer .notice { margin: 0; padding: 24px 16px; font-size: 14px; color: #9d9d9d; text-align: center; overflow-wrap: anywhere; }
+#limcode-mobile-drawer .more {
+  display: block; width: calc(100% - 16px); min-height: 44px; margin: 8px;
+  background: #3a3d41; color: #fff; border: none; border-radius: 6px; font-size: 14px;
+}
+@media (min-width: 600px) {
+  #limcode-mobile-drawer { width: 400px; border-right: 1px solid #333; }
+}
+@media (max-width: 599px) {
+  /* 输入框固定 5 行，键盘弹出后几乎挤掉消息区；手机上默认 3 行，展开按钮照常可用。 */
+  .composer:not(.is-editor-expanded) .rich-editor-control { flex: none !important; height: calc(4.5em + 16px) !important; }
+}
+@media (hover: none), (pointer: coarse) {
+  /* 触屏没有悬停：消息操作常显；输入控件不足 16px 时 iOS 聚焦会放大整页。 */
+  .message-actions { opacity: 0.75 !important; pointer-events: auto !important; }
+  textarea, input, select { font-size: 16px !important; }
 }
 `;
 
@@ -121,6 +167,25 @@ export interface LanMobileConversation {
   id: string;
   title: string;
   isOpen: boolean;
+  updatedAt: number;
+  projectName?: string;
+  statusLabel?: string;
+  /** 属于没在这个窗口打开的项目：可以查看，继续对话要到打开该项目的窗口。 */
+  foreign: boolean;
+}
+
+export type LanMobileHistoryScope =
+  | { kind: 'currentProject' | 'unbound' | 'all' }
+  | { kind: 'project'; folderUri: string };
+
+interface LanMobileStatus {
+  workspace: string;
+  activeConversationId: string | null;
+  folders: { uri: string; name: string }[];
+  scope: LanMobileHistoryScope;
+  conversations: LanMobileConversation[];
+  nextCursor: string | null;
+  total: number;
 }
 
 export interface LanMobileAccessHost {
@@ -192,14 +257,21 @@ export class LanMobileAccessServer {
     const sessionId = url.searchParams.get('sid') ?? '';
     const conversationId = url.searchParams.get('cid')?.trim() || undefined;
     switch (url.pathname) {
-      case '/__limcode_status': return this.sendJson(response, await this.status());
+      case '/__limcode_status': {
+        const application = await this.host.application();
+        if (!application) return this.sendJson(response, { error: '运行时未就绪' }, 503);
+        return this.sendJson(response, await this.status(application, url.searchParams));
+      }
       case '/__limcode_open':
         if (conversationId) await this.host.openConversation(conversationId);
         return this.sendJson(response, { ok: true });
       case '/__limcode_new': {
         const application = await this.host.application();
         if (!application) return this.sendJson(response, { error: '运行时未就绪' }, 503);
-        const created = await application.createConversation();
+        // 手机记住的范围可能来自占用过这个端口的另一个窗口，不属于本窗口的项目按默认项目新建。
+        const folder = url.searchParams.get('folder');
+        const known = application.getProjectFolderCandidates().some((candidate) => candidate.uri === folder);
+        const created = await application.createConversation(known && folder ? { projectFolderUri: folder } : {});
         await this.host.openConversation(created);
         return this.sendJson(response, { conversationId: created });
       }
@@ -213,15 +285,35 @@ export class LanMobileAccessServer {
     this.sendAsset(response, url.pathname);
   }
 
-  private async status(): Promise<{ workspace: string; activeConversationId: string | null; conversations: LanMobileConversation[] }> {
-    const application = await this.host.application();
+  private async status(application: ApplicationFacade, params: URLSearchParams): Promise<LanMobileStatus> {
+    const folders = application.getProjectFolderCandidates().map(({ uri, name }) => ({ uri, name }));
+    const scope = resolveHistoryScope(params.get('scope'), params.get('folder'), folders);
+    const cursor = params.get('cursor');
+    const page = await application.getConversationHistoryPage({
+      scopeKind: scope.kind,
+      ...(scope.kind === 'project' ? { projectFolderUri: scope.folderUri } : {}),
+      ...(cursor ? { cursor } : {}),
+      limit: HISTORY_PAGE_SIZE
+    });
     const open = new Set(this.host.openConversations());
-    const conversations: LanMobileConversation[] = [];
-    for (const id of open) conversations.push({ id, title: application?.getConversationDisplayTitle(id) ?? id, isOpen: true });
-    for (const entry of application?.getConversationHistoryEntries().slice(0, 30) ?? []) {
-      if (!open.has(entry.id)) conversations.push({ id: entry.id, title: entry.title || entry.id, isOpen: false });
-    }
-    return { workspace: this.host.workspaceName(), activeConversationId: this.host.activeConversationId() ?? null, conversations };
+    const folderUris = new Set(folders.map((folder) => folder.uri));
+    return {
+      workspace: this.host.workspaceName(),
+      activeConversationId: this.host.activeConversationId() ?? null,
+      folders,
+      scope,
+      conversations: page.entries.map((entry) => ({
+        id: entry.id,
+        title: entry.title || entry.id,
+        isOpen: open.has(entry.id),
+        updatedAt: entry.updatedAt,
+        ...(entry.projectName ? { projectName: entry.projectName } : {}),
+        ...(entry.runStatusLabel || entry.isRunning ? { statusLabel: entry.runStatusLabel || '运行中' } : {}),
+        foreign: Boolean(entry.projectFolderUri) && !folderUris.has(entry.projectFolderUri!)
+      })),
+      nextCursor: page.pageInfo.nextCursor ?? null,
+      total: page.pageInfo.total
+    };
   }
 
   private async session(sessionId: string, conversationId: string | undefined): Promise<MobileSession | undefined> {
@@ -311,7 +403,8 @@ export class LanMobileAccessServer {
       return;
     }
     const html = fs.readFileSync(indexPath, 'utf8')
-      .replace('<head>', `<head><style>${VSCODE_DARK_VARS_CSS}</style><script>${mobileShim(this.host.activeConversationId() ?? '', this.host.workspaceName())}</script>`);
+      .replace('<head>', () => `<head><style>${VSCODE_DARK_VARS_CSS}</style><script>${mobileShim(this.host.activeConversationId() ?? '', this.host.workspaceName())}</script>`)
+      .replace('</head>', () => `<style>${MOBILE_LAYOUT_CSS}</style></head>`);
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }).end(html);
   }
 
@@ -331,6 +424,13 @@ export class LanMobileAccessServer {
   }
 }
 
+/** 默认看当前项目；记住的项目不在这个窗口时退回当前项目，窗口没有打开文件夹时看全部。 */
+function resolveHistoryScope(kind: string | null, folder: string | null, folders: { uri: string }[]): LanMobileHistoryScope {
+  if (kind === 'project' && folder && folders.some((candidate) => candidate.uri === folder)) return { kind, folderUri: folder };
+  if (kind === 'unbound' || kind === 'all') return { kind };
+  return { kind: folders.length > 0 ? 'currentProject' : 'all' };
+}
+
 /** 页面里替代 acquireVsCodeApi：下行用 EventSource，上行按顺序 POST。 */
 function mobileShim(initialConversationId: string, workspaceName: string): string {
   return `(() => {
@@ -340,7 +440,23 @@ function mobileShim(initialConversationId: string, workspaceName: string): strin
   const cid = new URLSearchParams(location.search).get('cid') || ${JSON.stringify(initialConversationId)};
   const sid = crypto.randomUUID();
   const query = '?sid=' + encodeURIComponent(sid) + '&cid=' + encodeURIComponent(cid);
-  const open = target => { location.href = '/?cid=' + encodeURIComponent(target); };
+  let drawer;
+  // 列表打开时多压了一条历史记录，要替换掉它，否则返回键会先回到一个空状态。
+  const open = target => {
+    const url = '/?cid=' + encodeURIComponent(target);
+    if (drawer && drawer.open) location.replace(url); else location.href = url;
+  };
+  // 软键盘只缩小 visualViewport，不缩小布局视口；跟随它才能让输入框留在键盘上方。双指放大时不跟随。
+  const fitViewport = () => {
+    const viewport = window.visualViewport;
+    if (!viewport || viewport.scale > 1.01) return;
+    document.documentElement.style.setProperty('--limcode-app-height', viewport.height + 'px');
+    if (window.scrollY) window.scrollTo(0, 0);
+  };
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', fitViewport);
+    window.visualViewport.addEventListener('scroll', fitViewport);
+  }
   new EventSource('/__limcode_sse' + query).onmessage = event => {
     window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(event.data) }));
   };
@@ -358,27 +474,130 @@ function mobileShim(initialConversationId: string, workspaceName: string): strin
     setState: next => (state = next)
   });
   window.addEventListener('DOMContentLoaded', () => {
-    const bar = document.createElement('div');
+    fitViewport();
+    const WORKSPACE_NAME = ${JSON.stringify(workspaceName)};
+    const SCOPE_KEY = 'limcode-mobile-scope';
+    let scope = { kind: 'currentProject' };
+    try { scope = JSON.parse(localStorage.getItem(SCOPE_KEY)) || scope; } catch {}
+    const element = (tag, className, text) => {
+      const node = document.createElement(tag);
+      node.className = className;
+      node.textContent = text;
+      return node;
+    };
+    const fetchJson = (url, init) => fetch(url, init).then(async response => {
+      if (response.ok) return response.json();
+      const text = await response.text();
+      let message = text;
+      try { message = JSON.parse(text).error || text; } catch {}
+      throw new Error(message || String(response.status));
+    });
+    const ago = time => {
+      const minutes = Math.floor((Date.now() - time) / 60000);
+      if (minutes < 1) return '刚刚';
+      if (minutes < 60) return minutes + ' 分钟前';
+      if (minutes < 1440) return Math.floor(minutes / 60) + ' 小时前';
+      if (minutes < 43200) return Math.floor(minutes / 1440) + ' 天前';
+      return new Date(time).toLocaleDateString();
+    };
+
+    const bar = element('div', '', '');
     bar.id = 'limcode-mobile-bar';
-    bar.innerHTML = '<b></b><select><option>正在加载对话…</option></select><button data-new>＋新对话</button><button data-reload>↻</button>';
-    bar.querySelector('b').textContent = ${JSON.stringify(workspaceName)};
+    bar.innerHTML = '<button data-menu aria-label="对话列表">☰</button><b></b><button data-new aria-label="新对话">＋</button><button data-reload aria-label="刷新页面">↻</button>';
+    bar.querySelector('b').textContent = WORKSPACE_NAME;
     document.body.prepend(bar);
-    const select = bar.querySelector('select');
-    fetch('/__limcode_status').then(response => response.json()).then(data => {
-      select.innerHTML = '';
-      for (const item of data.conversations) {
-        const option = new Option((item.isOpen ? '● ' : '') + item.title, item.id);
-        option.selected = item.id === (cid || data.activeConversationId);
-        select.add(option);
-      }
+
+    drawer = document.createElement('dialog');
+    drawer.id = 'limcode-mobile-drawer';
+    drawer.setAttribute('aria-label', '对话列表');
+    drawer.innerHTML = '<header><b></b><button data-new aria-label="新对话">＋</button><button data-close aria-label="关闭">✕</button></header><select aria-label="对话范围"></select><div class="items"></div>';
+    drawer.querySelector('b').textContent = WORKSPACE_NAME;
+    document.body.append(drawer);
+    const select = drawer.querySelector('select');
+    const items = drawer.querySelector('.items');
+
+    const renderScopes = data => {
+      const options = data.folders.length > 0 ? [new Option('当前项目', 'currentProject')] : [];
+      if (data.folders.length > 1) for (const folder of data.folders) options.push(new Option(folder.name, 'project:' + folder.uri));
+      options.push(new Option('未绑定项目', 'unbound'), new Option('全部历史', 'all'));
+      select.replaceChildren(...options);
+      select.value = data.scope.kind === 'project' ? 'project:' + data.scope.folderUri : data.scope.kind;
+    };
+    const closeDrawer = () => { if (drawer.open) history.back(); };
+    const row = (item, data) => {
+      const current = item.id === (cid || data.activeConversationId);
+      const button = element('button', current ? 'item current' : 'item', '');
+      if (current) button.setAttribute('aria-current', 'true');
+      button.append(element('span', 'title', (item.isOpen ? '● ' : '') + item.title));
+      const meta = [data.scope.kind === 'all' && item.projectName, item.statusLabel, ago(item.updatedAt), item.foreign && '继续对话需打开它的项目'];
+      button.append(element('span', 'meta', meta.filter(Boolean).join(' · ')));
+      button.addEventListener('click', () => {
+        if (current) return closeDrawer();
+        fetch('/__limcode_open?cid=' + encodeURIComponent(item.id), { method: 'POST' }).finally(() => open(item.id));
+      });
+      return button;
+    };
+
+    let token = 0;
+    let cursor = null;
+    let seen = new Set();
+    const loadPage = more => {
+      const request = ++token;
+      const query = new URLSearchParams({ scope: scope.kind });
+      if (scope.folderUri) query.set('folder', scope.folderUri);
+      if (more) query.set('cursor', cursor); else seen = new Set();
+      const notice = element('p', 'notice', '正在加载…');
+      if (more) items.append(notice); else items.replaceChildren(notice);
+      fetchJson('/__limcode_status?' + query).then(data => {
+        if (request !== token) return;
+        notice.remove();
+        scope = data.scope;
+        try { localStorage.setItem(SCOPE_KEY, JSON.stringify(scope)); } catch {}
+        renderScopes(data);
+        for (const item of data.conversations) {
+          if (!seen.has(item.id)) { seen.add(item.id); items.append(row(item, data)); }
+        }
+        if (seen.size === 0) items.append(element('p', 'notice', '这个范围里还没有对话'));
+        cursor = data.nextCursor;
+        if (cursor) {
+          const button = element('button', 'more', '加载更多');
+          button.addEventListener('click', () => { button.remove(); loadPage(true); });
+          items.append(button);
+        }
+      }).catch(error => {
+        if (request !== token) return;
+        notice.textContent = '读取对话失败：' + error.message;
+        const button = element('button', 'more', '重试');
+        button.addEventListener('click', () => { notice.remove(); button.remove(); loadPage(more); });
+        items.append(button);
+      });
+    };
+    const createConversation = () => {
+      const query = scope.kind === 'project' ? '?folder=' + encodeURIComponent(scope.folderUri) : '';
+      fetchJson('/__limcode_new' + query, { method: 'POST' })
+        .then(data => open(data.conversationId))
+        .catch(error => alert('新建对话失败：' + error.message));
+    };
+
+    bar.querySelector('[data-menu]').addEventListener('click', () => {
+      drawer.showModal();
+      history.pushState({ limcodeDrawer: true }, '');
+      loadPage(false);
     });
-    select.addEventListener('change', () => {
-      if (select.value) fetch('/__limcode_open?cid=' + encodeURIComponent(select.value), { method: 'POST' }).finally(() => open(select.value));
-    });
-    bar.querySelector('[data-new]').addEventListener('click', () => {
-      fetch('/__limcode_new', { method: 'POST' }).then(response => response.json()).then(data => { if (data.conversationId) open(data.conversationId); });
-    });
+    bar.querySelector('[data-new]').addEventListener('click', createConversation);
     bar.querySelector('[data-reload]').addEventListener('click', () => location.reload());
+    drawer.querySelector('[data-new]').addEventListener('click', createConversation);
+    drawer.querySelector('[data-close]').addEventListener('click', closeDrawer);
+    // 点遮罩（宽屏）、Esc、手机返回键都走历史记录，保持只有一种关闭方式。
+    drawer.addEventListener('click', event => { if (event.target === drawer) closeDrawer(); });
+    drawer.addEventListener('cancel', event => { event.preventDefault(); closeDrawer(); });
+    window.addEventListener('popstate', () => { if (drawer.open) drawer.close(); });
+    select.addEventListener('change', () => {
+      scope = select.value.startsWith('project:')
+        ? { kind: 'project', folderUri: select.value.slice('project:'.length) }
+        : { kind: select.value };
+      loadPage(false);
+    });
   });
 })();`;
 }
