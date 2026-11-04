@@ -454,7 +454,7 @@ export const useConversationUiStore = defineStore('conversationUi', () => {
   };
 });
 
-function visibleMessageText(message: MessageRecord): string {
+export function visibleMessageText(message: MessageRecord): string {
   return message.content.parts
     .filter(isVisibleTextPart)
     .map((part) => part.text)

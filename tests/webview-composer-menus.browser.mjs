@@ -383,3 +383,61 @@ test('输入法用回车确认文字时不发送，确认后的回车照常发�
   await p.waitForFunction(() => window.fixture.posted.some(m => m.type === 'turn.start' || m.type === 'turn.enqueue'));
   assert.deepEqual(await sent(), ['你好 test']);
 });
+
+test('空输入框按↑↓翻看发过的消息，←→、输入或输入法转为编辑，翻看时回车直接发送', async t => {
+  const p = await pageFor(t), input = p.locator('textarea.rich-editor-control'), hint = p.locator('.rich-editor-history-hint');
+  await p.evaluate(() => {
+    const { feed } = window.fixture;
+    const rows = [['m1', 'user', '第一条'], ['m2', 'model', '回复'], ['m3', 'user', '第二条\n第二行'], ['m4', 'user', '第二条\n第二行'], ['m5', 'user', '最新一条']];
+    feed.committedRecords = { ...feed.committedRecords, Message: Object.fromEntries(rows.map(([id, role], index) =>
+      [id, { id, conversation_id: 'self', role, revision_id: 'r-' + id, message_seq: String(index + 1), deleted_at: null }])) };
+    for (const [id, , text] of rows) feed.details['message-content:r-' + id] = { status: 'ready', text, totalBytes: text.length };
+  });
+  const press = async (...keys) => { for (const key of keys) await input.press(key); };
+  await input.click();
+  await press('ArrowUp');
+  assert.equal(await input.inputValue(), '最新一条');
+  assert.match(await hint.innerText(), /历史 1\/3/);
+  await press('ArrowUp');
+  if (screenshotDir) await p.screenshot({ path: `${screenshotDir}/history-browsing.png` });
+  await press('ArrowUp', 'ArrowUp');
+  assert.equal(await input.inputValue(), '第一条', '相邻重复只留一条，翻到最早一条停住');
+  await press('ArrowDown');
+  assert.equal(await input.inputValue(), '第二条\n第二行', '多行消息里 ↓ 仍是翻看');
+  await press('ArrowDown', 'ArrowDown');
+  assert.equal(await input.inputValue(), '', '翻过最新一条回到空输入框');
+  assert.equal(await hint.count(), 0);
+  await press('ArrowUp', 'ArrowUp', 'ArrowLeft', 'ArrowUp');
+  assert.equal(await input.inputValue(), '第二条\n第二行', '← 之后 ↑ 只移动光标');
+  assert.equal(await hint.count(), 0);
+
+  await input.fill('');
+  await press('ArrowUp');
+  const cdp = await p.context().newCDPSession(p);
+  await cdp.send('Input.imeSetComposition', { text: 'ce', selectionStart: 2, selectionEnd: 2 });
+  assert.equal(await hint.count(), 0, '输入法开始输入即转为编辑');
+  await cdp.send('Input.dispatchKeyEvent', { type: 'rawKeyDown', key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 229 });
+  await cdp.send('Input.insertText', { text: '测' });
+  assert.equal(await input.inputValue(), '最新一条测');
+
+  await input.fill('');
+  await press('ArrowUp', 'ArrowUp', 'Enter');
+  await p.waitForFunction(() => window.fixture.posted.some(m => m.type === 'turn.start' || m.type === 'turn.enqueue'));
+  assert.deepEqual(await p.evaluate(() => window.fixture.posted.filter(m => m.type === 'turn.start' || m.type === 'turn.enqueue').map(m => m.payload?.text)), ['第二条\n第二行']);
+});
+
+test('翻看用的正文由输入框自己读取最近 20 条，不依赖消息列表是否显示过', async t => {
+  const p = await pageFor(t), input = p.locator('textarea.rich-editor-control');
+  await p.evaluate(() => {
+    const { feed } = window.fixture;
+    feed.committedRecords = { ...feed.committedRecords, Message: Object.fromEntries(Array.from({ length: 50 }, (_, index) => ['h' + index,
+      { id: 'h' + index, conversation_id: 'self', role: index % 2 ? 'model' : 'user', revision_id: 'r-h' + index, message_seq: String(index + 1), deleted_at: null }])) };
+  });
+  const latest = Array.from({ length: 20 }, (_, index) => 'message-content:r-h' + (48 - 2 * index));
+  await p.waitForFunction(keys => JSON.stringify(window.fixture.feed.detailOwnerKeys['composer-history']) === JSON.stringify(keys), latest);
+  assert.deepEqual(await p.evaluate(() => Object.keys(window.fixture.feed.details).filter(key => key.startsWith('message-content:')).sort()), [...latest].sort());
+  await p.evaluate(keys => { for (const key of keys) window.fixture.feed.details[key] = { status: 'ready', text: '历史 ' + key.slice(-2), totalBytes: 9 }; }, latest);
+  await input.click();
+  await input.press('ArrowUp');
+  assert.equal(await input.inputValue(), '历史 48');
+});
