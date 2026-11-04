@@ -9,6 +9,7 @@ import { createApp, h, ref } from 'vue';
 import { createPinia } from 'pinia';
 import Composer from '/src/components/input/Composer.vue';
 import MessageList from '/src/components/conversation/ReliableMessageList.vue';
+import WorkEnvironmentPolicyEditor from '/src/components/settings/workEnvironment/WorkEnvironmentPolicyEditor.vue';
 import { useClientStateStore } from '/src/stores/useClientStateStore';
 import { useGlobalSettingsStore } from '/src/stores/useGlobalSettingsStore';
 import { useSessionStore } from '/src/stores/useSessionStore';
@@ -16,9 +17,11 @@ import { useWorkEnvironmentStore } from '/src/stores/useWorkEnvironmentStore';
 import { useReliableKernelClientFeedStore } from '/src/stores/useReliableKernelClientFeedStore';
 import { GLOBAL_SETTINGS_SECTIONS } from '@shared/protocol';
 import '/src/theme/tokens.css'; import '/src/theme/base.css'; import '/src/theme/motion/dropdown.css';
-const pinia = createPinia(), mode = ref('menus');
+const pinia = createPinia(), mode = ref('menus'), environmentScope = ref('agent');
 const app = createApp({ setup: () => () => mode.value === 'menus'
-  ? h('div', { class: 'composer-fixture' }, [h(Composer)]) : h(MessageList) }).use(pinia);
+  ? h('div', { class: 'composer-fixture' }, [h(Composer)]) : mode.value === 'environment-settings'
+    ? h(WorkEnvironmentPolicyEditor, { scopeKind: environmentScope.value, scopeId: environmentScope.value === 'conversation' ? 'self' : 'main' })
+    : h(MessageList) }).use(pinia);
 const client = useClientStateStore(pinia), settings = useGlobalSettingsStore(pinia), feed = useReliableKernelClientFeedStore(pinia);
 const session = useSessionStore(pinia), environments = useWorkEnvironmentStore(pinia);
 client.configurationReady = true; client.currentConversationId = 'self';
@@ -33,6 +36,11 @@ for (const section of GLOBAL_SETTINGS_SECTIONS) settings.applySnapshot({ section
   : JSON.parse(JSON.stringify(settings[section])), revision: 'fixture', filePath: 'memory' });
 const allowed = Array.from({ length: 12 }, (_, i) => ({ id: 'env-' + i, kind: 'local', name: '工作目录 ' + i,
   rootPath: '/home/user/projects/readable-work-directory-' + i, available: true, index: i }));
+const realEnvironmentSelection = {
+  allowedEnvironmentsForConversation: environments.allowedEnvironmentsForConversation,
+  environmentSelectionForConversation: environments.environmentSelectionForConversation,
+  workEnvironmentEnabledForConversation: environments.workEnvironmentEnabledForConversation
+};
 environments.allowedEnvironmentsForConversation = () => allowed;
 environments.environmentSelectionForConversation = () => ({ allowed, error: '工作环境未获当前策略允许：旧工作目录，请重新选择。' });
 environments.workEnvironmentEnabledForConversation = () => true;
@@ -42,7 +50,8 @@ feed.collaborationHistoryNextBeforeCursor = { kind: 'message' };
 feed.collaborationHistoryHasMoreBefore = true;
 feed.collaborationHistoryLoadedPages = 1;
 const posted = [];
-window.fixture = { client, settings, feed, mode, posted, hold: false, pages: 0, errors: false,
+window.fixture = { client, settings, feed, mode, environmentScope, environments, posted, hold: false, pages: 0, errors: false,
+  restoreEnvironmentSelection() { Object.assign(environments, realEnvironmentSelection); },
   resetHistory() { feed.synchronizeCollaborationHistoryScope('self', true); feed.collaborationHistoryNextBeforeCursor = { kind: 'message' }; feed.collaborationHistoryHasMoreBefore = true; feed.collaborationHistoryLoadedPages = 1; this.pages = 0; },
   messagePage(records, sequence, scannedRows = 4096) {
     const rows = records.CollaborationMessage ?? [];
@@ -154,6 +163,131 @@ test('目录说明不随搜索聚焦弹出，最末选项可点击', async t => 
   await last.click();
   assert.equal(await p.getByRole('tooltip').count(), 0);
   assert.ok(await p.evaluate(() => window.fixture.posted.some(m => m.type === 'workEnvironment.select' || m.payload?.workEnvironmentId === 'env-11')));
+});
+
+test('关闭切换工具仍可手动选择允许目录，空名单说明实际Agent策略并可打开设置', async t => {
+  const p = await pageFor(t);
+  await p.evaluate(() => {
+    const { client, feed } = window.fixture;
+    window.fixture.restoreEnvironmentSelection();
+    client.workEnvironments = ['blocked', 'allowed'].map(id => ({
+      id, kind: 'localFolder', name: id === 'allowed' ? '获准目录' : '旧目录',
+      rootPath: '/home/user/projects/' + id, available: true, createdAt: 1, updatedAt: 1
+    }));
+    feed.records.AgentConversationLink = { active: { id: 'active', conversation_id: 'self', agent_id: 'main', role: 'default' } };
+    client.workEnvironmentPolicies = [{ id: 'agent-policy', name: 'Agent 工作环境策略', enabled: false, autoAllowWorkspaceFolders: false,
+      allowedWorkEnvironmentIds: ['allowed'], createdAt: 1, updatedAt: 1 }];
+    client.workEnvironmentPolicyScopeLinks = [{ id: 'agent-policy-link', scopeKind: 'agent', scopeId: 'main',
+      workEnvironmentPolicyId: 'agent-policy', role: 'active', createdAt: 1, updatedAt: 1 }];
+    client.conversationWorkEnvironmentLinks = [{ id: 'selected', conversationId: 'self', workEnvironmentId: 'blocked',
+      role: 'active', createdAt: 1, updatedAt: 1 }];
+  });
+  const dropdown = p.locator('.composer-work-environment-dropdown');
+  await dropdown.locator('> button').click();
+  assert.equal(await dropdown.getByRole('option').count(), 1);
+  await dropdown.getByRole('option', { name: /^获准目录/ }).click();
+  assert.equal(await dropdown.locator('> button').innerText(), '获准目录');
+  assert.ok(await p.evaluate(() => window.fixture.posted.some(message => message.type === 'workEnvironment.select'
+    && message.payload.workEnvironmentId === 'allowed')));
+  assert.equal(await p.evaluate(() => window.fixture.posted.filter(message => message.type === 'workEnvironmentPolicy.scope.set').length), 0);
+
+  await p.evaluate(() => window.fixture.client.workEnvironmentPolicies[0].allowedWorkEnvironmentIds = []);
+  await dropdown.locator('> button').click();
+  assert.equal(await dropdown.getByRole('option').count(), 0);
+  assert.match(await dropdown.locator('.composer-directory-warning').innerText(), /Agent 设置中调整「主助手」的工作环境策略/);
+  await dropdown.getByRole('button', { name: '打开 Agent 工作环境设置', exact: true }).click();
+  assert.ok(await p.evaluate(() => window.fixture.posted.some(message => message.type === 'agentSettings.open')));
+});
+
+test('新打开目录默认自动允许，关闭后保留手动名单与明确开关', async t => {
+  const p = await pageFor(t, 1000);
+  await p.evaluate(() => {
+    const { client, feed } = window.fixture;
+    window.fixture.restoreEnvironmentSelection();
+    client.workEnvironments = ['old', 'new', 'closed', 'remote'].map(id => ({ id,
+      kind: id === 'remote' ? 'remoteServer' : 'localFolder', source: id === 'remote' ? 'manual' : 'workspaceFolder',
+      name: id, rootPath: '/projects/' + id, available: id !== 'closed', createdAt: 1, updatedAt: 1 }));
+    feed.records.AgentConversationLink = { active: { id: 'active', conversation_id: 'self', agent_id: 'main', role: 'default' } };
+    client.workEnvironmentPolicies = [{ id: 'agent-policy', name: 'Agent 策略', enabled: false,
+      allowedWorkEnvironmentIds: ['old'], createdAt: 1, updatedAt: 1 }];
+    client.workEnvironmentPolicyScopeLinks = [{ id: 'agent-policy-link', scopeKind: 'agent', scopeId: 'main',
+      workEnvironmentPolicyId: 'agent-policy', role: 'active', createdAt: 1, updatedAt: 1 }];
+    client.conversationWorkEnvironmentLinks = [{ id: 'selected', conversationId: 'self', workEnvironmentId: 'new',
+      role: 'active', createdAt: 1, updatedAt: 1 }];
+  });
+  const dropdown = p.locator('.composer-work-environment-dropdown');
+  assert.equal(await dropdown.locator('> button').innerText(), 'new');
+  await dropdown.locator('> button').click();
+  assert.equal(await dropdown.getByRole('option').count(), 2);
+  assert.equal(await dropdown.getByRole('option', { name: /^remote\b/ }).count(), 0);
+  await p.evaluate(() => window.fixture.mode.value = 'environment-settings');
+  const automatic = p.getByRole('checkbox', { name: '自动允许已打开的本地目录', exact: true });
+  assert.equal(await automatic.getAttribute('aria-checked'), 'true');
+  const newRow = p.locator('.work-env-item').filter({ has: p.locator('.work-env-name', { hasText: /^new$/ }) });
+  assert.ok(await newRow.getByRole('checkbox', { name: '自动允许', exact: true }).isDisabled());
+  await automatic.click();
+  assert.equal(await newRow.getByRole('checkbox', { name: '允许', exact: true }).getAttribute('aria-checked'), 'false');
+  await p.getByRole('checkbox', { name: '启用工作环境切换工具', exact: true }).click();
+  await newRow.getByRole('checkbox', { name: '允许', exact: true }).click();
+  await newRow.getByRole('button', { name: '设为默认', exact: true }).click();
+  await p.getByRole('button', { name: '清除默认环境', exact: true }).click();
+  const saved = await p.evaluate(() => window.fixture.posted.filter(message => message.type === 'workEnvironmentPolicy.scope.set').map(message => message.payload));
+  assert.ok(saved.length >= 5);
+  assert.ok(saved.every(payload => payload.autoAllowWorkspaceFolders === false));
+  assert.deepEqual(saved.at(-1).allowedWorkEnvironmentIds.sort(), ['new', 'old']);
+  assert.equal(await p.evaluate(() => window.fixture.client.workEnvironmentPolicies[0].autoAllowWorkspaceFolders), false);
+  await p.evaluate(() => window.fixture.mode.value = 'menus');
+  await dropdown.locator('> button').click();
+  assert.equal(await dropdown.getByRole('option').count(), 2);
+});
+
+test('子Agent继承父目录不受自身旧名单阻挡，冻结范围不被自动目录扩张', async t => {
+  const p = await pageFor(t, 1000);
+  await p.evaluate(() => {
+    const { client, feed } = window.fixture;
+    window.fixture.restoreEnvironmentSelection();
+    client.workEnvironments = ['parent', 'later'].map(id => ({ id, kind: 'localFolder', source: 'workspaceFolder',
+      name: id, rootPath: '/projects/' + id, available: true, createdAt: 1, updatedAt: 1 }));
+    feed.records.ChildExecution = { child: { id: 'child', child_conversation_id: 'self' } };
+    feed.records.AgentConversationLink = { active: { id: 'active', conversation_id: 'self', agent_id: 'main', role: 'default' } };
+    client.workEnvironmentPolicies = [{ id: 'agent-policy', name: '自身旧名单', enabled: false,
+      allowedWorkEnvironmentIds: ['later'], createdAt: 1, updatedAt: 1 }];
+    client.workEnvironmentPolicyScopeLinks = [{ id: 'agent-policy-link', scopeKind: 'agent', scopeId: 'main',
+      workEnvironmentPolicyId: 'agent-policy', role: 'active', createdAt: 1, updatedAt: 1 }];
+    const frozen = { conversationId: 'self', enabled: true, defaultWorkEnvironmentId: 'parent', allowedWorkEnvironmentIds: ['parent', 'not-open'] };
+    feed.projections.activeConversationWindow = { conversationId: 'self',
+      childConversationBoundary: { conversationId: 'self', workEnvironment: frozen }, activeTurnWorkEnvironment: frozen };
+    client.conversationWorkEnvironmentLinks = [];
+  });
+  const dropdown = p.locator('.composer-work-environment-dropdown');
+  assert.equal(await dropdown.locator('> button').innerText(), 'parent');
+  assert.equal(await p.locator('.composer-work-directory').innerText(), 'parent');
+  await dropdown.locator('> button').click();
+  assert.equal(await dropdown.getByRole('option').count(), 1);
+  assert.match(await dropdown.getByRole('option').innerText(), /^parent/);
+  const inherited = await p.evaluate(() => window.fixture.environments.childInheritedWorkEnvironmentPolicy('self'));
+  assert.deepEqual(inherited.allowedWorkEnvironmentIds, ['parent', 'not-open']);
+  assert.equal(inherited.enabled, true);
+  await p.evaluate(() => {
+    window.fixture.mode.value = 'environment-settings';
+    window.fixture.environmentScope.value = 'conversation';
+  });
+  assert.match(await p.locator('.work-env-summary').innerText(), /继承派出方/);
+  assert.ok(await p.getByRole('checkbox', { name: '启用工作环境切换工具', exact: true }).isDisabled());
+  assert.equal(await p.getByRole('checkbox', { name: '启用工作环境切换工具', exact: true }).getAttribute('aria-checked'), 'true');
+  assert.equal(await p.getByRole('checkbox', { name: '自动允许已打开的本地目录', exact: true }).count(), 0);
+  const laterRow = p.locator('.work-env-item').filter({ has: p.locator('.work-env-name', { hasText: /^later$/ }) });
+  assert.equal(await laterRow.getByRole('checkbox', { name: '允许', exact: true }).getAttribute('aria-checked'), 'false');
+  assert.ok(await laterRow.getByRole('checkbox', { name: '允许', exact: true }).isDisabled());
+  await p.evaluate(() => {
+    window.fixture.mode.value = 'menus';
+    window.fixture.client.conversationWorkEnvironmentLinks = [{ id: 'outside', conversationId: 'self', workEnvironmentId: 'later',
+      role: 'active', createdAt: 1, updatedAt: 1 }];
+  });
+  await dropdown.locator('> button').click();
+  assert.match(await dropdown.locator('.composer-directory-warning').innerText(), /继承派出这个子 Agent 的对话/);
+  assert.equal(await dropdown.getByRole('button', { name: '打开 Agent 工作环境设置', exact: true }).count(), 0);
+  assert.equal(await p.evaluate(() => window.fixture.posted.filter(message => message.type === 'workEnvironmentPolicy.scope.set').length), 0);
 });
 
 test('模型菜单宽窗并排、窄窗返回渠道，不再固定170px', async t => {

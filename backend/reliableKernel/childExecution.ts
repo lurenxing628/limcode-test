@@ -517,10 +517,9 @@ export class ChildExecutionControlPlane {
       modelFallback: command.modelFallback,
       ...(workspace ? { workspace } : {}),
       ...(command.authorityBound === 'executor_agent'
-        // The user approved this delegation: no planning-Turn bound, only its working directory.
-        ? (inheritedBoundary?.defaultWorkEnvironmentId
-            ? { preferredWorkEnvironmentId: inheritedBoundary.defaultWorkEnvironmentId }
-            : {})
+        // An approved Plan uses its executor's own tools and skills, but inherits its working
+        // directory and environment range exactly like every other child execution.
+        ? (inheritedBoundary ? { inheritedWorkEnvironmentPolicy: inheritedBoundary } : {})
         // The child's tools and skills never exceed the parent Turn's; later Turns keep this same bound.
         : await this.parentTurnBound(parentTurnId, inheritedBoundary)),
       ...(inheritedThinkingOverride ? { inheritedThinkingOverride } : {})

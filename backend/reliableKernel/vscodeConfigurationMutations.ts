@@ -807,6 +807,7 @@ export class VscodeConfigurationMutations {
           id,
           name: normalizedOptionalText(payload.name) ?? existing?.name ?? defaultPolicyName('工作环境', scope.scopeKind),
           enabled: payload.enabled ?? existing?.enabled ?? false,
+          autoAllowWorkspaceFolders: payload.autoAllowWorkspaceFolders ?? existing?.autoAllowWorkspaceFolders ?? true,
           allowedWorkEnvironmentIds: allowed,
           ...(defaultId ? { defaultWorkEnvironmentId: defaultId } : {}),
           createdAt: existing?.createdAt ?? now,

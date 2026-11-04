@@ -1482,6 +1482,8 @@ export interface WorkEnvironmentPolicyRecord {
   id: string;
   name: string;
   enabled: boolean;
+  /** 默认自动允许当前窗口打开的本地工作区目录；false 时仅使用手动允许列表。 */
+  autoAllowWorkspaceFolders?: boolean;
   allowedWorkEnvironmentIds: string[];
   defaultWorkEnvironmentId?: string;
   createdAt: number;
@@ -3251,6 +3253,7 @@ export interface WorkEnvironmentPolicyScopeSetPayload {
   scopeId?: string;
   name?: string;
   enabled?: boolean;
+  autoAllowWorkspaceFolders?: boolean;
   allowedWorkEnvironmentIds: string[];
   defaultWorkEnvironmentId?: string;
 }

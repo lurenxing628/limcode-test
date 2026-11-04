@@ -230,12 +230,30 @@ const workEnvironmentOptions = computed<SettingsDropdownOption[]>(() =>
     }))
 );
 const workEnvironmentSelection = computed(() => workEnvironmentStore.environmentSelectionForConversation(clientState.currentConversationId));
-const workEnvironmentSwitchingEnabled = computed(() => workEnvironmentStore.workEnvironmentEnabledForConversation(clientState.currentConversationId));
+const inheritedWorkEnvironmentPolicy = computed(() => workEnvironmentStore.childInheritedWorkEnvironmentPolicy(clientState.currentConversationId));
+const workEnvironmentPolicyScope = computed(() => inheritedWorkEnvironmentPolicy.value !== undefined
+  ? undefined : workEnvironmentStore.effectivePolicyForConversation(clientState.currentConversationId).link);
+const workEnvironmentPolicySource = computed(() => {
+  if (inheritedWorkEnvironmentPolicy.value !== undefined) return '工作目录继承派出这个子 Agent 的对话，请从父对话允许的目录中选择。';
+  const scope = workEnvironmentPolicyScope.value;
+  if (scope?.scopeKind === 'agent') {
+    const name = clientState.agents.find(agent => agent.id === scope.scopeId)?.name ?? scope.scopeId;
+    return `请在 Agent 设置中调整「${name}」的工作环境策略。`;
+  }
+  if (scope?.scopeKind === 'workflow') {
+    const name = clientState.workflows.find(workflow => workflow.id === scope.scopeId)?.name ?? scope.scopeId;
+    return `请在工作流设置中调整「${name}」的工作环境策略。`;
+  }
+  if (scope?.scopeKind === 'conversation') return '请在当前对话设置中调整工作环境策略。';
+  if (scope?.scopeKind === 'run') return '请调整当前运行的工作环境策略。';
+  return '请在全局设置的工作环境页面调整允许列表。';
+});
 const workEnvironmentLabel = computed(() => workEnvironmentSelection.value.error
   ? '工作目录待选择'
   : workEnvironmentSelection.value.active?.name ?? '未绑定工作目录');
 const workEnvironmentDescription = computed(() => workEnvironmentSelection.value.error
-  ?? (workEnvironmentSelection.value.active ? workEnvironmentDisplayPath(workEnvironmentSelection.value.active) : '当前没有可用的工作目录。'));
+  ? `${workEnvironmentSelection.value.error} ${workEnvironmentPolicySource.value}`
+  : workEnvironmentSelection.value.active ? workEnvironmentDisplayPath(workEnvironmentSelection.value.active) : `当前没有可用的工作目录。${workEnvironmentPolicySource.value}`);
 const frozenWorkEnvironmentSelection = computed(() => workEnvironmentStore.frozenEnvironmentSelectionForConversation(clientState.currentConversationId));
 const displayedWorkEnvironmentSelection = computed(() => frozenWorkEnvironmentSelection.value ?? workEnvironmentSelection.value);
 const displayedWorkEnvironmentLabel = computed(() => displayedWorkEnvironmentSelection.value.error
@@ -1177,7 +1195,7 @@ function agentSourceDescription(agent: AgentRecord): string {
           :config="confirmedChannelConfig"
           :model="confirmedEffectiveModel?.model"
         />
-        <template v-if="workEnvironmentSwitchingEnabled && (workEnvironmentOptions.length || workEnvironmentSelection.error)">
+        <template v-if="workEnvironmentOptions.length || workEnvironmentSelection.error || workEnvironmentPolicyScope">
           <span class="composer-work-environment-trigger">
             <SettingsDropdown
               panel-sizing="content"
@@ -1195,7 +1213,9 @@ function agentSourceDescription(agent: AgentRecord): string {
               @open-change="workEnvironmentMenuOpen = $event"
             >
               <template #header>
-                <p v-if="workEnvironmentSelection.error" class="composer-directory-warning">{{ workEnvironmentSelection.error }}</p>
+                <p v-if="workEnvironmentSelection.error || !workEnvironmentOptions.length" class="composer-directory-warning">{{ workEnvironmentDescription }}</p>
+                <button v-if="(workEnvironmentSelection.error || !workEnvironmentOptions.length) && workEnvironmentPolicyScope?.scopeKind === 'agent'"
+                  type="button" @click="openAgentSettings">打开 Agent 工作环境设置</button>
               </template>
             </SettingsDropdown>
             <HoverTooltipPanel :disabled="workEnvironmentMenuOpen" :panel-title="frozenWorkEnvironmentSelection ? '下一回合工作目录' : '工作目录'"
@@ -1205,7 +1225,7 @@ function agentSourceDescription(agent: AgentRecord): string {
           </span>
         </template>
         <HoverTooltipPanel
-          v-if="frozenWorkEnvironmentSelection || (!workEnvironmentSwitchingEnabled && (displayedWorkEnvironmentSelection.active || displayedWorkEnvironmentSelection.error))"
+          v-if="frozenWorkEnvironmentSelection"
           panel-title="实际工作目录"
           :rows="[{ label: frozenWorkEnvironmentSelection ? '本回合目录' : '目录', value: displayedWorkEnvironmentDescription }]"
         >

@@ -76,6 +76,8 @@ Runtime domain exact set 只在 [`authority.json#runtimeDomains`](./contracts/au
 
 每项在 `authority.json#configurationDomains` 中给出 Repository、Codec 和 `migrationEntryIds`；物理路径与 disposition 只在 `migration.json#physicalManifest` 定义。
 
+工作环境策略的 `autoAllowWorkspaceFolders` 默认开启：当前窗口可用的本地 workspace folder 自动加入有效允许范围，远程服务器仍由手动名单指定；显式关闭后只使用手动名单。选目录、资格预览与 Turn 编译共用 `resolveWorkEnvironmentSelection`。新 Turn 将有效目录 id 和当前目录冻结，之后打开其它目录不会修改既有 Turn。子 Agent 直接继承派出方 Turn 冻结的工作目录、完整允许列表和环境工具开关，不再叠加自身 Agent／对话的工作环境名单；继承范围中暂不可用的目录仍保留其 id，但不能被选作当前目录。子 Agent 自身的工具、技能限制继续按原合同执行。
+
 Scope 过滤固定为：
 
 ```text

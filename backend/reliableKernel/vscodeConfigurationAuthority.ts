@@ -296,9 +296,11 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         ...(selection.active ? { workEnvironmentId: selection.active.id } : {}),
         // The same frozen policy compileWithCurrentWorkspace writes into the authority snapshot.
         policy: {
-          id: policy?.id ?? null,
-          enabled: policy?.enabled ?? false,
-          allowedWorkEnvironmentIds: selection.allowed.map((environment) => environment.id).sort(),
+          id: request.inheritedWorkEnvironmentPolicy ? null : policy?.id ?? null,
+          enabled: request.inheritedWorkEnvironmentPolicy?.enabled ?? policy?.enabled ?? false,
+          allowedWorkEnvironmentIds: request.inheritedWorkEnvironmentPolicy
+            ? [...request.inheritedWorkEnvironmentPolicy.allowedWorkEnvironmentIds]
+            : selection.allowed.map((environment) => environment.id).sort(),
           defaultWorkEnvironmentId: selection.active?.id ?? null
         }
       };
@@ -463,13 +465,16 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       policy: workEnvironmentPolicy,
       inheritedPolicy: request.inheritedWorkEnvironmentPolicy,
       explicitWorkEnvironmentId: selectedEnvironment?.workEnvironmentId,
-      preferredWorkEnvironmentId: request.preferredWorkEnvironmentId,
       project: request.workspace
     });
     if (environmentSelection.error) throw new Error(environmentSelection.error);
-    const effectiveAllowedWorkEnvironmentIds = environmentSelection.allowed.map(environment => environment.id).sort();
+    const effectiveAllowedWorkEnvironmentIds = request.inheritedWorkEnvironmentPolicy
+      ? [...request.inheritedWorkEnvironmentPolicy.allowedWorkEnvironmentIds]
+      : environmentSelection.allowed.map(environment => environment.id).sort();
     const defaultWorkEnvironmentId = environmentSelection.active?.id ?? null;
-    const promptWorkEnvironments = workEnvironmentPolicy?.enabled === true
+    const workEnvironmentSwitchingEnabled = request.inheritedWorkEnvironmentPolicy?.enabled
+      ?? workEnvironmentPolicy?.enabled ?? false;
+    const promptWorkEnvironments = workEnvironmentSwitchingEnabled
       || request.inheritedWorkEnvironmentPolicy !== undefined
       ? environmentSelection.allowed
       : environmentSelection.allowed.filter(environment =>
@@ -579,8 +584,8 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
         ...(runtimeContextText ? { text: runtimeContextText } : {})
       },
       workEnvironmentPolicy: {
-        id: workEnvironmentPolicy?.id ?? null,
-        enabled: workEnvironmentPolicy?.enabled ?? false,
+        id: request.inheritedWorkEnvironmentPolicy ? null : workEnvironmentPolicy?.id ?? null,
+        enabled: workEnvironmentSwitchingEnabled,
         allowedWorkEnvironmentIds: effectiveAllowedWorkEnvironmentIds,
         defaultWorkEnvironmentId
       }

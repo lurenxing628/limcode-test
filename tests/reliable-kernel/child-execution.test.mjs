@@ -392,7 +392,7 @@ test('child permissions and approval respect the complete frozen ancestor chain'
   assert.equal(isSkillEnabledByPolicy(skills, { id: 'lint', source: 'claude' }), false);
 });
 
-test('an externally approved Plan compiles its executor without the planner authority bound', async () => {
+test('an externally approved Plan uses executor tools and skills while inheriting the planner environment', async () => {
   const parent = await f.parent('approved-plan', policy({ allowedTools: ['read', 'submit_plan'] }));
   const turn = await f.app.turns.input(parent.input('plan'));
   const source = await f.source(turn.turnId, 'submit_plan');
@@ -405,6 +405,9 @@ test('an externally approved Plan compiles its executor without the planner auth
   const compiled = f.compileRequests.find(request => request.turnId === child.childTurnId);
   assert.equal(compiled.inheritedToolPolicy, undefined);
   assert.equal(compiled.inheritedSkillPolicy, undefined);
+  assert.deepEqual(compiled.inheritedWorkEnvironmentPolicy, {
+    enabled: false, allowedWorkEnvironmentIds: [], defaultWorkEnvironmentId: null
+  });
   const [snapshot] = await f.rows('AuthoritySnapshot', { turn_id: child.childTurnId });
   const [metadata] = await f.rows('ContentObject', { id: snapshot.content_object_id });
   const document = JSON.parse((await f.app.contentStore.read(metadata)).toString('utf8'));

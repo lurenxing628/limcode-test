@@ -22,7 +22,8 @@ test('绑定B的真实authority冻结文件与命令根，长脚本非零退出�
   const { workEnvironmentIdFromUri } = compiled('shared/workEnvironmentCatalog.js');
   const aId = workEnvironmentIdFromUri(folders[0].uri), bId = workEnvironmentIdFromUri(folders[1].uri);
   await authority.synchronizeWorkspaceFolders(folders);
-  await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: false, allowedWorkEnvironmentIds: [aId, bId], defaultWorkEnvironmentId: aId });
+  await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: false, autoAllowWorkspaceFolders: false,
+    allowedWorkEnvironmentIds: [aId, bId], defaultWorkEnvironmentId: aId });
   const frozen = JSON.parse((await authority.compile({ conversationId: 'bound-b', turnId: 'bound-turn', executorAgentId: 'main', intentKind: 'input',
     workspace: { uri: folders[1].uri } })).authoritySnapshot.content).workEnvironmentPolicy;
   const { resolveFrozenWorkEnvironmentBoundary } = compiled('backend/reliableKernel/workEnvironmentBoundary.js');
@@ -52,6 +53,68 @@ test('绑定B的真实authority冻结文件与命令根，长脚本非零退出�
   assert.throws(() => resolveFrozenWorkEnvironmentBoundary(frozen, [local(aId, a)]), /已不可用/);
 });
 
+test('换目录自动允许已打开的本地根，子Agent直接继承父范围且不随新目录扩张', async t => {
+  const root = await temporaryRoot(t, 'automatic-environment-smoke');
+  const a = folder(path.join(root, 'A'), 'A', 0), b = folder(path.join(root, 'B'), 'B', 0), c = folder(path.join(root, 'C'), 'C', 1);
+  const { authority, paths } = authorityAt(path.join(root, 'settings'), [a]);
+  await seedProvider(authority);
+  const { workEnvironmentIdFromUri } = compiled('shared/workEnvironmentCatalog.js');
+  const aId = workEnvironmentIdFromUri(a.uri), bId = workEnvironmentIdFromUri(b.uri), cId = workEnvironmentIdFromUri(c.uri);
+  await authority.synchronizeWorkspaceFolders([a]);
+  for (const scope of [{ scopeKind: 'global' }, { scopeKind: 'agent', scopeId: 'main' }, { scopeKind: 'agent', scopeId: 'worker' }]) {
+    await authority.mutations.setWorkEnvironmentPolicy({ ...scope, enabled: scope.scopeId === 'main',
+      allowedWorkEnvironmentIds: [aId], defaultWorkEnvironmentId: aId });
+  }
+  // Existing saved policies have no automatic-local-directory option yet.
+  const records = path.join(paths.workEnvironmentPoliciesRootUri.fsPath, 'records');
+  for (const file of await fs.readdir(records)) {
+    const target = path.join(records, file), saved = JSON.parse(await fs.readFile(target, 'utf8'));
+    delete saved.policy.autoAllowWorkspaceFolders;
+    await fs.writeFile(target, JSON.stringify(saved));
+  }
+  await authority.mutations.upsertWorkEnvironment({ id: 'manual-server', kind: 'remoteServer', source: 'manual',
+    name: 'Server', host: 'fixture.invalid', available: true, createdAt: 1, updatedAt: 1 });
+  await authority.synchronizeWorkspaceFolders([b]);
+  const request = { conversationId: 'automatic-parent', executorAgentId: 'main', workspace: { uri: b.uri } };
+  const freeze = async (next, turnId) => JSON.parse((await authority.compile({ ...next, turnId, intentKind: 'input' })).authoritySnapshot.content).workEnvironmentPolicy;
+  const preview = await authority.previewWorkEnvironment(request), parent = await freeze(request, 'automatic-parent-turn');
+  assert.equal(preview.workEnvironmentId, bId);
+  assert.deepEqual(preview.policy, parent);
+  assert.deepEqual(parent.allowedWorkEnvironmentIds, [bId]);
+  assert.equal(parent.enabled, true);
+  const savedPolicies = (await authority.configurationClientState()).workEnvironmentPolicies;
+  assert.ok(savedPolicies.every(policy => policy.allowedWorkEnvironmentIds.length === 1 && policy.allowedWorkEnvironmentIds[0] === aId));
+  await authority.synchronizeWorkspaceFolders([a, b]);
+  const parentWithBothRoots = await freeze(request, 'parent-two-roots-turn');
+  const inheritedIds = [aId, bId].sort();
+  assert.deepEqual(parentWithBothRoots.allowedWorkEnvironmentIds, inheritedIds);
+  await authority.synchronizeWorkspaceFolders([b]);
+
+  await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'agent', scopeId: 'main', autoAllowWorkspaceFolders: false,
+    allowedWorkEnvironmentIds: [aId], defaultWorkEnvironmentId: aId });
+  assert.match((await authority.previewWorkEnvironment(request)).error, /未获当前策略允许/);
+  await assert.rejects(freeze(request, 'manual-parent-turn'), /未获当前策略允许/);
+
+  await authority.mutations.setWorkEnvironmentPolicy({ scopeKind: 'agent', scopeId: 'worker', enabled: false, autoAllowWorkspaceFolders: false,
+    allowedWorkEnvironmentIds: [aId], defaultWorkEnvironmentId: aId });
+  const childRequest = { conversationId: 'automatic-child', executorAgentId: 'worker', workspace: { uri: a.uri },
+    inheritedWorkEnvironmentPolicy: parentWithBothRoots };
+  const childPreview = await authority.previewWorkEnvironment(childRequest), child = await freeze(childRequest, 'automatic-child-turn');
+  assert.equal(childPreview.workEnvironmentId, bId);
+  assert.deepEqual(childPreview.policy, child);
+  assert.deepEqual(child.allowedWorkEnvironmentIds, inheritedIds);
+  assert.equal(child.defaultWorkEnvironmentId, bId);
+  assert.equal(child.enabled, true);
+
+  await authority.synchronizeWorkspaceFolders([b, c]);
+  assert.deepEqual((await authority.previewWorkEnvironment(childRequest)).policy.allowedWorkEnvironmentIds, inheritedIds);
+  const { resolveFrozenWorkEnvironmentBoundary } = compiled('backend/reliableKernel/workEnvironmentBoundary.js');
+  assert.deepEqual(resolveFrozenWorkEnvironmentBoundary(child, await authority.workEnvironments()).allowed.map(environment => environment.id), [bId]);
+  await authority.mutations.selectConversationWorkEnvironment('automatic-child', cId);
+  assert.match((await authority.previewWorkEnvironment(childRequest)).error, /派出这个子 Agent/);
+  await assert.rejects(freeze(childRequest, 'child-outside-parent-turn'), /派出这个子 Agent/);
+});
+
 test('两个Host投影只改变本地可用性，preview按scope有界读取且反映peer新revision', async t => {
   const root = await temporaryRoot(t, 'host-preview-smoke'), a = folder(path.join(root, 'A'), 'A', 0), b = folder(path.join(root, 'B'), 'B', 0);
   const { authority: first, paths } = authorityAt(path.join(root, 'shared'), [a]);
@@ -59,7 +122,7 @@ test('两个Host投影只改变本地可用性，preview按scope有界读取且�
   await first.synchronizeWorkspaceFolders([a]); await second.synchronizeWorkspaceFolders([b]);
   const remote = id => ({ id, kind: 'remoteServer', source: 'manual', name: id, host: `${id}.invalid`, available: true, createdAt: 1, updatedAt: 1 });
   await first.mutations.upsertWorkEnvironment(remote('remote-a')); await first.mutations.upsertWorkEnvironment(remote('remote-b'));
-  await first.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true,
+  await first.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true, autoAllowWorkspaceFolders: false,
     allowedWorkEnvironmentIds: ['remote-a', 'remote-b'], defaultWorkEnvironmentId: 'remote-a' });
   const viewA = await first.configurationClientState(), viewB = await second.configurationClientState();
   assert.deepEqual(viewA.workEnvironmentPolicies[0].allowedWorkEnvironmentIds, ['remote-a', 'remote-b']);
@@ -75,7 +138,7 @@ test('两个Host投影只改变本地可用性，preview按scope有界读取且�
   assert.equal((await first.previewWorkEnvironment(request)).workEnvironmentId, 'remote-a');
   assert.ok(reads.length <= viewA.workEnvironments.length + 7, JSON.stringify(reads));
   assert.ok(reads.every(file => !file.includes('model-profiles')));
-  await second.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true,
+  await second.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true, autoAllowWorkspaceFolders: false,
     allowedWorkEnvironmentIds: ['remote-a', 'remote-b'], defaultWorkEnvironmentId: 'remote-b' });
   assert.equal((await first.previewWorkEnvironment(request)).workEnvironmentId, 'remote-b');
 });

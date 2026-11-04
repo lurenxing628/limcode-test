@@ -2,6 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { IconCloudDown, IconPlus, IconServer, IconTrash } from '@tabler/icons-vue';
 import type { WorkEnvironmentPolicyScopeKind, WorkEnvironmentRecord } from '@shared/protocol';
+import { autoAllowWorkspaceFolders, automaticallyAllowedWorkspaceFolders } from '@shared/workEnvironmentSelection';
 import {
   canRemoveWorkEnvironment,
   getWorkEnvironmentKindDefinition,
@@ -42,16 +43,29 @@ const deleteConfirmOpen = ref(false);
 const resolution = computed(() => store.effectivePolicyFor(props.scopeKind, props.scopeId));
 const localResolution = computed(() => store.localPolicyFor(props.scopeKind, props.scopeId));
 const effectivePolicy = computed(() => resolution.value.policy);
+const inheritedPolicy = computed(() => props.scopeKind === 'conversation' && props.scopeId
+  ? store.childInheritedWorkEnvironmentPolicy(props.scopeId) : undefined);
+const inheritsParent = computed(() => inheritedPolicy.value !== undefined);
+const parentPolicy = computed(() => inheritedPolicy.value && inheritedPolicy.value !== 'unknown' ? inheritedPolicy.value : undefined);
+const policyReadonly = computed(() => props.readonly || inheritsParent.value);
 const hasLocalOverride = computed(() => props.scopeKind === 'global' || !!localResolution.value.policy);
-const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !props.readonly);
+const canRestoreInheritance = computed(() => props.scopeKind !== 'global' && hasLocalOverride.value && !policyReadonly.value);
 const environments = computed(() => store.availableEnvironments);
-const allowedSet = computed(() => new Set(effectivePolicy.value?.allowedWorkEnvironmentIds ?? environments.value.map((item) => item.id)));
-const defaultEnvironmentId = computed(() => effectivePolicy.value?.defaultWorkEnvironmentId ?? '');
+const manualAllowedSet = computed(() => new Set(inheritsParent.value
+  ? parentPolicy.value?.allowedWorkEnvironmentIds ?? []
+  : effectivePolicy.value?.allowedWorkEnvironmentIds ?? environments.value.map((item) => item.id)));
+const automaticAllowedSet = computed(() => new Set(inheritsParent.value ? []
+  : automaticallyAllowedWorkspaceFolders(environments.value, effectivePolicy.value).map(environment => environment.id)));
+const allowedSet = computed(() => new Set([...manualAllowedSet.value, ...automaticAllowedSet.value]));
+const automaticWorkspaceFolders = computed(() => autoAllowWorkspaceFolders(effectivePolicy.value));
+const defaultEnvironmentId = computed(() => (inheritsParent.value ? parentPolicy.value?.defaultWorkEnvironmentId : effectivePolicy.value?.defaultWorkEnvironmentId) ?? '');
 const activeEnvironment = computed(() => environments.value.find((item) => item.id === activeEnvironmentId.value) ?? environments.value[0]);
 const activeDetailEditor = computed(() => workEnvironmentDetailEditorForKind(activeEnvironment.value?.kind));
-const canDeleteActiveEnvironment = computed(() => !props.readonly && canRemoveWorkEnvironment(activeEnvironment.value));
-const policyEnabled = computed(() => effectivePolicy.value?.enabled === true);
+const canDeleteActiveEnvironment = computed(() => !policyReadonly.value && canRemoveWorkEnvironment(activeEnvironment.value));
+const policyEnabled = computed(() => (inheritsParent.value ? parentPolicy.value?.enabled : effectivePolicy.value?.enabled) === true);
 const sourceLabel = computed(() => {
+  if (inheritedPolicy.value === 'unknown') return '父对话工作目录范围暂不可用';
+  if (inheritsParent.value) return '继承派出方工作目录与范围';
   if (props.scopeKind === 'global') return '全局默认策略';
   if (hasLocalOverride.value) return '当前范围的单独设置';
   if (resolution.value.inheritedFrom === 'workflow') return '继承当前工作流策略';
@@ -71,8 +85,8 @@ watch(
 );
 
 function toggleAllowed(environment: WorkEnvironmentRecord, enabled: boolean): void {
-  if (props.readonly) return;
-  const next = new Set(allowedSet.value);
+  if (policyReadonly.value || automaticAllowedSet.value.has(environment.id)) return;
+  const next = new Set(manualAllowedSet.value);
   if (enabled) next.add(environment.id);
   else next.delete(environment.id);
   const allowed = [...next];
@@ -81,13 +95,13 @@ function toggleAllowed(environment: WorkEnvironmentRecord, enabled: boolean): vo
 }
 
 function setDefault(environment: WorkEnvironmentRecord): void {
-  if (props.readonly || !allowedSet.value.has(environment.id)) return;
-  store.setPolicyForScope(props.scopeKind, props.scopeId, [...allowedSet.value], environment.id, effectivePolicy.value?.name);
+  if (policyReadonly.value || !allowedSet.value.has(environment.id)) return;
+  store.setPolicyForScope(props.scopeKind, props.scopeId, [...new Set([...manualAllowedSet.value, environment.id])], environment.id, effectivePolicy.value?.name);
 }
 
 function clearDefault(): void {
-  if (props.readonly) return;
-  store.setPolicyForScope(props.scopeKind, props.scopeId, [...allowedSet.value], undefined, effectivePolicy.value?.name);
+  if (policyReadonly.value) return;
+  store.setPolicyForScope(props.scopeKind, props.scopeId, [...manualAllowedSet.value], undefined, effectivePolicy.value?.name);
 }
 
 function restoreInheritance(): void {
@@ -96,14 +110,20 @@ function restoreInheritance(): void {
 }
 
 function setPolicyEnabled(enabled: boolean): void {
-  if (props.readonly) return;
-  const allowed = [...allowedSet.value];
+  if (policyReadonly.value) return;
+  const allowed = [...manualAllowedSet.value];
   const defaultId = defaultEnvironmentId.value || undefined;
   store.setPolicyForScope(props.scopeKind, props.scopeId, allowed, defaultId, effectivePolicy.value?.name, enabled);
 }
 
+function setAutomaticWorkspaceFolders(enabled: boolean): void {
+  if (policyReadonly.value) return;
+  const defaultId = enabled || manualAllowedSet.value.has(defaultEnvironmentId.value) ? defaultEnvironmentId.value || undefined : undefined;
+  store.setPolicyForScope(props.scopeKind, props.scopeId, [...manualAllowedSet.value], defaultId, effectivePolicy.value?.name, policyEnabled.value, enabled);
+}
+
 function openCreate(action: WorkEnvironmentCreateAction = WORK_ENVIRONMENT_CREATE_ACTIONS[0]): void {
-  if (props.readonly) return;
+  if (policyReadonly.value) return;
   activeCreateAction.value = action;
   createOpen.value = true;
 }
@@ -123,7 +143,7 @@ function confirmCreate(input: string): void {
 function cancelCreate(): void { createOpen.value = false; }
 
 function importFromVscode(): void {
-  if (props.readonly) return;
+  if (policyReadonly.value) return;
   store.importFromVscode();
 }
 
@@ -144,7 +164,7 @@ function cancelDelete(): void { deleteConfirmOpen.value = false; }
 
 function updateActiveEnvironment(patch: Partial<WorkEnvironmentRecord>): void {
   const environment = activeEnvironment.value;
-  if (!environment || props.readonly) return;
+  if (!environment || policyReadonly.value) return;
   store.updateEnvironment(environment.id, patch);
 }
 
@@ -162,7 +182,7 @@ function kindLabel(environment: WorkEnvironmentRecord): string {
 
 function detailNote(environment: WorkEnvironmentRecord): string {
   const definition = getWorkEnvironmentKindDefinition(environment.kind);
-  if (definition.systemManaged) return `${definition.label}工作环境由系统自动同步，仅可在这里配置是否允许和默认选择。`;
+  if (definition.systemManaged) return '已打开的本地目录默认自动允许；关闭自动允许后，可逐个设置允许范围。';
   if (!activeDetailEditor.value) return `${definition.label}工作环境暂未提供专属编辑器；后续新增 Docker 等环境时，只需要接入对应 kind 的详情编辑组件。`;
   return definition.description;
 }
@@ -178,7 +198,8 @@ function detailNote(environment: WorkEnvironmentRecord): string {
           {{ title }}
           <SettingsLoadingInline :show="workEnvironmentLoading" :text="workEnvironmentLoadingText" />
         </h3>
-        <p v-if="description">{{ description }}</p>
+        <p v-if="inheritsParent">{{ inheritedPolicy === 'unknown' ? '父对话的工作目录范围暂不可用，请稍后再试。' : '工作目录和允许范围直接继承派出这个子 Agent 的主 Agent，无需单独授权，也不会随后来打开的目录扩大。' }}</p>
+        <p v-else-if="description">{{ description }}</p>
       </div>
       <div class="work-env-summary" aria-live="polite">
         <span>{{ sourceLabel }}</span>
@@ -190,13 +211,21 @@ function detailNote(environment: WorkEnvironmentRecord): string {
 
     <div class="work-env-actions">
       <LcCheckbox
+        v-if="!inheritsParent"
+        :model-value="automaticWorkspaceFolders"
+        :disabled="policyReadonly"
+        @update:model-value="setAutomaticWorkspaceFolders"
+      >
+        <span>自动允许已打开的本地目录</span>
+      </LcCheckbox>
+      <LcCheckbox
         :model-value="policyEnabled"
-        :disabled="readonly"
+        :disabled="policyReadonly"
         @update:model-value="setPolicyEnabled"
       >
         <span>启用工作环境切换工具</span>
       </LcCheckbox>
-      <button type="button" :disabled="readonly" @click="importFromVscode">
+      <button type="button" :disabled="policyReadonly" @click="importFromVscode">
         <IconCloudDown stroke="2" aria-hidden="true" />
         <span>从 VS Code 导入</span>
       </button>
@@ -205,13 +234,13 @@ function detailNote(environment: WorkEnvironmentRecord): string {
         :key="action.id"
         type="button"
         class="secondary"
-        :disabled="readonly"
+        :disabled="policyReadonly"
         @click="openCreate(action)"
       >
         <IconPlus stroke="2" aria-hidden="true" />
         <span>{{ action.label }}</span>
       </button>
-      <button type="button" class="secondary" :disabled="readonly || !defaultEnvironmentId" @click="clearDefault">清除默认环境</button>
+      <button type="button" class="secondary" :disabled="policyReadonly || !defaultEnvironmentId" @click="clearDefault">清除默认环境</button>
       <button type="button" class="secondary" :disabled="!canRestoreInheritance" @click="restoreInheritance">恢复继承</button>
       <span class="work-env-status">{{ store.status }}</span>
     </div>
@@ -241,12 +270,12 @@ function detailNote(environment: WorkEnvironmentRecord): string {
             <div class="work-env-row-actions">
               <LcCheckbox
                 :model-value="allowedSet.has(environment.id)"
-                :disabled="readonly"
+                :disabled="policyReadonly || automaticAllowedSet.has(environment.id)"
                 @update:model-value="toggleAllowed(environment, $event)"
               >
-                <span>允许</span>
+                <span>{{ automaticAllowedSet.has(environment.id) ? '自动允许' : '允许' }}</span>
               </LcCheckbox>
-              <button type="button" class="mini-action" :disabled="readonly || !allowedSet.has(environment.id)" @click="setDefault(environment)">设为默认</button>
+              <button type="button" class="mini-action" :disabled="policyReadonly || !allowedSet.has(environment.id)" @click="setDefault(environment)">设为默认</button>
             </div>
           </article>
         </div>
@@ -276,7 +305,7 @@ function detailNote(environment: WorkEnvironmentRecord): string {
             :is="activeDetailEditor"
             v-if="activeDetailEditor"
             :environment="activeEnvironment"
-            :readonly="readonly"
+            :readonly="policyReadonly"
             @update="updateActiveEnvironment"
           />
 

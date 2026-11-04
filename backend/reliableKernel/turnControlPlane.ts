@@ -165,14 +165,9 @@ export interface TurnAuthorityCompilationRequest {
   workspace?: ProjectFolderAssignment;
   /**
    * Parent Turn's frozen work-environment boundary, supplied by child executions. The compiler
-   * intersects it with the child's own scoped policy — the boundary is never widened.
+   * inherits it directly instead of applying the child's own scoped environment policy.
    */
   inheritedWorkEnvironmentPolicy?: FrozenWorkEnvironmentBoundaryPolicy;
-  /**
-   * The planning Turn's working directory, supplied when a Plan the user approved runs in a new
-   * conversation: the child starts there if its own settings allow it. It narrows nothing.
-   */
-  preferredWorkEnvironmentId?: string;
   /**
    * The parent Turn's frozen tool policy, supplied for every Turn of a child execution the model
    * started (a Plan the user approved to run in a new conversation has none). The compiler

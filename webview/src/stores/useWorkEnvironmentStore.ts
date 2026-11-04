@@ -33,6 +33,10 @@ export interface WorkEnvironmentPolicyResolution {
   inheritedFrom?: WorkEnvironmentPolicyScopeKind | 'workflow' | 'fallback';
 }
 
+export interface ChildInheritedWorkEnvironmentPolicy extends WorkEnvironmentSelectionPolicy {
+  enabled: boolean;
+}
+
 function scopeIdFor(scopeKind: WorkEnvironmentPolicyScopeKind, scopeId?: string): string | undefined {
   return scopeKind === 'global' ? undefined : scopeId?.trim();
 }
@@ -156,13 +160,16 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
       return this.effectivePolicyFor('global');
     },
     workEnvironmentEnabledForConversation(conversationId: string): boolean {
+      const inherited = this.childInheritedWorkEnvironmentPolicy(conversationId);
+      if (inherited === 'unknown') return false;
+      if (inherited) return inherited.enabled;
       return this.effectivePolicyForConversation(conversationId).policy?.enabled === true;
     },
     /**
      * The work environments a child Agent conversation's next Turn inherits (its latest Turn's frozen
      * list and directory), as the kernel applies them; undefined for any other conversation.
      */
-    childInheritedWorkEnvironmentPolicy(conversationId: string): WorkEnvironmentSelectionPolicy | 'unknown' | undefined {
+    childInheritedWorkEnvironmentPolicy(conversationId: string): ChildInheritedWorkEnvironmentPolicy | 'unknown' | undefined {
       const feed = useReliableKernelClientFeedStore();
       const child = Object.values(feed.records.ChildExecution ?? {}).some(record => record.child_conversation_id === conversationId);
       if (!child) return undefined;
@@ -173,7 +180,9 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
       // A latest Turn that froze no work environments bounds nothing, as in the kernel.
       if (!frozen || !Array.isArray(frozen.allowedWorkEnvironmentIds)) return undefined;
       return {
+        enabled: frozen.enabled === true,
         allowedWorkEnvironmentIds: frozen.allowedWorkEnvironmentIds.filter((id): id is string => typeof id === 'string'),
+        autoAllowWorkspaceFolders: false,
         defaultWorkEnvironmentId: typeof frozen.defaultWorkEnvironmentId === 'string' ? frozen.defaultWorkEnvironmentId : null
       };
     },
@@ -213,7 +222,7 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
       if (!defaultWorkEnvironmentId) return { allowed: [] };
       return resolveWorkEnvironmentSelection({
         environments: useClientStateStore().workEnvironments,
-        policy: { allowedWorkEnvironmentIds, defaultWorkEnvironmentId },
+        policy: { allowedWorkEnvironmentIds, defaultWorkEnvironmentId, autoAllowWorkspaceFolders: false },
         explicitWorkEnvironmentId: defaultWorkEnvironmentId
       });
     },
@@ -242,15 +251,18 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
       upsertById(clientState.conversationWorkEnvironmentLinks, link);
       bridge.request(BridgeMessageType.WorkEnvironmentSelect, { conversationId, workEnvironmentId });
     },
-    setPolicyForScope(scopeKind: WorkEnvironmentPolicyScopeKind, scopeId: string | undefined, allowedIds: string[], defaultId?: string, name?: string, enabled?: boolean): void {
+    setPolicyForScope(scopeKind: WorkEnvironmentPolicyScopeKind, scopeId: string | undefined, allowedIds: string[], defaultId?: string, name?: string, enabled?: boolean, autoAllowWorkspaceFolders?: boolean): void {
+      const current = this.effectivePolicyFor(scopeKind, scopeId).policy;
+      const resolvedAutomatic = autoAllowWorkspaceFolders ?? current?.autoAllowWorkspaceFolders ?? true;
       const sanitized = sanitizePolicyInput(allowedIds, defaultId);
-      const resolvedEnabled = enabled ?? this.effectivePolicyFor(scopeKind, scopeId).policy?.enabled ?? false;
-      this.applyOptimisticPolicyScopeSet(scopeKind, scopeId, sanitized.allowed, sanitized.defaultId, name, resolvedEnabled);
+      const resolvedEnabled = enabled ?? current?.enabled ?? false;
+      this.applyOptimisticPolicyScopeSet(scopeKind, scopeId, sanitized.allowed, sanitized.defaultId, name, resolvedEnabled, resolvedAutomatic);
       const payload: WorkEnvironmentPolicyScopeSetPayload = {
         scopeKind,
         ...(scopeIdFor(scopeKind, scopeId) ? { scopeId: scopeIdFor(scopeKind, scopeId) } : {}),
         ...(name?.trim() ? { name: name.trim() } : {}),
         enabled: resolvedEnabled,
+        autoAllowWorkspaceFolders: resolvedAutomatic,
         allowedWorkEnvironmentIds: sanitized.allowed,
         ...(sanitized.defaultId ? { defaultWorkEnvironmentId: sanitized.defaultId } : {})
       };
@@ -265,7 +277,7 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
         ...(scopeIdFor(scopeKind, scopeId) ? { scopeId: scopeIdFor(scopeKind, scopeId) } : {})
       });
     },
-    applyOptimisticPolicyScopeSet(scopeKind: WorkEnvironmentPolicyScopeKind, scopeId: string | undefined, allowedIds: string[], defaultId?: string, name?: string, enabled?: boolean): void {
+    applyOptimisticPolicyScopeSet(scopeKind: WorkEnvironmentPolicyScopeKind, scopeId: string | undefined, allowedIds: string[], defaultId?: string, name?: string, enabled?: boolean, autoAllowWorkspaceFolders?: boolean): void {
       const clientState = useClientStateStore();
       const normalizedScopeId = scopeIdFor(scopeKind, scopeId);
       const existingLink = latestLink(clientState.workEnvironmentPolicyScopeLinks.filter((candidate) => scopeLinkMatches(candidate, scopeKind, normalizedScopeId)));
@@ -276,6 +288,8 @@ export const useWorkEnvironmentStore = defineStore('workEnvironment', {
         id: policyId,
         name: name?.trim() || existingPolicy?.name || defaultPolicyName(scopeKind),
         enabled: enabled ?? existingPolicy?.enabled ?? false,
+        autoAllowWorkspaceFolders: autoAllowWorkspaceFolders ?? existingPolicy?.autoAllowWorkspaceFolders
+          ?? this.effectivePolicyFor(scopeKind, scopeId).policy?.autoAllowWorkspaceFolders ?? true,
         allowedWorkEnvironmentIds: allowedIds,
         ...(defaultId ? { defaultWorkEnvironmentId: defaultId } : {}),
         createdAt: existingPolicy?.createdAt ?? now,
