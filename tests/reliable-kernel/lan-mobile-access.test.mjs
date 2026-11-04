@@ -42,7 +42,7 @@ const { LanMobileAccessServer, lanMobileAccessCommand, restoreLanMobileAccess } 
 const { RELIABLE_KERNEL_ACK_MESSAGE } = require(path.join(compiledRoot, 'shared/reliableKernelClientFeed.js'));
 
 function fakeApplication() {
-  const calls = { attached: [], visible: [], detached: [], messages: [], controls: [], created: [] };
+  const calls = { attached: [], visible: [], detached: [], messages: [], controls: [], created: [], pages: [] };
   const webviews = new Map();
   return {
     calls,
@@ -59,7 +59,21 @@ function fakeApplication() {
     handleReliableKernelControl(clientId, message) { calls.controls.push([clientId, message]); return true; },
     async createConversation(options) { calls.created.push(options); return 'created-conversation'; },
     getConversationDisplayTitle(conversationId) { return conversationId ? `标题 ${conversationId}` : '新对话'; },
-    getConversationHistoryEntries() { return [{ id: 'open-a', title: '已打开' }, { id: 'history-b', title: '历史对话' }]; }
+    folders: [{ uri: 'file:///project-a', name: 'project-a', index: 0 }, { uri: 'file:///project-b', name: 'project-b', index: 1 }],
+    getProjectFolderCandidates() { return this.folders; },
+    async getConversationHistoryPage(input) {
+      calls.pages.push(input);
+      return {
+        scope: { kind: 'all' },
+        originLinks: [],
+        pageInfo: { limit: input.limit, hasNext: true, nextCursor: 'next-page', total: 3 },
+        entries: [
+          { id: 'open-a', title: '已打开', updatedAt: 3, isRunning: true, projectFolderUri: 'file:///project-a', projectName: 'project-a' },
+          { id: 'history-b', title: '', updatedAt: 2, isRunning: false, runStatusLabel: '等待上级', projectFolderUri: 'file:///closed', projectName: 'closed' },
+          { id: 'unbound-c', title: '未绑定', updatedAt: 1, isRunning: false }
+        ]
+      };
+    }
   };
 }
 
@@ -99,7 +113,8 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
     workspaceName: () => '工作区',
     activeConversationId: () => 'open-a',
     openConversations: () => ['open-a'],
-    openConversation: async (conversationId) => { opened.push(conversationId); }
+    openConversation: async (conversationId) => { opened.push(conversationId); },
+    waiting: () => undefined
   });
   const port = await server.start(0, '127.0.0.1');
   t.after(() => server.stop());
@@ -110,14 +125,51 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
   assert.match(index, /__limcode_sse/);
   assert.match(index, /"open-a"/);
   assert.match(index, /--vscode-editor-background/);
+  assert.ok(index.indexOf('height: var(--limcode-app-height') > index.indexOf('<title>'), '布局样式排在应用样式之后');
   assert.equal(await (await fetch(`${base}/assets/main.js`)).text(), 'console.log(1)');
   assert.equal((await fetch(`${base}/..%2Flan-mobile-outside.txt`)).status, 404);
 
   const status = await (await fetch(`${base}/__limcode_status`)).json();
   assert.deepEqual(status.conversations, [
-    { id: 'open-a', title: '标题 open-a', isOpen: true },
-    { id: 'history-b', title: '历史对话', isOpen: false }
+    { id: 'open-a', title: '已打开', isOpen: true, updatedAt: 3, projectName: 'project-a', statusLabel: '运行中', foreign: false },
+    { id: 'history-b', title: 'history-b', isOpen: false, updatedAt: 2, projectName: 'closed', statusLabel: '等待上级', foreign: true },
+    { id: 'unbound-c', title: '未绑定', isOpen: false, updatedAt: 1, foreign: false }
   ]);
+  assert.equal(status.nextCursor, 'next-page');
+  assert.equal(status.total, 3);
+  assert.deepEqual(status.folders, [{ uri: 'file:///project-a', name: 'project-a' }, { uri: 'file:///project-b', name: 'project-b' }]);
+  assert.deepEqual(status.scope, { kind: 'currentProject' }, '默认只看当前项目');
+  assert.deepEqual(application.calls.pages.at(-1), { scopeKind: 'currentProject', limit: 50 });
+
+  const statusFor = async (query) => (await (await fetch(`${base}/__limcode_status?${query}`)).json()).scope;
+  assert.deepEqual(await statusFor('scope=all&cursor=c2'), { kind: 'all' });
+  assert.deepEqual(application.calls.pages.at(-1), { scopeKind: 'all', cursor: 'c2', limit: 50 });
+  assert.deepEqual(await statusFor('scope=unbound'), { kind: 'unbound' });
+  assert.deepEqual(await statusFor('scope=project&folder=file%3A%2F%2F%2Fproject-b'), { kind: 'project', folderUri: 'file:///project-b' });
+  assert.deepEqual(application.calls.pages.at(-1), { scopeKind: 'project', projectFolderUri: 'file:///project-b', limit: 50 });
+  assert.deepEqual(await statusFor('scope=project&folder=file%3A%2F%2F%2Fgone'), { kind: 'currentProject' }, '记住的项目不在这个窗口时退回当前项目');
+  const allFolders = application.folders;
+  application.folders = [];
+  assert.deepEqual(await statusFor(''), { kind: 'all' }, '窗口没有打开文件夹时看全部');
+  application.folders = allFolders;
+
+  // 读取失败要把原因带给页面，不能返回一个空列表。
+  const readPage = application.getConversationHistoryPage;
+  application.getConversationHistoryPage = async () => { throw new Error('读取历史失败'); };
+  const failed = await fetch(`${base}/__limcode_status`);
+  assert.equal(failed.status, 500);
+  assert.equal(await failed.text(), '读取历史失败');
+  application.getConversationHistoryPage = readPage;
+
+  // 只有属于这个窗口的项目才带给新建；其它情况走默认项目，避免后端因项目不在工作区而报错。
+  const createIn = (query) => fetch(`${base}/__limcode_new${query}`, { method: 'POST' }).then((response) => response.json());
+  assert.deepEqual(await createIn('?folder=file%3A%2F%2F%2Fproject-b'), { conversationId: 'created-conversation' });
+  assert.deepEqual(application.calls.created.at(-1), { projectFolderUri: 'file:///project-b' });
+  assert.deepEqual(await createIn('?folder=file%3A%2F%2F%2Fgone'), { conversationId: 'created-conversation' });
+  assert.deepEqual(application.calls.created.at(-1), {});
+  assert.deepEqual(await createIn(''), { conversationId: 'created-conversation' });
+  assert.deepEqual(application.calls.created.at(-1), {});
+  assert.deepEqual(opened.splice(0), ['created-conversation', 'created-conversation', 'created-conversation']);
 
   // 首条上行消息先于 SSE 建立会话：期间的下行消息排队，连上后补发。
   const query = '?sid=phone-1&cid=open-a';
@@ -149,6 +201,56 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
   server.stop();
   assert.deepEqual(application.calls.detached, ['client-1']);
   assert.equal(server.listening, false);
+});
+
+test('手机访问：运行时没启动好时说明原因，桌面没打开对话时按当前项目选一个', async (t) => {
+  const application = fakeApplication();
+  const pages = [];
+  application.getConversationHistoryPage = async (input) => {
+    pages.push(input);
+    return { scope: { kind: input.scopeKind }, originLinks: [], entries: application.emptyHistory ? [] : [{ id: 'recent', title: '最近' }], pageInfo: { limit: 1, hasNext: false, total: 1 } };
+  };
+  let ready;
+  let startupResult = new Promise((resolve, reject) => { ready = { resolve, reject }; });
+  let waiting = { title: '正在等待另一个窗口', description: '它正在合并旧数据' };
+  let active;
+  const opened = [];
+  const server = new LanMobileAccessServer({
+    application: () => startupResult,
+    webviewRoot: os.tmpdir(),
+    workspaceName: () => '工作区',
+    activeConversationId: () => active,
+    openConversations: () => [],
+    openConversation: async (conversationId) => { opened.push(conversationId); },
+    waiting: () => waiting
+  });
+  const base = `http://127.0.0.1:${await server.start(0, '127.0.0.1')}`;
+  t.after(() => server.stop());
+  const startup = async () => (await fetch(`${base}/__limcode_startup`)).json();
+  const land = async () => (await fetch(`${base}/__limcode_landing`, { method: 'POST' })).json();
+
+  assert.deepEqual(await startup(), { ready: false, waiting }, '还在启动时马上返回，不等运行时');
+  waiting = undefined;
+  assert.deepEqual(await startup(), { ready: false });
+  ready.resolve(application);
+  assert.deepEqual(await startup(), { ready: true });
+
+  assert.equal((await fetch(`${base}/__limcode_landing`)).status, 404, '只接受 POST，避免预取时新建对话');
+  assert.deepEqual(await land(), { conversationId: 'recent' });
+  assert.deepEqual(pages.at(-1), { scopeKind: 'currentProject', limit: 1 });
+  application.folders = [];
+  await land();
+  assert.deepEqual(pages.at(-1), { scopeKind: 'unbound', limit: 1 }, '窗口没打开文件夹时不进入其它项目的对话');
+  application.emptyHistory = true;
+  assert.deepEqual(await land(), { conversationId: 'created-conversation' }, '没有对话就新建');
+  assert.equal(application.calls.created.length, 1);
+  active = 'desktop-active';
+  assert.deepEqual(await land(), { conversationId: 'desktop-active' }, '桌面已打开对话时进入它');
+  assert.deepEqual(opened, ['recent', 'recent', 'created-conversation', 'desktop-active'], '进入的对话由这个窗口接管');
+
+  startupResult = Promise.reject(new Error('数据目录不可用'));
+  startupResult.catch(() => undefined);
+  assert.deepEqual(await startup(), { ready: false, error: '数据目录不可用' });
 });
 
 test('远程访问开关：设置页开启后出现状态栏项并记住，关闭后撤下，状态回传给设置页', async (t) => {
