@@ -253,7 +253,7 @@ test('手机访问：运行时没启动好时说明原因，桌面没打开对�
   assert.deepEqual(await startup(), { ready: false, error: '数据目录不可用' });
 });
 
-test('远程访问开关：设置页开启后出现状态栏项并记住，关闭后撤下，状态回传给设置页', async (t) => {
+test('远程访问开关：状态栏常驻，设置页开关后状态栏跟着变并记住，状态回传给设置页', async (t) => {
   const stored = new Map();
   const context = {
     extensionUri: { fsPath: os.tmpdir() },
@@ -266,10 +266,18 @@ test('远程访问开关：设置页开启后出现状态栏项并记住，关�
   const lastState = () => posted.at(-1)[1].payload;
   t.after(() => lanMobileAccessCommand(context, startup, { clientId: 'cleanup', enabled: false }));
 
+  // 窗口启动时状态栏就有开关，但默认不监听。
+  await restoreLanMobileAccess(context, startup);
+  assert.equal(statusItems.length, 1);
+  assert.ok(statusItems[0].shown);
+  assert.equal(statusItems[0].text, '$(remote) 远程访问：关');
+  assert.equal(statusItems[0].command, 'limcode-test.lanMobileAccess', '点一下就开启');
+  assert.ok(context.subscriptions.includes(statusItems[0]), '窗口关闭时一起释放');
+
   await lanMobileAccessCommand(context, startup, { clientId: 'settings-1' });
   assert.deepEqual(posted.map(([clientId, message]) => [clientId, message.type, message.channel]), [['settings-1', 'lanMobileAccess.state', 'settings']]);
   assert.deepEqual(lastState(), { enabled: false, urls: [] });
-  assert.equal(statusItems.length, 0, '默认关闭：读取状态不会开启');
+  assert.equal(stored.get('lanMobileAccess.enabled'), undefined, '默认关闭：读取状态不会开启');
 
   await lanMobileAccessCommand(context, startup, { clientId: 'settings-1', enabled: true });
   assert.equal(lastState().enabled, true);
@@ -277,10 +285,8 @@ test('远程访问开关：设置页开启后出现状态栏项并记住，关�
   const port = Number(new URL(lastState().urls[0]).port);
   assert.equal((await fetch(`http://127.0.0.1:${port}/missing.js`)).status, 404, '已在监听');
   assert.equal(stored.get('lanMobileAccess.enabled'), true);
-  assert.equal(statusItems.length, 1);
-  assert.ok(statusItems[0].shown);
-  assert.match(statusItems[0].text, /远程访问/);
-  assert.equal(statusItems[0].command, 'limcode-test.lanMobileAccess');
+  assert.equal(statusItems.length, 1, '开关复用同一个状态栏项');
+  assert.equal(statusItems[0].text, `$(remote) 远程访问 :${port}`);
 
   // 再开一次不会重复监听；另一个设置页随后也能收到变化。
   await lanMobileAccessCommand(context, startup, { clientId: 'gone' });
@@ -292,6 +298,17 @@ test('远程访问开关：设置页开启后出现状态栏项并记住，关�
   assert.deepEqual(posted.map(([clientId]) => clientId), ['settings-1'], '已关闭的设置页不再收到状态');
   assert.deepEqual(lastState(), { enabled: false, urls: [] });
   assert.equal(stored.get('lanMobileAccess.enabled'), false);
-  assert.ok(statusItems[0].disposed);
+  assert.equal(statusItems[0].text, '$(remote) 远程访问：关', '关闭后状态栏留着，可以再点开');
+  assert.equal(statusItems.length, 1);
+  assert.equal(statusItems[0].disposed, false);
   await assert.rejects(fetch(`http://127.0.0.1:${port}/missing.js`));
+
+  // 状态栏点击不带参数：关着时直接开启，再给出地址。
+  const notices = [];
+  vscode.window.showInformationMessage = async (message) => { notices.push(message); return undefined; };
+  t.after(() => { delete vscode.window.showInformationMessage; });
+  await lanMobileAccessCommand(context, startup);
+  assert.equal(stored.get('lanMobileAccess.enabled'), true);
+  assert.match(statusItems[0].text, /^\$\(remote\) 远程访问 :\d+$/);
+  assert.match(notices[0], /远程访问已开启：http:\/\//);
 });
