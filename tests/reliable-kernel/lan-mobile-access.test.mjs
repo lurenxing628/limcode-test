@@ -77,6 +77,13 @@ function fakeApplication() {
   };
 }
 
+async function waitFor(condition) {
+  for (let attempt = 0; !condition(); attempt++) {
+    if (attempt > 200) throw new Error('等待超时');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 async function readFrames(response, count) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -187,6 +194,16 @@ test('手机访问：页面注入桥接脚本，SSE 下发后端消息，POST �
   application.webviews.get('client-1').postMessage({ type: 'live', n: 2 });
   assert.deepEqual(await frames, [{ type: 'queued', n: 1 }, { type: 'live', n: 2 }]);
   assert.equal(application.calls.attached.length, 1, '同一个 sid 复用同一个会话');
+
+  // 断线时桌面端像面板被隐藏那样暂停推送，期间的消息排队，不写进断掉的连接；
+  // 重连后补发排队的消息，并让桌面端像面板重新显示那样重发完整状态。
+  await waitFor(() => application.calls.visible.length === 2);
+  assert.deepEqual(application.calls.visible, [['client-1', true], ['client-1', false]]);
+  application.webviews.get('client-1').postMessage({ type: 'offline', n: 3 });
+  const replay = readFrames(await fetch(`${base}/__limcode_sse${query}`), 1);
+  assert.deepEqual(await replay, [{ type: 'offline', n: 3 }]);
+  assert.deepEqual(application.calls.visible.slice(2, 4), [['client-1', false], ['client-1', true]]);
+  assert.equal(application.calls.attached.length, 1, '重连接回原会话');
 
   assert.deepEqual(await post({ type: 'conversation.open', id: 'm2', payload: { conversationId: 'history-b' } }), { ok: true, redirectCid: 'history-b' });
   assert.deepEqual(await post({ type: 'conversation.create', id: 'm3', payload: {} }), { ok: true, redirectCid: 'created-conversation' });

@@ -26,6 +26,8 @@ export const LAN_MOBILE_ACCESS_PORT = 14_319;
 const SESSION_LINGER_MS = 15_000;
 const SESSION_QUEUE_LIMIT = 500;
 const HISTORY_PAGE_SIZE = 50;
+/** 下行心跳间隔；手机端久收不到任何东西就认为连接已经悄悄断了，主动重连。 */
+const HEARTBEAT_MS = 15_000;
 
 const MIME_TYPES: Record<string, string> = {
   '.html': 'text/html; charset=utf-8',
@@ -222,6 +224,9 @@ interface MobileSession {
   application: ApplicationFacade;
   stream?: http.ServerResponse;
   queue: string[];
+  /** 已经连上过下行；之后的每次连上都是断线重连。 */
+  streamed?: boolean;
+  lingerTimer?: NodeJS.Timeout;
 }
 
 export class LanMobileAccessServer {
@@ -368,7 +373,7 @@ export class LanMobileAccessServer {
     const webview = {
       postMessage: (message: unknown) => {
         const frame = `data: ${JSON.stringify(message)}\n\n`;
-        if (session.stream && !session.stream.writableEnded) session.stream.write(frame);
+        if (session.stream) session.stream.write(frame);
         else if (session.queue.length < SESSION_QUEUE_LIMIT) session.queue.push(frame);
         return Promise.resolve(true);
       }
@@ -389,6 +394,7 @@ export class LanMobileAccessServer {
     if (!session) return;
     this.sessions.delete(sessionId);
     try { session.application.detachWebview(session.clientId); } catch { /* Runtime 已关闭 */ }
+    clearTimeout(session.lingerTimer);
     session.stream?.end();
   }
 
@@ -404,12 +410,33 @@ export class LanMobileAccessServer {
       Connection: 'keep-alive'
     });
     response.write(': connected\n\n');
+    const previous = session.stream;
     session.stream = response;
+    clearTimeout(session.lingerTimer);
+    // 旧连接可能已经悄悄断了（手机网络切换、休眠），关掉它，免得两条连接都在收。
+    previous?.end();
     for (const frame of session.queue.splice(0)) response.write(frame);
-    // 手机切到后台会断开；EventSource 用同一个 sid 重连时接回原会话，久不回来才释放。
-    request.on('close', () => setTimeout(() => {
-      if (this.sessions.get(sessionId)?.stream === response) this.closeSession(sessionId);
-    }, SESSION_LINGER_MS).unref());
+    // 桌面端发一条、等手机确认再发下一条，断线期间的消息已经丢了或被暂停。重连时像面板重新显示那样，
+    // 让它暂停后重发一份完整状态，补上漏掉的进度。
+    if (session.streamed) {
+      session.application.setWebviewVisible(session.clientId, false);
+      session.application.setWebviewVisible(session.clientId, true);
+    }
+    session.streamed = true;
+    const heartbeat = setInterval(() => response.write('event: ping\ndata: 0\n\n'), HEARTBEAT_MS);
+    heartbeat.unref();
+    request.on('close', () => {
+      clearInterval(heartbeat);
+      if (session.stream !== response) return;
+      // 断开后不再往这条连接写；桌面端像面板被隐藏那样暂停推送，不会因为等不到确认而把手机挂起。
+      session.stream = undefined;
+      try { session.application.setWebviewVisible(session.clientId, false); } catch { /* Runtime 已关闭 */ }
+      // 手机切到后台会断开；用同一个 sid 重连时接回原会话，久不回来才释放。
+      session.lingerTimer = setTimeout(() => {
+        if (this.sessions.get(sessionId) === session && !session.stream) this.closeSession(sessionId);
+      }, SESSION_LINGER_MS);
+      session.lingerTimer.unref();
+    });
   }
 
   private async receive(response: http.ServerResponse, sessionId: string, conversationId: string | undefined, raw: unknown): Promise<void> {
@@ -505,20 +532,54 @@ function mobileShim(initialConversationId: string, workspaceName: string): strin
     window.visualViewport.addEventListener('resize', fitViewport);
     window.visualViewport.addEventListener('scroll', fitViewport);
   }
-  if (cid) new EventSource('/__limcode_sse' + query).onmessage = event => {
-    window.dispatchEvent(new MessageEvent('message', { data: JSON.parse(event.data) }));
-  };
   let state = { kind: 'mainPanel', conversationId: cid };
   let sending = Promise.resolve();
+  let readyMessage;
+  let source;
+  let lastEventAt = 0;
+  let connectedOnce = false;
+  let snapshotSeen = true;
+  // 逐条发送，保持和面板 postMessage 相同的先后顺序。卡住的请求会堵住后面的确认，所以要有超时；
+  // 发送失败说明连接出了问题，重连一次拿回完整状态。没有对话的落地页不接会话，也不发消息。
+  const post = message => {
+    if (!cid) return;
+    if (message && message.type === 'bridge.ready') readyMessage = message;
+    sending = sending.then(() => fetch('/__limcode_msg' + query, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(message),
+      ...(AbortSignal.timeout ? { signal: AbortSignal.timeout(20000) } : {})
+    })).then(response => response.json()).then(result => { if (result && result.redirectCid) open(result.redirectCid); })
+      .catch(error => { console.error('[LimCode Mobile] postMessage failed', error); if (!document.hidden) connect(); });
+  };
+  // 下行连接。页面切到后台时断开，桌面端随之暂停推送；回到前台、或者久收不到心跳（连接悄悄断了）时重连，
+  // 桌面端会重发完整状态。会话若已被挂起，重连不会让它恢复，几秒内没收到完整状态就重新声明就绪。
+  const connect = () => {
+    if (!cid) return;
+    if (source) source.close();
+    lastEventAt = Date.now();
+    source = new EventSource('/__limcode_sse' + query);
+    source.onmessage = event => {
+      lastEventAt = Date.now();
+      const data = JSON.parse(event.data);
+      if (data && data.type === 'reliable-kernel.snapshot') snapshotSeen = true;
+      window.dispatchEvent(new MessageEvent('message', { data }));
+    };
+    source.addEventListener('ping', () => { lastEventAt = Date.now(); });
+    source.onopen = () => {
+      lastEventAt = Date.now();
+      if (!connectedOnce) { connectedOnce = true; return; }
+      snapshotSeen = false;
+      setTimeout(() => { if (!snapshotSeen && readyMessage) post(readyMessage); }, 5000);
+    };
+  };
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) return connect();
+    if (source) source.close();
+    source = undefined;
+  });
+  setInterval(() => { if (!document.hidden && Date.now() - lastEventAt > 45000) connect(); }, 5000);
+  connect();
   window.acquireVsCodeApi = () => ({
-    postMessage(message) {
-      if (!cid) return;
-      // 逐条发送，保持和面板 postMessage 相同的先后顺序。
-      sending = sending.then(() => fetch('/__limcode_msg' + query, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(message)
-      })).then(response => response.json()).then(result => { if (result && result.redirectCid) open(result.redirectCid); })
-        .catch(error => console.error('[LimCode Mobile] postMessage failed', error));
-    },
+    postMessage: post,
     getState: () => state,
     setState: next => (state = next)
   });
