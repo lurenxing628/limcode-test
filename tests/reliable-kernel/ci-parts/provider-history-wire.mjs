@@ -94,7 +94,7 @@ const answer = text => ({ role: 'model', parts: [{ text }] });
  * adapter and the provider request encoder are production code. `send` answers each request and
  * sees the frozen request, the adapter's LlmStartRequest and the encoded wire body.
  */
-async function fixture({ providerKind, modelId, baseUrl = 'https://example.invalid/v1', send }, run) {
+async function fixture({ providerKind, modelId, baseUrl = 'https://example.invalid/v1', send, tools = definitions, host = {}, configure }, run) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'limcode-tool-batch-wire-'));
   const configuration = new VscodeConfigurationAuthority(() => createVscodeStoragePaths(Uri.file(path.join(root, 'settings'))));
   const save = async (section, settings) => configuration.saveGlobalSettings(section, settings, (await configuration.loadGlobalSettings(section)).revision);
@@ -107,6 +107,7 @@ async function fixture({ providerKind, modelId, baseUrl = 'https://example.inval
     await save('llmProviderConfigs', { configs: [provider] });
     await save('llm', { activeProviderConfigId: provider.id });
     await configuration.mutations.setToolPolicy({ scopeKind: 'global', sourceConfigs: { srv: { enabled: true } } });
+    await configure?.(configuration);
     const rootAuthority = new kernel.RootAuthority(() => path.join(root, 'runtime'));
     await kernel.initializeEmptyRuntimeRoot(rootAuthority);
     app = await kernel.ReliableKernelApplication.open(rootAuthority, {
@@ -139,7 +140,7 @@ async function fixture({ providerKind, modelId, baseUrl = 'https://example.inval
         }
       } }; } },
       createToolDispatcher: dependencies => new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
-        host: { definitions: () => definitions } })
+        host: { definitions: () => tools, ...host } })
     });
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -198,6 +199,48 @@ test('a server-side compaction item from an ordinary Responses reply is stored w
   const secondQuestion = texts.findIndex(text => text.includes('second question'));
   assert.ok(firstQuestion < compactionIndex && compactionIndex < firstAnswer && firstAnswer < secondQuestion,
     `output order is kept: ${texts.map(text => text.slice(0, 60)).join(' | ')}`);
+});
+
+test('with several switchable work environments, consecutive requests send byte-identical tool definitions', { timeout: 120000 }, async () => {
+  // Tool descriptions list the switchable environments by W# reference. Every changed byte in the
+  // tool block invalidates the provider prompt cache for the whole request, so the references a
+  // request assigns there must be the same ones the next request sees.
+  const { switchWorkEnvironmentTool } = load('backend/world/modules/tools/definitions/switchWorkEnvironment/index.js');
+  const environment = (id, name) => ({ id, kind: 'remoteServer', source: 'manual', name, host: `${name}.invalid`,
+    user: 'dev', port: 22, workdir: `/srv/${name}`, available: true, createdAt: 1, updatedAt: 1 });
+  const environments = [environment('work-env-remote-alpha', 'alpha'), environment('work-env-remote-beta', 'beta')];
+  const toolBlocks = [];
+  await fixture({ providerKind: 'openai', modelId: 'gpt-5.5', tools: [switchWorkEnvironmentTool],
+    host: { async workEnvironmentsForAuthority() { return { allowed: environments }; } },
+    async configure(configuration) {
+      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['switch_work_environment'] });
+      await configuration.mutations.upsertWorkEnvironments(environments);
+      await configuration.mutations.setWorkEnvironmentPolicy({ scopeKind: 'global', enabled: true,
+        allowedWorkEnvironmentIds: environments.map(item => item.id), defaultWorkEnvironmentId: environments[0].id });
+    },
+    async send(round, { wire }) {
+      toolBlocks.push(JSON.stringify(wire.tools));
+      return answer(`Answer ${round}.`);
+    } }, async ({ app, turn }) => {
+    await turn('first question');
+    const second = await turn('second question');
+    await turn('third question');
+    // A compression rewrites the context root; the environment references must survive it too.
+    const [authority] = await rows(app, 'AuthoritySnapshot', { turn_id: second });
+    const headRootId = await app.context.currentHeadRootId(CONVERSATION);
+    await app.compression.create({ conversationId: CONVERSATION, headRootId, authoritySnapshotId: authority.id,
+      compressSegmentCount: (await app.context.materializeStructure(headRootId)).records.length - 1,
+      title: 'Earlier questions', idempotencyKey: 'work-environment-summary',
+      summary: [{ role: 'user', parts: [{ text: 'Earlier questions were answered.' }] }] });
+    await turn('fourth question');
+  });
+  assert.equal(toolBlocks.length, 4);
+  assert.match(toolBlocks[0], /W\d+ · alpha/);
+  assert.match(toolBlocks[0], /W\d+ · beta/);
+  assert.doesNotMatch(toolBlocks[0], /work-env-remote-/, 'raw environment ids stay out of the model-facing tool text');
+  assert.equal(toolBlocks[1], toolBlocks[0]);
+  assert.equal(toolBlocks[2], toolBlocks[0]);
+  assert.equal(toolBlocks[3], toolBlocks[0]);
 });
 }
 

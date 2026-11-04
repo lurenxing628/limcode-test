@@ -1305,7 +1305,9 @@ export class ReliableAgentLoop {
     // Share one immutable lookup during projection; replay resolves the frozen CAS base separately.
     const preparedModelHandles = prepareModelHandleCatalog(modelHandleCatalog);
     rememberPreparedModelHandleBase(this.database, this.contentStore, preparedModelHandles, runtimeStatus.contextHandles);
-    const inputBindings = selectContextHandleBindings(contextInputSources, preparedModelHandles);
+    // Tool definitions list switchable environments by W#. Binding them like context input keeps
+    // the same reference on the next request, so the tool block stays byte-identical for prompt caching.
+    const inputBindings = selectContextHandleBindings([...contextInputSources, input.tools], preparedModelHandles);
     const establishedInputRefs = new Map(runtimeStatus.contextHandles.entries.map(entry => [entry.ref, entry]));
     const contextHandleInputBindings = { ...inputBindings, entries: inputBindings.entries.filter(entry => {
       const established = establishedInputRefs.get(entry.ref);
