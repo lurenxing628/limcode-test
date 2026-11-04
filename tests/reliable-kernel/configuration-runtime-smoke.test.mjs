@@ -177,6 +177,21 @@ test('Gemini预算零经过生产adapter形成thinkingBudget零', async () => {
   assert.equal(wire.later_setting, undefined);
 });
 
+test('设置的最大输出 Token 经生产 adapter 进入四种渠道的实际 wire 字段', async () => {
+  for (const [name, model, read] of [
+    ['claude', 'claude-opus-4-6', wire => wire.max_tokens],
+    ['openai-compatible', 'deepseek-chat', wire => wire.max_tokens],
+    ['openai-responses', 'gpt-5', wire => wire.max_output_tokens],
+    ['gemini', 'gemini-2.5-pro', wire => wire.generationConfig.maxOutputTokens]
+  ]) assert.equal(read(await ordinaryWire(name, model, { maxOutputTokens: 64000 })), 64000, name);
+  assert.equal((await ordinaryWire('claude', 'claude-opus-4-6', {})).max_tokens, 64000, '未设置时 Claude 按 64000 发送');
+  assert.equal((await ordinaryWire('claude', 'claude-opus-4-6', { thinkingConfig: { thinkingLevel: 'high' } })).max_tokens, 64000);
+  for (const [name, model] of [['openai-compatible', 'deepseek-chat'], ['openai-responses', 'gpt-5']]) {
+    const wire = await ordinaryWire(name, model, {});
+    assert.equal(wire.max_tokens ?? wire.max_output_tokens ?? wire.max_completion_tokens, undefined, `${name}未设置时不发送上限`);
+  }
+});
+
 test('Claude adaptive effort进入实际wire，冲突采样覆盖拒绝且原配置保留', async () => {
   const { applySessionThinkingOverride, validateSessionThinkingOverride } = compiled('shared/sessionThinking.js');
   const { hasThinkingBodyConflict } = compiled('shared/sessionThinkingBody.js');

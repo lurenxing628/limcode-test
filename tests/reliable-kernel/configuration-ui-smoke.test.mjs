@@ -645,8 +645,17 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   const parameterMount = f.mount('Parameters', { config, 'onUpdate-generation-config': value => emitted.push(value) });
   const parameters = parameterMount.view;
   assert.equal(emitted.length, 0);
-  const removedKeys = ['maxOutputTokens', 'temperature', 'topP'];
+  const removedKeys = ['temperature', 'topP'];
   assert.ok(parameters.definitions.every(item => !removedKeys.includes(item.key)));
+  const maxOutput = parameters.definitions.find(item => item.key === 'maxOutputTokens');
+  assert.equal(parameters.definitions[0], maxOutput, '最大输出排在最前');
+  parameters.updateKnownValue(maxOutput, 64000);
+  assert.deepEqual(emitted.pop(), { maxOutputTokens: 64000 });
+  parameters.updateKnownValue(maxOutput, 1.5);
+  assert.equal(emitted.length, 0, '非整数不写入');
+  assert.match(parameters.jsonError, /正整数/);
+  parameters.updateKnownValue(maxOutput, undefined);
+  assert.equal(emitted.pop(), undefined, '清空后不再发送');
   const thinking = parameters.definitions.find(item => item.key === 'thinkingLevel');
   assert.ok(thinking.options.every(item => !['none', 'minimal'].includes(item.value)));
   const advanced = f.mount('Advanced', { config,
@@ -663,14 +672,15 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   parameters.resetJsonDraft();
   assert.deepEqual(JSON.parse(parameters.jsonDraft), { peer: true });
   const saved = { maxOutputTokens: 4096, temperature: 0.2, topP: 0.9 };
-  for (const [provider, model, baseUrl] of [
-    ['openai-responses', 'gpt-6-astra', 'https://api.openai.com/v1'],
-    ['openai-compatible', 'deepseek-chat', 'https://api.deepseek.com/v1'],
-    ['gemini', 'gemini-2.5-pro', 'https://generativelanguage.googleapis.com'],
-    ['claude', 'claude-sonnet-4-5', 'https://api.anthropic.com']
+  for (const [provider, model, baseUrl, wireField] of [
+    ['openai-responses', 'gpt-6-astra', 'https://api.openai.com/v1', 'max_output_tokens'],
+    ['openai-compatible', 'deepseek-chat', 'https://api.deepseek.com/v1', 'max_tokens'],
+    ['gemini', 'gemini-2.5-pro', 'https://generativelanguage.googleapis.com', 'generationConfig.maxOutputTokens'],
+    ['claude', 'claude-sonnet-4-5', 'https://api.anthropic.com', 'max_tokens']
   ]) {
     await parameterMount.setProps({ config: { ...config, provider, model, baseUrl, generationConfig: saved } });
     assert.ok(parameters.definitions.every(item => !removedKeys.includes(item.key)), `${provider}不重新显示已移除的控件`);
+    assert.equal(parameters.definitions.find(item => item.key === 'maxOutputTokens')?.displayPath, wireField, `${provider}显示最大输出`);
   }
   assert.equal(emitted.length, 0, '移除界面入口不能改写已有配置');
   const topK = parameters.definitions.find(item => item.key === 'topK');
@@ -678,6 +688,18 @@ test('专业参数编辑挂载不写默认，数值清空不落为0，思考档�
   assert.deepEqual(emitted.pop(), { ...saved, topK: 40 });
   parameters.updateKnownValue(topK, undefined);
   assert.deepEqual(emitted.pop(), saved);
+  const claudeMax = parameters.definitions.find(item => item.key === 'maxOutputTokens');
+  assert.match(claudeMax.description, /64000/, 'Claude 说明未设置时实际发送的默认上限');
+  assert.equal(claudeMax.placeholder, '未设置（发送 64000）');
+  assert.equal(maxOutput.placeholder, undefined, '其它渠道未设置时不发送');
+  await parameterMount.setProps({ config: { ...config, provider: 'claude', model: 'claude-sonnet-4-5', baseUrl: 'https://api.anthropic.com',
+    generationConfig: { thinkingConfig: { thinkingBudget: 8000 } } } });
+  parameters.updateKnownValue(parameters.definitions.find(item => item.key === 'maxOutputTokens'), 8000);
+  assert.equal(emitted.length, 0, 'Claude 最大输出不能不大于思考预算');
+  assert.match(parameters.jsonError, /思考预算必须小于最大输出/);
+  parameters.updateKnownValue(parameters.definitions.find(item => item.key === 'maxOutputTokens'), 32000);
+  assert.deepEqual(emitted.pop(), { maxOutputTokens: 32000, thinkingConfig: { thinkingBudget: 8000 } });
+  await parameterMount.setProps({ config: { ...config, provider: 'claude', model: 'claude-sonnet-4-5', baseUrl: 'https://api.anthropic.com', generationConfig: saved } });
   const claudeThinking = parameters.definitions.find(item => item.key === 'thinkingLevel');
   assert.deepEqual(claudeThinking.options.map(item => item.value), ['none'], '预算模型仍可显式关闭思考');
   parameters.updateKnownValue(claudeThinking, 'none');

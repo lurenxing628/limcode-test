@@ -21,6 +21,8 @@ export interface LlmParameterDefinition {
   defaultValue: number | boolean | LlmThinkingLevel | LlmReasoningMode;
   providers: readonly LlmProviderKind[];
   options?: readonly { value: string; label: string; description?: string }[];
+  /** 数值框为空时的占位文字；默认“未设置（模型默认）”。 */
+  placeholder?: string;
 }
 
 type BaseLlmParameterDefinition = Omit<LlmParameterDefinition, 'displayPath'>;
@@ -29,8 +31,10 @@ interface ProviderParameterDisplay {
   label?: string;
   path: string;
   description?: string;
+  placeholder?: string;
 }
 
+const ALL_PROVIDERS = ['openai-compatible', 'openai-responses', 'claude', 'gemini'] as const satisfies readonly LlmProviderKind[];
 const GEMINI_CLAUDE = ['gemini', 'claude'] as const satisfies readonly LlmProviderKind[];
 const REASONING_MODE_OPTIONS = [
   { value: 'standard', label: '标准' },
@@ -40,12 +44,18 @@ const REASONING_MODE_OPTIONS = [
 
 const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, ProviderParameterDisplay>> = {
   gemini: {
+    maxOutputTokens: { path: 'generationConfig.maxOutputTokens' },
     topK: { path: 'generationConfig.topK' },
     includeThoughts: { path: 'generationConfig.thinkingConfig.includeThoughts' },
     thinkingBudget: { path: 'generationConfig.thinkingConfig.thinkingBudget' },
     thinkingLevel: { path: 'generationConfig.thinkingConfig.thinkingLevel', label: 'Thinking Level' }
   },
   claude: {
+    maxOutputTokens: {
+      path: 'max_tokens',
+      description: '单次回复的输出上限，思考和正文共用；思考用完上限会以 MAX_TOKENS 结束且没有正文。未设置时发送 64000。',
+      placeholder: '未设置（发送 64000）'
+    },
     topK: { path: 'top_k', label: 'Top K / top_k' },
     thinkingBudget: {
       path: 'thinking.budget_tokens',
@@ -59,6 +69,7 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     }
   },
   'openai-compatible': {
+    maxOutputTokens: { path: 'max_tokens' },
     thinkingLevel: {
       path: 'reasoning_effort / thinking.type / enable_thinking',
       label: '思考强度',
@@ -66,6 +77,7 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
     }
   },
   'openai-responses': {
+    maxOutputTokens: { path: 'max_output_tokens' },
     reasoningMode: {
       path: 'reasoning.mode',
       label: '推理模式',
@@ -80,6 +92,15 @@ const PROVIDER_PARAMETER_DISPLAY: Record<LlmProviderKind, Record<string, Provide
 };
 
 export const LLM_PARAMETER_DEFINITIONS: readonly BaseLlmParameterDefinition[] = [
+  {
+    key: 'maxOutputTokens',
+    path: ['maxOutputTokens'],
+    label: '最大输出 Token',
+    description: '单次回复的输出上限，含思考在内；不是思考预算。未设置时不发送，由服务端决定。',
+    valueType: 'number',
+    defaultValue: 32000,
+    providers: ALL_PROVIDERS
+  },
   {
     key: 'topK',
     path: ['topK'],
@@ -191,6 +212,7 @@ function withProviderDisplay(definition: BaseLlmParameterDefinition, provider: L
     ...definition,
     label: display?.label ?? definition.label,
     description: display?.description ?? definition.description,
+    ...(display?.placeholder ? { placeholder: display.placeholder } : {}),
     displayPath: display?.path ?? definition.path.join('.')
   };
 }

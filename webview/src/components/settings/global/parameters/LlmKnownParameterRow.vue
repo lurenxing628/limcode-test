@@ -64,7 +64,7 @@ function updateEnum(value: string): void {
         :value="numberValue"
         type="number"
         step="any"
-        placeholder="未设置（模型默认）"
+        :placeholder="definition.placeholder ?? '未设置（模型默认）'"
         :aria-label="definition.label"
         @input="updateNumber"
       />

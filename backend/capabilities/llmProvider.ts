@@ -139,6 +139,7 @@ import {
   DEFAULT_LLM_COMPRESSION_SUMMARY_SYSTEM_PROMPT,
   DEFAULT_LLM_COMPRESSION_SUMMARY_USER_PROMPT,
   DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS,
+  defaultMaxOutputTokensForProvider,
   normalizeLlmCompressionMaxDurationMinutes,
   DEFAULT_LLM_COMPRESSION_SUMMARY_TARGET_TOKENS,
   DEFAULT_LLM_CONTEXT_WINDOW_TOKENS,
@@ -5617,6 +5618,23 @@ function adaptAstraGenerationConfig(
  * （Astra 按原规则；Sol / Luna 只把 minimal 提升为 low）。
  */
 function effectiveRequestGenerationConfig(
+  request: LlmStartRequest,
+  settings: LlmProviderConfigRecord
+): LlmGenerationConfigRecord | undefined {
+  return withDefaultMaxOutputTokens(adaptedRequestGenerationConfig(request, settings), settings.provider);
+}
+
+/** 未设置最大输出时补上渠道默认值（目前只有 Claude，库自带的 16000 回退不再使用）。 */
+function withDefaultMaxOutputTokens(
+  generationConfig: LlmGenerationConfigRecord | undefined,
+  provider: LlmProviderKind
+): LlmGenerationConfigRecord | undefined {
+  const fallback = defaultMaxOutputTokensForProvider(provider);
+  if (fallback === undefined || generationConfig?.maxOutputTokens !== undefined) return generationConfig;
+  return { ...(generationConfig ?? {}), maxOutputTokens: fallback };
+}
+
+function adaptedRequestGenerationConfig(
   request: LlmStartRequest,
   settings: LlmProviderConfigRecord
 ): LlmGenerationConfigRecord | undefined {
