@@ -595,7 +595,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       this.collaborationHistoryRequestId = requestId;
       this.collaborationHistoryRequestDirection = direction;
       this.collaborationHistoryRequestCursor = cursor;
-      this.collaborationHistoryRequestPageId = this.collaborationHistoryCurrentPageId;
+      const edgePage = direction === 'before' ? this.collaborationHistoryPages[0] : this.collaborationHistoryPages[this.collaborationHistoryPages.length - 1];
+      this.collaborationHistoryRequestPageId = edgePage?.id ?? null;
       this.collaborationHistoryRequestPeerGeneration = this.peerStateGeneration;
       this.collaborationHistoryRequestIsBootstrap = bootstrap;
       const timeout = setTimeout(() => {
@@ -645,21 +646,44 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       }
       try {
         const records = mergeHistoryRecordPage({}, message.page.records, COLLABORATION_HISTORY_RECORD_TYPES);
-        const members = admitReliableHistoryRecords(this.$state, records);
-        const page: ReliableResidentCollaborationPage = { id: message.requestId, members,
+        const hasRecords = Object.values(records).some(bucket => Object.keys(bucket).length > 0);
+        const page: ReliableResidentCollaborationPage = { id: message.requestId,
+          members: hasRecords ? admitReliableHistoryRecords(this.$state, records) : {},
           before: message.page.nextBeforeCursor, after: message.page.nextAfterCursor,
           hasMoreBefore: message.page.hasMoreBefore, hasMoreAfter: message.page.hasMoreAfter };
-        const replaced = this.collaborationHistoryPages.filter(candidate =>
-          sameCollaborationCursor(candidate.before, page.before) && sameCollaborationCursor(candidate.after, page.after));
-        const pages = this.collaborationHistoryPages.filter(candidate => !replaced.includes(candidate));
-        const sourceIndex = pages.findIndex(candidate => candidate.id === this.collaborationHistoryRequestPageId);
-        const insertAt = sourceIndex < 0 ? direction === 'before' ? 0 : pages.length
-          : sourceIndex + (direction === 'after' ? 1 : 0);
-        pages.splice(insertAt, 0, page);
-        this.collaborationHistoryPages = pages;
-        releaseResidentDetails(this.$state, releaseReliablePageMembers(this.$state, replaced));
-        releaseResidentDetails(this.$state, retainReliableCollaborationPages(this.$state, page.id));
-        setCollaborationHistoryCursorFromPage(this.$state, page);
+        const source = this.collaborationHistoryPages.find(candidate => candidate.id === this.collaborationHistoryRequestPageId);
+        if (source && !hasRecords) {
+          // Empty inventory scans extend the known edge. They neither evict readable cards nor
+          // turn a source transition into unvisited history on the already scanned opposite side.
+          if (direction === 'before') {
+            source.before = page.before;
+            source.hasMoreBefore = page.hasMoreBefore;
+          } else {
+            source.after = page.after;
+            source.hasMoreAfter = page.hasMoreAfter;
+          }
+        } else {
+          const emptySource = source && Object.values(source.members).every(ids => Object.keys(ids).length === 0) ? source : undefined;
+          if (emptySource) {
+            // The first real page also owns the empty interval already crossed to reach it.
+            if (direction === 'before') {
+              page.after = emptySource.after;
+              page.hasMoreAfter = emptySource.hasMoreAfter;
+            } else {
+              page.before = emptySource.before;
+              page.hasMoreBefore = emptySource.hasMoreBefore;
+            }
+          }
+          const replaced = this.collaborationHistoryPages.filter(candidate => candidate === emptySource
+            || sameCollaborationCursor(candidate.before, page.before) && sameCollaborationCursor(candidate.after, page.after));
+          const pages = this.collaborationHistoryPages.filter(candidate => !replaced.includes(candidate));
+          if (direction === 'before') pages.unshift(page);
+          else pages.push(page);
+          this.collaborationHistoryPages = pages;
+          releaseResidentDetails(this.$state, releaseReliablePageMembers(this.$state, replaced));
+          releaseResidentDetails(this.$state, retainReliableCollaborationPages(this.$state, page.id));
+        }
+        setCollaborationHistoryCursorsFromResidentPages(this.$state);
         for (const row of message.page.records.RuntimeDeliveryAnswerPresentation ?? []) {
           const id = String(row.id);
           this.acceptedAnswerPeerGenerations[id] = this.records.RuntimeDeliveryAnswerPresentation?.[id]
@@ -701,7 +725,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       if (this.collaborationHistoryCurrentPageId !== page.id || this.collaborationHistoryPages.length > 3) {
         releaseResidentDetails(this.$state, retainReliableCollaborationPages(this.$state, page.id));
       }
-      setCollaborationHistoryCursorFromPage(this.$state, page);
+      setCollaborationHistoryCursorsFromResidentPages(this.$state);
     },
 
     observeCollaborationHistoryError(message: ReliableKernelCollaborationHistoryErrorMessage): void {
@@ -2408,11 +2432,14 @@ function resetCollaborationHistoryState(
   state.collaborationHistoryScannedRows = 0;
 }
 
-function setCollaborationHistoryCursorFromPage(state: ReliableKernelFeedStoreState, page: ReliableResidentCollaborationPage): void {
-  state.collaborationHistoryNextBeforeCursor = page.before ?? null;
-  state.collaborationHistoryNextAfterCursor = page.after ?? null;
-  state.collaborationHistoryHasMoreBefore = page.hasMoreBefore;
-  state.collaborationHistoryHasMoreAfter = page.hasMoreAfter;
+/** Reading selects cache residency, while requests continue outside the whole resident interval. */
+function setCollaborationHistoryCursorsFromResidentPages(state: ReliableKernelFeedStoreState): void {
+  const first = state.collaborationHistoryPages[0];
+  const last = state.collaborationHistoryPages[state.collaborationHistoryPages.length - 1];
+  state.collaborationHistoryNextBeforeCursor = first?.before ?? null;
+  state.collaborationHistoryNextAfterCursor = last?.after ?? null;
+  state.collaborationHistoryHasMoreBefore = first?.hasMoreBefore ?? false;
+  state.collaborationHistoryHasMoreAfter = last?.hasMoreAfter ?? false;
 }
 
 function sameCollaborationCursor(

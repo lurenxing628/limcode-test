@@ -616,6 +616,32 @@ test('滚动：补入不等高历史后保留阅读行，丢失锚点不会跳�
   positions.delete('first'); restoreScrollAfterHistoryLoad({ scroller, anchor }); assert.equal(scroller.scrollTop, 1415);
 });
 
+test('滚动：协作反馈使用同一锚点恢复并保持完整可见', async () => {
+  const { captureScrollAnchor, restoreScrollAfterHistoryLoad } = await ui.load('components/conversation/scrollAnchor.ts');
+  let panelTop = 380, panelHeight = 80;
+  const scroller = {
+    scrollTop: 0, scrollHeight: 1000, clientHeight: 400,
+    getBoundingClientRect: () => ({ top: 30, bottom: 430, height: 400 }),
+    querySelectorAll: () => [{
+      dataset: { scrollAnchorKey: 'collaboration-history-after' },
+      getBoundingClientRect: () => ({ top: 30 + panelTop - scroller.scrollTop,
+        bottom: 30 + panelTop + panelHeight - scroller.scrollTop, height: panelHeight })
+    }]
+  };
+  const anchor = { anchorId: 'collaboration-history-after', offsetTop: 0, alignment: 'nearest' };
+  assert.equal(captureScrollAnchor({ scroller, visibleRows: [] }), null, '反馈不参与时间线记录选页');
+  assert.equal(restoreScrollAfterHistoryLoad({ scroller, anchor }), true);
+  assert.equal(scroller.scrollTop, 60, '只滚动露出视口外的反馈部分');
+  restoreScrollAfterHistoryLoad({ scroller, anchor });
+  assert.equal(scroller.scrollTop, 60, '已经完整可见时不重复移动');
+  panelHeight = 110;
+  restoreScrollAfterHistoryLoad({ scroller, anchor });
+  assert.equal(scroller.scrollTop, 90, '错误提示扩大面板后仍完整可见');
+  panelTop = 20;
+  restoreScrollAfterHistoryLoad({ scroller, anchor });
+  assert.equal(scroller.scrollTop, 20, '同一规则也能恢复视口上方的反馈');
+});
+
 test('滚动：内容检查和贴底共用frame，卸载回收观察者与排队frame', async t => {
   const sticky = await ui.load('composables/useBottomStickyScroller.ts');
   const old = Object.fromEntries(['Element', 'HTMLElement', 'ResizeObserver', 'MutationObserver'].map(key => [key, globalThis[key]]));

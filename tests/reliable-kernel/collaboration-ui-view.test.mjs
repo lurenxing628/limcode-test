@@ -534,8 +534,7 @@ test('collaboration reading pages stay bounded and restore mixed cards and accep
   assert.ok(feed.details[held]);
   feed.setDetailOwnerKeys('resident-expanded-answer', []);
   assert.equal(feed.details[held], undefined);
-  assert.equal(serve('after', 3).cursor.afterExchangeSeq, '2');
-  assert.equal(serve('after', 5).cursor.afterExchangeSeq, '4');
+  assert.equal(serve('after', 5).cursor.afterExchangeSeq, '4', '相邻的3/4页仍驻留，不重复读取');
   assert.equal(serve('after', 7).cursor.afterExchangeSeq, '6');
   assert.equal(feed.details[held].text, '完整已接收正文 8');
   const nextView = await render(), rows = nextView.setup.timelineRows.map(row => row.id);
@@ -545,7 +544,84 @@ test('collaboration reading pages stay bounded and restore mixed cards and accep
   const page = feed.collaborationHistoryPages.find(candidate => candidate.members.CollaborationMessage?.['resident-card-5']);
   feed.retainCollaborationReadingPage({ messageId: 'resident-card-5' });
   assert.equal(feed.collaborationHistoryCurrentPageId, page.id);
-  assert.equal(feed.collaborationHistoryNextAfterCursor.afterExchangeSeq, '6');
+  assert.equal(feed.collaborationHistoryNextAfterCursor.afterExchangeSeq, '8');
+  assert.equal(feed.collaborationHistoryHasMoreAfter, false, '阅读旧页不改变仍驻留的最新边界');
+});
+
+test('协作清单查空后保留已扫描的两端，不把清单切换显示成反向历史', async () => {
+  const id = 'empty-collaboration-inventory';
+  await database.transaction([conversation(id)]);
+  const state = openUi(id, { holdHistory: true });
+  const feed = state.feed;
+  feed.observe({ type: 'reliable-kernel.snapshot', sessionId: 'empty-inventory-session', hostBootId: 'empty-inventory-host',
+    messageSeq: '1', snapshotCommitSeq: '0', projections: { activeConversationWindow: {
+      conversationId: id, visibleMessageCount: '1', messages: [{ id: 'empty-inventory-message', revision_id: 'empty-inventory-revision',
+        conversation_id: id, role: 'user', message_seq: '1', display_seq: '1', created_at: NOW }]
+    } } });
+  const reader = new kernel.ClientHistoryReader(database);
+  for (let count = 0; count < 8 && (feed.collaborationHistoryLoading || feed.collaborationHistoryHasMoreBefore); count++) {
+    // Other tests populate foreign-only scan windows. Bootstrap remains bounded; the reader
+    // explicitly continues those windows rather than assuming an empty Conversation means an empty dataset.
+    if (!feed.collaborationHistoryLoading) assert.equal(feed.requestEarlierCollaborationHistory(id), true);
+    const request = state.posted.findLast(message => message.type === 'reliable-kernel.collaboration-history-request');
+    const page = await reader.backwardCollaboration({ conversationId: id, cursor: request.cursor, direction: request.direction, limit: request.limit });
+    feed.observe({ ...request, type: 'reliable-kernel.collaboration-history-result', page });
+  }
+  assert.equal(feed.collaborationHistoryLoading, false);
+  assert.equal(feed.collaborationHistoryHasMoreBefore, false);
+  assert.equal(feed.collaborationHistoryHasMoreAfter, false, '已扫描为空的另一端不能因切换清单重新变成可查找');
+  assert.equal(feed.collaborationHistoryPages.length, 1, '连续空扫描扩展边界，不挤占阅读页');
+  assert.equal(feed.requestLaterCollaborationHistory(id), false);
+  const view = await render();
+  assert.doesNotMatch(view.html, /查找更早协作记录|查找较新协作记录|显示更早内容/);
+});
+
+test('保留旧协作页不回退末页边界，连续空扫描不淘汰已经加载的卡片', () => {
+  const state = openUi('collaboration-frontier', { holdHistory: true });
+  const feed = state.feed;
+  feed.sessionId = 'collaboration-frontier-session';
+  feed.projections.activeConversationWindow = { conversationId: state.conversationId };
+  feed.collaborationHistoryConversationId = state.conversationId;
+  feed.collaborationHistoryHasMoreBefore = true;
+  feed.collaborationHistoryNextBeforeCursor = { kind: 'exchange', beforeExchangeSeq: '5' };
+  const serve = (direction, first, count, hasMoreAfter) => {
+    assert.equal(feed.requestCollaborationHistoryPage(state.conversationId, direction), true);
+    const request = state.posted.findLast(message => message.type === 'reliable-kernel.collaboration-history-request');
+    feed.observe({ ...request, type: 'reliable-kernel.collaboration-history-result', page: {
+      records: { CollaborationMessage: Array.from({ length: count }, (_, offset) => ({
+        id: `frontier-card-${first + offset}`, message_seq: String(first + offset), mode: 'message'
+      })) },
+      nextBeforeCursor: { kind: 'exchange', beforeExchangeSeq: String(first) },
+      nextAfterCursor: { kind: 'exchange', afterExchangeSeq: String(first + count - 1) },
+      hasMoreBefore: true, hasMoreAfter, hasMore: direction === 'before' || hasMoreAfter,
+      scannedRows: count, scanProgress: false, responseBytes: 300
+    } });
+    assert.equal(feed.collaborationHistoryError, null);
+    return request;
+  };
+  serve('before', 3, 2, true);
+  assert.equal(serve('after', 5, 1, false).cursor.afterExchangeSeq, '4');
+  const older = feed.collaborationHistoryPages.find(page => page.members.CollaborationMessage?.['frontier-card-3']);
+  feed.retainCollaborationReadingPage({ messageId: 'frontier-card-3' });
+  assert.equal(feed.collaborationHistoryCurrentPageId, older.id);
+  assert.equal(feed.collaborationHistoryNextAfterCursor.afterExchangeSeq, '5');
+  assert.equal(feed.collaborationHistoryHasMoreAfter, false, '缓存保留不能覆盖已读到的末页');
+  assert.equal(feed.requestLaterCollaborationHistory(state.conversationId), false);
+  for (let sequence = 2; sequence >= 1; sequence--) {
+    assert.equal(feed.requestEarlierCollaborationHistory(state.conversationId), true);
+    const request = state.posted.findLast(message => message.type === 'reliable-kernel.collaboration-history-request');
+    feed.observe({ ...request, type: 'reliable-kernel.collaboration-history-result', page: {
+      records: {}, nextBeforeCursor: { kind: 'exchange', beforeExchangeSeq: String(sequence) },
+      nextAfterCursor: { kind: 'exchange', afterExchangeSeq: String(sequence) },
+      hasMoreBefore: sequence > 1, hasMoreAfter: true, hasMore: sequence > 1,
+      scannedRows: 1, scanProgress: sequence > 1, responseBytes: 200
+    } });
+    assert.equal(feed.collaborationHistoryError, null);
+  }
+  assert.equal(feed.collaborationHistoryPages.length, 2);
+  assert.deepEqual(Object.keys(feed.committedRecords.CollaborationMessage).sort(), ['frontier-card-3', 'frontier-card-4', 'frontier-card-5']);
+  assert.equal(feed.collaborationHistoryHasMoreBefore, false);
+  assert.equal(feed.collaborationHistoryHasMoreAfter, false);
 });
 
 test('actual MessageList windows mixed timeline by proven position and retains recent messages', async () => {

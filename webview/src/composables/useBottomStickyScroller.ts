@@ -68,6 +68,9 @@ export function useBottomStickyScroller(
   let contentCheckPending = false;
   let stickyUntil = 0;
   let userDetachedFromBottom = false;
+  // A reading navigation owns its position until the next actual user scroll/jump. Layout changes
+  // at the physical bottom of a short history window are not a request to follow the live tail.
+  let readingNavigationOwnsScroll = false;
   let reattachLockedUntil = 0;
   let lastMetrics: ScrollMetrics | undefined;
   let touchActive = false;
@@ -117,7 +120,7 @@ export function useBottomStickyScroller(
   }
 
   function canAutoReattach(): boolean {
-    return performance.now() >= reattachLockedUntil;
+    return !readingNavigationOwnsScroll && performance.now() >= reattachLockedUntil;
   }
 
   function releaseStickyFromUserIntent(): void {
@@ -130,6 +133,7 @@ export function useBottomStickyScroller(
   }
 
   function scrollToBottomNow(): void {
+    readingNavigationOwnsScroll = false;
     stickyToBottom.value = true;
     userDetachedFromBottom = false;
     reattachLockedUntil = 0;
@@ -217,8 +221,11 @@ export function useBottomStickyScroller(
 
   function handleUserScrollIntent(event: Event): void {
     const detail = userScrollIntentDetail(event);
-    if (!detail) return;
+    if (!detail || detail.direction === 'none') return;
 
+    const wasReadingNavigation = readingNavigationOwnsScroll;
+    readingNavigationOwnsScroll = detail.source === 'scrollAnchor';
+    if (wasReadingNavigation && !readingNavigationOwnsScroll) reattachLockedUntil = 0;
     if (detail.direction === 'toward-start' || detail.direction === 'jump-start') {
       releaseStickyFromUserIntent();
       return;
@@ -232,6 +239,7 @@ export function useBottomStickyScroller(
   }
 
   function primeStickyFromBottomInteraction(event: Event): void {
+    if (readingNavigationOwnsScroll) return;
     const target = event.target;
     if (!(target instanceof Element) || !target.closest('[aria-expanded]')) return;
 

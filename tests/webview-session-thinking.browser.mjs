@@ -6,6 +6,7 @@ import { createRequire } from 'node:module';
 import test from 'node:test';
 import { chromium } from 'playwright';
 import { createBrowserFixtureServer } from './reliable-kernel/browser-fixture-server.mjs';
+import { createHistoryScrollFixture } from './reliable-kernel/collaboration-reading-browser-fixture.mjs';
 
 const require = createRequire(import.meta.url);
 const { createEmptyClientState } = require('../dist/extension/shared/clientStateSchema.js');
@@ -150,62 +151,7 @@ test('built chat can read thinking, recover an expired save session, and send wi
 // Host admission and card data are synthetic. MessageItem, body hydration, content rendering
 // and the reading viewport use production components; bodies arrive after history metadata.
 test('history click keeps the visible message anchored after the production Vue list updates', async () => {
-  const fixture = `
-    import { reactive, ref } from 'vue';
-    import {createReliablePresentationIndex} from '/src/domain/reliablePresentationIndex.ts';
-    const rows = (from, count) => Array.from({length:count}, (_, i) => ({id:'message-'+(from+i), seq:from+i, role:'user', content:{role:'user',parts:[{text:'message-'+(from+i)+' '+('delayed body ').repeat(120+i%3*20)}]}, createdAt:from+i, status:'completed', conversationId:'scroll-conversation'}));
-    const initialRows=rows(101,29);
-    const records=(messages,cards)=>({Message:Object.fromEntries(messages.map(row=>[row.id,{id:row.id,conversation_id:'scroll-conversation',message_seq:String(row.seq)}])),
-      CollaborationMessage:Object.fromEntries(cards.map(seq=>['card-'+seq,{id:'card-'+seq,message_seq:String(seq),mode:'message',text_preview:'card-'+seq}])),
-      CollaborationMessageSourceLink:Object.fromEntries(cards.map(seq=>['source-'+seq,{id:'source-'+seq,message_id:'card-'+seq,conversation_id:'scroll-conversation',source_kind:'tool'}])),
-      CollaborationMessageTargetLink:Object.fromEntries(cards.map(seq=>['target-'+seq,{id:'target-'+seq,message_id:'card-'+seq,conversation_id:'peer'}])),
-      CollaborationSendTimelineLink:Object.fromEntries(cards.map(seq=>['position-'+seq,{id:'position-'+seq,message_id:'card-'+seq,conversation_id:'scroll-conversation',predecessor_message_id:'message-'+seq,predecessor_message_seq:String(seq),exchange_seq:String(seq)}]))});
-    export const projection = ref({messages:initialRows,index:createReliablePresentationIndex(initialRows,[]),contentWindowByMessageId:{},splitSourceMessageIdByMessageId:{},absoluteFloorByMessageId:Object.fromEntries(initialRows.map(row=>[row.id,row.seq])), terminationByMessageId:{}, turnIdByMessageId:{}, interactionByToolCallId:{}, messageRevisionIdByMessageId:{}, modelRequestIdByMessageId:{}, toolCalls:[]});
-    export const conversationId = ref('scroll-conversation');
-    export const feed = reactive({records:{}, committedRecords:records(initialRows,[105]), projections:{activeConversationWindow:{visibleMessageCount:'130'}}, details:{}, messageContentWindows:{}, transientModelRequests:{}, historyConversationId:'scroll-conversation', historyPages:[], historyCurrentPageId:null, historyHasMore:true, historyHasMoreAfter:false, historyLoading:false, historyLoadedPages:1,
-      removedConversationIds:[],peerStateGeneration:0,acceptedAnswerPeerGenerations:{},collaborationHistoryConversationId:'scroll-conversation',collaborationHistoryHasMoreBefore:true,collaborationHistoryHasMoreAfter:false,collaborationHistoryLoading:false,collaborationHistoryLoadedPages:1,
-      requestEarlierHistory(){this.historyLoading=true;return true;},requestCollaborationHistoryPage(){this.collaborationHistoryLoading=true;return true;},retainCollaborationReadingPage(){},retainReadingPage(){},retainMessageContentWindows(){},setPinnedDetailKeys(){},requestDetail(){},moveMessageContentWindow(){} });
-    export const useReliableConversation = () => ({feed, conversationId, projection, ensureDetails(){},completeMessageContent:async id=>projection.value.index.messageById.get(id).content});
-    export const useChat = () => ({conversationAction:ref(null), conversationActionPending:ref(false), conversationActionLabel:ref(null), conversationActionNotice:ref(null), forkPendingTargetIds:ref(new Set()), currentAuthoritySelection:()=>({}), currentTurnInputEchoes:ref([])});
-    export const useGlobalSettingsStore = () => ({llmProviderConfigs:{configs:[]},llm:{}});
-    export const useSessionStore = () => ({ runtimeError: null });
-    export const useModelProfileStore = () => ({effectiveFor:()=>({})});
-    export const useReliableTimelinePresentationStore = () => ({isSuppressed:()=>false});
-    window.fulfillEarlier = () => {const messages=rows(81,50).map(row=>row.seq<101?{...row,content:{role:'user',parts:[]}}:row);projection.value={...projection.value,messages,index:createReliablePresentationIndex(messages,[],{},projection.value.index),absoluteFloorByMessageId:Object.fromEntries(messages.map(row=>[row.id,row.seq]))};feed.committedRecords=records(messages,[105]);feed.historyLoading=false;feed.historyLoadedPages++;};
-    window.hydrateEarlier = () => {const messages=rows(81,50);projection.value={...projection.value,messages,index:createReliablePresentationIndex(messages,[],{},projection.value.index)};};
-    window.fulfillCollaboration = () => {feed.committedRecords=records(projection.value.messages,[95,105]);feed.collaborationHistoryLoading=false;feed.collaborationHistoryHasMoreBefore=false;feed.collaborationHistoryLoadedPages++;};
-  `;
-  const stubs = ['useSessionStore', 'useReliableConversation', 'useChat', 'useGlobalSettingsStore', 'useModelProfileStore', 'useReliableTimelinePresentationStore'];
-  const server = await createBrowserFixtureServer({
-    dependencies: ['vue', 'pinia', '@tabler/icons-vue', 'markdown-it', 'markdown-it-texmath', 'katex'],
-    plugins: [{
-      name: 'history-scroll-browser-fixture', enforce: 'pre',
-      resolveId(id) { if (id.startsWith('virtual:scroll-')) return '\0' + id; },
-      load(id) {
-        if (id === '\0virtual:scroll-fixture') return fixture;
-        if (id === '\0virtual:scroll-body') return `import {h} from 'vue';export default {props:['card'],setup:p=>()=>p.card?h('div',{style:{height:'173px'}},p.card.messageId):null};`;
-      },
-      transform(code, id) {
-        if (!id.endsWith('/ReliableMessageList.vue')) return;
-        for (const hook of stubs) code = code.replace(new RegExp("from '(@webview/[^']+/" + hook + ")'", 'g'), "from 'virtual:scroll-fixture'");
-        code = code.replace(/from '\.\/(?!MessageItem\.vue)[^']+\.vue'/g, "from 'virtual:scroll-body'");
-        return code;
-      },
-      configureServer(vite) {
-        vite.middlewares.use('/history-scroll-fixture', async (_request, response) => {
-          response.setHeader('Content-Type', 'text/html');
-          response.end(await vite.transformIndexHtml('/history-scroll-fixture', `<link rel="icon" href="data:,"><div id="app"></div><script type="module">
-            import {createApp,h,ref} from 'vue'; import {createPinia} from 'pinia';
-            import '/src/theme/tokens.css'; import '/src/theme/base.css';
-            import '/src/theme/motion/message.css'; import '/src/theme/motion/content.css';
-            import List from '/src/components/conversation/ReliableMessageList.vue';
-            import {useBottomStickyScroller} from '/src/composables/useBottomStickyScroller.ts';
-            createApp({setup(){const scroller=ref(null);const sticky=useBottomStickyScroller(scroller);window.fixtureSticky=sticky;return()=>h('div',{id:'scroll-fixture',ref:scroller,tabindex:0,style:'width:640px;height:400px;overflow:auto;overflow-anchor:none'},[h(List,{scroller:scroller.value,followLatest:sticky.stickyToBottom.value})]);}}).use(createPinia()).mount('#app');
-          </script>`));
-        });
-      }
-    }]
-  });
+  const server = await createHistoryScrollFixture();
   let browser;
   const errors = [];
   try {
@@ -303,6 +249,248 @@ test('history click keeps the visible message anchored after the production Vue 
   }
 });
 
+
+async function withCollaborationHistoryBrowser(run) {
+  const server = await createHistoryScrollFixture();
+  let browser;
+  const errors = [];
+  try {
+    await server.listen();
+    browser = await chromium.launch({ headless: true, ...(process.env.LIMCODE_TEST_BROWSER_PATH ? { executablePath: process.env.LIMCODE_TEST_BROWSER_PATH } : {}) });
+    const page = await browser.newPage();
+    page.setDefaultTimeout(10000);
+    page.on('pageerror', error => errors.push(error.message));
+    await page.addInitScript(() => {
+      window.acquireVsCodeApi = () => ({
+        postMessage(message) {
+          if (message.type === 'reliable-kernel.collaboration-history-request') window.fixtureRequests?.push(structuredClone(message));
+        }, getState() {}, setState() {}
+      });
+    });
+    const base = `http://127.0.0.1:${server.httpServer.address().port}/history-scroll-fixture`;
+    const open = async (count = 80, cards = [105], realFeed = false) => {
+      await page.goto(`${base}?search=1&count=${count}&cards=${cards.join(',')}${realFeed ? '&real-feed=1' : ''}`, { waitUntil: 'domcontentloaded' });
+      await page.waitForFunction(last => {
+        const scroller = document.querySelector('#scroll-fixture');
+        return window.fixtureSticky?.stickyToBottom.value && scroller?.querySelector(`[data-timeline-row-key="message-${last}"]`)
+          && Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) < 1;
+      }, 100 + count);
+      if (realFeed) assert.equal(await page.evaluate(() => window.fixtureFeed.collaborationHistoryError), null,
+        '夹具初始页必须通过真实协作分页准入');
+    };
+    await run({ page, open });
+    assert.deepEqual(errors, []);
+  } finally {
+    try { await browser?.close(); }
+    finally { await server.close(); }
+  }
+}
+
+async function assertCollaborationHit(page, target, direction = 'after') {
+  await page.waitForFunction(sequence => {
+    const scroller = document.querySelector('#scroll-fixture');
+    const row = scroller.querySelector(`[data-timeline-row-key="collaboration:card-${sequence}"]`);
+    const card = row?.querySelector('article.collaboration-card');
+    if (!card) return false;
+    const viewport = scroller.getBoundingClientRect(), rect = row.getBoundingClientRect();
+    const cardRect = card.getBoundingClientRect();
+    return Math.abs(rect.top - viewport.top) < 1 && cardRect.height > 0
+      && cardRect.bottom > viewport.top && cardRect.top < viewport.bottom
+      && cardRect.left >= viewport.left && cardRect.right <= viewport.right;
+  }, target);
+  const row = page.locator(`[data-timeline-row-key="collaboration:card-${target}"]`);
+  assert.equal(await row.locator('.collaboration-card-preview').innerText(), `card-${target}`, '命中必须由真实协作卡片呈现');
+  assert.equal(await page.evaluate(() => window.fixtureSticky.stickyToBottom.value), false);
+  assert.match(await page.locator(`[data-history-direction="${direction}"]`).getByRole('status').innerText(),
+    direction === 'before' ? /已找到更早的协作记录/ : /已找到较新的协作记录/);
+  assert.equal(await page.evaluate(() => window.fixtureRetainedCards.at(-1)), `card-${target}`, '保留页必须来自实际命中，不是挂载卡片的中位数');
+}
+
+async function settleHistoryLayout(page) {
+  await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+}
+
+test('collaboration after aligns the hit in overlapping and completely replaced reading segments', async () => {
+  await withCollaborationHistoryBrowser(async ({ page, open }) => {
+    for (const count of [80, 160]) {
+      await open(count);
+      const previousRows = await page.locator('[data-timeline-row-key]').evaluateAll(rows => rows.map(row => row.dataset.timelineRowKey));
+      await page.getByRole('button', { name: '查找较新协作记录', exact: true }).click();
+      assert.deepEqual(await page.evaluate(() => window.fixtureRequests), [{ id: 'scroll-conversation', direction: 'after' }]);
+      await page.evaluate(() => window.fulfillSearch([105, 130]));
+      await assertCollaborationHit(page, 130);
+      const currentRows = await page.locator('[data-timeline-row-key]').evaluateAll(rows => rows.map(row => row.dataset.timelineRowKey));
+      assert.ok(currentRows.length <= 30, '查找不能用无限挂载来绕过分段定位');
+      assert.equal(currentRows.some(id => previousRows.includes(id)), count === 80,
+        count === 80 ? '80 条消息场景必须保留重叠段' : '160 条消息场景必须完全换段');
+    }
+  });
+});
+
+test('collaboration after keeps the hit and success feedback beyond 800ms and repeated late bodies', async () => {
+  await withCollaborationHistoryBrowser(async ({ page, open }) => {
+    await open(80, [164, 165, 166, 167, 168]);
+    const scroller = page.locator('#scroll-fixture');
+    await page.getByRole('button', { name: '查找较新协作记录', exact: true }).click();
+    // Cross the old 800ms reattach boundary, not a machine-dependent performance threshold.
+    await page.waitForTimeout(900);
+    await page.evaluate(() => window.fulfillSearch([164, 165, 166, 167, 168, 170]));
+    await assertCollaborationHit(page, 170);
+    assert.ok(await page.locator('[data-timeline-row-key]').count() <= 30);
+    for (const repetitions of [300, 500]) {
+      await page.waitForTimeout(900);
+      const previousHeight = await scroller.evaluate(element => element.scrollHeight);
+      await page.evaluate(repetitions => window.hydrateBefore(170, repetitions), repetitions);
+      await page.waitForFunction(height => document.querySelector('#scroll-fixture').scrollHeight > height, previousHeight);
+      await settleHistoryLayout(page);
+      await assertCollaborationHit(page, 170);
+    }
+    // Explicit user navigation, rather than content growth, gives following the tail back control.
+    await scroller.focus();
+    await page.keyboard.press('End');
+    await page.waitForFunction(() => {
+      const scroller = document.querySelector('#scroll-fixture');
+      return window.fixtureSticky.stickyToBottom.value && scroller.querySelector('[data-timeline-row-key="message-180"]')
+        && Math.abs(scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop) < 1;
+    });
+  });
+});
+
+test('collaboration after controls block ordinary loading and show stoppable, retryable feedback at the bottom', async () => {
+  await withCollaborationHistoryBrowser(async ({ page, open }) => {
+    await open(29);
+    assert.equal(await page.getByRole('button', { name: '显示更早内容', exact: true }).count(), 0,
+      '只有协作历史可继续时，不显示普通历史翻页入口');
+    await open();
+    const before = page.locator('[data-history-direction="before"]');
+    const controls = page.locator('[data-history-direction="after"]');
+    const newer = controls.getByRole('button', { name: '查找较新协作记录', exact: true });
+    await page.evaluate(() => { window.fixtureFeed.historyLoading = true; });
+    assert.equal(await before.getByRole('button', { name: '查找更早协作记录', exact: true }).isDisabled(), true);
+    assert.equal(await newer.isDisabled(), true);
+    assert.equal(await page.evaluate(() => window.fixtureRequests.length), 0);
+    await page.evaluate(() => { window.fixtureFeed.historyLoading = false; });
+
+    // Record geometry before Playwright's next click can auto-scroll an offscreen control.
+    const feedback = [];
+    const recordFeedback = async (locator, stage) => {
+      await settleHistoryLayout(page);
+      feedback.push(await locator.evaluate((element, stage) => {
+        const viewport = document.querySelector('#scroll-fixture').getBoundingClientRect();
+        const rect = element.getBoundingClientRect();
+        return { stage, text: element.textContent, direction: element.closest('[data-history-direction]')?.dataset.historyDirection,
+          top: rect.top - viewport.top, bottom: rect.bottom - viewport.top, viewportHeight: viewport.height,
+          fullyVisible: rect.height > 0 && rect.top >= viewport.top - 1 && rect.bottom <= viewport.bottom + 1
+            && rect.left >= viewport.left && rect.right <= viewport.right };
+      }, stage));
+    };
+    await newer.click();
+    const stop = controls.getByRole('button', { name: '停止查找', exact: true });
+    await recordFeedback(stop, '停止按钮');
+    await recordFeedback(controls.getByRole('status'), '查找进度');
+    assert.equal(await before.getByRole('status').count(), 0, 'after 进度不能只显示在顶部');
+    await stop.click();
+    assert.match(await controls.getByRole('status').innerText(), /已停止查找.*正在接收已发出的页面/);
+    assert.equal(await controls.getByRole('button', { name: '正在接收协作记录', exact: true }).isDisabled(), true);
+    await recordFeedback(controls.getByRole('status'), '停止后的在途页面提示');
+    const stoppedRows = await page.locator('[data-timeline-row-key]').evaluateAll(rows => rows.map(row => row.dataset.timelineRowKey));
+    await page.evaluate(() => window.fulfillSearch([105, 130], true));
+    await settleHistoryLayout(page);
+    assert.equal(await page.evaluate(() => window.fixtureRequests.length), 1, '停止后不继续扫描');
+    assert.deepEqual(await page.locator('[data-timeline-row-key]').evaluateAll(rows => rows.map(row => row.dataset.timelineRowKey)), stoppedRows,
+      '停止后的回包可以准入，但不能重新定位阅读段');
+    assert.equal(await page.locator('[data-timeline-row-key="message-180"]').count(), 1);
+    assert.equal(await page.locator('[data-timeline-row-key="collaboration:card-130"]').count(), 0);
+    await recordFeedback(controls.getByRole('status'), '停止完成');
+
+    await newer.click();
+    assert.equal(await page.evaluate(() => window.fixtureRequests.length), 2, '停止完成后可再次查找');
+    await page.evaluate(() => { window.fixtureFeed.collaborationHistoryLoading = false; window.fixtureFeed.collaborationHistoryError = '测试读取失败'; });
+    await controls.getByRole('alert').waitFor();
+    await recordFeedback(controls.getByRole('alert'), '读取失败');
+    await recordFeedback(controls.getByRole('status'), '失败后的重试提示');
+    assert.equal(await before.getByRole('alert').count(), 0, 'after 错误不能只显示在顶部');
+    assert.equal(await newer.isEnabled(), true);
+    await newer.click();
+    assert.equal(await page.evaluate(() => window.fixtureRequests.length), 3, '失败后必须真的能发起重试，而不只按钮启用');
+    assert.ok((await page.evaluate(() => window.fixtureRequests)).every(request => request.direction === 'after'));
+    assert.equal(await controls.getByRole('alert').count(), 0);
+    await page.evaluate(() => window.fulfillSearch([105, 130, 140]));
+    await assertCollaborationHit(page, 140);
+    assert.ok(feedback.every(item => item.direction === 'after' && item.fullyVisible),
+      `底部进度、停止与失败反馈必须在当前视口可读：${JSON.stringify(feedback)}`);
+  });
+});
+
+
+test('collaboration before uses the same hit anchor and direction-local feedback', async () => {
+  await withCollaborationHistoryBrowser(async ({ page, open }) => {
+    for (const count of [80, 160]) {
+      await open(count, [170]);
+      await page.getByRole('button', { name: '查找更早协作记录', exact: true }).click();
+      assert.deepEqual(await page.evaluate(() => window.fixtureRequests.map(request => request.direction)), ['before']);
+      const controls = page.locator('[data-history-direction="before"]');
+      await controls.getByRole('button', { name: '停止查找', exact: true }).waitFor();
+      assert.equal(await page.locator('[data-history-direction="after"]').getByRole('status').count(), 0);
+      await page.evaluate(() => window.fulfillSearch([130, 170]));
+      await assertCollaborationHit(page, 130, 'before');
+      assert.ok(await page.locator('[data-timeline-row-key]').count() <= 30);
+      await page.evaluate(() => window.hydrateBefore(130));
+      await settleHistoryLayout(page);
+      await assertCollaborationHit(page, 130, 'before');
+    }
+  });
+});
+
+test('real Feed keeps the terminal frontier while the browser reads an older card and scans empty pages', async () => {
+  await withCollaborationHistoryBrowser(async ({ page, open }) => {
+    await open(80, [105], true);
+    await page.getByRole('button', { name: '查找较新协作记录', exact: true }).click();
+    assert.equal(await page.evaluate(() => window.fixtureRequests[0].cursor.afterExchangeSeq), '105');
+    await page.evaluate(() => window.fulfillFeedHistory([130], { before: 130, after: 130, hasMoreBefore: true, hasMoreAfter: false }));
+    await assertCollaborationHit(page, 130);
+    assert.equal(await page.evaluate(() => window.fixtureFeed.collaborationHistoryHasMoreAfter), false);
+
+    const olderCard = page.locator('[data-timeline-row-key="collaboration:card-105"]');
+    for (let step = 0; step < 4 && !await olderCard.count(); step++) {
+      await page.getByRole('button', { name: '显示更早内容', exact: true }).click();
+      await settleHistoryLayout(page);
+    }
+    await olderCard.evaluate(element => {
+      const scroller = document.querySelector('#scroll-fixture');
+      scroller.dispatchEvent(new WheelEvent('wheel', { deltaY: -1, bubbles: true }));
+      // Keep a one-pixel edge of the preceding Message visible, regardless of fractional layout.
+      scroller.scrollTop += element.getBoundingClientRect().top - scroller.getBoundingClientRect().top - 1;
+    });
+    assert.equal(await page.evaluate(() => {
+      const scroller = document.querySelector('#scroll-fixture'), viewport = scroller.getBoundingClientRect();
+      return [...scroller.querySelectorAll('[data-timeline-row-key]')].find(row => {
+        const bounds = row.getBoundingClientRect();
+        return bounds.bottom > viewport.top && bounds.top < viewport.bottom;
+      })?.dataset.timelineRowKey;
+    }), 'message-105', '普通消息的可见边缘不能遮蔽协作选页');
+    await page.waitForFunction(() => window.fixtureFeed.collaborationHistoryCurrentPageId === window.fixtureInitialPageId);
+    assert.equal(await page.evaluate(() => window.fixtureRetainedCards.at(-1)), 'card-105');
+    assert.equal(await page.evaluate(() => window.fixtureFeed.collaborationHistoryNextAfterCursor.afterExchangeSeq), '130');
+    assert.equal(await page.evaluate(() => window.fixtureFeed.collaborationHistoryHasMoreAfter), false,
+      '真实视口保留旧页不能重新打开已经到达的末页');
+    assert.equal(await page.getByRole('button', { name: '查找较新协作记录', exact: true }).count(), 0);
+
+    await page.getByRole('button', { name: '查找更早协作记录', exact: true }).click();
+    assert.equal(await page.evaluate(() => window.fixtureRequests.at(-1).cursor.beforeExchangeSeq), '105');
+    await page.evaluate(() => window.fulfillFeedHistory([], { before: 104, after: 104, hasMoreBefore: true, hasMoreAfter: true }));
+    await page.waitForFunction(() => window.fixtureRequests.length === 3);
+    assert.equal(await page.evaluate(() => window.fixtureRequests.at(-1).cursor.beforeExchangeSeq), '104');
+    await page.evaluate(() => window.fulfillFeedHistory([], { before: 103, after: 103, hasMoreBefore: false, hasMoreAfter: true }));
+    await page.locator('[data-history-direction="before"]').getByRole('status').filter({ hasText: '没有更早的协作记录' }).waitFor();
+    assert.equal(await page.evaluate(() => window.fixtureFeed.collaborationHistoryPages.length), 2,
+      '连续空扫描不增加阅读页或淘汰已有卡片');
+    assert.deepEqual(await page.evaluate(() => Object.keys(window.fixtureFeed.committedRecords.CollaborationMessage).sort()), ['card-105', 'card-130']);
+    assert.equal(await page.evaluate(() => window.fixtureFeed.collaborationHistoryHasMoreAfter), false,
+      '空页的反向清单标志不能覆盖已经扫描的末端');
+    assert.equal(await page.getByRole('button', { name: '查找较新协作记录', exact: true }).count(), 0);
+  });
+});
 
 // The host supplies a body and an explicit full-read action; MessageItem, RichContentView,
 // text/Markdown rendering, ResizeObserver and the scroll viewport are production components.

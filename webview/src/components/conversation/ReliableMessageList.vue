@@ -33,6 +33,7 @@ import { collaborationCardPlacementLabel, projectCollaborationTimeline } from '@
 import MessageItem from './MessageItem.vue';
 import ConfirmPanel from '@webview/components/ui/ConfirmPanel.vue';
 import ReliableCollaborationCard from './ReliableCollaborationCard.vue';
+import ReliableCollaborationHistoryControls from './ReliableCollaborationHistoryControls.vue';
 import ReliableTurnTerminationRow from './ReliableTurnTerminationRow.vue';
 import { isManualStop } from './terminationNotice';
 import ReliableCompressionCard from './ReliableCompressionCard.vue';
@@ -150,7 +151,11 @@ function stopCollaborationSearch(notice = '已停止查找'): void {
   collaborationSearchNotice.value = notice;
 }
 onBeforeUnmount(() => stopCollaborationSearch(''));
-watch(() => feed.sessionId, () => stopCollaborationSearch(''));
+watch(() => feed.sessionId, () => {
+  stopCollaborationSearch('');
+  collaborationSearchDirection.value = 'before';
+  collaborationSearchStart.value = feed.collaborationHistoryScannedRows;
+});
 watch(() => feed.collaborationHistoryError, error => { if (error) stopCollaborationSearch('查找失败，可从当前位置重试'); });
 watch(() => session.runtimeError, error => { if (error) stopCollaborationSearch('运行连接已停止'); });
 const canRequestEarlierHistory = computed(() =>
@@ -166,7 +171,7 @@ const canRequestLaterCollaboration = computed(() =>
 const readingHistoryLoading = computed(() => feed.historyLoading
   || (pendingCollaborationPageForReading.value && feed.collaborationHistoryLoading));
 const hasEarlierSegment = computed(() => segmentStart.value > readingRun.value.start
-  || canRequestEarlierHistory.value || canRequestEarlierCollaboration.value);
+  || canRequestEarlierHistory.value);
 const hasLaterSegment = computed(() => segmentEnd.value < readingRun.value.end
   || readingRun.value.end < timelineRows.value.length || canRequestLaterHistory.value);
 const earlierSegmentLabel = computed(() => readingHistoryLoading.value && pendingHistoryDirection.value === 'before'
@@ -318,6 +323,8 @@ watch(conversationId, () => {
   pendingHistoryAnchorId.value = null;
   pendingCollaborationPageForReading.value = false;
   pendingCollaborationRowIds.value = null;
+  collaborationSearchDirection.value = 'before';
+  collaborationSearchStart.value = feed.collaborationHistoryScannedRows;
   pendingScrollAnchor.value = null;
   readingScrollAnchor = null;
   readingScrollTop = undefined;
@@ -355,9 +362,11 @@ watch(
     if (pages <= previousPages || !known || !collaborationSearching.value) return;
     const firstNew = timelineRows.value.findIndex((row) => row.kind === 'collaboration' && !known.has(row.id));
     if (firstNew >= 0) {
-      stopCollaborationSearch(collaborationSearchDirection.value === 'before' ? '已找到更早的协作记录' : '已找到较新的协作记录');
       followLatestSegment.value = false;
+      pendingScrollAnchor.value = { anchorId: timelineRows.value[firstNew]!.id, offsetTop: 0 };
       segmentStart.value = clampReadingStart(firstNew);
+      stopCollaborationSearch(collaborationSearchDirection.value === 'before' ? '已找到更早的协作记录' : '已找到较新的协作记录');
+      void restorePendingScrollAnchor();
       return;
     }
     if (!(collaborationSearchDirection.value === 'before' ? feed.collaborationHistoryHasMoreBefore : feed.collaborationHistoryHasMoreAfter)) {
@@ -645,6 +654,7 @@ async function restorePendingScrollAnchor(): Promise<void> {
   pendingScrollAnchor.value = null;
   readingScrollAnchor = restoreScrollAfterHistoryLoad({ scroller, anchor }) ? anchor : null;
   readingScrollTop = scroller?.scrollTop;
+  retainVisibleReadingPage();
 }
 
 function captureReadingScrollAnchor(): void {
@@ -656,6 +666,7 @@ function captureReadingScrollAnchor(): void {
     : captureScrollAnchor({ scroller: readingScroller, visibleRows: visibleRowMembership.value });
   if (pendingScrollAnchor.value) pendingScrollAnchor.value = readingScrollAnchor;
   readingScrollTop = readingScroller?.scrollTop;
+  retainVisibleReadingPage();
 }
 
 function followLatestReading(): void {
@@ -721,12 +732,14 @@ function showCollaborationHistory(direction: 'before' | 'after'): void {
   releaseStickyFromUserScroll(props.scroller);
   followLatestSegment.value = false;
   readingScrollAnchor = null;
+  pendingScrollAnchor.value = { anchorId: `collaboration-history-${direction}`, offsetTop: 0, alignment: 'nearest' };
   collaborationSearchStart.value = feed.collaborationHistoryScannedRows;
   collaborationSearchNotice.value = '';
   collaborationSearchDirection.value = direction;
   pendingCollaborationRowIds.value = new Set(timelineRows.value.map((row) => row.id));
   collaborationSearching.value = true;
   if (!feed.requestCollaborationHistoryPage(conversationId.value, direction)) stopCollaborationSearch('查找未开始，请重试');
+  void restorePendingScrollAnchor();
 }
 function showEarlierCollaboration(): void { showCollaborationHistory('before'); }
 function showLaterCollaboration(): void { showCollaborationHistory('after'); }
@@ -736,18 +749,22 @@ function historySourceMessageId(id: string): string {
 }
 
 function retainVisibleReadingPage(): void {
-  if (feed.historyLoading || feed.collaborationHistoryLoading || pendingHistoryAnchorId.value || collaborationSearching.value) return;
-  const rows = visibleRowMembership.value.filter(row => row.kind === 'message');
-  const row = rows[Math.floor(rows.length / 2)];
-  const cards = visibleRowMembership.value.filter(row => row.kind === 'collaboration');
-  const card = cards[Math.floor(cards.length / 2)];
-  if (!row && !card) return;
-  const anchor = pendingScrollAnchor.value ?? captureScrollAnchor({ scroller: props.scroller, visibleRows: visibleRowMembership.value });
+  if (feed.historyLoading || feed.collaborationHistoryLoading || pendingHistoryAnchorId.value
+    || pendingScrollAnchor.value || collaborationSearching.value) return;
+  // The two inventories retain their own first visible record. A visible fragment of an
+  // ordinary message must not prevent retaining the collaboration card immediately below it.
+  const visible = visibleRowMembership.value;
+  const anchor = captureScrollAnchor({ scroller: props.scroller, visibleRows: visible });
+  if (!anchor) return;
+  const messageAnchor = captureScrollAnchor({ scroller: props.scroller, visibleRows: visible.filter(row => row.kind === 'message') });
+  const collaborationAnchor = captureScrollAnchor({ scroller: props.scroller, visibleRows: visible.filter(row => row.kind === 'collaboration') });
+  const row = visible.find(candidate => candidate.id === messageAnchor?.anchorId);
+  const card = visible.find(candidate => candidate.id === collaborationAnchor?.anchorId);
   const previousPage = feed.historyCurrentPageId;
   const previousCollaborationPage = feed.collaborationHistoryCurrentPageId;
   if (row?.kind === 'message') feed.retainReadingPage(historySourceMessageId(row.message.id));
   if (card?.kind === 'collaboration') feed.retainCollaborationReadingPage(card.card);
-  if ((feed.historyCurrentPageId !== previousPage || feed.collaborationHistoryCurrentPageId !== previousCollaborationPage) && anchor) {
+  if (feed.historyCurrentPageId !== previousPage || feed.collaborationHistoryCurrentPageId !== previousCollaborationPage) {
     pendingScrollAnchor.value = anchor;
     void restorePendingScrollAnchor();
   }
@@ -763,6 +780,8 @@ function requestAdjacentHistory(direction: 'before' | 'after'): void {
   if (row?.kind === 'message') feed.retainReadingPage(historySourceMessageId(row.message.id));
   if (card?.kind === 'collaboration') feed.retainCollaborationReadingPage(card.card);
   pendingHistoryDirection.value = direction;
+  collaborationSearchDirection.value = direction;
+  collaborationSearchNotice.value = '';
   pendingHistoryAnchorId.value = anchor?.id ?? null;
   const requestedMessages = row?.kind === 'message' && (direction === 'before'
     ? feed.requestEarlierHistory(conversationId.value) : feed.requestLaterHistory(conversationId.value));
@@ -953,23 +972,11 @@ function messageRenderKey(message: MessageRecord): string {
 
 <template>
   <div ref="readingRoot" class="reliable-message-list">
-    <button
-      v-if="canRequestEarlierCollaboration"
-      type="button"
-      class="reliable-segment-control"
-      :disabled="!!session.runtimeError || collaborationSearching || feed.collaborationHistoryLoading"
-      @click="showEarlierCollaboration"
-    >
-      {{ (collaborationSearching || feed.collaborationHistoryLoading) && collaborationSearchDirection === 'before' ? '正在查找更早协作记录'
-        : '查找更早协作记录' }}
-    </button>
-    <button v-if="collaborationSearching" type="button" class="reliable-segment-control" @click="stopCollaborationSearch()">停止查找</button>
-    <p v-if="collaborationSearching || collaborationSearchNotice" class="reliable-collaboration-progress" role="status">
-      {{ collaborationSearching ? '正在查找' : collaborationSearchNotice }} · 已检查 {{ collaborationScanned.toLocaleString() }} 条记录
-    </p>
-    <p v-if="feed.collaborationHistoryError" class="reliable-history-error" role="alert">
-      {{ feed.collaborationHistoryError }}
-    </p>
+    <ReliableCollaborationHistoryControls direction="before" :available="canRequestEarlierCollaboration"
+      :active="collaborationSearchDirection === 'before'" :searching="collaborationSearching"
+      :loading="feed.collaborationHistoryLoading" :blocked="!!session.runtimeError || feed.historyLoading"
+      :scanned-rows="collaborationScanned" :notice="collaborationSearchNotice" :error="feed.collaborationHistoryError"
+      @search="showEarlierCollaboration" @stop="stopCollaborationSearch()" />
     <button
       v-if="hasEarlierSegment"
       type="button"
@@ -1072,12 +1079,11 @@ function messageRenderKey(message: MessageRecord): string {
     >
       {{ readingHistoryLoading && pendingHistoryDirection === 'after' ? '正在加载较新内容' : '显示较新内容' }}
     </button>
-    <button v-if="canRequestLaterCollaboration" type="button" class="reliable-segment-control"
-      :disabled="!!session.runtimeError || collaborationSearching || feed.historyLoading || feed.collaborationHistoryLoading"
-      @click="showLaterCollaboration">
-      {{ (collaborationSearching || feed.collaborationHistoryLoading) && collaborationSearchDirection === 'after'
-        ? '正在查找较新协作记录' : '查找较新协作记录' }}
-    </button>
+    <ReliableCollaborationHistoryControls direction="after" :available="canRequestLaterCollaboration"
+      :active="collaborationSearchDirection === 'after'" :searching="collaborationSearching"
+      :loading="feed.collaborationHistoryLoading" :blocked="!!session.runtimeError || feed.historyLoading"
+      :scanned-rows="collaborationScanned" :notice="collaborationSearchNotice" :error="feed.collaborationHistoryError"
+      @search="showLaterCollaboration" @stop="stopCollaborationSearch()" />
     <p
       v-if="retryBoundaryLabel && !visibleRetryBoundaryMessageId"
       class="reliable-retry-boundary"

@@ -3,6 +3,8 @@ import { dispatchUserScrollIntent } from '@webview/composables/scrollIntent';
 export interface ScrollAnchor {
   anchorId: string;
   offsetTop: number;
+  /** Feedback controls stay fully visible; timeline rows keep their exact reading offset. */
+  alignment?: 'nearest';
 }
 
 /** Capture a visible message, not a previous request's pending history id. */
@@ -36,12 +38,18 @@ export function restoreScrollAfterHistoryLoad(options: {
 }): boolean {
   const { scroller, anchor } = options;
   if (!scroller || !anchor) return false;
-  const row = [...scroller.querySelectorAll<HTMLElement>('[data-timeline-row-key]')]
-    .find(candidate => candidate.dataset.timelineRowKey === anchor.anchorId);
+  const row = [...scroller.querySelectorAll<HTMLElement>('[data-timeline-row-key], [data-scroll-anchor-key]')]
+    .find(candidate => (candidate.dataset.timelineRowKey ?? candidate.dataset.scrollAnchorKey) === anchor.anchorId);
   if (!row) return false;
-  const offset = row.getBoundingClientRect().top - scroller.getBoundingClientRect().top;
+  const viewport = scroller.getBoundingClientRect();
+  const bounds = row.getBoundingClientRect();
+  const delta = anchor.alignment === 'nearest'
+    ? bounds.height > viewport.height || bounds.top < viewport.top
+      ? bounds.top - viewport.top
+      : Math.max(0, bounds.bottom - viewport.bottom)
+    : bounds.top - viewport.top - anchor.offsetTop;
   const target = Math.max(0, Math.min(
-    scroller.scrollTop + offset - anchor.offsetTop,
+    scroller.scrollTop + delta,
     scroller.scrollHeight - scroller.clientHeight
   ));
   if (Math.abs(scroller.scrollTop - target) > 1) scroller.scrollTop = target;
