@@ -136,6 +136,9 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
       }
     }
     const legacyContinuation = legacyContinuations[0];
+    const acceptedChildAnswer = options.acceptedChildAnswer
+      ? await seedAcceptedChildAnswer(runtime, looseStore, conversationId, options.acceptedChildAnswer)
+      : undefined;
     await runtime.close();
     runtime = undefined;
 
@@ -185,12 +188,84 @@ export async function createPublishedRuntime(previousEpoch, options = {}) {
     await fs.writeFile(workspacePath, 'keep-workspace');
     return { scope, cleanupRoot, authority, paths: binding.paths, previous, conversationId, title, message,
       contentId: content.id, content, looseMessage, contextRootId, settingsPath, workspacePath, legacyContinuation, legacyContinuations,
+      acceptedChildAnswer,
       ...(attachmentContent ? { attachment: { id: attachmentId, content: attachmentContent, bytes: attachmentBytes } } : {}) };
   } catch (error) {
     await runtime?.close().catch(() => undefined);
     await fs.rm(options.configurationRoot ? scope : cleanupRoot, { recursive: true, force: true });
     throw error;
   }
+}
+
+async function seedAcceptedChildAnswer(runtime, store, conversationId, options) {
+  const at = '2026-08-12T10:40:00.000Z';
+  const sourceToolCallId = `${conversationId}_spawn_tool`;
+  const ids = kernel.childExecutionSpawnIdentity({ sourceToolCallId });
+  const parentTurnId = `${conversationId}_parent_turn`;
+  const submissionId = `${conversationId}_answer_submission`;
+  const inboxItemId = `${conversationId}_answer_inbox`;
+  const deliveryId = `${conversationId}_answer_delivery`;
+  const inputId = `${conversationId}_answer_input`;
+  const operationId = kernel.stablePhaseFId('operation', 'subagent-spawn', sourceToolCallId);
+  const attemptId = kernel.stablePhaseFId('attempt', 'subagent-spawn', sourceToolCallId, 1);
+  const title = '最初的子任务标题';
+  const answer = '已经进入父对话上下文的旧子任务答复';
+  // v0.0.10 shipped this exact payload without sourceToolCallId. Its immutable CAS survives
+  // the published 3→4 upgrade, while Operation retains the source ToolCall relationship.
+  const request = {
+    ...ids, childAgentId: 'published-child-agent',
+    authoritySnapshotId: kernel.stablePhaseFId('authority_snapshot', 'child-first', sourceToolCallId),
+    inputMessageId: kernel.stablePhaseFId('message', 'child-first', sourceToolCallId),
+    inputMessageRevisionId: kernel.stablePhaseFId('message_revision', 'child-first', sourceToolCallId),
+    completionPolicy: 'background', waitDeadlineAt: null, title,
+    leaseOwnerId: 'published-host', leaseExpiresAt: '2026-08-12T10:41:00.000Z', prompt: '旧版子任务指令',
+    ...(options.sourceToolCallId === undefined ? {} : { sourceToolCallId: options.sourceToolCallId })
+  };
+  const spawnContent = await store.ingest(runtime, kernel.canonicalPlainJson(request), 'application/vnd.limcode.subagent-spawn+json');
+  const payload = await store.ingest(runtime, answer, 'text/plain');
+  const projection = kernel.projectRuntimeDeliveryForModel({
+    kind: 'child_answer', phase: 'current_turn', status: 'submitted',
+    ...ids, sourceTurnId: ids.childTurnId, submissionId, deliveryId, inboxItemId,
+    targetTurnId: parentTurnId, deliveredAt: at, title: '旧答复标题', contentType: 'text/plain', content: answer
+  });
+  const envelopeContent = await store.ingest(runtime, projection.content, projection.contentType);
+  const insert = (domain, row) => kernel.DOMAIN_REPOSITORIES.domain(domain).insert(row);
+  await runtime.transaction([
+    insert('Conversation', { id: ids.childConversationId, title: '后来改过的子任务标题', status: 'active', created_at: at, updated_at: at }),
+    ...[[parentTurnId, conversationId], [ids.childTurnId, ids.childConversationId]].flatMap(([id, owner]) => [
+      insert('Turn', { id, conversation_id: owner, status: 'terminated', created_at: at, updated_at: at, terminal_at: at }),
+      insert('TurnTermination', { id: `${id}_termination`, turn_id: id, terminal_status: 'completed', reason: 'published answer fixture', created_at: at })
+    ]),
+    insert('ToolCall', { id: sourceToolCallId, turn_id: parentTurnId, call_seq: 1n, tool_name: 'run_agent', status: 'succeeded',
+      arguments_object_id: spawnContent.id, created_at: at, updated_at: at }),
+    insert('ChildExecution', { id: ids.childExecutionId, child_conversation_id: ids.childConversationId, status: 'idle', created_at: at, updated_at: at }),
+    insert('ChildExecutionParentLink', { id: `${sourceToolCallId}_parent`, child_execution_id: ids.childExecutionId,
+      source_tool_call_id: sourceToolCallId, parent_child_execution_id: null, parent_turn_id: parentTurnId, created_at: at }),
+    insert('ChildExecutionTurnLink', { id: `${sourceToolCallId}_turn`, child_execution_id: ids.childExecutionId, turn_seq: 1n, turn_id: ids.childTurnId, created_at: at }),
+    insert('AnswerBridge', { id: ids.answerBridgeId, child_execution_id: ids.childExecutionId, current_submission_id: submissionId,
+      status: 'submitted', created_at: at, updated_at: at }),
+    insert('AnswerSubmission', { id: submissionId, answer_bridge_id: ids.answerBridgeId, submission_seq: 1n, turn_id: ids.childTurnId, interrupted: 0n, created_at: at }),
+    insert('AnswerPayload', { id: `${submissionId}_payload`, submission_id: submissionId, title: '旧答复标题', content_object_id: payload.id,
+      byte_length: payload.byte_length, created_at: at }),
+    insert('Operation', { id: operationId, owner_kind: 'child_execution', owner_id: ids.childExecutionId, operation_seq: 1n,
+      tool_call_id: sourceToolCallId, status: 'succeeded', created_at: at, updated_at: at }),
+    insert('Attempt', { id: attemptId, operation_id: operationId, attempt_seq: 1n, status: 'succeeded', created_at: at, updated_at: at, completed_at: at }),
+    insert('EffectIntent', { id: `${attemptId}_effect`, attempt_id: attemptId, effect_kind: 'subagent_spawn', dispatch_state: 'receipt_written',
+      request_object_id: spawnContent.id, created_at: at, updated_at: at }),
+    insert('RuntimeInboxItem', { id: inboxItemId, dedupe_key: submissionId, source_kind: 'answer_submission', source_id: submissionId,
+      state: 'available', created_at: at, updated_at: at }),
+    insert('RuntimeDelivery', { id: deliveryId, inbox_item_id: inboxItemId, target_conversation_id: conversationId, target_turn_id: parentTurnId,
+      phase: 'current_turn', attempt_seq: 1n, retry_of_delivery_id: null, state: 'consumed', failure_reason: null, created_at: at, updated_at: at }),
+    insert('RuntimeDeliveryInputLink', { id: `${deliveryId}_link`, delivery_id: deliveryId, pending_turn_input_id: inputId,
+      handled_at: at, created_at: at, updated_at: at }),
+    insert('PendingTurnInput', { id: inputId, turn_id: parentTurnId, position: 1n, input_kind: 'runtime_context',
+      content_object_id: envelopeContent.id, state: 'consumed', created_at: at, updated_at: at }),
+    insert('ContextSegment', { id: `${inputId}_segment`, content_object_id: envelopeContent.id, segment_kind: 'runtime_context', created_at: at }),
+    insert('ContextSegmentSource', { id: `${inputId}_source`, segment_id: `${inputId}_segment`, source_kind: 'runtime_context',
+      source_id: inputId, source_revision: 0n, created_at: at })
+  ]);
+  return { ...ids, sourceToolCallId, operationId, attemptId, submissionId, inboxItemId, deliveryId, inputId,
+    title, answer, spawnContent, envelopeContent, request };
 }
 
 async function seedLegacyChildRuntimeContinuation(runtime, store, conversationId, label) {

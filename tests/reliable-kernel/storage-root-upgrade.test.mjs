@@ -194,7 +194,8 @@ function publishedRows(f, epoch = 5) {
   const db = new Database(f.paths.databasePath, { readonly: true });
   try {
     db.defaultSafeIntegers(true);
-    const schemas = epoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS;
+    const schemas = epoch === 6 ? kernel.EPOCH_6_RUNTIME_DOMAIN_SCHEMAS
+      : epoch === 4 ? kernel.EPOCH_4_RUNTIME_DOMAIN_SCHEMAS : kernel.EPOCH_5_RUNTIME_DOMAIN_SCHEMAS;
     const tables = new Set(schemas.map(row => row.table));
     return {
       ddl: db.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name").all()
@@ -203,6 +204,44 @@ function publishedRows(f, epoch = 5) {
     };
   } finally { db.close(); }
 }
+
+test('epoch4保留的已发布旧spawn请求没有sourceToolCallId，已接收答复无损升级并保留原始子任务标题', async () => {
+  const f = await published('accepted-legacy-spawn', 4, { acceptedChildAnswer: {} });
+  const answer = f.acceptedChildAnswer;
+  assert.equal(Object.hasOwn(answer.request, 'sourceToolCallId'), false);
+  const before = publishedRows(f, 4), casBefore = await bytesTree(f.paths.casRootPath);
+  const result = await new Cutover(f.authority, f.scope).ensureCurrentRoot();
+  assert.equal(result.epochMigratedFrom, 4);
+  assert.deepEqual(publishedRows(f, 4), before);
+  assert.deepEqual(await bytesTree(f.paths.casRootPath), casBefore);
+  await assertPreserved(f, result);
+  const db = new Database(f.paths.databasePath, { readonly: true });
+  try {
+    const presentation = db.prepare('SELECT * FROM runtime_delivery_answer_presentation WHERE delivery_id = ?').get(answer.deliveryId);
+    for (const [field, expected] of Object.entries({
+      conversation_id: f.conversationId, submission_id: answer.submissionId,
+      child_execution_id: answer.childExecutionId, child_conversation_id: answer.childConversationId,
+      answer_bridge_id: answer.answerBridgeId, source_turn_id: answer.childTurnId,
+      peer_title_preview: answer.title, answer_title_preview: '旧答复标题', outcome: 'submitted',
+      body_content_object_id: answer.envelopeContent.id, body_representation: 'historical-runtime-envelope'
+    })) assert.equal(presentation[field], expected, field);
+  } finally { db.close(); }
+});
+
+test('历史spawn请求显式sourceToolCallId冲突仍拒绝，保留原库、指针和正文', async () => {
+  const f = await published('conflicting-spawn-source', 4, {
+    acceptedChildAnswer: { sourceToolCallId: 'different-source-tool-call' }
+  });
+  const before = publishedRows(f, 4), casBefore = await bytesTree(f.paths.casRootPath);
+  const pointer = await fs.readFile(f.paths.rootPointerPath);
+  await assert.rejects(new Cutover(f.authority, f.scope).ensureCurrentRoot(), error =>
+    error.code === 'runtime-epoch-migration-failed'
+    && /Historical spawn request conflicts/.test(error.cause?.message));
+  assert.deepEqual(publishedRows(f, 4), before);
+  assert.deepEqual(await bytesTree(f.paths.casRootPath), casBefore);
+  assert.deepEqual(await fs.readFile(f.paths.rootPointerPath), pointer);
+});
+
 function packedState(f) {
   const database = new Database(path.join(f.paths.casRootPath, PACKED_CAS_FILE), { readonly: true });
   try {

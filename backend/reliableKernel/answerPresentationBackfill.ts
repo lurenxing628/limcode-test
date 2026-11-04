@@ -157,11 +157,16 @@ async function historicalSpawnPeer(database: Database.Database, reader: ReturnTy
   if (body.content_type !== 'application/vnd.limcode.subagent-spawn+json') throw new Error('Historical spawn metadata has an unexpected content type.');
   signal?.throwIfAborted();
   const request = JSON.parse((await reader.readChunk(body, 0, 1024 * 1024)).chunk.toString('utf8')) as Record<string, unknown>;
+  // Published spawn payloads originally kept the source tool only on Operation. Newer
+  // payloads also freeze it in CAS; validate that field when present, without inventing it
+  // for an already committed request. Child and bridge identities remain mandatory.
+  const hasSourceToolCall = Object.prototype.hasOwnProperty.call(request, 'sourceToolCallId');
   if (request.childExecutionId !== childExecutionId || request.answerBridgeId !== answerBridgeId
-    || (fact.tool_call_id !== null && fact.tool_call_id !== request.sourceToolCallId)) {
+    || (hasSourceToolCall && fact.tool_call_id !== null
+      && fact.tool_call_id !== request.sourceToolCallId)) {
     throw new Error('Historical spawn request conflicts with the accepted child answer identity.');
   }
-  requirePhaseFId(request.sourceToolCallId, 'historical spawn.sourceToolCallId');
+  if (hasSourceToolCall) requirePhaseFId(request.sourceToolCallId, 'historical spawn.sourceToolCallId');
   return { conversationId: requirePhaseFId(request.childConversationId, 'historical spawn.childConversationId'),
     title: answerTitlePreview(request.title) };
 }
