@@ -2,10 +2,13 @@ import type { MessageContent, MessageRecord, ToolCallRecord } from '@shared/prot
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import {
   projectReliableCommittedConversation, projectReliableConversationTransient, projectReliableConversation,
+  reliableTerminalRequestTime,
   type ReliableClientRecord, type ReliableClientRecordBuckets,
   type ReliableConversationProjection, type ReliableConversationProjectionInput
 } from './reliableConversationProjection.ts';
-import { createReliablePresentationIndex, withReliablePresentationMessages, withReliablePresentationMessageOverrides } from './reliablePresentationIndex.ts';
+import {
+  createReliablePresentationIndex, reliableCompressionAnchorAt, withReliablePresentationMessages, withReliablePresentationMessageOverrides
+} from './reliablePresentationIndex.ts';
 import { reliableMessageContentItemsKey } from './reliableMessageContentWindow.ts';
 
 const domains = [
@@ -133,16 +136,21 @@ export class ReliableConversationProjector {
     // Retry/continuation Turns can own no Message yet. Borrow only the stable global position;
     // the group still decides request visibility and projects its own output without history bodies.
     const transientSequenceAnchors = new Map<string, number>();
+    const { messageIds, messageById, messagePositionById } = committed.index;
     for (const [turnId, requests] of byTurn) {
       const sourceId = this.records.Turn?.[turnId]?.source_message_id;
-      const sourcePosition = typeof sourceId === 'string' ? committed.index.messagePositionById.get(sourceId) : undefined;
-      const lowerId = committed.index.messageIds[sourcePosition ?? committed.index.messageIds.length - 1];
-      const lower = lowerId ? committed.index.messageById.get(lowerId) : undefined;
-      if (!lower) continue;
-      const upperId = sourcePosition === undefined ? undefined : committed.index.messageIds[sourcePosition + 1];
-      const upper = upperId ? committed.index.messageById.get(upperId) : undefined;
-      const sequence = upper && upper.seq > lower.seq ? lower.seq + (upper.seq - lower.seq) / 2 : lower.seq + 0.5;
-      for (const request of Object.values(requests)) transientSequenceAnchors.set(request.modelRequestId, sequence);
+      const sourcePosition = typeof sourceId === 'string' ? messagePositionById.get(sourceId) : undefined;
+      for (const { modelRequestId } of Object.values(requests)) {
+        const terminalAt = reliableTerminalRequestTime(this.records.ModelRequest?.[modelRequestId]);
+        const position = sourcePosition ?? (terminalAt
+          ? messagePositionById.get(reliableCompressionAnchorAt(committed.index, terminalAt) ?? '')
+          : messageIds.length - 1);
+        if (position === undefined) continue;
+        const lower = messageById.get(messageIds[position] ?? ''), upper = messageById.get(messageIds[position + 1] ?? '');
+        if (!lower) continue;
+        transientSequenceAnchors.set(modelRequestId,
+          upper && upper.seq > lower.seq ? lower.seq + (upper.seq - lower.seq) / 2 : lower.seq + 0.5);
+      }
     }
     const projectedGroups = new Map<string, ReliableConversationProjection>();
     for (const id of new Set([...byTurn.keys(), ...this.layoutOverlayGroups])) {
