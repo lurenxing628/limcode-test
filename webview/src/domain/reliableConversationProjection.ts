@@ -880,6 +880,15 @@ function compareTransientRequests(
   return left.startedAt - right.startedAt || left.modelRequestId.localeCompare(right.modelRequestId);
 }
 
+/**
+ * Only a live request without a Message is the end of the transcript. A terminal one stays where
+ * it happened: later Messages and compression cards keep their real order below it, and once its
+ * Turn has left the resident window it is older than every row and is not drawn. Returns 0 while live.
+ */
+export function reliableTerminalRequestTime(request: ReliableClientRecord | undefined): number {
+  return request?.status === 'terminal' ? timestamp(request.created_at) : 0;
+}
+
 function transientSequenceAnchor(input: {
   messages: ParsedMessage[];
   messagesById: ReadonlyMap<string, ParsedMessage>;
@@ -934,7 +943,12 @@ function transientSequenceAnchor(input: {
     if (sourceMessageId) {
       lower = input.messagesById.get(sourceMessageId);
     }
-    if (!lower) lower = [...input.messages].sort(compareParsedMessages).pop();
+    if (!lower) {
+      const terminalAt = reliableTerminalRequestTime(input.modelRequestById.get(input.transient.modelRequestId));
+      lower = input.messages
+        .filter(({ message }) => !terminalAt || (message.createdAt > 0 && message.createdAt <= terminalAt))
+        .sort(compareParsedMessages).pop();
+    }
   }
   if (!lower) return undefined;
   if (!upper) {
