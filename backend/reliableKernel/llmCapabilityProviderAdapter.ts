@@ -94,7 +94,8 @@ import { claudeTurnScopedCompaction, recipeTurnReminderDelivery, reminderHistory
   type TurnReminderDeliveryMode, type TurnReminderIdentitySplit } from './turnReminderProjection';
 import {
   openAICompatibleModelReadsGeminiSignatures,
-  withoutGeminiFunctionCallSignatures
+  withoutGeminiFunctionCallSignatures,
+  withoutGeminiThoughtSignatures
 } from '../capabilities/geminiProviderAdaptation';
 import {
   RUNTIME_DELIVERY_HEADER_OPENINGS,
@@ -771,20 +772,29 @@ export class LlmCapabilityFullRequestAdapter implements FullRequestProviderAdapt
   }
 }
 
+/** The channel and model a request is actually sent to; the only source facts an isolator needs. */
+type ProviderRequestTarget = Pick<FullProviderRequest, 'providerId' | 'modelId'>;
+
 /**
  * Provider state stored in a model reply that only its source can read is not replayed elsewhere:
  * GPT reasoning signatures across Responses channels, Responses compaction items to another channel
- * or model, and Gemini call signatures to an OpenAI-compatible model that is not Gemini.
+ * or model, Gemini thought signatures to another channel or model, and Gemini call signatures to an
+ * OpenAI-compatible model that is not Gemini.
  */
 function isolateCrossSourceProviderState(
   content: MessageContent,
   source: FullProviderContextItem['modelSource'],
-  request: FullProviderRequest,
+  request: ProviderRequestTarget,
   provider: LlmProviderKind
 ): MessageContent {
   return isolateCrossSourceGeminiCallSignatures(
     isolateCrossSourceResponsesCompaction(
-      isolateCrossChannelGptThoughtSignatures(content, source, request, provider),
+      isolateCrossChannelGptThoughtSignatures(
+        isolateCrossChannelGeminiThoughtSignatures(content, source, request, provider),
+        source,
+        request,
+        provider
+      ),
       source,
       request,
       provider
@@ -793,6 +803,31 @@ function isolateCrossSourceProviderState(
     request,
     provider
   );
+}
+
+/**
+ * Gemini signs a reply (the last part, or the call inside a step) for the channel and model that
+ * produced it; replaying it to another one answers HTTP 400 "Corrupted thought signature"
+ * (https://ai.google.dev/gemini-api/docs/thought-signatures). The portable value keeps the vendor
+ * only — `gemini:` — while one channel's history is replayed to the next, so the signature of a
+ * reply from another channel or model of this conversation is not sent at all. Google validates
+ * signatures only inside the current turn; an unsigned call there gets the documented dummy
+ * (fillGeminiCurrentTurnSignatures), and older turns are not checked. A reply of unknown source
+ * keeps its signature: foreignness is not proven.
+ */
+function isolateCrossChannelGeminiThoughtSignatures(
+  content: MessageContent,
+  source: FullProviderContextItem['modelSource'],
+  request: ProviderRequestTarget,
+  provider: LlmProviderKind
+): MessageContent {
+  if (
+    provider !== 'gemini'
+    || content.role !== 'model'
+    || !source?.providerId.trim()
+    || (source.providerId === request.providerId && source.modelId === request.modelId)
+  ) return content;
+  return withoutGeminiThoughtSignatures(content);
 }
 
 /**
@@ -805,7 +840,7 @@ function isolateCrossSourceProviderState(
 function isolateCrossSourceResponsesCompaction(
   content: MessageContent,
   source: FullProviderContextItem['modelSource'],
-  request: FullProviderRequest,
+  request: ProviderRequestTarget,
   provider: LlmProviderKind
 ): MessageContent {
   if (
@@ -829,7 +864,7 @@ function isolateCrossSourceResponsesCompaction(
 function isolateCrossSourceGeminiCallSignatures(
   content: MessageContent,
   source: FullProviderContextItem['modelSource'],
-  request: FullProviderRequest,
+  request: ProviderRequestTarget,
   provider: LlmProviderKind
 ): MessageContent {
   if (
@@ -844,7 +879,7 @@ function isolateCrossSourceGeminiCallSignatures(
 function isolateCrossChannelGptThoughtSignatures(
   content: MessageContent,
   source: FullProviderContextItem['modelSource'],
-  request: FullProviderRequest,
+  request: ProviderRequestTarget,
   provider: LlmProviderKind
 ): MessageContent {
   if (
@@ -1029,7 +1064,9 @@ function* toLlmStartRequestWork(request: FullProviderRequest, checkCompressionBi
       const historical = reminderHistory.get(item.segmentId);
       if (historical) historyInsertions.push(historyInsertion(historical, contents.length));
       observeOutput(item, pairContents);
-      contents.push(...pairContents);
+      // 调用那一半带着签发它的渠道的签名，与回复正文同样按来源隔离。
+      contents.push(...pairContents.map((pair) =>
+        isolateCrossSourceProviderState(pair, item.modelSource, request, provider)));
       appendAttachmentState(item.segmentId, toolResults);
       continue;
     }
