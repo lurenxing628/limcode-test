@@ -51,6 +51,10 @@ const { ReliableConversationRunner } = load('backend/application/reliableKernel/
 
 const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
 
+const { CollaborationToolDispatcher } = load('backend/reliableKernel/collaborationToolDispatcher.js');
+
+const { ReliableChildAgentCoordinator } = load('backend/reliableKernel/childAgentCoordinator.js');
+
 const { createVscodeStoragePaths } = load('backend/capabilities/vscodeStorage/paths.js');
 
 const { createDefaultLlmProviderConfig } = load('backend/capabilities/vscodeStorage/llmProviderConfigs.js');
@@ -102,7 +106,7 @@ async function fixture({ providerKind, modelId, baseUrl = 'https://example.inval
     provider: providerKind, baseUrl, model: modelId,
     models: [{ id: modelId, name: 'synthetic' }], modelConfigs: [], generationConfig: {}, contextWindowTokens: 200000 };
   const errors = [], requests = [];
-  let app, runner;
+  let app, runner, collaborationTools, childAgents;
   try {
     await save('llmProviderConfigs', { configs: [provider] });
     await save('llm', { activeProviderConfigId: provider.id });
@@ -140,7 +144,31 @@ async function fixture({ providerKind, modelId, baseUrl = 'https://example.inval
         }
       } }; } },
       createToolDispatcher: dependencies => new ReliableToolDispatcher({ ...dependencies, effects: dependencies.runtime.effects,
-        host: { definitions: () => tools, ...host } })
+        host: {
+          definitions: () => tools,
+          async dispatchSpecial(definition, input, frozenAuthority, signal, admission) {
+            const collaborationResult = await collaborationTools?.dispatch(input, signal, frozenAuthority);
+            if (collaborationResult) return collaborationResult;
+            const childResult = await childAgents?.dispatch(input, signal, frozenAuthority, admission);
+            if (childResult) return childResult;
+            return host.dispatchSpecial?.(definition, input, frozenAuthority, signal, admission);
+          },
+          cancelTurnWaits: input => childAgents?.cancelParentWaits(input),
+          quiesce: reason => childAgents?.quiesce(reason),
+          ...host
+        } })
+    });
+    collaborationTools = new CollaborationToolDispatcher({
+      database: app.database, contentStore: app.contentStore, effects: app.runtime.effects,
+      collaboration: app.runtime.collaboration, board: app.runtime.collaborationBoard
+    });
+    childAgents = new ReliableChildAgentCoordinator({
+      database: app.database, effects: app.runtime.effects, children: app.runtime.children,
+      answers: app.runtime.answers, deliveries: app.runtime.deliveries, modelProvider: app.modelProvider,
+      turns: app.turns, agentLoop: app.agentLoop,
+      agents: { resolve: input => configuration.resolveAgent(input) },
+      modelProfiles: { async initializeConversation() { return { created: true }; } },
+      skills: { async loadSkillsWithinPolicy() { return []; } }
     });
     const now = new Date().toISOString();
     await app.database.transaction([
@@ -165,6 +193,7 @@ async function fixture({ providerKind, modelId, baseUrl = 'https://example.inval
     await run({ app, requests, turn });
     assert.deepEqual(errors, []);
   } finally {
+    await childAgents?.dispose().catch(() => {});
     runner?.dispose();
     if (app) await app.close();
     await fs.rm(root, { recursive: true, force: true });
@@ -241,6 +270,72 @@ test('with several switchable work environments, consecutive requests send byte-
   assert.equal(toolBlocks[1], toolBlocks[0]);
   assert.equal(toolBlocks[2], toolBlocks[0]);
   assert.equal(toolBlocks[3], toolBlocks[0]);
+});
+
+test('binding a child conversation C# handle on a later turn does not retroactively mutate earlier run_agent tool results on the wire', { timeout: 120000 }, async () => {
+  // Background `run_agent` spawn settles with `childControlHandle` (`childConversationId`, `answerBridgeId`, ...).
+  // `run_agent` maps `answerBridgeId -> childRef` (`A#`), while `C#` conversation handles are only allocated when
+  // a collaboration tool such as `list_agents` runs. If `childConversationId` leaked into the model-facing result,
+  // allocating `C#` on a later turn would retroactively rewrite that historical tool output via `projectKnownText`,
+  // breaking the provider prompt-cache prefix mid-history.
+  const { runAgentTool } = load('backend/world/modules/tools/definitions/runAgent/index.js');
+  const { agentCollaborationToolModules } = load('backend/world/modules/tools/definitions/agentCollaboration/index.js');
+  const listAgentsTool = agentCollaborationToolModules.map(module => module.create({})).find(tool => tool.declaration.name === 'list_agents');
+  assert.ok(listAgentsTool);
+  const parentWires = [];
+  await fixture({
+    providerKind: 'gemini',
+    modelId: 'gemini-2.5-pro',
+    baseUrl: 'https://example.invalid/v1beta',
+    tools: [runAgentTool, listAgentsTool],
+    async configure(configuration) {
+      await configuration.mutations.setToolPolicy({ scopeKind: 'global', allowedTools: ['run_agent', 'list_agents'] });
+    },
+    async send(_round, { request, wire }) {
+      if (request.conversationId !== CONVERSATION) return answer('Child finished.');
+      parentWires.push(structuredClone(wire));
+      if (parentWires.length === 1) {
+        return {
+          role: 'model',
+          parts: [{
+            id: 'spawn-1',
+            functionCall: {
+              name: 'run_agent',
+              args: { operation: 'spawn', taskName: 'inspect cache prefix', prompt: 'Inspect prefix stability.', foregroundWaitMs: 0 }
+            }
+          }]
+        };
+      }
+      if (parentWires.length === 2) return answer('Spawned child in background.');
+      if (parentWires.length === 3) {
+        return { role: 'model', parts: [{ id: 'team-1', functionCall: { name: 'list_agents', args: {} } }] };
+      }
+      return answer('Listed team members.');
+    }
+  }, async ({ turn }) => {
+    await turn('spawn a background child');
+    await turn('now list team members');
+  });
+  assert.equal(parentWires.length, 4);
+  const afterSpawnContents = parentWires[1].contents;
+  const afterListContents = parentWires[3].contents;
+  const spawnResultText = JSON.stringify(afterSpawnContents);
+  assert.match(spawnResultText, /"childRef":"A\d+"/);
+  assert.doesNotMatch(spawnResultText, /childConversationId|childExecutionId|childTurnId|conversation_/,
+    'raw durable child/conversation ids must not leak into model-facing run_agent results');
+  assert.match(JSON.stringify(afterListContents), /"conversationRef":"C\d+"/);
+  // Request 2 (`afterSpawnContents`) ends with a transient runtime-status reminder that is not
+  // persisted to Context; indices `0 .. afterSpawnContents.length - 2` are the committed prefix
+  // shared with all later requests (`[0]` user prompt, `[1]` run_agent call, `[2]` run_agent result).
+  const committedPrefixCount = afterSpawnContents.length - 1;
+  assert.equal(committedPrefixCount, 3);
+  for (let index = 0; index < committedPrefixCount; index += 1) {
+    assert.deepEqual(
+      afterListContents[index],
+      afterSpawnContents[index],
+      `historical wire content[${index}] must stay byte-identical after C# is allocated`
+    );
+  }
 });
 }
 
