@@ -52,10 +52,32 @@ export function hasOpaqueProviderCompaction(contents: readonly MessageContent[])
     || (Array.isArray(content.parts) && content.parts.some((part) => 'providerContext' in part && opaque(part.providerContext))));
 }
 
+const TEXT_TOKEN_CACHE_LIMIT = 2_048;
+const TEXT_TOKEN_CACHE_MIN_CHARS = 128;
+const TEXT_TOKEN_CACHE_MAX_CHARS = 262_144;
+const textTokenEstimateCache = new Map<string, number>();
+
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
+  const cacheable = text.length >= TEXT_TOKEN_CACHE_MIN_CHARS && text.length <= TEXT_TOKEN_CACHE_MAX_CHARS;
+  if (cacheable) {
+    const cached = textTokenEstimateCache.get(text);
+    if (cached !== undefined) {
+      textTokenEstimateCache.delete(text);
+      textTokenEstimateCache.set(text, cached);
+      return cached;
+    }
+  }
   const estimated = estimateTokenCount(text);
-  return Number.isFinite(estimated) && estimated > 0 ? Math.ceil(estimated) : 0;
+  const result = Number.isFinite(estimated) && estimated > 0 ? Math.ceil(estimated) : 0;
+  if (cacheable) {
+    textTokenEstimateCache.set(text, result);
+    if (textTokenEstimateCache.size > TEXT_TOKEN_CACHE_LIMIT) {
+      const oldestKey = textTokenEstimateCache.keys().next().value;
+      if (oldestKey !== undefined) textTokenEstimateCache.delete(oldestKey);
+    }
+  }
+  return result;
 }
 
 export function estimateJsonTokens(value: unknown): number {

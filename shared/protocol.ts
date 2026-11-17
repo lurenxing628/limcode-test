@@ -669,7 +669,6 @@ export const DEFAULT_SEGMENTED_SUMMARY_SYSTEM_PROMPT = [
   '- 文件路径、函数名、标识符、数字等关键细节要按原文保留，不要编造。',
   '- 用户明确要求核对、记住或稍后复用的事实，以及工具结果中的对应键值，必须逐项写入摘要。',
   '- 不得用“读取了N个文件”“工具执行成功”等数量或状态概述替代这些具体事实。',
-  '- 输出连贯的纯文本段落，不要使用 Markdown 标题(#)，以免与拼接时的分段标题冲突。',
   '- 必须把最终摘要用 <summary></summary> 标签包裹，标签外不要写其它内容。'
 ].join('\n');
 export const DEFAULT_SEGMENTED_SUMMARY_USER_PROMPT = '请总结下面的有序历史片段。';

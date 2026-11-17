@@ -73,7 +73,6 @@ import {
   projectStoredModelFacingWindow,
   providerTokenCalibration,
   preflightCompressionRequest,
-  selectContinuousAtomicTail,
   UNCALIBRATED_PROVIDER_TOKENS,
   type AtomicContextGroup,
   type CalibratedCompressionRooms,
@@ -775,7 +774,8 @@ export class ReliableContextCompressionCoordinator {
       retained: [],
       budgetTokens: plannedSkillBudgetTokens
     })?.estimatedTokens ?? 0;
-    const textTailPlan = command.sourceReplay || policy.methodKind === 'provider_native' || command.compressSegmentCount !== undefined
+    const groupTokenMemo = new Map<number, number>();
+    let textTailPlan = command.sourceReplay || policy.methodKind === 'provider_native' || command.compressSegmentCount !== undefined
       ? undefined
       : selectCompressionPrefixByTokens(
             materialized.records,
@@ -786,8 +786,32 @@ export class ReliableContextCompressionCoordinator {
             ),
             fullAttachmentCatalogState,
             fullModelHandleCatalog,
-            historyTokensBySegment
+            historyTokensBySegment,
+            storedWindow,
+            groupTokenMemo
           );
+    if (textTailPlan && skillReserveTokens > 0 && textTailPlan.sourceSegmentCount > 0) {
+      const refinedSkillReserveTokens = planSkillReattachment({
+        compressed: storedWindow.slice(0, textTailPlan.sourceSegmentCount),
+        retained: storedWindow.slice(textTailPlan.sourceSegmentCount),
+        budgetTokens: plannedSkillBudgetTokens
+      })?.estimatedTokens ?? 0;
+      if (refinedSkillReserveTokens < skillReserveTokens) {
+        textTailPlan = selectCompressionPrefixByTokens(
+          materialized.records,
+          semanticMaterialized.segments,
+          calibratedTailBudgetTokens(
+            rooms,
+            (effectiveSummaryMaxTokens ?? 0) + calibrateEstimatorToProvider(refinedSkillReserveTokens, calibration)
+          ),
+          fullAttachmentCatalogState,
+          fullModelHandleCatalog,
+          historyTokensBySegment,
+          storedWindow,
+          groupTokenMemo
+        );
+      }
+    }
     const hardContextRoomTokens = rooms.hardContextRoomTokens;
     if (textTailPlan?.newestGroupTokens !== undefined && textTailPlan.newestGroupTokens > hardContextRoomTokens) {
       return compressionError(
@@ -1785,7 +1809,9 @@ function selectCompressionPrefixByTokens(
   tailBudgetTokens: number,
   attachmentCatalogState: AttachmentCatalogState,
   modelHandleCatalog: ModelHandleCatalog,
-  historyTokensBySegment?: ReadonlyMap<string, number>
+  historyTokensBySegment?: ReadonlyMap<string, number>,
+  predecodedWindow?: readonly FullProviderContextItem[],
+  groupTokenMemo?: Map<number, number>
 ): {
   sourceSegmentCount: number;
   newestGroupTokens?: number;
@@ -1794,48 +1820,78 @@ function selectCompressionPrefixByTokens(
   if (records.length !== segments.length) {
     throw new Error('Structural and semantic Context materializations disagree on segment count.');
   }
-  const groups: AtomicContextGroup<number>[] = [];
+  const groupRanges: Array<{
+    kind: AtomicContextGroup<number>['kind'];
+    items: number[];
+    startIndex: number;
+    endIndexExclusive: number;
+  }> = [];
   for (let index = 0; index < records.length;) {
     const start = index;
     const items = [index];
     index += 1;
+    let hasToolPair = records[start].segment.segment_kind === 'tool_pair';
     if (records[start].segment.segment_kind === 'message') {
       while (index < records.length && records[index].segment.segment_kind === 'tool_pair') {
+        hasToolPair = true;
         items.push(index);
         index += 1;
       }
     }
-    const functionResponseCount = items.filter((position) =>
-      records[position].segment.segment_kind === 'tool_pair'
-    ).length;
-    const segmentIds = items.map((position) => segments[position].segmentId);
-    const groupAttachmentState = selectAttachmentCatalogStateSegments(
-      attachmentCatalogState,
-      segmentIds
-    );
-    groups.push({
-      kind: functionResponseCount > 0 ? 'tool_exchange' : 'message',
+    groupRanges.push({
+      kind: hasToolPair ? 'tool_exchange' : 'message',
       items,
       startIndex: start,
-      endIndexExclusive: index,
-      estimatedTokens: projectStoredModelFacingWindow(items.map((position) => ({
-        segmentId: segments[position].segmentId,
-        segmentKind: segments[position].segmentKind,
-        messageRole: segments[position].messageRole,
-        contentType: logicalMessageContentType(segments[position].contentObject.content_type),
-        content: segments[position].content.toString('utf8')
-      })), groupAttachmentState, modelHandleCatalog).tokenCount
-        + segmentIds.reduce((total, id) => total + (historyTokensBySegment?.get(id) ?? 0), 0),
-      functionCallCount: functionResponseCount > 0 ? 1 : 0,
-      functionResponseCount,
-      complete: true
+      endIndexExclusive: index
     });
   }
-  const selected = selectContinuousAtomicTail(groups, tailBudgetTokens);
-  const newest = selected.tailGroups[selected.tailGroups.length - 1];
+  if (groupRanges.length === 0) return { sourceSegmentCount: 0 };
+
+  const normalizedTailBudget = Math.max(0, Math.floor(tailBudgetTokens));
+  const hasAttachments = attachmentCatalogState.placements.length > 0 || attachmentCatalogState.catalog.length > 0;
+  const emptyAttachmentState: AttachmentCatalogState = { catalog: [], placements: [] };
+  const memo = groupTokenMemo ?? new Map<number, number>();
+  const measureGroup = (groupIndex: number): number => {
+    const cached = memo.get(groupIndex);
+    if (cached !== undefined) return cached;
+    const range = groupRanges[groupIndex]!;
+    const segmentIds = range.items.map((position) => segments[position].segmentId);
+    const groupAttachmentState = hasAttachments
+      ? selectAttachmentCatalogStateSegments(attachmentCatalogState, segmentIds)
+      : emptyAttachmentState;
+    const storedItems = range.items.map((position) => predecodedWindow?.[position] ?? {
+      segmentId: segments[position].segmentId,
+      segmentKind: segments[position].segmentKind,
+      messageRole: segments[position].messageRole,
+      contentType: logicalMessageContentType(segments[position].contentObject.content_type),
+      content: segments[position].content.toString('utf8')
+    });
+    const tokens = projectStoredModelFacingWindow(storedItems, groupAttachmentState, modelHandleCatalog).tokenCount
+      + segmentIds.reduce((total, id) => total + (historyTokensBySegment?.get(id) ?? 0), 0);
+    memo.set(groupIndex, tokens);
+    return tokens;
+  };
+
+  // Walk newest-to-oldest and stop as soon as the continuous tail budget is full so older prefix
+  // groups do not pay full projection + tokenx costs during tail planning.
+  const newestIndex = groupRanges.length - 1;
+  const newestGroupTokens = measureGroup(newestIndex);
+  const newestGroupKind = groupRanges[newestIndex]!.kind;
+  let firstTailIndex = groupRanges.length;
+  let tailTokens = 0;
+  for (let groupIndex = newestIndex; groupIndex >= 0; groupIndex -= 1) {
+    const groupTokens = measureGroup(groupIndex);
+    if (tailTokens + groupTokens > normalizedTailBudget) break;
+    firstTailIndex = groupIndex;
+    tailTokens += groupTokens;
+  }
+  if (firstTailIndex === groupRanges.length) {
+    firstTailIndex = newestIndex;
+  }
   return {
-    sourceSegmentCount: selected.prefixItems.length,
-    ...(newest ? { newestGroupTokens: newest.estimatedTokens, newestGroupKind: newest.kind } : {})
+    sourceSegmentCount: firstTailIndex === 0 ? 0 : groupRanges[firstTailIndex]!.startIndex,
+    newestGroupTokens,
+    newestGroupKind
   };
 }
 
