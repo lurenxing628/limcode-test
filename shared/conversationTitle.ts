@@ -24,6 +24,13 @@ export interface DisplayConversationTitleInput {
   maxLength?: number;
 }
 
+export function hasExplicitConversationTitle(title: string | undefined, conversationId?: string): boolean {
+  const explicitTitle = normalizeConversationTitleText(title ?? '');
+  if (!explicitTitle) return false;
+  return !isPlaceholderConversationTitle(explicitTitle)
+    && !isGeneratedConversationId(explicitTitle, conversationId);
+}
+
 export function displayConversationTitle(input: DisplayConversationTitleInput): string {
   const maxLength = input.maxLength ?? DEFAULT_CONVERSATION_TITLE_MAX_LENGTH;
   const explicitTitle = normalizeConversationTitleText(input.title ?? '');

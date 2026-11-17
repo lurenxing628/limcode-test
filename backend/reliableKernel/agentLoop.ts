@@ -3618,7 +3618,10 @@ export class ReliableAgentLoop {
    * from another source Turn to its terminal commit, which passes them on to the next Turn.
    */
   private async absorbRuntimeDeliveryInputs(turnId: string, routed: 'take' | 'leave' = 'take'): Promise<number> {
+    const turn = await this.requireExisting('Turn', turnId);
+    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
     const deliveries = await orderRuntimeDeliveriesForInjection(this.database, await listAllDomainRows(this.database, 'RuntimeDelivery', {
+      target_conversation_id: conversationId,
       target_turn_id: turnId,
       phase: 'current_turn',
       state: 'pending'
@@ -3636,9 +3639,8 @@ export class ReliableAgentLoop {
     }))
       .sort((left, right) => compareInteger(left.position, right.position));
     if (pending.length === 0) return 0;
-    const turn = await this.requireExisting('Turn', turnId);
-    if (turn.status !== 'active') return 0;
-    const conversationId = requireId(turn.conversation_id, 'Turn.conversation_id');
+    const currentTurn = await this.requireExisting('Turn', turnId);
+    if (currentTurn.status !== 'active') return 0;
     let absorbed = 0;
     for (const input of pending) {
       const inputId = requireId(input.id, 'PendingTurnInput.id');

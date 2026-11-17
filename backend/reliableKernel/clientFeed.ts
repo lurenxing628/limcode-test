@@ -233,7 +233,7 @@ export class BoundedClientFeed {
       );
       session.unsubscribe = subscription.unsubscribe;
       const snapshot = this.createSnapshotMessage(session, subscription.barrier.snapshotCommitSeq, subscription.barrier.snapshot);
-      const bytes = this.sendNow(session, snapshot, subscription.barrier.snapshotCommitSeq);
+      const bytes = this.sendNow(session, snapshot.message, subscription.barrier.snapshotCommitSeq, snapshot.bytes);
       this.recordSnapshotMetric('initial', bytes, readStartedAt);
       session.initializing = false;
       const buffered = session.handoffCommits;
@@ -408,7 +408,7 @@ export class BoundedClientFeed {
       session.snapshotRequired = session.snapshotRequestGeneration !== refreshRequestGeneration;
       if (session.snapshotRequired) session.snapshotReason = session.nextSnapshotReason ?? reason;
       const snapshot = this.createSnapshotMessage(session, barrier.snapshotCommitSeq, barrier.snapshot);
-      const bytes = this.sendNow(session, snapshot, barrier.snapshotCommitSeq);
+      const bytes = this.sendNow(session, snapshot.message, barrier.snapshotCommitSeq, snapshot.bytes);
       this.recordSnapshotMetric(reason, bytes, readStartedAt);
       for (const commit of buffered) this.enqueueCommit(session, commit);
     } finally {
@@ -447,11 +447,12 @@ export class BoundedClientFeed {
   private sendNow(
     session: ClientFeedSession,
     message: ReliableKernelDataMessage,
-    commitSeq: string
+    commitSeq: string,
+    precomputedBytes?: number
   ): number {
     const queued: QueuedDataMessage = {
       message,
-      bytes: wireBytes(message),
+      bytes: precomputedBytes ?? wireBytes(message),
       commitSeq
     };
     this.sendQueuedNow(session, queued);
@@ -472,7 +473,7 @@ export class BoundedClientFeed {
     session: ClientFeedSession,
     snapshotCommitSeq: string,
     projectionInput: ClientProjectionSnapshot
-  ): ReliableKernelSnapshotMessage {
+  ): { message: ReliableKernelSnapshotMessage; bytes: number } {
     const messageSeq = this.allocateMessageSeq(session);
     const projections = boundProjectionRecords(toWirePlain(projectionInput) as Record<string, PlainData>);
     const { dataSetId, rootInstanceId, rootGeneration } = this.database.binding;
@@ -485,11 +486,11 @@ export class BoundedClientFeed {
       snapshotCommitSeq: requireDecimal(snapshotCommitSeq, 'snapshotCommitSeq'),
       projections
     };
-    enforceSnapshotBounds(message);
+    const bytes = enforceSnapshotBounds(message);
     // Seed visibility from exactly what survived all byte/row bounds. Seeding before final
     // truncation leaves ghost identities that can admit unrelated incremental records.
     this.resetVisibleIdentities(session, message.projections);
-    return message;
+    return { message, bytes };
   }
 
   private createChangesMessage(
@@ -643,16 +644,7 @@ export class BoundedClientFeed {
         rememberScopedProjectionIdentity(session, change.domain, change.id, record);
         if (!wasKnown) {
           if (change.domain === 'Message') messageWindowAdvanced = true;
-          const count = incrementRecordCount(session.activeRecordCounts, change.domain);
-          if (
-            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE * (['RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation'].includes(change.domain) ? 2 : 1)
-            && LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(change.domain)
-            && change.domain !== 'Message'
-          ) {
-            // Never evict a relationship-bearing root type independently. The snapshot builder
-            // chooses temporal roots and returns their complete normalized dependency closure.
-            requiresSnapshot = true;
-          }
+          incrementRecordCount(session.activeRecordCounts, change.domain);
         }
         changed = true;
       }
@@ -662,6 +654,21 @@ export class BoundedClientFeed {
       const rollover = evictMessagesOutsideLiveWindow(session);
       evictions.push(...rollover.changes);
       requiresSnapshot = rollover.requiresSnapshot;
+    }
+
+    if (!requiresSnapshot) {
+      evictions.push(...evictOverflowLeafAndTurnWindows(session));
+      for (const [domain, count] of session.activeRecordCounts) {
+        if (domain === 'Message' || !LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(domain)) continue;
+        const limit = CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE
+          * (['RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation'].includes(domain) ? 2 : 1);
+        if (count > limit) {
+          // Never evict a still-referenced relationship-bearing root type independently. The
+          // snapshot builder chooses temporal roots and returns their complete normalized closure.
+          requiresSnapshot = true;
+          break;
+        }
+      }
     }
 
     const acceptedById = new Map(accepted.map((change) => [
@@ -2745,6 +2752,86 @@ function evictMessagesOutsideLiveWindow(
   return { changes, requiresSnapshot: false };
 }
 
+const TERMINAL_TURN_SATELLITE_DOMAINS = [
+  'ExecutionLease',
+  'TurnTermination',
+  'TurnExecutorLink'
+] as const;
+
+function evictOverflowLeafAndTurnWindows(session: ClientFeedSession): ClientScopedRuntimeChange[] {
+  const changes: ClientScopedRuntimeChange[] = [];
+
+  if ((session.activeRecordCounts.get('ConversationCommandReceipt') ?? 0) > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
+    const receipts: Array<{ key: string; id: string; temporal: string }> = [];
+    for (const key of session.materializedRecordKeys) {
+      if (!key.startsWith('ConversationCommandReceipt\0')) continue;
+      if ((session.activeRecordKeyRefCounts.get(key) ?? 0) > 1) continue;
+      const id = recordIdFromKey(key);
+      receipts.push({ key, id, temporal: session.materializedRecordTemporal.get(key) ?? id });
+    }
+    receipts.sort((left, right) => left.temporal.localeCompare(right.temporal));
+    for (const receipt of receipts) {
+      if ((session.activeRecordCounts.get('ConversationCommandReceipt') ?? 0) <= CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
+        break;
+      }
+      removeMaterializedRecord(session, receipt.key);
+      changes.push({
+        domain: 'ConversationCommandReceipt',
+        kind: 'remove',
+        id: receipt.id,
+        removalCause: 'window-eviction'
+      });
+    }
+  }
+
+  if ((session.activeRecordCounts.get('Turn') ?? 0) > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
+    const turnCandidates: Array<{ turnKey: string; turnId: string; satelliteKeys: string[]; temporal: string }> = [];
+    for (const turnId of session.primaryTurnIds) {
+      const turnKey = recordKey('Turn', turnId);
+      const turn = session.materializedRecords.get(turnKey);
+      if (!turn || turn.status === 'active') continue;
+      const satelliteKeys: string[] = [];
+      let satelliteReferencedExternally = false;
+      for (const satDomain of TERMINAL_TURN_SATELLITE_DOMAINS) {
+        for (const [satKey] of materializedRecordsMatching(session, satDomain, 'turn_id', turnId)) {
+          if ((session.activeRecordKeyRefCounts.get(satKey) ?? 0) > 1) {
+            satelliteReferencedExternally = true;
+            break;
+          }
+          satelliteKeys.push(satKey);
+        }
+        if (satelliteReferencedExternally) break;
+      }
+      if (satelliteReferencedExternally) continue;
+      // Only `Turn` itself (+1) and its own satellites (+satelliteKeys.length) may reference turnKey.
+      if ((session.activeRecordKeyRefCounts.get(turnKey) ?? 0) > 1 + satelliteKeys.length) continue;
+      turnCandidates.push({
+        turnKey,
+        turnId,
+        satelliteKeys,
+        temporal: session.materializedRecordTemporal.get(turnKey) ?? turnId
+      });
+    }
+    turnCandidates.sort((left, right) => left.temporal.localeCompare(right.temporal));
+    for (const candidate of turnCandidates) {
+      if ((session.activeRecordCounts.get('Turn') ?? 0) <= CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) break;
+      for (const satKey of candidate.satelliteKeys) {
+        if (!session.materializedRecordKeys.has(satKey)) continue;
+        const domain = recordDomainFromKey(satKey);
+        const id = recordIdFromKey(satKey);
+        removeMaterializedRecord(session, satKey);
+        changes.push({ domain, kind: 'remove', id, removalCause: 'window-eviction' });
+      }
+      if (session.materializedRecordKeys.has(candidate.turnKey)) {
+        removeMaterializedRecord(session, candidate.turnKey);
+        changes.push({ domain: 'Turn', kind: 'remove', id: candidate.turnId, removalCause: 'window-eviction' });
+      }
+    }
+  }
+
+  return changes;
+}
+
 function planMessageWindowEviction(
   session: ClientFeedSession,
   messageId: string
@@ -3117,9 +3204,9 @@ function boundProjectionRecords(projections: Record<string, PlainData>): Record<
   return visit(projections) as Record<string, PlainData>;
 }
 
-function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): void {
+function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): number {
   let bytes = wireBytes(message);
-  if (bytes <= CLIENT_SNAPSHOT_MAX_BYTES) return;
+  if (bytes <= CLIENT_SNAPSHOT_MAX_BYTES) return bytes;
   const activeWindow = requireSnapshotSection(message.projections, 'activeConversationWindow');
   const activeConversationId = typeof activeWindow.conversationId === 'string'
     ? activeWindow.conversationId
@@ -3140,6 +3227,7 @@ function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): void {
     reconcileSnapshotCausalBundles(message.projections);
     bytes = wireBytes(message);
   }
+  return bytes;
 }
 
 interface SnapshotRetentionCandidate {

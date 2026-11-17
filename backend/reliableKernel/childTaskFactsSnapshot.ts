@@ -250,7 +250,7 @@ function collectConversationChildTaskFacts(
       : options.kind === 'history' ? childId === options.childExecutionId
         : requestedChildren === null || requestedChildren.has(childId);
     if (needsCurrentWork) {
-      const intents = list('TurnIntent', { conversation_id: childConversationId, state: 'queued' });
+      const intents = list('TurnIntent', { conversation_id: childConversationId, state: 'queued', turn_id: null });
       queuedIntents.set(childId, intents);
       for (const intent of intents) if (intentSource(intentRevision(intent)).task) queuedInputCount += 1;
       // Continuing publishes Context atomically; completed/rejected receipts are historical.

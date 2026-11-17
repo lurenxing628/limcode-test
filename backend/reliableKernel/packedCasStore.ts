@@ -39,6 +39,10 @@ export class PackedCasStore {
   private readonly binding: HistoricalRootBinding;
   private readonly readOnly: boolean;
   private database?: Database.Database;
+  private readBodyStatement?: Database.Statement;
+  private inspectByteLengthStatement?: Database.Statement;
+  private existsBodyStatement?: Database.Statement;
+  private insertBodyStatement?: Database.Statement;
   private identity?: fs.BigIntStats;
   private rootIdentity?: fs.BigIntStats;
   private closed = false;
@@ -60,7 +64,8 @@ export class PackedCasStore {
     return withBusyRetry(() => {
       const database = this.openExisting();
       if (!database) return undefined;
-      const row = database.prepare(READ_BODY_SQL).get(Buffer.from(identity.sha256, 'hex')) as { body: unknown } | undefined;
+      const select = this.readBodyStatement ??= database.prepare(READ_BODY_SQL);
+      const row = select.get(Buffer.from(identity.sha256, 'hex')) as { body: unknown } | undefined;
       this.assertFileIdentity();
       if (!row) return undefined;
       if (!Buffer.isBuffer(row.body) || row.body.length > PACKED_CAS_MAX_BODY_BYTES) throw corrupt('Invalid packed CAS body.');
@@ -75,8 +80,9 @@ export class PackedCasStore {
     return withBusyRetry(() => {
       const database = this.openExisting();
       if (!database) return undefined;
-      const row = database.prepare('SELECT typeof(body) AS body_type, length(body) AS byte_length FROM cas_body WHERE digest = ?')
-        .get(Buffer.from(identity.sha256, 'hex')) as { body_type: unknown; byte_length: unknown } | undefined;
+      const inspect = this.inspectByteLengthStatement
+        ??= database.prepare('SELECT typeof(body) AS body_type, length(body) AS byte_length FROM cas_body WHERE digest = ?');
+      const row = inspect.get(Buffer.from(identity.sha256, 'hex')) as { body_type: unknown; byte_length: unknown } | undefined;
       this.assertFileIdentity();
       if (!row) return undefined;
       if (row.body_type !== 'blob' || typeof row.byte_length !== 'number' || !Number.isSafeInteger(row.byte_length)
@@ -104,7 +110,9 @@ export class PackedCasStore {
       // Validate a present store even when every requested key is still stored loose.
       let database = this.openExisting();
       const loose = inputs.map(entry => {
-        if (database?.prepare('SELECT 1 FROM cas_body WHERE digest = ?').get(entry.digest)) return false;
+        if (database && (this.existsBodyStatement ??= database.prepare('SELECT 1 FROM cas_body WHERE digest = ?')).get(entry.digest)) {
+          return false;
+        }
         return existingLooseMatches(this.binding.paths.casRootPath, entry.object, entry.bytes);
       });
       if (!database && loose.every(Boolean)) {
@@ -113,8 +121,8 @@ export class PackedCasStore {
       }
       database ??= this.createAndOpen();
       this.assertWalBudget(database);
-      const select = database.prepare(READ_BODY_SQL);
-      const insert = database.prepare('INSERT INTO cas_body (digest, body) VALUES (?, ?)');
+      const select = this.readBodyStatement ??= database.prepare(READ_BODY_SQL);
+      const insert = this.insertBodyStatement ??= database.prepare('INSERT INTO cas_body (digest, body) VALUES (?, ?)');
       const publish = database.transaction(() => {
         return inputs.map((entry, index): PackedCasPlacement => {
           const row = select.get(entry.digest) as { body: unknown } | undefined;
@@ -193,6 +201,10 @@ export class PackedCasStore {
     // Leave the owner fenced and retryable if SQLite refuses to close an outstanding handle.
     this.database?.close();
     this.database = undefined;
+    this.readBodyStatement = undefined;
+    this.inspectByteLengthStatement = undefined;
+    this.existsBodyStatement = undefined;
+    this.insertBodyStatement = undefined;
     this.closed = true;
   }
 

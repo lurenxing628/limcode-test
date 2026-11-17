@@ -634,7 +634,7 @@ export function applyReliableKernelDataMessage(
       if (!message.projections || typeof message.projections !== 'object' || Array.isArray(message.projections)) {
         throw new TypeError('snapshot.projections must be an object.');
       }
-      const projections = toStructuredClonePlainData(message.projections, 'snapshot.projections') as {
+      const projections = message.projections as {
         [key: string]: PlainData;
       };
       const state: ReliableKernelBoundedClientState = {
