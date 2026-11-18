@@ -628,7 +628,7 @@ test('compressed-tail truncation reuses the retained catalog and edits only the 
   }
 });
 
-test('unchanged user-tail resubmission or deletion keeps the ready catalog without a prefix snapshot or lineage reads', async () => {
+test('user-tail resubmission, edit or deletion keeps the ready catalog without a prefix snapshot or lineage reads', async () => {
   const { ContextSequenceControlPlane, contextSequenceNodeId } = kernelFile('contextSequence.js');
   const { upgradeConversationContextHandles } = kernelFile('conversationContextHandleUpgrade.js');
   const { estimateStoredModelFacingWindowTokens } = kernelFile('modelFacingContextProjection.js');
@@ -701,8 +701,11 @@ test('unchanged user-tail resubmission or deletion keeps the ready catalog witho
           { column: 'revision_seq', scope: { message_id: messageId } })]), ...mutation.steps
         ]);
         const current = await state.readConversationContextHandleStateRow(database, conversationId);
-        assert.equal(current.state, scenario === 'same-user' || deleting ? 'ready' : 'pending', scenario);
-        if (scenario === 'same-user' || deleting) {
+        // Editing the final user input must not fall back to a pending rescan: a fork has no
+        // per-prefix snapshots of its inherited history, so that rescan walks all of it.
+        const keeps = scenario === 'same-user' || scenario === 'changed-user' || deleting;
+        assert.equal(current.state, keeps ? 'ready' : 'pending', scenario);
+        if (keeps) {
           assert.equal(current.content_object_id, originalCatalog.content_object_id);
           assert.ok(current.requires_native_reset > 0n);
           const progress = [];
@@ -713,9 +716,10 @@ test('unchanged user-tail resubmission or deletion keeps the ready catalog witho
           assert.equal(catalog.tail_segment_count, deleting ? 0n : 1n);
           assert.equal(catalog.segment_count, deleting ? 1n : 2n);
           const [newRoot] = await rows('ContextSequenceRoot', { id: current.context_root_id });
-          assert.equal(newRoot.estimated_tokens, deleting ? summaryTokens : root.estimated_tokens);
-          assert.deepEqual(reads, deleting ? [summary.id, summary.id] : [],
-            'only the retained summary is read for deletion token estimation, never lineage or catalog bodies');
+          assert.equal(newRoot.estimated_tokens, deleting ? summaryTokens
+            : scenario === 'changed-user' ? summaryTokens + 1n : root.estimated_tokens);
+          assert.deepEqual(reads, scenario === 'same-user' ? [] : [summary.id, summary.id],
+            'only the retained summary is read for token estimation, never lineage or catalog bodies');
         }
       } finally { store.read = originalRead; }
       previousRevisionId = nextRevisionId;

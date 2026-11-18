@@ -1584,16 +1584,19 @@ export class ContextSequenceControlPlane {
     const sourceSegmentId = requireId(sourceRow.segment_id, 'ContextSegmentSource.segment_id');
     const targetIndex = state.records.findIndex((record) => record.segment.id === sourceSegmentId);
     let prefix: EditableContextSegment[];
-    // A final user input cannot mint a frozen identity. Removing it or replacing it unchanged
-    // keeps the ready catalog, including reserved ordinals, without reopening compression history.
+    // A final user input cannot mint a frozen identity, and appending one never changes the
+    // catalog. Removing or replacing it (edited or unchanged) therefore keeps the ready catalog,
+    // including reserved ordinals, without reopening compression history. A fork has no per-prefix
+    // snapshots of its inherited history, so a pending fallback here would rescan all of it.
     let reuseCurrentCatalog = false;
     if (targetIndex === state.records.length - 1 && targetIndex >= 0
-      && state.records[targetIndex].segment.segment_kind === 'message'
-      && (!replacement || state.records[targetIndex].segment.content_object_id === replacement.contentObjectId)) {
+      && state.records[targetIndex].segment.segment_kind === 'message') {
       const revision = await this.getOptional('MessageRevision', revisionId);
       reuseCurrentCatalog = revision?.role === 'user' && revision.revision_seq === sourceRow.source_revision
         && revision.content_object_id === state.records[targetIndex].segment.content_object_id;
     }
+    const unchangedReplacement = reuseCurrentCatalog && replacement !== null
+      && state.records[targetIndex].segment.content_object_id === replacement.contentObjectId;
     let blocks: DomainRow[] = [];
     if (targetIndex >= 0) {
       prefix = state.records.slice(0, targetIndex).map((record) => ({
@@ -1615,7 +1618,7 @@ export class ContextSequenceControlPlane {
       blocks = expanded.blocks;
     }
 
-    let estimatedTokens = reuseCurrentCatalog && replacement
+    let estimatedTokens = unchangedReplacement
       ? requireBigInt(state.root.estimated_tokens, 'ContextSequenceRoot.estimated_tokens')
       : await this.estimateEditableContextTokens(prefix);
     const now = this.timestamp();
@@ -1637,7 +1640,7 @@ export class ContextSequenceControlPlane {
         segment: { id: replacementSegmentId, segment_kind: 'message' },
         contentObject: { byte_length: replacement.contentByteLength }
       });
-      if (!reuseCurrentCatalog) estimatedTokens += replacement.contentEstimatedTokens;
+      if (!unchangedReplacement) estimatedTokens += replacement.contentEstimatedTokens;
     }
 
     const retainedSummary = prefix[0]?.segment.segment_kind === 'compression' ? prefix[0] : null;
