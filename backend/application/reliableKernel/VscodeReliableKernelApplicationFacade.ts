@@ -34,7 +34,8 @@ import {
 } from '../../reliableKernel/runtimeHostControl';
 import {
   DEFAULT_CONVERSATION_TITLE,
-  displayConversationTitle
+  displayConversationTitle,
+  hasExplicitConversationTitle
 } from '../../../shared/conversationTitle';
 import { BridgeMessageType } from '../../../shared/protocol';
 import { EXTENSION_BRAND, EXTENSION_COMMAND_IDS } from '../../../shared/extensionIdentity';
@@ -113,6 +114,7 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
   private readonly externalHistoryWatcher: ExternalDataVersionWatcher;
   private readonly interactionAttentionNotifier: InteractionAttentionNotifier;
   private readonly interactionLeaseEdges: InteractionLeaseEdgeTracker;
+  private readonly historyLeaseSignatures = new Map<string, { signature: string; expiresAtMs: number }>();
   private historyEntries: SidebarConversationHistoryEntry[] = [];
   private originLinks: ConversationOriginLinkRecord[] = [];
   private readonly historyPreviewByRevisionId = new Map<string, string>();
@@ -925,10 +927,10 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
     }
     const leaseAcquired = this.interactionLeaseEdges.observe(commit);
     if (leaseAcquired || runtimeCommitNeedsInteractionAttention(commit)) this.scheduleInteractionAttentionRefresh();
-    if (!commit.changes.some((change) => [
+    const historyLeaseChanged = this.observeHistoryLeaseChanges(commit);
+    if (!historyLeaseChanged && !commit.changes.some((change) => [
       'Conversation',
       'Turn',
-      'ExecutionLease',
       'Message',
       'ConversationOriginLink',
       'AgentConversationLink',
@@ -953,6 +955,42 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
         console.error('[LimCode] Reliable conversation history refresh failed.', error);
       });
     }, 25);
+  }
+
+  private observeHistoryLeaseChanges(commit: Pick<RuntimeCommitResult, 'changes'>): boolean {
+    let changed = false;
+    const nowMs = Date.now();
+    for (const change of commit.changes) {
+      if (change.domain !== 'ExecutionLease') continue;
+      if (change.kind === 'remove') {
+        if (this.historyLeaseSignatures.delete(change.id)) changed = true;
+        else changed = true;
+        continue;
+      }
+      const record = change.record;
+      if (!record) {
+        this.historyLeaseSignatures.delete(change.id);
+        changed = true;
+        continue;
+      }
+      const signature = `${String(record.host_boot_id)}\0${String(record.owner_id)}\0${String(record.generation)}`;
+      const nextExpiresAtMs = Date.parse(String(record.expires_at ?? ''));
+      const previous = this.historyLeaseSignatures.get(change.id);
+      this.historyLeaseSignatures.set(change.id, {
+        signature,
+        expiresAtMs: Number.isFinite(nextExpiresAtMs) ? nextExpiresAtMs : 0
+      });
+      if (this.historyLeaseSignatures.size > HISTORY_CACHE_LIMIT) {
+        const oldestKey = this.historyLeaseSignatures.keys().next().value;
+        if (oldestKey !== undefined) this.historyLeaseSignatures.delete(oldestKey);
+      }
+      // Heartbeat renewals on an unexpired lease keep the same (host_boot_id, owner_id, generation)
+      // and do not alter sidebar status.
+      if (!previous || previous.signature !== signature || previous.expiresAtMs <= nowMs) {
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   private scheduleInteractionAttentionRefresh(): void {
@@ -1057,8 +1095,16 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
       String(row.conversation_id),
       Number(row.message_count)
     ]));
+    const explicitTitledConversationIds = new Set(
+      projection.conversations
+        .filter((row) => hasExplicitConversationTitle(String(row.title ?? ''), String(row.id)))
+        .map((row) => String(row.id))
+    );
+    const neededTitleTargets = projection.titleTargets.filter(
+      (target) => !explicitTitledConversationIds.has(target.conversationId)
+    );
     const { titles: projectedTitles, previews } = await this.readConversationHistoryProjectionContent(
-      projection.titleTargets, projection.previewTargets
+      neededTitleTargets, projection.previewTargets
     );
     const activeTurnByConversation = new Map(
       projection.turns.filter((row) => row.status === 'active').map((row) => [String(row.conversation_id), row])

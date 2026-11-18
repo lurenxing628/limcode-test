@@ -176,9 +176,17 @@ export function createStreamingMarkdownPartsRenderer() {
 
       if (previousPreserveSoftBreaks !== undefined && previousPreserveSoftBreaks !== preserveSoftBreaks) resetState();
       previousPreserveSoftBreaks = preserveSoftBreaks;
-      if (!normalized.startsWith(previousText) || previousText.length < stableChars) resetState();
+      const appendedToPrevious = previousText.length > 0
+        && normalized.startsWith(previousText)
+        && previousText.length >= stableChars;
+      const definitionScanStart = appendedToPrevious ? previousText.lastIndexOf('\n') + 1 : 0;
+      if (!appendedToPrevious) resetState();
       previousText = normalized;
-      if (containsGlobalMarkdownDefinition(normalized)) incrementalDisabled = true;
+      if (!incrementalDisabled && containsGlobalMarkdownDefinition(
+        definitionScanStart > 0 ? normalized.slice(definitionScanStart) : normalized
+      )) {
+        incrementalDisabled = true;
+      }
       if (incrementalDisabled) return renderStreamingChunk(normalized, preserveSoftBreaks);
 
       const tail = normalized.slice(stableChars);

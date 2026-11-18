@@ -48,19 +48,24 @@ const editConfirmActions: ConfirmPanelAction[] = [
   { key: 'cancel', label: '取消', variant: 'secondary' },
   { key: 'direct-confirm', label: '确认编辑' }
 ];
+const userDisplayMessages = computed<readonly (typeof currentDisplayMessages.value)[number][]>((previous) => {
+  const next = currentDisplayMessages.value.filter((message) => message.role === 'user');
+  return previous && previous.length === next.length && next.every((msg, idx) => msg === previous[idx])
+    ? previous
+    : next;
+});
+const editingMessageId = computed(() => conversationUi.editingMessage?.message.id ?? '');
 const scrollMarkers = computed(() =>
-  currentDisplayMessages.value
-    .filter((message) => message.role === 'user')
-    .map((message, index) => {
-      const editing = conversationUi.editingMessage?.message.id === message.id;
-      const text = compactMessagePreview(message.content.parts);
-      return {
-        id: message.id,
-        label: `用户消息 · ${index + 1}`,
-        preview: text,
-        kind: editing ? 'user editing' : 'user'
-      };
-    })
+  userDisplayMessages.value.map((message, index) => {
+    const editing = editingMessageId.value === message.id;
+    const text = compactMessagePreview(message.content.parts);
+    return {
+      id: message.id,
+      label: `用户消息 · ${index + 1}`,
+      preview: text,
+      kind: editing ? 'user editing' : 'user'
+    };
+  })
 );
 
 watch(
@@ -74,7 +79,11 @@ watch(
 );
 
 watch(
-  () => `${currentConversationId.value}:${currentDisplayMessages.value.length}:${reliableConversation.feed.lastCommitSeq ?? ''}:${Object.keys(reliableConversation.feed.transientModelRequests).length}`,
+  () => {
+    const cid = currentConversationId.value;
+    if (!cid || pendingInitialBottomConversationId !== cid) return cid;
+    return `${cid}:${currentDisplayMessages.value.length}:${reliableConversation.feed.lastCommitSeq ?? ''}:${Object.keys(reliableConversation.feed.transientModelRequests).length}`;
+  },
   () => scheduleInitialConversationBottomScroll(),
   { flush: 'post' }
 );
@@ -169,7 +178,11 @@ function startReliableMessageEdit(message: (typeof currentDisplayMessages.value)
   conversationUi.startEditMessage(message, deleteCount);
 }
 
+const messagePreviewCache = new WeakMap<MessageContent['parts'], string>();
+
 function compactMessagePreview(parts: MessageContent['parts']): string {
+  const cached = messagePreviewCache.get(parts);
+  if (cached !== undefined) return cached;
   const maxPreviewCharacters = 180;
   const maxScannedCharacters = 4_096;
   let preview = '';
@@ -187,10 +200,15 @@ function compactMessagePreview(parts: MessageContent['parts']): string {
       if (pendingSpace) preview += ' ';
       pendingSpace = false;
       preview += character;
-      if (preview.length > maxPreviewCharacters) return `${preview.slice(0, maxPreviewCharacters)}...`;
+      if (preview.length > maxPreviewCharacters) {
+        const truncated = `${preview.slice(0, maxPreviewCharacters)}...`;
+        messagePreviewCache.set(parts, truncated);
+        return truncated;
+      }
     }
     if (scanned >= maxScannedCharacters) break;
   }
+  messagePreviewCache.set(parts, preview);
   return preview;
 }
 </script>

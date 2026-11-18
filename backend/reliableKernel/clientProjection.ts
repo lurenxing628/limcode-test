@@ -155,16 +155,20 @@ const COMPRESSION_BLOCK_SUMMARY_COLUMNS = `
   ) AS source_count,
   (
     SELECT revision.message_id
-      FROM compression_block_source AS anchor_source
+      FROM (
+        SELECT segment_id, position, id
+          FROM compression_block_source
+         WHERE compression_block_id = block.id
+         ORDER BY position DESC, id DESC
+         LIMIT -1
+      ) AS anchor_source
       CROSS JOIN context_segment_source AS segment_source
         ON segment_source.segment_id = anchor_source.segment_id
        AND segment_source.source_kind = 'message_revision'
-      JOIN message_revision AS revision ON revision.id = segment_source.source_id
-      JOIN message_part_of_conversation AS anchor_membership
+      CROSS JOIN message_revision AS revision ON revision.id = segment_source.source_id
+      CROSS JOIN message_part_of_conversation AS anchor_membership
         ON anchor_membership.message_id = revision.message_id
        AND anchor_membership.conversation_id = block.conversation_id
-     WHERE anchor_source.compression_block_id = block.id
-     ORDER BY anchor_source.position DESC, anchor_source.id DESC
      LIMIT 1
   ) AS anchor_message_id
 `;
@@ -181,18 +185,29 @@ export function projectCompressionBlockRecord(database: Database.Database, block
 }
 
 /** The immutable item index remains available after the current revision becomes the final aggregate. */
-function messageItemIndexRevisionSql(): string {
-  return `(CASE WHEN content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}' OR NOT EXISTS (
-    SELECT 1 FROM model_request_message_link AS output
-      JOIN model_request AS request ON request.id = output.model_request_id
-     WHERE output.message_id = revision.message_id
-       AND request.status = 'terminal'
-       AND request.terminal_state NOT IN ('completed', 'native_chain_rebased')
-  ) THEN (SELECT item.id FROM message_revision AS item
-    JOIN content_object AS item_content ON item_content.id = item.content_object_id
-    WHERE item.message_id = revision.message_id
-      AND item_content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}'
-    ORDER BY item.revision_seq DESC LIMIT 1) ELSE NULL END)`;
+function messageItemIndexRevisionSql(
+  columns: { id: string; messageId: string; revisionSeq: string } = {
+    id: 'revision.id',
+    messageId: 'revision.message_id',
+    revisionSeq: 'revision.revision_seq'
+  }
+): string {
+  return `(CASE
+    WHEN content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}' THEN ${columns.id}
+    WHEN ${columns.revisionSeq} = 1 THEN NULL
+    WHEN NOT EXISTS (
+      SELECT 1 FROM model_request_message_link AS output
+        JOIN model_request AS request ON request.id = output.model_request_id
+       WHERE output.message_id = ${columns.messageId}
+         AND request.status = 'terminal'
+         AND request.terminal_state NOT IN ('completed', 'native_chain_rebased')
+    ) THEN (SELECT item.id FROM message_revision AS item
+      JOIN content_object AS item_content ON item_content.id = item.content_object_id
+      WHERE item.message_id = ${columns.messageId}
+        AND item_content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}'
+      ORDER BY item.revision_seq DESC LIMIT 1)
+    ELSE NULL
+  END)`;
 }
 
 function projectLogicalMessageMetadata(database: Database.Database, row: DomainRow,
@@ -720,17 +735,22 @@ export function executeClientProjectionSnapshot(
   database: Database.Database,
   activeConversationId: string | null,
   commitSeq: bigint,
-  content: ClientProjectionContentAccess
+  content: ClientProjectionContentAccess,
+  messageCountCache?: ConversationHistoryMessageCounts
 ): SnapshotBarrier<ClientProjectionSnapshot> {
   const conversationId = activeConversationId === null ? null : requireRuntimeId(activeConversationId);
   database.exec('BEGIN');
   try {
+    const beforeDataVersion = messageCountCache?.dataVersion();
     const conversations = queryPlainRows(database, `
       SELECT id, title, status, created_at, updated_at
         FROM conversation
        ORDER BY updated_at DESC, id DESC
        LIMIT @limit
     `, { limit: BigInt(CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) });
+    const counts = messageCountCache?.synchronizeSnapshot(beforeDataVersion!, messageCountCache.dataVersion())
+      ? messageCountCache
+      : undefined;
     const emptyWindow = {
       conversationId,
       messages: [],
@@ -858,15 +878,9 @@ export function executeClientProjectionSnapshot(
        ORDER BY membership.message_seq DESC, m.id DESC
        LIMIT @messageLimit
     `, { conversationId, messageLimit: BigInt(CLIENT_MESSAGE_WINDOW_LIMIT) }).reverse();
-    const messageSummary = prepareCached(database, `
-      SELECT COUNT(CASE WHEN m.deleted_at IS NULL AND revision.role IN ('user', 'model') THEN 1 END) AS visible_message_count,
-             COALESCE(MAX(membership.message_seq), 0) AS last_message_seq
-        FROM message_part_of_conversation AS membership
-        JOIN message AS m ON m.id = membership.message_id
-        JOIN message_current_revision_link AS current_revision ON current_revision.message_id = m.id
-        JOIN message_revision AS revision ON revision.id = current_revision.revision_id
-       WHERE membership.conversation_id = ?
-    `).get(conversationId) as { visible_message_count: bigint; last_message_seq: bigint };
+    const messageSummary = counts
+      ? counts.readConversationSummary(database, conversationId)
+      : readUncachedConversationMessageSummary(database, conversationId);
     const visibleMessageCount = messageSummary.visible_message_count;
     let visibleFloor = visibleMessageCount - BigInt(rawMessageRows.length);
     let messageRows: Array<Record<string, unknown>> = rawMessageRows.map((row) => {
@@ -1038,12 +1052,10 @@ export function executeClientProjectionSnapshot(
         toolCallSourceLinks.map((row) => String(row.model_request_id))
       )
     ]).sort(compareModelRequestRows);
-    const modelContextProjections = queryAllByIds(
+    const modelContextProjections = queryModelContextProjectionsByRequestIds(
       database,
-      'model_context_projection',
-      'owner_id',
       modelRequests.map((row) => String(row.id))
-    ).filter((row) => row.owner_kind === 'model_request');
+    );
     const modelRequestMessageLinks = queryAllByIds(
       database,
       'model_request_message_link',
@@ -1581,7 +1593,7 @@ function projectCurrentTaskList(
        -- ToolOutcome but not the source's execution Operations), by that copied outcome.
        AND (
          EXISTS (
-           SELECT 1 FROM operation AS task_operation
+           SELECT 1 FROM operation AS task_operation INDEXED BY ix_operation_02
             WHERE task_operation.tool_call_id = call.id AND task_operation.status = 'succeeded'
          )
          OR EXISTS (
@@ -1600,8 +1612,11 @@ function projectCurrentTaskList(
   // never prevent the bounded Conversation Feed from opening; omit the card without interpreting
   // the old shape. ModelRequest recipe reads remain strict in readCurrentTurnTaskCard().
   try {
-    const operations: CurrentTurnTaskOperationFact[] = [];
-    for (const call of calls) {
+    // Updates before the latest eligible `rewrite` baseline are ignored by buildCurrentTurnTaskProjection;
+    // walk newest-to-oldest and stop at that baseline instead of reading all historical task artifacts.
+    const reverseOperations: CurrentTurnTaskOperationFact[] = [];
+    for (let index = calls.length - 1; index >= 0; index -= 1) {
+      const call = calls[index]!;
       const toolCallId = String(call.id);
       const artifact = taskArtifactForCall(database, readTaskProjectionJson(
         database,
@@ -1612,7 +1627,7 @@ function projectCurrentTaskList(
       if (call.tool_name === 'update_task_list') {
         const operation = taskListOperationFromSettledArtifact(artifact, toolCallId);
         if (!operation) continue;
-        operations.push({
+        reverseOperations.push({
           toolCallId,
           callSeq: String(call.call_seq),
           toolName: 'update_task_list',
@@ -1622,6 +1637,7 @@ function projectCurrentTaskList(
           sourceMessageSeq: String(call.message_seq),
           providerOrdinal: String(call.provider_ordinal)
         });
+        if (operation.mode === 'rewrite') break;
         continue;
       }
       const argumentsValue = readTaskProjectionJson(
@@ -1636,7 +1652,7 @@ function projectCurrentTaskList(
         toolCallId
       });
       if (!operation) continue;
-      operations.push({
+      reverseOperations.push({
         toolCallId,
         callSeq: String(call.call_seq),
         toolName: 'submit_plan',
@@ -1647,7 +1663,9 @@ function projectCurrentTaskList(
         sourceMessageSeq: String(call.message_seq),
         providerOrdinal: String(call.provider_ordinal)
       });
+      if (operation.mode === 'rewrite') break;
     }
+    const operations = reverseOperations.reverse();
     const projection = buildCurrentTurnTaskProjection({
       turnId: String(calls[calls.length - 1].turn_id),
       operations
@@ -1700,9 +1718,15 @@ export const CONVERSATION_HISTORY_EXACT_OFFSET_ROWS = 10_000;
  * the current last page inside the same read transaction, so a page emptied by deletions resolves
  * to the nearest existing page in one bounded read instead of a client-driven retry loop.
  */
+interface CachedConversationMessageCount {
+  count: bigint;
+  throughSeq?: bigint;
+  dirtyAfterSeq?: boolean;
+}
+
 /** Worker-local counts; status writes never discard already counted message history. */
 export class ConversationHistoryMessageCounts {
-  private readonly counts = new Map<string, bigint>();
+  private readonly counts = new Map<string, CachedConversationMessageCount>();
   private externalVersion: bigint | undefined;
 
   public constructor(private readonly writer: Database.Database) {}
@@ -1725,7 +1749,25 @@ export class ConversationHistoryMessageCounts {
     } else if (mutation.domain === 'Conversation' && mutation.kind === 'delete') {
       this.counts.delete(mutation.id);
     } else if (mutation.domain === 'MessagePartOfConversation' && mutation.kind === 'insert') {
-      this.counts.delete(String(mutation.row.conversation_id));
+      const conversationId = String(mutation.row.conversation_id);
+      const entry = this.counts.get(conversationId);
+      if (!entry) return;
+      const rawSeq = mutation.row.message_seq;
+      if (
+        rawSeq !== undefined
+        && rawSeq !== null
+        && entry.throughSeq !== undefined
+        && entry.throughSeq > 0n
+        && BigInt(String(rawSeq)) > entry.throughSeq
+      ) {
+        entry.dirtyAfterSeq = true;
+      } else {
+        this.counts.delete(conversationId);
+      }
+    } else if (mutation.domain === 'MessagePartOfConversation') {
+      this.clear();
+    } else if (mutation.domain === 'Message' && mutation.kind === 'delete') {
+      this.clear();
     } else {
       let messageId: unknown;
       if (mutation.domain === 'Message' && mutation.kind === 'update' && 'deleted_at' in mutation.patch) {
@@ -1747,24 +1789,108 @@ export class ConversationHistoryMessageCounts {
         messageId = row?.message_id;
       }
       if (typeof messageId === 'string') {
-        const membership = prepareCached(this.writer, 'SELECT conversation_id FROM message_part_of_conversation WHERE message_id = ?')
+        const membership = prepareCached(this.writer, 'SELECT conversation_id, message_seq FROM message_part_of_conversation WHERE message_id = ?')
           .get(messageId) as DomainRow | undefined;
-        if (membership) this.counts.delete(String(membership.conversation_id));
+        if (membership) {
+          const conversationId = String(membership.conversation_id);
+          const entry = this.counts.get(conversationId);
+          if (entry) {
+            if (entry.throughSeq !== undefined && entry.throughSeq > 0n && BigInt(String(membership.message_seq)) > entry.throughSeq) {
+              entry.dirtyAfterSeq = true;
+            } else {
+              this.counts.delete(conversationId);
+            }
+          }
+        }
       }
     }
   }
 
   public get(id: string): bigint | undefined {
-    const count = this.counts.get(id);
-    if (count !== undefined) { this.counts.delete(id); this.counts.set(id, count); }
-    return count;
+    const entry = this.counts.get(id);
+    if (!entry || entry.dirtyAfterSeq) return undefined;
+    this.counts.delete(id);
+    this.counts.set(id, entry);
+    return entry.count;
   }
 
-  public set(id: string, count: bigint): void {
+  public set(id: string, count: bigint, throughSeq?: bigint): void {
     this.counts.delete(id);
-    this.counts.set(id, count);
+    this.counts.set(id, { count, ...(throughSeq !== undefined ? { throughSeq } : {}) });
     if (this.counts.size > 512) this.counts.delete(this.counts.keys().next().value!);
   }
+
+  public resolveCount(database: Database.Database, id: string): bigint | undefined {
+    const entry = this.counts.get(id);
+    if (!entry) return undefined;
+    if (!entry.dirtyAfterSeq) {
+      this.counts.delete(id);
+      this.counts.set(id, entry);
+      return entry.count;
+    }
+    if (entry.throughSeq === undefined) {
+      this.counts.delete(id);
+      return undefined;
+    }
+    return this.readConversationSummary(database, id).visible_message_count;
+  }
+
+  public readConversationSummary(
+    database: Database.Database,
+    conversationId: string
+  ): { visible_message_count: bigint; last_message_seq: bigint } {
+    const entry = this.counts.get(conversationId);
+    const maxRow = prepareCached(database, `
+      SELECT COALESCE(MAX(membership.message_seq), 0) AS last_message_seq
+        FROM message_part_of_conversation AS membership
+       WHERE membership.conversation_id = ?
+    `).get(conversationId) as { last_message_seq: bigint };
+    const lastMessageSeq = BigInt(String(maxRow.last_message_seq));
+    if (entry && entry.throughSeq !== undefined) {
+      if (!entry.dirtyAfterSeq && entry.throughSeq === lastMessageSeq) {
+        this.counts.delete(conversationId);
+        this.counts.set(conversationId, entry);
+        return { visible_message_count: entry.count, last_message_seq: lastMessageSeq };
+      }
+      if (lastMessageSeq >= entry.throughSeq) {
+        const deltaRow = lastMessageSeq === entry.throughSeq
+          ? { delta_count: 0n }
+          : prepareCached(database, `
+              SELECT COUNT(1) AS delta_count
+                FROM message_part_of_conversation AS membership
+                JOIN message AS m ON m.id = membership.message_id
+                JOIN message_current_revision_link AS current_revision ON current_revision.message_id = m.id
+                JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+               WHERE membership.conversation_id = ?
+                 AND membership.message_seq > ?
+                 AND membership.message_seq <= ?
+                 AND m.deleted_at IS NULL
+                 AND revision.role IN ('user', 'model')
+            `).get(conversationId, entry.throughSeq, lastMessageSeq) as { delta_count: bigint };
+        const nextCount = entry.count + BigInt(String(deltaRow.delta_count));
+        this.set(conversationId, nextCount, lastMessageSeq);
+        return { visible_message_count: nextCount, last_message_seq: lastMessageSeq };
+      }
+    }
+    const fresh = readUncachedConversationMessageSummary(database, conversationId);
+    this.set(conversationId, fresh.visible_message_count, fresh.last_message_seq);
+    return fresh;
+  }
+}
+
+function readUncachedConversationMessageSummary(
+  database: Database.Database,
+  conversationId: string
+): { visible_message_count: bigint; last_message_seq: bigint } {
+  return prepareCached(database, `
+    SELECT COUNT(CASE WHEN m.deleted_at IS NULL AND revision.role IN ('user', 'model') THEN 1 END) AS visible_message_count,
+           COALESCE(MAX(membership.message_seq), 0) AS last_message_seq
+      FROM message_part_of_conversation AS membership
+      JOIN message AS m ON m.id = membership.message_id
+      JOIN message_current_revision_link AS current_revision ON current_revision.message_id = m.id
+      JOIN message_revision AS revision ON revision.id = current_revision.revision_id
+     WHERE membership.conversation_id = ?
+  `).get(conversationId) as { visible_message_count: bigint; last_message_seq: bigint };
 }
 
 export function executeConversationHistoryProjection(
@@ -1827,8 +1953,8 @@ export function executeConversationHistoryProjection(
       )
       SELECT conversation.id, conversation.title, conversation.status,
              conversation.created_at, conversation.updated_at
-        FROM conversation
-        JOIN page_conversation ON page_conversation.id = conversation.id
+        FROM page_conversation
+        CROSS JOIN conversation ON conversation.id = page_conversation.id
        ORDER BY conversation.updated_at DESC, conversation.id DESC
     `, seedParameters, { count: seedIds.length });
     const conversationIds = conversations.map((row) => String(row.id));
@@ -1844,21 +1970,32 @@ export function executeConversationHistoryProjection(
     );
     const availableCounts = new Map<string, bigint>();
     for (const id of conversationIds) {
-      const count = counts?.get(id);
+      const count = counts?.resolveCount(database, id);
       if (count !== undefined) availableCounts.set(id, count);
     }
     const missingCounts = conversationIds.filter(id => !availableCounts.has(id));
     const freshSummaries = missingCounts.length > 0 ? queryConversationMessageSummaries(database, missingCounts) : [];
-    const freshCounts = new Map(freshSummaries.map(row => [String(row.conversation_id), BigInt(String(row.message_count))]));
+    const freshById = new Map(freshSummaries.map(row => [
+      String(row.conversation_id),
+      {
+        count: BigInt(String(row.message_count)),
+        lastSeq: row.last_message_seq !== undefined ? BigInt(String(row.last_message_seq)) : undefined
+      }
+    ]));
+    const maxSeqForEmpty = counts && missingCounts.some(id => !freshById.has(id))
+      ? queryConversationLastMessageSeqs(database, missingCounts.filter(id => !freshById.has(id)))
+      : new Map<string, bigint>();
     for (const id of missingCounts) {
-      const count = freshCounts.get(id) ?? 0n;
+      const fresh = freshById.get(id);
+      const count = fresh?.count ?? 0n;
+      const throughSeq = fresh?.lastSeq ?? maxSeqForEmpty.get(id) ?? 0n;
       availableCounts.set(id, count);
-      counts?.set(id, count);
+      counts?.set(id, count, throughSeq);
     }
     const messageSummaries = counts ? conversationIds.flatMap(id => {
       const count = availableCounts.get(id)!;
       return count > 0n ? [{ conversation_id: id, message_count: count }] : [];
-    }) : freshSummaries;
+    }) : freshSummaries.map(({ conversation_id, message_count }) => ({ conversation_id, message_count }));
     const latestVisible = queryLatestVisibleRevisions(database, conversationIds);
     const firstUser = queryFirstUserRevisions(database, conversationIds);
     const targetRevisionIds = [...new Set([
@@ -1884,8 +2021,7 @@ export function executeConversationHistoryProjection(
     const submissionIds = answerBridges.flatMap((row) => row.current_submission_id === null
       ? []
       : [String(row.current_submission_id)]);
-    const inboxItems = queryAllByIds(database, 'runtime_inbox_item', 'source_id', submissionIds)
-      .filter((row) => row.source_kind === 'answer_submission');
+    const inboxItems = queryAnswerSubmissionInboxItems(database, submissionIds);
     const deliveries = queryAllByIds(database, 'runtime_delivery', 'inbox_item_id', inboxItems.map((row) => String(row.id)));
     const deliveryIds = deliveries.map((row) => String(row.id));
     const deliveryWakes = queryAllByIds(database, 'runtime_delivery_wake', 'delivery_id', deliveryIds);
@@ -1895,7 +2031,8 @@ export function executeConversationHistoryProjection(
     const turns = mergeRowsById([
       ...queryConversationIdChunks(database, conversationIds, (placeholders) => `
         SELECT * FROM turn INDEXED BY ix_turn_02
-         WHERE conversation_id IN (${placeholders}) AND status = 'active'
+         WHERE conversation_id IN (${placeholders})
+           AND status >= 'active' AND status <= 'active'
          ORDER BY id ASC
       `),
       ...queryAllByIds(database, 'turn', 'id', [
@@ -2700,12 +2837,12 @@ function buildClientVisibleMessageHistoryRecords(
   const modelRequests = readRows(database, 'model_request', 'id', requestIds)
     .sort(compareModelRequestRows);
   include('ModelRequest', facts.has('ModelRequest') ? modelRequests : singleResponseMeasurementReader(database, content).project(modelRequests));
-  include('ModelContextProjection', readRows(
-    database,
-    'model_context_projection',
+  include('ModelContextProjection', cachedRows(
+    'ModelContextProjection',
     'owner_id',
-    requestIds
-  ).filter((row) => row.owner_kind === 'model_request'));
+    requestIds,
+    () => queryModelContextProjectionsByRequestIds(database, requestIds)
+  ));
 
   const toolCallIds = [...new Set(sourceLinks.map((row) => String(row.tool_call_id)))];
   const toolCalls = readRows(database, 'tool_call', 'id', toolCallIds)
@@ -2880,12 +3017,12 @@ function queryClientProcesses(
 ): Array<Record<string, unknown>> {
   return queryPlainRows(database, `
     SELECT process.*
-      FROM process
-      JOIN process_origin_link AS origin ON origin.process_id = process.id
-      JOIN tool_call ON tool_call.id = origin.tool_call_id
-      JOIN turn ON turn.id = tool_call.turn_id
-     WHERE turn.conversation_id = @conversationId
-       AND process.status = 'running'
+      FROM process INDEXED BY ix_process_01
+      CROSS JOIN process_origin_link AS origin ON origin.process_id = process.id
+      CROSS JOIN tool_call ON tool_call.id = origin.tool_call_id
+      CROSS JOIN turn ON turn.id = tool_call.turn_id
+     WHERE process.status = 'running'
+       AND turn.conversation_id = @conversationId
      ORDER BY process.started_at DESC, process.id DESC
   `, { conversationId });
 }
@@ -2895,17 +3032,26 @@ function queryClientChildExecutions(
   conversationId: string
 ): Array<Record<string, unknown>> {
   return queryPlainRows(database, `
-    SELECT DISTINCT child.*
-      FROM child_execution AS child
-      JOIN child_execution_parent_link AS parent_link
-        ON parent_link.child_execution_id = child.id
-      LEFT JOIN tool_call AS source_call ON source_call.id = parent_link.source_tool_call_id
-      LEFT JOIN turn AS source_turn ON source_turn.id = source_call.turn_id
-     WHERE child.child_conversation_id = @conversationId
-        OR (
-          source_turn.conversation_id = @conversationId
-          AND child.status NOT IN ('closed', 'needs_human')
-        )
+    WITH matched_child_ids(id) AS (
+      SELECT child.id
+        FROM child_execution AS child
+       WHERE child.child_conversation_id = @conversationId
+      UNION
+      SELECT child.id
+        FROM turn AS source_turn
+        CROSS JOIN tool_call AS source_call ON source_call.turn_id = source_turn.id
+        CROSS JOIN child_execution_parent_link AS parent_link ON parent_link.source_tool_call_id = source_call.id
+        CROSS JOIN child_execution AS child ON child.id = parent_link.child_execution_id
+       WHERE source_turn.conversation_id = @conversationId
+         AND child.status NOT IN ('closed', 'needs_human')
+    )
+    SELECT child.*
+      FROM matched_child_ids
+      CROSS JOIN child_execution AS child ON child.id = matched_child_ids.id
+     WHERE EXISTS (
+       SELECT 1 FROM child_execution_parent_link AS parent_link
+        WHERE parent_link.child_execution_id = child.id
+     )
      ORDER BY child.created_at DESC, child.id DESC
   `, { conversationId });
 }
@@ -2984,7 +3130,7 @@ function queryVisibleMessageRowsByIds(
       return `@message${index}`;
     });
     rows.push(...queryIdListRows(database, `
-      WITH visible_messages AS (
+      WITH ranked_visible AS (
         SELECT message.id,
                membership.conversation_id,
                membership.message_seq,
@@ -2995,9 +3141,6 @@ function queryVisibleMessageRowsByIds(
                revision.revision_seq,
                revision.role,
                revision.content_object_id,
-               content.content_type,
-               content.byte_length,
-               ${messageItemIndexRevisionSql()} AS item_index_revision_id,
                ROW_NUMBER() OVER (
                  ORDER BY membership.message_seq ASC, message.id ASC
                ) AS display_seq
@@ -3005,7 +3148,6 @@ function queryVisibleMessageRowsByIds(
           JOIN message ON message.id = membership.message_id
           JOIN message_current_revision_link AS current_revision ON current_revision.message_id = message.id
           JOIN message_revision AS revision ON revision.id = current_revision.revision_id
-          JOIN content_object AS content ON content.id = revision.content_object_id
          WHERE membership.conversation_id = @conversationId
            AND membership.message_seq <= (
              SELECT MAX(message_seq) FROM message_part_of_conversation
@@ -3014,10 +3156,28 @@ function queryVisibleMessageRowsByIds(
            AND message.deleted_at IS NULL
            AND revision.role IN ('user', 'model')
       )
-      SELECT *
-        FROM visible_messages
-       WHERE id IN (${placeholders.join(',')})
-       ORDER BY message_seq ASC, id ASC
+      SELECT ranked.id,
+             ranked.conversation_id,
+             ranked.message_seq,
+             ranked.created_at,
+             ranked.updated_at,
+             ranked.deleted_at,
+             ranked.revision_id,
+             ranked.revision_seq,
+             ranked.role,
+             ranked.content_object_id,
+             content.content_type,
+             content.byte_length,
+             ${messageItemIndexRevisionSql({
+               id: 'ranked.revision_id',
+               messageId: 'ranked.id',
+               revisionSeq: 'ranked.revision_seq'
+             })} AS item_index_revision_id,
+             ranked.display_seq
+        FROM ranked_visible AS ranked
+        JOIN content_object AS content ON content.id = ranked.content_object_id
+       WHERE ranked.id IN (${placeholders.join(',')})
+       ORDER BY ranked.message_seq ASC, ranked.id ASC
     `, parameters, { count: chunk.length, chunkSize }));
   }
   return mergeRowsById(rows);
@@ -3153,12 +3313,76 @@ function queryAllByIds(
   return rows;
 }
 
+function queryModelContextProjectionsByRequestIds(
+  database: Database.Database,
+  requestIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const unique = [...new Set(requestIds)];
+  const rows: Array<Record<string, unknown>> = [];
+  const chunkSize = 400;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
+    const parameters: Record<string, string | bigint> = {};
+    const placeholders = chunk.map((id, index) => {
+      parameters[`id${index}`] = id;
+      return `@id${index}`;
+    });
+    rows.push(...queryIdListRows(database, `
+      SELECT * FROM model_context_projection
+       WHERE owner_kind = 'model_request'
+         AND owner_id IN (${placeholders.join(',')})
+       ORDER BY id ASC
+    `, parameters, { count: chunk.length, chunkSize }));
+  }
+  return rows;
+}
+
+function queryAnswerSubmissionInboxItems(
+  database: Database.Database,
+  submissionIds: readonly string[]
+): Array<Record<string, unknown>> {
+  const unique = [...new Set(submissionIds)];
+  const rows: Array<Record<string, unknown>> = [];
+  const chunkSize = 400;
+  for (let offset = 0; offset < unique.length; offset += chunkSize) {
+    const chunk = unique.slice(offset, offset + chunkSize);
+    const parameters: Record<string, string | bigint> = {};
+    const placeholders = chunk.map((id, index) => {
+      parameters[`id${index}`] = id;
+      return `@id${index}`;
+    });
+    rows.push(...queryIdListRows(database, `
+      SELECT * FROM runtime_inbox_item
+       WHERE source_kind = 'answer_submission'
+         AND source_id IN (${placeholders.join(',')})
+       ORDER BY id ASC
+    `, parameters, { count: chunk.length, chunkSize }));
+  }
+  return rows;
+}
+
+function queryConversationLastMessageSeqs(
+  database: Database.Database,
+  conversationIds: readonly string[]
+): Map<string, bigint> {
+  if (conversationIds.length === 0) return new Map();
+  const rows = queryConversationIdChunks(database, conversationIds, (placeholders) => `
+    SELECT membership.conversation_id, COALESCE(MAX(membership.message_seq), 0) AS last_message_seq
+      FROM message_part_of_conversation AS membership
+     WHERE membership.conversation_id IN (${placeholders})
+     GROUP BY membership.conversation_id
+  `);
+  return new Map(rows.map((row) => [String(row.conversation_id), BigInt(String(row.last_message_seq))]));
+}
+
 function queryConversationMessageSummaries(
   database: Database.Database,
   conversationIds: readonly string[]
 ): Array<Record<string, unknown>> {
   return queryConversationIdChunks(database, conversationIds, (placeholders) => `
-    SELECT membership.conversation_id, COUNT(*) AS message_count
+    SELECT membership.conversation_id,
+           COUNT(*) AS message_count,
+           COALESCE(MAX(membership.message_seq), 0) AS last_message_seq
       FROM message_part_of_conversation AS membership
       JOIN message ON message.id = membership.message_id
       JOIN message_current_revision_link AS current ON current.message_id = message.id
@@ -3248,13 +3472,11 @@ function queryConversationModelRequests(
     parameters[`visibleMessage${index}`] = messageId;
     return `@visibleMessage${index}`;
   });
-  const visibleLinkClause = visiblePlaceholders.length > 0
-    ? `OR EXISTS (
-         SELECT 1
-           FROM model_request_message_link AS visible_link
-          WHERE visible_link.model_request_id = request.id
-            AND visible_link.message_id IN (${visiblePlaceholders.join(',')})
-       )`
+  const visibleLinkUnion = visiblePlaceholders.length > 0
+    ? `UNION
+       SELECT visible_link.model_request_id AS id
+         FROM model_request_message_link AS visible_link
+        WHERE visible_link.message_id IN (${visiblePlaceholders.join(',')})`
     : '';
   return queryIdListRows(database, `
     WITH independent_request_tail AS (
@@ -3272,15 +3494,15 @@ function queryConversationModelRequests(
          )
        ORDER BY owner_turn.created_at DESC, request.request_seq DESC, request.id DESC
        LIMIT ${CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE}
+    ), selected_request_ids(id) AS (
+      SELECT id FROM independent_request_tail
+      ${visibleLinkUnion}
     )
     SELECT request.*
-      FROM model_request AS request
-      JOIN turn AS owner_turn ON owner_turn.id = request.turn_id
+      FROM selected_request_ids
+      CROSS JOIN model_request AS request ON request.id = selected_request_ids.id
+      CROSS JOIN turn AS owner_turn ON owner_turn.id = request.turn_id
      WHERE owner_turn.conversation_id = @conversationId
-       AND (
-         request.id IN (SELECT id FROM independent_request_tail)
-         ${visibleLinkClause}
-       )
      ORDER BY owner_turn.created_at DESC, request.request_seq DESC, request.id DESC
   `, parameters, { count: visiblePlaceholders.length }).reverse();
 }

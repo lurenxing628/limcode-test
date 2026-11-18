@@ -3720,39 +3720,53 @@ async function compactWithSegmentedSummary(
     ? plainTextOfContents(semanticRequest.priorSummaryContents)
     : '';
   const sourceContents = summaryDeltaContents(semanticRequest);
-  const deterministic = deterministicReplacementSummary(priorSummaryText, sourceContents, targetTokens);
-  let finalSummary = deterministic;
+  const fallback = (): string => deterministicReplacementSummary(priorSummaryText, sourceContents, targetTokens);
+  let finalSummary: string | undefined;
 
   if (sourceContents.length > 0 && provider.provider) {
     const calls = buildSegmentedSummaryProviderCalls(semanticRequest, summaryConfig, provider.settings);
-    const leaves = await mapWithBoundedConcurrency(
-      calls,
-      isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
-      (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
-      signal
-    );
-    const merged = await mergeSegmentedSummaryHierarchy(
-      provider,
-      leaves,
-      priorSummaryText,
-      summaryConfig,
-      targetTokens,
-      signal
-    );
-    // Only the final summary is shortened, once: leaf and intermediate results are merge inputs that
-    // the next merge rewrites anyway, so shortening each of them doubled the requests.
-    if (merged) {
+    const singlePassCall = calls.length === 1 && priorSummaryText
+      ? tryBuildSinglePassSegmentedSummaryCall(semanticRequest, sourceContents, summaryConfig, provider.settings)
+      : undefined;
+    if (singlePassCall) {
+      const candidate = await requestSummaryCandidate(provider, singlePassCall, signal);
       const shortened = await shortenOversizedSummary(
         provider,
-        merged.candidate,
-        { ...merged.call, targetTokens },
+        candidate,
+        { ...singlePassCall, targetTokens },
         signal
       );
-      finalSummary = finalizeStructuredSummary(shortened, deterministic, targetTokens);
+      finalSummary = finalizeStructuredSummary(shortened, fallback, targetTokens, sourceContents);
+    } else {
+      const leaves = await mapWithBoundedConcurrency(
+        calls,
+        isOpenAIResponsesWebSocketMode(provider.settings) ? 1 : SEGMENTED_SUMMARY_CONCURRENCY,
+        (call, _index, siblingSignal) => summarizeSingleRound(provider, call, siblingSignal),
+        signal
+      );
+      const merged = await mergeSegmentedSummaryHierarchy(
+        provider,
+        leaves,
+        priorSummaryText,
+        summaryConfig,
+        targetTokens,
+        signal
+      );
+      // Only the final summary is shortened, once: leaf and intermediate results are merge inputs that
+      // the next merge rewrites anyway, so shortening each of them doubled the requests.
+      if (merged) {
+        const shortened = await shortenOversizedSummary(
+          provider,
+          merged.candidate,
+          { ...merged.call, targetTokens },
+          signal
+        );
+        finalSummary = finalizeStructuredSummary(shortened, fallback, targetTokens, sourceContents);
+      }
     }
   }
 
-  const contents = compressionSummaryContents(finalSummary, targetTokens, attachmentState);
+  const contents = compressionSummaryContents(finalSummary ?? fallback(), targetTokens, attachmentState);
   return {
     id: `summary-${request.blockId}`,
     object: 'limcode.context_summary',
@@ -3790,9 +3804,11 @@ function finalAnswerTextOf(segment: MessageContent[]): string {
 }
 
 const SUMMARY_TAG_PATTERN = /<summary>([\s\S]*?)<\/summary>/i;
+const SUMMARY_ANALYSIS_TAG_PATTERN = /<analysis>[\s\S]*?<\/analysis>/gi;
 function extractSummaryTag(text: string): string {
-  const match = SUMMARY_TAG_PATTERN.exec(text);
-  return (match ? match[1] : text).trim();
+  const withoutAnalysis = text.replace(SUMMARY_ANALYSIS_TAG_PATTERN, '').trim();
+  const match = SUMMARY_TAG_PATTERN.exec(withoutAnalysis);
+  return (match ? match[1] : withoutAnalysis).trim();
 }
 
 interface ResolvedSummaryProvider {
@@ -3989,10 +4005,19 @@ export function planCompressionSummaryCalls(
   }
   const targetTokens = effectiveSummaryTargetTokens(methodConfig);
   const calls = buildSegmentedSummaryProviderCalls(request, methodConfig, settings);
-  const placeholder = (tokens: number): SegmentedSummaryNode => ({
-    summary: fitTextToTokenLimit('summary '.repeat(tokens), tokens),
-    sourceContents: []
-  });
+  const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
+  if (calls.length === 1 && (!priorSummaryText || tryBuildSinglePassSegmentedSummaryCall(request, sourceContents, methodConfig, settings))) {
+    return plan(1, 0);
+  }
+  const placeholderCache = new Map<number, string>();
+  const placeholder = (tokens: number): SegmentedSummaryNode => {
+    let summary = placeholderCache.get(tokens);
+    if (summary === undefined) {
+      summary = fitTextToTokenLimit('summary '.repeat(tokens), tokens);
+      placeholderCache.set(tokens, summary);
+    }
+    return { summary, sourceContents: [] };
+  };
   let nodes = calls.map((call) => placeholder(call.targetTokens));
   let mergeCalls = 0;
   for (let level = 0; nodes.length > 1; level += 1) {
@@ -4006,9 +4031,23 @@ export function planCompressionSummaryCalls(
     mergeCalls += groups.filter((group) => group.length > 1).length;
     nodes = groups.map((group) => group.length > 1 ? placeholder(targetTokens) : group[0]!);
   }
-  const priorSummaryText = request.priorSummaryContents?.length ? plainTextOfContents(request.priorSummaryContents) : '';
   if (nodes.length > 0 && priorSummaryText) mergeCalls += 1;
   return plan(calls.length, mergeCalls);
+}
+
+/**
+ * When the entire segmented delta plus `priorSummary` already fits inside one Provider window,
+ * generate the replacement summary directly in one pass instead of running a leaf pass followed by
+ * a sequential replacement-merge pass.
+ */
+function tryBuildSinglePassSegmentedSummaryCall(
+  request: LlmCompactRequest,
+  sourceContents: MessageContent[],
+  methodConfig: LlmCompressionConfigRecord,
+  settings: SummaryWindowSettings
+): SummaryProviderCall | undefined {
+  const call = buildSummaryProviderCall({ ...request, contents: sourceContents }, methodConfig, settings);
+  return isSummaryProviderCallWithinWindow(call, settings) ? call : undefined;
 }
 
 interface SegmentedSummaryChunk {
@@ -4619,11 +4658,11 @@ async function summarizeSingleRound(
   call: SummaryProviderCall,
   signal?: AbortSignal
 ): Promise<SummarizedSegmentNode> {
-  const fallback = deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
+  const fallback = (): string => deterministicReplacementSummary('', call.sourceContents, call.targetTokens);
   const candidate = await requestSummaryCandidate(resolved, call, signal);
   // Method changes belong to the durable coordinator, never a hidden leaf-level fallback.
   return {
-    summary: finalizeStructuredSummary(candidate, fallback, call.targetTokens),
+    summary: finalizeStructuredSummary(candidate, fallback, call.targetTokens, call.sourceContents),
     sourceContents: call.sourceContents,
     candidate,
     call
@@ -4908,7 +4947,7 @@ async function generateSummaryText(
   const text = extractSummaryTag((await executeSummaryProviderCall(resolved, call.request, signal)).trim());
   const summary = await shortenOversizedSummary(resolved, text, call, signal);
   return {
-    text: finalizeStructuredSummary(summary, fallback, targetTokens),
+    text: finalizeStructuredSummary(summary, fallback, targetTokens, request.contents),
     settings: resolved.settings
   };
 }
@@ -4985,6 +5024,9 @@ function deterministicReplacementSummary(
 
 function structuredSummaryFromContents(contents: MessageContent[]): StructuredSummary {
   const summary = emptyStructuredSummary();
+  for (const file of extractTouchedFilesFromContents(contents)) {
+    appendSummaryFact(summary, 'files', file);
+  }
   for (const content of contents) {
     for (const part of content.parts) {
       const rendered = renderSummaryPart(part).trim();
@@ -5008,6 +5050,57 @@ function structuredSummaryFromContents(contents: MessageContent[]): StructuredSu
   return summary;
 }
 
+const TOUCHED_FILE_ARGUMENT_KEYS = [
+  'path',
+  'filePath',
+  'file_path',
+  'targetFile',
+  'target_file',
+  'sourcePath',
+  'destinationPath',
+  'oldPath',
+  'newPath'
+] as const;
+
+function extractTouchedFilesFromContents(contents: readonly MessageContent[]): string[] {
+  const collected = new Set<string>();
+  const recordFile = (candidate: unknown): void => {
+    if (typeof candidate !== 'string') return;
+    const trimmed = candidate.trim().replace(/[),.;，。；]+$/, '');
+    if (!trimmed || trimmed.length > 512 || /\r|\n/.test(trimmed)) return;
+    collected.add(trimmed);
+  };
+  const inspectArgs = (args: unknown, depth = 0): void => {
+    if (!isRecord(args) || depth > 2) return;
+    for (const key of TOUCHED_FILE_ARGUMENT_KEYS) recordFile(args[key]);
+    for (const listKey of ['paths', 'files', 'edits'] as const) {
+      const list = args[listKey];
+      if (!Array.isArray(list)) continue;
+      for (const item of list.slice(0, 50)) {
+        if (typeof item === 'string') recordFile(item);
+        else inspectArgs(item, depth + 1);
+      }
+    }
+  };
+  for (const content of contents) {
+    for (const part of content.parts) {
+      if (isFunctionCallPart(part)) {
+        inspectArgs(part.functionCall.args);
+        continue;
+      }
+      if (isTextPart(part) && part.text.startsWith('{') && part.text.includes('"historical_tool_call"')) {
+        try {
+          const parsed = JSON.parse(part.text) as unknown;
+          if (isRecord(parsed) && parsed.kind === 'historical_tool_call') inspectArgs(parsed.arguments);
+        } catch {
+          // Malformed text parts are never fatal to deterministic file extraction.
+        }
+      }
+    }
+  }
+  return [...collected];
+}
+
 function structuredSummaryFromLooseText(text: string, fallbackField: StructuredSummaryField): StructuredSummary {
   const summary = emptyStructuredSummary();
   for (const fact of splitSummaryFacts(stripSummaryEnvelope(text))) {
@@ -5021,6 +5114,12 @@ function structuredSummaryFromLooseText(text: string, fallbackField: StructuredS
   return summary;
 }
 
+const SUMMARY_NONE_VALUES = new Set(['无', 'none', 'n/a', 'nil']);
+
+function isSummaryNonePlaceholder(value: string): boolean {
+  return SUMMARY_NONE_VALUES.has(value.trim().toLowerCase());
+}
+
 function parseStructuredSummary(text: string): StructuredSummary | undefined {
   const source = stripSummaryEnvelope(text);
   if (!isStructuredSummaryText(source)) return undefined;
@@ -5032,7 +5131,7 @@ function parseStructuredSummary(text: string): StructuredSummary | undefined {
     const heading = summaryHeading(line);
     if (heading) {
       field = heading.field;
-      if (heading.rest && heading.rest !== '无') appendSummaryFact(summary, field, heading.rest);
+      if (heading.rest && !isSummaryNonePlaceholder(heading.rest)) appendSummaryFact(summary, field, heading.rest);
       continue;
     }
     if (isWorkStatusHeading(line)) {
@@ -5041,26 +5140,58 @@ function parseStructuredSummary(text: string): StructuredSummary | undefined {
     }
     if (!field) continue;
     const fact = line.replace(/^[-*•]\s*/, '').trim();
-    if (fact && fact !== '无') appendSummaryFact(summary, field, fact);
+    if (fact && !isSummaryNonePlaceholder(fact)) appendSummaryFact(summary, field, fact);
   }
   return summary;
 }
 
+const SUMMARY_SECTION_HEADINGS: ReadonlyArray<readonly [string, StructuredSummaryField]> = [
+  ['重要约束、决定和准确标识', 'constraints'],
+  ['重要约束、决定和标识', 'constraints'],
+  ['重要约束与决定', 'constraints'],
+  ['重要约束', 'constraints'],
+  ['constraints, decisions, and exact identifiers', 'constraints'],
+  ['constraints & key decisions', 'constraints'],
+  ['constraints and decisions', 'constraints'],
+  ['key constraints', 'constraints'],
+  ['constraints', 'constraints'],
+  ['已完成', 'completed'],
+  ['completed', 'completed'],
+  ['done', 'completed'],
+  ['正在做', 'active'],
+  ['进行中', 'active'],
+  ['in progress', 'active'],
+  ['current progress', 'active'],
+  ['active', 'active'],
+  ['受阻', 'blocked'],
+  ['阻塞', 'blocked'],
+  ['blocked', 'blocked'],
+  ['blockers', 'blocked'],
+  ['下一步', 'next'],
+  ['后续步骤', 'next'],
+  ['next steps', 'next'],
+  ['next step', 'next'],
+  ['next', 'next'],
+  ['相关文件', 'files'],
+  ['涉及文件', 'files'],
+  ['relevant files', 'files'],
+  ['key files', 'files'],
+  ['modified files', 'files'],
+  ['files', 'files'],
+  ['目标', 'goals'],
+  ['任务目标', 'goals'],
+  ['goals', 'goals'],
+  ['goal', 'goals'],
+  ['objectives', 'goals'],
+  ['objective', 'goals']
+];
+
 function summaryHeading(line: string): { field: StructuredSummaryField; rest: string } | undefined {
   const normalized = summaryHeadingText(line).replace(/[：:]\s*/, ':');
-  const headings: Array<[string, StructuredSummaryField]> = [
-    ['重要约束、决定和准确标识', 'constraints'],
-    ['重要约束、决定和标识', 'constraints'],
-    ['已完成', 'completed'],
-    ['正在做', 'active'],
-    ['受阻', 'blocked'],
-    ['下一步', 'next'],
-    ['相关文件', 'files'],
-    ['目标', 'goals']
-  ];
-  for (const [heading, field] of headings) {
-    if (normalized === heading || normalized === `${heading}:`) return { field, rest: '' };
-    if (normalized.startsWith(`${heading}:`)) return { field, rest: normalized.slice(heading.length + 1).trim() };
+  const lower = normalized.toLowerCase();
+  for (const [heading, field] of SUMMARY_SECTION_HEADINGS) {
+    if (lower === heading || lower === `${heading}:`) return { field, rest: '' };
+    if (lower.startsWith(`${heading}:`)) return { field, rest: normalized.slice(heading.length + 1).trim() };
   }
   return undefined;
 }
@@ -5094,13 +5225,34 @@ function summaryHeadingText(line: string): string {
 
 /** 工作状态 only groups 已完成 / 正在做 / 受阻 and holds no facts of its own. */
 function isWorkStatusHeading(line: string): boolean {
-  return /^工作状态[：:]?$/.test(summaryHeadingText(line));
+  return /^(?:工作状态|work\s+status|current\s+status)[：:]?$/i.test(summaryHeadingText(line));
 }
 
 function isStructuredSummaryText(text: string): boolean {
   const source = stripSummaryEnvelope(text);
-  return ['目标', '重要约束、决定', '工作状态', '已完成', '正在做', '受阻', '下一步', '相关文件']
-    .every((heading) => source.includes(heading));
+  const matchedFields = new Set<string>();
+  for (const rawLine of source.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const heading = summaryHeading(line);
+    if (heading) {
+      matchedFields.add(heading.field);
+      if (matchedFields.size >= 2) return true;
+      continue;
+    }
+    if (isWorkStatusHeading(line)) {
+      matchedFields.add('work_status');
+      if (matchedFields.size >= 2) return true;
+    }
+  }
+  return false;
+}
+
+function hasFilesSummarySection(text: string): boolean {
+  for (const rawLine of stripSummaryEnvelope(text).split(/\r?\n/)) {
+    if (summaryHeading(rawLine.trim())?.field === 'files') return true;
+  }
+  return false;
 }
 
 /**
@@ -5111,12 +5263,24 @@ function isStructuredSummaryText(text: string): boolean {
  * （shortenOversizedSummary），仍超出才按条目机械删减。
  * 模型没按标题输出（例如拒答）或各节全是“无”时，才退回逐条抽取的确定性摘要。
  */
-function finalizeStructuredSummary(candidate: string, fallback: string | (() => string), targetTokens: number): string {
+function finalizeStructuredSummary(
+  candidate: string,
+  fallback: string | (() => string),
+  targetTokens: number,
+  sourceContents?: readonly MessageContent[]
+): string {
   requireSummaryVisibleOutput(candidate);
   const parsed = parseStructuredSummary(candidate);
   if (parsed && structuredSummaryFactCount(parsed) > 0) {
-    const text = modelSummaryText(candidate);
-    return estimateTokenCount(text) <= summaryBodyBudget(targetTokens) ? text : fitStructuredSummary(parsed, targetTokens);
+    const touchedFiles = sourceContents && parsed.files.length === 0 ? extractTouchedFilesFromContents(sourceContents) : [];
+    for (const file of touchedFiles) appendSummaryFact(parsed, 'files', file);
+    let text = modelSummaryText(candidate);
+    const budget = summaryBodyBudget(targetTokens);
+    if (touchedFiles.length > 0 && !hasFilesSummarySection(candidate)) {
+      const withFiles = `${text}\n\n相关文件\n${parsed.files.slice(0, 30).map((file) => `- ${file}`).join('\n')}`;
+      if (estimateTokenCount(withFiles) <= budget) text = withFiles;
+    }
+    return estimateTokenCount(text) <= budget ? text : fitStructuredSummary(parsed, targetTokens);
   }
   // Successful model summaries never need the full source transcript's deterministic extraction.
   const fallbackText = typeof fallback === 'function' ? fallback() : fallback;
@@ -5317,9 +5481,12 @@ function fitTextToTokenLimit(text: string, limit: number): string {
   if (estimateTokenCount(text) <= normalizedLimit) return text;
   let end = normalizedLimit;
   let sliced = sliceByTokens(text, 0, end);
-  while (end > 0 && estimateTokenCount(sliced) > normalizedLimit) {
-    end -= 1;
-    sliced = sliceByTokens(text, 0, end);
+  let estimated = estimateTokenCount(sliced);
+  while (end > 0 && estimated > normalizedLimit) {
+    const scaled = Math.floor((end * normalizedLimit) / estimated);
+    end = Math.max(0, Math.min(end - 1, scaled));
+    sliced = end > 0 ? sliceByTokens(text, 0, end) : '';
+    estimated = sliced ? estimateTokenCount(sliced) : 0;
   }
   return sliced;
 }

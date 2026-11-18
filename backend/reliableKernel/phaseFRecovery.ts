@@ -116,10 +116,17 @@ export class PhaseFRecoveryScanner {
   }
 
   private async settleInterruptedTaskWaits(signal: AbortSignal | undefined, context: PhaseFScanContext): Promise<void> {
-    const operations = (await Promise.all(['child_execution', CHILD_INTENT_ANSWER_WAIT_OWNER_KIND, CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
-      LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND].map(owner_kind => listAllDomainRows(this.database, 'Operation', {
-      owner_kind, status: 'waiting_answer'
-    })))).flat().filter(operation => operation.tool_call_id !== null);
+    const taskWaitOwnerKinds = new Set([
+      'child_execution',
+      CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
+      CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+      LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND
+    ]);
+    const operations = (await listAllDomainRows(this.database, 'Operation', {
+      status: 'waiting_answer'
+    })).filter((operation) =>
+      operation.tool_call_id !== null && taskWaitOwnerKinds.has(String(operation.owner_kind))
+    );
     const toolCallIds = [...new Set(operations.map(operation => String(operation.tool_call_id)))];
     const conversations = await this.conversationByToolCallId(toolCallIds);
     for (const toolCallId of toolCallIds) {

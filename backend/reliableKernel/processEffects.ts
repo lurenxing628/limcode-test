@@ -970,10 +970,14 @@ export class ProcessControlPlane {
   public async cleanupArchivedSpools(signal?: AbortSignal): Promise<ProcessSpoolCleanupReport> {
     signal?.throwIfAborted();
     await this.validateBinding();
-    const [processRows, receiptRows, mismatches] = await Promise.all([
+    const [processRows, receiptRows, mismatches, spoolEntries] = await Promise.all([
       listAllDomainRows(this.database, 'Process'),
       listAllDomainRows(this.database, 'ProcessReceipt'),
-      this.database.processOutputRegistrationMismatches()
+      this.database.processOutputRegistrationMismatches(),
+      fs.readdir(processSpoolRoot(this.binding)).then(
+        (entries) => new Set(entries),
+        (error) => isNotFound(error) ? new Set<string>() : undefined
+      )
     ]);
     const receiptsByProcess = new Map<string, DomainRow[]>();
     for (const receipt of receiptRows) {
@@ -1006,6 +1010,12 @@ export class ProcessControlPlane {
           } catch (error) {
             console.warn(`[reliable-kernel] retained incomplete process spool ${processId}:`, errorMessage(error));
             return 'failed';
+          }
+        } else if (spoolEntries !== undefined) {
+          const locator = typeof processRow.spool_locator === 'string' ? processRow.spool_locator.trim() : '';
+          const firstSegment = locator.split(/[\\/]/)[0] ?? '';
+          if (firstSegment && firstSegment !== '.' && firstSegment !== '..' && !spoolEntries.has(firstSegment)) {
+            return 'alreadyAbsent';
           }
         }
         try {

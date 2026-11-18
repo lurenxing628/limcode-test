@@ -109,22 +109,16 @@ export class WebviewBridge {
   }
 
   private captureTransportState(message: ExtensionToWebviewMessage): void {
-    const currentState = this.host.getState<BridgePersistedState>() ?? {};
-    const nextState: BridgePersistedState = { ...currentState };
-    let changed = false;
-
     if (message.clientId && message.clientId !== this.sessionId) {
       this.sessionId = message.clientId;
     }
 
     const meta = message.type === BridgeMessageType.Hello ? message.payload?.meta : undefined;
-    if (meta && !sameMeta(currentState.meta, meta)) {
-      nextState.meta = meta;
-      changed = true;
-    }
+    if (!meta) return;
 
-    if (changed) {
-      this.host.setState<BridgePersistedState>(nextState);
+    const currentState = this.host.getState<BridgePersistedState>() ?? {};
+    if (!sameMeta(currentState.meta, meta)) {
+      this.host.setState<BridgePersistedState>({ ...currentState, meta });
     }
   }
 

@@ -63,6 +63,7 @@ import {
   projectOrdinaryModelContents,
   projectOrdinaryModelContentsWork,
   preserveCanonicalModelContentsWork,
+  projectSummaryModelSegments,
   projectSummaryModelWindow,
   withSummaryDispatchRefs,
   stripNativeConfigurationUpdates,
@@ -1880,16 +1881,25 @@ function compressionContext(
       modelHandleCatalog
     };
   }
+  if (methodKind === 'segmented_summary') {
+    const projected = projectSummaryModelSegments(
+      segments,
+      modelHandleCatalog,
+      createManagedMediaBodyProjectionState()
+    );
+    return {
+      contents: projected.window.contents,
+      segments: projected.segments.filter((segment) => segment.length > 0),
+      priorSummaryContents,
+      ...(systemInstruction ? { systemInstruction } : {}),
+      attachmentCatalogState,
+      modelHandleCatalog
+    };
+  }
   const contentsMediaState = createManagedMediaBodyProjectionState();
-  const segmentsMediaState = createManagedMediaBodyProjectionState();
   return {
     contents: projectSummaryModelWindow(contents, modelHandleCatalog, contentsMediaState).contents,
-    // The complete projection above validates every part and managed-media occurrence. Only
-    // segmented summaries consume the second view; ordinary summaries discard it entirely.
-    segments: methodKind === 'segmented_summary'
-      ? segments.map((segment) =>
-          projectSummaryModelWindow(segment, modelHandleCatalog, segmentsMediaState).contents)
-      : [],
+    segments: [],
     priorSummaryContents,
     ...(systemInstruction ? { systemInstruction } : {}),
     attachmentCatalogState,

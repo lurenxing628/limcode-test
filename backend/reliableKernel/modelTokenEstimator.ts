@@ -52,13 +52,68 @@ export function hasOpaqueProviderCompaction(contents: readonly MessageContent[])
     || (Array.isArray(content.parts) && content.parts.some((part) => 'providerContext' in part && opaque(part.providerContext))));
 }
 
+const TEXT_TOKEN_CACHE_LIMIT = 2_048;
+const TEXT_TOKEN_CACHE_MIN_CHARS = 128;
+const TEXT_TOKEN_CACHE_MAX_CHARS = 262_144;
+const textTokenEstimateCache = new Map<string, number>();
+
 export function estimateTextTokens(text: string): number {
   if (!text) return 0;
+  const cacheable = text.length >= TEXT_TOKEN_CACHE_MIN_CHARS && text.length <= TEXT_TOKEN_CACHE_MAX_CHARS;
+  if (cacheable) {
+    const cached = textTokenEstimateCache.get(text);
+    if (cached !== undefined) {
+      textTokenEstimateCache.delete(text);
+      textTokenEstimateCache.set(text, cached);
+      return cached;
+    }
+  }
   const estimated = estimateTokenCount(text);
-  return Number.isFinite(estimated) && estimated > 0 ? Math.ceil(estimated) : 0;
+  const result = Number.isFinite(estimated) && estimated > 0 ? Math.ceil(estimated) : 0;
+  if (cacheable) {
+    textTokenEstimateCache.set(text, result);
+    if (textTokenEstimateCache.size > TEXT_TOKEN_CACHE_LIMIT) {
+      const oldestKey = textTokenEstimateCache.keys().next().value;
+      if (oldestKey !== undefined) textTokenEstimateCache.delete(oldestKey);
+    }
+  }
+  return result;
+}
+
+const frozenJsonTokenCache = new WeakMap<object, number>();
+
+function isDeeplyFrozenPlainJson(value: unknown, seen = new WeakSet<object>()): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true;
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value !== 'object') return false;
+  if (!Object.isFrozen(value) || seen.has(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) {
+      if (!isDeeplyFrozenPlainJson(value[i], seen)) return false;
+    }
+    return true;
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record);
+  for (let i = 0; i < keys.length; i += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(record, keys[i]!);
+    if (!descriptor || !('value' in descriptor)) return false;
+    if (!isDeeplyFrozenPlainJson(descriptor.value, seen)) return false;
+  }
+  return true;
 }
 
 export function estimateJsonTokens(value: unknown): number {
+  if (value !== null && typeof value === 'object' && Object.isFrozen(value)) {
+    const cached = frozenJsonTokenCache.get(value);
+    if (cached !== undefined) return cached;
+    const result = estimateTextTokens(safeJsonString(value));
+    if (isDeeplyFrozenPlainJson(value)) frozenJsonTokenCache.set(value, result);
+    return result;
+  }
   return estimateTextTokens(safeJsonString(value));
 }
 

@@ -121,7 +121,11 @@ const displayEntries = computed(() => {
     .sort((left, right) => right.updatedAt - left.updatedAt);
 });
 const historyForest = computed(() => buildConversationHistoryForest(displayEntries.value, originLinks.value));
+const flattenedHistoryNodes = computed(() => allHistoryNodes(historyForest.value));
 const originLinkByConversationId = computed(() => selectConversationOriginLinks(originLinks.value));
+const openConversationById = computed(() => new Map(
+  openConversations.value.map((item) => [item.conversationId, item] as const)
+));
 const visibleHistoryNodes = computed(() => flattenVisibleHistoryNodesWithIntent({
   forest: historyForest.value,
   expandedIds: expandedConversationIds.value,
@@ -577,7 +581,7 @@ function displayConversationTitle(entry: SidebarConversationHistoryEntry | undef
 }
 
 function openConversationState(entry: SidebarConversationHistoryEntry): OpenConversationPanelRecord | undefined {
-  return openConversations.value.find((item) => item.conversationId === entry.id);
+  return openConversationById.value.get(entry.id);
 }
 
 function openConversationClass(entry: SidebarConversationHistoryEntry): string | undefined {
@@ -595,14 +599,19 @@ function escapeHtml(value: string): string {
     .replace(/'/g, '&#39;');
 }
 
+const sameDayTimeFormatter = new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' });
+const otherDayDateFormatter = new Intl.DateTimeFormat('zh-CN', { month: '2-digit', day: '2-digit' });
+
 function formatTime(value: number | undefined): string {
   if (!value) return '未开始';
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return '未开始';
   const now = new Date();
-  const sameDay = date.toDateString() === now.toDateString();
-  if (sameDay) return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
-  return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  if (sameDay) return sameDayTimeFormatter.format(date);
+  return otherDayDateFormatter.format(date);
 }
 
 function displayProjectUri(uri: string): string {
@@ -655,7 +664,7 @@ function ensureActiveConversationAncestorsExpanded(): void {
   }
 
   const result = expandActiveConversationAncestors({
-    nodes: allHistoryNodes(historyForest.value),
+    nodes: flattenedHistoryNodes.value,
     activeConversationId,
     expandedIds: expandedConversationIds.value,
     userCollapsedIds: userCollapsedConversationIds.value,
@@ -670,7 +679,7 @@ function ensureActiveConversationAncestorsExpanded(): void {
 }
 
 function ensureNewActiveAgentAncestorsExpanded(): void {
-  const nodes = allHistoryNodes(historyForest.value);
+  const nodes = flattenedHistoryNodes.value;
   const result = expandNewlyActiveAgentAncestors({
     nodes,
     expandedIds: expandedConversationIds.value,

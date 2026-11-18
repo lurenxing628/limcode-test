@@ -1792,6 +1792,17 @@ export function withSummaryDispatchRefs(
   }));
 }
 
+const RECENT_SUMMARY_TOOL_BATCHES = 3;
+const OLDER_SUMMARY_TOOL_MAX_TOKENS = 512;
+const HIGH_SIGNAL_SUMMARY_TOOLS = new Set([
+  'skills',
+  'run_agent',
+  'query_agent',
+  'ask_user',
+  'submit_plan',
+  'update_task_list'
+]);
+
 /** Summary input keeps the first unique managed media body so the compression capability can
  * produce a reusable semantic observation before replacing bytes with text. Historical tool calls
  * remain readable descriptors and nested tool-response media is lifted beside that descriptor. */
@@ -1800,37 +1811,88 @@ export function projectSummaryModelWindow(
   modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
   mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
 ): ModelWindowProjection {
-  const ordinary = projectOrdinaryModelWindow(contents, modelHandleCatalogInput, mediaState);
-  const projected = ordinary.contents
-    .map((content): MessageContent => ({
+  return projectSummaryModelSegments([contents], modelHandleCatalogInput, mediaState).window;
+}
+
+export function projectSummaryModelSegments(
+  segments: readonly (readonly MessageContent[])[],
+  modelHandleCatalogInput: ReadonlyModelHandleCatalog | unknown = { entries: [] },
+  mediaState: ManagedMediaBodyProjectionState = createManagedMediaBodyProjectionState()
+): { window: ModelWindowProjection; segments: MessageContent[][] } {
+  const flatContents: MessageContent[] = [];
+  const segmentLengths: number[] = [];
+  for (const segment of segments) {
+    segmentLengths.push(segment.length);
+    for (const content of segment) flatContents.push(content);
+  }
+  const ordinary = projectOrdinaryModelWindow(flatContents, modelHandleCatalogInput, mediaState);
+  const recentToolContentIndices = selectRecentSummaryToolContentIndices(ordinary.contents);
+  const projectedByContent = ordinary.contents.map((content, index): MessageContent => {
+    const toolBudget = recentToolContentIndices.has(index) ? TOOL_RESULT_MAX_TOKENS : OLDER_SUMMARY_TOOL_MAX_TOKENS;
+    return {
       role: content.role,
-      parts: content.parts.flatMap(summaryParts)
-    }))
-    // A carrier left empty by a dropped transport-only update contributes nothing to the summary.
-    .filter((content) => content.parts.length > 0);
+      parts: content.parts.flatMap((part) => summaryParts(part, toolBudget))
+    };
+  });
+  const projectedSegments: MessageContent[][] = [];
+  const projectedFlat: MessageContent[] = [];
+  let cursor = 0;
+  for (const length of segmentLengths) {
+    const slice = projectedByContent
+      .slice(cursor, cursor + length)
+      // A carrier left empty by a dropped transport-only update contributes nothing to the summary.
+      .filter((content) => content.parts.length > 0);
+    cursor += length;
+    projectedSegments.push(slice);
+    for (const content of slice) projectedFlat.push(content);
+  }
   return {
-    contents: projected,
-    tokenCount: estimateMessageContentsTokens(projected),
-    mediaTokens: estimateMessageContentsMediaTokens(projected),
-    toolResultBatches: ordinary.toolResultBatches,
-    mandatoryBatchOverTarget: ordinary.mandatoryBatchOverTarget,
-    uniqueManagedMediaBodyCount: ordinary.uniqueManagedMediaBodyCount,
-    suppressedManagedMediaBodyCount: ordinary.suppressedManagedMediaBodyCount
+    window: {
+      contents: projectedFlat,
+      tokenCount: estimateMessageContentsTokens(projectedFlat),
+      mediaTokens: estimateMessageContentsMediaTokens(projectedFlat),
+      toolResultBatches: ordinary.toolResultBatches,
+      mandatoryBatchOverTarget: ordinary.mandatoryBatchOverTarget,
+      uniqueManagedMediaBodyCount: ordinary.uniqueManagedMediaBodyCount,
+      suppressedManagedMediaBodyCount: ordinary.suppressedManagedMediaBodyCount
+    },
+    segments: projectedSegments
   };
 }
 
-function summaryParts(part: ContentPart): ContentPart[] {
+function selectRecentSummaryToolContentIndices(contents: readonly MessageContent[]): Set<number> {
+  const toolGroups = groupAtomicMessageContentRanges(contents).filter(
+    (group) => group.kind === 'tool_exchange' || group.kind === 'tool_results'
+  );
+  const recent = new Set<number>();
+  const startGroup = Math.max(0, toolGroups.length - RECENT_SUMMARY_TOOL_BATCHES);
+  for (let groupIndex = startGroup; groupIndex < toolGroups.length; groupIndex += 1) {
+    const group = toolGroups[groupIndex];
+    for (let index = group.startIndex; index < group.endIndexExclusive; index += 1) {
+      recent.add(index);
+    }
+  }
+  return recent;
+}
+
+function effectiveSummaryToolMaxTokens(toolName: string, defaultBudget: number): number {
+  return HIGH_SIGNAL_SUMMARY_TOOLS.has(toolName) ? TOOL_RESULT_MAX_TOKENS : defaultBudget;
+}
+
+function summaryParts(part: ContentPart, defaultToolMaxTokens = TOOL_RESULT_MAX_TOKENS): ContentPart[] {
   const dispatchRef = (part as SummaryDispatchPart).summaryDispatchRef;
   if ('functionCall' in part) {
+    const maxTokens = effectiveSummaryToolMaxTokens(part.functionCall.name, defaultToolMaxTokens);
     return [{ text: stableJson({
       kind: 'historical_tool_call',
       ...(part.id ? { callId: part.id } : {}),
       ...(dispatchRef ? { dispatchRef } : {}),
       toolName: part.functionCall.name,
-      arguments: boundedValueDescriptor(part.functionCall.args, TOOL_RESULT_MAX_TOKENS)
+      arguments: boundedValueDescriptor(part.functionCall.args, maxTokens)
     }) }];
   }
   if ('functionResponse' in part) {
+    const maxTokens = effectiveSummaryToolMaxTokens(part.functionResponse.name, defaultToolMaxTokens);
     // A text result (a loaded skill) keeps its head up to a line boundary: the summary writer needs
     // the skill's opening and step list, and the skill itself is re-attached after the compression.
     const text = readModelTextToolResponse(part.functionResponse.response);
@@ -1843,12 +1905,12 @@ function summaryParts(part: ContentPart): ContentPart[] {
         toolName: part.functionResponse.name,
         result: text
           ? modelTextToolResponse(
-              measure(text.text) <= TOOL_RESULT_MAX_TOKENS
+              measure(text.text) <= maxTokens
                 ? text.text
-                : textHeadWithinTokens(text.text, TOOL_RESULT_MAX_TOKENS, measure),
+                : textHeadWithinTokens(text.text, maxTokens, measure),
               text.error
             )
-          : boundedValueDescriptor(part.functionResponse.response, TOOL_RESULT_MAX_TOKENS)
+          : boundedValueDescriptor(part.functionResponse.response, maxTokens)
       }) },
       ...(part.functionResponse.parts ?? []).map((media) => cloneJsonValue(media) as InlineDataPart)
     ];
@@ -2279,6 +2341,10 @@ function readPartialFirstLinePreview(
 function boundedValueDescriptor(value: unknown, maxTokens: number): unknown {
   const originalTokens = estimateJsonTokens(value);
   if (originalTokens <= maxTokens) return cloneJsonValue(value);
+  const record = asRecord(value);
+  if (record && record.truncated === true && typeof record.preview === 'string') {
+    return shrinkTruncatedPreviewRecord(record, record.preview, originalTokens, maxTokens);
+  }
   const serialized = stableJson(value);
   const base = {
     truncated: true,
@@ -2286,16 +2352,90 @@ function boundedValueDescriptor(value: unknown, maxTokens: number): unknown {
     originalTokens,
     preview: ''
   };
+  return fitPreviewInRecord(base, serialized, originalTokens, maxTokens);
+}
+
+function shrinkTruncatedPreviewRecord(
+  record: Record<string, unknown>,
+  preview: string,
+  originalTokens: number,
+  maxTokens: number
+): unknown {
+  const cloned = cloneJsonValue(record) as Record<string, unknown>;
+  const withoutPreview = { ...cloned, preview: '' };
+  if (estimateJsonTokens(withoutPreview) > maxTokens) {
+    return {
+      truncated: true,
+      ...(typeof record.status === 'string' ? { status: record.status } : {}),
+      ...(record.rereadHint !== undefined ? { rereadHint: cloneJsonValue(record.rereadHint) } : {}),
+      preview: ''
+    };
+  }
+  return fitPreviewInRecord(withoutPreview, preview, originalTokens, maxTokens);
+}
+
+function fitPreviewInRecord(
+  base: Record<string, unknown>,
+  sourceText: string,
+  sourceTokens: number,
+  maxTokens: number
+): Record<string, unknown> {
+  const baseTokens = estimateJsonTokens(base);
+  if (baseTokens >= maxTokens || sourceText.length === 0) return base;
+  const availableTokens = Math.max(1, maxTokens - baseTokens);
+  // Narrow the search interval proportionally first instead of running 18 full JSON+tokenx probes.
+  const initialGuess = Math.min(
+    sourceText.length,
+    Math.max(1, Math.floor((sourceText.length * availableTokens) / Math.max(1, sourceTokens)))
+  );
   let low = 0;
-  let high = serialized.length;
-  let best: unknown = base;
+  let high = sourceText.length;
+  let best: Record<string, unknown> = base;
+  const fits = (length: number): Record<string, unknown> | undefined => {
+    const candidate = { ...base, preview: headTailPreview(sourceText, length) };
+    return estimateJsonTokens(candidate) <= maxTokens ? candidate : undefined;
+  };
+  const guessCandidate = fits(initialGuess);
+  if (guessCandidate) {
+    best = guessCandidate;
+    low = initialGuess + 1;
+    let step = Math.max(64, Math.floor(initialGuess * 0.25));
+    while (low <= high) {
+      const probe = Math.min(high, low + step - 1);
+      const probed = fits(probe);
+      if (probed) {
+        best = probed;
+        low = probe + 1;
+        step *= 2;
+      } else {
+        high = probe - 1;
+        break;
+      }
+    }
+  } else {
+    high = initialGuess - 1;
+    let step = Math.max(64, Math.floor(initialGuess * 0.25));
+    while (low <= high) {
+      const probe = Math.max(low, high - step + 1);
+      const probed = fits(probe);
+      if (probed) {
+        best = probed;
+        low = probe + 1;
+        break;
+      }
+      high = probe - 1;
+      step *= 2;
+    }
+  }
   while (low <= high) {
     const length = Math.floor((low + high) / 2);
-    const candidate = { ...base, preview: headTailPreview(serialized, length) };
-    if (estimateJsonTokens(candidate) <= maxTokens) {
+    const candidate = fits(length);
+    if (candidate) {
       best = candidate;
       low = length + 1;
-    } else high = length - 1;
+    } else {
+      high = length - 1;
+    }
   }
   return best;
 }

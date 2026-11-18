@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed } from 'vue';
-import { displayConversationTitle } from '@shared/conversationTitle';
+import { displayConversationTitle, hasExplicitConversationTitle } from '@shared/conversationTitle';
 import { useClientStateStore } from '@webview/stores/useClientStateStore';
 import { useSessionStore } from '@webview/stores/useSessionStore';
 import { useReliableConversation } from '@webview/composables/useReliableConversation';
@@ -35,13 +35,21 @@ const latestModelRequest = computed(() => Object.values(records.value.ModelReque
 const title = computed(() => {
   const id = conversationId.value;
   if (!id) return '正在初始化对话…';
+  const rawTitle = typeof conversation.value?.title === 'string' ? conversation.value.title : undefined;
+  if (hasExplicitConversationTitle(rawTitle, id)) {
+    return displayConversationTitle({
+      id,
+      title: rawTitle,
+      fallbackTitle: session.conversationTitle
+    });
+  }
   const messages = reliableConversation.projection.value.messages;
   // The client feed keeps only a bounded tail. A tail-local "first" user message is not the
   // conversation's canonical first user message, so defer to the Host projection unless seq=1 is present.
   const includesConversationStart = messages.length === 0 || messages.some((message) => message.seq === 1);
   return displayConversationTitle({
     id,
-    title: typeof conversation.value?.title === 'string' ? conversation.value.title : undefined,
+    title: rawTitle,
     messages: includesConversationStart ? messages : undefined,
     fallbackTitle: session.conversationTitle
   });

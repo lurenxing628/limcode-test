@@ -12,7 +12,15 @@ const RECIPE_TYPE = 'application/vnd.limcode.model-request-recipe+json';
 const CONTROL_TYPE = 'application/vnd.limcode.model-stream-checkpoint+json';
 const MAX_RECIPE_BYTES = 2 * 1024 * 1024;
 const MAX_CONTROL_BYTES = 64 * 1024;
-const CACHE_ENTRIES = 128;
+const CACHE_ENTRIES = 512;
+
+interface CachedResponseMeasurement {
+  identity: string;
+  verifiedGeneration: string;
+  permanent: boolean;
+  controlKey?: string;
+  measurement: SingleResponseMeasurement | null;
+}
 
 /** Cheap selection only, never evidence that a request was ordinary. */
 export function needsSingleResponseMeasurement(request: DomainRow): boolean {
@@ -40,10 +48,17 @@ export function needsSingleResponseMeasurement(request: DomainRow): boolean {
  * can override that label. Missing or ambiguous evidence leaves the existing unknown untouched.
  */
 export class SingleResponseMeasurementReader {
-  private generation = '';
-  private readonly cache = new Map<string, { identity: string; measurement: SingleResponseMeasurement }>();
+  private readonly cache = new Map<string, CachedResponseMeasurement>();
+  private readonly authorityJsonCache = new Map<string, DomainRow | null>();
 
   public constructor(private readonly database: Database.Database, private readonly content: ClientProjectionContentAccess) {}
+
+  private rememberCache(id: string, entry: CachedResponseMeasurement): SingleResponseMeasurement | undefined {
+    this.cache.delete(id);
+    while (this.cache.size >= CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value!);
+    this.cache.set(id, entry);
+    return entry.measurement ? structuredClone(entry.measurement) : undefined;
+  }
 
   public read(request: DomainRow): SingleResponseMeasurement | undefined {
     if (!needsSingleResponseMeasurement(request) || typeof request.id !== 'string'
@@ -56,12 +71,14 @@ export class SingleResponseMeasurementReader {
     // instance AND the worker-owned verified CAS capability, never to a bare path or request id.
     const generation = `${(prepareCached(this.database, 'PRAGMA data_version').get() as { data_version: number | bigint }).data_version}:${
       (prepareCached(this.database, 'SELECT total_changes() AS value').get() as { value: number | bigint }).value}`;
-    if (this.generation !== generation) { this.cache.clear(); this.generation = generation; }
     const key = singleResponseMeasurementIdentity(current);
     const cached = this.cache.get(request.id);
     if (cached?.identity === key) {
-      this.cache.delete(request.id); this.cache.set(request.id, cached);
-      return structuredClone(cached.measurement);
+      if (cached.verifiedGeneration === generation || cached.permanent) {
+        this.cache.delete(request.id);
+        this.cache.set(request.id, cached);
+        return cached.measurement ? structuredClone(cached.measurement) : undefined;
+      }
     }
     const controls = prepareCached(this.database, `SELECT * FROM model_stream_checkpoint
       WHERE model_request_id = ? AND checkpoint_kind = 'native_control'
@@ -69,36 +86,57 @@ export class SingleResponseMeasurementReader {
     const nativeCall = prepareCached(this.database, `SELECT id FROM model_stream_checkpoint
       WHERE model_request_id = ? AND checkpoint_kind = 'native_tool_call' LIMIT 1`).get(request.id);
     const fences = prepareCached(this.database, 'SELECT * FROM model_stream_fence WHERE model_request_id = ? LIMIT 2').all(request.id) as DomainRow[];
+    const controlKey = `${fences.length}:${String(fences[0]?.id ?? '')}:${String(fences[0]?.outcome ?? '')}:${String(fences[0]?.terminal_stream_seq ?? '')}:${nativeCall ? '1' : '0'}:${controls.map((c) => `${String(c.id)}:${String(c.stream_seq)}:${String(c.content_object_id)}`).join(',')}`;
+    if (cached?.identity === key && cached.controlKey === controlKey) {
+      cached.verifiedGeneration = generation;
+      this.cache.delete(request.id);
+      this.cache.set(request.id, cached);
+      return cached.measurement ? structuredClone(cached.measurement) : undefined;
+    }
     const recipeMetadata = this.metadata(request.recipe_object_id);
     const authority = row(prepareCached(this.database, 'SELECT * FROM authority_snapshot WHERE id = ?').get(request.authority_snapshot_id));
     if (controls.length !== 2 || nativeCall || fences.length !== 1
       || !recipeMetadata || !authority || authority.turn_id !== current.turn_id
-      || typeof authority.content_object_id !== 'string') return undefined;
+      || typeof authority.content_object_id !== 'string') {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const stats = measurementRecord(current.stream_stats_json)!;
     const fence = fences[0];
     if (fence.model_request_id !== current.id || String(fence.attempt_seq) !== stats.attemptSeq
-      || String(fence.socket_generation) !== stats.socketGeneration || fence.outcome !== 'completed') return undefined;
+      || String(fence.socket_generation) !== stats.socketGeneration || fence.outcome !== 'completed') {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     controls.sort((a, b) => BigInt(String(a.stream_seq)) < BigInt(String(b.stream_seq)) ? -1 : 1);
     if (controls.some(control => control.model_request_id !== current.id
       || String(control.attempt_seq) !== stats.attemptSeq || String(control.socket_generation) !== stats.socketGeneration
-      || BigInt(String(control.stream_seq)) >= BigInt(String(fence.terminal_stream_seq)))) return undefined;
+      || BigInt(String(control.stream_seq)) >= BigInt(String(fence.terminal_stream_seq)))) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const recipe = this.readJson(recipeMetadata, RECIPE_TYPE, MAX_RECIPE_BYTES);
     if (!recipe || recipe.kind !== 'reliable-agent-turn' || recipe.nativeResponses !== undefined
-      || recipe.nativeLogicalBudget !== undefined || recipe.nativeErrorRecovery !== undefined) return undefined;
+      || recipe.nativeLogicalBudget !== undefined || recipe.nativeErrorRecovery !== undefined) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: true, controlKey, measurement: null });
+    }
     const createdMeta = this.metadata(String(controls[0].content_object_id));
     const completedMeta = this.metadata(String(controls[1].content_object_id));
     const authorityMeta = this.metadata(authority.content_object_id);
-    if (!createdMeta || !completedMeta || !authorityMeta) return undefined;
+    if (!createdMeta || !completedMeta || !authorityMeta) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     // Authority is verified immutable data, not the channel settings currently selected in the UI.
-    const document = this.readJson(authorityMeta, 'application/vnd.limcode.turn-authority-snapshot+json', MAX_RECIPE_BYTES);
+    const document = this.readAuthorityJson(authority.content_object_id, authorityMeta);
     const model = measurementRecord(document?.model);
     if (!model || model.provider !== 'openai-responses' || model.providerConfigId !== current.provider_id
-      || model.modelId !== current.model_id || (model.openaiResponsesTransport !== undefined && model.openaiResponsesTransport !== 'http')) return undefined;
+      || model.modelId !== current.model_id || (model.openaiResponsesTransport !== undefined && model.openaiResponsesTransport !== 'http')) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: true, controlKey, measurement: null });
+    }
     const createdEnvelope = this.readJson(createdMeta, CONTROL_TYPE, MAX_CONTROL_BYTES);
     const completedEnvelope = this.readJson(completedMeta, CONTROL_TYPE, MAX_CONTROL_BYTES);
     if (createdEnvelope?.kind !== 'native_control' || completedEnvelope?.kind !== 'native_control'
       || createdEnvelope.streamSeq !== String(controls[0].stream_seq)
-      || completedEnvelope.streamSeq !== String(controls[1].stream_seq)) return undefined;
+      || completedEnvelope.streamSeq !== String(controls[1].stream_seq)) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const created = measurementRecord(createdEnvelope.content);
     const completed = measurementRecord(completedEnvelope.content);
     const capabilities = measurementRecord(created?.capabilities);
@@ -109,32 +147,57 @@ export class SingleResponseMeasurementReader {
       || !capabilities || Object.keys(capabilities).length !== capabilityFields.length
       || capabilityFields.some(key => typeof capabilities[key] !== 'boolean')
       || nativeSessionCapabilities(capabilities) || created.admittedToolResultCallIds !== undefined
-      || completed.requiredInput !== undefined || completed.reason !== undefined) return undefined;
+      || completed.requiredInput !== undefined || completed.reason !== undefined) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const raw = measurementRecord(completed.usage);
     const usage = measurementRecord(current.usage_json)!;
     if (!raw || !token(raw.input_tokens) || !token(raw.output_tokens)
       || raw.input_tokens !== usage.promptTokenCount || raw.output_tokens !== usage.candidatesTokenCount
       || (raw.total_tokens !== undefined && raw.total_tokens !== raw.input_tokens + raw.output_tokens)
-      || usage.totalTokenCount !== raw.input_tokens + raw.output_tokens) return undefined;
+      || usage.totalTokenCount !== raw.input_tokens + raw.output_tokens) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const cachedTokens = measurementRecord(raw.input_tokens_details)?.cached_tokens;
     const reasoning = measurementRecord(raw.output_tokens_details)?.reasoning_tokens;
-    if (cachedTokens !== usage.cachedContentTokenCount || reasoning !== usage.thoughtsTokenCount) return undefined;
+    if (cachedTokens !== usage.cachedContentTokenCount || reasoning !== usage.thoughtsTokenCount) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     // This retained physical timing excludes response.created. Request-wide firstOutputAt from the
     // same producer may have counted that control event, so it is not used to repair old timing.
-    if (completed.timing === undefined) return undefined;
+    if (completed.timing === undefined) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const timing = parseNativeResponseTiming(completed.timing);
     if (typeof stats.completedAt !== 'number' || typeof stats.providerStartedAt !== 'number'
-      || timing.completedAt > stats.completedAt || timing.startedAt < stats.providerStartedAt) return undefined;
+      || timing.completedAt > stats.completedAt || timing.startedAt < stats.providerStartedAt) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
     const measurement: SingleResponseMeasurement = {
       recipeObjectId: String(current.recipe_object_id), responseId: created.responseId,
       attemptSeq: String(stats.attemptSeq), socketGeneration: String(stats.socketGeneration),
       inputTokens: raw.input_tokens, outputTokens: raw.output_tokens, totalTokens: usage.totalTokenCount as number,
       timing
     };
-    if (!singleResponseMeasurement({ ...current, single_response_measurement: measurement })) return undefined;
-    while (this.cache.size >= CACHE_ENTRIES) this.cache.delete(this.cache.keys().next().value!);
-    this.cache.set(request.id, { identity: key, measurement });
-    return structuredClone(measurement);
+    if (!singleResponseMeasurement({ ...current, single_response_measurement: measurement })) {
+      return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement: null });
+    }
+    return this.rememberCache(request.id, { identity: key, verifiedGeneration: generation, permanent: false, controlKey, measurement });
+  }
+
+  private readAuthorityJson(objectId: string, metadata: DomainRow): DomainRow | undefined {
+    if (this.authorityJsonCache.has(objectId)) {
+      const cached = this.authorityJsonCache.get(objectId);
+      this.authorityJsonCache.delete(objectId);
+      this.authorityJsonCache.set(objectId, cached ?? null);
+      return cached ?? undefined;
+    }
+    const parsed = this.readJson(metadata, 'application/vnd.limcode.turn-authority-snapshot+json', MAX_RECIPE_BYTES);
+    while (this.authorityJsonCache.size >= 128) {
+      this.authorityJsonCache.delete(this.authorityJsonCache.keys().next().value!);
+    }
+    this.authorityJsonCache.set(objectId, parsed ?? null);
+    return parsed;
   }
 
   public project(requests: DomainRow[]): DomainRow[] {

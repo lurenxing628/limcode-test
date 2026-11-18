@@ -153,6 +153,7 @@ export function flattenVisibleHistoryNodes(options: {
   maxVisualDepth: number;
 }): VisibleHistoryNode[] {
   const { forest, expandedIds, maxVisualDepth } = options;
+  const summaryCache = new WeakMap<ConversationHistoryTreeNode, ConversationHistoryDescendantAgentSummary>();
   const result: VisibleHistoryNode[] = [];
   const append = (node: ConversationHistoryTreeNode, depth: number): void => {
     const hasChildren = node.children.length > 0;
@@ -166,7 +167,12 @@ export function flattenVisibleHistoryNodes(options: {
       childCount: node.children.length,
       hasChildren,
       expanded,
-      descendantAgents: summarizeDescendantAgents(node)
+      descendantAgents: hasChildren ? summarizeDescendantAgents(node, summaryCache) : {
+        running: 0,
+        awaitingParent: 0,
+        interrupted: 0,
+        deliveryFailed: 0
+      }
     });
     if (!expanded) return;
     for (const child of node.children) append(child, depth + 1);

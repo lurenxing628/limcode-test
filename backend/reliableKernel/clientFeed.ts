@@ -138,6 +138,8 @@ interface ClientFeedSession {
   materializedRecordKeys: Set<string>;
   materializedRecords: Map<string, Record<string, unknown>>;
   materializedRecordReferences: Map<string, Set<string>>;
+  materializedReverseReferences: Map<string, Set<string>>;
+  materializedByDomainFieldValue: Map<string, Set<string>>;
   materializedRecordTemporal: Map<string, string>;
   activeRecordCounts: Map<string, number>;
   latestMessageSeq: bigint;
@@ -210,6 +212,8 @@ export class BoundedClientFeed {
       materializedRecordKeys: new Set<string>(),
       materializedRecords: new Map<string, Record<string, unknown>>(),
       materializedRecordReferences: new Map<string, Set<string>>(),
+      materializedReverseReferences: new Map<string, Set<string>>(),
+      materializedByDomainFieldValue: new Map<string, Set<string>>(),
       materializedRecordTemporal: new Map<string, string>(),
       activeRecordCounts: new Map<string, number>(),
       latestMessageSeq: 0n,
@@ -233,7 +237,7 @@ export class BoundedClientFeed {
       );
       session.unsubscribe = subscription.unsubscribe;
       const snapshot = this.createSnapshotMessage(session, subscription.barrier.snapshotCommitSeq, subscription.barrier.snapshot);
-      const bytes = this.sendNow(session, snapshot, subscription.barrier.snapshotCommitSeq);
+      const bytes = this.sendNow(session, snapshot.message, subscription.barrier.snapshotCommitSeq, snapshot.bytes);
       this.recordSnapshotMetric('initial', bytes, readStartedAt);
       session.initializing = false;
       const buffered = session.handoffCommits;
@@ -408,7 +412,7 @@ export class BoundedClientFeed {
       session.snapshotRequired = session.snapshotRequestGeneration !== refreshRequestGeneration;
       if (session.snapshotRequired) session.snapshotReason = session.nextSnapshotReason ?? reason;
       const snapshot = this.createSnapshotMessage(session, barrier.snapshotCommitSeq, barrier.snapshot);
-      const bytes = this.sendNow(session, snapshot, barrier.snapshotCommitSeq);
+      const bytes = this.sendNow(session, snapshot.message, barrier.snapshotCommitSeq, snapshot.bytes);
       this.recordSnapshotMetric(reason, bytes, readStartedAt);
       for (const commit of buffered) this.enqueueCommit(session, commit);
     } finally {
@@ -447,11 +451,12 @@ export class BoundedClientFeed {
   private sendNow(
     session: ClientFeedSession,
     message: ReliableKernelDataMessage,
-    commitSeq: string
+    commitSeq: string,
+    precomputedBytes?: number
   ): number {
     const queued: QueuedDataMessage = {
       message,
-      bytes: wireBytes(message),
+      bytes: precomputedBytes ?? wireBytes(message),
       commitSeq
     };
     this.sendQueuedNow(session, queued);
@@ -472,7 +477,7 @@ export class BoundedClientFeed {
     session: ClientFeedSession,
     snapshotCommitSeq: string,
     projectionInput: ClientProjectionSnapshot
-  ): ReliableKernelSnapshotMessage {
+  ): { message: ReliableKernelSnapshotMessage; bytes: number } {
     const messageSeq = this.allocateMessageSeq(session);
     const projections = boundProjectionRecords(toWirePlain(projectionInput) as Record<string, PlainData>);
     const { dataSetId, rootInstanceId, rootGeneration } = this.database.binding;
@@ -485,11 +490,11 @@ export class BoundedClientFeed {
       snapshotCommitSeq: requireDecimal(snapshotCommitSeq, 'snapshotCommitSeq'),
       projections
     };
-    enforceSnapshotBounds(message);
+    const bytes = enforceSnapshotBounds(message);
     // Seed visibility from exactly what survived all byte/row bounds. Seeding before final
     // truncation leaves ghost identities that can admit unrelated incremental records.
     this.resetVisibleIdentities(session, message.projections);
-    return message;
+    return { message, bytes };
   }
 
   private createChangesMessage(
@@ -628,31 +633,25 @@ export class BoundedClientFeed {
         accepted.push(acceptedChange);
         pending.splice(index, 1);
         if (wasKnown) {
+          const priorRecord = session.materializedRecords.get(ownKey);
           forgetScopedProjectionIdentity(
             session,
             change.domain,
             change.id,
-            session.materializedRecords.get(ownKey)
+            priorRecord
           );
+          unindexMaterializedRecordFields(session.materializedByDomainFieldValue, change.domain, ownKey, priorRecord);
           releaseMaterializedRecordReferences(session, ownKey);
         }
         session.materializedRecordKeys.add(ownKey);
         session.materializedRecords.set(ownKey, record);
+        indexMaterializedRecordFields(session.materializedByDomainFieldValue, change.domain, ownKey, record);
         session.materializedRecordTemporal.set(ownKey, recordTemporalKey(change.domain, record, change.id));
         retainMaterializedRecordReferences(session, change.domain, change.id, record);
         rememberScopedProjectionIdentity(session, change.domain, change.id, record);
         if (!wasKnown) {
           if (change.domain === 'Message') messageWindowAdvanced = true;
-          const count = incrementRecordCount(session.activeRecordCounts, change.domain);
-          if (
-            count > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE * (['RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation'].includes(change.domain) ? 2 : 1)
-            && LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(change.domain)
-            && change.domain !== 'Message'
-          ) {
-            // Never evict a relationship-bearing root type independently. The snapshot builder
-            // chooses temporal roots and returns their complete normalized dependency closure.
-            requiresSnapshot = true;
-          }
+          incrementRecordCount(session.activeRecordCounts, change.domain);
         }
         changed = true;
       }
@@ -662,6 +661,21 @@ export class BoundedClientFeed {
       const rollover = evictMessagesOutsideLiveWindow(session);
       evictions.push(...rollover.changes);
       requiresSnapshot = rollover.requiresSnapshot;
+    }
+
+    if (!requiresSnapshot) {
+      evictions.push(...evictOverflowLeafAndTurnWindows(session));
+      for (const [domain, count] of session.activeRecordCounts) {
+        if (domain === 'Message' || !LIVE_SNAPSHOT_WINDOW_ROOT_DOMAINS.has(domain)) continue;
+        const limit = CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE
+          * (['RuntimeDeliveryTimelineLink', 'RuntimeDeliveryAnswerPresentation'].includes(domain) ? 2 : 1);
+        if (count > limit) {
+          // Never evict a still-referenced relationship-bearing root type independently. The
+          // snapshot builder chooses temporal roots and returns their complete normalized closure.
+          requiresSnapshot = true;
+          break;
+        }
+      }
     }
 
     const acceptedById = new Map(accepted.map((change) => [
@@ -871,6 +885,8 @@ export class BoundedClientFeed {
     session.materializedRecordKeys.clear();
     session.materializedRecords.clear();
     session.materializedRecordReferences.clear();
+    session.materializedReverseReferences.clear();
+    session.materializedByDomainFieldValue.clear();
     session.materializedRecordTemporal.clear();
     session.activeRecordCounts.clear();
     session.latestMessageSeq = 0n;
@@ -897,6 +913,8 @@ export class BoundedClientFeed {
         session.activeRecordKeyRefCounts,
         session.materializedRecords,
         session.materializedRecordReferences,
+        session.materializedReverseReferences,
+        session.materializedByDomainFieldValue,
         session.activeRecordCounts,
         countedRecords,
         session.materializedRecordTemporal
@@ -2483,6 +2501,88 @@ function typedRecordReferenceKeys(
   return references;
 }
 
+const INDEXED_MATERIALIZED_FIELDS = [
+  'turn_id',
+  'message_id',
+  'model_request_id',
+  'owner_id',
+  'tool_call_id',
+  'source_tool_call_id',
+  'process_id',
+  'request_id',
+  'change_set_id',
+  'receipt_id'
+] as const;
+
+const INDEXED_MATERIALIZED_FIELDS_SET = new Set<string>(INDEXED_MATERIALIZED_FIELDS);
+
+function domainFieldValueKey(domain: string, field: string, value: string): string {
+  return `${domain}\0${field}\0${value}`;
+}
+
+function indexMaterializedRecordFields(
+  indexMap: Map<string, Set<string>>,
+  domain: string,
+  ownKey: string,
+  record: Record<string, unknown>
+): void {
+  for (let i = 0; i < INDEXED_MATERIALIZED_FIELDS.length; i += 1) {
+    const field = INDEXED_MATERIALIZED_FIELDS[i]!;
+    const value = record[field];
+    if (typeof value !== 'string' || !value) continue;
+    const key = domainFieldValueKey(domain, field, value);
+    let bucket = indexMap.get(key);
+    if (!bucket) {
+      bucket = new Set<string>();
+      indexMap.set(key, bucket);
+    }
+    bucket.add(ownKey);
+  }
+}
+
+function unindexMaterializedRecordFields(
+  indexMap: Map<string, Set<string>>,
+  domain: string,
+  ownKey: string,
+  record: Record<string, unknown> | undefined
+): void {
+  if (!record) return;
+  for (let i = 0; i < INDEXED_MATERIALIZED_FIELDS.length; i += 1) {
+    const field = INDEXED_MATERIALIZED_FIELDS[i]!;
+    const value = record[field];
+    if (typeof value !== 'string' || !value) continue;
+    const key = domainFieldValueKey(domain, field, value);
+    const bucket = indexMap.get(key);
+    if (!bucket) continue;
+    bucket.delete(ownKey);
+    if (bucket.size === 0) indexMap.delete(key);
+  }
+}
+
+function retainReverseReference(
+  reverseMap: Map<string, Set<string>>,
+  sourceKey: string,
+  targetKey: string
+): void {
+  let referrers = reverseMap.get(targetKey);
+  if (!referrers) {
+    referrers = new Set<string>();
+    reverseMap.set(targetKey, referrers);
+  }
+  referrers.add(sourceKey);
+}
+
+function releaseReverseReference(
+  reverseMap: Map<string, Set<string>>,
+  sourceKey: string,
+  targetKey: string
+): void {
+  const referrers = reverseMap.get(targetKey);
+  if (!referrers) return;
+  referrers.delete(sourceKey);
+  if (referrers.size === 0) reverseMap.delete(targetKey);
+}
+
 function retainMaterializedRecordReferences(
   session: ClientFeedSession,
   domain: string,
@@ -2493,21 +2593,29 @@ function retainMaterializedRecordReferences(
   const references = typedRecordReferenceKeys(domain, record);
   references.add(ownKey);
   session.materializedRecordReferences.set(ownKey, references);
-  for (const reference of references) retainActiveRecordKey(session, reference);
+  for (const reference of references) {
+    retainActiveRecordKey(session, reference);
+    retainReverseReference(session.materializedReverseReferences, ownKey, reference);
+  }
 }
 
 function releaseMaterializedRecordReferences(session: ClientFeedSession, ownKey: string): void {
   const references = session.materializedRecordReferences.get(ownKey);
   if (!references) return;
   session.materializedRecordReferences.delete(ownKey);
-  for (const reference of references) releaseActiveRecordKey(session, reference);
+  for (const reference of references) {
+    releaseActiveRecordKey(session, reference);
+    releaseReverseReference(session.materializedReverseReferences, ownKey, reference);
+  }
 }
 
 function removeMaterializedRecord(session: ClientFeedSession, ownKey: string): void {
   if (!session.materializedRecordKeys.has(ownKey)) return;
   const domain = recordDomainFromKey(ownKey);
   const id = recordIdFromKey(ownKey);
-  forgetScopedProjectionIdentity(session, domain, id, session.materializedRecords.get(ownKey));
+  const priorRecord = session.materializedRecords.get(ownKey);
+  forgetScopedProjectionIdentity(session, domain, id, priorRecord);
+  unindexMaterializedRecordFields(session.materializedByDomainFieldValue, domain, ownKey, priorRecord);
   releaseMaterializedRecordReferences(session, ownKey);
   forgetMessageDisplayFloor(session, ownKey);
   session.materializedRecordKeys.delete(ownKey);
@@ -2537,9 +2645,10 @@ function hasMaterializedReferenceFrom(
   targetKey: string,
   sourceDomains: readonly string[]
 ): boolean {
-  for (const [sourceKey, references] of session.materializedRecordReferences) {
-    if (!sourceDomains.some((domain) => sourceKey.startsWith(`${domain}\0`))) continue;
-    if (references.has(targetKey)) return true;
+  const referrers = session.materializedReverseReferences.get(targetKey);
+  if (!referrers) return false;
+  for (const sourceKey of referrers) {
+    if (sourceDomains.some((domain) => sourceKey.startsWith(`${domain}\0`))) return true;
   }
   return false;
 }
@@ -2654,13 +2763,26 @@ function collectProjectionRecordKeys(
   refCounts: Map<string, number>,
   records: Map<string, Record<string, unknown>>,
   referencesByRecord: Map<string, Set<string>>,
+  reverseReferences: Map<string, Set<string>>,
+  fieldIndex: Map<string, Set<string>>,
   counts: Map<string, number>,
   countedRecords: Set<string>,
   temporal: Map<string, string>
 ): void {
   if (Array.isArray(value)) {
     for (const entry of value) {
-      collectProjectionRecordKeys(entry, target, refCounts, records, referencesByRecord, counts, countedRecords, temporal);
+      collectProjectionRecordKeys(
+        entry,
+        target,
+        refCounts,
+        records,
+        referencesByRecord,
+        reverseReferences,
+        fieldIndex,
+        counts,
+        countedRecords,
+        temporal
+      );
     }
     return;
   }
@@ -2676,6 +2798,7 @@ function collectProjectionRecordKeys(
         if (!countedRecords.has(ownKey)) {
           countedRecords.add(ownKey);
           records.set(ownKey, entry);
+          indexMaterializedRecordFields(fieldIndex, domain, ownKey, entry);
           incrementRecordCount(counts, domain);
           const references = typedRecordReferenceKeys(domain, entry);
           references.add(ownKey);
@@ -2684,12 +2807,24 @@ function collectProjectionRecordKeys(
             const next = (refCounts.get(reference) ?? 0) + 1;
             refCounts.set(reference, next);
             target.add(reference);
+            retainReverseReference(reverseReferences, ownKey, reference);
           }
         }
         temporal.set(ownKey, recordTemporalKey(domain, entry, id));
       }
     }
-    collectProjectionRecordKeys(nested, target, refCounts, records, referencesByRecord, counts, countedRecords, temporal);
+    collectProjectionRecordKeys(
+      nested,
+      target,
+      refCounts,
+      records,
+      referencesByRecord,
+      reverseReferences,
+      fieldIndex,
+      counts,
+      countedRecords,
+      temporal
+    );
   }
 }
 
@@ -2743,6 +2878,86 @@ function evictMessagesOutsideLiveWindow(
     }
   }
   return { changes, requiresSnapshot: false };
+}
+
+const TERMINAL_TURN_SATELLITE_DOMAINS = [
+  'ExecutionLease',
+  'TurnTermination',
+  'TurnExecutorLink'
+] as const;
+
+function evictOverflowLeafAndTurnWindows(session: ClientFeedSession): ClientScopedRuntimeChange[] {
+  const changes: ClientScopedRuntimeChange[] = [];
+
+  if ((session.activeRecordCounts.get('ConversationCommandReceipt') ?? 0) > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
+    const receipts: Array<{ key: string; id: string; temporal: string }> = [];
+    for (const key of session.materializedRecordKeys) {
+      if (!key.startsWith('ConversationCommandReceipt\0')) continue;
+      if ((session.activeRecordKeyRefCounts.get(key) ?? 0) > 1) continue;
+      const id = recordIdFromKey(key);
+      receipts.push({ key, id, temporal: session.materializedRecordTemporal.get(key) ?? id });
+    }
+    receipts.sort((left, right) => left.temporal.localeCompare(right.temporal));
+    for (const receipt of receipts) {
+      if ((session.activeRecordCounts.get('ConversationCommandReceipt') ?? 0) <= CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
+        break;
+      }
+      removeMaterializedRecord(session, receipt.key);
+      changes.push({
+        domain: 'ConversationCommandReceipt',
+        kind: 'remove',
+        id: receipt.id,
+        removalCause: 'window-eviction'
+      });
+    }
+  }
+
+  if ((session.activeRecordCounts.get('Turn') ?? 0) > CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) {
+    const turnCandidates: Array<{ turnKey: string; turnId: string; satelliteKeys: string[]; temporal: string }> = [];
+    for (const turnId of session.primaryTurnIds) {
+      const turnKey = recordKey('Turn', turnId);
+      const turn = session.materializedRecords.get(turnKey);
+      if (!turn || turn.status === 'active') continue;
+      const satelliteKeys: string[] = [];
+      let satelliteReferencedExternally = false;
+      for (const satDomain of TERMINAL_TURN_SATELLITE_DOMAINS) {
+        for (const [satKey] of materializedRecordsMatching(session, satDomain, 'turn_id', turnId)) {
+          if ((session.activeRecordKeyRefCounts.get(satKey) ?? 0) > 1) {
+            satelliteReferencedExternally = true;
+            break;
+          }
+          satelliteKeys.push(satKey);
+        }
+        if (satelliteReferencedExternally) break;
+      }
+      if (satelliteReferencedExternally) continue;
+      // Only `Turn` itself (+1) and its own satellites (+satelliteKeys.length) may reference turnKey.
+      if ((session.activeRecordKeyRefCounts.get(turnKey) ?? 0) > 1 + satelliteKeys.length) continue;
+      turnCandidates.push({
+        turnKey,
+        turnId,
+        satelliteKeys,
+        temporal: session.materializedRecordTemporal.get(turnKey) ?? turnId
+      });
+    }
+    turnCandidates.sort((left, right) => left.temporal.localeCompare(right.temporal));
+    for (const candidate of turnCandidates) {
+      if ((session.activeRecordCounts.get('Turn') ?? 0) <= CLIENT_ACTIVE_RECORD_LIMIT_PER_TYPE) break;
+      for (const satKey of candidate.satelliteKeys) {
+        if (!session.materializedRecordKeys.has(satKey)) continue;
+        const domain = recordDomainFromKey(satKey);
+        const id = recordIdFromKey(satKey);
+        removeMaterializedRecord(session, satKey);
+        changes.push({ domain, kind: 'remove', id, removalCause: 'window-eviction' });
+      }
+      if (session.materializedRecordKeys.has(candidate.turnKey)) {
+        removeMaterializedRecord(session, candidate.turnKey);
+        changes.push({ domain: 'Turn', kind: 'remove', id: candidate.turnId, removalCause: 'window-eviction' });
+      }
+    }
+  }
+
+  return changes;
 }
 
 function planMessageWindowEviction(
@@ -2937,10 +3152,11 @@ function planMessageWindowEviction(
     }
   }
 
-  for (const [sourceKey, references] of session.materializedRecordReferences) {
-    if (bundle.has(sourceKey)) continue;
-    for (const targetKey of bundle) {
-      if (references.has(targetKey)) return { kind: 'snapshot' };
+  for (const targetKey of bundle) {
+    const referrers = session.materializedReverseReferences.get(targetKey);
+    if (!referrers) continue;
+    for (const sourceKey of referrers) {
+      if (!bundle.has(sourceKey)) return { kind: 'snapshot' };
     }
   }
   const keys = [...bundle].sort((left, right) => {
@@ -2957,6 +3173,16 @@ function materializedRecordsMatching(
   field: string,
   value: string
 ): Array<[string, Record<string, unknown>]> {
+  if (INDEXED_MATERIALIZED_FIELDS_SET.has(field)) {
+    const keys = session.materializedByDomainFieldValue.get(domainFieldValueKey(domain, field, value));
+    if (!keys || keys.size === 0) return [];
+    const matches: Array<[string, Record<string, unknown>]> = [];
+    for (const key of keys) {
+      const record = session.materializedRecords.get(key);
+      if (record && record[field] === value) matches.push([key, record]);
+    }
+    return matches;
+  }
   const prefix = `${domain}\0`;
   return [...session.materializedRecords.entries()].filter(([key, record]) =>
     key.startsWith(prefix) && record[field] === value
@@ -3117,9 +3343,9 @@ function boundProjectionRecords(projections: Record<string, PlainData>): Record<
   return visit(projections) as Record<string, PlainData>;
 }
 
-function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): void {
+function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): number {
   let bytes = wireBytes(message);
-  if (bytes <= CLIENT_SNAPSHOT_MAX_BYTES) return;
+  if (bytes <= CLIENT_SNAPSHOT_MAX_BYTES) return bytes;
   const activeWindow = requireSnapshotSection(message.projections, 'activeConversationWindow');
   const activeConversationId = typeof activeWindow.conversationId === 'string'
     ? activeWindow.conversationId
@@ -3140,6 +3366,7 @@ function enforceSnapshotBounds(message: ReliableKernelSnapshotMessage): void {
     reconcileSnapshotCausalBundles(message.projections);
     bytes = wireBytes(message);
   }
+  return bytes;
 }
 
 interface SnapshotRetentionCandidate {
@@ -3291,60 +3518,87 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
 
   let messageIds = snapshotIds(window, 'messages');
   const requestMessageLinks = snapshotArray(turns, 'modelRequestMessageLinks');
-  const linkedRequestIds = new Set(requestMessageLinks.flatMap((link) => {
+  const linkedRequestIds = new Set<string>();
+  const retainedLinkedRequestIds = new Set<string>();
+  for (const link of requestMessageLinks) {
     const id = snapshotField(link, 'model_request_id');
-    return id ? [id] : [];
-  }));
+    if (!id) continue;
+    linkedRequestIds.add(id);
+    if (messageIds.has(snapshotField(link, 'message_id') ?? '')) retainedLinkedRequestIds.add(id);
+  }
   filterSnapshotArray(turns, 'modelRequests', (request) => {
     const id = snapshotRecordId(request);
     if (!id) return false;
     if (snapshotField(request, 'status') !== 'terminal') return true;
     if (!linkedRequestIds.has(id)) return true;
-    return requestMessageLinks.some((link) =>
-      snapshotField(link, 'model_request_id') === id
-      && messageIds.has(snapshotField(link, 'message_id') ?? '')
-    );
+    return retainedLinkedRequestIds.has(id);
   });
   let requestIds = snapshotIds(turns, 'modelRequests');
 
   const sourceLinks = snapshotArray(tools, 'toolCallSourceLinks');
-  filterSnapshotArray(tools, 'toolCalls', (toolCall) => {
-    const id = snapshotRecordId(toolCall);
-    if (!id) return false;
-    return sourceLinks.some((link) =>
-      snapshotField(link, 'tool_call_id') === id
+  const retainedSourceToolCallIds = new Set<string>();
+  for (const link of sourceLinks) {
+    const id = snapshotField(link, 'tool_call_id');
+    if (
+      id
       && messageIds.has(snapshotField(link, 'message_id') ?? '')
       && requestIds.has(snapshotField(link, 'model_request_id') ?? '')
-    );
+    ) {
+      retainedSourceToolCallIds.add(id);
+    }
+  }
+  filterSnapshotArray(tools, 'toolCalls', (toolCall) => {
+    const id = snapshotRecordId(toolCall);
+    return Boolean(id && retainedSourceToolCallIds.has(id));
   });
   let toolCallIds = snapshotIds(tools, 'toolCalls');
 
   const interactionToolLinks = snapshotArray(tools, 'interactionToolCallLinks');
   const interactionOwnerLinks = snapshotArray(tools, 'interactionOwnerLinks');
+  const ownerLinkedInteractionIds = new Set<string>();
+  for (const link of interactionOwnerLinks) {
+    const requestId = snapshotField(link, 'request_id');
+    if (requestId) ownerLinkedInteractionIds.add(requestId);
+  }
+  const toolLinkedInteractionIds = new Set<string>();
+  for (const link of interactionToolLinks) {
+    const requestId = snapshotField(link, 'request_id');
+    if (requestId && toolCallIds.has(snapshotField(link, 'tool_call_id') ?? '')) {
+      toolLinkedInteractionIds.add(requestId);
+    }
+  }
   filterSnapshotArray(tools, 'interactionRequests', (request) => {
     const requestId = snapshotRecordId(request);
     return Boolean(
       requestId
-      && interactionOwnerLinks.some((link) => snapshotField(link, 'request_id') === requestId)
-      && interactionToolLinks.some((link) =>
-        snapshotField(link, 'request_id') === requestId
-        && toolCallIds.has(snapshotField(link, 'tool_call_id') ?? '')
-      )
+      && ownerLinkedInteractionIds.has(requestId)
+      && toolLinkedInteractionIds.has(requestId)
     );
   });
   const interactionIdsBeforeTurnPrune = snapshotIds(tools, 'interactionRequests');
 
   const processOriginLinks = snapshotArray(tools, 'processOriginLinks');
+  const linkedProcessIds = new Set<string>();
+  for (const link of processOriginLinks) {
+    const processId = snapshotField(link, 'process_id');
+    if (processId && toolCallIds.has(snapshotField(link, 'tool_call_id') ?? '')) {
+      linkedProcessIds.add(processId);
+    }
+  }
   filterSnapshotArray(tools, 'processes', (process) => {
     const processId = snapshotRecordId(process);
-    return Boolean(processId && processOriginLinks.some((link) =>
-      snapshotField(link, 'process_id') === processId
-      && toolCallIds.has(snapshotField(link, 'tool_call_id') ?? '')
-    ));
+    return Boolean(processId && linkedProcessIds.has(processId));
   });
   let processIds = snapshotIds(tools, 'processes');
 
   const childParentLinks = snapshotArray(subagents, 'childExecutionParentLinks');
+  const toolLinkedChildIds = new Set<string>();
+  for (const link of childParentLinks) {
+    const childId = snapshotField(link, 'child_execution_id');
+    if (childId && toolCallIds.has(snapshotField(link, 'source_tool_call_id') ?? '')) {
+      toolLinkedChildIds.add(childId);
+    }
+  }
   const activeConversationId = snapshotField(window, 'conversationId')
     ?? (typeof window.conversationId === 'string' ? window.conversationId : undefined);
   // A child whose answer was delivered here stays with that delivery's card, even when the tool
@@ -3360,10 +3614,7 @@ function reconcileSnapshotCausalBundles(projections: Record<string, PlainData>):
     if (!childId) return false;
     if (activeConversationId && snapshotField(child, 'child_conversation_id') === activeConversationId) return true;
     if (answeringChildIds.has(childId)) return true;
-    return childParentLinks.some((link) =>
-      snapshotField(link, 'child_execution_id') === childId
-      && toolCallIds.has(snapshotField(link, 'source_tool_call_id') ?? '')
-    );
+    return toolLinkedChildIds.has(childId);
   });
   const childIdsBeforeTurnPrune = snapshotIds(subagents, 'childExecutions');
 

@@ -244,6 +244,7 @@ const port = requireParentPort();
 const data = workerData as DatabaseWorkerData;
 const casByteAccess = new RuntimeSynchronousCasByteAccess(data.binding);
 let historyMessageCounts: ConversationHistoryMessageCounts;
+let sharedContextCasCache: VerifiedContextCasCache | undefined;
 
 /**
  * Bounded verified-CAS read capability handed to the client projection module. The worker keeps
@@ -253,6 +254,9 @@ let historyMessageCounts: ConversationHistoryMessageCounts;
 const clientProjectionContent: ClientProjectionContentAccess = {
   readVerifiedBytes: (metadata) => {
     requireRuntimeId(metadata.id);
+    if (sharedContextCasCache) {
+      return Buffer.from(sharedContextCasCache.read(metadata, casByteAccess));
+    }
     return casByteAccess.readBytes(requireCasObjectIdentity(metadata));
   }
 };
@@ -293,6 +297,7 @@ async function start(): Promise<void> {
   /** The open maintenance transaction of a maintenance instance (see DatabaseWorkerData.maintenance). */
   let maintenance: MaintenanceTransaction | undefined;
   const contextCasCache = new VerifiedContextCasCache();
+  sharedContextCasCache = contextCasCache;
   const attachmentScopeCache = new AttachmentProjectionScopeCache();
   const taskCards = new CurrentTurnTaskCardCache();
   const postCommit = (result: RuntimeCommitResult): void => {
@@ -602,7 +607,8 @@ async function start(): Promise<void> {
           reader,
           request.activeConversationId,
           commitSeq,
-          clientProjectionContent
+          clientProjectionContent,
+          historyMessageCounts
         );
         // A later session's fresh snapshot must not erase changes still owed to older sessions.
         clientNavigation ??= new Map((result.snapshot.navigationSummary.conversations as Array<Record<string, unknown>>)
@@ -612,7 +618,7 @@ async function start(): Promise<void> {
       }
       if (request.kind === 'clientNavigationChanges') {
         assertDatabaseBinding(reader, data.binding);
-        const result = executeClientProjectionSnapshot(reader, null, commitSeq, clientProjectionContent);
+        const result = executeClientProjectionSnapshot(reader, null, commitSeq, clientProjectionContent, historyMessageCounts);
         const records = result.snapshot.navigationSummary.conversations as Array<Record<string, unknown>>;
         const previous = clientNavigation;
         const stable = previous !== undefined && records.length === previous.size && records.every(record => previous.has(String(record.id)));
@@ -3469,10 +3475,18 @@ function executeProcessOutputRegistrationMismatches(
            CAST(COUNT(chunk.id) AS TEXT) AS registered_chunks,
            CAST(process.retained_bytes AS TEXT) AS expected_bytes,
            CAST(COALESCE(SUM(chunk.byte_length), 0) AS TEXT) AS registered_bytes
-      FROM process
+      FROM process NOT INDEXED
       LEFT JOIN process_output_chunk AS chunk ON chunk.process_id = process.id
      WHERE process.status IN ('exited', 'cancelled', 'timed_out', 'output_limit_exceeded')
-     GROUP BY process.id, process.retained_chunks, process.retained_bytes
+       AND (
+         process.retained_chunks <> 0
+         OR process.retained_bytes <> 0
+         OR EXISTS (
+           SELECT 1 FROM process_output_chunk AS any_chunk
+            WHERE any_chunk.process_id = process.id
+         )
+       )
+     GROUP BY process.id
     HAVING COUNT(chunk.id) <> process.retained_chunks
         OR COALESCE(SUM(chunk.byte_length), 0) <> process.retained_bytes
         OR (process.retained_chunks > 0 AND MIN(chunk.chunk_seq) <> 1)
@@ -3497,15 +3511,25 @@ function executeProcessOutputRegistrationMismatches(
 function executeEffectReceiptReconciliationCandidates(
   database: Database.Database
 ): EffectReceiptReconciliationCandidate[] {
+  // Closed range bounds (`>=` + `<=`) preserve exact equality semantics while bypassing SQLite's
+  // `INDEX_ONE_VALUE` rule when `sqlite_stat1` was sampled at idle (`stat = 'N N'`).
   const rows = prepareCached(database, `
+    WITH active_tool_status(status) AS (
+      VALUES ('pending'), ('executing'), ('waiting_approval'), ('waiting_answer')
+    ), active_op_status(status) AS (
+      VALUES ('pending'), ('executing'), ('waiting_answer')
+    )
     SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
-      FROM tool_call AS tool_call_row INDEXED BY ix_tool_call_02
+      FROM active_tool_status
+      CROSS JOIN tool_call AS tool_call_row INDEXED BY ix_tool_call_02
+        ON tool_call_row.status >= active_tool_status.status
+       AND tool_call_row.status <= active_tool_status.status
       CROSS JOIN operation AS operation_row
       CROSS JOIN attempt AS attempt_row
       CROSS JOIN effect_intent AS intent
       CROSS JOIN effect_receipt AS receipt
-     WHERE tool_call_row.status IN ('pending', 'executing', 'waiting_approval', 'waiting_answer')
-       AND operation_row.tool_call_id = tool_call_row.id
+     WHERE operation_row.tool_call_id = tool_call_row.id
+       AND operation_row.owner_kind <> 'interaction_request'
        AND attempt_row.operation_id = operation_row.id
        AND intent.attempt_id = attempt_row.id
        AND receipt.attempt_id = attempt_row.id
@@ -3517,12 +3541,15 @@ function executeEffectReceiptReconciliationCandidates(
        )
     UNION ALL
     SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
-      FROM operation AS operation_row INDEXED BY ix_operation_03
+      FROM active_op_status
+      CROSS JOIN operation AS operation_row INDEXED BY ix_operation_03
+        ON operation_row.status >= active_op_status.status
+       AND operation_row.status <= active_op_status.status
       CROSS JOIN attempt AS attempt_row
       CROSS JOIN effect_intent AS intent
       CROSS JOIN effect_receipt AS receipt
      WHERE operation_row.tool_call_id IS NULL
-       AND operation_row.status IN ('pending', 'executing', 'waiting_answer')
+       AND operation_row.owner_kind NOT IN ('model_request', 'answer_bridge', 'child_execution')
        AND attempt_row.operation_id = operation_row.id
        AND intent.attempt_id = attempt_row.id
        AND receipt.attempt_id = attempt_row.id
@@ -3560,7 +3587,7 @@ function executeChildProcessCleanupMaterializationCandidates(
            source_link.id AS source_link_id,
            source_link.process_id AS process_id
       FROM child_interruption_turn_link AS turn_link
-      JOIN process_completion_source_link AS source_link
+      CROSS JOIN process_completion_source_link AS source_link
         ON source_link.source_turn_id = turn_link.turn_id
       LEFT JOIN child_interruption_process_cleanup AS cleanup
         ON cleanup.interruption_request_id = turn_link.interruption_request_id
@@ -3608,17 +3635,38 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
     throw new RangeError('Repository list limit must be an integer from 1 to 1000.');
   }
   const encodedWhere = repository.codec.encodeWhere(read.where ?? {});
+  const orderColumn = read.orderBy?.column ?? 'id';
+  if (!repository.codec.hasColumn(orderColumn)) throw new Error(`${schema.repository} cannot order by ${orderColumn}.`);
+  const disarmStatusIndex = orderColumn !== 'status'
+    && hasSelectiveParentFilter(encodedWhere, read.toolConversationId !== undefined);
+  const whereKeys = Object.keys(encodedWhere);
+  const bypassOneValueIndex = !disarmStatusIndex
+    && read.toolConversationId === undefined
+    && whereKeys.every((key) => key === 'status' || key === 'state' || key === 'dispatch_state' || key === 'effect_kind');
   const predicates: string[] = [];
   const parameters: EncodedRow & { __after_id?: string; __limit?: bigint } = {};
   for (const [name, value] of Object.entries(encodedWhere)) {
     if (value === null) predicates.push(`${quote(name)} IS NULL`);
-    else {
+    else if (name === 'status' && disarmStatusIndex) {
+      // Prevent un-analyzed SQLite plans from choosing single-column ix_*_status over high-selectivity
+      // entity foreign-key indexes (turn_id, tool_call_id, operation_id, attempt_id, owner_kind+owner_id).
+      predicates.push(`+${quote(name)} = @${name}`);
+      parameters[name] = value;
+    } else if (
+      bypassOneValueIndex
+      && typeof value === 'string'
+      && (name === 'status' || name === 'state' || name === 'dispatch_state')
+      && read.keyset?.column !== name
+    ) {
+      // Closed range bounds bypass SQLite `where.c`'s `INDEX_ONE_VALUE` suppression when `sqlite_stat1`
+      // recorded idle-state skew (`stat = 'N N'`), restoring O(log N) B-tree seeks for active/pending rows.
+      predicates.push(`(${quote(name)} >= @${name} AND ${quote(name)} <= @${name})`);
+      parameters[name] = value;
+    } else {
       predicates.push(`${quote(name)} = @${name}`);
       parameters[name] = value;
     }
   }
-  const orderColumn = read.orderBy?.column ?? 'id';
-  if (!repository.codec.hasColumn(orderColumn)) throw new Error(`${schema.repository} cannot order by ${orderColumn}.`);
   const direction = read.orderBy?.direction === 'desc' ? 'DESC' : 'ASC';
   if (read.afterId !== undefined) {
     if (orderColumn !== 'id' || direction !== 'ASC') throw new TypeError('Repository afterId pagination requires id ascending order.');
@@ -3673,6 +3721,26 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   parameters.__limit = BigInt(read.limit);
   const sql = `SELECT * FROM ${quote(schema.table)}${predicates.length ? ` WHERE ${predicates.join(' AND ')}` : ''} ORDER BY ${quote(orderColumn)} ${direction}${orderColumn === 'id' ? '' : `, id ${direction}`} LIMIT @__limit`;
   return (prepareCached(database, sql).all(parameters) as Array<Record<string, unknown>>).map((row) => repository.codec.decode(row));
+}
+
+const SELECTIVE_PARENT_FILTER_KEYS = [
+  'turn_id',
+  'tool_call_id',
+  'operation_id',
+  'attempt_id',
+  'process_id',
+  'child_execution_id',
+  'model_request_id'
+] as const;
+
+function hasSelectiveParentFilter(encodedWhere: EncodedRow, hasToolConversationScope = false): boolean {
+  if (hasToolConversationScope) return true;
+  if (encodedWhere.status === undefined || encodedWhere.status === null) return false;
+  for (const key of SELECTIVE_PARENT_FILTER_KEYS) {
+    if (encodedWhere[key] !== undefined && encodedWhere[key] !== null) return true;
+  }
+  return encodedWhere.owner_kind !== undefined && encodedWhere.owner_kind !== null
+    && encodedWhere.owner_id !== undefined && encodedWhere.owner_id !== null;
 }
 
 function requireBackupDestination(value: unknown, dataRootPath: string): string {

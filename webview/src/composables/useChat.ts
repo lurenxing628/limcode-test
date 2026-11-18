@@ -830,6 +830,7 @@ function reconcileTurnInputSubmissions(
   snapshotRequired: boolean,
   removedConversationIds: readonly string[]
 ): void {
+  if (Object.keys(pendingTurnInputSubmissions.value).length === 0) return;
   let changed = false;
   const next = { ...pendingTurnInputSubmissions.value };
   for (const pending of Object.values(next)) {
@@ -1000,6 +1001,10 @@ function submitWithdrawnGuidanceCancel(
 function reconcileGuidanceControls(
   records: Record<string, Record<string, Record<string, unknown>>>
 ): void {
+  if (
+    Object.keys(pendingGuidanceControls.value).length === 0
+    && Object.keys(guidanceControlFailures.value).length === 0
+  ) return;
   const receiptConversations = new Map(Object.values(records.ConversationCommandReceipt ?? {}).flatMap((receipt) =>
     typeof receipt.command_id === 'string' && typeof receipt.conversation_id === 'string'
       ? [[receipt.command_id, receipt.conversation_id] as const] : []));
@@ -1595,25 +1600,34 @@ export function useChat() {
     const sessionId = reliableConversation.feed.sessionId;
     const clientId = bridge.currentClientId();
     if (sessionId) {
-      const records = reliableConversation.feed.records as unknown as Record<
-        string,
-        Record<string, Record<string, unknown>>
-      >;
-      reconcileCurrentTurnInputs();
-      reconcileGuidanceControls(records);
+      if (Object.keys(pendingTurnInputSubmissions.value).length > 0) {
+        reconcileCurrentTurnInputs();
+      }
+      if (
+        Object.keys(pendingGuidanceControls.value).length > 0
+        || Object.keys(guidanceControlFailures.value).length > 0
+      ) {
+        reconcileGuidanceControls(reliableRecords.value);
+      }
     }
-    if (clientId) replayTurnInputSubmissions(clientId, sessionId ?? undefined);
+    if (clientId && Object.keys(pendingTurnInputSubmissions.value).length > 0) {
+      replayTurnInputSubmissions(clientId, sessionId ?? undefined);
+    }
     if (!sessionId) return;
     reconcileStandaloneInterrupt();
     reconcileConversationAction();
-    replayForkRequestsForSession(sessionId);
+    if (Object.keys(forkRequests.value).length > 0) {
+      replayForkRequestsForSession(sessionId);
+    }
   });
 
   // A navigation away and back in one event still retires the old local wait.
   watchEffect(() => {
+    const submissions = Object.values(steeringSubmissions.value);
+    if (submissions.length === 0) return;
     const sessionId = reliableConversation.feed.sessionId;
     const records = reliableRecords.value;
-    for (const submission of Object.values(steeringSubmissions.value)) {
+    for (const submission of submissions) {
       const receipt = steeringReceiptsByConversation.value[submission.conversationId]?.[submission.commandId];
       if (settleSteeringFromReceipt(submission, receipt)) continue;
       const turn = records.Turn?.[submission.turnId];

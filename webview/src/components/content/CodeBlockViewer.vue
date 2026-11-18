@@ -21,7 +21,7 @@ const softWrap = ref(true);
 const copied = ref(false);
 let copiedResetTimer: number | undefined;
 
-const normalizedCode = computed(() => props.code.replace(/\r\n/g, '\n').replace(/\r/g, '\n'));
+const normalizedCode = computed(() => props.code.includes('\r') ? props.code.replace(/\r\n?/g, '\n') : props.code);
 const displayText = computed(() => {
   const text = normalizedCode.value;
   return text.endsWith('\n') ? text.slice(0, -1) : text;

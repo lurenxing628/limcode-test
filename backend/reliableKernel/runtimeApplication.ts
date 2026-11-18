@@ -346,19 +346,23 @@ export class ReliableKernelApplication {
       void this.processDeliveries.dispose().catch(error => console.error('[LimCode] Runtime delivery shutdown failed.', error));
     });
     this.unsubscribeConvergence = database.onCommit((commit) => {
-      if (!commit.changes.some((change) => [
-        'EffectIntent',
-        'EffectReceipt',
-        'Operation',
-        'ToolResultArtifact',
-        'InteractionResponse',
-        'FileChangeDecision',
-        'CollaborationMessage',
-        'CollaborationRequest',
-        'RuntimeDelivery',
-        'RuntimeDeliveryInputLink',
-        'TurnTermination'
-      ].includes(change.domain))) return;
+      if (!commit.changes.some((change) => {
+        if (change.domain === 'Operation') {
+          return change.kind !== 'upsert' || change.record?.owner_kind !== 'model_request';
+        }
+        return [
+          'EffectIntent',
+          'EffectReceipt',
+          'ToolResultArtifact',
+          'InteractionResponse',
+          'FileChangeDecision',
+          'CollaborationMessage',
+          'CollaborationRequest',
+          'RuntimeDelivery',
+          'RuntimeDeliveryInputLink',
+          'TurnTermination'
+        ].includes(change.domain);
+      })) return;
       this.scheduleRuntimeConvergence();
     });
     this.webviewFeed = new ReliableKernelWebviewFeedBridge(

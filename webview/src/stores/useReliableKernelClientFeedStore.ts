@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia';
-import { markRaw } from 'vue';
+import { markRaw, toRaw } from 'vue';
 import {
   MESSAGE_CONTENT_ITEM_PAGE_SIZE, parseReliableMessageContentItemPage, residentReliableMessageContentItems,
   reliableMessageContentItemsKey, type ReliableMessageContentWindow
@@ -391,7 +391,19 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       const previousSessionId = this.sessionId;
       const previousHostBootId = this.hostBootId;
       const previousConversationId = activeConversationId(this.projections);
-      const result = applyReliableKernelDataMessage(this.$state, message);
+      const rawRecords = toRaw(this.records);
+      const currentFeedState: ReliableKernelBoundedClientState = {
+        sessionId: this.sessionId,
+        hostBootId: this.hostBootId,
+        lastMessageSeq: this.lastMessageSeq,
+        lastCommitSeq: this.lastCommitSeq,
+        projections: toRaw(this.projections),
+        records: Object.fromEntries(
+          Object.entries(rawRecords).map(([domain, bucket]) => [domain, toRaw(bucket)])
+        ),
+        snapshotRequired: this.snapshotRequired
+      };
+      const result = applyReliableKernelDataMessage(currentFeedState, message);
       const nextConversationId = activeConversationId(result.state.projections);
       const continuingLoadedHistory = Boolean(
         result.ack
@@ -452,7 +464,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         this.lastSnapshotCommitSeq = result.state.lastCommitSeq;
       }
       this.projections = result.state.projections;
-      this.records = result.state.records;
+      this.records = markRawClientRecordLeaves(result.state.records, rawRecords);
       this.snapshotRequired = result.state.snapshotRequired;
       if (result.ack) {
         if (previousConversationId !== nextConversationId || previousSessionId !== this.sessionId) {
@@ -1570,10 +1582,9 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       const current = this.details[key];
       const priority = options.priority ?? 'visible';
       if (current?.status === 'ready') {
-        const pending = Object.values(this.pendingDetails).find((request) => request.key === key);
+        const pending = findPendingDetailByKey(this.$state, key);
         if (pending && DETAIL_PRIORITY_ORDER[priority] < DETAIL_PRIORITY_ORDER[pending.priority]) {
           pending.priority = priority;
-          this.sortDetailQueue();
           this.pumpDetailQueue();
         }
         this.detailCacheMeta[key] = {
@@ -1598,10 +1609,9 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         delete this.detailCacheMeta[key];
       }
       if (current?.status === 'loading') {
-        const pending = Object.values(this.pendingDetails).find((request) => request.key === key);
+        const pending = findPendingDetailByKey(this.$state, key);
         if (pending && DETAIL_PRIORITY_ORDER[priority] < DETAIL_PRIORITY_ORDER[pending.priority]) {
           pending.priority = priority;
-          this.sortDetailQueue();
           this.pumpDetailQueue();
         }
         return key;
@@ -1629,8 +1639,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         retryCount,
         ...(kind === 'accepted-answer-content' ? { peerStateGeneration: this.peerStateGeneration } : {})
       };
+      rememberPendingDetailKey(this.$state, key, requestId);
       this.detailQueue.push(requestId);
-      this.sortDetailQueue();
       this.pumpDetailQueue();
       return key;
     },
@@ -1653,6 +1663,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         detailRequestTimeouts.delete(requestId);
         detailDecoders.delete(requestId);
         detailTextChunks.delete(requestId);
+        forgetPendingDetailKey(this.$state, key, requestId);
         delete this.pendingDetails[requestId];
       }
       if (cancelledRequestIds.length > 0) {
@@ -1701,7 +1712,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       const key = detailKey(kind, id);
       const current = this.details[key];
       if (!id || !sessionId) return undefined;
-      const existing = Object.values(this.pendingDetails).find((request) => request.key === key);
+      const existing = findPendingDetailByKey(this.$state, key);
       if (existing) {
         // Its pages freeze the older prefix. One later read must observe a final Process update
         // even if it arrives before these pages finish and the running-process poll stops.
@@ -1709,7 +1720,6 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         const priority = options.priority ?? 'visible';
         if (DETAIL_PRIORITY_ORDER[priority] < DETAIL_PRIORITY_ORDER[existing.priority]) {
           existing.priority = priority;
-          this.sortDetailQueue();
           this.pumpDetailQueue();
         }
         return key;
@@ -1749,8 +1759,8 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
         retryCount: options.retryCount ?? current.retryCount ?? 0,
         ...(kind === 'accepted-answer-content' ? { peerStateGeneration: this.peerStateGeneration } : {})
       };
+      rememberPendingDetailKey(this.$state, key, requestId);
       this.detailQueue.push(requestId);
-      this.sortDetailQueue();
       this.pumpDetailQueue();
       return key;
     },
@@ -1963,6 +1973,7 @@ const useReliableKernelClientFeedStoreDefinition = defineStore('reliableKernelCl
       detailRequestTimeouts.delete(requestId);
       detailDecoders.delete(requestId);
       detailTextChunks.delete(requestId);
+      if (pending) forgetPendingDetailKey(this.$state, pending.key, requestId);
       delete this.pendingDetails[requestId];
       this.activeDetailRequestIds = this.activeDetailRequestIds.filter((id) => id !== requestId);
       this.detailQueue = this.detailQueue.filter((id) => id !== requestId);
@@ -2941,8 +2952,70 @@ function clearAllDetailRetryTimers(): void {
   detailRetryTimeouts.clear();
 }
 
+const pendingDetailRequestIdByKey = new WeakMap<object, Map<string, string>>();
+
+function pendingDetailIndex(state: ReliableKernelFeedStoreState): Map<string, string> {
+  const raw = toRaw(state) as object;
+  let index = pendingDetailRequestIdByKey.get(raw);
+  if (!index) {
+    index = new Map<string, string>();
+    pendingDetailRequestIdByKey.set(raw, index);
+  }
+  return index;
+}
+
+function rememberPendingDetailKey(state: ReliableKernelFeedStoreState, key: string, requestId: string): void {
+  pendingDetailIndex(state).set(key, requestId);
+}
+
+function forgetPendingDetailKey(state: ReliableKernelFeedStoreState, key: string, requestId: string): void {
+  const index = pendingDetailIndex(state);
+  if (index.get(key) === requestId) index.delete(key);
+}
+
+function findPendingDetailByKey(
+  state: ReliableKernelFeedStoreState,
+  key: string
+): ReliableKernelFeedStoreState['pendingDetails'][string] | undefined {
+  const index = pendingDetailIndex(state);
+  const indexedId = index.get(key);
+  if (indexedId !== undefined) {
+    const candidate = state.pendingDetails[indexedId];
+    if (candidate?.key === key) return candidate;
+    index.delete(key);
+  }
+  for (const [requestId, request] of Object.entries(state.pendingDetails)) {
+    if (request.key === key) {
+      index.set(key, requestId);
+      return request;
+    }
+  }
+  return undefined;
+}
+
+function markRawClientRecordLeaves(
+  nextRecords: ReliableKernelBoundedClientState['records'],
+  priorRawRecords: ReliableKernelBoundedClientState['records']
+): ReliableKernelBoundedClientState['records'] {
+  const marked: ReliableKernelBoundedClientState['records'] = {};
+  for (const [domain, bucket] of Object.entries(nextRecords)) {
+    const priorBucket = priorRawRecords[domain];
+    if (priorBucket && toRaw(bucket) === toRaw(priorBucket)) {
+      marked[domain] = bucket;
+      continue;
+    }
+    const nextBucket: Record<string, (typeof bucket)[string]> = {};
+    for (const [id, record] of Object.entries(bucket)) {
+      nextBucket[id] = record && typeof record === 'object' ? markRaw(record) : record;
+    }
+    marked[domain] = nextBucket;
+  }
+  return marked;
+}
+
 function cancelAllDetailRequests(state: ReliableKernelFeedStoreState): void {
   clearAllDetailRetryTimers();
+  pendingDetailRequestIdByKey.delete(toRaw(state) as object);
   for (const requestId of Object.keys(state.pendingDetails)) {
     const timeout = detailRequestTimeouts.get(requestId);
     if (timeout !== undefined) clearTimeout(timeout);

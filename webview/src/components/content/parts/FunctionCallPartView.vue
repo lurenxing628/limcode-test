@@ -115,40 +115,50 @@ const observedCancelResult = computed(() => {
 let autoApplyCountdownTimer: ReturnType<typeof setInterval> | undefined;
 let cancelProjectionTimer: ReturnType<typeof setTimeout> | undefined;
 const CANCEL_PROJECTION_DEADLINE_MS = 30_000;
+const toolResultsByCallId = computed(() => reliableConversation.projection.value.toolResultByCallId);
+const toolOutcomeStatusByCallId = computed(() => reliableConversation.projection.value.toolOutcomeStatusByCallId);
+const toolCallEventsByCallId = computed(() => reliableConversation.projection.value.toolCallEventsByCallId);
+const interactionByToolCallId = computed(() => reliableConversation.projection.value.interactionByToolCallId);
+const splitSourceMessageIds = computed(() => reliableConversation.projection.value.splitSourceMessageIdByMessageId);
+const messageRevisionIds = computed(() => reliableConversation.projection.value.messageRevisionIdByMessageId);
+const childConversationIdByToolCallId = computed(() => reliableConversation.projection.value.childConversationIdByToolCallId);
+const fileDiffByToolCallId = computed(() => reliableConversation.projection.value.fileDiffByToolCallId);
+const fileChangeSetIdByToolCallId = computed(() => reliableConversation.projection.value.fileChangeSetIdByToolCallId);
+
 const toolCall = computed<ToolCallRecord | undefined>(() => reliableToolCallForPart(
   reliableConversation.projection.value.index, props.messageId, props.part, props.toolOrdinal
 ));
 const toolResult = computed(() => {
   const call = toolCall.value;
   if (!call) return undefined;
-  return reliableConversation.projection.value.toolResultByCallId[call.id];
+  return toolResultsByCallId.value[call.id];
 });
 const toolResponseParts = computed(() => toolCall.value?.responseParts ?? []);
 const toolOutcomeStatus = computed<ReliableToolOutcomeProjectionStatus | undefined>(() => {
   const callId = toolCall.value?.id;
-  return callId ? reliableConversation.projection.value.toolOutcomeStatusByCallId[callId] : undefined;
+  return callId ? toolOutcomeStatusByCallId.value[callId] : undefined;
 });
 const toolEvents = computed<ToolCallEventRecord[]>(() => {
   const callId = toolCall.value?.id;
   if (!callId) return [];
-  return reliableConversation.projection.value.toolCallEventsByCallId[callId] ?? [];
+  return toolCallEventsByCallId.value[callId] ?? [];
 });
 const transientPreview = computed(() => {
   const partId = props.part.id;
   if (!partId || !props.messageId || globalSettings.appearance.conciseMode) return undefined;
-  const projection = reliableConversation.projection.value;
-  const durableCallId = toolCall.value?.id;
+  const call = toolCall.value;
+  const durableCallId = call?.id;
   // 转向边界拆分出的展示条目没有独立的持久化身份；预览与正文详请一律回溯到来源聚合消息，
   // durable ToolCall 的归属仍按拆分条目自身（ToolCallSourceLink 精确解析后的位置）。
-  const sourceMessageId = projection.splitSourceMessageIdByMessageId[props.messageId] ?? props.messageId;
+  const sourceMessageId = splitSourceMessageIds.value[props.messageId] ?? props.messageId;
   if (durableCallId) {
-    if (projection.interactionByToolCallId[durableCallId]?.status === 'pending') return undefined;
-    const exactCall = toolCall.value?.id === partId || toolCall.value?.functionCallId === partId;
+    if (interactionByToolCallId.value[durableCallId]?.status === 'pending') return undefined;
+    const exactCall = call?.id === partId || call?.functionCallId === partId;
     if (exactCall && !shouldKeepTransientToolCallPreview(
-      toolCall.value,
-      projection.toolOutcomeStatusByCallId[durableCallId]
+      call,
+      toolOutcomeStatusByCallId.value[durableCallId]
     )) return undefined;
-    const revisionId = projection.messageRevisionIdByMessageId[sourceMessageId];
+    const revisionId = messageRevisionIds.value[sourceMessageId];
     const messageDetail = revisionId
       ? reliableConversation.feed.details[reliableKernelDetailKey('message-content', revisionId)]
       : undefined;
@@ -199,14 +209,12 @@ const toolDisplay = computed(() => resolveToolDisplay({
   progress: displayProgress.value,
   events: toolEvents.value,
   toolCall: toolCall.value,
-  messages: reliableConversation.projection.value.messages,
-  toolCalls: reliableConversation.projection.value.toolCalls,
   checkpoints: [],
   checkpointTimelineAnchors: [],
   shadowRepositories: [],
   currentConversationId: reliableConversation.conversationId.value,
   childConversationId: toolCall.value
-    ? reliableConversation.projection.value.childConversationIdByToolCallId[toolCall.value.id]
+    ? childConversationIdByToolCallId.value[toolCall.value.id]
     : undefined,
   planProposalId: reliablePlanProposalId.value,
   stringifyValue
@@ -214,7 +222,7 @@ const toolDisplay = computed(() => resolveToolDisplay({
 const reliableFileDiff = computed<ToolDisplayDiff | undefined>(() => {
   const callId = toolCall.value?.id;
   if (!callId) return undefined;
-  const projection = reliableConversation.projection.value.fileDiffByToolCallId[callId];
+  const projection = fileDiffByToolCallId.value[callId];
   if (!projection) return undefined;
   return {
     files: projection.files.map((file) => ({
@@ -252,7 +260,7 @@ const headerActions = computed<ToolHeaderAction[]>(() => {
   const call = toolCall.value;
   const actions: ToolHeaderAction[] = (
     call
-    && reliableConversation.projection.value.fileChangeSetIdByToolCallId[call.id]
+    && fileChangeSetIdByToolCallId.value[call.id]
   )
     ? [{
         id: `open-reliable-diff-${call.id}`,

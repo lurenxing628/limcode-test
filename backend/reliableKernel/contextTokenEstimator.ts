@@ -182,6 +182,8 @@ export class ReliableContextTokenEstimator {
     };
   }
 
+  private readonly observedRequestAnchors = new Map<string, { rootId: string; outputSegmentId: string }>();
+
   private estimateObservedPrefix(
     conversationId: string,
     current: readonly ContextTokenEstimateSegment[],
@@ -200,14 +202,35 @@ export class ReliableContextTokenEstimator {
       ));
     }
     // The full window has already been validated and projected with this call's attachment facts.
-    const coveredProjected = anchor.coveredSegmentCount === current.length
-      ? currentProjected
-      : estimateMaterializedContextTokens(
-          current.slice(0, anchor.coveredSegmentCount),
-          attachments.projectRange(0, anchor.coveredSegmentCount),
+    // When the suffix past `anchor.coveredSegmentCount` contains no `tool_pair` segments, the
+    // 3-batch tool recency horizon in the covered prefix is unchanged, so projecting only the tiny
+    // suffix (`O(delta)`) is bit-for-bit identical to `currentProjected - coveredProjected`.
+    const suffixStart = anchor.coveredSegmentCount;
+    let deltaProjected = 0;
+    if (suffixStart < current.length) {
+      let suffixHasToolPair = false;
+      for (let i = suffixStart; i < current.length; i += 1) {
+        if (current[i]?.segmentKind === 'tool_pair') {
+          suffixHasToolPair = true;
+          break;
+        }
+      }
+      if (!suffixHasToolPair) {
+        deltaProjected = estimateMaterializedContextTokens(
+          current.slice(suffixStart),
+          attachments.projectRange(suffixStart, current.length),
           modelHandleCatalog
         );
-    const estimatedTokens = anchoredTokens + Math.max(0, currentProjected - coveredProjected);
+      } else {
+        const coveredProjected = estimateMaterializedContextTokens(
+          current.slice(0, suffixStart),
+          attachments.projectRange(0, suffixStart),
+          modelHandleCatalog
+        );
+        deltaProjected = Math.max(0, currentProjected - coveredProjected);
+      }
+    }
+    const estimatedTokens = anchoredTokens + deltaProjected;
     return {
       estimatedTokens: safeTokenCount(estimatedTokens, 'provider-observed Context estimate'),
       source: 'provider-observed-delta',
@@ -242,24 +265,35 @@ export class ReliableContextTokenEstimator {
           : providerPromptTokens(observedUsage);
         if (input === undefined) continue;
         const requestId = requireId(request.id, 'ModelRequest.id');
-        const related = await this.database.snapshot([
-          DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').list({
-            where: { model_request_id: requestId }, limit: 2
-          }),
-          DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
-            where: { owner_kind: 'model_request', owner_id: requestId }, limit: 2
-          })
-        ]);
-        const links = rows(related.snapshot[0]);
-        const projections = rows(related.snapshot[1]);
-        // Compression requests never own an assistant Message link. Excluding them is essential:
-        // their usage describes the compaction call, not the ordinary model prompt shown to users.
-        if (links.length === 0) continue;
-        if (links.length !== 1 || projections.length !== 1) return null;
+        let cachedMeta = this.observedRequestAnchors.get(requestId);
+        let rootId: string;
+        let messageId: string | undefined;
+        if (cachedMeta) {
+          this.observedRequestAnchors.delete(requestId);
+          this.observedRequestAnchors.set(requestId, cachedMeta);
+          rootId = cachedMeta.rootId;
+        } else {
+          const related = await this.database.snapshot([
+            DOMAIN_REPOSITORIES.domain('ModelRequestMessageLink').list({
+              where: { model_request_id: requestId }, limit: 2
+            }),
+            DOMAIN_REPOSITORIES.domain('ModelContextProjection').list({
+              where: { owner_kind: 'model_request', owner_id: requestId }, limit: 2
+            })
+          ]);
+          const links = rows(related.snapshot[0]);
+          const projections = rows(related.snapshot[1]);
+          // Compression requests never own an assistant Message link. Excluding them is essential:
+          // their usage describes the compaction call, not the ordinary model prompt shown to users.
+          if (links.length === 0) continue;
+          if (links.length !== 1 || projections.length !== 1) return null;
+          rootId = requireId(projections[0].root_id, 'ModelContextProjection.root_id');
+          messageId = requireId(links[0].message_id, 'ModelRequestMessageLink.message_id');
+        }
         // Historical calibration only needs ordered segment identity and count. Read fresh worker-
         // validated structure/provenance without loading CAS payloads that are not used here; all
         // semantic estimates below use the already materialized current root.
-        const projected = await this.context.materializeStructure(requireId(projections[0].root_id, 'ModelContextProjection.root_id'));
+        const projected = await this.context.materializeStructure(rootId);
         // Conversation Context is linear between explicit compression/edit operations. Once the latest
         // ordinary request is not a prefix, no older ordinary request can be a safer calibration.
         if (!isSegmentPrefix(projected.records, current)) return null;
@@ -269,7 +303,15 @@ export class ReliableContextTokenEstimator {
           modelRequestId: requestId,
           coveredSegmentCount: projected.records.length
         };
-        const outputSegmentId = await this.messageSegmentId(requireId(links[0].message_id, 'ModelRequestMessageLink.message_id'));
+        const outputSegmentId = cachedMeta
+          ? cachedMeta.outputSegmentId
+          : await this.messageSegmentId(messageId!);
+        if (!cachedMeta && outputSegmentId) {
+          while (this.observedRequestAnchors.size >= 256) {
+            this.observedRequestAnchors.delete(this.observedRequestAnchors.keys().next().value!);
+          }
+          this.observedRequestAnchors.set(requestId, { rootId, outputSegmentId });
+        }
         if (outputSegmentId && current[anchor.coveredSegmentCount]?.segmentId === outputSegmentId) {
           anchor.outputSegmentIndex = anchor.coveredSegmentCount;
           anchor.totalTokens = calibration.native ? undefined : providerTotalTokens(observedUsage);
