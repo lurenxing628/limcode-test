@@ -274,6 +274,48 @@ export function withoutGeminiFunctionCallSignatures<T extends { parts: readonly 
 }
 
 /**
+ * The content with every Gemini thought signature removed — a portable `thoughtSignature` that
+ * names Gemini or carries no prefix, and `thoughtSignatures.gemini` — on any part, not only on the
+ * function calls that `withoutGeminiFunctionCallSignatures` covers. Google issues a signature for
+ * the project, channel and model that produced the reply and answers a replay under another one
+ * with HTTP 400 "Corrupted thought signature", so a reply replayed to a different source is sent
+ * without them; other providers' signatures stay as they are. A part left with nothing but its
+ * empty text (the signature-only tail part) is dropped. Returns the same object when nothing is
+ * removed.
+ */
+export function withoutGeminiThoughtSignatures<T extends { parts: readonly unknown[] }>(content: T): T {
+  let changed = false;
+  const parts = content.parts.flatMap((part) => {
+    if (!isRecord(part)) return [part];
+    const projected: Record<string, unknown> = { ...part };
+    let partChanged = false;
+    const portable = normalizedSignatureString(part.thoughtSignature);
+    // An unprefixed signature is sent as a Gemini one (geminiSignatureFromUnifiedPart).
+    if (portable && (parsePortableThoughtSignature(portable)?.provider ?? 'gemini') === 'gemini') {
+      delete projected.thoughtSignature;
+      partChanged = true;
+    }
+    if (isRecord(part.thoughtSignatures) && 'gemini' in part.thoughtSignatures) {
+      const { gemini: _gemini, ...others } = part.thoughtSignatures;
+      if (Object.keys(others).length > 0) projected.thoughtSignatures = others;
+      else delete projected.thoughtSignatures;
+      partChanged = true;
+    }
+    if (!partChanged) return [part];
+    changed = true;
+    return isEmptyTextOnlyPart(projected) ? [] : [projected];
+  });
+  return changed ? { ...content, parts } : content;
+}
+
+function isEmptyTextOnlyPart(part: Record<string, unknown>): boolean {
+  return part.text === ''
+    && !('functionCall' in part) && !('functionResponse' in part)
+    && !('inlineData' in part) && !('fileData' in part) && !('providerContext' in part)
+    && !(isRecord(part.thoughtSignatures) && Object.keys(part.thoughtSignatures).length > 0);
+}
+
+/**
  * Gemini thought signatures on the OpenAI-compatible wire travel in
  * `tool_calls[].extra_content.google.thought_signature`
  * (https://ai.google.dev/gemini-api/docs/thought-signatures, "OpenAI compatibility").

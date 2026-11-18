@@ -371,6 +371,48 @@ test('Gemini 当前工具步补签名，并行响应和目录按整批配对', a
   assert.equal(body.contents[2].parts.at(-1).text, 'ATTACHMENT_CATALOG');
 });
 
+test('Gemini 签名只回放给签发它的渠道与模型，换渠道后旧签名不再发送', async () => {
+  const config = settings('gemini');
+  // Google 给回复签的名绑定产出它的渠道与模型，换一个渠道重放会 400 "Corrupted thought signature"。
+  const signedReply = () => model([{ ...call('read-1', 'read', { path: 'a' }),
+    thoughtSignature: 'gemini:CHANNEL_SIGNATURE' }, { text: '', thoughtSignature: 'gemini:CHANNEL_SIGNATURE' }]);
+  const answer = { role: 'user', parts: [result('read-1', 'read', { ok: true })] };
+  const project = async (contents, modelSource) => {
+    const request = fullRequest(config, contents);
+    for (const item of request.context) {
+      if (item.segmentKind === 'message' && item.messageRole === 'model') item.modelSource = modelSource;
+    }
+    let projected;
+    await new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability((input, emit) => {
+      projected = input; emit({ type: 'llm:done', payload: { requestId: input.id } });
+    })).sendFullRequest(request, accepted);
+    return (await llm.dryRunLlmProvider(projected, { settings: async () => config })).body;
+  };
+  const oldTurn = [user('go'), signedReply(), answer, user('again')];
+  // 同一条渠道同一个模型：原样回放（旧轮次不校验签名，也不补 dummy）。
+  const own = await project(oldTurn, { providerId: config.id, modelId: config.model });
+  assert.deepEqual(own.contents[1].parts, [
+    { functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' }, thoughtSignature: 'CHANNEL_SIGNATURE' },
+    { text: '', thoughtSignature: 'CHANNEL_SIGNATURE' }]);
+  // 来源未知：无法证明是别家的，照旧回放。
+  const unknown = await project(oldTurn, undefined);
+  assert.deepEqual(unknown.contents[1].parts, own.contents[1].parts);
+  for (const modelSource of [
+    { providerId: 'gemini-other-channel', modelId: config.model },
+    { providerId: config.id, modelId: 'gemini-2.5-pro' }
+  ]) {
+    // 换了渠道或模型：签名一律不发，只剩签名没有内容的尾 part 整条去掉。
+    const foreign = await project(oldTurn, modelSource);
+    assert.deepEqual(foreign.contents[1].parts,
+      [{ functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' } }]);
+  }
+  // 当前轮次里第一处工具调用必须带签名：清掉别家签名后按官方约定补 dummy。
+  const current = await project([user('go'), signedReply(), answer],
+    { providerId: 'gemini-other-channel', modelId: config.model });
+  assert.deepEqual(current.contents[1].parts, [{ functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' },
+    thoughtSignature: 'skip_thought_signature_validator' }]);
+});
+
 test('Gemini MCP schema 只发送可接受的子集并保持原 schema', async () => {
   const parameters = { type: 'object', additionalProperties: false,
     properties: { optional: { type: ['string', 'null'] },
