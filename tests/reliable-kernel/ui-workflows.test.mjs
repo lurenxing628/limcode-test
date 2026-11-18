@@ -747,6 +747,64 @@ test('显示：transient只更新当前消息，已提交历史正文和工具�
   assert.equal(second.messages.at(-1).content.parts.at(-1).text, 'continued live tail');
 });
 
+test('时间线：已结束却没有消息的请求停在发生的位置，不追着新消息到末尾带走压缩卡', async () => {
+  const { ReliableConversationProjector } = await ui.load('domain/reliableConversationProjector.ts');
+  const { projectReliableConversation: project } = await ui.load('domain/reliableConversationProjection.ts');
+  const { projectReliableCompressionTimeline: compression } = await ui.load('domain/reliableCompressionProjection.ts');
+  const at = second => `2026-08-03T00:00:${String(second).padStart(2, '0')}.000Z`;
+  const all = { Turn: {}, Message: {}, MessageTurnLink: {}, ModelRequest: {}, ModelRequestMessageLink: {} }, details = {};
+  const request = (id, turnId, requestSeq, second, state) => {
+    all.Turn[turnId] ??= { id: turnId, conversation_id: 'conversation-a', status: 'terminated', created_at: at(second) };
+    all.ModelRequest[id] = { id, turn_id: turnId, request_seq: requestSeq, created_at: at(second), ...state };
+  };
+  const exchange = (turnId, seq, second) => {
+    request(`${turnId}-request`, turnId, '1', second, { status: 'terminal', terminal_state: 'completed' });
+    for (const [role, offset] of [['user', 0], ['model', 1]]) {
+      const id = `${turnId}-${role}`;
+      all.Message[id] = { id, conversation_id: 'conversation-a', message_seq: String(seq + offset), revision_id: `revision-${id}`, role, created_at: at(second + offset) };
+      all.MessageTurnLink[id] = { id, message_id: id, turn_id: turnId, role: role === 'user' ? 'input' : 'model' };
+      details[`message-content:revision-${id}`] = ready(JSON.stringify({ role, parts: [{ text: id }] }));
+    }
+    all.ModelRequestMessageLink[turnId] = { id: turnId, model_request_id: `${turnId}-request`, message_id: `${turnId}-model` };
+  };
+  exchange('old', 1, 1); exchange('new', 3, 30); exchange('later', 5, 50);
+  // 没有落成消息的请求：一个在 old 轮次里被手动中断，一个属于自己还没有任何消息的轮次。
+  request('stopped', 'old', '2', 10, { status: 'terminal', terminal_state: 'interrupted' });
+  request('idle', 'idle', '1', 40, { status: 'streaming' });
+  const partial = (id, turnId, requestSeq, status, second) => ({ ...nativeTransient([{ text: `${id} partial` }])['request-a'],
+    turnId, modelRequestId: id, requestSeq, status, startedAt: Date.parse(at(second)), updatedAt: Date.parse(at(second)) });
+  const stopped = partial('stopped', 'old', '2', 'cancelled', 11), block = { id: 'block', created_at: at(45) };
+  const pick = (bucket, keep) => Object.fromEntries(Object.entries(bucket).filter(([, row]) => keep(row)));
+  // 实时窗口只按消息滚出；没有消息的请求和它的轮次不属于任何消息，会一直留在快照里。
+  const windowed = turns => {
+    const Message = pick(all.Message, row => turns.includes(all.MessageTurnLink[row.id].turn_id));
+    return { Turn: { ...all.Turn }, Message, MessageTurnLink: pick(all.MessageTurnLink, row => row.message_id in Message),
+      ModelRequest: pick(all.ModelRequest, row => !row.id.endsWith('-request') || turns.includes(row.turn_id)),
+      ModelRequestMessageLink: pick(all.ModelRequestMessageLink, row => row.message_id in Message) };
+  };
+  const projector = new ReliableConversationProjector();
+  const view = (turns, transientModelRequests) => {
+    const input = { conversationId: 'conversation-a', records: windowed(turns), details };
+    projector.projectCommitted(input);
+    const messages = projector.projectTransient({ transientModelRequests }).messages, rows = messages.map(row => row.id);
+    assert.deepEqual(project({ ...input, transientModelRequests }).messages.map(row => row.id), rows);
+    return { rows, card: Object.keys(compression([block], messages).byAnchor) };
+  };
+  // 还在进行的请求是末尾的活动行。
+  assert.deepEqual(view(['old', 'new'], { stopped, idle: partial('idle', 'idle', '1', 'streaming', 41) }).rows,
+    ['old-user', 'old-model', 'transient:stopped', 'new-user', 'new-model', 'transient:idle']);
+  // 结束之后它留在原地，后来的消息排在它下面，压缩卡跟着真实的先后顺序。
+  all.ModelRequest.idle = { ...all.ModelRequest.idle, status: 'terminal', terminal_state: 'failed' };
+  assert.deepEqual(view(['old', 'new', 'later'], { stopped, idle: partial('idle', 'idle', '1', 'failed', 41) }), {
+    rows: ['old-user', 'old-model', 'transient:stopped', 'new-user', 'new-model', 'transient:idle', 'later-user', 'later-model'],
+    card: ['transient:idle'] });
+  // 所属轮次滚出实时窗口后，这段早于已加载范围的部分输出不再显示，压缩卡回到真实消息之后。
+  assert.deepEqual(view(['new', 'later'], { stopped }), { rows: ['new-user', 'new-model', 'later-user', 'later-model'], card: ['new-model'] });
+  // 往上翻回那一页，它回到原来的位置。
+  assert.deepEqual(view(['old', 'new', 'later'], { stopped }).rows,
+    ['old-user', 'old-model', 'transient:stopped', 'new-user', 'new-model', 'later-user', 'later-model']);
+});
+
 test('历史：阅读页只驻留相邻页面，after游标重载已释放正文并保留展开详情', async t => {
   const h = ui.stores(t), feed = h.feed;
   const rows = (first, count) => Array.from({ length: count }, (_, offset) => {
