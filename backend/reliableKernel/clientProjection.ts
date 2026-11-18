@@ -185,19 +185,25 @@ export function projectCompressionBlockRecord(database: Database.Database, block
 }
 
 /** The immutable item index remains available after the current revision becomes the final aggregate. */
-function messageItemIndexRevisionSql(): string {
+function messageItemIndexRevisionSql(
+  columns: { id: string; messageId: string; revisionSeq: string } = {
+    id: 'revision.id',
+    messageId: 'revision.message_id',
+    revisionSeq: 'revision.revision_seq'
+  }
+): string {
   return `(CASE
-    WHEN content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}' THEN revision.id
-    WHEN revision.revision_seq = 1 THEN NULL
+    WHEN content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}' THEN ${columns.id}
+    WHEN ${columns.revisionSeq} = 1 THEN NULL
     WHEN NOT EXISTS (
       SELECT 1 FROM model_request_message_link AS output
         JOIN model_request AS request ON request.id = output.model_request_id
-       WHERE output.message_id = revision.message_id
+       WHERE output.message_id = ${columns.messageId}
          AND request.status = 'terminal'
          AND request.terminal_state NOT IN ('completed', 'native_chain_rebased')
     ) THEN (SELECT item.id FROM message_revision AS item
       JOIN content_object AS item_content ON item_content.id = item.content_object_id
-      WHERE item.message_id = revision.message_id
+      WHERE item.message_id = ${columns.messageId}
         AND item_content.content_type = '${NATIVE_MESSAGE_COMPOSITION_CONTENT_TYPE}'
       ORDER BY item.revision_seq DESC LIMIT 1)
     ELSE NULL
@@ -3162,7 +3168,11 @@ function queryVisibleMessageRowsByIds(
              ranked.content_object_id,
              content.content_type,
              content.byte_length,
-             ${messageItemIndexRevisionSql().replace(/\brevision\./g, 'ranked.')} AS item_index_revision_id,
+             ${messageItemIndexRevisionSql({
+               id: 'ranked.revision_id',
+               messageId: 'ranked.id',
+               revisionSeq: 'ranked.revision_seq'
+             })} AS item_index_revision_id,
              ranked.display_seq
         FROM ranked_visible AS ranked
         JOIN content_object AS content ON content.id = ranked.content_object_id

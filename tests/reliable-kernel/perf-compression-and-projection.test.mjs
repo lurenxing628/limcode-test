@@ -471,6 +471,57 @@ test('SQLite 关键投影查询无全表扫描，且消息计数支持带序号�
 
   const projectedBlock = projection.projectCompressionBlockRecord(f.db, 'cb-anchor');
   assert.equal(projectedBlock.anchor_message_id, 'm-500', 'anchor_message_id must resolve the highest position source');
+
+  // Verify `executeClientProjectionSnapshot` pins older messages (>200 messages back) without column alias errors
+  // and preserves exact `revision_id` / `item_index_revision_id` / `display_seq`.
+  const convId = 'conv-pinned-old';
+  f.conversation(convId);
+  f.insert('content_object', {
+    id: 'co-recipe', content_type: 'application/json', sha256: 'b'.repeat(64), byte_length: 2, storage_key: 'k2', created_at: ts
+  });
+  f.db.transaction(() => {
+    for (let i = 1; i <= 220; i += 1) f.message(`pm-${i}`, convId, i);
+    // Give pm-2 a second revision so `revision_seq = 2` executes the correlated fallback branch of `messageItemIndexRevisionSql`.
+    f.insert('message_revision', {
+      id: 'r-pm-2-v2', message_id: 'pm-2', revision_seq: 2, role: 'user',
+      content_object_id: 'co-recipe', created_at: ts
+    });
+    f.db.prepare('UPDATE message_current_revision_link SET revision_id = ? WHERE message_id = ?').run('r-pm-2-v2', 'pm-2');
+    f.insert('turn', { id: 't-old-pinned', conversation_id: convId, status: 'terminated', created_at: ts, updated_at: ts, terminal_at: ts });
+    f.insert('authority_snapshot', { id: 'auth-old-pinned', turn_id: 't-old-pinned', content_object_id: 'co-recipe', created_at: ts });
+    f.insert('model_request', {
+      id: 'req-old-pinned', turn_id: 't-old-pinned', request_seq: 1, status: 'terminal',
+      terminal_state: 'completed', provider_id: 'p', model_id: 'm', context_window_tokens: 128000,
+      compression_threshold_tokens: 100000, estimated_context_tokens: 1000,
+      authority_snapshot_id: 'auth-old-pinned', recipe_object_id: 'co-recipe',
+      usage_json: '{}', stream_stats_json: '{}', created_at: ts, updated_at: ts
+    });
+    f.insert('tool_call', {
+      id: 'tc-old-pinned', turn_id: 't-old-pinned', call_seq: 1, tool_name: 'bash', status: 'terminal',
+      arguments_object_id: 'co-recipe', created_at: ts, updated_at: ts
+    });
+    f.insert('tool_call_source_link', {
+      id: 'tcsl-old-pinned', tool_call_id: 'tc-old-pinned', model_request_id: 'req-old-pinned',
+      message_id: 'pm-2', provider_ordinal: 0, batch_id: 'batch-1', batch_ordinal: 0, created_at: ts
+    });
+    f.insert('process', {
+      id: 'proc-old-pinned', status: 'running', wrapper_nonce: 'nonce-1', wrapper_pid: 1234,
+      start_fingerprint: 'fp-1', command_digest: 'cd-1', spool_locator: 'spool-1',
+      retained_bytes: 0, retained_chunks: 0, dropped_bytes: 0, truncated: 0,
+      started_at: ts, updated_at: ts
+    });
+    f.insert('process_origin_link', {
+      id: 'pol-old-pinned', process_id: 'proc-old-pinned', tool_call_id: 'tc-old-pinned', created_at: ts
+    });
+  })();
+  const pinnedSnapshot = projection.executeClientProjectionSnapshot(f.db, convId, 1n, {
+    readVerifiedBytes: () => Buffer.from('{}')
+  });
+  const pinnedMsg = pinnedSnapshot.snapshot.activeConversationWindow.messages.find((row) => row.id === 'pm-2');
+  assert.ok(pinnedMsg, 'pinned historical message outside 200-message window must be materialized');
+  assert.equal(pinnedMsg.revision_id, 'r-pm-2-v2');
+  assert.equal(pinnedMsg.item_index_revision_id, null);
+  assert.equal(Number(pinnedMsg.display_seq), 2);
 });
 
 test('sqlite_stat1 空闲偏态 (INDEX_ONE_VALUE) 下关键状态与恢复查询仍走 B-tree SEARCH 索引', async (t) => {
