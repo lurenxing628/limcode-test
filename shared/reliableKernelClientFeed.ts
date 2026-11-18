@@ -712,7 +712,8 @@ export function applyReliableKernelDataMessage(
       if (!change.record || typeof change.record !== 'object' || Array.isArray(change.record)) {
         throw new TypeError('Client upsert requires a record.');
       }
-      const record = toStructuredClonePlainData(change.record, `change.${change.type}.${id}`) as {
+      // `message` was already validated and freshly cloned at the entry of `applyReliableKernelDataMessage`.
+      const record = change.record as {
         [key: string]: PlainData;
       };
       if (record.id !== id) throw new TypeError('Client upsert record id does not match change identity.');

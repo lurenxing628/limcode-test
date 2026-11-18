@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue';
-import type { MessageRecord, RunTerminationRecord } from '@shared/protocol';
+import type { MessageContent, MessageRecord, RunTerminationRecord } from '@shared/protocol';
 import { projectCompressionNotices, type CompressionNotice as CompressionWarningRecord } from '@shared/compressionNotices';
 import { useChat } from '@webview/composables/useChat';
 import { messageForkBlocked } from '@webview/composables/forkRequestLifecycle';
@@ -111,6 +111,20 @@ const compressionPositions = computed(() => projection.value.index.compressionPo
 const absoluteFloors = computed(() => projection.value.absoluteFloorByMessageId);
 const splitSourceMessageIds = computed(() => projection.value.splitSourceMessageIdByMessageId);
 const terminations = computed(() => projection.value.terminationByMessageId);
+const messageRevisionIds = computed(() => projection.value.messageRevisionIdByMessageId);
+const contentWindows = computed(() => projection.value.contentWindowByMessageId);
+const interactionsByToolCall = computed(() => projection.value.interactionByToolCallId);
+const modelRequestIdsByMessage = computed(() => projection.value.modelRequestIdByMessageId);
+const completeContentLoaders = new Map<string, () => Promise<MessageContent>>();
+function loadCompleteContentFor(messageId: string): () => Promise<MessageContent> {
+  let loader = completeContentLoaders.get(messageId);
+  if (!loader) {
+    loader = () => completeMessageContent(messageId);
+    if (completeContentLoaders.size >= 256) completeContentLoaders.clear();
+    completeContentLoaders.set(messageId, loader);
+  }
+  return loader;
+}
 const mountedTransientRequestIds = computed(() => new Set(messageOrderIds.value.flatMap((id) =>
   id.startsWith('transient:')
     ? [id.slice('transient:'.length)]
@@ -242,7 +256,29 @@ function latestReadingStart(): number {
   return Math.max(run.start, run.end - TIMELINE_MOUNT_LIMIT);
 }
 const visibleRowMembership = computed(() => timelineRows.value.slice(segmentStart.value, segmentEnd.value));
-const visibleTimelineRows = computed(() => visibleRowMembership.value.map(row => row.kind === 'message' ? { ...row, message: projection.value.index.messageById.get(row.message.id)! } : row));
+type TimelineMessageRow = Omit<Extract<(typeof timelineRows.value)[number], { kind: 'message' }>, 'message'> & {
+  message: MessageRecord;
+};
+let previousVisibleMessageRows = new Map<string, TimelineMessageRow>();
+const visibleTimelineRows = computed(() => {
+  const nextMessageRows = new Map<string, TimelineMessageRow>();
+  const rows = visibleRowMembership.value.map((row) => {
+    if (row.kind !== 'message') return row;
+    const message = projection.value.index.messageById.get(row.message.id)!;
+    const prior = previousVisibleMessageRows.get(row.id);
+    const resolved = prior && prior.message === message ? prior : { ...row, message };
+    nextMessageRows.set(row.id, resolved);
+    return resolved;
+  });
+  previousVisibleMessageRows = nextMessageRows;
+  return rows;
+});
+const visibleMessageIds = computed<readonly string[]>((previous) => {
+  const next = visibleRowMembership.value.flatMap((row) => row.kind === 'message' ? [row.message.id] : []);
+  return previous && previous.length === next.length && next.every((id, index) => id === previous[index])
+    ? previous
+    : next;
+});
 const visibleMessageRows = computed(() => visibleTimelineRows.value.flatMap((row) =>
   row.kind === 'message' ? [row.message] : []
 ));
@@ -598,26 +634,24 @@ const visibleRetryBoundaryMessageId = computed(() => {
 
 watch(
   () => [
-    ...visibleTimelineRows.value.flatMap((row) => row.kind === 'collaboration' && row.card.acceptedAnswerId
+    ...visibleRowMembership.value.flatMap((row) => row.kind === 'collaboration' && row.card.acceptedAnswerId
       ? [row.card.acceptedAnswerId] : []),
-    ...visibleMessageRows.value.map(messageDetailDemandSignature),
-    ...Object.entries(projection.value.interactionByToolCallId)
+    ...visibleMessageIds.value.map(messageDetailDemandSignatureById),
+    ...Object.entries(interactionsByToolCall.value)
       .filter(([, interaction]) => interaction.status === 'pending')
       .map(([toolCallId]) => toolCallId)
   ].join('|'),
   () => {
-    feed.retainMessageContentWindows(visibleMessageRows.value.map(message => historySourceMessageId(message.id)));
-    const pinnedDetailKeys = visibleMessageRows.value.flatMap((message) => {
-      if (projection.value.contentWindowByMessageId[message.id]) return [];
-      const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+    feed.retainMessageContentWindows(visibleMessageIds.value.map(id => historySourceMessageId(id)));
+    const pinnedDetailKeys = visibleMessageIds.value.flatMap((id) => {
+      if (contentWindows.value[id]) return [];
+      const revisionId = messageRevisionIds.value[id];
       return revisionId ? [reliableKernelDetailKey('message-content', revisionId)] : [];
     });
-    feed.setPinnedDetailKeys([...pinnedDetailKeys, ...visibleTimelineRows.value.flatMap((row) =>
+    feed.setPinnedDetailKeys([...pinnedDetailKeys, ...visibleRowMembership.value.flatMap((row) =>
       row.kind === 'collaboration' && row.card.acceptedAnswerId
         ? [reliableKernelDetailKey('accepted-answer-content', row.card.acceptedAnswerId)] : [])]);
-    const demand = prioritizedTimelineDetailDemand(
-      visibleMessageRows.value.map((message) => message.id)
-    );
+    const demand = prioritizedTimelineDetailDemand(visibleMessageIds.value);
     // The body nearest the composer must win the first transport slot. Pending interactions remain
     // critical, but are admitted only after that body so an old Conversation never paints its tail
     // last merely because the mounted segment is ordered chronologically.
@@ -886,31 +920,31 @@ function dismissCompressionWarning(warning: CompressionWarningRecord): void {
   timelinePresentation.suppress(conversationId.value, 'compression-warning', warning.id);
 }
 
-function messageDetailDemandSignature(message: MessageRecord): string {
-  const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
-  if (!revisionId) return `message:${message.id}:no-revision`;
+function messageDetailDemandSignatureById(messageId: string): string {
+  const revisionId = messageRevisionIds.value[messageId];
+  if (!revisionId) return `message:${messageId}:no-revision`;
   const status = feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status;
   return reliableKernelDetailDemandSignature({
     hydrate: true,
-    callId: message.id,
+    callId: messageId,
     targets: [{ kind: 'message-content', recordId: revisionId, status }]
   });
 }
 
 function messageDetailReady(message: MessageRecord): boolean {
-  const window = projection.value.contentWindowByMessageId[message.id];
+  const window = contentWindows.value[message.id];
   if (window) return !window.loading;
-  const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+  const revisionId = messageRevisionIds.value[message.id];
   if (!revisionId) return false;
   return feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status === 'ready';
 }
 
 function messageDetailLoading(message: MessageRecord): boolean {
   if (submissionEchoByMessageId.value[message.id]) return false;
-  const window = projection.value.contentWindowByMessageId[message.id];
+  const window = contentWindows.value[message.id];
   if (window) return window.loading && message.content.parts.length === 0;
   if (message.content.parts.length > 0) return false;
-  const revisionId = projection.value.messageRevisionIdByMessageId[message.id];
+  const revisionId = messageRevisionIds.value[message.id];
   if (!revisionId) return false;
   const status = feed.details[reliableKernelDetailKey('message-content', revisionId)]?.status;
   return status === undefined || status === 'loading';
@@ -965,7 +999,7 @@ function messageRenderKey(message: MessageRecord): string {
     ? message.id.slice('transient:'.length)
     : undefined;
   const modelRequestId = transientRequestId
-    || projection.value.modelRequestIdByMessageId[message.id];
+    || modelRequestIdsByMessage.value[message.id];
   return modelRequestId ? `model-request:${modelRequestId}` : `message:${message.id}`;
 }
 </script>
@@ -1010,12 +1044,12 @@ function messageRenderKey(message: MessageRecord): string {
         <MessageItem
           :message="displayedMessage(row.message)"
           :scroller="scroller"
-          :content-window="projection.contentWindowByMessageId[row.message.id]"
-          :load-complete-content="() => completeMessageContent(row.message.id)"
+          :content-window="contentWindows[row.message.id]"
+          :load-complete-content="loadCompleteContentFor(row.message.id)"
           @earlier-content="feed.moveMessageContentWindow(historySourceMessageId(row.message.id), 'before')"
           @later-content="feed.moveMessageContentWindow(historySourceMessageId(row.message.id), 'after')"
           @retry-content="feed.retryMessageContentWindow(historySourceMessageId(row.message.id))"
-          :run-id="projection.turnIdByMessageId[row.message.id]"
+          :run-id="messageTurnIds[row.message.id]"
           :termination="messageTermination(row.message)"
           :termination-notice-suppressed="isMessageTerminationSuppressed(row.message)"
           :run-had-completed-tools="runHadCompletedTools(row.message)"
@@ -1024,9 +1058,9 @@ function messageRenderKey(message: MessageRecord): string {
           :detail-loading="messageDetailLoading(row.message)"
           :detail-ready="messageDetailReady(row.message)"
           :mutation-pending="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message))"
-          :mutation-blocked="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
+          :mutation-blocked="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message)) || !messageRevisionIds[row.message.id]"
           :retry-blocked="!!submissionEchoByMessageId[row.message.id] || retryBlocked(row.message)"
-          :compact-blocked="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message)) || !projection.messageRevisionIdByMessageId[row.message.id]"
+          :compact-blocked="!!submissionEchoByMessageId[row.message.id] || (conversationActionPending && isConversationActionTarget(row.message)) || !messageRevisionIds[row.message.id]"
           :fork-blocked="!!submissionEchoByMessageId[row.message.id] || forkBlocked(row.message)"
           :pending-label="submissionEchoByMessageId[row.message.id]?.label ?? conversationActionLabel ?? '正在提交操作'"
           :floor-number="timelineFloor(row.message)"

@@ -133,24 +133,33 @@ export function packConversationHistoryForestIntoPages(
 
 /** Aggregate descendant Agent lifecycle/delivery facts without rewriting the root Conversation. */
 export function summarizeDescendantAgents(
-  node: ConversationHistoryTreeNode
+  node: ConversationHistoryTreeNode,
+  cache?: WeakMap<ConversationHistoryTreeNode, ConversationHistoryDescendantAgentSummary>
 ): ConversationHistoryDescendantAgentSummary {
+  const cached = cache?.get(node);
+  if (cached) return cached;
   const summary: ConversationHistoryDescendantAgentSummary = {
     running: 0,
     awaitingParent: 0,
     interrupted: 0,
     deliveryFailed: 0
   };
-  const visit = (candidate: ConversationHistoryTreeNode): void => {
-    if (candidate.originLink?.originKind === 'agent') {
-      if (candidate.entry.runState === 'running' || candidate.entry.isRunning) summary.running += 1;
-      else if (candidate.entry.runState === 'awaiting_parent') summary.awaitingParent += 1;
-      else if (candidate.entry.runState === 'interrupted') summary.interrupted += 1;
-      else if (candidate.entry.runState === 'delivery_failed') summary.deliveryFailed += 1;
+  for (const child of node.children) {
+    if (child.originLink?.originKind === 'agent') {
+      if (child.entry.runState === 'running' || child.entry.isRunning) summary.running += 1;
+      else if (child.entry.runState === 'awaiting_parent') summary.awaitingParent += 1;
+      else if (child.entry.runState === 'interrupted') summary.interrupted += 1;
+      else if (child.entry.runState === 'delivery_failed') summary.deliveryFailed += 1;
     }
-    for (const child of candidate.children) visit(child);
-  };
-  for (const child of node.children) visit(child);
+    if (child.children.length > 0) {
+      const childSummary = summarizeDescendantAgents(child, cache);
+      summary.running += childSummary.running;
+      summary.awaitingParent += childSummary.awaitingParent;
+      summary.interrupted += childSummary.interrupted;
+      summary.deliveryFailed += childSummary.deliveryFailed;
+    }
+  }
+  cache?.set(node, summary);
   return summary;
 }
 

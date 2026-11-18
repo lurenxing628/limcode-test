@@ -20,8 +20,10 @@ const {
   projectSummaryModelWindow,
   withSummaryDispatchRefs
 } = load('backend/reliableKernel/modelFacingContextProjection.js');
-const { estimateTextTokens } = load('backend/reliableKernel/modelTokenEstimator.js');
+const { estimateTextTokens, estimateJsonTokens } = load('backend/reliableKernel/modelTokenEstimator.js');
 const { applyReliableKernelDataMessage, createEmptyReliableKernelClientState } = load('shared/reliableKernelClientFeed.js');
+const { toStructuredClonePlainData } = load('shared/plainData.js');
+const { sliceTextFile, READ_SLICE_MAX_BYTES } = load('backend/capabilities/textFileSlice.js');
 
 function summaryProviderSettings(baseUrl, contextWindowTokens = 65_536) {
   return {
@@ -469,4 +471,222 @@ test('SQLite 关键投影查询无全表扫描，且消息计数支持带序号�
 
   const projectedBlock = projection.projectCompressionBlockRecord(f.db, 'cb-anchor');
   assert.equal(projectedBlock.anchor_message_id, 'm-500', 'anchor_message_id must resolve the highest position source');
+});
+
+test('sqlite_stat1 空闲偏态 (INDEX_ONE_VALUE) 下关键状态与恢复查询仍走 B-tree SEARCH 索引', async (t) => {
+  const f = projectionDatabase(t);
+  f.db.exec('ANALYZE');
+  // Simulate a large idle database where ANALYZE recorded `stat = "N N"` (avg_eq == total),
+  // which triggers SQLite `where.c`'s INDEX_ONE_VALUE rule against ordinary `=` / `IN` predicates.
+  const poisonedStats = [
+    ['tool_call', 'ix_tool_call_02', '25913 25913'],
+    ['operation', 'ix_operation_03', '25913 25913'],
+    ['effect_intent', 'ix_effect_intent_02', '15575 15575'],
+    ['runtime_delivery_wake', 'ix_runtime_delivery_wake_02', '416 416 416'],
+    ['turn', 'ix_turn_02', '3038 3038'],
+    ['child_interruption_turn_link', null, '15'],
+    ['process_completion_source_link', 'ix_process_completion_source_link_03', '21764 2']
+  ];
+  const insertStat = f.db.prepare('INSERT OR REPLACE INTO sqlite_stat1(tbl, idx, stat) VALUES (?, ?, ?)');
+  for (const [tbl, idx, stat] of poisonedStats) insertStat.run(tbl, idx, stat);
+  f.db.exec('ANALYZE sqlite_master');
+
+  const explainDetails = (sql, params = {}) =>
+    f.db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all(params).map((row) => String(row.detail)).join('\n');
+
+  // 1. Closed-range status/state/dispatch_state predicates must use B-tree SEARCH, never full SCAN.
+  for (const [table, column, indexName, val] of [
+    ['tool_call', 'status', 'ix_tool_call_02', 'executing'],
+    ['operation', 'status', 'ix_operation_03', 'waiting_answer'],
+    ['effect_intent', 'dispatch_state', 'ix_effect_intent_02', 'dispatched'],
+    ['runtime_delivery_wake', 'state', 'ix_runtime_delivery_wake_02', 'pending'],
+    ['turn', 'status', 'ix_turn_02', 'active']
+  ]) {
+    const plan = explainDetails(
+      `SELECT * FROM "${table}" WHERE ("${column}" >= @v AND "${column}" <= @v) ORDER BY "id" ASC LIMIT 16`,
+      { v: val }
+    );
+    assert.match(plan, new RegExp(`SEARCH ${table} USING INDEX ${indexName}`));
+    assert.doesNotMatch(plan, new RegExp(`SCAN ${table}\\b`));
+  }
+
+  // 2. Effect receipt reconciliation CTE + closed-range join must SEARCH ix_tool_call_02 & ix_operation_03.
+  const effectReconcilePlan = explainDetails(`
+    WITH active_tool_status(status) AS (
+      VALUES ('pending'), ('executing'), ('waiting_approval'), ('waiting_answer')
+    ), active_op_status(status) AS (
+      VALUES ('pending'), ('executing'), ('waiting_answer')
+    )
+    SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
+      FROM active_tool_status
+      CROSS JOIN tool_call AS tool_call_row INDEXED BY ix_tool_call_02
+        ON tool_call_row.status >= active_tool_status.status
+       AND tool_call_row.status <= active_tool_status.status
+      CROSS JOIN operation AS operation_row
+      CROSS JOIN attempt AS attempt_row
+      CROSS JOIN effect_intent AS intent
+      CROSS JOIN effect_receipt AS receipt
+     WHERE operation_row.tool_call_id = tool_call_row.id
+       AND operation_row.owner_kind <> 'interaction_request'
+       AND attempt_row.operation_id = operation_row.id
+       AND intent.attempt_id = attempt_row.id
+       AND receipt.attempt_id = attempt_row.id
+       AND intent.dispatch_state = 'receipt_written'
+       AND intent.effect_kind <> 'subagent_spawn'
+    UNION ALL
+    SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
+      FROM active_op_status
+      CROSS JOIN operation AS operation_row INDEXED BY ix_operation_03
+        ON operation_row.status >= active_op_status.status
+       AND operation_row.status <= active_op_status.status
+      CROSS JOIN attempt AS attempt_row
+      CROSS JOIN effect_intent AS intent
+      CROSS JOIN effect_receipt AS receipt
+     WHERE operation_row.tool_call_id IS NULL
+       AND operation_row.owner_kind NOT IN ('model_request', 'answer_bridge', 'child_execution')
+       AND attempt_row.operation_id = operation_row.id
+       AND intent.attempt_id = attempt_row.id
+       AND receipt.attempt_id = attempt_row.id
+       AND intent.dispatch_state = 'receipt_written'
+       AND intent.effect_kind <> 'subagent_spawn'
+     ORDER BY effect_intent_id ASC
+  `);
+  assert.match(effectReconcilePlan, /SEARCH tool_call_row USING INDEX ix_tool_call_02/);
+  assert.match(effectReconcilePlan, /SEARCH operation_row USING INDEX ix_operation_03/);
+  assert.doesNotMatch(effectReconcilePlan, /SCAN tool_call_row\b|SCAN operation_row\b/);
+
+  // 3. Child process cleanup materialization must drive from small `turn_link` and SEARCH `source_link`.
+  const cleanupPlan = explainDetails(`
+    SELECT turn_link.id AS turn_link_id, source_link.id AS source_link_id
+      FROM child_interruption_turn_link AS turn_link
+      CROSS JOIN process_completion_source_link AS source_link
+        ON source_link.source_turn_id = turn_link.turn_id
+      LEFT JOIN child_interruption_process_cleanup AS cleanup
+        ON cleanup.interruption_request_id = turn_link.interruption_request_id
+       AND cleanup.process_id = source_link.process_id
+     WHERE cleanup.id IS NULL
+     ORDER BY turn_link.id ASC, source_link.id ASC
+  `);
+  assert.match(cleanupPlan, /SEARCH source_link USING INDEX/);
+  assert.doesNotMatch(cleanupPlan, /SCAN source_link\b/);
+
+  // 4. End-to-end runtime database worker smoke check for executeRead closed-range & reconciliation queries.
+  const rt = await createBehaviorRuntime('perf-stat1');
+  try {
+    assert.deepEqual(await rt.app.database.effectReceiptReconciliationCandidates(), []);
+    assert.deepEqual(await rt.app.database.childProcessCleanupMaterializationCandidates(), []);
+    const snap = await rt.app.database.snapshot([
+      kernel.DOMAIN_REPOSITORIES.domain('ToolCall').list({ where: { status: 'executing' }, limit: 10 }),
+      kernel.DOMAIN_REPOSITORIES.domain('EffectIntent').list({
+        where: { effect_kind: 'subagent_spawn', dispatch_state: 'dispatched' },
+        limit: 10
+      }),
+      kernel.DOMAIN_REPOSITORIES.domain('RuntimeDeliveryWake').list({ where: { state: 'pending' }, limit: 10 })
+    ]);
+    assert.deepEqual(snap.snapshot, [[], [], []]);
+  } finally {
+    await rt.close();
+  }
+});
+
+test('toStructuredClonePlainData、sliceTextFile 与冻结 JSON Token 缓存保持精确契约一致', () => {
+  const input = {
+    str: 'hello',
+    num: 42,
+    bool: false,
+    nil: null,
+    omitted: undefined,
+    arr: [1, undefined, { nested: 'ok', drop: undefined }]
+  };
+  assert.deepEqual(toStructuredClonePlainData(input, 'root'), {
+    str: 'hello',
+    num: 42,
+    bool: false,
+    nil: null,
+    arr: [1, null, { nested: 'ok' }]
+  });
+
+  assert.throws(
+    () => toStructuredClonePlainData({ a: [{ b: Number.NaN }] }, 'msg'),
+    { name: 'TypeError', message: 'msg.a[0].b contains a non-finite number.' }
+  );
+  assert.throws(
+    () => toStructuredClonePlainData(undefined, 'top'),
+    { name: 'TypeError', message: 'top contains undefined outside an optional object field.' }
+  );
+  assert.throws(
+    () => toStructuredClonePlainData({ fn: () => {} }, 'msg'),
+    { name: 'TypeError', message: 'msg.fn contains unsupported function.' }
+  );
+  assert.throws(
+    () => toStructuredClonePlainData({ items: [new Map()] }, 'msg'),
+    { name: 'TypeError', message: 'msg.items[0] contains a forbidden class instance.' }
+  );
+  class CustomBox {}
+  assert.throws(
+    () => toStructuredClonePlainData({ box: new CustomBox() }, 'msg'),
+    { name: 'TypeError', message: 'msg.box contains a non-plain class instance.' }
+  );
+  const cyclic = { inner: {} };
+  cyclic.inner.self = cyclic;
+  assert.throws(
+    () => toStructuredClonePlainData(cyclic, 'cycleRoot'),
+    { name: 'TypeError', message: 'cycleRoot.inner.self contains a cycle.' }
+  );
+
+  // Reference split(/\r?\n/) comparison for sliceTextFile across edge cases.
+  const referenceSlice = (p, content, startLine, endLine) => {
+    const fileLines = content.split(/\r?\n/);
+    const from = typeof startLine === 'number' && Number.isFinite(startLine) ? Math.max(1, Math.floor(startLine)) : 1;
+    const to = typeof endLine === 'number' && Number.isFinite(endLine)
+      ? Math.min(fileLines.length, Math.max(1, Math.floor(endLine)))
+      : fileLines.length;
+    const lines = [];
+    let budget = READ_SLICE_MAX_BYTES;
+    for (let i = from; i <= to; i += 1) {
+      const text = fileLines[i - 1] ?? '';
+      const cost = Buffer.byteLength(`${i} ${text}`, 'utf8') + (lines.length > 0 ? 1 : 0);
+      if (cost > budget && lines.length > 0) break;
+      budget -= cost;
+      lines.push({ line: i, text });
+    }
+    return {
+      path: p,
+      startLine: from,
+      endLine: lines.length > 0 ? lines[lines.length - 1].line : to,
+      totalLines: fileLines.length,
+      lines,
+      content: lines.map((l) => `${l.line} ${l.text}`).join('\n')
+    };
+  };
+
+  for (const sample of [
+    '',
+    'single-line',
+    'a\n',
+    'a\r\nb\r\n',
+    'bare\rcarriage\nnext',
+    Array.from({ length: 400 }, (_, idx) => `line-${idx + 1}-${'x'.repeat(900)}`).join('\n')
+  ]) {
+    for (const [s, e] of [[undefined, undefined], [1, 1], [2, 3], [10, 5], [999, undefined], [1, 0]]) {
+      assert.deepEqual(sliceTextFile('f.txt', sample, s, e), referenceSlice('f.txt', sample, s, e));
+    }
+  }
+
+  // Deeply frozen tool declaration schema caches exact token count without mutability hazard.
+  const frozenSchema = Object.freeze({
+    name: 'read',
+    description: 'Read a file slice from the workspace',
+    parameters: Object.freeze({
+      type: 'object',
+      properties: Object.freeze({
+        path: Object.freeze({ type: 'string' }),
+        startLine: Object.freeze({ type: 'integer' })
+      }),
+      required: Object.freeze(['path'])
+    })
+  });
+  const firstTokens = estimateJsonTokens(frozenSchema);
+  assert.ok(firstTokens > 0);
+  assert.equal(estimateJsonTokens(frozenSchema), firstTokens);
 });
