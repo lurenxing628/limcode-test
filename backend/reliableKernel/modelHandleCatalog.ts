@@ -842,9 +842,10 @@ export function projectKnownToolValue(
     if (!hasMore) delete record.nextCursor;
     if (!running && !hasMore) delete record.processRef;
   }
-  if (toolName === 'run_agent' || toolName === 'read_agent_answer') {
+  if (toolName === 'run_agent' || toolName === 'read_agent_answer' || toolName === 'submit_plan') {
     for (const key of [
-      'agentId', 'runId', 'conversationId', 'childExecutionId', 'submissionId',
+      'agentId', 'runId', 'conversationId', 'childConversationId', 'childTurnId',
+      'childExecutionId', 'submissionId', 'answerSubmissionId', 'proposalId',
       'sourceTurnId', 'activeTurnIds', 'cancelledIntentIds'
     ]) delete record[key];
   }
