@@ -3511,15 +3511,25 @@ function executeProcessOutputRegistrationMismatches(
 function executeEffectReceiptReconciliationCandidates(
   database: Database.Database
 ): EffectReceiptReconciliationCandidate[] {
+  // Closed range bounds (`>=` + `<=`) preserve exact equality semantics while bypassing SQLite's
+  // `INDEX_ONE_VALUE` rule when `sqlite_stat1` was sampled at idle (`stat = 'N N'`).
   const rows = prepareCached(database, `
+    WITH active_tool_status(status) AS (
+      VALUES ('pending'), ('executing'), ('waiting_approval'), ('waiting_answer')
+    ), active_op_status(status) AS (
+      VALUES ('pending'), ('executing'), ('waiting_answer')
+    )
     SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
-      FROM tool_call AS tool_call_row INDEXED BY ix_tool_call_02
+      FROM active_tool_status
+      CROSS JOIN tool_call AS tool_call_row INDEXED BY ix_tool_call_02
+        ON tool_call_row.status >= active_tool_status.status
+       AND tool_call_row.status <= active_tool_status.status
       CROSS JOIN operation AS operation_row
       CROSS JOIN attempt AS attempt_row
       CROSS JOIN effect_intent AS intent
       CROSS JOIN effect_receipt AS receipt
-     WHERE tool_call_row.status IN ('pending', 'executing', 'waiting_approval', 'waiting_answer')
-       AND operation_row.tool_call_id = tool_call_row.id
+     WHERE operation_row.tool_call_id = tool_call_row.id
+       AND operation_row.owner_kind <> 'interaction_request'
        AND attempt_row.operation_id = operation_row.id
        AND intent.attempt_id = attempt_row.id
        AND receipt.attempt_id = attempt_row.id
@@ -3531,12 +3541,15 @@ function executeEffectReceiptReconciliationCandidates(
        )
     UNION ALL
     SELECT intent.id AS effect_intent_id, receipt.id AS effect_receipt_id
-      FROM operation AS operation_row INDEXED BY ix_operation_03
+      FROM active_op_status
+      CROSS JOIN operation AS operation_row INDEXED BY ix_operation_03
+        ON operation_row.status >= active_op_status.status
+       AND operation_row.status <= active_op_status.status
       CROSS JOIN attempt AS attempt_row
       CROSS JOIN effect_intent AS intent
       CROSS JOIN effect_receipt AS receipt
      WHERE operation_row.tool_call_id IS NULL
-       AND operation_row.status IN ('pending', 'executing', 'waiting_answer')
+       AND operation_row.owner_kind NOT IN ('model_request', 'answer_bridge', 'child_execution')
        AND attempt_row.operation_id = operation_row.id
        AND intent.attempt_id = attempt_row.id
        AND receipt.attempt_id = attempt_row.id
@@ -3574,7 +3587,7 @@ function executeChildProcessCleanupMaterializationCandidates(
            source_link.id AS source_link_id,
            source_link.process_id AS process_id
       FROM child_interruption_turn_link AS turn_link
-      JOIN process_completion_source_link AS source_link
+      CROSS JOIN process_completion_source_link AS source_link
         ON source_link.source_turn_id = turn_link.turn_id
       LEFT JOIN child_interruption_process_cleanup AS cleanup
         ON cleanup.interruption_request_id = turn_link.interruption_request_id
@@ -3626,6 +3639,10 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
   if (!repository.codec.hasColumn(orderColumn)) throw new Error(`${schema.repository} cannot order by ${orderColumn}.`);
   const disarmStatusIndex = orderColumn !== 'status'
     && hasSelectiveParentFilter(encodedWhere, read.toolConversationId !== undefined);
+  const whereKeys = Object.keys(encodedWhere);
+  const bypassOneValueIndex = !disarmStatusIndex
+    && read.toolConversationId === undefined
+    && whereKeys.every((key) => key === 'status' || key === 'state' || key === 'dispatch_state' || key === 'effect_kind');
   const predicates: string[] = [];
   const parameters: EncodedRow & { __after_id?: string; __limit?: bigint } = {};
   for (const [name, value] of Object.entries(encodedWhere)) {
@@ -3634,6 +3651,16 @@ function executeRead(database: Database.Database, read: RepositoryRead): DomainR
       // Prevent un-analyzed SQLite plans from choosing single-column ix_*_status over high-selectivity
       // entity foreign-key indexes (turn_id, tool_call_id, operation_id, attempt_id, owner_kind+owner_id).
       predicates.push(`+${quote(name)} = @${name}`);
+      parameters[name] = value;
+    } else if (
+      bypassOneValueIndex
+      && typeof value === 'string'
+      && (name === 'status' || name === 'state' || name === 'dispatch_state')
+      && read.keyset?.column !== name
+    ) {
+      // Closed range bounds bypass SQLite `where.c`'s `INDEX_ONE_VALUE` suppression when `sqlite_stat1`
+      // recorded idle-state skew (`stat = 'N N'`), restoring O(log N) B-tree seeks for active/pending rows.
+      predicates.push(`(${quote(name)} >= @${name} AND ${quote(name)} <= @${name})`);
       parameters[name] = value;
     } else {
       predicates.push(`${quote(name)} = @${name}`);

@@ -2025,7 +2025,8 @@ export function executeConversationHistoryProjection(
     const turns = mergeRowsById([
       ...queryConversationIdChunks(database, conversationIds, (placeholders) => `
         SELECT * FROM turn INDEXED BY ix_turn_02
-         WHERE conversation_id IN (${placeholders}) AND status = 'active'
+         WHERE conversation_id IN (${placeholders})
+           AND status >= 'active' AND status <= 'active'
          ORDER BY id ASC
       `),
       ...queryAllByIds(database, 'turn', 'id', [

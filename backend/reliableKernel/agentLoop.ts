@@ -1548,25 +1548,40 @@ export class ReliableAgentLoop {
     if (structure.root.id !== rootId) throw new Error('Native reasoning predecessor snapshot names another root.');
     if (structure.root.conversation_id !== conversationId) throw new Error('Native reasoning predecessor belongs to another Context scope.');
     for (let index = structure.records.length - 1; index >= 0; index--) {
-      const segment = structure.records[index].segment;
+      const record = structure.records[index]! as (typeof structure.records)[number] & {
+        readonly messageRole?: string | null;
+        readonly sourceModelRequestId?: string;
+      };
+      const segment = record.segment;
       if (segment.segment_kind === 'compression') return undefined;
       if (segment.segment_kind !== 'message' && segment.segment_kind !== 'tool_pair') continue;
-      const sources = await this.list('ContextSegmentSource', { segment_id: requireId(segment.id, 'Context segment id') }, 32);
+      if (
+        segment.segment_kind === 'message'
+        && typeof record.messageRole === 'string'
+        && record.messageRole !== 'model'
+      ) {
+        continue;
+      }
       const requestIds = new Set<string>();
-      for (const source of sources) {
-        if (source.source_kind === 'message_revision') {
-          const revision = await this.maybeGet('MessageRevision', requireId(source.source_id, 'Context Message revision'));
-          if (!revision || revision.role !== 'model' || revision.revision_seq !== source.source_revision
-            || revision.content_object_id !== segment.content_object_id) continue;
-          const links = await this.list('ModelRequestMessageLink', { message_id: revision.message_id }, 2);
-          for (const link of links) requestIds.add(requireId(link.model_request_id, 'Model output request'));
-        } else if (source.source_kind === 'tool_call' || source.source_kind === 'tool_model_result') {
-          const result = source.source_kind === 'tool_model_result'
-            ? await this.maybeGet('ToolModelResult', requireId(source.source_id, 'Context tool result')) : null;
-          if (source.source_kind === 'tool_model_result' && !result) continue;
-          const toolCallId = requireId(result?.tool_call_id ?? source.source_id, 'Context tool call');
-          for (const link of await this.list('ToolCallSourceLink', { tool_call_id: toolCallId }, 2)) {
-            requestIds.add(requireId(link.model_request_id, 'Tool source request'));
+      if (segment.segment_kind === 'message' && typeof record.sourceModelRequestId === 'string' && record.sourceModelRequestId) {
+        requestIds.add(requireId(record.sourceModelRequestId, 'Model output request'));
+      } else {
+        const sources = await this.list('ContextSegmentSource', { segment_id: requireId(segment.id, 'Context segment id') }, 32);
+        for (const source of sources) {
+          if (source.source_kind === 'message_revision') {
+            const revision = await this.maybeGet('MessageRevision', requireId(source.source_id, 'Context Message revision'));
+            if (!revision || revision.role !== 'model' || revision.revision_seq !== source.source_revision
+              || revision.content_object_id !== segment.content_object_id) continue;
+            const links = await this.list('ModelRequestMessageLink', { message_id: revision.message_id }, 2);
+            for (const link of links) requestIds.add(requireId(link.model_request_id, 'Model output request'));
+          } else if (source.source_kind === 'tool_call' || source.source_kind === 'tool_model_result') {
+            const result = source.source_kind === 'tool_model_result'
+              ? await this.maybeGet('ToolModelResult', requireId(source.source_id, 'Context tool result')) : null;
+            if (source.source_kind === 'tool_model_result' && !result) continue;
+            const toolCallId = requireId(result?.tool_call_id ?? source.source_id, 'Context tool call');
+            for (const link of await this.list('ToolCallSourceLink', { tool_call_id: toolCallId }, 2)) {
+              requestIds.add(requireId(link.model_request_id, 'Tool source request'));
+            }
           }
         }
       }

@@ -81,6 +81,8 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     active?: WorkEnvironmentRecord;
     allowed: WorkEnvironmentRecord[];
   }>>();
+  private readonly attachmentMaxBytesByAuthority = new WeakMap<object, Promise<number>>();
+  private readonly skillDirectoriesByAuthority = new WeakMap<object, { catalogSignature: string; dirs: string[] }>();
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -232,7 +234,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     if (!['read', 'skills'].includes(definition.declaration.name)) {
       throw new Error(`Tool ${definition.declaration.name} is not classified as a repeatable no-effect capability.`);
     }
-    const environments = await this.resolveEnvironments(authority);
+    const environments = await this.workEnvironmentsForAuthority(authority);
     const context: ToolExecutionContext = {
       toolCallId: input.toolCallId,
       conversationId: authorityConversationId(authority.document),
@@ -244,7 +246,7 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
       workEnvironments: environments.allowed,
       accessibleWorkEnvironments: environments.allowed,
       ...(definition.declaration.name === 'read' && !reliableReadAttachmentId(input.arguments)
-        ? { attachmentMaxBytes: await this.loadAttachmentMaxBytes(), skillDirectories: this.skillDirectoriesFor(authority) }
+        ? { attachmentMaxBytes: await this.loadAttachmentMaxBytes(authority), skillDirectories: this.skillDirectoriesFor(authority) }
         : {}),
       signal,
       emit
@@ -273,9 +275,25 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
    */
   private skillDirectoriesFor(authority: ReliableToolDispatchAuthority): string[] {
     try {
-      if (!frozenToolPolicyDocument(authority.document).allowedTools.includes(SKILLS_TOOL_NAME)) return [];
+      const key = authority.document && typeof authority.document === 'object'
+        ? authority.document as object
+        : undefined;
+      const catalogSignature = this.skills
+        .list()
+        .map((skill) => `${skill.id}\0${skill.dir}\0${skill.pluginRoot ?? ''}`)
+        .join('\n');
+      if (key) {
+        const cached = this.skillDirectoriesByAuthority.get(key);
+        if (cached && cached.catalogSignature === catalogSignature) return [...cached.dirs];
+      }
+      if (!frozenToolPolicyDocument(authority.document).allowedTools.includes(SKILLS_TOOL_NAME)) {
+        if (key) this.skillDirectoriesByAuthority.set(key, { catalogSignature, dirs: [] });
+        return [];
+      }
       const skills = skillCatalogWithinPolicy(this.skills, frozenSkillPolicy(authority.document)).list();
-      return [...new Set(skills.flatMap((skill) => [skill.dir, ...(skill.pluginRoot ? [skill.pluginRoot] : [])]))];
+      const dirs = [...new Set(skills.flatMap((skill) => [skill.dir, ...(skill.pluginRoot ? [skill.pluginRoot] : [])]))];
+      if (key) this.skillDirectoriesByAuthority.set(key, { catalogSignature, dirs });
+      return [...dirs];
     } catch {
       return [];
     }
@@ -463,7 +481,27 @@ export class VscodeReliableToolHost implements ReliableToolDispatcherHost {
     };
   }
 
-  private async loadAttachmentMaxBytes(): Promise<number> {
+  private async loadAttachmentMaxBytes(authority?: ReliableToolDispatchAuthority): Promise<number> {
+    const key = authority?.document && typeof authority.document === 'object'
+      ? authority.document as object
+      : undefined;
+    if (key) {
+      let pending = this.attachmentMaxBytesByAuthority.get(key);
+      if (!pending) {
+        pending = this.readAttachmentMaxBytes();
+        this.attachmentMaxBytesByAuthority.set(key, pending);
+        void pending.catch(() => {
+          if (this.attachmentMaxBytesByAuthority.get(key) === pending) {
+            this.attachmentMaxBytesByAuthority.delete(key);
+          }
+        });
+      }
+      return pending;
+    }
+    return this.readAttachmentMaxBytes();
+  }
+
+  private async readAttachmentMaxBytes(): Promise<number> {
     const loaded = await this.configuration.loadGlobalSettings('attachments');
     const settings = asRecord(loaded.settings);
     const maxMb = Number(settings?.maxStoredInlineFileMb);

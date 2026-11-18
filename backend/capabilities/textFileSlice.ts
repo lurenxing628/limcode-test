@@ -12,27 +12,43 @@ export function sliceTextFile(
   startLine: number | undefined,
   endLine: number | undefined
 ): FsReadFileResult {
-  const fileLines = content.split(/\r?\n/);
   const from = normalizeStartLine(startLine);
-  const to = normalizeEndLine(endLine, fileLines.length);
+  const maxRequestedLine = typeof endLine === 'number' && Number.isFinite(endLine)
+    ? Math.max(1, Math.floor(endLine))
+    : Number.POSITIVE_INFINITY;
   const lines: FsReadLine[] = [];
   let budget = READ_SLICE_MAX_BYTES;
+  let budgetExhausted = false;
+  let totalLines = 0;
+  let lineStart = 0;
 
-  for (let i = from; i <= to; i += 1) {
-    const text = fileLines[i - 1] ?? '';
-    const rendered = `${i} ${text}`;
-    const cost = Buffer.byteLength(rendered, 'utf8') + (lines.length > 0 ? 1 : 0);
-    // Always yield the first line, however long, so a read can never come back empty and stall.
-    if (cost > budget && lines.length > 0) break;
-    budget -= cost;
-    lines.push({ line: i, text });
+  while (true) {
+    totalLines += 1;
+    const newlineIndex = content.indexOf('\n', lineStart);
+    const rawEnd = newlineIndex === -1 ? content.length : newlineIndex;
+    if (!budgetExhausted && totalLines >= from && totalLines <= maxRequestedLine) {
+      const lineEnd = rawEnd > lineStart && content.charCodeAt(rawEnd - 1) === 13 ? rawEnd - 1 : rawEnd;
+      const text = content.slice(lineStart, lineEnd);
+      const rendered = `${totalLines} ${text}`;
+      const cost = Buffer.byteLength(rendered, 'utf8') + (lines.length > 0 ? 1 : 0);
+      // Always yield the first line, however long, so a read can never come back empty and stall.
+      if (cost > budget && lines.length > 0) {
+        budgetExhausted = true;
+      } else {
+        budget -= cost;
+        lines.push({ line: totalLines, text });
+      }
+    }
+    if (newlineIndex === -1) break;
+    lineStart = newlineIndex + 1;
   }
 
+  const to = normalizeEndLine(endLine, totalLines);
   return {
     path,
     startLine: from,
     endLine: lines.length > 0 ? lines[lines.length - 1]!.line : to,
-    totalLines: fileLines.length,
+    totalLines,
     lines,
     content: lines.map((line) => `${line.line} ${line.text}`).join('\n')
   };
