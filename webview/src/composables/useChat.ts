@@ -21,6 +21,7 @@ import {
 } from '@shared/reliableControlLifecycle';
 import { toStructuredClonePlainData } from '@shared/plainData';
 import { RELIABLE_KERNEL_SNAPSHOT_REQUEST_MESSAGE, reliableKernelRuntimeIdentity } from '@shared/reliableKernelClientFeed';
+import type { ReliableKernelBoundedClientState } from '@shared/reliableKernelClientFeed';
 import type { NativeSteeringReceipt } from '@shared/openAIResponsesNative';
 import { mergeSteeringReceipts, steeringReceiptsByConversationState } from '@webview/composables/steeringReceipts';
 import {
@@ -2011,6 +2012,15 @@ export function useChat() {
         setActionNotice(next.conversationId, HISTORY_COMMAND_CONTEXT_CHANGED_MESSAGE);
         return false;
       }
+      if (retrySwitchReplacesIdleRetry(existing, next, reliableConversation.feed.records)) {
+        // The user changed model/channel and asked again while the prior retry has produced
+        // nothing. Its Turn has no committed output to lose, so stop it and submit the new
+        // selection instead of making the user stop it by hand.
+        setConversationAction(next);
+        setActionNotice(next.conversationId, '正在停止上一次重试，随后按新选择的模型重新生成…');
+        reconcileConversationAction(true);
+        return true;
+      }
       if (!sameConversationActionSemantics(existing, next)) {
         setActionNotice(
           next.conversationId,
@@ -2780,6 +2790,33 @@ function sameConversationActionSemantics(
   return left.action === right.action
     && left.targetId === right.targetId
     && JSON.stringify(withoutCommand(left.commandPayload)) === JSON.stringify(withoutCommand(right.commandPayload));
+}
+
+function retrySwitchReplacesIdleRetry(
+  existing: ConversationActionState,
+  next: ConversationActionState,
+  records: ReliableKernelBoundedClientState['records']
+): boolean {
+  if (existing.action !== 'retry' || next.action !== 'retry' || existing.phase !== 'running') return false;
+  const turnId = existing.operationTurnId;
+  if (!turnId || interruptTargetHasSettled(records, turnId)) return false;
+  if (existing.commandPayload.type !== BridgeMessageType.MessageRetryFrom
+    || next.commandPayload.type !== BridgeMessageType.MessageRetryFrom) return false;
+  const before = existing.commandPayload.payload.model;
+  const after = next.commandPayload.payload.model;
+  if (before?.providerConfigId === after?.providerConfigId && before?.model === after?.model) return false;
+  return !turnHasCommittedOutput(records, turnId);
+}
+
+function turnHasCommittedOutput(records: ReliableKernelBoundedClientState['records'], turnId: string): boolean {
+  if (Object.values(records.ToolCall ?? {}).some((call) => call.turn_id === turnId)) return true;
+  if (Object.values(records.MessageTurnLink ?? {}).some((link) =>
+    link.turn_id === turnId && link.role !== 'input')) return true;
+  const requests = new Set(Object.values(records.ModelRequest ?? {})
+    .filter((request) => request.turn_id === turnId)
+    .map((request) => request.id));
+  return requests.size > 0 && Object.values(records.ModelRequestMessageLink ?? {}).some((link) =>
+    requests.has(link.model_request_id));
 }
 
 function withoutCommand(command: ConversationActionPayload): unknown {
