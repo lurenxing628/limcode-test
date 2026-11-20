@@ -40,6 +40,7 @@ import { bridge } from '@webview/transport';
 import { summaryRebuildTooltipRows } from '@webview/components/input/summaryRebuildPreview';
 import { useSummaryRebuildPreview } from '@webview/composables/useSummaryRebuildPreview';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
+import ReliableCacheHitStatus from '@webview/components/conversation/ReliableCacheHitStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
 import SteeringStatusPanel from '@webview/components/input/SteeringStatusPanel.vue';
@@ -1295,6 +1296,7 @@ function agentSourceDescription(agent: AgentRecord): string {
             {{ runtimeBadgeLabel }}
           </button>
         </HoverTooltipPanel>
+        <ReliableCacheHitStatus class="composer-cache-hit" />
         <ReliableContextStatus class="composer-token-usage" />
         <button
           type="button"
@@ -1806,6 +1808,19 @@ function agentSourceDescription(agent: AgentRecord): string {
 .composer-token-usage {
   flex: 0 0 auto;
   margin-left: var(--space-1);
+}
+
+/* 命中率紧贴上下文用量，两者之间只留按钮间距，窄面板上发送行不会被挤出边界。 */
+.composer-cache-hit {
+  flex: 0 0 auto;
+}
+
+.composer-cache-hit + .composer-token-usage {
+  margin-left: calc(var(--space-1) - var(--space-2));
+}
+
+@media (max-width: 340px) {
+  .composer-cache-hit { display: none; }
 }
 
 .composer-send,

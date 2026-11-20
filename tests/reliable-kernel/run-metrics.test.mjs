@@ -3,11 +3,12 @@ import path from 'node:path';
 import { before, after, test } from 'node:test';
 import { createWebviewSsrServer } from './webview-ssr-server.mjs';
 
-let server, modelRunMetrics, normalizeTokenUsage, foldNativeResponseMetrics, parseNativeResponseMetrics, modelRequestResponseMetrics;
+let server, modelRunMetrics, normalizeTokenUsage, cacheHit, foldNativeResponseMetrics, parseNativeResponseMetrics, modelRequestResponseMetrics;
 before(async () => {
   server = await createWebviewSsrServer();
   ({ modelRunMetrics } = await server.ssrLoadModule('/src/components/conversation/runMetricsModel.ts'));
   ({ normalizeTokenUsage } = await server.ssrLoadModule('/src/components/conversation/tokenUsageModel.ts'));
+  cacheHit = await server.ssrLoadModule('/src/components/conversation/cacheHitModel.ts');
   ({ modelRequestResponseMetrics } = await server.ssrLoadModule('/src/reliability/modelRequestStreamStats.ts'));
   ({ foldNativeResponseMetrics, parseNativeResponseMetrics } = await server.ssrLoadModule(path.resolve('backend/reliableKernel/nativeResponseMetrics.ts')));
 });
@@ -85,4 +86,55 @@ test('旧版本写入的累计请求耗时仍可读取，但不参与计速', ()
   const parsed = parseNativeResponseMetrics({ ...response, speedTotalDurationMs: 2000 });
   assert.equal(parsed.speedTotalDurationMs, undefined);
   assert.equal(modelRunMetrics({ responseMetrics: parsed }, false).tokenSpeed, 100);
+});
+
+test('单条命中率按总输入（含缓存）计算，估算用量和没有输入的请求不计入', () => {
+  // Claude 的 promptTokenCount 已由接入库合成 input + cache_creation + cache_read。
+  assert.equal(cacheHit.cacheHitRatio({ promptTokenCount: 223404, cachedContentTokenCount: 199118 }), 199118 / 223404);
+  assert.equal(cacheHit.cacheHitRatio({ promptTokenCount: 1000 }), undefined);
+  assert.equal(cacheHit.formatCacheHitPercent(199118 / 223404), '89%');
+  assert.equal(cacheHit.formatCacheHitPercent(0.004), '<1%');
+  assert.equal(cacheHit.formatCacheHitPercent(0.996), '99%');
+  assert.equal(cacheHit.formatCacheHitPercent(0), '0%');
+  const identity = { providerId: 'p', turnId: 't' };
+  assert.equal(cacheHit.cacheHitSample({ promptTokenCount: 1000, estimated: true }, identity), undefined);
+  assert.equal(cacheHit.cacheHitSample({ promptTokenCount: 0, cachedContentTokenCount: 0 }, identity), undefined);
+  assert.deepEqual(cacheHit.cacheHitSample({ promptTokenCount: 100, cachedContentTokenCount: 120 }, identity),
+    { ...identity, input: 100, cached: 100 });
+});
+
+test('汇总按 Token 加权；报过缓存的渠道缺字段按 0 计，从未报过的渠道单独记为未报告', () => {
+  const sample = (providerId, turnId, input, cached) => ({ providerId, turnId, input, ...(cached !== undefined ? { cached } : {}) });
+  const summary = cacheHit.summarizeCacheHits([
+    sample('gemini', 't2', 1000, 900),
+    sample('gemini', 't2', 1000),
+    sample('relay', 't1', 5000)
+  ]);
+  assert.equal(summary.requests, 3);
+  assert.equal(summary.unreported, 1);
+  assert.equal(summary.inputTokens, 2000);
+  assert.equal(summary.cachedTokens, 900);
+  assert.equal(summary.ratio, 0.45);
+  assert.equal(cacheHit.summarizeCacheHits([sample('relay', 't1', 5000)]).ratio, undefined);
+});
+
+test('底栏只取最近 100 次，最近一轮按最新请求所在的轮次统计，渠道是否报告看全部已加载请求', () => {
+  const newestFirst = [
+    { providerId: 'gemini', turnId: 'latest', createdAt: 3000, input: 1000 },
+    { providerId: 'gemini', turnId: 'latest', createdAt: 2000, input: 1000 },
+    ...Array.from({ length: 120 }, (_, index) => ({
+      providerId: 'gemini', turnId: `old-${index}`, createdAt: 1000 - index, input: 100, cached: 100
+    }))
+  ];
+  const { recent, latestTurn } = cacheHit.recentCacheHitSummaries(newestFirst);
+  assert.equal(recent.requests, cacheHit.CACHE_HIT_RECENT_REQUEST_LIMIT);
+  assert.equal(recent.inputTokens, 2000 + 98 * 100);
+  assert.equal(recent.cachedTokens, 98 * 100);
+  assert.equal(recent.lastAt, 3000);
+  assert.equal(recent.firstAt, 1000 - 97);
+  // 最近一轮两次都没带缓存字段，但同一渠道更早报过：按 0% 计，而不是"未报告"。
+  assert.equal(latestTurn.requests, 2);
+  assert.equal(latestTurn.unreported, 0);
+  assert.equal(latestTurn.ratio, 0);
+  assert.deepEqual(cacheHit.recentCacheHitSummaries([]).latestTurn, undefined);
 });
