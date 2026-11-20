@@ -12,7 +12,10 @@ import {
   turnInputEcho,
   type TurnInputDisplayTarget
 } from '@webview/domain/reliableTurnInputSubmission';
-import type { ReliableKernelDetailState } from '@webview/stores/useReliableKernelClientFeedStore';
+import type {
+  ReliableKernelDetailState,
+  ReliableKernelTransientState
+} from '@webview/stores/useReliableKernelClientFeedStore';
 import {
   decideInterruptWatchdog,
   decideTurnInputWithdrawal,
@@ -2012,7 +2015,9 @@ export function useChat() {
         setActionNotice(next.conversationId, HISTORY_COMMAND_CONTEXT_CHANGED_MESSAGE);
         return false;
       }
-      if (retrySwitchReplacesIdleRetry(existing, next, reliableConversation.feed.records)) {
+      if (retrySwitchReplacesIdleRetry(
+        existing, next, reliableConversation.feed.records, reliableConversation.feed.transientModelRequests
+      )) {
         // The user changed model/channel and asked again while the prior retry has produced
         // nothing. Its Turn has no committed output to lose, so stop it and submit the new
         // selection instead of making the user stop it by hand.
@@ -2795,7 +2800,8 @@ function sameConversationActionSemantics(
 function retrySwitchReplacesIdleRetry(
   existing: ConversationActionState,
   next: ConversationActionState,
-  records: ReliableKernelBoundedClientState['records']
+  records: ReliableKernelBoundedClientState['records'],
+  transient: Record<string, ReliableKernelTransientState>
 ): boolean {
   if (existing.action !== 'retry' || next.action !== 'retry' || existing.phase !== 'running') return false;
   const turnId = existing.operationTurnId;
@@ -2805,7 +2811,14 @@ function retrySwitchReplacesIdleRetry(
   const before = existing.commandPayload.payload.model;
   const after = next.commandPayload.payload.model;
   if (before?.providerConfigId === after?.providerConfigId && before?.model === after?.model) return false;
-  return !turnHasCommittedOutput(records, turnId);
+  return !turnHasCommittedOutput(records, turnId) && !turnHasStreamingOutput(transient, turnId);
+}
+
+// Text, thinking or tool calls still streaming are visible output even before they commit.
+function turnHasStreamingOutput(transient: Record<string, ReliableKernelTransientState>, turnId: string): boolean {
+  return Object.values(transient).some((request) => request.turnId === turnId && (
+    Boolean(request.text || request.thought) || request.outputParts.length > 0 || request.toolCalls.length > 0
+  ));
 }
 
 function turnHasCommittedOutput(records: ReliableKernelBoundedClientState['records'], turnId: string): boolean {

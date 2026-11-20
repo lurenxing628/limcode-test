@@ -141,7 +141,7 @@ test('输入：未确认重试复用command，明确拒绝保留失败输入且�
   assert.ok(chat.sendMessage('new input'));
 });
 
-test('重试：换模型再点重试会停掉未产出的旧重试并按新模型提交，已产出则仍拒绝', async t => {
+test('重试：换模型再点重试会停掉未产出的旧重试并按新模型提交，已产出或正在输出则仍拒绝', async t => {
   const model = id => ({ providerConfigId: id, provider: 'gemini', model: `${id}-model` });
   const retryPosts = () => payloads(ui.protocol.MessageRetryFrom).map(item => item.payload);
   const startRetry = (h, chat, id) => {
@@ -187,6 +187,15 @@ test('重试：换模型再点重试会停掉未产出的旧重试并按新模�
   const blockedInterrupts = payloads(ui.protocol.TurnInterrupt).length;
   assert.equal(producedChat.retryMessageFrom(produced.conversationId, target, { model: model('new-channel') }, 'reply-revision', 3), false);
   assert.equal(payloads(ui.protocol.TurnInterrupt).length, blockedInterrupts);
+
+  const streaming = ui.stores(t), streamingChat = streaming.useChat();
+  running(streaming, startRetry(streaming, streamingChat, 'old-channel'));
+  streaming.feed.transientModelRequests = { 'request-1': { conversationId: streaming.conversationId, turnId: 'retry-turn',
+    modelRequestId: 'request-1', text: '正在输出', thought: '', outputParts: [{ text: '正在输出' }], toolCalls: [], status: 'streaming' } };
+  await tick();
+  const streamingInterrupts = payloads(ui.protocol.TurnInterrupt).length;
+  assert.equal(streamingChat.retryMessageFrom(streaming.conversationId, target, { model: model('new-channel') }, 'reply-revision', 3), false);
+  assert.equal(payloads(ui.protocol.TurnInterrupt).length, streamingInterrupts, '正在流式输出的旧重试不应被替换');
 });
 
 test('输入：真实fork点击只接受匹配结果并打开当前来源的分支', async t => {
