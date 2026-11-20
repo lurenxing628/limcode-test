@@ -141,6 +141,63 @@ test('输入：未确认重试复用command，明确拒绝保留失败输入且�
   assert.ok(chat.sendMessage('new input'));
 });
 
+test('重试：换模型再点重试会停掉未产出的旧重试并按新模型提交，已产出或正在输出则仍拒绝', async t => {
+  const model = id => ({ providerConfigId: id, provider: 'gemini', model: `${id}-model` });
+  const retryPosts = () => payloads(ui.protocol.MessageRetryFrom).map(item => item.payload);
+  const startRetry = (h, chat, id) => {
+    const start = ui.posted.length, target = { kind: 'message', messageId: 'reply' };
+    assert.equal(chat.retryMessageFrom(h.conversationId, target, { model: model(id) }, 'reply-revision', 3), true);
+    return ui.posted.slice(start).find(item => item.type === ui.protocol.MessageRetryFrom);
+  };
+  const running = (h, request) => {
+    h.emit({ type: ui.protocol.ConversationActionResult, correlationId: request.id, payload: { action: 'retry',
+      conversationId: h.conversationId, commandId: request.payload.command.commandId, target: request.payload.target,
+      status: 'accepted', turnId: 'retry-turn' } });
+    h.feed.records = { ...h.feed.records,
+      Turn: { 'retry-turn': { id: 'retry-turn', conversation_id: h.conversationId, status: 'active' } },
+      ExecutionLease: { lease: { id: 'lease', turn_id: 'retry-turn', generation: '1' } },
+      ModelRequest: { 'request-1': { id: 'request-1', turn_id: 'retry-turn' } } };
+  };
+
+  const h = ui.stores(t), chat = h.useChat();
+  const first = startRetry(h, chat, 'old-channel'); running(h, first); await tick();
+  const interruptsBefore = payloads(ui.protocol.TurnInterrupt).length, retriesBefore = retryPosts().length;
+  const target = { kind: 'message', messageId: 'reply' };
+  assert.equal(chat.retryMessageFrom(h.conversationId, target, { model: model('old-channel') }, 'reply-revision', 3), true);
+  assert.equal(payloads(ui.protocol.TurnInterrupt).length, interruptsBefore, '同一模型重复点击不应停止旧重试');
+  assert.equal(chat.retryMessageFrom(h.conversationId, target, { model: model('new-channel') }, 'reply-revision', 3), true);
+  const interrupt = payloads(ui.protocol.TurnInterrupt).at(-1);
+  assert.equal(interrupt.payload.turnId, 'retry-turn');
+  assert.match(chat.conversationActionNotice.value ?? '', /正在停止上一次重试/);
+  assert.equal(retryPosts().length, retriesBefore, '旧重试停下前不应提交新重试');
+  h.feed.records = { ...h.feed.records,
+    Turn: { 'retry-turn': { id: 'retry-turn', conversation_id: h.conversationId, status: 'terminated' } },
+    ExecutionLease: {} };
+  await tick();
+  const resubmitted = retryPosts().at(-1);
+  assert.equal(retryPosts().length, retriesBefore + 1);
+  assert.deepEqual(resubmitted.model, model('new-channel'));
+  assert.notEqual(resubmitted.command.commandId, first.payload.command.commandId);
+
+  const produced = ui.stores(t), producedChat = produced.useChat();
+  running(produced, startRetry(produced, producedChat, 'old-channel'));
+  produced.feed.records = { ...produced.feed.records,
+    ModelRequestMessageLink: { link: { id: 'link', model_request_id: 'request-1', message_id: 'partial' } } };
+  await tick();
+  const blockedInterrupts = payloads(ui.protocol.TurnInterrupt).length;
+  assert.equal(producedChat.retryMessageFrom(produced.conversationId, target, { model: model('new-channel') }, 'reply-revision', 3), false);
+  assert.equal(payloads(ui.protocol.TurnInterrupt).length, blockedInterrupts);
+
+  const streaming = ui.stores(t), streamingChat = streaming.useChat();
+  running(streaming, startRetry(streaming, streamingChat, 'old-channel'));
+  streaming.feed.transientModelRequests = { 'request-1': { conversationId: streaming.conversationId, turnId: 'retry-turn',
+    modelRequestId: 'request-1', text: '正在输出', thought: '', outputParts: [{ text: '正在输出' }], toolCalls: [], status: 'streaming' } };
+  await tick();
+  const streamingInterrupts = payloads(ui.protocol.TurnInterrupt).length;
+  assert.equal(streamingChat.retryMessageFrom(streaming.conversationId, target, { model: model('new-channel') }, 'reply-revision', 3), false);
+  assert.equal(payloads(ui.protocol.TurnInterrupt).length, streamingInterrupts, '正在流式输出的旧重试不应被替换');
+});
+
 test('输入：真实fork点击只接受匹配结果并打开当前来源的分支', async t => {
   const h = ui.stores(t), chat = h.useChat(), start = ui.posted.length;
   assert.equal(chat.forkConversationFrom(h.conversationId, 'message-a', 'revision-a'), true);
