@@ -61,6 +61,11 @@ export function toUnifiedRequest(
   let readBoundary: number | undefined;
   contents.forEach((content, index) => {
     if (index === laidOut.readBreakpointBeforeContentIndex) readBoundary = unifiedContents.length;
+    // 网关正常结束却没给任何 part 时，回复按成功的空回复落成 parts: []。各家都拒收空内容
+    // （Gemini 400 "must include at least one parts field"），原样回放会让这条对话之后每次请求都失败。
+    // 只带内容级 providerContext 的项（Responses 原生项）本来就没有 parts，照常发送。
+    if (content.parts.length === 0
+      && (content as MessageContent & { providerContext?: unknown }).providerContext === undefined) return;
     unifiedContents.push(...toUnifiedContents(content, providerKind, nativeAsync));
   });
   if (laidOut.readBreakpointBeforeContentIndex === contents.length) readBoundary = unifiedContents.length;
