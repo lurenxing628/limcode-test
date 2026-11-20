@@ -413,6 +413,27 @@ test('Gemini 签名只回放给签发它的渠道与模型，换渠道后旧签�
     thoughtSignature: 'skip_thought_signature_validator' }]);
 });
 
+test('落盘的空回复不再随历史发出，之后的请求不会被 Gemini 以缺少 parts 拒绝', async () => {
+  // 网关以 STOP 正常结束却一个 part 都没给时，回复按成功的空回复落成 {"role":"model","parts":[]}；
+  // 原样回放会让这条对话之后的每次请求都 400 "must include at least one parts field"。
+  const contents = [user('go'), model([call('a', 'shell')]),
+    { role: 'user', parts: [result('a', 'shell', { ok: true })] }, model([]), user('again')];
+  for (const provider of ['gemini', 'claude', 'openai-compatible']) {
+    const config = settings(provider);
+    const request = fullRequest(config, contents);
+    let projected;
+    await new kernel.LlmCapabilityFullRequestAdapter(config.id, fakeCapability((input, emit) => {
+      projected = input; emit({ type: 'llm:done', payload: { requestId: input.id } });
+    })).sendFullRequest(request, accepted);
+    const unifiedRequest = conversion.toUnifiedRequest(projected, undefined, provider);
+    assert.ok(unifiedRequest.contents.every(content => content.parts.length > 0), provider);
+    assert.equal(unifiedRequest.contents.at(-1).parts.at(-1).text, 'again', provider);
+  }
+  const body = (await wire(settings('gemini'), contents)).body;
+  assert.ok(body.contents.every(content => content.parts.length > 0));
+  assert.deepEqual(body.contents.map(content => content.role), ['user', 'model', 'user', 'user']);
+});
+
 test('Gemini MCP schema 只发送可接受的子集并保持原 schema', async () => {
   const parameters = { type: 'object', additionalProperties: false,
     properties: { optional: { type: ['string', 'null'] },
