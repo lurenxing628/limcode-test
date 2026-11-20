@@ -69,7 +69,8 @@ const options = computed<SettingsDropdownOption[]>(() => {
   const result: SettingsDropdownOption[] = [{
     value: 'default',
     label: defaultLabel.value,
-    buttonLabel: `思考：${channelButtonValue.value}`,
+    // 渠道没设置思考时按钮只写“思考”：“由服务决定”太占输入栏的位置，说明留在下拉选项里。
+    buttonLabel: channelValue.value.endsWith(UNSET_THINKING_LABEL) && !unconfiguredModel.value ? '思考' : `思考：${channelButtonValue.value}`,
     description: '使用渠道或模型高级配置里的设置'
   }];
   if (inactiveOverride.value) {
