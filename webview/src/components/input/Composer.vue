@@ -40,6 +40,7 @@ import { bridge } from '@webview/transport';
 import { summaryRebuildTooltipRows } from '@webview/components/input/summaryRebuildPreview';
 import { useSummaryRebuildPreview } from '@webview/composables/useSummaryRebuildPreview';
 import ReliableContextStatus from '@webview/components/conversation/ReliableContextStatus.vue';
+import ReliableCacheHitStatus from '@webview/components/conversation/ReliableCacheHitStatus.vue';
 import ReliableAgentStatusPanel from '@webview/components/input/ReliableAgentStatusPanel.vue';
 import ReliableQueuePanel from '@webview/components/input/ReliableQueuePanel.vue';
 import SteeringStatusPanel from '@webview/components/input/SteeringStatusPanel.vue';
@@ -1295,6 +1296,7 @@ function agentSourceDescription(agent: AgentRecord): string {
             {{ runtimeBadgeLabel }}
           </button>
         </HoverTooltipPanel>
+        <ReliableCacheHitStatus class="composer-cache-hit" />
         <ReliableContextStatus class="composer-token-usage" />
         <button
           type="button"
@@ -1803,7 +1805,8 @@ function agentSourceDescription(agent: AgentRecord): string {
   outline: none;
 }
 
-.composer-token-usage {
+.composer-token-usage,
+.composer-cache-hit {
   flex: 0 0 auto;
   margin-left: var(--space-1);
 }

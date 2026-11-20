@@ -24,6 +24,7 @@ import ConfirmPanel, { type ConfirmPanelAction } from '@webview/components/ui/Co
 import HoverTooltipPanel from '@webview/components/ui/HoverTooltipPanel.vue';
 import { useGlobalSettingsStore } from '@webview/stores/useGlobalSettingsStore';
 import { normalizeTokenUsage } from './tokenUsageModel';
+import { cacheHitRatio, formatCacheHitPercent } from './cacheHitModel';
 import { modelRunMetrics, type ModelRunRound } from './runMetricsModel';
 
 const props = withDefaults(
@@ -476,7 +477,9 @@ function formatExactNumber(value: number): string {
 function tokenUsageSuffix(key: TokenUsageKind, usage: LlmUsageMetadataRecord): string | undefined {
   if (key === 'input') {
     const cached = usageNumber(usage, ['cachedContentTokenCount', 'cached_content_token_count', 'cached_tokens']);
-    return cached !== undefined ? `(${formatCompactNumber(cached)})` : undefined;
+    if (cached === undefined) return undefined;
+    const ratio = cacheHitRatio(usage);
+    return `(${formatCompactNumber(cached)}${ratio !== undefined ? ` · ${formatCacheHitPercent(ratio)}` : ''})`;
   }
 
   if (key === 'output') {
@@ -491,11 +494,15 @@ function tokenUsageDetails(key: TokenUsageKind, usage: LlmUsageMetadataRecord): 
   switch (key) {
     case 'total':
       return usageDetailItems(usage, ['promptTokenCount', 'candidatesTokenCount', 'thoughtsTokenCount']);
-    case 'input':
+    case 'input': {
+      const ratio = cacheHitRatio(usage);
       return [
-        ...usageDetailItems(usage, ['cachedContentTokenCount', 'cacheCreationInputTokenCount']),
+        ...usageDetailItems(usage, ['cachedContentTokenCount']),
+        ...(ratio !== undefined ? [{ label: '缓存命中率', value: formatCacheHitPercent(ratio), depth: 0 }] : []),
+        ...usageDetailItems(usage, ['cacheCreationInputTokenCount']),
         ...recordUsageDetailItems(usage.cacheCreationInputTokensDetails, 0)
       ];
+    }
     case 'output':
       return outputTokenDetails(usage);
   }
