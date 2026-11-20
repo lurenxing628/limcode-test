@@ -40,7 +40,7 @@ const samples = computed<CacheHitSample[]>(() => {
 });
 const summaries = computed(() => recentCacheHitSummaries(samples.value));
 const recent = computed(() => summaries.value.recent);
-const label = computed(() => recent.value.ratio === undefined ? '缓存 —' : `缓存 ${formatCacheHitPercent(recent.value.ratio)}`);
+const percent = computed(() => recent.value.ratio === undefined ? '—' : formatCacheHitPercent(recent.value.ratio));
 const tooltipRows = computed(() => {
   const latest = summaries.value.latestTurn;
   return [
@@ -98,7 +98,7 @@ function text(value: unknown): string {
     :rows="tooltipRows"
     :delay-ms="180"
   >
-    <button type="button" class="reliable-cache-hit-button" :aria-label="label">{{ label }}</button>
+    <button type="button" class="reliable-cache-hit-button" :aria-label="`缓存命中率 ${percent}`"><span class="reliable-cache-hit-prefix">缓存 </span>{{ percent }}</button>
   </HoverTooltipPanel>
 </template>
 
@@ -111,8 +111,8 @@ function text(value: unknown): string {
 
 .reliable-cache-hit-button {
   min-height: 22px;
-  padding: 2px 6px;
-  border: 1px solid var(--vscode-panel-border, transparent);
+  padding: 2px 4px;
+  border: 1px solid transparent;
   border-radius: var(--radius-sm);
   color: var(--vscode-descriptionForeground);
   background: transparent;
@@ -128,5 +128,10 @@ function text(value: unknown): string {
   border-color: var(--vscode-foreground);
   background: var(--vscode-list-hoverBackground, transparent);
   outline: none;
+}
+
+/* 窄面板只留百分比，悬浮说明仍写明是缓存命中率。 */
+@media (max-width: 400px) {
+  .reliable-cache-hit-prefix { display: none; }
 }
 </style>

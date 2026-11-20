@@ -1805,10 +1805,22 @@ function agentSourceDescription(agent: AgentRecord): string {
   outline: none;
 }
 
-.composer-token-usage,
-.composer-cache-hit {
+.composer-token-usage {
   flex: 0 0 auto;
   margin-left: var(--space-1);
+}
+
+/* 命中率紧贴上下文用量，两者之间只留按钮间距，窄面板上发送行不会被挤出边界。 */
+.composer-cache-hit {
+  flex: 0 0 auto;
+}
+
+.composer-cache-hit + .composer-token-usage {
+  margin-left: calc(var(--space-1) - var(--space-2));
+}
+
+@media (max-width: 340px) {
+  .composer-cache-hit { display: none; }
 }
 
 .composer-send,
