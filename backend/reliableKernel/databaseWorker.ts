@@ -39,6 +39,12 @@ import {
   optionalDecimalInteger,
   optionalPositiveInteger
 } from './runtimeModelRequestAggregate';
+import {
+  assertClaimedOutboxInsert,
+  assertRuntimeDeliveryAggregate,
+  assertRuntimeDeliveryStateTransition,
+  reconcileCorruptedRuntimeDeliveriesOnOpen
+} from './runtimeDeliveryAggregate';
 import type { RuntimeAllocatedSequence, RuntimeChange, RuntimeCommitResult, SnapshotBarrier } from './contracts';
 import type { ContentObjectMetadata } from './contentAddressedStore';
 import { requireCasObjectIdentity, type SynchronousCasByteAccess } from './casObjectAccess';
@@ -284,6 +290,9 @@ async function start(): Promise<void> {
   const writer = new Database(toSqliteFilePath(data.binding.paths.databasePath), { fileMustExist: true });
   configureWriterConnection(writer);
   assertCurrentSchema(writer, data.binding);
+  if (data.maintenance !== true) {
+    reconcileCorruptedRuntimeDeliveriesOnOpen(writer);
+  }
   configureTransactionChangeCapture(writer);
   const reader = new Database(toSqliteFilePath(data.binding.paths.databasePath), { readonly: true, fileMustExist: true });
   configureReaderConnection(reader);
@@ -1249,7 +1258,7 @@ function configureMaintenanceConnections(writer: Database.Database, reader: Data
   }
   writer.exec(`
     CREATE TEMP TABLE runtime_maintenance_scratch (
-      kind TEXT NOT NULL CHECK (kind IN ('model_request', 'turn', 'historical_copy')),
+      kind TEXT NOT NULL CHECK (kind IN ('model_request', 'turn', 'runtime_delivery', 'historical_copy')),
       id TEXT NOT NULL,
       PRIMARY KEY (kind, id)
     ) WITHOUT ROWID
@@ -2211,6 +2220,12 @@ function executeMutation(
         }
       }
     }
+    if (schema.key === 'ProcessCompletionDispatch') {
+      assertClaimedOutboxInsert('ProcessCompletionDispatch', row, 'completed_at', 'completed');
+    }
+    if (schema.key === 'RuntimeDeliveryWake') {
+      assertClaimedOutboxInsert('RuntimeDeliveryWake', row, 'acknowledged_at', 'acknowledged');
+    }
     if (schema.key === 'RuntimeDeliveryTimelineLink' || schema.key === 'CollaborationSendTimelineLink') {
       if (!historicalCopy) {
         const sameTransaction = schema.key === 'CollaborationSendTimelineLink'
@@ -2463,19 +2478,23 @@ function resolveMessageRevisionSequenceReference(
 interface TouchedRuntimeAggregates {
   modelRequestIds: { add(id: string): unknown };
   turnIds: { add(id: string): unknown };
+  runtimeDeliveryIds: { add(id: string): unknown };
 }
 
 /**
- * Checks every ModelRequest aggregate the executed `steps` touched. With `accumulated` (a maintenance
- * transaction) the touched ids are only added to it; assertMaintenanceAggregates runs at the commit.
+ * Checks every ModelRequest and RuntimeDelivery aggregate the executed `steps` touched. With
+ * `accumulated` (a maintenance transaction) the touched ids are only added to it;
+ * assertMaintenanceAggregates runs at the commit.
  */
 function assertTouchedRuntimeAggregates(
   database: Database.Database,
   steps: readonly RepositoryTransactionStep[],
   accumulated?: TouchedRuntimeAggregates
 ): void {
-  const collected = accumulated ? undefined : { modelRequestIds: new Set<string>(), turnIds: new Set<string>() };
-  const { modelRequestIds, turnIds } = accumulated ?? collected!;
+  const collected = accumulated
+    ? undefined
+    : { modelRequestIds: new Set<string>(), turnIds: new Set<string>(), runtimeDeliveryIds: new Set<string>() };
+  const { modelRequestIds, turnIds, runtimeDeliveryIds } = accumulated ?? collected!;
   const visit = (step: RepositoryTransactionStep): void => {
     if (step.kind === 'savepoint') {
       step.steps.forEach(visit);
@@ -2525,6 +2544,19 @@ function assertTouchedRuntimeAggregates(
       if (typeof id === 'string') turnIds.add(id);
     } else if (step.domain === 'TurnTermination' && step.kind === 'insert') {
       if (typeof step.row.turn_id === 'string') turnIds.add(step.row.turn_id);
+    } else if (step.domain === 'RuntimeDelivery') {
+      const id = step.kind === 'insert' ? step.row.id : 'id' in step ? step.id : null;
+      if (typeof id === 'string') runtimeDeliveryIds.add(id);
+    } else if (step.domain === 'RuntimeDeliveryInputLink') {
+      if (step.kind === 'insert' && typeof step.row.delivery_id === 'string') {
+        runtimeDeliveryIds.add(step.row.delivery_id);
+      } else if ('id' in step && typeof step.id === 'string') {
+        const link = prepareCached(
+          database,
+          'SELECT delivery_id FROM runtime_delivery_input_link WHERE id = ?'
+        ).get(step.id) as { delivery_id?: unknown } | undefined;
+        if (typeof link?.delivery_id === 'string') runtimeDeliveryIds.add(link.delivery_id);
+      }
     }
   };
   steps.forEach(visit);
@@ -2534,26 +2566,35 @@ function assertTouchedRuntimeAggregates(
 /** The aggregate checks of assertTouchedRuntimeAggregates, on the transaction's state as it is now. */
 function assertCollectedRuntimeAggregates(
   database: Database.Database,
-  touched: { modelRequestIds: ReadonlySet<string>; turnIds: ReadonlySet<string> }
+  touched: {
+    modelRequestIds: ReadonlySet<string>;
+    turnIds: ReadonlySet<string>;
+    runtimeDeliveryIds: ReadonlySet<string>;
+  }
 ): void {
   // Each changed request/operation/attempt is checked here. A Turn's terminal-set assertion is
   // part of its existing terminal writer; ending it does not mutate old request aggregates.
   for (const modelRequestId of touched.modelRequestIds) assertModelRequestAggregate(database, modelRequestId);
+  for (const deliveryId of touched.runtimeDeliveryIds) assertRuntimeDeliveryAggregate(database, deliveryId);
 }
 
 /** A maintenance transaction's touched ids, rows of its TEMP scratch table. */
 function maintenanceTouchedAggregates(database: Database.Database): TouchedRuntimeAggregates {
-  const sink = (kind: 'model_request' | 'turn') => ({
+  const sink = (kind: 'model_request' | 'turn' | 'runtime_delivery') => ({
     add: (id: string) => prepareCached(database,
       `INSERT OR IGNORE INTO temp.runtime_maintenance_scratch (kind, id) VALUES ('${kind}', ?)`).run(id)
   });
-  return { modelRequestIds: sink('model_request'), turnIds: sink('turn') };
+  return {
+    modelRequestIds: sink('model_request'),
+    turnIds: sink('turn'),
+    runtimeDeliveryIds: sink('runtime_delivery')
+  };
 }
 
 /**
  * assertCollectedRuntimeAggregates over a maintenance transaction's scratch table, on its state at the
  * commit: a touched Turn that is not active adds its ModelRequests, then every touched ModelRequest
- * aggregate is asserted, a page of ids at a time.
+ * and RuntimeDelivery aggregate is asserted, a page of ids at a time.
  */
 function assertMaintenanceAggregates(database: Database.Database): void {
   prepareCached(database, `
@@ -2564,13 +2605,23 @@ function assertMaintenanceAggregates(database: Database.Database): void {
       LEFT JOIN turn ON turn.id = touched.id
      WHERE touched.kind = 'turn' AND turn.status IS NOT 'active'
   `).run();
-  const page = prepareCached(database, `
+  const modelRequestPage = prepareCached(database, `
     SELECT id FROM temp.runtime_maintenance_scratch
      WHERE kind = 'model_request' AND id > ? ORDER BY id LIMIT ${MAINTENANCE_AGGREGATE_PAGE}
   `, { rows: 'pluck' });
   for (let after = ''; ;) {
-    const ids = page.all(after) as string[];
+    const ids = modelRequestPage.all(after) as string[];
     for (const id of ids) assertModelRequestAggregate(database, requireRuntimeId(id));
+    if (ids.length < MAINTENANCE_AGGREGATE_PAGE) break;
+    after = ids[ids.length - 1]!;
+  }
+  const deliveryPage = prepareCached(database, `
+    SELECT id FROM temp.runtime_maintenance_scratch
+     WHERE kind = 'runtime_delivery' AND id > ? ORDER BY id LIMIT ${MAINTENANCE_AGGREGATE_PAGE}
+  `, { rows: 'pluck' });
+  for (let after = ''; ;) {
+    const ids = deliveryPage.all(after) as string[];
+    for (const id of ids) assertRuntimeDeliveryAggregate(database, requireRuntimeId(id));
     if (ids.length < MAINTENANCE_AGGREGATE_PAGE) return;
     after = ids[ids.length - 1]!;
   }
@@ -2588,23 +2639,7 @@ function assertRuntimeStateTransition(
     return;
   }
   if (domain === 'RuntimeDelivery') {
-    const current = prepareCached(database, 'SELECT state, phase FROM runtime_delivery WHERE id = ?').get(id) as {
-      state?: unknown;
-      phase?: unknown;
-    } | undefined;
-    if (!current || typeof current.state !== 'string') {
-      throw new Error(`RuntimeDeliveryRepository update expected one row: ${id}`);
-    }
-    const nextState = 'state' in patch ? String(patch.state) : current.state;
-    const allowed: Record<string, readonly string[]> = {
-      pending: ['pending', 'consumed', 'failed'],
-      consumed: [],
-      failed: []
-    };
-    if (!allowed[current.state]?.includes(nextState)) {
-      throw new Error(`RuntimeDelivery state cannot transition from ${current.state} to ${nextState}.`);
-    }
-    return { state: current.state, phase: current.phase };
+    return assertRuntimeDeliveryStateTransition(database, id, patch);
   }
   if (domain === 'RuntimeDeliveryInputLink') {
     const current = prepareCached(database, 'SELECT handled_at FROM runtime_delivery_input_link WHERE id = ?').get(id) as {

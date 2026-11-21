@@ -920,9 +920,12 @@ export class CollaborationControlPlane {
         continue;
       }
       // Acknowledged as a notification (for example to a child stopped meanwhile): no Turn took it in.
-      if (delivery.target_turn_id === null) {
+      if (delivery.phase === 'notify_only' && delivery.target_turn_id === null) {
         await this.failUnansweredRequest(request, 'Task could not start: the target conversation could not take it.');
         continue;
+      }
+      if (delivery.target_turn_id === null) {
+        throw new Error(`Consumed RuntimeDelivery ${String(delivery.id)} (${String(delivery.phase)}) is missing target_turn_id.`);
       }
       // The Turn that took it in was deleted with its Conversation before the reply went out.
       if (!await this.maybe('Turn', String(delivery.target_turn_id))) {
