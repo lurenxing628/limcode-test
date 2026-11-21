@@ -173,6 +173,7 @@ export async function recoverDispatchedSpawn(f) {
     assert.equal((await f.rows('TurnTermination', { turn_id: ready.turnId }))[0].terminal_status, 'interrupted');
     await f.coordinator.interruptSubtree({ sourceKey: f.id('stop-child'), childExecutionId: ready.childExecutionId, reason: '用户停止' }, { userStop: true });
     assert.equal((await f.get('Turn', ready.childTurnId)).status, 'terminated');
+    assert.equal((await f.rows('TurnTermination', { turn_id: ready.childTurnId }))[0].reason, '用户停止');
     assert.equal(f.modelCalls.length, beforeCalls);
   });
 }

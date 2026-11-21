@@ -4033,12 +4033,12 @@ export class ReliableAgentLoop {
   }
 
   /**
-   * 普通中断请求沿用发起方写下的原因（如“用户请求中断当前 Turn。”），界面据此区分手动停止和系统停止；
-   * 子 Agent 的 termination_request 以及读不到原因时，仍记录执行器观察到的阶段。
+   * 中断请求（含顶层 interrupt_request 与子任务 termination_request）优先沿用发起方写下的原因，
+   * 界面据此区分用户手动暂停、父对话主动中断与系统异常；仅当载荷缺失原因时回退执行器阶段名。
    */
   private async terminationRequestReason(request: DomainRow, stage: string): Promise<string> {
     const observed = `Executor observed ${String(request.input_kind)} at ${stage}.`;
-    if (request.input_kind !== 'interrupt_request') return observed;
+    if (request.input_kind !== 'interrupt_request' && request.input_kind !== 'termination_request') return observed;
     try {
       const metadata = await this.requireExisting(
         'ContentObject',

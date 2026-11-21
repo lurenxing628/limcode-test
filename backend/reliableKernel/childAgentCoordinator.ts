@@ -2492,7 +2492,7 @@ export class ReliableChildAgentCoordinator {
     const cancelled = await this.interruptSubtree({
       sourceKey: `run-agent-interrupt:${input.toolCallId}`,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
-      reason: 'run_agent interrupt_subtree requested'
+      reason: '父对话主动中断了此子任务（interrupt_subtree）'
     });
     return this.settleOwnTool(input.toolCallId, {
       ok: true,

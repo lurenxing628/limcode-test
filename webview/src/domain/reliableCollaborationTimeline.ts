@@ -280,6 +280,7 @@ export function projectCollaborationTimeline(input: {
 export function collaborationCardPlacementLabel(card: CollaborationTimelineCard): string {
   if (card.placement === 'ordered') return card.imported ? '按导入顺序排列' : '';
   if (card.notificationOnly && card.placement === 'unbound') return '结果通知';
+  if (card.direction === 'incoming' && card.status === 'waiting' && card.placement === 'unbound') return '';
   if (card.placement === 'turn') return '按回合归组，具体顺序待确认';
   if (card.placement === 'turn-started') return '所属回合没有已加载的消息，按回合开始顺序排列';
   if (card.placement === 'earlier-turn') return '所属回合早于已加载的消息，位置待确认';
@@ -299,7 +300,10 @@ export function collaborationCardStatusLabel(card: CollaborationTimelineCard): s
   if (card.status === 'unknown') return '投递状态待确认';
   if (card.status === 'settled') return '';
   if (card.notificationOnly) return '通知待送达';
-  if (card.direction === 'incoming') return card.placement === 'unbound' ? '等待下一轮处理' : '已送达，等待本轮处理';
+  if (card.direction === 'incoming') {
+    if (card.placement !== 'unbound') return '已送达，等待本轮处理';
+    return card.kind === 'message' ? '待下一轮读取（静默留条）' : '等待下一轮处理';
+  }
   if (card.readBy === 'current-turn') return '已送达，对方本轮读取';
   if (card.readBy === 'next-turn') return '已送达，对方下一轮读取';
   return '等待对方处理';

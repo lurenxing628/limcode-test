@@ -312,12 +312,28 @@ test('时间线：模型用量和失败重试从真实关系恢复，不借用�
 
 test('时间线：停止按钮和旧版执行器原因都显示为手动暂停，失败原因原样保留', async () => {
   const { projectReliableTurnTermination: terminate } = await ui.load('domain/reliableConversationProjection.ts');
+  const { terminationNotice } = await ui.load('components/conversation/terminationNotice.ts');
   const records = nativeShellRecords('terminal');
   const stop = (terminal_status, reason) => terminate({ id: 'stop', turn_id: 'turn-a', terminal_status, reason, created_at: '2026-10-13T00:00:00Z' }, records);
-  for (const reason of ['用户请求中断当前 Turn。', 'Executor observed interrupt_request at tool_batch_boundary.']) {
+  for (const reason of [
+    '用户请求中断当前 Turn。',
+    '用户从侧栏请求递归终止当前子 Agent。',
+    '用户取消此子 Agent 执行。',
+    '用户请求中断父对话，已一并停止当前子任务。',
+    'Executor observed interrupt_request at tool_batch_boundary.'
+  ]) {
     const row = stop('interrupted', reason);
     assert.equal(row.actor, 'user'); assert.equal(row.reasonCode, 'user_cancelled'); assert.equal(row.detail, '手动暂停');
   }
+  for (const deleteReason of ['用户删除对话', '用户删除子任务对话']) {
+    const deleted = stop('interrupted', deleteReason);
+    assert.equal(deleted.actor, 'user');
+    assert.equal(deleted.detail, deleteReason);
+    assert.match(terminationNotice(deleted, false), new RegExp(`本次回复已停止（${deleteReason}）`));
+  }
+  const parentStopped = stop('interrupted', '父对话主动中断了此子任务（interrupt_subtree）');
+  assert.notEqual(parentStopped.actor, 'user');
+  assert.equal(parentStopped.detail, '父对话主动中断了此子任务（interrupt_subtree）');
   const failed = stop('failed', 'provider failed');
   assert.notEqual(failed.actor, 'user'); assert.equal(failed.detail, 'provider failed');
   assert.equal(stop('interrupted', 'Executor observed termination_request at model_request.').detail, 'Executor observed termination_request at model_request.');
@@ -349,7 +365,17 @@ test('时间线：持久Message壳的正文就绪前由同一个overlay占位', 
 });
 
 test('时间线：协作卡按已提交消息边界定位，外部Conversation消息不混入', async () => {
-  const { projectCollaborationTimeline } = await ui.load('domain/reliableCollaborationTimeline.ts');
+  const {
+    projectCollaborationTimeline,
+    collaborationCardPlacementLabel,
+    collaborationCardStatusLabel
+  } = await ui.load('domain/reliableCollaborationTimeline.ts');
+  const waitingNote = { messageId: 'note', direction: 'incoming', peer: { conversationId: 'peer', title: 'Peer', deleted: false }, peerRelation: 'cross_conversation', kind: 'message', textPreview: 'memo', status: 'waiting', placement: 'unbound' };
+  const waitingTask = { ...waitingNote, kind: 'followup' };
+  assert.equal(collaborationCardPlacementLabel(waitingNote), '');
+  assert.equal(collaborationCardStatusLabel(waitingNote), '待下一轮读取（静默留条）');
+  assert.equal(collaborationCardPlacementLabel(waitingTask), '');
+  assert.equal(collaborationCardStatusLabel(waitingTask), '等待下一轮处理');
   const { composeTimelineRows, latestTimelineSegmentStart } = await ui.load('components/conversation/segmentedTimeline.ts');
   const messages = Array.from({ length: 35 }, (_, i) => ({ id: `m${i + 1}` }));
   const records = {
