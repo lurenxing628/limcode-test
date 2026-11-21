@@ -254,7 +254,11 @@ export const RUNTIME_DATA_SET_CROSS_ROW_CHECKS: readonly RuntimeDataSetCrossRowC
   // A terminated Turn checks the requests it has at that moment: none yet (ModelRequest comes later) or complete units.
   { source: 'worker-aggregate', name: 'Turn', triggeredBy: ['Turn'], reads: ['ModelRequest'], handling: { kind: 'tolerates-missing' } },
   { source: 'worker-aggregate', name: 'TurnTermination', triggeredBy: ['TurnTermination'], reads: ['ModelRequest'], handling: { kind: 'tolerates-missing' } },
+  { source: 'worker-aggregate', name: 'RuntimeDelivery', triggeredBy: ['RuntimeDelivery'], reads: ['RuntimeDeliveryInputLink'], handling: { kind: 'unit', anchor: 'RuntimeDelivery' } },
+  { source: 'worker-aggregate', name: 'RuntimeDeliveryInputLink', triggeredBy: ['RuntimeDeliveryInputLink'], reads: ['RuntimeDelivery', 'RuntimeDeliveryInputLink'], handling: { kind: 'unit', anchor: 'RuntimeDelivery' } },
   // databaseWorker executeMutation (insert)
+  { source: 'worker-insert', name: 'ProcessCompletionDispatch', triggeredBy: ['ProcessCompletionDispatch'], reads: [], handling: { kind: 'reads-earlier' } },
+  { source: 'worker-insert', name: 'RuntimeDeliveryWake', triggeredBy: ['RuntimeDeliveryWake'], reads: [], handling: { kind: 'reads-earlier' } },
   { source: 'worker-insert', name: 'ModelStreamCheckpoint', triggeredBy: ['ModelStreamCheckpoint'], reads: ['ModelRequest'], handling: { kind: 'unit', anchor: 'Operation' } },
   { source: 'worker-insert', name: 'ModelStreamFence', triggeredBy: ['ModelStreamFence'], reads: ['ModelRequest'], handling: { kind: 'unit', anchor: 'Operation' } },
   { source: 'worker-insert', name: 'ModelRequest', triggeredBy: ['ModelRequest'], reads: [], handling: { kind: 'unit', anchor: 'Operation' } },

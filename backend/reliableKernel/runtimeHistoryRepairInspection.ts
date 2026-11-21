@@ -4,6 +4,7 @@ import { DOMAIN_REPOSITORIES } from './repositories';
 import { runtimeDataSetContentDigest } from './runtimeDataSetContent';
 import { prepareCached } from './runtimeStatementCache';
 import { terminalProcessReceiptSql } from './runtimeProcessHistory';
+import { assertRuntimeDeliveryAggregate } from './runtimeDeliveryAggregate';
 import { assertModelRequestAggregate } from './runtimeModelRequestAggregate';
 import { isRuntimeDataInvariant } from './runtimeDataInvariant';
 
@@ -100,6 +101,13 @@ export function inspectHistoryRepair(database: Database.Database): RuntimeHistor
     catch (error) {
       if (!isRuntimeDataInvariant(error)) throw error;
       sample('ModelRequest', row.id, `现存模型请求聚合不一致，不能猜测修复：${error instanceof Error ? error.message : String(error)}`, true);
+    }
+  }
+  for (const row of prepareCached(database, 'SELECT id FROM runtime_delivery ORDER BY id').iterate() as IterableIterator<{ id: string }>) {
+    try { assertRuntimeDeliveryAggregate(database, row.id); }
+    catch (error) {
+      if (!isRuntimeDataInvariant(error)) throw error;
+      sample('RuntimeDelivery', row.id, `现存运行投递聚合不一致，不能盲目合并：${error instanceof Error ? error.message : String(error)}`, true);
     }
   }
   plan.contentDigest = runtimeDataSetContentDigest(database);

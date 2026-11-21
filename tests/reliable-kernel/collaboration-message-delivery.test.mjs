@@ -10,6 +10,9 @@ const { crossConversationToolPermitted } = load('shared/toolPolicyResolution.js'
 const { runtimeDeliverySourceTurn } = load('backend/reliableKernel/childTaskTurn.js');
 const { ReliableToolDispatcher } = load('backend/reliableKernel/toolDispatcher.js');
 const { crossConversationToolModules } = load('backend/world/modules/tools/definitions/crossConversation/index.js');
+const { deriveCommittedParentHandling } = load('backend/reliableKernel/clientProjection.js');
+const { CORRUPTED_CONSUMED_DELIVERY_REASON } = load('backend/reliableKernel/runtimeDeliveryAggregate.js');
+import Database from 'better-sqlite3';
 let f;
 before(async () => { f = await openDeliveryFixture(); });
 after(async () => { await f?.close(); });
@@ -573,3 +576,146 @@ test('root-contained local transfer succeeds while an outside symlink read is re
 test('overwriting a symlink target preserves the external destination', overwriteSymlinkRefusal);
 test('copying a directory into its own descendant is refused without partial changes', directorySelfRefusal);
 test('the production remote bash guard refuses a relative symlink escape', remoteBashEscapeRefusal);
+
+test('the writer rejects invalid RuntimeDelivery and RuntimeDeliveryWake state combinations at commit', async () => {
+  const s = await f.scenario('delivery-invariants', 4);
+  const queued = await s.send('root', 'outsider', 'followup', 'Queued peer task', {
+    crossConversation: true,
+    queueBehindActiveTurn: true
+  });
+
+  await assert.rejects(
+    f.app.database.transaction([
+      repo('RuntimeDelivery').update(queued.deliveryId, { state: 'consumed', updated_at: f.now() })
+    ]),
+    /requires target_turn_id and exactly one RuntimeDeliveryInputLink/
+  );
+  await assert.rejects(
+    f.app.database.transaction([
+      repo('RuntimeDelivery').update(queued.deliveryId, {
+        state: 'consumed',
+        target_turn_id: s.turn('outsider'),
+        updated_at: f.now()
+      })
+    ]),
+    /requires target_turn_id and exactly one RuntimeDeliveryInputLink/
+  );
+  await assert.rejects(
+    f.app.database.transaction([
+      repo('RuntimeDelivery').update(queued.deliveryId, { state: 'failed', failure_reason: null, updated_at: f.now() })
+    ]),
+    /requires failure_reason/
+  );
+
+  const [wake] = await f.rows('RuntimeDeliveryWake', { delivery_id: queued.deliveryId });
+  assert.ok(wake);
+  await assert.rejects(
+    f.app.database.transaction([
+      repo('RuntimeDeliveryWake').insert({
+        ...wake,
+        id: f.id('invalid-wake-insert'),
+        delivery_id: f.id('nonexistent-delivery'),
+        state: 'acknowledged',
+        acknowledged_at: null
+      })
+    ]),
+    /requires acknowledged_at/
+  );
+  await f.app.database.transaction([
+    repo('RuntimeDeliveryWake').update(wake.id, {
+      state: 'claimed',
+      claim_owner_host_boot_id: f.app.database.hostBootId,
+      claim_generation: 1n,
+      claim_expires_at: new Date(Date.now() + 60000).toISOString(),
+      attempt_count: 1n,
+      updated_at: f.now()
+    })
+  ]);
+  await assert.rejects(
+    f.app.database.transaction([
+      repo('RuntimeDeliveryWake').update(wake.id, {
+        state: 'acknowledged',
+        claim_owner_host_boot_id: null,
+        claim_expires_at: null,
+        acknowledged_at: null,
+        updated_at: f.now()
+      })
+    ]),
+    /requires acknowledged_at/
+  );
+
+  const intact = await f.get('RuntimeDelivery', queued.deliveryId);
+  assert.equal(intact.state, 'pending');
+  assert.equal(intact.phase, 'next_turn');
+  assert.equal(intact.target_turn_id, null);
+});
+
+test('startup deterministically repairs externally corrupted consumed next_turn deliveries without masking projection errors', async () => {
+  assert.throws(
+    () => deriveCommittedParentHandling({ id: 'corrupted-row', state: 'consumed', phase: 'next_turn' }, undefined),
+    /invalid InputLink combination/
+  );
+
+  const local = await openDeliveryFixture();
+  try {
+    const s = await local.scenario('external-sql-corruption', 4);
+    const corrupted = await s.send('root', 'outsider', 'followup', 'Corrupted while queued', {
+      crossConversation: true,
+      queueBehindActiveTurn: true
+    });
+    const injected = await s.send('root', 'outsider', 'followup', 'Backed by real input link', {
+      crossConversation: true,
+      queueBehindActiveTurn: true
+    });
+    await local.endTurn(s.turn('outsider'));
+    const nextTurn = local.id('outsider-admitted');
+    await local.continuation(s, s.outsider, nextTurn, injected.deliveryId);
+
+    const binding = await local.root.current();
+    await local.deactivateRunner();
+    await local.coordinator.dispose();
+    await local.app.close();
+
+    const rawDb = new Database(binding.paths.databasePath);
+    try {
+      rawDb.prepare("UPDATE runtime_delivery SET state = 'consumed' WHERE id = ? AND state = 'pending'").run(corrupted.deliveryId);
+      rawDb.prepare("UPDATE runtime_delivery_wake SET state = 'acknowledged' WHERE delivery_id = ? AND state != 'acknowledged'").run(corrupted.deliveryId);
+      rawDb.prepare('UPDATE runtime_delivery SET target_turn_id = NULL WHERE id = ?').run(injected.deliveryId);
+    } finally {
+      rawDb.close();
+    }
+
+    await local.reopen();
+    await local.app.runtime.collaboration.reconcile();
+
+    const repairedFailed = await local.get('RuntimeDelivery', corrupted.deliveryId);
+    assert.equal(repairedFailed.state, 'failed');
+    assert.equal(repairedFailed.target_turn_id, null);
+    assert.equal(repairedFailed.failure_reason, CORRUPTED_CONSUMED_DELIVERY_REASON);
+
+    const [repairedWake] = await local.rows('RuntimeDeliveryWake', { delivery_id: corrupted.deliveryId });
+    assert.equal(repairedWake.state, 'dead_letter');
+    assert.equal(repairedWake.acknowledged_at, null);
+    assert.equal(repairedWake.last_error, CORRUPTED_CONSUMED_DELIVERY_REASON);
+
+    const [failedRequest] = await local.rows('CollaborationRequest', { message_id: corrupted.messageId });
+    assert.equal(failedRequest.state, 'failed');
+
+    const repairedInjected = await local.get('RuntimeDelivery', injected.deliveryId);
+    assert.equal(repairedInjected.state, 'consumed');
+    assert.equal(repairedInjected.target_turn_id, nextTurn);
+
+    const outsiderSnapshot = await local.app.database.clientProjectionSnapshot(s.outsider);
+    const rootSnapshot = await local.app.database.clientProjectionSnapshot(s.root);
+    const stringify = value => JSON.stringify(value, (_k, v) => typeof v === 'bigint' ? v.toString() : v);
+    assert.ok(stringify(outsiderSnapshot).includes(corrupted.deliveryId));
+    assert.ok(stringify(outsiderSnapshot).includes(injected.deliveryId));
+    assert.ok(stringify(rootSnapshot).includes(s.root));
+
+    const updatedStamp = repairedFailed.updated_at;
+    await local.reopen();
+    assert.equal((await local.get('RuntimeDelivery', corrupted.deliveryId)).updated_at, updatedStamp);
+  } finally {
+    await local.close();
+  }
+});
