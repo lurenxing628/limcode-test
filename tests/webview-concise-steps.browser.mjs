@@ -69,7 +69,7 @@ const fixtureHtml = `<!doctype html><html><head><link rel="icon" href="data:,"><
     status: streaming ? 'streaming' : 'final', content: { role: 'model', parts }, createdAt: 1, requestStartedAt: 1, completedAt: 2000 };
   createApp(MessageItem, { message, floorNumber: 64 }).use(pinia).mount('#app');
   const settings = useGlobalSettingsStore();
-  createApp(TimelineActivityRow, { activityKind: 'preparing', label: settings.appearance.streamingTextWaiting,
+  createApp(TimelineActivityRow, { activityKind: 'preparing', label: query.get('activity') || settings.appearance.streamingTextWaiting,
     modelLabel: 'fast-model', concise: settings.appearance.conciseMode }).use(pinia).mount('#activity');
 </script></body></html>`;
 
@@ -156,6 +156,24 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     // 这行插入时淡入，不硬跳。
     assert.match(await page.locator('.timeline-activity-row').evaluate(node => getComputedStyle(node).animationName), /lc-concise-row-enter/);
     assert.equal(await page.locator('.rich-step-group-label.lc-shimmer-text').count(), 1);
+    // 短文案一行放得下，不给展开。
+    const activitySummary = page.locator('.timeline-activity-row .lc-collapsible-summary');
+    assert.equal(await page.locator('.timeline-activity-row .lc-collapsible-block.is-empty').count(), 1);
+
+    // 自动重试时上游报错拼在这行里，一行放不下就能点开看全文。
+    const longError = '上游返回 400：' + 'Request contains an invalid argument, field contents[12].parts must not be empty. '.repeat(4) + '末尾标记';
+    await open('?concise&waiting&activity=' + encodeURIComponent(longError + '，3 秒后自动恢复（第 1/5 次）'));
+    await activitySummary.waitFor();
+    await page.locator('.timeline-activity-row .lc-collapsible-block:not(.is-empty)').waitFor();
+    assert.equal(await page.locator('.activity-concise-detail').count(), 0);
+    await activitySummary.click();
+    assert.equal(await activitySummary.getAttribute('aria-expanded'), 'true');
+    await page.locator('.activity-concise-detail').waitFor();
+    assert.match(await page.locator('.activity-concise-detail').innerText(), /末尾标记，3 秒后自动恢复/);
+    const detailBox = await page.locator('.activity-concise-detail').boundingBox();
+    assert.ok(detailBox.width <= 720 && detailBox.height > 40, JSON.stringify(detailBox));
+    await activitySummary.click();
+    await page.locator('.activity-concise-detail').waitFor({ state: 'detached' });
     await open('?concise&thinking');
     await summary.waitFor();
     assert.match(await summary.innerText(), /少女思考中/);

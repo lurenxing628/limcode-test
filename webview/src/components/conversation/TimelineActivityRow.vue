@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { IconTool } from '@tabler/icons-vue';
 import StreamingIndicatorTail from '@webview/components/content/StreamingIndicatorTail.vue';
 import CollapsibleContentBlock from '@webview/components/content/CollapsibleContentBlock.vue';
@@ -13,14 +14,37 @@ const props = defineProps<{
 }>();
 
 const settings = useGlobalSettingsStore();
+const labelText = computed(() => props.label || settings.appearance.streamingTextPreparing);
+
+// 简洁模式这一行只占一行；自动重试时上游报错原文也拼在里面，放不下时允许展开看全文。
+const labelElement = ref<HTMLElement>();
+const labelTruncated = ref(false);
+const detailExpanded = ref(false);
+const expandable = computed(() => labelTruncated.value || detailExpanded.value);
+let labelObserver: ResizeObserver | undefined;
+
+function measureLabel(): void {
+  const element = labelElement.value;
+  labelTruncated.value = Boolean(element && element.scrollWidth > element.clientWidth + 1);
+}
+
+onMounted(() => {
+  measureLabel();
+  if (typeof ResizeObserver === 'undefined' || !labelElement.value) return;
+  labelObserver = new ResizeObserver(measureLabel);
+  labelObserver.observe(labelElement.value);
+});
+watch(labelText, () => { void nextTick(measureLabel); });
+onBeforeUnmount(() => labelObserver?.disconnect());
 </script>
 
 <template>
   <article v-if="props.concise" class="timeline-activity-row assistant is-concise" :data-activity-kind="props.activityKind">
     <div class="activity-body">
-      <CollapsibleContentBlock :collapsible="false" icon-active :aria-label="props.label || settings.appearance.streamingTextPreparing">
+      <CollapsibleContentBlock v-model:expanded="detailExpanded" :collapsible="expandable" icon-active :aria-label="labelText">
         <template #icon><IconTool stroke="2" /></template>
-        <template #summary><span class="activity-concise-label lc-shimmer-text">{{ props.label || settings.appearance.streamingTextPreparing }}</span></template>
+        <template #summary><span ref="labelElement" class="activity-concise-label lc-shimmer-text">{{ labelText }}</span></template>
+        <p class="activity-concise-detail">{{ labelText }}</p>
       </CollapsibleContentBlock>
     </div>
   </article>
@@ -34,7 +58,7 @@ const settings = useGlobalSettingsStore();
           </span>
         </header>
         <div class="activity-body">
-          <StreamingIndicatorTail :text="props.label || settings.appearance.streamingTextPreparing" variant="preparing" />
+          <StreamingIndicatorTail :text="labelText" variant="preparing" />
         </div>
       </div>
     </div>
@@ -78,6 +102,17 @@ const settings = useGlobalSettingsStore();
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.activity-concise-detail {
+  margin: 0;
+  padding-top: var(--space-2);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+  color: var(--vscode-descriptionForeground);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .activity-container {
