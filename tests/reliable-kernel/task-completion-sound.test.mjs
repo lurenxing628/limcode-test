@@ -9,6 +9,7 @@ import { openDeliveryFixture } from './collaboration-delivery-fixture.mjs';
 const host = installVscode();
 after(() => host.dispose());
 const { completedMainTasks } = compiled('backend/application/reliableKernel/taskCompletionSound.js');
+const { decideOpenTaskCompletion } = compiled('backend/reliableKernel/agentLoop.js');
 const { normalizeTaskCompletionSoundSettings } = compiled('shared/taskCompletionSound.js');
 
 test('提示音默认关闭，导入音频与音量沿现有设置修订保存并重读', async t => {
@@ -80,4 +81,12 @@ test('真实终态事务只通知一次，重放完成命令不重复通知', as
   await f.app.turns.terminal(command);
   await f.app.turns.terminal(command);
   assert.deepEqual((await Promise.all(pending)).flat(), [parent]);
+});
+
+test('仅剩 blocked 异步等待项时直接按 model_completed_with_open_tasks 结束回合，不再强行弹回续跑', () => {
+  assert.equal(decideOpenTaskCompletion({ turnTaskCard: { counts: { unfinished: 0, pending: 0, inProgress: 0, blocked: 0 } } }, false), 'complete');
+  assert.equal(decideOpenTaskCompletion({ turnTaskCard: { counts: { unfinished: 2, pending: 0, inProgress: 0, blocked: 2 } } }, false), 'complete_with_open_tasks');
+  assert.equal(decideOpenTaskCompletion({ turnTaskCard: { counts: { unfinished: 2, pending: 1, inProgress: 0, blocked: 1 } } }, false), 'continue_once');
+  assert.equal(decideOpenTaskCompletion({ turnTaskCard: { counts: { unfinished: 2, pending: 1, inProgress: 0, blocked: 1 } } }, true), 'complete_with_open_tasks');
+  assert.equal(decideOpenTaskCompletion({ turnTaskCard: { counts: { unfinished: 1 } } }, false), 'continue_once');
 });
