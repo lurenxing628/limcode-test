@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue';
+import { computed, nextTick, onBeforeUnmount, ref, watch } from 'vue';
 import { IconTool } from '@tabler/icons-vue';
 import StreamingIndicatorTail from '@webview/components/content/StreamingIndicatorTail.vue';
 import CollapsibleContentBlock from '@webview/components/content/CollapsibleContentBlock.vue';
@@ -16,24 +16,32 @@ const props = defineProps<{
 const settings = useGlobalSettingsStore();
 const labelText = computed(() => props.label || settings.appearance.streamingTextPreparing);
 
-// 简洁模式这一行只占一行；自动重试时上游报错原文也拼在里面，放不下时允许展开看全文。
+// 这一行只占一行；自动重试时上游报错原文也拼在里面，放不下时允许展开看全文。
+// 简洁模式量摘要文字本身，普通模式量流式尾巴里的文字。
 const labelElement = ref<HTMLElement>();
 const labelTruncated = ref(false);
 const detailExpanded = ref(false);
 const expandable = computed(() => labelTruncated.value || detailExpanded.value);
 let labelObserver: ResizeObserver | undefined;
 
-function measureLabel(): void {
+function measuredText(): HTMLElement | undefined {
   const element = labelElement.value;
+  return element?.querySelector<HTMLElement>('.streaming-tail-text') ?? element;
+}
+
+function measureLabel(): void {
+  const element = measuredText();
   labelTruncated.value = Boolean(element && element.scrollWidth > element.clientWidth + 1);
 }
 
-onMounted(() => {
+watch(labelElement, () => {
+  labelObserver?.disconnect();
   measureLabel();
-  if (typeof ResizeObserver === 'undefined' || !labelElement.value) return;
-  labelObserver = new ResizeObserver(measureLabel);
-  labelObserver.observe(labelElement.value);
-});
+  const element = measuredText();
+  if (typeof ResizeObserver === 'undefined' || !element) return;
+  labelObserver ??= new ResizeObserver(measureLabel);
+  labelObserver.observe(element);
+}, { flush: 'post', immediate: true });
 watch(labelText, () => { void nextTick(measureLabel); });
 onBeforeUnmount(() => labelObserver?.disconnect());
 </script>
@@ -44,7 +52,7 @@ onBeforeUnmount(() => labelObserver?.disconnect());
       <CollapsibleContentBlock v-model:expanded="detailExpanded" :collapsible="expandable" icon-active :aria-label="labelText">
         <template #icon><IconTool stroke="2" /></template>
         <template #summary><span ref="labelElement" class="activity-concise-label lc-shimmer-text">{{ labelText }}</span></template>
-        <p class="activity-concise-detail">{{ labelText }}</p>
+        <p class="activity-detail activity-concise-detail">{{ labelText }}</p>
       </CollapsibleContentBlock>
     </div>
   </article>
@@ -58,7 +66,17 @@ onBeforeUnmount(() => labelObserver?.disconnect());
           </span>
         </header>
         <div class="activity-body">
-          <StreamingIndicatorTail :text="labelText" variant="preparing" />
+          <div class="activity-tail-line">
+            <span ref="labelElement" class="activity-tail-clip"><StreamingIndicatorTail :text="labelText" variant="preparing" /></span>
+            <button
+              v-if="expandable"
+              type="button"
+              class="activity-expand-toggle"
+              :aria-expanded="detailExpanded"
+              @click="detailExpanded = !detailExpanded"
+            >{{ detailExpanded ? '收起' : '展开' }}</button>
+          </div>
+          <p v-if="detailExpanded" class="activity-detail">{{ labelText }}</p>
         </div>
       </div>
     </div>
@@ -104,15 +122,69 @@ onBeforeUnmount(() => labelObserver?.disconnect());
   white-space: nowrap;
 }
 
-.activity-concise-detail {
+.activity-detail {
   margin: 0;
-  padding-top: var(--space-2);
+  padding-top: var(--space-1);
   font-size: var(--font-size-sm);
   line-height: 1.6;
   color: var(--vscode-descriptionForeground);
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   user-select: text;
+}
+
+.activity-concise-detail {
+  padding-top: var(--space-2);
+}
+
+.activity-tail-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.activity-tail-clip {
+  display: block;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.activity-tail-clip :deep(.streaming-tail) {
+  display: flex;
+  max-width: 100%;
+  margin-left: 0;
+}
+
+.activity-tail-clip :deep(.streaming-tail-text) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.activity-tail-clip :deep(.streaming-tail-cursor) {
+  flex: none;
+}
+
+.activity-expand-toggle {
+  flex: none;
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  color: var(--vscode-textLink-foreground);
+  cursor: pointer;
+}
+
+.activity-expand-toggle:hover {
+  text-decoration: underline;
+}
+
+.activity-expand-toggle:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
 }
 
 .activity-container {

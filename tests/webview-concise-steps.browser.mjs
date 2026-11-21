@@ -97,6 +97,7 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     page.on('pageerror', error => errors.push(error.message));
     const open = search => page.goto(`http://127.0.0.1:${server.httpServer.address().port}/concise-steps-fixture${search}`, { waitUntil: 'domcontentloaded' });
     const summary = page.locator('.rich-step-group > .lc-collapsible-header .lc-collapsible-summary');
+    const longError = '上游返回 400：' + 'Request contains an invalid argument, field contents[12].parts must not be empty. '.repeat(4) + '末尾标记';
 
     // 普通模式：头部、思考、两张工具卡和底栏照常显示。
     await open('');
@@ -104,6 +105,22 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     assert.equal(await page.locator('.floor-header').count(), 1);
     assert.equal(await page.locator('.message-footer').count(), 1);
     assert.equal(await page.locator('.rich-step-group').count(), 0);
+    // 普通模式的等待行：短文案不给展开。
+    assert.equal(await page.locator('.timeline-activity-row .activity-header').count(), 1);
+    assert.equal(await page.locator('.activity-expand-toggle').count(), 0);
+
+    // 普通模式下重试报错过长：一行内省略，点"展开"看全文。
+    await open('?activity=' + encodeURIComponent(longError + '，3 秒后自动恢复（第 1/5 次）'));
+    const expandToggle = page.locator('.timeline-activity-row .activity-expand-toggle');
+    await expandToggle.waitFor();
+    assert.equal(await expandToggle.innerText(), '展开');
+    assert.equal(await page.locator('.timeline-activity-row').evaluate(node => node.scrollWidth <= node.clientWidth), true);
+    assert.equal(await page.locator('.activity-detail').count(), 0);
+    await expandToggle.click();
+    assert.equal(await expandToggle.innerText(), '收起');
+    assert.match(await page.locator('.activity-detail').innerText(), /末尾标记，3 秒后自动恢复/);
+    await expandToggle.click();
+    await page.locator('.activity-detail').waitFor({ state: 'detached' });
 
     // 简洁模式：整条消息只剩一行步骤摘要，点开才渲染思考和工具卡。
     await open('?concise');
@@ -161,7 +178,6 @@ test('concise mode folds a tool-only round into one step summary row', async () 
     assert.equal(await page.locator('.timeline-activity-row .lc-collapsible-block.is-empty').count(), 1);
 
     // 自动重试时上游报错拼在这行里，一行放不下就能点开看全文。
-    const longError = '上游返回 400：' + 'Request contains an invalid argument, field contents[12].parts must not be empty. '.repeat(4) + '末尾标记';
     await open('?concise&waiting&activity=' + encodeURIComponent(longError + '，3 秒后自动恢复（第 1/5 次）'));
     await activitySummary.waitFor();
     await page.locator('.timeline-activity-row .lc-collapsible-block:not(.is-empty)').waitFor();
