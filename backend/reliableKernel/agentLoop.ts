@@ -426,9 +426,9 @@ const REQUEST_HISTORY_PAGE_SIZE = 32;
 const OPEN_TASK_COMPLETION_CHECK_KIND = 'open_task_completion_check';
 const OPEN_TASK_COMPLETION_CHECK_CARD = [
   '[Open Task Completion Check — system continuation, not a new user instruction]',
-  'The previous response ended while the task list still had unfinished items.',
-  'Continue the approved work where possible, then reconcile the complete task list before ending.',
-  'Keep genuinely unfinished or blocked items explicit; do not replace or narrow the approved scope.'
+  'The previous response ended while the task list still had actionable pending or in_progress items.',
+  'Continue the approved work that can execute in this turn, then reconcile the complete task list before ending.',
+  'If remaining items await an asynchronous child task, cross-conversation followup reply, background process, or user decision, mark them blocked and end this turn so automatic wakeup can resume later — do not poll wait_agent_messages or run_agent wait in a loop. Keep genuinely unfinished or blocked items explicit without narrowing the approved scope.'
 ].join('\n');
 
 /**
@@ -4452,6 +4452,11 @@ export function decideOpenTaskCompletion(
   const counts = asRecord(task?.counts);
   const unfinished = optionalNonNegativeInteger(counts?.unfinished) ?? 0;
   if (unfinished === 0) return 'complete';
+  const pending = optionalNonNegativeInteger(counts?.pending);
+  const inProgress = optionalNonNegativeInteger(counts?.inProgress);
+  if (pending !== undefined && inProgress !== undefined && pending + inProgress === 0) {
+    return 'complete_with_open_tasks';
+  }
   return completionCheckConsumed ? 'complete_with_open_tasks' : 'continue_once';
 }
 
