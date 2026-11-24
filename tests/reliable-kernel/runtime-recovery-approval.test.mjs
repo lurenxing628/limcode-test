@@ -161,6 +161,43 @@ test('two queued process results are consumed by one admitted continuation', asy
   assert.equal(await f.app.turns.admitNextQueued(h.lease()), null);
 });
 
+test('a process-result continuation keeps the source authority but answers on the current model', async () => {
+  const f = await runtime(), h = await f.scope('current-model-continuation');
+  const finishing = await h.input('finishing');
+  const router = new kernel.AutomaticRuntimeDeliveryRouter(f.app.database, f.app.contentStore);
+  assert.equal((await router.establishFinalOutputFence({ turnId: finishing.turnId,
+    modelRequestId: await finalRequest(h, finishing.turnId) })).established, true);
+  const compiler = f.app.turns.authorityCompiler, requests = [];
+  const current = { model: { providerConfigId: 'switched-provider', provider: 'fixture', modelId: 'switched-model',
+    retryPolicy: { enabled: false, maxRetries: 0 } },
+  modelProfile: { compressionThresholdTokens: 50000, contextWindowTokens: 64000,
+    tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 } },
+  compression: { enabled: false } };
+  compiler.compileModel = async request => { requests.push(request); return current; };
+  try {
+    const id = `${h.id}:result`;
+    const result = await f.app.runtime.deliveries.createAutomatic({ inboxItemId: await processResult(h, id, finishing.turnId),
+      targetConversationId: h.id, sourceTurnId: finishing.turnId });
+    assert.equal((await f.app.turns.runtimeContinuation({ source: { kind: 'internal', key: `${id}:continue` },
+      ...h.lease(), deliveryId: result.delivery.id, sourceTurnId: finishing.turnId })).admitted, false);
+    await finish(h, finishing.turnId);
+    const admitted = await f.app.turns.admitNextQueued(h.lease()); assert.ok(admitted?.turnId);
+    const [source] = await rows(f.app.database, 'AuthoritySnapshot', { turn_id: finishing.turnId });
+    const [snapshot] = await rows(f.app.database, 'AuthoritySnapshot', { turn_id: admitted.turnId });
+    const before = await content(f.app, source.content_object_id), after = await content(f.app, snapshot.content_object_id);
+    assert.deepEqual([after.model, after.modelProfile, after.compression], [current.model, current.modelProfile, current.compression]);
+    for (const key of ['toolPolicy', 'systemPrompt', 'runtimeContext', 'workEnvironmentPolicy', 'planReviewPolicy']) {
+      assert.deepEqual(after[key], before[key], key);
+    }
+    assert.deepEqual(requests.map(request => [request.conversationId, request.intentKind, request.sourceTurnId]),
+      [[h.id, 'runtime_continuation', finishing.turnId]]);
+    for (const input of await rows(f.app.database, 'PendingTurnInput', { turn_id: admitted.turnId, input_kind: 'runtime_delivery', state: 'pending' })) {
+      await f.app.runtime.deliveries.markInputHandled(input.id);
+    }
+    await finish(h, admitted.turnId);
+  } finally { delete compiler.compileModel; }
+});
+
 test('stream reset keeps the committed tool effect and its model result exactly once', stream.scenario1);
 
 test('task-list preserves frozen arguments and replays the canonical CAS result', async () => {
