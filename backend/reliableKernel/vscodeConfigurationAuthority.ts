@@ -117,6 +117,7 @@ import type { AttachmentSettingsAuthority } from './attachmentIngest';
 import type {
   CompiledTurnAuthority,
   TurnAuthorityCompilationRequest,
+  TurnFrozenModelAuthority,
   TurnWorkEnvironmentPreview,
   TurnWorkEnvironmentPreviewRequest,
   TurnAuthorityCompiler
@@ -233,6 +234,12 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     });
   }
 
+  /** The model members compile() would freeze for this request, without reading prompts, tools or folders. */
+  public async compileModel(request: TurnAuthorityCompilationRequest): Promise<TurnFrozenModelAuthority> {
+    const records = await this.loadRecords();
+    return frozenModelAuthority(records, request, resolveModelSelection(records, request));
+  }
+
   /**
    * The default work environment compile() would freeze for a new Turn, resolved the same way
    * (explicit choice, inherited boundary, project, scoped policy default) against this window's
@@ -312,21 +319,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     const records = await this.loadRecords();
     const { agentId, agent, workflowId, workflow, builtinAgent, builtinWorkflow,
       scopesLowToHigh, scopesHighToLow, modelProfile, provider, modelId } = resolveModelSelection(records, request);
-
-    const conversationModelProfile = resolveRecordAtScope(
-      records.modelProfileScopeLinks,
-      records.modelProfiles,
-      { scopeKind: 'conversation', scopeId: request.conversationId },
-      (link) => link.modelProfileId
-    );
-    // 子对话的第一个回合在写入它自己的模型记录之前编译：还没有对话级记录时，按父回合冻结的继承选择。
-    const savedConversationThinkingOverride = conversationModelProfile
-      ? conversationModelProfile.providerConfigId === provider.id
-        && conversationModelProfile.provider === provider.provider
-        && conversationModelProfile.model === modelId
-        ? conversationModelProfile.thinkingOverride
-        : undefined
-      : request.inheritedThinkingOverride;
+    const frozenModel = frozenModelAuthority(records, request, { modelProfile, provider, modelId });
 
     const planReviewPolicy = resolveScopedRecord(
       records.planReviewPolicyScopeLinks,
@@ -419,34 +412,6 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       scopesHighToLow,
       (link) => link.workEnvironmentPolicyId
     );
-    const selectedModelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
-    const systemPromptPrefix = selectedModelConfig?.systemPromptPrefix ?? provider.systemPromptPrefix;
-    const contextWindow = resolveContextWindow(provider, modelId);
-    const primaryGenerationConfig = selectedModelConfig?.generationConfig ?? provider.generationConfig;
-    const primaryCapabilities = resolveProviderModelCapabilities(provider, modelId);
-    // 只冻结实际生效的覆盖（子 Agent 按它继承）；不适用的旧覆盖按渠道设置发送。
-    const savedThinking = savedConversationThinkingOverride
-      ? resolveSavedSessionThinkingOverride(savedConversationThinkingOverride, provider.provider, modelId, primaryGenerationConfig,
-        selectedModelConfig ? selectedModelConfig.requestBody : provider.requestBody, provider)
-      : undefined;
-    const effectiveConversationThinkingOverride = savedThinking?.status === 'applied' ? savedThinking.override : undefined;
-    // 与 initializeConversationModelProfile 写入子对话记录的继承标记一致：继承来的强度适用时才继续往下传。
-    const inheritThinkingToChildren = conversationModelProfile
-      ? conversationModelProfile.inheritThinkingToChildren === true
-      : effectiveConversationThinkingOverride !== undefined;
-    const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
-      ?? defaultMaxOutputTokensForProvider(provider.provider) ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
-    const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
-    // Native facts freeze with the Turn: the kernel capability gate must replay identically after
-    // recovery even if the editable channel settings change mid-request.
-    const nativeResponses = normalizeOpenAIResponsesNativeSettings(
-      selectedModelConfig?.nativeResponses ?? provider.nativeResponses
-    );
-    // 每轮提醒是否改用 Claude 轮内系统消息：随 Turn 冻结，恢复与重放一致；关闭时快照里没有这个字段。
-    const claudeTurnScopedReminders = provider.provider === 'claude'
-      && (selectedModelConfig?.claudeTurnScopedReminders ?? provider.claudeTurnScopedReminders) === true;
-    const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
-    const compressionThresholdTokens = compression.thresholdTokens;
     // The stored settings are checked like saved ones, so a hand-edited list can never be spread into
     // characters when bounded by the parent (see requireSkillSourceConfigs).
     const ownSkillPolicy = {
@@ -525,38 +490,7 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
       executorAgentId: agentId,
       intentKind: request.intentKind,
       ...(request.sourceTurnId ? { sourceTurnId: request.sourceTurnId } : {}),
-      model: {
-        providerConfigId: provider.id,
-        provider: provider.provider,
-        modelId,
-        baseUrl: provider.baseUrl,
-        openaiResponsesTransport: provider.openaiResponsesTransport,
-        enableMultimodalTools,
-        historyImages: normalizeHistoryImageSettings((selectedModelConfig ?? provider).historyImages),
-        systemPromptPrefix,
-        maxOutputTokens,
-        capabilities: clonePlain(primaryCapabilities),
-        ...(primaryGenerationConfig ? { generationConfig: clonePlain(primaryGenerationConfig) } : {}),
-        ...((selectedModelConfig?.requestBody ?? provider.requestBody)
-          ? { requestBody: clonePlain(selectedModelConfig?.requestBody ?? provider.requestBody) } : {}),
-        ...(primaryGenerationConfig?.thinkingConfig
-          ? { thinkingConfig: clonePlain(primaryGenerationConfig.thinkingConfig) }
-          : {}),
-        ...(effectiveConversationThinkingOverride
-          ? { thinkingOverride: clonePlain(effectiveConversationThinkingOverride) }
-          : {}),
-        ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {}),
-        ...(nativeResponses ? { nativeResponses } : {}),
-        ...(claudeTurnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
-        retryPolicy: frozenProviderRetryPolicy(provider, modelId)
-      },
-      modelProfile: {
-        id: modelProfile?.id ?? null,
-        compressionThresholdTokens,
-        contextWindowTokens: contextWindow,
-        tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
-      },
-      compression: compression.snapshot,
+      ...frozenModel,
       planReviewPolicy: {
         id: planReviewPolicy?.id ?? builtinPlanReviewPolicy?.id ?? null,
         mode: planReviewPolicy?.mode ?? builtinPlanReviewPolicy?.mode ?? 'off',
@@ -1164,6 +1098,94 @@ export class VscodeConfigurationAuthority implements TurnAuthorityCompiler, Atta
     };
   }
 
+}
+
+/**
+ * The model, context window and compression a Turn freezes for its resolved provider/model. compile()
+ * and a runtime continuation that keeps its source Turn's other authority share this one derivation.
+ */
+function frozenModelAuthority(
+  records: ConfigurationRecords,
+  request: TurnAuthorityCompilationRequest,
+  { modelProfile, provider, modelId }: Pick<ReturnType<typeof resolveModelSelection>, 'modelProfile' | 'provider' | 'modelId'>
+): TurnFrozenModelAuthority {
+    const conversationModelProfile = resolveRecordAtScope(
+      records.modelProfileScopeLinks,
+      records.modelProfiles,
+      { scopeKind: 'conversation', scopeId: request.conversationId },
+      (link) => link.modelProfileId
+    );
+    // 子对话的第一个回合在写入它自己的模型记录之前编译：还没有对话级记录时，按父回合冻结的继承选择。
+    const savedConversationThinkingOverride = conversationModelProfile
+      ? conversationModelProfile.providerConfigId === provider.id
+        && conversationModelProfile.provider === provider.provider
+        && conversationModelProfile.model === modelId
+        ? conversationModelProfile.thinkingOverride
+        : undefined
+      : request.inheritedThinkingOverride;
+
+    const selectedModelConfig = provider.modelConfigs.find((candidate) => candidate.modelId === modelId);
+    const systemPromptPrefix = selectedModelConfig?.systemPromptPrefix ?? provider.systemPromptPrefix;
+    const contextWindow = resolveContextWindow(provider, modelId);
+    const primaryGenerationConfig = selectedModelConfig?.generationConfig ?? provider.generationConfig;
+    const primaryCapabilities = resolveProviderModelCapabilities(provider, modelId);
+    // 只冻结实际生效的覆盖（子 Agent 按它继承）；不适用的旧覆盖按渠道设置发送。
+    const savedThinking = savedConversationThinkingOverride
+      ? resolveSavedSessionThinkingOverride(savedConversationThinkingOverride, provider.provider, modelId, primaryGenerationConfig,
+        selectedModelConfig ? selectedModelConfig.requestBody : provider.requestBody, provider)
+      : undefined;
+    const effectiveConversationThinkingOverride = savedThinking?.status === 'applied' ? savedThinking.override : undefined;
+    // 与 initializeConversationModelProfile 写入子对话记录的继承标记一致：继承来的强度适用时才继续往下传。
+    const inheritThinkingToChildren = conversationModelProfile
+      ? conversationModelProfile.inheritThinkingToChildren === true
+      : effectiveConversationThinkingOverride !== undefined;
+    const maxOutputTokens = positiveSafeIntegerOrUndefined(primaryGenerationConfig?.maxOutputTokens)
+      ?? defaultMaxOutputTokensForProvider(provider.provider) ?? DEFAULT_LLM_COMPRESSION_OUTPUT_RESERVE_TOKENS;
+    const enableMultimodalTools = selectedModelConfig?.enableMultimodalTools ?? provider.enableMultimodalTools;
+    // Native facts freeze with the Turn: the kernel capability gate must replay identically after
+    // recovery even if the editable channel settings change mid-request.
+    const nativeResponses = normalizeOpenAIResponsesNativeSettings(
+      selectedModelConfig?.nativeResponses ?? provider.nativeResponses
+    );
+    // 每轮提醒是否改用 Claude 轮内系统消息：随 Turn 冻结，恢复与重放一致；关闭时快照里没有这个字段。
+    const claudeTurnScopedReminders = provider.provider === 'claude'
+      && (selectedModelConfig?.claudeTurnScopedReminders ?? provider.claudeTurnScopedReminders) === true;
+    const compression = resolveFrozenCompression(records, provider, modelId, contextWindow);
+    const compressionThresholdTokens = compression.thresholdTokens;
+    return {
+      model: {
+        providerConfigId: provider.id,
+        provider: provider.provider,
+        modelId,
+        baseUrl: provider.baseUrl,
+        openaiResponsesTransport: provider.openaiResponsesTransport,
+        enableMultimodalTools,
+        historyImages: normalizeHistoryImageSettings((selectedModelConfig ?? provider).historyImages),
+        systemPromptPrefix,
+        maxOutputTokens,
+        capabilities: clonePlain(primaryCapabilities),
+        ...(primaryGenerationConfig ? { generationConfig: clonePlain(primaryGenerationConfig) } : {}),
+        ...((selectedModelConfig?.requestBody ?? provider.requestBody)
+          ? { requestBody: clonePlain(selectedModelConfig?.requestBody ?? provider.requestBody) } : {}),
+        ...(primaryGenerationConfig?.thinkingConfig
+          ? { thinkingConfig: clonePlain(primaryGenerationConfig.thinkingConfig) }
+          : {}),
+        ...(effectiveConversationThinkingOverride
+          ? { thinkingOverride: clonePlain(effectiveConversationThinkingOverride) }
+          : {}),
+        ...(inheritThinkingToChildren ? { inheritThinkingToChildren: true } : {}),
+        ...(nativeResponses ? { nativeResponses } : {}),
+        ...(claudeTurnScopedReminders ? { claudeTurnScopedReminders: true } : {}),
+        retryPolicy: frozenProviderRetryPolicy(provider, modelId)
+      },
+      modelProfile: {
+        id: modelProfile?.id ?? null,
+        compressionThresholdTokens,
+        contextWindowTokens: contextWindow,
+        tokenEstimator: { kind: 'utf8-bytes-ceil', bytesPerToken: 4 }
+      },
+      compression: compression.snapshot
+    };
 }
 
 type ModelSelectionRecords = Pick<ConfigurationRecords, 'agents' | 'workflows' | 'modelProfiles' | 'modelProfileScopeLinks'

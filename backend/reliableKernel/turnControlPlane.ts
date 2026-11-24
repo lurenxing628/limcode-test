@@ -217,6 +217,15 @@ export interface TurnAuthorityCompiler {
   compile(request: TurnAuthorityCompilationRequest): Promise<CompiledTurnAuthority>;
   /** The work environment compile() would freeze for such a request, against this Host's catalog. */
   previewWorkEnvironment?(request: TurnWorkEnvironmentPreviewRequest): Promise<TurnWorkEnvironmentPreview>;
+  /** The model members compile() would freeze for such a request. */
+  compileModel?(request: TurnAuthorityCompilationRequest): Promise<TurnFrozenModelAuthority>;
+}
+
+/** The provider/model, context window and compression members of a frozen Turn authority. */
+export interface TurnFrozenModelAuthority {
+  model: Record<string, unknown>;
+  modelProfile: Record<string, unknown>;
+  compression: Record<string, unknown>;
 }
 
 export type TurnWorkEnvironmentPreviewRequest = Pick<
@@ -1965,6 +1974,9 @@ export class TurnControlPlane {
     if (plan.runtimeMaintenance && plan.inheritSourceAuthority) {
       compiled = await this.withNextTurnWorkEnvironment(compiled, conversation.id as string);
     }
+    if (plan.operation === 'runtime_continuation' && plan.inheritSourceAuthority) {
+      compiled = await this.withCurrentModel(compiled, conversation.id as string, requireId(plan.sourceTurnId, 'sourceTurnId'));
+    }
     if (retryRewind) compiled = withRetryLineage(compiled, retryRewind.lineage);
     const now = this.timestamp();
 
@@ -2477,6 +2489,41 @@ export class TurnControlPlane {
             defaultWorkEnvironmentId: preview.policy.defaultWorkEnvironmentId
           }
         }, 'Maintenance authority')
+      }
+    };
+  }
+
+  /**
+   * A process result or child answer continues with its source Turn's frozen tools, prompt and work
+   * environment, but on the model the Conversation uses now: otherwise background work started before
+   * the user switched channel keeps answering on the old channel, and each such continuation spawns
+   * more work that carries it on.
+   */
+  private async withCurrentModel(
+    compiled: ReturnType<typeof normalizeCompiledTurnAuthority>,
+    conversationId: string,
+    sourceTurnId: string
+  ): Promise<ReturnType<typeof normalizeCompiledTurnAuthority>> {
+    if (!this.authorityCompiler.compileModel) return compiled;
+    const current = await this.authorityCompiler.compileModel({
+      conversationId,
+      turnId: compiled.turnId,
+      executorAgentId: compiled.executorAgentId,
+      intentKind: 'runtime_continuation',
+      sourceTurnId
+    });
+    const content = compiled.authoritySnapshot.content;
+    const document = normalizePlainJson(JSON.parse(
+      typeof content === 'string' ? content : Buffer.from(content).toString('utf8')
+    ) as unknown, 'Runtime continuation authority');
+    if (!document || typeof document !== 'object' || Array.isArray(document)) {
+      throw new Error('Runtime continuation authority must be a JSON object.');
+    }
+    return {
+      ...compiled,
+      authoritySnapshot: {
+        ...compiled.authoritySnapshot,
+        content: canonicalPlainJson({ ...document, ...current }, 'Runtime continuation authority')
       }
     };
   }
