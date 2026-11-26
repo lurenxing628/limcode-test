@@ -303,6 +303,20 @@ test('模型菜单宽窗并排、窄窗返回渠道，不再固定170px', async 
   assert.ok((await bounds(p, '.channel-model-panel')).width >= 280);
 });
 
+test('窄窗模型菜单不随软键盘收起而关闭，能选中模型', async t => {
+  // 手机上打开渠道列表会聚焦搜索框弹出键盘；点开模型列表时搜索框被替换掉，键盘收回，窗口高度变化。
+  const p = await pageFor(t);
+  await p.locator('.composer-channel-dropdown > button').click();
+  await p.getByRole('button', { name: '切换该渠道的 LLM', exact: true }).click();
+  await p.getByRole('button', { name: '‹ 返回渠道' }).waitFor();
+  await p.setViewportSize({ width: 360, height: 500 });
+  await p.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+  assert.equal(await p.getByRole('button', { name: '‹ 返回渠道' }).count(), 1, '键盘收起后模型列表还在');
+  await p.locator('.composer-channel-dropdown .settings-selectable-title', { hasText: 'long-model-name-with-a-readable-description' }).click();
+  // 选中后模型列表收起（只有选中渠道里存在的模型才会收起）。
+  await p.getByRole('button', { name: '‹ 返回渠道' }).waitFor({ state: 'detached' });
+});
+
 test('协作查找跨空页显示进度、查完结束、停止不继续请求、失败保留游标', async t => {
   const p = await pageFor(t);
   await p.evaluate(() => window.fixture.mode.value = 'history');
