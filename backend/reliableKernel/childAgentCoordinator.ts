@@ -2492,7 +2492,7 @@ export class ReliableChildAgentCoordinator {
     const cancelled = await this.interruptSubtree({
       sourceKey: `run-agent-interrupt:${input.toolCallId}`,
       childExecutionId: requireId(snapshot.childExecution.id, 'ChildExecution.id'),
-      reason: 'run_agent interrupt_subtree requested'
+      reason: '父对话主动中断了此子任务（interrupt_subtree）'
     });
     return this.settleOwnTool(input.toolCallId, {
       ok: true,
@@ -2520,8 +2520,11 @@ export class ReliableChildAgentCoordinator {
     const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
     const task = await this.requireScopedChildTask(projection, answerBridgeId, 'direct');
     // Deleting a child that has not answered yet silently drops its answer. Giving it up must be an
-    // explicit interrupt first; the interrupted child is then deletable like any finished one.
-    if ((await this.dependencies.answers.readCurrent(answerBridgeId)).status === 'running') {
+    // explicit interrupt first; once interrupt_subtree has durably committed (status=interrupting or
+    // already settled), the child can no longer submit a normal answer and deleteConversation stops
+    // and awaits any still-winding-down turns cleanly before deleting the subtree.
+    const currentAnswer = await this.dependencies.answers.readCurrent(answerBridgeId);
+    if (currentAnswer.status === 'running' && !currentAnswer.interrupting) {
       throw new Error(`子 Agent ${answerBridgeId} 仍在运行、尚未提交答复，不能删除：删除会丢掉它的答复。`
         + '请先用 wait 等待答复；确定不再需要它时，先用 interrupt_subtree 中断，再删除。');
     }

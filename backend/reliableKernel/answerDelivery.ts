@@ -86,7 +86,7 @@ export interface AnswerWaitRecoveryResult {
 
 export type AnswerReadResult =
   | { status: 'not_found' }
-  | { status: 'running'; answerBridgeId: string; childExecutionId: string }
+  | { status: 'running'; answerBridgeId: string; childExecutionId: string; interrupting?: boolean }
   | { status: 'interrupted'; answerBridgeId: string; childExecutionId: string }
   | {
       status: 'failed';
@@ -645,10 +645,16 @@ export class AnswerControlPlane {
     const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
     const snapshot = await this.children.readExecutionSnapshot(childExecutionId);
     if (!snapshot.currentSubmission) {
+      const childStatus = String(snapshot.childExecution.status);
       const running = snapshot.activeTurn?.status === ACTIVE_TURN
-        || ['starting', 'active'].includes(String(snapshot.childExecution.status));
+        || ['starting', 'active'].includes(childStatus);
       return running
-        ? { status: 'running', answerBridgeId, childExecutionId }
+        ? {
+            status: 'running',
+            answerBridgeId,
+            childExecutionId,
+            ...(childStatus === 'interrupting' || childStatus === 'interrupted' ? { interrupting: true } : {})
+          }
         : { status: 'interrupted', answerBridgeId, childExecutionId };
     }
     const submissionId = requirePhaseFId(snapshot.currentSubmission.id, 'AnswerSubmission.id');

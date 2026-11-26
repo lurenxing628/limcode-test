@@ -426,9 +426,9 @@ const REQUEST_HISTORY_PAGE_SIZE = 32;
 const OPEN_TASK_COMPLETION_CHECK_KIND = 'open_task_completion_check';
 const OPEN_TASK_COMPLETION_CHECK_CARD = [
   '[Open Task Completion Check — system continuation, not a new user instruction]',
-  'The previous response ended while the task list still had unfinished items.',
-  'Continue the approved work where possible, then reconcile the complete task list before ending.',
-  'Keep genuinely unfinished or blocked items explicit; do not replace or narrow the approved scope.'
+  'The previous response ended while the task list still had actionable pending or in_progress items.',
+  'Continue the approved work that can execute in this turn, then reconcile the complete task list before ending.',
+  'If remaining items await an asynchronous child task, cross-conversation followup reply, background process, or user decision, mark them blocked and end this turn so automatic wakeup can resume later — do not poll wait_agent_messages or run_agent wait in a loop. Keep genuinely unfinished or blocked items explicit without narrowing the approved scope.'
 ].join('\n');
 
 /**
@@ -4033,12 +4033,12 @@ export class ReliableAgentLoop {
   }
 
   /**
-   * 普通中断请求沿用发起方写下的原因（如“用户请求中断当前 Turn。”），界面据此区分手动停止和系统停止；
-   * 子 Agent 的 termination_request 以及读不到原因时，仍记录执行器观察到的阶段。
+   * 中断请求（含顶层 interrupt_request 与子任务 termination_request）优先沿用发起方写下的原因，
+   * 界面据此区分用户手动暂停、父对话主动中断与系统异常；仅当载荷缺失原因时回退执行器阶段名。
    */
   private async terminationRequestReason(request: DomainRow, stage: string): Promise<string> {
     const observed = `Executor observed ${String(request.input_kind)} at ${stage}.`;
-    if (request.input_kind !== 'interrupt_request') return observed;
+    if (request.input_kind !== 'interrupt_request' && request.input_kind !== 'termination_request') return observed;
     try {
       const metadata = await this.requireExisting(
         'ContentObject',
@@ -4452,6 +4452,11 @@ export function decideOpenTaskCompletion(
   const counts = asRecord(task?.counts);
   const unfinished = optionalNonNegativeInteger(counts?.unfinished) ?? 0;
   if (unfinished === 0) return 'complete';
+  const pending = optionalNonNegativeInteger(counts?.pending);
+  const inProgress = optionalNonNegativeInteger(counts?.inProgress);
+  if (pending !== undefined && inProgress !== undefined && pending + inProgress === 0) {
+    return 'complete_with_open_tasks';
+  }
   return completionCheckConsumed ? 'complete_with_open_tasks' : 'continue_once';
 }
 

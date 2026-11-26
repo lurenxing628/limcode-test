@@ -1651,7 +1651,7 @@ export class VscodeReliableKernelCommandRouter {
         const interrupted = await this.product.childAgents.interruptSubtree({
           sourceKey: `${payload.command.commandId}:child:${String(link.child_execution_id)}`,
           childExecutionId: String(link.child_execution_id),
-          reason: 'parent_turn_interrupted'
+          reason: '用户请求中断父对话，已一并停止当前子任务。'
         }, { userStop: true });
         if (interrupted?.executingWindowAlive) {
           void vscode.window.showInformationMessage(`${EXTENSION_BRAND}：${STOP_WAITS_FOR_EXECUTING_WINDOW_MESSAGE}`);

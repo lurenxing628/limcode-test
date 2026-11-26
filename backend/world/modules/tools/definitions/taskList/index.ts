@@ -74,6 +74,7 @@ Usage rules:
 - For complex, multi-step, cross-file work, or when the user explicitly asks to track progress, first use rewrite to create 3-8 tasks.
 - Before starting a piece of work, set it to in_progress; mark it completed as soon as it is done.
 - Keep only one in_progress task at a time; the frontend automatically moves the previous in_progress task back to pending.
+- When remaining steps depend on an asynchronous child task, cross-conversation followup reply, background process, or user input after independent work in this turn is done, mark those waiting steps blocked before ending the turn so the turn closes cleanly without an open-task continuation check and resumes on automatic wakeup.
 - When a new, clearly separate user task / new plan / new phase comes up, use rewrite so unrelated tasks are not mixed into one list.
 - When continuing the same batch of work, use update and only submit the entries that changed.
 - This is not the final reply text; the frontend renders the task list dynamically from the tool calls in the current conversation.`,
