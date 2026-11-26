@@ -389,7 +389,7 @@ test('Gemini 签名只回放给签发它的渠道与模型，换渠道后旧签�
     return (await llm.dryRunLlmProvider(projected, { settings: async () => config })).body;
   };
   const oldTurn = [user('go'), signedReply(), answer, user('again')];
-  // 同一条渠道同一个模型：原样回放（旧轮次不校验签名，也不补 dummy）。
+  // 同一条渠道同一个模型：原样回放，已有签名不动。
   const own = await project(oldTurn, { providerId: config.id, modelId: config.model });
   assert.deepEqual(own.contents[1].parts, [
     { functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' }, thoughtSignature: 'CHANNEL_SIGNATURE' },
@@ -401,12 +401,13 @@ test('Gemini 签名只回放给签发它的渠道与模型，换渠道后旧签�
     { providerId: 'gemini-other-channel', modelId: config.model },
     { providerId: config.id, modelId: 'gemini-2.5-pro' }
   ]) {
-    // 换了渠道或模型：签名一律不发，只剩签名没有内容的尾 part 整条去掉。
+    // 换了渠道或模型：旧签名一律不发，只剩签名没有内容的尾 part 整条去掉；
+    // Gemini 4 连旧轮次的工具步也校验，所以调用上补官方 dummy。
     const foreign = await project(oldTurn, modelSource);
-    assert.deepEqual(foreign.contents[1].parts,
-      [{ functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' } }]);
+    assert.deepEqual(foreign.contents[1].parts, [{ functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' },
+      thoughtSignature: 'skip_thought_signature_validator' }]);
   }
-  // 当前轮次里第一处工具调用必须带签名：清掉别家签名后按官方约定补 dummy。
+  // 当前轮次同理：清掉别家签名后按官方约定补 dummy。
   const current = await project([user('go'), signedReply(), answer],
     { providerId: 'gemini-other-channel', modelId: config.model });
   assert.deepEqual(current.contents[1].parts, [{ functionCall: { name: 'read', args: { path: 'a' }, id: 'read-1' },
