@@ -591,7 +591,9 @@ function onWindowKeydown(event: KeyboardEvent): void {
 }
 
 function onWindowResize(): void {
-  channelModelPanel.value = null;
+  // 并排面板按打开时的坐标定位，窗口一变就关；嵌在渠道列表里的随列表自己重新定位。
+  // 手机上软键盘收回也会触发 resize，嵌入式的若跟着关，点开模型列表会闪一下就退回渠道列表。
+  if (!channelModelPanel.value?.inline) channelModelPanel.value = null;
   if (!editorExpanded.value) return;
   updateExpandedEditorHeight();
 }
