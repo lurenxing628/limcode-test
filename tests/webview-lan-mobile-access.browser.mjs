@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { after, before, test } from 'node:test';
@@ -284,4 +286,25 @@ test('运行时还在等待时说明原因；桌面没打开对话时自动进�
   await page.locator('textarea').waitFor();
   assert.equal(await page.locator('#limcode-mobile-notice').count(), 0);
   assert.equal(opened.at(-1), 'c0', '进入的对话由这个窗口接管');
+});
+
+test('回复里用本机路径写的图片在手机上能显示，非图片文件不给读', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), '本机 图片-'));
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const image = path.join(dir, '预览 1.png');
+  // 1x1 的红色 PNG。
+  fs.writeFileSync(image, Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==', 'base64'));
+  fs.writeFileSync(path.join(dir, 'secret.txt'), 'x');
+  const original = bodies['rev-model'];
+  bodies['rev-model'] = { role: 'model', parts: [{ text: `成品预览：\n\n![预览](<${image.split(path.sep).join('/')}>)` }] };
+  t.after(() => { bodies['rev-model'] = original; });
+
+  const page = await pageFor(t);
+  const img = page.locator('img[alt="预览"]');
+  await img.waitFor();
+  await page.waitForFunction(() => document.querySelector('img[alt="预览"]')?.naturalWidth === 1);
+  assert.match(await img.getAttribute('src'), /^\/__limcode_local\//);
+
+  const secret = (await img.getAttribute('src')).replace(/[^/]+$/, 'secret.txt');
+  assert.equal((await fetch(base + secret)).status, 404);
 });
