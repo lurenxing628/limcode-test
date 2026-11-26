@@ -16,6 +16,7 @@ import {
   type WebviewToExtensionMessage
 } from '../shared/protocol';
 import { isReliableKernelControlMessage } from '../shared/reliableKernelClientFeed';
+import { LOCAL_RESOURCE_MAPPINGS_META_NAME, type WebviewLocalResourceMapping } from '../shared/localFileResources';
 
 /**
  * 手机局域网访问：在本机开一个 HTTP 服务，把插件现成的聊天页面原样交给手机浏览器。
@@ -41,6 +42,20 @@ const MIME_TYPES: Record<string, string> = {
   '.woff': 'font/woff',
   '.woff2': 'font/woff2',
   '.ttf': 'font/ttf'
+};
+
+/** 回复里用本机路径写的图片经这个路径读取；只给图片格式，不限目录（用户定的）。 */
+const LOCAL_IMAGE_ROUTE = '/__limcode_local';
+const LOCAL_IMAGE_TYPES: Record<string, string> = {
+  '.png': 'image/png',
+  '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg',
+  '.gif': 'image/gif',
+  '.webp': 'image/webp',
+  '.bmp': 'image/bmp',
+  '.avif': 'image/avif',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon'
 };
 
 // 浏览器里没有 VS Code 注入的主题变量，给一套深色默认值。
@@ -314,6 +329,7 @@ export class LanMobileAccessServer {
       case '/':
       case '/index.html': return this.sendIndex(response);
     }
+    if (url.pathname.startsWith(`${LOCAL_IMAGE_ROUTE}/`)) return this.sendLocalImage(response, url.pathname.slice(LOCAL_IMAGE_ROUTE.length));
     this.sendAsset(response, url.pathname);
   }
 
@@ -472,7 +488,7 @@ export class LanMobileAccessServer {
       return;
     }
     const html = fs.readFileSync(indexPath, 'utf8')
-      .replace('<head>', () => `<head><style>${VSCODE_DARK_VARS_CSS}</style><script>${mobileShim(this.host.activeConversationId() ?? '', this.host.workspaceName())}</script>`)
+      .replace('<head>', () => `<head>${localImageMappingsMeta()}<style>${VSCODE_DARK_VARS_CSS}</style><script>${mobileShim(this.host.activeConversationId() ?? '', this.host.workspaceName())}</script>`)
       .replace('</head>', () => `<style>${MOBILE_LAYOUT_CSS}</style></head>`);
     response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }).end(html);
   }
@@ -485,6 +501,20 @@ export class LanMobileAccessServer {
       return;
     }
     response.writeHead(200, { 'Content-Type': MIME_TYPES[path.extname(file).toLowerCase()] ?? 'application/octet-stream' });
+    fs.createReadStream(file).pipe(response);
+  }
+
+  private sendLocalImage(response: http.ServerResponse, encodedPath: string): void {
+    let decoded: string;
+    try { decoded = decodeURIComponent(encodedPath); } catch { decoded = ''; }
+    // Windows 上映射成 `/E:/...`，去掉开头的斜杠才是盘符路径。
+    const file = path.resolve(process.platform === 'win32' ? decoded.replace(/^\/+/, '') : decoded);
+    const type = LOCAL_IMAGE_TYPES[path.extname(file).toLowerCase()];
+    if (!decoded || !type || !fs.existsSync(file) || !fs.statSync(file).isFile()) {
+      response.writeHead(404).end();
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-cache' });
     fs.createReadStream(file).pipe(response);
   }
 
@@ -768,6 +798,15 @@ function mobileShim(initialConversationId: string, workspaceName: string): strin
     });
   });
 })();`;
+}
+
+/** 和桌面面板同一个 meta：Markdown 图片的本机路径按它改写成手机能请求的地址。 */
+function localImageMappingsMeta(): string {
+  const mappings: WebviewLocalResourceMapping[] = process.platform === 'win32'
+    ? [...'ABCDEFGHIJKLMNOPQRSTUVWXYZ'].map((letter) => ({ pathPrefix: `${letter}:/`, resourceBase: `${LOCAL_IMAGE_ROUTE}/${letter}:`, caseSensitive: false }))
+    : [{ pathPrefix: '/', resourceBase: LOCAL_IMAGE_ROUTE, caseSensitive: true }];
+  const content = JSON.stringify(mappings).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  return `<meta name="${LOCAL_RESOURCE_MAPPINGS_META_NAME}" content="${content}">`;
 }
 
 function readBody(request: http.IncomingMessage): Promise<Buffer> {
