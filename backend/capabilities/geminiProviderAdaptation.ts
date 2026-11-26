@@ -31,7 +31,7 @@ function installProviderSchemaEncoder<T>(
 ): T {
   const geminiOpenAICompatible = providerKind === 'openai-compatible' && isGeminiOpenAICompatibleModelName(modelId);
   if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && providerKind !== 'claude' && !geminiOpenAICompatible) return provider;
-  const fillsCurrentTurnSignatures = providerKind === 'gemini' && geminiModelMayValidateSignatures(modelId);
+  const fillsStepSignatures = providerKind === 'gemini' && geminiModelMayValidateSignatures(modelId);
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
@@ -51,7 +51,7 @@ function installProviderSchemaEncoder<T>(
     const encoded = originalEncodeRequest(normalizedRequest, stream);
     if (providerKind === 'gemini' || geminiOpenAICompatible) {
       restoreGeminiToolSchemas(encoded, normalizedRequest);
-      if (providerKind === 'gemini' && fillsCurrentTurnSignatures) fillGeminiStepSignatures(encoded);
+      if (providerKind === 'gemini' && fillsStepSignatures) fillGeminiStepSignatures(encoded);
     } else if (providerKind === 'claude') {
       restoreClaudeCompactionBlocks(encoded, claudeProjection.blocks);
       restoreClaudeToolResultPairing(encoded);
