@@ -102,7 +102,9 @@ async function resolvePendingInteractionAttention(
   const owners = await listRows(database, 'InteractionOwnerLink', { request_id: requestId }, 2);
   if (owners.length !== 1) return undefined;
   const turnId = requireText(owners[0].turn_id, 'InteractionOwnerLink.turn_id');
-  if (kind === 'plan_review') {
+  if (kind === 'plan_review' || kind === 'ask_user') {
+    // Child plan reviews auto-approve or stay internal; child ask_user questions are routed to the
+    // direct parent Agent rather than popping up a VS Code toast asking the human to switch tabs.
     const childMemberships = await listRows(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 1);
     if (childMemberships.length > 0) return undefined;
   }

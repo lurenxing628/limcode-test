@@ -14,7 +14,7 @@ export const MAX_AUTOMATIC_FOLLOWUPS_CONFIG_KEY = 'maxAutomaticFollowups';
 export const DEFAULT_MAX_AUTOMATIC_FOLLOWUPS = 32;
 /** Boolean user switch, frozen per Turn; it has no defaultConfig entry and is off unless set. */
 export { CROSS_CONVERSATION_COLLABORATION_CONFIG_KEY };
-export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'interrupt_subtree', 'delete_subtree'] as const;
+export const RUN_AGENT_OPERATIONS = ['spawn', 'send', 'list', 'read', 'wait', 'answer_question', 'interrupt_subtree', 'delete_subtree'] as const;
 /** Skills one spawn may preload into its child's first input. */
 export const MAX_RUN_AGENT_SKILLS = 8;
 export type RunAgentOperation = typeof RUN_AGENT_OPERATIONS[number];
@@ -81,8 +81,9 @@ export const runAgentTool: ToolDefinition = {
 - spawn forkTurns defaults to "none". Use "all" or a positive integer string to inherit all or the most recent N completed turns. Current, failed and interrupted turns are excluded; inherited child references never grant control. The prompt always starts a new assignment.
 - send requires answerBridgeId and prompt, reusing that child conversation and answer channel. It queues after the current child turn unless interrupt=true explicitly redirects current work. An unknown or missing reference fails; it never creates a replacement child.
 - A child's answer is the final reply of each of its turns: it settles a foreground wait, otherwise it is delivered to you as that child's final result. Progress the child reports mid-task arrives separately as a collaboration message.
-- read/list/wait default to direct children; scope="tree" also permits verified descendants. send, interrupt_subtree and delete_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
-- wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change or the bounded timeout. A single answerBridgeId takes priority over an unused answerBridgeIds array, which is reported. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
+- read/list/wait default to direct children; scope="tree" also permits verified descendants. send, answer_question, interrupt_subtree and delete_subtree only control direct children. Inherited history references are not authority to control another conversation's children.
+- wait observes one answerBridgeId or 1 to 32 answerBridgeIds until a status/task/result change, a pending ask_user question, or the bounded timeout. A single answerBridgeId takes priority over an unused answerBridgeIds array, which is reported. It never resumes, cancels or sends work. Do not repeatedly poll; continue independent work, then wait or finish the turn when only a child answer remains.
+- answer_question answers a direct child's pending ask_user question so the child can resume immediately without waiting for the human user to open the child tab. Requires answerBridgeId and at least one of selectedOptionIndexes (0-based) or answer (custom text); questionId is optional when the child has a single pending question. If you cannot decide on the user's behalf, ask the user in this conversation first, then forward their decision with answer_question.
 - interrupt_subtree explicitly stops a direct child and its descendants without assigning a new task. Do not interrupt merely because a child is slow.
 - delete_subtree permanently deletes an unneeded direct child conversation and its descendants. Only delete a child that has already answered or that you interrupted: a child still running without an answer is refused, because deleting it would drop the answer; wait for it first, or interrupt_subtree it if you truly no longer need it. Keep what you need from its answer before deleting. Available only when the user enables deletion in Agent settings. The deleted child cannot be continued.
 - list/read pages are bounded by both limit and a token budget. Follow nextCursor to continue. If a tool-result preview was truncated, repeat the same operation and target with cursor=rereadCursor, preferably as a single call, so omitted text is not skipped. A read source may span pages; reassemble its text by textOffset and respect textFormat (text or message_json).
@@ -102,11 +103,23 @@ export const runAgentTool: ToolDefinition = {
         },
         answerBridgeId: {
           type: 'string',
-          description: 'Required for send, read, interrupt_subtree and delete_subtree. For wait, this single target takes priority over answerBridgeIds.'
+          description: 'Required for send, read, answer_question, interrupt_subtree and delete_subtree. For wait, this single target takes priority over answerBridgeIds.'
         },
         answerBridgeIds: {
           type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 32,
           description: 'For wait only: 1 to 32 distinct existing child references, used when answerBridgeId is absent.'
+        },
+        questionId: {
+          type: 'string',
+          description: 'For answer_question only. Optional pending ask_user question ID; omit if the child has a single pending question.'
+        },
+        selectedOptionIndexes: {
+          type: 'array', items: { type: 'integer', minimum: 0 },
+          description: 'For answer_question only. 0-based indices of selected options from the child\'s pending question.'
+        },
+        answer: {
+          type: 'string',
+          description: 'For answer_question only. Custom text answer to the child\'s pending question.'
         },
         taskName: {
           type: 'string',
@@ -222,6 +235,7 @@ function summarizeRunAgentToolCall(rawArgs: unknown, context: ToolCallSummaryCon
   const operation = typeof args.operation === 'string' ? args.operation.trim() : '';
   if (!(RUN_AGENT_OPERATIONS as readonly string[]).includes(operation)) return undefined;
   const answerBridgeId = typeof args.answerBridgeId === 'string' ? args.answerBridgeId.trim() : '';
+  if (operation === 'answer_question') return answerBridgeId ? `Answer child question · ${answerBridgeId}` : 'Answer child question';
   if (operation === 'interrupt_subtree') return answerBridgeId ? `Interrupt Agent · ${answerBridgeId}` : 'Interrupt Agent';
   if (operation === 'delete_subtree') return answerBridgeId ? `删除子 Agent · ${answerBridgeId}` : '删除子 Agent';
   if (['list', 'read', 'wait'].includes(operation)) return `${operation} child tasks${answerBridgeId ? ` · ${answerBridgeId}` : ''}`;

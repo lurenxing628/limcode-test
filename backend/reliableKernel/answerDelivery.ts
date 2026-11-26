@@ -2033,10 +2033,18 @@ export class RuntimeDeliveryControlPlane {
         this.listRows('ChildExecution', { child_conversation_id: sourceConversationId }, 1),
         this.listRows('ChildExecution', { child_conversation_id: targetConversationId }, 1)
       ]);
-      const senderKind = sources[0].source_kind === 'board' || sourceChildren.length > 0 || targetChildren.length > 0
+      const senderKind = sources[0].source_kind === 'board'
+        || sources[0].source_kind === 'child_question'
+        || sourceChildren.length > 0
+        || targetChildren.length > 0
         ? 'team_agent' as const : 'other_conversation' as const;
+      let answerBridgeId: string | undefined;
+      if (sources[0].source_kind === 'child_question' && sourceChildren.length === 1) {
+        const bridges = await this.listRows('AnswerBridge', { child_execution_id: sourceChildren[0].id }, 2);
+        if (bridges.length === 1) answerBridgeId = requirePhaseFId(bridges[0].id, 'AnswerBridge.id');
+      }
       const senderTitle = sender ? displayConversationTitle({ id: sourceConversationId, title: String(sender.title), maxLength: 80 }) : null;
-      return projectRuntimeDeliveryForModel({ ...(board ? { board } : {}), kind: 'collaboration_message', phase, deliveryId, inboxItemId, targetTurnId, deliveredAt, messageId, sourceConversationId, targetConversationId, sourceKind: String(sources[0].source_kind), mode: message.mode as 'message' | 'followup', replyToMessageId: replies[0] ? String(replies[0].request_message_id) : null, content: contentBytes.toString('utf8'),
+      return projectRuntimeDeliveryForModel({ ...(board ? { board } : {}), ...(answerBridgeId ? { answerBridgeId } : {}), kind: 'collaboration_message', phase, deliveryId, inboxItemId, targetTurnId, deliveredAt, messageId, sourceConversationId, targetConversationId, sourceKind: String(sources[0].source_kind), mode: message.mode as 'message' | 'followup', replyToMessageId: replies[0] ? String(replies[0].request_message_id) : null, content: contentBytes.toString('utf8'),
         failureReply: sources[0].source_kind === 'completion' && sources[0].turn_id === null, senderKind, senderTitle });
     }
     if (inbox.source_kind === 'process_receipt') {

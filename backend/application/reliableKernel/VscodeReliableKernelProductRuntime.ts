@@ -533,6 +533,8 @@ export class VscodeReliableKernelProductRuntime {
         children: application.runtime.children,
         answers: application.runtime.answers,
         deliveries: application.runtime.deliveries,
+        collaboration: application.runtime.collaboration,
+        interactions: application.interactions,
         modelProvider: application.modelProvider,
         turns: application.turns,
         agentLoop: application.agentLoop,

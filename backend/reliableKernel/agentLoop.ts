@@ -1322,7 +1322,16 @@ export class ReliableAgentLoop {
         queuedTasks: child.queuedTasks, queuedInputCount: child.queuedInputCount,
         truncated: child.truncated, latestTurnOutcome: child.latestTurnOutcome,
         answerAvailable: child.answerAvailable, answerHandling: child.answerHandling,
-        status: child.status, resumable: child.resumable
+        status: child.status, resumable: child.resumable,
+        ...(child.pendingQuestion ? {
+          pendingQuestion: {
+            questionId: child.pendingQuestion.questionId,
+            question: child.pendingQuestion.question,
+            options: child.pendingQuestion.options,
+            multiple: child.pendingQuestion.multiple,
+            createdAt: child.pendingQuestion.createdAt
+          }
+        } : {})
       })).join('');
       const inheritedChildRefs = (runtimeStatusCard.inheritedChildTargets ?? [])
         .map(target => modelHandleRef(preparedModelHandles, 'child', target))

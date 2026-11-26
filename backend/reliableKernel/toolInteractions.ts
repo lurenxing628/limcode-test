@@ -512,6 +512,12 @@ export class ToolInteractionControlPlane {
     requestId: string;
     response: unknown;
     cancelled?: boolean;
+    parentAgent?: {
+      parentConversationId: string;
+      parentTurnId: string;
+      parentToolCallId: string;
+      childExecutionId: string;
+    };
   }): Promise<AskUserResolutionResult> {
     const source = normalizeSource(input.source, ['command', 'internal'], 'ask-user-resolve');
     const requestId = requireId(input.requestId, 'requestId');
@@ -521,14 +527,21 @@ export class ToolInteractionControlPlane {
     if (ownerRows.length !== 1) throw new Error('ask_user InteractionRequest must have one owner link.');
     const turn = await this.requireExisting('Turn', requireId(ownerRows[0].turn_id, 'InteractionOwnerLink.turn_id'));
     if (source.kind === 'internal') {
-      if (input.cancelled === true || !await this.autoApprovalAllowed(turn.id as string, 'ask_user')) {
-        throw new Error('内部 Ask 自动回复需要冻结工具策略明确授权，且不能取消问题。');
+      if (input.cancelled === true) {
+        throw new Error('内部 Ask 回复不能取消问题。');
       }
-      const automaticResponse = {
-        answer: { selectedOptionIndexes: [], customText: BACKGROUND_ASK_USER_AUTO_ANSWER }
-      };
-      if (canonicalJson(input.response) !== canonicalJson(automaticResponse)) {
-        throw new Error('内部 Ask 自动回复只能使用系统默认回答，不能代选用户答案。');
+      if (input.parentAgent) {
+        await this.assertDirectParentAskUserAuthority(turn.id as string, input.parentAgent);
+      } else {
+        if (!await this.autoApprovalAllowed(turn.id as string, 'ask_user')) {
+          throw new Error('内部 Ask 自动回复需要冻结工具策略明确授权，且不能取消问题。');
+        }
+        const automaticResponse = {
+          answer: { selectedOptionIndexes: [], customText: BACKGROUND_ASK_USER_AUTO_ANSWER }
+        };
+        if (canonicalJson(input.response) !== canonicalJson(automaticResponse)) {
+          throw new Error('内部 Ask 自动回复只能使用系统默认回答，不能代选用户答案。');
+        }
       }
     }
     const pauseId = stablePhaseDId('outcome_pause', stablePhaseDId('operation', `ask-user:${await this.toolCallIdForRequest(requestId)}`));
@@ -1324,6 +1337,46 @@ export class ToolInteractionControlPlane {
       canonicalJson({ toolCallId, status, detail }),
       'application/vnd.limcode.tool-result-artifact+json'
     );
+  }
+
+  private async assertDirectParentAskUserAuthority(
+    childTurnId: string,
+    parentAgent: {
+      parentConversationId: string;
+      parentTurnId: string;
+      parentToolCallId: string;
+      childExecutionId: string;
+    }
+  ): Promise<void> {
+    const parentConversationId = requireId(parentAgent.parentConversationId, 'parentAgent.parentConversationId');
+    const parentTurnId = requireId(parentAgent.parentTurnId, 'parentAgent.parentTurnId');
+    const parentToolCallId = requireId(parentAgent.parentToolCallId, 'parentAgent.parentToolCallId');
+    const childExecutionId = requireId(parentAgent.childExecutionId, 'parentAgent.childExecutionId');
+    const [parentTurn, parentToolCall, childTurnLinks, parentLinks] = await Promise.all([
+      this.requireExisting('Turn', parentTurnId),
+      this.requireExisting('ToolCall', parentToolCallId),
+      this.list('ChildExecutionTurnLink', { turn_id: childTurnId }, 2),
+      this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2)
+    ]);
+    if (parentTurn.status !== 'active' || parentTurn.conversation_id !== parentConversationId) {
+      throw new Error('父 Agent 回复子任务提问需要处于活动状态的直接父对话 Turn。');
+    }
+    if (parentToolCall.turn_id !== parentTurnId || parentToolCall.tool_name !== 'run_agent') {
+      throw new Error('父 Agent 回复子任务提问必须来自当前活动 Turn 的 run_agent 调用。');
+    }
+    if (childTurnLinks.length !== 1 || childTurnLinks[0].child_execution_id !== childExecutionId) {
+      throw new Error('该 ask_user 请求不属于指定的子 Agent 执行谱系。');
+    }
+    if (parentLinks.length !== 1) {
+      throw new Error('子 Agent 缺少唯一的直接父任务关系。');
+    }
+    const spawnParentTurn = await this.requireExisting(
+      'Turn',
+      requireId(parentLinks[0].parent_turn_id, 'ChildExecutionParentLink.parent_turn_id')
+    );
+    if (spawnParentTurn.conversation_id !== parentConversationId) {
+      throw new Error('只有直接父 Agent 对话才能回答该子 Agent 的提问。');
+    }
   }
 
   private async autoApprovalAllowed(turnId: string, toolName: 'ask_user' | 'submit_plan'): Promise<boolean> {
