@@ -43,7 +43,8 @@ export type CollaborationDeliveryMode =
   | 'informational_message'
   | 'completion_reply'
   | 'failure_reply'
-  | 'board_notification';
+  | 'board_notification'
+  | 'child_question';
 
 /** Who sent it: another top-level conversation, or another agent in the receiver's own team. */
 export type CollaborationSenderKind = 'other_conversation' | 'team_agent';
@@ -105,6 +106,7 @@ export interface CollaborationMessageModelEnvelope extends RuntimeDeliveryModelE
   /** Display title of the sending conversation (a team agent's name) when delivered; null once deleted. */
   senderTitle: string | null;
   board?: { postId: string; channelId: string; threadId: string };
+  answerBridgeId?: string;
 }
 
 export type RuntimeDeliveryModelEnvelope =
@@ -161,6 +163,7 @@ export interface CollaborationMessageModelProjectionInput extends ProjectionComm
   senderKind: CollaborationSenderKind;
   senderTitle: string | null;
   board?: { postId: string; channelId: string; threadId: string };
+  answerBridgeId?: string;
 }
 
 export type RuntimeDeliveryModelProjectionInput =
@@ -197,8 +200,9 @@ export function projectRuntimeDeliveryForModel(
   if (input.kind === 'collaboration_message') {
     const { failureReply, phase: _phase, ...collaboration } = input;
     const delivery: CollaborationDeliveryMode = input.sourceKind === 'board' ? 'board_notification'
-      : input.sourceKind === 'completion' ? (failureReply ? 'failure_reply' : 'completion_reply')
-        : input.mode === 'followup' ? 'followup_task' : 'informational_message';
+      : input.sourceKind === 'child_question' ? 'child_question'
+        : input.sourceKind === 'completion' ? (failureReply ? 'failure_reply' : 'completion_reply')
+          : input.mode === 'followup' ? 'followup_task' : 'informational_message';
     envelope = requireRuntimeDeliveryModelEnvelope({ ...common, ...collaboration, delivery, sourceId: input.messageId, status: 'submitted' });
   } else if (input.kind === 'process_completion') {
     const content = requirePlainRecord(input.content, 'Process completion model content');
@@ -314,18 +318,24 @@ export function requireRuntimeDeliveryModelEnvelope(input: unknown): RuntimeDeli
   if (value.kind === 'collaboration_message') {
     const messageId = requirePhaseFId(value.messageId, 'Collaboration envelope.messageId');
     if (value.sourceId !== messageId || value.status !== 'submitted' || !['message', 'followup'].includes(String(value.mode))) throw new Error('Collaboration envelope has conflicting identity or mode.');
-    if (!['tool', 'completion', 'board'].includes(String(value.sourceKind))) throw new Error('Collaboration envelope source kind is not supported.');
+    if (!['tool', 'completion', 'board', 'child_question'].includes(String(value.sourceKind))) throw new Error('Collaboration envelope source kind is not supported.');
     let board: { postId: string; channelId: string; threadId: string } | undefined;
     if (value.sourceKind === 'board') {
       const origin = requirePlainRecord(value.board, 'Collaboration board origin');
       board = { postId: requirePhaseFId(origin.postId, 'postId'), channelId: requirePhaseFId(origin.channelId, 'channelId'), threadId: requirePhaseFId(origin.threadId, 'threadId') };
     } else if (value.board !== undefined) throw new Error('Only board notifications may carry board origin.');
+    let answerBridgeId: string | undefined;
+    if (value.answerBridgeId !== undefined) {
+      if (value.sourceKind !== 'child_question') throw new Error('Only child_question notifications may carry answerBridgeId.');
+      answerBridgeId = requirePhaseFId(value.answerBridgeId, 'Collaboration child_question answerBridgeId');
+    }
     const replyToMessageId = value.replyToMessageId === null ? null : requirePhaseFId(value.replyToMessageId, 'replyToMessageId');
     const senderKind = value.senderKind;
     if (senderKind !== 'other_conversation' && senderKind !== 'team_agent') throw new Error('Collaboration envelope sender kind is not supported.');
     if (value.sourceKind === 'board' && senderKind !== 'team_agent') throw new Error('Board notifications come only from team agents.');
+    if (value.sourceKind === 'child_question' && senderKind !== 'team_agent') throw new Error('Child question notifications come only from team agents.');
     const delivery = requireCollaborationDelivery(value.delivery, String(value.sourceKind), value.mode as 'message' | 'followup', replyToMessageId);
-    return { ...common, ...(board ? { board } : {}), kind: 'collaboration_message', status: 'submitted', sourceId: messageId, messageId,
+    return { ...common, ...(board ? { board } : {}), ...(answerBridgeId ? { answerBridgeId } : {}), kind: 'collaboration_message', status: 'submitted', sourceId: messageId, messageId,
       sourceConversationId: requirePhaseFId(value.sourceConversationId, 'sourceConversationId'), targetConversationId: requirePhaseFId(value.targetConversationId, 'targetConversationId'), sourceKind: String(value.sourceKind), mode: value.mode as 'message' | 'followup', replyToMessageId, content: requireString(value.content, 'Collaboration envelope.content'),
       delivery, senderKind, senderTitle: value.senderTitle === null ? null : requirePhaseFText(value.senderTitle, 'Collaboration envelope.senderTitle') };
   }
@@ -400,7 +410,11 @@ function requireCollaborationDelivery(
     ? [mode === 'followup' ? 'followup_task' : 'informational_message']
     : sourceKind === 'completion'
       ? (mode === 'message' && replyToMessageId !== null ? ['completion_reply', 'failure_reply'] : [])
-      : sourceKind === 'board' && mode === 'message' ? ['board_notification'] : [];
+      : sourceKind === 'board' && mode === 'message'
+        ? ['board_notification']
+        : sourceKind === 'child_question' && mode === 'message'
+          ? ['child_question']
+          : [];
   if (!allowed.includes(value as CollaborationDeliveryMode)) {
     throw new Error('Collaboration envelope delivery conflicts with its source and mode.');
   }
@@ -426,7 +440,11 @@ const COLLABORATION_DELIVERY_TEXT: Record<CollaborationDeliveryMode, { label: st
     label: 'failure notice',
     purpose: 'Your earlier request named by replyToMessageRef was not completed; this is not a new task.'
   },
-  board_notification: { label: 'board notification', purpose: 'It is information only, not a task.' }
+  board_notification: { label: 'board notification', purpose: 'It is information only, not a task.' },
+  child_question: {
+    label: 'child question',
+    purpose: 'Your direct child agent paused on ask_user and is waiting for your answer. Reply directly using run_agent with operation="answer_question" and the childRef and questionId below; if you cannot decide without the user, ask the user in this conversation first and then call run_agent operation="answer_question".'
+  }
 };
 
 /**
@@ -530,6 +548,7 @@ function runtimeModelEnvelope(
       messageId: envelope.messageId,
       ...(envelope.replyToMessageId === null ? {} : { replyToMessageId: envelope.replyToMessageId }),
       ...(envelope.board ? { board: envelope.board } : {}),
+      ...(envelope.answerBridgeId ? { answerBridgeId: envelope.answerBridgeId } : {}),
       content: envelope.content
     }, catalog) as Record<string, unknown>;
   }

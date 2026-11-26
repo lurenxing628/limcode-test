@@ -16,6 +16,7 @@ export interface ChildTaskCurrentState {
   status: ChildExecutionStatus;
   queuedInputCount: number;
   awaitingHandling: boolean;
+  hasPendingQuestion?: boolean;
   createdAt: string;
 }
 
@@ -74,6 +75,9 @@ export interface ConversationChildTaskFacts {
   deliveryWakes: DomainRow[];
   deliveryInputLinks: DomainRow[];
   deliveryIntentLinks: DomainRow[];
+  pendingAskUserRequests: DomainRow[];
+  pendingAskUserOwnerLinks: DomainRow[];
+  pendingAskUserToolCallLinks: DomainRow[];
   contentObjects: DomainRow[];
 }
 
@@ -119,7 +123,8 @@ function collectConversationChildTaskFacts(
     terminations: [], executionLeases: [], executorLinks: [], agentLinks: [], sourceToolCalls: [],
     answerToolCalls: [], answerWaitOperations: [], toolOutcomes: [], toolResultArtifacts: [], toolModelResults: [], toolResultMessageRevisions: [],
     answerBridges: [], answerSubmissions: [], answerPayloads: [], inboxItems: [], inboxPayloadLinks: [],
-    deliveries: [], deliveryWakes: [], deliveryInputLinks: [], deliveryIntentLinks: [], contentObjects: []
+    deliveries: [], deliveryWakes: [], deliveryInputLinks: [], deliveryIntentLinks: [],
+    pendingAskUserRequests: [], pendingAskUserOwnerLinks: [], pendingAskUserToolCallLinks: [], contentObjects: []
   };
   const seen = new Map<FactsRowsKey, Set<string>>();
   const add = (key: FactsRowsKey, values: DomainRow[]) => {
@@ -246,6 +251,7 @@ function collectConversationChildTaskFacts(
     add('answerBridges', [bridge]);
     let queuedInputCount = 0;
     let awaitingHandling = false;
+    let hasPendingQuestion = false;
     const needsCurrentWork = options.kind === 'runtime' ? depth === 1
       : options.kind === 'history' ? childId === options.childExecutionId
         : requestedChildren === null || requestedChildren.has(childId);
@@ -282,9 +288,20 @@ function collectConversationChildTaskFacts(
           AND input.handled_at IS NULL AND (wake.state IS NULL OR wake.state != 'dead_letter')`, requireRuntimeId(bridge.id), conversationId);
       waitingDeliveries.set(childId, pending);
       awaitingHandling = pending.length > 0;
+      const activeTurnLink = one('ChildExecutionActiveTurnLink', { child_execution_id: childId });
+      if (activeTurnLink) {
+        const pendingQuestionRow = prepareCached(database, `
+          SELECT req.id FROM interaction_owner_link AS owner
+            JOIN interaction_request AS req ON req.id = owner.request_id
+            WHERE owner.turn_id = ? AND req.request_kind = 'ask_user' AND req.status = 'pending'
+            LIMIT 1
+        `).get(requireRuntimeId(activeTurnLink.turn_id)) as { id?: unknown } | undefined;
+        hasPendingQuestion = pendingQuestionRow !== undefined;
+      }
     }
     taskStates.push({ childExecutionId: childId, answerBridgeId: requireRuntimeId(bridge.id), depth,
-      status: requireChildExecutionStatus(child.status), queuedInputCount, awaitingHandling, createdAt: String(child.created_at) });
+      status: requireChildExecutionStatus(child.status), queuedInputCount, awaitingHandling,
+      ...(hasPendingQuestion ? { hasPendingQuestion } : {}), createdAt: String(child.created_at) });
     const descendants = new Map<string, DomainRow>();
     for (const descendant of list('ChildExecutionParentLink', { parent_child_execution_id: childId })) descendants.set(requireRuntimeId(descendant.id), descendant);
     for (const descendant of linksInConversation(childConversationId)) descendants.set(requireRuntimeId(descendant.id), descendant);
@@ -301,7 +318,23 @@ function collectConversationChildTaskFacts(
     const execution = readChildExecutionSnapshot(database, childId);
     executions.set(childId, execution);
     add('turnLinks', execution.turnLinks);
-    if (execution.activeTurnLink) add('activeTurnLinks', [execution.activeTurnLink]);
+    if (execution.activeTurnLink) {
+      add('activeTurnLinks', [execution.activeTurnLink]);
+      const activeTurnId = requireRuntimeId(execution.activeTurnLink.turn_id);
+      const pendingQuestions = query('InteractionRequest', `
+        SELECT req.* FROM interaction_owner_link AS owner
+          JOIN interaction_request AS req ON req.id = owner.request_id
+          WHERE owner.turn_id = ? AND req.request_kind = 'ask_user' AND req.status = 'pending'
+          ORDER BY req.created_at, req.id
+      `, activeTurnId);
+      add('pendingAskUserRequests', pendingQuestions);
+      for (const req of pendingQuestions) {
+        const ownerLink = one('InteractionOwnerLink', { request_id: req.id }, true)!;
+        const toolCallLink = one('InteractionToolCallLink', { request_id: req.id }, true)!;
+        add('pendingAskUserOwnerLinks', [ownerLink]);
+        add('pendingAskUserToolCallLinks', [toolCallLink]);
+      }
+    }
     const childConversationId = requireRuntimeId(execution.childExecution.child_conversation_id);
     const source = get('ToolCall', execution.parentLink.source_tool_call_id);
     if (source.turn_id !== execution.parentLink.parent_turn_id) throw new Error('Child task snapshot source ToolCall crosses Turn scope.');
@@ -521,7 +554,7 @@ function collectConversationChildTaskFacts(
   for (const key of Object.keys(rows) as FactsRowsKey[]) {
     if (key === 'contentObjects') continue;
     for (const row of rows[key]) {
-      for (const column of ['content_object_id', 'arguments_object_id']) {
+      for (const column of ['content_object_id', 'arguments_object_id', 'prompt_object_id']) {
         if (row[column] !== null && row[column] !== undefined) add('contentObjects', [get('ContentObject', row[column])]);
       }
     }
@@ -554,6 +587,7 @@ function collectConversationChildTaskFacts(
 export function compareChildTaskCurrentPriority(a: ChildTaskCurrentState, b: ChildTaskCurrentState): number {
   const live = (status: ChildExecutionStatus) => ['starting', 'active', 'interrupting'].includes(status);
   return Number(live(b.status)) - Number(live(a.status))
+    || Number(Boolean(b.hasPendingQuestion)) - Number(Boolean(a.hasPendingQuestion))
     || Number(b.queuedInputCount > 0) - Number(a.queuedInputCount > 0)
     || Number(b.awaitingHandling) - Number(a.awaitingHandling)
     || Number(a.status === 'closed') - Number(b.status === 'closed')

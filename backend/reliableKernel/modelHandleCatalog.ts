@@ -883,7 +883,7 @@ export function resolveModelToolArguments(
     const operation = typeof record.operation === 'string' ? record.operation.trim() : '';
     const ignoresChild = toolName === 'run_agent' && (operation === 'spawn' || operation === 'list');
     if (!ignoresChild) replaceRef(toolName, record, 'childRef', 'answerBridgeId', 'child', catalog);
-    const usesChildList = toolName === 'run_agent' && !['spawn', 'send', 'list', 'read', 'interrupt_subtree', 'delete_subtree'].includes(operation)
+    const usesChildList = toolName === 'run_agent' && !['spawn', 'send', 'list', 'read', 'answer_question', 'interrupt_subtree', 'delete_subtree'].includes(operation)
       && !('answerBridgeId' in record);
     if (usesChildList && 'answerBridgeIds' in record) throw canonicalArgumentError(toolName, 'answerBridgeIds', 'childRefs', 'child', true);
     if (usesChildList && 'childRefs' in record) {

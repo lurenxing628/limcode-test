@@ -1,3 +1,4 @@
+import { normalizeAskUserToolRequest } from '../../shared/askUser';
 import type { ContentAddressedStore, ContentObjectMetadata } from './contentAddressedStore';
 import { LogicalMessageContentReader, logicalMessageContentType } from './logicalMessageContent';
 import type { SnapshotBarrier } from './contracts';
@@ -79,6 +80,21 @@ export interface ConversationChildTaskAnswerHandling {
   failureReasonText?: string;
 }
 
+export interface ConversationChildTaskPendingQuestionOption {
+  index: number;
+  label: string;
+  description?: string;
+}
+
+export interface ConversationChildTaskPendingQuestion {
+  questionId: string;
+  toolCallId: string;
+  question: string;
+  options: ConversationChildTaskPendingQuestionOption[];
+  multiple: boolean;
+  createdAt: string;
+}
+
 export interface ConversationChildTaskRecord {
   childExecutionId: string;
   answerBridgeId: string;
@@ -93,6 +109,7 @@ export interface ConversationChildTaskRecord {
   currentInputs: ConversationChildTaskSource[];
   queuedInputs: ConversationChildTaskSource[];
   timeline: ConversationChildTaskSource[];
+  pendingQuestion?: ConversationChildTaskPendingQuestion;
   execution: {
     activeTurnId?: string;
     latestTurnId?: string;
@@ -136,6 +153,7 @@ export interface ConversationChildTaskRuntimeStatus {
     answerAvailable: boolean;
     answerHandling: 'handled' | 'runtime_pending' | 'tool_result' | 'failed' | 'unknown';
     resumable: boolean;
+    pendingQuestion?: ConversationChildTaskPendingQuestion;
   }>;
 }
 
@@ -182,6 +200,7 @@ export interface ConversationChildTaskSummary {
   queuedInputCount: number;
   answerAvailable: boolean;
   latestTurnOutcome?: string;
+  pendingQuestion?: ConversationChildTaskPendingQuestion;
 }
 
 export interface ConversationChildTaskSourceChunk extends Omit<ConversationChildTaskSource, 'content'> {
@@ -362,6 +381,7 @@ export async function buildConversationChildTaskRuntimeStatus(
   const states = facts.taskStates?.filter(state => state.depth === 1);
   const ranked = states ? [...states].sort(compareChildTaskCurrentPriority).map(state => tasksById.get(state.childExecutionId)!) : [...direct].sort((a, b) =>
     Number(live(b.status)) - Number(live(a.status))
+    || Number(Boolean(b.pendingQuestion)) - Number(Boolean(a.pendingQuestion))
     || Number(b.queuedInputs.length > 0) - Number(a.queuedInputs.length > 0)
     || Number(pendingHandling(b)) - Number(pendingHandling(a))
     || Number(a.status === 'closed') - Number(b.status === 'closed')
@@ -413,7 +433,8 @@ export async function buildConversationChildTaskRuntimeStatus(
             ? 'runtime_pending'
             : task.result.deliveries.some(item => item.sourceId === latestAnswer?.answerId
                 && (item.state === 'failed' || item.wakeState === 'dead_letter')) ? 'failed' : 'unknown',
-      resumable: task.resumable
+      resumable: task.resumable,
+      ...(task.pendingQuestion ? { pendingQuestion: task.pendingQuestion } : {})
     });
   }
   return {
@@ -468,6 +489,9 @@ async function projectConversationChildTaskFacts(
   const deliveriesByInbox = groupRows(facts.deliveries, 'inbox_item_id');
   const deliveryInputs = uniqueBy(facts.deliveryInputLinks, 'delivery_id');
   const deliveryWakes = uniqueBy(facts.deliveryWakes, 'delivery_id');
+  const pendingAskUserRequests = indexRows(facts.pendingAskUserRequests ?? []);
+  const pendingAskUserOwnersByTurn = groupRows(facts.pendingAskUserOwnerLinks ?? [], 'turn_id');
+  const pendingAskUserToolCallByRequest = uniqueBy(facts.pendingAskUserToolCallLinks ?? [], 'request_id');
   const contextRevisionIds = new Set(facts.contextSegmentSources.filter(source => source.source_kind === 'message_revision').map(source => source.source_id));
   const depthCache = new Map<string, number>();
   const parentConversation = (childId: string): string => {
@@ -682,6 +706,13 @@ async function projectConversationChildTaskFacts(
       const sourceTurnId = [...origins][0];
       return sourceTurnId ? [...effectiveInputs(sourceTurnId, seen), ...ownInputs] : ownInputs;
     };
+    const pendingQuestion = await readPendingAskUserQuestion(
+      activeTurnId,
+      pendingAskUserRequests,
+      pendingAskUserOwnersByTurn,
+      pendingAskUserToolCallByRequest,
+      contents
+    );
     const task = {
       childExecutionId, answerBridgeId, parentConversationId: parentConversation(childExecutionId),
       conversationId: childConversationId, depth,
@@ -693,6 +724,7 @@ async function projectConversationChildTaskFacts(
       currentInputs: effectiveInputs(currentTurnId),
       queuedInputs: timeline.filter(source => source.classification === 'task' && (source.state === 'queued' || source.state === 'pending')),
       timeline,
+      ...(pendingQuestion ? { pendingQuestion } : {}),
       execution: {
         ...(activeTurnId ? { activeTurnId } : {}), ...(latestTurnId ? { latestTurnId } : {}),
         ...(termination && latestTurnId ? { termination: {
@@ -731,6 +763,7 @@ export function sameConversationChildTaskState(
     && previous.initialTask?.id === current.initialTask?.id
     && sameOrdered(previous.currentInputs, current.currentInputs, sameTaskSourceId)
     && sameOrdered(previous.queuedInputs, current.queuedInputs, sameTaskSourceId)
+    && previous.pendingQuestion?.questionId === current.pendingQuestion?.questionId
     && previous.execution.activeTurnId === current.execution.activeTurnId
     && previous.execution.latestTurnId === current.execution.latestTurnId
     && sameOptional(previous.execution.termination, current.execution.termination,
@@ -868,6 +901,45 @@ class SnapshotContentReader {
     }
     throw new Error(`TurnIntent ${id} has an unsupported envelope kind.`);
   }
+}
+
+async function readPendingAskUserQuestion(
+  activeTurnId: string | undefined,
+  requestsById: Map<string, DomainRow>,
+  ownersByTurn: Map<string, DomainRow[]>,
+  toolCallByRequest: Map<string, DomainRow>,
+  contents: SnapshotContentReader
+): Promise<ConversationChildTaskPendingQuestion | undefined> {
+  if (!activeTurnId) return undefined;
+  const ownerLinks = ownersByTurn.get(activeTurnId);
+  if (!ownerLinks || ownerLinks.length === 0) return undefined;
+  const pending = ownerLinks
+    .map(link => requestsById.get(requireText(link.request_id, 'InteractionOwnerLink.request_id')))
+    .filter((row): row is DomainRow => !!row && row.request_kind === 'ask_user' && row.status === 'pending')
+    .sort(compareCreatedRows);
+  const request = pending[0];
+  if (!request) return undefined;
+  const questionId = requireText(request.id, 'InteractionRequest.id');
+  const toolLink = requiredRow(toolCallByRequest, questionId, 'InteractionToolCallLink');
+  const toolCallId = requireText(toolLink.tool_call_id, 'InteractionToolCallLink.tool_call_id');
+  const promptObjectId = requireText(request.prompt_object_id, 'InteractionRequest.prompt_object_id');
+  const body = await contents.json(promptObjectId, 'application/vnd.limcode.ask-user-prompt+json');
+  if (body.toolCallId !== toolCallId) {
+    throw new Error(`Child task ask_user prompt ${questionId} does not match its ToolCall.`);
+  }
+  const prompt = normalizeAskUserToolRequest(body.prompt);
+  return {
+    questionId,
+    toolCallId,
+    question: prompt.question,
+    options: prompt.options.map((option, index) => ({
+      index,
+      label: option.label,
+      ...(option.description ? { description: option.description } : {})
+    })),
+    multiple: prompt.multiple,
+    createdAt: requireText(request.created_at, 'InteractionRequest.created_at')
+  };
 }
 
 async function readLatestAnswer(
@@ -1158,7 +1230,8 @@ export function childTaskSummary(task: ConversationChildTaskRecord): Conversatio
     ...(text ? { taskPreview: text.slice(0, 120) } : {}),
     currentInputCount: task.currentInputs.length, queuedInputCount: task.queuedInputs.length,
     answerAvailable: !!task.result.latestAnswer,
-    ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {})
+    ...(task.execution.termination ? { latestTurnOutcome: task.execution.termination.status } : {}),
+    ...(task.pendingQuestion ? { pendingQuestion: task.pendingQuestion } : {})
   };
 }
 
@@ -1188,6 +1261,15 @@ export function renderConversationChildTaskCard(
   lines.push(...card.queuedInputs.map(source => sourceLine('queued', source)));
   if (card.omittedCurrentInputs || card.omittedQueuedInputs) {
     lines.push(`omitted_sources: current=${card.omittedCurrentInputs}; queued=${card.omittedQueuedInputs}; read this child for the full timeline`);
+  }
+  if (card.pendingQuestion) {
+    const optionsText = card.pendingQuestion.options
+      .map(option => `[${option.index}] ${option.label}${option.description ? ` (${option.description})` : ''}`)
+      .join('; ');
+    lines.push(
+      `pending_question: questionId=${card.pendingQuestion.questionId}; multiple=${card.pendingQuestion.multiple}; question=${JSON.stringify(card.pendingQuestion.question)}; options=${optionsText}`,
+      `Action required: answer this child's question using run_agent operation=answer_question${reference ? ` with childRef=${reference.childRef}` : ''} and questionId=${card.pendingQuestion.questionId} (or ask the user in this conversation first if you cannot decide).`
+    );
   }
   const answer = card.result.latestAnswer;
   lines.push(answer

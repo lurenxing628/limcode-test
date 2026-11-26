@@ -12,7 +12,8 @@ import { preparedContentObjectSteps } from './contentObjectTransaction';
 import { ContextSequenceControlPlane } from './contextSequence';
 import { readInitialRuntimeContextForTurn } from './initialRuntimeContext';
 import { normalizeChildForkTurns, prepareChildContextFork, type ChildForkTurns } from './childContextFork';
-import { readConversationChildTaskProjection, readConversationChildTaskHistory, readConversationChildTaskList, type ConversationChildTaskPageOptions, type ConversationChildTaskScope } from './conversationChildTaskProjection';
+import { normalizeAskUserToolRequest } from '../../shared/askUser';
+import { readConversationChildTaskProjection, readConversationChildTaskHistory, readConversationChildTaskList, type ConversationChildTaskPageOptions, type ConversationChildTaskPendingQuestion, type ConversationChildTaskScope } from './conversationChildTaskProjection';
 import type { ChildExecutionSnapshot } from './childExecutionFactsSnapshot';
 export type { ChildExecutionSnapshot } from './childExecutionFactsSnapshot';
 import { readConversationChildHandles } from './conversationChildHandles';
@@ -3057,6 +3058,199 @@ export class ChildExecutionControlPlane {
     }
   }
 
+  /**
+   * Reads the earliest pending ask_user question on a child-task Turn, or null if none exists
+   * (including when the Turn is a direct human-authored chat Turn in the child tab).
+   */
+  public async readPendingChildTaskQuestion(
+    childExecutionIdInput: string,
+    turnIdInput: string
+  ): Promise<{ pendingQuestion: ConversationChildTaskPendingQuestion; ownerLinkId: string } | null> {
+    const childExecutionId = requirePhaseFId(childExecutionIdInput, 'childExecutionId');
+    const turnId = requirePhaseFId(turnIdInput, 'turnId');
+    const memberships = await this.listRows('ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length !== 1 || memberships[0].child_execution_id !== childExecutionId) return null;
+    if (!await this.isTaskTurn(turnId)) return null;
+    const ownerLinks = await listAllDomainRows(this.database, 'InteractionOwnerLink', { turn_id: turnId });
+    if (ownerLinks.length === 0) return null;
+    const pending: Array<{ request: DomainRow; ownerLinkId: string }> = [];
+    for (const link of ownerLinks) {
+      const request = await this.maybeGet(
+        'InteractionRequest',
+        requirePhaseFId(link.request_id, 'InteractionOwnerLink.request_id')
+      );
+      if (request && request.request_kind === 'ask_user' && request.status === 'pending') {
+        pending.push({
+          request,
+          ownerLinkId: requirePhaseFId(link.id, 'InteractionOwnerLink.id')
+        });
+      }
+    }
+    if (pending.length === 0) return null;
+    pending.sort((left, right) =>
+      String(left.request.created_at).localeCompare(String(right.request.created_at))
+      || String(left.request.id).localeCompare(String(right.request.id))
+    );
+    const chosen = pending[0];
+    const questionId = requirePhaseFId(chosen.request.id, 'InteractionRequest.id');
+    const toolLinks = await this.listRows('InteractionToolCallLink', { request_id: questionId }, 2);
+    if (toolLinks.length !== 1) return null;
+    const toolCallId = requirePhaseFId(toolLinks[0].tool_call_id, 'InteractionToolCallLink.tool_call_id');
+    const promptMeta = await this.requireExisting(
+      'ContentObject',
+      requirePhaseFId(chosen.request.prompt_object_id, 'InteractionRequest.prompt_object_id')
+    ) as ContentObjectMetadata;
+    const body = JSON.parse((await this.contentStore.read(promptMeta)).toString('utf8')) as Record<string, unknown>;
+    if (body.toolCallId !== toolCallId) {
+      throw new Error(`Child task ask_user prompt ${questionId} does not match its ToolCall.`);
+    }
+    const prompt = normalizeAskUserToolRequest(body.prompt);
+    return {
+      ownerLinkId: chosen.ownerLinkId,
+      pendingQuestion: {
+        questionId,
+        toolCallId,
+        question: prompt.question,
+        options: prompt.options.map((option, index) => ({
+          index,
+          label: option.label,
+          ...(option.description ? { description: option.description } : {})
+        })),
+        multiple: prompt.multiple,
+        createdAt: requireIsoTimestamp(chosen.request.created_at, 'InteractionRequest.created_at')
+      }
+    };
+  }
+
+  /**
+   * Releases a parent's initial foreground wait early when its child task Turn pauses on ask_user,
+   * preventing circular deadlock while keeping the child alive in the background.
+   */
+  public async settleForegroundChildQuestion(input: {
+    childExecutionId: string;
+    childTurnId: string;
+    now?: string;
+  }): Promise<boolean> {
+    const childExecutionId = requirePhaseFId(input.childExecutionId, 'childExecutionId');
+    const childTurnId = requirePhaseFId(input.childTurnId, 'childTurnId');
+    const now = requireIsoTimestamp(input.now ?? this.timestamp(), 'now');
+    const pending = await this.readPendingChildTaskQuestion(childExecutionId, childTurnId);
+    if (!pending) return false;
+    const snapshot = await this.readExecutionSnapshot(childExecutionId);
+    const toolCallId = requirePhaseFId(
+      snapshot.parentLink.source_tool_call_id,
+      'ChildExecutionParentLink.source_tool_call_id'
+    );
+    const executions = await this.listRows('ToolExecution', { tool_call_id: toolCallId }, 2);
+    if (executions.length !== 1 || executions[0].status !== 'waiting_answer') return false;
+    const sourceIdentity = `foreground-child-question:${toolCallId}:${pending.pendingQuestion.questionId}`;
+    const detail = childPendingQuestionWaitDetail(
+      snapshot.childExecution,
+      snapshot.answerBridge,
+      pending.pendingQuestion
+    );
+    const settlement = await this.prepareForegroundSettlement({
+      childExecutionId,
+      status: 'succeeded',
+      detail,
+      sourceIdentity
+    });
+    if (!settlement) return false;
+    const toolCall = await this.requireExisting('ToolCall', toolCallId);
+    const parentTurn = await this.requireExisting('Turn', requirePhaseFId(toolCall.turn_id, 'ToolCall.turn_id'));
+    try {
+      await this.database.transaction([
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').assert(pending.pendingQuestion.questionId, {
+          request_kind: 'ask_user',
+          status: 'pending'
+        }),
+        DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').assert(pending.ownerLinkId, {
+          request_id: pending.pendingQuestion.questionId,
+          turn_id: childTurnId
+        }),
+        DOMAIN_REPOSITORIES.domain('CommandReceipt').insert({
+          id: settlement.receiptId,
+          source_kind: 'internal',
+          source_key: sourceIdentity,
+          conversation_id: parentTurn.conversation_id,
+          turn_id: parentTurn.id,
+          created_at: now
+        }),
+        ...settlement.steps
+      ]);
+      await this.finalizeWaitSettlement(toolCallId);
+      return true;
+    } catch (error) {
+      if (!isExpectedSettlementRace(error)) throw error;
+      if ((await this.finalizeWaitSettlement(toolCallId)) !== null) return true;
+      const latestRequest = await this.maybeGet('InteractionRequest', pending.pendingQuestion.questionId);
+      if (!latestRequest || latestRequest.status !== 'pending') return false;
+      throw error;
+    }
+  }
+
+  /**
+   * Releases a parent's continuation foreground wait early when its child task Turn pauses on
+   * ask_user, preventing circular deadlock while keeping the child alive in the background.
+   */
+  public async settleContinuationForegroundChildQuestion(input: {
+    answerBridgeId: string;
+    turnIntentId: string;
+    toolCallId: string;
+    childTurnId: string;
+  }): Promise<boolean> {
+    const answerBridgeId = requirePhaseFId(input.answerBridgeId, 'answerBridgeId');
+    const turnIntentId = requirePhaseFId(input.turnIntentId, 'turnIntentId');
+    const toolCallId = requirePhaseFId(input.toolCallId, 'toolCallId');
+    const childTurnId = requirePhaseFId(input.childTurnId, 'childTurnId');
+    const bridge = await this.requireExisting('AnswerBridge', answerBridgeId);
+    const childExecutionId = requirePhaseFId(bridge.child_execution_id, 'AnswerBridge.child_execution_id');
+    const pending = await this.readPendingChildTaskQuestion(childExecutionId, childTurnId);
+    if (!pending) return false;
+    const operations = await this.readContinuationWaitOperations({
+      bridge,
+      status: 'waiting_answer',
+      turnIntentId,
+      toolCallId
+    });
+    if (operations.length !== 1) return false;
+    const executions = await this.listRows('ToolExecution', { tool_call_id: toolCallId }, 2);
+    if (executions.length !== 1 || executions[0].status !== 'waiting_answer') return false;
+    const snapshot = await this.readExecutionSnapshot(childExecutionId);
+    const detail = childPendingQuestionWaitDetail(
+      snapshot.childExecution,
+      snapshot.answerBridge,
+      pending.pendingQuestion
+    );
+    const authoritySteps: RepositoryTransactionStep[] = [
+      DOMAIN_REPOSITORIES.domain('InteractionRequest').assert(pending.pendingQuestion.questionId, {
+        request_kind: 'ask_user',
+        status: 'pending'
+      }),
+      DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').assert(pending.ownerLinkId, {
+        request_id: pending.pendingQuestion.questionId,
+        turn_id: childTurnId
+      })
+    ];
+    try {
+      const settled = await this.settleContinuationOperation({
+        operation: operations[0],
+        execution: executions[0],
+        detail,
+        status: 'succeeded',
+        sourceIdentity: `foreground-child-question:${toolCallId}:${pending.pendingQuestion.questionId}`,
+        authoritySteps
+      });
+      return settled !== null;
+    } catch (error) {
+      if (!isExpectedSettlementRace(error)) throw error;
+      if ((await this.finalizeWaitSettlement(toolCallId)) !== null) return true;
+      const latestRequest = await this.maybeGet('InteractionRequest', pending.pendingQuestion.questionId);
+      if (!latestRequest || latestRequest.status !== 'pending') return false;
+      throw error;
+    }
+  }
+
   /** Expired foreground wait settles with a background control handle and never dispatches spawn. */
   public async settleForegroundTimeout(childExecutionIdInput: string, nowInput = this.timestamp()): Promise<boolean> {
     const childExecutionId = requirePhaseFId(childExecutionIdInput, 'childExecutionId');
@@ -4176,6 +4370,21 @@ function childControlHandle(child: DomainRow, bridge: DomainRow) {
     childConversationId: child.child_conversation_id,
     answerBridgeId: bridge.id,
     state: child.status
+  };
+}
+
+function childPendingQuestionWaitDetail(
+  child: DomainRow,
+  bridge: DomainRow,
+  pendingQuestion: ConversationChildTaskPendingQuestion
+) {
+  const answerBridgeId = requirePhaseFId(bridge.id, 'AnswerBridge.id');
+  return {
+    ...childControlHandle(child, bridge),
+    status: 'awaiting_parent_answer',
+    childContinuesInBackground: true,
+    pendingQuestion,
+    guidance: `Child task (${answerBridgeId}) paused on ask_user (questionId=${pendingQuestion.questionId}) and is waiting in the background for your answer. Reply with run_agent(operation="answer_question", childRef=${answerBridgeId}, questionId=${JSON.stringify(pendingQuestion.questionId)}, ...) using selectedOptionIndexes and/or answer.`
   };
 }
 

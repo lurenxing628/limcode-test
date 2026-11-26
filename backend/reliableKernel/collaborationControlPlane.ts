@@ -1,3 +1,4 @@
+import { normalizeAskUserToolRequest } from '../../shared/askUser';
 import { collaborationSendTimelineStep } from './timelineAcceptance';
 import { RuntimeDeliveryControlPlane } from './answerDelivery';
 import { AutomaticRuntimeDeliveryRouter } from './automaticRuntimeDelivery';
@@ -63,6 +64,7 @@ export type CollaborationSource = { kind: 'tool'; turnId: string; toolCallId: st
 /** turnId is null for the failure reply to a task that no Turn will answer. */
 interface CompletionSource { kind: 'completion'; turnId: string | null; requestId: string }
 interface BoardSource { kind: 'board'; turnId: string; postId: string; conversationId: string }
+interface ChildQuestionSource { kind: 'child_question'; turnId: string; requestId: string; childExecutionId: string }
 export interface CollaborationSendCommand {
   source: CollaborationSource;
   targetConversationId: string;
@@ -193,7 +195,110 @@ export class CollaborationControlPlane {
     }
   }
 
-  private async sendInternal(input: Omit<CollaborationSendCommand, 'source'> & { source: CollaborationSource | CompletionSource | BoardSource }) {
+  /**
+   * Durable, idempotent notification from a child paused on ask_user to its direct parent.
+   * Uses mode='message' so it never creates a CollaborationRequest or completion reply loop,
+   * while waking an idle parent or injecting into a running parent Turn.
+   */
+  public async notifyChildQuestion(input: {
+    childTurnId: string;
+    childExecutionId: string;
+    answerBridgeId: string;
+    requestId: string;
+    parentConversationId: string;
+  }): Promise<{
+    status: 'delivered' | 'already_resolved' | 'skipped';
+    deliveryId?: string;
+    messageId?: string;
+    deduplicated?: boolean;
+    reason?: string;
+  }> {
+    const childTurnId = requirePhaseFId(input.childTurnId, 'childTurnId');
+    const childExecutionId = requirePhaseFId(input.childExecutionId, 'childExecutionId');
+    const answerBridgeId = requirePhaseFId(input.answerBridgeId, 'answerBridgeId');
+    const requestId = requirePhaseFId(input.requestId, 'requestId');
+    const parentConversationId = requirePhaseFId(input.parentConversationId, 'parentConversationId');
+    const request = await this.maybe('InteractionRequest', requestId);
+    if (!request || request.request_kind !== 'ask_user') {
+      return { status: 'skipped', reason: 'not_ask_user' };
+    }
+    if (request.status !== 'pending') {
+      return { status: 'already_resolved' };
+    }
+    const [ownerLinks, childTurnLinks, parentLinks, bridges] = await Promise.all([
+      this.rows('InteractionOwnerLink', { request_id: requestId }),
+      this.rows('ChildExecutionTurnLink', { turn_id: childTurnId }),
+      this.rows('ChildExecutionParentLink', { child_execution_id: childExecutionId }),
+      this.rows('AnswerBridge', { child_execution_id: childExecutionId })
+    ]);
+    if (
+      ownerLinks.length !== 1 || ownerLinks[0].turn_id !== childTurnId
+      || childTurnLinks.length !== 1 || childTurnLinks[0].child_execution_id !== childExecutionId
+      || parentLinks.length !== 1
+      || bridges.length !== 1 || bridges[0].id !== answerBridgeId
+    ) {
+      throw new Error('Child question notification conflicts with immutable lineage or interaction facts.');
+    }
+    const spawnParentTurn = await this.maybe('Turn', String(parentLinks[0].parent_turn_id));
+    if (!spawnParentTurn || spawnParentTurn.conversation_id !== parentConversationId) {
+      return { status: 'skipped', reason: 'parent_unavailable' };
+    }
+    const parentConversation = await this.maybe('Conversation', parentConversationId);
+    if (!parentConversation || parentConversation.status !== 'active') {
+      return { status: 'skipped', reason: 'parent_not_active' };
+    }
+    const promptMeta = await this.existing('ContentObject', String(request.prompt_object_id)) as ContentObjectMetadata;
+    const promptBody = JSON.parse((await this.contentStore.read(promptMeta)).toString('utf8')) as Record<string, unknown>;
+    const prompt = normalizeAskUserToolRequest(promptBody.prompt);
+    const optionsLines = prompt.options.map((option, index) =>
+      `  [${index}] ${option.label}${option.description ? ` — ${option.description}` : ''}`
+    );
+    const text = [
+      `Child task (${answerBridgeId}) paused on ask_user and is waiting for your answer.`,
+      `questionId: ${requestId}`,
+      `multiple: ${prompt.multiple}`,
+      `question: ${prompt.question}`,
+      'options:',
+      ...optionsLines,
+      `Reply with run_agent(operation="answer_question", childRef=${answerBridgeId}, questionId=${JSON.stringify(requestId)}, ...) using selectedOptionIndexes and/or answer. If you cannot decide without the user, ask the user in this conversation first and then reply to the child.`
+    ].join('\n');
+    let localRetries = 0;
+    let contentionRetries = 0;
+    for (;;) {
+      try {
+        const sent = await this.sendInternal({
+          source: { kind: 'child_question', turnId: childTurnId, requestId, childExecutionId },
+          targetConversationId: parentConversationId,
+          text,
+          mode: 'message'
+        });
+        return {
+          status: 'delivered',
+          deliveryId: sent.deliveryId,
+          messageId: sent.messageId,
+          deduplicated: sent.deduplicated
+        };
+      } catch (error) {
+        if (isRetryableLocalExecutionError(error)) {
+          if (localRetries >= LOCAL_EXECUTION_MAX_RETRIES) throw new LocalExecutionRecoveryExhaustedError(error);
+          await waitForLocalExecutionRetry(++localRetries);
+          continue;
+        }
+        if (isTransactionAssertionFailure(error)) {
+          const latest = await this.maybe('InteractionRequest', requestId);
+          if (!latest || latest.status !== 'pending') return { status: 'already_resolved' };
+          if (contentionRetries++ < 3) continue;
+        }
+        const detail = error instanceof Error ? error.message : String(error);
+        if (/cannot revive|requires active Conversations/.test(detail)) {
+          return { status: 'skipped', reason: detail };
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async sendInternal(input: Omit<CollaborationSendCommand, 'source'> & { source: CollaborationSource | CompletionSource | BoardSource | ChildQuestionSource }) {
     if (input.mode !== 'message' && input.mode !== 'followup') throw new TypeError('Unsupported collaboration delivery mode.');
     if (typeof input.text !== 'string' || !input.text.trim() || Buffer.byteLength(input.text) > COLLABORATION_MESSAGE_MAX_TEXT_BYTES) throw new RangeError(`Collaboration text must contain 1..${COLLABORATION_MESSAGE_MAX_TEXT_BYTES} UTF-8 bytes.`);
     const targetConversationId = requirePhaseFId(input.targetConversationId, 'targetConversationId');
@@ -205,7 +310,10 @@ export class CollaborationControlPlane {
     if (input.queueBehindActiveTurn && (source.kind !== 'tool' || input.onlyIfRunning)) throw new Error('Only tool-sourced sends may queue behind a running target Turn.');
     const creating = input.newConversationSteps !== undefined;
     if (creating && (source.kind !== 'tool' || !input.crossConversation || input.mode !== 'followup')) throw new Error('Only a cross-conversation followup tool call may create its target Conversation.');
-    const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId') : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId') : stablePhaseFId('board_notice', source.postId, targetConversationId);
+    const sourceKey = source.kind === 'tool' ? requirePhaseFId(source.toolCallId, 'toolCallId')
+      : source.kind === 'completion' ? requirePhaseFId(source.requestId, 'requestId')
+        : source.kind === 'child_question' ? requirePhaseFId(source.requestId, 'requestId')
+          : stablePhaseFId('board_notice', source.postId, targetConversationId);
     const dedupeKey = collaborationDedupeKey(source.kind, sourceKey);
     const messageId = stablePhaseFId('collaboration_message', dedupeKey);
     const inboxItemId = stablePhaseFId('runtime_inbox_item', messageId);
@@ -245,6 +353,19 @@ export class CollaborationControlPlane {
       if (boardSource.conversation_id !== sourceConversationId || boardSource.source_turn_id !== source.turnId) throw new Error('Board notification source conflicts with immutable post source.');
       sourceSteps.push(DOMAIN_REPOSITORIES.domain('CollaborationBoardPostSourceLink').assert(String(boardSource.id), { post_id: source.postId, conversation_id: sourceConversationId, source_turn_id: source.turnId }));
     }
+    if (source.kind === 'child_question') {
+      const request = await this.existing('InteractionRequest', source.requestId);
+      const owner = await this.one('InteractionOwnerLink', { request_id: source.requestId });
+      if (request.request_kind !== 'ask_user' || request.status !== 'pending' || owner.turn_id !== source.turnId || sourceTurn?.status !== 'active') {
+        throw new Error('Child question notification requires a pending ask_user request on an active child Turn.');
+      }
+      sourceSteps.push(
+        DOMAIN_REPOSITORIES.domain('Turn').assert(source.turnId, { status: 'active', conversation_id: sourceConversationId }),
+        DOMAIN_REPOSITORIES.domain('TurnTermination').assertNone({ turn_id: source.turnId }),
+        DOMAIN_REPOSITORIES.domain('InteractionRequest').assert(source.requestId, { request_kind: 'ask_user', status: 'pending' }),
+        DOMAIN_REPOSITORIES.domain('InteractionOwnerLink').assert(String(owner.id), { request_id: source.requestId, turn_id: source.turnId })
+      );
+    }
     if (source.kind === 'tool') {
       const tool = await this.existing('ToolCall', source.toolCallId);
       if (tool.turn_id !== source.turnId || sourceTurn?.status !== 'active' || tool.status === 'terminal') throw new Error('Collaboration sender must be a live ToolCall in its exact active Turn.');
@@ -260,6 +381,7 @@ export class CollaborationControlPlane {
     // source stays inside its derived team; another team's child tasks are never addressable.
     if (source.kind !== 'completion' && sourceScope?.rootConversationId !== targetScope.rootConversationId) {
       if (source.kind === 'board') throw new Error('Board notifications cannot cross team roots.');
+      if (source.kind === 'child_question') throw new Error('Child question notifications cannot cross team roots.');
       if (sourceMember?.childExecutionId || targetMember.childExecutionId) throw new Error('Cross-conversation collaboration cannot address or originate from a child task of another team.');
       if (!input.crossConversation) throw new Error('Cross-conversation collaboration is not enabled.');
     }
@@ -354,7 +476,7 @@ export class CollaborationControlPlane {
   /** What this send does at its target; decides whether its commit also writes a wake. */
   private async targetDelivery(input: {
     input: Omit<CollaborationSendCommand, 'source'>;
-    source: CollaborationSource | CompletionSource | BoardSource;
+    source: CollaborationSource | CompletionSource | BoardSource | ChildQuestionSource;
     sourceTurnId: string | null;
     sourceScope: CollaborationIdentity | null;
     currentTurnId: string | null;

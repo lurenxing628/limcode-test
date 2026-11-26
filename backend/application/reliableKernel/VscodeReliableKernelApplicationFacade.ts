@@ -1032,7 +1032,11 @@ export class VscodeReliableKernelApplicationFacade implements ApplicationFacade 
 
   private async readInteractionAttention(): Promise<void> {
     const database = this.product.application.database;
-    const pending = await readPendingInteractionAttention(database, database.hostBootId);
+    const pending = await readPendingInteractionAttention(
+      database,
+      database.hostBootId,
+      this.product.application.contentStore
+    );
     if (this.disposed) return;
     this.interactionAttentionNotifier.synchronize(pending);
   }

@@ -16,10 +16,12 @@ import {
   type ChildExecutionControlPlane,
   type ChildExecutionSnapshot
 } from './childExecution';
+import type { CollaborationControlPlane } from './collaborationControlPlane';
 import type {
   PlanDelegationEnsureRequest,
   PlanDelegationRequest,
-  PlanDelegationResult
+  PlanDelegationResult,
+  ToolInteractionControlPlane
 } from './toolInteractions';
 import type { EffectControlPlane, ToolTerminalResult } from './effectControlPlane';
 import type { ModelProviderControlPlane } from './modelProviderControlPlane';
@@ -110,6 +112,8 @@ export interface ReliableChildAgentCoordinatorDependencies {
   children: ChildExecutionControlPlane;
   answers: AnswerControlPlane;
   deliveries: RuntimeDeliveryControlPlane;
+  collaboration?: CollaborationControlPlane;
+  interactions?: ToolInteractionControlPlane;
   modelProvider: ModelProviderControlPlane;
   turns: TurnControlPlane;
   agentLoop: ReliableAgentLoop;
@@ -194,6 +198,7 @@ export interface ReliableChildAgentRecoveryReport {
 }
 
 const CHILD_WAKE_POLL_MS = 500;
+const CHILD_PENDING_QUESTION_NOTIFY_RETRY_MS = 1_000;
 const CHILD_RECOVERY_CHANGE_SCAN_MS = 2_000;
 const CHILD_RECOVERY_SAFETY_SCAN_MS = 5_000;
 /** The owner of a question's or plan review's wait Operation (ToolInteractionControlPlane). */
@@ -242,6 +247,7 @@ export class ReliableChildAgentCoordinator {
     waitingToolCallId?: string;
     contextHandleUpgradeConversationId?: string;
     nextWakeAt?: number;
+    pendingQuestionNotifyRetryAt?: number;
     childDeadlineAt?: number;
     deadlineReadPending?: boolean;
     deadlineRetryAt?: number;
@@ -1432,6 +1438,7 @@ export class ReliableChildAgentCoordinator {
       }
     }
 
+    let pendingQuestionNotifyFailed = false;
     for (const link of scopedActiveLinks) {
       signal?.throwIfAborted();
       const childExecutionId = requireId(link.child_execution_id, 'ChildExecutionActiveTurnLink.child_execution_id');
@@ -1472,6 +1479,10 @@ export class ReliableChildAgentCoordinator {
         // Another live owner drives this child; keep the level-triggered takeover edge alive.
         report.deferredTurnIds.push(turnId);
         continue;
+      }
+      if (recovered.value !== 'terminal') {
+        const notified = await this.notifyParentOfPendingChildQuestions(childExecutionId, turnId);
+        if (!notified) pendingQuestionNotifyFailed = true;
       }
       if (recovered.value === 'resumed') {
         report.resumedTurnIds.push(turnId);
@@ -1567,7 +1578,9 @@ export class ReliableChildAgentCoordinator {
 
     const outstandingContinuations = (await this.dependencies.children.listPendingContinuations())
       .filter((entry) => inScope(entry.childExecutionId));
-    const passNeedsPolling = report.deferredTurnIds.length > 0 || outstandingContinuations.length > 0;
+    const passNeedsPolling = report.deferredTurnIds.length > 0
+      || outstandingContinuations.length > 0
+      || pendingQuestionNotifyFailed;
     // A scoped pass must not clear polling another Conversation still needs.
     this.recoveryPollingNeeded = conversationId === undefined
       ? passNeedsPolling
@@ -1765,6 +1778,25 @@ export class ReliableChildAgentCoordinator {
         for (const [turnId, waiting] of [...this.waitingOwned]) {
           if (this.disposing || this.handoff) return;
           if (this.activeTurns.has(turnId)) continue;
+          if (
+            waiting.pendingQuestionNotifyRetryAt !== undefined
+            && Date.now() >= waiting.pendingQuestionNotifyRetryAt
+          ) {
+            const retryScheduledAt = waiting.pendingQuestionNotifyRetryAt;
+            const notified = await this.notifyParentOfPendingChildQuestions(waiting.childExecutionId, turnId);
+            if (this.disposing || this.handoff) return;
+            if (this.waitingOwned.get(turnId) !== waiting || this.activeTurns.has(turnId)) continue;
+            if (notified) {
+              waiting.pendingQuestionNotifyRetryAt = undefined;
+              if (waiting.nextWakeAt === retryScheduledAt) {
+                waiting.nextWakeAt = undefined;
+              }
+            } else {
+              const retryAt = Date.now() + CHILD_PENDING_QUESTION_NOTIFY_RETRY_MS;
+              waiting.pendingQuestionNotifyRetryAt = retryAt;
+              waiting.nextWakeAt = waiting.nextWakeAt === undefined ? retryAt : Math.min(waiting.nextWakeAt, retryAt);
+            }
+          }
           if (waiting.contextHandleUpgradeConversationId && Date.now() >= (waiting.nextWakeAt ?? 0)) {
             const turn = await this.get('Turn', turnId);
             if (!turn || turn.status !== 'active') { this.waitingOwned.delete(turnId); continue; }
@@ -2088,6 +2120,8 @@ export class ReliableChildAgentCoordinator {
         return this.inspectChildTasks(input, args, operation);
       case 'wait':
         return this.waitChildTasks(input, args, signal);
+      case 'answer_question':
+        return this.answerChildQuestion(input, args);
       case 'interrupt_subtree':
         return this.interruptChild(input, args);
       case 'delete_subtree':
@@ -2483,6 +2517,127 @@ export class ReliableChildAgentCoordinator {
     );
   }
 
+  private async answerChildQuestion(
+    input: ReliableAgentToolDispatchInput,
+    args: { [key: string]: PlainJsonValue }
+  ): Promise<ChildDispatchResult> {
+    const interactions = this.dependencies.interactions;
+    if (!interactions) throw new Error('当前宿主未接入子 Agent 提问回复控制面。');
+    const conversationId = await this.conversationForCaller(input);
+    const answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
+    const projection = await this.dependencies.children.readConversationTaskProjection(conversationId, []);
+    const task = await this.requireScopedChildTask(projection, answerBridgeId, 'direct');
+    const selectedOptionIndexes = Array.isArray(args.selectedOptionIndexes)
+      ? args.selectedOptionIndexes as number[]
+      : [];
+    const customText = typeof args.answer === 'string' && args.answer.trim() ? args.answer.trim() : undefined;
+    const requestedQuestionId = args.questionId === undefined
+      ? undefined
+      : requireText(args.questionId, 'run_agent.questionId');
+
+    let questionId: string;
+    let childTurnId: string;
+    if (requestedQuestionId) {
+      const request = await this.get('InteractionRequest', requestedQuestionId);
+      if (!request || request.request_kind !== 'ask_user') {
+        throw new Error(`Ask question ${requestedQuestionId} does not exist.`);
+      }
+      const ownerLinks = await this.list('InteractionOwnerLink', { request_id: requestedQuestionId }, 2);
+      if (ownerLinks.length !== 1) {
+        throw new Error(`Ask question ${requestedQuestionId} has no unique owner Turn.`);
+      }
+      childTurnId = requireId(ownerLinks[0].turn_id, 'InteractionOwnerLink.turn_id');
+      const memberships = await this.list('ChildExecutionTurnLink', { turn_id: childTurnId }, 2);
+      if (memberships.length !== 1 || memberships[0].child_execution_id !== task.childExecutionId) {
+        throw new Error(`Ask question ${requestedQuestionId} does not belong to child task ${answerBridgeId}.`);
+      }
+      questionId = requestedQuestionId;
+    } else {
+      const snapshot = await this.dependencies.children.readExecutionSnapshot(task.childExecutionId);
+      const activeTurnId = typeof snapshot.activeTurnLink?.turn_id === 'string'
+        ? snapshot.activeTurnLink.turn_id
+        : undefined;
+      const latestTurnId = typeof snapshot.latestTurnLink?.turn_id === 'string'
+        ? snapshot.latestTurnLink.turn_id
+        : undefined;
+      const pending: Array<{ id: string; createdAt: string; turnId: string }> = [];
+      const resolvedExisting: Array<{ id: string; createdAt: string; turnId: string }> = [];
+      const candidateTurns = uniqueStrings([
+        ...(activeTurnId ? [activeTurnId] : []),
+        ...(latestTurnId ? [latestTurnId] : [])
+      ]);
+      for (const turnId of candidateTurns) {
+        const ownerLinks = await listAllDomainRows(this.dependencies.database, 'InteractionOwnerLink', { turn_id: turnId });
+        for (const link of ownerLinks) {
+          const requestId = requireId(link.request_id, 'InteractionOwnerLink.request_id');
+          const request = await this.get('InteractionRequest', requestId);
+          if (!request || request.request_kind !== 'ask_user') continue;
+          const entry = { id: requestId, createdAt: String(request.created_at), turnId };
+          if (request.status === 'pending' && turnId === activeTurnId) pending.push(entry);
+          else if (request.status !== 'pending') resolvedExisting.push(entry);
+        }
+      }
+      pending.sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+      if (pending.length === 1) {
+        questionId = pending[0].id;
+        childTurnId = pending[0].turnId;
+      } else if (pending.length > 1) {
+        throw new Error(
+          `Child task ${answerBridgeId} has ${pending.length} pending questions (${pending.map(item => item.id).join(', ')}); pass questionId to select one.`
+        );
+      } else if (resolvedExisting.length > 0) {
+        resolvedExisting.sort((left, right) => right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id));
+        const latest = resolvedExisting[0];
+        if (activeTurnId) await this.resume(activeTurnId).catch(() => false);
+        return this.settleOwnTool(input.toolCallId, {
+          ok: true,
+          operation: 'answer_question',
+          status: 'already_answered',
+          answerBridgeId,
+          questionId: latest.id
+        }, `run-agent-answer-question:${input.toolCallId}`);
+      } else {
+        throw new Error(`Child task ${answerBridgeId} has no pending ask_user question to answer.`);
+      }
+    }
+
+    const resolution = await interactions.resolveAskUser({
+      source: { kind: 'internal', key: `parent-answer-question:${input.toolCallId}` },
+      requestId: questionId,
+      response: {
+        answer: {
+          selectedOptionIndexes,
+          ...(customText ? { customText } : {})
+        }
+      },
+      parentAgent: {
+        parentConversationId: conversationId,
+        parentTurnId: input.turnId,
+        parentToolCallId: input.toolCallId,
+        childExecutionId: task.childExecutionId
+      }
+    });
+    await this.resume(childTurnId).catch(() => false);
+    if (!resolution.won) {
+      return this.settleOwnTool(input.toolCallId, {
+        ok: true,
+        operation: 'answer_question',
+        status: 'already_answered',
+        answerBridgeId,
+        questionId
+      }, `run-agent-answer-question:${input.toolCallId}`);
+    }
+    return this.settleOwnTool(input.toolCallId, {
+      ok: true,
+      operation: 'answer_question',
+      status: 'answered',
+      answerBridgeId,
+      questionId,
+      ...(selectedOptionIndexes.length > 0 ? { selectedOptionIndexes } : {}),
+      ...(customText ? { answer: customText } : {})
+    }, `run-agent-answer-question:${input.toolCallId}`);
+  }
+
   private async interruptChild(
     input: ReliableAgentToolDispatchInput,
     args: { [key: string]: PlainJsonValue }
@@ -2854,6 +3009,13 @@ export class ReliableChildAgentCoordinator {
           this.reportError(error, 'read-child-wait-deadline', turnId);
         }
       }
+      const notified = await this.notifyParentOfPendingChildQuestions(childExecutionId, turnId);
+      if (!notified && !this.disposing && !this.handoff && this.waitingOwned.get(turnId) === waiting) {
+        const retryAt = Date.now() + CHILD_PENDING_QUESTION_NOTIFY_RETRY_MS;
+        waiting.pendingQuestionNotifyRetryAt = retryAt;
+        waiting.nextWakeAt = waiting.nextWakeAt === undefined ? retryAt : Math.min(waiting.nextWakeAt, retryAt);
+        this.ensureRecoveryPolling();
+      }
     } else {
       this.waitingOwned.delete(turnId);
       const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
@@ -2876,6 +3038,59 @@ export class ReliableChildAgentCoordinator {
       this.triggerRecoveryPass();
     }
     return result;
+  }
+
+  private async notifyParentOfPendingChildQuestions(childExecutionId: string, turnId: string): Promise<boolean> {
+    const collaboration = this.dependencies.collaboration;
+    if (!collaboration || this.disposing || this.handoff) return true;
+    try {
+      // Only parent-dispatched child task Turns route ask_user to their parent Agent.
+      // A direct human-authored Turn inside a child conversation tab belongs to the user.
+      if (!await this.dependencies.answers.isChildTaskTurn(turnId)) return true;
+      const ownerLinks = await listAllDomainRows(this.dependencies.database, 'InteractionOwnerLink', { turn_id: turnId });
+      if (ownerLinks.length === 0) return true;
+      const pending: DomainRow[] = [];
+      for (const link of ownerLinks) {
+        const request = await this.get('InteractionRequest', requireId(link.request_id, 'InteractionOwnerLink.request_id'));
+        if (request && request.request_kind === 'ask_user' && request.status === 'pending') pending.push(request);
+      }
+      if (pending.length === 0) return true;
+      pending.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.id).localeCompare(String(right.id)));
+      const [parentLinks, bridges] = await Promise.all([
+        this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2),
+        this.list('AnswerBridge', { child_execution_id: childExecutionId }, 2)
+      ]);
+      if (parentLinks.length !== 1 || bridges.length !== 1) return true;
+      const parentTurn = await this.get('Turn', requireId(parentLinks[0].parent_turn_id, 'ChildExecutionParentLink.parent_turn_id'));
+      if (!parentTurn) return true;
+      const parentConversationId = requireId(parentTurn.conversation_id, 'Parent Turn.conversation_id');
+      const answerBridgeId = requireId(bridges[0].id, 'AnswerBridge.id');
+      let allNotified = true;
+      for (const request of pending) {
+        if (this.disposing || this.handoff) return true;
+        try {
+          const notified = await collaboration.notifyChildQuestion({
+            childTurnId: turnId,
+            childExecutionId,
+            answerBridgeId,
+            requestId: requireId(request.id, 'InteractionRequest.id'),
+            parentConversationId
+          });
+          if (notified.deliveryId) this.notifyExistingDelivery(notified.deliveryId);
+        } catch (error) {
+          allNotified = false;
+          if (!this.disposing && !this.handoff) {
+            this.reportError(error, 'notify-parent-child-question', turnId);
+          }
+        }
+      }
+      return allNotified;
+    } catch (error) {
+      if (!this.disposing && !this.handoff) {
+        this.reportError(error, 'notify-parent-child-question', turnId);
+      }
+      return Boolean(this.disposing || this.handoff);
+    }
   }
 
   private async failChildDrive(
@@ -3041,11 +3256,20 @@ export class ReliableChildAgentCoordinator {
       if (aborted) return aborted;
       const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
       if (settled) return this.childWaitResult(settled);
+      // Release the parent Turn early if the child paused on ask_user, preventing circular
+      // deadlock where the parent blocks waiting for a child that is waiting for the parent.
+      if (await this.dependencies.children.settleForegroundChildQuestion({
+        childExecutionId,
+        childTurnId: sourceTurnId,
+        now: this.timestamp()
+      })) {
+        return this.requireWaitSettlement(toolCallId);
+      }
       const remaining = Date.parse(deadline) - Date.now();
       if (remaining <= 0) break;
       const snapshot = await this.dependencies.children.wait(
         childExecutionId,
-        Math.min(remaining, signal ? 50 : 1_000)
+        Math.min(remaining, 50)
       );
       if (snapshot.activeTurn?.id !== sourceTurnId || snapshot.activeTurn.status === 'terminated') {
         await this.dependencies.children.settleInterruptedForegroundWait(toolCallId, signal);
@@ -3066,6 +3290,10 @@ export class ReliableChildAgentCoordinator {
     deadline: string,
     signal?: AbortSignal
   ): Promise<ChildDispatchResult> {
+    const bridge = await this.get('AnswerBridge', answerBridgeId);
+    const childExecutionId = bridge
+      ? requireId(bridge.child_execution_id, 'AnswerBridge.child_execution_id')
+      : undefined;
     for (;;) {
       if (this.handoff) throw this.handoff;
       const aborted = await this.settleUserAbort(toolCallId, signal, 'child-continuation-foreground-wait', true);
@@ -3076,6 +3304,23 @@ export class ReliableChildAgentCoordinator {
       }
       const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
       if (settled) return this.childWaitResult(settled);
+      if (childExecutionId) {
+        let questionTurnId = typeof intent?.turn_id === 'string' ? intent.turn_id : undefined;
+        if (!questionTurnId) {
+          const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
+          if (snapshot.activeTurn?.status === 'active') {
+            questionTurnId = requireId(snapshot.activeTurn.id, 'Child active Turn.id');
+          }
+        }
+        if (questionTurnId && await this.dependencies.children.settleContinuationForegroundChildQuestion({
+          answerBridgeId,
+          turnIntentId,
+          toolCallId,
+          childTurnId: questionTurnId
+        })) {
+          return this.requireWaitSettlement(toolCallId);
+        }
+      }
       const remaining = Date.parse(deadline) - Date.now();
       if (remaining <= 0) break;
       await delay(Math.min(50, remaining));
@@ -3493,6 +3738,7 @@ const RUN_AGENT_OPERATION_FIELDS: Record<typeof RUN_AGENT_OPERATIONS[number], re
   list: ['scope', 'status', 'limit', 'cursor'],
   read: ['answerBridgeId', 'scope', 'limit', 'cursor'],
   wait: ['answerBridgeId', 'answerBridgeIds', 'scope', 'timeoutMs'],
+  answer_question: ['answerBridgeId', 'questionId', 'selectedOptionIndexes', 'answer'],
   interrupt_subtree: ['answerBridgeId'],
   delete_subtree: ['answerBridgeId']
 };
@@ -3530,6 +3776,25 @@ export function validateRunAgentToolArguments(value: unknown): { [key: string]: 
       }
     } else if (operation === 'read' || operation === 'interrupt_subtree' || operation === 'delete_subtree') {
       args.answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
+    } else if (operation === 'answer_question') {
+      args.answerBridgeId = requireText(args.answerBridgeId, 'run_agent.answerBridgeId');
+      if (args.questionId !== undefined) args.questionId = requireText(args.questionId, 'run_agent.questionId');
+      if (args.selectedOptionIndexes !== undefined) {
+        if (!Array.isArray(args.selectedOptionIndexes)) {
+          throw new ToolArgumentError('run_agent.selectedOptionIndexes must be an array of non-negative integers.');
+        }
+        const normalized: number[] = [];
+        for (const [index, entry] of args.selectedOptionIndexes.entries()) {
+          normalized.push(normalizeToolInteger(entry, `run_agent.selectedOptionIndexes[${index}]`, 0, 0, 100));
+        }
+        args.selectedOptionIndexes = normalized;
+      }
+      if (args.answer !== undefined) args.answer = requireText(args.answer, 'run_agent.answer');
+      const selectedCount = Array.isArray(args.selectedOptionIndexes) ? args.selectedOptionIndexes.length : 0;
+      const hasCustomAnswer = typeof args.answer === 'string' && args.answer.length > 0;
+      if (selectedCount === 0 && !hasCustomAnswer) {
+        throw new ToolArgumentError('run_agent answer_question requires at least one of selectedOptionIndexes or answer.');
+      }
     } else if (operation === 'wait') {
       const references = childTaskWaitReferences(args);
       if (args.answerBridgeId !== undefined) {
@@ -3639,7 +3904,10 @@ function childTaskWaitReferences(args: { [key: string]: PlainJsonValue }): strin
 }
 
 function childTaskWaitSettled(tasks: ConversationChildTaskRecord[]): boolean {
-  return tasks.some(task => !['starting', 'active', 'interrupting'].includes(task.status) && task.queuedInputs.length === 0);
+  return tasks.some(task =>
+    Boolean(task.pendingQuestion)
+    || (!['starting', 'active', 'interrupting'].includes(task.status) && task.queuedInputs.length === 0)
+  );
 }
 
 function observeChildTaskChanges(database: RuntimeDatabase): {
