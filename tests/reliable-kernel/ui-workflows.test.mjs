@@ -370,12 +370,39 @@ test('时间线：协作卡按已提交消息边界定位，外部Conversation�
     collaborationCardPlacementLabel,
     collaborationCardStatusLabel
   } = await ui.load('domain/reliableCollaborationTimeline.ts');
-  const waitingNote = { messageId: 'note', direction: 'incoming', peer: { conversationId: 'peer', title: 'Peer', deleted: false }, peerRelation: 'cross_conversation', kind: 'message', textPreview: 'memo', status: 'waiting', placement: 'unbound' };
-  const waitingTask = { ...waitingNote, kind: 'followup' };
+  const pendingIncoming = (mode, extraRecords = {}) => projectCollaborationTimeline({
+    conversationId: 'self',
+    messages: [],
+    turnIdByMessageId: {},
+    removedConversationIds: [],
+    records: {
+      CollaborationMessage: { pending: { id: 'pending', message_seq: '1', mode, text_preview: 'memo' } },
+      CollaborationMessageSourceLink: { source: { id: 'source', message_id: 'pending', conversation_id: 'peer', source_kind: 'tool', turn_id: 'peer-turn' } },
+      CollaborationMessageTargetLink: { target: { id: 'target', message_id: 'pending', conversation_id: 'self', inbox_item_id: 'inbox' } },
+      RuntimeDelivery: { delivery: { id: 'delivery', inbox_item_id: 'inbox', target_conversation_id: 'self', target_turn_id: null, state: 'pending', attempt_seq: '1' } },
+      ...extraRecords
+    }
+  }).unlocated[0];
+  const waitingNote = pendingIncoming('message');
+  const waitingTask = pendingIncoming('followup');
+  const waitingChildTeamMessage = pendingIncoming('message', {
+    ChildExecution: { child: { id: 'child-self', child_conversation_id: 'self' } }
+  });
+  const waitingParentTeamMessage = pendingIncoming('message', {
+    ChildExecution: { child: { id: 'child-peer', child_conversation_id: 'peer' } }
+  });
+  assert.equal(waitingNote.silentNote, true);
   assert.equal(collaborationCardPlacementLabel(waitingNote), '');
   assert.equal(collaborationCardStatusLabel(waitingNote), '待下一轮读取（静默留条）');
+  assert.equal(waitingTask.silentNote, undefined);
   assert.equal(collaborationCardPlacementLabel(waitingTask), '');
   assert.equal(collaborationCardStatusLabel(waitingTask), '等待下一轮处理');
+  assert.equal(waitingChildTeamMessage.silentNote, undefined);
+  assert.equal(collaborationCardPlacementLabel(waitingChildTeamMessage), '');
+  assert.equal(collaborationCardStatusLabel(waitingChildTeamMessage), '等待下一轮处理');
+  assert.equal(waitingParentTeamMessage.silentNote, undefined);
+  assert.equal(collaborationCardPlacementLabel(waitingParentTeamMessage), '');
+  assert.equal(collaborationCardStatusLabel(waitingParentTeamMessage), '等待下一轮处理');
   const { composeTimelineRows, latestTimelineSegmentStart } = await ui.load('components/conversation/segmentedTimeline.ts');
   const messages = Array.from({ length: 35 }, (_, i) => ({ id: `m${i + 1}` }));
   const records = {
