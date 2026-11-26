@@ -22,7 +22,7 @@ import {
 } from '../webview/getWebviewHtml';
 import { isReliableKernelControlMessage } from '../../shared/reliableKernelClientFeed';
 import type { ApplicationFacade, ConversationRecoveryResult } from '../ApplicationFacade';
-import type { ApplicationStartup } from '../ApplicationStartup';
+import type { ApplicationStartup, ApplicationStartupWaiting } from '../ApplicationStartup';
 import { answerDataRootPrompt, cancelDataRootPrompts } from '../dataRootPrompts';
 import { isConversationRuntimeOwnerBusyError } from '../../backend/reliableKernel/ConversationRuntimeOwnerManager';
 
@@ -55,7 +55,9 @@ export class MainPanel {
   private readonly extensionUri: vscode.Uri;
   private readonly backendApp: ApplicationFacade;
   private readonly panelId: string;
-  private readonly clientId: BridgeClientId;
+  private clientId?: BridgeClientId;
+  private mounted = false;
+  private disposed = false;
   private readonly kind: MainPanelKind;
   private readonly conversationId?: string;
   private readonly toolCallId?: string;
@@ -68,15 +70,33 @@ export class MainPanel {
         async deserializeWebviewPanel(webviewPanel, state) {
           const serialized = optionsFromSerializedState(state, webviewPanel.title);
           let disposed = false;
-          const startupDispose = webviewPanel.onDidDispose(() => { disposed = true; });
-          MainPanel.renderInitializing(webviewPanel, serialized, startup.waiting());
+          let startupFinished = false;
+          const unrendered = Symbol('unrendered');
+          let lastRenderedWaiting: ApplicationStartupWaiting | undefined | typeof unrendered = unrendered;
+          const renderInitializingIfVisible = (status: ApplicationStartupWaiting | undefined) => {
+            if (disposed || startupFinished || !webviewPanel.visible) return;
+            if (lastRenderedWaiting === status) return;
+            lastRenderedWaiting = status;
+            MainPanel.renderInitializing(webviewPanel, serialized, status);
+          };
           // While another window holds the data directory, the shell says why (the stage, no seconds).
           const waiting = startup.onDidChangeWaiting((status) => {
-            if (!disposed) MainPanel.renderInitializing(webviewPanel, serialized, status);
+            renderInitializingIfVisible(status);
           });
+          const startupViewState = webviewPanel.onDidChangeViewState(() => {
+            if (webviewPanel.visible) renderInitializingIfVisible(startup.waiting());
+          });
+          const startupDispose = webviewPanel.onDidDispose(() => {
+            disposed = true;
+            waiting.dispose();
+            startupViewState.dispose();
+          });
+          renderInitializingIfVisible(startup.waiting());
           try {
             const backendApp = await startup.wait().finally(() => waiting.dispose());
             const options = await resolveRestoredPanelOptions(backendApp, serialized);
+            startupFinished = true;
+            startupViewState.dispose();
             if (disposed) {
               startupDispose.dispose();
               return;
@@ -90,9 +110,12 @@ export class MainPanel {
             );
             startupDispose.dispose();
           } catch (error) {
+            startupFinished = true;
+            waiting.dispose();
+            startupViewState.dispose();
             startupDispose.dispose();
             if (disposed) return;
-            MainPanel.renderUnavailable(
+            MainPanel.renderUnavailableWhenVisible(
               webviewPanel,
               error instanceof Error ? error.message : String(error)
             );
@@ -119,7 +142,7 @@ export class MainPanel {
       : undefined;
     if (!conversationId) {
       if (isDisposed()) return;
-      MainPanel.revive(webviewPanel, extensionUri, backendApp, options);
+      MainPanel.revive(webviewPanel, extensionUri, backendApp, options, { deferMountUntilVisible: true });
       return;
     }
     await MainPanel.enqueueConversationOpen(conversationId, async () => {
@@ -127,14 +150,14 @@ export class MainPanel {
       const existing = MainPanel.existingConversationPanel(kind, options, conversationId);
       if (existing && (kind === 'chat' || options.reuse)) {
         existing.refreshTitle(options.title);
-        existing.panel.reveal(webviewPanel.viewColumn ?? vscode.ViewColumn.One);
+        existing.reveal(webviewPanel.viewColumn ?? vscode.ViewColumn.One);
         MainPanel.notifyConversationPanelStateChanged();
         webviewPanel.dispose();
         return;
       }
       // A restore blocked behind a queued open may already have been closed by the user.
       if (isDisposed()) return;
-      MainPanel.revive(webviewPanel, extensionUri, backendApp, options);
+      MainPanel.revive(webviewPanel, extensionUri, backendApp, options, { deferMountUntilVisible: true });
       if (options.conversationId) {
         MainPanel.scheduleRestoredTitleRefresh(backendApp, options.conversationId);
       }
@@ -154,7 +177,7 @@ export class MainPanel {
     context.subscriptions.push(
       vscode.window.registerWebviewPanelSerializer(MainPanel.viewType, {
         async deserializeWebviewPanel(webviewPanel) {
-          MainPanel.renderUnavailable(webviewPanel, message);
+          MainPanel.renderUnavailableWhenVisible(webviewPanel, message);
         }
       })
     );
@@ -190,7 +213,7 @@ export class MainPanel {
         const existing = [...MainPanel.panels.values()].find((candidate) => candidate.matches(options));
         if (existing) {
           existing.refreshTitle(options.title);
-          existing.panel.reveal(column);
+          existing.reveal(column);
           MainPanel.notifyConversationPanelStateChanged();
           return Promise.resolve();
         }
@@ -208,7 +231,7 @@ export class MainPanel {
     const existing = MainPanel.existingConversationPanel(kind, options, conversationId);
     if (existing && (kind === 'chat' || options.reuse)) {
       existing.refreshTitle(options.title);
-      existing.panel.reveal(column);
+      existing.reveal(column);
       MainPanel.notifyConversationPanelStateChanged();
       return Promise.resolve();
     }
@@ -271,7 +294,7 @@ export class MainPanel {
     const existing = MainPanel.existingConversationPanel(kind, options, conversationId);
     if (existing && (kind === 'chat' || options.reuse)) {
       existing.refreshTitle(options.title);
-      existing.panel.reveal(column);
+      existing.reveal(column);
       MainPanel.notifyConversationPanelStateChanged();
       return;
     }
@@ -299,9 +322,10 @@ export class MainPanel {
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
-    options: MainPanelOptions = {}
+    options: MainPanelOptions = {},
+    reviveOptions?: { deferMountUntilVisible?: boolean }
   ): void {
-    const instance = new MainPanel(panel, extensionUri, backendApp, options);
+    const instance = new MainPanel(panel, extensionUri, backendApp, options, reviveOptions);
     MainPanel.panels.set(instance.panelId, instance);
     MainPanel.notifyConversationPanelStateChanged();
     // Recovery is optional and never blocks a peer-owned view. A dead Host may have exited after
@@ -338,6 +362,28 @@ export class MainPanel {
     panel.webview.html = getUnavailableWebviewHtml(message);
   }
 
+  private static renderUnavailableWhenVisible(panel: vscode.WebviewPanel, message: string): void {
+    if (panel.visible) {
+      MainPanel.renderUnavailable(panel, message);
+      return;
+    }
+    let settled = false;
+    let viewStateListener: vscode.Disposable | undefined;
+    let disposeListener: vscode.Disposable | undefined;
+    const cleanup = () => {
+      if (settled) return;
+      settled = true;
+      viewStateListener?.dispose();
+      disposeListener?.dispose();
+    };
+    disposeListener = panel.onDidDispose(cleanup);
+    viewStateListener = panel.onDidChangeViewState(() => {
+      if (settled || !panel.visible) return;
+      cleanup();
+      MainPanel.renderUnavailable(panel, message);
+    });
+  }
+
   private static renderInitializing(
     panel: vscode.WebviewPanel,
     options: MainPanelOptions,
@@ -368,7 +414,8 @@ export class MainPanel {
     panel: vscode.WebviewPanel,
     extensionUri: vscode.Uri,
     backendApp: ApplicationFacade,
-    options: MainPanelOptions
+    options: MainPanelOptions,
+    reviveOptions?: { deferMountUntilVisible?: boolean }
   ) {
     this.panel = panel;
     this.extensionUri = extensionUri;
@@ -380,27 +427,74 @@ export class MainPanel {
     this.planProposalId = options.planProposalId;
 
     this.refreshTitle(options.title);
-    this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
-    this.clientId = this.backendApp.attachWebview(panel.webview, this.panelWebviewMeta());
-    try {
-      this.backendApp.setWebviewVisible(this.clientId, panel.visible);
-      this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri, {
-        enableLocalFileResources: supportsLocalFileResources(this.kind)
-      });
-    } catch (error) {
-      this.backendApp.detachWebview(this.clientId);
-      throw error;
+    const shouldDeferMount = Boolean(reviveOptions?.deferMountUntilVisible && !this.panel.visible);
+    if (!shouldDeferMount) {
+      this.mountWebview({ rethrowOnError: true });
     }
 
     this.panel.onDidDispose(() => this.dispose(), null, this.disposables);
     this.panel.onDidChangeViewState(() => {
-      this.backendApp.setWebviewVisible(this.clientId, this.panel.visible);
-      MainPanel.notifyConversationPanelStateChanged();
+      this.handleViewStateChanged();
     }, null, this.disposables);
+  }
+
+  private reveal(column?: vscode.ViewColumn): void {
+    this.panel.reveal(column);
+    this.mountIfVisible();
+  }
+
+  private mountIfVisible(): void {
+    if (this.disposed || this.mounted || !this.panel.visible) return;
+    this.mountWebview({ rethrowOnError: false });
+  }
+
+  private handleViewStateChanged(): void {
+    if (this.disposed) return;
+    if (!this.mounted) {
+      if (this.panel.visible) {
+        this.mountWebview({ rethrowOnError: false });
+      }
+    } else if (this.clientId !== undefined) {
+      this.backendApp.setWebviewVisible(this.clientId, this.panel.visible);
+    }
+    MainPanel.notifyConversationPanelStateChanged();
+  }
+
+  private mountWebview(options: { rethrowOnError: boolean }): void {
+    if (this.mounted || this.disposed) return;
+    let clientId: BridgeClientId | undefined;
+    try {
+      this.panel.webview.options = MainPanel.webviewPanelOptions(this.extensionUri, this.kind);
+      clientId = this.backendApp.attachWebview(this.panel.webview, this.panelWebviewMeta());
+      this.clientId = clientId;
+      this.mounted = true;
+      this.backendApp.setWebviewVisible(clientId, this.panel.visible);
+      this.panel.webview.html = getWebviewHtml(this.panel.webview, this.extensionUri, {
+        enableLocalFileResources: supportsLocalFileResources(this.kind)
+      });
+      this.bindMessageListener(clientId);
+    } catch (error) {
+      this.mounted = false;
+      this.clientId = undefined;
+      if (clientId !== undefined) {
+        this.backendApp.detachWebview(clientId);
+      }
+      if (options.rethrowOnError) {
+        throw error;
+      }
+      console.error('[LimCode] Failed to mount deferred webview panel.', error);
+      void vscode.window.showWarningMessage?.(
+        `${EXTENSION_BRAND}: 无法加载视图：${error instanceof Error ? error.message : String(error)}`
+      );
+    }
+  }
+
+  private bindMessageListener(clientId: BridgeClientId): void {
     this.panel.webview.onDidReceiveMessage(
       (raw: unknown) => {
+        if (this.disposed || this.clientId !== clientId) return;
         if (isReliableKernelControlMessage(raw)) {
-          const handled = this.backendApp.handleReliableKernelControl?.(this.clientId, raw);
+          const handled = this.backendApp.handleReliableKernelControl?.(clientId, raw);
           if (handled instanceof Promise) {
             void handled.catch((error) => console.warn('[LimCode] Reliable client feed control failed.', error));
           }
@@ -428,14 +522,14 @@ export class MainPanel {
           return;
         }
         if (message.type === BridgeMessageType.DataRootAction && message.payload?.action) {
-          this.runDataRootActionFromPanel(message.payload);
+          this.runDataRootActionFromPanel(clientId, message.payload);
           return;
         }
         if (message.type === BridgeMessageType.LanMobileAccessRequest) {
-          void vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.lanMobileAccess, { clientId: this.clientId, ...message.payload });
+          void vscode.commands.executeCommand(EXTENSION_COMMAND_IDS.lanMobileAccess, { clientId, ...message.payload });
           return;
         }
-        this.backendApp.handleWebviewMessage(this.clientId, message);
+        this.backendApp.handleWebviewMessage(clientId, message);
         this.refreshTitleFromOutgoingMessage(message);
       },
       null,
@@ -444,10 +538,19 @@ export class MainPanel {
   }
 
   public dispose(): void {
-    cancelDataRootPrompts(this.clientId);
+    if (this.disposed) return;
+    this.disposed = true;
+    const clientId = this.clientId;
+    this.clientId = undefined;
+    this.mounted = false;
+    if (clientId !== undefined) {
+      cancelDataRootPrompts(clientId);
+    }
     MainPanel.panels.delete(this.panelId);
     MainPanel.notifyConversationPanelStateChanged();
-    this.backendApp.detachWebview(this.clientId);
+    if (clientId !== undefined) {
+      this.backendApp.detachWebview(clientId);
+    }
     while (this.disposables.length) {
       const disposable = this.disposables.pop();
       disposable?.dispose();
@@ -458,10 +561,10 @@ export class MainPanel {
    * Settings-page data-directory buttons run the commands for this page (their confirmations come
    * back here as ConfirmPanels); an answer resolves the command's open prompt.
    */
-  private runDataRootActionFromPanel(payload: DataRootActionPayload): void {
+  private runDataRootActionFromPanel(clientId: BridgeClientId, payload: DataRootActionPayload): void {
     const action = payload.action;
     if (action === 'answer') {
-      answerDataRootPrompt(this.clientId, payload);
+      answerDataRootPrompt(clientId, payload);
       return;
     }
     // Each of these writes the data directory: refused at once while this window is frozen for a
@@ -477,7 +580,7 @@ export class MainPanel {
         : action === 'deletePrevious' ? EXTENSION_COMMAND_IDS.deletePreviousDataRoot
           : action === 'cleanupBackups' ? EXTENSION_COMMAND_IDS.cleanupBackups : undefined;
     if (!command) return;
-    void vscode.commands.executeCommand(command, { clientId: this.clientId }).then(undefined, (error) => {
+    void vscode.commands.executeCommand(command, { clientId }).then(undefined, (error) => {
       const message = error instanceof Error ? error.message : String(error);
       void vscode.window.showErrorMessage(`数据目录操作失败：${message}`);
     });
@@ -580,6 +683,7 @@ export class MainPanel {
   public static saveComposerDrafts(post: (clientId: BridgeClientId, message: ExtensionToWebviewMessage) => boolean): number {
     let asked = 0;
     for (const panel of MainPanel.panels.values()) {
+      if (!panel.mounted || panel.clientId === undefined) continue;
       if (post(panel.clientId, { id: createMessageId(), type: BridgeMessageType.ComposerDraftSave, channel: 'control' })) asked += 1;
     }
     return asked;
