@@ -198,6 +198,7 @@ export interface ReliableChildAgentRecoveryReport {
 }
 
 const CHILD_WAKE_POLL_MS = 500;
+const CHILD_PENDING_QUESTION_NOTIFY_RETRY_MS = 1_000;
 const CHILD_RECOVERY_CHANGE_SCAN_MS = 2_000;
 const CHILD_RECOVERY_SAFETY_SCAN_MS = 5_000;
 /** The owner of a question's or plan review's wait Operation (ToolInteractionControlPlane). */
@@ -246,6 +247,7 @@ export class ReliableChildAgentCoordinator {
     waitingToolCallId?: string;
     contextHandleUpgradeConversationId?: string;
     nextWakeAt?: number;
+    pendingQuestionNotifyRetryAt?: number;
     childDeadlineAt?: number;
     deadlineReadPending?: boolean;
     deadlineRetryAt?: number;
@@ -1436,6 +1438,7 @@ export class ReliableChildAgentCoordinator {
       }
     }
 
+    let pendingQuestionNotifyFailed = false;
     for (const link of scopedActiveLinks) {
       signal?.throwIfAborted();
       const childExecutionId = requireId(link.child_execution_id, 'ChildExecutionActiveTurnLink.child_execution_id');
@@ -1476,6 +1479,10 @@ export class ReliableChildAgentCoordinator {
         // Another live owner drives this child; keep the level-triggered takeover edge alive.
         report.deferredTurnIds.push(turnId);
         continue;
+      }
+      if (recovered.value !== 'terminal') {
+        const notified = await this.notifyParentOfPendingChildQuestions(childExecutionId, turnId);
+        if (!notified) pendingQuestionNotifyFailed = true;
       }
       if (recovered.value === 'resumed') {
         report.resumedTurnIds.push(turnId);
@@ -1571,7 +1578,9 @@ export class ReliableChildAgentCoordinator {
 
     const outstandingContinuations = (await this.dependencies.children.listPendingContinuations())
       .filter((entry) => inScope(entry.childExecutionId));
-    const passNeedsPolling = report.deferredTurnIds.length > 0 || outstandingContinuations.length > 0;
+    const passNeedsPolling = report.deferredTurnIds.length > 0
+      || outstandingContinuations.length > 0
+      || pendingQuestionNotifyFailed;
     // A scoped pass must not clear polling another Conversation still needs.
     this.recoveryPollingNeeded = conversationId === undefined
       ? passNeedsPolling
@@ -1769,6 +1778,25 @@ export class ReliableChildAgentCoordinator {
         for (const [turnId, waiting] of [...this.waitingOwned]) {
           if (this.disposing || this.handoff) return;
           if (this.activeTurns.has(turnId)) continue;
+          if (
+            waiting.pendingQuestionNotifyRetryAt !== undefined
+            && Date.now() >= waiting.pendingQuestionNotifyRetryAt
+          ) {
+            const retryScheduledAt = waiting.pendingQuestionNotifyRetryAt;
+            const notified = await this.notifyParentOfPendingChildQuestions(waiting.childExecutionId, turnId);
+            if (this.disposing || this.handoff) return;
+            if (this.waitingOwned.get(turnId) !== waiting || this.activeTurns.has(turnId)) continue;
+            if (notified) {
+              waiting.pendingQuestionNotifyRetryAt = undefined;
+              if (waiting.nextWakeAt === retryScheduledAt) {
+                waiting.nextWakeAt = undefined;
+              }
+            } else {
+              const retryAt = Date.now() + CHILD_PENDING_QUESTION_NOTIFY_RETRY_MS;
+              waiting.pendingQuestionNotifyRetryAt = retryAt;
+              waiting.nextWakeAt = waiting.nextWakeAt === undefined ? retryAt : Math.min(waiting.nextWakeAt, retryAt);
+            }
+          }
           if (waiting.contextHandleUpgradeConversationId && Date.now() >= (waiting.nextWakeAt ?? 0)) {
             const turn = await this.get('Turn', turnId);
             if (!turn || turn.status !== 'active') { this.waitingOwned.delete(turnId); continue; }
@@ -2981,7 +3009,13 @@ export class ReliableChildAgentCoordinator {
           this.reportError(error, 'read-child-wait-deadline', turnId);
         }
       }
-      await this.notifyParentOfPendingChildQuestions(childExecutionId, turnId);
+      const notified = await this.notifyParentOfPendingChildQuestions(childExecutionId, turnId);
+      if (!notified && !this.disposing && !this.handoff && this.waitingOwned.get(turnId) === waiting) {
+        const retryAt = Date.now() + CHILD_PENDING_QUESTION_NOTIFY_RETRY_MS;
+        waiting.pendingQuestionNotifyRetryAt = retryAt;
+        waiting.nextWakeAt = waiting.nextWakeAt === undefined ? retryAt : Math.min(waiting.nextWakeAt, retryAt);
+        this.ensureRecoveryPolling();
+      }
     } else {
       this.waitingOwned.delete(turnId);
       const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
@@ -3006,43 +3040,56 @@ export class ReliableChildAgentCoordinator {
     return result;
   }
 
-  private async notifyParentOfPendingChildQuestions(childExecutionId: string, turnId: string): Promise<void> {
+  private async notifyParentOfPendingChildQuestions(childExecutionId: string, turnId: string): Promise<boolean> {
     const collaboration = this.dependencies.collaboration;
-    if (!collaboration || this.disposing || this.handoff) return;
+    if (!collaboration || this.disposing || this.handoff) return true;
     try {
+      // Only parent-dispatched child task Turns route ask_user to their parent Agent.
+      // A direct human-authored Turn inside a child conversation tab belongs to the user.
+      if (!await this.dependencies.answers.isChildTaskTurn(turnId)) return true;
       const ownerLinks = await listAllDomainRows(this.dependencies.database, 'InteractionOwnerLink', { turn_id: turnId });
-      if (ownerLinks.length === 0) return;
+      if (ownerLinks.length === 0) return true;
       const pending: DomainRow[] = [];
       for (const link of ownerLinks) {
         const request = await this.get('InteractionRequest', requireId(link.request_id, 'InteractionOwnerLink.request_id'));
         if (request && request.request_kind === 'ask_user' && request.status === 'pending') pending.push(request);
       }
-      if (pending.length === 0) return;
+      if (pending.length === 0) return true;
       pending.sort((left, right) => String(left.created_at).localeCompare(String(right.created_at)) || String(left.id).localeCompare(String(right.id)));
       const [parentLinks, bridges] = await Promise.all([
         this.list('ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2),
         this.list('AnswerBridge', { child_execution_id: childExecutionId }, 2)
       ]);
-      if (parentLinks.length !== 1 || bridges.length !== 1) return;
+      if (parentLinks.length !== 1 || bridges.length !== 1) return true;
       const parentTurn = await this.get('Turn', requireId(parentLinks[0].parent_turn_id, 'ChildExecutionParentLink.parent_turn_id'));
-      if (!parentTurn) return;
+      if (!parentTurn) return true;
       const parentConversationId = requireId(parentTurn.conversation_id, 'Parent Turn.conversation_id');
       const answerBridgeId = requireId(bridges[0].id, 'AnswerBridge.id');
+      let allNotified = true;
       for (const request of pending) {
-        if (this.disposing || this.handoff) return;
-        const notified = await collaboration.notifyChildQuestion({
-          childTurnId: turnId,
-          childExecutionId,
-          answerBridgeId,
-          requestId: requireId(request.id, 'InteractionRequest.id'),
-          parentConversationId
-        });
-        if (notified.deliveryId) this.notifyExistingDelivery(notified.deliveryId);
+        if (this.disposing || this.handoff) return true;
+        try {
+          const notified = await collaboration.notifyChildQuestion({
+            childTurnId: turnId,
+            childExecutionId,
+            answerBridgeId,
+            requestId: requireId(request.id, 'InteractionRequest.id'),
+            parentConversationId
+          });
+          if (notified.deliveryId) this.notifyExistingDelivery(notified.deliveryId);
+        } catch (error) {
+          allNotified = false;
+          if (!this.disposing && !this.handoff) {
+            this.reportError(error, 'notify-parent-child-question', turnId);
+          }
+        }
       }
+      return allNotified;
     } catch (error) {
       if (!this.disposing && !this.handoff) {
         this.reportError(error, 'notify-parent-child-question', turnId);
       }
+      return Boolean(this.disposing || this.handoff);
     }
   }
 
@@ -3209,11 +3256,20 @@ export class ReliableChildAgentCoordinator {
       if (aborted) return aborted;
       const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
       if (settled) return this.childWaitResult(settled);
+      // Release the parent Turn early if the child paused on ask_user, preventing circular
+      // deadlock where the parent blocks waiting for a child that is waiting for the parent.
+      if (await this.dependencies.children.settleForegroundChildQuestion({
+        childExecutionId,
+        childTurnId: sourceTurnId,
+        now: this.timestamp()
+      })) {
+        return this.requireWaitSettlement(toolCallId);
+      }
       const remaining = Date.parse(deadline) - Date.now();
       if (remaining <= 0) break;
       const snapshot = await this.dependencies.children.wait(
         childExecutionId,
-        Math.min(remaining, signal ? 50 : 1_000)
+        Math.min(remaining, 50)
       );
       if (snapshot.activeTurn?.id !== sourceTurnId || snapshot.activeTurn.status === 'terminated') {
         await this.dependencies.children.settleInterruptedForegroundWait(toolCallId, signal);
@@ -3234,6 +3290,10 @@ export class ReliableChildAgentCoordinator {
     deadline: string,
     signal?: AbortSignal
   ): Promise<ChildDispatchResult> {
+    const bridge = await this.get('AnswerBridge', answerBridgeId);
+    const childExecutionId = bridge
+      ? requireId(bridge.child_execution_id, 'AnswerBridge.child_execution_id')
+      : undefined;
     for (;;) {
       if (this.handoff) throw this.handoff;
       const aborted = await this.settleUserAbort(toolCallId, signal, 'child-continuation-foreground-wait', true);
@@ -3244,6 +3304,23 @@ export class ReliableChildAgentCoordinator {
       }
       const settled = await this.dependencies.children.finalizeWaitSettlement(toolCallId);
       if (settled) return this.childWaitResult(settled);
+      if (childExecutionId) {
+        let questionTurnId = typeof intent?.turn_id === 'string' ? intent.turn_id : undefined;
+        if (!questionTurnId) {
+          const snapshot = await this.dependencies.children.readExecutionSnapshot(childExecutionId);
+          if (snapshot.activeTurn?.status === 'active') {
+            questionTurnId = requireId(snapshot.activeTurn.id, 'Child active Turn.id');
+          }
+        }
+        if (questionTurnId && await this.dependencies.children.settleContinuationForegroundChildQuestion({
+          answerBridgeId,
+          turnIntentId,
+          toolCallId,
+          childTurnId: questionTurnId
+        })) {
+          return this.requireWaitSettlement(toolCallId);
+        }
+      }
       const remaining = Date.parse(deadline) - Date.now();
       if (remaining <= 0) break;
       await delay(Math.min(50, remaining));

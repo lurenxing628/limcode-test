@@ -1,6 +1,15 @@
+import type { ContentAddressedStore } from '../../reliableKernel/contentAddressedStore';
+import {
+  CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
+  CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+  LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
+  childContinuationTurnId
+} from '../../reliableKernel/childSendLineage';
+import { isChildTaskTurn } from '../../reliableKernel/childTaskTurn';
 import type { RuntimeCommitResult } from '../../reliableKernel/contracts';
 import { DOMAIN_REPOSITORIES, type DomainRow } from '../../reliableKernel/repositories';
 import type { RuntimeDatabase } from '../../reliableKernel/runtimeDatabase';
+import { TURN_EXECUTION_PRESET_CONTENT_TYPE } from '../../reliableKernel/runtimeDeliveryContinuationIdentity';
 import { displayConversationTitle } from '../../../shared/conversationTitle';
 import { EXTENSION_BRAND } from '../../../shared/extensionIdentity';
 
@@ -80,13 +89,15 @@ export class InteractionLeaseEdgeTracker {
  */
 export async function readPendingInteractionAttention(
   database: RuntimeDatabase,
-  hostBootId: string
+  hostBootId: string,
+  contentStore?: ContentAddressedStore
 ): Promise<PendingInteractionAttention[]> {
   const requests = await listRows(database, 'InteractionRequest', { status: 'pending' }, 1000);
   const resolved = await Promise.all(requests.map((request) => resolvePendingInteractionAttention(
     database,
     hostBootId,
-    request
+    request,
+    contentStore
   )));
   return resolved.filter((request): request is PendingInteractionAttention => request !== undefined);
 }
@@ -94,7 +105,8 @@ export async function readPendingInteractionAttention(
 async function resolvePendingInteractionAttention(
   database: RuntimeDatabase,
   hostBootId: string,
-  request: DomainRow
+  request: DomainRow,
+  contentStore?: ContentAddressedStore
 ): Promise<PendingInteractionAttention | undefined> {
   const kind = interactionAttentionKind(request.request_kind);
   if (!kind) return undefined;
@@ -102,11 +114,17 @@ async function resolvePendingInteractionAttention(
   const owners = await listRows(database, 'InteractionOwnerLink', { request_id: requestId }, 2);
   if (owners.length !== 1) return undefined;
   const turnId = requireText(owners[0].turn_id, 'InteractionOwnerLink.turn_id');
-  if (kind === 'plan_review' || kind === 'ask_user') {
-    // Child plan reviews auto-approve or stay internal; child ask_user questions are routed to the
-    // direct parent Agent rather than popping up a VS Code toast asking the human to switch tabs.
+  if (kind === 'plan_review') {
     const childMemberships = await listRows(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 1);
     if (childMemberships.length > 0) return undefined;
+  } else if (kind === 'ask_user') {
+    // Only suppress VS Code attention toasts for parent-dispatched child-task Turns (which route
+    // ask_user to the direct parent Agent). A user-authored Turn started directly inside a child
+    // conversation tab still belongs to the human user and must keep its toast.
+    const isTaskTurn = contentStore
+      ? await isChildTaskTurn(database, contentStore, turnId)
+      : await isChildTaskTurnWithoutContentStore(database, turnId);
+    if (isTaskTurn) return undefined;
   }
   const leases = await listRows(database, 'ExecutionLease', { turn_id: turnId }, 2);
   if (leases.length !== 1 || leases[0].host_boot_id !== hostBootId) return undefined;
@@ -242,4 +260,111 @@ function requireText(value: unknown, label: string): string {
 function timestampMs(value: unknown): number {
   const parsed = typeof value === 'string' ? Date.parse(value) : Number.NaN;
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+/** Mirrors childTaskTurn.isChildTaskTurn using durable relation rows when a caller omits contentStore. */
+async function isChildTaskTurnWithoutContentStore(
+  database: RuntimeDatabase,
+  turnId: string
+): Promise<boolean> {
+  const memberships = await listRows(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 2);
+  if (memberships.length !== 1) return false;
+  const childExecutionId = requireText(memberships[0].child_execution_id, 'ChildExecutionTurnLink.child_execution_id');
+  return await requestingParentTurnWithoutContentStore(database, childExecutionId, turnId, new Set()) !== null;
+}
+
+async function requestingParentTurnWithoutContentStore(
+  database: RuntimeDatabase,
+  childExecutionId: string,
+  turnId: string,
+  visited: Set<string>
+): Promise<string | null> {
+  if (visited.has(turnId)) return null;
+  visited.add(turnId);
+  try {
+    const memberships = await listRows(database, 'ChildExecutionTurnLink', { turn_id: turnId }, 2);
+    if (memberships.length !== 1 || memberships[0].child_execution_id !== childExecutionId) return null;
+    const intents = await listRows(database, 'TurnIntent', { turn_id: turnId }, 2);
+    if (intents.length === 0) {
+      if (String(memberships[0].turn_seq) !== '1') return null;
+      const parents = await listRows(database, 'ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2);
+      return parents.length === 1 && typeof parents[0].parent_turn_id === 'string' ? parents[0].parent_turn_id : null;
+    }
+    if (intents.length !== 1) return null;
+    const turnIntentId = requireText(intents[0].id, 'TurnIntent.id');
+    const deliveryLinks = await listRows(database, 'RuntimeDeliveryIntentLink', { turn_intent_id: turnIntentId }, 2);
+    if (deliveryLinks.length > 0) {
+      if (deliveryLinks.length !== 1) return null;
+      const delivery = await maybeRow(database, 'RuntimeDelivery', requireText(deliveryLinks[0].delivery_id, 'RuntimeDeliveryIntentLink.delivery_id'));
+      if (!delivery) return null;
+      const inbox = await maybeRow(database, 'RuntimeInboxItem', requireText(delivery.inbox_item_id, 'RuntimeDelivery.inbox_item_id'));
+      let sourceTurnId: string | null = null;
+      if (inbox?.source_kind === 'process_receipt') {
+        const receipt = await maybeRow(database, 'ProcessReceipt', requireText(inbox.source_id, 'RuntimeInboxItem.source_id'));
+        const sources = receipt
+          ? await listRows(database, 'ProcessCompletionSourceLink', { process_id: receipt.process_id }, 2)
+          : [];
+        sourceTurnId = sources.length === 1 && typeof sources[0].source_turn_id === 'string'
+          ? sources[0].source_turn_id
+          : null;
+      } else if (inbox?.source_kind === 'answer_submission') {
+        const submission = await maybeRow(database, 'AnswerSubmission', requireText(inbox.source_id, 'RuntimeInboxItem.source_id'));
+        const bridge = submission
+          ? await maybeRow(database, 'AnswerBridge', requireText(submission.answer_bridge_id, 'AnswerSubmission.answer_bridge_id'))
+          : null;
+        if (submission && bridge) {
+          sourceTurnId = await requestingParentTurnWithoutContentStore(
+            database,
+            requireText(bridge.child_execution_id, 'AnswerBridge.child_execution_id'),
+            requireText(submission.turn_id, 'AnswerSubmission.turn_id'),
+            visited
+          );
+        }
+      }
+      return sourceTurnId === null
+        ? null
+        : await requestingParentTurnWithoutContentStore(database, childExecutionId, sourceTurnId, visited);
+    }
+    const [presets, intentLinks] = await Promise.all([
+      listRows(database, 'TurnExecutionPresetRevision', { intent_id: turnIntentId, revision_seq: '1' }, 2),
+      listRows(database, 'ChildExecutionIntentLink', { child_execution_id: childExecutionId, turn_intent_id: turnIntentId }, 2)
+    ]);
+    if (presets.length !== 1 || intentLinks.length !== 1) return null;
+    const presetObj = await maybeRow(database, 'ContentObject', requireText(presets[0].preset_object_id, 'TurnExecutionPresetRevision.preset_object_id'));
+    if (!presetObj || presetObj.content_type !== TURN_EXECUTION_PRESET_CONTENT_TYPE) return null;
+    let operations = await listRows(database, 'Operation', {
+      owner_kind: CHILD_INTENT_ANSWER_WAIT_OWNER_KIND,
+      owner_id: turnIntentId
+    }, 2);
+    if (operations.length === 0) {
+      operations = await listRows(database, 'Operation', {
+        owner_kind: CHILD_TURN_ANSWER_WAIT_OWNER_KIND,
+        owner_id: childContinuationTurnId(childExecutionId, turnIntentId)
+      }, 2);
+    }
+    if (operations.length === 0) {
+      const bridges = await listRows(database, 'AnswerBridge', { child_execution_id: childExecutionId }, 2);
+      if (bridges.length !== 1) return null;
+      const legacy = await listRows(database, 'Operation', {
+        owner_kind: LEGACY_ANSWER_BRIDGE_WAIT_OWNER_KIND,
+        owner_id: bridges[0].id
+      }, 2);
+      if (legacy.length === 0) return null;
+      const parents = await listRows(database, 'ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2);
+      return parents.length === 1 && typeof parents[0].parent_turn_id === 'string' ? parents[0].parent_turn_id : null;
+    }
+    if (operations.length !== 1 || typeof operations[0].tool_call_id !== 'string') return null;
+    const toolCall = await maybeRow(database, 'ToolCall', operations[0].tool_call_id);
+    const requester = toolCall && typeof toolCall.turn_id === 'string'
+      ? await maybeRow(database, 'Turn', toolCall.turn_id)
+      : null;
+    const parents = await listRows(database, 'ChildExecutionParentLink', { child_execution_id: childExecutionId }, 2);
+    const originalParent = parents.length === 1 && typeof parents[0].parent_turn_id === 'string'
+      ? await maybeRow(database, 'Turn', parents[0].parent_turn_id)
+      : null;
+    if (!requester || !originalParent || requester.conversation_id !== originalParent.conversation_id) return null;
+    return requireText(requester.id, 'Turn.id');
+  } finally {
+    visited.delete(turnId);
+  }
 }

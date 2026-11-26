@@ -824,10 +824,367 @@ test('interactionAttention suppresses child ask_user popups while preserving top
       }
     });
 
-    const pending = await readPendingInteractionAttention(local.app.database, local.app.database.hostBootId);
+    const pending = await readPendingInteractionAttention(local.app.database, local.app.database.hostBootId, local.app.contentStore);
     const ids = pending.map(item => item.requestId);
-    assert.equal(ids.includes(childPaused.requestId), false, 'child ask_user must NOT trigger VS Code attention toast');
+    assert.equal(ids.includes(childPaused.requestId), false, 'child task ask_user must NOT trigger VS Code attention toast');
     assert.equal(ids.includes(parentPaused.requestId), true, 'top-level ask_user MUST still trigger VS Code attention toast');
+  } finally {
+    await local.close();
+  }
+});
+
+test('foreground wait (spawn & send with foregroundWaitMs=30s) settles immediately when child calls ask_user without deadlock', { timeout: 15000 }, async () => {
+  const local = await openAskUserFixture();
+  try {
+    const parent = await local.parentTurn('foreground-wait-no-deadlock');
+    let childConversationId;
+    let childModelRound = 0;
+
+    local.model = async (request, start) => {
+      const wire = JSON.stringify(start.contents);
+      if (request.conversationId !== parent.conversationId) {
+        childConversationId = request.conversationId;
+        childModelRound += 1;
+        if (childModelRound === 1) {
+          return toolCallAnswer('ask_user', {
+            question: 'Spawn phase: pick serialization format',
+            options: [{ label: 'JSON' }, { label: 'CBOR' }],
+            multiple: false
+          }, 'fg-spawn-ask-1');
+        }
+        if (childModelRound === 2) {
+          assert.match(wire, /CBOR/);
+          return textAnswer('Spawn completed with CBOR.');
+        }
+        if (childModelRound === 3) {
+          return toolCallAnswer('ask_user', {
+            question: 'Send phase: enable compression?',
+            options: [{ label: 'Yes' }, { label: 'No' }],
+            multiple: false
+          }, 'fg-send-ask-1');
+        }
+        assert.match(wire, /Yes/);
+        return textAnswer('Continuation completed with compression enabled.');
+      }
+      return textAnswer('parent ok');
+    };
+
+    const [parentAuthoritySnap] = await local.rows('AuthoritySnapshot', { turn_id: parent.turnId });
+    const parentAuthorityMeta = await local.get('ContentObject', parentAuthoritySnap.content_object_id);
+    const parentAuthorityDoc = JSON.parse((await local.app.contentStore.read(parentAuthorityMeta)).toString('utf8'));
+
+    // 1. Spawn with foregroundWaitMs=30_000 -> child calls ask_user -> settles well under 5s!
+    const spawnToolCallId = await local.toolCall(parent.turnId, 'run_agent', {
+      operation: 'spawn',
+      taskName: 'fg-worker',
+      prompt: 'Choose format and implement',
+      foregroundWaitMs: 30_000
+    });
+    const spawnStartedAt = Date.now();
+    await local.coordinator.dispatch(
+      {
+        turnId: parent.turnId,
+        modelRequestId: local.id('fg-spawn-req'),
+        toolCallId: spawnToolCallId,
+        toolName: 'run_agent',
+        arguments: {
+          operation: 'spawn',
+          taskName: 'fg-worker',
+          prompt: 'Choose format and implement',
+          foregroundWaitMs: 30_000
+        }
+      },
+      undefined,
+      { document: parentAuthorityDoc }
+    );
+    const spawnElapsedMs = Date.now() - spawnStartedAt;
+    assert.ok(spawnElapsedMs < 5_000, `spawn foreground wait deadlocked (${spawnElapsedMs}ms)`);
+
+    const spawnDetail = await local.readToolDetail(spawnToolCallId);
+    assert.equal(spawnDetail.status, 'awaiting_parent_answer');
+    assert.equal(spawnDetail.childContinuesInBackground, true);
+    assert.ok(spawnDetail.answerBridgeId);
+    assert.equal(spawnDetail.pendingQuestion.question, 'Spawn phase: pick serialization format');
+    assert.equal(spawnDetail.pendingQuestion.options[1].label, 'CBOR');
+    assert.match(spawnDetail.guidance, /answer_question/);
+
+    // Verify durable settlement invariants on parent ToolCall/ToolExecution/ToolOutcome/ToolModelResult.
+    assert.equal((await local.get('ToolCall', spawnToolCallId)).status, 'terminal');
+    assert.equal((await local.rows('ToolOutcome', { tool_call_id: spawnToolCallId })).length, 1);
+    assert.equal((await local.rows('ToolModelResult', { tool_call_id: spawnToolCallId })).length, 1);
+
+    // Parent answers the spawn-phase question -> child resumes and completes!
+    const spawnAnswered = await local.dispatchRunAgent(parent.turnId, {
+      operation: 'answer_question',
+      answerBridgeId: spawnDetail.answerBridgeId,
+      questionId: spawnDetail.pendingQuestion.questionId,
+      selectedOptionIndexes: [1]
+    });
+    assert.equal(spawnAnswered.detail.status, 'answered');
+    await local.coordinator.waitForIdle();
+    const afterSpawnAnswer = await local.app.runtime.answers.readCurrent(spawnDetail.answerBridgeId);
+    assert.equal(afterSpawnAnswer.status, 'submitted');
+    assert.match(afterSpawnAnswer.content, /Spawn completed with CBOR/);
+
+    // 2. Continuation send with foregroundWaitMs=30_000 -> child calls ask_user -> settles immediately!
+    const sendToolCallId = await local.toolCall(parent.turnId, 'run_agent', {
+      operation: 'send',
+      answerBridgeId: spawnDetail.answerBridgeId,
+      prompt: 'Now add transport layer',
+      foregroundWaitMs: 30_000
+    });
+    const sendStartedAt = Date.now();
+    await local.coordinator.dispatch({
+      turnId: parent.turnId,
+      modelRequestId: local.id('fg-send-req'),
+      toolCallId: sendToolCallId,
+      toolName: 'run_agent',
+      arguments: {
+        operation: 'send',
+        answerBridgeId: spawnDetail.answerBridgeId,
+        prompt: 'Now add transport layer',
+        foregroundWaitMs: 30_000
+      }
+    });
+    const sendElapsedMs = Date.now() - sendStartedAt;
+    assert.ok(sendElapsedMs < 5_000, `send foreground wait deadlocked (${sendElapsedMs}ms)`);
+
+    const sendDetail = await local.readToolDetail(sendToolCallId);
+    assert.equal(sendDetail.status, 'awaiting_parent_answer');
+    assert.equal(sendDetail.childContinuesInBackground, true);
+    assert.equal(sendDetail.answerBridgeId, spawnDetail.answerBridgeId);
+    assert.equal(sendDetail.pendingQuestion.question, 'Send phase: enable compression?');
+
+    // Parent answers continuation question -> child resumes and completes!
+    const sendAnswered = await local.dispatchRunAgent(parent.turnId, {
+      operation: 'answer_question',
+      answerBridgeId: spawnDetail.answerBridgeId,
+      questionId: sendDetail.pendingQuestion.questionId,
+      selectedOptionIndexes: [0]
+    });
+    assert.equal(sendAnswered.detail.status, 'answered');
+    await local.coordinator.waitForIdle();
+    const afterSendAnswer = await local.app.runtime.answers.readCurrent(spawnDetail.answerBridgeId);
+    assert.equal(afterSendAnswer.status, 'submitted');
+    assert.match(afterSendAnswer.content, /Continuation completed with compression enabled/);
+    assert.ok(childConversationId);
+  } finally {
+    await local.close();
+  }
+});
+
+test('transient notifyChildQuestion failure retries automatically via poll loop and recoverStartup delivers already-parked questions', { timeout: 15000 }, async () => {
+  const local = await openAskUserFixture();
+  try {
+    const parent = await local.parentTurn('transient-notify-retry');
+    const child = await local.spawn(parent, 'retry-worker');
+    await local.endTurn(parent.turnId);
+
+    const parentSawQuestion = gate();
+    const childFinished = gate();
+    let childRound = 0;
+    let parentRound = 0;
+
+    local.model = async (request, start) => {
+      const wire = JSON.stringify(start.contents);
+      if (request.conversationId === child.childConversationId) {
+        childRound += 1;
+        if (childRound === 1) {
+          return toolCallAnswer('ask_user', {
+            question: 'Retry delivery question: pick port?',
+            options: [{ label: '8080' }, { label: '9090' }],
+            multiple: false
+          }, 'retry-ask-1');
+        }
+        childFinished.resolve(wire);
+        return textAnswer('Using port 9090.');
+      }
+      if (request.conversationId === parent.conversationId) {
+        parentRound += 1;
+        if (parentRound === 1) {
+          parentSawQuestion.resolve(wire);
+          const childRefMatch = wire.match(/childRef=(A\d+)/);
+          const questionIdMatch = wire.match(/questionId:\s*([^\s\\"]+)/);
+          assert.ok(childRefMatch && questionIdMatch);
+          return toolCallAnswer('run_agent', {
+            operation: 'answer_question',
+            childRef: childRefMatch[1],
+            questionId: questionIdMatch[1],
+            selectedOptionIndexes: [1]
+          }, 'retry-parent-answer-1');
+        }
+        return textAnswer('Replied after retry.');
+      }
+      return textAnswer('ok');
+    };
+
+    // Inject a one-time transient error on collaboration.notifyChildQuestion.
+    const originalNotify = local.app.runtime.collaboration.notifyChildQuestion.bind(local.app.runtime.collaboration);
+    let notifyAttempts = 0;
+    local.app.runtime.collaboration.notifyChildQuestion = async (input) => {
+      notifyAttempts += 1;
+      if (notifyAttempts === 1) {
+        throw new Error('Injected transient SQLITE_BUSY during notifyChildQuestion');
+      }
+      return originalNotify(input);
+    };
+
+    local.activateRunner();
+    await local.app.processDeliveries.start();
+
+    assert.equal(local.coordinator.launch(child.childExecutionId, child.childTurnId), true);
+    await local.coordinator.activeTurns.get(child.childTurnId);
+
+    // First attempt failed transiently -> no message yet, child is parked with retry scheduled.
+    assert.equal(notifyAttempts, 1);
+    assert.equal((await local.rows('CollaborationMessageSourceLink', { source_kind: 'child_question' })).length, 0);
+
+    // Without any manual intervention or Host restart, the poll loop retries and wakes the parent!
+    await local.until(() => parentSawQuestion.settled, 'poll loop did not retry failed notifyChildQuestion', 8_000);
+    assert.ok(notifyAttempts >= 2);
+    await local.until(() => childFinished.settled, 'child did not resume after retried notification');
+
+    await local.coordinator.waitForIdle();
+    await local.runner.waitForIdle();
+    const answer = await local.app.runtime.answers.readCurrent(child.answerBridgeId);
+    assert.equal(answer.status, 'submitted');
+    assert.match(answer.content, /Using port 9090/);
+
+    // Part B: recoverStartup delivers a child ask_user that was already parked before Host restart.
+    const recoveryParent = await local.parentTurn('recovery-parked-question-parent');
+    const recoveryChild = await local.spawn(recoveryParent, 'recovery-parked-worker');
+    local.model = async request => {
+      if (request.conversationId === recoveryChild.childConversationId) {
+        return toolCallAnswer('ask_user', {
+          question: 'Already parked before startup recovery',
+          options: [{ label: 'Continue' }],
+          multiple: false
+        }, 'recovery-parked-ask-1');
+      }
+      return textAnswer('ok');
+    };
+    // Simulate a Host crash/failure right before notifyChildQuestion could commit.
+    local.app.runtime.collaboration.notifyChildQuestion = async () => {
+      throw new Error('Host died before notifying parent');
+    };
+    assert.equal(local.coordinator.launch(recoveryChild.childExecutionId, recoveryChild.childTurnId), true);
+    await local.coordinator.activeTurns.get(recoveryChild.childTurnId);
+    const [parkedReq] = await local.rows('InteractionRequest', { request_kind: 'ask_user', status: 'pending' });
+    assert.ok(parkedReq);
+    assert.equal(
+      (await local.rows('CollaborationMessageSourceLink', { source_kind: 'child_question', source_key: parkedReq.id })).length,
+      0
+    );
+    // Clear in-memory waitingOwned (simulating fresh startup) and restore notifyChildQuestion.
+    local.coordinator.waitingOwned.clear();
+    local.app.runtime.collaboration.notifyChildQuestion = originalNotify;
+
+    await local.coordinator.recoverStartup();
+    await local.coordinator.waitForIdle();
+    assert.equal(
+      (await local.rows('CollaborationMessageSourceLink', { source_kind: 'child_question', source_key: parkedReq.id })).length,
+      1,
+      'recoverStartup must deliver pending ask_user for already-parked child task Turns'
+    );
+  } finally {
+    await local.close();
+  }
+});
+
+test('direct human chat Turn in child tab preserves interactionAttention toast and does NOT notify parent', { timeout: 12000 }, async () => {
+  const local = await openAskUserFixture();
+  try {
+    const parent = await local.parentTurn('human-chat-in-child-tab-parent');
+    const child = await local.spawn(parent, 'child-tab-worker');
+
+    // Finish the parent-dispatched spawn Turn so the child conversation is idle.
+    await local.endTurn(child.childTurnId, 'completed');
+    await local.app.runtime.children.observeTurnTerminal(child.childExecutionId, child.childTurnId);
+    await local.app.database.conversationOwners.claim(child.childConversationId);
+
+    // Human user directly sends a message in the child conversation tab.
+    local.model = async request => {
+      if (request.conversationId === child.childConversationId) {
+        return toolCallAnswer('ask_user', {
+          question: 'Direct human chat question in child tab',
+          options: [{ label: 'Option 1' }, { label: 'Option 2' }],
+          multiple: false
+        }, 'human-child-tab-ask-1');
+      }
+      return textAnswer('done');
+    };
+    const humanTurn = await local.coordinator.inputFromConversation({
+      commandId: local.id('human-child-input'),
+      childExecutionId: child.childExecutionId,
+      conversationId: child.childConversationId,
+      content: 'Hey child, quick question from the human user'
+    });
+    assert.ok(humanTurn.admitted && humanTurn.turnId);
+    await local.coordinator.activeTurns.get(humanTurn.turnId);
+
+    const [humanAskReq] = await local.rows('InteractionRequest', { request_kind: 'ask_user', status: 'pending' });
+    assert.ok(humanAskReq, 'expected pending ask_user from human-initiated child tab turn');
+    assert.equal(await local.app.runtime.answers.isChildTaskTurn(humanTurn.turnId), false);
+
+    // 1. Must NOT notify or wake parent Agent!
+    assert.equal((await local.rows('CollaborationMessageSourceLink', { source_kind: 'child_question' })).length, 0);
+    assert.equal((await local.rows('RuntimeDelivery', { target_conversation_id: parent.conversationId })).length, 0);
+
+    // 2. Must STILL produce an interactionAttention toast (both with and without contentStore)!
+    const withStore = await readPendingInteractionAttention(
+      local.app.database,
+      local.app.database.hostBootId,
+      local.app.contentStore
+    );
+    const withoutStore = await readPendingInteractionAttention(
+      local.app.database,
+      local.app.database.hostBootId
+    );
+    assert.equal(withStore.some(item => item.requestId === humanAskReq.id), true, 'human-authored child-tab ask_user must keep VS Code toast (with contentStore)');
+    assert.equal(withoutStore.some(item => item.requestId === humanAskReq.id), true, 'human-authored child-tab ask_user must keep VS Code toast (without contentStore)');
+  } finally {
+    await local.close();
+  }
+});
+
+test('authority guard rejects already-terminal parent run_agent ToolCall in resolveAskUser', { timeout: 10000 }, async () => {
+  const local = await openAskUserFixture();
+  try {
+    const parent = await local.parentTurn('terminal-parent-tool-guard');
+    const child = await local.spawn(parent, 'guarded-child');
+    const askCallId = await local.toolCall(child.childTurnId, 'ask_user', {
+      question: 'Need live parent run_agent call',
+      options: [{ label: 'Yes' }],
+      multiple: false
+    });
+    const paused = await local.app.interactions.pauseForAskUser({
+      source: { kind: 'internal', key: `pause:${askCallId}` },
+      toolCallId: askCallId,
+      prompt: {
+        question: 'Need live parent run_agent call',
+        options: [{ label: 'Yes' }],
+        multiple: false
+      }
+    });
+
+    // Execute a benign run_agent(list) so we obtain a genuine, already-terminal run_agent ToolCall in parentTurn.
+    const listed = await local.dispatchRunAgent(parent.turnId, { operation: 'list' });
+    assert.equal((await local.get('ToolCall', listed.toolCallId)).status, 'terminal');
+
+    await assert.rejects(
+      local.app.interactions.resolveAskUser({
+        source: { kind: 'internal', key: `replay-terminal:${listed.toolCallId}` },
+        requestId: paused.requestId,
+        response: { answer: { selectedOptionIndexes: [0] } },
+        parentAgent: {
+          parentConversationId: parent.conversationId,
+          parentTurnId: parent.turnId,
+          parentToolCallId: listed.toolCallId,
+          childExecutionId: child.childExecutionId
+        }
+      }),
+      /运行中 run_agent 调用/
+    );
   } finally {
     await local.close();
   }

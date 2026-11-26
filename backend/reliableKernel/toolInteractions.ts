@@ -1361,8 +1361,12 @@ export class ToolInteractionControlPlane {
     if (parentTurn.status !== 'active' || parentTurn.conversation_id !== parentConversationId) {
       throw new Error('父 Agent 回复子任务提问需要处于活动状态的直接父对话 Turn。');
     }
-    if (parentToolCall.turn_id !== parentTurnId || parentToolCall.tool_name !== 'run_agent') {
-      throw new Error('父 Agent 回复子任务提问必须来自当前活动 Turn 的 run_agent 调用。');
+    if (
+      parentToolCall.turn_id !== parentTurnId
+      || parentToolCall.tool_name !== 'run_agent'
+      || parentToolCall.status === 'terminal'
+    ) {
+      throw new Error('父 Agent 回复子任务提问必须来自当前活动 Turn 的运行中 run_agent 调用。');
     }
     if (childTurnLinks.length !== 1 || childTurnLinks[0].child_execution_id !== childExecutionId) {
       throw new Error('该 ask_user 请求不属于指定的子 Agent 执行谱系。');
