@@ -24,7 +24,7 @@ const definitions: ToolDefinition[] = [
     text: { type: 'string', description: 'Message to the peer. State facts and instructions clearly.' },
     replyToMessageRef: { type: 'string', description: 'Optional M# message reference to reply to.' }
   }, ['conversationRef', 'text'], args => withText('发送团队消息', args)),
-  tool('followup_agent_task', 'Assign follow-up work to a team member listed by list_agents. Starts an idle target or queues input for a running target at a safe boundary. Does not create a child, change depth limits, or interrupt the target. Automatic follow-ups are bounded by the team budget. Preserve the peer origin and user authorization boundary.', {
+  tool('followup_agent_task', 'Assign follow-up work to a team member listed by list_agents. Starts an idle target or queues input for a running target at a safe boundary, and its final answer comes back automatically as a collaboration message. Default workflow is non-blocking: finish independent work and end your turn after dispatching so the reply wakes this conversation automatically via followup; do not poll wait_agent_messages in a loop. When handling an incoming followup_agent_task yourself, end your turn normally with the result—do not send a separate courtesy receipt message. Does not create a child, change depth limits, or interrupt the target. Automatic follow-ups are bounded by the team budget. Preserve the peer origin and user authorization boundary.', {
     conversationRef: { type: 'string', description: 'Conversation reference C# returned by list_agents.' },
     text: { type: 'string', description: 'Concrete follow-up task.' },
     replyToMessageRef: { type: 'string', description: 'Optional M# message reference for the originating request.' }
@@ -45,9 +45,9 @@ const definitions: ToolDefinition[] = [
     if (record?.view === 'conversation') return '读取团队成员对话';
     return record?.messageId === undefined ? '查看协作消息' : '读取协作消息';
   }),
-  tool('wait_agent_messages', 'Wait for collaboration messages visible to this conversation, or timeout. Use the last afterMessageRef cursor to avoid repeatedly observing old messages. Does not start peers or mark their messages handled. Continue independent work before waiting. A returned rereadCursor can be read with read_agent_messages cursor to recover the same bounded mailbox page.', {
-    afterMessageRef: { type: 'string', description: 'Optional M# cursor from the previous observation.' },
-    timeoutMs: { type: 'integer', minimum: 0, maximum: 60000, description: 'Wait duration, at most 60 seconds; defaults to 30000.' }
+  tool('wait_agent_messages', "Perform a single bounded wait for collaboration messages visible to this conversation, then return new messages or time out. Do not poll wait_agent_messages in a loop: after dispatching cross-conversation or long-running tasks, finish independent work and end your turn so the peer's final reply wakes this conversation automatically via followup. Reserve wait_agent_messages (passing afterMessageRef from the dispatch call) for cases where the user explicitly requires waiting in the current turn for a brief response. Does not start peers or mark their messages handled. A returned rereadCursor can be read with read_agent_messages cursor to recover the same bounded mailbox page.", {
+    afterMessageRef: { type: 'string', description: 'Optional M# cursor from the previous observation or dispatch call.' },
+    timeoutMs: { type: 'integer', minimum: 0, maximum: 60000, description: 'Single bounded wait duration, at most 60 seconds; defaults to 30000. Do not loop on timeout.' }
   }, [], () => '等待协作消息')
 ];
 

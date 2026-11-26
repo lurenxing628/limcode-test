@@ -6,9 +6,13 @@ export function terminationNotice(
   runHadCompletedTools: boolean | undefined
 ): string {
   if (isManualStop(termination)) {
+    const customDetail = termination?.detail?.trim().replace(/[。.!！?？]+$/, '');
+    const prefix = customDetail && customDetail !== '手动暂停'
+      ? `本次回复已停止（${customDetail}）。`
+      : '本次回复已手动暂停。';
     return runHadCompletedTools
-      ? '本次回复已手动暂停。已执行的工具结果已保留，未完成的正文不会进入后续 LLM 上下文。'
-      : '本次回复已手动暂停。未完成的正文不会进入后续 LLM 上下文。';
+      ? `${prefix}已执行的工具结果已保留，未完成的正文不会进入后续 LLM 上下文。`
+      : `${prefix}未完成的正文不会进入后续 LLM 上下文。`;
   }
   const detail = termination?.detail?.trim().replace(/[。.!！?？]+$/, '');
   if (termination?.reasonCode === 'empty_model_result') {

@@ -30,6 +30,8 @@ export interface CollaborationTimelineCard {
   /** Settled for a proven accepted event; otherwise the newest loaded delivery attempt. */
   status: 'waiting' | 'failed' | 'settled' | 'unknown';
   readBy?: 'current-turn' | 'next-turn';
+  /** A waiting incoming plain message that never opens a Turn on its own (cross-conversation note or board notice). */
+  silentNote?: boolean;
   /** A child result delivered for display only, without creating a reply Turn. */
   notificationOnly?: boolean;
   /** Independent provenance records distinguish target-preserving historical import order. */
@@ -118,6 +120,12 @@ export function projectCollaborationTimeline(input: {
   // A redelivery is another attempt, not a revocation of the already accepted logical envelope.
   // Keep the accepted attempt and its own proof together; never attach its link to the retry.
   for (const [key, delivery] of acceptedDeliveries) deliveries.set(key, delivery);
+  const childConversationIds = new Set(
+    Object.values(input.records.ChildExecution ?? {})
+      .map((execution) => text(execution.child_conversation_id))
+      .filter(Boolean)
+  );
+  const selfIsChild = childConversationIds.has(input.conversationId);
   const messages = Object.values(input.records.CollaborationMessage ?? {})
     .filter((message) => typeof message.id === 'string')
     .sort((left, right) => compareSequence(left.message_seq, right.message_seq) || text(left.id).localeCompare(text(right.id)));
@@ -144,6 +152,11 @@ export function projectCollaborationTimeline(input: {
           : delivery.state === 'consumed' ? 'settled' : 'unknown',
       placement: 'unbound'
     };
+    if (incoming && card.status === 'waiting' && card.kind === 'message'
+      && (source.source_kind === 'board'
+        || (source.source_kind === 'tool' && !selfIsChild && card.peerRelation !== 'child' && !childConversationIds.has(peerConversationId)))) {
+      card.silentNote = true;
+    }
     if (!incoming && card.status === 'waiting' && card.kind !== 'followup') {
       card.readBy = text(delivery?.target_turn_id) ? 'current-turn' : 'next-turn';
     }
@@ -280,6 +293,7 @@ export function projectCollaborationTimeline(input: {
 export function collaborationCardPlacementLabel(card: CollaborationTimelineCard): string {
   if (card.placement === 'ordered') return card.imported ? '按导入顺序排列' : '';
   if (card.notificationOnly && card.placement === 'unbound') return '结果通知';
+  if (card.direction === 'incoming' && card.status === 'waiting' && card.placement === 'unbound') return '';
   if (card.placement === 'turn') return '按回合归组，具体顺序待确认';
   if (card.placement === 'turn-started') return '所属回合没有已加载的消息，按回合开始顺序排列';
   if (card.placement === 'earlier-turn') return '所属回合早于已加载的消息，位置待确认';
@@ -299,7 +313,10 @@ export function collaborationCardStatusLabel(card: CollaborationTimelineCard): s
   if (card.status === 'unknown') return '投递状态待确认';
   if (card.status === 'settled') return '';
   if (card.notificationOnly) return '通知待送达';
-  if (card.direction === 'incoming') return card.placement === 'unbound' ? '等待下一轮处理' : '已送达，等待本轮处理';
+  if (card.direction === 'incoming') {
+    if (card.placement !== 'unbound') return '已送达，等待本轮处理';
+    return card.silentNote ? '待下一轮读取（静默留条）' : '等待下一轮处理';
+  }
   if (card.readBy === 'current-turn') return '已送达，对方本轮读取';
   if (card.readBy === 'next-turn') return '已送达，对方下一轮读取';
   return '等待对方处理';

@@ -1691,11 +1691,18 @@ export function projectReliableTurnTermination(
 const MANUAL_STOP_DETAIL = '手动暂停';
 
 /**
- * 停止按钮（以及删除、编辑前的自动停止）写下的原因。旧版本只记录了执行器观察到的英文阶段说明，
- * 那时几乎都来自手动停止，一并按手动暂停显示。
+ * 停止按钮（含顶层对话停止、父对话级联停止子任务、侧栏停止子任务、卡片取消子任务）写下的原因，
+ * 以及旧版本只记录了执行器阶段名的 interrupt_request，一并按手动暂停显示。
  */
+const MANUAL_STOP_REASON_PREFIXES = [
+  '用户请求中断',
+  '用户从侧栏请求',
+  '用户取消此子 Agent 执行',
+  'Executor observed interrupt_request'
+] as const;
+
 function isManualStopReason(reason: string): boolean {
-  return reason.startsWith('用户请求中断当前 Turn') || reason.startsWith('Executor observed interrupt_request');
+  return MANUAL_STOP_REASON_PREFIXES.some((prefix) => reason.startsWith(prefix));
 }
 
 function projectTurnTerminations(
