@@ -31,7 +31,7 @@ function installProviderSchemaEncoder<T>(
 ): T {
   const geminiOpenAICompatible = providerKind === 'openai-compatible' && isGeminiOpenAICompatibleModelName(modelId);
   if (providerKind !== 'gemini' && providerKind !== 'openai-responses' && providerKind !== 'claude' && !geminiOpenAICompatible) return provider;
-  const fillsCurrentTurnSignatures = providerKind === 'gemini' && geminiModelMayValidateSignatures(modelId);
+  const fillsStepSignatures = providerKind === 'gemini' && geminiModelMayValidateSignatures(modelId);
   const runtimeProvider = provider as T & {
     format?: {
       encodeRequest?: (request: unknown, stream: boolean) => unknown;
@@ -51,7 +51,7 @@ function installProviderSchemaEncoder<T>(
     const encoded = originalEncodeRequest(normalizedRequest, stream);
     if (providerKind === 'gemini' || geminiOpenAICompatible) {
       restoreGeminiToolSchemas(encoded, normalizedRequest);
-      if (providerKind === 'gemini' && fillsCurrentTurnSignatures) fillGeminiCurrentTurnSignatures(encoded);
+      if (providerKind === 'gemini' && fillsStepSignatures) fillGeminiStepSignatures(encoded);
     } else if (providerKind === 'claude') {
       restoreClaudeCompactionBlocks(encoded, claudeProjection.blocks);
       restoreClaudeToolResultPairing(encoded);
@@ -630,38 +630,22 @@ function emptyGeminiOpenAIToolCallSignatures(): GeminiOpenAIToolCallSignatures {
 }
 
 /**
- * Native Gemini validates signatures only in the current turn: everything after the newest user
- * content that carries ordinary content (text, media) rather than a functionResponse. In that turn
- * "the first functionCall part in each step ... must include its thought_signature", otherwise 400
- * (https://ai.google.dev/gemini-api/docs/thought-signatures). Calls produced by another model, or
- * retried on Gemini after another model failed, have no Gemini signature; the documented dummy
- * goes on the first call of each such model content. Existing signatures are never touched.
- *
- * A user content that mixes function responses with text is not treated as a turn boundary, so the
- * turn can only be over-estimated; a dummy in an unvalidated earlier turn is harmless.
+ * Native Gemini requires "the first functionCall part in each step" to carry its thought_signature,
+ * otherwise 400 (https://ai.google.dev/gemini-api/docs/thought-signatures). The documentation says
+ * only the current turn is checked, but Gemini 4 checks every step of the history: a conversation
+ * whose earlier tool calls came from another channel or model (signature removed, never had one)
+ * is rejected as soon as the current turn calls a tool. The documented dummy therefore goes on the
+ * first unsigned call of every model content. It depends only on the content itself, so the prefix
+ * stays byte-stable across requests. Existing signatures are never touched.
  */
-function fillGeminiCurrentTurnSignatures(encodedRequest: unknown): void {
+function fillGeminiStepSignatures(encodedRequest: unknown): void {
   if (!isRecord(encodedRequest) || !Array.isArray(encodedRequest.contents)) return;
-  const contents = encodedRequest.contents;
-  let turnStart = 0;
-  for (let index = contents.length - 1; index >= 0; index -= 1) {
-    if (isGeminiTurnStartingUserContent(contents[index])) {
-      turnStart = index + 1;
-      break;
-    }
-  }
-  for (const content of contents.slice(turnStart)) {
+  for (const content of encodedRequest.contents) {
     if (!isRecord(content) || content.role !== 'model' || !Array.isArray(content.parts)) continue;
     const firstCall = content.parts.find((part) => isRecord(part) && isRecord(part.functionCall));
     if (!isRecord(firstCall) || normalizedSignatureString(firstCall.thoughtSignature)) continue;
     firstCall.thoughtSignature = GEMINI_THOUGHT_SIGNATURE_SKIP_VALIDATOR;
   }
-}
-
-function isGeminiTurnStartingUserContent(content: unknown): boolean {
-  if (!isRecord(content) || content.role !== 'user' || !Array.isArray(content.parts)) return false;
-  const parts = content.parts.filter(isRecord);
-  return parts.length > 0 && !parts.some((part) => isRecord(part.functionResponse));
 }
 
 function normalizeGeminiThinkingRequest(request: unknown, modelId: string): unknown {

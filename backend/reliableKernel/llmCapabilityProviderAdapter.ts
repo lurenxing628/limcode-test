@@ -811,9 +811,9 @@ function isolateCrossSourceProviderState(
  * produced it; replaying it to another one answers HTTP 400 "Corrupted thought signature"
  * (https://ai.google.dev/gemini-api/docs/thought-signatures). The portable value keeps the vendor
  * only — `gemini:` — while one channel's history is replayed to the next, so the signature of a
- * reply from another channel or model of this conversation is not sent at all. Google validates
- * signatures only inside the current turn; an unsigned call there gets the documented dummy
- * (fillGeminiCurrentTurnSignatures), and older turns are not checked. A reply of unknown source
+ * reply from another channel or model of this conversation is not sent at all. Every unsigned
+ * tool step then gets the documented dummy (fillGeminiStepSignatures): Gemini 4 validates the
+ * whole history, not only the current turn. A reply of unknown source
  * keeps its signature: foreignness is not proven.
  */
 function isolateCrossChannelGeminiThoughtSignatures(
