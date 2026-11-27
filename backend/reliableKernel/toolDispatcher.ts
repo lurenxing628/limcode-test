@@ -54,6 +54,14 @@ import {
   runAgentToolAvailableAtDepth
 } from '../world/modules/tools/definitions/runAgent';
 import { validateReadFileToolArguments } from '../world/modules/tools/definitions/readFile';
+import {
+  ANTIGRAVITY_TOOL_NAME,
+  antigravityDefaultModel,
+  antigravityExecutionTimeoutMs,
+  resolveAgyExecutable,
+  validateAntigravityToolArguments
+} from '../world/modules/tools/definitions/antigravity';
+import { antigravityProcessCommand } from './antigravityProcess';
 import { isSkillEnabledByPolicy } from '../world/modules/skill/policy';
 import { composeSkillsToolDescription } from '../world/modules/skill/skillDescription';
 import {
@@ -203,6 +211,10 @@ export interface ReliableToolDispatcherDependencies {
 
 const FILE_TOOLS = new Set(['write', 'edit', 'delete']);
 const PROCESS_TOOLS = new Set(['bash', 'shell']);
+/** Tools whose start/read runs through ProcessEffects and therefore shares the process/MCP lane. */
+const PROCESS_LANE_TOOLS = new Set([...PROCESS_TOOLS, ANTIGRAVITY_TOOL_NAME]);
+/** antigravity hands its result over through the background process; it only waits for quick failures. */
+const ANTIGRAVITY_FOREGROUND_WAIT_MS = 3_000;
 const SPECIAL_TOOLS = new Set([
   RUN_AGENT_TOOL_NAME,
   'read_agent_answer',
@@ -281,7 +293,7 @@ function nativeSchedulingLaneKind(
     && ['spawn', 'send'].includes(optionalText(plainOptionalRecord(input.arguments)?.operation) ?? '')
   ) return 'child';
   if (
-    PROCESS_TOOLS.has(input.toolName)
+    PROCESS_LANE_TOOLS.has(input.toolName)
     || definitionsByName.get(input.toolName)?.declaration.source?.kind === 'mcp'
   ) return 'processOrMcp';
   if (isAttachmentReadInput(input)) return 'attachment';
@@ -1249,12 +1261,12 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     const childInputs = indexed.filter(({ input }) => requiresChildAdmission(input));
     const processOrMcpInputs = indexed.filter(({ input }) =>
       !requiresChildAdmission(input) && (
-        PROCESS_TOOLS.has(input.toolName)
+        PROCESS_LANE_TOOLS.has(input.toolName)
         || definitionsByName.get(input.toolName)?.declaration.source?.kind === 'mcp'
       ));
     const ordinaryInputs = indexed.filter(({ input }) =>
       !requiresChildAdmission(input)
-      && !PROCESS_TOOLS.has(input.toolName)
+      && !PROCESS_LANE_TOOLS.has(input.toolName)
       && definitionsByName.get(input.toolName)?.declaration.source?.kind !== 'mcp');
     const attachmentInputs = ordinaryInputs.filter(({ input }) => isAttachmentReadInput(input));
     // Attachment reads settle inside their own two-slot lane as soon as each file is materialized.
@@ -1572,6 +1584,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     }
     if (PROCESS_TOOLS.has(input.toolName)) {
       return this.captureAbortableExecution(input, (signal) => this.dispatchProcess(input, authority, signal, existingOperation));
+    }
+    if (input.toolName === ANTIGRAVITY_TOOL_NAME) {
+      return this.captureAbortableExecution(input, (signal) => this.dispatchAntigravity(input, authority, signal, existingOperation));
     }
     if (input.toolName === TRANSFER_TOOL_NAME) {
       return this.captureHostEvents(input, (emit, signal) =>
@@ -1934,6 +1949,67 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       return this.reject(input, `${input.toolName} 没有工作目录 resolver。`);
     }
     const cwd = await this.dependencies.host.resolveProcessCwd({ ...input, arguments: args }, authority);
+    return this.startProcess(input, signal, {
+      command,
+      cwd,
+      executionTimeoutMs,
+      maxOutputBytes,
+      foregroundWaitMs: effectiveProcessForegroundWaitMs(command, foregroundWaitMs, executionTimeoutMs)
+    });
+  }
+
+  /**
+   * antigravity is a background process whose command the backend builds: start/send run the shipped
+   * runner around agy, read/stop are the ordinary process observation and stop paths.
+   */
+  private async dispatchAntigravity(
+    input: ReliableAgentToolDispatchInput,
+    authority: ReliableToolDispatchAuthority,
+    signal: AbortSignal,
+    existingOperation?: DomainRow
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    // A prepared start/stop resumes from its durable intent exactly like a command's.
+    if (existingOperation || signal.aborted) return this.dispatchProcess(input, authority, signal, existingOperation);
+    const args = validateAntigravityToolArguments(input.arguments);
+    if (args.operation === 'read') {
+      return this.readProcessOutput(input, {
+        processId: args.processId!,
+        ...(args.outputHandle ? { outputHandle: args.outputHandle } : {})
+      }, signal);
+    }
+    if (args.operation === 'stop') return this.stopProcess(input, { processId: args.processId! }, signal);
+    const config = authority.toolConfig?.config;
+    const agyPath = resolveAgyExecutable(config);
+    if (!agyPath) return this.reject(input, '找不到 agy 可执行文件：请安装 Antigravity CLI，或在 antigravity 工具设置里填写 agy 路径。');
+    if (!this.dependencies.host.resolveProcessCwd) {
+      return this.reject(input, `${input.toolName} 没有工作目录 resolver。`);
+    }
+    const cwd = await this.dependencies.host.resolveProcessCwd({
+      ...input,
+      arguments: args.cwd ? { cwd: args.cwd } : {}
+    }, authority);
+    const command = antigravityProcessCommand({
+      agyPath,
+      prompt: args.prompt!,
+      model: args.model ?? antigravityDefaultModel(config),
+      ...(args.agyConversationId ? { conversationId: args.agyConversationId } : {}),
+      cwd
+    });
+    return this.startProcess(input, signal, {
+      command,
+      cwd,
+      executionTimeoutMs: antigravityExecutionTimeoutMs(config),
+      maxOutputBytes: DEFAULT_PROCESS_MAX_OUTPUT_BYTES,
+      foregroundWaitMs: ANTIGRAVITY_FOREGROUND_WAIT_MS
+    });
+  }
+
+  private async startProcess(
+    input: ReliableAgentToolDispatchInput,
+    signal: AbortSignal,
+    launch: { command: string; cwd: string; executionTimeoutMs: number; maxOutputBytes: number; foregroundWaitMs: number }
+  ): Promise<ToolTerminalResult | ReliableAgentToolPause | ReliableAgentToolSettled> {
+    const { command, cwd, executionTimeoutMs, maxOutputBytes } = launch;
     if (signal.aborted) {
       const handoff = handoffReason(signal);
       if (handoff) throw handoff;
@@ -1949,7 +2025,7 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
     });
     const started = await this.dependencies.processes.dispatchStart(
       prepared.effect.effectIntentId,
-      effectiveProcessForegroundWaitMs(command, foregroundWaitMs, executionTimeoutMs),
+      launch.foregroundWaitMs,
       signal
     );
     const handoff = handoffReason(signal);
@@ -2173,6 +2249,9 @@ export class ReliableToolDispatcher implements ReliableAgentToolDispatcher {
       definitionAllowedByAuthority(toolPolicy, definition)
       && (workEnvironmentPolicy.enabled || !WORK_ENVIRONMENT_TOOLS.has(definition.declaration.name))
       && (!isCrossConversationTool(definition.declaration.name) || topLevel)
+      // Without an agy executable the tool could only fail, so the model does not see it.
+      && (definition.declaration.name !== ANTIGRAVITY_TOOL_NAME
+        || resolveAgyExecutable(toolPolicy.toolConfigs[ANTIGRAVITY_TOOL_NAME]?.config) !== undefined)
     ).map((definition): EffectiveToolDefinitionInput => ({
       definition,
       allowChildSpawn: definition.declaration.name !== RUN_AGENT_TOOL_NAME || allowChildSpawn,

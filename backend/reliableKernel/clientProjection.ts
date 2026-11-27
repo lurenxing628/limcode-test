@@ -466,6 +466,7 @@ function childToolAction(toolName: string): string {
   switch (toolName) {
     case 'bash':
     case 'shell': return '运行命令';
+    case 'antigravity': return '调用 Antigravity';
     case 'read':
     case 'read_file': return '读取文件';
     case 'edit': return '编辑文件';
@@ -503,6 +504,9 @@ function childToolArgumentPreview(
     const toolName = String(tool.tool_name);
     if ((toolName === 'bash' || toolName === 'shell') && typeof args.command === 'string') {
       return compactChildActivitySummary(args.command);
+    }
+    if (toolName === 'antigravity' && typeof args.prompt === 'string') {
+      return compactChildActivitySummary(typeof args.model === 'string' ? `${args.model} · ${args.prompt}` : args.prompt);
     }
     if (toolName === 'run_agent' && typeof args.prompt === 'string') {
       const skills = Array.isArray(args.skills)
@@ -565,11 +569,13 @@ export function projectProcessRecord(
         ? parsed as Record<string, unknown>
         : undefined;
       requestedBackground = argumentsRecord?.foregroundWaitMs === 0;
-      if (typeof argumentsRecord?.command === 'string' && argumentsRecord.command.length > 0) {
-        commandPreview = argumentsRecord.command.length <= 240
-          ? argumentsRecord.command
-          : `${argumentsRecord.command.slice(0, 239)}…`;
-      }
+      // antigravity builds its command in the backend; its panel line is the model and task instead.
+      const preview = typeof argumentsRecord?.command === 'string' && argumentsRecord.command.length > 0
+        ? argumentsRecord.command
+        : typeof argumentsRecord?.prompt === 'string' && argumentsRecord.prompt.trim()
+          ? `Antigravity · ${typeof argumentsRecord.model === 'string' && argumentsRecord.model.trim() ? argumentsRecord.model.trim() : '默认模型'} · ${argumentsRecord.prompt.replace(/\s+/g, ' ').trim()}`
+          : undefined;
+      if (preview) commandPreview = preview.length <= 240 ? preview : `${preview.slice(0, 239)}…`;
     } catch {
       argumentsProjectionState = 'error';
     }
