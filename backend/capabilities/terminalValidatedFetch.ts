@@ -1,7 +1,10 @@
 import type { LlmProviderKind } from '../../shared/protocol';
 import type { DebugHttpObservation } from '../reliableKernel/debugCapture/observer';
 
-const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
+// A thinking model may stay silent for minutes before its first byte, and a non-streaming body
+// only arrives once generation finished. Keep this aligned with the kernel semantic idle deadline
+// (600s) so the transport guard never preempts it.
+const DEFAULT_BODY_IDLE_TIMEOUT_MS = 600_000;
 
 export interface TerminalValidatedFetchOptions {
   bodyIdleTimeoutMs?: number;

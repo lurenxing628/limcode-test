@@ -13,7 +13,7 @@ import { URL } from 'url';
 import { EXTENSION_USER_AGENT } from '../../shared/extensionIdentity';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
-const DEFAULT_BODY_IDLE_TIMEOUT_MS = 60_000;
+const DEFAULT_BODY_IDLE_TIMEOUT_MS = 600_000;
 const DEFAULT_OVERALL_TIMEOUT_MS = 15 * 60 * 1_000;
 
 export interface ProxyFetchTimeoutOptions {
