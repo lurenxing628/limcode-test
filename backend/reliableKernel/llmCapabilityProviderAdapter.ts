@@ -2388,7 +2388,7 @@ function modelFacingToolsForHandleCatalog(
     const parameters = cloneSchemaRecord(tool.parameters);
     if (tool.name === READ_TOOL_NAME) {
       renameSchemaProperty(parameters, 'attachmentId', 'attachmentRef');
-    } else if (tool.name === 'bash' || tool.name === 'shell') {
+    } else if (tool.name === 'bash' || tool.name === 'shell' || tool.name === 'antigravity') {
       renameSchemaProperty(parameters, 'processId', 'processRef');
       renameSchemaProperty(parameters, 'outputHandle', 'cursor');
     } else if (tool.name === 'run_agent' || tool.name === 'read_agent_answer') {

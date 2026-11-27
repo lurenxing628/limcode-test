@@ -1,5 +1,6 @@
 import type { ToolDefinition } from '../registry';
 import { readAgentAnswerToolModule } from './agentAnswer';
+import { antigravityToolModule } from './antigravity';
 import { askUserToolModule } from './askUser';
 import { commandToolModule } from './command';
 import { deleteToolModule } from './delete';
@@ -24,6 +25,7 @@ export { askUserTool, askUserToolModule } from './askUser';
 export { submitPlanTool, submitPlanToolModule } from './submitPlan';
 export { readAgentAnswerTool, readAgentAnswerToolModule } from './agentAnswer';
 export { commandToolModule, createCommandTool } from './command';
+export { antigravityToolModule, antigravityTool, ANTIGRAVITY_TOOL_NAME } from './antigravity';
 export { deleteToolModule, deleteTool } from './delete';
 export { editToolModule, editTool } from './edit';
 export { readFileToolModule, readFileTool } from './readFile';
@@ -49,7 +51,8 @@ const BUILTIN_TOOL_MODULES: readonly ToolDefinitionModule[] = [
   runAgentToolModule,
   ...agentCollaborationToolModules,
   ...crossConversationToolModules,
-  commandToolModule
+  commandToolModule,
+  antigravityToolModule
 ];
 
 export function createBuiltinToolDefinitions(context: ToolDefinitionContext): ToolDefinition[] {

@@ -22,7 +22,8 @@ export const PROCESS_WRAPPER_CHUNKS_DIRECTORY = 'chunks';
 export const PROCESS_WRAPPER_PROTOCOL = 'limcode-process-wrapper';
 export const DEFAULT_PROCESS_EXECUTION_TIMEOUT_MS = 120_000;
 export const MIN_PROCESS_EXECUTION_TIMEOUT_MS = 1_000;
-export const MAX_PROCESS_EXECUTION_TIMEOUT_MS = 600_000;
+/** Commands stay capped at 10 minutes by their own arguments; antigravity runs may last up to 2 hours. */
+export const MAX_PROCESS_EXECUTION_TIMEOUT_MS = 7_200_000;
 export const DEFAULT_PROCESS_MAX_OUTPUT_BYTES = 256 * 1024 * 1024;
 export const MIN_PROCESS_MAX_OUTPUT_BYTES = 1024;
 export const MAX_PROCESS_MAX_OUTPUT_BYTES = 1024 * 1024 * 1024;

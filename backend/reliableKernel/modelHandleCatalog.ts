@@ -4,6 +4,7 @@ import { createModelHandleTextProjection } from './modelHandleTextProjection';
 import { commandToolMode } from '../../shared/commandToolArguments';
 import { isEmptyToolArgument, ToolArgumentError } from '../../shared/toolArgumentUtils';
 import { compactReadFileToolArguments } from '../world/modules/tools/definitions/readFile';
+import { ANTIGRAVITY_TOOL_NAME } from '../world/modules/tools/definitions/antigravity';
 import { selectCollaborationToolArguments } from './collaborationToolDispatcher';
 
 export type ModelHandleKind = 'attachment' | 'process' | 'cursor' | 'child' | 'workEnvironment'
@@ -835,7 +836,7 @@ export function projectKnownToolValue(
   const record = asRecord(projected);
   if (!record) return projected;
 
-  if (toolName === 'bash' || toolName === 'shell') {
+  if (toolName === 'bash' || toolName === 'shell' || toolName === ANTIGRAVITY_TOOL_NAME) {
     const hasMore = record.hasMore === true;
     const running = record.status === 'running' || record.status === 'background_started'
       || record.complete === false;
@@ -879,6 +880,10 @@ export function resolveModelToolArguments(
     }
   } else if (toolName === 'bash' || toolName === 'shell') {
     resolveCommandArguments(toolName, record, catalog);
+  } else if (toolName === ANTIGRAVITY_TOOL_NAME) {
+    const operation = typeof record.operation === 'string' ? record.operation.trim() : '';
+    if (operation === 'read' || operation === 'stop') replaceRef(toolName, record, 'processRef', 'processId', 'process', catalog);
+    if (operation === 'read') replaceRef(toolName, record, 'cursor', 'outputHandle', 'cursor', catalog);
   } else if (toolName === 'run_agent' || toolName === 'read_agent_answer') {
     const operation = typeof record.operation === 'string' ? record.operation.trim() : '';
     const ignoresChild = toolName === 'run_agent' && (operation === 'spawn' || operation === 'list');
@@ -1295,7 +1300,8 @@ function modelReferenceKeys(toolName: string, record: Record<string, unknown>): 
   switch (toolName) {
     case 'read': return ['attachmentRef'];
     case 'bash':
-    case 'shell': return ['processRef', 'cursor'];
+    case 'shell':
+    case ANTIGRAVITY_TOOL_NAME: return ['processRef', 'cursor'];
     case 'run_agent':
     case 'read_agent_answer': return ['childRef', 'childRefs'];
     case SWITCH_WORK_ENVIRONMENT_TOOL_NAME: return ['workEnvironmentRef'];

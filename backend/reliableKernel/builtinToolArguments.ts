@@ -6,6 +6,7 @@ import { normalizeSubmitPlanToolRequest } from '../../shared/planReview';
 import { requireTaskListOperation } from '../../shared/taskListProjection';
 import { ToolArgumentError } from '../../shared/toolArgumentUtils';
 import { TASK_LIST_TOOL_NAME, TRANSFER_TOOL_NAME } from '../../shared/protocol';
+import { ANTIGRAVITY_TOOL_NAME, validateAntigravityToolArguments } from '../world/modules/tools/definitions/antigravity';
 import { validateReadFileToolArguments } from '../world/modules/tools/definitions/readFile';
 import { validateSkillsToolArguments } from '../world/modules/tools/definitions/skills';
 import { validateReadAgentAnswerToolArguments, validateRunAgentToolArguments } from './childAgentCoordinator';
@@ -27,6 +28,7 @@ export function validateBuiltinToolArguments(toolName: string, args: unknown): u
       case 'run_agent': return validateRunAgentToolArguments(args);
       case 'read_agent_answer': return validateReadAgentAnswerToolArguments(args);
       case TRANSFER_TOOL_NAME: return validateWorkEnvironmentTransferArguments(args);
+      case ANTIGRAVITY_TOOL_NAME: return validateAntigravityToolArguments(args);
       default: return args;
     }
   } catch (error) {
